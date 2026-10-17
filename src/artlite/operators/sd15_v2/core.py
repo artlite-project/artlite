@@ -60,7 +60,7 @@ C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a v2_shift's off
 SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
 ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a GroupNorm record continued from / kept for the next op: one record over several ops)
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
-C_GTAB = 64  # (GroupNorm apply: ``group_words``, one per 16 channels)
+C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
 K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN = 1, 2, 3, 4, 5
 O_BF16, O_BFP16, O_GEGLU, O_VT = 0, 1, 2, 3
@@ -495,18 +495,21 @@ static inline __attribute__((always_inline)) void {{ p }}_split_st(aie::vector<f
 }
 
 // GroupNorm coefficients of n16 x 16 channels (s = gamma rstd, t = beta - mean s): mr = mean [16] | rstd [16] of the
-// record window's groups, tw: per 16 channels their two groups' indices in it and the first one's lanes (``group_words``),
-// gb = gamma, beta [c16][16 | 16] fp32 -> coef [c8][s_hi 8 | s_lo 8 | t_hi 8 | t_lo 8] (gb and coef may be one buffer:
-// an iteration reads its 128 B before it writes them; pipelined)
+// record window's groups, tw: per 16 channels two words, the indices in it of their first, middle and last channel's
+// groups and the lanes of the first and of the last group (``group_words``: groups of 10 channels span three), gb =
+// gamma, beta [c16][16 | 16] fp32 -> coef [c8][s_hi 8 | s_lo 8 | t_hi 8 | t_lo 8] (gb and coef may be one buffer: an
+// iteration reads its 128 B before it writes them; pipelined)
 static __attribute__((noinline)) void {{ p }}_gnc16(const float *__restrict gb, const float *__restrict mr, bfloat16 *__restrict coef,
                                               const int32_t *__restrict tw, int n16) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   AIE_LOOP_MIN_ITERATION_COUNT(5)
   for (int k = 0; k < n16; k++) {
-    const unsigned w = *tw++, ia = w & 31, ib = (w >> 5) & 31;
-    const aie::mask<16> mk = aie::mask<16>::from_uint32(w >> 16);
-    const aie::vector<float, 16> rs = aie::select(aie::broadcast<float, 16>(mr[16 + ib]), aie::broadcast<float, 16>(mr[16 + ia]), mk);
-    const aie::vector<float, 16> mu = aie::select(aie::broadcast<float, 16>(mr[ib]), aie::broadcast<float, 16>(mr[ia]), mk);
+    const unsigned w = *tw++, wm = *tw++, ia = w & 31, ib = (w >> 5) & 31, ic = (w >> 10) & 31;
+    const aie::mask<16> ma = aie::mask<16>::from_uint32(wm & 0xFFFF), mc = aie::mask<16>::from_uint32(wm >> 16);
+    const aie::vector<float, 16> rs = aie::select(aie::select(aie::broadcast<float, 16>(mr[16 + ib]), aie::broadcast<float, 16>(mr[16 + ic]), mc),
+                                                  aie::broadcast<float, 16>(mr[16 + ia]), ma);
+    const aie::vector<float, 16> mu = aie::select(aie::select(aie::broadcast<float, 16>(mr[ib]), aie::broadcast<float, 16>(mr[ic]), mc),
+                                                  aie::broadcast<float, 16>(mr[ia]), ma);
     const aie::vector<float, 16> sv = al::mulff<16>(rs, aie::load_v<16>(gb));
     const aie::vector<float, 16> tv = aie::sub(aie::load_v<16>(gb + 16), al::mulff<16>(mu, sv));
     aie::vector<bfloat16, 16> sh, sl, th, tl;
@@ -952,16 +955,20 @@ __attribute__((minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, int32_t *out
 
 
 def group_words(ch0: int, nch: int, gsize: int, g0: int) -> np.ndarray:
-    """C_GTAB of a GroupNorm apply core (channels [ch0, ch0 + nch) in groups of gsize >= 16, its record window from group
-    g0): per 16 channels from ch0 the window indices of their first and last channel's groups (bits 0..4, 5..9) and
-    the lanes in the first group (a mask, bits 16..31)."""
-    assert gsize >= 16 and nch % 16 == 0
+    """C_GTAB of a GroupNorm apply core (channels [ch0, ch0 + nch) in groups of gsize >= 8, its record window from group
+    g0): per 16 channels from ch0 the window indices of their first, middle and last channel's groups (bits 0..4, 5..9,
+    10..14), then the lanes of the first group and of the last (masks, bits 0..15, 16..31: the middle group's lanes are
+    the rest)."""
+    assert gsize >= 8 and nch % 16 == 0
     out = []
     for c in range(ch0, ch0 + nch, 16):
-        ga, gb = c // gsize, (c + 15) // gsize
-        n = min((ga + 1) * gsize - c, 16)
-        assert 0 <= ga - g0 < 16 and 0 <= gb - g0 < 16
-        out.append((ga - g0) | (gb - g0) << 5 | ((1 << n) - 1) << 16)
+        ga, gm, gc = c // gsize, (c + 8) // gsize, (c + 15) // gsize
+        grp = [(c + j) // gsize for j in range(16)]
+        assert len(set(grp)) <= 3 and all(0 <= g - g0 < 16 for g in (ga, gm, gc))
+        gm = next((g for g in grp if g not in (ga, gc)), ga)
+        ma = sum(1 << j for j in range(16) if grp[j] == ga)
+        mc = sum(1 << j for j in range(16) if grp[j] == gc and gc != ga)
+        out += [(ga - g0) | (gm - g0) << 5 | (gc - g0) << 10, ma | mc << 16]
     return np.array(out, np.uint32).view(np.int32)
 
 

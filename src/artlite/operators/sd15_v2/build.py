@@ -141,13 +141,18 @@ class Builder:
         self.tb_used = 0
         self._zfill = False
         self._tab_runs: dict[int, tuple] = {}  # (row -> a table's B run, taken before the row's next op: ``table``)
+        self._rec_names: dict[str, int] = {}  # (records' DDR images by name: their uses)
+        self._images: dict[str, int] = {}  # (DDR image name -> its data's hash)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
 
     # -- DDR images
     def image(self, name: str, data: np.ndarray) -> int:
-        """A persistent DDR buffer holding ``data``; returns its device address."""
+        """A persistent DDR buffer holding ``data``; returns its device address. A name may be imaged again with the
+        same data only (ops of several bands share a layer's images: the dispatch reads what was written last)."""
         data = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
+        h = hash(data.tobytes())
+        assert self._images.setdefault(name, h) == h, f"DDR image {name!r} written again with other data"
         self.v2.alloc(name, data.size)
         self.v2.write(name, data)
         return self.v2.address(name)
@@ -257,12 +262,12 @@ class Builder:
                 self.ddr(TBIAS, TBIAS_BYTES)
             off = self.tb_used
             self.tb_used += ROWS * nb
-            assert self.tb_used <= TBIAS_BYTES and g.ntile == 1
+            assert self.tb_used <= TBIAS_BYTES
             tb = self.v2.address(TBIAS)
             for r, ro in rows.items():
-                (a, n), = ro.runs
+                (a, n), *more = ro.runs  # (more: the weights again per further tile)
                 self.v2.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
-                ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb)]
+                ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
             self.tb_hooks.append((tbias, off, torch.cat([g._rows(r) for r in range(ROWS)]).numpy()))
         cols = {c: g.col_ops(c) for c in range(COLS)}
         if extra:
@@ -273,8 +278,10 @@ class Builder:
 
     def records(self, rec: int, *, name: str, ch_off: int, nr: int, gsize: int) -> Records:
         """Drain a producer's GroupNorm records (memtile ``rec`` [core][OCH], 4 OCH bytes: released by the drain's op)
-        to DDR, with the next op; the consumer's B stream reads them after ``Seq.ddr_sync`` (``apply`` syncs)."""
-        base = self.ddr(name, COLS * ROWS * 256)
+        to DDR, with the next op; the consumer's B stream reads them after ``Seq.ddr_sync`` (``apply`` syncs). Each call
+        its own DDR image (``name``, numbered from its second use: the bands of one layer)."""
+        k = self._rec_names[name] = self._rec_names.get(name, -1) + 1
+        base = self.ddr(f"{name}.{k}" if k else name, COLS * ROWS * 256)
         cols = {c: ColOps(drains=[MemTask([{"addr": rec, "nwords": 256, "dims": [(64, 1), (ROWS, D.OCH // 4)]}],
                                           ddr=(base + c * 1024, 1024, None))]) for c in range(COLS)}
         self._drains.append((cols, [(rec, 4 * D.OCH)], True))

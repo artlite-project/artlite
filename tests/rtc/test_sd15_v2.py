@@ -141,7 +141,7 @@ def images(m: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("mode, m, C, ntile", [("gnsilu", 64, 1280, 1), ("gn", 64, 640, 1), ("gnsilu", 16, 1280, 1),
-                                              ("ln", 64, 1280, 1), ("ln", 16, 320, 1), ("gnsilu", 64, 640, 2),
+                                              ("ln", 64, 1280, 1), ("ln", 16, 320, 1), ("gnsilu", 64, 640, 2), ("gnsilu", 64, 320, 4),
                                               ("gn", 64, 640, 2), ("ln", 64, 640, 2), ("ln", 64, 320, 4)])
 def test_norm(v2: V2Device, mode: str, m: int, C: int, ntile: int) -> None:
     """A GEMM's output with its statistics (GroupNorm group sums through DDR and the B streams, LayerNorm per-token sums
@@ -388,6 +388,40 @@ def test_resnet(v2: V2Device, H: int, cin: int, cout: int) -> None:
     y = from_level_tokens(torch.stack([L.from_ctiles(yb[c], lv.m, cout, lv.m) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
     assert _rel(y, ref) < 1.5e-2
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("cin, cout", [(640, 640), (320, 640)])
+def test_resnet_bands(v2: V2Device, cin: int, cout: int) -> None:
+    """ResnetBlock2D on the banded 32x32 level (x and the output in DDR per band, h parked; the shortcut where cin !=
+    cout): within 1.5e-2 of the fp32 reference."""
+    from artlite.operators.sd15_v2.unet import DTensor, copy_stats, resnet_bands
+    from models.sd15 import reference
+    torch.manual_seed(13)
+    p, H = "r.", 32
+    w = _rand_resnet(p, cin, cout)
+    tb = 0.3 * torch.randn(cout)
+    x = torch.randn(2, cin, H, H)
+    lv = Level(H, 2)
+    bd = Builder(v2)
+    xc = level_tokens(x, lv.R, lv.Lg)
+    xd = DTensor(lv, cin, "x_in", rec=[])
+    for b in range(2):
+        bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+    for b in range(2):
+        t = xd.load(bd, b)
+        xd.rec += copy_stats(bd, t, name=f"x.st{b}", st=(cin // 32, 0))
+        bd.mem.release(t.addr, t.nbytes)
+    out = resnet_bands(bd, w, p, xd, cout=cout, time_bias=tb, eps=1e-5, stats=None, name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    yb = [v2.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
+    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, cout, lv.m) for b in range(2)])
+                                       for c in range(COLS)]), lv.R, lv.Lg)
+    ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
+    err = _rel(y, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
 
 
 def _rand_transformer(p: str, C: int = 1280, cd: int = 768) -> dict:

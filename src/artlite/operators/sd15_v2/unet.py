@@ -33,6 +33,7 @@ class Tensor:
     kind: str = "ct"
     rec: list[Records] | None = None
     pnp: int = 0  # (panels: token panels per kb, if not the level's: a GEGLU output's padding)
+    size: int = 0  # (the bytes allocated: ``alloc``)
 
     @property
     def np(self) -> int:
@@ -44,13 +45,15 @@ class Tensor:
 
 
 def alloc(bd: Builder, lv: Level, C: int, kind: str = "ct", pnp: int = 0, top: bool = False) -> Tensor:
+    """A memtile tensor (panels of tiles of 64: room for whole A objects of 2 k-tiles, the GEMMs' walk reads them)."""
     t = Tensor(lv, C, 0, kind, pnp=pnp)
-    t.addr = bd.mem.alloc(t.nbytes, top=top)
+    t.size = t.nbytes if kind == "ct" or lv.m != 64 else -(-C // 128) * 16 * t.np * 72
+    t.addr = bd.mem.alloc(t.size, top=top)
     return t
 
 
 def free(bd: Builder, t: Tensor) -> None:
-    bd.mem.release(t.addr, t.nbytes)
+    bd.mem.release(t.addr, t.size or t.nbytes)
 
 
 def silu_table(bd: Builder) -> None:
@@ -86,13 +89,17 @@ def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch
 
 
 def conv(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor, *, name: str, out: Tensor, stride: int = 1,
-         res: Tensor | None = None, stats: tuple[int, int] | None = None, tbias: str | None = None) -> None:
+         res: Tensor | None = None, stats: tuple[int, int] | None = None, tbias: str | None = None,
+         band: int | None = None) -> None:
     """A 3x3 conv of the panels x into the C tiles out (+ res), out's records for ``stats``; tbias: the resnet whose
-    time bias b includes (``Builder.gemm``: rewritten per step)."""
+    time bias b includes (``Builder.gemm``: rewritten per step). band: of a banded level, x the whole column's panels,
+    out band ``band``'s (row tiles: ``ops.Gemm`` rc)."""
     lv = out.lv
     N = w.shape[0]
     kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": N, "x": x.addr, "y": out.addr, "out": "bf16", "conv": stride, "R": lv.R, "Lg": lv.Lg,
               "zero": bd.zero, "x_np": x.np}
+    if band is not None:
+        kw.update(ntile=lv.ntile, R=1, rc=lv.R, r0=band * lv.R // lv.nb)
     rec = bd.mem.alloc(4 * D.OCH, top=True) if stats else None
     if stats:
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
@@ -325,9 +332,14 @@ class DTensor:
         t.rec = self.rec
         return t
 
-    def store(self, bd: Builder, b: int, t: Tensor) -> None:
-        """Band b from the memtile tensor t (drained with the next op, t's bytes released after it); its records."""
-        bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.nbytes)])
+    def store(self, bd: Builder, b: int, t: Tensor, *, defer: bool = True) -> None:
+        """Band b from the memtile tensor t (drained with the next op, t's bytes released after it; defer False: an op
+        of its own, t freed); its records."""
+        if defer:
+            bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.nbytes)])
+        else:
+            bd.op(bd.spill(self.band(b), t.addr, t.nbytes), {})
+            free(bd, t)
         self.rec = (self.rec or []) + (t.rec or [])
 
 
@@ -353,6 +365,58 @@ def transformer_bands(bd: Builder, w: dict, p: str, x: DTensor, *, kv: int, ctx_
         gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=xb, res=xb, stats=stats)
         free(bd, h4)
         out.store(bd, b, xb)
+    return out
+
+
+def band_view(t: Tensor, b: int) -> Tensor:
+    """Band b of a whole column's panel tensor t (its token panels from b np; the kb stride t's)."""
+    return Tensor(t.lv, t.C, t.addr + b * t.lv.np * L.PANEL, "pn", pnp=t.np)
+
+
+def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: torch.Tensor, eps: float,
+                 stats: tuple[int, int] | None, name: str) -> DTensor:
+    """``resnet`` on a banded level (x and the output in DDR): GN1 + SiLU of each band into the whole column's panels
+    (the convs' halo rows), conv1 (+ the time bias) per band with GN2's records (parked in DDR, the last band's kept),
+    GN2 + SiLU of each band (the last first), conv2 + x (or its 1x1 shortcut) per band -> the output's band (records
+    for ``stats``). A band's C tiles are a third of the memtile: an earlier band's output drained in an op of its own,
+    before the next band's convs (barriers: those reuse its bytes)."""
+    lv, nb = x.lv, x.lv.nb
+    npw = lv.np * nb  # (a whole column's token panels)
+
+    def norm(t: DTensor, wp: str, C: int, last: Tensor | None = None) -> Tensor:
+        pw = alloc(bd, lv, C, "pn", pnp=npw)
+        for b in reversed(range(nb)):
+            tb = last if b == nb - 1 and last is not None else t.load(bd, b)
+            tb.rec = t.rec  # (every band's)
+            gn_apply(bd, tb, band_view(pw, b), w[wp + "weight"], w[wp + "bias"], name=wp[:-1], eps=eps, silu=True)
+            free(bd, tb)
+        return pw
+    p1 = norm(x, p + "norm1.", x.C)
+    h = DTensor(lv, cout, name + ".h")
+    for b in range(nb):
+        hb = alloc(bd, lv, cout)
+        conv(bd, p1, w[p + "conv1.weight"], w[p + "conv1.bias"] + time_bias, name=p + "conv1", out=hb,
+             stats=(cout // 32, 0), tbias=p, band=b)
+        if b < nb - 1:
+            h.store(bd, b, hb, defer=False)
+    free(bd, p1)
+    h.rec += hb.rec
+    p2 = norm(h, p + "norm2.", cout, last=hb)
+    out = DTensor(lv, cout, name)
+    for b in range(nb):
+        if p + "conv_shortcut.weight" in w:
+            xb = x.load(bd, b)
+            px = alloc(bd, lv, x.C, "pn", top=True)
+            plain(bd, xb, px, name=p + "xpn")
+            free(bd, xb)
+            sc = alloc(bd, lv, cout)
+            gemm(bd, px, w[p + "conv_shortcut.weight"], w[p + "conv_shortcut.bias"], name=p + "conv_shortcut", out=sc)
+            free(bd, px)
+        else:
+            sc = x.load(bd, b)
+        conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sc, res=sc, stats=stats, band=b)
+        out.store(bd, b, sc, defer=b == nb - 1)
+    free(bd, p2)
     return out
 
 

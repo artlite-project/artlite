@@ -134,6 +134,8 @@ class Gemm:
         ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "geglu": self.N // 16}.get(self.out, 0) * self.y_np * L.PANEL or \
             self.N // 80 * self.ntile * L.ct_bytes(self.m)
         assert self.y + ybytes <= D.HEAP and self.x + self.K // 8 * self.x_np * L.PANEL <= D.HEAP, "tensors past the heap"
+        assert self.conv or self.x + self.aobj * (128 // self.m) * 8 * self.x_np * L.PANEL <= 512 * 1024, \
+            "the A objects' walk past the memtile (an over-read hangs)"
         assert self.res is None or self.res + (self.N // 80 * self.ntile - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= \
             512 * 1024, "the residual's last objects past the memtile"
         assert self.stats != "gn" or self.gsize, "a GroupNorm's group size"
@@ -442,7 +444,7 @@ class Apply:
         self.nhalf = self.nblk * self.ntile * (3 if self.m == 64 else 1)
         self.half_step = 960 if self.m == 64 else ct // 4
         self.aobj = -(-self.nhalf // 2) + (self.mode == "ln")
-        assert self.nblk * 80 <= 640 and (not self.gn or (self.gsize >= 16 and self.tokens)) and (self.mode != "ln" or self.C)
+        assert self.nblk * 80 <= 640 and (not self.gn or (self.gsize >= 8 and self.tokens)) and (self.mode != "ln" or self.C)
         assert self.mode != "ln" or self.ntile <= 4, "LayerNorm records past their A object"
         last = self.x + (self.blk0 + (len(self.rows) - 1) * self.nblk) * self.ntile * ct + 4 * (self.nhalf - 1) * self.half_step
         assert last + D.A_OBJ // 2 <= 512 * 1024, "x's walk past the memtile"
@@ -461,7 +463,7 @@ class Apply:
             g0 = gn_window(ch0, n, self.gsize)
             cmd[[K.C_GSIZE, K.C_CH0, K.C_G0, K.C_INVN, K.C_GINV]] = (
                 self.gsize, ch0, g0, _f32(1.0 / (self.gsize * self.tokens)), K.group_inv(self.gsize))
-            cmd[K.C_GTAB:K.C_GTAB + n // 16] = K.group_words(ch0, n, self.gsize, g0)
+            cmd[K.C_GTAB:K.C_GTAB + n // 8] = K.group_words(ch0, n, self.gsize, g0)
         elif self.mode == "ln":
             cmd[K.C_INVN] = _f32(1.0 / self.C)
         return cmd.view(np.uint8)
