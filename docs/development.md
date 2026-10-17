@@ -13,10 +13,11 @@ pytest tests/rtc --dump-designs DIR                  # render every design, no N
 ruff check <changed files>                           # the tree passes: fix whatever it reports
 ```
 
-The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The tests
-need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the background
-while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay corpus
-(`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp build
+GitHub runs `ruff check` on each push to `main` and each pull request; the tests need an NPU, so they run on your
+machine. The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The
+tests need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the
+background while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay
+corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp build
 (`ARTLITE_LLAMA_CPP_DIR`).
 
 The C++ runtime's tests (gtest, `tests/npu_test.cpp`) build in their own tree, with the venv active (`build/` belongs

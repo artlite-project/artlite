@@ -1,0 +1,17 @@
+name: ruff
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: ruff check (the version uv.lock pins)
+        run: pipx run "ruff==$(sed -n '/^name = "ruff"$/{n;s/^version = "\(.*\)"$/\1/p}' uv.lock)" check --output-format=github .

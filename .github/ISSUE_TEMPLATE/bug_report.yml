@@ -1,0 +1,26 @@
+name: Bug report
+description: A crash, a hang, an error or wrong output
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what it printed (the error or traceback), and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file
+      description: The Hugging Face repository and file, if a model is involved.
+      placeholder: unsloth/Llama-3.2-1B-Instruct-GGUF Llama-3.2-1B-Instruct-Q4_K_M.gguf
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: |
+        The output of this, run in your Artlite checkout (processor, kernel, NPU, its firmware, the driver, Artlite's commit):
+        ```
+        grep -m1 'model name' /proc/cpuinfo; uname -r; cat /sys/bus/pci/drivers/amdxdna/*/{vbnv,fw_version} /sys/module/amdxdna/version; git rev-parse --short HEAD
+        ```
+      render: text

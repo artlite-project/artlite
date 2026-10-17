@@ -93,6 +93,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/models/common.py`, `cli.py`, `bench.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli` and `artlite-bench` |
 | `tests/rtc/` | operator and model tests (`common.py`: the essay corpus, cached CPU references; `llama_ref.py`, `gemma_ref.py`, `qwen35_ref.py`: model references; `llama_cpu.py`, `gemma_cpu.py`: fp32 CPU models; `elementwise.py`: 1-D stream operators, the activations' harnesses; `mmv.py`: the decode GEMV's host model and its harness `MmvOperator`; `dma_model.py`: the host DMA model) |
 | `tests/datasets/` | the long-prompt corpus (gitignored; `fetch_datasets.py` fetches it, `common.essay()` reads it) |
+| `.github/` | GitHub: the `ruff check` workflow (on pushes to `main` and pull requests), the issue and pull request templates, the security policy |
 | `docs/` | the user documentation (index: `docs/README.md`): installation, the tools' options, models (`models/`: tested files, plans, one page per model), benchmark methodology (the charts' test system and measured files), design, development; the README's performance charts: `data/*.json` (Artlite's and other runtimes' measurements), `charts.py` draws them as `images/*.svg`; `diagram.py` draws the README's how-it-works diagram; `images/`: also the logo and the docs' pictures |
 
 ## How an operator works
