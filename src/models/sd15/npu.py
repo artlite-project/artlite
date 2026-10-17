@@ -1,5 +1,5 @@
 """Stable Diffusion 1.5's UNet on the NPU: ``NpuUNet``, the pipeline's noise predictor (``artlite.operators.sd15``'s
-UNet program: the whole step in one library program; its 16x16 / 8x8 levels by ``artlite.operators.sd15_v2``'s
+UNet program: the whole step in one library program; its 32x32 .. 8x8 levels by ``artlite.operators.sd15_v2``'s
 section, one raw item of the program, whose weights, time biases and context K / V^T are in its own buffers on the
 program's device).
 

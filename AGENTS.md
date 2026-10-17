@@ -83,7 +83,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
 | `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |
-| `src/artlite/operators/sd15/`, `sd15_v2/` | the SD 1.5 UNet: the 64x64 / 32x32 levels' overlay (one static design, regular and transformer variants) and its attention, the 16x16 / 8x8 levels on `sd15_v2`'s design (one raw item), the UNet step as one library program (`sd15/unet.py`) |
+| `src/artlite/operators/sd15/`, `sd15_v2/` | the SD 1.5 UNet: the 64x64 level's overlay (one static design, regular and transformer variants) and its attention, the 32x32 .. 8x8 levels on `sd15_v2`'s design (one raw item; 32x32 in bands), the UNet step as one library program (`sd15/unet.py`) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`) |

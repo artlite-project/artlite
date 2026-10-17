@@ -1,4 +1,4 @@
-"""Stable Diffusion 1.5's UNet levels 64x64 and 32x32 on one static array design (an overlay; the 16x16 / 8x8 levels:
+"""Stable Diffusion 1.5's UNet level 64x64 on one static array design (an overlay; the 32x32 .. 8x8 levels:
 ``sd15_v2``): its operators share its configuration, so a library program of them never reconfigures; the operators
 differ in their runtime sequences and in commands their cores read.
 

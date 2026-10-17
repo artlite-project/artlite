@@ -1,8 +1,10 @@
-"""sd15_v2's UNet blocks on a ``build.Builder`` (the 16x16 / 8x8 levels: resnets, transformers, down / upsampling).
+"""sd15_v2's UNet blocks on a ``build.Builder`` (resnets, transformers, down / upsampling of the 32x32 .. 8x8 levels).
 
-A block takes its input as a C-tile tensor in the memtile with the GroupNorm records its first norm needs, and returns
-its output the same way (records in the layout its consumer asks for: ``stats`` = (group size, channel offset) of the
-consumer's GroupNorm, a concatenation's second part at its offset). Weights by diffusers name (``w[p + ...]``).
+A block takes its input with the GroupNorm records its first norm needs and returns its output the same way (records in
+the layout its consumer asks for: ``stats`` = (group size, channel offset) of the consumer's GroupNorm, a
+concatenation's second part at its offset): at 16x16 / 8x8 C-tile tensors in the memtile (a level fits it), at 32x32
+DDR tensors per band (``DTensor``: the ``*_bands`` blocks run band by band, a band's working set the memtile's). Weights
+by diffusers name (``w[p + ...]``).
 """
 
 from dataclasses import dataclass

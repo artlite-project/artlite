@@ -1,4 +1,4 @@
-"""sd15_v2's static design: compiled once, run by host-built transactions (``seq``) for both its levels (16x16, 8x8).
+"""sd15_v2's static design: compiled once, run by host-built transactions (``seq``) for all its levels (32x32 .. 8x8).
 
 Array roles (column c, core row r):
 - column c holds a token tile's activations in its memtile: every channel of its tokens;
