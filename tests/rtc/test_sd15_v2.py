@@ -460,6 +460,27 @@ def test_resnet_cat_bands(v2: V2Device, ch: int, cs: int) -> None:
     assert err < 1.5e-2
 
 
+def test_downsample_bands(v2: V2Device) -> None:
+    """The stride-2 downsampler of the banded 32x32 level (x in DDR per band) into 16x16 C tiles: within 8e-3 of torch
+    on the bfp16-rounded input."""
+    from artlite.operators.sd15_v2.unet import DTensor, downsample_bands
+    torch.manual_seed(15)
+    C, p, H = 640, "s.", 32
+    x = torch.randn(2, C, H, H)
+    w = {p + "conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, p + "conv.bias": 0.1 * torch.randn(C)}
+    lv = Level(H, 2)
+    bd = Builder(v2)
+    xc = level_tokens(x, lv.R, lv.Lg)
+    xd = DTensor(lv, C, "x_in")
+    for b in range(2):
+        bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+    out = downsample_bands(bd, w, p, xd)
+    y = _level_output(v2, bd, out, "y_out")
+    xq = q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+    ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), stride=2, padding=1)
+    assert _rel(y, ref) < 8e-3, _rel(y, ref)
+
+
 def _rand_transformer(p: str, C: int = 1280, cd: int = 768) -> dict:
     g = torch.Generator().manual_seed(7)
     q = p + "transformer_blocks.0."

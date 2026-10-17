@@ -15,7 +15,8 @@ core copies it into its workspace and releases the slot. Kinds:
   (``ops.Gemm.conv_words``, ``v2_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
   C; statistics of the result (C_STATS: GroupNorm group sums of the
   op (C_STF: carried over from / to the next op), LayerNorm per-token sums of a tile, each emitted as one output
-  chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B), its bfp16 panels (m x 90 B,
+  chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B; O_DS: its groups 0 and 2, a
+  stride-2 conv's x, in 2 x 2 chunks), its bfp16 panels (m x 90 B,
   [rb][cb]), their transposes (V^T: [rb][cb] of [8 channels][8 tokens], the exponent per channel), or GEGLU (the
   pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) in ``OCH`` chunks (the last one padded);
 - ``K_APPLY`` (core rows 2, 3): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
@@ -54,7 +55,8 @@ C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
 CALL, NCALL = 10, 11  # (words of a call, the most calls)
 CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk crosses between cbuf and the object)
-C_PATS = C_CALLS + CALL * NCALL  # (conv: the walks of B and C, a dims_3d_t each)
+C_PATS = C_CALLS + CALL * NCALL  # (the MAC's walks of B and C, a dims_3d_t each: a conv's, a GEMM's, attention's P V^T)
+C_WALKS = C_PATS - 7  # (a GEMM's and attention's P V^T: the MAC's walk of A)
 C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
 C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a v2_shift's offsets)
 SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
@@ -63,7 +65,7 @@ C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
 K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN = 1, 2, 3, 4, 5
-O_BF16, O_BFP16, O_GEGLU, O_VT = 0, 1, 2, 3
+O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS = 0, 1, 2, 3, 4
 S_NONE, S_GN, S_LN = 0, 1, 2
 A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
@@ -407,10 +409,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32
   const int nres = ws[{{ C_NRES }}], om = ws[{{ C_OUT }}], stats = ws[{{ C_STATS }}], stf = ws[{{ C_STF }}];
   const int kpo = m == 64 ? 2 : 8, nrb = m / 8;  // (k-tiles per A object, row blocks)
   // (the MAC's walks; m 64: the band pairs (0, 2), (1, 3) alternate per block, C's halves in two L1 regions)
-  const bool il = m == 64;
-  const dims_3d_t pa = il ? dims_3d_t(1, 1152, 4, -3456, -2304) : dims_3d_t(4, -1152, m / 16 - 1, 0, 0);
-  const dims_3d_t pb = il ? dims_3d_t(1, -1152, 4, 0, -5760) : dims_3d_t(4, 0, m / 16 - 1, -5760, -5760);
-  const dims_3d_t pl = il ? dims_3d_t(1, 2560, 4, -2432, -1792) : dims_3d_t(4, 128, m / 16 - 1, 768, 768);
+  const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
+  const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});  // (the MAC's walks: the command's, ``ops.mac_walks``)
   bfloat16 *c = (bfloat16 *)cb;
   float *cf = (float *)cb;  // (the C tile in fp32, rounded to bf16 in place before the epilogue)
   float *rec = (float *)s.s1;
@@ -462,7 +462,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32
         {{ p }}_geglu(cb, cb, (bfloat16 *)s.s0, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);  // (scratch: no statistics in a GEGLU op)
         nbytes = m * 45;
       }
-      {{ p }}_out(s, cb, nbytes);
+      if (om == {{ O_DS }}) {  // (a stride-2 conv's tile: groups 0 and 2, row blocks 0, 1 and 4, 5)
+        {{ p }}_out(s, cb, 2560);
+        {{ p }}_out(s, cb + 1280, 2560);
+      } else
+        {{ p }}_out(s, cb, nbytes);
     }
     if (stats == {{ S_LN }}) {{ p }}_out(s, s.s1, 8 * m);
   }
@@ -869,8 +873,9 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
   const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}], d160 = nd == 20;
   const int npair = (nqp + 1) / 2;
   float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
-  // (P V^T at d 80: the GEMM MAC, one band: A rewound per 16-col block, B and C walk on)
-  const dims_3d_t pa(4, -1152, 0, 0, 0), pb(4, 0, 0, 0, 0), pl(4, 128, 0, 0, 0);
+  // (P V^T at d 80: the GEMM MAC of one band, its walks the command's)
+  const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
+  const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
   for (int u = 0; u < nunit; u++) {
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 128 * nd * npair);

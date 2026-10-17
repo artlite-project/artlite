@@ -428,6 +428,25 @@ def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bi
     return out
 
 
+def downsample_bands(bd: Builder, w: dict, p: str, x: DTensor) -> Tensor:
+    """The stride-2 conv of a banded level's x (32x32) into the next level's C tiles (16x16, one band): x's panels of
+    the whole column, the conv's even output rows (row tiles 0 and 2: a column's 16x16 rows) of every x, of which the
+    even ones (groups 0 and 2: the next level's groups 0 and 1) are output (``ops.Gemm`` "ds")."""
+    lv, npw = x.lv, x.lv.np * x.lv.nb
+    px = alloc(bd, lv, x.C, "pn", pnp=npw)
+    for b in range(lv.nb):
+        xb = x.load(bd, b)
+        plain(bd, xb, band_view(px, b), name=p + "xpn")
+        free(bd, xb)
+    N = w[p + "conv.weight"].shape[0]
+    y = alloc(bd, Level(lv.H // 2), N)
+    g = Gemm(m=64, ntile=lv.R // 2, K=x.C, N=N, x=px.addr, y=y.addr, out="ds", conv=1, R=1, Lg=lv.Lg, zero=bd.zero,
+             x_np=npw, rc=lv.R, rstep=2)
+    bd.gemm(g, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv")
+    free(bd, px)
+    return y
+
+
 def skip_bands(bd: Builder, x: DTensor, *, name: str, st: tuple[int, int]) -> DTensor:
     """A banded level's tensor as a skip: x with GroupNorm records in its concatenation's group space (st = (group size,
     channel offset)): a copy op per band."""
