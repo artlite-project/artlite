@@ -1,0 +1,95 @@
+{
+  "runtime": "OpenFlowLM",
+  "about": "OpenFlowLM's models on the same machine and prompts, for comparison: a FastFlowLM fork that runs them on its own open (IRON / mlir-aie) NPU kernels. comparable_quants: the GGUF quants of the same model whose Artlite rows the charts pair with this one, first match first (q4nx is Q4_1 numerics, with Q8_0 lm_head and ssm_out in the Qwen3.5 containers). A note on a missing value says why it is missing.",
+  "version": "0.1.0-99fe7e4 (Atomic-Germ/OpenFlowLM-Next at 99fe7e4), oflm serve with every model on the open kernels, default prefill chunks of 4096, each model at its native context (Qwen3.8 27B at 131072: its KV at the native 262144 does not fit beside the weights with 16 GB to spare)",
+  "date": "2026-10-17",
+  "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU), NPU power mode turbo",
+  "chart_note": "oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes",
+  "method": {
+    "ttft_s": "streaming /v1/chat/completions with a Paul Graham essays prompt of n tokens, greedy, 128 tokens: client time to the first token (median of up to 3)",
+    "prefill_tps": "n / ttft_s",
+    "decode_tps": "(tokens - 1) / time from the first to the last streamed token",
+    "engine_prefill_tps": "OpenFlowLM's own figures: without the HTTP and streaming overhead",
+    "engine_decode_tps": "OpenFlowLM's own figures: without sampling and streaming"
+  },
+  "results": [
+    {
+      "model": "Qwen3 0.6B",
+      "tag": "qwen3:0.6b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF (FastFlowLM's container)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 2.33, "2048": 5.06, "4096": 11.91, "8192": 58.21},
+      "prefill_tps": {"1024": 439, "2048": 405, "4096": 344, "8192": 141},
+      "decode_tps": {"1024": 32.86, "2048": 21.61, "4096": 13.07, "8192": 7.22},
+      "engine_prefill_tps": {"1024": 469, "2048": 425, "4096": 357, "8192": 143},
+      "engine_decode_tps": {"1024": 32.67, "2048": 21.43, "4096": 12.93, "8192": 7.13},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "tag": "llama3.2:1b",
+      "quant": "q4nx",
+      "weights": "Unsloth's imatrix Q4_1 GGUF (FastFlowLM's container, bit-exact with the Q4_1 file Artlite measures)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 7.16, "2048": 22.69, "4096": 80.76},
+      "prefill_tps": {"1024": 143, "2048": 90, "4096": 51},
+      "decode_tps": {"1024": 35.98, "2048": 27.68, "4096": 19.38},
+      "engine_prefill_tps": {"1024": 143, "2048": 90, "4096": 51},
+      "engine_decode_tps": {"1024": 36.7, "2048": 28.17, "4096": 19.65},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "tag": "llama3.2:3b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF (FastFlowLM's container)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 15.33, "2048": 48.41, "4096": 176.37},
+      "prefill_tps": {"1024": 67, "2048": 42, "4096": 23},
+      "decode_tps": {"1024": 16.27, "2048": 12.82, "4096": 9.01},
+      "engine_prefill_tps": {"1024": 67, "2048": 42, "4096": 23},
+      "engine_decode_tps": {"1024": 16.49, "2048": 12.98, "4096": 9.11},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    },
+    {
+      "model": "Llama 3.1 8B Instruct",
+      "tag": "llama3.1:8b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF (FastFlowLM's container)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 23.33, "2048": 70.08, "4096": 242.77},
+      "prefill_tps": {"1024": 44, "2048": 29, "4096": 17},
+      "decode_tps": {"1024": 8.5, "2048": 7.11, "4096": 5.35},
+      "engine_prefill_tps": {"1024": 44, "2048": 29, "4096": 17},
+      "engine_decode_tps": {"1024": 8.59, "2048": 7.18, "4096": 5.41},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    },
+    {
+      "model": "Qwen3.5 9B",
+      "tag": "qwen3.5:9b",
+      "quant": "q4nx",
+      "weights": "Q4_1 linears, Q8_0 lm_head and ssm_out (FastFlowLM's container)",
+      "comparable_quants": ["Q4_K_M", "Q4_K_S"],
+      "ttft_s": {"1024": 7.83, "2048": 14.95, "4096": 29.55, "8192": 60.24, "16384": 127.38},
+      "prefill_tps": {"1024": 131, "2048": 137, "4096": 139, "8192": 136, "16384": 129},
+      "decode_tps": {"1024": 7.0, "2048": 6.61, "4096": 5.99, "8192": 5.02, "16384": 3.85},
+      "engine_prefill_tps": {"1024": 142, "2048": 143, "4096": 142, "8192": 138, "16384": 130},
+      "engine_decode_tps": {"1024": 6.92, "2048": 6.53, "4096": 5.92, "8192": 4.95, "16384": 3.8},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    },
+    {
+      "model": "Qwen3.8 27B",
+      "tag": "qwen3.8:27b",
+      "quant": "q4nx",
+      "weights": "Q4_1 linears, Q8_0 lm_head and ssm_out, converted from a Q8_0 GGUF (OpenFlowLM's container); no MTP head",
+      "comparable_quants": ["Q4_K_M", "Q4_K_S"],
+      "ttft_s": {"1024": 26.13, "2048": 50.13, "4096": 98.97},
+      "prefill_tps": {"1024": 39, "2048": 41, "4096": 41},
+      "decode_tps": {"1024": 2.49, "2048": 2.4, "4096": 2.25},
+      "engine_prefill_tps": {"1024": 42, "2048": 42, "4096": 42},
+      "engine_decode_tps": {"1024": 2.45, "2048": 2.36, "4096": 2.22},
+      "notes": {"prefill_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}, "decode_tps": {"32768": "not measured: a run at this length would take OpenFlowLM over 5 minutes"}}
+    }
+  ]
+}

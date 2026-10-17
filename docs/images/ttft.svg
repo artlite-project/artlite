@@ -1,0 +1,302 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="927" viewBox="0 0 880 927" role="img" aria-labelledby="t d">
+<title id="t">Time to first token</title>
+<desc id="d">Both axes are logarithmic and equally scaled. The 45° diagonals are constant prefill speeds, so a curve's slope is how its time grows with the prompt (1: linear, 2: quadratic), and the vertical gap between two curves is a speed ratio.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#59636e;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#1f2328}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#1f2328}.lbl{font-size:12px;fill:#1f2328}.lbl2{font-size:12px}.strong{font-weight:600;fill:#1f2328}.muted{fill:#818b98}.small{font-size:10px}.halo{paint-order:stroke;stroke:#ffffff;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#eef1f4}.axis{stroke:#c8d1da}.guide{stroke:#d5dce3}.bracket{stroke:#59636e;fill:none}.ft{fill:#86b6ef}.f0{fill:#2a78d6}.l0{stroke:#2a78d6;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#2a78d6;stroke:#ffffff;stroke-width:1.5}.b0{fill:#2a78d6;fill-opacity:.16}.f1{fill:#eb6834}.l1{stroke:#eb6834;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#eb6834;stroke:#ffffff;stroke-width:1.5}.b1{fill:#eb6834;fill-opacity:.16}.f2{fill:#1baf7a}.l2{stroke:#1baf7a;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#1baf7a;stroke:#ffffff;stroke-width:1.5}.b2{fill:#1baf7a;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#ffffff;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
+<rect x="0.5" y="0.5" width="879" height="926" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<text x="24.0" y="40.0" class="title">Time to first token</text>
+<text x="24.0" y="59.0" class="sub">Both axes are logarithmic and equally scaled. The 45° diagonals are constant prefill speeds, so a curve's slope is how</text>
+<text x="24.0" y="78.0" class="sub">its time grows with the prompt (1: linear, 2: quadratic), and the vertical gap between two curves is a speed ratio.</text>
+<line x1="24.0" y1="105.0" x2="44.0" y2="105.0" class="l0"/>
+<circle cx="34" cy="105" r="3.5" class="d0"/>
+<text x="50.0" y="108.0" class="lbl">Artlite</text>
+<rect x="102.672" y="99" width="20" height="12" rx="2" class="b0"/>
+<text x="128.7" y="108.0" class="lbl">Artlite, the range of its quants</text>
+<line x1="306.8" y1="105.0" x2="326.8" y2="105.0" class="l1"/>
+<circle cx="316.756" cy="105" r="3.5" class="d1"/>
+<text x="332.8" y="108.0" class="lbl">FastFlowLM 1.0.7</text>
+<line x1="450.1" y1="105.0" x2="470.1" y2="105.0" class="l3"/>
+<circle cx="460.12" cy="105" r="3.5" class="d3"/>
+<text x="476.1" y="108.0" class="lbl">OpenFlowLM 0.1.0-99fe7e4</text>
+<text x="64.0" y="144.0" class="h">Llama 3.2 1B Instruct</text>
+<circle cx="67.5" cy="156.0" r="3.5" class="d0"/>
+<text x="74.0" y="160.0">Q4_1</text>
+<circle cx="116.4" cy="156.0" r="3.5" class="d1"/>
+<text x="122.9" y="160.0">q4nx</text>
+<circle cx="162.3" cy="156.0" r="3.5" class="d3"/>
+<text x="168.8" y="160.0">q4nx</text>
+<line x1="64.0" y1="424.5" x2="207.0" y2="424.5" class="grid"/>
+<text x="58.0" y="428.5" text-anchor="end">0.1 s</text>
+<line x1="64.0" y1="352.5" x2="207.0" y2="352.5" class="grid"/>
+<text x="58.0" y="356.5" text-anchor="end">1 s</text>
+<line x1="64.0" y1="280.5" x2="207.0" y2="280.5" class="grid"/>
+<text x="58.0" y="284.5" text-anchor="end">10 s</text>
+<line x1="64.0" y1="208.5" x2="207.0" y2="208.5" class="grid"/>
+<text x="58.0" y="212.5" text-anchor="end">100 s</text>
+<line x1="64.0" y1="214.3" x2="108.3" y2="170.0" class="guide"/>
+<line x1="64.0" y1="286.3" x2="180.3" y2="170.0" class="guide"/>
+<line x1="64.0" y1="358.2" x2="207.0" y2="215.2" class="guide"/>
+<line x1="64.1" y1="430.2" x2="207.0" y2="287.2" class="guide"/>
+<line x1="64.0" y1="430.2" x2="207.0" y2="430.2" class="axis"/>
+<line x1="64.0" y1="170.0" x2="64.0" y2="430.2" class="axis"/>
+<line x1="70.5" y1="430.2" x2="70.5" y2="434.2" class="axis"/>
+<text x="70.5" y="446.2" text-anchor="middle">1k</text>
+<line x1="92.2" y1="430.2" x2="92.2" y2="434.2" class="axis"/>
+<line x1="113.8" y1="430.2" x2="113.8" y2="434.2" class="axis"/>
+<text x="113.8" y="446.2" text-anchor="middle">4k</text>
+<line x1="135.5" y1="430.2" x2="135.5" y2="434.2" class="axis"/>
+<line x1="157.2" y1="430.2" x2="157.2" y2="434.2" class="axis"/>
+<text x="157.2" y="446.2" text-anchor="middle">16k</text>
+<line x1="178.8" y1="430.2" x2="178.8" y2="434.2" class="axis"/>
+<line x1="200.5" y1="430.2" x2="200.5" y2="434.2" class="axis"/>
+<text x="200.5" y="446.2" text-anchor="middle">64k</text>
+<polygon points="70.5,413.8 135.5,344.1 178.8,282.0 200.5,245.4 200.5,247.5 178.8,285.3 135.5,350.4 70.5,421.5" class="b0"/>
+<polyline points="70.5,363.7 92.2,351.3 113.8,332.9 135.5,306.4 157.2,276.1 178.8,242.2 200.5,205.0" class="l1"/>
+<circle cx="70.5" cy="363.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 0.700 s</title></circle>
+<circle cx="92.2" cy="351.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 1.04 s</title></circle>
+<circle cx="113.8" cy="332.9" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 1.87 s</title></circle>
+<circle cx="135.5" cy="306.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 4.37 s</title></circle>
+<circle cx="157.2" cy="276.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 11.5 s</title></circle>
+<circle cx="178.8" cy="242.2" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 34.1 s</title></circle>
+<circle cx="200.5" cy="205.0" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 112 s</title></circle>
+<polyline points="70.5,291.0 92.2,254.9 113.8,215.2" class="l3"/>
+<circle cx="70.5" cy="291.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 7.16 s</title></circle>
+<circle cx="92.2" cy="254.9" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 22.7 s</title></circle>
+<circle cx="113.8" cy="215.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 80.8 s</title></circle>
+<polyline points="70.5,421.5 135.5,350.4 178.8,285.2 200.5,247.4" class="l0"/>
+<circle cx="70.5" cy="421.5" r="3.5" class="d0"><title>Artlite Q4_1, 1k tokens: 0.110 s</title></circle>
+<circle cx="135.5" cy="350.4" r="3.5" class="d0"><title>Artlite Q4_1, 8k tokens: 1.07 s</title></circle>
+<circle cx="178.8" cy="285.2" r="3.5" class="d0"><title>Artlite Q4_1, 32k tokens: 8.60 s</title></circle>
+<circle cx="200.5" cy="247.4" r="3.5" class="d0"><title>Artlite Q4_1, 64k tokens: 28.8 s</title></circle>
+<text x="207.5" y="209.0" class="halo">112 s</text>
+<text x="120.8" y="219.2" class="halo">80.8 s</text>
+<text x="207.5" y="251.4" class="halo">28.8 s</text>
+<path d="M67.5,415.5h6M70.5,415.5V369.7M67.5,369.7h6" class="bracket"/>
+<text x="77.5" y="396.6" class="lbl halo">6.4×</text>
+<path d="M197.5,241.4h6M200.5,241.4V211.0M197.5,211.0h6" class="bracket"/>
+<text x="207.5" y="230.2" class="lbl halo">3.9×</text>
+<text x="83.6" y="191.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 83.6 191.8)">10 tok/s</text>
+<text x="117.6" y="246.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 117.6 246.8)">100 tok/s</text>
+<text x="98.3" y="321.1" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 98.3 321.1)">1k tok/s</text>
+<text x="192.6" y="315.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 192.6 315.8)">10k tok/s</text>
+<text x="265.0" y="144.0" class="h">Llama 3.2 3B Instruct</text>
+<circle cx="268.5" cy="156.0" r="3.5" class="d0"/>
+<text x="275.0" y="160.0">Q4_K_M</text>
+<circle cx="333.9" cy="156.0" r="3.5" class="d1"/>
+<text x="340.4" y="160.0">q4nx</text>
+<circle cx="379.8" cy="156.0" r="3.5" class="d3"/>
+<text x="386.3" y="160.0">q4nx</text>
+<line x1="265.0" y1="424.5" x2="408.0" y2="424.5" class="grid"/>
+<line x1="265.0" y1="352.5" x2="408.0" y2="352.5" class="grid"/>
+<line x1="265.0" y1="280.5" x2="408.0" y2="280.5" class="grid"/>
+<line x1="265.0" y1="208.5" x2="408.0" y2="208.5" class="grid"/>
+<line x1="265.0" y1="214.3" x2="309.3" y2="170.0" class="guide"/>
+<line x1="265.0" y1="286.3" x2="381.3" y2="170.0" class="guide"/>
+<line x1="265.0" y1="358.2" x2="408.0" y2="215.2" class="guide"/>
+<line x1="265.1" y1="430.2" x2="408.0" y2="287.2" class="guide"/>
+<line x1="265.0" y1="430.2" x2="408.0" y2="430.2" class="axis"/>
+<line x1="265.0" y1="170.0" x2="265.0" y2="430.2" class="axis"/>
+<line x1="271.5" y1="430.2" x2="271.5" y2="434.2" class="axis"/>
+<text x="271.5" y="446.2" text-anchor="middle">1k</text>
+<line x1="293.2" y1="430.2" x2="293.2" y2="434.2" class="axis"/>
+<line x1="314.8" y1="430.2" x2="314.8" y2="434.2" class="axis"/>
+<text x="314.8" y="446.2" text-anchor="middle">4k</text>
+<line x1="336.5" y1="430.2" x2="336.5" y2="434.2" class="axis"/>
+<line x1="358.2" y1="430.2" x2="358.2" y2="434.2" class="axis"/>
+<text x="358.2" y="446.2" text-anchor="middle">16k</text>
+<line x1="379.8" y1="430.2" x2="379.8" y2="434.2" class="axis"/>
+<line x1="401.5" y1="430.2" x2="401.5" y2="434.2" class="axis"/>
+<text x="401.5" y="446.2" text-anchor="middle">64k</text>
+<polygon points="271.5,385.3 336.5,316.5 379.8,257.9 379.8,262.0 336.5,323.4 271.5,393.7" class="b0"/>
+<polyline points="271.5,337.4 293.2,324.4 314.8,299.1 336.5,279.3 358.2,249.6 379.8,216.3 401.5,179.4" class="l1"/>
+<circle cx="271.5" cy="337.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 1.62 s</title></circle>
+<circle cx="293.2" cy="324.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 2.46 s</title></circle>
+<circle cx="314.8" cy="299.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 5.52 s</title></circle>
+<circle cx="336.5" cy="279.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 10.4 s</title></circle>
+<circle cx="358.2" cy="249.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 26.9 s</title></circle>
+<circle cx="379.8" cy="216.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 78.0 s</title></circle>
+<circle cx="401.5" cy="179.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 253 s</title></circle>
+<polyline points="271.5,267.2 293.2,231.2 314.8,190.8" class="l3"/>
+<circle cx="271.5" cy="267.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 15.3 s</title></circle>
+<circle cx="293.2" cy="231.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 48.4 s</title></circle>
+<circle cx="314.8" cy="190.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 176 s</title></circle>
+<polyline points="271.5,390.3 336.5,320.8 379.8,260.4" class="l0"/>
+<circle cx="271.5" cy="390.3" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.299 s</title></circle>
+<circle cx="336.5" cy="320.8" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 2.76 s</title></circle>
+<circle cx="379.8" cy="260.4" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 19.0 s</title></circle>
+<text x="408.5" y="183.4" class="halo">253 s</text>
+<text x="321.8" y="194.8" class="halo">176 s</text>
+<text x="386.8" y="264.4" class="halo">19.0 s</text>
+<path d="M268.5,384.3h6M271.5,384.3V343.4M268.5,343.4h6" class="bracket"/>
+<text x="278.5" y="367.8" class="lbl halo">5.4×</text>
+<path d="M376.8,254.4h6M379.8,254.4V222.3M376.8,222.3h6" class="bracket"/>
+<text x="386.8" y="242.4" class="lbl halo">4.1×</text>
+<text x="283.5" y="192.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 283.5 192.9)">10 tok/s</text>
+<text x="327.3" y="238.1" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 327.3 238.1)">100 tok/s</text>
+<text x="329.3" y="308.1" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 329.3 308.1)">1k tok/s</text>
+<text x="390.1" y="319.3" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 390.1 319.3)">10k tok/s</text>
+<text x="466.0" y="144.0" class="h">Llama 3.1 8B Instruct</text>
+<circle cx="469.5" cy="156.0" r="3.5" class="d0"/>
+<text x="476.0" y="160.0">Q4_K_M</text>
+<circle cx="534.9" cy="156.0" r="3.5" class="d1"/>
+<text x="541.4" y="160.0">q4nx*</text>
+<circle cx="585.0" cy="156.0" r="3.5" class="d3"/>
+<text x="591.5" y="160.0">q4nx</text>
+<line x1="466.0" y1="424.5" x2="609.0" y2="424.5" class="grid"/>
+<line x1="466.0" y1="352.5" x2="609.0" y2="352.5" class="grid"/>
+<line x1="466.0" y1="280.5" x2="609.0" y2="280.5" class="grid"/>
+<line x1="466.0" y1="208.5" x2="609.0" y2="208.5" class="grid"/>
+<line x1="466.0" y1="214.3" x2="510.3" y2="170.0" class="guide"/>
+<line x1="466.0" y1="286.3" x2="582.3" y2="170.0" class="guide"/>
+<line x1="466.0" y1="358.2" x2="609.0" y2="215.2" class="guide"/>
+<line x1="466.1" y1="430.2" x2="609.0" y2="287.2" class="guide"/>
+<line x1="466.0" y1="430.2" x2="609.0" y2="430.2" class="axis"/>
+<line x1="466.0" y1="170.0" x2="466.0" y2="430.2" class="axis"/>
+<line x1="472.5" y1="430.2" x2="472.5" y2="434.2" class="axis"/>
+<text x="472.5" y="446.2" text-anchor="middle">1k</text>
+<line x1="494.2" y1="430.2" x2="494.2" y2="434.2" class="axis"/>
+<line x1="515.8" y1="430.2" x2="515.8" y2="434.2" class="axis"/>
+<text x="515.8" y="446.2" text-anchor="middle">4k</text>
+<line x1="537.5" y1="430.2" x2="537.5" y2="434.2" class="axis"/>
+<line x1="559.2" y1="430.2" x2="559.2" y2="434.2" class="axis"/>
+<text x="559.2" y="446.2" text-anchor="middle">16k</text>
+<line x1="580.8" y1="430.2" x2="580.8" y2="434.2" class="axis"/>
+<line x1="602.5" y1="430.2" x2="602.5" y2="434.2" class="axis"/>
+<text x="602.5" y="446.2" text-anchor="middle">64k</text>
+<polygon points="472.5,366.1 537.5,295.7 580.8,236.5 580.8,237.2 537.5,297.1 472.5,367.8" class="b0"/>
+<polyline points="472.5,320.8 494.2,304.8 515.8,286.3 537.5,261.5 559.2,234.6 580.8,204.5" class="l1"/>
+<circle cx="472.5" cy="320.8" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 2.76 s</title></circle>
+<circle cx="494.2" cy="304.8" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 4.60 s</title></circle>
+<circle cx="515.8" cy="286.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 8.30 s</title></circle>
+<circle cx="537.5" cy="261.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 18.4 s</title></circle>
+<circle cx="559.2" cy="234.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 43.4 s</title></circle>
+<circle cx="580.8" cy="204.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 114 s</title></circle>
+<polyline points="472.5,254.0 494.2,219.6 515.8,180.8" class="l3"/>
+<circle cx="472.5" cy="254.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 23.3 s</title></circle>
+<circle cx="494.2" cy="219.6" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 70.1 s</title></circle>
+<circle cx="515.8" cy="180.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 243 s</title></circle>
+<polyline points="472.5,366.1 537.5,295.7 580.8,236.5" class="l0"/>
+<circle cx="472.5" cy="366.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.648 s</title></circle>
+<circle cx="537.5" cy="295.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 6.16 s</title></circle>
+<circle cx="580.8" cy="236.5" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 40.9 s</title></circle>
+<text x="522.8" y="184.8" class="halo">243 s</text>
+<text x="587.8" y="208.5" class="halo">114 s</text>
+<text x="587.8" y="240.5" class="halo">40.9 s</text>
+<path d="M469.5,360.1h6M472.5,360.1V326.8M469.5,326.8h6" class="bracket"/>
+<text x="479.5" y="347.4" class="lbl halo">4.3×</text>
+<path d="M577.8,230.5h6M580.8,230.5V210.5M577.8,210.5h6" class="bracket"/>
+<text x="587.8" y="224.5" class="lbl halo">2.8×</text>
+<text x="484.5" y="192.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 484.5 192.9)">10 tok/s</text>
+<text x="513.8" y="252.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 513.8 252.6)">100 tok/s</text>
+<text x="503.9" y="317.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 503.9 317.5)">1k tok/s</text>
+<text x="594.6" y="315.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 594.6 315.8)">10k tok/s</text>
+<text x="667.0" y="144.0" class="h">Gemma 4 E4B it</text>
+<circle cx="670.5" cy="156.0" r="3.5" class="d0"/>
+<text x="677.0" y="160.0">Q4_0</text>
+<circle cx="719.4" cy="156.0" r="3.5" class="d1"/>
+<text x="725.9" y="160.0">q4nx</text>
+<line x1="667.0" y1="424.5" x2="810.0" y2="424.5" class="grid"/>
+<line x1="667.0" y1="352.5" x2="810.0" y2="352.5" class="grid"/>
+<line x1="667.0" y1="280.5" x2="810.0" y2="280.5" class="grid"/>
+<line x1="667.0" y1="208.5" x2="810.0" y2="208.5" class="grid"/>
+<line x1="667.0" y1="214.3" x2="711.3" y2="170.0" class="guide"/>
+<line x1="667.0" y1="286.3" x2="783.3" y2="170.0" class="guide"/>
+<line x1="667.0" y1="358.2" x2="810.0" y2="215.2" class="guide"/>
+<line x1="667.1" y1="430.2" x2="810.0" y2="287.2" class="guide"/>
+<line x1="667.0" y1="430.2" x2="810.0" y2="430.2" class="axis"/>
+<line x1="667.0" y1="170.0" x2="667.0" y2="430.2" class="axis"/>
+<line x1="673.5" y1="430.2" x2="673.5" y2="434.2" class="axis"/>
+<text x="673.5" y="446.2" text-anchor="middle">1k</text>
+<line x1="695.2" y1="430.2" x2="695.2" y2="434.2" class="axis"/>
+<line x1="716.8" y1="430.2" x2="716.8" y2="434.2" class="axis"/>
+<text x="716.8" y="446.2" text-anchor="middle">4k</text>
+<line x1="738.5" y1="430.2" x2="738.5" y2="434.2" class="axis"/>
+<line x1="760.2" y1="430.2" x2="760.2" y2="434.2" class="axis"/>
+<text x="760.2" y="446.2" text-anchor="middle">16k</text>
+<line x1="781.8" y1="430.2" x2="781.8" y2="434.2" class="axis"/>
+<line x1="803.5" y1="430.2" x2="803.5" y2="434.2" class="axis"/>
+<text x="803.5" y="446.2" text-anchor="middle">64k</text>
+<polyline points="673.5,321.1 695.2,308.7 716.8,292.9 738.5,269.7 760.2,243.6 781.8,217.2 803.5,186.6" class="l1"/>
+<circle cx="673.5" cy="321.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 2.73 s</title></circle>
+<circle cx="695.2" cy="308.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 4.06 s</title></circle>
+<circle cx="716.8" cy="292.9" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 6.74 s</title></circle>
+<circle cx="738.5" cy="269.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 14.1 s</title></circle>
+<circle cx="760.2" cy="243.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 32.6 s</title></circle>
+<circle cx="781.8" cy="217.2" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 75.7 s</title></circle>
+<circle cx="803.5" cy="186.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 202 s</title></circle>
+<polyline points="673.5,382.8 738.5,322.3 781.8,272.6 803.5,242.5" class="l0"/>
+<circle cx="673.5" cy="382.8" r="3.5" class="d0"><title>Artlite Q4_0, 1k tokens: 0.380 s</title></circle>
+<circle cx="738.5" cy="322.3" r="3.5" class="d0"><title>Artlite Q4_0, 8k tokens: 2.63 s</title></circle>
+<circle cx="781.8" cy="272.6" r="3.5" class="d0"><title>Artlite Q4_0, 32k tokens: 12.9 s</title></circle>
+<circle cx="803.5" cy="242.5" r="3.5" class="d0"><title>Artlite Q4_0, 64k tokens: 33.7 s</title></circle>
+<text x="810.5" y="190.6" class="halo">202 s</text>
+<text x="810.5" y="246.5" class="halo">33.7 s</text>
+<path d="M670.5,376.8h6M673.5,376.8V327.1M670.5,327.1h6" class="bracket"/>
+<text x="680.5" y="355.9" class="lbl halo">7.2×</text>
+<path d="M800.5,236.5h6M803.5,236.5V192.6M800.5,192.6h6" class="bracket"/>
+<text x="810.5" y="218.6" class="lbl halo">6.0×</text>
+<text x="685.5" y="192.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 685.5 192.9)">10 tok/s</text>
+<text x="697.6" y="252.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 697.6 252.9)">100 tok/s</text>
+<text x="734.8" y="304.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 734.8 304.5)">1k tok/s</text>
+<text x="695.6" y="415.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 695.6 415.8)">10k tok/s</text>
+<text x="437.0" y="466.2" text-anchor="middle" class="muted">prompt length, tokens</text>
+<text x="64.0" y="500.2" class="h">Qwen3.8 27B</text>
+<circle cx="67.5" cy="512.2" r="3.5" class="d0"/>
+<text x="74.0" y="516.2">Q4_K_M</text>
+<circle cx="132.9" cy="512.2" r="3.5" class="d1"/>
+<text x="139.4" y="516.2">1.0.9 q4nx</text>
+<circle cx="206.3" cy="512.2" r="3.5" class="d3"/>
+<text x="212.8" y="516.2">q4nx</text>
+<line x1="64.0" y1="780.7" x2="207.0" y2="780.7" class="grid"/>
+<text x="58.0" y="784.7" text-anchor="end">0.1 s</text>
+<line x1="64.0" y1="708.7" x2="207.0" y2="708.7" class="grid"/>
+<text x="58.0" y="712.7" text-anchor="end">1 s</text>
+<line x1="64.0" y1="636.7" x2="207.0" y2="636.7" class="grid"/>
+<text x="58.0" y="640.7" text-anchor="end">10 s</text>
+<line x1="64.0" y1="564.7" x2="207.0" y2="564.7" class="grid"/>
+<text x="58.0" y="568.7" text-anchor="end">100 s</text>
+<line x1="64.0" y1="570.4" x2="108.3" y2="526.2" class="guide"/>
+<line x1="64.0" y1="642.4" x2="180.3" y2="526.2" class="guide"/>
+<line x1="64.0" y1="714.4" x2="207.0" y2="571.4" class="guide"/>
+<line x1="64.1" y1="786.3" x2="207.0" y2="643.4" class="guide"/>
+<line x1="64.0" y1="786.3" x2="207.0" y2="786.3" class="axis"/>
+<line x1="64.0" y1="526.2" x2="64.0" y2="786.3" class="axis"/>
+<line x1="70.5" y1="786.3" x2="70.5" y2="790.3" class="axis"/>
+<text x="70.5" y="802.3" text-anchor="middle">1k</text>
+<line x1="92.2" y1="786.3" x2="92.2" y2="790.3" class="axis"/>
+<line x1="113.8" y1="786.3" x2="113.8" y2="790.3" class="axis"/>
+<text x="113.8" y="802.3" text-anchor="middle">4k</text>
+<line x1="135.5" y1="786.3" x2="135.5" y2="790.3" class="axis"/>
+<line x1="157.2" y1="786.3" x2="157.2" y2="790.3" class="axis"/>
+<text x="157.2" y="802.3" text-anchor="middle">16k</text>
+<line x1="178.8" y1="786.3" x2="178.8" y2="790.3" class="axis"/>
+<line x1="200.5" y1="786.3" x2="200.5" y2="790.3" class="axis"/>
+<text x="200.5" y="802.3" text-anchor="middle">64k</text>
+<polyline points="70.5,639.7 92.2,619.5 113.8,598.3 134.5,576.9" class="l1"/>
+<circle cx="70.5" cy="639.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 9.08 s</title></circle>
+<circle cx="92.2" cy="619.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 17.3 s</title></circle>
+<circle cx="113.8" cy="598.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 34.2 s</title></circle>
+<circle cx="134.5" cy="576.9" r="3.5" class="d1"><title>FastFlowLM q4nx, 7936 tokens: 67.7 s</title></circle>
+<polyline points="70.5,606.7 92.2,586.3 113.8,565.0" class="l3"/>
+<circle cx="70.5" cy="606.7" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 26.1 s</title></circle>
+<circle cx="92.2" cy="586.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 50.1 s</title></circle>
+<circle cx="113.8" cy="565.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 99.0 s</title></circle>
+<polyline points="70.5,680.0 135.5,613.6 178.8,563.5 200.5,534.8" class="l0"/>
+<circle cx="70.5" cy="680.0" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 2.50 s</title></circle>
+<circle cx="135.5" cy="613.6" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 20.9 s</title></circle>
+<circle cx="178.8" cy="563.5" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 104 s</title></circle>
+<circle cx="200.5" cy="534.8" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 260 s</title></circle>
+<text x="207.5" y="538.8" class="halo">260 s</text>
+<text x="120.8" y="569.0" class="halo">99.0 s</text>
+<text x="141.5" y="582.0" class="halo">67.7 s</text>
+<path d="M67.5,674.0h6M70.5,674.0V645.7M67.5,645.7h6" class="bracket"/>
+<text x="77.5" y="663.9" class="lbl halo">3.6×</text>
+<text x="86.9" y="544.7" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 86.9 544.7)">10 tok/s</text>
+<text x="106.2" y="597.4" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 106.2 597.4)">100 tok/s</text>
+<text x="164.0" y="628.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 164.0 628.5)">1k tok/s</text>
+<text x="92.6" y="772.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 92.6 772.0)">10k tok/s</text>
+<text x="135.5" y="822.3" text-anchor="middle" class="muted">prompt length, tokens</text>
+<text x="24.0" y="850.3">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
+<text x="24.0" y="866.3">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
+<text x="24.0" y="882.3">* DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
+<text x="24.0" y="898.3">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
+</svg>

@@ -1,0 +1,514 @@
+"""sd15_v2's UNet blocks on a ``build.Builder`` (the 16x16 / 8x8 levels: resnets, transformers, down / upsampling).
+
+A block takes its input as a C-tile tensor in the memtile with the GroupNorm records its first norm needs, and returns
+its output the same way (records in the layout its consumer asks for: ``stats`` = (group size, channel offset) of the
+consumer's GroupNorm, a concatenation's second part at its offset). Weights by diffusers name (``w[p + ...]``).
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from ml_dtypes import bfloat16
+
+from ..design import COLS
+from ..overlay.runtime import Transaction
+from ..sd15 import overlay as old
+from . import design as D
+from . import layout as L
+from .build import TBIAS, Builder, Level, Records
+from .ops import Apply, Attention, Gemm
+from .runtime import V2Device
+from .seq import ColOps, MemTask
+
+
+@dataclass
+class Tensor:
+    """A tensor of a level in the memtile: C tiles (kind "ct") or panels ("pn") of C channels at ``addr``; its
+    GroupNorm records for the next norm (``rec``)."""
+
+    lv: Level
+    C: int
+    addr: int
+    kind: str = "ct"
+    rec: list[Records] | None = None
+    pnp: int = 0  # (panels: token panels per kb, if not the level's: a GEGLU output's padding)
+
+    @property
+    def np(self) -> int:
+        return self.pnp or self.lv.np
+
+    @property
+    def nbytes(self) -> int:
+        return self.lv.ct(self.C) if self.kind == "ct" else self.C // 8 * self.np * 72
+
+
+def alloc(bd: Builder, lv: Level, C: int, kind: str = "ct", pnp: int = 0, top: bool = False) -> Tensor:
+    t = Tensor(lv, C, 0, kind, pnp=pnp)
+    t.addr = bd.mem.alloc(t.nbytes, top=top)
+    return t
+
+
+def free(bd: Builder, t: Tensor) -> None:
+    bd.mem.release(t.addr, t.nbytes)
+
+
+def silu_table(bd: Builder) -> None:
+    bd.table("silu", old.silu_table(), rows=D.APPLY_ROWS)
+
+
+def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, eps: float,
+             silu: bool, y_kb0: int = 0, ch0: int = 0, ccat: int = 0, extra: dict | None = None) -> None:
+    """GroupNorm (32 groups, + SiLU) of x into the panels y (from kb y_kb0). x may be the part [ch0, ch0 + x.C) of a
+    concatenation of ccat channels (its records in that space; gamma, beta: the part's). Ops of the apply rows' two
+    cores, each within one record window: a window per core, or a window's halves (extra: col ops merged into the
+    first)."""
+    C = ccat or x.C
+    gs = C // 32
+    win = 16 * gs
+    lo, hi = ch0, ch0 + x.C
+    pieces = []
+    for a in range(lo // win * win, hi, win):
+        pieces.append((max(a, lo), min(a + win, hi)))
+    sizes = {b - a for a, b in pieces}
+    if len(pieces) == 2 and len(sizes) == 1 and sizes.pop() <= 640:
+        ops = [(pieces[0][0], (pieces[0][1] - pieces[0][0]) // 80)]  # (a core per window)
+    else:
+        ops = [(a, (b - a) // 160) for a, b in pieces]  # (a window's halves)
+        assert all(2 * n * 80 == b - a and n * 80 <= 640 for (a, b), (_, n) in zip(pieces, ops, strict=True)), pieces
+    if silu:
+        silu_table(bd)
+    for k, (a, nblk) in enumerate(ops):
+        ap = Apply(m=x.lv.m, nblk=nblk, mode="gnsilu" if silu else "gn", x=x.addr, y=y.addr,
+                   blk0=(a - ch0) // 80, y_kb0=y_kb0 + (a - ch0) // 8, y_np=y.np, gsize=gs, ch_off=a,
+                   tokens=x.lv.H ** 2, eps=eps)
+        bd.apply(ap, gamma, beta, name=f"{name}.{k}", records=x.rec, extra=extra if k == 0 else None)
+
+
+def conv(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor, *, name: str, out: Tensor, stride: int = 1,
+         res: Tensor | None = None, stats: tuple[int, int] | None = None, tbias: str | None = None) -> None:
+    """A 3x3 conv of the panels x into the C tiles out (+ res), out's records for ``stats``; tbias: the resnet whose
+    time bias b includes (``Builder.gemm``: rewritten per step)."""
+    lv = out.lv
+    N = w.shape[0]
+    kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": N, "x": x.addr, "y": out.addr, "out": "bf16", "conv": stride, "R": lv.R, "Lg": lv.Lg,
+              "zero": bd.zero, "x_np": x.np}
+    rec = bd.mem.alloc(4 * D.OCH, top=True) if stats else None
+    if stats:
+        kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
+    bd.gemm(Gemm(**kw, res=res.addr if res is not None else None), w, b, name=name, tbias=tbias)
+    if stats:
+        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0])]
+
+
+def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, name: str, out: Tensor,
+         res: Tensor | None = None, stats: tuple[int, int] | None = None, kind: str = "bf16", ln: bool = False,
+         split: int = 1, extra: dict | None = None) -> int:
+    """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu"), + res;
+    out's GroupNorm records for ``stats``; ln: LayerNorm records, returns their memtile address (the caller frees
+    ``LN_REC`` bytes after the apply). split: ops of npass / split passes (a lock counts a GEMM's sends to 63).
+    extra: col ops (fills / drains) merged into the first op."""
+    lv = out.lv
+    kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": w.shape[0], "x": x.addr, "y": out.addr, "out": kind,
+          "res": res.addr if res else None, "x_np": x.np, "y_np": out.np if kind != "bf16" else None}
+    rec = bd.mem.alloc(LN_REC if ln else 4 * D.OCH, top=not ln) if stats or ln else 0  # (LN: its apply's walk reads on)
+    if stats:
+        kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
+    elif ln:
+        kw.update(stats="ln", rec=rec)
+    assert split == 1 or not (stats or ln)
+    npass = w.shape[0] // 320
+    for k in range(split):
+        part = {} if split == 1 else {"p0": k * npass // split, "npo": npass // split}
+        bd.gemm(Gemm(**kw, **part), w.flatten(1), b, name=name if split == 1 else f"{name}.{k}", extra=extra if k == 0 else None)
+    if stats:
+        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=w.shape[0] // 4, gsize=stats[0])]
+    return rec
+
+
+LN_REC = 4 * D.OCH  # (a tile's LayerNorm records: [core][OCH])
+
+
+def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels: Tensor | None = None,
+               extra: dict | None = None) -> list[Records]:
+    """GroupNorm records of the C tiles x for ``st`` (a copy op: K 0, x as the residual), optionally its panels (extra:
+    col ops merged into it)."""
+    lv = x.lv
+    rec = bd.mem.alloc(4 * D.OCH, top=True)
+    y = panels.addr if panels is not None else bd.mem.alloc(lv.pn(x.C))
+    g = Gemm(m=lv.m, ntile=1, K=0, N=x.C, x=0, y=y, out="bfp16", res=x.addr, stats="gn", rec=rec, gsize=st[0],
+             ch_off=st[1])
+    bd.gemm(g, None, None, name=name, extra=extra)
+    if panels is None:
+        bd.mem.release(y, lv.pn(x.C))
+    r = bd.records(rec, name=f"{name}.rec", ch_off=st[1], nr=x.C // 4, gsize=st[0])
+    return [r]
+
+
+def plain(bd: Builder, x: Tensor, y: Tensor, *, name: str) -> None:
+    """The C tiles x as panels y: a copy (K 0, x as the residual) on every core row."""
+    bd.gemm(Gemm(m=x.lv.m, ntile=1, K=0, N=x.C, x=0, y=y.addr, out="bfp16", res=x.addr, y_np=y.np), None, None, name=name)
+
+
+def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: torch.Tensor, eps: float,
+           stats: tuple[int, int] | None) -> Tensor:
+    """diffusers' ResnetBlock2D: GN1 + SiLU, conv1 (+ the time bias), GN2 + SiLU, conv2 + x (or its 1x1 shortcut).
+    x: C tiles with records for GN1 (freed); returns the output C tiles with records for ``stats``."""
+    lv = x.lv
+    p1 = alloc(bd, lv, x.C, "pn")
+    gn_apply(bd, x, p1, w[p + "norm1.weight"], w[p + "norm1.bias"], name=p + "norm1", eps=eps, silu=True)
+    h = alloc(bd, lv, cout)
+    conv(bd, p1, w[p + "conv1.weight"], w[p + "conv1.bias"] + time_bias, name=p + "conv1", out=h,
+         stats=(cout // 32, 0), tbias=p)
+    free(bd, p1)
+    sc = x
+    if p + "conv_shortcut.weight" in w:
+        px = alloc(bd, lv, x.C, "pn")
+        plain(bd, x, px, name=p + "xpn")
+        sc = alloc(bd, lv, cout)
+        gemm(bd, px, w[p + "conv_shortcut.weight"], w[p + "conv_shortcut.bias"], name=p + "conv_shortcut", out=sc)
+        free(bd, px)
+        free(bd, x)
+    p2 = alloc(bd, lv, cout, "pn")
+    gn_apply(bd, h, p2, w[p + "norm2.weight"], w[p + "norm2.bias"], name=p + "norm2", eps=eps, silu=True)
+    free(bd, h)
+    conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sc, res=sc, stats=stats)
+    free(bd, p2)
+    return sc
+
+
+
+LOG2E = 1.4426950408889634
+
+
+def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
+    """LayerNorm of the C tiles h (records at rec: its producer's) into the panels y; frees rec."""
+    a = Apply(m=h.lv.m, nblk=h.C // 160, mode="ln", x=h.addr, y=y.addr, rec=rec, C=h.C, y_np=y.np)
+    bd.apply(a, gamma, beta, name=name)
+    bd.mem.release(rec, LN_REC)
+
+
+def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0) -> Tensor:
+    """Attention of the panels q (scaled queries) on the K / V^T slots at DDR kv: the output panels."""
+    o = alloc(bd, q.lv, q.C, "pn")
+    at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys)
+    cmd = bd.image(name, at.command())
+    bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
+    return o
+
+
+def transformer(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, ctx_kv: int, nctx: int,
+                stats: tuple[int, int] | None, spill: bool) -> Tensor:
+    """diffusers' Transformer2DModel of SD 1.x (one BasicTransformerBlock, 8 heads): GN -> proj_in -> + attn1 (LN1) ->
+    + attn2 (LN2; the context's K / V^T slots at DDR ctx_kv, nctx keys) -> + GEGLU feed-forward (LN3) -> proj_out + x.
+    kv: a DDR buffer for the self-attention's slots; spill: x in DDR during the block (16x16: the memtile)."""
+    lv, C = x.lv, x.C
+    q = p + "transformer_blocks.0."
+    pg = alloc(bd, lv, C, "pn")
+    gn_apply(bd, x, pg, w[p + "norm.weight"], w[p + "norm.bias"], name=p + "norm", eps=1e-6, silu=False,
+             extra=bd.spill(p + "x", x.addr, x.nbytes) if spill else None)
+    if spill:
+        free(bd, x)
+    h = alloc(bd, lv, C)
+    rec = gemm(bd, pg, w[p + "proj_in.weight"], w[p + "proj_in.bias"], name=p + "proj_in", out=h, ln=True)
+    free(bd, pg)
+    for k, a in enumerate(("attn1", "attn2")):
+        n = alloc(bd, lv, C, "pn")
+        ln_apply(bd, h, n, w[q + f"norm{k + 1}.weight"], w[q + f"norm{k + 1}.bias"], name=q + f"norm{k + 1}", rec=rec)
+        vdr = None
+        if a == "attn1":  # (K, V^T first, drained to DDR during the next GEMMs: K's with V's, V^T's with Q's)
+            kt, vt = alloc(bd, lv, C, "pn"), alloc(bd, lv, C, "pn")
+            at = Attention(np=lv.np, q=0, o=0, kv=kv)
+            gemm(bd, n, w[q + a + ".to_k.weight"], None, name=q + a + ".to_k", out=kt, kind="bfp16")
+            gemm(bd, n, w[q + a + ".to_v.weight"], None, name=q + a + ".to_v", out=vt, kind="vt",
+                 extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k") for c in range(COLS)})
+            free(bd, kt)
+            vdr = {c: at.kv_drains(kt.addr, vt.addr, c, part="v") for c in range(COLS)}
+        qt = alloc(bd, lv, C, "pn")
+        gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / 160 ** 0.5), None, name=q + a + ".to_q", out=qt, kind="bfp16",
+             extra=vdr)
+        if vdr:
+            bd.s.ddr_sync()
+            free(bd, vt)
+        free(bd, n)
+        o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx)
+        free(bd, qt)
+        rec = gemm(bd, o, w[q + a + ".to_out.0.weight"], w[q + a + ".to_out.0.bias"], name=q + a + ".to_out", out=h,
+                   res=h, ln=True)
+        free(bd, o)
+    n = alloc(bd, lv, C, "pn")
+    ln_apply(bd, h, n, w[q + "norm3.weight"], w[q + "norm3.bias"], name=q + "norm3", rec=rec)
+    bd.table("gelu", old._gelu_table()[0])
+    w1, b1, w2, b2 = (w[q + "ff.net.0.proj.weight"], w[q + "ff.net.0.proj.bias"], w[q + "ff.net.2.weight"],
+                      w[q + "ff.net.2.bias"])
+    hid = w1.shape[0] // 2
+    half = hid // 2
+    junk = 2 if lv.m == 16 else 0
+    h4 = None
+    for k in range(2):  # (the hidden channels in halves: the GEGLU output of all of them does not fit the memtile)
+        g = alloc(bd, lv, half, "pn", pnp=lv.np + junk)
+        rows = torch.cat([w1[k * half:(k + 1) * half], w1[hid + k * half:hid + (k + 1) * half]])
+        bias = torch.cat([b1[k * half:(k + 1) * half], b1[hid + k * half:hid + (k + 1) * half]])
+        gemm(bd, n, rows, bias, name=q + f"ff1.{k}", out=g, kind="geglu", split=2)
+        if k == 1:
+            free(bd, n)
+            h4 = alloc(bd, lv, C, "pn")
+        gemm(bd, g, w2[:, k * half:(k + 1) * half], b2 if k == 0 else None, name=q + f"ff2.{k}",
+             out=h if k == 0 else h4, res=h, kind="bf16" if k == 0 else "bfp16")
+        free(bd, g)
+    free(bd, h)
+    if spill:
+        x = alloc(bd, lv, C)
+        bd.op(bd.load(p + "x", x.addr, x.nbytes), {})
+    gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=x, res=x, stats=stats)
+    free(bd, h4)
+    return x
+
+
+@dataclass
+class Skip:
+    """A skip connection for the up path: parked in DDR (its C tiles: image ``ct``, its plain panels: ``pn``, the up
+    path's shortcut input, and records in the up path's concatenation's group space), or resident (``ps``: the plain
+    panels, ``pb``: the concatenation's GroupNorm + SiLU of the skip's channels, applied when the skip is made: no group
+    straddles the concatenation, so its records suffice)."""
+
+    lv: Level
+    C: int
+    ct: str = ""
+    pn: str = ""
+    rec: list[Records] | None = None
+    ps: Tensor | None = None
+    pb: Tensor | None = None
+
+
+def make_skip(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], norm: tuple | None = None,
+              defer: bool = True) -> Skip:
+    """The C tiles x (kept in the memtile) as a skip: st = (group size, channel offset) of its concatenation. norm =
+    (gamma, beta, eps) of the concatenation's channels of the skip: a resident skip (``Skip.pb``). Else parked in DDR:
+    x's C tiles drained with the copy, its panels with the next op (defer: at the heap's top, so that their release
+    leaves no hole between the next ops' tensors; else an op of their own: the next op's outputs need their bytes)."""
+    pn = alloc(bd, x.lv, x.C, "pn", top=norm is None and defer)
+    rec = copy_stats(bd, x, name=name + ".st", st=st, panels=pn,
+                     extra=bd.spill(name + ".ct", x.addr, x.nbytes) if norm is None else None)
+    if norm is not None:
+        assert st[1] % st[0] == 0, "a group straddles the concatenation"
+        g, b, eps = norm
+        pb = alloc(bd, x.lv, x.C, "pn")
+        gn_apply(bd, Tensor(x.lv, x.C, x.addr, rec=rec), pb, g, b, name=name + ".norm", eps=eps, silu=True, ch0=st[1],
+                 ccat=st[1] + x.C)
+        return Skip(x.lv, x.C, ps=pn, pb=pb)
+    if defer:
+        bd.defer(bd.spill(name + ".pn", pn.addr, pn.nbytes), release=[(pn.addr, pn.nbytes)])
+    else:
+        bd.op(bd.spill(name + ".pn", pn.addr, pn.nbytes), {})
+        free(bd, pn)
+    return Skip(x.lv, x.C, name + ".ct", name + ".pn", rec)
+
+
+def resnet_cat(bd: Builder, w: dict, p: str, h: Tensor, skip: Skip, *, cout: int, time_bias: torch.Tensor,
+               eps: float, stats: tuple[int, int] | None) -> Tensor:
+    """A resnet of the up path on the concatenation [h | skip] (h: C tiles with records in the concatenation's group
+    space): conv1 and the 1x1 shortcut in two K-chunks (h's, the skip's), the partials in the residual stream; ordered
+    so that 16x16 fits the memtile (conv1's partial parked in DDR, drained with the next op; the skip's panels loaded
+    with the shortcut's first GEMM; at 8x8 conv1's partial and a resident skip stay)."""
+    lv, ch, cs = h.lv, h.C, skip.C
+    C = ch + cs
+    park = lv.H > 8
+    w1, wsc = w[p + "conv1.weight"], w[p + "conv_shortcut.weight"]
+    g1, b1 = w[p + "norm1.weight"], w[p + "norm1.bias"]
+    recs = (h.rec or []) + (skip.rec or [])
+    h.rec = recs
+    pa = alloc(bd, lv, ch, "pn")
+    gn_apply(bd, h, pa, g1[:ch], b1[:ch], name=p + "norm1.h", eps=eps, silu=True, ccat=C)
+    c1 = alloc(bd, lv, cout)
+    conv(bd, pa, w1[:, :ch], w[p + "conv1.bias"] + time_bias, name=p + "conv1.h", out=c1, tbias=p)
+    free(bd, pa)
+    if park:
+        bd.defer(bd.spill(p + "c1", c1.addr, c1.nbytes), release=[(c1.addr, c1.nbytes)])
+    ph = alloc(bd, lv, ch, "pn")
+    plain(bd, h, ph, name=p + "hpn")
+    free(bd, h)
+    sc = alloc(bd, lv, cout)
+    ps, fill = skip.ps, None
+    if ps is None:
+        ps = alloc(bd, lv, cs, "pn")
+        fill = bd.load(skip.pn, ps.addr, ps.nbytes)
+    gemm(bd, ph, wsc[:, :ch], w[p + "conv_shortcut.bias"], name=p + "conv_shortcut.h", out=sc, extra=fill)
+    free(bd, ph)
+    gemm(bd, ps, wsc[:, ch:], None, name=p + "conv_shortcut.s", out=sc, res=sc)
+    free(bd, ps)
+    pb = skip.pb
+    if pb is None:
+        sk = alloc(bd, lv, cs)
+        sk.rec = recs
+        bd.op(bd.load(skip.ct, sk.addr, sk.nbytes), {})
+        pb = alloc(bd, lv, cs, "pn")
+        gn_apply(bd, sk, pb, g1[ch:], b1[ch:], name=p + "norm1.s", eps=eps, silu=True, ch0=ch, ccat=C)
+        free(bd, sk)
+    if park:
+        c1 = alloc(bd, lv, cout)
+        bd.op(bd.load(p + "c1", c1.addr, c1.nbytes), {})
+    conv(bd, pb, w1[:, ch:], None, name=p + "conv1.s", out=c1, res=c1, stats=(cout // 32, 0))
+    free(bd, pb)
+    p2 = alloc(bd, lv, cout, "pn")
+    gn_apply(bd, c1, p2, w[p + "norm2.weight"], w[p + "norm2.bias"], name=p + "norm2", eps=eps, silu=True)
+    free(bd, c1)
+    conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sc, res=sc, stats=stats)
+    free(bd, p2)
+    return sc
+
+
+def downsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] | None) -> Tensor:
+    """The stride-2 conv of the C tiles x (16x16) to the next level's C tiles (x kept)."""
+    px = alloc(bd, x.lv, x.C, "pn")
+    plain(bd, x, px, name=p + "xpn")
+    y = alloc(bd, Level(x.lv.H // 2), w[p + "conv.weight"].shape[0])
+    conv(bd, px, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv", out=y, stride=2, stats=stats)
+    free(bd, px)
+    return y
+
+
+def upsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] | None) -> Tensor:
+    """Nearest 2x of the C tiles x, then the conv (x freed): the upsampled panels via DDR (16x16 column c's rows are
+    8x8 row c: each panel (row, group, image) is the 8x8 panel (image), x = g + 2 lane), the conv on the next level."""
+    lv2 = Level(2 * x.lv.H)
+    px = alloc(bd, x.lv, x.C, "pn")
+    plain(bd, x, px, name=p + "xpn")
+    free(bd, x)
+    nb = px.nbytes
+    bd.op(bd.spill(p + "up", px.addr, nb), {})
+    bd.s.ddr_sync()
+    free(bd, px)
+    u = alloc(bd, lv2, x.C, "pn")
+    base = bd.v2.address(p + "up")
+    cols = {c: ColOps(fills=[MemTask([{"addr": u.addr + (2 * r + g) * 2 * L.PANEL, "nwords": nb // 4,
+                                       "dims": [(36, 1), (x.C // 8, lv2.np * 18)]}], ddr=(base + c * nb, nb, None))
+                             for r in range(2) for g in range(2)]) for c in range(COLS)}
+    bd.op(cols, {})
+    y = alloc(bd, lv2, w[p + "conv.weight"].shape[0])
+    conv(bd, u, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv", out=y, stats=stats)
+    free(bd, u)
+    return y
+
+
+CTX_KEYS = 77  # (the text context's tokens)
+
+
+def section(bd: Builder, w: dict, x6: Tensor, *, biases: dict[str, torch.Tensor], ctx_kv: dict[str, int], kv: int,
+            eps: float) -> Tensor:
+    """The UNet's 16x16 / 8x8 levels: down_blocks.2 (2 resnets + transformers, the downsampler), down_blocks.3 (2
+    resnets), the mid block, up_blocks.0 (3 resnets on concatenations, the upsampler), up_blocks.1 (3 resnets on
+    concatenations + transformers), from x6 (16x16 C tiles, 640 channels: down_blocks.1's downsampler output) to
+    up_blocks.1's output (16x16 C tiles, 1280). biases: the resnets' time biases; ctx_kv: per transformer prefix the
+    DDR address of its context's K / V^T slots; kv: a DDR buffer for the self-attention slots (16x16's size)."""
+
+    def res(p: str, h: Tensor, st: tuple[int, int] | None) -> Tensor:
+        return resnet(bd, w, p, h, cout=1280, time_bias=biases[p], eps=eps, stats=st)
+
+    def cat(p: str, h: Tensor, s: Skip, st: tuple[int, int] | None) -> Tensor:
+        return resnet_cat(bd, w, p, h, s, cout=1280, time_bias=biases[p], eps=eps, stats=st)
+
+    def tr(p: str, h: Tensor, st: tuple[int, int] | None) -> Tensor:
+        return transformer(bd, w, p, h, kv=kv, ctx_kv=ctx_kv[p], nctx=CTX_KEYS, stats=st, spill=h.lv.H == 16)
+
+    x6.rec = copy_stats(bd, x6, name="x6.st", st=(20, 0))
+    s6 = make_skip(bd, x6, name="s6", st=(60, 1280), defer=False)
+    d2 = "down_blocks.2."
+    x = res(d2 + "resnets.0.", x6, (40, 0))
+    x = tr(d2 + "attentions.0.", x, (40, 0))
+    s7 = make_skip(bd, x, name="s7", st=(80, 1280))
+    x = res(d2 + "resnets.1.", x, (40, 0))
+    x = tr(d2 + "attentions.1.", x, None)
+    s8 = make_skip(bd, x, name="s8", st=(80, 1280))
+    y = downsample(bd, w, d2 + "downsamplers.0.", x, stats=(40, 0))
+    free(bd, x)
+    u0 = "up_blocks.0."
+
+    def norm(j: int) -> tuple:  # (the skip channels' norm1 of up_blocks.0.resnets.j)
+        q = f"{u0}resnets.{j}.norm1."
+        return w[q + "weight"][1280:], w[q + "bias"][1280:], eps
+    s9 = make_skip(bd, y, name="s9", st=(80, 1280), norm=norm(2))
+    x = res("down_blocks.3.resnets.0.", y, (40, 0))
+    s10 = make_skip(bd, x, name="s10", st=(80, 1280), norm=norm(1))
+    x = res("down_blocks.3.resnets.1.", x, (40, 0))
+    s11 = make_skip(bd, x, name="s11", st=(80, 1280), norm=norm(0))
+    x = res("mid_block.resnets.0.", x, (40, 0))
+    x = tr("mid_block.attentions.0.", x, (40, 0))
+    x = res("mid_block.resnets.1.", x, (80, 0))
+    x = cat(u0 + "resnets.0.", x, s11, (80, 0))
+    x = cat(u0 + "resnets.1.", x, s10, (80, 0))
+    x = cat(u0 + "resnets.2.", x, s9, None)
+    x = upsample(bd, w, u0 + "upsamplers.0.", x, stats=(80, 0))
+    u1 = "up_blocks.1."
+    x = cat(u1 + "resnets.0.", x, s8, (40, 0))
+    x = tr(u1 + "attentions.0.", x, (80, 0))
+    x = cat(u1 + "resnets.1.", x, s7, (40, 0))
+    x = tr(u1 + "attentions.1.", x, (60, 0))
+    x = cat(u1 + "resnets.2.", x, s6, (40, 0))
+    return tr(u1 + "attentions.2.", x, None)
+
+
+class Section:
+    """The 16x16 / 8x8 levels (``section``) as one dispatch between the sd15 overlay's operators: its input from the
+    down_blocks.1 downsampler's output (bf16 half tiles [8 passes][8 half tiles][C_OBJ]: half tile c is column c's
+    rows, the same C-tile order), its output into the up_blocks.1 upsampler conv's input (bfp16 panel objects
+    [16 passes][4 tiles][C_OBJ] of [8 tg][10 q][2 images][9 x 8 B]). x_in, out: their device addresses. Per step the
+    resnets' time biases (``set_time``), per prompt the context's K / V^T slots (``set_context``)."""
+
+    PREFIXES = [f"down_blocks.2.attentions.{j}." for j in range(2)] + ["mid_block.attentions.0."] + \
+        [f"up_blocks.1.attentions.{j}." for j in range(3)]
+
+    def __init__(self, v2: V2Device, w: dict, *, x_in: int, out: int, eps: float):
+        self.v2, self.w = v2, w
+        bd = self.bd = Builder(v2)
+        lv = Level(16)
+        x6 = alloc(bd, lv, 640)
+        bd.op(self._fill_old(x6, x_in), {})
+        kv = bd.ddr("kv_self", 16 * lv.np * 2 * D.Q)
+        ctx_kv = {p: bd.image(p + "ctx", np.zeros(16 * 3 * 2 * D.Q, np.uint8)) for p in self.PREFIXES}
+        zero = {p[:-len("time_emb_proj.weight")]: torch.zeros(w[p].shape[0]) for p in w if p.endswith("time_emb_proj.weight")}
+        y = section(bd, w, x6, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
+        pn = alloc(bd, lv, 1280, "pn")
+        plain(bd, y, pn, name="out.pn")
+        bd.op(self._drain_old(pn, out), {})
+        self.words = bd.s.finish()
+        self.tr = None
+
+    @staticmethod
+    def _fill_old(x: Tensor, src: int) -> dict[int, ColOps]:
+        """Column c's x6 C tiles from the overlay's half tiles: per pass its half tile c (10240 B) into the object."""
+        ct = L.ct_bytes(x.lv.m)
+        npass = x.C // 80
+        return {c: ColOps(fills=[MemTask([{"addr": x.addr, "nwords": npass * 2560, "dims": [(640, 1), (4, 640), (npass, ct // 4)]}],
+                                         ddr=(src + c * 20480, npass * 10240, (640, 4, 640, 8 * 5120)))]) for c in range(COLS)}
+
+    @staticmethod
+    def _drain_old(pn: Tensor, dst: int) -> dict[int, ColOps]:
+        """Column c's output panels into the overlay's panel objects: per pass the tile c / 2's tg [4 (c % 2), ..)
+        (5760 B): [tg][q][image] from the panels [kb][token panel (tg, image)]."""
+        npass = pn.C // 80
+        kb = pn.np * 18
+        return {c: ColOps(drains=[MemTask([{"addr": pn.addr, "nwords": npass * 1440,
+                                            "dims": [(36, 1), (10, kb), (4, 36), (0, 10 * kb)]}],
+                                          ddr=(dst + (c // 2) * 20480 + (c % 2) * 5760, npass * 5760, (720, 2, 720, 4 * 5120)))])
+                for c in range(COLS)}
+
+    def set_time(self, biases: dict[str, torch.Tensor]) -> None:
+        """The resnets' time biases (by prefix): their conv1 commands' biases (the conv bias + the time bias, bf16) in
+        TBIAS, one write."""
+        buf = np.empty(self.bd.tb_used // 2, bfloat16)
+        for p, off, rows in self.bd.tb_hooks:
+            buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p]).numpy()[rows]
+        self.v2.write(TBIAS, buf)
+
+    def set_context(self, ctx: torch.Tensor) -> None:
+        """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768)."""
+        for p in self.PREFIXES:
+            a = p + "transformer_blocks.0.attn2."
+            self.v2.write(p + "ctx", L.kv_slots(ctx @ self.w[a + "to_k.weight"].T, ctx @ self.w[a + "to_v.weight"].T))
+
+    def run(self) -> None:
+        """One dispatch on the design's own context (in a library: its raw item, ``words``)."""
+        if self.tr is None:
+            self.tr = Transaction(self.v2.dev, self.words)
+        self.v2.run(self.tr)

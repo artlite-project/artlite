@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="456" viewBox="0 0 880 456" role="img" aria-labelledby="t d">
+<title id="t">How Artlite runs a model on the NPU</title>
+<desc id="d">The host builds each operator's design once (an operator renders C++ and an IRON design per shape, Peano and aiecc compile them into an ELF that configures the array), packs a GGUF file's weights once into a weight image in DRAM at their quantization's size, and every step dispatches a transaction through the C++ runtime and the amdxdna driver. The NPU's 8 columns of shim DMA, memory tile and 4 cores stream the weights and the KV cache from DRAM through one 32 bytes per cycle port, about 57 GB/s, of the 256 GB/s LPDDR5X that the CPU and the iGPU share.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.H{font-size:12px;font-weight:700;letter-spacing:.08em;fill:#59636e}.h{font-size:10.5px;font-weight:700;letter-spacing:.08em;fill:#818b98}.n{font-size:10.5px;fill:#818b98}.t{font-size:12px;font-weight:600;fill:#1f2328}.s{font-size:10.5px;fill:#59636e}.ns{font-size:10px;fill:#59636e}.b{font-weight:700;fill:#1f2328}.p{font-size:10px;fill:#59636e}.panel{fill:#f6f8fa;stroke:#d1d9e0}.node{fill:#ffffff;stroke:#d1d9e0}.pill{fill:#ffffff;stroke:#d1d9e0}.weights{fill:#ffffff;stroke:#1baf7a;stroke-opacity:.6}.arrow{fill:none;stroke:#59636e;stroke-width:1.3;marker-end:url(#head)}.core{fill:#2a78d6}.mem{fill:#2a78d6;fill-opacity:.45}.shim{fill:#ffffff;stroke:#818b98}.portbox{fill:#1baf7a}.flow{fill:none;stroke:#1baf7a;stroke-width:1.6;stroke-dasharray:4 4;animation:flow 0.9s linear infinite}.port{stroke-width:3}.col{stroke-width:2}@keyframes flow{to{stroke-dashoffset:-8}}@media (prefers-reduced-motion:reduce){.flow{animation:none}}</style>
+<defs><marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0.5L8,4L0,7.5z" fill="#59636e"/></marker><pattern id="tiles" width="12" height="12" patternUnits="userSpaceOnUse" x="40" y="362"><rect x="3" y="3" width="7" height="7" rx="1.5" fill="#1baf7a" fill-opacity=".14"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="455" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<rect x="24" y="24" width="516" height="292" rx="10" class="panel"/>
+<rect x="592" y="24" width="264" height="292" rx="10" class="panel"/>
+<rect x="24" y="344" width="832" height="88" rx="10" class="panel"/>
+<text x="40" y="50" class="H">HOST</text>
+<text x="87.9499" y="50" class="n">Python and C++</text>
+<text x="608" y="50" class="H">NPU</text>
+<text x="646.358" y="50" class="n">AIE2P array</text>
+<text x="40" y="78" class="h">BUILD</text>
+<text x="85.0575" y="78" class="n">once per design, cached</text>
+<rect x="40" y="88" width="104" height="44" rx="7" class="node"/>
+<text x="92" y="106" class="t" text-anchor="middle">operator</text>
+<text x="92" y="122" class="ns" text-anchor="middle">Python class</text>
+<rect x="164" y="88" width="104" height="44" rx="7" class="node"/>
+<text x="216" y="106" class="t" text-anchor="middle">C++ + IRON</text>
+<text x="216" y="122" class="ns" text-anchor="middle">rendered per shape</text>
+<path d="M147,110H161" class="arrow"/>
+<rect x="288" y="88" width="104" height="44" rx="7" class="node"/>
+<text x="340" y="106" class="t" text-anchor="middle">Peano · aiecc</text>
+<text x="340" y="122" class="ns" text-anchor="middle">LLVM for AI Engine</text>
+<path d="M271,110H285" class="arrow"/>
+<rect x="412" y="88" width="104" height="44" rx="7" class="node"/>
+<text x="464" y="106" class="t" text-anchor="middle">ELF</text>
+<text x="464" y="122" class="ns" text-anchor="middle">device image</text>
+<path d="M395,110H409" class="arrow"/>
+<text x="40" y="162" class="h">RUN</text>
+<text x="75.2552" y="162" class="n">every decode step and prefill chunk</text>
+<rect x="40" y="172" width="104" height="44" rx="7" class="node"/>
+<text x="92" y="190" class="t" text-anchor="middle">artlite-cli</text>
+<text x="92" y="206" class="ns" text-anchor="middle">server · bench</text>
+<rect x="164" y="172" width="104" height="44" rx="7" class="node"/>
+<text x="216" y="190" class="t" text-anchor="middle">transaction</text>
+<text x="216" y="206" class="ns" text-anchor="middle">built per step</text>
+<path d="M147,194H161" class="arrow"/>
+<rect x="288" y="172" width="104" height="44" rx="7" class="node"/>
+<text x="340" y="190" class="t" text-anchor="middle">runtime</text>
+<text x="340" y="206" class="ns" text-anchor="middle">C++ · nanobind</text>
+<path d="M271,194H285" class="arrow"/>
+<rect x="412" y="172" width="104" height="44" rx="7" class="node"/>
+<text x="464" y="190" class="t" text-anchor="middle">amdxdna</text>
+<text x="464" y="206" class="ns" text-anchor="middle">kernel driver</text>
+<path d="M395,194H409" class="arrow"/>
+<text x="40" y="246" class="h">LOAD</text>
+<text x="82.2641" y="246" class="n">once per model</text>
+<rect x="40" y="256" width="104" height="44" rx="7" class="node"/>
+<text x="92" y="274" class="t" text-anchor="middle">GGUF file</text>
+<text x="92" y="290" class="ns" text-anchor="middle">Q4_K · Q6_K · BF16</text>
+<rect x="164" y="256" width="104" height="44" rx="7" class="node"/>
+<text x="216" y="274" class="t" text-anchor="middle">re-layout</text>
+<text x="216" y="290" class="ns" text-anchor="middle">lossless, same size</text>
+<path d="M147,278H161" class="arrow"/>
+<rect x="40" y="362" width="412" height="52" rx="7" class="weights"/>
+<rect x="40" y="362" width="412" height="52" rx="7" fill="url(#tiles)"/>
+<text x="56" y="384" class="t">weight image</text>
+<text x="56" y="400" class="s">the quantization's size, streamed every step</text>
+<rect x="468" y="362" width="160" height="52" rx="7" class="node"/>
+<text x="484" y="384" class="t">KV cache</text>
+<text x="484" y="400" class="s">read and written</text>
+<text x="840" y="374" class="H" text-anchor="end">DRAM</text>
+<text x="840" y="392" class="s" text-anchor="end">LPDDR5X · 256 GB/s</text>
+<text x="840" y="407" class="s" text-anchor="end">shared with CPU, iGPU</text>
+<path d="M420,362V359Q420,353 426,353H692Q698,353 698,347V300" class="flow port"/>
+<path d="M548,362V353" class="flow"/>
+<path d="M698,300C698,276 621,267 621,245" class="flow"/>
+<path d="M621,245V110" class="flow col"/>
+<path d="M698,300C698,276 643,267 643,245" class="flow"/>
+<path d="M643,245V110" class="flow col"/>
+<path d="M698,300C698,276 665,267 665,245" class="flow"/>
+<path d="M665,245V110" class="flow col"/>
+<path d="M698,300C698,276 687,267 687,245" class="flow"/>
+<path d="M687,245V110" class="flow col"/>
+<path d="M698,300C698,276 709,267 709,245" class="flow"/>
+<path d="M709,245V110" class="flow col"/>
+<path d="M698,300C698,276 731,267 731,245" class="flow"/>
+<path d="M731,245V110" class="flow col"/>
+<path d="M698,300C698,276 753,267 753,245" class="flow"/>
+<path d="M753,245V110" class="flow col"/>
+<path d="M698,300C698,276 775,267 775,245" class="flow"/>
+<path d="M775,245V110" class="flow col"/>
+<rect x="689" y="310" width="18" height="12" rx="3" class="portbox"/>
+<text x="682" y="334" class="s" text-anchor="end">one 32 B/cycle port · <tspan class="b">~57 GB/s</tspan></text>
+<rect x="612" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="612" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="612" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="612" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="612" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="612" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="634" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="634" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="634" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="634" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="634" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="634" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="656" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="656" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="656" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="656" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="656" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="656" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="678" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="678" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="678" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="678" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="678" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="678" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="700" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="700" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="700" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="700" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="700" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="700" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="722" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="722" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="722" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="722" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="722" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="722" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="744" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="744" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="744" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="744" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="744" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="744" y="227" width="18" height="18" rx="4" class="shim"/>
+<rect x="766" y="101" width="18" height="18" rx="4" class="core"/>
+<rect x="766" y="123" width="18" height="18" rx="4" class="core"/>
+<rect x="766" y="145" width="18" height="18" rx="4" class="core"/>
+<rect x="766" y="167" width="18" height="18" rx="4" class="core"/>
+<rect x="766" y="197" width="18" height="18" rx="4" class="mem"/>
+<rect x="766" y="227" width="18" height="18" rx="4" class="shim"/>
+<text x="698" y="92" class="n" text-anchor="middle">8 columns</text>
+<text x="794" y="147" class="s">32 cores</text>
+<text x="794" y="210" class="s">memory</text>
+<text x="794" y="240" class="s">shim DMA</text>
+<path d="M516,110H608" class="arrow"/>
+<rect x="523.935" y="102" width="60.13" height="16" rx="8" class="pill"/>
+<text x="554" y="113.5" class="p" text-anchor="middle">configures</text>
+<path d="M516,194H592Q600,194 600,202V228Q600,236 608,236" class="arrow"/>
+<rect x="523.1" y="186" width="61.8" height="16" rx="8" class="pill"/>
+<text x="554" y="197.5" class="p" text-anchor="middle">dispatches</text>
+<path d="M216,300V358" class="arrow"/>
+<rect x="186.49" y="322" width="59.02" height="16" rx="8" class="pill"/>
+<text x="216" y="333.5" class="p" text-anchor="middle">packs into</text>
+</svg>

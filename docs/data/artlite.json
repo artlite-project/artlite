@@ -1,0 +1,139 @@
+{
+  "runtime": "Artlite",
+  "about": "Artlite's measured models; docs/charts.py draws docs/images from this file and the other runtimes' files. Keys of ttft_s / prefill_tps / decode_tps are prompt lengths in tokens. How to measure a model: the artlite-bench skill; the file each row measured (Hugging Face repository, file, sha256), the test system and the toolchain: docs/methodology.md.",
+  "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)",
+  "method": {
+    "ttft_s": "artlite-bench -p 1024,8192,32768,65536 -n 0: avg_ns of pp<n> (the prompt's chunks and the last token's logits)",
+    "prefill_tps": "the same run: avg_ts",
+    "decode_tps": "artlite-cli -n 256 --greedy on a Paul Graham essays prompt of 1023 / 32767 tokens",
+    "mtp": "decode with the model's drafter, at the best tokens per step S for that length"
+  },
+  "results": [
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q4_0",
+      "ttft_s": {"1024": 0.11, "8192": 1.07, "32768": 8.59, "65536": 28.7},
+      "prefill_tps": {"1024": 9345, "32768": 3815},
+      "decode_tps": {"1024": 68.0, "32768": 39.9}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q4_1",
+      "ttft_s": {"1024": 0.11, "8192": 1.07, "32768": 8.6, "65536": 28.8},
+      "prefill_tps": {"1024": 9344, "32768": 3810},
+      "decode_tps": {"1024": 64.7, "32768": 37.0}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q4_K_M",
+      "ttft_s": {"1024": 0.124, "8192": 1.16, "32768": 8.96, "65536": 29.5},
+      "prefill_tps": {"1024": 8236, "32768": 3658},
+      "decode_tps": {"1024": 66.1, "32768": 39.0}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q3_K_L",
+      "ttft_s": {"1024": 0.137, "8192": 1.28, "32768": 9.44, "65536": 30.5},
+      "prefill_tps": {"1024": 7469, "32768": 3471},
+      "decode_tps": {"1024": 68.9, "32768": 38.5},
+      "notes": {
+        "decode_tps": {"1024": "stopped at an end-of-sequence token after 143 of the 256 tokens"}
+      }
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "BF16",
+      "ttft_s": {"1024": 0.129, "8192": 1.21, "32768": 9.19, "65536": 29.9},
+      "prefill_tps": {"1024": 7915, "32768": 3567},
+      "decode_tps": {"1024": 39.5, "32768": 27.9}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q6_K",
+      "ttft_s": {"1024": 0.141, "8192": 1.31, "32768": 9.55, "65536": 30.7},
+      "prefill_tps": {"1024": 7254, "32768": 3430},
+      "decode_tps": {"1024": 51.9, "32768": 32.6}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "quant": "Q5_K_M",
+      "ttft_s": {"1024": 0.141, "8192": 1.29, "32768": 9.49, "65536": 30.6},
+      "prefill_tps": {"1024": 7283, "32768": 3452},
+      "decode_tps": {"1024": 53.6, "32768": 34.7}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "Q4_K_M",
+      "ttft_s": {"1024": 0.299, "8192": 2.76, "32768": 19.0},
+      "prefill_tps": {"1024": 3430, "32768": 1723},
+      "decode_tps": {"1024": 26.6, "32768": 13.5}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "BF16",
+      "ttft_s": {"1024": 0.32, "8192": 2.95, "32768": 19.8},
+      "prefill_tps": {"1024": 3201, "32768": 1658},
+      "decode_tps": {"1024": 15.2, "32768": 9.8}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "Q4_0",
+      "ttft_s": {"1024": 0.268, "8192": 2.54, "32768": 18.1},
+      "prefill_tps": {"1024": 3826, "32768": 1810},
+      "decode_tps": {"1024": 27.9, "32768": 13.8}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "Q5_K_M",
+      "ttft_s": {"1024": 0.339, "8192": 3.1, "32768": 20.4},
+      "prefill_tps": {"1024": 3016, "32768": 1607},
+      "decode_tps": {"1024": 21.9, "32768": 12.2}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "Q2_K",
+      "ttft_s": {"1024": 0.35, "8192": 3.16, "32768": 20.6},
+      "prefill_tps": {"1024": 2922, "32768": 1590},
+      "decode_tps": {"1024": 36.7, "32768": 15.7}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "quant": "Q3_K_M",
+      "ttft_s": {"1024": 0.302, "8192": 2.78, "32768": 19.1},
+      "prefill_tps": {"1024": 3389, "32768": 1716},
+      "decode_tps": {"1024": 30.0, "32768": 13.9}
+    },
+    {
+      "model": "Llama 3.1 8B Instruct",
+      "quant": "Q4_K_M",
+      "ttft_s": {"1024": 0.648, "8192": 6.16, "32768": 40.9},
+      "prefill_tps": {"1024": 1579, "32768": 802},
+      "decode_tps": {"1024": 11.9, "32768": 7.9}
+    },
+    {
+      "model": "Llama 3.1 8B Instruct",
+      "quant": "Q4_K_S",
+      "ttft_s": {"1024": 0.614, "8192": 5.89, "32768": 39.9},
+      "prefill_tps": {"1024": 1668, "32768": 822},
+      "decode_tps": {"1024": 12.4, "32768": 8.2}
+    },
+    {
+      "model": "Gemma 4 E4B it",
+      "quant": "Q4_0",
+      "ttft_s": {"1024": 0.38, "8192": 2.63, "32768": 12.9, "65536": 33.7},
+      "prefill_tps": {"1024": 2716, "32768": 2530},
+      "decode_tps": {"1024": 16.7, "32768": 13.7},
+      "mtp": {
+        "decode_tps": {"1024": 28.8, "32768": 16.9},
+        "tokens_per_step": {"1024": 4, "32768": 2}
+      }
+    },
+    {
+      "model": "Qwen3.8 27B",
+      "quant": "Q4_K_M",
+      "ttft_s": {"1024": 2.5, "8192": 20.9, "32768": 104, "65536": 260},
+      "prefill_tps": {"1024": 410, "32768": 316},
+      "decode_tps": {"1024": 3.3, "32768": 3.0}
+    }
+  ]
+}

@@ -1,0 +1,1183 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+/*
+ * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
+ */
+
+#ifndef _UAPI_AMDXDNA_ACCEL_H_
+#define _UAPI_AMDXDNA_ACCEL_H_
+
+#ifdef __KERNEL__
+#include <drm/drm.h>
+#else
+#include <libdrm/drm.h>
+#endif
+#include <linux/const.h>
+#include <linux/stddef.h>
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define AMDXDNA_INVALID_CMD_HANDLE	(~0UL)
+#define AMDXDNA_INVALID_ADDR		(~0UL)
+#define AMDXDNA_INVALID_CTX_HANDLE	0
+#define AMDXDNA_INVALID_BO_HANDLE	0
+#define AMDXDNA_INVALID_FENCE_HANDLE	0
+#define AMDXDNA_INVALID_DOORBELL_OFFSET	(~0U)
+
+/*
+ * Define hardware context priority
+ */
+#define AMDXDNA_QOS_REALTIME_PRIORITY	0x100
+#define AMDXDNA_QOS_HIGH_PRIORITY	0x180
+#define AMDXDNA_QOS_NORMAL_PRIORITY	0x200
+#define AMDXDNA_QOS_LOW_PRIORITY	0x280
+
+enum amdxdna_device_type {
+	AMDXDNA_DEV_TYPE_UNKNOWN = -1,
+	AMDXDNA_DEV_TYPE_KMQ = 0,
+	AMDXDNA_DEV_TYPE_UMQ = 1,
+	AMDXDNA_DEV_TYPE_PF = 2,
+	AMDXDNA_DEV_TYPE_UMQ_NONCOHERENT = 3,
+};
+
+enum amdxdna_drm_ioctl_id {
+	DRM_AMDXDNA_CREATE_HWCTX,
+	DRM_AMDXDNA_DESTROY_HWCTX,
+	DRM_AMDXDNA_CONFIG_HWCTX,
+	DRM_AMDXDNA_CREATE_BO,
+	DRM_AMDXDNA_GET_BO_INFO,
+	DRM_AMDXDNA_SYNC_BO,
+	DRM_AMDXDNA_EXEC_CMD,
+	DRM_AMDXDNA_GET_INFO,
+	DRM_AMDXDNA_SET_STATE,
+	DRM_AMDXDNA_WAIT_CMD = 9,
+	DRM_AMDXDNA_GET_ARRAY = 10,
+};
+
+/**
+ * struct qos_info - QoS information for driver.
+ * @gops: Giga operations per second.
+ * @fps: Frames per second.
+ * @dma_bandwidth: DMA bandwidtha.
+ * @latency: Frame response latency.
+ * @frame_exec_time: Frame execution time.
+ * @priority: Request priority.
+ *
+ * User program can provide QoS hints to driver.
+ */
+struct amdxdna_qos_info {
+	__u32 gops;
+	__u32 fps;
+	__u32 dma_bandwidth;
+	__u32 latency;
+	__u32 frame_exec_time;
+	__u32 priority;
+};
+
+/**
+ * struct amdxdna_drm_create_hwctx - Create hardware context.
+ * @ext: MBZ.
+ * @ext_flags: MBZ.
+ * @qos_p: Address of QoS info.
+ * @umq_bo: BO handle for user mode queue(UMQ).
+ * @log_buf_bo: BO handle for log buffer.
+ * @max_opc: Maximum operations per cycle.
+ * @num_tiles: Number of AIE tiles.
+ * @mem_size: Size of AIE tile memory.
+ * @umq_doorbell: Returned offset of doorbell associated with UMQ.
+ * @handle: Returned hardware context handle.
+ * @syncobj_handle: Returned syncobj handle for command completion.
+ */
+struct amdxdna_drm_create_hwctx {
+	__u64 ext;
+	__u64 ext_flags;
+	__u64 qos_p;
+	__u32 umq_bo;
+	__u32 log_buf_bo;
+	__u32 max_opc;
+	__u32 num_tiles;
+	__u32 mem_size;
+	__u32 umq_doorbell;
+	__u32 handle;
+	__u32 syncobj_handle;
+};
+
+/**
+ * struct amdxdna_drm_destroy_hwctx - Destroy hardware context.
+ * @handle: Hardware context handle.
+ * @pad: MBZ.
+ */
+struct amdxdna_drm_destroy_hwctx {
+	__u32 handle;
+	__u32 pad;
+};
+
+/**
+ * struct amdxdna_cu_config - configuration for one CU
+ * @cu_bo: CU configuration buffer bo handle.
+ * @cu_func: Function of a CU.
+ * @pad: MBZ.
+ */
+struct amdxdna_cu_config {
+	__u32 cu_bo;
+	__u8  cu_func;
+	__u8  pad[3];
+};
+
+/**
+ * struct amdxdna_hwctx_param_config_cu - configuration for CUs in hardware context
+ * @num_cus: Number of CUs to configure.
+ * @pad: MBZ.
+ * @cu_configs: Array of CU configurations of struct amdxdna_cu_config.
+ */
+struct amdxdna_hwctx_param_config_cu {
+	__u16 num_cus;
+	__u16 pad[3];
+	struct amdxdna_cu_config cu_configs[] __counted_by(num_cus);
+};
+
+enum amdxdna_drm_config_hwctx_param {
+	DRM_AMDXDNA_HWCTX_CONFIG_CU,
+	DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
+	DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
+};
+
+/**
+ * enum amdxdna_fw_buf_type - CERT firmware buffer type.
+ * @AMDXDNA_FW_BUF_DEBUG: CERT debug buffer.
+ * @AMDXDNA_FW_BUF_TRACE: CERT trace buffer.
+ * @AMDXDNA_FW_BUF_DBG_Q: CERT debug queue.
+ * @AMDXDNA_FW_BUF_LOG:   CERT log buffer.
+ */
+enum amdxdna_fw_buf_type {
+	AMDXDNA_FW_BUF_DEBUG,
+	AMDXDNA_FW_BUF_TRACE,
+	AMDXDNA_FW_BUF_DBG_Q,
+	AMDXDNA_FW_BUF_LOG,
+};
+
+/**
+ * struct amdxdna_uc_info_entry - per-uC slice descriptor in
+ *                                struct amdxdna_fw_buffer_metadata.
+ * @index: uC index. The payload BO is sliced per-uC; @index must be unique
+ *         within an array and stay below the device's CERT uC count.
+ * @size:  Per-uC slice size in bytes. Entries with size == 0 are ignored.
+ */
+struct amdxdna_uc_info_entry {
+	__u32 index;
+	__u32 size;
+};
+
+/**
+ * struct amdxdna_fw_buffer_metadata - per-hwctx CERT buffer description.
+ * @buf_type:   One of enum amdxdna_fw_buf_type.
+ * @num_ucs:    Number of valid entries in @uc_info.
+ * @pad:        MBZ. Reserved for ABI growth.
+ * @bo_handle:  Handle of the payload BO (AMDXDNA_BO_SHARE) holding the
+ *              concatenated per-uC slices.
+ * @command_id: User tag for trace correlation.
+ * @uc_info:    Per-uC slice descriptors, in payload BO layout order.
+ *
+ * The metadata is carried in a SHARE BO whose handle user space passes via
+ * struct amdxdna_drm_config_hwctx.param_val for
+ * %DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF and %DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF.
+ * AIE4-only.
+ */
+struct amdxdna_fw_buffer_metadata {
+	__u8 buf_type;
+	__u8 num_ucs;
+	__u8 pad[2];
+	__u32 bo_handle;
+	__u64 command_id;
+	struct amdxdna_uc_info_entry uc_info[];
+};
+
+/**
+ * struct amdxdna_drm_config_hwctx - Configure hardware context.
+ * @handle: hardware context handle.
+ * @param_type: Value in enum amdxdna_drm_config_hwctx_param. Specifies the
+ *              structure passed in via param_val.
+ * @param_val: A structure specified by the param_type struct member.
+ * @param_val_size: Size of the parameter buffer pointed to by the param_val.
+ *		    If param_val is not a pointer, driver can ignore this.
+ * @pad: MBZ.
+ *
+ * Note: if the param_val is a pointer pointing to a buffer, the maximum size
+ * of the buffer is 4KiB(PAGE_SIZE).
+ */
+struct amdxdna_drm_config_hwctx {
+	__u32 handle;
+	__u32 param_type;
+	__u64 param_val;
+	__u32 param_val_size;
+	__u32 pad;
+};
+
+enum amdxdna_bo_type {
+	AMDXDNA_BO_INVALID = 0,
+	AMDXDNA_BO_SHMEM = 1, /* Be compatible with legacy application code. */
+	AMDXDNA_BO_SHARE = 1,
+	AMDXDNA_BO_DEV_HEAP = 2,
+	AMDXDNA_BO_DEV = 3,
+	AMDXDNA_BO_CMD = 4,
+};
+
+/**
+ * struct amdxdna_drm_va_entry
+ * @vaddr: Virtual address.
+ * @len: Size of entry.
+ */
+struct amdxdna_drm_va_entry {
+	__u64 vaddr;
+	__u64 len;
+};
+
+/**
+ * struct amdxdna_drm_va_tbl
+ * @dmabuf_fd: The fd of dmabuf.
+ * @num_entries: Number of va entries.
+ * @va_entries: Array of va entries.
+ *
+ * The input can be either a dmabuf fd or a virtual address entry table.
+ * When dmabuf_fd is used, num_entries must be zero.
+ */
+struct amdxdna_drm_va_tbl {
+	__s32 dmabuf_fd;
+	__u32 num_entries;
+	struct amdxdna_drm_va_entry va_entries[];
+};
+
+/**
+ * struct amdxdna_drm_create_bo - Create a buffer object.
+ * @flags: Buffer flags. MBZ.
+ * @vaddr: User VA of buffer if applied. MBZ.
+ * @size: Size in bytes.
+ * @type: Buffer type.
+ * @handle: Returned DRM buffer object handle.
+ */
+struct amdxdna_drm_create_bo {
+	__u64	flags;
+	__u64	vaddr;
+	__u64	size;
+	__u32	type;
+	__u32	handle;
+};
+
+/**
+ * struct amdxdna_drm_get_bo_info - Get buffer object information.
+ * @ext: MBZ.
+ * @ext_flags: MBZ.
+ * @handle: DRM buffer object handle.
+ * @pad: MBZ.
+ * @map_offset: Returned DRM fake offset for mmap().
+ * @vaddr: Returned user VA of buffer. 0 in case user needs mmap().
+ * @xdna_addr: Returned XDNA device virtual address.
+ */
+struct amdxdna_drm_get_bo_info {
+	__u64 ext;
+	__u64 ext_flags;
+	__u32 handle;
+	__u32 pad;
+	__u64 map_offset;
+	__u64 vaddr;
+	__u64 xdna_addr;
+};
+
+/**
+ * struct amdxdna_drm_sync_bo - Sync buffer object.
+ * @handle: Buffer object handle.
+ * @direction: Direction of sync, can be from device or to device.
+ * @offset: Offset in the buffer to sync.
+ * @size: Size in bytes.
+ */
+struct amdxdna_drm_sync_bo {
+	__u32 handle;
+#define SYNC_DIRECT_TO_DEVICE	0U
+#define SYNC_DIRECT_FROM_DEVICE	1U
+	__u32 direction;
+	__u64 offset;
+	__u64 size;
+};
+
+enum amdxdna_cmd_type {
+	AMDXDNA_CMD_SUBMIT_EXEC_BUF = 0,
+	AMDXDNA_CMD_SUBMIT_DEPENDENCY,
+	AMDXDNA_CMD_SUBMIT_SIGNAL,
+};
+
+/**
+ * struct amdxdna_drm_exec_cmd - Execute command.
+ * @ext: MBZ.
+ * @ext_flags: MBZ.
+ * @hwctx: Hardware context handle.
+ * @type: One of command type in enum amdxdna_cmd_type.
+ * @cmd_handles: Array of command handles or the command handle itself
+ *               in case of just one.
+ * @args: Array of arguments for all command handles.
+ * @cmd_count: Number of command handles in the cmd_handles array.
+ * @arg_count: Number of arguments in the args array.
+ * @seq: Returned sequence number for this command.
+ */
+struct amdxdna_drm_exec_cmd {
+	__u64 ext;
+	__u64 ext_flags;
+	__u32 hwctx;
+	__u32 type;
+	__u64 cmd_handles;
+	__u64 args;
+	__u32 cmd_count;
+	__u32 arg_count;
+	__u64 seq;
+};
+
+/**
+ * struct amdxdna_drm_wait_cmd - Wait execution command.
+ *
+ * @hwctx: Context handle.
+ * @timeout: timeout in ms, 0 implies infinite wait.
+ * @seq: sequence number of the command returned by execute command.
+ *
+ * Wait a command specified by seq to be completed.
+ */
+struct amdxdna_drm_wait_cmd {
+	__u32 hwctx;
+	__u32 timeout;
+	__u64 seq;
+};
+
+/**
+ * struct amdxdna_drm_query_aie_status - Query the status of the AIE hardware
+ * @buffer: The user space buffer that will return the AIE status.
+ * @buffer_size: The size of the user space buffer.
+ * @cols_filled: A bitmap of AIE columns whose data has been returned in the buffer.
+ */
+struct amdxdna_drm_query_aie_status {
+	__u64 buffer; /* out */
+	__u32 buffer_size; /* in */
+	__u32 cols_filled; /* out */
+};
+
+/**
+ * struct amdxdna_drm_query_aie_version - Query the version of the AIE hardware
+ * @major: The major version number.
+ * @minor: The minor version number.
+ */
+struct amdxdna_drm_query_aie_version {
+	__u32 major; /* out */
+	__u32 minor; /* out */
+};
+
+/**
+ * struct amdxdna_drm_query_aie_tile_metadata - Query the metadata of AIE tile (core, mem, shim)
+ * @row_count: The number of rows.
+ * @row_start: The starting row number.
+ * @dma_channel_count: The number of dma channels.
+ * @lock_count: The number of locks.
+ * @event_reg_count: The number of events.
+ * @pad: Structure padding.
+ */
+struct amdxdna_drm_query_aie_tile_metadata {
+	__u16 row_count;
+	__u16 row_start;
+	__u16 dma_channel_count;
+	__u16 lock_count;
+	__u16 event_reg_count;
+	__u16 pad[3];
+};
+
+/**
+ * struct amdxdna_drm_query_aie_metadata - Query the metadata of the AIE hardware
+ * @col_size: The size of a column in bytes.
+ * @cols: The total number of columns.
+ * @rows: The total number of rows.
+ * @version: The version of the AIE hardware.
+ * @core: The metadata for all core tiles.
+ * @mem: The metadata for all mem tiles.
+ * @shim: The metadata for all shim tiles.
+ */
+struct amdxdna_drm_query_aie_metadata {
+	__u32 col_size;
+	__u16 cols;
+	__u16 rows;
+	struct amdxdna_drm_query_aie_version version;
+	struct amdxdna_drm_query_aie_tile_metadata core;
+	struct amdxdna_drm_query_aie_tile_metadata mem;
+	struct amdxdna_drm_query_aie_tile_metadata shim;
+};
+
+/**
+ * struct amdxdna_drm_query_clock - Metadata for a clock
+ * @name: The clock name.
+ * @freq_mhz: The clock frequency.
+ * @pad: Structure padding.
+ */
+struct amdxdna_drm_query_clock {
+	__u8 name[16];
+	__u32 freq_mhz;
+	__u32 pad;
+};
+
+/**
+ * struct amdxdna_drm_query_clock_metadata - Query metadata for clocks
+ * @mp_npu_clock: The metadata for MP-NPU clock.
+ * @h_clock: The metadata for H clock.
+ */
+struct amdxdna_drm_query_clock_metadata {
+	struct amdxdna_drm_query_clock mp_npu_clock;
+	struct amdxdna_drm_query_clock h_clock;
+};
+
+enum amdxdna_sensor_type {
+	AMDXDNA_SENSOR_TYPE_POWER,
+	AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION,
+	AMDXDNA_SENSOR_TYPE_TEMPERATURE
+};
+
+/**
+ * struct amdxdna_drm_query_sensor - The data for single sensor.
+ * @label: The name for a sensor.
+ * @input: The current value of the sensor.
+ * @max: The maximum value possible for the sensor.
+ * @average: The average value of the sensor.
+ * @highest: The highest recorded sensor value for this driver load for the sensor.
+ * @status: The sensor status.
+ * @units: The unit of the scaled value (pow(10, unitm) * value), not of the raw
+ *         @input, @max, @average and @highest members.
+ * @unitm: Translates value member variables into the correct unit via (pow(10, unitm) * value).
+ * @type: The sensor type from enum amdxdna_sensor_type.
+ * @pad: Structure padding.
+ */
+struct amdxdna_drm_query_sensor {
+	__u8  label[64];
+	__u32 input;
+	__u32 max;
+	__u32 average;
+	__u32 highest;
+	__u8  status[64];
+	__u8  units[16];
+	__s8  unitm;
+	__u8  type;
+	__u8  pad[6];
+};
+
+/**
+ * struct amdxdna_drm_query_hwctx - The data for single context.
+ * @context_id: The ID for this context.
+ * @start_col: The starting column for the partition assigned to this context.
+ * @num_col: The number of columns in the partition assigned to this context.
+ * @pad: Structure padding.
+ * @pid: The Process ID of the process that created this context.
+ * @command_submissions: The number of commands submitted to this context.
+ * @command_completions: The number of commands completed by this context.
+ * @migrations: The number of times this context has been moved to a different partition.
+ * @preemptions: The number of times this context has been preempted by another context in the
+ *               same partition.
+ * @errors: The errors for this context.
+ */
+struct amdxdna_drm_query_hwctx {
+	__u32 context_id;
+	__u32 start_col;
+	__u32 num_col;
+	__u32 pad;
+	__s64 pid;
+	__u64 command_submissions;
+	__u64 command_completions;
+	__u64 migrations;
+	__u64 preemptions;
+	__u64 errors;
+};
+
+enum amdxdna_power_mode_type {
+	POWER_MODE_DEFAULT, /* Fallback to calculated DPM */
+	POWER_MODE_LOW,     /* Set frequency to lowest DPM */
+	POWER_MODE_MEDIUM,  /* Set frequency to medium DPM */
+	POWER_MODE_HIGH,    /* Set frequency to highest DPM */
+	POWER_MODE_TURBO,   /* Maximum power */
+};
+
+/**
+ * struct amdxdna_drm_get_power_mode - Get the configured power mode
+ * @power_mode: The mode type from enum amdxdna_power_mode_type
+ * @pad: Structure padding.
+ */
+struct amdxdna_drm_get_power_mode {
+	__u8 power_mode;
+	__u8 pad[7];
+};
+
+/**
+ * struct amdxdna_drm_query_firmware_version - Query the firmware version
+ * @major: The major version number
+ * @minor: The minor version number
+ * @patch: The patch level version number
+ * @build: The build ID
+ */
+struct amdxdna_drm_query_firmware_version {
+	__u32 major; /* out */
+	__u32 minor; /* out */
+	__u32 patch; /* out */
+	__u32 build; /* out */
+};
+
+/**
+ * struct amdxdna_drm_query_aie_load - AIE hardware utilization snapshot
+ * @sample_duration_ms: Milliseconds to wait between counter snapshots; 0 selects
+ *                      the driver default (2 ms).
+ * @load_percent: AIE utilization 0-100.
+ * @timestamp_ms: Firmware uptime (ms) of the second snapshot.
+ * @operations_per_second: Total counter delta across all counters per second.
+ * @num_activity_counters: Number of valid entries in @activity_counters; set by driver.
+ * @activity_counters: Raw counter values from the second snapshot.
+ */
+struct amdxdna_drm_query_aie_load {
+	__u32 sample_duration_ms; /* in */
+	__u32 load_percent; /* out */
+	__u64 timestamp_ms; /* out */
+	__u64 operations_per_second; /* out */
+	__u32 num_activity_counters; /* out */
+	__u64 activity_counters[]; /* out */
+};
+
+enum amdxdna_drm_get_param {
+	DRM_AMDXDNA_QUERY_AIE_STATUS,
+	DRM_AMDXDNA_QUERY_AIE_METADATA,
+	DRM_AMDXDNA_QUERY_AIE_VERSION,
+	DRM_AMDXDNA_QUERY_CLOCK_METADATA,
+	DRM_AMDXDNA_QUERY_SENSORS,
+	DRM_AMDXDNA_QUERY_HW_CONTEXTS,		/* admin or matching EUID */
+	DRM_AMDXDNA_QUERY_FIRMWARE_VERSION = 8,
+	DRM_AMDXDNA_GET_POWER_MODE,
+	DRM_AMDXDNA_QUERY_TELEMETRY,		/* admin or matching EUID */
+	DRM_AMDXDNA_GET_FORCE_PREEMPT_STATE,
+	DRM_AMDXDNA_QUERY_RESOURCE_INFO,
+	DRM_AMDXDNA_GET_FRAME_BOUNDARY_PREEMPT_STATE,
+	DRM_AMDXDNA_QUERY_CERT_FIRMWARE_VERSION = 14,
+	DRM_AMDXDNA_GET_AUTO_COREDUMP,
+	DRM_AMDXDNA_QUERY_AIE_LOAD,
+};
+
+/**
+ * struct amdxdna_drm_get_resource_info - Get resource information
+ */
+struct amdxdna_drm_get_resource_info {
+	/** @npu_clk_max: max H-Clocks */
+	__u64 npu_clk_max;
+	/** @npu_tops_max: max TOPs */
+	__u64 npu_tops_max;
+	/** @npu_task_max: max number of tasks */
+	__u64 npu_task_max;
+	/** @npu_tops_curr: current TOPs */
+	__u64 npu_tops_curr;
+	/** @npu_task_curr: current number of tasks */
+	__u64 npu_task_curr;
+};
+
+/**
+ * struct amdxdna_drm_attribute_state - State of an attribute
+ */
+struct amdxdna_drm_attribute_state {
+	/** @state: enabled or disabled */
+	__u8 state;
+	/** @pad: MBZ */
+	__u8 pad[7];
+};
+
+/**
+ * struct amdxdna_drm_query_telemetry_header - Telemetry data header
+ */
+struct amdxdna_drm_query_telemetry_header {
+	/** @major: Firmware telemetry interface major version number */
+	__u32 major;
+	/** @minor: Firmware telemetry interface minor version number */
+	__u32 minor;
+	/** @type: Telemetry query type */
+	__u32 type;
+	/** @map_num_elements: Total number of elements in the map table */
+	__u32 map_num_elements;
+	/** @map: Element map */
+	__u32 map[];
+};
+
+/**
+ * struct amdxdna_drm_get_info - Get some information from the AIE hardware.
+ * @param: Value in enum amdxdna_drm_get_param. Specifies the structure passed in the buffer.
+ * @buffer_size: Size of the input buffer. Size needed/written by the kernel.
+ * @buffer: A structure specified by the param struct member.
+ */
+struct amdxdna_drm_get_info {
+	__u32 param; /* in */
+	__u32 buffer_size; /* in/out */
+	__u64 buffer; /* in/out */
+};
+
+#define AMDXDNA_HWCTX_STATE_IDLE	0
+#define AMDXDNA_HWCTX_STATE_ACTIVE	1
+
+/* Length of the process name reported per hardware context (matches TASK_COMM_LEN). */
+#define AMDXDNA_HWCTX_PROC_NAME_LEN	16
+
+/**
+ * struct amdxdna_drm_hwctx_entry - The hardware context array entry
+ */
+struct amdxdna_drm_hwctx_entry {
+	/** @context_id: Context ID. */
+	__u32 context_id;
+	/** @start_col: Start AIE array column assigned to context. */
+	__u32 start_col;
+	/** @num_col: Number of AIE array columns assigned to context. */
+	__u32 num_col;
+	/** @hwctx_id: The real hardware context id. */
+	__u32 hwctx_id;
+	/** @pid: ID of process which created this context. */
+	__s64 pid;
+	/** @command_submissions: Number of commands submitted. */
+	__u64 command_submissions;
+	/** @command_completions: Number of commands completed. */
+	__u64 command_completions;
+	/** @migrations: Number of times been migrated. */
+	__u64 migrations;
+	/** @preemptions: Number of times been preempted. */
+	__u64 preemptions;
+	/** @errors: Number of errors happened. */
+	__u64 errors;
+	/** @priority: Context priority. */
+	__u64 priority;
+	/** @heap_usage: Usage of device heap buffer. */
+	__u64 heap_usage;
+	/** @suspensions: Number of times been suspended. */
+	__u64 suspensions;
+	/**
+	 * @state: Context state.
+	 * %AMDXDNA_HWCTX_STATE_IDLE
+	 * %AMDXDNA_HWCTX_STATE_ACTIVE
+	 */
+	__u32 state;
+	/** @pasid: PASID been bound. */
+	__u32 pasid;
+	/** @gops: Giga operations per second. */
+	__u32 gops;
+	/** @fps: Frames per second. */
+	__u32 fps;
+	/** @dma_bandwidth: DMA bandwidth. */
+	__u32 dma_bandwidth;
+	/** @latency: Frame response latency. */
+	__u32 latency;
+	/** @frame_exec_time: Frame execution time. */
+	__u32 frame_exec_time;
+	/** @txn_op_idx: Index of last control code executed. */
+	__u32 txn_op_idx;
+	/** @ctx_pc: Program counter. */
+	__u32 ctx_pc;
+	/** @fatal_error_type: Fatal error type if context crashes. */
+	__u32 fatal_error_type;
+	/** @fatal_error_exception_type: Firmware exception type. */
+	__u32 fatal_error_exception_type;
+	/** @fatal_error_exception_pc: Firmware exception program counter. */
+	__u32 fatal_error_exception_pc;
+	/** @fatal_error_app_module: Exception module name. */
+	__u32 fatal_error_app_module;
+	/** @pad: Structure pad. */
+	__u32 pad;
+	/** @name: Name of the process which created this context. */
+	char name[AMDXDNA_HWCTX_PROC_NAME_LEN];
+	/**
+	 * @npu_gen: NPU generation for the health fields below.
+	 * %AMDXDNA_HWCTX_NPU_GEN_AIE2
+	 * %AMDXDNA_HWCTX_NPU_GEN_AIE4
+	 */
+#define AMDXDNA_HWCTX_NPU_GEN_AIE2	0
+#define AMDXDNA_HWCTX_NPU_GEN_AIE4	1
+	__u32 npu_gen;
+	/**
+	 * @fw_ctx_status: Firmware hardware-context status from the app health
+	 * report. Valid when @npu_gen is %AMDXDNA_HWCTX_NPU_GEN_AIE4.
+	 */
+	__u32 fw_ctx_status;
+	/**
+	 * @num_uc: Number of valid entries in @uc_info. Valid when @npu_gen is
+	 * %AMDXDNA_HWCTX_NPU_GEN_AIE4.
+	 */
+	__u32 num_uc;
+	/**
+	 * @ctx_error_type: Firmware async context error type. Live health
+	 * queries leave this 0; a cached fault may populate it. Valid when
+	 * @npu_gen is %AMDXDNA_HWCTX_NPU_GEN_AIE4.
+	 */
+	__u32 ctx_error_type;
+	/**
+	 * @uc_info: Opaque per-uC health payload. Valid when @npu_gen is
+	 * %AMDXDNA_HWCTX_NPU_GEN_AIE4. Each of the @num_uc entries is
+	 * %AMDXDNA_HWCTX_UC_HEALTH_BYTES and matches the firmware app-health
+	 * per-uC record (same layout as the command-timeout health payload).
+	 */
+#define AMDXDNA_HWCTX_MAX_UC		6
+#define AMDXDNA_HWCTX_UC_HEALTH_BYTES	44
+	__u8 uc_info[AMDXDNA_HWCTX_MAX_UC][AMDXDNA_HWCTX_UC_HEALTH_BYTES];
+};
+
+/**
+ * struct amdxdna_async_error - XDNA async error structure
+ */
+struct amdxdna_async_error {
+	/** @err_code: Error code. */
+	__u64 err_code;
+	/** @ts_us: Timestamp. */
+	__u64 ts_us;
+	/** @ex_err_code: Extra error code */
+	__u64 ex_err_code;
+};
+
+/**
+ * struct amdxdna_drm_bo_usage - all types of BO usage
+ * BOs managed by XRT/SHIM/driver is counted as internal.
+ * Others are counted as external which are managed by applications.
+ *
+ * Among all types of BOs:
+ *   AMDXDNA_BO_DEV_HEAP - is counted for internal.
+ *   AMDXDNA_BO_SHARE    - is counted for external.
+ *   AMDXDNA_BO_CMD      - is counted for internal.
+ *   AMDXDNA_BO_DEV      - is counted by heap_usage only, not internal
+ *                         or external. It does not add to the total memory
+ *                         footprint since its mem comes from heap which is
+ *                         already counted as internal.
+ */
+struct amdxdna_drm_bo_usage {
+	/** @pid: The ID of the process to query from. */
+	__s64 pid;
+	/** @total_usage: Total BO size used by process. */
+	__u64 total_usage;
+	/** @internal_usage: Total internal BO size used by process. */
+	__u64 internal_usage;
+	/** @heap_usage: Total device BO size used by process. */
+	__u64 heap_usage;
+};
+
+/**
+ * struct amdxdna_drm_aie_coredump - The data for AIE coredump
+ */
+struct amdxdna_drm_aie_coredump {
+	/** @pid: The Process ID of the process that created this context. */
+	__u64 pid;
+	/** @context_id: Context ID. */
+	__u32 context_id;
+	/** @pad: MBZ. */
+	__u32 pad;
+};
+
+/**
+ * enum amdxdna_aie_tile_access_type - AIE tile access path selector
+ * @AMDXDNA_AIE_TILE_ACCESS_REG: Single 32-bit tile-local register access.
+ * @AMDXDNA_AIE_TILE_ACCESS_MEM: DMA block transfer through firmware buffer.
+ */
+enum amdxdna_aie_tile_access_type {
+	AMDXDNA_AIE_TILE_ACCESS_REG,
+	AMDXDNA_AIE_TILE_ACCESS_MEM,
+};
+
+/**
+ * struct amdxdna_drm_aie_tile_access - The data for AIE tile read/write
+ */
+struct amdxdna_drm_aie_tile_access {
+	/** @pid: The Process ID of the process that created this context. */
+	__u64 pid;
+	/** @context_id: Context ID. */
+	__u32 context_id;
+	/** @col: The AIE column index. */
+	__u32 col;
+	/** @row: The AIE row index. */
+	__u32 row;
+	/** @addr: The AIE tile address to read/write. */
+	__u32 addr;
+	/** @size: The size of bytes to read/write. */
+	__u32 size;
+	/** @type: Access path, one of enum amdxdna_aie_tile_access_type. */
+	__u8  type;
+	/** @pad: MBZ. */
+	__u8  pad[3];
+};
+
+/**
+ * struct amdxdna_dpt_metadata - DPT metadata shared between shim and driver.
+ */
+struct amdxdna_dpt_metadata {
+	/**
+	 * @offset: [in/out] DPT read pointer. In: where in the FW ring to
+	 * start reading. Out: updated to the next read position.
+	 */
+	__u64 offset;
+	/**
+	 * @size: [out] Number of bytes the kernel wrote into the payload
+	 * area. The input value is ignored.
+	 */
+	__u32 size;
+	/**
+	 * @watch: [in] If non-zero, the request may wait in the kernel
+	 * until new data is available.
+	 */
+	__u8  watch;
+	/** @pad: MBZ. */
+	__u8  pad[3];
+};
+
+/**
+ * struct amdxdna_drm_set_dpt_state - Structure to configure DPT.
+ */
+struct amdxdna_drm_set_dpt_state {
+	/** @action: 1 to enable, 0 to disable. */
+	__u32 action;
+	/**
+	 * @config: For firmware logging this value indicates log level.
+	 * For DRM_AMDXDNA_SET_FW_TRACE_STATE on enable, a non-zero category
+	 * bitmask is mandatory; passing 0 returns -EINVAL.
+	 */
+	__u32 config;
+	/** @pad: MBZ. */
+	__u64 pad;
+};
+
+/**
+ * struct amdxdna_drm_get_dpt_state - Structure to get current DPT state.
+ *
+ * Convention used by the corresponding DRM_AMDXDNA_FW_*_CONFIG GET ioctl:
+ *   Ioctl returns -EOPNOTSUPP: firmware doesn't support this feature.
+ *   @status == 1: feature is enabled; @version and @config are valid.
+ *   @status == 0: feature is supported but currently disabled;
+ *                 @version and @config are zero-filled and MUST NOT be
+ *                 interpreted by user space.
+ */
+struct amdxdna_drm_get_dpt_state {
+	/** @version: Payload version. Valid only when @status == 1. */
+	__u32 version;
+	/** @status: 1 implies enabled, 0 implies disabled. */
+	__u32 status;
+	/** @config: Kind-specific configuration (log level for FW_LOG,
+	 *  category bitmask for FW_TRACE). Valid only when @status == 1.
+	 */
+	__u32 config;
+	/** @pad: MBZ. */
+	__u32 pad;
+};
+
+/*
+ * Supported params in struct amdxdna_drm_get_array
+ */
+#define DRM_AMDXDNA_HW_CONTEXT_ALL	0
+#define DRM_AMDXDNA_HW_CONTEXT_BY_ID	1
+#define DRM_AMDXDNA_HW_LAST_ASYNC_ERR	2
+#define DRM_AMDXDNA_FW_LOG		3
+#define DRM_AMDXDNA_FW_TRACE		4
+#define DRM_AMDXDNA_AIE_COREDUMP	5
+#define DRM_AMDXDNA_BO_USAGE		6
+#define DRM_AMDXDNA_FW_LOG_CONFIG	7
+#define DRM_AMDXDNA_FW_TRACE_CONFIG	8
+#define DRM_AMDXDNA_AIE_TILE_READ	9
+
+/**
+ * struct amdxdna_drm_get_array - Get information array.
+ */
+struct amdxdna_drm_get_array {
+	/**
+	 * @param:
+	 *
+	 * Supported params:
+	 *
+	 * %DRM_AMDXDNA_HW_CONTEXT_ALL:
+	 * Returns the created hardware contexts the caller is allowed to see:
+	 * contexts owned by other Linux users are omitted unless the caller has
+	 * CAP_SYS_ADMIN, which sees all contexts.
+	 *
+	 * %DRM_AMDXDNA_HW_CONTEXT_BY_ID:
+	 * Returns a single hardware context selected by (pid, context_id).
+	 * num_element must be 1. The first sizeof(struct
+	 * amdxdna_drm_hwctx_entry) bytes of buffer carry the request
+	 * (context_id + pid); on success the driver overwrites that entry
+	 * with the matching context. Both fields must be set: context_id
+	 * must be non-zero (0 is the reserved invalid context handle) and
+	 * pid must be non-zero, otherwise -EINVAL is returned. Access: a
+	 * process running as the same Linux user as the context creator (or
+	 * CAP_SYS_ADMIN) may query the context; a caller that may not see the
+	 * target gets -ENOENT, indistinguishable from a genuinely missing
+	 * context, so another user's contexts are not disclosed.
+	 *
+	 * %DRM_AMDXDNA_HW_LAST_ASYNC_ERR:
+	 * Returns last async error.
+	 *
+	 * %DRM_AMDXDNA_AIE_COREDUMP:
+	 * Returns AIE tile memory dump for a hardware context.
+	 *
+	 * Input: num_element must be 1. buffer points to a user buffer whose
+	 * size is element_size bytes. The first sizeof(struct
+	 * amdxdna_drm_aie_coredump) bytes of buffer carry the request
+	 * (pid + context_id). On success the driver writes rows * cols * 1 MB
+	 * of tile dump data into buffer. If the buffer is too small the
+	 * driver sets element_size to the required size and returns -ENOSPC.
+	 *
+	 * Access: any process running as the same Linux user as the
+	 * context creator may coredump that context; CAP_SYS_ADMIN may
+	 * coredump any context.
+	 *
+	 * %DRM_AMDXDNA_BO_USAGE:
+	 * Returns usage of heap/internal/external BOs.
+	 *
+	 * %DRM_AMDXDNA_AIE_TILE_READ:
+	 * Read an AIE tile register or memory block.
+	 *
+	 * num_element must be 1. The first sizeof(struct
+	 * amdxdna_drm_aie_tile_access) bytes of buffer carry the request
+	 * (pid, context_id, col, row, addr, size, type). On success the
+	 * driver overwrites the first size bytes of buffer with the data
+	 * read back. If element_size is too small the driver sets it to the
+	 * required size and returns -ENOSPC.
+	 *
+	 * @type selects the access path and must be set explicitly to one
+	 * of enum amdxdna_aie_tile_access_type. REG is a single 32-bit
+	 * tile-local register access (requires size == 4); MEM is a DMA
+	 * block transfer through firmware.
+	 *
+	 * Access: any process running as the same Linux user as the
+	 * context creator may read that context; CAP_SYS_ADMIN may read
+	 * any context.
+	 *
+	 * %DRM_AMDXDNA_FW_LOG:
+	 * Returns firmware log payload plus metadata.
+	 *
+	 * num_element must be 1. buffer points to a user buffer whose size
+	 * is element_size bytes. The last sizeof(struct amdxdna_dpt_metadata)
+	 * bytes of buffer carry the request/reply metadata (offset, size,
+	 * watch); the remainder receives the payload. When @watch is set the
+	 * call sleeps in the kernel until new data is available, logging is
+	 * disabled, or a signal arrives.
+	 *
+	 * Returns -ESTALE if @offset predates a disable/enable cycle that
+	 * restarted the ring: that cursor can never be satisfied, and the
+	 * data emitted before the restart is lost. The metadata is still
+	 * written back, with @offset reset to the start of the live ring and
+	 * @size 0, so a caller resumes by storing it and reissuing the call.
+	 * Returns -ESHUTDOWN if logging is not enabled, or was disabled while
+	 * the call waited; that is terminal for the session, so a caller must
+	 * not retry it in a loop. Any other error leaves @buffer untouched.
+	 *
+	 * Access: requires CAP_SYS_ADMIN.
+	 *
+	 * %DRM_AMDXDNA_FW_LOG_CONFIG:
+	 * Returns the current firmware log configuration as
+	 * struct amdxdna_drm_get_dpt_state.
+	 *
+	 * num_element must be 1. element_size must be at least
+	 * sizeof(struct amdxdna_drm_get_dpt_state).
+	 *
+	 * Access: unprivileged. Returns -EOPNOTSUPP if firmware doesn't
+	 * support this feature.
+	 *
+	 * %DRM_AMDXDNA_FW_TRACE:
+	 * Returns firmware event trace payload plus metadata.
+	 *
+	 * num_element must be 1. buffer points to a user buffer whose size
+	 * is element_size bytes. The last sizeof(struct amdxdna_dpt_metadata)
+	 * bytes of buffer carry the request/reply metadata (offset, size,
+	 * watch); the remainder receives the payload. When @watch is set the
+	 * call sleeps in the kernel until new data is available, tracing is
+	 * disabled, or a signal arrives.
+	 *
+	 * Returns -ESTALE if @offset predates a disable/enable cycle that
+	 * restarted the ring: that cursor can never be satisfied, and the
+	 * events emitted before the restart are lost. The metadata is still
+	 * written back, with @offset reset to the start of the live ring and
+	 * @size 0, so a caller resumes by storing it and reissuing the call.
+	 * Returns -ESHUTDOWN if tracing is not enabled, or was disabled while
+	 * the call waited; that is terminal for the session, so a caller must
+	 * not retry it in a loop. Any other error leaves @buffer untouched.
+	 *
+	 * Access: requires CAP_SYS_ADMIN.
+	 *
+	 * %DRM_AMDXDNA_FW_TRACE_CONFIG:
+	 * Returns the current firmware trace configuration as
+	 * struct amdxdna_drm_get_dpt_state.
+	 *
+	 * num_element must be 1. element_size must be at least
+	 * sizeof(struct amdxdna_drm_get_dpt_state).
+	 *
+	 * Access: unprivileged. Returns -EOPNOTSUPP if firmware doesn't
+	 * support this feature.
+	 */
+	__u32 param;
+	/**
+	 * @element_size:
+	 *
+	 * Specifies maximum element size and returns the actual element size.
+	 */
+	__u32 element_size;
+	/**
+	 * @num_element:
+	 *
+	 * Specifies maximum number of elements and returns the actual number
+	 * of elements.
+	 */
+	__u32 num_element; /* in/out */
+	/** @pad: MBZ */
+	__u32 pad;
+	/**
+	 * @buffer:
+	 *
+	 * Specifies the match conditions and returns the matched information
+	 * array.
+	 */
+	__u64 buffer;
+};
+
+enum amdxdna_drm_set_param {
+	DRM_AMDXDNA_SET_POWER_MODE,
+	DRM_AMDXDNA_WRITE_AIE_MEM,
+	DRM_AMDXDNA_WRITE_AIE_REG,
+	DRM_AMDXDNA_SET_FORCE_PREEMPT,
+	DRM_AMDXDNA_SET_FRAME_BOUNDARY_PREEMPT,
+	DRM_AMDXDNA_SET_FW_LOG_STATE,
+	DRM_AMDXDNA_SET_FW_TRACE_STATE,
+	DRM_AMDXDNA_AIE_TILE_WRITE,
+	DRM_AMDXDNA_SET_AUTO_COREDUMP = 9,
+};
+
+/**
+ * struct amdxdna_drm_set_state - Set the state of the AIE hardware.
+ */
+struct amdxdna_drm_set_state {
+	/**
+	 * @param:
+	 *
+	 * Supported params:
+	 *
+	 * %DRM_AMDXDNA_SET_POWER_MODE:
+	 * Sets the power mode.
+	 *
+	 * %DRM_AMDXDNA_WRITE_AIE_MEM:
+	 * Writes AIE memory (legacy).
+	 *
+	 * %DRM_AMDXDNA_WRITE_AIE_REG:
+	 * Writes AIE register (legacy).
+	 *
+	 * %DRM_AMDXDNA_SET_FORCE_PREEMPT:
+	 * Sets force preempt state.
+	 *
+	 * %DRM_AMDXDNA_SET_FRAME_BOUNDARY_PREEMPT:
+	 * Sets frame boundary preempt state.
+	 *
+	 * %DRM_AMDXDNA_AIE_TILE_WRITE:
+	 * Write an AIE tile register or memory block.
+	 *
+	 * The first sizeof(struct amdxdna_drm_aie_tile_access) bytes of
+	 * buffer carry the request (pid, context_id, col, row, addr, size,
+	 * type). The next size bytes contain the data to write. If
+	 * buffer_size is too small the driver sets it to the required size
+	 * and returns -ENOSPC.
+	 *
+	 * @type selects the access path and must be set explicitly to one
+	 * of enum amdxdna_aie_tile_access_type. REG is a single 32-bit
+	 * tile-local register access (requires size == 4); MEM is a DMA
+	 * block transfer through firmware.
+	 *
+	 * Access: requires CAP_SYS_ADMIN (the carrier SET_STATE ioctl is
+	 * DRM_ROOT_ONLY).
+	 *
+	 * %DRM_AMDXDNA_SET_FW_LOG_STATE:
+	 * Enable, disable, or change the level of firmware logging.
+	 *
+	 * buffer points to struct amdxdna_drm_set_dpt_state. action=0
+	 * disables logging; action=1 enables it (or, if already enabled,
+	 * changes the level to @config). @config must be in
+	 * [1, AMDXDNA_DPT_FW_LOG_LEVEL_MAX).
+	 *
+	 * Access: requires CAP_SYS_ADMIN (the SET_STATE ioctl is
+	 * DRM_ROOT_ONLY).
+	 *
+	 * %DRM_AMDXDNA_SET_FW_TRACE_STATE:
+	 * Enable, disable, or change the category bitmask of firmware
+	 * event tracing.
+	 *
+	 * buffer points to struct amdxdna_drm_set_dpt_state. action=0
+	 * disables tracing; action=1 enables it (or, if already enabled,
+	 * replaces the category bitmask). @config must be a non-zero
+	 * bitmask; passing 0 returns -EINVAL.
+	 *
+	 * Access: requires CAP_SYS_ADMIN (the SET_STATE ioctl is
+	 * DRM_ROOT_ONLY).
+	 *
+	 * %DRM_AMDXDNA_SET_AUTO_COREDUMP:
+	 * Controls automatic AIE tile core dump capture on timeout.
+	 * 0 - disable auto core dump capture.
+	 * 1 - capture a core dump into the hardware context on timeout.
+	 */
+	__u32 param;
+	/**
+	 * @buffer_size:
+	 *
+	 * Size of the input buffer in bytes.
+	 */
+	__u32 buffer_size;
+	/**
+	 * @buffer:
+	 *
+	 * Pointer to the input buffer.
+	 */
+	__u64 buffer;
+};
+
+/**
+ * struct amdxdna_drm_set_power_mode - Set the power mode of the AIE hardware
+ * @power_mode: The sensor type from enum amdxdna_power_mode_type
+ * @pad: MBZ.
+ */
+struct amdxdna_drm_set_power_mode {
+	__u8 power_mode;
+	__u8 pad[7];
+};
+
+#define DRM_IOCTL_AMDXDNA_CREATE_HWCTX \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_HWCTX, \
+		 struct amdxdna_drm_create_hwctx)
+
+#define DRM_IOCTL_AMDXDNA_DESTROY_HWCTX \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_DESTROY_HWCTX, \
+		 struct amdxdna_drm_destroy_hwctx)
+
+#define DRM_IOCTL_AMDXDNA_CONFIG_HWCTX \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CONFIG_HWCTX, \
+		 struct amdxdna_drm_config_hwctx)
+
+#define DRM_IOCTL_AMDXDNA_CREATE_BO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_BO, \
+		 struct amdxdna_drm_create_bo)
+
+#define DRM_IOCTL_AMDXDNA_GET_BO_INFO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_BO_INFO, \
+		 struct amdxdna_drm_get_bo_info)
+
+#define DRM_IOCTL_AMDXDNA_SYNC_BO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SYNC_BO, \
+		 struct amdxdna_drm_sync_bo)
+
+#define DRM_IOCTL_AMDXDNA_EXEC_CMD \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_EXEC_CMD, \
+		 struct amdxdna_drm_exec_cmd)
+
+#define DRM_IOCTL_AMDXDNA_GET_INFO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_INFO, \
+		 struct amdxdna_drm_get_info)
+
+#define DRM_IOCTL_AMDXDNA_SET_STATE \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SET_STATE, \
+		 struct amdxdna_drm_set_state)
+
+#define DRM_IOCTL_AMDXDNA_GET_ARRAY \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_ARRAY, \
+		 struct amdxdna_drm_get_array)
+
+#define DRM_IOCTL_AMDXDNA_WAIT_CMD \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_AMDXDNA_WAIT_CMD, \
+		struct amdxdna_drm_wait_cmd)
+
+#if defined(__cplusplus)
+} /* extern c end */
+#endif
+
+#endif /* _UAPI_AMDXDNA_ACCEL_H_ */

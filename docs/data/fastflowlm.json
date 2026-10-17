@@ -1,0 +1,123 @@
+{
+  "runtime": "FastFlowLM",
+  "about": "FastFlowLM's models on the same machine and prompts, for comparison. comparable_quants: the GGUF quants of the same model whose Artlite rows the charts pair with this one, first match first (q4nx is Q4_1 or Q4_K numerics in FLM's own tiles). same_shapes_as: a model with the same architecture and sizes. A row's version and date: a row measured with another release than the file's.",
+  "version": "1.0.7 (v1.0.7-56-g6c9ed874), flm serve, default prefill chunks of 4096, each model at its native context",
+  "date": "2026-10-04",
+  "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU), NPU power mode turbo",
+  "chart_note": "flm serve, 4096-token prefill chunks",
+  "method": {
+    "ttft_s": "streaming /v1/chat/completions with a Paul Graham essays prompt of n tokens, greedy, 128 tokens: client time to the first token (median of up to 3)",
+    "prefill_tps": "n / ttft_s",
+    "decode_tps": "(tokens - 1) / time from the first to the last streamed token",
+    "engine_prefill_tps": "FLM's own figures: without the HTTP and streaming overhead, a few percent higher",
+    "engine_decode_tps": "FLM's own figures: without sampling and streaming"
+  },
+  "results": [
+    {
+      "model": "Qwen3 0.6B",
+      "tag": "qwen3:0.6b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF (Unsloth style)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 0.88, "2048": 1.26, "4096": 2.21, "8192": 5.25, "16384": 15.38, "32768": 45.19},
+      "prefill_tps": {"1024": 1166, "2048": 1624, "4096": 1853, "8192": 1559, "16384": 1065, "32768": 725},
+      "decode_tps": {"1024": 70.87, "2048": 60.25, "4096": 45.96, "8192": 32.14, "16384": 19.74, "32768": 11.17},
+      "engine_prefill_tps": {"1024": 1258, "2048": 1733, "4096": 1941, "8192": 1603, "16384": 1082, "32768": 732},
+      "engine_decode_tps": {"1024": 70.94, "2048": 60.18, "4096": 45.79, "8192": 31.86, "16384": 19.52, "32768": 11.03}
+    },
+    {
+      "model": "Llama 3.2 1B Instruct",
+      "tag": "llama3.2:1b",
+      "quant": "q4nx",
+      "weights": "Unsloth's imatrix Q4_1 GGUF (bit-exact with the Q4_1 file Artlite measures)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 0.7, "2048": 1.04, "4096": 1.87, "8192": 4.37, "16384": 11.53, "32768": 34.07, "65536": 111.96},
+      "prefill_tps": {"1024": 1456, "2048": 1978, "4096": 2193, "8192": 1875, "16384": 1421, "32768": 962, "65536": 585},
+      "decode_tps": {"1024": 57.07, "2048": 54.67, "4096": 50.07, "8192": 43.51, "16384": 33.29, "32768": 23.29, "65536": 14.5},
+      "engine_prefill_tps": {"1024": 1479, "2048": 1999, "4096": 2211, "8192": 1883, "16384": 1425, "32768": 963, "65536": 586},
+      "engine_decode_tps": {"1024": 58.43, "2048": 55.89, "4096": 51.14, "8192": 44.33, "16384": 33.84, "32768": 23.61, "65536": 14.67}
+    },
+    {
+      "model": "Llama 3.2 3B Instruct",
+      "tag": "llama3.2:3b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF (Unsloth style)",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 1.62, "2048": 2.46, "4096": 5.52, "8192": 10.4, "16384": 26.88, "32768": 78.05, "65536": 253.37},
+      "prefill_tps": {"1024": 631, "2048": 831, "4096": 743, "8192": 787, "16384": 610, "32768": 420, "65536": 259},
+      "decode_tps": {"1024": 23.15, "2048": 21.98, "4096": 19.9, "8192": 16.8, "16384": 12.75, "32768": 8.59, "65536": 5.17},
+      "engine_prefill_tps": {"1024": 635, "2048": 836, "4096": 745, "8192": 789, "16384": 610, "32768": 420, "65536": 259},
+      "engine_decode_tps": {"1024": 23.45, "2048": 22.26, "4096": 20.15, "8192": 17.0, "16384": 12.89, "32768": 8.67, "65536": 5.22}
+    },
+    {
+      "model": "Gemma 4 E2B it",
+      "tag": "gemma4-it:e2b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF; int8 embeddings, bf16 per-layer projections",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 1.63, "2048": 2.44, "4096": 4.08, "8192": 9.02, "16384": 21.11, "32768": 54.64, "65536": 159.73},
+      "prefill_tps": {"1024": 630, "2048": 840, "4096": 1004, "8192": 908, "16384": 776, "32768": 600, "65536": 410},
+      "decode_tps": {"1024": 19.63, "2048": 19.0, "4096": 17.77, "8192": 15.84, "16384": 12.92, "32768": 9.53, "65536": 6.22},
+      "engine_prefill_tps": {"1024": 646, "2048": 854, "4096": 1015, "8192": 913, "16384": 779, "32768": 601, "65536": 411},
+      "engine_decode_tps": {"1024": 19.92, "2048": 19.28, "4096": 18.03, "8192": 16.06, "16384": 13.08, "32768": 9.64, "65536": 6.29}
+    },
+    {
+      "model": "Gemma 4 E4B it",
+      "tag": "gemma4-it:e4b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF; int8 embeddings, bf16 per-layer projections",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 2.73, "2048": 4.06, "4096": 6.74, "8192": 14.14, "16384": 32.59, "32768": 75.69, "65536": 201.64},
+      "prefill_tps": {"1024": 375, "2048": 504, "4096": 608, "8192": 579, "16384": 503, "32768": 433, "65536": 325},
+      "decode_tps": {"1024": 11.53, "2048": 11.22, "4096": 10.73, "8192": 9.85, "16384": 8.42, "32768": 6.55, "65536": 4.53},
+      "engine_prefill_tps": {"1024": 386, "2048": 514, "4096": 615, "8192": 583, "16384": 505, "32768": 434, "65536": 325},
+      "engine_decode_tps": {"1024": 11.67, "2048": 11.36, "4096": 10.85, "8192": 9.96, "16384": 8.51, "32768": 6.62, "65536": 4.58}
+    },
+    {
+      "model": "DeepSeek R1 Distill Llama 8B",
+      "same_shapes_as": "Llama 3.1 8B Instruct",
+      "tag": "deepseek-r1:8b",
+      "quant": "q4nx",
+      "weights": "imatrix Q4_1 GGUF, untied",
+      "comparable_quants": ["Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0"],
+      "ttft_s": {"1024": 2.76, "2048": 4.6, "4096": 8.3, "8192": 18.39, "16384": 43.36, "32768": 113.88},
+      "prefill_tps": {"1024": 371, "2048": 445, "4096": 493, "8192": 445, "16384": 378, "32768": 288},
+      "decode_tps": {"1024": 10.76, "2048": 10.46, "4096": 9.91, "8192": 8.94, "16384": 7.49, "32768": 5.65},
+      "engine_prefill_tps": {"1024": 372, "2048": 447, "4096": 494, "8192": 446, "16384": 378, "32768": 288},
+      "engine_decode_tps": {"1024": 10.87, "2048": 10.57, "4096": 10.01, "8192": 9.03, "16384": 7.56, "32768": 5.7}
+    },
+    {
+      "model": "Qwen3.6 35B-A3B",
+      "tag": "qwen3.6-moe:35b-a3b",
+      "quant": "q4nx",
+      "weights": "Q4_K GGUF re-fit to FLM's Q4_K (4.625 bpw)",
+      "comparable_quants": ["Q4_K_M", "Q4_K_S"],
+      "ttft_s": {"1024": 9.02, "2048": 11.57, "4096": 16.89, "8192": 33.93, "16384": 68.52, "32768": 150.35},
+      "prefill_tps": {"1024": 113, "2048": 177, "4096": 242, "8192": 241, "16384": 239, "32768": 218},
+      "decode_tps": {"1024": 16.53, "2048": 16.29, "4096": 15.74, "8192": 14.68, "16384": 13.0, "32768": 10.71},
+      "engine_prefill_tps": {"1024": 119, "2048": 184, "4096": 249, "8192": 245, "16384": 241, "32768": 219},
+      "engine_decode_tps": {"1024": 16.36, "2048": 16.12, "4096": 15.57, "8192": 14.52, "16384": 12.85, "32768": 10.59}
+    },
+    {
+      "model": "Qwen3.8 27B",
+      "tag": "qwen3.8-mtp:27b",
+      "version": "1.0.9 (v1.0.9-41-gd8767c0a), ctx-len 8192: its largest that loads",
+      "date": "2026-10-17",
+      "quant": "q4nx",
+      "weights": "Q4_K numerics re-fit to FLM's Q4_K (4.625 bpw); lm_head and embedding Q8_0; its MTP layer",
+      "comparable_quants": ["Q4_K_M", "Q4_K_S"],
+      "ttft_s": {"1024": 9.08, "2048": 17.34, "4096": 34.17, "7936": 67.68},
+      "prefill_tps": {"1024": 113, "2048": 118, "4096": 120, "7936": 117},
+      "decode_tps": {"1024": 1.89, "2048": 1.91, "4096": 1.48, "7936": 1.6},
+      "engine_prefill_tps": {"1024": 113, "2048": 118, "4096": 120, "7936": 117},
+      "engine_decode_tps": {"1024": 1.91, "2048": 1.94, "4096": 1.5, "7936": 1.65},
+      "notes": {
+        "prefill_tps": {"32768": "FastFlowLM loads it with at most 8192 positions"},
+        "decode_tps": {
+          "1024": "with its MTP head: 7 drafts per step, 2.76 accepted",
+          "32768": "FastFlowLM loads it with at most 8192 positions"
+        }
+      }
+    }
+  ]
+}

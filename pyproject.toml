@@ -1,0 +1,98 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "nanobind>=2.12.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "artlite"
+version = "0.1.0"
+description = "Lightweight NPU runtime for AMD Ryzen AI"
+readme = "README.md"
+license = "GPL-3.0-or-later AND Apache-2.0 AND GPL-2.0-only WITH Linux-syscall-note"  # csrc/shim_xdna: its LICENSE
+license-files = ["LICENSE", "csrc/shim_xdna/LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "mlir_aie==1.4.5.dev48+gcb6f2d1",
+    "llvm_aie==22.0.0.2026101601+4f5df13d",
+    "numpy",
+    "torch>=2.11.0",
+    "pyyaml>=6.0.3",
+    "ml-dtypes",
+    "gguf>=0.19.0",
+    "jinja2>=3.1.6",
+]
+
+[project.scripts]
+artlite-cli = "models.cli:main"
+artlite-bench = "models.bench:main"
+artlite-server = "models.server.main:main"
+
+[project.optional-dependencies]
+examples = [
+    "gigatoken>=0.10.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "nanobind>=2.12.0",
+    "scikit-build-core>=0.10",
+    "ruff>=0.16.2",
+    "httpx>=0.28",
+    "openai>=1.60",
+]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build"
+wheel.packages = ["src/artlite", "src/models"]
+
+[tool.uv]
+find-links = [
+    "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4",
+    "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/rtc"]
+markers = [
+    "slow: whole-model tests (minutes each); skipped unless --run-slow or -m slow",
+    "smoke: the quick check after a change (conftest.SMOKE): host tests and one NPU case per component",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[tool.ruff]
+line-length = 120  # the style's width (import sorting wraps at it); long lines are not reported
+force-exclude = true  # (so that the format exclusion also holds for files named on the command line)
+
+[tool.ruff.lint]
+# ruff's default rule set (pyflakes, bugbear, pyupgrade, isort, pylint errors, ...) plus checks of AGENTS.md rules,
+# each clean on the whole tree: `ruff check` reports only what a change introduced. Not checked, since the tree
+# does not follow them: line length (E501), fully unannotated functions (IRON worker / sequence callbacks),
+# positional parameters beyond 3 (PLR0917: public signatures, positional IRON callbacks).
+extend-select = [
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ANN205", "ANN206",  # see flake8-annotations
+    "E711", "E712", "E713", "E714", "E721",  # comparisons with None / True, `not in`, type()
+    "TID251",  # banned imports (below)
+]
+
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true  # a function with any annotation must annotate every parameter and its return value
+suppress-none-returning = true  # (but `-> None` is not required)
+mypy-init-return = true
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"iron".msg = "never import IRON operators: Artlite operators are self-contained (aie.iron is fine)"
+
+[tool.ruff.format]
+exclude = ["*"]  # the tree is not uniformly formatted: `ruff format` must not rewrite whole files

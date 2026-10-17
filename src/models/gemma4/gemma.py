@@ -1,0 +1,246 @@
+"""Gemma 4 (E4B) inference on the NPU from a GGUF file (Q4_0 layers, Q8_0 embedding).
+
+A decode dispatch runs up to four consecutive tokens on one stream of the weights
+(``artlite.operators.gemma4.overlay.GemmaOverlay``, the decode overlay): every layer's projections and the LM head on
+the main and helper cores, the attention and the KV cache on the attention cores. A prompt runs in chunks of up to
+2048 tokens through the prefill (``artlite.operators.gemma4.prefill.GemmaPrefill``: GEMMs on the same weight image,
+its caches the decode's), only the layers that own a KV cache (24 of E4B's 42: the others read the caches of layers
+22 / 23); its last token runs as a decode step (the logits). The host computes what enters them - the tokens'
+embedding rows and per-layer inputs (``per_layer_model_proj`` of the embedding plus the per-layer embedding row; a
+chunk's on a worker thread while the previous chunk runs) - and samples from the logits.
+
+Multi-token prediction (``NpuGemma.generate``, with the model's ``gemma4-assistant`` drafter, ``mtp-<model file>`` next
+to it: ``artlite.operators.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
+sampled token takes three draft tokens along - the drafter's guesses of what follows, a dispatch of the same design each
+(~1 ms) - and every draft that the model's own choice at its position confirms is a token without a dispatch of its
+own. The text is the model's: a draft is only kept where the token sampled from the model's logits is that draft.
+
+Memory: the weights the NPU streams (the layers and the LM head: 3.0 GB of E4B's Q4_0 file) are
+re-laid-out into a device buffer at load, at their quantization's size; nothing is written to
+disk. The per-layer token embedding (1.6 GB) is never loaded: its rows are read from the mapped
+file, as is the token embedding's row.
+"""
+
+import os
+import time
+from collections import OrderedDict
+from collections.abc import Iterator
+
+import torch
+
+from artlite import parallel_compile
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import GemmaConfig, assistant_of
+from artlite.operators.gemma4.draft import GemmaDraft, argmax_bf16, output_norm
+from artlite.operators.gemma4.overlay import GemmaOverlay
+from artlite.operators.gemma4.prefill import GemmaPrefill
+from artlite.operators.overlay.decode import SLOTS as BATCH  # tokens per dispatch
+
+from ..common import Model, OverlayModel, Sampling
+from .host import GemmaHost, softcap
+from .tokenizer import GemmaTokenizer, chat_prompt
+
+
+class NpuGemma(OverlayModel):
+    """The model on the NPU and the host side of a token.
+
+    ``capacity``: the positions the caches hold (48.4 KB per position: the 20 sliding-window layers' linear caches and
+    the 4 full layers'; ``kv_k`` "single": 32.3 KB); ``prefill``: prompts in chunks through the prefill (else as decode
+    steps); ``drafter``: the multi-token-prediction drafter's GGUF file ("": ``mtp-<model file>`` next to the model,
+    when it is there; None: none); ``kv_k``: the caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block
+    per 8 dims)."""
+
+    INPUT_CACHE = 1024  # tokens whose inputs are kept (24 KB each)
+    DRAFTS = BATCH - 1  # draft tokens per dispatch
+
+    def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 8, prefill: bool = True,
+                 drafter: str | None = "", kv_k: str = "hilo"):
+        self.gguf = gguf
+        self.host = GemmaHost(gguf, threads=threads)
+        self._inputs: OrderedDict[int, tuple[torch.Tensor, torch.Tensor | None]] = OrderedDict()
+        self.cfg = self.host.cfg
+        self.eos_token_ids = self.cfg.eos_token_ids
+        if capacity > self.cfg.max_position_embeddings:
+            raise ValueError(f"capacity {capacity} exceeds the model's context of {self.cfg.max_position_embeddings}")
+        self.capacity = capacity
+        self.overlay = GemmaOverlay(gguf, max_positions=capacity + BATCH, kv_k=kv_k)
+        self.prefill = GemmaPrefill(self.overlay) if prefill else None
+        path = assistant_of(gguf.path) if drafter == "" else drafter
+        self.drafter: GemmaDraft | None = None
+        if path and (drafter or os.path.exists(path)):
+            self.drafter = GemmaDraft(self.overlay, GGUFFile(path))
+        parallel_compile.compile_all([self.overlay.op] + ([self.prefill.lib] if prefill else []))
+        self.overlay.load(threads=threads)
+        if self.drafter is not None:
+            self.drafter.load(threads=threads)
+            self.drafter.gguf.release()
+        if self.prefill is not None:
+            self.prefill.bind()
+            self.prefill.lib._kernel()  # (its HW context before timing, as the decode's)
+        for S in range(1, BATCH + 1):  # (the steps' transactions; with drafts every S has logits)
+            self.overlay.prepare(S, logits=S == 1 or self.drafter is not None)
+            self.overlay.prepare(S, logits=False)
+        if self.prefill is not None:  # (a prompt's last token after its chunk)
+            self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
+        if self.cfg.per_layer_dim:
+            self.inputs(0)  # (the per-layer projection's bf16 copy before timing)
+        gguf.release()
+        self.position = 0
+        self.t_draft = 0.0
+        self.drafted = self.accepted = 0
+
+    def describe(self) -> str:
+        d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
+        return (f"{self.overlay.image.streamed_bytes() / 1e9:.2f} GB of weights, {self.overlay.sizes['KV'] / 1e6:.0f} MB "
+                f"of KV cache ({self.capacity} positions){d}")
+
+    def stats(self) -> str:
+        if not self.drafted:
+            return ""
+        return (f"{self.drafted} draft tokens ({self.t_draft / self.drafted * 1e3:.2f} ms each), {self.accepted} "
+                f"accepted")
+
+    def reset(self) -> None:
+        """Forget the cached positions."""
+        self.position = 0
+
+    def _prepare(self, tokens: list[int]) -> None:
+        """The inputs of the tokens that are not kept, in one pass over the per-layer projection."""
+        new = list(dict.fromkeys(t for t in tokens if t not in self._inputs))
+        if not new:
+            return
+        x = self.host.embed(new)
+        pli = self.host.per_layer_inputs(new, x, bf16=True)
+        for i, t in enumerate(new):
+            self._inputs[t] = (x[i].bfloat16(), None if pli is None else pli[i].bfloat16())
+
+    def inputs(self, token: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """What the NPU needs of a token: its scaled embedding (hidden,) and its per-layer inputs
+        (layers, per_layer_dim), bf16. They depend on the token alone: the last ones are kept."""
+        self._prepare([token])
+        self._inputs.move_to_end(token)
+        return self._inputs[token]
+
+    def cap(self, logits: torch.Tensor) -> torch.Tensor:
+        return softcap(logits, self.cfg.final_logit_softcapping)
+
+    def _step_inputs(self, tokens: list[int]) -> tuple:
+        """(the tokens' kept inputs: ``inputs``)"""
+        self._prepare(tokens)
+        ins = [self.inputs(t) for t in tokens]
+        while len(self._inputs) > self.INPUT_CACHE:
+            self._inputs.popitem(last=False)
+        return torch.stack([i[0] for i in ins]), None if ins[0][1] is None else torch.stack([i[1] for i in ins])
+
+    def chunk_inputs(self, tokens: list[int], x: torch.Tensor | None = None
+                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """A prefill chunk's inputs: the scaled embeddings (n, hidden) and the per-layer inputs (n, the prefill's layers,
+        dim), bf16 values (x: the embeddings, computed already)."""
+        x = self.host.embed(tokens) if x is None else x
+        pli = self.host.per_layer_inputs(tokens, x, bf16=True, layers=len(self.prefill.layers))
+        return x.bfloat16(), None if pli is None else pli.bfloat16()
+
+    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
+        """(the first chunk: its per-layer inputs on the worker thread while its first operators run)"""
+        if not first:
+            return self.chunk_inputs(tokens)
+        x = self.host.embed(tokens)
+        return x.bfloat16(), self._pool.submit(lambda: self.chunk_inputs(tokens, x)[1])
+
+    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+        """(a step from the prefill's last layer on - the layers that share a KV cache, the LM head: 19 of E4B's 42
+        layers, ~25 ms less than a decode step -, its input the chunk's residual stream)"""
+        t0 = time.perf_counter()
+        x = self.prefill.residual(n - 1)
+        pli = self.inputs(token)[1]
+        self.t_host += time.perf_counter() - t0
+        return self._dispatch(lambda: self.overlay.step(x, None if pli is None else pli[None], self.position + n - 1,
+                                                        start=self.prefill.layers[-1])[0])
+
+    # ------------------------------------------------------------------
+    # Multi-token prediction
+    # ------------------------------------------------------------------
+
+    def hidden_state(self, slot: int | None = None) -> torch.Tensor:
+        """The output-normed hidden state (hidden,) bf16 of slot ``slot`` of the last step (it computed logits; default:
+        its last token's, ``slot``): what a draft continues from."""
+        slot = self.slot if slot is None else slot
+        return output_norm(self.overlay.residual(slot), self.host.mat("output_norm.weight"), self.cfg.rms_norm_eps)
+
+    def draft(self, token: int, h: torch.Tensor, n: int) -> list[int]:
+        """The drafter's guesses of the (up to n) tokens after ``token`` - the token of the next position, not run yet;
+        h: the hidden state of the position before it -: its most likely one, the most likely one after that, ...
+        (ends with an end-of-sequence token)."""
+        t0 = time.perf_counter()
+        out: list[int] = []
+        while len(out) < n and token not in self.eos_token_ids:
+            x = self._inputs[token][0] if token in self._inputs else self.host.embed([token])[0]
+            token = self.drafter.token(self.drafter.step(x, h if not out else None, self.position))
+            out.append(token)  # (its per-layer inputs: with the verifying step's others, in one pass)
+        self.t_draft += time.perf_counter() - t0
+        self.drafted += len(out)
+        return out
+
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling) -> Iterator[int]:
+        """With the drafter: multi-token prediction. The sampled token's dispatch takes up to ``DRAFTS`` draft tokens
+        along; the model's logits after a token give its own next token (sampled), and as long as that is the draft that
+        ran behind it, the draft's logits are valid too. The rejected drafts' positions are forgotten (the next steps
+        overwrite their cache records)."""
+        if self.drafter is None:
+            yield from super().generate(logits, max_tokens, sampling)
+            return
+        if max_tokens == 0:
+            return
+        cap = self.cfg.final_logit_softcapping
+        token = sampling.pick(*torch.topk(logits.float(), sampling.k))
+        h = self.hidden_state()
+        n = 1
+        yield token
+        while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
+            k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else BATCH)
+            d = self.draft(token, h, k) if k > 0 else []
+            raw = self.steps([token, *d])
+            new: list[int] = []
+            for i in range(len(d) + 1):  # (the soft cap is monotonic: applied to the top k alone)
+                if sampling.k == 1:
+                    new.append(argmax_bf16(raw[i]))
+                else:
+                    v, ids = torch.topk(raw[i].float(), sampling.k)
+                    new.append(sampling.pick(softcap(v, cap), ids))
+                if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
+                    break
+            self.position -= len(d) + 1 - len(new)
+            self.accepted += len(new) - 1
+            h = self.hidden_state(len(new) - 1)
+            for token in new:
+                n += 1
+                yield token
+
+
+class Gemma(Model):
+    """Gemma 4 from a GGUF file: the architecture, tokenizer and chat template from its metadata. ``kv_k``: the KV
+    caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block per 8 dims)."""
+
+    name = "Gemma 4"
+    thinks = True
+    reasoning = ("<|channel>thought", "<channel|>")  # (a thought is the "thought" channel)
+
+    def __init__(self, path: str, *, kv_k: str = "hilo"):
+        if kv_k not in ("hilo", "single"):
+            raise ValueError(f"kv_k: {kv_k!r} (one of hilo, single)")
+        self.kv_k = kv_k
+        self.gguf = GGUFFile(path)
+        self.tokenizer = GemmaTokenizer(self.gguf)
+        self.eos_token_ids = GemmaConfig.from_gguf(self.gguf).eos_token_ids
+
+    def encode(self, text: str) -> list[int]:
+        return self.tokenizer.encode(text, add_bos=True)
+
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
+        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think))
+
+    def sampling(self, *, think: bool = False) -> Sampling:
+        return Sampling(temp=1.0, top_k=64, top_p=0.95)  # (the model card's)
+
+    def load(self, *, capacity: int, prefill: bool = True) -> NpuGemma:
+        return NpuGemma(self.gguf, capacity=capacity, prefill=prefill, kv_k=self.kv_k)

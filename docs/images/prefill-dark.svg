@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="922" viewBox="0 0 880 922" role="img" aria-labelledby="t d">
+<title id="t">Prefill speed, tokens/s</title>
+<desc id="d">Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file. Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#9198a1;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#f0f6fc}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#f0f6fc}.lbl{font-size:12px;fill:#f0f6fc}.lbl2{font-size:12px}.strong{font-weight:600;fill:#f0f6fc}.muted{fill:#6e7681}.small{font-size:10px}.halo{paint-order:stroke;stroke:#0d1117;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#1b2129}.axis{stroke:#3d444d}.guide{stroke:#2d333b}.bracket{stroke:#9198a1;fill:none}.ft{fill:#1c5cab}.f0{fill:#3987e5}.l0{stroke:#3987e5;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#3987e5;stroke:#0d1117;stroke-width:1.5}.b0{fill:#3987e5;fill-opacity:.16}.f1{fill:#d95926}.l1{stroke:#d95926;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#d95926;stroke:#0d1117;stroke-width:1.5}.b1{fill:#d95926;fill-opacity:.16}.f2{fill:#199e70}.l2{stroke:#199e70;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#199e70;stroke:#0d1117;stroke-width:1.5}.b2{fill:#199e70;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#0d1117;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
+<rect x="0.5" y="0.5" width="879" height="921" rx="8" fill="#0d1117" stroke="#3d444d"/>
+<text x="24.0" y="40.0" class="title">Prefill speed, tokens/s</text>
+<text x="24.0" y="59.0" class="sub">Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file.</text>
+<text x="24.0" y="78.0" class="sub">Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</text>
+<rect x="24" y="99" width="12" height="12" rx="3" class="f0"/>
+<text x="42.0" y="108.0" class="lbl">Artlite</text>
+<rect x="94.672" y="99" width="12" height="12" rx="3" class="f1"/>
+<text x="112.7" y="108.0" class="lbl">FastFlowLM 1.0.7</text>
+<rect x="230.036" y="99" width="12" height="12" rx="3" class="f3"/>
+<text x="248.0" y="108.0" class="lbl">OpenFlowLM 0.1.0-99fe7e4</text>
+<text x="162.7" y="142.0" class="h">1k-token prompt</text>
+<text x="524.4" y="142.0" class="h">32k-token prompt</text>
+<line x1="162.7" y1="154.0" x2="162.7" y2="770.0" class="axis"/>
+<text x="162.7" y="784.0" text-anchor="middle">0</text>
+<line x1="323.9" y1="154.0" x2="323.9" y2="770.0" class="grid"/>
+<text x="323.9" y="784.0" text-anchor="middle">5k</text>
+<line x1="485.0" y1="154.0" x2="485.0" y2="770.0" class="grid"/>
+<text x="485.0" y="784.0" text-anchor="middle">10k</text>
+<line x1="524.4" y1="154.0" x2="524.4" y2="770.0" class="axis"/>
+<text x="524.4" y="784.0" text-anchor="middle">0</text>
+<line x1="685.5" y1="154.0" x2="685.5" y2="770.0" class="grid"/>
+<text x="685.5" y="784.0" text-anchor="middle">5k</text>
+<line x1="846.6" y1="154.0" x2="846.6" y2="770.0" class="grid"/>
+<text x="846.6" y="784.0" text-anchor="middle">10k</text>
+<text x="24" y="168.0" class="h">Llama 3.2 1B Instruct</text>
+<text x="152.7" y="186.5" text-anchor="end" class="lbl">Q4_0</text>
+<path d="M162.7,176.0h297.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-297.2z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_0, 1k-token prompt: 9345</title></path>
+<text x="468.9" y="186.5">9345</text>
+<path d="M524.4,176.0h119.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-119.0z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_0, 32k-token prompt: 3815</title></path>
+<text x="652.3" y="186.5">3815</text>
+<text x="152.7" y="205.5" text-anchor="end" class="lbl">Q4_1</text>
+<path d="M162.7,195.0h297.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-297.1z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_1, 1k-token prompt: 9344</title></path>
+<text x="468.9" y="205.5">9344</text>
+<path d="M524.4,195.0h118.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-118.8z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_1, 32k-token prompt: 3810</title></path>
+<text x="652.1" y="205.5">3810</text>
+<text x="152.7" y="220.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
+<path d="M162.7,210.0h42.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-42.9z" class="f1"><title>FastFlowLM, Llama 3.2 1B Instruct q4nx, 1k-token prompt: 1456</title></path>
+<text x="214.6" y="220.5">1456<tspan dx="10" class="strong">Artlite 6.4× faster</tspan></text>
+<path d="M524.4,210.0h27.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-27.0z" class="f1"><title>FastFlowLM, Llama 3.2 1B Instruct q4nx, 32k-token prompt: 962</title></path>
+<text x="560.4" y="220.5">962<tspan dx="10" class="strong">Artlite 4.0× faster</tspan></text>
+<text x="152.7" y="235.5" text-anchor="end" class="lbl2">OpenFlowLM q4nx</text>
+<path d="M162.7,225.0h0.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-0.6z" class="f3"><title>OpenFlowLM, Llama 3.2 1B Instruct q4nx, 1k-token prompt: 143</title></path>
+<text x="172.3" y="235.5">143<tspan dx="10" class="strong">Artlite 65× faster</tspan></text>
+<text x="529.4" y="235.5">—*</text>
+<text x="152.7" y="254.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,244.0h261.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-261.4z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_K_M, 1k-token prompt: 8236</title></path>
+<text x="433.2" y="254.5">8236</text>
+<path d="M524.4,244.0h113.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-113.9z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_K_M, 32k-token prompt: 3658</title></path>
+<text x="647.3" y="254.5">3658</text>
+<text x="152.7" y="273.5" text-anchor="end" class="lbl">Q3_K_L</text>
+<path d="M162.7,263.0h236.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-236.7z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q3_K_L, 1k-token prompt: 7469</title></path>
+<text x="408.4" y="273.5">7469</text>
+<path d="M524.4,263.0h107.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-107.9z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q3_K_L, 32k-token prompt: 3471</title></path>
+<text x="641.2" y="273.5">3471</text>
+<text x="152.7" y="292.5" text-anchor="end" class="lbl">BF16</text>
+<path d="M162.7,282.0h251.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-251.1z" class="f0"><title>Artlite, Llama 3.2 1B Instruct BF16, 1k-token prompt: 7915</title></path>
+<text x="422.8" y="292.5">7915</text>
+<path d="M524.4,282.0h111.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-111.0z" class="f0"><title>Artlite, Llama 3.2 1B Instruct BF16, 32k-token prompt: 3567</title></path>
+<text x="644.3" y="292.5">3567</text>
+<text x="152.7" y="311.5" text-anchor="end" class="lbl">Q6_K</text>
+<path d="M162.7,301.0h229.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-229.8z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q6_K, 1k-token prompt: 7254</title></path>
+<text x="401.5" y="311.5">7254</text>
+<path d="M524.4,301.0h106.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-106.5z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q6_K, 32k-token prompt: 3430</title></path>
+<text x="639.9" y="311.5">3430</text>
+<text x="152.7" y="330.5" text-anchor="end" class="lbl">Q5_K_M</text>
+<path d="M162.7,320.0h230.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-230.7z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q5_K_M, 1k-token prompt: 7283</title></path>
+<text x="402.4" y="330.5">7283</text>
+<path d="M524.4,320.0h107.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-107.3z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q5_K_M, 32k-token prompt: 3452</title></path>
+<text x="640.6" y="330.5">3452</text>
+<line x1="24" y1="347.0" x2="856" y2="347.0" class="grid"/>
+<text x="24" y="365.0" class="h">Llama 3.2 3B Instruct</text>
+<text x="152.7" y="383.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,373.0h106.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-106.5z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q4_K_M, 1k-token prompt: 3430</title></path>
+<text x="278.3" y="383.5">3430</text>
+<path d="M524.4,373.0h51.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-51.5z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q4_K_M, 32k-token prompt: 1723</title></path>
+<text x="584.9" y="383.5">1723</text>
+<text x="152.7" y="398.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
+<path d="M162.7,388.0h16.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-16.3z" class="f1"><title>FastFlowLM, Llama 3.2 3B Instruct q4nx, 1k-token prompt: 631</title></path>
+<text x="188.1" y="398.5">631<tspan dx="10" class="strong">Artlite 5.4× faster</tspan></text>
+<path d="M524.4,388.0h9.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-9.5z" class="f1"><title>FastFlowLM, Llama 3.2 3B Instruct q4nx, 32k-token prompt: 420</title></path>
+<text x="542.9" y="398.5">420<tspan dx="10" class="strong">Artlite 4.1× faster</tspan></text>
+<text x="152.7" y="413.5" text-anchor="end" class="lbl2">OpenFlowLM q4nx</text>
+<path d="M162.7,403.0h0.0a2.1593286249331194,2.1593286249331194 0 0 1 2.1593286249331194,2.1593286249331194v8.7a2.1593286249331194,2.1593286249331194 0 0 1 -2.1593286249331194,2.1593286249331194h0.0z" class="f3"><title>OpenFlowLM, Llama 3.2 3B Instruct q4nx, 1k-token prompt: 67</title></path>
+<text x="169.9" y="413.5">67<tspan dx="10" class="strong">Artlite 51× faster</tspan></text>
+<text x="529.4" y="413.5">—*</text>
+<text x="152.7" y="432.5" text-anchor="end" class="lbl">BF16</text>
+<path d="M162.7,422.0h99.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-99.2z" class="f0"><title>Artlite, Llama 3.2 3B Instruct BF16, 1k-token prompt: 3201</title></path>
+<text x="270.9" y="432.5">3201</text>
+<path d="M524.4,422.0h49.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-49.4z" class="f0"><title>Artlite, Llama 3.2 3B Instruct BF16, 32k-token prompt: 1658</title></path>
+<text x="582.8" y="432.5">1658</text>
+<text x="152.7" y="451.5" text-anchor="end" class="lbl">Q4_0</text>
+<path d="M162.7,441.0h119.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-119.3z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q4_0, 1k-token prompt: 3826</title></path>
+<text x="291.0" y="451.5">3826</text>
+<path d="M524.4,441.0h54.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-54.3z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q4_0, 32k-token prompt: 1810</title></path>
+<text x="587.7" y="451.5">1810</text>
+<text x="152.7" y="470.5" text-anchor="end" class="lbl">Q5_K_M</text>
+<path d="M162.7,460.0h93.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-93.2z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q5_K_M, 1k-token prompt: 3016</title></path>
+<text x="264.9" y="470.5">3016</text>
+<path d="M524.4,460.0h47.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-47.8z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q5_K_M, 32k-token prompt: 1607</title></path>
+<text x="581.1" y="470.5">1607</text>
+<text x="152.7" y="489.5" text-anchor="end" class="lbl">Q2_K</text>
+<path d="M162.7,479.0h90.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-90.2z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q2_K, 1k-token prompt: 2922</title></path>
+<text x="261.9" y="489.5">2922</text>
+<path d="M524.4,479.0h47.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-47.2z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q2_K, 32k-token prompt: 1590</title></path>
+<text x="580.6" y="489.5">1590</text>
+<text x="152.7" y="508.5" text-anchor="end" class="lbl">Q3_K_M</text>
+<path d="M162.7,498.0h105.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-105.2z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q3_K_M, 1k-token prompt: 3389</title></path>
+<text x="276.9" y="508.5">3389</text>
+<path d="M524.4,498.0h51.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-51.3z" class="f0"><title>Artlite, Llama 3.2 3B Instruct Q3_K_M, 32k-token prompt: 1716</title></path>
+<text x="584.7" y="508.5">1716</text>
+<line x1="24" y1="525.0" x2="856" y2="525.0" class="grid"/>
+<text x="24" y="543.0" class="h">Llama 3.1 8B Instruct</text>
+<text x="152.7" y="561.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,551.0h46.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-46.9z" class="f0"><title>Artlite, Llama 3.1 8B Instruct Q4_K_M, 1k-token prompt: 1579</title></path>
+<text x="218.6" y="561.5">1579</text>
+<path d="M524.4,551.0h21.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-21.8z" class="f0"><title>Artlite, Llama 3.1 8B Instruct Q4_K_M, 32k-token prompt: 802</title></path>
+<text x="555.2" y="561.5">802</text>
+<text x="152.7" y="576.5" text-anchor="end" class="lbl2">FastFlowLM q4nx†</text>
+<path d="M162.7,566.0h8.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-8.0z" class="f1"><title>FastFlowLM, DeepSeek R1 Distill Llama 8B q4nx, 1k-token prompt: 371</title></path>
+<text x="179.7" y="576.5">371<tspan dx="10" class="strong">Artlite 4.3× faster</tspan></text>
+<path d="M524.4,566.0h5.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-5.3z" class="f1"><title>FastFlowLM, DeepSeek R1 Distill Llama 8B q4nx, 32k-token prompt: 288</title></path>
+<text x="538.6" y="576.5">288<tspan dx="10" class="strong">Artlite 2.8× faster</tspan></text>
+<text x="152.7" y="591.5" text-anchor="end" class="lbl2">OpenFlowLM q4nx</text>
+<path d="M162.7,581.0h0.0a1.418066559657571,1.418066559657571 0 0 1 1.418066559657571,1.418066559657571v10.2a1.418066559657571,1.418066559657571 0 0 1 -1.418066559657571,1.418066559657571h0.0z" class="f3"><title>OpenFlowLM, Llama 3.1 8B Instruct q4nx, 1k-token prompt: 44</title></path>
+<text x="169.1" y="591.5">44<tspan dx="10" class="strong">Artlite 36× faster</tspan></text>
+<text x="529.4" y="591.5">—*</text>
+<text x="152.7" y="610.5" text-anchor="end" class="lbl">Q4_K_S</text>
+<path d="M162.7,600.0h49.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-49.8z" class="f0"><title>Artlite, Llama 3.1 8B Instruct Q4_K_S, 1k-token prompt: 1668</title></path>
+<text x="221.5" y="610.5">1668</text>
+<path d="M524.4,600.0h22.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-22.5z" class="f0"><title>Artlite, Llama 3.1 8B Instruct Q4_K_S, 32k-token prompt: 822</title></path>
+<text x="555.9" y="610.5">822</text>
+<line x1="24" y1="627.0" x2="856" y2="627.0" class="grid"/>
+<text x="24" y="645.0" class="h">Gemma 4 E4B it</text>
+<text x="152.7" y="663.5" text-anchor="end" class="lbl">Q4_0</text>
+<path d="M162.7,653.0h83.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-83.5z" class="f0"><title>Artlite, Gemma 4 E4B it Q4_0, 1k-token prompt: 2716</title></path>
+<text x="255.2" y="663.5">2716</text>
+<path d="M524.4,653.0h77.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-77.5z" class="f0"><title>Artlite, Gemma 4 E4B it Q4_0, 32k-token prompt: 2530</title></path>
+<text x="610.9" y="663.5">2530</text>
+<text x="152.7" y="678.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
+<path d="M162.7,668.0h8.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-8.1z" class="f1"><title>FastFlowLM, Gemma 4 E4B it q4nx, 1k-token prompt: 375</title></path>
+<text x="179.8" y="678.5">375<tspan dx="10" class="strong">Artlite 7.2× faster</tspan></text>
+<path d="M524.4,668.0h10.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-10.0z" class="f1"><title>FastFlowLM, Gemma 4 E4B it q4nx, 32k-token prompt: 433</title></path>
+<text x="543.3" y="678.5">433<tspan dx="10" class="strong">Artlite 5.8× faster</tspan></text>
+<line x1="24" y1="695.0" x2="856" y2="695.0" class="grid"/>
+<text x="24" y="713.0" class="h">Qwen3.8 27B</text>
+<text x="152.7" y="731.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,721.0h9.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-9.2z" class="f0"><title>Artlite, Qwen3.8 27B Q4_K_M, 1k-token prompt: 410</title></path>
+<text x="180.9" y="731.5">410</text>
+<path d="M524.4,721.0h6.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-6.2z" class="f0"><title>Artlite, Qwen3.8 27B Q4_K_M, 32k-token prompt: 316</title></path>
+<text x="539.5" y="731.5">316</text>
+<text x="152.7" y="746.5" text-anchor="end" class="lbl2">FastFlowLM 1.0.9 q4nx</text>
+<path d="M162.7,736.0h0.0a3.641852755484216,3.641852755484216 0 0 1 3.641852755484216,3.641852755484216v5.7a3.641852755484216,3.641852755484216 0 0 1 -3.641852755484216,3.641852755484216h0.0z" class="f1"><title>FastFlowLM, Qwen3.8 27B q4nx, 1k-token prompt: 113</title></path>
+<text x="171.4" y="746.5">113<tspan dx="10" class="strong">Artlite 3.6× faster</tspan></text>
+<text x="529.4" y="746.5">—‡</text>
+<text x="152.7" y="761.5" text-anchor="end" class="lbl2">OpenFlowLM q4nx</text>
+<path d="M162.7,751.0h0.0a1.2569226324237561,1.2569226324237561 0 0 1 1.2569226324237561,1.2569226324237561v10.5a1.2569226324237561,1.2569226324237561 0 0 1 -1.2569226324237561,1.2569226324237561h0.0z" class="f3"><title>OpenFlowLM, Qwen3.8 27B q4nx, 1k-token prompt: 39</title></path>
+<text x="169.0" y="761.5">39<tspan dx="10" class="strong">Artlite 11× faster</tspan></text>
+<text x="529.4" y="761.5">—*</text>
+<text x="24.0" y="814.0">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
+<text x="24.0" y="830.0">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
+<text x="24.0" y="846.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
+<text x="24.0" y="862.0">† DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
+<text x="24.0" y="878.0">‡ FastFlowLM loads it with at most 8192 positions</text>
+<text x="24.0" y="894.0">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
+</svg>
