@@ -66,9 +66,10 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from ..base import JINJA_ENV, ArgSpec, ArtcOperator, hashed_prefix
+from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, range32, stream_walk
 from ..gemm.gemm_q import ChainPart, chained_fill
+from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
 from ..overlay.kv import Records
 from ..util import Attr, bf16_hilo, regions
@@ -287,6 +288,7 @@ class PrepOperator(ArtcOperator):
     Parameters ``params``."""
 
     STACK = 1024
+    pfx = kernel_prefix("pap")
 
     def __init__(self, *, T: int, shape: Shape, layout: Layout, kv_bytes: int, cs_positions: int, kv_pad: int = 0):
         s = shape
@@ -301,17 +303,11 @@ class PrepOperator(ArtcOperator):
         hd = self.shape.hd
         return regions([("row", 4 * hd), ("stage", 32 * hd)])
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         s = self.shape
         return _PREP.render(p=p, HD=s.hd, ND=s.nd, KP=s.kp, KREC=s.rec.k_bytes, QUNIT=s.qunit, qc=bf16_hilo(s.scale),
                             w=Attr(self.workspace()))
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("pap", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def n_cs(self) -> int:
@@ -830,6 +826,7 @@ class AttnOperator(ArtcOperator):
     past them), A (T x heads hd as bfp16 panels [T / 8][heads hd / 8]). Parameters ``params``."""
 
     STACK = 2048
+    pfx = kernel_prefix("paa")
     # stats builds: core counters 0: cycles in the region, 1: lock (memory) stall cycles, 2: all cycles, 3: windows
     # (AM029 Performance_Control0 / 1)
     CTRL: ClassVar[tuple[tuple[int, int], ...]] = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24),
@@ -862,18 +859,12 @@ class AttnOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         return regions(self.regions(self.qb * self.shape.qh, self.cr))
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         s = self.shape
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
                             KP=s.kp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("paa", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def n_qs(self) -> int:

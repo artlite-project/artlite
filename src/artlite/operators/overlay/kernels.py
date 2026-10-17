@@ -413,7 +413,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int h = 0; h < 64 * ng; h += 64) {  // (the ng windows of [8 gate | 8 up] rows completed)
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + h)).template to_vector<bfloat16>());
-            {{ p }}_silu_lut<32>(gs, gs + 32);
+            {{ lut }}_silu_lut<32>(gs, gs + 32);
             aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
         }
     }
@@ -421,7 +421,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
     if (flags & {{ F_GU }}) {
         bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
         aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt)).template to_vector<bfloat16>());
-        {{ p }}_silu_lut<32>(gs, gs + 32);
+        {{ lut }}_silu_lut<32>(gs, gs + 32);
         aie::store_v(yt, al::mulc<32>(aie::load_v<32>(yt + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
     }
 {% else %}

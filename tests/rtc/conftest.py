@@ -110,8 +110,15 @@ _dump_state: dict[str, object] = {"test": "", "lock": threading.Lock()}
 
 
 def _dump(out: str, op: object) -> None:
-    src = op.get_kernel_src() or ""
-    mlir = str(op.get_mlir_artifact())
+    """An operator's kernel source and MLIR, or a fused ELF's (its translation unit and fused design)."""
+    from artlite.operators.fused.elf import FusedElf
+
+    if isinstance(op, FusedElf):
+        spec = op.build_spec()
+        src, mlir = spec.source or "", spec.mlir
+    else:
+        ks = op.kernel_source()
+        src, mlir = ks.text if ks is not None else "", op.mlir_text()
     name = f"{type(op).__name__}_{hashlib.sha256((src + mlir).encode()).hexdigest()[:16]}"
     with _dump_state["lock"]:
         for ext, text in ((".cc", src), (".mlir", mlir)):
@@ -140,6 +147,8 @@ def pytest_configure(config: pytest.Config) -> None:
         for op in operators:
             for one in op.operators if isinstance(op, FusedElf) else [op]:
                 _dump(out, one)
+            if isinstance(op, FusedElf):
+                _dump(out, op)
         pytest.skip("--dump-designs")
 
     def compile_op(self: ArtcOperator, *args: object, **kwargs: object) -> None:

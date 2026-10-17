@@ -108,7 +108,7 @@ class V2Design(ArtcOperator):
         def ty(n: int) -> type[np.ndarray]:
             return np.ndarray[(n // 4,), i32]
         sig = [ty(0x8000), ty(NO * OSL), ty(C_BYTES), ty(WS), ty(TABB)]
-        k_main = {role: Kernel(f"v2_main_{role}", "kernel.o", sig) for role in ("a", "b")}
+        k_main = {role: Kernel(f"{core.P}_main_{role}", "kernel.o", sig) for role in ("a", "b")}
         mems = [Tile(c, 1) for c in range(COLS)]
         shims = [Tile(c, 0) for c in range(COLS)]
         cores = [[Tile(c, r + 2) for r in range(ROWS)] for c in range(COLS)]

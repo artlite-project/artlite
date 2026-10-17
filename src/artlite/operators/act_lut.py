@@ -33,6 +33,9 @@ import numpy as np
 import torch
 
 from .base import JINJA_ENV
+from .kernel_source import kernel_prefix
+
+LUT = kernel_prefix("lut")  # the prefix of the tables' kernels (``kernel_source``: one copy for all operators)
 
 
 def _bf16(x: np.ndarray) -> np.ndarray:
@@ -160,26 +163,26 @@ class ActTable:
         w = self.table_words()
         return np.concatenate([w, w])
 
-    def render(self, p: str, *, table_arg: bool = False, gate_up: bool = False, x_step: int = 32) -> str:
-        """The C++ of ``{p}_<name>_lut<N>(x, y)`` (x and y distinct buffers) and its tables. ``table_arg``: no static
-        tables (a core's .rodata lands after the stack, over the buffers a design pins there): ``{p}_<name>_tab`` takes
+    def render(self, *, table_arg: bool = False, gate_up: bool = False, x_step: int = 32) -> str:
+        """The C++ of ``{LUT}_<name>_lut<N>(x, y)`` (x and y distinct buffers) and its tables. ``table_arg``: no static
+        tables (a core's .rodata lands after the stack, over the buffers a design pins there): ``{LUT}_<name>_tab`` takes
         the tables (``table_buffer``, a worker buffer of the core) as its last parameter. ``gate_up``: only ``_tab``,
         its x the gate halves of a GEMM's gate/up C tile ([gate 64 | up 64] per 128 values); ``x_step``: x's 32 values
         of an iteration are that many elements apart (otherwise)."""
         shift = int(np.log2(16 / self.seg))  # 16 bytes of offset per segment
-        return _TABLE.render(p=p, name=self.name, words=[f"0x{w:08x}u" for w in self.table_words()], M=repr(self.m),
+        return _TABLE.render(p=LUT, name=self.name, words=[f"0x{w:08x}u" for w in self.table_words()], M=repr(self.m),
                              bias=int(self.m * 2 ** shift), shift=shift, t_max=repr(self.t_max), table_arg=table_arg,
                              gate_up=gate_up, x_step=x_step)
 
-    def render_unrolled(self, p: str, n: int) -> str:
-        """The C++ of ``{p}_tabu(x, t, t2, y, tab)``: the table pass over n values (a multiple of 64; t = t2 = min(|x|,
+    def render_unrolled(self, n: int) -> str:
+        """The C++ of ``{LUT}_tabu(x, t, t2, y, tab)``: the table pass over n values (a multiple of 64; t = t2 = min(|x|,
         t_max) as bf16, y may be t; ``tab``: ``table_buffer``), two 32-lane halves per iteration with every load
         before the gathers (the gathers carry no memory operand, so each memory operation orders them: one chain per
         iteration ran at 30 cycles per 32 lanes, two at ~22). A plain function (not a template): a kernel of a
         program-memory-patched design must be emitted where it is defined."""
         assert n % 64 == 0
         shift = int(np.log2(16 / self.seg))
-        return _UNROLLED.render(p=p, n64=n // 64, bias=int(self.m * 2 ** shift), shift=shift,
+        return _UNROLLED.render(p=LUT, n64=n // 64, bias=int(self.m * 2 ** shift), shift=shift,
                                 nw=len(self.table_words()))
 
 
@@ -250,7 +253,7 @@ alignas(64) static const uint32_t {{ p }}_{{ name }}_cd[{{ words | length }}] = 
 {% endif %}
 
 // 16 table reads: lanes 0-7 into q0, 8-15 into q1
-[[clang::always_inline]] inline void {{ p }}_{{ "lut16" if name == "silu" else name ~ "_lut16" }}(v16int32 ptr, v32bfloat16 &q0, v32bfloat16 &q1)
+[[clang::always_inline]] inline void {{ p }}_{{ name }}_lut16(v16int32 ptr, v32bfloat16 &q0, v32bfloat16 &q1)
 {
     q0 = insert(q0, 0, (v16bfloat16)load_4x64_lo(extract_v8int32(ptr, 0)));
     q0 = insert(q0, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 0)));
@@ -285,8 +288,8 @@ __attribute__((noinline)) void {{ p }}_{{ name }}_tab(const bfloat16 *__restrict
         const aie::vector<bfloat16, 32> t2 = aie::load_v<32>(pt2);
         const aie::vector<bfloat16, 32> v = aie::mac(k, t, one).template to_vector<bfloat16>();  // t on the grid
         v32bfloat16 q0, q1, q2, q3;
-        {{ p }}_{{ "lut16" if name == "silu" else name ~ "_lut16" }}(::add(base, bfloat16_to_int(v.extract<16>(0), {{ shift }})), q0, q1);
-        {{ p }}_{{ "lut16" if name == "silu" else name ~ "_lut16" }}(::add(base, bfloat16_to_int(v.extract<16>(1), {{ shift }})), q2, q3);
+        {{ p }}_{{ name }}_lut16(::add(base, bfloat16_to_int(v.extract<16>(0), {{ shift }})), q0, q1);
+        {{ p }}_{{ name }}_lut16(::add(base, bfloat16_to_int(v.extract<16>(1), {{ shift }})), q2, q3);
         const aie::vector<bfloat16, 32> r = aie::mac(aie::msc(k, v, one), t2, one).template to_vector<bfloat16>();
         const aie::vector<bfloat16, 32> r2 = aie::mul(r, r).template to_vector<bfloat16>();
         const v32bfloat16 s0 = ::shuffle(q0, q1, T16_16x4_lo);  // c2 | c1 of lanes 0-15
@@ -338,6 +341,6 @@ SILU = ActTable("silu", silu64, 0.25, 32.0, 24.0)
 GELU = ActTable("gelu", gelu64, 0.125, 16.0, 8.0)
 
 
-def render_silu(p: str) -> str:
-    """The C++ of ``{p}_silu_lut<N>(x, y)`` (x and y distinct buffers) and its tables."""
-    return SILU.render(p)
+def render_silu() -> str:
+    """The C++ of ``{LUT}_silu_lut<N>(x, y)`` (x and y distinct buffers) and its tables."""
+    return SILU.render()

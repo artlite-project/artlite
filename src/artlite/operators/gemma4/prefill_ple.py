@@ -22,6 +22,7 @@ from ml_dtypes import bfloat16
 from .. import act_lut
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS
+from ..kernel_source import kernel_prefix
 
 SLOT = 64  # the gate outputs' and proj inputs' column slots
 PER = 32  # values per slot
@@ -49,7 +50,7 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, b
         }
     }
     // gelu of the values (x: the slots of y, {{ SLOT }} apart)
-    {{ p }}_gelu_tab<{{ 8 * 8 * PER }}>(y, t, t, t, tab);
+    {{ lut }}_gelu_tab<{{ 8 * 8 * PER }}>(y, t, t, t, tab);
     {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values, 4 of zeros
         const bfloat16 *__restrict pg = t;
         al::BOut<> o((bfp16ebs8 *)out);
@@ -77,19 +78,16 @@ class PleOperator(ArtcOperator):
     (panels of T x 8 SLOT)."""
 
     STACK = 1024
+    p = kernel_prefix("g4ple")
 
     def __init__(self, *, T: int, cols: int = COLS):
         assert T % 8 == 0 and T >= 8 * cols and 1 <= cols <= COLS
         self.T, self.cols = T, cols
         super().__init__()
 
-    @property
-    def p(self) -> str:
-        return "g4ple"
-
     def get_kernel_src(self) -> str:
-        gelu = act_lut.GELU.render(self.p, table_arg=True, x_step=SLOT)
-        return _SRC.render(p=self.p, gelu=gelu, SLOT=SLOT, PER=PER, tmax=repr(act_lut.GELU.t_max))
+        gelu = act_lut.GELU.render(table_arg=True, x_step=SLOT)
+        return _SRC.render(p=self.p, lut=act_lut.LUT, gelu=gelu, SLOT=SLOT, PER=PER, tmax=repr(act_lut.GELU.t_max))
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T

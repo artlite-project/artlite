@@ -40,9 +40,10 @@ from ml_dtypes import bfloat16
 from .. import act_lut
 from ..design import COLS
 from ..formats import FORMATS, KC, slot
+from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
 from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, TILES, GemmQOperator, L1Error, planar
-from .mac import render_mac
+from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
 REGION = 0x4000  # a core's data memory: four 16 KB regions of two interleaved banks
@@ -64,6 +65,7 @@ class GemmQdOperator(GemmQOperator):
     (``nrows`` is ``mac_rows``); planar tiles: see the module docstring."""
 
     DQ_CORE = True
+    p = kernel_prefix("gqd")
 
     def __init__(self, *, mac_rows: int = 3, m: int = 64, **kw: object):
         """``M``: the tokens the caller uses; the operator runs ``M`` padded to a multiple of
@@ -220,17 +222,11 @@ class GemmQdOperator(GemmQOperator):
                 iv[0] += size
         return lay
 
-    @property
-    def p(self) -> str:
-        return ("gqd" + super().p[2:] + ("_pp" if self.pingpong else "") + ("_h2" if self.halves == 2 else "")
-                + ("_c1" if self.c_depth == 1 else "")
-                + (f"_sx{self.sxp}" if self.sxp > 1 else "") + ("_b1" if self.b_depth == 1 else ""))
-
     def get_kernel_src(self) -> str:
         # (without forcing the post-RA pipeliner: II 33 per block instead of 34)
-        mac = render_mac(name=f"{self.p}_mac", m=self.m, n=self.nm, k=KT)
-        gelu = act_lut.GELU.render(self.p, table_arg=True, gate_up=True) if self.silu and self.act == "gelu" else ""
-        return _KERNEL_TPL.render(p=self.p, m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
+        mac = render_mac(k=KT)
+        gelu = act_lut.GELU.render(table_arg=True, gate_up=True) if self.silu and self.act == "gelu" else ""
+        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", lut=act_lut.LUT, m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
                                   act=self.act, gelu_src=gelu, gelu_tmax=repr(act_lut.GELU.t_max), fmt=self.fmt,
                                   nsb=self.nsb,
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,

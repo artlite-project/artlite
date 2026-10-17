@@ -134,7 +134,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
     event0();
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if lut %}
-    {{ name }}_silu_lut<{{ ts }}>(input, output);
+    {{ lut }}_silu_lut<{{ ts }}>(input, output);
 {% else %}
     // al::silu, 16 lanes per step (see kernel_lib.h)
     for (int j = 0; j < {{ ts }}; j += 16) {
@@ -167,8 +167,8 @@ class SiluOperator(StreamOperator):
         return 0xA00  # a 2.2 KB frame
 
     def get_kernel_src(self) -> str:
-        return ((act_lut.render_silu(self.kernel_name) if self.lut else "")
-                + _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut))
+        return ((act_lut.render_silu() if self.lut else "")
+                + _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and act_lut.LUT))
 
 
 _GELU = JINJA_ENV.from_string(r"""

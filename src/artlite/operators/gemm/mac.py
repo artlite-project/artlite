@@ -38,11 +38,12 @@ cycles and 1584 B).
 """
 
 from ..base import JINJA_ENV
+from ..kernel_source import kernel_prefix
+
+MAC = kernel_prefix("mac")  # the helper's name (``kernel_source``: one copy for all operators that render it alike)
 
 _MAC_TPL = JINJA_ENV.from_string(r"""
 {% set r, s, t = 8, 8, 8 %}
-{% set nb = n // (2 * t) %}
-{% set nbr = m // (2 * r) %}
 {% set ks = k // s %}
 {% set ct = "float" if f32 else "bfloat16" %}
 {% macro kstep(bfill) %}
@@ -68,7 +69,8 @@ _MAC_TPL = JINJA_ENV.from_string(r"""
       acc3.mac(A1, aie::op_transpose(B1));
     }
 {% endmacro %}
-// C ({{ m }} x {{ n }}, 8x8 row-major sub-blocks) += A @ B over one {{ k }}-k tile (operators/gemm/mac.py{{ "; B: halves pB (h), pB1" if split else "" }})
+// C (M x N, 8x8 row-major sub-blocks) += A @ B over one {{ k }}-k tile (operators/gemm/mac.py{{ "; B: halves pB (h), pB1" if split else "" }})
+template <int M, int N>
 static inline __attribute__((always_inline)) void {{ name }}(
     const bfp16ebs8 *__restrict pA, const void *__restrict pB,
 {% if split %}
@@ -79,25 +81,27 @@ static inline __attribute__((always_inline)) void {{ name }}(
   using AStream = aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, {{ r * s }}, aie_dm_resource::a>;
   using BStream = aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, {{ s * t }}, aie_dm_resource::b>;
   using MMUL = aie::mmul<{{ r }}, {{ s }}, {{ t }}, bfp16ebs8>;
+  static_assert(M % {{ 2 * r }} == 0 && N % {{ 2 * t }} == 0{{ " && N % " ~ 4 * t ~ " == 0" if split else "" }});
+  constexpr int NB = N / {{ 2 * t }}, NBR = M / {{ 2 * r }};  // (16-col blocks, 16-row bands)
   AStream a_stream(pA);
   BStream b_stream((const bfp16ebs8 *)pB);
 {% if split %}
-{% set nbh = nb // 2 %}
+  constexpr int NBH = NB / 2;
   // [half][band][block of the half]: A rewinds per block, continues per band, restarts per half; B rewinds per band,
   // then jumps to the other half; C: the half's blocks (own: half h), then the other half's
-  dims_3d_t patA({{ nbh - 1 }}, {{ -2 * ks }}, {{ nbr - 1 }}, 0, {{ -2 * ks * nbr }});
-  dims_3d_t patB({{ nbh - 1 }}, 0, {{ nbr - 1 }}, {{ -nbh * 2 * ks * 72 }},
-                 (int)((const char *)pB1 - (const char *)pB) - {{ nbh * 2 * ks * 72 }});
-  const int c3 = {{ -(nbr - 1) * 2 * r * n + 2 * r * t }} - {{ 2 * nbh * 2 * r * t }} * h;
-  dims_3d_t patL({{ nbh - 1 }}, {{ 2 * r * t }}, {{ nbr - 1 }}, {{ 2 * r * n - (nbh - 1) * 2 * r * t }}, c3);
-  dims_3d_t patS({{ nbh - 1 }}, {{ 2 * r * t }}, {{ nbr - 1 }}, {{ 2 * r * n - (nbh - 1) * 2 * r * t }}, c3);
-  pCld += {{ nbh * 2 * r * t }} * h;
-  pCst += {{ nbh * 2 * r * t }} * h;
+  dims_3d_t patA(NBH - 1, {{ -2 * ks }}, NBR - 1, 0, {{ -2 * ks }} * NBR);
+  dims_3d_t patB(NBH - 1, 0, NBR - 1, -NBH * {{ 2 * ks * 72 }},
+                 (int)((const char *)pB1 - (const char *)pB) - NBH * {{ 2 * ks * 72 }});
+  const int c3 = -(NBR - 1) * {{ 2 * r }} * N + {{ 2 * r * t }} - 2 * NBH * {{ 2 * r * t }} * h;
+  dims_3d_t patL(NBH - 1, {{ 2 * r * t }}, NBR - 1, {{ 2 * r }} * N - (NBH - 1) * {{ 2 * r * t }}, c3);
+  dims_3d_t patS(NBH - 1, {{ 2 * r * t }}, NBR - 1, {{ 2 * r }} * N - (NBH - 1) * {{ 2 * r * t }}, c3);
+  pCld += NBH * {{ 2 * r * t }} * h;
+  pCst += NBH * {{ 2 * r * t }} * h;
 {% elif not pats %}
-  dims_2d_t patA({{ nb - 1 }}, {{ -2 * ks }}, 0);
+  dims_2d_t patA(NB - 1, {{ -2 * ks }}, 0);
 {% endif %}
 {% if not split and not pats %}
-  dims_2d_t patB({{ nb - 1 }}, 0, {{ -nb * 2 * ks }});
+  dims_2d_t patB(NB - 1, 0, -NB * {{ 2 * ks }});
 {% endif %}
 {% if not split %}
 {% if not pats %}
@@ -105,10 +109,10 @@ static inline __attribute__((always_inline)) void {{ name }}(
 {% endif %}
 {% endif %}
 {% if nbr_arg %}
-  AIE_LOOP_MIN_ITERATION_COUNT({{ nb }})
-  for (int it = 0; it < nbr * {{ nb }}; it++) {
+  AIE_LOOP_MIN_ITERATION_COUNT(NB)
+  for (int it = 0; it < nbr * NB; it++) {
 {% else %}
-  for (int it = 0; it < {{ nbr * nb }}; it++) {
+  for (int it = 0; it < NBR * NB; it++) {
 {% endif %}
 {% if zero %}
     MMUL acc0(aie::zeros<accfloat, {{ r * t }}>()), acc1(aie::zeros<accfloat, {{ r * t }}>()),
@@ -117,11 +121,11 @@ static inline __attribute__((always_inline)) void {{ name }}(
     MMUL acc0((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld))));
     MMUL acc1((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld + {{ r * t }}))));
 {% if c2_bank %}
-    MMUL acc2((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>((const {{ ct }} __aie_dm_resource_{{ c2_bank }} *)(pCld + {{ n * r }})))));
-    MMUL acc3((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>((const {{ ct }} __aie_dm_resource_{{ c2_bank }} *)(pCld + {{ r * t + n * r }})))));
+    MMUL acc2((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>((const {{ ct }} __aie_dm_resource_{{ c2_bank }} *)(pCld + N * {{ r }})))));
+    MMUL acc3((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>((const {{ ct }} __aie_dm_resource_{{ c2_bank }} *)(pCld + {{ r * t }} + N * {{ r }})))));
 {% else %}
-    MMUL acc2((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld + {{ n * r }}))));
-    MMUL acc3((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld + {{ r * t + n * r }}))));
+    MMUL acc2((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld + N * {{ r }}))));
+    MMUL acc3((aie::accum<accfloat, {{ r * t }}>(aie::load_v<{{ r * t }}>(pCld + {{ r * t }} + N * {{ r }}))));
 {% endif %}
 {% endif %}
 {% for step in range(ks) %}
@@ -129,8 +133,8 @@ static inline __attribute__((always_inline)) void {{ name }}(
 {%- endfor %}
     aie::store_v(pCst, acc0.template to_vector<{{ ct }}>());
     aie::store_v(pCst + {{ r * t }}, acc1.template to_vector<{{ ct }}>());
-    aie::store_v(pCst + {{ n * r }}, acc2.template to_vector<{{ ct }}>());
-    aie::store_v(pCst + {{ r * t + n * r }}, acc3.template to_vector<{{ ct }}>());
+    aie::store_v(pCst + N * {{ r }}, acc2.template to_vector<{{ ct }}>());
+    aie::store_v(pCst + {{ r * t }} + N * {{ r }}, acc3.template to_vector<{{ ct }}>());
 {% if pats %}
     a_stream.seek_byte(patA);
 {% else %}
@@ -142,28 +146,28 @@ static inline __attribute__((always_inline)) void {{ name }}(
     pCst = add_3d_ptr(pCst, patS);
 {% else %}
     b_stream.seek(patB);
-    pCld = add_2d_ptr(pCld, {{ 2 * r * n - (nb - 1) * 2 * r * t }}, {{ nb - 1 }}, cL, {{ 2 * r * t }});
-    pCst = add_2d_ptr(pCst, {{ 2 * r * n - (nb - 1) * 2 * r * t }}, {{ nb - 1 }}, cS, {{ 2 * r * t }});
+    pCld = add_2d_ptr(pCld, {{ 2 * r }} * N - (NB - 1) * {{ 2 * r * t }}, NB - 1, cL, {{ 2 * r * t }});
+    pCst = add_2d_ptr(pCst, {{ 2 * r }} * N - (NB - 1) * {{ 2 * r * t }}, NB - 1, cS, {{ 2 * r * t }});
 {% endif %}
   }
 }
 """)
 
 
-def render_mac(*, name: str, m: int, n: int, k: int, split: bool = False, f32: bool = False,
-               nbr_arg: bool = False, zero: bool = False, pats: bool = False, c2_bank: str = "") -> str:
-    """C++ of the MAC helper ``name(pA, pB, pCld, pCst)`` for an m x n stripe and a k-tile of k
-    (``split``: ``name(pA, pB, pB1, pCld, pCst, h)``, B in halves, the module docstring; ``f32``: an fp32 C stripe,
+def render_mac(*, name: str = MAC, k: int, split: bool = False, f32: bool = False, nbr_arg: bool = False,
+               zero: bool = False, pats: bool = False, c2_bank: str = "") -> str:
+    """C++ of the MAC helper ``name<M, N>(pA, pB, pCld, pCst)`` for an M x N stripe (a template: every stripe shape of
+    a translation unit is one definition) and a k-tile of k
+    (``split``: ``name<M, N>(pA, pB, pB1, pCld, pCst, h)``, B in halves, the module docstring; ``f32``: an fp32 C stripe,
     II 47 per 16x16 block at k 64 instead of 33; ``nbr_arg``: the stripe's 16-row bands a runtime argument ``nbr``
-    (m: their maximum), the same schedule; ``zero``: C := A B^T, pCld unread; ``pats``: the walks of the 16-row
+    (M: their maximum), the same schedule; ``zero``: C := A B^T, pCld unread; ``pats``: the walks of the 16-row
     bands' A (``seek_byte`` after each block: rewind by the block's 2 k / 8 panels, at a band's end the move to the next
     band's first panel, wherever it is), of B (``seek_byte`` after each block: to the next block's panels) and of C
     (``add_3d_ptr``; one iterator per pointer) are the caller's ``patA``, ``patB``, ``patL``, ``patS``: blocks in any
     order, bands from several buffers); ``c2_bank``: the bank the second 8-row band's C loads are annotated with
-    (the scheduler's memory model only; the fp32 C at m = 64 with "b": II 41 instead of 43, the same code otherwise)."""
+    (the scheduler's memory model only; the fp32 C at M = 64 with "b": II 41 instead of 43, the same code otherwise)."""
     # (every block pops a multiple of 8 panels per stream)
-    assert k % 32 == 0 and m % 16 == 0 and n % 16 == 0
-    assert not split or n % 32 == 0
+    assert k % 32 == 0
     assert not (nbr_arg and split) and not (pats and split)
-    return _MAC_TPL.render(name=name, m=m, n=n, k=k, split=split, f32=f32, nbr_arg=nbr_arg, zero=zero, pats=pats,
+    return _MAC_TPL.render(name=name, k=k, split=split, f32=f32, nbr_arg=nbr_arg, zero=zero, pats=pats,
                            c2_bank=c2_bank)

@@ -53,9 +53,10 @@ from ml_dtypes import bfloat16
 from ...gguf_model import GGUFFile
 from ...model_config import QwenConfig
 from .. import act_lut
-from ..base import JINJA_ENV, ArgSpec, ArtcOperator, hashed_prefix
+from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS
 from ..gemm.gemm_q import chained_fill
+from ..kernel_source import kernel_prefix
 from ..prefill.gemm import Layout
 from ..util import Attr, bf16_hilo, regions
 from . import gdn as GD
@@ -174,8 +175,8 @@ namespace {
             const aie::vector<float, 64> s = aie::load_v<64>(ps);
             ps += 64;
             aie::vector<bfloat16, 64> sh, sl;
-            {{ p }}_split(s, sh, sl);
-            const aie::vector<bfloat16, 64> kh_ = {{ p }}_tile8(pk), kl = {{ p }}_tile8(pk + {{ D }});
+            {{ g }}_split(s, sh, sl);
+            const aie::vector<bfloat16, 64> kh_ = {{ g }}_tile8(pk), kl = {{ g }}_tile8(pk + {{ D }});
             pk += 8;
             aie::accum<accfloat, 64> acc(s);
             acc = aie::mac(acc, sh, gh);
@@ -197,7 +198,7 @@ namespace {
         for (int b = 0; b < 16; b++) {
             const aie::vector<float, 64> s = aie::load_v<64>(ps);
             ps += 64;
-            const aie::vector<bfloat16, 64> kh_ = {{ p }}_tile8(pk), kl = {{ p }}_tile8(pk + {{ D }});
+            const aie::vector<bfloat16, 64> kh_ = {{ g }}_tile8(pk), kl = {{ g }}_tile8(pk + {{ D }});
             pk += 8;
             aie::accum<accfloat, 64> acc(s);
             acc = aie::mac(acc, kh_, eh1);
@@ -244,7 +245,7 @@ __attribute__((noinline)) void {{ p }}_pair4(const float *__restrict si, float *
         aie::store_v(eb + 96, aie::accum<accfloat, 32>(aie::sub(dl1, aie::accum<accfloat, 32>(h_).template to_vector<float>())).template to_vector<bfloat16>());
     }
     aie::vector<bfloat16, 64> gh, gl;  // D as bf16 hi + lo
-    {{ p }}_split(aie::broadcast<float, 64>(Dv[0]), gh, gl);
+    {{ g }}_split(aie::broadcast<float, 64>(Dv[0]), gh, gl);
     AIE_LOOP_NO_UNROLL
     for (int pj = 0; pj < 4; pj++)
         {{ p }}_pass2(si + 1024 * pj, so + 1024 * pj, si2 + 1024 * pj, so2 + 1024 * pj, kq0, kq1, eb + 8 * pj, gh, gl);
@@ -328,7 +329,7 @@ void {{ p }}_group(const bfloat16 *__restrict b, const bfloat16 *__restrict s, f
     {{ p }}_conv8<32>(r, SW(bfloat16, {{ w.wc }}), yc);
 {% endif %}
 {% if "silu" not in ablate %}
-    {{ p }}_silu_lut<256>(yc, ys);
+    {{ lut }}_silu_lut<256>(yc, ys);
 {% endif %}
     al::copy<96, 32>(r, r + 256);  // (the last 3 tokens: the next group's window)
     float *__restrict ob = SW(float, {{ w.ob }});  // o of the pair [2][32]
@@ -424,7 +425,7 @@ __attribute__((noinline)) void {{ p }}_l2b4(const bfloat16 *__restrict y0, const
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
             aie::vector<bfloat16, 64> a, b;
-            {{ p }}_split(al::mulff<64>(aie::accum<accfloat, 64>(aie::load_v<64>(x[i] + 64 * k)).template to_vector<float>(), iv), a, b);
+            {{ g }}_split(al::mulff<64>(aie::accum<accfloat, 64>(aie::load_v<64>(x[i] + 64 * k)).template to_vector<float>(), iv), a, b);
             aie::store_v(o[i] + 64 * k, a);
             aie::store_v(o[i] + {{ D }} + 64 * k, b);
         }
@@ -521,7 +522,7 @@ void {{ p }}_pgroup(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
     bfloat16 *__restrict ys = SW(bfloat16, {{ w.ys }});
     {{ p }}_conv8<256>(r, SW(bfloat16, {{ w.wc }}), yc);
-    {{ p }}_silu_lut<{{ 8 * 256 }}>(yc, ys);
+    {{ lut }}_silu_lut<{{ 8 * 256 }}>(yc, ys);
     al::copy<{{ 3 * 256 }}, 32>(r, r + {{ 8 * 256 }});  // (the last 3 tokens: the next group's window)
     // the gates of the k head's v heads h = kh, kh + 2, kh + 4, times the mask; two heads per call (lanes [head 2][the
     // 8 tokens]: one call each of softplus, expm1, sigmoid for a pair of heads instead of one per head on 8 lanes)
@@ -543,11 +544,11 @@ void {{ p }}_pgroup(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
             bi[t] = (int32_t)ab[64 * t + {{ HC }} + h0] << 16;
             bi[8 + t] = (int32_t)ab[64 * t + {{ HC }} + h1] << 16;
         }
-        const aie::vector<float, 16> sp = {{ p }}_softplus(
+        const aie::vector<float, 16> sp = {{ g }}_softplus(
             aie::add(ai.template cast_to<float>(), aie::concat(aie::broadcast<float, 8>(gp[h0]), aie::broadcast<float, 8>(gp[h1]))));
         const aie::vector<float, 16> d = al::mulff<16>(
-            {{ p }}_expm1(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[16 + h0]), aie::broadcast<float, 8>(gp[16 + h1])))), m);
-        const aie::vector<float, 16> be = al::mulff<16>({{ p }}_sigmoid(bi.template cast_to<float>()), m);
+            {{ g }}_expm1(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[16 + h0]), aie::broadcast<float, 8>(gp[16 + h1])))), m);
+        const aie::vector<float, 16> be = al::mulff<16>({{ g }}_sigmoid(bi.template cast_to<float>()), m);
         aie::store_v(gt + {{ 32 * hp }}, d.template extract<8>(0));
         aie::store_v(gt + {{ 48 + 32 * hp }}, be.template extract<8>(0));
 {% if 2 * hp + 1 < VH %}
@@ -589,6 +590,7 @@ class GdnPrepOperator(ArtcOperator):
     STACK = 5120
     CV_ROWS = 10  # rows of CV read (the q / k conv state: one object of 10 rows x 256)
     MASK_ELEMS = B_ELEMS  # bf16 of the mask argument (an object; T fp32 used)
+    pfx = kernel_prefix("gdp")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout):
         assert T % 8 == 0 and T // 8 <= 64 and 4 * (T + 16) <= 2 * self.MASK_ELEMS
@@ -604,19 +606,13 @@ class GdnPrepOperator(ArtcOperator):
                  ("mask", 4 * (self.T + 16)), ("gt", 4 * 96)]
         return regions(sizes)
 
-    def _render(self, p: str) -> str:
-        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=p, eps=repr(self.cfg.rms_norm_eps), ln2=bf16_hilo(math.log(2)),
+    def get_kernel_src(self) -> str:
+        p = self.pfx
+        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), ln2=bf16_hilo(math.log(2)),
                                                             D=D)
-        return _PREP.render(p=p, helpers=helpers, silu=act_lut.render_silu(p), w=Attr(self.workspace()), D=D, NCH=256,
+        return _PREP.render(p=p, g=GD.GDN, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT, w=Attr(self.workspace()), D=D, NCH=256,
                             HC=self.hc, VH=self.hc // 2, T=self.T, REC_ELEMS=REC_ELEMS, G_OFF=G_OFF, AP_OFF=AP_OFF,
                             eps=repr(self.cfg.rms_norm_eps))
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("gdp", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def n_pr(self) -> int:
@@ -703,6 +699,7 @@ class GdnScanOperator(ArtcOperator):
 
     STACK = 5120
     CV_ROWS = 8  # rows of CV read (the v quarter's conv state: [8][32])
+    pfx = kernel_prefix("gdsc")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, ablate: tuple[str, ...] = ()):
         """``ablate`` (timing experiments, wrong results): kernel parts compiled out ("conv", "silu": of the v quarter,
@@ -721,19 +718,13 @@ class GdnScanOperator(ArtcOperator):
                  ("g", 4 * 16), ("cw", 4 * 128), ("eb", 2 * 128)]
         return regions(sizes)
 
-    def _render(self, p: str) -> str:
-        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=p, eps=repr(self.cfg.rms_norm_eps), ln2=bf16_hilo(math.log(2)),
+    def get_kernel_src(self) -> str:
+        p = self.pfx
+        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), ln2=bf16_hilo(math.log(2)),
                                                             D=D)
-        return _SCAN.render(p=p, helpers=helpers, silu=act_lut.render_silu(p), w=Attr(self.workspace()), D=D, NCH=32,
+        return _SCAN.render(p=p, g=GD.GDN, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT, w=Attr(self.workspace()), D=D, NCH=32,
                             PART=PART, rs=bf16_hilo(1 / math.sqrt(D)), REC_ELEMS=REC_ELEMS, G_OFF=G_OFF, AP_OFF=AP_OFF,
                             ablate=self.ablate)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("gdsc", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         n_p = P_HEAD + COLS * self.hc * REC
@@ -928,7 +919,7 @@ void {{ p }}_pair(const bfloat16 *__restrict o, const bfloat16 *__restrict z, fl
     bfloat16 *__restrict zs = (bfloat16 *)(ws + {{ D + 8 * 256 }});  // silu(z) [8][256]
     bfloat16 *__restrict ivt = (bfloat16 *)(ws + {{ D + 8 * 256 + 4 * 256 }});  // [16][hi 32 | lo 32]
     bfloat16 *__restrict nwt = ivt + 1024;  // [{{ D // 32 }}][hi 32 | lo 32]
-    {{ p }}_silu_lut<{{ OBJ }}>(z, zs);
+    {{ lut }}_silu_lut<{{ OBJ }}>(z, zs);
     for (int i = 0; i < {{ D // 32 }}; i++) {
         const aie::vector<float, 32> w = aie::load_v<32>(nw + 32 * i);
         const aie::vector<bfloat16, 32> h = aie::accum<accfloat, 32>(w).template to_vector<bfloat16>();
@@ -963,6 +954,7 @@ class GdnOutOperator(ArtcOperator):
 
     STACK = 4096
     OBJ = 2048  # bf16 of an input object: 8 tokens x a pair of heads
+    pfx = kernel_prefix("gdo")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, hslot: int, cs_off: int, gc_rows: int = 0):
         assert T % 8 == 0 and T // 8 <= 64
@@ -974,15 +966,9 @@ class GdnOutOperator(ArtcOperator):
         assert cs_off + 4 * self.OBJ <= hslot, "the conv-state objects end in the column's slot"
         super().__init__()
 
-    def _render(self, p: str) -> str:
-        return _OUT.render(p=p, silu=act_lut.render_silu(p), D=D, OBJ=self.OBJ, eps=repr(self.cfg.rms_norm_eps))
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("gdo", self._render("P"))
-
     def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
+        p = self.pfx
+        return _OUT.render(p=p, silu=act_lut.render_silu(), lut=act_lut.LUT, D=D, OBJ=self.OBJ, eps=repr(self.cfg.rms_norm_eps))
 
     def conv_offset(self, n: int) -> int:
         """The ``gdn_conv`` parameter of a chunk of n valid tokens: GC's first element of row n - 3."""

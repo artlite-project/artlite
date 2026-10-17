@@ -67,6 +67,7 @@ from ml_dtypes import bfloat16
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, stream_walk
 from ..gemm.gemm_q import chained_fill
+from ..kernel_source import kernel_prefix
 from ..util import Attr, bf16_value, regions
 
 CH = 256  # columns per chunk (PrefillNormOperator)
@@ -407,6 +408,7 @@ class PrefillNormOperator(ArtcOperator):
     """(Add +) RMSNorm of a prompt with bfp16ebs8 panel output; see the module docstring."""
 
     STACK = 1024
+    p = kernel_prefix("pn")
 
     def __init__(self, *, T: int, add: bool = True, E: int = 2048, eps: float = 1e-5, d_pitch: int = 0,
                  cols: int = COLS, deltas: int = 1, d_stride: int = 0):
@@ -430,12 +432,6 @@ class PrefillNormOperator(ArtcOperator):
         assert self.d_stride >= T * COLS * self.d_pitch and (self.deltas >= 2 or not d_stride)
         super().__init__()
 
-    @property
-    def _prefix(self) -> str:
-        forced = self.replay and 16 * self.E <= 32768  # (the replay design at a small E: two deltas)
-        return (f"pn{self.E}" + ("r" if forced else "") + (f"h{self.deltas}" if self.hold else "")
-                + ("" if self.eps == 1e-5 else f"_e{self.eps:g}".replace("-", "m").replace(".", "p")))
-
     def get_arg_spec(self) -> list[ArgSpec]:
         EMB = self.E
         n = self.T * EMB
@@ -451,9 +447,9 @@ class PrefillNormOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         if self.hold:
-            return _HOLD_SRC.render(p=self._prefix, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
-        # (the same source for add and no add: a fused ELF compiles one copy of identical sources)
-        return _SRC.render(p=self._prefix, E=self.E, C=CH, eps=repr(self.eps), replay=self.replay)
+            return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
+        # (the same source for add and no add: one copy in a fused ELF)
+        return _SRC.render(p=self.p, E=self.E, C=CH, eps=repr(self.eps), replay=self.replay)
 
     def get_mlir_artifact(self) -> Module:
         if self.hold:
@@ -461,7 +457,7 @@ class PrefillNormOperator(ArtcOperator):
         if self.replay:
             return self._replay_design()
         T, add = self.T, self.add
-        EMB, p = self.E, self._prefix
+        EMB, p = self.E, self.p
         n_g = T // (8 * self.cols)  # token groups per core
         bf = np.dtype[bfloat16]
         chunk_ty = np.ndarray[(8 * CH,), bf]
@@ -558,7 +554,7 @@ class PrefillNormOperator(ArtcOperator):
 
     def _replay_design(self) -> Module:
         """E > 2048: x (and delta) groups through the memtile, sent twice (pass A, pass B)."""
-        T, add, E, p, nd = self.T, self.add, self.E, self._prefix, self.deltas
+        T, add, E, p, nd = self.T, self.add, self.E, self.p, self.deltas
         n_g = T // (8 * self.cols)
         n_kc = E // CH
         bf = np.dtype[bfloat16]
@@ -689,7 +685,7 @@ class PrefillNormOperator(ArtcOperator):
         [kc][delta][HG][HCH]) and pass B (half panels: the group's HG tokens of each panel's 8); the memtile joins two
         groups' half panels into whole panel rows (the shim writes long runs: scattered 36-byte writes ran at a fraction
         of the DDR rate); each byte read once."""
-        T, E, p, nd, cols = self.T, self.E, self._prefix, self.deltas, self.cols
+        T, E, p, nd, cols = self.T, self.E, self.p, self.deltas, self.cols
         tc = T // cols  # (a core's tokens)
         n_g, n_kc, n_w, n_r = tc // HG, E // HCH, E // (HG * HCH), tc // 8
         bf = np.dtype[bfloat16]
@@ -1013,6 +1009,7 @@ class ResidualNormOperator(ArtcOperator):
     pairs), D: the deltas (2 T 8 d_pitch per delta, ``d_stride`` apart), XN: panels."""
 
     STACK = 1024
+    p = kernel_prefix("gn")
 
     def __init__(self, *, T: int, E: int, mode: str, eps: float, d_pitch: int = 0, deltas: int = 1, d_stride: int = 0,
                  scale: bool = False, cols: int = COLS):
@@ -1032,11 +1029,6 @@ class ResidualNormOperator(ArtcOperator):
         sizes = [("wp", 2 * E), ("w1", 2 * E), ("ss", 256), ("ah", 128), ("al", 128), ("ih", 128), ("il", 128),
                  ("sh", 128), ("sl", 128)]
         return regions(sizes)
-
-    @property
-    def p(self) -> str:
-        return (f"gn{self.E}_{self.mode}{'_s' if self.scale else ''}{f'_d{self.deltas}' if self.deltas > 1 else ''}"
-                + f"_e{self.eps:g}".replace("-", "m").replace(".", "p"))
 
     def get_kernel_src(self) -> str:
         return _RSRC.render(p=self.p, E=self.E, CH=RCH, eps=repr(self.eps), mode=self.mode, deltas=self.deltas,

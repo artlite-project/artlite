@@ -203,8 +203,9 @@ artifacts that Artlite loads directly, cached per content hash in
 - **NPU instructions** (`insts.bin`) - shim DMA programming (uint32 arrays)
 
 ```
-get_kernel_src()  ->  kernel.cc   (Jinja2-rendered C++; "operators.h" is
-    |                             prepended as a precompiled header)
+get_kernel_src()  ->  kernel.cc   (Jinja2-rendered C++, each name resolved to
+    |                             <stem>_<name>_<hash of its code>; "operators.h"
+    |                             as a precompiled header)
     |  Peano clang++ -O2 -std=c++20 --target=aie2p-none-unknown-elf
     v
 kernel.o
@@ -215,7 +216,9 @@ get_mlir_artifact()  ->  design.mlir   (aie.iron design linking kernel.o)
 main.pdi + insts.bin  (loaded by artlite.Program)
 ```
 
-A fused program (`FusedOperator`, `Library`) builds its designs into one ELF the same way. The C++ test build
+A fused program (`FusedOperator`, `Library`) builds its designs into one ELF the same way, its operators' kernels as
+one `kernel.cc`: a section per operator, each definition once (a name is a hash of its code, so the same helper of two
+operators, or of two configurations of one, is one function; a section lists what it shares with earlier ones). The C++ test build
 (`tests/CMakeLists.txt`) runs the same `aiecc` step through its `add_aie_target()` function.
 
 The first run of a model compiles its designs, from seconds to a few minutes per model (Stable Diffusion's UNet

@@ -62,10 +62,11 @@ overhead loops, no runtime trip counts); use `constexpr` for derived values.
 
 ```python
 from ..base import JINJA_ENV  # StrictUndefined: a misspelled template variable is an error, not an empty string
+from ..kernel_source import kernel_prefix
 
 _KERNEL = JINJA_ENV.from_string(r"""
 extern "C"
-void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
+void {{ p }}_gelu(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     for (int j = 0; j < {{ ts }}; j += 32) {
@@ -79,9 +80,10 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 ```
 
 - `operators.h` (and with it `kernel_lib.h`) is prepended to every kernel: no includes.
-- The entry point's name encodes every template parameter, and every namespace-scope helper carries that prefix
-  (`{{ name }}_body`): a fused ELF or library compiles all its operators' sources as one translation unit, so a
-  shared name is a redefinition error or, worse, a silent mix-up (AGENTS.md "Rules").
+- Every namespace-scope name is `{{ p }}_<name>`, helpers too, with `p = kernel_prefix("<stem>")` (a class attribute;
+  the stem names the operator in `kernel.cc`), and the design declares the kernels the same way
+  (`Kernel(f"{self.p}_gelu", "kernel.o", ...)`): the build names each definition by its code, so a fused ELF or library
+  (one translation unit) holds equal code once and never mixes up two configurations (AGENTS.md "Rules").
 - The speed rules (512-bit vectors, bank qualifiers, `__restrict` parameters, no division / branches in loop bodies):
   aie-kernel-perf-optimization section 2.
 

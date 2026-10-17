@@ -15,9 +15,10 @@ use any modern SIMD (AVX-512 included).
 - **Never write a nonzero shim BD AxQoS.** It hung the NPU; only a reboot recovered it.
 - **Never kill a process that holds an NPU context** (let it finish or time out). A killed process has wedged the
   NPU beyond a driver reload. Give compile-only scripts, which open no context, short timeouts instead.
-- **Every kernel entry point** (`extern "C"` in `get_kernel_src()`) has a unique name encoding all its template
-  parameters, and every namespace-scope helper carries the operator's prefix too. Fused programs link several
-  operators' kernels: a collision passes the isolated tests and silently breaks the fused ones.
+- **Kernel names**: every namespace-scope name of a kernel source (entry points, helpers, tables, types, macros) is
+  `{{ p }}_<name>` with `p = kernel_prefix(stem)`, and the design declares its kernels under the same names. The build
+  names each definition by its code (`operators/kernel_source.py`), so a fused program's `kernel.cc` holds every
+  definition once; a name written out in full collides as soon as two configurations meet in one fused program.
 - **Weights stay at their quantization's size.** Never expand them on the host; prefill and decode read one weight
   image in place. Lossless, same-size re-layouts are fine (images are packed at every load: nothing on disk).
 - Operators are self-contained: never import IRON operators.
@@ -80,6 +81,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 |---|---|
 | `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md` |
 | `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
+| `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |
 | `src/artlite/operators/sd15/`, `sd15_v2/` | the SD 1.5 UNet: the 64x64 / 32x32 levels' overlay (one static design, regular and transformer variants) and its attention, the 16x16 / 8x8 levels on `sd15_v2`'s design (one raw item), the UNet step as one library program (`sd15/unet.py`) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
@@ -100,7 +102,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 - One file per operator: an `ArtcOperator` subclass implementing
   - `get_kernel_src()`: C++ from a Jinja2 template (`JINJA_ENV`: undefined variables are errors) with shapes, trip
-    counts and strides as compile-time constants;
+    counts and strides as compile-time constants, its names under `kernel_prefix` (Rules);
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
 - Reuse the shared pieces instead of copying: `kernel_lib.h` (exp2, SiLU, GELU, `inv_rms`, bfp16 panels, lane
@@ -109,8 +111,9 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`).
 - New operators are exported from `operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. Tests need no
   compile plumbing: pytest plans the selected tests in a subprocess and builds their designs in the background.
-- `compile()` = render (`build_spec()`, in the calling thread) + build (Peano: `kernel.cc` -> `kernel.o`, with
-  `operators.h` prepended; `aiecc`: `design.mlir` -> `main.pdi` + `insts.bin`). `compile_all(ops)` builds many in
+- `compile()` = render (`build_spec()`, in the calling thread) + build (Peano: `kernel.cc` -> `kernel.o`; `aiecc`:
+  `design.mlir` -> `main.pdi` + `insts.bin`). `kernel.cc` has a section per operator (a fused ELF's: each definition
+  in the first section that uses it, a later one lists what it shares). `compile_all(ops)` builds many in
   parallel: use it wherever several designs are compiled before anything runs (`parallel_map` for other compile
   work). `ARTLITE_COMPILE_JOBS` bounds the builds; `python -m artlite.parallel_compile CMD ...` fills the cache for
   any command.
@@ -156,7 +159,6 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 - `FusedOperator` refuses to run while a buffer read before it is written was never written by the host (declare
   intentionally empty ones `uninitialized`). The host writes only input and scratch buffers: output BOs are never
   flushed, so cached host writes land over the NPU's (garbage in 64-byte runs).
-- A fused ELF keeps one copy of identical kernel names: variants that share names must render identical sources.
 - No kernel statics in fused or overlay designs (rewritten on every reconfiguration; they also collide with pinned
   L1 buffers): scratch and tables are worker `Buffer`s. Every kernel entry that rounds sets
   `aie::set_rounding(conv_even)` (the default is floor).

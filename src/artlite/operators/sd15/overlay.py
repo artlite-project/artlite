@@ -24,7 +24,9 @@ writing the differing words (``fused.program.program_memory_patch``), not by rec
 be byte-identical: the variant entries go through trampolines (weak: no caller sees through them), every trampoline is
 emitted before the impls (functions come out in the order of their first reference; an ordering table references the
 ones only the core main calls), the stubs keep an opaque side effect (or their callers would drop the calls), and the
-shared helpers are plain external functions (deferred templates and statics would land after the impls).
+shared helpers are plain external functions (deferred templates and statics would land after the impls). In a
+library's translation unit the variants link one copy of the code they share (``kernel_source``), so every definition
+the variants share comes before the first that differs (``Overlay.source``): both link it at the same addresses.
 
 Ops (``TiledOp``): a weight image of B objects (per stream: command, init and k-tile objects) and a runtime sequence:
 heap loads (DDR -> memtile), sends (heap -> core k: BD taps), weight fills (shim -> B stream), and per column one shim
@@ -60,6 +62,7 @@ from artlite.operators import act_lut
 from artlite.operators import bfp16 as _bfp16
 from artlite.operators.base import ArgDirection, ArgSpec, ArtcOperator
 from artlite.operators.design import COLS, ROWS, range32
+from artlite.operators.kernel_source import kernel_prefix
 
 
 def bfp16_blocks(x: np.ndarray) -> np.ndarray:
@@ -292,7 +295,7 @@ __attribute__((noinline, minsize)) void {{ p }}_geglu_impl(int32_t *__restrict c
       const aie::vector<bfloat16, 64> ga = aie::abs(g);
       aie::store_v(t + 64 * i, aie::min(aie::add(ga, ga), hi));  // (2 |z|: the GELU table in the SiLU geometry)
     }
-    {{ p }}_tabu(z, t, t, t, tab);
+    {{ lut }}_tabu(z, t, t, t, tab);
     for (int i = 0; i < 10; i++)
       aie::store_v(y + 64 * i, aie::mul(aie::load_v<64>(t + 64 * i),
                                         aie::load_v<64>(x + 1280 * tg + 640 * (i / 5) + 64 * (i % 5))).template to_vector<bfloat16>());
@@ -336,7 +339,7 @@ CONV_ENTRY = ("conv3", ("const int32_t *__restrict a0, const int32_t *__restrict
 
 _SRC = r"""
 namespace {
-{{ mac }}
+{{ mac_src }}
 
 // K1: one k-tile (CBC ci-blocks; NDX taps) into the C tile [R][L][2 pairs][2 J][64] bf16; A: band rows of S L + H groups
 // [CBC][2] panels (H: halo groups), B: [J][NDX][CBC][2]
@@ -523,7 +526,7 @@ __attribute__((noinline)) void {{ p }}_apply(int32_t *__restrict c_, const int32
         aie::store_v(t + 64 * cb, aie::min(aie::abs(zb), hi));
       }
       if (silu)
-        {{ p }}_tabu(z, t, t, px, tab);
+        {{ lut }}_tabu(z, t, t, px, tab);
       else
         for (int cb = 0; cb < 10; cb++) aie::store_v(px + 64 * cb, aie::load_v<64>(z + 64 * cb));
     }
@@ -576,6 +579,53 @@ __attribute__((minsize)) void {{ p }}_lnbegin(int32_t *__restrict ws, int32_t *_
   ws[{{ W_FQ }}] = 2;  // (emit: 2 x REC bytes)
 }
 
+// piece i of a C object (5 A objects of A_OBJ bytes each) added to this core's C tile (from element W_ROFF): C += it
+void {{ p }}_resid(const int32_t *__restrict a0, const int32_t *__restrict a1, int32_t *__restrict ws,
+                   int32_t *__restrict c) {
+  const bfloat16 *src = (const bfloat16 *){{ p }}_a(a0, a1, ws);
+  const int ri = ws[{{ W_RI }}];  // (the piece of the object: 5 per C object)
+  ws[{{ W_RI }}] = ri == 4 ? 0 : ri + 1;
+  const int lo = ri * {{ A_OBJ // 2 }};
+  const int n = {{ C_OBJ // 2 }} - lo < {{ A_OBJ // 2 }} ? {{ C_OBJ // 2 }} - lo : {{ A_OBJ // 2 }};
+  bfloat16 *dst = (bfloat16 *)c + ws[{{ W_ROFF }}] + lo;
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  for (int j = 0; j < n; j += 32) {
+    aie::accum<accfloat, 32> s(aie::load_v<32>(dst + j));
+    s = aie::add(s, aie::load_v<32>(src + j));
+    aie::store_v(dst + j, s.template to_vector<bfloat16>());
+  }
+}
+
+// GEMM k-tile of 32: A object [8 tg][4 kb][2 pairs] bfp16 (the MAC's pop order), 1 B slot [5][4][2]: C [16 r8][10][64]
+void {{ p }}_gemm(const int32_t *__restrict a0, const int32_t *__restrict a1, const int32_t *__restrict ring,
+                  int32_t *__restrict ws, int32_t *__restrict c) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const int32_t *a = {{ p }}_a(a0, a1, ws);
+  const int32_t *b = {{ p }}_b(ring, ws, 1);
+  {{ mac }}((const bfp16ebs8 *)a, b, (const bfloat16 __aie_dm_resource_c *)c, (bfloat16 __aie_dm_resource_c *)c);
+}
+
+// padding B slots of a tile (keep the ring at 0 / 3)
+__attribute__((minsize)) void {{ p }}_bskip(int32_t *__restrict ws) {
+  const int pos = ws[{{ W_BPOS }}] + ws[{{ W_NBP }}];
+  ws[{{ W_BPOS }}] = pos >= {{ NQ }} ? pos - {{ NQ }} : pos;
+}
+
+// the core's records (W_NEMIT, after its passes) -> C (one object)
+__attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, int32_t *__restrict band, int32_t *__restrict c) {
+  const int n = ws[{{ W_FQ }}] * {{ REC // 64 }};
+  for (int i = 0; i < n; i++) aie::store_v(c + 16 * i, aie::load_v<16>(band + 16 * i));
+  ws[{{ W_FQ }}] = 0;
+}
+
+
+}  // extern "C"
+"""
+
+# the shared kernels that call the variant entries (after every shared kernel: ``Overlay.source``)
+_SRC_V = r"""
+extern "C" {
+
 // per tile: the init object (3 B slots): [2 pairs][80] bf16 bias (bytes 0 ..), [gamma 80 | beta 80] fp32 (bytes 640 ..),
 // the pass (int32 at byte 1280). Mode 0: C := the bias broadcast over the sub-blocks' rows; mode 1 (GN apply): C := 0,
 // coef := the pass's GN coefficients
@@ -612,38 +662,6 @@ __attribute__((minsize)) void {{ p }}_init(const int32_t *__restrict ring, int32
       aie::store_v(cc + (rg * 10 + cb) * 64, aie::concat(v8, v8, v8, v8, v8, v8, v8, v8));
     }
   }
-}
-
-// piece i of a C object (5 A objects of A_OBJ bytes each) added to this core's C tile (from element W_ROFF): C += it
-void {{ p }}_resid(const int32_t *__restrict a0, const int32_t *__restrict a1, int32_t *__restrict ws,
-                   int32_t *__restrict c) {
-  const bfloat16 *src = (const bfloat16 *){{ p }}_a(a0, a1, ws);
-  const int ri = ws[{{ W_RI }}];  // (the piece of the object: 5 per C object)
-  ws[{{ W_RI }}] = ri == 4 ? 0 : ri + 1;
-  const int lo = ri * {{ A_OBJ // 2 }};
-  const int n = {{ C_OBJ // 2 }} - lo < {{ A_OBJ // 2 }} ? {{ C_OBJ // 2 }} - lo : {{ A_OBJ // 2 }};
-  bfloat16 *dst = (bfloat16 *)c + ws[{{ W_ROFF }}] + lo;
-  aie::set_rounding(aie::rounding_mode::conv_even);
-  for (int j = 0; j < n; j += 32) {
-    aie::accum<accfloat, 32> s(aie::load_v<32>(dst + j));
-    s = aie::add(s, aie::load_v<32>(src + j));
-    aie::store_v(dst + j, s.template to_vector<bfloat16>());
-  }
-}
-
-// GEMM k-tile of 32: A object [8 tg][4 kb][2 pairs] bfp16 (the MAC's pop order), 1 B slot [5][4][2]: C [16 r8][10][64]
-void {{ p }}_gemm(const int32_t *__restrict a0, const int32_t *__restrict a1, const int32_t *__restrict ring,
-                  int32_t *__restrict ws, int32_t *__restrict c) {
-  aie::set_rounding(aie::rounding_mode::conv_even);
-  const int32_t *a = {{ p }}_a(a0, a1, ws);
-  const int32_t *b = {{ p }}_b(ring, ws, 1);
-  {{ p }}_mac_k((const bfp16ebs8 *)a, b, (const bfloat16 __aie_dm_resource_c *)c, (bfloat16 __aie_dm_resource_c *)c);
-}
-
-// padding B slots of a tile (keep the ring at 0 / 3)
-__attribute__((minsize)) void {{ p }}_bskip(int32_t *__restrict ws) {
-  const int pos = ws[{{ W_BPOS }}] + ws[{{ W_NBP }}];
-  ws[{{ W_BPOS }}] = pos >= {{ NQ }} ? pos - {{ NQ }} : pos;
 }
 
 // per-tile epilogue (mode W_NE): 1: the C tile's 160 sub-blocks (bf16) -> bfp16 panels in place, in their order (panel i
@@ -691,21 +709,13 @@ __attribute__((minsize)) void {{ p }}_pre(const int32_t *__restrict ring, int32_
   }
 }
 
-
-// the core's records (W_NEMIT, after its passes) -> C (one object)
-__attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, int32_t *__restrict band, int32_t *__restrict c) {
-  const int n = ws[{{ W_FQ }}] * {{ REC // 64 }};
-  for (int i = 0; i < n; i++) aie::store_v(c + 16 * i, aie::load_v<16>(band + 16 * i));
-  ws[{{ W_FQ }}] = 0;
-}
-
 }  // extern "C"
 """
 
 
-def _silu(p: str) -> str:
-    """The SiLU table pass (``{p}_tabu(z, t, t, y, tab)`` over 640 values, t = min(|z|, 24))."""
-    return act_lut.SILU.render_unrolled(p, 640)
+def _silu() -> str:
+    """The SiLU table pass (``{LUT}_tabu(z, t, t, y, tab)`` over 640 values, t = min(|z|, 24))."""
+    return act_lut.SILU.render_unrolled(640)
 
 
 def _gelu_table() -> tuple[np.ndarray, float]:
@@ -750,20 +760,23 @@ class Overlay:
         self.A_OBJ = A_OBJ
         self.BAND = BAND
         assert NREC * REC + 1280 <= BAND  # (sum op: the records + a pass's channel sums)
-        self.p = "sd15_row" + ("" if conv else "t")  # (the variants' kernels: one translation unit in a library)
+        self.p = kernel_prefix("sd15")  # (the variants' kernels: one translation unit in a library)
 
     def source(self) -> str:
-        """The shared kernels, then the variant region (``_SRC_CONV``)."""
+        """The kernels both variants share (one copy in a library's translation unit: ``kernel_source``), the shared
+        kernels that call variant entries (``_SRC_V``), the entries' trampolines, then the variant region
+        (``_SRC_CONV``). Every shared definition comes before the first that differs, in both variants: their cores
+        link the same code at the same addresses up to the variant region."""
         from artlite.operators.base import JINJA_ENV
-        from artlite.operators.gemm.mac import render_mac
+        from artlite.operators.gemm.mac import MAC, render_mac
         p = self.p
         entries = [CONV_ENTRY] + R_ENTRIES + T_ENTRIES + self.ext_entries()
         # (a stub's opaque side effect: otherwise the compiler deletes the shared code's calls of an empty entry, and
-        # the variants' shared code would differ)
-        # (one function for every stub: the others are aliases of it)
+        # the variants' shared code would differ; one function for every stub: the others are aliases of it)
+        stub = f'extern "C" __attribute__((noinline)) void {p}_stub(const char *a) {{ (void)*(volatile const char *)a; }}\n'
+
         def stubs(es: list) -> str:
-            return (f'extern "C" __attribute__((noinline)) void {p}_stub(const char *a) {{ (void)*(volatile const char *)a; }}\n'
-                    + "".join(f'void {p}_{n}_impl({prm}) __attribute__((alias("{p}_stub")));\n' for n, prm, _ in es))
+            return "".join(f'void {p}_{n}_impl({prm}) __attribute__((alias("{p}_stub")));\n' for n, prm, _ in es)
         protos = 'extern "C" {\n' + "".join(f"void {p}_{n}({prm});\n" for n, prm, _ in entries) + '}  // extern "C"\n'
         var = "\n".join(f"void {p}_{n}_impl({prm});" for n, prm, _ in entries)
         # (functions are emitted in the order of their first reference: the table, after the shared code, places
@@ -777,9 +790,9 @@ class Overlay:
         else:
             var += _SRC_CONV_STUB + stubs(R_ENTRIES) + _SRC_T
         ext = "" if self.conv else self.ext_source()
-        return JINJA_ENV.from_string(protos + _SRC + var).render(
-            p=self.p, mac=render_mac(name=f"{self.p}_mac_k", m=128, n=80, k=32), CBC=CBC, NQ=NQ, Q=Q, A_OBJ=A_OBJ,
-            C_OBJ=C_OBJ, C_BUF=C_BUF, ROFF=ROFF, REC=REC, NREC=NREC, hm=_masks(), silu=_silu(self.p),
+        return JINJA_ENV.from_string(_SRC + stub + protos + _SRC_V + var).render(
+            p=self.p, mac=f"{MAC}<128, 80>", mac_src=render_mac(k=32), CBC=CBC, NQ=NQ, Q=Q, A_OBJ=A_OBJ,
+            C_OBJ=C_OBJ, C_BUF=C_BUF, ROFF=ROFF, REC=REC, NREC=NREC, hm=_masks(), silu=_silu(), lut=act_lut.LUT,
             CMD_TILE=CMD_TILE, LREC=LREC, gelu_tmax=_gelu_table()[1],
             **{k: v for k, v in globals().items() if k.startswith("E_")},
             **{k: v for k, v in globals().items() if k.startswith("W_")}) + ext

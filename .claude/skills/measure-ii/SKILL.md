@@ -189,7 +189,7 @@ shared register / memory port of its body (the counts of `variant_search`,
 tables in `artlite/aie2p_isa.py`), with the ops of one or two binding ones:
 
 ```
-gq_q4_k_m64_n64_dqb_sb4_dq, stack 256 B, code 116 bundles / 704 B
+gq_dq_5e0a71c2, stack 256 B, code 116 bundles / 704 B
   for.body @kernel.cc:583: post-RA pipelined, II=40, NS=2, ZOL, 7 iters (trip 8: 1 peeled)
     cost 51 + 7*40 + 25 = 356 cy [iters from ZOL]; body 40 bundles (272 B)
     res bound 40 (rm: vshuffle 24, vst.flush.512.conv 8, vst.push.576.conv.bfp16ebs8.fp32 8); slots lda 5, ldb 9, st 16, vec 12, mv 28
@@ -293,7 +293,9 @@ mmvh_q5k_mm loop 1/1: for.body @kernel.cc:261, depth 1 (in base); ranked by cycl
   helper's pragma applies to all its callers; a loop that calls a helper with loops is not innermost);
   `--loop K` picks others (K counts the targets' rolled loops in source order, then the helpers');
   `--sub V OLD NEW` (must match once);
-  `--define V FN @def.cc` (a whole function); `--param V key=value` (an operator / Jinja argument);
+  `--define V FN @def.cc` (a whole function); patches may name functions as `kernel.cc` does (`<stem>_<name>_<hash>`:
+  the hash follows the code, so a patched function and its callers get new ones) or as rendered (`__artlite_<stem>_<name>`);
+  `--param V key=value` (an operator / Jinja argument);
   `--variants FILE.py` with `VARIANTS = [Variant(...)]`.
 - Program memory: the summary's `code B` is the whole object. For one core's bytes, walk the call graph (`jl`,
   tail `j`) from its entry kernels in each variant's `kernel.cc.s` with the report's per-function block bytes

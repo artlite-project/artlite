@@ -44,7 +44,6 @@ Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel sourc
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -58,9 +57,10 @@ from ml_dtypes import bfloat16
 
 from ... import txn
 from .. import act_lut
-from ..base import ArgSpec, ArtcOperator, hashed_prefix
+from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, linear_tap, range32
 from ..formats import FORMATS
+from ..kernel_source import kernel_prefix
 from ..util import Attr, regions
 from . import gemv
 from .kernels import SRC as _SRC
@@ -232,20 +232,26 @@ class DecodeOverlayOperator(ArtcOperator):
         """The kernel source of the model's cores."""
         return ""
 
-    def _render(self, p: str) -> str:
+    @property
+    def pfx(self) -> str:
+        """The placeholder prefix of the kernels (``kernel_source``), under ``PREFIX``."""
+        return kernel_prefix(self.PREFIX)
+
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         consts = self._consts()
         fmts = list(self.rows)
         assert not self.xh or OBJ_K * 2 == self.chunk.k
         x0 = -(self.max_g * self.chunk.xp // 2 if self.xh else self.chunk.xp // 2)  # (core 1's panels -> core 0's)
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, solo=self.solo, solo_x0=x0)
         if self.act == "silu":
-            src += "\nnamespace {\n" + act_lut.render_silu(p) + "\n}  // namespace\n"
+            src += "\nnamespace {\n" + act_lut.render_silu() + "\n}  // namespace\n"
         src += self._extra_src(p, consts)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs, "XS_SLOT": gemv.XS_SLOT,
               "XPH": self.max_g * self.chunk.xp // 2, "XPHC": self.chunk.xp // 2,
               "PANEL": gemv.PANEL,
               "Y_FLOATS": gemv.Y_FLOATS}
-        return src + _SRC.render(p=p, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
+        return src + _SRC.render(p=p, lut=act_lut.LUT, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
                                  WIN=WINS.get(self.win, 0),
                                  RES_PITCH=self.res_pitch, eps=repr(self.eps), META=META, C_LEN=C_LEN, NBLK=NBLK,
                                  SLOTS=SLOTS, XPAY=XPAY, OBJ_K=OBJ_K, NX_PER_NORM=NX_PER_NORM, gv=Attr(gv),
@@ -258,14 +264,6 @@ class DecodeOverlayOperator(ArtcOperator):
                                  COLS=COLS,
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
                                  **consts)
-
-    @functools.cached_property
-    def pfx(self) -> str:
-        """The prefix of the kernel entry points: ``PREFIX`` + a hash of the configuration's source."""
-        return hashed_prefix(self.PREFIX, self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def d_cols(self) -> list[int]:

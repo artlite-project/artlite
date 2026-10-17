@@ -37,6 +37,7 @@ import numpy as np
 from ...model_config import QwenConfig
 from ..base import JINJA_ENV
 from ..design import COLS
+from ..kernel_source import kernel_prefix
 from ..util import Attr, bf16_hilo, regions
 
 D = 128  # ssm_state: k and v dims of a head
@@ -53,7 +54,8 @@ G_WORDS = 16
 
 
 # The GDN math (fp32 to ~2^-16 through bf16 hi / lo products; rendered with p, eps, ln2 in an anonymous namespace):
-# the decode's GDN core and the prefill scan (gdn_prefill.py)
+# the decode's GDN core and the prefill scan (gdn_prefill.py: under GDN, one copy for its operators)
+GDN = kernel_prefix("gdn")
 HELPERS = r"""// fp32 math to ~2^-16 through bf16 hi / lo products (al::mulff), 16 lanes
 
 // 2^y for y >= -126: n = round(y) by the 1.5 2^23 split, 2^f = e^(f ln 2) by its Taylor polynomial of degree 6

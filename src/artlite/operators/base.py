@@ -22,6 +22,7 @@ import torch
 from jinja2 import Environment, StrictUndefined
 
 from .. import profiling
+from .kernel_source import KernelSource, translation_unit
 
 if TYPE_CHECKING:
     from aie.ir import Module
@@ -119,13 +120,6 @@ def _run_aiecc(cmd: list[str], *, cwd: str, link_files: Callable[[], None]) -> N
 
 def _cache_key(*args: object) -> str:
     return hashlib.sha256(repr(args).encode()).hexdigest()[:16]
-
-
-def hashed_prefix(stem: str, source: str) -> str:
-    """A kernel-name prefix encoding everything a template rendered: ``stem`` + a hash of ``source``
-    (the kernel source rendered with a placeholder prefix). For operators with too many template
-    parameters to spell out in their entry-point names."""
-    return stem + hashlib.sha256(source.encode()).hexdigest()[:8]
 
 
 def _aiecc_peano() -> str:
@@ -274,7 +268,8 @@ class BuildSpec:
 
     kind: "rtc" (an ArtcOperator: main.pdi + insts.bin) or "fused" (a FusedOperator: a full ELF);
     label: the operator class or the fused ELF's name (checks, messages; a fused ELF's file name);
-    source: the kernel translation unit (operators.h included), None without kernels."""
+    source: the kernel translation unit (``kernel_source.translation_unit``), None without kernels;
+    mlir: the design, its kernel names resolved (``KernelSource.rename``)."""
 
     kind: str
     label: str
@@ -380,9 +375,12 @@ class ArtcOperator:
     """Base class for Artlite RTC operators.
 
     Subclasses override:
-      - ``get_kernel_src()`` -> C++ source code string
-      - ``get_mlir_artifact()``  -> MLIR module
+      - ``get_kernel_src()`` -> C++ source code string, its namespace-scope names under ``kernel_prefix(stem)``
+      - ``get_mlir_artifact()``  -> MLIR module, its kernels declared under the same names
       - ``get_arg_spec()``       -> list of ArgSpec(direction, shape, dtype)
+
+    The build names the kernels by their code (``kernel_source``): ``kernel_source()`` resolves the source,
+    ``mlir_text()`` the design.
 
     Usage::
 
@@ -430,6 +428,42 @@ class ArtcOperator:
         """
         return None
 
+    def kernel_source(self) -> KernelSource | None:
+        """The kernel source with its names resolved (rendered once per operator object)."""
+        if "_kernel_source" not in self.__dict__:
+            raw = self.get_kernel_src()
+            self._kernel_source = None if raw is None else KernelSource(raw, label=self.kernel_label(),
+                                                                        detail=self.kernel_detail())
+        return self._kernel_source
+
+    def kernel_label(self) -> str:
+        """The operator's section header in a translation unit: its class and file."""
+        mod = sys.modules[type(self).__module__].__file__ or ""
+        where = os.path.relpath(mod, os.path.dirname(OPERATORS_DIR)) if mod.startswith(OPERATORS_DIR) else \
+            os.path.basename(mod)
+        return f"{type(self).__name__} ({where})"
+
+    def kernel_detail(self) -> str:
+        """What tells the operator's sections in a fused ELF's translation unit apart: its scalar constructor
+        arguments."""
+        def plain(v: object) -> str | None:
+            if v is None or isinstance(v, bool | int):
+                return repr(v)
+            if isinstance(v, float):
+                return f"{v:g}"
+            return repr(v) if isinstance(v, str) and len(v) <= 24 else None
+        args, kwargs = self.__dict__.get("_ctor", ((), {}))
+        shown = [t for t in map(plain, args) if t is not None]
+        return ", ".join(shown + [f"{k}={t}" for k, v in kwargs.items() if (t := plain(v)) is not None])
+
+    def mlir_text(self) -> str:
+        """The design's MLIR, its kernel names resolved (rendered once per operator object)."""
+        if "_mlir_text" not in self.__dict__:
+            text = str(self.get_mlir_artifact())
+            ks = self.kernel_source()
+            self._mlir_text = ks.rename(text) if ks is not None else text
+        return self._mlir_text
+
     def get_mlir_artifact(self) -> Module:
         """Return MLIR module for this operator.
 
@@ -450,9 +484,8 @@ class ArtcOperator:
         if profiling_cfg is not None and profiling_cfg.mode == "trace":
             profiling.install_iron_hook()
 
-        source_code = self.get_kernel_src()
-        if source_code is not None:
-            source_code = '#include "operators.h"\n\n' + source_code
+        ks = self.kernel_source()
+        source_code = None if ks is None else translation_unit([ks])
 
         # Profiling parameters shape the final design (trace ops are inside
         # the MLIR already; counter injection happens in build), so they take
@@ -470,9 +503,8 @@ class ArtcOperator:
             )
         else:
             profile_key = ("counters", profiling_cfg.counter_specs)
-        return BuildSpec(kind="rtc", label=type(self).__name__, source=source_code,
-                         mlir=str(self.get_mlir_artifact()), clang_flags=tuple(self.clang_flags),
-                         profile_key=profile_key)
+        return BuildSpec(kind="rtc", label=type(self).__name__, source=source_code, mlir=self.mlir_text(),
+                         clang_flags=tuple(self.clang_flags), profile_key=profile_key)
 
     def compile(self, device: Device | None = None) -> ArtcOperator:
         """Compile the operator and prepare for dispatch (cached on disk, the render too: ``render_cache``; several

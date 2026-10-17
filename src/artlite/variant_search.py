@@ -327,38 +327,42 @@ class Variant:
 
 @dataclass
 class _Rendered:
-    source: str  # the compiled file: '#include "operators.h"' + the patched kernel source
+    source: str  # the compiled file: the patched kernel source's translation unit (``kernel_source``)
     kernel_source: str  # the patched kernel source (what get_kernel_src returns)
     clang_cmd: list[str]
     pragma_lines: list[int]  # in the compiled file
 
 
-_INCLUDE = '#include "operators.h"\n\n'  # (as ArtcOperator.compile prepends it)
-
-
 def render_variant(
     factory: Callable[..., Any], kwargs: Mapping[str, Any], variant: Variant, *, functions: Sequence[str]
 ) -> _Rendered:
-    """Render the operator (or the render function) with the variant's parameters and apply its patches."""
+    """Render the operator (or the render function) with the variant's parameters and apply its patches. The patches
+    see the rendered source's names (``{{ p }}_<name>``: ``kernel_source.MARK`` ...) and may also write them as the
+    compiled file has them."""
     from .operators.base import AIE_TARGET, CLANG_CMD_COMMON
+    from .operators.kernel_source import KernelSource
 
     made = factory(**{**kwargs, **variant.params})
     if isinstance(made, str):
         source, flags = made, []
     else:
         source, flags = made.get_kernel_src(), list(made.clang_flags)
+    raw_names = {v: k for k, v in KernelSource(source).names.items()}
+
+    def raw(text: str) -> str:  # (names as compiled -> as rendered)
+        return re.sub(r"\b\w+_[0-9a-f]{8}\b", lambda m: raw_names.get(m.group(), m.group()), text)
     try:
         for name, definition in variant.defines.items():
-            source = replace_function(source, name, definition)
+            source = replace_function(source, name, raw(definition))
         for old, new in variant.subs:
-            source = substitute(source, old, new)
-        lines: list[int] = []
+            source = substitute(source, raw(old), raw(new))
         if variant.pragma is not None:
             source = apply_pragma(source, functions, variant.pragma, loops=variant.loops)
-            lines = [line + _INCLUDE.count("\n") for line in pragma_lines(source, functions, loops=variant.loops)]
+        unit = KernelSource(source).text
+        lines = pragma_lines(unit, functions, loops=variant.loops) if variant.pragma is not None else []
     except ValueError as exc:
         raise ValueError(f"variant {variant.name}: {exc}") from None
-    return _Rendered(_INCLUDE + source, source, [*CLANG_CMD_COMMON, f"--target={AIE_TARGET}", *flags], lines)
+    return _Rendered(unit, source, [*CLANG_CMD_COMMON, f"--target={AIE_TARGET}", *flags], lines)
 
 
 # -- Post-pipeliner trace (debug build of llvm-aie) ------------------------------------------------------------
@@ -757,11 +761,14 @@ def search(
 ) -> SearchResult:
     """Render the variants of factory(**kwargs) (an ArtcOperator, or a function returning kernel source) and
     measure them in parallel (jobs at a time, default ``parallel_compile.jobs()``). functions: the target functions (name substrings) that take the pragmas and get a
-    table per loop; totals: other functions reported by their cycles per call (e.g. the kernel entry point).
+    table per loop (a name as compiled matches without its hash: a patch renames what it changes, ``kernel_source``);
+    totals: other functions reported by their cycles per call (e.g. the kernel entry point).
     The post-pipeliner trace (debug llvm-aie) is taken for variants with an unpipelined one-block target loop, or
     for all with why. A patch that does not apply raises ValueError before anything compiles."""
     from .operators.base import CACHE_DIR
 
+    functions = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in functions]
+    totals = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in totals]
     names = [variant.name for variant in variants]
     if len(set(names)) != len(names) or not names:
         raise ValueError(f"variant names must be unique and not empty: {names}")

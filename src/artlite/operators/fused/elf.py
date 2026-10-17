@@ -14,6 +14,7 @@ from ..._native import ParameterScratchpad
 from ...elf_parser import CTRL_SCRATCHPAD, DataBd, ParsedElf, parse_elf, patch_control_code, pdi_sections
 from ..base import BuildSpec
 from ..design import COLS
+from ..kernel_source import translation_unit
 from . import design, layout
 from .layout import BufferLayout, Runlist, distinct, scratch_segments
 
@@ -81,17 +82,19 @@ class FusedElf:
         return self
 
     def build_spec(self) -> BuildSpec:
-        """The kernels (one translation unit: the operators agree on their compile flags) and the fused design."""
+        """The kernels (one translation unit, each definition once: ``kernel_source``; the operators agree on their
+        compile flags) and the fused design."""
         ops = self.operators
         flags = {tuple(op.clang_flags) for op in ops}
         assert len(flags) <= 1, f"{self.name}: the operators' clang_flags differ ({sorted(flags)})"
-        sources = dict.fromkeys(src for op in ops if (src := op.get_kernel_src()))
+        sources = {ks.raw: ks for op in ops if (ks := op.kernel_source()) is not None}
         arg_bytes = [self.layout.space_bytes["input"], self.layout.space_bytes["output"],
                      *(end - start for start, end in self.segments)]
         entries = [(op, [self._arg(n) for n in names]) for op, *names in self.runlist]
         mlir = design.render(entries, arg_bytes=arg_bytes, library=self.LIBRARY)
-        return BuildSpec(kind="fused", label=self.name, source='#include "operators.h"\n\n' + "\n".join(sources),
-                         mlir=mlir, clang_flags=flags.pop() if flags else (), expand_load_pdis=self.expand_load_pdis)
+        return BuildSpec(kind="fused", label=self.name,
+                         source=translation_unit(sources.values()) if sources else None, mlir=mlir,
+                         clang_flags=flags.pop() if flags else (), expand_load_pdis=self.expand_load_pdis)
 
     def _arg(self, name: str) -> design.Arg:
         """Where a buffer (or slice) lies in main's arguments."""

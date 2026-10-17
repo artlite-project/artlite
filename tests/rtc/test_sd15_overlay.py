@@ -4,12 +4,16 @@ conv-layout inputs, stride 2 into the lower level's half tiles, upsampling from 
 bfp16 outputs, GEGLU), GroupNorm (a concatenation's records) and LayerNorm; and a library program across the regular
 and transformer variants (program-memory patches instead of reconfigurations)."""
 
+import os
+import subprocess
+
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 
 import artlite
+from artlite.operators.design import COLS, ROWS
 from artlite.operators.sd15 import overlay as ov
 from artlite.operators.sd15.attention import AttnOverlay
 from artlite.operators.sd15.overlay import C_OBJ, SOBJ, ApplyOp, ConvL, GemmL, SumOp
@@ -233,9 +237,19 @@ def test_layer_norm(W: int, C: int) -> None:
     assert _rel(ov.from_panels(Z.to_torch(), C, W, W), ref) < 9e-3
 
 
+def _core_main(elf: str, core: str) -> list[str]:
+    """A core ELF's own function (the core main: the kernels it calls, by address), disassembled."""
+    from artlite.operators.checks import OBJDUMP
+    lines = subprocess.run([OBJDUMP, "-d", f"--disassemble-symbols={core}", elf], capture_output=True, text=True,
+                           check=True).stdout.splitlines()
+    return lines[next(i for i, ln in enumerate(lines) if ln.endswith(f"<{core}>:")):]
+
+
 def test_variant_patches() -> None:
     """A library program of a conv (regular variant), a GEMM (transformer variant) and the conv again: the designs are
-    program-memory patches of each other (both directions), and both operators compute what they compute alone."""
+    program-memory patches of each other (both directions; every core's main byte for byte the same: the patch
+    rewrites the kernels while the cores wait in it, ``Overlay.source``), and both operators compute what they compute
+    alone."""
     from artlite.operators.sd15.unet import Arena, Program
     torch.manual_seed(0)
     W, C = 32, 640
@@ -247,6 +261,11 @@ def test_variant_patches() -> None:
     prog.add(g, "a", "wg", "y2")
     prog.add(c, "x", "z", "wc", "y3")
     prog.compile()
+    prj = os.path.join(os.path.dirname(prog.lib.elf_path), "design.mlir.prj")  # (the fused design's devices: op<i>_<class>)
+    for core in (f"core_{col}_{row}" for col in range(COLS) for row in range(2, 2 + ROWS)):
+        conv, gemm = (_core_main(os.path.join(prj, f"elfs_{d}_{core}", f"elfs_{d}_{core}.elf"), core)
+                      for d in ("op0_ConvL", "op1_GemmL"))
+        assert conv == gemm, f"{core}: the variants' mains differ"
     patches = prog.lib.load()._asm.patches
     assert {(0, 1), (1, 0)} <= set(patches), patches.keys()
     x, a = torch.randn(2, C, W, W).bfloat16().float(), torch.randn(2, C, W, W)

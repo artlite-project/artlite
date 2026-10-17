@@ -28,14 +28,6 @@ class Arg(NamedTuple):
     nbytes: int
 
 
-def operator_mlir(op: ArtcOperator) -> str:
-    """An operator's MLIR, rendered once per operator object (ELFs that share operators: the stages of a prefill)."""
-    text = op.__dict__.get("_fused_mlir")
-    if text is None:
-        text = op._fused_mlir = str(op.get_mlir_artifact())
-    return text
-
-
 def without_sequences(mlir: str) -> str:
     """A design's MLIR text without its runtime sequences (each from its ``aie.runtime_sequence`` line to the closing
     brace at that line's indentation)."""
@@ -60,7 +52,7 @@ def render(entries: Sequence[tuple[ArtcOperator, Sequence[Arg]]], *, arg_bytes: 
 
     ops = distinct(op for op, _ in entries)
     names = {id(op): f"op{i}_{type(op).__name__}" for i, op in enumerate(ops)}
-    texts = {names[id(op)]: operator_mlir(op) for op in ops}
+    texts = {names[id(op)]: op.mlir_text() for op in ops}
     device = _device(texts)
     designs: dict[str, str] = {}
     host = {n: designs.setdefault(without_sequences(t), n) if library else n for n, t in texts.items()}

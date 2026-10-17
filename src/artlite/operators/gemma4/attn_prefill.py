@@ -49,9 +49,10 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ...model_config import GemmaConfig
-from ..base import JINJA_ENV, ArgSpec, ArtcOperator, hashed_prefix
+from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, range32, stream_walk
 from ..gemm.gemm_q import ChainPart, chained_fill
+from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
 from ..prefill.gemm import Layout
 from ..util import Attr, regions
@@ -315,6 +316,7 @@ class GemmaPrepOperator(ArtcOperator):
     layer's cache: 2 KV heads of ``kv_bytes`` each, from the first head's guard). Parameters ``params``."""
 
     STACK = 2048
+    pfx = kernel_prefix("g4ap")
 
     def __init__(self, *, T: int, cfg: GemmaConfig, hd: int, layout: Layout, kv_bytes: int, cs_positions: int,
                  kv_pad: int = 0, kp: int = 2):
@@ -332,18 +334,12 @@ class GemmaPrepOperator(ArtcOperator):
         hd = self.kind.hd
         return {"c": 0, "row": 256, "stage": 256 + 4 * hd, "vn": 256 + 4 * hd, "size": 256 + 36 * hd}
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         k = self.kind
         args = {"p": p, "HD": k.hd, "ND": k.nd, "ROT": k.rot, "eps": repr(self.cfg.rms_norm_eps), "KP": k.kp}
         return JINJA_ENV.from_string(_NR0).render(**args) + _PREP.render(w=Attr(self.workspace()), HALVES=not k.swa,
                                                                          **args)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("g4ap", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def n_cs(self) -> int:
@@ -822,6 +818,7 @@ class GemmaAttnOperator(ArtcOperator):
     layer's cache, from the first head's guard), A (T x 8 hd as bfp16 panels [T / 8][hd]). Parameters ``params``."""
 
     STACK = 3072
+    pfx = kernel_prefix("g4aa")
 
     def __init__(self, *, T: int, cfg: GemmaConfig, hd: int, kv_bytes: int, kv_pad: int = 0, kp: int = 2,
                  ablate: tuple[str, ...] = ()):
@@ -845,18 +842,12 @@ class GemmaAttnOperator(ArtcOperator):
         sizes = [("sc", 256 * rg * qb), ("m", 256 * qb), ("l", 256 * qb), ("pp", 144 * rg * qb), ("rm", 256), ("st", 64)]
         return regions(sizes)
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         k = self.kind
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=k.nd, RG=k.recs, KP=k.kp, SWA=k.swa, QB=self.qb,
                             tri=f"{tri:016X}", ablate=self.ablate)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("g4aa", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     @property
     def n_qs(self) -> int:

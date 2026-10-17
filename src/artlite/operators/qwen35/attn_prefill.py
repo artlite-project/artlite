@@ -47,9 +47,10 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ...model_config import QwenConfig
-from ..base import JINJA_ENV, ArgSpec, ArtcOperator, hashed_prefix
+from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, range32, stream_walk
 from ..gemm.gemm_q import chained_fill
+from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
 from ..prefill.gemm import Layout
 from ..util import Attr, bf16_hilo, regions
@@ -221,6 +222,7 @@ class AttnPrepOperator(ArtcOperator):
     p0 / 32 (``params``)."""
 
     STACK = 3072
+    pfx = kernel_prefix("qap")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int,
                  qs_T: int = 0):
@@ -238,17 +240,11 @@ class AttnPrepOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         return {"nrm": 0, "row": 8 * HD, "stage": 12 * HD, "size": 44 * HD}
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         qs = bf16_hilo(math.log2(math.e) / 16)
         return _PREP.render(p=p, HD=HD, ND=ND, w=Attr(self.workspace()), eps=repr(self.cfg.rms_norm_eps), qs=qs,
                             AT_REC_K=AT.REC_K)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("qap", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -582,6 +578,7 @@ class PrefillAttnOperator(ArtcOperator):
     cores' trip count), ``QA_OFF``: the bf16 offset of the chunk's second group (``params``)."""
 
     STACK = 3072
+    pfx = kernel_prefix("qaa")
 
     def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = ()):
         """``ablate`` (timing experiments, wrong results): kernel bodies compiled out ("qk", "soft", "pv")."""
@@ -598,17 +595,11 @@ class PrefillAttnOperator(ArtcOperator):
         sizes = [("o", qc * 8192), ("sc", qc * 1024), ("m", qc * 256), ("l", qc * 256), ("pp", qc * 288), ("rm", 256)]
         return regions(sizes)
 
-    def _render(self, p: str) -> str:
+    def get_kernel_src(self) -> str:
+        p = self.pfx
         tri = sum(1 << (8 * q + k) for q in range(8) for k in range(8) if k > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), QC=self.qc, HD=HD, ND=ND, SLOT=SLOT, tri=f"{tri:016X}",
                             ablate=self.ablate)
-
-    @property
-    def pfx(self) -> str:
-        return hashed_prefix("qaa", self._render("P"))
-
-    def get_kernel_src(self) -> str:
-        return self._render(self.pfx)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T

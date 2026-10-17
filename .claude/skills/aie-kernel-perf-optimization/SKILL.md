@@ -105,10 +105,11 @@ Violating any of these usually costs more than any micro-tuning gains.
 - **Tables as worker `Buffer`s** (a LUT's coefficients: `Buffer(initial_value=...)`, `act_lut`
   `render(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
   pinned at fixed addresses (`pin_l1_buffers`).
-- **Every function at namespace scope carries the operator's prefix** (`{{ p }}_...`), helpers too: a library or
-  fused ELF compiles all its operators' kernel sources as one translation unit (identical sources once), so two
-  operators' helpers of one name collide, anonymous namespaces included. Keep templates and helpers out of
-  `extern "C"` blocks.
+- **Every name at namespace scope is `{{ p }}_...`** (`p = kernel_prefix(stem)`, AGENTS.md "Rules"), helpers too:
+  the build names each definition by its code, so the operators of a library or fused ELF (one translation unit)
+  share equal helpers and never collide. A helper renderer several operators use renders under its own stem
+  (`act_lut.LUT`, `gemm.mac.MAC`) and a helper that differs only in constants can take them as template parameters
+  (`mac<M, N>`): one definition for all of them. Keep templates and helpers out of `extern "C"` blocks.
 - **`noinline` boundaries** cost a call, a return and argument moves (~10-20 cycles). Use one when a loop pipelines
   standalone but not inside a big function (II 64 / 111 inlined vs 11 / 16); for a helper called from several places
   (one copy in program memory); when the inlined frame would blow the stack (an exact fp32 GELU inlined: 7.3 KB); for

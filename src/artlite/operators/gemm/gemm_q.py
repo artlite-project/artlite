@@ -72,8 +72,9 @@ from ml_dtypes import bfloat16
 from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, ROWS, stream_walk
 from ..formats import FORMATS, KC, KT, kernel_template, slot
+from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
-from .mac import render_mac
+from .mac import MAC, render_mac
 
 TILES = 4  # tiles per pass
 A_RESIDENT_MAX = 448 * 1024  # bytes of a core row's A strip kept in its memtile (one buffer: the
@@ -256,7 +257,7 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             py += 32;
         }
     }
-    {{ p }}_gelu_tab<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab);
+    {{ lut }}_gelu_tab<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab);
     {
         const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
         const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
@@ -291,7 +292,7 @@ void {{ p }}_mm(const bfloat16 *__restrict pA_in, const void *__restrict own, co
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
     const bool odd = kt & 1;
-    {{ p }}_mac((const bfp16ebs8 *)pA_in, own, other, (const bfloat16 __aie_dm_resource_c *)(odd ? pCb : pC),
+    {{ mac }}((const bfp16ebs8 *)pA_in, own, other, (const bfloat16 __aie_dm_resource_c *)(odd ? pCb : pC),
                 (bfloat16 __aie_dm_resource_c *)(odd ? pC : pCb), h);
 {% if "ev_mm" in ablate or "ev_kt" in ablate %}
     event1();
@@ -310,7 +311,7 @@ void {{ p }}_mm(const bfloat16 *__restrict pA_in, const void *__restrict stage, 
     // (every entry sets the rounding: BFP16 tiles have no dq kernel that would, and
     // the default truncates the C tiles and B conversions: 5.7e-2 instead of 1.2e-2 rel-rms)
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_mac((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
+    {{ mac }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
                 (bfloat16 __aie_dm_resource_c *)pC);
 {% if "ev_mm" in ablate or "ev_kt" in ablate %}
     event1();
@@ -331,7 +332,7 @@ void {{ p }}_mm2(const bfloat16 *__restrict pA_in, const void *__restrict stage,
     return;
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_mac((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pCin,
+    {{ mac }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pCin,
                 (bfloat16 __aie_dm_resource_c *)pCout);
 {% if "ev_mm" in ablate or "ev_kt" in ablate %}
     event1();
@@ -392,6 +393,7 @@ class GemmQOperator(ArtcOperator):
     """
 
     DQ_CORE = False  # (GemmQdOperator: one dequantizing core per column)
+    p = kernel_prefix("gq")  # (the kernels' names: ``kernel_source``)
 
     def __init__(
         self,
@@ -612,15 +614,6 @@ class GemmQOperator(ArtcOperator):
             nxt[g] += need
         return layout
 
-    @property
-    def p(self) -> str:
-        return (f"gq_{self.fmt.lower()}_m{self.m}_n{self.n}{f'_{self.act}' if self.silu else ''}"
-                f"{'_cb' if self.c_bfp16 else ''}"
-                f"{'' if self.nsb == 8 else f'_sb{self.nsb}'}"
-                f"{f'_t{self.tiles}' if self.TR != self.n or self.tiles != 64 // self.R else ''}"
-                f"{f'_r{self.R}' if self.planar else ''}"
-                f"{f'_cp{self.n_out}' if self.c_pack else ''}")
-
     def get_arg_spec(self) -> list[ArgSpec]:
         return [
             ArgSpec("in", (self.M * self.a_K * 9 // 16,), torch.bfloat16),
@@ -630,8 +623,8 @@ class GemmQOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         # the MAC: B as the dequantized bfp16 panels, or BFP16 tiles
-        mac = render_mac(name=f"{self.p}_mac", m=self.m, n=self.n, k=KT, split=self.pair)
-        return _KERNEL_TPL.render(p=self.p, m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act,
+        mac = render_mac(k=KT, split=self.pair)
+        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.n}>", m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act,
                                   fmt=self.fmt,
                                   nsb=self.nsb, dqb=False,
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
