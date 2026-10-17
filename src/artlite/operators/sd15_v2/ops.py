@@ -81,7 +81,11 @@ class Gemm:
     tokens: R rows of Lg groups, x = g + Lg lane; the input's rows R conv of Lg conv groups); weights (N, K, 3, 3);
     the halo rows from the neighbour columns' memtiles (``zero``: a memtile region of zeros for the image's edges,
     ``conv_zero_bytes``); with a residual the sends are per pass the chunks' task, then the residual's (an op of
-    2 npo tasks per core: ``seq.Seq.op`` issues them in rounds)."""
+    2 npo tasks per core: ``seq.Seq.op`` issues them in rounds). Rows (``rc``: x holds the column's rc rows of 4 groups,
+    32x32): the op's ntile tiles are output rows r0 .. of 4 groups (m 64); per chunk an A object per dy: the 8 (row,
+    group) pairs from input row r + dy - 1's predecessor group (slot 0, then the row's groups in slots 1-4, slot 5 the
+    next row's group 0), into whose slots 0 and 5 the core shifts the row's group 3 one lane down and its group 0 one
+    lane up: every tap's 4 bands are slots dx .. dx + 3 (``conv_words``)."""
 
     m: int
     ntile: int
@@ -104,6 +108,8 @@ class Gemm:
     R: int = 0
     Lg: int = 0
     zero: int = 0
+    rc: int = 0
+    r0: int = 0
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N % 320 == 0 and self.K % 8 == 0 and self.out in ("bf16", "bfp16", "geglu", "vt")
@@ -112,7 +118,8 @@ class Gemm:
         assert 0 <= self.p0 and self.p0 + self.npo <= self.npass
         self.nkt = -(-self.K // D.KT)
         if self.conv:
-            assert self.m == 16 * self.R * self.Lg and self.ntile == 1 and self.K % 64 == 0 and self.conv in (1, 2)
+            assert self.m == 16 * self.R * self.Lg and (self.ntile == 1 or self.rc) and self.K % 64 == 0 and self.conv in (1, 2)
+            assert not self.rc or (self.R, self.Lg, self.conv) == (1, 4, 1) and self.r0 + self.ntile <= self.rc
             self.nch = self.K // 64
             self.Li, self.Rc = self.Lg * self.conv, self.R * self.conv  # (the input's groups, the column's input rows)
             self.Ri = self.Rc + (2 if self.conv == 1 else 1)  # (an object's rows: the halos above / below)
@@ -151,6 +158,8 @@ class Gemm:
         byte offset: ``design.a_byte``), or a lane-shifted copy in cbuf (the phase's: a row's last group one lane down,
         its group 0 one lane up); a call per group where the two sources' row strides differ), the B and C walks, the
         taps' words, the shift phases."""
+        if self.rc:
+            return self._row_words()
         R, LG, Li, st = self.R, self.Lg, self.Li, self.conv
         assert (R, LG) in ((1, 1), (2, 2)), (R, LG)
         rs, il = Li * 1152, R == 2  # (il: 4 bands, per group its rows alternate per block: C's halves in two regions)
@@ -211,6 +220,40 @@ class Gemm:
         assert K.C_PHASE + 24 <= D.WS // 4
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
 
+    def _row_words(self) -> np.ndarray:
+        """``conv_words`` of the row tiles (``rc``): 4 MAC calls relative to an object, the same for its 3 taps (dx): bands
+        b = groups 0..3 in slots dx + b (slot s at ``design.a_byte`` (1152 s): slots 4.. in the second half); one call of
+        the 4 bands where the pairs (b0, b2), (b1, b3) are equally far apart (the il walk), else a call per pair; the
+        shift phase (slot 4 one lane down into slot 0, slot 1 up into slot 5) and a new A object before each dy's taps."""
+        A = [D.a_byte(1152 * k) for k in range(6)]
+
+        def walk(bands: list[int]) -> tuple:  # (the A walk of 4 bands or of one pair)
+            a = [A[k] for k in bands]
+            if len(a) == 2:
+                return 2, (1, a[1] - a[0] - 1152, 4, a[0] - a[1] - 1152, 0)
+            assert a[2] - a[0] == a[3] - a[1]
+            return 4, (1, a[2] - a[0] - 1152, 4, a[0] - a[2] - 1152, a[1] - a[2] - 1152)
+        calls, first = [], []
+        for dx in range(3):
+            first.append(len(calls))
+            sl = [dx + b for b in range(4)]
+            if A[sl[2]] - A[sl[0]] == A[sl[3]] - A[sl[1]]:
+                calls.append((sl[0], 0, *walk(sl)))
+            else:
+                calls += [(sl[0], 0, *walk([sl[0], sl[2]])), (sl[1], 1, *walk([sl[1], sl[3]]))]
+        first.append(len(calls))
+        words = []
+        for src, g, nbr, dims in calls:
+            words += [(1 << 30 if g else 0) | nbr << 16 | A[src], *dims, 0, 0, dims[4], dims[4]]
+        tapw = [first[dx] * K.CALL | (first[dx + 1] - first[dx]) << 10 | (1 if dx == 0 else 0) << 12 |
+                (1 if dx == 0 and dy else 0) << 15 for dy, dx in self.tap_order(0)]
+        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out[:len(words)] = words
+        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
+        out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
+        out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 4] = (A[4], A[0] | K.SH_OBJ, A[1], A[5] | K.SH_OBJ)
+        return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
+
     def command(self, bias: torch.Tensor | None, row: int) -> np.ndarray:
         """Row ``row``'s command slot (Q bytes); bias: (N,) or None (a conv's: its bias + the time bias)."""
         cmd = np.zeros(D.Q // 4, np.int32)
@@ -259,6 +302,28 @@ class Gemm:
         """Bytes of the zeros an edge column's missing halo row reads (one row of 8 kb: the iteration stays on it)."""
         return self.Li * 8 * 2 * L.PANEL
 
+    def _row_sends(self, col: int, t: int) -> MemTask:
+        """Tile t's A objects of the row tiles (``rc``), per chunk 3 (dy): the pairs (row, group) from input row
+        r + dy - 1's predecessor ([pair 8][kb 8][2], pair q at q 144 B of a kb's panels: q -1 is before x); the row above
+        the column's first from the west column (the image's top: zeros), below its last from the east (the bottom)."""
+        kbw, r = self.x_np * 18, self.r0 + t
+        obj = [(36, 1), (8, kbw), (8, 36), (0, 144)]
+        it = (8 * kbw, self.nch)
+
+        def own(dy0: int, n: int, base: int = txn.MEM_OWN, row0: int | None = None) -> dict:
+            q = 4 * (r + dy0 - 1 if row0 is None else row0) - 1
+            return {"addr": self.x + 144 * q, "nwords": n * D.A_OBJ // 4, "dims": obj, "base": base, "iteration": it}
+        zero = {"addr": self.zero, "nwords": D.A_OBJ // 4, "dims": [(288, 1), (8, 1)]}
+        lo, hi = (1 if r == 0 else 0), (2 if r == self.rc - 1 else 3)
+        chain = []
+        if r == 0:
+            chain.append(zero if col == 0 else own(0, 1, txn.MEM_WEST, self.rc - 1))
+        chain.append(own(lo, hi - lo))
+        if r == self.rc - 1:
+            chain.append(zero if col == COLS - 1 else own(2, 1, txn.MEM_EAST, 0))
+        assert self.x >= 144, "the first object's slot 0 before x"
+        return MemTask(chain, repeat=self.nch * (1 if self.res is not None else self.npo))
+
     def _conv_sends(self, col: int) -> MemTask:
         """The chunks' A objects: [rows Ri][Li groups][kb 8][2] from the west column's last row (the image's top: zeros),
         the column's rows, the east column's first row (stride 1; the bottom: zeros); the last BD reads on to fill
@@ -287,14 +352,17 @@ class Gemm:
         co = ColOps()
         for r in range(4):
             sends, recvs = [], []
-            if self.conv and self.res is not None:  # (per pass: its chunks, then its residual objects)
-                ow = self.nres * D.A_OBJ // 4
-                res = MemTask([{"addr": self.res + (r * self.npass + P0) * ct, "nwords": ow, "dims": _contig(ow),
-                                "iteration": (ct // 4, NPO)}])
-                for _ in range(NPO):
-                    sends += [self._conv_sends(col), res]
-            elif self.conv:
-                sends.append(self._conv_sends(col))
+            if self.conv:  # (per tile; with a residual per pass its chunks, then its residual objects)
+                for t in range(NT):
+                    cs = self._row_sends(col, t) if self.rc else self._conv_sends(col)
+                    if self.res is None:
+                        sends.append(cs)
+                        continue
+                    ow = self.nres * D.A_OBJ // 4
+                    res = MemTask([{"addr": self.res + ((r * self.npass + P0) * NT + t) * ct, "nwords": ow,
+                                    "dims": _contig(ow), "iteration": (NT * ct // 4, NPO)}])
+                    for _ in range(NPO):
+                        sends += [cs, res]
             else:
                 def chain(t: int, it: bool, r: int = r) -> list[dict]:  # (tile t's; it: the BDs step over the tiles)
                     out = []

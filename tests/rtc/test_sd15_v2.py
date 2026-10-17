@@ -313,6 +313,41 @@ def test_conv(v2: V2Device, H: int, stride: int, Cin: int, N: int, res: bool) ->
     assert _rel(y, ref) < 8e-3
 
 
+@pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (640, 320, True)])
+def test_conv_rows(v2: V2Device, Cin: int, N: int, res: bool) -> None:
+    """A 3x3 conv (padding 1) of a 32x32 level in row tiles (the input's 4 rows of 4 groups per column whole in the
+    memtile, an op per band of 2 output rows; halo rows from the neighbour columns), bias, a residual: within 8e-3 of
+    torch on the bfp16-rounded operands."""
+    torch.manual_seed(12)
+    H, rc = 32, 4
+    x = torch.randn(2, Cin, H, H)
+    w, b = torch.randn(N, Cin, 3, 3) / (9 * Cin) ** 0.5, torch.randn(N) * 0.1
+    r_img = torch.randn(2, N, H, H)
+    xt, rt = level_tokens(x, rc, 4), level_tokens(r_img, rc, 4)  # (COLS, 256, C): band b = tokens [128 b, ..)
+    Z, X = 0, 4096
+    yb = N // 80 * 2 * L.ct_bytes(64)  # (a band's C tiles)
+    Y = [X + Cin // 8 * 32 * L.PANEL + k * yb for k in range(2)]
+    RES = Y if res else [None, None]  # (the output in place of the residual)
+    s = v2.seq()
+    s.op(merge(fills(v2, "x", [L.panels(xt[c]) for c in range(COLS)], X), fills(v2, "z", [np.zeros(4096, np.uint8)] * COLS, Z),
+               *([fills(v2, f"r{k}", [L.ctiles(rt[c, 128 * k:128 * (k + 1)], 64) for c in range(COLS)], RES[k]) for k in range(2)]
+                 if res else [])), {})
+    for k in range(2):
+        g = Gemm(m=64, ntile=2, K=Cin, N=N, x=X, y=Y[k], res=RES[k], out="bf16", conv=1, R=1, Lg=4, zero=Z, x_np=32,
+                 rc=rc, r0=2 * k)
+        s.op({c: g.col_ops(c) for c in range(COLS)}, gemm_rows(v2, f"w{k}", g, w, b), barrier=True)
+    s.op(merge(*(drains(v2, f"y{k}", yb, Y[k]) for k in range(2))), {})
+    v2.run(v2.transaction(s))
+    ys = [v2.read(f"y{k}", COLS * yb).reshape(COLS, yb) for k in range(2)]
+    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(ys[k][c], 128, N, 64) for k in range(2)]) for c in range(COLS)]),
+                          rc, 4)
+    ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
+    if res:
+        ref = ref + r_img.bfloat16().float()
+    err = _rel(y, ref)
+    assert err < 8e-3, err
+
+
 def _rand_resnet(p: str, cin: int, cout: int) -> dict:
     g = torch.Generator().manual_seed(5)
     w = {p + "norm1.weight": 1 + 0.2 * torch.randn(cin, generator=g), p + "norm1.bias": 0.2 * torch.randn(cin, generator=g),

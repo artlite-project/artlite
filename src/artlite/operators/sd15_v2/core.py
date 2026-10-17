@@ -57,6 +57,7 @@ CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk 
 C_PATS = C_CALLS + CALL * NCALL  # (conv: the walks of B and C, a dims_3d_t each)
 C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
 C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a v2_shift's offsets)
+SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
 ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a GroupNorm record continued from / kept for the next op: one record over several ops)
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, one per 16 channels)
@@ -362,7 +363,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const 
 // (C_PHASE: per output row r < C_R the {{ p }}_shift of two object groups into cbuf, one lane down / up), a B slot and its
 // MAC calls (C_CALLS: the first band's source (bit 31: cbuf, else the object; bits 0..15: its byte offset), bit 30:
 // the second group's C bands, bits 16..23: the bands; the A walk (a dims_3d_t); its last step per A slot (the walk
-// may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS)
+// may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS); the row tiles (``ops.Gemm`` rc): an
+// A object per dy (bit 15 of its first tap: the next object), its shift phase's destinations in the object (SH_OBJ)
 static __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf) {
   static_assert(sizeof(dims_3d_t) == 28);
   const int nch = ws[{{ C_NCH }}], R = ws[{{ C_R }}], rot = ws[{{ C_ROT }}];
@@ -377,9 +379,15 @@ static __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32
 {% endfor %}
     for (int t = 0, i = rot & ch; t < 9; t++, i = i == 8 ? 0 : i + 1) {
       const unsigned tw = ws[{{ C_TAPW }} + i];
-      if (tw >> 12) {
-        const int32_t *pw = ws + {{ C_PHASE }} + 8 * ((tw >> 12) - 1);
-        for (int r = 0; r < R; r++, pw += 4) {{ p }}_shift(a + pw[0], cbuf + pw[1], a + pw[2], cbuf + pw[3], mk);
+      if (tw >> 15) {  // (the row tiles: the next dy's object)
+        {{ p }}_give_a(s, (int32_t *)a);
+        a = (const uint8_t *){{ p }}_take_a(s);
+      }
+      if ((tw >> 12) & 7) {
+        const int32_t *pw = ws + {{ C_PHASE }} + 8 * (((tw >> 12) & 7) - 1);
+        for (int r = 0; r < R; r++, pw += 4)
+          {{ p }}_shift(a + pw[0], (pw[1] < 0 ? (uint8_t *)a : cbuf) + (pw[1] & 0xFFFF), a + pw[2],
+                   (pw[3] < 0 ? (uint8_t *)a : cbuf) + (pw[3] & 0xFFFF), mk);
       }
       int32_t *b = {{ p }}_take_b(s);
       const int32_t *e = e0 + (tw & 0x3FF);
