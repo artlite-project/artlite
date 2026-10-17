@@ -142,6 +142,7 @@ class Builder:
         self._zfill = False
         self._tab_runs: dict[int, tuple] = {}  # (row -> a table's B run, taken before the row's next op: ``table``)
         self._rec_names: dict[str, int] = {}  # (records' DDR images by name: their uses)
+        self._rec_img: dict[str, int] = {}  # (records' DDR images by name: the current one's address)
         self._images: dict[str, int] = {}  # (DDR image name -> its data's hash)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
@@ -276,12 +277,15 @@ class Builder:
         if g.conv:
             self.tab = dict.fromkeys(range(ROWS))
 
-    def records(self, rec: int, *, name: str, ch_off: int, nr: int, gsize: int) -> Records:
+    def records(self, rec: int, *, name: str, ch_off: int, nr: int, gsize: int, band: int = 0, nbands: int = 1) -> Records:
         """Drain a producer's GroupNorm records (memtile ``rec`` [core][OCH], 4 OCH bytes: released by the drain's op)
-        to DDR, with the next op; the consumer's B stream reads them after ``Seq.ddr_sync`` (``apply`` syncs). Each call
-        its own DDR image (``name``, numbered from its second use: the bands of one layer)."""
-        k = self._rec_names[name] = self._rec_names.get(name, -1) + 1
-        base = self.ddr(f"{name}.{k}" if k else name, COLS * ROWS * 256)
+        to DDR, with the next op; the consumer's B stream reads them after ``Seq.ddr_sync`` (``apply`` syncs). A layer's
+        bands' records in one DDR image [band][col][core][256 B] (band 0 opens a new one: ``name``, numbered from its
+        second use), so that a consumer gathers a producer's strips of every band in one shim BD."""
+        if band == 0:
+            k = self._rec_names[name] = self._rec_names.get(name, -1) + 1
+            self._rec_img[name] = self.ddr(f"{name}.{k}" if k else name, nbands * COLS * ROWS * 256)
+        base = self._rec_img[name] + band * COLS * ROWS * 256
         cols = {c: ColOps(drains=[MemTask([{"addr": rec, "nwords": 256, "dims": [(64, 1), (ROWS, D.OCH // 4)]}],
                                           ddr=(base + c * 1024, 1024, None))]) for c in range(COLS)}
         self._drains.append((cols, [(rec, 4 * D.OCH)], True))
@@ -293,16 +297,17 @@ class Builder:
         runs, cmds, gbs, slots = {}, [], [], {}
         for i, r in enumerate(a.rows):
             rr, nrec = [], 0
-            if a.gn:  # (per producer rows' gather: strips of their records in every column, split at slot ends)
+            if a.gn:  # (per producer rows' gather: strips of their records in every column)
                 c0, n = a.ch0(r), a.nblk * 80
-                for rs in records:
+                for rs in sorted(records, key=lambda rs: -len(rs.rows_for(c0, n))):  # (the larger strips first: fewer
+                    # gathers cut at slot ends)
                     sel = rs.rows_for(c0, n)
                     assert sel == list(range(sel[0], sel[-1] + 1)) if sel else True, sel
                     for col in range(COLS) if sel else ():
                         rr.append((rs.addr + col * 1024 + sel[0] * 256, len(sel) * 256))
-                        nrec += len(sel)
-                assert nrec, (c0, n)
-                rr = self._slots(rr)
+                assert rr, (c0, n)
+                rr, ns = self._slots(rr)
+                nrec = ns * K.REC_SLOT  # (whole slots: their zero records add nothing)
             runs[r] = rr
             slots[r] = -(-nrec // K.REC_SLOT)
             cmds.append(a.command(r, nrec))
@@ -315,35 +320,35 @@ class Builder:
         cols = {c: a.col_ops() for c in range(COLS)}
         self.op(self.merge(cols, extra) if extra else cols, rows, sync=sync)
 
-    def _slots(self, strips: list[tuple[int, int]]) -> list[tuple]:
-        """Record strips (device address, bytes) packed into B slots of ``core.REC_SLOT`` records (a strip cut at a
-        slot's end; each slot padded to Q), runs of equal strips 1 KB apart merged into one shim gather."""
+    def _slots(self, strips: list[tuple[int, int]]) -> tuple[list[tuple], int]:
+        """Record strips (device address, bytes) packed whole into B slots of ``core.REC_SLOT`` records (each slot
+        filled up with zero records, then padded to Q), runs of equal strips of the columns (1 KB apart) and bands (8
+        KB) merged into one shim gather. Returns the B runs and the slots."""
         cap = K.REC_SLOT * 256
-        slots, cur, used = [], [], 0
+        slots, used = [[]], 0
         for a, n in strips:
-            while n:
-                k = min(n, cap - used)
-                cur.append((a, k))
-                a, n, used = a + k, n - k, used + k
-                if used == cap:
-                    slots.append(cur)
-                    cur, used = [], 0
-        if cur:
-            slots.append(cur)
+            assert n <= cap
+            if used + n > cap:
+                slots.append([])
+                used = 0
+            slots[-1].append((a, n))
+            used += n
         out = []
         for sl in slots:
             i = 0
             while i < len(sl):
                 a, n = sl[i]
                 j = i + 1
-                while j < len(sl) and sl[j][1] == n and sl[j][0] == a + 1024 * (j - i):
+                while j < len(sl) and sl[j][1] == n and sl[j][0] == a + 1024 * ((j - i) % COLS) + 8192 * ((j - i) // COLS):
                     j += 1
-                out.append((a, n) if j == i + 1 else (a, n * (j - i), (n // 4, j - i, 256, 2048)))
+                if j - i > COLS:  # (whole groups of the columns' strips: a shim BD's length)
+                    j = i + (j - i) // COLS * COLS
+                out.append((a, n) if j == i + 1 else (a, n * (j - i), (n // 4, min(j - i, COLS), 256, 2048)))
                 i = j
             used = sum(n for _, n in sl)
             if used < D.Q:
                 out.append((self.zeros_q(), D.Q - used))
-        return out
+        return out, len(slots)
 
     def zeros_q(self) -> int:
         if "_zq" not in self.v2.dev.buffers:

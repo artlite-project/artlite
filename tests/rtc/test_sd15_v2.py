@@ -424,6 +424,42 @@ def test_resnet_bands(v2: V2Device, cin: int, cout: int) -> None:
     assert err < 1.5e-2
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("ch, cs", [(1280, 640), (640, 320)])
+def test_resnet_cat_bands(v2: V2Device, ch: int, cs: int) -> None:
+    """The up path's resnet on [h | skip] on the banded 32x32 level (K parts of at most 640 channels, partial sums
+    parked in DDR): within 1.5e-2 of the fp32 reference."""
+    from artlite.operators.sd15_v2.unet import DTensor, resnet_cat_bands, skip_bands
+    from models.sd15 import reference
+    torch.manual_seed(14)
+    p, H, cout = "r.", 32, 640
+    w = _rand_resnet(p, ch + cs, cout)
+    tb = 0.3 * torch.randn(cout)
+    hx, sk = torch.randn(2, ch, H, H), torch.randn(2, cs, H, H)
+    lv = Level(H, 2)
+    bd = Builder(v2)
+
+    def ddr(x: torch.Tensor, name: str) -> DTensor:
+        xc = level_tokens(x, lv.R, lv.Lg)
+        t = DTensor(lv, x.shape[1], name)
+        for b in range(2):
+            bd.image(t.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+        return t
+    C = ch + cs
+    hd = skip_bands(bd, ddr(hx, "h_in"), name="h", st=(C // 32, 0))
+    sd = skip_bands(bd, ddr(sk, "s_in"), name="s", st=(C // 32, ch))
+    out = resnet_cat_bands(bd, w, p, hd, sd, cout=cout, time_bias=tb, eps=1e-5, stats=None, name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    yb = [v2.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
+    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, cout, lv.m) for b in range(2)])
+                                       for c in range(COLS)]), lv.R, lv.Lg)
+    ref = reference.resnet(w, p, torch.cat([hx, sk], 1), eps=1e-5, time_bias=tb)
+    err = _rel(y, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
+
+
 def _rand_transformer(p: str, C: int = 1280, cd: int = 768) -> dict:
     g = torch.Generator().manual_seed(7)
     q = p + "transformer_blocks.0."

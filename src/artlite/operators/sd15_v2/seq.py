@@ -181,23 +181,29 @@ class Seq:
         return push
 
     def _b_chain(self, col: int, op: int, runs: list[tuple]) -> None:
-        """A row's B runs as one task of chained BDs on shim MM2S 1 (BDs from ``B_BDS`` in turn; a BD rewritten
-        only when its last user is complete)."""
+        """A row's B runs as tasks of chained BDs on shim MM2S 1 (BDs from ``B_BDS`` in turn; a BD rewritten only when
+        its last user is complete): more runs than BDs go as several chains, each after the previous one completed
+        (its slots are taken as they arrive: the wait cannot block the cores)."""
         key = (0, col, txn.MM2S, 1)
-        self._slot(key, op)
-        k = self._kbd.get(key, 0)
-        ids = [B_BDS[(k + i) % len(B_BDS)] for i in range(len(runs))]
-        assert len(ids) <= len(B_BDS), len(runs)
-        self._kbd[key] = k + len(runs)
-        for i, (bid, run) in enumerate(zip(ids, runs, strict=True)):
-            if (u := self._user.get((col, -1 - bid))) is not None and u != op:
-                self.complete(u)
-            self.t.shim_bd(col, bid, address=run[0], nbytes=run[1], dims=run[2] if len(run) > 2 else None,
-                           next_bd=ids[i + 1] if i + 1 < len(ids) else None)
-            self._user[(col, -1 - bid)] = op
-        n = self.t.n_ops
-        self.t.shim_push(col, txn.MM2S, 1, ids[0])
-        self._pushed(key, n)
+        for c0 in range(0, len(runs), len(B_BDS)):
+            chunk = runs[c0:c0 + len(B_BDS)]
+            if c0:  # (the previous chain complete: its BDs free)
+                self.t.set_token(self._q[key][-1][1])
+                self.t.sync(col=col, direction=txn.MM2S, channel=1)
+                self._q[key].pop()
+            self._slot(key, op)
+            k = self._kbd.get(key, 0)
+            ids = [B_BDS[(k + i) % len(B_BDS)] for i in range(len(chunk))]
+            self._kbd[key] = k + len(chunk)
+            for i, (bid, run) in enumerate(zip(ids, chunk, strict=True)):
+                if (u := self._user.get((col, -1 - bid))) is not None and u != op:
+                    self.complete(u)
+                self.t.shim_bd(col, bid, address=run[0], nbytes=run[1], dims=run[2] if len(run) > 2 else None,
+                               next_bd=ids[i + 1] if i + 1 < len(ids) else None)
+                self._user[(col, -1 - bid)] = op
+            n = self.t.n_ops
+            self.t.shim_push(col, txn.MM2S, 1, ids[0])
+            self._pushed(key, n)
 
     def _shim(self, col: int, d: int, ch: int, op: int, address: int, nbytes: int, dims: tuple | None,
               iteration: tuple[int, int] | None = None, *, repeat: int = 1) -> int:

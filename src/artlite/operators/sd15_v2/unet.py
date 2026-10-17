@@ -105,12 +105,13 @@ def conv(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor, *, name: str,
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
     bd.gemm(Gemm(**kw, res=res.addr if res is not None else None), w, b, name=name, tbias=tbias)
     if stats:
-        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0])]
+        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0], band=band or 0,
+                              nbands=lv.nb)]
 
 
 def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, name: str, out: Tensor,
          res: Tensor | None = None, stats: tuple[int, int] | None = None, kind: str = "bf16", ln: bool = False,
-         split: int = 1, extra: dict | None = None) -> int:
+         split: int = 1, extra: dict | None = None, band: int = 0) -> int:
     """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu"), + res;
     out's GroupNorm records for ``stats``; ln: LayerNorm records, returns their memtile address (the caller frees
     ``ln_rec`` bytes after the apply). split: ops of npass / split passes (a lock counts a GEMM's sends to 63).
@@ -129,7 +130,8 @@ def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, nam
         part = {} if split == 1 else {"p0": k * npass // split, "npo": npass // split}
         bd.gemm(Gemm(**kw, **part), w.flatten(1), b, name=name if split == 1 else f"{name}.{k}", extra=extra if k == 0 else None)
     if stats:
-        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=w.shape[0] // 4, gsize=stats[0])]
+        out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=w.shape[0] // 4, gsize=stats[0], band=band,
+                              nbands=lv.nb)]
     return rec
 
 
@@ -139,7 +141,7 @@ def ln_rec(lv: Level) -> int:
 
 
 def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels: Tensor | None = None,
-               extra: dict | None = None) -> list[Records]:
+               extra: dict | None = None, band: int = 0) -> list[Records]:
     """GroupNorm records of the C tiles x for ``st`` (a copy op: K 0, x as the residual), optionally its panels (extra:
     col ops merged into it)."""
     lv = x.lv
@@ -150,7 +152,7 @@ def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels
     bd.gemm(g, None, None, name=name, extra=extra)
     if panels is None:
         bd.mem.release(y, lv.pn(x.C))
-    r = bd.records(rec, name=f"{name}.rec", ch_off=st[1], nr=x.C // 4, gsize=st[0])
+    r = bd.records(rec, name=f"{name}.rec", ch_off=st[1], nr=x.C // 4, gsize=st[0], band=band, nbands=lv.nb)
     return [r]
 
 
@@ -325,10 +327,15 @@ class DTensor:
     def nbytes(self) -> int:
         return self.lv.ct(self.C) if self.kind == "ct" else self.lv.pn(self.C)
 
-    def load(self, bd: Builder, b: int) -> Tensor:
-        """Band b in the memtile (an op of its fills)."""
-        t = alloc(bd, self.lv, self.C, self.kind)
-        bd.op(bd.load(self.band(b), t.addr, t.nbytes), {})
+    def load(self, bd: Builder, b: int, c0: int = 0, n: int | None = None) -> Tensor:
+        """Band b in the memtile (an op of its fills); C tiles: its channels [c0, c0 + n) (whole 80-channel blocks)."""
+        n = n or self.C - c0
+        t = alloc(bd, self.lv, n, self.kind)
+        off = self.lv.ct(c0) if c0 else 0
+        assert self.kind == "ct" or not c0
+        base = bd.v2.address(self.band(b))
+        bd.op({c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
+                                        ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}, {})
         t.rec = self.rec
         return t
 
@@ -336,7 +343,7 @@ class DTensor:
         """Band b from the memtile tensor t (drained with the next op, t's bytes released after it; defer False: an op
         of its own, t freed); its records."""
         if defer:
-            bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.nbytes)])
+            bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.size or t.nbytes)])
         else:
             bd.op(bd.spill(self.band(b), t.addr, t.nbytes), {})
             free(bd, t)
@@ -362,7 +369,8 @@ def transformer_bands(bd: Builder, w: dict, p: str, x: DTensor, *, kv: int, ctx_
             bd.op(bd.merge(bd.load(parked[0].band(b), h.addr, h.nbytes), bd.load(parked[1].band(b), qt.addr, qt.nbytes)), {})
         h4 = _block_out(bd, w, p, h, qt, kv=kv, ctx_kv=ctx_kv, nctx=nctx)
         xb = x.load(bd, b)
-        gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=xb, res=xb, stats=stats)
+        gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=xb, res=xb, stats=stats,
+             band=b)
         free(bd, h4)
         out.store(bd, b, xb)
     return out
@@ -416,6 +424,74 @@ def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bi
             sc = x.load(bd, b)
         conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sc, res=sc, stats=stats, band=b)
         out.store(bd, b, sc, defer=b == nb - 1)
+    free(bd, p2)
+    return out
+
+
+def skip_bands(bd: Builder, x: DTensor, *, name: str, st: tuple[int, int]) -> DTensor:
+    """A banded level's tensor as a skip: x with GroupNorm records in its concatenation's group space (st = (group size,
+    channel offset)): a copy op per band."""
+    out = DTensor(x.lv, x.C, x.name, rec=[])
+    for c0 in range(0, x.C, 640):  # (in parts of 640 channels: a band's C tiles and their panels in the memtile)
+        n = min(640, x.C - c0)
+        for b in range(x.lv.nb):
+            t = x.load(bd, b, c0, n)
+            out.rec += copy_stats(bd, t, name=f"{name}.st{c0}", st=(st[0], st[1] + c0), band=b)
+            free(bd, t)
+    return out
+
+
+def resnet_cat_bands(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cout: int, time_bias: torch.Tensor,
+                     eps: float, stats: tuple[int, int] | None, name: str) -> DTensor:
+    """``resnet_cat`` on a banded level (h, the skip and the output in DDR; their records in the concatenation's group
+    space): conv1 and the 1x1 shortcut over K parts of at most 640 channels (h's, the skip's: a part's whole-column
+    panels fit beside a band's C tiles), their partial sums (bf16 C tiles) parked in DDR per band; GN1 + SiLU of each
+    part's channels, conv1's parts (+ the time bias, GN2's records in the last), the shortcut's parts per band, GN2 +
+    SiLU, conv2 + the shortcut per band -> the output's band (records for ``stats``)."""
+    lv, nb, ch, cs = h.lv, h.lv.nb, h.C, skip.C
+    C, npw = ch + cs, h.lv.np * h.lv.nb
+    recs = (h.rec or []) + (skip.rec or [])
+    g1, b1, w1, wsc = w[p + "norm1.weight"], w[p + "norm1.bias"], w[p + "conv1.weight"], w[p + "conv_shortcut.weight"]
+    parts = [(h, c0, min(640, ch - c0), c0) for c0 in range(0, ch, 640)] + \
+        [(skip, c0, min(640, cs - c0), ch + c0) for c0 in range(0, cs, 640)]  # (source, its channel, channels, in C)
+    c1 = DTensor(lv, cout, name + ".c1")
+    for k, (src, c0, n, cc) in enumerate(parts):
+        pw = alloc(bd, lv, n, "pn", pnp=npw)
+        for b in reversed(range(nb)):
+            xb = src.load(bd, b, c0, n)
+            xb.rec = recs
+            gn_apply(bd, xb, band_view(pw, b), g1[cc:cc + n], b1[cc:cc + n], name=f"{p}norm1.{k}", eps=eps, silu=True,
+                     ch0=cc, ccat=C)
+            free(bd, xb)
+        for b in range(nb):
+            cb = c1.load(bd, b) if k else alloc(bd, lv, cout)
+            first, last = k == 0, k == len(parts) - 1
+            conv(bd, pw, w1[:, cc:cc + n], w[p + "conv1.bias"] + time_bias if first else None, name=f"{p}conv1.{k}", out=cb,
+                 res=None if first else cb, stats=(cout // 32, 0) if last else None, tbias=p if first else None, band=b)
+            c1.store(bd, b, cb, defer=False)
+        free(bd, pw)
+    sc = DTensor(lv, cout, name + ".sc")
+    for b in range(nb):
+        sb = alloc(bd, lv, cout)
+        for k, (src, c0, n, cc) in enumerate(parts):
+            xb = src.load(bd, b, c0, n)
+            px = alloc(bd, lv, n, "pn", top=True)
+            plain(bd, xb, px, name=f"{p}xpn.{k}")
+            free(bd, xb)
+            gemm(bd, px, wsc[:, cc:cc + n].flatten(1), w[p + "conv_shortcut.bias"] if k == 0 else None,
+                 name=f"{p}conv_shortcut.{k}", out=sb, res=sb if k else None)
+            free(bd, px)
+        sc.store(bd, b, sb, defer=False)
+    p2 = alloc(bd, lv, cout, "pn", pnp=npw)
+    for b in reversed(range(nb)):
+        cb = c1.load(bd, b)
+        gn_apply(bd, cb, band_view(p2, b), w[p + "norm2.weight"], w[p + "norm2.bias"], name=p + "norm2", eps=eps, silu=True)
+        free(bd, cb)
+    out = DTensor(lv, cout, name)
+    for b in range(nb):
+        sb = sc.load(bd, b)
+        conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sb, res=sb, stats=stats, band=b)
+        out.store(bd, b, sb, defer=b == nb - 1)
     free(bd, p2)
     return out
 
