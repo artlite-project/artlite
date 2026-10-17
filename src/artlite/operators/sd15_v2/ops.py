@@ -279,48 +279,52 @@ class Gemm:
         return MemTask(chain, repeat=self.nch * (1 if self.res is not None else self.npo))
 
     def col_ops(self, col: int = 0) -> ColOps:
-        m, ct = self.m, L.ct_bytes(self.m)
+        """Per core its sends and receives. Tiles: the receives one task whose BDs step over the tiles; the sends one
+        task (execution t NPO + p: with one pass per core or one tile, its BDs step linearly), else a task per tile."""
+        m, ct, NT = self.m, L.ct_bytes(self.m), self.ntile
         P0, NPO = self.p0, self.npo
+        XN, YN, TP = self.x_np, self.y_np, m // 8 * 18  # (TP: a tile's token panels in words)
         co = ColOps()
         for r in range(4):
             sends, recvs = [], []
-            for t in range(self.ntile):
-                XN = self.x_np
-                if self.conv and self.res is not None:  # (per pass: its chunks, then its residual objects)
-                    ow = self.nres * D.A_OBJ // 4
-                    res = MemTask([{"addr": self.res + (r * self.npass + P0) * ct, "nwords": ow, "dims": _contig(ow),
-                                    "iteration": (ct // 4, NPO)}])
-                    for _ in range(NPO):
-                        sends += [self._conv_sends(col), res]
-                    chain = []
-                elif self.conv:
-                    sends.append(self._conv_sends(col))
-                    chain = []
-                elif not self.aobj:  # (K 0: C := bias + the residual, a copy with statistics)
-                    chain = []
+            if self.conv and self.res is not None:  # (per pass: its chunks, then its residual objects)
+                ow = self.nres * D.A_OBJ // 4
+                res = MemTask([{"addr": self.res + (r * self.npass + P0) * ct, "nwords": ow, "dims": _contig(ow),
+                                "iteration": (ct // 4, NPO)}])
+                for _ in range(NPO):
+                    sends += [self._conv_sends(col), res]
+            elif self.conv:
+                sends.append(self._conv_sends(col))
+            else:
+                def chain(t: int, it: bool, r: int = r) -> list[dict]:  # (tile t's; it: the BDs step over the tiles)
+                    out = []
+                    if self.aobj:
+                        out.append({"addr": self.x + t * TP * 4, "nwords": self.aobj * D.A_OBJ // 4,
+                                    "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)],
+                                    **({"iteration": (TP, NT)} if it else {})})
+                    if self.res is not None:  # (execution i = t NPO + p: the object (r npass + P0 + p, t))
+                        ow = self.nres * D.A_OBJ // 4
+                        out.append({"addr": self.res + ((r * self.npass + P0) * NT + t) * ct, "nwords": ow,
+                                    "dims": _contig(ow), "iteration": (ct // 4, NT * NPO) if it else (NT * ct // 4, NPO)})
+                    return out
+                if NT == 1 or NPO == 1:
+                    sends.append(MemTask(chain(0, True), repeat=NT * NPO))
                 else:
-                    chain = [{"addr": self.x + 2 * (m // 16) * t * L.PANEL, "nwords": self.aobj * D.A_OBJ // 4,
-                              "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)]}]
-                if self.res is not None and not self.conv:
-                    ow = self.nres * D.A_OBJ // 4
-                    chain.append({"addr": self.res + ((r * self.npass + P0) * self.ntile + t) * ct, "nwords": ow,
-                                  "dims": _contig(ow), "iteration": (self.ntile * ct // 4, NPO)})
-                if chain:
-                    sends.append(MemTask(chain, repeat=NPO))
-                YN = self.y_np
-                if self.out in ("bfp16", "vt"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token panel (m / 8) t + rb)
-                    data = _panel_recv(self.y + ((r * self.npass + P0) * 10 * YN + m // 8 * t) * L.PANEL, YN, m // 8, 10,
-                                       NPO)
-                elif self.out == "geglu":  # (pass p: [rb][5 cb] -> kb (r npass + p) 5 + cb)
-                    data = _panel_recv(self.y + ((r * self.npass + P0) * 5 * YN + m // 8 * t) * L.PANEL, YN, m // 8, 5,
-                                       NPO, self.junk)
-                else:  # (pass p: the C-tile object (r npass + p, t))
-                    data = {"addr": self.y + ((r * self.npass + P0) * self.ntile + t) * ct, "nwords": NPO * ct // 4,
-                            "dims": _contig(ct // 4) + [(NPO, self.ntile * ct // 4)]}
-                chain = [data]
-                if self.stats == "ln":
-                    chain.append({"addr": self.rec + (4 * t + r) * D.OCH, "nwords": D.OCH // 4})
-                recvs.append(MemTask(chain))
+                    sends += [MemTask(chain(t, False), repeat=NPO) for t in range(NT)]
+                    assert len(sends) * len(sends[0].chain) <= 4, "more send BDs than a channel has"
+            if self.out in ("bfp16", "vt"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token panel (m / 8) t + rb)
+                data = _panel_recv(self.y + (r * self.npass + P0) * 10 * YN * L.PANEL, YN, m // 8, 10, NPO)
+                data["iteration"] = (TP, NT)
+            elif self.out == "geglu":  # (pass p: [rb][5 cb] -> kb (r npass + p) 5 + cb)
+                data = _panel_recv(self.y + (r * self.npass + P0) * 5 * YN * L.PANEL, YN, m // 8, 5, NPO, self.junk)
+                data["iteration"] = (TP, NT)
+            else:  # (pass p: the C-tile object (r npass + p, t))
+                data = {"addr": self.y + (r * self.npass + P0) * NT * ct, "nwords": NPO * ct // 4,
+                        "dims": _contig(ct // 4) + [(NPO, NT * ct // 4)], "iteration": (ct // 4, NT)}
+            rc = [data]
+            if self.stats == "ln":
+                rc.append({"addr": self.rec + r * D.OCH, "nwords": D.OCH // 4, "iteration": (D.OCH, NT)})
+            recvs.append(MemTask(rc, repeat=NT))
             if self.stats == "gn" and not self.stf & K.ST_HOLD:
                 recvs.append(MemTask([{"addr": self.rec + r * D.OCH, "nwords": D.OCH // 4}]))
             co.sends[r], co.recvs[r] = sends, recvs
@@ -336,18 +340,19 @@ class Gemm:
 
 @dataclass
 class Apply:
-    """mode "gn" / "gnsilu" / "ln" of the bf16 C-tile tensor x (one tile of m tokens; blocks of 80 channels: ``nblk``
-    per core of ``rows`` from block ``blk0``) into the panel tensor y (``y_np`` token panels per kb; its kb of the i-th core's first
-    channel: ``y_kb0`` + 10 i nblk). GroupNorm: groups of ``gsize`` channels, the i-th core's first channel ``ch_off`` +
-    80 i nblk in their space (its groups in one record window: ``gn_window``); the records come on the B stream
-    (``row_ops(records=)``). LayerNorm: the producer's records at ``rec`` ([core][OCH]); ``C``: the norm's
-    channels (1 / C)."""
+    """mode "gn" / "gnsilu" / "ln" of the bf16 C-tile tensor x (``ntile`` tiles of m tokens; blocks of 80 channels:
+    ``nblk`` per core of ``rows`` from block ``blk0``) into the panel tensor y (``y_np`` token panels per kb; its kb of the
+    i-th core's first channel: ``y_kb0`` + 10 i nblk). GroupNorm: groups of ``gsize`` channels, the i-th core's first
+    channel ``ch_off`` + 80 i nblk in their space (its groups in one record window: ``gn_window``); the records come on
+    the B stream (``row_ops(records=)``). LayerNorm: the producer's records at ``rec`` ([tile][core][OCH]); ``C``: the
+    norm's channels (1 / C)."""
 
     m: int
     nblk: int
     mode: str
     x: int
     y: int
+    ntile: int = 1
     blk0: int = 0
     y_kb0: int = 0
     y_np: int | None = None
@@ -359,19 +364,20 @@ class Apply:
     eps: float = 1e-5
 
     def __post_init__(self) -> None:
-        assert self.mode in ("gn", "gnsilu", "ln") and self.m in (64, 16)
-        self.np = self.m // 8
+        assert self.mode in ("gn", "gnsilu", "ln") and self.m in (64, 16) and (self.m == 64 or self.ntile == 1)
+        self.np = self.m * self.ntile // 8
         self.y_np = self.y_np or self.np
         self.gn = self.mode in ("gn", "gnsilu")
         self.rows = D.APPLY_ROWS
         ct = L.ct_bytes(self.m)  # (an object's row blocks, then its padding: m 64 a row block, m 16 80 words)
         assert ct - self.m * 160 == (1280 if self.m == 64 else 320)
-        self.nhalf = self.nblk * (3 if self.m == 64 else 1)  # (A halves: 3 slots each, 1 + np slots a block)
+        # (A halves: m 64 3 slots each (a tile's 8 row blocks and its padding in 3 halves), m 16 a tile per half)
+        self.nhalf = self.nblk * self.ntile * (3 if self.m == 64 else 1)
         self.half_step = 960 if self.m == 64 else ct // 4
         self.aobj = -(-self.nhalf // 2) + (self.mode == "ln")
         assert self.nblk * 80 <= 640 and (not self.gn or (self.gsize >= 16 and self.tokens)) and (self.mode != "ln" or self.C)
-        assert self.mode != "ln" or 4 * 8 * self.m <= D.A_OBJ // 2, "LayerNorm records past an A half"
-        last = self.x + (self.blk0 + (len(self.rows) - 1) * self.nblk) * ct + 4 * (self.nhalf - 1) * self.half_step
+        assert self.mode != "ln" or self.ntile <= 4, "LayerNorm records past their A object"
+        last = self.x + (self.blk0 + (len(self.rows) - 1) * self.nblk) * self.ntile * ct + 4 * (self.nhalf - 1) * self.half_step
         assert last + D.A_OBJ // 2 <= 512 * 1024, "x's walk past the memtile"
 
     def ch0(self, row: int) -> int:
@@ -381,7 +387,8 @@ class Apply:
     def command(self, row: int, nrec: int = 0) -> np.ndarray:
         cmd = np.zeros(D.Q // 4, np.int32)
         mode = {"gn": K.A_GN, "gnsilu": K.A_GNSILU, "ln": K.A_LN}[self.mode]
-        cmd[[K.C_KIND, K.C_M, K.C_NBLK, K.C_MODE, K.C_NREC, K.C_EPS]] = K.K_APPLY, self.m, self.nblk, mode, nrec, _f32(self.eps)
+        cmd[[K.C_KIND, K.C_M, K.C_NTILE, K.C_NBLK, K.C_MODE, K.C_NREC, K.C_EPS]] = (K.K_APPLY, self.m, self.ntile, self.nblk,
+                                                                                mode, nrec, _f32(self.eps))
         if self.gn:
             ch0, n = self.ch0(row), self.nblk * 80
             g0 = gn_window(ch0, n, self.gsize)
@@ -407,19 +414,21 @@ class Apply:
         return out.view(np.uint8)
 
     def col_ops(self) -> ColOps:
-        m, ct = self.m, L.ct_bytes(self.m)
+        ct = L.ct_bytes(self.m)
         co = ColOps()
         for i, r in enumerate(self.rows):
             chain = []
-            if self.mode == "ln":  # (the tile's records of the column's 4 cores: [core][S1 m | S2 m])
-                chain.append({"addr": self.rec, "nwords": D.A_OBJ // 4, "dims": [(2 * m, 1), (4, D.OCH // 4)]})
-            blk = self.blk0 + i * self.nblk  # (its blocks' objects, contiguous: per A half 3 slots (m 64: a block's
-            # 8 row blocks and its padding in 3 halves; m 16: a block's 2 and its padding), then whatever follows)
-            chain.append({"addr": self.x + blk * ct, "nwords": (self.aobj - (self.mode == "ln")) * D.A_OBJ // 4,
+            if self.mode == "ln":  # (the tiles' records of the column's 4 cores: [tile][core][S1 m | S2 m], 576 B apart:
+                # a tile's 2304 B never straddle the object's halves)
+                chain.append({"addr": self.rec, "nwords": D.A_OBJ // 4, "dims": [(144, 1), (4, D.OCH // 4),
+                                                                                 (self.ntile, D.OCH)]})
+            blk = self.blk0 + i * self.nblk  # (its blocks' objects [block][tile], contiguous: per A half 3 slots (m 64:
+            # a tile's 8 row blocks and its padding in 3 halves; m 16: a tile's 2 and its padding), then whatever follows)
+            chain.append({"addr": self.x + blk * self.ntile * ct, "nwords": (self.aobj - (self.mode == "ln")) * D.A_OBJ // 4,
                           "dims": [(D.A_OBJ // 16, 1), (2, D.A_OBJ // 16), (self.nhalf, self.half_step)]})
             co.sends[r] = [MemTask(chain)]
             YN = self.y_np
-            co.recvs[r] = [MemTask([_panel_recv(self.y + (self.y_kb0 + 10 * i * self.nblk) * YN * L.PANEL, YN, m // 8, 10,
+            co.recvs[r] = [MemTask([_panel_recv(self.y + (self.y_kb0 + 10 * i * self.nblk) * YN * L.PANEL, YN, self.np, 10,
                                                 self.nblk)])]
         return co
 
@@ -433,82 +442,97 @@ class Apply:
 
 @dataclass
 class Attention:
-    """Attention of 8 heads of d 160 over each image's keys: row i of ``design.ATTN_ROWS`` runs the units (image, head)
-    of heads [4 i, 4 i + 4), image-major. q: the column's query panels ([kb 160][np], scaled by log2 e / sqrt 160), o:
-    the output panels (the same layout); kv: the device address of the K / V^T slots ([image][head][group of 32
-    keys][K | V^T slot]). Self-attention (keys = the image's tokens): ``kv_drains`` writes each column's part from its K
-    and V^T panels; an image's token panels in a column are 2 apart (``kpc`` of them: its queries, its keys / 8).
-    Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last group's keys from nkeys masked)."""
+    """Attention of 8 heads of d 160 (16x16, 8x8) or 80 (32x32) over each image's keys: row i of ``design.ATTN_ROWS`` runs
+    the units (tile, image, head) of heads [4 i, 4 i + 4), tile-major then image-major (a tile: 4 query panels of each
+    image, 8 token panels; 8x8: one panel of each). q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
+    o: the output panels (the same layout); kv: the device address of the K / V^T slots ([image][head][group of
+    keys][K | V^T]: d 160 groups of 32 keys, d 80 of 64), written by ``kv_drains``. Self-attention (keys = the image's
+    tokens, of ``nbands`` ops of np token panels: band b's column c holds keys [(8 b + c) kpi, ..) of its image): an
+    image's token panels in a column are 2 apart. Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last
+    group's keys from nkeys masked)."""
 
     np: int
     q: int
     o: int
     kv: int
     nkeys: int = 0
+    d: int = 160
+    nbands: int = 1
 
     def __post_init__(self) -> None:
-        self.kpc = self.np // 2
-        self.ng = -(-self.nkeys // 32) if self.nkeys else 8 * self.kpc // 4  # (key groups of an image)
-        self.nk = self.nkeys - 32 * (self.ng - 1) if self.nkeys else 32
-        assert self.kpc in (1, 4), self.np
-        assert self.q + (172 * self.np + 8) * L.PANEL <= D.HEAP, "the last head's walk past the heap"
+        assert self.d in (80, 160)
+        self.nd = self.d // 8  # (d-blocks of a head)
+        self.gk = 4 if self.d == 160 else 8  # (key panels of a group)
+        self.kpi = self.np // 2  # (an image's token panels in the op)
+        self.kpc = min(self.kpi, 4)  # (query panels of a unit)
+        self.nt = self.kpi // self.kpc  # (tiles)
+        keys = 8 * COLS * self.kpi * self.nbands
+        self.ng = -(-(self.nkeys or keys) // (8 * self.gk))  # (key groups of an image)
+        self.nk = self.nkeys - 8 * self.gk * (self.ng - 1) if self.nkeys else 8 * self.gk
+        assert self.kpc in (1, 4) and (self.d == 160 or self.kpc == 4), self.np
+        assert self.q + ((7 * self.nd + 32) * self.np + 8) * L.PANEL <= D.HEAP, "the last head's walk past the heap"
 
     def command(self) -> np.ndarray:
         cmd = np.zeros(D.Q // 4, np.int32)
-        cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK]] = K.K_ATTN, 8, self.kpc, self.ng, self.nk
+        cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 8 * self.nt, self.kpc, self.ng,
+                                                                             self.nk, self.nd, self.gk)
         return cmd.view(np.uint8)
 
     def col_ops(self) -> ColOps:
-        """Per attention row and image: the units' queries (per head an A object: query pairs [pair][d-block][2], a
-        single panel paired with the next one; a pair per half: 12 more d-blocks of the walk after its 20), their
+        """Per attention row and (tile, image) its 4 units' queries (per head an A object: query pairs [pair][d-block][2], a
+        single panel paired with the next one; a pair per half: 32 d-blocks of the walk, the head's first), their
         outputs ([qp][d-block])."""
         co = ColOps()
-        hstep, kb = 20 * self.np * 18, self.np * 18  # (words: a head's 20 kb, one kb)
+        hstep, kb = self.nd * self.np * 18, self.np * 18  # (words: a head's kb, one kb)
         for i, r in enumerate(D.ATTN_ROWS):
             sends, recvs = [], []
-            for img in range(2):
-                p0 = (80 * i * self.np + img) * L.PANEL
-                sends.append(MemTask([{"addr": self.q + p0, "nwords": D.A_OBJ // 4,
-                                       "dims": _dims((18, 1), (2, 36), (32, kb), (max(self.kpc // 2, 1), 72)),
-                                       "iteration": (hstep, 4)}], repeat=4))
-                recvs.append(MemTask([{"addr": self.o + p0, "nwords": self.kpc * 20 * 18,
-                                       "dims": _dims((18, 1), (20, kb), (self.kpc, 36)), "iteration": (hstep, 4)}],
-                                     repeat=4))
+            for t in range(self.nt):
+                for img in range(2):
+                    p0 = (4 * self.nd * i * self.np + 8 * t + img) * L.PANEL
+                    sends.append(MemTask([{"addr": self.q + p0, "nwords": D.A_OBJ // 4,
+                                           "dims": _dims((18, 1), (2, 36), (32, kb), (max(self.kpc // 2, 1), 72)),
+                                           "iteration": (hstep, 4)}], repeat=4))
+                    recvs.append(MemTask([{"addr": self.o + p0, "nwords": self.kpc * self.nd * 18,
+                                           "dims": _dims((18, 1), (self.nd, kb), (self.kpc, 36)), "iteration": (hstep, 4)}],
+                                         repeat=4))
             co.sends[r], co.recvs[r] = sends, recvs
         return co
 
     def row_ops(self, cmd: int) -> dict[int, RowOps]:
-        """The attention rows' B streams: the command, then per image its 4 units' K / V^T slots (contiguous)."""
+        """The attention rows' B streams: the command, then per (tile, image) its 4 units' K / V^T slots (contiguous)."""
         unit = self.ng * 2 * D.Q
-        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (8 * img + 4 * i) * unit, 4 * unit) for img in range(2)],
-                          b_objects=1 + 8 * 2 * self.ng, parity=self.kpc == 4)
+        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (8 * img + 4 * i) * unit, 4 * unit) for _ in range(self.nt)
+                                               for img in range(2)],
+                          b_objects=1 + 8 * self.nt * 2 * self.ng, parity=self.kpc == 4)
                 for i, r in enumerate(D.ATTN_ROWS)}
 
     def kv_bytes(self) -> int:
         return 16 * self.ng * 2 * D.Q
 
-    def kv_drains(self, k: int, vt: int, col: int, *, part: str = "kv") -> ColOps:
-        """Column ``col``'s drains of its keys' part of every slot (key panels kp0 .. of group g): from the K panels at
-        ``k`` ([kb][np]) the K slot rows [key pair][d-block][2], from the V^T panels at ``vt`` the V^T slot [d-block
-        pair][key panel][2]; per image a task of the 8 heads. part: "k" / "v": only K's / V^T's."""
-        g, kp0 = divmod(col * self.kpc, 4)
-        hstep, kb = 20 * self.np * 18, self.np * 18
+    def kv_drains(self, k: int, vt: int, col: int, *, part: str = "kv", band: int = 0) -> ColOps:
+        """Column ``col``'s drains of its keys' part of every slot (band ``band``'s: key panels kp0 .. of group g): from the
+        K panels at ``k`` ([kb][np]) the K slot rows [key block][d-block][2], from the V^T panels at ``vt`` the V^T slot
+        [d-block pair][key panel][2]; per image a task of the 8 heads. part: "k" / "v": only K's / V^T's."""
+        g, kp0 = divmod((band * COLS + col) * self.kpi, self.gk)
+        hstep, kb = self.nd * self.np * 18, self.np * 18
         unit = self.ng * 2 * D.Q  # (a head's slots in DDR)
         co = ColOps()
         for img in range(2):
             slot = self.kv + 8 * img * unit + g * 2 * D.Q
-            if self.kpc == 4:  # (the column's keys fill the group: whole slots)
-                kw, kd = _dims((18, 1), (2, 36), (20, kb), (2, 72)), (slot, D.Q, None, (unit // 4, 8))
-                vw, vd = _dims((18, 1), (2, kb), (4, 36), (10, 2 * kb)), (slot + D.Q, D.Q, None, (unit // 4, 8))
-            else:  # (one key panel: every other panel of the K slot's pair rows, a pair of every V^T row of 4)
+            if self.kpi == self.gk:  # (the column's keys fill the group: whole slots)
+                kw, kd = _dims((18, 1), (2, 36), (self.nd, kb), (self.gk // 2, 72)), (slot, D.Q, None, (unit // 4, 8))
+                vw = _dims((18, 1), (2, kb), (self.gk, 36), (self.nd // 2, 2 * kb))
+                vd = (slot + D.Q, D.Q, None, (unit // 4, 8))
+            else:  # (d 160, one key panel: every other panel of the K slot's pair rows, a pair of every V^T row of 4)
+                assert self.d == 160 and self.kpi == 1
                 kw = _dims((18, 1), (20, kb))
                 kd = (slot + (kp0 // 2 * 40 + kp0 % 2) * L.PANEL, 20 * L.PANEL, (18, 20, 36, 720), (unit // 4, 8))
                 vw = _dims((18, 1), (2, kb), (10, 2 * kb))
                 vd = (slot + D.Q + 2 * kp0 * L.PANEL, 20 * L.PANEL, (36, 10, 144, 1440), (unit // 4, 8))
             if "k" in part:
-                co.drains.append(MemTask([{"addr": k + img * L.PANEL, "nwords": self.kpc * 20 * 18, "dims": kw,
+                co.drains.append(MemTask([{"addr": k + img * L.PANEL, "nwords": self.kpi * self.nd * 18, "dims": kw,
                                            "iteration": (hstep, 8)}], repeat=8, ddr=kd))
             if "v" in part:
-                co.drains.append(MemTask([{"addr": vt + img * L.PANEL, "nwords": self.kpc * 20 * 18, "dims": vw,
+                co.drains.append(MemTask([{"addr": vt + img * L.PANEL, "nwords": self.kpi * self.nd * 18, "dims": vw,
                                            "iteration": (hstep, 8)}], repeat=8, ddr=vd))
         return co

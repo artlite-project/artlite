@@ -48,7 +48,7 @@ from ..kernel_source import kernel_prefix
 
 # command header words
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
- C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF) = range(25)
+ C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP) = range(27)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
 C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
@@ -538,14 +538,14 @@ static __attribute__((noinline, minsize)) void {{ p }}_ch_coef(const float *__re
                 coef + 32 * (c8 / 8));
 }
 
-// LayerNorm per token: the tile's records of the column's 4 cores ([core][S1 m | S2 m]) -> tokc [rb][a_hi 8 | a_lo 8 |
-// b_hi 8 | b_lo 8] (a = rstd, b = -mean rstd); st: scratch (mean 16 | rstd 16)
+// LayerNorm per token: a tile's records of the column's 4 cores ([core][S1 m | S2 m], 144 floats apart) -> tokc [rb][a_hi 8 |
+// a_lo 8 | b_hi 8 | b_lo 8] (a = rstd, b = -mean rstd); st: scratch (mean 16 | rstd 16)
 static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__restrict ra, const int32_t *ws, float *__restrict st,
                                                 bfloat16 *__restrict tokc, int m) {
   for (int k = 0; k < m; k += 16) {
     aie::vector<float, 16> s1 = aie::zeros<float, 16>(), s2 = aie::zeros<float, 16>();
     for (int q = 0; q < 4; q++) {
-      const float *r = ra + 2 * m * q;
+      const float *r = ra + 144 * q;
       s1 = aie::add(s1, aie::load_v<16>(r + k));
       s2 = aie::add(s2, aie::load_v<16>(r + m + k));
     }
@@ -615,46 +615,51 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
 }
 
 // GroupNorm / LayerNorm apply (the module docstring): the row blocks in place in their A objects (``ops.Apply``: per
-// block nrb + 1 slots of 3 per half, the last one the C-tile object's padding). C holds:
+// block and tile nrb + 1 slots of 3 per half, the last one the C-tile object's padding). C holds:
 // the coefficients (GN: [img][ch / 8][s_hi s_lo t_hi t_lo] from 0; LN: [ch / 8][..] from 0), LN's token coefficients
-// [rb][a_hi a_lo b_hi b_lo] (from 8192 B), t (640 at 16640 B), the output chunk's panels (at 17920 B)
+// [tile][rb][a_hi a_lo b_hi b_lo] (from 8192 B), t (640 at 16640 B), the output chunk's panels (at 17920 B)
 static __attribute__((noinline, minsize)) void {{ p }}_apply_run({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
-  const int m = ws[{{ C_M }}], nblk = ws[{{ C_NBLK }}], mode = ws[{{ C_MODE }}];
+  const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], nblk = ws[{{ C_NBLK }}], mode = ws[{{ C_MODE }}];
   const int nrb = m / 8, nch = 80 * nblk, ln = mode == {{ A_LN }};
   bfloat16 *coef = (bfloat16 *)cb, *tokc = (bfloat16 *)((uint8_t *)cb + 8192);
   bfloat16 *tt = (bfloat16 *)((uint8_t *)cb + 16640);
   int32_t *pan = (int32_t *)((uint8_t *)cb + 17920);
   int32_t *a = nullptr;
+  int h = 0;  // (the slot's place in its A object: half h / 3, row block h % 3)
   for (int blk = 0; blk < nblk; blk++)
-    for (int rb = 0; rb < nrb; rb++) {
+    for (int t = 0; t < ntile; t++) {
+      for (int rb = 0; rb < nrb; rb++) {
 {% if win == "apply" %}
-      event0();
+        event0();
 {% endif %}
-      const int h = ((nrb + 1) * blk + rb) % 6;  // (the slot's place in its A object: half h / 3, row block h % 3)
-      if (h == 0) {
-        if (a) {{ p }}_give_a(s, a);
-        a = {{ p }}_take_a(s);
+        if (h == 0) {
+          if (a) {{ p }}_give_a(s, a);
+          a = {{ p }}_take_a(s);
+        }
+        bfloat16 *x = (bfloat16 *)(a + (h < 3 ? 320 * h : {{ (A_OBJ // 2 + A_HI) // 4 }} + 320 * (h - 3)));
+        const bfloat16 *cf = coef + 32 * ((ln ? 0 : nch / 8 * (rb & 1)) + 10 * blk);
+        {{ p }}_apply_rb(x, x, tt, cf, tokc + 32 * (nrb * t + rb), tab, (bfp16ebs8 *)((uint8_t *)pan + 720 * (rb & 1)), mode);
+{% if win == "apply" %}
+        event1();
+{% endif %}
+        if (rb & 1) {{ p }}_out(s, pan, {{ OCH }});  // (two row blocks: 20 panels, an output chunk)
+        h = h == 5 ? 0 : h + 1;
       }
-      bfloat16 *x = (bfloat16 *)(a + (h < 3 ? 320 * h : {{ (A_OBJ // 2 + A_HI) // 4 }} + 320 * (h - 3)));
-      const bfloat16 *cf = coef + 32 * ((ln ? 0 : nch / 8 * (rb & 1)) + 10 * blk);
-      {{ p }}_apply_rb(x, x, tt, cf, tokc + 32 * rb, tab, (bfp16ebs8 *)((uint8_t *)pan + 720 * (rb & 1)), mode);
-{% if win == "apply" %}
-      event1();
-{% endif %}
-      if (rb & 1) {{ p }}_out(s, pan, {{ OCH }});  // (two row blocks: 20 panels, an output chunk)
+      h = h == 5 ? 0 : h + 1;  // (the tile's padding slot)
     }
   if (a) {{ p }}_give_a(s, a);
 }
 
-// LayerNorm apply: the coefficients (gamma, beta per channel, the tile's per-token ones), then the row blocks
-// (``{{ p }}_apply_run``)
+// LayerNorm apply: the coefficients (gamma, beta per channel, the tiles' per-token ones: their records in one A object,
+// 2304 B per tile), then the row blocks (``{{ p }}_apply_run``)
 static __attribute__((noinline, minsize)) void {{ p }}_apply_ln({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
-  const int nch = 80 * ws[{{ C_NBLK }}];
+  const int nch = 80 * ws[{{ C_NBLK }}], m = ws[{{ C_M }}];
   int32_t *gb = {{ p }}_take_b(s);
   {{ p }}_ch_coef((const float *)gb, (const float *)gb + nch, (bfloat16 *)cb, nch);
   {{ p }}_give_b(s, gb);
   int32_t *ra = {{ p }}_take_a(s);
-  {{ p }}_ln_tok((const float *)ra, ws, (float *)s.s1, (bfloat16 *)((uint8_t *)cb + 8192), ws[{{ C_M }}]);
+  for (int t = 0; t < ws[{{ C_NTILE }}]; t++)
+    {{ p }}_ln_tok((const float *){{ p }}_aw(ra, 576 * t), ws, (float *)s.s1, (bfloat16 *)((uint8_t *)cb + 8192) + 4 * m * t, m);
   {{ p }}_give_a(s, ra);
   {{ p }}_apply_run(s, cb, ws, tab);
 }
@@ -709,8 +714,9 @@ inline __attribute__((always_inline)) aie::accum<accfloat, 32> {{ p }}_exp2(aie:
   return aie::mac(r, pf2, hi);
 }
 
-// P = 2^(S - m) in place ([q panel: QS floats apart][key panel][64], 32 lanes per step: A = S + mb); sl, ss: S as
-// distinct restrict parameters (each read before it is written: the loop pipelines, II 23)
+// P = 2^(S - m) in place of 4 key panels ([q panel: QS floats apart][key panel 4 (of the group's, 64 floats apart)][64],
+// 32 lanes per step: A = S + mb, mb [q panel][8 q][8]); sl, ss: S as distinct restrict parameters (each read before it
+// is written: the loop pipelines, II 23; a runtime trip count or walk leaves it unpipelined)
 static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict mb) {
 {% if win == "aexp" %}
   event0();
@@ -729,10 +735,10 @@ static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, f
 }
 
 // the softmax's rare steps (``{{ p }}_attn_sm``): keys from nk on masked (S = -2^14), the first group's reference max (per
-// query the max of its 32 scores in bf16: a reference, not the exact max; mb = 192 - it, [q panel][8 q][8])
-static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict sm, float *__restrict mb, int first, int nk) {
-  if (nk < 32)
-    for (int kp = 0; kp < 4; kp++) {  // (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept)
+// query the max of its group's scores in bf16: a reference, not the exact max; mb = 192 - it, [q panel][8 q][8])
+static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict sm, float *__restrict mb, int first, int nk, int nkp) {
+  if (nk < 8 * nkp)
+    for (int kp = 0; kp < nkp; kp++) {  // (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept)
       const int v = nk - 8 * kp;
       const unsigned lo = v >= 8 ? 0xFFu : (v <= 0 ? 0u : (1u << v) - 1);
       const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
@@ -745,7 +751,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict
     for (int qp = 0; qp < 2; qp++) {
       const float *p = sm + {{ QS }} * qp;
       aie::vector<bfloat16, 64> m = aie::accum<accfloat, 64>(aie::load_v<64>(p)).template to_vector<bfloat16>();
-      for (int kp = 1; kp < 4; kp++)
+      for (int kp = 1; kp < nkp; kp++)
         m = aie::max(m, aie::accum<accfloat, 64>(aie::load_v<64>(p + 64 * kp)).template to_vector<bfloat16>());
       auto [e1, o1] = aie::interleave_unzip(m.template extract<32>(0), m.template extract<32>(1), 1);
       const aie::vector<bfloat16, 32> m1 = aie::max(e1, o1);
@@ -757,38 +763,42 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict
     }
 }
 
-// the softmax of a query pair and key group (``K_ATTN``): S [2 q panels, QS floats apart][4 key panels][64] fp32 (keys from nk on:
-// -2^14), the reference max (first group: mb = 192 - max per query, [2][8 q][8]), P = 2^(S - m) (``{{ p }}_pexp``) -> pp
-// (bfp16 panels [key panel][q panel]: the PV MAC's A order), l [2][8 q][8] += the row sums of those panels (a MAC with
-// ones: the P that multiplies V)
+// the softmax of a query pair and key group (``K_ATTN``): S [2 q panels, QS floats apart][nkp key panels][64] fp32 (keys
+// from nk on: -2^14), the reference max (first group: mb = 192 - max per query, [2][8 q][8]), P = 2^(S - m)
+// (``{{ p }}_pexp`` per 4 key panels) -> pp (bfp16 panels [key panel][q panel]: the P V^T MAC's A order), l [2][8 q][8] += the row sums of
+// those panels (a MAC with ones: the P that multiplies V)
 static __attribute__((noinline)) void {{ p }}_attn_sm(float *__restrict sm, float *__restrict mb, float *__restrict l,
-                                                 bfp16ebs8 *__restrict pp, int first, int nk) {
+                                                 bfp16ebs8 *__restrict pp, int first, int nk, int nkp) {
   aie::set_rounding(aie::rounding_mode::conv_even);
-  if (nk < 32 || first) {{ p }}_attn_mm(sm, mb, first, nk);
-  {{ p }}_pexp(sm, sm, mb);
+  if (nk < 8 * nkp || first) {{ p }}_attn_mm(sm, mb, first, nk, nkp);
+  for (int k = 0; k < nkp; k += 4) {{ p }}_pexp(sm + 64 * k, sm + 64 * k, mb);
   const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
   al::MM8 a0(aie::accum<accfloat, 64>(aie::load_v<64>(l))), a1(aie::accum<accfloat, 64>(aie::load_v<64>(l + 64)));
   al::BOut<> po(pp);
-  AIE_LOOP_UNROLL_FULL
-  for (int kp = 0; kp < 4; kp++) {
-    const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64 * kp)).template to_vector<bfp16ebs8>();
-    const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(sm + {{ QS }} + 64 * kp)).template to_vector<bfp16ebs8>();
+  const float *s0 = sm, *s1 = sm + {{ QS }};
+  AIE_LOOP_MIN_ITERATION_COUNT(4)
+  for (int kp = 0; kp < nkp; kp++) {
+    const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(s0)).template to_vector<bfp16ebs8>();
+    const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(s1)).template to_vector<bfp16ebs8>();
     po.push(p0);
     po.push(p1);
     a0.mac(p0, aie::op_transpose(ones));
     a1.mac(p1, aie::op_transpose(ones));
+    s0 += 64;
+    s1 += 64;
   }
   aie::store_v(l, a0.template to_vector<float>());
   aie::store_v(l + 64, a1.template to_vector<float>());
 }
 
-// a query pair and key group: S := Q K^T (16 queries, 32 keys, k 160; Q [d-block 20][2 panels], K [key block 2][d-block
-// 20][2 panels]) as S [q panel: QS floats apart][key panel 4][64]: per block of 16 keys four accumulators [q panel][key
+// a query pair and key group: S := Q K^T (16 queries, 16 nkb keys, k 8 nd; Q [d-block nd][2 panels], K [key block nkb][d-block
+// nd][2 panels]) as S [q panel: QS floats apart][key panel 2 nkb][64]: per block of 16 keys four accumulators [q panel][key
 // panel] over the d-blocks (post-RA pipelined, II 4)
-static __attribute__((noinline)) void {{ p }}_attn_qk(const int32_t *__restrict q, const int32_t *__restrict k, float *__restrict sm) {
+static __attribute__((noinline)) void {{ p }}_attn_qk(const int32_t *__restrict q, const int32_t *__restrict k, float *__restrict sm,
+                                                 int nkb, int nd) {
   using MM = aie::mmul<8, 8, 8, bfp16ebs8, bfp16ebs8>;
   aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> ks((const bfp16ebs8 *)k);
-  for (int blk = 0; blk < 2; blk++) {
+  for (int blk = 0; blk < nkb; blk++) {
     aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, 64, aie_dm_resource::a> qs((const bfp16ebs8 *)q);
     aie::block_vector<bfp16ebs8, 64> A0 = qs.pop(), A1 = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
     MM c0, c1, c2, c3;
@@ -797,7 +807,8 @@ static __attribute__((noinline)) void {{ p }}_attn_qk(const int32_t *__restrict 
     c2.mul(A1, aie::op_transpose(B0));
     c3.mul(A1, aie::op_transpose(B1));
     AIE_PREPARE_FOR_POSTPIPELINING
-    for (int d = 1; d < 20; d++) {
+    AIE_LOOP_MIN_ITERATION_COUNT(9)
+    for (int d = 1; d < nd; d++) {
       A0 = qs.pop();
       A1 = qs.pop();
       B0 = ks.pop();
@@ -815,23 +826,23 @@ static __attribute__((noinline)) void {{ p }}_attn_qk(const int32_t *__restrict 
   }
 }
 
-// O += P V^T (m 16 npair, n 160, k 32)
+// O += P V^T of d 160 (m 16 npair, n 160, k 32)
 static __attribute__((noinline)) void {{ p }}_attn_pv(const bfp16ebs8 *__restrict pp, const int32_t *__restrict v,
                                                  float *__restrict o, int npair) {
   {{ p }}_pvm<32, 160>(pp, v, (const float __aie_dm_resource_c *)o, (float __aie_dm_resource_c *)o, npair);
 }
 
-// O / l -> bfp16 panels [qp][db] at out (O's buffer: panel i at 72 i, read at 256 i): O rounded to bf16, times 1 / l as
-// bf16 hi + lo (pipelined)
+// O / l -> bfp16 panels [qp][db < nd] at out (O's buffer: panel i at 72 i, read at 256 i): O rounded to bf16, times 1 / l
+// as bf16 hi + lo (pipelined)
 static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o, const float *__restrict l, int nqp,
-                                                  bfp16ebs8 *__restrict out) {
+                                                  bfp16ebs8 *__restrict out, int nd) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> po(out);
   for (int qp = 0; qp < nqp; qp++) {
     aie::vector<bfloat16, 64> rh, rl;
     al::split2<64>(al::bcast8(aie::inv(aie::filter_even(aie::filter_even(aie::filter_even(aie::load_v<64>(l + 64 * qp)))))), rh, rl);
-    AIE_LOOP_MIN_ITERATION_COUNT(20)
-    for (int db = 0; db < 20; db++) {
+    AIE_LOOP_MIN_ITERATION_COUNT(10)
+    for (int db = 0; db < nd; db++) {
       const aie::vector<bfloat16, 64> ob = aie::accum<accfloat, 64>(aie::load_v<64>(o)).template to_vector<bfloat16>();
       po.push(aie::mac(aie::mul(ob, rh), ob, rl).template to_vector<bfp16ebs8>());
       o += 64;
@@ -839,16 +850,19 @@ static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o
   }
 }
 
-// K_ATTN (the module docstring): O in the C buffer (fp32 [qp][20][64]), S of a pair in the Q object's halves' tails
-// (1 KB per q panel after the pair), the pairs' P in s1 (576 B each), 192 - m and l ([qp][8 q][8] each) in the
-// workspace after the header
+// K_ATTN (the module docstring): O in the C buffer (fp32 [qp][nd][64]), S of a pair in the Q object's halves' tails
+// (after the pair, from the next 64-B boundary: one q panel's per half), the pairs' P (d 160: in s1, 576 B each; d 80: pair 0's in s0, pair 1's in s1),
+// 192 - m and l ([qp][8 q][8] each) in the workspace after the header
 static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
   const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
+  const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}], d160 = nd == 20;
   const int npair = (nqp + 1) / 2;
   float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
+  // (P V^T at d 80: the GEMM MAC, one band: A rewound per 16-col block, B and C walk on)
+  const dims_3d_t pa(4, -1152, 0, 0, 0), pb(4, 0, 0, 0, 0), pl(4, 128, 0, 0, 0);
   for (int u = 0; u < nunit; u++) {
     int32_t *q = {{ p }}_take_a(s);
-    {{ p }}_zero(cb, 2560 * npair);
+    {{ p }}_zero(cb, 128 * nd * npair);
     {{ p }}_zero((int32_t *)l, 128 * npair);
     for (int g = 0; g < ng; g++) {  // (K given back before V is taken: the next K arrives during the PVs)
       int32_t *k = {{ p }}_take_b(s);
@@ -856,9 +870,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
       event0();
 {% endif %}
       for (int pr = 0; pr < npair; pr++) {
-        float *sm = (float *)(q + {{ 40 * 18 }});
-        {{ p }}_attn_qk({{ p }}_aw(q, {{ A_OBJ // 8 }} * pr), k, sm);
-        {{ p }}_attn_sm(sm, mb + 128 * pr, l + 128 * pr, (bfp16ebs8 *)(s.s1 + {{ 8 * 18 }} * pr), g == 0, g == ng - 1 ? nkl : 32);
+        int32_t *qa = {{ p }}_aw(q, {{ A_OBJ // 8 }} * pr);
+        float *sm = (float *)(q + (36 * nd + 15) / 16 * 16);  // (64-B aligned: the 2048-bit stores' unit)
+        bfp16ebs8 *pp = (bfp16ebs8 *)(d160 ? s.s1 + {{ 8 * 18 }} * pr : (pr ? s.s1 : s.s0));
+        {{ p }}_attn_qk(qa, k, sm, nkp / 2, nd);
+        {{ p }}_attn_sm(sm, mb + 128 * pr, l + 128 * pr, pp, g == 0, g == ng - 1 ? nkl : 8 * nkp, nkp);
       }
 {% if win == "aqk" %}
       event1();
@@ -868,7 +884,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
 {% if win == "apv" %}
       event0();
 {% endif %}
-      {{ p }}_attn_pv((const bfp16ebs8 *)s.s1, v, o, npair);
+      if (d160)
+        {{ p }}_attn_pv((const bfp16ebs8 *)s.s1, v, o, npair);
+      else
+        for (int pr = 0; pr < npair; pr++)
+          {{ p }}_ktf(pr ? s.s1 : s.s0, v, o + 1280 * pr, 1, pa, pb, pl);
 {% if win == "apv" %}
       event1();
 {% endif %}
@@ -878,11 +898,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
 {% if win == "afin" %}
     event0();
 {% endif %}
-    {{ p }}_attn_fin(o, l, nqp, (bfp16ebs8 *)o);
+    {{ p }}_attn_fin(o, l, nqp, (bfp16ebs8 *)o, nd);
 {% if win == "afin" %}
     event1();
 {% endif %}
-    {{ p }}_out(s, cb, {{ OCH }} * nqp);
+    {{ p }}_out(s, cb, 72 * nd * nqp);
   }
 }
 

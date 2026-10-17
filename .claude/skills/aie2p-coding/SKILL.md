@@ -230,6 +230,9 @@ Silent wrong results:
 - **A rolled `extract<8>(h)` loop stored wrong lanes** (besides compiling to a switch): unroll lane loops.
 - **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
   (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
+- **A 2048-bit vector (`aie::store_v` / `load_v` of 64 fp32) at an address 32-B but not 64-B aligned** is accessed 32 B
+  lower (the low address bits dropped): its stores overwrite the 32 B before the buffer (sd15_v2's d-80 attention
+  scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B boundaries.
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
   array) reads garbage (NaN state). Open one stream at the array's start and pop in order.
 - **Sub-byte and block-float pointer arithmetic**: loop-carried or large-offset `uint4*` advancement can return zeros

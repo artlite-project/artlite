@@ -140,24 +140,25 @@ def images(m: int) -> torch.Tensor:
     return (torch.arange(m // 8).repeat_interleave(8) % 2).repeat(COLS)
 
 
-@pytest.mark.parametrize("mode, m, C", [("gnsilu", 64, 1280), ("gn", 64, 640), ("gnsilu", 16, 1280), ("ln", 64, 1280),
-                                       ("ln", 16, 320)])
-def test_norm(v2: V2Device, mode: str, m: int, C: int) -> None:
+@pytest.mark.parametrize("mode, m, C, ntile", [("gnsilu", 64, 1280, 1), ("gn", 64, 640, 1), ("gnsilu", 16, 1280, 1),
+                                              ("ln", 64, 1280, 1), ("ln", 16, 320, 1), ("gnsilu", 64, 640, 2),
+                                              ("gn", 64, 640, 2), ("ln", 64, 640, 2), ("ln", 64, 320, 4)])
+def test_norm(v2: V2Device, mode: str, m: int, C: int, ntile: int) -> None:
     """A GEMM's output with its statistics (GroupNorm group sums through DDR and the B streams, LayerNorm per-token sums
-    in the memtile) normalized by Apply into panels: within 9e-3 of torch on the GEMM's bf16 output (bfp16 rounding of
-    the result alone ~7.7e-3)."""
+    in the memtile) normalized by Apply into panels (ntile tiles of m per op): within 9e-3 of torch on the GEMM's bf16
+    output (bfp16 rounding of the result alone ~7.7e-3)."""
     torch.manual_seed(1)
-    T, K_ = m, 320
+    T, K_ = m * ntile, 320
     x = torch.randn(COLS * T, K_)
     w = torch.randn(C, K_) / K_ ** 0.5
     b = torch.randn(C) * 2
     gamma, beta = 1 + 0.3 * torch.randn(C), 0.3 * torch.randn(C)
     gn = mode in ("gn", "gnsilu")
     X, Y = 0, K_ // 8 * T // 8 * L.PANEL
-    REC = Y + C // 80 * L.ct_bytes(m)
+    REC = Y + C // 80 * ntile * L.ct_bytes(m)
     Z = REC + 16 * D.OCH
-    g = Gemm(m=m, ntile=1, K=K_, N=C, x=X, y=Y, out="bf16", stats="gn" if gn else "ln", rec=REC, gsize=C // 32)
-    a = Apply(m=m, nblk=C // 160, mode=mode, x=Y, y=Z, gsize=C // 32, rec=REC, tokens=COLS * T // 2, C=C)
+    g = Gemm(m=m, ntile=ntile, K=K_, N=C, x=X, y=Y, out="bf16", stats="gn" if gn else "ln", rec=REC, gsize=C // 32)
+    a = Apply(m=m, nblk=C // 160, mode=mode, x=Y, y=Z, ntile=ntile, gsize=C // 32, rec=REC, tokens=COLS * T // 2, C=C)
     s = v2.seq()
     s.op(fills(v2, "x", [L.panels(x[c * T:(c + 1) * T]) for c in range(COLS)], X), {})
     s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(v2, "w", g, w, b))
@@ -184,14 +185,15 @@ def test_norm(v2: V2Device, mode: str, m: int, C: int) -> None:
         rows[r] = a.row_ops(v2.address("ap", 2 * i * D.Q), rec_runs, 1 if gn else 0)
     s.op({c: a.col_ops() for c in range(COLS)}, rows)
     nz = C // 8 * T // 8 * L.PANEL
-    s.op(merge(drains(v2, "y", C // 80 * L.ct_bytes(m), Y), drains(v2, "z", nz, Z)), {})
+    ny = C // 80 * ntile * L.ct_bytes(m)
+    s.op(merge(drains(v2, "y", ny, Y), drains(v2, "z", nz, Z)), {})
     v2.run(v2.transaction(s))
-    yb = v2.read("y", COLS * C // 80 * L.ct_bytes(m)).reshape(COLS, -1)
+    yb = v2.read("y", COLS * ny).reshape(COLS, -1)
     y = torch.cat([L.from_ctiles(yb[c], T, C, m) for c in range(COLS)])
     zb = v2.read("z", COLS * nz).reshape(COLS, nz)
     z = torch.cat([L.from_panels(zb[c], T, C) for c in range(COLS)])
     if gn:
-        img = images(m)
+        img = images(T)
         ref = torch.zeros_like(y)
         for i in range(2):
             yi = y[img == i].T[None]  # (1, C, tokens)
@@ -203,47 +205,50 @@ def test_norm(v2: V2Device, mode: str, m: int, C: int) -> None:
     assert _rel(z, ref) < 9e-3
 
 
-@pytest.mark.parametrize("np_", [8, 2])
-def test_attention(v2: V2Device, np_: int) -> None:
-    """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2): each column's
-    queries against all keys of their image (K / V^T panels drained to DDR slots, the attention rows' B streams):
-    within 1.5e-2 of softmax attention on the bfp16-rounded operands (measured ~1.16e-2: P in bfp16 per 8 keys ~8e-3,
-    the bfp16 output ~6e-3, vexp2)."""
+@pytest.mark.parametrize("np_, d, nb", [(8, 160, 1), (2, 160, 1), (16, 80, 2)])
+def test_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
+    """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
+    panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
+    panels drained to DDR slots, the attention rows' B streams): within 1.5e-2 of softmax attention on the
+    bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys ~8e-3, the bfp16 output ~6e-3, vexp2)."""
     torch.manual_seed(3)
-    T, C = 8 * np_, 1280
-    x = torch.randn(3, COLS * T, C)
-    qs, k, v = x[0] * (1.4426950408889634 / 160 ** 0.5) * 2, x[1], x[2]
+    T, C = 8 * np_, 8 * d
+    x = torch.randn(3, nb, COLS * T, C)
+    qs, k, v = x[0, 0] * (1.4426950408889634 / d ** 0.5) * 2, x[1], x[2]
     QA = 0
     KA = QA + C // 8 * np_ * L.PANEL + D.A_OBJ  # (the last head's walk past its panels)
     VA = KA + C // 8 * np_ * L.PANEL
     OA = VA + C // 8 * np_ * L.PANEL
     cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
-    v2.alloc("kv", 16 * np_ * 2 * D.Q)
-    at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"))
-    assert at.kv_bytes() == 16 * np_ * 2 * D.Q
+    at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb)
+    v2.alloc("kv", at.kv_bytes())
+    at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb)
     s = v2.seq()
-    s.op(merge(fills(v2, "q", [L.panels(qs[sl]) for sl in cols], QA), fills(v2, "k", [L.panels(k[sl]) for sl in cols], KA),
-               fills(v2, "v", [L.vt_panels(v[sl]) for sl in cols], VA)), {})
-    s.op({c: at.kv_drains(KA, VA, c) for c in range(COLS)}, {})
+    for b in range(nb):
+        s.op(merge(fills(v2, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
+                   fills(v2, f"v{b}", [L.vt_panels(v[b, sl]) for sl in cols], VA)), {})
+        s.op({c: at.kv_drains(KA, VA, c, band=b) for c in range(COLS)}, {})
     s.ddr_sync()
     v2.alloc("acmd", D.Q)
     v2.write("acmd", at.command())
+    s.op(fills(v2, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
     s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(v2.address("acmd")))
-    nb = C // 8 * np_ * L.PANEL
-    s.op(drains(v2, "o", nb, OA), {})
+    nbytes = C // 8 * np_ * L.PANEL
+    s.op(drains(v2, "o", nbytes, OA), {})
     v2.run(v2.transaction(s))
-    ob = v2.read("o", COLS * nb).reshape(COLS, nb)
+    ob = v2.read("o", COLS * nbytes).reshape(COLS, nbytes)
     o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
-    vq = torch.cat([q(v[sl].T).T for sl in cols])
     img = images(T)
     ref = torch.zeros(COLS * T, C)
     for i in range(2):
         sel = img == i
+        kk = torch.cat([q(k[b][sel]) for b in range(nb)])
+        vq = torch.cat([torch.cat([q(v[b, sl].T).T for sl in cols])[sel] for b in range(nb)])
         for h in range(8):
-            ch = slice(160 * h, 160 * (h + 1))
-            sc = q(qs[sel][:, ch]) @ q(k[sel][:, ch]).T
+            ch = slice(d * h, d * (h + 1))
+            sc = q(qs[sel][:, ch]) @ kk[:, ch].T
             p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
-            ref[sel, ch] = (p @ vq[sel][:, ch]) / p.sum(-1, keepdim=True)
+            ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
     assert _rel(o, ref) < 1.5e-2
 
 

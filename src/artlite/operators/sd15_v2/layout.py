@@ -87,17 +87,17 @@ def gemm_weights(w: torch.Tensor, row: int, npass: int) -> np.ndarray:
     return blocks(np.ascontiguousarray(t.numpy())).reshape(-1)
 
 
-def kv_slots(k: torch.Tensor, v: torch.Tensor) -> np.ndarray:
-    """An attention's K / V^T slots of 8 heads of d 160: k, v (2 images, keys, 1280) -> [image][head][group of 32
-    keys][K slot [key pair 2][d-block 20][2] | V^T slot [d-block pair 10][key panel 4][2]] (keys padded to whole groups
-    with zeros: ``ops.Attention`` masks them)."""
-    n = k.shape[1]
-    ng = -(-n // 32)
-    kp = torch.zeros(2, 32 * ng, 1280)
-    vp = torch.zeros(2, 32 * ng, 1280)
+def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
+    """An attention's K / V^T slots of 8 heads of d 160 (groups of 32 keys) or 80 (groups of 64): k, v (2 images, keys,
+    8 d) -> [image][head][group][K slot [key block][d-block][2] | V^T slot [d-block pair][key panel][2]] (keys padded to
+    whole groups with zeros: ``ops.Attention`` masks them)."""
+    n, nd, gk = k.shape[1], d // 8, 4 if d == 160 else 8
+    ng = -(-n // (8 * gk))
+    kp = torch.zeros(2, 8 * gk * ng, 8 * d)
+    vp = torch.zeros(2, 8 * gk * ng, 8 * d)
     kp[:, :n], vp[:, :n] = k.float(), v.float()
-    kk = kp.reshape(2, ng, 2, 2, 8, 8, 20, 8).permute(0, 5, 1, 2, 6, 3, 4, 7)  # i g kpr kh j h db d -> i h g kpr db kh j d
-    vv = vp.reshape(2, ng, 4, 8, 8, 10, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kb j h dp dh d -> i h g dp kb dh d j
+    kk = kp.reshape(2, ng, gk // 2, 2, 8, 8, nd, 8).permute(0, 5, 1, 2, 6, 3, 4, 7)  # i g kb kh j h db d -> i h g kb db kh j d
+    vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
     kb_ = blocks(np.ascontiguousarray(kk.numpy())).reshape(2, 8, ng, -1)
     vb_ = blocks(np.ascontiguousarray(vv.numpy())).reshape(2, 8, ng, -1)
     return np.concatenate([kb_, vb_], axis=-1).reshape(-1)
