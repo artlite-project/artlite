@@ -241,7 +241,7 @@ def _block_in(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, band: int = 0
     qt = alloc(bd, lv, C, "pn")
     gemm(bd, n, w[a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=a + ".to_q", out=qt, kind="bfp16",
          extra={c: at.kv_drains(kt.addr, vt.addr, c, part="v", band=band) for c in range(COLS)})
-    bd.s.ddr_sync()
+    bd.ddr_sync()
     free(bd, vt)
     free(bd, n)
     return h, qt
@@ -333,19 +333,25 @@ class DTensor:
         t = alloc(bd, self.lv, n, self.kind)
         off = self.lv.ct(c0) if c0 else 0
         assert self.kind == "ct" or not c0
+        bd.reading(self.band(b))
         base = bd.v2.address(self.band(b))
         bd.op({c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
                                         ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}, {})
         t.rec = self.rec
         return t
 
-    def store(self, bd: Builder, b: int, t: Tensor, *, defer: bool = True) -> None:
-        """Band b from the memtile tensor t (drained with the next op, t's bytes released after it; defer False: an op
-        of its own, t freed); its records."""
+    def store(self, bd: Builder, b: int, t: Tensor, *, defer: bool = True, c0: int = 0) -> None:
+        """Band b (C tiles: its channels from c0) from the memtile tensor t (drained with the next op, t's bytes released
+        after it; defer False: an op of its own, t freed); its records."""
+        base = bd.ddr(self.band(b), COLS * self.nbytes)
+        bd.written(self.band(b))
+        off = self.lv.ct(c0) if c0 else 0
+        cols = {c: ColOps(drains=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
+                                          ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}
         if defer:
-            bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.size or t.nbytes)])
+            bd.defer(cols, release=[(t.addr, t.size or t.nbytes)])
         else:
-            bd.op(bd.spill(self.band(b), t.addr, t.nbytes), {})
+            bd.op(cols, {})
             free(bd, t)
         self.rec = (self.rec or []) + (t.rec or [])
 
@@ -372,7 +378,7 @@ def transformer_bands(bd: Builder, w: dict, p: str, x: DTensor, *, kv: int, ctx_
         gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=xb, res=xb, stats=stats,
              band=b)
         free(bd, h4)
-        out.store(bd, b, xb)
+        out.store(bd, b, xb, defer=False)
     return out
 
 
@@ -423,7 +429,7 @@ def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bi
         else:
             sc = x.load(bd, b)
         conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sc, res=sc, stats=stats, band=b)
-        out.store(bd, b, sc, defer=b == nb - 1)
+        out.store(bd, b, sc, defer=False)
     free(bd, p2)
     return out
 
@@ -433,18 +439,55 @@ def downsample_bands(bd: Builder, w: dict, p: str, x: DTensor) -> Tensor:
     the whole column, the conv's even output rows (row tiles 0 and 2: a column's 16x16 rows) of every x, of which the
     even ones (groups 0 and 2: the next level's groups 0 and 1) are output (``ops.Gemm`` "ds")."""
     lv, npw = x.lv, x.lv.np * x.lv.nb
+    N = w[p + "conv.weight"].shape[0]
+    y = alloc(bd, Level(lv.H // 2), N)  # (first: the next level's tensors start at the memtile's bottom)
     px = alloc(bd, lv, x.C, "pn", pnp=npw)
     for b in range(lv.nb):
         xb = x.load(bd, b)
         plain(bd, xb, band_view(px, b), name=p + "xpn")
         free(bd, xb)
-    N = w[p + "conv.weight"].shape[0]
-    y = alloc(bd, Level(lv.H // 2), N)
     g = Gemm(m=64, ntile=lv.R // 2, K=x.C, N=N, x=px.addr, y=y.addr, out="ds", conv=1, R=1, Lg=lv.Lg, zero=bd.zero,
              x_np=npw, rc=lv.R, rstep=2)
     bd.gemm(g, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv")
     free(bd, px)
     return y
+
+
+def upsample_bands(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] | None, name: str) -> DTensor:
+    """Nearest 2x of the C tiles x (16x16, freed) into a banded level (32x32), then the conv: x's panels via DDR into the
+    whole column's panels of the level (a 16x16 column's 2 rows are the 32x32 column's 4: row 2 r + f, group 2 g + e
+    of panel (r, g): 4 fills), in K parts of 640 channels; per band the conv's halves of 640 outputs (+ the earlier
+    part's partial sums, parked in DDR) -> the output's band (records for ``stats`` in the last part)."""
+    lv = Level(2 * x.lv.H, 2)
+    npw = lv.np * lv.nb
+    px = alloc(bd, x.lv, x.C, "pn")
+    plain(bd, x, px, name=p + "xpn")
+    free(bd, x)
+    nb = px.nbytes
+    bd.op(bd.spill(name + ".up", px.addr, nb), {})
+    bd.ddr_sync()
+    free(bd, px)
+    src = bd.v2.address(name + ".up")
+    wc, bc = w[p + "conv.weight"], w[p + "conv.bias"]
+    N = wc.shape[0]
+    out = DTensor(lv, N, name)
+    for k, c0 in enumerate(range(0, x.C, 640)):
+        n = min(640, x.C - c0)
+        pw = alloc(bd, lv, n, "pn", pnp=npw)
+        pb = n // 8 * x.lv.np * L.PANEL  # (the part's panels per 16x16 column)
+        bd.op({c: ColOps(fills=[MemTask([{"addr": pw.addr + (8 * f + 2 * e) * L.PANEL, "nwords": pb // 4,
+                                          "dims": [(36, 1), (2, 72), (2, 288), (0, npw * 18)]}],
+                                        ddr=(src + c * nb + c0 // 8 * x.lv.np * L.PANEL, pb, None))
+                                for f in range(2) for e in range(2)]) for c in range(COLS)}, {})
+        last = c0 + n == x.C
+        for b in range(lv.nb):
+            for o0 in range(0, N, 640):
+                cb = out.load(bd, b, o0, 640) if k else alloc(bd, lv, 640)
+                conv(bd, pw, wc[o0:o0 + 640, c0:c0 + n], bc[o0:o0 + 640] if k == 0 else None, name=f"{p}conv.{k}.{o0}",
+                     out=cb, res=cb if k else None, stats=(stats[0], stats[1] + o0) if stats and last else None, band=b)
+                out.store(bd, b, cb, defer=False, c0=o0)
+        free(bd, pw)
+    return out
 
 
 def skip_bands(bd: Builder, x: DTensor, *, name: str, st: tuple[int, int]) -> DTensor:
@@ -510,7 +553,7 @@ def resnet_cat_bands(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *,
     for b in range(nb):
         sb = sc.load(bd, b)
         conv(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", out=sb, res=sb, stats=stats, band=b)
-        out.store(bd, b, sb, defer=b == nb - 1)
+        out.store(bd, b, sb, defer=False)
     free(bd, p2)
     return out
 
@@ -627,7 +670,7 @@ def upsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] 
     free(bd, x)
     nb = px.nbytes
     bd.op(bd.spill(p + "up", px.addr, nb), {})
-    bd.s.ddr_sync()
+    bd.ddr_sync()
     free(bd, px)
     u = alloc(bd, lv2, x.C, "pn")
     base = bd.v2.address(p + "up")
@@ -698,50 +741,97 @@ def section(bd: Builder, w: dict, x6: Tensor, *, biases: dict[str, torch.Tensor]
     return tr(u1 + "attentions.2.", x, None)
 
 
-class Section:
-    """The 16x16 / 8x8 levels (``section``) as one dispatch between the sd15 overlay's operators: its input from the
-    down_blocks.1 downsampler's output (bf16 half tiles [8 passes][8 half tiles][C_OBJ]: half tile c is column c's
-    rows, the same C-tile order), its output into the up_blocks.1 upsampler conv's input (bfp16 panel objects
-    [16 passes][4 tiles][C_OBJ] of [8 tg][10 q][2 images][9 x 8 B]). x_in, out: their device addresses. Per step the
-    resnets' time biases (``set_time``), per prompt the context's K / V^T slots (``set_context``)."""
+def outer(bd: Builder, w: dict, x5: DTensor, s3: DTensor, *, biases: dict[str, torch.Tensor], ctx_kv: dict[str, int],
+          kv: int, kv32: int, eps: float) -> DTensor:
+    """The UNet from down_blocks.1 to up_blocks.2 (the 32x32 level banded, the 16x16 / 8x8 levels by ``section``): x5
+    (32x32, 320 channels: down_blocks.0's downsampler output, records for down_blocks.1's first GroupNorm) and s3 (the
+    same, records in up_blocks.2.resnets.2's concatenation) -> up_blocks.2's output (32x32, 640). kv32: a DDR buffer for
+    the 32x32 self-attention's slots (kv: the 16x16 ones)."""
+    d1, u2 = "down_blocks.1.", "up_blocks.2."
 
-    PREFIXES = [f"down_blocks.2.attentions.{j}." for j in range(2)] + ["mid_block.attentions.0."] + \
-        [f"up_blocks.1.attentions.{j}." for j in range(3)]
+    def res(p: str, x: DTensor, st: tuple[int, int] | None) -> DTensor:
+        return resnet_bands(bd, w, p, x, cout=640, time_bias=biases[p], eps=eps, stats=st, name=p[:-1])
+
+    def tr(p: str, x: DTensor, st: tuple[int, int] | None) -> DTensor:
+        return transformer_bands(bd, w, p, x, kv=kv32, ctx_kv=ctx_kv[p], nctx=CTX_KEYS, stats=st, name=p[:-1])
+
+    def cat(p: str, h: DTensor, s: DTensor, st: tuple[int, int] | None) -> DTensor:
+        return resnet_cat_bands(bd, w, p, h, s, cout=640, time_bias=biases[p], eps=eps, stats=st, name=p[:-1])
+    x = tr(d1 + "attentions.0.", res(d1 + "resnets.0.", x5, (20, 0)), (20, 0))
+    s4 = skip_bands(bd, x, name="s4", st=(40, 640))
+    x = tr(d1 + "attentions.1.", res(d1 + "resnets.1.", x, (20, 0)), None)
+    s5 = skip_bands(bd, x, name="s5", st=(60, 1280))
+    y = section(bd, w, downsample_bands(bd, w, d1 + "downsamplers.0.", x), biases=biases, ctx_kv=ctx_kv, kv=kv, eps=eps)
+    x = upsample_bands(bd, w, "up_blocks.1.upsamplers.0.", y, stats=(60, 0), name="up_blocks.1.up")
+    x = tr(u2 + "attentions.0.", cat(u2 + "resnets.0.", x, s5, (20, 0)), (40, 0))
+    x = tr(u2 + "attentions.1.", cat(u2 + "resnets.1.", x, s4, (20, 0)), (30, 0))
+    return tr(u2 + "attentions.2.", cat(u2 + "resnets.2.", x, s3, (20, 0)), None)
+
+
+class Section:
+    """The UNet from down_blocks.1 to up_blocks.2 (``outer``) as one dispatch between the sd15 overlay's operators: its
+    input the down_blocks.0 downsampler conv's output (bf16 half tiles [4 passes][32 half tiles][C_OBJ]: half tile k is
+    32x32 row k, the C-tile order of a row tile), its output into the up_blocks.2 upsampler conv's input (bfp16 panel
+    objects [8 passes][16 tiles][C_OBJ] of [8 tg][10 q][2 images][9 x 8 B]: tile k is 32x32 rows 2 k, 2 k + 1, a band).
+    x_in, out: their device addresses. Per step the resnets' time biases (``set_time``), per prompt the context's K /
+    V^T slots (``set_context``)."""
+
+    PREFIXES = [f"down_blocks.{i}.attentions.{j}." for i in (1, 2) for j in range(2)] + ["mid_block.attentions.0."] + \
+        [f"up_blocks.{i}.attentions.{j}." for i in (1, 2) for j in range(3)]
 
     def __init__(self, v2: V2Device, w: dict, *, x_in: int, out: int, eps: float):
         self.v2, self.w = v2, w
         bd = self.bd = Builder(v2)
-        lv = Level(16)
-        x6 = alloc(bd, lv, 640)
-        bd.op(self._fill_old(x6, x_in), {})
-        kv = bd.ddr("kv_self", 16 * lv.np * 2 * D.Q)
-        ctx_kv = {p: bd.image(p + "ctx", np.zeros(16 * 3 * 2 * D.Q, np.uint8)) for p in self.PREFIXES}
+        lv = Level(32, 2)
+        x5, s3 = self._input(bd, lv, x_in)
+        kv = bd.ddr("kv_self", 16 * Level(16).np * 2 * D.Q)
+        kv32 = bd.ddr("kv_self32", Attention(np=lv.np, q=0, o=0, kv=0, d=80, nbands=lv.nb).kv_bytes())
+        ctx_kv = {p: bd.image(p + "ctx", np.zeros(len(self._ctx(p, torch.zeros(2, CTX_KEYS, 768))), np.uint8))
+                  for p in self.PREFIXES}
         zero = {p[:-len("time_emb_proj.weight")]: torch.zeros(w[p].shape[0]) for p in w if p.endswith("time_emb_proj.weight")}
-        y = section(bd, w, x6, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
-        pn = alloc(bd, lv, 1280, "pn")
-        plain(bd, y, pn, name="out.pn")
-        bd.op(self._drain_old(pn, out), {})
+        y = outer(bd, w, x5, s3, biases=zero, ctx_kv=ctx_kv, kv=kv, kv32=kv32, eps=eps)
+        self._output(bd, y, out)
         self.words = bd.s.finish()
         self.tr = None
 
     @staticmethod
-    def _fill_old(x: Tensor, src: int) -> dict[int, ColOps]:
-        """Column c's x6 C tiles from the overlay's half tiles: per pass its half tile c (10240 B) into the object."""
-        ct = L.ct_bytes(x.lv.m)
-        npass = x.C // 80
-        return {c: ColOps(fills=[MemTask([{"addr": x.addr, "nwords": npass * 2560, "dims": [(640, 1), (4, 640), (npass, ct // 4)]}],
-                                         ddr=(src + c * 20480, npass * 10240, (640, 4, 640, 8 * 5120)))]) for c in range(COLS)}
+    def _input(bd: Builder, lv: Level, src: int) -> tuple[DTensor, DTensor]:
+        """x5 from the overlay's half tiles (per band and pass its rows' half tiles, 10240 B each, into the C-tile
+        objects), its records for down_blocks.1's GroupNorm and for the skip's concatenation, in DDR per band."""
+        x5, recs = DTensor(lv, 320, "x5", rec=[]), []
+        ct, npass = L.ct_bytes(64), 4
+        for b in range(lv.nb):
+            t = alloc(bd, lv, 320)
+            bd.op({c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": npass * 2560, "dims": [(640, 1), (4, 640), (npass, ct // 2)],
+                                              "iteration": (ct // 4, 2)}], repeat=2,
+                                             ddr=(src + (lv.R * c + 2 * b) * 20480, npass * 10240, (640, 4, 640, 32 * 5120),
+                                                  (5120, 2)))]) for c in range(COLS)}, {})
+            x5.rec += copy_stats(bd, t, name="x5.st", st=(10, 0), band=b)
+            recs += copy_stats(bd, t, name="s3.st", st=(30, 640), band=b)
+            x5.store(bd, b, t, defer=False)
+        return x5, DTensor(lv, 320, "x5", rec=recs)
 
     @staticmethod
-    def _drain_old(pn: Tensor, dst: int) -> dict[int, ColOps]:
-        """Column c's output panels into the overlay's panel objects: per pass the tile c / 2's tg [4 (c % 2), ..)
-        (5760 B): [tg][q][image] from the panels [kb][token panel (tg, image)]."""
-        npass = pn.C // 80
-        kb = pn.np * 18
-        return {c: ColOps(drains=[MemTask([{"addr": pn.addr, "nwords": npass * 1440,
-                                            "dims": [(36, 1), (10, kb), (4, 36), (0, 10 * kb)]}],
-                                          ddr=(dst + (c // 2) * 20480 + (c % 2) * 5760, npass * 5760, (720, 2, 720, 4 * 5120)))])
-                for c in range(COLS)}
+    def _output(bd: Builder, y: DTensor, dst: int) -> None:
+        """y's bands as the overlay's panel objects: per band its panels, per pass (tg, q, image) from [kb][token panel
+        (tg, image)]."""
+        lv = y.lv
+        npass, kb = y.C // 80, lv.np * 18
+        for b in range(lv.nb):
+            t = y.load(bd, b)
+            pn = alloc(bd, lv, y.C, "pn")
+            plain(bd, t, pn, name="out.pn")
+            free(bd, t)
+            bd.op({c: ColOps(drains=[MemTask([{"addr": pn.addr, "nwords": npass * 2880,
+                                               "dims": [(36, 1), (10, kb), (8, 36), (0, 10 * kb)]}],
+                                             ddr=(dst + (2 * c + b) * 20480, npass * 11520, (720, 4, 720, 16 * 5120)))])
+                   for c in range(COLS)}, {})
+            free(bd, pn)
+
+    def _ctx(self, p: str, ctx: torch.Tensor) -> np.ndarray:
+        a = p + "transformer_blocks.0.attn2."
+        wk, wv = self.w[a + "to_k.weight"], self.w[a + "to_v.weight"]
+        return L.kv_slots(ctx @ wk.T, ctx @ wv.T, d=wk.shape[0] // 8)
 
     def set_time(self, biases: dict[str, torch.Tensor]) -> None:
         """The resnets' time biases (by prefix): their conv1 commands' biases (the conv bias + the time bias, bf16) in
@@ -754,8 +844,7 @@ class Section:
     def set_context(self, ctx: torch.Tensor) -> None:
         """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768)."""
         for p in self.PREFIXES:
-            a = p + "transformer_blocks.0.attn2."
-            self.v2.write(p + "ctx", L.kv_slots(ctx @ self.w[a + "to_k.weight"].T, ctx @ self.w[a + "to_v.weight"].T))
+            self.v2.write(p + "ctx", self._ctx(p, ctx))
 
     def run(self) -> None:
         """One dispatch on the design's own context (in a library: its raw item, ``words``)."""

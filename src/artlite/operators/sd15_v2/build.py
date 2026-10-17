@@ -142,8 +142,9 @@ class Builder:
         self._zfill = False
         self._tab_runs: dict[int, tuple] = {}  # (row -> a table's B run, taken before the row's next op: ``table``)
         self._rec_names: dict[str, int] = {}  # (records' DDR images by name: their uses)
-        self._rec_img: dict[str, int] = {}  # (records' DDR images by name: the current one's address)
+        self._rec_img: dict[str, tuple] = {}  # (records' DDR images by name: the current one's address, its bands)
         self._images: dict[str, int] = {}  # (DDR image name -> its data's hash)
+        self._dirty: set[str] = set()  # (DDR images drained into since the last DDR sync)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
 
@@ -204,8 +205,27 @@ class Builder:
         """Drains (``spill``) with the next op (not synced: ``op``); release: memtile (addr, bytes) freed after it."""
         self._drains.append((cols, list(release), False))
 
+    def ddr_sync(self) -> None:
+        """Every drain pushed so far written to DDR (``seq.Seq.ddr_sync``)."""
+        self.s.ddr_sync()
+        self._dirty.clear()
+
+    def written(self, name: str) -> None:
+        """DDR image ``name`` is drained into (a later fill of it syncs first: ``reading``)."""
+        self._dirty.add(name)
+
+    def reading(self, name: str) -> None:
+        """A fill of DDR image ``name`` follows: if a drain wrote it since the last sync, that drain pushed (pending
+        deferred drains with an op of their own) and DDR synced (a fill's shim read is not ordered after a drain's
+        writes)."""
+        if name in self._dirty:
+            if self._drains:
+                self.op({}, {})
+            self.ddr_sync()
+
     def load(self, name: str, addr: int, nbytes: int) -> dict[int, ColOps]:
         """Fills of DDR image ``name`` ([col][nbytes]) into the memtile at addr (merge into an op)."""
+        self.reading(name)
         base = self.v2.address(name)
         return {c: ColOps(fills=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * nbytes, nbytes, None))])
                 for c in range(COLS)}
@@ -213,6 +233,7 @@ class Builder:
     def spill(self, name: str, addr: int, nbytes: int) -> dict[int, ColOps]:
         """Drains of the memtile bytes [addr, addr + nbytes) into DDR image ``name`` ([col][nbytes])."""
         base = self.ddr(name, COLS * nbytes)
+        self.written(name)
         return {c: ColOps(drains=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * nbytes, nbytes, None))])
                 for c in range(COLS)}
 
@@ -280,12 +301,16 @@ class Builder:
     def records(self, rec: int, *, name: str, ch_off: int, nr: int, gsize: int, band: int = 0, nbands: int = 1) -> Records:
         """Drain a producer's GroupNorm records (memtile ``rec`` [core][OCH], 4 OCH bytes: released by the drain's op)
         to DDR, with the next op; the consumer's B stream reads them after ``Seq.ddr_sync`` (``apply`` syncs). A layer's
-        bands' records in one DDR image [band][col][core][256 B] (band 0 opens a new one: ``name``, numbered from its
-        second use), so that a consumer gathers a producer's strips of every band in one shim BD."""
-        if band == 0:
+        bands' records in one DDR image [band][col][core][256 B] (a band the current one holds already opens a new
+        one: ``name``, numbered from its second), so that a consumer gathers a producer's strips of every band in one
+        shim BD."""
+        img, held = self._rec_img.get(name, (0, {band}))
+        if band in held:
             k = self._rec_names[name] = self._rec_names.get(name, -1) + 1
-            self._rec_img[name] = self.ddr(f"{name}.{k}" if k else name, nbands * COLS * ROWS * 256)
-        base = self._rec_img[name] + band * COLS * ROWS * 256
+            img, held = self.ddr(f"{name}.{k}" if k else name, nbands * COLS * ROWS * 256), set()
+        held.add(band)
+        self._rec_img[name] = img, held
+        base = img + band * COLS * ROWS * 256
         cols = {c: ColOps(drains=[MemTask([{"addr": rec, "nwords": 256, "dims": [(64, 1), (ROWS, D.OCH // 4)]}],
                                           ddr=(base + c * 1024, 1024, None))]) for c in range(COLS)}
         self._drains.append((cols, [(rec, 4 * D.OCH)], True))
@@ -314,7 +339,7 @@ class Builder:
             gbs.append(a.gamma_beta(gamma, beta, r))
         sync = a.gn and any(r for _, _, r in self._drains)  # (records drained with this op: synced before its B runs)
         if a.gn and not sync:
-            self.s.ddr_sync()
+            self.ddr_sync()
         addr = self.image(name, np.concatenate([x for i in range(len(a.rows)) for x in (cmds[i], gbs[i])]))
         rows = {r: a.row_ops(addr + 2 * i * D.Q, runs[r], slots[r]) for i, r in enumerate(a.rows)}
         cols = {c: a.col_ops() for c in range(COLS)}
@@ -351,7 +376,7 @@ class Builder:
         return out, len(slots)
 
     def zeros_q(self) -> int:
-        if "_zq" not in self.v2.dev.buffers:
+        if not self.v2.has("_zq"):
             self.image("_zq", np.zeros(D.Q, np.uint8))
         return self.v2.address("_zq")
 

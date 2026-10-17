@@ -481,6 +481,29 @@ def test_downsample_bands(v2: V2Device) -> None:
     assert _rel(y, ref) < 8e-3, _rel(y, ref)
 
 
+@pytest.mark.slow
+def test_upsample_bands(v2: V2Device) -> None:
+    """The nearest 2x upsampler with its conv from 16x16 C tiles (1280 channels) into the banded 32x32 level (K parts,
+    output halves, partial sums in DDR): within 8e-3 of torch on the bfp16-rounded input."""
+    from artlite.operators.sd15_v2.unet import upsample_bands
+    torch.manual_seed(16)
+    C, p = 1280, "s."
+    x = torch.randn(2, C, 16, 16)
+    w = {p + "conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, p + "conv.bias": 0.1 * torch.randn(C)}
+    bd = Builder(v2)
+    xt = _level_input(bd, Level(16), x, "x_in")
+    out = upsample_bands(bd, w, p, xt, stats=None, name="u")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    lv = out.lv
+    yb = [v2.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
+    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(2)])
+                                       for c in range(COLS)]), lv.R, lv.Lg)
+    xq = F.interpolate(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), scale_factor=2.0, mode="nearest")
+    ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), padding=1)
+    assert _rel(y, ref) < 8e-3, _rel(y, ref)
+
+
 def _rand_transformer(p: str, C: int = 1280, cd: int = 768) -> dict:
     g = torch.Generator().manual_seed(7)
     q = p + "transformer_blocks.0."
@@ -645,10 +668,9 @@ def test_resample(v2: V2Device, kind: str) -> None:
 
 @pytest.mark.slow
 def test_section(v2: V2Device) -> None:
-    """The 16x16 / 8x8 levels with SD 1.5's weights (down_blocks.2 .. up_blocks.1: ``unet.Section``, the sd15 overlay's
-    tensor layouts at both ends) on the reference's own down_blocks.1 output of random latents (t 500, a random
-    context), spliced into the fp32 reference UNet: the step's output within 1e-2 of the reference's (measured
-    4.1e-3; at up_blocks.1's output 4.5e-2, bfp16 operands)."""
+    """The 32x32 .. 8x8 levels with SD 1.5's weights (down_blocks.1 .. up_blocks.2: ``unet.Section``, the sd15 overlay's
+    tensor layouts at both ends) on the reference's own down_blocks.0 downsampler output of random latents (t 500, a
+    random context), spliced into the fp32 reference UNet: the step's output within 1.5e-2 of the reference's."""
     import time
 
     from artlite.model_config import sd15_dir
@@ -667,64 +689,62 @@ def test_section(v2: V2Device) -> None:
     def res(p: str, h: torch.Tensor) -> torch.Tensor:
         return reference.resnet(w, p, h, eps=eps, time_bias=biases[p])
 
+    def tr(p: str, h: torch.Tensor) -> torch.Tensor:
+        return u.transformer(p, h, ctx)
+
     h = reference.conv(w, "conv_in.", lat)
-    outer = [h]
-    for i in range(2):
-        for j in range(2):
-            h = u.transformer(f"down_blocks.{i}.attentions.{j}.", res(f"down_blocks.{i}.resnets.{j}.", h), ctx)
-            outer.append(h)
-        h = reference.conv(w, f"down_blocks.{i}.downsamplers.0.conv.", h, stride=2)
-        if i == 0:
-            outer.append(h)
-    x6 = h
-    skips = [x6]
+    skips = [h]
     for j in range(2):
-        h = u.transformer(f"down_blocks.2.attentions.{j}.", res(f"down_blocks.2.resnets.{j}.", h), ctx)
+        h = tr(f"down_blocks.0.attentions.{j}.", res(f"down_blocks.0.resnets.{j}.", h))
         skips.append(h)
-    h = reference.conv(w, "down_blocks.2.downsamplers.0.conv.", h, stride=2)
+    x5 = h = reference.conv(w, "down_blocks.0.downsamplers.0.conv.", h, stride=2)
+    for i in (1, 2):
+        skips.append(h)
+        for j in range(2):
+            h = tr(f"down_blocks.{i}.attentions.{j}.", res(f"down_blocks.{i}.resnets.{j}.", h))
+            skips.append(h)
+        h = reference.conv(w, f"down_blocks.{i}.downsamplers.0.conv.", h, stride=2)
     skips.append(h)
     for j in range(2):
         h = res(f"down_blocks.3.resnets.{j}.", h)
         skips.append(h)
-    h = res("mid_block.resnets.1.", u.transformer("mid_block.attentions.0.", res("mid_block.resnets.0.", h), ctx))
-    for j in range(3):
-        h = res(f"up_blocks.0.resnets.{j}.", torch.cat([h, skips.pop()], 1))
-    h = reference.conv(w, "up_blocks.0.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
-    for j in range(3):
-        h = u.transformer(f"up_blocks.1.attentions.{j}.", res(f"up_blocks.1.resnets.{j}.", torch.cat([h, skips.pop()], 1)),
-                          ctx)
-    def finish(h: torch.Tensor) -> torch.Tensor:  # (up_blocks.1's upsampler .. conv_out)
-        sk = list(outer)
-        h = reference.conv(w, "up_blocks.1.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
-        for i in (2, 3):
-            for j in range(3):
-                h = u.transformer(f"up_blocks.{i}.attentions.{j}.",
-                                  res(f"up_blocks.{i}.resnets.{j}.", torch.cat([h, sk.pop()], 1)), ctx)
-            if i == 2:
-                h = reference.conv(w, "up_blocks.2.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
+    h = res("mid_block.resnets.1.", tr("mid_block.attentions.0.", res("mid_block.resnets.0.", h)))
+    for i in range(3):
+        for j in range(3):
+            h = res(f"up_blocks.{i}.resnets.{j}.", torch.cat([h, skips.pop()], 1))
+            if i:
+                h = tr(f"up_blocks.{i}.attentions.{j}.", h)
+        if i < 2:
+            h = reference.conv(w, f"up_blocks.{i}.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
+    ref = h
+
+    def finish(h: torch.Tensor) -> torch.Tensor:  # (up_blocks.2's upsampler .. conv_out)
+        sk = list(skips)
+        h = reference.conv(w, "up_blocks.2.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
+        for j in range(3):
+            h = tr(f"up_blocks.3.attentions.{j}.", res(f"up_blocks.3.resnets.{j}.", torch.cat([h, sk.pop()], 1)))
         return reference.conv(w, "conv_out.", reference.group_norm(w, "conv_norm_out.", h, eps, silu=True))
 
-    ref = h
     t0 = time.perf_counter()
     from artlite.operators.sd15 import overlay as old
     from artlite.operators.sd15_v2.unet import Section
-    halves = old.to_ctile(x6).view(torch.uint8).numpy().reshape(8, 4, 2, 10240)  # (pass, tile, half: tg 0..3 / 4..7)
-    x_old = np.zeros((8, 8, old.C_OBJ), np.uint8)
-    x_old[:, :, :10240] = halves.reshape(8, 8, 10240)
+    halves = old.to_ctile(x5).view(torch.uint8).numpy().reshape(4, 16, 2, 10240)  # (pass, tile, half: rows 2 t, 2 t + 1)
+    x_old = np.zeros((4, 32, old.C_OBJ), np.uint8)
+    x_old[:, :, :10240] = halves.reshape(4, 32, 10240)
     v2.alloc("x_old", x_old.size)
     v2.write("x_old", x_old)
-    v2.alloc("out_old", 16 * 4 * old.C_OBJ)
+    v2.alloc("out_old", 8 * 16 * old.C_OBJ)
     sec = Section(v2, w, x_in=v2.address("x_old"), out=v2.address("out_old"), eps=eps)
     sec.set_time(biases)
     sec.set_context(ctx)
     print(f"section: {sec.bd.s.n} ops, built in {time.perf_counter() - t0:.1f} s")
     sec.run()
-    y = old.from_panels(torch.from_numpy(v2.read("out_old", 16 * 4 * old.C_OBJ)), 1280, 16, 16)
+    y = old.from_panels(torch.from_numpy(v2.read("out_old", 8 * 16 * old.C_OBJ)), 640, 32, 32)
     ts = []
     for _ in range(5):
         t1 = time.perf_counter()
         sec.run()
         ts.append(time.perf_counter() - t1)
     err = _rel(finish(y), finish(ref))
-    print(f"section: up_blocks.1 rel err {_rel(y, ref):.3e}, the step's {err:.3e}; {np.median(ts) * 1e3:.1f} ms per dispatch")
-    assert err < 1e-2
+    print(f"section: up_blocks.2 rel err {_rel(y, ref):.3e}, the step's {err:.3e}; {np.median(ts) * 1e3:.1f} ms per dispatch")
+    assert err < 1.5e-2

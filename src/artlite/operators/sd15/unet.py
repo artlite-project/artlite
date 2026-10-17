@@ -1,10 +1,10 @@
-"""SD 1.5's UNet step as one library program (``UNetProgram``) over one device buffer (``Arena``): the 64x64 / 32x32
-levels by overlay operators, the 16x16 / 8x8 levels by ``sd15_v2``'s section in one raw item.
+"""SD 1.5's UNet step as one library program (``UNetProgram``) over one device buffer (``Arena``): the 64x64 level by
+overlay operators, the 32x32 .. 8x8 levels by ``sd15_v2``'s section in one raw item.
 
 Each operator shape is one library entry (``UNetProgram.get``); a program item is an entry with arena addresses. The
 overlay design and the section's design cost two reconfigurations per step; the transformer blocks run in the
-overlay's transformer variant, entered and left by program-memory patches. The section takes down_blocks.1's
-downsampler conv's half tiles (``v2_in``) and writes the panel objects up_blocks.1's upsampler conv reads (``v2_out``).
+overlay's transformer variant, entered and left by program-memory patches. The section takes down_blocks.0's
+downsampler conv's half tiles (``v2_in``) and writes the panel objects up_blocks.2's upsampler conv reads (``v2_out``).
 
 Data flow (overlay.py's layouts):
 - Sums carry the residuals: every tensor buffer has room for summands after it, and a residual sum's stack is
@@ -13,8 +13,8 @@ Data flow (overlay.py's layouts):
 - Skips in place: concatenation buffers [h | s | room]. The skip's producing sum writes s there with a second GroupNorm
   record set (the concatenation's groups, h's pass offset); h's producer writes before it; the up block's resnet reads
   [h | s].
-- Stride-2 convs write half tiles of the lower level, which its sum reads (``SumOp(half_in)``); upsampling convs read
-  the lower level's panel objects (``ConvL(up)``).
+- The stride-2 conv writes half tiles of the lower level (the section's input); the upsampling conv reads the lower
+  level's panel objects (``ConvL(up)``: the section's output).
 - conv_in reads the latents in the conv layout (4 channels padded to 32); conv_out writes 80 channels (4 real).
 - Per step the host writes the latents and the 10 overlay resnets' time biases (their first sums' weight images); per
   prompt the cross attentions' K / V (``kv_packs``). The caller writes the section's (``sd15_v2.unet.Section``: its
@@ -42,7 +42,7 @@ from artlite.operators.sd15_v2.design import V2Design
 
 C2 = C_OBJ // 2  # (bf16 of an object)
 SLACK = (SOBJ - C_OBJ) // 2  # (bf16 after a staged tensor: its last objects' A objects read past it)
-LEVELS = (64, 32)  # (the overlay's; 16x16 / 8x8: the section)
+LEVELS = (64,)  # (the overlay's; 32x32 .. 8x8: the section)
 ALIGN = 2048  # (bf16: arena offsets 4 KB aligned)
 
 
@@ -172,13 +172,13 @@ class Program:
 
 class UNetProgram:
     """The UNet step (``build``) as one library program on the diffusers weights ``w`` (fp32 tensors by name): overlay
-    operators, and between down_blocks.1's downsampler conv and up_blocks.1's upsampler conv the 16x16 / 8x8 levels by
+    operators, and between down_blocks.0's downsampler conv and up_blocks.2's upsampler conv the 32x32 .. 8x8 levels by
     ``sd15_v2.unet.Section``: a raw transaction on its design ``v2_design`` (``v2_raw``, its words the caller's once the
     arena is laid out; its input ``v2_in``, output ``v2_out``)."""
 
-    # (level, channels) of skip i, the channels of h in its concatenation (skips 6 .. 11: the section's)
-    SKIP = ((64, 320), (64, 320), (64, 320), (32, 320), (32, 640), (32, 640))
-    HCH = (320, 320, 640, 640, 640, 1280)
+    # (level, channels) of skip i, the channels of h in its concatenation (skips 3 .. 11: the section's)
+    SKIP = ((64, 320), (64, 320), (64, 320))
+    HCH = (320, 320, 640)
 
     def __init__(self, w: dict[str, torch.Tensor]):
         self.w = w
@@ -396,44 +396,22 @@ class UNetProgram:
         return st
 
     def v2_section(self) -> None:
-        """The section's raw item, then up_blocks.1's upsampler conv from its panels (``v2_out``)."""
-        p = "up_blocks.1.upsamplers.0.conv."
-        self.v2_out = self.alloc(p + "pl", ysz(1280, 16) + SLACK)
+        """The section's raw item, then up_blocks.2's upsampler conv from its panels (``v2_out``)."""
+        p = "up_blocks.2.upsamplers.0.conv."
+        self.v2_out = self.alloc(p + "pl", ysz(640, 32) + SLACK)
         self.v2_design = V2Design()
         self.v2_raw = RawTxn(np.zeros(4, np.uint32))
         self.prog.add_raw(self.v2_design, self.v2_raw, self.v2_in, self.v2_out)
-        st = self.alloc(p + "stack", 2 * ysz(1280, 32) + SLACK)
-        n = self.conv(p + "c", 32, self.v2_out, ci=1280, co=1280, wt=self.w[p + "weight"], b=self.w[p + "bias"],
+        st = self.alloc(p + "stack", 2 * ysz(640, 64) + SLACK)
+        n = self.conv(p + "c", 64, self.v2_out, ci=640, co=640, wt=self.w[p + "weight"], b=self.w[p + "bias"],
                       out=(st, 0), up=True)
-        h = self.final_sum(32, 16, n, (st, 0), self.h_dest(5), p + "s")
+        h = self.final_sum(64, 8, n, (st, 0), self.h_dest(2), p + "s")
         self.outs.append((p, h))
-        self.cat_sums[5]["h"] = [o for o, _ in h.sums]
-
-    def down(self, p: str, x: Act, dest: Dest) -> Act:
-        """conv3x3 stride 2 at x's level -> level W / 2 (half tiles, summed there)."""
-        w, W, C = self.w, x.W, x.C
-        pl = self.plain(p + "pl", x)
-        cic = ConvL.max_chunk(self.ov[W], W // 2, C, C, stride=2)
-        n = C // cic
-        st = self.alloc(p + "stack", n * 2 * ysz(C, W // 2) + SLACK)
-        for j in range(n):
-            c = self.get(ConvL, W, Hp=W // 2, ci=C, co=C, ci0=j * cic, cic=cic, stride=2)
-            assert c.y_elems == 2 * ysz(C, W // 2)
-            self.add(c, pl, "zeros", self.wimg(f"{p}c.{j}", c.pack(w[p + "weight"][:, j * cic:(j + 1) * cic],
-                                                                  w[p + "bias"] if j == 0 else None)), (st, j * c.y_elems))
-        return self.final_sum(W // 2, C // 80, n, (st, 0), dest, p + "s", half_in=True)
-
-    def up(self, p: str, x: Act, dest: Dest) -> Act:
-        """nearest 2x + conv3x3: the conv at level 2 W reads x's panels."""
-        w, W, C = self.w, 2 * x.W, x.C
-        pl = self.plain(p + "pl", x)
-        st = self.alloc(p + "stack", 2 * ysz(C, W) + SLACK)
-        n = self.conv(p + "c", W, pl, ci=C, co=C, wt=w[p + "weight"], b=w[p + "bias"], out=(st, 0), up=True)
-        return self.final_sum(W, C // 80, n, (st, 0), dest, p + "s")
+        self.cat_sums[2]["h"] = [o for o, _ in h.sums]
 
     def build(self) -> None:
-        """The step's items: conv_in, down_blocks.0 / 1, the section (``v2_section``), up_blocks.2 / 3, the output
-        conv; the time biases are zero until written (``time_bias_images``)."""
+        """The step's items: conv_in, down_blocks.0, the section (``v2_section``: down_blocks.1 .. up_blocks.2), up_blocks.2's
+        upsampler, up_blocks.3, the output conv; the time biases are zero until written (``time_bias_images``)."""
         w = self.w
         self.alloc("lat", 66 * 8 * 4 * 144 // 2)  # (the latents in the conv layout: 66 rows x 8 groups x 4 cb x 144 B)
         win = torch.zeros(320, 32, 3, 3)
@@ -444,41 +422,29 @@ class UNetProgram:
             self.add(c, "lat", self.wimg(f"cin.{k}", c.pack(win, w["conv_in.bias"])), (st, 0))
         h = self.final_sum(64, 4, 1, (st, 0), self.skip_dest(0), "cin.s")
         self.cat_sums[0] = {"s": [o for o, _ in h.sums]}
-        for i, C in enumerate((320, 640)):
-            for j in range(2):
-                p = f"down_blocks.{i}.resnets.{j}."
-                d = self.skip_dest(len(self.cat_sums))
-                h = self.resnet(p, h, C, self.new_dest(p + "out", C, h.W))
-                self.outs.append((p, h))
-                p = f"down_blocks.{i}.attentions.{j}."
-                h = self.transformer(p, h, d)
-                self.outs.append((p, h))
-                self.cat_sums[len(self.cat_sums)] = {"s": [o for o, _ in h.sums]}
-            if i == 0:
-                p = "down_blocks.0.downsamplers.0.conv."
-                h = self.down(p, h, self.skip_dest(3))
-                self.outs.append((p, h))
-                self.cat_sums[3] = {"s": [o for o, _ in h.sums]}
-        self.v2_in = self.down_stack("down_blocks.1.downsamplers.0.conv.", h)  # (the section's input: not summed here)
+        for j in range(2):
+            p = f"down_blocks.0.resnets.{j}."
+            d = self.skip_dest(len(self.cat_sums))
+            h = self.resnet(p, h, 320, self.new_dest(p + "out", 320, h.W))
+            self.outs.append((p, h))
+            p = f"down_blocks.0.attentions.{j}."
+            h = self.transformer(p, h, d)
+            self.outs.append((p, h))
+            self.cat_sums[len(self.cat_sums)] = {"s": [o for o, _ in h.sums]}
+        self.v2_in = self.down_stack("down_blocks.0.downsamplers.0.conv.", h)  # (the section's input: not summed here)
         self.v2_section()
-        for i, C in ((2, 640), (3, 320)):
-            for j in range(3):
-                si = 11 - 3 * i - j
-                x = self.cat_act(si)
-                p = f"up_blocks.{i}.resnets.{j}."
-                d = self.h_dest(si - 1) if j < 2 else self.new_dest(f"up{i}", C, x.W)
-                h = self.resnet(p, x, C, self.new_dest(p + "out", C, x.W))
-                self.outs.append((p, h))
-                p = f"up_blocks.{i}.attentions.{j}."
-                h = self.transformer(p, h, d)
-                self.outs.append((p, h))
-                if j < 2:
-                    self.cat_sums[si - 1]["h"] = [o for o, _ in h.sums]
-            if i == 2:
-                p = "up_blocks.2.upsamplers.0.conv."
-                h = self.up(p, h, self.h_dest(2))
-                self.outs.append((p, h))
-                self.cat_sums[2]["h"] = [o for o, _ in h.sums]
+        for j in range(3):
+            si = 2 - j
+            x = self.cat_act(si)
+            p = f"up_blocks.3.resnets.{j}."
+            d = self.h_dest(si - 1) if j < 2 else self.new_dest("up3", 320, x.W)
+            h = self.resnet(p, x, 320, self.new_dest(p + "out", 320, x.W))
+            self.outs.append((p, h))
+            p = f"up_blocks.3.attentions.{j}."
+            h = self.transformer(p, h, d)
+            self.outs.append((p, h))
+            if j < 2:
+                self.cat_sums[si - 1]["h"] = [o for o, _ in h.sums]
         po = self.norm("pout", h, w["conv_norm_out.weight"], w["conv_norm_out.bias"])
         wout = torch.zeros(80, 320, 3, 3)
         wout[:4] = w["conv_out.weight"]
