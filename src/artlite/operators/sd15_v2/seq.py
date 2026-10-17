@@ -74,8 +74,10 @@ class Seq:
         self.frontier = 0  # every task of the ops before it is complete
         self._q: dict[tuple, collections.deque] = {}  # (row 0 / 1, col, dir, ch) -> ops of its pending tasks
         self._k: dict[tuple, int] = {}  # tasks per shim channel (BD rotation)
-        self._kbd: dict[tuple, int] = {}  # BD rotation per memtile channel
-        self._last: dict[tuple, tuple] = {}  # per memtile channel: its last task's BD ids and chain words
+        self._kbd: dict[tuple, int] = {}  # BD rotation per shim channel (the B runs)
+        self._chains: dict[tuple, list] = {}  # per memtile channel: (BD ids, chain words) of the chains its BDs hold
+        self._lru: dict[tuple[int, int], int] = {}  # (col, memtile BD) -> its last use
+        self._tick = 0
         self._held: dict[tuple[int, int], list[int]] = {}  # (col, memtile BD) -> its words
         self._user: dict[tuple[int, int], int] = {}  # (col, memtile BD) -> the op of the last task that used it
         self._gates: dict[int, list[int]] = {}  # op -> per column its gate's push (for tokens)
@@ -127,35 +129,39 @@ class Seq:
         q[-1] = (q[-1][0], push)
 
     def _task(self, col: int, d: int, ch: int, op: int, chain: list[list[int]], repeat: int) -> int:
-        """A memtile task: its chain on the channel's next BDs (rewritten only if they changed: then their last user
-        complete), linked; the same chain as the channel's previous task reuses its BDs. Returns the push's
-        operation number."""
+        """A memtile task: its chain on BDs of the channel's pool (``design.mem_bd_pool``), linked: a chain the channel ran
+        before reuses its BDs while they still hold it, else the pool's least recently used BDs (rewritten: their last
+        user complete; never one of this op's). Returns the push's operation number."""
         key = (1, col, d, ch)
         self._slot(key, op)
-        assert len(chain) <= 4, len(chain)
-        last = self._last.get(key)
-        if last is not None and last[1] == chain:
-            ids = last[0]
-            for bid in ids:
-                self._user[(col, bid)] = op
-            push = self.t.mem_push(col, d, ch, ids[0], repeat=repeat)
-            self._pushed(key, push)
-            return push
-        k = self._kbd.get(key, 0)
-        ids = [D.mem_bd_id(d, ch, (k + i) % 4) if ch < 5 else 0 for i in range(len(chain))]
-        self._kbd[key] = k + len(chain)
-        self._last[key] = (ids, [list(w) for w in chain])
-        for i, (bid, words) in enumerate(zip(ids, chain, strict=True)):
-            words = list(words)
-            if i + 1 < len(chain):
-                words[1] |= 1 << 19 | ids[i + 1] << 20
-            if self._held.get((col, bid)) != words:
-                if (u := self._user.get((col, bid))) is not None:
-                    assert u != op, f"op {op}: more BDs on memtile channel {(d, ch)} than its {4}"
-                    self.complete(u)
-                self.t.mem_bd(col, bid, words)
-                self._held[(col, bid)] = words
+
+        def linked(ids: list[int]) -> list[list[int]]:
+            out = []
+            for i, words in enumerate(chain):
+                words = list(words)
+                if i + 1 < len(chain):
+                    words[1] |= 1 << 19 | ids[i + 1] << 20
+                out.append(words)
+            return out
+        pool = D.mem_bd_pool(ch)
+        ids = next((ids for ids, raw in self._chains.get(key, []) if raw == chain
+                    and all(self._held.get((col, b)) == w for b, w in zip(ids, linked(ids), strict=True))), None)
+        if ids is None:
+            free = sorted((b for b in pool if self._user.get((col, b)) != op), key=lambda b: self._lru.get((col, b), -1))
+            assert len(free) >= len(chain), f"op {op}: more BDs on memtile channel {(d, ch)} than its pool has free"
+            ids = free[:len(chain)]
+            for bid, words in zip(ids, linked(ids), strict=True):
+                if self._held.get((col, bid)) != words:
+                    if (u := self._user.get((col, bid))) is not None:
+                        self.complete(u)
+                    self.t.mem_bd(col, bid, words)
+                    self._held[(col, bid)] = words
+            cache = self._chains.setdefault(key, [])
+            cache[:] = [(i, r) for i, r in cache if not set(i) & set(ids)] + [(ids, [list(w) for w in chain])]
+        for bid in ids:
             self._user[(col, bid)] = op
+            self._tick += 1
+            self._lru[(col, bid)] = self._tick
         push = self.t.mem_push(col, d, ch, ids[0], repeat=repeat)
         self._pushed(key, push)
         return push

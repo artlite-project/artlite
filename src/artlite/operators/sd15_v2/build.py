@@ -28,9 +28,12 @@ TBIAS, TBIAS_BYTES = "_tbias", 64 * 1024  # (the time-biased convs' command bias
 
 @dataclass(frozen=True)
 class Level:
-    """A level's geometry per column: R image rows of Lg groups of 8 lanes, both images (m = 16 R Lg tokens)."""
+    """A level's geometry per column: R image rows of Lg groups of 8 lanes, both images; its tokens in ``nb`` bands (the
+    memtile holds one band's tensors: 32x32 two of 2 rows, 64x64 four), a band's in tiles of m tokens (64: 4 groups of a
+    row; 8x8: 16)."""
 
     H: int
+    nb: int = 1
 
     @property
     def R(self) -> int:
@@ -41,19 +44,27 @@ class Level:
         return self.H // 8
 
     @property
+    def T(self) -> int:  # (a band's tokens per column)
+        return 16 * self.R * self.Lg // self.nb
+
+    @property
     def m(self) -> int:
-        return 16 * self.R * self.Lg
+        return min(self.T, 64)
+
+    @property
+    def ntile(self) -> int:
+        return self.T // self.m
 
     @property
     def np(self) -> int:  # (token panels per kb)
-        return self.m // 8
+        return self.T // 8
 
     def ct(self, C: int) -> int:
-        """Bytes of a C-tile tensor of C channels."""
-        return C // 80 * L.ct_bytes(self.m)
+        """Bytes of a C-tile tensor of C channels (one band)."""
+        return C // 80 * self.ntile * L.ct_bytes(self.m)
 
     def pn(self, C: int) -> int:
-        """Bytes of a panel tensor of C channels."""
+        """Bytes of a panel tensor of C channels (one band)."""
         return C // 8 * self.np * L.PANEL
 
 

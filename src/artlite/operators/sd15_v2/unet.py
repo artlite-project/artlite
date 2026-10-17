@@ -79,7 +79,7 @@ def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch
     if silu:
         silu_table(bd)
     for k, (a, nblk) in enumerate(ops):
-        ap = Apply(m=x.lv.m, nblk=nblk, mode="gnsilu" if silu else "gn", x=x.addr, y=y.addr,
+        ap = Apply(m=x.lv.m, nblk=nblk, mode="gnsilu" if silu else "gn", x=x.addr, y=y.addr, ntile=x.lv.ntile,
                    blk0=(a - ch0) // 80, y_kb0=y_kb0 + (a - ch0) // 8, y_np=y.np, gsize=gs, ch_off=a,
                    tokens=x.lv.H ** 2, eps=eps)
         bd.apply(ap, gamma, beta, name=f"{name}.{k}", records=x.rec, extra=extra if k == 0 else None)
@@ -106,12 +106,12 @@ def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, nam
          split: int = 1, extra: dict | None = None) -> int:
     """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu"), + res;
     out's GroupNorm records for ``stats``; ln: LayerNorm records, returns their memtile address (the caller frees
-    ``LN_REC`` bytes after the apply). split: ops of npass / split passes (a lock counts a GEMM's sends to 63).
+    ``ln_rec`` bytes after the apply). split: ops of npass / split passes (a lock counts a GEMM's sends to 63).
     extra: col ops (fills / drains) merged into the first op."""
     lv = out.lv
-    kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": w.shape[0], "x": x.addr, "y": out.addr, "out": kind,
+    kw = {"m": lv.m, "ntile": lv.ntile, "K": x.C, "N": w.shape[0], "x": x.addr, "y": out.addr, "out": kind,
           "res": res.addr if res else None, "x_np": x.np, "y_np": out.np if kind != "bf16" else None}
-    rec = bd.mem.alloc(LN_REC if ln else 4 * D.OCH, top=not ln) if stats or ln else 0  # (LN: its apply's walk reads on)
+    rec = bd.mem.alloc(ln_rec(lv) if ln else 4 * D.OCH, top=not ln) if stats or ln else 0  # (LN: its apply's walk reads on)
     if stats:
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
     elif ln:
@@ -126,7 +126,9 @@ def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, nam
     return rec
 
 
-LN_REC = 4 * D.OCH  # (a tile's LayerNorm records: [core][OCH])
+def ln_rec(lv: Level) -> int:
+    """Bytes of a band's LayerNorm records ([tile][core][OCH])."""
+    return lv.ntile * 4 * D.OCH
 
 
 def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels: Tensor | None = None,
@@ -136,7 +138,7 @@ def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels
     lv = x.lv
     rec = bd.mem.alloc(4 * D.OCH, top=True)
     y = panels.addr if panels is not None else bd.mem.alloc(lv.pn(x.C))
-    g = Gemm(m=lv.m, ntile=1, K=0, N=x.C, x=0, y=y, out="bfp16", res=x.addr, stats="gn", rec=rec, gsize=st[0],
+    g = Gemm(m=lv.m, ntile=lv.ntile, K=0, N=x.C, x=0, y=y, out="bfp16", res=x.addr, stats="gn", rec=rec, gsize=st[0],
              ch_off=st[1])
     bd.gemm(g, None, None, name=name, extra=extra)
     if panels is None:
@@ -147,7 +149,8 @@ def copy_stats(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], panels
 
 def plain(bd: Builder, x: Tensor, y: Tensor, *, name: str) -> None:
     """The C tiles x as panels y: a copy (K 0, x as the residual) on every core row."""
-    bd.gemm(Gemm(m=x.lv.m, ntile=1, K=0, N=x.C, x=0, y=y.addr, out="bfp16", res=x.addr, y_np=y.np), None, None, name=name)
+    bd.gemm(Gemm(m=x.lv.m, ntile=x.lv.ntile, K=0, N=x.C, x=0, y=y.addr, out="bfp16", res=x.addr, y_np=y.np), None, None,
+            name=name)
 
 
 def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: torch.Tensor, eps: float,
@@ -183,54 +186,73 @@ LOG2E = 1.4426950408889634
 
 def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
     """LayerNorm of the C tiles h (records at rec: its producer's) into the panels y; frees rec."""
-    a = Apply(m=h.lv.m, nblk=h.C // 160, mode="ln", x=h.addr, y=y.addr, rec=rec, C=h.C, y_np=y.np)
+    a = Apply(m=h.lv.m, nblk=h.C // 160, mode="ln", x=h.addr, y=y.addr, ntile=h.lv.ntile, rec=rec, C=h.C, y_np=y.np)
     bd.apply(a, gamma, beta, name=name)
-    bd.mem.release(rec, LN_REC)
+    bd.mem.release(rec, ln_rec(h.lv))
 
 
 def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0) -> Tensor:
-    """Attention of the panels q (scaled queries) on the K / V^T slots at DDR kv: the output panels."""
+    """Attention of the panels q (scaled queries, 8 heads) on the K / V^T slots at DDR kv (self-attention: the keys of
+    all of the level's bands): the output panels."""
     o = alloc(bd, q.lv, q.C, "pn")
-    at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys)
-    cmd = bd.image(name, at.command())
-    bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
+    for t in range(max(q.lv.np // 8, 1)):  # (an op per tile)
+        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=q.C // 8, nbands=q.lv.nb, tile=t)
+        cmd = bd.image(name, at.command())
+        bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
     return o
 
 
-def transformer(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, ctx_kv: int, nctx: int,
-                stats: tuple[int, int] | None, spill: bool) -> Tensor:
-    """diffusers' Transformer2DModel of SD 1.x (one BasicTransformerBlock, 8 heads): GN -> proj_in -> + attn1 (LN1) ->
-    + attn2 (LN2; the context's K / V^T slots at DDR ctx_kv, nctx keys) -> + GEGLU feed-forward (LN3) -> proj_out + x.
-    kv: a DDR buffer for the self-attention's slots; spill: x in DDR during the block (16x16: the memtile)."""
+def _block_in(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, band: int = 0, extra: dict | None = None,
+              free_x: bool = False, park: str = "") -> tuple[Tensor | None, Tensor]:
+    """A transformer block's first part on (a band of) x: GN -> proj_in -> h, LN1 -> K, V^T (drained into the
+    self-attention's slots at DDR kv: K's with V's GEMM, V^T's with Q's) and Q. Returns (h, the scaled queries'
+    panels); free_x: x freed after the GroupNorm (extra: col ops merged into it); park: h drained into that DDR image
+    with the K GEMM and freed (returned as None)."""
     lv, C = x.lv, x.C
-    q = p + "transformer_blocks.0."
+    q, a = p + "transformer_blocks.0.", p + "transformer_blocks.0.attn1"
     pg = alloc(bd, lv, C, "pn")
-    gn_apply(bd, x, pg, w[p + "norm.weight"], w[p + "norm.bias"], name=p + "norm", eps=1e-6, silu=False,
-             extra=bd.spill(p + "x", x.addr, x.nbytes) if spill else None)
-    if spill:
+    gn_apply(bd, x, pg, w[p + "norm.weight"], w[p + "norm.bias"], name=p + "norm", eps=1e-6, silu=False, extra=extra)
+    if free_x:
         free(bd, x)
     h = alloc(bd, lv, C)
     rec = gemm(bd, pg, w[p + "proj_in.weight"], w[p + "proj_in.bias"], name=p + "proj_in", out=h, ln=True)
     free(bd, pg)
+    n = alloc(bd, lv, C, "pn")
+    ln_apply(bd, h, n, w[q + "norm1.weight"], w[q + "norm1.bias"], name=q + "norm1", rec=rec)
+    if park:
+        bd.defer(bd.spill(park, h.addr, h.nbytes), release=[(h.addr, h.nbytes)])
+        h = None
+    kt, vt = alloc(bd, lv, C, "pn"), alloc(bd, lv, C, "pn")
+    at = Attention(np=lv.np, q=0, o=0, kv=kv, d=C // 8, nbands=lv.nb)
+    gemm(bd, n, w[a + ".to_k.weight"], None, name=a + ".to_k", out=kt, kind="bfp16",
+         extra=None)
+    gemm(bd, n, w[a + ".to_v.weight"], None, name=a + ".to_v", out=vt, kind="vt",
+         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k", band=band) for c in range(COLS)})
+    free(bd, kt)
+    qt = alloc(bd, lv, C, "pn")
+    gemm(bd, n, w[a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=a + ".to_q", out=qt, kind="bfp16",
+         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="v", band=band) for c in range(COLS)})
+    bd.s.ddr_sync()
+    free(bd, vt)
+    free(bd, n)
+    return h, qt
+
+
+def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, ctx_kv: int, nctx: int) -> Tensor:
+    """A transformer block's second part on (a band of) h with its queries qt (freed): + attn1 (the keys' slots at DDR
+    kv) -> + attn2 (LN2; the context's K / V^T slots at DDR ctx_kv, nctx keys) -> + GEGLU feed-forward (LN3); h freed.
+    Returns the proj_out input (panels)."""
+    lv, C = h.lv, h.C
+    q = p + "transformer_blocks.0."
+    rec = 0
     for k, a in enumerate(("attn1", "attn2")):
-        n = alloc(bd, lv, C, "pn")
-        ln_apply(bd, h, n, w[q + f"norm{k + 1}.weight"], w[q + f"norm{k + 1}.bias"], name=q + f"norm{k + 1}", rec=rec)
-        vdr = None
-        if a == "attn1":  # (K, V^T first, drained to DDR during the next GEMMs: K's with V's, V^T's with Q's)
-            kt, vt = alloc(bd, lv, C, "pn"), alloc(bd, lv, C, "pn")
-            at = Attention(np=lv.np, q=0, o=0, kv=kv)
-            gemm(bd, n, w[q + a + ".to_k.weight"], None, name=q + a + ".to_k", out=kt, kind="bfp16")
-            gemm(bd, n, w[q + a + ".to_v.weight"], None, name=q + a + ".to_v", out=vt, kind="vt",
-                 extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k") for c in range(COLS)})
-            free(bd, kt)
-            vdr = {c: at.kv_drains(kt.addr, vt.addr, c, part="v") for c in range(COLS)}
-        qt = alloc(bd, lv, C, "pn")
-        gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / 160 ** 0.5), None, name=q + a + ".to_q", out=qt, kind="bfp16",
-             extra=vdr)
-        if vdr:
-            bd.s.ddr_sync()
-            free(bd, vt)
-        free(bd, n)
+        if a == "attn2":
+            n = alloc(bd, lv, C, "pn")
+            ln_apply(bd, h, n, w[q + "norm2.weight"], w[q + "norm2.bias"], name=q + "norm2", rec=rec)
+            qt = alloc(bd, lv, C, "pn")
+            gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=q + a + ".to_q", out=qt,
+                 kind="bfp16")
+            free(bd, n)
         o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx)
         free(bd, qt)
         rec = gemm(bd, o, w[q + a + ".to_out.0.weight"], w[q + a + ".to_out.0.bias"], name=q + a + ".to_out", out=h,
@@ -257,12 +279,81 @@ def transformer(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, ctx_kv: int
              out=h if k == 0 else h4, res=h, kind="bf16" if k == 0 else "bfp16")
         free(bd, g)
     free(bd, h)
+    return h4
+
+
+def transformer(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, ctx_kv: int, nctx: int,
+                stats: tuple[int, int] | None, spill: bool) -> Tensor:
+    """diffusers' Transformer2DModel of SD 1.x (one BasicTransformerBlock, 8 heads) on a level of one band: GN ->
+    proj_in -> + attn1 (LN1) -> + attn2 (LN2; the context's K / V^T slots at DDR ctx_kv, nctx keys) -> + GEGLU
+    feed-forward (LN3) -> proj_out + x. kv: a DDR buffer for the self-attention's slots; spill: x in DDR during the block
+    (16x16: the memtile)."""
+    lv, C = x.lv, x.C
+    h, qt = _block_in(bd, w, p, x, kv=kv, extra=bd.spill(p + "x", x.addr, x.nbytes) if spill else None, free_x=spill)
+    h4 = _block_out(bd, w, p, h, qt, kv=kv, ctx_kv=ctx_kv, nctx=nctx)
     if spill:
         x = alloc(bd, lv, C)
         bd.op(bd.load(p + "x", x.addr, x.nbytes), {})
     gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=x, res=x, stats=stats)
     free(bd, h4)
     return x
+
+
+@dataclass
+class DTensor:
+    """A tensor of a banded level in DDR: per band b its columns' memtile images ([col][band tensor bytes], DDR image
+    ``band(b)``: ``Builder.spill`` / ``load``) of C tiles (kind "ct") or panels ("pn"); its GroupNorm records for the
+    next norm (every band's)."""
+
+    lv: Level
+    C: int
+    name: str
+    kind: str = "ct"
+    rec: list[Records] | None = None
+
+    def band(self, b: int) -> str:
+        return f"{self.name}.{b}"
+
+    @property
+    def nbytes(self) -> int:
+        return self.lv.ct(self.C) if self.kind == "ct" else self.lv.pn(self.C)
+
+    def load(self, bd: Builder, b: int) -> Tensor:
+        """Band b in the memtile (an op of its fills)."""
+        t = alloc(bd, self.lv, self.C, self.kind)
+        bd.op(bd.load(self.band(b), t.addr, t.nbytes), {})
+        t.rec = self.rec
+        return t
+
+    def store(self, bd: Builder, b: int, t: Tensor) -> None:
+        """Band b from the memtile tensor t (drained with the next op, t's bytes released after it); its records."""
+        bd.defer(bd.spill(self.band(b), t.addr, t.nbytes), release=[(t.addr, t.nbytes)])
+        self.rec = (self.rec or []) + (t.rec or [])
+
+
+def transformer_bands(bd: Builder, w: dict, p: str, x: DTensor, *, kv: int, ctx_kv: int, nctx: int,
+                      stats: tuple[int, int] | None, name: str) -> DTensor:
+    """``transformer`` on a banded level (32x32 / 64x64: x and the output in DDR): every band's first part (its keys
+    into the slots; h and Q parked in DDR, h with the K GEMM, Q with the next op; the last band's kept), then the
+    bands' second parts (the last band first) and proj_out + x -> the output band (records for ``stats``)."""
+    lv, C, nb = x.lv, x.C, x.lv.nb
+    parked = DTensor(lv, C, name + ".h"), DTensor(lv, C, name + ".q", "pn")
+    for b in range(nb):
+        h, qt = _block_in(bd, w, p, x.load(bd, b), kv=kv, band=b, free_x=True,
+                          park=parked[0].band(b) if b < nb - 1 else "")
+        if b < nb - 1:
+            parked[1].store(bd, b, qt)
+    out = DTensor(lv, C, name)
+    for b in reversed(range(nb)):
+        if b < nb - 1:
+            h, qt = alloc(bd, lv, C), alloc(bd, lv, C, "pn")
+            bd.op(bd.merge(bd.load(parked[0].band(b), h.addr, h.nbytes), bd.load(parked[1].band(b), qt.addr, qt.nbytes)), {})
+        h4 = _block_out(bd, w, p, h, qt, kv=kv, ctx_kv=ctx_kv, nctx=nctx)
+        xb = x.load(bd, b)
+        gemm(bd, h4, w[p + "proj_out.weight"], w[p + "proj_out.bias"], name=p + "proj_out", out=xb, res=xb, stats=stats)
+        free(bd, h4)
+        out.store(bd, b, xb)
+    return out
 
 
 @dataclass

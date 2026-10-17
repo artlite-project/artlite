@@ -232,7 +232,9 @@ def test_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
     v2.alloc("acmd", D.Q)
     v2.write("acmd", at.command())
     s.op(fills(v2, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
-    s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(v2.address("acmd")))
+    for t in range(max(np_ // 8, 1)):  # (an op per tile)
+        at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb, tile=t)
+        s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(v2.address("acmd")))
     nbytes = C // 8 * np_ * L.PANEL
     s.op(drains(v2, "o", nbytes, OA), {})
     v2.run(v2.transaction(s))
@@ -409,6 +411,46 @@ def test_transformer(v2: V2Device, H: int) -> None:
     y = from_level_tokens(torch.stack([L.from_ctiles(yb[c], lv.m, C, lv.m) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
     assert _rel(y, ref) < 2e-2
+
+
+@pytest.mark.slow
+def test_transformer_bands(v2: V2Device) -> None:
+    """The transformer on a banded level (32x32, 640 channels, d 80: 2 bands, x and the output in DDR, h and Q of band 0
+    parked): within 2e-2 of the fp32 reference."""
+    import types
+
+    from artlite.operators.sd15_v2.unet import DTensor, copy_stats, transformer_bands
+    from models.sd15 import reference
+    torch.manual_seed(11)
+    p, C, H = "t.", 640, 32
+    w = _rand_transformer(p, C)
+    x = torch.randn(2, C, H, H)
+    ctx = torch.randn(2, 77, 768)
+    q = p + "transformer_blocks.0.attn2."
+    lv = Level(H, 2)
+    bd = Builder(v2)
+    xc = level_tokens(x, lv.R, lv.Lg)  # (COLS, 2 T, C): band b = tokens [T b, T (b + 1))
+    xd = DTensor(lv, C, "x_in")
+    for b in range(2):
+        bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+    xd.rec = []
+    for b in range(2):  # (the input's records: a copy op per band)
+        t = xd.load(bd, b)
+        xd.rec += copy_stats(bd, t, name=f"x.st{b}", st=(C // 32, 0))
+        bd.mem.release(t.addr, t.nbytes)
+    from artlite.operators.sd15_v2.ops import Attention
+    kv = bd.ddr("kv_self", Attention(np=lv.np, q=0, o=0, kv=0, d=C // 8, nbands=2).kv_bytes())
+    ckv = bd.image("kv_ctx", L.kv_slots(ctx @ w[q + "to_k.weight"].T, ctx @ w[q + "to_v.weight"].T, d=C // 8))
+    out = transformer_bands(bd, w, p, xd, kv=kv, ctx_kv=ckv, nctx=77, stats=None, name="y")
+    bd.op({}, {})  # (the last band's deferred drain)
+    v2.run(bd.transaction())
+    yb = [v2.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
+    yc = torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(2)]) for c in range(COLS)])
+    y = from_level_tokens(yc, lv.R, lv.Lg)
+    ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
+    err = _rel(y, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 2e-2
 
 
 def _level_input(bd: Builder, lv: Level, x: torch.Tensor, name: str) -> Tensor:

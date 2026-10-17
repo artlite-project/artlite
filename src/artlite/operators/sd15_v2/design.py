@@ -74,15 +74,17 @@ assert L1["tab"] + TABB <= L1["c"] and L1["ws"] + WS <= 0x8000 and R23["s1"] + S
 assert all(v % 64 == 0 for v in R23.values())
 assert all(v % 64 == 0 for v in L1.values())
 
-# memtile BDs: per (direction, channel) 4 BDs of its parity (even channels 0-23, odd 24-47); odd 40: the gate's
-# static landing chain; 41-47 the gate tasks (one BD per op, rotating)
+# memtile BDs: per channel number 0..4 a pool of 8 BDs of its parity (even channels 0-23, odd 24-47) that its two directions
+# share (the sequencer takes the least recently used); odd 40: the gate's static landing chain; 41-47 the gate tasks (one
+# BD per op, rotating)
 GATE_BDS = tuple(range(41, 48))
 
 
-def mem_bd_id(direction: int, ch: int, k: int) -> int:
-    """BD k (0..3) of a memtile channel (S2MM / MM2S 0..4)."""
-    assert 0 <= k < 4 and 0 <= ch < 5
-    return 24 * (ch % 2) + 8 * (ch // 2) + 4 * direction + k
+def mem_bd_pool(ch: int) -> tuple[int, ...]:
+    """The BDs of memtile channels S2MM / MM2S ``ch`` (0..4)."""
+    assert 0 <= ch < 5
+    base = 24 * (ch % 2) + 8 * (ch // 2)
+    return tuple(range(base, base + 8))
 
 
 class V2Design(ArtcOperator):
