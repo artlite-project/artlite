@@ -1,6 +1,7 @@
 """The cores' program of sd15_v2's design (``design``): a C++ main reading commands from the row's B stream. The main
 loop (``v2_run``), GEMMs and convs are shared code; the other kinds are a role's code (``ROLES``: "a" attention of
-d 80 / 160, "b" the applies, "c" attention of d 40; together they do not fit 16 KB of program memory): a core of role x starts at ``v2_main_x``, which puts
+d 80 / 160, "b" the applies, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512; together they
+do not fit 16 KB of program memory): a core of role x starts at ``v2_main_x``, which puts
 its role's entry (``v2_ext_x``) into the ext word and enters ``v2_run``. Each role's ELF holds the shared code first,
 at the same addresses in every role's (the role code is what only its main reaches, placed after it): a role switch
 rewrites the program memory from there and the ext word (``runtime.role_code``, ``seq.Seq.role``).
