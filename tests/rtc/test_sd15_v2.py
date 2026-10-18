@@ -352,6 +352,56 @@ def test_conv_rows(v2: V2Device, Cin: int, N: int, res: bool) -> None:
     assert err < 8e-3, err
 
 
+IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (64x64: a row's groups in their storage order, even then odd)
+
+
+def il_tokens(x: torch.Tensor, rows: int) -> torch.Tensor:
+    """``level_tokens`` of a 64x64 level's rows (8 groups): token panel (row, group IL[k], image)."""
+    t = level_tokens(x, rows, 8)
+    return t.reshape(COLS, rows, 8, 16, -1)[:, :, list(IL)].reshape(t.shape)
+
+
+def from_il_tokens(y: torch.Tensor, rows: int) -> torch.Tensor:
+    inv = [IL.index(g) for g in range(8)]
+    return from_level_tokens(y.reshape(COLS, rows, 8, 16, -1)[:, :, inv].reshape(y.shape), rows, 8)
+
+
+@pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (320, 320, True)])
+def test_conv_il(v2: V2Device, Cin: int, N: int, res: bool) -> None:
+    """A 3x3 conv (padding 1) of a 64x64 level in its row tiles (``ops.Gemm`` il: a row's even groups, its odd ones),
+    an op per band of 2 output rows per column, its input's 4 rows (the halos included, zeros past the image) filled
+    per band; bias, a residual: within 8e-3 of torch on the bfp16-rounded operands."""
+    torch.manual_seed(13)
+    H = 64
+    x = torch.randn(2, Cin, H, H)
+    w, b = torch.randn(N, Cin, 3, 3) / (9 * Cin) ** 0.5, torch.randn(N) * 0.1
+    r_img = torch.randn(2, N, H, H)
+    xp = F.pad(x, (0, 0, 1, 1))  # (a zero row above and below)
+    rt = il_tokens(r_img, 8)  # (COLS, 1024, N): band b = tokens [256 b, ..)
+    Z, X = 0, 4096
+    yb = N // 80 * 4 * L.ct_bytes(64)  # (a band's C tiles)
+    Y = X + Cin // 8 * 64 * L.PANEL
+    s = v2.seq()
+    for k in range(4):
+        xs = [L.panels(il_tokens(torch.cat([xp[:, :, 8 * c + 2 * k:8 * c + 2 * k + 4] for c in range(COLS)], 2), 4)[c])
+              for c in range(COLS)]
+        s.op(merge(fills(v2, f"x{k}", xs, X), *([fills(v2, f"r{k}", [L.ctiles(rt[c, 256 * k:256 * (k + 1)], 64)
+                                                                    for c in range(COLS)], Y)] if res else [])), {})
+        g = Gemm(m=64, ntile=4, K=Cin, N=N, x=X, y=Y, res=Y if res else None, out="bf16", conv=1, R=1, Lg=8, zero=Z,
+                 x_np=64, rc=4, r0=1, il=True)
+        s.op({c: g.col_ops(c) for c in range(COLS)}, gemm_rows(v2, f"w{k}", g, w, b), barrier=True)
+        s.op(drains(v2, f"y{k}", yb, Y), {})
+    v2.run(v2.transaction(s))
+    ys = [v2.read(f"y{k}", COLS * yb).reshape(COLS, yb) for k in range(4)]
+    y = from_il_tokens(torch.stack([torch.cat([L.from_ctiles(ys[k][c], 256, N, 64) for k in range(4)]) for c in range(COLS)]),
+                       8)
+    ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
+    if res:
+        ref = ref + r_img.bfloat16().float()
+    err = _rel(y, ref)
+    assert err < 8e-3, err
+
+
 def _rand_resnet(p: str, cin: int, cout: int) -> dict:
     g = torch.Generator().manual_seed(5)
     w = {p + "norm1.weight": 1 + 0.2 * torch.randn(cin, generator=g), p + "norm1.bias": 0.2 * torch.randn(cin, generator=g),

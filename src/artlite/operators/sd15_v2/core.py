@@ -371,7 +371,8 @@ __attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const int32_t
 // the second group's C bands, bits 16..23: the bands; the A walk (a dims_3d_t); its last step per A slot (the walk
 // may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS); the row tiles (``ops.Gemm`` rc): an
 // A object per dy (bit 15 of its first tap: the next object), its shift phase's destinations in the object (SH_OBJ)
-__attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf) {
+// (64x64: the tap words of odd tiles in bits 16..31)
+__attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf, int par) {
   static_assert(sizeof(dims_3d_t) == 28);
   const int nch = ws[{{ C_NCH }}], R = ws[{{ C_R }}], rot = ws[{{ C_ROT }}];
   const dims_3d_t &pb = *(const dims_3d_t *)(ws + {{ C_PATS }}), &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
@@ -384,7 +385,7 @@ __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws,
     e0[{{ CALL * i + 5 }}] = e0[{{ CALL * i }} + k];
 {% endfor %}
     for (int t = 0, i = rot & ch; t < 9; t++, i = i == 8 ? 0 : i + 1) {
-      const unsigned tw = ws[{{ C_TAPW }} + i];
+      const unsigned tw = (par ? (unsigned)ws[{{ C_TAPW }} + i] >> 16 : ws[{{ C_TAPW }} + i]) & 0xFFFF;
       if (tw >> 15) {  // (the row tiles: the next dy's object)
         {{ p }}_give_a(s, (int32_t *)a);
         a = (const uint8_t *){{ p }}_take_a(s);
@@ -424,7 +425,7 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
     for (int p = 0; p < npass; p++) {
       {{ p }}_bias_f((const bfloat16 *)(ws + {{ C_BIAS }}) + 80 * p, cf, nrb);
       if (ws[{{ C_CONV }}])
-        {{ p }}_conv(s, ws, cf, (uint8_t *)tab);
+        {{ p }}_conv(s, ws, cf, (uint8_t *)tab, t & 1);
       else
       for (int kt = 0; kt < nkt; kt += kpo) {
         int32_t *a = {{ p }}_take_a(s);

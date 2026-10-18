@@ -96,7 +96,9 @@ class Gemm:
     32x32): the op's ntile tiles are output rows r0 .. of 4 groups (m 64); per chunk an A object per dy: the 8 (row,
     group) pairs from input row r + dy - 1's predecessor group (slot 0, then the row's groups in slots 1-4, slot 5 the
     next row's group 0), into whose slots 0 and 5 the core shifts the row's group 3 one lane down and its group 0 one
-    lane up: every tap's 4 bands are slots dx .. dx + 3 (``conv_words``)."""
+    lane up: every tap's 4 bands are slots dx .. dx + 3 (``conv_words``). il (64x64, Lg 8): x holds rc rows of 8 groups
+    (the halo rows included), a row's even groups then its odd ones; tile t = output row r0 + rstep (t // 2)'s even
+    (t even) or odd groups; per chunk an A object per dy: input row r + dy - 1 (``_il_words``)."""
 
     m: int
     ntile: int
@@ -122,6 +124,7 @@ class Gemm:
     rc: int = 0
     r0: int = 0
     rstep: int = 1
+    il: bool = False
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N % 320 == 0 and self.K % 8 == 0 and \
@@ -132,8 +135,13 @@ class Gemm:
         assert 0 <= self.p0 and self.p0 + self.npo <= self.npass
         self.nkt = -(-self.K // D.KT)
         if self.conv:
-            assert self.m == 16 * self.R * self.Lg and (self.ntile == 1 or self.rc) and self.K % 64 == 0 and self.conv in (1, 2)
-            assert not self.rc or (self.R, self.Lg, self.conv) == (1, 4, 1) and self.r0 + self.rstep * (self.ntile - 1) < self.rc
+            assert self.m * (1 + self.il) == 16 * self.R * self.Lg and (self.ntile == 1 or self.rc) and self.K % 64 == 0 \
+                and self.conv in (1, 2)
+            if self.il:  # (the tiles' input rows in x)
+                assert (self.R, self.Lg, self.conv, self.ntile % 2) == (1, 8, 1, 0) and self.r0 >= 1 and \
+                    self.r0 + self.rstep * (self.ntile // 2 - 1) + 1 < self.rc
+            else:
+                assert not self.rc or (self.R, self.Lg, self.conv) == (1, 4, 1) and self.r0 + self.rstep * (self.ntile - 1) < self.rc
             self.nch = self.K // 64
             self.Li, self.Rc = self.Lg * self.conv, self.R * self.conv  # (the input's groups, the column's input rows)
             self.Ri = self.Rc + (2 if self.conv == 1 else 1)  # (an object's rows: the halos above / below)
@@ -164,6 +172,8 @@ class Gemm:
 
     def tap_order(self, c: int) -> list[tuple[int, int]]:
         """The taps (dy, dx) of chunk c in the order of its B slots."""
+        if self.il:
+            return [(dy, dx) for dy in range(3) for dx in (1, 2, 0)]
         if self.R == 1:
             return [(dy, dx) for dy in range(3) for dx in range(3)]
         return list(self.ORDER2[c % 2:]) + list(self.ORDER2[:c % 2])
@@ -174,6 +184,8 @@ class Gemm:
         byte offset: ``design.a_byte``), or a lane-shifted copy in cbuf (the phase's: a row's last group one lane down,
         its group 0 one lane up); a call per group where the two sources' row strides differ), the B and C walks, the
         taps' words, the shift phases."""
+        if self.il:
+            return self._il_words()
         if self.rc:
             return self._row_words()
         R, LG, Li, st = self.R, self.Lg, self.Li, self.conv
@@ -231,7 +243,7 @@ class Gemm:
         out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
         out[:len(words)] = words
         out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [*pb, 0, 0, *pl, 0, 0]
-        out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
+        out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = [w | w << 16 for w in tapw]  # (odd tiles: the same)
         out[K.C_PHASE - K.C_CALLS:] = pw.reshape(-1)
         assert K.C_PHASE + 24 <= D.WS // 4
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
@@ -263,11 +275,43 @@ class Gemm:
             words += [(1 << 30 if g else 0) | nbr << 16 | A[src], *dims, 0, 0, dims[4], dims[4]]
         tapw = [first[dx] * K.CALL | (first[dx + 1] - first[dx]) << 10 | (1 if dx == 0 else 0) << 12 |
                 (1 if dx == 0 and dy else 0) << 15 for dy, dx in self.tap_order(0)]
+        tapw = [w | w << 16 for w in tapw]  # (odd tiles: the same)
         out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
         out[:len(words)] = words
         out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
         out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
         out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 4] = (A[4], A[0] | K.SH_OBJ, A[1], A[5] | K.SH_OBJ)
+        return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
+
+    def _il_words(self) -> np.ndarray:
+        """``conv_words`` of the 64x64 row tiles (``il``): the object row r + dy - 1's groups [g0 g2 g4 g6 | g1 g3 g5 g7]
+        (slots A0..A7, ``design.a_byte`` (1152 k)), its taps in the order dx 0, +1, -1 (``tap_order``). Even tiles:
+        [A0..A3], [A4..A7], then g7 one lane down into slot A0 (both read), dx -1 from [A0 A4 A5 A6] (the pairs (A0, A5),
+        (A4, A6): a call each); odd tiles: [A4..A7], g0 one lane up into A4, dx +1 from [A1 A2 A3 A4] (the pairs (A1, A3),
+        (A2, A4)), [A0..A3]. Each shift phase's other half lands in cbuf (unused)."""
+        A = [D.a_byte(1152 * k) for k in range(8)]
+
+        def il4(k: int) -> list[int]:  # (4 slots from k: the il walk)
+            a = A[k:k + 4]
+            return [4 << 16 | a[0], 1, a[2] - a[0] - 1152, 4, a[0] - a[2] - 1152, a[1] - a[2] - 1152, 0, 0,
+                    a[1] - a[2] - 1152, a[1] - a[2] - 1152]
+
+        def pair(g: int, x: int, y: int) -> list[int]:
+            return [(1 << 30 if g else 0) | 2 << 16 | x, 1, y - x - 1152, 4, x - y - 1152, 0, 0, 0, 0, 0]
+        words = il4(0) + il4(4) + pair(0, A[0], A[5]) + pair(1, A[4], A[6]) + pair(0, A[1], A[3]) + pair(1, A[2], A[4])
+        use = ({1: (0, 1), 2: (1, 1), 0: (2, 2)}, {1: (1, 1), 2: (4, 2), 0: (0, 1)})  # (per parity, dx: first call, calls)
+        phase = ({0: 1}, {2: 2})  # (per parity: its shift before that tap)
+        tapw = []
+        for dy, dx in self.tap_order(0):
+            w = [use[p][dx][0] * K.CALL | use[p][dx][1] << 10 | phase[p].get(dx, 0) << 12 | (dx == 1 and dy > 0) << 15
+                 for p in range(2)]
+            tapw.append(w[0] | w[1] << 16)
+        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out[:len(words)] = words
+        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
+        out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
+        out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 16] = [A[7], A[0] | K.SH_OBJ, A[0], 0, 0, 0, 0, 0,
+                                                                 A[7], 1152, A[0], A[4] | K.SH_OBJ, 0, 0, 0, 0]
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
 
     def command(self, bias: torch.Tensor | None, row: int) -> np.ndarray:
@@ -343,6 +387,14 @@ class Gemm:
         assert self.x >= 144, "the first object's slot 0 before x"
         return MemTask(chain, repeat=self.nch * (1 if self.res is not None else self.npo))
 
+    def _il_sends(self, t: int) -> MemTask:
+        """Tile t's A objects of the 64x64 row tiles (``il``), per chunk 3 (dy): input rows r - 1 .. r + 1 of x, each its
+        groups [group 8][kb 8][2] (one BD: the rows are consecutive)."""
+        kbw, r = self.x_np * 18, self.r0 + self.rstep * (t // 2)
+        return MemTask([{"addr": self.x + 1152 * (r - 1), "nwords": 3 * D.A_OBJ // 4,
+                         "dims": [(36, 1), (8, kbw), (8, 36), (0, 288)], "iteration": (8 * kbw, self.nch)}],
+                       repeat=self.nch * (1 if self.res is not None else self.npo))
+
     def _conv_sends(self, col: int) -> MemTask:
         """The chunks' A objects: [rows Ri][Li groups][kb 8][2] from the west column's last row (the image's top: zeros),
         the column's rows, the east column's first row (stride 1; the bottom: zeros); the last BD reads on to fill
@@ -373,7 +425,7 @@ class Gemm:
             sends, recvs = [], []
             if self.conv:  # (per tile; with a residual per pass its chunks, then its residual objects)
                 for t in range(NT):
-                    cs = self._row_sends(col, t) if self.rc else self._conv_sends(col)
+                    cs = self._il_sends(t) if self.il else self._row_sends(col, t) if self.rc else self._conv_sends(col)
                     if self.res is None:
                         sends.append(cs)
                         continue
