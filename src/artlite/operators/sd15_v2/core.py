@@ -24,7 +24,8 @@ core copies it into its workspace and releases the slot. Kinds:
   pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) in ``OCH`` chunks (the last one padded);
 - ``K_APPLY`` (role b): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
   stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
-  beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm: the B slots after it C_NREC
+  beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
+  image's halves, their sums added): the B slots after it C_NREC
   group records (``REC_SLOT`` per slot, summed); LayerNorm: the first A object the tile's per-token records of the
   column's 4 cores;
 - ``K_ATTN`` (role a): per unit (C_NUNIT: an image and head of d 160) its queries (an A object: C_NQP query
@@ -52,7 +53,7 @@ from ..kernel_source import kernel_prefix
 
 # command header words
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
- C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP) = range(27)
+ C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
 C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
@@ -371,7 +372,7 @@ __attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const int32_t
 // the second group's C bands, bits 16..23: the bands; the A walk (a dims_3d_t); its last step per A slot (the walk
 // may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS); the row tiles (``ops.Gemm`` rc): an
 // A object per dy (bit 15 of its first tap: the next object), its shift phase's destinations in the object (SH_OBJ)
-// (64x64: the tap words of odd tiles in bits 16..31)
+// (per tile its half of the tap words: C_TPAR bit t, the high one where set)
 __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf, int par) {
   static_assert(sizeof(dims_3d_t) == 28);
   const int nch = ws[{{ C_NCH }}], R = ws[{{ C_R }}], rot = ws[{{ C_ROT }}];
@@ -425,7 +426,7 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
     for (int p = 0; p < npass; p++) {
       {{ p }}_bias_f((const bfloat16 *)(ws + {{ C_BIAS }}) + 80 * p, cf, nrb);
       if (ws[{{ C_CONV }}])
-        {{ p }}_conv(s, ws, cf, (uint8_t *)tab, t & 1);
+        {{ p }}_conv(s, ws, cf, (uint8_t *)tab, (unsigned)ws[{{ C_TPAR }}] >> t & 1);
       else
       for (int kt = 0; kt < nkt; kt += kpo) {
         int32_t *a = {{ p }}_take_a(s);
@@ -504,8 +505,8 @@ static inline __attribute__((always_inline)) void {{ p }}_split_st(aie::vector<f
 }
 
 // GroupNorm coefficients of n16 x 16 channels (s = gamma rstd, t = beta - mean s): mr = mean [16] | rstd [16] of the
-// record window's groups, tw: per 16 channels two words, the indices in it of their first, middle and last channel's
-// groups and the lanes of the first and of the last group (``group_words``: groups of 10 channels span three), gb =
+// record window's groups, tw: per 16 channels two words, the indices in it of their groups in lane order (up to four:
+// groups of 4 channels), the fourth's first lane, the lanes of the first and of the third (``group_words``), gb =
 // gamma, beta [c16][16 | 16] fp32 -> coef [c8][s_hi 8 | s_lo 8 | t_hi 8 | t_lo 8] (gb and coef may be one buffer: an
 // iteration reads its 128 B before it writes them; pipelined)
 static __attribute__((noinline)) void {{ p }}_gnc16(const float *__restrict gb, const float *__restrict mr, bfloat16 *__restrict coef,
@@ -513,11 +514,14 @@ static __attribute__((noinline)) void {{ p }}_gnc16(const float *__restrict gb, 
   aie::set_rounding(aie::rounding_mode::conv_even);
   AIE_LOOP_MIN_ITERATION_COUNT(5)
   for (int k = 0; k < n16; k++) {
-    const unsigned w = *tw++, wm = *tw++, ia = w & 31, ib = (w >> 5) & 31, ic = (w >> 10) & 31;
+    const unsigned w = *tw++, wm = *tw++, ia = w & 31, ib = (w >> 5) & 31, ic = (w >> 10) & 31, id = (w >> 15) & 31;
     const aie::mask<16> ma = aie::mask<16>::from_uint32(wm & 0xFFFF), mc = aie::mask<16>::from_uint32(wm >> 16);
-    const aie::vector<float, 16> rs = aie::select(aie::select(aie::broadcast<float, 16>(mr[16 + ib]), aie::broadcast<float, 16>(mr[16 + ic]), mc),
+    const aie::mask<16> md = aie::mask<16>::from_uint32(0xFFFFu << ((w >> 20) & 31));
+    const aie::vector<float, 16> rs = aie::select(aie::select(aie::select(aie::broadcast<float, 16>(mr[16 + ib]), aie::broadcast<float, 16>(mr[16 + ic]), mc),
+                                                              aie::broadcast<float, 16>(mr[16 + id]), md),
                                                   aie::broadcast<float, 16>(mr[16 + ia]), ma);
-    const aie::vector<float, 16> mu = aie::select(aie::select(aie::broadcast<float, 16>(mr[ib]), aie::broadcast<float, 16>(mr[ic]), mc),
+    const aie::vector<float, 16> mu = aie::select(aie::select(aie::select(aie::broadcast<float, 16>(mr[ib]), aie::broadcast<float, 16>(mr[ic]), mc),
+                                                              aie::broadcast<float, 16>(mr[id]), md),
                                                   aie::broadcast<float, 16>(mr[ia]), ma);
     const aie::vector<float, 16> sv = al::mulff<16>(rs, aie::load_v<16>(gb));
     const aie::vector<float, 16> tv = aie::sub(aie::load_v<16>(gb + 16), al::mulff<16>(mu, sv));
@@ -703,8 +707,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_apply_gn({{ p }}_st &s, i
     {{ p }}_recsum(rb_, st, left < {{ REC_SLOT }} ? left : {{ REC_SLOT }});
     {{ p }}_give_b(s, (int32_t *)rb_);
   }
+  const int join = ws[{{ C_JOIN }}];
+  if (join) {{ p }}_recsum(st + 32, st, 1);  // (the images are one image's halves: image 0's sums += image 1's)
   for (int img = 0; img < 2; img++) {
-    {{ p }}_mrstd(st + 32 * img, st + 32 * img + 16, ws, st + 64 + 32 * img, st + 80 + 32 * img);
+    const float *si = st + (join ? 0 : 32 * img);
+    {{ p }}_mrstd(si, si + 16, ws, st + 64 + 32 * img, st + 80 + 32 * img);
     {{ p }}_gnc16(gp, st + 64 + 32 * img, (bfloat16 *)cb + 4 * nch * img, ws + {{ C_GTAB }}, nch / 16);
   }
 {% if win == "gnc" %}
@@ -1178,21 +1185,24 @@ __attribute__((noinline, minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, in
 """
 
 
-def group_words(ch0: int, nch: int, gsize: int, g0: int) -> np.ndarray:
-    """C_GTAB of a GroupNorm apply core (channels [ch0, ch0 + nch) in groups of gsize >= 8, its record window from group
-    g0): per 16 channels from ch0 the window indices of their first, middle and last channel's groups (bits 0..4, 5..9,
-    10..14), then the lanes of the first group and of the last (masks, bits 0..15, 16..31: the middle group's lanes are
-    the rest)."""
-    assert gsize >= 8 and nch % 16 == 0
+def group_words(ch0: int, nch: int, gsize: int, g0: int, nreal: int = 0) -> np.ndarray:
+    """C_GTAB of a GroupNorm apply core (channels [ch0, ch0 + nch) in groups of gsize >= 4, its record window from group
+    g0; nreal: only the first that many are real, the rest pads in the last real channel's group): per 16 channels from
+    ch0 the window indices of their groups in lane order (up to four: bits 0..4, 5..9, 10..14, 15..19; a third or
+    fourth repeats the last) and the fourth's first lane (bits 20..24, 16: none), then the lanes of the first group and
+    of the third (masks, bits 0..15, 16..31: the second group's lanes are the rest)."""
+    assert gsize >= 4 and nch % 16 == 0
+    nreal = nreal or nch
     out = []
     for c in range(ch0, ch0 + nch, 16):
-        ga, gm, gc = c // gsize, (c + 8) // gsize, (c + 15) // gsize
-        grp = [(c + j) // gsize for j in range(16)]
-        assert len(set(grp)) <= 3 and all(0 <= g - g0 < 16 for g in (ga, gm, gc))
-        gm = next((g for g in grp if g not in (ga, gc)), ga)
+        grp = [min(c + j, ch0 + nreal - 1) // gsize for j in range(16)]
+        gs = sorted(set(grp))
+        assert len(gs) <= 4 and all(0 <= g - g0 < 16 for g in gs), (c, gs, g0)
+        ga, gb, gc, gd = (gs + [gs[-1]] * 3)[:4] if len(gs) > 2 else (gs[0], gs[0], gs[-1], gs[-1])
         ma = sum(1 << j for j in range(16) if grp[j] == ga)
         mc = sum(1 << j for j in range(16) if grp[j] == gc and gc != ga)
-        out += [(ga - g0) | (gm - g0) << 5 | (gc - g0) << 10, ma | mc << 16]
+        e3 = grp.index(gd) if len(gs) == 4 else 16
+        out += [(ga - g0) | (gb - g0) << 5 | (gc - g0) << 10 | (gd - g0) << 15 | e3 << 20, ma | mc << 16]
     return np.array(out, np.uint32).view(np.int32)
 
 
@@ -1205,10 +1215,15 @@ def group_inv(gsize: int) -> int:
 
 
 @functools.cache
-def shift_masks() -> bytes:
-    """``v2_shift``'s byte masks (``C_MASKS``): per byte of a 576-byte cycle (8 panels) 0xFF where kept after a shift
-    down (lane 0 of each panel cleared), then up (lane 7 cleared)."""
-    return bytes(0 if (i % 72 < 9 if d == 0 else i % 72 >= 63) else 0xFF for d in range(2) for i in range(576))
+def shift_masks(joined: bool = False) -> bytes:
+    """``v2_shift``'s byte masks (``C_MASKS``): per byte of a 576-byte cycle (8 panels [kb][image 2]) 0xFF where kept
+    after a shift down (lane 0 of each panel cleared), then up (lane 7 cleared). joined: the two images are one image's
+    halves side by side, a cut lane of image 1 down / image 0 up the pixel across the seam: only image 0's lane 0 (down)
+    and image 1's lane 7 (up) cleared."""
+    def cut(d: int, i: int) -> bool:
+        img = i // 72 % 2
+        return (i % 72 < 9 and not (joined and img)) if d == 0 else (i % 72 >= 63 and not (joined and not img))
+    return bytes(0 if cut(d, i) else 0xFF for d in range(2) for i in range(576))
 
 
 def source(*, win: str = "") -> str:

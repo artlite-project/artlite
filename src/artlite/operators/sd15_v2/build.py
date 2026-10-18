@@ -31,10 +31,12 @@ TBIAS, TBIAS_BYTES = "_tbias", 64 * 1024  # (the time-biased convs' command bias
 class Level:
     """A level's geometry per column: R image rows of Lg groups of 8 lanes, both images; its tokens in ``nb`` bands (the
     memtile holds one band's tensors: 32x32 two of 2 rows, 64x64 four), a band's in tiles of m tokens (64: 4 groups of a
-    row; 8x8: 16)."""
+    row; 8x8: 16). half: one image of H x H, its left and right halves as the two images (``vae``): Lg groups of a half
+    row."""
 
     H: int
     nb: int = 1
+    half: bool = False
 
     @property
     def R(self) -> int:
@@ -42,7 +44,7 @@ class Level:
 
     @property
     def Lg(self) -> int:
-        return self.H // 8
+        return self.H // (16 if self.half else 8)
 
     @property
     def T(self) -> int:  # (a band's tokens per column)
@@ -115,14 +117,15 @@ class Records:
     ch_off: int
     nr: int
     gsize: int
+    split: int = 1  # (core rows of a channel slice: ``ops.Gemm`` tsplit)
 
     def rows_for(self, c0: int, n: int) -> list[int]:
         """The producer rows whose records an apply core of channels [c0, c0 + n) sums: of its window, with channels
         of its groups (a group may straddle two producers)."""
         w = gn_window(c0, n, self.gsize)
         lo, hi = c0 // self.gsize * self.gsize, -(-(c0 + n) // self.gsize) * self.gsize
-        return [r for r in range(ROWS) if gn_window(self.ch_off + r * self.nr, self.nr, self.gsize) == w
-                and self.ch_off + r * self.nr < hi and lo < self.ch_off + (r + 1) * self.nr]
+        a = [self.ch_off + r // self.split * self.nr for r in range(ROWS)]
+        return [r for r in range(ROWS) if gn_window(a[r], self.nr, self.gsize) == w and a[r] < hi and lo < a[r] + self.nr]
 
 
 @dataclass
@@ -145,6 +148,7 @@ class Builder:
         self._rec_names: dict[str, int] = {}  # (records' DDR images by name: their uses)
         self._rec_img: dict[str, tuple] = {}  # (records' DDR images by name: the current one's address, its bands)
         self._images: dict[str, int] = {}  # (DDR image name -> its data's hash)
+        self._ddr: dict[str, int] = {}  # (DDR image name -> its bytes)
         self._gemm_images: dict[str, tuple] = {}  # (a GEMM's image name -> (its commands' hash, its weights), address, row bytes)
         self._dirty: set[str] = set()  # (DDR images drained into since the last DDR sync)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
@@ -157,11 +161,14 @@ class Builder:
         data = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
         h = hash(data.tobytes())
         assert self._images.setdefault(name, h) == h, f"DDR image {name!r} written again with other data"
-        self.v2.alloc(name, data.size)
+        self.ddr(name, data.size)
         self.v2.write(name, data)
         return self.v2.address(name)
 
     def ddr(self, name: str, nbytes: int) -> int:
+        """The device address of DDR image ``name`` of nbytes (a name this dispatch took with fewer bytes is an error:
+        ops pushed so far read that image)."""
+        assert self._ddr.setdefault(name, nbytes) >= nbytes, f"DDR image {name!r} of {self._ddr[name]} B asked for {nbytes} B"
         self.v2.alloc(name, nbytes)
         return self.v2.address(name)
 
@@ -276,22 +283,34 @@ class Builder:
             self.tab[r] = name
 
     def gemm(self, g: Gemm, w: torch.Tensor | None, b: torch.Tensor | None, *, name: str, barrier: bool = False,
-             extra: dict[int, ColOps] | None = None, inputs_ready: bool = False, tbias: str | None = None) -> None:
+             extra: dict[int, ColOps] | None = None, inputs_ready: bool = False, tbias: str | None = None,
+             wname: str = "") -> None:
         """A GEMM / conv / copy op (``extra``: fills / drains merged into it; ``name``'s image: per row its command,
-        then its weights). A conv is a barrier (its halo rows: the neighbours'), unless inputs_ready (complete before an
-        earlier op: its later passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes:
-        the commands' biases on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
+        then its weights; wname: the weights in an image of that name, shared by a layer's command variants). A conv is
+        a barrier (its halo rows: the neighbours'), unless inputs_ready (complete before an earlier op: its later
+        passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes: the commands' biases
+        on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
         cmds = [g.command(b, r) for r in range(ROWS)]
         key = (hash(b"".join(c.tobytes() for c in cmds)),
                None if w is None else (w.data_ptr(), tuple(w.shape), w.stride(), w.dtype))
-        if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
-            addr, per = self._gemm_images[name][1:]
+        if wname:
+            assert not tbias
+            addr = self.image(name, np.concatenate(cmds))
+            if wname not in self._gemm_images:
+                ws = [g.weights(w, r) for r in range(ROWS)]
+                self._gemm_images[wname] = (key[1], self.image(wname, np.concatenate(ws)), ws[0].size)
+            assert self._gemm_images[wname][0] == key[1], f"weights image {wname!r} of other weights"
+            wa, wb = self._gemm_images[wname][1:]
+            rows = {r: g.row_ops(addr + r * D.Q, wa + r * wb) for r in range(ROWS)}
         else:
-            ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
-            per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)
-            addr = self.image(name, np.concatenate([x for r in range(ROWS) for x in (cmds[r], ws[r])]))
-            self._gemm_images[name] = (key, addr, per)
-        rows = {r: g.row_ops(addr + r * per) for r in range(ROWS)}
+            if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
+                addr, per = self._gemm_images[name][1:]
+            else:
+                ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
+                per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)
+                addr = self.image(name, np.concatenate([x for r in range(ROWS) for x in (cmds[r], ws[r])]))
+                self._gemm_images[name] = (key, addr, per)
+            rows = {r: g.row_ops(addr + r * per) for r in range(ROWS)}
         if tbias:  # (the first run in three: the header, the biases from TBIAS, the rest)
             nb, hb = 160 * g.npo, 4 * K.C_BIAS
             if not self.tb_used:
@@ -337,7 +356,7 @@ class Builder:
         for i, r in enumerate(a.rows):
             rr, nrec = [], 0
             if a.gn:  # (per producer rows' gather: strips of their records in every column)
-                c0, n = a.ch0(r), a.nblk * 80
+                c0, n = a.ch0(r), a.nreal or a.nblk * 80
                 for rs in sorted(records, key=lambda rs: -len(rs.rows_for(c0, n))):  # (the larger strips first: fewer
                     # gathers cut at slot ends)
                     sel = rs.rows_for(c0, n)
