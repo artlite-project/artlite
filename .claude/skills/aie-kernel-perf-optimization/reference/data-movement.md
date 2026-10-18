@@ -52,6 +52,10 @@ bandwidth.
   - producers write the format the next consumer reads (the prefill norms and GdnOut emit the next GEMM's
     bfp16 A panels; the decode's producers drain into the GEMV's token-interleaved layout).
 - **bfp16 panels** `[rows / 8][K / 8][8 x 9 B]` carry activations in 56% of bf16's bytes.
+- **Channels padded to whole passes** (a core's 80-channel C tile, 128 real of 160): pad in the C tiles only, drain or
+  read just the real kbs (memtile BDs with a slices dimension; a 4-dim walk whose 4th size is implied by the task's
+  words: 3 sizes plus a repeat); a kernel's output padded to whole output chunks lands in junk rows of the receiving
+  tensor (sd15_v2's VAE decoder: `vae.Chans`, `Attention512`'s 80-kb output).
 - **One image on a design for two**: its left and right halves as the two images. A lane shift moves a whole slot
   ([kb][image 2] panels) as one byte stream, so the second half's cut lane takes the first half's edge lane: the
   pixel across the seam, for free; only the masks change (sd15_v2's VAE decoder: `core.shift_masks(joined)`), and
