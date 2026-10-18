@@ -24,7 +24,10 @@ calls page code only through the entry words, from resident code. Hazards and th
   16 KB: a page past it writes the tile's other registers and breaks the core;
 - page data: the core's data memory is the resident ELF's: ``link`` refuses a page whose functions need data the
   resident code does not have (constant or jump tables);
-- the stack: the deepest call of the core, page entries called from their resident callers, fits its stack_size.
+- the stack: the deepest call of the core, page entries called from their resident callers, fits its stack_size;
+- a stale page: a configuration (a PDI load) rewrites the slot's start with the startup code and leaves the state
+  words: after one, the state is cleared (the memtile transport's reload) or a dispatch's first page is always sent
+  (self-DMA: the host's).
 
 Transports, how the packets reach the TileControl:
 
@@ -32,7 +35,7 @@ Transports, how the packets reach the TileControl:
   TLAST, which cuts a packet that crosses it; the wake lock is the last slot's last packet), and the core's own MM2S
   channel streams the slots into its own TileControl (``loop_flow``: a packet flow inside the tile's switchbox, one id
   on every core) while it sleeps in ``pg_self``. The sender of the stream (the host) knows which page each core needs.
-  The TileControl takes ~2.4 B / cycle: two slots of 5760 B in ~4830 cycles, whatever the code in them;
+  The TileControl takes ~1.9-2.4 B / cycle: two slots of 5760 B in ~4830 cycles, whatever the code in them;
 - memtile: the core's request (``pg_request`` with ``request``'s words: a control packet from its stream port to its
   memtile's TileControl, ``request_flow``) pushes a BD of the page's stream, stored in the memtile (``Store``), on a
   memtile MM2S channel of its own (``page_flow``): 86 cycles + ~0.39 us per KB of code. A queue drops a push when full:
