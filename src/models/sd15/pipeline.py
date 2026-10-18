@@ -8,7 +8,8 @@ replace the CPU's one at a time:
 - ``NoisePredictor``: latents (2, 4, 64, 64) fp32 already scaled by 1 / sqrt(sigma^2 + 1), a fractional timestep
   (``host.resnet_time_biases`` turns it into each resnet's time bias) and the context (2, 77, 768) -> the predicted
   noise (2, 4, 64, 64). The batch is [uncond, cond]. The context is the same tensor for every step of an image:
-  what depends only on it (each cross-attention's K and V) can be computed once per image;
+  what depends only on it (each cross-attention's K and V) can be computed once per image; one with a
+  ``prepare(timesteps)`` gets the steps' timesteps before the text encoder runs (per-timestep work started early);
 - ``ImageDecoder``: the sampler's final latents (1, 4, 64, 64) -> the image (1, 3, 512, 512) in about [-1, 1].
 ``load_backend("cpu", ...)``: the three in fp32 torch (``reference``); ``"npu"``: the UNet and the VAE decoder on
 the NPU (``npu``).
@@ -124,10 +125,12 @@ class StableDiffusion:
         b = self.backend
         t0 = time.perf_counter()
         with torch.no_grad():
+            sigmas = self.schedule.sigmas(steps, sampler)
+            if hasattr(b.unet, "prepare"):
+                b.unet.prepare([self.schedule.timestep(s) for s in sigmas[:-1]])
             ids = torch.tensor([self.tokenizer.encode(negative_prompt), self.tokenizer.encode(prompt)])
             context = b.text_encoder(ids)
             t1 = time.perf_counter()
-            sigmas = self.schedule.sigmas(steps, sampler)
             generator = torch.Generator().manual_seed(seed)
             shape = (1, LATENT_CHANNELS, height // LATENT_SCALE, width // LATENT_SCALE)
             x = torch.randn(shape, generator=generator) * sigmas[0]

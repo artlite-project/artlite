@@ -41,21 +41,13 @@ def latent_panels(lat: torch.Tensor) -> list[np.ndarray]:
     the image's other kbs zeros)."""
     x = torch.zeros(2, 8, 64, 64)
     x[:, :lat.shape[1]] = lat
-    t = tokens(x)
-    return [L.panels(t[c]) for c in range(COLS)]
+    return np.split(L.panels(tokens(x).reshape(-1, 8)), COLS)  # (one kb: the columns' panels in a row)
 
 
 def noise(raw: np.ndarray) -> torch.Tensor:
-    """conv_out's output image ([band][col][OUT]) -> (2, 4, 64, 64)."""
-    ct = L.ct_bytes(64)
-    r = raw.reshape(LV64.nb, COLS, 4, 8, 128)
-    y = torch.zeros(COLS, 1024, 4)
-    for b in range(LV64.nb):
-        for c in range(COLS):
-            buf = np.zeros((4, ct), np.uint8)
-            buf[:, :8 * 1280].reshape(4, 8, 1280)[:, :, :128] = r[b, c]
-            y[c, 256 * b:256 * (b + 1)] = L.from_ctiles(buf.reshape(-1), 256, 80, 64)[:, :4]
-    return from_tokens(y)
+    """conv_out's output image ([band][col][OUT]: [tile][row block][8 tokens][8 channels] bf16) -> (2, 4, 64, 64)."""
+    v = torch.from_numpy(np.ascontiguousarray(raw).reshape(LV64.nb, COLS, 4, 8, 8, 16)).view(torch.bfloat16)[..., :4]
+    return from_tokens(v.float().permute(1, 0, 2, 3, 4, 5).reshape(COLS, 1024, 4))
 
 
 @dataclass

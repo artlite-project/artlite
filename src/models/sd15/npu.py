@@ -3,14 +3,14 @@
 DDR images), and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: two dispatches around the mid
 block's attention, which runs on the host in bf16).
 
-Per step the host writes the latents and the 22 resnets' time biases (``host``), runs the dispatch and reads the 4
-output channels; per prompt (a new context) it writes the cross attentions' K / V^T (computed on the host). The first
+Per step the host writes the latents and the 22 resnets' time biases (``host``: the steps' computed ahead on a worker
+thread, ``NpuUNet.prepare``), runs the dispatch and reads the 4 output channels; per prompt (a new context) it writes the cross attentions' K / V^T (computed on the host). The first
 build writes the weight images and builds the dispatches' transactions (the design's compile is cached).
 """
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
@@ -36,9 +36,18 @@ class NpuUNet:
         self.net = UNet(V2Device(), self.w, eps=cfg["norm_eps"])
         self.context: torch.Tensor | None = None
         self.pool = ThreadPoolExecutor(8)  # (the time biases' projections)
+        self.worker = ThreadPoolExecutor(1)  # (the steps' time biases ahead of them: ``prepare``)
+        self.biases: dict[float, Future] = {}
+
+    def prepare(self, timesteps: list[float]) -> None:
+        """The steps' time biases computed ahead, on a worker thread (the pipeline: before its text encoder runs)."""
+        for t in timesteps:
+            if t not in self.biases:
+                self.biases[t] = self.worker.submit(resnet_time_biases, self.w, t, pool=self.pool)
 
     def __call__(self, x: torch.Tensor, t: float, context: torch.Tensor) -> torch.Tensor:
-        self.net.set_time(resnet_time_biases(self.w, t, pool=self.pool))
+        f = self.biases.pop(t, None)
+        self.net.set_time(f.result() if f else resnet_time_biases(self.w, t, pool=self.pool))
         if self.context is None or not torch.equal(self.context, context):
             self.net.set_context(context)
             self.context = context.clone()
