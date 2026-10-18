@@ -52,6 +52,10 @@ bandwidth.
   - producers write the format the next consumer reads (the prefill norms and GdnOut emit the next GEMM's
     bfp16 A panels; the decode's producers drain into the GEMV's token-interleaved layout).
 - **bfp16 panels** `[rows / 8][K / 8][8 x 9 B]` carry activations in 56% of bf16's bytes.
+- **One image on a design for two**: its left and right halves as the two images. A lane shift moves a whole slot
+  ([kb][image 2] panels) as one byte stream, so the second half's cut lane takes the first half's edge lane: the
+  pixel across the seam, for free; only the masks change (sd15_v2's VAE decoder: `core.shift_masks(joined)`), and
+  the per-image statistics are summed (the GroupNorm apply's C_JOIN).
 - **Tokens per weight pass**: a weight-streaming GEMM re-reads all weights once per token chunk (GemmQ, 32 -> 64
   tokens per core row: GEMMs -15..26%); L1 bounds the tokens per pass.
 - **Queries per pass over a KV cache**: a flash attention re-reads its KV head's history once per
@@ -168,6 +172,10 @@ offsets): aie2p-coding section 8. For speed:
   Gemma step 3751 -> 1366 waits, -0.25 ms (qwen35: no change). Extra BD writes on the X fills cost ~60% of their
   firmware time in step time; on the weight runs nothing (issued far ahead). Fewer tasks per boundary (one broadcast
   fill instead of one per column) is a design-time lever.
+- **An op's fixed cost** (sd15_v2: per column a gate, then the op's tasks): an empty op 4.6 µs, a fill-only op of
+  16 KB per column 7.9 µs, a band's conv ~13 µs above its B-stream time. Many small ops: the next op's input fills
+  (and its output's allocation) merged into the current op where the memtile holds both, double buffering across ops
+  (sd15_v2 `vae.prefetch`: the VAE decoder's second dispatch 282 -> 258 ms).
 - **Watchdog**: a dispatch must finish within the driver's TDR (2 s): size chunks for < 1 s.
   A killed job fails with `DispatchError ... TIMEOUT (state 8)`; for a host-built transaction
   its message names the operations at the firmware's `txn_op_idx` (where it stopped).
@@ -240,8 +248,11 @@ offsets): aie2p-coding section 8. For speed:
 - **Waiting**: a blocking driver wait adds 0.3-1.7 ms and leaves the core cold. Nap in 0.2 ms
   slices until just before the expected end, then spin
   (`FusedOperator.__call__(spin_after_s=..., nap_s=0.0002)`).
+- **The first dispatch after new host buffers** takes ~0.15 s more (the driver maps them): a model's load ends with an
+  empty dispatch (sd15_v2 `V2Device.warm`), or its first step pays it.
 - **Overlap host work**: prepare the next chunk's inputs on a worker thread while the NPU runs
-  (gemma `NpuGemma.prompt`). A decode step's position patches (cache ranges, tails, token objects: ~0.15 ms of numpy)
+  (gemma `NpuGemma.prompt`); what depends only on a step's index (SD's per-step time biases, 2.6 ms of GEMVs) for all
+  steps before the first (`NpuUNet.prepare`, started before the text encoder). A decode step's position patches (cache ranges, tails, token objects: ~0.15 ms of numpy)
   for the next step while this one runs, on a second transaction buffer (`ModelOverlay.AHEAD`, `OverlayDevice.submit`
   / `wait`; a patched step runs only at its position and ring state); the embedding row in C++
   (`_native.dequant_rows`): Llama 1B's step 14.92 -> 14.75 ms.
