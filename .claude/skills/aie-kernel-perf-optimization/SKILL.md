@@ -64,6 +64,7 @@ traps).
 **Clock: 1.81 GHz** in turbo, under any load: seconds = cycles / 1.81e9. A window's counted cycles are its schedule
 plus stall cycles (memory, lock, stream), and the stall counters account for the difference exactly. When e2e
 exceeds busy / 1.81 GHz, find the stalls, the waits outside the windows or the DMA floor; never fit a multiplier.
+In the driver's default power mode a stalled core's counters stop: count in turbo (measuring.md "Which counters").
 
 ## 2. Rules for hot loops
 
@@ -294,6 +295,11 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   row's TileControl ports (a broadcast: one stream writes the 8 cores), while the cores wait for a command (above:
   never into a running core). 16 cores x 5.9 KB: ~7 µs (blockwrites ~130 µs). `sd15.runtime.role_code` links
   each role's ELF from a core's object (its main aliased in the linker script), `seq.Seq.role` switches.
+  A core can also page its own code, without the host: a 3-word control packet from its stream port (`put_ms`:
+  stream header, write of 1 word, value) to its memtile's TileControl pushes the page's BD on a memtile MM2S start
+  queue (0xA0634 for channel 0); the page's control packets end by setting a core lock the core waits on. 86 cycles
+  from request to the new code for a small page, + ~0.39 µs per KB of code (~2.15 B / cycle of packets: 4 data words
+  per 6). Call the page through a resident noinline function (aie2p-coding section 9: the acquire and the call).
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 
 Rejected size levers: rejected.md "Program memory".

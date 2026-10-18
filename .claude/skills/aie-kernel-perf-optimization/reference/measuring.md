@@ -114,6 +114,10 @@ Core module (AM029 `Performance_Control0/1`):
 
 - For memory stalls use `23 | 23` (MEMORY_STALL) in counter 1.
 - STREAM_STALL is 24 and CASCADE_STALL 25.
+- **Power mode**: in the driver's default mode (clock gating) a stalled core's counters stop: a core waiting 10 ms on
+  a lock counted a 0.02 M-cycle window and 0.2 M cycles of TRUE; in turbo the window was 18.5 M cycles (the lock
+  stall inside it) and the stall counters account for it. Count in turbo (`xrt-smi configure --pmode turbo` with no
+  context open, `default` after), above all for light loads (a few cores, long waits).
 - A start == stop pair counts occurrences for pulse events, and cycles for level events
   (stalls).
 

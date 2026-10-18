@@ -73,7 +73,9 @@ Manual conversion: `python -m artlite.profiling dump.ttbin <rtc_dir>/design.mlir
 
 Counter limits of the KMD (hence the 4-counter cap):
 - **Reading memtile counter registers ≥ 0x91030 hangs the KMD context permanently** (ETIME, then ENODEV; the NPU
-  needs a driver reload or a reboot).
+  needs a driver reload or a reboot). Reading core register 0x38004 (AM029's Core_Status offset) did the same, and the
+  driver reload then failed to start the NPU (SMU): a reboot. Read only registers the tools already read (core and
+  memory-module counters, lock values from 0x1F000, 0x32004, data memory).
 - Memtile per-task START->FINISHED window pairs count 0: use GROUP_DMA_ACTIVITY dwell and stall levels instead.
 - The 3rd start/stop control register (counters 4/5) silently ignores write32.
 

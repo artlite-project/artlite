@@ -40,7 +40,14 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   [AM027]; measured: control packets into a core running a loop never complete (the row's broadcast stalls).
 - Core load / store: two 512-bit load units + one 512-bit store unit, each with an AGU (2D / 3D addressing). [AM027]
 - Streams: one 32-bit input and one 32-bit output AXI4-Stream, plus 512-bit cascade streams (accumulator forwarding)
-  with a two-deep 512-bit FIFO on each side. [AM027]
+  with a two-deep 512-bit FIFO on each side. [AM027] Measured: a core port carries 4 B / cycle; `get_ss()` is
+  `mov rX, ss` on the load A slot and `put_ms` a store-slot `mov ms`, one word per instruction (no vector stream
+  access); a cascade read is `vmov.k dm, scd` on load A (4 per 2048-bit accumulator), a write `vmov mcd, bm` on the
+  store slot: the slots of an L1 C round trip (the ISA's `vaddmac.f dst, acc, scd, ...`, the cascade added inside the
+  MAC, has no Peano intrinsic). Both cascade directions carry >= 12 B / cycle. **In the driver's default power mode
+  core-to-core streams (one core's output port into another's input port) and the west-to-east cascade lost or
+  duplicated words under flow control**; in turbo 640 K words and 64 K cascade words were exact; DMA -> core port and
+  core port -> DMA are exact in both modes.
 - DMA channels per tile: compute and shim tiles 2 S2MM + 2 MM2S; memory tiles 6 S2MM + 6 MM2S. [AM027, GEMM-gen]
 - A core reads and writes its own data memory and its north, south and west neighbours' (shared data memory).
   [AM027, measured]
@@ -245,6 +252,10 @@ Silent wrong results:
 - `alignas()` does not work for `bfloat16` on AIE: use `__attribute__((aligned(64)))` (AGENTS.md: 64-byte alignment of
   128-byte loads).
 - `AIE_LOOP_IGNORE_MEM_DEPS` also drops the compiler's spill / reload ordering: a spilling loop computes garbage.
+- **A lock acquire before a call can land in the call's delay slots** (`jl p0` with `acq` in slot 4): the core
+  fetches the callee before the acquire completes, fatal when the wait is for that very code (pages written by
+  control packets: the core runs stale code and its fetch then blocks the writes). `__builtin_aie2p_sched_barrier()`
+  after the acquire, and the call through a resident noinline function.
 - **Jinja `trim_blocks`** eats the newline after a block tag: `{% endif %}` at the end of a line glues the next line
   onto it (e.g. `inline` onto a return type). Put block tags on their own lines and read the rendered `kernel.cc` in
   the cache dir.

@@ -16,7 +16,7 @@ by kernel II.
 | path | rate |
 |---|---|
 | a DMA channel, a stream-switch port | 64 bit per cycle = 8 B at 1.8 GHz = 14.4 GB/s (AM027) |
-| the core's own stream port | 32 bit (ObjectFifos do not use it) |
+| the core's own stream port | 4 B per cycle (7.2 GB/s) each way, ObjectFifos do not use it; the core spends an issue slot per 32-bit word (aie2p-coding section 2); a broadcast that includes a core port runs at its rate (a DMA consumer on it: 7.0 instead of 13.2 GB/s) |
 | a core's input DMA channel (S2MM) | 8 B per cycle: every consumer of a broadcast receives the whole stream at this rate |
 | one shim MM2S channel reading DDR alone | ~13.8 GB/s: 7.7 B per array cycle (its 8 B stream) |
 | one shim tile, both MM2S channels | ~27 GB/s: 15.5 B per cycle (the shim DMA's 128-bit AXI master, AM020) |
@@ -139,6 +139,16 @@ offsets): aie2p-coding section 8. For speed:
   pattern (`(a // 8, 2 n, a // 8, n_sb * a // 4)`-style dims) instead of n_sb tasks.
 - **Runtime-variable lengths cost nothing**: a scratchpad `length_parameter`, applied by the firmware at dispatch (256
   fills per token: no measurable cost).
+- **Several cores into one S2MM channel**: in out-of-order mode (IRON `DmaChannel(out_of_order=True)`; each sender's
+  BD inserts a header naming the receive BD) 4 cores sent into one memtile S2MM at 7.98 B / cycle, exact, freeing
+  three channels. A task is a packet count (1-256, Start_BD_ID ignored): re-arm it per round (the start queue word
+  `(packets - 1) << 16`); the receive BDs' count locks are 6-bit.
+- **Zero compression** (memtile MM2S compresses, S2MM decompresses; core tiles too; enabled by channel control bit 4
+  and BD bit 31 (memtile word 4), host-built BDs: mlir-aie does not expose it). Format: per 64-byte block two 32-bit
+  nonzero-byte masks (one per 32-byte half), then the nonzero bytes, padded to a multiple of 8 bytes. A decompressing
+  memtile S2MM writes faster than its stream: one shim channel delivered 15.5 / 20.9 / 28.3 GB/s of payload at 50 / 75
+  / 90% zero bytes (plain 11.4). Quantized weights have < 1% zero bytes (compressed 1.125x larger): only zero-rich
+  data gains.
 
 ## Task queues and transactions (host-built sequences)
 
