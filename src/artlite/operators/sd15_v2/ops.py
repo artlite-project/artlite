@@ -585,13 +585,14 @@ class Apply:
 @dataclass
 class Attention:
     """Attention of 8 heads of d 160 (16x16, 8x8) or 80 (32x32) over each image's keys, for the queries of tile ``tile``
-    (4 query panels of each image, 8 token panels; 8x8: one panel of each): row i of ``rows`` (in role a) runs the units
-    (image, head) of heads [h i, h i + h), h = 8 / len(rows), image-major. q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
+    (4 query panels of each image, 8 token panels; 8x8: one panel of each), or of d 40 (64x64, role c) for all of the
+    op's (16 query panels of each image, one op): row i of ``rows`` (in role a / c) runs the units (image, head) of heads
+    [h i, h i + h), h = 8 / len(rows), image-major. q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
     o: the output panels (the same layout); kv: the device address of the K / V^T slots ([image][head][group of
     keys][K | V^T]: d 160 groups of 32 keys, d 80 of 64), written by ``kv_drains``. Self-attention (keys = the image's
     tokens, of ``nbands`` ops of np token panels: band b's column c holds keys [(8 b + c) kpi, ..) of its image): an
     image's token panels in a column are 2 apart. Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last
-    group's keys from nkeys masked)."""
+    group's keys from nkeys masked). d 40: a key group's K and V^T in one slot."""
 
     np: int
     q: int
@@ -604,25 +605,29 @@ class Attention:
     rows: tuple[int, ...] = D.ATTN_ROWS
 
     def __post_init__(self) -> None:
-        assert self.d in (80, 160) and len(self.rows) in (2, 4)
+        assert self.d in (40, 80, 160) and len(self.rows) in (2, 4)
         self.hpr = 8 // len(self.rows)  # (heads per row)
         self.nd = self.d // 8  # (d-blocks of a head)
         self.gk = 4 if self.d == 160 else 8  # (key panels of a group)
         self.kpi = self.np // 2  # (an image's token panels in the op)
-        self.kpc = min(self.kpi, 4)  # (query panels of a unit: an op per tile keeps a core's sends and receives to two
-        # BDs each)
-        assert 8 * self.tile < self.np
+        self.kpc = 16 if self.d == 40 else min(self.kpi, 4)  # (query panels of a unit: an op per tile keeps a core's sends
+        # and receives to two BDs each)
+        self.role = "c" if self.d == 40 else "a"
+        self.slots = 1 if self.d == 40 else 2  # (B slots of a key group)
+        assert 8 * self.tile < self.np and (self.d != 40 or (self.kpi, self.tile) == (16, 0))
         keys = 8 * COLS * self.kpi * self.nbands
         self.ng = -(-(self.nkeys or keys) // (8 * self.gk))  # (key groups of an image)
         self.nk = self.nkeys - 8 * self.gk * (self.ng - 1) if self.nkeys else 8 * self.gk
-        assert self.kpc in (1, 4) and (self.d == 160 or self.kpc == 4), self.np
-        assert self.q + ((7 * self.nd + 32) * self.np + 8) * L.PANEL <= D.HEAP, "the last head's walk past the heap"
+        assert self.kpc in (1, 4, 16) and (self.d == 160 or self.kpc >= 4), self.np
+        assert self.q + ((7 * self.nd + (8 if self.d == 40 else 32)) * self.np + 8) * L.PANEL <= D.HEAP, \
+            "the last head's walk past the heap"
 
     def command(self) -> np.ndarray:
         cmd = np.zeros(D.Q // 4, np.int32)
         cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 2 * self.hpr, self.kpc, self.ng, self.nk,
                                                                              self.nd, self.gk)
-        cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
+        if self.d == 80:
+            cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
         return cmd.view(np.uint8)
 
     def col_ops(self) -> ColOps:
@@ -632,12 +637,13 @@ class Attention:
         co = ColOps()
         hstep, kb = self.nd * self.np * 18, self.np * 18  # (words: a head's kb, one kb)
         h = self.hpr
+        nkb = 8 if self.d == 40 else 32  # (the walk's d-blocks per pair: d 40 [pair 8][d-block 8 (5 used)][2])
         for i, r in enumerate(self.rows):
             sends, recvs = [], []
             for img in range(2):
                 p0 = (h * self.nd * i * self.np + 8 * self.tile + img) * L.PANEL
                 sends.append(MemTask([{"addr": self.q + p0, "nwords": D.A_OBJ // 4,
-                                       "dims": _dims((18, 1), (2, 36), (32, kb), (max(self.kpc // 2, 1), 72)),
+                                       "dims": _dims((18, 1), (2, 36), (nkb, kb), (max(self.kpc // 2, 1), 72)),
                                        "iteration": (hstep, h)}], repeat=h))
                 recvs.append(MemTask([{"addr": self.o + p0, "nwords": self.kpc * self.nd * 18,
                                        "dims": _dims((18, 1), (self.nd, kb), (self.kpc, 36)), "iteration": (hstep, h)}],
@@ -647,13 +653,13 @@ class Attention:
 
     def row_ops(self, cmd: int) -> dict[int, RowOps]:
         """The attention rows' B streams: the command, then per image its units' K / V^T slots (contiguous)."""
-        unit, h = self.ng * 2 * D.Q, self.hpr
+        unit, h = self.ng * self.slots * D.Q, self.hpr
         return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (8 * img + h * i) * unit, h * unit) for img in range(2)],
-                          b_objects=1 + 2 * h * 2 * self.ng, parity=self.kpc == 4, role="a")
+                          b_objects=1 + 2 * h * self.slots * self.ng, parity=self.kpc == 4, role=self.role)
                 for i, r in enumerate(self.rows)}
 
     def kv_bytes(self) -> int:
-        return 16 * self.ng * 2 * D.Q
+        return 16 * self.ng * self.slots * D.Q
 
     def kv_drains(self, k: int, vt: int, col: int, *, part: str = "kv", band: int = 0) -> ColOps:
         """Column ``col``'s drains of its keys' part of every slot (band ``band``'s: key panels kp0 .. of group g): from the
@@ -661,11 +667,20 @@ class Attention:
         [d-block pair][key panel][2]; per image a task of the 8 heads. part: "k" / "v": only K's / V^T's."""
         g, kp0 = divmod((band * COLS + col) * self.kpi, self.gk)
         hstep, kb = self.nd * self.np * 18, self.np * 18
-        unit = self.ng * 2 * D.Q  # (a head's slots in DDR)
+        unit = self.ng * self.slots * D.Q  # (a head's slots in DDR)
         co = ColOps()
         for img in range(2):
-            slot = self.kv + 8 * img * unit + g * 2 * D.Q
-            if self.kpi == self.gk:  # (the column's keys fill the group: whole slots)
+            slot = self.kv + 8 * img * unit + g * self.slots * D.Q
+            if self.d == 40:  # (the column's keys fill two groups: per head their K, their V^T parts of d-blocks 0..3
+                # ([d-block pair][key panel][2]) and of d-block 4 ([key panel])
+                assert self.kpi == 2 * self.gk
+                kw = _dims((18, 1), (2, 36), (5, kb), (8, 72))
+                kd = (slot, D.Q, (720, 2, 1440, 2880), (unit // 4, 8))
+                vws = [(0, _dims((18, 1), (2, kb), (16, 36), (2, 2 * kb)), (slot + D.Q // 2, 4 * 1152, (288, 2, 1440, 288),
+                                                                           (unit // 4, 8))),
+                       (4 * kb, _dims((18, 1), (16, 36)), (slot + D.Q // 2 + 2304, 2 * 576, (144, 2, 1440, 144),
+                                                          (unit // 4, 8)))]
+            elif self.kpi == self.gk:  # (the column's keys fill the group: whole slots)
                 kw, kd = _dims((18, 1), (2, 36), (self.nd, kb), (self.gk // 2, 72)), (slot, D.Q, None, (unit // 4, 8))
                 vw = _dims((18, 1), (2, kb), (self.gk, 36), (self.nd // 2, 2 * kb))
                 vd = (slot + D.Q, D.Q, None, (unit // 4, 8))
@@ -678,7 +693,11 @@ class Attention:
             if "k" in part:
                 co.drains.append(MemTask([{"addr": k + img * L.PANEL, "nwords": self.kpi * self.nd * 18, "dims": kw,
                                            "iteration": (hstep, 8)}], repeat=8, ddr=kd))
-            if "v" in part:
+            if "v" in part and self.d == 40:
+                for off, w, dd in vws:
+                    co.drains.append(MemTask([{"addr": vt + img * L.PANEL + 4 * off, "nwords": dd[1] // 4, "dims": w,
+                                               "iteration": (hstep, 8)}], repeat=8, ddr=dd))
+            elif "v" in part:
                 co.drains.append(MemTask([{"addr": vt + img * L.PANEL, "nwords": self.kpi * self.nd * 18, "dims": vw,
                                            "iteration": (hstep, 8)}], repeat=8, ddr=vd))
         return co

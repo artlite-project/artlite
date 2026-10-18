@@ -88,16 +88,23 @@ def gemm_weights(w: torch.Tensor, row: int, npass: int) -> np.ndarray:
 
 
 def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
-    """An attention's K / V^T slots of 8 heads of d 160 (groups of 32 keys) or 80 (groups of 64): k, v (2 images, keys,
-    8 d) -> [image][head][group][K slot [key block][d-block][2] | V^T slot [d-block pair][key panel][2]] (keys padded to
-    whole groups with zeros: ``ops.Attention`` masks them)."""
+    """An attention's K / V^T slots of 8 heads of d 160 (groups of 32 keys), 80 or 40 (groups of 64): k, v (2 images,
+    keys, 8 d) -> [image][head][group][K [key block][d-block][2] | V^T [d-block pair][key panel][2]] (d 40: V^T's
+    d-block 4 as [key panel] after the pairs', K and V^T one slot; keys padded to whole groups with zeros:
+    ``ops.Attention`` masks them)."""
     n, nd, gk = k.shape[1], d // 8, 4 if d == 160 else 8
     ng = -(-n // (8 * gk))
     kp = torch.zeros(2, 8 * gk * ng, 8 * d)
     vp = torch.zeros(2, 8 * gk * ng, 8 * d)
     kp[:, :n], vp[:, :n] = k.float(), v.float()
     kk = kp.reshape(2, ng, gk // 2, 2, 8, 8, nd, 8).permute(0, 5, 1, 2, 6, 3, 4, 7)  # i g kb kh j h db d -> i h g kb db kh j d
-    vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
+    if d == 40:  # ([d-block pair 2][key panel][2] of d-blocks 0..3, then [key panel] of d-block 4)
+        v4 = vp.reshape(2, ng, gk, 8, 8, nd, 8)  # i g kp j h db d
+        va = v4[..., :4, :].reshape(2, ng, gk, 8, 8, 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # -> i h g dp kp dh d j
+        vb = v4[..., 4, :].permute(0, 4, 1, 2, 5, 3)  # i g kp j h d -> i h g kp d j
+        vv = torch.cat([va.reshape(2, 8, ng, -1), vb.reshape(2, 8, ng, -1)], -1)
+    else:
+        vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
     kb_ = blocks(np.ascontiguousarray(kk.numpy())).reshape(2, 8, ng, -1)
     vb_ = blocks(np.ascontiguousarray(vv.numpy())).reshape(2, 8, ng, -1)
     return np.concatenate([kb_, vb_], axis=-1).reshape(-1)

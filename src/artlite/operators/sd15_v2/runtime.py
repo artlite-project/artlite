@@ -27,8 +27,9 @@ class Role:
     entry: int
 
 
-def _elf(path: str) -> tuple[dict[str, bytes], dict[str, int]]:
-    """An ELF32 file's sections and symbol values by name."""
+def _elf(path: str) -> tuple[dict[str, bytes], dict[str, int], dict[str, set[str]]]:
+    """An ELF32 file's sections, symbol values by name and, from .rela.text (a link with --emit-relocs), per function
+    the symbols its code refers to."""
     with open(path, "rb") as f:
         b = f.read()
     shoff, = struct.unpack_from("<I", b, 0x20)
@@ -39,38 +40,69 @@ def _elf(path: str) -> tuple[dict[str, bytes], dict[str, int]]:
         o = hdr[table][4] + off
         return b[o:b.index(b"\0", o)].decode()
     secs = {name(shstrndx, h[0]): b[h[4]:h[4] + h[5]] for h in hdr}
-    syms = {}
+    syms, table, funcs = {}, [], []
     for h in hdr:
         if h[1] == 2:  # (SHT_SYMTAB: entries of 16 bytes, names in the section h[6] links)
             for o in range(h[4], h[4] + h[5], 16):
-                st_name, st_value = struct.unpack_from("<II", b, o)
-                if st_name:
-                    syms[name(h[6], st_name)] = st_value
-    return secs, syms
+                st_name, st_value, st_size, st_info = struct.unpack_from("<IIIB", b, o)
+                nm = name(h[6], st_name) if st_name else ""
+                table.append(nm)
+                if nm:
+                    syms[nm] = st_value
+                    if st_info & 15 == 2:  # (STT_FUNC)
+                        funcs.append((st_value, st_value + st_size, nm))
+    refs: dict[str, set[str]] = {}
+    for h in hdr:
+        if h[1] == 4 and name(shstrndx, h[0]) == ".rela.text":  # (SHT_RELA: offset, info (symbol << 8 | type), addend)
+            for o in range(h[4], h[4] + h[5], 12):
+                off, info = struct.unpack_from("<II", b, o)
+                caller = next((f for lo, hi, f in funcs if lo <= off < hi), None)
+                if caller:
+                    refs.setdefault(caller, set()).add(table[info >> 8])
+    return secs, syms, refs
+
+
+def _stack_sizes(work_dir: str) -> dict[str, int]:
+    """The kernel's functions' stack bytes (clang's -fstack-usage: ``kernel.su``) by symbol."""
+    out = {}
+    with open(os.path.join(work_dir, "kernel.su")) as f:
+        for line in f:
+            loc, n, _ = line.rstrip("\n").split("\t")
+            out[loc.rsplit(":", 1)[-1]] = int(n)
+    return out
+
+
+def _depth(f: str, calls: dict[str, set[str]], su: dict[str, int], seen: tuple = ()) -> int:
+    """The deepest stack from function f down its calls."""
+    assert f not in seen, f"recursion through {f}"
+    return su.get(f, 0) + max((_depth(g, calls, su, seen + (f,)) for g in calls.get(f, ()) if g in su), default=0)
 
 
 def role_code(work_dir: str) -> dict[str, Role]:
     """Each role's code, from its ELF: core (0, 2)'s link with that role's main in place of its own (an alias in the
-    core's linker script; ``role_<x>.elf`` in the design's project directory). The shared code and the data are
-    identical in every role's ELF (asserted: the switch rewrites neither)."""
+    core's linker script; ``role_<x>.r.elf`` in the design's project directory). The shared code and the data are
+    identical in every role's ELF (asserted: the switch rewrites neither); a role's stack (the main loop's, every
+    role function's and the largest shared function's: a bound, aiecc checks only the design's own ELFs) fits."""
     prj = os.path.join(work_dir, "design.mlir.prj")
     stem = K.P.removeprefix(MARK)  # (the linked names: <stem>_<name>_<hash>)
     base = D.ROLE[0]
     own = os.path.join(prj, "elfs_main_core_0_2", "elfs_main_core_0_2.elf")
     mains = {r: next(n for n in _elf(own if r == base else os.path.join(work_dir, "kernel.o"))[1]
                      if n.startswith(f"{stem}_main_{r}_")) for r in K.ROLES}
+    own = os.path.join(prj, "role_base.r.elf")  # (the base role's ELF again, with the relocations: its call graph)
     elfs = {}
     for r in K.ROLES:
-        path = own if r == base else os.path.join(prj, f"role_{r}.elf")
+        path = own if r == base else os.path.join(prj, f"role_{r}.r.elf")
         if not os.path.exists(path):
             with open(os.path.join(prj, "ldScripts_main_core_0_2.ld.script")) as f:
-                script = f.read() + f"\n{mains[base]} = {mains[r]};\n"
+                script = f.read() + (f"\n{mains[base]} = {mains[r]};\n" if r != base else "")
             tmp = f"{path}.{os.getpid()}"
             with open(tmp + ".ld", "w") as f:
                 f.write(script)
             subprocess.run([os.path.join(PEANO_DIR, "bin", "clang"), "-O2", "--target=aie2p-none-unknown-elf",
                             "-fuse-ld=lld", os.path.join(prj, "objects_main_core_0_2", "objects_main_core_0_2.o"),
-                            "-Wl,--gc-sections", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld", "-o", tmp],
+                            "-Wl,--gc-sections", "-Wl,--emit-relocs", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld",
+                            "-o", tmp],
                            check=True)
             os.replace(tmp, path)
             os.remove(tmp + ".ld")
@@ -80,12 +112,19 @@ def role_code(work_dir: str) -> dict[str, Role]:
     end = start.pop()
     first = min(v for r in K.ROLES for n, v in elfs[r][1].items() if f"{stem}_" in n and v < end)  # (kernel.o's code)
     ref = elfs[base][0]
+    su = _stack_sizes(work_dir)
+    run = next(n for n in su if f"{stem}_run_" in n)
     out = {}
-    for r, (secs, syms) in elfs.items():
+    for r, (secs, syms, refs) in elfs.items():
         assert secs[".text"][first:end] == ref[".text"][first:end] and secs[".data"] == ref[".data"], r
+        entry = next(n for n in syms if f"{stem}_ext_{r}_" in n)
+        calls = dict(refs)
+        calls[run] = calls.get(run, set()) | {entry}  # (the main loop calls the role's entry through ext)
+
+        stack = _depth(mains[r], calls, su)
+        assert stack <= D.STACK, f"role {r}: its code's stack reaches {stack} B (the cores': {D.STACK})"
         code = secs[".text"][end:]
-        out[r] = Role(end, np.frombuffer(code + bytes(-len(code) % 4), np.uint32), syms[next(
-            n for n in syms if f"{stem}_ext_{r}_" in n)])
+        out[r] = Role(end, np.frombuffer(code + bytes(-len(code) % 4), np.uint32), syms[entry])
     return out
 
 
