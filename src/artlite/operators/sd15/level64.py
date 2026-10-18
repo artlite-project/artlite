@@ -1,4 +1,4 @@
-"""sd15_v2's 64x64 level (``build.Level(64, 4)``): bands of 2 rows per column, a row's tokens as two tiles (its even
+"""sd15's 64x64 level (``build.Level(64, 4)``): bands of 2 rows per column, a row's tokens as two tiles (its even
 groups, its odd: ``ops.Gemm`` il). The residual stream and the blocks' C tiles in DDR per band (``unet.DTensor``); a
 conv's input panels in DDR as the whole level's (``PImage``), from which each band's conv fills its rows and their halo
 rows (the neighbour bands' and columns', zeros past the image)."""
@@ -102,7 +102,7 @@ class PImage:
         assert -1 <= lo and hi <= R + 1
         bd.reading(self.name)  # (first: the deferred drains pushed, their bytes released)
         x = alloc(bd, self.lv, n, "pn", pnp=16 * (hi - lo), exact=True)
-        base = bd.v2.address(self.name) + c0 // 8 * R * ROW
+        base = bd.npu.address(self.name) + c0 // 8 * R * ROW
         zero = bd.zeros(nkb * ROW)
         kbx = (hi - lo) * ROW // 4  # (words: x's kb)
 

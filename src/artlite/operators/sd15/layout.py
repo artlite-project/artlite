@@ -1,4 +1,4 @@
-"""sd15_v2's memtile tensor layouts and their host packers (tests, the level boundaries' DDR images).
+"""sd15's memtile tensor layouts and their host packers (tests, the level boundaries' DDR images).
 
 Per column (its tokens: ``NP`` token panels of 8; a tile = the m tokens a core's C tile holds: panels 16 t .. for
 m = 128):

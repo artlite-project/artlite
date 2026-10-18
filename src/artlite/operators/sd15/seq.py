@@ -1,4 +1,4 @@
-"""Host-built transactions of sd15_v2's design (``design``): ops in program order, handed over by locks.
+"""Host-built transactions of sd15's design (``design``): ops in program order, handed over by locks.
 
 Per column an op is a set of memtile tasks: receives (S2MM r <- core r's outputs), sends (MM2S r -> core r), fills
 (DDR -> S2MM 4) and drains (MM2S 4 -> DDR); per row a run of B-stream reads (shim -> the row's cores). The handover:

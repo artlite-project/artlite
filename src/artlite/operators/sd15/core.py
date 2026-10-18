@@ -1,8 +1,8 @@
-"""The cores' program of sd15_v2's design (``design``): a C++ main reading commands from the row's B stream. The main
-loop (``v2_run``), GEMMs and convs are shared code; the other kinds are a role's code (``ROLES``: "a" attention of
+"""The cores' program of sd15's design (``design``): a C++ main reading commands from the row's B stream. The main
+loop (``sd15_run``), GEMMs and convs are shared code; the other kinds are a role's code (``ROLES``: "a" attention of
 d 80 / 160, "b" the applies, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512; together they
-do not fit 16 KB of program memory): a core of role x starts at ``v2_main_x``, which puts
-its role's entry (``v2_ext_x``) into the ext word and enters ``v2_run``. Each role's ELF holds the shared code first,
+do not fit 16 KB of program memory): a core of role x starts at ``sd15_main_x``, which puts
+its role's entry (``sd15_ext_x``) into the ext word and enters ``sd15_run``. Each role's ELF holds the shared code first,
 at the same addresses in every role's (the role code is what only its main reaches, placed after it): a role switch
 rewrites the program memory from there and the ext word (``runtime.role_code``, ``seq.Seq.role``).
 
@@ -15,8 +15,8 @@ core copies it into its workspace and releases the slot. Kinds:
   (m = C_M tokens, 64 or 16: an fp32 C tile, rounded to bf16 once after the residual); a conv (C_CONV, the tile = the
   column's tokens: C_R rows of groups, x = g + groups lane): per chunk of 64 input channels (C_NCH) an A object of its
   input band rows (the halo rows included) and per tap a B slot, in the host's tap order: the taps' A are the object's
-  groups or lane-shifted copies (``v2_shift``) of its edge groups, their MAC calls, walks and shift phases host-built
-  (``ops.Gemm.conv_words``, ``v2_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
+  groups or lane-shifted copies (``sd15_shift``) of its edge groups, their MAC calls, walks and shift phases host-built
+  (``ops.Gemm.conv_words``, ``sd15_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
   C; statistics of the result (C_STATS: GroupNorm group sums of the
   op (C_STF: carried over from / to the next op), LayerNorm per-token sums of a tile, each emitted as one output
   chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B; O_DS: its groups 0 and 2, a
@@ -63,7 +63,7 @@ CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk 
 C_PATS = C_CALLS + CALL * NCALL  # (the MAC's walks of B and C, a dims_3d_t each: a conv's, a GEMM's, attention's P V^T)
 C_WALKS = C_PATS - 7  # (a GEMM's and attention's P V^T: the MAC's walk of A)
 C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
-C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a v2_shift's offsets)
+C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a sd15_shift's offsets)
 SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
 ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a GroupNorm record continued from / kept for the next op: one record over several ops)
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
@@ -75,7 +75,7 @@ S_NONE, S_GN, S_LN = 0, 1, 2
 A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
-P = kernel_prefix("v2")  # (the kernels' names: ``kernel_source``)
+P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
 ROLES = ("a", "b", "c", "v")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
@@ -1330,7 +1330,7 @@ def group_inv(gsize: int) -> int:
 
 @functools.cache
 def shift_masks(joined: bool = False) -> bytes:
-    """``v2_shift``'s byte masks (``C_MASKS``): per byte of a 576-byte cycle (8 panels [kb][image 2]) 0xFF where kept
+    """``sd15_shift``'s byte masks (``C_MASKS``): per byte of a 576-byte cycle (8 panels [kb][image 2]) 0xFF where kept
     after a shift down (lane 0 of each panel cleared), then up (lane 7 cleared). joined: the two images are one image's
     halves side by side, a cut lane of image 1 down / image 0 up the pixel across the seam: only image 0's lane 0 (down)
     and image 1's lane 7 (up) cleared."""

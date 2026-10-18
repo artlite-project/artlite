@@ -1,4 +1,4 @@
-"""sd15_v2's VAE decoder (SD 1.x AutoencoderKL's): one image on the UNet's design, its left and right halves as the
+"""sd15's VAE decoder (SD 1.x AutoencoderKL's): one image on the UNet's design, its left and right halves as the
 design's two images (``build.Level`` half; the convs' joined shift masks carry the pixels across the seam).
 
 Levels (``LEVELS``): 64 px (a row = one tile of 4 groups: ``ops.Gemm`` rc; bands of 2 rows), 128 (two tiles a row,
@@ -25,7 +25,7 @@ from . import layout as L
 from .build import Builder, Level
 from .level64 import IL
 from .ops import Apply, Gemm
-from .runtime import V2Device
+from .runtime import Sd15Device
 from .seq import ColOps, MemTask, RowOps
 from .unet import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
 
@@ -216,7 +216,7 @@ class VImage:
         nr = hi - lo
         x = alloc(bd, self.lv, n, "pn", pnp=2 * npos * nr, exact=True)
         rp = self.rowp * 18
-        base = bd.v2.address(self.name) + c0 // 8 * R * rp * 4 + 4 * 36 * p0
+        base = bd.npu.address(self.name) + c0 // 8 * R * rp * 4 + 4 * 36 * p0
         zero = bd.zeros(nkb * nr * npos * 144)
         kbx, kbs, pw = 2 * npos * nr * 18, R * rp, npos * 36  # (words: x's kb, the image's kb, a row's positions)
 
@@ -270,7 +270,7 @@ def image_bytes(img: VImage, x: torch.Tensor) -> np.ndarray:
 
 def write(bd: Builder, img: VImage, x: torch.Tensor) -> None:
     img.base(bd)
-    bd.v2.write(img.name, image_bytes(img, x))
+    bd.npu.write(img.name, image_bytes(img, x))
 
 
 def fetch(bd: Builder, x: DTensor, b: int) -> tuple[Tensor, dict]:
@@ -278,7 +278,7 @@ def fetch(bd: Builder, x: DTensor, b: int) -> tuple[Tensor, dict]:
     pushed): the tensor and its fills (per column), for an op of their own or merged into the op before its use."""
     bd.reading(x.band(b))
     t = alloc(bd, x.lv, x.C, x.kind)
-    base = bd.v2.address(x.band(b))
+    base = bd.npu.address(x.band(b))
     t.rec = x.rec
     return t, {c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}], ddr=(base + c * x.nbytes, t.nbytes,
                                                                                          None))]) for c in range(COLS)}
@@ -418,10 +418,10 @@ def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
         bd.image(t.band(b), v)
 
 
-def read_dtensor(v2: V2Device, t: DTensor, ch: Chans) -> torch.Tensor:
+def read_dtensor(npu: Sd15Device, t: DTensor, ch: Chans) -> torch.Tensor:
     """t's real channels as (1, C, H, H)."""
     lv, P, ct = t.lv, ch.P, L.ct_bytes(64)
-    raw = np.stack([v2.read(t.band(b), COLS * t.nbytes) for b in range(lv.nb)]).reshape(lv.nb, COLS, P // 80, lv.ntile, ct)
+    raw = np.stack([npu.read(t.band(b), COLS * t.nbytes) for b in range(lv.nb)]).reshape(lv.nb, COLS, P // 80, lv.ntile, ct)
     v = torch.from_numpy(np.ascontiguousarray(raw[..., :64 * 160])).view(torch.bfloat16)
     y = v.reshape(lv.nb, COLS, P // 80, lv.ntile, 8, 10, 8, 8).permute(1, 0, 3, 4, 6, 2, 5, 7)  # col band t rb tok cb80 cb ch
     return from_tokens(ch.unpad(y.float().reshape(COLS, -1, P)), lv)
@@ -567,12 +567,12 @@ def decoder(bd: Builder, w: dict, lat: VImage, *, scale: float, eps: float, name
 
 
 class Decoder:
-    """The VAE decoder on a V2Device as one dispatch: ``self(latents)``, the sampler's latents (1, 4, 64, 64) -> the
+    """The VAE decoder on a Sd15Device as one dispatch: ``self(latents)``, the sampler's latents (1, 4, 64, 64) -> the
     image (1, 3, 512, 512) in about [-1, 1]. Weights by diffusers name (``decoder.*``, ``post_quant_conv.*``)."""
 
-    def __init__(self, v2: V2Device, w: dict, *, scale: float, eps: float = 1e-6):
-        self.v2 = v2
-        bd = Builder(v2)
+    def __init__(self, npu: Sd15Device, w: dict, *, scale: float, eps: float = 1e-6):
+        self.npu = npu
+        bd = Builder(npu)
         self.lat = VImage(64, "vae.lat", L64)
         self.lat.base(bd)
         decoder(bd, w, self.lat, scale=scale, eps=eps, name="vae.out")
@@ -582,22 +582,22 @@ class Decoder:
 
     def state(self) -> dict:
         """What ``restored`` needs besides the device's images (the transaction's shim addresses as relocations)."""
-        return {"lat": self.lat, "words": self.words, "rel": self.v2.relocations(self.addrs)}
+        return {"lat": self.lat, "words": self.words, "rel": self.npu.relocations(self.addrs)}
 
     @classmethod
-    def restored(cls, v2: V2Device, state: dict) -> "Decoder":
-        """A Decoder of ``state()`` on a device whose images were restored (``V2Device.restore``)."""
+    def restored(cls, npu: Sd15Device, state: dict) -> "Decoder":
+        """A Decoder of ``state()`` on a device whose images were restored (``Sd15Device.restore``)."""
         d = cls.__new__(cls)
-        d.v2, d.tr, d.lat = v2, None, state["lat"]
-        d.words = v2.relocate(state["words"], state["rel"])
+        d.npu, d.tr, d.lat = npu, None, state["lat"]
+        d.words = npu.relocate(state["words"], state["rel"])
         return d
 
     def __call__(self, lat: torch.Tensor) -> torch.Tensor:
         if self.tr is None:
-            self.tr = Transaction(self.v2.dev, self.words)
-        self.v2.write(self.lat.name, image_bytes(self.lat, latents(lat)))
-        self.v2.run(self.tr)
-        return image(self.v2.read("vae.out"))
+            self.tr = Transaction(self.npu.dev, self.words)
+        self.npu.write(self.lat.name, image_bytes(self.lat, latents(lat)))
+        self.npu.run(self.tr)
+        return image(self.npu.read("vae.out"))
 
 
 GK = 16  # (keys of a d-512 attention's group: four B slots)

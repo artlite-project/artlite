@@ -42,9 +42,9 @@ def _qwen(path: str) -> None:
 
 
 def _sd15(path: str) -> None:
-    from artlite.operators.sd15_v2.design import V2Design
+    from artlite.operators.sd15.design import Sd15Design
 
-    parallel_compile.compile_all([V2Design()])
+    parallel_compile.compile_all([Sd15Design()])
 
 
 APPS: dict[str, tuple[str, Callable[[str], None]]] = {

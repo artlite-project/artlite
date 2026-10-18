@@ -109,7 +109,7 @@ class StableDiffusion:
 
     name = "Stable Diffusion 1.5"
 
-    def __init__(self, path: str, *, backend: str = "cpu"):
+    def __init__(self, path: str, *, backend: str = "npu"):
         check_pipeline(path)
         self.tokenizer = ClipTokenizer(os.path.join(path, "tokenizer"))
         self.schedule = Schedule.from_config(os.path.join(path, "scheduler", "scheduler_config.json"))

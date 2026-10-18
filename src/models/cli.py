@@ -61,7 +61,7 @@ def arg_parser() -> argparse.ArgumentParser:
     img.add_argument("-o", "--output", default="output.png", help="the PNG file to write (default: output.png)")
     img.add_argument("-W", "--width", type=int, default=512, help="image width (512 only for now)")
     img.add_argument("-H", "--height", type=int, default=512, help="image height (512 only for now)")
-    img.add_argument("--backend", choices=BACKENDS, default="cpu", help="what runs the networks (default: cpu)")
+    img.add_argument("--backend", choices=BACKENDS, default="npu", help="what runs the networks (default: npu)")
     return p
 
 

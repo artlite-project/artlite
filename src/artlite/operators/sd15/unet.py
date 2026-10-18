@@ -1,4 +1,4 @@
-"""sd15_v2's UNet blocks on a ``build.Builder`` (resnets, transformers, down / upsampling of the 32x32 .. 8x8 levels;
+"""sd15's UNet blocks on a ``build.Builder`` (resnets, transformers, down / upsampling of the 32x32 .. 8x8 levels;
 the banded transformer the 64x64 level's too: ``level64``).
 
 A block takes its input with the GroupNorm records its first norm needs and returns its output the same way (records in
@@ -361,7 +361,7 @@ class DTensor:
         off = self.lv.ct(c0) if c0 else 0
         assert self.kind == "ct" or not c0
         bd.reading(self.band(b))
-        base = bd.v2.address(self.band(b))
+        base = bd.npu.address(self.band(b))
         bd.op({c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
                                         ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}, {})
         t.rec = self.rec
@@ -494,7 +494,7 @@ def upsample_bands(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int,
     bd.op(bd.spill(name + ".up", px.addr, nb), {})
     bd.ddr_sync()
     free(bd, px)
-    src = bd.v2.address(name + ".up")
+    src = bd.npu.address(name + ".up")
     wc, bc = w[p + "conv.weight"], w[p + "conv.bias"]
     N = wc.shape[0]
     out = DTensor(lv, N, name)
@@ -700,7 +700,7 @@ def upsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] 
     bd.ddr_sync()
     free(bd, px)
     u = alloc(bd, lv2, x.C, "pn")
-    base = bd.v2.address(p + "up")
+    base = bd.npu.address(p + "up")
     cols = {c: ColOps(fills=[MemTask([{"addr": u.addr + (2 * r + g) * 2 * L.PANEL, "nwords": nb // 4,
                                        "dims": [(36, 1), (x.C // 8, lv2.np * 18)]}], ddr=(base + c * nb, nb, None))
                              for r in range(2) for g in range(2)]) for c in range(COLS)}

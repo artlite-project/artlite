@@ -1,4 +1,4 @@
-"""Stable Diffusion 1.5 with the UNet and the VAE decoder on the NPU (models.sd15.npu, artlite.operators.sd15_v2): one
+"""Stable Diffusion 1.5 with the UNet and the VAE decoder on the NPU (models.sd15.npu, artlite.operators.sd15): one
 UNet step and one decode against the fp32 reference, and text to image against the CPU backend. Slow: building them
 writes their weight images and builds their transactions."""
 
@@ -30,7 +30,7 @@ def npu_unet(model_dir: str) -> NpuUNet:
 
 @pytest.fixture(scope="module")
 def npu_vae(model_dir: str, npu_unet: NpuUNet) -> NpuVae:
-    return NpuVae(f"{model_dir}/vae", npu_unet.net.v2)
+    return NpuVae(f"{model_dir}/vae", npu_unet.net.npu)
 
 
 def test_unet_step(model_dir: str, npu_unet: NpuUNet) -> None:

@@ -98,7 +98,7 @@ Violating any of these usually costs more than any micro-tuning gains.
   MMUL results. An `aie::accum` constant (e.g. a MAC's init value) takes a `dm` too; prefer a `vector` constant with
   `aie::mac(acc, v, c)` where you can. A 64-lane bf16 vector takes two of the 12 `x`: an elementwise loop with four
   replicated coefficient vectors spilled at 64 lanes a step (II 26-30 per 64) and runs at II 8 per 32 lanes
-  (sd15_v2's GroupNorm rows).
+  (sd15's GroupNorm rows).
 - **Short conversion chains**: convert directly (`aie::to_float`, `accum<accfloat>(v).to_vector<bfloat16>()`); fold
   power-of-two scales into the SRS shift (`to_vector<T>(shift)`); reduce in the native type and convert the scalar
   result.
@@ -219,15 +219,15 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   tile in another region (`pingpong`, alternating k-tiles) removes it: free where the operator has one anyway
   (gate/up's epilogue scratch), not worth a C object's double buffering where it does not (rejected.md). Or one C tile
   across two regions (its halves at 0x4000 -/+ half) walked so that consecutive blocks alternate halves (`pats` walks:
-  band pairs (0, 2), (1, 3) block by block): sd15_v2's fp32 C at m = 64, conflicts in the C regions 15.9K -> 0.4K
+  band pairs (0, 2), (1, 3) block by block): sd15's fp32 C at m = 64, conflicts in the C regions 15.9K -> 0.4K
   cycles per 1280 x 1280 GEMM op, the op -8%. It needs a two-stage loop (NS 2): with NS 3 a block's stores meet the
   loads two blocks later.
 - **An object read in two parts, each part paired with another stream** (an m-64 A object's two k-tiles, each against
   its own B slot): split it over two regions (two chained BDs: aie2p-coding section 8) so that part j sits in region
   2 + j, and keep the other stream's parity (the op's command in B slot 0, so that k-tile i is in B slot (i + 1) % 2).
-  sd15_v2's 16x16 GEMM: memory stall 7.6 -> 3.6 us, -12% per op; with the parity off by one every k-tile conflicts.
+  sd15's 16x16 GEMM: memory stall 7.6 -> 3.6 us, -12% per op; with the parity off by one every k-tile conflicts.
   Where one object feeds several calls (a conv's rows, in two regions), order the calls so that their regions
-  alternate with the B slots (sd15_v2 `Gemm.ORDER2`, rotated by one in odd chunks of 9 taps: memory stall -37%).
+  alternate with the B slots (sd15 `Gemm.ORDER2`, rotated by one in odd chunks of 9 taps: memory stall -37%).
 - **A bank annotation is also a scheduling hint**: the fp32-C MAC with its second 8-row panel's C loads annotated as
   bank b (the same addresses, still on slot A: machine-model.md) pipelines at II 41 instead of 43 (`render_mac(c2_bank=)`;
   the stores annotated too, or every load: not pipelined or II 43-44). Sweep annotations like pragmas.
@@ -287,12 +287,12 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
   sub-block); a table activation (`act_lut`) instead of a polynomial chain: smaller and faster.
 - No runtime-library arithmetic (`checks.py` warns when a kernel calls it).
-- **Roles: code variants rewritten at run time** (a static design whose kernels do not fit 16 KB together, sd15_v2):
+- **Roles: code variants rewritten at run time** (a static design whose kernels do not fit 16 KB together, sd15):
   every role's ELF holds the shared code (main loop, GEMMs) first, at the same addresses, and the role's code after
   it (what only its entry reaches); the main loop calls role code through a pointer in data memory. A switch rewrites
   that tail and the pointer by control packets: one packet flow per core row from a free shim MM2S channel to the
   row's TileControl ports (a broadcast: one stream writes the 8 cores), while the cores wait for a command (above:
-  never into a running core). 16 cores x 5.9 KB: ~7 µs (blockwrites ~130 µs). `sd15_v2.runtime.role_code` links
+  never into a running core). 16 cores x 5.9 KB: ~7 µs (blockwrites ~130 µs). `sd15.runtime.role_code` links
   each role's ELF from a core's object (its main aliased in the linker script), `seq.Seq.role` switches.
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 

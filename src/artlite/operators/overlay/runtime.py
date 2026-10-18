@@ -1,5 +1,5 @@
 """Host-side runtime of the designs that run on host-built transactions (``artlite.txn``): the decode overlays
-(``overlay.decode`` and its models'), sd15_v2's design.
+(``overlay.decode`` and its models'), sd15's design.
 
 ``Sequence`` turns a list of DMA transfers (fills of a column's input streams, drains of its output streams) into
 the transaction of a dispatch; ``sync`` closes a group of transfers that must complete before the next group is

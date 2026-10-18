@@ -1,4 +1,4 @@
-"""Building sd15_v2 programs: a dispatch's ops (``seq.Seq``) with their DDR images (commands, weights, tables), the
+"""Building sd15 programs: a dispatch's ops (``seq.Seq``) with their DDR images (commands, weights, tables), the
 memtile allocation (the same addresses in every column) and the GroupNorm records' routes.
 
 Tensors of a level (``Level``): C tiles (bf16, ``layout.ct_bytes`` per 80 channels: a residual stream, a norm's
@@ -22,7 +22,7 @@ from . import core as K
 from . import design as D
 from . import layout as L
 from .ops import Apply, Gemm, gn_window
-from .runtime import V2Device
+from .runtime import Sd15Device
 from .seq import B_BDS, ColOps, MemTask, RowOps
 
 TBIAS, TBIAS_BYTES = "_tbias", 64 * 1024  # (the time-biased convs' command biases: [op][row][passes 80 bf16])
@@ -134,11 +134,11 @@ class Builder:
     """A dispatch under construction: ``ops`` in order, DDR images by name (``image``), the memtile (``mem``), the
     activation table each core row holds."""
 
-    v2: V2Device
+    npu: Sd15Device
     mem: Mem = field(default_factory=Mem)
 
     def __post_init__(self) -> None:
-        self.s = self.v2.seq()
+        self.s = self.npu.seq()
         self.tab: dict[int, str | None] = dict.fromkeys(range(ROWS))
         self.tables: dict[str, np.ndarray] = {}
         self.zero = self.mem.alloc(4096)  # (zeros: a conv's halo rows at the image's edges)
@@ -163,15 +163,15 @@ class Builder:
         h = hash(data.tobytes())
         assert self._images.setdefault(name, h) == h, f"DDR image {name!r} written again with other data"
         self.ddr(name, data.size)
-        self.v2.write(name, data)
-        return self.v2.address(name)
+        self.npu.write(name, data)
+        return self.npu.address(name)
 
     def ddr(self, name: str, nbytes: int) -> int:
         """The device address of DDR image ``name`` of nbytes (a name this dispatch took with fewer bytes is an error:
         ops pushed so far read that image)."""
         assert self._ddr.setdefault(name, nbytes) >= nbytes, f"DDR image {name!r} of {self._ddr[name]} B asked for {nbytes} B"
-        self.v2.alloc(name, nbytes)
-        return self.v2.address(name)
+        self.npu.alloc(name, nbytes)
+        return self.npu.address(name)
 
     # -- ops
     def op(self, cols: dict[int, ColOps], rows: dict[int, RowOps], *, barrier: bool = False, nolock: bool = False,
@@ -242,7 +242,7 @@ class Builder:
     def load(self, name: str, addr: int, nbytes: int) -> dict[int, ColOps]:
         """Fills of DDR image ``name`` ([col][nbytes]) into the memtile at addr (merge into an op)."""
         self.reading(name)
-        base = self.v2.address(name)
+        base = self.npu.address(name)
         return {c: ColOps(fills=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * nbytes, nbytes, None))])
                 for c in range(COLS)}
 
@@ -319,10 +319,10 @@ class Builder:
             off = self.tb_used
             self.tb_used += ROWS * nb
             assert self.tb_used <= TBIAS_BYTES
-            tb = self.v2.address(TBIAS)
+            tb = self.npu.address(TBIAS)
             for r, ro in rows.items():
                 (a, n), *more = ro.runs  # (more: the weights again per further tile)
-                self.v2.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
+                self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
                 ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
             self.tb_hooks.append((tbias, off, torch.cat([g._rows(r) for r in range(ROWS)]).numpy()))
         co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
@@ -413,13 +413,13 @@ class Builder:
 
     def zeros(self, nbytes: int) -> int:
         """The device address of nbytes of zeros in DDR (one image of the largest size asked)."""
-        self.v2.alloc("_zddr", nbytes)
-        return self.v2.address("_zddr")
+        self.npu.alloc("_zddr", nbytes)
+        return self.npu.address("_zddr")
 
     def zeros_q(self) -> int:
-        if not self.v2.has("_zq"):
+        if not self.npu.has("_zq"):
             self.image("_zq", np.zeros(D.Q, np.uint8))
-        return self.v2.address("_zq")
+        return self.npu.address("_zq")
 
     def finish(self) -> np.ndarray:
         """The dispatch's transaction words (``seq.Seq.finish``), the drains still pending pushed first."""
@@ -428,7 +428,7 @@ class Builder:
         return self.s.finish()
 
     def transaction(self):
-        return Transaction(self.v2.dev, self.finish())
+        return Transaction(self.npu.dev, self.finish())
 
     @property
     def images(self) -> list[str]:

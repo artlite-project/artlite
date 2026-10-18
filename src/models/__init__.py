@@ -12,7 +12,7 @@ with a web chat).
 | ``llama`` | ``llama3`` | Llama 3.2 1B / 3B, Llama 3.1 8B |
 | ``gemma4`` | ``gemma4`` | Gemma 4 E4B |
 | ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 (Gated DeltaNet and full-attention layers) |
-| ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (CPU backend; NPU: the UNet) |
+| ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 
 from __future__ import annotations

@@ -184,7 +184,7 @@ Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, BFP16 for BF16 / F16 tensors); t
 tiles (``gemm/``: GemmQ, GemmQd, their MAC loop); the decode overlay run by host-built transactions
 (``overlay/``: GEMV cores, the KV record format, the attention core of Gemma and Llama, the models' shared host
 side); the prefill's chunk programs, GEMM planner, norms and attention (``prefill/``); the models' own operators
-(``llama/``: weight image, decode overlay, prefill; ``qwen35/``; ``gemma4/``; ``sd15_v2/``).
+(``llama/``: weight image, decode overlay, prefill; ``qwen35/``; ``gemma4/``; ``sd15/``).
 
 Build-time checks (``operators/checks.py``, every compile): kernel stack depth vs
 each core's ``stack_size``, kernel signatures vs the design's declarations, and a

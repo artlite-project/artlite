@@ -8,7 +8,7 @@ options follow llama.cpp's `llama-cli` where it has an equivalent, the image opt
 artlite-cli -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
     -p "Factorize x^2 + x - 6 = 0"
 artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "a photograph of an astronaut riding a horse" \
-    --backend npu -o astronaut.png
+    -o astronaut.png
 ```
 
 `-m` (required) is a GGUF file or a diffusers directory, or a path relative to the models directory
@@ -60,4 +60,4 @@ A diffusers directory as `-m` generates a 512x512 PNG ([Stable Diffusion 1.5](mo
 | `-s SEED`, `--seed` | the noise's seed (default 1608560892) |
 | `-o FILE`, `--output` | the PNG file (default `output.png`) |
 | `-W N`, `--width`; `-H N`, `--height` | image size (512 only for now) |
-| `--backend NAME` | `cpu` (default: every network in fp32 torch) or `npu` (the UNet on the NPU) |
+| `--backend NAME` | `npu` (default: the UNet and the VAE decoder on the NPU) or `cpu` (every network in fp32 torch) |

@@ -1,4 +1,4 @@
-"""SD 1.x's UNet step on sd15_v2's design (``UNet``): one dispatch from the latents to the predicted noise, every level
+"""SD 1.x's UNet step on sd15's design (``UNet``): one dispatch from the latents to the predicted noise, every level
 on the design (64x64: ``level64``; 32x32 .. 8x8: ``unet.outer``), its weights in DDR images.
 
 Per step the host writes the latents (conv_in's PImage, ``level64.latent_panels``) and the resnets' time biases
@@ -18,7 +18,7 @@ from . import layout as L
 from .build import TBIAS, Builder, Level
 from .level64 import LV64, PImage, conv_in64, conv_out64, down64, latent_panels, noise, resnet64, resnet_cat64, up64
 from .ops import Attention
-from .runtime import V2Device
+from .runtime import Sd15Device
 from .unet import CTX_KEYS, DTensor, outer, skip_bands, transformer_bands
 
 
@@ -54,15 +54,15 @@ def unet(bd: Builder, w: dict, lat: PImage, *, biases: dict[str, torch.Tensor], 
 
 
 class UNet:
-    """The UNet step (``unet``) as one dispatch on a V2Device: ``__call__(x)`` (the scaled latents (2, 4, 64, 64)) ->
+    """The UNet step (``unet``) as one dispatch on a Sd15Device: ``__call__(x)`` (the scaled latents (2, 4, 64, 64)) ->
     the predicted noise; per step the resnets' time biases (``set_time``), per prompt the context (``set_context``)."""
 
     PREFIXES = [f"down_blocks.{i}.attentions.{j}." for i in range(3) for j in range(2)] + ["mid_block.attentions.0."] + \
         [f"up_blocks.{i}.attentions.{j}." for i in (1, 2, 3) for j in range(3)]
 
-    def __init__(self, v2: V2Device, w: dict, *, eps: float):
-        self.v2, self.w = v2, w
-        bd = self.bd = Builder(v2)
+    def __init__(self, npu: Sd15Device, w: dict, *, eps: float):
+        self.npu, self.w = npu, w
+        bd = self.bd = Builder(npu)
         lat = self.lat = PImage(64, "lat")
         bd.ddr(lat.name, COLS * lat.colbytes)  # (zeros: per step only its first kb written)
         lv32 = Level(32, 2)
@@ -85,15 +85,15 @@ class UNet:
     def state(self) -> dict:
         """What ``restored`` needs besides the device's images: the transaction (its shim addresses as relocations),
         the latents' image, the time biases' places."""
-        return {"words": self.words, "rel": self.v2.relocations(self.addrs), "lat": self.lat, "tb_used": self.tb_used,
+        return {"words": self.words, "rel": self.npu.relocations(self.addrs), "lat": self.lat, "tb_used": self.tb_used,
                 "tb_hooks": self.tb_hooks}
 
     @classmethod
-    def restored(cls, v2: V2Device, w: dict, state: dict) -> "UNet":
-        """A UNet of ``state()`` on a device whose images were restored (``V2Device.restore``); w: the RUNTIME weights."""
+    def restored(cls, npu: Sd15Device, w: dict, state: dict) -> "UNet":
+        """A UNet of ``state()`` on a device whose images were restored (``Sd15Device.restore``); w: the RUNTIME weights."""
         net = cls.__new__(cls)
-        net.v2, net.w, net.tr = v2, w, None
-        net.words = v2.relocate(state["words"], state["rel"])
+        net.npu, net.w, net.tr = npu, w, None
+        net.words = npu.relocate(state["words"], state["rel"])
         net.lat, net.tb_used, net.tb_hooks = state["lat"], state["tb_used"], state["tb_hooks"]
         return net
 
@@ -108,17 +108,17 @@ class UNet:
         buf = np.empty(self.tb_used // 2, bfloat16)
         for p, off, rows in self.tb_hooks:
             buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p]).numpy()[rows]
-        self.v2.write(TBIAS, buf)
+        self.npu.write(TBIAS, buf)
 
     def set_context(self, ctx: torch.Tensor, pool: Executor | None = None) -> None:
         """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768) (pool: computed on its threads)."""
         for p, v in zip(self.PREFIXES, (pool.map if pool else map)(lambda p: self._ctx(p, ctx), self.PREFIXES), strict=True):
-            self.v2.write(p + "ctx", v)
+            self.npu.write(p + "ctx", v)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         for c, p in enumerate(latent_panels(x)):
-            self.v2.write(self.lat.name, p, c * self.lat.colbytes)
+            self.npu.write(self.lat.name, p, c * self.lat.colbytes)
         if self.tr is None:
-            self.tr = Transaction(self.v2.dev, self.words)
-        self.v2.run(self.tr)
-        return noise(self.v2.read("out"))
+            self.tr = Transaction(self.npu.dev, self.words)
+        self.npu.run(self.tr)
+        return noise(self.npu.read("out"))

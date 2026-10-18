@@ -187,13 +187,13 @@ BDs:
   slices of 128 B per row = 1024 words) goes as sub-units of 16 rows: the memtile then receives [sub-unit][tile][row
   16], and the consumer reads its rows in that order (`GemmQOperator.us`, the Q4 slot's dequant row permutation).
 - A core-tile BD takes no lock or exactly one acquire and one release (aiecc). A buffer filled by two BDs in turn (an
-  object split over two L1 regions: sd15_v2's `design.R23`): the first acquires the free lock and releases a lock only
+  object split over two L1 regions: sd15's `design.R23`): the first acquires the free lock and releases a lock only
   the DMA uses, the second acquires that one and releases the full lock.
 - Core BD sizes are at most 255 per dimension, and IRON coalesces contiguous tap dimensions first (a [2, 9, 128] walk
   of 1152-word runs becomes [2, 1152]: "Size may not exceed 255"). A long contiguous run is a length-only BD (rank 1,
   stride 1): split a buffer into one BD per run instead.
 - A memtile walk that reads past the 512 KB memtile hangs the dispatch (TDR, no error): e.g. a tensor at the heap's
-  top whose consumer reads whole fixed-size objects past its end (sd15_v2's GEMM residual reads; `Gemm` asserts it).
+  top whose consumer reads whole fixed-size objects past its end (sd15's GEMM residual reads; `Gemm` asserts it).
 - A chained fill of more BDs costs shim BD ids: keep a column's chains within 14 BDs (`b_chain` asserts it).
 - Shim BD iteration (word 6): `Iteration_Current` 31:26, `Iteration_Wrap` 25:20 = count - 1, `Iteration_Stepsize`
   19:0 = words - 1; a repeated task advances its base address per execution: one BD writes nh x nph consecutive
@@ -233,7 +233,7 @@ Silent wrong results:
 - **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
   (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
 - **A 2048-bit vector (`aie::store_v` / `load_v` of 64 fp32) at an address 32-B but not 64-B aligned** is accessed 32 B
-  lower (the low address bits dropped): its stores overwrite the 32 B before the buffer (sd15_v2's d-80 attention
+  lower (the low address bits dropped): its stores overwrite the 32 B before the buffer (sd15's d-80 attention
   scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B boundaries.
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
   array) reads garbage (NaN state), and so does a `seek` to such a position (a rewind by a panel count not a multiple

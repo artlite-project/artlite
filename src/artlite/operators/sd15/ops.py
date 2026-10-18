@@ -1,4 +1,4 @@
-"""sd15_v2's layers as ops of the sequencer (``seq``): per column its memtile tasks, per row its B stream.
+"""sd15's layers as ops of the sequencer (``seq``): per column its memtile tasks, per row its B stream.
 
 ``Gemm``: y = x W^T + b (+ a residual) for every column's tokens (``ntile`` tiles of m). Core (c, r) computes row r's
 N / 4 output channels in passes of 80. Memtile tasks per column: per core one send per tile (a BD per pass: the
@@ -211,7 +211,7 @@ class Gemm:
         return list(self.ORDER2[c % 2:]) + list(self.ORDER2[:c % 2])
 
     def conv_words(self) -> np.ndarray:
-        """The conv's command words from ``core.C_CALLS`` (``core``'s v2_conv): per tap (dy, dx) of the order its MAC
+        """The conv's command words from ``core.C_CALLS`` (``core``'s sd15_conv): per tap (dy, dx) of the order its MAC
         calls (the bands (g, r), g-major, each group's source: object row r conv + dy's group conv g + dx - 1 (its
         byte offset: ``design.a_byte``), or a lane-shifted copy in cbuf (the phase's: a row's last group one lane down,
         its group 0 one lane up); a call per group where the two sources' row strides differ), the B and C walks, the

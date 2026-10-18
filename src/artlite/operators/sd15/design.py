@@ -1,4 +1,4 @@
-"""sd15_v2's static design: compiled once, run by host-built transactions (``seq``) for all of the UNet's levels.
+"""sd15's static design: compiled once, run by host-built transactions (``seq``) for all of the UNet's levels.
 
 Array roles (column c, core row r):
 - column c holds a token tile's activations in its memtile: every channel of its tokens;
@@ -107,7 +107,7 @@ def mem_bd_pool(ch: int) -> tuple[int, ...]:
     return tuple(range(base, base + 8))
 
 
-class V2Design(ArtcOperator):
+class Sd15Design(ArtcOperator):
     """The static design. Its runtime sequence is a probe (never run: the transactions are built on the host) whose
     tasks make aiecc route the memtiles' task-complete tokens; ``check_endpoints`` checks the shim channels."""
 
@@ -134,39 +134,39 @@ class V2Design(ArtcOperator):
         mems = [Tile(c, 1) for c in range(COLS)]
         shims = [Tile(c, 0) for c in range(COLS)]
         cores = [[Tile(c, r + 2) for r in range(ROWS)] for c in range(COLS)]
-        heap = [Buffer(type=ty(HEAP), tile=mems[c], name=f"v2_heap_{c}", address=0) for c in range(COLS)]
-        d_in = [Flow(shims[c], mems[c], src_channel=0, dst_channel=4, name=f"v2_din{c}") for c in range(COLS)]
-        d_out = [Flow(mems[c], shims[c], src_channel=4, dst_channel=0, name=f"v2_dout{c}") for c in range(COLS)]
-        b = [Flow(shims[B_SHIM[r]], [cores[c][r] for c in range(COLS)], src_channel=1, name=f"v2_b{r}")
+        heap = [Buffer(type=ty(HEAP), tile=mems[c], name=f"sd15_heap_{c}", address=0) for c in range(COLS)]
+        d_in = [Flow(shims[c], mems[c], src_channel=0, dst_channel=4, name=f"sd15_din{c}") for c in range(COLS)]
+        d_out = [Flow(mems[c], shims[c], src_channel=4, dst_channel=0, name=f"sd15_dout{c}") for c in range(COLS)]
+        b = [Flow(shims[B_SHIM[r]], [cores[c][r] for c in range(COLS)], src_channel=1, name=f"sd15_b{r}")
              for r in range(ROWS)]
-        a = {(c, r): Flow(mems[c], cores[c][r], src_channel=r, dst_channel=0, name=f"v2_a{c}_{r}")
+        a = {(c, r): Flow(mems[c], cores[c][r], src_channel=r, dst_channel=0, name=f"sd15_a{c}_{r}")
              for c in range(COLS) for r in range(ROWS)}
-        o = {(c, r): Flow(cores[c][r], mems[c], src_channel=0, dst_channel=r, name=f"v2_o{c}_{r}")
+        o = {(c, r): Flow(cores[c][r], mems[c], src_channel=0, dst_channel=r, name=f"sd15_o{c}_{r}")
              for c in range(COLS) for r in range(ROWS)}
-        gate = [Flow(mems[c], mems[c], src_channel=5, dst_channel=5, name=f"v2_gate{c}") for c in range(COLS)]
+        gate = [Flow(mems[c], mems[c], src_channel=5, dst_channel=5, name=f"sd15_gate{c}") for c in range(COLS)]
         ctl = [PacketFlow(CTRL_ID[r], shims[CTRL_SHIM], cores[0][r], src_channel=1, dst_port=WireBundle.TileControl,
                           extra_dsts=[PacketDest(cores[c][r], WireBundle.TileControl, 0) for c in range(1, COLS)],
-                          keep_pkt_header=True, name=f"v2_ctl{r}") for r in range(ROWS)]
+                          keep_pkt_header=True, name=f"sd15_ctl{r}") for r in range(ROWS)]
         flows = d_in + d_out + b + list(a.values()) + list(o.values()) + gate + ctl
         dmas, workers = [], []
         for c in range(COLS):  # (the gate tasks' words land in a scratch buffer: a static chain, no locks)
-            gs = Buffer(type=ty(64), tile=mems[c], name=f"v2_gs_{c}", address=GATE_SCRATCH)
+            gs = Buffer(type=ty(64), tile=mems[c], name=f"sd15_gs_{c}", address=GATE_SCRATCH)
             dmas.append(TileDma(mems[c], [DmaChannel(DMAChannelDir.S2MM, 5, [Bd(gs, tap=TAP((16,), 0, [4], [1]),
                                                                                 bd_id=40)])]))
         for c in range(COLS):
             for r in range(ROWS):
                 t = cores[c][r]
-                bufs = {n: Buffer(type=ty(sz), tile=t, name=f"v2_{n}_{c}_{r}", address=L1[n])
+                bufs = {n: Buffer(type=ty(sz), tile=t, name=f"sd15_{n}_{c}_{r}", address=L1[n])
                         for n, sz in (("r23", 0x8000), ("out", NO * OSL), ("c", C_BYTES), ("ws", WS), ("tab", TABB),
                                       ("ext", 16))}
                 r23 = bufs["r23"]
 
                 def part(off: int, n: int) -> TAP:
                     return TAP((0x2000,), off // 4, [n // 4], [1])
-                af, aa = Lock(t, lock_id=0, init=2, name=f"v2_af_{c}_{r}"), Lock(t, lock_id=1, init=0, name=f"v2_aa_{c}_{r}")
-                bf, bb = Lock(t, lock_id=2, init=2, name=f"v2_bf_{c}_{r}"), Lock(t, lock_id=3, init=0, name=f"v2_bb_{c}_{r}")
-                of, oo = Lock(t, lock_id=4, init=NO, name=f"v2_of_{c}_{r}"), Lock(t, lock_id=5, init=0, name=f"v2_oo_{c}_{r}")
-                ah = Lock(t, lock_id=6, init=0, name=f"v2_ah_{c}_{r}")  # (an A slot's first half written)
+                af, aa = Lock(t, lock_id=0, init=2, name=f"sd15_af_{c}_{r}"), Lock(t, lock_id=1, init=0, name=f"sd15_aa_{c}_{r}")
+                bf, bb = Lock(t, lock_id=2, init=2, name=f"sd15_bf_{c}_{r}"), Lock(t, lock_id=3, init=0, name=f"sd15_bb_{c}_{r}")
+                of, oo = Lock(t, lock_id=4, init=NO, name=f"sd15_of_{c}_{r}"), Lock(t, lock_id=5, init=0, name=f"sd15_oo_{c}_{r}")
+                ah = Lock(t, lock_id=6, init=0, name=f"sd15_ah_{c}_{r}")  # (an A slot's first half written)
                 dmas.append(TileDma(t, [
                     DmaChannel(DMAChannelDir.S2MM, a[c, r].endpoint(t),
                                [Bd(r23, tap=part(R23[n] + h * 0x4000, A_OBJ // 2), acquires=[Acquire(ah if h else af)],

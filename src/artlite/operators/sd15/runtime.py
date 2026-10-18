@@ -1,4 +1,4 @@
-"""sd15_v2's design on the NPU (``V2Device``): its hardware context, DDR buffers, the roles' code (``role_code``), and
+"""sd15's design on the NPU (``Sd15Device``): its hardware context, DDR buffers, the roles' code (``role_code``), and
 dispatches of ``seq.Seq`` programs."""
 
 import os
@@ -135,15 +135,15 @@ def role_packets(role: Role, row: int) -> np.ndarray:
                                             (D.L1["ext"], np.array([role.entry, 1], np.uint32))])
 
 
-class V2Device:
+class Sd15Device:
     """The compiled design and its DDR images by name (``alloc`` / ``write`` / ``read`` / ``address``), sub-allocated
     from a few large host buffers (``CHUNK`` bytes each: a dispatch lists every buffer, and the driver's command holds
     some 500)."""
 
     CHUNK = 64 << 20
 
-    def __init__(self, design: D.V2Design | None = None):
-        self.design = design or D.V2Design()
+    def __init__(self, design: D.Sd15Design | None = None):
+        self.design = design or D.Sd15Design()
         self.dev = OverlayDevice(self.design)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
