@@ -75,7 +75,7 @@ A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("v2")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "b", "c")
+ROLES = ("a", "b", "c", "v")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
@@ -1131,6 +1131,115 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int
   }
 }
 
+// S [key panel 2][64] (+)= Q K^T over 32 d-blocks of one query panel (Q [d-block 32] panels, K [d-block 32][key panel
+// 2]): two chains (acc: S's values their start)
+static __attribute__((noinline)) void {{ p }}_qk512(const int32_t *__restrict q, const int32_t *__restrict k,
+                                               float *__restrict sm, int acc) {
+  al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+  al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+  al::MM8 c0(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm)) : aie::zeros<accfloat, 64>());
+  al::MM8 c1(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)) : aie::zeros<accfloat, 64>());
+  AIE_PREPARE_FOR_POSTPIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(32)
+  for (int d = 0; d < 32; d++) {
+    const al::BV A = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
+    c0.mac(A, aie::op_transpose(B0));
+    c1.mac(A, aie::op_transpose(B1));
+  }
+  aie::store_v(sm, c0.template to_vector<float>());
+  aie::store_v(sm + 64, c1.template to_vector<float>());
+}
+
+// O [d-block 32][64] += P V^T of one query panel and 16 keys (P [key panel 2], V^T [d-block 32][key panel 2])
+static __attribute__((noinline)) void {{ p }}_pv512(const bfp16ebs8 *__restrict pp, const int32_t *__restrict vt,
+                                               const float *__restrict ol, float *__restrict os) {
+  al::BInR<aie_dm_resource::a> ps(pp);
+  const al::BV P0 = ps.pop(), P1 = ps.pop();
+  al::BInR<aie_dm_resource::b> vs((const bfp16ebs8 *)vt);
+  AIE_PREPARE_FOR_POSTPIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int d = 0; d < 32; d += 2) {
+    al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(ol))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(ol + 64)));
+    const al::BV V0 = vs.pop(), V1 = vs.pop(), V2 = vs.pop(), V3 = vs.pop();
+    c0.mac(P0, aie::op_transpose(V0));
+    c1.mac(P0, aie::op_transpose(V2));
+    c0.mac(P1, aie::op_transpose(V1));
+    c1.mac(P1, aie::op_transpose(V3));
+    aie::store_v(os, c0.template to_vector<float>());
+    aie::store_v(os + 64, c1.template to_vector<float>());
+    ol += 128;
+    os += 128;
+  }
+}
+
+// a query panel's softmax step on 16 keys: S [key panel 2][64] (first: the reference max per query, mb = 192 - it [8 q][8],
+// not raised later: P saturates above it), P = 2^(S - m) -> pp (bfp16 [key panel 2]), l [8 q][8] += the row sums of
+// those panels (a MAC with ones)
+static __attribute__((noinline, minsize)) void {{ p }}_sm512(float *__restrict sm, float *__restrict mb, float *__restrict l,
+                                                         bfp16ebs8 *__restrict pp, int first) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  if (first) {
+    const aie::vector<bfloat16, 64> m = aie::max(aie::accum<accfloat, 64>(aie::load_v<64>(sm)).template to_vector<bfloat16>(),
+                                                 aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)).template to_vector<bfloat16>());
+    auto [e1, o1] = aie::interleave_unzip(m.template extract<32>(0), m.template extract<32>(1), 1);
+    const aie::vector<bfloat16, 32> m1 = aie::max(e1, o1);
+    auto [e2, o2] = aie::interleave_unzip(m1.template extract<16>(0), m1.template extract<16>(1), 1);
+    const aie::vector<bfloat16, 16> m2 = aie::max(e2, o2);
+    auto [e3, o3] = aie::interleave_unzip(m2.template extract<8>(0), m2.template extract<8>(1), 1);
+    const aie::vector<float, 8> mx = aie::accum<accfloat, 8>(aie::max(e3, o3)).template to_vector<float>();
+    aie::store_v(mb, al::bcast8(aie::sub(aie::broadcast<float, 8>(192.0f), mx)));
+  }
+  for (int h = 0; h < 4; h++) {
+    aie::accum<accfloat, 32> A(aie::load_v<32>(sm + 32 * h));
+    A = aie::add(A, aie::load_v<32>(mb + 32 * (h & 1)));
+    aie::store_v(sm + 32 * h, {{ p }}_exp2(A).template to_vector<float>());
+  }
+  const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
+  const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(sm)).template to_vector<bfp16ebs8>();
+  const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)).template to_vector<bfp16ebs8>();
+  al::BOut<> po(pp);
+  po.push(p0);
+  po.push(p1);
+  al::MM8 a(aie::accum<accfloat, 64>(aie::load_v<64>(l)));
+  a.mac(p0, aie::op_transpose(ones));
+  a.mac(p1, aie::op_transpose(ones));
+  aie::store_v(l, a.template to_vector<float>());
+}
+
+// K_ATTN of d 512 (role v: a single head, the VAE decoder's mid block): per unit (C_NUNIT) a query panel (8 queries, a
+// half of its A object: [d-block 64] panels, scaled by log2 e / sqrt d; two units an object), per key group of 16 (C_NG)
+// four B slots: K of d-blocks 0..31 [d-block 32][key panel 2], of 32..63, then V^T likewise; O [d-block 64][64] (the C
+// buffer) += P V^T, l += P J; then O / l -> bfp16 panels [d-block 64]. S, 192 - m, l and P in the workspace after the
+// header.
+static __attribute__((noinline, minsize)) void {{ p }}_attn512({{ p }}_st &s, int32_t *cb, int32_t *ws) {
+  const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}];
+  float *o = (float *)cb, *sm = (float *)(ws + 64), *mb = sm + 128, *l = mb + 64;
+  bfp16ebs8 *pp = (bfp16ebs8 *)(l + 64);
+  int32_t *q = nullptr;
+  for (int u = 0; u < nunit; u++) {
+    if (!(u & 1)) q = {{ p }}_take_a(s);
+    const int32_t *qu = {{ p }}_aw(q, {{ A_OBJ // 8 }} * (u & 1));
+    {{ p }}_zero(cb, 4096);
+    {{ p }}_zero((int32_t *)l, 64);
+    for (int g = 0; g < ng; g++) {
+      int32_t *k0 = {{ p }}_take_b(s), *k1 = {{ p }}_take_b(s);
+      {{ p }}_qk512(qu, k0, sm, 0);
+      {{ p }}_qk512(qu + 576, k1, sm, 1);
+      {{ p }}_give_b(s, k0);
+      {{ p }}_give_b(s, k1);
+      {{ p }}_sm512(sm, mb, l, pp, g == 0);
+      for (int h = 0; h < 2; h++) {
+        int32_t *v = {{ p }}_take_b(s);
+        {{ p }}_pv512(pp, v, o + 2048 * h, o + 2048 * h);
+        {{ p }}_give_b(s, v);
+      }
+    }
+    if (u & 1 || u == nunit - 1) {{ p }}_give_a(s, q);
+    {{ p }}_attn_fin(o, l, 1, (bfp16ebs8 *)o, 64);
+    {{ p }}_out(s, cb, 4608);
+  }
+}
+
 // the cores' main loop (shared): commands from the B stream; GEMMs / convs and tables here, the other kinds by the role's
 // code through its entry in ext (a role switch rewrites it while the core waits for a command: ``seq.Seq.role``)
 __attribute__((noinline, minsize)) void {{ p }}_run(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
@@ -1161,6 +1270,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_ext_a({{ p }}_st &s, int3
 
 static __attribute__((noinline, minsize)) void {{ p }}_ext_c({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   {{ p }}_attn40(s, cb, ws, tab);
+}
+
+static __attribute__((noinline, minsize)) void {{ p }}_ext_v({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_attn512(s, cb, ws);
 }
 
 static __attribute__((noinline, minsize)) void {{ p }}_ext_b({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {

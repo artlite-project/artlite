@@ -26,8 +26,8 @@ from .build import Builder, Level
 from .level64 import IL
 from .ops import Apply, Gemm
 from .runtime import V2Device
-from .seq import ColOps, MemTask
-from .unet import DTensor, Tensor, _silu, alloc, free, plain
+from .seq import ColOps, MemTask, RowOps
+from .unet import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
 
 L64, L128, L256, L512 = Level(64, 4, True), Level(128, 16, True), Level(256, 64, True), Level(512, 128, True)
 LEVELS = {lv.H: lv for lv in (L64, L128, L256, L512)}
@@ -547,17 +547,13 @@ def image(raw: np.ndarray, n: int = 3) -> torch.Tensor:
     return from_tokens(t, lv)
 
 
-def head(bd: Builder, w: dict, lat: VImage, *, scale: float, eps: float) -> DTensor:
-    """The decoder up to its mid block's attention: conv_in, mid_block.resnets.0."""
+def decoder(bd: Builder, w: dict, lat: VImage, *, scale: float, eps: float, name: str) -> None:
+    """The decoder from the latents' image: conv_in, the mid block (resnet, attention, resnet), the up blocks (their
+    upsamplers), conv_norm_out and conv_out into DDR image ``name``."""
     h = conv_in(bd, w, lat, scale=scale, name="vae.conv_in")
-    C = chans(w["decoder.conv_in.weight"].shape[0])
-    return resnet(bd, w, "decoder.mid_block.resnets.0.", h, cin=C, cout=C, eps=eps, name="vae.mid0")
-
-
-def tail(bd: Builder, w: dict, h: DTensor, *, eps: float, name: str) -> None:
-    """The decoder from its mid block's attention's output h (with its records): mid_block.resnets.1, the up blocks
-    (their upsamplers), conv_norm_out and conv_out into DDR image ``name``."""
-    C = 512
+    C = w["decoder.conv_in.weight"].shape[0]
+    h = resnet(bd, w, "decoder.mid_block.resnets.0.", h, cin=chans(C), cout=chans(C), eps=eps, name="vae.mid0")
+    h = mid_attention(bd, w, "decoder.mid_block.attentions.0.", h, eps=eps, name="vae.attn")
     h = resnet(bd, w, "decoder.mid_block.resnets.1.", h, cin=chans(C), cout=chans(C), eps=eps, name="vae.mid1")
     for i in range(4):
         for j in range(3):
@@ -571,51 +567,158 @@ def tail(bd: Builder, w: dict, h: DTensor, *, eps: float, name: str) -> None:
 
 
 class Decoder:
-    """The VAE decoder on a V2Device: ``self(latents, attend)``, the sampler's latents (1, 4, 64, 64) -> the image (1,
-    3, 512, 512) in about [-1, 1]: conv_in and the mid block's first resnet as one dispatch, the mid block's attention
-    ``attend`` (1, 512, 64, 64) -> the same, on the host, the rest as a second dispatch. Weights by diffusers name
-    (``decoder.*``, ``post_quant_conv.*``)."""
+    """The VAE decoder on a V2Device as one dispatch: ``self(latents)``, the sampler's latents (1, 4, 64, 64) -> the
+    image (1, 3, 512, 512) in about [-1, 1]. Weights by diffusers name (``decoder.*``, ``post_quant_conv.*``)."""
 
     def __init__(self, v2: V2Device, w: dict, *, scale: float, eps: float = 1e-6):
         self.v2 = v2
-        self.C = chans(w["decoder.conv_in.weight"].shape[0])
-        a = Builder(v2)
+        bd = Builder(v2)
         self.lat = VImage(64, "vae.lat", L64)
-        self.lat.base(a)
-        self.h0 = head(a, w, self.lat, scale=scale, eps=eps)
-        self.words_a = a.finish()
-        b = Builder(v2)
-        self.h1 = DTensor(L64, self.C.P, "vae.h1")
-        for k in range(L64.nb):
-            b.ddr(self.h1.band(k), COLS * self.h1.nbytes)
-        with_stats(b, self.h1, self.C, name="vae.h1.st")
-        tail(b, w, self.h1, eps=eps, name="vae.out")
-        self.words_b = b.finish()
+        self.lat.base(bd)
+        decoder(bd, w, self.lat, scale=scale, eps=eps, name="vae.out")
+        self.words = bd.finish()
         self.tr = None
-        self.addrs = a.s.t.addrs, b.s.t.addrs
-        self.images = a.images + b.images
+        self.addrs, self.images = bd.s.t.addrs, bd.images
 
     def state(self) -> dict:
-        """What ``restored`` needs besides the device's images (the transactions' shim addresses as relocations)."""
-        return {"C": self.C, "lat": self.lat, "h0": self.h0, "h1": self.h1,
-                "words": (self.words_a, self.words_b), "rel": tuple(self.v2.relocations(a) for a in self.addrs)}
+        """What ``restored`` needs besides the device's images (the transaction's shim addresses as relocations)."""
+        return {"lat": self.lat, "words": self.words, "rel": self.v2.relocations(self.addrs)}
 
     @classmethod
     def restored(cls, v2: V2Device, state: dict) -> "Decoder":
         """A Decoder of ``state()`` on a device whose images were restored (``V2Device.restore``)."""
         d = cls.__new__(cls)
-        d.v2, d.tr = v2, None
-        d.C, d.lat, d.h0, d.h1 = state["C"], state["lat"], state["h0"], state["h1"]
-        d.words_a, d.words_b = (v2.relocate(w, r) for w, r in zip(state["words"], state["rel"], strict=True))
+        d.v2, d.tr, d.lat = v2, None, state["lat"]
+        d.words = v2.relocate(state["words"], state["rel"])
         return d
 
-    def __call__(self, lat: torch.Tensor, attend: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    def __call__(self, lat: torch.Tensor) -> torch.Tensor:
         if self.tr is None:
-            self.tr = Transaction(self.v2.dev, self.words_a), Transaction(self.v2.dev, self.words_b)
+            self.tr = Transaction(self.v2.dev, self.words)
         self.v2.write(self.lat.name, image_bytes(self.lat, latents(lat)))
-        self.v2.run(self.tr[0])
-        h = attend(read_dtensor(self.v2, self.h0, self.C))
-        for k, v in enumerate(dtensor_bytes(self.h1, h, self.C)):
-            self.v2.write(self.h1.band(k), v)
-        self.v2.run(self.tr[1])
+        self.v2.run(self.tr)
         return image(self.v2.read("vae.out"))
+
+
+GK = 16  # (keys of a d-512 attention's group: four B slots)
+
+
+@dataclass
+class Attention512:
+    """Single-head attention of d 512 (the mid block's, role v: ``core``'s attn512) for the queries of a band: per core
+    row ``units`` query panels of the column's (q: panels [d-block 64][np], scaled by log2 e / sqrt d), every core
+    against all ``nkeys`` keys of the K / V^T image at DDR kv ([group][K d-blocks 0..31, 32..63, V^T likewise][Q];
+    ``kv_drains``); the output panels at o ([d-block 80][np]: d-blocks 64..79 junk, the output chunks' padding)."""
+
+    np: int
+    q: int
+    o: int
+    kv: int
+    nkeys: int
+    padded: bool = False  # (q's kbs in Chans(512)'s stored layout: 4 slices of 20, 16 real)
+
+    def __post_init__(self) -> None:
+        assert self.nkeys % GK == 0 and self.np % 8 == 0
+        self.units = self.np // 4  # (per core row)
+        self.ng = self.nkeys // GK
+
+    def command(self) -> np.ndarray:
+        cmd = np.zeros(D.Q // 4, np.int32)
+        cmd[[K.C_KIND, K.C_NUNIT, K.C_NG]] = K.K_ATTN, self.units, self.ng
+        return cmd.view(np.uint8)
+
+    def kv_bytes(self) -> int:
+        return self.ng * 4 * D.Q
+
+    def col_ops(self) -> ColOps:
+        """Per row its query panels [units r ..) as A objects of two ([unit 2][d-block 64][panel]), their outputs."""
+        co, kb = ColOps(), self.np * 18  # (words: a kb's panels)
+        u = self.units
+        for r in range(4):
+            p0 = r * u
+            dims = [(18, 1), (16, kb), (4, 20 * kb), (0, 18)] if self.padded else [(18, 1), (64, kb), (2, 18)]
+            co.sends[r] = [MemTask([{"addr": self.q + 72 * p0, "nwords": D.A_OBJ // 4, "dims": dims,
+                                     "iteration": (36, u // 2)}], repeat=u // 2)]
+            co.recvs[r] = [MemTask([{"addr": self.o + 72 * p0, "nwords": u * 80 * 18, "dims": [(18, 1), (80, kb), (u, 18)]}])]
+        return co
+
+    def row_ops(self, cmd: int) -> dict[int, RowOps]:
+        """Per row the command, then per unit the K / V^T image (every core takes it: the row's broadcast)."""
+        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv, self.kv_bytes())] * self.units,
+                          b_objects=1 + self.units * 4 * self.ng, parity=False, role="v") for r in range(4)}
+
+
+def kv512_image(k: torch.Tensor, v: torch.Tensor) -> np.ndarray:
+    """K and V (keys, 512) as Attention512's image ([group][slot 4][Q]: K panels [d-block 32][key panel 2] of d-blocks
+    0..31, of 32..63, then V^T panels likewise; a slot's last 1152 bytes unused) (tests)."""
+    nkp = k.shape[0] // 8
+    kp, vp = L.panels(k).reshape(64, nkp, 72), L.vt_panels(v).reshape(64, nkp, 72)
+    out = np.zeros((nkp // 2, 4, D.Q), np.uint8)
+    for sl, src in enumerate((kp[:32], kp[32:], vp[:32], vp[32:])):
+        out[:, sl, :4608] = src.reshape(32, nkp // 2, 2, 72).transpose(1, 0, 2, 3).reshape(nkp // 2, -1)
+    return out.reshape(-1)
+
+
+def kv_drains(at: Attention512, t: Tensor, slot: int, band: int, col: int) -> ColOps:
+    """Column ``col``'s drains of band ``band``'s K (slot 0) or V^T (slot 2) panels t (Chans(512)'s stored layout
+    [kb 80][np]) into the image's slots slot, slot + 1 (d-blocks 0..31, 32..63) of its key groups ([d-block 32][key
+    panel 2] each)."""
+    kb, ng = t.np * 18, t.np // 2  # (words: a kb's panels; the column's groups in the band)
+    g0 = (band * COLS + col) * ng
+    return ColOps(drains=[MemTask([{"addr": t.addr + 4 * 40 * h * kb, "nwords": ng * 1152,
+                                    "dims": [(36, 1), (16, kb), (2, 20 * kb), (0, 36)]}],
+                                  ddr=(at.kv + (4 * g0 + slot + h) * D.Q, ng * 4608, (576, 2, 576, 4 * D.Q // 4)))
+                          for h in range(2)])
+
+
+def mid_attention(bd: Builder, w: dict, p: str, x: DTensor, *, eps: float, name: str) -> DTensor:
+    """The mid block's attention (one head of 512 over the 4096 pixels) of x (the 64 level's, stored 512 channels):
+    GroupNorm, then per band q (scaled by log2 e / sqrt 512: parked in DDR), k and v^T (into the K / V^T image), then
+    per band the attention (``Attention512``, every core row in role v), proj_attn + x -> a DTensor with records for
+    its norm."""
+    lv, ch = x.lv, chans(512)
+    ns = ("query.", "key.", "value.", "proj_attn.") if p + "query.weight" in w else ("to_q.", "to_k.", "to_v.", "to_out.0.")
+    (wq, bq), (wk, bk), (wv, bv), (wo, bo) = ((w[p + n + "weight"].flatten(1), w[p + n + "bias"]) for n in ns)
+    c = LOG2E / ch.C ** 0.5
+    gn = norm(bd, x, w[p + "group_norm.weight"], w[p + "group_norm.bias"], ch=ch, name=name + ".n", eps=eps, silu=False)
+    at0 = Attention512(np=lv.np, q=0, o=0, kv=0, nkeys=lv.H ** 2, padded=True)
+    at0.kv = bd.ddr(name + ".kv", at0.kv_bytes())
+    bd.written(name + ".kv")
+    qd = DTensor(lv, ch.P, name + ".q", "pn")
+    rb = lv.R // lv.nb
+
+    pw = {n: (ch.pad(wt), ch.pad(bt)) for n, wt, bt in (("q", wq * c, bq * c), ("k", wk, bk), ("v", wv, bv), ("o", wo, bo))}
+
+    def proj(t: Tensor, n: str, out: str, extra: dict | None = None) -> Tensor:
+        y = alloc(bd, lv, ch.P, "pn")
+        bd.gemm(Gemm(m=64, ntile=lv.ntile, K=ch.C, N=ch.P, x=t.addr, y=y.addr, out=out, x_np=t.np, y_np=y.np), *pw[n],
+                name=f"{name}.{n}", extra=extra)
+        return y
+    for b in range(lv.nb):
+        xg, cols = gn.fill(bd, rb * b, rb * b + rb, 0, gn.rowp // 2, 0, ch.C)
+        bd.op(cols, {})
+        qt = proj(xg, "q", "bfp16")
+        kt = proj(xg, "k", "bfp16")
+        vt = proj(xg, "v", "vt", extra={col: kv_drains(at0, kt, 0, b, col) for col in range(COLS)})
+        free(bd, xg)
+        free(bd, kt)
+        bd.defer({col: kv_drains(at0, vt, 2, b, col) for col in range(COLS)}, release=[(vt.addr, vt.size)])
+        qd.store(bd, b, qt)
+    out = DTensor(lv, ch.P, name, rec=[])
+    rec = bd.mem.alloc(4 * D.OCH, top=True)
+    cmd = bd.image(name + ".cmd", at0.command())
+    bd.reading(name + ".kv")
+    for b in range(lv.nb):
+        qb = load(bd, qd, b)
+        o = alloc(bd, lv, ch.P, "pn")
+        at = Attention512(np=lv.np, q=qb.addr, o=o.addr, kv=at0.kv, nkeys=at0.nkeys, padded=True)
+        bd.op({col: at.col_ops() for col in range(COLS)}, at.row_ops(cmd))
+        free(bd, qb)
+        xb = load(bd, x, b)
+        g = Gemm(m=64, ntile=lv.ntile, K=ch.C, N=ch.P, x=o.addr, y=xb.addr, out="bf16", res=xb.addr, x_np=o.np,
+                 stats="gn", rec=rec, gsize=ch.gsize, ch_step=ch.stride, ch_real=ch.per, stf=stf(b, lv.nb))
+        bd.gemm(g, *pw["o"], name=f"{name}.o.{g.stf}", wname=name + ".o.w")
+        free(bd, o)
+        out.store(bd, b, xb)
+    out.rec = records(bd, rec, ch=ch, name=name + ".rec")
+    return out

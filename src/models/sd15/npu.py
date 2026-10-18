@@ -1,7 +1,6 @@
 """Stable Diffusion 1.5's UNet and VAE decoder on the NPU: ``NpuUNet``, the pipeline's noise predictor
 (``artlite.operators.sd15_v2``'s ``model.UNet``: the whole step as one dispatch of its static design, its weights in
-DDR images), and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: two dispatches around the mid
-block's attention, which runs on the host in bf16).
+DDR images), and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: one dispatch).
 
 Per step the host writes the latents and the 22 resnets' time biases (``host``: the steps' computed ahead on a worker
 thread, ``NpuUNet.prepare``), runs the dispatch and reads the 4 output channels; per prompt (a new context) it writes the cross attentions' K / V^T (computed on the host). The first
@@ -67,26 +66,23 @@ class NpuUNet:
 
 
 class NpuVae:
-    """The VAE decoder of a diffusers directory's ``vae`` on the NPU (the device of a ``NpuUNet``'s design): the
-    sampler's latents (B, 4, 64, 64) -> the images (B, 3, 512, 512), one at a time."""
+    """The VAE decoder of a diffusers directory's ``vae`` on the NPU (the device of a ``NpuUNet``'s design, one
+    dispatch): the sampler's latents (B, 4, 64, 64) -> the images (B, 3, 512, 512), one at a time."""
 
     def __init__(self, directory: str, v2: V2Device, *, state: dict | None = None):
-        self.ref = reference.VaeDecoder(directory)
-        cfg = self.ref.cfg
+        with open(os.path.join(directory, "config.json")) as f:
+            cfg = json.load(f)
         assert cfg["block_out_channels"] == [128, 256, 512, 512] and cfg["layers_per_block"] == 2 and \
             cfg.get("latent_channels", 4) == 4, f"{directory}: not SD 1.x's VAE"
         if state is None:
-            self.dec = Decoder(v2, self.ref.w, scale=self.ref.scale, eps=self.ref.EPS)
+            w = load_safetensors(os.path.join(directory, "diffusion_pytorch_model.safetensors"), ("decoder.", "post_quant_conv."))
+            self.dec = Decoder(v2, w, scale=cfg.get("scaling_factor", 0.18215), eps=reference.VaeDecoder.EPS)
             v2.warm()
         else:  # (a restored device's: ``load``)
             self.dec = Decoder.restored(v2, state)
 
-    def _attend(self, h: torch.Tensor) -> torch.Tensor:
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            return self.ref.attention("decoder.mid_block.attentions.0.", h).float()
-
     def __call__(self, latents: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.dec(latents[i:i + 1], self._attend) for i in range(latents.shape[0])])
+        return torch.cat([self.dec(latents[i:i + 1]) for i in range(latents.shape[0])])
 
 
 # (what the cache's key covers besides the model's files: the code that builds the images and the transactions)

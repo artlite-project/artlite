@@ -35,14 +35,6 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
     return float((y - ref).norm() / ref.norm())
 
 
-def read(v2: V2Device, y: DTensor, ch: vae.Chans) -> torch.Tensor:
-    """A DTensor's real channels as (1, C, H, H)."""
-    lv = y.lv
-    bands = [v2.read(y.band(b), COLS * y.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
-    t = torch.stack([torch.cat([L.from_ctiles(bands[b][c], lv.T, ch.P, 64) for b in range(lv.nb)]) for c in range(COLS)])
-    return vae.from_tokens(ch.unpad(t), lv)
-
-
 @pytest.mark.parametrize("H, Cin, N", [(64, 512, 512), (128, 512, 512), (256, 256, 256), (512, 128, 256),
                                       (512, 128, 128)])
 def test_conv(v2: V2Device, H: int, Cin: int, N: int) -> None:
@@ -59,7 +51,7 @@ def test_conv(v2: V2Device, H: int, Cin: int, N: int) -> None:
     y = vae.conv_layer(bd, img, w, b, ch=ch, name=f"c{H}", stats=False)
     bd.op({}, {})
     v2.run(bd.transaction())
-    err = _rel(read(v2, y, ch), qconv(x, w, b))
+    err = _rel(vae.read_dtensor(v2, y, ch), qconv(x, w, b))
     print(f"H {H}: rel err {err:.3e}")
     assert err < 8e-3
 
@@ -101,7 +93,7 @@ def test_resnet(v2: V2Device, H: int, cin: int, cout: int) -> None:
                      name=p + "y")
     bd.op({}, {})
     v2.run(bd.transaction())
-    err = _rel(read(v2, out, vae.chans(cout)), reference.resnet(w, p, x, eps=1e-6))
+    err = _rel(vae.read_dtensor(v2, out, vae.chans(cout)), reference.resnet(w, p, x, eps=1e-6))
     print(f"H {H} {cin} -> {cout}: rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -122,15 +114,14 @@ def test_upsample(v2: V2Device, H: int, C: int) -> None:
     bd.op({}, {})
     v2.run(bd.transaction())
     up = F.interpolate(x.bfloat16().float(), scale_factor=2.0, mode="nearest")
-    err = _rel(read(v2, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
+    err = _rel(vae.read_dtensor(v2, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
     print(f"H {H} -> {2 * H}: rel err {err:.3e}")
     assert err < 8e-3
 
 
 @pytest.mark.slow
 def test_decoder(v2: V2Device) -> None:
-    """SD 1.5's VAE decoder (its mid attention on the host) on the sampler's latents of a prompt: within 2e-2 of the
-    fp32 decoder (pixels)."""
+    """SD 1.5's VAE decoder (one dispatch) on random latents: within 2e-2 of the fp32 decoder (pixels)."""
     from artlite.model_config import sd15_dir
     from models.sd15 import reference
     path = os.path.join(sd15_dir(), "vae")
@@ -140,8 +131,62 @@ def test_decoder(v2: V2Device) -> None:
     dec = vae.Decoder(v2, ref.w, scale=ref.scale, eps=ref.EPS)
     torch.manual_seed(7)
     lat = torch.randn(1, 4, 64, 64)  # (the sampler's latents: about unit variance)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        y = dec(lat, lambda h: ref.attention("decoder.mid_block.attentions.0.", h).float())
-    err = _rel(y, ref(lat))
+    err = _rel(dec(lat), ref(lat))
     print(f"rel err {err:.3e}")
     assert err < 2e-2
+
+
+def test_attention512(v2: V2Device) -> None:
+    """The mid block's single-head attention of d 512 (role v) for a band of 1024 queries (16 query panels a column, 4 a
+    core row) over 1024 keys: within 1.5e-2 of softmax attention on the bfp16 operands."""
+    import numpy as np
+
+    from artlite.operators.sd15_v2.seq import ColOps, MemTask
+    torch.manual_seed(5)
+    nq, nk, d = 8 * 128, 1024, 512
+    qs = torch.randn(nq, d) * (1.4426950408889634 / d ** 0.5) * 2
+    k, v = torch.randn(nk, d), torch.randn(nk, d)
+    bd = Builder(v2)
+    kv = bd.image("a512.kv", vae.kv512_image(k, v))
+    Qa, Oa = 0, 64 * 16 * 72
+    qimg = np.concatenate([L.panels(qs[128 * c:128 * (c + 1)]) for c in range(COLS)])
+    qa = bd.image("a512.q", qimg)
+    bd.op({c: ColOps(fills=[MemTask([{"addr": Qa, "nwords": qimg.size // 32}], ddr=(qa + c * qimg.size // 8, qimg.size // 8,
+                                                                                      None))]) for c in range(COLS)}, {})
+    at = vae.Attention512(np=16, q=Qa, o=Oa, kv=kv, nkeys=nk)
+    bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(bd.image("a512.cmd", at.command())))
+    ob = 80 * 16 * 72
+    out = bd.ddr("a512.o", COLS * ob)
+    bd.op({c: ColOps(drains=[MemTask([{"addr": Oa, "nwords": ob // 4}], ddr=(out + c * ob, ob, None))]) for c in range(COLS)},
+          {})
+    v2.run(bd.transaction())
+    raw = v2.read("a512.o", COLS * ob).reshape(COLS, 80 * 16 * 72)
+    o = torch.cat([L.from_panels(raw[c][:64 * 16 * 72], 128, d) for c in range(COLS)])
+    qq, kq, vq = q(qs), q(k), q(v)
+    p = torch.exp2(qq @ kq.T - (qq @ kq.T).max(-1, keepdim=True).values)
+    ref = (p @ vq) / p.sum(-1, keepdim=True)
+    err = _rel(o, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
+
+
+def test_mid_attention(v2: V2Device) -> None:
+    """The decoder's mid-block attention on the 64 level (GroupNorm, q / k / v, the d-512 attention over all 4096
+    pixels, proj_attn + x): within 1.5e-2 of the fp32 reference."""
+    from models.sd15 import reference
+    torch.manual_seed(6)
+    p, C, lv = "m.", 512, vae.LEVELS[64]
+    g = torch.Generator().manual_seed(8)
+    w = {p + "group_norm.weight": 1 + 0.2 * torch.randn(C, generator=g), p + "group_norm.bias": 0.2 * torch.randn(C, generator=g)}
+    for n in ("to_q.", "to_k.", "to_v.", "to_out.0."):
+        w[p + n + "weight"] = torch.randn(C, C, generator=g) / C ** 0.5
+        w[p + n + "bias"] = 0.1 * torch.randn(C, generator=g)
+    x = torch.randn(1, C, 64, 64)
+    bd = Builder(v2)
+    out = vae.mid_attention(bd, w, p, _input(bd, x, lv, "ma.x"), eps=1e-6, name="ma")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    ref = reference.VaeDecoder.attention(type("R", (), {"w": w, "EPS": 1e-6})(), p, x)
+    err = _rel(vae.read_dtensor(v2, out, vae.chans(C)), ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
