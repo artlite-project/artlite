@@ -88,7 +88,8 @@ class NpuVae:
 
 # (what the cache's key covers besides the model's files: the code that builds the images and the transactions)
 _SOURCES = ("artlite/operators/sd15", "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/act_lut.py",
-            "artlite/operators/fused/ctrlpkt.py", "artlite/operators/overlay/runtime.py", "models/sd15/npu.py",
+            "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/operators/overlay/runtime.py",
+            "models/sd15/npu.py",
             "models/sd15/reference.py", "models/sd15/weights.py")
 
 
