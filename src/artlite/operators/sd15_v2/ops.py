@@ -17,6 +17,7 @@ Tensors are memtile byte addresses, the same in every column; ``np`` is a panel 
 (the column's tokens / 8, or more: a padded tensor), in (image row, group, image) order: token panel tp is image tp % 2.
 """
 
+import functools
 import struct
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ from . import layout as L
 from .seq import ColOps, MemTask, RowOps
 
 
+@functools.cache
 def _contig(words: int) -> list[tuple[int, int]]:
     """Dims of ``words`` contiguous words (d0 <= 1023)."""
     d0 = next(d for d in range(min(words, 1023), 0, -1) if words % d == 0)

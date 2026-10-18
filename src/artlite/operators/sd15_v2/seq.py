@@ -84,7 +84,7 @@ class Seq:
         self._q: dict[tuple, collections.deque] = {}  # (row 0 / 1, col, dir, ch) -> ops of its pending tasks
         self._k: dict[tuple, int] = {}  # tasks per shim channel (BD rotation)
         self._kbd: dict[tuple, int] = {}  # BD rotation per shim channel (the B runs)
-        self._chains: dict[tuple, list] = {}  # per memtile channel: (BD ids, chain words) of the chains its BDs hold
+        self._chains: dict[tuple, dict] = {}  # per memtile channel: chain -> (its BD ids, their words) of the chains its BDs hold
         self._lru: dict[tuple[int, int], int] = {}  # (col, memtile BD) -> its last use
         self._tick = 0
         self._held: dict[tuple[int, int], list[int]] = {}  # (col, memtile BD) -> its words
@@ -152,21 +152,26 @@ class Seq:
                     words[1] |= 1 << 19 | ids[i + 1] << 20
                 out.append(words)
             return out
-        pool = D.mem_bd_pool(ch)
-        ids = next((ids for ids, raw in self._chains.get(key, []) if raw == chain
-                    and all(self._held.get((col, b)) == w for b, w in zip(ids, linked(ids), strict=True))), None)
-        if ids is None:
+        cache = self._chains.setdefault(key, {})
+        ck = tuple(tuple(w) for w in chain)
+        hit = cache.get(ck)
+        if hit is not None and all(self._held.get((col, b)) == w for b, w in zip(*hit, strict=True)):
+            ids = hit[0]
+        else:
+            pool = D.mem_bd_pool(ch)
             free = sorted((b for b in pool if self._user.get((col, b)) != op), key=lambda b: self._lru.get((col, b), -1))
             assert len(free) >= len(chain), f"op {op}: more BDs on memtile channel {(d, ch)} than its pool has free"
             ids = free[:len(chain)]
-            for bid, words in zip(ids, linked(ids), strict=True):
+            words_l = linked(ids)
+            for bid, words in zip(ids, words_l, strict=True):
                 if self._held.get((col, bid)) != words:
                     if (u := self._user.get((col, bid))) is not None:
                         self.complete(u)
                     self.t.mem_bd(col, bid, words)
                     self._held[(col, bid)] = words
-            cache = self._chains.setdefault(key, [])
-            cache[:] = [(i, r) for i, r in cache if not set(i) & set(ids)] + [(ids, [list(w) for w in chain])]
+            for k in [k for k, (i, _) in cache.items() if not set(i).isdisjoint(ids)]:
+                del cache[k]
+            cache[ck] = (ids, words_l)
         for bid in ids:
             self._user[(col, bid)] = op
             self._tick += 1
