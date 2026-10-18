@@ -75,6 +75,27 @@ class UNet:
         unet(bd, w, lat, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
         self.words = bd.finish()
         self.tr = None
+        self.tb_used, self.tb_hooks = bd.tb_used, bd.tb_hooks
+        self.addrs, self.images = bd.s.t.addrs, list(bd.images)
+
+    # (the host's weights at run time: the time embedding, the resnets' time projections and conv1 biases, the cross
+    # attentions' K / V projections: ``host.resnet_time_biases``, ``set_time``, ``set_context``)
+    RUNTIME = ("time_embedding.", "time_emb_proj.", "conv1.bias", "attn2.to_k.weight", "attn2.to_v.weight")
+
+    def state(self) -> dict:
+        """What ``restored`` needs besides the device's images: the transaction (its shim addresses as relocations),
+        the latents' image, the time biases' places."""
+        return {"words": self.words, "rel": self.v2.relocations(self.addrs), "lat": self.lat, "tb_used": self.tb_used,
+                "tb_hooks": self.tb_hooks}
+
+    @classmethod
+    def restored(cls, v2: V2Device, w: dict, state: dict) -> "UNet":
+        """A UNet of ``state()`` on a device whose images were restored (``V2Device.restore``); w: the RUNTIME weights."""
+        net = cls.__new__(cls)
+        net.v2, net.w, net.tr = v2, w, None
+        net.words = v2.relocate(state["words"], state["rel"])
+        net.lat, net.tb_used, net.tb_hooks = state["lat"], state["tb_used"], state["tb_hooks"]
+        return net
 
     def _ctx(self, p: str, ctx: torch.Tensor) -> np.ndarray:
         a = p + "transformer_blocks.0.attn2."
@@ -84,8 +105,8 @@ class UNet:
     def set_time(self, biases: dict[str, torch.Tensor]) -> None:
         """The resnets' time biases (by prefix): their conv1 commands' biases (the conv bias + the time bias, bf16) in
         TBIAS, one write."""
-        buf = np.empty(self.bd.tb_used // 2, bfloat16)
-        for p, off, rows in self.bd.tb_hooks:
+        buf = np.empty(self.tb_used // 2, bfloat16)
+        for p, off, rows in self.tb_hooks:
             buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p]).numpy()[rows]
         self.v2.write(TBIAS, buf)
 

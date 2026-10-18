@@ -429,3 +429,8 @@ class Builder:
 
     def transaction(self):
         return Transaction(self.v2.dev, self.finish())
+
+    @property
+    def images(self) -> list[str]:
+        """The DDR images this dispatch wrote at build time (weights, commands, tables: what a model's cache keeps)."""
+        return list(self._images)

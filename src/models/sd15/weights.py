@@ -18,13 +18,15 @@ def read_header(path: str) -> tuple[dict[str, dict], int]:
     return header, 8 + n
 
 
-def load_safetensors(path: str, prefixes: tuple[str, ...] = ()) -> dict[str, torch.Tensor]:
-    """The tensors of a file (``prefixes``: only those whose names start with one of them), in file order."""
+def load_safetensors(path: str, prefixes: tuple[str, ...] = (), *, contains: tuple[str, ...] = ()) -> dict[str, torch.Tensor]:
+    """The tensors of a file (``prefixes``: only those whose names start with one of them; ``contains``: or contain
+    one), in file order."""
     header, base = read_header(path)
     out = {}
     with open(path, "rb") as f:
         for name, e in sorted(header.items(), key=lambda item: item[1]["data_offsets"][0]):
-            if prefixes and not name.startswith(prefixes):
+            if (prefixes or contains) and not (name.startswith(prefixes) if prefixes else False) and \
+                    not any(c in name for c in contains):
                 continue
             begin, end = e["data_offsets"]
             t = torch.empty(e["shape"], dtype=DTYPES[e["dtype"]])

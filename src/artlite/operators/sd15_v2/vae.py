@@ -592,6 +592,22 @@ class Decoder:
         tail(b, w, self.h1, eps=eps, name="vae.out")
         self.words_b = b.finish()
         self.tr = None
+        self.addrs = a.s.t.addrs, b.s.t.addrs
+        self.images = a.images + b.images
+
+    def state(self) -> dict:
+        """What ``restored`` needs besides the device's images (the transactions' shim addresses as relocations)."""
+        return {"C": self.C, "lat": self.lat, "h0": self.h0, "h1": self.h1,
+                "words": (self.words_a, self.words_b), "rel": tuple(self.v2.relocations(a) for a in self.addrs)}
+
+    @classmethod
+    def restored(cls, v2: V2Device, state: dict) -> "Decoder":
+        """A Decoder of ``state()`` on a device whose images were restored (``V2Device.restore``)."""
+        d = cls.__new__(cls)
+        d.v2, d.tr = v2, None
+        d.C, d.lat, d.h0, d.h1 = state["C"], state["lat"], state["h0"], state["h1"]
+        d.words_a, d.words_b = (v2.relocate(w, r) for w, r in zip(state["words"], state["rel"], strict=True))
+        return d
 
     def __call__(self, lat: torch.Tensor, attend: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
         if self.tr is None:

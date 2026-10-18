@@ -185,6 +185,14 @@ class V2Device:
         chunk, off, n = self._images[name]
         return self.dev.view(chunk)[off:off + n]
 
+    def view(self, name: str) -> np.ndarray:
+        """An image's host bytes (written there: then ``flush``)."""
+        return self._view(name)
+
+    def flush(self, name: str) -> None:
+        chunk, off, n = self._images[name]
+        self.dev.flush(chunk, off, n)
+
     def write(self, name: str, data: np.ndarray, offset: int = 0) -> None:
         """Host bytes -> an image (flushed)."""
         data = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
@@ -211,6 +219,42 @@ class V2Device:
 
     def run(self, tr: Transaction) -> None:
         self.dev.dispatch(tr)
+
+    def layout(self) -> dict:
+        """The DDR layout: the host buffers in creation order (name, bytes), per image its buffer, offset and bytes
+        (``restore`` rebuilds it on another device)."""
+        return {"buffers": [(n, self.dev.view(n).nbytes) for n in self.dev.buffers], "images": dict(self._images),
+                "chunk": getattr(self, "_chunk", None), "top": self._top}
+
+    def restore(self, layout: dict) -> None:
+        """``layout()`` of a device built from the same design: the buffers this one lacks allocated in that order (the
+        same names), the images where they were (their bytes zero: the owner writes them)."""
+        for n, nbytes in layout["buffers"]:
+            if n not in self.dev.buffers:
+                self.dev.alloc(n, nbytes)
+        self._images = dict(layout["images"])
+        self._chunk, self._top = layout["chunk"], layout["top"]
+
+    def relocations(self, addrs: list[tuple[int, int]]) -> np.ndarray:
+        """Shim BD addresses of a transaction (``txn.Txn.addrs``) as [word index, buffer number, offset] rows: where
+        ``relocate`` writes them for another device's buffers."""
+        names = list(self.dev.buffers)
+        base = np.array([self.dev.address(n) for n in names], np.int64)
+        order = np.argsort(base)
+        a = np.array([x for _, x in addrs], np.int64)
+        k = order[np.searchsorted(base[order], a, side="right") - 1]
+        size = np.array([self.dev.view(n).nbytes for n in names], np.int64)
+        assert ((a >= base[k]) & (a < base[k] + size[k])).all(), "a shim address outside the buffers"
+        return np.stack([np.array([i for i, _ in addrs], np.int64), k, a - base[k]], 1)
+
+    def relocate(self, words: np.ndarray, rel: np.ndarray) -> np.ndarray:
+        """words with the addresses of ``relocations`` rows rewritten for this device's buffers (a copy)."""
+        base = np.array([self.dev.address(n) for n in self.dev.buffers], np.int64)
+        a = base[rel[:, 1]] + rel[:, 2]
+        out = words.copy()
+        out[rel[:, 0]] = (a & 0xFFFFFFFF).astype(np.uint32)
+        out[rel[:, 0] + 1] = (a >> 32).astype(np.uint32)
+        return out
 
     def warm(self) -> None:
         """An empty dispatch: the first one after new host buffers takes ~0.15 s more than later ones (a model's load

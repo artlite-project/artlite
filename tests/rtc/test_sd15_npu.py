@@ -71,3 +71,18 @@ def test_txt2img(model_dir: str, npu_unet: NpuUNet, npu_vae: NpuVae) -> None:
     diff = np.abs(npu.pixels.astype(int) - cpu.pixels.astype(int)).mean()
     print(f"\nlatents rel err {err:.3e}, pixels mean |diff| {diff:.2f}; npu steps {npu.t_steps:.2f} s")
     assert err < 0.8 and diff < 25
+
+
+def test_load(model_dir: str, npu_unet: NpuUNet, npu_vae: NpuVae) -> None:
+    """``npu.load`` (the npu backend's): built and cached, or restored from the cache (the device's images, the
+    transactions with their shim addresses relocated), then restored again: a step and a decode bit-identical to the
+    models built in this process."""
+    from models.sd15 import npu
+    torch.manual_seed(0)
+    x, ctx, lat = torch.randn(2, 4, 64, 64), torch.randn(2, 77, 768), torch.randn(1, 4, 64, 64)
+    y, img = npu_unet(x, 500.0, ctx), npu_vae(lat)
+    for _ in range(2):
+        unet, vae = npu.load(model_dir)
+        torch.testing.assert_close(unet(x, 500.0, ctx), y, rtol=0, atol=0)
+        torch.testing.assert_close(vae(lat), img, rtol=0, atol=0)
+        del unet, vae

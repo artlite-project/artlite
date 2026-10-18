@@ -63,10 +63,9 @@ def load_backend(name: str, path: str) -> Backend:
                        unet=reference.UNet(os.path.join(path, "unet")),
                        vae=reference.VaeDecoder(os.path.join(path, "vae")))
     if name == "npu":  # (the UNet and the VAE decoder on the NPU, one design; the text encoder on the CPU)
-        from .npu import NpuUNet, NpuVae
-        unet = NpuUNet(os.path.join(path, "unet"))
-        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")), unet=unet,
-                       vae=NpuVae(os.path.join(path, "vae"), unet.net.v2))
+        from . import npu
+        unet, vae = npu.load(path)
+        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")), unet=unet, vae=vae)
     raise ValueError(f"unknown backend {name!r} (backends: {', '.join(BACKENDS)})")
 
 

@@ -80,6 +80,7 @@ class Txn:
         self._ops: list[list[int]] = []
         self.n_ops = 0
         self.n_words = 4  # words so far, with the header
+        self.addrs: list[tuple[int, int]] = []  # (the word index of each shim BD's address low word, the address)
 
     def _add(self, words: list[int]) -> int:
         """Append an operation; returns its word index in ``words()``."""
@@ -142,9 +143,11 @@ class Txn:
             it = ((count - 1) << 20) | (step - 1)
         nxt = 0 if next_bd is None else next_bd << 27 | 1 << 26  # (BD word 7: Next_BD, Use_Next_BD)
         assert next_bd is None or 0 <= next_bd < SHIM_BDS
-        return self.blockwrite(tile_address(col, 0, SHIM_BD0 + BD_BYTES * bd),
-                               [*bd_words(address, nbytes), d0, _BD_BURST_512B | d1, _BD_AXCACHE | d2, it,
-                                _BD_VALID | nxt]) + 4
+        at = self.blockwrite(tile_address(col, 0, SHIM_BD0 + BD_BYTES * bd),
+                             [*bd_words(address, nbytes), d0, _BD_BURST_512B | d1, _BD_AXCACHE | d2, it,
+                              _BD_VALID | nxt]) + 4
+        self.addrs.append((at + 1, address))
+        return at
 
     def shim_push(self, col: int, direction: int, channel: int, bd: int, *, token: bool = False,
                   repeat: int = 1) -> None:

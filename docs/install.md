@@ -56,7 +56,9 @@ Which files run: [Models](models/README.md).
 ## Build cache
 
 The first run of a model compiles its NPU designs into `~/.cache/artlite` (`ARTLITE_CACHE_DIR`), keyed by their
-content: later runs load them. The cache only grows; deleting it is safe (the next runs rebuild what they need).
+content: later runs load them. Stable Diffusion's npu backend also keeps its built weight images and dispatches there
+(~1 GB per model directory, the latest build only). The cache only grows; deleting it is safe (the next runs rebuild
+what they need).
 
 ## Troubleshooting
 
