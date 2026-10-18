@@ -399,11 +399,6 @@ class ArtcOperator:
         result = out.to_torch()
     """
 
-    # Designs whose variants keep the cores' main byte for byte and differ only in kernels after it: a library program
-    # switches between two of them by rewriting program memory (``fused.program.program_memory_patch``). Other designs
-    # differ in main too (loop counts), which the cores have partly run when they wait for the next entry.
-    PROGRAM_MEMORY_VARIANTS = False
-
     def __new__(cls, *args: object, **kwargs: object) -> Self:
         self = super().__new__(cls)
         self._ctor = (args, kwargs)  # (the render manifest's key: ``render_cache``)

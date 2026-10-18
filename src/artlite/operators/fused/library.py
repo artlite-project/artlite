@@ -17,7 +17,7 @@ from ...elf_parser import ParsedElf
 from ..base import ArtcOperator
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
-from .program import PIECE_BYTES, Assembler, Item, RawTxn
+from .program import PIECE_BYTES, Assembler, Item
 
 
 class Library(FusedElf):
@@ -54,8 +54,7 @@ class Library(FusedElf):
         code, bds = self._control_program(elf, lambda bd: 0)  # (the items' addresses: written per item)
         slots = [(s.offset, s.offset + s.nbytes, e, k)
                  for e, (_, *names) in enumerate(self.runlist) for k, s in enumerate(map(self.layout.span, names))]
-        variants = {e for e, (op, *_) in enumerate(self.runlist) if op.PROGRAM_MEMORY_VARIANTS}
-        self._asm = Assembler(code, bds, slots, variants)
+        self._asm = Assembler(code, bds, slots)
         assert len(self._asm.blocks) == len(self.runlist), (len(self._asm.blocks), len(self.runlist))
         self._dispatch_bufs = list(self._pdis.values())
         if self._asm.packet_bytes:  # (the configurations' control packets: ``ctrlpkt``)
@@ -79,7 +78,7 @@ class Library(FusedElf):
             self._piece_bos = [self._device.alloc_insts_buffer(PIECE_BYTES) for _ in range(2)]
         key = None
         if len(bounds) == 2 and not hooks:  # (a program of one piece run again: still in the BO of its parity)
-            key = (hash(tuple((e, addrs if isinstance(addrs, RawTxn) else tuple(addrs)) for e, addrs in items)), asm.parity)
+            key = (hash(tuple((e, tuple(addrs)) for e, addrs in items)), asm.parity)
             held = self._held[asm.parity]
             if held is not None and held[0] == key:
                 kern.dispatch_elf_async(self._piece_bos[asm.parity], refs, held[1])

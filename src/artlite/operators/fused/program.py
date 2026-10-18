@@ -7,18 +7,13 @@ configuration only where the previous item is of another design:
 
 - the configurations' PDI loads alternate between the library's two (the firmware skips the load, and with it the
   array reset, of the PDI it loaded last);
-- between variants of one array design (operators with ``PROGRAM_MEMORY_VARIANTS``) the differing program-memory
-  words instead of the configuration (``program_memory_patch``);
 - a RunOp again right after its own design: the form with a poll for a free task-queue slot before each shim task
   push (``Run.guarded``);
 - memory-tile BDs the registers already hold since the last configuration left out (``Run.emit``);
 - the configurations without the writes their PDI load's array reset makes redundant, a tile's stream switch ports
   as blockwrites (``_prune``: 57% fewer configuration operations in a Llama prefill chunk, -6% time at 1K tokens);
 - the cores' program memory by control packets where they cost less than blockwrites (``ctrlpkt``: a Llama 1B chunk
-  of 128 tokens 43 -> 35 ms), from a packet buffer the library allocates (``Assembler.place``);
-- an item may be a host-built transaction (``RawTxn``) on an entry's design instead of its RunOp: its operations after
-  the configuration (it must leave every token waited for and need no BD the array held: the BDs are written again
-  after it).
+  of 128 tokens 43 -> 35 ms), from a packet buffer the library allocates (``Assembler.place``).
 """
 
 from __future__ import annotations
@@ -27,7 +22,6 @@ import functools
 import itertools
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple
 
 import numpy as np
 
@@ -39,15 +33,7 @@ from .elf import ShimBd
 # heap with the library's PDIs
 PIECE_BYTES = 24 << 20
 
-class RawTxn:
-    """A host-built transaction (``txn.Txn.words()``: header, then its operations) run as an item on an entry's
-    design (identity-hashed: ``words`` are fixed once it has run, the library keeps assembled programs)."""
-
-    def __init__(self, words: np.ndarray):
-        self.words = np.ascontiguousarray(words, np.uint32)
-
-
-Item = tuple[int, "Sequence[int] | RawTxn"]  # (entry, the device addresses of its arguments, or a raw transaction)
+Item = tuple[int, Sequence[int]]  # (entry, the device addresses of its arguments)
 Slot = tuple[int, int, int, int]  # (scratch start, end, entry, argument): where the ELF placed an entry's argument
 
 _CORE_CONTROL = 0x32000  # a core's control register (enable: bit 0)
@@ -60,7 +46,6 @@ _CORE_LOCKS, _MEM_LOCKS = (0x1F000, 0x1F100), (0xC0000, 0xC0400)  # lock values 
 # a reset; AM025)
 _SWITCH_PORTS = {0: ((0x3F000, 0x3F058), (0x3F100, 0x3F15C)), 1: ((0xB0000, 0xB0044), (0xB0100, 0xB0148)),
                  2: ((0x3F000, 0x3F05C), (0x3F100, 0x3F164))}
-_PROGRAM_MEMORY = (0x20000, 0x24000)  # a core's program memory
 _MEM_TILE_BDS = (0xA0000, 0xA0600)  # a memory tile's BD registers (48 BDs of 8 words)
 # (word 6: Iteration_Current 28:23, which the DMA advances each time it loads the BD, Iteration_Wrap 22:17,
 # Iteration_Stepsize 16:0: a BD with an iteration does not keep its written value, AM029 DMA_BD0_6)
@@ -200,51 +185,6 @@ class Block:
     packets: list[tuple[int, np.ndarray]] = field(default_factory=list)
 
 
-class Patch(NamedTuple):
-    words: np.ndarray
-    n_ops: int
-
-
-def program_memory_patch(a: Block, b: Block, gap: int = 8) -> Patch | None:
-    """When the configurations of two designs differ only in the cores' program memory (variants of one array design:
-    the same routes, buffers, locks and core main, other kernels at the end of .text), the operations that turn an
-    array running a into b: blockwrites of b's differing words (runs closer than ``gap`` words merged), no PDI load (its
-    reset would clear the registers the variants share; it leaves memories as they were). Only the configurations are
-    compared: the caller ensures the same core main
-    (``ArtcOperator.PROGRAM_MEMORY_VARIANTS``). The cores wait in their main between entries, past its loop's setup
-    (trip counts in registers): rewritten there, a's values would run b's next entry."""
-    ra, pa = _split_program_memory(a.config[4:])
-    rb, pb = _split_program_memory(b.config[4:])
-    if ra.shape != rb.shape or (ra != rb).any() or set(pa) != set(pb):
-        return None
-    parts, n = [], 0
-    for reg, new in pb.items():
-        old = pa[reg]
-        diff = np.ones(len(new), bool)
-        m = min(len(old), len(new))
-        diff[:m] = new[:m] != old[:m]
-        idx = np.flatnonzero(diff)
-        for run in np.split(idx, np.flatnonzero(np.diff(idx) > gap) + 1) if len(idx) else ():
-            s, e = int(run[0]), int(run[-1]) + 1
-            parts += [np.array([txn.OP_BLOCKWRITE, 0, reg + 4 * s, 4 * (4 + e - s)], np.uint32), new[s:e]]
-            n += 1
-    return Patch(np.concatenate(parts) if parts else np.zeros(0, np.uint32), n)
-
-
-def _split_program_memory(cfg: np.ndarray) -> tuple[np.ndarray, dict[int, np.ndarray]]:
-    """A configuration (after its PDI load) without the cores' program-memory blockwrites, and those
-    ({address: words})."""
-    rest, pm = [], {}
-    ops = txn.op_offsets(cfg)
-    for (p, op), e in zip(ops, [q for q, _ in ops[1:]] + [len(cfg)]):
-        reg = int(cfg[p + 2]) if op == txn.OP_BLOCKWRITE else 0
-        if op == txn.OP_BLOCKWRITE and _row(reg) >= 2 and _PROGRAM_MEMORY[0] <= reg & 0xFFFFF < _PROGRAM_MEMORY[1]:
-            pm[reg] = cfg[p + 4:e]
-        else:
-            rest.append(cfg[p:e])
-    return (np.concatenate(rest) if rest else np.zeros(0, np.uint32)), pm
-
-
 def _prune(cfg: np.ndarray, zero: Collection[int] = ()) -> tuple[np.ndarray, list[int]]:
     """A configuration (after its PDI load: an array reset) with fewer operations (each costs the firmware ~0.1 us):
     without the writes the reset makes redundant (lock values written the value they hold, 0 after the reset, before
@@ -318,12 +258,11 @@ def _prune(cfg: np.ndarray, zero: Collection[int] = ()) -> tuple[np.ndarray, lis
     return np.concatenate(keep), left
 
 
-def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot], variants: Collection[int] = ()
+def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
          ) -> tuple[np.ndarray, np.ndarray, list[Block], list[np.ndarray]]:
     """A library ELF's control program (patched, 32-bit words) -> its header, its preamble (the operations before the
     first PDI load: the scratchpad's creation), one ``Block`` per entry and the two PDI loads its configurations
-    alternate between. ``bds``: its data BDs, ``slots``: where the ELF placed each entry's arguments; ``variants``:
-    entries whose program memory stays blockwrites (``program_memory_patch`` compares them)."""
+    alternate between. ``bds``: its data BDs, ``slots``: where the ELF placed each entry's arguments."""
     ops = [(p + 4, op) for p, op in txn.op_offsets(code[4:])]
     starts = [p for p, _ in ops] + [len(code)]
     loads = [i for i, (_, op) in enumerate(ops) if op == txn.OP_LOAD_PDI] + [len(ops)]
@@ -349,7 +288,7 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot], variant
         assert all(slots[i][2] == e for i in k) and (bd_start[sel] < [slots[i][1] for i in k]).all(), \
             f"block {e}: BD arguments"
         cfg, loader = code[lo + 4:mid], None
-        if ctrlpkt.ENABLED and e not in variants:
+        if ctrlpkt.ENABLED:
             without, pm = ctrlpkt.split(cfg)
             if pm and ctrlpkt.worth(candidate := ctrlpkt.Loader(pm)):
                 cfg, loader = without, candidate
@@ -370,14 +309,10 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot], variant
 
 
 class Assembler:
-    """Programs of a library ELF's blocks (``_cut``). ``variants``: the entries whose operators set
-    PROGRAM_MEMORY_VARIANTS (the designs between which a program-memory patch replaces the configuration)."""
+    """Programs of a library ELF's blocks (``_cut``)."""
 
-    def __init__(self, code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot], variants: Collection[int]):
-        self.header, self.preamble, self.blocks, self.loadpdi = _cut(code, bds, slots, variants)
-        firsts = sorted({blk.design for blk in self.blocks if blk.design in variants})
-        self.patches = {(a, b): p for a in firsts for b in firsts
-                        if a != b and (p := program_memory_patch(self.blocks[a], self.blocks[b])) is not None}
+    def __init__(self, code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]):
+        self.header, self.preamble, self.blocks, self.loadpdi = _cut(code, bds, slots)
         self.parity = 1  # (the PDI load of the next configuration; the first: the second, as aiecc starts)
         self._offsets: dict[bytes, int] = {}  # (each distinct packet stream's byte offset in the packet buffer)
         self.packet_bytes = 0
@@ -397,15 +332,9 @@ class Assembler:
                 a = address + self._offsets[p.tobytes()]
                 blk.config[w], blk.config[w + 1] = a & 0xFFFFFFFF, a >> 32
 
-    def _switch(self, e: int, prev: int | None) -> tuple[Patch | None, bool]:
-        """How item ``e`` follows item ``prev``: (the program-memory patch, whether a configuration) before it."""
-        if prev is None:
-            return None, True
-        d0, d1 = self.blocks[prev].design, self.blocks[e].design
-        if d0 == d1:
-            return None, False
-        patch = self.patches.get((d0, d1))
-        return patch, patch is None
+    def _configure(self, e: int, prev: int | None) -> bool:
+        """Whether item ``e`` after item ``prev`` takes its design's configuration."""
+        return prev is None or self.blocks[prev].design != self.blocks[e].design
 
     def assemble(self, items: Sequence[Item]) -> np.ndarray:
         """A control program (a TXN) of the items; advances ``parity``."""
@@ -413,24 +342,8 @@ class Assembler:
         state = np.full((64, (_MEM_TILE_BDS[1] - _MEM_TILE_BDS[0]) // 4), -1, np.int64)  # (per column: the BDs held)
         for e, addrs in items:
             blk = self.blocks[e]
-            patch, configure = self._switch(e, prev)
-            if isinstance(addrs, RawTxn):  # (its design's configuration, then its operations)
-                assert patch is None, "a raw transaction after a program-memory patch"
-                if configure:
-                    cfg = blk.config.copy()
-                    cfg[:4] = self.loadpdi[self.parity]
-                    self.parity ^= 1
-                    parts.append(cfg)
-                    n_ops += blk.n_config
-                parts.append(addrs.words[4:])
-                n_ops += int(addrs.words[2])
-                state[:] = -1
-                prev = e
-                continue
-            if patch is not None:  # (no reset: queued tasks may remain)
-                parts.append(patch.words)
-                n_ops += patch.n_ops
-            elif configure:
+            configure = self._configure(e, prev)
+            if configure:
                 cfg = blk.config.copy()
                 cfg[:4] = self.loadpdi[self.parity]
                 self.parity ^= 1
@@ -453,14 +366,10 @@ class Assembler:
         """The item bounds of a program's pieces: ``splits``, and a cut at the last change of design before a piece
         would exceed PIECE_BYTES."""
         def nbytes(i: int, prev: int | None) -> int:  # (as ``assemble`` emits it, all memory-tile BDs written)
-            e, addrs = items[i]
-            blk = self.blocks[e]
-            patch, configure = self._switch(e, prev)
-            if isinstance(addrs, RawTxn):
-                return 4 * ((blk.config.size if configure else 0) + addrs.words.size - 4)
-            if configure:
+            blk = self.blocks[items[i][0]]
+            if self._configure(items[i][0], prev):
                 return 4 * (blk.config.size + blk.run.words.size)
-            return 4 * ((patch.words.size if patch is not None else 0) + blk.run.guarded.words.size)
+            return 4 * blk.run.guarded.words.size
 
         empty = 4 * (4 + self.preamble.size)
         forced = set(splits) | {len(items)}

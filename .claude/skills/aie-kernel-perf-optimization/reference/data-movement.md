@@ -206,17 +206,9 @@ offsets): aie2p-coding section 8. For speed:
   was most of a 1.29 MB PDI).
 - **Program memory is the tight resource** in overlays (16 KB for all phases): SKILL.md section 7.
 - **Library entries of one array design share one compiled device** (`fused.Library`: an overlay's
-  operators differ only in their runtime sequences): one design compiled, not one per entry (the SD 1.5 UNet: 157
-  entries, 3 devices, ~2 min). Runtime-task BD ids are numbered per device, so pin the static design's memtile BD ids
-  (`Bd(bd_id=)`): variants of a design must configure alike.
-- **Variants of one design switch by a program-memory patch** (`fused.program.program_memory_patch`: the differing
-  words, no PDI load): ~0.2-0.4 ms instead of a 1.15 ms reconfiguration
-  (SD 1.5: a conv variant and a transformer variant, 20 switches per step). The variants' shared code must be
-  byte-identical (artlite.operators.sd15.overlay's docstring: weak trampolines, an ordering table, stubs with an
-  opaque side effect, no deferred helpers); check `llvm-nm -n` of both core ELFs. The core main must be identical
-  too, so a design opts in (`ArtcOperator.PROGRAM_MEMORY_VARIANTS`): the cores wait for the next entry past their
-  loop's setup, so variants whose mains differ (GemmQd K parts of different k-chunk counts) would run with the first
-  one's (NaN).
+  operators differ only in their runtime sequences): one design compiled, not one per entry. Runtime-task BD ids are
+  numbered per device, so pin the static design's memtile BD ids (`Bd(bd_id=)`): variants of a design must configure
+  alike.
 - **A ConfigureOp's single writes cost as much as its program memory.** aiecc's expansion writes, per core, every
   lock value (0 after the reset), the DMA channels' and the core's reset pulses and each stream switch port alone:
   ~2500 operations for a 32-core design. `program._prune` drops what the PDI load's array reset already holds and
