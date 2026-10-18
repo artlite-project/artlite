@@ -139,6 +139,8 @@ class ModelOverlay:
                 act[self.loadr + (c * SLOTS + s) * XB:][:4 * META] = mp.loadr_meta(s).view(np.uint8)
         self._load()
         dev.flush("ACT")
+        if (store := self.op.page_store()) is not None:  # (paged formats: their pages loadable before every dispatch)
+            dev.set_prologue(self.op.page_prologue(store))
         self.reset()
 
     def _load(self) -> None:

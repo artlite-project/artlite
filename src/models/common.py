@@ -291,6 +291,7 @@ class OverlayModel(NpuModel):
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
                                     tokens[i + n:i + n + m]) if m else None
             self.prefill.run(*args, self.position, T)
+            self.overlay.dev.stale = True  # (another hardware context ran: ``OverlayDevice.set_prologue``)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches

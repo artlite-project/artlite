@@ -24,8 +24,8 @@ from ..overlay.decode import C_LEN, META, NX_PER_NORM, DecodeOverlayOperator, _S
 class LlamaDecodeOperator(DecodeOverlayOperator):
     """The Llama decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of 1024
     columns (``tile_bytes``); ``attn``: the attention cores' shapes (None: without); ``gu_win``: the gate / up
-    tiles hold fewer than 16 rows (Q5_K, Q6_K: ``DecodeOverlayOperator``); ``solo``: formats whose tiles the helpers run
-    alone (``DecodeOverlayOperator``)."""
+    tiles hold fewer than 16 rows (Q5_K, Q6_K: ``DecodeOverlayOperator``); ``paged``: formats whose kernels are code
+    pages (``DecodeOverlayOperator``)."""
 
     PREFIX = "l3d"
     ATTN_STACK = 3072
@@ -34,12 +34,12 @@ class LlamaDecodeOperator(DecodeOverlayOperator):
     ATTN_A_DEPTH = 2  # (the attention cores' cache objects in L1: one arrives while the core works on the other)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float = 1e-5, attn: Attn | None = None,
-                 gu_win: bool = False, solo: tuple[str, ...] = (), win: str = ""):
+                 gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
         assert all(gemv.supported(f, 4) for f in rows), rows
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes and attn.chain == 1)
         self.attn = attn
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu", packed=True,
-                         tok=True, gu_win=gu_win, solo=solo, win=win)
+                         tok=True, gu_win=gu_win, paged=paged, win=win)
 
     def _extra_src(self, p: str, consts: dict[str, int]) -> str:
         if self.attn is None:

@@ -45,7 +45,7 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 Time to first token at 1K / 8K / 32K prompt tokens: 1B Q4_0 0.109 / 1.07 / 8.59 s, 3B Q4_K_M 0.305 / 2.78 / 19.1 s,
 8B Q4_K_M 0.653 / 6.16 / 40.9 s; a 48-token chat prompt: 1B Q4_0 35 ms, 3B 70 ms, 8B 129 ms. Decode per token at 100 /
 32K positions (Q4_K_M): 1B 14.8 / 25.6 ms, 3B 36.7 / 74.2 ms, 8B 83.3 / 125.8 ms (hi + lo K at 32K: 30.7 / 92.6 /
-147.2 ms); at 100 positions 1B Q4_0 14.1, Q4_1 15.1, Q3_K_L 14.2, BF16 25.0 ms, 3B Q2_K 26.3, Q3_K_M 32.3 ms. Quality vs the CPU model
+147.2 ms); at 100 positions 1B Q4_0 14.1, Q4_1 15.1, Q3_K_L 14.2, BF16 25.0 ms, 3B Q2_K 26.3, Q3_K_M 31.9 ms. Quality vs the CPU model
 on the same weights (three chat prompts and three essay windows through the prefill, their continuations
 teacher-forced): KL 0.0016 / 0.0011 / 0.0011 for 1B / 3B / 8B.
 

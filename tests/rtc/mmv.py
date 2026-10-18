@@ -326,10 +326,10 @@ class MmvOperator(ArtcOperator):
     into the second one's memory.
 
     Args: A (n_tiles tile_bytes uint8), X (x panels + sum panels of a chunk, uint8), OUT (n_tiles x ``y_floats`` fp32:
-    [g][slot][r]). ``solo``: the second core runs the whole tile (``render(solo=)``)."""
+    [g][slot][r])."""
 
-    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, solo: bool = False):
-        self.fmt, self.n_tiles, self.tile_bytes, self.chunk, self.solo = fmt, n_tiles, tile_bytes, Chunk(nsb), solo
+    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4):
+        self.fmt, self.n_tiles, self.tile_bytes, self.chunk = fmt, n_tiles, tile_bytes, Chunk(nsb)
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
         self.hy = helper_y(fmt, nsb)  # (where the second core's rows go)
         self.yn = 128 if self.rows > 16 and not row_split(fmt, nsb) else Y_FLOATS  # (a core's output)
@@ -345,8 +345,7 @@ class MmvOperator(ArtcOperator):
         fid, ch = FORMATS[self.fmt].fid, self.chunk
         n = ch.xp + ch.xs
         x1 = 0 if row_split(self.fmt, ch.nsb) else ch.xp // 2  # (the second core's panels)
-        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb,
-                      solo=(self.fmt,) if self.solo else ()) + f"""
+        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb) + f"""
 extern "C" {{
 void mmvh_copy(const uint8_t *__restrict x, uint8_t *__restrict xb)
 {{

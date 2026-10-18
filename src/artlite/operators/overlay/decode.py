@@ -40,23 +40,30 @@ The main core's program, per X object (``_begin``):
   after the tiles the residual goes out (bf16).
 
 Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``kernels.py`` (and ``gemv.py``).
+
+Paged formats (``paged``: a model whose formats' kernels do not fit the cores together): their kernels are code pages
+(``paging``, the memtile transport): per column the main and helper cores request a format's page for their half
+before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes; the
+pager's state words and wake lock on both cores), which ``page_store`` links and the device loads before a dispatch
+whenever it is stale (``runtime.OverlayDevice.set_prologue``: first, then after another hardware context ran).
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
 import torch
 from aie.ir import Module
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import forever_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ... import txn
-from .. import act_lut
+from .. import act_lut, paging
 from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, linear_tap, range32
 from ..formats import FORMATS
@@ -119,6 +126,12 @@ S_NPS, S_SCALE, S_COL, S_H8, S_IH, S_NAS = 44, 45, 48, 49, 50, 52
 N_TOK = 8
 S_WORDS = 64
 assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS
+# paged formats (module docstring): the memtile's page channel, its first page BD (none of aiecc's: ``Store.check``), the
+# store's bytes; the pager's state words (data memory of the main and helper cores) and wake lock; the stream ids of
+# the pages' and the requests' routes (main, helper)
+PG_CH, PG_BD, PG_STORE, PG_STORE_BYTES = 5, 40, 0x78000, 0x8000
+PG_STATE, PG_WAKE = 0xFFE0, 15  # (32-byte aligned: aiecc)
+PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 # the event windows of a stats build (DecodeOverlayOperator(win=)): main's half tile, the helper's, main's row
 # epilogue (collect), the helper's input objects
 WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}  # (gap: a phase's last tile to the next X object; gapm: to the next phase's)  # (pre: a phase's begin to its first tile)
@@ -166,13 +179,13 @@ class DecodeOverlayOperator(ArtcOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
-                 gu_win: bool = False, solo: tuple[str, ...] = (), win: str = ""):
+                 gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
         count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold fewer
-        than 16 rows (their [8 gate | 8 up] groups cross tiles: a window per slot); solo: formats whose tiles the
-        helpers run alone, both halves (``gemv.render(solo=)``: the main cores' program memory without their kernels)."""
+        than 16 rows (their [8 gate | 8 up] groups cross tiles: a window per slot); paged: formats whose kernels are
+        code pages (module docstring)."""
         self.chunk = gemv.Chunk(nsb)
         self.max_g = MAX_K // self.chunk.k  # K chunks of a phase's group
         assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= MAX_K
@@ -180,7 +193,8 @@ class DecodeOverlayOperator(ArtcOperator):
         assert act in ("silu", "gelu") and (not pli or act == "gelu")
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
-        self.solo = tuple(sorted(solo))
+        self.paged = tuple(sorted(paged))
+        assert set(self.paged) <= set(rows), (paged, rows)
         assert not gu_win or act == "silu"
         self.rowsplit = sorted(f for f in rows if gemv.row_split(f, nsb))
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
@@ -242,8 +256,8 @@ class DecodeOverlayOperator(ArtcOperator):
         consts = self._consts()
         fmts = list(self.rows)
         assert not self.xh or OBJ_K * 2 == self.chunk.k
-        x0 = -(self.max_g * self.chunk.xp // 2 if self.xh else self.chunk.xp // 2)  # (core 1's panels -> core 0's)
-        src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, solo=self.solo, solo_x0=x0)
+        src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
+                          pg=self._page_spec() if self.paged else None)
         if self.act == "silu":
             src += "\nnamespace {\n" + act_lut.render_silu() + "\n}  // namespace\n"
         src += self._extra_src(p, consts)
@@ -264,6 +278,42 @@ class DecodeOverlayOperator(ArtcOperator):
                                  COLS=COLS,
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
                                  **consts)
+
+    def _page_spec(self) -> gemv.PageSpec:
+        """The pager of the paged formats (main core: half 0, helper: half 1)."""
+        (h0, ctl), (h1, _) = (paging.request(stream_id=i, channel=PG_CH) for i in PG_REQ_ID)
+        return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1),
+                             bd0=(PG_BD, PG_BD + len(self.paged)), ctl=ctl)
+
+    def page_store(self) -> paging.Store | None:
+        """The compiled design's page store (the paged formats' pages of the main cores, then of the helpers), checked
+        against the design's configuration; None without paged formats."""
+        if not self.paged:
+            return None
+        wd = os.path.dirname(self._program.insts_path)
+        fp = f"{self.pfx}m"
+
+        def pager(h: int, row: int, stack: int) -> paging.Pager:
+            pages = gemv.page_entries(fp, self.paged, h)
+            return paging.link(wd, pages=pages, pager=f"{fp}_pg_request",
+                               calls={f"{fp}_mmv": tuple(e for es in pages.values() for e in es)},
+                               roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
+                               cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
+                               stream_id=PG_PAGE_ID[h])
+        store = paging.Store(base=PG_STORE, size=PG_STORE_BYTES, channel=PG_CH, bd0=PG_BD,
+                             pagers=(pager(0, self.MAIN_ROW, self.STACK), pager(1, self.HELPER_ROW, self.HELPER_STACK)))
+        store.check(wd, range(COLS))
+        return store
+
+    def page_prologue(self, store: paging.Store) -> np.ndarray:
+        """The transaction that makes the pages loadable: the store and its BDs in every memtile, every paging core's
+        state words cleared (a configuration rewrites the slot's start with the startup code)."""
+        t = txn.Txn()
+        store.load(t, range(COLS))
+        for c in range(COLS):
+            for row in (self.MAIN_ROW, self.HELPER_ROW):
+                t.write32(txn.tile_address(c, row, PG_STATE), 0)
+        return t.words()
 
     @property
     def d_cols(self) -> list[int]:
@@ -318,6 +368,8 @@ class DecodeOverlayOperator(ArtcOperator):
 
         def main_fn(a_f, x_f, c_f, cmd_f, res_f, *rest):
             rest = list(rest)
+            if self.paged:  # (the pager's state words and the column's page store: placed, used by no code here)
+                rest = rest[:-2]
             m_f = rest.pop(0) if self.msg else None
             r_f = rest.pop(0) if self.relay else None
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
@@ -408,7 +460,7 @@ class DecodeOverlayOperator(ArtcOperator):
                         c_f.release(1)
                         r_f.release(1)
 
-        def helper_fn(cmd_f, res_f, htask, hs, sq, xp):
+        def helper_fn(cmd_f, res_f, htask, hs, sq, xp, *pg):
             for _ in forever_():
                 c = cmd_f.acquire(1)
                 r = res_f.acquire(1)
@@ -416,7 +468,20 @@ class DecodeOverlayOperator(ArtcOperator):
                 res_f.release(1)
                 cmd_f.release(1)
 
-        workers = []
+        workers, pg_flows, pg_locks, pg_main, pg_help = [], [], [], {}, {}
+        st_ty = np.ndarray[(paging.STATE_WORDS,), i32]
+        for c in range(COLS):  # (paged formats: per core its state words and wake lock, per column its store and routes)
+            if not self.paged:
+                break
+            mem, main, helper = Tile(c, 1), Tile(c, mr), Tile(c, hr)
+            store = Buffer(np.ndarray[(PG_STORE_BYTES // 4,), i32], tile=mem, name=f"{P}_pgstore{c}", address=PG_STORE)
+            pg_main[c] = [Buffer(st_ty, tile=main, name=f"{P}_pgst{c}_{mr}", address=PG_STATE), store]
+            pg_help[c] = [Buffer(st_ty, tile=helper, name=f"{P}_pgst{c}_{hr}", address=PG_STATE)]
+            pg_locks += [Lock(main, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{mr}"),
+                         Lock(helper, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{hr}")]
+            for h, t in enumerate((main, helper)):
+                pg_flows += [paging.page_flow(mem, t, channel=PG_CH, stream_id=PG_PAGE_ID[h]),
+                             paging.request_flow(t, mem, stream_id=PG_REQ_ID[h])]
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}")
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
@@ -427,10 +492,11 @@ class DecodeOverlayOperator(ArtcOperator):
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
                                             *([r_fifos[c].cons()] if self.relay else []), k_begin, k_nbegin, k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
-                                            *([k_psums] if self.post else []), ws, xp, xs, c],
+                                            *([k_psums] if self.post else []), ws, xp, xs, c, *pg_main.get(c, [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
-            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp], tile=Tile(c, hr),
+            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *pg_help.get(c, [])],
+                                  tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos)
         extra, d_fifos = self._extra_workers(s)
@@ -453,6 +519,10 @@ class DecodeOverlayOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(a_n,), bf], np.ndarray[(x_n,), bf], np.ndarray[(c_n,), bf],
                            a_prod, x_prod, c_cons, d_cons])
+        for f in pg_flows:
+            rt.add_flow(f)
+        for lk in pg_locks:
+            rt.add_lock(lk)
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
     def check_endpoints(self, insts: np.ndarray) -> None:

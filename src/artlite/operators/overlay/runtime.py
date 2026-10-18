@@ -233,6 +233,20 @@ class OverlayDevice:
         self._loaded = np.zeros(0, np.uint32)  # (the words load() wrote)
         self.buffers: dict[str, object] = {}
         self._submitted: tuple[Transaction, float] | None = None  # (``submit``: the running one, its start)
+        self._prologue: Transaction | None = None
+        self.stale = False  # (``set_prologue``)
+
+    def set_prologue(self, words: np.ndarray) -> None:
+        """A transaction run before the next dispatch whenever ``stale``: state the design keeps on the array beyond its
+        configuration (code pages' stores: ``paging.Store``), lost when another hardware context ran on the device (its
+        owner then sets ``stale``). Stale from here on."""
+        self._prologue = Transaction(self, words)
+        self.stale = True
+
+    def _fresh(self) -> None:
+        if self.stale and self._prologue is not None:
+            self.stale = False
+            self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
 
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
         """A zeroed host buffer the NPU can read and write; returns its uint8 view. The NPU's DMA
@@ -278,6 +292,7 @@ class OverlayDevice:
         """Run a transaction (default: the loaded one); blocking. The DispatchError of a transaction
         the driver's hang detection stopped names the operations where the firmware was."""
         try:
+            self._fresh()
             if transaction is None:
                 self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
                 return
@@ -292,6 +307,7 @@ class OverlayDevice:
     def submit(self, transaction: Transaction) -> None:
         """Start a transaction and return: ``wait`` waits for it (the host prepares the next one meanwhile)."""
         assert self._submitted is None, "a transaction is running"
+        self._fresh()
         self._submitted = (transaction, time.perf_counter())
         self._prog._kernel().dispatch_async(transaction.buffer, list(self.buffers.values()))
 

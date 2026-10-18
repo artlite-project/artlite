@@ -100,21 +100,20 @@ def check_formats(image: LlamaImage) -> set[str]:
     return fmts
 
 
-def solo_formats(gguf: GGUFFile, fmts: set[str]) -> tuple[str, ...]:
-    """The formats whose tiles the helper cores run alone (``LlamaDecodeOperator(solo=)``): the main cores' program
-    memory holds the kernels of three formats; of four or more (Q3_K_M: Q3_K, Q4_K, Q5_K, Q6_K), the one of the fewest
-    bytes in the file goes, if they are under 5% of its weights (its tiles then take one core's time for both halves).
-    By the whole file: the same choice for any layers and vocabulary the overlay runs."""
+def paged_formats(gguf: GGUFFile, fmts: set[str]) -> tuple[str, ...]:
+    """The formats whose kernels are code pages (``LlamaDecodeOperator(paged=)``): the main cores' program memory holds
+    the kernels of three formats; of four or more (Q3_K_M: Q3_K, Q4_K, Q5_K, Q6_K) the one of the most bytes in the file
+    stays and the others share a page slot (two would leave the slot less than a page: the pager and the paged
+    dispatch take ~0.5 KB). A page loads when a tile of another paged format comes (Q3_K_M: Q5_K and Q4_K in the first
+    layers, Q4_K for the rest, the LM head's Q6_K, a few per step). By the whole file: the same choice for any layers and
+    vocabulary the overlay runs."""
     if len(fmts) < 4:
         return ()
     nbytes = dict.fromkeys(fmts, 0)
     for _, qtype, _, n in gguf.tensor_info.values():
         if has_tile_format(qtype) and tile_format(qtype) in nbytes:
             nbytes[tile_format(qtype)] += n
-    f = min(nbytes, key=lambda f: nbytes[f])
-    if nbytes[f] * 20 >= sum(nbytes.values()):
-        raise NotImplementedError(f"{', '.join(sorted(fmts))} tiles: the decode's main cores hold three formats' kernels")
-    return (f,)
+    return tuple(sorted(sorted(fmts, key=lambda f: -nbytes[f])[1:]))
 
 
 @dataclass
@@ -156,7 +155,7 @@ class LlamaOverlay(ModelOverlay):
                             eps=cfg.rms_norm_eps, a_bytes=self.T)
         gu = {b.R for L in self.layers for b in img.region(L, "gate_up").blocks}
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
-                                      eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16}, solo=solo_formats(gguf, fmts))
+                                      eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16}, paged=paged_formats(gguf, fmts))
         self.rec = kv.Records(self.hd, self.kp)
         self.pg = at.pg[self.hd]  # positions per cache group
         self.n_groups = -(-max_positions // self.pg)

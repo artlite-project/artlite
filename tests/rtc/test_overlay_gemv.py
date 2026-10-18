@@ -103,6 +103,7 @@ GEMV = [
     ("Q8_0", 9216, 2, ("gemma", "Q4_0"), "token_embd.weight"),
     ("Q4_K", 9280, 4, ("llama", "Q4_K_M", "1B"), "blk.0.ffn_gate.weight"),
     ("Q5_K", 9280, 4, ("llama", "Q5_K_M", "1B"), "blk.0.ffn_gate.weight"),
+    ("Q5_K", 9856, 4, ("llama", "Q3_K_M", "3B"), "blk.0.attn_v.weight"),
     ("Q6_K", 9280, 4, ("llama", "Q4_K_M", "1B"), "blk.0.attn_v.weight"),
     ("BFP16", 9216, 4, ("llama", "BF16", "1B"), "blk.0.ffn_gate.weight"),
     ("Q4_0", 9280, 4, ("llama", "Q4_0", "1B"), "blk.0.ffn_gate.weight"),
@@ -124,13 +125,7 @@ def test_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str,
     _check_gemv(fmt, S_BYTES, NSB, key, name, S)
 
 
-@pytest.mark.parametrize("S", [1, 4])
-def test_gemv_solo(S: int) -> None:
-    """A solo format (``gemv.render(solo=)``: the second core runs both halves of its tiles): Q3_K_M's Q5_K."""
-    _check_gemv("Q5_K", 9856, 4, ("llama", "Q3_K_M", "3B"), "blk.0.attn_v.weight", S, solo=True)
-
-
-def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int, solo: bool = False) -> None:
+def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int) -> None:
     path = _path(key)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
@@ -138,7 +133,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
     assert tile_format(t.qtype) == fmt
     KC = 256 * NSB
     n_tiles = 3
-    op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB, solo=solo)
+    op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB)
     R = op.rows
     t.rows, t.raw = n_tiles * R, t.raw[:n_tiles * R]
     f = t.fields()

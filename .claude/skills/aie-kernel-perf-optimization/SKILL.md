@@ -297,8 +297,11 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   Self-DMA (sd15: the page in two B slots of its input stream, its MM2S 1 into its own TileControl): ~2.4 B / cycle of
   slots, 2.7 µs for two 5760-B slots whatever the code; the host knows each row's role and puts the page before the op
   that needs it. Memtile (the core's request packet pushes a page BD on a memtile MM2S channel of its own): 86 cycles
-  + ~0.39 µs per KB of code, at most 4 cores per channel. Put a rarely used epilogue in the page of the role that runs
-  before it (sd15's GEGLU in the LayerNorm page: 1.7 KB off the resident code).
+  + ~0.39 µs per KB of code, at most 4 cores per channel; its store and BDs reloaded after another hardware context ran
+  (`OverlayDevice.set_prologue`: 0.3 ms). Decode overlays page the tile formats beyond the one of the most bytes when
+  four or more do not fit (`DecodeOverlayOperator(paged=)`: Llama 3B Q3_K_M, a few loads per step, the main core 2.4 KB
+  freer). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
+  1.7 KB off the resident code). A page's constant tables must be resident (`retain`: `gemv`'s `_nz`).
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 
 Rejected size levers: rejected.md "Program memory".

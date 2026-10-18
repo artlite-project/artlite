@@ -41,6 +41,7 @@ Transports, how the packets reach the TileControl:
   another hardware context ran (its configuration resets the BDs and may use the memtile).
 """
 
+import hashlib
 import os
 import re
 import struct
@@ -300,7 +301,11 @@ class Store:
 
     def check(self, work_dir: str, cols: range) -> None:
         """None of the store's BDs, its channel's registers or its bytes is in the design's configuration (aiecc's
-        CDO: ``cdo_writes``)."""
+        CDO: ``cdo_writes``; a check passed once is remembered in the design's directory)."""
+        done = os.path.join(work_dir, "design.mlir.prj",
+                            f"store_{_key(self.base, self.size, self.channel, self.bd0, self.nbytes, tuple(cols))}.ok")
+        if os.path.exists(done):
+            return
         regs = cdo_writes(work_dir)
         for c in cols:
             mine = {txn.tile_address(c, 1, txn.MEM_BD0 + 32 * (self.bd0 + k) + 4 * i)
@@ -310,6 +315,8 @@ class Store:
             hit = sorted(mine & regs) + [a for a in regs if lo <= a < hi][:1]
             if hit:
                 raise PagingError(f"the design configures {hex(hit[0])} (column {c}): the page store's")
+        with open(done, "w"):
+            pass
 
 
 def cdo_writes(work_dir: str) -> set[int]:
@@ -438,8 +445,16 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     ``pages`` maps a page's name to its entries (the state's entry words in order); ``pager``: the pager function
     (``pg_self`` / ``pg_request``), ``calls``: per resident function the entries it calls (through the state words),
     ``roots``: the core's kernels (their stack, ``stack`` bytes). Names are kernel names (``{p}_<local>``: ``symbols``; a
-    caller or root may be a template). Each page's ELF is kept in the project directory (``page_<name>.elf``)."""
+    caller or root may be a template). Each page's ELF is kept in the project directory (``page_<name>.elf``), the
+    result too (``pages_<key>.npz``: a design's directory is named by its content, the key is the arguments and this
+    module's source)."""
     prj = os.path.join(work_dir, "design.mlir.prj")
+    key = _key(pages, pager, calls, roots, stack, cores, state, wake, stream_id)
+    cached = os.path.join(prj, f"pages_{key}.npz")
+    if os.path.exists(cached):
+        with np.load(cached) as z:
+            return Pager(int(z["slot"]), state, wake, stream_id,
+                         {n: Page(z[f"code_{i}"], tuple(int(e) for e in z[f"entries_{i}"])) for i, n in enumerate(pages)})
     c0, r0 = cores[0]
     ref_path = _core_elf(prj, c0, r0)
     ref = _read(ref_path)
@@ -449,10 +464,11 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     if {e for es in calls.values() for e in es} - entries:
         raise PagingError(f"calls of functions no page enters: {sorted({e for es in calls.values() for e in es} - entries)}")
     lname = {n: symbol(names, n) for n in {pager, *entries}}
-    many = {n: symbols(names, n) for n in {*roots, *calls}}
     resident = {n for n, v, s, info, shn in ref.symbols if n and shn}
-    if lname[pager] not in resident or any(not set(many[n]) <= resident for n in calls):
-        raise PagingError(f"the pager {pager} or a caller of entries ({', '.join(calls)}) is not resident")
+    many = {n: [x for x in symbols(names, n) if x in resident] for n in {*roots, *calls}}  # (their instances here)
+    if lname[pager] not in resident or not all(many.values()):
+        raise PagingError(f"the pager {pager}, a caller of entries ({', '.join(calls)}) or a root ({', '.join(roots)}) "
+                          "is not resident")
     entry_of = {n: shn for n, v, s, info, shn in obj.symbols if n and shn}
     sec_resident = {shn for n, v, s, info, shn in obj.symbols if n in resident and 0 < shn < len(obj.sections)}
     text = ref.section(".text")[4]
@@ -494,7 +510,19 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
                               f"[{slot:#x}, {PM_BYTES:#x})")
         code = pt[4] + bytes(-len(pt[4]) % 4)
         out[name] = Page(np.frombuffer(code, np.uint32).copy(), tuple(e.address(lname[x]) for x in entries))
+    tmp = f"{cached}.{os.getpid()}.npz"
+    np.savez(tmp, slot=slot, **{f"code_{i}": p.code for i, p in enumerate(out.values())},
+             **{f"entries_{i}": np.array(p.entries, np.int64) for i, p in enumerate(out.values())})
+    os.replace(tmp, cached)
     return Pager(slot, state, wake, stream_id, out)
+
+
+def _key(*args: object) -> str:
+    """A cache key of ``args`` and this module's source."""
+    with open(__file__, "rb") as f:
+        h = hashlib.sha1(f.read())
+    h.update(repr(args).encode())
+    return h.hexdigest()[:16]
 
 
 def _without_start(e: _Elf, end: int) -> bytes:

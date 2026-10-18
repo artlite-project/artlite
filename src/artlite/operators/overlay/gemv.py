@@ -2,8 +2,9 @@
 the tiles of the weight image (``formats``) against bfp16 panels of up to 4 slots' x, with exact integer weight panels
 (BFP16 tiles: their own panels). Two cores share a tile: the super-block split (every format's tiles of 1024
 columns: one core takes super-blocks 0, 1 (``{p}_mmv<0>``), the other 2, 3 (``{p}_mmv<1>``)) or the row split
-(Gemma's 512-column Q4_0 / Q8_0 tiles: each core its half of the rows of every super-block, ``row_split``); a solo
-format's tiles (``render(solo=)``) the second core alone.
+(Gemma's 512-column Q4_0 / Q8_0 tiles: each core its half of the rows of every super-block, ``row_split``). A paged
+format's kernels (``render(paged=)``) are code pages (``paging``, the memtile transport): a core loads the format's
+page for its half before a tile of it unless the page is in, and calls the page's entry (``{p}_pgf<H>_<format>``).
 
 This module is the frame: the shared helpers, the x and sum panels and the dispatcher ``{p}_mmv<H>``. The formats'
 kernels and template variables are their slots' (``Slot.mmv_*``, ``sources["mmv/<fmt>"]``: ``formats.q4k`` etc.). The
@@ -30,6 +31,9 @@ keeps its transposed codes, its tables and partial sums in its scratch (``SCR_BY
 Output: y [g 2][slot 4][r 8] fp32 (rows 8 g ..), accumulated.
 """
 
+from dataclasses import dataclass
+
+from .. import paging
 from ..formats import FORMATS, kernel_template, slot
 from ..formats import SLOTS as FORMAT_SLOTS
 from ..formats.common import MMV_SLOTS
@@ -198,7 +202,7 @@ template <typename T>
 }
 
 // -z e_i panels (mantissas): [z 8, 16, 32][i][64]
-alignas(64) static const int8_t {{ p }}_nz[3][8][64] = {
+alignas(64) {{ retain }}static const int8_t {{ p }}_nz[3][8][64] = {
 {% for z in (8, 16, 32) %}
     {
 {% for i in range(8) %}
@@ -235,11 +239,21 @@ __attribute__((noinline)) void {{ p }}_sc(const bfloat16 *__restrict c, const bf
 {% include part %}
 {% endfor %}
 
+{% if paged %}
+{{ pager }}
+
+// (resident) page ``page`` of core half H into program memory unless its state words name it (``render(paged=)``)
+template <int H>
+__attribute__((noinline)) void {{ p }}_pg_need(int page)
+{
+    if (((const volatile int32_t *){{ pg.state }})[0] != page)
+        {{ p }}_pg_request(H ? (int32_t){{ pg.hdr[1] }}u : (int32_t){{ pg.hdr[0] }}u, (int32_t){{ pg.ctl }}u,
+                           (H ? {{ pg.bd0[1] }} : {{ pg.bd0[0] }}) + page - 1);
+}
+{% endif %}
+
 // One tile of format fmt, super-blocks 2 H, 2 H + 1: y[g][32] += their rows against xp (the 64 panels of those
 // super-blocks) and xs (the chunk's sum panels)
-{% if solo %}
-// (a solo format, ``render(solo=)``: core 1 runs both halves of its tiles, core 0 none)
-{% endif %}
 {% if rowsplit %}
 // (a row-split format, ``row_split``: rows 16 H .. of all its super-blocks, xp the chunk's panels; Q8_0: its row
 // group H into y[32 H ..])
@@ -250,12 +264,11 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
                                            int32_t fmt)
 {
 {% for f in fmts %}
-{% if f in solo %}
+{% if f in paged %}
     if (fmt == {{ fid[f] }}) {
-        if constexpr (H == 1) {
-            {{ p }}_{{ fn[f] }}<0>(a, xp - {{ -solo_x0 }}, xs, y, scr);
-            {{ p }}_{{ fn[f] }}<1>(a, xp, xs, y, scr);
-        }
+        {{ p }}_pg_need<H>({{ paged.index(f) + 1 }});
+        ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *))(intptr_t)
+             ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr);
         return;
     }
 {% else %}
@@ -266,20 +279,51 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 }
 
 }  // namespace
+{% for f in paged %}
+{% for h in (0, 1) %}
+
+// (a page: format {{ f }}'s half {{ h }}, entered through the pager's state words only; external, so that it stays in
+// the object for ``paging.link``)
+void {{ p }}_pgf{{ h }}_{{ f | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                        float *__restrict y, uint8_t *__restrict scr)
+{
+    {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr);
+}
+{% endfor %}
+{% endfor %}
 """
 
 
 _TEMPLATE = kernel_template(_SRC)
 
 
-def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, solo: tuple[str, ...] = (),
-           solo_x0: int = 0) -> str:
+@dataclass(frozen=True)
+class PageSpec:
+    """Where the paged formats' pages go and come from (``render(paged=)``): the pager's state words (a core address,
+    the same on both cores), its wake lock (a core lock id), per core half the stream header of its request route and
+    the BD of its first page (``paging.request``, ``paging.Store.bd``: page i at bd0 + i - 1), the control header
+    writing the page channel's start queue."""
+
+    state: int
+    wake: int
+    hdr: tuple[int, int]
+    bd0: tuple[int, int]
+    ctl: int
+
+
+def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str, ...]]:
+    """The pages of core half h (``paging.link``'s ``pages``) of ``render(p, paged=)``: per paged format its entry, in
+    page-id order."""
+    return {f: (f"{p}_pgf{h}_{f.lower()}",) for f in paged}
+
+
+def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
+           pg: PageSpec | None = None) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
-    super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``solo``: formats whose tiles
-    core 1 runs alone, both halves (its xp: the second half's panels, as always; the first half's at xp + solo_x0,
-    default: right before them), core 0 none: program memory of core 0 (the main core) for a rare format."""
+    super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
+    are code pages (``pg``: their pager), in page-id order (from 1)."""
     assert all(supported(f, nsb) for f in fmts), (fmts, nsb)
-    assert all(f in fmts and not row_split(f, nsb) for f in solo), (solo, fmts)
+    assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
     parts: list[str] = []
     var: dict[str, int] = {}
     for s in FORMAT_SLOTS:
@@ -287,7 +331,11 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, sol
             if f.name in fmts:
                 parts += [x for x in s.mmv_parts(f.name, nsb) if x not in parts]
                 var.update(s.mmv_vars(f.name, tile_bytes, nsb))
-    return _TEMPLATE.render(p=p, fmts=sorted(fmts), solo=solo, solo_x0=solo_x0 or -(32 * nsb // 2 * PANEL), parts=parts,
+    pager = paging.source(p, wake=pg.wake, request=True) if paged else ""
+    # (retain: the frame's table in every link where formats are paged, used or not by resident code: a page brings no
+    # data of its own)
+    return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
+                            retain="__attribute__((used, retain)) " if paged else "",
                             rowsplit=any(row_split(f, nsb) for f in fmts),
                             fid={f: FORMATS[f].fid for f in FORMATS}, fn={f: FORMATS[f].mmv for f in FORMATS}, NSB=nsb,
                             PANEL=PANEL, XS_SLOT=XS_SLOT, **var)
