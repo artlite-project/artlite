@@ -26,13 +26,16 @@ over every bf16 input).
 """
 
 import functools
+import hashlib
+import inspect
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from .base import JINJA_ENV
+from .base import CACHE_DIR, JINJA_ENV
 from .kernel_source import kernel_prefix
 
 LUT = kernel_prefix("lut")  # the prefix of the tables' kernels (``kernel_source``: one copy for all operators)
@@ -120,7 +123,22 @@ class ActTable:
 
     @functools.cached_property
     def coefficients(self) -> np.ndarray:
-        """(segs, 3): c0 (fp32 values), c1, c2 (bf16 values) of g's segments."""
+        """(segs, 3): c0 (fp32 values), c1, c2 (bf16 values) of g's segments (cached on disk: ~1 s to fit, keyed by the
+        table's parameters and the fitting code)."""
+        code = [inspect.getsource(f) for f in (self.f64, ActTable._fit, ActTable._reduce, _minimax, _round_bf16, _bf16, _f32,
+                                               bf16_values, ulp_bf16)]
+        key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, code)).encode()).hexdigest()[:16]
+        path = os.path.join(CACHE_DIR, "act_lut", f"{self.name}_{key}.npy")
+        if os.path.exists(path):
+            return np.load(path)
+        coef = self._fit()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.npy"
+        np.save(tmp, coef)
+        os.replace(tmp, path)
+        return coef
+
+    def _fit(self) -> np.ndarray:
         x = bf16_values()
         t = -x[(x <= 0) & (x >= -self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
         v, r, r2 = self._reduce(t)

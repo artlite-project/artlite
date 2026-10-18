@@ -440,6 +440,12 @@ class Gemm:
                              1).reshape(ws.shape[0], -1)
         return L.gemm_weights(ws, 0, self.npo)
 
+    @property
+    def col_free(self) -> bool:
+        """The op's tasks are the same in every column (none reads a neighbour's memtile or the image's edge)."""
+        return not self.conv or self.il or bool(self.wide) or (bool(self.rc) and self.r0 >= 1 and
+                                                               self.r0 + self.rstep * (self.ntile - 1) < self.rc - 1)
+
     def conv_zero_bytes(self) -> int:
         """Bytes of the zeros an edge column's missing halo row reads (one row of 8 kb: the iteration stays on it)."""
         return self.Li * 8 * 2 * L.PANEL

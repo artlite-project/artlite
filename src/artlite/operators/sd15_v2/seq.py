@@ -85,10 +85,11 @@ class Seq:
         self._k: dict[tuple, int] = {}  # tasks per shim channel (BD rotation)
         self._kbd: dict[tuple, int] = {}  # BD rotation per shim channel (the B runs)
         self._chains: dict[tuple, dict] = {}  # per memtile channel: chain -> (its BD ids, their words) of the chains its BDs hold
-        self._lru: dict[tuple[int, int], int] = {}  # (col, memtile BD) -> its last use
+        self._lru = [[-1] * txn.MEM_BDS for _ in range(COLS)]  # (per column, per memtile BD: its last use)
         self._tick = 0
-        self._held: dict[tuple[int, int], list[int]] = {}  # (col, memtile BD) -> its words
-        self._user: dict[tuple[int, int], int] = {}  # (col, memtile BD) -> the op of the last task that used it
+        self._held: list[list[list[int] | None]] = [[None] * txn.MEM_BDS for _ in range(COLS)]  # (its words)
+        self._user: list[list[int | None]] = [[None] * txn.MEM_BDS for _ in range(COLS)]  # (the op of its last task)
+        self._b_user: dict[tuple[int, int], int] = {}  # (col, shim BD of the B runs) -> the op of its last task
         self._gates: dict[int, list[int]] = {}  # op -> per column its gate's push (for tokens)
         self._prod = [0] * COLS  # producers pushed since the column's last gate
         self._par = [0] * ROWS  # per row: B objects, mod 2
@@ -137,10 +138,10 @@ class Seq:
         q = self._q[key]
         q[-1] = (q[-1][0], push)
 
-    def _task(self, col: int, d: int, ch: int, op: int, chain: list[list[int]], repeat: int) -> int:
+    def _task(self, col: int, d: int, ch: int, op: int, chain: list[list[int]], ck: tuple, repeat: int) -> int:
         """A memtile task: its chain on BDs of the channel's pool (``design.mem_bd_pool``), linked: a chain the channel ran
         before reuses its BDs while they still hold it, else the pool's least recently used BDs (rewritten: their last
-        user complete; never one of this op's). Returns the push's operation number."""
+        user complete; never one of this op's; ck: the chain as a key). Returns the push's operation number."""
         key = (1, col, d, ch)
         self._slot(key, op)
 
@@ -153,29 +154,29 @@ class Seq:
                 out.append(words)
             return out
         cache = self._chains.setdefault(key, {})
-        ck = tuple(tuple(w) for w in chain)
         hit = cache.get(ck)
-        if hit is not None and all(self._held.get((col, b)) == w for b, w in zip(*hit, strict=True)):
+        users, held, lru = self._user[col], self._held[col], self._lru[col]
+        if hit is not None and all(held[b] == w for b, w in zip(*hit, strict=True)):
             ids = hit[0]
         else:
             pool = D.mem_bd_pool(ch)
-            free = sorted((b for b in pool if self._user.get((col, b)) != op), key=lambda b: self._lru.get((col, b), -1))
+            free = sorted((b for b in pool if users[b] != op), key=lru.__getitem__)
             assert len(free) >= len(chain), f"op {op}: more BDs on memtile channel {(d, ch)} than its pool has free"
             ids = free[:len(chain)]
             words_l = linked(ids)
             for bid, words in zip(ids, words_l, strict=True):
-                if self._held.get((col, bid)) != words:
-                    if (u := self._user.get((col, bid))) is not None:
+                if held[bid] != words:
+                    if (u := users[bid]) is not None:
                         self.complete(u)
                     self.t.mem_bd(col, bid, words)
-                    self._held[(col, bid)] = words
+                    held[bid] = words
             for k in [k for k, (i, _) in cache.items() if not set(i).isdisjoint(ids)]:
                 del cache[k]
             cache[ck] = (ids, words_l)
         for bid in ids:
-            self._user[(col, bid)] = op
+            users[bid] = op
             self._tick += 1
-            self._lru[(col, bid)] = self._tick
+            lru[bid] = self._tick
         push = self.t.mem_push(col, d, ch, ids[0], repeat=repeat)
         self._pushed(key, push)
         return push
@@ -184,12 +185,12 @@ class Seq:
         key = (1, col, txn.MM2S, 5)
         self._slot(key, op)
         bid = D.GATE_BDS[op % len(D.GATE_BDS)]
-        if self._held.get((col, bid)) != words:
-            if (u := self._user.get((col, bid))) is not None:
+        if self._held[col][bid] != words:
+            if (u := self._user[col][bid]) is not None:
                 self.complete(u)
             self.t.mem_bd(col, bid, words)
-            self._held[(col, bid)] = words
-        self._user[(col, bid)] = op
+            self._held[col][bid] = words
+        self._user[col][bid] = op
         push = self.t.mem_push(col, txn.MM2S, 5, bid)
         self._pushed(key, push)
         return push
@@ -210,11 +211,11 @@ class Seq:
             ids = [B_BDS[(k + i) % len(B_BDS)] for i in range(len(chunk))]
             self._kbd[key] = k + len(chunk)
             for i, (bid, run) in enumerate(zip(ids, chunk, strict=True)):
-                if (u := self._user.get((col, -1 - bid))) is not None and u != op:
+                if (u := self._b_user.get((col, bid))) is not None and u != op:
                     self.complete(u)
                 self.t.shim_bd(col, bid, address=run[0], nbytes=run[1], dims=run[2] if len(run) > 2 else None,
                                next_bd=ids[i + 1] if i + 1 < len(ids) else None)
-                self._user[(col, -1 - bid)] = op
+                self._b_user[(col, bid)] = op
             n = self.t.n_ops
             self.t.shim_push(col, txn.MM2S, 1, ids[0])
             self._pushed(key, n)
@@ -257,12 +258,16 @@ class Seq:
         if barrier and n:
             self.complete(n - 1)
 
-        def chain(t: MemTask, acquire: bool, release: bool) -> list[list[int]]:
-            out = []
-            for i, bd in enumerate(t.chain):
-                out.append(txn.mem_bd_words(**bd, acquire=(lock_g, 1, True) if acquire and i == 0 else None,
-                                            release=(x, 1) if release and i == len(t.chain) - 1 else None))
-            return out
+        memo: dict[tuple, tuple] = {}  # ((task, acquire, release) -> its BD words: a task object of several columns)
+
+        def chain(t: MemTask, acquire: bool, release: bool) -> tuple:
+            key = (id(t), acquire, release)
+            if key not in memo:
+                words = [txn.mem_bd_words(**bd, acquire=(lock_g, 1, True) if acquire and i == 0 else None,
+                                          release=(x, 1) if release and i == len(t.chain) - 1 else None)
+                         for i, bd in enumerate(t.chain)]
+                memo[key] = (words, tuple(tuple(w) for w in words))
+            return memo[key]
 
         for r, ro in rows.items():
             assert not ro.role or ro.role == self.role_of[r], f"op {n}: row {r} is in role {self.role_of[r]}, not {ro.role}"
@@ -295,16 +300,16 @@ class Seq:
                  for e in [ls[k]]] if deep else [e for ls in lists for e in ls]
         for kind, c, ch, t in order:
             if kind == "recv":
-                self._task(c, txn.S2MM, ch, n, chain(t, False, True), t.repeat)
+                self._task(c, txn.S2MM, ch, n, *chain(t, False, True), t.repeat)
                 self._prod[c] += t.repeat
             elif kind == "send":
-                self._task(c, txn.MM2S, ch, n, chain(t, not free_sends, False), t.repeat)
+                self._task(c, txn.MM2S, ch, n, *chain(t, not free_sends, False), t.repeat)
             elif kind == "fill":
-                self._task(c, txn.S2MM, 4, n, chain(t, True, True), t.repeat)
+                self._task(c, txn.S2MM, 4, n, *chain(t, True, True), t.repeat)
                 self._prod[c] += t.repeat
                 self._shim(c, txn.MM2S, 0, n, *t.ddr, repeat=t.repeat)
             else:
-                self._task(c, txn.MM2S, 4, n, chain(t, True, True), t.repeat)
+                self._task(c, txn.MM2S, 4, n, *chain(t, True, True), t.repeat)
                 self._prod[c] += t.repeat
                 self._drains[c] = self._shim(c, txn.S2MM, 0, n, *t.ddr, repeat=t.repeat)
         if sync:

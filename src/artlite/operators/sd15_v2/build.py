@@ -325,7 +325,8 @@ class Builder:
                 self.v2.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
                 ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
             self.tb_hooks.append((tbias, off, torch.cat([g._rows(r) for r in range(ROWS)]).numpy()))
-        cols = {c: g.col_ops(c) for c in range(COLS)}
+        co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
+        cols = {c: co or g.col_ops(c) for c in range(COLS)}
         if extra:
             cols = self.merge(cols, extra)
         self.op(cols, rows, barrier=barrier or (bool(g.conv) and not inputs_ready), nolock=inputs_ready)
@@ -376,7 +377,8 @@ class Builder:
             self.ddr_sync()
         addr = self.image(name, np.concatenate([x for i in range(len(a.rows)) for x in (cmds[i], gbs[i])]))
         rows = {r: a.row_ops(addr + 2 * i * D.Q, runs[r], slots[r]) for i, r in enumerate(a.rows)}
-        cols = {c: a.col_ops() for c in range(COLS)}
+        co = a.col_ops()
+        cols = {c: co for c in range(COLS)}
         self.op(self.merge(cols, extra) if extra else cols, rows, sync=sync)
 
     def _slots(self, strips: list[tuple[int, int]]) -> tuple[list[tuple], int]:
