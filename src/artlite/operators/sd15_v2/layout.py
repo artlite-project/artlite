@@ -102,7 +102,7 @@ def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
         v4 = vp.reshape(2, ng, gk, 8, 8, nd, 8)  # i g kp j h db d
         va = v4[..., :4, :].reshape(2, ng, gk, 8, 8, 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # -> i h g dp kp dh d j
         vb = v4[..., 4, :].permute(0, 4, 1, 2, 5, 3)  # i g kp j h d -> i h g kp d j
-        vv = torch.cat([va.reshape(2, 8, ng, -1), vb.reshape(2, 8, ng, -1)], -1)
+        vv = torch.cat([va.reshape(2, 8, ng, -1, 8), vb.reshape(2, 8, ng, -1, 8)], 3)
     else:
         vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
     kb_ = blocks(np.ascontiguousarray(kk.numpy())).reshape(2, 8, ng, -1)

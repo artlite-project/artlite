@@ -968,20 +968,29 @@ static __attribute__((noinline)) void {{ p }}_qk40(const int32_t *__restrict q, 
   }
 }
 
-// a pair's rare steps (``{{ p }}_qk40``'s S): keys from nk on masked (S = -2^14), the first group's reference max per
-// query (the bf16 max of its scores, not raised later: P saturates above it): bias := -it
+// a pair's keys from nk on masked: S := v (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept); v: per lane, or none:
+// -126 - bias (2^-126 for P: vexp2 is exact there, and garbage far below)
+static void {{ p }}_mask40(float *__restrict sm, const bfloat16 *__restrict bias, int nk) {
+  for (int kp = 0; kp < 8; kp++) {
+    const int v = nk - 8 * kp;
+    const unsigned lo = v >= 8 ? 0xFFu : (v <= 0 ? 0u : (1u << v) - 1);
+    const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
+    for (int h = 0; h < 4; h++) {
+      float *p = sm + 512 * (h >> 1) + 64 * kp + 32 * (h & 1);
+      const aie::vector<float, 32> m = bias ? aie::msc(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-126.0f)),
+                                                       aie::load_v<32>(bias + 64 * (h >> 1) + 32 * (h & 1)),
+                                                       aie::broadcast<bfloat16, 32>(1.0f)).template to_vector<float>()
+                                            : aie::broadcast<float, 32>(-16384.0f);
+      aie::store_v(p, aie::select(m, aie::load_v<32>(p), mk));
+    }
+  }
+}
+
+// a pair's rare steps (``{{ p }}_qk40``'s S): keys from nk on masked, the first group's reference max per query (the
+// bf16 max of its unmasked scores, not raised later: P saturates above it): bias := -it
 static __attribute__((noinline, minsize)) void {{ p }}_first40(float *__restrict sm, bfloat16 *__restrict bias, int first,
                                                           int nk) {
-  if (nk < 64)
-    for (int kp = 0; kp < 8; kp++) {  // (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept)
-      const int v = nk - 8 * kp;
-      const unsigned lo = v >= 8 ? 0xFFu : (v <= 0 ? 0u : (1u << v) - 1);
-      const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
-      for (int h = 0; h < 4; h++) {
-        float *p = sm + 512 * (h >> 1) + 64 * kp + 32 * (h & 1);
-        aie::store_v(p, aie::select(aie::broadcast<float, 32>(-16384.0f), aie::load_v<32>(p), mk));
-      }
-    }
+  if (first && nk < 64) {{ p }}_mask40(sm, nullptr, nk);  // (out of the max)
   if (first)
     for (int qp = 0; qp < 2; qp++) {
       const float *p = sm + 512 * qp;
@@ -996,6 +1005,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_first40(float *__restrict
       const aie::vector<float, 8> nm = aie::mul(aie::max(e3, o3), aie::broadcast<bfloat16, 8>(-1.0f)).template to_vector<float>();
       aie::store_v(bias + 64 * qp, aie::accum<accfloat, 64>(al::bcast8(nm)).template to_vector<bfloat16>());
     }
+  if (nk < 64) {{ p }}_mask40(sm, bias, nk);
 }
 
 // P = 2^(S + bias) of a pair's 16 panels (S [2 q panels: 512 floats apart][8 key panels][64], bias [2 q panels][64]

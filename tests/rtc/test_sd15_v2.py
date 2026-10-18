@@ -13,7 +13,7 @@ from artlite.operators.sd15_v2.build import Builder, Level
 from artlite.operators.sd15_v2.ops import Apply, Attention, Gemm
 from artlite.operators.sd15_v2.runtime import V2Device
 from artlite.operators.sd15_v2.seq import ColOps, MemTask, RowOps
-from artlite.operators.sd15_v2.unet import Tensor
+from artlite.operators.sd15_v2.unet import DTensor, Tensor
 
 COLS, ROWS = 8, 4
 
@@ -353,6 +353,47 @@ def test_conv_rows(v2: V2Device, Cin: int, N: int, res: bool) -> None:
     assert err < 8e-3, err
 
 
+@pytest.mark.parametrize("np_, d, nb", [(8, 160, 1), (16, 80, 2), (32, 40, 4)])
+def test_cross_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
+    """Cross-attention on 77 context keys (``layout.kv_slots``, the last group's keys from 77 masked) of the queries of a
+    16x16 level (d 160), a 32x32 band (d 80) or a 64x64 band (d 40, role c on every row): within 1.5e-2 of softmax
+    attention on the bfp16-rounded operands."""
+    torch.manual_seed(4)
+    T, C = 8 * np_, 8 * d
+    qs = torch.randn(COLS * T, C) * (1.4426950408889634 / d ** 0.5) * 2
+    k, v = torch.randn(2, 77, C), torch.randn(2, 77, C)
+    QA, OA = 0, C // 8 * np_ * L.PANEL + D.A_OBJ
+    cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
+    v2.alloc("ckv", L.kv_slots(k, v, d=d).size)
+    v2.write("ckv", L.kv_slots(k, v, d=d))
+    ar = tuple(range(ROWS)) if d == 40 else D.ATTN_ROWS
+    s = v2.seq()
+    s.role(ar, "c" if d == 40 else "a")
+    s.op(fills(v2, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
+    for t in range(1 if d == 40 else max(np_ // 8, 1)):
+        at = Attention(np=np_, q=QA, o=OA, kv=v2.address("ckv"), nkeys=77, d=d, nbands=nb, tile=t, rows=ar)
+        v2.alloc(f"ccmd{t}", D.Q)
+        v2.write(f"ccmd{t}", at.command())
+        s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(v2.address(f"ccmd{t}")))
+    nbytes = C // 8 * np_ * L.PANEL
+    s.op(drains(v2, "o", nbytes, OA), {})
+    v2.run(v2.transaction(s))
+    ob = v2.read("o", COLS * nbytes).reshape(COLS, nbytes)
+    o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
+    img = images(T)
+    ref = torch.zeros(COLS * T, C)
+    for i in range(2):
+        sel = img == i
+        kk, vq = q(k[i]), q(F.pad(v[i].T, (0, 3))).T[:77]  # (V^T blocks of 8 keys: the slots' zero keys)
+        for h in range(8):
+            ch = slice(d * h, d * (h + 1))
+            sc = q(qs[sel][:, ch]) @ kk[:, ch].T
+            p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
+            ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
+    err = _rel(o, ref)
+    assert err < 1.5e-2, err
+
+
 IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (64x64: a row's groups in their storage order, even then odd)
 
 
@@ -475,6 +516,50 @@ def test_resnet_bands(v2: V2Device, cin: int, cout: int) -> None:
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
     err = _rel(y, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
+
+
+def _il_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> DTensor:
+    """A 64x64 DTensor of x (2, C, 64, 64) in DDR per band, with GroupNorm records for st (copy ops)."""
+    from artlite.operators.sd15_v2.level64 import LV64
+    from artlite.operators.sd15_v2.unet import copy_stats
+    lv, C = LV64, x.shape[1]
+    xc = il_tokens(x, lv.R)
+    xd = DTensor(lv, C, name, rec=[])
+    for b in range(lv.nb):
+        bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+    for b in range(lv.nb):
+        t = xd.load(bd, b)
+        xd.rec += copy_stats(bd, t, name=f"{name}.st{b}", st=st, band=b)
+        bd.mem.release(t.addr, t.nbytes)
+    return xd
+
+
+def _il_output(v2: V2Device, y: DTensor) -> torch.Tensor:
+    lv = y.lv
+    yb = [v2.read(y.band(b), COLS * y.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
+    return from_il_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, y.C, lv.m) for b in range(lv.nb)])
+                                       for c in range(COLS)]), lv.R)
+
+
+@pytest.mark.slow
+def test_resnet64(v2: V2Device) -> None:
+    """ResnetBlock2D 320 -> 320 on the 64x64 level (``level64``: x and the output in DDR per band, the convs' input rows
+    from DDR panel images): within 1.5e-2 of the fp32 reference."""
+    from artlite.operators.sd15_v2.level64 import resnet64
+    from models.sd15 import reference
+    torch.manual_seed(15)
+    p, C = "r.", 320
+    w = _rand_resnet(p, C, C)
+    tb = 0.3 * torch.randn(C)
+    x = torch.randn(2, C, 64, 64)
+    bd = Builder(v2)
+    xd = _il_input(bd, x, "x_in", (C // 32, 0))
+    out = resnet64(bd, w, p, xd, cout=C, time_bias=tb, eps=1e-5, stats=None, name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    err = _rel(_il_output(v2, out), reference.resnet(w, p, x, eps=1e-5, time_bias=tb))
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -653,6 +738,35 @@ def test_transformer_bands(v2: V2Device) -> None:
     y = from_level_tokens(yc, lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
     err = _rel(y, ref)
+    print(f"rel err {err:.3e}")
+    assert err < 2e-2
+
+
+@pytest.mark.slow
+def test_transformer64(v2: V2Device) -> None:
+    """The transformer on the 64x64 level (320 channels, d 40 on role c: 4 bands, x and the output in DDR, h and Q of
+    bands 0 .. 2 parked): within 2e-2 of the fp32 reference."""
+    import types
+
+    from artlite.operators.sd15_v2.level64 import LV64
+    from artlite.operators.sd15_v2.ops import Attention
+    from artlite.operators.sd15_v2.unet import transformer_bands
+    from models.sd15 import reference
+    torch.manual_seed(16)
+    p, C = "t.", 320
+    w = _rand_transformer(p, C)
+    x = torch.randn(2, C, 64, 64)
+    ctx = torch.randn(2, 77, 768)
+    q = p + "transformer_blocks.0.attn2."
+    bd = Builder(v2)
+    xd = _il_input(bd, x, "x_in", (C // 32, 0))
+    kv = bd.ddr("kv_self64", Attention(np=LV64.np, q=0, o=0, kv=0, d=40, nbands=LV64.nb).kv_bytes())
+    ckv = bd.image("kv_ctx40", L.kv_slots(ctx @ w[q + "to_k.weight"].T, ctx @ w[q + "to_v.weight"].T, d=40))
+    out = transformer_bands(bd, w, p, xd, kv=kv, ctx_kv=ckv, nctx=77, stats=None, name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
+    err = _rel(_il_output(v2, out), ref)
     print(f"rel err {err:.3e}")
     assert err < 2e-2
 

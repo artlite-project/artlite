@@ -193,7 +193,8 @@ def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: tor
 
 
 LOG2E = 1.4426950408889634
-SELF_ROWS, CROSS_ROWS = (0, 1, 2, 3), D.ATTN_ROWS  # (the core rows of self- / cross-attention: rows 2, 3 switched to role a)
+SELF_ROWS, CROSS_ROWS = (0, 1, 2, 3), D.ATTN_ROWS  # (the core rows of self- / cross-attention: rows 2, 3 switched to
+# role a; d 40 (role c): every row)
 
 
 def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
@@ -207,9 +208,10 @@ def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0, rows: 
     """Attention of the panels q (scaled queries, 8 heads) on the K / V^T slots at DDR kv (self-attention: the keys of
     all of the level's bands) on the core rows ``rows``: the output panels."""
     o = alloc(bd, q.lv, q.C, "pn")
-    for t in range(max(q.lv.np // 8, 1)):  # (an op per tile)
-        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=q.C // 8, nbands=q.lv.nb, tile=t,
-                       rows=rows)
+    d = q.C // 8
+    for t in range(1 if d == 40 else max(q.lv.np // 8, 1)):  # (an op per tile; d 40: per band)
+        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=d, nbands=q.lv.nb, tile=t,
+                       rows=SELF_ROWS if d == 40 else rows)
         cmd = bd.image(name, at.command())
         bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
     return o

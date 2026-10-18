@@ -172,6 +172,9 @@ class Builder:
         whose role commands need another role are switched first (``seq.Seq.role``)."""
         for role in sorted({ro.role for ro in rows.values() if ro.role}):
             self.s.role(tuple(r for r, ro in rows.items() if ro.role == role), role)
+        for r, ro in rows.items():  # (role c's attention: its scores in the table buffer)
+            if ro.role == "c":
+                self.tab[r] = None
         if not self._zfill:  # (the zero region, once)
             self._zfill = True
             z = self.image("_zeros", np.zeros(COLS * 4096, np.uint8))
@@ -378,6 +381,11 @@ class Builder:
             if used < D.Q:
                 out.append((self.zeros_q(), D.Q - used))
         return out, len(slots)
+
+    def zeros(self, nbytes: int) -> int:
+        """The device address of nbytes of zeros in DDR (one image of the largest size asked)."""
+        self.v2.alloc("_zddr", nbytes)
+        return self.v2.address("_zddr")
 
     def zeros_q(self) -> int:
         if not self.v2.has("_zq"):
