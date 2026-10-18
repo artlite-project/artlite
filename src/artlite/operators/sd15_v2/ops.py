@@ -527,14 +527,14 @@ class Apply:
         record slots after them (``core.REC_SLOT`` records each, the last one's rest anything). (Only the op's ``rows``
         have a B stream.)"""
         runs = [(img, 2 * D.Q)] + list(records)
-        return RowOps(runs=runs, b_objects=2 + nslots, parity=False)
+        return RowOps(runs=runs, b_objects=2 + nslots, parity=False, role="b")
 
 
 @dataclass
 class Attention:
     """Attention of 8 heads of d 160 (16x16, 8x8) or 80 (32x32) over each image's keys, for the queries of tile ``tile``
-    (4 query panels of each image, 8 token panels; 8x8: one panel of each): row i of ``design.ATTN_ROWS`` runs the units
-    (image, head) of heads [4 i, 4 i + 4), image-major. q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
+    (4 query panels of each image, 8 token panels; 8x8: one panel of each): row i of ``rows`` (in role a) runs the units
+    (image, head) of heads [h i, h i + h), h = 8 / len(rows), image-major. q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
     o: the output panels (the same layout); kv: the device address of the K / V^T slots ([image][head][group of
     keys][K | V^T]: d 160 groups of 32 keys, d 80 of 64), written by ``kv_drains``. Self-attention (keys = the image's
     tokens, of ``nbands`` ops of np token panels: band b's column c holds keys [(8 b + c) kpi, ..) of its image): an
@@ -549,9 +549,11 @@ class Attention:
     d: int = 160
     nbands: int = 1
     tile: int = 0
+    rows: tuple[int, ...] = D.ATTN_ROWS
 
     def __post_init__(self) -> None:
-        assert self.d in (80, 160)
+        assert self.d in (80, 160) and len(self.rows) in (2, 4)
+        self.hpr = 8 // len(self.rows)  # (heads per row)
         self.nd = self.d // 8  # (d-blocks of a head)
         self.gk = 4 if self.d == 160 else 8  # (key panels of a group)
         self.kpi = self.np // 2  # (an image's token panels in the op)
@@ -566,7 +568,7 @@ class Attention:
 
     def command(self) -> np.ndarray:
         cmd = np.zeros(D.Q // 4, np.int32)
-        cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 8, self.kpc, self.ng, self.nk,
+        cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 2 * self.hpr, self.kpc, self.ng, self.nk,
                                                                              self.nd, self.gk)
         cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
         return cmd.view(np.uint8)
@@ -577,25 +579,26 @@ class Attention:
         ([qp][d-block])."""
         co = ColOps()
         hstep, kb = self.nd * self.np * 18, self.np * 18  # (words: a head's kb, one kb)
-        for i, r in enumerate(D.ATTN_ROWS):
+        h = self.hpr
+        for i, r in enumerate(self.rows):
             sends, recvs = [], []
             for img in range(2):
-                p0 = (4 * self.nd * i * self.np + 8 * self.tile + img) * L.PANEL
+                p0 = (h * self.nd * i * self.np + 8 * self.tile + img) * L.PANEL
                 sends.append(MemTask([{"addr": self.q + p0, "nwords": D.A_OBJ // 4,
                                        "dims": _dims((18, 1), (2, 36), (32, kb), (max(self.kpc // 2, 1), 72)),
-                                       "iteration": (hstep, 4)}], repeat=4))
+                                       "iteration": (hstep, h)}], repeat=h))
                 recvs.append(MemTask([{"addr": self.o + p0, "nwords": self.kpc * self.nd * 18,
-                                       "dims": _dims((18, 1), (self.nd, kb), (self.kpc, 36)), "iteration": (hstep, 4)}],
-                                     repeat=4))
+                                       "dims": _dims((18, 1), (self.nd, kb), (self.kpc, 36)), "iteration": (hstep, h)}],
+                                     repeat=h))
             co.sends[r], co.recvs[r] = sends, recvs
         return co
 
     def row_ops(self, cmd: int) -> dict[int, RowOps]:
-        """The attention rows' B streams: the command, then per image its 4 units' K / V^T slots (contiguous)."""
-        unit = self.ng * 2 * D.Q
-        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (8 * img + 4 * i) * unit, 4 * unit) for img in range(2)],
-                          b_objects=1 + 8 * 2 * self.ng, parity=self.kpc == 4)
-                for i, r in enumerate(D.ATTN_ROWS)}
+        """The attention rows' B streams: the command, then per image its units' K / V^T slots (contiguous)."""
+        unit, h = self.ng * 2 * D.Q, self.hpr
+        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (8 * img + h * i) * unit, h * unit) for img in range(2)],
+                          b_objects=1 + 2 * h * 2 * self.ng, parity=self.kpc == 4, role="a")
+                for i, r in enumerate(self.rows)}
 
     def kv_bytes(self) -> int:
         return 16 * self.ng * 2 * D.Q

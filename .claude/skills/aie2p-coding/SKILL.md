@@ -35,7 +35,9 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
 - Banks: AM027 describes 8 physical 8 KB banks interleaved into 4 logical 512-bit wide banks (16 KB regions); the
   mlir-aie target model reports `getNumBanks(...) = 4` for core tiles and 8 for memory tiles. [AM027,
   `AIETargetModel.h`]
-- Program memory per tile: **16 KB**. [AM027]
+- Program memory per tile: **16 KB**. [AM027] Written from outside (AXI blockwrites, control packets) only while the
+  core does not fetch (it waits on a lock, or is disabled): a concurrent access loses to the fetch and gets SLVERR
+  [AM027]; measured: control packets into a core running a loop never complete (the row's broadcast stalls).
 - Core load / store: two 512-bit load units + one 512-bit store unit, each with an AGU (2D / 3D addressing). [AM027]
 - Streams: one 32-bit input and one 32-bit output AXI4-Stream, plus 512-bit cascade streams (accumulator forwarding)
   with a two-deep 512-bit FIFO on each side. [AM027]

@@ -8,7 +8,9 @@ Array roles (column c, core row r):
 - A: memtile c MM2S r -> core (c, r) S2MM 0 (the memtile tensors, ``A_OBJ`` objects);
 - O: core (c, r) MM2S 0 -> memtile c S2MM r (``OCH`` chunks);
 - DDR: shim c MM2S 0 -> memtile c S2MM 4 (fills), memtile c MM2S 4 -> shim c S2MM 0 (drains);
-- the gate: memtile c MM2S 5 -> its own S2MM 5 (a static landing chain): the op handover's lock task (``seq``).
+- the gate: memtile c MM2S 5 -> its own S2MM 5 (a static landing chain): the op handover's lock task (``seq``);
+- control packets: shim ``CTRL_SHIM`` MM2S 1 -> every core's TileControl port, packet id ``CTRL_ID[r]`` to row r's
+  cores (broadcast): role switches (``seq.Seq.role``).
 Memtile channels and shim channels run host tasks only; the cores' channels are static chains (``layout``).
 
 Core L1 (pinned, ``L1``): the stack, the activation table, the C tile (m tokens x 80 channels, 8 x 8 sub-blocks
@@ -19,19 +21,34 @@ scratch buffer k in region 2 + k. An m-64 A object's k-tile j is in region 2 + j
 host's NOP commands, ``seq``) its k-tile i is in B slot (i + 1) % 2, so the MAC never reads A and B from one region.
 
 The cores' program (``core``): a C++ main reading commands from the B stream (lock intrinsics on the pinned core locks:
-0 / 1 A free / full, 2 / 3 B, 4 / 5 the output ring; 6 between an A slot's two BDs); rows 0, 1 and rows 2, 3 run
-different mains (``ROLE``): what
-does not fit 16 KB of program memory twice is split between them (attention on ``ATTN_ROWS``, the applies on
-``APPLY_ROWS``: those ops take the other rows' share of the work).
+0 / 1 A free / full, 2 / 3 B, 4 / 5 the output ring; 6 between an A slot's two BDs). What does not fit 16 KB of program
+memory together is split into roles (``core.ROLES``): the cores start in ``ROLE`` (rows 0, 1 attention, rows 2, 3 the
+applies), and a transaction switches rows between roles by control packets (``seq.Seq.role``): an op runs on rows in
+the role it needs (the applies on ``APPLY_ROWS``, cross-attention on ``ATTN_ROWS``, self-attention on every row).
 """
 
 from typing import ClassVar
 
 import numpy as np
 import torch
-from aie.dialects._aie_enum_gen import DMAChannelDir
+from aie.dialects._aie_enum_gen import DMAChannelDir, WireBundle
 from aie.helpers.taplib import TensorAccessPattern as TAP
-from aie.iron import Acquire, Bd, Buffer, DmaChannel, Flow, Kernel, Lock, Program, Release, Runtime, TileDma, Worker
+from aie.iron import (
+    Acquire,
+    Bd,
+    Buffer,
+    DmaChannel,
+    Flow,
+    Kernel,
+    Lock,
+    PacketDest,
+    PacketFlow,
+    Program,
+    Release,
+    Runtime,
+    TileDma,
+    Worker,
+)
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
@@ -55,12 +72,15 @@ STACK = 1280
 HEAP = 510 * 1024  # memtile bytes for tensors
 GATE_SCRATCH = HEAP  # (memtile: the gate tasks' landing words)
 B_SHIM = (0, 2, 4, 6)
+CTRL_SHIM, CTRL_ID = 1, (1, 2, 3, 4)
+PM = 0x20000  # (a core tile's program memory)
+assert CTRL_SHIM not in B_SHIM
 ROLE = "aabb"  # (core row -> its main: "a" with attention, "b" with the applies: ``core``)
 ATTN_ROWS, APPLY_ROWS = (0, 1), (2, 3)
 # pinned L1 offsets (16 KB regions: 0 stack + tab + C's first half, 1 C's second half + out + ws, 2 and 3 the stream
 # buffers ``R23``: per region the A slots' halves, a B slot, a scratch buffer)
 L1 = {"tab": STACK, "c": 0x4000 - C_BYTES // 2, "out": 0x4000 + C_BYTES // 2, "ws": 0x4000 + C_BYTES // 2 + NO * OSL,
-      "r23": 0x8000}
+      "r23": 0x8000, "ext": 0x4000 - C_BYTES // 2 - 64}  # (ext: the role's entry, ``core``)
 # (byte offsets in regions 2, 3: A slot k's first half at k A_OBJ / 2, its second half 16 KB on; B slot k and scratch
 # buffer k in region 2 + k)
 R23 = {"a0": 0, "a1": A_OBJ // 2, "b0": A_OBJ, "b1": 0x4000 + A_OBJ, "s0": A_OBJ + Q, "s1": 0x4000 + A_OBJ + Q}
@@ -70,7 +90,7 @@ A_HI = 0x4000 - A_OBJ // 2  # (the gap between an A slot's halves: object byte o
 def a_byte(o: int) -> int:
     """Byte o of an A object in its slot (``R23``: the halves 16 KB apart)."""
     return o + (A_HI if o >= A_OBJ // 2 else 0)
-assert L1["tab"] + TABB <= L1["c"] and L1["ws"] + WS <= 0x8000 and R23["s1"] + SCR <= 0x8000
+assert L1["tab"] + TABB <= L1["ext"] and L1["ws"] + WS <= 0x8000 and R23["s1"] + SCR <= 0x8000
 assert all(v % 64 == 0 for v in R23.values())
 assert all(v % 64 == 0 for v in L1.values())
 
@@ -109,7 +129,7 @@ class V2Design(ArtcOperator):
 
         def ty(n: int) -> type[np.ndarray]:
             return np.ndarray[(n // 4,), i32]
-        sig = [ty(0x8000), ty(NO * OSL), ty(C_BYTES), ty(WS), ty(TABB)]
+        sig = [ty(0x8000), ty(NO * OSL), ty(C_BYTES), ty(WS), ty(TABB), ty(16)]
         k_main = {role: Kernel(f"{core.P}_main_{role}", "kernel.o", sig) for role in ("a", "b")}
         mems = [Tile(c, 1) for c in range(COLS)]
         shims = [Tile(c, 0) for c in range(COLS)]
@@ -124,7 +144,10 @@ class V2Design(ArtcOperator):
         o = {(c, r): Flow(cores[c][r], mems[c], src_channel=0, dst_channel=r, name=f"v2_o{c}_{r}")
              for c in range(COLS) for r in range(ROWS)}
         gate = [Flow(mems[c], mems[c], src_channel=5, dst_channel=5, name=f"v2_gate{c}") for c in range(COLS)]
-        flows = d_in + d_out + b + list(a.values()) + list(o.values()) + gate
+        ctl = [PacketFlow(CTRL_ID[r], shims[CTRL_SHIM], cores[0][r], src_channel=1, dst_port=WireBundle.TileControl,
+                          extra_dsts=[PacketDest(cores[c][r], WireBundle.TileControl, 0) for c in range(1, COLS)],
+                          keep_pkt_header=True, name=f"v2_ctl{r}") for r in range(ROWS)]
+        flows = d_in + d_out + b + list(a.values()) + list(o.values()) + gate + ctl
         dmas, workers = [], []
         for c in range(COLS):  # (the gate tasks' words land in a scratch buffer: a static chain, no locks)
             gs = Buffer(type=ty(64), tile=mems[c], name=f"v2_gs_{c}", address=GATE_SCRATCH)
@@ -134,7 +157,8 @@ class V2Design(ArtcOperator):
             for r in range(ROWS):
                 t = cores[c][r]
                 bufs = {n: Buffer(type=ty(sz), tile=t, name=f"v2_{n}_{c}_{r}", address=L1[n])
-                        for n, sz in (("r23", 0x8000), ("out", NO * OSL), ("c", C_BYTES), ("ws", WS), ("tab", TABB))}
+                        for n, sz in (("r23", 0x8000), ("out", NO * OSL), ("c", C_BYTES), ("ws", WS), ("tab", TABB),
+                                      ("ext", 16))}
                 r23 = bufs["r23"]
 
                 def part(off: int, n: int) -> TAP:
@@ -154,9 +178,9 @@ class V2Design(ArtcOperator):
                                    acquires=[Acquire(oo)], releases=[Release(of)]) for k in range(NO)]),
                 ]))
 
-                def core_fn(rb, ou, cb, w, tb, km):
-                    km(rb, ou, cb, w, tb)
-                workers.append(Worker(core_fn, [*(bufs[n] for n in ("r23", "out", "c", "ws", "tab")),
+                def core_fn(rb, ou, cb, w, tb, ex, km):
+                    km(rb, ou, cb, w, tb, ex)
+                workers.append(Worker(core_fn, [*(bufs[n] for n in ("r23", "out", "c", "ws", "tab", "ext")),
                                                 k_main[ROLE[r]]], tile=t, stack_size=STACK, while_true=False))
         ty_arg = np.ndarray[(4096,), np.dtype[bfloat16]]
 

@@ -10,6 +10,7 @@ GroupNorm records (``Records``): a producer op's per-core records ([core][OCH] i
 DDR by its B stream (a shim gather of every column's).
 """
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -167,7 +168,10 @@ class Builder:
     def op(self, cols: dict[int, ColOps], rows: dict[int, RowOps], *, barrier: bool = False, nolock: bool = False,
            sync: bool = False) -> int:
         """Push an op (``seq.Seq.op``) with the drains pending since the last op (``records``, ``defer``) merged into
-        its drains; sync: DDR synced after its memtile tasks, before its B runs (a GroupNorm apply reading them)."""
+        its drains; sync: DDR synced after its memtile tasks, before its B runs (a GroupNorm apply reading them). Rows
+        whose role commands need another role are switched first (``seq.Seq.role``)."""
+        for role in sorted({ro.role for ro in rows.values() if ro.role}):
+            self.s.role(tuple(r for r, ro in rows.items() if ro.role == role), role)
         if not self._zfill:  # (the zero region, once)
             self._zfill = True
             z = self.image("_zeros", np.zeros(COLS * 4096, np.uint8))
@@ -184,7 +188,7 @@ class Builder:
                 rows = dict(rows)
                 for r, t in tabs.items():
                     ro = rows.get(r, RowOps(runs=[], b_objects=0, parity=False))
-                    rows[r] = RowOps(runs=t.runs + ro.runs, b_objects=ro.b_objects + 2, parity=ro.parity)
+                    rows[r] = dataclasses.replace(ro, runs=t.runs + ro.runs, b_objects=ro.b_objects + 2)
         pending, self._drains = self._drains, []
         if sync:  # (an op synced for its records: at most two drain tasks a column, the rest with the next op)
             take, keep, nd = [], [], max((len(co.drains) for co in cols.values()), default=0)

@@ -205,12 +205,14 @@ def test_norm(v2: V2Device, mode: str, m: int, C: int, ntile: int) -> None:
     assert _rel(z, ref) < 9e-3
 
 
-@pytest.mark.parametrize("np_, d, nb", [(8, 160, 1), (2, 160, 1), (16, 80, 2)])
-def test_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
+@pytest.mark.parametrize("np_, d, nb, rows", [(8, 160, 1, 2), (2, 160, 1, 2), (16, 80, 2, 2), (16, 80, 2, 4),
+                                              (8, 160, 1, 4)])
+def test_attention(v2: V2Device, np_: int, d: int, nb: int, rows: int) -> None:
     """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
     panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
-    panels drained to DDR slots, the attention rows' B streams): within 1.5e-2 of softmax attention on the
-    bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys ~8e-3, the bfp16 output ~6e-3, vexp2)."""
+    panels drained to DDR slots, the attention rows' B streams; rows 4: every core row, rows 2, 3 switched to role a):
+    within 1.5e-2 of softmax attention on the bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys
+    ~8e-3, the bfp16 output ~6e-3, vexp2)."""
     torch.manual_seed(3)
     T, C = 8 * np_, 8 * d
     x = torch.randn(3, nb, COLS * T, C)
@@ -220,10 +222,12 @@ def test_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
     VA = KA + C // 8 * np_ * L.PANEL
     OA = VA + C // 8 * np_ * L.PANEL
     cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
-    at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb)
+    ar = D.ATTN_ROWS if rows == 2 else tuple(range(ROWS))
+    at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb, rows=ar)
     v2.alloc("kv", at.kv_bytes())
-    at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb)
+    at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb, rows=ar)
     s = v2.seq()
+    s.role(ar, "a")
     for b in range(nb):
         s.op(merge(fills(v2, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
                    fills(v2, f"v{b}", [L.vt_panels(v[b, sl]) for sl in cols], VA)), {})
@@ -233,7 +237,7 @@ def test_attention(v2: V2Device, np_: int, d: int, nb: int) -> None:
     v2.write("acmd", at.command())
     s.op(fills(v2, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
     for t in range(max(np_ // 8, 1)):  # (an op per tile)
-        at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb, tile=t)
+        at = Attention(np=np_, q=QA, o=OA, kv=v2.address("kv"), d=d, nbands=nb, tile=t, rows=ar)
         s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(v2.address("acmd")))
     nbytes = C // 8 * np_ * L.PANEL
     s.op(drains(v2, "o", nbytes, OA), {})

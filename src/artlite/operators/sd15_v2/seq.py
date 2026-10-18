@@ -16,6 +16,9 @@ Per column an op is a set of memtile tasks: receives (S2MM r <- core r's outputs
 - an op's command is in B slot 0, so that its k-tile i is in B slot (i + 1) % 2 (a k-tile of an A object in region 2
   + i % 2: ``design.R23``): per row the host tracks the B objects and puts a NOP command before an op (``RowOps.parity``)
   when they are odd (and at the end: the cores' positions persist across dispatches).
+- core roles (``core.ROLES``): an op's role commands on a row (``RowOps.role``) need the row's cores in that role;
+  ``role`` switches rows (their program memory rewritten while they wait for a command), the end restores the
+  design's (``design.ROLE``).
 """
 
 import collections
@@ -30,7 +33,7 @@ from . import design as D
 R_LOCKS = 6  # rotating gate locks G (> ops in flight)
 LOCK_X, LOCK_G0 = 0, 1  # memtile lock ids
 SHIM_BD_BASE = {(txn.MM2S, 0): 0, (txn.S2MM, 0): 8}  # (4 BDs each; the B streams' MM2S 1: B_BDS)
-B_BDS = (4, 5, 6, 7, 12, 13, 14, 15)  # (MM2S 1: a pool for the B runs' chains, S2MM 1 unused)
+B_BDS = (4, 5, 6, 7, 12, 13, 14, 15)  # (MM2S 1: a pool for the B runs' chains, the role switches', S2MM 1 unused)
 
 
 @dataclass
@@ -57,19 +60,25 @@ class ColOps:
 @dataclass
 class RowOps:
     """An op's B stream in one row: (device address, bytes[, shim dims]) runs, the B objects each of its cores takes;
-    parity: the op's command must be in B slot 0 (its k-tiles' B slots matter: m-64 GEMMs, convs and attention)."""
+    parity: the op's command must be in B slot 0 (its k-tiles' B slots matter: m-64 GEMMs, convs and attention); role:
+    the role whose code its command runs (None: shared code)."""
 
     runs: list[tuple]
     b_objects: int
     parity: bool = True
+    role: str | None = None
 
 
 class Seq:
-    """A dispatch's transaction. ``nop``: the device address of a NOP command (one B slot)."""
+    """A dispatch's transaction. ``nop``: the device address of a NOP command (one B slot); ctrl: per (role, core row)
+    the device address and bytes of its switch's control packets (``runtime.role_packets``)."""
 
-    def __init__(self, *, nop: int):
+    def __init__(self, *, nop: int, ctrl: dict | None = None):
         self.t = txn.Txn()
         self.nop = nop
+        self.ctrl = ctrl or {}
+        self.role_of = list(D.ROLE)  # (per core row its role)
+        self._row_op = [-1] * ROWS  # (per core row the last op with commands there)
         self.n = 0  # ops pushed
         self.frontier = 0  # every task of the ops before it is complete
         self._q: dict[tuple, collections.deque] = {}  # (row 0 / 1, col, dir, ch) -> ops of its pending tasks
@@ -250,6 +259,10 @@ class Seq:
                                             release=(x, 1) if release and i == len(t.chain) - 1 else None))
             return out
 
+        for r, ro in rows.items():
+            assert not ro.role or ro.role == self.role_of[r], f"op {n}: row {r} is in role {self.role_of[r]}, not {ro.role}"
+            self._row_op[r] = n
+
         def b_runs() -> None:
             for r, ro in sorted(rows.items()):
                 nop = self._par[r] and ro.parity
@@ -295,6 +308,34 @@ class Seq:
             b_runs()
         return n
 
+    def role(self, rows: tuple[int, ...], role: str) -> None:
+        """Core rows ``rows`` in role ``role`` for the ops pushed from now: where a row is in another one, once every op
+        with commands there is complete (an empty op pushed for its gate when the last is the newest: the cores wait for
+        a command, their instruction fetch stalled; a program-memory write that meets a fetch fails, AM027), its cores'
+        program memory from the shared code's end and their ext words rewritten by control packets: per row a BD of one
+        task on shim ``design.CTRL_SHIM`` MM2S 1 (the row's broadcast), ending with the marker word ext[1] := 1, cleared
+        before and polled in every core."""
+        rows = tuple(r for r in rows if self.role_of[r] != role)
+        if not rows:
+            return
+        u = max(self._row_op[r] for r in rows)
+        if u >= self.frontier:
+            if u + 1 >= self.n:
+                self.op({}, {})
+            self.complete(u)
+        mark = [txn.tile_address(c, r + 2, D.L1["ext"] + 4) for r in rows for c in range(COLS)]
+        for a in mark:
+            self.t.write32(a, 0)
+        for i, r in enumerate(rows):
+            addr, nbytes = self.ctrl[(role, r)]
+            self.t.shim_bd(D.CTRL_SHIM, B_BDS[i], address=addr, nbytes=nbytes,
+                           next_bd=B_BDS[i + 1] if i + 1 < len(rows) else None)
+        self.t.shim_push(D.CTRL_SHIM, txn.MM2S, 1, B_BDS[0])
+        for a in mark:
+            self.t.maskpoll32(a, 1, 0xFFFFFFFF)
+        for r in rows:
+            self.role_of[r] = role
+
     def ddr_sync(self) -> None:
         """Wait until every drain pushed so far has written DDR (before a fill or B stream reads what it wrote)."""
         for c, op in sorted(self._drains.items()):  # (a channel completes in order: its last drain covers the others)
@@ -303,9 +344,11 @@ class Seq:
         self._drains.clear()
 
     def finish(self) -> np.ndarray:
-        """The transaction: the cores' B parity restored, every op complete, every drain written to DDR."""
+        """The transaction: the cores' B parity and roles restored, every op complete, every drain written to DDR."""
         # (a last op: its gate makes the previous op's completion observable; the rows' parity NOPs)
         self.op({}, {r: RowOps(runs=[], b_objects=0) for r in range(ROWS) if self._par[r]})
+        for role in sorted(set(D.ROLE)):
+            self.role(tuple(r for r in range(ROWS) if D.ROLE[r] == role), role)
         self.complete(self.n - 2)
         self.ddr_sync()
         return self.t.words()

@@ -1,6 +1,9 @@
-"""The cores' program of sd15_v2's design (``design``): a C++ main reading commands from the row's B stream. Core rows 0,
-1 run ``v2_main_a`` (GEMM, attention), rows 2, 3 ``v2_main_b`` (GEMM, the applies): a core links what its main
-reaches, and the two together do not fit 16 KB of program memory.
+"""The cores' program of sd15_v2's design (``design``): a C++ main reading commands from the row's B stream. The main
+loop (``v2_run``), GEMMs and convs are shared code; the other kinds are a role's code (``ROLES``: "a" attention, "b"
+the applies; together they do not fit 16 KB of program memory): a core of role x starts at ``v2_main_x``, which puts
+its role's entry (``v2_ext_x``) into the ext word and enters ``v2_run``. Each role's ELF holds the shared code first,
+at the same addresses in every role's (the role code is what only its main reaches, placed after it): a role switch
+rewrites the program memory from there and the ext word (``runtime.role_code``, ``seq.Seq.role``).
 
 A command is one B slot: the header words ``C_*`` and, from word ``C_BIAS``, the op's biases (bf16 [pass][80]); the
 core copies it into its workspace and releases the slot. Kinds:
@@ -19,12 +22,12 @@ core copies it into its workspace and releases the slot. Kinds:
   stride-2 conv's x, in 2 x 2 chunks), its bfp16 panels (m x 90 B,
   [rb][cb]), their transposes (V^T: [rb][cb] of [8 channels][8 tokens], the exponent per channel), or GEGLU (the
   pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) in ``OCH`` chunks (the last one padded);
-- ``K_APPLY`` (core rows 2, 3): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
+- ``K_APPLY`` (role b): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
   stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
   beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm: the B slots after it C_NREC
   group records (``REC_SLOT`` per slot, summed); LayerNorm: the first A object the tile's per-token records of the
   column's 4 cores;
-- ``K_ATTN`` (core rows 0, 1): per unit (C_NUNIT: an image and head of d 160) its queries (an A object: C_NQP query
+- ``K_ATTN`` (role a): per unit (C_NUNIT: an image and head of d 160) its queries (an A object: C_NQP query
   panels (1, 2 or 4) as pairs [pair][d-block 20][2], a pair per half; a single panel's pair partner is junk), per key
   group (C_NG of 32
   keys, C_NK of them valid in the last one) a K slot [key pair 2][d-block 20][2] and a V^T slot [d-block pair 10][key
@@ -71,19 +74,20 @@ A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("v2")  # (the kernels' names: ``kernel_source``)
+ROLES = ("a", "b")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
 {{ macf }}
 {{ pvm }}
 
-namespace {
-constexpr unsigned {{ p }}_L_AF = 48, {{ p }}_L_AA = 49, {{ p }}_L_BF = 50, {{ p }}_L_BB = 51, {{ p }}_L_OF = 52, {{ p }}_L_OO = 53;  // (the core's locks 0..5)
-
 struct {{ p }}_st {  // the static chains' positions (A ping-pong, B slots, output ring) and the scratch buffers
   int32_t *a0, *a1, *b0, *b1, *outr, *s0, *s1;
   int apar, bpos, opos;
 };
+
+namespace {
+constexpr unsigned {{ p }}_L_AF = 48, {{ p }}_L_AA = 49, {{ p }}_L_BF = 50, {{ p }}_L_BB = 51, {{ p }}_L_OF = 52, {{ p }}_L_OO = 53;  // (the core's locks 0..5)
 
 // (take: the next slot, its position advanced; give: release it: two slots may be held at once)
 inline __attribute__((always_inline)) int32_t *{{ p }}_take_a({{ p }}_st &s) {
@@ -343,7 +347,7 @@ __attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32
 }
 
 // nbytes from src through the output ring, in OCH chunks (the last one padded with what follows src)
-static __attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const int32_t *src, int nbytes) {
+__attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const int32_t *src, int nbytes) {
 {% if win == "out" %}
   event0();
 {% endif %}
@@ -367,7 +371,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const 
 // the second group's C bands, bits 16..23: the bands; the A walk (a dims_3d_t); its last step per A slot (the walk
 // may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS); the row tiles (``ops.Gemm`` rc): an
 // A object per dy (bit 15 of its first tap: the next object), its shift phase's destinations in the object (SH_OBJ)
-static __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf) {
+__attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf) {
   static_assert(sizeof(dims_3d_t) == 28);
   const int nch = ws[{{ C_NCH }}], R = ws[{{ C_R }}], rot = ws[{{ C_ROT }}];
   const dims_3d_t &pb = *(const dims_3d_t *)(ws + {{ C_PATS }}), &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
@@ -404,7 +408,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32
   }
 }
 
-static __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+__attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], npass = ws[{{ C_NPASS }}], nkt = ws[{{ C_NKT }}];
   const int nres = ws[{{ C_NRES }}], om = ws[{{ C_OUT }}], stats = ws[{{ C_STATS }}], stf = ws[{{ C_STF }}];
   const int kpo = m == 64 ? 2 : 8, nrb = m / 8;  // (k-tiles per A object, row blocks)
@@ -922,11 +926,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
   }
 }
 
-extern "C" {
-
-{% for role in ("a", "b") %}
-// the main of core rows {{ "0, 1: GEMM, attention" if role == "a" else "2, 3: GEMM, the applies" }}
-__attribute__((minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab) {
+// the cores' main loop (shared): commands from the B stream; GEMMs / convs and tables here, the other kinds by the role's
+// code through its entry in ext (a role switch rewrites it while the core waits for a command: ``seq.Seq.role``)
+__attribute__((noinline, minsize)) void {{ p }}_run(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
+                                                const int32_t *ext) {
   {{ p }}_st s{r23 + {{ R23.a0 // 4 }}, r23 + {{ R23.a1 // 4 }}, r23 + {{ R23.b0 // 4 }}, r23 + {{ R23.b1 // 4 }}, outr,
           r23 + {{ R23.s0 // 4 }}, r23 + {{ R23.s1 // 4 }}, 0, 0, 0};
   for (;;) {
@@ -936,22 +939,36 @@ __attribute__((minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, int32_t *out
     const int kind = ws[{{ C_KIND }}];
     if (kind == {{ K_GEMM }}) {
       {{ p }}_gemm(s, cb, ws, tab);
-{% if role == "a" %}
-    } else if (kind == {{ K_ATTN }}) {
-      {{ p }}_attn(s, cb, ws);
-{% else %}
-    } else if (kind == {{ K_APPLY }}) {
-      if (ws[{{ C_MODE }}] == {{ A_LN }})
-        {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
-      else
-        {{ p }}_apply_gn(s, cb, ws, (const uint32_t *)tab);
-{% endif %}
     } else if (kind == {{ K_TABLE }}) {
       int32_t *t = {{ p }}_take_b(s);
       {{ p }}_copy8(t, tab, {{ TAB // 4 }});
       {{ p }}_give_b(s, t);
+    } else if (kind != {{ K_NOP }}) {
+      ((void (*)({{ p }}_st &, int32_t *, int32_t *, int32_t *))(intptr_t)*ext)(s, cb, ws, tab);
     }
   }
+}
+
+// the roles' entries (after every shared definition)
+static __attribute__((noinline, minsize)) void {{ p }}_ext_a({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_attn(s, cb, ws);
+}
+
+static __attribute__((noinline, minsize)) void {{ p }}_ext_b({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  if (ws[{{ C_MODE }}] == {{ A_LN }})
+    {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
+  else
+    {{ p }}_apply_gn(s, cb, ws, (const uint32_t *)tab);
+}
+
+extern "C" {
+
+{% for role in roles %}
+// the start of a core of role {{ role }}
+__attribute__((noinline, minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
+                                                          int32_t *ext) {
+  *ext = (int32_t)(intptr_t)&{{ p }}_ext_{{ role }};
+  {{ p }}_run(r23, outr, cb, ws, tab, ext);
 }
 {% endfor %}
 
@@ -995,7 +1012,7 @@ def source(*, win: str = "") -> str:
     from . import design as d
     assert win in ("",) + WINS, win
     return JINJA_ENV.from_string(_SRC).render(
-        p=P, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
+        p=P, roles=ROLES, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
         tabu=act_lut.SILU.render_unrolled(640), lut=act_lut.LUT,
         gelu_tmax=act_lut.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,

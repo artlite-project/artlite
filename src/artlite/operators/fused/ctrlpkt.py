@@ -78,10 +78,10 @@ def _north(own: int, up: list[int]) -> list[int]:
     return out
 
 
-def packets(row: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
-    """A tile's writes ((tile-local address, words)) as control packets: per packet the stream header (the tile's id),
-    the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding)."""
-    head = _parity(ROW_ID[row])
+def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
+    """A tile's writes ((tile-local address, words)) as control packets: per packet the stream header (``stream_id``:
+    the route's packet id), the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding)."""
+    head = _parity(stream_id)
     out = []
     for addr, data in writes:
         for i in range(0, len(data), 4):
@@ -135,7 +135,7 @@ class Loader:
                 w = self.writes[(c, r)]
                 if r == rows[-1]:  # (the column's last: its marker)
                     w = [*w, (MARK[min(r, 2)], np.array([MARK_VALUE], np.uint32))]
-                self.streams[(c, r)] = packets(r, w)
+                self.streams[(c, r)] = packets(ROW_ID[r], w)
 
     def routes(self) -> list[tuple[int, list[int], str]]:
         """The loader's writes (absolute address, words, kind: "mux", "ports", "slots"): per column the shim mux and

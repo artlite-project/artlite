@@ -299,7 +299,7 @@ def test_control_packets_encoding(tmp_path):
     out = tmp_path / "pk.bin"
     subprocess.run([shutil.which("aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
     want = np.fromfile(out, np.uint32)
-    assert np.array_equal(ctrlpkt.packets(4, writes), want)
+    assert np.array_equal(ctrlpkt.packets(ctrlpkt.ROW_ID[4], writes), want)
 
 
 def _add_chain(name: str, **kw: object) -> FusedOperator:

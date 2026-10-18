@@ -1,12 +1,99 @@
-"""sd15_v2's design on the NPU (``V2Device``): its hardware context, DDR buffers, and dispatches of ``seq.Seq``
-programs."""
+"""sd15_v2's design on the NPU (``V2Device``): its hardware context, DDR buffers, the roles' code (``role_code``), and
+dispatches of ``seq.Seq`` programs."""
+
+import os
+import struct
+import subprocess
+from dataclasses import dataclass
 
 import numpy as np
 
+from ..base import PEANO_DIR
+from ..fused import ctrlpkt
+from ..kernel_source import MARK
 from ..overlay.runtime import OverlayDevice, Transaction
 from . import core as K
 from . import design as D
 from .seq import Seq
+
+
+@dataclass(frozen=True)
+class Role:
+    """A role's code (``core.ROLES``): its program-memory words from byte ``start`` (the end of the shared code) and its
+    entry (the ext word's value)."""
+
+    start: int
+    words: np.ndarray
+    entry: int
+
+
+def _elf(path: str) -> tuple[dict[str, bytes], dict[str, int]]:
+    """An ELF32 file's sections and symbol values by name."""
+    with open(path, "rb") as f:
+        b = f.read()
+    shoff, = struct.unpack_from("<I", b, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x2E)
+    hdr = [struct.unpack_from("<IIIIIIIIII", b, shoff + i * shentsize) for i in range(shnum)]
+
+    def name(table: int, off: int) -> str:
+        o = hdr[table][4] + off
+        return b[o:b.index(b"\0", o)].decode()
+    secs = {name(shstrndx, h[0]): b[h[4]:h[4] + h[5]] for h in hdr}
+    syms = {}
+    for h in hdr:
+        if h[1] == 2:  # (SHT_SYMTAB: entries of 16 bytes, names in the section h[6] links)
+            for o in range(h[4], h[4] + h[5], 16):
+                st_name, st_value = struct.unpack_from("<II", b, o)
+                if st_name:
+                    syms[name(h[6], st_name)] = st_value
+    return secs, syms
+
+
+def role_code(work_dir: str) -> dict[str, Role]:
+    """Each role's code, from its ELF: core (0, 2)'s link with that role's main in place of its own (an alias in the
+    core's linker script; ``role_<x>.elf`` in the design's project directory). The shared code and the data are
+    identical in every role's ELF (asserted: the switch rewrites neither)."""
+    prj = os.path.join(work_dir, "design.mlir.prj")
+    stem = K.P.removeprefix(MARK)  # (the linked names: <stem>_<name>_<hash>)
+    base = D.ROLE[0]
+    own = os.path.join(prj, "elfs_main_core_0_2", "elfs_main_core_0_2.elf")
+    mains = {r: next(n for n in _elf(own if r == base else os.path.join(work_dir, "kernel.o"))[1]
+                     if n.startswith(f"{stem}_main_{r}_")) for r in K.ROLES}
+    elfs = {}
+    for r in K.ROLES:
+        path = own if r == base else os.path.join(prj, f"role_{r}.elf")
+        if not os.path.exists(path):
+            with open(os.path.join(prj, "ldScripts_main_core_0_2.ld.script")) as f:
+                script = f.read() + f"\n{mains[base]} = {mains[r]};\n"
+            tmp = f"{path}.{os.getpid()}"
+            with open(tmp + ".ld", "w") as f:
+                f.write(script)
+            subprocess.run([os.path.join(PEANO_DIR, "bin", "clang"), "-O2", "--target=aie2p-none-unknown-elf",
+                            "-fuse-ld=lld", os.path.join(prj, "objects_main_core_0_2", "objects_main_core_0_2.o"),
+                            "-Wl,--gc-sections", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld", "-o", tmp],
+                           check=True)
+            os.replace(tmp, path)
+            os.remove(tmp + ".ld")
+        elfs[r] = _elf(path)
+    start = {elfs[r][1][mains[r]] for r in K.ROLES}
+    assert len(start) == 1, f"the roles' shared code ends at {start}"
+    end = start.pop()
+    first = min(v for r in K.ROLES for n, v in elfs[r][1].items() if f"{stem}_" in n and v < end)  # (kernel.o's code)
+    ref = elfs[base][0]
+    out = {}
+    for r, (secs, syms) in elfs.items():
+        assert secs[".text"][first:end] == ref[".text"][first:end] and secs[".data"] == ref[".data"], r
+        code = secs[".text"][end:]
+        out[r] = Role(end, np.frombuffer(code + bytes(-len(code) % 4), np.uint32), syms[next(
+            n for n in syms if f"{stem}_ext_{r}_" in n)])
+    return out
+
+
+def role_packets(role: Role, row: int) -> np.ndarray:
+    """A switch of core row ``row`` to ``role``: control packets (packet id ``design.CTRL_ID[row]``, the row's cores)
+    of its code, then of the ext words (its entry, the marker 1: ``seq.Seq.role``)."""
+    return ctrlpkt.packets(D.CTRL_ID[row], [(D.PM + role.start, role.words),
+                                            (D.L1["ext"], np.array([role.entry, 1], np.uint32))])
 
 
 class V2Device:
@@ -23,10 +110,18 @@ class V2Device:
         self.dev = OverlayDevice(self.design, device=device)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
+        self.roles = role_code(os.path.dirname(self.dev._prog.insts_path))
         nop = np.zeros(D.Q // 4, np.int32)
         nop[K.C_KIND] = K.K_NOP
         self.alloc("_nop", D.Q)
         self.write("_nop", nop.view(np.uint8))
+        self.ctrl = {}
+        for role, code in self.roles.items():
+            for r in range(len(D.ROLE)):
+                pk = role_packets(code, r)
+                self.alloc(f"_role_{role}_{r}", pk.nbytes)
+                self.write(f"_role_{role}_{r}", pk)
+                self.ctrl[(role, r)] = (self.address(f"_role_{role}_{r}"), pk.nbytes)
 
     def has(self, name: str) -> bool:
         return name in self._images
@@ -72,7 +167,7 @@ class V2Device:
         return self.dev.address(chunk, off + offset)
 
     def seq(self) -> Seq:
-        return Seq(nop=self.address("_nop"))
+        return Seq(nop=self.address("_nop"), ctrl=self.ctrl)
 
     def transaction(self, seq: Seq) -> Transaction:
         return Transaction(self.dev, seq.finish())

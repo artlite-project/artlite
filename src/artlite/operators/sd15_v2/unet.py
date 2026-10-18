@@ -193,6 +193,7 @@ def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: tor
 
 
 LOG2E = 1.4426950408889634
+SELF_ROWS, CROSS_ROWS = (0, 1, 2, 3), D.ATTN_ROWS  # (the core rows of self- / cross-attention: rows 2, 3 switched to role a)
 
 
 def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
@@ -202,12 +203,13 @@ def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch
     bd.mem.release(rec, ln_rec(h.lv))
 
 
-def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0) -> Tensor:
+def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0, rows: tuple[int, ...] = D.ATTN_ROWS) -> Tensor:
     """Attention of the panels q (scaled queries, 8 heads) on the K / V^T slots at DDR kv (self-attention: the keys of
-    all of the level's bands): the output panels."""
+    all of the level's bands) on the core rows ``rows``: the output panels."""
     o = alloc(bd, q.lv, q.C, "pn")
     for t in range(max(q.lv.np // 8, 1)):  # (an op per tile)
-        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=q.C // 8, nbands=q.lv.nb, tile=t)
+        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=q.C // 8, nbands=q.lv.nb, tile=t,
+                       rows=rows)
         cmd = bd.image(name, at.command())
         bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
     return o
@@ -264,7 +266,8 @@ def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, 
             gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=q + a + ".to_q", out=qt,
                  kind="bfp16")
             free(bd, n)
-        o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx)
+        o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx,
+                   rows=SELF_ROWS if a == "attn1" else CROSS_ROWS)
         free(bd, qt)
         rec = gemm(bd, o, w[q + a + ".to_out.0.weight"], w[q + a + ".to_out.0.bias"], name=q + a + ".to_out", out=h,
                    res=h, ln=True)

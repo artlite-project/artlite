@@ -287,6 +287,13 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
   sub-block); a table activation (`act_lut`) instead of a polynomial chain: smaller and faster.
 - No runtime-library arithmetic (`checks.py` warns when a kernel calls it).
+- **Roles: code variants rewritten at run time** (a static design whose kernels do not fit 16 KB together, sd15_v2):
+  every role's ELF holds the shared code (main loop, GEMMs) first, at the same addresses, and the role's code after
+  it (what only its entry reaches); the main loop calls role code through a pointer in data memory. A switch rewrites
+  that tail and the pointer by control packets: one packet flow per core row from a free shim MM2S channel to the
+  row's TileControl ports (a broadcast: one stream writes the 8 cores), while the cores wait for a command (above:
+  never into a running core). 16 cores x 5.9 KB: ~7 µs (blockwrites ~130 µs). `sd15_v2.runtime.role_code` links
+  each role's ELF from a core's object (its main aliased in the linker script), `seq.Seq.role` switches.
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 
 Rejected size levers: rejected.md "Program memory".
