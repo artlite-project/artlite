@@ -5,7 +5,6 @@ from .gemm.gemm_qd import GemmQdOperator
 from .gemma4.decode import GemmaDecodeOperator
 from .llama.decode import LlamaDecodeOperator
 from .prefill.norm import PrefillNormOperator
-from .sd15.unet import UNetProgram
 
 __all__ = [
     "ArgSpec",
@@ -15,5 +14,4 @@ __all__ = [
     "GemmaDecodeOperator",
     "LlamaDecodeOperator",
     "PrefillNormOperator",
-    "UNetProgram",
 ]

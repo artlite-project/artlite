@@ -6,14 +6,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from artlite.operators.sd15 import overlay as old
+from artlite.operators import act_lut
 from artlite.operators.sd15_v2 import design as D
 from artlite.operators.sd15_v2 import layout as L
 from artlite.operators.sd15_v2.build import Builder, Level
 from artlite.operators.sd15_v2.ops import Apply, Attention, Gemm
 from artlite.operators.sd15_v2.runtime import V2Device
 from artlite.operators.sd15_v2.seq import ColOps, MemTask, RowOps
-from artlite.operators.sd15_v2.unet import DTensor, Tensor
+from artlite.operators.sd15_v2.unet import DTensor, Tensor, gelu_table
 
 COLS, ROWS = 8, 4
 
@@ -110,7 +110,7 @@ def test_geglu(v2: V2Device, m: int, K: int, N: int) -> None:
     g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, out="geglu")
     s = v2.seq()
     s.op(fills(v2, "x", [L.panels(x[c * T:(c + 1) * T]) for c in range(COLS)], X), {})
-    s.op({}, table_rows(v2, "tab", old._gelu_table()[0]))
+    s.op({}, table_rows(v2, "tab", gelu_table()))
     s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(v2, "w", g, w, b))
     ybytes = N // 16 * g.y_np * L.PANEL
     s.op(drains(v2, "y", ybytes, Y), {})
@@ -168,7 +168,7 @@ def test_norm(v2: V2Device, mode: str, m: int, C: int, ntile: int) -> None:
                                         ddr=(v2.address("rec", c * 1024), 1024, None))]) for c in range(COLS)}, {})
         s.ddr_sync()
         v2.alloc("zeros", D.Q)
-    tabs = table_rows(v2, "tab", old.silu_table()) if mode == "gnsilu" else {}
+    tabs = table_rows(v2, "tab", np.asarray(act_lut.SILU.table_buffer()).view(np.uint8)) if mode == "gnsilu" else {}
     if tabs:
         s.op({}, tabs)
     npr = 4 // len(a.rows)  # (the producer cores whose records the i-th core sums: [npr i, ..))
@@ -529,10 +529,11 @@ def _il_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> D
     xd = DTensor(lv, C, name, rec=[])
     for b in range(lv.nb):
         bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
-    for b in range(lv.nb):
-        t = xd.load(bd, b)
-        xd.rec += copy_stats(bd, t, name=f"{name}.st{b}", st=st, band=b)
-        bd.mem.release(t.addr, t.nbytes)
+    for c0 in range(0, C, 320):  # (parts of 320 channels: a band's C tiles and panels in the memtile)
+        for b in range(lv.nb):
+            t = xd.load(bd, b, c0, 320)
+            xd.rec += copy_stats(bd, t, name=f"{name}.st{c0}", st=(st[0], st[1] + c0), band=b)
+            bd.mem.release(t.addr, t.nbytes)
     return xd
 
 
@@ -742,6 +743,90 @@ def test_transformer_bands(v2: V2Device) -> None:
     assert err < 2e-2
 
 
+def _b32_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> DTensor:
+    """A 32x32 DTensor of x (2, C, 32, 32) in DDR per band (``Level(32, 2)``), with GroupNorm records for st."""
+    from artlite.operators.sd15_v2.unet import copy_stats
+    lv, C = Level(32, 2), x.shape[1]
+    xc = level_tokens(x, lv.R, lv.Lg)
+    xd = DTensor(lv, C, name, rec=[])
+    for b in range(lv.nb):
+        bd.image(xd.band(b), np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+    for b in range(lv.nb):
+        t = xd.load(bd, b)
+        xd.rec += copy_stats(bd, t, name=f"{name}.st{b}", st=st, band=b)
+        bd.mem.release(t.addr, t.nbytes)
+    return xd
+
+
+@pytest.mark.slow
+def test_down64(v2: V2Device) -> None:
+    """The 64x64 level's stride-2 conv (320 -> 320) into the 32x32 level's bands (``level64.down64``): within 8e-3 of
+    torch on the bfp16-rounded operands."""
+    from artlite.operators.sd15_v2.level64 import down64
+    torch.manual_seed(17)
+    C = 320
+    x = torch.randn(2, C, 64, 64)
+    w = {"s.conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, "s.conv.bias": 0.1 * torch.randn(C)}
+    bd = Builder(v2)
+    xd = _il_input(bd, x, "x_in", (C // 32, 0))
+    out = down64(bd, w, "s.", xd, stats=(C // 32, 0), name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    lv = out.lv
+    yb = [v2.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
+    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(lv.nb)])
+                                       for c in range(COLS)]), lv.R, lv.Lg)
+    ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w["s.conv.weight"]),
+                   w["s.conv.bias"].bfloat16().float(), padding=1, stride=2)
+    err = _rel(y, ref)
+    assert err < 8e-3, err
+
+
+@pytest.mark.slow
+def test_up64(v2: V2Device) -> None:
+    """Nearest 2x of a 32x32 level's bands (640 channels) and the conv (640 -> 640, K parts and output halves of 320)
+    into the 64x64 level (``level64.up64``): within 8e-3 of torch on the bfp16-rounded operands."""
+    from artlite.operators.sd15_v2.level64 import up64
+    torch.manual_seed(18)
+    C = 640
+    x = torch.randn(2, C, 32, 32)
+    w = {"s.conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, "s.conv.bias": 0.1 * torch.randn(C)}
+    bd = Builder(v2)
+    xd = _b32_input(bd, x, "x_in", (C // 32, 0))
+    out = up64(bd, w, "s.", xd, stats=(30, 0), name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    xu = F.interpolate(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), scale_factor=2.0, mode="nearest")
+    ref = F.conv2d(xu, qconv_w(w["s.conv.weight"]), w["s.conv.bias"].bfloat16().float(), padding=1)
+    err = _rel(_il_output(v2, out), ref)
+    assert err < 8e-3, err
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("ch", [640, 320])
+def test_resnet_cat64(v2: V2Device, ch: int) -> None:
+    """The up path's resnet on [h | skip] (skip 320) -> 320 on the 64x64 level (K parts of 320): within 1.5e-2 of the
+    fp32 reference."""
+    from artlite.operators.sd15_v2.level64 import resnet_cat64
+    from models.sd15 import reference
+    torch.manual_seed(19)
+    p, cs, cout = "r.", 320, 320
+    w = _rand_resnet(p, ch + cs, cout)
+    tb = 0.3 * torch.randn(cout)
+    h, sk = torch.randn(2, ch, 64, 64), torch.randn(2, cs, 64, 64)
+    gs = (ch + cs) // 32
+    bd = Builder(v2)
+    hd = _il_input(bd, h, "h_in", (gs, 0))
+    sd = _il_input(bd, sk, "s_in", (gs, ch))
+    out = resnet_cat64(bd, w, p, hd, sd, cout=cout, time_bias=tb, eps=1e-5, stats=None, name="y")
+    bd.op({}, {})
+    v2.run(bd.transaction())
+    ref = reference.resnet(w, p, torch.cat([h, sk], 1), eps=1e-5, time_bias=tb)
+    err = _rel(_il_output(v2, out), ref)
+    print(f"rel err {err:.3e}")
+    assert err < 1.5e-2
+
+
 @pytest.mark.slow
 def test_transformer64(v2: V2Device) -> None:
     """The transformer on the 64x64 level (320 channels, d 40 on role c: 4 bands, x and the output in DDR, h and Q of
@@ -836,13 +921,13 @@ def test_resample(v2: V2Device, kind: str) -> None:
 
 
 @pytest.mark.slow
-def test_section(v2: V2Device) -> None:
-    """The 32x32 .. 8x8 levels with SD 1.5's weights (down_blocks.1 .. up_blocks.2: ``unet.Section``, the sd15 overlay's
-    tensor layouts at both ends) on the reference's own down_blocks.0 downsampler output of random latents (t 500, a
-    random context), spliced into the fp32 reference UNet: the step's output within 1.5e-2 of the reference's."""
+def test_unet(v2: V2Device) -> None:
+    """SD 1.5's UNet step (``model.UNet``: every level on the design, one dispatch) on random latents at t 500 with a
+    random context: within 1.5e-2 of the fp32 reference; a second run the same."""
     import time
 
     from artlite.model_config import sd15_dir
+    from artlite.operators.sd15_v2.model import UNet
     from models import is_diffusers
     from models.sd15 import reference
     from models.sd15.host import resnet_time_biases
@@ -850,70 +935,20 @@ def test_section(v2: V2Device) -> None:
     if not is_diffusers(path):
         pytest.skip(f"{path}: not present")
     u = reference.UNet(f"{path}/unet")
-    w, eps = u.w, u.cfg["norm_eps"]
     torch.manual_seed(0)
-    lat, ctx = torch.randn(2, 4, 64, 64), torch.randn(2, 77, 768)
-    biases = resnet_time_biases(w, 500.0)
-
-    def res(p: str, h: torch.Tensor) -> torch.Tensor:
-        return reference.resnet(w, p, h, eps=eps, time_bias=biases[p])
-
-    def tr(p: str, h: torch.Tensor) -> torch.Tensor:
-        return u.transformer(p, h, ctx)
-
-    h = reference.conv(w, "conv_in.", lat)
-    skips = [h]
-    for j in range(2):
-        h = tr(f"down_blocks.0.attentions.{j}.", res(f"down_blocks.0.resnets.{j}.", h))
-        skips.append(h)
-    x5 = h = reference.conv(w, "down_blocks.0.downsamplers.0.conv.", h, stride=2)
-    for i in (1, 2):
-        skips.append(h)
-        for j in range(2):
-            h = tr(f"down_blocks.{i}.attentions.{j}.", res(f"down_blocks.{i}.resnets.{j}.", h))
-            skips.append(h)
-        h = reference.conv(w, f"down_blocks.{i}.downsamplers.0.conv.", h, stride=2)
-    skips.append(h)
-    for j in range(2):
-        h = res(f"down_blocks.3.resnets.{j}.", h)
-        skips.append(h)
-    h = res("mid_block.resnets.1.", tr("mid_block.attentions.0.", res("mid_block.resnets.0.", h)))
-    for i in range(3):
-        for j in range(3):
-            h = res(f"up_blocks.{i}.resnets.{j}.", torch.cat([h, skips.pop()], 1))
-            if i:
-                h = tr(f"up_blocks.{i}.attentions.{j}.", h)
-        if i < 2:
-            h = reference.conv(w, f"up_blocks.{i}.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
-    ref = h
-
-    def finish(h: torch.Tensor) -> torch.Tensor:  # (up_blocks.2's upsampler .. conv_out)
-        sk = list(skips)
-        h = reference.conv(w, "up_blocks.2.upsamplers.0.conv.", F.interpolate(h, scale_factor=2.0, mode="nearest"))
-        for j in range(3):
-            h = tr(f"up_blocks.3.attentions.{j}.", res(f"up_blocks.3.resnets.{j}.", torch.cat([h, sk.pop()], 1)))
-        return reference.conv(w, "conv_out.", reference.group_norm(w, "conv_norm_out.", h, eps, silu=True))
-
+    x, ctx = torch.randn(2, 4, 64, 64), torch.randn(2, 77, 768)
     t0 = time.perf_counter()
-    from artlite.operators.sd15 import overlay as old
-    from artlite.operators.sd15_v2.unet import Section
-    halves = old.to_ctile(x5).view(torch.uint8).numpy().reshape(4, 16, 2, 10240)  # (pass, tile, half: rows 2 t, 2 t + 1)
-    x_old = np.zeros((4, 32, old.C_OBJ), np.uint8)
-    x_old[:, :, :10240] = halves.reshape(4, 32, 10240)
-    v2.alloc("x_old", x_old.size)
-    v2.write("x_old", x_old)
-    v2.alloc("out_old", 8 * 16 * old.C_OBJ)
-    sec = Section(v2, w, x_in=v2.address("x_old"), out=v2.address("out_old"), eps=eps)
-    sec.set_time(biases)
-    sec.set_context(ctx)
-    print(f"section: {sec.bd.s.n} ops, built in {time.perf_counter() - t0:.1f} s")
-    sec.run()
-    y = old.from_panels(torch.from_numpy(v2.read("out_old", 8 * 16 * old.C_OBJ)), 640, 32, 32)
+    net = UNet(v2, u.w, eps=u.cfg["norm_eps"])
+    print(f"UNet: {net.bd.s.n} ops, built in {time.perf_counter() - t0:.1f} s")
+    net.set_time(resnet_time_biases(u.w, 500.0))
+    net.set_context(ctx)
+    y = net(x)
     ts = []
-    for _ in range(5):
+    for _ in range(3):
         t1 = time.perf_counter()
-        sec.run()
+        y2 = net(x)
         ts.append(time.perf_counter() - t1)
-    err = _rel(finish(y), finish(ref))
-    print(f"section: up_blocks.2 rel err {_rel(y, ref):.3e}, the step's {err:.3e}; {np.median(ts) * 1e3:.1f} ms per dispatch")
+    err = _rel(y, u(x, 500.0, ctx))
+    print(f"UNet: rel err {err:.3e}; {np.median(ts) * 1e3:.1f} ms per step")
+    assert torch.equal(y, y2)
     assert err < 1.5e-2

@@ -42,12 +42,9 @@ def _qwen(path: str) -> None:
 
 
 def _sd15(path: str) -> None:
-    from artlite.operators.sd15.unet import UNetProgram
-    from models.sd15.weights import load_safetensors
+    from artlite.operators.sd15_v2.design import V2Design
 
-    unet = UNetProgram(load_safetensors(os.path.join(path, "unet", "diffusion_pytorch_model.safetensors")))
-    unet.build()
-    unet.prog.compile()
+    parallel_compile.compile_all([V2Design()])
 
 
 APPS: dict[str, tuple[str, Callable[[str], None]]] = {

@@ -142,11 +142,9 @@ class V2Device:
 
     CHUNK = 64 << 20
 
-    def __init__(self, design: D.V2Design | None = None, *, device: object = None):
-        """device: an ``artlite.Device`` to share (a library's whose entry the design is: its transactions run as the
-        library's raw items, ``fused.program.RawTxn``)."""
+    def __init__(self, design: D.V2Design | None = None):
         self.design = design or D.V2Design()
-        self.dev = OverlayDevice(self.design, device=device)
+        self.dev = OverlayDevice(self.design)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
         self.roles = role_code(os.path.dirname(self.dev._prog.insts_path))

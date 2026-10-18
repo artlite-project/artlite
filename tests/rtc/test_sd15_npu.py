@@ -1,6 +1,6 @@
-"""Stable Diffusion 1.5 with the UNet on the NPU (models.sd15.npu, artlite.operators.sd15): one UNet step against the
-fp32 reference, and text to image against the CPU backend. Slow: building the program packs the weight images and
-compiles 157 library entries (cached)."""
+"""Stable Diffusion 1.5 with the UNet on the NPU (models.sd15.npu, artlite.operators.sd15_v2): one UNet step against
+the fp32 reference, and text to image against the CPU backend. Slow: building the UNet writes its weight images and
+builds its transaction."""
 
 import numpy as np
 import pytest
@@ -29,8 +29,8 @@ def npu_unet(model_dir: str) -> NpuUNet:
 
 
 def test_unet_step(model_dir: str, npu_unet: NpuUNet) -> None:
-    """One step on random latents and context against the fp32 UNet: within 2.5e-2 (measured 1.51e-2:
-    bfp16 operands, bf16 intermediates, the attention's exp2 approximation), and the same again (no state leaks)."""
+    """One step on random latents and context against the fp32 UNet: within 2.5e-2 (measured 1.19e-2: bfp16 operands,
+    bf16 intermediates, the 64x64 attention's exp2 approximation), and the same again (no state leaks)."""
     torch.manual_seed(0)
     x, ctx = torch.randn(2, 4, 64, 64), torch.randn(2, 77, 768)
     ref = reference.UNet(f"{model_dir}/unet")(x, 500.0, ctx)

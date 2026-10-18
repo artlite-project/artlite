@@ -98,7 +98,8 @@ class Gemm:
     next row's group 0), into whose slots 0 and 5 the core shifts the row's group 3 one lane down and its group 0 one
     lane up: every tap's 4 bands are slots dx .. dx + 3 (``conv_words``). il (64x64, Lg 8): x holds rc rows of 8 groups
     (the halo rows included), a row's even groups then its odd ones; tile t = output row r0 + rstep (t // 2)'s even
-    (t even) or odd groups; per chunk an A object per dy: input row r + dy - 1 (``_il_words``)."""
+    (t even) or odd groups (par0: row r0 + rstep t's even groups, a stride-2 conv's outputs); per chunk an A object per
+    dy: input row r + dy - 1 (``_il_words``)."""
 
     m: int
     ntile: int
@@ -125,6 +126,7 @@ class Gemm:
     r0: int = 0
     rstep: int = 1
     il: bool = False
+    par0: bool = False
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N % 320 == 0 and self.K % 8 == 0 and \
@@ -138,8 +140,8 @@ class Gemm:
             assert self.m * (1 + self.il) == 16 * self.R * self.Lg and (self.ntile == 1 or self.rc) and self.K % 64 == 0 \
                 and self.conv in (1, 2)
             if self.il:  # (the tiles' input rows in x)
-                assert (self.R, self.Lg, self.conv, self.ntile % 2) == (1, 8, 1, 0) and self.r0 >= 1 and \
-                    self.r0 + self.rstep * (self.ntile // 2 - 1) + 1 < self.rc
+                assert (self.R, self.Lg, self.conv) == (1, 8, 1) and (self.par0 or self.ntile % 2 == 0) and self.r0 >= 1 \
+                    and self.r0 + self.rstep * ((self.ntile if self.par0 else self.ntile // 2) - 1) + 1 < self.rc
             else:
                 assert not self.rc or (self.R, self.Lg, self.conv) == (1, 4, 1) and self.r0 + self.rstep * (self.ntile - 1) < self.rc
             self.nch = self.K // 64
@@ -305,7 +307,7 @@ class Gemm:
         for dy, dx in self.tap_order(0):
             w = [use[p][dx][0] * K.CALL | use[p][dx][1] << 10 | phase[p].get(dx, 0) << 12 | (dx == 1 and dy > 0) << 15
                  for p in range(2)]
-            tapw.append(w[0] | w[1] << 16)
+            tapw.append(w[0] | w[0 if self.par0 else 1] << 16)
         out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
         out[:len(words)] = words
         out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
@@ -390,7 +392,7 @@ class Gemm:
     def _il_sends(self, t: int) -> MemTask:
         """Tile t's A objects of the 64x64 row tiles (``il``), per chunk 3 (dy): input rows r - 1 .. r + 1 of x, each its
         groups [group 8][kb 8][2] (one BD: the rows are consecutive)."""
-        kbw, r = self.x_np * 18, self.r0 + self.rstep * (t // 2)
+        kbw, r = self.x_np * 18, self.r0 + self.rstep * (t if self.par0 else t // 2)
         return MemTask([{"addr": self.x + 1152 * (r - 1), "nwords": 3 * D.A_OBJ // 4,
                          "dims": [(36, 1), (8, kbw), (8, 36), (0, 288)], "iteration": (8 * kbw, self.nch)}],
                        repeat=self.nch * (1 if self.res is not None else self.npo))
