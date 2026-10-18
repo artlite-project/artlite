@@ -68,18 +68,21 @@ def _disassembly(obj_path: str) -> dict[str, list[str]]:
     return funcs
 
 
-def stack_usage(obj_path: str, su_path: str) -> dict[str, int]:
-    """Deepest stack (bytes) of every function of kernel.o: its frame plus the deepest callee."""
+def stack_usage(obj_path: str, su_path: str, *, calls: dict[str, set[str]] | None = None) -> dict[str, int]:
+    """Deepest stack (bytes) of every function of kernel.o: its frame plus the deepest callee (``calls``: more calls,
+    by function name: indirect ones)."""
     own: dict[str, int] = {}
     with open(su_path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 2:
                 own[parts[0].rsplit(":", 1)[-1]] = int(parts[1])
-    calls: dict[str, set[str]] = {}
+    graph: dict[str, set[str]] = {}
     for fn, lines in _disassembly(obj_path).items():
-        calls[fn] = {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([A-Za-z_]\w*)$", ln))
+        graph[fn] = {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([A-Za-z_]\w*)$", ln))
                      and not m.group(1).startswith(".") and m.group(1) != fn}
+    for fn, more in (calls or {}).items():
+        graph[fn] = graph.get(fn, set()) | more
     memo: dict[str, int] = {}
 
     def depth(fn: str, seen: frozenset[str]) -> int:
@@ -87,11 +90,11 @@ def stack_usage(obj_path: str, su_path: str) -> dict[str, int]:
             return memo[fn]
         if fn in seen:  # recursion: count the frame once
             return own.get(fn, _UNKNOWN_FRAME)
-        d = own.get(fn, _UNKNOWN_FRAME) + max((depth(c, seen | {fn}) for c in calls.get(fn, ())), default=0)
+        d = own.get(fn, _UNKNOWN_FRAME) + max((depth(c, seen | {fn}) for c in graph.get(fn, ())), default=0)
         memo[fn] = d
         return d
 
-    return {fn: depth(fn, frozenset()) for fn in set(own) | set(calls)}
+    return {fn: depth(fn, frozenset()) for fn in set(own) | set(graph)}
 
 
 def core_frames(design_dir: str) -> dict[str, int]:
