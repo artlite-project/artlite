@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="312" viewBox="0 0 880 312" role="img" aria-labelledby="t d">
+<title id="t">A page in two B slots</title>
+<desc id="d">A page is a stream of control packets: each has a stream header (packet id 7), a control header (write, 1 to 4 words, the tile address) and up to 4 words. Slot b0 holds the first 240 packets of code; slot b1 the rest of the code, the state words, filler packets that rewrite the state words with the same values, and last the packet that sets the wake lock. A slot's buffer descriptor ends the stream's packet there, so no packet crosses the slots' boundary.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.eb{font-size:10px;font-weight:700;letter-spacing:.1em;fill:#818b98}.ti{font-size:11.5px;font-weight:600;fill:#1f2328}.st{font-size:11px;font-weight:700;fill:#1f2328}.lb{font-size:10.5px;fill:#59636e}.pl{font-size:10px;fill:#59636e}.sb{font-size:10px;fill:#59636e}.en{font-size:10.5px;fill:#818b98}.c{font-size:10px;fill:#1f2328}.bn{font-size:10px;font-weight:700}.mo,.sm,.mm{font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;font-size:9.5px;fill:#1f2328}.sm{font-size:10px;fill:#59636e}.mm{font-size:10px;fill:#818b98}.halo,.halop,.halot{paint-order:stroke;stroke:#ffffff;stroke-width:5px;stroke-linejoin:round}.halop{stroke:#f6f8fa}.halot{stroke:#e9ecef}.panel{fill:#f6f8fa;stroke:#d1d9e0}.tile{fill:#e9ecef;stroke:#c8d1da}.card{fill:#ffffff;stroke:#d1d9e0}.a,.w{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.w.ctl,.a.ctl{stroke-width:1.3}.hatch{fill:url(#hatch);stroke:#d1d9e0}.slot{fill:#ffffff;stroke:#eb6834;stroke-dasharray:4 3}.axis{fill:none;stroke:#c8d1da}.guide{fill:none;stroke:#c8d1da;stroke-dasharray:3 3}.resident{fill:#ebecee;stroke:#acb1b6}.gcore{fill:#2a78d6}.gmem{fill:#9fc2ed}.gshim{fill:#ffffff;stroke:#818b98}.a.data,.w.data{stroke:#2a78d6}.a.data{marker-end:url(#hdata)}.card.data{fill:#eaf2fb;stroke:#8ab5e8}.port.data{fill:#dde9f8;stroke:#2a78d6}.buf.data{fill:#d4e4f7}.solid.data{fill:#2a78d6}.badge.data{fill:#2a78d6;stroke:#ffffff;stroke-width:2px}.bn.data{fill:#ffffff}.a.code,.w.code{stroke:#eb6834}.a.code{marker-end:url(#hcode)}.card.code{fill:#fdf0eb;stroke:#f4ac8f}.port.code{fill:#fce7df;stroke:#eb6834}.buf.code{fill:#fbe1d6}.solid.code{fill:#eb6834}.badge.code{fill:#eb6834;stroke:#ffffff;stroke-width:2px}.bn.code{fill:#0d1117}.a.wts,.w.wts{stroke:#1baf7a}.a.wts{marker-end:url(#hwts)}.card.wts{fill:#e8f7f2;stroke:#82d3b6}.port.wts{fill:#dbf2ea;stroke:#1baf7a}.buf.wts{fill:#d1efe4}.solid.wts{fill:#1baf7a}.badge.wts{fill:#1baf7a;stroke:#ffffff;stroke-width:2px}.bn.wts{fill:#0d1117}.a.ctl,.w.ctl{stroke:#59636e}.a.ctl{marker-end:url(#hctl)}.card.ctl{fill:#eeeff0;stroke:#a4a9af}.port.ctl{fill:#e4e6e8;stroke:#59636e}.buf.ctl{fill:#dee0e2}.solid.ctl{fill:#59636e}.badge.ctl{fill:#59636e;stroke:#ffffff;stroke-width:2px}.bn.ctl{fill:#ffffff}</style>
+<defs><marker id="hdata" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#2a78d6"/></marker><marker id="hcode" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#eb6834"/></marker><marker id="hwts" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#1baf7a"/></marker><marker id="hctl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#59636e"/></marker><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#ffffff"/><line x1="0" y1="0" x2="0" y2="5" stroke="#d1d9e0" stroke-width="1.6"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="311" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<text x="24" y="36" class="eb">ONE PACKET</text>
+<text x="107.869" y="36" class="en">6 words, 24 B: one write, applied by TileControl</text>
+<rect x="24" y="52" width="144" height="44" rx="6" class="card"/>
+<text x="96" y="70" class="ti" text-anchor="middle">stream header</text>
+<text x="96" y="86" class="sm" text-anchor="middle">id 7 · parity</text>
+<rect x="172" y="52" width="184" height="44" rx="6" class="card"/>
+<text x="264" y="70" class="ti" text-anchor="middle">control header</text>
+<text x="264" y="86" class="sm" text-anchor="middle">write · 4 words · address</text>
+<rect x="360" y="52" width="116" height="44" rx="6" class="card code"/>
+<text x="418" y="70" class="ti" text-anchor="middle">word 0</text>
+<text x="418" y="86" class="sm" text-anchor="middle">code</text>
+<rect x="480" y="52" width="116" height="44" rx="6" class="card code"/>
+<text x="538" y="70" class="ti" text-anchor="middle">word 1</text>
+<text x="538" y="86" class="sm" text-anchor="middle">code</text>
+<rect x="600" y="52" width="116" height="44" rx="6" class="card code"/>
+<text x="658" y="70" class="ti" text-anchor="middle">word 2</text>
+<text x="658" y="86" class="sm" text-anchor="middle">code</text>
+<rect x="720" y="52" width="116" height="44" rx="6" class="card code"/>
+<text x="778" y="70" class="ti" text-anchor="middle">word 3</text>
+<text x="778" y="86" class="sm" text-anchor="middle">code</text>
+<text x="24" y="136" class="eb">THE PAGE</text>
+<text x="91.5209" y="136" class="en">ln: 5984 B of code in 374 packets (widths schematic)</text>
+<rect x="24" y="152" width="408" height="44" rx="4" class="card code"/>
+<text x="229" y="178" class="c" text-anchor="middle">code: packets 1-240</text>
+<rect x="448" y="152" width="228.48" height="44" rx="4" class="card code"/>
+<text x="563.24" y="178" class="c" text-anchor="middle">code: packets 241-374</text>
+<rect x="678.48" y="152" width="26.56" height="44" rx="4" class="buf ctl"/>
+<text x="691.76" y="178" class="c" text-anchor="middle">state</text>
+<rect x="707.04" y="152" width="134.68" height="44" rx="4" class="hatch"/>
+<text x="774.38" y="178" class="c halo" text-anchor="middle">fillers</text>
+<rect x="843.72" y="152" width="12.28" height="44" rx="4" class="solid code"/>
+<text x="228" y="216" class="sm" text-anchor="middle">B slot b0 · 5760 B</text>
+<path d="M432,146V202" class="w ctl"/>
+<text x="652" y="216" class="sm" text-anchor="middle">B slot b1 · 5760 B</text>
+<path d="M856,146V202" class="w ctl"/>
+<text x="856" y="142" class="sb" text-anchor="end">wake lock</text>
+<text x="440" y="238" class="sb" text-anchor="middle">a slot's BD ends with TLAST, so the packets are whole in each slot</text>
+<rect x="24" y="274" width="14" height="14" rx="3" class="card code"/>
+<text x="46" y="285" class="lb">code → program memory, at the slot</text>
+<rect x="248.394" y="274" width="14" height="14" rx="3" class="buf ctl"/>
+<text x="270.394" y="285" class="lb">state words → data memory: page id, entries</text>
+<rect x="511.312" y="274" width="14" height="14" rx="3" class="solid code"/>
+<text x="533.312" y="285" class="lb">wake lock := 1, last: the core wakes</text>
+</svg>

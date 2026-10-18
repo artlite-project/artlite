@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="600" viewBox="0 0 880 600" role="img" aria-labelledby="t d">
+<title id="t">sd15's overlay design</title>
+<desc id="d">One configuration runs every operation of Stable Diffusion's UNet. Each row of 8 cores receives one broadcast B stream, commands and the weights of its channel slice, from the shim tile of column 0, 2, 4 or 6. In each column the memory tile holds the activations of that column's tokens: it sends the A stream to each of its 4 cores and receives each core's outputs, the O stream; the shim tile fills the memory tile from DDR and drains it to DDR. The cores run a main loop that executes the commands; the host builds every dispatch's transaction.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.eb{font-size:10px;font-weight:700;letter-spacing:.1em;fill:#6e7681}.ti{font-size:11.5px;font-weight:600;fill:#f0f6fc}.st{font-size:11px;font-weight:700;fill:#f0f6fc}.lb{font-size:10.5px;fill:#9198a1}.pl{font-size:10px;fill:#9198a1}.sb{font-size:10px;fill:#9198a1}.en{font-size:10.5px;fill:#6e7681}.c{font-size:10px;fill:#f0f6fc}.bn{font-size:10px;font-weight:700}.mo,.sm,.mm{font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;font-size:9.5px;fill:#f0f6fc}.sm{font-size:10px;fill:#9198a1}.mm{font-size:10px;fill:#6e7681}.halo,.halop,.halot{paint-order:stroke;stroke:#0d1117;stroke-width:5px;stroke-linejoin:round}.halop{stroke:#151b23}.halot{stroke:#1f252d}.panel{fill:#151b23;stroke:#3d444d}.tile{fill:#1f252d;stroke:#3d444d}.card{fill:#0d1117;stroke:#3d444d}.a,.w{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.w.ctl,.a.ctl{stroke-width:1.3}.hatch{fill:url(#hatch);stroke:#3d444d}.slot{fill:#0d1117;stroke:#d95926;stroke-dasharray:4 3}.axis{fill:none;stroke:#3d444d}.guide{fill:none;stroke:#3d444d;stroke-dasharray:3 3}.resident{fill:#1d2128;stroke:#4f545c}.gcore{fill:#3987e5}.gmem{fill:#214674}.gshim{fill:#0d1117;stroke:#6e7681}.a.data,.w.data{stroke:#3987e5}.a.data{marker-end:url(#hdata)}.card.data{fill:#111d2c;stroke:#255288}.port.data{fill:#142438;stroke:#3987e5}.buf.data{fill:#162940}.solid.data{fill:#3987e5}.badge.data{fill:#3987e5;stroke:#0d1117;stroke-width:2px}.bn.data{fill:#ffffff}.a.code,.w.code{stroke:#d95926}.a.code{marker-end:url(#hcode)}.card.code{fill:#211818;stroke:#7d391f}.port.code{fill:#2e1d19;stroke:#d95926}.buf.code{fill:#361f1a}.solid.code{fill:#d95926}.badge.code{fill:#d95926;stroke:#0d1117;stroke-width:2px}.bn.code{fill:#ffffff}.a.wts,.w.wts{stroke:#199e70}.a.wts{marker-end:url(#hwts)}.card.wts{fill:#0e1f20;stroke:#145f48}.port.wts{fill:#0f2825;stroke:#199e70}.buf.wts{fill:#0f2d29}.solid.wts{fill:#199e70}.badge.wts{fill:#199e70;stroke:#0d1117;stroke-width:2px}.bn.wts{fill:#0d1117}.a.ctl,.w.ctl{stroke:#9198a1}.a.ctl{marker-end:url(#hctl)}.card.ctl{fill:#1a1e25;stroke:#565b63}.port.ctl{fill:#22272d;stroke:#9198a1}.buf.ctl{fill:#272c33}.solid.ctl{fill:#9198a1}.badge.ctl{fill:#9198a1;stroke:#0d1117;stroke-width:2px}.bn.ctl{fill:#0d1117}</style>
+<defs><marker id="hdata" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#3987e5"/></marker><marker id="hcode" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#d95926"/></marker><marker id="hwts" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#199e70"/></marker><marker id="hctl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#9198a1"/></marker><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#0d1117"/><line x1="0" y1="0" x2="0" y2="5" stroke="#3d444d" stroke-width="1.6"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="599" rx="8" fill="#0d1117" stroke="#3d444d"/>
+<rect x="24" y="24" width="344" height="552" rx="10" class="panel"/>
+<text x="38" y="44" class="eb">ARRAY</text>
+<text x="86.5477" y="44" class="en">8 columns × 4 cores</text>
+<path d="M40,60L64,60" class="a wts"/>
+<text x="72" y="63.5" class="lb">B: commands, weights</text>
+<path d="M197.62,60L221.62,60" class="a data"/>
+<text x="229.62" y="63.5" class="lb">activations</text>
+<path d="M299,484L299,108" class="w wts"/>
+<path d="M95,108L333,108" class="w wts"/>
+<path d="M231,484L231,168" class="w wts"/>
+<path d="M95,168L333,168" class="w wts"/>
+<path d="M163,484L163,228" class="w wts"/>
+<path d="M95,228L333,228" class="w wts"/>
+<path d="M95,484L95,288" class="w wts"/>
+<path d="M95,288L333,288" class="w wts"/>
+<rect x="84" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="84" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="84" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="84" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="84" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="84" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="95" y="514" class="mm" text-anchor="middle">0</text>
+<rect x="118" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="118" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="118" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="118" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="118" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="118" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="129" y="514" class="mm" text-anchor="middle">1</text>
+<rect x="152" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="152" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="152" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="152" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="152" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="152" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="163" y="514" class="mm" text-anchor="middle">2</text>
+<rect x="186" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="186" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="186" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="186" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="186" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="186" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="197" y="514" class="mm" text-anchor="middle">3</text>
+<rect x="220" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="220" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="220" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="220" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="220" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="220" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="231" y="514" class="mm" text-anchor="middle">4</text>
+<rect x="254" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="254" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="254" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="254" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="254" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="254" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="265" y="514" class="mm" text-anchor="middle">5</text>
+<rect x="288" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="288" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="288" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="288" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="288" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="288" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="299" y="514" class="mm" text-anchor="middle">6</text>
+<rect x="322" y="97" width="22" height="22" rx="4" class="gcore"/>
+<rect x="322" y="157" width="22" height="22" rx="4" class="gcore"/>
+<rect x="322" y="217" width="22" height="22" rx="4" class="gcore"/>
+<rect x="322" y="277" width="22" height="22" rx="4" class="gcore"/>
+<rect x="322" y="377" width="22" height="22" rx="4" class="gmem"/>
+<rect x="322" y="473" width="22" height="22" rx="4" class="gshim"/>
+<text x="333" y="514" class="mm" text-anchor="middle">7</text>
+<text x="40" y="112" class="en">row 5</text>
+<text x="40" y="172" class="en">row 4</text>
+<text x="40" y="232" class="en">row 3</text>
+<text x="40" y="292" class="en">row 2</text>
+<text x="40" y="392" class="en">memory</text>
+<text x="40" y="488" class="en">shim</text>
+<text x="40" y="548" class="lb">Row r's B stream: one shim's MM2S 1,</text>
+<text x="40" y="563" class="lb">broadcast to the row's 8 cores.</text>
+<rect x="384" y="24" width="472" height="552" rx="10" class="panel"/>
+<text x="398" y="44" class="eb">ONE COLUMN</text>
+<text x="485.777" y="44" class="en">enlarged</text>
+<rect x="408" y="84" width="232" height="48" rx="10" class="tile"/>
+<text x="526" y="107" class="ti" text-anchor="middle">core (c, 5)</text>
+<text x="526" y="121" class="sb" text-anchor="middle">main loop</text>
+<path d="M344,108L382,108" class="a wts"/>
+<path d="M776,356L776,124Q776,118 770,118L666,118" class="a data"/>
+<path d="M666,98L782,98Q788,98 788,104L788,354" class="a data"/>
+<rect x="383.615" y="100" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="408" y="111.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="615.615" y="90" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="101.4" class="mo" text-anchor="middle">MM2S 0</text>
+<rect x="615.615" y="110" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="121.4" class="mo" text-anchor="middle">S2MM 0</text>
+<rect x="408" y="144" width="232" height="48" rx="10" class="tile"/>
+<text x="526" y="167" class="ti" text-anchor="middle">core (c, 4)</text>
+<text x="526" y="181" class="sb" text-anchor="middle">main loop</text>
+<path d="M344,168L382,168" class="a wts"/>
+<path d="M748,356L748,184Q748,178 742,178L666,178" class="a data"/>
+<path d="M666,158L754,158Q760,158 760,164L760,354" class="a data"/>
+<rect x="383.615" y="160" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="408" y="171.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="615.615" y="150" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="161.4" class="mo" text-anchor="middle">MM2S 0</text>
+<rect x="615.615" y="170" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="181.4" class="mo" text-anchor="middle">S2MM 0</text>
+<rect x="408" y="204" width="232" height="48" rx="10" class="tile"/>
+<text x="526" y="227" class="ti" text-anchor="middle">core (c, 3)</text>
+<text x="526" y="241" class="sb" text-anchor="middle">main loop</text>
+<path d="M344,228L382,228" class="a wts"/>
+<path d="M720,356L720,244Q720,238 714,238L666,238" class="a data"/>
+<path d="M666,218L726,218Q732,218 732,224L732,354" class="a data"/>
+<rect x="383.615" y="220" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="408" y="231.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="615.615" y="210" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="221.4" class="mo" text-anchor="middle">MM2S 0</text>
+<rect x="615.615" y="230" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="241.4" class="mo" text-anchor="middle">S2MM 0</text>
+<rect x="408" y="264" width="232" height="48" rx="10" class="tile"/>
+<text x="526" y="287" class="ti" text-anchor="middle">core (c, 2)</text>
+<text x="526" y="301" class="sb" text-anchor="middle">main loop</text>
+<path d="M344,288L382,288" class="a wts"/>
+<path d="M692,356L692,304Q692,298 686,298L666,298" class="a data"/>
+<path d="M666,278L698,278Q704,278 704,284L704,354" class="a data"/>
+<rect x="383.615" y="280" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="408" y="291.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="615.615" y="270" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="281.4" class="mo" text-anchor="middle">MM2S 0</text>
+<rect x="615.615" y="290" width="48.77" height="16" rx="4" class="port data"/>
+<text x="640" y="301.4" class="mo" text-anchor="middle">S2MM 0</text>
+<rect x="408" y="356" width="432" height="64" rx="10" class="tile"/>
+<text x="422" y="376" class="eb">MEMORY TILE</text>
+<text x="511.095" y="376" class="en">(c, 1)</text>
+<text x="422" y="398" class="sb">the activations of column c's tokens</text>
+<text x="826" y="398" class="sm" text-anchor="end">A: MM2S 0-3 · O: S2MM 0-3</text>
+<rect x="408" y="460" width="432" height="48" rx="10" class="tile"/>
+<text x="422" y="488" class="eb">SHIM TILE</text>
+<text x="487.555" y="488" class="en">(c, 0)</text>
+<text x="748" y="492" class="sb" text-anchor="end">columns 0, 2, 4, 6</text>
+<rect x="408" y="520" width="432" height="48" rx="10" class="tile"/>
+<text x="422" y="548" class="eb">DDR</text>
+<rect x="482" y="530" width="160" height="28" rx="6" class="card"/>
+<text x="562" y="548" class="ti" text-anchor="middle">activations</text>
+<rect x="688" y="530" width="144" height="28" rx="6" class="card"/>
+<text x="760" y="548" class="ti" text-anchor="middle">weights · commands</text>
+<path d="M548,530L548,470" class="a data"/>
+<path d="M548,452L548,430" class="a data"/>
+<path d="M628,428L628,450" class="a data"/>
+<path d="M628,468L628,528" class="a data"/>
+<path d="M760,530L760,470" class="a wts"/>
+<text x="536" y="448" class="pl" text-anchor="end">fill</text>
+<text x="640" y="448" class="pl">drain</text>
+<rect x="523.615" y="412" width="48.77" height="16" rx="4" class="port data"/>
+<text x="548" y="423.4" class="mo" text-anchor="middle">S2MM 4</text>
+<rect x="603.615" y="412" width="48.77" height="16" rx="4" class="port data"/>
+<text x="628" y="423.4" class="mo" text-anchor="middle">MM2S 4</text>
+<rect x="523.615" y="452" width="48.77" height="16" rx="4" class="port data"/>
+<text x="548" y="463.4" class="mo" text-anchor="middle">MM2S 0</text>
+<rect x="603.615" y="452" width="48.77" height="16" rx="4" class="port data"/>
+<text x="628" y="463.4" class="mo" text-anchor="middle">S2MM 0</text>
+<rect x="735.615" y="452" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="760" y="463.4" class="mo" text-anchor="middle">MM2S 1</text>
+</svg>

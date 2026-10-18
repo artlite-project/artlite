@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="456" viewBox="0 0 880 456" role="img" aria-labelledby="t d">
+<title id="t">Two ways to change a row's code at run time</title>
+<desc id="d">Left: the host writes the code. It waits until the row's operations are complete, sends the code as control packets from shim tile 1 to the TileControl port of each of the row's 8 cores, and polls every core until the code is written; the row is idle meanwhile. Right: the core loads its page. The host puts the page into the row's B stream ahead of the operation that needs it; each core receives it in its B slots and streams it into its own TileControl. Nothing waits but the page's own transfer.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.eb{font-size:10px;font-weight:700;letter-spacing:.1em;fill:#6e7681}.ti{font-size:11.5px;font-weight:600;fill:#f0f6fc}.st{font-size:11px;font-weight:700;fill:#f0f6fc}.lb{font-size:10.5px;fill:#9198a1}.pl{font-size:10px;fill:#9198a1}.sb{font-size:10px;fill:#9198a1}.en{font-size:10.5px;fill:#6e7681}.c{font-size:10px;fill:#f0f6fc}.bn{font-size:10px;font-weight:700}.mo,.sm,.mm{font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;font-size:9.5px;fill:#f0f6fc}.sm{font-size:10px;fill:#9198a1}.mm{font-size:10px;fill:#6e7681}.halo,.halop,.halot{paint-order:stroke;stroke:#0d1117;stroke-width:5px;stroke-linejoin:round}.halop{stroke:#151b23}.halot{stroke:#1f252d}.panel{fill:#151b23;stroke:#3d444d}.tile{fill:#1f252d;stroke:#3d444d}.card{fill:#0d1117;stroke:#3d444d}.a,.w{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.w.ctl,.a.ctl{stroke-width:1.3}.hatch{fill:url(#hatch);stroke:#3d444d}.slot{fill:#0d1117;stroke:#d95926;stroke-dasharray:4 3}.axis{fill:none;stroke:#3d444d}.guide{fill:none;stroke:#3d444d;stroke-dasharray:3 3}.resident{fill:#1d2128;stroke:#4f545c}.gcore{fill:#3987e5}.gmem{fill:#214674}.gshim{fill:#0d1117;stroke:#6e7681}.a.data,.w.data{stroke:#3987e5}.a.data{marker-end:url(#hdata)}.card.data{fill:#111d2c;stroke:#255288}.port.data{fill:#142438;stroke:#3987e5}.buf.data{fill:#162940}.solid.data{fill:#3987e5}.badge.data{fill:#3987e5;stroke:#0d1117;stroke-width:2px}.bn.data{fill:#ffffff}.a.code,.w.code{stroke:#d95926}.a.code{marker-end:url(#hcode)}.card.code{fill:#211818;stroke:#7d391f}.port.code{fill:#2e1d19;stroke:#d95926}.buf.code{fill:#361f1a}.solid.code{fill:#d95926}.badge.code{fill:#d95926;stroke:#0d1117;stroke-width:2px}.bn.code{fill:#ffffff}.a.wts,.w.wts{stroke:#199e70}.a.wts{marker-end:url(#hwts)}.card.wts{fill:#0e1f20;stroke:#145f48}.port.wts{fill:#0f2825;stroke:#199e70}.buf.wts{fill:#0f2d29}.solid.wts{fill:#199e70}.badge.wts{fill:#199e70;stroke:#0d1117;stroke-width:2px}.bn.wts{fill:#0d1117}.a.ctl,.w.ctl{stroke:#9198a1}.a.ctl{marker-end:url(#hctl)}.card.ctl{fill:#1a1e25;stroke:#565b63}.port.ctl{fill:#22272d;stroke:#9198a1}.buf.ctl{fill:#272c33}.solid.ctl{fill:#9198a1}.badge.ctl{fill:#9198a1;stroke:#0d1117;stroke-width:2px}.bn.ctl{fill:#0d1117}</style>
+<defs><marker id="hdata" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#3987e5"/></marker><marker id="hcode" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#d95926"/></marker><marker id="hwts" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#199e70"/></marker><marker id="hctl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#9198a1"/></marker><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#0d1117"/><line x1="0" y1="0" x2="0" y2="5" stroke="#3d444d" stroke-width="1.6"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="455" rx="8" fill="#0d1117" stroke="#3d444d"/>
+<rect x="24" y="24" width="408" height="408" rx="10" class="panel"/>
+<text x="38" y="44" class="eb">THE HOST WRITES THE CODE</text>
+<text x="218.642" y="44" class="en">the row idles from 1 to 3</text>
+<text x="288" y="134" class="ti" text-anchor="middle">…</text>
+<rect x="40" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="52" y="74" class="mm">core (0, 2)</text>
+<rect x="50" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="96" y="101" class="c" text-anchor="middle">program memory</text>
+<path d="M96,188L96,112" class="a code"/>
+<path d="M96,220L96,206" class="a code"/>
+<rect x="57.1275" y="188" width="77.745" height="16" rx="4" class="port code"/>
+<text x="96" y="199.4" class="mo" text-anchor="middle">TileControl</text>
+<rect x="40" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="96" y="272" class="mm" text-anchor="middle">shim (0, 0)</text>
+<rect x="160" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="172" y="74" class="mm">core (1, 2)</text>
+<rect x="170" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="216" y="101" class="c" text-anchor="middle">program memory</text>
+<path d="M216,188L216,112" class="a code"/>
+<path d="M216,220L216,206" class="a code"/>
+<rect x="177.127" y="188" width="77.745" height="16" rx="4" class="port code"/>
+<text x="216" y="199.4" class="mo" text-anchor="middle">TileControl</text>
+<rect x="160" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="216" y="272" class="mm" text-anchor="middle">shim (1, 0)</text>
+<rect x="304" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="316" y="74" class="mm">core (7, 2)</text>
+<rect x="314" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="360" y="101" class="c" text-anchor="middle">program memory</text>
+<path d="M360,188L360,112" class="a code"/>
+<path d="M360,220L360,206" class="a code"/>
+<rect x="321.127" y="188" width="77.745" height="16" rx="4" class="port code"/>
+<text x="360" y="199.4" class="mo" text-anchor="middle">TileControl</text>
+<rect x="304" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="360" y="272" class="mm" text-anchor="middle">shim (7, 0)</text>
+<path d="M96,220L360,220" class="w code"/>
+<path d="M216,236L216,220" class="w code"/>
+<text x="288" y="223" class="pl halop" text-anchor="middle">control packets</text>
+<rect x="191.615" y="236" width="48.77" height="16" rx="4" class="port code"/>
+<text x="216" y="247.4" class="mo" text-anchor="middle">MM2S 1</text>
+<rect x="160" y="308" width="112" height="40" rx="6" class="card"/>
+<text x="216" y="325" class="ti" text-anchor="middle">DDR</text>
+<text x="216" y="340" class="sb" text-anchor="middle">the role's code</text>
+<path d="M216,308L216,254" class="a code"/>
+<circle cx="49" cy="372" r="8.5" class="badge ctl"/>
+<text x="49" y="375.6" class="bn ctl" text-anchor="middle">1</text>
+<text x="66" y="376" class="st">Wait</text>
+<text x="95.54" y="376" class="lb">until the row's ops are complete</text>
+<circle cx="49" cy="392" r="8.5" class="badge ctl"/>
+<text x="49" y="395.6" class="bn ctl" text-anchor="middle">2</text>
+<text x="66" y="396" class="st">Push</text>
+<text x="98.8238" y="396" class="lb">shim 1 sends the packets</text>
+<circle cx="49" cy="412" r="8.5" class="badge ctl"/>
+<text x="49" y="415.6" class="bn ctl" text-anchor="middle">3</text>
+<text x="66" y="416" class="st">Poll</text>
+<text x="91.6206" y="416" class="lb">every core's marker word</text>
+<rect x="448" y="24" width="408" height="408" rx="10" class="panel"/>
+<text x="462" y="44" class="eb">THE CORE LOADS ITS PAGE</text>
+<text x="631.555" y="44" class="en">nothing waits</text>
+<text x="712" y="134" class="ti" text-anchor="middle">…</text>
+<rect x="464" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="476" y="74" class="mm">core (0, 2)</text>
+<rect x="474" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="520" y="101" class="c" text-anchor="middle">program memory</text>
+<rect x="474" y="124" width="92" height="24" rx="5" class="card code"/>
+<text x="520" y="140" class="mo" text-anchor="middle">TileControl</text>
+<rect x="474" y="160" width="52" height="20" rx="4" class="buf wts"/>
+<text x="500" y="173.5" class="mo" text-anchor="middle">slots</text>
+<path d="M520,124L520,112" class="a code"/>
+<path d="M500,160L500,150" class="a code"/>
+<path d="M500,188L500,182" class="w wts"/>
+<path d="M500,220L500,206" class="a wts"/>
+<rect x="475.615" y="188" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="500" y="199.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="464" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="520" y="272" class="mm" text-anchor="middle">shim (0, 0)</text>
+<rect x="584" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="596" y="74" class="mm">core (1, 2)</text>
+<rect x="594" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="640" y="101" class="c" text-anchor="middle">program memory</text>
+<rect x="594" y="124" width="92" height="24" rx="5" class="card code"/>
+<text x="640" y="140" class="mo" text-anchor="middle">TileControl</text>
+<rect x="594" y="160" width="52" height="20" rx="4" class="buf wts"/>
+<text x="620" y="173.5" class="mo" text-anchor="middle">slots</text>
+<path d="M640,124L640,112" class="a code"/>
+<path d="M620,160L620,150" class="a code"/>
+<path d="M620,188L620,182" class="w wts"/>
+<path d="M620,220L620,206" class="a wts"/>
+<rect x="595.615" y="188" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="620" y="199.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="584" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="640" y="272" class="mm" text-anchor="middle">shim (1, 0)</text>
+<rect x="728" y="56" width="112" height="140" rx="10" class="tile"/>
+<text x="740" y="74" class="mm">core (7, 2)</text>
+<rect x="738" y="84" width="92" height="26" rx="5" class="card code"/>
+<text x="784" y="101" class="c" text-anchor="middle">program memory</text>
+<rect x="738" y="124" width="92" height="24" rx="5" class="card code"/>
+<text x="784" y="140" class="mo" text-anchor="middle">TileControl</text>
+<rect x="738" y="160" width="52" height="20" rx="4" class="buf wts"/>
+<text x="764" y="173.5" class="mo" text-anchor="middle">slots</text>
+<path d="M784,124L784,112" class="a code"/>
+<path d="M764,160L764,150" class="a code"/>
+<path d="M764,188L764,182" class="w wts"/>
+<path d="M764,220L764,206" class="a wts"/>
+<rect x="739.615" y="188" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="764" y="199.4" class="mo" text-anchor="middle">S2MM 1</text>
+<rect x="728" y="244" width="112" height="40" rx="10" class="tile"/>
+<text x="784" y="272" class="mm" text-anchor="middle">shim (7, 0)</text>
+<path d="M500,220L764,220" class="w wts"/>
+<path d="M520,236L520,220" class="w wts"/>
+<text x="712" y="223" class="pl halop" text-anchor="middle">B stream</text>
+<rect x="495.615" y="236" width="48.77" height="16" rx="4" class="port wts"/>
+<text x="520" y="247.4" class="mo" text-anchor="middle">MM2S 1</text>
+<rect x="464" y="308" width="112" height="40" rx="6" class="card"/>
+<text x="520" y="325" class="ti" text-anchor="middle">DDR</text>
+<text x="520" y="340" class="sb" text-anchor="middle">B run: page first</text>
+<path d="M520,308L520,254" class="a wts"/>
+<circle cx="473" cy="372" r="8.5" class="badge ctl"/>
+<text x="473" y="375.6" class="bn ctl" text-anchor="middle">1</text>
+<text x="490" y="376" class="st">Push</text>
+<text x="522.824" y="376" class="lb">the B run: the page, then the op's commands</text>
+</svg>

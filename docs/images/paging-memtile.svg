@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="412" viewBox="0 0 880 412" role="img" aria-labelledby="t d">
+<title id="t">A page from the memory tile</title>
+<desc id="d">In the decode overlay, the main core of a column requests a page itself: it sends three words through its stream port, a control packet to its memory tile's TileControl that writes the page's buffer descriptor into the start queue of MM2S channel 5, and sleeps on its wake lock. MM2S 5 streams the page from the memory tile's page store into the core's TileControl, which writes the code into the slot, the state words and the wake lock. The host writes the store and its buffer descriptors before a dispatch when they are stale: after the configuration and after a prefill. The helper core pages the same way.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.eb{font-size:10px;font-weight:700;letter-spacing:.1em;fill:#818b98}.ti{font-size:11.5px;font-weight:600;fill:#1f2328}.st{font-size:11px;font-weight:700;fill:#1f2328}.lb{font-size:10.5px;fill:#59636e}.pl{font-size:10px;fill:#59636e}.sb{font-size:10px;fill:#59636e}.en{font-size:10.5px;fill:#818b98}.c{font-size:10px;fill:#1f2328}.bn{font-size:10px;font-weight:700}.mo,.sm,.mm{font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;font-size:9.5px;fill:#1f2328}.sm{font-size:10px;fill:#59636e}.mm{font-size:10px;fill:#818b98}.halo,.halop,.halot{paint-order:stroke;stroke:#ffffff;stroke-width:5px;stroke-linejoin:round}.halop{stroke:#f6f8fa}.halot{stroke:#e9ecef}.panel{fill:#f6f8fa;stroke:#d1d9e0}.tile{fill:#e9ecef;stroke:#c8d1da}.card{fill:#ffffff;stroke:#d1d9e0}.a,.w{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.w.ctl,.a.ctl{stroke-width:1.3}.hatch{fill:url(#hatch);stroke:#d1d9e0}.slot{fill:#ffffff;stroke:#eb6834;stroke-dasharray:4 3}.axis{fill:none;stroke:#c8d1da}.guide{fill:none;stroke:#c8d1da;stroke-dasharray:3 3}.resident{fill:#ebecee;stroke:#acb1b6}.gcore{fill:#2a78d6}.gmem{fill:#9fc2ed}.gshim{fill:#ffffff;stroke:#818b98}.a.data,.w.data{stroke:#2a78d6}.a.data{marker-end:url(#hdata)}.card.data{fill:#eaf2fb;stroke:#8ab5e8}.port.data{fill:#dde9f8;stroke:#2a78d6}.buf.data{fill:#d4e4f7}.solid.data{fill:#2a78d6}.badge.data{fill:#2a78d6;stroke:#ffffff;stroke-width:2px}.bn.data{fill:#ffffff}.a.code,.w.code{stroke:#eb6834}.a.code{marker-end:url(#hcode)}.card.code{fill:#fdf0eb;stroke:#f4ac8f}.port.code{fill:#fce7df;stroke:#eb6834}.buf.code{fill:#fbe1d6}.solid.code{fill:#eb6834}.badge.code{fill:#eb6834;stroke:#ffffff;stroke-width:2px}.bn.code{fill:#0d1117}.a.wts,.w.wts{stroke:#1baf7a}.a.wts{marker-end:url(#hwts)}.card.wts{fill:#e8f7f2;stroke:#82d3b6}.port.wts{fill:#dbf2ea;stroke:#1baf7a}.buf.wts{fill:#d1efe4}.solid.wts{fill:#1baf7a}.badge.wts{fill:#1baf7a;stroke:#ffffff;stroke-width:2px}.bn.wts{fill:#0d1117}.a.ctl,.w.ctl{stroke:#59636e}.a.ctl{marker-end:url(#hctl)}.card.ctl{fill:#eeeff0;stroke:#a4a9af}.port.ctl{fill:#e4e6e8;stroke:#59636e}.buf.ctl{fill:#dee0e2}.solid.ctl{fill:#59636e}.badge.ctl{fill:#59636e;stroke:#ffffff;stroke-width:2px}.bn.ctl{fill:#ffffff}</style>
+<defs><marker id="hdata" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#2a78d6"/></marker><marker id="hcode" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#eb6834"/></marker><marker id="hwts" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#1baf7a"/></marker><marker id="hctl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#59636e"/></marker><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#ffffff"/><line x1="0" y1="0" x2="0" y2="5" stroke="#d1d9e0" stroke-width="1.6"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="411" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<circle cx="33" cy="40" r="8.5" class="badge code"/>
+<text x="33" y="43.6" class="bn code" text-anchor="middle">1</text>
+<text x="50" y="44" class="st">Load the store</text>
+<text x="50" y="60" class="lb">when stale (after a configuration, a</text>
+<text x="50" y="75" class="lb">prefill): the stores and their BDs</text>
+<circle cx="33" cy="100" r="8.5" class="badge ctl"/>
+<text x="33" y="103.6" class="bn ctl" text-anchor="middle">2</text>
+<text x="50" y="104" class="st">Request</text>
+<text x="50" y="120" class="lb">a tile of a paged format whose page is</text>
+<text x="50" y="135" class="lb">not loaded: 3 words out, then sleep</text>
+<circle cx="33" cy="160" r="8.5" class="badge ctl"/>
+<text x="33" y="163.6" class="bn ctl" text-anchor="middle">3</text>
+<text x="50" y="164" class="st">Queue</text>
+<text x="50" y="180" class="lb">TileControl writes the page's BD id</text>
+<text x="50" y="195" class="lb">into MM2S 5's start queue</text>
+<circle cx="33" cy="220" r="8.5" class="badge code"/>
+<text x="33" y="223.6" class="bn code" text-anchor="middle">4</text>
+<text x="50" y="224" class="st">Stream</text>
+<text x="50" y="240" class="lb">MM2S 5 streams the page into the</text>
+<text x="50" y="255" class="lb">core's TileControl</text>
+<circle cx="33" cy="280" r="8.5" class="badge code"/>
+<text x="33" y="283.6" class="bn code" text-anchor="middle">5</text>
+<text x="50" y="284" class="st">Write, wake</text>
+<text x="50" y="300" class="lb">the slot, the state words, the wake</text>
+<text x="50" y="315" class="lb">lock: the core runs the page</text>
+<rect x="24" y="344" width="200" height="44" rx="6" class="card"/>
+<text x="124" y="363" class="ti" text-anchor="middle">command processor</text>
+<text x="124" y="378" class="sb" text-anchor="middle">the dispatch's prologue</text>
+<rect x="324" y="24" width="532" height="144" rx="10" class="tile"/>
+<text x="338" y="44" class="eb">MAIN CORE</text>
+<text x="412.701" y="44" class="en">(c, 4)</text>
+<rect x="340" y="52" width="236" height="100" rx="6" class="card"/>
+<text x="354" y="72" class="ti">program memory</text>
+<rect x="352" y="82" width="212" height="26" rx="4" class="resident"/>
+<text x="362" y="99" class="c">resident: Q3_K, the pager</text>
+<rect x="352" y="116" width="212" height="26" rx="4" class="card code"/>
+<text x="362" y="133" class="c">slot: Q4_K, Q5_K or Q6_K</text>
+<rect x="596" y="56" width="120" height="26" rx="4" class="buf code"/>
+<text x="656" y="72.5" class="mo" text-anchor="middle">state words</text>
+<rect x="596" y="90" width="120" height="26" rx="4" class="buf code"/>
+<text x="656" y="106.5" class="mo" text-anchor="middle">wake lock</text>
+<path d="M744,160L744,75Q744,69 738,69L718,69" class="a code"/>
+<path d="M744,103L718,103" class="a code"/>
+<path d="M744,160L744,135Q744,129 738,129L566,129" class="a code"/>
+<circle cx="744" cy="146" r="8.5" class="badge code"/>
+<text x="744" y="149.6" class="bn code" text-anchor="middle">5</text>
+<text x="340" y="196" class="sb">rows 3, 2 between: the helper core (c, 3)</text>
+<text x="340" y="210" class="sb">pages its half of each tile the same way</text>
+<rect x="324" y="236" width="532" height="156" rx="10" class="tile"/>
+<text x="338" y="256" class="eb">MEMORY TILE</text>
+<text x="427.095" y="256" class="en">(c, 1)</text>
+<rect x="340" y="268" width="252" height="108" rx="6" class="card"/>
+<text x="354" y="288" class="ti">page store · 32 KB</text>
+<text x="354" y="316" class="sb">main</text>
+<rect x="406" y="300" width="54" height="24" rx="4" class="buf code"/>
+<text x="433" y="315.5" class="mo" text-anchor="middle">Q4_K</text>
+<rect x="466" y="300" width="54" height="24" rx="4" class="buf code"/>
+<text x="493" y="315.5" class="mo" text-anchor="middle">Q5_K</text>
+<rect x="526" y="300" width="54" height="24" rx="4" class="buf code"/>
+<text x="553" y="315.5" class="mo" text-anchor="middle">Q6_K</text>
+<text x="354" y="348" class="sb">helper</text>
+<rect x="406" y="332" width="54" height="24" rx="4" class="buf code"/>
+<text x="433" y="347.5" class="mo" text-anchor="middle">Q4_K</text>
+<rect x="466" y="332" width="54" height="24" rx="4" class="buf code"/>
+<text x="493" y="347.5" class="mo" text-anchor="middle">Q5_K</text>
+<rect x="526" y="332" width="54" height="24" rx="4" class="buf code"/>
+<text x="553" y="347.5" class="mo" text-anchor="middle">Q6_K</text>
+<rect x="592" y="276" width="64" height="26" rx="6" class="card"/>
+<text x="624" y="293" class="ti" text-anchor="middle">queue</text>
+<path d="M624,178L624,226" class="a ctl"/>
+<circle cx="624" cy="202" r="8.5" class="badge ctl"/>
+<text x="624" y="205.6" class="bn ctl" text-anchor="middle">2</text>
+<path d="M624,244L624,274" class="a ctl"/>
+<circle cx="606" cy="260" r="8.5" class="badge ctl"/>
+<text x="606" y="263.6" class="bn ctl" text-anchor="middle">3</text>
+<path d="M656,289L726,289Q732,289 732,283L732,246" class="a ctl"/>
+<path d="M592,348L750,348Q756,348 756,342L756,246" class="a code"/>
+<text x="766" y="320" class="sb">the page's BD:</text>
+<text x="766" y="334" class="sm">40-45</text>
+<path d="M744,226L744,178" class="a code"/>
+<circle cx="744" cy="202" r="8.5" class="badge code"/>
+<text x="744" y="205.6" class="bn code" text-anchor="middle">4</text>
+<rect x="585.128" y="160" width="77.745" height="16" rx="4" class="port ctl"/>
+<text x="624" y="171.4" class="mo" text-anchor="middle">stream port</text>
+<rect x="705.128" y="160" width="77.745" height="16" rx="4" class="port code"/>
+<text x="744" y="171.4" class="mo" text-anchor="middle">TileControl</text>
+<rect x="585.128" y="228" width="77.745" height="16" rx="4" class="port ctl"/>
+<text x="624" y="239.4" class="mo" text-anchor="middle">TileControl</text>
+<rect x="719.615" y="228" width="48.77" height="16" rx="4" class="port code"/>
+<text x="744" y="239.4" class="mo" text-anchor="middle">MM2S 5</text>
+<path d="M224,366L338,366" class="a code"/>
+<circle cx="268" cy="366" r="8.5" class="badge code"/>
+<text x="268" y="369.6" class="bn code" text-anchor="middle">1</text>
+</svg>

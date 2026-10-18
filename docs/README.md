@@ -10,7 +10,8 @@
 | [Benchmark methodology](methodology.md) | how the README's charts are measured: test system, files, other runtimes |
 | [Where the NPU fits](npu-vs-igpu.md) | bandwidth and power against the iGPU, workloads to explore |
 | [Design](design.md) | runtime layers, C++ and Python API, kernel compilation, error handling, driver behaviour |
+| [Universal programs](paging.md) | code pages: cores that load their own code, compared with classic designs |
 | [Development](development.md) | tests, operators, kernel tools, environment variables, skills |
 
 `data/` and `charts.py` hold the performance charts' numbers and draw them into `images/`; `diagram.py` draws the
-README's how-it-works diagram.
+README's how-it-works diagram, `paging_diagrams.py` the figures of [Universal programs](paging.md).

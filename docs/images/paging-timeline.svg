@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="372" viewBox="0 0 880 372" role="img" aria-labelledby="t d">
+<title id="t">sd15's rows in time</title>
+<desc id="d">A schematic of part of a transformer block on the 4 core rows. With host role switches, the LayerNorm runs on rows 4 and 5 only and cross-attention on rows 2 and 3 only, and every switch of rows 4 and 5 to attention and back waits for the array to drain. With pages, every row runs every operation, and a row's page arrives in its B stream just before the operation that needs it, about 2.7 microseconds.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif}.eb{font-size:10px;font-weight:700;letter-spacing:.1em;fill:#818b98}.ti{font-size:11.5px;font-weight:600;fill:#1f2328}.st{font-size:11px;font-weight:700;fill:#1f2328}.lb{font-size:10.5px;fill:#59636e}.pl{font-size:10px;fill:#59636e}.sb{font-size:10px;fill:#59636e}.en{font-size:10.5px;fill:#818b98}.c{font-size:10px;fill:#1f2328}.bn{font-size:10px;font-weight:700}.mo,.sm,.mm{font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;font-size:9.5px;fill:#1f2328}.sm{font-size:10px;fill:#59636e}.mm{font-size:10px;fill:#818b98}.halo,.halop,.halot{paint-order:stroke;stroke:#ffffff;stroke-width:5px;stroke-linejoin:round}.halop{stroke:#f6f8fa}.halot{stroke:#e9ecef}.panel{fill:#f6f8fa;stroke:#d1d9e0}.tile{fill:#e9ecef;stroke:#c8d1da}.card{fill:#ffffff;stroke:#d1d9e0}.a,.w{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.w.ctl,.a.ctl{stroke-width:1.3}.hatch{fill:url(#hatch);stroke:#d1d9e0}.slot{fill:#ffffff;stroke:#eb6834;stroke-dasharray:4 3}.axis{fill:none;stroke:#c8d1da}.guide{fill:none;stroke:#c8d1da;stroke-dasharray:3 3}.resident{fill:#ebecee;stroke:#acb1b6}.gcore{fill:#2a78d6}.gmem{fill:#9fc2ed}.gshim{fill:#ffffff;stroke:#818b98}.a.data,.w.data{stroke:#2a78d6}.a.data{marker-end:url(#hdata)}.card.data{fill:#eaf2fb;stroke:#8ab5e8}.port.data{fill:#dde9f8;stroke:#2a78d6}.buf.data{fill:#d4e4f7}.solid.data{fill:#2a78d6}.badge.data{fill:#2a78d6;stroke:#ffffff;stroke-width:2px}.bn.data{fill:#ffffff}.a.code,.w.code{stroke:#eb6834}.a.code{marker-end:url(#hcode)}.card.code{fill:#fdf0eb;stroke:#f4ac8f}.port.code{fill:#fce7df;stroke:#eb6834}.buf.code{fill:#fbe1d6}.solid.code{fill:#eb6834}.badge.code{fill:#eb6834;stroke:#ffffff;stroke-width:2px}.bn.code{fill:#0d1117}.a.wts,.w.wts{stroke:#1baf7a}.a.wts{marker-end:url(#hwts)}.card.wts{fill:#e8f7f2;stroke:#82d3b6}.port.wts{fill:#dbf2ea;stroke:#1baf7a}.buf.wts{fill:#d1efe4}.solid.wts{fill:#1baf7a}.badge.wts{fill:#1baf7a;stroke:#ffffff;stroke-width:2px}.bn.wts{fill:#0d1117}.a.ctl,.w.ctl{stroke:#59636e}.a.ctl{marker-end:url(#hctl)}.card.ctl{fill:#eeeff0;stroke:#a4a9af}.port.ctl{fill:#e4e6e8;stroke:#59636e}.buf.ctl{fill:#dee0e2}.solid.ctl{fill:#59636e}.badge.ctl{fill:#59636e;stroke:#ffffff;stroke-width:2px}.bn.ctl{fill:#ffffff}</style>
+<defs><marker id="hdata" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#2a78d6"/></marker><marker id="hcode" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#eb6834"/></marker><marker id="hwts" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#1baf7a"/></marker><marker id="hctl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M1,1L9,5L1,9L3.2,5z" fill="#59636e"/></marker><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#ffffff"/><line x1="0" y1="0" x2="0" y2="5" stroke="#d1d9e0" stroke-width="1.6"/></pattern></defs>
+<rect x="0.5" y="0.5" width="879" height="371" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<text x="24" y="36" class="eb">HOST ROLE SWITCHES</text>
+<text x="165.413" y="36" class="en">rows 2, 3: attention · rows 4, 5: the norms</text>
+<rect x="89" y="48" width="60" height="21" rx="4" class="card"/>
+<text x="119" y="62.5" class="c" text-anchor="middle">LN</text>
+<rect x="89" y="73" width="60" height="21" rx="4" class="card"/>
+<text x="119" y="87.5" class="c" text-anchor="middle">LN</text>
+<rect x="89" y="98" width="60" height="21" rx="4" class="hatch"/>
+<rect x="89" y="123" width="60" height="21" rx="4" class="hatch"/>
+<rect x="151" y="48" width="106.5" height="21" rx="4" class="card"/>
+<text x="204.25" y="62.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="151" y="73" width="106.5" height="21" rx="4" class="card"/>
+<text x="204.25" y="87.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="151" y="98" width="106.5" height="21" rx="4" class="card"/>
+<text x="204.25" y="112.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="151" y="123" width="106.5" height="21" rx="4" class="card"/>
+<text x="204.25" y="137.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="259.5" y="48" width="29" height="21" rx="4" class="solid ctl"/>
+<rect x="259.5" y="73" width="29" height="21" rx="4" class="solid ctl"/>
+<rect x="259.5" y="98" width="29" height="21" rx="4" class="hatch"/>
+<rect x="259.5" y="123" width="29" height="21" rx="4" class="hatch"/>
+<text x="274" y="160" class="pl" text-anchor="middle">switch</text>
+<rect x="290.5" y="48" width="106.5" height="21" rx="4" class="card"/>
+<text x="343.75" y="62.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="290.5" y="73" width="106.5" height="21" rx="4" class="card"/>
+<text x="343.75" y="87.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="290.5" y="98" width="106.5" height="21" rx="4" class="card"/>
+<text x="343.75" y="112.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="290.5" y="123" width="106.5" height="21" rx="4" class="card"/>
+<text x="343.75" y="137.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="399" y="48" width="29" height="21" rx="4" class="solid ctl"/>
+<rect x="399" y="73" width="29" height="21" rx="4" class="solid ctl"/>
+<rect x="399" y="98" width="29" height="21" rx="4" class="hatch"/>
+<rect x="399" y="123" width="29" height="21" rx="4" class="hatch"/>
+<text x="413.5" y="160" class="pl" text-anchor="middle">switch</text>
+<rect x="430" y="48" width="106.5" height="21" rx="4" class="card"/>
+<text x="483.25" y="62.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="430" y="73" width="106.5" height="21" rx="4" class="card"/>
+<text x="483.25" y="87.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="430" y="98" width="106.5" height="21" rx="4" class="card"/>
+<text x="483.25" y="112.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="430" y="123" width="106.5" height="21" rx="4" class="card"/>
+<text x="483.25" y="137.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="538.5" y="48" width="60" height="21" rx="4" class="card"/>
+<text x="568.5" y="62.5" class="c" text-anchor="middle">LN</text>
+<rect x="538.5" y="73" width="60" height="21" rx="4" class="card"/>
+<text x="568.5" y="87.5" class="c" text-anchor="middle">LN</text>
+<rect x="538.5" y="98" width="60" height="21" rx="4" class="hatch"/>
+<rect x="538.5" y="123" width="60" height="21" rx="4" class="hatch"/>
+<rect x="600.5" y="48" width="75.5" height="21" rx="4" class="card"/>
+<text x="638.25" y="62.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="600.5" y="73" width="75.5" height="21" rx="4" class="card"/>
+<text x="638.25" y="87.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="600.5" y="98" width="75.5" height="21" rx="4" class="card"/>
+<text x="638.25" y="112.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="600.5" y="123" width="75.5" height="21" rx="4" class="card"/>
+<text x="638.25" y="137.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="678" y="48" width="106.5" height="21" rx="4" class="hatch"/>
+<rect x="678" y="73" width="106.5" height="21" rx="4" class="hatch"/>
+<rect x="678" y="98" width="106.5" height="21" rx="4" class="card"/>
+<text x="731.25" y="112.5" class="c" text-anchor="middle">cross-attn</text>
+<rect x="678" y="123" width="106.5" height="21" rx="4" class="card"/>
+<text x="731.25" y="137.5" class="c" text-anchor="middle">cross-attn</text>
+<text x="24" y="63" class="en">row 5</text>
+<text x="24" y="88" class="en">row 4</text>
+<text x="24" y="113" class="en">row 3</text>
+<text x="24" y="138" class="en">row 2</text>
+<text x="24" y="192" class="eb">PAGES</text>
+<text x="72.5594" y="192" class="en">every row runs every operation</text>
+<rect x="89" y="204" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="89" y="229" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="89" y="254" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="89" y="279" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="96.75" y="204" width="29" height="21" rx="4" class="card"/>
+<text x="111.25" y="218.5" class="c" text-anchor="middle">LN</text>
+<rect x="96.75" y="229" width="29" height="21" rx="4" class="card"/>
+<text x="111.25" y="243.5" class="c" text-anchor="middle">LN</text>
+<rect x="96.75" y="254" width="29" height="21" rx="4" class="card"/>
+<text x="111.25" y="268.5" class="c" text-anchor="middle">LN</text>
+<rect x="96.75" y="279" width="29" height="21" rx="4" class="card"/>
+<text x="111.25" y="293.5" class="c" text-anchor="middle">LN</text>
+<rect x="127.75" y="204" width="106.5" height="21" rx="4" class="card"/>
+<text x="181" y="218.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="127.75" y="229" width="106.5" height="21" rx="4" class="card"/>
+<text x="181" y="243.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="127.75" y="254" width="106.5" height="21" rx="4" class="card"/>
+<text x="181" y="268.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="127.75" y="279" width="106.5" height="21" rx="4" class="card"/>
+<text x="181" y="293.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="236.25" y="204" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="236.25" y="229" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="236.25" y="254" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="236.25" y="279" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="244" y="204" width="106.5" height="21" rx="4" class="card"/>
+<text x="297.25" y="218.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="244" y="229" width="106.5" height="21" rx="4" class="card"/>
+<text x="297.25" y="243.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="244" y="254" width="106.5" height="21" rx="4" class="card"/>
+<text x="297.25" y="268.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="244" y="279" width="106.5" height="21" rx="4" class="card"/>
+<text x="297.25" y="293.5" class="c" text-anchor="middle">self-attn</text>
+<rect x="352.5" y="204" width="106.5" height="21" rx="4" class="card"/>
+<text x="405.75" y="218.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="352.5" y="229" width="106.5" height="21" rx="4" class="card"/>
+<text x="405.75" y="243.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="352.5" y="254" width="106.5" height="21" rx="4" class="card"/>
+<text x="405.75" y="268.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="352.5" y="279" width="106.5" height="21" rx="4" class="card"/>
+<text x="405.75" y="293.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="461" y="204" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="461" y="229" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="461" y="254" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="461" y="279" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="468.75" y="204" width="29" height="21" rx="4" class="card"/>
+<text x="483.25" y="218.5" class="c" text-anchor="middle">LN</text>
+<rect x="468.75" y="229" width="29" height="21" rx="4" class="card"/>
+<text x="483.25" y="243.5" class="c" text-anchor="middle">LN</text>
+<rect x="468.75" y="254" width="29" height="21" rx="4" class="card"/>
+<text x="483.25" y="268.5" class="c" text-anchor="middle">LN</text>
+<rect x="468.75" y="279" width="29" height="21" rx="4" class="card"/>
+<text x="483.25" y="293.5" class="c" text-anchor="middle">LN</text>
+<rect x="499.75" y="204" width="75.5" height="21" rx="4" class="card"/>
+<text x="537.5" y="218.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="499.75" y="229" width="75.5" height="21" rx="4" class="card"/>
+<text x="537.5" y="243.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="499.75" y="254" width="75.5" height="21" rx="4" class="card"/>
+<text x="537.5" y="268.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="499.75" y="279" width="75.5" height="21" rx="4" class="card"/>
+<text x="537.5" y="293.5" class="c" text-anchor="middle">GEMM</text>
+<rect x="577.25" y="204" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="577.25" y="229" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="577.25" y="254" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="577.25" y="279" width="5.75" height="21" rx="4" class="solid code"/>
+<rect x="585" y="204" width="52.25" height="21" rx="4" class="card"/>
+<text x="611.125" y="218.5" class="c" text-anchor="middle">cross-attn</text>
+<rect x="585" y="229" width="52.25" height="21" rx="4" class="card"/>
+<text x="611.125" y="243.5" class="c" text-anchor="middle">cross-attn</text>
+<rect x="585" y="254" width="52.25" height="21" rx="4" class="card"/>
+<text x="611.125" y="268.5" class="c" text-anchor="middle">cross-attn</text>
+<rect x="585" y="279" width="52.25" height="21" rx="4" class="card"/>
+<text x="611.125" y="293.5" class="c" text-anchor="middle">cross-attn</text>
+<text x="24" y="219" class="en">row 5</text>
+<text x="24" y="244" class="en">row 4</text>
+<text x="24" y="269" class="en">row 3</text>
+<text x="24" y="294" class="en">row 2</text>
+<path d="M88,330L785.5,330" class="a ctl"/>
+<text x="793.5" y="333.5" class="pl">time</text>
+<rect x="88" y="346" width="14" height="14" rx="3" class="card"/>
+<text x="110" y="357" class="lb">operation</text>
+<rect x="181.774" y="346" width="14" height="14" rx="3" class="hatch"/>
+<text x="203.774" y="357" class="lb">idle</text>
+<rect x="248.112" y="346" width="14" height="14" rx="3" class="solid ctl"/>
+<text x="270.112" y="357" class="lb">host role switch: drain, write, poll</text>
+<rect x="449.827" y="346" width="14" height="14" rx="3" class="solid code"/>
+<text x="471.827" y="357" class="lb">page: ~2.7 µs</text>
+<text x="856" y="357" class="en" text-anchor="end">schematic, not to scale</text>
+</svg>
