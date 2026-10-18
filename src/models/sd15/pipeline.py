@@ -10,7 +10,8 @@ replace the CPU's one at a time:
   noise (2, 4, 64, 64). The batch is [uncond, cond]. The context is the same tensor for every step of an image:
   what depends only on it (each cross-attention's K and V) can be computed once per image;
 - ``ImageDecoder``: the sampler's final latents (1, 4, 64, 64) -> the image (1, 3, 512, 512) in about [-1, 1].
-``load_backend("cpu", ...)``: the three in fp32 torch (``reference``); ``"npu"``: the UNet on the NPU (``npu``).
+``load_backend("cpu", ...)``: the three in fp32 torch (``reference``); ``"npu"``: the UNet and the VAE decoder on
+the NPU (``npu``).
 """
 
 import json
@@ -54,29 +55,17 @@ class Backend:
     vae: ImageDecoder
 
 
-class Bf16Decoder:
-    """An image decoder run under bf16 autocast on the CPU (the npu backend's VAE decoder: half fp32's time, pixels
-    within ~0.2 / 255 of it)."""
-
-    def __init__(self, decoder: ImageDecoder):
-        self.decoder = decoder
-
-    def __call__(self, latents: torch.Tensor) -> torch.Tensor:
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            return self.decoder(latents).float()
-
-
 def load_backend(name: str, path: str) -> Backend:
     """The networks of a diffusers directory on a backend: ``cpu`` (fp32 torch) or ``npu``."""
     if name == "cpu":
         return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")),
                        unet=reference.UNet(os.path.join(path, "unet")),
                        vae=reference.VaeDecoder(os.path.join(path, "vae")))
-    if name == "npu":  # (the UNet on the NPU; the text encoder and the VAE decoder (in bf16) on the CPU)
-        from .npu import NpuUNet
-        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")),
-                       unet=NpuUNet(os.path.join(path, "unet")),
-                       vae=Bf16Decoder(reference.VaeDecoder(os.path.join(path, "vae"))))
+    if name == "npu":  # (the UNet and the VAE decoder on the NPU, one design; the text encoder on the CPU)
+        from .npu import NpuUNet, NpuVae
+        unet = NpuUNet(os.path.join(path, "unet"))
+        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")), unet=unet,
+                       vae=NpuVae(os.path.join(path, "vae"), unet.net.v2))
     raise ValueError(f"unknown backend {name!r} (backends: {', '.join(BACKENDS)})")
 
 

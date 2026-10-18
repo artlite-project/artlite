@@ -11,18 +11,21 @@ Channels (``Chans``): per producing core row a slice, padded to whole 80-channel
 channel space (a slice in one record window); the panels of a conv's input hold the real channels only.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 from ..design import COLS
+from ..overlay.runtime import Transaction
 from . import core as K
 from . import design as D
 from . import layout as L
 from .build import Builder, Level
 from .level64 import IL
 from .ops import Apply, Gemm
+from .runtime import V2Device
 from .seq import ColOps, MemTask
 from .unet import DTensor, Tensor, _silu, alloc, free, plain
 
@@ -256,17 +259,25 @@ class VImage:
         return x, {"Lg": 4, "rc": rb + 2, "r0": 1}
 
 
-def write(bd: Builder, img: VImage, x: torch.Tensor) -> None:
-    """The host's image of x (1, C, H, H) into img's DDR image (a model's input; tests)."""
+def image_bytes(img: VImage, x: torch.Tensor) -> np.ndarray:
+    """The host's x (1, C, H, H) as img's DDR image (a model's input; tests)."""
     lv = img.lv
     t = tokens(x, lv)
     if kind(lv) == "wide":  # (the rows' positions: [the last group, groups 0 .. G - 1, group 0])
         t = t.reshape(COLS, lv.R, lv.Lg, 16, -1)
         t = torch.cat([t[:, :, -1:], t, t[:, :, :1]], 2).reshape(COLS, -1, x.shape[1])
-    base = img.base(bd)
-    v = np.concatenate([L.panels(t[c]) for c in range(COLS)])
-    bd.v2.write(img.name, v)
-    assert v.size == COLS * img.colbytes and base
+    return np.concatenate([L.panels(t[c]) for c in range(COLS)])
+
+
+def write(bd: Builder, img: VImage, x: torch.Tensor) -> None:
+    img.base(bd)
+    bd.v2.write(img.name, image_bytes(img, x))
+
+
+def load(bd: Builder, x: DTensor, b: int) -> Tensor:
+    """Band b of x in the memtile, allocated after the pending drains (the previous layer's last band) are pushed."""
+    bd.reading(x.band(b))
+    return x.load(bd, b)
 
 
 def stf(b: int, nb: int) -> int:
@@ -284,7 +295,7 @@ def conv(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None, *, c
     x, kw = img.rows(bd, band, c0, w.shape[1])
     acc = out is not None
     if res is not None and not acc:
-        out = res.load(bd, band)
+        out = load(bd, res, band)
     out = out or alloc(bd, lv, ch.P)
     g = dict(m=64, ntile=lv.ntile, K=w.shape[1], N=ch.P, x=x.addr, y=out.addr, out="bf16", conv=1, R=1, zero=bd.zero,
              x_np=x.np, joined=True, res=out.addr if acc or res is not None else None, ch_step=ch.stride,
@@ -305,8 +316,7 @@ def norm(bd: Builder, x: DTensor, gamma: torch.Tensor, beta: torch.Tensor, *, ch
     img = VImage(ch.C, name, lv)
     g, bt = ch.pad(gamma), ch.pad(beta)
     for b in range(lv.nb):
-        bd.reading(x.band(b))  # (first: the pending drains pushed, their bytes released)
-        xb = x.load(bd, b)
+        xb = load(bd, x, b)
         if silu:
             bd.table("silu", _silu(), rows=APPLY_ROWS)
         t = alloc(bd, lv, ch.P, "pn")
@@ -352,12 +362,24 @@ def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None
     return out
 
 
-def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
-    """The host's x (1, C, H, H) as t's bands (C tiles of the stored channels ``ch``)."""
+def dtensor_bytes(t: DTensor, x: torch.Tensor, ch: Chans) -> list[np.ndarray]:
+    """The host's x (1, C, H, H) as t's bands' DDR images (C tiles of the stored channels ``ch``)."""
     lv = t.lv
     xt = ch.pad(tokens(x, lv).permute(2, 0, 1)).permute(1, 2, 0)  # (COLS, tokens, P)
-    for b in range(lv.nb):
-        bd.image(t.band(b), np.concatenate([L.ctiles(xt[c, lv.T * b:lv.T * (b + 1)], 64) for c in range(COLS)]))
+    return [np.concatenate([L.ctiles(xt[c, lv.T * b:lv.T * (b + 1)], 64) for c in range(COLS)]) for b in range(lv.nb)]
+
+
+def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
+    for b, v in enumerate(dtensor_bytes(t, x, ch)):
+        bd.image(t.band(b), v)
+
+
+def read_dtensor(v2: V2Device, t: DTensor, ch: Chans) -> torch.Tensor:
+    """t's real channels as (1, C, H, H)."""
+    lv = t.lv
+    bands = [v2.read(t.band(b), COLS * t.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
+    y = torch.stack([torch.cat([L.from_ctiles(bands[b][c], lv.T, ch.P, 64) for b in range(lv.nb)]) for c in range(COLS)])
+    return from_tokens(ch.unpad(y), lv)
 
 
 def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
@@ -365,7 +387,7 @@ def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
     lv = x.lv
     rec = bd.mem.alloc(4 * D.OCH, top=True)
     for b in range(lv.nb):
-        xb = x.load(bd, b)
+        xb = load(bd, x, b)
         y = alloc(bd, lv, ch.P)
         g = Gemm(m=64, ntile=lv.ntile, K=0, N=ch.P, x=0, y=y.addr, out="bf16", res=xb.addr, stats="gn", rec=rec,
                  gsize=ch.gsize, ch_step=ch.stride, ch_real=ch.per, tsplit=4 // ch.slices, stf=stf(b, lv.nb))
@@ -382,7 +404,7 @@ def shortcut(bd: Builder, x: DTensor, w: torch.Tensor, b: torch.Tensor, *, cin: 
     bp = cout.pad(b)
     out = DTensor(lv, cout.P, name)
     for band in range(lv.nb):
-        xb = x.load(bd, band)
+        xb = load(bd, x, band)
         px = alloc(bd, lv, cin.P, "pn", top=True)
         plain(bd, xb, px, name=name + ".xpn")
         free(bd, xb)
@@ -413,9 +435,118 @@ def upsample(bd: Builder, w: dict, p: str, x: DTensor, *, ch: Chans, name: str) 
     lv2 = LEVELS[2 * x.lv.H]
     img = VImage(ch.C, name + ".up", lv2)
     for band in range(x.lv.nb):
-        xb = x.load(bd, band)
+        xb = load(bd, x, band)
         t = alloc(bd, x.lv, ch.P, "pn")
         plain(bd, xb, t, name=p + "xpn")
         free(bd, xb)
         img.store_up(bd, band, t, x.lv, ch)
     return conv_layer(bd, img, w[p + "conv.weight"], w[p + "conv.bias"], ch=ch, name=name)
+
+
+def conv_in(bd: Builder, w: dict, lat: VImage, *, scale: float, name: str) -> DTensor:
+    """The latents' 1 / scaling_factor, post_quant_conv and conv_in as one 3x3 conv of the latents' image (``latents``:
+    64 channels, the 4 latent ones, a ones channel (post_quant_conv's bias through conv_in's taps: zero past the image's
+    edges, as the padding of post_quant_conv's output), zeros) -> 512 channels with records."""
+    wi, bi = w["decoder.conv_in.weight"], w["decoder.conv_in.bias"]
+    wq, bq = w["post_quant_conv.weight"][:, :, 0, 0], w["post_quant_conv.bias"]
+    w64 = torch.zeros(wi.shape[0], 64, 3, 3)
+    w64[:, :wq.shape[1]] = torch.einsum("omyx,mi->oiyx", wi, wq) / scale
+    w64[:, wq.shape[1]] = torch.einsum("omyx,m->oyx", wi, bq)
+    return conv_layer(bd, lat, w64, bi, ch=chans(wi.shape[0]), name=name)
+
+
+def latents(lat: torch.Tensor) -> torch.Tensor:
+    """The sampler's latents (1, 4, 64, 64) as ``conv_in``'s input channels (1, 64, 64, 64)."""
+    x = torch.zeros(1, 64, *lat.shape[2:])
+    x[:, :lat.shape[1]] = lat
+    x[:, lat.shape[1]] = 1
+    return x
+
+
+OUTB = L512.ntile * 8 * 128  # (conv_out's bytes per band and column: [tile][row block][64] of output channels 0..7)
+
+
+def conv_out(bd: Builder, w: dict, x: DTensor, *, C: int, eps: float, name: str) -> None:
+    """conv_norm_out (GroupNorm + SiLU) and conv_out of the 512 level's x (C channels): its 3 output channels on every core row (one
+    slice: Gemm tsplit 4), their first 8 channels' blocks drained into DDR image ``name`` ([band][col][OUTB]:
+    ``image``)."""
+    img = norm(bd, x, w["decoder.conv_norm_out.weight"], w["decoder.conv_norm_out.bias"], ch=chans(C),
+               name=name + ".n", eps=eps)
+    ch = Chans(w["decoder.conv_out.weight"].shape[0], 1)
+    wp, bp = ch.pad(w["decoder.conv_out.weight"]), ch.pad(w["decoder.conv_out.bias"])
+    lv, ct = x.lv, L.ct_bytes(64)
+    base = bd.ddr(name, lv.nb * COLS * OUTB)
+    bd.written(name)
+    for band in range(lv.nb):
+        cb = conv(bd, img, wp, bp, ch=ch, name=name + ".c", band=band)
+        bd.defer({c: ColOps(drains=[MemTask([{"addr": cb.addr, "nwords": OUTB // 4, "dims": [(32, 1), (8, 320), (lv.ntile, ct // 4)]}],
+                                            ddr=(base + (band * COLS + c) * OUTB, OUTB, None))]) for c in range(COLS)},
+                 release=[(cb.addr, cb.size or cb.nbytes)])
+    bd.op({}, {})
+    bd.ddr_sync()
+
+
+def image(raw: np.ndarray, n: int = 3) -> torch.Tensor:
+    """conv_out's output image ([band][col][OUTB]) -> (1, n, 512, 512)."""
+    lv = L512
+    v = torch.from_numpy(np.ascontiguousarray(raw).reshape(lv.nb, COLS, lv.ntile, 8, 8, 16)).view(torch.bfloat16)[..., :n]
+    t = v.float().permute(1, 0, 2, 3, 4, 5).reshape(COLS, lv.nb * lv.T, n)  # (col, band tile rb token, ch)
+    return from_tokens(t, lv)
+
+
+def head(bd: Builder, w: dict, lat: VImage, *, scale: float, eps: float) -> DTensor:
+    """The decoder up to its mid block's attention: conv_in, mid_block.resnets.0."""
+    h = conv_in(bd, w, lat, scale=scale, name="vae.conv_in")
+    C = chans(w["decoder.conv_in.weight"].shape[0])
+    return resnet(bd, w, "decoder.mid_block.resnets.0.", h, cin=C, cout=C, eps=eps, name="vae.mid0")
+
+
+def tail(bd: Builder, w: dict, h: DTensor, *, eps: float, name: str) -> None:
+    """The decoder from its mid block's attention's output h (with its records): mid_block.resnets.1, the up blocks
+    (their upsamplers), conv_norm_out and conv_out into DDR image ``name``."""
+    C = 512
+    h = resnet(bd, w, "decoder.mid_block.resnets.1.", h, cin=chans(C), cout=chans(C), eps=eps, name="vae.mid1")
+    for i in range(4):
+        for j in range(3):
+            p = f"decoder.up_blocks.{i}.resnets.{j}."
+            cout = w[p + "conv1.weight"].shape[0]
+            h = resnet(bd, w, p, h, cin=chans(C), cout=chans(cout), eps=eps, name=f"vae.u{i}.{j}")
+            C = cout
+        if i < 3:
+            h = upsample(bd, w, f"decoder.up_blocks.{i}.upsamplers.0.", h, ch=chans(C), name=f"vae.u{i}.up")
+    conv_out(bd, w, h, C=C, eps=eps, name=name)
+
+
+class Decoder:
+    """The VAE decoder on a V2Device: ``self(latents, attend)``, the sampler's latents (1, 4, 64, 64) -> the image (1,
+    3, 512, 512) in about [-1, 1]: conv_in and the mid block's first resnet as one dispatch, the mid block's attention
+    ``attend`` (1, 512, 64, 64) -> the same, on the host, the rest as a second dispatch. Weights by diffusers name
+    (``decoder.*``, ``post_quant_conv.*``)."""
+
+    def __init__(self, v2: V2Device, w: dict, *, scale: float, eps: float = 1e-6):
+        self.v2 = v2
+        self.C = chans(w["decoder.conv_in.weight"].shape[0])
+        a = Builder(v2)
+        self.lat = VImage(64, "vae.lat", L64)
+        self.lat.base(a)
+        self.h0 = head(a, w, self.lat, scale=scale, eps=eps)
+        self.words_a = a.finish()
+        b = Builder(v2)
+        self.h1 = DTensor(L64, self.C.P, "vae.h1")
+        for k in range(L64.nb):
+            b.ddr(self.h1.band(k), COLS * self.h1.nbytes)
+        with_stats(b, self.h1, self.C, name="vae.h1.st")
+        tail(b, w, self.h1, eps=eps, name="vae.out")
+        self.words_b = b.finish()
+        self.tr = None
+
+    def __call__(self, lat: torch.Tensor, attend: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        if self.tr is None:
+            self.tr = Transaction(self.v2.dev, self.words_a), Transaction(self.v2.dev, self.words_b)
+        self.v2.write(self.lat.name, image_bytes(self.lat, latents(lat)))
+        self.v2.run(self.tr[0])
+        h = attend(read_dtensor(self.v2, self.h0, self.C))
+        for k, v in enumerate(dtensor_bytes(self.h1, h, self.C)):
+            self.v2.write(self.h1.band(k), v)
+        self.v2.run(self.tr[1])
+        return image(self.v2.read("vae.out"))

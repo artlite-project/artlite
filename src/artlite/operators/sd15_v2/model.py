@@ -71,7 +71,7 @@ class UNet:
                   for p in self.PREFIXES}
         zero = {p[:-len("time_emb_proj.weight")]: torch.zeros(w[p].shape[0]) for p in w if p.endswith("time_emb_proj.weight")}
         unet(bd, w, lat, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
-        self.words = bd.s.finish()
+        self.words = bd.finish()
         self.tr = None
 
     def _ctx(self, p: str, ctx: torch.Tensor) -> np.ndarray:

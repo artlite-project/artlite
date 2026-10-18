@@ -28,5 +28,5 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |
 | qwen3 | 🤔 Qwen3 0.6B | | unsloth Q4_1 |
-| text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder and the VAE decoder on the NPU |
+| text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
 | speech recognition | 🤔 Whisper base.en | | whisper.cpp `ggml-base.en.bin` |

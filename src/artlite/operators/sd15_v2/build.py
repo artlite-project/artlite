@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from ..design import COLS, ROWS
+from ..overlay.runtime import Transaction
 from . import core as K
 from . import design as D
 from . import layout as L
@@ -418,5 +419,11 @@ class Builder:
             self.image("_zq", np.zeros(D.Q, np.uint8))
         return self.v2.address("_zq")
 
+    def finish(self) -> np.ndarray:
+        """The dispatch's transaction words (``seq.Seq.finish``), the drains still pending pushed first."""
+        if self._drains:
+            self.op({}, {})
+        return self.s.finish()
+
     def transaction(self):
-        return self.v2.transaction(self.s)
+        return Transaction(self.v2.dev, self.finish())

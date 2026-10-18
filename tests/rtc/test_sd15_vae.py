@@ -1,5 +1,7 @@
 """sd15_v2's VAE decoder (``operators.sd15_v2.vae``) on the NPU: its convs, norms and blocks per level vs torch."""
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -123,3 +125,23 @@ def test_upsample(v2: V2Device, H: int, C: int) -> None:
     err = _rel(read(v2, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
     print(f"H {H} -> {2 * H}: rel err {err:.3e}")
     assert err < 8e-3
+
+
+@pytest.mark.slow
+def test_decoder(v2: V2Device) -> None:
+    """SD 1.5's VAE decoder (its mid attention on the host) on the sampler's latents of a prompt: within 2e-2 of the
+    fp32 decoder (pixels)."""
+    from artlite.model_config import sd15_dir
+    from models.sd15 import reference
+    path = os.path.join(sd15_dir(), "vae")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    ref = reference.VaeDecoder(path)
+    dec = vae.Decoder(v2, ref.w, scale=ref.scale, eps=ref.EPS)
+    torch.manual_seed(7)
+    lat = torch.randn(1, 4, 64, 64)  # (the sampler's latents: about unit variance)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        y = dec(lat, lambda h: ref.attention("decoder.mid_block.attentions.0.", h).float())
+    err = _rel(y, ref(lat))
+    print(f"rel err {err:.3e}")
+    assert err < 2e-2

@@ -83,14 +83,14 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
 | `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |
-| `src/artlite/operators/sd15_v2/` | the SD 1.5 UNet step as one dispatch of a static design (host-built transactions, core roles switched by control packets): the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`) |
+| `src/artlite/operators/sd15_v2/` | the SD 1.5 UNet step as one dispatch of a static design (host-built transactions, core roles switched by control packets): the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`); the VAE decoder on the same design (`vae.py`) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
 | `src/artlite/{txn,model_config,measure_ii,variant_search,profiling}.py` | transactions, model files, schedule tools, profiling |
 | `src/models/{llama3,gemma4,qwen35}/` | the models on the NPU and their host side (tokenizers, chat templates, inputs); `models.open_model` picks one by a GGUF file's architecture |
-| `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet (`npu.py`) |
+| `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) |
 | `src/models/server/` | `artlite-server`: the HTTP API (FastAPI: llama-server's routes and shapes), the NPU worker and its prompt cache, llama.cpp's prebuilt web UI (pinned) |
 | `src/models/common.py`, `cli.py`, `bench.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli` and `artlite-bench` |
 | `tests/rtc/` | operator and model tests (`common.py`: the essay corpus, cached CPU references; `llama_ref.py`, `gemma_ref.py`, `qwen35_ref.py`: model references; `llama_cpu.py`, `gemma_cpu.py`: fp32 CPU models; `elementwise.py`: 1-D stream operators, the activations' harnesses; `mmv.py`: the decode GEMV's host model and its harness `MmvOperator`; `dma_model.py`: the host DMA model) |
