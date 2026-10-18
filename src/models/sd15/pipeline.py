@@ -54,17 +54,29 @@ class Backend:
     vae: ImageDecoder
 
 
+class Bf16Decoder:
+    """An image decoder run under bf16 autocast on the CPU (the npu backend's VAE decoder: half fp32's time, pixels
+    within ~0.2 / 255 of it)."""
+
+    def __init__(self, decoder: ImageDecoder):
+        self.decoder = decoder
+
+    def __call__(self, latents: torch.Tensor) -> torch.Tensor:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return self.decoder(latents).float()
+
+
 def load_backend(name: str, path: str) -> Backend:
     """The networks of a diffusers directory on a backend: ``cpu`` (fp32 torch) or ``npu``."""
     if name == "cpu":
         return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")),
                        unet=reference.UNet(os.path.join(path, "unet")),
                        vae=reference.VaeDecoder(os.path.join(path, "vae")))
-    if name == "npu":  # (the UNet on the NPU; the text encoder and the VAE decoder still on the CPU)
+    if name == "npu":  # (the UNet on the NPU; the text encoder and the VAE decoder (in bf16) on the CPU)
         from .npu import NpuUNet
         return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")),
                        unet=NpuUNet(os.path.join(path, "unet")),
-                       vae=reference.VaeDecoder(os.path.join(path, "vae")))
+                       vae=Bf16Decoder(reference.VaeDecoder(os.path.join(path, "vae"))))
     raise ValueError(f"unknown backend {name!r} (backends: {', '.join(BACKENDS)})")
 
 
