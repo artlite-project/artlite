@@ -402,11 +402,15 @@ def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None
     return out
 
 
-def dtensor_bytes(t: DTensor, x: torch.Tensor, ch: Chans) -> list[np.ndarray]:
-    """The host's x (1, C, H, H) as t's bands' DDR images (C tiles of the stored channels ``ch``)."""
-    lv = t.lv
+def dtensor_bytes(t: DTensor, x: torch.Tensor, ch: Chans) -> np.ndarray:
+    """The host's x (1, C, H, H) as t's bands' DDR images ([band][col][80-channel block][tile][``layout.ct_bytes``]: C
+    tiles of the stored channels ``ch``)."""
+    lv, P, ct = t.lv, ch.P, L.ct_bytes(64)
     xt = ch.pad(tokens(x, lv).permute(2, 0, 1)).permute(1, 2, 0)  # (COLS, tokens, P)
-    return [np.concatenate([L.ctiles(xt[c, lv.T * b:lv.T * (b + 1)], 64) for c in range(COLS)]) for b in range(lv.nb)]
+    v = xt.reshape(COLS, lv.nb, lv.ntile, 8, 8, P // 80, 10, 8).permute(1, 0, 5, 2, 3, 6, 4, 7)  # band col cb80 t rb cb tok ch
+    out = np.zeros((lv.nb, COLS, P // 80, lv.ntile, ct), np.uint8)
+    out[..., :64 * 160] = v.bfloat16().reshape(lv.nb, COLS, P // 80, lv.ntile, -1).view(torch.uint8).numpy()
+    return out.reshape(lv.nb, -1)
 
 
 def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
@@ -416,10 +420,11 @@ def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
 
 def read_dtensor(v2: V2Device, t: DTensor, ch: Chans) -> torch.Tensor:
     """t's real channels as (1, C, H, H)."""
-    lv = t.lv
-    bands = [v2.read(t.band(b), COLS * t.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
-    y = torch.stack([torch.cat([L.from_ctiles(bands[b][c], lv.T, ch.P, 64) for b in range(lv.nb)]) for c in range(COLS)])
-    return from_tokens(ch.unpad(y), lv)
+    lv, P, ct = t.lv, ch.P, L.ct_bytes(64)
+    raw = np.stack([v2.read(t.band(b), COLS * t.nbytes) for b in range(lv.nb)]).reshape(lv.nb, COLS, P // 80, lv.ntile, ct)
+    v = torch.from_numpy(np.ascontiguousarray(raw[..., :64 * 160])).view(torch.bfloat16)
+    y = v.reshape(lv.nb, COLS, P // 80, lv.ntile, 8, 10, 8, 8).permute(1, 0, 3, 4, 6, 2, 5, 7)  # col band t rb tok cb80 cb ch
+    return from_tokens(ch.unpad(y.float().reshape(COLS, -1, P)), lv)
 
 
 def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
