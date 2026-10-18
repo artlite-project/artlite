@@ -1,7 +1,7 @@
 """SD 1.x's UNet step on sd15_v2's design (``UNet``): one dispatch from the latents to the predicted noise, every level
 on the design (64x64: ``level64``; 32x32 .. 8x8: ``unet.outer``), its weights in DDR images.
 
-Per step the host writes the latents (conv_in's PImage, ``level64.latent_image``) and the resnets' time biases
+Per step the host writes the latents (conv_in's PImage, ``level64.latent_panels``) and the resnets' time biases
 (``set_time``), runs the dispatch and reads conv_out's channels (``level64.noise``); per prompt the cross-attentions' K /
 V^T slots of the text context (``set_context``)."""
 
@@ -14,7 +14,7 @@ from ..overlay.runtime import Transaction
 from . import design as D
 from . import layout as L
 from .build import TBIAS, Builder, Level
-from .level64 import LV64, PImage, conv_in64, conv_out64, down64, latent_image, noise, resnet64, resnet_cat64, up64
+from .level64 import LV64, PImage, conv_in64, conv_out64, down64, latent_panels, noise, resnet64, resnet_cat64, up64
 from .ops import Attention
 from .runtime import V2Device
 from .unet import CTX_KEYS, DTensor, outer, skip_bands, transformer_bands
@@ -61,8 +61,8 @@ class UNet:
     def __init__(self, v2: V2Device, w: dict, *, eps: float):
         self.v2, self.w = v2, w
         bd = self.bd = Builder(v2)
-        lat = PImage(64, "lat")
-        bd.ddr(lat.name, COLS * lat.colbytes)
+        lat = self.lat = PImage(64, "lat")
+        bd.ddr(lat.name, COLS * lat.colbytes)  # (zeros: per step only its first kb written)
         lv32 = Level(32, 2)
         kv = {16: bd.ddr("kv_self", 16 * Level(16).np * 2 * D.Q),
               32: bd.ddr("kv_self32", Attention(np=lv32.np, q=0, o=0, kv=0, d=80, nbands=lv32.nb).kv_bytes()),
@@ -93,7 +93,8 @@ class UNet:
             self.v2.write(p + "ctx", self._ctx(p, ctx))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self.v2.write("lat", latent_image(x))
+        for c, p in enumerate(latent_panels(x)):
+            self.v2.write(self.lat.name, p, c * self.lat.colbytes)
         if self.tr is None:
             self.tr = Transaction(self.v2.dev, self.words)
         self.v2.run(self.tr)

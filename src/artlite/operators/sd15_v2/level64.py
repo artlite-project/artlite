@@ -36,12 +36,13 @@ def from_tokens(y: torch.Tensor) -> torch.Tensor:
     return v[..., [IL.index(g) for g in range(8)]].reshape(2, C, 64, 64)
 
 
-def latent_image(lat: torch.Tensor) -> np.ndarray:
-    """The latents (2, 4, 64, 64) as conv_in's PImage of 64 channels (the rest zeros)."""
-    x = torch.zeros(2, 64, 64, 64)
+def latent_panels(lat: torch.Tensor) -> list[np.ndarray]:
+    """The latents (2, 4, 64, 64) as conv_in's PImage's first kb per column (its 8 channels: the 4 latent ones, zeros;
+    the image's other kbs zeros)."""
+    x = torch.zeros(2, 8, 64, 64)
     x[:, :lat.shape[1]] = lat
     t = tokens(x)
-    return np.concatenate([L.panels(t[c]) for c in range(COLS)])
+    return [L.panels(t[c]) for c in range(COLS)]
 
 
 def noise(raw: np.ndarray) -> torch.Tensor:
