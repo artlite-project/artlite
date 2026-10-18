@@ -135,12 +135,15 @@ class PImage:
         return x
 
 
-def conv64(bd: Builder, img: PImage, w: torch.Tensor, b: torch.Tensor | None, *, name: str, band: int, out: Tensor,
-           c0: int = 0, res: Tensor | None = None, stats: tuple[int, int] | None = None, tbias: str | None = None) -> None:
-    """A 3x3 conv (padding 1) of img's channels [c0, c0 + K) (w: (N, K, 3, 3), N <= 320: out the band's C tiles) for band
-    ``band`` (+ res; out's GroupNorm records for ``stats``; tbias: ``unet.conv``'s)."""
+def conv64(bd: Builder, img: PImage, w: torch.Tensor, b: torch.Tensor | None, *, name: str, band: int,
+           out: Tensor | None = None, c0: int = 0, res: Tensor | None = None, stats: tuple[int, int] | None = None,
+           tbias: str | None = None) -> Tensor:
+    """A 3x3 conv (padding 1) of img's channels [c0, c0 + K) (w: (N, K, 3, 3), N <= 320) for band ``band`` into out's C
+    tiles (none: new ones, allocated after the input rows' fills, which take the drains pending: their bytes released
+    first) (+ res; out's GroupNorm records for ``stats``; tbias: ``unet.conv``'s); returns out."""
     lv = img.lv
     x = img.rows(bd, band, c0, w.shape[1])
+    out = out or alloc(bd, lv, w.shape[0])
     kw = {"m": lv.m, "ntile": lv.ntile, "K": w.shape[1], "N": w.shape[0], "x": x.addr, "y": out.addr, "out": "bf16",
           "conv": 1, "R": 1, "Lg": lv.Lg, "zero": bd.zero, "x_np": x.np, "rc": lv.R // lv.nb + 2, "r0": 1, "il": True,
           "res": res.addr if res is not None else None}
@@ -152,6 +155,7 @@ def conv64(bd: Builder, img: PImage, w: torch.Tensor, b: torch.Tensor | None, *,
     if stats:
         out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=w.shape[0] // 4, gsize=stats[0], band=band,
                               nbands=lv.nb)]
+    return out
 
 
 def norm64(bd: Builder, x: DTensor, wp: str, w: dict, *, name: str, eps: float, c0: int = 0, n: int | None = None,
@@ -180,16 +184,15 @@ def resnet64(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: 
     p1 = norm64(bd, x, p + "norm1.", w, name=name + ".p1", eps=eps)
     h = DTensor(x.lv, cout, name + ".h", rec=[])
     for b in range(x.lv.nb):
-        hb = alloc(bd, x.lv, cout)
-        conv64(bd, p1, w[p + "conv1.weight"], w[p + "conv1.bias"] + time_bias, name=p + "conv1", band=b, out=hb,
-               stats=(cout // 32, 0), tbias=p)
-        h.store(bd, b, hb, defer=False)
+        hb = conv64(bd, p1, w[p + "conv1.weight"], w[p + "conv1.bias"] + time_bias, name=p + "conv1", band=b,
+                    stats=(cout // 32, 0), tbias=p)
+        h.store(bd, b, hb)
     p2 = norm64(bd, h, p + "norm2.", w, name=name + ".p2", eps=eps)
     out = DTensor(x.lv, cout, name)
     for b in range(x.lv.nb):
         sc = x.load(bd, b)
         conv64(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", band=b, out=sc, res=sc, stats=stats)
-        out.store(bd, b, sc, defer=False)
+        out.store(bd, b, sc)
     return out
 
 
@@ -207,13 +210,13 @@ def resnet_cat64(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cou
             for k, (src, c0, cc) in enumerate(parts)]
     c1 = DTensor(lv, cout, name + ".c1", rec=[])
     for b in range(lv.nb):
-        cb = alloc(bd, lv, cout)
+        cb = None
         for k, (_, _, cc) in enumerate(parts):
             first, last = k == 0, k == len(parts) - 1
-            conv64(bd, imgs[k], w1[:, cc:cc + 320], w[p + "conv1.bias"] + time_bias if first else None,
-                   name=f"{p}conv1.{k}", band=b, out=cb, res=None if first else cb,
-                   stats=(cout // 32, 0) if last else None, tbias=p if first else None)
-        c1.store(bd, b, cb, defer=False)
+            cb = conv64(bd, imgs[k], w1[:, cc:cc + 320], w[p + "conv1.bias"] + time_bias if first else None,
+                        name=f"{p}conv1.{k}", band=b, out=cb, res=None if first else cb,
+                        stats=(cout // 32, 0) if last else None, tbias=p if first else None)
+        c1.store(bd, b, cb, defer=b < lv.nb - 1)  # (the last: the shortcut's tensors need its bytes)
     sc = DTensor(lv, cout, name + ".sc")
     for b in range(lv.nb):
         sb = alloc(bd, lv, cout)
@@ -225,13 +228,13 @@ def resnet_cat64(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cou
             gemm(bd, px, wsc[:, cc:cc + 320].flatten(1), w[p + "conv_shortcut.bias"] if k == 0 else None,
                  name=f"{p}conv_shortcut.{k}", out=sb, res=sb if k else None)
             free(bd, px)
-        sc.store(bd, b, sb, defer=False)
+        sc.store(bd, b, sb, defer=False)  # (the next band's sum and parts need its bytes)
     p2 = norm64(bd, c1, p + "norm2.", w, name=name + ".p2", eps=eps)
     out = DTensor(lv, cout, name)
     for b in range(lv.nb):
         sb = sc.load(bd, b)
         conv64(bd, p2, w[p + "conv2.weight"], w[p + "conv2.bias"], name=p + "conv2", band=b, out=sb, res=sb, stats=stats)
-        out.store(bd, b, sb, defer=False)
+        out.store(bd, b, sb)
     return out
 
 
@@ -258,7 +261,7 @@ def down64(bd: Builder, w: dict, p: str, x: DTensor, *, stats: tuple[int, int], 
                      ch_off=stats[1]), wc, w[p + "conv.bias"], name=p + "conv")
         free(bd, xr)
         y.rec = [bd.records(rec, name=f"{p}conv.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0], band=b, nbands=lv2.nb)]
-        out.store(bd, b, y, defer=False)
+        out.store(bd, b, y)
     return out
 
 
@@ -278,12 +281,13 @@ def up64(bd: Builder, w: dict, p: str, x: DTensor, *, stats: tuple[int, int], na
     out = DTensor(LV64, N, name, rec=[])
     for b in range(LV64.nb):
         for o0 in range(0, N, 320):
-            cb = alloc(bd, LV64, 320)
+            cb = None
             for k, c0 in enumerate(range(0, x.C, 320)):
                 last = c0 + 320 == x.C
-                conv64(bd, img, wc[o0:o0 + 320, c0:c0 + 320], bc[o0:o0 + 320] if k == 0 else None, name=f"{p}conv.{k}.{o0}",
-                       band=b, out=cb, c0=c0, res=cb if k else None, stats=(stats[0], stats[1] + o0) if last else None)
-            out.store(bd, b, cb, defer=False, c0=o0)
+                cb = conv64(bd, img, wc[o0:o0 + 320, c0:c0 + 320], bc[o0:o0 + 320] if k == 0 else None,
+                            name=f"{p}conv.{k}.{o0}", band=b, out=cb, c0=c0, res=cb if k else None,
+                            stats=(stats[0], stats[1] + o0) if last else None)
+            out.store(bd, b, cb, c0=o0)
     return out
 
 
@@ -295,9 +299,7 @@ def conv_in64(bd: Builder, w: dict, lat: PImage, *, stats: tuple[int, int], name
     w64[:, :wi.shape[1]] = wi
     out = DTensor(LV64, wi.shape[0], name, rec=[])
     for b in range(LV64.nb):
-        cb = alloc(bd, LV64, wi.shape[0])
-        conv64(bd, lat, w64, w["conv_in.bias"], name="conv_in", band=b, out=cb, stats=stats)
-        out.store(bd, b, cb, defer=False)
+        out.store(bd, b, conv64(bd, lat, w64, w["conv_in.bias"], name="conv_in", band=b, stats=stats))
     return out
 
 
@@ -311,8 +313,7 @@ def conv_out64(bd: Builder, w: dict, x: DTensor, *, eps: float, name: str) -> No
     w320[:wo.shape[0]], b320[:wo.shape[0]] = wo, w["conv_out.bias"]
     base = bd.ddr(name, LV64.nb * COLS * OUT)
     for b in range(LV64.nb):
-        cb = alloc(bd, LV64, 320)
-        conv64(bd, img, w320, b320, name="conv_out", band=b, out=cb)
+        cb = conv64(bd, img, w320, b320, name="conv_out", band=b)
         bd.op({c: ColOps(drains=[MemTask([{"addr": cb.addr, "nwords": OUT // 4,
                                            "dims": [(32, 1), (8, 320), (4, L.ct_bytes(64) // 4)]}],
                                          ddr=(base + (b * COLS + c) * OUT, OUT, None))]) for c in range(COLS)}, {})
