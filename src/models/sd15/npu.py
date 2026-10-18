@@ -34,6 +34,7 @@ class NpuUNet:
             f"{directory}: not SD 1.x's UNet"
         self.w = load_safetensors(os.path.join(directory, "diffusion_pytorch_model.safetensors"))
         self.net = UNet(V2Device(), self.w, eps=cfg["norm_eps"])
+        self.net.v2.warm()
         self.context: torch.Tensor | None = None
         self.pool = ThreadPoolExecutor(8)  # (the time biases' projections)
         self.worker = ThreadPoolExecutor(1)  # (the steps' time biases ahead of them: ``prepare``)
@@ -49,7 +50,7 @@ class NpuUNet:
         f = self.biases.pop(t, None)
         self.net.set_time(f.result() if f else resnet_time_biases(self.w, t, pool=self.pool))
         if self.context is None or not torch.equal(self.context, context):
-            self.net.set_context(context)
+            self.net.set_context(context, pool=self.pool)
             self.context = context.clone()
         return self.net(x)
 
@@ -64,6 +65,7 @@ class NpuVae:
         assert cfg["block_out_channels"] == [128, 256, 512, 512] and cfg["layers_per_block"] == 2 and \
             cfg.get("latent_channels", 4) == 4, f"{directory}: not SD 1.x's VAE"
         self.dec = Decoder(v2, self.ref.w, scale=self.ref.scale, eps=self.ref.EPS)
+        v2.warm()
 
     def _attend(self, h: torch.Tensor) -> torch.Tensor:
         with torch.autocast("cpu", dtype=torch.bfloat16):

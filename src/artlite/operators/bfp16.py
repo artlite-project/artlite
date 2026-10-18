@@ -16,7 +16,7 @@ import torch
 
 
 def _blocks(w: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(w, np.float32))
+    x = w.float().contiguous() if isinstance(w, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(w, np.float32))
     amax = x.abs().amax(-1)
     e = torch.frexp(amax.clamp_min(2.0 ** -120))[1] - 1  # floor(log2(amax))
     s = ((133 - e) << 23).view(torch.float32)[..., None]  # 2^(6 - e)

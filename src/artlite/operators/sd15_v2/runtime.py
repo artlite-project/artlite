@@ -211,3 +211,8 @@ class V2Device:
 
     def run(self, tr: Transaction) -> None:
         self.dev.dispatch(tr)
+
+    def warm(self) -> None:
+        """An empty dispatch: the first one after new host buffers takes ~0.15 s more than later ones (a model's load
+        ends with it, so that its first step does not)."""
+        self.run(self.transaction(self.seq()))

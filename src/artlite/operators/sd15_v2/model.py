@@ -5,6 +5,8 @@ Per step the host writes the latents (conv_in's PImage, ``level64.latent_panels`
 (``set_time``), runs the dispatch and reads conv_out's channels (``level64.noise``); per prompt the cross-attentions' K /
 V^T slots of the text context (``set_context``)."""
 
+from concurrent.futures import Executor
+
 import numpy as np
 import torch
 from ml_dtypes import bfloat16
@@ -87,10 +89,10 @@ class UNet:
             buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p]).numpy()[rows]
         self.v2.write(TBIAS, buf)
 
-    def set_context(self, ctx: torch.Tensor) -> None:
-        """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768)."""
-        for p in self.PREFIXES:
-            self.v2.write(p + "ctx", self._ctx(p, ctx))
+    def set_context(self, ctx: torch.Tensor, pool: Executor | None = None) -> None:
+        """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768) (pool: computed on its threads)."""
+        for p, v in zip(self.PREFIXES, (pool.map if pool else map)(lambda p: self._ctx(p, ctx), self.PREFIXES), strict=True):
+            self.v2.write(p + "ctx", v)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         for c, p in enumerate(latent_panels(x)):
