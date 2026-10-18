@@ -281,9 +281,10 @@ def test_library_program_memory_variants(monkeypatch):
 def test_control_packets_encoding(tmp_path):
     """``ctrlpkt.packets`` encodes a tile's writes as mlir-aie's aie-translate does (stream and control headers with
     their parity, up to 4 words a packet)."""
-    import shutil
+    import os
     import subprocess
 
+    from artlite.operators.base import AIECC
     from artlite.operators.fused import ctrlpkt
 
     rng = np.random.default_rng(1)
@@ -297,7 +298,7 @@ def test_control_packets_encoding(tmp_path):
                     f"#aie.packet_info<pkt_type = 0, pkt_id = {ctrlpkt.ROW_ID[4]}>}}\n    aie.runtime_sequence() {{\n"
                     f"{ops}\n    }}\n  }}\n}}\n")
     out = tmp_path / "pk.bin"
-    subprocess.run([shutil.which("aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
+    subprocess.run([os.path.join(os.path.dirname(AIECC), "aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
     want = np.fromfile(out, np.uint32)
     assert np.array_equal(ctrlpkt.packets(ctrlpkt.ROW_ID[4], writes), want)
 

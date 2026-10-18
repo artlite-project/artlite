@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -44,7 +45,8 @@ PEANO_DIR = find_spec("llvm-aie").submodule_search_locations[0]
 MLIR_AIE_DIR = find_spec("mlir_aie").submodule_search_locations[0]
 MLIR_AIE_INCLUDE = os.path.join(MLIR_AIE_DIR, "include")
 CLANGPP = os.path.join(PEANO_DIR, "bin", "clang++")
-AIECC = shutil.which("aiecc")
+# PATH, then the interpreter's scripts directory: an unactivated venv (an IDE's test discovery) runs its python without it
+AIECC = shutil.which("aiecc") or shutil.which("aiecc", path=sysconfig.get_path("scripts"))
 if not AIECC:
     sys.exit("ERROR: aiecc not found in PATH. Please check your installation.")
 
