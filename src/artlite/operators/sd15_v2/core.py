@@ -1196,6 +1196,7 @@ def group_words(ch0: int, nch: int, gsize: int, g0: int) -> np.ndarray:
     return np.array(out, np.uint32).view(np.int32)
 
 
+@functools.cache
 def group_inv(gsize: int) -> int:
     """C_GINV: ceil(2^20 / gsize), exact as c // gsize for every channel index c < 4096."""
     gi = -(-(1 << 20) // gsize)

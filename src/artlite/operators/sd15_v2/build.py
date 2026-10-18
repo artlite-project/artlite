@@ -145,6 +145,7 @@ class Builder:
         self._rec_names: dict[str, int] = {}  # (records' DDR images by name: their uses)
         self._rec_img: dict[str, tuple] = {}  # (records' DDR images by name: the current one's address, its bands)
         self._images: dict[str, int] = {}  # (DDR image name -> its data's hash)
+        self._gemm_images: dict[str, tuple] = {}  # (a GEMM's image name -> (its commands' hash, its weights), address, row bytes)
         self._dirty: set[str] = set()  # (DDR images drained into since the last DDR sync)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
@@ -281,9 +282,15 @@ class Builder:
         earlier op: its later passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes:
         the commands' biases on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
         cmds = [g.command(b, r) for r in range(ROWS)]
-        ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
-        per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)
-        addr = self.image(name, np.concatenate([x for r in range(ROWS) for x in (cmds[r], ws[r])]))
+        key = (hash(b"".join(c.tobytes() for c in cmds)),
+               None if w is None else (w.data_ptr(), tuple(w.shape), w.stride(), w.dtype))
+        if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
+            addr, per = self._gemm_images[name][1:]
+        else:
+            ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
+            per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)
+            addr = self.image(name, np.concatenate([x for r in range(ROWS) for x in (cmds[r], ws[r])]))
+            self._gemm_images[name] = (key, addr, per)
         rows = {r: g.row_ops(addr + r * per) for r in range(ROWS)}
         if tbias:  # (the first run in three: the header, the biases from TBIAS, the rest)
             nb, hb = 160 * g.npo, 4 * K.C_BIAS

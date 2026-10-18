@@ -15,24 +15,33 @@ import numpy as np
 import torch
 
 
-def blocks(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _blocks(w: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    x = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(w, np.float32))
+    amax = x.abs().amax(-1)
+    e = torch.frexp(amax.clamp_min(2.0 ** -120))[1] - 1  # floor(log2(amax))
+    s = ((133 - e) << 23).view(torch.float32)[..., None]  # 2^(6 - e)
+    m = torch.round(x * s)
+    over = m.amax(-1) > 127  # a positive maximum rounded up to 128
+    m = torch.where(over[..., None], torch.round(x * (s * 0.5)), m)
+    e = torch.where(amax == 0, -127, e + over)  # an all-zero block has exponent byte 0
+    return (e + 127).clamp(0, 255).to(torch.uint8), m.to(torch.int8)
+
+
+def blocks(w: np.ndarray | torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     """float (..., 8) -> (exponent bytes (...,), int8 mantissas (..., 8)), round to nearest even.
     As the hardware: a positive maximum that rounds up to 128 raises the exponent, a negative
     one stays at -128; an all-zero block has exponent byte 0."""
-    x = np.asarray(w, np.float32)
-    amax = np.abs(x).max(-1)
-    e = np.floor(np.log2(np.maximum(amax, 2.0 ** -120))).astype(np.int32)
-    m = np.rint(x / np.ldexp(np.float32(1.0), e - 6)[..., None])
-    e = np.where(m.max(-1) > 127, e + 1, e)  # a positive maximum rounded up to 128
-    m = np.rint(x / np.ldexp(np.float32(1.0), e - 6)[..., None])
-    e = np.where(amax == 0, -127, e)  # an all-zero block has exponent byte 0
-    return np.clip(e + 127, 0, 255).astype(np.uint8), m.astype(np.int8)
+    e, m = _blocks(w)
+    return e.numpy(), m.numpy()
 
 
-def block_bytes(x: np.ndarray) -> np.ndarray:
+def block_bytes(x: np.ndarray | torch.Tensor) -> np.ndarray:
     """float (..., 8) -> bfp16ebs8 blocks (..., 9) uint8 [E, m0 .. m7] (``blocks``)."""
-    e, m = blocks(x)
-    return np.concatenate([e[..., None], m.view(np.uint8)], axis=-1)
+    e, m = _blocks(x)
+    out = torch.empty((*e.shape, 9), dtype=torch.uint8)
+    out[..., 0] = e
+    out[..., 1:] = m.view(torch.uint8)
+    return out.numpy()
 
 
 def block_values(b: np.ndarray) -> np.ndarray:

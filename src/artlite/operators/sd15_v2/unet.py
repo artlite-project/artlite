@@ -8,6 +8,7 @@ DDR tensors per band (``DTensor``: the ``*_bands`` blocks run band by band, a ba
 by diffusers name (``w[p + ...]``).
 """
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -57,10 +58,16 @@ def free(bd: Builder, t: Tensor) -> None:
     bd.mem.release(t.addr, t.size or t.nbytes)
 
 
+@functools.cache
+def _silu() -> np.ndarray:
+    return np.asarray(act_lut.SILU.table_buffer()).view(np.uint8)
+
+
 def silu_table(bd: Builder) -> None:
-    bd.table("silu", np.asarray(act_lut.SILU.table_buffer()).view(np.uint8), rows=D.APPLY_ROWS)
+    bd.table("silu", _silu(), rows=D.APPLY_ROWS)
 
 
+@functools.cache
 def gelu_table() -> np.ndarray:
     """act_lut.GELU's table for the GEGLU epilogue's table pass (the SiLU table's form, fed t' = 2 t: its segment index
     and remainder exactly 2x GELU's, so c1 / 2, c2 / 4; each copy padded to SiLU's words)."""

@@ -19,10 +19,7 @@ from . import design as D
 PANEL = 72
 
 
-def blocks(x: np.ndarray) -> np.ndarray:
-    """float (..., 8) -> bfp16ebs8 bytes (..., 9) [E, m0..m7] (round to nearest even)."""
-    e, m = _bfp16.blocks(x)
-    return np.concatenate([e[..., None], m.view(np.uint8)], axis=-1)
+blocks = _bfp16.block_bytes  # float (..., 8) -> bfp16ebs8 bytes (..., 9) [E, m0..m7] (round to nearest even)
 
 
 def unblocks(b: np.ndarray) -> np.ndarray:
@@ -39,7 +36,7 @@ def ct_bytes(m: int) -> int:
 def panels(x: torch.Tensor) -> np.ndarray:
     """(tokens, C) -> the panel layout [C / 8][tokens / 8][8][9] (bytes)."""
     t, c = x.shape
-    return blocks(np.ascontiguousarray(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3).numpy())).reshape(-1)
+    return blocks(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3)).reshape(-1)
 
 
 def from_panels(b: np.ndarray, tokens: int, c: int) -> torch.Tensor:
@@ -51,7 +48,7 @@ def vt_panels(x: torch.Tensor) -> np.ndarray:
     """(tokens, C) -> panels of the transposes [C / 8][tokens / 8][8 channels][8 tokens] (bytes; the exponent per
     channel)."""
     t, c = x.shape
-    return blocks(np.ascontiguousarray(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 3, 1).numpy())).reshape(-1)
+    return blocks(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 3, 1)).reshape(-1)
 
 
 def from_vt_panels(b: np.ndarray, tokens: int, c: int) -> torch.Tensor:
@@ -84,7 +81,7 @@ def gemm_weights(w: torch.Tensor, row: int, npass: int) -> np.ndarray:
     ws = torch.zeros(npass * 80, nkt * D.KT)
     ws[:, :k] = w[row * npass * 80:(row + 1) * npass * 80].float()
     t = ws.reshape(npass, 5, 2, 8, nkt, 8, 8).permute(0, 4, 1, 5, 2, 3, 6)  # p kt j s h n k
-    return blocks(np.ascontiguousarray(t.numpy())).reshape(-1)
+    return blocks(t).reshape(-1)
 
 
 def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
@@ -105,6 +102,6 @@ def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
         vv = torch.cat([va.reshape(2, 8, ng, -1, 8), vb.reshape(2, 8, ng, -1, 8)], 3)
     else:
         vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
-    kb_ = blocks(np.ascontiguousarray(kk.numpy())).reshape(2, 8, ng, -1)
-    vb_ = blocks(np.ascontiguousarray(vv.numpy())).reshape(2, 8, ng, -1)
+    kb_ = blocks(kk).reshape(2, 8, ng, -1)
+    vb_ = blocks(vv).reshape(2, 8, ng, -1)
     return np.concatenate([kb_, vb_], axis=-1).reshape(-1)
