@@ -206,10 +206,10 @@ class VImage:
             cols[c] = ColOps(drains=drains)
         bd.defer(cols, release=[(t.addr, t.size or t.nbytes)])
 
-    def fill(self, bd: Builder, lo: int, hi: int, p0: int, npos: int, c0: int, n: int) -> Tensor:
+    def fill(self, bd: Builder, lo: int, hi: int, p0: int, npos: int, c0: int, n: int) -> tuple[Tensor, dict]:
         """Channels [c0, c0 + n) of rows [lo, hi) of every column (rows past the column's: the west column's last, the
         east column's first; zeros past the image), positions [p0, p0 + npos) of each (wide; else the whole rows), as
-        memtile panels [kb][row][position] (an op of its fills)."""
+        memtile panels [kb][row][position]: the tensor and its fills (per column)."""
         R, nkb = self.lv.R, n // 8
         assert -1 <= lo and hi <= R + 1
         bd.reading(self.name)  # (first: the deferred drains pushed, their bytes released)
@@ -233,8 +233,7 @@ class VImage:
             a, z = max(lo, 0), min(hi, R)
             fills.append(task(a - lo, z - a, col + 4 * a * rp, rp, kbs))
             cols[c] = ColOps(fills=fills)
-        bd.op(cols, {})
-        return x
+        return x, cols
 
     def fill_bytes(self, n: int) -> int:
         """Memtile bytes of a band's conv input of n channels (``rows``)."""
@@ -243,20 +242,20 @@ class VImage:
             return n // 8 * 3 * 2 * (lv.Lg // 2 + 4) * L.PANEL
         return n // 8 * (lv.R // lv.nb + 2) * self.rowp * L.PANEL
 
-    def rows(self, bd: Builder, b: int, c0: int = 0, n: int | None = None) -> tuple[Tensor, dict]:
+    def rows(self, bd: Builder, b: int, c0: int = 0, n: int | None = None) -> tuple[Tensor, dict, dict]:
         """Band b's conv input (channels [c0, c0 + n)): its rows and the halo rows (wide: the half row's window of
-        Lg / 2 + 4 positions); returns it with its Gemm keywords."""
+        Lg / 2 + 4 positions); returns it with its Gemm keywords and its fills."""
         n, lv = n or self.C - c0, self.lv
         if kind(lv) == "wide":
             r, h = divmod(b, 2)
             npos = lv.Lg // 2 + 4
-            x = self.fill(bd, r - 1, r + 2, h * lv.Lg // 2, npos, c0, n)
-            return x, {"Lg": 4, "rc": 3, "r0": 1, "wide": "fm" if h == 0 else "ml", "wpos": npos}
+            x, cols = self.fill(bd, r - 1, r + 2, h * lv.Lg // 2, npos, c0, n)
+            return x, {"Lg": 4, "rc": 3, "r0": 1, "wide": "fm" if h == 0 else "ml", "wpos": npos}, cols
         rb = lv.R // lv.nb
-        x = self.fill(bd, rb * b - 1, rb * b + rb + 1, 0, self.rowp // 2, c0, n)
+        x, cols = self.fill(bd, rb * b - 1, rb * b + rb + 1, 0, self.rowp // 2, c0, n)
         if kind(lv) == "il":
-            return x, {"Lg": 8, "rc": rb + 2, "r0": 1, "il": True}
-        return x, {"Lg": 4, "rc": rb + 2, "r0": 1}
+            return x, {"Lg": 8, "rc": rb + 2, "r0": 1, "il": True}, cols
+        return x, {"Lg": 4, "rc": rb + 2, "r0": 1}, cols
 
 
 def image_bytes(img: VImage, x: torch.Tensor) -> np.ndarray:
@@ -274,10 +273,22 @@ def write(bd: Builder, img: VImage, x: torch.Tensor) -> None:
     bd.v2.write(img.name, image_bytes(img, x))
 
 
-def load(bd: Builder, x: DTensor, b: int) -> Tensor:
-    """Band b of x in the memtile, allocated after the pending drains (the previous layer's last band) are pushed."""
+def fetch(bd: Builder, x: DTensor, b: int) -> tuple[Tensor, dict]:
+    """Band b of x in the memtile (allocated after the pending drains of an image written since the last sync are
+    pushed): the tensor and its fills (per column), for an op of their own or merged into the op before its use."""
     bd.reading(x.band(b))
-    return x.load(bd, b)
+    t = alloc(bd, x.lv, x.C, x.kind)
+    base = bd.v2.address(x.band(b))
+    t.rec = x.rec
+    return t, {c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}], ddr=(base + c * x.nbytes, t.nbytes,
+                                                                                         None))]) for c in range(COLS)}
+
+
+def load(bd: Builder, x: DTensor, b: int) -> Tensor:
+    """Band b of x in the memtile (an op of its fills)."""
+    t, cols = fetch(bd, x, b)
+    bd.op(cols, {})
+    return t
 
 
 def stf(b: int, nb: int) -> int:
@@ -285,45 +296,52 @@ def stf(b: int, nb: int) -> int:
     return (K.ST_KEEP if b else 0) | (K.ST_HOLD if b < nb - 1 else 0)
 
 
-def conv(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None, *, ch: Chans, name: str, band: int,
-         out: Tensor | None = None, res: DTensor | None = None, c0: int = 0, rec: int = 0) -> Tensor:
-    """A 3x3 conv (padding 1) of img's channels [c0, c0 + K) (w: (P, K, 3, 3), its output rows stored as ``ch``: the
-    same tensor for a layer's bands) for band ``band`` into out's C tiles, + out (partial sums); none: new ones, or
-    res's band (+ res), allocated after the input's fills (which take the drains pending: their bytes released first);
-    rec: GroupNorm records of the output there (one over the layer's bands: ``stf``); returns out."""
-    lv = img.lv
-    x, kw = img.rows(bd, band, c0, w.shape[1])
-    acc = out is not None
-    if res is not None and not acc:
-        out = load(bd, res, band)
-    out = out or alloc(bd, lv, ch.P)
-    g = dict(m=64, ntile=lv.ntile, K=w.shape[1], N=ch.P, x=x.addr, y=out.addr, out="bf16", conv=1, R=1, zero=bd.zero,
-             x_np=x.np, joined=True, res=out.addr if acc or res is not None else None, ch_step=ch.stride,
-             ch_real=ch.per, tsplit=4 // ch.slices, **kw)
+def prefetch(bd: Builder, get: Callable[[], tuple]) -> tuple | None:
+    """get()'s tensors and fills where the memtile holds them beside the current op's (None: it does not)."""
+    free_before = list(bd.mem.free)
+    try:
+        return get()
+    except MemoryError:
+        bd.mem.free = free_before
+        return None
+
+
+def conv(bd: Builder, x: Tensor, kw: dict, w: torch.Tensor, b: torch.Tensor | None, *, ch: Chans, name: str,
+         band: int, nb: int, out: Tensor, acc: bool = False, rec: int = 0, extra: dict | None = None) -> None:
+    """A 3x3 conv (padding 1) of the input rows x (``VImage.rows``: their Gemm keywords kw; w: (P, K, 3, 3), its output
+    rows stored as ``ch``: the same tensor for a layer's bands) for band ``band`` of nb into out's C tiles (acc: + out,
+    a residual or the partial sums); rec: GroupNorm records of the output there (one over the layer's bands:
+    ``stf``); extra: fills merged into its op (the next band's inputs)."""
+    g = dict(m=64, ntile=x.lv.ntile, K=w.shape[1], N=ch.P, x=x.addr, y=out.addr, out="bf16", conv=1, R=1, zero=bd.zero,
+             x_np=x.np, joined=True, res=out.addr if acc else None, ch_step=ch.stride, ch_real=ch.per,
+             tsplit=4 // ch.slices, **kw)
     if rec:
-        g.update(stats="gn", rec=rec, gsize=ch.gsize, stf=stf(band, lv.nb))
-    bd.gemm(Gemm(**g), w, b, name=f"{name}.{kw.get('wide', '')}{g.get('stf', '')}", wname=f"{name}.w")
-    free(bd, x)
-    return out
+        g.update(stats="gn", rec=rec, gsize=ch.gsize, stf=stf(band, nb))
+    bd.gemm(Gemm(**g), w, b, name=f"{name}.{kw.get('wide', '')}{g.get('stf', '')}", wname=f"{name}.w", extra=extra)
 
 
 def norm(bd: Builder, x: DTensor, gamma: torch.Tensor, beta: torch.Tensor, *, ch: Chans, name: str, eps: float,
          silu: bool = True) -> VImage:
     """GroupNorm (+ SiLU) of x (its stored channels ``ch``, its records) into a VImage of the real channels, band by
     band: an apply on every core row (one slice each: a record window), the halves' statistics joined (gamma, beta:
-    the real channels')."""
+    the real channels'); the next band's load merged into an apply where the memtile holds both."""
     lv = x.lv
     img = VImage(ch.C, name, lv)
     g, bt = ch.pad(gamma), ch.pad(beta)
+    def inputs(b: int) -> tuple:  # (band b's input, its fills, its output)
+        xb, cols = fetch(bd, x, b)
+        return xb, cols, alloc(bd, lv, ch.P, "pn")
+    nxt = None
     for b in range(lv.nb):
-        xb = load(bd, x, b)
+        xb, _, t = nxt if nxt else (load(bd, x, b), None, None)
+        t = t or alloc(bd, lv, ch.P, "pn")
         if silu:
             bd.table("silu", _silu(), rows=APPLY_ROWS)
-        t = alloc(bd, lv, ch.P, "pn")
+        nxt = prefetch(bd, lambda b=b: inputs(b + 1)) if b + 1 < lv.nb else None
         ap = Apply(m=64, nblk=ch.pslice // 80, mode="gnsilu" if silu else "gn", x=xb.addr, y=t.addr, ntile=lv.ntile,
                    y_np=t.np, gsize=ch.gsize, ch_step=ch.stride, tokens=lv.H ** 2, eps=eps, rows=APPLY_ROWS[:ch.slices],
                    join=True, nreal=ch.per)
-        bd.apply(ap, g, bt, name=name + ".a", records=xb.rec)
+        bd.apply(ap, g, bt, name=name + ".a", records=xb.rec, extra=nxt[1] if nxt else None)
         free(bd, xb)
         img.store(bd, b, t, ch)
     return img
@@ -340,7 +358,8 @@ def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None
                res: DTensor | None = None, stats: bool = True) -> DTensor:
     """A 3x3 conv of every band of img (w, b: the real channels' (N, K, 3, 3), (N,); + res: its band in place) -> a
     DTensor of the stored channels ``ch`` with records for its norm. K in parts where a band's input and output do not
-    fit the memtile together (the partial sums in the output's C tiles)."""
+    fit the memtile together (the partial sums in the output's C tiles); a conv's op takes the next one's input rows
+    (and residual) where the memtile holds them too."""
     lv = img.lv
     K = w.shape[1]
     kp = K
@@ -351,12 +370,33 @@ def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None
     parts = [(c0, wp[:, c0:c0 + kp]) for c0 in range(0, K, kp)]
     out = DTensor(lv, ch.P, name, rec=[])
     rec = bd.mem.alloc(4 * D.OCH, top=True) if stats else 0
-    for band in range(lv.nb):
-        o = None
-        for k, (c0, wk) in enumerate(parts):
-            o = conv(bd, img, wk, bp if k == 0 else None, ch=ch, name=f"{name}.k{k}", band=band, out=o,
-                     res=res if k == 0 else None, c0=c0, rec=rec if k == len(parts) - 1 else 0)
-        out.store(bd, band, o)
+    steps = [(band, k) for band in range(lv.nb) for k in range(len(parts))]
+
+    def inputs(i: int, out: bool) -> tuple:  # (step i's input rows, their Gemm keywords, where ``out`` its output
+        # (part 0: its residual band, or a new one), the fills)
+        band, k = steps[i]
+        x, kw, cols = img.rows(bd, band, parts[k][0], kp)
+        if not out or k:
+            return x, kw, None, cols
+        if res is None:
+            return x, kw, alloc(bd, lv, ch.P), cols
+        r, rc = fetch(bd, res, band)
+        return x, kw, r, bd.merge(cols, rc)
+    nxt, o = None, None
+    for i, (band, k) in enumerate(steps):
+        if nxt is None:  # (its op takes the drains pending: their bytes released before the output's allocation)
+            nxt = inputs(i, False)
+            bd.op(nxt[3], {})
+        x, kw, r, _ = nxt
+        if k == 0:
+            o = r or (load(bd, res, band) if res is not None else alloc(bd, lv, ch.P))
+        nxt = prefetch(bd, lambda i=i: inputs(i + 1, True)) if i + 1 < len(steps) else None
+        last = k == len(parts) - 1
+        conv(bd, x, kw, parts[k][1], bp if k == 0 else None, ch=ch, name=f"{name}.k{k}", band=band, nb=lv.nb, out=o,
+             acc=bool(k) or res is not None, rec=rec if last else 0, extra=nxt[3] if nxt else None)
+        free(bd, x)
+        if last:
+            out.store(bd, band, o)
     if stats:
         out.rec = records(bd, rec, ch=ch, name=name + ".rec")
     return out
@@ -477,8 +517,16 @@ def conv_out(bd: Builder, w: dict, x: DTensor, *, C: int, eps: float, name: str)
     lv, ct = x.lv, L.ct_bytes(64)
     base = bd.ddr(name, lv.nb * COLS * OUTB)
     bd.written(name)
+    nxt = None
     for band in range(lv.nb):
-        cb = conv(bd, img, wp, bp, ch=ch, name=name + ".c", band=band)
+        if nxt is None:
+            nxt = img.rows(bd, band)
+            bd.op(nxt[2], {})
+        x, kw, _, cb = (*nxt, None) if len(nxt) == 3 else nxt
+        cb = cb or alloc(bd, lv, ch.P)
+        nxt = prefetch(bd, lambda band=band: (*img.rows(bd, band + 1), alloc(bd, lv, ch.P))) if band + 1 < lv.nb else None
+        conv(bd, x, kw, wp, bp, ch=ch, name=name + ".c", band=band, nb=lv.nb, out=cb, extra=nxt[2] if nxt else None)
+        free(bd, x)
         bd.defer({c: ColOps(drains=[MemTask([{"addr": cb.addr, "nwords": OUTB // 4, "dims": [(32, 1), (8, 320), (lv.ntile, ct // 4)]}],
                                             ddr=(base + (band * COLS + c) * OUTB, OUTB, None))]) for c in range(COLS)},
                  release=[(cb.addr, cb.size or cb.nbytes)])
