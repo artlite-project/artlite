@@ -236,7 +236,8 @@ Silent wrong results:
   lower (the low address bits dropped): its stores overwrite the 32 B before the buffer (sd15_v2's d-80 attention
   scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B boundaries.
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
-  array) reads garbage (NaN state). Open one stream at the array's start and pop in order.
+  array) reads garbage (NaN state), and so does a `seek` to such a position (a rewind by a panel count not a multiple
+  of 8: 5 panels, 360 B). Open one stream at the array's start and pop in order.
 - **Sub-byte and block-float pointer arithmetic**: loop-carried or large-offset `uint4*` advancement can return zeros
   or garbage, and `sizeof(bfp16ebs8)` is 9, `sizeof(uint4)` 1. Offset a `uint8_t *` and cast at the load or the stream
   constructor (`uint8_t[N*9]` for blocks). `aie::load_v<N>(uint4*)` + `.unpack()` yields linear nibble order (lane
