@@ -6,9 +6,8 @@ k-tiles of the column's panels, d3 over the k-tiles; with a residual a chained B
 receives (per tile the passes' outputs: bfp16 panels scattered into a panel tensor [kb][token panel], or bf16 C-tile
 objects; statistics records into ``rec``).
 
-``Apply``: GroupNorm (+ SiLU) / LayerNorm of a bf16 C-tile tensor into panels: the i-th core of its rows
-(``design.APPLY_ROWS``) normalizes the 80-channel blocks [blk0 + i nblk, ..) for the column's
-tokens.
+``Apply``: GroupNorm (+ SiLU) / LayerNorm of a bf16 C-tile tensor into panels: the i-th core of its rows normalizes
+the 80-channel blocks [blk0 + i nblk, ..) for the column's tokens.
 
 ``Attention``: 8 heads of d 160 (16x16, 8x8): the queries of a column's tokens against the keys of their image (K / V^T
 slots in DDR, written by ``Attention.kv_drains``, on the B streams of the attention rows).
@@ -26,7 +25,7 @@ import torch
 from ml_dtypes import bfloat16
 
 from ... import txn
-from ..design import COLS
+from ..design import COLS, ROWS
 from . import core as K
 from . import design as D
 from . import layout as L
@@ -575,7 +574,8 @@ class Gemm:
         wb = self.npo * self.nkt * D.Q
         runs = [(img, D.Q + wb)] + [(img + D.Q, wb)] * (self.nt - 1 if wb else 0) if wimg is None else \
             [(img, D.Q)] + [(wimg, wb)] * self.nt
-        return RowOps(runs=runs, b_objects=1 + self.nt * self.npo * self.nkt, parity=self.m == 64 and self.nkt > 0)
+        return RowOps(runs=runs, b_objects=1 + self.nt * self.npo * self.nkt, parity=self.m == 64 and self.nkt > 0,
+                      role="ln" if self.out == "geglu" else None)  # (the GEGLU epilogue: page ln's)
 
 
 @dataclass
@@ -585,7 +585,7 @@ class Apply:
     i-th core's first channel: ``y_kb0`` + 10 i nblk). GroupNorm: groups of ``gsize`` channels, the i-th core's first
     channel ``ch_off`` + 80 i nblk in their space (its groups in one record window: ``gn_window``); the records come on
     the B stream (``row_ops(records=)``). LayerNorm: the producer's records at ``rec`` ([tile][core][OCH]); ``C``: the
-    norm's channels (1 / C). rows: its core rows (role b); join: the two images are one image's halves (their records'
+    norm's channels (1 / C). rows: its core rows (roles gn / ln); join: the two images are one image's halves (their records'
     sums added); ch_step: a core's channels in the statistics' space (default nblk 80), nreal: its real ones (the rest
     pads, in their last group)."""
 
@@ -604,7 +604,7 @@ class Apply:
     tokens: int = 0  # (GroupNorm: tokens of an image)
     C: int = 0
     eps: float = 1e-5
-    rows: tuple[int, ...] = D.APPLY_ROWS
+    rows: tuple[int, ...] = tuple(range(ROWS))
     join: bool = False
     ch_step: int = 0
     nreal: int = 0
@@ -682,7 +682,7 @@ class Apply:
         record slots after them (``core.REC_SLOT`` records each, the last one's rest anything). (Only the op's ``rows``
         have a B stream.)"""
         runs = [(img, 2 * D.Q)] + list(records)
-        return RowOps(runs=runs, b_objects=2 + nslots, parity=False, role="b")
+        return RowOps(runs=runs, b_objects=2 + nslots, parity=False, role="ln" if self.mode == "ln" else "gn")
 
 
 @dataclass
@@ -705,7 +705,7 @@ class Attention:
     d: int = 160
     nbands: int = 1
     tile: int = 0
-    rows: tuple[int, ...] = D.ATTN_ROWS
+    rows: tuple[int, ...] = tuple(range(ROWS))
 
     def __post_init__(self) -> None:
         assert self.d in (40, 80, 160) and len(self.rows) in (2, 4)

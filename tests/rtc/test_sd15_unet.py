@@ -140,13 +140,14 @@ def images(m: int) -> torch.Tensor:
     return (torch.arange(m // 8).repeat_interleave(8) % 2).repeat(COLS)
 
 
-@pytest.mark.parametrize("mode, m, C, ntile", [("gnsilu", 64, 1280, 1), ("gn", 64, 640, 1), ("gnsilu", 16, 1280, 1),
-                                              ("ln", 64, 1280, 1), ("ln", 16, 320, 1), ("gnsilu", 64, 640, 2), ("gnsilu", 64, 320, 4),
-                                              ("gn", 64, 640, 2), ("ln", 64, 640, 2), ("ln", 64, 320, 4)])
-def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int) -> None:
+@pytest.mark.parametrize("mode, m, C, ntile, nrows", [
+    ("gnsilu", 64, 1280, 1, 4), ("gn", 64, 640, 1, 4), ("gnsilu", 16, 1280, 1, 4), ("ln", 64, 1280, 1, 4),
+    ("ln", 16, 320, 1, 4), ("gnsilu", 64, 640, 2, 4), ("gnsilu", 64, 320, 4, 4), ("gn", 64, 640, 2, 4),
+    ("ln", 64, 640, 2, 4), ("ln", 64, 320, 4, 4), ("gnsilu", 64, 1280, 1, 2), ("ln", 64, 640, 2, 2)])
+def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int, nrows: int) -> None:
     """A GEMM's output with its statistics (GroupNorm group sums through DDR and the B streams, LayerNorm per-token sums
-    in the memtile) normalized by Apply into panels (ntile tiles of m per op): within 9e-3 of torch on the GEMM's bf16
-    output (bfp16 rounding of the result alone ~7.7e-3)."""
+    in the memtile) normalized by Apply on nrows core rows into panels (ntile tiles of m per op): within 9e-3 of torch
+    on the GEMM's bf16 output (bfp16 rounding of the result alone ~7.7e-3)."""
     torch.manual_seed(1)
     T, K_ = m * ntile, 320
     x = torch.randn(COLS * T, K_)
@@ -158,7 +159,8 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int) -> None:
     REC = Y + C // 80 * ntile * L.ct_bytes(m)
     Z = REC + 16 * D.OCH
     g = Gemm(m=m, ntile=ntile, K=K_, N=C, x=X, y=Y, out="bf16", stats="gn" if gn else "ln", rec=REC, gsize=C // 32)
-    a = Apply(m=m, nblk=C // 160, mode=mode, x=Y, y=Z, ntile=ntile, gsize=C // 32, rec=REC, tokens=COLS * T // 2, C=C)
+    a = Apply(m=m, nblk=C // (80 * nrows), mode=mode, x=Y, y=Z, ntile=ntile, gsize=C // 32, rec=REC,
+              tokens=COLS * T // 2, C=C, rows=tuple(range(4 - nrows, 4)))
     s = npu.seq()
     s.op(fills(npu, "x", [L.panels(x[c * T:(c + 1) * T]) for c in range(COLS)], X), {})
     s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, b))
@@ -210,8 +212,8 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int) -> None:
 def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int) -> None:
     """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
     panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
-    panels drained to DDR slots, the attention rows' B streams; rows 4: every core row, rows 2, 3 switched to role a;
-    d 40: a 64x64 band, the keys of 4 bands, role c on every row):
+    panels drained to DDR slots, the attention rows' B streams; rows 4: every core row; d 40: a 64x64 band, the keys of
+    4 bands, role c on every row):
     within 1.5e-2 of softmax attention on the bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys
     ~8e-3, the bfp16 output ~6e-3, vexp2)."""
     torch.manual_seed(3)
@@ -223,12 +225,11 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int) -> Non
     VA = KA + C // 8 * np_ * L.PANEL
     OA = VA + C // 8 * np_ * L.PANEL
     cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
-    ar = D.ATTN_ROWS if rows == 2 else tuple(range(ROWS))
+    ar = (0, 1) if rows == 2 else tuple(range(ROWS))
     at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb, rows=ar)
     npu.alloc("kv", at.kv_bytes())
     at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, rows=ar)
     s = npu.seq()
-    s.role(ar, at.role)
     for b in range(nb):
         s.op(merge(fills(npu, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
                    fills(npu, f"v{b}", [L.vt_panels(v[b, sl]) for sl in cols], VA)), {})
@@ -366,9 +367,8 @@ def test_cross_attention(npu: Sd15Device, np_: int, d: int, nb: int) -> None:
     cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
     npu.alloc("ckv", L.kv_slots(k, v, d=d).size)
     npu.write("ckv", L.kv_slots(k, v, d=d))
-    ar = tuple(range(ROWS)) if d == 40 else D.ATTN_ROWS
+    ar = tuple(range(ROWS))
     s = npu.seq()
-    s.role(ar, "c" if d == 40 else "a")
     s.op(fills(npu, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
     for t in range(1 if d == 40 else max(np_ // 8, 1)):
         at = Attention(np=np_, q=QA, o=OA, kv=npu.address("ckv"), nkeys=77, d=d, nbands=nb, tile=t, rows=ar)

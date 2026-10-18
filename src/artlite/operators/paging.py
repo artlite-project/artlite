@@ -24,7 +24,7 @@ calls page code only through the entry words, from resident code. Hazards and th
   16 KB: a page past it writes the tile's other registers and breaks the core;
 - page data: the core's data memory is the resident ELF's: ``link`` refuses a page whose functions need data the
   resident code does not have (constant or jump tables);
-- the stack: the deepest call of the core, page entries called from the resident caller, fits its stack_size.
+- the stack: the deepest call of the core, page entries called from their resident callers, fits its stack_size.
 
 Transports, how the packets reach the TileControl:
 
@@ -33,10 +33,12 @@ Transports, how the packets reach the TileControl:
   channel streams the slots into its own TileControl (``loop_flow``: a packet flow inside the tile's switchbox, one id
   on every core) while it sleeps in ``pg_self``. The sender of the stream (the host) knows which page each core needs.
   The TileControl takes ~2.4 B / cycle: two slots of 5760 B in ~4830 cycles, whatever the code in them;
-- memtile: the core's request (``pg_request``: a control packet from its stream port to its memtile's TileControl)
-  pushes a BD of the page's stream, stored in the memtile, on a memtile MM2S channel of its own: 86 cycles + ~0.39 us
-  per KB of code. A queue drops a push when full: a channel serves at most 4 cores, one request in flight each; a
-  queue shared with tasks that wait for the cores deadlocks.
+- memtile: the core's request (``pg_request`` with ``request``'s words: a control packet from its stream port to its
+  memtile's TileControl, ``request_flow``) pushes a BD of the page's stream, stored in the memtile (``Store``), on a
+  memtile MM2S channel of its own (``page_flow``): 86 cycles + ~0.39 us per KB of code. A queue drops a push when full:
+  a channel serves at most 4 cores, one request in flight each; a queue shared with tasks that wait for the cores
+  deadlocks. The store and its BDs are host-written (``Store.load``) after the design's configuration: again after
+  another hardware context ran (its configuration resets the BDs and may use the memtile).
 """
 
 import os
@@ -50,9 +52,11 @@ from aie.dialects._aie_enum_gen import WireBundle
 from aie.iron import PacketFlow
 from aie.iron.device import Tile
 
+from .. import txn
 from .base import JINJA_ENV, PEANO_DIR
 from .checks import CORE_FRAME, MAIN_INIT_FRAME, core_frames, stack_usage
 from .fused.ctrlpkt import _parity, packets
+from .kernel_source import MARK
 
 PM = 0x20000  # (a core tile's program memory, tile-local: the control packets' addresses)
 PM_BYTES = 0x4000
@@ -115,13 +119,22 @@ def _read(path: str) -> _Elf:
     return e
 
 
-def symbol(names: list[str], stem: str, local: str) -> str:
-    """The linked name of kernel name ``{p}_<local>`` (``kernel_source``: ``<stem>_<local>_<hash>``, in a mangled name
-    or alone)."""
-    pat = re.compile(rf"(?<![A-Za-z_]){re.escape(stem)}_{re.escape(local)}_[0-9a-f]{{8}}(?![0-9a-f])")
+def symbols(names: list[str], name: str) -> list[str]:
+    """The linked names of kernel name ``name`` (a placeholder name, ``{p}_<local>``: ``kernel_source`` links it as
+    ``<p without the mark>_<local>_<hash>``, in a mangled name or alone; a template's instances: several)."""
+    assert name.startswith(MARK), name
+    pat = re.compile(rf"(?<![A-Za-z_]){re.escape(name[len(MARK):])}_[0-9a-f]{{8}}(?![0-9a-f])")
     out = sorted({n for n in names if pat.search(n)})
+    if not out:
+        raise PagingError(f"{name}: no definition")
+    return out
+
+
+def symbol(names: list[str], name: str) -> str:
+    """The linked name of kernel name ``name`` (``symbols``: exactly one)."""
+    out = symbols(names, name)
     if len(out) != 1:
-        raise PagingError(f"{stem}_{local}: {len(out)} definitions ({', '.join(out)})")
+        raise PagingError(f"{name}: {len(out)} definitions ({', '.join(out)})")
     return out[0]
 
 
@@ -220,6 +233,111 @@ def loop_flow(tile: Tile, *, channel: int = 1, stream_id: int = LOOP_ID) -> Pack
                       name=f"pg_loop{tile.col}_{tile.row}")
 
 
+def page_flow(mem: Tile, core: Tile, *, channel: int, stream_id: int) -> PacketFlow:
+    """The memtile transport's route of a core's pages: its memtile's MM2S ``channel`` into its TileControl (the stored
+    streams carry ``stream_id``: one per core of the column)."""
+    return PacketFlow(stream_id, mem, core, src_channel=channel, dst_port=WireBundle.TileControl, keep_pkt_header=True,
+                      name=f"pg_page{core.col}_{core.row}")
+
+
+def request_flow(core: Tile, mem: Tile, *, stream_id: int) -> PacketFlow:
+    """The route of a core's page requests: its stream port into its memtile's TileControl."""
+    return PacketFlow(stream_id, core, mem, src_port=WireBundle.Core, src_channel=0, dst_port=WireBundle.TileControl,
+                      keep_pkt_header=True, name=f"pg_req{core.col}_{core.row}")
+
+
+def request(*, stream_id: int, channel: int) -> tuple[int, int]:
+    """``pg_request``'s first two words: the stream header of a core's request route (``request_flow``) and a control
+    header writing one word at its memtile MM2S ``channel``'s start queue (the third: the page BD's id)."""
+    return _parity(stream_id), _parity((txn.MEM_MM2S_CTRL + 8 * channel + 4) & 0xFFFFF)
+
+
+@dataclass(frozen=True)
+class Store:
+    """A column's page store (memtile transport): the page streams of ``pagers`` (one per core of the column that
+    pages, its ``stream_id`` its ``page_flow``'s) in the ``size`` memtile bytes from ``base`` (the design's reserved
+    buffer), a BD per (pager, page) from ``bd0`` in that order (BDs of ``channel``'s parity: even channels 0-23, odd
+    24-47)."""
+
+    base: int
+    size: int
+    channel: int
+    bd0: int
+    pagers: tuple[Pager, ...]
+
+    def __post_init__(self) -> None:
+        n = sum(len(p.pages) for p in self.pagers)
+        lo = 24 * (self.channel % 2)
+        if not (lo <= self.bd0 and self.bd0 + n <= lo + 24):
+            raise PagingError(f"BDs {self.bd0}..{self.bd0 + n - 1} are not of memtile channel {self.channel}'s parity")
+        if self.nbytes > self.size:
+            raise PagingError(f"the pages' streams ({self.nbytes} B) do not fit the store ({self.size} B)")
+
+    def bd(self, k: int, name: str) -> int:
+        """The BD of pager k's page ``name`` (``pg_request``'s third word)."""
+        return self.bd0 + sum(len(p.pages) for p in self.pagers[:k]) + list(self.pagers[k].pages).index(name)
+
+    def streams(self) -> list[np.ndarray]:
+        return [p.stream(n) for p in self.pagers for n in p.pages]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(4 * s.size for s in self.streams())
+
+    def load(self, t: txn.Txn, cols: range) -> None:
+        """The store's words and BDs written in columns ``cols`` (blockwrites)."""
+        words = np.concatenate(self.streams())
+        off = 0
+        bds = []
+        for s in self.streams():
+            bds.append(txn.mem_bd_words(addr=self.base + 4 * off, nwords=s.size))
+            off += s.size
+        for c in cols:
+            for i in range(0, words.size, 1024):
+                t.blockwrite(txn.tile_address(c, 1, self.base + 4 * i), [int(w) for w in words[i:i + 1024]])
+            for k, w in enumerate(bds):
+                t.mem_bd(c, self.bd0 + k, w)
+
+    def check(self, work_dir: str, cols: range) -> None:
+        """None of the store's BDs, its channel's registers or its bytes is in the design's configuration (aiecc's
+        CDO: ``cdo_writes``)."""
+        regs = cdo_writes(work_dir)
+        for c in cols:
+            mine = {txn.tile_address(c, 1, txn.MEM_BD0 + 32 * (self.bd0 + k) + 4 * i)
+                    for k in range(sum(len(p.pages) for p in self.pagers)) for i in range(8)}
+            mine |= {txn.tile_address(c, 1, txn.MEM_MM2S_CTRL + 8 * self.channel + i) for i in (0, 4)}
+            lo, hi = txn.tile_address(c, 1, self.base), txn.tile_address(c, 1, self.base + self.nbytes)
+            hit = sorted(mine & regs) + [a for a in regs if lo <= a < hi][:1]
+            if hit:
+                raise PagingError(f"the design configures {hex(hit[0])} (column {c}): the page store's")
+
+
+def cdo_writes(work_dir: str) -> set[int]:
+    """The register and memory addresses a compiled design's configuration writes (aiecc's CDO files: writes,
+    masked writes and block writes, 64-bit addresses)."""
+    out: set[int] = set()
+    prj = os.path.join(work_dir, "design.mlir.prj")
+    for name in ("main_aie_cdo_init.bin", "main_aie_cdo_enable.bin", "main_aie_cdo_elfs.bin"):
+        path = next((p for p in (os.path.join(prj, "cdo_main", name), os.path.join(prj, name)) if os.path.exists(p)), None)
+        if path is None:
+            raise PagingError(f"{work_dir}: no CDO {name}")
+        with open(path, "rb") as f:
+            b = f.read()
+        w = struct.unpack(f"<{len(b) // 4}I", b[:len(b) // 4 * 4])
+        i = 5  # (the header: its length, "CDO", the version, the length, the checksum)
+        while i < len(w):
+            api, n = w[i] & 0xFF, (w[i] >> 16) & 0xFF
+            i += 1
+            if n == 0xFF:
+                n, i = w[i], i + 1
+            p = w[i:i + n]
+            if api in (5, 7, 8):  # (block write, masked write, write: the address in two words)
+                a = p[0] << 32 | p[1]
+                out.update(a + 4 * k for k in range(n - 2 if api == 5 else 1))
+            i += n
+    return out
+
+
 _SRC = r"""
 {% if send is not none %}
 // (paging: ``artlite.operators.paging``) a page's slots, held by the core, out through its own MM2S into its
@@ -313,23 +431,28 @@ def _same_kernels(ref: _Elf, other: _Elf, end: int, where: str) -> None:
             raise PagingError(f"{where}: its data section {name} differs from the pages' core's")
 
 
-def link(work_dir: str, *, stem: str, pages: dict[str, tuple[str, ...]], pager: str, caller: str, root: str,
-         stack: int, cores: list[tuple[int, int]], state: int, wake: int, stream_id: int = LOOP_ID) -> Pager:
+def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls: dict[str, tuple[str, ...]],
+         roots: tuple[str, ...], stack: int, cores: list[tuple[int, int]], state: int, wake: int,
+         stream_id: int = LOOP_ID) -> Pager:
     """The pages of the cores ``cores`` (their resident code alike: checked) of a compiled design in ``work_dir``:
-    ``pages`` maps a page's name to its entries (kernel names ``{p}_<local>`` under ``stem``, the state's entry
-    words in order); ``pager``: the pager function's local name (``pg_self`` / ``pg_request``), ``caller``: the
-    resident function that calls the entries, ``root``: the core's kernel (its stack, ``stack`` bytes). Each page's
-    ELF is kept in the project directory (``page_<name>.elf``)."""
+    ``pages`` maps a page's name to its entries (the state's entry words in order); ``pager``: the pager function
+    (``pg_self`` / ``pg_request``), ``calls``: per resident function the entries it calls (through the state words),
+    ``roots``: the core's kernels (their stack, ``stack`` bytes). Names are kernel names (``{p}_<local>``: ``symbols``; a
+    caller or root may be a template). Each page's ELF is kept in the project directory (``page_<name>.elf``)."""
     prj = os.path.join(work_dir, "design.mlir.prj")
     c0, r0 = cores[0]
     ref_path = _core_elf(prj, c0, r0)
     ref = _read(ref_path)
     obj = _read(os.path.join(work_dir, "kernel.o"))
     names = [s[0] for s in obj.symbols if s[0]]
-    lname = {n: symbol(names, stem, n) for n in {pager, caller, root, *(e for es in pages.values() for e in es)}}
+    entries = {e for es in pages.values() for e in es}
+    if {e for es in calls.values() for e in es} - entries:
+        raise PagingError(f"calls of functions no page enters: {sorted({e for es in calls.values() for e in es} - entries)}")
+    lname = {n: symbol(names, n) for n in {pager, *entries}}
+    many = {n: symbols(names, n) for n in {*roots, *calls}}
     resident = {n for n, v, s, info, shn in ref.symbols if n and shn}
-    if lname[pager] not in resident or lname[caller] not in resident:
-        raise PagingError(f"the pager {pager} or the caller {caller} is not resident")
+    if lname[pager] not in resident or any(not set(many[n]) <= resident for n in calls):
+        raise PagingError(f"the pager {pager} or a caller of entries ({', '.join(calls)}) is not resident")
     entry_of = {n: shn for n, v, s, info, shn in obj.symbols if n and shn}
     sec_resident = {shn for n, v, s, info, shn in obj.symbols if n in resident and 0 < shn < len(obj.sections)}
     text = ref.section(".text")[4]
@@ -339,8 +462,9 @@ def link(work_dir: str, *, stem: str, pages: dict[str, tuple[str, ...]], pager: 
     for c, r in cores[1:]:
         _same_kernels(ref, _read(_core_elf(prj, c, r)), slot, f"core ({c}, {r})")
     check_pager(ref_path, pager=lname[pager], wake=wake)
-    usage = _stack(work_dir, lname[caller], [lname[e] for es in pages.values() for e in es])
-    need = usage.get(lname[root], 0) + core_frames(work_dir).get(f"{c0},{r0}", CORE_FRAME) + MAIN_INIT_FRAME
+    usage = _stack(work_dir, {c: {lname[e] for e in es} for n, es in calls.items() for c in many[n]})
+    need = max(usage.get(r, 0) for n in roots for r in many[n]) + \
+        core_frames(work_dir).get(f"{c0},{r0}", CORE_FRAME) + MAIN_INIT_FRAME
     if need > stack:
         raise PagingError(f"the core's deepest call with page entries needs {need} B of stack, the core has {stack}")
     with open(os.path.join(prj, f"ldScripts_main_core_{c0}_{r0}.ld.script")) as f:
@@ -386,12 +510,12 @@ def _size(e: _Elf, name: str) -> int:
     return next(s for n, v, s, info, shn in e.symbols if n == name and shn)
 
 
-def _stack(work_dir: str, caller: str, entries: list[str]) -> dict[str, int]:
-    """Each function's deepest stack (``checks.stack_usage``) with ``caller`` calling every page entry."""
+def _stack(work_dir: str, calls: dict[str, set[str]]) -> dict[str, int]:
+    """Each function's deepest stack (``checks.stack_usage``) with the resident functions calling page entries."""
     su = os.path.join(work_dir, "kernel.su")
     if not os.path.exists(su):
         return {}
-    return stack_usage(os.path.join(work_dir, "kernel.o"), su, calls={caller: set(entries)})
+    return stack_usage(os.path.join(work_dir, "kernel.o"), su, calls=calls)
 
 
 def _link_page(prj: str, obj: _Elf, own: set[int], script: str, slot: int, name: str, core: tuple[int, int]) -> str:

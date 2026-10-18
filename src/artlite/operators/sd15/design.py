@@ -9,8 +9,8 @@ Array roles (column c, core row r):
 - O: core (c, r) MM2S 0 -> memtile c S2MM r (``OCH`` chunks);
 - DDR: shim c MM2S 0 -> memtile c S2MM 4 (fills), memtile c MM2S 4 -> shim c S2MM 0 (drains);
 - the gate: memtile c MM2S 5 -> its own S2MM 5 (a static landing chain): the op handover's lock task (``seq``);
-- control packets: shim ``CTRL_SHIM`` MM2S 1 -> every core's TileControl port, packet id ``CTRL_ID[r]`` to row r's
-  cores (broadcast): role switches (``seq.Seq.role``).
+- pages: core (c, r) MM2S 1 -> its own TileControl (``paging.loop_flow``): a static chain over the two B slots streams
+  a page that came in the B stream into the core's program memory (``core``'s roles).
 Memtile channels and shim channels run host tasks only; the cores' channels are static chains (``layout``).
 
 Core L1 (pinned, ``L1``): the stack, the activation table, the C tile (m tokens x 80 channels, 8 x 8 sub-blocks
@@ -21,17 +21,17 @@ scratch buffer k in region 2 + k. An m-64 A object's k-tile j is in region 2 + j
 host's NOP commands, ``seq``) its k-tile i is in B slot (i + 1) % 2, so the MAC never reads A and B from one region.
 
 The cores' program (``core``): a C++ main reading commands from the B stream (lock intrinsics on the pinned core locks:
-0 / 1 A free / full, 2 / 3 B, 4 / 5 the output ring; 6 between an A slot's two BDs). What does not fit 16 KB of program
-memory together is split into roles (``core.ROLES``): the cores start in ``ROLE`` (rows 0, 1 attention, rows 2, 3 the
-applies), and a transaction switches rows between roles by control packets (``seq.Seq.role``): an op runs on rows in
-the role it needs (the applies on ``APPLY_ROWS``, cross-attention on ``ATTN_ROWS``, self-attention on every row).
+0 / 1 A free / full, 2 / 3 B, 4 / 5 the output ring; 6 between an A slot's two BDs; 7 / 8 a page's slots sent / done,
+9 the pager's wake). What does not fit 16 KB of program memory together is split into roles (``core.ROLES``), pages of
+code the cores load themselves (``paging``): the host puts a role's page into a row's B stream before the first op that
+needs it there (``seq``), so every row runs every role.
 """
 
 from typing import ClassVar
 
 import numpy as np
 import torch
-from aie.dialects._aie_enum_gen import DMAChannelDir, WireBundle
+from aie.dialects._aie_enum_gen import DMAChannelDir
 from aie.helpers.taplib import TensorAccessPattern as TAP
 from aie.iron import (
     Acquire,
@@ -41,8 +41,6 @@ from aie.iron import (
     Flow,
     Kernel,
     Lock,
-    PacketDest,
-    PacketFlow,
     Program,
     Release,
     Runtime,
@@ -53,6 +51,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ... import txn
+from .. import paging
 from ..base import ArgDirection, ArgSpec, ArtcOperator
 from ..design import COLS, ROWS
 from . import core
@@ -72,15 +71,11 @@ STACK = 1280
 HEAP = 510 * 1024  # memtile bytes for tensors
 GATE_SCRATCH = HEAP  # (memtile: the gate tasks' landing words)
 B_SHIM = (0, 2, 4, 6)
-CTRL_SHIM, CTRL_ID = 1, (1, 2, 3, 4)
-PM = 0x20000  # (a core tile's program memory)
-assert CTRL_SHIM not in B_SHIM
-ROLE = "aabb"  # (core row -> its main: "a" with attention, "b" with the applies: ``core``)
-ATTN_ROWS, APPLY_ROWS = (0, 1), (2, 3)
+L_SEND, L_DONE, L_WAKE = 7, 8, 9  # (core locks of the pages: ``paging``)
 # pinned L1 offsets (16 KB regions: 0 stack + tab + C's first half, 1 C's second half + out + ws, 2 and 3 the stream
 # buffers ``R23``: per region the A slots' halves, a B slot, a scratch buffer)
 L1 = {"tab": STACK, "c": 0x4000 - C_BYTES // 2, "out": 0x4000 + C_BYTES // 2, "ws": 0x4000 + C_BYTES // 2 + NO * OSL,
-      "r23": 0x8000, "ext": 0x4000 - C_BYTES // 2 - 64}  # (ext: the role's entry, ``core``)
+      "r23": 0x8000, "ext": 0x4000 - C_BYTES // 2 - 64}  # (ext: the pager's state words, ``core``)
 # (byte offsets in regions 2, 3: A slot k's first half at k A_OBJ / 2, its second half 16 KB on; B slot k and scratch
 # buffer k in region 2 + k)
 R23 = {"a0": 0, "a1": A_OBJ // 2, "b0": A_OBJ, "b1": 0x4000 + A_OBJ, "s0": A_OBJ + Q, "s1": 0x4000 + A_OBJ + Q}
@@ -130,7 +125,7 @@ class Sd15Design(ArtcOperator):
         def ty(n: int) -> type[np.ndarray]:
             return np.ndarray[(n // 4,), i32]
         sig = [ty(0x8000), ty(NO * OSL), ty(C_BYTES), ty(WS), ty(TABB), ty(16)]
-        k_main = {role: Kernel(f"{core.P}_main_{role}", "kernel.o", sig) for role in ("a", "b")}
+        k_main = Kernel(f"{core.P}_main", "kernel.o", sig)
         mems = [Tile(c, 1) for c in range(COLS)]
         shims = [Tile(c, 0) for c in range(COLS)]
         cores = [[Tile(c, r + 2) for r in range(ROWS)] for c in range(COLS)]
@@ -144,10 +139,8 @@ class Sd15Design(ArtcOperator):
         o = {(c, r): Flow(cores[c][r], mems[c], src_channel=0, dst_channel=r, name=f"sd15_o{c}_{r}")
              for c in range(COLS) for r in range(ROWS)}
         gate = [Flow(mems[c], mems[c], src_channel=5, dst_channel=5, name=f"sd15_gate{c}") for c in range(COLS)]
-        ctl = [PacketFlow(CTRL_ID[r], shims[CTRL_SHIM], cores[0][r], src_channel=1, dst_port=WireBundle.TileControl,
-                          extra_dsts=[PacketDest(cores[c][r], WireBundle.TileControl, 0) for c in range(1, COLS)],
-                          keep_pkt_header=True, name=f"sd15_ctl{r}") for r in range(ROWS)]
-        flows = d_in + d_out + b + list(a.values()) + list(o.values()) + gate + ctl
+        loops = [paging.loop_flow(cores[c][r]) for c in range(COLS) for r in range(ROWS)]
+        flows = d_in + d_out + b + list(a.values()) + list(o.values()) + gate + loops
         dmas, workers = [], []
         for c in range(COLS):  # (the gate tasks' words land in a scratch buffer: a static chain, no locks)
             gs = Buffer(type=ty(64), tile=mems[c], name=f"sd15_gs_{c}", address=GATE_SCRATCH)
@@ -167,6 +160,9 @@ class Sd15Design(ArtcOperator):
                 bf, bb = Lock(t, lock_id=2, init=2, name=f"sd15_bf_{c}_{r}"), Lock(t, lock_id=3, init=0, name=f"sd15_bb_{c}_{r}")
                 of, oo = Lock(t, lock_id=4, init=NO, name=f"sd15_of_{c}_{r}"), Lock(t, lock_id=5, init=0, name=f"sd15_oo_{c}_{r}")
                 ah = Lock(t, lock_id=6, init=0, name=f"sd15_ah_{c}_{r}")  # (an A slot's first half written)
+                ps = Lock(t, lock_id=L_SEND, init=0, name=f"sd15_ps_{c}_{r}")
+                pd = Lock(t, lock_id=L_DONE, init=0, name=f"sd15_pd_{c}_{r}")
+                Lock(t, lock_id=L_WAKE, init=0, name=f"sd15_pw_{c}_{r}")
                 dmas.append(TileDma(t, [
                     DmaChannel(DMAChannelDir.S2MM, a[c, r].endpoint(t),
                                [Bd(r23, tap=part(R23[n] + h * 0x4000, A_OBJ // 2), acquires=[Acquire(ah if h else af)],
@@ -176,12 +172,14 @@ class Sd15Design(ArtcOperator):
                     DmaChannel(DMAChannelDir.MM2S, o[c, r].endpoint(t),
                                [Bd(bufs["out"], tap=TAP((NO * OSL // 4,), k * OSL // 4, [OCH // 4], [1]),
                                    acquires=[Acquire(oo)], releases=[Release(of)]) for k in range(NO)]),
+                    DmaChannel(DMAChannelDir.MM2S, 1,  # (a page's slots, held by the core: ``paging.loop_flow``)
+                               [Bd(r23, tap=part(R23[n], Q), acquires=[Acquire(ps)], releases=[Release(pd)]) for n in ("b0", "b1")]),
                 ]))
 
                 def core_fn(rb, ou, cb, w, tb, ex, km):
                     km(rb, ou, cb, w, tb, ex)
                 workers.append(Worker(core_fn, [*(bufs[n] for n in ("r23", "out", "c", "ws", "tab", "ext")),
-                                                k_main[ROLE[r]]], tile=t, stack_size=STACK, while_true=False))
+                                                k_main], tile=t, stack_size=STACK, while_true=False))
         ty_arg = np.ndarray[(4096,), np.dtype[bfloat16]]
 
         def seq(X, Y):  # (the probe: awaited tasks on the memtile channels the transactions await; never run)

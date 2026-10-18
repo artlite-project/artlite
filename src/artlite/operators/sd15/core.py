@@ -1,10 +1,12 @@
 """The cores' program of sd15's design (``design``): a C++ main reading commands from the row's B stream. The main
-loop (``sd15_run``), GEMMs and convs are shared code; the other kinds are a role's code (``ROLES``: "a" attention of
-d 80 / 160, "b" the applies, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512; together they
-do not fit 16 KB of program memory): a core of role x starts at ``sd15_main_x``, which puts
-its role's entry (``sd15_ext_x``) into the ext word and enters ``sd15_run``. Each role's ELF holds the shared code first,
-at the same addresses in every role's (the role code is what only its main reaches, placed after it): a role switch
-rewrites the program memory from there and the ext word (``runtime.role_code``, ``seq.Seq.role``).
+loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
+d 80 / 160, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
+"ln" the LayerNorm apply and the GEGLU epilogue of the feed-forward GEMMs that follow it; together they do not fit 16 KB
+of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the pager's state
+words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second). A page arrives in the B stream
+(``runtime.Sd15Device``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
+core holds both slots, its MM2S 1 streams them into its own program memory while it sleeps in ``sd15_pg_self``, then it
+gives them back.
 
 A command is one B slot: the header words ``C_*`` and, from word ``C_BIAS``, the op's biases (bf16 [pass][80]); the
 core copies it into its workspace and releases the slot. Kinds:
@@ -23,7 +25,7 @@ core copies it into its workspace and releases the slot. Kinds:
   stride-2 conv's x, in 2 x 2 chunks), its bfp16 panels (m x 90 B,
   [rb][cb]), their transposes (V^T: [rb][cb] of [8 channels][8 tokens], the exponent per channel), or GEGLU (the
   pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) in ``OCH`` chunks (the last one padded);
-- ``K_APPLY`` (role b): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
+- ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
   stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
   beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
   image's halves, their sums added): the B slots after it C_NREC
@@ -47,7 +49,7 @@ import functools
 
 import numpy as np
 
-from .. import act_lut
+from .. import act_lut, paging
 from ..base import JINJA_ENV
 from ..gemm.mac import render_mac
 from ..kernel_source import kernel_prefix
@@ -76,16 +78,18 @@ A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "b", "c", "v")
+ROLES = ("a", "c", "v", "gn", "ln")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
 {{ macf }}
 {{ pvm }}
 
-struct {{ p }}_st {  // the static chains' positions (A ping-pong, B slots, output ring) and the scratch buffers
+struct {{ p }}_st {  // the static chains' positions (A ping-pong, B slots, output ring), the scratch buffers, the pager's
+  // state words (the loaded page's entries)
   int32_t *a0, *a1, *b0, *b1, *outr, *s0, *s1;
   int apar, bpos, opos;
+  const volatile int32_t *ext;
 };
 
 namespace {
@@ -466,7 +470,9 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
         {{ p }}_vt(cb, cb, nrb * 10);
         nbytes = m * 90;
       } else if (om == {{ O_GEGLU }}) {
-        {{ p }}_geglu(cb, cb, (bfloat16 *)s.s0, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);  // (scratch: no statistics in a GEGLU op)
+        // (page ln's second entry: ``seq``; scratch: no statistics in a GEGLU op)
+        ((void (*)(const int32_t *, int32_t *, bfloat16 *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[2])(
+            cb, cb, (bfloat16 *)s.s0, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
         nbytes = m * 45;
       }
       if (om == {{ O_DS }}) {  // (a stride-2 conv's tile: groups 0 and 2, row blocks 0, 1 and 4, 5)
@@ -1241,14 +1247,24 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn512({{ p }}_st &s, in
   }
 }
 
-// the cores' main loop (shared): commands from the B stream; GEMMs / convs and tables here, the other kinds by the role's
-// code through its entry in ext (a role switch rewrites it while the core waits for a command: ``seq.Seq.role``)
+{{ pager }}
+
+// the cores' main loop (resident): commands from the B stream; GEMMs / convs and tables here, the other kinds by the
+// role's page through its entry (ext[1]); a page (its first word the packets' header: ``paging``) into program memory
 __attribute__((noinline, minsize)) void {{ p }}_run(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
-                                                const int32_t *ext) {
+                                                const volatile int32_t *ext) {
   {{ p }}_st s{r23 + {{ R23.a0 // 4 }}, r23 + {{ R23.a1 // 4 }}, r23 + {{ R23.b0 // 4 }}, r23 + {{ R23.b1 // 4 }}, outr,
-          r23 + {{ R23.s0 // 4 }}, r23 + {{ R23.s1 // 4 }}, 0, 0, 0};
+          r23 + {{ R23.s0 // 4 }}, r23 + {{ R23.s1 // 4 }}, 0, 0, 0, ext};
   for (;;) {
     int32_t *b = {{ p }}_take_b(s);
+    if (b[0] == (int32_t){{ header }}u) {  // (its second slot: B slot 1; MM2S 1 sends both, then they are free)
+      acquire_greater_equal({{ p }}_L_BB, 1);
+      s.bpos = 0;
+      {{ p }}_pg_self();
+      acquire_greater_equal({{ lock_base + L_DONE }}, 2);
+      release({{ p }}_L_BF, 2);
+      continue;
+    }
     {{ p }}_copy8(b, ws, {{ WS // 4 }});
     {{ p }}_give_b(s, b);
     const int kind = ws[{{ C_KIND }}];
@@ -1259,41 +1275,39 @@ __attribute__((noinline, minsize)) void {{ p }}_run(int32_t *r23, int32_t *outr,
       {{ p }}_copy8(t, tab, {{ TAB // 4 }});
       {{ p }}_give_b(s, t);
     } else if (kind != {{ K_NOP }}) {
-      ((void (*)({{ p }}_st &, int32_t *, int32_t *, int32_t *))(intptr_t)*ext)(s, cb, ws, tab);
+      ((void (*)({{ p }}_st &, int32_t *, int32_t *, int32_t *))(intptr_t)ext[1])(s, cb, ws, tab);
     }
   }
 }
 
-// the roles' entries (after every shared definition)
-static __attribute__((noinline, minsize)) void {{ p }}_ext_a({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+// the roles' entries (pages: only the pager's state words reach them)
+__attribute__((noinline, minsize)) void {{ p }}_ext_a({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
   {{ p }}_attn(s, cb, ws);
 }
 
-static __attribute__((noinline, minsize)) void {{ p }}_ext_c({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+__attribute__((noinline, minsize)) void {{ p }}_ext_c({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   {{ p }}_attn40(s, cb, ws, tab);
 }
 
-static __attribute__((noinline, minsize)) void {{ p }}_ext_v({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+__attribute__((noinline, minsize)) void {{ p }}_ext_v({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
   {{ p }}_attn512(s, cb, ws);
 }
 
-static __attribute__((noinline, minsize)) void {{ p }}_ext_b({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
-  if (ws[{{ C_MODE }}] == {{ A_LN }})
-    {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
-  else
-    {{ p }}_apply_gn(s, cb, ws, (const uint32_t *)tab);
+__attribute__((noinline, minsize)) void {{ p }}_ext_gn({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  {{ p }}_apply_gn(s, cb, ws, (const uint32_t *)tab);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_ln({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
 }
 
 extern "C" {
 
-{% for role in roles %}
-// the start of a core of role {{ role }}
-__attribute__((noinline, minsize)) void {{ p }}_main_{{ role }}(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
-                                                          int32_t *ext) {
-  *ext = (int32_t)(intptr_t)&{{ p }}_ext_{{ role }};
+// the start of every core (its first command's role arrives as a page before it)
+__attribute__((noinline, minsize)) void {{ p }}_main(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
+                                                 int32_t *ext) {
   {{ p }}_run(r23, outr, cb, ws, tab, ext);
 }
-{% endfor %}
 
 }  // extern "C"
 """
@@ -1344,7 +1358,8 @@ def source(*, win: str = "") -> str:
     from . import design as d
     assert win in ("",) + WINS, win
     return JINJA_ENV.from_string(_SRC).render(
-        p=P, roles=ROLES, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
+        p=P, pager=paging.source(P, wake=d.L_WAKE, send=d.L_SEND), header=paging.header(), lock_base=paging.LOCK_BASE,
+        L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
         tabu=act_lut.SILU.render_unrolled(640), lut=act_lut.LUT,
         gelu_tmax=act_lut.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,

@@ -288,18 +288,17 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
   sub-block); a table activation (`act_lut`) instead of a polynomial chain: smaller and faster.
 - No runtime-library arithmetic (`checks.py` warns when a kernel calls it).
-- **Roles: code variants rewritten at run time** (a static design whose kernels do not fit 16 KB together, sd15):
-  every role's ELF holds the shared code (main loop, GEMMs) first, at the same addresses, and the role's code after
-  it (what only its entry reaches); the main loop calls role code through a pointer in data memory. A switch rewrites
-  that tail and the pointer by control packets: one packet flow per core row from a free shim MM2S channel to the
-  row's TileControl ports (a broadcast: one stream writes the 8 cores), while the cores wait for a command (above:
-  never into a running core). 16 cores x 5.9 KB: ~7 µs (blockwrites ~130 µs). `sd15.runtime.role_code` links
-  each role's ELF from a core's object (its main aliased in the linker script), `seq.Seq.role` switches.
-  A core can also page its own code, without the host: a 3-word control packet from its stream port (`put_ms`:
-  stream header, write of 1 word, value) to its memtile's TileControl pushes the page's BD on a memtile MM2S start
-  queue (0xA0634 for channel 0); the page's control packets end by setting a core lock the core waits on. 86 cycles
-  from request to the new code for a small page, + ~0.39 µs per KB of code (~2.15 B / cycle of packets: 4 data words
-  per 6). Call the page through a resident noinline function (aie2p-coding section 9: the acquire and the call).
+- **Pages: code the cores load themselves** (`operators/paging.py`, its docstring the hazards and their guards; sd15):
+  the resident code (aiecc's link of the core) and pages of what only a page's entries reach, each linked at the slot
+  (the resident end: `_main_init`, the crt's startup code, is linked last and the slot starts there) from a copy of
+  `kernel.o` with the page's sections renamed; `paging.link` checks the resident code and data against aiecc's on every
+  core, the page within 16 KB, no page data, no page reaching the pager, the stack with the entries. The core triggers a
+  page and sleeps on its wake lock in one resident function and enters page code through the pager's state words.
+  Self-DMA (sd15: the page in two B slots of its input stream, its MM2S 1 into its own TileControl): ~2.4 B / cycle of
+  slots, 2.7 µs for two 5760-B slots whatever the code; the host knows each row's role and puts the page before the op
+  that needs it. Memtile (the core's request packet pushes a page BD on a memtile MM2S channel of its own): 86 cycles
+  + ~0.39 µs per KB of code, at most 4 cores per channel. Put a rarely used epilogue in the page of the role that runs
+  before it (sd15's GEGLU in the LayerNorm page: 1.7 KB off the resident code).
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 
 Rejected size levers: rejected.md "Program memory".

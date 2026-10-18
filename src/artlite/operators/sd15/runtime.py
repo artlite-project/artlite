@@ -1,138 +1,27 @@
-"""sd15's design on the NPU (``Sd15Device``): its hardware context, DDR buffers, the roles' code (``role_code``), and
-dispatches of ``seq.Seq`` programs."""
+"""sd15's design on the NPU (``Sd15Device``): its hardware context, DDR buffers, the roles' pages (``paging``: one
+image of two B slots per role, the same for every core), and dispatches of ``seq.Seq`` programs."""
 
 import os
-import struct
-import subprocess
-from dataclasses import dataclass
 
 import numpy as np
 
-from ..base import PEANO_DIR
-from ..fused import ctrlpkt
-from ..kernel_source import MARK
+from .. import paging
+from ..design import COLS, ROWS
 from ..overlay.runtime import OverlayDevice, Transaction
 from . import core as K
 from . import design as D
 from .seq import Seq
 
 
-@dataclass(frozen=True)
-class Role:
-    """A role's code (``core.ROLES``): its program-memory words from byte ``start`` (the end of the shared code) and its
-    entry (the ext word's value)."""
-
-    start: int
-    words: np.ndarray
-    entry: int
-
-
-def _elf(path: str) -> tuple[dict[str, bytes], dict[str, int], dict[str, set[str]]]:
-    """An ELF32 file's sections, symbol values by name and, from .rela.text (a link with --emit-relocs), per function
-    the symbols its code refers to."""
-    with open(path, "rb") as f:
-        b = f.read()
-    shoff, = struct.unpack_from("<I", b, 0x20)
-    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x2E)
-    hdr = [struct.unpack_from("<IIIIIIIIII", b, shoff + i * shentsize) for i in range(shnum)]
-
-    def name(table: int, off: int) -> str:
-        o = hdr[table][4] + off
-        return b[o:b.index(b"\0", o)].decode()
-    secs = {name(shstrndx, h[0]): b[h[4]:h[4] + h[5]] for h in hdr}
-    syms, table, funcs = {}, [], []
-    for h in hdr:
-        if h[1] == 2:  # (SHT_SYMTAB: entries of 16 bytes, names in the section h[6] links)
-            for o in range(h[4], h[4] + h[5], 16):
-                st_name, st_value, st_size, st_info = struct.unpack_from("<IIIB", b, o)
-                nm = name(h[6], st_name) if st_name else ""
-                table.append(nm)
-                if nm:
-                    syms[nm] = st_value
-                    if st_info & 15 == 2:  # (STT_FUNC)
-                        funcs.append((st_value, st_value + st_size, nm))
-    refs: dict[str, set[str]] = {}
-    for h in hdr:
-        if h[1] == 4 and name(shstrndx, h[0]) == ".rela.text":  # (SHT_RELA: offset, info (symbol << 8 | type), addend)
-            for o in range(h[4], h[4] + h[5], 12):
-                off, info = struct.unpack_from("<II", b, o)
-                caller = next((f for lo, hi, f in funcs if lo <= off < hi), None)
-                if caller:
-                    refs.setdefault(caller, set()).add(table[info >> 8])
-    return secs, syms, refs
-
-
-def _stack_sizes(work_dir: str) -> dict[str, int]:
-    """The kernel's functions' stack bytes (clang's -fstack-usage: ``kernel.su``) by symbol."""
-    out = {}
-    with open(os.path.join(work_dir, "kernel.su")) as f:
-        for line in f:
-            loc, n, _ = line.rstrip("\n").split("\t")
-            out[loc.rsplit(":", 1)[-1]] = int(n)
-    return out
-
-
-def _depth(f: str, calls: dict[str, set[str]], su: dict[str, int], seen: tuple = ()) -> int:
-    """The deepest stack from function f down its calls."""
-    assert f not in seen, f"recursion through {f}"
-    return su.get(f, 0) + max((_depth(g, calls, su, seen + (f,)) for g in calls.get(f, ()) if g in su), default=0)
-
-
-def role_code(work_dir: str) -> dict[str, Role]:
-    """Each role's code, from its ELF: core (0, 2)'s link with that role's main in place of its own (an alias in the
-    core's linker script; ``role_<x>.r.elf`` in the design's project directory). The shared code and the data are
-    identical in every role's ELF (asserted: the switch rewrites neither); a role's stack (the main loop's, every
-    role function's and the largest shared function's: a bound, aiecc checks only the design's own ELFs) fits."""
-    prj = os.path.join(work_dir, "design.mlir.prj")
-    stem = K.P.removeprefix(MARK)  # (the linked names: <stem>_<name>_<hash>)
-    base = D.ROLE[0]
-    own = os.path.join(prj, "elfs_main_core_0_2", "elfs_main_core_0_2.elf")
-    mains = {r: next(n for n in _elf(own if r == base else os.path.join(work_dir, "kernel.o"))[1]
-                     if n.startswith(f"{stem}_main_{r}_")) for r in K.ROLES}
-    own = os.path.join(prj, "role_base.r.elf")  # (the base role's ELF again, with the relocations: its call graph)
-    elfs = {}
-    for r in K.ROLES:
-        path = own if r == base else os.path.join(prj, f"role_{r}.r.elf")
-        if not os.path.exists(path):
-            with open(os.path.join(prj, "ldScripts_main_core_0_2.ld.script")) as f:
-                script = f.read() + (f"\n{mains[base]} = {mains[r]};\n" if r != base else "")
-            tmp = f"{path}.{os.getpid()}"
-            with open(tmp + ".ld", "w") as f:
-                f.write(script)
-            subprocess.run([os.path.join(PEANO_DIR, "bin", "clang"), "-O2", "--target=aie2p-none-unknown-elf",
-                            "-fuse-ld=lld", os.path.join(prj, "objects_main_core_0_2", "objects_main_core_0_2.o"),
-                            "-Wl,--gc-sections", "-Wl,--emit-relocs", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld",
-                            "-o", tmp],
-                           check=True)
-            os.replace(tmp, path)
-            os.remove(tmp + ".ld")
-        elfs[r] = _elf(path)
-    start = {elfs[r][1][mains[r]] for r in K.ROLES}
-    assert len(start) == 1, f"the roles' shared code ends at {start}"
-    end = start.pop()
-    first = min(v for r in K.ROLES for n, v in elfs[r][1].items() if f"{stem}_" in n and v < end)  # (kernel.o's code)
-    ref = elfs[base][0]
-    su = _stack_sizes(work_dir)
-    run = next(n for n in su if f"{stem}_run_" in n)
-    out = {}
-    for r, (secs, syms, refs) in elfs.items():
-        assert secs[".text"][first:end] == ref[".text"][first:end] and secs[".data"] == ref[".data"], r
-        entry = next(n for n in syms if f"{stem}_ext_{r}_" in n)
-        calls = dict(refs)
-        calls[run] = calls.get(run, set()) | {entry}  # (the main loop calls the role's entry through ext)
-
-        stack = _depth(mains[r], calls, su)
-        assert stack <= D.STACK, f"role {r}: its code's stack reaches {stack} B (the cores': {D.STACK})"
-        code = secs[".text"][end:]
-        out[r] = Role(end, np.frombuffer(code + bytes(-len(code) % 4), np.uint32), syms[entry])
-    return out
-
-
-def role_packets(role: Role, row: int) -> np.ndarray:
-    """A switch of core row ``row`` to ``role``: control packets (packet id ``design.CTRL_ID[row]``, the row's cores)
-    of its code, then of the ext words (its entry, the marker 1: ``seq.Seq.role``)."""
-    return ctrlpkt.packets(D.CTRL_ID[row], [(D.PM + role.start, role.words),
-                                            (D.L1["ext"], np.array([role.entry, 1], np.uint32))])
+def role_pages(work_dir: str) -> paging.Pager:
+    """The roles' pages (``core.ROLES``, entries ``sd15_ext_<role>``, called from the main loop ``sd15_run``; "ln" also
+    ``sd15_geglu``, the GEMM's) of the compiled design in ``work_dir``, the same on every core."""
+    p = K.P
+    pages = {r: (f"{p}_ext_{r}",) + ((f"{p}_geglu",) if r == "ln" else ()) for r in K.ROLES}
+    return paging.link(work_dir, pages=pages, pager=f"{p}_pg_self",
+                       calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES), f"{p}_gemm": (f"{p}_geglu",)},
+                       roots=(f"{p}_main",), stack=D.STACK, cores=[(c, r + 2) for c in range(COLS) for r in range(ROWS)],
+                       state=D.L1["ext"], wake=D.L_WAKE)
 
 
 class Sd15Device:
@@ -147,18 +36,17 @@ class Sd15Device:
         self.dev = OverlayDevice(self.design)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
-        self.roles = role_code(os.path.dirname(self.dev._prog.insts_path))
+        self.pager = role_pages(os.path.dirname(self.dev._prog.insts_path))
         nop = np.zeros(D.Q // 4, np.int32)
         nop[K.C_KIND] = K.K_NOP
         self.alloc("_nop", D.Q)
         self.write("_nop", nop.view(np.uint8))
-        self.ctrl = {}
-        for role, code in self.roles.items():
-            for r in range(len(D.ROLE)):
-                pk = role_packets(code, r)
-                self.alloc(f"_role_{role}_{r}", pk.nbytes)
-                self.write(f"_role_{role}_{r}", pk)
-                self.ctrl[(role, r)] = (self.address(f"_role_{role}_{r}"), pk.nbytes)
+        self.pages = {}
+        for role in K.ROLES:
+            pg = self.pager.slots(role, words=D.Q // 4, n=2)
+            self.alloc(f"_page_{role}", pg.nbytes)
+            self.write(f"_page_{role}", pg)
+            self.pages[role] = self.address(f"_page_{role}")
 
     def has(self, name: str) -> bool:
         return name in self._images
@@ -212,7 +100,7 @@ class Sd15Device:
         return self.dev.address(chunk, off + offset)
 
     def seq(self) -> Seq:
-        return Seq(nop=self.address("_nop"), ctrl=self.ctrl)
+        return Seq(nop=self.address("_nop"), pages=self.pages)
 
     def transaction(self, seq: Seq) -> Transaction:
         return Transaction(self.dev, seq.finish())

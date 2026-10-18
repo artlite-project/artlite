@@ -177,10 +177,7 @@ class Builder:
     def op(self, cols: dict[int, ColOps], rows: dict[int, RowOps], *, barrier: bool = False, nolock: bool = False,
            sync: bool = False) -> int:
         """Push an op (``seq.Seq.op``) with the drains pending since the last op (``records``, ``defer``) merged into
-        its drains; sync: DDR synced after its memtile tasks, before its B runs (a GroupNorm apply reading them). Rows
-        whose role commands need another role are switched first (``seq.Seq.role``)."""
-        for role in sorted({ro.role for ro in rows.values() if ro.role}):
-            self.s.role(tuple(r for r, ro in rows.items() if ro.role == role), role)
+        its drains; sync: DDR synced after its memtile tasks, before its B runs (a GroupNorm apply reading them)."""
         for r, ro in rows.items():  # (role c's attention: its scores in the table buffer)
             if ro.role == "c":
                 self.tab[r] = None

@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from .. import act_lut
-from ..design import COLS
+from ..design import COLS, ROWS
 from . import design as D
 from . import layout as L
 from .build import Builder, Level, Records
@@ -64,7 +64,7 @@ def _silu() -> np.ndarray:
 
 
 def silu_table(bd: Builder) -> None:
-    bd.table("silu", _silu(), rows=D.APPLY_ROWS)
+    bd.table("silu", _silu())
 
 
 @functools.cache
@@ -82,31 +82,37 @@ def gelu_table() -> np.ndarray:
     return np.concatenate([w, w]).view(np.uint8)
 
 
+def gn_ops(lo: int, hi: int, win: int) -> list[tuple[int, int, tuple[int, ...]]]:
+    """The apply ops of GroupNorm channels [lo, hi) (record windows of ``win`` channels from 0): (first channel, blocks
+    of 80 per core, core rows). Each core's channels lie in one window: the range in equal parts, one per row, where
+    they do; else per window on as many rows as divide it."""
+    def parts(a: int, b: int, n: int) -> int:
+        q, r = divmod(b - a, n)
+        ok = not r and not q % 80 and q <= 640 and all((a + i * q) // win == (a + (i + 1) * q - 1) // win for i in range(n))
+        return q // 80 if ok else 0
+    if nblk := parts(lo, hi, ROWS):
+        return [(lo, nblk, tuple(range(ROWS)))]
+    out = []
+    for a in range(lo // win * win, hi, win):
+        a0, a1 = max(a, lo), min(a + win, hi)
+        n = max(n for n in range(1, ROWS + 1) if parts(a0, a1, n))
+        out.append((a0, parts(a0, a1, n), tuple(range(n))))
+    return out
+
+
 def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, eps: float,
              silu: bool, y_kb0: int = 0, ch0: int = 0, ccat: int = 0, extra: dict | None = None) -> None:
     """GroupNorm (32 groups, + SiLU) of x into the panels y (from kb y_kb0). x may be the part [ch0, ch0 + x.C) of a
-    concatenation of ccat channels (its records in that space; gamma, beta: the part's). Ops of the apply rows' two
-    cores, each within one record window: a window per core, or a window's halves (extra: col ops merged into the
-    first)."""
+    concatenation of ccat channels (its records in that space; gamma, beta: the part's). Ops of every core row, each
+    core within one record window (``gn_ops``; extra: col ops merged into the first)."""
     C = ccat or x.C
     gs = C // 32
-    win = 16 * gs
-    lo, hi = ch0, ch0 + x.C
-    pieces = []
-    for a in range(lo // win * win, hi, win):
-        pieces.append((max(a, lo), min(a + win, hi)))
-    sizes = {b - a for a, b in pieces}
-    if len(pieces) == 2 and len(sizes) == 1 and sizes.pop() <= 640:
-        ops = [(pieces[0][0], (pieces[0][1] - pieces[0][0]) // 80)]  # (a core per window)
-    else:
-        ops = [(a, (b - a) // 160) for a, b in pieces]  # (a window's halves)
-        assert all(2 * n * 80 == b - a and n * 80 <= 640 for (a, b), (_, n) in zip(pieces, ops, strict=True)), pieces
     if silu:
         silu_table(bd)
-    for k, (a, nblk) in enumerate(ops):
+    for k, (a, nblk, rows) in enumerate(gn_ops(ch0, ch0 + x.C, 16 * gs)):
         ap = Apply(m=x.lv.m, nblk=nblk, mode="gnsilu" if silu else "gn", x=x.addr, y=y.addr, ntile=x.lv.ntile,
                    blk0=(a - ch0) // 80, y_kb0=y_kb0 + (a - ch0) // 8, y_np=y.np, gsize=gs, ch_off=a,
-                   tokens=x.lv.H ** 2, eps=eps)
+                   tokens=x.lv.H ** 2, eps=eps, rows=rows)
         bd.apply(ap, gamma, beta, name=f"{name}.{k}", records=x.rec, extra=extra if k == 0 else None)
 
 
@@ -213,25 +219,23 @@ def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: tor
 
 
 LOG2E = 1.4426950408889634
-SELF_ROWS, CROSS_ROWS = (0, 1, 2, 3), D.ATTN_ROWS  # (the core rows of self- / cross-attention: rows 2, 3 switched to
-# role a; d 40 (role c): every row)
 
 
 def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
-    """LayerNorm of the C tiles h (records at rec: its producer's) into the panels y; frees rec."""
-    a = Apply(m=h.lv.m, nblk=h.C // 160, mode="ln", x=h.addr, y=y.addr, ntile=h.lv.ntile, rec=rec, C=h.C, y_np=y.np)
+    """LayerNorm of the C tiles h (records at rec: its producer's) into the panels y on every core row; frees rec."""
+    a = Apply(m=h.lv.m, nblk=h.C // (80 * ROWS), mode="ln", x=h.addr, y=y.addr, ntile=h.lv.ntile, rec=rec, C=h.C,
+              y_np=y.np)
     bd.apply(a, gamma, beta, name=name)
     bd.mem.release(rec, ln_rec(h.lv))
 
 
-def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0, rows: tuple[int, ...] = D.ATTN_ROWS) -> Tensor:
+def attend(bd: Builder, q: Tensor, kv: int, *, name: str, nkeys: int = 0) -> Tensor:
     """Attention of the panels q (scaled queries, 8 heads) on the K / V^T slots at DDR kv (self-attention: the keys of
-    all of the level's bands) on the core rows ``rows``: the output panels."""
+    all of the level's bands) on every core row: the output panels."""
     o = alloc(bd, q.lv, q.C, "pn")
     d = q.C // 8
     for t in range(1 if d == 40 else max(q.lv.np // 8, 1)):  # (an op per tile; d 40: per band)
-        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=d, nbands=q.lv.nb, tile=t,
-                       rows=SELF_ROWS if d == 40 else rows)
+        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, nkeys=nkeys, d=d, nbands=q.lv.nb, tile=t)
         cmd = bd.image(name, at.command())
         bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
     return o
@@ -288,8 +292,7 @@ def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, 
             gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=q + a + ".to_q", out=qt,
                  kind="bfp16")
             free(bd, n)
-        o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx,
-                   rows=SELF_ROWS if a == "attn1" else CROSS_ROWS)
+        o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx)
         free(bd, qt)
         rec = gemm(bd, o, w[q + a + ".to_out.0.weight"], w[q + a + ".to_out.0.bias"], name=q + a + ".to_out", out=h,
                    res=h, ln=True)

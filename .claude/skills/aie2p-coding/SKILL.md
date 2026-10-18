@@ -193,6 +193,10 @@ BDs:
   length"); a longer one can make aiecc run for 25+ minutes instead. A gathered unit longer than 1023 words (32-row
   slices of 128 B per row = 1024 words) goes as sub-units of 16 rows: the memtile then receives [sub-unit][tile][row
   16], and the consumer reads its rows in that order (`GemmQOperator.us`, the Q4 slot's dequant row permutation).
+- A BD ends with TLAST: a stream of control packets split over BDs (a page's slots) holds whole packets per BD, a
+  packet across the end is cut and the rest misparsed (`paging.Pager.slots`).
+- A core's DMA can stream into its own TileControl (a packet flow inside its switchbox: `paging.loop_flow`; one packet
+  id on all 32 cores routes, the flows never meet). `get_coreid()` is col << 16 | row.
 - A core-tile BD takes no lock or exactly one acquire and one release (aiecc). A buffer filled by two BDs in turn (an
   object split over two L1 regions: sd15's `design.R23`): the first acquires the free lock and releases a lock only
   the DMA uses, the second acquires that one and releases the full lock.
@@ -255,7 +259,7 @@ Silent wrong results:
 - **A lock acquire before a call can land in the call's delay slots** (`jl p0` with `acq` in slot 4): the core
   fetches the callee before the acquire completes, fatal when the wait is for that very code (pages written by
   control packets: the core runs stale code and its fetch then blocks the writes). `__builtin_aie2p_sched_barrier()`
-  after the acquire, and the call through a resident noinline function.
+  after the acquire, and the call through a resident noinline function (`paging.check_pager` checks a pager's ELF).
 - **Jinja `trim_blocks`** eats the newline after a block tag: `{% endif %}` at the end of a line glues the next line
   onto it (e.g. `inline` onto a return type). Put block tags on their own lines and read the rendered `kernel.cc` in
   the cache dir.

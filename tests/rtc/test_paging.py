@@ -1,10 +1,12 @@
-"""Code pages (artlite.operators.paging): the linker's checks, and self-DMA paging on every core of the array.
+"""Code pages (artlite.operators.paging): the linker's checks, and paging on every core of the array by both transports.
 
 The probe design: each core runs a resident main over a ring of ``NS`` L1 slots that its row's broadcast stream fills
-(shim MM2S 1 of columns 0, 2, 4, 6 -> the row's 8 cores); a slot is a command ([kind, x]: kind 1 calls the loaded
-page's entry with x) or, at ring position 0, the first of a page's ``NS`` slots, which the core's MM2S 1 streams into
-its own TileControl (``paging.loop_flow``) while it sleeps in ``pg_self``. Results in a pinned buffer (``RES``): y, the
-command count, the page count, ``get_coreid()``, the state's page id."""
+(shim MM2S 1 of columns 0, 2, 4, 6 -> the row's 8 cores); a slot is a command ([kind, x, page]: kind 1 calls the loaded
+page's entry with x, kind 2 first loads page ``page`` unless loaded) or, self-DMA, at ring position 0 the first of a
+page's ``NS`` slots, which the core's MM2S 1 streams into its own TileControl (``paging.loop_flow``) while it sleeps in
+``pg_self``. Memtile: a column's 4 cores request their pages from a store in their memtile (``paging.Store``, MM2S
+``PCH``), a request of each in flight on one channel. Results in a pinned buffer (``RES``): y, the command count, the
+page count, ``get_coreid()``, the state's page id."""
 
 import os
 from typing import ClassVar
@@ -30,6 +32,9 @@ SLOTS, ST, RES = 0x8000, 0x7F00, 0x7E00  # (L1 byte offsets: the ring, the pager
 LE, LF, LS, LD, LW = range(5)  # (core locks: ring slots empty / full, MM2S send / done, the pager's wake)
 STACK = 1024
 CHAIN = 700  # (statements of the big page's entry)
+PCH, PBD0, STORE, STORE_BYTES = 5, 24, 0x40000, 0x20000  # (memtile: the page channel, its first BD, the store)
+PAGE_ID, REQ_ID = (9, 10, 11, 12), (13, 14, 15, 16)  # (memtile: per core row its pages' and requests' stream ids)
+PAGES = ("a", "b", "big")
 STEM = "pgt"
 P = kernel_prefix(STEM)
 
@@ -68,6 +73,20 @@ int32_t {{ p }}_pg_big(int32_t x) {
 __attribute__((noinline)) int32_t {{ p }}_call(const volatile int32_t *st, int32_t x) {
   return ((int32_t (*)(int32_t))(intptr_t)st[1])(x);
 }
+{% if transport == "memtile" %}
+
+// (resident) page ``page`` into program memory unless the state names it: the request of this core's row
+__attribute__((noinline)) void {{ p }}_pg_need(const volatile int32_t *st, int page) {
+  if (st[0] == page)
+    return;
+  const int r = (get_coreid() & 31) - 2;
+  const int32_t hdr = r == 0 ? (int32_t){{ hdr[0] }}u : r == 1 ? (int32_t){{ hdr[1] }}u : r == 2 ? (int32_t){{ hdr[2] }}u
+                                                                                        : (int32_t){{ hdr[3] }}u;
+  event0();
+  {{ p }}_pg_request(hdr, (int32_t){{ ctl }}u, {{ bd0 }} + r * {{ npages }} + page - 1);
+  event1();
+}
+{% endif %}
 
 extern "C" {
 
@@ -77,6 +96,7 @@ void {{ p }}_main(int32_t *slots, int32_t *res, int32_t *st) {
   for (;;) {
     acquire_greater_equal({{ L + LF }}, 1);
     volatile int32_t *b = slots + pos * {{ SW }};
+{% if transport == "self" %}
     if (b[0] == (int32_t){{ header }}u) {  // (a page: the ring's NS slots from position 0)
 {% if variant == "acq" %}
       acquire_greater_equal({{ L + LW }}, 0);
@@ -90,11 +110,18 @@ void {{ p }}_main(int32_t *slots, int32_t *res, int32_t *st) {
       res[2] = ++pages;
       continue;
     }
-    const int k = b[0], x = b[1];
+{% endif %}
+    const int k = b[0], x = b[1], page = b[2];
     release({{ L + LE }}, 1);
     pos = pos + 1 == {{ NS }} ? 0 : pos + 1;
     if (k == 0)
       continue;
+{% if transport == "memtile" %}
+    if (k == 2) {
+      {{ p }}_pg_need((const volatile int32_t *)st, page);
+      res[2] = ++pages;
+    }
+{% endif %}
     res[0] = {{ p }}_call((const volatile int32_t *)st, x);
     res[1] = ++seq;
     res[4] = st[0];
@@ -123,15 +150,20 @@ class PagingProbe(ArtcOperator):
     ENDPOINTS: ClassVar[dict[str, tuple[int, int]]] = {}
     BD_BASE: ClassVar[dict[str, int]] = {}
 
-    def __init__(self, *, cols: int = 8, variant: str = "", chain: int = CHAIN):
-        self.cols, self.variant, self.chain = cols, variant, chain
+    def __init__(self, *, cols: int = 8, variant: str = "", chain: int = CHAIN, transport: str = "self"):
+        assert transport in ("self", "memtile")
+        self.cols, self.variant, self.chain, self.transport = cols, variant, chain, transport
         super().__init__()
 
     def get_kernel_src(self) -> str:
-        pager = paging.source(P, wake=LW, send=LS, nslots=NS)
+        mem = self.transport == "memtile"
+        pager = paging.source(P, wake=LW, request=True) if mem else paging.source(P, wake=LW, send=LS, nslots=NS)
+        req = [paging.request(stream_id=i, channel=PCH) for i in REQ_ID]
         return JINJA_ENV.from_string(_SRC).render(p=P, pager=pager, variant=self.variant, chain=self.chain, SW=SW, NS=NS,
                                                   L=paging.LOCK_BASE, LE=LE, LF=LF, LD=LD, LW=LW,
-                                                  header=paging.header())
+                                                  header=paging.header(), transport=self.transport,
+                                                  hdr=[h for h, _ in req], ctl=req[0][1], bd0=PBD0,
+                                                  npages=len(PAGES))
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec(ArgDirection.IN, (1024,), torch.int32), ArgSpec(ArgDirection.OUT, (1024,), torch.int32)]
@@ -166,17 +198,25 @@ class PagingProbe(ArtcOperator):
 
                 def part(j: int) -> TAP:
                     return TAP((NS * SW,), j * SW, [SW], [1])
-                flows.append(paging.loop_flow(t))
-                dmas.append(TileDma(t, [
-                    DmaChannel(DMAChannelDir.S2MM, b[r].endpoint(t),
-                               [Bd(ring, tap=part(j), acquires=[Acquire(le)], releases=[Release(lf)]) for j in range(NS)]),
-                    DmaChannel(DMAChannelDir.MM2S, 1,
-                               [Bd(ring, tap=part(j), acquires=[Acquire(ls)], releases=[Release(ld)]) for j in range(NS)]),
-                ]))
+                chans = [DmaChannel(DMAChannelDir.S2MM, b[r].endpoint(t),
+                                    [Bd(ring, tap=part(j), acquires=[Acquire(le)], releases=[Release(lf)])
+                                     for j in range(NS)])]
+                if self.transport == "self":
+                    flows.append(paging.loop_flow(t))
+                    chans.append(DmaChannel(DMAChannelDir.MM2S, 1, [Bd(ring, tap=part(j), acquires=[Acquire(ls)],
+                                                                       releases=[Release(ld)]) for j in range(NS)]))
+                else:
+                    mem = Tile(c, 1)
+                    flows += [paging.page_flow(mem, t, channel=PCH, stream_id=PAGE_ID[r]),
+                              paging.request_flow(t, mem, stream_id=REQ_ID[r])]
+                dmas.append(TileDma(t, chans))
 
                 def fn(ri, rs, s, kk):
                     kk(ri, rs, s)
                 workers.append(Worker(fn, [ring, res, st, k], tile=t, stack_size=STACK, while_true=False))
+        if self.transport == "memtile":  # (the stores: reserved memtile bytes)
+            for c in range(self.cols):
+                Buffer(type=ty(STORE_BYTES // 4), tile=Tile(c, 1), name=f"pgt_store{c}", address=STORE)
         ty_arg = np.ndarray[(1024,), i32]
 
         def seq(X, Y):
@@ -196,8 +236,10 @@ def _work_dir(op: ArtcOperator) -> str:
 
 def _link(op: PagingProbe) -> paging.Pager:
     cores = [(c, r + 2) for c in range(op.cols) for r in range(ROWS if op.cols > 1 else 2)]
-    return paging.link(_work_dir(op), stem=STEM, pages={"a": ("pg_a",), "b": ("pg_b",), "big": ("pg_big",)},
-                       pager="pg_self", caller="call", root="main", stack=STACK, cores=cores, state=ST, wake=LW)
+    return paging.link(_work_dir(op), pages={n: (f"{P}_pg_{n}",) for n in PAGES},
+                       pager=f"{P}_pg_self" if op.transport == "self" else f"{P}_pg_request",
+                       calls={f"{P}_call": tuple(f"{P}_pg_{n}" for n in PAGES)}, roots=(f"{P}_main",), stack=STACK,
+                       cores=cores, state=ST, wake=LW)
 
 
 def _compiled(op: PagingProbe) -> PagingProbe:
@@ -267,9 +309,9 @@ class _Bench:
         return np.array([self.reg(c, r, 0x31520) for c, r in self.tiles], np.int64)
 
 
-def _cmd(x: int, kind: int = 1) -> np.ndarray:
+def _cmd(x: int, kind: int = 1, page: int = 0) -> np.ndarray:
     s = np.zeros(SW, np.uint32)
-    s[0], s[1] = kind, np.uint32(np.int32(x).view(np.uint32))
+    s[0], s[1], s[2] = kind, np.uint32(np.int32(x).view(np.uint32)), page
     return s
 
 
@@ -317,7 +359,46 @@ def test_self_dma(probe: PagingProbe, bench: _Bench) -> None:
 def test_entries_resident_refused(probe: PagingProbe) -> None:
     """A resident function cannot be a page entry."""
     with pytest.raises(paging.PagingError, match="is resident"):
-        paging.link(_work_dir(probe), stem=STEM, pages={"x": ("call",)}, pager="pg_self", caller="call", root="main",
-                    stack=STACK, cores=[(0, 2)], state=ST, wake=LW)
+        paging.link(_work_dir(probe), pages={"x": (f"{P}_call",)}, pager=f"{P}_pg_self", calls={f"{P}_main": (f"{P}_call",)},
+                    roots=(f"{P}_main",), stack=STACK, cores=[(0, 2)], state=ST, wake=LW)
 
 
+
+
+@pytest.fixture(scope="module")
+def mprobe() -> PagingProbe:
+    return _compiled(PagingProbe(transport="memtile"))
+
+
+def test_memtile(mprobe: PagingProbe) -> None:
+    """Every core pages its own code from a store in its memtile (the 4 cores of a column on one MM2S channel, a
+    request each in flight): two pages in turn (64 times), the big page; a store that is none of the design's
+    configuration (its BDs, channel, bytes); the cycles of a request to the page's code."""
+    import dataclasses
+    pg = _link(mprobe)
+    store = paging.Store(base=STORE, size=STORE_BYTES, channel=PCH, bd0=PBD0,
+                         pagers=tuple(dataclasses.replace(pg, stream_id=i) for i in PAGE_ID))
+    store.check(_work_dir(mprobe), range(mprobe.cols))
+    assert [store.bd(k, n) for k in range(4) for n in PAGES] == list(range(PBD0, PBD0 + 4 * len(PAGES)))
+    bench = _Bench(mprobe)
+    t = txn.Txn()
+    store.load(t, range(mprobe.cols))
+    bench.dev.dispatch(Transaction(bench.dev, t.words()))
+    page = {n: pg.page_id(n) for n in PAGES}
+
+    def cmds(*xs: tuple[int, str]) -> list[np.ndarray]:
+        out = [_cmd(x, 2, page[n]) for x, n in xs]
+        return out + [_cmd(0, 0)] * (-len(out) % NS)
+    bench.run(cmds((10, "a")))
+    assert bench.res(0) == [31] * 32 and bench.res(4) == [page["a"]] * 32
+    c0 = bench.cycles()
+    bench.run(cmds(*[(100 + i, "a" if i % 2 else "b") for i in range(64)]), counters=True)
+    per = float(np.median((bench.cycles() - c0) % (1 << 32))) / 64
+    assert bench.res(0) == [3 * 163 + 1] * 32
+    bench.run(cmds((-77, "big"), (5, "big")))
+    assert bench.res(0) == [big(5) & 0xFFFFFFFF] * 32 and bench.res(4) == [page["big"]] * 32
+    c0 = bench.cycles()
+    bench.run(cmds((1, "a"), (2, "big")), counters=True)
+    per_big = float(np.median((bench.cycles() - c0) % (1 << 32)))
+    print(f"\nstore {store.nbytes} B per column; a 32-B page {per:.0f} cycles from the request, the a and big pages "
+          f"({pg.pages['big'].nbytes} B) {per_big:.0f}")
