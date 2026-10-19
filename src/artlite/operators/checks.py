@@ -10,9 +10,11 @@
   count, pointers for memrefs and scalars of the same width (an ``int`` return
   once shifted IRON's scalar argument registers).
 - Rounding: every kernel entry whose code rounds (vector conversions and SRS
-  stores) sets the rounding mode itself (``aie::set_rounding``); the mode is
-  per-core state that survives kernel calls, so relying on another kernel to set
-  it breaks when that kernel is absent. Reported as a warning.
+  stores), itself or in a function it calls, sets the rounding mode
+  (``aie::set_rounding``: the entry or a function on the path to the rounding
+  one); the mode is per-core state that survives kernel calls, so relying on
+  another kernel to set it breaks when that kernel is absent. Reported as a
+  warning.
 - Library arithmetic: calls of compiler-rt arithmetic helpers (the core has no scalar floating
   point: a scalar float product is ``__mulsf3``; a signed division by a constant is ``__divsi3``):
   slow, and each helper costs program memory. Reported as a warning; vectorize the math (e.g.
@@ -119,6 +121,32 @@ def rounding_functions(obj_path: str) -> dict[str, tuple[bool, bool]]:
     """Function -> (rounds: has conversion / SRS instructions, sets_mode: writes crrnd), own code only."""
     return {fn: (any(_ROUNDING.search(ln) for ln in lines), any("crrnd" in ln and "mov" in ln for ln in lines))
             for fn, lines in _disassembly(obj_path).items()}
+
+
+def unset_rounding(obj_path: str, entries: set[str]) -> dict[str, list[str]]:
+    """Entry -> the functions of its call tree (``kernel.o``'s relocations) that round while neither they nor a
+    function on the path from the entry set the rounding mode."""
+    funcs = _disassembly(obj_path)
+    rnd = rounding_functions(obj_path)
+    calls = {fn: {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([\w.$]+)$", ln)) and m.group(1) in funcs}
+             for fn, lines in funcs.items()}
+    out: dict[str, list[str]] = {}
+    for e in sorted(entries & set(funcs)):
+        lax, seen, todo = set(), set(), [e]
+        while todo:  # (functions reached with the mode unset so far)
+            f = todo.pop()
+            if f in seen:
+                continue
+            seen.add(f)
+            rounds, sets = rnd.get(f, (False, False))
+            if sets:
+                continue
+            if rounds:
+                lax.add(f)
+            todo += calls.get(f, ())
+        if lax:
+            out[e] = sorted(lax)
+    return out
 
 
 def library_arithmetic(obj_path: str) -> dict[str, set[str]]:
@@ -230,11 +258,12 @@ def check(*, source: str | None, mlir_text: str, obj_path: str | None, label: st
                 deep = max(callees, key=lambda c: usage.get(c, 0))
                 errors.append(f"core ({tile}): {deep} and the core's own frame ({own} B) need {need} B of stack, "
                               f"the core has stack_size {stack}")
-        rounding = rounding_functions(obj_path)
         called = set().union(*(c for _, _, c in cores)) if cores else set()
-        lax = sorted(fn for fn in called if rounding.get(fn, (False, True)) == (True, False))
+        lax = unset_rounding(obj_path, called)
         if lax:
-            sys.stderr.write(f"{label}: kernels that round without setting the rounding mode: {', '.join(lax)}\n")
+            sys.stderr.write(f"{label}: kernels that round without setting the rounding mode: "
+                             + "; ".join(f"{e} ({', '.join(f for f in fs if f != e) or 'itself'})" if fs != [e] else e
+                                         for e, fs in lax.items()) + "\n")
         lib = library_arithmetic(obj_path)
         if lib:
             sys.stderr.write(f"{label}: scalar arithmetic through runtime library calls (slow, program memory): "

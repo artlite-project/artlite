@@ -246,6 +246,7 @@ __attribute__((noinline)) void {{ p }}_hinput(uint8_t *__restrict xs, const floa
 // multiple of 8, wp: n bf16 of w_post)
 __attribute__((noinline)) void {{ p }}_pupd(const bfloat16 *__restrict wp, int32_t *__restrict ws, int j0, int n)
 {
+    aie::set_rounding(aie::rounding_mode::conv_even);
     float *__restrict r = WS(float, {{ w_.res }}) + j0;
     const float *__restrict v = WS(float, {{ w_.pend }}) + j0;
     aie::vector<bfloat16, 32> ivh, ivl;
