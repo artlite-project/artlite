@@ -1,0 +1,22 @@
+{
+  "runtime": "llama.cpp",
+  "about": "llama.cpp's results on the same machine and prompts, for comparison, in artlite.json's schema: MiniCPM-V 4.7's image prompts (image_ttft_s) with the same GGUF files as Artlite's.",
+  "version": "b11699 (7182ef71e), llama-server, Vulkan",
+  "date": "2026-10-19",
+  "machine": "Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S iGPU), Mesa 26.2.4 (RADV)",
+  "chart_note": "llama-server, the model and its vision encoder on the Radeon 8060S iGPU (Vulkan)",
+  "method": {
+    "image_ttft_s": "llama-server -c 32768 -np 1 -ngl 99 --mmproj FILE: an image prompt as Artlite's (artlite.json: image_prompts), cache_prompt false, 16 tokens: the client's time to the first token, median of 3 after a warmup; the best of 3 sessions (the iGPU's sessions differ by up to 8%)"
+  },
+  "results": [
+    {
+      "model": "MiniCPM-V 4.7 1B",
+      "quant": "Q4_K_M",
+      "backend": "Vulkan",
+      "image_ttft_s": {
+        "16x": {"sd15-astronaut.jpg": 0.549, "airplane.jpeg": 1.58, "test-1.jpeg": 0.497, "hk_OCR.jpg": 1.16},
+        "4x": {"sd15-astronaut.jpg": 0.883, "airplane.jpeg": 2.65, "test-1.jpeg": 0.865, "hk_OCR.jpg": 1.96}
+      }
+    }
+  ]
+}

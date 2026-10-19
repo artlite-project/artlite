@@ -6,8 +6,10 @@ artlite.json holds Artlite's measurements. Every other file in docs/data is a ru
 the same schema; its rows are drawn next to the Artlite row of the same model whose quant comes first in their
 comparable_quants (default: the row's own quant), and left out when no Artlite row matches. same_shapes_as charts a
 model under another model's group (same architecture and sizes, other weights); a row's own version (one measured
-with another release than its file's) is in its label, and its notes are footnotes as Artlite's. Standard library
-only: the SVGs use the platform's sans-serif font, and text widths are estimated from Helvetica's metrics.
+with another release than its file's) is in its label, and its notes are footnotes as Artlite's. The image-ttft chart
+draws the rows with image_ttft_s (per vision encoder and image) under artlite.json's image_prompts: a group per image,
+its glyph the image's outline cut into its slices, all glyphs to one scale. Standard library only: the SVGs use the
+platform's sans-serif font, and text widths are estimated from Helvetica's metrics.
 """
 
 from __future__ import annotations
@@ -142,6 +144,7 @@ class Data:
     legend: dict[str, str]  # runtime -> legend label
     chart_notes: dict[str, str]  # runtime -> a line under the charts that show it
     machine: str
+    image_prompts: dict  # artlite.json's: the question, the vision encoders and the images of image_ttft_s
 
     def color(self, runtime: str) -> int:
         return RUNTIMES.index(runtime) if runtime in RUNTIMES else len(RUNTIMES) - 1
@@ -177,7 +180,7 @@ def load() -> Data:
                     break
             else:
                 print(f"charts: no Artlite row to compare {name} {r['model']} {r['quant']} with", file=sys.stderr)
-    return Data(rows, comparisons, groups, legend, chart_notes, art["machine"])
+    return Data(rows, comparisons, groups, legend, chart_notes, art["machine"], art.get("image_prompts", {}))
 
 
 # ---- SVG
@@ -254,7 +257,9 @@ class Svg:
             f".lbl2{{font-size:12px}}.strong{{font-weight:600;fill:{t.ink}}}.muted{{fill:{t.muted}}}"
             f".small{{font-size:10px}}.halo{{paint-order:stroke;stroke:{t.surface};stroke-width:3px;"
             f"stroke-linejoin:round}}.grid{{stroke:{t.grid}}}.axis{{stroke:{t.axis}}}.guide{{stroke:{t.guide}}}"
-            f".bracket{{stroke:{t.ink2};fill:none}}.ft{{fill:{t.tint}}}{series}")
+            f".bracket{{stroke:{t.ink2};fill:none}}.ft{{fill:{t.tint}}}"
+            f".detail{{font-size:12px;font-weight:400;fill:{t.ink2}}}.tile{{fill:{t.grid};stroke:{t.ink2};stroke-width:1}}.cut{{stroke:{t.ink2};stroke-width:.75;fill:none}}"
+            f"{series}")
         h = math.ceil(self.height)
         return (
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{h}" viewBox="0 0 {WIDTH} {h}" '
@@ -278,23 +283,128 @@ def bar(x: float, y: float, w: float, h: float, cls: str, tip: str) -> str:
 class BarRow:
     label: str
     cls: str
-    values: dict[int, float | None]
+    values: dict[int | str, float | None]  # panel -> value
     tip: str
-    marks: dict[int, str] = field(default_factory=dict)  # context -> footnote mark of the value
-    suffix: dict[int, str] = field(default_factory=dict)  # context -> muted text after the value
+    marks: dict[int | str, str] = field(default_factory=dict)  # panel -> footnote mark of the value
+    suffix: dict[int | str, str] = field(default_factory=dict)  # panel -> muted text after the value
     partner: BarRow | None = None
+
+
+@dataclass
+class Heading:
+    """A group of bars: its name, muted details after it, and for an image its glyph (``tiles``: width and height in
+    pixels, rows and columns of its slices)."""
+    text: str
+    detail: str = ""
+    tiles: tuple[int, int, int, int] | None = None
+
+
+GLYPH = 40.0  # an image glyph's longest side in pixels: the largest image's (the others to the same scale)
+
+
+def glyph(x: float, y: float, w: float, h: float, rows: int, cols: int, tip: str) -> str:
+    """An image as its outline, cut into its slices."""
+    cuts = "".join(f"M{x + w * c / cols:.1f},{y:.1f}v{h:.1f}" for c in range(1, cols))
+    cuts += "".join(f"M{x:.1f},{y + h * r / rows:.1f}h{w:.1f}" for r in range(1, rows))
+    return (f'<g><title>{escape(tip)}</title><rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" '
+            f'rx="1.5" class="tile"/>' + (f'<path d="{cuts}" class="cut"/>' if cuts else "") + "</g>")
+
+
+def draw_bars(svg: Svg, items: list[Heading | BarRow], panels: list[tuple[int | str, str]],
+              fmt: Callable[[float], str], *, lower_better: bool = False, ticks: int = 4) -> None:
+    """Panels (key, heading) side by side on one scale with about ``ticks`` grid lines: a row per bar under its
+    group's heading, a comparison right under its partner with how much faster Artlite is (``lower_better``: the
+    values are times)."""
+    bars = [it for it in items if isinstance(it, BarRow)]
+    label_w = max(text_width(b.label, 12) for b in bars) + 14
+    gap = 30
+    plot_w = (WIDTH - 2 * PAD - label_w - (len(panels) - 1) * gap) / len(panels)
+    panel_x = [PAD + label_w + i * (plot_w + gap) for i in range(len(panels))]
+
+    def parts(b: BarRow, n: int | str) -> tuple[str, str, str]:
+        """The value label: number (with its footnote mark), muted suffix, speedup."""
+        v = b.values[n]
+        if v is None:
+            return "—" + b.marks.get(n, ""), "", ""
+        pv = b.partner.values[n] if b.partner else None
+        fast = speedup(v / pv if lower_better else pv / v) if pv else ""
+        return fmt(v) + b.marks.get(n, ""), b.suffix.get(n, ""), fast
+
+    def label_width(b: BarRow, n: int | str) -> float:
+        num, suffix, fast = parts(b, n)
+        return (text_width(num, 11) + (6 + text_width(suffix, 11) if suffix else 0)
+                + (10 + text_width(fast, 11, bold=True) if fast else 0))
+
+    # one scale for all panels, the largest that still fits every bar's label
+    scale = min((plot_w - 6 - label_width(b, n)) / b.values[n] for b in bars for n, _ in panels if b.values[n])
+    step = nice_step(plot_w / scale, ticks)
+    grid = [i * step for i in range(int(plot_w / scale / step + 1e-9) + 1)]
+    sizes = [max(h.tiles[:2]) for h in items if isinstance(h, Heading) and h.tiles]
+    px_per_pixel = GLYPH / max(sizes) if sizes else 0.0
+    glyph_h = max((h.tiles[1] * px_per_pixel for h in items if isinstance(h, Heading) and h.tiles), default=0.0)
+
+    y = svg.y + 34
+    for i, (_, heading) in enumerate(panels):
+        svg.text(panel_x[i], y, heading, "h")
+    y += 12
+    rows_top = y
+    body: list[str] = []
+    bh = 13
+    for k, it in enumerate(items):
+        if isinstance(it, Heading):
+            if k:
+                body.append(f'<line x1="{PAD}" y1="{y + 8:.1f}" x2="{WIDTH - PAD}" y2="{y + 8:.1f}" class="grid"/>')
+                y += 12
+            x, band = PAD, 22.0
+            if it.tiles:  # the glyphs centred in a column of the largest's width, the text beside them
+                w, h, rows, cols = it.tiles
+                band = glyph_h + 6
+                gw, gh = w * px_per_pixel, h * px_per_pixel
+                body.append(glyph(PAD + (GLYPH - gw) / 2, y + 4 + (glyph_h - gh) / 2, gw, gh, rows, cols,
+                                  f"{it.text}: {w} × {h} pixels, {rows} × {cols} slices"))
+                x += GLYPH + 10
+            base = y + 4 + glyph_h / 2 + 4.5 if it.tiles else y + 14
+            detail = f'<tspan dx="8" class="detail">{escape(it.detail)}</tspan>' if it.detail else ""
+            body.append(f'<text x="{x:g}" y="{base:.1f}" class="h">{escape(it.text)}{detail}</text>')
+            y += band
+            continue
+        if it.partner is not None:
+            y -= 4  # 2 px under its partner
+        base = y + bh / 2 + 4
+        body.append(f'<text x="{PAD + label_w - 10:.1f}" y="{base:.1f}" text-anchor="end" '
+                    f'class="{"lbl2" if it.partner else "lbl"}">{escape(it.label)}</text>')
+        for i, (n, heading) in enumerate(panels):
+            v = it.values[n]
+            w = max(v * scale, 1.0) if v is not None else 0.0
+            if v is not None:
+                body.append(bar(panel_x[i], y, w, bh, it.cls, f"{it.tip}, {heading}: {fmt(v)}"))
+            num, suffix, fast = parts(it, n)
+            spans = escape(num)
+            if suffix:
+                spans += f'<tspan dx="6" class="muted">{escape(suffix)}</tspan>'
+            if fast:
+                spans += f'<tspan dx="10" class="strong">{escape(fast)}</tspan>'
+            body.append(f'<text x="{panel_x[i] + w + 5:.1f}" y="{base:.1f}">{spans}</text>')
+        y += bh + 6
+    for x0 in panel_x:
+        for t in grid:
+            svg.line(x0 + t * scale, rows_top, x0 + t * scale, y, "grid" if t else "axis")
+            svg.text(x0 + t * scale, y + 14, kilo(t), "", "middle")
+    for s in body:
+        svg.add(s)
+    svg.y = y + 44
 
 
 def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: tuple[int, ...],
               fmt: Callable[[float], str]) -> Svg:
     notes = Notes()
-    items: list[str | BarRow] = []  # group names and bars
+    items: list[Heading | BarRow] = []
     shown = {"Artlite"}
     mtp = False
     for g in data.groups:
         group_rows = [r for r in data.rows if r.group == g and any(r.get(key, n) is not None for n in contexts)]
         if group_rows:
-            items.append(g)
+            items.append(Heading(g))
         for r in group_rows:
             marks = {int(n): notes.mark(t) for n, t in r.raw.get("notes", {}).get(key, {}).items()}
             main = BarRow(r.quant, f"f{data.color('Artlite')}", {n: r.get(key, n) for n in contexts},
@@ -319,72 +429,56 @@ def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: t
     if mtp:
         legend.insert(1, ("box", "ft", "Artlite with its MTP drafter, S tokens per step"))
     svg.legend(legend)
-
-    bars = [it for it in items if isinstance(it, BarRow)]
-    label_w = max(text_width(b.label, 12) for b in bars) + 14
-    gap = 30
-    plot_w = (WIDTH - 2 * PAD - label_w - (len(contexts) - 1) * gap) / len(contexts)
-    panel_x = [PAD + label_w + i * (plot_w + gap) for i in range(len(contexts))]
-
-    def parts(b: BarRow, n: int) -> tuple[str, str, str]:
-        """The value label: number (with its footnote mark), muted suffix, speedup."""
-        v = b.values[n]
-        if v is None:
-            return "—" + b.marks.get(n, ""), "", ""
-        pv = b.partner.values[n] if b.partner else None
-        return fmt(v) + b.marks.get(n, ""), b.suffix.get(n, ""), speedup(pv / v) if pv else ""
-
-    def label_width(b: BarRow, n: int) -> float:
-        num, suffix, fast = parts(b, n)
-        return (text_width(num, 11) + (6 + text_width(suffix, 11) if suffix else 0)
-                + (10 + text_width(fast, 11, bold=True) if fast else 0))
-
-    # one scale for all panels, the largest that still fits every bar's label
-    scale = min((plot_w - 6 - label_width(b, n)) / b.values[n] for b in bars for n in contexts if b.values[n])
-    step = nice_step(plot_w / scale, 4)
-    ticks = [i * step for i in range(int(plot_w / scale / step + 1e-9) + 1)]
-
-    y = svg.y + 34
-    for i, n in enumerate(contexts):
-        svg.text(panel_x[i], y, f"{tokens(n)}-token prompt", "h")
-    y += 12
-    rows_top = y
-    body: list[str] = []
-    bh = 13
-    for k, it in enumerate(items):
-        if isinstance(it, str):
-            if k:
-                body.append(f'<line x1="{PAD}" y1="{y + 8:.1f}" x2="{WIDTH - PAD}" y2="{y + 8:.1f}" class="grid"/>')
-                y += 12
-            body.append(f'<text x="{PAD}" y="{y + 14:.1f}" class="h">{escape(it)}</text>')
-            y += 22
-            continue
-        if it.partner is not None:
-            y -= 4  # 2 px under its partner
-        base = y + bh / 2 + 4
-        body.append(f'<text x="{PAD + label_w - 10:.1f}" y="{base:.1f}" text-anchor="end" '
-                    f'class="{"lbl2" if it.partner else "lbl"}">{escape(it.label)}</text>')
-        for i, n in enumerate(contexts):
-            v = it.values[n]
-            w = max(v * scale, 1.0) if v is not None else 0.0
-            if v is not None:
-                body.append(bar(panel_x[i], y, w, bh, it.cls, f"{it.tip}, {tokens(n)}-token prompt: {fmt(v)}"))
-            num, suffix, fast = parts(it, n)
-            spans = escape(num)
-            if suffix:
-                spans += f'<tspan dx="6" class="muted">{escape(suffix)}</tspan>'
-            if fast:
-                spans += f'<tspan dx="10" class="strong">{escape(fast)}</tspan>'
-            body.append(f'<text x="{panel_x[i] + w + 5:.1f}" y="{base:.1f}">{spans}</text>')
-        y += bh + 6
-    for x0 in panel_x:
-        for t in ticks:
-            svg.line(x0 + t * scale, rows_top, x0 + t * scale, y, "grid" if t else "axis")
-            svg.text(x0 + t * scale, y + 14, kilo(t), "", "middle")
-    for s in body:
-        svg.add(s)
-    svg.y = y + 44
+    draw_bars(svg, items, [(n, f"{tokens(n)}-token prompt") for n in contexts], fmt)
     svg.footer(data.footer_lines(shown), notes, data.machine)
+    return svg
+
+
+# ---- an image prompt's time to first token: a group per image, a panel per vision encoder
+
+
+def image_chart(data: Data) -> Svg:
+    key = "image_ttft_s"
+    prompts = data.image_prompts
+    encoders = list(prompts["encoders"].items())
+    rows = [r for r in data.rows if r.raw.get(key)]
+    notes = Notes()
+    items: list[Heading | BarRow] = []
+    legend = {"Artlite": "Artlite"}  # (a comparison's own version: the release its images were measured with)
+
+    def values(row: Row, image: str) -> dict[int | str, float | None]:
+        return {e: row.raw[key].get(e, {}).get(image) for e, _ in encoders}
+
+    def marks(row: Row) -> dict[int | str, str]:
+        return {e: notes.mark(t) for e, t in row.raw.get("notes", {}).get(key, {}).items()}
+
+    for name, im in prompts["images"].items():
+        (w, h), (sr, sc) = im["size"], im["slices"]
+        cut = f" and {sr * sc} slices" if sr * sc else ""
+        items.append(Heading(name, f"{w} × {h}: an overview{cut}", (w, h, max(sr, 1), max(sc, 1))))
+        for r in rows:
+            main = BarRow("Artlite" if len(rows) == 1 else f"Artlite {r.quant}", f"f{data.color('Artlite')}",
+                          values(r, name), f"Artlite, {r.raw['model']} {r.quant}, {name}", marks(r))
+            items.append(main)
+            for c in data.paired(r):
+                if c.raw.get(key):
+                    legend[c.runtime] = (f"{c.runtime} {c.raw['version'].split()[0]}" if "version" in c.raw
+                                         else data.legend[c.runtime])
+                    label = " ".join([c.runtime, *[c.quant] * (c.quant != r.quant), *[c.raw.get("backend", "")]])
+                    items.append(BarRow(label.strip(), f"f{data.color(c.runtime)}", values(c, name),
+                                        f"{label.strip()}, {c.raw['model']} {c.quant}, {name}", marks(c),
+                                        partner=main))
+
+    model = " / ".join(dict.fromkeys(f"{r.raw['model']} {r.quant}" for r in rows))
+    svg = Svg("Time to first token with an image, seconds", [
+        (f"{model} with an image and “{prompts['question']}”: the vision encoder on each of the image's "
+         "entries"),
+        ("(an overview and its slices), then the prefill. From the request to the first streamed token, through each "
+         "runtime's server."),
+    ])
+    svg.legend([("box", f"f{data.color(k)}", v) for k, v in legend.items()])
+    draw_bars(svg, items, [(e, heading) for e, heading in encoders], sig3, lower_better=True, ticks=6)
+    svg.footer([f"{legend[k]}: {v}" for k, v in data.chart_notes.items() if k in legend], notes, data.machine)
     return svg
 
 
@@ -577,6 +671,7 @@ def main() -> None:
              pairing],
             (1024, 32768), lambda v: f"{v:.0f}"),
         "ttft": ttft_chart(data),
+        "image-ttft": image_chart(data),
     }
     IMAGES.mkdir(exist_ok=True)
     for name, svg in charts.items():

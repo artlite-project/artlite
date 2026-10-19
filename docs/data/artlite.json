@@ -1,12 +1,23 @@
 {
   "runtime": "Artlite",
-  "about": "Artlite's measured models; docs/charts.py draws docs/images from this file and the other runtimes' files. Keys of ttft_s / prefill_tps / decode_tps are prompt lengths in tokens. How to measure a model: the artlite-bench skill; the file each row measured (Hugging Face repository, file, sha256), the test system and the toolchain: docs/methodology.md.",
+  "about": "Artlite's measured models; docs/charts.py draws docs/images from this file and the other runtimes' files. Keys of ttft_s / prefill_tps / decode_tps are prompt lengths in tokens; image_ttft_s holds per vision encoder (an mmproj file) and image the time to the first token of an image prompt (image_prompts: the question, the encoders, the images). How to measure a model: the artlite-bench skill; the file each row measured (Hugging Face repository, file, sha256), the test system and the toolchain: docs/methodology.md.",
   "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)",
   "method": {
     "ttft_s": "artlite-bench -p 1024,8192,32768,65536 -n 0: avg_ns of pp<n> (the prompt's chunks and the last token's logits)",
     "prefill_tps": "the same run: avg_ts",
     "decode_tps": "artlite-cli -n 256 --greedy on a Paul Graham essays prompt of 1023 / 32767 tokens",
-    "mtp": "decode with the model's drafter, at the best tokens per step S for that length"
+    "mtp": "decode with the model's drafter, at the best tokens per step S for that length",
+    "image_ttft_s": "artlite-server --mmproj FILE, a streaming /v1/chat/completions request of the image and the question, thinking off, greedy, 16 tokens: the client's time to the first token, median of 3 after a warmup, the image's pixels new on every request (no kept embeddings); NPU power mode default"
+  },
+  "image_prompts": {
+    "question": "Describe this image in detail.",
+    "encoders": {"16x": "16x vision encoder: 64 tokens per entry", "4x": "4x vision encoder: 256 tokens per entry"},
+    "images": {
+      "sd15-astronaut.jpg": {"size": [512, 512], "slices": [2, 1], "source": "Artlite docs/images"},
+      "airplane.jpeg": {"size": [1920, 1440], "slices": [3, 3], "source": "OpenBMB/MiniCPM-V assets"},
+      "test-1.jpeg": {"size": [640, 488], "slices": [1, 2], "source": "llama.cpp tools/mtmd"},
+      "hk_OCR.jpg": {"size": [1300, 858], "slices": [2, 3], "source": "OpenBMB/MiniCPM-V assets"}
+    }
   },
   "results": [
     {
@@ -140,7 +151,11 @@
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.167, "8192": 1.41, "32768": 8.56, "65536": 24.9},
       "prefill_tps": {"1024": 6118, "32768": 3827},
-      "decode_tps": {"1024": 83.4, "32768": 55.6}
+      "decode_tps": {"1024": 83.4, "32768": 55.6},
+      "image_ttft_s": {
+        "16x": {"sd15-astronaut.jpg": 0.323, "airplane.jpeg": 0.570, "test-1.jpeg": 0.270, "hk_OCR.jpg": 0.460},
+        "4x": {"sd15-astronaut.jpg": 0.686, "airplane.jpeg": 1.28, "test-1.jpeg": 0.509, "hk_OCR.jpg": 1.01}
+      }
     }
   ]
 }

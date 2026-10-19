@@ -109,6 +109,11 @@ How these are measured: [Benchmark methodology](docs/methodology.md).
   <img alt="Time to first token against prompt length from 1k to 64k tokens on log-log axes, one panel per model, Artlite, FastFlowLM and OpenFlowLM" src="docs/images/ttft.svg">
 </picture>
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/image-ttft-dark.svg">
+  <img alt="Time to first token of MiniCPM-V 4.7 1B with an image, for four images with their slice grids and the 16x and 4x vision encoders: Artlite, FastFlowLM and llama.cpp on the iGPU (Vulkan)" src="docs/images/image-ttft.svg">
+</picture>
+
 ## How it works
 
 <picture>

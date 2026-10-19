@@ -1,13 +1,15 @@
 # Benchmark methodology
 
 The README's charts compare Artlite with FastFlowLM and OpenFlowLM (FastFlowLM's fork on open NPU kernels) on one
-machine, with the same prompts, wherever they run the same model with comparable 4-bit weights:
+machine, with the same prompts, wherever they run the same model with comparable 4-bit weights, and an image
+prompt's time to first token also with llama.cpp on the iGPU:
 
 | chart | what |
 |---|---|
 | decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4 also with its drafter (MTP) |
 | prefill | tokens/s of a 1k- and a 32k-token prompt |
 | TTFT | time to first token against prompt length, 1k to 64k tokens, log-log |
+| image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
 
 Each Artlite bar is one GGUF file ([below](#measured-files)). FastFlowLM's and OpenFlowLM's bars stand under the
 Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF's numerics in their own tiles.
@@ -33,12 +35,19 @@ One NPU job at a time, with no other heavy CPU load.
 | prefill | the same run: `avg_ts` of `pp1024`, `pp32768` |
 | decode | `artlite-cli -n 256 --greedy` on a prompt of 1023 / 32767 tokens: its generation speed |
 | decode with MTP | the same at the best tokens per step for each length (Gemma 4: 1 to 4) |
+| image TTFT | `artlite-server --mmproj FILE`, streaming `/v1/chat/completions` requests of an image and "Describe this image in detail.", thinking off, greedy: the client's time to the first token, median of 3 after a warmup |
 
 The prompts are Paul Graham's essays (`tests/datasets/paul_graham_essays` in file-name order, fetched by
 `tests/datasets/fetch_datasets.py`) followed by a request to summarize them, cut to the length with the model's chat
 template. Decode is greedy, so the text, and with it the drafts' acceptance, is the same on every run; it does not come
 from `artlite-bench`'s `tg` tests, whose random tokens a drafter never guesses. The model file is read into the page
 cache first, and the designs are compiled before the timed runs.
+
+The image prompts' images: `docs/images/sd15-astronaut.jpg` (512 x 512), OpenBMB/MiniCPM-V's `assets/airplane.jpeg`
+(1920 x 1440) and `assets/hk_OCR.jpg` (1300 x 858), and llama.cpp's `tools/mtmd/test-1.jpeg` (640 x 488). Each is cut
+as the official processor cuts it, into an overview and up to 9 slices, in every runtime. No request is served from a
+cache: each one sends the image's pixels with a random 4 x 4 block in its corner (re-encoded as JPEG quality 95) and a
+random word before the question. The same client measures every runtime's server.
 
 The step-by-step procedure, with its prompt and draft-count scripts, is the
 [artlite-bench skill](../.claude/skills/artlite-bench/SKILL.md).
@@ -64,7 +73,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
 | Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-17 |
-| MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model; text prompts) | `588c6c94c82f` | 2026-10-19 |
+| MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-19 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
 runs, with the toolchain pinned then:
@@ -83,7 +92,9 @@ chunks of 4096 tokens and each model at its native context:
 - TTFT: a streaming `/v1/chat/completions` request with the same essay prompt of n tokens, greedy, 128 tokens: the
   client's time to the first token, median of up to 3;
 - prefill: n / TTFT;
-- decode: (tokens - 1) / the time from the first to the last streamed token.
+- decode: (tokens - 1) / the time from the first to the last streamed token;
+- image TTFT (FastFlowLM 1.0.9): Artlite's image prompts and client, 16 tokens. Its MiniCPM-V has the 16x vision
+  encoder only (bf16).
 
 | runtime | model | its model | weights | under Artlite's |
 |---|---|---|---|---|
@@ -102,13 +113,21 @@ OpenFlowLM runs that take over 5 minutes were not measured; the charts mark the 
 hold models with no Artlite row yet (FastFlowLM's Qwen3 0.6B, Gemma 4 E2B, Qwen3.6 35B-A3B; OpenFlowLM's Qwen3 0.6B,
 Qwen3.5 9B), which the charts leave out.
 
+## llama.cpp
+
+llama.cpp b11699 (7182ef71e, built with Vulkan and `GGML_NATIVE`) on the Radeon 8060S iGPU, Mesa 26.2.4 (RADV), for
+the image TTFT chart: `llama-server -m MiniCPM-V-4_7-1B-Q4_K_M.gguf --mmproj FILE -c 32768 -np 1 -ngl 99`, the model
+and its vision encoder on the iGPU (flash attention on), the same GGUF files, image prompts and client as Artlite's,
+`cache_prompt` false. The iGPU's sessions (a server start and its requests) differ by up to 8%: the chart has the best
+of 3.
+
 ## Data and charts
 
 | file | |
 |---|---|
-| `data/artlite.json` | Artlite's results: per model and quant, `ttft_s`, `prefill_tps`, `decode_tps` (keys: prompt lengths in tokens), `mtp`, `notes` (footnotes) |
-| `data/fastflowlm.json`, `data/openflowlm.json` | the other runtimes' results in the same schema; `comparable_quants` pairs a row with Artlite's files, `same_shapes_as` charts it under a model of the same architecture and sizes |
-| `charts.py` | draws `images/{decode,prefill,ttft}.svg` and their `-dark` variants from the data |
+| `data/artlite.json` | Artlite's results: per model and quant, `ttft_s`, `prefill_tps`, `decode_tps` (keys: prompt lengths in tokens), `mtp`, `image_ttft_s` (keys: the vision encoder, then the image), `notes` (footnotes); `image_prompts`: the question, the encoders and the images (size, slice grid) |
+| `data/fastflowlm.json`, `data/openflowlm.json`, `data/llama.cpp.json` | the other runtimes' results in the same schema; `comparable_quants` pairs a row with Artlite's files, `same_shapes_as` charts it under a model of the same architecture and sizes |
+| `charts.py` | draws `images/{decode,prefill,ttft,image-ttft}.svg` and their `-dark` variants from the data |
 
 ```bash
 python docs/charts.py

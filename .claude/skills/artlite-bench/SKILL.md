@@ -1,6 +1,6 @@
 ---
 name: artlite-bench
-description: "Measure a model's numbers for the README's performance charts (docs/data/artlite.json) the same way every time: TTFT at 1k / 8k / 32k / 64k and prefill speed with artlite-bench, decode speed at 1k / 32k with artlite-cli on essay prompts, and for a model with a drafter (MTP) the best tokens per dispatch S at each length. Use when asked to benchmark a model, add or refresh a model's chart numbers, or compare prefill / decode / MTP speeds across days or models."
+description: "Measure a model's numbers for the README's performance charts (docs/data/artlite.json) the same way every time: TTFT at 1k / 8k / 32k / 64k and prefill speed with artlite-bench, decode speed at 1k / 32k with artlite-cli on essay prompts, for a model with a drafter (MTP) the best tokens per dispatch S at each length, and for a model with a vision encoder an image prompt's TTFT through artlite-server (and other runtimes' servers). Use when asked to benchmark a model, add or refresh a model's chart numbers, or compare prefill / decode / MTP / image-prompt speeds across days, models or runtimes."
 ---
 
 # Benchmarking a model for the README charts
@@ -13,6 +13,7 @@ A model's entry in `docs/data/artlite.json` and where each number comes from (ke
 | `prefill_tps`: 1024 32768 | the same run | `avg_ts` of `pp1024`, `pp32768` |
 | `decode_tps`: 1024 32768 | `artlite-cli` on an essay prompt of 1023 / 32767 tokens, `-n 256 --greedy` | its `generation: ... tokens/s` |
 | `mtp`: `decode_tps`, `tokens_per_step` | the decode runs again per draft count | the best S at each length, and its speed |
+| `image_ttft_s`: encoder, then image | `image_ttft.py` against `artlite-server --mmproj FILE` | the median per image (section 5) |
 
 Decode is not taken from `artlite-bench`'s `tg` tests: their tokens are random, so a drafter's guesses are never
 accepted and MTP cannot show; and `tg` times `top_k` steps, not the app's `generate`. Decode runs greedy: the text,
@@ -76,7 +77,23 @@ token at short contexts (the weights stream once), but its attention grows with 
 acceptance falls with their depth. The `D draft tokens (X ms each), A accepted` part of the line explains a result:
 acceptance per draft, and the drafter's own cost (it also grows with the context).
 
-## 5. The entry and the charts
+## 5. Image prompts (a model with a vision encoder)
+
+```bash
+artlite-server -m MODEL.gguf --mmproj MMPROJ.gguf --port 8080 --no-ui &      # (one per encoder file)
+python .claude/skills/artlite-bench/image_ttft.py http://127.0.0.1:8080 IMAGE ...
+```
+
+The images are `docs/data/artlite.json`'s `image_prompts` (where each comes from: `docs/methodology.md`). The script
+sends each image with fresh pixels, so no kept embeddings or prompt cache serve a request (it stops if a server reports
+cached tokens). It prints the median of 3 per image after a warmup, which reproduces within ~2%. Stop the server with
+SIGTERM, which waits for its NPU dispatch.
+
+Other runtimes' servers take the same script: `llama-server -m MODEL.gguf --mmproj MMPROJ.gguf -c 32768 -np 1
+-ngl 99` (Vulkan), and `flm serve <tag> --ctx-len <native> --prefill-chunk-len 4096` with the NPU in turbo. An iGPU's
+sessions (a server start and its requests) differ by up to 8%: take the best of 3, after the machine has idled.
+
+## 6. The entry and the charts
 
 ```json
 {
@@ -91,6 +108,8 @@ acceptance per draft, and the drafter's own cost (it also grows with the context
 
 `model` names the chart group (the same string for every file of a model; groups keep the file's order). TTFT with 3
 significant digits (0.44, 3.14, 16.7), prefill in whole tok/s, decode with one decimal. Without a drafter: no `mtp`.
+Image prompts: `"image_ttft_s": {"16x": {"airplane.jpeg": 0.570, ...}, "4x": {...}}`, the encoders and images those of
+`image_prompts` (a new image there needs its size and slice grid, `minicpmv.slice_image`'s `Grid.grid`).
 A run to explain goes in `notes` (`"notes": {"decode_tps": {"1024": "stopped at an end-of-sequence token after 143 of
 the 256 tokens"}}`: a footnote on that bar). Then `python docs/charts.py` redraws `docs/images` (light and dark SVGs;
 commit both), and the model table in `docs/models/README.md` gets the file. `docs/methodology.md`'s "Measured files"
