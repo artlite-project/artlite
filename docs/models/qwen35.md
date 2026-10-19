@@ -1,9 +1,11 @@
-# Qwen3.5 / 3.6 / 3.8 on the NPU
+# Qwen3.5 / 3.6 / 3.8 and MiniCPM-V 4.7 on the NPU
 
-Qwen3.6-27B, Qwen3.8-27B (without its MTP layer) and Qwen3.5-9B from a GGUF file (llama.cpp architecture `qwen35`:
-Gated DeltaNet layers with a full-attention layer every fourth). The architecture, tokenizer and chat template are
-read from the file's metadata. Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an
-empty thought); default sampling: the file's (`general.sampling.*`), else the model card's.
+Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and the language model of MiniCPM-V 4.7 1B (text
+prompts; its vision encoder is planned) from a GGUF file (llama.cpp architecture `qwen35`: Gated DeltaNet layers with
+a full-attention layer every fourth). The architecture, tokenizer and chat template are read from the file's metadata.
+Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
+the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100;
+Artlite has no repetition penalty).
 
 ## Model files
 
@@ -11,10 +13,11 @@ empty thought); default sampling: the file's (`general.sampling.*`), else the mo
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
+$ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf     (MiniCPM-V's language model)
 ```
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
-the files. The NPU path reads Q4_K, Q5_K and Q6_K tensors.
+the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`). The NPU path reads Q4_K, Q5_K and Q6_K tensors.
 
 ## How the NPU path works
 
@@ -26,7 +29,8 @@ read what to do from their input streams. Per column:
 - the GDN core runs the Gated DeltaNet step: conv, gates, the delta rule on the fp32 state that it
   reads and writes back to DDR every token;
 - the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
-  the position into the KV cache.
+  the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
+  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core.
 
 The prompt runs in chunks of up to 2048 tokens (layer-major, in sub-chunks of 256) through the prefill
 (`qwen35/prefill.py`): the prefill GEMMs, which read the same weight image, the Gated DeltaNet scan
@@ -35,6 +39,5 @@ runs as dispatches of whole layers, each within the driver's hang detection. The
 from the LM head alone. Tokens where a chunk cannot start (inside a 32-position cache group, e.g. after a
 generated reply; fewer than 3 left) run as decode steps.
 
-Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's) are
-re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written
-to disk.
+Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's)
+are re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.

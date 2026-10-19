@@ -34,7 +34,7 @@ def _tokens(path: str, n: int, name: str = "founders.txt") -> list[int]:
     return ref.llama_tokenize(path, essay(name))[:n]
 
 
-@pytest.mark.parametrize("size", ["9B", "27B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_slice(size: str) -> None:
     from artlite.operators.qwen35.overlay import QwenOverlay
 
@@ -63,7 +63,7 @@ def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
     return (lw.exp() * (lw - lg)).sum(-1)
 
 
-@pytest.mark.parametrize("size", ["9B", "27B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_teacher_forced(size: str) -> None:
     path = _path(size)
     tokens = _tokens(path, 128)
@@ -79,7 +79,7 @@ def test_teacher_forced(size: str) -> None:
     assert kl < 1.5 * kl_llama and agree > agree_llama - 0.02
 
 
-@pytest.mark.parametrize("size", ["9B", "27B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches

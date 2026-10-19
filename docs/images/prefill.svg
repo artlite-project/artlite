@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="922" viewBox="0 0 880 922" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="990" viewBox="0 0 880 990" role="img" aria-labelledby="t d">
 <title id="t">Prefill speed, tokens/s</title>
 <desc id="d">Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file. Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</desc>
 <style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#59636e;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#1f2328}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#1f2328}.lbl{font-size:12px;fill:#1f2328}.lbl2{font-size:12px}.strong{font-weight:600;fill:#1f2328}.muted{fill:#818b98}.small{font-size:10px}.halo{paint-order:stroke;stroke:#ffffff;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#eef1f4}.axis{stroke:#c8d1da}.guide{stroke:#d5dce3}.bracket{stroke:#59636e;fill:none}.ft{fill:#86b6ef}.f0{fill:#2a78d6}.l0{stroke:#2a78d6;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#2a78d6;stroke:#ffffff;stroke-width:1.5}.b0{fill:#2a78d6;fill-opacity:.16}.f1{fill:#eb6834}.l1{stroke:#eb6834;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#eb6834;stroke:#ffffff;stroke-width:1.5}.b1{fill:#eb6834;fill-opacity:.16}.f2{fill:#1baf7a}.l2{stroke:#1baf7a;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#1baf7a;stroke:#ffffff;stroke-width:1.5}.b2{fill:#1baf7a;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#ffffff;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
-<rect x="0.5" y="0.5" width="879" height="921" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<rect x="0.5" y="0.5" width="879" height="989" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
 <text x="24.0" y="40.0" class="title">Prefill speed, tokens/s</text>
 <text x="24.0" y="59.0" class="sub">Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file.</text>
 <text x="24.0" y="78.0" class="sub">Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</text>
@@ -14,18 +14,18 @@
 <text x="248.0" y="108.0" class="lbl">OpenFlowLM 0.1.0-99fe7e4</text>
 <text x="162.7" y="142.0" class="h">1k-token prompt</text>
 <text x="524.4" y="142.0" class="h">32k-token prompt</text>
-<line x1="162.7" y1="154.0" x2="162.7" y2="770.0" class="axis"/>
-<text x="162.7" y="784.0" text-anchor="middle">0</text>
-<line x1="323.9" y1="154.0" x2="323.9" y2="770.0" class="grid"/>
-<text x="323.9" y="784.0" text-anchor="middle">5k</text>
-<line x1="485.0" y1="154.0" x2="485.0" y2="770.0" class="grid"/>
-<text x="485.0" y="784.0" text-anchor="middle">10k</text>
-<line x1="524.4" y1="154.0" x2="524.4" y2="770.0" class="axis"/>
-<text x="524.4" y="784.0" text-anchor="middle">0</text>
-<line x1="685.5" y1="154.0" x2="685.5" y2="770.0" class="grid"/>
-<text x="685.5" y="784.0" text-anchor="middle">5k</text>
-<line x1="846.6" y1="154.0" x2="846.6" y2="770.0" class="grid"/>
-<text x="846.6" y="784.0" text-anchor="middle">10k</text>
+<line x1="162.7" y1="154.0" x2="162.7" y2="838.0" class="axis"/>
+<text x="162.7" y="852.0" text-anchor="middle">0</text>
+<line x1="323.9" y1="154.0" x2="323.9" y2="838.0" class="grid"/>
+<text x="323.9" y="852.0" text-anchor="middle">5k</text>
+<line x1="485.0" y1="154.0" x2="485.0" y2="838.0" class="grid"/>
+<text x="485.0" y="852.0" text-anchor="middle">10k</text>
+<line x1="524.4" y1="154.0" x2="524.4" y2="838.0" class="axis"/>
+<text x="524.4" y="852.0" text-anchor="middle">0</text>
+<line x1="685.5" y1="154.0" x2="685.5" y2="838.0" class="grid"/>
+<text x="685.5" y="852.0" text-anchor="middle">5k</text>
+<line x1="846.6" y1="154.0" x2="846.6" y2="838.0" class="grid"/>
+<text x="846.6" y="852.0" text-anchor="middle">10k</text>
 <text x="24" y="168.0" class="h">Llama 3.2 1B Instruct</text>
 <text x="152.7" y="186.5" text-anchor="end" class="lbl">Q4_0</text>
 <path d="M162.7,176.0h297.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-297.2z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_0, 1k-token prompt: 9345</title></path>
@@ -160,10 +160,22 @@
 <path d="M162.7,751.0h0.0a1.2569226324237561,1.2569226324237561 0 0 1 1.2569226324237561,1.2569226324237561v10.5a1.2569226324237561,1.2569226324237561 0 0 1 -1.2569226324237561,1.2569226324237561h0.0z" class="f3"><title>OpenFlowLM, Qwen3.8 27B q4nx, 1k-token prompt: 39</title></path>
 <text x="169.0" y="761.5">39<tspan dx="10" class="strong">Artlite 11× faster</tspan></text>
 <text x="529.4" y="761.5">—*</text>
-<text x="24.0" y="814.0">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
-<text x="24.0" y="830.0">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
-<text x="24.0" y="846.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
-<text x="24.0" y="862.0">† DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
-<text x="24.0" y="878.0">‡ FastFlowLM loads it with at most 8192 positions</text>
-<text x="24.0" y="894.0">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
+<line x1="24" y1="778.0" x2="856" y2="778.0" class="grid"/>
+<text x="24" y="796.0" class="h">MiniCPM-V 4.7 1B</text>
+<text x="152.7" y="814.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,804.0h189.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-189.4z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 1k-token prompt: 6000</title></path>
+<text x="361.1" y="814.5">6000</text>
+<path d="M524.4,804.0h92.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-92.0z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 32k-token prompt: 2980</title></path>
+<text x="625.4" y="814.5">2980</text>
+<text x="152.7" y="829.5" text-anchor="end" class="lbl2">FastFlowLM 1.0.9 q4nx</text>
+<path d="M162.7,819.0h44.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-44.9z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 1k-token prompt: 1518</title></path>
+<text x="216.6" y="829.5">1518<tspan dx="10" class="strong">Artlite 4.0× faster</tspan></text>
+<path d="M524.4,819.0h54.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-54.3z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 32k-token prompt: 1810</title></path>
+<text x="587.7" y="829.5">1810<tspan dx="10" class="strong">Artlite 1.6× faster</tspan></text>
+<text x="24.0" y="882.0">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
+<text x="24.0" y="898.0">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
+<text x="24.0" y="914.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
+<text x="24.0" y="930.0">† DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
+<text x="24.0" y="946.0">‡ FastFlowLM loads it with at most 8192 positions</text>
+<text x="24.0" y="962.0">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
 </svg>

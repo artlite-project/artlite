@@ -33,8 +33,11 @@ from artlite.operators.qwen35.prefill import SIZES, QwenPrefill
 from ..common import Model, OverlayModel, Sampling
 from .tokenizer import QwenTokenizer, chat_prompt
 
-# the model card's sampling (thinking / instruct) when the file names none (general.sampling.*)
+# the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
+# set; its repetition penalty 1.03 aside): the language model of openbmb's files, marked by the M-RoPE order of its
+# vision (``QwenConfig.rope_section_order`` "zyxt": llama.cpp's mark of MiniCPM-V 4.7; its general.name is generic)
 SAMPLING = {True: {"temp": 1.0, "top_k": 20, "top_p": 0.95}, False: {"temp": 0.7, "top_k": 20, "top_p": 0.8}}
+MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95}
 
 
 class NpuQwen(OverlayModel):
@@ -93,9 +96,9 @@ class NpuQwen(OverlayModel):
 
 
 class Qwen(Model):
-    """A qwen35 model from a GGUF file: the architecture, tokenizer and chat template from its metadata. Opening the
-    file allocates the weight image's buffer and packs it in a thread (``WeightBuffer``) while the tokenizer and
-    the designs load."""
+    """A qwen35 model from a GGUF file (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7's language model): the architecture,
+    tokenizer and chat template from its metadata. Opening the file allocates the weight image's buffer and packs it in
+    a thread (``WeightBuffer``) while the tokenizer and the designs load."""
 
     name = "Qwen3.5"
     thinks = True
@@ -107,6 +110,9 @@ class Qwen(Model):
         self.tokenizer = QwenTokenizer(self.gguf)
         self.cfg = QwenConfig.from_gguf(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
+        self.minicpmv = self.cfg.rope_section_order == "zyxt"
+        if self.minicpmv:
+            self.name = "MiniCPM-V 4.7"
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -116,7 +122,7 @@ class Qwen(Model):
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""
-        s = SAMPLING[think] | self.cfg.sampling
+        s = (MINICPMV_SAMPLING if self.minicpmv else SAMPLING[think]) | self.cfg.sampling
         return Sampling(temp=s["temp"], top_k=int(s["top_k"]), top_p=s["top_p"])
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:

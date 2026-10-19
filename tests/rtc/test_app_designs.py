@@ -56,6 +56,7 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
+    "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "sd15": (sd15_dir(), _sd15),
 }
 
