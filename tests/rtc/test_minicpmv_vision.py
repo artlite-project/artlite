@@ -41,13 +41,13 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _entries(enc: V.Encoder, il: int) -> list[torch.Tensor]:
-    """The two entries' residuals (256, 1152) before layer il (> the merger's)."""
+    """The two entries' residuals (256, 1152) before layer il (> the merger's: layer 7's the merger's output)."""
     ov = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
     out = []
     for px in (ov, np.ascontiguousarray(ov[:, :, ::-1])):
         tr: dict[str, torch.Tensor] = {}
         enc.forward(px, None, tr)
-        out.append(tr[f"layer_out-{il - 1}"])
+        out.append(tr["vit_merger_ds_out" if il == enc.insert + 1 else f"layer_out-{il - 1}"])
     return out
 
 
@@ -90,3 +90,43 @@ def test_layer(npu: Sd15Device, enc: V.Encoder) -> None:
               f"(the CPU's {_rel(e, exact):.2e})")
         assert float(g[:, M.H:].abs().max()) == 0
         assert _rel(g[:, :M.H], e) < 3e-3
+
+
+@pytest.mark.slow  # (20 layers' weights converted on the host)
+def test_layers(npu: Sd15Device, enc: V.Encoder) -> None:
+    """The 20 layers after the ViT merger (7 .. 26) in one dispatch on two entries: as far from the float64 layers as
+    the CPU at the NPU's rounding points (the two apart by ~1e-2 after 20 layers: each layer's 1.5e-3); the dispatch's
+    time."""
+    import time
+
+    xs = [V._bf16(x) for x in _entries(enc, 7)]
+    sim = V.NpuEncoder(MMPROJ)
+    want, exact = list(xs), [x.double() for x in xs]
+    for il in range(7, 27):
+        want = [sim.layer(x, il) for x in want]
+        exact = [enc._layer(x, il) for x in exact]
+    lv = Level(16)
+    bd = Builder(npu)
+    xc = _level_in(xs)
+    x = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
+    bd.image("x_in", np.concatenate([L.ctiles(xc[c], lv.m) for c in range(COLS)]))
+    bd.op(bd.load("x_in", x.addr, lv.ct(M.C)), {})
+    rec = M.ln_records(bd, x, name="x.rec")
+    kv = bd.ddr("kv", M.kv_bytes(lv))
+    for il in range(7, 27):
+        x, rec = M.layer(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, rec, kv=kv)
+    bd.op(bd.spill("y_out", x.addr, lv.ct(M.C)), {})
+    tr = bd.transaction()
+    npu.run(tr)
+    ts = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        npu.run(tr)
+        ts.append(time.perf_counter() - t0)
+    yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
+    got = _level_out(torch.stack([L.from_ctiles(yb[c], lv.m, M.C, lv.m) for c in range(COLS)]))
+    for g, e, x in zip(got, want, exact, strict=True):
+        npu_err, cpu_err = _rel(g[:, :M.H], x), _rel(e, x)
+        print(f"20 layers on 2 x 256 tokens: {1e3 * min(ts):.2f} ms ({1e3 * min(ts) / 20:.3f} ms per layer); from "
+              f"float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
+        assert npu_err < 1.1 * cpu_err

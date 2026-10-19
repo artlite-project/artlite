@@ -8,7 +8,8 @@ padded to 80 (Q / K / V rows, O's columns: 16 heads of d 80); the feed-forward's
 
 A layer (``layer``) on a level of two entries (sd15's two images): LN1 -> K, V (their slots drained to DDR), Q
 (x log2 e / sqrt 72) -> attention (16 heads, the softmax's max raised past attention sinks) -> O + x (LayerNorm
-records) -> LN2 (x parked in DDR meanwhile) -> up + GELU (panels) -> x back -> down + x (records).
+records) -> LN2 (x parked in DDR meanwhile) -> up + GELU (panels) -> x back -> down + x (records). Its memtile
+layout alternates between two (x low / high), the same every other layer.
 """
 
 import math
@@ -17,6 +18,7 @@ from collections.abc import Callable
 import torch
 
 from ..design import COLS
+from ..sd15 import design as D
 from ..sd15.build import Builder, Level
 from ..sd15.ops import Apply, Attention, Gemm
 from ..sd15.unet import Tensor, alloc, free, gelu_table, gemm, ln_rec
@@ -120,12 +122,16 @@ def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: in
     free(bd, qt)
     rec = gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=x, res=x, ln=True)
     free(bd, o)
-    n = alloc(bd, lv, C, "pn", top=True)  # (away from x: the hidden panels take x's memory and what follows it)
+    # (the down GEMM reads the hidden panels and writes y: 506 of the memtile's 510 KB; layers alternate between x low,
+    # the LN2 panels at the top and the hidden from the bottom (y then high), and x high, the LN2 panels at the bottom
+    # and the hidden at the top (y then low))
+    low = x.addr < D.HEAP // 2
+    n = alloc(bd, lv, C, "pn", top=low)
     bd.defer(bd.spill(name + ".x", x.addr, x.nbytes), release=[(x.addr, x.size or x.nbytes)])  # (with LN2: the hidden
     # panels take the memtile)
     ln(bd, x, n, w["ln2_g"], w["ln2_b"], name=name + ".ln2", rec=rec)
     bd.table("gelu", gelu_table())
-    g = alloc(bd, lv, FFN, "pn")
+    g = alloc(bd, lv, FFN, "pn", top=not low)
     gemm(bd, n, w["up"], w["up_b"], name=name + ".up", out=g, kind="gelu")
     free(bd, n)
     y = alloc(bd, lv, C)
