@@ -64,8 +64,8 @@ def _level_out(y: torch.Tensor) -> list[torch.Tensor]:
 
 
 def test_layer(npu: Sd15Device, enc: V.Encoder) -> None:
-    """One layer (10) on two entries: within 3e-3 of the CPU at the NPU's rounding points (measured 1.5e-3: their orders
-    of summation, exp2, GELU's table; both 1.7e-3 from float64), the pad channels zero."""
+    """One layer (10) on two entries: as far from the float64 layer as the CPU at the NPU's rounding points (both 1.7e-3;
+    1.5e-3 apart: their orders of summation, exp2, GELU's table), the pad channels zero."""
     il = 10
     xs = [V._bf16(x) for x in _entries(enc, il)]
     sim = V.NpuEncoder(MMPROJ)
@@ -89,7 +89,7 @@ def test_layer(npu: Sd15Device, enc: V.Encoder) -> None:
         print(f"NPU vs CPU at its rounding points {_rel(g[:, :M.H], e):.2e}; vs float64 {_rel(g[:, :M.H], exact):.2e} "
               f"(the CPU's {_rel(e, exact):.2e})")
         assert float(g[:, M.H:].abs().max()) == 0
-        assert _rel(g[:, :M.H], e) < 3e-3
+        assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)
 
 
 @pytest.mark.slow  # (20 layers' weights converted on the host)
@@ -130,3 +130,54 @@ def test_layers(npu: Sd15Device, enc: V.Encoder) -> None:
         print(f"20 layers on 2 x 256 tokens: {1e3 * min(ts):.2f} ms ({1e3 * min(ts) / 20:.3f} ms per layer); from "
               f"float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
         assert npu_err < 1.1 * cpu_err
+
+
+def _bands_in(bd: Builder, x: list[torch.Tensor], lv: Level, name: str) -> M.Bands:
+    """Two entries (1024 tokens, 1152) as a banded 32 x 32 level's residual in DDR (their records by a copy op per
+    band)."""
+    img = torch.stack([torch.nn.functional.pad(e.float(), (0, M.C - M.H)).T.reshape(M.C, 32, 32) for e in x])
+    xc = level_tokens(img, lv.R, lv.Lg)  # (COLS, nb T, C): band b = tokens [T b, T (b + 1))
+    bands = M.Bands(lv, name)
+    for b in range(lv.nb):
+        bd.image(f"{name}.in.{b}", np.concatenate([L.ctiles(xc[c, lv.T * b:lv.T * (b + 1)], lv.m) for c in range(COLS)]))
+        t = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
+        bd.op(bd.load(f"{name}.in.{b}", t.addr, t.nbytes), {})
+        bands.store(bd, b, t, M.ln_records(bd, t, name=f"{name}.rec{b}"))
+    bd.op({}, {})
+    return bands
+
+
+def _bands_out(npu: Sd15Device, y: M.Bands) -> list[torch.Tensor]:
+    lv = y.lv
+    yb = [npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1) for b in range(lv.nb)]
+    yc = torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, M.C, lv.m) for b in range(lv.nb)]) for c in range(COLS)])
+    img = from_level_tokens(yc, lv.R, lv.Lg)
+    return [img[i].reshape(M.C, 1024).T for i in range(2)]
+
+
+def test_layer_bands(npu: Sd15Device, enc: V.Encoder) -> None:
+    """A layer before the ViT merger (3) on two entries of 32 x 32 tokens, the level in 4 bands: as far from the float64
+    layer as the CPU at the NPU's rounding points (both ~8.6e-3), the pad channels zero."""
+    il = 3
+    ov = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
+    xs = []
+    for px in (ov, np.ascontiguousarray(ov[:, :, ::-1])):
+        tr: dict[str, torch.Tensor] = {}
+        enc.forward(px, None, tr)
+        xs.append(V._bf16(tr[f"layer_out-{il - 1}"]))
+    sim = V.NpuEncoder(MMPROJ)
+    want = [sim.layer(x, il) for x in xs]
+    lv = Level(32, 4)
+    bd = Builder(npu)
+    x = _bands_in(bd, xs, lv, "x")
+    out = M.Bands(lv, "y")
+    M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, out,
+                  kv=bd.ddr("kv", M.kv_bytes(lv)))
+    bd.op({}, {})  # (the last band's drains)
+    npu.run(bd.transaction())
+    for g, e, xx in zip(_bands_out(npu, out), want, xs, strict=True):
+        exact = enc._layer(xx.double(), il)
+        print(f"NPU vs CPU at its rounding points {_rel(g[:, :M.H], e):.2e}; vs float64 {_rel(g[:, :M.H], exact):.2e} "
+              f"(the CPU's {_rel(e, exact):.2e})")
+        assert float(g[:, M.H:].abs().max()) == 0
+        assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)

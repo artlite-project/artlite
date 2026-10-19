@@ -9,7 +9,8 @@ padded to 80 (Q / K / V rows, O's columns: 16 heads of d 80); the feed-forward's
 A layer (``layer``) on a level of two entries (sd15's two images): LN1 -> K, V (their slots drained to DDR), Q
 (x log2 e / sqrt 72) -> attention (16 heads, the softmax's max raised past attention sinks) -> O + x (LayerNorm
 records) -> LN2 (x parked in DDR meanwhile) -> up + GELU (panels) -> x back -> down + x (records). Its memtile
-layout alternates between two (x low / high), the same every other layer.
+layout alternates between two (x low / high), the same every other layer. On a banded level (``layer_bands``: the
+layers before the ViT merger, 1024 tokens an entry) the residual and its records are in DDR per band (``Bands``).
 """
 
 import math
@@ -21,7 +22,7 @@ from ..design import COLS
 from ..sd15 import design as D
 from ..sd15.build import Builder, Level
 from ..sd15.ops import Apply, Attention, Gemm
-from ..sd15.unet import Tensor, alloc, free, gelu_table, gemm, ln_rec
+from ..sd15.unet import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
 FFN_REAL, FFN = 4304, 4480
@@ -99,35 +100,46 @@ def attend(bd: Builder, q: Tensor, kv: int, *, name: str) -> Tensor:
     return o
 
 
-def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv: int) -> tuple[Tensor, int]:
-    """A ViT layer (module docstring) on the residual's C tiles x with its LayerNorm records at rec (its producer's):
-    the output's C tiles (x's memory freed) and their records. kv: a DDR buffer for the attention's K / V^T slots
-    (``kv_bytes``)."""
-    lv = x.lv
-    n = alloc(bd, lv, C, "pn")
-    ln(bd, x, n, w["ln1_g"], w["ln1_b"], name=name + ".ln1", rec=rec)
+def _kv(bd: Builder, w: dict[str, torch.Tensor], name: str, n: Tensor, kv: int, band: int, *, q: bool) -> Tensor | None:
+    """K and V of the LN1 panels n (their slots' drains: band ``band``'s keys), and Q (q: its panels; else None, V^T's
+    drains with the next op)."""
+    lv = n.lv
     kt, vt = alloc(bd, lv, C, "pn"), alloc(bd, lv, C, "pn")
     at = Attention(np=lv.np, q=0, o=0, kv=kv, d=HP, nbands=lv.nb, heads=HEADS)
     gemm(bd, n, w["k"], w["k_b"], name=name + ".k", out=kt, kind="bfp16")
     gemm(bd, n, w["v"], w["v_b"], name=name + ".v", out=vt, kind="vt",
-         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k") for c in range(COLS)})
+         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k", band=band) for c in range(COLS)})
     free(bd, kt)
+    vd = {c: at.kv_drains(kt.addr, vt.addr, c, part="v", band=band) for c in range(COLS)}
+    if not q:
+        bd.defer(vd, release=[(vt.addr, vt.size)])
+        return None
     qt = alloc(bd, lv, C, "pn")
-    gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16",
-         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="v") for c in range(COLS)})
-    bd.ddr_sync()
+    gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16", extra=vd)
     free(bd, vt)
-    free(bd, n)
+    return qt
+
+
+def _attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: Tensor, kv: int) -> int:
+    """x += O (the attention of the queries qt, freed): x's records."""
     o = attend(bd, qt, kv, name=name + ".attn")
     free(bd, qt)
     rec = gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=x, res=x, ln=True)
     free(bd, o)
+    return rec
+
+
+def _ffn(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, park: str = "") -> tuple[Tensor, int]:
+    """LN2, x parked in DDR (image ``park``, default name.x), up + GELU, x back, down + x: the output's C tiles (x's
+    memory freed) and records."""
+    park = park or name + ".x"
+    lv = x.lv
     # (the down GEMM reads the hidden panels and writes y: 506 of the memtile's 510 KB; layers alternate between x low,
     # the LN2 panels at the top and the hidden from the bottom (y then high), and x high, the LN2 panels at the bottom
     # and the hidden at the top (y then low))
     low = x.addr < D.HEAP // 2
     n = alloc(bd, lv, C, "pn", top=low)
-    bd.defer(bd.spill(name + ".x", x.addr, x.nbytes), release=[(x.addr, x.size or x.nbytes)])  # (with LN2: the hidden
+    bd.defer(bd.spill(park, x.addr, x.nbytes), release=[(x.addr, x.size or x.nbytes)])  # (with LN2: the hidden
     # panels take the memtile)
     ln(bd, x, n, w["ln2_g"], w["ln2_b"], name=name + ".ln2", rec=rec)
     bd.table("gelu", gelu_table())
@@ -135,10 +147,69 @@ def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: in
     gemm(bd, n, w["up"], w["up_b"], name=name + ".up", out=g, kind="gelu")
     free(bd, n)
     y = alloc(bd, lv, C)
-    bd.op(bd.load(name + ".x", y.addr, y.nbytes), {})
+    bd.op(bd.load(park, y.addr, y.nbytes), {})
     rec = gemm(bd, g, w["down"], w["down_b"], name=name + ".down", out=y, res=y, ln=True)
     free(bd, g)
     return y, rec
+
+
+def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv: int) -> tuple[Tensor, int]:
+    """A ViT layer (module docstring) on the residual's C tiles x with its LayerNorm records at rec (its producer's):
+    the output's C tiles (x's memory freed) and their records. kv: a DDR buffer for the attention's K / V^T slots
+    (``kv_bytes``)."""
+    n = alloc(bd, x.lv, C, "pn")
+    ln(bd, x, n, w["ln1_g"], w["ln1_b"], name=name + ".ln1", rec=rec)
+    qt = _kv(bd, w, name, n, kv, 0, q=True)
+    bd.ddr_sync()
+    free(bd, n)
+    return _ffn(bd, w, name, x, _attn_out(bd, w, name, qt, x, kv))
+
+
+class Bands:
+    """A banded level's residual in DDR: per band its C tiles (``DTensor`` image ``name.b``) and LayerNorm records
+    (image ``name.rec.b``)."""
+
+    def __init__(self, lv: Level, name: str):
+        self.lv, self.name = lv, name
+        self.x = DTensor(lv, C, name)
+
+    def load(self, bd: Builder, b: int) -> tuple[Tensor, int]:
+        """Band b's C tiles and records in the memtile (one op of fills)."""
+        lv = self.lv
+        t = alloc(bd, lv, C)
+        rec = bd.mem.alloc(ln_rec(lv))
+        bd.op(bd.merge(bd.load(self.x.band(b), t.addr, t.nbytes), bd.load(f"{self.name}.rec.{b}", rec, ln_rec(lv))), {})
+        return t, rec
+
+    def store(self, bd: Builder, b: int, t: Tensor, rec: int) -> None:
+        """Band b from the memtile's C tiles t and records rec (drained with the next op, their bytes released after
+        it)."""
+        bd.defer(bd.merge(bd.spill(self.x.band(b), t.addr, t.nbytes), bd.spill(f"{self.name}.rec.{b}", rec, ln_rec(self.lv))),
+                 release=[(t.addr, t.size or t.nbytes), (rec, ln_rec(self.lv))])
+
+
+def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands, *, kv: int) -> None:
+    """A ViT layer on a banded level (each entry's keys in every band): per band LN1, K and V into the slots; then per
+    band LN1 again, Q, the attention, O + x and the feed-forward into ``out``'s band (x's bands read twice; Q computed
+    in the second pass instead of parked in DDR)."""
+    for b in range(x.lv.nb):
+        xb, rec = x.load(bd, b)
+        n = alloc(bd, x.lv, C, "pn")
+        ln(bd, xb, n, w["ln1_g"], w["ln1_b"], name=f"{name}.ln1", rec=rec)
+        free(bd, xb)
+        _kv(bd, w, name, n, kv, b, q=False)
+        free(bd, n)
+    bd.op({}, {})  # (the last band's V^T drains)
+    bd.ddr_sync()
+    for b in range(x.lv.nb):
+        xb, rec = x.load(bd, b)
+        n = alloc(bd, x.lv, C, "pn")
+        ln(bd, xb, n, w["ln1_g"], w["ln1_b"], name=f"{name}.ln1", rec=rec)
+        qt = alloc(bd, x.lv, C, "pn")
+        gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16")
+        free(bd, n)
+        y, rec = _ffn(bd, w, name, xb, _attn_out(bd, w, name, qt, xb, kv), park=f"{name}.x.{b}")
+        out.store(bd, b, y, rec)
 
 
 def kv_bytes(lv: Level) -> int:
