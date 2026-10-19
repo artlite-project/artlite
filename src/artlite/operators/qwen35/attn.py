@@ -2,8 +2,9 @@
 NeoX RoPE on the first 64 dims, q / k RMS-normed per head, a sigmoid output gate) for S <= 4 token slots at positions
 p .. p + S - 1.
 
-Column c attends with its QC query heads (27B 3, 9B 2) to KV head c // 2 over the whole cache (``overlay.kv``'s
-layout: groups of 32 positions, two K objects and a V object). A step's attention runs in sub-steps (``SUB`` slots of
+The KV heads' columns form chains of NPH = 8 / KV heads (9B / 27B NPH 2, MiniCPM-V 4): column c attends with its QC
+query heads (27B 3, 9B 2, MiniCPM-V 1) to KV head c // NPH over the whole cache (``overlay.kv``'s layout: groups of 32
+positions, two K objects and a V object). A step's attention runs in sub-steps (``SUB`` slots of
 one group at most, ``overlay.vring.substeps``) whose S x QC query rows (row s QC + h: slot s, head h) go 4 to a set of
 MMUL panels ([rows hi | rows lo] per 8 dims). Per sub-step the core gets:
 
@@ -22,16 +23,18 @@ from the ring of the layer's KV head (``overlay.vring``; or after a prefill the 
 tail objects, after the cache; the core puts the slots' V in and per slot encodes the record up to the slot and adds
 its P V. Its outputs go to the main core (shared-memory FIFO R, ``C_LEN`` values per object), which relays them to C:
 o = y / l * sigmoid(gate) ([head][k block: 8 dims][slot S][8] bf16: into the sub-step's slots of the attn_out phase's
-input), then the records of the sub-step's first and last positions (the same twice when one record holds both): an
-even column their K records, an odd one their V panels up to the last position and their rows (the ring).
+input), then the records of the sub-step's first and last positions (the same twice when one record holds both): a
+chain's first column their K records, its last one their V panels up to the last position and their rows (the ring),
+the columns between none (``A_ROLE``).
 
 A sub-step from 4 groups on (``AttnShape.splits``: the same for every position of its group) reads each head's cache
-once per pair instead of once per column: both cores of a pair take the pair's 2 QC heads (the partner's q objects
-follow the own ones on X), the even core attends to the groups 0 .. ``M_GATT`` - 1 (then it reads the sub-step's
-group from ``M_GJ`` on only to insert its K records), the odd core to the rest; the even core's partial (m, l, y) stays
-in its workspace, and the odd core (its east neighbour: shared memory) merges it into its own and emits o for the
-pair's heads (a token ObjectFifo orders the two). So a slot's attention is the same in every step it can be part of:
-a step of S slots gives each the numbers of a step of one.
+once per chain instead of once per column: every core of a chain takes the chain's NPH QC heads (the chain's q objects
+in column order on X) and a run of the groups (``AttnShape.bounds``): the first core the groups 0 .. ``M_GATT`` - 1
+(then it reads the sub-step's group from ``M_GJ`` on only to insert its K records), the last one the groups up to the
+sub-step's. The partials (m, l, y) merge west to east: a core's partial stays in its workspace until its east
+neighbour (shared memory) has merged it into its own, and the last core emits o for the chain's heads (a token
+ObjectFifo orders each neighbour pair). So a slot's attention is the same in every step it can be part of: a step of
+S slots gives each the numbers of a step of one.
 """
 
 import math
@@ -52,7 +55,7 @@ POS_PER_GROUP = 32  # 4 records: two K objects and a V object
 ROT = 32  # rotated pairs (dims i, i + 32 for i < 32)
 F_ATT = 1 << 10  # M_FLAGS of an attention core's object
 SMAX = 4
-SUB = 2  # slots of a sub-step at most (``substeps``: a pair's query rows of two slots fill the sets)
+SUB = 2  # slots of a sub-step at most (``substeps``)
 U = 3  # sub-steps of a step at most
 
 
@@ -61,9 +64,10 @@ U = 3  # sub-steps of a step at most
 # step), M_ATREC (record mode: the first tail object is the open record's V panels), M_NTAIL (tail objects)
 
 # state words of the attention core (the first ones are trip counts of its program)
-(A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_PAR, A_QS,
+(A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
  A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_TREC, A_NTAIL) = range(27)
 A_WORDS = 32
+ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 
 _SRC = JINJA_ENV.from_string(r"""
 // The attention core's workspace (offsets in bytes: AttnShape.workspace())
@@ -209,7 +213,7 @@ __attribute__((noinline, minsize)) uint32_t {{ p }}_mask(int set, int r, int p, 
     uint32_t m = 0;
     AIE_LOOP_NO_UNROLL
     for (int q = 0; q < 4; q++) {
-        const int row = 4 * set + q, s = QR == {{ QC }} ? al::div_small<{{ QC }}>(row) : al::div_small<{{ 2 * QC }}>(row);
+        const int row = 4 * set + q, s = QR == {{ QC }} ? al::div_small<{{ QC }}>(row) : al::div_small<{{ NPH * QC }}>(row);
         int n = p + s - 8 * r + 1;  // valid positions of the record for the row
         n = n < 0 ? 0 : (n > 8 ? 8 : n);
         if (s < S)
@@ -223,8 +227,8 @@ __attribute__((noinline, minsize)) uint32_t {{ p }}_mask(int set, int r, int p, 
 // in qa; t = 1 of a step in one record: nothing more (the emission repeats the first's). The step's V rows in (the
 // rows past its last position: as they were, read by no one). Per slot that reaches the record: the record's V panels
 // from its rows up to the slot's position (into kb: what that position sees of the record, whatever the step), y += P
-// V of the slot's rows. The odd column then keeps the last panels and the rows for its emission ([V | rows] per record
-// from rec on).
+// V of the slot's rows. A chain's last column then keeps the last panels and the rows for its emission ([V | rows] per
+// record from rec on).
 __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int32_t *__restrict ws, int t)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -254,7 +258,7 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
             {{ p }}_pv(v, AW(uint8_t, {{ a.pp }}), y, y);
         }
     }
-    if (st[{{ A_PAR }}]) {  // (the emission: the panels of the record's rows up to the step's last position, its rows)
+    if (st[{{ A_ROLE }}] == {{ ROLE_V }}) {  // (the emission: the panels of the record's rows up to the step's last position, its rows)
         uint8_t *__restrict e = AW(uint8_t, {{ a.rec }}) + {{ REC_V + ROWS_B }} * t;
         al::copy<{{ REC_V // 4 }}, 16>((uint32_t *)e, (const uint32_t *)v);
         al::copy<{{ ROWS_B // 4 }}, 16>((uint32_t *)(e + {{ REC_V }}), (const uint32_t *)rows);
@@ -292,10 +296,12 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         st[{{ A_NXSKIP }}] = m[{{ M_SKIP }}];
         return;
     }
-    const int S = m[{{ M_NS }}], split = m[{{ M_SPLIT }}], par = col & 1;
+    // (the column's place in its KV head's chain: its first core emits the K records, the last the V panels and rows)
+    const int S = m[{{ M_NS }}], split = m[{{ M_SPLIT }}], k = col - {{ NPH }} * al::div_small<{{ NPH }}>(col);
+    const int last = k == {{ NPH - 1 }};
     st[{{ A_S }}] = S;
-    st[{{ A_QR }}] = split ? {{ 2 * QC }} : {{ QC }};  // (query rows per slot: the column's heads, or the pair's)
-    st[{{ A_NQ }}] = split ? 2 * S : S;
+    st[{{ A_QR }}] = split ? {{ NPH * QC }} : {{ QC }};  // (query rows per slot: the column's heads, or the chain's)
+    st[{{ A_NQ }}] = split ? {{ NPH }} * S : S;
     st[{{ A_NQP }}] = 1;
     st[{{ A_NKV }}] = S;
     st[{{ A_NOBJ }}] = m[{{ M_NASKIP }}];
@@ -304,15 +310,15 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_TREC }}] = m[{{ M_ATREC }}];
     st[{{ A_NTAIL }}] = m[{{ M_NTAIL }}];
     st[{{ A_I }}] = 0;
-    st[{{ A_PAR }}] = par;
+    st[{{ A_ROLE }}] = k == 0 ? {{ ROLE_K }} : last ? {{ ROLE_V }} : {{ ROLE_O }};
     st[{{ A_QS }}] = 0;
     st[{{ A_KS }}] = 0;
     st[{{ A_G0 }}] = m[{{ M_G0 }}];
     st[{{ A_GATT }}] = m[{{ M_GATT }}];
     st[{{ A_GJ }}] = m[{{ M_GJ }}];
-    st[{{ A_TP }}] = split && !par;  // (the even core of a split step: its partial to the odd core, which merges, emits o)
-    st[{{ A_TC }}] = split && par;
-    st[{{ A_NO }}] = 4 * S * (split ? (par ? {{ 2 * QC }} : 0) : {{ QC }});
+    st[{{ A_TP }}] = split && !last;  // (a split step: its partial to the east neighbour, which merges it; the last emits o)
+    st[{{ A_TC }}] = split && k;
+    st[{{ A_NO }}] = 4 * S * (split ? (last ? {{ NPH * QC }} : 0) : {{ QC }});
     al::copy<{{ 2 * HD + 64 * SMAX }}, 16>(AW(float, {{ a.nrm }}), (const float *)(x + {{ 2 * META }}));
 }
 
@@ -325,17 +331,16 @@ __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
     st[{{ A_XL }}] = left - n;
 }
 
-// The next q object (a slot's heads, the step's slot A_SA + s; split: the column's own slots, then the partner
-// column's): its heads' q (normed, rotated, x log2(e) / 16) into the staging rows (row s QR + its heads' index in the
-// pair), sigmoid(gate)
+// The next q object (a slot's heads, the step's slot A_SA + s; split: the slots of the chain's columns in order): its
+// heads' q (normed, rotated, x log2(e) / 16) into the staging rows (row s QR + its heads' index in the chain),
+// sigmoid(gate)
 __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int i = st[{{ A_QS }}], S = st[{{ A_S }}], QR = st[{{ A_QR }}];
     st[{{ A_QS }}] = i + 1;
-    const int own = i < S, s = own ? i : i - S;
-    const int h0 = QR == {{ QC }} ? 0 : {{ QC }} * (own ? st[{{ A_PAR }}] : 1 - st[{{ A_PAR }}]);
+    const int kc = QR == {{ QC }} ? 0 : (S == 1 ? i : i >> 1), s = i - S * kc, h0 = {{ QC }} * kc;  // (S <= 2: SUB)
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     const float *__restrict nrm = AW(float, {{ a.nrm }});
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * (st[{{ A_SA }}] + s);
@@ -388,7 +393,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int s = st[{{ A_KS }}];
     st[{{ A_KS }}] = s + 1;
-    const bfloat16 *__restrict kv = x + {{ 2 * META }} + {{ 2 * HD }} * (col >> 1);
+    const bfloat16 *__restrict kv = x + {{ 2 * META }} + {{ 2 * HD }} * al::div_small<{{ NPH }}>(col);
     const float *__restrict nrm = AW(float, {{ a.nrm }}) + 64 * st[{{ A_SA }}];
     float *__restrict kf = AW(float, {{ a.kf }});
     {{ p }}_norm_rope(kv, AW(float, {{ a.nrm }}) + {{ HD }}, nrm + {{ 2 * HD }} + 64 * s, nrm + {{ 2 * HD + 32 }} + 64 * s, kf);
@@ -436,7 +441,7 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
                 for (int s = 0; s < S; s++)
                     if (((p + s) >> 3) == r)
                         {{ p }}_put_k(rec, AW(uint8_t, {{ a.kb }}) + {{ 18 * ND }} * s, (p + s) & 7);
-                if (st[{{ A_PAR }}] == 0)
+                if (st[{{ A_ROLE }}] == {{ ROLE_K }})
                     al::copy<{{ REC_K // 4 }}, 16>(AW(uint32_t, {{ a.rec }}) + {{ REC_K // 4 }} * (r - rp), (const uint32_t *)rec);
             }
             AIE_LOOP_NO_UNROLL
@@ -479,8 +484,9 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
     }
 }
 
-// The attention is through (split, odd core: first the even core's partial over its groups merged in, pw its workspace
-// through shared memory): 1 / l per row (8 lanes each); st[A_NE] R objects (o, then the records)
+// The attention is through (split: first the west neighbour's partial merged in, pw its workspace through shared
+// memory; the partial of a core with an east neighbour then stays for it): 1 / l per row (8 lanes each); st[A_NE] R
+// objects (o, then the records)
 __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -491,10 +497,9 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
         return;
     }
     const int S = st[{{ A_S }}], nsets = (st[{{ A_QR }}] * S + 3) >> 2;
-    st[{{ A_NE }}] = st[{{ A_NO }}] + (st[{{ A_PAR }}] ? {{ 2 * (REC_V + ROWS_B) // (2 * C_LEN) }} : {{ 2 * REC_K // (2 * C_LEN) }});
-    if (st[{{ A_TP }}])  // (the even core of a split step: its partial stays for the odd core)
-        return;
-    AIE_LOOP_NO_UNROLL
+    const int role = st[{{ A_ROLE }}];
+    st[{{ A_NE }}] = st[{{ A_NO }}] + (role == {{ ROLE_V }} ? {{ 2 * (REC_V + ROWS_B) // (2 * C_LEN) }} :
+                                       role == {{ ROLE_K }} ? {{ 2 * REC_K // (2 * C_LEN) }} : 0);
     for (int set = 0; set < (st[{{ A_TC }}] ? nsets : 0); set++) {  // m = max(m_e, m_o): y, l = both rescaled, summed
         float *__restrict ml = AW(float, {{ a.ml }}) + 64 * set;
         const float *__restrict me = (const float *)pw + {{ a.ml // 4 }} + 64 * set;
@@ -506,6 +511,8 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
         {{ p }}_mrg((const float __aie_dm_resource_a *)y, y, (const float __aie_dm_resource_b *)ye,
                     {{ p }}_exp2(aie::sub(m0, mx)), {{ p }}_exp2(aie::sub(m1, mx)));
     }
+    if (st[{{ A_TP }}])  // (a split step's core with an east neighbour: its partial stays for it)
+        return;
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < nsets; set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + {{ 32 * ND }};
@@ -514,8 +521,8 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
 }
 
 // The next R object: of o ([head QR][k block 32][slot S][8] bf16: the sub-step's slots, o = y / l * sigmoid(gate)),
-// then of the records (the even column the K records of the step's first and last positions, the odd one their V
-// panels and rows: the same record twice when one holds both)
+// then of the records (a chain's first column the K records of the step's first and last positions, its last one
+// their V panels and rows: the same record twice when one holds both)
 __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict r)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -524,7 +531,7 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
     st[{{ A_EIDX }}] = e + 1;
     if (e >= no) {
         const int k = e - no, p = st[{{ A_P }}], one = (p >> 3) == ((p + S - 1) >> 3);
-        const int nr = st[{{ A_PAR }}] ? {{ (REC_V + ROWS_B) // (2 * C_LEN) }} : {{ REC_K // (2 * C_LEN) }};
+        const int nr = st[{{ A_ROLE }}] == {{ ROLE_V }} ? {{ (REC_V + ROWS_B) // (2 * C_LEN) }} : {{ REC_K // (2 * C_LEN) }};
         const int second = k >= nr;
         aie::store_v(r, aie::load_v<{{ C_LEN }}>(AW(bfloat16, {{ a.rec }}) + {{ C_LEN }} * (k - (second ? nr : 0) + (second && !one ? nr : 0))));
         return;
@@ -549,15 +556,18 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
 
 
 class AttnShape:
-    """The attention core's sizes for a model: QC query heads per column, the query-row sets, the cache's capacity."""
+    """The attention core's sizes for a model: QC query heads per column, NPH columns per KV head (a chain), the
+    query-row sets, the cache's capacity."""
 
     def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = 9280, xpay: int = 4096):
-        assert cfg.head_dim == HD and cfg.num_key_value_heads * 2 == COLS and cfg.rope_dims == 2 * ROT
-        assert cfg.num_attention_heads % COLS == 0
+        assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
+        self.kvh = cfg.num_key_value_heads
+        assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay
+        self.nph = COLS // self.kvh
         self.qc = cfg.num_attention_heads // COLS
         assert 1 <= self.qc <= 4 and 2 * 2 * self.qc * HD <= xpay and 4 * (2 * HD + 64 * SMAX) <= xpay
         assert REC.pg(a_bytes) == POS_PER_GROUP
-        self.rows = SMAX * self.qc
+        self.rows = SUB * self.nph * self.qc  # (a split sub-step's query rows at most)
         self.sets = -(-self.rows // 4)
         self.c_len, self.a_bytes = c_len, a_bytes
         self.eps = cfg.rms_norm_eps
@@ -565,17 +575,29 @@ class AttnShape:
         self.max_positions = self.groups * POS_PER_GROUP
         self.head_bytes = 3 * a_bytes * self.groups  # a KV head's cache
 
-    def n_rel(self, par: int, split: bool, n: int) -> int:
-        """R objects of a sub-step of n slots of a column of parity par: o (split: the odd column's of the pair's heads,
-        none of the even column), then two records (the even column K records, the odd one V panels and rows)."""
-        no = 4 * n * ((2 * self.qc if par else 0) if split else self.qc)
-        return no + 2 * ((REC_V + ROWS_B if par else REC_K) // (2 * self.c_len))
+    def role(self, c: int) -> int:
+        """Column c's role in its KV head's chain (``ROLE_K``: its first, ``ROLE_V``: its last, ``ROLE_O``)."""
+        k = c % self.nph
+        return ROLE_K if k == 0 else ROLE_V if k == self.nph - 1 else ROLE_O
+
+    def n_rel(self, c: int, split: bool, n: int) -> int:
+        """R objects of a sub-step of n slots of column c: o (split: the chain's last column's of the chain's heads),
+        then two records (the chain's first column K records, its last one V panels and rows)."""
+        role = self.role(c)
+        no = 4 * n * ((self.nph * self.qc if role == ROLE_V else 0) if split else self.qc)
+        return no + {ROLE_K: 2 * REC_K, ROLE_V: 2 * (REC_V + ROWS_B), ROLE_O: 0}[role] // (2 * self.c_len)
 
     @staticmethod
     def splits(g: int) -> bool:
-        """Whether a sub-step whose slots are in group g splits the cache between a column pair (from 4 groups on: the
+        """Whether a sub-step whose slots are in group g splits the cache along the chains (from 4 groups on: the
         same for each of its positions in every step)."""
         return g >= 3
+
+    def bounds(self, g: int) -> list[int]:
+        """A split sub-step in group g: the groups of the chain's cores, core k's from bounds[k] to bounds[k + 1]."""
+        G = g + 1
+        assert G >= self.nph
+        return [G * k // self.nph for k in range(self.nph + 1)]
 
     def workspace(self) -> dict[str, int]:
         """Byte offsets of the core's workspace regions (and "size"). y: per set its blocks [db][row 4 x 8] fp32, then
@@ -593,10 +615,11 @@ class AttnShape:
         return out
 
     def render(self, p: str, consts: dict[str, int]) -> str:
-        return _SRC.render(p=p, a=Attr(self.workspace()), QC=self.qc, SETS=self.sets, SMAX=SMAX, HD=HD, ND=ND,
+        return _SRC.render(p=p, a=Attr(self.workspace()), QC=self.qc, NPH=self.nph, SETS=self.sets, SMAX=SMAX, HD=HD, ND=ND,
                            REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps), C_LEN=self.c_len,
                            qc=bf16_hilo(math.log2(math.e) / 16),
-                           **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k.startswith("A_")}))
+                           **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items()
+                                                            if k.startswith(("A_", "ROLE_"))}))
 
 
 # ----------------------------------------------------------------------

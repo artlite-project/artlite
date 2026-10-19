@@ -18,16 +18,6 @@ from .qwen35_ref import QwenConfig, qwen_gguf
 S = 9280
 
 
-def _padded(f: dict[str, np.ndarray], kc: int) -> dict[str, np.ndarray]:
-    """Fields of a chunk narrower than kc columns (a padded K's last) with zero super-blocks to kc."""
-    sb = f["q" if "q" in f else "w"].shape[1] // 256
-    out = {}
-    for k, v in f.items():
-        n = kc if k in ("q", "w") else v.shape[1] * (kc // 256) // sb
-        out[k] = np.concatenate([v, np.zeros((v.shape[0], n - v.shape[1], *v.shape[2:]), v.dtype)], axis=1)
-    return out
-
-
 @pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_layout(size: str) -> None:
     path = qwen_gguf("Q4_K_M", size)
@@ -72,7 +62,7 @@ def test_layout(size: str) -> None:
     tiles = pack_rows([t], blk.rows[5, :blk.R], blk.fmt, blk.R, S, dn.n_kc)
     k0 = (dn.n_kc - 1) * KC
     f = slice_fields(t.fields(), blk.rows[5, :blk.R], k0=k0, cols=t.cols, kc=KC)
-    assert np.array_equal(tiles[0, -1], pack_tile(blk.fmt, _padded(f, KC) if t.cols - k0 < KC else f, S))
+    assert np.array_equal(tiles[0, -1], pack_tile(blk.fmt, f, S))
 
 
 @pytest.mark.parametrize("size", ["9B", "1B"])

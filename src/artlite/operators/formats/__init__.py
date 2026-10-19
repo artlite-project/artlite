@@ -128,14 +128,12 @@ def choose_tile_bytes(formats: dict[str, int], nsb: int = 8, gu: dict[str, int] 
 
 
 def slice_fields(f: dict[str, np.ndarray], rows: np.ndarray, *, k0: int, cols: int, kc: int) -> dict[str, np.ndarray]:
-    """Rows and the kc-column chunk at k0 of QTensor.fields() arrays."""
+    """Rows and the kc-column chunk at k0 of QTensor.fields() arrays (columns past ``cols``: zero fields, a K padded
+    to whole chunks as the packer pads it)."""
     out = {}
     for k, v in f.items():
-        if k in ("q", "w"):
-            out[k] = v[rows, k0:k0 + kc]
-        elif v.ndim == 2:  # (rows, blocks along K)
-            per = cols // v.shape[1]
-            out[k] = v[rows, k0 // per:(k0 + kc) // per]
-        else:  # (rows, super-blocks, n)
-            out[k] = v[rows, k0 // 256:(k0 + kc) // 256]
+        per = 1 if k in ("q", "w") else cols // v.shape[1] if v.ndim == 2 else 256  # (columns per entry along K)
+        x = v[rows, k0 // per:(k0 + kc) // per]
+        n = kc // per - x.shape[1]
+        out[k] = np.concatenate([x, np.zeros((x.shape[0], n, *x.shape[2:]), x.dtype)], axis=1) if n else x
     return out

@@ -21,8 +21,8 @@ base rows before the next decode step. Per step
 the columns load the slots' residual slices (F_LOADR), then per layer
 
 - GDN layer: gdn_in (normed; F_MSG: its rows to the GDN cores) | the GDN step (``gdn``) | gdn_out;
-- attention layer: attn_in (normed; q + gate to the F_ATT regions, K / V halves to the raw objects) | the attention
-  (the cache through A; o and two records relayed through C) | attn_out;
+- attention layer: attn_in (normed; q + gate to the F_ATT regions, the column's parts of K / V to the raw objects) | the
+  attention (the cache through A; o and the records relayed through C, ``attn``'s chains) | attn_out;
 - gate_up | down (its K groups);
 
 and the LM head (normed) -> LOGITS. The transfers go out in rounds over the columns (a phase's weights, inputs,
@@ -89,17 +89,19 @@ DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart
 
 
 class _Step:
-    """The transaction of a step of S slots (its attentions' sub-steps ``subs``: first slot, slots, whether the column
-    pairs divide their caches' groups) and its words that follow the position: the KV cache and ring reads (A: their
+    """The transaction of a step of S slots (its attentions' sub-steps ``subs``: first slot, slots, whether the
+    chains divide their caches' groups) and its words that follow the position: the KV cache and ring reads (A: their
     address and length) and the record drains (C: their address)."""
 
     def __init__(self, S: int, subs: tuple[tuple[int, int, bool], ...]):
         self.S, self.subs = S, subs
         self.tr: Transaction | None = None
-        self.fills: list[tuple[int, int, int, int, str]] = []  # (BD word index, layer, column, sub-step, which groups)
+        # (BD word index, layer, column, sub-step, which groups: "all", the column's "run" of a split, "new": the
+        # sub-step's group)
+        self.fills: list[tuple[int, int, int, int, str]] = []
         self.tails: list[tuple[int, int, int, int, int]] = []  # (BD word index, layer, column, sub-step, tail object)
-        # (BD handle, layer, column, sub-step, i-th record drain: the even column's K records 0, 1; the odd column's
-        # V panels and rows of record 0, then of record 1)
+        # (BD handle, layer, column, sub-step, i-th record drain: a chain's first column's K records 0, 1; its last
+        # column's V panels and rows of record 0, then of record 1)
         self.drains: list[tuple[list[int], int, int, int, int]] = []
 
 
@@ -170,13 +172,13 @@ class QwenOverlay(ModelOverlay):
             if cfg.attention[L]:  # ([column][F_ATT per sub-step], then [column][q objects SLOTS])
                 self.fatt[L] = take("ACT", COLS * (attn.U + SLOTS) * XB)
                 self.rawkv[L] = take("ACT", SLOTS * XB)
-                self.kv_off[L] = take("KV", 4 * self.ash.head_bytes)
+                self.kv_off[L] = take("KV", self.ash.kvh * self.ash.head_bytes)
             else:
                 self.gobj[L] = take("GOBJ", COLS * self.gcol)
                 self.gstate[L] = take("GSTATE", COLS * self.ps)
                 self.ghdr[L] = take("GHDR", COLS * HSLOT)
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
-            self.ring_off[L] = take("KV", COLS // 2 * 2 * self.T)
+            self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
         if self.ash is not None:  # (the prefill's slices past the end; a step's second record; a tail fill's T bytes)
             take("KV", (KV_PAD // attn.POS_PER_GROUP + 1) * 3 * self.T)
         self._sizes()
@@ -334,46 +336,50 @@ class QwenOverlay(ModelOverlay):
     def _attention(self, seq: Sequence, st: _Step, L: int, S: int) -> None:
         """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them)."""
         dev, ash, T = self.dev, self.ash, self.T
-        qc = ash.qc
+        qc, nph = ash.qc, ash.nph
+        per = ash.kvh * attn.HD // COLS  # (K and V rows of a column: its part of KV head per c // HD)
         self._weights(seq, (L, "attn_in"), 0)
         seq.sync()
         self._inputs(seq, self.inp[(L, "attn_in")][0], S)
-        for c in range(COLS):  # [q + gate | K half | V half] per slot -> its q object, the slot's raw K, V object
-            h, half = c // 2, c % 2
+        for c in range(COLS):  # [q + gate | K part | V part] per slot -> its q object, the slot's raw K, V object
+            h, e0 = divmod(per * c, attn.HD)
             q0 = self._q(L, c, 0) + 4 * META
             seq.drain("C", c, dev.address("ACT", q0), S * qc * 2 * 2 * attn.HD, (C_LEN // 2, S, XB // 4, C_LEN // 2))
             raw = self.rawkv[L] + 4 * META
             for part in (0, 1):
-                seq.drain("C", c, dev.address("ACT", raw + 2 * (512 * h + 256 * part + 128 * half)), S * 256,
+                seq.drain("C", c, dev.address("ACT", raw + 2 * (2 * attn.HD * h + attn.HD * part + e0)), S * 2 * per,
                           (C_LEN // 2, S, XB // 4, C_LEN // 2))
         for u, (a, n, split) in enumerate(st.subs):
             if u:
                 seq.sync()  # (sub-step u - 1's records in DDR)
             for c in range(COLS):  # the cache of the column's KV head (address, length: _set_position), its ring
-                kinds = (("all",) if not split else ("odd",) if c % 2 else ("even", "new"))
-                for kind in kinds:  # (split: the even column its first groups, then the new positions' for their records)
-                    at = seq.fill("A", c, dev.address("KV", self.kv_off[L] + c // 2 * ash.head_bytes), 3 * T)
+                kinds = ("all",) if not split else ("run", "new") if c % nph == 0 else ("run",)
+                for kind in kinds:  # (split: the chain's first column its run, then the new positions' for their records)
+                    at = seq.fill("A", c, dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes), 3 * T)
                     st.fills.append((at, L, c, u, kind))
-                if not split or c % 2:  # (a column that attends to the newest group: the tail objects)
-                    st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // 2)), T), L, c, u, t)
+                if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
+                    st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T), L, c, u, t)
                                  for t in range(tails(n))]
             if u == 0:
                 seq.sync()  # (attn_in's q, K, V in DDR)
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", self._fatt(L, c, u)), XB)
-                seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
-                if split:  # (the pair's other column's q objects)
-                    seq.fill("X", c, dev.address("ACT", self._q(L, c ^ 1, a)), n * XB)
+                if split:  # (the q objects of the chain's columns, in order)
+                    seq.fill("X", c, dev.address("ACT", self._q(L, c - c % nph, a)), nph * n * XB,
+                             (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
+                else:
+                    seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
                 seq.fill("X", c, dev.address("ACT", self.rawkv[L] + a * XB), n * XB)
-            for c in range(COLS):  # o (the column's heads in attn_out's x at the sub-step's slots; split: the odd
-                # column's of the pair's), then the records (addresses: _set_position)
-                if not split or c % 2:
-                    h0, nh = (qc * (c - 1), 2 * qc) if split else (qc * c, qc)
+            for c in range(COLS):  # o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's
+                # last column's of the chain's), then the records (addresses: _set_position)
+                role = ash.role(c)
+                if not split or role == attn.ROLE_V:
+                    h0, nh = (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc)
                     at, left = self._x_at((L, "attn_out"), attn.HD * h0)
                     assert left >= 2048 * nh
                     seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * n * 32 * nh,
                               None if n == SLOTS else (4 * n, 32 * nh, 16, 16 * 32 * nh))
-                sizes = (attn.REC_V, attn.ROWS_B) * 2 if c % 2 else (attn.REC_K,) * 2
+                sizes = {attn.ROLE_K: (attn.REC_K,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
                 for k, nb in enumerate(sizes):
                     hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb)
                     st.drains.append((hd, L, c, u, k))
@@ -403,7 +409,7 @@ class QwenOverlay(ModelOverlay):
 
     def subs(self, p: int, S: int) -> tuple[tuple[int, int, bool], ...]:
         """The attention's sub-steps of a step at p .. p + S - 1 (``overlay.vring.substeps``): (first slot, slots,
-        whether the column pairs divide the cache: by its group alone)."""
+        whether the chains divide the cache: by its group alone)."""
         if self.ash is None:
             return ()
         return tuple((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP))
@@ -418,6 +424,7 @@ class QwenOverlay(ModelOverlay):
         assert 0 <= p and p + S <= self.max_positions, (p, S)
         assert st.subs == self.subs(p, S), (p, S, st.subs)
         dev, ash, T = self.dev, self.ash, self.T
+        nph = ash.nph
         act = dev.view("ACT")
         cs = np.zeros((SLOTS, 64), np.float32)
         for s in range(S):
@@ -429,49 +436,53 @@ class QwenOverlay(ModelOverlay):
                 self.vring.check(L, p, p)
         for u, (a, n, split) in enumerate(st.subs):
             q, g = p + a, (p + a) // attn.POS_PER_GROUP
-            G, ne = g + 1, (g + 1) // 2  # (groups through g; split: the even column's attention groups 0 .. ne - 1)
-            groups.append({"all": (0, G), "even": (0, ne), "new": (g, g + 1), "odd": (ne, G)})
+            G = g + 1  # (groups through g; split: chain core k's attention groups b[k] .. b[k + 1] - 1)
+            b = ash.bounds(g) if split else [0] * (nph + 1)
+            groups.append({(c, "all"): (0, G) for c in range(COLS)} | {(c, "new"): (g, g + 1) for c in range(COLS)}
+                          | {(c, "run"): (b[c % nph], b[c % nph + 1]) for c in range(COLS)})
             for L in self.fatt:
                 for c in range(COLS):
                     o = self._fatt(L, c, u)
                     m = act[o:o + 4 * META].view(np.int32)
-                    nt = tails(n) if not split or c % 2 else 0
-                    m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, a, (3 if split else 2) * n, int(split)
-                    m[M_NREL], m[M_NTAIL], m[M_ATREC] = ash.n_rel(c % 2, split, n), nt, int(rec_mode[L] and u == 0)
+                    k = c % nph
+                    nt = tails(n) if not split or ash.role(c) == attn.ROLE_V else 0
+                    m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, a, (nph + 1 if split else 2) * n, int(split)
+                    m[M_NREL], m[M_NTAIL], m[M_ATREC] = ash.n_rel(c, split, n), nt, int(rec_mode[L] and u == 0)
                     if not split:
                         m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * G + nt, 0, 1 << 20, 0
-                    elif c % 2 == 0:
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (ne + 1), 0, ne, g
+                    elif k == 0:  # (then group g for its K records)
+                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[1] + 1), 0, b[1], g
                     else:
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (G - ne) + nt, ne, 1 << 20, 0
+                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
                     q0 = o + 4 * META + 4 * 2 * attn.HD
                     act[q0:q0 + cs.nbytes] = cs.view(np.uint8).reshape(-1)
         for L in self.fatt:
             dev.flush("ACT", self.fatt[L], COLS * attn.U * XB)
         w = st.tr.words
         for at, L, c, u, kind in st.fills:
-            g0, g1 = groups[u][kind]
-            w[at:at + 3] = txn.bd_words(dev.address("KV", self.kv_off[L] + c // 2 * ash.head_bytes + 3 * g0 * T),
+            g0, g1 = groups[u][(c, kind)]
+            w[at:at + 3] = txn.bd_words(dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes + 3 * g0 * T),
                                         3 * (g1 - g0) * T)
         for at, L, c, u, t in st.tails:  # (the ring slots of the sub-step's first and last records, or the first's V
             a, n, _ = st.subs[u]  # panels in record mode)
             r = (p + a + (n - 1 if t else 0)) >> 3
             if rec_mode[L] and u == 0 and t == 0:
-                off = self.kv_off[L] + c // 2 * ash.head_bytes + 3 * (r // 4) * T + 2 * T + r % 4 * attn.REC_V
+                off = self.kv_off[L] + c // nph * ash.head_bytes + 3 * (r // 4) * T + 2 * T + r % 4 * attn.REC_V
             else:
-                off = self.ring(L, c // 2) + (r & 1) * T
+                off = self.ring(L, c // nph) + (r & 1) * T
             w[at:at + 3] = txn.bd_words(dev.address("KV", off), T)
         for hd, L, c, u, k in st.drains:
             a, n, _ = st.subs[u]
-            r = (p + a + (n - 1 if (k >= 2 if c % 2 else k) else 0)) >> 3
+            v = ash.role(c) == attn.ROLE_V
+            r = (p + a + (n - 1 if (k >= 2 if v else k) else 0)) >> 3
             g, j = r // 4, r % 4
-            head = self.kv_off[L] + c // 2 * ash.head_bytes + 3 * g * T
-            if c % 2 == 0:
+            head = self.kv_off[L] + c // nph * ash.head_bytes + 3 * g * T
+            if not v:
                 off, nb = head + j // 2 * T + j % 2 * attn.REC_K, attn.REC_K
             elif k % 2 == 0:
                 off, nb = head + 2 * T + j * attn.REC_V, attn.REC_V
             else:
-                off, nb = self.ring(L, c // 2) + (r & 1) * T, attn.ROWS_B
+                off, nb = self.ring(L, c // nph) + (r & 1) * T, attn.ROWS_B
             w[hd[0]:hd[0] + 3] = txn.bd_words(dev.address("KV", off), nb)
         st.tr.flush()
 

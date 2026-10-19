@@ -4,7 +4,8 @@ cores of every column, their GEMV phases) with the qwen35 cores:
 - GDN (c, 2), with ``gdn``: the Gated DeltaNet step of S slots (``qwen35/gdn.py``) on the gdn_in phase's rows (the main
   core's M stream), outputs on D;
 - attention (c, 5), with ``attn``: the full-attention layers' attention of S slots (``qwen35/attn.py``), the KV cache
-  through A (broadcast with the main core's), outputs relayed by the main core (shared-memory FIFO R) to C.
+  through A (broadcast with the main core's), outputs relayed by the main core (shared-memory FIFO R) to C; a KV head's
+  chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair.
 
 Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
 ``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
@@ -155,11 +156,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             tok_ty = np.ndarray[(16,), i32]
             k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, c_ty])
 
-            def attn_fn(a_f, x_f, r_f, t_f, abegin, anb, aq, aqpan, akv, aobj, aend, aemit, ws, pw, col):
-                # t_f: the pair's token, every attention step: the even core produces it around its scores (a split
-                # step's even partial stays in its workspace, pw, until the odd core has merged it), the odd core
-                # consumes it around its end (the merge)
-                odd = col % 2 == 1
+            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, aend, aemit, ws, pw, col):
+                # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
+                # attention step: a core produces its east token around its scores (a split step's partial stays in its
+                # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
+                # of the west partial, pw)
                 for _ in forever_():
                     x = x_f.acquire(1)
                     abegin(x, ws, col)
@@ -178,8 +179,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                         a_f.acquire(1)
                         a_f.release(1)
                     for _ in range32(ws[i_a + AT.A_NQP]):  # (an attention step)
-                        if not odd:
-                            t_f.acquire(1)
+                        for t in t_out:
+                            t.acquire(1)
                         for _ in range32(ws[i_a + AT.A_NQ]):
                             x = x_f.acquire(1)
                             aq(x, ws)
@@ -193,12 +194,14 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             a = a_f.acquire(1)
                             aobj(a, ws)
                             a_f.release(1)
-                        if odd:
-                            t_f.acquire(1)
+                        if t_in:
+                            t_in[0].acquire(1)
                             aend(ws, pw)
-                            t_f.release(1)
+                            t_in[0].release(1)
+                            for t in t_out:
+                                t.release(1)
                         else:
-                            t_f.release(1)
+                            t_out[0].release(1)
                             aend(ws, pw)
                         for _ in range32(ws[i_a + AT.A_NE]):
                             r = r_f.acquire(1)
@@ -207,12 +210,14 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
             aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
                           tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
-            toks = [ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(0, COLS, 2)]
+            n = attn.nph
+            toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS) if c % n < n - 1}  # (c -> c + 1)
             for c in range(COLS):
-                tok = toks[c // 2].cons() if c % 2 else toks[c // 2].prod()
-                workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=1), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(), tok,
-                                                k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_aend, k_aemit, aws[c],
-                                                aws[c & ~1], c],
+                t_in = [toks[c - 1].cons()] if c % n else []
+                t_out = [toks[c].prod()] if c in toks else []
+                workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=1), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(),
+                                                t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_aend,
+                                                k_aemit, aws[c], aws[c - 1 if c % n else c], c],
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
