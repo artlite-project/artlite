@@ -333,21 +333,21 @@
 <circle cx="364.7" cy="571.8" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 18.1 s</title></circle>
 <circle cx="383.6" cy="546.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 46.6 s</title></circle>
 <circle cx="402.4" cy="517.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 128k tokens: 136 s</title></circle>
-<polyline points="270.6,698.4 327.1,638.3 364.7,585.3 383.6,554.2" class="l0"/>
-<circle cx="270.6" cy="698.4" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.171 s</title></circle>
-<circle cx="327.1" cy="638.3" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 1.56 s</title></circle>
-<circle cx="364.7" cy="585.3" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 11.0 s</title></circle>
-<circle cx="383.6" cy="554.2" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 34.6 s</title></circle>
+<polyline points="270.6,699.0 327.1,641.1 364.7,592.1 383.6,563.1" class="l0"/>
+<circle cx="270.6" cy="699.0" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.167 s</title></circle>
+<circle cx="327.1" cy="641.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 1.41 s</title></circle>
+<circle cx="364.7" cy="592.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 8.56 s</title></circle>
+<circle cx="383.6" cy="563.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 24.9 s</title></circle>
 <text x="409.4" y="521.1" class="halo">136 s</text>
-<text x="390.6" y="558.2" class="halo">34.6 s</text>
-<path d="M267.6,692.4h6M270.6,692.4V667.3M267.6,667.3h6" class="bracket"/>
-<text x="277.6" y="683.8" class="lbl halo">3.9×</text>
-<path d="M380.6,548.2h6M383.6,548.2V552.1M380.6,552.1h6" class="bracket"/>
-<text x="376.6" y="554.1" text-anchor="end" class="lbl halo">1.3×</text>
+<text x="390.6" y="567.1" class="halo">24.9 s</text>
+<path d="M267.6,693.0h6M270.6,693.0V667.3M267.6,667.3h6" class="bracket"/>
+<text x="277.6" y="684.2" class="lbl halo">4.0×</text>
+<path d="M380.6,557.1h6M383.6,557.1V552.1M380.6,552.1h6" class="bracket"/>
+<text x="376.6" y="558.6" text-anchor="end" class="lbl halo">1.9×</text>
 <text x="287.4" y="522.1" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 287.4 522.1)">10 tok/s</text>
 <text x="286.3" y="568.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 286.3 568.8)">100 tok/s</text>
 <text x="310.1" y="607.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 310.1 607.5)">1k tok/s</text>
-<text x="393.6" y="603.4" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 393.6 603.4)">10k tok/s</text>
+<text x="386.5" y="610.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 386.5 610.6)">10k tok/s</text>
 <text x="236.0" y="753.9" text-anchor="middle" class="muted">prompt length, tokens</text>
 <text x="24.0" y="781.9">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
 <text x="24.0" y="797.9">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>

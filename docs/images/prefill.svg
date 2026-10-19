@@ -163,15 +163,15 @@
 <line x1="24" y1="778.0" x2="856" y2="778.0" class="grid"/>
 <text x="24" y="796.0" class="h">MiniCPM-V 4.7 1B</text>
 <text x="152.7" y="814.5" text-anchor="end" class="lbl">Q4_K_M</text>
-<path d="M162.7,804.0h189.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-189.4z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 1k-token prompt: 6000</title></path>
-<text x="361.1" y="814.5">6000</text>
-<path d="M524.4,804.0h92.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-92.0z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 32k-token prompt: 2980</title></path>
-<text x="625.4" y="814.5">2980</text>
+<path d="M162.7,804.0h193.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-193.2z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 1k-token prompt: 6118</title></path>
+<text x="364.9" y="814.5">6118</text>
+<path d="M524.4,804.0h119.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-119.3z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 32k-token prompt: 3827</title></path>
+<text x="652.7" y="814.5">3827</text>
 <text x="152.7" y="829.5" text-anchor="end" class="lbl2">FastFlowLM 1.0.9 q4nx</text>
 <path d="M162.7,819.0h44.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-44.9z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 1k-token prompt: 1518</title></path>
 <text x="216.6" y="829.5">1518<tspan dx="10" class="strong">Artlite 4.0× faster</tspan></text>
 <path d="M524.4,819.0h54.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-54.3z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 32k-token prompt: 1810</title></path>
-<text x="587.7" y="829.5">1810<tspan dx="10" class="strong">Artlite 1.6× faster</tspan></text>
+<text x="587.7" y="829.5">1810<tspan dx="10" class="strong">Artlite 2.1× faster</tspan></text>
 <text x="24.0" y="882.0">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
 <text x="24.0" y="898.0">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
 <text x="24.0" y="914.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
