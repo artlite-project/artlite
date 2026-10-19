@@ -59,7 +59,7 @@ positions (transformers' `get_rope_index`; llama.cpp numbers the markers like te
 
 The encoder (`vision/minicpmv.py`) runs on Stable Diffusion's static design (`sd15/`, in a hardware context of its own):
 one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final merger) on two entries, or on
-one larger than 64 tokens alone, in about 65 ms: about 32 ms per entry (llama.cpp on the CPU: ~0.2 s per entry). The 4x
+one larger than 64 tokens alone, in about 60 ms: about 30 ms per entry (llama.cpp on the CPU: ~0.2 s per entry). The 4x
 file has no ViT merger, so its 27 layers all run on 1024 tokens per entry: about 65 ms per entry. Its weights are
 converted to bfp16 at the first load and cached with the dispatches, as Stable Diffusion's (~0.7 GB, the cache
 directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next turns do not run it again.

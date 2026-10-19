@@ -521,8 +521,10 @@ def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> tupl
     memtile: per source band LN1 -> Q, K, V^T panels (to DDR); per merged tile (two token panels: 8 windows of each
     image per column) the window attention of the 4 sources' rows -> o's rows (to DDR); per source band O + x (to DDR);
     per merged tile its 4 sources' rows of that as one tile of 16 merged tokens (5120 channels), their records and
-    panels (the mean's K), LayerNorm(4608), up + GELU, down + the mean -> the tile's rows of the band (DDR); the band's
-    C tiles and LayerNorm records."""
+    panels (the mean's K, to DDR), LayerNorm(4608) (to DDR: the band's panels); up + GELU on the band's 64 merged
+    tokens a column (m 64: its 100 MB of weights streamed once, not per tile of 16), the hidden to DDR in chunks; per
+    merged tile its hidden and mean panels back, down + the mean -> the tile's rows of the band (DDR); the band's C
+    tiles and LayerNorm records."""
     lv, lp, l16 = x.lv, POST, vit_level(1, 16)
     pn, ct = lv.pn(C), lv.ct(C)  # (bytes per column: a band's panels, C tiles)
     ob = L.ct_bytes(64)  # (an 80-channel block's C-tile object in a band)
@@ -561,15 +563,12 @@ def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> tupl
         gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=xb, res=xb)
         free(bd, o)
         x2.store(bd, s, xb, defer=False)
-    for j in range(4):  # (merged tile j's MLP)
-        spare = bd.mem.alloc(4096, top=True)  # (the down GEMM's A walk reads past its panels' end)
-        xp = alloc(bd, l16, MERGED, "pn", top=True)
-        nl = alloc(bd, l16, MERGED, "pn")  # (below mc: mc's memory and what follows it then takes the hidden)
-        mc = alloc(bd, l16, MERGED)
-        ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
-        fills = [_xfer(bd, x2.band(s), ct, fill=True, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=2 * j * 1280,
-                       mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)) for s in range(4)]
-        bd.op(bd.merge(*fills), {})
+    pn16, pn64 = l16.pn(MERGED), lp.pn(MERGED)  # (bytes per column: a merged tile's panels, the band's)
+    for j in range(4):  # (merged tile j's LayerNorm(4608) panels into the band's (DDR: its token panels 2 j, 2 j + 1)
+        # and its panels for the mean's K (DDR))
+        xp = alloc(bd, l16, MERGED, "pn")
+        nl = alloc(bd, l16, MERGED, "pn")
+        mc = _merged(bd, [(x2.band(s), 2 * j) for s in range(4)], name)
         rec = bd.mem.alloc(ln_rec(l16))
         for h in range(2):  # (the panels and records in two copies of 8 passes: a command's biases reach 14; one record
             # over both)
@@ -581,19 +580,40 @@ def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> tupl
             bd.apply(a, w["ds_g"], w["ds_b"], name=f"{name}.ds_ln{h}")
         bd.mem.release(rec, ln_rec(l16))
         free(bd, mc)
+        bd.op(bd.merge(_xfer(bd, name + ".nl", pn64, fill=False, mem=nl.addr, nbytes=pn16, off=2 * j * 72,
+                             sdims=(36, MERGED // 8, 144, MERGED // 8 * 144)),
+                       _xfer(bd, name + ".xp", 4 * pn16, fill=False, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
+        free(bd, nl)
+        free(bd, xp)
+    # up + GELU on the band's 64 merged tokens a column (its weights streamed once), the hidden to DDR in chunks of 960
+    hb = HID // 8 * lp.pn(8)  # (a column's hidden panels: [kb 2160][token panel 8][72 B])
+    bd.table("gelu", gelu_table())
+    nl = alloc(bd, lp, MERGED, "pn")
+    spare = bd.mem.alloc(D.A_OBJ)  # (the GEMM's A walk reads past its panels' end)
+    bd.op(_xfer(bd, name + ".nl", pn64, fill=True, mem=nl.addr, nbytes=pn64), {})
+    nc = 960  # (3 passes a row)
+    g = alloc(bd, lp, nc, "pn")
+    for c in range(HID // nc):
+        gemm(bd, nl, w["up"][nc * c:nc * (c + 1)], w["up_b"][nc * c:nc * (c + 1)], name=f"{name}.up{c}", out=g,
+             kind="gelu")
+        bd.op(_xfer(bd, name + ".hid", hb, fill=False, mem=g.addr, nbytes=g.nbytes, off=c * g.nbytes), {})
+    free(bd, g)
+    bd.mem.release(spare, D.A_OBJ)
+    free(bd, nl)
+    for j in range(4):  # (merged tile j's down + the mean of 4: its hidden and mean panels from DDR)
+        spare = bd.mem.alloc(4096, top=True)  # (the down GEMM's A walk reads past its panels' end)
+        xp = alloc(bd, l16, MERGED, "pn", top=True)
         hid = alloc(bd, l16, HID, "pn", top=True)  # (directly below xp: the down GEMM's K is [hidden | xp])
         assert hid.addr + hid.size == xp.addr, (hid.addr, hid.size, xp.addr)
-        bd.table("gelu", gelu_table())
-        n6 = HID // 6  # (6 GEMMs of 9 passes a row: a command's biases reach 14)
-        for k in range(6):
-            gemm(bd, nl, w["up"][n6 * k:n6 * (k + 1)], w["up_b"][n6 * k:n6 * (k + 1)], name=f"{name}.up{k}",
-                 out=Tensor(l16, n6, hid.addr + n6 // 8 * l16.np * 72 * k, "pn"), kind="gelu")
-        free(bd, nl)
+        bd.op(bd.merge(_xfer(bd, name + ".hid", hb, fill=True, mem=hid.addr, nbytes=hid.nbytes, off=2 * j * 72,
+                             sdims=(36, HID // 24, 144, HID // 24 * 144)),
+                       _xfer(bd, name + ".xp", 4 * pn16, fill=True, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
         y = alloc(bd, l16, C)
         gemm(bd, Tensor(l16, HID + MERGED, hid.addr, "pn"), w["down"], w["down_b"], name=name + ".down", out=y)
         free(bd, hid)
         free(bd, xp)
         bd.mem.release(spare, 4096)
+        ct16 = l16.ct(80)
         bd.op(_xfer(bd, y2.band(0), ct, fill=False, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
                     mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
         free(bd, y)
