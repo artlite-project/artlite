@@ -9,9 +9,9 @@ cores of every column, their GEMV phases) with the qwen35 cores:
 
 Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
 ``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
-column pair divides the cache's groups (1); the core's first group, the end of its attention groups, the first group
-past them (the even core's: the sub-step's group, for its records only); its first slot in the step; record mode (the
-first tail object is the open record's V panels); the tail objects.
+KV head's chain divides the cache's groups (1); the core's first group, the end of its attention groups, the first
+group past them (a chain's first core's: the sub-step's group, for its records only); its first slot in the step;
+record mode (the first tail object is the open record's V panels); the tail objects.
 """
 
 import numpy as np
