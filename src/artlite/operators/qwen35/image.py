@@ -11,10 +11,13 @@ Per-column rows (the columns' work is independent up to each output projection):
 - attention layers ("attn_in"): column c holds q heads 3c .. (27B; 9B: 2 per column) with their gate rows
   (``attn_q``: per head [q 256 | gate 256]), and rows 128 c .. of ``attn_k`` and of ``attn_v`` (half a KV head).
 - "gate_up": ``overlay.image.gate_up_rows``; "down", "gdn_out" (``ssm_out``), "attn_out" (``attn_output``): rows
-  hidden / 8 c ..; "lm": rows vocab / 8 c .. of ``output``.
+  hidden / 8 c ..; "lm": rows vocab / 8 c .. of ``output``, the vocabulary padded to whole C objects per column
+  (MiniCPM-V's 248094 -> 248320; padding rows -1: zero tiles).
 
-The activation objects' payload (``payload``: the K groups) is the hidden state rounded up to whole 4 KB state panels
-of the GDN cores (27B 6144, 9B 4096 elements): down takes its K chunks in groups (27B 1 of 17, 9B 4 of 12).
+down's K is the ffn padded to whole K chunks (MiniCPM-V's 3584 -> 4096: zero super-blocks, ``overlay.image``). The
+activation objects' payload (``payload``: the K groups) is the hidden state rounded up to whole 4 KB state panels of the
+GDN cores, at least 4096 elements (27B 6144, 9B and MiniCPM-V 4096): down takes its K chunks in groups (27B 1 of 17, 9B
+4 of 12, MiniCPM-V 4 of 4).
 """
 
 import numpy as np
@@ -22,6 +25,7 @@ import numpy as np
 from ...gguf_model import GGUFFile
 from ...model_config import QwenConfig
 from ..design import COLS
+from ..overlay.decode import C_LEN
 from ..overlay.image import TileImage, column_rows, gate_up_rows
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
@@ -29,8 +33,8 @@ KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 
 def payload(hidden: int) -> int:
     """bf16 elements of an activation object's payload: the hidden state, rounded up to whole 4 KB panels (the
-    GDN state objects carry whole panels)."""
-    return -(-hidden // 2048) * 2048
+    GDN state objects carry whole panels), at least 4096."""
+    return max(-(-hidden // 2048) * 2048, 4096)
 
 
 def gdn_v_heads(cfg: QwenConfig, c: int) -> list[int]:
@@ -44,21 +48,23 @@ class QwenImage(TileImage):
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0):
-        """layers: the layers to lay out (default: all); vocab: LM rows (default: the vocabulary; tests take
+        """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
-        super().__init__(gguf, kc=KC, payload=payload(H), tile_bytes=tile_bytes,
-                         vocab=cfg.vocab_size if vocab is None else vocab)
-        assert H % KC == 0 and I % KC == 0 and H % (8 * COLS) == 0 and I % (64 * COLS) == 0
+        if vocab is None:
+            vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
+        super().__init__(gguf, kc=KC, payload=payload(H), tile_bytes=tile_bytes, vocab=vocab)
+        assert H % KC == 0 and H % (8 * COLS) == 0 and I % (64 * COLS) == 0
         assert cfg.ssm_k_heads % COLS == 0 and cfg.num_attention_heads % COLS == 0
         assert cfg.num_key_value_heads * cfg.head_dim % (COLS * 64) == 0
         assert self.vocab % COLS == 0
         for layer in self.layers:
             self._layer(layer)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
-        self._add(-1, "lm", [("lm", (lm,), column_rows(self.vocab))], H)
+        rows = column_rows(self.vocab)
+        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
         self._place()
 
     def _layer(self, layer: int) -> None:

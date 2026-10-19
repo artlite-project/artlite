@@ -293,9 +293,11 @@ class ModelOverlay:
         self.dev.flush("ACT", rg.off + XB, xi.size)
 
     def _logits(self, S: int) -> torch.Tensor:
-        """The last step's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next dispatch)."""
+        """The last step's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next dispatch): the
+        LM rows of the vocabulary (an image's rows padded to whole C objects per column are cut off)."""
         self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
-        return torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
+        x = torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
+        return x[:, :min(self.vocab, self.cfg.vocab_size)]
 
     def _run(self, S: int, position: int, logits: bool) -> torch.Tensor | None:
         """Dispatch the step of S slots at ``position`` (its inputs written): its transaction (built at its first use),

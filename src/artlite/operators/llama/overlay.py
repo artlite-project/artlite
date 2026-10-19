@@ -13,7 +13,7 @@ per layer L (column c = KV head c):
   down's input (its K groups); down: into the residual, its copy out as the next layer's qkv input;
 
 and the LM head: output_norm -> LOGITS [slot][vocab] bf16 (the vocabulary padded to whole C objects per column: the
-padding rows' logits are cut off, ``_logits``).
+padding rows' logits are cut off, ``ModelOverlay._logits``).
 
 The KV caches (KV): per layer and KV head linear groups of kp + 1 objects of the tile size T (``overlay.kv``: kp K
 objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``), 128 positions per group at
@@ -442,10 +442,6 @@ class LlamaOverlay(ModelOverlay):
         self._write_loadr(xf)
         self._write_input(self.inp[(self.layers[0], "qkv")][0], interleave(xf, packed_slots(S)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
-
-    def _logits(self, S: int) -> torch.Tensor:
-        """(the padded vocabulary's real rows: the model's or the slice's ``vocab``)"""
-        return super()._logits(S)[:, :min(self.vocab, self.cfg.vocab_size)]
 
     def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions: K rotated, V as it is."""

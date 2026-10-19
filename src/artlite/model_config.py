@@ -57,9 +57,18 @@ def gemma_gguf(quant: str = "Q4_0", size: str = "E4B") -> str:
 
 def qwen_gguf(quant: str = "Q4_K_M", size: str = "27B") -> str:
     """The GGUF file of a qwen35-architecture model: Qwen3.6-27B (``size="27B"``), its MTP variant
-    Qwen3.8-27B (``"3.8-27B"``), Qwen3.5-9B (``"9B"``)."""
+    Qwen3.8-27B (``"3.8-27B"``), Qwen3.5-9B (``"9B"``), the language model of MiniCPM-V 4.7 1B (``"1B"``,
+    openbmb's: ``minicpmv_gguf``)."""
+    if size == "1B":
+        return minicpmv_gguf(quant)
     name = {"27B": "Qwen3.6-27B", "3.8-27B": "Qwen3.8-27B", "9B": "Qwen3.5-9B"}[size]
     return os.path.join(MODELS_DIR, "lmstudio-community", f"{name}-GGUF", f"{name}-{quant}.gguf")
+
+
+def minicpmv_gguf(quant: str = "Q4_K_M") -> str:
+    """A file of openbmb's MiniCPM-V 4.7 1B GGUF repository: the language model of a quantization (GGUF architecture
+    ``qwen35``)."""
+    return os.path.join(MODELS_DIR, "openbmb", "MiniCPM-V-4.7-1B-gguf", f"MiniCPM-V-4_7-1B-{quant}.gguf")
 
 
 def assistant_of(model: str) -> str:
@@ -242,7 +251,9 @@ class QwenConfig:
     ``ssm_state`` dims (v head j reads q / k head j % ssm_k_heads), a causal depthwise conv of ``ssm_conv``
     taps over [q | k | v]. Full attention: ``num_attention_heads`` query heads (each with a sigmoid output
     gate) over ``num_key_value_heads`` KV heads of ``head_dim``; q / k RMS-normed per head, RoPE (NeoX
-    pairs) on the first ``rope_dims`` dims only. ``nextn_layers``: multi-token-prediction blocks after the
+    pairs) on the first ``rope_dims`` dims only, in ``rope_sections`` of pairs whose positions differ for image
+    embeddings only (M-RoPE: ``rope_section_order`` maps an image token's position components t, y, x, z to the
+    sections, llama.cpp's "tyxz" or MiniCPM-V's "zyxt"). ``nextn_layers``: multi-token-prediction blocks after the
     trunk's layers (Qwen3.8)."""
 
     vocab_size: int
@@ -261,6 +272,7 @@ class QwenConfig:
     rope_base: float
     rope_dims: int
     rope_sections: tuple[int, ...]
+    rope_section_order: str
     nextn_layers: int
     max_position_embeddings: int
     eos_token_ids: tuple[int, ...]
@@ -303,6 +315,7 @@ class QwenConfig:
             rope_base=float(m("rope.freq_base")),
             rope_dims=int(m("rope.dimension_count")),
             rope_sections=tuple(int(x) for x in m("rope.dimension_sections")),
+            rope_section_order=str(m("rope.section_order", "tyxz")),
             nextn_layers=nextn,
             max_position_embeddings=int(m("context_length")),
             eos_token_ids=tuple(dict.fromkeys(eos)),

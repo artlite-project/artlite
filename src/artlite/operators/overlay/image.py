@@ -16,7 +16,8 @@ input, in ``gemm_q``'s convention: K chunks in groups of ``kc_group``, group G o
 
 A region whose input is longer than an activation object's payload (``payload``: the model's) takes its K chunks in
 groups (``kc_group``: the largest divisor of the chunk count whose group fits the payload); every other region keeps a
-row tile's chunks consecutive. The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB
+row tile's chunks consecutive. An input of no whole number of chunks (MiniCPM-V's ffn 3584) is padded to the next one:
+its tiles' columns past the matrix are zero super-blocks. The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB
 before a tile, and past a region's last tile.
 """
 
@@ -168,7 +169,7 @@ class TileImage:
             fmt = fmts.pop()
             R = self.R[fmt]
             blocks.append(Block(bname, tensors, _pad_rows(rows, R), fmt, R))
-        n_kc = K // self.kc
+        n_kc = -(-K // self.kc)
         self.regions.append(Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes,
                                    self.kc))
 
@@ -251,7 +252,7 @@ class TileImage:
         """A block for ``_native.pack_tiles``."""
         ts = [self.tensor(t) for t in b.tensors]
         return (_native_format(b.fmt, ts), b.R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt, r.rt0[b.name],
-                r.offset, r.col_stride, [_raw_bytes(t) for t in ts], b.rows)
+                r.offset, r.col_stride, [_raw_bytes(t) for t in ts], b.rows, ts[0].cols // 256)
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
         """Pack every region into ``out`` (uint8, nbytes; the PAD bytes are left as they are): the C++ packer
@@ -288,13 +289,15 @@ def _raw_bytes(t: QTensor) -> np.ndarray:
 def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int, nch: int, *, kc: int = 1024
               ) -> np.ndarray:
     """Tiles (n / R, nch, S) of ``rows`` (-1: zero rows; n a multiple of R) of the stacked tensors over nch K
-    chunks of kc (``_native.pack_tiles``): tile (g, k) = ``pack_tile(fmt, fields of rows g R .. of chunk k, S)``."""
+    chunks of kc (``_native.pack_tiles``; columns past the tensors' as zero super-blocks): tile (g, k) =
+    ``pack_tile(fmt, fields of rows g R .. of chunk k, S)``."""
     t = tensors[0]
-    assert tile_format(t.qtype) == fmt and t.cols == nch * kc and rows.size % R == 0
+    assert tile_format(t.qtype) == fmt and t.cols <= nch * kc and rows.size % R == 0
     G = rows.size // R
     out = np.zeros(G * nch * S, np.uint8)
     _native.pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, G, 0, 0, out.size,
-                              [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1))],
+                              [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1),
+                              t.cols // 256)],
                        threads=1)
     return out.reshape(G, nch, S)
 

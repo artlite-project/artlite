@@ -23,7 +23,8 @@ size_t block_bytes(TileFormat f);
 /// A run of row tiles in every column block of a weight image's region (``overlay.image.Block``): column c's
 /// n rows (indices into the stacked tensors, -1: a zero row) as n / R row tiles of S bytes over n_kc K chunks
 /// of 256 nsb columns, row tile rt's tile of chunk kc at ``Region.tile(rt0 + rt, kc)`` of the column block
-/// (column c's block at offset + c col_stride).
+/// (column c's block at offset + c col_stride). A tensor row holds row_sb super-blocks (at most n_kc nsb): the
+/// columns past them are zero super-blocks (a K padded to whole chunks).
 struct PackBlock {
   TileFormat fmt;
   int R;
@@ -35,7 +36,8 @@ struct PackBlock {
   int rt0;               // the block's first row tile
   size_t offset;         // the region's first byte in the image
   size_t col_stride;     // bytes from a column block to the next (at least the block's)
-  std::vector<std::pair<const uint8_t*, int64_t>> tensors;  // stacked (GGUF blocks, rows) of n_kc nsb blocks each
+  int row_sb;            // super-blocks of a tensor row
+  std::vector<std::pair<const uint8_t*, int64_t>> tensors;  // stacked (GGUF blocks, rows) of row_sb blocks each
   const int64_t* rows;   // (cols, n)
   int cols;
   int64_t n;
