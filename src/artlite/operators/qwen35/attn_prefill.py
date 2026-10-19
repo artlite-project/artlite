@@ -11,7 +11,8 @@ The 2 x KV heads jobs of the KV cores (``AttnPrepOperator.kv_job``: one every 8 
 column, MiniCPM-V every other): K head h (rms(k) k_norm, rotated) as hi + lo records, then V head h as records of blocks
 over the 8 positions, in the decode's cache layout (``overlay.kv``): the chunk's groups from p0 / 32 on (scratchpad
 parameter ``QA_KV``), so the decode continues from them. cos / sin of the
-positions from a table of every position (``cs_table``; parameter ``QA_CS``).
+tokens' positions from a table (``cs_table``; parameter ``QA_CS``: the row of the chunk's first token): the static rows
+of every text position, or rows the host writes past them for a chunk of image tokens (M-RoPE: ``cs_rows``).
 
 ``PrefillAttnOperator``: per column 4 cores, passes of 32 QG queries (QG = 2 when a column holds one q head, the L1 of
 the 9B's two heads: half the history's re-streams, else 1); core r takes the QG token groups QG r .. of the pass for
@@ -69,10 +70,16 @@ QA_N = "qa_n"  # scratchpad parameter: p0 / 32 + 1 (cache groups every attention
 QA_OFF = "qa_off"  # scratchpad parameter: bf16 offset of the chunk's second cache group
 
 
-def cs_table(cfg: QwenConfig, n: int) -> np.ndarray:
-    """(n, 64) fp32: per position [cos 32 | sin 32] of the rotated pairs (``QwenConfig.rope_theta``)."""
-    th = cfg.rope_theta(list(range(n))).astype(np.float64)
+def cs_rows(cfg: QwenConfig, positions: np.ndarray | range) -> np.ndarray:
+    """(n, 64) fp32: per position (text, or M-RoPE (T, H, W)) [cos 32 | sin 32] of the rotated pairs
+    (``QwenConfig.rope_theta``)."""
+    th = cfg.rope_theta(positions).astype(np.float64)
     return np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+
+
+def cs_table(cfg: QwenConfig, n: int) -> np.ndarray:
+    """(n, 64) fp32: ``cs_rows`` of the text positions 0 .. n - 1."""
+    return cs_rows(cfg, range(n))
 
 
 _PREP = JINJA_ENV.from_string(r"""
@@ -219,10 +226,10 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
 
 class AttnPrepOperator(ArtcOperator):
     """The attention prep of a chunk (module docstring). Runtime sequence: G (attn_in's output, ``layout``), CS (the
-    ``cs_table`` of every position, as bf16 pairs), NRM (q_norm | k_norm fp32), QS (per column, token group and head
-    a ``SLOT``; ``qs_T``: the tokens of a column's part, default T: a sub-chunk's part of a longer chunk's QS), KV (one
-    layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 p0, ``QA_KV`` = GROUP /
-    2 * p0 / 32 (``params``)."""
+    cos / sin table of ``cs_positions`` rows, as bf16 pairs), NRM (q_norm | k_norm fp32), QS (per column, token group
+    and head a ``SLOT``; ``qs_T``: the tokens of a column's part, default T: a sub-chunk's part of a longer chunk's QS),
+    KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
+    of the first token (default p0), ``QA_KV`` = GROUP / 2 * p0 / 32 (``params``)."""
 
     STACK = 3072
     pfx = kernel_prefix("qap")
@@ -273,10 +280,12 @@ class AttnPrepOperator(ArtcOperator):
         g = 2 * self.qc * SLOT // 2  # (a token group's)
         return ((COLS - 1) * self.qs_T // 8 + self.T // 8) * g
 
-    def params(self, p0: int) -> dict[str, int]:
-        """The scratchpad parameters of a chunk at position p0."""
-        assert p0 % 32 == 0 and p0 + self.T <= self.cs_positions
-        return {QA_CS: 128 * p0, QA_KV: GROUP // 2 * (p0 // 32)}
+    def params(self, p0: int, cs_row: int | None = None) -> dict[str, int]:
+        """The scratchpad parameters of a chunk at position p0 whose tokens' cos / sin start at table row ``cs_row``
+        (default p0)."""
+        r = p0 if cs_row is None else cs_row
+        assert p0 % 32 == 0 and 0 <= r and r + self.T <= self.cs_positions
+        return {QA_CS: 128 * r, QA_KV: GROUP // 2 * (p0 // 32)}
 
     def get_mlir_artifact(self) -> Module:
         p, T, qc, lay = self.pfx, self.T, self.qc, self.layout

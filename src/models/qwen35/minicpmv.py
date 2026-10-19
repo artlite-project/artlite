@@ -40,9 +40,12 @@ from PIL import Image, ImageOps
 
 from artlite.model_config import ClipConfig
 
+from .sequence import MEDIA, Sequence
+
 # token ids of the markers (the GGUF's vocabulary; the official config's image_start_id .. newline_id)
 IMAGE, IMAGE_END, SLICE, SLICE_END, IMAGE_ID, IMAGE_ID_END, NEWLINE = 248078, 248079, 248088, 248089, 248090, 248091, 198
-MEDIA = -1  # an image token in a layout (its embedding row in place of a token's)
+# the markers' rows in the mmproj's v.tok_embd_sep (the language model's embeddings of them, unquantized)
+SEP_ROWS = {IMAGE_END: 0, SLICE: 1, SLICE_END: 2, NEWLINE: 3}
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,22 @@ class Grid:
         if newline_after:
             pos.append((O, O, O))
         return np.asarray(pos, np.int64), O + max(ch, cw) + 1
+
+    def sequence(self, embd: np.ndarray, sep: np.ndarray) -> Sequence:
+        """The image's tokens (``layout``, the template's "\\n" after it) from position 0: the encoder's rows ``embd``
+        (its entries' tokens in order: the overview's, then the slices' row by row) for its ``MEDIA`` tokens, the
+        mmproj's ``v.tok_embd_sep`` rows ``sep`` for the markers inside it (``SEP_ROWS``); ``<image>`` and the
+        template's "\\n" as text tokens."""
+        ids = np.asarray(self.layout(), np.int64)
+        given = np.ones(len(ids), bool)
+        given[0] = given[-1] = False
+        media = ids[given] == MEDIA
+        rows = np.empty((int(given.sum()), embd.shape[1]), np.float32)
+        assert embd.shape[0] == media.sum(), (embd.shape, int(media.sum()))
+        rows[media] = embd
+        rows[~media] = sep[[SEP_ROWS[int(t)] for t in ids[given][~media]]]
+        pos, nxt = self.positions(0)
+        return Sequence(ids, given, rows, pos, nxt)
 
 
 # ----------------------------------------------------------------------

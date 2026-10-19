@@ -1,14 +1,18 @@
-"""MiniCPM-V 4.7's image host side (models/qwen35/minicpmv.py), no NPU: the slicing against transformers'
+"""MiniCPM-V 4.7's image host side (models/qwen35/minicpmv.py, sequence.py), no NPU: the slicing against transformers'
 ``MiniCPMV4_6ImageProcessor`` (its values, including the sizes where llama.cpp's float grid choice differs), the token
 layout of an image and its positions against transformers' ``MiniCPMV4_7Model.get_rope_index`` (the values of
 llama.cpp PR #30510's ``test_decoder_pos_minicpmv4_7``, from transformers 5.19, for the tokens after ``<image>``; the
-official ``<image>`` corner and the template's "\\n" after the image, which that PR leaves out)."""
+official ``<image>`` corner and the template's "\\n" after the image, which that PR leaves out); the M-RoPE angles
+against transformers' interleaving; an image as a ``Sequence`` (its rows, its slices)."""
+
+import os
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from artlite.model_config import ClipConfig
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import ClipConfig, QwenConfig, minicpmv_gguf
 from models.qwen35 import minicpmv as M
 
 CLIP = ClipConfig(projector="minicpmv4_7", image_size=448, patch_size=14, hidden=1152, ffn=4304, layers=27, heads=16,
@@ -86,3 +90,40 @@ def test_positions(ov: tuple, grid: tuple, cell: tuple, text: int, want: list) -
     # without the template's newline: the same positions, one token fewer
     p2, n2 = g.positions(5, newline_after=False)
     assert np.array_equal(p2, pos[:-1]) and n2 == nxt and len(g.layout(newline_after=False)) == len(lay) - 1
+
+
+def test_mrope_angles() -> None:
+    path = minicpmv_gguf()
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
+    pos = np.random.default_rng(0).integers(0, 4096, (64, 3))
+    # transformers' interleaved M-RoPE: pair i by H for i % 3 == 1 below 33, by W for i % 3 == 2 below 30, else T
+    i = np.arange(cfg.rope_dims // 2)
+    comp = np.where((i % 3 == 1) & (i < 33), 1, np.where((i % 3 == 2) & (i < 30), 2, 0))
+    want = pos[:, comp] * cfg.rope_base ** (-2.0 * i / cfg.rope_dims)
+    assert np.allclose(cfg.rope_theta(pos), want, rtol=1e-5, atol=0)
+    text = np.arange(100)
+    assert np.array_equal(cfg.rope_theta(text), cfg.rope_theta(np.repeat(text[:, None], 3, 1)))
+
+
+def test_sequence() -> None:
+    g = M.Grid(ov=(2, 3), grid=(1, 2), cell=(2, 2))
+    lay = g.layout()
+    n_media = lay.count(M.MEDIA)
+    embd = np.arange(n_media * 4, dtype=np.float32).reshape(n_media, 4)
+    sep = -np.arange(1, 17, dtype=np.float32).reshape(4, 4)
+    img = g.sequence(embd, sep)
+    assert list(img.ids) == lay and not img.given[0] and not img.given[-1] and img.given[1:-1].all()
+    media = np.asarray(lay)[img.given] == M.MEDIA
+    assert np.array_equal(img.rows[media], embd) and np.array_equal(img.rows[~media][0], sep[0])  # (</image>)
+    pos, nxt = g.positions(0)
+    assert np.array_equal(img.pos, pos) and img.next == nxt
+    seq = [7, 8, 9] + img + [10, 11]
+    assert len(seq) == len(lay) + 5 and seq.next == 3 + nxt + 2
+    assert tuple(seq.pos[3]) == (3, 2, 2) and tuple(seq.pos[-2]) == (3 + nxt,) * 3  # (<image>; the text after)
+    for k in range(len(seq) + 1):  # (slices run one after another as the whole)
+        a, b = seq[:k], seq[k:]
+        ab = a + b
+        assert np.array_equal(ab.ids, seq.ids) and np.array_equal(ab.given, seq.given)
+        assert np.array_equal(ab.rows, seq.rows) and np.array_equal(ab.pos, seq.pos) and ab.next == seq.next

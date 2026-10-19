@@ -6,11 +6,18 @@
 //
 //   minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE -p PROMPT -o OUTDIR [-a ANSWER] [-e EMBD] [-n REGEX]
 //                 [--threads N]
+//   minicpmv_dump -m MODEL --seq SEQ --pos POS -o OUTDIR [--from K] [--threads N]
 //
 // PROMPT: a text file with the media marker (mtmd_default_marker()) where the image goes; ANSWER: raw little-endian
 // int32 token ids appended after the prompt (teacher forcing); EMBD: raw float32 embeddings (n_tokens, n_embd) that the
 // language model takes for the image instead of the encoder's (the encoder is not run). REGEX: the encoder tensors
 // (names without the "-<il>" suffix) to dump.
+//
+// --seq: the language model alone on a whole sequence of embedding rows with given M-RoPE positions (the official
+// ones, which mtmd's are not): SEQ raw float32 (n, n_embd), the text tokens' rows too; POS raw int32 (n, 3), per token
+// (T, H, W). A token's KV position is its index, so the attention is causal in token order; its RoPE sections 0, 1, 2
+// turn by T, H, W (the slots z, y, x of an embedding under rope.section_order zyxt). Output: logits.npy (the rows of
+// tokens K .. n - 1), chunks.json ({"chunks": [], "logit_tokens", "entries": 0}), meta.json.
 //
 // Output in OUTDIR:
 // - chunks.json: the prompt's chunks in order, text ({"text": [token ids]}) or image ({"image": n_tokens, "n_pos",
@@ -185,7 +192,8 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 
 static void usage() {
     fprintf(stderr, "usage: minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE -p PROMPT -o OUTDIR [-a ANSWER.i32]\n"
-                    "                     [-e EMBD.f32] [-n REGEX] [--threads N]\n");
+                    "                     [-e EMBD.f32] [-n REGEX] [--threads N]\n"
+                    "       minicpmv_dump -m MODEL --seq SEQ.f32 --pos POS.i32 -o OUTDIR [--from K] [--threads N]\n");
     exit(1);
 }
 
@@ -205,8 +213,80 @@ static std::string read_file(const std::string & path) {
     return s;
 }
 
+static llama_context_params context_params(int n_tokens, int threads) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t) ((n_tokens + 255) / 256 * 256);
+    cp.n_batch = cp.n_ctx;
+    cp.n_ubatch = cp.n_ctx;
+    cp.n_seq_max = 1;
+    cp.n_threads = threads;
+    cp.n_threads_batch = threads;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.type_k = GGML_TYPE_F32;
+    cp.type_v = GGML_TYPE_F32;
+    cp.offload_kqv = false;
+    cp.op_offload = false;
+    cp.no_perf = true;
+    return cp;
+}
+
+// --seq (the header)
+static int run_sequence(llama_model * model, const std::string & seq_path, const std::string & pos_path, int from,
+                        const std::string & outdir, int threads) {
+    const int n_embd = llama_model_n_embd_inp(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::string seq = read_file(seq_path), pos = read_file(pos_path);
+    const int n = (int) (seq.size() / (4 * (size_t) n_embd));
+    if (seq.size() != (size_t) n * n_embd * 4 || pos.size() != (size_t) n * 3 * 4 || from < 0 || from >= n) {
+        fprintf(stderr, "%s / %s: %zu / %zu bytes, from %d: not (n, %d) float32 / (n, 3) int32\n", seq_path.c_str(),
+                pos_path.c_str(), seq.size(), pos.size(), from, n_embd);
+        return 1;
+    }
+    const float * rows = (const float *) seq.data();
+    const int32_t * thw = (const int32_t *) pos.data();
+    llama_context * ctx = llama_init_from_model(model, context_params(n, threads));
+    if (!ctx) {
+        fprintf(stderr, "cannot create a context\n");
+        return 1;
+    }
+    llama_batch_ext * b = llama_batch_ext_init(ctx);
+    for (int i = 0; i < n; i++) {
+        const llama_embd e = {rows + (size_t) i * n_embd, 1, (size_t) n_embd};
+        const int32_t idx = llama_batch_ext_add_embd(b, 0, e);
+        const llama_pos p[4] = {i, thw[3 * i + 1], thw[3 * i + 2], thw[3 * i]};  // (slots t, y, x, z)
+        if (idx != i || !llama_batch_ext_set_pos(b, idx, p) || (i >= from && !llama_batch_ext_set_output_logits(b, idx, true))) {
+            fprintf(stderr, "cannot add token %d to the batch\n", i);
+            return 1;
+        }
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b) != 0) {
+        fprintf(stderr, "llama_process failed\n");
+        return 1;
+    }
+    std::vector<float> logits;
+    for (int i = from; i < n; i++) {
+        const float * l = llama_get_logits_ith(ctx, i);
+        logits.insert(logits.end(), l, l + n_vocab);
+    }
+    write_npy(outdir + "/logits.npy", logits.data(), logits.size() * 4, {(int64_t) (n - from), n_vocab}, "<f4");
+    FILE * js = fopen((outdir + "/chunks.json").c_str(), "w");
+    fprintf(js, "{\"chunks\": [], \"logit_tokens\": [");
+    for (int i = from; i < n; i++) {
+        fprintf(js, "%s%d", i > from ? ", " : "", i);
+    }
+    fprintf(js, "], \"entries\": 0}\n");
+    fclose(js);
+    FILE * f = fopen((outdir + "/meta.json").c_str(), "w");
+    fprintf(f, "{\"seq\": \"%s\", \"tokens\": %d, \"from\": %d}\n", seq_path.c_str(), n, from);
+    fclose(f);
+    llama_batch_ext_free(b);
+    llama_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
-    std::string model_path, mmproj_path, image_path, prompt_path, answer_path, embd_path, regex_arg;
+    std::string model_path, mmproj_path, image_path, prompt_path, answer_path, embd_path, regex_arg, seq_path, pos_path;
+    int from = 0;
     State st;
     int threads = 16;
     for (int i = 1; i < argc; i++) {
@@ -235,11 +315,19 @@ int main(int argc, char ** argv) {
             regex_arg = next();
         } else if (a == "--threads") {
             threads = std::atoi(next().c_str());
+        } else if (a == "--seq") {
+            seq_path = next();
+        } else if (a == "--pos") {
+            pos_path = next();
+        } else if (a == "--from") {
+            from = std::atoi(next().c_str());
         } else {
             usage();
         }
     }
-    if (model_path.empty() || mmproj_path.empty() || image_path.empty() || prompt_path.empty() || st.outdir.empty()) {
+    const bool sequence = !seq_path.empty();
+    if (model_path.empty() || st.outdir.empty() || (sequence ? pos_path.empty()
+                                                              : mmproj_path.empty() || image_path.empty() || prompt_path.empty())) {
         usage();
     }
     st.names = std::regex(regex_arg.empty() ? "$^" : regex_arg);
@@ -259,6 +347,12 @@ int main(int argc, char ** argv) {
     if (!model) {
         fprintf(stderr, "cannot load %s\n", model_path.c_str());
         return 1;
+    }
+    if (sequence) {
+        const int rc = run_sequence(model, seq_path, pos_path, from, st.outdir, threads);
+        llama_model_free(model);
+        llama_backend_free();
+        return rc;
     }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
@@ -297,19 +391,7 @@ int main(int argc, char ** argv) {
     }
     n_total += (int) answer.size();
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = (uint32_t) ((n_total + 255) / 256 * 256);
-    cp.n_batch = cp.n_ctx;
-    cp.n_ubatch = cp.n_ctx;
-    cp.n_seq_max = 1;
-    cp.n_threads = threads;
-    cp.n_threads_batch = threads;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cp.type_k = GGML_TYPE_F32;
-    cp.type_v = GGML_TYPE_F32;
-    cp.offload_kqv = false;
-    cp.op_offload = false;
-    cp.no_perf = true;
+    const llama_context_params cp = context_params(n_total, threads);
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "cannot create a context\n");

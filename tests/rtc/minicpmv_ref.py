@@ -6,7 +6,8 @@ the llama.cpp tree of ``model_config.LLAMA_CPP_DIR``): the prompt's chunks (text
 decoder positions, which for MiniCPM-V 4.7 differ from the official ``get_rope_index`` at the markers and after the
 image: llama.cpp PR #30510), each image's embeddings, the encoder's tensors per entry (the overview, then the slices
 row by row; inp_raw: the entry's pixels) and the logits after every text token. Cached under
-``tests/rtc/refs/<model>/vgolden_<hash>/`` (``--refresh-refs`` recomputes).
+``tests/rtc/refs/<model>/vgolden_<hash>/`` (``--refresh-refs`` recomputes). ``seq_golden``: the language model alone on
+a sequence of embedding rows at given (the official) positions.
 
 The encoder (``Encoder``): llama.cpp's ``clip_graph_minicpmv4_6`` (``tools/mtmd/models/minicpmv.cpp``) on the mmproj's
 tensors for one entry's pixels (3, H, W): the patch embedding, the learned position embedding over a 70 x 70 grid, the
@@ -136,6 +137,42 @@ def golden(model: str, mmproj: str, image: str, prompt: str, *, answer: list[int
         r = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if r.returncode:
             raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
+        shutil.rmtree(path, ignore_errors=True)
+        os.replace(tmp, path)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return VisionGolden(path)
+
+
+def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *, threads: int = 16) -> VisionGolden:
+    """llama.cpp's language model on a whole sequence of embedding rows (n, n_embd) (the text tokens' too) at the
+    official M-RoPE positions ``pos`` (n, 3) (T, H, W), causal in token order (``minicpmv_dump --seq``): ``logits``
+    of tokens ``first`` .. n - 1."""
+    rows = np.ascontiguousarray(rows, np.float32)
+    pos = np.ascontiguousarray(pos, np.int32)
+    assert pos.shape == (rows.shape[0], 3), (rows.shape, pos.shape)
+    key = (common.model_key(model), hashlib.sha256(rows.tobytes() + pos.tobytes()).hexdigest(), first, _lib_identity(),
+           _mtmd_identity())
+    h = hashlib.sha256(repr(key).encode())
+    with open(DUMP_SRC, "rb") as f:
+        h.update(f.read())
+    folder = common.model_refs(model)
+    path = os.path.join(folder, f"vseq_{h.hexdigest()[:16]}")
+    if os.path.exists(os.path.join(path, "meta.json")) and not common.REFRESH_REFS:
+        return VisionGolden(path)
+    os.makedirs(folder, exist_ok=True)
+    tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
+    try:
+        rows.tofile(os.path.join(tmp, "seq.f32"))
+        pos.tofile(os.path.join(tmp, "pos.i32"))
+        cmd = [dump_tool(), "-m", model, "--seq", os.path.join(tmp, "seq.f32"), "--pos", os.path.join(tmp, "pos.i32"),
+               "--from", str(first), "-o", tmp, "--threads", str(threads)]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if r.returncode:
+            raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
+        for f in ("seq.f32", "pos.i32"):
+            os.remove(os.path.join(tmp, f))
         shutil.rmtree(path, ignore_errors=True)
         os.replace(tmp, path)
     except BaseException:

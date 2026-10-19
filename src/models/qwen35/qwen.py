@@ -6,6 +6,9 @@ against exact-integer weight panels), the Gated DeltaNet steps (conv states and 
 the full attention and its KV cache on the attention cores. The host reads the tokens' embedding rows from the mapped
 file and samples from the logits.
 
+A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows with M-RoPE positions: MiniCPM-V's
+images): each cache slot's position (``QwenOverlay.rope``) comes from it, the text after it from its ``next`` on.
+
 A prompt runs in chunks of up to 2048 tokens through the prefill (``artlite.operators.qwen35.prefill.QwenPrefill``:
 layer-major, control code assembled per chunk from one library ELF; the GEMMs read the same weight image, the chunk's K /
 V, GDN states and conv states land in the decode's buffers), each chunk in pieces of a few layers (dispatches of one HW
@@ -19,8 +22,10 @@ file in the page cache: 1.1 s): the buffer allocated and the image packed (C++) 
 the designs (found through the render manifest) and the overlay's other buffers load.
 """
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
@@ -31,6 +36,7 @@ from artlite.operators.qwen35.overlay import QwenOverlay
 from artlite.operators.qwen35.prefill import SIZES, QwenPrefill
 
 from ..common import Model, OverlayModel, Sampling
+from .sequence import Sequence
 from .tokenizer import QwenTokenizer, chat_prompt
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
@@ -61,6 +67,8 @@ class NpuQwen(OverlayModel):
         self.overlay.ready()  # (the weights' thread packs meanwhile)
         gguf.release()
         self.position = 0
+        self.rope_next = 0  # (the M-RoPE position of the next text token)
+        self._prompting = False
 
     @property
     def capacity(self) -> int:
@@ -74,7 +82,7 @@ class NpuQwen(OverlayModel):
     def reset(self) -> None:
         """A new sequence: no cached positions, the GDN states zeroed."""
         self.overlay.reset()
-        self.position = 0
+        self.position = self.rope_next = 0
 
     def rewind(self, n: int) -> int:
         """(all cached positions or none: the GDN layers' states hold the whole sequence and cannot go back)"""
@@ -83,11 +91,51 @@ class NpuQwen(OverlayModel):
         self.reset()
         return 0
 
-    def _step_inputs(self, tokens: list[int]) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _rows(self, tokens: list[int] | Sequence) -> torch.Tensor:
+        """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
+        if not isinstance(tokens, Sequence):
+            return self.gguf.rows("token_embd.weight", tokens)
+        x = torch.empty(len(tokens), self.cfg.hidden_size)
+        t = ~tokens.given
+        if t.any():
+            x[torch.from_numpy(t)] = self.gguf.rows("token_embd.weight", tokens.ids[t])
+        if tokens.given.any():
+            x[torch.from_numpy(tokens.given)] = torch.from_numpy(tokens.rows)
+        return x
 
-    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
+        return (self._rows(tokens),)
+
+    def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
+        return (self._rows(tokens),)
+
+    def prompt(self, tokens: list[int] | Sequence, *, logits: bool = False,
+               progress: Callable[[int], None] | None = None) -> torch.Tensor | None:
+        """(a sequence's positions from ``rope_next``)"""
+        p, n = self.position, len(tokens)
+        if p + n > self.capacity:
+            raise ValueError(f"the KV cache holds {self.capacity} positions")
+        seq = tokens if isinstance(tokens, Sequence) else Sequence.text(tokens)
+        self.overlay.rope[p:p + n] = self.rope_next + seq.pos
+        self._prompting = True
+        try:
+            return super().prompt(tokens, logits=logits, progress=progress)
+        finally:
+            self._prompting = False
+            done = self.position - p  # (a prompt that ``progress`` stopped: the text after its last cached token)
+            self.rope_next = (self.rope_next + seq.next if done == n else
+                              int(self.overlay.rope[self.position - 1].max()) + 1 if done else self.rope_next)
+
+    def steps(self, tokens: list[int], *, logits: bool = True) -> torch.Tensor | None:
+        """(tokens after a prompt: text from ``rope_next``)"""
+        if self._prompting:
+            return super().steps(tokens, logits=logits)
+        p, n = self.position, len(tokens)
+        if p + n <= self.capacity:
+            self.overlay.rope[p:p + n] = self.rope_next + np.arange(n)[:, None]
+        out = super().steps(tokens, logits=logits)
+        self.rope_next += n
+        return out
 
     def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
         """(the LM head alone on the chunk's last output row)"""

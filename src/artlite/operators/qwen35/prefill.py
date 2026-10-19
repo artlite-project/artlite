@@ -16,7 +16,8 @@ projection's output,
   decode's conv states in GHDR before each chunk), ``GdnOutOperator`` (ssm_out's panels; the new conv state of the
   chunk's last valid tokens into GHDR);
 - attention layer: ``AttnPrepOperator`` per sub-chunk (its K / V into the layer's KV cache: slices of the cache and the
-  cos / sin table shifted by the sub-chunk's positions, the parameters the chunk's), ``PrefillAttnOperator`` once;
+  cos / sin table shifted by the sub-chunk's positions, the parameters the chunk's: the table's rows of its text
+  positions, or of an image's tokens written past them), ``PrefillAttnOperator`` once;
 
 the output projection, the post-attention norm, gate/up (silu(gate) up panels) and down. An output projection whose A
 strip would be refetched per pass runs in K parts whose strips stay in the memtile where they cost less
@@ -132,8 +133,9 @@ class QwenPrefill(ChunkPrefill):
                 self._op(GP.GdnOutOperator, lay, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=MAX_T))
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
-        return self._op(AP.AttnPrepOperator, lay, head_bytes=self.ov.ash.head_bytes, cs_positions=self.ov.max_positions,
-                        qs_T=T)
+        """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""
+        return self._op(AP.AttnPrepOperator, lay, head_bytes=self.ov.ash.head_bytes,
+                        cs_positions=self.ov.max_positions + SUB, qs_T=T)
 
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
@@ -278,15 +280,30 @@ class QwenPrefill(ChunkPrefill):
     # Run
     # ------------------------------------------------------------------
 
-    def params(self, T: int, p0: int, n: int) -> dict[str, int]:
-        """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens."""
+    def params(self, T: int, p0: int, n: int, cs_row: int | None = None) -> dict[str, int]:
+        """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens (their cos / sin from
+        table row ``cs_row``, default p0)."""
         out = {}
         if self.gdn:
             out[GP.CONV_OFF] = self.gout.conv_offset(n)
         if self.att:
             prep = self._prep(self.plans[(self.att[0], "attn_in")].layout, T)
-            out |= prep.params(p0) | self.attn[T].params(p0)
+            out |= prep.params(p0, cs_row) | self.attn[T].params(p0)
         return out
+
+    def _cs_row(self, p0: int, n: int) -> int:
+        """The cos / sin table row of a chunk's first token: its text position where the n valid tokens' positions
+        are consecutive text ones (``QwenOverlay.rope``), else the rows past the text positions, written with the
+        tokens'."""
+        rope = self.ov.rope[p0:p0 + n]
+        r0 = int(rope[0, 0])
+        if (rope == r0 + np.arange(n)[:, None]).all():
+            return r0
+        R = self.ov.max_positions
+        dev = self.ov.dev
+        dev.view("PCS")[256 * R:256 * (R + n)] = AP.cs_rows(self.cfg, rope).view(np.uint8).reshape(-1)
+        dev.flush("PCS", 256 * R, 256 * n)
+        return R
 
     def _fits_budget(self, T: int, p0: int) -> bool:
         """(an attention layer's flash attention within the budget)"""
@@ -309,7 +326,7 @@ class QwenPrefill(ChunkPrefill):
             dev.flush("PM", 0, 4 * T)
             self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
             self._conv_states()
-        self._launch(T, p0, self.params(T, p0, n))
+        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None))
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32)."""

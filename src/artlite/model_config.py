@@ -343,17 +343,21 @@ class QwenConfig:
     def q_per_kv(self) -> int:
         return self.num_attention_heads // self.num_key_value_heads
 
-    def rope_theta(self, positions: np.ndarray | range) -> np.ndarray:
-        """(n, rope_dims / 2) float32 angles of text positions: pair i turns by p * base^(-2 i / rope_dims), the
-        factor built by repeated float32 multiplication as llama.cpp's CPU RoPE (``ggml_mrope_cache_init``; the
-        interleaved sections all use the text position)."""
+    def rope_theta(self, positions: np.ndarray | range | list) -> np.ndarray:
+        """(n, rope_dims / 2) float32 angles of positions: (n,) text positions or (n, 3) M-RoPE ones (T, H, W). Pair i
+        turns by its component's p * base^(-2 i / rope_dims), the factor built by repeated float32 multiplication as
+        llama.cpp's CPU RoPE (``ggml_mrope_cache_init``); the components interleave by ``rope_sections`` (transformers'
+        ``apply_interleaved_mrope``): H for i % 3 == 1 below 3 sections[1], W for i % 3 == 2 below 3 sections[2], T
+        otherwise."""
         scale = np.float32(np.power(np.float32(self.rope_base), np.float32(-2.0 / self.rope_dims)))
         n = self.rope_dims // 2
         p = np.asarray(positions, np.float32)
-        out = np.empty((p.size, n), np.float32)
-        th = p.copy()
+        th = np.repeat(p.reshape(-1, 1), 3, 1) if p.ndim < 2 else p.copy()
+        s = self.rope_sections
+        comp = [1 if i % 3 == 1 and i < 3 * s[1] else 2 if i % 3 == 2 and i < 3 * s[2] else 0 for i in range(n)]
+        out = np.empty((th.shape[0], n), np.float32)
         for i in range(n):
-            out[:, i] = th
+            out[:, i] = th[:, comp[i]]
             th = (th * scale).astype(np.float32)
         return out
 

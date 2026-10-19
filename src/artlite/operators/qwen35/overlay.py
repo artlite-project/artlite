@@ -106,10 +106,18 @@ class _Step:
         self.drains: list[tuple[list[int], int, int, int, int]] = []
 
 
+def _text_rope(n: int) -> np.ndarray:
+    return np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
+
+
 class QwenOverlay(ModelOverlay):
     """A qwen35 GGUF model on the multi-slot decode overlay. ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the KV caches' capacity, ``weights``: the
-    image's buffer allocated ahead (its image's layers and vocabulary)."""
+    image's buffer allocated ahead (its image's layers and vocabulary).
+
+    ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot, which the step's and the prefill's
+    rotations take; the slot's index (text from position 0) until a model writes others (an image's tokens, the
+    text after it: ``models.qwen35``), again after ``reset``."""
 
     CONFIG, IMAGE = QwenConfig, QwenImage
 
@@ -121,6 +129,7 @@ class QwenOverlay(ModelOverlay):
         self.gsh = gdn.GdnShape(cfg) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
+        self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
@@ -260,6 +269,7 @@ class QwenOverlay(ModelOverlay):
         dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
         self._conv_in_ghdr = False
+        self.rope[:] = _text_rope(self.max_positions)
 
     # ------------------------------------------------------------------
     # The transaction of a step
@@ -451,7 +461,7 @@ class QwenOverlay(ModelOverlay):
         act = dev.view("ACT")
         cs = np.zeros((SLOTS, 64), np.float32)
         for s in range(S):
-            cs[s] = np.concatenate(attn.rope_cs(self.cfg, p + s))
+            cs[s] = np.concatenate(attn.rope_cs(self.cfg, self.rope[p + s]))
         groups, rec_mode = [], {}
         for L in self.fatt:
             rec_mode[L] = L in self.vring.from_prefill
@@ -591,6 +601,7 @@ class QwenOverlay(ModelOverlay):
         dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
         self._conv_in_ghdr = False
+        self.rope[:] = _text_rope(self.max_positions)
 
     def _lm_phase(self, seq: Sequence) -> None:
         if self.image.column_major:
