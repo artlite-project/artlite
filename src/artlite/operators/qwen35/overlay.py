@@ -28,7 +28,9 @@ the columns load the slots' residual slices (F_LOADR), then per layer
 and the LM head (normed) -> LOGITS. The transfers go out in rounds over the columns (a phase's weights, inputs,
 outputs): a channel holds 4 queued tasks, and the oldest one that a fifth waits for must not need a later round. A
 phase's inputs wait for the drains before them (``Sequence.sync``: its producers' outputs are in DDR), its weights go
-out before that wait (they stream into the memtile meanwhile).
+out before that wait (they stream into the memtile meanwhile). A column-major image (``image.QwenImage``) streams a
+column's weights between two attentions (their caches on A) as one run, its phases' norm-weight objects in it; a
+region-major one per phase and K group (the norm-weight objects from NORM).
 """
 
 import numpy as np
@@ -77,11 +79,10 @@ from .decode import (
     M_SPLIT,
     QwenDecodeOperator,
 )
-from .image import QwenImage, gdn_v_heads
+from .image import NORMS, QwenImage, gdn_v_heads
 
 FLAGS = {"gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
          "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM}
-NORM = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "lm": "output_norm"}
 KV_PAD = 2048 - 256  # positions past the caches (the last layer's): the prefill's sub-chunk slices
 CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (prefill.CS_OFF)
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
@@ -265,13 +266,16 @@ class QwenOverlay(ModelOverlay):
     # ------------------------------------------------------------------
 
     def _weights(self, seq: Sequence, phase: tuple[int, str], gi: int) -> None:
-        """The A fills of a phase's K group gi: its norm-weight objects (the first group of a normed phase), its tiles."""
+        """The A fills of a phase's K group gi: its norm-weight objects (the first group of a normed phase), its tiles
+        (a column-major image: none, ``_runs``)."""
+        if self.image.column_major:
+            return
         dev, (L, name) = self.dev, phase
         region = self.image.region(L, name)
         gr = mp.groups(region, FLAGS[name], 1)[gi]
         for c in range(COLS):
             if gi == 0 and FLAGS[name] & F_NORM:  # (object n: T bytes from weight 4096 n on)
-                key = (-1, "output_norm") if L < 0 else (L, NORM[name])
+                key = (-1, "output_norm") if L < 0 else (L, NORMS[name])
                 seq.fill("A", c, dev.address("NORM", self.norm_off[key]), self.n_norm * self.T,
                          (self.T // 16, 4, self.T // 16, NX_PER_NORM * OBJ_K // 2))
             for o, n, dims, rep, it in mp.a_reads(region, c, gr):
@@ -333,8 +337,21 @@ class QwenOverlay(ModelOverlay):
                 seq.drain("D", c, dev.address("ACT", at), MG.D_BYTES, (512, 2, xg // 4, 1024))
         assert sh.ch == (4 + sh.hc) * gdn.D
 
-    def _attention(self, seq: Sequence, st: _Step, L: int, S: int) -> None:
-        """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them)."""
+    def _runs(self, lm: bool) -> list[list[tuple[int, str]]]:
+        """A column-major step's weight runs: its phases up to the first attention's attn_in, then from each
+        attention's attn_out up to the next one's attn_in (or the end)."""
+        out: list[list[tuple[int, str]]] = [[]]
+        for phase in self._phases():
+            if phase[1] == "lm" and not lm:
+                break
+            if phase[1] == "attn_out":
+                out.append([])
+            out[-1].append(phase)
+        return [r for r in out if r]
+
+    def _attention(self, seq: Sequence, st: _Step, L: int, S: int, run: list[tuple[int, str]] | None = None) -> None:
+        """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them);
+        ``run``: the weights after it (a column-major image), after the last sub-step's cache reads."""
         dev, ash, T = self.dev, self.ash, self.T
         qc, nph = ash.qc, ash.nph
         per = ash.kvh * attn.HD // COLS  # (K and V rows of a column: its part of KV head per c // HD)
@@ -360,6 +377,8 @@ class QwenOverlay(ModelOverlay):
                 if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T), L, c, u, t)
                                  for t in range(tails(n))]
+            if u == len(st.subs) - 1 and run:
+                self._weight_run(seq, run)
             if u == 0:
                 seq.sync()  # (attn_in's q, K, V in DDR)
             for c in range(COLS):
@@ -391,9 +410,13 @@ class QwenOverlay(ModelOverlay):
         st = _Step(S, subs)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
+        runs = self._runs(lm) if self.image.column_major else []
+        if runs:
+            self._weight_run(seq, runs[0])
         for i, L in enumerate(self.layers):
             if cfg.attention[L]:
-                self._attention(seq, st, L, S)
+                run = next((r for r in runs if r[0] == (L, "attn_out")), None)
+                self._attention(seq, st, L, S, run)
                 self._phase(seq, (L, "attn_out"), S, (L, "gate_up"))
             else:
                 self._gdn(seq, L, S)
@@ -570,6 +593,8 @@ class QwenOverlay(ModelOverlay):
         self._conv_in_ghdr = False
 
     def _lm_phase(self, seq: Sequence) -> None:
+        if self.image.column_major:
+            self._weight_run(seq, [(-1, "lm")])
         self._phase(seq, (-1, "lm"), 1, "LOGITS")
 
     def accept(self, n: int) -> None:

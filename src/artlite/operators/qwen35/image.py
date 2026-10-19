@@ -14,6 +14,11 @@ Per-column rows (the columns' work is independent up to each output projection):
   hidden / 8 c ..; "lm": rows vocab / 8 c .. of ``output``, the vocabulary padded to whole C objects per column
   (MiniCPM-V's 248094 -> 248320; padding rows -1: zero tiles).
 
+Column-major (``overlay.image``: a column's regions in step order, each normed phase's norm-weight objects before its
+tiles, data region "<name>_norm") when every region's decode K groups are whole chunk groups of the image
+(``contiguous``: the 9B, MiniCPM-V), so that a decode step streams a column's weights between two attentions as one run;
+else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its down's 17 chunk-major in groups of 5).
+
 down's K is the ffn padded to whole K chunks (MiniCPM-V's 3584 -> 4096: zero super-blocks, ``overlay.image``). The
 activation objects' payload (``payload``: the K groups) is the hidden state rounded up to whole 4 KB state panels of the
 GDN cores, at least 4096 elements (27B 6144, 9B and MiniCPM-V 4096): down takes its K chunks in groups (27B 1 of 17, 9B
@@ -25,10 +30,12 @@ import numpy as np
 from ...gguf_model import GGUFFile
 from ...model_config import QwenConfig
 from ..design import COLS
-from ..overlay.decode import C_LEN
-from ..overlay.image import TileImage, column_rows, gate_up_rows
+from ..overlay.decode import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
+from ..overlay.image import Region, TileImage, column_rows, gate_up_rows
+from ..overlay.phases import group_chunks
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
+NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "lm": "output_norm"}
 
 
 def payload(hidden: int) -> int:
@@ -41,6 +48,12 @@ def gdn_v_heads(cfg: QwenConfig, c: int) -> list[int]:
     """The v heads of column c (increasing): those whose q / k head (j % k_heads) is one of the column's."""
     kpc = cfg.ssm_k_heads // COLS
     return [j for j in range(cfg.ssm_v_heads) if j % cfg.ssm_k_heads // kpc == c]
+
+
+def contiguous(region: Region) -> bool:
+    """Whether the decode's K groups of a region (``phases.group_chunks``) are whole chunk groups of the image: the
+    tiles stream in the image's order."""
+    return all(g == region.kc_group for _, g in group_chunks(region))
 
 
 class QwenImage(TileImage):
@@ -65,7 +78,20 @@ class QwenImage(TileImage):
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         rows = column_rows(self.vocab)
         self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
+        self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
+        self.column_major = all(contiguous(r) for r in self.regions)
+        if self.column_major:  # (each normed phase's norm-weight objects before its tiles)
+            regions, self.regions = self.regions, []
+            for r in regions:
+                if r.name in NORMS:
+                    self._add_data(r.layer, r.name + "_norm", self.n_norm * self.tile_bytes)
+                self.regions.append(r)
         self._place()
+
+    def norm_objects(self, layer: int, name: str) -> np.ndarray:
+        """(n_norm, tile_bytes) uint8: the phase's RMSNorm weights (bf16)."""
+        w = self.gguf.tensor("output_norm.weight" if layer < 0 else f"blk.{layer}.{NORMS[name]}.weight").dequantize()
+        return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
 
     def _layer(self, layer: int) -> None:
         cfg, b = self.cfg, f"blk.{layer}."

@@ -1,6 +1,7 @@
 """The qwen35 weight image (operators/qwen35/image.py), on the host (no NPU): the layout of a GGUF file (every row of
-every matrix in exactly one column's block, the GDN heads' column partition, MiniCPM-V's padded vocabulary and down K)
-and the packed image's tiles at their places (the C++ packer against the slots' ``pack_tile``: test_overlay_gemv.py)."""
+every matrix in exactly one column's block, the GDN heads' column partition, MiniCPM-V's padded vocabulary and down K,
+column-major where the decode's K groups allow it) and the packed image's tiles and norm-weight objects at their places
+(the C++ packer against the slots' ``pack_tile``: test_overlay_gemv.py)."""
 
 import os
 
@@ -10,8 +11,9 @@ import pytest
 from artlite.gguf_model import GGUFFile
 from artlite.operators.design import COLS
 from artlite.operators.formats import pack_tile, slice_fields
-from artlite.operators.overlay.image import pack_rows
-from artlite.operators.qwen35.image import KC, QwenImage, gdn_v_heads
+from artlite.operators.overlay.decode import norm_objects
+from artlite.operators.overlay.image import BLOCK_BYTES, pack_rows
+from artlite.operators.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
 from .qwen35_ref import QwenConfig, qwen_gguf
 
@@ -27,10 +29,22 @@ def test_layout(size: str) -> None:
     cfg = QwenConfig.from_gguf(g)
     img = QwenImage(g, cfg)
     assert img.tile_bytes == S
+    assert img.column_major == (size != "27B")  # (the 27B: its output projections' and down's groups are strided)
+    if img.column_major:  # a column's regions in a row (each normed phase's norm objects first), one run per block
+        names = [r.name for r in img.regions]
+        assert all(names[i - 1] == n + "_norm" for i, n in enumerate(names) if n in NORMS)
+        blocks = img._blocks()
+        assert len(blocks) == (2 if size == "9B" else 1)
+        for blk in blocks:
+            stream = sum(r.col_bytes for r in blk)
+            assert img.runs(blk[0], blk[-1]) == [(blk[0], stream)] and COLS * stream <= BLOCK_BYTES
     end = 0
     for r in img.regions:
         assert r.offset >= end and r.offset % 64 == 0
-        end = r.offset + r.nbytes
+        end = r.offset + (r.col_bytes if img.column_major else r.nbytes)
+        if r.data:
+            assert r.data == img.n_norm * S
+            continue
         assert {r.tile(rt, kc) for rt in range(r.n_rt) for kc in range(r.n_kc)} == set(range(r.n_rt * r.n_kc))
         for b in r.blocks:
             rows = b.rows[b.rows >= 0]
@@ -82,9 +96,15 @@ def test_pack_image(size: str) -> None:
     rng = np.random.default_rng(0)
     for r in img.regions:
         assert r.name != "down" or (r.kc_group < r.n_kc) == (size == "9B")
+        if r.data:  # (every column's copy of the phase's norm-weight objects)
+            L, name = r.layer, r.name.removesuffix("_norm")
+            w = np.asarray(g.tensor("output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight").raw, np.float32)
+            want = norm_objects(w.reshape(-1), S).view(np.uint8).reshape(-1)
+            for c in range(COLS):
+                assert np.array_equal(out[r.offset + c * r.col_stride:][:want.size], want), (L, r.name, c)
         for b in r.blocks:
             c, t = int(rng.integers(COLS)), int(rng.integers(b.tiles))
             ref = pack_rows([g.tensor(n) for n in b.tensors], b.rows[c, t * b.R:(t + 1) * b.R], b.fmt, b.R, S, r.n_kc)
-            col = out[r.offset + c * r.col_bytes:r.offset + (c + 1) * r.col_bytes].reshape(-1, S)
+            col = out[r.offset + c * r.col_stride:r.offset + c * r.col_stride + r.col_bytes].reshape(-1, S)
             for kc in range(r.n_kc):
                 assert np.array_equal(col[r.tile(r.rt0[b.name] + t, kc)], ref[0, kc]), (r.layer, r.name, b.name, kc)
