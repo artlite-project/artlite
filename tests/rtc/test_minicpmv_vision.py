@@ -237,8 +237,9 @@ def test_before_merger(npu: Sd15Device, enc: V.Encoder, case: str) -> None:
         trs.append(tr)
         ref.append(tf)
     bd = Builder(npu)
-    x = M.patch_embed(bd, M.patch_weights(lambda n: sim.w(n).float()), "x0")
-    for n, data in M.inputs(entries, [M.patches(e) for e in ents], [_pos(sim, e) for e in entries], "x0").items():
+    norm = (sim.cfg.mean, sim.cfg.std)
+    x = M.patch_embed(bd, M.patch_weights(lambda n: sim.w(n).float(), *norm), "x0")
+    for n, data in M.inputs(entries, [M.patches(e, norm) for e in ents], [_pos(sim, e) for e in entries], "x0").items():
         npu.write(n, data)
     kv = bd.ddr("kv", M.kv_bytes(M.PRE))
     pre, _ = M.level_keys(case, entries, joint=entries[0].joint)
@@ -359,10 +360,10 @@ def test_merger(npu: Sd15Device, enc: V.Encoder, case: str) -> None:
 @pytest.mark.parametrize("compression", [16, 4])
 def test_encoder(npu: Sd15Device, compression: int) -> None:
     """The whole encoder (``Encoder``: its pair and joint transactions; the 16x file, or the 4x one without the ViT
-    merger) on the entries of both of ``_pixels``' cases: their embeddings on average as far from the float64
-    encoder's as the CPU at the NPU's rounding points, each one within 1.3x of it (the final merger amplifies the
-    residual's difference ~3.5x, so its direction decides an entry's: in the 16x file the 24 x 40 entry's 1.7% against
-    the CPU's 1.6% after layer 26 gives 5.9% against 4.9%, the overview's 4.1% against 5.0%); each dispatch's time."""
+    merger) on the entries of both of ``_pixels``' cases: their embeddings' median per-token error from the float64
+    encoder's on average within 1.1x of the CPU's at the NPU's rounding points, each entry's within 1.2x (not the rms:
+    a few fragile tokens hold most of an entry's squared error, any small difference changing them by up to ~90%, so
+    an entry's rms is a draw of 0.8-1.9x the CPU's); each dispatch's time."""
     import time
 
     path = minicpmv_mmproj(compression)
@@ -370,7 +371,8 @@ def test_encoder(npu: Sd15Device, compression: int) -> None:
         pytest.skip(f"{path} missing")
     sim, enc = V.NpuEncoder(path), V.Encoder(path)
     pos = V._bf16(sim.w("v.position_embd.weight"))
-    npe = M.Encoder(npu, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert), pos, patch=sim.patch)
+    npe = M.Encoder(npu, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert, sim.cfg.mean, sim.cfg.std), pos,
+                    patch=sim.patch)
     errs = []
     for case in ("pair", "joint"):
         ents = _pixels(case)
@@ -383,8 +385,10 @@ def test_encoder(npu: Sd15Device, compression: int) -> None:
             ts.append(time.perf_counter() - t0)
         print(f"encoder ({compression}x), {case} of {len(ents)}: {1e3 * min(ts):.1f} ms")
         for g, e in zip(got, ents, strict=True):
-            npu_err, cpu_err = _rel(g, ex := enc.forward(e)), _rel(want := sim.forward(e), ex)
-            print(f"embeddings: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g, want):.2e}")
-            errs.append((npu_err, cpu_err))
+            ex, want = enc.forward(e), sim.forward(e)
+            med = [float(((a.double() - ex).norm(dim=1) / ex.norm(dim=1)).median()) for a in (g, want)]
+            print(f"embeddings: from float64 median {med[0]:.2e} (the CPU's {med[1]:.2e}), rms {_rel(g, ex):.2e} (the "
+                  f"CPU's {_rel(want, ex):.2e}), NPU vs CPU {_rel(g, want):.2e}")
+            errs.append(med)
     npu_err, cpu_err = np.mean(errs, 0)
-    assert npu_err < 1.1 * cpu_err and all(a < 1.3 * b for a, b in errs), errs
+    assert npu_err < 1.1 * cpu_err and all(a < 1.2 * b for a, b in errs), errs

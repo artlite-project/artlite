@@ -189,6 +189,10 @@ form (the gate halves of a gate/up C tile).
   (hh + hl + lh). The exact split is on the MMUL with a -I panel (restructurings.md R4).
 - **Idempotence**: conversion is not idempotent. A -128 mantissa keeps its exponent; converting
   the value again raises it. Host models insert the kernel's blocks; they do not re-round values.
+- **Exact integers**: integers in [-128, 127] are exact with exponent byte 133 (a scale of 1), which `bfp16.blocks`
+  does not pick for a block holding -128 (`sd15.layout.int_panels`). MiniCPM-V's encoder takes the 8-bit pixels so,
+  as p - 128, with the normalization folded into the patch embedding's weights and its offset on a constant input in
+  a block of its own: no rounding of the input, and cheaper host packing than float panels.
 - **Host packing**: round to nearest even when packing on the host (`bfp16.blocks`), not truncate
   (as mlir-aie's `floatToBfp16` helper does): a Llama Q4_0 prefill's KL 0.00085 vs 0.00145 truncated.
 
@@ -214,6 +218,9 @@ form (the gate halves of a gate/up C tile).
   last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046). In a DMA-bound
   attention the second MMUL per record costs nothing measurable; give the lo products their own accumulator chain
   when one chain would serialize (QB = 1).
+- **hi + lo weights** where a GEMM is sensitive and cheap: `sd15.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
+  the lo ones on the A panels walked again). MiniCPM-V's encoder takes them at its patch embedding and its final
+  merger (a quarter of its weights' error between them); any other layer's weights held 1-3% each and did not pay.
 - **A GEMM's bf16 C tile between k-tiles** (`gemm/mac.py`: C stored as bf16 after every 64 k) rounds the running sum
   K / 64 times; the error grows with the number of roundings and the partial sums' size. Splitting K into parts
   that each emit a bf16 C, summed in fp32 by the consumer (a residual add), cuts it (Gemma's down, K = 10240, in 4
@@ -234,6 +241,18 @@ weights as bfp16 panels, bf16 outputs, the C tile per k-tile, K parts, P and V b
   teacher-forced tokens after the prompt.
 - Average over several prompts: one prompt's error at the last layers varies by ~+-30% with the rounding luck,
   and a 64-token KL mean is dominated by its few largest tokens (max 0.014 at mean 0.0006).
+- Rank rounding points one at a time in the exact model (only that point rounded). In the model with every rounding,
+  any change re-draws all later roundings, so one run of it measures that noise: in MiniCPM-V's encoder every early
+  site moved the KL by the same ~0.01. The one-site errors add up (as squares) where the full model's do not.
+- A few fragile tokens can hold most of an output's squared error (MiniCPM-V's ViT: the worst 1% held 67-80%,
+  single tokens changed by 57-99% by any small change): rank by the median per-token error.
+- llama.cpp's CPU takes Q4_K weights' activations as Q8, so any change of the input re-draws that rounding: a KL
+  floor (~0.005 on MiniCPM-V 1B over 96 tokens). Its F32 requant (`llama-quantize --allow-requantize IN OUT F32`)
+  has none.
+- Average the KL over realizations: a tiny dither (1e-6 relative, or single bf16 ulps in 0.1% of an input) re-draws
+  every later rounding; 10-20 per config resolve ~5%. Report a prompt whose KL hinges on one near-tie token apart
+  (MiniCPM-V: a month read from small print): the model's other biases set its sign, so it moved one way in the CPU
+  model and the other on the NPU while the remaining prompts agreed.
 - Check the model against the NPU per layer. Where they diverge, a rounding point is missing from the model (the
   attention's P was: the simulation matched the NPU through layer 17 and fell short after it until P was modeled).
 - `bfp16.values` emulates the conversion; insert blocks where the kernel converts, never re-round (above).

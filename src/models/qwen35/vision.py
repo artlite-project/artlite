@@ -60,8 +60,8 @@ class NpuVision:
             enc = V.Encoder.restored(npu, st, pos, patch=self.clip.patch_size)
         else:
             npu = Sd15Device()
-            enc = V.Encoder(npu, V.weights(self._get, self.clip.layers, self.clip.merger_layer), pos,
-                            patch=self.clip.patch_size)
+            enc = V.Encoder(npu, V.weights(self._get, self.clip.layers, self.clip.merger_layer, self.clip.mean,
+                                           self.clip.std), pos, patch=self.clip.patch_size)
             save_state(cache, npu, enc.images, enc.state())
         npu.warm()
         return enc

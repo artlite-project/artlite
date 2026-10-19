@@ -14,6 +14,12 @@ band, in the memtile from the merger to the final merger). The entries' sizes re
 patch panels and position rows (``inputs``) and the levels' key masks (``level_keys``), so ``Encoder`` builds two
 transactions once (pair, joint) and rewrites those per dispatch.
 
+The GEMMs' operands are bfp16 panels (C fp32 over the whole K: sd15's); the patch embedding's are the pixels' exact
+8-bit integers (``patches``, ``patch_weights``: the normalization folded into its weights), and the GEMMs of ``HILO``
+(the patch embedding, the final merger's up and down: the most sensitive weights for their cost) take hi + lo weights
+(``ops.Gemm``). Most of the embeddings' error is the activations' panels (the weights' bfp16 about a quarter of it);
+the largest single rounding is post_ln's panels, the identity GEMM's A (``_post``).
+
 A layer (``layer``) on a level: LN1 -> K, V (their slots drained to DDR), Q (x log2 e / sqrt 72) -> attention (16
 heads, the softmax's max raised past attention sinks, key groups of padding skipped) -> O + x (LayerNorm records) ->
 LN2 (x parked in DDR meanwhile) -> up + GELU (panels) -> x back -> down + x (records). Its memtile layout alternates
@@ -391,18 +397,42 @@ def kv_bytes(lv: Level) -> int:
     return Keys("").attention(lv).kv_bytes()
 
 
-def patch_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
-    """The patch embedding as a GEMM (588 = 3 x 14 x 14 inputs (c, ky, kx) padded to 640 -> C) and its bias."""
-    w = get("v.patch_embd.weight").float().reshape(H, -1)
-    return {"w": _pad(w, C, 640), "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C)}
+HILO = ("v.patch_embd.weight", "mm.up.weight", "mm.down.weight")  # (the mmproj's weights of the hi + lo GEMMs)
+PIX, ONE = 588, 592  # (a patch's inputs (c, ky, kx) of 3 x 14 x 14; the constant input 1, a bfp16 block of its own)
 
 
-def patches(pixels: np.ndarray | torch.Tensor, patch: int = 14) -> torch.Tensor:
-    """An entry's pixels (3, H, W) -> its patches (ph pw, 640): (c, ky, kx) of each, raster order, zero-padded."""
-    x = torch.as_tensor(np.asarray(pixels), dtype=torch.float32)
+def pixel_map(mean: tuple[float, ...], std: tuple[float, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    """The normalization x = (p / 255 - mean) / std of a patch's inputs (c, ky, kx) as x = a q + o of q = p - 128 (float64
+    a, o of the 588 inputs)."""
+    m, s = (torch.tensor(v, dtype=torch.float64).repeat_interleave(PIX // 3) for v in (mean, std))
+    a = 1 / (255 * s)
+    return a, 128 * a - m / s
+
+
+def patch_weights(get: Callable[[str], torch.Tensor], mean: tuple[float, ...], std: tuple[float, ...]) -> dict:
+    """The patch embedding as a GEMM of the integer panels of ``patches`` (640 inputs -> C) with the pixels'
+    normalization (``pixel_map``) folded in: input k < 588 the weights' column k times a_k, input 592 (the constant 1)
+    their offset sum_k w_k o_k; the bias; "norm": the mean and std."""
+    w = get("v.patch_embd.weight").double().reshape(H, -1)
+    a, o = pixel_map(mean, std)
+    wt = torch.zeros(C, 640)
+    wt[:H, :PIX], wt[:H, ONE] = (w * a).float(), (w @ o).float()
+    return {"w": wt, "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C), "norm": (tuple(mean), tuple(std))}
+
+
+def patches(pixels: np.ndarray | torch.Tensor, norm: tuple[tuple[float, ...], tuple[float, ...]],
+            patch: int = 14) -> torch.Tensor:
+    """An entry's pixels (3, H, W), normalized by norm (mean, std) from 8-bit values p -> its patches' integer inputs
+    (ph pw, 640): q = p - 128 of (c, ky, kx) of each (raster order), input 592 the constant 1, zeros elsewhere
+    (``patch_weights``; pixels of other values: the nearest p)."""
+    x = torch.as_tensor(np.asarray(pixels), dtype=torch.float64)
+    mean, std = (torch.tensor(v, dtype=torch.float64)[:, None, None] for v in norm)
+    q = torch.round((x * std + mean) * 255).clamp(0, 255) - 128
     ph, pw = x.shape[1] // patch, x.shape[2] // patch
-    p = x.reshape(3, ph, patch, pw, patch).permute(1, 3, 0, 2, 4).reshape(ph * pw, -1)
-    return torch.nn.functional.pad(p, (0, 640 - p.shape[1]))
+    out = torch.zeros(ph * pw, 640)
+    out[:, :PIX] = q.reshape(3, ph, patch, pw, patch).permute(1, 3, 0, 2, 4).reshape(ph * pw, -1)
+    out[:, ONE] = 1
+    return out
 
 
 def patch_embed(bd: Builder, w: dict[str, torch.Tensor], name: str) -> Bands:
@@ -419,22 +449,22 @@ def patch_embed(bd: Builder, w: dict[str, torch.Tensor], name: str) -> Bands:
         bd.op({c: ColOps(fills=[MemTask([{"addr": pt.addr, "nwords": pn // 4}], ddr=(pi + c * pn, pn, None)),
                                MemTask([{"addr": x.addr, "nwords": cn // 4}], ddr=(ri + c * cn, cn, None))])
                for c in range(COLS)}, {})
-        rec = gemm(bd, pt, w["w"], w["b"], name=name + ".gemm", out=x, res=x, ln=True)
+        rec = gemm(bd, pt, w["w"], w["b"], name=name + ".gemm", out=x, res=x, ln=True, hilo=True)
         free(bd, pt)
         out.store(bd, b, x, rec)
     return out
 
 
 def inputs(entries: list[Entry], pix: list[torch.Tensor], pos: list[torch.Tensor], name: str) -> dict[str, np.ndarray]:
-    """``patch_embed``'s DDR images for a dispatch's placed entries (``place``): their patches (``patches``: pix) and
-    position rows (pos: (n, C)) at every group of their images (``Entry.fill_slots``)."""
+    """``patch_embed``'s DDR images for a dispatch's placed entries (``place``): their patches (``patches``: pix, as
+    integer panels) and position rows (pos: (n, C)) at every group of their images (``Entry.fill_slots``)."""
     fills = [e.fill_slots() for e in entries]
     slots = [f[:5] for f in fills]
     xp = pack([p[f[5]] for p, f in zip(pix, fills, strict=True)], slots, PRE.nb)
     xr = pack([p[f[5]] for p, f in zip(pos, fills, strict=True)], slots, PRE.nb)
     out = {}
     for b in range(PRE.nb):
-        out[f"{name}.pix.{b}"] = np.concatenate([L.panels(xp[b, c]) for c in range(COLS)])
+        out[f"{name}.pix.{b}"] = np.concatenate([L.int_panels(xp[b, c]) for c in range(COLS)])
         out[f"{name}.pos.{b}"] = np.concatenate([L.ctiles(xr[b, c], PRE.m) for c in range(COLS)])
     return out
 
@@ -682,10 +712,10 @@ def _final_mlp(bd: Builder, w: dict[str, torch.Tensor], name: str, mc: Tensor) -
     n3 = FUP // 3  # (3 GEMMs of 5 passes a row: a command's biases reach 14)
     for k in range(3):
         gemm(bd, nl, w["up"][n3 * k:n3 * (k + 1)], w["up_b"][n3 * k:n3 * (k + 1)], name=f"{name}.up{k}",
-             out=Tensor(l16, n3, g.addr + n3 // 8 * l16.np * 72 * k, "pn"), kind="gelu")
+             out=Tensor(l16, n3, g.addr + n3 // 8 * l16.np * 72 * k, "pn"), kind="gelu", hilo=True)
     free(bd, nl)
     e = alloc(bd, l16, C)
-    gemm(bd, g, w["down"], w["down_b"], name=name + ".down", out=e)
+    gemm(bd, g, w["down"], w["down_b"], name=name + ".down", out=e, hilo=True)
     free(bd, g)
     return e
 
@@ -741,10 +771,11 @@ def embeddings(npu: Sd15Device, image: str, entries: list[Entry], merge: int = 4
     return out
 
 
-def weights(get: Callable[[str], torch.Tensor], layers: int, insert: int) -> dict:
-    """Every padded weight of the encoder: "patch", per layer il its ``layer_weights``, "merger" (after layer
-    ``insert``; -1: none, the 4x file), "final"."""
-    return {"patch": patch_weights(get), "merger": merger_weights(get) if insert >= 0 else None,
+def weights(get: Callable[[str], torch.Tensor], layers: int, insert: int, mean: tuple[float, ...],
+            std: tuple[float, ...]) -> dict:
+    """Every padded weight of the encoder: "patch" (the pixels' normalization mean, std folded in), per layer il its
+    ``layer_weights``, "merger" (after layer ``insert``; -1: none, the 4x file), "final"."""
+    return {"patch": patch_weights(get, mean, std), "merger": merger_weights(get) if insert >= 0 else None,
             "final": final_weights(get), **{il: layer_weights(get, il) for il in range(layers)}, "insert": insert,
             "layers": layers}
 
@@ -787,7 +818,7 @@ class Encoder:
 
     def __init__(self, npu: Sd15Device, w: dict, pos: torch.Tensor, *, patch: int, name: str = "v"):
         """w: ``weights``; pos: the learned position embedding (70 x 70 rows, 1152) in bf16 values; patch: pixels."""
-        self.npu, self.name, self.patch = npu, name, patch
+        self.npu, self.name, self.patch, self.norm = npu, name, patch, w["patch"]["norm"]
         self.merge = 4 if w["insert"] >= 0 else 2  # (patches per output token per side)
         self.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
         bd = Builder(npu)
@@ -802,13 +833,14 @@ class Encoder:
         """What ``restored`` needs besides the device's images: the transactions (their shim addresses as
         relocations)."""
         return {"words": self.words, "rel": {j: self.npu.relocations(a) for j, a in self.addrs.items()}, "out": self.out,
-                "merge": self.merge}
+                "merge": self.merge, "norm": self.norm}
 
     @classmethod
     def restored(cls, npu: Sd15Device, state: dict, pos: torch.Tensor, *, patch: int, name: str = "v") -> "Encoder":
         """An Encoder of ``state()`` on a device whose images were restored (``Sd15Device.restore``)."""
         enc = cls.__new__(cls)
         enc.npu, enc.name, enc.patch, enc.out, enc.merge, enc.tr = npu, name, patch, state["out"], state["merge"], {}
+        enc.norm = state["norm"]
         enc.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
         enc.words = {j: npu.relocate(wd, state["rel"][j]) for j, wd in state["words"].items()}
         return enc
@@ -816,7 +848,7 @@ class Encoder:
     def _host(self, ents: list[Entry], pixels: list[np.ndarray]) -> dict[str, np.ndarray]:
         """A dispatch's DDR images: its placed entries' patch panels and position rows, its levels' commands."""
         pos = [self.pos[torch.from_numpy(positions(e.ph, e.pw))] for e in ents]
-        out = inputs(ents, [patches(p, self.patch) for p in pixels], pos, self.name + ".x0")
+        out = inputs(ents, [patches(p, self.norm, self.patch) for p in pixels], pos, self.name + ".x0")
         joint = ents[0].joint
         keys = level_keys(f"{self.name}.{'joint' if joint else 'pair'}", ents, joint=joint)
         for k, lv in list(zip(keys, (PRE, POST), strict=True))[:2 if self.merge == 4 else 1]:  # (4x: no POST level)

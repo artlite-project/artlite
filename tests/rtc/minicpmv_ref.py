@@ -34,6 +34,7 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LLAMA_CPP_DIR, ClipConfig
 from artlite.operators.base import CACHE_DIR
+from artlite.operators.vision import minicpmv as vision
 
 from . import common
 from .qwen35_ref import _lib_identity, _llama_lib
@@ -346,19 +347,27 @@ def _bfp(x: torch.Tensor) -> torch.Tensor:
 
 class NpuEncoder(Encoder):
     """The encoder at the rounding points of sd15's design (``artlite.operators.vision.minicpmv``; float64 between
-    them): a GEMM's A as bfp16 panels and its weights bfp16, C over the whole K from the bf16 bias plus a bf16
-    residual, rounded once (bf16 C tiles: the residual stream, a LayerNorm's input; bfp16 panels: a GEMM's or the
-    attention's input, V^T blocked over 8 tokens); LayerNorm statistics S1, S2 of the bf16 values in fp32, var =
-    max(S2 / n - mean^2, 0); GELU of bf16 values to bf16 (act_lut); attention with q (x log2 e / sqrt d) and k single
-    bfp16, P = 2^(s - max) in bf16 as bfp16 panels, l their sums, o / l as panels."""
+    them): a GEMM's A as bfp16 panels (the patch embedding's: the pixels' integers, exact) and its weights bfp16 (hi +
+    lo those of ``minicpmv.HILO``), C over the whole K from the bf16 bias plus a bf16 residual, rounded once (bf16 C
+    tiles: the residual stream, a LayerNorm's input; bfp16 panels: a GEMM's or the attention's input, V^T blocked over
+    8 tokens); LayerNorm statistics S1, S2 of the bf16 values in fp32, var = max(S2 / n - mean^2, 0); GELU of bf16
+    values to bf16 (act_lut); attention with q (x log2 e / sqrt d) and k single bfp16, P = 2^(s - max) in bf16 as bfp16
+    panels, l their sums, o / l as panels."""
 
     def __init__(self, mmproj: str):
         super().__init__(mmproj)
         self._wq: dict[str, torch.Tensor] = {}
 
+    @staticmethod
+    def _round(w: torch.Tensor, name: str) -> torch.Tensor:
+        """The weights w (N, K) of the mmproj's tensor ``name`` as the NPU takes them: bfp16 blocks along K (hi + lo:
+        ``minicpmv.HILO``)."""
+        hi = _bfp(w)
+        return hi + _bfp(w - hi) if name in vision.HILO else hi
+
     def wq(self, name: str) -> torch.Tensor:
         if name not in self._wq:
-            self._wq[name] = _bfp(self.w(name))
+            self._wq[name] = self._round(self.w(name), name)
         return self._wq[name]
 
     def gemm(self, a: torch.Tensor, name: str, bias: str | None, res: torch.Tensor | None = None) -> torch.Tensor:
@@ -448,8 +457,16 @@ class NpuEncoder(Encoder):
         P, H = self.patch, self.hidden
         x = torch.as_tensor(np.asarray(pixels), dtype=self.dtype)
         ph, pw = x.shape[1] // P, x.shape[2] // P
-        cols = x.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)  # (patches (c, ky, kx))
-        c = _bfp(cols) @ _bfp(self.w("v.patch_embd.weight").reshape(H, -1)).T + _bf16(self.w("v.patch_embd.bias").reshape(-1))
+        # (the patches' inputs (c, ky, kx) as the integers q = p - 128 of the 8-bit pixels p (exact panels); the
+        # normalization x = a q + o folded into the weights, the offset sum_k w_k o_k on a constant input of its own)
+        mean, std = (torch.tensor(v, dtype=self.dtype) for v in (self.cfg.mean, self.cfg.std))
+        q = torch.round((x * std[:, None, None] + mean[:, None, None]) * 255) - 128
+        cols = q.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)
+        a = (1 / (255 * std)).repeat_interleave(P * P)
+        o = 128 * a - (mean / std).repeat_interleave(P * P)
+        w, name = self.w("v.patch_embd.weight").reshape(H, -1), "v.patch_embd.weight"
+        c = cols @ self._round(w * a, name).T + self._round((w @ o)[:, None], name)[:, 0] \
+            + _bf16(self.w("v.patch_embd.bias").reshape(-1))
         x = _bf16(c + _bf16(self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]))
         tr = trace if trace is not None else {}
         tr["pos_embed"] = x

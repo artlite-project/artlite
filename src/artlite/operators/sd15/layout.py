@@ -39,6 +39,16 @@ def panels(x: torch.Tensor) -> np.ndarray:
     return blocks(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3)).reshape(-1)
 
 
+def int_panels(x: torch.Tensor) -> np.ndarray:
+    """(tokens, C) of integers in [-128, 127] -> the panel layout, exactly (every block's mantissas the integers, its
+    exponent byte 133: a scale of 1)."""
+    t, c = x.shape
+    m = x.to(torch.int8).reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3)
+    out = torch.full((*m.shape[:-1], 9), 133, dtype=torch.uint8)
+    out[..., 1:] = m.view(torch.uint8)
+    return out.numpy().reshape(-1)
+
+
 def from_panels(b: np.ndarray, tokens: int, c: int) -> torch.Tensor:
     v = unblocks(np.asarray(b, np.uint8)[:c // 8 * tokens * 9].reshape(c // 8, tokens // 8, 8, 9))
     return torch.from_numpy(np.ascontiguousarray(v)).permute(1, 2, 0, 3).reshape(tokens, c)

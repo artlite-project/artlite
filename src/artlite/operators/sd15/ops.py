@@ -115,7 +115,10 @@ class Gemm:
 
     ch_step: a core row's channels in the statistics' channel space (default its passes'), ch_real: how many of them
     count (the record window). tsplit: core rows per channel slice: row r computes slice r // tsplit (N tsplit / 4
-    channels) for the (r % tsplit)-th of tsplit parts of the tiles (``tiles``)."""
+    channels) for the (r % tsplit)-th of tsplit parts of the tiles (``tiles``).
+
+    hilo: the weights as two bfp16 parts, hi = bfp16(w) and lo = bfp16(w - hi) (about bf16's precision): K doubled, per
+    pass the hi k-tiles, then the lo ones on the A panels walked again (twice the MACs and weight bytes)."""
 
     m: int
     ntile: int
@@ -150,6 +153,7 @@ class Gemm:
     ch_real: int = 0
     tsplit: int = 1
     tpar: int = -0x55555556  # (0xAAAAAAAA: the odd tiles' tap words)
+    hilo: bool = False
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N * self.tsplit % 320 == 0 and self.K % 8 == 0 and \
@@ -160,7 +164,8 @@ class Gemm:
         self.nt = self.ntile // self.tsplit  # (a core's tiles)
         self.npo = self.npo or self.npass - self.p0
         assert 0 <= self.p0 and self.p0 + self.npo <= self.npass
-        self.nkt = -(-self.K // D.KT)
+        self.nkt = -(-self.K // D.KT) * (2 if self.hilo else 1)
+        assert not self.hilo or self.K and not self.conv
         if self.conv:
             assert self.m * (1 + self.il) == 16 * self.R * self.Lg and (self.ntile == 1 or self.rc) and self.K % 64 == 0 \
                 and self.conv in (1, 2)
@@ -188,7 +193,9 @@ class Gemm:
             self.y_np * L.PANEL or \
             self.N // 80 * (1 if self.out == "ds" else self.ntile) * L.ct_bytes(self.m)
         assert self.y + ybytes <= D.HEAP and self.x + self.K // 8 * self.x_np * L.PANEL <= D.HEAP, "tensors past the heap"
-        assert self.conv or self.x + self.aobj * (128 // self.m) * 8 * self.x_np * L.PANEL <= 512 * 1024, \
+        walk = self.aobj * (128 // self.m) - (self.nkt // 2 if self.hilo else 0)  # (k-tiles of x a walk reads; hilo:
+        # the second, the longer)
+        assert self.conv or self.x + walk * 8 * self.x_np * L.PANEL <= 512 * 1024, \
             "the A objects' walk past the memtile (an over-read hangs)"
         assert self.res is None or self.res + (self.N // 80 * self.ntile - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= \
             512 * 1024, "the residual's last objects past the memtile"
@@ -436,6 +443,10 @@ class Gemm:
     def weights(self, w: torch.Tensor, row: int) -> np.ndarray:
         """Row ``row``'s weight image (a conv's k-tiles: per chunk of 64 input channels its taps, ``tap_order``)."""
         ws = w[self._rows(row)]
+        if self.hilo:  # ([hi | lo], each K padded to whole k-tiles)
+            wp = torch.nn.functional.pad(ws.float(), (0, self.nkt // 2 * D.KT - ws.shape[1]))
+            hi = torch.from_numpy(L.unblocks(L.blocks(wp.reshape(wp.shape[0], -1, 8)))).reshape(wp.shape)
+            ws = torch.cat([hi, wp - hi], 1)
         if self.conv:
             t = ws.reshape(-1, self.nch, 64, 3, 3).permute(0, 1, 3, 4, 2)  # (n, chunk, dy, dx, k)
             ws = torch.stack([torch.stack([t[:, c, dy, dx] for dy, dx in self.tap_order(c)], 1) for c in range(self.nch)],
@@ -535,10 +546,12 @@ class Gemm:
                 def chain(t: int, it: bool, sl: int = sl) -> list[dict]:  # (tile t's; it: the BDs step over the row's
                     # tiles (one pass) or passes (one tile))
                     out = []
-                    if self.aobj:
-                        out.append({"addr": self.x + t * TP * 4, "nwords": self.aobj * D.A_OBJ // 4,
-                                    "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)],
-                                    **({"iteration": (TP, self.nt)} if it else {})})
+                    if self.aobj:  # (hilo: x walked twice, the hi k-tiles' A, then the lo ones')
+                        nw = self.aobj * D.A_OBJ // 4
+                        for n in ([self.nkt // 2 * m * 18, nw - self.nkt // 2 * m * 18] if self.hilo else [nw]):
+                            out.append({"addr": self.x + t * TP * 4, "nwords": n,
+                                        "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)],
+                                        **({"iteration": (TP, self.nt)} if it else {})})
                     if self.res is not None:  # (the object (sl npass + P0 + p, t))
                         ow = self.nres * D.A_OBJ // 4
                         it_res = (ct // 4, self.nt) if NPO == 1 else (NT * ct // 4, NPO)
