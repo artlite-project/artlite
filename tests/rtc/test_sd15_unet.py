@@ -123,6 +123,30 @@ def test_geglu(npu: Sd15Device, m: int, K: int, N: int) -> None:
     assert _rel(y, ref) < 1.2e-2
 
 
+@pytest.mark.parametrize("m, ntile, K, N", [(64, 1, 1280, 4480), (16, 2, 1280, 1280)])
+def test_gelu(npu: Sd15Device, m: int, ntile: int, K: int, N: int) -> None:
+    """A GEMM with the GELU epilogue (MiniCPM-V's ViT feed-forward: gelu of the N outputs as panels): within 1.2e-2 of
+    torch on the bfp16-rounded operands (bf16 outputs, GELU's table, the bfp16 output)."""
+    torch.manual_seed(4)
+    T = m * ntile
+    x = torch.randn(COLS * T, K)
+    w, b = torch.randn(N, K) / K ** 0.5, torch.randn(N) * 0.1
+    X, Y = 0, K // 8 * T // 8 * L.PANEL
+    g = Gemm(m=m, ntile=ntile, K=K, N=N, x=X, y=Y, out="gelu")
+    s = npu.seq()
+    s.op(fills(npu, "x", [L.panels(x[c * T:(c + 1) * T]) for c in range(COLS)], X), {})
+    s.op({}, table_rows(npu, "tab", gelu_table()))
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, b))
+    ybytes = N // 8 * g.y_np * L.PANEL
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    out = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    y = torch.cat([L.from_panels(out[c], g.y_np * 8, N)[:T] for c in range(COLS)])
+    u = q(x) @ q(w).T + b.bfloat16().float()
+    ref = F.gelu(u.bfloat16().float(), approximate="tanh")
+    assert _rel(y, ref) < 1.2e-2
+
+
 def table_rows(npu: Sd15Device, name: str, tab: np.ndarray) -> dict:
     """A K_TABLE command and its table slot on every row."""
     from artlite.operators.sd15 import core as K
@@ -207,18 +231,22 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int, nrows: int
     assert _rel(z, ref) < 9e-3
 
 
-@pytest.mark.parametrize("np_, d, nb, rows", [(8, 160, 1, 2), (2, 160, 1, 2), (16, 80, 2, 2), (16, 80, 2, 4),
-                                              (8, 160, 1, 4), (32, 40, 4, 4)])
-def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int) -> None:
+@pytest.mark.parametrize("np_, d, nb, rows, sink", [(8, 160, 1, 2, False), (2, 160, 1, 2, False), (16, 80, 2, 2, False),
+                                                    (16, 80, 2, 4, False), (8, 160, 1, 4, False), (32, 40, 4, 4, False),
+                                                    (16, 80, 2, 4, True), (8, 160, 1, 4, True)])
+def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: bool) -> None:
     """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
     panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
     panels drained to DDR slots, the attention rows' B streams; rows 4: every core row; d 40: a 64x64 band, the keys of
-    4 bands, role c on every row):
+    4 bands, role c on every row; sink: a key of the last band x 30, its scores ~90 log2 units past the first group's
+    for half the queries: the reference max raised, ``raise_max``):
     within 1.5e-2 of softmax attention on the bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys
     ~8e-3, the bfp16 output ~6e-3, vexp2)."""
     torch.manual_seed(3)
     T, C = 8 * np_, 8 * d
     x = torch.randn(3, nb, COLS * T, C)
+    if sink:
+        x[1, nb - 1, COLS * T - 1] *= 30
     qs, k, v = x[0, 0] * (1.4426950408889634 / d ** 0.5) * 2, x[1], x[2]
     QA = 0
     KA = QA + C // 8 * np_ * L.PANEL + D.A_OBJ  # (the last head's walk past its panels)
@@ -228,7 +256,7 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int) -> Non
     ar = (0, 1) if rows == 2 else tuple(range(ROWS))
     at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb, rows=ar)
     npu.alloc("kv", at.kv_bytes())
-    at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, rows=ar)
+    at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, rows=ar, raise_max=sink)
     s = npu.seq()
     for b in range(nb):
         s.op(merge(fills(npu, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
@@ -239,7 +267,7 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int) -> Non
     npu.write("acmd", at.command())
     s.op(fills(npu, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
     for t in range(1 if d == 40 else max(np_ // 8, 1)):  # (an op per tile; d 40: one)
-        at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, tile=t, rows=ar)
+        at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, tile=t, rows=ar, raise_max=sink)
         s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(npu.address("acmd")))
     nbytes = C // 8 * np_ * L.PANEL
     s.op(drains(npu, "o", nbytes, OA), {})

@@ -98,6 +98,9 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 - Row max by `shuffle_down_rotate` 1, 2, 4 and max.
 - A per-query integer reference max from the first KV chunk (+1), P = 2^(s - m) with the clamp
   above, and no O rescaling.
+- Not with attention sinks past the first chunk: MiniCPM-V's ViT scores reach 71 log2 units above its first 32 keys'
+  maximum (P saturates at 2^63; embeddings' KL 0.0090 -> 0.0074 once raised). Check each later group against m + 16
+  in bf16 and rescale o and l on the rare raise (sd15 `ops.Attention(raise_max=)`, the qwen35 prefill attention).
 - Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
   bf16 rounding can put the largest argument above 0.
 
