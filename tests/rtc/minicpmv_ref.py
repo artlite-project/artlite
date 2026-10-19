@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LLAMA_CPP_DIR
+from artlite.model_config import LLAMA_CPP_DIR, ClipConfig
 from artlite.operators.base import CACHE_DIR
 
 from . import common
@@ -169,15 +169,11 @@ class Encoder:
 
     def __init__(self, mmproj: str, *, llama: bool = False):
         self.g = g = GGUFFile(mmproj)
-        m = lambda k, d=None: g.meta.get(f"clip.vision.{k}", d)
-        assert g.meta["clip.projector_type"] == "minicpmv4_7", g.meta["clip.projector_type"]
-        self.hidden, self.heads = int(m("embedding_length")), int(m("attention.head_count"))
-        self.hd = self.hidden // self.heads
-        self.layers, self.patch = int(m("block_count")), int(m("patch_size"))
-        self.eps = float(m("attention.layer_norm_epsilon"))
-        self.merge = int(m("projector.scale_factor", 4))  # (4: the ViT merger and the final merge, 2: the final only)
-        wa = m("wa_layer_indexes")
-        self.insert = int(wa[0]) if self.merge == 4 else -1
+        self.cfg = cfg = ClipConfig.from_gguf(g)
+        assert cfg.projector == "minicpmv4_7", cfg.projector
+        self.hidden, self.heads, self.hd = cfg.hidden, cfg.heads, cfg.head_dim
+        self.layers, self.patch, self.eps = cfg.layers, cfg.patch_size, cfg.eps
+        self.merge, self.insert = cfg.merge, cfg.merger_layer  # (the ViT merger and the final merge, or the final only)
         self.llama = llama
         self.dtype = torch.float32 if llama else torch.float64
         self._w: dict[str, torch.Tensor] = {}

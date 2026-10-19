@@ -71,6 +71,14 @@ def minicpmv_gguf(quant: str = "Q4_K_M") -> str:
     return os.path.join(MODELS_DIR, "openbmb", "MiniCPM-V-4.7-1B-gguf", f"MiniCPM-V-4_7-1B-{quant}.gguf")
 
 
+def minicpmv_mmproj(compression: int = 16) -> str:
+    """MiniCPM-V 4.7 1B's vision encoder and projector (GGUF architecture ``clip``, projector ``minicpmv4_7``): 16x
+    token compression (the ViT merger in the encoder: 64 tokens per 448 x 448 slice), or 4x (without it: 256)."""
+    assert compression in (4, 16), compression
+    return os.path.join(MODELS_DIR, "openbmb", "MiniCPM-V-4.7-1B-gguf",
+                        "mmproj-model-f16.gguf" if compression == 16 else "mmproj-model-f16-4x.gguf")
+
+
 def assistant_of(model: str) -> str:
     """Where the multi-token-prediction drafter (``gemma4-assistant``) of a Gemma 4 model file is
     expected: ``mtp-<model file>`` next to it."""
@@ -348,3 +356,56 @@ class QwenConfig:
             out[:, i] = th
             th = (th * scale).astype(np.float32)
         return out
+
+
+@dataclass(frozen=True)
+class ClipConfig:
+    """A vision encoder and projector, from the metadata of its GGUF file (architecture ``clip``; llama.cpp's
+    ``tools/mtmd/clip.cpp``): ``projector`` (``clip.projector_type``: "minicpmv4_7"), the ViT (``layers`` of
+    ``hidden`` with ``heads``, ``ffn``, LayerNorm ``eps``), its input (``image_size`` pixels, ``patch_size``, the
+    normalization ``mean`` / ``std``), the language model's width ``projection_dim``, ``merge`` (``projector.scale_factor``:
+    patches per output token per side, MiniCPM-V 4 or 2), ``max_slices`` and the layer after which the ViT merger runs
+    (``merger_layer``: ``wa_layer_indexes``, -1 without one)."""
+
+    projector: str
+    image_size: int
+    patch_size: int
+    hidden: int
+    ffn: int
+    layers: int
+    heads: int
+    eps: float
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
+    projection_dim: int
+    merge: int
+    max_slices: int
+    merger_layer: int
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> ClipConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch == "clip", f"{gguf.path}: architecture {gguf.arch!r}, expected clip"
+        m = lambda k, d=None: gguf.meta.get(f"clip.vision.{k}", d)
+        merge = int(m("projector.scale_factor", 4))
+        wa = m("wa_layer_indexes")
+        return cls(
+            projector=str(gguf.meta["clip.projector_type"]),
+            image_size=int(m("image_size")),
+            patch_size=int(m("patch_size")),
+            hidden=int(m("embedding_length")),
+            ffn=int(m("feed_forward_length")),
+            layers=int(m("block_count")),
+            heads=int(m("attention.head_count")),
+            eps=float(m("attention.layer_norm_epsilon")),
+            mean=tuple(float(x) for x in m("image_mean")),
+            std=tuple(float(x) for x in m("image_std")),
+            projection_dim=int(m("projection_dim")),
+            merge=merge,
+            max_slices=int(m("max_slice_nums", 9)),
+            merger_layer=int(wa[0]) if merge == 4 and wa is not None else -1,
+        )
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden // self.heads
