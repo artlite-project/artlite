@@ -193,6 +193,7 @@ class Gemm:
         assert self.res is None or self.res + (self.N // 80 * self.ntile - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= \
             512 * 1024, "the residual's last objects past the memtile"
         assert self.stats != "gn" or self.gsize, "a GroupNorm's group size"
+        assert self.stats != "ln" or not self.stf or self.nt == 1, "a LayerNorm record over ops of one tile"
 
     def ch0(self, row: int) -> int:
         """Row ``row``'s first output channel in the statistics' channel space."""
@@ -562,7 +563,7 @@ class Gemm:
                 data = {"addr": self.y + ((sl * self.npass + P0) * NT + self.tiles(r)[0]) * ct, "nwords": NPO * ct // 4,
                         "dims": _contig(ct // 4) + [(NPO, NT * ct // 4)], "iteration": (ct // 4, self.nt)}
             rc = [data]
-            if self.stats == "ln":
+            if self.stats == "ln" and not self.stf & K.ST_HOLD:
                 rc.append({"addr": self.rec + r * D.OCH, "nwords": D.OCH // 4, "iteration": (D.OCH, NT)})
             recvs.append(MemTask(rc, repeat=1 if self.out == "ds" else self.nt))
             if self.stats == "gn" and not self.stf & K.ST_HOLD:

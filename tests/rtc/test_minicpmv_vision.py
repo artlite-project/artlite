@@ -268,3 +268,58 @@ def test_window_attention(npu: Sd15Device) -> None:
     err = _rel(o, ref)
     print(f"window attention: rel err {err:.2e}")
     assert err < 1.2e-2
+
+
+def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: M.VitLevel, name: str) -> M.Bands:
+    """Two entries' rows (n_i, 1152) at their slots as a banded level's residual in DDR (records by a copy op per
+    band)."""
+    tiles = M.pack([torch.nn.functional.pad(r.float(), (0, M.C - M.H)) for r in rows], slots, lv.nb)
+    bands = M.Bands(lv, name)
+    for b in range(lv.nb):
+        bd.image(f"{name}.in.{b}", np.concatenate([L.ctiles(tiles[b, c], 64) for c in range(COLS)]))
+        t = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
+        bd.op(bd.load(f"{name}.in.{b}", t.addr, t.nbytes), {})
+        bands.store(bd, b, t, M.ln_records(bd, t, name=f"{name}.rec{b}"))
+    bd.op({}, {})
+    return bands
+
+
+def _before_merger(sim: V.NpuEncoder, px: np.ndarray) -> torch.Tensor:
+    """The CPU at the NPU's rounding points through layer 6 (raster order)."""
+    tr: dict[str, torch.Tensor] = {}
+    P, H = sim.patch, sim.hidden
+    x = torch.as_tensor(np.asarray(px), dtype=sim.dtype)
+    ph, pw = x.shape[1] // P, x.shape[2] // P
+    cols = x.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)
+    c = V._bfp(cols) @ V._bfp(sim.w("v.patch_embd.weight").reshape(H, -1)).T + V._bf16(sim.w("v.patch_embd.bias").reshape(-1))
+    x = V._bf16(c + V._bf16(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(ph, pw))]))
+    for il in range(sim.insert + 1):
+        x = sim.layer(x, il)
+    del tr
+    return x
+
+
+@pytest.mark.slow  # (the CPU encoder's first 7 layers, the merger's weights converted)
+def test_merger(npu: Sd15Device, enc: V.Encoder) -> None:
+    """The ViT merger on two entries (the astronaut's overview, 32 x 32 patches; its first slice, 24 x 44: 2 bands)
+    from the CPU's layer-6 output (at the NPU's rounding points): as far from the float64 merger of that input as the
+    CPU's merger."""
+    ents = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][:2]
+    sim = V.NpuEncoder(MMPROJ)
+    entries = [M.Entry(e.shape[1] // 14, e.shape[2] // 14) for e in ents]
+    nbp = max(e.bands for e in entries)
+    xs = [_before_merger(sim, e) for e in ents]
+    want = [sim.vit_merger(x, e.ph, e.pw) for x, e in zip(xs, entries, strict=True)]
+    exact = [enc.vit_merger(x.double(), e.ph, e.pw) for x, e in zip(xs, entries, strict=True)]
+    bd = Builder(npu)
+    x = _bands_from(bd, xs, [e.patch_slots() for e in entries], M.vit_level(4 * nbp), "x")
+    out = M.Bands(M.vit_level(nbp), "y")
+    M.merger(bd, M.merger_weights(lambda n: sim.w(n).float()), "m", x, out)
+    bd.op({}, {})
+    npu.run(bd.transaction())
+    got = M.unpack(_bands_read(npu, out), [e.window_slots() for e in entries])
+    for g, e, ex in zip(got, want, exact, strict=True):
+        npu_err, cpu_err = _rel(g[:, :M.H], ex), _rel(e, ex)
+        print(f"merger: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
+        assert float(g[:, M.H:].abs().max()) == 0
+        assert npu_err < 1.1 * cpu_err

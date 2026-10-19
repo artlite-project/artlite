@@ -38,15 +38,18 @@ GROUPS = 64  # final groups (4 x 4 patches) of an entry per band: a tile's 8 col
 
 @dataclass(frozen=True)
 class VitLevel(Level):
-    """A ViT level: ``nb`` bands of one 64-token tile per column (both entries: token panel tp of entry tp % 2)."""
+    """A ViT level: ``nb`` bands of one tile per column of ``tm`` tokens (64; 16: the merges' tiles of merged tokens;
+    both entries: token panel tp of entry tp % 2)."""
+
+    tm: int = 64
 
     @property
     def T(self) -> int:
-        return 64
+        return self.tm
 
     @property
     def m(self) -> int:
-        return 64
+        return self.tm
 
     @property
     def ntile(self) -> int:
@@ -54,11 +57,11 @@ class VitLevel(Level):
 
     @property
     def np(self) -> int:
-        return 8
+        return self.tm // 8
 
 
-def vit_level(nb: int) -> VitLevel:
-    return VitLevel(0, nb)
+def vit_level(nb: int, tm: int = 64) -> VitLevel:
+    return VitLevel(0, nb, False, tm)
 
 
 @dataclass(frozen=True)
@@ -138,11 +141,8 @@ def _pad(w: torch.Tensor, rows: int, cols: int = 0) -> torch.Tensor:
     return out
 
 
-def layer_weights(get: Callable[[str], torch.Tensor], il: int) -> dict[str, torch.Tensor]:
-    """Layer il's padded weights (float32) by role: q, k, v (rows by head), o (columns by head), up, down and their
-    biases (``*_b``), ln1 / ln2 gamma and beta (``*_g``, ``*_b``); ``get(name)``: a tensor of the mmproj as
-    (rows, cols) or (cols,)."""
-    p = f"v.blk.{il}."
+def _attn_weights(get: Callable[[str], torch.Tensor], p: str) -> dict[str, torch.Tensor]:
+    """The padded q, k, v (rows by head; q x log2 e / sqrt 72), o (columns by head) of prefix p, their biases."""
     s = LOG2E / math.sqrt(HD)
     w = {}
     for r in ("q", "k", "v"):
@@ -154,6 +154,15 @@ def layer_weights(get: Callable[[str], torch.Tensor], il: int) -> dict[str, torc
     o = get(p + "attn_out.weight").float()
     w["o"] = _pad(_heads(o.T).T, C, C)
     w["o_b"] = _pad(get(p + "attn_out.bias").float().reshape(-1), C)
+    return w
+
+
+def layer_weights(get: Callable[[str], torch.Tensor], il: int) -> dict[str, torch.Tensor]:
+    """Layer il's padded weights (float32) by role: q, k, v (rows by head), o (columns by head), up, down and their
+    biases (``*_b``), ln1 / ln2 gamma and beta (``*_g``, ``*_b``); ``get(name)``: a tensor of the mmproj as
+    (rows, cols) or (cols,)."""
+    p = f"v.blk.{il}."
+    w = _attn_weights(get, p)
     w["up"] = _pad(get(p + "ffn_up.weight").float(), FFN, C)
     w["up_b"] = _pad(get(p + "ffn_up.bias").float().reshape(-1), FFN)
     w["down"] = _pad(get(p + "ffn_down.weight").float(), C, FFN)
@@ -388,3 +397,133 @@ class WindowAttention:
 
     def row_ops(self, cmd: int) -> dict[int, RowOps]:
         return {r: RowOps(runs=[(cmd, D.Q)], b_objects=1, parity=False, role="w") for r in range(4)}
+
+
+MERGED, HID = 4 * C, 17280  # (a merged token's channels: 4 x 1280; the ViT merger's hidden, 17216 padded)
+
+
+def _blocks4(v: torch.Tensor, axis: int = -1) -> torch.Tensor:
+    """A merged token's 4 x 1152 channels (along axis) -> 4 x 1280 (each source's padded)."""
+    v = v.float().movedim(axis, -1)
+    out = torch.zeros(*v.shape[:-1], 4, C)
+    out[..., :H] = v.reshape(*v.shape[:-1], 4, H)
+    return out.reshape(*v.shape[:-1], MERGED).movedim(-1, axis)
+
+
+def merger_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The ViT merger's padded weights: its attention's (``_attn_weights``) and ln1; ds_ln (4608 -> 5120, per source),
+    up (5120 -> 17280) and down (17280 + 5120 -> 1280: the mean of the merged token's 4 sources as its last K, 1 / 4
+    per source channel)."""
+    p = "v.vit_merger."
+    w = _attn_weights(get, p)
+    w["ln1_g"], w["ln1_b"] = (_pad(get(p + f"ln1.{n}").float().reshape(-1), C) for n in ("weight", "bias"))
+    w["ds_g"], w["ds_b"] = (_blocks4(get(p + f"ds_ln.{n}").reshape(-1)) for n in ("weight", "bias"))
+    w["up"] = _pad(_blocks4(get(p + "ds_ffn_up.weight"), 1), HID, MERGED)
+    w["up_b"] = _pad(get(p + "ds_ffn_up.bias").float().reshape(-1), HID)
+    mean = torch.zeros(C, MERGED)
+    for k in range(4):
+        mean[torch.arange(H), C * k + torch.arange(H)] = 0.25
+    w["down"] = torch.cat([_pad(get(p + "ds_ffn_down.weight").float(), C, HID), mean], 1)
+    w["down_b"] = _pad(get(p + "ds_ffn_down.bias").float().reshape(-1), C)
+    return w
+
+
+def _xfer(bd: Builder, name: str, image_bytes: int, *, fill: bool, mem: int, nbytes: int, off: int = 0,
+          mdims: list | None = None, sdims: tuple | None = None) -> dict[int, ColOps]:
+    """Per column a fill (DDR image ``name`` -> memtile at mem) or drain of nbytes: column c's bytes of the image
+    ([col][image_bytes]) from off, the memtile walk mdims (``ops._dims`` form), the shim's sdims (``txn.shim_bd``)."""
+    base = bd.ddr(name, COLS * image_bytes)
+    (bd.reading if fill else bd.written)(name)
+    bd_ = {"addr": mem, "nwords": nbytes // 4} | ({"dims": mdims} if mdims else {})
+    t = lambda c: MemTask([bd_], ddr=(base + c * image_bytes + off, nbytes, sdims))
+    return {c: ColOps(fills=[t(c)]) if fill else ColOps(drains=[t(c)]) for c in range(COLS)}
+
+
+def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands) -> None:
+    """The ViT merger (module docstring) from the level before it (x: 4 bands per band of out) into out's level: per
+    band of out, per source band LN1 -> Q, K, V^T panels (to DDR); per merged tile (two token panels: 8 windows of each
+    entry per column) the window attention of the 4 sources' rows -> o's rows (to DDR); per source band O + x (to DDR);
+    per merged tile its 4 sources' rows of that as one tile of 16 merged tokens (5120 channels), their records and
+    panels (the mean's K), LayerNorm(4608), up + GELU, down + the mean -> the tile's rows of out's band; the band's
+    records."""
+    lv, lp, l16 = x.lv, out.lv, vit_level(1, 16)
+    pn, ct = lv.pn(C), lv.ct(C)  # (bytes per column: a band's panels, C tiles)
+    ob = L.ct_bytes(64)  # (an 80-channel block's C-tile object in a band)
+    rows = 2 * 72  # (a kb's two token panels)
+    src = C // 8 * rows  # (a source's rows: [kb 160][2][72])
+    pad = 1024  # (past each source's rows: the window attention's walk reads 16 d-blocks a head)
+    x2 = DTensor(lv, C, name + ".x2")
+    for t in range(lp.nb):
+        for s in range(4):  # (Q, K, V^T of each source band)
+            b = 4 * t + s
+            xb, rec = x.load(bd, b)
+            n = alloc(bd, lv, C, "pn")
+            ln(bd, xb, n, w["ln1_g"], w["ln1_b"], name=name + ".ln1", rec=rec)
+            free(bd, xb)
+            for role, kind in (("q", "bfp16"), ("k", "bfp16"), ("v", "vt")):
+                o = alloc(bd, lv, C, "pn")
+                gemm(bd, n, w[role], w[role + "_b"], name=f"{name}.{role}", out=o, kind=kind)
+                bd.defer(_xfer(bd, f"{name}.{role}.{b}", pn, fill=False, mem=o.addr, nbytes=pn), release=[(o.addr, o.size)])
+            free(bd, n)
+        for j in range(4):  # (the window attention of merged tile j: token panels 2 j, 2 j + 1 of the sources)
+            base = {r: bd.mem.alloc(4 * (src + pad)) for r in ("q", "k", "v", "o")}
+            sd = (36, C // 8, 144, C // 8 * 36)  # (per kb its two panels' 36 words, 576 B apart)
+            for r in ("q", "k", "v"):  # (an op per role: a memtile channel's pool holds 8 BDs)
+                bd.op(bd.merge(*[_xfer(bd, f"{name}.{r}.{4 * t + s}", pn, fill=True, mem=base[r] + s * (src + pad),
+                                       nbytes=src, off=2 * j * 72, sdims=sd) for s in range(4)]), {})
+            wa = WindowAttention(q=base["q"], k=base["k"], vt=base["v"], o=base["o"], stride=src + pad)
+            bd.op({c: wa.col_ops() for c in range(COLS)}, wa.row_ops(bd.image(name + ".wcmd", wa.command())))
+            drains = [_xfer(bd, f"{name}.o.{4 * t + s}", pn, fill=False, mem=base["o"] + s * (src + pad), nbytes=src,
+                            off=2 * j * 72, sdims=sd) for s in range(4)]
+            bd.op(bd.merge(*drains), {})
+            for a in base.values():
+                bd.mem.release(a, 4 * (src + pad))
+        for s in range(4):  # (O + x of each source band)
+            b = 4 * t + s
+            xb, rec = x.load(bd, b)
+            bd.mem.release(rec, ln_rec(lv))
+            o = alloc(bd, lv, C, "pn")
+            bd.op(_xfer(bd, f"{name}.o.{b}", pn, fill=True, mem=o.addr, nbytes=pn), {})
+            gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=xb, res=xb)
+            free(bd, o)
+            x2.store(bd, b, xb, defer=False)
+        for j in range(4):  # (merged tile j's MLP)
+            spare = bd.mem.alloc(4096, top=True)  # (the down GEMM's A walk reads past its panels' end)
+            xp = alloc(bd, l16, MERGED, "pn", top=True)
+            nl = alloc(bd, l16, MERGED, "pn")  # (below mc: mc's memory and what follows it then takes the hidden)
+            mc = alloc(bd, l16, MERGED)
+            ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
+            fills = [_xfer(bd, x2.band(4 * t + s), ct, fill=True, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560,
+                           off=2 * j * 1280, mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
+                     for s in range(4)]
+            bd.op(bd.merge(*fills), {})
+            rec = bd.mem.alloc(ln_rec(l16))
+            for h in range(2):  # (the panels and records in two copies of 8 passes: a command's biases reach 14; one
+                # record over both)
+                bd.gemm(Gemm(m=16, ntile=1, K=0, N=MERGED, x=0, y=xp.addr, out="bfp16", res=mc.addr, stats="ln", rec=rec,
+                             p0=8 * h, npo=8, stf=(K.ST_HOLD, K.ST_KEEP)[h]), None, None, name=f"{name}.mrec{h}")
+            for h in range(2):  # (LayerNorm(4608) in two applies of 2560 channels: 640 a core)
+                a = Apply(m=16, nblk=8, mode="ln", x=mc.addr, y=nl.addr, blk0=32 * h, y_kb0=320 * h, rec=rec, C=4 * H,
+                          eps=EPS, y_np=nl.np)
+                bd.apply(a, w["ds_g"], w["ds_b"], name=f"{name}.ds_ln{h}")
+            bd.mem.release(rec, ln_rec(l16))
+            free(bd, mc)
+            hid = alloc(bd, l16, HID, "pn", top=True)  # (directly below xp: the down GEMM's K is [hidden | xp])
+            assert hid.addr + hid.size == xp.addr, (hid.addr, hid.size, xp.addr)
+            bd.table("gelu", gelu_table())
+            n6 = HID // 6  # (6 GEMMs of 9 passes a row: at most 16)
+            for k in range(6):
+                gemm(bd, nl, w["up"][n6 * k:n6 * (k + 1)], w["up_b"][n6 * k:n6 * (k + 1)], name=f"{name}.up{k}",
+                     out=Tensor(l16, n6, hid.addr + n6 // 8 * l16.np * 72 * k, "pn"), kind="gelu")
+            free(bd, nl)
+            y = alloc(bd, l16, C)
+            gemm(bd, Tensor(l16, HID + MERGED, hid.addr, "pn"), w["down"], w["down_b"], name=name + ".down", out=y)
+            free(bd, hid)
+            free(bd, xp)
+            bd.mem.release(spare, 4096)
+            bd.op(_xfer(bd, out.x.band(t), ct, fill=False, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
+                        mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
+            free(bd, y)
+        xt = alloc(bd, lp, C)  # (the band's records)
+        bd.op(_xfer(bd, out.x.band(t), ct, fill=True, mem=xt.addr, nbytes=ct), {})
+        out.store(bd, t, xt, ln_records(bd, xt, name=name + ".rec"))

@@ -281,6 +281,26 @@ class Encoder:
         y = self._mm(gelu(self._mm(y, up + ".weight", up + ".bias")), down + ".weight", down + ".bias")
         return y, parts
 
+    def vit_merger(self, x: torch.Tensor, h: int, w: int, tr: dict | None = None) -> torch.Tensor:
+        """The ViT merger of the residual x (h w tokens, raster order): attention inside 2 x 2 windows, then the 2 x 2
+        merge plus the 4 tokens' mean -> (h / 2 w / 2, hidden)."""
+        tr = tr if tr is not None else {}
+        n_pos = h * w
+        win = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)  # (window-major)
+        inv = np.empty_like(win)
+        inv[win] = np.arange(n_pos)
+        mask = torch.full((n_pos, n_pos), -torch.inf, dtype=self.dtype)
+        for b in range(n_pos // 4):
+            mask[4 * b:4 * b + 4, 4 * b:4 * b + 4] = 0
+        a = self._attn(self._ln(x, "v.vit_merger.ln1")[torch.from_numpy(win)], "v.vit_merger.", mask)
+        x = x + a[torch.from_numpy(inv)]
+        tr["vit_merger_attn_residual"] = x
+        y, parts = self._merge(x, h, w, "v.vit_merger.ds_ln", "v.vit_merger.ds_ffn_up", "v.vit_merger.ds_ffn_down",
+                               self._gelu)
+        x = y + (parts[0] + parts[1] + parts[2] + parts[3]) * 0.25
+        tr["vit_merger_ds_out"] = x
+        return x
+
     def forward(self, pixels: np.ndarray | torch.Tensor, suffix: str | None = None,
                 trace: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
         """One entry: pixels (3, H, W) (normalized, as llama.cpp's inp_raw) -> its embeddings (tokens, 1024), then the
@@ -298,28 +318,14 @@ class Encoder:
         x = x + self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]
         tr = trace if trace is not None else {}
         tr["pos_embed"] = x
-        n_pos, h, w = ph * pw, ph, pw
+        h, w = ph, pw
         for il in range(self.layers):
             x = self._layer(x, il)
             tr[f"layer_out-{il}"] = x
             if il != self.insert:
                 continue
-            # the ViT merger: attention inside 2 x 2 windows, then the 2 x 2 merge plus the 4 tokens' mean
-            win = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)  # (window-major)
-            inv = np.empty_like(win)
-            inv[win] = np.arange(n_pos)
-            mask = torch.full((n_pos, n_pos), -torch.inf, dtype=self.dtype)
-            for b in range(n_pos // 4):
-                mask[4 * b:4 * b + 4, 4 * b:4 * b + 4] = 0
-            a = self._attn(self._ln(x, "v.vit_merger.ln1")[torch.from_numpy(win)], "v.vit_merger.", mask)
-            x = x + a[torch.from_numpy(inv)]
-            tr["vit_merger_attn_residual"] = x
-            y, parts = self._merge(x, h, w, "v.vit_merger.ds_ln", "v.vit_merger.ds_ffn_up", "v.vit_merger.ds_ffn_down",
-                                   self._gelu)
-            x = y + (parts[0] + parts[1] + parts[2] + parts[3]) * 0.25
-            tr["vit_merger_ds_out"] = x
+            x = self.vit_merger(x, h, w, tr)
             h, w = h // 2, w // 2
-            n_pos = h * w
         x = self._ln(x, "v.post_ln")
         tr["post_ln"] = x
         erf = lambda t: 0.5 * t * (1 + torch.erf(t / math.sqrt(2)))
@@ -397,3 +403,73 @@ class NpuEncoder(Encoder):
         x = _bf16(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
         h = self.gelu_panels(self.gemm(self.ln(x, p + "ln2"), p + "ffn_up.weight", p + "ffn_up.bias"))
         return _bf16(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
+
+    def window_attention(self, a: torch.Tensor, p: str) -> torch.Tensor:
+        """The ViT merger's attention inside windows of 4 consecutive tokens: a the LayerNorm's panels -> o panels (Q
+        (x log2 e / sqrt d), K bfp16 along the dims, V bfp16 over 8 windows, scores fp32, P = 2^(s - max) / l in
+        bf16)."""
+        n, H, d = a.shape[0], self.heads, self.hd
+        q = self.gemm(a, p + "attn_q.weight", p + "attn_q.bias") * (math.log2(math.e) / math.sqrt(d))
+        q = _bfp(q.reshape(n // 4, 4, H, d))
+        k = _bfp(self.gemm(a, p + "attn_k.weight", p + "attn_k.bias").reshape(n // 4, 4, H, d))
+        v = self.gemm(a, p + "attn_v.weight", p + "attn_v.bias").reshape(n // 4, 4, H, d)
+        nw = n // 4
+        vp = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 0, 0, -nw % 8)).permute(1, 2, 3, 0)  # (s, h, d, window)
+        v = _bfp(vp)[..., :nw].permute(3, 0, 1, 2)
+        s = torch.einsum("wihd,wjhd->whij", q, k)
+        pr = torch.exp2(s - s.amax(-1, keepdim=True))
+        pr = _bf16(pr / pr.sum(-1, keepdim=True))
+        o = torch.einsum("whij,wjhd->wihd", pr, v)
+        return _bfp(o.reshape(n, self.hidden))
+
+    def vit_merger(self, x: torch.Tensor, h: int, w: int, tr: dict | None = None, *,
+                   mean_panels: bool = True) -> torch.Tensor:
+        """``Encoder.vit_merger`` at the NPU's rounding points (mean_panels: the mean of 4 from the tokens' bfp16
+        panels, summed with the down GEMM; else their bf16 mean)."""
+        tr = tr if tr is not None else {}
+        H = self.hidden
+        win = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)  # (window order)
+        xw = x[torch.from_numpy(win)]
+        o = self.window_attention(self.ln(xw, "v.vit_merger.ln1"), "v.vit_merger.")
+        xw = _bf16(self.gemm(o, "v.vit_merger.attn_out.weight", "v.vit_merger.attn_out.bias", xw))
+        cat = xw.reshape(-1, 4 * H)
+        g = self.gelu_panels(self.gemm(self.ln(cat, "v.vit_merger.ds_ln"), "v.vit_merger.ds_ffn_up.weight",
+                                       "v.vit_merger.ds_ffn_up.bias"))
+        mean4 = _bfp(xw).reshape(-1, 4, H).sum(1) / 4 if mean_panels else _bf16(xw.reshape(-1, 4, H).mean(1))
+        x = _bf16(self.gemm(g, "v.vit_merger.ds_ffn_down.weight", "v.vit_merger.ds_ffn_down.bias", mean4))
+        tr["vit_merger_ds_out"] = x
+        return x
+
+    def forward(self, pixels: np.ndarray | torch.Tensor, suffix: str | None = None,
+                trace: dict[str, torch.Tensor] | None = None, *, mean_panels: bool = True) -> torch.Tensor:
+        """``Encoder.forward`` at the NPU's rounding points (tokens in window order through the ViT merger: the merge
+        of 4 consecutive tokens). mean_panels: the merger's mean of 4 from the tokens' bfp16 panels, summed with the
+        down GEMM (else their bf16 mean)."""
+        P, H = self.patch, self.hidden
+        x = torch.as_tensor(np.asarray(pixels), dtype=self.dtype)
+        ph, pw = x.shape[1] // P, x.shape[2] // P
+        cols = x.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)  # (patches (c, ky, kx))
+        c = _bfp(cols) @ _bfp(self.w("v.patch_embd.weight").reshape(H, -1)).T + _bf16(self.w("v.patch_embd.bias").reshape(-1))
+        x = _bf16(c + _bf16(self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]))
+        tr = trace if trace is not None else {}
+        tr["pos_embed"] = x
+        h, w = ph, pw
+        for il in range(self.layers):
+            x = self.layer(x, il)
+            tr[f"layer_out-{il}"] = x
+            if il != self.insert:
+                continue
+            x = self.vit_merger(x, h, w, tr, mean_panels=mean_panels)
+            h, w = h // 2, w // 2
+        y = _bf16(self.ln(x, "v.post_ln"))  # (panels, then their values as C tiles)
+        tr["post_ln"] = y
+        idx = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)
+        cat = y[torch.from_numpy(idx)].reshape(-1, 4 * H)
+        up = self.gemm(self.ln(cat, "mm.input_norm"), "mm.up.weight", "mm.up.bias")
+        z = _bf16(up)
+        g = _bfp(_bf16(0.5 * z * (1 + torch.erf(z / math.sqrt(2)))))
+        out = _bf16(self.gemm(g, "mm.down.weight", "mm.down.bias"))
+        tr["merger_out"] = out
+        if suffix is not None:
+            out = torch.cat([out, self.w("v.tok_embd_sep")[SUFFIX_ROWS[suffix]]])
+        return out

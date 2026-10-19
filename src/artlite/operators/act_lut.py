@@ -67,6 +67,13 @@ def gelu64(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(np.minimum(-z, 700.0)))
 
 
+def gelu_erf64(x: np.ndarray) -> np.ndarray:
+    """gelu in its erf form (x Phi(x): MiniCPM-V's final merger)."""
+    import torch
+    x = np.asarray(x, np.float64)
+    return 0.5 * x * (1.0 + torch.erf(torch.from_numpy(x / np.sqrt(2.0))).numpy())
+
+
 def ulp_bf16(t: np.ndarray) -> np.ndarray:
     """The bf16 ULP at t (normal range)."""
     return np.exp2(np.floor(np.log2(np.maximum(np.abs(t), 2.0 ** -126))) - 7)
@@ -357,6 +364,7 @@ SILU = ActTable("silu", silu64, 0.25, 32.0, 24.0)
 # GELU: 65 segments of 1/8 over [0, 8] (g(-8) ~ -4e-21): within 0.58 bf16 ULP for |x| < 4, 1.42 in [-6, -4) (absolute
 # 1.4e-7), below: within 6e-13; al::gelu_lut: 1.7 ULP at ~7 cycles per element
 GELU = ActTable("gelu", gelu64, 0.125, 16.0, 8.0)
+GELU_ERF = ActTable("gelu_erf", gelu_erf64, 0.125, 16.0, 8.0)
 
 
 def render_silu() -> str:

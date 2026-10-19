@@ -73,7 +73,8 @@ C_WALKS = C_PATS - 7  # (a GEMM's and attention's P V^T: the MAC's walk of A)
 C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
 C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a sd15_shift's offsets)
 SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
-ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a GroupNorm record continued from / kept for the next op: one record over several ops)
+ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a statistics record continued from / kept for the next op: one record over several
+# ops; LayerNorm's: ops of one tile)
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
@@ -464,7 +465,7 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
   float *rec = (float *)s.s1;
   if (stats == {{ S_GN }} && !(stf & {{ ST_KEEP }})) {{ p }}_zero(s.s1, {{ REC_GN // 4 }});
   for (int t = 0; t < ntile; t++) {
-    if (stats == {{ S_LN }}) {{ p }}_zero(s.s1, 2 * m);
+    if (stats == {{ S_LN }} && !(stf & {{ ST_KEEP }})) {{ p }}_zero(s.s1, 2 * m);
     for (int p = 0; p < npass; p++) {
       {{ p }}_bias_f((const bfloat16 *)(ws + {{ C_BIAS }}) + 80 * p, cf, nrb);
       if (ws[{{ C_CONV }}])
@@ -523,7 +524,7 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
       } else
         {{ p }}_out(s, cb, nbytes);
     }
-    if (stats == {{ S_LN }}) {{ p }}_out(s, s.s1, 8 * m);
+    if (stats == {{ S_LN }} && !(stf & {{ ST_HOLD }})) {{ p }}_out(s, s.s1, 8 * m);
   }
   if (stats == {{ S_GN }} && !(stf & {{ ST_HOLD }})) {{ p }}_out(s, s.s1, {{ REC_GN }});
 }
