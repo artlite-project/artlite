@@ -323,3 +323,35 @@ def test_merger(npu: Sd15Device, enc: V.Encoder) -> None:
         print(f"merger: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
         assert float(g[:, M.H:].abs().max()) == 0
         assert npu_err < 1.1 * cpu_err
+
+
+@pytest.mark.slow  # (the CPU encoders, every weight converted)
+def test_encoder(npu: Sd15Device, enc: V.Encoder) -> None:
+    """The whole encoder on two entries (the astronaut's overview, 32 x 32 patches; its first slice, 24 x 44) in one
+    dispatch: each one's embeddings as far from the float64 encoder's as the CPU at the NPU's rounding points; the
+    dispatch's time."""
+    import time
+
+    ents = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][:2]
+    sim = V.NpuEncoder(MMPROJ)
+    entries = [M.Entry(e.shape[1] // 14, e.shape[2] // 14) for e in ents]
+    want = [sim.forward(e) for e in ents]
+    exact = [enc.forward(e) for e in ents]
+    pos = [torch.nn.functional.pad(V._bf16(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(e.ph, e.pw))]
+                                           ).float(), (0, M.C - M.H)) for e in entries]
+    bd = Builder(npu)
+    imgs = M.encode(bd, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert), entries,
+                    [M.patches(e) for e in ents], pos)
+    tr = bd.transaction()
+    npu.run(tr)
+    ts = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        npu.run(tr)
+        ts.append(time.perf_counter() - t0)
+    got = M.embeddings(npu, imgs, entries)
+    print(f"encoder on 2 entries: {1e3 * min(ts):.1f} ms")
+    for g, e, ex in zip(got, want, exact, strict=True):
+        npu_err, cpu_err = _rel(g, ex), _rel(e, ex)
+        print(f"embeddings: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g, e):.2e}")
+        assert npu_err < 1.1 * cpu_err
