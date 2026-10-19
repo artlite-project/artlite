@@ -60,7 +60,8 @@ from ..kernel_source import kernel_prefix
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
  C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
 C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
-C_KMASK = 704  # (attention of d 80 / 160: per image and key group its keys' valid bits, [image][group][2] words; -1: all)
+C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
+# groups; -1: all; around the command's walks)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
 C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
@@ -979,7 +980,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
   const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
   const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
   for (int u = 0; u < nunit; u++) {
-    const int32_t *km = ws + {{ C_KMASK }} + 2 * ng * (u >= nunit / 2);  // (the unit's image's key masks)
+    const int32_t *km = ws + (u >= nunit / 2 ? {{ C_KMASK[1] }} : {{ C_KMASK[0] }});  // (the unit's image's key masks)
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 128 * nd * npair);
     {{ p }}_zero((int32_t *)l, 128 * npair);
@@ -1175,7 +1176,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int
   const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
   float *o = (float *)cb, *lc = (float *)(ws + 64), *sm = (float *)tab;
   for (int u = 0; u < nunit; u++) {
-    const int32_t *km = ws + {{ C_KMASK }} + 2 * ng * (u >= nunit / 2);  // (the unit's image's key masks)
+    const int32_t *km = ws + (u >= nunit / 2 ? {{ C_KMASK[1] }} : {{ C_KMASK[0] }});  // (the unit's image's key masks)
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 5120);
     {{ p }}_zero((int32_t *)lc, 128);

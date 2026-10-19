@@ -181,3 +181,48 @@ def test_layer_bands(npu: Sd15Device, enc: V.Encoder) -> None:
               f"(the CPU's {_rel(e, exact):.2e})")
         assert float(g[:, M.H:].abs().max()) == 0
         assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)
+
+
+def _bands_read(npu: Sd15Device, y: M.Bands) -> torch.Tensor:
+    """A banded level's residual -> (nb, COLS, 64, C)."""
+    lv = y.lv
+    return torch.stack([torch.stack([L.from_ctiles(npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1)[c], 64, M.C,
+                                                   64) for c in range(COLS)]) for b in range(lv.nb)])
+
+
+@pytest.mark.slow  # (7 layers' weights converted on the host)
+def test_before_merger(npu: Sd15Device, enc: V.Encoder) -> None:
+    """The patch embedding and layers 0 .. 6 on two entries of different sizes (the astronaut's overview, 32 x 32
+    patches: 64 groups; its first slice, 24 x 44: 66 groups, so 8 bands, the overview's padding masked): each as far
+    from the float64 encoder as the CPU at the NPU's rounding points."""
+    ents = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][:2]
+    sim = V.NpuEncoder(MMPROJ)
+    entries = [M.Entry(e.shape[1] // 14, e.shape[2] // 14) for e in ents]
+    lv = M.vit_level(4 * max(e.bands for e in entries))
+    trs, ref = [], []
+    for e in ents:
+        tr, tf = {}, {}
+        sim.forward(e, None, tr)
+        enc.forward(e, None, tf)
+        trs.append(tr)
+        ref.append(tf)
+    pos = [V._bf16(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(e.ph, e.pw))]) for e in entries]
+    bd = Builder(npu)
+    x = M.patch_embed(bd, M.patch_weights(lambda n: sim.w(n).float()), entries, [M.patches(e) for e in ents],
+                      [torch.nn.functional.pad(p.float(), (0, M.C - M.H)) for p in pos], lv, "x0")
+    kv = bd.ddr("kv", M.kv_bytes(lv))
+    valid = M.key_valid(entries, lv.nb, "patch")
+    for il in range(7):
+        y = M.Bands(lv, f"x{il + 1}")
+        M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, y, kv=kv, valid=valid)
+        x = y
+    bd.op({}, {})
+    npu.run(bd.transaction())
+    slots = [e.patch_slots() for e in entries]
+    for key, name in (("x0", "pos_embed"), ("x7", "layer_out-6")):
+        got = M.unpack(_bands_read(npu, M.Bands(lv, key)), slots)
+        for g, tr, tf in zip(got, trs, ref, strict=True):
+            npu_err, cpu_err = _rel(g[:, :M.H], tf[name]), _rel(tr[name], tf[name])
+            print(f"{name}: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], tr[name]):.2e}")
+            assert float(g[:, M.H:].abs().max()) == 0
+            assert npu_err < 1.1 * cpu_err + 1e-4

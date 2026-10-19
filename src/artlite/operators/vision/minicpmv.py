@@ -15,19 +15,113 @@ layers before the ViT merger, 1024 tokens an entry) the residual and its records
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from ..design import COLS
 from ..sd15 import design as D
+from ..sd15 import layout as L
 from ..sd15.build import Builder, Level
 from ..sd15.ops import Apply, Attention, Gemm
+from ..sd15.seq import ColOps, MemTask
 from ..sd15.unet import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
 FFN_REAL, FFN = 4304, 4480
 EPS = 1e-6
 LOG2E = 1.4426950408889634
+GROUPS = 64  # final groups (4 x 4 patches) of an entry per band: a tile's 8 columns x 8 lanes
+
+
+@dataclass(frozen=True)
+class VitLevel(Level):
+    """A ViT level: ``nb`` bands of one 64-token tile per column (both entries: token panel tp of entry tp % 2)."""
+
+    @property
+    def T(self) -> int:
+        return 64
+
+    @property
+    def m(self) -> int:
+        return 64
+
+    @property
+    def ntile(self) -> int:
+        return 1
+
+    @property
+    def np(self) -> int:
+        return 8
+
+
+def vit_level(nb: int) -> VitLevel:
+    return VitLevel(0, nb)
+
+
+@dataclass(frozen=True)
+class Entry:
+    """An entry's patch grid (ph x pw, multiples of 4) on the ViT's levels, laid out so that both 2 x 2 merges are block
+    copies: final group G (its 4 x 4 patches; raster order of the ph / 4 x pw / 4 grid) in band G // 64 of the levels
+    after the ViT merger, column G % 64 // 8, lane G % 8; its window s' (2 x 2 patches, in the merge's order (0, 0),
+    (0, 1), (1, 0), (1, 1)) in the entry's token panel s' (panel 2 s' + the entry's image of the tile), the window's
+    token s in band 4 (G // 64) + s before the merger, at its window's place. ``bands``: the levels' bands after the
+    merger (4 x before it); a pair of entries takes the larger's."""
+
+    ph: int
+    pw: int
+
+    def __post_init__(self) -> None:
+        assert self.ph % 4 == 0 and self.pw % 4 == 0, (self.ph, self.pw)
+
+    @property
+    def groups(self) -> int:
+        return self.ph // 4 * (self.pw // 4)
+
+    @property
+    def bands(self) -> int:
+        return -(-self.groups // GROUPS)
+
+    def patch_slots(self) -> tuple[np.ndarray, ...]:
+        """Per patch (raster order): its band before the merger, column, panel of its entry (0 .. 3) and lane."""
+        r, c = np.divmod(np.arange(self.ph * self.pw), self.pw)
+        g = r // 4 * (self.pw // 4) + c // 4
+        return 4 * (g // GROUPS) + (r % 2) * 2 + c % 2, g % GROUPS // 8, (r // 2 % 2) * 2 + c // 2 % 2, g % 8
+
+    def window_slots(self) -> tuple[np.ndarray, ...]:
+        """Per window of the ViT merger's output (raster order of the ph / 2 x pw / 2 grid): its band, column, panel of
+        its entry and lane."""
+        h, w = self.ph // 2, self.pw // 2
+        r, c = np.divmod(np.arange(h * w), w)
+        g = r // 2 * (w // 2) + c // 2
+        return g // GROUPS, g % GROUPS // 8, (r % 2) * 2 + c % 2, g % 8
+
+
+def pack(rows: list[torch.Tensor], slots: list[tuple[np.ndarray, ...]], nb: int) -> torch.Tensor:
+    """Two entries' rows (n_i, k) at their slots (``Entry.patch_slots`` / ``window_slots``) -> per band and column its
+    tile's tokens (nb, COLS, 64, k), zeros elsewhere."""
+    out = torch.zeros(nb, COLS, 64, rows[0].shape[1])
+    for img, (x, (b, c, k, ln)) in enumerate(zip(rows, slots, strict=True)):
+        out[b, c, (2 * k + img) * 8 + ln] = x.float()
+    return out
+
+
+def unpack(tiles: torch.Tensor, slots: list[tuple[np.ndarray, ...]]) -> list[torch.Tensor]:
+    """``pack``'s inverse: per entry its rows."""
+    return [tiles[b, c, (2 * k + img) * 8 + ln] for img, (b, c, k, ln) in enumerate(slots)]
+
+
+def key_valid(entries: list[Entry], nb: int, slots: str) -> tuple[np.ndarray, np.ndarray]:
+    """Per entry its keys' validity in the attention's key order ([band][column][panel][lane], ``ops.Attention``) on
+    a level of nb bands: ``slots`` "patch" (before the merger) or "window" (after it)."""
+    out = []
+    for e in entries:
+        ok = np.zeros((nb, COLS, 4, 8), bool)
+        b, c, k, ln = e.patch_slots() if slots == "patch" else e.window_slots()
+        ok[b, c, k, ln] = True
+        out.append(ok.reshape(-1))
+    return tuple(out)
 
 
 def _heads(w: torch.Tensor) -> torch.Tensor:
@@ -89,12 +183,13 @@ def ln(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tenso
     bd.mem.release(rec, ln_rec(x.lv))
 
 
-def attend(bd: Builder, q: Tensor, kv: int, *, name: str) -> Tensor:
-    """The attention of the scaled queries' panels q on the K / V^T slots at DDR kv (every key of their entry): the
-    output panels."""
+def attend(bd: Builder, q: Tensor, kv: int, *, name: str, valid: tuple | None = None) -> Tensor:
+    """The attention of the scaled queries' panels q on the K / V^T slots at DDR kv (every key of their entry; valid:
+    per entry its keys' validity, ``key_valid``): the output panels."""
     o = alloc(bd, q.lv, C, "pn")
     for t in range(max(q.lv.np // 8, 1)):  # (an op per tile)
-        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, d=HP, nbands=q.lv.nb, tile=t, heads=HEADS, raise_max=True)
+        at = Attention(np=q.lv.np, q=q.addr, o=o.addr, kv=kv, d=HP, nbands=q.lv.nb, tile=t, heads=HEADS, raise_max=True,
+                       valid=valid)
         cmd = bd.image(name, at.command())
         bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
     return o
@@ -120,9 +215,10 @@ def _kv(bd: Builder, w: dict[str, torch.Tensor], name: str, n: Tensor, kv: int, 
     return qt
 
 
-def _attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: Tensor, kv: int) -> int:
+def _attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: Tensor, kv: int,
+              valid: tuple | None) -> int:
     """x += O (the attention of the queries qt, freed): x's records."""
-    o = attend(bd, qt, kv, name=name + ".attn")
+    o = attend(bd, qt, kv, name=name + ".attn", valid=valid)
     free(bd, qt)
     rec = gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=x, res=x, ln=True)
     free(bd, o)
@@ -153,16 +249,17 @@ def _ffn(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int
     return y, rec
 
 
-def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv: int) -> tuple[Tensor, int]:
+def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv: int,
+          valid: tuple | None = None) -> tuple[Tensor, int]:
     """A ViT layer (module docstring) on the residual's C tiles x with its LayerNorm records at rec (its producer's):
     the output's C tiles (x's memory freed) and their records. kv: a DDR buffer for the attention's K / V^T slots
-    (``kv_bytes``)."""
+    (``kv_bytes``); valid: the entries' keys' validity (``key_valid``)."""
     n = alloc(bd, x.lv, C, "pn")
     ln(bd, x, n, w["ln1_g"], w["ln1_b"], name=name + ".ln1", rec=rec)
     qt = _kv(bd, w, name, n, kv, 0, q=True)
     bd.ddr_sync()
     free(bd, n)
-    return _ffn(bd, w, name, x, _attn_out(bd, w, name, qt, x, kv))
+    return _ffn(bd, w, name, x, _attn_out(bd, w, name, qt, x, kv, valid))
 
 
 class Bands:
@@ -188,7 +285,8 @@ class Bands:
                  release=[(t.addr, t.size or t.nbytes), (rec, ln_rec(self.lv))])
 
 
-def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands, *, kv: int) -> None:
+def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands, *, kv: int,
+                valid: tuple | None = None) -> None:
     """A ViT layer on a banded level (each entry's keys in every band): per band LN1, K and V into the slots; then per
     band LN1 again, Q, the attention, O + x and the feed-forward into ``out``'s band (x's bands read twice; Q computed
     in the second pass instead of parked in DDR)."""
@@ -208,10 +306,47 @@ def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, ou
         qt = alloc(bd, x.lv, C, "pn")
         gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16")
         free(bd, n)
-        y, rec = _ffn(bd, w, name, xb, _attn_out(bd, w, name, qt, xb, kv), park=f"{name}.x.{b}")
+        y, rec = _ffn(bd, w, name, xb, _attn_out(bd, w, name, qt, xb, kv, valid), park=f"{name}.x.{b}")
         out.store(bd, b, y, rec)
 
 
 def kv_bytes(lv: Level) -> int:
     """Bytes of a level's K / V^T slots (``layer``'s kv)."""
     return Attention(np=lv.np, q=0, o=0, kv=0, d=HP, nbands=lv.nb, heads=HEADS).kv_bytes()
+
+
+def patch_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The patch embedding as a GEMM (588 = 3 x 14 x 14 inputs (c, ky, kx) padded to 640 -> C) and its bias."""
+    w = get("v.patch_embd.weight").float().reshape(H, -1)
+    return {"w": _pad(w, C, 640), "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C)}
+
+
+def patches(pixels: np.ndarray | torch.Tensor, patch: int = 14) -> torch.Tensor:
+    """An entry's pixels (3, H, W) -> its patches (ph pw, 640): (c, ky, kx) of each, raster order, zero-padded."""
+    x = torch.as_tensor(np.asarray(pixels), dtype=torch.float32)
+    ph, pw = x.shape[1] // patch, x.shape[2] // patch
+    p = x.reshape(3, ph, patch, pw, patch).permute(1, 3, 0, 2, 4).reshape(ph * pw, -1)
+    return torch.nn.functional.pad(p, (0, 640 - p.shape[1]))
+
+
+def patch_embed(bd: Builder, w: dict[str, torch.Tensor], entries: list[Entry], pix: list[torch.Tensor],
+                pos: list[torch.Tensor], lv: VitLevel, name: str) -> Bands:
+    """The two entries' patch embeddings (``patches``: pix; their position embedding rows: pos, (n, C)) into the
+    banded level lv before the merger: per band a GEMM of the host's patch panels with the position rows as its
+    residual -> the residual's bands and records."""
+    slots = [e.patch_slots() for e in entries]
+    xp, xr = pack(pix, slots, lv.nb), pack(pos, slots, lv.nb)
+    out = Bands(lv, name)
+    for b in range(lv.nb):
+        pi = bd.image(f"{name}.pix.{b}", np.concatenate([L.panels(xp[b, c]) for c in range(COLS)]))
+        ri = bd.image(f"{name}.pos.{b}", np.concatenate([L.ctiles(xr[b, c], lv.m) for c in range(COLS)]))
+        pt = alloc(bd, lv, 640, "pn")
+        x = alloc(bd, lv, C)
+        pn, cn = lv.pn(640), lv.ct(C)
+        bd.op({c: ColOps(fills=[MemTask([{"addr": pt.addr, "nwords": pn // 4}], ddr=(pi + c * pn, pn, None)),
+                               MemTask([{"addr": x.addr, "nwords": cn // 4}], ddr=(ri + c * cn, cn, None))])
+               for c in range(COLS)}, {})
+        rec = gemm(bd, pt, w["w"], w["b"], name=name + ".gemm", out=x, res=x, ln=True)
+        free(bd, pt)
+        out.store(bd, b, x, rec)
+    return out

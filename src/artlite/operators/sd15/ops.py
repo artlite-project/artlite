@@ -739,8 +739,10 @@ class Attention:
                                                                              self.nd, self.gk)
         cmd[K.C_RAISE] = self.raise_max
         if self.d != 40:
-            assert K.C_KMASK + 4 * self.ng <= D.WS // 4, "key masks past the workspace"
-            cmd[K.C_KMASK:K.C_KMASK + 4 * self.ng] = self.key_masks()
+            assert self.ng <= 32 and K.C_KMASK[0] + 64 <= K.C_WALKS and K.C_KMASK[1] + 64 <= D.WS // 4, "key masks"
+            km = self.key_masks().reshape(2, -1)
+            for img in range(2):
+                cmd[K.C_KMASK[img]:K.C_KMASK[img] + 2 * self.ng] = km[img]
         if self.d == 80:
             cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
         return cmd.view(np.uint8)
