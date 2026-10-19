@@ -4,7 +4,6 @@
   "version": "1.0.7 (v1.0.7-56-g6c9ed874), flm serve, default prefill chunks of 4096, each model at its native context",
   "date": "2026-10-04",
   "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU), NPU power mode turbo",
-  "chart_note": "flm serve, 4096-token prefill chunks",
   "method": {
     "ttft_s": "streaming /v1/chat/completions with a Paul Graham essays prompt of n tokens, greedy, 128 tokens: client time to the first token (median of up to 3)",
     "prefill_tps": "n / ttft_s",

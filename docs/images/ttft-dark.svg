@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="858" viewBox="0 0 880 858" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="810" viewBox="0 0 880 810" role="img" aria-labelledby="t d">
 <title id="t">Time to first token</title>
 <desc id="d">Both axes are logarithmic and equally scaled. The 45° diagonals are constant prefill speeds, so a curve's slope is how its time grows with the prompt (1: linear, 2: quadratic), and the vertical gap between two curves is a speed ratio.</desc>
 <style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#9198a1;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#f0f6fc}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#f0f6fc}.lbl{font-size:12px;fill:#f0f6fc}.lbl2{font-size:12px}.strong{font-weight:600;fill:#f0f6fc}.muted{fill:#6e7681}.small{font-size:10px}.halo{paint-order:stroke;stroke:#0d1117;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#1b2129}.axis{stroke:#3d444d}.guide{stroke:#2d333b}.bracket{stroke:#9198a1;fill:none}.ft{fill:#1c5cab}.detail{font-size:12px;font-weight:400;fill:#9198a1}.tile{fill:#1b2129;stroke:#9198a1;stroke-width:1}.cut{stroke:#9198a1;stroke-width:.75;fill:none}.f0{fill:#3987e5}.l0{stroke:#3987e5;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#3987e5;stroke:#0d1117;stroke-width:1.5}.b0{fill:#3987e5;fill-opacity:.16}.f1{fill:#d95926}.l1{stroke:#d95926;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#d95926;stroke:#0d1117;stroke-width:1.5}.b1{fill:#d95926;fill-opacity:.16}.f2{fill:#199e70}.l2{stroke:#199e70;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#199e70;stroke:#0d1117;stroke-width:1.5}.b2{fill:#199e70;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#0d1117;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
-<rect x="0.5" y="0.5" width="879" height="857" rx="8" fill="#0d1117" stroke="#3d444d"/>
+<rect x="0.5" y="0.5" width="879" height="809" rx="8" fill="#0d1117" stroke="#3d444d"/>
 <text x="24.0" y="40.0" class="title">Time to first token</text>
 <text x="24.0" y="59.0" class="sub">Both axes are logarithmic and equally scaled. The 45° diagonals are constant prefill speeds, so a curve's slope is how</text>
 <text x="24.0" y="78.0" class="sub">its time grows with the prompt (1: linear, 2: quadratic), and the vertical gap between two curves is a speed ratio.</text>
@@ -349,8 +349,5 @@
 <text x="310.1" y="607.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 310.1 607.5)">1k tok/s</text>
 <text x="386.5" y="610.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 386.5 610.6)">10k tok/s</text>
 <text x="236.0" y="753.9" text-anchor="middle" class="muted">prompt length, tokens</text>
-<text x="24.0" y="781.9">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
-<text x="24.0" y="797.9">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
-<text x="24.0" y="813.9">* DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
-<text x="24.0" y="829.9">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
+<text x="24.0" y="781.9">* DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
 </svg>

@@ -142,8 +142,6 @@ class Data:
     comparisons: list[Row]  # other runtimes' rows that have a partner
     groups: list[str]  # in artlite.json's order
     legend: dict[str, str]  # runtime -> legend label
-    chart_notes: dict[str, str]  # runtime -> a line under the charts that show it
-    machine: str
     image_prompts: dict  # artlite.json's: the question, the vision encoders and the images of image_ttft_s
 
     def color(self, runtime: str) -> int:
@@ -152,24 +150,18 @@ class Data:
     def paired(self, row: Row) -> list[Row]:
         return [c for c in self.comparisons if c.partner is row]
 
-    def footer_lines(self, runtimes: set[str]) -> list[str]:
-        return [f"{self.legend[k]}: {v}" for k, v in self.chart_notes.items() if k in runtimes]
-
 
 def load() -> Data:
     art = json.loads((DATA / "artlite.json").read_text())
     rows = [Row("Artlite", r["model"], r) for r in art["results"]]
     groups = list(dict.fromkeys(r.group for r in rows))
     legend = {"Artlite": "Artlite"}
-    chart_notes = {}
     others = [json.loads(p.read_text()) for p in sorted(DATA.glob("*.json")) if p.name != "artlite.json"]
     others.sort(key=lambda d: RUNTIMES.index(d["runtime"]) if d["runtime"] in RUNTIMES else len(RUNTIMES))
     comparisons = []
     for other in others:
         name = other["runtime"]
         legend[name] = f"{name} {other['version'].split()[0]}" if "version" in other else name
-        if "chart_note" in other:
-            chart_notes[name] = other["chart_note"]
         for r in other["results"]:
             row = Row(name, r.get("same_shapes_as", r["model"]), r)
             candidates = [a for a in rows if a.group == row.group]
@@ -180,7 +172,7 @@ def load() -> Data:
                     break
             else:
                 print(f"charts: no Artlite row to compare {name} {r['model']} {r['quant']} with", file=sys.stderr)
-    return Data(rows, comparisons, groups, legend, chart_notes, art["machine"], art.get("image_prompts", {}))
+    return Data(rows, comparisons, groups, legend, art.get("image_prompts", {}))
 
 
 # ---- SVG
@@ -238,11 +230,12 @@ class Svg:
             x += text_width(label, 12) + 22
         self.y = y
 
-    def footer(self, lines: list[str], notes: Notes, machine: str) -> None:
-        for s in [*lines, *(f"{NOTE_MARKS[i]} {t}" for i, t in enumerate(notes.texts)), machine]:
-            self.text(PAD, self.y, s)
+    def footer(self, notes: Notes) -> None:
+        """The footnotes under the chart (how the numbers are measured: docs/methodology.md)."""
+        for i, t in enumerate(notes.texts):
+            self.text(PAD, self.y, f"{NOTE_MARKS[i]} {t}")
             self.y += 16
-        self.height = self.y + PAD - 12
+        self.height = self.y + PAD - (12 if notes.texts else 30)
 
     def render(self, theme: Theme) -> str:
         t = theme
@@ -430,7 +423,7 @@ def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: t
         legend.insert(1, ("box", "ft", "Artlite with its MTP drafter, S tokens per step"))
     svg.legend(legend)
     draw_bars(svg, items, [(n, f"{tokens(n)}-token prompt") for n in contexts], fmt)
-    svg.footer(data.footer_lines(shown), notes, data.machine)
+    svg.footer(notes)
     return svg
 
 
@@ -478,7 +471,7 @@ def image_chart(data: Data) -> Svg:
     ])
     svg.legend([("box", f"f{data.color(k)}", v) for k, v in legend.items()])
     draw_bars(svg, items, [(e, heading) for e, heading in encoders], sig3, lower_better=True, ticks=6)
-    svg.footer([f"{legend[k]}: {v}" for k, v in data.chart_notes.items() if k in legend], notes, data.machine)
+    svg.footer(notes)
     return svg
 
 
@@ -653,7 +646,7 @@ def ttft_chart(data: Data) -> Svg:
                      "middle")
 
     svg.y = top + math.ceil(len(panels) / cols) * (plot_h + 96) + 8
-    svg.footer(data.footer_lines(set(shown)), notes, data.machine)
+    svg.footer(notes)
     return svg
 
 

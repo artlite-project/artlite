@@ -4,7 +4,6 @@
   "version": "0.1.0-99fe7e4 (Atomic-Germ/OpenFlowLM-Next at 99fe7e4), oflm serve with every model on the open kernels, default prefill chunks of 4096, each model at its native context (Qwen3.8 27B at 131072: its KV at the native 262144 does not fit beside the weights with 16 GB to spare)",
   "date": "2026-10-17",
   "machine": "Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU), NPU power mode turbo",
-  "chart_note": "oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes",
   "method": {
     "ttft_s": "streaming /v1/chat/completions with a Paul Graham essays prompt of n tokens, greedy, 128 tokens: client time to the first token (median of up to 3)",
     "prefill_tps": "n / ttft_s",

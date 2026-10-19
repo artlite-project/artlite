@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="1041" viewBox="0 0 880 1041" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="993" viewBox="0 0 880 993" role="img" aria-labelledby="t d">
 <title id="t">Decode speed, tokens/s</title>
 <desc id="d">Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file. Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</desc>
 <style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#59636e;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#1f2328}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#1f2328}.lbl{font-size:12px;fill:#1f2328}.lbl2{font-size:12px}.strong{font-weight:600;fill:#1f2328}.muted{fill:#818b98}.small{font-size:10px}.halo{paint-order:stroke;stroke:#ffffff;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#eef1f4}.axis{stroke:#c8d1da}.guide{stroke:#d5dce3}.bracket{stroke:#59636e;fill:none}.ft{fill:#86b6ef}.detail{font-size:12px;font-weight:400;fill:#59636e}.tile{fill:#eef1f4;stroke:#59636e;stroke-width:1}.cut{stroke:#59636e;stroke-width:.75;fill:none}.f0{fill:#2a78d6}.l0{stroke:#2a78d6;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#2a78d6;stroke:#ffffff;stroke-width:1.5}.b0{fill:#2a78d6;fill-opacity:.16}.f1{fill:#eb6834}.l1{stroke:#eb6834;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#eb6834;stroke:#ffffff;stroke-width:1.5}.b1{fill:#eb6834;fill-opacity:.16}.f2{fill:#1baf7a}.l2{stroke:#1baf7a;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#1baf7a;stroke:#ffffff;stroke-width:1.5}.b2{fill:#1baf7a;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#ffffff;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
-<rect x="0.5" y="0.5" width="879" height="1040" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
+<rect x="0.5" y="0.5" width="879" height="992" rx="8" fill="#ffffff" stroke="#d1d9e0"/>
 <text x="24.0" y="40.0" class="title">Decode speed, tokens/s</text>
 <text x="24.0" y="59.0" class="sub">Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file.</text>
 <text x="24.0" y="78.0" class="sub">Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</text>
@@ -183,12 +183,9 @@
 <text x="317.8" y="848.5">41.8<tspan dx="10" class="strong">Artlite 2.0× faster</tspan></text>
 <path d="M524.4,838.0h76.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-76.6z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 32k-token prompt: 22.4</title></path>
 <text x="610.0" y="848.5">22.4<tspan dx="10" class="strong">Artlite 2.5× faster</tspan></text>
-<text x="24.0" y="901.0">FastFlowLM 1.0.7: flm serve, 4096-token prefill chunks</text>
-<text x="24.0" y="917.0">OpenFlowLM 0.1.0-99fe7e4: oflm serve on its open kernels, 4096-token prefill chunks, runs of at most 5 minutes</text>
-<text x="24.0" y="933.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
-<text x="24.0" y="949.0">† stopped at an end-of-sequence token after 143 of the 256 tokens</text>
-<text x="24.0" y="965.0">‡ DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
-<text x="24.0" y="981.0">§ with its MTP head: 7 drafts per step, 2.76 accepted</text>
-<text x="24.0" y="997.0">¶ FastFlowLM loads it with at most 8192 positions</text>
-<text x="24.0" y="1013.0">Ryzen AI Max+ 395 (Strix Halo, XDNA 2 NPU)</text>
+<text x="24.0" y="901.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
+<text x="24.0" y="917.0">† stopped at an end-of-sequence token after 143 of the 256 tokens</text>
+<text x="24.0" y="933.0">‡ DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
+<text x="24.0" y="949.0">§ with its MTP head: 7 drafts per step, 2.76 accepted</text>
+<text x="24.0" y="965.0">¶ FastFlowLM loads it with at most 8192 positions</text>
 </svg>
