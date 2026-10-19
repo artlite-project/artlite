@@ -1,8 +1,8 @@
 # Qwen3.5 / 3.6 / 3.8 and MiniCPM-V 4.7 on the NPU
 
-Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and the language model of MiniCPM-V 4.7 1B (text
-prompts; its vision encoder is planned) from a GGUF file (llama.cpp architecture `qwen35`: Gated DeltaNet layers with
-a full-attention layer every fourth). The architecture, tokenizer and chat template are read from the file's metadata.
+Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and MiniCPM-V 4.7 1B (its language model, and images
+through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (llama.cpp architecture `qwen35`: Gated
+DeltaNet layers with a full-attention layer every fourth). The architecture, tokenizer and chat template are read from the file's metadata.
 Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
 the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100;
 Artlite has no repetition penalty).
@@ -14,6 +14,7 @@ $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf 
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf     (MiniCPM-V's language model)
+$ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf            (its vision encoder, 16x)
 ```
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
@@ -41,3 +42,24 @@ generated reply; fewer than 3 left) run as decode steps.
 
 Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's)
 are re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.
+
+## Images (MiniCPM-V 4.7)
+
+```bash
+artlite-cli -m openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf \
+    --mmproj openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf --image photo.jpg -p "Describe the image."
+```
+
+`--mmproj` (artlite-cli and [artlite-server](../server.md), whose chat messages then take `image_url` parts) loads the
+vision encoder. An image is cut as the official processor cuts it (transformers' `MiniCPMV4_6ImageProcessor`): an
+overview of about 448 x 448 pixels and, for a larger image, a grid of up to `--max-slices` slices (default the file's 9;
+the model card uses 36), each entry 64 tokens or a few more. Its tokens take the official M-RoPE positions
+(transformers' `get_rope_index`; llama.cpp numbers the markers like text, its PR #30510).
+
+The encoder (`vision/minicpmv.py`) runs on Stable Diffusion's static design (`sd15/`, in a hardware context of its
+own): one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final merger) on two entries,
+or on one larger than 64 tokens alone, in about 65 ms: about 32 ms per entry (llama.cpp on the CPU: ~0.2 s per entry).
+Its weights are converted to bfp16 at the first load and cached with the dispatches, as Stable Diffusion's (~0.7 GB,
+the cache directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next turns do not run it again.
+The 4x file (`mmproj-model-f16-4x.gguf`, 256 tokens per slice) does not run yet.
+

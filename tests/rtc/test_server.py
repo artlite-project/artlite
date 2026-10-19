@@ -7,6 +7,7 @@ Qwen's exact continuation). Serving the fake model with the web UI, for a manual
 """
 
 import argparse
+import base64
 import contextlib
 import json
 import re
@@ -16,13 +17,15 @@ import time
 from collections.abc import Iterator
 
 import httpx
+import numpy as np
 import openai
 import pytest
 import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import Model, NpuModel, Sampling
+from models.common import MEDIA_MARKER, Model, NpuModel, Sampling
+from models.qwen35.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
 from models.server.engine import Engine, Job, ReasoningSplitter, StopMatcher
@@ -83,6 +86,31 @@ class FakeModel(Model):
 
     def sampling(self, *, think: bool = False) -> Sampling:
         return Sampling(temp=0.6 if think else 0.7, top_k=8, top_p=0.9)
+
+
+class FakeVision(FakeModel):
+    """A model with a vision encoder: an image part's bytes as two embedding rows (their first 16 bytes), the encoder's
+    threads recorded."""
+
+    vision = "fake"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.threads: list[str] = []
+
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int] | Sequence:
+        seq, text = Sequence.text([], 8), "<s>"
+        for m in messages:
+            text += f"<|{m['role']}|>"
+            for part in m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]:
+                if part["type"] == "image":
+                    self.threads.append(threading.current_thread().name)
+                    rows = np.frombuffer(bytes(part["image"])[:16].ljust(16, b"\0"), np.uint8).astype(np.float32)
+                    img = Sequence(np.full(2, MEDIA), np.ones(2, bool), rows.reshape(2, 8), np.zeros((2, 3), np.int64), 1)
+                    seq, text = seq + self.tokenizer.encode(text) + img, ""
+                else:
+                    text += str(part["text"])
+        return seq + self.tokenizer.encode(text + "<|assistant|>")
 
 
 class FakeNpu(NpuModel):
@@ -163,9 +191,9 @@ def _stop_engines() -> Iterator[None]:
         e.join(5)
 
 
-def make(*, reasoning: tuple[str, str] | None = None, load: object = None, **kw: object
+def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, **kw: object
          ) -> tuple[FakeModel, FakeNpu, Engine]:
-    model = FakeModel(reasoning=reasoning)
+    model = FakeVision() if vision else FakeModel(reasoning=reasoning)
     npu = FakeNpu(model, **kw)
     engine = Engine(load or (lambda: (model, npu)), warmup=False)
     ENGINES.append(engine)
@@ -350,6 +378,60 @@ def test_prompt_cache(fake: tuple) -> None:
     # without the cache
     b4 = chat(client, turn2, cache_prompt=False).json()
     assert b4["timings"]["cache_n"] == 0 and npu.calls[-2] == ("reset",)
+
+
+def _image(data: bytes) -> dict[str, object]:
+    return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}}
+
+
+def test_images() -> None:
+    """image_url parts (data URIs) reach the model's chat as image parts, on the NPU worker (the encoder's dispatches
+    between jobs); the prompt cache tells images apart by their rows; vision in /props and /v1/models."""
+    model, _npu, engine = make(vision=True)
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        turn1 = [{"role": "user", "content": [{"type": "text", "text": "look"}, _image(b"cat" * 8),
+                                              {"type": "text", "text": "what is it"}]}]
+        b1 = chat(client, turn1).json()
+        assert b1["timings"]["cache_n"] == 0 and model.threads == ["artlite-npu"]
+        turn2 = turn1 + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "more"}]
+        b2 = chat(client, turn2).json()
+        assert b2["timings"]["cache_n"] >= 8  # (past the image)
+        other = [{"role": "user", "content": [{"type": "text", "text": "look"}, _image(b"dog" * 8),
+                                              {"type": "text", "text": "what is it"}]}]
+        b3 = chat(client, other).json()
+        assert b3["timings"]["cache_n"] <= 3 and len(model.threads) == 3  # (the image's rows differ: cut before it)
+        assert client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}]}).status_code == 400
+        p = client.get("/props").json()
+        assert p["modalities"]["vision"] is True
+        m = client.get("/v1/models").json()
+        assert "multimodal" in m["models"][0]["capabilities"] and "image" in m["data"][0]["architecture"]["input_modalities"]
+        prompt = client.post("/apply-template", json={"messages": turn1}).json()["prompt"]
+        assert prompt == f"<s><|user|>look\n{MEDIA_MARKER}\nwhat is it<|assistant|>"
+
+
+def test_images_refused(fake: tuple) -> None:
+    """A model without a vision encoder refuses images."""
+    client = fake[3]
+    r = chat(client, [{"role": "user", "content": [_image(b"x"), {"type": "text", "text": "hi"}]}])
+    assert r.status_code == 400 and "text only" in r.json()["error"]["message"]
+
+
+def test_prompt_images() -> None:
+    """Model.prompt places images at the text's media markers, else before it."""
+    model = FakeVision()
+    got = model.prompt(f"a {MEDIA_MARKER} b {MEDIA_MARKER}", images=[b"1", b"2"])
+    want = model.chat([{"role": "user", "content": [{"type": "text", "text": "a "}, {"type": "image", "image": b"1"},
+                                                    {"type": "text", "text": " b "}, {"type": "image", "image": b"2"}]}])
+    assert got.cache_keys() == want.cache_keys()
+    first = model.prompt("describe", images=[b"1"])
+    assert first.cache_keys() == model.chat([{"role": "user", "content": [
+        {"type": "image", "image": b"1"}, {"type": "text", "text": "describe"}]}]).cache_keys()
+    with pytest.raises(ValueError, match="marker"):
+        model.prompt(f"a {MEDIA_MARKER}", images=[b"1", b"2"])
+    with pytest.raises(ValueError, match="vision"):
+        FakeModel().prompt("hi", images=[b"1"])
 
 
 def test_prompt_cache_exact() -> None:

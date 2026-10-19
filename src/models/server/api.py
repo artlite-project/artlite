@@ -6,11 +6,13 @@ that it fits the KV cache, queues a job and turns its events into the response."
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
 import secrets
 import time
+import urllib.parse
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,7 +27,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
-from ..common import Sampling
+from ..common import MEDIA_MARKER, Sampling
 from .engine import Engine, Job
 
 log = logging.getLogger("artlite.server")
@@ -119,6 +121,18 @@ class ApiError(Exception):
 
     def body(self) -> dict[str, Any]:
         return {"error": {"code": self.status, "message": self.message, "type": self.kind, **self.extra}}
+
+
+def image_bytes(url: object) -> bytes:
+    """An ``image_url`` part's image: a data URI's bytes (base64 or percent-encoded)."""
+    u = url.get("url") if isinstance(url, dict) else url
+    if not isinstance(u, str) or not u.startswith("data:") or "," not in u:
+        raise bad_request("an image_url must be a data URI (data:image/...;base64,...)")
+    head, data = u.split(",", 1)
+    try:
+        return base64.b64decode(data, validate=True) if head.endswith(";base64") else urllib.parse.unquote_to_bytes(data)
+    except ValueError:
+        raise bad_request("an image_url's base64 data does not decode") from None
 
 
 def bad_request(message: str) -> ApiError:
@@ -307,19 +321,29 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                            f"context size ({capacity} tokens), try increasing it", n_prompt_tokens=len(ids),
                            n_ctx=capacity)
 
-    def messages_of(messages: list[Message]) -> list[dict[str, object]]:
-        """The messages for the chat template: text content (parts joined by newlines; images are refused)."""
+    def messages_of(messages: list[Message], *, media: bool = False) -> list[dict[str, object]]:
+        """The messages for the chat template: text content (parts joined by newlines), with images (``image_url``
+        parts of data URIs, a model with a vision encoder) as parts ``{"type": "image", "image": bytes}`` among the
+        text parts; ``media``: images as the text ``MEDIA_MARKER`` (the template's text alone)."""
         out = []
+        vision = engine.model.vision is not None
         for m in messages:
             if m.role not in ROLES:
                 raise bad_request(f"message role {m.role!r} (one of {', '.join(ROLES)})")
             content = m.content
             if isinstance(content, list):
+                parts: list[dict[str, object]] = []
                 for part in content:
-                    if part.get("type") != "text":
-                        raise bad_request(f"content of type {part.get('type')!r} is not supported: this server's "
-                                          f"models take text only")
-                content = "\n".join(str(part.get("text", "")) for part in content)
+                    kind = part.get("type")
+                    if kind == "text":
+                        parts.append({"type": "text", "text": str(part.get("text", ""))})
+                    elif kind == "image_url" and vision:
+                        parts.append({"type": "text", "text": MEDIA_MARKER} if media else
+                                     {"type": "image", "image": image_bytes(part.get("image_url"))})
+                    else:
+                        raise bad_request(f"content of type {kind!r} is not supported: this server's model takes "
+                                          f"text{' and images (image_url)' if vision else ' only'}")
+                content = parts if any(p["type"] == "image" for p in parts) else "\n".join(p["text"] for p in parts)
             d: dict[str, object] = {**(m.model_extra or {}), "role": m.role, "content": content or ""}
             if m.reasoning_content:
                 d["reasoning_content"] = m.reasoning_content
@@ -337,21 +361,28 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         think = bool(kw["enable_thinking"]) if "enable_thinking" in kw else default_think()
         return think and engine.model.thinks
 
-    async def render(messages: list[Message], kwargs: dict[str, Any] | None) -> tuple[list[int], bool]:
-        """The prompt's tokens through the chat template, and whether the model thinks."""
+    async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, media: bool = False
+                     ) -> tuple[list[int], bool]:
+        """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
+        engine's worker between its jobs; ``media``: images as text, ``messages_of``), and whether the model thinks."""
         think = thinking(kwargs)
-        msgs = messages_of(messages)
+        msgs = messages_of(messages, media=media)
         try:
+            if any(isinstance(m["content"], list) for m in msgs):
+                return await asyncio.wrap_future(engine.run(lambda: engine.model.chat(msgs, think=think))), think
             return await run_in_threadpool(engine.model.chat, msgs, think=think), think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
+        except (OSError, ValueError) as e:  # (an image that does not open, or does not fit the prompt)
+            raise bad_request(str(e)) from None
 
     def inside(ids: list[int]) -> bool:
         """Whether a prompt ends inside a thought (its last text is the model's open marker)."""
         markers = engine.model.reasoning
         if markers is None:
             return False
-        tail = engine.model.tokenizer.decode_bytes(ids[-8:], special=True).decode("utf-8", errors="replace")
+        last = [int(t) for t in getattr(ids, "ids", ids)[-8:] if t >= 0]  # (a sequence's ids; an image's rows: none)
+        tail = engine.model.tokenizer.decode_bytes(last, special=True).decode("utf-8", errors="replace")
         return tail.rstrip().endswith(markers[0])
 
     def job(req: Generation, ids: list[int], *, think: bool, reasoning: bool = False, max_tokens: int | None = None,
@@ -445,22 +476,25 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         return {"default_generation_settings": {"n_ctx": engine.npu.capacity, "params": params(sampling(
                     default_think()))},
                 "total_slots": 1, "model_alias": options.alias, "model_path": info.path,
-                "modalities": {"vision": False, "audio": False, "video": False}, "endpoint_slots": options.slots,
-                "endpoint_props": False, "endpoint_metrics": False, "ui": options.ui is not None, "ui_settings": {},
+                "modalities": {"vision": engine.model.vision is not None, "audio": False, "video": False},
+                "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
+                "ui": options.ui is not None, "ui_settings": {},
                 "chat_template": info.chat_template, "bos_token": info.bos_token, "eos_token": info.eos_token,
                 "build_info": options.build_info, "is_sleeping": False, "cors_proxy_enabled": False}
 
     @listed.get("/v1/models")
     @listed.get("/models")
     async def models() -> dict[str, Any]:
-        name = options.alias
+        name, vision = options.alias, engine.model is not None and engine.model.vision is not None
         return {"object": "list",
                 "models": [{"name": name, "model": name, "modified_at": "", "size": "", "digest": "", "type": "model",
-                            "description": "", "tags": [""], "capabilities": ["completion"], "parameters": "",
+                            "description": "", "tags": [""], "capabilities": ["completion"] + ["multimodal"] * vision,
+                            "parameters": "",
                             "details": {"parent_model": "", "format": "gguf", "family": "", "families": [""],
                                         "parameter_size": "", "quantization_level": ""}}],
                 "data": [{"id": name, "aliases": [], "tags": [], "object": "model",
-                          "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                          "architecture": {"input_modalities": ["text"] + ["image"] * vision,
+                                           "output_modalities": ["text"]},
                           "created": int(time.time()), "owned_by": "artlite",
                           "meta": {"n_vocab": info.n_vocab, "n_ctx": options.n_ctx, "n_ctx_train": info.n_ctx_train,
                                    "n_embd": info.n_embd, "n_params": info.n_params, "size": info.size,
@@ -659,7 +693,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
     @api.post("/apply-template")
     async def apply_template(req: TemplateRequest) -> dict[str, str]:
-        ids, _ = await render(req.messages, req.chat_template_kwargs)
+        ids, _ = await render(req.messages, req.chat_template_kwargs, media=True)
         return {"prompt": engine.model.tokenizer.decode_bytes(ids, special=True).decode("utf-8", errors="replace")}
 
     # ------------------------------------------------------------------

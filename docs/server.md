@@ -28,8 +28,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 Sampling has the temperature, top-k, top-p and min-p. The other sampler fields (penalties, DRY, XTC, typical-p,
 mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's settings for them have no effect.
-Not provided: tool calls, images, embeddings, reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA,
-several models at a time (router mode); their routes answer 501.
+Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
+`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: tool calls,
+embeddings, reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, several models at a time (router
+mode); their routes answer 501.
 
 ## Web chat
 
@@ -91,6 +93,13 @@ NPU:
 | `--no-prefill` | run prompts as decode steps |
 | `--kv-k single\|hilo` | the KV cache's K precision (Llama, Gemma 4), as [artlite-cli](cli.md)'s |
 | `--warmup`, `--no-warmup` | run one token after loading (default on) |
+
+Images:
+
+| option | |
+|---|---|
+| `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in chat messages |
+| `--max-slices N` | an image's slices at most (default: the mmproj's, 9; the model card uses 36) |
 
 Logging:
 

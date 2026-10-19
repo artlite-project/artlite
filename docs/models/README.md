@@ -24,7 +24,7 @@ architecture, tokenizer and chat template come from its metadata.
 | qwen35 | ✅ Qwen3.5 9B | lmstudio-community Q4_K_M | |
 | | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M | vision |
 | | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M | MTP, vision |
-| | ✅ MiniCPM-V 4.7 1B (its language model) | openbmb Q4_K_M | vision (its mmproj, 16x and 4x); openbmb's other quants |
+| | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x) | the 4x mmproj; openbmb's other quants |
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |

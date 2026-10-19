@@ -54,3 +54,9 @@ class Sequence:
 
     def __radd__(self, other: list[int]) -> Sequence:
         return Sequence.text(other, self.rows.shape[1]) + self
+
+    def cache_keys(self) -> list[int | bytes]:
+        """Per token what a prompt cache compares: its id, or its given row's bytes (an image's tokens: their ids are
+        alike)."""
+        rows = iter(self.rows)
+        return [next(rows).tobytes() if g else int(t) for t, g in zip(self.ids, self.given, strict=True)]

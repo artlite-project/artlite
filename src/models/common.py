@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 R = TypeVar("R")
+MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
 
 
 @dataclass(frozen=True)
@@ -321,6 +322,7 @@ class Model:
     One subclass per architecture (``models.ARCHITECTURES``); constructor keywords are its options."""
 
     name: str  # for messages: "Llama 3", ...
+    vision: Any = None  # the image encoder (an option of the model's: its mmproj file), or None: text only
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
     tokenizer: Detokenizer
@@ -332,7 +334,9 @@ class Model:
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
         """Token ids of a conversation through the chat template, up to the assistant's turn (``think``: let it
-        think first; otherwise an empty thought where the template has one)."""
+        think first; otherwise an empty thought where the template has one). A message's content may be a list of
+        parts: ``{"type": "text", "text": ...}``, ``{"type": "image", "image": a file, its bytes or a PIL image}``
+        (a model with ``vision``: its prompt then a sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError
 
     def sampling(self, *, think: bool = False) -> Sampling:
@@ -344,12 +348,25 @@ class Model:
         (else as decode steps). NotImplementedError: a file whose shapes or formats the NPU path does not handle."""
         raise NotImplementedError
 
-    def prompt(self, text: str, *, system: str | None = None, raw: bool = False, think: bool = False) -> list[int]:
+    def prompt(self, text: str, *, system: str | None = None, raw: bool = False, think: bool = False,
+               images: list[object] = ()) -> list[int]:
         """Token ids of a user message after an optional system message, through the chat template (``raw``: the text
-        alone)."""
+        alone); ``images`` (files or their bytes) where the text has ``MEDIA_MARKER``, else before it."""
+        if images and self.vision is None:
+            raise ValueError(f"{self.name}: images need a vision encoder (an mmproj file)")
         if raw:
+            if images:
+                raise ValueError("images go through the chat template (not a raw prompt)")
             return self.encode(text)
         if think and not self.thinks:
             raise ValueError(f"{self.name} has no thinking mode")
-        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": text}]
+        content: str | list[dict[str, object]] = text
+        if images:
+            parts = text.split(MEDIA_MARKER) if MEDIA_MARKER in text else ["", text]
+            if len(parts) != len(images) + 1:
+                raise ValueError(f"{len(images)} image(s) for {len(parts) - 1} {MEDIA_MARKER} marker(s) in the prompt")
+            content = [{"type": "text", "text": parts[0]}] if parts[0] else []
+            for im, t in zip(images, parts[1:], strict=True):
+                content += [{"type": "image", "image": im}] + ([{"type": "text", "text": t}] if t else [])
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
         return self.chat(messages, think=think)

@@ -4,9 +4,12 @@ options follow llama.cpp's ``llama-cli`` where it has an equivalent, the image o
 ``sd-cli`` (but ``--sampler``).
 
     artlite-cli -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf -p "..."
+    artlite-cli -m openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf \\
+        --mmproj openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf --image photo.jpg -p "Describe the image."
     artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "..." -o image.png
 
-Text: the prompt goes through the model's chat template (``--raw``: as it is); tokens are then sampled until an
+Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image`` files (a model with a
+vision encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them; tokens are then sampled until an
 end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed report to
 stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr.
 """
@@ -22,7 +25,7 @@ import torch
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
-from .common import StreamDecoder, auto_capacity
+from .common import MEDIA_MARKER, StreamDecoder, auto_capacity
 from .sd15.pipeline import BACKENDS, check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
@@ -53,6 +56,12 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Gemma): one bfp16 block per 8 dims (Llama's default), or "
                         "hi + lo blocks (Gemma's default; +50%% cache bytes and read time)")
+    vis = p.add_argument_group("images in the prompt (MiniCPM-V 4.7)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-model-f16.gguf)")
+    vis.add_argument("--image", action="append", default=[],
+                     help=f"an image file (repeatable): where the prompt has {MEDIA_MARKER}, else before it")
+    vis.add_argument("--max-slices", type=int,
+                     help="an image's slices at most (default: the mmproj's, 9; the model card uses 36)")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
@@ -111,12 +120,17 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed)
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
+    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices}
     try:
         text = prompt_text(args)
-        model = open_model(args.model, **({"kv_k": args.kv_k} if args.kv_k else {}))
-        ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think)
+        model = open_model(args.model, **{k: v for k, v in options.items() if v})
+        ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image)
     except (OSError, ValueError, NotImplementedError) as e:
         sys.exit(f"artlite-cli: {e}")
+    if model.vision is not None and args.image:
+        v = model.vision
+        sys.stderr.write(f"{len(args.image)} image(s): {v.entries} entries through the encoder in {v.t_encode:.2f} s "
+                         f"({1e3 * v.t_encode / max(v.entries, 1):.0f} ms each)\n")
     capacity = args.ctx_size or auto_capacity(len(ids) + max(args.n_predict, 0))
     if len(ids) >= capacity:
         sys.exit(f"artlite-cli: a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")

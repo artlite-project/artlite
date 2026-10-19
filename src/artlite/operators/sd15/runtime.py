@@ -1,11 +1,17 @@
 """sd15's design on the NPU (``Sd15Device``): its hardware context, DDR buffers, the roles' pages (``paging``: one
 image of two B slots per role, the same for every core), and dispatches of ``seq.Seq`` programs."""
 
+import glob
+import hashlib
 import os
+import pickle
+import shutil
+from importlib.metadata import version
 
 import numpy as np
 
 from .. import paging
+from ..base import CACHE_DIR
 from ..design import COLS, ROWS
 from ..overlay.runtime import OverlayDevice, Transaction
 from . import core as K
@@ -148,3 +154,61 @@ class Sd15Device:
         """An empty dispatch: the first one after new host buffers takes ~0.15 s more than later ones (a model's load
         ends with it, so that its first step does not)."""
         self.run(self.transaction(self.seq()))
+
+
+# A model's built state on the design (the device's layout, the DDR images its builds wrote: weights, commands,
+# tables; its transactions with their shim addresses as relocations) cached in a directory per model file: restored,
+# a load skips the weights' conversion and the builds.
+
+def state_dir(kind: str, path: str, sources: tuple[str, ...], files: list[str]) -> str:
+    """The cache directory of a model's built state: ``CACHE_DIR/kind/<path's digest>/<key>``, the key covering the
+    toolchain, the code that builds the images and transactions (``sources``: files or directories of the src tree)
+    and the model's ``files`` (size and mtime)."""
+    src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    h = hashlib.sha256(version("llvm-aie").encode())
+    for s in sources:
+        p = os.path.join(src, s)
+        for f in sorted(glob.glob(os.path.join(p, "*.py"))) if os.path.isdir(p) else [p]:
+            with open(f, "rb") as fh:
+                h.update(fh.read())
+    for f in files:
+        st = os.stat(f)
+        h.update(f"{os.path.basename(f)} {st.st_size} {st.st_mtime_ns}".encode())
+    return os.path.join(CACHE_DIR, kind, hashlib.sha256(os.path.abspath(path).encode()).hexdigest()[:12], h.hexdigest()[:16])
+
+
+def load_state(cache: str) -> tuple[Sd15Device, dict] | None:
+    """A device restored from ``save_state``'s directory (its images written back) and the saved state; None: no
+    entry."""
+    if not os.path.exists(os.path.join(cache, "state.pkl")):
+        return None
+    with open(os.path.join(cache, "state.pkl"), "rb") as f:
+        st = pickle.load(f)
+    npu = Sd15Device()
+    npu.restore(st["layout"])
+    with open(os.path.join(cache, "images.bin"), "rb") as f:
+        for name, at, n in st["images"]:
+            f.seek(at)
+            f.readinto(npu.view(name)[:n])
+            npu.flush(name)
+    return npu, st["state"]
+
+
+def save_state(cache: str, npu: Sd15Device, images: list[str], state: dict) -> None:
+    """The built state of a device (the DDR images ``images``) and the models' ``state`` into the cache directory
+    (written to a sibling, then renamed); the model file's older entries removed."""
+    root, tmp = os.path.dirname(cache), f"{cache}.{os.getpid()}"
+    os.makedirs(tmp)
+    index, at = [], 0
+    with open(os.path.join(tmp, "images.bin"), "wb") as f:
+        for name in dict.fromkeys(images):
+            v = npu.view(name)
+            f.write(v.tobytes())
+            index.append((name, at, v.size))
+            at += v.size
+    with open(os.path.join(tmp, "state.pkl"), "wb") as f:
+        pickle.dump({"layout": npu.layout(), "images": index, "state": state}, f)
+    for e in os.listdir(root):
+        if e != os.path.basename(tmp):
+            shutil.rmtree(os.path.join(root, e), ignore_errors=True)
+    os.replace(tmp, cache)

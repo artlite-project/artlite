@@ -8,20 +8,14 @@ the cross attentions' K / V^T (computed on the host). The first build writes the
 dispatches' transactions (the design's compile is cached).
 """
 
-import glob
-import hashlib
 import json
 import os
-import pickle
-import shutil
 from concurrent.futures import Future, ThreadPoolExecutor
-from importlib.metadata import version
 
 import torch
 
-from artlite.operators.base import CACHE_DIR
 from artlite.operators.sd15.model import UNet
-from artlite.operators.sd15.runtime import Sd15Device
+from artlite.operators.sd15.runtime import Sd15Device, load_state, save_state, state_dir
 from artlite.operators.sd15.vae import Decoder
 
 from . import reference
@@ -93,37 +87,14 @@ _SOURCES = ("artlite/operators/sd15", "artlite/txn.py", "artlite/operators/bfp16
             "models/sd15/reference.py", "models/sd15/weights.py")
 
 
-def _key(path: str) -> str:
-    src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # (the src directory)
-    h = hashlib.sha256(version("llvm-aie").encode())
-    for s in _SOURCES:
-        p = os.path.join(src, s)
-        for f in sorted(glob.glob(os.path.join(p, "*.py"))) if os.path.isdir(p) else [p]:
-            with open(f, "rb") as fh:
-                h.update(fh.read())
-    for sub in ("unet", "vae"):
-        for f in ("config.json", "diffusion_pytorch_model.safetensors"):
-            st = os.stat(os.path.join(path, sub, f))
-            h.update(f"{sub}/{f} {st.st_size} {st.st_mtime_ns}".encode())
-    return h.hexdigest()[:16]
-
-
 def load(path: str) -> tuple[NpuUNet, NpuVae]:
-    """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache (``CACHE_DIR/sd15``:
+    """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache (``runtime.state_dir``:
     the device's layout, the images the builds wrote (weights, commands, tables), the transactions with their shim
     addresses relocated; keyed by the model's files and the code), else built and cached (one entry per model)."""
-    root = os.path.join(CACHE_DIR, "sd15", hashlib.sha256(os.path.abspath(path).encode()).hexdigest()[:12])
-    cache = os.path.join(root, _key(path))
-    if os.path.exists(os.path.join(cache, "state.pkl")):
-        with open(os.path.join(cache, "state.pkl"), "rb") as f:
-            st = pickle.load(f)
-        npu = Sd15Device()
-        npu.restore(st["layout"])
-        with open(os.path.join(cache, "images.bin"), "rb") as f:
-            for name, at, n in st["images"]:
-                f.seek(at)
-                f.readinto(npu.view(name)[:n])
-                npu.flush(name)
+    files = [os.path.join(path, sub, f) for sub in ("unet", "vae") for f in ("config.json", "diffusion_pytorch_model.safetensors")]
+    cache = state_dir("sd15", path, _SOURCES, files)
+    if (got := load_state(cache)) is not None:
+        npu, st = got
         unet = NpuUNet(os.path.join(path, "unet"), npu=npu, state=st["unet"])
         vae = NpuVae(os.path.join(path, "vae"), npu, state=st["vae"])
         npu.warm()
@@ -131,19 +102,5 @@ def load(path: str) -> tuple[NpuUNet, NpuVae]:
     unet = NpuUNet(os.path.join(path, "unet"))
     npu = unet.net.npu
     vae = NpuVae(os.path.join(path, "vae"), npu)
-    tmp = f"{cache}.{os.getpid()}"
-    os.makedirs(tmp)
-    index, at = [], 0
-    with open(os.path.join(tmp, "images.bin"), "wb") as f:
-        for name in dict.fromkeys(unet.net.images + vae.dec.images):
-            v = npu.view(name)
-            f.write(v.tobytes())
-            index.append((name, at, v.size))
-            at += v.size
-    with open(os.path.join(tmp, "state.pkl"), "wb") as f:
-        pickle.dump({"layout": npu.layout(), "images": index, "unet": unet.net.state(), "vae": vae.dec.state()}, f)
-    for e in os.listdir(root):  # (the model's older entries)
-        if e != os.path.basename(tmp):
-            shutil.rmtree(os.path.join(root, e), ignore_errors=True)
-    os.replace(tmp, cache)
+    save_state(cache, npu, unet.net.images + vae.dec.images, {"unet": unet.net.state(), "vae": vae.dec.state()})
     return unet, vae

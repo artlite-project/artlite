@@ -36,8 +36,10 @@ from artlite.operators.qwen35.overlay import QwenOverlay
 from artlite.operators.qwen35.prefill import SIZES, QwenPrefill
 
 from ..common import Model, OverlayModel, Sampling
+from .minicpmv import image_prompt
 from .sequence import Sequence
 from .tokenizer import QwenTokenizer, chat_prompt
+from .vision import NpuVision
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
 # set; its repetition penalty 1.03 aside): the language model of openbmb's files, marked by the M-RoPE order of its
@@ -146,13 +148,14 @@ class NpuQwen(OverlayModel):
 class Qwen(Model):
     """A qwen35 model from a GGUF file (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7's language model): the architecture,
     tokenizer and chat template from its metadata. Opening the file allocates the weight image's buffer and packs it in
-    a thread (``WeightBuffer``) while the tokenizer and the designs load."""
+    a thread (``WeightBuffer``) while the tokenizer and the designs load. ``mmproj``: MiniCPM-V's vision encoder file
+    (``vision.NpuVision``: images in prompts; ``max_slices``: an image's slices at most, default the file's)."""
 
     name = "Qwen3.5"
     thinks = True
     reasoning = ("<think>", "</think>")
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None):
         self.gguf = GGUFFile(path)
         self.weights = WeightBuffer(QwenImage(self.gguf))
         self.tokenizer = QwenTokenizer(self.gguf)
@@ -161,12 +164,30 @@ class Qwen(Model):
         self.minicpmv = self.cfg.rope_section_order == "zyxt"
         if self.minicpmv:
             self.name = "MiniCPM-V 4.7"
+        self._npu: NpuQwen | None = None
+        if mmproj is not None:
+            if not self.minicpmv:
+                raise ValueError(f"{path}: an mmproj file goes with MiniCPM-V 4.7's language model")
+            self.vision = NpuVision(mmproj, max_slices=max_slices)
+            if self.vision.clip.projection_dim != self.cfg.hidden_size:
+                raise ValueError(f"{mmproj}: embeddings of {self.vision.clip.projection_dim}, the language model's "
+                                 f"{self.cfg.hidden_size}")
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think))
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int] | Sequence:
+        text = chat_prompt(self.gguf, messages, enable_thinking=think)
+        images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
+                  if isinstance(p, dict) and p.get("type") == "image"]
+        if not images:
+            return self.tokenizer.encode(text)
+        if self.vision is None:
+            raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
+        seq = image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
+        if self._npu is not None:  # (the encoder's hardware context ran: ``OverlayDevice.set_prologue``)
+            self._npu.overlay.dev.stale = True
+        return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""
@@ -174,4 +195,5 @@ class Qwen(Model):
         return Sampling(temp=s["temp"], top_k=int(s["top_k"]), top_p=s["top_p"])
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
-        return NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights)
+        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights)
+        return self._npu

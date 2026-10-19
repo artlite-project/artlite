@@ -32,6 +32,7 @@ breaks ties of its KV position by (H, W)).
 
 import io
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -101,21 +102,41 @@ class Grid:
             pos.append((O, O, O))
         return np.asarray(pos, np.int64), O + max(ch, cw) + 1
 
-    def sequence(self, embd: np.ndarray, sep: np.ndarray) -> Sequence:
-        """The image's tokens (``layout``, the template's "\\n" after it) from position 0: the encoder's rows ``embd``
-        (its entries' tokens in order: the overview's, then the slices' row by row) for its ``MEDIA`` tokens, the
-        mmproj's ``v.tok_embd_sep`` rows ``sep`` for the markers inside it (``SEP_ROWS``); ``<image>`` and the
-        template's "\\n" as text tokens."""
-        ids = np.asarray(self.layout(), np.int64)
+    def sequence(self, embd: np.ndarray, sep: np.ndarray, *, newline_after: bool = True) -> Sequence:
+        """The image's tokens (``layout``, the template's "\\n" after it: ``newline_after``) from position 0: the
+        encoder's rows ``embd`` (its entries' tokens in order: the overview's, then the slices' row by row) for its
+        ``MEDIA`` tokens, the mmproj's ``v.tok_embd_sep`` rows ``sep`` for the markers inside it (``SEP_ROWS``);
+        ``<image>`` and the template's "\\n" as text tokens."""
+        ids = np.asarray(self.layout(newline_after=newline_after), np.int64)
         given = np.ones(len(ids), bool)
-        given[0] = given[-1] = False
+        given[0] = False
+        given[-1] &= not newline_after
         media = ids[given] == MEDIA
         rows = np.empty((int(given.sum()), embd.shape[1]), np.float32)
         assert embd.shape[0] == media.sum(), (embd.shape, int(media.sum()))
         rows[media] = embd
         rows[~media] = sep[[SEP_ROWS[int(t)] for t in ids[given][~media]]]
-        pos, nxt = self.positions(0)
+        pos, nxt = self.positions(0, newline_after=newline_after)
         return Sequence(ids, given, rows, pos, nxt)
+
+
+IMAGE_PAD = "<|image_pad|>"  # (the chat template's place of an image)
+
+
+def image_prompt(text: str, images: list[object], encode: Callable[[str], list[int]],
+                 sequence: Callable[..., Sequence]) -> Sequence:
+    """A chat prompt's text with the template's ``IMAGE_PAD`` per image -> its tokens: each placeholder becomes the text
+    ``<image_id>k</image_id>`` (k counting the prompt's images from 0) and the image's tokens (``sequence(image,
+    newline_after=)``: ``Grid.sequence``'s); the template's "\\n" after a placeholder is the image's last token, at its
+    official position."""
+    parts = text.split(IMAGE_PAD)
+    if len(parts) != len(images) + 1:
+        raise ValueError(f"{len(images)} image(s) for {len(parts) - 1} place(s) in the prompt")
+    seq = Sequence.text(encode(parts[0]))
+    for k, (im, tail) in enumerate(zip(images, parts[1:], strict=True)):
+        nl = tail.startswith("\n")
+        seq = seq + encode(f"<image_id>{k}</image_id>") + sequence(im, newline_after=nl) + encode(tail[nl:])
+    return seq
 
 
 # ----------------------------------------------------------------------

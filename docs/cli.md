@@ -7,6 +7,8 @@ options follow llama.cpp's `llama-cli` where it has an equivalent, the image opt
 ```bash
 artlite-cli -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
     -p "Factorize x^2 + x - 6 = 0"
+artlite-cli -m openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf \
+    --mmproj openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf --image photo.jpg -p "Describe the image."
 artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "a photograph of an astronaut riding a horse" \
     -o astronaut.png
 ```
@@ -37,6 +39,9 @@ and generation speeds go to stderr.
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Gemma 4), below |
+| `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
+| `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
+| `--max-slices N` | an image's slices at most (default: the mmproj's, 9; the model card uses 36) |
 
 The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen
 the file's `general.sampling.*`, else its model card's.

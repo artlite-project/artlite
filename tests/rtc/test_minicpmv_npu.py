@@ -18,7 +18,7 @@ from artlite.model_config import ClipConfig, minicpmv_gguf
 from artlite.operators.overlay import kv as KV
 from artlite.operators.qwen35 import attn as AT
 from models.qwen35 import minicpmv as M
-from models.qwen35.qwen import NpuQwen
+from models.qwen35.qwen import NpuQwen, Qwen
 from models.qwen35.tokenizer import QwenTokenizer, chat_prompt
 
 from . import minicpmv_ref as V
@@ -50,10 +50,7 @@ def case() -> tuple:
     chunk = gold.embd(0)  # (llama.cpp's image chunk: the tokens after <image>, through the last marker)
     embd = chunk[np.asarray(grid.layout(newline_after=False)[1:]) == M.MEDIA]
     img = grid.sequence(embd, GGUFFile(MMPROJ).rows("v.tok_embd_sep", [0, 1, 2, 3]).numpy())
-    words = essay("founders.txt").split()
-    before, after = " ".join(words[:90]), " ".join(words[90:300]) + "\n\nDescribe the image."
-    text = chat_prompt(g, [{"role": "user", "content": [{"type": "text", "text": before}, {"type": "image"},
-                                                        {"type": "text", "text": after}]}], enable_thinking=False)
+    text = chat_prompt(g, _messages(None), enable_thinking=False)
     head, tail = text.split("<|image_pad|>")
     seq = tok.encode(head + "<image_id>0</image_id>") + img + tok.encode(tail.removeprefix("\n"))
     answer = tok.encode(ANSWER)
@@ -64,6 +61,22 @@ def case() -> tuple:
     rows[seq.given] = seq.rows
     want = torch.from_numpy(np.asarray(V.seq_golden(path, rows, seq.pos, K - 1).logits, np.float32)[:-1].copy())
     return path, seq, K, want
+
+
+def _messages(image: str | None) -> list[dict[str, object]]:
+    """The prompt: an essay paragraph, the image (its file: the app's image part), more essay and the question."""
+    words = essay("founders.txt").split()
+    before, after = " ".join(words[:90]), " ".join(words[90:300]) + "\n\nDescribe the image."
+    img = {"type": "image"} | ({"image": image} if image else {})
+    return [{"role": "user", "content": [{"type": "text", "text": before}, img, {"type": "text", "text": after}]}]
+
+
+def _kl_report(name: str, want: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
+    kl = _kl(want, got)
+    agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
+    print(f"{name}: KL vs llama.cpp at the official positions {float(kl.mean()):.4f} (max {float(kl.max()):.4f}), "
+          f"argmax agreement {agree:.3f} over {len(kl)} tokens")
+    return float(kl.mean()), agree
 
 
 def _k_cache(model: NpuQwen, n: int) -> np.ndarray:
@@ -90,15 +103,35 @@ def test_image_prompt(case: tuple) -> None:
         got = [model.forward(seq[:K])]
         caches[prefill] = _k_cache(model, K - K % 32)
         got = torch.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]])
-        kl = _kl(want, got)
-        agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
-        print(f"{'prefill' if prefill else 'steps'}: KL vs llama.cpp at the official positions {float(kl.mean()):.4f} "
-              f"(max {float(kl.max()):.4f}), argmax agreement {agree:.3f} over {len(kl)} tokens")
+        kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
         assert model.rope_next == seq.next - 1  # (the text positions continued through the answer's steps)
-        assert float(kl.mean()) < 0.008 and agree > 0.92
+        assert kl < 0.008 and agree > 0.92
         del model
     err = lambda a, b: float(np.linalg.norm(caches[True][:, a:b] - caches[False][:, a:b])
                              / np.linalg.norm(caches[False][:, a:b]))
     e_img, e_text = err(i_img, i_end + 1), err(512, K - K % 32)
     print(f"K cache, prefill vs decode steps: the image's slots {e_img:.4f}, the text's after it {e_text:.4f}")
     assert e_img < 1.5 * e_text + 2e-3
+
+
+def test_app_image_prompt(case: tuple) -> None:
+    """The app's path (``Qwen(mmproj=)``: the chat prompt with the NPU encoder's embeddings) teacher-forced over the
+    description, against llama.cpp's own encoder and language model: the prompt's tokens and positions the
+    reference's, the KL within ~2x of the language model's alone (``test_image_prompt``: llama.cpp's embeddings; the
+    encoder's own share: V3's gate); the image encoded again after the language model's dispatches (another hardware
+    context ran in between) bit-identical."""
+    path, seq, K, want = case
+    app = Qwen(path, mmproj=MMPROJ)
+    im = M.load_image(IMAGE)
+    first, _ = app.vision.embeddings(im)
+    prompt = app.chat(_messages(IMAGE))
+    assert np.array_equal(prompt.ids, seq.ids[:K]) and np.array_equal(prompt.pos, seq.pos[:K])
+    assert np.array_equal(prompt.given, seq.given[:K])
+    model = app.load(capacity=1024)
+    got = [model.forward(prompt)]
+    got = torch.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]])
+    kl, agree = _kl_report("the NPU encoder, prefill", want, got)
+    assert kl < 0.016 and agree > 0.9
+    app.vision._kept.clear()
+    again, _ = app.vision.embeddings(im)
+    assert np.array_equal(first, again)

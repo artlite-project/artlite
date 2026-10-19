@@ -3,6 +3,7 @@ arrival order (``Engine``); the prompt cache across requests; the generated text
 its split into thoughts and answer (``ReasoningSplitter``); the timings of a generation as llama-server reports them."""
 
 import collections
+import concurrent.futures
 import itertools
 import logging
 import threading
@@ -39,7 +40,7 @@ class Job:
     - ``error``: ``message``, a failure in the model (the job ends);
     - ``cancelled``: the job ended early (``cancel`` set)."""
 
-    ids: list[int]
+    ids: list[int]  # (or a sequence of ids and embedding rows: an image's, ``Model.chat``)
     emit: Emit
     sampling: Sampling
     max_tokens: int = -1  # < 0: until an end-of-sequence token or a full cache
@@ -57,8 +58,20 @@ class Job:
     n_gen: int = 0  # tokens generated so far
 
 
+@dataclass(eq=False)
+class Call:
+    """Work for the worker between jobs (``Engine.run``): an image prompt's encoder, the NPU dispatches of another
+    hardware context."""
+
+    fn: Callable[[], Any]
+    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+    conv_id: str | None = None
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+
 def common_prefix(a: list[int], b: list[int]) -> int:
-    """The length of the longest common prefix of two token lists."""
+    """The length of the longest common prefix of two prompts' tokens (ids; a sequence's given rows by their bytes)."""
+    a, b = (getattr(x, "cache_keys", lambda x=x: x)() for x in (a, b))
     return next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), min(len(a), len(b)))
 
 
@@ -205,14 +218,21 @@ class Engine:
     def wait_ready(self, timeout: float | None = None) -> bool:
         return self._ready.wait(timeout)
 
-    def submit(self, job: Job) -> None:
+    def submit(self, job: Job | Call) -> None:
         """Queue a job (after the ones waiting)."""
         with self._cv:
             if self._stopping:
                 raise RuntimeError("the server is shutting down")
-            job.name = job.name or f"request {next(self._ids)}"
+            if isinstance(job, Job):
+                job.name = job.name or f"request {next(self._ids)}"
             self._queue.append(job)
             self._cv.notify()
+
+    def run(self, fn: Callable[[], Any]) -> concurrent.futures.Future:
+        """Run fn on the worker after the queued jobs (NPU work outside a generation); its result or exception."""
+        call = Call(fn)
+        self.submit(call)
+        return call.future
 
     def waiting(self) -> int:
         """Jobs in the queue (not running)."""
@@ -261,7 +281,17 @@ class Engine:
                     self._cv.wait()
                 if not self._queue:
                     return
-                job = self.current = self._queue.popleft()
+                job = self._queue.popleft()
+                if not isinstance(job, Call):
+                    self.current = job
+            if isinstance(job, Call):
+                try:
+                    if job.cancel.is_set():
+                        raise RuntimeError("the server is shutting down")
+                    job.future.set_result(job.fn())
+                except Exception as e:  # noqa: BLE001 (the caller's: its future)
+                    job.future.set_exception(e)
+                continue
             try:
                 self._process(job)
             except Cancelled:

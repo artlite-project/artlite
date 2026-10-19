@@ -78,6 +78,11 @@ def arg_parser() -> argparse.ArgumentParser:
                      help="thoughts in reasoning_content (auto, deepseek) or in content (none) (default: auto)")
     gen.add_argument("--chat-template-kwargs", type=json.loads, default={},
                      help="chat template variables as a JSON object, under each request's (enable_thinking)")
+    vis = p.add_argument_group("images (MiniCPM-V 4.7)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-model-f16.gguf): images "
+                     "in chat messages (image_url parts of data URIs)")
+    vis.add_argument("--max-slices", type=int,
+                     help="an image's slices at most (default: the mmproj's, 9; the model card uses 36)")
     npu = p.add_argument_group("NPU")
     npu.add_argument("--no-prefill", action="store_true", help="run prompts as decode steps")
     npu.add_argument("--kv-k", choices=("single", "hilo"),
@@ -210,7 +215,8 @@ def main(argv: list[str] | None = None) -> None:
 
     def load() -> tuple[Model, NpuModel]:
         t0 = time.perf_counter()
-        model = open_model(args.model, **({"kv_k": args.kv_k} if args.kv_k else {}))
+        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices}
+        model = open_model(args.model, **{k: v for k, v in opts.items() if v})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
         npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)
