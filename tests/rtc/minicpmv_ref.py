@@ -16,7 +16,8 @@ ViT layers (LayerNorm with bias, 16 heads of 72, GELU tanh), the ViT merger afte
 16x files only), the post LayerNorm and the final 2 x 2 merge (4608 -> LayerNorm -> 4608 GELU erf -> 1024), then the
 entry's separator rows of ``v.tok_embd_sep``. In float64, or with ``llama=True`` llama.cpp's CPU rounding: the patch
 embedding in fp16 (pixels and kernel: ggml_conv_2d's im2col), a matmul against BF16 weights takes its activations as
-bf16, GELU tanh goes through ggml's fp16 table.
+bf16, GELU tanh goes through ggml's fp16 table. ``NpuEncoder``: the encoder at the NPU's rounding points
+(``artlite.operators.vision.minicpmv`` on sd15's design).
 """
 
 import hashlib
@@ -327,3 +328,72 @@ class Encoder:
         if suffix is not None:
             x = torch.cat([x, self.w("v.tok_embd_sep")[SUFFIX_ROWS[suffix]]])
         return x
+
+
+def _bfp(x: torch.Tensor) -> torch.Tensor:
+    """bfp16ebs8 blocks of 8 along the last axis (RNE)."""
+    from artlite.operators import bfp16
+    n = x.shape[-1]
+    xp = torch.nn.functional.pad(x, (0, -n % 8)) if n % 8 else x
+    return torch.from_numpy(bfp16.values(xp.to(torch.float32).numpy())).to(x.dtype)[..., :n]
+
+
+class NpuEncoder(Encoder):
+    """The encoder at the rounding points of sd15's design (``artlite.operators.vision.minicpmv``; float64 between
+    them): a GEMM's A as bfp16 panels and its weights bfp16, C over the whole K from the bf16 bias plus a bf16
+    residual, rounded once (bf16 C tiles: the residual stream, a LayerNorm's input; bfp16 panels: a GEMM's or the
+    attention's input, V^T blocked over 8 tokens); LayerNorm statistics S1, S2 of the bf16 values in fp32, var =
+    max(S2 / n - mean^2, 0); GELU of bf16 values to bf16 (act_lut); attention with q (x log2 e / sqrt d) and k single
+    bfp16, P = 2^(s - max) in bf16 as bfp16 panels, l their sums, o / l as panels."""
+
+    def __init__(self, mmproj: str):
+        super().__init__(mmproj)
+        self._wq: dict[str, torch.Tensor] = {}
+
+    def wq(self, name: str) -> torch.Tensor:
+        if name not in self._wq:
+            self._wq[name] = _bfp(self.w(name))
+        return self._wq[name]
+
+    def gemm(self, a: torch.Tensor, name: str, bias: str | None, res: torch.Tensor | None = None) -> torch.Tensor:
+        """a: the A panels' values -> C + bias + residual, unrounded."""
+        c = a @ self.wq(name).T
+        if bias:
+            c = c + _bf16(self.w(bias).reshape(-1))
+        return c if res is None else c + res
+
+    def ln(self, x: torch.Tensor, prefix: str) -> torch.Tensor:
+        """x: bf16 values -> the LayerNorm's bfp16 panels."""
+        x32 = x.to(torch.float32)
+        n = x.shape[-1]
+        mean = x32.sum(-1, keepdim=True) / n
+        var = torch.clamp((x32 * x32).sum(-1, keepdim=True) / n - mean * mean, min=0)
+        rstd = 1 / torch.sqrt(var + self.eps)
+        y = (x - mean.to(x.dtype)) * rstd.to(x.dtype) * self.w(prefix + ".weight").reshape(-1) \
+            + self.w(prefix + ".bias").reshape(-1)
+        return _bfp(y)
+
+    def gelu_panels(self, c: torch.Tensor) -> torch.Tensor:
+        return _bfp(_bf16(_gelu_tanh(_bf16(c))))
+
+    def attention(self, a: torch.Tensor, p: str) -> torch.Tensor:
+        """a: the LayerNorm's panels (n, hidden) -> o / l panels (n, hidden)."""
+        n, H, d = a.shape[0], self.heads, self.hd
+        q = self.gemm(a, p + "attn_q.weight", p + "attn_q.bias") * (math.log2(math.e) / math.sqrt(d))
+        k = self.gemm(a, p + "attn_k.weight", p + "attn_k.bias")
+        v = self.gemm(a, p + "attn_v.weight", p + "attn_v.bias")
+        q = _bfp(q.reshape(n, H, d).transpose(0, 1))
+        k = _bfp(k.reshape(n, H, d).transpose(0, 1))
+        v = _bfp(v.reshape(n, H, d).permute(1, 2, 0)).transpose(1, 2)  # (V^T panels: blocks over 8 tokens)
+        s = q @ k.transpose(1, 2)  # (log2 units)
+        pr = _bfp(_bf16(torch.exp2(s - s.amax(-1, keepdim=True))))
+        o = (pr @ v) / pr.sum(-1, keepdim=True)
+        return _bfp(o.transpose(0, 1).reshape(n, self.hidden))
+
+    def layer(self, x: torch.Tensor, il: int) -> torch.Tensor:
+        """Layer il on the residual x (bf16 values)."""
+        p = f"v.blk.{il}."
+        o = self.attention(self.ln(x, p + "ln1"), p)
+        x = _bf16(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
+        h = self.gelu_panels(self.gemm(self.ln(x, p + "ln2"), p + "ffn_up.weight", p + "ffn_up.bias"))
+        return _bf16(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
