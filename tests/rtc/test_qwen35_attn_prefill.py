@@ -57,6 +57,8 @@ class _Setup:
         self.lay = PG.plan_phase(img, img.region(L, "attn_in"), T, pitch=PG.phase_pitch(img, "attn_in", T)).layout
         self.ash = AT.AttnShape(cfg, MAX_POS, a_bytes=img.tile_bytes)
         self.T, self.n2, self.qc = T, n2, cfg.num_attention_heads // COLS
+        self.kvh = cfg.num_key_value_heads
+        self.per = self.kvh * AT.HD // COLS  # (K / V dims of a column)
         self.tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T + n2]
         n = len(self.tokens)
         G_ = ref.golden(path, self.tokens, layers=(L,), names="Qcur_full|Kcur|Vcur|Qcur|gate_sigmoid|attn_gated",
@@ -75,8 +77,9 @@ class _Setup:
         for c in range(COLS):
             G[:n, c * lay.pitch + lay.off["q"] + np.arange(2 * qc * AT.HD)] = \
                 self.qfull[t0:t0 + n, 2 * qc * AT.HD * c:2 * qc * AT.HD * (c + 1)]
-            G[:n, c * lay.pitch + lay.off["k"] + np.arange(AT.HD // 2)] = self.k[t0:t0 + n, 128 * c:128 * (c + 1)]
-            G[:n, c * lay.pitch + lay.off["v"] + np.arange(AT.HD // 2)] = self.v[t0:t0 + n, 128 * c:128 * (c + 1)]
+            e = self.per
+            G[:n, c * lay.pitch + lay.off["k"] + np.arange(e)] = self.k[t0:t0 + n, e * c:e * (c + 1)]
+            G[:n, c * lay.pitch + lay.off["v"] + np.arange(e)] = self.v[t0:t0 + n, e * c:e * (c + 1)]
         return G
 
     def nr(self, x: np.ndarray, w: np.ndarray, pos: np.ndarray) -> np.ndarray:
@@ -107,9 +110,10 @@ def _run(fused: FusedOperator, params: dict[str, int], G: np.ndarray) -> None:
     fused.sync_scratch_from_device()
 
 
-def test_attn_prep() -> None:
+@pytest.mark.parametrize("size", ["9B", "1B"])
+def test_attn_prep(size: str) -> None:
     T, n2 = 64, 45
-    s = _Setup("9B", T, n2)
+    s = _Setup(size, T, n2)
     op, fused = _prep_fused(s)
     qc, hd = s.qc, AT.HD
     for t0, n in [(0, T), (T, n2)]:
@@ -126,19 +130,19 @@ def test_attn_prep() -> None:
         sg_want = 1 / (1 + np.exp(-np.asarray(qg[:, :, 1], np.float64))).transpose(1, 0, 2)
         assert np.abs(sg - sg_want).max() < 2 ** -8, t0
     # the cache: both chunks' positions of every KV head (K normed, rotated; V as stored)
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(4, -1, 3, 9280)
+    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
     pos = np.arange(T + n2)
-    kr = s.k[:T + n2].reshape(T + n2, 4, hd)
+    kr = s.k[:T + n2].reshape(T + n2, s.kvh, hd)
     k_want = s.nr(kr, s.kn, pos)
-    for h in range(4):
+    for h in range(s.kvh):
         K, V = KV.kv_from_groups(kv[h, :(T + n2 + 31) // 32], AT.HD)
         assert ref.rel_err(K[:T + n2], k_want[:, h]) < 2e-4, h
         assert ref.rel_err(V[:T + n2], s.v[:T + n2, 256 * h:256 * (h + 1)]) < 1e-2, h
-        k_gold = np.asarray(s.gold["Kcur.1", s.L], np.float32).reshape(-1, 4, hd)[:T + n2, h]
+        k_gold = np.asarray(s.gold["Kcur.1", s.L], np.float32).reshape(-1, s.kvh, hd)[:T + n2, h]
         assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
 
 
-@pytest.mark.parametrize("size", ["9B", "27B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_attn_prefill(size: str) -> None:
     """AttnPrep then PrefillAttn (one fused runlist) over two chunks: the output panels against the exact attention
     of the cores' own operands (their Q panels, the cache they wrote, their sigmoid(gate): within 0.7%, the bfp16
@@ -161,15 +165,18 @@ def test_attn_prefill(size: str) -> None:
         slots = fused.get_buffer("QS").view(torch.uint8).numpy().reshape(COLS, T // 8, 2, qc, AP.SLOT)
         q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
-        kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(4, -1, 3, 9280)
+        kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
         want = np.zeros((n, H, hd))
-        for h in range(4):
+        for h in range(s.kvh):
             K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD))
-            for g in range(H // 4 * h, H // 4 * (h + 1)):
+            for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
                 sc = q[g].astype(np.float64) @ K.T / 16
                 sc[np.arange(t0, t0 + n)[:, None] < np.arange(t0 + n)[None]] = -np.inf
                 pr = np.exp(sc - sc.max(-1, keepdims=True))
                 want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
-        assert ref.rel_err(A, want) < 1e-2, t0
+        # (1B: a peakier softmax, its largest P 0.45 on average (9B 0.28): single V rows carry more of an output, the
+        # largest error ~2 ULPs of a bfp16 block; the rms error as the 9B's)
+        assert ref.rel_err(A, want) < (1.5e-2 if size == "1B" else 1e-2), t0
+        assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2, t0
         gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[t0:t0 + n]
         assert ref.rel_err(A, gold) < 3e-2, t0

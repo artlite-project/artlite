@@ -44,6 +44,10 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "gate_up", 256), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "down", 256),
          ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 8, "down", 64), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 3, "attn_in", 64),
          ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 3, "attn_out", 256),
+         ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gdn_in", 256), ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gdn_out", 64),
+         ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gate_up", 256), ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "down", 256),
+         ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "down", 64), ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "attn_in", 256),
+         ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "attn_out", 64),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "qkv", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 256),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "o", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "o", 256),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "down", 288),
@@ -89,11 +93,12 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
     return plan_gemm(img, region, T, pitch=pitch)
 
 
-def _rows(img: object, tensors: tuple[str, ...], rows: np.ndarray) -> torch.Tensor:
+def _rows(img: object, tensors: tuple[str, ...], rows: np.ndarray, K: int = 0) -> torch.Tensor:
     """Dequantized rows of the stacked tensors as the image holds them (Llama's Q / K rows in rotate-half order, Gemma's
-    proj in its slotted copy)."""
+    proj in its slotted copy; K: zero columns past the tensors' up to K, a K padded to whole chunks)."""
     w = torch.cat([img.tensor(t).dequantize().float().reshape(img.tensor(t).rows, -1) for t in tensors])
-    return w[torch.from_numpy(rows)]
+    w = w[torch.from_numpy(rows)]
+    return torch.nn.functional.pad(w, (0, max(K - w.shape[1], 0)))
 
 
 def _run(op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a_off: int = 0) -> torch.Tensor:
@@ -118,8 +123,9 @@ def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
 
 
 def _tol(K: int) -> float:
-    """The weights dequantized to bfp16 panels, C rounded to bf16 after each 64-k tile: ~2^-9 sqrt(K / 64)."""
-    return 1.35 * 2 ** -9 * (K / 64) ** 0.5
+    """C rounded to bf16 after each 64-k tile: ~2^-9 sqrt(K / 64); the weights dequantized to bfp16 panels: a floor
+    whatever K (Q4_K: ~1.1% at K = 1024, MiniCPM-V's input projections), the bound's at K = 2048."""
+    return 1.35 * 2 ** -9 * (max(K, 2048) / 64) ** 0.5
 
 
 @pytest.mark.parametrize(("model", "quant", "size", "layers", "layer", "phase", "T"), CASES,
@@ -156,7 +162,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         h8 = cfg.hidden_size // COLS
         cols = np.concatenate([pitch_c + np.arange(h8) for pitch_c in PG.d_pitch(img, T) * np.arange(COLS)])
         rows = np.concatenate([b.rows[c][b.rows[c] >= 0] for c in range(COLS)])
-        want = Aq[:T] @ _rows(img, b.tensors, rows).T
+        want = Aq[:T] @ _rows(img, b.tensors, rows, K).T
         assert _rel(C[:, cols], want) < _tol(K)
         return
     lay = pp.layout

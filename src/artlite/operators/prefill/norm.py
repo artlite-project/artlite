@@ -32,7 +32,8 @@ w1, row 2 the hi / lo bits of s) are d's first object.
 with xn as panels.
 
 ``cols`` cores (one per column), 8 tokens per step: core c takes token groups c, c + cols, ...
-Per group, pass A streams x (and delta) in chunks of 8 tokens x 256 columns, keeps x (+ delta)
+Per group, pass A streams x (and delta) in chunks of 8 tokens x ``ch`` columns (256; E / 8 below 2048: the norm weight
+is one chunk-sized object of the x stream), keeps x (+ delta)
 in the group's x_out object (16 E bytes, the buffer of pass B) and sums the squares; pass B
 gathers 8 x 8 panels, multiplies by w and 1 / rms (bf16 hi + lo) and converts them to
 bfp16. The norm weight is the first object of the x stream.
@@ -70,7 +71,7 @@ from ..gemm.gemm_q import chained_fill
 from ..kernel_source import kernel_prefix
 from ..util import Attr, bf16_value, regions
 
-CH = 256  # columns per chunk (PrefillNormOperator)
+CH = 256  # columns per chunk (PrefillNormOperator; E / 8 for E < 2048)
 
 _SRC = JINJA_ENV.from_string(r"""
 namespace {
@@ -430,6 +431,8 @@ class PrefillNormOperator(ArtcOperator):
                                  and self.deltas * HG * E * 2 + 2 * E // 8 * 72 <= 500 * 1024), (T, E, deltas, cols)
         self.d_stride = d_stride or T * COLS * self.d_pitch
         assert self.d_stride >= T * COLS * self.d_pitch and (self.deltas >= 2 or not d_stride)
+        self.ch = min(CH, E // 8)  # (columns per chunk)
+        assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
         super().__init__()
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -449,7 +452,7 @@ class PrefillNormOperator(ArtcOperator):
         if self.hold:
             return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
         # (the same source for add and no add: one copy in a fused ELF)
-        return _SRC.render(p=self.p, E=self.E, C=CH, eps=repr(self.eps), replay=self.replay)
+        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay)
 
     def get_mlir_artifact(self) -> Module:
         if self.hold:
@@ -460,9 +463,10 @@ class PrefillNormOperator(ArtcOperator):
         EMB, p = self.E, self.p
         n_g = T // (8 * self.cols)  # token groups per core
         bf = np.dtype[bfloat16]
+        CH = self.ch
         chunk_ty = np.ndarray[(8 * CH,), bf]
         grp_ty = np.ndarray[(8 * EMB,), bf]
-        pan_ty = np.ndarray[(CH // 8 * 36,), bf]  # 32 panels of 72 B
+        pan_ty = np.ndarray[(CH // 8 * 36,), bf]  # CH / 8 panels of 72 B
         w_ty = np.ndarray[(EMB,), bf]
         st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
         E = EMB

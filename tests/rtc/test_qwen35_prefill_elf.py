@@ -16,7 +16,7 @@ from . import qwen35_ref as ref
 from .common import essay
 
 
-@pytest.mark.parametrize("size", ["9B", "27B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_prefill_slice(size: str) -> None:
     from artlite.operators.qwen35.overlay import QwenOverlay
     from artlite.operators.qwen35.prefill import QwenPrefill
@@ -61,6 +61,7 @@ def test_prefill_slice(size: str) -> None:
           f"{np.mean(err[256:n1]):.4f}, chunk 2 mean {np.mean(err[n1:]):.4f}); decode after the prefill "
           f"{np.mean(cont):.4f}, decode only {np.mean(dec):.4f}")
     # (the prefill GEMMs multiply bfp16 activations by the weights dequantized to bfp16: ~1.4% rms per projection vs
-    # the decode GEMV's bf16 x; 9B: mean 1.0%, max 6.3% at token 0, an outlier dimension cancelling in layer 19)
-    assert np.max(err) < 8e-2 and np.mean(err) < 1.5e-2
+    # the decode GEMV's bf16 x; 9B: mean 1.0%, max 6.3% at token 0, an outlier dimension cancelling in layer 19; 1B:
+    # llama.cpp's own noise is ~3x the 9B's, the decode path's error 1.5%, the prefill's 1.7%)
+    assert np.max(err) < 8e-2 and np.mean(err) < max(1.5e-2, 1.3 * np.mean(dec))
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3

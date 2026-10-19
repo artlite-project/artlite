@@ -138,7 +138,8 @@ class QwenPrefill(ChunkPrefill):
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
         cfg, H = self.cfg, self.H
-        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "Y": 2 * COLS * self.d_pitch, "HP": 9 * cfg.intermediate_size // 8,
+        kd = self.img.region(self.layers[0], "down").K  # (down's K: the ffn padded to whole K chunks)
+        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "Y": 2 * COLS * self.d_pitch, "HP": 9 * kd // 8,
                    "F": 2 * COLS * self.d_pitch, "PM": 4}
         self.rb_g = {k: 2 * COLS * p for k, p in self.pitch.items()}  # (gdn_in / attn_in rows)
         self.rb_a = {"gdn_in": 9 * cfg.ssm_v_heads * GD.D // 8, "attn_in": 9 * cfg.num_attention_heads * AP.HD // 8}
@@ -167,7 +168,7 @@ class QwenPrefill(ChunkPrefill):
                    for g in p_in.gemms for j in range(S)]
             if cfg.attention[L]:
                 prep, attn = self._prep(p_in.layout, T), self.attn[T]
-                kv0, hb = ov.kv_off[L], 4 * ov.ash.head_bytes
+                kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
                 qs_g = 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots)
                 grp = SUB // 32 * AP.GROUP  # (a sub-chunk's cache groups)

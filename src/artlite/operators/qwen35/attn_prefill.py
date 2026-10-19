@@ -1,19 +1,21 @@
 """The prefill of the qwen35 full-attention layers: a T-token chunk at position p0 (a multiple of 32) from the attn_in
-GEMMs' output G (``prefill.gemm``: per column [q + gate of its QC heads | K half | V half]) to the attn_out GEMM's A.
+GEMMs' output G (``prefill.gemm``: per column [q + gate of its QC heads | K part | V part]: KV head h's dims in the NPH
+= 8 / KV heads columns NPH h ..) to the attn_out GEMM's A.
 
 ``AttnPrepOperator``: per column c, cores 2 .. 1 + QC one per q head (the column's heads QC c ..), core 2 + QC the
 column's KV role. Per 8 tokens a Q core turns its head's rows into the attention's operands: q / rms(q) q_norm, the
 NeoX rotation of dims 0 .. 63, x log2(e) / 16 (scores in log2 units), as bfp16 panels of 8 queries x 8 dims, per d-block
 hi then lo (4608 B), then sigmoid(gate) (256 bf16 per query, padded to 4608 B). QS holds per column and token group
 [the column's heads' Q panels | their sigmoid(gate)] (``SLOT`` bytes per head each).
-The KV core of column c < 4 writes K head c (rms(k) k_norm, rotated) as hi + lo records, of column c >= 4 V head
-c - 4 as records of blocks over the 8 positions, in the decode's cache layout (``overlay.kv``): the chunk's
-groups from p0 / 32 on (scratchpad parameter ``QA_KV``), so the decode continues from them. cos / sin of the
+The 2 x KV heads jobs of the KV cores (``AttnPrepOperator.kv_job``: one every 8 / (2 KV heads) columns; 9B / 27B every
+column, MiniCPM-V every other): K head h (rms(k) k_norm, rotated) as hi + lo records, then V head h as records of blocks
+over the 8 positions, in the decode's cache layout (``overlay.kv``): the chunk's groups from p0 / 32 on (scratchpad
+parameter ``QA_KV``), so the decode continues from them. cos / sin of the
 positions from a table of every position (``cs_table``; parameter ``QA_CS``).
 
 ``PrefillAttnOperator``: per column 4 cores, passes of 32 queries; core r takes queries 8 r .. of the pass for each of the
 column's heads (QC row panels: an O of QC x 8 KB) and streams the cache groups up to the pass's (the KV head's stream
-broadcast to the 8 cores of its two columns): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
+broadcast to the 4 NPH cores of its columns): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
 products: one loop, the KV head's memtile re-lays each record per d-block, [K hi | K lo] and the V object's two
 records), per group of 32 positions the softmax (a row's maximum is raised, rescaling o and l, only when the group's
 exceeds it by 2^16: the per-dimension norm weights leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2
@@ -218,18 +220,20 @@ class AttnPrepOperator(ArtcOperator):
     """The attention prep of a chunk (module docstring). Runtime sequence: G (attn_in's output, ``layout``), CS (the
     ``cs_table`` of every position, as bf16 pairs), NRM (q_norm | k_norm fp32), QS (per column, token group and head
     a ``SLOT``; ``qs_T``: the tokens of a column's part, default T: a sub-chunk's part of a longer chunk's QS), KV (one
-    layer's cache: 4 heads of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 p0, ``QA_KV`` = GROUP / 2 *
-    p0 / 32 (``params``)."""
+    layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 p0, ``QA_KV`` = GROUP /
+    2 * p0 / 32 (``params``)."""
 
     STACK = 3072
     pfx = kernel_prefix("qap")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int,
                  qs_T: int = 0):
-        assert cfg.head_dim == HD and cfg.num_key_value_heads * 2 == COLS and cfg.rope_dims == 2 * AT.ROT
+        self.kvh = cfg.num_key_value_heads
+        assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0 and T // 8 <= 64, "whole cache groups; a BD repeats at most 64 times"
         assert {"q", "k", "v"} <= set(layout.off)
         self.T, self.cfg, self.layout = T, cfg, layout
+        self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
         self.qc = cfg.num_attention_heads // COLS
         assert 1 <= self.qc <= 3, "a core per q head and the KV core in a column"
         self.head_bytes, self.cs_positions = head_bytes, cs_positions
@@ -246,13 +250,21 @@ class AttnPrepOperator(ArtcOperator):
         return _PREP.render(p=p, HD=HD, ND=ND, w=Attr(self.workspace()), eps=repr(self.cfg.rms_norm_eps), qs=qs,
                             AT_REC_K=AT.REC_K)
 
+    def kv_job(self, c: int) -> tuple[str, int] | None:
+        """Column c's KV core's job: ("k" or "v", the KV head), or None (one every COLS / (2 KV heads) columns)."""
+        step = COLS // (2 * self.kvh)
+        if c % step:
+            return None
+        j = c // step
+        return ("k" if j < self.kvh else "v"), j % self.kvh
+
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
         return [ArgSpec("in", (T * self.layout.N,), torch.bfloat16),
                 ArgSpec("in", (self.cs_positions * 128,), torch.bfloat16),
                 ArgSpec("in", (2 * HD * 2,), torch.bfloat16),
                 ArgSpec("out", (self.n_qs,), torch.bfloat16),
-                ArgSpec("out", (4 * self.head_bytes // 2,), torch.bfloat16)]
+                ArgSpec("out", (self.kvh * self.head_bytes // 2,), torch.bfloat16)]
 
     @property
     def n_qs(self) -> int:
@@ -272,6 +284,8 @@ class AttnPrepOperator(ArtcOperator):
         row_ty = np.ndarray[(8 * 2 * HD,), bf]  # 8 rows of [q | gate]
         kv_ty = np.ndarray[(8 * HD,), bf]  # 8 rows of a KV head
         in_ty = np.ndarray[(qc * 8 * 2 * HD + 8 * HD,), bf]
+        inq_ty = np.ndarray[(qc * 8 * 2 * HD,), bf]  # (a column without a KV job)
+        jobs = {c: self.kv_job(c) for c in range(COLS) if self.kv_job(c) is not None}
         cs_ty = np.ndarray[(8 * 128,), bf]  # 8 positions x 64 fp32 (the norms: 512 fp32)
         slot_ty = np.ndarray[(SLOT // 2,), bf]
         qs_ty = np.ndarray[(qc * SLOT // 2,), bf]
@@ -286,15 +300,15 @@ class AttnPrepOperator(ArtcOperator):
         p_cs, p_kv = ScratchpadParameter(QA_CS, np.int32), ScratchpadParameter(QA_KV, np.int32)
         n_tg = T // 8
 
-        a3 = [ObjectFifo(in_ty, name=f"qp_a{c}", depth=2) for c in range(COLS)]
-        a1 = [a3[c].cons().split([8 * 2 * HD * h for h in range(qc)] + [qc * 8 * 2 * HD], tile=Tile(c, 1),
-                                 depths=[2] * (qc + 1), obj_types=[row_ty] * qc + [kv_ty],
-                                 names=[f"qp_ah{c}_{h}" for h in range(qc + 1)]) for c in range(COLS)]
+        a3 = [ObjectFifo(in_ty if c in jobs else inq_ty, name=f"qp_a{c}", depth=2) for c in range(COLS)]
+        a1 = [a3[c].cons().split([8 * 2 * HD * h for h in range(qc + (c in jobs))], tile=Tile(c, 1),
+                                 depths=[2] * (qc + (c in jobs)), obj_types=[row_ty] * qc + [kv_ty] * (c in jobs),
+                                 names=[f"qp_ah{c}_{h}" for h in range(qc + (c in jobs))]) for c in range(COLS)]
         b = [ObjectFifo(cs_ty, name=f"qp_b{c}", depth=2) for c in range(COLS)]
         o3 = [ObjectFifo(qs_ty, name=f"qp_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([SLOT // 2 * h for h in range(qc)], tile=Tile(c, 1), depths=[2] * qc,
                                 obj_types=[slot_ty] * qc, names=[f"qp_oh{c}_{h}" for h in range(qc)]) for c in range(COLS)]
-        k = [ObjectFifo(kr_ty if c < 4 else vr_ty, name=f"qp_k{c}", depth=2) for c in range(COLS)]
+        k = {c: ObjectFifo(kr_ty if jobs[c][0] == "k" else vr_ty, name=f"qp_k{c}", depth=2) for c in jobs}
 
         def core(a_h, b_h, o_h, prm, fn, ws, sg=None):
             for _ in forever_():
@@ -319,35 +333,42 @@ class AttnPrepOperator(ArtcOperator):
 
         workers = []
         for c in range(COLS):
-            for h in range(qc + 1):
+            for h in range(qc + (c in jobs)):
                 ws = Buffer(ws_ty, name=f"qp_ws{c}_{h}")
                 if h < qc:
                     fn, args = core_q, [a1[c][h].cons(), b[c].cons(), o1[c][h].prod(), k_prm, k_q, k_sg, ws]
                 else:
-                    fn, args = core, [a1[c][h].cons(), b[c].cons(), k[c].prod(), k_prm, k_k if c < 4 else k_v, ws]
+                    fn, args = core, [a1[c][h].cons(), b[c].cons(), k[c].prod(), k_prm,
+                                      k_k if jobs[c][0] == "k" else k_v, ws]
                 workers.append(Worker(fn, args, tile=Tile(c, 2 + h), stack_size=self.STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
-        n_cs, n_kv = self.cs_positions * 128, 4 * self.head_bytes // 2
+        n_cs, n_kv = self.cs_positions * 128, self.kvh * self.head_bytes // 2
+        nph, per = self.nph, self.per
         n_qs, qs_col = self.n_qs, self.qs_T // 8 * 2 * qc * SLOT // 2
         hb, g2, o2 = self.head_bytes // 2, GROUP // 2, 9280 // 2
 
-        def seq(G, CS, NRM, QS, KV, ah, bh, oh, kh):
+        def seq(G, CS, NRM, QS, KV, ah, bh, oh, khs):
+            kh = dict(zip(k, khs))
             sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
-                h = c % 4  # the KV head of the column's role (K for c < 4, V)
-                src = lay.off["k"] if c < 4 else lay.off["v"]
-                chained_fill(ah[c], G, [
-                    TensorAccessPattern((T * N,), c * pitch + lay.off["q"], [n_tg, qc, 8, 2 * HD], [8 * N, 2 * HD, N, 1]),
-                    TensorAccessPattern((T * N,), 2 * h * pitch + src, [n_tg, 8, 2, HD // 2], [8 * N, N, pitch, 1])],
-                    tg)
+                taps = [TensorAccessPattern((T * N,), c * pitch + lay.off["q"], [n_tg, qc, 8, 2 * HD],
+                                            [8 * N, 2 * HD, N, 1])]
+                if c in jobs:  # (the KV head's rows: its dims in its NPH columns)
+                    kind, h = jobs[c]
+                    taps.append(TensorAccessPattern((T * N,), nph * h * pitch + lay.off[kind], [n_tg, 8, nph, per],
+                                                    [8 * N, N, pitch, 1]))
+                chained_fill(ah[c], G, taps, tg)
                 bh[c].fill(NRM, TensorAccessPattern((2 * HD * 2,), 0, [1, 1, 1, 2 * HD * 2], [0, 0, 0, 1]), group=tg)
                 bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 128], [0, 0, 0, 1]), offset_parameter=p_cs,
                            group=tg)
                 oh[c].drain(QS, TensorAccessPattern((n_qs,), c * qs_col, [1, 1, 1, n_tg * qc * SLOT], [0, 0, 0, 1]),
                             group=tg, wait=True)
+                if c not in jobs:
+                    continue
+                kind, h = jobs[c]
                 # (rows of 576 elements: a shim BD's inner dimension is at most 1023 words)
-                if c < 4:  # records 4 i .. 4 i + 3 of the chunk: K objects 3 (g + i), 3 (g + i) + 1, two records each
+                if kind == "k":  # records 4 i .. 4 i + 3 of the chunk: K objects 3 (g + i), 3 (g + i) + 1, two records each
                     tap = TensorAccessPattern((n_kv,), h * hb, [T // 32, 2, 8, 576], [g2, o2, 576, 1])
                 else:  # V object 3 (g + i) + 2: its 4 records
                     tap = TensorAccessPattern((n_kv,), h * hb + 2 * o2, [1, T // 32, 8, 576], [0, g2, 576, 1])
@@ -359,7 +380,7 @@ class AttnPrepOperator(ArtcOperator):
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(k)]])
+                           [f.cons(tile=Tile(c, 0)) for c, f in k.items()]])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
 
@@ -570,9 +591,9 @@ void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h,
 
 class PrefillAttnOperator(ArtcOperator):
     """Causal attention of a T-token chunk at p0 (module docstring) on the cache that already holds the chunk's K and V
-    (``AttnPrepOperator``). Column c (q heads QC c .., KV head c // 2), core row r; passes of 32 queries: in pass b
+    (``AttnPrepOperator``). Column c (q heads QC c .., KV head c // NPH), core row r; passes of 32 queries: in pass b
     the core takes the 8 queries 32 b + 8 r .. of each of the column's heads (QC row panels), streams the cache groups
-    0 .. p0 / 32 + b (the KV head's stream broadcast to the 8 cores of its two columns) and writes their outputs as the
+    0 .. p0 / 32 + b (the KV head's stream broadcast to the 4 NPH cores of its columns) and writes their outputs as the
     attn_out GEMM's A panels. Runtime sequence: QS (the prep's), KV (one layer's cache), A (T x heads x 256 as bfp16
     panels [T / 8][heads x 32]). Parameters ``QA_N`` = p0 / 32 + 1 (the history groups every pass streams first, and the
     cores' trip count), ``QA_OFF``: the bf16 offset of the chunk's second group (``params``)."""
@@ -582,9 +603,11 @@ class PrefillAttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = ()):
         """``ablate`` (timing experiments, wrong results): kernel bodies compiled out ("qk", "soft", "pv")."""
-        assert cfg.head_dim == HD and cfg.num_key_value_heads * 2 == COLS
+        self.kvh = cfg.num_key_value_heads
+        assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0 and T // 32 <= 64
         self.T, self.cfg, self.head_bytes = T, cfg, head_bytes
+        self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
         self.H = cfg.num_attention_heads
@@ -604,7 +627,7 @@ class PrefillAttnOperator(ArtcOperator):
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
         return [ArgSpec("in", (COLS * T // 8 * 2 * self.qc * SLOT // 2,), torch.bfloat16),
-                ArgSpec("in", (4 * self.head_bytes // 2,), torch.bfloat16),
+                ArgSpec("in", (self.kvh * self.head_bytes // 2,), torch.bfloat16),
                 ArgSpec("out", (T * self.H * HD * 9 // 16,), torch.bfloat16)]
 
     def params(self, p0: int) -> dict[str, int]:
@@ -633,9 +656,11 @@ class PrefillAttnOperator(ArtcOperator):
                                  obj_types=[q_ty] * 4, names=[f"pa_qr{c}_{r}" for r in range(4)]) for c in range(COLS)]
         # the KV head's records through its memtile, each re-laid per d-block ([hi | lo] of a K record, the two records
         # of a V object): one panel stream in the kernels' loops
-        kv3 = [ObjectFifo(kv_ty, name=f"pa_ks{h}", depth=2) for h in range(4)]
+        nph, n_kvh = self.nph, self.kvh
+        kv3 = [ObjectFifo(kv_ty, name=f"pa_ks{h}", depth=2) for h in range(n_kvh)]
         ilv = stream_walk(AT.REC_K // 2, [(ND, 36), (2, ND * 36), (36, 1)])
-        kv = [kv3[h].cons().forward(tile=Tile(2 * h, 1), depth=2, name=f"pa_kv{h}", to_stream=ilv) for h in range(4)]
+        kv = [kv3[h].cons().forward(tile=Tile(nph * h, 1), depth=2, name=f"pa_kv{h}", to_stream=ilv)
+              for h in range(n_kvh)]
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
@@ -665,12 +690,12 @@ class PrefillAttnOperator(ArtcOperator):
                         o_h.release(1)
                     q_h.release(1)
 
-        workers = [Worker(core, [q1[c][r].cons(), kv[c // 2].cons(), o1[c][r].prod(), k_init, k_qk, k_soft, k_pv, k_fin,
+        workers = [Worker(core, [q1[c][r].cons(), kv[c // nph].cons(), o1[c][r].prod(), k_init, k_qk, k_soft, k_pv, k_fin,
                                  Buffer(ws_ty, name=f"pa_ws{c}_{r}"), p_n, r],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs = COLS * T // 8 * 2 * qc * SLOT // 2
-        n_kv, n_a = 4 * self.head_bytes // 2, T * H * HD * 9 // 16
+        n_kv, n_a = n_kvh * self.head_bytes // 2, T * H * HD * 9 // 16
         hb, sl = self.head_bytes // 2, SLOT // 2
 
         def seq(QS, KV, A, qh, kvh, oh):
@@ -686,7 +711,7 @@ class PrefillAttnOperator(ArtcOperator):
             inflight = []  # (a pass's fills hold 2 of the shim tile's 16 BDs: at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
-                for h in range(4):  # the history (QA_N groups), then the chunk's groups before the pass's
+                for h in range(n_kvh):  # the history (QA_N groups), then the chunk's groups before the pass's
                     kvh[h].fill(KV, TensorAccessPattern((n_kv,), h * hb, [1, 3, 4, 1152], [0, 4640, 1152, 1]),
                                 length_parameter=p_n, group=tp, wait=not b)
                     if b:
@@ -701,7 +726,7 @@ class PrefillAttnOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(q3)],
-                           [f.prod(tile=Tile(2 * h, 0)) for h, f in enumerate(kv3)],
+                           [f.prod(tile=Tile(nph * h, 0)) for h, f in enumerate(kv3)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()

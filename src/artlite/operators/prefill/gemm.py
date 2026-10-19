@@ -13,7 +13,8 @@ the image) and the layout of their output (``Layout``):
 - output projections (``OUT``: into the residual stream): column c's rows (hidden / 8) at c d_pitch (``d_pitch``: one
   pitch for every layer, the residual add reads it);
 - gate_up: act(gate) up as bfp16 panels (the down projection's A; ``act``: silu, or gelu for Gemma), column c's
-  outputs (ffn / 8) at their place.
+  outputs (ffn / 8) at their place, in rows of the down projection's K (the ffn padded to whole K chunks: MiniCPM-V's
+  3584 in rows of 4096, the padding columns never written: zero).
 
 A run of consecutive blocks of one tile format is one GEMM: Q4_K and BFP16 tile-major (64-row passes, GemmQ or GemmQd),
 planar tiles (Q5_K / Q6_K, Gemma's Q4_0 of 32 rows x 512 columns, ...: ``gemm_qd.choose_planar_plan``). Limits of a
@@ -237,7 +238,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         for i in range(ng):  # (GEMMs of consecutive passes)
             p0, p1 = passes * i // ng, passes * (i + 1) // ng
             oc = [[ffn * c + width * p for p in range(p0, p1)] for c in range(COLS)]
-            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": image.cfg.intermediate_size, "tile_bytes": S,
+            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": -(-ffn * COLS // KC) * KC, "tile_bytes": S,
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
                   "blocks": ((tp * p0, p1 - p0),)}
