@@ -84,6 +84,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |
 | `src/artlite/operators/sd15/` | the SD 1.5 UNet step as one dispatch of a static design (host-built transactions, core roles as code pages the cores load): the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`); the VAE decoder on the same design (`vae.py`) |
+| `src/artlite/operators/vision/` | vision encoders on sd15's design: MiniCPM-V 4.7's (`minicpmv.py`: the whole encoder per dispatch, ``Encoder``) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |

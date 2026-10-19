@@ -155,6 +155,13 @@ class Builder:
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
 
+    def fork(self) -> "Builder":
+        """A builder of another dispatch on the same device that shares this one's DDR images (weights, commands,
+        tables: written once, the same names in both)."""
+        b = Builder(self.npu)
+        b.tables, b._images, b._ddr, b._gemm_images = self.tables, self._images, self._ddr, self._gemm_images
+        return b
+
     # -- DDR images
     def image(self, name: str, data: np.ndarray) -> int:
         """A persistent DDR buffer holding ``data``; returns its device address. A name may be imaged again with the

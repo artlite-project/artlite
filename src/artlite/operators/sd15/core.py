@@ -41,7 +41,8 @@ core copies it into its workspace and releases the slot. Kinds:
   pairs (m 16 npair); K is given back before V is taken (the next K arrives during P V^T). The softmax: the reference
   max of each query from the first group (with C_RAISE raised, O and l rescaled, where a later group's scores exceed
   it by 2^16: attention sinks; else never, P saturating at 2^63 above it; q pre-scaled by log2 e / sqrt d), P = 2^(s - m) to 0.59 bf16 ULP, l = the row sums of the bfp16 P;
-  out: O / l as panels [query panel][d-block].
+  out: O / l as panels [query panel][d-block]. A group whose keys are all masked (C_KMASK) is streamed and skipped
+  (the first group computed sets the reference max).
 
 Statistics records (``REC`` bytes, an output chunk): GroupNorm [image 2][S1, S2][16 groups] fp32 of groups of C_GSIZE
 channels counted from C_G0 (the core's first output channel C_CH0 + its passes); LayerNorm [S1 m | S2 m] fp32.
@@ -986,18 +987,20 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 128 * nd * npair);
     {{ p }}_zero((int32_t *)l, 128 * npair);
+    int first = 1;  // (no group computed yet: the next one sets the reference max)
     for (int g = 0; g < ng; g++) {  // (K given back before V is taken: the next K arrives during the PVs)
       int32_t *k = {{ p }}_take_b(s);
+      const int live = km[2 * g] != 0 || (!d160 && km[2 * g + 1] != 0);  // (a group of masked keys only: streamed, skipped)
 {% if win == "aqk" %}
       event0();
 {% endif %}
-      for (int pr = 0; pr < npair; pr++) {
+      for (int pr = 0; live && pr < npair; pr++) {
         int32_t *qa = {{ p }}_aw(q, {{ A_OBJ // 8 }} * pr);
         float *sm = (float *)(q + (36 * nd + 15) / 16 * 16);  // (64-B aligned: the 2048-bit stores' unit)
         bfp16ebs8 *pp = (bfp16ebs8 *)(d160 ? s.s1 + {{ 8 * 18 }} * pr : (pr ? s.s1 : s.s0));
         {{ p }}_attn_qk<{{ QS }}>(qa, k, sm, nkp / 2, nd);
         {{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, km + 2 * g, nkp, o + 128 * nd * pr, nd,
-                                         g == 0, ws[{{ C_RAISE }}]);
+                                         first, ws[{{ C_RAISE }}]);
       }
 {% if win == "aqk" %}
       event1();
@@ -1007,7 +1010,9 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
 {% if win == "apv" %}
       event0();
 {% endif %}
-      if (d160)
+      if (!live)
+        ;
+      else if (d160)
         {{ p }}_attn_pv((const bfp16ebs8 *)s.s1, v, o, npair);
       else
         for (int pr = 0; pr < npair; pr++)
@@ -1016,6 +1021,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
       event1();
 {% endif %}
       {{ p }}_give_b(s, v);
+      first &= !live;
     }
     {{ p }}_give_a(s, q);
 {% if win == "afin" %}

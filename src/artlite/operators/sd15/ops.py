@@ -701,7 +701,10 @@ class Attention:
     image's token panels in a column are 2 apart. Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last
     group's keys from nkeys masked). d 40: a key group's K and V^T in one slot. raise_max: every key group checks the
     softmax's reference max (raised past an attention sink; d 80 / 160), else the first group's. valid (d 80 / 160): per
-    image a boolean array over its keys in the slots' order, the others masked (default: the first nkeys, or all)."""
+    image a boolean array over its keys in the slots' order, the others masked (default: the first nkeys, or all).
+    joint (d 80 / 160 self-attention): the images' keys one sequence (an entry over both images of its bands: MiniCPM-V's
+    lone entries): image 1's groups after image 0's in one slot region, which both images' units stream (valid: per
+    image over that sequence)."""
 
     np: int
     q: int
@@ -715,6 +718,7 @@ class Attention:
     raise_max: bool = False
     heads: int = 8
     valid: tuple | None = None
+    joint: bool = False
 
     def __post_init__(self) -> None:
         assert self.d in (40, 80, 160) and len(self.rows) in (2, 4) and (self.heads == 8 or self.d == 80 and self.heads == 16)
@@ -728,7 +732,11 @@ class Attention:
         self.slots = 1 if self.d == 40 else 2  # (B slots of a key group)
         assert 8 * self.tile < self.np and (self.d != 40 or (self.kpi, self.tile) == (16, 0))
         keys = 8 * COLS * self.kpi * self.nbands
-        self.ng = -(-(self.nkeys or keys) // (8 * self.gk))  # (key groups of an image)
+        self.ng = -(-(self.nkeys or keys) // (8 * self.gk))  # (key groups of an image; joint: of both)
+        self.ngi = self.ng  # (an image's own groups: the second image's first in the joint sequence)
+        if self.joint:
+            assert self.d != 40 and not self.nkeys
+            self.ng *= 2
         self.nk = self.nkeys - 8 * self.gk * (self.ng - 1) if self.nkeys else 8 * self.gk
         assert self.kpc in (1, 4, 16) and (self.d == 160 or self.kpc >= 4), self.np
         assert self.q + (((self.heads - 1) * self.nd + (8 if self.d == 40 else 32)) * self.np + 8) * L.PANEL <= D.HEAP, \
@@ -790,12 +798,13 @@ class Attention:
     def row_ops(self, cmd: int) -> dict[int, RowOps]:
         """The attention rows' B streams: the command, then per image its units' K / V^T slots (contiguous)."""
         unit, h = self.ng * self.slots * D.Q, self.hpr
-        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (self.heads * img + h * i) * unit, h * unit) for img in range(2)],
+        return {r: RowOps(runs=[(cmd, D.Q)] + [(self.kv + (self.heads * img * (not self.joint) + h * i) * unit, h * unit)
+                                               for img in range(2)],
                           b_objects=1 + 2 * h * self.slots * self.ng, parity=self.kpc == 4, role=self.role)
                 for i, r in enumerate(self.rows)}
 
     def kv_bytes(self) -> int:
-        return 2 * self.heads * self.ng * self.slots * D.Q
+        return (1 if self.joint else 2) * self.heads * self.ng * self.slots * D.Q
 
     def kv_drains(self, k: int, vt: int, col: int, *, part: str = "kv", band: int = 0) -> ColOps:
         """Column ``col``'s drains of its keys' part of every slot (band ``band``'s: key panels kp0 .. of group g): from the
@@ -807,7 +816,7 @@ class Attention:
         co = ColOps()
         H = self.heads
         for img in range(2):
-            slot = self.kv + H * img * unit + g * self.slots * D.Q
+            slot = self.kv + (g + img * self.ngi if self.joint else H * img * self.ng + g) * self.slots * D.Q
             if self.d == 40:  # (the column's keys fill two groups: per head their K, their V^T parts of d-blocks 0..3
                 # ([d-block pair][key panel][2]) and of d-block 4 ([key panel])
                 assert self.kpi == 2 * self.gk
