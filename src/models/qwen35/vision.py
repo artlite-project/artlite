@@ -33,8 +33,8 @@ KEEP = 8  # images whose embeddings are kept
 
 
 class NpuVision:
-    """The vision encoder and projector of an mmproj file (projector ``minicpmv4_7``, 16x: the ViT merger) on the NPU;
-    ``max_slices``: an image's slices at most (default: the file's)."""
+    """The vision encoder and projector of an mmproj file (projector ``minicpmv4_7``: 16x, 64 tokens per slice, or 4x,
+    256) on the NPU; ``max_slices``: an image's slices at most (default: the file's)."""
 
     def __init__(self, path: str, *, max_slices: int | None = None):
         self.path = path
@@ -42,8 +42,6 @@ class NpuVision:
         self.clip = ClipConfig.from_gguf(self.gguf)
         if self.clip.projector != "minicpmv4_7":
             raise NotImplementedError(f"{path}: projector {self.clip.projector!r} (MiniCPM-V 4.7's minicpmv4_7 only)")
-        if self.clip.merger_layer < 0:
-            raise NotImplementedError(f"{path}: an mmproj without the ViT merger (the 4x file; the 16x one runs)")
         self.max_slices = max_slices or self.clip.max_slices
         self.sep = self.gguf.rows("v.tok_embd_sep", [0, 1, 2, 3]).numpy()
         self._kept: collections.OrderedDict[bytes, torch.Tensor] = collections.OrderedDict()

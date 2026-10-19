@@ -1,5 +1,5 @@
-"""MiniCPM-V 4.7's vision encoder (projector ``minicpmv4_7``: a SigLIP2 ViT of 27 layers, the ViT merger after layer 6,
-the final 2 x 2 merger) on sd15's static design (``operators.sd15``: one design for both models, its ops built by
+"""MiniCPM-V 4.7's vision encoder (projector ``minicpmv4_7``: a SigLIP2 ViT of 27 layers, the ViT merger after layer 6
+(the 16x file; the 4x file has none), the final 2 x 2 merger) on sd15's static design (``operators.sd15``: one design for both models, its ops built by
 host-built transactions).
 
 Channels: the hidden 1152 padded to ``C`` = 1280 (passes of 80 on 4 core rows): the residual's 1152 real channels,
@@ -619,25 +619,33 @@ def final_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]
     return w
 
 
-def final(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int) -> str:
-    """The final merger of ``POST``'s band (x, its records at rec; freed): post_ln (its panels back to C tiles by an
-    identity GEMM, to DDR), the band's 4 windows of each group as one tile of 16 merged tokens (5120 channels: a DDR
-    round trip of block copies), their records, LayerNorm(4608), up + GELU (erf), down -> the embeddings: DDR image
-    ``name.out`` ([col][16 x 1280 channels as C tiles of 16]; ``embeddings`` reads it)."""
-    lv, l16 = x.lv, vit_level(1, 16)
-    ct, ob, ct16 = lv.ct(C), L.ct_bytes(64), l16.ct(80)
-    n = alloc(bd, lv, C, "pn")
+def _post(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int) -> Tensor:
+    """post_ln of a band's C tiles x (its records at rec; x freed), its panels back to C tiles by an identity GEMM."""
+    n = alloc(bd, x.lv, C, "pn")
     ln(bd, x, n, w["post_g"], w["post_b"], name=name + ".post", rec=rec)
     free(bd, x)
-    y = alloc(bd, lv, C)
+    y = alloc(bd, x.lv, C)
     gemm(bd, n, w["eye"], None, name=name + ".eye", out=y)
     free(bd, n)
-    bd.op(_xfer(bd, f"{name}.p", ct, fill=False, mem=y.addr, nbytes=ct), {})
-    free(bd, y)
+    return y
+
+
+def _merged(bd: Builder, src: list[tuple[str, int]], name: str) -> Tensor:
+    """A tile of 16 merged tokens (5120 channels: C tiles of m 16) from 4 sources' token panels (DDR images of a band's
+    C tiles, ``src``: per source its image and its first of two token panels): block copies."""
+    l16, ct, ob = vit_level(1, 16), POST.ct(C), L.ct_bytes(64)
+    ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
     mc = alloc(bd, l16, MERGED)
-    fills = [_xfer(bd, f"{name}.p", ct, fill=True, mem=mc.addr + 16 * k * ct16, nbytes=16 * 2560, off=2 * k * 1280,
-                   mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)) for k in range(4)]
-    bd.op(bd.merge(*fills), {})
+    bd.op(bd.merge(*[_xfer(bd, img, ct, fill=True, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=tp * 1280,
+                           mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
+                     for s, (img, tp) in enumerate(src)]), {})
+    return mc
+
+
+def _final_mlp(bd: Builder, w: dict[str, torch.Tensor], name: str, mc: Tensor) -> Tensor:
+    """The final merger's MLP on a tile of 16 merged tokens (mc, freed): their records, LayerNorm(4608), up + GELU
+    (erf), down -> the embeddings' C tiles (m 16, 1280 channels: 1024 real)."""
+    l16 = mc.lv
     nl = alloc(bd, l16, MERGED, "pn")
     rec = bd.mem.alloc(ln_rec(l16))
     for h in range(2):  # (records over both copies; their panels into nl, overwritten by the LayerNorm)
@@ -659,30 +667,66 @@ def final(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: in
     e = alloc(bd, l16, C)
     gemm(bd, g, w["down"], w["down_b"], name=name + ".down", out=e)
     free(bd, g)
+    return e
+
+
+def final(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int) -> str:
+    """The final merger of ``POST``'s band (x, its records at rec; freed): post_ln (``_post``, to DDR), the band's 4
+    windows of each group as one tile of 16 merged tokens (``_merged``: a DDR round trip of block copies), the MLP
+    (``_final_mlp``) -> the embeddings: DDR image ``name.out`` ([col][16 x 1280 channels as C tiles of 16];
+    ``embeddings`` reads it)."""
+    y = _post(bd, w, name, x, rec)
+    bd.op(_xfer(bd, f"{name}.p", y.nbytes, fill=False, mem=y.addr, nbytes=y.nbytes), {})
+    free(bd, y)
+    e = _final_mlp(bd, w, name, _merged(bd, [(f"{name}.p", 2 * k) for k in range(4)], name))
+    l16 = e.lv
     bd.op(_xfer(bd, name + ".out", l16.ct(C), fill=False, mem=e.addr, nbytes=l16.ct(C)), {})
     free(bd, e)
     return name + ".out"
 
 
-def embeddings(npu: Sd15Device, image: str, entries: list[Entry]) -> list[torch.Tensor]:
-    """The final merger's output (``final``'s image) -> per placed entry its embeddings (groups, 1024) in raster order
-    of its final grid."""
+def final_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> str:
+    """The final merger of ``PRE``'s bands (the 4x file, without the ViT merger: an output token per window, its 4
+    tokens in bands 0 .. 3): per band post_ln (``_post``, to DDR); per merged tile k (window k of both images' groups:
+    token panels 2 k, 2 k + 1 of the bands) the 4 bands' rows as one tile of 16 merged tokens, the MLP -> the
+    embeddings: DDR image ``name.out`` ([col][tile 4][16 x 1280 channels as C tiles of 16])."""
+    p = DTensor(x.lv, C, name + ".p")
+    for s in range(4):
+        y = _post(bd, w, name, *x.load(bd, s))
+        p.store(bd, s, y, defer=False)
+    t16 = vit_level(1, 16).ct(C)
+    for k in range(4):
+        e = _final_mlp(bd, w, name, _merged(bd, [(p.band(s), 2 * k) for s in range(4)], name))
+        bd.op(_xfer(bd, name + ".out", 4 * t16, fill=False, mem=e.addr, nbytes=t16, off=k * t16), {})
+        free(bd, e)
+    return name + ".out"
+
+
+def embeddings(npu: Sd15Device, image: str, entries: list[Entry], merge: int = 4) -> list[torch.Tensor]:
+    """The final merger's output (``final``'s image; merge 2: ``final_bands``') -> per placed entry its embeddings
+    (tokens, 1024) in raster order of its final grid (merge 4: its groups; 2: its windows)."""
     l16 = vit_level(1, 16)
-    raw = npu.read(image, COLS * l16.ct(C)).reshape(COLS, -1)
-    tiles = torch.stack([L.from_ctiles(raw[c], 16, C, 16)[:, :OUT] for c in range(COLS)])  # ([col] (16 tokens: image
-    # 0's 8 lanes, then image 1's), 1024)
+    nt = 1 if merge == 4 else 4
+    raw = npu.read(image, COLS * nt * l16.ct(C)).reshape(COLS, nt, -1)
+    tiles = torch.stack([torch.stack([L.from_ctiles(raw[c, t], 16, C, 16)[:, :OUT] for t in range(nt)])
+                         for c in range(COLS)])  # ([col][tile] (16 tokens: image 0's 8 lanes, then image 1's), 1024)
     out = []
     for e in entries:
-        g = np.arange(e.groups)
-        img, col, lane = e._place(g)
-        out.append(tiles[col, 8 * img + lane])
+        if merge == 4:
+            img, col, lane = e._place(np.arange(e.groups))
+            out.append(tiles[col, 0, 8 * img + lane])
+        else:
+            _, col, k, lane, img = e.window_slots()
+            out.append(tiles[col, k, 8 * img + lane])
     return out
 
 
 def weights(get: Callable[[str], torch.Tensor], layers: int, insert: int) -> dict:
-    """Every padded weight of the encoder: "patch", per layer il its ``layer_weights``, "merger", "final"."""
-    return {"patch": patch_weights(get), "merger": merger_weights(get), "final": final_weights(get),
-            **{il: layer_weights(get, il) for il in range(layers)}, "insert": insert, "layers": layers}
+    """Every padded weight of the encoder: "patch", per layer il its ``layer_weights``, "merger" (after layer
+    ``insert``; -1: none, the 4x file), "final"."""
+    return {"patch": patch_weights(get), "merger": merger_weights(get) if insert >= 0 else None,
+            "final": final_weights(get), **{il: layer_weights(get, il) for il in range(layers)}, "insert": insert,
+            "layers": layers}
 
 
 def level_keys(name: str, entries: list[Entry] | None = None, *, joint: bool) -> tuple[Keys, Keys]:
@@ -696,16 +740,19 @@ def level_keys(name: str, entries: list[Entry] | None = None, *, joint: bool) ->
 def encode(bd: Builder, w: dict, *, joint: bool, name: str = "v") -> str:
     """One dispatch of the whole encoder (``weights``) on two entries of at most 64 groups each, or one of at most 128
     (joint): the patch embedding (its inputs: ``inputs``, DDR images name.x0.pix.b / .pos.b), layers 0 .. insert on
-    ``PRE``'s bands, the ViT merger into ``POST``'s band, the later layers on it in the memtile, the final merger;
-    returns the final merger's image (``embeddings`` reads it). The levels' attention commands (``level_keys``: name
-    .joint / .pair) hold their key masks (``Encoder`` writes them per dispatch)."""
+    ``PRE``'s bands, the ViT merger into ``POST``'s band, the later layers on it in the memtile, the final merger
+    (without the ViT merger, the 4x file: every layer on ``PRE``, ``final_bands``); returns the final merger's image
+    (``embeddings`` reads it). The levels' attention commands (``level_keys``: name .joint / .pair) hold their key masks
+    (``Encoder`` writes them per dispatch)."""
     pre, post = level_keys(f"{name}.{'joint' if joint else 'pair'}", joint=joint)
     x = patch_embed(bd, w["patch"], name + ".x0")
     kv = bd.ddr(name + ".kv", kv_bytes(PRE))
-    for il in range(w["insert"] + 1):
+    for il in range(w["insert"] + 1 if w["insert"] >= 0 else w["layers"]):
         y = Bands(PRE, f"{name}.x{il + 1}")
         layer_bands(bd, w[il], f"{name}.l{il}", x, y, kv=kv, keys=pre)
         x = y
+    if w["insert"] < 0:
+        return final_bands(bd, w["final"], name + ".f", x)
     xt, rec = merger(bd, w["merger"], name + ".mg", x)
     for il in range(w["insert"] + 1, w["layers"]):
         xt, rec = layer(bd, w[il], f"{name}.l{il}", xt, rec, kv=kv, keys=post)
@@ -721,6 +768,7 @@ class Encoder:
     def __init__(self, npu: Sd15Device, w: dict, pos: torch.Tensor, *, patch: int, name: str = "v"):
         """w: ``weights``; pos: the learned position embedding (70 x 70 rows, 1152) in bf16 values; patch: pixels."""
         self.npu, self.name, self.patch = npu, name, patch
+        self.merge = 4 if w["insert"] >= 0 else 2  # (patches per output token per side)
         self.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
         bd = Builder(npu)
         self.words, self.addrs = {}, {}
@@ -733,13 +781,14 @@ class Encoder:
     def state(self) -> dict:
         """What ``restored`` needs besides the device's images: the transactions (their shim addresses as
         relocations)."""
-        return {"words": self.words, "rel": {j: self.npu.relocations(a) for j, a in self.addrs.items()}, "out": self.out}
+        return {"words": self.words, "rel": {j: self.npu.relocations(a) for j, a in self.addrs.items()}, "out": self.out,
+                "merge": self.merge}
 
     @classmethod
     def restored(cls, npu: Sd15Device, state: dict, pos: torch.Tensor, *, patch: int, name: str = "v") -> "Encoder":
         """An Encoder of ``state()`` on a device whose images were restored (``Sd15Device.restore``)."""
         enc = cls.__new__(cls)
-        enc.npu, enc.name, enc.patch, enc.out, enc.tr = npu, name, patch, state["out"], {}
+        enc.npu, enc.name, enc.patch, enc.out, enc.merge, enc.tr = npu, name, patch, state["out"], state["merge"], {}
         enc.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
         enc.words = {j: npu.relocate(wd, state["rel"][j]) for j, wd in state["words"].items()}
         return enc
@@ -749,8 +798,8 @@ class Encoder:
         pos = [self.pos[torch.from_numpy(positions(e.ph, e.pw))] for e in ents]
         out = inputs(ents, [patches(p, self.patch) for p in pixels], pos, self.name + ".x0")
         joint = ents[0].joint
-        for k, lv in zip(level_keys(f"{self.name}.{'joint' if joint else 'pair'}", ents, joint=joint), (PRE, POST),
-                         strict=True):
+        keys = level_keys(f"{self.name}.{'joint' if joint else 'pair'}", ents, joint=joint)
+        for k, lv in list(zip(keys, (PRE, POST), strict=True))[:2 if self.merge == 4 else 1]:  # (4x: no POST level)
             out[k.name] = k.attention(lv).command()
         return out
 
@@ -769,7 +818,7 @@ class Encoder:
                 if joint not in self.tr:
                     self.tr[joint] = Transaction(self.npu.dev, self.words[joint])
                 self.npu.run(self.tr[joint])
-                for i, e in zip(idx, embeddings(self.npu, self.out, ents), strict=True):
+                for i, e in zip(idx, embeddings(self.npu, self.out, ents, self.merge), strict=True):
                     out[i] = e
         return out
 

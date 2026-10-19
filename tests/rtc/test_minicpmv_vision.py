@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import ClipConfig
+from artlite.model_config import ClipConfig, minicpmv_mmproj
 from artlite.operators.sd15 import layout as L
 from artlite.operators.sd15.build import Builder, Level
 from artlite.operators.sd15.runtime import Sd15Device
@@ -356,15 +356,19 @@ def test_merger(npu: Sd15Device, enc: V.Encoder, case: str) -> None:
 
 
 @pytest.mark.slow  # (the CPU encoders, every weight converted)
-def test_encoder(npu: Sd15Device, enc: V.Encoder) -> None:
-    """The whole encoder (``Encoder``: its pair and joint transactions) on the entries of both of ``_pixels``' cases:
-    their embeddings on average as far from the float64 encoder's as the CPU at the NPU's rounding points, each one
-    within 1.3x of it (the final merger amplifies the residual's difference ~3.5x, so its direction decides an
-    entry's: the 24 x 40 entry's 1.7% against the CPU's 1.6% after layer 26 gives 5.9% against 4.9%, the overview's
-    4.1% against 5.0%); each dispatch's time."""
+@pytest.mark.parametrize("compression", [16, 4])
+def test_encoder(npu: Sd15Device, compression: int) -> None:
+    """The whole encoder (``Encoder``: its pair and joint transactions; the 16x file, or the 4x one without the ViT
+    merger) on the entries of both of ``_pixels``' cases: their embeddings on average as far from the float64
+    encoder's as the CPU at the NPU's rounding points, each one within 1.3x of it (the final merger amplifies the
+    residual's difference ~3.5x, so its direction decides an entry's: in the 16x file the 24 x 40 entry's 1.7% against
+    the CPU's 1.6% after layer 26 gives 5.9% against 4.9%, the overview's 4.1% against 5.0%); each dispatch's time."""
     import time
 
-    sim = V.NpuEncoder(MMPROJ)
+    path = minicpmv_mmproj(compression)
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    sim, enc = V.NpuEncoder(path), V.Encoder(path)
     pos = V._bf16(sim.w("v.position_embd.weight"))
     npe = M.Encoder(npu, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert), pos, patch=sim.patch)
     errs = []
@@ -377,7 +381,7 @@ def test_encoder(npu: Sd15Device, enc: V.Encoder) -> None:
             t0 = time.perf_counter()
             npu.run(tr)
             ts.append(time.perf_counter() - t0)
-        print(f"encoder, {case} of {len(ents)}: {1e3 * min(ts):.1f} ms")
+        print(f"encoder ({compression}x), {case} of {len(ents)}: {1e3 * min(ts):.1f} ms")
         for g, e in zip(got, ents, strict=True):
             npu_err, cpu_err = _rel(g, ex := enc.forward(e)), _rel(want := sim.forward(e), ex)
             print(f"embeddings: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g, want):.2e}")
