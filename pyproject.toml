@@ -31,6 +31,7 @@ examples = [
     "gigatoken>=0.10.0",
     "fastapi>=0.115",
     "uvicorn>=0.32",
+    "pillow>=11.0",  # image input (MiniCPM-V): decoding, and the bicubic resampling of the models' training
 ]
 
 [dependency-groups]

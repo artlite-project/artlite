@@ -1,12 +1,21 @@
-"""MiniCPM-V 4.7's images in the qwen35 language model (its mmproj, projector ``minicpmv4_7``): the token layout of an
-image and its M-RoPE positions.
+"""MiniCPM-V 4.7's images in the qwen35 language model (its mmproj, projector ``minicpmv4_7``): an image's slices and
+pixels, its token layout and its M-RoPE positions.
+
+Slicing (``slice_image``), as transformers' ``MiniCPMV4_6ImageProcessor`` and the training code (MiniCPM-V's
+``finetune/dataset.py``): an image of more than ``image_size`` squared pixels gets a grid of slices (``slice_grid``:
+of ``max_slices`` +- 1 slices, the grid whose cols / rows is nearest the image's aspect in log, in double: llama.cpp's
+mtmd computes it in float, where ties between transposed grids pick the one of fewer columns: 3 x 2 slices of a 1024 x
+1024 image instead of 2 x 3) and an overview of about that area; a small image is only scaled up to it. Sides align to
+4 patches (56 pixels: the encoder's two 2 x 2 merges, in both files), each size taken from the original by Pillow's
+bicubic filter (the training's; llama.cpp ports it), the pixels normalized by the mmproj's mean and std.
 
 An image is an overview (``ov``: tokens h x w) and, unless it is small, a grid of slices (``rows`` x ``cols`` of ``cell``
 tokens each). Its tokens, as the official processor lays them out (transformers' ``MiniCPMV4_7Processor``)::
 
     <image> [ov] </image> <slice> [S00] </slice> <slice> [S01] </slice> \\n <slice> [S10] </slice> ...
 
-the slice rows joined by "\\n"; the chat template's "\\n" after the image follows.
+the slice rows joined by "\\n", after the text ``<image_id>k</image_id>`` (k counting a prompt's images from 0); the chat
+template's "\\n" after the image follows.
 
 Positions are (T, H, W) per token, as transformers' ``MiniCPMV4_7Model.get_rope_index`` gives them (``positions``),
 llama.cpp's RoPE sections by its ``rope.section_order`` zyxt (section 0: T, 1: H, 2: W). With O the image's first
@@ -21,10 +30,15 @@ the text after the image at O + its tiles and separators; its PR #30510 moves bo
 breaks ties of its KV position by (H, W)).
 """
 
+import io
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+from PIL import Image, ImageOps
+
+from artlite.model_config import ClipConfig
 
 # token ids of the markers (the GGUF's vocabulary; the official config's image_start_id .. newline_id)
 IMAGE, IMAGE_END, SLICE, SLICE_END, IMAGE_ID, IMAGE_ID_END, NEWLINE = 248078, 248079, 248088, 248089, 248090, 248091, 198
@@ -83,3 +97,77 @@ class Grid:
         if newline_after:
             pos.append((O, O, O))
         return np.asarray(pos, np.int64), O + max(ch, cw) + 1
+
+
+# ----------------------------------------------------------------------
+# Slicing
+# ----------------------------------------------------------------------
+
+
+def _divide(length: float, d: int) -> int:
+    return max(round(length / d) * d, d)  # (Python's round: ties to even)
+
+
+def best_resize(h: float, w: float, scale: int, align: int, *, upscale: bool = False) -> tuple[int, int]:
+    """(h, w) of an image (or a slice) of more than ``scale`` squared pixels (or any, ``upscale``) brought to about
+    that area at its aspect, the sides rounded to multiples of ``align``."""
+    if h * w > scale * scale or upscale:
+        r = w / h
+        h = int(scale / math.sqrt(r))
+        w = int(h * r)
+    return _divide(h, align), _divide(w, align)
+
+
+def slice_grid(h: int, w: int, max_slices: int, scale: int) -> tuple[int, int] | None:
+    """(rows, cols) of an image's slices, None for an image of at most one slice's area."""
+    log_ratio = math.log(w / h)
+    multiple = min(math.ceil(w * h / (scale * scale)), max_slices)
+    if multiple <= 1:
+        return None
+    best, err = (1, 1), math.inf
+    for n in (multiple - 1, multiple, multiple + 1):
+        if n == 1 or n > max_slices:
+            continue
+        for rows in range(1, n + 1):
+            if n % rows == 0:
+                e = abs(log_ratio - math.log((n // rows) / rows))
+                if e < err or (e == err and rows > best[0]):
+                    best, err = (rows, n // rows), e
+    return best
+
+
+def refine_size(h: int, w: int, grid: tuple[int, int], scale: int, align: int) -> tuple[int, int]:
+    """(h, w) of the image that the grid's slices cut."""
+    rows, cols = grid
+    sh, sw = best_resize(_divide(h, rows) / rows, _divide(w, cols) / cols, scale, align, upscale=True)
+    return sh * rows, sw * cols
+
+
+def load_image(src: str | bytes) -> Image.Image:
+    """An image file (a path or its bytes) as RGB, turned upright by its EXIF orientation (transformers'
+    ``load_image``; an alpha channel dropped; a JPEG's pixels within 3 levels of llama.cpp's stb_image)."""
+    with Image.open(io.BytesIO(src) if isinstance(src, bytes) else src) as im:
+        return ImageOps.exif_transpose(im).convert("RGB")
+
+
+def _pixels(im: Image.Image, clip: ClipConfig) -> np.ndarray:
+    x = np.asarray(im, np.float32).transpose(2, 0, 1) / np.float32(255)
+    return (x - np.float32(clip.mean)[:, None, None]) / np.float32(clip.std)[:, None, None]
+
+
+def slice_image(im: Image.Image, clip: ClipConfig, max_slices: int | None = None) -> tuple[list[np.ndarray], Grid]:
+    """An RGB image's entries for the encoder (the overview, then the slices row by row: pixels (3, H, W), float32)
+    and its token grid; ``max_slices``: the mmproj's (9) by default (MiniCPM-V's card uses 36 for images)."""
+    w, h = im.size
+    scale, align, tok = clip.image_size, clip.patch_size * 4, clip.patch_size * clip.merge
+    grid = slice_grid(h, w, max_slices or clip.max_slices, scale)
+    oh, ow = best_resize(h, w, scale, align, upscale=grid is None)
+    entries = [_pixels(im.resize((ow, oh), Image.Resampling.BICUBIC), clip)]
+    if grid is None:
+        return entries, Grid(ov=(oh // tok, ow // tok))
+    rh, rw = refine_size(h, w, grid, scale, align)
+    ref = im.resize((rw, rh), Image.Resampling.BICUBIC)
+    sh, sw = rh // grid[0], rw // grid[1]
+    entries += [_pixels(ref.crop((c * sw, r * sh, (c + 1) * sw, (r + 1) * sh)), clip)
+                for r in range(grid[0]) for c in range(grid[1])]
+    return entries, Grid(ov=(oh // tok, ow // tok), grid=grid, cell=(sh // tok, sw // tok))

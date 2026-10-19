@@ -1,20 +1,22 @@
-"""MiniCPM-V 4.7's vision references (tests/rtc/minicpmv_ref.py) against llama.cpp's libmtmd on an image (no NPU):
-the torch encoder op by op in llama.cpp's rounding mode (each op fed llama.cpp's own input: within its fp32 summation
-order and a few fp16 table ULPs) and per entry (the overview, the slices: within the encoder's own sensitivity across
-27 layers and two merges, ~0.5-1%), with the separator rows between the entries; the token layout of the image
-chunk."""
+"""MiniCPM-V 4.7's vision references (tests/rtc/minicpmv_ref.py) and slicing (models/qwen35/minicpmv.py) against
+llama.cpp's libmtmd on an image (no NPU): the entries' pixels identical (where llama.cpp's float grid choice agrees
+with the official; a JPEG's within its decoders' differences), the image chunk's tokens; the torch encoder op by op
+in llama.cpp's rounding mode (each op fed llama.cpp's own input: within its fp32 summation order and a few fp16 table
+ULPs) and per entry (the overview, the slices: within the encoder's own sensitivity across 27 layers and two merges,
+~0.5-1%), with the separator rows between the entries."""
 
 import os
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
-from artlite.model_config import MODELS_DIR, minicpmv_gguf
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import MODELS_DIR, ClipConfig, minicpmv_gguf
+from models.qwen35 import minicpmv as M
 
 from . import minicpmv_ref as V
-
-pytestmark = pytest.mark.slow  # (the whole encoder on the CPU, in float32)
 
 IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
 MMPROJ = os.path.join(MODELS_DIR, "openbmb", "MiniCPM-V-4.7-1B-gguf", "mmproj-model-f16.gguf")
@@ -22,12 +24,40 @@ NAMES = ("pos_embed|layer_inp_normed|Qcur|attn_out|ffn_inp_normed|ffn_up_b|ffn_g
          "vit_merger_ds_out|post_ln|merger_out")
 
 
-@pytest.fixture(scope="module")
-def gold() -> V.VisionGolden:
+def _files() -> None:
     for path in (minicpmv_gguf(), MMPROJ):
         if not os.path.exists(path):
             pytest.skip(f"{path} missing")
+
+
+@pytest.fixture(scope="module")
+def gold() -> V.VisionGolden:
+    _files()
     return V.golden(minicpmv_gguf(), MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)
+
+
+@pytest.mark.parametrize("case", ["astronaut", "square-1024", "small"])
+def test_slices(case: str, tmp_path: str) -> None:
+    _files()
+    path = IMAGE
+    if case != "astronaut":  # (noise: the resampling exact at every pixel)
+        w, h = (1024, 1024) if case == "square-1024" else (300, 200)
+        path = os.path.join(tmp_path, f"{case}.png")
+        Image.fromarray(np.random.default_rng(0).integers(0, 256, (h, w, 3), np.uint8)).save(path)
+    g = V.golden(minicpmv_gguf(), MMPROJ, path, "<__media__>Describe the image.",
+                 names=NAMES if case == "astronaut" else "pos_embed")  # (the astronaut's: test_ops' golden)
+    entries, grid = M.slice_image(M.load_image(path), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
+    ll = [g.tensor("inp_raw", k) for k in range(g.entries)]
+    # identical; a JPEG's decoded pixels within 3 levels (Pillow's libjpeg-turbo vs llama.cpp's stb_image)
+    tol = 3.01 / 127.5 if case == "astronaut" else 0
+    same = lambda a, b: a.shape == b.shape and np.abs(a - b).max() <= tol
+    assert same(entries[0], ll[0])  # (the overview)
+    if case == "square-1024":  # (llama.cpp's float tie: 3 x 2 slices of 392 x 560 instead of 2 x 3 of 560 x 336)
+        assert grid.grid == (2, 3) and [e.shape for e in ll[1:]] == [(3, 392, 560)] * 6
+        return
+    assert len(entries) == len(ll) and all(same(a, b) for a, b in zip(entries, ll, strict=True))
+    text, image = (c for c in g.chunks[:2])
+    assert text["text"][-1] == M.IMAGE and image["image"] == len(grid.layout(newline_after=False)) - 1
 
 
 def _rel(a: torch.Tensor | np.ndarray, b: np.ndarray) -> float:
@@ -35,6 +65,7 @@ def _rel(a: torch.Tensor | np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
+@pytest.mark.slow  # (the whole encoder on the CPU, in float32)
 def test_ops(gold: V.VisionGolden) -> None:
     enc = V.Encoder(MMPROJ, llama=True)
     t = lambda name, il=None: torch.from_numpy(gold.tensor(name, 0, il).copy())
@@ -53,6 +84,7 @@ def test_ops(gold: V.VisionGolden) -> None:
     assert _rel(enc._mm(t("ffn_gelu", 0), p + "ffn_down.weight", p + "ffn_down.bias"), gold.tensor("ffn_out", 0, 0)) < 1e-6
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("llama", [True, False], ids=["llama", "f64"])
 def test_entries(gold: V.VisionGolden, llama: bool) -> None:
     enc = V.Encoder(MMPROJ, llama=llama)
