@@ -13,9 +13,10 @@ over the 8 positions, in the decode's cache layout (``overlay.kv``): the chunk's
 parameter ``QA_KV``), so the decode continues from them. cos / sin of the
 positions from a table of every position (``cs_table``; parameter ``QA_CS``).
 
-``PrefillAttnOperator``: per column 4 cores, passes of 32 queries; core r takes queries 8 r .. of the pass for each of the
-column's heads (QC row panels: an O of QC x 8 KB) and streams the cache groups up to the pass's (the KV head's stream
-broadcast to the 4 NPH cores of its columns): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
+``PrefillAttnOperator``: per column 4 cores, passes of 32 QG queries (QG = 2 when a column holds one q head, the L1 of
+the 9B's two heads: half the history's re-streams, else 1); core r takes the QG token groups QG r .. of the pass for
+each of the column's heads (QC QG row panels: an O of QC QG x 8 KB) and streams the cache groups up to the pass's (the
+KV head's stream broadcast to the 4 NPH cores of its columns): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
 products: one loop, the KV head's memtile re-lays each record per d-block, [K hi | K lo] and the V object's two
 records), per group of 32 positions the softmax (a row's maximum is raised, rescaling o and l, only when the group's
 exceeds it by 2^16: the per-dimension norm weights leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2
@@ -385,9 +386,10 @@ class AttnPrepOperator(ArtcOperator):
 
 
 _ATTN = JINJA_ENV.from_string(r"""
-// The attention core's workspace (bytes, PrefillAttnOperator.workspace()): o [head][db 32][8 x 8] fp32, sc [head][record
-// 4][8 x 8] fp32 (scores, log2 units), m, l [head][64] (lane 8 q + k: query q's running maximum / its partial sums),
-// pp [head][record] P panels, rm (a head's group maxima)
+// The attention core's workspace (bytes, PrefillAttnOperator.workspace()): per row panel (R = QC QG: head h = i / QG,
+// token group QG r + i % QG of the pass) o [panel][db 32][8 x 8] fp32, sc [panel][record 4][8 x 8] fp32 (scores, log2
+// units), m, l [panel][64] (lane 8 q + k: query q's running maximum / its partial sums), pp [panel][record] P panels,
+// rm (a panel's group maxima)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
@@ -464,23 +466,23 @@ extern "C" {
 // A pass's start: o = 0, m = -1e30, l = 0
 void {{ p }}_init(float *__restrict ws)
 {
-    al::zero<{{ QC * 2048 }}, 64>(AW(float, {{ w.o }}));
+    al::zero<{{ R * 2048 }}, 64>(AW(float, {{ w.o }}));
     float *__restrict m = AW(float, {{ w.m }});
-    for (int i = 0; i < {{ QC }}; i++)
+    for (int i = 0; i < {{ R }}; i++)
         aie::store_v(m + 64 * i, aie::broadcast<float, 64>(-1e30f));
-    al::zero<{{ QC * 64 }}, 64>(AW(float, {{ w.l }}));
+    al::zero<{{ R * 64 }}, 64>(AW(float, {{ w.l }}));
 }
 
 // Scores of K record k (8 positions; per d-block its hi and lo panels: the memtile interleaves the record's halves)
-// for each head: Q hi K hi + Q lo K hi + Q hi K lo (q: per head per d-block the Q panels hi, lo), one loop of two
-// panel streams and three MMUL chains
+// for each row panel: Q hi K hi + Q lo K hi + Q hi K lo (q: per panel per d-block the Q panels hi, lo), one loop of
+// two panel streams and three MMUL chains
 void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, float *__restrict ws, int32_t k)
 {
 {% if "qk" in ablate %}
     return;
 {% endif %}
     float *__restrict sc = AW(float, {{ w.sc }}) + 64 * k;
-    for (int h = 0; h < {{ QC }}; h++) {
+    for (int h = 0; h < {{ R }}; h++) {
         al::MM8 a(aie::zeros<accfloat, 64>()), b(aie::zeros<accfloat, 64>()), c(aie::zeros<accfloat, 64>());
         al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)((const uint8_t *)q + {{ SLOT }} * h));
         al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)kr);
@@ -495,9 +497,11 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, flo
     }
 }
 
-// The group's softmax terms: on the diagonal group (diag = 0) keys after the query masked (record k vs the core's queries
-// 8 r ..); a row's maximum m is raised (o, l rescaled) only when its group maximum exceeds it by 2^16; P = 2^(s - m)
-// as bfp16 panels, l += P
+// The group's softmax terms, diag groups before the pass's last: per row panel (its token group t = QG r + i % QG of
+// the pass, in the pass's group t / 4) on its diagonal group keys after the query masked (record k vs record t % 4),
+// the groups after it wholly (a panel's first groups are never masked: they lie before every pass's queries); a row's
+// maximum m is raised (o, l rescaled) only when its group maximum exceeds it by 2^16; P = 2^(s - m) as bfp16 panels,
+// l += P
 void {{ p }}_soft(float *__restrict ws, int32_t diag, int32_t r)
 {
 {% if "soft" in ablate %}
@@ -506,13 +510,14 @@ void {{ p }}_soft(float *__restrict ws, int32_t diag, int32_t r)
     aie::set_rounding(aie::rounding_mode::conv_even);
     const aie::mask<64> tri = aie::mask<64>::from_uint64(0x{{ tri }}ull);  // lane 8 q + j: j > q
     const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-1e30f);
-    for (int h = 0; h < {{ QC }}; h++) {
+    for (int h = 0; h < {{ R }}; h++) {
         float *__restrict s = AW(float, {{ w.sc }}) + 256 * h;
-        if (diag == 0) {
+        const int t = {{ QG }} * r + h % {{ QG }}, rec = t & 3, dd = diag - ({{ QG - 1 }} - (t >> 2));
+        if (dd <= 0) {
             for (int k = 0; k < 4; k++) {
-                if (k > r)
+                if (dd < 0 || k > rec)
                     aie::store_v(s + 64 * k, ninf);
-                else if (k == r)
+                else if (k == rec)
                     aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
             }
         }
@@ -557,7 +562,7 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half
 {% if "pv" in ablate %}
     return;
 {% endif %}
-    for (int h = 0; h < {{ QC }}; h++) {
+    for (int h = 0; h < {{ R }}; h++) {
         al::BIn<> ps((const bfp16ebs8 *)(AW(uint8_t, {{ w.pp }}) + 288 * h + 144 * half));
         const al::BV P0 = ps.pop(), P1 = ps.pop();
         float *__restrict o = AW(float, {{ w.o }}) + 2048 * h;
@@ -565,7 +570,7 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half
     }
 }
 
-// Head h's output: o / l sigmoid(gate) as the attn_out GEMM's 32 A panels (8 queries x 8 dims; sg: [8][256] bf16)
+// Row panel h's output: o / l sigmoid(gate) as the attn_out GEMM's 32 A panels (8 queries x 8 dims; sg: [8][256] bf16)
 void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -591,10 +596,10 @@ void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h,
 
 class PrefillAttnOperator(ArtcOperator):
     """Causal attention of a T-token chunk at p0 (module docstring) on the cache that already holds the chunk's K and V
-    (``AttnPrepOperator``). Column c (q heads QC c .., KV head c // NPH), core row r; passes of 32 queries: in pass b
-    the core takes the 8 queries 32 b + 8 r .. of each of the column's heads (QC row panels), streams the cache groups
-    0 .. p0 / 32 + b (the KV head's stream broadcast to the 4 NPH cores of its columns) and writes their outputs as the
-    attn_out GEMM's A panels. Runtime sequence: QS (the prep's), KV (one layer's cache), A (T x heads x 256 as bfp16
+    (``AttnPrepOperator``). Column c (q heads QC c .., KV head c // NPH), core row r; passes of 32 QG queries (``qg``):
+    in pass b the core takes the QG token groups 4 QG b + QG r .. of each of the column's heads (QC QG row panels),
+    streams the cache groups 0 .. p0 / 32 + QG (b + 1) - 1 (the KV head's stream broadcast to the 4 NPH cores of its
+    columns) and writes their outputs as the attn_out GEMM's A panels. Runtime sequence: QS (the prep's), KV (one layer's cache), A (T x heads x 256 as bfp16
     panels [T / 8][heads x 32]). Parameters ``QA_N`` = p0 / 32 + 1 (the history groups every pass streams first, and the
     cores' trip count), ``QA_OFF``: the bf16 offset of the chunk's second group (``params``)."""
 
@@ -610,19 +615,21 @@ class PrefillAttnOperator(ArtcOperator):
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
+        self.qg = 2 if self.qc == 1 and T % 64 == 0 else 1  # (query groups per core and head)
+        self.R = self.qc * self.qg  # (row panels)
         self.H = cfg.num_attention_heads
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
-        qc = self.qc
-        sizes = [("o", qc * 8192), ("sc", qc * 1024), ("m", qc * 256), ("l", qc * 256), ("pp", qc * 288), ("rm", 256)]
+        R = self.R
+        sizes = [("o", R * 8192), ("sc", R * 1024), ("m", R * 256), ("l", R * 256), ("pp", R * 288), ("rm", 256)]
         return regions(sizes)
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         tri = sum(1 << (8 * q + k) for q in range(8) for k in range(8) if k > q)
-        return _ATTN.render(p=p, w=Attr(self.workspace()), QC=self.qc, HD=HD, ND=ND, SLOT=SLOT, tri=f"{tri:016X}",
-                            ablate=self.ablate)
+        return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
+                            tri=f"{tri:016X}", ablate=self.ablate)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -635,10 +642,10 @@ class PrefillAttnOperator(ArtcOperator):
         return {QA_N: p0 // 32 + 1, QA_OFF: GROUP // 2 * (p0 // 32 + 1)}
 
     def get_mlir_artifact(self) -> Module:
-        p, T, qc, H = self.pfx, self.T, self.qc, self.H
+        p, T, qc, H, qg, R = self.pfx, self.T, self.qc, self.H, self.qg, self.R
         bf = np.dtype[bfloat16]
-        q_ty = np.ndarray[(qc * SLOT // 2,), bf]
-        qm_ty = np.ndarray[(4 * qc * SLOT // 2,), bf]
+        q_ty = np.ndarray[(R * SLOT // 2,), bf]
+        qm_ty = np.ndarray[(4 * R * SLOT // 2,), bf]
         kv_ty = np.ndarray[(AT.REC_K // 2,), bf]  # a K record, or two V records
         o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
         om_ty = np.ndarray[(4 * ND * 36,), bf]
@@ -649,10 +656,10 @@ class PrefillAttnOperator(ArtcOperator):
         k_pv = Kernel(f"{p}_pv", "kernel.o", [kv_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
-        n_pass = T // 32
+        n_pass = T // (32 * qg)
 
         q3 = [ObjectFifo(qm_ty, name=f"pa_q{c}", depth=2) for c in range(COLS)]
-        q1 = [q3[c].cons().split([qc * SLOT // 2 * r for r in range(4)], tile=Tile(c, 1), depths=[1] * 4,
+        q1 = [q3[c].cons().split([R * SLOT // 2 * r for r in range(4)], tile=Tile(c, 1), depths=[1] * 4,
                                  obj_types=[q_ty] * 4, names=[f"pa_qr{c}_{r}" for r in range(4)]) for c in range(COLS)]
         # the KV head's records through its memtile, each re-laid per d-block ([hi | lo] of a K record, the two records
         # of a V object): one panel stream in the kernels' loops
@@ -671,7 +678,7 @@ class PrefillAttnOperator(ArtcOperator):
                     q = q_h.acquire(1)
                     init(ws)
                     # read after this dispatch's first object: the host wrote it before the fills
-                    n = n_p.read() + b
+                    n = n_p.read() + b * qg + (qg - 1)
                     for g in range32(n):
                         for k in range(4):
                             kr = kv_h.acquire(1)
@@ -684,7 +691,7 @@ class PrefillAttnOperator(ArtcOperator):
                             kv_h.release(1)
                     q_h.release(1)
                     sg = q_h.acquire(1)
-                    for h in range(qc):
+                    for h in range(R):
                         o = o_h.acquire(1)
                         fin(ws, sg, h, o)
                         o_h.release(1)
@@ -702,20 +709,25 @@ class PrefillAttnOperator(ArtcOperator):
             sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
-                base = c * n_qs // COLS  # [token group][Q panels | sigmoid(gate)][head][SLOT]; pass b: groups 4 b ..
-                taps = [TensorAccessPattern((n_qs,), base + part * qc * sl, [n_pass, 4, 2 * qc, sl // 2],
-                                            [8 * qc * sl, 2 * qc * sl, sl // 2, 1]) for part in range(2)]
+                base = c * n_qs // COLS  # [token group][Q panels | sigmoid(gate)][head][SLOT]; pass b: groups 4 QG b ..
+                taps = [TensorAccessPattern((n_qs,), base + part * qc * sl, [n_pass, 4 * qg, 2 * qc, sl // 2],
+                                            [4 * qg * 2 * qc * sl, 2 * qc * sl, sl // 2, 1]) for part in range(2)]
                 chained_fill(qh[c], QS, taps, tg)
-                oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36, [n_pass, qc, 4, ND * 36],
-                                                   [4 * H * ND * 36, ND * 36, H * ND * 36, 1]), group=tg, wait=True)
+                # (a joined object: the 4 rows' panel i; QG > 1 (one head): token groups i, QG + i, .. of the pass)
+                g_st = ND * 36 if qg == 1 else H * ND * 36
+                oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36, [n_pass, R, 4, ND * 36],
+                                                   [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]), group=tg,
+                            wait=True)
             inflight = []  # (a pass's fills hold 2 of the shim tile's 16 BDs: at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
+                more = qg * b + qg - 1  # (the chunk's groups after its first through the pass's)
                 for h in range(n_kvh):  # the history (QA_N groups), then the chunk's groups before the pass's
                     kvh[h].fill(KV, TensorAccessPattern((n_kv,), h * hb, [1, 3, 4, 1152], [0, 4640, 1152, 1]),
-                                length_parameter=p_n, group=tp, wait=not b)
-                    if b:
-                        kvh[h].fill(KV, TensorAccessPattern((n_kv,), h * hb, [1, 3 * b, 4, 1152], [0, 4640, 1152, 1]),
+                                length_parameter=p_n, group=tp, wait=not more)
+                    if more:
+                        kvh[h].fill(KV, TensorAccessPattern((n_kv,), h * hb, [1, 3 * more, 4, 1152],
+                                                            [0, 4640, 1152, 1]),
                                     offset_parameter=p_off, group=tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) > 1:
@@ -738,7 +750,7 @@ class PrefillAttnOperator(ArtcOperator):
         """Core byte addresses by 16 KB region (aiecc puts the stack at 0): 0 the K / V records and an output buffer,
         1 the Q panels held through a pass and the other output buffer, 2 and 3 the workspace (O, the scores, P): QK
         streams Q (1) against K (0), PV V (0) into O (2, 3). 27B: 61 of 64 KB."""
-        kv, o, q = AT.REC_K, ND * 72, self.qc * SLOT
+        kv, o, q = AT.REC_K, ND * 72, self.R * SLOT
         lay = {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, 0x4000 + q], "pa_qr": [0x4000],
                "pa_ws": [0x8000]}
         assert self.STACK + 2 * kv + o <= 0x4000 and 0x4000 + q + o <= 0x8000

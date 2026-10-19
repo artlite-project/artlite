@@ -142,14 +142,14 @@ def test_attn_prep(size: str) -> None:
         assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
-def test_attn_prefill(size: str) -> None:
+@pytest.mark.parametrize(("size", "T"), [("9B", 64), ("27B", 64), ("1B", 64), ("1B", 192)])
+def test_attn_prefill(size: str, T: int) -> None:
     """AttnPrep then PrefillAttn (one fused runlist) over two chunks: the output panels against the exact attention
     of the cores' own operands (their Q panels, the cache they wrote, their sigmoid(gate): within 0.7%, the bfp16
-    output and P panels) and llama.cpp's attn_gated (~1% rms)."""
+    output and P panels) and llama.cpp's attn_gated (~1% rms). The 1B: passes of 64 queries (one head per column)."""
     from artlite.operators import bfp16
 
-    T, n2 = 64, 45
+    n2 = 45
     s = _Setup(size, T, n2)
     prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes)
