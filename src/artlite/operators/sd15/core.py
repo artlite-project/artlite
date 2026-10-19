@@ -60,6 +60,7 @@ from ..kernel_source import kernel_prefix
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
  C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
 C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
+C_KMASK = 704  # (attention of d 80 / 160: per image and key group its keys' valid bits, [image][group][2] words; -1: all)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
 C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
@@ -808,12 +809,12 @@ static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, f
 {% endif %}
 }
 
-// the softmax's masked keys (``{{ p }}_attn_sm``, the last group's): keys from nk on, S = -2^14
+// the softmax's masked keys (``{{ p }}_attn_sm``): key k of the group kept where bit k of km (two words) is set, else
+// S = -2^14
 template <int QS>
-static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict sm, int nk, int nkp) {
-  for (int kp = 0; kp < nkp; kp++) {  // (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept)
-    const int v = nk - 8 * kp;
-    const unsigned lo = v >= 8 ? 0xFFu : (v <= 0 ? 0u : (1u << v) - 1);
+static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict sm, const int32_t *km, int nkp) {
+  for (int kp = 0; kp < nkp; kp++) {  // (32 lanes [4 q][8 keys]: the panel's byte of the mask)
+    const unsigned lo = ((unsigned)km[kp >> 2] >> (8 * (kp & 3))) & 0xFFu;
     const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
     for (int h = 0; h < 4; h++) {  // (q panel h / 2, its half h % 2)
       float *p = sm + QS * (h >> 1) + 64 * kp + 32 * (h & 1);
@@ -878,10 +879,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *_
 // panels (a MAC with ones: the P that multiplies V)
 template <int QS, bool QPM>
 static __attribute__((noinline)) void {{ p }}_attn_sm(float *__restrict sm, float *__restrict mb, float *__restrict l,
-                                                 bfp16ebs8 *__restrict pp, int nk, int nkp, float *o, int nd, int first,
-                                                 int raise) {
+                                                 bfp16ebs8 *__restrict pp, const int32_t *km, int nkp, float *o, int nd,
+                                                 int first, int raise) {
   aie::set_rounding(aie::rounding_mode::conv_even);
-  if (nk < 8 * nkp) {{ p }}_attn_mm<QS>(sm, nk, nkp);
+  if ((km[0] & km[1]) != -1) {{ p }}_attn_mm<QS>(sm, km, nkp);
   if (first || raise) {{ p }}_attn_raise<QS>(sm, mb, o, l, nkp, nd, first);
   for (int k = 0; k < nkp; k += 4) {{ p }}_pexp<QS>(sm + 64 * k, sm + 64 * k, mb);
   const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
@@ -970,7 +971,7 @@ static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o
 // (after the pair, from the next 64-B boundary: one q panel's per half), the pairs' P (d 160: in s1, 576 B each; d 80: pair 0's in s0, pair 1's in s1),
 // 192 - m and l ([qp][8 q][8] each) in the workspace after the header
 static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
-  const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
+  const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}];
   const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}], d160 = nd == 20;
   const int npair = (nqp + 1) / 2;
   float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
@@ -978,6 +979,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
   const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
   const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
   for (int u = 0; u < nunit; u++) {
+    const int32_t *km = ws + {{ C_KMASK }} + 2 * ng * (u >= nunit / 2);  // (the unit's image's key masks)
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 128 * nd * npair);
     {{ p }}_zero((int32_t *)l, 128 * npair);
@@ -991,8 +993,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
         float *sm = (float *)(q + (36 * nd + 15) / 16 * 16);  // (64-B aligned: the 2048-bit stores' unit)
         bfp16ebs8 *pp = (bfp16ebs8 *)(d160 ? s.s1 + {{ 8 * 18 }} * pr : (pr ? s.s1 : s.s0));
         {{ p }}_attn_qk<{{ QS }}>(qa, k, sm, nkp / 2, nd);
-        {{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, g == ng - 1 ? nkl : 8 * nkp, nkp,
-                                         o + 128 * nd * pr, nd, g == 0, ws[{{ C_RAISE }}]);
+        {{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, km + 2 * g, nkp, o + 128 * nd * pr, nd,
+                                         g == 0, ws[{{ C_RAISE }}]);
       }
 {% if win == "aqk" %}
       event1();
@@ -1173,6 +1175,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int
   const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
   float *o = (float *)cb, *lc = (float *)(ws + 64), *sm = (float *)tab;
   for (int u = 0; u < nunit; u++) {
+    const int32_t *km = ws + {{ C_KMASK }} + 2 * ng * (u >= nunit / 2);  // (the unit's image's key masks)
     int32_t *q = {{ p }}_take_a(s);
     {{ p }}_zero(cb, 5120);
     {{ p }}_zero((int32_t *)lc, 128);

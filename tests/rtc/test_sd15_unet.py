@@ -231,18 +231,19 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int, nrows: int
     assert _rel(z, ref) < 9e-3
 
 
-@pytest.mark.parametrize("np_, d, nb, rows, sink, heads", [
-    (8, 160, 1, 2, False, 8), (2, 160, 1, 2, False, 8), (16, 80, 2, 2, False, 8), (16, 80, 2, 4, False, 8),
-    (8, 160, 1, 4, False, 8), (32, 40, 4, 4, False, 8), (16, 80, 2, 4, True, 8), (8, 160, 1, 4, True, 8),
-    (8, 80, 1, 4, False, 16), (8, 80, 1, 4, True, 16), (16, 80, 2, 4, True, 16), (16, 80, 1, 4, False, 16),
-    (16, 80, 2, 4, False, 16)])
-def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: bool, heads: int) -> None:
+@pytest.mark.parametrize("np_, d, nb, rows, sink, heads, masked", [
+    (8, 160, 1, 2, False, 8, False), (2, 160, 1, 2, False, 8, False), (16, 80, 2, 2, False, 8, False),
+    (16, 80, 2, 4, False, 8, False), (8, 160, 1, 4, False, 8, False), (32, 40, 4, 4, False, 8, False),
+    (16, 80, 2, 4, True, 8, False), (8, 160, 1, 4, True, 8, False), (8, 80, 1, 4, False, 16, False),
+    (8, 80, 1, 4, True, 16, False), (16, 80, 2, 4, True, 16, False), (16, 80, 1, 4, False, 16, False),
+    (16, 80, 2, 4, False, 16, False), (8, 80, 2, 4, False, 16, True), (8, 160, 1, 4, False, 8, True)])
+def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: bool, heads: int, masked: bool) -> None:
     """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
     panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
     panels drained to DDR slots, the attention rows' B streams; rows 4: every core row; d 40: a 64x64 band, the keys of
     4 bands, role c on every row; sink: a key of the last band x 30, its scores ~90 log2 units past the first group's
     for half the queries: the reference max raised, ``raise_max``; heads 16 of d 80: MiniCPM-V's ViT, at 16x16 a key
-    group of two columns' keys):
+    group of two columns' keys; masked: a random fifth of each image's keys masked, ``valid``):
     within 1.5e-2 of softmax attention on the bfp16-rounded operands (measured ~1.16e-2 at d 160: P in bfp16 per 8 keys
     ~8e-3, the bfp16 output ~6e-3, vexp2)."""
     torch.manual_seed(3)
@@ -250,6 +251,8 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: 
     x = torch.randn(3, nb, COLS * T, C)
     if sink:
         x[1, nb - 1, COLS * T - 1] *= 30
+    nkeys = 4 * COLS * T * nb // 8  # (an image's: half of each column's token panels, every band)
+    valid = (torch.rand(2, nkeys) > 0.2).numpy() if masked else None
     qs, k, v = x[0, 0] * (1.4426950408889634 / d ** 0.5) * 2, x[1], x[2]
     QA = 0
     KA = QA + C // 8 * np_ * L.PANEL + D.A_OBJ  # (the last head's walk past its panels)
@@ -261,7 +264,8 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: 
     ar = (0, 1) if rows == 2 else tuple(range(ROWS))
     at = Attention(np=np_, q=QA, o=OA, kv=0, d=d, nbands=nb, rows=ar, heads=heads)
     npu.alloc("kv", at.kv_bytes())
-    at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, rows=ar, raise_max=sink, heads=heads)
+    at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, rows=ar, raise_max=sink, heads=heads,
+                   valid=valid)
     s = npu.seq()
     for b in range(nb):
         s.op(merge(fills(npu, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
@@ -274,7 +278,7 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: 
     s.op(fills(npu, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
     for t in range(1 if d == 40 else max(np_ // 8, 1)):  # (an op per tile; d 40: one)
         at = Attention(np=np_, q=QA, o=OA, kv=npu.address("kv"), d=d, nbands=nb, tile=t, rows=ar, raise_max=sink,
-                       heads=heads)
+                       heads=heads, valid=valid)
         s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(npu.address("acmd")))
     nbytes = C // 8 * np_ * L.PANEL
     s.op(drains(npu, "o", nbytes, OA), {})
@@ -290,6 +294,8 @@ def test_attention(npu: Sd15Device, np_: int, d: int, nb: int, rows: int, sink: 
         for h in range(heads):
             ch = slice(d * h, d * (h + 1))
             sc = q(qs[sel][:, ch]) @ kk[:, ch].T
+            if valid is not None:
+                sc[:, ~torch.from_numpy(valid[i])] = -torch.inf
             p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
             ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
     assert _rel(o, ref) < 1.5e-2

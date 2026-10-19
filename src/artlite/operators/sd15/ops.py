@@ -699,7 +699,8 @@ class Attention:
     tokens, of ``nbands`` ops of np token panels: band b's column c holds keys [(8 b + c) kpi, ..) of its image): an
     image's token panels in a column are 2 apart. Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last
     group's keys from nkeys masked). d 40: a key group's K and V^T in one slot. raise_max: every key group checks the
-    softmax's reference max (raised past an attention sink; d 80 / 160), else the first group's."""
+    softmax's reference max (raised past an attention sink; d 80 / 160), else the first group's. valid (d 80 / 160): per
+    image a boolean array over its keys in the slots' order, the others masked (default: the first nkeys, or all)."""
 
     np: int
     q: int
@@ -712,6 +713,7 @@ class Attention:
     rows: tuple[int, ...] = tuple(range(ROWS))
     raise_max: bool = False
     heads: int = 8
+    valid: tuple | None = None
 
     def __post_init__(self) -> None:
         assert self.d in (40, 80, 160) and len(self.rows) in (2, 4) and (self.heads == 8 or self.d == 80 and self.heads == 16)
@@ -736,9 +738,30 @@ class Attention:
         cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 2 * self.hpr, self.kpc, self.ng, self.nk,
                                                                              self.nd, self.gk)
         cmd[K.C_RAISE] = self.raise_max
+        if self.d != 40:
+            assert K.C_KMASK + 4 * self.ng <= D.WS // 4, "key masks past the workspace"
+            cmd[K.C_KMASK:K.C_KMASK + 4 * self.ng] = self.key_masks()
         if self.d == 80:
             cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
         return cmd.view(np.uint8)
+
+    def key_masks(self) -> np.ndarray:
+        """C_KMASK: per image and key group its keys' valid bits (bit k: key k of the group; two words, -1 past a group
+        of 32 keys)."""
+        per = 8 * self.gk  # (keys of a group)
+        out = np.full((2, self.ng, 2), -1, np.int64)
+        for img in range(2):
+            ok = np.zeros(self.ng * per, bool)
+            if self.valid is not None:
+                v = np.asarray(self.valid[img], bool)
+                ok[:v.size] = v
+            else:
+                ok[:(self.ng - 1) * per + self.nk] = True
+            bits = ok.reshape(self.ng, per // 32 if per >= 32 else 1, -1)
+            for g in range(self.ng):
+                for j in range(per // 32):
+                    out[img, g, j] = int(sum(1 << k for k in range(32) if bits[g, j, k]))
+        return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32).reshape(-1)
 
     def col_ops(self) -> ColOps:
         """Per attention row and image its 4 units' queries (per head an A object: query pairs [pair][d-block][2], a single
