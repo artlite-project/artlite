@@ -1,7 +1,8 @@
 """The cores' program of sd15's design (``design``): a C++ main reading commands from the row's B stream. The main
 loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
 d 80 / 160, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
-"ln" the LayerNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it; together they do not fit 16 KB
+"ln" the LayerNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's window
+attention; together they do not fit 16 KB
 of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the pager's state
 words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third). A page arrives in the B stream
 (``runtime.Sd15Device``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
@@ -76,14 +77,14 @@ ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a GroupNorm record continued from / kept for 
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
-K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN = 1, 2, 3, 4, 5
+K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN = 1, 2, 3, 4, 5, 6
 O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU = 0, 1, 2, 3, 4, 5
 S_NONE, S_GN, S_LN = 0, 1, 2
 A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "c", "v", "gn", "ln")
+ROLES = ("a", "c", "v", "gn", "ln", "w")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
@@ -1327,6 +1328,135 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn512({{ p }}_st &s, in
   }
 }
 
+// ---- K_WATTN (role w): MiniCPM-V's ViT merger's attention inside its 2 x 2 windows (``vision.minicpmv``)
+
+// a row's scores: per source i a pass over the d-blocks of the A objects' row ([d-block 10][source 4]: Q_i's and every
+// K_j's panels), the 4 C tiles Q_i K_j^T in accumulators -> sc [i][j][64] (lane 8 w + w': only the diagonal w = w', a
+// window per lane, is used)
+static __attribute__((noinline)) void {{ p }}_wsc(const bfp16ebs8 *__restrict q, const bfp16ebs8 *__restrict k,
+                                             float *__restrict sc) {
+{% for i in range(4) %}
+  {
+    al::BIn<aie_dm_resource::a> qs(q);
+    al::BIn<aie_dm_resource::b> ks(k);
+    al::MM8 c0, c1, c2, c3;
+    for (int db = 0; db < 10; db++) {
+{% for s in range(4) %}
+      const al::BV q{{ s }} = qs.pop();
+{% endfor %}
+      const al::BV k0 = ks.pop(), k1 = ks.pop(), k2 = ks.pop(), k3 = ks.pop();
+      if (db == 0) {
+        c0.mul(q{{ i }}, aie::op_transpose(k0));
+        c1.mul(q{{ i }}, aie::op_transpose(k1));
+        c2.mul(q{{ i }}, aie::op_transpose(k2));
+        c3.mul(q{{ i }}, aie::op_transpose(k3));
+      } else {
+        c0.mac(q{{ i }}, aie::op_transpose(k0));
+        c1.mac(q{{ i }}, aie::op_transpose(k1));
+        c2.mac(q{{ i }}, aie::op_transpose(k2));
+        c3.mac(q{{ i }}, aie::op_transpose(k3));
+      }
+    }
+    aie::store_v(sc + {{ 256 * i }}, c0.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 64 }}, c1.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 128 }}, c2.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 192 }}, c3.template to_vector<float>());
+  }
+{% endfor %}
+}
+
+// the diagonals of a row's 16 C tiles (sc [i][j], lane 8 w + w') -> dd [i][j][8]: per half of 4 rows the masked lanes
+// summed by rows
+static __attribute__((noinline)) void {{ p }}_wdg(const float *__restrict sc, float *__restrict dd) {
+  const aie::vector<float, 32> z = aie::zeros<float, 32>();
+  for (int t = 0; t < 32; t++) {  // (half t % 2 of tile t / 2: rows 4 (t % 2) .., their diagonal lanes 9 r + 4 (t % 2))
+    const aie::mask<32> dg = aie::mask<32>::from_uint32(t & 1 ? 0x80402010u : 0x08040201u);
+    const aie::vector<float, 32> v = aie::select(z, aie::load_v<32>(sc + 32 * t), dg);
+    auto [e1, o1] = aie::interleave_unzip(v.template extract<16>(0), v.template extract<16>(1), 1);
+    const aie::vector<float, 16> r1 = aie::add(e1, o1);
+    auto [e2, o2] = aie::interleave_unzip(r1.template extract<8>(0), r1.template extract<8>(1), 1);
+    const aie::vector<float, 8> r2 = aie::add(e2, o2);
+    auto [e3, o3] = aie::interleave_unzip(r2.template extract<4>(0), r2.template extract<4>(1), 1);
+    aie::store_v(dd + 4 * t, aie::add(e3, o3));
+  }
+}
+
+// a row's softmax: per source i and window the 4 scores (dd [i][j][8]; q pre-scaled by log2 e / sqrt d), P_ij = 2^(s_ij
+// - max_j) / l in bf16 as diagonal panels pd [i][j] (lane 9 w = P of window w; one value a row: exact in bfp16)
+static __attribute__((noinline, minsize)) void {{ p }}_wsm(const float *__restrict dd, bfp16ebs8 *__restrict pd) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  al::BOut<> po(pd);
+  for (int i = 0; i < 4; i++) {
+    const aie::vector<float, 32> v = aie::load_v<32>(dd + 32 * i);  // ([j][w])
+    const aie::vector<float, 8> m = aie::max(aie::max(v.template extract<8>(0), v.template extract<8>(1)),
+                                             aie::max(v.template extract<8>(2), v.template extract<8>(3)));
+    const aie::vector<float, 32> e = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::add(
+        aie::sub(v, aie::concat(m, m, m, m)), aie::broadcast<float, 32>(192.0f)))).template to_vector<float>();
+    const aie::vector<float, 8> inv = aie::inv(aie::add(aie::add(e.template extract<8>(0), e.template extract<8>(1)),
+                                                        aie::add(e.template extract<8>(2), e.template extract<8>(3))));
+    const aie::vector<bfloat16, 32> pb = aie::accum<accfloat, 32>(al::mulff<32>(e, aie::concat(inv, inv, inv, inv)))
+                                             .template to_vector<bfloat16>();
+{% for j in range(4) %}
+    {
+      aie::vector<bfloat16, 64> d = aie::zeros<bfloat16, 64>();
+{% for w in range(8) %}
+      d.set(pb.get({{ 8 * j + w }}), {{ 9 * w }});
+{% endfor %}
+      po.push(aie::accum<accfloat, 64>(d).template to_vector<bfp16ebs8>());
+    }
+{% endfor %}
+  }
+}
+
+// a row's output: per d-block the 4 sources' V^T panels ([8 dims][8 windows]); o_i = sum_j diag(P_ij) V_j -> bfp16 panels
+// [d-block][i] at out
+static __attribute__((noinline)) void {{ p }}_wpv(const bfp16ebs8 *__restrict pd, const bfp16ebs8 *__restrict vt,
+                                             bfp16ebs8 *__restrict out) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  al::BIn<aie_dm_resource::b> vs(vt);
+  al::BOut<> po(out);
+  for (int db = 0; db < 10; db++) {
+    const al::BV v0 = vs.pop(), v1 = vs.pop(), v2 = vs.pop(), v3 = vs.pop();
+    al::BIn<aie_dm_resource::a> ps(pd);
+    for (int i = 0; i < 4; i++) {
+      al::MM8 c;
+      c.mul(ps.pop(), aie::op_transpose(v0));
+      c.mac(ps.pop(), aie::op_transpose(v1));
+      c.mac(ps.pop(), aie::op_transpose(v2));
+      c.mac(ps.pop(), aie::op_transpose(v3));
+      po.push(c.template to_vector<bfp16ebs8>());
+    }
+  }
+}
+
+// K_WATTN: per unit (C_NUNIT: a head of the op's two token panels) the A objects Q, K, V^T, each a row (token panel) per
+// half [d-block 10][source 4] (the half's rest junk): per row the scores (sc: 16 C tiles in cb, dd their diagonals),
+// the softmax (pd: per row 16 diagonal panels), then o (ob: [row][d-block][source]) out
+static __attribute__((noinline, minsize)) void {{ p }}_wattn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
+  const int nunit = ws[{{ C_NUNIT }}];
+  float *sc = (float *)cb;
+  bfp16ebs8 *pd = (bfp16ebs8 *)(cb + 1024);  // (2 rows of 16 panels: 1152 B each)
+  bfp16ebs8 *ob = (bfp16ebs8 *)(cb + 2048);  // (2 rows of 40 panels: 2880 B each)
+  float *dd = (float *)(cb + 3584);  // (a row's 16 diagonals of 8)
+  for (int u = 0; u < nunit; u++) {
+    int32_t *q = {{ p }}_take_a(s);
+    int32_t *k = {{ p }}_take_a(s);
+    for (int row = 0; row < 2; row++) {
+      {{ p }}_wsc((const bfp16ebs8 *){{ p }}_aw(q, {{ A_OBJ // 8 }} * row), (const bfp16ebs8 *){{ p }}_aw(k, {{ A_OBJ // 8 }} * row), sc);
+      {{ p }}_wdg(sc, dd);
+      {{ p }}_wsm(dd, (bfp16ebs8 *)((uint8_t *)pd + 1152 * row));
+    }
+    {{ p }}_give_a(s, q);
+    {{ p }}_give_a(s, k);
+    int32_t *v = {{ p }}_take_a(s);
+    for (int row = 0; row < 2; row++)
+      {{ p }}_wpv((const bfp16ebs8 *)((const uint8_t *)pd + 1152 * row), (const bfp16ebs8 *){{ p }}_aw(v, {{ A_OBJ // 8 }} * row),
+                  (bfp16ebs8 *)((uint8_t *)ob + 2880 * row));
+    {{ p }}_give_a(s, v);
+    {{ p }}_out(s, (int32_t *)ob, 5760);
+  }
+}
+
 {{ pager }}
 
 // the cores' main loop (resident): commands from the B stream; GEMMs / convs and tables here, the other kinds by the
@@ -1379,6 +1509,10 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_gn({{ p }}_st &s, int32_t *c
 
 __attribute__((noinline, minsize)) void {{ p }}_ext_ln({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_w({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_wattn(s, cb, ws);
 }
 
 extern "C" {

@@ -21,11 +21,12 @@ import numpy as np
 import torch
 
 from ..design import COLS
+from ..sd15 import core as K
 from ..sd15 import design as D
 from ..sd15 import layout as L
 from ..sd15.build import Builder, Level
-from ..sd15.ops import Apply, Attention, Gemm
-from ..sd15.seq import ColOps, MemTask
+from ..sd15.ops import Apply, Attention, Gemm, _dims
+from ..sd15.seq import ColOps, MemTask, RowOps
 from ..sd15.unet import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
@@ -350,3 +351,40 @@ def patch_embed(bd: Builder, w: dict[str, torch.Tensor], entries: list[Entry], p
         free(bd, pt)
         out.store(bd, b, x, rec)
     return out
+
+
+@dataclass
+class WindowAttention:
+    """The ViT merger's attention inside its 2 x 2 windows (``core`` K_WATTN, role w) for the windows of two token
+    panels per column (a window per lane; its 4 tokens the 4 sources): the memtile panel tensors of the sources' Q
+    (x log2 e / sqrt 72) and K at q, k, their V^T at vt, the outputs at o; source s's [kb 160][panel 2][72 B] at
+    base + s stride. Core row r: heads 4 r .. 4 r + 3, per head its A objects Q, K, V^T (a panel per half: [d-block 16
+    (10 used)][source 4]) and its output [panel][d-block 10][source 4]."""
+
+    q: int
+    k: int
+    vt: int
+    o: int
+    stride: int
+
+    def command(self) -> np.ndarray:
+        cmd = np.zeros(D.Q // 4, np.int32)
+        cmd[[K.C_KIND, K.C_NUNIT]] = (K.K_WATTN, HEADS // 4)
+        return cmd.view(np.uint8)
+
+    def col_ops(self) -> ColOps:
+        co = ColOps()
+        sw = self.stride // 4
+        walk = _dims((18, 1), (4, sw), (16, 36), (2, 18))  # (a panel, the sources, 16 d-blocks, the panels: 9216 B)
+        head = 10 * 36  # (words: a head's 10 d-blocks)
+        for r in range(4):
+            h0 = 4 * r * head
+            sends = [MemTask([{"addr": a + 4 * h0, "nwords": D.A_OBJ // 4, "dims": walk, "iteration": (head, 4)}
+                              for a in (self.q, self.k, self.vt)], repeat=4)]
+            recvs = [MemTask([{"addr": self.o + 4 * h0, "nwords": 1440, "dims": _dims((18, 1), (4, sw), (10, 36), (2, 18)),
+                               "iteration": (head, 4)}], repeat=4)]
+            co.sends[r], co.recvs[r] = sends, recvs
+        return co
+
+    def row_ops(self, cmd: int) -> dict[int, RowOps]:
+        return {r: RowOps(runs=[(cmd, D.Q)], b_objects=1, parity=False, role="w") for r in range(4)}

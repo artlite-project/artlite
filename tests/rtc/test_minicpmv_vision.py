@@ -13,6 +13,7 @@ from artlite.model_config import ClipConfig
 from artlite.operators.sd15 import layout as L
 from artlite.operators.sd15.build import Builder, Level
 from artlite.operators.sd15.runtime import Sd15Device
+from artlite.operators.sd15.seq import ColOps, MemTask
 from artlite.operators.sd15.unet import Tensor
 from artlite.operators.vision import minicpmv as M
 from models.qwen35 import minicpmv as MV
@@ -226,3 +227,44 @@ def test_before_merger(npu: Sd15Device, enc: V.Encoder) -> None:
             print(f"{name}: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], tr[name]):.2e}")
             assert float(g[:, M.H:].abs().max()) == 0
             assert npu_err < 1.1 * cpu_err + 1e-4
+
+
+def test_window_attention(npu: Sd15Device) -> None:
+    """The ViT merger's window attention on random Q, K, V of 4 sources for two token panels per column: within 1.2e-2
+    of softmax attention per window and head on the bfp16 operands (Q, K blocked along the dims, V along the 8 windows
+    of a panel), P in bf16 and the bfp16 output."""
+    from .test_sd15_unet import q as bq
+
+    torch.manual_seed(5)
+    n = COLS * 16  # (windows: per column 2 panels of 8)
+    x = torch.randn(3, 4, n, M.C)  # (Q, K, V; source; window; channel)
+    x[0] *= M.LOG2E / M.HD ** 0.5 * 2
+    stride = M.C // 8 * 2 * 72  # (a source's [kb][2][72])
+    QA, KA, VA, OA = 0, 4 * stride + 8192, 8 * stride + 16384, 12 * stride + 24576
+    cols = [slice(c * 16, (c + 1) * 16) for c in range(COLS)]
+    bd = Builder(npu)
+    ops = {}
+    for t, (base, f) in enumerate(((QA, L.panels), (KA, L.panels), (VA, L.vt_panels))):
+        img = bd.image(f"in{t}", np.concatenate([np.concatenate([f(x[t, s, sl]) for s in range(4)]) for sl in cols]))
+        ops[t] = {c: ColOps(fills=[MemTask([{"addr": base, "nwords": stride}], ddr=(img + c * 4 * stride, 4 * stride, None))])
+                  for c in range(COLS)}
+    bd.op(bd.merge(*ops.values()), {})
+    wa = M.WindowAttention(q=QA, k=KA, vt=VA, o=OA, stride=stride)
+    cmd = bd.image("wcmd", wa.command())
+    bd.op({c: wa.col_ops() for c in range(COLS)}, wa.row_ops(cmd))
+    bd.op(bd.spill("o", OA, 4 * stride), {})
+    npu.run(bd.transaction())
+    ob = npu.read("o", COLS * 4 * stride).reshape(COLS, 4, stride)
+    o = torch.stack([torch.cat([L.from_panels(ob[c, s], 16, M.C) for c in range(COLS)]) for s in range(4)])  # (s, n, C)
+    qq, kk = bq(x[0]), bq(x[1])
+    vv = torch.stack([torch.cat([bq(x[2, s, sl].T).T for sl in cols]) for s in range(4)])  # (V^T: blocks over 8 windows)
+    ref = torch.zeros(4, n, M.C)
+    for h in range(M.HEADS):
+        ch = slice(M.HP * h, M.HP * (h + 1))
+        sc = torch.einsum("iwd,jwd->wij", qq[:, :, ch], kk[:, :, ch])
+        pr = torch.exp2(sc - sc.amax(-1, keepdim=True))
+        pr = pr / pr.sum(-1, keepdim=True)
+        ref[:, :, ch] = torch.einsum("wij,jwd->iwd", pr, vv[:, :, ch])
+    err = _rel(o, ref)
+    print(f"window attention: rel err {err:.2e}")
+    assert err < 1.2e-2
