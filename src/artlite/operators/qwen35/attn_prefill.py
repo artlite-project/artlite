@@ -24,15 +24,16 @@ exceeds it by 2^16: the per-dimension norm weights leave scores unbounded), P = 
 builds an exact 2^n; 0.59 ULP) as bfp16 panels, o += P V; at the pass's end o / l sigmoid(gate) as the attn_out GEMM's
 bfp16 A panels. Within 0.7% of the exact attention of its own operands, ~1% rms of llama.cpp's attn_gated.
 
-Time (27B, T = 512, per layer alone): attention 1.30 / 7.93 ms at
-p0 = 0 / 4K (9.77 at 4K without the interleave; its compute compiled out: 5.86, the KV re-streams of the 32-query
-passes at the DDR ceiling).
+Time (T = 512, per layer alone, at p0 = 0 / 4K / 16K): the 27B 1.38 / 6.89 / 22.1 ms (its compute compiled out at
+16K: 20.6, the KV re-streams of the 32-query passes at the DDR ceiling), the 1B 0.97 / 2.47 / 7.23 (5.99: the cores'
+QK binds).
 """
 
 import math
 
 import numpy as np
 import torch
+from aie.dialects.aiex import npu_write32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (
@@ -69,6 +70,9 @@ QA_CS = "qa_cs"  # scratchpad parameter: bf16 offset of the chunk's rows in the 
 QA_KV = "qa_kv"  # scratchpad parameter: bf16 offset of the chunk's first cache group (GROUP / 2 * p0 / 32)
 QA_N = "qa_n"  # scratchpad parameter: p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count)
 QA_OFF = "qa_off"  # scratchpad parameter: bf16 offset of the chunk's second cache group
+PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
+# (timing builds, ablate "ev_<kernel>": counter 0 the window's cycles, 1 lock stall, 2 all cycles, 3 the windows)
+COUNTERS = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24), (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24))
 
 
 def slot_walk() -> TensorAccessPattern:
@@ -429,31 +433,14 @@ class AttnPrepOperator(ArtcOperator):
 
 _ATTN = JINJA_ENV.from_string(r"""
 // The attention core's workspace (bytes, PrefillAttnOperator.workspace()): per row panel (R = QC QG: head h = i / QG,
-// token group QG r + i % QG of the pass) o [panel][db 32][8 x 8] fp32, sc [panel][record 4][8 x 8] fp32 (scores, log2
-// units), m, l [panel][64] (lane 8 q + k: query q's running maximum / its partial sums), pp [panel][record] P panels,
-// rm (a panel's group maxima)
+// token group QG r + i % QG of the pass) sc [panel][record 4][8 x 8] fp32 (A = s + 192 - m: the scores s in log2
+// units against the row's maximum; after the softmax its first 288 B the P panels), m, b, l [panel][64] (lane 8 q + k:
+// query q's running maximum, 192 - m, the partial sums), o [panel][db 32][8 x 8] fp32{{ ", ob its second copy (P V
+// reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, its own buffer): P [8][32],
+// f [8][32] bf16 (or a rescale's row maxima [64] fp32)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
-
-// 2^y of 32 lanes, y = A - 192 (|y| < 64; A an fp32 accumulator): n = round(y) by the bf16 rounding of A, f = A - (192 +
-// n), vexp2 of n + 64 (exact: a non-negative integer; the 2^-64 is in the constants), 2^f = 1 + c1 f + f^2 (c2 + c3 f)
-// (c1 fitted first, then c2, c3 with its rounding: 0.59 bf16 ULP)
-[[clang::always_inline]] inline aie::accum<accfloat, 32> {{ p }}_exp2(aie::accum<accfloat, 32> A)
-{
-    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
-    const aie::vector<bfloat16, 32> v = A.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> f = aie::msc(A, v, one).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> P = al::exp2_acc<32>(aie::mac(aie::mul(v, one), aie::broadcast<bfloat16, 32>(-128.0f), one));
-    const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f * 0x1p-64f)),
-                                                  aie::broadcast<bfloat16, 32>(0.2412109375f * 0x1p-64f), one)
-                                             .template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf = aie::mul(P, f).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf2 = aie::mul(pf, f).template to_vector<bfloat16>();
-    aie::accum<accfloat, 32> r = aie::mul(P, aie::broadcast<bfloat16, 32>(0x1p-64f));
-    r = aie::mac(r, pf, aie::broadcast<bfloat16, 32>(0.69140625f * 0x1p-64f));
-    return aie::mac(r, pf2, hi);
-}
 
 // Rows whose maximum grew: o, l scaled by 2^(m - mn), m = mn = max(m, rm) (rm: the rows' group maxima)
 __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__restrict pl, float *__restrict pm,
@@ -468,37 +455,97 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     aie::store_v(pm, mn);
 }
 
-// P = 2^(s - m) of a head's 4 score panels, clamped at 2^-63 (A = max(s + 192 - m, 129)), in place (sl, ss: the
-// scores as distinct restrict parameters, each read before it is written); l += P
-__attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict pm,
-                                            float *__restrict pl)
+// Masked keys of a diag group (row panel token group t, record rec = t % 4; dd < 0: the group lies after the panel's
+// queries): -16384 (P = 0 against any real row maximum)
+__attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int32_t rec)
 {
-    const aie::vector<float, 32> b0 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm));
-    const aie::vector<float, 32> b1 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm + 32));
-    const aie::vector<float, 32> lo = aie::broadcast<float, 32>(129.0f);
-    aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
+    const aie::mask<64> tri = aie::mask<64>::from_uint64(0x{{ tri }}ull);  // lane 8 q + j: j > q
+    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-16384.0f);
     for (int k = 0; k < 4; k++) {
-        const aie::accum<accfloat, 32> p0 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl), b0), lo)));
-        const aie::accum<accfloat, 32> p1 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl + 32), b1), lo)));
-        l0 = aie::add(l0, p0);
-        l1 = aie::add(l1, p1);
-        aie::store_v(ss, p0.template to_vector<float>());
-        aie::store_v(ss + 32, p1.template to_vector<float>());
-        sl += 64;
-        ss += 64;
+        if (dd < 0 || k > rec)
+            aie::store_v(s + 64 * k, ninf);
+        else if (k == rec)
+            aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
+    }
+}
+
+// pass 1 of P = 2^(s - m) over a head's 4 panels of A = s + 192 - m, 32 lanes a step: v = bf16(A) (an integer for
+// 128 <= A < 256), f = bf16(A - v), P = 2^(max(v, 129) - 192) exactly (vexp2 of max(v, 129) - 128: the 2^-64 in pass
+// 2's constants; below 129 2^-63, f small: P ~ 0) -> pP, pF; whether every v <= 208 (s <= m + 16)
+[[clang::always_inline]] inline bool {{ p }}_pexp1(const float *__restrict sl, bfloat16 *__restrict pP,
+                                                   bfloat16 *__restrict pF)
+{
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), lo = aie::broadcast<bfloat16, 32>(129.0f);
+    aie::vector<bfloat16, 32> mx = lo;
+    AIE_LOOP_UNROLL(2)
+    for (int t = 0; t < 8; t++) {
+        aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
+        const aie::vector<bfloat16, 32> v0 = A.template to_vector<bfloat16>();
+        mx = aie::max(mx, v0);
+        aie::store_v(pF, aie::msc(A, v0, one).template to_vector<bfloat16>());
+        aie::store_v(pP, al::exp2_acc<32>(aie::mac(aie::mul(aie::max(v0, lo), one), aie::broadcast<bfloat16, 32>(-128.0f),
+                                                   one)));
+        sl += 32;
+        pP += 32;
+        pF += 32;
+    }
+    return aie::lt(mx, aie::broadcast<bfloat16, 32>(209.0f)).full();
+}
+
+__attribute__((noinline)) bool {{ p }}_pass1(const float *__restrict s, float *__restrict pw)
+{
+    return {{ p }}_pexp1(s, (bfloat16 *)pw, (bfloat16 *)pw + 256);
+}
+
+// pass 2, a panel a step: 2^f = 1 + c1 f + f^2 (c2 + c3 f) (c1 fitted first, then c2, c3 with its rounding: 0.59 bf16
+// ULP), times P: the panel's P as bfp16 into pp, l += P
+__attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *__restrict pl, uint8_t *__restrict pp)
+{
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const bfloat16 *__restrict pP = (const bfloat16 *)pw;
+    const bfloat16 *__restrict pF = (const bfloat16 *)pw + 256;
+    al::BOut<> po((bfp16ebs8 *)pp);
+    aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < 4; t++) {
+        aie::accum<accfloat, 32> r[2];
+        AIE_LOOP_UNROLL_FULL
+        for (int u = 0; u < 2; u++) {
+            const aie::vector<bfloat16, 32> P = aie::load_v<32>(pP + 32 * u), f = aie::load_v<32>(pF + 32 * u);
+            const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f * 0x1p-64f)),
+                                                          aie::broadcast<bfloat16, 32>(0.2412109375f * 0x1p-64f), one)
+                                                     .template to_vector<bfloat16>();
+            const aie::vector<bfloat16, 32> p1 = aie::mul(P, f).template to_vector<bfloat16>();
+            const aie::vector<bfloat16, 32> p2 = aie::mul(p1, f).template to_vector<bfloat16>();
+            r[u] = aie::mul(P, aie::broadcast<bfloat16, 32>(0x1p-64f));
+            r[u] = aie::mac(r[u], p1, aie::broadcast<bfloat16, 32>(0.69140625f * 0x1p-64f));
+            r[u] = aie::mac(r[u], p2, hi);
+        }
+        l0 = aie::add(l0, r[0]);
+        l1 = aie::add(l1, r[1]);
+        po.push(aie::concat(r[0], r[1]).template to_vector<bfp16ebs8>());
+        pP += 64;
+        pF += 64;
     }
     aie::store_v(pl, l0.template to_vector<float>());
     aie::store_v(pl + 32, l1.template to_vector<float>());
 }
 
-// a head's 4 P panels (fp32) -> bfp16 panels
-__attribute__((noinline)) void {{ p }}_ppack(const float *__restrict s, uint8_t *__restrict pp)
+// A head's row maxima rise: rm = the group's row maxima of s = A - b, then o, l scaled by 2^(m - mn), m = mn =
+// max(m, rm), b = 192 - mn, A += the change of b
+__attribute__((noinline)) void {{ p }}_raise(float *__restrict s, float *__restrict o, float *__restrict pl,
+                                             float *__restrict pm, float *__restrict pb, float *__restrict prm)
 {
-    al::BOut<> po((bfp16ebs8 *)pp);
-    for (int k = 0; k < 4; k++) {
-        po.push(aie::accum<accfloat, 64>(aie::load_v<64>(s)).template to_vector<bfp16ebs8>());
-        s += 64;
-    }
+    const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
+                                              aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+    const aie::vector<float, 64> b = aie::load_v<64>(pb);
+    aie::store_v(prm, aie::sub(al::bcast8(al::group8<true>(v)), b));
+    {{ p }}_rescale(o, pl, pm, prm);
+    const aie::vector<float, 64> bn = aie::sub(aie::broadcast<float, 64>(192.0f), aie::load_v<64>(pm));
+    const aie::vector<float, 64> d = aie::sub(bn, b);
+    aie::store_v(pb, bn);
+    for (int k = 0; k < 4; k++)
+        aie::store_v(s + 64 * k, aie::add(aie::load_v<64>(s + 64 * k), d));
 }
 
 // a head's o += P0 V0 + P1 V1 (v: per d-block the two records' panels, interleaved by the memtile; o in place: ol, os
@@ -525,101 +572,108 @@ template <int NB>
 
 extern "C" {
 
-// A pass's start: o = 0, m = -1e30, l = 0
+// A pass's start: o = 0, m = -1e30, b = 0 (the first group raises m), l = 0
 void {{ p }}_init(float *__restrict ws)
 {
     al::zero<{{ R * 2048 }}, 64>(AW(float, {{ w.o }}));
     float *__restrict m = AW(float, {{ w.m }});
     for (int i = 0; i < {{ R }}; i++)
         aie::store_v(m + 64 * i, aie::broadcast<float, 64>(-1e30f));
+    al::zero<{{ R * 64 }}, 64>(AW(float, {{ w.b }}));
     al::zero<{{ R * 64 }}, 64>(AW(float, {{ w.l }}));
 }
 
-// Scores of K record k (8 positions; per d-block its hi and lo panels: the memtile interleaves the record's halves{{ "; d-blocks 0 .. 15 in kr, the rest in kr1: the two streams" if TWO }})
-// for each row panel: Q hi K hi + Q lo K hi + Q hi K lo (q: per panel per d-block the Q panels hi, lo), {{ "a loop per stream object" if TWO else "one loop" }}
+// Scores of K record k (8 positions; per d-block its hi and lo panels: the memtile interleaves the record's halves{{ "; the two streams' objects one after the other" if TWO }})
+// for each row panel: b + Q hi K hi + Q lo K hi + Q hi K lo (q: per panel per d-block the Q panels hi, lo), one loop
 // of two panel streams and three MMUL chains
-void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, {{ "const bfloat16 *__restrict kr1, " if TWO }}float *__restrict ws, int32_t k)
+void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, float *__restrict ws, int32_t k)
 {
 {% if "qk" in ablate %}
     return;
 {% endif %}
+{% if "ev_qk" in ablate %}
+    event0();
+{% endif %}
     float *__restrict sc = AW(float, {{ w.sc }}) + 64 * k;
+    const float *__restrict pb = AW(float, {{ w.b }});
     for (int h = 0; h < {{ R }}; h++) {
-        al::MM8 a(aie::zeros<accfloat, 64>()), b(aie::zeros<accfloat, 64>()), c(aie::zeros<accfloat, 64>());
+        al::MM8 a(aie::accum<accfloat, 64>(aie::load_v<64>(pb + 64 * h))), b(aie::zeros<accfloat, 64>()),
+            c(aie::zeros<accfloat, 64>());
         al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)((const uint8_t *)q + {{ SLOT }} * h));
-{% for src in (["kr", "kr1"] if TWO else ["kr"]) %}
-        {
-        al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *){{ src }});
+        al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)kr);
         AIE_PREPARE_FOR_POSTPIPELINING
-        for (int db = 0; db < {{ ND // 2 if TWO else ND }}; db++) {
+        for (int db = 0; db < {{ ND }}; db++) {
             const al::BV qh = qs.pop(), ql = qs.pop(), Kh = ks.pop(), Kl = ks.pop();
             a.mac(qh, aie::op_transpose(Kh));
             b.mac(ql, aie::op_transpose(Kh));
             c.mac(qh, aie::op_transpose(Kl));
         }
-        }
-{% endfor %}
         aie::store_v(sc + 256 * h, aie::add(aie::add(a.to_accum(), c.to_accum()), b.to_accum()).template to_vector<float>());
     }
+{% if "ev_qk" in ablate %}
+    event1();
+{% endif %}
 }
 
 // The group's softmax terms, diag groups before the pass's last: per row panel (its token group t = QG r + i % QG of
 // the pass, in the pass's group t / 4) on its diagonal group keys after the query masked (record k vs record t % 4),
 // the groups after it wholly (a panel's first groups are never masked: they lie before every pass's queries); a row's
-// maximum m is raised (o, l rescaled) only when its group maximum exceeds it by 2^16; P = 2^(s - m) as bfp16 panels,
-// l += P
-void {{ p }}_soft(float *__restrict ws, int32_t diag, int32_t r)
+// maximum m is raised (o, l rescaled, pass 1 again) on the pass's first group (g = 0) and when the group's exceeds it
+// by 2^16; P = 2^(s - m) as bfp16 panels, l += P
+void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int32_t r, int32_t g)
 {
 {% if "soft" in ablate %}
     return;
 {% endif %}
+{% if "ev_soft" in ablate %}
+    event0();
+{% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::mask<64> tri = aie::mask<64>::from_uint64(0x{{ tri }}ull);  // lane 8 q + j: j > q
-    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-1e30f);
     for (int h = 0; h < {{ R }}; h++) {
         float *__restrict s = AW(float, {{ w.sc }}) + 256 * h;
-        const int t = {{ QG }} * r + h % {{ QG }}, rec = t & 3, dd = diag - ({{ QG - 1 }} - (t >> 2));
-        if (dd <= 0) {
-            for (int k = 0; k < 4; k++) {
-                if (dd < 0 || k > rec)
-                    aie::store_v(s + 64 * k, ninf);
-                else if (k == rec)
-                    aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
-            }
-        }
-        const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
-                                                  aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+        const int t = {{ QG }} * r + h % {{ QG }}, dd = diag - ({{ QG - 1 }} - (t >> 2));
+        if (dd <= 0)
+            {{ p }}_mask(s, dd, t & 3);
         float *__restrict pm = AW(float, {{ w.m }}) + 64 * h;
         float *__restrict pl = AW(float, {{ w.l }}) + 64 * h;
-        // (each lane against its row's maximum: the rows' group maxima only when one is raised, rarely)
-        if (!aie::lt(aie::sub(v, aie::load_v<64>(pm)), aie::broadcast<float, 64>(16.0f)).full()) {
-            float *__restrict prm = AW(float, {{ w.rm }});
-            aie::store_v(prm, al::bcast8(al::group8<true>(v)));
-            {{ p }}_rescale(AW(float, {{ w.o }}) + 2048 * h, pl, pm, prm);
+        if (!{{ p }}_pass1(s, pw) || g == 0) {
+            {{ p }}_raise(s, AW(float, {{ w.o }}) + 2048 * h, pl, pm, AW(float, {{ w.b }}) + 64 * h, pw);
+            {{ p }}_pass1(s, pw);
         }
-        {{ p }}_pexp(s, s, pm, pl);
-        {{ p }}_ppack(s, AW(uint8_t, {{ w.pp }}) + 288 * h);
+        {{ p }}_pass2(pw, pl, (uint8_t *)s);
     }
+{% if "ev_soft" in ablate %}
+    event1();
+{% endif %}
 }
 
 // o += P V of two of the group's V records (v: records 2 half, 2 half + 1, a panel per d-block of blocks over the
-// positions{{ "; d-blocks 0 .. 15 in v, the rest in v1: the two streams" if TWO }})
-void {{ p }}_pv(const bfloat16 *__restrict v, {{ "const bfloat16 *__restrict v1, " if TWO }}float *__restrict ws, int32_t half)
+// positions{{ "; the two streams' objects one after the other" if TWO }}){{ "; o -> ob, then ob -> o: loads and stores in different regions" if OB }}
+void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half)
 {
 {% if "pv" in ablate %}
     return;
 {% endif %}
-    for (int h = 0; h < {{ R }}; h++) {
-        al::BIn<> ps((const bfp16ebs8 *)(AW(uint8_t, {{ w.pp }}) + 288 * h + 144 * half));
-        const al::BV P0 = ps.pop(), P1 = ps.pop();
-        float *__restrict o = AW(float, {{ w.o }}) + 2048 * h;
-{% if TWO %}
-        {{ p }}_pvh<{{ ND // 2 }}>(P0, P1, (const uint8_t *)v, o, o);
-        {{ p }}_pvh<{{ ND // 2 }}>(P0, P1, (const uint8_t *)v1, o + {{ 64 * ND // 2 }}, o + {{ 64 * ND // 2 }});
-{% else %}
-        {{ p }}_pvh<{{ ND }}>(P0, P1, (const uint8_t *)v, o, o);
+{% if "ev_pv" in ablate %}
+    event0();
 {% endif %}
+{% if OB %}
+    const float *__restrict src = AW(float, {{ w.o }}) + (half ? {{ w.ob - w.o }} / 4 : 0);
+    float *__restrict dst = AW(float, {{ w.o }}) + (half ? 0 : {{ w.ob - w.o }} / 4);
+{% else %}
+    const float *__restrict src = AW(float, {{ w.o }});
+    float *__restrict dst = AW(float, {{ w.o }});
+{% endif %}
+    for (int h = 0; h < {{ R }}; h++) {
+        al::BIn<> ps((const bfp16ebs8 *)(AW(uint8_t, {{ w.sc }}) + 1024 * h + 144 * half));
+        const al::BV P0 = ps.pop(), P1 = ps.pop();
+        const float *__restrict ol = src + 2048 * h;
+        float *__restrict os = dst + 2048 * h;
+        {{ p }}_pvh<{{ ND }}>(P0, P1, (const uint8_t *)v, ol, os);
     }
+{% if "ev_pv" in ablate %}
+    event1();
+{% endif %}
 }
 
 {% if TWO %}
@@ -676,7 +730,9 @@ class PrefillAttnOperator(ArtcOperator):
     pfx = kernel_prefix("qaa")
 
     def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = ()):
-        """``ablate`` (timing experiments, wrong results): kernel bodies compiled out ("qk", "soft", "pv")."""
+        """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_qk",
+        "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
+        two streams only)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0 and T // 32 <= 64
@@ -690,18 +746,19 @@ class PrefillAttnOperator(ArtcOperator):
         # (one q head per column: each KV head's cache on two streams, half of every object each, so a core takes it on
         # both input channels; its Q and gates ride ahead and behind on them; more q heads: one stream, Q apart)
         self.two = self.qc == 1 and self.nph >= 2
+        self.ob = self.R <= 2  # (o's second copy fits: regions 2 and 3)
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
         R = self.R
-        sizes = [("o", R * 8192), ("sc", R * 1024), ("m", R * 256), ("l", R * 256), ("pp", R * 288), ("rm", 256)]
-        return regions(sizes)
+        sizes = [("sc", R * 1024), ("m", R * 256), ("b", R * 256), ("l", R * 256), ("o", R * 8192)]
+        return regions(sizes + [("ob", R * 8192)] if self.ob else sizes)
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         tri = sum(1 << (8 * q + k) for q in range(8) for k in range(8) if k > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
-                            tri=f"{tri:016X}", ablate=self.ablate, TWO=self.two)
+                            tri=f"{tri:016X}", ablate=self.ablate, TWO=self.two, OB=self.ob)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -724,9 +781,10 @@ class PrefillAttnOperator(ArtcOperator):
         o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
         om_ty = np.ndarray[(4 * ND * 36,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
+        pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, kv_ty, ws_ty, np.int32])
-        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, np.int32, np.int32])
+        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [kv_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
@@ -747,7 +805,7 @@ class PrefillAttnOperator(ArtcOperator):
         o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
-        def core(q_h, kv_h, o_h, init, qk, soft, pv, fin, ws, n_p, row):
+        def core(q_h, kv_h, o_h, init, qk, soft, pv, fin, ws, pw, n_p, row):
             for _ in forever_():
                 for b in range_(n_pass):
                     q = q_h.acquire(1)
@@ -759,7 +817,7 @@ class PrefillAttnOperator(ArtcOperator):
                             kr = kv_h.acquire(1)
                             qk(q, kr, ws, k)
                             kv_h.release(1)
-                        soft(ws, n - 1 - g, row)
+                        soft(ws, pw, n - 1 - g, row, g)
                         for half in range(2):
                             v = kv_h.acquire(1)
                             pv(v, ws, half)
@@ -773,7 +831,7 @@ class PrefillAttnOperator(ArtcOperator):
                     q_h.release(1)
 
         workers = [Worker(core, [q1[c][r].cons(), kv[c // nph].cons(), o1[c][r].prod(), k_init, k_qk, k_soft, k_pv, k_fin,
-                                 Buffer(ws_ty, name=f"pa_ws{c}_{r}"), p_n, r],
+                                 Buffer(ws_ty, name=f"pa_ws{c}_{r}"), Buffer(pw_ty, name=f"pa_pw{c}_{r}"), p_n, r],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs = COLS * T // 8 * 2 * qc * SLOT // 2
@@ -818,7 +876,7 @@ class PrefillAttnOperator(ArtcOperator):
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()
         pin_l1_buffers(module, fifo=lambda name, depth: next((v for k, v in lay.items() if name.startswith(k)), None),
-                       buffer=lambda name: lay["pa_ws"][0] if name.startswith("pa_ws") else None)
+                       buffer=lambda name: next((v[0] for k, v in lay.items() if name.startswith(k)), None))
         return module
 
     def _two_artifact(self) -> Module:
@@ -836,11 +894,12 @@ class PrefillAttnOperator(ArtcOperator):
         o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
         om_ty = np.ndarray[(4 * ND * 36,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
+        pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, h_ty, q_ty, np.int32, np.int32])
-        k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, h_ty, h_ty, ws_ty, np.int32])
-        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, np.int32, np.int32])
-        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, h_ty, ws_ty, np.int32])
+        k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, h_ty, ws_ty, np.int32])
+        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
+        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
@@ -854,7 +913,7 @@ class PrefillAttnOperator(ArtcOperator):
         o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
-        def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, qb, n_p, row, me):
+        def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me):
             for _ in forever_():
                 for b in range_(n_pass):
                     for i in range_(n_q):
@@ -869,15 +928,15 @@ class PrefillAttnOperator(ArtcOperator):
                     for g in range32(n):
                         for k in range(4):
                             ka = a_h.acquire(1)
-                            kb = b_h.acquire(1)
-                            qk(qb, ka, kb, ws, k)
+                            b_h.acquire(1)  # (b's object follows a's: l1_layout)
+                            qk(qb, ka, ws, k)
                             a_h.release(1)
                             b_h.release(1)
-                        soft(ws, n - 1 - g, row)
+                        soft(ws, pw, n - 1 - g, row, g)
                         for half in range(2):
                             va = a_h.acquire(1)
-                            vb = b_h.acquire(1)
-                            pv(va, vb, ws, half)
+                            b_h.acquire(1)
+                            pv(va, ws, half)
                             a_h.release(1)
                             b_h.release(1)
                     for i in range_(n_q):  # (the gates into the Q slots' buffer)
@@ -897,6 +956,7 @@ class PrefillAttnOperator(ArtcOperator):
             for r in range(4):
                 workers.append(Worker(core, [kv[h, 0].cons(), kv[h, 1].cons(), o1[c][r].prod(), k_init, k_qsel, k_qk,
                                              k_soft, k_pv, k_fin, Buffer(ws_ty, name=f"pa_ws{c}_{r}"),
+                                             Buffer(pw_ty, name=f"pa_pw{c}_{r}"),
                                              Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph) * 4 * qg + qg * r],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
@@ -907,6 +967,11 @@ class PrefillAttnOperator(ArtcOperator):
 
         def seq(QS, KV, A, kvh, oh):
             sync_parameters()
+            if any(a.startswith("ev_") for a in self.ablate):  # (the cores' counters: window cycles, lock stall)
+                for c in range(COLS):
+                    for r in range(4):
+                        for reg, val in COUNTERS:
+                            npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):
                 oh[c].drain(A, TensorAccessPattern((n_a,), c * ND * 36, [n_pass, R, 4, ND * 36],
@@ -946,17 +1011,20 @@ class PrefillAttnOperator(ArtcOperator):
         return module
 
     def l1_layout(self) -> dict[str, list[int]]:
-        """Core byte addresses by 16 KB region (aiecc puts the stack at 0): 0 the K / V records and an output buffer,
-        1 the Q panels held through a pass and the other output buffer, 2 and 3 the workspace (O, the scores, P): QK
-        streams Q (1) against K (0), PV V (0) into O (2, 3). 27B: 61 of 64 KB."""
-        kv, o, q = AT.REC_K, ND * 72, self.R * SLOT
-        if self.two:  # (the two streams' half objects in region 0; the Q slots, then the gates, in region 1)
+        """Core byte addresses by 16 KB region (aiecc puts the stack at 0): 0 the K / V records, an output buffer and the
+        softmax's scratch, 1 the Q panels held through a pass, the other output buffer (and with o's second copy the
+        scores, m, l), 2 and 3 o (its two copies, else the workspace): QK streams Q (1) against K (0), PV V (0) from one
+        o copy into the other. The 1B and 9B: all 64 KB, the 27B 61."""
+        kv, o, q, w = AT.REC_K, ND * 72, self.R * SLOT, self.workspace()
+        pw = self.STACK + 2 * kv + o
+        if self.two:  # (the two streams' half objects in region 0, object i of b after object i of a: the kernels read
+            # both from a's pointer; the Q slots, then the gates, in region 1)
             h = kv // 2
-            lay = {"pa_ka": [self.STACK, self.STACK + h], "pa_kb": [self.STACK + 2 * h, self.STACK + 3 * h],
-                   "pa_or": [self.STACK + 4 * h, 0x4000 + q], "pa_qb": [0x4000], "pa_ws": [0x8000]}
+            lay = {"pa_ka": [self.STACK, self.STACK + 2 * h], "pa_kb": [self.STACK + h, self.STACK + 3 * h],
+                   "pa_or": [self.STACK + 4 * h, 0x4000 + q], "pa_qb": [0x4000]}
         else:
-            lay = {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, 0x4000 + q], "pa_qr": [0x4000],
-                   "pa_ws": [0x8000]}
-        assert self.STACK + 2 * kv + o <= 0x4000 and 0x4000 + q + o <= 0x8000
-        assert 0x8000 + self.workspace()["size"] <= 0x10000
+            lay = {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, 0x4000 + q], "pa_qr": [0x4000]}
+        ws = 0x8000 - w["o"] if self.ob else 0x8000
+        lay |= {"pa_pw": [pw], "pa_ws": [ws]}
+        assert pw + PW <= 0x4000 and 0x4000 + q + o <= ws and ws + w["size"] <= 0x10000
         return lay
