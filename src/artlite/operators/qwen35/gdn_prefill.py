@@ -1184,12 +1184,6 @@ void {{ p }}_norm(const bfloat16 *__restrict a, float *__restrict ws)
     al::copy<{{ D }}, 32>(ws, (const float *)a);
 }
 
-// A conv state object (the last valid tokens' qkv rows) -> out
-void {{ p }}_copy(const bfloat16 *__restrict b, bfloat16 *__restrict c)
-{
-    al::copy<{{ OBJ }}, 64>(c, b);
-}
-
 // 1 / rms of the 16 (token, head) rows of o -> ivt [16][hi 32 | lo 32] (bf16)
 [[clang::always_inline]] inline void {{ p }}_rms16(const bfloat16 *__restrict o, bfloat16 *__restrict ivt)
 {
@@ -1246,11 +1240,13 @@ void {{ p }}_copy(const bfloat16 *__restrict b, bfloat16 *__restrict c)
     }
 }
 
-// 8 tokens of a pair of v heads: o, z [8][2 x 128] -> rms(o) ssm_norm silu(z) as 32 bfp16 panels (8 tokens x 8 dims)
-// (4565 cycles: the rows' 1 / rms first, then one pipelined loop, II 14 per 32; per-row loops, unpipelined: 7713)
-void {{ p }}_pair(const bfloat16 *__restrict o, const bfloat16 *__restrict z, float *__restrict ws,
-                  bfloat16 *__restrict out)
+// 8 tokens of a pair of v heads: u = [o | z] ([8][2 x 128] each) -> rms(o) ssm_norm silu(z) as 32 bfp16 panels (8
+// tokens x 8 dims) (4565 cycles: the rows' 1 / rms first, then one pipelined loop, II 14 per 32; per-row loops,
+// unpipelined: 7713)
+void {{ p }}_pair(const bfloat16 *__restrict u, float *__restrict ws, bfloat16 *__restrict out)
 {
+    const bfloat16 *__restrict o = u;
+    const bfloat16 *__restrict z = u + {{ OBJ }};
     aie::set_rounding(aie::rounding_mode::conv_even);
     const float *__restrict nw = ws;
     float *__restrict y = ws + {{ D }};  // [8][256]
@@ -1285,17 +1281,19 @@ void {{ p }}_pair(const bfloat16 *__restrict o, const bfloat16 *__restrict z, fl
 
 
 class GdnOutOperator(ArtcOperator):
-    """The gated output of a GDN layer's chunk and its new conv state (module docstring). Runtime sequence: O (the
-    scan's), G (z), GC (``gc_rows`` rows of G's layout: the prompt chunk's; the conv state rows from the scratchpad
-    parameter ``gdn_conv``: ``conv_offset``), P (ssm_norm first), GHDR (the conv states written), A (the ssm_out
-    GEMM's panels, T x hv 128)."""
+    """The gated output of a GDN layer's chunk and its new conv state (module docstring). Per column 4 cores: the units
+    (8 tokens x a pair of the column's v heads, pair-major) come as [o | z] objects, four per memtile object split
+    between the cores, their panels joined back; the conv state goes from GC through the memtile into GHDR (no core).
+    Runtime sequence: O (the scan's), G (z), GC (``gc_rows`` rows of G's layout: the prompt chunk's; the conv state rows
+    from the scratchpad parameter ``gdn_conv``: ``conv_offset``), P (ssm_norm first), GHDR (the conv states written), A
+    (the ssm_out GEMM's panels, T x hv 128)."""
 
     STACK = 4096
-    OBJ = 2048  # bf16 of an input object: 8 tokens x a pair of heads
+    OBJ = 2048  # bf16 of an o (or z) unit: 8 tokens x a pair of heads
     pfx = kernel_prefix("gdo")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, hslot: int, cs_off: int, gc_rows: int = 0):
-        assert T % 8 == 0 and T // 8 <= 64
+        assert T % 32 == 0 and T // 8 <= 64
         self.T, self.cfg, self.layout, self.hslot, self.cs_off = T, cfg, layout, hslot, cs_off
         self.gc_rows = gc_rows or T
         self.sh = GD.GdnShape(cfg)
@@ -1329,73 +1327,73 @@ class GdnOutOperator(ArtcOperator):
     def get_mlir_artifact(self) -> Module:
         p, T, hc, lay, hv, ch = self.pfx, self.T, self.hc, self.layout, self.hv, self.ch
         bf = np.dtype[bfloat16]
-        obj_ty = np.ndarray[(self.OBJ,), bf]
-        pan_ty = np.ndarray[(32 * 36,), bf]  # 32 panels of 72 B
+        U = 2 * self.OBJ  # (a unit: [o | z])
+        obj_ty, u_ty, uq_ty = (np.ndarray[(n,), bf] for n in (self.OBJ, U, 4 * U))
+        pan_ty, panq_ty = np.ndarray[(32 * 36,), bf], np.ndarray[(4 * 32 * 36,), bf]  # 32 panels of 72 B
         ws_ty = np.ndarray[(D + 8 * 256 + 4 * 256 + 512 + D // 32 * 32,), np.dtype[np.float32]]  # norm | y | silu(z) (bf16) | 1 / rms | norm hi / lo
-        k_norm = Kernel(f"{p}_norm", "kernel.o", [obj_ty, ws_ty])
-        k_copy = Kernel(f"{p}_copy", "kernel.o", [obj_ty, obj_ty])
-        k_pair = Kernel(f"{p}_pair", "kernel.o", [obj_ty, obj_ty, ws_ty, pan_ty])
+        k_norm = Kernel(f"{p}_norm", "kernel.o", [u_ty, ws_ty])
+        k_pair = Kernel(f"{p}_pair", "kernel.o", [u_ty, ws_ty, pan_ty])
         conv = ScratchpadParameter(CONV_OFF, np.int32)
-        a_f = [ObjectFifo(obj_ty, name=f"go_a{c}", depth=2) for c in range(COLS)]
-        b_f = [ObjectFifo(obj_ty, name=f"go_b{c}", depth=2) for c in range(COLS)]
-        c_f = [ObjectFifo(pan_ty, name=f"go_c{c}", depth=2) for c in range(COLS)]
-        d_f = [ObjectFifo(obj_ty, name=f"go_d{c}", depth=1) for c in range(COLS)]
+        a3 = [ObjectFifo(uq_ty, name=f"go_a{c}", depth=2) for c in range(COLS)]
+        a1 = [a3[c].cons().split([U * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[u_ty] * 4,
+                                 names=[f"go_ap{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        c3 = [ObjectFifo(panq_ty, name=f"go_c{c}", depth=2) for c in range(COLS)]
+        c1 = [c3[c].prod().join([32 * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
+                                obj_types=[pan_ty] * 4, names=[f"go_cp{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        d3 = [ObjectFifo(obj_ty, name=f"go_d{c}", depth=2) for c in range(COLS)]  # (the conv state: DDR -> memtile -> DDR)
+        d1 = [d3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"go_dm{c}") for c in range(COLS)]
         n_g, npair = T // 8, hc // 2
+        per_core = n_g * npair // 4
 
-        def core(a_h, b_h, c_h, d_h, norm, copy, pair, ws):
+        def core(a_h, c_h, norm, pair, ws):
             for _ in forever_():
                 a = a_h.acquire(1)
                 norm(a, ws)
                 a_h.release(1)
-                for _ in range_(2):
-                    b = b_h.acquire(1)
-                    d = d_h.acquire(1)
-                    copy(b, d)
-                    d_h.release(1)
-                    b_h.release(1)
-                for _ in range_(n_g * npair):
+                for _ in range_(per_core):
                     a = a_h.acquire(1)
-                    b = b_h.acquire(1)
                     c = c_h.acquire(1)
-                    pair(a, b, ws, c)
+                    pair(a, ws, c)
                     c_h.release(1)
-                    b_h.release(1)
                     a_h.release(1)
 
-        workers = [Worker(core, [a_f[c].cons(), b_f[c].cons(), c_f[c].prod(), d_f[c].prod(), k_norm, k_copy, k_pair,
-                                 Buffer(ws_ty, name=f"go_ws{c}")], tile=Tile(c, 2), stack_size=self.STACK,
-                          dynamic_objfifo_lowering=True, while_true=False) for c in range(COLS)]
+        workers = [Worker(core, [a1[c][r].cons(), c1[c][r].prod(), k_norm, k_pair, Buffer(ws_ty, name=f"go_ws{c}_{r}")],
+                          tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
+                   for c in range(COLS) for r in range(4)]
         N, n_o, n_p = lay.N, T * hv * D, params_bytes(hc) // 2
         n_hdr, n_a = self.ghdr_bytes // 2, T * hv * D * 9 // 16
         kb_row = hv * D // 8 * 36  # (bf16 of a token group's panels)
 
         n_gc = self.gc_rows * N
 
-        def seq(O, G, GC, P, GH, A, ah, bh, ch_, dh):
+        def seq(O, G, GC, P, GH, A, ah, ch_, dh, d1h):
             sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
-                ah[c].fill(P, TensorAccessPattern((n_p,), 0, [1, 1, 1, self.OBJ], [0, 0, 0, 1]), group=tg)
-                ah[c].fill(O, TensorAccessPattern((n_o,), 2 * c * D, [n_g, npair, 8, 2 * D], [8 * hv * D, 16 * D, hv * D, 1]),
-                           group=tg)
+                # (the norm to each core: P's first unit read four times)
+                ah[c].fill(P, TensorAccessPattern((n_p,), 0, [1, 4, U // 1024, 1024], [0, 0, 1024, 1]), group=tg)
+                z0 = c * lay.pitch + lay.off["z"]
+                for pp in range(npair):  # (the pair's units [o | z] of every token group)
+                    chained_fill(ah[c], O, [TensorAccessPattern((n_o,), 2 * c * D + 16 * D * pp, [n_g, 1, 8, 2 * D],
+                                                                [8 * hv * D, 0, hv * D, 1]),
+                                            ChainPart(G, TensorAccessPattern((T * N,), z0 + 2 * D * pp, [n_g, 1, 8, 2 * D],
+                                                                             [8 * N, 0, N, 1]))], tg)
                 qkv = c * lay.pitch + lay.off["qkv"]
-                bh[c].fill(GC, TensorAccessPattern((n_gc,), qkv, [1, 1, 3, ch], [0, 0, N, 1]), offset_parameter=conv,
+                dh[c].fill(GC, TensorAccessPattern((n_gc,), qkv, [1, 1, 3, ch], [0, 0, N, 1]), offset_parameter=conv,
                            group=tg)
-                bh[c].fill(GC, TensorAccessPattern((n_gc,), 0, [1, 1, 1, 2 * self.OBJ - 3 * ch], [0, 0, 0, 1]),
+                dh[c].fill(GC, TensorAccessPattern((n_gc,), 0, [1, 1, 1, 2 * self.OBJ - 3 * ch], [0, 0, 0, 1]),
                            group=tg)
-                bh[c].fill(G, TensorAccessPattern((T * N,), c * lay.pitch + lay.off["z"], [n_g, npair, 8, 2 * D],
-                                                  [8 * N, 2 * D, N, 1]), group=tg)
                 # (the conv state and the objects' padding after it: the bytes the decode's conv-state drain writes)
                 cs = (c * self.hslot + self.cs_off) // 2
-                dh[c].drain(GH, TensorAccessPattern((n_hdr,), cs, [1, 1, 1, 2 * self.OBJ], [0, 0, 0, 1]), group=tg)
-                ch_[c].drain(A, TensorAccessPattern((n_a,), 2 * c * 16 * 36, [n_g, npair, 1, 32 * 36],
-                                                    [kb_row, 16 * 16 * 36, 0, 1]), group=tg, wait=True)
+                d1h[c].drain(GH, TensorAccessPattern((n_hdr,), cs, [1, 1, 1, 2 * self.OBJ], [0, 0, 0, 1]), group=tg)
+                ch_[c].drain(A, TensorAccessPattern((n_a,), 2 * c * 16 * 36, [1, npair, n_g, 32 * 36],
+                                                    [0, 16 * 16 * 36, kb_row, 1]), group=tg, wait=True)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_o,), bf], np.ndarray[(T * N,), bf], np.ndarray[(n_gc,), bf],
                            np.ndarray[(n_p,), bf], np.ndarray[(n_hdr,), bf], np.ndarray[(n_a,), bf],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a_f)],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b_f)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(c_f)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(d_f)]])
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(c3)],
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(d3)],
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(d1)]])
         return Program(NPU2(), rt, workers=workers).resolve_program()

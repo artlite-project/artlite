@@ -134,7 +134,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
     event0();
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if lut %}
-    {{ lut }}_silu_lut<{{ ts }}>(input, output);
+    {{ lut }}_{{ table }}_lut<{{ ts }}>(input, output);
 {% else %}
     // al::silu, 16 lanes per step (see kernel_lib.h)
     for (int j = 0; j < {{ ts }}; j += 16) {
@@ -153,22 +153,25 @@ class SiluOperator(StreamOperator):
     (software exp2, two Newton steps for the reciprocal; not pipelined: one long fp32 chain per 16 lanes, spilling,
     ~16 cycles per element)."""
 
-    def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, lut: bool = False):
-        self.lut = lut
+    def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, lut: bool = False,
+                 table: str = "silu"):
+        """``table``: the act_lut table of the lut form (silu, sigmoid)."""
+        self.lut, self.table = lut, table
         super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, dtypes_in=(torch.bfloat16,),
                          dtypes_out=(torch.bfloat16,))
 
     @property
     def kernel_name(self) -> str:
-        return f"silu_{'lut' if self.lut else 'exact'}_bf16_{self.tile}"
+        return f"{self.table}_{'lut' if self.lut else 'exact'}_bf16_{self.tile}"
 
     @property
     def stack_size(self) -> int | None:
         return 0xA00  # a 2.2 KB frame
 
     def get_kernel_src(self) -> str:
-        return ((act_lut.render_silu() if self.lut else "")
-                + _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and act_lut.LUT))
+        tab = {"silu": act_lut.SILU, "sigmoid": act_lut.SIGMOID}[self.table]
+        return ((tab.render() if self.lut else "")
+                + _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and act_lut.LUT, table=self.table))
 
 
 _GELU = JINJA_ENV.from_string(r"""
@@ -214,8 +217,9 @@ class GeluOperator(StreamOperator):
 def emulate(table: act_lut.ActTable, x: np.ndarray) -> np.ndarray:
     """A table activation's kernel result (``ActTable.render``; bit-exact on the NPU)."""
     x = act_lut._bf16(x)
-    v, r, r2 = table._reduce(np.minimum(np.abs(x), np.float32(table.t_max)))
-    s = ((v - table.m) / table.seg).astype(np.int64)
+    tm = np.float32(table.t_max)
+    v, r, r2 = table._reduce(np.clip(x, -tm, tm) if table.full else np.minimum(np.abs(x), tm))
+    s = ((v - table.base) / table.seg).astype(np.int64)
     c0, c1, c2 = (act_lut._f32(table.coefficients[s, i]) for i in range(3))
     acc = act_lut._f32(act_lut._f32(c0 + act_lut._f32(c1 * r)) + act_lut._f32(c2 * r2))
-    return act_lut._bf16(act_lut._f32(acc + np.maximum(x, np.float32(0))))
+    return act_lut._bf16(acc if table.full else act_lut._f32(acc + np.maximum(x, np.float32(0))))

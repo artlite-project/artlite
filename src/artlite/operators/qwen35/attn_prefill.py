@@ -51,6 +51,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ...model_config import QwenConfig
+from .. import act_lut
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, range32, stream_walk
 from ..gemm.gemm_q import chained_fill
@@ -87,6 +88,8 @@ _PREP = JINJA_ENV.from_string(r"""
 #define PW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
+
+{{ sigmoid }}
 
 // x (256 bf16) -> row = x / rms(x) w (fp32), dims 0 .. 63 rotated by cs [cos 32 | sin 32] (NeoX pairs i, i + 32)
 __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
@@ -151,14 +154,18 @@ __attribute__((noinline)) void {{ p }}_hiloi(const float *__restrict st, uint8_t
 
 extern "C" {
 
-// The first object: q_norm, k_norm (256 fp32 each)
+// The first object: q_norm, k_norm (256 fp32 each); q_norm times the scores' scale log2(e) / 16 (the rotation is
+// linear: the scale before it)
 void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
 {
+    aie::set_rounding(aie::rounding_mode::conv_even);
     al::copy<{{ 2 * HD }}, 16>(PW(float, {{ w.nrm }}), (const float *)n);
+    for (int i = 0; i < {{ HD }}; i += 64)
+        aie::store_v(PW(float, {{ w.nrm }}) + i, al::mul_hilo<64, {{ qs[0] }}f, {{ qs[1] }}f>(aie::load_v<64>(PW(float, {{ w.nrm }}) + i)));
 }
 
 // 8 tokens of a q head: q (rows [q 256 | gate 256] bf16), cs (8 x [cos 32 | sin 32] fp32) -> out: per d-block the
-// Q panels hi, lo of q / rms(q) q_norm, rotated, x log2(e) / 16
+// Q panels hi, lo of q / rms(q) q_norm log2(e) / 16, rotated
 void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -167,27 +174,26 @@ void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, flo
     float *__restrict st = PW(float, {{ w.stage }});
     for (int r = 0; r < 8; r++) {
         {{ p }}_nr(q + {{ 2 * HD }} * r, PW(float, {{ w.nrm }}), cs + 64 * r, row);
-        for (int i = 0; i < {{ HD }}; i += 64)
-            aie::store_v(row + i, al::mul_hilo<64, {{ qs[0] }}f, {{ qs[1] }}f>(aie::load_v<64>(row + i)));
         {{ p }}_scatter(row, st, r);
     }
     {{ p }}_hiloi(st, (uint8_t *)out);
 }
 
-// sigmoid(gate) of the 8 tokens = 1 / (1 + 2^(-gate log2 e)) -> sg (8 x 256 bf16)
+// sigmoid(gate) of the 8 tokens -> sg (8 x 256 bf16): the gates clamped to the table's range into sg, then the table
+// pass in place (act_lut.SIGMOID: within 0.54 bf16 ULP)
 void {{ p }}_sg(const bfloat16 *__restrict q, bfloat16 *__restrict sg)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::vector<float, 32> one = aie::broadcast<float, 32>(1.0f);
+    const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ tmax }}f), lo = aie::broadcast<bfloat16, 32>(-{{ tmax }}f);
+    const bfloat16 *__restrict g = q + {{ HD }};
+    bfloat16 *__restrict t = sg;
     for (int r = 0; r < 8; r++) {
-        const bfloat16 *__restrict g = q + {{ 2 * HD }} * r + {{ HD }};
-        for (int i = 0; i < {{ HD }}; i += 32) {
-            const aie::vector<float, 32> gv = aie::accum<accfloat, 32>(aie::load_v<32>(g + i)).template to_vector<float>();
-            const aie::vector<float, 32> e = al::exp2f<32>(al::log2e<32>(aie::sub(aie::zeros<float, 32>(), gv)));
-            aie::store_v(sg + {{ HD }} * r + i,
-                         aie::accum<accfloat, 32>(aie::inv(aie::add(e, one))).template to_vector<bfloat16>());
-        }
+        for (int i = 0; i < {{ HD }}; i += 32)
+            aie::store_v(t + i, aie::min(aie::max(aie::load_v<32>(g + i), lo), hi));
+        g += {{ 2 * HD }};
+        t += {{ HD }};
     }
+    {{ lut }}_sigmoid_tab<{{ 8 * HD }}>(sg, sg, sg, sg);
 }
 
 // 8 tokens of a KV head's K (rows [half 0 | half 1] bf16), cs -> its cache record [hi panels | lo panels]
@@ -256,7 +262,8 @@ class AttnPrepOperator(ArtcOperator):
         p = self.pfx
         qs = bf16_hilo(math.log2(math.e) / 16)
         return _PREP.render(p=p, HD=HD, ND=ND, w=Attr(self.workspace()), eps=repr(self.cfg.rms_norm_eps), qs=qs,
-                            AT_REC_K=AT.REC_K)
+                            AT_REC_K=AT.REC_K, sigmoid=act_lut.SIGMOID.render(), lut=act_lut.LUT,
+                            tmax=repr(act_lut.SIGMOID.t_max))
 
     def kv_job(self, c: int) -> tuple[str, int] | None:
         """Column c's KV core's job: ("k" or "v", the KV head), or None (one every COLS / (2 KV heads) columns)."""

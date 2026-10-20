@@ -39,3 +39,21 @@ class TestRtcSiLU:
         exact = np.mean(out[m] == torch.from_numpy(ref[m]).float().bfloat16().float().numpy())
         assert err <= 0.59 and exact >= 0.998, f"max error {err:.3f} bf16 ULPs, {exact:.2%} correctly rounded"
         assert np.abs(out[~m] - ref[~m]).max() < 1e-9
+
+    def test_sigmoid_lut(self):
+        """The table sigmoid (act_lut.SIGMOID: the function over [-16, 16]) over every finite bf16 (but the tiny
+        ones): bit-exact against its emulation, within 0.6 bf16 ULP in [-16, 16] (beyond: within 1.2e-7)."""
+        x = torch.from_numpy(act_lut.bf16_values()).bfloat16()
+        x = x[(x.float().abs() >= 1e-30) | (x == 0)]
+        x = torch.cat([x, torch.zeros(-len(x) % 1024, dtype=torch.bfloat16)])
+        op = SiluOperator(size=len(x), num_columns=1, tile_size=1024, lut=True, table="sigmoid").compile()
+        out = op.run(x).float().numpy()
+        xf = x.float().numpy()
+        assert np.array_equal(out, emulate(act_lut.SIGMOID, xf))
+        ref = act_lut.sigmoid64(xf)
+        m = np.abs(xf) <= act_lut.SIGMOID.t_max
+        err = (np.abs(out[m] - ref[m]) / act_lut.ulp_bf16(ref[m])).max()
+        exact = np.mean(out[m] == torch.from_numpy(ref[m]).float().bfloat16().float().numpy())
+        print(f"sigmoid table: max {err:.3f} bf16 ULPs, {exact:.2%} correctly rounded")
+        assert err <= 0.6 and exact >= 0.99, f"max error {err:.3f} bf16 ULPs, {exact:.2%} correctly rounded"
+        assert np.abs(out[~m] - ref[~m]).max() < 1.2e-7

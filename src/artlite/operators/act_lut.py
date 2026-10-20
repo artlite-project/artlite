@@ -20,6 +20,9 @@ table is stored as groups of 4 entries, each group twice (64 bytes per 4 segment
 per segment, 3.2 KB for SiLU (cd aliased onto ab: half the memory, 9% slower). Entries: [c2 bf16 | c1 bf16 | c0 fp32]
 (``shuffle(.., T16_16x4_lo)`` gives c2 | c1 per 16 lanes, ``T32_16x2_hi`` c0).
 
+Sigmoid (``full``: the function itself over [-16, 16], x + 48 in the binade [32, 64] of ULP 1/4: 129 segments, no
+symmetry, x clamped to the range): within 0.6 bf16 ULP, ~1 cycle per element (an fp32 exp2 and reciprocal: ~5).
+
 vexp2 is Schraudolph's exp exactly, 2^floor(y) (1 + the 7-bit truncated fraction of y) of y truncated to bf16 (off by
 up to 6.1%; exact at non-negative integers); vtanh returns x below 0.5 and is up to 19 ULP off below 1 (both probed
 over every bf16 input).
@@ -58,6 +61,10 @@ def bf16_values() -> np.ndarray:
 def silu64(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, np.float64)
     return x / (1.0 + np.exp(np.minimum(-x, 700.0)))
+
+
+def sigmoid64(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(np.minimum(-np.asarray(x, np.float64), 700.0)))
 
 
 def gelu64(x: np.ndarray) -> np.ndarray:
@@ -104,6 +111,7 @@ def _round_bf16(c: float) -> float:
 class ActTable:
     """An activation f with f(x) - f(-x) = x (x sigmoid of an odd function: SiLU, GELU) as relu(x) + g(t), g(t) =
     f(-t), t = min(|x|, t_max), g a table of segments of ``seg`` over [0, t_max] (t + m in one binade of ULP seg).
+    ``full``: f itself over [-t_max, t_max] (x clamped; x + m in the binade [m - t_max, m + t_max]: sigmoid).
     ``floor``: the error that counts in units of the result's ULP is at least this absolute one (GELU's tail, below
     1e-7 at t = 5, decays faster than a quadratic per segment follows; relative accuracy there is irrelevant)."""
 
@@ -113,10 +121,16 @@ class ActTable:
     m: float
     t_max: float
     floor: float = 0.0
+    full: bool = False
+
+    @property
+    def base(self) -> float:
+        """The reduced argument's binade start (its first segment's)."""
+        return self.m - self.t_max if self.full else self.m
 
     @property
     def segs(self) -> int:
-        return int(self.t_max / self.seg) + 1
+        return int((2 if self.full else 1) * self.t_max / self.seg) + 1
 
     @property
     def groups(self) -> int:
@@ -134,7 +148,7 @@ class ActTable:
         table's parameters and the fitting code)."""
         code = [inspect.getsource(f) for f in (self.f64, ActTable._fit, ActTable._reduce, _minimax, _round_bf16, _bf16, _f32,
                                                bf16_values, ulp_bf16)]
-        key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, code)).encode()).hexdigest()[:16]
+        key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, self.full, code)).encode()).hexdigest()[:16]
         path = os.path.join(CACHE_DIR, "act_lut", f"{self.name}_{key}.npy")
         if os.path.exists(path):
             return np.load(path)
@@ -147,18 +161,24 @@ class ActTable:
 
     def _fit(self) -> np.ndarray:
         x = bf16_values()
-        t = -x[(x <= 0) & (x >= -self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
-        v, r, r2 = self._reduce(t)
-        s = ((v - self.m) / self.seg).astype(np.int64)
-        f = self.f64(-t)
-        # (the error of y = relu(x) + g on both sides)
-        w = 1.0 / np.maximum(np.minimum(ulp_bf16(f), ulp_bf16(self.f64(t))), self.floor)
+        if self.full:
+            t = x[(np.abs(x) <= self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
+            v, r, r2 = self._reduce(t)
+            f = self.f64(t)
+            w = 1.0 / np.maximum(ulp_bf16(f), self.floor)
+        else:
+            t = -x[(x <= 0) & (x >= -self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
+            v, r, r2 = self._reduce(t)
+            f = self.f64(-t)
+            # (the error of y = relu(x) + g on both sides)
+            w = 1.0 / np.maximum(np.minimum(ulp_bf16(f), ulp_bf16(self.f64(t))), self.floor)
+        s = ((v - self.base) / self.seg).astype(np.int64)
         coef = np.zeros((self.segs, 3))
         for k in range(self.segs):
-            sel = (s == k) & (t != 0)
+            sel = (s == k) & ((t != 0) | self.full)
             rk, r2k, fk, wk = r[sel].astype(np.float64), r2[sel].astype(np.float64), f[sel], w[sel]
             ones, zero = np.ones_like(rk), np.zeros_like(fk)
-            if k == 0:  # c0 = 0: tiny t stay relative-accurate
+            if k == 0 and not self.full:  # c0 = 0: tiny t stay relative-accurate
                 c2 = _round_bf16(_minimax([rk, r2k], fk, wk, zero)[1])
                 c1 = _round_bf16(_minimax([rk], fk, wk, c2 * r2k)[0])
                 coef[k] = 0.0, c1, c2
@@ -196,8 +216,8 @@ class ActTable:
         of an iteration are that many elements apart (otherwise)."""
         shift = int(np.log2(16 / self.seg))  # 16 bytes of offset per segment
         return _TABLE.render(p=LUT, name=self.name, words=[f"0x{w:08x}u" for w in self.table_words()], M=repr(self.m),
-                             bias=int(self.m * 2 ** shift), shift=shift, t_max=repr(self.t_max), table_arg=table_arg,
-                             gate_up=gate_up, x_step=x_step)
+                             bias=int(self.base * 2 ** shift), shift=shift, t_max=repr(self.t_max), table_arg=table_arg,
+                             gate_up=gate_up, x_step=x_step, full=self.full)
 
     def render_unrolled(self, n: int) -> str:
         """The C++ of ``{LUT}_tabu(x, t, t2, y, tab)``: the table pass over n values (a multiple of 64; t = t2 = min(|x|,
@@ -286,7 +306,7 @@ alignas(64) static const uint32_t {{ p }}_{{ name }}_cd[{{ words | length }}] = 
     q1 = insert(q1, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 1)));
 }
 
-// y = c0 + c1 r + c2 r^2 + max(x, 0) of t = min(|x|, {{ t_max | float | int }}) (in t_ and t2_: y, read before it is written){{ "; x: the gate halves of a gate/up C tile" if gate_up }}
+// y = c0 + c1 r + c2 r^2{{ " + max(x, 0) of t = min(|x|, %d)" % (t_max | float | int) if not full else " of t = x clamped to +-%d" % (t_max | float | int) }} (in t_ and t2_: y, read before it is written){{ "; x: the gate halves of a gate/up C tile" if gate_up }}
 template <int N>
 __attribute__((noinline)) void {{ p }}_{{ name }}_tab(const bfloat16 *__restrict x, const bfloat16 *__restrict t_,
                                                 const bfloat16 *__restrict t2_, bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab" if table_arg }})
@@ -324,7 +344,9 @@ __attribute__((noinline)) void {{ p }}_{{ name }}_tab(const bfloat16 *__restrict
         acc.insert(1, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q2, q3, T32_16x2_hi)));
         acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_hi)), r);
         acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_lo)), r2);
+{% if not full %}
         acc = aie::mac(acc, aie::max(aie::load_v<32>(px), aie::zeros<bfloat16, 32>()), one);
+{% endif %}
         aie::store_v(py, acc.template to_vector<bfloat16>());
 {% if gate_up %}
         px = add_2d_ptr(px, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
@@ -345,11 +367,18 @@ __attribute__((noinline)) void {{ p }}_{{ name }}_lut(const bfloat16 *__restrict
     aie::set_rounding(aie::rounding_mode::conv_even);
     {
         const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ t_max }}f);
+{% if full %}
+        const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ t_max }}f);
+{% endif %}
         const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)x;
         bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < N / 32; j++) {
+{% if full %}
+            aie::store_v(pw, aie::min(aie::max(aie::load_v<32>(px), lo), hi));
+{% else %}
             aie::store_v(pw, aie::min(aie::abs(aie::load_v<32>(px)), hi));
+{% endif %}
             px += 32;
             pw += 32;
         }
@@ -365,6 +394,7 @@ SILU = ActTable("silu", silu64, 0.25, 32.0, 24.0)
 # 1.4e-7), below: within 6e-13; al::gelu_lut: 1.7 ULP at ~7 cycles per element
 GELU = ActTable("gelu", gelu64, 0.125, 16.0, 8.0)
 GELU_ERF = ActTable("gelu_erf", gelu_erf64, 0.125, 16.0, 8.0)
+SIGMOID = ActTable("sigmoid", sigmoid64, 0.25, 48.0, 16.0, full=True)
 
 
 def render_silu() -> str:
