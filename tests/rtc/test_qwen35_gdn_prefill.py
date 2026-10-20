@@ -64,7 +64,7 @@ def test_gdn_scan(T: int, size: str) -> None:
     fused.get_buffer("P").view(torch.uint8)[:P.size] = torch.from_numpy(P)
     st = [np.zeros((sh.hc, 128, 128), np.float32) for _ in range(COLS)]
     cs = [np.zeros((3, sh.ch), np.float32) for _ in range(COLS)]
-    cv = fused.get_buffer("CV").view(torch.int16).numpy().reshape(prep.CV_ROWS, lay.N)
+    cv = fused.get_buffer("CV").view(torch.int16).numpy().reshape(-1, lay.N)
     mask = fused.get_buffer("M").view(torch.float32).numpy()
     s_err = []
     for chunk, (t0, n) in enumerate([(0, T), (T, n2)]):

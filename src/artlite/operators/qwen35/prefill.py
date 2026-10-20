@@ -10,11 +10,10 @@ projection's output,
 ``PrefillNormOperator``: bf16 residual, bfp16 panels of rms(x) w), the input projection (``prefill.gemm``), then
 
 - GDN layer: ``GdnPrepOperator`` (q / k once per k head and the gates, d = beta = 0 for the padding tokens: the mask
-  PM; records in PR), ``GdnScanOperator``
-  (the layer's states in GSTATE, read and written by each sub-chunk in turn; its conv state from the 3 rows of G before
-  the sub-chunk: the previous sub-chunk's, the first's from the layer's rows of CVL, which the host fills from the
-  decode's conv states in GHDR before each chunk), ``GdnOutOperator`` (ssm_out's panels; the new conv state of the
-  chunk's last valid tokens into GHDR);
+  PM; records in PR; per sub-chunk, its conv state from the 3 rows of G before it: the previous sub-chunk's, the
+  first's from the layer's rows of CVL, which the host fills from the decode's conv states in GHDR before each chunk),
+  ``GdnScanOperator`` once over the whole chunk (the layer's states in GSTATE read and written once, its v conv state
+  from CVL), ``GdnOutOperator`` (ssm_out's panels; the new conv state of the chunk's last valid tokens into GHDR);
 - attention layer: ``AttnPrepOperator`` per sub-chunk (its K / V into the layer's KV cache: slices of the cache and the
   cos / sin table shifted by the sub-chunk's positions, the parameters the chunk's: the table's rows of its text
   positions, or of an image's tokens written past them), ``PrefillAttnOperator`` once;
@@ -104,12 +103,12 @@ class QwenPrefill(ChunkPrefill):
                     for P in sorted({p.parts for p in self.plans.values() if p.parts > 1})}
         self._ops: dict[tuple, object] = {}
         # (the prefill's own static buffers: per GDN layer its scan parameters, per attention layer its q / k norms)
-        self.n_p = GP.P_HEAD + COLS * overlay.gsh.hc * GP.REC if self.gdn else 0
+        self.n_p = GP.params_bytes(overlay.gsh.hc) if self.gdn else 0
         self.pp_off = {L: i * self.n_p for i, L in enumerate(self.gdn)}
         self.qn_off = {L: i * 4 * 2 * AP.HD for i, L in enumerate(self.att)}
         self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes) for T in self.sizes} \
             if self.att else {}
-        self.gout = self._gdn_ops(self.plans[(self.gdn[0], "gdn_in")].layout)[2] if self.gdn else None
+        self.gout = self._gdn_ops(self.plans[(self.gdn[0], "gdn_in")].layout, SUB)[2] if self.gdn else None
         self._rows()
         self._library()
 
@@ -128,8 +127,9 @@ class QwenPrefill(ChunkPrefill):
             self._ops[key] = cls(**args)
         return self._ops[key]
 
-    def _gdn_ops(self, lay: PG.Layout) -> tuple[GP.GdnPrepOperator, GP.GdnScanOperator, GP.GdnOutOperator]:
-        return (self._op(GP.GdnPrepOperator, lay), self._op(GP.GdnScanOperator, lay),
+    def _gdn_ops(self, lay: PG.Layout, T: int) -> tuple[GP.GdnPrepOperator, GP.GdnScanOperator, GP.GdnOutOperator]:
+        """(the scan over the chunk of T tokens in one call: the states read and written once)"""
+        return (self._op(GP.GdnPrepOperator, lay), self._op(GP.GdnScanOperator, lay, T=T, sub=SUB),
                 self._op(GP.GdnOutOperator, lay, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=MAX_T))
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
@@ -179,7 +179,7 @@ class QwenPrefill(ChunkPrefill):
                        for j in range(S)]
                 rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2)))
             else:
-                gprep, scan, gout = self._gdn_ops(p_in.layout)
+                gprep, scan, gout = self._gdn_ops(p_in.layout, T)
                 i = self.gdn.index(L)
                 pp = f"PP[{self.pp_off[L]}:{self.pp_off[L] + self.n_p}]"
                 gh = f"GHDR[{ov.ghdr[L]}:{ov.ghdr[L] + gout.ghdr_bytes}]"
@@ -189,8 +189,8 @@ class QwenPrefill(ChunkPrefill):
                 pr = arg_bytes(gprep, 4)  # (a sub-chunk's records)
                 rl += [(gprep, tok("G", j, gprep, i=0, row=g_rb), cv[j], pp, sl("PM", j * SUB * 4, gprep, i=3),
                         sl("PR", j * pr, gprep, i=4)) for j in range(S)]
-                rl += [(scan, sl("PR", j * pr, scan, i=0), tok("G", j, scan, i=1, row=g_rb), cv[j], pp, gs,
-                        tok("O", j, scan, i=5, row=self.rb_o)) for j in range(S)]
+                rl.append((scan, sl("PR", 0, scan, i=0), tok("G", 0, scan, i=1, row=g_rb),
+                           sl("CVL", 3 * i * g_rb, scan, i=2), pp, gs, tok("O", 0, scan, i=5, row=self.rb_o)))
                 rl += [(gout, tok("O", j, gout, i=0, row=self.rb_o), tok("G", j, gout, i=1, row=g_rb),
                         sl("G", 0, gout, i=2), pp, gh, tok("A", j, gout, i=5, row=a_rb)) for j in range(S)]
             out, fp = self.plans[(L, self._phases(L)[1])], self.f_part
@@ -359,7 +359,7 @@ class QwenPrefill(ChunkPrefill):
 
     def layer_entries(self, L: int, S: int) -> int:
         gemms = sum(len(self.plans[(L, name)].gemms) for name in self._phases(L))
-        return S * (gemms + 2) + (S + 1 if self.cfg.attention[L] else 3 * S)
+        return S * (gemms + 2) + (S + 1 if self.cfg.attention[L] else 2 * S + 1)
 
 
 def attention_seconds(p0: int, S: int) -> float:
