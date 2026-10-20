@@ -7,6 +7,7 @@ are allocated: the items address the caller's buffers.
 """
 
 import itertools
+import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -43,9 +44,11 @@ class Library(FusedElf):
     def items(self, runlist: Runlist, buffers: Mapping[str, Any]) -> list[Item]:
         """A program's items: per run of ``runlist`` ((operator, *buffer names)) its entry and the device addresses of
         its arguments in ``buffers`` (host buffers by name; ``"NAME[a:b]"`` from byte a)."""
+        ctx = self.load()._ctx if sys.platform == "win32" else None  # (Windows: addresses depend on the context)
+
         def address(name: str) -> int:
             base, start, _ = parse_name(name)
-            return txn.device_address(buffers[base], start)
+            return txn.device_address(buffers[base], start, ctx)
 
         return [(self._entry[id(op)], [address(n) for n in names]) for op, *names in runlist]
 
@@ -59,7 +62,7 @@ class Library(FusedElf):
         self._dispatch_bufs = list(self._pdis.values())
         if self._asm.packet_bytes:  # (the configurations' control packets: ``ctrlpkt``)
             bo = self._device.alloc_host_buffer(-(-self._asm.packet_bytes // 4096) * 4096)
-            self._asm.place(bo.map().view(np.uint32), txn.device_address(bo))
+            self._asm.place(bo.map().view(np.uint32), txn.device_address(bo, 0, self._ctx))
             bo.sync_to_device()
             self._dispatch_bufs.append(bo)
 

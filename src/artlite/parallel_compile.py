@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
 JOBS_ENV = "ARTLITE_COMPILE_JOBS"
 PLANNING_ENV = "ARTLITE_PLANNING"
-PLAN_FD_ENV = "ARTLITE_PLAN_FD"  # "<Precompiler pid>:<fd>": where its planning child writes the specs
+PLAN_FD_ENV = "ARTLITE_PLAN_FD"  # "<Precompiler pid>:<fd>": where its planning child writes the specs (Windows: a handle)
 FOREGROUND, BACKGROUND = 0, 1  # pool priorities
 
 
@@ -250,7 +250,14 @@ def _sink_from_env() -> Callable[[BuildSpec], None] | None:
     if os.environ.get(PLANNING_ENV) != "1":
         return None
     owner, _, fd = os.environ.get(PLAN_FD_ENV, "").partition(":")
-    if not fd or int(owner) != os.getppid():
+    if sys.platform == "win32":  # (a venv's python.exe starts the real interpreter: the parent is not the owner; only the
+        import _winapi  # direct child is handed the handle, so for a grandchild it is not a pipe)
+        import msvcrt
+
+        if not fd or _winapi.GetFileType(int(fd)) != _winapi.FILE_TYPE_PIPE:
+            return lambda spec: None
+        fd = str(msvcrt.open_osfhandle(int(fd), os.O_WRONLY))
+    elif not fd or int(owner) != os.getppid():
         return lambda spec: None
     out = os.fdopen(int(fd), "wb", buffering=0)
     lock = threading.Lock()
@@ -293,9 +300,20 @@ class Precompiler:
 
     def __init__(self, cmd: Sequence[str], *, cwd: str | None = None):
         read_fd, write_fd = os.pipe()
-        env = {**os.environ, PLANNING_ENV: "1", PLAN_FD_ENV: f"{os.getpid()}:{write_fd}"}
-        self._proc = subprocess.Popen(list(cmd), cwd=cwd, env=env, pass_fds=(write_fd,), stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        if sys.platform == "win32":  # (no pass_fds: the child inherits the pipe's handle, and only that one)
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(write_fd)
+            os.set_handle_inheritable(handle, True)
+            startup = subprocess.STARTUPINFO(lpAttributeList={"handle_list": [handle]})
+            spawn = {"startupinfo": startup, "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            plan_fd = handle
+        else:
+            spawn = {"pass_fds": (write_fd,), "start_new_session": True}
+            plan_fd = write_fd
+        env = {**os.environ, PLANNING_ENV: "1", PLAN_FD_ENV: f"{os.getpid()}:{plan_fd}"}
+        self._proc = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **spawn)
         os.close(write_fd)
         self.queue = BuildQueue()
         self._reader = threading.Thread(target=self._read, args=(read_fd,), name="artlite-plan", daemon=True)
@@ -315,7 +333,9 @@ class Precompiler:
     def close(self) -> None:
         """Stop planning (the process group: its subprocesses plan too, none holds an NPU context),
         cancel the builds not started, wait for the running ones."""
-        if self._proc.poll() is None:
+        if self._proc.poll() is None and sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)], capture_output=True, check=False)
+        elif self._proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(self._proc.pid, signal.SIGKILL)
         self._proc.wait()

@@ -4,15 +4,17 @@ parameters) and its hardware context, created at the first dispatch.
 """
 
 import os
+import sys
 import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any, NamedTuple, Self
 
 import numpy as np
 
+from ... import txn
 from ..._native import ParameterScratchpad
 from ...elf_parser import CTRL_SCRATCHPAD, DataBd, ParsedElf, parse_elf, patch_control_code, pdi_sections
-from ..base import BuildSpec
+from ..base import XCLBIN_KERNEL, BuildSpec, _file_lock, pdi_xclbin
 from ..design import COLS
 from ..kernel_source import translation_unit
 from . import design, layout
@@ -48,6 +50,7 @@ class FusedElf:
         self._loaded = False
         self._lock = threading.Lock()
         self._device: Any = None
+        self._ctx: Any = None
         self._kern: Any = None
         self._params: ParameterScratchpad | None = None
 
@@ -145,6 +148,8 @@ class FusedElf:
             raise ValueError(f"{self.elf_path}: built for a partition of {elf.partition_columns} columns")
         dev = self._device = artlite.Device()
         self._first_pdi = np.frombuffer(elf.pdi_map[min(elf.pdi_map)].data, np.uint8)  # (configures the context)
+        if sys.platform == "win32":  # (XRT gives a buffer its device address only once a hardware context exists)
+            self._open_context()
         self._pdis = {}
         for sym, section in pdi_sections(elf).items():
             bo = self._pdis[sym] = dev.alloc_insts_buffer(section.size)
@@ -166,9 +171,17 @@ class FusedElf:
             bds.append(s)
             return address(s)
 
-        code, _ = patch_control_code(elf, address=at, pdis={k: bo.paddr for k, bo in self._pdis.items()},
-                                     scratchpad=self._scratchpad.paddr if self._scratchpad is not None else None)
-        return np.frombuffer(bytes(code), np.uint32), sorted(bds)
+        code, _ = patch_control_code(elf, address=at, pdis={k: self._paddr(bo) for k, bo in self._pdis.items()},
+                                     scratchpad=self._paddr(self._scratchpad) if self._scratchpad is not None else None)
+        words = np.frombuffer(bytes(code), np.uint32)
+        if sys.platform == "win32":  # (run as a transaction: Kernel.dispatch_elf)
+            words = txn.without_ddr_patches(words)
+        return words, sorted(bds)
+
+    def _paddr(self, bo: Any) -> int:
+        """A BO's device address in this ELF's context (Windows: each context has its own; elsewhere none is open yet
+        and the address is the same in all)."""
+        return bo.paddr if self._ctx is None else bo.paddr_in(self._ctx)
 
     def set_params(self, values: Mapping[str, int]) -> None:
         """Write runtime parameters (``aie.iron.ScratchpadParameter``: int32 by name) for the next dispatch."""
@@ -193,6 +206,19 @@ class FusedElf:
             self.load()
             with self._lock:
                 if self._kern is None:
-                    self._ctx = self._device.create_context(self._first_pdi, "main")  # (the Kernel refers to it)
-                    self._kern = artlite.Kernel(self._device, self._ctx, "main")
+                    if self._ctx is None:
+                        self._open_context()
+                    self._kern = artlite.Kernel(self._device, self._ctx, self._kernel_name)
         return self._kern
+
+    def _open_context(self) -> None:
+        """The hardware context (the Kernel refers to it): on Windows from an xclbin of the first PDI, beside the ELF.
+        The control program runs there as a transaction (``Kernel.dispatch_elf``), its PDI loads included."""
+        image, self._kernel_name = self._first_pdi, "main"
+        if sys.platform == "win32":
+            path = os.path.splitext(self.elf_path)[0] + ".xclbin"
+            with _file_lock(path + ".lock"):
+                if not os.path.exists(path):
+                    pdi_xclbin(image.tobytes(), path)
+            image, self._kernel_name = np.fromfile(path, np.uint8), XCLBIN_KERNEL
+        self._ctx = self._device.create_context(image, self._kernel_name)

@@ -16,6 +16,7 @@
 
 namespace shim_xdna {
 struct pdev;
+struct hw_ctx;
 
 enum xclBOSyncDirection {
   XCL_BO_SYNC_BO_TO_DEVICE = 0,
@@ -79,6 +80,7 @@ struct bo {
   uint32_t get_drm_bo_handle() const;
   // Address the NPU uses (the user VA of the mapping in PASID mode)
   uint64_t get_paddr() const;
+  uint64_t paddr_in(const hw_ctx&) const { return get_paddr(); }  // (the same in every hardware context)
   std::string_view type_to_name() const;
 
  private:

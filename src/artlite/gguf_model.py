@@ -309,7 +309,10 @@ class GGUFFile:
     def release(self, name: str | None = None) -> None:
         """Give the mapping's resident pages back (after a loader copied what it needs): they
         leave this process, stay in the system's page cache while it has room, and come back on
-        the next access. ``name``: only the whole pages inside that tensor's data."""
+        the next access (Windows: nothing, the mapping has no such hint). ``name``: only the whole pages inside that
+        tensor's data."""
+        if not hasattr(mmap.mmap, "madvise"):
+            return
         if name is None:
             self.data._mmap.madvise(mmap.MADV_DONTNEED)
             return

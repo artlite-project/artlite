@@ -28,11 +28,8 @@
 #include "artlite/gguf_json.h"
 #include "artlite/kernel.h"
 #include "artlite/profiler.h"
+#include "artlite/shim.h"
 #include "artlite/tile_pack.h"
-#include "shim_xdna/bo.h"
-#include "shim_xdna/device.h"
-#include "shim_xdna/ert.h"
-#include "shim_xdna/hwctx.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -229,6 +226,9 @@ static void retire(artlite::Kernel& self, F&& f) {
 // NOLINTBEGIN(bugprone-unused-raii)
 NB_MODULE(_native, m) {
   m.doc() = "Artlite: lightweight NPU runtime";
+#ifdef ARTLITE_XRT_DIR
+  m.attr("XRT_DIR") = ARTLITE_XRT_DIR;  // (Windows: the XRT the module was built against)
+#endif
 
   // Zero-copy numpy/torch views of Buffer mappings (map()) keep their
   // Buffer/Device wrappers alive until after nanobind's exit-time leak audit,
@@ -297,7 +297,10 @@ NB_MODULE(_native, m) {
             self.sync(shim_xdna::direction::device2host, size, offset);
           },
           "size"_a, "offset"_a)
-      .def_prop_ro("paddr", [](shim_xdna::bo& self) -> uint64_t { return self.get_paddr(); });
+      .def_prop_ro("paddr", [](shim_xdna::bo& self) -> uint64_t { return self.get_paddr(); })
+      .def(
+          "paddr_in", [](shim_xdna::bo& self, const shim_xdna::hw_ctx& ctx) -> uint64_t { return self.paddr_in(ctx); },
+          "ctx"_a, "The device address in a hardware context (on Windows each context has its own).");
 
   // --- HwContext (wraps shim_xdna::hw_ctx directly) ---
   nb::class_<shim_xdna::hw_ctx>(m, "HwContext")

@@ -12,13 +12,13 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2a78d6"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-2a78d6">
-  <img alt="Linux" src="https://img.shields.io/badge/OS-Linux-2a78d6">
+  <img alt="Linux, Windows" src="https://img.shields.io/badge/OS-Linux%20%7C%20Windows-2a78d6">
   <img alt="NPU: XDNA 2 (AIE2P)" src="https://img.shields.io/badge/NPU-XDNA%202%20(AIE2P)-2a78d6">
 </p>
 
 Artlite runs LLMs and Stable Diffusion on the XDNA 2 NPU (an AIE2P AI Engine array) of AMD's Strix Point, Krackan
 Point and Strix Halo processors. Its runtime is a small C++ library that talks to the `amdxdna` driver directly, in
-place of XRT.
+place of XRT; on Windows 11 the same library runs through XRT.
 
 Its kernels are compiled at run time, as with NVRTC and HIPRTC, from sources generated for the task: each operator
 renders C++ specialized for its shapes, data formats and place on the array, plus an IRON design of the array's data
@@ -49,7 +49,8 @@ device rather than for portability.
 ## Quick start
 
 Requirements: a Ryzen AI processor with an XDNA 2 NPU, Linux with the `amdxdna` driver, libdrm, CMake, a C++23
-compiler and [uv](https://docs.astral.sh/uv/). Details: [Installation](docs/install.md).
+compiler and [uv](https://docs.astral.sh/uv/). Details: [Installation](docs/install.md) (Windows 11: [through
+XRT](docs/install.md#windows)).
 
 ```bash
 git clone https://github.com/artlite-project/artlite && cd artlite

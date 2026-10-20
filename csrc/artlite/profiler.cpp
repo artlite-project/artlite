@@ -7,8 +7,7 @@
 #include <cstring>
 
 #include "artlite/error.h"
-#include "shim_xdna/bo.h"
-#include "shim_xdna/hwctx.h"
+#include "artlite/shim.h"
 
 namespace artlite {
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import functools
 import os
+import sys
 import threading
 import time
 from typing import ClassVar, Protocol
@@ -229,6 +230,8 @@ class OverlayDevice:
         prog._ensure_loaded()
         op.check_endpoints(np.fromfile(prog.insts_path, np.uint32))
         self.device, self._prog = prog._device, prog
+        if sys.platform == "win32":  # (XRT gives a buffer its device address only once a hardware context exists)
+            prog._kernel()
         self._insts = self.device.alloc_insts_buffer(max_instruction_bytes)
         self._loaded = np.zeros(0, np.uint32)  # (the words load() wrote)
         self.buffers: dict[str, object] = {}
@@ -279,7 +282,7 @@ class OverlayDevice:
 
     def address(self, name: str, offset: int = 0) -> int:
         """Device address of a byte of a buffer (for ``Sequence.fill`` / ``drain``)."""
-        return txn.device_address(self.buffers[name], offset)
+        return txn.device_address(self.buffers[name], offset, self._prog._ctx)
 
     def load(self, words: np.ndarray) -> None:
         """Make ``words`` the transaction of the following dispatches (``dispatch()``)."""

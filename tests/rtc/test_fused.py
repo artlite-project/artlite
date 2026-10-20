@@ -1,5 +1,7 @@
 """Tests for FusedOperator: compile and dispatch multiple ops as one ELF."""
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -188,12 +190,12 @@ def test_library_program():
 
     n = 1024
     shift, add = ShiftOperator(n=n), AddOperator(size=n)
-    lib = Library("t_library", [shift, add]).compile()
+    lib = Library("t_library", [shift, add]).compile().load()  # (on Windows, buffer addresses need a context first)
     dev = artlite.Device()
     x = torch.randn(2 * n).bfloat16()
     bx = artlite.from_torch(x.clone(), dev)
     t, u, v, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(4))
-    a = {k: device_address(b) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
+    a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
     items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["t"], a["u"]]), (0, [a["x"], a["v"]]), (1, [a["u"], a["v"], a["out"]])]
     lib.set_params({ShiftOperator.PARAM: 128})
     assert lib.run(items, splits=[1, 3], bufs=[b._raw for b in (bx, t, u, v, out)]) == 3
@@ -221,7 +223,7 @@ def test_library_program_packets(monkeypatch):
         assert all(bool(blk.packets) == packets for blk in lib._asm.blocks)
         bx = artlite.from_torch(x.clone(), dev)
         t, u, v, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(4))
-        a = {k: device_address(b) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
+        a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
         items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["t"], a["u"]]), (0, [a["x"], a["v"]]),
                  (1, [a["u"], a["v"], a["out"]])]
         lib.set_params({ShiftOperator.PARAM: 64})
@@ -270,7 +272,7 @@ def test_library_program_memory_variants(monkeypatch):
     x, y = torch.randn(n).bfloat16(), torch.randn(n).bfloat16()
     bx, by = artlite.from_torch(x.clone(), dev), artlite.from_torch(y.clone(), dev)
     t, u = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
-    a = {k: device_address(b) for k, b in {"x": bx, "y": by, "t": t, "u": u}.items()}
+    a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "y": by, "t": t, "u": u}.items()}
     lib.run([(0, [a["x"], a["y"], a["t"]]), (1, [a["x"], a["y"], a["u"]])], bufs=[b._raw for b in (bx, by, t, u)])
     for s, out in ((2, t), (3, u)):
         out.sync_from_device()
@@ -334,9 +336,9 @@ class TestFusedLifecycle:
             addr = int(words[bd.offset // 4 + 1]) | (int(words[bd.offset // 4 + 2]) & 0xFFFF) << 32
             if bd.space == "scratch" and w.offset <= bd.start < w.offset + w.nbytes:
                 in_ext += 1
-                assert addr == device_address(ext, 4096 + bd.start - w.offset)
+                assert addr == device_address(ext, 4096 + bd.start - w.offset, f._ctx)
             else:
-                assert addr == device_address(*f._bo_at(bd.space, bd.start))
+                assert addr == device_address(*f._bo_at(bd.space, bd.start), f._ctx)
         assert in_ext == 2, f"expected the two reads of w, got {in_ext}"
 
     def test_async_dispatches(self):
@@ -398,9 +400,9 @@ class TestFusedLifecycle:
         into it."""
         dev = artlite.Device()
         ub = dev.alloc_user_buffer(4 << 20)
-        assert ub.paddr % (2 << 20) == 0 and not ub.map().any()
         f = _add_chain("t_user", buffer_sizes={"w": 2048, "t": 2048},
-                       external_buffers={"w": (ub, 1 << 20), "t": (ub, 3 << 20)}).compile()
+                       external_buffers={"w": (ub, 1 << 20), "t": (ub, 3 << 20)}).compile().load()
+        assert (sys.platform == "win32" or ub.paddr % (2 << 20) == 0) and not ub.map().any()  # (2 MB pages on Linux)
         torch.manual_seed(7)
         x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
         ub.map()[1 << 20:(1 << 20) + 2048] = w.view(torch.uint8).numpy()
