@@ -1,11 +1,8 @@
 #include "artlite/file_io.h"
 
-#include <fcntl.h>
 #include <immintrin.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -16,7 +13,8 @@
 #include <vector>
 
 #include "artlite/error.h"
-#include "shim_xdna/bo.h"
+#include "artlite/platform.h"
+#include "artlite/shim.h"
 
 namespace artlite {
 
@@ -28,7 +26,7 @@ constexpr unsigned kMaxThreads = 16;      // (2 GB from the page cache: 16 threa
 
 // dst gets the bytes of src through streaming stores (the head up to dst's 64-B alignment and
 // the tail through memcpy). The calling thread fences its own stores.
-__attribute__((target("avx512f"))) void stream_copy(char* dst, const char* src, size_t n) {
+ARTLITE_AVX512_FN void stream_copy(char* dst, const char* src, size_t n) {
   size_t head = std::min(n, (64 - reinterpret_cast<uintptr_t>(dst) % 64) % 64);
   std::memcpy(dst, src, head);
   size_t i = head;
@@ -45,17 +43,15 @@ __attribute__((target("avx512f"))) void stream_copy(char* dst, const char* src, 
   std::memcpy(dst + i, src + i, n - i);
 }
 
-void copy_range(int fd, char* dst, uint64_t file_offset, size_t n) {
-  std::unique_ptr<char, decltype(&std::free)> bounce(static_cast<char*>(std::aligned_alloc(64, kBounce)), &std::free);
+void copy_range(const platform::File& file, char* dst, uint64_t file_offset, size_t n) {
+  auto bounce = platform::aligned_buffer(64, kBounce);
   if (!bounce) throw std::bad_alloc();
   for (size_t done = 0; done < n;) {
     size_t len = std::min(kBounce, n - done);
     for (size_t got = 0; got < len;) {
-      ssize_t r = ::pread(fd, bounce.get() + got, len - got, static_cast<off_t>(file_offset + done + got));
-      if (r < 0 && errno == EINTR) continue;
-      if (r < 0) throw std::system_error(errno, std::generic_category(), "read_file: pread");
+      size_t r = file.read_at(bounce.get() + got, len - got, file_offset + done + got);
       if (r == 0) throw Error("read_file: the file ended early");
-      got += static_cast<size_t>(r);
+      got += r;
     }
     stream_copy(dst + done, bounce.get(), len);
     done += len;
@@ -68,9 +64,8 @@ void copy_range(int fd, char* dst, uint64_t file_offset, size_t n) {
 void read_file(shim_xdna::bo& buf, size_t offset, const std::string& path, uint64_t file_offset, size_t nbytes) {
   if (offset > buf.size() || nbytes > buf.size() - offset)
     throw Error(std::format("read_file: {} bytes at offset {} exceed the buffer ({} bytes)", nbytes, offset, buf.size()));
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) throw std::system_error(errno, std::generic_category(), "read_file: cannot open '" + path + "'");
-  ::posix_fadvise(fd, static_cast<off_t>(file_offset), static_cast<off_t>(nbytes), POSIX_FADV_SEQUENTIAL);
+  platform::File file(path);
+  file.advise_sequential(file_offset, nbytes);
 
   char* dst = static_cast<char*>(buf.map()) + offset;
   unsigned threads = static_cast<unsigned>(std::clamp<size_t>(
@@ -82,19 +77,18 @@ void read_file(shim_xdna::bo& buf, size_t offset, const std::string& path, uint6
     size_t a = std::min(nbytes, t * step), b = std::min(nbytes, a + step);
     pool.emplace_back([&, t, a, b] {
       try {
-        copy_range(fd, dst + a, file_offset + a, b - a);
+        copy_range(file, dst + a, file_offset + a, b - a);
       } catch (...) {
         errors[t] = std::current_exception();
       }
     });
   }
   try {
-    copy_range(fd, dst, file_offset, std::min(nbytes, step));
+    copy_range(file, dst, file_offset, std::min(nbytes, step));
   } catch (...) {
     errors[0] = std::current_exception();
   }
   for (auto& th : pool) th.join();
-  ::close(fd);
   for (auto& e : errors)
     if (e) std::rethrow_exception(e);
 }

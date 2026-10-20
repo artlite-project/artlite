@@ -95,7 +95,8 @@ class FusedOperator(FusedElf):
             assert s.space == "scratch", f"external buffer {name} must be a scratch buffer"
             self._ext.append((s.offset, s.offset + s.nbytes, bo, offset))
         self._scratch_bo = dev.alloc_host_buffer(max(min((e[0] for e in self._ext), default=sizes["scratch"]), 2))
-        code, self._bds = self._control_program(elf, lambda bd: txn.device_address(*self._bo_at(bd.space, bd.start)))
+        code, self._bds = self._control_program(
+            elf, lambda bd: txn.device_address(*self._bo_at(bd.space, bd.start), self._ctx))
         self._insts_bo = dev.alloc_insts_buffer(code.nbytes)
         np.copyto(self._insts_bo.map(), code.view(np.uint8))
         self._insts_bo.sync_to_device()

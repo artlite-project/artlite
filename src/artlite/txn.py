@@ -40,10 +40,10 @@ DDR_AIE_ADDR_OFFSET = 0x80000000  # device address of a host buffer = its paddr 
 
 # opcodes
 OP_WRITE, OP_BLOCKWRITE, OP_MASKWRITE, OP_MASKPOLL, OP_TCT, OP_DDR_PATCH = 0, 1, 3, 4, 0x80, 0x81
-OP_LOAD_PDI, OP_CREATE_SCRATCHPAD = 8, 10
+OP_NOOP, OP_LOAD_PDI, OP_CREATE_SCRATCHPAD = 5, 8, 10
 # words of the fixed-size operations (a blockwrite and the custom operations, 0x80 on, carry their byte size)
-_OP_WORDS = {OP_WRITE: 6, OP_MASKWRITE: 7, OP_MASKPOLL: 7, 5: 1, 6: 1, 7: 7, OP_LOAD_PDI: 4, OP_CREATE_SCRATCHPAD: 4,
-             12: 3}
+_OP_WORDS = {OP_WRITE: 6, OP_MASKWRITE: 7, OP_MASKPOLL: 7, OP_NOOP: 1, 6: 1, 7: 7, OP_LOAD_PDI: 4,
+             OP_CREATE_SCRATCHPAD: 4, 12: 3}
 
 # shim tile DMA registers (row 0)
 SHIM_BD0 = 0x1D000
@@ -267,11 +267,29 @@ def bd_offsets(nbytes: int, dims: tuple[int, int, int, int] | None = None) -> np
     return 4 * (i % n0 + i // n0 % n1 * s1 + i // (n0 * n1) * s2)
 
 
-def device_address(buffer: object, offset: int = 0) -> int:
+def device_address(buffer: object, offset: int = 0, context: object = None) -> int:
     """The address the shim DMA uses for byte ``offset`` of a host buffer (an ``artlite``
-    Buffer or Tensor)."""
+    Buffer or Tensor) in the hardware context ``context`` (on Windows each context maps a buffer
+    at its own address; None: any context of the process)."""
     raw = getattr(buffer, "_raw", buffer)
-    return raw.paddr + offset + DDR_AIE_ADDR_OFFSET
+    return (raw.paddr if context is None else raw.paddr_in(context)) + offset + DDR_AIE_ADDR_OFFSET
+
+
+def without_ddr_patches(words: np.ndarray) -> np.ndarray:
+    """A transaction (header included) with each DDR patch replaced by no-ops of its size, so that its BDs keep the
+    addresses the host resolved. The firmware applies a patch with the command's buffer of its argument index: on
+    Windows a full ELF's control program runs as a transaction whose command lists other buffers than the runtime
+    sequence's arguments. Offsets and the byte size stay; the operation count grows."""
+    out = np.array(words, np.uint32)
+    body = out[4:]
+    extra = 0
+    for p, op in op_offsets(body):
+        if op == OP_DDR_PATCH:
+            n = int(body[p + 1]) // 4
+            body[p:p + n] = OP_NOOP
+            extra += n - 1
+    out[2] += extra
+    return out
 
 
 def op_offsets(body: np.ndarray) -> list[tuple[int, int]]:

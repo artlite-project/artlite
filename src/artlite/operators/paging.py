@@ -57,7 +57,7 @@ from aie.iron import PacketFlow
 from aie.iron.device import Tile
 
 from .. import txn
-from .base import JINJA_ENV, PEANO_DIR
+from .base import JINJA_ENV, peano_tool
 from .checks import CORE_FRAME, MAIN_INIT_FRAME, core_frames, stack_usage
 from .fused.ctrlpkt import _parity, packets
 from .kernel_source import MARK
@@ -69,8 +69,8 @@ LOCK_BASE = 48  # (core lock 0 in the core's lock numbering: acquire / release i
 STATE_WORDS = 4  # the pager's state: [page id, entry 0, entry 1, entry 2] (0: no page)
 STARTUP = "_main_init"
 LOOP_ID = 7  # (the self-DMA flows' stream id: a packet flow inside each tile's switchbox)
-OBJDUMP = os.path.join(PEANO_DIR, "bin", "llvm-objdump")
-_CLANG = os.path.join(PEANO_DIR, "bin", "clang")
+OBJDUMP = peano_tool("llvm-objdump")
+_CLANG = peano_tool("clang")
 
 
 class PagingError(RuntimeError):

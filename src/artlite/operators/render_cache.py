@@ -40,7 +40,7 @@ import numpy as np
 import torch
 
 from .. import profiling
-from .base import AIECC, CACHE_DIR, CLANGPP, ArtcOperator
+from .base import AIECC, CACHE_DIR, CLANGPP, PROGRAM_IMAGE, ArtcOperator
 
 if TYPE_CHECKING:
     from .fused.elf import FusedElf
@@ -227,7 +227,7 @@ def lookup(op: ArtcOperator | FusedElf) -> str | None:
     except (OSError, ValueError):
         return None
     work_dir = os.path.join(CACHE_DIR, entry["work_dir"])
-    artifacts = ("main.pdi", "insts.bin") if isinstance(op, ArtcOperator) else op.artifacts
+    artifacts = (PROGRAM_IMAGE, "insts.bin") if isinstance(op, ArtcOperator) else op.artifacts
     if not all(os.path.exists(os.path.join(work_dir, n)) for n in artifacts):
         return None
     return work_dir

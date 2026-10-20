@@ -16,3 +16,4 @@ __pycache__
 src/artlite/_native.pyi
 src/artlite/py.typed
 /.claude/settings.local.json
+*.pyd

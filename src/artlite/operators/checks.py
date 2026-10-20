@@ -30,9 +30,9 @@ import subprocess
 import sys
 from collections.abc import Iterator
 
-from .base import PEANO_DIR
+from .base import peano_tool
 
-OBJDUMP = os.path.join(PEANO_DIR, "bin", "llvm-objdump")
+OBJDUMP = peano_tool("llvm-objdump")
 _UNKNOWN_FRAME = 64  # stack of a callee without a frame record (runtime library helpers)
 CORE_FRAME = 128  # a core's own frame when its object is not kept (the largest measured)
 MAIN_INIT_FRAME = 64  # the crt's _main_init frame below main's (paddxm [sp], #0x40 before it calls main)

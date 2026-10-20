@@ -5,7 +5,8 @@ the `amdxdna` driver directly: no xclbin, no plugin layers, zero-copy buffers. O
 ("RTC") from Jinja2 C++ templates specialized per shape, plus an IRON (`aie.iron`) array design lowered through
 MLIR-AIE. Python package: `artlite` (nanobind bindings `artlite._native`, operators `artlite.operators`), with
 the models in package `models` (`src/models/`, commands `artlite-cli` and `artlite-bench`), built with
-scikit-build-core.
+scikit-build-core. On Windows 11 the same runtime goes through XRT (`csrc/shim_xrt/`; setup and differences:
+`docs/install.md`, Windows).
 
 Target: AIE2P (NPU2) only, i.e. AMD Strix Point, Strix Halo and Krackan. All these CPUs are znver5, so `csrc/` may
 use any modern SIMD (AVX-512 included).
@@ -79,7 +80,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 | path | what |
 |---|---|
-| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md` |
+| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md`; on Windows `shim_xrt/` (the shim over XRT) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
 | `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
 | `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |

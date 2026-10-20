@@ -7,9 +7,6 @@
 #include "artlite/tile_pack.h"
 
 #include <immintrin.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -28,6 +25,7 @@
 #include <unordered_map>
 
 #include "artlite/error.h"
+#include "artlite/platform.h"
 
 namespace artlite {
 
@@ -126,7 +124,7 @@ inline __m512i nibble_pairs(__m512i w) {
 inline uint16_t bf16_of(const uint8_t* f16, bool neg = false) {
   uint16_t h;
   std::memcpy(&h, f16, 2);
-  float f = _cvtsh_ss(h);
+  float f = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));  // (_cvtsh_ss: not in MSVC)
   if (neg) f = -f;
   uint32_t u;
   std::memcpy(&u, &f, 4);
@@ -485,7 +483,7 @@ struct Item {
 
 /// The whole pages inside [p, p + n) (MADV_DONTNEED must not touch a neighbour's) or around it (MADV_WILLNEED).
 std::pair<uintptr_t, size_t> pages(const uint8_t* p, size_t n, bool inside) {
-  const uintptr_t ps = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+  const uintptr_t ps = static_cast<uintptr_t>(platform::page_size());
   uintptr_t a = reinterpret_cast<uintptr_t>(p), b = a + n;
   a = inside ? (a + ps - 1) / ps * ps : a / ps * ps;
   b = inside ? b / ps * ps : (b + ps - 1) / ps * ps;
@@ -562,8 +560,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   std::exception_ptr error;
 
   auto worker = [&] {
-    std::unique_ptr<uint8_t, decltype(&std::free)> tile(
-        static_cast<uint8_t*>(std::aligned_alloc(64, (max_S + 63) / 64 * 64)), &std::free);
+    auto tile = platform::aligned_buffer<uint8_t>(64, (max_S + 63) / 64 * 64);
     std::vector<uint8_t> part;  // (the rows of a chunk past a row's end: its super-blocks, then zero ones)
     try {
       if (!tile) throw std::bad_alloc();
@@ -653,7 +650,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
           }
           for (size_t t : drop) {  // (the pages stay in the page cache)
             auto [a, n] = pages(tensors[t].data, tensors[t].bytes, true);
-            if (n) ::madvise(reinterpret_cast<void*>(a), n, MADV_DONTNEED);
+            if (n) platform::drop_pages(reinterpret_cast<void*>(a), n);
           }
         }
       }
@@ -669,11 +666,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   // threads unless mincore finds it resident (pread: the device's 128 KB readahead makes page faults and
   // MADV_WILLNEED / POPULATE_READ stream at 1.2 - 1.8 GB/s, 16 threads of 8 MB reads at 3.5 GB/s: a cold 27B packs
   // in 5.3 s), at most a window ahead of the workers; a worker starts an item once its tensors are read
-  int fd = -1;
-  if (!opt.file.empty()) {
-    fd = ::open(opt.file.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) throw std::system_error(errno, std::generic_category(), "pack_tiles: cannot open '" + opt.file + "'");
-  }
+  std::unique_ptr<platform::File> file;
+  if (!opt.file.empty()) file = std::make_unique<platform::File>(opt.file);
+  const bool prefetching = file != nullptr;
   struct Piece {
     const uint8_t* data;
     size_t bytes, tensor;
@@ -684,13 +679,12 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     window = std::max(window, tensors[t].bytes);
     for (size_t o = 0; o < tensors[t].bytes; o += kPrefetchPiece)
       pieces.push_back({tensors[t].data + o, std::min(kPrefetchPiece, tensors[t].bytes - o), t});
-    tensors[t].pending = fd >= 0 ? -(-int64_t(tensors[t].bytes) / int64_t(kPrefetchPiece)) : 0;
+    tensors[t].pending = prefetching ? -(-int64_t(tensors[t].bytes) / int64_t(kPrefetchPiece)) : 0;
   }
   std::atomic<size_t> next_piece{0}, issued{0};
   auto prefetcher = [&] {
-    const size_t ps = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    std::unique_ptr<char, decltype(&std::free)> buf(static_cast<char*>(std::aligned_alloc(ps, kPrefetchPiece + ps)),
-                                                    &std::free);
+    const size_t ps = platform::page_size();
+    auto buf = platform::aligned_buffer(ps, kPrefetchPiece + ps);
     std::vector<unsigned char> resident(kPrefetchPiece / ps + 2);
     for (size_t k; !finished && !failed && (k = next_piece++) < pieces.size();) {
       const Piece& pc = pieces[k];
@@ -698,13 +692,15 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
         std::this_thread::sleep_for(std::chrono::microseconds(200));
       issued += pc.bytes;
       auto [a, len] = pages(pc.data, pc.bytes, false);
-      if (buf && ::mincore(reinterpret_cast<void*>(a), len, resident.data()) == 0 &&
-          !std::all_of(resident.begin(), resident.begin() + len / ps, [](unsigned char r) { return r & 1; }))
+      if (buf && platform::needs_reading(reinterpret_cast<void*>(a), len, resident.data()))
         for (size_t got = 0; got < len;) {  // (errors, no buffer: the workers' page faults read it)
-          ssize_t r = ::pread(fd, buf.get(), len - got,
-                              static_cast<off_t>(a - reinterpret_cast<uintptr_t>(opt.map) + got));
-          if (r <= 0 && errno != EINTR) break;
-          if (r > 0) got += static_cast<size_t>(r);
+          size_t r = 0;
+          try {
+            r = file->read_at(buf.get(), len - got, a - reinterpret_cast<uintptr_t>(opt.map) + got);
+          } catch (const std::system_error&) {
+          }
+          if (r == 0) break;
+          got += r;
         }
       tensors[pc.tensor].pending--;
     }
@@ -714,14 +710,13 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   threads = static_cast<unsigned>(std::min<size_t>(threads, std::max<size_t>(1, items.size())));
   std::vector<std::thread> pool;
   std::vector<std::thread> prefetch;
-  if (fd >= 0)
+  if (prefetching)
     for (unsigned i = 0; i < kPrefetchThreads; i++) prefetch.emplace_back(prefetcher);
   for (unsigned i = 1; i < threads; i++) pool.emplace_back(worker);
   worker();
   for (auto& th : pool) th.join();
   finished = true;
   for (auto& th : prefetch) th.join();
-  if (fd >= 0) ::close(fd);
   if (error) std::rethrow_exception(error);
 }
 
