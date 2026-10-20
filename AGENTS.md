@@ -108,8 +108,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
 - Reuse the shared pieces instead of copying: `kernel_lib.h` (exp2, SiLU, GELU, `inv_rms`, bfp16 panels, lane
-  shuffles), `act_lut.py` (activations through the gather LUT), `design.py` (`COLS`, `ROWS`, `range32`: i32 Worker
-  loops over a bound read at run time, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels),
+  shuffles), `act_lut.py` (activations through the gather LUT), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops
+  with an i32 induction variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels),
   `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`).
 - New operators are exported from `operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. Tests need no
   compile plumbing: pytest plans the selected tests in a subprocess and builds their designs in the background.

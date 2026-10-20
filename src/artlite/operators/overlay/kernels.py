@@ -261,7 +261,7 @@ __attribute__((noinline)) void {{ p }}_pupd(const bfloat16 *__restrict wp, int32
                                                       aie::load_v<8>(v + {{ 2 * RES_PITCH }} + j), aie::load_v<8>(v + {{ 3 * RES_PITCH }} + j));
         const aie::vector<bfloat16, 8> w8 = aie::load_v<8>(wp + j);
         aie::vector<bfloat16, 32> ah, al;  // (a = v wp; res + a ivv: al::mulff's three products onto res)
-        al::split2<32>(al::mulc<32>(vv, aie::concat(w8, w8, w8, w8)).template to_vector<float>(), ah, al);
+        al::split2<32>(al::mulc<32>(vv, w8.template grow_replicate<32>()).template to_vector<float>(), ah, al);
         const aie::vector<float, 32> n = aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 32>(rv), ah, ivh), ah, ivl), al, ivh)
                                              .template to_vector<float>();
         const aie::vector<float, 32> rn = al::mulc<32>(n, sc).template to_vector<float>();

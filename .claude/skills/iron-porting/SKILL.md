@@ -93,9 +93,10 @@ void {{ p }}_gelu(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie
   `TensorAccessPattern`s of a multi-column distribution (`from aie.helpers.taplib import TensorAccessPattern`).
 - Device `NPU2()` (not `npu1_1col` or `npu2_1col`: Artlite targets AIE2P only); `Program(...).resolve_program()`
   without a placer.
-- Worker loops: IRON's `range_()` (`aie.iron.controlflow`) for a constant bound, `design.range32()` for a bound read at
-  run time, `forever_()` with `Worker(while_true=False)` for a core's infinite loop (aie-kernel-perf-optimization
-  section 7). Shared design pieces (`COLS`, `ROWS`, `range32`, `linear_tap`, `stream_walk`): `operators/design.py`.
+- Worker loops: IRON's `range_()` (`aie.iron.controlflow`; an i32 loop on the core for a constant bound or one read
+  from a buffer), `design.range32()` for a body that computes with the i32 induction variable, `forever_()` with
+  `Worker(while_true=False)` for a core's infinite loop (aie-kernel-perf-optimization section 7). Shared design pieces
+  (`COLS`, `ROWS`, `range32`, `linear_tap`, `stream_walk`): `operators/design.py`.
 - All kernel functions compile into one `kernel.o`: every `Kernel` names it.
 
 ```python

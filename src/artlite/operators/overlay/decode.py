@@ -50,6 +50,7 @@ whenever it is stale (``runtime.OverlayDevice.set_prologue``: first, then after 
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import ClassVar
@@ -58,14 +59,14 @@ import numpy as np
 import torch
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Program, Runtime, Worker
-from aie.iron.controlflow import forever_
+from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ... import txn
 from .. import act_lut, paging
 from ..base import ArgSpec, ArtcOperator
-from ..design import COLS, linear_tap, range32
+from ..design import COLS, linear_tap
 from ..formats import FORMATS
 from ..kernel_source import kernel_prefix
 from ..util import Attr, regions
@@ -386,18 +387,18 @@ class DecodeOverlayOperator(ArtcOperator):
             def strips(call: object) -> None:  # (packed: the object's strips, the next command before an answer)
                 command(call)
                 if self.packed:
-                    for _ in range32(ws[i_st + S_NXS1]):
+                    for _ in range_(ws[i_st + S_NXS1]):
                         command(call)
                         answer()
                 answer()
 
             def emits() -> None:
-                for _ in range32(ws[i_st + S_NE]):
+                for _ in range_(ws[i_st + S_NE]):
                     o = c_f.acquire(1)
                     emit(ws, o)
                     c_f.release(1)
                 if m_f is not None:
-                    for _ in range32(ws[i_st + S_NM]):
+                    for _ in range_(ws[i_st + S_NM]):
                         o = m_f.acquire(1)
                         emit(ws, o)
                         m_f.release(1)
@@ -410,23 +411,23 @@ class DecodeOverlayOperator(ArtcOperator):
                 answer()
                 x_f.release(1)
                 if psums:
-                    for _ in range32(ws[i_st + S_NPS]):  # (a header: the partial sums object)
+                    for _ in range_(ws[i_st + S_NPS]):  # (a header: the partial sums object)
                         x = x_f.acquire(1)
                         psums[0](x, ws)
                         x_f.release(1)
-                for _ in range32(ws[i_st + S_NNO]):  # the input under its norm-weight objects (the helper's work)
+                for _ in range_(ws[i_st + S_NNO]):  # the input under its norm-weight objects (the helper's work)
                     a = a_f.acquire(1)
                     nbegin(a, ws)
-                    for _ in range32(ws[i_st + S_NXN]):
+                    for _ in range_(ws[i_st + S_NXN]):
                         x = x_f.acquire(1)
                         strips(lambda c, x=x, a=a: strip_n(x, a, ws, c))
                         x_f.release(1)
                     a_f.release(1)
-                for _ in range32(ws[i_st + S_NXP]):  # or without
+                for _ in range_(ws[i_st + S_NXP]):  # or without
                     x = x_f.acquire(1)
                     strips(lambda c, x=x: strip(x, ws, c))
                     x_f.release(1)
-                for _ in range32(ws[i_st + S_NIN]):
+                for _ in range_(ws[i_st + S_NIN]):
                     c = cmd_f.acquire(1)
                     inp(ws, c, xs)
                     cmd_f.release(1)
@@ -435,7 +436,7 @@ class DecodeOverlayOperator(ArtcOperator):
                     res_f.release(1)
                 if psums:
                     emits()  # (a header: the updated residual slice)
-                for _ in range32(ws[i_st + S_NT]):
+                for _ in range_(ws[i_st + S_NT]):
                     a = a_f.acquire(1)
                     c = cmd_f.acquire(1)
                     tcmd(a, ws, c, xs)
@@ -446,14 +447,14 @@ class DecodeOverlayOperator(ArtcOperator):
                     res_f.release(1)
                     a_f.release(1)
                     emits()  # (after the last tile: the phase's last outputs too)
-                for _ in range32(ws[i_st + S_NSKIP]):  # the other cores' X objects
+                for _ in range_(ws[i_st + S_NSKIP]):  # the other cores' X objects
                     x_f.acquire(1)
                     x_f.release(1)
-                for _ in range32(ws[i_st + S_NASKIP]):  # and A objects
+                for _ in range_(ws[i_st + S_NASKIP]):  # and A objects
                     a_f.acquire(1)
                     a_f.release(1)
                 if r_f is not None:
-                    for _ in range32(ws[i_st + S_NR]):  # the model core's outputs -> C
+                    for _ in range_(ws[i_st + S_NR]):  # the model core's outputs -> C
                         r = r_f.acquire(1)
                         o = c_f.acquire(1)
                         relay(r, o)
@@ -505,7 +506,8 @@ class DecodeOverlayOperator(ArtcOperator):
         x_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["X"][1]) for c, f in enumerate(x_l3)]
         c_cons = [f.cons(tile=Tile(c, 0), channel=self.ENDPOINTS["C"][1]) for c, f in enumerate(c_fifos)]
         d_cons = [f.cons(tile=Tile(c, 0), channel=self.ENDPOINTS["D"][1]) for c, f in d_fifos]
-        a_n, x_n, c_n = COLS * self.tile_bytes // 2, COLS * XB // 2, 2 * COLS * C_LEN
+        d_len = [math.prod(f.shape) * np.dtype(f.dtype).itemsize // 2 for _, f in d_fifos]  # (whole objects)
+        a_n, x_n, c_n = COLS * self.tile_bytes // 2, COLS * XB // 2, COLS * C_LEN + sum(d_len)
 
         def seq(W_, ACT, OUT, a_h, x_h, c_h, d_h):  # the probe: one task per stream, in ENDPOINTS order
             for c in range(COLS):
@@ -515,7 +517,7 @@ class DecodeOverlayOperator(ArtcOperator):
             for c in range(COLS):
                 c_h[c].drain(OUT, linear_tap(c_n, c * C_LEN, C_LEN), wait=True)
             for c in range(len(d_h)):
-                d_h[c].drain(OUT, linear_tap(c_n, (COLS + c) * C_LEN, C_LEN), wait=True)
+                d_h[c].drain(OUT, linear_tap(c_n, COLS * C_LEN + sum(d_len[:c]), d_len[c]), wait=True)
 
         rt = Runtime(seq, [np.ndarray[(a_n,), bf], np.ndarray[(x_n,), bf], np.ndarray[(c_n,), bf],
                            a_prod, x_prod, c_cons, d_cons])

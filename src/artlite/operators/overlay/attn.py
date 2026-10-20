@@ -54,12 +54,12 @@ import math
 
 import numpy as np
 from aie.iron import Buffer, Kernel, ObjectFifo, Worker
-from aie.iron.controlflow import forever_
+from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
 from ..base import JINJA_ENV
-from ..design import COLS, range32
+from ..design import COLS
 from ..util import Attr, bf16_bits, bf16_hilo, regions, rup
 from .kv import Records
 from .vring import ring_rows, substeps, tails
@@ -1203,39 +1203,39 @@ class Attn:
                 x = x_f.acquire(1)
                 abegin(x, ws, col)
                 x_f.release(1)
-                for _ in range32(ws[i_a + A_NPS]):  # (a header's partial sums object)
+                for _ in range_(ws[i_a + A_NPS]):  # (a header's partial sums object)
                     x_f.acquire(1)
                     x_f.release(1)
-                for _ in range32(ws[i_a + A_NNO]):  # (a main core's normed phase: as it consumes them)
+                for _ in range_(ws[i_a + A_NNO]):  # (a main core's normed phase: as it consumes them)
                     a_f.acquire(1)
                     anb(ws)
-                    for _ in range32(ws[i_a + A_NXN]):
+                    for _ in range_(ws[i_a + A_NXN]):
                         x_f.acquire(1)
                         x_f.release(1)
                     a_f.release(1)
-                for _ in range32(ws[i_a + A_NXSKIP]):
+                for _ in range_(ws[i_a + A_NXSKIP]):
                     x_f.acquire(1)
                     x_f.release(1)
-                for _ in range32(ws[i_a + A_NASKIP]):
+                for _ in range_(ws[i_a + A_NASKIP]):
                     a_f.acquire(1)
                     a_f.release(1)
-                for _ in range32(ws[i_a + A_NQP]):  # (an attention step)
+                for _ in range_(ws[i_a + A_NQP]):  # (an attention step)
                     if tr is not None:
                         tr.acquire(1)
                     aq0(ws)  # (its first q object, from abegin)
-                    for _ in range32(ws[i_a + A_NQ]):
+                    for _ in range_(ws[i_a + A_NQ]):
                         x = x_f.acquire(1)
                         aq(x, ws)
                         x_f.release(1)
                     aqpan(ws)
-                    for _ in range32(ws[i_a + A_NKV]):
+                    for _ in range_(ws[i_a + A_NKV]):
                         x = x_f.acquire(1)
                         akv(x, ws, col // chain)
                         x_f.release(1)
-                    for _ in range32(ws[i_a + A_NOBJ]):
+                    for _ in range_(ws[i_a + A_NOBJ]):
                         a = a_f.acquire(1)
                         aobj(a, ws)
-                        for _ in range32(ws[i_a + A_NE]):  # (records to emit from it)
+                        for _ in range_(ws[i_a + A_NE]):  # (records to emit from it)
                             d = d_f.acquire(1)
                             arec(a, ws, d)
                             d_f.release(1)
@@ -1247,7 +1247,7 @@ class Attn:
                         tl.release(1)
                     if tr is not None:
                         tr.release(1)
-                    for _ in range32(ws[i_a + A_NE]):  # (o)
+                    for _ in range_(ws[i_a + A_NE]):  # (o)
                         d = d_f.acquire(1)
                         aemit(ws, d)
                         d_f.release(1)

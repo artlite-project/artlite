@@ -134,6 +134,9 @@ per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 
 - **Expand by a broadcast and two 8x8 transposes** (`al::expand8_of`, `al::expand16_bc`: `vextbcst.128` is not on the
   port, 2 shuffles per 64 lanes instead of the zips' 3-4): GemmQ's tile-major dequant II 46 -> 40, bit-exact. In an
   alu-bound loop the zips schedule better (Q6_K's dequant: II 46 with zips, 88 with transposes): measure.
+- **Repeat a 128-bit vector with `grow_replicate<N>()`** (one `vextbcst.128`), not `aie::concat(v, v, ...)`: aie_api
+  concatenates 128-bit pieces with one `vshift` each, in sequence. K2 / K3 scales repeated to 64 lanes (`formats/k23.py`
+  `_d64`): the GemmQd super-block header's loop II 22 -> 18 (the prefill level: not its bound).
 - **Transpose bytes before the arithmetic, not bf16 results after it**: Q4_K's scale header (`formats/q4k.py`
   `_hdr_q4k`) as [row][group] nibbles -> bf16 products -> transposes took 12 shuffles per 128 values; one `T8_8x8`
   shuffle per 8x8 bytes and an even / odd row zip before the math, the crumb words shared by their two super-blocks,

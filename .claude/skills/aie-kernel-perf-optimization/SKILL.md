@@ -136,8 +136,9 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   budget, the GEMV's own DMA as a stall source.
 - **R6 Per-lane scales of small sub-blocks**: `broadcast_elem_128` + two 8x8 transposes instead of zips (II 44 -> 29),
   scales kept in the MMUL's lane order, fission of a spilling dequant (750 -> 590 cycles per 64 rows).
-- **R7 Port-bound loops** (shuffles and panel pushes share `L_RM_PORT`): broadcast + transpose expansions, transposes
-  of bytes before the arithmetic (II 46 -> 40; a Q4_K header 2246 -> 920 cycles).
+- **R7 Port-bound loops** (shuffles and panel pushes share `L_RM_PORT`): broadcast + transpose expansions, 128-bit
+  repeats by `grow_replicate` (not `concat` chains: a `vshift` each), transposes of bytes before the arithmetic (II
+  46 -> 40; a Q4_K header 2246 -> 920 cycles).
 - **R8 Pointer walks instead of index math** (`add_3d_ptr` walks: II 46 -> 30, alu 0) and small scalar gathers
   unrolled to constant offsets (4660 -> 281 cycles).
 - **R9 Batched small calls, filled lanes**: scalar-ish math once for all panels, independent small reductions in one
@@ -268,15 +269,18 @@ relocations to function symbols: `llvm-objdump -dr`; sizes from `llvm-nm -S`). R
 cycles in one variant_search run.
 
 Levers that worked (the decode overlay's main core: -1.1 KB):
-- **Worker loops**: IRON's `range_` for a constant bound (aiecc narrows it to i32), `design.range32` for a bound read
-  at run time (`range_` would keep a 64-bit counter: two registers and a carry per loop), a core's infinite loop as
+- **Worker loops**: IRON's `range_` (aiecc narrows its counter to i32 when the bound is a constant or read from a
+  buffer; an index counter is two registers and a carry per loop), `design.range32` for a body that computes with the
+  i32 induction variable, a core's infinite loop as
   `forever_()` with `Worker(while_true=False)` (`scf.while(true)`, no counter: 48-192 B per core; 816 B on a small core
   whose counted loop LLVM unrolled); i32 loops and `while_true=False` took 624 B off the decode main core. opt fully
   unrolls a constant-trip worker loop to drop the rotation of the FIFO objects' pointers (the Qwen decode GDN core's
   32 panels: +800 B): `range32(n, unroll=False)` keeps it rolled. A global cap on unrolling instead cost the Gemma
   prefill 22% (other cores' unrolled loops are hot). The cores' llc
-  runs with `--enable-aie-zol-without-minitercount=false` (`operators/base.py` `CORE_LLC_FLAGS`): loops without a
-  known minimum trip count (FIFO skip loops) would become zero-overhead loops padded with NOP bundles (~180 B each).
+  runs with `--enable-aie-zol-without-minitercount=false` (`operators/base.py` `CORE_LLC_FLAGS`, aiecc `-Xllc`): loops
+  without a known minimum trip count (FIFO skip loops) would become zero-overhead loops padded with NOP bundles (~180 B
+  each). aiecc's `-Xopt=<arg>` reaches the cores' opt (`-opt-bisect-limit=<n>`, `-opt-disable=<passes>`: which pass
+  grows a core).
 - **Code per core**: a shared function rendered per core with only that core's cases; one kernel entry per operation,
   and small end-of-phase work folded into the last call of an existing kernel (every kernel call is Worker control
   code too); a Python helper called twice in the IRON program inlines its loops twice; the work split between

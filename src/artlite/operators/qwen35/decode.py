@@ -100,24 +100,24 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                     x = x_f.acquire(1)
                     gbegin(x, ws)
                     x_f.release(1)
-                    for _ in range32(ws[i_g + G.G_NSKIP]):
+                    for _ in range_(ws[i_g + G.G_NSKIP]):
                         x_f.acquire(1)
                         x_f.release(1)
-                    for _ in range32(ws[i_g + G.G_NMSG]):
+                    for _ in range_(ws[i_g + G.G_NMSG]):
                         m = m_f.acquire(1)
                         gmsg(m, ws)
                         m_f.release(1)
-                    for _ in range32(ws[i_g + G.G_ON]):
-                        for _ in range32(ws[i_g + G.G_NCP]):  # conv pairs: q, k, then each pair of v heads
+                    for _ in range_(ws[i_g + G.G_ON]):
+                        for _ in range_(ws[i_g + G.G_NCP]):  # conv pairs: q, k, then each pair of v heads
                             conv2()
-                            for _ in range32(ws[i_g + G.G_KO]):  # (after k)
+                            for _ in range_(ws[i_g + G.G_KO]):  # (after k)
                                 x = x_f.acquire(1)
                                 gkold(x, ws)
                                 x_f.release(1)
                                 d = d_f.acquire(1)
                                 gknew(ws, d)
                                 d_f.release(1)
-                            for _ in range32(ws[i_g + G.G_PO]):  # (after a pair's v)
+                            for _ in range_(ws[i_g + G.G_PO]):  # (after a pair's v)
                                 x = x_f.acquire(1)
                                 gdl(x, ws)
                                 x_f.release(1)
@@ -165,32 +165,32 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                     x = x_f.acquire(1)
                     abegin(x, ws, col)
                     x_f.release(1)
-                    for _ in range32(ws[i_a + AT.A_NNO]):  # (a main core's normed phase: as it consumes them)
+                    for _ in range_(ws[i_a + AT.A_NNO]):  # (a main core's normed phase: as it consumes them)
                         a_f.acquire(1)
                         anb(ws)
-                        for _ in range32(ws[i_a + AT.A_NXN]):
+                        for _ in range_(ws[i_a + AT.A_NXN]):
                             x_f.acquire(1)
                             x_f.release(1)
                         a_f.release(1)
-                    for _ in range32(ws[i_a + AT.A_NXSKIP]):
+                    for _ in range_(ws[i_a + AT.A_NXSKIP]):
                         x_f.acquire(1)
                         x_f.release(1)
-                    for _ in range32(ws[i_a + AT.A_NASKIP]):
+                    for _ in range_(ws[i_a + AT.A_NASKIP]):
                         a_f.acquire(1)
                         a_f.release(1)
-                    for _ in range32(ws[i_a + AT.A_NQP]):  # (an attention step)
+                    for _ in range_(ws[i_a + AT.A_NQP]):  # (an attention step)
                         for t in t_out:
                             t.acquire(1)
-                        for _ in range32(ws[i_a + AT.A_NQ]):
+                        for _ in range_(ws[i_a + AT.A_NQ]):
                             x = x_f.acquire(1)
                             aq(x, ws)
                             x_f.release(1)
                         aqpan(ws)
-                        for _ in range32(ws[i_a + AT.A_NKV]):
+                        for _ in range_(ws[i_a + AT.A_NKV]):
                             x = x_f.acquire(1)
                             akv(x, ws, col)
                             x_f.release(1)
-                        for _ in range32(ws[i_a + AT.A_NOBJ]):
+                        for _ in range_(ws[i_a + AT.A_NOBJ]):
                             a = a_f.acquire(1)
                             aobj(a, ws)
                             a_f.release(1)
@@ -203,7 +203,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                         else:
                             t_out[0].release(1)
                             aend(ws, pw)
-                        for _ in range32(ws[i_a + AT.A_NE]):
+                        for _ in range_(ws[i_a + AT.A_NE]):
                             r = r_f.acquire(1)
                             aemit(ws, r)
                             r_f.release(1)

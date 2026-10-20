@@ -5,13 +5,11 @@ import fcntl
 import glob
 import hashlib
 import os
-import shlex
 import shutil
 import subprocess
 import sys
 import sysconfig
 import tempfile
-import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -73,7 +71,7 @@ AIE_TARGET = "aie2p-none-unknown-elf"
 # llc flags for the cores' own code (the worker loops aiecc generates from a design; the kernels are clang++'s): a loop
 # without a known minimum trip count (an object fifo's skip loop: acquire, release) as a branch loop, not a zero-overhead
 # loop padded with full NOP bundles (~32 instead of ~180 B each: the Gemma decode overlay's attention cores' loop 1840 ->
-# 1408 B, the main cores' 2400 -> 2192). aiecc takes no llc flags: it runs a Peano whose llc adds them (_aiecc_peano).
+# 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
 CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false",)
 
 # Shared Jinja environment for all kernel template strings.
@@ -122,31 +120,6 @@ def _run_aiecc(cmd: list[str], *, cwd: str, link_files: Callable[[], None]) -> N
 
 def _cache_key(*args: object) -> str:
     return hashlib.sha256(repr(args).encode()).hexdigest()[:16]
-
-
-def _aiecc_peano() -> str:
-    """The Peano directory aiecc runs: the real one's entries linked, bin/llc a wrapper adding CORE_LLC_FLAGS (made once
-    per Peano and flags, in the cache directory)."""
-    d = os.path.join(CACHE_DIR, "peano_" + _cache_key(PEANO_DIR, version("llvm_aie"), CORE_LLC_FLAGS))
-    if os.path.isdir(d):
-        return d
-    tmp = f"{d}.tmp{os.getpid()}.{threading.get_ident()}"
-    os.makedirs(os.path.join(tmp, "bin"))
-    for name in os.listdir(PEANO_DIR):
-        if name != "bin":
-            os.symlink(os.path.join(PEANO_DIR, name), os.path.join(tmp, name))
-    for name in os.listdir(os.path.join(PEANO_DIR, "bin")):
-        if name != "llc":
-            os.symlink(os.path.join(PEANO_DIR, "bin", name), os.path.join(tmp, "bin", name))
-    llc = os.path.join(tmp, "bin", "llc")
-    with open(llc, "w") as f:
-        f.write(f'#!/bin/sh\nexec {shlex.quote(os.path.join(PEANO_DIR, "bin", "llc"))} "$@" {shlex.join(CORE_LLC_FLAGS)}\n')
-    os.chmod(llc, 0o755)
-    try:
-        os.rename(tmp, d)
-    except OSError:  # (another build made it meanwhile)
-        shutil.rmtree(tmp)
-    return d
 
 
 @contextlib.contextmanager
@@ -296,7 +269,8 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
     pch_path = _compile_pch(clang_cmd=clang_cmd)
     # --unified: every core of a device lowered once (default: a clone of the design per core); the same outputs, aiecc
     # -55% (the Llama prefill library 52 -> 21 s, the SD 1.5 UNet program 22 -> 8 s)
-    aiecc_opts = [*([f"-j{aiecc_jobs}"] if aiecc_jobs else []), "--unified"]
+    aiecc_opts = [*([f"-j{aiecc_jobs}"] if aiecc_jobs else []), "--unified", f"--peano={PEANO_DIR}",
+                  *(f"-Xllc={flag}" for flag in CORE_LLC_FLAGS)]
     if spec.kind == "fused":
         key = _cache_key(spec.source, spec.mlir, pch_path, version("mlir_aie"), version("llvm_aie"),
                          spec.expand_load_pdis, CORE_LLC_FLAGS)
@@ -308,10 +282,9 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
             with open(mlir_path, "w") as f:
                 f.write(spec.mlir)
             if not os.path.exists(elf_path) or ignore_cache:
-                _run_aiecc([AIECC, *aiecc_opts, "--peano", _aiecc_peano(),
-                            *(["--expand-load-pdis"] if spec.expand_load_pdis else []), "--get-full-elf",
-                            "--get-scratchpad-parameters", "--full-elf-name", os.path.abspath(elf_path),
-                            os.path.abspath(mlir_path)], cwd=work_dir,
+                _run_aiecc([AIECC, *aiecc_opts, *(["--expand-load-pdis"] if spec.expand_load_pdis else []),
+                            "--get-full-elf", "--get-scratchpad-parameters", "--full-elf-name",
+                            os.path.abspath(elf_path), os.path.abspath(mlir_path)], cwd=work_dir,
                            link_files=lambda: _kernel_and_checks(spec, work_dir=work_dir, pch_path=pch_path,
                                                                  ignore_cache=ignore_cache, measure=measure))
             elif spec.source:
@@ -346,8 +319,8 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
 
         # Step 2: compile MLIR -> PDI + insts, the C++ kernel -> kernel.o meanwhile
         if not (os.path.exists(pdi_path) and os.path.exists(insts_path)) or ignore_cache:
-            aiecc_cmd = [AIECC, *aiecc_opts, "--get-pdi", "--get-npu-insts", f"--peano={_aiecc_peano()}",
-                         "--pdi-name=main.pdi", "--npu-insts-name=insts.bin"]
+            aiecc_cmd = [AIECC, *aiecc_opts, "--get-pdi", "--get-npu-insts", "--pdi-name=main.pdi",
+                         "--npu-insts-name=insts.bin"]
             if profiling_cfg is not None:
                 # Persist design.mlir.prj intermediates (notably
                 # input_with_addresses.mlir) for trace parsing.

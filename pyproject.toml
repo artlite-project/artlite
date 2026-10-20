@@ -11,8 +11,8 @@ license = "GPL-3.0-or-later AND Apache-2.0 AND GPL-2.0-only WITH Linux-syscall-n
 license-files = ["LICENSE", "csrc/shim_xdna/LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "mlir_aie==1.4.5.dev48+gcb6f2d1",
-    "llvm_aie==22.0.0.2026101601+4f5df13d",
+    "mlir_aie==1.4.5.dev56+g1a647f1",
+    "llvm_aie==22.0.0.2026102001+4f5df13d",
     "numpy",
     "torch>=2.11.0",
     "pyyaml>=6.0.3",

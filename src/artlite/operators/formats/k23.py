@@ -80,11 +80,8 @@ alignas(64) static const int8_t {{ p }}_onehot[8][64] = {
                                                  aie::vector<bfloat16, 64> &hi)
 {
     const aie::vector<bfloat16, 16> v = aie::load_v<16>((const bfloat16 *)w);
-    const aie::vector<bfloat16, 16> l = aie::concat(aie::filter_even(v, 1), aie::filter_even(v, 1));
-    const aie::vector<bfloat16, 16> h = aie::concat(aie::filter_odd(v, 1), aie::filter_odd(v, 1));
-    const aie::vector<bfloat16, 32> l2 = aie::concat(l, l), h2 = aie::concat(h, h);
-    lo = aie::concat(l2, l2);
-    hi = aie::concat(h2, h2);
+    lo = aie::filter_even(v, 1).template grow_replicate<64>();
+    hi = aie::filter_odd(v, 1).template grow_replicate<64>();
 }
 
 // lanes [r][8]: 8 values (r), each repeated over its row's 8 lanes (a broadcast and two 8x8 transposes)

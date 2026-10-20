@@ -14,12 +14,11 @@ ROWS = 4  # compute rows per column (rows 2-5; memtile row 1, shim row 0)
 
 
 def range32(stop: object, *, unroll: bool = True) -> Iterator[object]:
-    """``scf.for`` from 0 to stop (an int or an i32 value) with i32 bounds; yields the i32 induction variable.
-    For a bound read at run time (``range32(ws[i])``): IRON's ``range_`` casts it to index, a 64-bit counter on the
-    core (two registers and a carry). With a constant bound use ``range_``: aiecc narrows its loop to i32
-    (aie-core-int-range-narrowing; the same code). ``unroll=False``: LLVM keeps the loop
-    rolled (a dynamic core rotates its FIFO objects' pointers on every release, and opt fully unrolls a
-    constant-trip loop to drop that rotation: program memory)."""
+    """``scf.for`` from 0 to stop (an int or an i32 value) with i32 bounds; yields the i32 induction variable, for a
+    body that computes with it. Otherwise use IRON's ``range_``: aiecc narrows its loop to i32 when the bound is a
+    constant or read from a buffer (``range_(ws[i])``; aie-core-int-range-narrowing; the same code). ``unroll=False``:
+    LLVM keeps the loop rolled (a dynamic core rotates its FIFO objects' pointers on every release, and opt fully
+    unrolls a constant-trip loop to drop that rotation: program memory)."""
     c0, c1 = arith.constant(T.i32(), 0), arith.constant(T.i32(), 1)
     stop = arith.constant(T.i32(), stop) if isinstance(stop, int) else stop
     if isinstance(stop.type, IndexType):
