@@ -28,19 +28,27 @@ def _bf(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
+def _slot_order(slots: np.ndarray) -> np.ndarray:
+    """QS slots (..., SLOT) uint8 as stored ([half][value 2][d-block 16][72 B]: ``AP.slot_walk``) -> [d-block 32][the
+    two values' 144 B]."""
+    lead = slots.shape[:-1]
+    return np.ascontiguousarray(slots.reshape(*lead, 2, 2, AP.ND // 2, 72).swapaxes(-3, -2)).reshape(*lead, AP.ND, 144)
+
+
 def _q_panels(slots: np.ndarray) -> np.ndarray:
     """Q slots (..., SLOT) uint8 -> (..., 8 queries, 256) the Q values they hold (hi + lo)."""
     lead = slots.shape[:-1]
-    p = slots.reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
+    p = _slot_order(slots).reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
     v = bfp16.block_values(p[..., 0, :, :]) + bfp16.block_values(p[..., 1, :, :])  # [db][query][8]
     return np.moveaxis(v, -3, -2).reshape(*lead, 8, AP.HD)
 
 
 def _gate_sigmoid(slots: np.ndarray) -> np.ndarray:
-    """sigmoid(gate) slots (..., SLOT) uint8 -> (..., 8, 256) (fp32 of the bf16 stored)."""
+    """sigmoid(gate) slots (..., SLOT) uint8 -> (..., 8, 256) (fp32 of the bf16 stored: per d-block [query][8])."""
     lead = slots.shape[:-1]
-    g = np.ascontiguousarray(slots[..., :8 * AP.HD * 2]).view(np.uint16).astype(np.uint32) << 16
-    return g.view(np.float32).reshape(*lead, 8, AP.HD)
+    g = _slot_order(slots).view(np.uint16).reshape(*lead, AP.ND, 72)[..., :64].astype(np.uint32) << 16
+    g = g.view(np.float32).reshape(*lead, AP.ND, 8, 8)  # [db][query][8]
+    return np.moveaxis(g, -3, -2).reshape(*lead, 8, AP.HD)
 
 
 class _Setup:
