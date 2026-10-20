@@ -12,6 +12,8 @@
 
 #include <cstring>
 #include <limits>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -20,6 +22,21 @@
 #include "device.h"
 #include "shim_err.h"
 #include "xrt_mem.h"
+
+namespace {
+
+// GET_ARRAY of a request only xdna-driver's module serves (Linux's own driver: EOPNOTSUPP).
+void get_array_xdna_driver(const shim_xdna::pdev& p, amdxdna_drm_get_array& ga, std::string_view what,
+                           std::string_view request) {
+  try {
+    p.ioctl(DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga);
+  } catch (const std::system_error& e) {
+    if (e.code().value() != EOPNOTSUPP) throw;
+    shim_xdna::shim_err(EOPNOTSUPP, "{} needs xdna-driver's amdxdna module (the driver has no {})", what, request);
+  }
+}
+
+}  // namespace
 
 namespace shim_xdna {
 
@@ -157,7 +174,7 @@ amdxdna_drm_hwctx_entry hw_ctx::status() const {
   ga.element_size = sizeof(e);
   ga.num_element = 1;
   ga.buffer = reinterpret_cast<uintptr_t>(&e);
-  m_device.get_pdev().ioctl(DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga);
+  get_array_xdna_driver(m_device.get_pdev(), ga, "a context's status", "DRM_AMDXDNA_HW_CONTEXT_BY_ID");
   return e;
 }
 
@@ -181,7 +198,7 @@ uint32_t hw_ctx::read_aie_reg(uint32_t col, uint32_t row, uint32_t reg_addr) con
   ga.element_size = sizeof(ta);
   ga.num_element = 1;
   ga.buffer = reinterpret_cast<uintptr_t>(&ta);
-  m_device.get_pdev().ioctl(DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga);
+  get_array_xdna_driver(m_device.get_pdev(), ga, "reading AIE tiles", "DRM_AMDXDNA_AIE_TILE_READ");
 
   // For REG reads the KMD copies the value over the first 4 bytes of the
   // buffer, which aliases .pid.

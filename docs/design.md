@@ -258,8 +258,15 @@ a clean failure, never while a job may be hung (a mailbox timeout destroys the c
   word is safe; it resets the state to NEW only when the job starts, so the runtime writes NEW
   before each submit. After any failure the driver overwrites the packet with 0xff (the health
   record on TIMEOUT): the runtime rewrites every packet word per dispatch.
-- The driver ignores EXEC_CMD's argument BOs: it neither pins them nor keeps them alive for the
-  job (the runtime lists them for drivers that pin them).
+- EXEC_CMD's argument BOs: xdna-driver's module ignores them (it neither pins them nor keeps them
+  alive for the job); Linux's own driver looks up, pins and locks each one in the DRM file the
+  command is submitted to. So the runtime lists each BO once, and a process opens one DRM file
+  per device: every `Device` of an index shares it (`pdev::open`), as does XRT.
+- DEV BOs (control code, PDIs) are ranges of the DRM file's device heap: heap BOs of 64 MB,
+  contiguous in the NPU's and the CPU's addresses, added while a DEV BO does not fit, up to
+  512 MB. Linux's driver before 7.2 allows one heap BO: 64 MB per process.
+- Reading AIE tiles (`HwContext.read_aie_reg`: counter profiling, the paging probes) and a
+  context's status are xdna-driver requests; Linux's driver serves neither (NotImplementedError).
 - In PASID mode the NPU addresses BOs by user VA through MMU notifiers: a `munmap`,
   `mprotect` or `fork` of a BO range while a job runs blocks until the client is idle. Allocate
   BOs before dispatching, and don't free buffers or spawn processes during an async dispatch.

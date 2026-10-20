@@ -300,7 +300,10 @@ class _Bench:
         self.dev.dispatch(Transaction(self.dev, t.words()))
 
     def reg(self, c: int, r: int, addr: int) -> int:
-        return self.op._program._ctx.read_aie_reg(c, r, addr) & 0xFFFFFFFF
+        try:
+            return self.op._program._ctx.read_aie_reg(c, r, addr) & 0xFFFFFFFF
+        except NotImplementedError as e:  # (a driver that reads no AIE tiles: Linux's own)
+            pytest.skip(str(e))
 
     def res(self, k: int) -> list[int]:
         return [self.reg(c, r, RES + 4 * k) for c, r in self.tiles]

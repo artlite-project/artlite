@@ -38,6 +38,10 @@ struct properties {
 
 // Tag of the user-memory constructor.
 struct user_memory {};
+// Tag of the heap constructor: the CPU address of the heap BO (in its pdev's reservation).
+struct heap_memory {
+  void* at;
+};
 
 // A DRM buffer object, mapped into this process. The NPU's DMA does not snoop the CPU caches:
 // sync() writes back and invalidates the range (both directions).
@@ -56,8 +60,8 @@ struct bo {
 
   // flags: XCL_BO_FLAGS_HOST_ONLY, XRT_BO_FLAGS_CACHEABLE or XCL_BO_FLAGS_EXECBUF
   bo(const pdev& p, size_t size, uint32_t flags);
-  // Support BO creation from internal
-  bo(const pdev& p, size_t size, amdxdna_bo_type type);
+  // A heap BO of the pdev's device heap (pdev::add_heap_bo), unmapped with the pdev's reservation.
+  bo(const pdev& p, size_t size, heap_memory);
   // A host-only BO in this process's memory: anonymous 2 MB pages (MADV_HUGEPAGE, MADV_DONTFORK), faulted in
   // and flushed by several threads, then pinned by the driver (a userptr BO, AMDXDNA_BO_SHARE with a VA table).
   // A SHMEM BO's pages are allocated and mapped by the driver in one thread (16 GB: 1.7 s; this: ~0.3 s).
@@ -78,8 +82,8 @@ struct bo {
   std::string_view type_to_name() const;
 
  private:
-  bo(const pdev& p, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type type);
-  void mmap_bo(size_t align);
+  bo(const pdev& p, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type type, void* at = nullptr);
+  void mmap_bo(void* at);
   void release() noexcept;
 };
 

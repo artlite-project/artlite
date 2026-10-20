@@ -155,8 +155,9 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   it. A killed job fails with `DispatchError ... TIMEOUT (state 8)` and "TDR timeout detected" in dmesg;
   `health["txn_op_idx"]` is the last control-code operation the firmware ran.
 - A runtime-sequence argument stays below 4 GB (ELF relocation addends are 32-bit).
-- An ELF's control code goes into its device's 64 MB heap (`CREATE_BO ... Resource temporarily unavailable`); every
-  ConfigureOp inlines its design's configuration. Long programs: `fused.Library` + `Library.run`.
+- An ELF's control code goes into the process's device heap (64 MB heap BOs up to 512 MB; one before Linux 7.2:
+  `CREATE_BO ... No space left on device`); every ConfigureOp inlines its design's configuration. Long programs:
+  `fused.Library` + `Library.run`.
   Thousands of entries in one aiecc ELF make aiecc's time explode.
 - `FusedOperator` refuses to run while a buffer read before it is written was never written by the host (declare
   intentionally empty ones `uninitialized`). The host writes only input and scratch buffers: output BOs are never

@@ -7,7 +7,8 @@ Two complementary mechanisms, selected by the ``ARTLITE_PROFILE`` env var:
     The operator's MLIR is rewritten at compile time (post-placement
     ``aiex.npu.write32`` ops configure counters at the start of the runtime
     sequence), and after every dispatch the counter values are read back over
-    the context-scoped ``AMDXDNA_AIE_TILE_READ`` ioctl (no root required) and
+    the context-scoped ``AMDXDNA_AIE_TILE_READ`` ioctl (no root required;
+    xdna-driver's module only) and
     appended as Chromium JSON counter events. Typical use: count cycles
     between ``event0()`` / ``event1()`` markers in the kernel. A "host"
     process adds per dispatch its wall time, the driver's device busy time

@@ -71,30 +71,19 @@ std::string_view bo::type_to_name() const {
   }
 }
 
-void bo::mmap_bo(size_t align) {
+void bo::mmap_bo(void* at) {
   if (m_map_offset == AMDXDNA_INVALID_ADDR) {
     // A DEV BO is a range of the device heap: its CPU address follows from the heap's mapping
     // (the driver's reported user VA exists only in PASID mode).
-    const bo& heap = *m_pdev.m_dev_heap_bo;
-    m_aligned = static_cast<char*>(heap.m_aligned) + (m_xdna_addr - heap.m_xdna_addr);
+    m_aligned = m_pdev.dev_bo_address(m_xdna_addr);
     return;
   }
 
-  if (align == 0) {
-    m_aligned = m_pdev.mmap(nullptr, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED,
-                            m_map_offset);
+  if (at) {  // (a heap BO, at its place in the pdev's reservation)
+    m_aligned = m_pdev.mmap(at, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, m_map_offset);
     return;
   }
-
-  // Reserve twice the alignment, then map the BO at the aligned address inside the reservation.
-  m_parent_size = align * 2 - 1;
-  m_parent = ::mmap(nullptr, m_parent_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (m_parent == MAP_FAILED) {
-    m_parent = nullptr;
-    shim_err(errno, "mmap(len={}) failed", m_parent_size);
-  }
-  auto aligned = reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(m_parent) + align) & ~(align - 1));
-  m_aligned = m_pdev.mmap(aligned, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, m_map_offset);
+  m_aligned = m_pdev.mmap(nullptr, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED, m_map_offset);
 }
 
 void bo::release() noexcept {
@@ -103,7 +92,8 @@ void bo::release() noexcept {
     m_pdev.try_ioctl(DRM_IOCTL_GEM_CLOSE, &close_bo);
     m_handle = AMDXDNA_INVALID_BO_HANDLE;
   }
-  if (m_map_offset != AMDXDNA_INVALID_ADDR && m_aligned && !m_user) ::munmap(m_aligned, m_aligned_size);
+  if (m_map_offset != AMDXDNA_INVALID_ADDR && m_aligned && !m_user && m_type != AMDXDNA_BO_DEV_HEAP)
+    ::munmap(m_aligned, m_aligned_size);
   if (m_parent) ::munmap(m_parent, m_parent_size);
   m_aligned = m_parent = nullptr;
   if (m_handle != AMDXDNA_INVALID_BO_HANDLE) {
@@ -113,20 +103,22 @@ void bo::release() noexcept {
   }
 }
 
-bo::bo(const pdev& pdev, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type type)
+bo::bo(const pdev& pdev, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type type, void* at)
     : m_pdev(pdev), m_aligned_size(size), m_flags(flags), m_type(type) {
   if (m_type == AMDXDNA_BO_INVALID) shim_err(EINVAL, "Invalid BO flags: {:#x}", flags.all);
 
   amdxdna_drm_create_bo cbo = {.size = size, .type = static_cast<uint32_t>(m_type)};
-  m_pdev.ioctl(DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo);
+  if (m_type == AMDXDNA_BO_DEV)
+    m_pdev.create_dev_bo(cbo);
+  else
+    m_pdev.ioctl(DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo);
   m_handle = cbo.handle;
   try {
     amdxdna_drm_get_bo_info info = {.handle = m_handle};
     m_pdev.ioctl(DRM_IOCTL_AMDXDNA_GET_BO_INFO, &info);
     m_map_offset = info.map_offset;
     m_xdna_addr = info.xdna_addr;
-    // Device mem heap must align at 64MB boundary.
-    mmap_bo(m_type == AMDXDNA_BO_DEV_HEAP ? 64 * 1024 * 1024 : 0);
+    mmap_bo(at);
   } catch (...) {
     release();
     throw;
@@ -202,7 +194,7 @@ bo::bo(const pdev& p, size_t size, user_memory)
 bo::bo(const pdev& p, size_t size, uint32_t flags)
     : bo(p, size, shim_xcl_bo_flags{.flags = flags}, flag_to_type(shim_xcl_bo_flags{.flags = flags})) {}
 
-bo::bo(const pdev& p, size_t size, amdxdna_bo_type type) : bo(p, size, shim_xcl_bo_flags{}, type) {}
+bo::bo(const pdev& p, size_t size, heap_memory h) : bo(p, size, shim_xcl_bo_flags{}, AMDXDNA_BO_DEV_HEAP, h.at) {}
 
 // GEM_CLOSE of a BO a job still uses is safe for the driver (it holds its own references) but
 // not for the job: the caller keeps BOs alive until their commands complete.

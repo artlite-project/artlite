@@ -55,7 +55,7 @@ struct Kernel::Impl {
   Impl(device& d, hw_ctx& c, std::string_view name)
       : dev(d), ctx(c), cu_mask(1u << c.cu_index(name.empty() ? c.m_cu_info[0].m_name : name)) {}
 
-  // Waits for what is still running: the driver does not keep a job's buffers alive.
+  // Waits for what is still running: xdna-driver's module does not keep a job's buffers alive.
   ~Impl() {
     if (pending.empty()) return;
     try {
@@ -86,6 +86,10 @@ struct Kernel::Impl {
     arg_handles.clear();
     arg_handles.push_back(first.get_drm_bo_handle());
     for (auto& b : bufs) arg_handles.push_back(b.get().get_drm_bo_handle());
+    // Linux's own driver looks up, pins and locks each listed BO in the context's DRM file (all of
+    // them in one acquire context: a handle listed twice fails with EALREADY)
+    std::ranges::sort(arg_handles);
+    arg_handles.erase(std::ranges::unique(arg_handles).begin(), arg_handles.end());
     uint64_t seq;
     try {
       seq = ctx.submit(*cmd, arg_handles);

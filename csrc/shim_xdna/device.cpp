@@ -14,6 +14,7 @@
 #include <charconv>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <string>
 
 #include "bo.h"
@@ -52,9 +53,10 @@ std::string ioctl_cmd2name(unsigned long cmd) {
   }
 }
 
-// Device memory heap needs to be within one 64MB page. The maximum size is
-// 64MB.
-const size_t dev_mem_size = (64 << 20);
+// The device heap: heap BOs of 64 MB (each within one 64 MB page of the NPU's addresses) up to
+// the driver's maximum.
+constexpr size_t heap_bo_size = size_t(64) << 20;
+constexpr size_t heap_max_size = size_t(512) << 20;
 }  // namespace
 
 namespace shim_xdna {
@@ -64,17 +66,64 @@ pdev::pdev(uint32_t device_index) {
   m_dev_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (m_dev_fd < 0) shim_err(errno, "Failed to open device {}", path);
   try {
-    m_dev_heap_bo = std::make_unique<bo>(*this, dev_mem_size, AMDXDNA_BO_DEV_HEAP);
+    m_heap_range_size = heap_max_size + heap_bo_size;  // (room to align it)
+    m_heap_range = ::mmap(nullptr, m_heap_range_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m_heap_range == MAP_FAILED) {
+      m_heap_range = nullptr;
+      shim_err(errno, "mmap(len={}) failed", m_heap_range_size);
+    }
+    m_heap_cpu = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(m_heap_range) + heap_bo_size - 1) &
+                                         ~(heap_bo_size - 1));
+    add_heap_bo();
+    m_heap_xdna_addr = m_heap_bos[0]->m_xdna_addr;
   } catch (...) {
+    m_heap_bos.clear();
+    if (m_heap_range) ::munmap(m_heap_range, m_heap_range_size);
     ::close(m_dev_fd);
     throw;
   }
 }
 
+// The heap BOs' handles first, then their mappings with the reservation (no hole in it meanwhile).
 pdev::~pdev() {
-  m_dev_heap_bo.reset();
+  m_heap_bos.clear();
+  ::munmap(m_heap_range, m_heap_range_size);
   ::close(m_dev_fd);
 }
+
+std::shared_ptr<pdev> pdev::open(uint32_t device_index) {
+  static std::mutex lock;
+  static std::map<uint32_t, std::weak_ptr<pdev>> pdevs;
+  std::lock_guard guard(lock);
+  std::weak_ptr<pdev>& w = pdevs[device_index];
+  std::shared_ptr<pdev> p = w.lock();
+  if (!p) w = p = std::make_shared<pdev>(device_index);
+  return p;
+}
+
+void pdev::add_heap_bo() const {
+  size_t n = m_heap_bos.size();
+  if ((n + 1) * heap_bo_size > heap_max_size)
+    shim_err(ENOSPC, "the device heap is at its maximum of {} MB", heap_max_size >> 20);
+  m_heap_bos.push_back(std::make_unique<bo>(*this, heap_bo_size, heap_memory{m_heap_cpu + n * heap_bo_size}));
+}
+
+void pdev::create_dev_bo(amdxdna_drm_create_bo& cbo) const {
+  std::lock_guard guard(m_heap_lock);
+  // EAGAIN: the driver placed the BO past the heap BOs
+  while (::ioctl(m_dev_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo) == -1) {
+    int err = errno;
+    if (err != EAGAIN) shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed");
+    try {
+      add_heap_bo();
+    } catch (const std::exception& e) {
+      shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed (a DEV BO of {} bytes; the device heap of {} MB is full: {})",
+               cbo.size, m_heap_bos.size() * (heap_bo_size >> 20), e.what());
+    }
+  }
+}
+
+void* pdev::dev_bo_address(uint64_t xdna_addr) const { return m_heap_cpu + (xdna_addr - m_heap_xdna_addr); }
 
 void pdev::ioctl(unsigned long cmd, void* arg) const {
   if (::ioctl(m_dev_fd, cmd, arg) == -1) shim_err(errno, "{} IOCTL failed", ioctl_cmd2name(cmd));
@@ -105,15 +154,15 @@ static T get_info(const pdev& dev, uint32_t param) {
   return value;
 }
 
-device::device(uint32_t device_index) : m_pdev(device_index) {
-  auto metadata = get_info<amdxdna_drm_query_aie_metadata>(m_pdev, DRM_AMDXDNA_QUERY_AIE_METADATA);
+device::device(uint32_t device_index) : m_pdev(pdev::open(device_index)) {
+  auto metadata = get_info<amdxdna_drm_query_aie_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_AIE_METADATA);
   n_rows = metadata.core.row_count;
   n_cols = metadata.cols;
 }
 
 device::~device() = default;
 
-const pdev& device::get_pdev() const { return m_pdev; }
+const pdev& device::get_pdev() const { return *m_pdev; }
 
 std::unique_ptr<hw_ctx> device::create_hw_context(std::span<const uint8_t> pdi,
                                                   std::string_view cu_name) {
@@ -121,21 +170,21 @@ std::unique_ptr<hw_ctx> device::create_hw_context(std::span<const uint8_t> pdi,
 }
 
 std::unique_ptr<bo> device::alloc_bo(size_t size, uint32_t flags) {
-  return std::make_unique<bo>(m_pdev, size, flags);
+  return std::make_unique<bo>(*m_pdev, size, flags);
 }
 
 std::unique_ptr<bo> device::alloc_user_bo(size_t size) {
-  return std::make_unique<bo>(m_pdev, size, user_memory{});
+  return std::make_unique<bo>(*m_pdev, size, user_memory{});
 }
 
 clocks device::query_clocks() const {
-  auto c = get_info<amdxdna_drm_query_clock_metadata>(m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA);
+  auto c = get_info<amdxdna_drm_query_clock_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA);
   return {c.mp_npu_clock.freq_mhz, c.h_clock.freq_mhz};
 }
 
 uint64_t device::busy_ns() const {
   // "drm-engine-<name>:\t<N> ns" lines (one engine on AIE2)
-  std::ifstream f("/proc/self/fdinfo/" + std::to_string(m_pdev.m_dev_fd));
+  std::ifstream f("/proc/self/fdinfo/" + std::to_string(m_pdev->m_dev_fd));
   uint64_t total = 0;
   for (std::string line; std::getline(f, line);) {
     if (!line.starts_with("drm-engine-")) continue;
@@ -155,7 +204,7 @@ std::optional<amdxdna_async_error> device::last_async_error() const {
   ga.element_size = sizeof(err);
   ga.num_element = 1;
   ga.buffer = reinterpret_cast<uintptr_t>(&err);
-  m_pdev.ioctl(DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga);
+  m_pdev->ioctl(DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga);
   if (!err.err_code && !err.ts_us) return std::nullopt;
   return err;
 }

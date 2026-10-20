@@ -50,7 +50,7 @@ unit the memtile permutes is then one slice of the pass's tiles; ~10% more weigh
 per-pass pattern [chunk][unit][tile][words] has more dimensions than a shim BD (3 + repeat), so the
 weights of all passes come as one chained task per column and token chunk (``b_chain``: one BD per
 K chunk, each iterating over the passes): per-pass fills would need a task each (per-pass groups
-blew the prefill's control code past the 64 MB device heap), and more than 4 queued fills on a
+blew the prefill's control code past a 64 MB heap BO), and more than 4 queued fills on a
 channel stall the controller before the A fills are issued (a hang).
 ``gemm_qd.GemmQdOperator`` runs the dequant on one core per column instead of on every core; it
 also reads every other dequantized tile through the planar gather (``planar``: Q5_K, Q6_K, Q2_K, Q3_K, and

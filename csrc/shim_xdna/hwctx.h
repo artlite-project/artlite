@@ -50,7 +50,8 @@ struct hw_ctx {
   uint32_t cu_index(std::string_view cu_name) const;
 
   // Submit an exec-buffer command; returns its point on the context's timeline. arg_handles:
-  // BOs the command uses (for the drivers that pin a command's BOs for the job; others ignore them).
+  // BOs the command uses, each once (Linux's driver pins and locks them for the job; xdna-driver's
+  // module ignores them).
   uint64_t submit(const bo& cmd, std::span<const uint32_t> arg_handles) const;
 
   // Wait until every command up to `seq` finished (the driver writes a command's state before

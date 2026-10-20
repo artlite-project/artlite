@@ -7,6 +7,7 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -663,5 +665,15 @@ NB_MODULE(_native, m) {
         }
       },
       exc_dispatch.ptr());
+  // A request the driver does not serve (EOPNOTSUPP: e.g. reading AIE tiles on Linux's own driver):
+  // NotImplementedError, a RuntimeError.
+  nb::register_exception_translator([](const std::exception_ptr& p, void*) {
+    try {
+      std::rethrow_exception(p);
+    } catch (const std::system_error& e) {
+      if (e.code().value() != EOPNOTSUPP) throw;
+      PyErr_SetString(PyExc_NotImplementedError, e.what());
+    }
+  });
 }
 // NOLINTEND(bugprone-unused-raii)

@@ -29,8 +29,8 @@ from ... import txn
 from . import ctrlpkt
 from .elf import ShimBd
 
-# Bytes of a program's piece (a dispatch: ``Library.run``): two instruction BOs of this size share the device's 64 MB
-# heap with the library's PDIs
+# Bytes of a program's piece (a dispatch: ``Library.run``): two instruction BOs of this size share the process's device
+# heap with the library's PDIs (one 64 MB heap BO before Linux 7.2)
 PIECE_BYTES = 24 << 20
 
 Item = tuple[int, Sequence[int]]  # (entry, the device addresses of its arguments)
