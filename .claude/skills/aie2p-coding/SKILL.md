@@ -225,6 +225,27 @@ BDs:
   transform splits the 5-D iteration into a 4-D MemTile transform and a 3-D CompTile S2MM transform, linearizing the
   inner `r x s` tile into one dimension. [GEMM-gen]
 
+Transfers the array chooses (control packets into a shim) [measured]:
+- Packets that a shim's own MM2S channel streams reach its TileControl and write its BDs, locks and task queues;
+  packets from the array do not reach a shim's TileControl. So a core writes the packets (constant words from the host,
+  addresses it computes) into its output stream, and they come back from DDR on the shim's MM2S. Route: the channel's
+  slave port (MM2S0 = South 3, MM2S1 = South 7) in packet mode, a slot of the packets' id on a free arbiter, master
+  Tile_Ctrl (0x3F000) in packet mode on it, header kept. A packet-switched ObjectFifo (`packet=True`) shares the channel
+  at no measurable cost; its fills' BDs carry Enable_Packet and its id (word 2 bits 30, 23:19). IRON's placer counts a
+  PacketFlow's DMA source as a channel beside an ObjectFifo's on the same channel ("requires ... DMA channels"): the
+  host writes that route (slot and master: two words).
+- Order the DDR round trip with a shim lock (0x14000 + 16 n), not a firmware sync: the drain's S2MM BD releases it, the
+  packets' MM2S BD acquires it (word 7), both pushed at once. A core's release of the packets -> the first 9 KB object
+  of the BD they pushed in its L1: ~2.6 us on 8 columns (~7.6 us with a TCT sync between drain and read).
+- The packets may write whole BDs (two 4-word packets each, no host template) and push them, chained behind one push.
+  Validate them on the host: a BD id past 15 writes the channels' control and queue registers, a nonzero AxQoS hangs.
+- Device and host pushes share a queue of 4; the firmware's TCT waits count device-pushed tokens. Host pushes after a
+  device push keep their order only once the transaction has seen it (the packets' last write sets a shim lock that
+  it maskpolls); without that they overtake it.
+- Self-chaining gather on one channel: [block k: rewrite chain k's row addresses, push chain k, write and push block
+  k + 1's BD] [chain k] [block k + 1] ...: FIFO order keeps a block off BDs in use, the queue at <= 3. Per channel ~1 us
+  per block + ~0.15 us per row BD; 8 columns within 2-5% of contiguous reads.
+
 ## 9. Peano and aie_api traps
 
 Crashes:
@@ -236,6 +257,8 @@ Crashes:
   wrong subprogram: "Broken module found" (`!dbg attachment points at wrong subprogram`) only with line tables, so
   measure_ii's compile fails while the plain build works. Write the unrolled body out by hand.
 - Peano cannot lower inline `asm`.
+- `get_cycles()` (aie_api `tile::cycles()`) has no Peano definition (undefined symbol at link), and a core reading its
+  own Timer_Low (0x340F8) by `__builtin_aie2p_read_tm` stalled it (TDR): time with event0 / event1 counters.
 
 Silent wrong results:
 - **A load followed by a store to the same address can be reordered** (`yv = load(y); store(y, zeros); ... use(yv)`:
