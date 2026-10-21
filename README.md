@@ -106,7 +106,7 @@ How these are measured: [Benchmark methodology](docs/methodology.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/ttft-dark.svg">
-  <img alt="Time to first token against prompt length from 1k to 64k tokens on log-log axes, one panel per model, Artlite, FastFlowLM and OpenFlowLM" src="docs/images/ttft.svg">
+  <img alt="Time to first token against prompt length from 1k to 128k tokens on log-log axes, one panel per model, Artlite, FastFlowLM and OpenFlowLM" src="docs/images/ttft.svg">
 </picture>
 
 <picture>

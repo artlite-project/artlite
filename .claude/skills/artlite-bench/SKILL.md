@@ -9,7 +9,7 @@ A model's entry in `docs/data/artlite.json` and where each number comes from (ke
 
 | field | tool | value |
 |---|---|---|
-| `ttft_s`: 1024 8192 32768 65536 | `artlite-bench -p 1024,8192,32768,65536 -n 0` | `avg_ns` / 1e9 of `pp<n>` (the prompt's chunks and the last token's logits) |
+| `ttft_s`: 1024 8192 32768 65536 (and 131072 where a compared runtime has it) | `artlite-bench -p 1024,8192,32768,65536 -n 0` | `avg_ns` / 1e9 of `pp<n>` (the prompt's chunks and the last token's logits) |
 | `prefill_tps`: 1024 32768 | the same run | `avg_ts` of `pp1024`, `pp32768` |
 | `decode_tps`: 1024 32768 | `artlite-cli` on an essay prompt of 1023 / 32767 tokens, `-n 256 --greedy` | its `generation: ... tokens/s` |
 | `mtp`: `decode_tps`, `tokens_per_step` | the decode runs again per draft count | the best S at each length, and its speed |

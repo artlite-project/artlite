@@ -8,7 +8,7 @@ prompt's time to first token also with llama.cpp on the iGPU:
 |---|---|
 | decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4 also with its drafter (MTP) |
 | prefill | tokens/s of a 1k- and a 32k-token prompt |
-| TTFT | time to first token against prompt length, 1k to 64k tokens, log-log |
+| TTFT | time to first token against prompt length, 1k to 128k tokens, log-log |
 | image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
 
 Each Artlite bar is one GGUF file ([below](#measured-files)). FastFlowLM's and OpenFlowLM's bars stand under the
@@ -31,7 +31,7 @@ One NPU job at a time, with no other heavy CPU load.
 
 | number | how |
 |---|---|
-| TTFT | `artlite-bench -p 1024,8192,32768,65536 -n 0 -r 3`: `avg_ns` of each `pp<n>` (the prompt's chunks and the last token's logits) |
+| TTFT | `artlite-bench -p 1024,8192,32768,65536 -n 0 -r 3` (MiniCPM-V 4.7 1B also 131072): `avg_ns` of each `pp<n>` (the prompt's chunks and the last token's logits) |
 | prefill | the same run: `avg_ts` of `pp1024`, `pp32768` |
 | decode | `artlite-cli -n 256 --greedy` on a prompt of 1023 / 32767 tokens: its generation speed |
 | decode with MTP | the same at the best tokens per step for each length (Gemma 4: 1 to 4) |
@@ -63,7 +63,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | | BF16 | [unsloth/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct-BF16.gguf) `Llama-3.2-1B-Instruct-BF16.gguf` | `f5d05e90d179` | 2026-10-15 |
 | | Q6_K | [bartowski/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct-Q6_K.gguf) `Llama-3.2-1B-Instruct-Q6_K.gguf` | `0f4c510daf16` | 2026-10-15 |
 | | Q5_K_M | [MaziyarPanahi/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/MaziyarPanahi/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct.Q5_K_M.gguf) `Llama-3.2-1B-Instruct.Q5_K_M.gguf` | `a8c8692a3f2d` | 2026-10-15 |
-| Llama 3.2 3B Instruct | Q4_K_M | [unsloth/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf) `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | `6c99cc00ae91` | 2026-10-15 |
+| Llama 3.2 3B Instruct | Q4_K_M | [unsloth/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf) `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | `6c99cc00ae91` | 2026-10-21 |
 | | BF16 | [unsloth/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-BF16.gguf) `Llama-3.2-3B-Instruct-BF16.gguf` | `9b8dce13b6cb` | 2026-10-15 |
 | | Q4_0 | [bartowski/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-Q4_0.gguf) `Llama-3.2-3B-Instruct-Q4_0.gguf` | `4d491003bf6b` | 2026-10-15 |
 | | Q5_K_M | [bartowski/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-Q5_K_M.gguf) `Llama-3.2-3B-Instruct-Q5_K_M.gguf` | `0b94ccd04d90` | 2026-10-15 |
