@@ -91,6 +91,13 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   half the norms' bytes) and single bfp16 Q, K and P panels.
 - Judge a precision change on KL means over several sequences (Llama: three chat prompts, three essay windows): one
   or two prompts move by ~30% with small rounding changes.
+- An MoE model is chaotic: any rounding change moves a near-tied expert (Qwen3.6-35B-A3B: llama.cpp's own prompt and
+  one-token graphs pick another top 8 for 40-70% of the tokens by the last layers), and a 1e-7 change of the router's
+  logits already reaches llama.cpp's prompt-vs-decode KL. So KL cannot rank its formats: rank them by their error in
+  one block on llama.cpp's inputs (against llama.cpp's own Q8_K error there) and by the paired next-token NLL on an
+  8K essay window over two trajectories (prompt graphs of two ubatch sizes: ~1e-2 nats of noise per run). Its router:
+  BFP16 hi + lo rows against x hi + lo, the logits fp32 up to the top k (single BFP16 rows change 6% of the top-8 sets
+  per layer and cost ~2.5e-2 nats per token; bf16 logits change 11%).
 - Long-K output projections in K parts (`plan_phase(k_part=)`): each part's bf16 C tile sums fewer
   k-tiles, the residual add sums the parts in fp32. Llama 3B's down (K 8192, 128 k-tiles) in two parts: KL(same) on a
   chat prompt 0.00071 -> 0.00031, an essay's 0.00122 -> 0.00101.
