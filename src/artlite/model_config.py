@@ -262,7 +262,12 @@ class QwenConfig:
     pairs) on the first ``rope_dims`` dims only, in ``rope_sections`` of pairs whose positions differ for image
     embeddings only (M-RoPE: ``rope_section_order`` maps an image token's position components t, y, x, z to the
     sections, llama.cpp's "tyxz" or MiniCPM-V's "zyxt"). ``nextn_layers``: multi-token-prediction blocks after the
-    trunk's layers (Qwen3.8)."""
+    trunk's layers (Qwen3.8).
+
+    A ``qwen35moe`` file (Qwen3.6-35B-A3B; ``src/models/qwen35moe.cpp``) has the same layers with an MoE FFN instead of
+    the dense one (``intermediate_size`` 0): ``n_experts`` experts of width ``expert_ffn``, the ``n_experts_used``
+    largest of a softmax over the router's logits per token (their weights renormalized), plus a shared expert of width
+    ``shared_ffn`` times a sigmoid gate (``moe``)."""
 
     vocab_size: int
     hidden_size: int
@@ -285,12 +290,17 @@ class QwenConfig:
     max_position_embeddings: int
     eos_token_ids: tuple[int, ...]
     sampling: dict[str, float]
+    n_experts: int = 0
+    n_experts_used: int = 0
+    expert_ffn: int = 0
+    shared_ffn: int = 0
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> QwenConfig:
         """From an ``artlite.gguf_model.GGUFFile``."""
-        assert gguf.arch == "qwen35", f"{gguf.path}: architecture {gguf.arch!r}, expected qwen35"
+        assert gguf.arch in ("qwen35", "qwen35moe"), f"{gguf.path}: architecture {gguf.arch!r}, expected qwen35(moe)"
         m = gguf.arch_meta
+        moe = gguf.arch == "qwen35moe"
         nextn = int(m("nextn_predict_layers", 0))
         n = int(m("block_count")) - nextn
         rec = m("attention.recurrent_layers")
@@ -309,7 +319,7 @@ class QwenConfig:
         return cls(
             vocab_size=vocab,
             hidden_size=int(m("embedding_length")),
-            intermediate_size=int(m("feed_forward_length")),
+            intermediate_size=0 if moe else int(m("feed_forward_length")),
             num_hidden_layers=n,
             num_attention_heads=int(m("attention.head_count")),
             num_key_value_heads=int(m("attention.head_count_kv")),
@@ -330,7 +340,15 @@ class QwenConfig:
             sampling={k: float(gguf.meta[f"general.sampling.{k}"])
                       for k in ("top_k", "top_p", "temp", "penalty_repeat", "penalty_last_n")
                       if f"general.sampling.{k}" in gguf.meta},
+            n_experts=int(m("expert_count")) if moe else 0,
+            n_experts_used=int(m("expert_used_count")) if moe else 0,
+            expert_ffn=int(m("expert_feed_forward_length")) if moe else 0,
+            shared_ffn=int(m("expert_shared_feed_forward_length")) if moe else 0,
         )
+
+    @property
+    def moe(self) -> bool:
+        return self.n_experts > 0
 
     @property
     def gdn_layers(self) -> list[int]:

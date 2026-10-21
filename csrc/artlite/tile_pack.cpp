@@ -1,5 +1,5 @@
 // The tile packers of ``artlite.operators.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, bf16.py:
-// ``pack``) on GGUF blocks, with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
+// ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
 // Compiled with -march=znver5 (CMakeLists.txt).
@@ -32,14 +32,14 @@ namespace artlite {
 namespace {
 
 constexpr int kMaxNsb = 16;
-// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BF16, F16
-constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 512, 512};
+// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BF16, F16, F32
+constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 512, 512, 1024};
 constexpr int64_t kItemRows = 2048;                // rows of a work item
 constexpr size_t kPrefetchWindow = size_t(2) << 30;
 constexpr size_t kPrefetchPiece = size_t(8) << 20;
 constexpr unsigned kPrefetchThreads = 16;
 
-alignas(64) const uint8_t kZeroRow[kMaxNsb * 512] = {};  // a padding row's blocks (-1)
+alignas(64) const uint8_t kZeroRow[kMaxNsb * 1024] = {};  // a padding row's blocks (-1)
 
 using Idx = std::array<uint8_t, 64>;
 
@@ -429,6 +429,16 @@ inline void bfp16_blocks(__m512 x, uint8_t* blk0, uint8_t* blk1) {
   std::memcpy(blk1 + 1, reinterpret_cast<const uint8_t*>(&mb) + 8, 8);
 }
 
+/// The values of two bfp16ebs8 blocks (``operators.bfp16.block_values``): m 2^(E - 133).
+inline __m512 bfp16_values(const uint8_t* blk0, const uint8_t* blk1) {
+  int64_t m0, m1;
+  std::memcpy(&m0, blk0 + 1, 8);
+  std::memcpy(&m1, blk1 + 1, 8);
+  const __m512 m = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_set_epi64x(m1, m0)));
+  const __m256 e0 = _mm256_set1_ps(float(blk0[0]) - 133.0f), e1 = _mm256_set1_ps(float(blk1[0]) - 133.0f);
+  return _mm512_scalef_ps(m, _mm512_insertf32x8(_mm512_castps256_ps512(e0), e1, 1));
+}
+
 /// BFP16 (bf16.py) of BF16 or F16 rows: 8 rows of [k8][row][exp, 8 int8] blocks.
 template <bool F16>
 void tile_bfp16(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -438,6 +448,19 @@ void tile_bfp16(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
       const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src[r] + 16 * k));
       const __m512 x = F16 ? _mm512_cvtph_ps(v) : _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(v), 16));
       bfp16_blocks(x, t + (size_t(k) * R + r) * 9, t + (size_t(k + 1) * R + r) * 9);
+    }
+}
+
+/// BFP16 planes of F32 rows (bf16.py): row r's plane lo[r] (0: bfp16(w), 1: bfp16(w - plane 0); w - plane 0 is exact
+/// in fp32).
+void tile_bfp16_f32(uint8_t* t, const uint8_t* const* src, const uint8_t* lo, int R, int nsb) {
+  const int nk8 = 32 * nsb;
+  for (int r = 0; r < R; r++)
+    for (int k = 0; k < nk8; k += 2) {
+      uint8_t *b0 = t + (size_t(k) * R + r) * 9, *b1 = t + (size_t(k + 1) * R + r) * 9;
+      const __m512 x = _mm512_loadu_ps(src[r] + 32 * k);
+      bfp16_blocks(x, b0, b1);
+      if (lo[r]) bfp16_blocks(_mm512_sub_ps(x, bfp16_values(b0, b1)), b0, b1);
     }
 }
 
@@ -461,6 +484,7 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
       return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
     case TileFormat::BFP16_BF16:
     case TileFormat::BFP16_F16:
+    case TileFormat::BFP16_F32:
       return 288 * size_t(nsb) * R;
   }
   return 0;
@@ -503,6 +527,7 @@ TileFormat tile_format(std::string_view name) {
   if (name == "Q3_K") return TileFormat::Q3_K;
   if (name == "BFP16/BF16") return TileFormat::BFP16_BF16;
   if (name == "BFP16/F16") return TileFormat::BFP16_F16;
+  if (name == "BFP16/F32") return TileFormat::BFP16_F32;
   throw Error(std::format("pack_tiles: no native packer for {}", name));
 }
 
@@ -525,16 +550,19 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     const PackBlock& b = blocks[bi];
     const size_t row_bytes = size_t(b.row_sb) * kBlockBytes[static_cast<int>(b.fmt)];
     const bool pairs = b.fmt <= TileFormat::Q6_K || b.fmt == TileFormat::Q3_K;  // (scales of super-block pairs)
-    const bool bfp = b.fmt == TileFormat::BFP16_BF16 || b.fmt == TileFormat::BFP16_F16;
-    if (b.R <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % b.R ||
-        (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 || b.kc_group <= 0 ||
-        b.n_kc % b.kc_group || used_bytes(b.fmt, b.R, b.nsb) > b.S || b.row_sb <= 0 || b.row_sb > b.n_kc * b.nsb ||
-        (b.row_sb % 2 && pairs) ||
-        b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / b.R > b.n_rt ||
+    const bool bfp = b.fmt >= TileFormat::BFP16_BF16, f32 = b.fmt == TileFormat::BFP16_F32;
+    const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
+    if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
+        tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
+        b.kc_group <= 0 || b.n_kc % b.kc_group || used_bytes(b.fmt, b.R, b.nsb) > b.S || b.row_sb <= 0 ||
+        b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
+        (b.G > 1 && (b.n_kc != 1 || b.row_sb * b.G != b.nsb || f32)) ||
+        b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
         b.offset + (b.cols - 1) * b.col_stride + size_t(b.n_rt) * b.n_kc * b.S > out_size)
-      throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, S {}, nsb {}, n {}, n_kc {} / {}, "
-                              "row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.S, b.nsb, b.n, b.n_kc,
-                              b.kc_group, b.rt0, b.n / b.R, b.n_rt, b.cols * b.col_stride, b.offset, out_size));
+      throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, G {}, S {}, nsb {}, row_sb {}, n {}, "
+                              "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
+                              b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
+                              b.cols * b.col_stride, b.offset, out_size));
     int64_t total = 0;
     for (auto [data, rows] : b.tensors) {
       total += rows;
@@ -542,11 +570,12 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       if (added) tensors.emplace_back(data, size_t(rows) * row_bytes, 0, 0);
       block_tensors[bi].push_back(it->second);
     }
+    const int64_t indices = f32 ? 2 * total : total;  // (F32: two planes per row)
     for (int64_t i = 0; i < b.cols * b.n; i++)
-      if (b.rows[i] < -1 || b.rows[i] >= total)
-        throw Error(std::format("pack_tiles: block {}: row {} of {} stacked rows", bi, b.rows[i], total));
+      if (b.rows[i] < -1 || b.rows[i] >= indices)
+        throw Error(std::format("pack_tiles: block {}: row {} of {} stacked rows", bi, b.rows[i], indices));
     max_S = std::max(max_S, b.S);
-    const int64_t step = std::max<int64_t>(1, kItemRows / b.R), tiles = b.n / b.R;
+    const int64_t step = std::max<int64_t>(1, kItemRows / tile_rows), tiles = b.n / tile_rows;
     for (int c = 0; c < b.cols; c++)
       for (int64_t t0 = 0; t0 < tiles; t0 += step) {
         items.push_back({static_cast<int>(bi), c, t0, std::min(step, tiles - t0)});
@@ -566,20 +595,24 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       if (!tile) throw std::bad_alloc();
       const uint8_t* src[256];
       const uint8_t* base[256];
+      uint8_t lo[256];
       for (size_t k; !failed && (k = next++) < items.size();) {
         const Item& it = items[k];
         const PackBlock& b = blocks[it.block];
-        if (b.R > 256) throw Error("pack_tiles: more than 256 rows per tile");
+        const bool f32 = b.fmt == TileFormat::BFP16_F32;
+        const int tile_rows = b.R * b.G;
         const size_t bb = kBlockBytes[static_cast<int>(b.fmt)], row_bytes = size_t(b.row_sb) * bb;
         for (size_t t : block_tensors[it.block])  // (read by the prefetchers: no page fault reads it in 128 KB)
           while (tensors[t].pending > 0 && !failed) std::this_thread::sleep_for(std::chrono::microseconds(100));
         std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
         uint8_t* col = out + b.offset + it.col * b.col_stride;
         for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
-          const int64_t* rows = b.rows + it.col * b.n + rt * b.R;
-          for (int r = 0; r < b.R; r++) {
+          const int64_t* rows = b.rows + it.col * b.n + rt * tile_rows;
+          for (int r = 0; r < tile_rows; r++) {
             base[r] = nullptr;
             int64_t i = rows[r];
+            lo[r] = f32 && i >= 0 ? i & 1 : 0;
+            if (f32 && i >= 0) i >>= 1;
             for (auto [data, n] : b.tensors) {
               if (i < 0) break;
               if (i < n) {
@@ -591,9 +624,15 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
           }
           for (int kc = 0; kc < b.n_kc; kc++) {
             const int have = std::clamp(b.row_sb - kc * b.nsb, 0, b.nsb);  // (the chunk's super-blocks in a row)
-            if (have < b.nsb && part.size() < size_t(b.R) * b.nsb * bb) part.assign(size_t(b.R) * b.nsb * bb, 0);
+            if ((have < b.nsb || b.G > 1) && part.size() < size_t(b.R) * b.nsb * bb)
+              part.assign(size_t(b.R) * b.nsb * bb, 0);
             for (int r = 0; r < b.R; r++) {
-              if (!base[r] || have == 0) {
+              if (b.G > 1) {  // (a tile row of G rows of row_sb super-blocks)
+                uint8_t* p = part.data() + size_t(r) * b.nsb * bb;
+                for (int j = 0; j < b.G; j++)
+                  std::memcpy(p + j * row_bytes, base[b.G * r + j] ? base[b.G * r + j] : kZeroRow, row_bytes);
+                src[r] = p;
+              } else if (!base[r] || have == 0) {
                 src[r] = kZeroRow;
               } else if (have == b.nsb) {
                 src[r] = base[r] + kc * b.nsb * bb;
@@ -635,12 +674,15 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
               case TileFormat::BFP16_F16:
                 tile_bfp16<true>(tile.get(), src, b.R, b.nsb);
                 break;
+              case TileFormat::BFP16_F32:
+                tile_bfp16_f32(tile.get(), src, lo, b.R, b.nsb);
+                break;
             }
             const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
             put_tile(col + idx * b.S, tile.get(), b.S);
           }
         }
-        done_bytes += size_t(it.nt) * b.R * row_bytes;
+        done_bytes += size_t(it.nt) * tile_rows * row_bytes;
         if (opt.release) {
           std::vector<size_t> drop;
           {

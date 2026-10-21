@@ -594,7 +594,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
         std::vector<artlite::PackBlock> bs;
         for (nb::handle h : blocks) {
           auto t = nb::cast<nb::tuple>(h);
-          if (t.size() != 13) throw artlite::Error("pack_tiles: a block is a tuple of 13");
+          if (t.size() != 14) throw artlite::Error("pack_tiles: a block is a tuple of 14");
           artlite::PackBlock b{};
           b.fmt = artlite::tile_format(nb::cast<std::string>(t[0]));
           b.R = nb::cast<int>(t[1]);
@@ -607,6 +607,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           b.offset = nb::cast<size_t>(t[8]);
           b.col_stride = nb::cast<size_t>(t[9]);
           b.row_sb = nb::cast<int>(t[12]);
+          b.G = nb::cast<int>(t[13]);
           const size_t row_bytes = size_t(b.row_sb) * artlite::block_bytes(b.fmt);
           for (nb::handle r : nb::cast<nb::list>(t[10])) {
             auto raw = nb::cast<Raw>(r, false);
@@ -633,11 +634,12 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       nb::sig("def pack_tiles(out: numpy.ndarray[numpy.uint8], blocks: list[tuple], threads: int = 0, "
               "release: bool = False, file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None) -> None"),
       "Pack weight tiles (every tile format: bit-identical to the formats' pack_tile) into out. A block: "
-      "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb) as "
-      "overlay.image.TileImage.pack builds it (format: a tile format, BFP16 as \"BFP16/BF16\" or \"BFP16/F16\" by "
-      "its tensors' type; tensors: (rows, row bytes) uint8 arrays of GGUF blocks, stacked; rows: "
-      "(columns, n) int64 stacked row indices, -1 a zero row; row_sb: a tensor row's super-blocks, at most n_kc nsb: "
-      "zero super-blocks past them). threads: 0 = one per physical core; release: "
+      "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb, G) as "
+      "overlay.image.TileImage.pack builds it (format: a tile format, BFP16 as \"BFP16/BF16\", \"BFP16/F16\" or "
+      "\"BFP16/F32\" by its tensors' type; tensors: (rows, row bytes) uint8 arrays of GGUF blocks, stacked; rows: "
+      "(columns, n) int64 stacked row indices, -1 a zero row (BFP16/F32: 2 i + p is plane p of row i); row_sb: a "
+      "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
+      "consecutive in rows, along K). threads: 0 = one per physical core; release: "
       "MADV_DONTNEED each tensor's pages when done (file mappings only); file: (path, its whole mapping) of the "
       "tensors: read into the page cache ahead of the workers.");
 

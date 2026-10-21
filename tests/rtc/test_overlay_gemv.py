@@ -68,6 +68,55 @@ def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
             assert np.array_equal(tiles[g, k], pack_tile(fmt, f, S_BYTES)), (g, k)
 
 
+# (GGUF type, tile bytes, rows per tile row G): an MoE's downs (K 256 and 512 in tiles of 1024 columns)
+GROUPS = [("Q4_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_K", 9280, 2), ("Q6_K", 9280, 2)]
+
+
+@pytest.mark.parametrize(("qtype", "S_BYTES", "G"), GROUPS, ids=[f"{f}-G{g}" for f, _, g in GROUPS])
+def test_pack_native_groups(qtype: str, S_BYTES: int, G: int) -> None:
+    """Row-group tiles (pack_rows G): a tile row of G rows of 1024 / G columns, one after the other along K, as the
+    slot's pack_tile packs those rows' fields side by side; two stacked tensors, padding rows, a partial last tile."""
+    fmt, K = tile_format(qtype), 1024 // G
+    R = FORMATS[fmt].rows(S_BYTES, 4)
+    a, b = _random_tensor(qtype, 30, K, 4), _random_tensor(qtype, 11, K, 5)
+    rows = np.concatenate([np.random.default_rng(6).permutation(41), [-1] * 3])
+    rows = np.concatenate([rows, np.full((-rows.size) % (R * G), -1)])
+    tiles = pack_rows([a, b], rows, fmt, R, S_BYTES, 1, G=G)
+    zero = QTensor(name="z", qtype=qtype, rows=1, cols=K, raw=np.zeros_like(a.raw[:1]))
+    fa, fb, fz = a.fields(), b.fields(), zero.fields()
+    for t in range(tiles.shape[0]):
+        per = []
+        for v in range(t * R, (t + 1) * R):  # (a tile row: its G rows' fields along K)
+            parts = []
+            for r in rows[v * G:(v + 1) * G]:
+                src, idx = (fz, 0) if r < 0 else ((fa, r) if r < 30 else (fb, r - 30))
+                parts.append(slice_fields(src, np.array([idx]), k0=0, cols=K, kc=K))
+            per.append({key: np.concatenate([p[key] for p in parts], 1) for key in parts[0]})
+        f = {key: np.concatenate([p[key] for p in per]) for key in per[0]}
+        assert np.array_equal(tiles[t, 0], pack_tile(fmt, f, S_BYTES)), t
+
+
+def test_pack_native_planes() -> None:
+    """BFP16 tiles of F32 rows (an MoE router's): index 2 i + p is plane p of row i, as the slot's pack_tile packs w
+    (hi = bfp16(w): its blocks, not hi's own, which a mantissa of -128 coarsens) and w - hi (lo); hi + lo within 3e-5
+    of w (relative RMS per row); values over many octaves, an all-zero block, padding rows."""
+    rng = np.random.default_rng(7)
+    w = (rng.standard_normal((9, 2048)) * np.exp2(rng.integers(-20, 4, (9, 1)))).astype(np.float32)
+    w[3, 8:16] = 0
+    t = QTensor(name="r", qtype="F32", rows=9, cols=2048, raw=w)
+    rows = np.concatenate([rng.permutation(18), [-1] * 6])
+    tiles = pack_rows([t], rows, "BFP16", 8, 9280, 2)
+    hi = bfp16.values(w)
+    src = np.zeros((19, 2048), np.float32)  # (what pack_tile rounds for index 2 i + p; 18: a zero row)
+    src[0:18:2], src[1:18:2] = w, w - hi
+    for g in range(3):
+        for k in range(2):
+            f = {"w": src[np.where(rows[8 * g:8 * g + 8] < 0, 18, rows[8 * g:8 * g + 8]), 1024 * k:1024 * (k + 1)]}
+            assert np.array_equal(tiles[g, k], pack_tile("BFP16", f, 9280)), (g, k)
+    err = np.sqrt(((hi + bfp16.values(w - hi) - w) ** 2).mean(1) / (w ** 2).mean(1))
+    assert err.max() < 3e-5, err
+
+
 def _bf(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.asarray(x, np.float32)).bfloat16().double().numpy()
 

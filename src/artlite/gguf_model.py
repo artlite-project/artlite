@@ -63,8 +63,11 @@ class QTensor:
                low 2 bits | 4 x the hmask bit);           w = d sc_j (q - 4) (j = 16-group)
         BF16:  w (rows, cols) u16 bf16 bit patterns
         F16:   w (rows, cols) float16
+        F32:   w (rows, cols) float32
         """
         t = self.qtype
+        if t == "F32":
+            return {"w": self.raw}
         if t == "BF16":
             return {"w": self._bf16().view(torch.int16).numpy().view(np.uint16)}
         if t == "F16":

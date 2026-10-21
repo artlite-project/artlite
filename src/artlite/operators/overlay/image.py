@@ -17,8 +17,15 @@ input, in ``gemm_q``'s convention: K chunks in groups of ``kc_group``, group G o
 A region whose input is longer than an activation object's payload (``payload``: the model's) takes its K chunks in
 groups (``kc_group``: the largest divisor of the chunk count whose group fits the payload); every other region keeps a
 row tile's chunks consecutive. An input of no whole number of chunks (MiniCPM-V's ffn 3584) is padded to the next one:
-its tiles' columns past the matrix are zero super-blocks. The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB
-before a tile, and past a region's last tile.
+its tiles' columns past the matrix are zero super-blocks; an input of a fraction 1 / G of a chunk (an MoE's down, K 512
+or 256) takes row groups instead (``Block.G``, ``group_rows``: G rows of K columns per tile row, no padding bytes).
+The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB before a tile, and past a
+region's last tile.
+
+An MoE layer's experts are slab regions (``slabs``, after the column-major or region-major regions): one block per
+expert half instead of per column (``Region.cols``), the layer's slab regions back to back in a half (``_add_slab``),
+so that expert e's two halves (blocks 2 e, 2 e + 1) are one contiguous run of the image that a decode column streams
+whole.
 """
 
 from dataclasses import dataclass, field
@@ -52,23 +59,28 @@ def kc_group(n_kc: int, xp: int, kc: int) -> int:
 
 @dataclass(frozen=True)
 class Block:
-    """A run of row tiles in every column's block of a region: ``rows`` (COLS, n) indices into the stack of the
-    ``tensors`` (their rows one after the other; -1: a zero padding row), n a multiple of R."""
+    """A run of row tiles in every column's block of a region: ``rows`` (cols, n) indices into the stack of the
+    ``tensors`` (their rows one after the other; -1: a zero padding row), n a multiple of R G: tile row v holds rows
+    v G .. v G + G - 1 of them one after the other along K (G > 1: row groups, ``group_rows``). F32 tensors (an MoE
+    router's) are BFP16 tiles of two planes per row: index 2 i + p is plane p of row i (0: hi = bfp16(w), 1: lo =
+    bfp16(w - hi); ``formats.bf16``)."""
 
     name: str
     tensors: tuple[str, ...]
     rows: np.ndarray
     fmt: str
     R: int
+    G: int = 1
 
     @property
     def tiles(self) -> int:
-        return self.rows.shape[1] // self.R
+        return self.rows.shape[1] // (self.R * self.G)
 
 
 @dataclass
 class Region:
-    """The tiles of one phase: 8 column blocks of ``col_bytes`` from ``offset`` on."""
+    """The tiles of one phase: ``cols`` column blocks (the 8 columns'; a slab region's: one per expert half) of
+    ``col_bytes`` from ``offset`` on."""
 
     layer: int  # -1: the LM head
     name: str
@@ -81,6 +93,7 @@ class Region:
     offset: int = 0  # (column 0's block)
     col_stride: int = 0  # (from a column's block to the next)
     rt0: dict[str, int] = field(default_factory=dict)  # first row tile of each block
+    cols: int = COLS
 
     def __post_init__(self) -> None:
         assert self.n_kc % self.kc_group == 0
@@ -100,7 +113,7 @@ class Region:
 
     @property
     def nbytes(self) -> int:
-        return COLS * self.col_bytes
+        return self.cols * self.col_bytes
 
     def tile(self, rt: int, kc: int) -> int:
         """Index in a column block of row tile rt's tile of K chunk kc."""
@@ -112,7 +125,7 @@ class Region:
 
 
 def _pad_rows(rows: np.ndarray, R: int) -> np.ndarray:
-    """(COLS, n) rows -> (COLS, ceil(n / R) R), padded with -1."""
+    """(cols, n) rows -> (cols, ceil(n / R) R), padded with -1."""
     n = -(-rows.shape[1] // R) * R
     out = np.full((rows.shape[0], n), -1, np.int64)
     out[:, :rows.shape[1]] = rows
@@ -120,8 +133,8 @@ def _pad_rows(rows: np.ndarray, R: int) -> np.ndarray:
 
 
 class TileImage:
-    """A weight image of a GGUF file: ``regions`` (``region(layer, name)``), ``nbytes``; ``pack(out)`` fills a buffer of
-    nbytes. A model's subclass adds its regions (``_add``) and calls ``_place``."""
+    """A weight image of a GGUF file: ``regions`` and ``slabs`` (``region(layer, name)``), ``nbytes``; ``pack(out)``
+    fills a buffer of nbytes. A model's subclass adds its regions (``_add``, ``_add_slab``) and calls ``_place``."""
 
     def __init__(self, gguf: GGUFFile, *, kc: int, payload: int, tile_bytes: int, vocab: int,
                  max_rows: dict[str, int] | None = None, column_major: bool = False):
@@ -135,14 +148,27 @@ class TileImage:
                   if FORMATS[f].rows(self.tile_bytes, self.nsb, mr.get(f, 0))}
         self.column_major = column_major
         self.regions: list[Region] = []
+        self.slabs: list[Region] = []
         self._own: dict[str, QTensor] = {}  # (tensors a model substitutes: re-laid-out copies in memory)
+        self._views: dict[str, QTensor] = {}  # (the file's tensors as rows of another width: ``view``)
 
     def tensor(self, name: str) -> QTensor:
-        """A tensor the blocks name (the file's, or the model's substitute: ``_own``)."""
-        return self._own[name] if name in self._own else self.gguf.tensor(name)
+        """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``)."""
+        return self._own.get(name) or self._views.get(name) or self.gguf.tensor(name)
+
+    def view(self, name: str, row_sb: int) -> None:
+        """The blocks read the file's tensor ``name`` as rows of row_sb super-blocks (a row of the file: several rows of
+        the view, one after the other; an MoE down's halves)."""
+        t = self.gguf.tensor(name)
+        n = t.cols // (256 * row_sb)
+        assert t.cols == n * 256 * row_sb, (name, t.cols, row_sb)
+        self._views[name] = QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
+                                    raw=t.raw.reshape(t.rows * n, -1))
 
     def fmt(self, name: str) -> str:
-        return tile_format(self.gguf.tensor_info[name][1])
+        """A tensor's tile format (F32: BFP16 planes, ``Block``)."""
+        qtype = self.gguf.tensor_info[name][1]
+        return "BFP16" if qtype == "F32" else tile_format(qtype)
 
     def _choose_tile_bytes(self) -> int:
         """The object size of the formats in the file (``formats.choose_tile_bytes``: rows streamed per format and K
@@ -160,25 +186,39 @@ class TileImage:
                     rows[f] = rows.get(f, 0) + dims[1] * n_kc
         return choose_tile_bytes(rows, self.nsb, gu)
 
-    def _add(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int) -> None:
-        """A region of the blocks ``parts`` = (name, tensors, rows (COLS, n)) over an input of K elements."""
+    def _add(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int, *,
+             G: int = 1) -> None:
+        """A region of the blocks ``parts`` = (name, tensors, rows (COLS, n)) over an input of K elements; G > 1: K =
+        kc / G, the blocks' rows given as row groups (``group_rows``)."""
+        self.regions.append(self._region(layer, name, parts, K, G))
+
+    def _add_slab(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int, *,
+                  G: int = 1) -> None:
+        """A slab region (as ``_add``, rows (2 E, n): a block per expert half), after the layer's previous ones in a
+        half."""
+        self.slabs.append(self._region(layer, name, parts, K, G))
+
+    def _region(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int,
+                G: int) -> Region:
+        assert G == 1 or G * K == self.kc, (name, K, G)
         blocks = []
         for bname, tensors, rows in parts:
             fmts = {self.fmt(t) for t in tensors}
             assert len(fmts) == 1, f"{tensors}: one tile format per block ({fmts})"
             fmt = fmts.pop()
             R = self.R[fmt]
-            blocks.append(Block(bname, tensors, _pad_rows(rows, R), fmt, R))
+            assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
+            blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G))
         n_kc = -(-K // self.kc)
-        self.regions.append(Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes,
-                                   self.kc))
+        return Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes, self.kc,
+                      cols=parts[0][2].shape[0])
 
     def _add_data(self, layer: int, name: str, nbytes: int) -> None:
         """A data region of nbytes per column ("<phase>_norm": ``norm_objects``, written at pack time)."""
         self.regions.append(Region(layer, name, [], 1, 1, self.tile_bytes, self.kc, data=nbytes))
 
     def _place(self) -> None:
-        """The regions' offsets (after the leading PAD) and column strides, ``nbytes``."""
+        """The regions' offsets (after the leading PAD) and column strides, then the slab regions', ``nbytes``."""
         if self.column_major:
             end = PAD
             for blk in self._blocks():
@@ -193,8 +233,17 @@ class TileImage:
             for r in self.regions:
                 r.offset, r.col_stride = end, r.col_bytes
                 end += r.nbytes
+        for L in dict.fromkeys(r.layer for r in self.slabs):  # (a layer's halves: its slab regions back to back)
+            rs = [r for r in self.slabs if r.layer == L]
+            half = sum(r.col_bytes for r in rs)
+            off = end
+            for r in rs:
+                assert r.cols == rs[0].cols
+                r.offset, r.col_stride = off, half
+                off += r.col_bytes
+            end += rs[0].cols * half
         self.nbytes = -(-(end + PAD) // 4096) * 4096
-        self._index = {(r.layer, r.name): r for r in self.regions}
+        self._index = {(r.layer, r.name): r for r in self.regions + self.slabs}
 
     def _blocks(self) -> list[list[Region]]:
         """The regions of a column-major image in layout blocks of whole layers, each of at most BLOCK_BYTES (one
@@ -252,7 +301,7 @@ class TileImage:
         """A block for ``_native.pack_tiles``."""
         ts = [self.tensor(t) for t in b.tensors]
         return (_native_format(b.fmt, ts), b.R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt, r.rt0[b.name],
-                r.offset, r.col_stride, [_raw_bytes(t) for t in ts], b.rows, ts[0].cols // 256)
+                r.offset, r.col_stride, [_raw_bytes(t) for t in ts], b.rows, ts[0].cols // 256, b.G)
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
         """Pack every region into ``out`` (uint8, nbytes; the PAD bytes are left as they are): the C++ packer
@@ -260,7 +309,7 @@ class TileImage:
         data regions. ``release``: give back the GGUF file's pages of each packed tensor (they stay in the page
         cache). Returns whether bytes went through the CPU caches (the data regions: flush a device buffer)."""
         assert out.dtype == np.uint8 and out.size >= self.nbytes
-        blocks = [(r, b) for r in self.regions for b in r.blocks]
+        blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
         own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (memory of their own: never released)
         mapped = [x for x in blocks if x not in own]
         _native.pack_tiles(out, [self._native_block(r, b) for r, b in mapped], threads=threads, release=release,
@@ -277,29 +326,32 @@ class TileImage:
 
 
 def _native_format(fmt: str, tensors: list[QTensor]) -> str:
-    """A tile format's name for ``_native.pack_tiles`` (BFP16: by its tensors' type, "BFP16/BF16" or "BFP16/F16")."""
+    """A tile format's name for ``_native.pack_tiles`` (BFP16: by its tensors' type, "BFP16/BF16", "BFP16/F16" or
+    "BFP16/F32")."""
     return f"{fmt}/{tensors[0].qtype}" if fmt == "BFP16" else fmt
 
 
 def _raw_bytes(t: QTensor) -> np.ndarray:
-    """A tensor's rows as bytes (BF16 / F16: (rows, 2 cols))."""
+    """A tensor's rows as bytes (BF16 / F16: (rows, 2 cols), F32: (rows, 4 cols))."""
     return t.raw if t.raw.dtype == np.uint8 else t.raw.view(np.uint8)
 
 
-def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int, nch: int, *, kc: int = 1024
-              ) -> np.ndarray:
-    """Tiles (n / R, nch, S) of ``rows`` (-1: zero rows; n a multiple of R) of the stacked tensors over nch K
-    chunks of kc (``_native.pack_tiles``; columns past the tensors' as zero super-blocks): tile (g, k) =
-    ``pack_tile(fmt, fields of rows g R .. of chunk k, S)``."""
+def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int, nch: int, *, kc: int = 1024,
+              G: int = 1) -> np.ndarray:
+    """Tiles (n / (R G), nch, S) of ``rows`` (-1: zero rows; n a multiple of R G; F32 tensors: BFP16 planes,
+    ``Block``) of the stacked tensors over nch K chunks of kc (``_native.pack_tiles``; columns past the tensors' as
+    zero super-blocks): tile (t, k) = ``pack_tile(fmt, fields of rows t R .. of chunk k, S)``; G > 1 (one chunk):
+    tile row v = rows v G .. v G + G - 1 along K."""
     t = tensors[0]
-    assert tile_format(t.qtype) == fmt and t.cols <= nch * kc and rows.size % R == 0
-    G = rows.size // R
-    out = np.zeros(G * nch * S, np.uint8)
-    _native.pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, G, 0, 0, out.size,
+    assert (fmt == "BFP16" if t.qtype == "F32" else tile_format(t.qtype) == fmt) and t.cols * G <= nch * kc
+    assert rows.size % (R * G) == 0
+    n = rows.size // (R * G)
+    out = np.zeros(n * nch * S, np.uint8)
+    _native.pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, n, 0, 0, out.size,
                               [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1),
-                              t.cols // 256)],
+                              t.cols // 256, G)],
                        threads=1)
-    return out.reshape(G, nch, S)
+    return out.reshape(n, nch, S)
 
 
 def column_rows(n: int) -> np.ndarray:
@@ -308,12 +360,24 @@ def column_rows(n: int) -> np.ndarray:
     return per * np.arange(COLS)[:, None] + np.arange(per)[None]
 
 
-def gate_up_rows(ffn: int, R: int) -> np.ndarray:
-    """(COLS, n) rows of the stack [gate; up] (ffn rows each) for the gate/up phase: column c's outputs ffn / 8 c ..
-    in groups of 64, each as 8 x [8 gate | 8 up] rows (128) in ``gu_tiles(R)`` tiles (-1: padding rows)."""
-    fr = ffn // COLS  # gate (and up) rows per column
-    gu = np.full((COLS, fr // 64, gu_tiles(R) * R), -1, np.int64)
-    g0 = fr * np.arange(COLS)[:, None] + 64 * np.arange(fr // 64)  # (COLS, groups): a group's first gate row
+def gate_up_rows(ffn: int, R: int, cols: int = COLS) -> np.ndarray:
+    """(cols, n) rows of the stack [gate; up] (ffn rows each) for the gate/up phase: column c's outputs ffn / cols c ..
+    in groups of 64, each as 8 x [8 gate | 8 up] rows (128) in ``gu_tiles(R)`` tiles (-1: padding rows). (An MoE's
+    experts: cols = the expert halves, ``Region.cols``.)"""
+    fr = ffn // cols  # gate (and up) rows per column
+    gu = np.full((cols, fr // 64, gu_tiles(R) * R), -1, np.int64)
+    g0 = fr * np.arange(cols)[:, None] + 64 * np.arange(fr // 64)  # (cols, groups): a group's first gate row
     gu[:, :, :128] = (g0[..., None, None, None] + 8 * np.arange(8)[:, None, None] + ffn * np.arange(2)[:, None]
-                      + np.arange(8)).reshape(COLS, fr // 64, 128)  # 8 x [8 gate | 8 up]
-    return gu.reshape(COLS, -1)
+                      + np.arange(8)).reshape(cols, fr // 64, 128)  # 8 x [8 gate | 8 up]
+    return gu.reshape(cols, -1)
+
+
+def group_rows(rows: np.ndarray, R: int, G: int) -> np.ndarray:
+    """(cols, n) rows of a matrix of K = kc / G as row-group tiles (``Block.G``): (cols, t R G) - tile i's row r holds
+    rows[:, G R i + R j + r] at slot j < G (its K columns j K ..), -1 past n: a tile's G R outputs in their order,
+    slot-major."""
+    cols, n = rows.shape
+    t = -(-n // (R * G))
+    i, r, j = np.meshgrid(np.arange(t), np.arange(R), np.arange(G), indexing="ij")
+    src = (G * R * i + R * j + r).reshape(-1)  # (the entries in tile, row, slot order)
+    return np.ascontiguousarray(np.concatenate([rows, np.full((cols, 1), -1, np.int64)], 1)[:, np.minimum(src, n)])

@@ -1,6 +1,7 @@
 """BFP16 tiles (288 bytes per row and super-block) of a BF16 or F16 tensor, its values rounded once to bfp16ebs8: 8 rows
 = 32 MMUL panels per super-block [k8][row][exp, 8 int8]. (BF16 and F16 tensors have no tile format of their own:
-``tile_format``.)
+``tile_format``.) Of an F32 tensor (an MoE router's rows), two planes per row: hi = bfp16(w) and lo = bfp16(w - hi)
+(``overlay.image.Block``), whose sum is w to ~3e-5.
 
 Prefill: GemmQ's tile-major permutation delivers them as MMUL B panels (no dequant). Decode: the panels against the x
 panels as they are (``_MMV``)."""
@@ -40,8 +41,8 @@ __attribute__((noinline)) void {{ p }}_bfp(uint8_t *__restrict a, const uint8_t 
 
 
 def _values(w: np.ndarray) -> np.ndarray:
-    """A BF16 tensor's bf16 bit patterns (uint16) or an F16 tensor's values -> float32."""
-    if w.dtype == np.float16:
+    """A BF16 tensor's bf16 bit patterns (uint16) or an F16 / F32 tensor's values -> float32."""
+    if w.dtype in (np.float16, np.float32):
         return w.astype(np.float32)
     return torch.from_numpy(np.ascontiguousarray(w).view(np.int16)).view(torch.bfloat16).float().numpy()
 

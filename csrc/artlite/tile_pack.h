@@ -9,22 +9,24 @@
 
 namespace artlite {
 
-/// The tile formats of ``artlite.operators.formats`` with a native packer (every slot's ``pack``; BFP16 of BF16 and of
-/// F16 tensors).
-enum class TileFormat { Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BFP16_BF16, BFP16_F16 };
+/// The tile formats of ``artlite.operators.formats`` with a native packer (every slot's ``pack``; BFP16 of BF16, F16 and
+/// F32 tensors).
+enum class TileFormat { Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BFP16_BF16, BFP16_F16, BFP16_F32 };
 
-/// "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q8_0", "Q4_1", "Q2_K", "Q3_K", "BFP16/BF16", "BFP16/F16" -> the format (throws on
-/// others).
+/// "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q8_0", "Q4_1", "Q2_K", "Q3_K", "BFP16/BF16", "BFP16/F16", "BFP16/F32" -> the format
+/// (throws on others).
 TileFormat tile_format(std::string_view name);
 
-/// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512).
+/// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512, F32: 1024).
 size_t block_bytes(TileFormat f);
 
 /// A run of row tiles in every column block of a weight image's region (``overlay.image.Block``): column c's
-/// n rows (indices into the stacked tensors, -1: a zero row) as n / R row tiles of S bytes over n_kc K chunks
+/// n rows (indices into the stacked tensors, -1: a zero row) as n / (R G) row tiles of S bytes over n_kc K chunks
 /// of 256 nsb columns, row tile rt's tile of chunk kc at ``Region.tile(rt0 + rt, kc)`` of the column block
 /// (column c's block at offset + c col_stride). A tensor row holds row_sb super-blocks (at most n_kc nsb): the
-/// columns past them are zero super-blocks (a K padded to whole chunks).
+/// columns past them are zero super-blocks (a K padded to whole chunks). G > 1 (row groups: one chunk, G row_sb = nsb):
+/// a tile row is G tensor rows, consecutive in ``rows``, one after the other along K. BFP16 of F32 tensors: row index
+/// 2 i + p is plane p of stacked row i (0: bfp16(w), 1: bfp16(w - plane 0)).
 struct PackBlock {
   TileFormat fmt;
   int R;
@@ -41,6 +43,7 @@ struct PackBlock {
   const int64_t* rows;   // (cols, n)
   int cols;
   int64_t n;
+  int G = 1;             // tensor rows per tile row
 };
 
 struct PackOptions {
