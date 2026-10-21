@@ -35,6 +35,9 @@ and generation speeds go to stderr.
 | `--temp X` | sampling temperature (default: the model's; 0: greedy) |
 | `--top-k N` | sample among the k most likely tokens (default: the model's) |
 | `--top-p X` | nucleus sampling threshold (default: the model's) |
+| `--repeat-penalty X` | divide the logits of the last `--repeat-last-n` tokens, the prompt's too, by X (multiply the negative ones) (default: the model's; 1: none) |
+| `--repeat-last-n N` | the tokens the penalties look back at (default: the model's, 64; 0: none) |
+| `--presence-penalty X`, `--frequency-penalty X` | subtract X, or X times their count, from those tokens' logits (default: the model's, 0) |
 | `--greedy` | always the most likely token |
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |

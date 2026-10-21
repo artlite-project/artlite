@@ -327,7 +327,8 @@ class QwenConfig:
             nextn_layers=nextn,
             max_position_embeddings=int(m("context_length")),
             eos_token_ids=tuple(dict.fromkeys(eos)),
-            sampling={k: float(gguf.meta[f"general.sampling.{k}"]) for k in ("top_k", "top_p", "temp")
+            sampling={k: float(gguf.meta[f"general.sampling.{k}"])
+                      for k in ("top_k", "top_p", "temp", "penalty_repeat", "penalty_last_n")
                       if f"general.sampling.{k}" in gguf.meta},
         )
 

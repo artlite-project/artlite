@@ -3,9 +3,12 @@ generation loop of a model on the NPU (``NpuModel``), a model on a decode overla
 (``OverlayModel``: its steps, prompts and accounting), sampling, chat templates, incremental detokenization and the
 default KV cache capacity."""
 
+import collections
+import copy
 import functools
+import math
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,20 +24,37 @@ MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cp
 
 @dataclass(frozen=True)
 class Sampling:
-    """How the next token is chosen: among the ``top_k`` largest logits, softmax at temperature ``temp``, then the
-    smallest prefix of them reaching probability ``top_p``, of those the ones with at least ``min_p`` times the largest
-    probability; the argmax when ``greedy`` or ``temp`` <= 0."""
+    """How the next token is chosen: the logits penalized as llama.cpp's penalties sampler does (``Penalties``: the
+    tokens among the last ``repeat_last_n`` of the prompt and the generated ones), among the ``top_k`` largest of them,
+    softmax at temperature ``temp``, then the smallest prefix of them reaching probability ``top_p``, of those the ones
+    with at least ``min_p`` times the largest probability; the argmax when ``greedy`` or ``temp`` <= 0."""
 
     temp: float = 1.0
     top_k: int = 64
     top_p: float = 1.0
     greedy: bool = False
     min_p: float = 0.0
+    repeat_penalty: float = 1.0  # a recent token's logit divided by it (multiplied when <= 0); 1: none
+    repeat_last_n: int = 64  # the recent tokens (0: no penalties)
+    presence_penalty: float = 0.0  # subtracted from a recent token's logit
+    frequency_penalty: float = 0.0  # subtracted from a recent token's logit per occurrence
+
+    def __post_init__(self) -> None:
+        if not 0 < self.repeat_penalty < math.inf:
+            raise ValueError(f"repeat_penalty {self.repeat_penalty}: greater than 0 (1: none)")
+        if self.repeat_last_n < 0:
+            raise ValueError(f"repeat_last_n {self.repeat_last_n}: at least 0 (0: no penalties)")
 
     @property
     def k(self) -> int:
         """The candidates a choice needs (1: the argmax)."""
         return 1 if self.greedy or self.temp <= 0 else self.top_k
+
+    @property
+    def penalized(self) -> bool:
+        """Whether the penalties change logits."""
+        return self.repeat_last_n > 0 and (self.repeat_penalty != 1.0 or self.presence_penalty != 0.0
+                                           or self.frequency_penalty != 0.0)
 
     def pick(self, values: torch.Tensor, ids: torch.Tensor) -> int:
         """The next token from the ``k`` largest logits (values descending) and their token ids."""
@@ -48,12 +68,15 @@ class Sampling:
         return int(ids[torch.multinomial(p / p.sum(), 1)])
 
 
-def topk_bf16(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def topk_bf16(x: torch.Tensor, k: int, exclude: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """The k largest of bf16 values x (a vocabulary's logits) as fp32, descending, and their indices (as torch.topk of
     x.float(), 3-10x faster): the values' bits as int16 with the negative ones' magnitude bits flipped compare as the
-    values do; k = 1: their argmax, else the k blocks of 256 with the largest maxima hold the k largest."""
+    values do; k = 1: their argmax, else the k blocks of 256 with the largest maxima hold the k largest. ``exclude``:
+    indices that rank last."""
     b = x.view(torch.int16).numpy()
     key = b ^ ((b >> 15) & 0x7FFF)
+    if exclude is not None:
+        key[exclude.numpy()] = np.iinfo(np.int16).min
     if k == 1:
         i = int(np.argmax(key))
         return x[i:i + 1].float(), torch.tensor([i])
@@ -65,6 +88,85 @@ def topk_bf16(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     j = np.argpartition(sel, -k)[-k:]
     i = torch.from_numpy(idx[j[np.argsort(-sel[j].astype(np.int32), kind="stable")]])
     return x[i].float(), i
+
+
+class Penalties:
+    """llama.cpp's penalties sampler over a generation: the tokens among the last ``repeat_last_n`` of the prompt
+    (``prompt``: its ids; an image's rows, negative, are none) and of the generated ones (``accept``) have their logits
+    divided by ``repeat_penalty`` (multiplied when <= 0), less ``presence_penalty`` and ``frequency_penalty`` times
+    their count. Nothing when the sampling has no penalties (``Sampling.penalized``)."""
+
+    def __init__(self, sampling: Sampling, prompt: Sequence[int] = ()):
+        self.sampling = sampling
+        self.n = sampling.repeat_last_n if sampling.penalized else 0
+        self.last: collections.deque[int] = collections.deque()
+        self.counts: collections.Counter[int] = collections.Counter()
+        tail: list[int] = []
+        for t in reversed(getattr(prompt, "ids", prompt)):
+            if len(tail) == self.n:
+                break
+            if t >= 0:
+                tail.append(int(t))
+        for t in reversed(tail):
+            self.accept(t)
+
+    @property
+    def active(self) -> bool:
+        return self.n > 0
+
+    def copy(self) -> "Penalties":
+        """Another window of the same tokens (a draft's)."""
+        out = copy.copy(self)
+        out.last, out.counts = self.last.copy(), self.counts.copy()
+        return out
+
+    def accept(self, token: int) -> None:
+        """The sequence's next token."""
+        if not self.n:
+            return
+        self.last.append(token)
+        self.counts[token] += 1
+        if len(self.last) > self.n:
+            old = self.last.popleft()
+            self.counts[old] -= 1
+            if not self.counts[old]:
+                del self.counts[old]
+
+    def top(self, logits: torch.Tensor, k: int, cap: Callable[[torch.Tensor], torch.Tensor] | None = None, *,
+            rows: torch.Tensor | None = None, where: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``k`` largest penalized logits (fp32, descending) and their token ids, of a token's logits (vocab,), fp32
+        or the overlay's bf16; ``cap``: the model's logits of those (monotonic: applied to the candidates alone);
+        ``rows``, ``where``: the token of each logit and the logit of each token (logits in another order: a drafter's).
+        The candidates: the recent tokens and the ``k`` largest logits of the others."""
+        at = None
+        if self.counts:
+            ids = torch.tensor(list(self.counts))
+            at = ids if where is None else where[ids]
+        if logits.dtype == torch.bfloat16:
+            v, i = topk_bf16(logits, k, exclude=at)
+        else:
+            x = logits.float()
+            if at is not None:
+                x = x.clone()
+                x[at] = -math.inf
+            v, i = torch.topk(x, k)
+        if cap is not None:
+            v = cap(v)
+        if rows is not None:
+            i = rows[i]
+        if at is None:
+            return v, i
+        if k > logits.numel() - len(ids):  # (fewer other tokens than k: recent ones among them, unpenalized)
+            keep = ~torch.isin(i, ids)
+            v, i = v[keep], i[keep]
+        x = logits[at].float()
+        x = (x if cap is None else cap(x)).numpy()
+        s, count = self.sampling, np.fromiter(self.counts.values(), np.float32, len(ids))
+        x = np.where(x <= 0, x * s.repeat_penalty, x / s.repeat_penalty) - s.presence_penalty \
+            - count * s.frequency_penalty
+        v, i = torch.cat([v, torch.from_numpy(x.astype(np.float32))]), torch.cat([i, ids.to(i.dtype)])
+        v, j = torch.topk(v, min(k, v.numel()))
+        return v, i[j]
 
 
 def auto_capacity(tokens: int) -> int:
@@ -159,21 +261,27 @@ class NpuModel:
         """Run ``token`` at the next position: the logits (vocab,) of the next token."""
         raise NotImplementedError
 
-    def top_k(self, token: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Run ``token`` at the next position: the ``k`` largest logits of the next token (fp32, descending) and their
-        token ids."""
-        return torch.topk(self.step(token).float(), k)
+        token ids (``penalties``: of the penalized logits)."""
+        logits = self.step(token).float()
+        return torch.topk(logits, k) if penalties is None else penalties.top(logits, k)
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = ()
+                 ) -> Iterator[int]:
         """Sample up to ``max_tokens`` tokens (< 0: no limit) after the cached positions; ``logits``: of the last
-        cached one. Ends after an end-of-sequence token or when the cache is full."""
+        cached one; ``prompt``: the prompt's tokens (the penalties' first). Ends after an end-of-sequence token or when
+        the cache is full."""
         if max_tokens == 0:
             return
-        token = sampling.pick(*torch.topk(logits.float(), sampling.k))
+        penalties = Penalties(sampling, prompt)
+        token = sampling.pick(*penalties.top(logits, sampling.k))
+        penalties.accept(token)
         n = 1
         yield token
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            token = sampling.pick(*self.top_k(token, sampling.k))
+            token = sampling.pick(*self.top_k(token, sampling.k, penalties))
+            penalties.accept(token)
             n += 1
             yield token
 
@@ -243,9 +351,12 @@ class OverlayModel(NpuModel):
         out = self.steps([token], logits=logits)
         return None if out is None else self.cap(out[0].float())
 
-    def top_k(self, token: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """(``cap`` is monotonic: applied to the top k alone)"""
-        v, i = topk_bf16(self.steps([token])[0], k)
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """(``cap`` is monotonic: applied to the candidates alone)"""
+        raw = self.steps([token])[0]
+        if penalties is not None:
+            return penalties.top(raw, k, self.cap)
+        v, i = topk_bf16(raw, k)
         return self.cap(v), i
 
     def _chunk(self, left: int, position: int | None = None) -> int:

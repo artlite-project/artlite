@@ -29,8 +29,9 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/v1/models`, `/props`, `/health`, `/slots` | the model, the server's settings, its state |
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
 
-Sampling has the temperature, top-k, top-p and min-p. The other sampler fields (penalties, DRY, XTC, typical-p,
-mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's settings for them have no effect.
+Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
+sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
+settings for them have no effect.
 Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
 `image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: tool calls,
 embeddings, reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, model downloads; their routes answer
@@ -145,7 +146,7 @@ Generation:
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
 | `-np N`, `--parallel` | sequences at a time (1 only: the NPU runs one) |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
-| `--temp`, `--top-k`, `--top-p`, `--min-p` | sampling defaults (default: the model's) |
+| `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
 | `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |

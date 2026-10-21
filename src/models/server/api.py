@@ -33,18 +33,18 @@ from .engine import Engine, Job
 log = logging.getLogger("artlite.server")
 
 TOP_K_ALL = 1000  # the candidates of top_k <= 0 (llama.cpp: all tokens; past these the probabilities are negligible)
-SAMPLERS = ["top_k", "temperature", "top_p", "min_p"]  # in the order Sampling applies them
+SAMPLERS = ["penalties", "top_k", "temperature", "top_p", "min_p"]  # in the order Sampling applies them
+PENALTIES = ("repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_penalty")  # (Sampling's, Options')
 # sampler fields the NPU path does not have, with their neutral values (others are ignored with a log line)
 NEUTRAL: dict[str, object] = {
-    "typical_p": 1.0, "typ_p": 1.0, "repeat_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
-    "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0, "dynatemp_range": 0.0, "top_n_sigma": -1.0,
-    "n_probs": 0, "logprobs": False, "top_logprobs": 0, "ignore_eos": False, "logit_bias": None, "grammar": None,
-    "json_schema": None, "response_format": None, "tools": None, "thinking_budget_tokens": None,
+    "typical_p": 1.0, "typ_p": 1.0, "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0,
+    "dynatemp_range": 0.0, "top_n_sigma": -1.0, "n_probs": 0, "logprobs": False, "top_logprobs": 0,
+    "ignore_eos": False, "logit_bias": None, "grammar": None, "json_schema": None, "response_format": None,
+    "tools": None, "thinking_budget_tokens": None,
 }
 # llama-server's other sampler settings, as /props reports them (the parameters of samplers that are off)
 OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": -1.0, "xtc_probability": 0.0,
-                "xtc_threshold": 0.1, "typical_p": 1.0, "repeat_last_n": 64, "repeat_penalty": 1.0,
-                "presence_penalty": 0.0, "frequency_penalty": 0.0, "dry_multiplier": 0.0, "dry_base": 1.75,
+                "xtc_threshold": 0.1, "typical_p": 1.0, "dry_multiplier": 0.0, "dry_base": 1.75,
                 "dry_allowed_length": 2, "dry_penalty_last_n": -1, "mirostat": 0, "mirostat_tau": 5.0,
                 "mirostat_eta": 0.1, "n_keep": 0, "ignore_eos": False, "n_probs": 0, "min_keep": 0,
                 "post_sampling_probs": False, "backend_sampling": False, "lora": []}
@@ -64,6 +64,10 @@ class Options:
     top_k: int | None = None
     top_p: float | None = None
     min_p: float | None = None
+    repeat_penalty: float | None = None
+    repeat_last_n: int | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     seed: int = -1  # a request's default seed (< 0: random)
     reasoning: str = "off"  # think: on, off, auto (when the model can)
     reasoning_format: str = "auto"  # auto: thoughts in reasoning_content; none: in content
@@ -165,6 +169,10 @@ class Generation(BaseModel):
     top_k: int | None = None
     top_p: float | None = None
     min_p: float | None = None
+    repeat_penalty: float | None = None
+    repeat_last_n: int | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     seed: int | None = None
     stop: str | list[str] | None = None
     n: int | None = 1
@@ -331,13 +339,15 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     def sampling(think: bool) -> Sampling:
         """The defaults of a request: the model's, then the command line's."""
         s = engine.model.sampling(think=think)
-        given = {"temp": options.temp, "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p}
+        given = {"temp": options.temp, "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
+                 **{k: getattr(options, k) for k in PENALTIES}}
         return dataclasses.replace(s, **{k: v for k, v in given.items() if v is not None})
 
     def params(s: Sampling) -> dict[str, Any]:
         """llama-server's generation settings (/props, /slots)."""
         return {"seed": options.seed, "temperature": 0.0 if s.greedy else s.temp, "top_k": s.top_k, "top_p": s.top_p,
-                "min_p": s.min_p, **OTHER_PARAMS, "max_tokens": options.n_predict, "n_predict": options.n_predict,
+                "min_p": s.min_p, **{k: getattr(s, k) for k in PENALTIES}, **OTHER_PARAMS,
+                "max_tokens": options.n_predict, "n_predict": options.n_predict,
                 "stream": False, "reasoning_format": options.reasoning_format, "samplers": SAMPLERS,
                 "timings_per_token": False}
 
@@ -356,8 +366,12 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
     def request_sampling(req: Generation, think: bool) -> Sampling:
         s = sampling(think)
-        given = {"temp": req.temperature, "top_k": req.top_k, "top_p": req.top_p, "min_p": req.min_p}
-        s = dataclasses.replace(s, **{k: v for k, v in given.items() if v is not None})
+        given = {"temp": req.temperature, "top_k": req.top_k, "top_p": req.top_p, "min_p": req.min_p,
+                 **{k: getattr(req, k) for k in PENALTIES}}
+        try:
+            s = dataclasses.replace(s, **{k: v for k, v in given.items() if v is not None})
+        except ValueError as e:  # (a penalty out of range)
+            raise bad_request(str(e)) from None
         if req.temperature is not None and req.temperature > 0:
             s = dataclasses.replace(s, greedy=False)
         return dataclasses.replace(s, top_k=min(s.top_k, TOP_K_ALL) if s.top_k > 0 else TOP_K_ALL)

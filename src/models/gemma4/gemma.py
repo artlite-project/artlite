@@ -21,10 +21,11 @@ disk. The per-layer token embedding (1.6 GB) is never loaded: its rows are read 
 file, as is the token embedding's row.
 """
 
+import functools
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import torch
 
@@ -36,7 +37,7 @@ from artlite.operators.gemma4.overlay import GemmaOverlay
 from artlite.operators.gemma4.prefill import GemmaPrefill
 from artlite.operators.overlay.decode import SLOTS as BATCH  # tokens per dispatch
 
-from ..common import Model, OverlayModel, Sampling
+from ..common import Model, OverlayModel, Penalties, Sampling
 from .host import GemmaHost, softcap
 from .tokenizer import GemmaTokenizer, chat_prompt
 
@@ -167,46 +168,67 @@ class NpuGemma(OverlayModel):
         slot = self.slot if slot is None else slot
         return output_norm(self.overlay.residual(slot), self.host.mat("output_norm.weight"), self.cfg.rms_norm_eps)
 
-    def draft(self, token: int, h: torch.Tensor, n: int) -> list[int]:
+    @functools.cached_property
+    def _draft_where(self) -> torch.Tensor:
+        """The drafter's logit of each token (the inverse of its ``rows``)."""
+        rows = self.drafter.rows
+        out = torch.empty_like(rows)
+        out[rows] = torch.arange(len(rows), dtype=rows.dtype)
+        return out
+
+    def draft(self, token: int, h: torch.Tensor, n: int, penalties: Penalties | None = None) -> list[int]:
         """The drafter's guesses of the (up to n) tokens after ``token`` - the token of the next position, not run yet;
         h: the hidden state of the position before it -: its most likely one, the most likely one after that, ...
-        (ends with an end-of-sequence token)."""
+        (ends with an end-of-sequence token); ``penalties``: the generation's (up to ``token``), which the guesses
+        get too."""
         t0 = time.perf_counter()
         out: list[int] = []
+        recent = penalties.copy() if penalties is not None and penalties.active else None
         while len(out) < n and token not in self.eos_token_ids:
             x = self._inputs[token][0] if token in self._inputs else self.host.embed([token])[0]
-            token = self.drafter.token(self.drafter.step(x, h if not out else None, self.position))
+            raw = self.drafter.step(x, h if not out else None, self.position)
+            if recent is None:
+                token = self.drafter.token(raw)
+            else:
+                token = int(recent.top(raw, 1, self.cap, rows=self.drafter.rows, where=self._draft_where)[1][0])
+                recent.accept(token)
             out.append(token)  # (its per-layer inputs: with the verifying step's others, in one pass)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = ()
+                 ) -> Iterator[int]:
         """With the drafter: multi-token prediction. The sampled token's dispatch takes up to ``DRAFTS`` draft tokens
         along; the model's logits after a token give its own next token (sampled), and as long as that is the draft that
         ran behind it, the draft's logits are valid too. The rejected drafts' positions are forgotten (the next steps
         overwrite their cache records)."""
         if self.drafter is None:
-            yield from super().generate(logits, max_tokens, sampling)
+            yield from super().generate(logits, max_tokens, sampling, prompt)
             return
         if max_tokens == 0:
             return
         cap = self.cfg.final_logit_softcapping
-        token = sampling.pick(*torch.topk(logits.float(), sampling.k))
+        penalties = Penalties(sampling, prompt)
+        token = sampling.pick(*penalties.top(logits, sampling.k))
+        penalties.accept(token)
         h = self.hidden_state()
         n = 1
         yield token
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
             k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else BATCH)
-            d = self.draft(token, h, k) if k > 0 else []
+            d = self.draft(token, h, k, penalties) if k > 0 else []
             raw = self.steps([token, *d])
             new: list[int] = []
             for i in range(len(d) + 1):  # (the soft cap is monotonic: applied to the top k alone)
-                if sampling.k == 1:
+                if penalties.active:
+                    new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.cap)))
+                elif sampling.k == 1:
                     new.append(argmax_bf16(raw[i]))
                 else:
                     v, ids = torch.topk(raw[i].float(), sampling.k)
                     new.append(sampling.pick(softcap(v, cap), ids))
+                penalties.accept(new[i])
                 if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
                     break
             self.position -= len(d) + 1 - len(new)

@@ -24,7 +24,7 @@ import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER, Model, NpuModel, Sampling
+from models.common import MEDIA_MARKER, Model, NpuModel, Penalties, Sampling
 from models.qwen35.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
@@ -174,9 +174,10 @@ class FakeNpu(NpuModel):
         self._next = iter([self.tok.id(p) for p in pieces] + [EOS])
         return self._logits(next(self._next))
 
-    def top_k(self, token: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         self._run([token])
-        return torch.topk(self._logits(next(self._next, EOS)), k)
+        logits = self._logits(next(self._next, EOS))
+        return torch.topk(logits, k) if penalties is None else penalties.top(logits, k)
 
 
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)
@@ -296,6 +297,27 @@ def test_completions(fake: tuple) -> None:
     lines = [json.loads(b[6:]) for b in client.post("/completion", json={"prompt": "x", "stream": True}).text.split(
         "\n\n") if b.startswith("data: ")]
     assert lines[0]["content"] == " D" and lines[-1]["stop"] is True  # (no [DONE] in the native stream)
+
+
+def test_penalties() -> None:
+    """The penalties of the command line and of a request, over the prompt's tokens too: a reply of a prompt's word
+    whose logit the frequency penalty pushes below the others' gives another token."""
+    _model, npu, engine = make()
+    with TestClient(app_of(engine, repeat_penalty=1.2)) as client:
+        assert engine.wait_ready(5)
+        assert client.get("/props").json()["default_generation_settings"]["params"]["repeat_penalty"] == 1.2
+        body = {"prompt": "hello there", "temperature": 0}
+        npu.replies = [["hello"]]
+        r = client.post("/completion", json=body | {"repeat_last_n": 16, "presence_penalty": 0.5}).json()
+        g = r["generation_settings"]
+        assert r["content"] == "hello"  # (a penalized logit of 0 stays 0)
+        assert (g["repeat_penalty"], g["repeat_last_n"], g["presence_penalty"], g["frequency_penalty"]) == \
+            (1.2, 16, 0.5, 0.0)
+        npu.replies = [["hello"]]
+        assert client.post("/completion", json=body | {"frequency_penalty": 150}).json()["content"] != "hello"
+        npu.replies = [["hello"]]
+        assert client.post("/completion", json=body | {"frequency_penalty": 150, "repeat_last_n": 0}
+                           ).json()["content"] == "hello"
 
 
 # ----------------------------------------------------------------------
@@ -564,7 +586,10 @@ def test_errors(fake: tuple) -> None:
         "invalid_request_error"
     assert client.post("/v1/embeddings", json={}).status_code == 501
     assert client.get("/tools").status_code == 403
-    # the text parts of a content list, and the fields the UI sends (accepted; the NPU path has no penalties)
+    for bad in ({"repeat_penalty": 0}, {"repeat_last_n": -1}):
+        r = chat(client, "x", **bad)
+        assert r.status_code == 400 and next(iter(bad)) in r.json()["error"]["message"], bad
+    # the text parts of a content list, and the fields the UI sends (accepted)
     npu.replies = [["fine"]]
     parts = [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]
     r = chat(client, parts, stream=True, reasoning_format="auto", repeat_penalty=1.1, dry_multiplier=0.0,
@@ -657,6 +682,8 @@ def test_props_and_models(fake: tuple) -> None:
     g = p["default_generation_settings"]
     assert g["n_ctx"] == npu.capacity and g["params"]["temperature"] == 0.7 and g["params"]["top_k"] == 8
     assert g["params"]["top_p"] == 0.9 and g["params"]["min_p"] == 0.0 and g["params"]["max_tokens"] == -1
+    assert g["params"]["repeat_penalty"] == 1.0 and g["params"]["repeat_last_n"] == 64
+    assert g["params"]["samplers"][0] == "penalties"
     assert p["modalities"] == {"vision": False, "audio": False, "video": False} and "role" not in p
     assert p["chat_template"] == TEMPLATE and p["model_path"].endswith("fake.gguf") and p["total_slots"] == 1
     m = client.get("/v1/models").json()

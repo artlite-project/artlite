@@ -27,9 +27,9 @@ from fastapi import FastAPI
 from artlite.model_config import MODELS_DIR, model_path
 
 from .. import open_model
-from ..common import Model, NpuModel
+from ..common import Model, NpuModel, Sampling
 from . import ui
-from .api import ModelInfo, Options, create_app
+from .api import PENALTIES, ModelInfo, Options, create_app
 from .engine import Engine
 
 log = logging.getLogger("artlite.server")
@@ -92,6 +92,14 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("--top-p", type=float, help="nucleus sampling threshold (default: the model's)")
     gen.add_argument("--min-p", type=float, help="drop tokens below this fraction of the most likely one's "
                                                  "probability (default: the model's, 0)")
+    gen.add_argument("--repeat-penalty", type=float, help="divide the logits of the last --repeat-last-n tokens by "
+                                                          "this (default: the model's; 1: none)")
+    gen.add_argument("--repeat-last-n", type=int,
+                     help="the tokens the penalties look back at (default: the model's, 64; 0: none)")
+    gen.add_argument("--presence-penalty", type=float, help="subtract this from the logits of the last "
+                                                            "--repeat-last-n tokens (default: the model's, 0)")
+    gen.add_argument("--frequency-penalty", type=float, help="subtract this times their count from the logits of the "
+                     "last --repeat-last-n tokens (default: the model's, 0)")
     gen.add_argument("-s", "--seed", type=int, default=-1, help="sampling seed (default: -1, random per request)")
     gen.add_argument("-rea", "--reasoning", choices=("on", "off", "auto"), default="off",
                      help="let a model with a thinking mode think first (auto: when it has one; default: off); a "
@@ -276,14 +284,16 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     try:
         info = ModelInfo.from_gguf(args.model)
         keys = api_keys(args)
+        penalties = {k: getattr(args, k) for k in PENALTIES if getattr(args, k) is not None}
+        Sampling(**penalties)  # (ValueError: out of range)
     except (OSError, ValueError) as e:
         if report is not None:
             report({"error": f"{type(e).__name__}: {e}"})
         sys.exit(f"artlite-server: {e}")
     n_ctx = capacity(args.ctx_size, info.n_ctx_train)
     options = Options(alias=args.alias or name, n_ctx=n_ctx, api_keys=keys, n_predict=args.n_predict, temp=args.temp,
-                      top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, seed=args.seed, reasoning=args.reasoning,
-                      reasoning_format="none" if args.reasoning_format == "none" else "auto",
+                      top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, **penalties, seed=args.seed,
+                      reasoning=args.reasoning, reasoning_format="none" if args.reasoning_format == "none" else "auto",
                       chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
                       sse_ping_interval=args.sse_ping_interval, slots=args.slots,
                       cors_origins=[o.strip() for o in args.cors_origins.split(",") if o.strip()],

@@ -50,6 +50,14 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temp", type=float, help="sampling temperature (default: the model's; 0: greedy)")
     p.add_argument("--top-k", type=int, help="sample among the k most likely tokens (default: the model's)")
     p.add_argument("--top-p", type=float, help="nucleus sampling threshold (default: the model's)")
+    p.add_argument("--repeat-penalty", type=float,
+                   help="divide the logits of the last --repeat-last-n tokens by this (default: the model's; 1: none)")
+    p.add_argument("--repeat-last-n", type=int,
+                   help="the tokens the penalties look back at (default: the model's, 64; 0: none)")
+    p.add_argument("--presence-penalty", type=float,
+                   help="subtract this from the logits of the last --repeat-last-n tokens (default: the model's, 0)")
+    p.add_argument("--frequency-penalty", type=float, help="subtract this times their count from the logits of the "
+                   "last --repeat-last-n tokens (default: the model's, 0)")
     p.add_argument("--greedy", action="store_true", help="always the most likely token")
     p.add_argument("-s", "--seed", type=int, default=1608560892, help="sampling seed")
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
@@ -125,6 +133,12 @@ def main(argv: list[str] | None = None) -> None:
         text = prompt_text(args)
         model = open_model(args.model, **{k: v for k, v in options.items() if v})
         ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image)
+        sampling = model.sampling(think=args.think)
+        given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
+                 "repeat_last_n": args.repeat_last_n, "presence_penalty": args.presence_penalty,
+                 "frequency_penalty": args.frequency_penalty}
+        sampling = dataclasses.replace(sampling, **{k: v for k, v in given.items() if v is not None},
+                                       greedy=sampling.greedy or args.greedy)
     except (OSError, ValueError, NotImplementedError) as e:
         sys.exit(f"artlite-cli: {e}")
     if model.vision is not None and args.image:
@@ -141,17 +155,13 @@ def main(argv: list[str] | None = None) -> None:
     npu.prepare(len(ids))
     sys.stderr.write(f"{name} ({model.name}): {len(ids)} prompt tokens; loaded in {time.perf_counter() - t0:.1f} s: "
                      f"{npu.describe()}\n")
-    sampling = model.sampling(think=args.think)
-    given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p}
-    sampling = dataclasses.replace(sampling, **{k: v for k, v in given.items() if v is not None},
-                                   greedy=sampling.greedy or args.greedy)
     out = StreamDecoder(model.tokenizer)
     t0 = time.perf_counter()
     logits = npu.forward(ids)
     t1 = time.perf_counter()
     npu_s, host_s, passes = npu.t_npu, npu.t_host, npu.dispatches
     n = 0
-    for token in npu.generate(logits, args.n_predict, sampling):
+    for token in npu.generate(logits, args.n_predict, sampling, ids):
         n += 1
         if token not in model.eos_token_ids:
             print(out.feed(token), end="", flush=True)

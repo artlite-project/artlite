@@ -4,8 +4,8 @@ Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and MiniCPM-V 4.7 1
 through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (llama.cpp architecture `qwen35`: Gated
 DeltaNet layers with a full-attention layer every fourth). The architecture, tokenizer and chat template are read from the file's metadata.
 Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
-the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100;
-Artlite has no repetition penalty).
+the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100,
+repetition penalty 1.03).
 
 ## Model files
 

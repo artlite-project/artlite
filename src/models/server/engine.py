@@ -375,7 +375,7 @@ class Engine:
                     job.emit("delta", {"parts": parts, "timings": times(time.perf_counter())})
 
             finish = "length"
-            for token in npu.generate(logits, job.max_tokens, job.sampling):
+            for token in npu.generate(logits, job.max_tokens, job.sampling, ids):
                 gen.append(token)
                 job.n_gen = len(gen)
                 if token in model.eos_token_ids:
