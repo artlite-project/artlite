@@ -72,8 +72,8 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | Llama 3.1 8B Instruct | Q4_K_M | [lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | `f2be3e1a239c` | 2026-10-15 |
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
-| Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-17 |
-| MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-19 |
+| Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-21 |
+| MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
 runs, with the toolchain pinned then:
@@ -81,7 +81,7 @@ runs, with the toolchain pinned then:
 | recorded | mlir-aie | llvm-aie (Peano) |
 |---|---|---|
 | 2026-10-15 | 1.4.5.dev30+g766aca4 | 22.0.0.2026101201+83ba9ea9 |
-| 2026-10-17, 2026-10-19 | 1.4.5.dev48+gcb6f2d1 | 22.0.0.2026101601+4f5df13d |
+| 2026-10-21 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 
 ## FastFlowLM and OpenFlowLM
 
