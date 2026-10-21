@@ -88,6 +88,19 @@ def half_walk(n: int = 1) -> TensorAccessPattern:
     return stream_walk(n * SLOT // 4, [(n, SLOT // 4), (ND // 2, 36), (2, SLOT // 8), (36, 1)])
 
 
+def two_streams(cfg: QwenConfig, T: int) -> bool:
+    """Whether the prefill attention of a T-token chunk takes each KV head's cache on two streams (one q head per
+    column, two row panels per core): its prep then writes QS pass-major (``AttnPrepOperator`` ``passes``)."""
+    return cfg.num_attention_heads == COLS and COLS // cfg.num_key_value_heads >= 2 and T % 64 == 0
+
+
+def part_walk() -> TensorAccessPattern:
+    """A memtile's walk of one shim channel's part of a stream object: d-blocks 8 i .. 8 i + 7 of its 4 pieces (a K
+    object's records' hi and lo panels, a V object's 4 records, two slots' halves' values: [piece 4][d-block 8][36]) ->
+    [d-block][piece][36]; the two parts make the object [d-block 16][piece 4][36]."""
+    return stream_walk(SLOT // 4, [(ND // 4, 36), (4, SLOT // 16), (36, 1)])
+
+
 def cs_rows(cfg: QwenConfig, positions: np.ndarray | range) -> np.ndarray:
     """(n, 64) fp32: per position (text, or M-RoPE (T, H, W)) [cos 32 | sin 32] of the rotated pairs
     (``QwenConfig.rope_theta``)."""
@@ -262,7 +275,8 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
 class AttnPrepOperator(ArtcOperator):
     """The attention prep of a chunk (module docstring). Runtime sequence: G (attn_in's output, ``layout``), CS (the
     cos / sin table of ``cs_positions`` rows, as bf16 pairs), NRM (q_norm | k_norm fp32), QS (per column, token group
-    and head a ``SLOT``; ``qs_T``: the tokens of a column's part, default T: a sub-chunk's part of a longer chunk's QS),
+    and head a ``SLOT``; ``qs_T``: the tokens of a column's part, default T: a sub-chunk's part of a longer chunk's QS;
+    ``passes``: [64-token pass][column][token group 8] instead, a sub-chunk's part contiguous: ``two_streams``),
     KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
     of the first token (default p0), ``QA_KV`` = GROUP / 2 * p0 / 32 (``params``)."""
 
@@ -270,7 +284,7 @@ class AttnPrepOperator(ArtcOperator):
     pfx = kernel_prefix("qap")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int,
-                 qs_T: int = 0):
+                 qs_T: int = 0, passes: bool = False):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0 and T // 8 <= 64, "whole cache groups; a BD repeats at most 64 times"
@@ -282,6 +296,8 @@ class AttnPrepOperator(ArtcOperator):
         self.head_bytes, self.cs_positions = head_bytes, cs_positions
         self.qs_T = qs_T or T
         assert self.qs_T >= T and self.qs_T % 8 == 0
+        self.passes = passes
+        assert not passes or (self.qc == 1 and T % 64 == 0)
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
@@ -314,7 +330,7 @@ class AttnPrepOperator(ArtcOperator):
     def n_qs(self) -> int:
         """bf16 of the QS argument: the columns' parts ``qs_T`` tokens apart, T tokens of the last."""
         g = 2 * self.qc * SLOT // 2  # (a token group's)
-        return ((COLS - 1) * self.qs_T // 8 + self.T // 8) * g
+        return COLS * self.T // 8 * g if self.passes else ((COLS - 1) * self.qs_T // 8 + self.T // 8) * g
 
     def params(self, p0: int, cs_row: int | None = None) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 whose tokens' cos / sin start at table row ``cs_row``
@@ -409,8 +425,10 @@ class AttnPrepOperator(ArtcOperator):
                 bh[c].fill(NRM, TensorAccessPattern((2 * HD * 2,), 0, [1, 1, 1, 2 * HD * 2], [0, 0, 0, 1]), group=tg)
                 bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 128], [0, 0, 0, 1]), offset_parameter=p_cs,
                            group=tg)
-                oh[c].drain(QS, TensorAccessPattern((n_qs,), c * qs_col, [1, 1, 1, n_tg * qc * SLOT], [0, 0, 0, 1]),
-                            group=tg, wait=True)
+                qs_tap = (TensorAccessPattern((n_qs,), c * 8 * SLOT, [1, n_tg // 8, 64, 576], [0, COLS * 8 * SLOT, 576, 1])
+                          if self.passes else
+                          TensorAccessPattern((n_qs,), c * qs_col, [1, 1, 1, n_tg * qc * SLOT], [0, 0, 0, 1]))
+                oh[c].drain(QS, qs_tap, group=tg, wait=True)
                 if c not in jobs:
                     continue
                 kind, h = jobs[c]
@@ -583,7 +601,52 @@ void {{ p }}_init(float *__restrict ws)
     al::zero<{{ R * 64 }}, 64>(AW(float, {{ w.l }}));
 }
 
-// Scores of K record k (8 positions; per d-block its hi and lo panels: the memtile interleaves the record's halves{{ "; the two streams' objects one after the other" if TWO }})
+{% if TWO %}
+// Scores of K object k2 (records 2 k2, 2 k2 + 1; per d-block their hi and lo panels: [d-block 32][record 2][hi | lo],
+// the memtile interleaves the object's records, the two streams' objects one after the other) for both row panels
+// (q: [d-block 32][panel 2][hi | lo]): per panel and record b + Q hi K hi + Q lo K hi + Q hi K lo, one MMUL chain each;
+// every K panel popped once for both row panels, every Q panel once for both records (12 MMULs per d-block: their bound)
+void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, float *__restrict ws, int32_t k2)
+{
+{% if "qk" in ablate %}
+    return;
+{% endif %}
+{% if "ev_qk" in ablate %}
+    event0();
+{% endif %}
+    float *__restrict sc = AW(float, {{ w.sc }}) + 128 * k2;
+    const float *__restrict pb = AW(float, {{ w.b }});
+    const aie::accum<accfloat, 64> b0(aie::load_v<64>(pb)), b1(aie::load_v<64>(pb + 64));
+    al::MM8 a00(b0), a01(b0), a10(b1), a11(b1);  // (row panel, record)
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+    al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)kr);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND }}; db++) {
+        const al::BV K0h = ks.pop(), K0l = ks.pop(), K1h = ks.pop(), K1l = ks.pop();
+        const al::BV q0h = qs.pop(), q0l = qs.pop(), q1h = qs.pop(), q1l = qs.pop();
+        a00.mac(q0h, aie::op_transpose(K0h));
+        a01.mac(q0h, aie::op_transpose(K1h));
+        a10.mac(q1h, aie::op_transpose(K0h));
+        a11.mac(q1h, aie::op_transpose(K1h));
+        a00.mac(q0l, aie::op_transpose(K0h));
+        a01.mac(q0l, aie::op_transpose(K1h));
+        a10.mac(q1l, aie::op_transpose(K0h));
+        a11.mac(q1l, aie::op_transpose(K1h));
+        a00.mac(q0h, aie::op_transpose(K0l));
+        a01.mac(q0h, aie::op_transpose(K1l));
+        a10.mac(q1h, aie::op_transpose(K0l));
+        a11.mac(q1h, aie::op_transpose(K1l));
+    }
+    aie::store_v(sc, a00.template to_vector<float>());
+    aie::store_v(sc + 64, a01.template to_vector<float>());
+    aie::store_v(sc + 256, a10.template to_vector<float>());
+    aie::store_v(sc + 320, a11.template to_vector<float>());
+{% if "ev_qk" in ablate %}
+    event1();
+{% endif %}
+}
+{% else %}
+// Scores of K record k (8 positions; per d-block its hi and lo panels: the memtile interleaves the record's halves)
 // for each row panel: b + Q hi K hi + Q lo K hi + Q hi K lo (q: per panel per d-block the Q panels hi, lo), one loop
 // of two panel streams and three MMUL chains
 void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, float *__restrict ws, int32_t k)
@@ -614,6 +677,8 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, flo
     event1();
 {% endif %}
 }
+
+{% endif %}
 
 // The group's softmax terms, diag groups before the pass's last: per row panel (its token group t = QG r + i % QG of
 // the pass, in the pass's group t / 4) on its diagonal group keys after the query masked (record k vs record t % 4),
@@ -647,8 +712,58 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int3
 {% endif %}
 }
 
+{% if TWO %}
+// o += P V of the group's 4 V records for both row panels (v: [d-block 32][record 4], the memtile interleaves the
+// object's records, the two streams' objects one after the other): every V panel popped once for both panels; o in
+// place (ol, os the same panels as distinct restrict parameters, each read before it is written)
+[[clang::always_inline]] inline void {{ p }}_pv2(const uint8_t *__restrict v, const uint8_t *__restrict pp,
+                                                 const float *__restrict ol_, float *__restrict os_)
+{
+    al::BIn<> p0((const bfp16ebs8 *)pp), p1((const bfp16ebs8 *)(pp + 1024));
+    const al::BV P0 = p0.pop(), P1 = p0.pop(), P2 = p0.pop(), P3 = p0.pop();
+    const al::BV Q0 = p1.pop(), Q1 = p1.pop(), Q2 = p1.pop(), Q3 = p1.pop();
+    al::BInR<aie_dm_resource::a> sv((const bfp16ebs8 *)v);
+    const float __aie_dm_resource_c *__restrict o0 = (const float __aie_dm_resource_c *)ol_;
+    const float __aie_dm_resource_c *__restrict o1 = (const float __aie_dm_resource_c *)(ol_ + 2048);
+    float __aie_dm_resource_d *__restrict s0 = (float __aie_dm_resource_d *)os_;
+    float __aie_dm_resource_d *__restrict s1 = (float __aie_dm_resource_d *)(os_ + 2048);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND }}; db++) {
+        al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(o0))), d(aie::accum<accfloat, 64>(aie::load_v<64>(o1)));
+        const al::BV V0 = sv.pop(), V1 = sv.pop(), V2 = sv.pop(), V3 = sv.pop();
+        c.mac(P0, aie::op_transpose(V0));
+        d.mac(Q0, aie::op_transpose(V0));
+        c.mac(P1, aie::op_transpose(V1));
+        d.mac(Q1, aie::op_transpose(V1));
+        c.mac(P2, aie::op_transpose(V2));
+        d.mac(Q2, aie::op_transpose(V2));
+        c.mac(P3, aie::op_transpose(V3));
+        d.mac(Q3, aie::op_transpose(V3));
+        aie::store_v(s0, c.template to_vector<float>());
+        aie::store_v(s1, d.template to_vector<float>());
+        o0 += 64;
+        o1 += 64;
+        s0 += 64;
+        s1 += 64;
+    }
+}
+
+void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws)
+{
+{% if "pv" in ablate %}
+    return;
+{% endif %}
+{% if "ev_pv" in ablate %}
+    event0();
+{% endif %}
+    {{ p }}_pv2((const uint8_t *)v, AW(uint8_t, {{ w.sc }}), AW(float, {{ w.o }}), AW(float, {{ w.o }}));
+{% if "ev_pv" in ablate %}
+    event1();
+{% endif %}
+}
+{% else %}
 // o += P V of two of the group's V records (v: records 2 half, 2 half + 1, a panel per d-block of blocks over the
-// positions{{ "; the two streams' objects one after the other" if TWO }}){{ "; o -> ob, then ob -> o: loads and stores in different regions" if OB }}
+// positions){{ "; o -> ob, then ob -> o: loads and stores in different regions" if OB }}
 void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half)
 {
 {% if "pv" in ablate %}
@@ -676,18 +791,16 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half
 {% endif %}
 }
 
+{% endif %}
+
 {% if TWO %}
-// A pass's slot i of the KV head's cores (its halves a, b, one per stream: [d-block 16][72] each): the core's own (me ..
-// me + R - 1) into q (its R slots: Q panels at the pass's start, then sigmoid(gate) at its end)
-void {{ p }}_qsel(const bfloat16 *__restrict a, const bfloat16 *__restrict b, bfloat16 *__restrict q, int32_t i,
-                  int32_t me)
+// A pass's slot pair i of the KV head's cores (slots 2 i, 2 i + 1, d-blocks 0 .. 15 in a, the rest in b's object after
+// it: [d-block 32][slot 2][72 x 2]): the core's own (pair me) into q (Q panels at the pass's start, then
+// sigmoid(gate) at its end)
+void {{ p }}_qsel(const bfloat16 *__restrict a, bfloat16 *__restrict q, int32_t i, int32_t me)
 {
-    const unsigned k = (unsigned)(i - me);
-    if (k >= {{ R }}u)
-        return;
-    bfloat16 *__restrict d = q + {{ SLOT // 2 }} * k;
-    al::copy<{{ SLOT // 4 }}, 32>(d, a);
-    al::copy<{{ SLOT // 4 }}, 32>(d + {{ SLOT // 4 }}, b);
+    if (i == me)
+        al::copy<{{ SLOT }}, 32>(q, a);
 }
 
 {% endif %}
@@ -700,14 +813,18 @@ void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h,
     const aie::vector<float, 8> ls = al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * h));
     const aie::vector<float, 16> inv = aie::inv(aie::concat(ls, aie::broadcast<float, 8>(1.0f)));
     const aie::vector<float, 64> iv = al::bcast8(inv.template extract<8>(0));
+{% if TWO %}
+    const bfloat16 *__restrict g = sg + 72 * h;  // (per d-block and panel [query 8][8] and 8 zeros)
+{% else %}
     const bfloat16 *__restrict g = sg + {{ SLOT // 2 }} * h;  // (per d-block [query 8][8] and 8 zeros)
+{% endif %}
     const float *__restrict o = AW(float, {{ w.o }}) + 2048 * h;
     al::BOut<> po((bfp16ebs8 *)out);
     for (int db = 0; db < {{ ND }}; db++) {
         aie::vector<bfloat16, 64> gv;
         AIE_LOOP_UNROLL_FULL
         for (int q = 0; q < 8; q++)
-            gv.insert(q, aie::load_v<8>(g + 72 * db + 8 * q));
+            gv.insert(q, aie::load_v<8>(g + {{ 144 if TWO else 72 }} * db + 8 * q));
         const aie::vector<float, 64> y = al::mulff<64>(aie::load_v<64>(o + 64 * db), iv);
         po.push(al::mulc<64>(y, gv).template to_vector<bfp16ebs8>());
     }
@@ -745,8 +862,8 @@ class PrefillAttnOperator(ArtcOperator):
         self.H = cfg.num_attention_heads
         # (one q head per column: each KV head's cache on two streams, half of every object each, so a core takes it on
         # both input channels; its Q and gates ride ahead and behind on them; more q heads: one stream, Q apart)
-        self.two = self.qc == 1 and self.nph >= 2
-        self.ob = self.R <= 2  # (o's second copy fits: regions 2 and 3)
+        self.two = two_streams(cfg, T)
+        self.ob = self.R <= 2 and not self.two  # (o's second copy fits: regions 2 and 3)
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
@@ -880,35 +997,41 @@ class PrefillAttnOperator(ArtcOperator):
         return module
 
     def _two_artifact(self) -> Module:
-        """One q head per column: stream s of KV head h carries d-blocks 16 s .. 16 s + 15 of every cache object (a K
-        record's hi and lo panels, a V object's two records) from its own shim through its own memtile (the column
-        NPH h + 2 s: re-laid per d-block, ``half_walk``), broadcast to the head's 4 NPH cores, which take the two on
-        their two input channels: with one stream the shim channel and each core's input bound the history's
-        re-streams (the 1B at 16K: 24.5 GB/s for its 2 KV heads). Per pass each stream carries first the halves of the
-        pass's Q slots of the head's cores ([column NPH][token group 4 QG], from QS), then the history and the chunk's
-        groups before the pass's, then the halves of their sigmoid(gate) slots: each core copies its own (``qsel``)."""
+        """One q head per column, two row panels per core (``two_streams``): stream s of KV head h carries d-blocks
+        16 s .. 16 s + 15 of every cache object (a K object's two records, hi and lo panels; a V object's four records)
+        from two shims (columns NPH h + 2 s and the next: d-blocks 8 i .. of each from part i) through its memtile
+        (column NPH h + 2 s: re-laid per d-block, ``part_walk``), broadcast to the head's 4 NPH cores, which take the
+        two on their two input channels: with one stream the shim channel and each core's input bound the history's
+        re-streams (the 1B at 16K: 24.5 GB/s for its 2 KV heads), with one shim channel per stream ~40 GB/s for the 4.
+        Per pass each stream carries first the halves of the pass's Q slots of the head's cores ([column NPH][token
+        group 8], from the pass-major QS), two slots an object, then the history and the chunk's groups before the
+        pass's, then the halves of their sigmoid(gate) slots: each core copies its own pair (``qsel``)."""
         p, T, H, qg, R = self.pfx, self.T, self.H, self.qg, self.R
         bf = np.dtype[bfloat16]
         q_ty = np.ndarray[(R * SLOT // 2,), bf]
-        h_ty = np.ndarray[(SLOT // 4,), bf]  # (half a K record, a V object's half, half a slot)
+        h_ty = np.ndarray[(SLOT // 2,), bf]  # (half a K or V object, the halves of two slots)
         o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
         om_ty = np.ndarray[(4 * ND * 36,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
         pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
-        k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, h_ty, q_ty, np.int32, np.int32])
+        k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, h_ty, ws_ty, np.int32])
         k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
-        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty, np.int32])
+        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
         n_q = nph * 4 * qg  # (a pass's slots of a KV head's cores)
 
         streams = {(h, s): nph * h + 2 * s for h in range(n_kvh) for s in range(2)}
-        kv3 = {hs: ObjectFifo(h_ty, name=f"pa_ks{hs[0]}_{hs[1]}", depth=2) for hs in streams}
-        kv = {hs: kv3[hs].cons().forward(tile=Tile(c, 1), depth=2, name=f"pa_k{'ab'[hs[1]]}{hs[0]}",
-                                         to_stream=half_walk()) for hs, c in streams.items()}
+        # (each stream from the shims of columns NPH h + 2 s and the next, d-blocks 8 i .. of every piece from part i,
+        # joined by its memtile: one shim channel each paced the history's re-streams)
+        kv = {hs: ObjectFifo(h_ty, name=f"pa_k{'ab'[hs[1]]}{hs[0]}", depth=2, to_stream=part_walk()) for hs in streams}
+        kv3 = {hs: kv[hs].prod().join([0, SLOT // 4], tile=Tile(c, 1), depths=[2, 2],
+                                      obj_types=[np.ndarray[(SLOT // 4,), bf]] * 2,
+                                      names=[f"pa_ks{hs[0]}_{hs[1]}_{i}" for i in range(2)])
+               for hs, c in streams.items()}
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
@@ -916,33 +1039,32 @@ class PrefillAttnOperator(ArtcOperator):
         def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me):
             for _ in forever_():
                 for b in range_(n_pass):
-                    for i in range_(n_q):
+                    for i in range_(n_q // 2):
                         a = a_h.acquire(1)
-                        bb = b_h.acquire(1)
-                        qsel(a, bb, qb, i, me)
+                        b_h.acquire(1)  # (b's object follows a's: l1_layout)
+                        qsel(a, qb, i, me)
                         a_h.release(1)
                         b_h.release(1)
                     init(ws)
                     # read after this dispatch's first object: the host wrote it before the fills
                     n = n_p.read() + b * qg + (qg - 1)
                     for g in range32(n):
-                        for k in range(4):
+                        for k in range(2):
                             ka = a_h.acquire(1)
-                            b_h.acquire(1)  # (b's object follows a's: l1_layout)
+                            b_h.acquire(1)
                             qk(qb, ka, ws, k)
                             a_h.release(1)
                             b_h.release(1)
                         soft(ws, pw, n - 1 - g, row, g)
-                        for half in range(2):
-                            va = a_h.acquire(1)
-                            b_h.acquire(1)
-                            pv(va, ws, half)
-                            a_h.release(1)
-                            b_h.release(1)
-                    for i in range_(n_q):  # (the gates into the Q slots' buffer)
+                        va = a_h.acquire(1)
+                        b_h.acquire(1)
+                        pv(va, ws)
+                        a_h.release(1)
+                        b_h.release(1)
+                    for i in range_(n_q // 2):  # (the gates into the Q slots' buffer)
                         a = a_h.acquire(1)
-                        bb = b_h.acquire(1)
-                        qsel(a, bb, qb, i, me)
+                        b_h.acquire(1)
+                        qsel(a, qb, i, me)
                         a_h.release(1)
                         b_h.release(1)
                     for h in range(R):
@@ -957,13 +1079,12 @@ class PrefillAttnOperator(ArtcOperator):
                 workers.append(Worker(core, [kv[h, 0].cons(), kv[h, 1].cons(), o1[c][r].prod(), k_init, k_qsel, k_qk,
                                              k_soft, k_pv, k_fin, Buffer(ws_ty, name=f"pa_ws{c}_{r}"),
                                              Buffer(pw_ty, name=f"pa_pw{c}_{r}"),
-                                             Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph) * 4 * qg + qg * r],
+                                             Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph) * 4 + r],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
         n_qs = COLS * T // 8 * 2 * SLOT // 2
         n_kv, n_a = n_kvh * self.head_bytes // 2, T * H * HD * 9 // 16
         hb, sl, half = self.head_bytes // 2, SLOT // 2, SLOT // 4
-        qs_col = T // 8 * 2 * sl  # (bf16 of a column's part of QS: per token group [Q slot | gate slot])
 
         def seq(QS, KV, A, kvh, oh):
             sync_parameters()
@@ -981,18 +1102,20 @@ class PrefillAttnOperator(ArtcOperator):
             for b in range(n_pass):
                 tp = TaskGroup()
                 more = qg * b + qg - 1  # (the chunk's groups after its first through the pass's)
-                for (h, s), f in zip(streams, kvh, strict=True):
-                    q0 = nph * h * qs_col + 4 * qg * b * 2 * sl + s * half  # (the pass's token groups of the head's columns)
-                    parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, [1, nph, 4 * qg, half], [0, qs_col, 2 * sl, 1])),
-                             ChainPart(KV, TensorAccessPattern((n_kv,), h * hb + s * SLOT // 8, [1, 3, 4, SLOT // 8],
-                                                               [0, 4640, SLOT // 4, 1]), length_parameter=p_n)]
+                for ((h, s), i), f in zip(((hs, i) for hs in streams for i in range(2)), kvh, strict=True):
+                    # (part i: d-blocks 16 s + 8 i .. of every piece; QS pass-major: the pass's slots of the head's
+                    # columns [column NPH][token group 8] one after the other, a slot [Q | sigmoid(gate)])
+                    q0 = (b * COLS + nph * h) * 8 * SLOT + s * half + i * SLOT // 16
+                    k0, run = h * hb + s * SLOT // 8 + i * SLOT // 16, SLOT // 16
+                    q_dims, q_str = [1, nph * 8, 2, run], [0, SLOT, SLOT // 8, 1]
+                    parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str)),
+                             ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, run], [0, 4640, SLOT // 4, 1]),
+                                       length_parameter=p_n)]
                     if more:
-                        parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), h * hb + s * SLOT // 8,
-                                                                       [1, 3 * more, 4, SLOT // 8],
+                        parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3 * more, 4, run],
                                                                        [0, 4640, SLOT // 4, 1]),
                                                offset_parameter=p_off))
-                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + sl, [1, nph, 4 * qg, half],
-                                                                   [0, qs_col, 2 * sl, 1])))
+                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) > 1:
@@ -1002,7 +1125,7 @@ class PrefillAttnOperator(ArtcOperator):
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
-                           [kv3[hs].prod(tile=Tile(c, 0)) for hs, c in streams.items()],
+                           [kv3[hs][i].prod(tile=Tile(c + i, 0)) for hs, c in streams.items() for i in range(2)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()
@@ -1014,14 +1137,17 @@ class PrefillAttnOperator(ArtcOperator):
         """Core byte addresses by 16 KB region (aiecc puts the stack at 0): 0 the K / V records, an output buffer and the
         softmax's scratch, 1 the Q panels held through a pass, the other output buffer (and with o's second copy the
         scores, m, l), 2 and 3 o (its two copies, else the workspace): QK streams Q (1) against K (0), PV V (0) from one
-        o copy into the other. The 1B and 9B: all 64 KB, the 27B 61."""
+        o copy into the other (two streams: their objects in regions 0 and 1). The 9B: all 64 KB, the 27B 61."""
         kv, o, q, w = AT.REC_K, ND * 72, self.R * SLOT, self.workspace()
         pw = self.STACK + 2 * kv + o
-        if self.two:  # (the two streams' half objects in region 0, object i of b after object i of a: the kernels read
-            # both from a's pointer; the Q slots, then the gates, in region 1)
-            h = kv // 2
-            lay = {"pa_ka": [self.STACK, self.STACK + 2 * h], "pa_kb": [self.STACK + h, self.STACK + 3 * h],
-                   "pa_or": [self.STACK + 4 * h, 0x4000 + q], "pa_qb": [0x4000]}
+        if self.two:  # (the two streams' objects i in region i, b's after a's: the kernels read both from a's pointer; the
+            # Q slots, then the gates, and the scores in region 2, o in 3)
+            lay = {"pa_ka": [self.STACK, 0x4000], "pa_kb": [self.STACK + kv, 0x4000 + kv],
+                   "pa_or": [self.STACK + 2 * kv, 0x4000 + 2 * kv], "pa_qb": [0x8000], "pa_pw": [pw],
+                   "pa_ws": [0x10000 - w["size"]]}
+            assert pw + PW <= 0x4000 and 0x4000 + 2 * kv + o <= 0x8000 and 0x8000 + q <= 0x10000 - w["size"]
+            assert 0x10000 - w["size"] + w["o"] == 0xC000
+            return lay
         else:
             lay = {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, 0x4000 + q], "pa_qr": [0x4000]}
         ws = 0x8000 - w["o"] if self.ob else 0x8000
