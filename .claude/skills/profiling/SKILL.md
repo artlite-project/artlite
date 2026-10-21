@@ -21,7 +21,8 @@ Kernels emit pulses on core events `INSTR_EVENT_0` (0x21=33) / `INSTR_EVENT_1` (
 into the runtime sequence that program each core tile's 4 performance counters (AM029 `Performance_Control0/1` at
 0x31500/0x31504, values at 0x31520..0x3152C). After every sampled dispatch the C++ runtime
 (`artlite._native.Profiler`) reads the counters through the context-scoped `AMDXDNA_AIE_TILE_READ` ioctl (no root
-needed; xdna-driver's module only: Linux's own driver raises NotImplementedError) and appends Chromium "C" counter
+needed; xdna-driver's module only: Linux's own driver and the XRT backend raise NotImplementedError; traces work on
+all) and appends Chromium "C" counter
 events to `$ARTLITE_PROFILE_DIR/<OpClass>_<key>_counters.json`.
 
 Values are **per-dispatch deltas** of cumulative counters: e.g. the sum of all `event0→event1` window cycles since

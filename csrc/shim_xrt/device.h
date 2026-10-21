@@ -18,7 +18,7 @@ class device;
 
 namespace shim_xdna {
 
-// NPU clocks in MHz (XRT does not report them).
+// NPU clocks in MHz (XRT does not report them: 0).
 struct clocks {
   uint32_t mp_npu_mhz;
   uint32_t h_mhz;
@@ -38,8 +38,8 @@ struct device {
   std::unique_ptr<bo> alloc_bo(size_t size, uint32_t flags);
   std::unique_ptr<bo> alloc_user_bo(size_t size);
 
-  // xclbin: the bytes of the program's .xclbin file.
-  std::unique_ptr<hw_ctx> create_hw_context(std::span<const uint8_t> xclbin, std::string_view kernel_name);
+  // A context configured by a PDI (opened from an xclbin of it: pdi_xclbin).
+  std::unique_ptr<hw_ctx> create_hw_context(std::span<const uint8_t> pdi, std::string_view kernel_name);
 
   clocks query_clocks() const;
   uint64_t busy_ns() const;

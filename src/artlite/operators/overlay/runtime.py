@@ -18,14 +18,13 @@ from __future__ import annotations
 import collections
 import functools
 import os
-import sys
 import threading
 import time
 from typing import ClassVar, Protocol
 
 import numpy as np
 
-from ... import parallel_compile, txn
+from ... import backend, parallel_compile, txn
 from ..._native import Buffer, Device, DispatchError
 
 # buffers from this size on are user-memory BOs: 2 MB pages faulted in by several threads (a SHMEM BO's pages are
@@ -230,7 +229,7 @@ class OverlayDevice:
         prog._ensure_loaded()
         op.check_endpoints(np.fromfile(prog.insts_path, np.uint32))
         self.device, self._prog = prog._device, prog
-        if sys.platform == "win32":  # (XRT gives a buffer its device address only once a hardware context exists)
+        if backend.ADDRESSES_NEED_CONTEXT:
             prog._kernel()
         self._insts = self.device.alloc_insts_buffer(max_instruction_bytes)
         self._loaded = np.zeros(0, np.uint32)  # (the words load() wrote)

@@ -224,10 +224,15 @@ static void retire(artlite::Kernel& self, F&& f) {
 }
 
 // NOLINTBEGIN(bugprone-unused-raii)
-NB_MODULE(_native, m) {
+// The module's name: _native, or _native_<backend> for a second backend of the platform (artlite.backend).
+#define ARTLITE_NB_MODULE(name, m) NB_MODULE(name, m)
+ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
   m.doc() = "Artlite: lightweight NPU runtime";
-#ifdef ARTLITE_XRT_DIR
-  m.attr("XRT_DIR") = ARTLITE_XRT_DIR;  // (Windows: the XRT the module was built against)
+#ifdef ARTLITE_SHIM_XRT
+  m.attr("BACKEND") = "xrt";
+  m.attr("XRT_DIR") = ARTLITE_XRT_DIR;  // (the XRT the module was built against: its tools)
+#else
+  m.attr("BACKEND") = "xdna";
 #endif
 
   // Zero-copy numpy/torch views of Buffer mappings (map()) keep their
@@ -300,7 +305,7 @@ NB_MODULE(_native, m) {
       .def_prop_ro("paddr", [](shim_xdna::bo& self) -> uint64_t { return self.get_paddr(); })
       .def(
           "paddr_in", [](shim_xdna::bo& self, const shim_xdna::hw_ctx& ctx) -> uint64_t { return self.paddr_in(ctx); },
-          "ctx"_a, "The device address in a hardware context (on Windows each context has its own).");
+          "ctx"_a, "The device address in a hardware context (XRT on Windows maps a buffer at its own in each).");
 
   // --- HwContext (wraps shim_xdna::hw_ctx directly) ---
   nb::class_<shim_xdna::hw_ctx>(m, "HwContext")

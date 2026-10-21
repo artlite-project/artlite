@@ -1,7 +1,5 @@
 """Tests for FusedOperator: compile and dispatch multiple ops as one ELF."""
 
-import sys
-
 import numpy as np
 import pytest
 import torch
@@ -12,6 +10,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 import artlite
+from artlite import backend
 from artlite.operators import FusedOperator
 from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
 from artlite.operators.fused import Library
@@ -190,7 +189,7 @@ def test_library_program():
 
     n = 1024
     shift, add = ShiftOperator(n=n), AddOperator(size=n)
-    lib = Library("t_library", [shift, add]).compile().load()  # (on Windows, buffer addresses need a context first)
+    lib = Library("t_library", [shift, add]).compile().load()  # (on XRT, buffer addresses need a context first)
     dev = artlite.Device()
     x = torch.randn(2 * n).bfloat16()
     bx = artlite.from_torch(x.clone(), dev)
@@ -402,7 +401,7 @@ class TestFusedLifecycle:
         ub = dev.alloc_user_buffer(4 << 20)
         f = _add_chain("t_user", buffer_sizes={"w": 2048, "t": 2048},
                        external_buffers={"w": (ub, 1 << 20), "t": (ub, 3 << 20)}).compile().load()
-        assert (sys.platform == "win32" or ub.paddr % (2 << 20) == 0) and not ub.map().any()  # (2 MB pages on Linux)
+        assert (backend.XRT or ub.paddr % (2 << 20) == 0) and not ub.map().any()  # (amdxdna: 2 MB pages)
         torch.manual_seed(7)
         x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
         ub.map()[1 << 20:(1 << 20) + 2048] = w.view(torch.uint8).numpy()

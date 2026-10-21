@@ -1,7 +1,5 @@
 #include "artlite/kernel.h"
 
-#include <sched.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,10 +8,10 @@
 #include <format>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "artlite/error.h"
+#include "artlite/spin.h"
 #include "shim_xdna/bo.h"
 #include "shim_xdna/device.h"
 #include "shim_xdna/ert.h"
@@ -26,9 +24,6 @@ using namespace shim_xdna;
 namespace {
 
 constexpr size_t kCmdBoSize = 4096;
-constexpr int kMaxSpinMs = 20;  // (a dispatch longer than expected: then the blocking wait)
-constexpr int kNapUs = 200;     // (the sleep before the poll in naps: a long one lets the CPU's core drop into a deep
-                                // C-state, and the host work after the dispatch then runs on a cold core, ~10x slower)
 
 uint32_t state_of(const bo& cmd) {
   return std::atomic_ref<uint32_t>(*static_cast<uint32_t*>(cmd.map())).load(std::memory_order_acquire) &
@@ -168,25 +163,6 @@ struct Kernel::Impl {
                        [](const Command& c) { return ert_cmd_state_is_terminal(state_of(*c.cmd)); });
   }
 
-  // Sleep until t0 + after_us on CPU cpu (in naps of kNapUs, ending early when the commands finish: an after_us
-  // from a slow run must not hold the next ones that long, each run's own time feeding the next estimate), then poll
-  // the commands' states there (yielding: the completion's work may need that CPU) until they finish or kMaxSpinMs
-  // pass.
-  void spin(std::chrono::steady_clock::time_point t0, int64_t after_us, int cpu) const {
-    cpu_set_t old, one;
-    if (cpu < 0 || cpu >= CPU_SETSIZE || sched_getaffinity(0, sizeof old, &old) != 0 || !CPU_ISSET(cpu, &old)) return;
-    CPU_ZERO(&one);
-    CPU_SET(cpu, &one);
-    if (sched_setaffinity(0, sizeof one, &one) != 0) return;
-    const auto until = t0 + std::chrono::microseconds(after_us);
-    const auto nap = std::chrono::microseconds(kNapUs);
-    while (std::chrono::steady_clock::now() + nap < until && !done()) std::this_thread::sleep_for(nap);
-    if (!done()) std::this_thread::sleep_until(until);
-    const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(kMaxSpinMs);
-    while (!done() && std::chrono::steady_clock::now() < limit) sched_yield();
-    sched_setaffinity(0, sizeof old, &old);
-  }
-
   // ERT_START_CU payload (transactions):
   //   regmap[0-1]: firmware opcode (uint64, value 3)
   //   regmap[2-3]: instruction buffer BO (device address, 64-bit)
@@ -245,7 +221,7 @@ void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>>
                       int64_t spin_after_us, int spin_cpu) {
   const auto t0 = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
-  if (spin_after_us >= 0) impl_->spin(t0, spin_after_us, spin_cpu);
+  if (spin_after_us >= 0) spin_on_cpu(t0, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 
@@ -268,7 +244,7 @@ void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrappe
 void Kernel::dispatch_wait(uint32_t timeout_ms) { impl_->wait_all(timeout_ms); }
 
 void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu) {
-  if (spin_after_us >= 0) impl_->spin(impl_->t_submit, spin_after_us, spin_cpu);
+  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 

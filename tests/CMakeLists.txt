@@ -54,7 +54,7 @@ add_aie_target(addone "${TEST_DATA_DIR}/addone.mlir" EXTRA_DEPS addone_mlir)
 # --- C++ test binaries ---
 
 add_executable(artlite_tests npu_test.cpp)
-target_link_libraries(artlite_tests PRIVATE artlite GTest::gtest GTest::gtest_main)
+target_link_libraries(artlite_tests PRIVATE artlite_xdna GTest::gtest GTest::gtest_main)
 target_compile_definitions(artlite_tests PRIVATE
   TEST_DATA_DIR="${TEST_DATA_DIR}"
 )

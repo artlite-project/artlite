@@ -1,8 +1,8 @@
 #pragma once
 
-// The NPU shim of this platform: the amdxdna driver's ioctls on Linux, XRT on Windows. Both define
-// shim_xdna::{device, bo, hw_ctx}.
-#ifdef _WIN32
+// The NPU shim of this build's backend (ARTLITE_SHIM_XRT): the amdxdna driver's ioctls (Linux) or XRT's API (Windows;
+// Linux where XRT is installed). Both define shim_xdna::{device, bo, hw_ctx}.
+#ifdef ARTLITE_SHIM_XRT
 #include "shim_xrt/bo.h"
 #include "shim_xrt/device.h"
 #include "shim_xrt/hwctx.h"

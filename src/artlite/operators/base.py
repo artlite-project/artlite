@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import glob
 import hashlib
 import os
@@ -9,7 +8,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import version
@@ -19,7 +18,7 @@ from typing import TYPE_CHECKING, NamedTuple, Self
 import torch
 from jinja2 import Environment, StrictUndefined
 
-from .. import profiling
+from .. import backend, portable, profiling
 from .kernel_source import KernelSource, translation_unit
 
 if TYPE_CHECKING:
@@ -44,8 +43,8 @@ MLIR_AIE_INCLUDE = os.path.join(MLIR_AIE_DIR, "include")
 
 
 def peano_tool(name: str) -> str:
-    """A Peano binary's path (``.exe`` on Windows)."""
-    return os.path.join(PEANO_DIR, "bin", name + (".exe" if sys.platform == "win32" else ""))
+    """A Peano binary's path."""
+    return os.path.join(PEANO_DIR, "bin", name + portable.EXE)
 
 
 CLANGPP = peano_tool("clang++")
@@ -80,88 +79,13 @@ AIE_TARGET = "aie2p-none-unknown-elf"
 # 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
 CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false",)
 
-# What configures the NPU for a program: its PDI (the amdxdna driver loads it directly), on Windows an xclbin that
-# wraps it (XRT loads nothing else: ``pdi_xclbin``).
-PROGRAM_IMAGE = "main.xclbin" if sys.platform == "win32" else "main.pdi"
-XCLBIN_KERNEL = "MLIR_AIE"
 
-
-def _xrt_tool(name: str) -> str | None:
-    """An XRT command-line tool (PATH, then the directory of the XRT the native module was built against)."""
-    from .. import _native
-
-    found = shutil.which(name)
-    if not found and (root := getattr(_native, "XRT_DIR", None)):
-        found = shutil.which(name, path=root)
-    return found
-
-
-def _xclbinutil() -> str:
-    """The xclbinutil that packs the xclbin."""
-    found = _xrt_tool("xclbinutil")
-    if not found:
-        sys.exit("ERROR: xclbinutil not found: put XRT's directory on PATH")
-    return found
-
-
-def _tool_env() -> dict[str, str]:
-    """The environment of the build tools. aiecc packs a full ELF with aiebu-asm, which the Windows wheels lack: XRT's
-    directory joins PATH."""
-    env = dict(os.environ)
-    if sys.platform == "win32" and not shutil.which("aiebu-asm") and (tool := _xrt_tool("aiebu-asm")):
-        env["PATH"] = os.path.dirname(tool) + os.pathsep + env["PATH"]
-    return env
-
-
-def _image_options() -> list[str]:
-    """The aiecc options that write PROGRAM_IMAGE."""
-    if sys.platform != "win32":
-        return ["--get-pdi", "--pdi-name=main.pdi"]
-    return ["--get-xclbin", f"--xclbin-name={PROGRAM_IMAGE}", f"--xclbin-kernel-name={XCLBIN_KERNEL}",
-            f"--xclbinutil-path={_xclbinutil()}"]
-
-
-# The sections of aiecc's xclbins besides the PDI: the memory banks, the kernel (opcode, control code, its length in
-# words, five buffers) and the partition (all columns).
-_XCLBIN_MEM = {"mem_topology": {"m_count": "2", "m_mem_data": [
-    {"m_type": "MEM_DRAM", "m_used": "1", "m_sizeKB": "0x10000", "m_tag": "HOST", "m_base_address": "0x4000000"},
-    {"m_type": "MEM_DRAM", "m_used": "1", "m_sizeKB": "0xc000", "m_tag": "SRAM", "m_base_address": "0x4000000"}]}}
-_XCLBIN_KERNELS = {"ps-kernels": {"kernels": [{
-    "name": XCLBIN_KERNEL, "type": "dpu", "extended-data": {"subtype": "DPU", "functional": "0", "dpu_kernel_id": "0x901"},
-    "arguments": [
-        {"name": "opcode", "address-qualifier": "SCALAR", "type": "uint64_t", "offset": "0x00"},
-        {"name": "instr", "memory-connection": "SRAM", "address-qualifier": "GLOBAL", "type": "char *", "offset": "0x08"},
-        {"name": "ninstr", "address-qualifier": "SCALAR", "type": "uint32_t", "offset": "0x10"},
-        *({"name": f"bo{i}", "memory-connection": "HOST", "address-qualifier": "GLOBAL", "type": "void*",
-           "offset": f"0x{0x14 + 8 * i:X}"} for i in range(5))],
-    "instances": [{"name": "MLIRAIE"}]}]}}
-
-
-def pdi_xclbin(pdi: bytes, path: str) -> None:
-    """Write ``path``: an xclbin of ``pdi`` in aiecc's form (kernel XCLBIN_KERNEL), what opens a hardware context on
-    Windows."""
-    import json
-    import uuid
-
-    with tempfile.TemporaryDirectory() as tmp:
-        files = {name: os.path.join(tmp, name) for name in ("main.pdi", "mem.json", "kernels.json", "part.json")}
-        with open(files["main.pdi"], "wb") as f:
-            f.write(pdi)
-        part = {"aie_partition": {
-            "name": "QoS", "operations_per_cycle": "2048", "inference_fingerprint": "23423",
-            "pre_post_fingerprint": "12345", "partition": {"column_width": 8, "start_columns": [0]},
-            "PDIs": [{"uuid": str(uuid.UUID(bytes=hashlib.sha256(pdi).digest()[:16], version=4)),
-                      "file_name": files["main.pdi"],
-                      "cdo_groups": [{"name": "DPU", "type": "PRIMARY", "pdi_id": "0x01", "dpu_kernel_ids": ["0x901"],
-                                      "pre_cdo_groups": ["0xC1"]}]}]}}
-        for name, data in (("mem.json", _XCLBIN_MEM), ("kernels.json", _XCLBIN_KERNELS), ("part.json", part)):
-            with open(files[name], "w") as f:
-                json.dump(data, f)
-        out = os.path.join(tmp, "main.xclbin")
-        _run([_xclbinutil(), "--add-replace-section", f"MEM_TOPOLOGY:JSON:{files['mem.json']}", "--add-kernel",
-              files["kernels.json"], "--add-replace-section", f"AIE_PARTITION:JSON:{files['part.json']}", "--force",
-              "--quiet", "--output", out])
-        shutil.move(out, path)
+def _tool_env() -> dict[str, str] | None:
+    """The environment of the build tools (None: this process's). aiecc packs a full ELF with aiebu-asm, which mlir-aie's
+    Windows wheels lack: XRT's joins PATH."""
+    if not portable.WINDOWS or shutil.which("aiebu-asm") or not (tool := backend.xrt_tool("aiebu-asm")):
+        return None
+    return {**os.environ, "PATH": os.path.dirname(tool) + os.pathsep + os.environ.get("PATH", "")}
 
 
 # Shared Jinja environment for all kernel template strings.
@@ -212,50 +136,21 @@ def _cache_key(*args: object) -> str:
     return hashlib.sha256(repr(args).encode()).hexdigest()[:16]
 
 
-if sys.platform == "win32":
-    import msvcrt
-
-    def _lock_fd(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # (retries for 10 s, then raises: loop until we hold it)
-
-    def _unlock_fd(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-
-else:
-    import fcntl
-
-    def _lock_fd(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-
-    def _unlock_fd(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+def profile_key(cfg: profiling.ProfileConfig | None) -> tuple | None:
+    """What a profiling configuration changes in a design (``BuildSpec.profile_key``: part of the cache key): trace
+    parameters shape the MLIR, counters are injected by the build."""
+    if cfg is None:
+        return None
+    if cfg.mode == "trace":
+        return "trace", cfg.trace_size, str(cfg.trace_events), cfg.trace_tiles, cfg.trace_lateral, cfg.trace_distribute
+    return "counters", cfg.counter_specs
 
 
-@contextlib.contextmanager
-def _file_lock(lock_path: str) -> Iterator[None]:
-    """Exclusive inter-process+inter-thread lock (flock; LockFileEx on Windows).
-
-    Two compilations of the same cache key writing into the same rtc_<hash>/
-    directory race (truncated kernel.o, half-rewritten design.mlir.prj ->
-    spurious aiecc/ld.lld failures under pytest-xdist or duplicate
-    parallel_compile entries). Serializing on a per-key lock file removes the
-    race while keeping distinct keys fully parallel.
-    """
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        while True:
-            try:
-                _lock_fd(fd)
-                break
-            except OSError:
-                if sys.platform != "win32":
-                    raise
-        yield
-    finally:
-        _unlock_fd(fd)
-        os.close(fd)
+def buildable(spec: BuildSpec) -> bool:
+    """Whether this process builds ``spec`` as rendered: the build takes the profiling configuration (counters, trace
+    lowering, intermediates) from its process, so a spec of another one (a planning subprocess's) only where they
+    agree."""
+    return spec.kind != "rtc" or spec.profile_key == profile_key(profiling.get_config())
 
 
 def _compile_pch(*, clang_cmd: list[str]) -> str:
@@ -291,7 +186,7 @@ def _compile_pch(*, clang_cmd: list[str]) -> str:
     operators_pch_path = os.path.join(operators_pch_dir, f"{pch_hash}.pch")
     # Lock around the exists-check AND the write: a fast-path read of a
     # partially-written .pch from a parallel process crashes clang.
-    with _file_lock(operators_pch_path + ".lock"):
+    with portable.file_lock(operators_pch_path + ".lock"):
         if not os.path.exists(operators_pch_path):
             _run([*pch_cmd, "-x", "c++-header", OPERATORS_H, "-o", operators_pch_path])
 
@@ -394,7 +289,7 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
         work_dir = os.path.join(CACHE_DIR, f"fused_{key}")
         os.makedirs(work_dir, exist_ok=True)
         elf_path = os.path.join(work_dir, f"{spec.label}.elf")
-        with _file_lock(os.path.join(CACHE_DIR, f"fused_{key}.lock")):
+        with portable.file_lock(os.path.join(CACHE_DIR, f"fused_{key}.lock")):
             mlir_path = os.path.join(work_dir, "design.mlir")
             with open(mlir_path, "w") as f:
                 f.write(spec.mlir)
@@ -411,17 +306,20 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
 
     assert spec.kind == "rtc", spec.kind
     profiling_cfg = profiling.get_config()
+    if not buildable(spec):
+        raise RuntimeError(f"{spec.label}: rendered with profiling {spec.profile_key}, this process has "
+                           f"{profile_key(profiling_cfg)}")
     key = _cache_key(spec.source, *spec.clang_flags, spec.mlir, pch_path, spec.profile_key, CORE_LLC_FLAGS)
     work_dir = os.path.join(CACHE_DIR, f"rtc_{key}")
     os.makedirs(work_dir, exist_ok=True)
-    pdi_path = os.path.join(work_dir, PROGRAM_IMAGE)
+    pdi_path = os.path.join(work_dir, "main.pdi")
     insts_path = os.path.join(work_dir, "insts.bin")
     mlir_path = os.path.join(work_dir, "design.mlir")
 
     # Steps 1-3 under a per-key lock: concurrent compilation of an
     # identical operator (same cache dir) from parallel tests/processes
     # otherwise produces corrupted kernel.o / design.mlir.prj artifacts.
-    with _file_lock(os.path.join(CACHE_DIR, f"rtc_{key}.lock")):
+    with portable.file_lock(os.path.join(CACHE_DIR, f"rtc_{key}.lock")):
         # Step 1: write MLIR (with profiling transforms applied)
         if not os.path.exists(mlir_path) or ignore_cache:
             final_text = spec.mlir
@@ -436,7 +334,7 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
 
         # Step 2: compile MLIR -> PDI + insts, the C++ kernel -> kernel.o meanwhile
         if not (os.path.exists(pdi_path) and os.path.exists(insts_path)) or ignore_cache:
-            aiecc_cmd = [AIECC, *aiecc_opts, *_image_options(), "--get-npu-insts",
+            aiecc_cmd = [AIECC, *aiecc_opts, "--get-pdi", "--get-npu-insts", "--pdi-name=main.pdi",
                          "--npu-insts-name=insts.bin"]
             if profiling_cfg is not None:
                 # Persist design.mlir.prj intermediates (notably
@@ -574,24 +472,8 @@ class ArtcOperator:
         ks = self.kernel_source()
         source_code = None if ks is None else translation_unit([ks])
 
-        # Profiling parameters shape the final design (trace ops are inside
-        # the MLIR already; counter injection happens in build), so they take
-        # part in the cache key.
-        if profiling_cfg is None:
-            profile_key = None
-        elif profiling_cfg.mode == "trace":
-            profile_key = (
-                "trace",
-                profiling_cfg.trace_size,
-                str(profiling_cfg.trace_events),
-                profiling_cfg.trace_tiles,
-                profiling_cfg.trace_lateral,
-                profiling_cfg.trace_distribute,
-            )
-        else:
-            profile_key = ("counters", profiling_cfg.counter_specs)
         return BuildSpec(kind="rtc", label=type(self).__name__, source=source_code, mlir=self.mlir_text(),
-                         clang_flags=tuple(self.clang_flags), profile_key=profile_key)
+                         clang_flags=tuple(self.clang_flags), profile_key=profile_key(profiling_cfg))
 
     def compile(self, device: Device | None = None) -> ArtcOperator:
         """Compile the operator and prepare for dispatch (cached on disk, the render too: ``render_cache``; several
@@ -620,7 +502,7 @@ class ArtcOperator:
         """Bind the built artifacts in ``work_dir`` (``build``) for dispatch."""
         import artlite
 
-        pdi_path = os.path.join(work_dir, PROGRAM_IMAGE)
+        pdi_path = os.path.join(work_dir, "main.pdi")
         insts_path = os.path.join(work_dir, "insts.bin")
         self._program = artlite.Program(
             pdi_path=pdi_path,

@@ -269,8 +269,8 @@ def bd_offsets(nbytes: int, dims: tuple[int, int, int, int] | None = None) -> np
 
 def device_address(buffer: object, offset: int = 0, context: object = None) -> int:
     """The address the shim DMA uses for byte ``offset`` of a host buffer (an ``artlite``
-    Buffer or Tensor) in the hardware context ``context`` (on Windows each context maps a buffer
-    at its own address; None: any context of the process)."""
+    Buffer or Tensor) in the hardware context ``context`` (XRT on Windows maps a buffer at its own
+    address in each: ``backend``; None: any context of the process)."""
     raw = getattr(buffer, "_raw", buffer)
     return (raw.paddr if context is None else raw.paddr_in(context)) + offset + DDR_AIE_ADDR_OFFSET
 
@@ -278,7 +278,7 @@ def device_address(buffer: object, offset: int = 0, context: object = None) -> i
 def without_ddr_patches(words: np.ndarray) -> np.ndarray:
     """A transaction (header included) with each DDR patch replaced by no-ops of its size, so that its BDs keep the
     addresses the host resolved. The firmware applies a patch with the command's buffer of its argument index: on
-    Windows a full ELF's control program runs as a transaction whose command lists other buffers than the runtime
+    XRT a full ELF's control program runs as a transaction whose command lists other buffers than the runtime
     sequence's arguments. Offsets and the byte size stay; the operation count grows."""
     out = np.array(words, np.uint32)
     body = out[4:]

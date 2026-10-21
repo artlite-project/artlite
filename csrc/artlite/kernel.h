@@ -15,12 +15,12 @@ struct hw_ctx;
 
 namespace artlite {
 
-/// Submits commands to a hardware context. Exec-buffer BOs are pooled and reused, so a
-/// dispatch costs one submit ioctl plus the wait. Any number of asynchronous dispatches may be
-/// pending (the driver runs at most 4 per context; a 5th submit blocks until one completes).
-/// Failures throw DispatchError with the command state (and the firmware's report on a
-/// TIMEOUT). The caller keeps the buffers of a pending dispatch alive until it is waited for
-/// (the driver does not); the destructor waits for pending dispatches.
+/// Submits commands to a hardware context: on the amdxdna shim (kernel.cpp) the firmware's command packets in
+/// pooled exec-buffer BOs, so a dispatch costs one submit ioctl plus the wait; on XRT (kernel_xrt.cpp) runs of the
+/// context's kernel. Any number of asynchronous dispatches may be pending (the driver runs at most 4 per context; a
+/// 5th submit blocks until one completes). Failures throw DispatchError with the command state (and the firmware's
+/// report on a TIMEOUT). The caller keeps the buffers of a pending dispatch alive until it is waited for (the driver
+/// does not); the destructor waits for pending dispatches.
 class Kernel {
  public:
   Kernel(shim_xdna::device& dev, shim_xdna::hw_ctx& ctx);
@@ -44,14 +44,14 @@ class Kernel {
 
   // dispatch, the calling thread sleeping spin_after_us after the submit (or until the command finishes, if earlier),
   // then polling the command's state on CPU spin_cpu (the one that takes the NPU's completion interrupts) until it
-  // finishes (at most kMaxSpinMs, then the blocking wait): that CPU is awake when the interrupt comes. (A CPU in its deepest C-state, 350 us exit latency on
-  // Strix, delays each completion by 0.3 - 0.8 ms: a dispatch of ~1 ms after the host idled took 1.9 instead of 1.2.)
+  // finishes (at most kMaxSpinMs, then the blocking wait): that CPU is awake when the interrupt comes (spin.h).
   // spin_after_us < 0, or spin_cpu outside the thread's affinity: a plain dispatch.
   void dispatch(shim_xdna::bo& ctrl_code,
                 std::span<const std::reference_wrapper<shim_xdna::bo>> data_bufs,
                 uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu);
 
-  // Dispatch a full ELF: single command with ERT_START_NPU_PREEMPT_ELF.
+  // Dispatch a full ELF's control program: one command with ERT_START_NPU_PREEMPT_ELF (on XRT: a transaction, its
+  // DDR patches removed: txn.without_ddr_patches).
   // instr_bo: patched instruction buffer (ctrltext with addresses resolved)
   // data_bufs: the BOs the ELF uses (passed to drivers that pin them)
   // instr_bytes: the control code's length from the BO's start (0: the whole BO)

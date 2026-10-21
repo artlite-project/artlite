@@ -25,25 +25,32 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # --- System dependencies ---
-if(WIN32)
-  # XRT's headers and xrt_coreutil.lib from $XILINX_XRT, set for the build only (set at run time, XRT looks for its
-  # driver library there); its directory is recorded in the module for the tools (xclbinutil, aiebu-asm)
-  find_path(XRT_INCLUDE_DIR xrt/xrt_device.h HINTS "$ENV{XILINX_XRT}/include")
-  find_library(XRT_COREUTIL_LIBRARY xrt_coreutil HINTS "$ENV{XILINX_XRT}/lib")
-  if(NOT XRT_INCLUDE_DIR OR NOT XRT_COREUTIL_LIBRARY)
-    message(FATAL_ERROR "XRT not found: set XILINX_XRT to its install directory, which holds include/ and lib/ "
-                        "(usually C:\\Xilinx\\XRT)")
-  endif()
-  get_filename_component(XRT_DIR "${XRT_INCLUDE_DIR}" DIRECTORY)
-  if(MSVC)
-    add_compile_options(/Zc:__cplusplus /utf-8)  # (XRT's headers pick std::any by __cplusplus)
-  endif()
-else()
+# The backends (src/artlite/backend.py): Artlite's shim on the amdxdna driver's ioctls (Linux, libdrm) and the same
+# runtime over XRT's API (xrt_coreutil): Windows' only one; on Linux a second module where XRT is found.
+option(ARTLITE_XRT "Linux: also build the XRT backend (artlite._native_xrt) where XRT is installed" ON)
+if(NOT WIN32)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 endif()
+if(WIN32 OR ARTLITE_XRT)
+  # XRT's headers and xrt_coreutil from $XILINX_XRT (on Windows set for the build only: set at run time, XRT looks for
+  # its driver library there), else the system's; its directory is recorded in the module for its tools (aiebu-asm)
+  find_path(XRT_INCLUDE_DIR xrt/xrt_device.h HINTS "$ENV{XILINX_XRT}/include" /opt/xilinx/xrt/include)
+  find_library(XRT_COREUTIL_LIBRARY xrt_coreutil HINTS "$ENV{XILINX_XRT}/lib" /opt/xilinx/xrt/lib)
+  if(XRT_INCLUDE_DIR AND XRT_COREUTIL_LIBRARY)
+    get_filename_component(XRT_DIR "${XRT_INCLUDE_DIR}" DIRECTORY)
+  elseif(WIN32)
+    message(FATAL_ERROR "XRT not found: set XILINX_XRT to its install directory, which holds include/ and lib/ "
+                        "(usually C:\\Xilinx\\XRT)")
+  else()
+    message(STATUS "XRT not found: no XRT backend (artlite._native_xrt)")
+  endif()
+endif()
+if(MSVC)
+  add_compile_options(/Zc:__cplusplus /utf-8)  # (XRT's headers pick std::any by __cplusplus)
+endif()
 
-# --- C++ libraries (artlite_shim + artlite) ---
+# --- C++ libraries (a static library per backend: artlite_xdna, artlite_xrt) ---
 add_subdirectory(csrc)
 
 # --- Python + nanobind ---
@@ -58,13 +65,22 @@ if(NOT SKBUILD AND NOT nanobind_ROOT)
 endif()
 find_package(nanobind CONFIG REQUIRED)
 
-nanobind_add_module(_native STABLE_ABI csrc/bindings.cpp)
-target_link_libraries(_native PRIVATE artlite)
+# A module per backend: the platform's own as _native, Linux's XRT one as _native_xrt (its own nanobind domain: the
+# same C++ types)
+function(artlite_module name backend)
+  nanobind_add_module(${name} STABLE_ABI ${ARGN} csrc/bindings.cpp)
+  target_link_libraries(${name} PRIVATE artlite_${backend})
+  target_compile_definitions(${name} PRIVATE ARTLITE_MODULE=${name})
+  install(TARGETS ${name} LIBRARY DESTINATION artlite)
+endfunction()
 if(WIN32)
-  target_compile_definitions(_native PRIVATE ARTLITE_XRT_DIR="${XRT_DIR}")
+  artlite_module(_native xrt)
+else()
+  artlite_module(_native xdna)
+  if(XRT_DIR)
+    artlite_module(_native_xrt xrt NB_DOMAIN xrt)
+  endif()
 endif()
-
-install(TARGETS _native LIBRARY DESTINATION artlite)
 
 # --- Stub generation ---
 nanobind_add_stub(

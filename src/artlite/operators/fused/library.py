@@ -7,7 +7,6 @@ are allocated: the items address the caller's buffers.
 """
 
 import itertools
-import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -44,7 +43,7 @@ class Library(FusedElf):
     def items(self, runlist: Runlist, buffers: Mapping[str, Any]) -> list[Item]:
         """A program's items: per run of ``runlist`` ((operator, *buffer names)) its entry and the device addresses of
         its arguments in ``buffers`` (host buffers by name; ``"NAME[a:b]"`` from byte a)."""
-        ctx = self.load()._ctx if sys.platform == "win32" else None  # (Windows: addresses depend on the context)
+        ctx = self.load()._ctx  # (on XRT: open, its addresses)
 
         def address(name: str) -> int:
             base, start, _ = parse_name(name)

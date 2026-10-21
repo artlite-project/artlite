@@ -20,8 +20,8 @@ default: the CPU count; 1 builds serially):
 - ``BuildQueue``: background builds that wait behind the foreground ones (the tests' precompilation).
 - ``Precompiler(cmd)``: run a command (tests, an app, a script) in planning mode in a subprocess
   (``ARTLITE_PLANNING=1``: every ``compile()`` hands its spec to this process instead of building, the
-  first access to a device raises ``PlanStop``; its subprocesses inherit it) and build the designs it
-  renders in the background, so that the real run finds them in the cache.
+  first access to a device raises ``PlanStop``; its subprocesses inherit it and plan too) and build the designs
+  it renders in the background, so that the real run finds them in the cache.
   The test session does this for the selected tests (``tests/rtc/conftest.py``). From a shell:
   ``python -m artlite.parallel_compile CMD ...`` builds everything CMD would compile, then exits.
 
@@ -30,22 +30,22 @@ A task already running on the pool runs a nested ``parallel_map`` / ``compile_al
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import gc
 import heapq
 import itertools
 import os
-import pickle
-import signal
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future
+from multiprocessing import AuthenticationError
+from multiprocessing.connection import Client, Connection, Listener
 from typing import TYPE_CHECKING, Any
 
-from .operators.base import BuildSpec, build
+from . import portable
+from .operators.base import BuildSpec, build, buildable
 
 if TYPE_CHECKING:
     from . import Device
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
 JOBS_ENV = "ARTLITE_COMPILE_JOBS"
 PLANNING_ENV = "ARTLITE_PLANNING"
-PLAN_FD_ENV = "ARTLITE_PLAN_FD"  # "<Precompiler pid>:<fd>": where its planning child writes the specs (Windows: a handle)
+PLAN_SINK_ENV = "ARTLITE_PLAN_SINK"  # "<key>:<address>": the Precompiler's listener that its planning processes send to
 FOREGROUND, BACKGROUND = 0, 1  # pool priorities
 
 
@@ -187,6 +187,9 @@ class BuildQueue:
         self.failed = 0
 
     def submit(self, spec: BuildSpec) -> None:
+        """(a spec this process does not build as rendered is left to its own: ``buildable``)"""
+        if not buildable(spec):
+            return
         with self._lock:
             if spec in self._seen:
                 return
@@ -245,27 +248,22 @@ PLANNED: Any = _Planned()
 
 
 def _sink_from_env() -> Callable[[BuildSpec], None] | None:
-    """A process started in planning mode: the specs go to its Precompiler's pipe (only in its direct
-    child: subprocesses of that one plan into nothing), else nowhere."""
+    """A process started in planning mode (or a subprocess of one): the specs go to its Precompiler's listener (an
+    authenticated connection, opened at the first), else nowhere."""
     if os.environ.get(PLANNING_ENV) != "1":
         return None
-    owner, _, fd = os.environ.get(PLAN_FD_ENV, "").partition(":")
-    if sys.platform == "win32":  # (a venv's python.exe starts the real interpreter: the parent is not the owner; only the
-        import _winapi  # direct child is handed the handle, so for a grandchild it is not a pipe)
-        import msvcrt
-
-        if not fd or _winapi.GetFileType(int(fd)) != _winapi.FILE_TYPE_PIPE:
-            return lambda spec: None
-        fd = str(msvcrt.open_osfhandle(int(fd), os.O_WRONLY))
-    elif not fd or int(owner) != os.getppid():
+    key, _, address = os.environ.get(PLAN_SINK_ENV, "").partition(":")
+    if not address:
         return lambda spec: None
-    out = os.fdopen(int(fd), "wb", buffering=0)
     lock = threading.Lock()
+    conn: Connection | None = None
 
     def sink(spec: BuildSpec) -> None:
-        line = base64.b64encode(pickle.dumps(spec)) + b"\n"
-        with lock, contextlib.suppress(OSError):  # (the Precompiler stopped reading)
-            out.write(line)
+        nonlocal conn
+        with lock, contextlib.suppress(OSError, EOFError, AuthenticationError):  # (the Precompiler stopped listening)
+            if conn is None:
+                conn = Client(address, authkey=bytes.fromhex(key))
+            conn.send(spec)
 
     return sink
 
@@ -294,52 +292,73 @@ def no_device() -> None:
 
 class Precompiler:
     """Run ``cmd`` in planning mode in a subprocess (it builds nothing and never opens the NPU) and
-    build every design it renders in the background (``BuildQueue``), while this process goes on.
-    ``close()`` stops the planning process (safe to kill: it holds no NPU context) and the builds
-    that have not started; ``wait()`` lets both finish."""
+    build every design it renders in the background (``BuildQueue``), while this process goes on. The
+    specs come over a listener (a Unix socket, on Windows a named pipe) that the planning processes connect
+    to with the key in their environment. ``close()`` stops the planning process (safe to kill: it holds no
+    NPU context) and the builds that have not started; ``wait()`` lets both finish."""
 
     def __init__(self, cmd: Sequence[str], *, cwd: str | None = None):
-        read_fd, write_fd = os.pipe()
-        if sys.platform == "win32":  # (no pass_fds: the child inherits the pipe's handle, and only that one)
-            import msvcrt
-
-            handle = msvcrt.get_osfhandle(write_fd)
-            os.set_handle_inheritable(handle, True)
-            startup = subprocess.STARTUPINFO(lpAttributeList={"handle_list": [handle]})
-            spawn = {"startupinfo": startup, "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            plan_fd = handle
-        else:
-            spawn = {"pass_fds": (write_fd,), "start_new_session": True}
-            plan_fd = write_fd
-        env = {**os.environ, PLANNING_ENV: "1", PLAN_FD_ENV: f"{os.getpid()}:{plan_fd}"}
+        key = self._key = os.urandom(32)
+        self._listener = Listener(authkey=key)
+        self._stopping = False
+        self._readers: list[threading.Thread] = []
+        env = {**os.environ, PLANNING_ENV: "1", PLAN_SINK_ENV: f"{key.hex()}:{self._listener.address}"}
         self._proc = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **spawn)
-        os.close(write_fd)
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      **portable.group_options())
         self.queue = BuildQueue()
-        self._reader = threading.Thread(target=self._read, args=(read_fd,), name="artlite-plan", daemon=True)
-        self._reader.start()
+        self._accepter = threading.Thread(target=self._accept, name="artlite-plan", daemon=True)
+        self._accepter.start()
 
-    def _read(self, fd: int) -> None:
-        with os.fdopen(fd, "rb") as f:
-            for line in f:
-                self.queue.submit(pickle.loads(base64.b64decode(line)))
+    def _accept(self) -> None:
+        """A reader per planning process that connects, until ``_stop`` (its own connection ends the wait)."""
+        while True:
+            try:
+                conn = self._listener.accept()
+            except (OSError, EOFError, AuthenticationError):
+                if self._stopping:
+                    return
+                continue
+            if self._stopping:
+                conn.close()
+                return
+            reader = threading.Thread(target=self._read, args=(conn,), name="artlite-plan-read", daemon=True)
+            reader.start()
+            self._readers.append(reader)
+
+    def _read(self, conn: Connection) -> None:
+        with conn:
+            while True:
+                try:
+                    spec = conn.recv()
+                except (OSError, EOFError):
+                    return
+                self.queue.submit(spec)
+
+    def _stop(self) -> None:
+        """No more connections (one of its own ends the listener's wait); wait for the readers (their processes
+        ended)."""
+        if self._stopping:
+            return
+        self._stopping = True
+        with contextlib.suppress(OSError, EOFError, AuthenticationError):
+            Client(self._listener.address, authkey=self._key).close()
+        self._accepter.join()
+        self._listener.close()
+        for reader in self._readers:
+            reader.join()
 
     def wait(self) -> None:
         """Wait for the planning process to end and every design it rendered to be built."""
         self._proc.wait()
-        self._reader.join()
+        self._stop()
         self.queue.wait()
 
     def close(self) -> None:
         """Stop planning (the process group: its subprocesses plan too, none holds an NPU context),
         cancel the builds not started, wait for the running ones."""
-        if self._proc.poll() is None and sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)], capture_output=True, check=False)
-        elif self._proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(self._proc.pid, signal.SIGKILL)
-        self._proc.wait()
-        self._reader.join()
+        portable.kill_group(self._proc)
+        self._stop()
         self.queue.close()
 
 

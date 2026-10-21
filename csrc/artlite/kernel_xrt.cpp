@@ -1,18 +1,16 @@
-// Kernel on Windows: transactions (and full ELFs' control programs, which are transactions) run as XRT runs of the
-// program's xclbin kernel.
-#include <windows.h>
-
+// Kernel on XRT: transactions (and full ELFs' control programs, which are transactions) run as XRT runs of the
+// context's kernel (shim_xrt/xclbin.h).
 #include <algorithm>
 #include <chrono>
 #include <deque>
 #include <format>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "artlite/error.h"
 #include "artlite/kernel.h"
 #include "artlite/shim.h"
+#include "artlite/spin.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
@@ -25,9 +23,7 @@ using shim_xdna::hw_ctx;
 
 namespace {
 
-constexpr int kMaxSpinMs = 20;  // (a dispatch longer than expected: then the blocking wait)
-constexpr int kNapUs = 200;
-// The kernel's arguments (aiecc's xclbin): opcode, instruction buffer, its length in words, then the buffers.
+// The kernel's arguments: opcode, instruction buffer, its length in words, then the buffers.
 constexpr unsigned kArgOpcode = 0, kArgInstr = 1, kArgWords = 2, kArgFirstBuffer = 3;
 constexpr uint64_t kFirmwareOpcode = 3;
 constexpr size_t kMaxBuffers = 5;  // (bo0 .. bo4: a kernel with more fails to run)
@@ -38,18 +34,14 @@ uint32_t state_of(const xrt::run& r) { return static_cast<uint32_t>(r.state()); 
 
 struct Kernel::Impl {
   hw_ctx& ctx;
-  std::unique_ptr<xrt::kernel> named;  // (a kernel other than the context's)
-  xrt::kernel* kernel;
   // (runs and their buffer count: a run is reused only for as many buffers, so that it holds no earlier one)
   std::vector<std::pair<xrt::run, size_t>> idle;
   std::deque<std::pair<xrt::run, size_t>> pending;  // submitted, in order
   std::chrono::steady_clock::time_point t_submit;
 
-  Impl(hw_ctx& c, std::string_view name) : ctx(c), kernel(c.m_kernel.get()) {
-    if (!name.empty() && name != c.m_kernel_name) {
-      named = std::make_unique<xrt::kernel>(*c.m_ctx, std::string(name));
-      kernel = named.get();
-    }
+  Impl(hw_ctx& c, std::string_view name) : ctx(c) {
+    if (!name.empty() && name != c.m_kernel_name)
+      throw Error(std::format("the context has no kernel '{}' (its kernel: '{}')", name, c.m_kernel_name));
   }
 
   ~Impl() {
@@ -70,12 +62,16 @@ struct Kernel::Impl {
                  bool resolved = false) {
     if (instr_bytes > ctrl_code.size())
       throw DispatchError(std::format("{} bytes of control code in a BO of {}", instr_bytes, ctrl_code.size()));
+    const bool regions = resolved || data_bufs.size() > kMaxBuffers;
+    if (regions && !resolved && ctrl_code.ddr_patched())
+      throw DispatchError(std::format("a transaction with DDR patches (aiecc's) takes at most {} buffers on XRT, not {}",
+                                      kMaxBuffers, data_bufs.size()));
     try {
       std::vector<xrt::bo*> args;
       for (size_t i = 0; i < data_bufs.size(); i++) {
         bo& b = data_bufs[i].get();
         const unsigned arg = kArgFirstBuffer + static_cast<unsigned>(std::min(i, kMaxBuffers - 1));
-        if (!resolved && data_bufs.size() <= kMaxBuffers) {
+        if (!regions) {
           args.push_back(&b.xrt_for(ctx, arg));
         } else if (b.is_data()) {
           xrt::bo* x = &b.region_for(ctx, arg);
@@ -88,7 +84,7 @@ struct Kernel::Impl {
       xrt::run run;
       const auto same = std::find_if(idle.begin(), idle.end(), [&](const auto& p) { return p.second == args.size(); });
       if (same == idle.end()) {
-        run = xrt::run(*kernel);
+        run = xrt::run(*ctx.m_kernel);
       } else {
         run = std::move(same->first);
         idle.erase(same);
@@ -173,21 +169,6 @@ struct Kernel::Impl {
     return std::all_of(pending.begin(), pending.end(),
                        [](const auto& p) { return shim_xdna::ert_cmd_state_is_terminal(state_of(p.first)); });
   }
-
-  // Sleep until t0 + after_us on CPU cpu (in naps, ending early when the runs finish), then poll their states there
-  // until they finish or kMaxSpinMs pass: that CPU is awake when the completion comes.
-  void spin(std::chrono::steady_clock::time_point t0, int64_t after_us, int cpu) const {
-    if (cpu < 0 || cpu >= 64) return;
-    const DWORD_PTR old = ::SetThreadAffinityMask(::GetCurrentThread(), DWORD_PTR(1) << cpu);
-    if (!old) return;
-    const auto until = t0 + std::chrono::microseconds(after_us);
-    const auto nap = std::chrono::microseconds(kNapUs);
-    while (std::chrono::steady_clock::now() + nap < until && !done()) std::this_thread::sleep_for(nap);
-    if (!done()) std::this_thread::sleep_until(until);
-    const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(kMaxSpinMs);
-    while (!done() && std::chrono::steady_clock::now() < limit) ::SwitchToThread();
-    ::SetThreadAffinityMask(::GetCurrentThread(), old);
-  }
 };
 
 Kernel::Kernel(device&, hw_ctx& ctx) : impl_(std::make_unique<Impl>(ctx, std::string_view{})) {}
@@ -212,7 +193,7 @@ void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>>
                       int64_t spin_after_us, int spin_cpu) {
   const auto t0 = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
-  if (spin_after_us >= 0) impl_->spin(t0, spin_after_us, spin_cpu);
+  if (spin_after_us >= 0) spin_on_cpu(t0, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 
@@ -235,7 +216,7 @@ void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrappe
 void Kernel::dispatch_wait(uint32_t timeout_ms) { impl_->wait_all(timeout_ms); }
 
 void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu) {
-  if (spin_after_us >= 0) impl_->spin(impl_->t_submit, spin_after_us, spin_cpu);
+  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 

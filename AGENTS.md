@@ -5,8 +5,8 @@ the `amdxdna` driver directly: no xclbin, no plugin layers, zero-copy buffers. O
 ("RTC") from Jinja2 C++ templates specialized per shape, plus an IRON (`aie.iron`) array design lowered through
 MLIR-AIE. Python package: `artlite` (nanobind bindings `artlite._native`, operators `artlite.operators`), with
 the models in package `models` (`src/models/`, commands `artlite-cli` and `artlite-bench`), built with
-scikit-build-core. On Windows 11 the same runtime goes through XRT (`csrc/shim_xrt/`; setup and differences:
-`docs/install.md`, Windows).
+scikit-build-core. On Windows 11 the same runtime goes through XRT (the XRT backend, `csrc/shim_xrt/`; on Linux too
+where XRT is installed: `ARTLITE_BACKEND=xrt`; setup and differences: `docs/install.md`, Windows).
 
 Target: AIE2P (NPU2) only, i.e. AMD Strix Point, Strix Halo and Krackan. All these CPUs are znver5, so `csrc/` may
 use any modern SIMD (AVX-512 included).
@@ -59,6 +59,7 @@ artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds
 artlite-server -m <org>/<repo>/<file>.gguf                          # OpenAI API + web chat on :8080, as llama-server (NPU)
 pytest tests/rtc/test_<operator>.py -k <config-id>                  # needs the NPU
 pytest tests/rtc -m smoke                                           # after a change: ~1 min with cached designs (NPU)
+ARTLITE_BACKEND=xrt pytest tests/rtc -m smoke                       # the same on the XRT backend (Windows' code path)
 pytest tests/rtc --run-slow ...                                     # also the whole-model tests
 pytest tests/rtc --dump-designs DIR                                 # render every design, no NPU
 ruff check <changed files>                                          # the tree passes: fix all it reports
@@ -80,7 +81,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 | path | what |
 |---|---|
-| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md`; on Windows `shim_xrt/` (the shim over XRT) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
+| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md`; the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
+| `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
 | `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
 | `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
 | `src/artlite/operators/{gemm,prefill,overlay,llama,gemma4,qwen35}/` | operators by purpose and model |

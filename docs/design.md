@@ -1,6 +1,7 @@
 # Design
 
-A C++ / Python runtime for AMD Ryzen AI NPUs that talks to the `amdxdna` kernel driver directly, without XRT.
+A C++ / Python runtime for AMD Ryzen AI NPUs that talks to the `amdxdna` kernel driver directly, without XRT; on
+Windows (and on Linux where XRT is installed) the same runtime runs over XRT's API ([Backends](#backends)).
 
 Components:
 - **artlite** - C++ library (Device, Buffer, HwContext, Executable, Kernel)
@@ -26,6 +27,8 @@ flowchart TB
     nat --> cpp["artlite (C++): Executable, Kernel, Profiler, errors"]
     cpp --> shim["shim_xdna (C++): device, bo, hw_ctx"]
     shim -->|"DRM ioctls on /dev/accel/accel0"| drv["amdxdna driver"] --> npu["NPU: AIE2P array"]
+    cpp -.->|"XRT backend"| xshim["shim_xrt (C++): the same over XRT"]
+    xshim -->|"xrt_coreutil"| xrt["XRT: amdxdna (Linux), the MCDM driver (Windows)"] --> npu
 ```
 
 **Layer separation:**
@@ -33,6 +36,18 @@ flowchart TB
 - **shim_xdna namespace**: Low-level DRM shim for device management, buffer allocation, and hardware contexts
 
 **Supported hardware**: AIE2P (NPU2) only - AMD Strix Point, Strix Halo, Krackan (4 rows x 8 cols).
+
+### Backends
+
+`artlite._native` is one of two builds of the bindings and the C++ library, on one of two shims with the same
+`shim_xdna` interface: Artlite's own on the `amdxdna` ioctls (Linux) and `csrc/shim_xrt` on XRT's API (Windows' only
+one; on Linux a second module, `artlite._native_xrt`, where XRT is installed). `ARTLITE_BACKEND` picks one per
+process (`artlite.backend`, which also lists what the Python side does differently on XRT); `artlite.portable` holds
+the operating system's part of the Python side (file locks, process groups). On XRT a context opens from an xclbin
+that `shim_xrt/xclbin.cpp` builds around the PDI, a command lists at most 5 buffers (data buffers lie in shared
+regions), buffers take their device address per context, and a fused ELF's control program runs as a transaction
+(`txn.without_ddr_patches`). On Linux the two are level but for that last point: the firmware runs a control program
+slower as a transaction than as an ELF (a small fused ELF ~30 us more per dispatch, prefill 2-6% slower).
 
 ---
 

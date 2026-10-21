@@ -1,19 +1,23 @@
 #pragma once
 
-// The few operating-system calls of the host code (file reads, aligned memory, page hints), for Linux and Windows.
+// The few operating-system calls of the host code (file reads, aligned memory, page hints, sleeps, CPU affinity), for
+// Linux and Windows.
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #ifdef _WIN32
 #include <malloc.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -85,6 +89,80 @@ inline bool needs_reading([[maybe_unused]] void* addr, [[maybe_unused]] size_t n
          !std::all_of(vec, vec + n / page_size(), [](unsigned char r) { return r & 1; });
 #endif
 }
+
+// Sleep about `d`. On Windows on a high-resolution waitable timer: Sleep() and std::this_thread::sleep_for wait for
+// the system timer's ticks, 15.6 ms unless a process asked for finer ones.
+inline void nap(std::chrono::microseconds d) {
+  if (d.count() <= 0) return;
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+  struct Timer {
+    HANDLE h = ::CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    ~Timer() {
+      if (h) ::CloseHandle(h);
+    }
+  };
+  thread_local Timer timer;
+  LARGE_INTEGER due;
+  due.QuadPart = -static_cast<LONGLONG>(d.count()) * 10;  // (100 ns units; negative: from now)
+  if (timer.h && ::SetWaitableTimerEx(timer.h, &due, 0, nullptr, nullptr, nullptr, 0)) {
+    ::WaitForSingleObject(timer.h, INFINITE);
+    return;
+  }
+#endif
+  std::this_thread::sleep_for(d);
+}
+
+// The calling thread runs on CPU `cpu` while this lives, if its affinity allows that CPU (`pinned()`; else nothing
+// changes); the affinity is restored at the end.
+class ThreadOnCpu {
+ public:
+  explicit ThreadOnCpu(int cpu) {
+#ifdef _WIN32
+    if (cpu < 0 || cpu >= 64) return;
+    const DWORD_PTR one = DWORD_PTR(1) << cpu;
+    old_ = ::SetThreadAffinityMask(::GetCurrentThread(), one);
+    if (old_ && !(old_ & one)) {
+      ::SetThreadAffinityMask(::GetCurrentThread(), old_);
+      old_ = 0;
+    }
+#else
+    cpu_set_t one;
+    if (cpu < 0 || cpu >= CPU_SETSIZE || ::sched_getaffinity(0, sizeof old_, &old_) != 0 || !CPU_ISSET(cpu, &old_))
+      return;
+    CPU_ZERO(&one);
+    CPU_SET(cpu, &one);
+    pinned_ = ::sched_setaffinity(0, sizeof one, &one) == 0;
+#endif
+  }
+  ~ThreadOnCpu() {
+#ifdef _WIN32
+    if (old_) ::SetThreadAffinityMask(::GetCurrentThread(), old_);
+#else
+    if (pinned_) ::sched_setaffinity(0, sizeof old_, &old_);
+#endif
+  }
+  ThreadOnCpu(const ThreadOnCpu&) = delete;
+  ThreadOnCpu& operator=(const ThreadOnCpu&) = delete;
+
+  bool pinned() const {
+#ifdef _WIN32
+    return old_ != 0;
+#else
+    return pinned_;
+#endif
+  }
+
+ private:
+#ifdef _WIN32
+  DWORD_PTR old_ = 0;
+#else
+  cpu_set_t old_;
+  bool pinned_ = false;
+#endif
+};
 
 // A file opened for reading at offsets from several threads.
 class File {

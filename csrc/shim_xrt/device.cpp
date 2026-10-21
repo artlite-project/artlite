@@ -54,8 +54,8 @@ std::unique_ptr<bo> device::alloc_bo(size_t size, uint32_t flags) {
 
 std::unique_ptr<bo> device::alloc_user_bo(size_t size) { return std::make_unique<bo>(*this, size, user_memory{}); }
 
-std::unique_ptr<hw_ctx> device::create_hw_context(std::span<const uint8_t> xclbin, std::string_view kernel_name) {
-  return std::make_unique<hw_ctx>(*this, xclbin, kernel_name);
+std::unique_ptr<hw_ctx> device::create_hw_context(std::span<const uint8_t> pdi, std::string_view kernel_name) {
+  return std::make_unique<hw_ctx>(*this, pdi, kernel_name);
 }
 
 clocks device::query_clocks() const { return {0, 0}; }

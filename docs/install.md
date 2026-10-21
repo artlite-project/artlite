@@ -42,18 +42,19 @@ uv pip install --no-build-isolation --no-deps -ve .
 
 ## Windows
 
-Artlite runs on Windows 11 through XRT instead of the driver's ioctls (`csrc/shim_xrt/`). What differs from Linux:
+Artlite runs on Windows 11 through XRT instead of the driver's ioctls (the XRT backend, `csrc/shim_xrt/`). What
+differs from Linux:
 
 | | |
 |---|---|
 | NPU driver | the Ryzen AI driver 32.0.203.304 or newer (Task Manager > Performance > NPU shows it) |
-| XRT | its headers, `xrt_coreutil.lib`, `xclbinutil.exe` and `aiebu-asm.exe` in one directory (usually `C:\Xilinx\XRT`): an XRT 2.21 build or SDK, version 2.21 or newer |
+| XRT | its headers, `xrt_coreutil.lib` and `aiebu-asm.exe` in one directory (usually `C:\Xilinx\XRT`): an XRT 2.21 build or SDK, version 2.21 or newer |
 | C++ compiler | MSVC 2022 (Build Tools, "Desktop development with C++"), C++23 (`/std:c++latest`) |
 | CMake, Python, uv | as above |
 
-The build finds XRT through `XILINX_XRT`, and the module it builds remembers that directory for `xclbinutil` and
-`aiebu-asm`. Set `XILINX_XRT` for the build only: while it is set, XRT looks for its driver library there, and every
-run fails with `No such library '...\xrt_core.dll'`.
+The build finds XRT through `XILINX_XRT`, and the module it builds remembers that directory for `aiebu-asm` (aiecc
+packs fused ELFs with it; mlir-aie's Windows wheels lack it). Set `XILINX_XRT` for the build only: while it is set,
+XRT looks for its driver library there, and every run fails with `No such library '...\xrt_core.dll'`.
 
 ```powershell
 git clone https://github.com/artlite-project/artlite; cd artlite
@@ -64,19 +65,31 @@ uv pip install --no-build-isolation -ve .
 Remove-Item Env:XILINX_XRT
 ```
 
-- Each program is an xclbin that wraps its PDI (`main.xclbin`, from aiecc; a fused ELF's beside the ELF, of its first
-  PDI, packed with `xclbinutil` in aiecc's form): XRT loads nothing else.
-- A fused ELF's control program (fused operators, the prefill's library programs) runs as a transaction of its
-  xclbin's kernel: its addresses are resolved on the host as on Linux, PDI loads included, and its DDR patches become
+- Speed: the NPU driver's default power mode may keep the NPU below its top clock, which bounds both its compute and
+  its memory reads (on Linux the default is the top level; its balanced level costs about 30% of prefill and decode
+  speed). `xrt-smi configure --pmode performance` (`C:\Windows\System32\AMD\xrt-smi.exe`) sets the top level, as
+  FastFlowLM does at its start.
+- A hardware context opens from an xclbin that the runtime builds around the program's PDI in memory (aiecc's
+  sections): programs are built as on Linux.
+- A fused ELF's control program (fused operators, the prefill's library programs) runs as a transaction of the
+  context's kernel: its addresses are resolved on the host as on Linux, PDI loads included, and its DDR patches become
   no-ops (the firmware would take their addresses from the command's buffers).
 - The NPU reaches only the data buffers a command lists, at most 5. A program of more buffers lists the regions they
   lie in: buffers under 256 MB share 1 GB regions of the process, a larger one has its own. Instruction buffers
   (control code, PDIs, the scratchpad) need not be listed.
 - Each hardware context maps a buffer at its own device address (`Buffer.paddr_in`), and only once a context exists
   in the process (XRT's rule): a program opens its context before it resolves addresses.
-- Not available: the profiler's register reads and `Device.clocks()`, `busy_ns()`, `last_async_error()` (they return 0 or
-  nothing).
+- Not available: the profiler's register reads (counters; traces work) and `Device.clocks()`, `busy_ns()`,
+  `last_async_error()` (they return 0 or nothing).
 - The planning step of the tests and `python -m artlite.parallel_compile` work as on Linux.
+
+### The XRT backend on Linux
+
+Where XRT (2.21 or newer) and its NPU plugin (xdna-driver's `libxrt_driver_xdna`) are installed, the Linux build also
+makes the XRT backend, `artlite._native_xrt` (`-DARTLITE_XRT=OFF` skips it). `ARTLITE_BACKEND=xrt` selects it for a
+process: the tests and the tools then run Windows' code path on Linux, but for the register reads above. Prefill is a
+few percent slower there than on the default backend: the firmware runs a control program slower as a transaction
+than as an ELF.
 
 ## Models directory
 

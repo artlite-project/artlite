@@ -30,7 +30,8 @@ import time
 import numpy as np
 import torch
 
-from . import _native, profiling
+from . import profiling
+from .backend import _native  # (first: the backend ARTLITE_BACKEND selects is artlite._native)
 from .operators.base import ArgDirection, ArgSpec
 
 # Re-export low-level C++ bindings for advanced usage
