@@ -27,7 +27,7 @@ use any modern SIMD (AVX-512 included).
   other test-only code live in `tests/rtc/`. Layout inverses and readbacks stay next to the code they mirror.
 - No absolute paths in code, tests or scripts: derive them from `__file__` or package constants. Model files only
   through `artlite.model_config` (below).
-- Licenses: Artlite is GPL-3.0-or-later and its own files carry no license header. Code from another project keeps
+- Licenses: Artlite is LGPL-2.1-or-later and its own files carry no license header. Code from another project keeps
   its copyright and license notices plus a "Modified for Artlite" line, and is listed with its license in a LICENSE
   next to it (`csrc/shim_xdna/LICENSE`).
 - Python: annotate all parameters and return types; functions with more than 3 parameters take keyword-only

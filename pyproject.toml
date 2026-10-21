@@ -7,7 +7,7 @@ name = "artlite"
 version = "0.1.0"
 description = "Lightweight NPU runtime for AMD Ryzen AI"
 readme = "README.md"
-license = "GPL-3.0-or-later AND Apache-2.0 AND GPL-2.0-only WITH Linux-syscall-note"  # csrc/shim_xdna: its LICENSE
+license = "LGPL-2.1-or-later AND Apache-2.0 AND GPL-2.0-only WITH Linux-syscall-note"  # csrc/shim_xdna: its LICENSE
 license-files = ["LICENSE", "csrc/shim_xdna/LICENSE"]
 requires-python = ">=3.12"
 dependencies = [

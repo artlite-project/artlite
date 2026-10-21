@@ -1,9 +1,9 @@
 The files in this directory are derived from AMD's XRT shim for the amdxdna
 driver (https://github.com/amd/xdna-driver, src/shim/) and from XRT
 (https://github.com/Xilinx/XRT). Unlike the rest of Artlite, which is licensed
-under the GNU General Public License version 3 or later (LICENSE at the top of
-the repository), they keep their original licenses, and Artlite's changes to
-them are licensed under the same terms:
+under the GNU Lesser General Public License version 2.1 or later (LICENSE at
+the top of the repository), they keep their original licenses, and Artlite's
+changes to them are licensed under the same terms:
 
 bo.cpp, bo.h, device.cpp, device.h, hwctx.cpp, hwctx.h, shim_err.h
     Derived from xdna-driver's src/shim/, modified for Artlite.
