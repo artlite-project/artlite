@@ -31,9 +31,11 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   3 x 96 = 288). Chunk sizes are multiples of SUB: a prompt just above a multiple pays a whole sub-chunk.
 - **Short prompts: sizes of their own.** A chat prompt in a SUB-token chunk pays every operator's ConfigureOp and
   passes for tokens it does not have; sizes below SUB with operators planned at that T (`ChunkPrefill.SMALL`: one
-  sub-chunk; Llama's 64 / 128) took Llama 3B's 26-token prompt from 183 to 133 ms. Choose their operators by speed,
-  not configuration size (configurations by control packets: GemmQ, the attention on 4 rows, the norms on 4 columns;
-  3B's chat prompt 96 -> 70 ms). Long prompts the other way: chunks past 2048 in whole
+  sub-chunk; Llama's and Qwen's 64 / 128) took Llama 3B's 26-token prompt from 183 to 133 ms, the Qwen 9B's / 27B's
+  32-token one from ~222 / ~650 to 159 / 452 ms (the weights still stream once: ~0.6 of a sub-chunk's time at 64).
+  Plan their input projections at SUB's pitch where buffers outlive a chunk in that layout (Qwen's conv states).
+  Choose their operators by speed, not configuration size (configurations by control packets: GemmQ, the attention on
+  4 rows, the norms on 4 columns; 3B's chat prompt 96 -> 70 ms). Long prompts the other way: chunks past 2048 in whole
   1024-token sub-chunks (Llama 3072 / 4096, where the flash attention's 64 passes allow) halve the ConfigureOps per
   token (1B 8K TTFT 1.29 -> 1.21 s).
 - **Library ELF** (`fused.Library`): each design compiled once, whatever the depth and chunk sizes;
