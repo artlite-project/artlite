@@ -13,7 +13,7 @@ import logging
 import secrets
 import time
 import urllib.parse
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -99,7 +99,7 @@ class ModelInfo:
 
         g = GGUFFile(path)
         meta, arch = g.meta, str(g.arch)
-        fields, n_vocab = file_info(path)
+        fields, n_vocab = file_info(path, gguf=g)
         ids = [int(meta[k]) for k in ("tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id") if k in meta]
         names = json.loads(g.strings_json("tokenizer.ggml.tokens", ids)) if ids else []
         special = dict(zip([k for k in ("bos", "eos") if f"tokenizer.ggml.{k}_token_id" in meta], names, strict=True))
@@ -221,15 +221,14 @@ def sse(data: object) -> str:
 
 
 # ----------------------------------------------------------------------
-# The app
+# What the model's server and the router share
 # ----------------------------------------------------------------------
 
 
-def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
-    """The FastAPI app of the server: the routes on ``engine`` with ``options``; ``info``: the model file's."""
-    app = FastAPI(title="artlite-server", version=options.build_info, docs_url="/docs", redoc_url=None)
-    app.add_middleware(CORSMiddleware, allow_origins=options.cors_origins, allow_methods=["*"], allow_headers=["*"])
-    warned: set[tuple[str, str]] = set()
+def new_app(*, build_info: str, cors_origins: list[str], lifespan: Callable | None = None) -> FastAPI:
+    """A FastAPI app whose errors all answer in OpenAI's shape, with CORS."""
+    app = FastAPI(title="artlite-server", version=build_info, docs_url="/docs", redoc_url=None, lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_methods=["*"], allow_headers=["*"])
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, e: ApiError) -> JSONResponse:
@@ -251,14 +250,68 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                                                                                                  "invalid_request_error")
         return JSONResponse(ApiError(e.status_code, kind, str(e.detail)).body(), status_code=e.status_code)
 
+    return app
+
+
+def key_check(api_keys: frozenset[str]) -> Callable[..., Awaitable[None]]:
+    """The dependency of the routes that need an API key (``Authorization: Bearer`` or ``X-Api-Key``), when the
+    server has keys."""
+
     async def authorized(authorization: str | None = Header(None), x_api_key: str | None = Header(None)) -> None:
-        """An API key (``Authorization: Bearer`` or ``X-Api-Key``), when the server has keys."""
-        if not options.api_keys:
+        if not api_keys:
             return
         key = x_api_key or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ")
                             else "")
-        if not any(secrets.compare_digest(key.encode(), k.encode()) for k in options.api_keys):
+        if not any(secrets.compare_digest(key.encode(), k.encode()) for k in api_keys):
             raise ApiError(401, "authentication_error", "Invalid API Key")
+
+    return authorized
+
+
+NOT_SUPPORTED = ["/v1/chat/completions/control", "/v1/responses", "/responses", "/v1/messages",
+                 "/v1/messages/count_tokens", "/v1/embeddings", "/embeddings", "/embedding", "/rerank", "/reranking",
+                 "/v1/rerank", "/v1/reranking", "/infill", "/v1/audio/transcriptions", "/audio/transcriptions",
+                 "/lora-adapters", "/metrics"]
+
+
+def add_unsupported(router: APIRouter) -> None:
+    """llama-server's routes that Artlite does not have (501), and ``/tools``: 403, which the web UI reads as its server
+    tools being off."""
+
+    @router.get("/tools")
+    @router.post("/tools")
+    async def tools() -> JSONResponse:
+        return JSONResponse({"error": {"message": "this feature is disabled", "type": "feature_disabled"}},
+                            status_code=403)
+
+    async def unsupported(request: Request) -> None:
+        raise ApiError(501, "not_supported_error", f"{request.url.path} is not supported by artlite-server")
+
+    for path in NOT_SUPPORTED:
+        router.add_api_route(path, unsupported, methods=["GET", "POST"], include_in_schema=False)
+
+
+def add_ui(app: FastAPI, ui: Callable[[FastAPI], None] | None, no_ui: str) -> None:
+    """The web UI's files at ``/`` (after the app's routes), or a page that says why there is none."""
+    if ui is not None:
+        ui(app)
+        return
+
+    @app.get("/", include_in_schema=False)
+    async def page() -> HTMLResponse:
+        return HTMLResponse(f"<!doctype html><title>artlite-server</title><p>{no_ui}</p>")
+
+
+# ----------------------------------------------------------------------
+# The app
+# ----------------------------------------------------------------------
+
+
+def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
+    """The FastAPI app of the server: the routes on ``engine`` with ``options``; ``info``: the model file's."""
+    app = new_app(build_info=options.build_info, cors_origins=options.cors_origins)
+    authorized = key_check(options.api_keys)
+    warned: set[tuple[str, str]] = set()
 
     async def loaded() -> None:
         if not engine.ready:
@@ -713,30 +766,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     async def lookup_streams() -> list[Any]:
         return []
 
-    @listed.get("/tools")
-    @listed.post("/tools")
-    async def tools() -> JSONResponse:
-        return JSONResponse({"error": {"message": "this feature is disabled", "type": "feature_disabled"}},
-                            status_code=403)
-
-    not_supported = ["/v1/chat/completions/control", "/v1/responses", "/responses", "/v1/messages",
-                     "/v1/messages/count_tokens", "/v1/embeddings", "/embeddings", "/embedding", "/rerank",
-                     "/reranking", "/v1/rerank", "/v1/reranking", "/infill", "/v1/audio/transcriptions",
-                     "/audio/transcriptions", "/lora-adapters", "/metrics"]
-
-    async def unsupported(request: Request) -> None:
-        raise ApiError(501, "not_supported_error", f"{request.url.path} is not supported by artlite-server")
-
-    for path in not_supported:
-        listed.add_api_route(path, unsupported, methods=["GET", "POST"], include_in_schema=False)
-
+    add_unsupported(listed)
     app.include_router(public)
     app.include_router(listed)
     app.include_router(api)
-    if options.ui is not None:
-        options.ui(app)
-    else:
-        @app.get("/", include_in_schema=False)
-        async def no_ui() -> HTMLResponse:
-            return HTMLResponse(f"<!doctype html><title>artlite-server</title><p>{options.no_ui}</p>")
+    add_ui(app, options.ui, options.no_ui)
     return app

@@ -28,8 +28,9 @@ device rather than for portability.
 
 - **GGUF files as they are.** No conversion step, no extra copy of the weights.
 - **Prompt and generation on the NPU.**
-- **Tools in llama.cpp's style.** `artlite-cli`, `artlite-server` (an OpenAI-compatible API and llama.cpp's web chat)
-  and `artlite-bench`, with llama.cpp's option names where they apply.
+- **Tools in llama.cpp's style.** `artlite-cli`, `artlite-server` (an OpenAI-compatible API and llama.cpp's web chat,
+  for one model or with a model picker over all of yours) and `artlite-bench`, with llama.cpp's option names where
+  they apply.
 
 > [!NOTE]
 > Artlite is mostly research into how far this hardware can be pushed, and where the NPU is the right device for the
@@ -69,6 +70,7 @@ uvx --from huggingface_hub hf download ggml-org/gemma-4-E4B-it-GGUF \
 M=ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf
 artlite-cli -m $M -p "Factorize x^2 + x - 6"     # the answer streams to stdout
 artlite-server -m $M -rea on                     # an OpenAI-compatible API and a web chat on http://127.0.0.1:8080
+artlite-server                                   # the same for every model of the models directory (a model picker)
 artlite-bench -m $M -p 1024,8192 -n 128          # prompt and generation speeds, as llama-bench
 ```
 

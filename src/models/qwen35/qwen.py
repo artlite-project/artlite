@@ -39,7 +39,7 @@ from ..common import Model, OverlayModel, Sampling
 from .minicpmv import image_prompt
 from .sequence import Sequence
 from .tokenizer import QwenTokenizer, chat_prompt
-from .vision import NpuVision
+from .vision import PROJECTORS, NpuVision
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
 # set; its repetition penalty 1.03 aside): the language model of openbmb's files, marked by the M-RoPE order of its
@@ -154,6 +154,7 @@ class Qwen(Model):
     name = "Qwen3.5"
     thinks = True
     reasoning = ("<think>", "</think>")
+    projectors = PROJECTORS
 
     def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None):
         self.gguf = GGUFFile(path)

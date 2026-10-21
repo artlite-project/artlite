@@ -323,6 +323,7 @@ class Model:
 
     name: str  # for messages: "Llama 3", ...
     vision: Any = None  # the image encoder (an option of the model's: its mmproj file), or None: text only
+    projectors: tuple[str, ...] = ()  # the projector types (``clip.projector_type``) of the mmproj files it takes
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
     tokenizer: Detokenizer

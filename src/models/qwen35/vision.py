@@ -30,6 +30,7 @@ _SOURCES = ("artlite/operators/sd15", "artlite/operators/vision", "artlite/txn.p
             "artlite/operators/act_lut.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
             "artlite/operators/overlay/runtime.py", "models/qwen35/vision.py")
 KEEP = 8  # images whose embeddings are kept
+PROJECTORS = ("minicpmv4_7",)  # the mmproj projector types (``clip.projector_type``) of the encoder
 
 
 class NpuVision:
@@ -40,7 +41,7 @@ class NpuVision:
         self.path = path
         self.gguf = GGUFFile(path)
         self.clip = ClipConfig.from_gguf(self.gguf)
-        if self.clip.projector != "minicpmv4_7":
+        if self.clip.projector not in PROJECTORS:
             raise NotImplementedError(f"{path}: projector {self.clip.projector!r} (MiniCPM-V 4.7's minicpmv4_7 only)")
         self.max_slices = max_slices or self.clip.max_slices
         self.sep = self.gguf.rows("v.tok_embd_sep", [0, 1, 2, 3]).numpy()

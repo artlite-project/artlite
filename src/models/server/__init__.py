@@ -1,12 +1,17 @@
-"""artlite-server: an OpenAI-compatible HTTP server and web chat for one GGUF model on the NPU, as llama.cpp's
+"""artlite-server: an OpenAI-compatible HTTP server and web chat for GGUF models on the NPU, as llama.cpp's
 ``llama-server`` (its options and the subset of its API that applies), for trying models more conveniently than
-``artlite-cli``:
+``artlite-cli``: one model, or the models of a directory (router mode: ``router``):
 
     artlite-server -m ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf    # then http://127.0.0.1:8080
+    artlite-server                                                            # the models directory's models
 
 Modules: ``main`` (the command line, uvicorn, the shutdown), ``api`` (the FastAPI routes, server-sent events, API
 keys), ``engine`` (the NPU worker, the prompt cache, stop strings, the reasoning split, timings), ``ui`` (llama.cpp's
-prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml authors).
+prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml authors); router mode: ``router`` (a
+model server process per model, loads and unloads, the proxy), ``child`` (a model server under the router),
+``catalog`` (the directory's models, their ids, presets).
+
+What follows is one model's server (router mode runs one per loaded model).
 
 Threads: uvicorn's event loop serves HTTP; one worker thread (``engine.Engine``) owns the model and makes every NPU
 call. It opens and loads the model after the server starts - until then the API answers 503 ``Loading model``, which
@@ -29,6 +34,6 @@ The API (llama-server's shapes): ``/v1/chat/completions`` (streamed or not, ``re
 ``prompt_progress``, ``usage``), ``/v1/completions``, ``/completion``, ``/v1/models``, ``/props``, ``/health``,
 ``/slots``, ``/tokenize``, ``/detokenize``, ``/apply-template``. Sampling is the model's (temperature, top-k, top-p,
 min-p); the sampler fields the NPU path does not have (penalties, DRY, XTC, typical-p, mirostat, ...) are accepted
-and ignored, logged when not neutral. Not provided: tool calls, images, embeddings, reranking, infill, the Responses
-and Anthropic APIs, ``/metrics``, LoRA, router mode, resumable streams.
+and ignored, logged when not neutral. Not provided: tool calls, embeddings, reranking, infill, the Responses and
+Anthropic APIs, ``/metrics``, LoRA, resumable streams.
 """

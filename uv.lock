@@ -76,6 +76,7 @@ dependencies = [
 examples = [
     { name = "fastapi" },
     { name = "gigatoken" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "uvicorn" },
 ]
@@ -95,6 +96,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'examples'", specifier = ">=0.115" },
     { name = "gguf", specifier = ">=0.19.0" },
     { name = "gigatoken", marker = "extra == 'examples'", specifier = ">=0.10.0" },
+    { name = "httpx", marker = "extra == 'examples'", specifier = ">=0.28" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "llvm-aie", specifier = "==22.0.0.2026102001+4f5df13d" },
     { name = "ml-dtypes" },

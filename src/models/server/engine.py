@@ -189,16 +189,17 @@ class Engine:
     The prompt cache: ``cached`` holds the tokens whose K / V the caches hold (the last sampled token never ran). A job
     keeps the prefix its prompt shares with them (``NpuModel.rewind``: a cache group's multiple, or for Qwen only an
     exact continuation) and runs the rest; a prompt that is all cached runs its last token again (``forward`` needs
-    one). ``on_exit``: called when the worker ends on its own (the load failed)."""
+    one). ``on_ready``: called on the worker once the model is loaded (after the warmup); ``on_exit``: when the worker
+    ends on its own (the load failed)."""
 
     def __init__(self, load: Callable[[], tuple[Model, NpuModel]], *, warmup: bool = True,
-                 on_exit: Callable[[], None] | None = None):
+                 on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None):
         self.model: Model | None = None
         self.npu: NpuModel | None = None
         self.error: str | None = None  # why the load failed
         self.cached: list[int] = []
         self.current: Job | None = None
-        self._load, self._warmup, self._on_exit = load, warmup, on_exit
+        self._load, self._warmup, self._on_ready, self._on_exit = load, warmup, on_ready, on_exit
         self._queue: collections.deque[Job] = collections.deque()
         self._cv = threading.Condition()
         self._stopping = False
@@ -275,6 +276,8 @@ class Engine:
                 self._on_exit()
             return
         self._ready.set()
+        if self._on_ready is not None:
+            self._on_ready()
         while True:
             with self._cv:
                 while not self._queue and not self._stopping:

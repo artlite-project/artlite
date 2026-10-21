@@ -164,9 +164,10 @@ def file_type_name(ftype: object) -> str:
     return re.sub(r"_K_([SML])$", lambda m: "_K - " + {"S": "Small", "M": "Medium", "L": "Large"}[m[1]], name)
 
 
-def file_info(path: str) -> tuple[dict[str, object], int]:
-    """A GGUF file's fields (llama.cpp's model_type, size and parameters) and its vocabulary size."""
-    f = GGUFFile(path)
+def file_info(path: str, *, gguf: GGUFFile | None = None) -> tuple[dict[str, object], int]:
+    """A GGUF file's fields (llama.cpp's model_type, size and parameters) and its vocabulary size; ``gguf``: the file
+    already open."""
+    f = gguf or GGUFFile(path)
     info = {"model_filename": path,
             "model_type": f"{f.arch} {f.meta.get('general.size_label', '?B')} "
                           f"{file_type_name(f.meta.get('general.file_type'))}",
