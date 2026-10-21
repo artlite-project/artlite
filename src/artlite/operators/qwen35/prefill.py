@@ -135,7 +135,7 @@ class QwenPrefill(ChunkPrefill):
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
         """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""
         return self._op(AP.AttnPrepOperator, lay, head_bytes=self.ov.ash.head_bytes,
-                        cs_positions=self.ov.max_positions + SUB, qs_T=T, passes=AP.two_streams(self.cfg, T))
+                        cs_positions=self.ov.max_positions + SUB)
 
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
@@ -172,7 +172,7 @@ class QwenPrefill(ChunkPrefill):
                 prep, attn = self._prep(p_in.layout, T), self.attn[T]
                 kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
-                qs_g = 2 * prep.qc * AP.SLOT * (COLS if prep.passes else 1)  # (bytes of a token group's Q slots)
+                qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots: QS pass-major)
                 grp = SUB // 32 * AP.GROUP  # (a sub-chunk's cache groups)
                 rl += [(prep, tok("G", j, prep, i=0, row=g_rb), sl("PCS", j * SUB * 256, prep, i=1), qn,
                         sl("QS", j * SUB // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")

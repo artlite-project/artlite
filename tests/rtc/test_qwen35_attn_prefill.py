@@ -51,12 +51,11 @@ def _gate_sigmoid(slots: np.ndarray) -> np.ndarray:
     return np.moveaxis(g, -3, -2).reshape(*lead, 8, AP.HD)
 
 
-def _qs_slots(fused: FusedOperator, T: int, qc: int, passes: bool) -> np.ndarray:
-    """QS as [column][token group][Q | gate][head][SLOT] uint8 (from the pass-major layout if ``passes``)."""
-    qs = fused.get_buffer("QS").view(torch.uint8).numpy()
-    if passes:
-        return np.ascontiguousarray(qs.reshape(T // 64, COLS, 8, 2, qc, AP.SLOT).swapaxes(0, 1)).reshape(COLS, T // 8, 2, qc, AP.SLOT)
-    return qs.reshape(COLS, T // 8, 2, qc, AP.SLOT)
+def _qs_slots(fused: FusedOperator, T: int, qc: int, qg: int) -> np.ndarray:
+    """QS (pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head][SLOT]) as [column][token group][Q |
+    gate][head][SLOT] uint8."""
+    qs = fused.get_buffer("QS").view(torch.uint8).numpy().reshape(T // (32 * qg), COLS, 4 * qg, 2, qc, AP.SLOT)
+    return np.ascontiguousarray(qs.swapaxes(0, 1)).reshape(COLS, T // 8, 2, qc, AP.SLOT)
 
 
 class _Setup:
@@ -107,8 +106,7 @@ class _Setup:
 
 
 def _prep_fused(s: _Setup) -> tuple[AP.AttnPrepOperator, FusedOperator]:
-    op = AP.AttnPrepOperator(T=s.T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS,
-                             passes=AP.two_streams(s.cfg, s.T))
+    op = AP.AttnPrepOperator(T=s.T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     fused = FusedOperator(name="attn_prep", runlist=[(op, "G", "CS", "NRM", "QS", "KV")], input_args=["G", "CS", "NRM"],
                           output_args=["QS"]).compile()  # (KV: scratch, zeroed by the host: flushed with the inputs)
     fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
@@ -136,7 +134,7 @@ def test_attn_prep(size: str) -> None:
     for t0, n in [(0, T), (T, n2)]:
         _run(fused, op.params(t0), s.G(t0, n))
         pos = np.arange(t0, t0 + n)
-        slots = _qs_slots(fused, T, qc, op.passes)
+        slots = _qs_slots(fused, T, qc, op.qg)
         q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]  # [head][token]
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
         qg = s.qfull[t0:t0 + n].reshape(n, -1, 2, hd)
@@ -168,8 +166,7 @@ def test_attn_prefill(size: str, T: int) -> None:
 
     n2 = 45
     s = _Setup(size, T, n2)
-    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS,
-                               passes=AP.two_streams(s.cfg, T))
+    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes)
     fused = FusedOperator(name="attn_prefill", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
@@ -180,7 +177,7 @@ def test_attn_prefill(size: str, T: int) -> None:
     for t0, n in [(0, T), (T, n2)]:
         _run(fused, prep.params(t0) | attn.params(t0), s.G(t0, n))
         A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
-        slots = _qs_slots(fused, T, qc, prep.passes)
+        slots = _qs_slots(fused, T, qc, prep.qg)
         q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
         kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
