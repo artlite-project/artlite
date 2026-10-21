@@ -66,10 +66,12 @@ HD = AT.HD
 ND = AT.ND
 SLOT = AT.REC_K  # bytes per head of a token group's Q panels (and of its sigmoid(gate): 4096 B used)
 GROUP = 3 * 9280  # bytes of a cache group (32 positions: two K objects, a V object)
-QA_CS = "qa_cs"  # scratchpad parameter: bf16 offset of the chunk's rows in the cos / sin table (128 p0)
-QA_KV = "qa_kv"  # scratchpad parameter: bf16 offset of the chunk's first cache group (GROUP / 2 * p0 / 32)
-QA_N = "qa_n"  # scratchpad parameter: p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count)
-QA_OFF = "qa_off"  # scratchpad parameter: bf16 offset of the chunk's second cache group
+# Scratchpad parameters. QA_KV and QA_OFF are one per operator size ("qa_kv<T>"): a parameter's range is the tightest
+# of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
+QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
+QA_KV = "qa_kv"  # bf16 offset of the chunk's first cache group (GROUP / 2 * p0 / 32)
+QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count)
+QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
 # (timing builds, ablate "ev_<kernel>": counter 0 the window's cycles, 1 lock stall, 2 all cycles, 3 the windows)
 COUNTERS = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24), (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24))
@@ -281,7 +283,7 @@ class AttnPrepOperator(ArtcOperator):
     and head a ``SLOT``, pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head], ``pass_groups``;
     a sub-chunk's part of a chunk's QS contiguous),
     KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
-    of the first token (default p0), ``QA_KV`` = GROUP / 2 * p0 / 32 (``params``)."""
+    of the first token (default p0), ``QA_KV`` (T's) = GROUP / 2 * p0 / 32 (``params``)."""
 
     STACK = 3072
     pfx = kernel_prefix("qap")
@@ -336,7 +338,7 @@ class AttnPrepOperator(ArtcOperator):
         (default p0)."""
         r = p0 if cs_row is None else cs_row
         assert p0 % 32 == 0 and 0 <= r and r + self.T <= self.cs_positions
-        return {QA_CS: 128 * r, QA_KV: GROUP // 2 * (p0 // 32)}
+        return {QA_CS: 128 * r, f"{QA_KV}{self.T}": GROUP // 2 * (p0 // 32)}
 
     def get_mlir_artifact(self) -> Module:
         p, T, qc, lay = self.pfx, self.T, self.qc, self.layout
@@ -358,7 +360,7 @@ class AttnPrepOperator(ArtcOperator):
         k_sg = Kernel(f"{p}_sg", "kernel.o", [row_ty, ws_ty, slot_ty])
         k_k = Kernel(f"{p}_k", "kernel.o", [kv_ty, cs_ty, ws_ty, kr_ty])
         k_v = Kernel(f"{p}_v", "kernel.o", [kv_ty, cs_ty, ws_ty, vr_ty])
-        p_cs, p_kv = ScratchpadParameter(QA_CS, np.int32), ScratchpadParameter(QA_KV, np.int32)
+        p_cs, p_kv = ScratchpadParameter(QA_CS, np.int32), ScratchpadParameter(f"{QA_KV}{T}", np.int32)
         n_tg = T // 8
 
         a3 = [ObjectFifo(in_ty if c in jobs else inq_ty, name=f"qp_a{c}", depth=2) for c in range(COLS)]
@@ -847,7 +849,7 @@ class PrefillAttnOperator(ArtcOperator):
     streams the cache groups 0 .. p0 / 32 + QG (b + 1) - 1 (the KV head's stream broadcast to the 4 NPH cores of its
     columns) and writes their outputs as the attn_out GEMM's A panels. Runtime sequence: QS (the prep's), KV (one layer's cache), A (T x heads x 256 as bfp16
     panels [T / 8][heads x 32]). Parameters ``QA_N`` = p0 / 32 + 1 (the history groups every pass streams first, and the
-    cores' trip count), ``QA_OFF``: the bf16 offset of the chunk's second group (``params``)."""
+    cores' trip count), ``QA_OFF`` (T's): the bf16 offset of the chunk's second group (``params``)."""
 
     STACK = 3072
     pfx = kernel_prefix("qaa")
@@ -891,7 +893,7 @@ class PrefillAttnOperator(ArtcOperator):
 
     def params(self, p0: int) -> dict[str, int]:
         assert p0 % 32 == 0
-        return {QA_N: p0 // 32 + 1, QA_OFF: GROUP // 2 * (p0 // 32 + 1)}
+        return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": GROUP // 2 * (p0 // 32 + 1)}
 
     def get_mlir_artifact(self) -> Module:
         if self.two:
@@ -910,7 +912,7 @@ class PrefillAttnOperator(ArtcOperator):
         k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [kv_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
-        p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
+        p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
         assert nph >= 2, "a KV head's stream from two shims of its columns"
         n_q = nph * 4 * qg * qc  # (a pass's slots of a KV head's cores, one object each)
@@ -1036,7 +1038,7 @@ class PrefillAttnOperator(ArtcOperator):
         k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
-        p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(QA_OFF, np.int32)
+        p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
         n_q = nph * 4 * qg  # (a pass's slots of a KV head's cores)
 
