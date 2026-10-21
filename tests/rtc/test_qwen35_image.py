@@ -8,6 +8,7 @@ import os
 
 import numpy as np
 import pytest
+import torch
 
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.operators import bfp16
@@ -128,8 +129,8 @@ def _group_out(n: int, R: int, G: int) -> np.ndarray:
 
 
 def test_layout_moe() -> None:
-    """Qwen3.6-35B-A3B: the config's MoE fields; per layer the router's planes ([hi | lo] of the column's 32 experts),
-    the shared gate's planes in every column, the shared expert's gate / up (every row once) and down (row groups of
+    """Qwen3.6-35B-A3B: the config's MoE fields; per layer the shared expert's gate / up (every row once), the
+    router's planes (each of the column's 32 experts' hi, lo), the shared gate's planes in every column, its down (row groups of
     2: tile i's row r, slot j = row 2 R i + R j + r of the column's 256); the expert slabs: half 2 e + h's gate / up
     rows (outputs h F / 2 .. of expert e), its down as row groups of 4 (slot j of tile i's row r: output 4 R i + R j
     + r over the half's K), every row of the 3-D tensors (the down's view: halves) once; an expert's two halves one
@@ -149,10 +150,10 @@ def test_layout_moe() -> None:
     for L in range(cfg.num_hidden_layers):
         b = f"blk.{L}."
         mi = img.region(L, "moe_in")
-        assert [x.name for x in mi.blocks] == ["router", "sgate", "sgu"] and mi.n_kc == 2
+        assert [x.name for x in mi.blocks] == ["sgu", "router", "sgate"] and mi.n_kc == 2
         router, sgate = mi.block("router").rows, mi.block("sgate").rows
         mine = 32 * np.arange(COLS)[:, None] + np.arange(32)
-        assert np.array_equal(router, np.concatenate([2 * mine, 2 * mine + 1], 1))  # (8 tiles per column)
+        assert np.array_equal(router, np.stack([2 * mine, 2 * mine + 1], -1).reshape(COLS, -1))  # (8 tiles per column)
         assert (sgate == [2 * E, 2 * E + 1, -1, -1, -1, -1, -1, -1]).all()
         gu = mi.block("sgu").rows
         assert sorted(gu[gu >= 0].tolist()) == list(range(2 * cfg.shared_ffn))
@@ -184,38 +185,53 @@ def test_layout_moe() -> None:
 def test_pack_moe() -> None:
     """QwenImage.pack of an attention layer (Q6_K expert downs) and a GDN layer (Q4_K): sampled tiles of every block,
     slab blocks too, at their places as pack_rows packs their rows; the router's planes decoded from the image (hi
-    exactly bfp16.values of the F32 rows, hi + lo within 3e-5 of them, relative RMS per row; the shared gate's in every
-    column); an expert's slab rows as the oracle's matrices (``qwen35_ref.experts``: gate / up rows, the down's
-    columns of the half)."""
+    exactly bfp16.values of the F32 rows times w / bf16(w) of the layer's post_attention_norm, hi + lo within 4e-5 of
+    them, relative RMS per row; the shared gate's in every column); an expert's slab rows as the oracle's matrices
+    (``qwen35_ref.experts``: gate / up rows, the down's columns of the half); the MoE model's K groups of 2048 (gdn_out,
+    attn_out: 2 groups of 2 chunks)."""
     g, cfg, img = _moe_image([3, 5])
     E, F, H = cfg.n_experts, cfg.expert_ffn, cfg.hidden_size
     out = np.zeros(img.nbytes, np.uint8)
     img.pack(out)
     rng = np.random.default_rng(0)
+
+    def ratio(L: int) -> np.ndarray:  # (the router's rows times w / bf16(w))
+        w = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").raw, np.float32).reshape(-1)
+        return (w / torch.from_numpy(w.copy()).bfloat16().float().numpy()).astype(np.float32)
+
+    def tensor(name: str) -> QTensor:
+        t = img.tensor(name)
+        if t.qtype != "F32":
+            return t
+        raw = (np.asarray(t.raw, np.float32).reshape(t.rows, t.cols) * ratio(int(name.split(".")[1]))).astype(np.float32)
+        return QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
+
     for r in img.regions + img.slabs:
         for b in r.blocks:
             for _ in range(2):
                 c, t = int(rng.integers(r.cols)), int(rng.integers(b.tiles))
                 n = b.R * b.G
-                ref = pack_rows([img.tensor(x) for x in b.tensors], b.rows[c, t * n:(t + 1) * n], b.fmt, b.R, S, r.n_kc,
+                ref = pack_rows([tensor(x) for x in b.tensors], b.rows[c, t * n:(t + 1) * n], b.fmt, b.R, S, r.n_kc,
                                 G=b.G)
                 col = out[r.offset + c * r.col_stride:r.offset + c * r.col_stride + r.col_bytes].reshape(-1, S)
                 for kc in range(r.n_kc):
                     assert np.array_equal(col[r.tile(r.rt0[b.name] + t, kc)], ref[0, kc]), (r.layer, r.name, b.name, kc)
     for L in (3, 5):
         b = f"blk.{L}."
-        w = np.concatenate([g.tensor(b + "ffn_gate_inp.weight").raw, g.tensor(b + "ffn_gate_inp_shexp.weight").raw])
+        w = np.concatenate([g.tensor(b + "ffn_gate_inp.weight").raw, g.tensor(b + "ffn_gate_inp_shexp.weight").raw]) * ratio(L)
         mi = img.region(L, "moe_in")
+        assert img.region(L, "attn_out" if cfg.attention[L] else "gdn_out").kc_group == 2
+        rt0 = mi.rt0["router"]
         for c in range(COLS):
             col = out[mi.offset + c * mi.col_stride:].reshape(-1)[:mi.col_bytes].reshape(-1, S)
-            vals = np.stack([np.concatenate([_bfp16_rows(col[mi.tile(rt, kc)]) for kc in range(2)], 1)
+            vals = np.stack([np.concatenate([_bfp16_rows(col[mi.tile(rt0 + rt, kc)]) for kc in range(2)], 1)
                              for rt in range(9)])  # (tile, 8 rows, H)
-            hi, lo = vals[:4].reshape(32, H), vals[4:8].reshape(32, H)
+            hi, lo = vals[:8].reshape(32, 2, H).transpose(1, 0, 2)
             rows = w[32 * c:32 * c + 32]
             assert np.array_equal(hi, bfp16.values(rows)), (L, c)
             assert np.array_equal(lo, bfp16.values(rows - hi)), (L, c)
             err = np.sqrt(((hi + lo - rows) ** 2).mean(1) / (rows ** 2).mean(1))
-            assert err.max() < 3e-5, (L, c, err.max())
+            assert err.max() < 4e-5, (L, c, err.max())
             assert np.array_equal(vals[8, 0], bfp16.values(w[E])) and np.array_equal(vals[8, 1], bfp16.values(w[E] - vals[8, 0]))
             assert not vals[8, 2:].any()
         # an expert's slab rows: the oracle's matrices

@@ -257,19 +257,22 @@ __attribute__((noinline)) void {{ p }}_q6k_mm(const uint8_t *__restrict xp, cons
 
 template <int HI>
 __attribute__((noinline)) void {{ p }}_q6k(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *__restrict tab = (bfloat16 *)(scr + 4096);  // [g][h][hl][i][r]
     bfloat16 *__restrict c = (bfloat16 *)(scr + 5120);  // [i][h][g][32]
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         const int sb = 2 * HI + u;
+{% if rg %}
+        float *__restrict yu = y + u * ys;  // (row groups: each super-block's rows of their own)
+{% endif %}
         {{ p }}_q6k_tr(a + {{ q6_codes }} + {{ 2 * 3 * 32 * R6 }} * sb, scr);
         {{ p }}_q6k_tab(a, tab, sb);
         {{ p }}_q6k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * (2 + sb), scr, c);
         // (sub-blocks n = 2 i + h in c's order; their tables at 128 h + 8 i: the h = 0 ones, then the h = 1 ones)
-        {{ p }}_sc(c, tab, y, 256, 8, 128);
-        {{ p }}_sc(c + 64, tab + 128, y, 256, 8, 128);
+        {{ p }}_sc(c, tab, {{ "yu" if rg else "y" }}, 256, 8, 128);
+        {{ p }}_sc(c + 64, tab + 128, {{ "yu" if rg else "y" }}, 256, 8, 128);
     }
 }
 """

@@ -229,10 +229,10 @@ __attribute__((noinline)) void {{ p }}_q4k_tr(const uint8_t *__restrict src, uin
 
 // Pass 2: per (g, sb) the table TD = d sc ([i][r], sc = lo + 16 crumb through I) -> tab; y[g] += the offsets
 // hilo(XS sc) 8 d + hilo(XS mn) (-dmin) (w = d sc (q - 8) + 8 d sc - dmin mn). HI: the second core's super-blocks 2, 3
-// (crumbs in bits 2-3)
+// (crumbs in bits 2-3){{ "; ys: the second super-block's rows at y + ys (row groups)" if rg else "" }}
 template <int HI>
 __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, const uint8_t *__restrict xs,
-                                               bfloat16 *__restrict tab, float *__restrict y)
+                                               bfloat16 *__restrict tab, float *__restrict y{{ ", int ys" if rg else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const v64bfp16ebs8 I = al::eye();
@@ -263,8 +263,14 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, co
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)),
                            aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(), Y);
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), {{ p }}_rep8v(m8), Y);
+{% if rg %}
+            {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (per super-block: its rows of their own with ys)
+            Y = aie::zeros<accfloat, 64>();
+{% endif %}
         }
+{% if not rg %}
         {{ p }}_yadd(y + 32 * g, Y);
+{% endif %}
     }
 }
 
@@ -309,17 +315,17 @@ __attribute__((noinline)) void {{ p }}_q4k_mm(const uint8_t *__restrict xp, cons
 // super-blocks 2 HI, 2 HI + 1 of a Q4_K tile
 template <int HI>
 __attribute__((noinline)) void {{ p }}_q4k(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     uint8_t *codes = a + 1024 + 4096 * HI;
     bfloat16 *tab = (bfloat16 *)(scr + 1024);
     bfloat16 *c = (bfloat16 *)(scr + 2048);
     {{ p }}_q4k_hw(a, scr);
     {{ p }}_q4k_tr(codes, codes);
-    {{ p }}_q4k_tab<HI>(scr, xs, tab, y);
+    {{ p }}_q4k_tab<HI>(scr, xs, tab, y{{ ", ys" if rg else "" }});
     {{ p }}_q4k_mm(xp, xs + {{ XS_SLOT }} * HI, codes, c);
     {{ p }}_sc(c, tab, y, 128, 8, 64);
-    {{ p }}_sc(c + 512, tab + 256, y, 128, 8, 64);
+    {{ p }}_sc(c + 512, tab + 256, y{{ " + ys" if rg else "" }}, 128, 8, 64);
 }
 """
 

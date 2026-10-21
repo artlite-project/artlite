@@ -165,11 +165,15 @@ class ModelOverlay:
         """The metadata object of a K group (``phases.groups``' words, the model's own added)."""
         return m
 
+    def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
+        """The K groups of a phase for S slots (``phases.groups``)."""
+        return mp.groups(self.image.region(L, name), self._flags(L, name), S)
+
     def _metas(self, S: int) -> None:
         """The phases' metadata objects for S slots (from layer ``start`` on)."""
         act = self.dev.view("ACT")
         for (L, name), regs in self.inp.items():
-            for rg, gr in zip(regs, mp.groups(self.image.region(L, name), self._flags(L, name), S)):
+            for rg, gr in zip(regs, self._groups(L, name, S)):
                 act[rg.off:rg.off + 4 * META] = self._meta(L, name, rg, gr.meta).view(np.uint8)
         self.dev.flush("ACT")
         self._metas_s = (S, self.start)

@@ -41,6 +41,24 @@ The main core's program, per X object (``_begin``):
 
 Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``kernels.py`` (and ``gemv.py``).
 
+MoE (``moe``: an MoE model's FFN; its transaction: ``qwen35.overlay``): the X stream is packet-switched (``XID``),
+its shim channel also carrying control packets into the shim's own TileControl (``moe.route``); the decode's K groups
+stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side chunk. Per layer:
+
+- the input phase (F_NORM) has blocks of their own kinds (the block word's B_*): the shared expert's gate / up (B_GU),
+  the router's [hi, lo] rows (B_PAIR: their sums go out, fp32), the shared expert's gate (B_PAIR, B_KEEP: its logit
+  stays in the state, S_SG);
+- the route object (F_ROUTE: the 8 columns' logits as its payload): the helper routes (``moe.route``), the main core
+  emits the control packets and the expert object's metadata (rbuf);
+- the shared expert's down (G 2 row groups; F_WS: times the gate's sigmoid; its panels in the side chunk, M_XC0);
+- the expert object (F_EXPERT, written by the column itself: its items, M_NT their A objects for the other cores): the
+  main core's sub-phases (S_NSUB; set up by the helper from the plan's templates, ``hsub``): per item and half, gate /
+  up on the input phase's panels and 1 / rms (F_HOUT: its h as [h | h] strips in the hold buffer), down on two strips
+  of the hold buffer in the side chunk (G 4 row groups: a tile's 4 blocks of R rows are rows of their own; F_WS: the
+  item's weights; F_ACCUM: into acc, bf16 [slot][hidden] in the helper's memory; F_ACC0 stores; F_EMITA: acc out);
+- the combine (F_COMB): its input objects are the 8 columns' partials of a slot's residual slice, which the helper adds
+  into the residual (K_ACC); the residual then goes out.
+
 Paged formats (``paged``: a model whose formats' kernels do not fit the cores together): their kernels are code pages
 (``paging``, the memtile transport): per column the main and helper cores request a format's page for their half
 before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes; the
@@ -69,6 +87,7 @@ from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, linear_tap
 from ..formats import FORMATS
 from ..kernel_source import kernel_prefix
+from ..moe import route as moe_k
 from ..util import Attr, regions
 from . import gemv
 from .kernels import SRC as _SRC
@@ -113,6 +132,28 @@ F_PZERO = 1 << 15  # pend = 0 first (an F_VOUT phase's first K group)
 F_TOK = 1 << 16  # (another core's object) a token object: the main core keeps M_TOK_NG + col (its cache A objects)
 F_KPAIR = 1 << 18  # (a header) its tiles hold row pairs of a matrix of K = POST_K (a row's super-blocks: two rows), run
 # as two slots of one token: slot 0 = [x | 0], slot 1 = [0 | x] (the helper mirrors strip 0 into slot 1 for strip 1)
+# (``moe`` designs: an MoE layer, module docstring "MoE")
+B_GU = 512  # in a block's format word: its rows are [8 gate | 8 up] groups (F_GU for this block)
+B_PAIR = 1024  # its rows are pairs [hi, lo] of one value (an F32 router's planes): the pairs' sums go out
+B_KEEP = 2048  # (B_PAIR) the block's first value stays in the main core's state (S_SG + slot): the shared expert's gate
+B_G2, B_G4 = 4096, gemv.B_G4  # its tiles hold row groups of 2 / 4 rows (``overlay.image.Block.G``)
+F_WS = 1 << 19  # the rows times the slots' scales (wsc: the shared expert's gate, an expert's routing weights)
+F_ROUTE = 1 << 20  # the route object: the router's logits as its payload -> the routing (control packets, expert object)
+F_EXPERT = 1 << 21  # the expert object: the column's items, M_NT their A objects (the main core's sub-phases)
+F_COMB = 1 << 22  # the combine: its input objects (the columns' partials of a slot) add into the residual; F_EMITR
+F_HOUT = 1 << 23  # (an expert's gate / up sub-phase) the outputs into the hold buffer: its down's input
+F_ACCUM = 1 << 24  # (a down sub-phase) the rows add into acc ([slot][hidden] bf16; F_ACC0: stored), F_EMITA: then out
+F_ACC0 = 1 << 25
+F_EMITA = 1 << 26
+XID = 3  # (moe) the X stream's packet id (its channel also carries the routing's control packets: ``moe.route.CID``)
+# (moe) metadata words: a phase's first chunk of x / sum panels; the route object's (the layer's expert halves at
+# M_RBASE (device address lo, hi) + k M_RSTR, M_RTGU + M_RTDN A objects each); the expert object's items (M_NITEM,
+# then per item: e | h0 << 8 | h1 << 9, its weights per slot, fp32 bits)
+M_NITEM, M_ITEM = 24, 25
+ITEM_WORDS = 1 + SLOTS  # (e | h0 << 8 | h1 << 9, its weight in each slot)
+M_RBASE, M_RSTR, M_RTGU, M_RTDN = 50, 52, 53, 54
+M_XC0 = 55
+assert M_ITEM + ITEM_WORDS * moe_k.MAX_ITEMS <= M_RBASE
 
 # state words of the main core's workspace (the first ones are trip counts of the core program)
 (S_NNO, S_NXN, S_NXP, S_NIN, S_NT, S_NE, S_NSKIP, S_NASKIP, S_NM, S_NR, S_FLAGS, S_NS, S_K8, S_G, S_NRT, S_NB, S_KC,
@@ -125,8 +166,11 @@ S_B = 32  # the block table, 3 words per block
 # slice and 1 / norm length (M_H8, M_IH); (``tok``) the cache objects per token object (S_NAS + M_TOK_KIND: N_TOK words)
 S_NPS, S_SCALE, S_COL, S_H8, S_IH, S_NAS = 44, 45, 48, 49, 50, 52
 N_TOK = 8
+# (moe) the sub-phases of an expert object (a trip count), their local input strips (a trip count), the phase's first
+# panel chunk, the next sub-phase, the shared gate's logit per slot (fp32 bits)
+S_NSUB, S_NLS, S_XC0, S_SUB, S_SG = 44, 45, 46, 47, 48
 S_WORDS = 64
-assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS
+assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS and S_SG + SLOTS <= S_WORDS
 # paged formats (module docstring): the memtile's page channel, its first page BD (none of aiecc's: ``Store.check``), the
 # store's bytes; the pager's state words (data memory of the main and helper cores) and wake lock; the stream ids of
 # the pages' and the requests' routes (main, helper)
@@ -138,7 +182,7 @@ PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}  # (gap: a phase's last tile to the next X object; gapm: to the next phase's)  # (pre: a phase's begin to its first tile)
 # the helper's commands: CMD words 0 .. 3 (by kind), the kind at C_KIND
 C_KIND = 4
-K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN = range(6)
+K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC = range(8)  # (K_SUB, K_ACC: moe)
 C_SP = 5  # (K_STRIP, K_PSTRIP) the input's slots per k block (K_PSTRIP: + C_MIRROR: strip 0 into slot 1, F_KPAIR)
 C_MIRROR = 8
 POST_K = 256  # (post designs) k of a header phase's input object: [k block 32][v | r][slot 4][8] bf16
@@ -180,16 +224,25 @@ class DecodeOverlayOperator(ArtcOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
-                 gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
+                 gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
+                 max_k: int = MAX_K, win: str = ""):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
         count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold fewer
         than 16 rows (their [8 gate | 8 up] groups cross tiles: a window per slot); paged: formats whose kernels are
-        code pages (module docstring)."""
+        code pages (module docstring); moe: (experts, experts used per token) of the MoE layers' phases (module
+        docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
+        combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
+        the side chunk)."""
         self.chunk = gemv.Chunk(nsb)
-        self.max_g = MAX_K // self.chunk.k  # K chunks of a phase's group
-        assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= MAX_K
+        self.moe = moe is not None
+        self.experts, self.top = moe or (0, 0)
+        assert max_k % self.chunk.k == 0 and max_k <= MAX_K
+        self.max_k = max_k
+        self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
+        assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= max_k
+        assert not moe or not (post or pli or packed or tok or gu_win) and act == "silu" and nsb == 4
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert act in ("silu", "gelu") and (not pli or act == "gelu")
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
@@ -204,6 +257,9 @@ class DecodeOverlayOperator(ArtcOperator):
         self.yt = 128 if any(r > 16 for r in rows.values()) else 64  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
         self.yn = 128 if any(r > 16 and f not in self.rowsplit for f, r in rows.items()) else gemv.Y_FLOATS
+        if self.moe:  # (row groups: a tile's 4 blocks of 16 rows, the helper's two)
+            self.yt, self.yn = 256, 128
+            self.PACKET, self.BD_COUNT = {"X": XID}, {"A": 3}  # (shim BD 3: the experts' tasks, ``moe``)
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
         self.h8 = hidden // COLS
@@ -230,6 +286,10 @@ class DecodeOverlayOperator(ArtcOperator):
             sizes += [("pli", 2 * 4 * SLOTS * 8)]
         if self.gu_win:
             sizes += [("gw", 4 * SLOTS * (64 if self.yt == 128 else 32))]
+        if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
+            # routing's C objects (control packets, the expert object's metadata), the expert object's plan)
+            sizes += [("wsc", 4 * 32), ("hold", 2 * SLOTS * OBJ_K), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
+                      ("plan", 4 * moe_k.PLAN_WORDS)]
         out = regions(sizes)
         assert MAX_K + 2048 <= gemv.SCR_BYTES  # (the 16-k sums of a K group, fp32, and hpstrip's nb in the helper's scratch)
         return out
@@ -258,7 +318,7 @@ class DecodeOverlayOperator(ArtcOperator):
         fmts = list(self.rows)
         assert not self.xh or OBJ_K * 2 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
-                          pg=self._page_spec() if self.paged else None)
+                          pg=self._page_spec() if self.paged else None, rg=self.moe)
         if self.act == "silu":
             src += "\nnamespace {\n" + act_lut.render_silu() + "\n}  // namespace\n"
         src += self._extra_src(p, consts)
@@ -278,7 +338,17 @@ class DecodeOverlayOperator(ArtcOperator):
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS,
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
-                                 **consts)
+                                 moe=self.moe, **self._moe_vars(p, consts), **consts)
+
+    def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
+        """(moe) The template variables of the MoE paths: the routing's source (``moe.route``), the side chunk, the
+        plan's layout."""
+        if not self.moe:
+            return {}
+        route = moe_k.render(p, consts | {"META": META, "SLOTS": SLOTS, "ITEM_WORDS": ITEM_WORDS,
+                                          "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS)
+        return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
+                "ITEM_WORDS": ITEM_WORDS}
 
     def _page_spec(self) -> gemv.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
@@ -355,11 +425,19 @@ class DecodeOverlayOperator(ArtcOperator):
         k_relay = Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty])
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
+        if self.moe:  # (acc: the experts' partials of the column, in the helper's memory)
+            acc_ty = np.ndarray[(SLOTS * self.hidden,), bf]
+            k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty, acc_ty])
+            k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, acc_ty])
+            k_sub = Kernel(f"{p}_sub", "kernel.o", [ws_ty, cmd_ty])
+            k_lstrip = Kernel(f"{p}_lstrip", "kernel.o", [ws_ty, cmd_ty])
 
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
         a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH) for c in range(COLS)]
         a_l1 = [a_l3[c].cons(depth=self.A_DEPTH).forward(tile=Tile(c, 1), depth=2, name=f"{P}_a{c}") for c in range(COLS)]
-        x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH) for c in range(COLS)]
+        # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
+        x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH, **({"packet": True, "packet_id": XID} if self.moe
+                                                                            else {})) for c in range(COLS)]
         x_l1 = [x_l3[c].cons(depth=self.X_DEPTH).forward(tile=Tile(c, 1), depth=1, name=f"{P}_x{c}") for c in range(COLS)]
         c_fifos = [ObjectFifo(c_ty, name=f"{P}_C{c}", depth=2) for c in range(COLS)]
         cmds = [ObjectFifo(cmd_ty, name=f"{P}_cmd{c}", depth=2) for c in range(COLS)]
@@ -373,7 +451,10 @@ class DecodeOverlayOperator(ArtcOperator):
                 rest = rest[:-2]
             m_f = rest.pop(0) if self.msg else None
             r_f = rest.pop(0) if self.relay else None
+            if self.moe:
+                sub, lstrip, acc, *rest = rest
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
+            ea = (acc,) if self.moe else ()  # (collect's and emit's last argument: moe's acc)
 
             def command(call: object) -> None:  # a strip of the input object: the helper's command
                 c = cmd_f.acquire(1)
@@ -395,12 +476,12 @@ class DecodeOverlayOperator(ArtcOperator):
             def emits() -> None:
                 for _ in range_(ws[i_st + S_NE]):
                     o = c_f.acquire(1)
-                    emit(ws, o)
+                    emit(ws, o, *ea)
                     c_f.release(1)
                 if m_f is not None:
                     for _ in range_(ws[i_st + S_NM]):
                         o = m_f.acquire(1)
-                        emit(ws, o)
+                        emit(ws, o, *ea)
                         m_f.release(1)
 
             for _ in forever_():
@@ -427,26 +508,41 @@ class DecodeOverlayOperator(ArtcOperator):
                     x = x_f.acquire(1)
                     strips(lambda c, x=x: strip(x, ws, c))
                     x_f.release(1)
-                for _ in range_(ws[i_st + S_NIN]):
-                    c = cmd_f.acquire(1)
-                    inp(ws, c, xs)
-                    cmd_f.release(1)
-                    r = res_f.acquire(1)
-                    inv(r, ws)
-                    res_f.release(1)
-                if psums:
-                    emits()  # (a header: the updated residual slice)
-                for _ in range_(ws[i_st + S_NT]):
-                    a = a_f.acquire(1)
-                    c = cmd_f.acquire(1)
-                    tcmd(a, ws, c, xs)
-                    cmd_f.release(1)
-                    tile(a, ws, xp, xs)
-                    r = res_f.acquire(1)
-                    collect(r, ws)
-                    res_f.release(1)
-                    a_f.release(1)
-                    emits()  # (after the last tile: the phase's last outputs too)
+                def inputs() -> None:  # the sum panels, the 1 / rms
+                    for _ in range_(ws[i_st + S_NIN]):
+                        c = cmd_f.acquire(1)
+                        inp(ws, c, xs)
+                        cmd_f.release(1)
+                        r = res_f.acquire(1)
+                        inv(r, ws)
+                        res_f.release(1)
+
+                def tiles() -> None:
+                    for _ in range_(ws[i_st + S_NT]):
+                        a = a_f.acquire(1)
+                        c = cmd_f.acquire(1)
+                        tcmd(a, ws, c, xs)
+                        cmd_f.release(1)
+                        tile(a, ws, xp, xs)
+                        r = res_f.acquire(1)
+                        collect(r, ws, *ea)
+                        res_f.release(1)
+                        a_f.release(1)
+                        emits()  # (after the last tile: the phase's last outputs too)
+
+                inputs()
+                if psums or self.moe:
+                    emits()  # (a header: the updated residual slice; moe: the routing's objects, the combine's residual)
+                tiles()
+                if self.moe:
+                    for _ in range_(ws[i_st + S_NSUB]):  # an expert object's sub-phases: the helper sets each up
+                        command(lambda c: sub(ws, c))
+                        answer()
+                        for _ in range_(ws[i_st + S_NLS]):  # (a down's input: strips from the hold buffer)
+                            command(lambda c: lstrip(ws, c))
+                            answer()
+                        inputs()
+                        tiles()
                 for _ in range_(ws[i_st + S_NSKIP]):  # the other cores' X objects
                     x_f.acquire(1)
                     x_f.release(1)
@@ -485,13 +581,15 @@ class DecodeOverlayOperator(ArtcOperator):
                              paging.request_flow(t, mem, stream_id=PG_REQ_ID[h])]
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}")
+            moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
             xs = Buffer(xs_ty, name=f"{P}_xs{c}", tile=Tile(c, mr))
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, hr))
             workers.append(Worker(main_fn, [a_l1[c].cons(), x_l1[c].cons(depth=1), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
-                                            *([r_fifos[c].cons()] if self.relay else []), k_begin, k_nbegin, k_strip_n,
+                                            *([r_fifos[c].cons()] if self.relay else []), *moe_args, k_begin, k_nbegin,
+                                            k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
                                             *([k_psums] if self.post else []), ws, xp, xs, c, *pg_main.get(c, [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,

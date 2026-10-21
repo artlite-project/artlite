@@ -12,6 +12,7 @@ with a web chat).
 | ``llama`` | ``llama3`` | Llama 3.2 1B / 3B, Llama 3.1 8B |
 | ``gemma4`` | ``gemma4`` | Gemma 4 E4B |
 | ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 (Gated DeltaNet and full-attention layers), MiniCPM-V 4.7 (images: its mmproj) |
+| ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN) |
 | ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 
@@ -35,6 +36,7 @@ ARCHITECTURES = {
     "llama": ("models.llama3.llama", "Llama"),
     "gemma4": ("models.gemma4.gemma", "Gemma"),
     "qwen35": ("models.qwen35.qwen", "Qwen"),
+    "qwen35moe": ("models.qwen35.qwen", "Qwen"),
 }
 # diffusers pipeline class (``_class_name`` of model_index.json) -> (module, class), imported on use
 PIPELINES = {

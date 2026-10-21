@@ -266,9 +266,10 @@ Silent wrong results:
 - **A rolled `extract<8>(h)` loop stored wrong lanes** (besides compiling to a switch): unroll lane loops.
 - **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
   (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
-- **A 2048-bit vector (`aie::store_v` / `load_v` of 64 fp32) at an address 32-B but not 64-B aligned** is accessed 32 B
-  lower (the low address bits dropped): its stores overwrite the 32 B before the buffer (sd15's d-80 attention
-  scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B boundaries.
+- **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B
+  aligned** is accessed 32 B lower (the low address bits dropped): its stores overwrite the 32 B before the buffer
+  (sd15's d-80 attention scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B
+  boundaries, or access a 32-B-aligned window as two 32-B halves (`overlay/kernels.py`'s MoE accumulator).
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
   array) reads garbage (NaN state), and so does a `seek` to such a position (a rewind by a panel count not a multiple
   of 8: 5 panels, 360 B). Open one stream at the array's start and pop in order.

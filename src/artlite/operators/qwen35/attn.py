@@ -55,8 +55,9 @@ POS_PER_GROUP = 32  # 4 records: two K objects and a V object
 ROT = 32  # rotated pairs (dims i, i + 32 for i < 32)
 F_ATT = 1 << 10  # M_FLAGS of an attention core's object
 SMAX = 4
-SUB = 2  # slots of a sub-step at most (``substeps``)
-U = 3  # sub-steps of a step at most
+SUB = 2  # slots of a sub-step at most (``substeps``; a split one: ``AttnShape.split_sub``)
+U = 3  # sub-steps of a step at most (``AttnShape.u``)
+MAX_SPLIT_ROWS = 12  # a split sub-step's query rows at most (the workspace's sets)
 
 
 # metadata words of an F_ATT object: decode.py's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A
@@ -567,7 +568,11 @@ class AttnShape:
         self.qc = cfg.num_attention_heads // COLS
         assert 1 <= self.qc <= 4 and 2 * 2 * self.qc * HD <= xpay and 4 * (2 * HD + 64 * SMAX) <= xpay
         assert REC.pg(a_bytes) == POS_PER_GROUP
-        self.rows = SUB * self.nph * self.qc  # (a split sub-step's query rows at most)
+        # (a split sub-step's slots: SUB, or one where a chain's heads would need more query rows than the workspace
+        # holds: Qwen3.6-35B-A3B's 8 per KV head; then a step takes up to SMAX sub-steps)
+        self.split_sub = SUB if SUB * self.nph * self.qc <= MAX_SPLIT_ROWS else 1
+        self.u = U if self.split_sub == SUB else SMAX
+        self.rows = max(self.split_sub * self.nph * self.qc, SUB * self.qc)  # (a sub-step's query rows at most)
         self.sets = -(-self.rows // 4)
         self.c_len, self.a_bytes = c_len, a_bytes
         self.eps = cfg.rms_norm_eps

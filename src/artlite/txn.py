@@ -52,6 +52,7 @@ S2MM, MM2S = 0, 1  # directions (the sync operation's encoding)
 CTRL = {S2MM: (0x1D200, 0x1D208), MM2S: (0x1D210, 0x1D218)}
 QUEUE = {S2MM: (0x1D204, 0x1D20C), MM2S: (0x1D214, 0x1D21C)}
 QUEUE_STATUS = {S2MM: (0x1D220, 0x1D224), MM2S: (0x1D228, 0x1D22C)}  # (Task_Queue_Size: bits 22:20)
+SHIM_LOCK0 = 0x14000  # shim lock n's value at SHIM_LOCK0 + 16 n (16 locks)
 SHIM_BDS = 16
 QUEUE_DEPTH = 4  # tasks a channel queues
 CONTROLLER_ID = 15  # the firmware's task-complete-token controller (as aiecc sets it)
@@ -119,7 +120,8 @@ class Txn:
 
     def shim_bd(self, col: int, bd: int, *, address: int, nbytes: int,
                 dims: tuple[int, int, int, int] | None = None, iteration: tuple[int, int] | None = None,
-                next_bd: int | None = None) -> int:
+                next_bd: int | None = None, packet: int | None = None, acquire: tuple[int, int] | None = None,
+                release: tuple[int, int] | None = None) -> int:
         """Write shim BD ``bd`` of column ``col``: ``nbytes`` bytes from the device address
         ``address`` (``device_address`` of a host buffer) on, contiguous - or, with ``dims`` = (n0,
         n1, s1, s2) in 32-bit words, word number i0 + n0 * (i1 + n1 * i2) of the stream at address
@@ -128,7 +130,9 @@ class Txn:
         that repeats the BD (``shim_push(repeat=)``) starts at address + 4 * step * (i % count). Returns the
         word index of the BD in ``words()``: [length in words, address low, address high] may be rewritten
         there (``bd_words``) before a later dispatch of the same transaction. next_bd: the task continues with that BD
-        (a chain: one queue entry)."""
+        (a chain: one queue entry). packet: the MM2S stream gets a packet header of this id (a packet-switched
+        channel); acquire (lock, value): the BD waits for shim lock ``lock`` >= value and subtracts it; release (lock,
+        value): adds value to it when done."""
         assert 0 <= bd < SHIM_BDS
         d0 = d1 = d2 = 0
         if dims is not None:
@@ -143,9 +147,13 @@ class Txn:
             it = ((count - 1) << 20) | (step - 1)
         nxt = 0 if next_bd is None else next_bd << 27 | 1 << 26  # (BD word 7: Next_BD, Use_Next_BD)
         assert next_bd is None or 0 <= next_bd < SHIM_BDS
+        w = bd_words(address, nbytes)
+        if packet is not None:  # (word 2: Enable_Packet, Packet_ID)
+            assert 0 <= packet < 32, packet
+            w[2] |= 1 << 30 | packet << 19
+        nxt |= shim_lock_bits(acquire, release)
         at = self.blockwrite(tile_address(col, 0, SHIM_BD0 + BD_BYTES * bd),
-                             [*bd_words(address, nbytes), d0, _BD_BURST_512B | d1, _BD_AXCACHE | d2, it,
-                              _BD_VALID | nxt]) + 4
+                             [*w, d0, _BD_BURST_512B | d1, _BD_AXCACHE | d2, it, _BD_VALID | nxt]) + 4
         self.addrs.append((at + 1, address))
         return at
 
@@ -246,6 +254,21 @@ def mem_bd_words(*, addr: int, nwords: int, dims: list[tuple[int, int]] | None =
         lk, v = release
         w7 |= lk << 16 | _s7(v) << 24
     w[7] = w7
+    return w
+
+
+def shim_lock_bits(acquire: tuple[int, int] | None = None, release: tuple[int, int] | None = None) -> int:
+    """A shim BD's word 7 lock fields: acquire (lock, value): wait for >= value, subtract it (Lock_Acq_Enable,
+    Lock_Acq_Value = -value); release (lock, value): add value when done (Lock_Rel_Value, Lock_Rel_ID)."""
+    w = 0
+    if acquire is not None:
+        lk, v = acquire
+        assert 0 <= lk < 16 and 0 < v < 64, acquire
+        w |= 1 << 12 | ((-v) & 0x7F) << 5 | lk
+    if release is not None:
+        lk, v = release
+        assert 0 <= lk < 16 and 0 < v < 64, release
+        w |= (v & 0x7F) << 18 | lk << 13
     return w
 
 

@@ -186,6 +186,44 @@ template <unsigned N, bool ZERO = false>
     return aie::add(pf.template cast_to<int32>(), aie::upshift(n, 23)).template cast_to<float>();
 }
 
+// 2^x in fp32 to ~2^-16 for x >= -126 (exp2f's split, then e^(f ln 2) by its Taylor polynomial of degree 6 in fp32
+// products, mulff): where exp2f's bf16-level error shows, e.g. an MoE router's weights
+template <unsigned N>
+[[clang::always_inline]] inline aie::vector<float, N> exp2_fp32(aie::vector<float, N> x)
+{
+    x = aie::max(x, aie::broadcast<float, N>(-126.0f));
+    const aie::vector<float, N> magic = aie::broadcast<float, N>(12582912.0f);  // 1.5 * 2^23
+    const aie::vector<float, N> y = aie::add(x, magic);
+    const aie::vector<float, N> f = aie::sub(x, aie::sub(y, magic));
+    const aie::vector<int32, N> n = aie::sub(y.template cast_to<int32>(), aie::broadcast<int32, N>(0x4B400000));
+    const aie::vector<float, N> t = mul_hilo<N, 0.69140625f, 0.001739501953125f>(f);  // (f ln 2)
+    aie::vector<float, N> p = aie::broadcast<float, N>(1.0f / 720);
+    p = aie::add(aie::broadcast<float, N>(1.0f / 120), mulff<N>(t, p));
+    p = aie::add(aie::broadcast<float, N>(1.0f / 24), mulff<N>(t, p));
+    p = aie::add(aie::broadcast<float, N>(1.0f / 6), mulff<N>(t, p));
+    p = aie::add(aie::broadcast<float, N>(0.5f), mulff<N>(t, p));
+    p = aie::add(aie::broadcast<float, N>(1.0f), mulff<N>(t, p));
+    p = aie::add(aie::broadcast<float, N>(1.0f), mulff<N>(t, p));
+    return aie::add(p.template cast_to<int32>(), aie::upshift(n, 23)).template cast_to<float>();
+}
+
+// 1 / x in fp32 to ~2^-16 for normal x > 0: the mantissa's reciprocal (a linear guess on [1, 2), 6%, and three Newton
+// steps in mulff), its exponent negated in the bits (no scalar division: a soft-float call)
+template <unsigned N>
+[[clang::always_inline]] inline aie::vector<float, N> recip_fp32(aie::vector<float, N> x)
+{
+    const aie::vector<int32, N> b = x.template cast_to<int32>();
+    const aie::vector<int32, N> e = aie::sub(aie::bit_and(b, aie::broadcast<int32, N>(0x7F800000)),
+                                             aie::broadcast<int32, N>(0x3F800000));
+    const aie::vector<float, N> m = aie::sub(b, e).template cast_to<float>();  // (in [1, 2))
+    const aie::vector<float, N> two = aie::broadcast<float, N>(2.0f);
+    aie::vector<float, N> r = aie::sub(aie::broadcast<float, N>(1.4117647f),
+                                       mulc<N>(m, aie::broadcast<bfloat16, N>(0.47058824f)).template to_vector<float>());
+    for (int i = 0; i < 3; i++)
+        r = mulff<N>(r, aie::sub(two, mulff<N>(m, r)));
+    return aie::sub(r.template cast_to<int32>(), e).template cast_to<float>();
+}
+
 // the same 2^x rounded to bf16
 template <unsigned N>
 [[clang::always_inline]] inline aie::vector<bfloat16, N> exp2(aie::vector<float, N> x)

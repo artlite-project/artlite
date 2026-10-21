@@ -2,7 +2,8 @@
 
 Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and MiniCPM-V 4.7 1B (its language model, and images
 through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (llama.cpp architecture `qwen35`: Gated
-DeltaNet layers with a full-attention layer every fourth). The architecture, tokenizer and chat template are read from the file's metadata.
+DeltaNet layers with a full-attention layer every fourth), and Qwen3.6-35B-A3B (`qwen35moe`: the same layers with a
+mixture of experts as the FFN: [below](#mixture-of-experts-qwen36-35b-a3b)). The architecture, tokenizer and chat template are read from the file's metadata.
 Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
 the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100,
 repetition penalty 1.03).
@@ -13,13 +14,15 @@ repetition penalty 1.03).
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
+$ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf     (MiniCPM-V's language model)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf            (its vision encoder, 16x)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf         (the same, 4x: finer detail)
 ```
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
-the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`). The NPU path reads Q4_K, Q5_K and Q6_K tensors.
+the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"). The NPU path reads Q4_K,
+Q5_K and Q6_K tensors (and an MoE router's F32 ones).
 
 ## How the NPU path works
 
@@ -41,8 +44,18 @@ runs as dispatches of whole layers, each within the driver's hang detection. The
 from the LM head alone. Tokens where a chunk cannot start (inside a 32-position cache group, e.g. after a
 generated reply; fewer than 3 left) run as decode steps.
 
-Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's)
-are re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.
+Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's,
+21.02 GB of the 35B-A3B's) are re-laid-out into a device buffer at load, in memory, at their quantization's size.
+Nothing is written to disk.
+
+## Mixture of experts (Qwen3.6-35B-A3B)
+
+Each layer's FFN is 256 experts (8 per token) and a shared expert. A decode step computes the router's logits in fp32
+on every column, then each column's cores pick every token's top 8 themselves and point the column's weight stream at
+the experts they take (control packets the column writes and its shim reads back); each column computes whole experts
+or halves of them, and the next phase adds the columns' results into the residual stream (`moe/route.py`,
+`overlay/decode.py`). A step streams 1.96 GB of the image at one token (8 of the 256 experts in every layer).
+Its prompts run as decode steps (about 45 tokens/s): the chunked prefill does not run MoE layers.
 
 ## Images (MiniCPM-V 4.7)
 

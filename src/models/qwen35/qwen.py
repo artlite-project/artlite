@@ -1,4 +1,5 @@
-"""Qwen3.5 / Qwen3.6 (GGUF architecture ``qwen35``: Gated DeltaNet and full-attention layers) on the NPU.
+"""Qwen3.5 / Qwen3.6 (GGUF architectures ``qwen35``: Gated DeltaNet and full-attention layers, and ``qwen35moe``: the
+same with a mixture of experts as the FFN) on the NPU.
 
 A dispatch runs up to 4 tokens through every layer and the LM head on one stream of the weights
 (``artlite.operators.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers (the MMUL
@@ -14,7 +15,7 @@ layer-major, control code assembled per chunk from one library ELF; the GEMMs re
 V, GDN states and conv states land in the decode's buffers), each chunk in pieces of a few layers (dispatches of one HW
 context); its last token's logits come from the LM head alone (``QwenOverlay.logits_of``). Tokens where a chunk cannot
 start (a position inside a 32-position cache group, after a generated reply; fewer than 3 tokens left) run as decode
-steps of up to 4 tokens.
+steps of up to 4 tokens, and so does an MoE model's whole prompt (no prefill for its layers).
 
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to disk. Load (27B, the
@@ -50,7 +51,8 @@ MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95, "penalty_repeat":
 
 class NpuQwen(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full-attention layers' caches hold; ``prefill``: prompts
-    in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``prefill.SIZES``)."""
+    in chunks through the prefill ELFs (else as decode steps; an MoE model's always), of the sizes ``sizes`` (default
+    ``prefill.SIZES``)."""
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):
@@ -59,6 +61,7 @@ class NpuQwen(OverlayModel):
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
+        prefill = prefill and not self.cfg.moe
         self.prefill = QwenPrefill(self.overlay, sizes=sizes) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)

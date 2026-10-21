@@ -15,6 +15,8 @@ from ..formats import FORMATS
 from . import gemv
 from .decode import (
     B_F32,
+    B_G2,
+    B_G4,
     F_EMITR,
     F_LOADR,
     F_MAIN,
@@ -80,16 +82,19 @@ def group_chunks(region: Region) -> list[tuple[int, int]]:
     return [(k, min(max_g, n - k)) for k in range(0, n, max_g)]
 
 
-def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False) -> list[Group]:
+def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
+           block_flags: dict[str, int] | None = None) -> list[Group]:
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
     header: input objects of POST_K). The "ab" block (alpha, beta) goes out as fp32 with F_MSG (the GDN core's) or
-    ``f32_ab``."""
+    ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block of row groups (``Block.G``) gets B_G2 / B_G4."""
     assert len(region.blocks) <= NBLK and 1 <= S <= gemv.SLOTS
     blk, rt = [], 0
     for b, nv in zip(region.blocks, valid_rows(region)):
         rt += b.tiles
         f32 = B_F32 if (flags & F_MSG or f32_ab) and b.name == "ab" else 0
-        blk += [rt, FORMATS[b.fmt].fid | f32, nv]
+        assert b.G in (1, 2, 4), b.G
+        g = {1: 0, 2: B_G2, 4: B_G4}[b.G]
+        blk += [rt, FORMATS[b.fmt].fid | f32 | g | (block_flags or {}).get(b.name, 0), nv]
     parts = group_chunks(region)
     out = []
     for i, (k0, g) in enumerate(parts):

@@ -490,7 +490,9 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("27B", 150, 2, True, True), ("9B", 151, 2, True, False),
                                                              ("1B", 38, 2, False, False), ("1B", 5, 1, False, True),
                                                              ("1B", 150, 2, True, True), ("1B", 1001, 2, True, False),
-                                                             ("1B", 129, 1, True, False)])
+                                                             ("1B", 129, 1, True, False), ("35B-A3B", 38, 2, False, False),
+                                                             ("35B-A3B", 150, 1, True, True),
+                                                             ("35B-A3B", 1001, 1, True, False)])
 def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of qwen35_ref.core_attention over what the slot sees (closed records as the cache
@@ -498,7 +500,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
     records of the new positions; its last: their records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
-    emitting o of the chain's heads."""
+    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of one slot)."""
     from artlite.operators.qwen35 import attn as A1
 
     path = ref.qwen_gguf("Q4_K_M", size)
@@ -663,7 +665,7 @@ def interleave_bits(v: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B"])
 @pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
@@ -671,7 +673,9 @@ def test_overlay_slice(size: str, mode: str) -> None:
     them); over 104 positions by steps of two (split: from 96 positions on, the attention's chains divide their
     caches: 9B pairs, 1B chains of 4): the residual stream after every layer and accepted token within llama.cpp's noise
     (its Q8_K activations) of its decode. The 1B's noise is ~3x the 9B's: its layer 0 against float64 math on the same
-    weights is off by 1.9% on average (6% at most; the NPU's: 0.8%)."""
+    weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's
+    routing differs from llama.cpp's (a near tie of its 8th and 9th logits) its layer output moves by 10-40%; none here
+    (0.5-0.9% on average, 3.4% at most)."""
     from artlite.operators.qwen35.overlay import QwenOverlay
 
     path = ref.qwen_gguf("Q4_K_M", size)
@@ -699,8 +703,73 @@ def test_overlay_slice(size: str, mode: str) -> None:
         ov.accept(acc)
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split")
-    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2)}[size]
+    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
+
+
+# ----------------------------------------------------------------------
+# An MoE layer (operators/overlay/decode.py's "MoE", qwen35/overlay.py)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("S", [1, 2, 3, 4])
+def test_moe_layer(S: int) -> None:
+    """Qwen3.6-35B-A3B's layer 0 (GDN, then its MoE) in one step of S slots: on the NPU's own input to the MoE (moe_in's
+    x), the router's logits (the route object's payload) within 3e-5 of fp32 math (the norm weight's bf16 rounding
+    corrected in the router's rows: ``image.QwenImage.pack``), the slots' top 8 the oracle's (``moe_route``); every
+    column's control packets and expert object as the host's routing of the NPU's logits makes them (``moe.route``:
+    the union dealt as whole experts and halves; the items' weights to 1e-5: the cores' fp32 to ~2^-16); each slot's
+    layer output within 1% of the
+    oracle's (``moe_ffn`` + ``shared_expert`` on x)."""
+    from artlite.operators.moe import route as MR
+    from artlite.operators.qwen35.overlay import CP_BYTES, QwenOverlay
+
+    path = ref.qwen_gguf("Q4_K_M", "35B-A3B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    ov = QwenOverlay(g, layers=[0], vocab=COLS * 64, max_positions=128)
+    ov.load(release=False)
+    cfg, H, L = ov.cfg, ov.H, 0
+    x = g.rows("token_embd.weight", ref.llama_tokenize(path, essay("apple.txt"))[:S])
+    ov.step(x, 0, logits=False)
+    dev = ov.dev
+    dev.fetch("ACT")
+    act = dev.view("ACT")
+    off = ov.inp[(L, "moe_in")][0].off + OD.XB
+    xin = _bf16(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
+    b = f"blk.{L}."
+    xn = ref.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
+                      cfg.rms_norm_eps)
+    W = np.asarray(g.tensor(b + "ffn_gate_inp.weight").raw, np.float32).reshape(cfg.n_experts, H)
+    lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
+    o = ov.xch[L] + 4 * OD.META
+    lg = act[o:o + 4096].view(np.float32).reshape(OD.SLOTS, -1)[:S]
+    assert ref.rel_err(lg, lg_ref) < 3e-5, ref.rel_err(lg, lg_ref)
+    ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
+    rids, rw = ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
+    assert np.array_equal(ids, rids)
+    gu = ov.image.region(L, "exp_gu")
+    for c in range(COLS):
+        cp = act[ov.cp[L] + c * (CP_BYTES + OD.XB):][:CP_BYTES].view(np.uint32)
+        assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset),
+                                                                     stride=gu.col_stride)), c
+        em = cp[MR.RBUF_META:MR.RBUF_META + OD.META].view(np.int32)
+        dn = ov.image.region(L, "exp_down")
+        nh = sum(h1 - h0 + 1 for _, h0, h1 in items[c])
+        assert (em[OD.M_NITEM], em[OD.M_NT]) == (len(items[c]), nh * (gu.n_rt * gu.n_kc + dn.n_rt * dn.n_kc)), c
+        for i, (e, h0, h1) in enumerate(items[c]):
+            it = em[OD.M_ITEM + OD.ITEM_WORDS * i:][:OD.ITEM_WORDS]
+            assert it[0] == e | h0 << 8 | h1 << 9
+            assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (c, i)
+    ex = ref.experts(g, L)
+    shared = ref.shared_expert(xn, *(g.tensor(b + t).dequantize().numpy() for t in
+                                     ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
+                               np.asarray(g.tensor(b + "ffn_gate_inp_shexp.weight").raw, np.float32).reshape(-1))
+    want = xin + ref.moe_ffn(xn, rids, rw, ex) + shared
+    for s in range(S):
+        got = ov.hidden(-1, slot=s).numpy()
+        assert ref.rel_err(got, want[s]) < 1e-2, (s, ref.rel_err(got, want[s]))
 
 
 # ----------------------------------------------------------------------

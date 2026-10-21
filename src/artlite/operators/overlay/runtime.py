@@ -9,8 +9,9 @@ own, to be patched (``txn.bd_words``) and dispatched again (its last durations t
 interrupts near its end: ``irq_cpu``). ``WeightBuffer`` packs a weight image in a thread.
 
 The design's operator (``OverlayOperator``) names its streams: ``ENDPOINTS`` (stream -> (direction, shim
-channel)), ``BD_BASE`` (stream -> the first of the txn.QUEUE_DEPTH shim BDs its transfers use in turn: 16 BDs per
-shim tile), and checks with ``check_endpoints`` that aiecc gave each stream the channel it names.
+channel)), ``BD_BASE`` (stream -> the first of the shim BDs its transfers use in turn: 16 BDs per shim tile;
+``BD_COUNT``: how many, default txn.QUEUE_DEPTH), ``PACKET`` (stream -> the packet id of its transfers on a
+packet-switched channel), and checks with ``check_endpoints`` that aiecc gave each stream the channel it names.
 """
 
 from __future__ import annotations
@@ -78,17 +79,23 @@ class Sequence:
         the drains of every sync depend on (a phase's inputs, not weight runs that span phases): a sync waits for
         them first, one wait per run of columns, while the phase still runs, so the next phase's fills after the
         sync find empty queues instead of each waiting for its column's oldest (Gemma's step: 1366 waits instead of
-        3751, 0.2 ms less)."""
+        3751, 0.2 ms less).
+
+        A task the array pushes itself (``device_task``: control packets that write and push BDs the host does not
+        use) takes a queue slot without a token: the channel's later host task's token covers it."""
         self.op = op
         self.txn = txn.Txn()
         self.rolling = rolling
         self.inputs = inputs
+        self._bd_count: dict[str, int] = getattr(op, "BD_COUNT", {})
+        self._packet: dict[str, int] = getattr(op, "PACKET", {})
         self._next_bd: dict[tuple[int, str], int] = {}
         self._controlled: set[tuple[int, int, int]] = set()
         self._drains: list[tuple[str, int, int, int, tuple | None, list[int]]] = []
         self._pending: dict[tuple[int, str], int] = {}  # transfers issued since the channel's last sync
         self._fill_tokens: set[tuple[int, str]] = set()  # fills whose task-complete token is not waited for yet
-        self._queued: dict[tuple[int, str], list[int]] = {}  # rolling: per channel the push ops not waited for
+        # rolling: per channel the push ops not waited for (None: a task the array pushed)
+        self._queued: dict[tuple[int, str], list[int | None]] = {}
 
     def _bd(self, stream: str, col: int) -> int:
         k = self._next_bd.get((col, stream), 0)
@@ -113,15 +120,20 @@ class Sequence:
         self._pending[(col, stream)] = 0
 
     def fill(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None = None, repeat: int = 1,
-             iteration: tuple[int, int] | None = None) -> int:
+             iteration: tuple[int, int] | None = None, *, packet: bool = True,
+             acquire: tuple[int, int] | None = None) -> int:
         """Read ``nbytes`` at the device address into a column's A or X stream (``dims``: gathered,
         see ``txn.Txn.shim_bd``), ``repeat`` times in a row (``iteration``: each from a further address). A
         channel queues 4 tasks: the fourth fill since the last sync carries a token, a fifth one first waits
-        for it."""
+        for it. On a packet-switched stream (``PACKET``) the fill gets the stream's packet header unless ``packet``
+        is False (words that carry their own headers: control packets); acquire (shim lock, value): the task waits
+        for the lock (rolling)."""
         direction, channel = self.op.ENDPOINTS[stream]
         assert direction == txn.MM2S, stream
         if self.rolling:
-            return self._task(stream, col, address, nbytes, dims, repeat, iteration)
+            return self._task(stream, col, address, nbytes, dims, repeat, iteration,
+                              packet=self._packet.get(stream) if packet else None, acquire=acquire)
+        assert stream not in self._packet and acquire is None, "packet-switched streams, locks: rolling sequences"
         if self._pending.get((col, stream), 0) == txn.QUEUE_DEPTH:
             self._wait_fill(stream, col)
         token = self._pending.get((col, stream), 0) == txn.QUEUE_DEPTH - 1
@@ -132,37 +144,64 @@ class Sequence:
                                   dims=dims, repeat=repeat, token=token, iteration=iteration)
 
     def drain(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None = None,
-              repeat: int = 1, iteration: tuple[int, int] | None = None) -> list[int]:
+              repeat: int = 1, iteration: tuple[int, int] | None = None, *,
+              release: tuple[int, int] | None = None) -> list[int]:
         """Write the next ``nbytes`` of a column's output stream to the device address (``dims``:
         scattered). The transfer is issued by the next ``sync`` (rolling: at once); the returned
-        one-element list then holds its BD's word index."""
+        one-element list then holds its BD's word index. release (shim lock, value): added to the lock when the
+        transfer is done (rolling)."""
         assert self.op.ENDPOINTS[stream][0] == txn.S2MM, stream
         handle: list[int] = []
         if self.rolling:
-            handle.append(self._task(stream, col, address, nbytes, dims, repeat, iteration))
+            handle.append(self._task(stream, col, address, nbytes, dims, repeat, iteration, release=release))
             return handle
-        assert repeat == 1 and iteration is None, "repeated drains: rolling sequences"
+        assert repeat == 1 and iteration is None and release is None, "repeated drains, locks: rolling sequences"
         self._drains.append((stream, col, address, nbytes, dims, handle))
         return handle
 
     def _task(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None, repeat: int,
-              iteration: tuple[int, int] | None = None) -> int:
-        """Rolling: a transfer, after waiting for the channel's oldest when 4 are queued."""
+              iteration: tuple[int, int] | None = None, *, packet: int | None = None,
+              acquire: tuple[int, int] | None = None, release: tuple[int, int] | None = None) -> int:
+        """Rolling: a transfer, after waiting for the channel's oldest when 4 are queued (or as many host tasks as
+        the stream has BDs)."""
         direction, channel = self.op.ENDPOINTS[stream]
         key = (col, stream)
         self._controller(col, direction, channel)
-        queued = self._queued.setdefault(key, [])
-        if len(queued) == txn.QUEUE_DEPTH:
-            self.txn.set_token(queued.pop(0))
-            self.txn.sync(col=col, direction=direction, channel=channel)
+        n_bd = self._bd_count.get(stream, txn.QUEUE_DEPTH)
+        self._room(stream, col, lambda q: len(q) < txn.QUEUE_DEPTH and sum(e is not None for e in q) < n_bd)
         k = self._next_bd.get(key, 0)
         self._next_bd[key] = k + 1
-        bd = self.op.BD_BASE[stream] + k % txn.QUEUE_DEPTH
-        at = self.txn.shim_bd(col, bd, address=address, nbytes=nbytes, dims=dims, iteration=iteration)
-        queued.append(self.txn.n_ops)
+        bd = self.op.BD_BASE[stream] + k % n_bd
+        at = self.txn.shim_bd(col, bd, address=address, nbytes=nbytes, dims=dims, iteration=iteration, packet=packet,
+                              acquire=acquire, release=release)
+        self._queued[key].append(self.txn.n_ops)
         self.txn.shim_push(col, direction, channel, bd, repeat=repeat)
         return at
 
+    def _room(self, stream: str, col: int, ok: object) -> None:
+        """Rolling: wait for a column's oldest host tasks of a stream (and the array's tasks before them) until its
+        queue is ``ok``."""
+        direction, channel = self.op.ENDPOINTS[stream]
+        queued = self._queued.setdefault((col, stream), [])
+        while not ok(queued):
+            i = next(i for i, e in enumerate(queued) if e is not None)  # (the array's tasks: no token of their own)
+            self.txn.set_token(queued[i])
+            del queued[:i + 1]
+            self.txn.sync(col=col, direction=direction, channel=channel)
+
+    def device_task(self, stream: str, col: int) -> None:
+        """Rolling: a task of the stream that the array pushes (into the column's queue, without a token) after the
+        transfers issued so far; the queue keeps a slot for it."""
+        assert self.rolling
+        self._room(stream, col, lambda q: len(q) < txn.QUEUE_DEPTH)
+        self._queued[(col, stream)].append(None)
+
+    def device_done(self, stream: str, col: int) -> None:
+        """Rolling: the array's tasks of the column's stream are complete (a sync waited for outputs that consumed
+        them), and so are the tasks queued before them: no wait for those."""
+        q = self._queued.get((col, stream), [])
+        if None in q:
+            del q[:len(q) - q[::-1].index(None)]
 
     def _retire(self, streams: list[str]) -> None:
         """Rolling: wait for every queued task of the streams: a token on each channel's last one, one wait per run
@@ -171,7 +210,9 @@ class Sequence:
             direction, channel = self.op.ENDPOINTS[stream]
             cols = sorted(c for (c, s), q in self._queued.items() if s == stream and q)
             for c in cols:
-                self.txn.set_token(self._queued[(c, stream)][-1])
+                last = self._queued[(c, stream)][-1]
+                assert last is not None, f"stream {stream}, column {c}: no host task after the array's to wait for"
+                self.txn.set_token(last)
                 self._queued[(c, stream)].clear()
             start = 0
             for i in range(1, len(cols) + 1):

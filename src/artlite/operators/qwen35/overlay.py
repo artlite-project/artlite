@@ -23,7 +23,12 @@ the columns load the slots' residual slices (F_LOADR), then per layer
 - GDN layer: gdn_in (normed; F_MSG: its rows to the GDN cores) | the GDN step (``gdn``) | gdn_out;
 - attention layer: attn_in (normed; q + gate to the F_ATT regions, the column's parts of K / V to the raw objects) | the
   attention (the cache through A; o and the records relayed through C, ``attn``'s chains) | attn_out;
-- gate_up | down (its K groups);
+- gate_up | down (its K groups); an MoE layer (``QwenConfig.moe``) instead: moe_in (normed: the shared expert's gate /
+  up, the router's logits, the shared gate's logit) | the route object (XCH: the logits of every column; the helper
+  core's routing: ``moe.route``; its control packets out to CP, streamed back into the shim's TileControl: the
+  expert slab's BDs pushed by the array) | sdown (the shared expert's down x its gate, into the residual) | the expert
+  object (CP, after the routing's drain: the column's items; its sub-phases on the main core: gate / up, down into acc)
+  | the combine (PART: the columns' partials of the slice, into the residual, then out) (``overlay.decode``'s "MoE");
 
 and the LM head (normed) -> LOGITS. The transfers go out in rounds over the columns (a phase's weights, inputs,
 outputs): a channel holds 4 queued tasks, and the oldest one that a fifth waits for must not need a later round. A
@@ -33,26 +38,45 @@ column's weights between two attentions (their caches on A) as one run, its phas
 region-major one per phase and K group (the norm-weight objects from NORM).
 """
 
+import os
+
 import numpy as np
 import torch
 
 from ... import txn
 from ...gguf_model import GGUFFile
 from ...model_config import QwenConfig
+from .. import paging
 from ..design import COLS
+from ..moe import route as MR
 from ..overlay import phases as mp
 from ..overlay.decode import (
+    B_F32,
+    B_GU,
+    B_KEEP,
+    B_PAIR,
     C_LEN,
+    F_COMB,
     F_EMITR,
     F_GU,
+    F_MAIN,
     F_MSG,
     F_NORM,
     F_RESID,
+    F_ROUTE,
+    F_WS,
     M_FLAGS,
     M_NASKIP,
     M_NREL,
     M_NS,
+    M_NX,
+    M_RBASE,
+    M_RSTR,
+    M_RTDN,
+    M_RTGU,
     M_SKIP,
+    M_XC0,
+    MAX_K,
     META,
     NX_PER_NORM,
     OBJ_K,
@@ -82,7 +106,10 @@ from .decode import (
 from .image import NORMS, QwenImage, gdn_v_heads
 
 FLAGS = {"gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
-         "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM}
+         "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM, "moe_in": F_NORM, "sdown": F_RESID | F_WS}
+MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32, "sgate": B_PAIR | B_KEEP}  # (moe_in's blocks: ``overlay.decode``)
+MOE_MAX_K = 2048  # (an MoE model's K groups at most: ``image.payload``)
+CP_BYTES = 128 * MR.RBUF_OBJECTS  # (a column's routing objects in CP; the expert object starts 256 B before their end)
 KV_PAD = 2048 - 256  # positions past the caches (the last layer's): the prefill's sub-chunk slices
 CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (prefill.CS_OFF)
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
@@ -131,9 +158,12 @@ class QwenOverlay(ModelOverlay):
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
-        fmts = {b.fmt for r in img.regions for b in r.blocks}
+        self.moe = cfg.moe
+        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks}
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
-                                      eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash)
+                                      eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
+                                      moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
+                                      max_k=MOE_MAX_K if cfg.moe else MAX_K)
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
@@ -146,10 +176,44 @@ class QwenOverlay(ModelOverlay):
     def _flags(self, L: int, name: str) -> int:
         return FLAGS[name]
 
+    def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
+        return mp.groups(self.image.region(L, name), FLAGS[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None)
+
+    def _meta(self, L: int, name: str, rg: object, m: np.ndarray) -> np.ndarray:
+        if name == "sdown":  # (its panels in the side chunk: the expert's gate / up reads moe_in's)
+            m[M_XC0] = self.op.max_g - 1
+        return m
+
+    def _metas(self, S: int) -> None:
+        """(and an MoE model's: per layer its route object's and expert objects' templates, the combine's)"""
+        super()._metas(S)
+        if not self.moe:
+            return
+        act, img = self.dev.view("ACT"), self.image
+        for L in self.layers:
+            gu, dn = img.region(L, "exp_gu"), img.region(L, "exp_down")
+            m = np.zeros(META, np.int32)
+            m[M_FLAGS], m[M_NS] = F_MAIN | F_ROUTE, S
+            a = self.dev.address("W", gu.offset)
+            m[M_RBASE:M_RBASE + 2] = np.array([a & 0xFFFFFFFF, a >> 32], np.uint32).view(np.int32)
+            m[M_RSTR], m[M_RTGU], m[M_RTDN] = gu.col_stride, gu.n_rt * gu.n_kc, dn.n_rt * dn.n_kc
+            assert gu.col_stride % 4 == 0 and 2 * self.cfg.n_experts * gu.col_stride < 1 << 32
+            act[self.xch[L]:self.xch[L] + 4 * META] = m.view(np.uint8)
+            tpl = np.concatenate([mp.groups(gu, F_GU, S)[0].meta, mp.groups(dn, 0, S)[0].meta])
+            for c in range(COLS):  # (the expert object's payload: the gate / up and down templates)
+                o = self.cp[L] + c * (CP_BYTES + XB) + CP_BYTES
+                act[o:o + tpl.nbytes] = tpl.view(np.uint8)
+        m = np.zeros(META, np.int32)
+        m[M_FLAGS], m[M_NS], m[M_NX] = F_MAIN | F_COMB, S, S
+        for c in range(COLS):
+            act[self.part + c * self.part_col:][:4 * META] = m.view(np.uint8)
+        self.dev.flush("ACT")
+
     def _phases(self) -> list[tuple[int, str]]:
         cfg = self.cfg
+        ffn = ("moe_in", "sdown") if self.moe else ("gate_up", "down")
         out = [(L, name) for L in self.layers for name in
-               (("attn_in", "attn_out") if cfg.attention[L] else ("gdn_in", "gdn_out")) + ("gate_up", "down")]
+               (("attn_in", "attn_out") if cfg.attention[L] else ("gdn_in", "gdn_out")) + ffn]
         return [*out, (-1, "lm")]
 
     def _input(self, L: int) -> tuple[int, str]:
@@ -180,18 +244,31 @@ class QwenOverlay(ModelOverlay):
             take("GSTATE", 256)  # (the first panel object's header bytes)
         for L in self.layers:
             if cfg.attention[L]:  # ([column][F_ATT per sub-step], then [column][q objects SLOTS])
-                self.fatt[L] = take("ACT", COLS * (attn.U + SLOTS) * XB)
+                self.fatt[L] = take("ACT", COLS * (self.ash.u + SLOTS) * XB)
                 self.rawkv[L] = take("ACT", SLOTS * XB)
                 self.kv_off[L] = take("KV", self.ash.kvh * self.ash.head_bytes)
             else:
                 self.gobj[L] = take("GOBJ", COLS * self.gcol)
                 self.gstate[L] = take("GSTATE", COLS * self.ps)
                 self.ghdr[L] = take("GHDR", COLS * HSLOT)
+        self.xch, self.cp = {}, {}
+        if self.moe:  # (per MoE layer its route object, per column its routing's objects and expert object; PART)
+            for L in self.layers:
+                self.xch[L] = take("ACT", XB)
+                self.cp[L] = take("ACT", COLS * (CP_BYTES + XB))
+            self.part = take("ACT", COLS * self.part_col)
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
         if self.ash is not None:  # (the prefill's slices past the end; a step's second record; a tail fill's T bytes)
             take("KV", (KV_PAD // attn.POS_PER_GROUP + 1) * 3 * self.T)
         self._sizes()
+
+    @property
+    def part_col(self) -> int:
+        """PART's bytes per column: the combine's metadata object, then per slot the 8 columns' partials of the
+        column's slice ([slot][column][hidden / 8] bf16: one object's payload per slot)."""
+        assert self.H * 2 == XPAY, "a slot's partials of a slice in one X object's payload"
+        return XB + SLOTS * XPAY
 
     def ring(self, L: int, h: int) -> int:
         """Byte offset in KV of KV head h's ring of attention layer L: 2 slots of T bytes, slot r & 1 the V values of
@@ -200,11 +277,11 @@ class QwenOverlay(ModelOverlay):
 
     def _fatt(self, L: int, c: int, u: int) -> int:
         """ACT offset of column c's F_ATT object of sub-step u of layer L."""
-        return self.fatt[L] + (c * attn.U + u) * XB
+        return self.fatt[L] + (c * self.ash.u + u) * XB
 
     def _q(self, L: int, c: int, s: int) -> int:
         """ACT offset of column c's q object of slot s of layer L."""
-        return self.fatt[L] + (COLS * attn.U + c * SLOTS + s) * XB
+        return self.fatt[L] + (COLS * self.ash.u + c * SLOTS + s) * XB
 
     def _gpay(self, L: int, c: int, k: int) -> int:
         """GOBJ offset of layer L's column c's object k's payload (k: conv q / k 0 .. 3, K 4, pair p 5 + 3 p ..)."""
@@ -215,7 +292,9 @@ class QwenOverlay(ModelOverlay):
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
-        """The norm weights (NORM), the attention layers' F_ATT objects."""
+        """The norm weights (NORM), the attention layers' F_ATT objects; (MoE) the control route's registers free."""
+        if self.moe:
+            MR.check_route(paging.cdo_writes(os.path.dirname(self.op._program.insts_path)), range(COLS))
         norm = self.dev.view("NORM")
         for (L, name), off in self.norm_off.items():
             w = torch.from_numpy(self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight")).bfloat16()
@@ -231,7 +310,7 @@ class QwenOverlay(ModelOverlay):
         act = self.dev.view("ACT")
         norms = np.concatenate([self._f32(f"blk.{L}.attn_q_norm.weight"), self._f32(f"blk.{L}.attn_k_norm.weight")])
         for c in range(COLS):
-            for u in range(attn.U):
+            for u in range(self.ash.u):
                 o = self._fatt(L, c, u)
                 m = np.zeros(META, np.int32)
                 m[M_FLAGS] = attn.F_ATT
@@ -349,7 +428,8 @@ class QwenOverlay(ModelOverlay):
 
     def _runs(self, lm: bool) -> list[list[tuple[int, str]]]:
         """A column-major step's weight runs: its phases up to the first attention's attn_in, then from each
-        attention's attn_out up to the next one's attn_in (or the end)."""
+        attention's attn_out up to the next one's attn_in (or the end); an MoE layer's run ends with its sdown (the
+        array pushes its experts' slabs next)."""
         out: list[list[tuple[int, str]]] = [[]]
         for phase in self._phases():
             if phase[1] == "lm" and not lm:
@@ -357,6 +437,8 @@ class QwenOverlay(ModelOverlay):
             if phase[1] == "attn_out":
                 out.append([])
             out[-1].append(phase)
+            if phase[1] == "sdown":
+                out.append([])
         return [r for r in out if r]
 
     def _attention(self, seq: Sequence, st: _Step, L: int, S: int, run: list[tuple[int, str]] | None = None) -> None:
@@ -413,26 +495,79 @@ class QwenOverlay(ModelOverlay):
                     hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb)
                     st.drains.append((hd, L, c, u, k))
 
+    def _moe(self, seq: Sequence, L: int, S: int, to: tuple[int, str], run: list[tuple[int, str]] | None) -> None:
+        """An MoE layer (module docstring) after its residual's drains into moe_in's x: moe_in, the route object (the
+        control packets' round trip: the drain releases LOCK_CP, the control task acquires it; the array's A task),
+        sdown, the expert object (after the routing's drain), then ``run``'s weights (after the array's last packet:
+        LOCK_DONE), the partials into PART, the combine; its residual -> ``to``."""
+        dev, h8 = self.dev, self.H // COLS
+        self._weights(seq, (L, "moe_in"), 0)
+        seq.sync()
+        self._inputs(seq, self.inp[(L, "moe_in")][0], S)
+        for c in range(COLS):  # (per slot: the shared expert's h, then the router's 32 logits (fp32))
+            self._values_to(seq, c, (L, "sdown"), e0=64 * c, n=64, S=S)
+            seq.drain("C", c, dev.address("ACT", self.xch[L] + 4 * META + 128 * c), S * 128, (32, S, 256, 32))
+        seq.sync()
+        for c in range(COLS):
+            cp = self.cp[L] + c * (CP_BYTES + XB)
+            seq.fill("X", c, dev.address("ACT", self.xch[L]), XB)
+            seq.drain("C", c, dev.address("ACT", cp), CP_BYTES, release=(MR.LOCK_CP, 1))
+            seq.fill("X", c, dev.address("ACT", cp), 4 * MR.PACKET_WORDS, packet=False, acquire=(MR.LOCK_CP, 1))
+            seq.device_task("A", c)
+        self._weights(seq, (L, "sdown"), 0)
+        rg = self.inp[(L, "sdown")][0]  # (its x [h | h]: the first input object twice)
+        for c in range(COLS):
+            seq.fill("X", c, dev.address("ACT", rg.off), 2 * XB, DIMS_OBJ)
+            seq.fill("X", c, dev.address("ACT", rg.off + XPAY), XB)
+        seq.sync()
+        for c in range(COLS):
+            seq.fill("X", c, dev.address("ACT", self.cp[L] + c * (CP_BYTES + XB) + CP_BYTES - 4 * META), XB)
+        for c in range(COLS):  # (the array's packets are through: later host pushes on A keep their order)
+            lock = txn.tile_address(c, 0, txn.SHIM_LOCK0 + 16 * MR.LOCK_DONE)
+            seq.txn.maskpoll32(lock, 1, 0x3F)
+            seq.txn.write32(lock, 0)
+        if run:
+            self._weight_run(seq, run)
+        pc = self.part_col
+        for c in range(COLS):  # (acc's objects [64 rows j][slot] -> PART[j / 4][slot][c][j % 4 ..])
+            seq.drain("C", c, dev.address("ACT", self.part + XB + 2 * h8 * c), 4 * S * 128, (32, S, XPAY // 4, 32),
+                      COLS, (pc // 4, COLS))
+        seq.sync()
+        for c in range(COLS):  # (the partials are in DDR: the experts' tasks are complete)
+            seq.device_done("A", c)
+            seq.fill("X", c, dev.address("ACT", self.part + c * pc), (1 + S) * XB, DIMS_OBJ)
+        for c in range(COLS):
+            self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S)
+
     def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, bool], ...]) -> _Step:
         """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps)."""
         dev, cfg = self.dev, self.cfg
         seq = Sequence(self.op, rolling=True, inputs=("X",))
         st = _Step(S, subs)
+        if self.moe:  # (the control packets' route; the routing's shim locks)
+            for c in range(COLS):
+                MR.control_route(seq.txn, c)
+                for lk in (MR.LOCK_CP, MR.LOCK_DONE):
+                    seq.txn.write32(txn.tile_address(c, 0, txn.SHIM_LOCK0 + 16 * lk), 0)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
         runs = self._runs(lm) if self.image.column_major else []
         if runs:
             self._weight_run(seq, runs[0])
+        ffn = "moe_in" if self.moe else "gate_up"
         for i, L in enumerate(self.layers):
             if cfg.attention[L]:
                 run = next((r for r in runs if r[0] == (L, "attn_out")), None)
                 self._attention(seq, st, L, S, run)
-                self._phase(seq, (L, "attn_out"), S, (L, "gate_up"))
+                self._phase(seq, (L, "attn_out"), S, (L, ffn))
             else:
                 self._gdn(seq, L, S)
-                self._phase(seq, (L, "gdn_out"), S, (L, "gate_up"))
-            self._phase(seq, (L, "gate_up"), S, (L, "down"))
+                self._phase(seq, (L, "gdn_out"), S, (L, ffn))
             nxt = self._input(self.layers[i + 1]) if i + 1 < len(self.layers) else (-1, "lm")
+            if self.moe:
+                self._moe(seq, L, S, nxt, next((r for r in runs if r[0] == nxt), None))
+                continue
+            self._phase(seq, (L, "gate_up"), S, (L, "down"))
             self._phase(seq, (L, "down"), S, nxt)
         if lm:
             self._phase(seq, (-1, "lm"), S, "LOGITS")
@@ -445,8 +580,12 @@ class QwenOverlay(ModelOverlay):
         whether the chains divide the cache: by its group alone)."""
         if self.ash is None:
             return ()
-        return tuple((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP))
-                     for a, n in substeps(p, S, attn.POS_PER_GROUP, attn.SUB))
+        out = []
+        for a, n in substeps(p, S, attn.POS_PER_GROUP, attn.SUB):
+            split = attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)
+            r = self.ash.split_sub if split else n  # (a split sub-step's slots at most: ``AttnShape.split_sub``)
+            out += [(a + i, min(r, n - i), split) for i in range(0, n, r)]
+        return tuple(out)
 
     def _set_position(self, st: _Step, p: int) -> None:
         """The F_ATT objects (per sub-step: its positions, cache objects, rotations) and the step's cache and ring
@@ -490,7 +629,7 @@ class QwenOverlay(ModelOverlay):
                     q0 = o + 4 * META + 4 * 2 * attn.HD
                     act[q0:q0 + cs.nbytes] = cs.view(np.uint8).reshape(-1)
         for L in self.fatt:
-            dev.flush("ACT", self.fatt[L], COLS * attn.U * XB)
+            dev.flush("ACT", self.fatt[L], COLS * self.ash.u * XB)
         w = st.tr.words
         for at, L, c, u, kind in st.fills:
             g0, g1 = groups[u][(c, kind)]

@@ -1,7 +1,7 @@
 # Models
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Gemma 4](gemma4.md),
-[Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7](qwen35.md), [Stable Diffusion 1.5](sd15.md).
+[Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
 `~/.artlite/models`) as `<account>/<repository>/<file>`: [Installation](../install.md#models-directory). A GGUF file's
@@ -25,6 +25,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M | vision |
 | | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M | MTP, vision |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
+| qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M (decode; prompts as decode steps) | the prompt's prefill, MTP, vision |
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |
