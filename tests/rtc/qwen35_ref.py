@@ -5,14 +5,21 @@ llama.cpp tree of ``model_config.LLAMA_CPP_DIR``) and returns the tensors it dum
 intermediates of llama.cpp's graph (``src/models/qwen35.cpp``: e.g. ``attn_norm``, ``linear_attn_qkv_mixed``,
 ``z``, ``alpha``, ``beta``, ``conv_output_silu``, ``attn_output`` - the GDN core output, but after W_o in the
 full-attention layers -, ``new_state``, ``final_output``, ``Qcur_full``, ``Kcur.1`` - after RoPE -,
-``attn_pregate``, ``l_out``), and the logits of every position. They are cached under
-``tests/rtc/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs`` recomputes). llama.cpp quantizes the
-activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that error, and its prompt and one-token graphs
-differ by ~1% after a few layers: compare layers by tolerance, the model by KL.
+``attn_pregate``, ``l_out``; a ``qwen35moe`` layer's MoE in ``src/llama-graph.cpp``'s ``build_moe_ffn`` and
+``src/models/qwen35moe.cpp``: ``attn_post_norm`` - its input -, ``ffn_moe_logits``, ``ffn_moe_probs``, ``ffn_moe_topk``
+- the experts' ids, int32 -, ``ffn_moe_weights_norm``, ``ffn_moe_gate`` / ``_up`` / ``_down`` (tokens, k, ...),
+``ffn_moe_weighted``, ``ffn_moe_out``, ``ffn_shexp``, ``shared_expert_gate``, ``ffn_out``), and the logits of every
+position. They are cached under ``tests/rtc/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs``
+recomputes). llama.cpp quantizes the activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that
+error, and its prompt and one-token graphs differ by ~1% after a few layers: compare layers by tolerance, the model
+by KL. In a ``qwen35moe`` model they differ by ~15% at the last layer and in the top 8 of 40-70% of the tokens
+there: any rounding change moves a near-tied expert, and the difference grows (a 1e-7 change of the router's logits
+reaches the same KL), so its layers are compared where the routing agrees.
 
 Oracles: the exact math of each block in float32 (llama.cpp's CPU ops), on numpy arrays with tokens as the
 leading axis: ``rms_norm``, ``conv_seq``, ``l2norm``, ``gdn_gates``, ``gdn_seq`` / ``gdn_step``,
-``gated_norm``, ``rope_partial``, ``attention_gqa``, ``q_and_gate``.
+``gated_norm``, ``rope_partial``, ``attention_gqa``, ``q_and_gate``; the MoE FFN: ``moe_route``, ``moe_ffn`` (over
+``experts``), ``shared_expert``.
 
 The cores' arithmetic (their rounding points, float64 elsewhere): ``core_gdn_step`` (the decode's GDN core),
 ``core_gdn_scan`` / ``core_gdn_out`` (the prefill's GDN scan and gated output), ``core_attention`` (a decode
@@ -25,6 +32,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -295,6 +303,63 @@ def attention_gqa(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, scale: float, 
     p = np.exp(s)
     p /= p.sum(-1, keepdims=True)
     return np.einsum("thp,phd->thd", p, v[:, kv]).astype(np.float32)
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    """Over the last axis, as ``ggml_soft_max``: the maximum subtracted, the sum in float64."""
+    x = f32(x)
+    e = np.exp(x - x.max(-1, keepdims=True))
+    return (e / e.sum(-1, keepdims=True, dtype=np.float64)).astype(np.float32)
+
+
+def moe_route(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """The router's choice (``build_moe_ffn``: softmax gating, the weights renormalized, no scale, no groups): logits
+    (T, E) -> the experts of the k largest probabilities (T, k), largest first, and their weights p_e / their sum."""
+    p = softmax(logits)
+    ids = np.argsort(-p, axis=-1, kind="stable")[:, :k]
+    w = np.take_along_axis(p, ids, -1)
+    return ids, (w / np.maximum(w.sum(-1, keepdims=True), np.float32(6.103515625e-5))).astype(np.float32)
+
+
+def swiglu(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndarray) -> np.ndarray:
+    """A SwiGLU FFN: down (silu(gate x) * up x); x (T, H), gate / up (F, H), down (H, F)."""
+    x = f32(x)
+    return (silu(x @ f32(gate).T) * (x @ f32(up).T)) @ f32(down).T
+
+
+def experts(gguf: object, layer: int) -> Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """A ``qwen35moe`` layer's expert e as fp32 (gate (F, H), up (F, H), down (H, F)): rows e F .. (e + 1) F of the
+    GGUF's ``ffn_gate_exps`` / ``ffn_up_exps`` (3-D tensors, an expert's matrix contiguous), e H .. of
+    ``ffn_down_exps``."""
+    b = f"blk.{layer}."
+    F, H = gguf.tensor(b + "ffn_down_exps.weight").cols, gguf.tensor(b + "ffn_gate_exps.weight").cols
+
+    def get(e: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def rows(name: str, n: int) -> np.ndarray:
+            return gguf.rows(b + name, np.arange(e * n, (e + 1) * n)).numpy()
+
+        return rows("ffn_gate_exps.weight", F), rows("ffn_up_exps.weight", F), rows("ffn_down_exps.weight", H)
+
+    return get
+
+
+def moe_ffn(x: np.ndarray, ids: np.ndarray, weights: np.ndarray,
+            expert: Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]]) -> np.ndarray:
+    """The routed experts' sum (``ffn_moe_out``): y_t = sum_i weights[t, i] swiglu_e(x_t), e = ids[t, i] (``moe_route``);
+    x (T, H); ``expert(e)``: its (gate, up, down) (``experts``)."""
+    x = f32(x)
+    y = np.zeros_like(x)
+    for e in np.unique(ids):
+        t, i = np.nonzero(ids == e)
+        y[t] += f32(weights)[t, i][:, None] * swiglu(x[t], *expert(int(e)))
+    return y
+
+
+def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndarray,
+                  gate_inp: np.ndarray) -> np.ndarray:
+    """The shared expert times its gate (``ffn_shexp_gated``): sigmoid(gate_inp . x) swiglu(x); gate_inp (H,) (the
+    GGUF's ``ffn_gate_inp_shexp``). A layer's FFN output is ``moe_ffn`` + this."""
+    return sigmoid(f32(x) @ f32(gate_inp).reshape(-1, 1)) * swiglu(x, gate, up, down)
 
 
 def rel_err(a: np.ndarray, b: np.ndarray) -> float:

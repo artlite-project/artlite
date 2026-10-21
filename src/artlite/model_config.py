@@ -58,10 +58,10 @@ def gemma_gguf(quant: str = "Q4_0", size: str = "E4B") -> str:
 def qwen_gguf(quant: str = "Q4_K_M", size: str = "27B") -> str:
     """The GGUF file of a qwen35-architecture model: Qwen3.6-27B (``size="27B"``), its MTP variant
     Qwen3.8-27B (``"3.8-27B"``), Qwen3.5-9B (``"9B"``), the language model of MiniCPM-V 4.7 1B (``"1B"``,
-    openbmb's: ``minicpmv_gguf``)."""
+    openbmb's: ``minicpmv_gguf``); the MoE Qwen3.6-35B-A3B (``"35B-A3B"``, GGUF architecture ``qwen35moe``)."""
     if size == "1B":
         return minicpmv_gguf(quant)
-    name = {"27B": "Qwen3.6-27B", "3.8-27B": "Qwen3.8-27B", "9B": "Qwen3.5-9B"}[size]
+    name = {"27B": "Qwen3.6-27B", "3.8-27B": "Qwen3.8-27B", "9B": "Qwen3.5-9B", "35B-A3B": "Qwen3.6-35B-A3B"}[size]
     return os.path.join(MODELS_DIR, "lmstudio-community", f"{name}-GGUF", f"{name}-{quant}.gguf")
 
 

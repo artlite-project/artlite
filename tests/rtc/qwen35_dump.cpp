@@ -11,12 +11,12 @@
 // steps), in one run. LAYERS: comma-separated layer indices, "g" for the tensors without a layer (il = -1),
 // "all" for every layer. REGEX: the tensor names (without the "-<il>" suffix) to dump.
 //
-// Output: OUTDIR/<name>-<il>.npy (float32, ggml tensors as numpy arrays: shape = ne reversed): stacked over
-// the run's tokens along the tensor's token axis (the lowest ne[d], d >= 1, of the ubatch's token count with
-// all dimensions above it 1) -> (tokens, ...); the recurrent states (STATE_NAMES) have no token axis: the
-// last ubatch's (--states last) or all of them (--states all: (ubatches, ...)). A name computed twice in a
-// ubatch (Kcur before and after RoPE) gets ".1", ".2", ... from the second on. OUTDIR/logits.npy: (tokens,
-// vocab) of every position. OUTDIR/meta.json: what ran.
+// Output: OUTDIR/<name>-<il>.npy (float32, I32 tensors such as the experts' ids ffn_moe_topk int32; ggml tensors as
+// numpy arrays: shape = ne reversed): stacked over the run's tokens along the tensor's token axis (the lowest ne[d],
+// d >= 1, of the ubatch's token count with all dimensions above it 1) -> (tokens, ...); the recurrent states
+// (STATE_NAMES) have no token axis: the last ubatch's (--states last) or all of them (--states all: (ubatches,
+// ...)). A name computed twice in a ubatch (Kcur before and after RoPE) gets ".1", ".2", ... from the second on.
+// OUTDIR/logits.npy: (tokens, vocab) of every position. OUTDIR/meta.json: what ran.
 //
 // Backend: CPU only (no devices), F32 KV cache, flash attention off.
 
@@ -57,10 +57,16 @@ struct Npy {
             exit(1);
         }
         std::vector<char> pad(HEADER, ' ');
-        fwrite(pad.data(), 1, HEADER, f);
+        write(pad.data(), HEADER);
     }
 
-    void write(const void * data, size_t bytes) { fwrite(data, 1, bytes, f); }
+    // a short write (a full disk) fails the run: a truncated file must not be cached as a golden
+    void write(const void * data, size_t bytes) {
+        if (fwrite(data, 1, bytes, f) != bytes) {
+            fprintf(stderr, "short write (%zu bytes)\n", bytes);
+            exit(1);
+        }
+    }
 
     void close() {
         std::string shape = "(" + std::to_string(rows) + (tail.empty() ? "," : "");
@@ -77,8 +83,11 @@ struct Npy {
         head += (char) (n >> 8);
         head += dict;
         fseek(f, 0, SEEK_SET);
-        fwrite(head.data(), 1, head.size(), f);
-        fclose(f);
+        write(head.data(), head.size());
+        if (fclose(f) != 0) {
+            fprintf(stderr, "cannot close a .npy file\n");
+            exit(1);
+        }
         f = nullptr;
     }
 };
@@ -108,8 +117,9 @@ static std::pair<std::string, int> split_name(const char * full) {
 }
 
 static bool wanted(const State & st, const ggml_tensor * t) {
-    if (strpbrk(t->name, " (") || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
-        return false;  // (ggml's derived names "x (view)", integer tensors)
+    if (strpbrk(t->name, " (") || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 &&
+                                    t->type != GGML_TYPE_I32)) {
+        return false;  // (ggml's derived names "x (view)", other integer tensors)
     }
     auto [base, il] = split_name(t->name);
     if (!std::regex_match(base, st.names)) {
@@ -118,7 +128,7 @@ static bool wanted(const State & st, const ggml_tensor * t) {
     return il < 0 ? st.layers.count(-1) > 0 : (st.all_layers || st.layers.count(il) > 0);
 }
 
-// the tensor's elements as float32 in numpy order (ne[0] fastest)
+// the tensor's elements as float32 in numpy order (ne[0] fastest); an I32 tensor's as their int32 bit patterns
 static std::vector<float> to_f32(const ggml_tensor * t) {
     if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
         fprintf(stderr, "%s: not in host memory (CPU backend only)\n", t->name);
@@ -136,6 +146,7 @@ static std::vector<float> to_f32(const ggml_tensor * t) {
                         case GGML_TYPE_F32: out[i++] = *(const float *) p; break;
                         case GGML_TYPE_F16: out[i++] = ggml_fp16_to_fp32(*(const ggml_fp16_t *) p); break;
                         case GGML_TYPE_BF16: out[i++] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) p); break;
+                        case GGML_TYPE_I32: memcpy(&out[i++], p, 4); break;
                         default:
                             fprintf(stderr, "%s: tensor type %s\n", t->name, ggml_type_name(t->type));
                             exit(1);
@@ -190,6 +201,9 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
     Npy & f = st.files[name];
     if (!f.f) {
         f.open(st.outdir + "/" + name + ".npy");
+        if (t->type == GGML_TYPE_I32) {
+            f.dtype = "<i4";
+        }
         if (d) {
             for (int k = d - 1; k >= 0; k--) {
                 f.tail.push_back(t->ne[k]);
