@@ -57,6 +57,13 @@ MAX_T = SIZES[-1]
 assert MAX_T - SUB <= KV_PAD
 CS_OFF = 4 * META + 640  # the conv state's bytes in a GDN header slot of the overlay
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
+# the time model's constants (``layer_seconds``; fitted to the chunk times of the 1B, 9B and 27B Q4_K_M, T = 256 ..
+# 2048 at p0 = 0 .. 30K: within ~2%): per sub-chunk a byte of a layer's weights, a GEMM item, a norm per hidden unit,
+# the GDN ops per v head, the attention prep per q head; a ConfigureOp
+WEIGHT_S, GEMM_S, NORM_S, GDN_S, PREP_S, CFG_S = 28.4e-12, 0.056e-3, 43e-9, 21.7e-6, 17e-6, 0.116e-3
+# the flash attention per cached position and sub-chunk: the larger of its cache bytes at ATTN_BW (each pass streams
+# the history, K and V of every KV head) and the cores' cycles per 32-key group and row panel (two streams / one)
+ATTN_BW, ATTN_CYC_TWO, ATTN_CYC_ONE, CORE_HZ = 58e9, 1020, 1500, 1.81e9
 
 
 def _key(lay: PG.Layout) -> tuple:
@@ -307,7 +314,7 @@ class QwenPrefill(ChunkPrefill):
 
     def _fits_budget(self, T: int, p0: int) -> bool:
         """(an attention layer's flash attention within the budget)"""
-        return not self.att or attention_seconds(p0, T // SUB) <= PIECE_BUDGET_S
+        return not self.att or self.attention_seconds(p0, T // SUB) <= PIECE_BUDGET_S
 
     def run(self, x: torch.Tensor, p0: int, T: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the first layer's input rows of
@@ -339,18 +346,28 @@ class QwenPrefill(ChunkPrefill):
     # Time estimates
     # ------------------------------------------------------------------
 
+    def attention_seconds(self, p0: int, S: int) -> float:
+        """Estimated time of an attention layer's flash attention over a chunk of S sub-chunks at p0 (the 1B / 9B /
+        27B: 0.144 / 0.488 / 0.636 ms per 1K cached positions and sub-chunk)."""
+        at = self.attn[S * SUB]
+        passes = SUB / (32 * at.qg)  # (per sub-chunk)
+        dma = passes * at.kvh * (AP.AT.REC_K + AP.AT.REC_V) / 8 / ATTN_BW
+        cores = passes * at.R * (ATTN_CYC_TWO if at.two else ATTN_CYC_ONE) / 32 / CORE_HZ
+        return max(dma, cores) * sum(p0 + SUB * j for j in range(S))
+
     def layer_seconds(self, L: int, p0: int, S: int = 1) -> float:
-        """(per sub-chunk the GEMMs by the bytes of their weights (28 ms per GB) plus 0.05 ms each, 0.32 ms per norm,
-        the GDN ops 0.041 ms per v head, the attention prep 0.3 ms; the flash attention (``attention_seconds``);
-        0.075 ms per ConfigureOp: the 27B's and 9B's chunks of 256 .. 2048 tokens at p0 = 0 within 2%)"""
+        """(per sub-chunk the GEMMs by the bytes of their weights and their items, the norms by the hidden size, the GDN
+        ops by the v heads, the attention prep by the q heads; the flash attention (``attention_seconds``); CFG_S per
+        ConfigureOp)"""
+        cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
         wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
-        s = S * (0.028e-9 * wbytes + 0.05e-3 * len(gemms) + 0.32e-3 * 2)
-        if self.cfg.attention[L]:
-            s += S * 0.3e-3 + attention_seconds(p0, S)
+        s = S * (WEIGHT_S * wbytes + GEMM_S * len(gemms) + 2 * NORM_S * self.H)
+        if cfg.attention[L]:
+            s += S * PREP_S * cfg.num_attention_heads + self.attention_seconds(p0, S)
         else:
-            s += S * 0.041e-3 * self.cfg.ssm_v_heads
-        return s + 0.075e-3 * self.layer_configs(L)
+            s += S * GDN_S * cfg.ssm_v_heads
+        return s + CFG_S * self.layer_configs(L)
 
     def layer_configs(self, L: int) -> int:
         """(its GEMM objects, the GDN or attention ops, the norms)"""
@@ -360,10 +377,3 @@ class QwenPrefill(ChunkPrefill):
     def layer_entries(self, L: int, S: int) -> int:
         gemms = sum(len(self.plans[(L, name)].gemms) for name in self._phases(L))
         return S * (gemms + 2) + (S + 1 if self.cfg.attention[L] else 2 * S + 1)
-
-
-def attention_seconds(p0: int, S: int) -> float:
-    """Estimated time of an attention layer's flash attention over a chunk of S sub-chunks at p0 (~0.82 ms per 1K
-    cached positions and sub-chunk: the 27B's 2048-token chunks at p0 = 0 / 8K / 16K / 30K took 6307 / 7141 / 7989 /
-    9480 ms; ~60% of it the KV re-streams of the 32-query passes at the DDR ceiling)."""
-    return sum(0.82e-3 * (p0 + SUB * j) / 1024 for j in range(S)) + 0.95e-3 * S

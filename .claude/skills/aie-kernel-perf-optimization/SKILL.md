@@ -143,15 +143,17 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   unrolled to constant offsets (4660 -> 281 cycles).
 - **R9 Batched small calls, filled lanes**: scalar-ish math once for all panels, independent small reductions in one
   call, two heads per call, two blocks per iteration of a RecMII-bound loop.
-- **R10 Sequential recurrences** (the GDN scan): two tokens per pass exactly, the reduction S^T [k q] on the MMUL,
-  pass 2 split in two loops (698 -> 413 cycles per token and panel).
+- **R10 Sequential recurrences** (the GDN scan): chunkwise (WY / UT form), 16 tokens per state read and write, the
+  state products and the update on the MMUL, the intra-chunk solve in fp32 by 8-token blocks (a 1B chunk's scan
+  70 -> 24 ms).
 - **R11 Several tokens per decode step**: a DMA-bound step of S tokens costs about one (tokens on the MMUL's A rows,
   inputs interleaved per 8-element block, recurrent state replayed instead of snapshotted).
 - **R12 Neighbour cores sharing derived data** through shared memory (GemmQ's dequant pairs: per k-tile 980 -> ~800
   cycles, the 9B prefill chunk -7%).
 - **R13 Flash attention with several query heads per core**: at most two panel streams per loop (the memtile
-  interleaves the rest), P V over pairs of row blocks, row sums on the MMUL, rare paths out of line (88 -> 15.1 ms
-  per layer).
+  interleaves the rest), every pop for as many MMULs as the accumulators allow (two row panels x two records: the
+  MMUL bound), P V over pairs of row blocks, the softmax in pipelined passes with no per-lane constants, o in two
+  copies, rare paths out of line (88 -> 15.1 ms per layer; qwen35 1B 9.95 -> 4.95).
 
 ## 4. Pipelining playbook
 

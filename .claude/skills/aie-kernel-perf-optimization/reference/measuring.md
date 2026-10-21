@@ -19,6 +19,9 @@ Where a design's time goes, measured on the hardware rather than inferred from s
 - One NPU job at a time. Each variant in its own process: a switch to a HW context reloads its PDI (~2.2 ms for a
   decode overlay's 0.56 MB, ~0 for a library's empty one). Variants that differ by less than run-to-run noise (~±1 ms
   on a 30 ms chunk): two instances in one process, alternated.
+- Time an operator in a library program or as `FusedOperator(expand_load_pdis=False)`: a single-op FusedOperator's
+  default reloads its PDIs per dispatch (+0.8 ms for a 32-core attention design), more than a ConfigureOp costs in a
+  library.
 - Report median and p10 over several reps. Desktop DRAM traffic moves e2e by ±15%, and a
   memory-heavy CPU job slows DMA-bound NPU work by up to 40%. Check `top` for a busy CPU first.
 - The AIE clock is 1.81 GHz in turbo, whatever the kernel does: cycles / 1.81e9 = seconds. (The

@@ -98,7 +98,8 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Streaming a residual update's v and r from two regions at once | a core must hold both: aiecc rejects a release that does not match an acquire of the same loop body; interleave pairs in one stream |
 | Broadcasting a KV head's cache to the two decode attention cores that read it (each still consumes all of it) | no change at any context; splitting the positions between them and merging (m, l, y) gave -8% at 32K |
 | Splitting a DMA-bound attention block's query rows over the 4th core row (Llama 3B prefill: 96 rows as 4 x 24) | not built: 12.09 vs 12.16 ms with the compute compiled out; 64-query blocks (half the KV reads) gave -25% |
-| Two shim channels per KV head joined in one memtile (Gemma prefill attention) | 7 memtile inputs: does not build (aie2p-coding section 8); two streams through two memtiles work (data-movement.md) |
+| Two shim channels per KV head joined in one memtile (Gemma prefill attention) | 7 memtile inputs: does not build (aie2p-coding section 8); two streams through two memtiles work, and each from two shims once Q rides the KV stream (qwen35: data-movement.md) |
+| A second o copy for the qwen35 27B's attention (three row panels per core) | no L1 left (61 of 64 KB): its P V stays in place, ~2.8 ms of memory stall per layer at 16K |
 
 ## Numerics
 

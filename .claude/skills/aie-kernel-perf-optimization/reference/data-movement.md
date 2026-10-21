@@ -23,6 +23,7 @@ by kernel II.
 | all shim channels together | ~57 GB/s read or write: the NPU's one 32 B / cycle fabric port. Not full from 4 channels on 4 shims: one MM2S channel each into memtiles ~50 GB/s together, on 8 shims ~55; sd15's 4 B streams into cores (5760-byte core BDs) 11.2 GB/s each, MAC on or off |
 | reads and writes at once | ~76 GB/s together |
 | DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate |
+| short DDR write rows | a GemmQ pass's C (64 columns per token: 128 B rows) costs a short-K GEMM ~25%: the qwen35 1B's gdn_in (K 1024) 0.22 vs 0.17 ms per item when each pass's C is written whole; rows at the column's pitch (2.3 KB stride) instead of the full row (18 KB) did not help: the row length binds |
 | BD fields | 64 B bursts -16%, ≥ 128 B full; AxCACHE 0 halves the rate (Artlite: 512 B, AxCACHE 2) |
 
 All shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (AMD's Strix Point SoC
@@ -94,6 +95,11 @@ bandwidth.
     own (the paper's duplicated Q broadcast); the producer writes them so that the memtile's walk restores them.
   - One shim task per pass and stream: Q, history and chunk as one BD chain (`chained_fill` with `ChainPart`s:
     BDs of other buffers, scratchpad offset / length parameters).
+  - Then one shim channel per stream binds (~10 GB/s each: 4 streams ~40 GB/s). Each stream from two shims, joined
+    by its memtile (part i: d-blocks 8 i .. of every piece), cut the qwen35 1B's floor 5.8 -> 4.1 ms per layer and the
+    9B's 20.0 -> 16.9. A join sends each part as its own transfer, so the memtile's walk (`to_stream`) applies within
+    a part: split the parts so that each re-lays by itself. The join takes two of the memtile's 6 S2MM channels:
+    the attention's Q slots ride the KV stream instead of their own input (the column's output join takes four).
   Further: more queries per pass (fewer re-reads; bounded by L1: the fp32 O of head_dim 512), or cores splitting the
   positions and merging partial softmax results (below).
 - **Read each byte of a tile once.** A gather of fixed-size units wastes the rest of a unit when a part is smaller:

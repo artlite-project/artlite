@@ -119,6 +119,13 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
   bound 9). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
   halves (moves).
 
+### Sigmoid through the gather LUT (`act_lut.SIGMOID`: the qwen35 attention prep's gate)
+
+No odd symmetry to fold: `ActTable(full=True)` tabulates f itself over [-t_max, t_max] (here 16), the range
+reduction as SiLU's with x + 48 in one binade of ULP 1/4 (129 segments), beyond it clamped: within 0.54 bf16 ULP,
+99.9% correctly rounded (`test_sigmoid_lut`); 1718 instead of 10273 cycles per 8 tokens of 256 gates (an fp32 exp2
+and reciprocal).
+
 ### SiLU (GemmQ's gate/up epilogue: the vtanh form + `al::silu_small`)
 
 - vtanh form (`al::tanh_acc` / `al::exp2_acc`): u (1 + tanh(u)), u = x / 2. Below x = -3,

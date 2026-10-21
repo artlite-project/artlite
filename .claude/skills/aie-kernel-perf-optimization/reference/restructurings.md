@@ -13,7 +13,7 @@ what to expect.
 - R7 Port-bound loops: fewer shuffles
 - R8 Pointer walks instead of index math; constant offsets
 - R9 Batched small calls, filled lanes
-- R10 Sequential recurrences: token pairs, the reduction on the MMUL
+- R10 Sequential recurrences: chunkwise on the MMUL
 - R11 Several tokens per decode step
 - R12 Neighbour cores sharing derived data
 - R13 Flash attention with several query heads per core
@@ -156,39 +156,43 @@ per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 
 
 ## R9 Batched small calls, filled lanes
 
-- **Scalar-ish math once for all panels**: the GDN scan's fp32 token math (u, delta, o, e0: ~266 cycles of latency)
-  per 8-column panel ran on 16 lanes with 8 used; per token pair the 4 panels' pass 1 stores its parts, the math runs
-  once on 32 lanes, then pass 2 per panel: 2548 instead of 4 x 747 cycles per pair, bit-exact (the same per-lane
-  arithmetic).
-- **One call for independent small reductions**: a pair's 4 l2 norms (reduce -> invsqrt -> scale chains) in one call:
-  424 vs 4 x 150 cycles; its 4 dot products: 136 vs 4 x 76.
-- **Packed lanes**: the GDN gates (softplus, expm1, sigmoid in fp32: they feed the fp32 state, no bf16 table) on 16
-  lanes for 8 tokens of one v head; two heads per call halve the calls.
-- **A RecMII-bound loop: two blocks per iteration**: the GDN scan's pass 1 (split + MMUL chain, RecMII 11 per block)
-  at II 12-14 per two blocks, written out by hand (`AIE_LOOP_UNROLL` in an inlined helper breaks measure_ii's build:
-  aie2p-coding section 9).
+- **Scalar-ish math once for all panels**: math that needs a few lanes per panel (a recurrence's per-token scalars)
+  runs once on 32 lanes for all panels between two passes over them, not on 16 lanes per panel (a token-pair GDN
+  scan: 2548 instead of 4 x 747 cycles per pair, bit-exact: the same per-lane arithmetic).
+- **One call for independent small reductions**: 4 l2 norms (reduce -> invsqrt -> scale chains) in one call: 424 vs
+  4 x 150 cycles; 4 dot products: 136 vs 4 x 76.
+- **Packed lanes**: the GDN gates (softplus, expm1 in fp32: they feed the fp32 state) of two heads per call
+  (`GdnPrepOperator`).
+- **A RecMII-bound loop: two blocks per iteration**, two independent chains in one body (a split + MMUL chain of
+  RecMII 11 per block: II 12-14 per two blocks), written out by hand (`AIE_LOOP_UNROLL` in an inlined helper breaks
+  measure_ii's build: aie2p-coding section 9).
 
-## R10 Sequential recurrences: token pairs, the reduction on the MMUL (`qwen35/gdn_prefill.py`)
+## R10 Sequential recurrences: chunkwise on the MMUL (`qwen35/gdn_prefill.py`)
 
-The Gated DeltaNet scan updates an fp32 state S (128 x 128 per head) token by token: u = S^T k, w = S^T q, then
-S + d S + k delta^T. Per token and 8-column panel of S the vector form took 698 cycles (pass 1 mv-bound by the
-`tile8` broadcasts of k / q, II 15; pass 2 store-bound by the hi / lo split's conversions and the fp32 stores, II 18).
-A generated sweep of ~1300 structures (`variant_search` with factory knobs, a few minutes per sweep) found 413 cycles
-per token:
+The Gated DeltaNet scan updates an fp32 state S (128 x 128 per head) token by token (u = S^T k, then S + d S +
+k delta^T): every token reads and writes S, and even two tokens per pass (token 1's products from S0 and token 0's
+result) took 413 cycles per token and 8-column panel. The chunkwise (WY / UT) form handles C = 16 tokens per state
+read and write:
 
-- **Two tokens per pass, exactly.** Token 1's products come from S0 and token 0's result: S1^T k1 = (1 + d0) S0^T k1
-  + delta0 (k0 . k1), the same for q1; the update S2 = S0 + D S0 + k0 e0^T + k1 delta1^T with D = d0 + d1 + d0 d1,
-  e0 = (1 + d1) delta0. Half the state loads, stores and hi / lo splits, 10.5 instead of 12 MACs per element and
-  token. A null second token (d = beta = 0) handles an odd count.
-- **The reduction on the MMUL**: S^T [k0 q0 k1 q1] as one 8-row A panel per i-block ([4 rows bfp16 hi | 4 rows lo],
-  built once per pair) against the state block's bfp16 hi and lo (`al::split_hilo`, B via `op_transpose`): 3 MMULs
-  per block for both tokens, no broadcasts. bfp16 hi + lo (14 bits) was as accurate as bf16 hi / lo products. The loop
-  runs at II 11 per block (RecMII 11 whatever the number of accumulators or the A stream: ResMII 4).
-- **Pass 2 in two loops**: decay + token 0's rank-1, then token 1's rank-1. Each holds half the loop invariants
-  (64-lane hi / lo expansions): one loop at II 22 spilled them, two run at 16 + 5.
-- On the NPU the scan went 5.97 -> 5.13 ms per 27B layer (T = 256). The gate math (softplus, expm1, sigmoid: 4 KB)
-  does not fit the scan cores' program memory: `GdnPrepOperator` computes it, once per k head instead of once per
-  core. Measure a static gain against the whole kernel before porting it.
+- **The state products on the MMUL**: per chunk X^T = (K S0)^T and Y^T = (Q S0)^T (bfp16 hi + lo operands, three
+  products), the update S0 + K^T (Gamma_C / Gamma U). The decays as products E = prod (1 + d) - 1: no cancellation
+  for weak decays.
+- **The intra-chunk solve in fp32**: U = (I + L)^-1 R by 8-token blocks, T00 and T11 by row substitution on bf16 hi /
+  lo MAC chains, U1 = T11 (R1 - L10 U0). T by MMUL products ((I - N)(I + N^2)(I + N^4), hi + lo) doubled the error of
+  deep layers.
+- **Accuracy first on the CPU**: the chunk form at the kernels' rounding points vs the exact recurrence (numerics.md
+  "Precision studies"): o within ~3e-5 rms (token pairs 1.5e-5), ~100x below o's bf16 rounding; the largest site is
+  X^T / Y^T (the products of S0 serve all 16 tokens, their rounding correlated).
+- **The work around it**: the prep (q, k panels, the gates) on 4 cores per column, a k and a q core per k head (the
+  memtile splits each input object between them, their panels joined into one record per chunk); the scan once per
+  layer over the whole chunk.
+- **Compiler**: block vectors popped in a function's first block and held across a loop exhausted the registers (the
+  same pops inside an outer loop compile); `concat` of two half-width broadcasts pushed lane by lane (32 `vpush` per
+  step: two full broadcasts and a select instead); program memory forced rolled loops (T inverse 5.4 -> 1.2 KB) and
+  `minsize` on cold helpers.
+- Per 16-token chunk and core 8.4K cycles (T inverse 719, X / Y 314 per j-block post-RA pipelined, the decay scan
+  444). A 2048-token chunk of the 1B (MiniCPM-V's LM): scan 70 -> 24 ms, prefill +18%; 9B / 27B +10%. With the
+  chunk math compiled out the scan runs within ~10% of its time: DMA-bound in the program.
 
 ## R11 Several tokens per decode step (draft verification, short prompts)
 
@@ -259,3 +263,19 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   exp loop are bound by loads and the exp2's vec ops, not MMULs; it stays, with single Q: smaller buffers, KL within
   the prefill's gate); `minsize` on the cold kernels (-0.5 KB of 7.8; with configuration by control packets program
   memory costs a few µs per design switch).
+
+qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core when a column holds one q head), per
+32-key group and core, the 1B (MiniCPM-V's LM) at p0 = 16K:
+- **Every pop for as many MMULs as one-chain accumulators allow**: with K objects of two records (the memtile
+  interleaves the records per d-block) the score loop pops 4 K and 4 Q panels per d-block for 12 MMULs on 4
+  accumulators, one chain each for Q hi K hi + Q lo K hi + Q hi K lo: II 12, the MMUL bound (0.67 pops per MMUL
+  instead of 1.33 for one panel and record): 2 x 423 instead of 4 x 358 cycles. P V likewise: a group's 4 V records
+  for both panels per pop, II 9 for 8 MMULs.
+- **The softmax in two pipelined passes**: the QK chain starts at b = 192 - m (A = s + 192 - m stored), so the exp2
+  pass has no per-lane constants (II 26 -> 8 per 64 lanes); 8 steps of 32 lanes, not 4 of 64 (with 4 iterations
+  the stages exceed the trip count: no post-RA schedule); the m + 16 bound check folded in as a running bf16 max; P
+  to bfp16 straight from the second pass's accumulators (no fp32 round trip): 1156 -> 441 cycles.
+- **o in two copies** (P V reads one, writes the other, in different regions) where L1 allows: o loaded and stored in
+  place in one region put P V 50% above its schedule (548 vs 364 cycles).
+- 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
+  pops (each K panel once per head) and its in-place o (no L1 for a second copy).

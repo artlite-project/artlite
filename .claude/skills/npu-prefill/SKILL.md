@@ -41,7 +41,10 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   whole layers, each estimated under `PIECE_BUDGET_S` (the driver kills a dispatch after 2 s; DDR contention adds up
   to 40%). Keep a per-layer time estimate (`layer_seconds`) for the splits and the chunk planner, fitted to measured
   chunks (sizes x positions; Llama's within ~5%): a model 2x off put a 48-token prompt in a 256-token chunk (58 ms)
-  instead of a 128-token one (44). A program's ConfigureOps alternate two PDI-load slots: `run` assembles the next
+  instead of a 128-token one (44). Terms that scale with the model's dimensions fit one set of constants to all its
+  sizes (Qwen: weight bytes, GEMM items, hidden size, v heads, q heads; the flash attention per cached position as
+  the larger of its cache bytes and its cores' cycles: the 1B, 9B and 27B within ~2%); constants fitted to the
+  largest model alone were 2-3.7x high for the 1B. A program's ConfigureOps alternate two PDI-load slots: `run` assembles the next
   run's pieces (the other parity) while one runs, else a size's second run pays it (1B +6 ms, 8B +105 ms).
 - **Runtime values** (position, cache offsets, window starts) are scratchpad parameters set per chunk (`params()`):
   only for operators in the library (an unknown name raises), range-checked against the arguments' declared sizes
