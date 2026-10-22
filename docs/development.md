@@ -17,8 +17,8 @@ GitHub runs `ruff check` on each push to `main` and each pull request; the tests
 machine. The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The
 tests need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the
 background while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay
-corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp build
-(`ARTLITE_LLAMA_CPP_DIR`).
+corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp CPU build
+(`ARTLITE_LLAMA_CPP_DIR`) and skip without one.
 
 The C++ runtime's tests (gtest, `tests/npu_test.cpp`) build in their own tree, with the venv active (`build/` belongs
 to the editable install):

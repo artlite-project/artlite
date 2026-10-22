@@ -35,6 +35,7 @@ import tempfile
 from collections.abc import Callable
 
 import numpy as np
+import pytest
 import torch
 
 from artlite.model_config import LLAMA_CPP_DIR, QwenConfig, qwen_gguf  # noqa: F401 (tests import them from here)
@@ -53,11 +54,16 @@ DUMP_SRC = os.path.join(HERE, "qwen35_dump.cpp")
 # ----------------------------------------------------------------------
 
 
+def llama_cpp_bin(name: str) -> str:
+    """A file of the llama.cpp CPU build (``build/bin/<name>``), or skip the test without one."""
+    path = os.path.join(LLAMA_CPP_DIR, "build", "bin", name)
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing: no llama.cpp CPU build (ARTLITE_LLAMA_CPP_DIR)")
+    return path
+
+
 def _llama_lib() -> str:
-    lib = os.path.join(LLAMA_CPP_DIR, "build", "bin", "libllama.so")
-    if not os.path.exists(lib):
-        raise FileNotFoundError(f"{lib}: no llama.cpp build (model_config.LLAMA_CPP_DIR, ARTLITE_LLAMA_CPP_DIR)")
-    return lib
+    return llama_cpp_bin("libllama.so")
 
 
 def _lib_identity() -> str:
@@ -84,7 +90,7 @@ def dump_tool() -> str:
 
 def llama_tokenize(model: str, text: str) -> list[int]:
     """llama.cpp's token ids of a text (``llama-tokenize``: special tokens parsed, no BOS)."""
-    exe = os.path.join(LLAMA_CPP_DIR, "build", "bin", "llama-tokenize")
+    exe = llama_cpp_bin("llama-tokenize")
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(text)
         path = f.name

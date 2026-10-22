@@ -37,7 +37,7 @@ from artlite.operators.base import CACHE_DIR
 from artlite.operators.vision import minicpmv as vision
 
 from . import common
-from .qwen35_ref import _lib_identity, _llama_lib
+from .qwen35_ref import _lib_identity, _llama_lib, llama_cpp_bin
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DUMP_SRC = os.path.join(HERE, "minicpmv_dump.cpp")
@@ -52,7 +52,7 @@ SUFFIX_ROWS = {"ov": [0], "ov_slice": [0, 1], "slice": [2, 1], "row_end": [2, 3,
 
 
 def _mtmd_identity() -> str:
-    lib = os.path.realpath(os.path.join(os.path.dirname(_llama_lib()), "libmtmd.so"))
+    lib = os.path.realpath(llama_cpp_bin("libmtmd.so"))
     return f"{lib}:{os.path.getsize(lib)}:{int(os.path.getmtime(lib))}"
 
 
