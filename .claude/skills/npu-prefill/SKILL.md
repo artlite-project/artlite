@@ -121,6 +121,10 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - Llama 3B Q4_K_M, 1024 tokens at p0 = 0 (341 ms): GEMMs ~70%, design switches ~13%, norms ~7%, attention ~6%. A
   layer whose V and down are Q6_K costs ~2.2 ms more than a Q4_K one (planar GemmQd: a dequantizing core per column,
   66 of 80 MAC columns, 1024 tokens as 1152): ~9% of the chunk.
+- Other chips: a Krackan Point laptop runs Gemma E4B's Q4_0 prefill at 0.96x Strix Halo's speed, the Q4_K_M files'
+  at 0.51x (Llama 1B) and 0.73x (Qwen 27B). It has the same array and clock, and a faster DRAM path in every
+  `artlite-probe` pattern. Not the cause: Linux 7.0's driver (the same speed on Halo), control-code density (per ms of
+  a 1024-token chunk: 1B 75 syncs and 1.2 configurations, Gemma 41 and 0.85, 27B 19 and 0.31). Not known yet.
 - Levers that worked: the A strip resident through K parts (`prefill.gemm.resident_k_part`); reading each weight byte once (header units); more
   queries per attention pass where L1 allows (sliding window: 2 blocks of 32); a broadcast KV stream on both of each
   core's input channels (full attention at 30K: -41%); the last token from the prefill's last

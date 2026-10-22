@@ -11,30 +11,38 @@ by kernel II.
 - Overlays, libraries and fused ELFs
 - Host side of a dispatch
 
-## Rates and ceilings (Strix, NPU2)
+## Rates and ceilings (NPU2: Strix Halo, and Krackan Point where it differs)
 
 | path | rate |
 |---|---|
 | a DMA channel, a stream-switch port | 64 bit per cycle = 8 B at 1.8 GHz = 14.4 GB/s (AM027) |
 | the core's own stream port | 4 B per cycle (7.2 GB/s) each way, ObjectFifos do not use it; the core spends an issue slot per 32-bit word (aie2p-coding section 2); a broadcast that includes a core port runs at its rate (a DMA consumer on it: 7.0 instead of 13.2 GB/s) |
 | a core's input DMA channel (S2MM) | 8 B per cycle: every consumer of a broadcast receives the whole stream at this rate |
-| one shim MM2S channel reading DDR alone | ~13.8 GB/s: 7.7 B per array cycle (its 8 B stream) |
-| one shim tile, both MM2S channels | ~27 GB/s: 15.5 B per cycle (the shim DMA's 128-bit AXI master, AM020) |
-| all shim channels together | ~57 GB/s read or write: the NPU's one 32 B / cycle fabric port. Not full from 4 channels on 4 shims: one MM2S channel each into memtiles ~50 GB/s together, on 8 shims ~55; sd15's 4 B streams into cores (5760-byte core BDs) 11.2 GB/s each, MAC on or off |
-| reads and writes at once | ~76 GB/s together |
-| DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate |
+| one shim MM2S channel reading DDR alone | ~13.8 GB/s: 7.7 B per array cycle (its 8 B stream); Krackan 14.2 |
+| one shim tile, both MM2S channels | ~27 GB/s: 15.5 B per cycle (the shim DMA's 128-bit AXI master, AM020); Krackan 28.1 |
+| all shim channels together | ~57 GB/s read or write: Strix Halo's one 32 B / cycle fabric port (Krackan: 97.8 read, 87.2 write, 54 B per cycle: 81% of its 120 GB/s bus). Not full from 4 channels on 4 shims: one MM2S channel each into memtiles ~50 GB/s together, on 8 shims ~55; sd15's 4 B streams into cores (5760-byte core BDs) 11.2 GB/s each, MAC on or off |
+| reads and writes at once | ~76 GB/s together (Krackan 88.2: no more than its writes alone) |
+| DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate. Krackan the same in proportion: 28.6 / 55.9 / 95.6 GB/s for 256 B / 512 B / 1 KB rows, 89.6 skewed by 256 B |
 | short DDR write rows | a GemmQ pass's C (64 columns per token: 128 B rows) costs a short-K GEMM ~25%: the qwen35 1B's gdn_in (K 1024) 0.22 vs 0.17 ms per item when each pass's C is written whole; rows at the column's pitch (2.3 KB stride) instead of the full row (18 KB) did not help: the row length binds |
 | BD fields | 64 B bursts -16%, ≥ 128 B full; AxCACHE 0 halves the rate (Artlite: 512 B, AxCACHE 2) |
 
-All shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (AMD's Strix Point SoC
-slide: "NPU Datapath - 32B/cycle"; 31.7 B measured at 800, 1267 and 1810 MHz): not the fabric or memory clocks, not
-IOMMU translation (4 KB vs 2 MB pages: the same rate), not latency. Gathers of rows ≥ 1 KB, or at a stride off
-4 KB multiples by 64-256 B, run at the port rate.
-No setting raises it; the SMU's `average_ipu_reads` (amdgpu `gpu_metrics`, MB/s) reads it directly.
+On Strix Halo all shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (31.7 B
+measured at 800, 1267 and 1810 MHz): not the fabric or memory clocks, not IOMMU translation (4 KB vs 2 MB pages: the
+same rate), not latency. Gathers of rows ≥ 1 KB, or at a stride off 4 KB multiples by 64-256 B, run at the port rate.
+No setting raises it; the SMU's `average_ipu_reads` (amdgpu `gpu_metrics`, MB/s) reads it directly. The port is
+Halo's, not the array's: Krackan Point's NPU, at the same 1.81 GHz, reads 54 B per cycle (AMD's Strix Point slide
+says "NPU Datapath - 32B/cycle", with no clock). A column's DRAM share is thus ~3.9 B per array cycle on Halo, ~6.8
+on Krackan; GemmQd's cost model (`gemm_qd.k_tile_cycles`) assumes Halo's.
 Decode streams every weight once per token, so its tokens/s is this ceiling / bytes per token: the iGPU (~190-199
 GB/s) decodes the same model ~3.6x faster. Single-token decode reads ~55-56 GB/s, ~97-98% of the ceiling (Llama 1B:
 the A channels starved on memory half the time, backpressured 1%); the remaining levers are fewer bytes per token
-(speculative decoding on the multi-token step, MoE, low-bit formats, tile padding).
+(speculative decoding on the multi-token step, MoE, low-bit formats, tile padding). On Krackan the same decode reads
+64-70 GB/s (Llama 1B, Gemma E4B, Qwen 27B), ~70% of that chip's 16-channel rate. Two limits sit there that Halo's port
+hides. Each column streams its weights on one shim channel (A: MM2S 0): Halo's 8 such channels read 56.4 GB/s (the
+port), Krackan's are not measured yet. The main core's work per tile (its half-tile GEMV, the helper's handoff, the
+collect) caps a column at ~5.9 B per array cycle on Q4_K and ~4.3 on Q6_K, against ~12 on Q4_0. Measured in Halo's
+steps with the event windows: 1B 10.9 of 14.7 ms, 27B 200 of 296 ms, Gemma 25 of 55 ms. A second weight channel per
+column and a cheaper K-quant tile on the main core would speed up a chip with a wider path, not Halo.
 
 Where the columns' streams start in DRAM matters, though no microbenchmark showed it: the 8 column streams of a
 column-major image at an odd multiple of 256 KB apart (`overlay/image.py` `_col_stride`: each in its own 256 KB slot

@@ -39,7 +39,8 @@ device rather than for portability.
 >
 > The NPU's limit is memory bandwidth: ~57 GB/s on Strix Halo, where the iGPU reads ~244 GB/s of the 256 GB/s bus.
 > Decode, which reads every weight once per token, is therefore ~3.6x faster on the iGPU there, with Artlite's decode
-> already close to the NPU's limit; on a Krackan Point laptop with a 128-bit bus the iGPU's lead is 1.25-1.44x.
+> already close to the NPU's limit; on a Krackan Point laptop, whose NPU reads ~98 GB/s of its 120 GB/s bus, the
+> iGPU's lead is 1.25-1.44x.
 > Compute-bound work such as prefill runs on par with the iGPU, at a fraction of its power, and leaves the iGPU free.
 > Which workloads belong on the NPU is not fully explored yet: [Where the NPU fits](docs/npu-vs-igpu.md) has the
 > measurements and the candidates.

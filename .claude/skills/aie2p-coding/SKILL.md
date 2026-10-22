@@ -20,7 +20,22 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
 
 ## 1. Architecture identity
 
-- Internal name `aie2p` == NPU2 == XDNA2. Chips: Strix Point, Strix Halo, Krackan. [mlir-aie `skills/aie-kernel-opt`]
+- Internal name `aie2p` == NPU2 == XDNA2. Every chip below has the same 8-column array, rated 50-60 TOPS (the driver
+  counts 4096 x 8 columns x H-clock: 59 at 1.8 GHz). Strix Point, Krackan and Strix Halo share one DPM table (H-clock
+  up to 1800 MHz: xdna-driver's npu4 / npu5 / npu6 use `npu4_regs.c`'s). They differ in the memory bus and the NPU's
+  path to it (section 4). [AMD product pages; xdna-driver `amdxdna_pci_drv.c`]
+
+  | chip | parts | memory | PCI `1022:17f0` revision (driver table, firmware dir) |
+  |---|---|---|---|
+  | Strix Point | Ryzen AI 9 HX 375 / HX 370 / 365 | 128-bit LPDDR5X-8000 / DDR5-5600 | 0x10 (npu4, `17f0_10`) |
+  | Krackan Point | Ryzen AI 7 350, Ryzen AI 5 340 / 330 | 128-bit LPDDR5X-8000 / DDR5-5600 | 0x20 in the tables (npu6, `17f0_10`) |
+  | Strix Halo | Ryzen AI Max / Max+ 385-395 (PRO 380: 128-bit) | 256-bit LPDDR5X-8000, 256 GB/s | 0x11 (npu5, `17f0_11`) |
+  | Gorgon Point | Ryzen AI 400 (HX 475 / 470, AI 7 450, AI 5 430; 450G desktop) | 128-bit LPDDR5X-8533 / DDR5-5600 | |
+  | Gorgon Halo | Ryzen AI Max+ PRO 495 / 485 | 256-bit LPDDR5X-8533 | (Linux 7.4) |
+
+  Also XDNA 2: Ryzen AI Z2 Extreme (handheld), Ryzen AI Embedded P100. Boards sharing a PCI revision are told apart by
+  the firmware's revision query only (STXA, STXB, KRK1, KRK2, HALO, GPT1-3: xdna-driver `aie2_msg_priv.h`; sysfs
+  `vbnv`). Versal AI Edge Gen 2 has AIE-ML v2 tiles too, behind a NoC: not Artlite's target.
 - Peano target: `--target=aie2p-none-unknown-elf`. [`src/artlite/operators/base.py` (`AIE_TARGET`)]
 - Physical array (mlir-aie `NPU2TargetModel`): 1 shim row + 1 memory-tile row + 4 compute rows = 6 rows, 8 columns:
   32 compute cores, 8 memory tiles, 8 shim tiles. [`include/aie/Dialect/AIE/IR/AIETargetModel.h`, ATB]
@@ -82,10 +97,20 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   (cannot be set while an NPU context is active). `sudo xrt-smi configure --pmode performance --device
   0000:c5:00.1` is safe at any time.
 - Measured with the cores' counters: 1.81 GHz in turbo under any load; the reported `h_clock` is a lagging average.
-- Off-chip bandwidth: ~65 GB/s effective on Strix Point, ~50 GB/s of effective DRAM bandwidth in GEMM workloads
-  [ATB, GEMM-gen]. Measured: ~57 GB/s read for the whole NPU (one 32 B / cycle fabric port shared by all shims),
-  ~13.8 GB/s per shim MM2S channel, ~27 GB/s per shim; DMA channels and stream-switch ports carry 8 B per cycle
-  (14.4 GB/s). The full table: aie-kernel-perf-optimization `reference/data-movement.md`.
+- Off-chip bandwidth is the chip's, not the array's. Measured (`artlite-probe`, power mode `default`, both at 1.81 GHz):
+
+  | | Strix Halo (256-bit LPDDR5X-8000) | Krackan Point (128-bit LPDDR5X-7500) |
+  |---|---|---|
+  | one shim MM2S channel / one shim's two | 13.9 / 26.9 GB/s | 14.2 / 28.1 GB/s |
+  | all 16 channels: read / write / 8 read + 8 write | 56.8 / 57.6 / 76.1 | 97.8 / 87.2 / 88.2 |
+  | read per array cycle | 31.4 B: one 32 B port at the array clock | 54.1 B: 81% of its 120 GB/s bus |
+
+  A DMA channel and a stream-switch port carry 8 B per cycle (14.4 GB/s), a shim's 128-bit AXI master 16 B, on both;
+  what all 8 shims reach is the SoC's. AMD's Strix Point slide gives "NPU Datapath - 32B/cycle" (Hot Chips 2024 Zen 5
+  talk, p. 20) with no clock, direction or port count; Krackan's NPU reads more than 32 B per cycle at any fabric
+  clock. Strix Point is not measured here. Papers: ~65 GB/s effective on Strix Point [ATB], ~50 GB/s in GEMM-shaped
+  transfers on a DDR5-5600 Krackan [GEMM-gen]. The full table: aie-kernel-perf-optimization
+  `reference/data-movement.md`.
 
 ## 5. Vector widths and data types
 
