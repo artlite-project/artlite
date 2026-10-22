@@ -60,7 +60,8 @@ A prompt's chunk routes its tokens on the host: each MoE layer's dispatch ends a
 logits back, picks every token's top 8 (AVX-512) and writes each column's work list (chunks of up to 192 pairs of one
 expert, dealt to the columns in turn) as control packets: the gather's while the shared expert runs, the experts'
 GEMMs' and the combine's while the gather runs; the columns then gather their chunks' rows, run the experts' gate / up
-and down on them, and the combine adds the routed and shared experts' outputs (`moe/prefill.py`).
+and down on them (moving only the 64-row strips of a chunk that hold valid rows: most experts get a few dozen of a
+chunk's 192), and the combine adds the routed and shared experts' outputs (`moe/prefill.py`).
 
 ## Images (MiniCPM-V 4.7)
 

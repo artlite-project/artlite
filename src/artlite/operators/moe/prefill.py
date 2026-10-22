@@ -24,7 +24,7 @@ from ..design import COLS
 from ..prefill.norm import PrefillNormOperator
 from . import gemm as MG
 from . import plan as MP
-from .expert_gemm import CHUNK, N_PARAM, R_PARAM, ExpertGemmOperator
+from .expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
 from .gather import CHAIN, CombineOperator, GatherNormOperator, ds_row
 
 
@@ -141,8 +141,7 @@ class MoEPrefill:
         dev.flush("CBG")
         counts = plan.counts
         groups = [int((-(-plan.sizes[c] // CHAIN)).sum()) for c in range(COLS)]  # (the gather norm's)
-        lib.set_params({**{f"{N_PARAM}{c}": counts[c] | groups[c] << 8 for c in range(COLS)},
-                        **{f"{R_PARAM}{c}": counts[c] - 1 for c in range(COLS)}})
+        lib.set_params({f"{N_PARAM}{c}": counts[c] | groups[c] << 8 for c in range(COLS)})
         self._routed = (L, n, plan, wts, sg)
         return plan
 
@@ -157,13 +156,15 @@ class MoEPrefill:
 
         gu, dn = self.gu[L], self.dn[L]
         cb = self.comb[T, dn.y_layout]
-        for name, op, region, out in (("CBU", gu, self.img.region(L, "exp_gu"), "H"),
-                                      ("CBD", dn, self.img.region(L, "exp_down"), "Y")):
+        active = [sz > M for sz in plan.sizes]  # (chunks of more than one MAC row's tokens)
+        for name, op, region, a_buf, out in (("CBU", gu, self.img.region(L, "exp_gu"), "XP", "H"),
+                                             ("CBD", dn, self.img.region(L, "exp_down"), "H", "Y")):
             v = dev.view(name).view(np.uint32)
             w = op.cb_words
-            op.streams(plan.experts, cb=[addr(name, 4 * c * w) for c in range(COLS)], slab=addr("W", region.offset),
-                       slab_stride=region.col_stride,
+            op.streams(plan.experts, active, cb=[addr(name, 4 * c * w) for c in range(COLS)],
+                       slab=addr("W", region.offset), slab_stride=region.col_stride,
                        c_address=[addr(out, 2 * c * self.cap * op.c_slot) for c in range(COLS)],
+                       a_address=[addr(a_buf, 2 * c * self.cap * op.a_slot) for c in range(COLS)],
                        out=[v[c * w:(c + 1) * w] for c in range(COLS)])
         pos = np.zeros((T, self.K), np.int64)
         pos[:n] = plan.pos

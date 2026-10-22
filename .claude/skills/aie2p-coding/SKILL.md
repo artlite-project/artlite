@@ -245,6 +245,14 @@ Transfers the array chooses (control packets into a shim) [measured]:
 - Self-chaining gather on one channel: [block k: rewrite chain k's row addresses, push chain k, write and push block
   k + 1's BD] [chain k] [block k + 1] ...: FIFO order keeps a block off BDs in use, the queue at <= 3. Per channel ~1 us
   per block + ~0.15 us per row BD; 8 columns within 2-5% of contiguous reads.
+- **Finish on TLAST** (an S2MM channel's FoT_Mode, bits 17:16 of its DMA_S2MM_<ch>_Ctrl, 1 = no counts; memtile
+  0xA0600 + 8 ch; mlir-aie has no API: a maskwrite in the runtime sequence, the FIFO's channel pinned with
+  `cons(channel=)`): a BD ends at the stream's TLAST (every shim BD sends one at its end), so a sender may send less
+  than the object; a split's input BDs (one per part, with their walks) each end on their own TLAST. An expert GEMM's
+  A strips: a strip without valid rows sent as one 72-byte marker panel, which its core checks (`moe.expert_gemm`).
+  Without FoT such a short transfer hangs the dispatch. A runtime-sequence transfer that is not whole objects fails
+  mlir-aie's verifier: send them from control packets (or raw `npu_writebd` in a standalone operator: a library's
+  assembler maps every data BD to an argument slot).
 
 ## 9. Peano and aie_api traps
 

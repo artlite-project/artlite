@@ -171,11 +171,12 @@ def test_shared_down(L: int, T: int) -> None:
 @pytest.mark.parametrize("L", [3, 5])
 def test_expert_gemms(L: int) -> None:
     """The experts' gate / up and down (``moe.expert_gemm``: per column a work list of 192-token chunks, each of a
-    random expert; the weights pushed by the column's control stream) in one program: per chunk H = silu(gate) up
-    within 3.5e-2 of fp64 on the chunk's A panels, the down within 3.4e-2 of the exact product of the NPU's H (both
-    halves; Q6_K in layer 3, Q4_K in 5); columns of 1 .. cap chunks."""
+    random expert, rows 64 .. 191 active or not; the weights, A strips and drains pushed by the column's control stream)
+    in one program: per chunk H = silu(gate) up within 3.5e-2 of fp64 on the chunk's A panels, the down within 3.4e-2
+    of the exact product of the NPU's H (both halves; Q6_K in layer 3, Q4_K in 5), on the rows that move; an inactive
+    chunk's rows 64 .. (but the column's last chunk's) untouched; columns of 1 .. cap chunks."""
     from artlite.operators.fused import Library
-    from artlite.operators.moe.expert_gemm import CHUNK, N_PARAM, R_PARAM, ExpertGemmOperator
+    from artlite.operators.moe.expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
     from artlite.txn import device_address
 
     g, img, W = _image()
@@ -190,27 +191,30 @@ def test_expert_gemms(L: int) -> None:
     ns = rng.integers(1, cap + 1, size=COLS)
     ns[0] = cap
     ex = [list(rng.integers(0, cfg.n_experts, size=int(n))) for n in ns]
+    act = [rng.random(int(n)) < 0.5 for n in ns]
+    act[1][:] = False  # (a column whose only rows 64 .. are its last chunk's)
     Wd = artlite.empty((img.nbytes // 2,), dtype=torch.bfloat16, device=dev)
     Wd._raw.map()[:] = W
     Wd._raw.sync_to_device()
     A = (torch.randn(COLS, cap, CHUNK, H, generator=torch.Generator().manual_seed(L)) * 0.5).bfloat16()
     pan = torch.stack([torch.stack([bfp16.to_panels(A[c, k]) for k in range(cap)]) for c in range(COLS)])
     XP = artlite.from_torch(pan.reshape(-1).contiguous(), dev)
-    Hb = artlite.from_torch(torch.zeros(COLS * cap * gu.c_slot, dtype=torch.bfloat16), dev)
-    Yb = artlite.from_torch(torch.zeros(COLS * cap * dn.c_slot, dtype=torch.bfloat16), dev)
+    UNSET = 0x7FC1  # (what no drain writes)
+    Hb = artlite.from_torch(torch.full((COLS * cap * gu.c_slot,), UNSET, dtype=torch.int16).view(torch.bfloat16), dev)
+    Yb = artlite.from_torch(torch.full((COLS * cap * dn.c_slot,), UNSET, dtype=torch.int16).view(torch.bfloat16), dev)
     cbs = {}
-    for op, name, region, out in ((gu, "gu", gu_r, Hb), (dn, "dn", dn_r, Yb)):
+    for op, name, region, a_in, out in ((gu, "gu", gu_r, XP, Hb), (dn, "dn", dn_r, Hb, Yb)):
         cb = artlite.from_torch(torch.zeros(COLS * op.cb_words * 2, dtype=torch.bfloat16), dev)
         cbv = cb._raw.map().view(np.uint32)
         for c in range(COLS):
-            words = op.stream(ex[c], cb=device_address(cb, 4 * c * op.cb_words, lib._ctx),
-                              slab=device_address(Wd, region.offset, lib._ctx), slab_stride=region.col_stride,
-                              c_address=device_address(out, 2 * c * cap * op.c_slot, lib._ctx))
-            cbv[c * op.cb_words:c * op.cb_words + words.size] = words
+            op.stream(ex[c], act[c], cb=device_address(cb, 4 * c * op.cb_words, lib._ctx),
+                      slab=device_address(Wd, region.offset, lib._ctx), slab_stride=region.col_stride,
+                      c_address=device_address(out, 2 * c * cap * op.c_slot, lib._ctx),
+                      a_address=device_address(a_in, 2 * c * cap * op.a_slot, lib._ctx),
+                      out=cbv[c * op.cb_words:(c + 1) * op.cb_words])
         cb._raw.sync_to_device()
         cbs[name] = cb
-    lib.set_params({**{f"{N_PARAM}{c}": int(ns[c]) for c in range(COLS)},
-                    **{f"{R_PARAM}{c}": int(ns[c]) - 1 for c in range(COLS)}})
+    lib.set_params({f"{N_PARAM}{c}": int(ns[c]) for c in range(COLS)})
     a = {k: device_address(b, 0, lib._ctx) for k, b in (("gu", cbs["gu"]), ("dn", cbs["dn"]), ("xp", XP), ("h", Hb),
                                                         ("y", Yb))}
     lib.run([(0, [a["gu"], a["xp"], a["h"]]), (1, [a["dn"], a["h"], a["y"]])],
@@ -218,18 +222,23 @@ def test_expert_gemms(L: int) -> None:
     Hb.sync_from_device()
     Yb.sync_from_device()
     hv = Hb.to_torch().view(COLS, cap, -1)
-    yv = torch.from_numpy(dn.y_rows(Yb.to_torch().view(torch.int16).numpy().reshape(COLS, cap, -1)).copy())
-    yv = yv.view(torch.bfloat16)[..., :H]
+    hr = hv.view(torch.int16).numpy()
+    yr = dn.y_rows(Yb.to_torch().view(torch.int16).numpy().reshape(COLS, cap, -1))[..., :H]
+    yv = torch.from_numpy(yr.copy()).view(torch.bfloat16)
     ex_w = ref.experts(g, L)
     errs_h, errs_y = [], []
     for c in range(COLS):
         for k in range(int(ns[c])):
+            rows = CHUNK if act[c][k] or k == ns[c] - 1 else M
             gate, up, down = (np.asarray(m, np.float64) for m in ex_w(int(ex[c][k])))
-            aq = bfp16.from_panels(pan[c, k], CHUNK, H).double().numpy()
+            aq = bfp16.from_panels(pan[c, k], CHUNK, H).double().numpy()[:rows]
             hg, hu = aq @ gate.T, aq @ up.T
-            got_h = bfp16.from_panels(hv[c, k], CHUNK, F).double().numpy()
+            g = rows // 8 * F // 8 * 36  # (H: the rows' token groups' panels first)
+            assert (hr[c, k, :g] != UNSET).any() and (hr[c, k, g:] == UNSET).all(), (c, k, rows)
+            assert (yr[c, k, rows:] == UNSET).all() and not (yr[c, k, :rows] == UNSET).all(axis=1).any(), (c, k)
+            got_h = bfp16.from_panels(hv[c, k], CHUNK, F).double().numpy()[:rows]
             errs_h.append(ref.rel_err(got_h, hg / (1 + np.exp(-hg)) * hu))
-            errs_y.append(ref.rel_err(yv[c, k].double().numpy(), got_h @ down.T))
+            errs_y.append(ref.rel_err(yv[c, k, :rows].double().numpy(), got_h @ down.T))
     print(f"layer {L}: chunks {list(ns)}; H err max {max(errs_h):.2e}, down err max {max(errs_y):.2e}")
     assert max(errs_h) < 3.5e-2 and max(errs_y) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
 
@@ -244,7 +253,7 @@ def test_moe_block(L: int) -> None:
     x + delta exactly the bf16 sum."""
     from artlite.operators.fused import Library
     from artlite.operators.moe import plan as MP
-    from artlite.operators.moe.expert_gemm import N_PARAM, R_PARAM, ExpertGemmOperator
+    from artlite.operators.moe.expert_gemm import N_PARAM, ExpertGemmOperator, M
     from artlite.operators.moe.gather import CHAIN, CombineOperator, GatherNormOperator, ds_row
     from artlite.txn import device_address
 
@@ -308,11 +317,12 @@ def test_moe_block(L: int) -> None:
     px_rows = a["PX"] + 2 * H * np.arange(T)
     for name, op, region in (("CBU", gu, img.region(L, "exp_gu")), ("CBD", dn, img.region(L, "exp_down"))):
         v = bufs[name]._raw.map().view(np.uint32)
-        out = a["H"] if name == "CBU" else a["Y"]
+        a_in, out = (a["XP"], a["H"]) if name == "CBU" else (a["H"], a["Y"])
         for c in range(COLS):
-            words = op.stream(plan.experts[c], cb=a[name] + 4 * c * op.cb_words, slab=a["W"] + region.offset,
-                              slab_stride=region.col_stride, c_address=out + 2 * c * cap * op.c_slot)
-            v[c * op.cb_words:c * op.cb_words + words.size] = words
+            op.stream(plan.experts[c], plan.sizes[c] > M, cb=a[name] + 4 * c * op.cb_words,
+                      slab=a["W"] + region.offset, slab_stride=region.col_stride,
+                      c_address=out + 2 * c * cap * op.c_slot, a_address=a_in + 2 * c * cap * op.a_slot,
+                      out=v[c * op.cb_words:(c + 1) * op.cb_words])
     v = bufs["CBG"]._raw.map().view(np.uint32)
     for c in range(COLS):
         words = gnorm.stream(px_rows[plan.rows[c]], plan.sizes[c], cb=a["CBG"] + 4 * c * gnorm.cb_words,
@@ -330,8 +340,7 @@ def test_moe_block(L: int) -> None:
     for k in ("CBG", "CBU", "CBD", "CBC", "DS"):
         bufs[k]._raw.sync_to_device()
     groups = [int((-(-plan.sizes[c] // CHAIN)).sum()) for c in range(COLS)]
-    lib.set_params({**{f"{N_PARAM}{c}": counts[c] | groups[c] << 8 for c in range(COLS)},
-                    **{f"{R_PARAM}{c}": counts[c] - 1 for c in range(COLS)}})
+    lib.set_params({f"{N_PARAM}{c}": counts[c] | groups[c] << 8 for c in range(COLS)})
     lib.run([(4, [a["CBG"], a["WN"], a["XP"]]), (5, [a["CBU"], a["XP"], a["H"]]), (6, [a["CBD"], a["H"], a["Y"]]),
              (7, [a["CBC"], a["DS"], a["DL"]]), (8, [a["PX"], a["DL"], a["WN"], a["PX"], a["XN"]])], bufs=raw)
     for k in ("DL", "PX"):

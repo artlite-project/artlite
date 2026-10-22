@@ -102,6 +102,12 @@ bandwidth.
     the attention's Q slots ride the KV stream instead of their own input (the column's output join takes four).
   Further: more queries per pass (fewer re-reads; bounded by L1: the fp32 O of head_dim 512), or cores splitting the
   positions and merging partial softmax results (below).
+- **Move only valid rows of a work item**: a fixed-size work unit (an MoE expert GEMM's 192-row chunk, most chunks a
+  few dozen valid rows) moved its padding rows through DDR with the valid ones: at 1024 tokens 44% of the expert GEMMs'
+  DDR bytes were rows, ~80% of them padding, and the down's Q4_K chunks ran at the combined read + write ceiling (~76
+  GB/s). Per 64-row strip: the control stream sends a strip or a marker panel (finish-on-TLAST, aie2p-coding section
+  8), the cores skip the marker strips' outputs, row 0's outputs straight to the shim, rows 1 and 2's joined: chunks
+  of 1024 / 2048 tokens -14% / -7%, bit-identical.
 - **Read each byte of a tile once.** A gather of fixed-size units wastes the rest of a unit when a part is smaller:
   Gemma's 512-column Q4_0 tiles have a 1 KB header, read as a 4 KB slice-sized unit per K chunk (1.33x the tile
   bytes). One unit holding the headers of 4 consecutive K chunks (`GemmQOperator.hg`, `hdr_groups`) reads the
