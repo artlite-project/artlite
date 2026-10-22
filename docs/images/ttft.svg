@@ -332,17 +332,17 @@
 <circle cx="327.1" cy="553.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 33.9 s</title></circle>
 <circle cx="345.9" cy="534.2" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 68.5 s</title></circle>
 <circle cx="364.7" cy="512.9" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 150 s</title></circle>
-<polyline points="270.6,648.5 327.1,598.7 364.7,553.6 383.6,527.6" class="l0"/>
-<circle cx="270.6" cy="648.5" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 1.02 s</title></circle>
-<circle cx="327.1" cy="598.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 6.37 s</title></circle>
-<circle cx="364.7" cy="553.6" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 33.6 s</title></circle>
-<circle cx="383.6" cy="527.6" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 87.4 s</title></circle>
+<polyline points="270.6,654.7 327.1,608.9 364.7,565.1 383.6,539.9" class="l0"/>
+<circle cx="270.6" cy="654.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.811 s</title></circle>
+<circle cx="327.1" cy="608.9" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 4.38 s</title></circle>
+<circle cx="364.7" cy="565.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 22.0 s</title></circle>
+<circle cx="383.6" cy="539.9" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 55.6 s</title></circle>
 <text x="371.7" y="516.9" class="halo">150 s</text>
-<text x="390.6" y="531.6" class="halo">87.4 s</text>
-<path d="M267.6,642.5h6M270.6,642.5V595.3M267.6,595.3h6" class="bracket"/>
-<text x="277.6" y="622.9" class="lbl halo">8.8×</text>
-<path d="M361.7,547.6h6M364.7,547.6V518.9M361.7,518.9h6" class="bracket"/>
-<text x="357.7" y="537.2" text-anchor="end" class="lbl halo">4.5×</text>
+<text x="390.6" y="543.9" class="halo">55.6 s</text>
+<path d="M267.6,648.7h6M270.6,648.7V595.3M267.6,595.3h6" class="bracket"/>
+<text x="277.6" y="626.0" class="lbl halo">11×</text>
+<path d="M361.7,559.1h6M364.7,559.1V518.9M361.7,518.9h6" class="bracket"/>
+<text x="357.7" y="543.0" text-anchor="end" class="lbl halo">6.8×</text>
 <text x="288.1" y="520.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 288.1 520.0)">10 tok/s</text>
 <text x="301.2" y="552.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 301.2 552.5)">100 tok/s</text>
 <text x="320.8" y="595.4" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 320.8 595.4)">1k tok/s</text>
