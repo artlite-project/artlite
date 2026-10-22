@@ -59,19 +59,20 @@ Q4_0 / Q4_1 tiles of other than 16 rows or of 512 columns; ``tiles`` per pass, `
 """
 
 import itertools
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ..base import ArgSpec, ArtcOperator
-from ..design import COLS, ROWS, stream_walk
+from ..design import COLS, ROWS, range32, stream_walk, times_i32
 from ..formats import FORMATS, KC, KT, kernel_template, slot
 from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
@@ -531,6 +532,8 @@ class GemmQOperator(ArtcOperator):
         c_pairs: bool = False,
         groups: int = 1,
         slots: int = 0,
+        mc_param: str = "",
+        mc_unit: int = 0,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -547,7 +550,9 @@ class GemmQOperator(ArtcOperator):
         (``overlay.image.Block.G``: a tile row holds G rows of kc / G columns, tile i's row r slot j = output row
         G R i + R j + r; A has K / G columns, the K chunks' parts of a slot one after the other): per pass G slots, each a
         GEMM of the A strip with its super-blocks (the strip resent per slot), C objects of ``slots`` slots
-        (default: one, two for tiles of an odd row count; GemmQd only).
+        (default: one, two for tiles of an odd row count; GemmQd only). ``mc_param``: the cores run as many token
+        chunks as this scratchpad parameter says, in units of ``mc_unit`` tokens (a multiple of nrows m; default
+        nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion), "ev_dq" / "ev_mm" / "ev_kt" put event0/1 markers around dq, mm or
@@ -556,6 +561,8 @@ class GemmQOperator(ArtcOperator):
         assert self.planar or tile_major(fmt, rows, kc), f"no GEMM path reads {fmt} tiles of {rows} rows x {kc}"
         assert not self.planar or self.DQ_CORE, f"{fmt} tiles of {rows} rows x {kc}: GemmQdOperator"
         self.ablate = tuple(ablate)
+        self.mc_param = mc_param
+        self.mc_unit = mc_unit
         self.nrows = nrows  # core rows used (fewer rows: a smaller program image, cheaper reconfiguration)
         assert M % (nrows * 16) == 0 and K % kc == 0 and kc % 256 == 0 and tile_bytes % 4 == 0
         assert kc in (KC, 1024, 512)
@@ -678,6 +685,22 @@ class GemmQOperator(ArtcOperator):
         self.m = ms[0]
         self.mc = M // (nrows * self.m)
         super().__init__()
+
+    def _chunk_passes(self, prm: object) -> Iterator[None]:
+        """The cores' loop over token chunks and passes: mc chunks, or ``mc_param``'s (prm: its handle)."""
+        if prm is None:
+            for _ in range_(self.mc * self.passes):
+                yield
+            return
+        n, scale = prm.read(), (self.mc_unit or self.nrows * self.m) // (self.nrows * self.m)
+        assert scale * self.nrows * self.m == (self.mc_unit or self.nrows * self.m), (self.mc_unit, self.nrows, self.m)
+        for _ in range32(times_i32(n, scale) if scale > 1 else n):
+            for _ in range_(self.passes):
+                yield
+
+    def _mc_prm(self) -> object:
+        """``mc_param``'s handle for the workers (None without it)."""
+        return ScratchpadParameter(self.mc_param, np.int32) if self.mc_param else None
 
     @property
     def hdr_direct(self) -> bool:
@@ -1089,15 +1112,15 @@ class GemmQOperator(ArtcOperator):
             for row in range(ROWS):
                 c_l1[row].append(parts[row])
 
-        passes, n_kc, planes = self.passes, self.n_kc, self.hdr_units
+        n_kc, planes = self.n_kc, self.hdr_units
         q4k = k_hdr2 is not None  # (Q4_K: the header slots collected in st, expanded per K chunk)
 
         silu = self.silu
 
         c_pairs = self.c_pairs
 
-        def core_fn(bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
-            for _ in range_(self.mc * passes):  # token chunks x passes
+        def core_fn(prm, bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
+            for _ in self._chunk_passes(prm):  # token chunks x passes
                 c = cf.acquire(1)
                 acc = extra[1] if silu or c_pairs else c
                 zero(acc)
@@ -1113,8 +1136,8 @@ class GemmQOperator(ArtcOperator):
                     extra[0](acc, c)
                 cf.release(1)
 
-        def pair_fn(bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
-            for _ in range_(self.mc * passes):  # token chunks x passes
+        def pair_fn(prm, bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
+            for _ in self._chunk_passes(prm):  # token chunks x passes
                 c = cf.acquire(1)
                 acc = extra[1] if silu else c
                 zero(acc)
@@ -1145,6 +1168,7 @@ class GemmQOperator(ArtcOperator):
                 cf.release(1)
 
         workers = []
+        prm = self._mc_prm()
         for row in range(ROWS):
             for c in range(COLS):
                 st = Buffer(st_ty, name=f"gq_st_{c}_{row}")
@@ -1155,12 +1179,12 @@ class GemmQOperator(ArtcOperator):
                 if pair:
                     h = row % 2
                     ws = Buffer(ws_ty, name=f"gq_ws_{c}_{row}")
-                    args = [b_l1[c][h].cons(), a_l1[row].cons(), c_l1[row][c].prod(), x_f[c, row].prod(),
+                    args = [prm, b_l1[c][h].cons(), a_l1[row].cons(), c_l1[row][c].prod(), x_f[c, row].prod(),
                             x_f[c, row ^ 1].cons(), k_zero, k_hdr, k_dq, k_mm, ws, st, h, *extra]
                     workers.append(Worker(pair_fn, args, tile=Tile(c, row + 2), stack_size=2048,
                                           dynamic_objfifo_lowering=True))
                     continue
-                workers.append(Worker(core_fn, [b_l1[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero, k_mm,
+                workers.append(Worker(core_fn, [prm, b_l1[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero, k_mm,
                                                  st, *extra],
                                       tile=Tile(c, row + 2), stack_size=2048, dynamic_objfifo_lowering=True))
 

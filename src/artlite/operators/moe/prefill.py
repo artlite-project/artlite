@@ -1,8 +1,8 @@
 """An MoE model's MoE blocks in its chunk prefill (``prefill.chunks.ChunkPrefill``; qwen35's ``QwenPrefill``): per
 layer, after the post-attention norm with lo panels (PXM: per token [x hi | x lo] panels, ``PrefillNormOperator(lo=True)``)
 
-1. per sub-chunk the router (LG: fp32 logits, ``gemm.router``) — a piece of the program ends here;
-2. per sub-chunk the shared expert's gate / up (HS) and down (DS, rows of ``gather.ds_row``: COLS ``pitch``, then the
+1. the router (LG: fp32 logits, ``gemm.router``) — a piece of the program ends here;
+2. the shared expert's gate / up (HS) and down (DS, rows of ``gather.ds_row``: COLS ``pitch``, then the
    token's weights; ``gemm``) — while this piece runs, the host routes the chunk (``host_route``: the logits fetched,
    the top k, ``plan.Plan``, the gathered norm's control streams, the chunk counts as scratchpad parameters) before
    the next piece starts;
@@ -11,8 +11,9 @@ layer, after the post-attention norm with lo panels (PXM: per token [x hi | x lo
    experts' gate / up (H) and down (Y, ``expert_gemm``), the combine (DL: the delta per token,
    ``gather.CombineOperator``);
 
-then the model's residual norm adds DL. The buffers are the chunk's, shared by the layers (one layer's block in
-flight). ``cap``: chunks per column at most (the worst case of a chunk of ``max_t`` tokens: ceil((256 + max_t k /
+then the model's residual norm adds DL. The router and the shared expert's GEMMs run one item each over the chunk
+(from ``sub`` tokens on: their token chunks a scratchpad parameter, ``params``; an item per sub-chunk would pay each
+item's pipeline fill and drain). The buffers are the chunk's, shared by the layers (one layer's block in flight). ``cap``: chunks per column at most (the worst case of a chunk of ``max_t`` tokens: ceil((256 + max_t k /
 CHUNK) / COLS))."""
 
 from types import SimpleNamespace
@@ -61,13 +62,20 @@ class MoEPrefill:
     # Operators and buffers
     # ------------------------------------------------------------------
 
-    def gemms(self, L: int, t: int) -> SimpleNamespace:
-        """Layer L's GEMMs of sub-chunks of t tokens: the router, the shared gate / up and down."""
+    def gemms(self, L: int, T: int) -> SimpleNamespace:
+        """Layer L's GEMMs of a chunk of T tokens: the router, the shared gate / up and down; from ``sub`` tokens on one
+        item each over the whole chunk (their token chunks a scratchpad parameter: ``params``)."""
         mi = self.img.region(L, "moe_in")
-        return SimpleNamespace(router=MG.router(self.img, mi, t, ops=self._gemms),
-                               sgu=MG.shared_gate_up(self.img, mi, t, width=self.Fs, ops=self._gemms),
-                               sdown=MG.row_group_gemm(self.img.region(L, "sdown"), t, pitch=self.pitch,
-                                                       row=ds_row(self.H, self.pitch), ops=self._gemms))
+        whole = T >= self.sub
+        return SimpleNamespace(router=MG.router(self.img, mi, T, ops=self._gemms, whole=whole),
+                               sgu=MG.shared_gate_up(self.img, mi, T, width=self.Fs, ops=self._gemms, whole=whole),
+                               sdown=MG.row_group_gemm(self.img.region(L, "sdown"), T, pitch=self.pitch,
+                                                       row=ds_row(self.H, self.pitch), ops=self._gemms, whole=whole))
+
+    def params(self, T: int) -> dict[str, int]:
+        """The scratchpad parameters of a chunk of T tokens: the whole-chunk GEMMs' token chunks (``gemms``)."""
+        assert T < self.sub or T % MG.CHUNK_UNIT == 0, T
+        return {MG.CHUNK_PARAM: T // MG.CHUNK_UNIT} if T >= self.sub else {}
 
     def rows(self) -> dict[str, int]:
         """Bytes per token of the per-token buffers."""
@@ -90,18 +98,14 @@ class MoEPrefill:
         ``host_route``, the expert GEMMs': after ``host_streams``). ``tok(buf, j, op, i, row)`` / ``sl(buf, off, op,
         i)``: the prefill's slices; ``w(gemm)``: a GEMM's weight slice; ``norm``: the post-attention norm weight's
         slice."""
-        t = min(T, self.sub)
-        S = T // t
-        g = self.gemms(L, t)
+        g = self.gemms(L, T)
         rb = self.rows()
         rl: list[tuple] = []
         r = g.router
-        rl += [(r.op, tok("PXM", j, r.op, 0, rb["PXM"]), w(r), tok("LG", j, r.op, 2, rb["LG"])) for j in range(S)]
+        rl.append((r.op, tok("PXM", 0, r.op, 0, rb["PXM"]), w(r), tok("LG", 0, r.op, 2, rb["LG"])))
         i_shared = len(rl)
-        rl += [(g.sgu.op, tok("PXM", j, g.sgu.op, 0, rb["PXM"]), w(g.sgu), tok("HS", j, g.sgu.op, 2, rb["HS"]))
-               for j in range(S)]
-        rl += [(g.sdown.op, tok("HS", j, g.sdown.op, 0, rb["HS"]), w(g.sdown), tok("DS", j, g.sdown.op, 2, rb["DS"]))
-               for j in range(S)]
+        rl.append((g.sgu.op, tok("PXM", 0, g.sgu.op, 0, rb["PXM"]), w(g.sgu), tok("HS", 0, g.sgu.op, 2, rb["HS"])))
+        rl.append((g.sdown.op, tok("HS", 0, g.sdown.op, 0, rb["HS"]), w(g.sdown), tok("DS", 0, g.sdown.op, 2, rb["DS"])))
         i_experts = len(rl)
         gu, dn = self.gu[L], self.dn[L]
         cb = self.comb[T, dn.y_layout]

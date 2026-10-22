@@ -35,8 +35,13 @@ def router_pitch(region: object) -> int:
     return router_passes(region) * PASS // 2
 
 
-def router(image: object, region: object, T: int, *, ops: dict | None = None) -> PG.Gemm:
-    """The router GEMM of T tokens (module docstring); C in bf16 units: per token COLS router_pitch fp32 values."""
+CHUNK_PARAM, CHUNK_UNIT = "moe_t", 256  # a whole-chunk GEMM's token chunks (``GemmQOperator.mc_param``): a chunk's
+# tokens / CHUNK_UNIT, the cores' own chunks of fewer tokens scaled from it
+
+
+def router(image: object, region: object, T: int, *, ops: dict | None = None, whole: bool = False) -> PG.Gemm:
+    """The router GEMM of T tokens (module docstring); C in bf16 units: per token COLS router_pitch fp32 values.
+    ``whole``: the token chunks' count a scratchpad parameter (``chunk_param``: one design for any T)."""
     b = region.block("router")
     assert b.fmt == "BFP16" and region.block("sgate").fmt == "BFP16"
     passes, pitch = router_passes(region), 2 * router_pitch(region)  # (pitch: bf16 units)
@@ -45,13 +50,17 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None) ->
           "out_cols": [[pitch * c + PASS * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
           "kc_group": region.kc_group, "blocks": ((region.rt0["router"], passes),),
           "region_rt": min(region.n_rt, region.rt0["router"] + passes * PASS // b.R), "k_rep": 2, "c_pairs": True}
+    if whole:
+        kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     op = PG._gemm(kw, T, "qkv", ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)
 
 
-def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: dict | None = None) -> PG.Gemm:
+def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: dict | None = None,
+                   whole: bool = False) -> PG.Gemm:
     """The shared expert's gate / up GEMM of T tokens on x's hi panels (A of 2 hidden columns: [hi | lo]):
-    silu(gate) up as bfp16 panels of ``width`` (the shared expert's) columns, column c's from width / COLS c on."""
+    silu(gate) up as bfp16 panels of ``width`` (the shared expert's) columns, column c's from width / COLS c on.
+    ``whole``: as ``router``'s."""
     b = region.block("sgu")
     per = width // COLS  # (outputs per column)
     tp = PASS // b.R  # (tiles per pass: 4 x [8 gate | 8 up] rows, 32 outputs)
@@ -63,6 +72,8 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
           "kc_group": region.kc_group, "silu": True, "act": "silu", "c_bfp16": True,
           "blocks": ((region.rt0["sgu"], passes),), "region_rt": min(region.n_rt, region.rt0["sgu"] + b.tiles),
           "a_cols": (0, 2 * region.K)}
+    if whole:
+        kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     op = PG._gemm(kw, T, "gu", ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)
 
@@ -78,11 +89,11 @@ def shared_pitch(image: object, layers: list[int]) -> int:
 
 
 def row_group_gemm(region: object, T: int, *, pitch: int, row: int = 0, ops: dict | None = None, mac_rows: int = 0,
-                   m: int = 0) -> PG.Gemm:
+                   m: int = 0, whole: bool = False) -> PG.Gemm:
     """A dense GEMM of T tokens on a region of row-group tiles (one block: the shared down): GemmQd, ``groups`` G,
     passes of ROW_GROUP_TILES tiles, column c's outputs from c pitch on, in rows of ``row`` bf16 (default COLS pitch:
     the columns past them left alone); mac_rows / m: the MAC rows and tokens per MAC row (default: 2 x 64 from T 128 on,
-    else 1 x T)."""
+    else 1 x T); ``whole``: as ``router``'s."""
     (b,) = region.blocks
     G, R, tiles = b.G, b.R, ROW_GROUP_TILES
     passes = -(-b.tiles // tiles)
@@ -95,6 +106,8 @@ def row_group_gemm(region: object, T: int, *, pitch: int, row: int = 0, ops: dic
           "out_cols": [[pitch * c + tiles * G * R * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
           "kc_group": region.kc_group, "blocks": ((0, passes),), "region_rt": min(region.n_rt, tiles * passes),
           "groups": G}
+    if whole:
+        kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     if planar(b.fmt, R, region.kc):
         kw.update(tiles=tiles, c_pack=True)
     key = repr((sorted(kw.items()), mac_rows, m))

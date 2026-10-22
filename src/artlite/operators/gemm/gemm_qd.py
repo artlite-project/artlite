@@ -299,7 +299,7 @@ class GemmQdOperator(GemmQOperator):
             for row in range(MR):
                 c_l1[row].append(parts[row])
 
-        passes, n_kc, planes, nsb, mc = self.passes, self.n_kc, self.hdr_units, self.nsb, self.mc
+        n_kc, planes, nsb = self.n_kc, self.hdr_units, self.nsb
         silu = self.silu
         # hg > 1: runs (chunks per header unit, units) of a chunk group's header groups (the same in every group)
         runs = [(r, len(list(it))) for r, it in itertools.groupby(r for k0, r in self.hdr_groups if k0 < self.kc_group)]
@@ -313,9 +313,9 @@ class GemmQdOperator(GemmQOperator):
                     dfo.release(1)
                 bf.release(1)
 
-        def dq_fn(bf, dfo, hdr, dq, ws, hb, *extra):  # extra: dk.sb, dk.chunk, the ex buffer (those present)
+        def dq_fn(prm, bf, dfo, hdr, dq, ws, hb, *extra):  # extra: dk.sb, dk.chunk, the ex buffer (those present)
             ex = extra[-1:] if dk.ex_ty is not None else ()
-            for _ in range_(mc * passes):  # token chunks x passes: the weights stream once per chunk
+            for _ in self._chunk_passes(prm):  # token chunks x passes: the weights stream once per chunk
                 if self.hg > 1:  # a header unit per group of K chunks, then its chunks
                     for _ in range_(n_kc // self.kc_group):
                         for r, n_units in runs:
@@ -346,10 +346,10 @@ class GemmQdOperator(GemmQOperator):
 
         pingpong = self.pingpong
 
-        def mac_fn(dfi, af, cf, zero, mm, *extra):
+        def mac_fn(prm, dfi, af, cf, zero, mm, *extra):
             act_arg = extra[-1] if gelu else 0  # (gelu: the table buffer; silu: the kernel's opaque runtime zero)
             if self.G > 1:  # row groups: per pass vp C objects of ``slots`` slots, each over the whole A strip
-                for _ in range_(mc * passes):
+                for _ in self._chunk_passes(prm):
                     for _ in range_(self.vp):
                         c = cf.acquire(1)
                         for s_ in range(self.slots):
@@ -367,7 +367,7 @@ class GemmQdOperator(GemmQOperator):
                 return
             if halves > 1:  # one A k-tile for both halves' D objects, a C tile each; their outputs as two C objects
                 accs = (extra[1], extra[3])
-                for _ in range_(mc * passes):
+                for _ in self._chunk_passes(prm):
                     for acc in accs:
                         zero(acc)
                     for _ in range_(n_kc * (self.kc // KT)):
@@ -382,7 +382,7 @@ class GemmQdOperator(GemmQOperator):
                         extra[0](acc, c, extra[2], act_arg)
                         cf.release(1)
                 return
-            for _ in range_(mc * passes):
+            for _ in self._chunk_passes(prm):
                 c = cf.acquire(1)
                 acc = extra[1] if silu or c_pack else c
                 zero(acc)
@@ -408,10 +408,11 @@ class GemmQdOperator(GemmQOperator):
                 cf.release(1)
 
         workers = []
+        prm = self._mc_prm()
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"gq_ws_{c}")
             hb = Buffer(hb_ty, name=f"gq_hb_{c}")
-            workers.append(Worker(dq_fn, [b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
+            workers.append(Worker(dq_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
                                           *([dk.sb] if dk.sb is not None else []),
                                           *([dk.chunk] if dk.chunk is not None else []),
                                           *([Buffer(dk.ex_ty, name=f"gq_ex_{c}")] if dk.ex_ty is not None else [])],
@@ -423,8 +424,8 @@ class GemmQdOperator(GemmQOperator):
                     extra.append(Buffer(acc_ty, name=f"gq_accb_{c}_{row}"))
                 if gelu:
                     extra.append(Buffer(lut_ty, name=f"gq_lut_{c}_{row}", initial_value=act_lut.GELU.table_buffer()))
-                workers.append(Worker(mac_fn, [d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero, k_mm,
-                                               *extra],
+                workers.append(Worker(mac_fn, [prm, d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero,
+                                               k_mm, *extra],
                                       tile=Tile(c, 3 + row), stack_size=2048, dynamic_objfifo_lowering=True))
 
         A_ty = np.ndarray[(self.M * self.a_K * 9 // 16,), np.dtype[bfloat16]]

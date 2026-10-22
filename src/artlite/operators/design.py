@@ -31,6 +31,11 @@ def range32(stop: object, *, unroll: bool = True) -> Iterator[object]:
         scf.yield_([])
 
 
+def times_i32(value: object, k: int) -> object:
+    """An i32 value (e.g. a scratchpad parameter's) times the constant k, in a core's program."""
+    return arith.muli(value, arith.constant(T.i32(), k))
+
+
 def linear_tap(size: int, offset: int, length: int) -> TensorAccessPattern:
     """``length`` consecutive elements from ``offset`` of a 1-D tensor of ``size`` elements."""
     return TensorAccessPattern((size,), offset, [1, 1, 1, length], [0, 0, 0, 1])

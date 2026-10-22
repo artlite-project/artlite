@@ -370,7 +370,7 @@ class QwenPrefill(ChunkPrefill):
     def params(self, T: int, p0: int, n: int, cs_row: int | None = None) -> dict[str, int]:
         """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens (their cos / sin from
         table row ``cs_row``, default p0)."""
-        out = {}
+        out = self.moe.params(T) if self.moe else {}
         if self.gdn:
             out[GP.CONV_OFF] = self._gdn_ops(self.sz[self._t(T)].plans[(self.gdn[0], "gdn_in")].layout, T)[2] \
                 .conv_offset(n)
@@ -453,11 +453,10 @@ class QwenPrefill(ChunkPrefill):
         cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
         wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
-        if self.moe:  # (the router's, the shared expert's)
-            gemms += [None] * 3
+        if self.moe:  # (the router's, the shared expert's weights per sub-chunk; their items: one per chunk)
             wbytes += sum(self.img.region(L, name).nbytes for name in ("moe_in", "sdown"))
         Ss = S if S >= 1 else S + SMALL_S * (1 - S)
-        s = Ss * (WEIGHT_S * wbytes + GEMM_S * len(gemms) + 2 * NORM_S * self.H)
+        s = Ss * (WEIGHT_S * wbytes + GEMM_S * len(gemms) + 2 * NORM_S * self.H) + (3 * GEMM_S if self.moe else 0)
         if cfg.attention[L]:
             s += Ss * PREP_S * cfg.num_attention_heads + self.attention_seconds(p0, S)
         else:
