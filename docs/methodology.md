@@ -73,6 +73,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
 | Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-21 |
+| Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf` | `4ac6a06bce55` | 2026-10-22 |
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
@@ -82,6 +83,7 @@ runs, with the toolchain pinned then:
 |---|---|---|
 | 2026-10-15 | 1.4.5.dev30+g766aca4 | 22.0.0.2026101201+83ba9ea9 |
 | 2026-10-21 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
+| 2026-10-22 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 
 ## FastFlowLM and OpenFlowLM
 
@@ -103,6 +105,7 @@ chunks of 4096 tokens and each model at its native context:
 | | DeepSeek R1 Distill Llama 8B (Llama 3.1 8B's shapes) | `deepseek-r1:8b` | imatrix Q4_1 GGUF, untied | Llama 3.1 8B Q4_K_M |
 | | Gemma 4 E4B it | `gemma4-it:e4b` | imatrix Q4_1 GGUF; int8 embeddings, bf16 per-layer projections | Q4_0 |
 | | Qwen3.8 27B | `qwen3.8-mtp:27b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw); lm_head and embedding Q8_0; its MTP layer (7 drafts per step); at most 8192 positions | Q4_K_M |
+| | Qwen3.6 35B-A3B | `qwen3.6-moe:35b-a3b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw) | Q4_K_M |
 | | MiniCPM-V 4.7 1B | `minicpm-v-4.7:1b` | FastFlowLM's own Q4_K quantization (560 MB per token, the lm_head Q8_0), not openbmb's GGUF files; text prompts | Q4_K_M |
 | OpenFlowLM | Llama 3.2 1B Instruct | `llama3.2:1b` | FastFlowLM's container of the same Q4_1 | Q4_1 |
 | | Llama 3.2 3B Instruct | `llama3.2:3b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |
@@ -110,8 +113,8 @@ chunks of 4096 tokens and each model at its native context:
 | | Qwen3.8 27B | `qwen3.8:27b` | Q4_1 linears, Q8_0 lm_head and ssm_out, converted from a Q8_0 GGUF; no MTP head; 131072 positions | Q4_K_M |
 
 OpenFlowLM runs that take over 5 minutes were not measured; the charts mark the missing values. The data files also
-hold models with no Artlite row yet (FastFlowLM's Qwen3 0.6B, Gemma 4 E2B, Qwen3.6 35B-A3B; OpenFlowLM's Qwen3 0.6B,
-Qwen3.5 9B), which the charts leave out.
+hold models with no Artlite row yet (FastFlowLM's Qwen3 0.6B, Gemma 4 E2B; OpenFlowLM's Qwen3 0.6B, Qwen3.5 9B),
+which the charts leave out.
 
 ## llama.cpp
 

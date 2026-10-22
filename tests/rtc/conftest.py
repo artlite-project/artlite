@@ -53,6 +53,7 @@ SMOKE = (
     "test_moe_plan.py", "test_moe_prefill.py::test_moe_block[5]",
     "test_qwen35_decode.py::test_overlay_slice[lazy-35B-A3B]",
     "test_qwen35_prefill_elf.py::test_prefill_slice[9B]", "test_qwen35_prefill_elf.py::test_prefill_slice[27B]",
+    "test_qwen35_prefill_elf.py::test_prefill_slice[35B-A3B]",
     "test_qwen35_attn_prefill.py::test_attn_prefill[9B-64]", "test_qwen35_attn_prefill.py::test_attn_prefill[1B-192]",
     "test_qwen35_gdn_prefill.py::test_gdn_scan[64-9B]", "test_prefill_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
     "test_sd15_unet.py::test_gemm[16-2-640-640-True-bf16]", "test_sd15_unet.py::test_conv[16-1-640-640-True]",

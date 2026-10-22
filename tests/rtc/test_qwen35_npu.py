@@ -63,7 +63,7 @@ def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
     return (lw.exp() * (lw - lg)).sum(-1)
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B"])
 def test_teacher_forced(size: str) -> None:
     path = _path(size)
     tokens = _tokens(path, 128)
@@ -76,10 +76,12 @@ def test_teacher_forced(size: str) -> None:
     agree_llama = float((dec.argmax(-1) == pro.argmax(-1)).float().mean())
     print(f"{size}: KL {kl:.4f} (llama.cpp prompt vs decode {kl_llama:.4f}), argmax agreement {agree:.3f} "
           f"({agree_llama:.3f}) over {len(tokens)} tokens")
-    assert kl < 1.5 * kl_llama and agree > agree_llama - 0.02
+    # (an MoE model's routing flips near-tied experts: its argmax agreement moves by a few of the 128 tokens)
+    tol = 0.05 if model.cfg.moe else 0.02
+    assert kl < 1.5 * kl_llama and agree > agree_llama - tol
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
