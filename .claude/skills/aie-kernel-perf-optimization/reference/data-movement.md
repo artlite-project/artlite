@@ -267,7 +267,15 @@ offsets): aie2p-coding section 8. For speed:
 
 - **Waiting**: a blocking driver wait adds 0.3-1.7 ms and leaves the core cold. Nap in 0.2 ms
   slices until just before the expected end, then spin
-  (`FusedOperator.__call__(spin_after_s=..., nap_s=0.0002)`).
+  (`FusedOperator.__call__(spin_after_s=..., nap_s=0.0002)`). Keep the thread on that core between dispatches too: a
+  thread let go after each wait (its affinity restored) ran the host work between a library program's pieces ~2.5x
+  slower, on whatever core the scheduler woke for it (`Library.run` pins its thread to the interrupts' CPU,
+  `portable.on_cpu`).
+- **Host work between pieces is on the critical path** where the piece it overlaps is short (an MoE layer's routing
+  under its shared expert's ~1.5 ms): time it in the real run (a pieces timeline: dispatch, hook, wait), not alone (it
+  ran 2-3x faster alone); split it so that each piece's inputs come first and the rest overlaps the next piece (two
+  hooks), and keep assembled pieces (`Library.PIECES_KEPT`, bytes: a cache of too few re-assembled a 1 MB piece,
+  ~1.3 ms, every time).
 - **The first dispatch after new host buffers** takes ~0.15 s more (the driver maps them): a model's load ends with an
   empty dispatch (sd15 `Sd15Device.warm`), or its first step pays it.
 - **Overlap host work**: prepare the next chunk's inputs on a worker thread while the NPU runs

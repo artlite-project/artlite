@@ -7,14 +7,16 @@ are allocated: the items address the caller's buffers.
 """
 
 import itertools
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
-from ... import txn
+from ... import portable, txn
 from ...elf_parser import ParsedElf
 from ..base import ArtcOperator
+from ..overlay.runtime import SPIN_MARGIN_US, irq_cpu
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
 from .program import PIECE_BYTES, Assembler, Item
@@ -22,7 +24,11 @@ from .program import PIECE_BYTES, Assembler, Item
 
 class Library(FusedElf):
     LIBRARY = True
-    PIECES_KEPT = 64  # (assembled pieces kept for programs run again)
+    # bytes of assembled pieces kept for programs run again: every piece of a prefill's chunk sizes at both parities
+    # (Qwen3.6-35B-A3B's 2048-token chunk: 83 pieces, 44 MB; a large piece assembled again ~1.3 ms of host time, on the
+    # critical path where the previous piece is short)
+    PIECES_KEPT = 512 << 20
+    SPIN_US = SPIN_MARGIN_US  # (a piece's wait polls from this long before its shortest seen end: ``wait``)
 
     def __init__(self, name: str, operators: Iterable[ArtcOperator]):
         """``operators``: the library's entries (each operator object once: repeats are dropped), in order."""
@@ -36,6 +42,17 @@ class Library(FusedElf):
         # (assembled pieces: (id(items), a, b, parity) -> (items, piece, parity after); a program's items are a list the
         # caller keeps, e.g. ChunkPrefill's per chunk size)
         self._pieces: dict[tuple[int, int, int, int], tuple[Sequence[Item], np.ndarray, int]] = {}
+        self._pieces_bytes = 0
+        self._ends: dict[tuple[int, int, int], float] = {}  # ((id(items), a, b) -> a piece's shortest seen duration)
+
+    def _keep(self, key: tuple[int, int, int, int], entry: tuple[Sequence[Item], np.ndarray, int]) -> None:
+        """Keep an assembled piece (all dropped when they would exceed PIECES_KEPT bytes)."""
+        if self._pieces_bytes + entry[1].nbytes > self.PIECES_KEPT:
+            self._pieces.clear()
+            self._pieces_bytes = 0
+        self._ends: dict[tuple[int, int, int], float] = {}  # ((id(items), a, b) -> a piece's shortest seen duration)
+        self._pieces[key] = entry
+        self._pieces_bytes += entry[1].nbytes
 
     def __contains__(self, op: ArtcOperator) -> bool:
         return id(op) in self._entry
@@ -71,7 +88,18 @@ class Library(FusedElf):
         new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed
         PIECE_BYTES. ``bufs``: the data BOs the items address. ``hooks``: per item index of ``splits``, a host function
         called before the piece it starts is dispatched (while the previous one runs: e.g. inputs that only later
-        items read). Returns the dispatches."""
+        items read). Returns the dispatches.
+
+        The calling thread runs on the CPU that takes the NPU's interrupts meanwhile (``irq_cpu``): it waits for each
+        piece there (napping, then polling from shortly before its shortest seen end), and the host work between
+        pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU the scheduler
+        woke for it)."""
+        cpu = irq_cpu()
+        with portable.on_cpu(cpu):
+            return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
+
+    def _run(self, items: Sequence[Item], *, splits: Iterable[int], bufs: Sequence[Any],
+             hooks: Mapping[int, Callable[[], None]] | None, cpu: int) -> int:
         asm = self.load()._asm
         kern = self._kernel()
         bounds = asm.bounds(items, set(splits))
@@ -88,6 +116,15 @@ class Library(FusedElf):
                 kern.dispatch_wait()
                 return 1
         k, starts = 0, []
+        submit, pkey = 0.0, None
+
+        def wait() -> None:  # (the dispatched piece: napping on the interrupts' CPU, then polling near its end)
+            est = self._ends.get(pkey)
+            after = int(est * 1e6) - self.SPIN_US if est is not None else 1 << 30
+            kern.dispatch_wait(0, max(0, after) if cpu >= 0 else -1, max(cpu, 0))
+            d = time.perf_counter() - submit
+            self._ends[pkey] = min(d, est) if est is not None else d
+
         for k, (a, b) in enumerate(itertools.pairwise(bounds)):
             starts.append(asm.parity)
             slot = asm.parity if key is not None else k % 2
@@ -97,9 +134,7 @@ class Library(FusedElf):
                 piece, asm.parity = hit[1], hit[2]
             else:
                 piece = asm.assemble(items[a:b])
-                if len(self._pieces) >= self.PIECES_KEPT:
-                    self._pieces.clear()
-                self._pieces[ck] = (items, piece, asm.parity)
+                self._keep(ck, (items, piece, asm.parity))
             assert piece.nbytes <= PIECE_BYTES, piece.nbytes
             bo = self._piece_bos[slot]
             np.copyto(bo.map()[:piece.nbytes], piece.view(np.uint8))
@@ -108,7 +143,8 @@ class Library(FusedElf):
             if hooks and a in hooks:
                 hooks[a]()
             if k:
-                kern.dispatch_wait()  # (piece k - 1; meanwhile piece k was assembled)
+                wait()  # (piece k - 1; meanwhile piece k was assembled)
+            submit, pkey = time.perf_counter(), (id(items), a, b)
             kern.dispatch_elf_async(bo, refs, piece.nbytes)
         if key is not None and asm.parity != slot:
             self._ahead(items, key, asm)
@@ -120,11 +156,9 @@ class Library(FusedElf):
                 if hit is None or hit[0] is not items:
                     asm.parity = p ^ 1
                     piece = asm.assemble(items[a:b])
-                    if len(self._pieces) >= self.PIECES_KEPT:
-                        self._pieces.clear()
-                    self._pieces[ck] = (items, piece, asm.parity)
+                    self._keep(ck, (items, piece, asm.parity))
             asm.parity = end
-        kern.dispatch_wait()
+        wait()
         return k + 1
 
     def _ahead(self, items: Sequence[Item], key: tuple, asm: Assembler) -> None:
@@ -143,9 +177,7 @@ class Library(FusedElf):
         else:
             piece = asm.assemble(items)
             end, asm.parity = asm.parity, p
-            if len(self._pieces) >= self.PIECES_KEPT:
-                self._pieces.clear()
-            self._pieces[ck] = (items, piece, end)
+            self._keep(ck, (items, piece, end))
         bo = self._piece_bos[p]
         np.copyto(bo.map()[:piece.nbytes], piece.view(np.uint8))
         bo.sync_to_device(piece.nbytes, 0)

@@ -3,6 +3,8 @@
 
 #include "artlite/moe_host.h"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -36,8 +38,10 @@ double row_sum(const double* a, int n) {
   return s;
 }
 
-void route_rows(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E, int k,
-                int32_t* ids, float* weights) {
+// (the reference: per token an insertion sort of ordered keys; NaN logits and the shapes ``route_rows_avx512`` does
+// not take)
+void route_rows_scalar(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E,
+                       int k, int32_t* ids, float* weights) {
   // per token the k largest keys, descending: a logit's ordered bits, then ~id (ties to the lower id; -0 as +0)
   std::vector<uint64_t> top(k + 1);
   std::vector<double> e(k);
@@ -65,13 +69,121 @@ void route_rows(const float* logits, int64_t t0, int64_t t1, int64_t row, int pe
   }
 }
 
+// e^x of 8 doubles x <= 0 (the routing's l - l_max): x = n ln 2 + r, |r| <= ln 2 / 2, a degree-12 Taylor polynomial in
+// r (relative error < 2^-52), times 2^n (n >= -1022: below, 0)
+__m512d exp_nonpos(__m512d x) {
+  const __m512d log2e = _mm512_set1_pd(1.4426950408889634), ln2hi = _mm512_set1_pd(6.93147180369123816490e-01),
+                ln2lo = _mm512_set1_pd(1.90821492927058770002e-10);
+  x = _mm512_max_pd(x, _mm512_set1_pd(-708.0));
+  const __m512d n = _mm512_roundscale_pd(_mm512_mul_pd(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  const __m512d r = _mm512_fnmadd_pd(n, ln2lo, _mm512_fnmadd_pd(n, ln2hi, x));
+  static constexpr double c[13] = {1.0,          1.0,          1.0 / 2,       1.0 / 6,        1.0 / 24,
+                                   1.0 / 120,    1.0 / 720,    1.0 / 5040,    1.0 / 40320,    1.0 / 362880,
+                                   1.0 / 3628800, 1.0 / 39916800, 1.0 / 479001600};
+  __m512d p = _mm512_set1_pd(c[12]);
+  for (int i = 11; i >= 0; i--) p = _mm512_fmadd_pd(p, r, _mm512_set1_pd(c[i]));
+  const __m512i e = _mm512_slli_epi64(_mm512_add_epi64(_mm512_cvtpd_epi64(n), _mm512_set1_epi64(1023)), 52);
+  return _mm512_mul_pd(p, _mm512_castsi512_pd(e));
+}
+
+// route_rows_scalar's routing, AVX-512 (Zen 5): a token's E logits in E / 16 vectors (a column's per_col from c pitch:
+// per_col a multiple of 16). Their lane maxima (a max tree) bound the k largest from below: the k-th largest lane
+// maximum t has k logits >= t (one per lane), so the k largest are >= t. The logits >= t (k .. ~20), compressed in id
+// order with their ids, go through an insertion sort (larger first; a later equal value stays behind: ties to the lower
+// id; -0 == +0 as the scalar path's keys). The weights: exp_nonpos (k == 8) in numpy's summation order. A token with a
+// NaN logit goes to the scalar path.
+void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E,
+                       int k, int32_t* ids, float* weights) {
+  const int nv = E / 16, vpc = per_col / 16;
+  const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  __m512 v[32];
+  alignas(64) float cv[512 + 16];
+  alignas(64) int32_t ci[512 + 16];
+  constexpr int64_t kAhead = 8;  // (tokens prefetched ahead: the logits come from DRAM, which the NPU keeps busy)
+  for (int64_t t = t0; t < t1; t++) {
+    const float* p = logits + t * row;
+    if (t + kAhead < t1)
+      for (int j = 0; j < nv; j++)
+        _mm_prefetch(reinterpret_cast<const char*>(p + kAhead * row + (j / vpc) * pitch + (j % vpc) * 16), _MM_HINT_T0);
+    __mmask16 nan = 0;
+    for (int j = 0; j < nv; j++) {
+      v[j] = _mm512_loadu_ps(p + (j / vpc) * pitch + (j % vpc) * 16);
+      nan |= _mm512_cmp_ps_mask(v[j], v[j], _CMP_UNORD_Q);
+    }
+    if (nan) {
+      route_rows_scalar(logits, t, t + 1, row, per_col, pitch, E, k, ids, weights);
+      continue;
+    }
+    __m512 m[32];  // (a max tree)
+    for (int j = 0; j < nv; j++) m[j] = v[j];
+    for (int w = nv; w > 1;) {
+      const int h = w / 2;
+      for (int j = 0; j < h; j++) m[j] = _mm512_max_ps(m[2 * j], m[2 * j + 1]);
+      if (w % 2) m[h] = m[w - 1];
+      w = h + w % 2;
+    }
+    // the k-th largest lane maximum: the least of the lanes that fewer than k lanes exceed (each lane against the
+    // 15 rotations, independent compares)
+    const __m512 lm = m[0];
+    __m512i above = _mm512_setzero_si512();
+    for (int r = 1; r < 16; r++) {
+      const __m512 rot = _mm512_permutexvar_ps(_mm512_and_si512(_mm512_add_epi32(lane, _mm512_set1_epi32(r)),
+                                                                _mm512_set1_epi32(15)), lm);
+      above = _mm512_mask_add_epi32(above, _mm512_cmp_ps_mask(rot, lm, _CMP_GT_OQ), above, _mm512_set1_epi32(1));
+    }
+    const __mmask16 top = _mm512_cmplt_epi32_mask(above, _mm512_set1_epi32(k));
+    const __m512 th = _mm512_set1_ps(_mm512_mask_reduce_min_ps(top, lm));
+    int n = 0;
+    for (int j = 0; j < nv; j++) {
+      const __mmask16 ge = _mm512_cmp_ps_mask(v[j], th, _CMP_GE_OQ);
+      const int x0 = (j / vpc) * per_col + (j % vpc) * 16;
+      // (compresses into registers: a compress into memory is microcoded on Zen 4 / 5)
+      _mm512_storeu_ps(cv + n, _mm512_maskz_compress_ps(ge, v[j]));
+      _mm512_storeu_si512(ci + n, _mm512_maskz_compress_epi32(ge, _mm512_add_epi32(lane, _mm512_set1_epi32(x0))));
+      n += std::popcount(unsigned(ge));
+    }
+    float tv[16];
+    int32_t ti[16];
+    int nt = 0;
+    for (int i = 0; i < n; i++) {
+      const float x = cv[i] + 0.0f;
+      if (nt == k && !(x > tv[k - 1])) continue;
+      int j = nt < k ? nt++ : k - 1;
+      for (; j > 0 && tv[j - 1] < x; j--) tv[j] = tv[j - 1], ti[j] = ti[j - 1];
+      tv[j] = x, ti[j] = ci[i];
+    }
+    for (int j = 0; j < k; j++) ids[t * k + j] = ti[j];
+    if (k != 8) {
+      double e[16];
+      for (int j = 0; j < k; j++) e[j] = std::exp(double(tv[j]) - double(tv[0]));
+      const double s = row_sum(e, k);
+      for (int j = 0; j < k; j++) weights[t * k + j] = float(e[j] / s);
+      continue;
+    }
+    const __m512d l = _mm512_cvtps_pd(_mm256_loadu_ps(tv));
+    const __m512d e = exp_nonpos(_mm512_sub_pd(l, _mm512_set1_pd(double(tv[0]))));
+    alignas(64) double ev[8];
+    _mm512_store_pd(ev, e);
+    const double sum = ((ev[0] + ev[1]) + (ev[2] + ev[3])) + ((ev[4] + ev[5]) + (ev[6] + ev[7]));
+    _mm256_storeu_ps(weights + t * k, _mm512_cvtpd_ps(_mm512_div_pd(e, _mm512_set1_pd(sum))));
+  }
+}
+
+void route_rows(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E, int k,
+                int32_t* ids, float* weights) {
+  if (k <= 16 && per_col % 16 == 0 && E % per_col == 0 && E <= 512)
+    route_rows_avx512(logits, t0, t1, row, per_col, pitch, E, k, ids, weights);
+  else
+    route_rows_scalar(logits, t0, t1, row, per_col, pitch, E, k, ids, weights);
+}
+
 }  // namespace
 
 void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, int32_t* ids,
                float* weights) {
   if (k < 1 || k > E || E % per_col) throw Error(std::format("moe_route: k {} of E {} ({} per column)", k, E, per_col));
-  // (a chunk's tokens on threads of 256 at least)
-  const int64_t nt = std::min<int64_t>(n / 256, std::max(1u, std::thread::hardware_concurrency() / 2));
+  // (threads of 4096 tokens at least: the vector path takes ~0.16 us per token, a thread's start ~0.1 ms)
+  const int64_t nt = std::min<int64_t>(n / 4096, std::max(1u, std::thread::hardware_concurrency() / 2));
   if (nt <= 1) {
     route_rows(logits, 0, n, row, per_col, pitch, E, k, ids, weights);
     return;

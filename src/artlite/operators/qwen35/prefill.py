@@ -98,10 +98,11 @@ class QwenPrefill(ChunkPrefill):
         self.pitch = {name: PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att))
                       if ls}
         self.d_pitch = PG.d_pitch(img, SUB)
-        # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the shared expert's item, the experts'))
+        # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the items that start its pieces: the shared
+        # expert's, the gathered norm's, the expert GEMMs'))
         self.moe = MoEPrefill(img, layers=self.layers, sizes=self.sizes, sub=SUB, eps=cfg.rms_norm_eps) \
             if cfg.moe else None
-        self._moe_marks: dict[int, list[tuple[int, int, int]]] = {}
+        self._moe_marks: dict[int, list[tuple[int, tuple[int, int, int]]]] = {}
         self._gemms: dict[str, object] = {}  # (one object per distinct GEMM)
         self._k_parts: dict[tuple, int] = {}  # (per region shape and size: output projections in resident K parts)
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
@@ -270,9 +271,9 @@ class QwenPrefill(ChunkPrefill):
                        for j in range(S)]
                 rl += [(ln, tok("PX", j, ln, i=0), tok("Y", j, ln, i=1, row=ry), pan, tok("PX", j, ln, i=3),
                         tok("PXM", j, ln, i=4)) for j in range(S)]
-                items, i_s, i_e = self.moe.items(L, T, tok=lambda b, j, op, i, row: tok(b, j, op, i=i, row=row),
-                                                 sl=lambda b, off, op, i: sl(b, off, op, i=i), w=self._w, norm=pan)
-                marks.append((L, len(rl) + i_s, len(rl) + i_e))
+                items, at = self.moe.items(L, T, tok=lambda b, j, op, i, row: tok(b, j, op, i=i, row=row),
+                                           sl=lambda b, off, op, i: sl(b, off, op, i=i), w=self._w, norm=pan)
+                marks.append((L, tuple(len(rl) + i for i in at)))
                 rl += items
                 pm = o.pnm or o.pn
                 rl += [(pm, tok("PX", j, pm, i=0), tok("DL", j, pm, i=1), self._next_norm(L), tok("PX", j, pm, i=3),
@@ -413,14 +414,16 @@ class QwenPrefill(ChunkPrefill):
             dev.flush("PM", 0, 4 * T)
             self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
             self._conv_states()
-        hooks = {i_e: functools.partial(self.moe.host_step, L, n=n, T=T, dev=dev, lib=self.lib)
-                 for L, _, i_e in self._moe_marks[T]} if self.moe else None
-        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks)
+        hooks = {}
+        for L, (_, i_e, i_g) in self._moe_marks.get(T, ()):
+            hooks[i_e] = functools.partial(self.moe.host_route, L, n=n, T=T, dev=dev, lib=self.lib)
+            hooks[i_g] = functools.partial(self.moe.host_streams, L, n=n, T=T, dev=dev, lib=self.lib)
+        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks or None)
 
     def _splits(self, T: int, p0: int) -> list[int]:
         """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""
         out = super()._splits(T, p0)
-        return sorted({*out, *(i for _, i_s, i_e in self._moe_marks.get(T, ()) for i in (i_s, i_e))})
+        return sorted({*out, *(i for _, at in self._moe_marks.get(T, ()) for i in at)})
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32)."""

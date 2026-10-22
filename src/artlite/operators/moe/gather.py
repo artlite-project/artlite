@@ -308,25 +308,38 @@ class GatherNormOperator(_Gathered):
         chunks: rows (n, CHUNK) the device addresses of their rows (padding: the chunk's first), sizes (n) their valid
         rows, the column's XP slots from device address xp: per chunk its groups of valid rows (``ctl.assemble``; its
         first block also pushes its drain)."""
-        rows = np.asarray(rows, np.int64)
-        g = -(-np.asarray(sizes, np.int64) // CHAIN)  # (groups per chunk)
-        n = g.size
-        assert 1 <= n <= self.cap and (g >= 1).all()
-        k = np.repeat(np.arange(n), g)  # (per block its chunk)
-        j = np.arange(k.size) - np.repeat(np.cumsum(g) - g, g)  # (its group in the chunk)
-        bases = np.zeros((k.size, CHAIN + 2), np.int64)
-        bases[:, :CHAIN] = rows.reshape(n, -1, CHAIN)[k, j]
-        bases[:, CHAIN] = xp + 2 * self.slot * k
-        bases[:, CHAIN + 1] = g[k] * self.group // 2  # (the drain's words)
-        ts = [self._templates[1], *self._drain_templates.values()]
-        keys = list(self._drain_templates)
-        start = j == 0
-        blocks = np.zeros(k.size, np.int32)
-        blocks[start] = [1 + keys.index((c == 0, c % 2, c == n - 1)) for c in range(n)]
-        lk = np.where(start, np.array(LOCKS)[k % 2], 0)
         out = np.empty(self.cb_words, np.uint32) if out is None else out
-        return out[:ctl.assemble(out, ts, blocks, bases, base=cb, b0_words=self.b0_words, bds=BLOCK_BDS,
-                                 acquire=(lk, start.astype(np.int64)))]
+        return self.streams([rows], [sizes], cb=[cb], xp=[xp], out=[out])[0]
+
+    def streams(self, rows: list[np.ndarray], sizes: list[np.ndarray], *, cb: list[int], xp: list[int],
+                out: list[np.ndarray]) -> list[np.ndarray]:
+        """``stream`` of several columns (their blocks computed together): per column its rows, sizes, addresses and
+        output array; returns each column's words."""
+        n = np.array([len(s) for s in sizes])
+        assert ((1 <= n) & (n <= self.cap)).all()
+        g = -(-np.concatenate(sizes).astype(np.int64) // CHAIN)  # (groups per chunk)
+        assert (g >= 1).all()
+        col = np.repeat(np.arange(len(n)), n)  # (per chunk: its column, its index there)
+        kk = np.arange(g.size) - np.repeat(np.cumsum(n) - n, n)
+        k = np.repeat(np.arange(g.size), g)  # (per block its chunk, its group in the chunk)
+        first = np.cumsum(g) - g
+        j = np.arange(k.size) - first[k]
+        bases = np.empty((k.size, CHAIN + 2), np.int64)
+        bases[:, :CHAIN] = np.concatenate([np.asarray(r, np.int64) for r in rows]).reshape(g.size, -1, CHAIN)[k, j]
+        bases[:, CHAIN] = (np.asarray(xp, np.int64)[col] + 2 * self.slot * kk)[k]
+        bases[:, CHAIN + 1] = g[k] * self.group // 2  # (the drain's words)
+        ts = [self._templates[1], *self._drain_templates.values()]  # (the drain templates by (first, parity, last))
+        blocks = np.zeros(k.size, np.int32)
+        blocks[first] = 1 + 4 * (kk == 0) + 2 * (kk % 2) + (kk == n[col] - 1)
+        lk, start = np.zeros(k.size, np.int64), np.zeros(k.size, np.int64)
+        lk[first], start[first] = np.array(LOCKS)[kk % 2], 1
+        ends = np.cumsum(np.bincount(col[k], minlength=len(n)))
+        res = []
+        for c, (a, b) in enumerate(zip([0, *ends[:-1]], ends)):
+            w = ctl.assemble(out[c], ts, blocks[a:b], bases[a:b], base=cb[c], b0_words=self.b0_words, bds=BLOCK_BDS,
+                             acquire=(lk[a:b], start[a:b]))
+            res.append(out[c][:w])
+        return res
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (COLS * self.cb_words * 2,), torch.bfloat16), ArgSpec("in", (self.E,), torch.bfloat16),

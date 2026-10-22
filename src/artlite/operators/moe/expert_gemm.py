@@ -209,18 +209,33 @@ class ExpertGemmOperator(GemmQdOperator):
         chunks of ``experts`` (chunk k: expert experts[k], its slab region's first half at slab + 2 e slab_stride;
         its C slot at c_address + k slot): the chunks' templates (``chunk_template``) as the blocks of
         ``ctl.assemble`` ("down": chunk k's drain in set k % 2, block k + 1's BD acquiring its set's lock)."""
-        e = np.asarray(experts, np.int64)
-        n = e.size
-        assert 1 <= n <= self.cap
-        k = np.arange(n)
+        out = np.empty(self.cb_words, np.uint32) if out is None else out
+        return self.streams([experts], cb=[cb], slab=slab, slab_stride=slab_stride, c_address=[c_address],
+                            out=[out])[0]
+
+    def streams(self, experts: list[np.ndarray], *, cb: list[int], slab: int, slab_stride: int, c_address: list[int],
+                out: list[np.ndarray]) -> list[np.ndarray]:
+        """``stream`` of several columns (their blocks computed together): per column its experts, addresses and output
+        array; returns each column's words."""
+        n = np.array([len(e) for e in experts])
+        assert ((1 <= n) & (n <= self.cap)).all()
+        e = np.concatenate(experts).astype(np.int64)
+        col = np.repeat(np.arange(len(n)), n)
+        k = np.arange(e.size) - np.repeat(np.cumsum(n) - n, n)  # (a chunk's index in its column)
         down = self.kind == "down"
         ts = [self.chunk_template(p, last, slab_stride) for last in (False, True) for p in (0, 1)] if down else \
             [self.chunk_template(0, False, slab_stride)]
-        blocks = (k % 2 + 2 * (k == n - 1)) if down else np.zeros(n, np.int32)
-        bases = np.stack([slab + 2 * e * slab_stride, c_address + 2 * self.c_slot * k], 1)
-        acq = (np.array(LOCKS, np.int64)[k % 2], np.full(n, self.passes, np.int64)) if down else None
-        out = np.empty(self.cb_words, np.uint32) if out is None else out
-        return out[:ctl.assemble(out, ts, blocks, bases, base=cb, b0_words=self.b0_words, bds=BLOCK_BDS, acquire=acq)]
+        blocks = (k % 2 + 2 * (k == n[col] - 1)).astype(np.int32) if down else np.zeros(e.size, np.int32)
+        bases = np.stack([slab + 2 * e * slab_stride, np.asarray(c_address, np.int64)[col] + 2 * self.c_slot * k], 1)
+        locks = np.array(LOCKS, np.int64)[k % 2]
+        ends = np.cumsum(n)
+        res = []
+        for c, (a, b) in enumerate(zip([0, *ends[:-1]], ends)):
+            acq = (locks[a:b], np.full(b - a, self.passes, np.int64)) if down else None
+            w = ctl.assemble(out[c], ts, blocks[a:b], bases[a:b], base=cb[c], b0_words=self.b0_words, bds=BLOCK_BDS,
+                             acquire=acq)
+            res.append(out[c][:w])
+        return res
 
     # ------------------------------------------------------------------
     # The down's outputs (Y)

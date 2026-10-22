@@ -1,4 +1,5 @@
-"""The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups.
+"""The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups, a
+thread's CPU.
 (``gguf_model``'s page hints test for ``mmap.madvise`` themselves.)"""
 
 import contextlib
@@ -69,3 +70,19 @@ def kill_group(proc: subprocess.Popen) -> None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
     proc.wait()
+
+
+@contextlib.contextmanager
+def on_cpu(cpu: int) -> Iterator[None]:
+    """The calling thread on CPU ``cpu`` meanwhile (Linux; if its affinity allows that CPU), its affinity restored
+    after; else (cpu < 0, Windows) nothing changes."""
+    get, put = getattr(os, "sched_getaffinity", None), getattr(os, "sched_setaffinity", None)
+    old = get(0) if get is not None and cpu >= 0 else set()
+    if cpu not in old:
+        yield
+        return
+    put(0, {cpu})
+    try:
+        yield
+    finally:
+        put(0, old)
