@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <format>
 #include <fstream>
 #include <map>
 #include <string>
@@ -45,6 +46,8 @@ std::string ioctl_cmd2name(unsigned long cmd) {
       return "DRM_IOCTL_AMDXDNA_GET_ARRAY";
     case DRM_IOCTL_GEM_CLOSE:
       return "DRM_IOCTL_GEM_CLOSE";
+    case DRM_IOCTL_VERSION:
+      return "DRM_IOCTL_VERSION";
     case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT:
       return "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT";
     case DRM_IOCTL_SYNCOBJ_DESTROY:
@@ -240,6 +243,19 @@ std::unique_ptr<bo> device::alloc_user_bo(size_t size) {
 clocks device::query_clocks() const {
   auto c = get_info<amdxdna_drm_query_clock_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA);
   return {c.mp_npu_clock.freq_mhz, c.h_clock.freq_mhz};
+}
+
+int device::power_mode() const {
+  return get_info<amdxdna_drm_get_power_mode>(*m_pdev, DRM_AMDXDNA_GET_POWER_MODE).power_mode;
+}
+
+std::string device::driver_version() const {
+  char name[64] = {};
+  drm_version v = {};
+  v.name = name;
+  v.name_len = sizeof(name) - 1;
+  m_pdev->ioctl(DRM_IOCTL_VERSION, &v);
+  return std::format("{} {}.{}.{}", name, v.version_major, v.version_minor, v.version_patchlevel);
 }
 
 uint64_t device::busy_ns() const {

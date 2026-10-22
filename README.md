@@ -136,7 +136,7 @@ Details: [Design](docs/design.md).
 | | |
 |---|---|
 | [Installation](docs/install.md) | hardware, driver, build, models directory, troubleshooting |
-| [artlite-cli](docs/cli.md), [artlite-server](docs/server.md), [artlite-bench](docs/bench.md) | the tools and every option |
+| [artlite-cli](docs/cli.md), [artlite-server](docs/server.md), [artlite-bench](docs/bench.md), [artlite-probe](docs/probe.md) | the tools and every option |
 | [Models](docs/models/README.md) | tested files, plans, how each model runs on the NPU |
 | [Benchmark methodology](docs/methodology.md) | how the charts are measured: test system, files, other runtimes |
 | [Where the NPU fits](docs/npu-vs-igpu.md) | bandwidth and power against the iGPU, workloads to explore |

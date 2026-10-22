@@ -6,6 +6,7 @@
 | [artlite-cli](cli.md) | text and images from the command line |
 | [artlite-server](server.md) | the OpenAI-compatible server and web chat |
 | [artlite-bench](bench.md) | prompt and generation speeds, as llama-bench |
+| [artlite-probe](probe.md) | the NPU's clock, dispatch round trip and DRAM rates, next to Strix Halo's |
 | [Models](models/README.md) | tested files, plans, and how each model runs on the NPU: [Llama 3](models/llama3.md), [Gemma 4](models/gemma4.md), [Qwen3.5 / 3.6 / 3.8](models/qwen35.md), [Stable Diffusion 1.5](models/sd15.md) |
 | [Benchmark methodology](methodology.md) | how the README's charts are measured: test system, files, other runtimes |
 | [Where the NPU fits](npu-vs-igpu.md) | bandwidth and power against the iGPU, workloads to explore |

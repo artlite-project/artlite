@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -46,6 +47,8 @@ struct device {
   std::unique_ptr<hw_ctx> create_hw_context(std::span<const uint8_t> pdi, std::string_view kernel_name);
 
   clocks query_clocks() const;
+  int power_mode() const { return -1; }  // (xrt-smi reports it)
+  std::string driver_version() const { return {}; }
   uint64_t busy_ns() const;
   // No device heap of the process's own: XRT places instruction buffers.
   size_t heap_free() const { return SIZE_MAX; }

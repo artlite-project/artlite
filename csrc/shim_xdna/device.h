@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -107,6 +108,10 @@ struct device {
                                             std::string_view cu_name);
 
   clocks query_clocks() const;
+  // The NPU's power mode (enum amdxdna_power_mode_type).
+  int power_mode() const;
+  // The DRM driver's name and version ("amdxdna_accel_driver 0.6.0": Linux 7.0's).
+  std::string driver_version() const;
   // Device busy time of this DRM client (all the process's contexts on the device), from fdinfo:
   // mailbox send to response, summed over the commands; 0 from a driver without the fdinfo line
   // (Linux's own driver). Reads a /proc file: keep it out of timed regions.

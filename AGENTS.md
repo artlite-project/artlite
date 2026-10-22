@@ -58,6 +58,7 @@ artlite-cli -m <org>/<repo>/<file>.gguf -p "..." -n 100             # run a mode
 artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds, as llama-bench (NPU)
 artlite-server -m <org>/<repo>/<file>.gguf                          # OpenAI API + web chat on :8080, as llama-server (NPU)
 artlite-server                                                      # router mode: the models dir's models, one process each
+artlite-probe                                                       # the NPU's clock, dispatch and DRAM rates vs Strix Halo's
 pytest tests/rtc/test_<operator>.py -k <config-id>                  # needs the NPU
 pytest tests/rtc -m smoke                                           # after a change: ~1 min with cached designs (NPU)
 ARTLITE_BACKEND=xrt pytest tests/rtc -m smoke                       # the same on the XRT backend (Windows' code path)
@@ -98,7 +99,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/models/{llama3,gemma4,qwen35}/` | the models on the NPU and their host side (tokenizers, chat templates, inputs); `models.open_model` picks one by a GGUF file's architecture |
 | `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) |
 | `src/models/server/` | `artlite-server`: the HTTP API (FastAPI: llama-server's routes and shapes), the NPU worker and its prompt cache, llama.cpp's prebuilt web UI (pinned); router mode (`router.py`: a model server process per model, `child.py`; `catalog.py`: the models directory's models, presets) |
-| `src/models/common.py`, `cli.py`, `bench.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli` and `artlite-bench` |
+| `src/models/common.py`, `cli.py`, `bench.py`, `probe.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli`, `artlite-bench` and `artlite-probe` (its designs: `artlite.operators.probe`) |
 | `tests/rtc/` | operator and model tests (`common.py`: the essay corpus, cached CPU references; `llama_ref.py`, `gemma_ref.py`, `qwen35_ref.py`: model references; `llama_cpu.py`, `gemma_cpu.py`: fp32 CPU models; `elementwise.py`: 1-D stream operators, the activations' harnesses; `mmv.py`: the decode GEMV's host model and its harness `MmvOperator`; `dma_model.py`: the host DMA model) |
 | `tests/datasets/` | the long-prompt corpus (gitignored; `fetch_datasets.py` fetches it, `common.essay()` reads it) |
 | `.github/` | GitHub: the `ruff check` workflow (on pushes to `main` and pull requests), the issue and pull request templates, the security policy |

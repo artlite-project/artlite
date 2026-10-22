@@ -418,6 +418,11 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           },
           "(MP-NPU clock, H clock) in MHz as the driver reports them.",
           nb::sig("def clocks(self) -> tuple[int, int]"))
+      .def("driver_version", &shim_xdna::device::driver_version,
+           "The DRM driver's name and version: amdxdna_accel_driver 0.6 / 0.8 / 0.10 are Linux 7.0 / 7.1 / 7.2's "
+           "own (\"\" on XRT).")
+      .def("power_mode", &shim_xdna::device::power_mode,
+           "The NPU's power mode: 0 default, 1 low, 2 medium, 3 high, 4 turbo (-1 on XRT: xrt-smi reports it).")
       .def("heap_free", &shim_xdna::device::heap_free,
            "Bytes of the process's device heap (DEV BOs: alloc_insts_buffer) not in use yet, as the driver spends it "
            "(each BO rounded up to 32 KB, 128 KB per hardware context), of the heap BOs mapped so far.")
