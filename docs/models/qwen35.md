@@ -37,17 +37,17 @@ read what to do from their input streams. Per column:
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
   share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core.
 
-The prompt runs in chunks of up to 2048 tokens (layer-major, in sub-chunks of 256; short prompts in chunks of 64 or
-128) through the prefill (`qwen35/prefill.py`): the prefill GEMMs, which read the same weight image, the Gated DeltaNet
-scan and the flash attention. A chunk's K / V, GDN states and conv states land in the decode's buffers; a chunk
-runs as dispatches of whole layers, each within the driver's hang detection. The prompt's last logits come
-from the LM head alone. Tokens where a chunk cannot start (inside a 32-position cache group, e.g. after a
-generated reply; fewer than 3 left) run as decode steps.
+The prompt runs in chunks of up to 2048 tokens (the 35B-A3B: 4096, its experts' weights streamed once per chunk;
+layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the prefill (`qwen35/prefill.py`):
+the prefill GEMMs, which read the same weight image, the Gated DeltaNet scan and the flash attention. A chunk's K / V,
+GDN states and conv states land in the decode's buffers; a chunk runs as dispatches of whole layers, each within the
+driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
+(inside a 32-position cache group, e.g. after a generated reply; fewer than 3 left) run as decode steps.
 
 Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's,
 21.02 GB of the 35B-A3B's) are re-laid-out into a device buffer at load, in memory, at their quantization's size.
-Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.67 GB (the
-35B-A3B, 0.47 GB of them its experts' inputs and outputs).
+Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.97 GB (the
+35B-A3B, 0.66 GB of them its experts' inputs and outputs).
 
 ## Mixture of experts (Qwen3.6-35B-A3B)
 

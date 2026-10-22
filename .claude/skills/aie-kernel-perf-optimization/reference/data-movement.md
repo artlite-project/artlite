@@ -86,7 +86,9 @@ bandwidth.
   per core (8 B / cycle) a 2048-token chunk at 30K positions took 259 ms, the same with every kernel compiled out.
   **Feed each core on both input channels** (as arXiv 2609.21264's fused attention: Q + K on one inbound path, V on
   the other): two streams per KV head, each from its own shim through its own memtile, each carrying half of every
-  cache object: 153 ms, bit-exact (144 with the kernels compiled out: ~49 GB/s, near the DDR ceiling).
+  cache object: 153 ms, bit-exact (144 with the kernels compiled out: ~49 GB/s, near the DDR ceiling). The qwen35
+  35B-A3B (2 KV heads, two q heads per column: a core's two row panels are two heads of one token group) on one stream
+  per KV head: 17.2 ms per layer at 16K positions (T 512), 16.9 with every kernel compiled out; on two: 10.6 (8.8).
   - Split the objects so that each kernel loop still reads two block-vector streams: by d-block halves (d-blocks
     0-31 of a K record's hi and lo panels on one stream, 32-63 on the other; the memtile interleaves them per d-block;
     a loop per stream object, the accumulation order unchanged). Split by part (K hi on one stream, K lo on the

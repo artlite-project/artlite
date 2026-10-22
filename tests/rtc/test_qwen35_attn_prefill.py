@@ -28,25 +28,25 @@ def _bf(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
-def _slot_order(slots: np.ndarray) -> np.ndarray:
-    """QS slots (..., SLOT) uint8 as stored ([half][value 2][d-block 16][72 B]: ``AP.slot_walk``) -> [d-block 32][the
-    two values' 144 B]."""
-    lead = slots.shape[:-1]
-    return np.ascontiguousarray(slots.reshape(*lead, 2, 2, AP.ND // 2, 72).swapaxes(-3, -2)).reshape(*lead, AP.ND, 144)
+def _slot_order(slots: np.ndarray, two: bool) -> np.ndarray:
+    """QS slots (..., SLOT) uint8 as stored ([half 2][value 2][d-block 16][72 B], two streams [quarter 4][value 2]
+    [d-block 8][72 B]: ``AP.slot_walk``) -> [d-block 32][the two values' 144 B]."""
+    lead, n = slots.shape[:-1], 4 if two else 2
+    return np.ascontiguousarray(slots.reshape(*lead, n, 2, AP.ND // n, 72).swapaxes(-3, -2)).reshape(*lead, AP.ND, 144)
 
 
-def _q_panels(slots: np.ndarray) -> np.ndarray:
+def _q_panels(slots: np.ndarray, two: bool) -> np.ndarray:
     """Q slots (..., SLOT) uint8 -> (..., 8 queries, 256) the Q values they hold (hi + lo)."""
     lead = slots.shape[:-1]
-    p = _slot_order(slots).reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
+    p = _slot_order(slots, two).reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
     v = bfp16.block_values(p[..., 0, :, :]) + bfp16.block_values(p[..., 1, :, :])  # [db][query][8]
     return np.moveaxis(v, -3, -2).reshape(*lead, 8, AP.HD)
 
 
-def _gate_sigmoid(slots: np.ndarray) -> np.ndarray:
+def _gate_sigmoid(slots: np.ndarray, two: bool) -> np.ndarray:
     """sigmoid(gate) slots (..., SLOT) uint8 -> (..., 8, 256) (fp32 of the bf16 stored: per d-block [query][8])."""
     lead = slots.shape[:-1]
-    g = _slot_order(slots).view(np.uint16).reshape(*lead, AP.ND, 72)[..., :64].astype(np.uint32) << 16
+    g = _slot_order(slots, two).view(np.uint16).reshape(*lead, AP.ND, 72)[..., :64].astype(np.uint32) << 16
     g = g.view(np.float32).reshape(*lead, AP.ND, 8, 8)  # [db][query][8]
     return np.moveaxis(g, -3, -2).reshape(*lead, 8, AP.HD)
 
@@ -125,7 +125,7 @@ def _run(fused: FusedOperator, params: dict[str, int], G: np.ndarray) -> None:
     fused.sync_scratch_from_device()
 
 
-@pytest.mark.parametrize("size", ["9B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B"])
 def test_attn_prep(size: str) -> None:
     T, n2 = 64, 45
     s = _Setup(size, T, n2)
@@ -135,8 +135,8 @@ def test_attn_prep(size: str) -> None:
         _run(fused, op.params(t0), s.G(t0, n))
         pos = np.arange(t0, t0 + n)
         slots = _qs_slots(fused, T, qc, op.qg)
-        q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]  # [head][token]
-        sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
+        q = _q_panels(slots[:, :, 0], op.two).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]  # [head][token]
+        sg = _gate_sigmoid(slots[:, :, 1], op.two).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
         qg = s.qfull[t0:t0 + n].reshape(n, -1, 2, hd)
         q_want = s.nr(qg[:, :, 0], s.qn, pos).transpose(1, 0, 2) * np.log2(np.e) / 16
         assert ref.rel_err(q, q_want) < 2e-4, t0  # (hi + lo panels: ~14 bits below a block's maximum)
@@ -157,7 +157,7 @@ def test_attn_prep(size: str) -> None:
         assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
 
 
-@pytest.mark.parametrize(("size", "T"), [("9B", 64), ("27B", 64), ("1B", 64), ("1B", 192)])
+@pytest.mark.parametrize(("size", "T"), [("9B", 64), ("27B", 64), ("1B", 64), ("1B", 192), ("35B-A3B", 64)])
 def test_attn_prefill(size: str, T: int) -> None:
     """AttnPrep then PrefillAttn (one fused runlist) over two chunks: the output panels against the exact attention
     of the cores' own operands (their Q panels, the cache they wrote, their sigmoid(gate): within 0.7%, the bfp16
@@ -178,8 +178,8 @@ def test_attn_prefill(size: str, T: int) -> None:
         _run(fused, prep.params(t0) | attn.params(t0), s.G(t0, n))
         A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
         slots = _qs_slots(fused, T, qc, prep.qg)
-        q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
-        sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
+        q = _q_panels(slots[:, :, 0], prep.two).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
+        sg = _gate_sigmoid(slots[:, :, 1], prep.two).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
         kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
         want = np.zeros((n, H, hd))
         for h in range(s.kvh):

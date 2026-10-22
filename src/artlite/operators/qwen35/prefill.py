@@ -60,7 +60,8 @@ from .overlay import KV_PAD, QwenOverlay
 SUB = 256  # tokens per sub-chunk (the operators' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each)
-MAX_T = SIZES[-1]
+MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
+MAX_T = MOE_SIZES[-1]
 assert MAX_T - SUB <= KV_PAD
 CS_OFF = 4 * META + 640  # the conv state's bytes in a GDN header slot of the overlay
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
@@ -83,13 +84,16 @@ def _key(lay: PG.Layout) -> tuple:
 
 
 class QwenPrefill(ChunkPrefill):
-    """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches: a
-    larger chunk's transfers leave them, and aiecc rejects the design); ``run`` runs one."""
+    """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (default ``SIZES``, an MoE model's
+    ``MOE_SIZES``; those within the overlay's caches: a larger chunk's transfers leave them, and aiecc rejects the
+    design); ``run`` runs one."""
 
     SUB, SMALL, MAX_T, MIN_TOKENS, NAME = SUB, SMALL, MAX_T, 3, "qwen_prefill"
 
-    def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] = SIZES):
-        super().__init__(overlay, sizes)
+    def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None):
+        default = MOE_SIZES if overlay.cfg.moe else SIZES
+        super().__init__(overlay, sizes or default)
+        self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
         cfg, img = self.cfg, self.img
         self.layers = overlay.layers
         self.gdn = [L for L in self.layers if not cfg.attention[L]]
@@ -180,7 +184,7 @@ class QwenPrefill(ChunkPrefill):
         """(the scan over the chunk of T tokens in one call: the states read and written once)"""
         t = self._t(T)
         return (self._op(GP.GdnPrepOperator, lay, T=t), self._op(GP.GdnScanOperator, lay, T=T, sub=t),
-                self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=MAX_T))
+                self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=self.max_t))
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
         """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""

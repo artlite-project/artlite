@@ -35,7 +35,7 @@ from artlite.model_config import QwenConfig
 from artlite.operators.overlay.runtime import WeightBuffer
 from artlite.operators.qwen35.image import QwenImage
 from artlite.operators.qwen35.overlay import QwenOverlay
-from artlite.operators.qwen35.prefill import SIZES, QwenPrefill
+from artlite.operators.qwen35.prefill import QwenPrefill
 
 from ..common import Model, OverlayModel, Sampling
 from .minicpmv import image_prompt
@@ -52,10 +52,10 @@ MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95, "penalty_repeat":
 
 class NpuQwen(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full-attention layers' caches hold; ``prefill``: prompts
-    in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``prefill.SIZES``)."""
+    in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``QwenPrefill``'s)."""
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
-                 sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):
+                 sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None):
         """weights: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
         self.gguf = gguf
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights)

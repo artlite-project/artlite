@@ -17,7 +17,8 @@ of every text position, or rows the host writes past them for a chunk of image t
 ``PrefillAttnOperator``: per column 4 cores, passes of 32 QG queries (QG = 2 when a column holds one q head, the L1 of
 the 9B's two heads: half the history's re-streams, else 1); core r takes the QG token groups QG r .. of the pass for
 each of the column's heads (QC QG row panels: an O of QC QG x 8 KB) and streams the cache groups up to the pass's (the
-KV head's stream broadcast to the 4 NPH cores of its columns): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
+KV head's stream broadcast to the 4 NPH cores of its columns; with two row panels per core and 4 columns per KV head
+on two streams, ``two_streams``: one stream's memtile channel bound the history's re-streams): per K record the scores on the MMUL (Q hi + lo against K hi + lo, three
 products: one loop, the KV head's memtile re-lays each record per d-block, [K hi | K lo] and the V object's two
 records), per group of 32 positions the softmax (a row's maximum is raised, rescaling o and l, only when the group's
 exceeds it by 2^16: the per-dimension norm weights leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2
@@ -26,7 +27,7 @@ bfp16 A panels. Within 0.7% of the exact attention of its own operands, ~1% rms 
 
 Time (T = 512, per layer alone, at p0 = 0 / 4K / 16K): the 27B 1.38 / 6.89 / 22.1 ms (its compute compiled out at
 16K: 20.6, the KV re-streams of the 32-query passes at the DDR ceiling), the 1B 0.97 / 2.47 / 7.23 (5.99: the cores'
-QK binds).
+QK binds), the 35B-A3B (two streams) 1.12 / 3.44 / 10.6 (8.8).
 """
 
 import math
@@ -77,11 +78,13 @@ PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
 COUNTERS = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24), (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24))
 
 
-def slot_walk() -> TensorAccessPattern:
+def slot_walk(two: bool) -> TensorAccessPattern:
     """QS's slots in DDR: a slot's 32 pairs of 36 values (a d-block's Q panels hi, lo; or its gate block) as [half 2]
-    [value 2][d-block 16][36] (the attention's walks, ``part_walk``, read a half's d-blocks back in order): written so by
-    the prep's join from the cores' [d-block][72]."""
-    return TensorAccessPattern((SLOT // 2,), 0, [2, ND // 2, 2, 36], [SLOT // 4, 36, SLOT // 8, 1])
+    [value 2][d-block 16][36], for the two-stream attention (``two_streams``) as [quarter 4][value 2][d-block 8][36]
+    (the attention's walks, ``part_walk``, read a half's or quarter's d-blocks back in order; a quarter's values one
+    run of a stream part): written so by the prep's join from the cores' [d-block][72]."""
+    n = 4 if two else 2
+    return TensorAccessPattern((SLOT // 2,), 0, [n, ND // n, 2, 36], [SLOT // (2 * n), 36, SLOT // (4 * n), 1])
 
 
 def pass_groups(cfg: QwenConfig, T: int) -> int:
@@ -91,9 +94,11 @@ def pass_groups(cfg: QwenConfig, T: int) -> int:
 
 
 def two_streams(cfg: QwenConfig, T: int) -> bool:
-    """Whether the prefill attention of a T-token chunk takes each KV head's cache on two streams (one q head per
-    column, two row panels per core)."""
-    return cfg.num_attention_heads == COLS and COLS // cfg.num_key_value_heads >= 2 and pass_groups(cfg, T) == 2
+    """Whether the prefill attention of a T-token chunk takes each KV head's cache on two streams (two row panels per
+    core: one q head per column and QG = 2, or two q heads; a KV head's 4 columns at least, each stream from two
+    shims)."""
+    qc = cfg.num_attention_heads // COLS
+    return COLS // cfg.num_key_value_heads >= 4 and qc * pass_groups(cfg, T) == 2
 
 
 def part_walk(two: bool) -> TensorAccessPattern:
@@ -299,6 +304,7 @@ class AttnPrepOperator(ArtcOperator):
         assert 1 <= self.qc <= 3, "a core per q head and the KV core in a column"
         self.head_bytes, self.cs_positions = head_bytes, cs_positions
         self.qg = pass_groups(cfg, T)
+        self.two = two_streams(cfg, T)  # (QS's slot layout: ``slot_walk``)
         assert T % (32 * self.qg) == 0
         super().__init__()
 
@@ -371,7 +377,7 @@ class AttnPrepOperator(ArtcOperator):
         o3 = [ObjectFifo(qs_ty, name=f"qp_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([SLOT // 2 * h for h in range(qc)], tile=Tile(c, 1), depths=[2] * qc,
                                 obj_types=[slot_ty] * qc, names=[f"qp_oh{c}_{h}" for h in range(qc)],
-                                from_stream=[slot_walk()] * qc) for c in range(COLS)]
+                                from_stream=[slot_walk(self.two)] * qc) for c in range(COLS)]
         k = {c: ObjectFifo(kr_ty if jobs[c][0] == "k" else vr_ty, name=f"qp_k{c}", depth=2) for c in jobs}
 
         def core(a_h, b_h, o_h, prm, fn, ws, sg=None):
@@ -860,7 +866,7 @@ class PrefillAttnOperator(ArtcOperator):
         two streams only)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
-        assert T % 32 == 0 and T // 32 <= 64
+        assert T % 32 == 0
         self.T, self.cfg, self.head_bytes = T, cfg, head_bytes
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
@@ -868,8 +874,9 @@ class PrefillAttnOperator(ArtcOperator):
         self.qg = pass_groups(cfg, T)  # (query groups per core and head)
         self.R = self.qc * self.qg  # (row panels)
         self.H = cfg.num_attention_heads
-        # (one q head per column: each KV head's cache on two streams, half of every object each, so a core takes it on
-        # both input channels; its Q and gates ride ahead and behind on them; more q heads: one stream, Q apart)
+        # (two row panels per core, a KV head's 4 columns: each KV head's cache on two streams, half of every object
+        # each, so a core takes it on both input channels; its Q and gates ride ahead and behind on them; else one
+        # stream, Q apart)
         self.two = two_streams(cfg, T)
         self.ob = self.R <= 2 and not self.two  # (o's second copy fits: regions 2 and 3)
         super().__init__()
@@ -976,10 +983,13 @@ class PrefillAttnOperator(ArtcOperator):
             tg = TaskGroup()
             for c in range(COLS):
                 # (a joined object: the 4 rows' panel i; QG > 1 (one head): token groups i, QG + i, .. of the pass)
+                # (passes in runs of at most 64: a BD repeats at most 64 times)
                 g_st = ND * 36 if qg == 1 else H * ND * 36
-                oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36, [n_pass, R, 4, ND * 36],
-                                                   [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]), group=tg,
-                            wait=True)
+                for b0 in range(0, n_pass, 64):
+                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36 + b0 * 4 * qg * H * ND * 36,
+                                                       [min(64, n_pass - b0), R, 4, ND * 36],
+                                                       [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]), group=tg,
+                                wait=True)
             inflight = []  # (a pass: one task of up to four BDs per part, at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
@@ -1015,16 +1025,17 @@ class PrefillAttnOperator(ArtcOperator):
         return module
 
     def _two_artifact(self) -> Module:
-        """One q head per column, two row panels per core (``two_streams``): stream s of KV head h carries d-blocks
+        """Two row panels per core (``two_streams``: QG token groups of one q head, or a token group of QC = 2
+        heads): stream s of KV head h carries d-blocks
         16 s .. 16 s + 15 of every cache object (a K object's two records, hi and lo panels; a V object's four records)
         from two shims (columns NPH h + 2 s and the next: d-blocks 8 i .. of each from part i) through its memtile
         (column NPH h + 2 s: re-laid per d-block, ``part_walk``), broadcast to the head's 4 NPH cores, which take the
         two on their two input channels: with one stream the shim channel and each core's input bound the history's
         re-streams (the 1B at 16K: 24.5 GB/s for its 2 KV heads), with one shim channel per stream ~40 GB/s for the 4.
         Per pass each stream carries first the halves of the pass's Q slots of the head's cores ([column NPH][token
-        group 8], from the pass-major QS), two slots an object, then the history and the chunk's groups before the
-        pass's, then the halves of their sigmoid(gate) slots: each core copies its own pair (``qsel``)."""
-        p, T, H, qg, R = self.pfx, self.T, self.H, self.qg, self.R
+        group 4 QG][head QC], from the pass-major QS), two slots an object, then the history and the chunk's groups
+        before the pass's, then the halves of their sigmoid(gate) slots: each core copies its own pair (``qsel``)."""
+        p, T, H, qc, qg, R = self.pfx, self.T, self.H, self.qc, self.qg, self.R
         bf = np.dtype[bfloat16]
         q_ty = np.ndarray[(R * SLOT // 2,), bf]
         h_ty = np.ndarray[(SLOT // 2,), bf]  # (half a K or V object, the halves of two slots)
@@ -1040,7 +1051,7 @@ class PrefillAttnOperator(ArtcOperator):
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
-        n_q = nph * 4 * qg  # (a pass's slots of a KV head's cores)
+        n_q = nph * 4 * qg * qc  # (a pass's slots of a KV head's cores)
 
         streams = {(h, s): nph * h + 2 * s for h in range(n_kvh) for s in range(2)}
         # (each stream from the shims of columns NPH h + 2 s and the next, d-blocks 8 i .. of every piece from part i,
@@ -1100,9 +1111,10 @@ class PrefillAttnOperator(ArtcOperator):
                                              Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph) * 4 + r],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
-        n_qs = COLS * T // 8 * 2 * SLOT // 2
+        n_qs = COLS * T // 8 * qc * SLOT
         n_kv, n_a = n_kvh * self.head_bytes // 2, T * H * HD * 9 // 16
-        hb, sl, half = self.head_bytes // 2, SLOT // 2, SLOT // 4
+        hb, sl = self.head_bytes // 2, SLOT // 2
+        blk = 4 * qg * qc * SLOT  # (a column's slots in a pass: per token group [its heads' Q | their sigmoid(gate)])
 
         def seq(QS, KV, A, kvh, oh):
             sync_parameters()
@@ -1113,19 +1125,23 @@ class PrefillAttnOperator(ArtcOperator):
                             npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):
-                oh[c].drain(A, TensorAccessPattern((n_a,), c * ND * 36, [n_pass, R, 4, ND * 36],
-                                                   [4 * qg * H * ND * 36, H * ND * 36, qg * H * ND * 36, 1]),
-                            group=tg, wait=True)
+                g_st = ND * 36 if qg == 1 else H * ND * 36  # (the row panels: heads, or token groups)
+                for b0 in range(0, n_pass, 64):  # (runs of at most 64 passes)
+                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36 + b0 * 4 * qg * H * ND * 36,
+                                                       [min(64, n_pass - b0), R, 4, ND * 36],
+                                                       [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]),
+                                group=tg, wait=True)
             inflight = []  # (a pass: one task of up to four BDs per stream, at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
                 more = qg * b + qg - 1  # (the chunk's groups after its first through the pass's)
                 for ((h, s), i), f in zip(((hs, i) for hs in streams for i in range(2)), kvh, strict=True):
                     # (part i: d-blocks 16 s + 8 i .. of every piece; QS pass-major: the pass's slots of the head's
-                    # columns [column NPH][token group 8] one after the other, a slot [Q | sigmoid(gate)])
-                    q0 = (b * COLS + nph * h) * 8 * SLOT + s * half + i * SLOT // 16
+                    # columns [column NPH][token group 4 QG] one after the other, a token group's [Q | sigmoid(gate)]
+                    # of its QC heads)
+                    q0 = (b * COLS + nph * h) * blk + (2 * s + i) * SLOT // 8  # (its quarter of the slots: ``slot_walk``)
                     k0, run = h * hb + s * SLOT // 8 + i * SLOT // 16, SLOT // 16
-                    q_dims, q_str = [1, nph * 8, 2, run], [0, SLOT, SLOT // 8, 1]
+                    q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 8], [0, qc * SLOT, SLOT // 2, 1]
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str)),
                              ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, run], [0, 4640, SLOT // 4, 1]),
                                        length_parameter=p_n)]
@@ -1133,7 +1149,7 @@ class PrefillAttnOperator(ArtcOperator):
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3 * more, 4, run],
                                                                        [0, 4640, SLOT // 4, 1]),
                                                offset_parameter=p_off))
-                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + sl, q_dims, q_str)))
+                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) > 1:

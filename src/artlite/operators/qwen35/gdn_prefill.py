@@ -1027,7 +1027,7 @@ class GdnScanOperator(ArtcOperator):
         kept); "ev_chunk": an event window around a chunk call (results unchanged)."""
         self.sub = sub or T
         assert T % self.sub == 0 and self.sub % C == 0 and T // self.sub <= 64
-        assert T <= 2 * self.RUN, "the v rows and o in at most two runs"
+        assert T <= 4 * self.RUN, "the v rows and o in at most four runs (a round's BDs: 13 of a shim's 16)"
         self.T, self.cfg, self.layout = T, cfg, layout
         self.ablate = tuple(ablate)
         self.sh = GD.GdnShape(cfg)
