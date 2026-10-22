@@ -24,7 +24,7 @@ always: its drains carry the tokens the sequence waits for). The control stream'
   (per token a C object holds ``vp`` runs of the pass's outputs).
 
 "gu": the halves' gate / up rows of the slab ("exp_gu": per half 32 row tiles x 2 K chunks, ``overlay.image.gate_up_rows``),
-passes of 64 rows (32 outputs) in the halves' order: H = silu(gate) up as bfp16 panels of the expert's width.
+passes of ``GU_ROWS`` rows (64 outputs) in the halves' order: H = silu(gate) up as bfp16 panels of the expert's width.
 "down": the slab's "exp_down" (all hidden rows over a half's columns, row groups of 4; Q4_K or Q6_K), the halves as
 two K chunks one slab stride apart (A: the expert's H, 512 columns), two slots per C object (``GemmQOperator.slots``).
 """
@@ -96,18 +96,20 @@ class ExpertGemmOperator(GemmQdOperator):
     rows ``N`` wide: whole passes, Q6_K's 47 tiles of 44 rows as 12 passes of 4: 2112, the last tile's rows the next
     half's bytes, never read). ``of``: from a layer's slab region."""
 
+    GU_ROWS = 128  # rows of a gate / up pass (128: its A strip resent half as often as at 64)
+
     def __init__(self, *, kind: str, fmt: str, R: int, row_tiles: int, G: int = 1, K: int, tile_bytes: int, kc: int,
                  kc_group: int = 1, cap: int, out: int):
         assert kind in ("gu", "down")
         self.kind, self.cap = kind, cap
         self._templates: dict[tuple, tuple[np.ndarray, list]] = {}
         if kind == "gu":
-            tp = 64 // R
+            tp = self.GU_ROWS // R  # (tiles per pass)
             ph = row_tiles // tp  # passes per half
             kw = {"fmt": fmt, "rows": R, "K": K, "N": out, "passes": 2 * ph,
-                  "out_cols": [[32 * p for p in range(2 * ph)]] * COLS, "kc_group": kc_group,
+                  "out_cols": [[self.GU_ROWS // 2 * p for p in range(2 * ph)]] * COLS, "kc_group": kc_group,
                   "region_rt": row_tiles, "silu": True, "act": "silu", "c_bfp16": True,
-                  "blocks": ((0, 2 * ph),)}
+                  "blocks": ((0, 2 * ph),), "tiles": tp, "pingpong": self.GU_ROWS == 64}
             self.ph = ph
         else:
             tiles = 4
@@ -210,8 +212,8 @@ class ExpertGemmOperator(GemmQdOperator):
         objects (per pass and object ``vp``): "gu" H panels [group][N / 8][36] (a pass: its 4 panels of the rows'
         groups), "down" the pass-major ``y_layout`` (an object: its rows' tokens whole)."""
         if self.kind == "gu":
-            g = self.N // 8 * 36  # (a token group's panels)
-            return tuple(TensorAccessPattern((1, 1 << 30), g0 * g, [self.passes, 1, n, 4 * 36], [4 * 36, 0, g, 1])
+            g, w = self.N // 8 * 36, self.n_out // 8 * 36  # (a token group's panels, a pass's)
+            return tuple(TensorAccessPattern((1, 1 << 30), g0 * g, [self.passes, 1, n, w], [w, 0, g, 1])
                          for g0, n in ((0, M // 8), (M // 8, 2 * M // 8)))
         obj = CHUNK * self.n_out
         return tuple(TensorAccessPattern((1, 1 << 30), t0 * self.n_out, [self.passes * self.vp, 1, 1, n * self.n_out],

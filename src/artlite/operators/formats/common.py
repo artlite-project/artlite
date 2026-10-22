@@ -154,7 +154,7 @@ class Slot:
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
         """(count, bytes) of the dequantizing core's buffers besides B and D: the scale workspace ``ws``, the
         header slots ``hb`` (and Q5_K's ``ex``)."""
-        return {"ws": (1, max(1024 * op.nsb * op.ws_planes, 64)), "hb": (1, KT * op.n * 2)}
+        return {"ws": (1, max(1024 * op.nsb * op.ws_planes * op.tq // 4, 64)), "hb": (1, KT * op.n * 2)}
 
     def qd_kernels(self, op: object, kernel: KernelFn, *, B_l1_ty: object, ws_ty: object, hb_ty: object,
                    D_ty: object) -> DqKernels:

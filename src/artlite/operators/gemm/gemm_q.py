@@ -666,7 +666,8 @@ class GemmQOperator(ArtcOperator):
         # GemmQ's dequant: each pair of core rows splits every k-tile (GemmQd: one dequantizing core)
         self.pair = self.dequant and not self.DQ_CORE
         assert not self.pair or (self.tiles == TILES and nrows % 2 == 0), "GemmQ dequant: 4 tiles per pass, row pairs"
-        self.tq = TILES // 2 if self.pair else TILES  # tiles of a core's k-tile objects (its dequant)
+        # tiles of a core's k-tile objects (its dequant; GemmQd: the pass's)
+        self.tq = TILES // 2 if self.pair else self.tiles if self.DQ_CORE and not self.planar else TILES
         # the W argument: hdr_skip bytes before the matrix, then its columns' regions (and the tiles the
         # last column's extra row tiles read after its region: those of the next region in the image)
         nk, g, rt, rs = self.n_kc, self.kc_group, self.region_rt, self.rt_stride
@@ -711,7 +712,8 @@ class GemmQOperator(ArtcOperator):
     @property
     def b_l1_words(self) -> int:
         """Words of an L1 weight object (one k-tile; planar: [plane][word 2][rows padded to n])."""
-        return 2 * FORMATS[self.fmt].planes * self.n if self.planar else self.tiles * self.slice // 16 * self.tq // TILES
+        return 2 * FORMATS[self.fmt].planes * self.n if self.planar else \
+            (self.tq if self.pair else self.tiles) * self.slice // 16
 
     def _buffers(self, m: int) -> dict[str, tuple[int, int]]:
         """(count, bytes) of each core buffer with m tokens per core row: the FIFO objects A
@@ -838,7 +840,7 @@ class GemmQOperator(ArtcOperator):
         a_wdims = [(ak // KT * (m // 16), 8 * 72), (2, 36), (8, 72), (36, 1)]
         a_obj = m * ak * 9 // 16
         c_l1 = m * no * 9 // 16 if cb else m * self.n_c
-        parts = TILES // self.tq
+        parts = 2 if self.pair else 1
         return GemmQDataflow(
             b_obj=obj_w, b_l1=self.b_l1_words, b_wdims=None if noperm else stream_walk(obj_w // parts, wdims),
             b_rdims=None if noperm else stream_walk(obj_w // parts, rdims, rpad), b_parts=parts,

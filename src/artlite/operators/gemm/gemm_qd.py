@@ -42,7 +42,7 @@ from ..design import COLS
 from ..formats import FORMATS, KC, slot
 from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
-from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, TILES, GemmQOperator, L1Error, pack_plan, planar
+from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, GemmQOperator, L1Error, pack_plan, planar
 from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
@@ -67,18 +67,19 @@ class GemmQdOperator(GemmQOperator):
     DQ_CORE = True
     p = kernel_prefix("gqd")
 
-    def __init__(self, *, mac_rows: int = 3, m: int = 64, **kw: object):
+    def __init__(self, *, mac_rows: int = 3, m: int = 64, pingpong: bool | None = None, **kw: object):
         """``M``: the tokens the caller uses; the operator runs ``M`` padded to a multiple of
         mac_rows x m (its A and C arguments have that many rows; the padding rows are computed from
         whatever A holds there and never matter). Gate/up (``silu``): the MAC cores' k-tiles
         alternate between two C tiles in different L1 regions (``pingpong``) (in one region the MAC loop's C
         loads and stores conflict: 90 bank conflicts per k-tile; gate/up T = 2048 7.70 -> 7.50 ms). The planar MAC
-        cores' L1 placement: the first of ``PLANAR_PLANS`` that fits, else aiecc's."""
+        cores' L1 placement: the first of ``PLANAR_PLANS`` that fits, else aiecc's. ``pingpong``: as said (default as
+        above)."""
         assert 1 <= mac_rows <= 3 and "nrows" not in kw and m % 16 == 0
         # (planar SiLU passes of a whole group: two C tiles of its halves, no pingpong)
         rows = kw.get("rows", 16)
         self.pingpong = bool(kw.get("silu")) and (not planar(kw.get("fmt", "Q4_0"), rows, kw.get("kc", KC))
-                                                  or kw.get("tiles", 0) * rows == 64)
+                                                  or kw.get("tiles", 0) * rows == 64) if pingpong is None else pingpong
         # MAC cores' C objects (1: the next pass waits for the drain): 2 if they fit L1, else 1 (``_l1_bytes``)
         self.c_depth = 2
         self.T = kw.pop("M")
@@ -233,7 +234,7 @@ class GemmQdOperator(GemmQOperator):
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,
                                   mac_src=mac, c_pack=self.c_pack, n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
                                   TR=self.TR, pingpong=self.pingpong, planar=self.planar, hu=self.hdr_units,
-                                  hp0=self._hdr_plane0, hs=self._hdr_slot_words, sxp=self.sxp, tq=TILES, pair=False,
+                                  hp0=self._hdr_plane0, hs=self._hdr_slot_words, sxp=self.sxp, tq=self.tq, pair=False,
                                   us=self.us, c_pairs=False, macf="", slots=self.slots,
                                   pack_plan=pack_plan(self.nm, self.n_out, self.n_c, self.tiles, self.R)
                                   if self.c_pack and self.slots == 2 else None,
