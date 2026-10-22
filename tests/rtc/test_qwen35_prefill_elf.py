@@ -16,7 +16,7 @@ from . import qwen35_ref as ref
 from .common import essay
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B"])
 def test_prefill_slice(size: str) -> None:
     from artlite.operators.qwen35.overlay import QwenOverlay
     from artlite.operators.qwen35.prefill import QwenPrefill
@@ -60,9 +60,15 @@ def test_prefill_slice(size: str) -> None:
     print(f"{size} layers {layers}: prefill error mean {np.mean(err):.4f} max {np.max(err):.4f} (sub-chunk 2 mean "
           f"{np.mean(err[256:n1]):.4f}, chunks 2, 3 mean {np.mean(err[n1:n1 + n2]):.4f}, {np.mean(err[n1 + n2:]):.4f}); "
           f"decode after the prefill "
-          f"{np.mean(cont):.4f}, decode only {np.mean(dec):.4f}")
+          f"{np.mean(cont):.4f}, decode only {np.mean(dec):.4f}; median {np.median(err):.4f}, p95 "
+          f"{np.percentile(err, 95):.4f}, above 5%: {int((np.asarray(err) > 5e-2).sum())} of {len(err)}")
     # (the prefill GEMMs multiply bfp16 activations by the weights dequantized to bfp16: ~1.4% rms per projection vs
-    # the decode GEMV's bf16 x; 9B: mean 1.0%, max 6.3% at token 0, an outlier dimension cancelling in layer 19; 1B:
-    # llama.cpp's own noise is ~3x the 9B's, the decode path's error 1.5%, the prefill's 1.7%)
-    assert np.max(err) < 8e-2 and np.mean(err) < max(1.5e-2, 1.3 * np.mean(dec))
+    # the decode GEMV's bf16 x; 9B: mean 0.8%, max 6.4%, an outlier dimension cancelling in layer 19; 1B: llama.cpp's
+    # own noise is ~3x the 9B's, the decode path's error 1.5%, the prefill's 1.7%; 35B-A3B: mean 1.8% = 2.1x the decode
+    # path's, 8 of 365 tokens above 5%: the experts' two GEMMs and routing flips, x ~1% off changes a few % of the
+    # top-8 sets per layer)
+    if g.arch_meta("expert_count"):
+        assert np.max(err) < 0.12 and np.mean(err) < 2.4 * np.mean(dec)
+    else:
+        assert np.max(err) < 8e-2 and np.mean(err) < max(1.5e-2, 1.3 * np.mean(dec))
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3

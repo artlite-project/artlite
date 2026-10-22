@@ -78,25 +78,56 @@ def _north(own: int, up: list[int]) -> list[int]:
     return out
 
 
+def _parity_v(words: np.ndarray) -> np.ndarray:
+    """``_parity`` of each word of an array."""
+    w = np.asarray(words, np.uint32)
+    c = w ^ (w >> 16)
+    c ^= c >> 8
+    c ^= c >> 4
+    c ^= c >> 2
+    c ^= c >> 1
+    return w | ((~c & 1) << 31).astype(np.uint32)
+
+
 def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
     """A tile's writes ((tile-local address, words)) as control packets: per packet the stream header (``stream_id``:
     the route's packet id), the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding)."""
     head = _parity(stream_id)
     out = []
     for addr, data in writes:
-        for i in range(0, len(data), 4):
-            d = data[i:i + 4]
-            out += [head, _parity(((len(d) - 1) << 20) | ((addr + 4 * i) & 0xFFFFF)), *(int(v) for v in d)]
-    return np.array(out, np.uint32)
+        d = np.asarray(data, np.uint32)
+        q, r = divmod(d.size, 4)
+        if q:  # (whole packets of 4 words)
+            blk = np.empty((q, 6), np.uint32)
+            blk[:, 0] = head
+            blk[:, 1] = _parity_v(3 << 20 | (addr + 16 * np.arange(q, dtype=np.int64)) & 0xFFFFF)
+            blk[:, 2:] = d[:4 * q].reshape(q, 4)
+            out.append(blk.reshape(-1))
+        if r:
+            out.append(np.array([head, _parity(((r - 1) << 20) | ((addr + 16 * q) & 0xFFFFF)), *d[4 * q:].tolist()],
+                                np.uint32))
+    return np.concatenate(out) if out else np.zeros(0, np.uint32)
 
 
 def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
     """A configuration (after its PDI load) without the writes control packets take (per core and memory tile its
     program memory, DMA BDs, DMA channels, locks, the core's control but its enable: writes, blockwrites, masked writes
     as the values they leave), and those per tile in their order."""
-    rest, moved, value = [], defaultdict(list), {}
+    rest, moved = [], defaultdict(list)
+    value, big = {}, []  # (the moved writes: per word of short ones (seq, value); long ones (seq, address, words))
+
+    def last(reg: int, default: int) -> int:
+        """The value the moved writes left at reg (a masked write's old value)."""
+        seq, v = value.get(reg, (-1, default))
+        for q, r, words in reversed(big):
+            if q < seq:
+                break
+            if r <= reg < r + 4 * len(words):
+                return int(words[(reg - r) // 4])
+        return v
+
     ops = txn.op_offsets(cfg)
-    for (p, op), e in zip(ops, [q for q, _ in ops[1:]] + [len(cfg)]):
+    for seq, ((p, op), e) in enumerate(zip(ops, [q for q, _ in ops[1:]] + [len(cfg)])):
         reg = int(cfg[p + 2]) if op in (txn.OP_WRITE, txn.OP_BLOCKWRITE, txn.OP_MASKWRITE) else 0
         row, off = min((reg >> 20) & 0x1F, 2), reg & 0xFFFFF
         n = (e - p - 4) if op == txn.OP_BLOCKWRITE else 1
@@ -106,12 +137,15 @@ def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
             continue
         if op == txn.OP_MASKWRITE:
             v, m = int(cfg[p + 4]), int(cfg[p + 5])
-            old = value.get(reg, _CORE_CONTROL_RESET if row == 2 and off == _CORE_CONTROL else 0)
+            old = last(reg, _CORE_CONTROL_RESET if row == 2 and off == _CORE_CONTROL else 0)
             words = np.array([(old & ~m) | (v & m)], np.uint32)
         else:
             words = cfg[p + 4:e] if op == txn.OP_BLOCKWRITE else cfg[p + 4:p + 5]
-        for i, w in enumerate(words):
-            value[reg + 4 * i] = int(w)
+        if len(words) > 16:  # (program and data memory)
+            big.append((seq, reg, words))
+        else:
+            for i, w in enumerate(words):
+                value[reg + 4 * i] = (seq, int(w))
         moved[(reg >> 25, (reg >> 20) & 0x1F)].append((off, words))
     return (np.concatenate(rest) if rest else np.zeros(0, np.uint32)), dict(moved)
 

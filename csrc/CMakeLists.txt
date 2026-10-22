@@ -1,8 +1,9 @@
-# What every backend shares (dequantization, executables, GGUF strings, weight packing)
+# What every backend shares (dequantization, executables, GGUF strings, weight packing, the MoE prefill's host step)
 add_library(artlite_core OBJECT
   artlite/dequant.cpp
   artlite/executable.cpp
   artlite/gguf_json.cpp
+  artlite/moe_host.cpp
   artlite/tile_pack.cpp
 )
 target_include_directories(artlite_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

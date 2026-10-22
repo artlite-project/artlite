@@ -159,16 +159,16 @@ def phase_pitch(image: TileImage, name: str, T: int) -> int:
 
 
 def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[list[int]], *, few: bool,
-        k_part: tuple[int, int] = (0, 0)) -> dict[str, object]:
+        k_part: tuple[int, int] = (0, 0), plan_T: int = 0) -> dict[str, object]:
     """GemmQ arguments of a run of blocks (its passes, the row tiles they read) over K chunks k_part = (first,
-    count) (default: all)."""
+    count) (default: all); planar passes as planned for plan_T tokens (default T)."""
     b0 = region.blocks[run[0]]
     rt0 = region.rt0[b0.name]
     kw: dict[str, object] = {"fmt": b0.fmt, "rows": b0.R, "M": T, "K": K, "N": N, "tile_bytes": region.tile_bytes,
                              "col_bytes": region.col_stride, "passes": len(out_cols[0]), "out_cols": out_cols,
                              "kc": region.kc, "kc_group": region.kc_group}
     if is_planar(b0.fmt, b0.R, region.kc):
-        plan = _plan(region, run, T, region.K, few)
+        plan = _plan(region, run, plan_T or T, region.K, few)
         blocks = tuple((rt0 + r, n) for r, n in plan.blocks)
         kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks)
         rt_end = max(r + plan.tiles * n for r, n in blocks)
@@ -216,12 +216,14 @@ def _part_seconds(plan: PhasePlan) -> float:
 
 
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[str, GemmQOperator] | None = None,
-               act: str = "silu", k_part: int = 0) -> PhasePlan:
+               act: str = "silu", k_part: int = 0, layout_T: int = 0) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
     projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
     reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu). ``k_part``: an output
     projection in K parts of that many chunks (dividing a chunk group: each part's A strip may stay in the memtile, and
-    each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add)."""
+    each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input
+    projection's layout (its planar passes) as planned for that many tokens (the layout of buffers that outlive a chunk,
+    e.g. qwen35's conv states in G's rows; default T)."""
     name, K, S, KC = region.name, region.K, region.tile_bytes, region.kc
     which = WHICH[name]
     if name == "gate_up":
@@ -287,17 +289,18 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
             op = _gemm(kw, T, which, ops)
             gemms.append(Gemm(op, region.offset + k0 * region.n_rt * S - op.hdr_skip, part=i, a_off=k0 * KC // 8 * 36))
         return PhasePlan(gemms, None, parts)
-    lay = _in_layout(region, T, pitch)
+    TL = layout_T or T
+    lay = _in_layout(region, TL, pitch)
     off = lay.off
     gemms = []
     for run in _runs(region):
         b0 = region.blocks[run[0]]
         col0s = [off[region.blocks[i].name] for i in run]
         if is_planar(b0.fmt, b0.R, KC):
-            oc = _plan(region, run, T, K, False).out_cols(col0s, [lay.pitch] * len(run))
+            oc = _plan(region, run, TL, K, False).out_cols(col0s, [lay.pitch] * len(run))
         else:
             oc = [[lay.pitch * c + o + 64 * p for i, o in zip(run, col0s)
                    for p in range(-(-region.blocks[i].tiles // _tp(region.blocks[i])))] for c in range(COLS)]
-        op = _gemm(_kw(region, run, T, K, lay.N, oc, few=False), T, which, ops)
+        op = _gemm(_kw(region, run, T, K, lay.N, oc, few=False, plan_T=TL), T, which, ops)
         gemms.append(Gemm(op, region.offset - op.hdr_skip))
     return PhasePlan(gemms, lay)

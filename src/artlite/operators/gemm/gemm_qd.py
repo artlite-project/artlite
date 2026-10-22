@@ -42,7 +42,7 @@ from ..design import COLS
 from ..formats import FORMATS, KC, slot
 from ..kernel_source import kernel_prefix
 from ..l1_layout import pin_l1_buffers
-from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, TILES, GemmQOperator, L1Error, planar
+from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, TILES, GemmQOperator, L1Error, pack_plan, planar
 from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
@@ -94,7 +94,8 @@ class GemmQdOperator(GemmQOperator):
         nm = self.nm
         return {"A": (2, m * 72), "D": (D_DEPTH, nm * KT * 9 // 8),
                 "C": (self.c_depth, m * self.n_out * 9 // 8 if self.c_bfp16 else m * self.n_c * 2),
-                "acc": ((2 if self.pingpong or self.halves == 2 else 1) if self.silu or self.c_pack else 0, m * nm * 2),
+                "acc": ((2 if self.pingpong or self.halves == 2 or self.slots == 2 else 1) if self.silu or self.c_pack
+                        else 0, m * nm * 2),
                 "sx": (1 if self.silu else 0, m * nm // self.sxp),
                 "lut": (1 if self.silu and self.act == "gelu" else 0, act_lut.GELU.table_buffer().nbytes)}
 
@@ -178,7 +179,7 @@ class GemmQdOperator(GemmQOperator):
         against aiecc's placement (alternating runs): 3B Q2_K down (Q3_K, m 64, n 128, crossed) 5.74 -> 5.15 ms (aiecc
         put A and D of one k-tile in one region: the MAC cores' memory stall 1.58 -> 0.62 ms), gate/up (g4) 7.41 -> 7.13,
         3B Q3_K_M gate/up 7.32 -> 6.99, 1B Q3_K_L 4.99 -> 4.78; 3B Q5_K (crossed) unchanged."""
-        two = self.halves == 2 or self.pingpong
+        two = self.halves == 2 or self.pingpong or self.slots == 2
         # (pingpong: both C tiles in every window, D alternating as A: g4's acc and D1 would meet)
         auto = ["g1"] if self.pingpong else ["g4", "g1"] if two else ["crossed", "separate"]
         for plan in auto:
@@ -233,7 +234,9 @@ class GemmQdOperator(GemmQOperator):
                                   mac_src=mac, c_pack=self.c_pack, n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
                                   TR=self.TR, pingpong=self.pingpong, planar=self.planar, hu=self.hdr_units,
                                   hp0=self._hdr_plane0, hs=self._hdr_slot_words, sxp=self.sxp, tq=TILES, pair=False,
-                                  us=self.us,
+                                  us=self.us, c_pairs=False, macf="", slots=self.slots,
+                                  pack_plan=pack_plan(self.nm, self.n_out, self.n_c, self.tiles, self.R)
+                                  if self.c_pack and self.slots == 2 else None,
                                   **slot(self.fmt).qd_template_vars(self))
 
     def get_mlir_artifact(self) -> Module:
@@ -266,7 +269,8 @@ class GemmQdOperator(GemmQOperator):
                                        B_l1_ty=B_l1_ty, ws_ty=ws_ty, hb_ty=hb_ty, D_ty=D_ty)
         k_mm = (Kernel(f"{p}_mm2", "kernel.o", [A_l1_ty, D_ty, acc_ty, acc_ty]) if self.pingpong else
                 Kernel(f"{p}_mm", "kernel.o", [A_l1_ty, D_ty, acc_ty]))
-        k_pack = Kernel(f"{p}_pack", "kernel.o", [acc_ty, C_l1_ty]) if self.c_pack else None
+        k_pack = (Kernel(f"{p}_pack2", "kernel.o", [acc_ty, acc_ty, C_l1_ty]) if self.slots == 2 else
+                  Kernel(f"{p}_pack", "kernel.o", [acc_ty, C_l1_ty])) if self.c_pack else None
 
         # B: shim -> memtile -> the column's dequantizing core (k-tile objects in dequant order)
         b_l3 = [ObjectFifo(B_l2_ty, name=f"gqB_{c}", depth=2, from_stream_per_cons=df.b_wdims)
@@ -344,6 +348,23 @@ class GemmQdOperator(GemmQOperator):
 
         def mac_fn(dfi, af, cf, zero, mm, *extra):
             act_arg = extra[-1] if gelu else 0  # (gelu: the table buffer; silu: the kernel's opaque runtime zero)
+            if self.G > 1:  # row groups: per pass vp C objects of ``slots`` slots, each over the whole A strip
+                for _ in range_(mc * passes):
+                    for _ in range_(self.vp):
+                        c = cf.acquire(1)
+                        for s_ in range(self.slots):
+                            acc = extra[1 + s_] if c_pack else c
+                            zero(acc)
+                            for _ in range_(self.KA // KT):
+                                d = dfi.acquire(1)
+                                a = af.acquire(1)
+                                mm(a, d, acc)
+                                af.release(1)
+                                dfi.release(1)
+                        if c_pack:
+                            extra[0](*extra[1:1 + self.slots], c)
+                        cf.release(1)
+                return
             if halves > 1:  # one A k-tile for both halves' D objects, a C tile each; their outputs as two C objects
                 accs = (extra[1], extra[3])
                 for _ in range_(mc * passes):
@@ -398,7 +419,7 @@ class GemmQdOperator(GemmQOperator):
             for row in range(MR):
                 extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}"), Buffer(sx_ty, name=f"gq_sx_{c}_{row}")]
                          if silu else [k_pack, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if c_pack else [])
-                if pingpong or halves > 1:
+                if pingpong or halves > 1 or self.slots == 2:
                     extra.append(Buffer(acc_ty, name=f"gq_accb_{c}_{row}"))
                 if gelu:
                     extra.append(Buffer(lut_ty, name=f"gq_lut_{c}_{row}", initial_value=act_lut.GELU.table_buffer()))

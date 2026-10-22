@@ -174,7 +174,10 @@ class ChunkPrefill:
     # ------------------------------------------------------------------
 
     def compile(self) -> ChunkPrefill:
+        """Build the library and load it (its configurations' control packets: seconds of host work for a model's
+        designs, e.g. in the thread that runs while the overlay's weights pack, not at the first chunk)."""
         parallel_compile.compile_all([self.lib])
+        self.lib.load()
         return self
 
     def fits(self, T: int, p0: int) -> bool:

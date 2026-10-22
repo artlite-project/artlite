@@ -300,6 +300,46 @@ void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float
         pw += 8;
     }
 }
+
+{% if lo %}
+// pass B with the lo panels: the chunk's 32 panels of v = g * w * (1 / rms) as bfp16(v) -> out, then 32 of
+// bfp16(v - bfp16(v)) -> out + 32 panels (x hi + lo: an MoE router's input). g w is exact in fp32 (bf16 x bf16) and
+// split into bf16 hi + lo; v = (hi + lo)(inv hi + inv lo) in fp32
+void {{ p }}_bl(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float *__restrict st,
+                bfloat16 *__restrict out, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *__restrict ih = (bfloat16 *)(st + 256);
+    bfloat16 *__restrict il = ih + 64;
+    if (kc == 0)
+        {{ p }}_inv(st);
+    const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
+    const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
+    const al::BV nI = al::neg_eye();
+    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> ol((bfp16ebs8 *)out + {{ C }});  // (C / 8 panels of 8 blocks)
+    const bfloat16 *__restrict pg = g + {{ C }} * kc;
+    const bfloat16 *__restrict pw = w + {{ C }} * kc;
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ C // 8 }}; kb++) {
+        aie::vector<bfloat16, 64> xp = aie::concat(
+            aie::concat(aie::load_v<8>(pg), aie::load_v<8>(pg + {{ E }})),
+            aie::concat(aie::load_v<8>(pg + {{ 2 * E }}), aie::load_v<8>(pg + {{ 3 * E }})),
+            aie::concat(aie::load_v<8>(pg + {{ 4 * E }}), aie::load_v<8>(pg + {{ 5 * E }})),
+            aie::concat(aie::load_v<8>(pg + {{ 6 * E }}), aie::load_v<8>(pg + {{ 7 * E }})));
+        const aie::accum<accfloat, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>());
+        const aie::vector<bfloat16, 64> wh = xw.template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> wl = aie::msc(xw, wh, one).template to_vector<bfloat16>();
+        al::BV h, l;
+        al::split_hilo(aie::mac(aie::mac(aie::mac(aie::mul(wh, vh), wh, vl), wl, vh), wl, vl), nI, h, l);
+        o.push(h);
+        ol.push(l);
+        pg += 8;
+        pw += 8;
+    }
+}
+{% endif %}
 {% endif %}
 
 }  // extern "C"
@@ -412,13 +452,15 @@ class PrefillNormOperator(ArtcOperator):
     p = kernel_prefix("pn")
 
     def __init__(self, *, T: int, add: bool = True, E: int = 2048, eps: float = 1e-5, d_pitch: int = 0,
-                 cols: int = COLS, deltas: int = 1, d_stride: int = 0):
+                 cols: int = COLS, deltas: int = 1, d_stride: int = 0, lo: bool = False):
         """cols: cores (one per column) taking the token groups in turn: few for short prompts, where the
         op's reconfiguration costs more than its work. deltas = 2 (replay mode): x += d + d2 (a projection in two
         K parts: summed in fp32, rounded once), both at d_pitch, d2 ``d_stride`` elements after d
-        in the delta argument (default T 8 d_pitch; e.g. the C size of a GEMM that pads the tokens)."""
+        in the delta argument (default T 8 d_pitch; e.g. the C size of a GEMM that pads the tokens). lo: xn as
+        hi + lo panels (an MoE router's x), panels of 2 E columns: per token group [bfp16(v) | bfp16(v - bfp16(v))]
+        (one delta, E <= 2048)."""
         assert T % (8 * cols) == 0 and T > 0 and E % 1024 == 0 and 1 <= cols <= COLS
-        self.T, self.add, self.E, self.eps, self.cols = T, add, E, eps, cols
+        self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
         assert self.d_pitch >= E // COLS and (add or not d_pitch)
         self.deltas = deltas if add else 0
@@ -433,6 +475,7 @@ class PrefillNormOperator(ArtcOperator):
         assert self.d_stride >= T * COLS * self.d_pitch and (self.deltas >= 2 or not d_stride)
         self.ch = min(CH, E // 8)  # (columns per chunk)
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
+        assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
         super().__init__()
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -445,14 +488,14 @@ class PrefillNormOperator(ArtcOperator):
         specs.append(ArgSpec("in", (EMB,), torch.bfloat16))
         if self.add:
             specs.append(ArgSpec("out", (n,), torch.bfloat16))
-        specs.append(ArgSpec("out", (n * 9 // 16,), torch.bfloat16))
+        specs.append(ArgSpec("out", ((2 if self.lo else 1) * n * 9 // 16,), torch.bfloat16))
         return specs
 
     def get_kernel_src(self) -> str:
         if self.hold:
             return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
         # (the same source for add and no add: one copy in a fused ELF)
-        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay)
+        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo)
 
     def get_mlir_artifact(self) -> Module:
         if self.hold:
@@ -466,14 +509,15 @@ class PrefillNormOperator(ArtcOperator):
         CH = self.ch
         chunk_ty = np.ndarray[(8 * CH,), bf]
         grp_ty = np.ndarray[(8 * EMB,), bf]
-        pan_ty = np.ndarray[(CH // 8 * 36,), bf]  # CH / 8 panels of 72 B
+        nl = 2 if self.lo else 1  # (lo: the chunk's hi panels, then its lo panels)
+        pan_ty = np.ndarray[(nl * CH // 8 * 36,), bf]  # CH / 8 panels of 72 B
         w_ty = np.ndarray[(EMB,), bf]
         st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
         E = EMB
         k_w = Kernel(f"{p}_w", "kernel.o", [chunk_ty, w_ty])
         k_a = (Kernel(f"{p}_a", "kernel.o", [chunk_ty, chunk_ty, grp_ty, st_ty, np.int32]) if add else
                Kernel(f"{p}_a0", "kernel.o", [chunk_ty, grp_ty, st_ty, np.int32]))
-        k_b = Kernel(f"{p}_b", "kernel.o", [grp_ty, w_ty, st_ty, pan_ty, np.int32])
+        k_b = Kernel(f"{p}_bl" if self.lo else f"{p}_b", "kernel.o", [grp_ty, w_ty, st_ty, pan_ty, np.int32])
 
         xf = [ObjectFifo(chunk_ty, name=f"pn_x{c}", depth=2) for c in range(self.cols)]
         df = [ObjectFifo(chunk_ty, name=f"pn_d{c}", depth=2) for c in range(self.cols)] if add else []
@@ -545,6 +589,12 @@ class PrefillNormOperator(ArtcOperator):
                     dh[c].fill(d, dgrp(c), group=tg)
                     oh[c].drain(xo, TensorAccessPattern((n,), 8 * E * c, [1, n_g, 8 * E // 1024, 1024],
                                                         [0, 8 * self.cols * E, 1024, 1]), group=tg, wait=True)
+                if self.lo:  # (a group's chunks [hi | lo] -> [hi panels | lo panels]: rows of 2 E)
+                    ph[c].drain(xn, TensorAccessPattern((2 * n * 9 // 16,), c * (E // 4) * 36,
+                                                        [n_g, 8, 2, E // 64 * 36],
+                                                        [self.cols * (E // 4) * 36, E // 64 * 36, E // 8 * 36, 1]),
+                                group=tg, wait=True)
+                    continue
                 ph[c].drain(xn, TensorAccessPattern((n * 9 // 16,), c * (E // 8) * 36,
                                                     [1, n_g, 8, E // 64 * 36], [0, self.cols * (E // 8) * 36, E // 64 * 36, 1]),
                             group=tg, wait=True)
@@ -552,7 +602,7 @@ class PrefillNormOperator(ArtcOperator):
 
         vt = np.ndarray[(n,), bf]
         types = [vt] + ([np.ndarray[(nd,), bf]] if add else []) + [np.ndarray[(E,), bf]] + ([vt] if add else [])
-        types.append(np.ndarray[(n * 9 // 16,), bf])
+        types.append(np.ndarray[((2 if self.lo else 1) * n * 9 // 16,), bf])
         rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 

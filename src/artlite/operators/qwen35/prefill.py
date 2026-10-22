@@ -38,6 +38,7 @@ last three); the padding tokens after the valid ones leave the GDN states alone 
 tokens overwrite.
 """
 
+import functools
 import math
 from types import SimpleNamespace
 
@@ -45,6 +46,7 @@ import numpy as np
 import torch
 
 from ..design import COLS
+from ..moe.prefill import MoEPrefill
 from ..prefill import gemm as PG
 from ..prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
 from ..prefill.norm import PrefillNormOperator
@@ -69,6 +71,8 @@ WEIGHT_S, GEMM_S, NORM_S, GDN_S, PREP_S, CFG_S = 28.4e-12, 0.056e-3, 43e-9, 21.7
 # a SMALL size's operators: S + SMALL_S (1 - S) of a sub-chunk's terms (the weights stream whatever the tokens; T = 64
 # / 128 within ~9%)
 SMALL_S = 0.42
+# an MoE layer's experts (``moe.prefill.MoEPrefill.layer_seconds``): per byte of their weights, of their rows
+MOE_WEIGHT_S, MOE_ROW_S = 1 / 38e9, 1 / 38e9
 # the flash attention per cached position and sub-chunk: the larger of its cache bytes at ATTN_BW (each pass streams
 # the history, K and V of every KV head) and the cores' cycles per 32-key group and row panel (two streams / one)
 ATTN_BW, ATTN_CYC_TWO, ATTN_CYC_ONE, CORE_HZ = 58e9, 1020, 1500, 1.81e9
@@ -94,6 +98,10 @@ class QwenPrefill(ChunkPrefill):
         self.pitch = {name: PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att))
                       if ls}
         self.d_pitch = PG.d_pitch(img, SUB)
+        # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the shared expert's item, the experts'))
+        self.moe = MoEPrefill(img, layers=self.layers, sizes=self.sizes, sub=SUB, eps=cfg.rms_norm_eps) \
+            if cfg.moe else None
+        self._moe_marks: dict[int, list[tuple[int, int, int]]] = {}
         self._gemms: dict[str, object] = {}  # (one object per distinct GEMM)
         self._k_parts: dict[tuple, int] = {}  # (per region shape and size: output projections in resident K parts)
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
@@ -120,7 +128,8 @@ class QwenPrefill(ChunkPrefill):
 
     def _size_ops(self, t: int) -> SimpleNamespace:
         """The operators of sub-chunks of t tokens: the GEMM plans (the input projections at SUB's pitch, so G's layout
-        and the conv states' rows in it are every size's; the output projections at t's own), the norms."""
+        and the conv states' rows in it are every size's: gdn_in's planar passes SUB's where t's would widen the pitch
+        or move the qkv block; the output projections at t's own), the norms."""
         cfg, img, H = self.cfg, self.img, self.H
         dpt = PG.d_pitch(img, t)
 
@@ -130,7 +139,13 @@ class QwenPrefill(ChunkPrefill):
             key = (name, region.K, region.kc_group, tuple(b.fmt for b in region.blocks), t)
             if key not in self._k_parts:
                 self._k_parts[key] = PG.resident_k_part(img, region, t, pitch=pitch)
-            return PG.plan_phase(img, region, t, pitch=pitch, ops=self._gemms, k_part=self._k_parts[key])
+            plan = PG.plan_phase(img, region, t, pitch=pitch, ops=self._gemms, k_part=self._k_parts[key])
+            if name == "gdn_in" and t != SUB:  # (the conv states' rows in G: SUB's pitch and qkv block)
+                sub = PG.plan_phase(img, region, SUB, pitch=pitch).layout
+                if (plan.layout.pitch, plan.layout.off["qkv"]) != (sub.pitch, sub.off["qkv"]):
+                    plan = PG.plan_phase(img, region, t, pitch=pitch, ops=self._gemms, k_part=self._k_parts[key],
+                                         layout_T=SUB)
+            return plan
 
         plans = {(L, name): plan(L, name) for L in self.layers for name in self._phases(L)}
         eps = cfg.rms_norm_eps
@@ -143,11 +158,14 @@ class QwenPrefill(ChunkPrefill):
             plans=plans, d_pitch=dpt, f_part=f_part, rb_y=2 * COLS * dpt,
             pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps),
             pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp),
+            pnm=PrefillNormOperator(T=t, E=H, eps=eps) if dp else None,  # (an MoE layer's delta: rows of H)
             pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2)
                  for P in sorted({p.parts for p in plans.values() if p.parts > 1})})
 
     def _phases(self, L: int) -> tuple[str, ...]:
-        return (("attn_in", "attn_out") if self.cfg.attention[L] else ("gdn_in", "gdn_out")) + ("gate_up", "down")
+        """(an MoE layer's FFN: ``moe``)"""
+        mixer = ("attn_in", "attn_out") if self.cfg.attention[L] else ("gdn_in", "gdn_out")
+        return mixer if self.cfg.moe else mixer + ("gate_up", "down")
 
     def _op(self, cls: type, lay: PG.Layout | None = None, **kw: object) -> object:
         """One operator object per class, layout and arguments (the layers share them: one design each in an ELF)."""
@@ -171,9 +189,11 @@ class QwenPrefill(ChunkPrefill):
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
         cfg, H = self.cfg, self.H
-        kd = self.img.region(self.layers[0], "down").K  # (down's K: the ffn padded to whole K chunks)
-        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "Y": 2 * COLS * self.d_pitch, "HP": 9 * kd // 8,
-                   "F": 2 * COLS * self.d_pitch, "PM": 4}
+        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "Y": 2 * COLS * self.d_pitch, "F": 2 * COLS * self.d_pitch, "PM": 4}
+        if self.moe:
+            self.rb |= self.moe.rows()
+        else:  # (down's K: the ffn padded to whole K chunks)
+            self.rb["HP"] = 9 * self.img.region(self.layers[0], "down").K // 8
         self.rb_g = {k: 2 * COLS * p for k, p in self.pitch.items()}  # (gdn_in / attn_in rows)
         self.rb_a = {"gdn_in": 9 * cfg.ssm_v_heads * GD.D // 8, "attn_in": 9 * cfg.num_attention_heads * AP.HD // 8}
         self.rb_o = 2 * cfg.ssm_v_heads * GD.D
@@ -207,6 +227,7 @@ class QwenPrefill(ChunkPrefill):
         rl: list[tuple] = [(o.pn0, tok("PX", j, o.pn0, i=0), self._norm(self.layers[0], "attn_norm"),
                             tok("PXN", j, o.pn0, i=2)) for j in range(S)]
         starts = []
+        marks = []
         for L in self.layers:
             starts.append(len(rl))
             kind = self._phases(L)[0]
@@ -241,6 +262,22 @@ class QwenPrefill(ChunkPrefill):
                         sl("G", 0, gout, i=2), pp, gh, tok("A", j, gout, i=5, row=a_rb)) for j in range(S)]
             out, fp = o.plans[(L, self._phases(L)[1])], o.f_part
             pan = self._norm(L, "post_attention_norm")
+            if self.moe:  # (the out projection, the norm with lo panels, the MoE block, the residual norm)
+                assert out.parts == 1, "an MoE layer's out projection in one part"
+                (g,) = out.gemms
+                ln = self.moe.ln[t]
+                rl += [(g.op, tok("A", j, g.op, i=0, row=a_rb), self._w(g), tok("Y", j, g.op, i=2, row=ry))
+                       for j in range(S)]
+                rl += [(ln, tok("PX", j, ln, i=0), tok("Y", j, ln, i=1, row=ry), pan, tok("PX", j, ln, i=3),
+                        tok("PXM", j, ln, i=4)) for j in range(S)]
+                items, i_s, i_e = self.moe.items(L, T, tok=lambda b, j, op, i, row: tok(b, j, op, i=i, row=row),
+                                                 sl=lambda b, off, op, i: sl(b, off, op, i=i), w=self._w, norm=pan)
+                marks.append((L, len(rl) + i_s, len(rl) + i_e))
+                rl += items
+                pm = o.pnm or o.pn
+                rl += [(pm, tok("PX", j, pm, i=0), tok("DL", j, pm, i=1), self._next_norm(L), tok("PX", j, pm, i=3),
+                        tok("PXN", j, pm, i=4)) for j in range(S)]
+                continue
             if out.parts == 1:
                 (g,) = out.gemms
                 rl += [(g.op, tok("A", j, g.op, i=0, row=a_rb), self._w(g), tok("Y", j, g.op, i=2, row=ry))
@@ -269,6 +306,7 @@ class QwenPrefill(ChunkPrefill):
                 rl += [(pn, tok("PX", j, pn, i=0), sl("F", P * j * fp, pn, i=1), nxt, tok("PX", j, pn, i=3),
                         tok("PXN", j, pn, i=4)) for j in range(S)]
         self._starts[T] = [*starts, len(rl)]
+        self._moe_marks[T] = marks
         return rl
 
     # ------------------------------------------------------------------
@@ -375,7 +413,14 @@ class QwenPrefill(ChunkPrefill):
             dev.flush("PM", 0, 4 * T)
             self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
             self._conv_states()
-        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None))
+        hooks = {i_e: functools.partial(self.moe.host_step, L, n=n, T=T, dev=dev, lib=self.lib)
+                 for L, _, i_e in self._moe_marks[T]} if self.moe else None
+        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks)
+
+    def _splits(self, T: int, p0: int) -> list[int]:
+        """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""
+        out = super()._splits(T, p0)
+        return sorted({*out, *(i for _, i_s, i_e in self._moe_marks.get(T, ()) for i in (i_s, i_e))})
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32)."""
@@ -405,19 +450,20 @@ class QwenPrefill(ChunkPrefill):
         cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
         wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
+        if self.moe:  # (the router's, the shared expert's)
+            gemms += [None] * 3
+            wbytes += sum(self.img.region(L, name).nbytes for name in ("moe_in", "sdown"))
         Ss = S if S >= 1 else S + SMALL_S * (1 - S)
         s = Ss * (WEIGHT_S * wbytes + GEMM_S * len(gemms) + 2 * NORM_S * self.H)
         if cfg.attention[L]:
             s += Ss * PREP_S * cfg.num_attention_heads + self.attention_seconds(p0, S)
         else:
             s += Ss * GDN_S * cfg.ssm_v_heads
+        if self.moe:
+            s += self.moe.layer_seconds(L, round(S * SUB), weight_s=MOE_WEIGHT_S, row_s=MOE_ROW_S)
         return s + CFG_S * self.layer_configs(L)
 
     def layer_configs(self, L: int) -> int:
-        """(its GEMM objects, the GDN or attention ops, the norms)"""
+        """(its GEMM objects, the GDN or attention ops, the norms; an MoE layer's block: 7)"""
         gemms = {id(g.op) for name in self._phases(L) for g in self.plans[(L, name)].gemms}
-        return len(gemms) + (2 if self.cfg.attention[L] else 3) + 2
-
-    def layer_entries(self, L: int, S: int) -> int:
-        gemms = sum(len(self.plans[(L, name)].gemms) for name in self._phases(L))
-        return S * (gemms + 2) + (S + 1 if self.cfg.attention[L] else 2 * S + 1)
+        return len(gemms) + (2 if self.cfg.attention[L] else 3) + 2 + (7 if self.moe else 0)

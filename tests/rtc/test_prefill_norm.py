@@ -48,6 +48,38 @@ def test_prefill_norm(T: int, add: bool, E: int, d_pitch: int, cols: int):
         assert torch.equal(xb.to_torch().view(T, E), (x.float() + d.float()).bfloat16())
 
 
+@pytest.mark.parametrize(("T", "d_pitch"), [(64, 0), (256, 264)], ids=["T64", "T256-dp264"])
+def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
+    """xn as hi + lo panels (``lo``: an MoE router's x, Qwen3.6-35B-A3B's hidden 2048): per token group [hi | lo]
+    panels; hi + lo within 4e-5 of x / rms(x) w in fp64 (x the bf16 sum; 2.6e-5: lo's rounding, ~2^-16 of each block's
+    maximum; the per-token scale 1 / rms 2.4e-6), hi the single panels' rounding."""
+    E = 2048
+    g = torch.Generator().manual_seed(T)
+    x = (torch.randn(T, E, generator=g) * 2).bfloat16()
+    d = torch.randn(T, E, generator=g).bfloat16()
+    w = (torch.rand(E, generator=g) + 0.5).bfloat16()
+    op = PrefillNormOperator(T=T, E=E, d_pitch=d_pitch, lo=True).compile()
+    dev = op.device
+    xb, wb = artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(w.clone(), dev)
+    xnb = artlite.empty((2 * T * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
+    dp = d_pitch or E // 8
+    dpad = torch.full((T, 8, dp), 1e30).bfloat16()
+    dpad[:, :, :E // 8] = d.view(T, 8, E // 8)
+    op.dispatch(xb, artlite.from_torch(dpad.flatten(), dev), wb, xb, xnb)
+    xnb.sync_from_device()
+    xs = (x.float() + d.float()).bfloat16().double()
+    ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.double()
+    both = _from_panels(xnb.to_torch(), T, 2 * E).double()  # (per token [hi | lo])
+    hi, lo = both[:, :E], both[:, E:]
+    assert ((hi - ref).norm() / ref.norm()).item() < 1e-2
+    rel = ((hi + lo - ref).norm() / ref.norm()).item()
+    scale = ((hi + lo) * ref).sum(1) / (ref * ref).sum(1) - 1  # (per token)
+    print(f"hi + lo rel-rms {rel:.2e}; per-token scale rms {scale.pow(2).mean().sqrt():.2e}")
+    assert rel < 4e-5, rel
+    xb.sync_from_device()
+    assert torch.equal(xb.to_torch().view(T, E), xs.float().bfloat16())
+
+
 # (T, E, d_pitch, cols, rows, deltas): Llama's and qwen35's projections in K parts
 DELTAS = [(64, 5120, 660, 4, 96, 2), (256, 4096, 528, 8, 256, 2), (64, 4096, 0, 2, 64, 2),
           (1024, 3072, 396, 8, 1024, 2), (2048, 4096, 528, 8, 2048, 2), (512, 2048, 264, 8, 512, 2),

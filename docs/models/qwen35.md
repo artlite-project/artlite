@@ -55,7 +55,11 @@ on every column, then each column's cores pick every token's top 8 themselves an
 the experts they take (control packets the column writes and its shim reads back); each column computes whole experts
 or halves of them, and the next phase adds the columns' results into the residual stream (`moe/route.py`,
 `overlay/decode.py`). A step streams 1.96 GB of the image at one token (8 of the 256 experts in every layer).
-Its prompts run as decode steps (about 45 tokens/s): the chunked prefill does not run MoE layers.
+A prompt's chunk routes its tokens on the host: each MoE layer's dispatch ends after the router, the host reads the
+logits back, picks every token's top 8 and writes each column's work list (chunks of up to 192 pairs of one expert,
+dealt to the columns in turn) as control packets while the shared expert runs; the columns then gather their chunks'
+rows, run the experts' gate / up and down on them, and the combine adds the routed and shared experts' outputs
+(`moe/prefill.py`).
 
 ## Images (MiniCPM-V 4.7)
 
