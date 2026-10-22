@@ -22,8 +22,8 @@ Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF'
 | processor | AMD Ryzen AI Max+ 395: 16 Zen 5 cores, Radeon 8060S iGPU, XDNA 2 NPU |
 | memory | 128 GB LPDDR5X-8000, 256-bit (256 GB/s) |
 | OS | Gentoo Linux, kernel 7.2.9 |
-| NPU driver and firmware | `amdxdna` from AMD's xdna-driver (2.21.70-790-g49fe4e13), NPU firmware 1.1.2.65 |
-| power | ACPI platform profile `performance`; NPU power mode: the driver's default for Artlite (it sets none), `turbo` for FastFlowLM and OpenFlowLM |
+| NPU driver and firmware | `amdxdna` from AMD's xdna-driver (2.21.70-790-g49fe4e13), NPU firmware 1.1.2.65 (xdna-driver's build, `npu.dev.sbin`; linux-firmware's `npu_7.sbin` 1.1.2.65 measures the same) |
+| power | ACPI platform profile `performance` in both of its handlers (amd-pmf and asus-wmi: `/sys/class/platform-profile/*/profile`; `/sys/firmware/acpi/platform_profile` reads `custom` when they differ); NPU power mode: the driver's default for Artlite (it sets none), `turbo` for FastFlowLM and OpenFlowLM |
 
 One NPU job at a time, with no other heavy CPU load.
 

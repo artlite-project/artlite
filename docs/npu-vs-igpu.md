@@ -7,10 +7,13 @@ power mode `default`.
 
 ## Memory bandwidth
 
-All of the NPU's DRAM traffic goes through one 32-byte-per-cycle port to the SoC's Infinity Fabric, clocked by the AI
-Engine array: ~57 GB/s at 1.81 GHz, for reads and for writes alike. One shim DMA channel streams 13.8 GB/s, one shim
-column 27 GB/s, and four channels fill the port: no kernel, data layout or DMA setting gets past it. Its rate follows
-the array clock, so the NPU's power modes scale it (`balanced`: ~38 GB/s, `powersaver`: ~23 GB/s).
+On Strix Halo all of the NPU's DRAM traffic goes through one 32-byte-per-cycle port to the SoC's Infinity Fabric,
+clocked by the AI Engine array: ~57 GB/s at 1.81 GHz, for reads and for writes alike. One shim DMA channel streams
+13.8 GB/s, one shim column 27 GB/s, and four channels fill the port: no kernel, data layout or DMA setting gets past
+it. Its rate follows the array clock, so the NPU's power modes scale it (`balanced`: ~38 GB/s, `powersaver`: ~23
+GB/s). A Krackan Point laptop's NPU, the same 8-column array, decodes faster than this ceiling allows (Qwen3.8 27B: 4.2
+tokens/s, at least 67 GB/s): there the ceiling is higher, for a reason not known yet. `artlite-probe` measures a
+machine's clock and rates.
 
 | DRAM reads, GB/s | alone | NPU + iGPU together |
 |---|---|---|
@@ -40,9 +43,10 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
   decoding) and fewer bytes per token (MoE, lower-bit weights).
 - **Prefill** is compute-bound and on par, at a fraction of the iGPU's power.
 - **Both decoding at once** reach ~204 GB/s in total, 7% above the iGPU alone: they compete for the bus.
-- **Smaller platforms.** Strix Point and Krackan Point have a 128-bit bus (~120 GB/s peak) while the NPU keeps its own
-  limit: the iGPU's decode lead should shrink to about 1.8x (not measured). Under a laptop's power cap or on
-  battery, the iGPU cannot hold its clocks.
+- **Smaller platforms.** Strix Point and Krackan Point have a 128-bit bus (~120 GB/s peak). On a Krackan Point laptop
+  (Ryzen AI 7 350, LPDDR5-7500, Radeon 860M) llama.cpp's Vulkan decode leads Artlite's by 1.44x (Llama 3.2 1B
+  Q4_K_M: 113.5 vs 78.7 tokens/s), 1.25x (Gemma 4 E4B Q4_0: 29.3 vs 23.4) and 1.36x (Qwen3.8 27B Q4_K_M: 5.77 vs
+  4.24), plugged in and on battery alike: that laptop's iGPU holds its clocks on battery.
 
 ## Candidates to explore
 
@@ -58,5 +62,5 @@ than speed. Not tried yet, ranked by expected value per effort:
 | 5 | Diffusion LLMs (parallel block decoding) | a block of tokens per weight pass turns decode into prefill |
 | 6 | Batched decode, parallel sampling | the NPU's spare compute in decode |
 | 7 | Extremely compressed models (1-bit, ternary) | few bytes per token; the iGPU may become bound by unpacking them |
-| 8 | Power-capped and smaller platforms | the iGPU throttles under a cap; a 128-bit bus narrows its lead |
+| 8 | Power-capped and smaller platforms | a 128-bit bus narrows the iGPU's decode lead to 1.25-1.44x (Krackan Point) |
 | 9 | An always-on second model beside the iGPU's | the GPU stays free; the two share only DRAM |

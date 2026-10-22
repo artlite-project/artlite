@@ -35,11 +35,11 @@ device rather than for portability.
 > [!NOTE]
 > Artlite is mostly research into how far this hardware can be pushed, and where the NPU is the right device for the
 > work. The CPU, the iGPU and the NPU share one power budget and one LPDDR5X bus. The iGPU reads that bus at its full
-> width, but it throttles under a power cap and on battery; the NPU computes at about 8 W.
+> width; the NPU computes at about 8 W.
 >
-> The NPU's limit is memory bandwidth. All its DRAM traffic goes through one 32-byte-per-cycle port clocked by the AI
-> Engine array: ~57 GB/s on Strix Halo, where the iGPU reads ~244 GB/s of the 256 GB/s bus. Decode, which reads every
-> weight once per token, is therefore ~3.6x faster on the iGPU, with Artlite's decode already close to the NPU's limit.
+> The NPU's limit is memory bandwidth: ~57 GB/s on Strix Halo, where the iGPU reads ~244 GB/s of the 256 GB/s bus.
+> Decode, which reads every weight once per token, is therefore ~3.6x faster on the iGPU there, with Artlite's decode
+> already close to the NPU's limit; on a Krackan Point laptop with a 128-bit bus the iGPU's lead is 1.25-1.44x.
 > Compute-bound work such as prefill runs on par with the iGPU, at a fraction of its power, and leaves the iGPU free.
 > Which workloads belong on the NPU is not fully explored yet: [Where the NPU fits](docs/npu-vs-igpu.md) has the
 > measurements and the candidates.
