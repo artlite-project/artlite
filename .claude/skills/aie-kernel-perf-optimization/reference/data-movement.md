@@ -29,7 +29,9 @@ by kernel II.
 On Strix Halo all shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (31.7 B
 measured at 800, 1267 and 1810 MHz): not the fabric or memory clocks, not IOMMU translation (4 KB vs 2 MB pages: the
 same rate), not latency. Gathers of rows ≥ 1 KB, or at a stride off 4 KB multiples by 64-256 B, run at the port rate.
-No setting raises it; the SMU's `average_ipu_reads` (amdgpu `gpu_metrics`, MB/s) reads it directly. The port is
+No setting raises it: `ME_AXIMM_CONFIG.MASTER_SEL` (0x1E020) picks AXI-MM or streaming for the shim's one NMU, not
+a second master (AM025), and AM029's `NMU_Switches_Config` belongs to another array-interface layout (its shim BDs
+at 0x9000, NPU2's at 0x1D000). The SMU's `average_ipu_reads` (amdgpu `gpu_metrics`, MB/s) reads the rate directly. The port is
 Halo's, not the array's: Krackan Point's NPU, at the same 1.81 GHz, reads 54 B per cycle (AMD's Strix Point slide
 says "NPU Datapath - 32B/cycle", with no clock). A column's DRAM share is thus ~3.9 B per array cycle on Halo, ~6.8
 on Krackan; GemmQd's cost model (`gemm_qd.k_tile_cycles`) assumes Halo's.
