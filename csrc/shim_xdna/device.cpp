@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <fstream>
@@ -54,9 +55,14 @@ std::string ioctl_cmd2name(unsigned long cmd) {
 }
 
 // The device heap: heap BOs of 64 MB (each within one 64 MB page of the NPU's addresses) up to
-// the driver's maximum.
+// the driver's maximum. The driver places DEV BOs at 32 KB (dev_mem_buf_shift 15) and takes 4
+// command buffers of 4 KB per hardware context from the heap (aie2_ctx.c, HWCTX_MAX_CMDS).
 constexpr size_t heap_bo_size = size_t(64) << 20;
 constexpr size_t heap_max_size = size_t(512) << 20;
+constexpr size_t dev_bo_align = size_t(32) << 10;
+constexpr size_t context_heap_bytes = 4 * dev_bo_align;
+
+size_t dev_bo_bytes(size_t size) { return (size + dev_bo_align - 1) & ~(dev_bo_align - 1); }
 }  // namespace
 
 namespace shim_xdna {
@@ -108,19 +114,73 @@ void pdev::add_heap_bo() const {
   m_heap_bos.push_back(std::make_unique<bo>(*this, heap_bo_size, heap_memory{m_heap_cpu + n * heap_bo_size}));
 }
 
+bool pdev::try_add_heap_bo() const {
+  if ((m_heap_bos.size() + 1) * heap_bo_size > heap_max_size) return false;
+  try {
+    add_heap_bo();
+    return true;
+  } catch (const std::system_error& e) {
+    // EBUSY: one heap BO per process (Linux before 7.2); EOPNOTSUPP: a device without heap expansion
+    if (e.code().value() != EBUSY && e.code().value() != EOPNOTSUPP) throw;
+    m_heap_fixed = true;
+    return false;
+  }
+}
+
 void pdev::create_dev_bo(amdxdna_drm_create_bo& cbo) const {
-  std::lock_guard guard(m_heap_lock);
-  // EAGAIN: the driver placed the BO past the heap BOs
+  std::unique_lock guard(m_heap_lock);
+  bool reclaimed = false;
+  // EAGAIN: the driver placed the BO past the heap BOs; ENOSPC below the maximum: a driver that
+  // never places one there (one heap BO: Linux before 7.2)
   while (::ioctl(m_dev_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo) == -1) {
     int err = errno;
-    if (err != EAGAIN) shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed");
-    try {
-      add_heap_bo();
-    } catch (const std::exception& e) {
-      shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed (a DEV BO of {} bytes; the device heap of {} MB is full: {})",
-               cbo.size, m_heap_bos.size() * (heap_bo_size >> 20), e.what());
+    if (err == EAGAIN && try_add_heap_bo()) continue;
+    if (err != EAGAIN && err != ENOSPC) shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed");
+    size_t heap = m_heap_bos.size() * heap_bo_size;
+    if (err == ENOSPC && heap < heap_max_size) m_heap_fixed = true;
+    if (m_heap_fixed && !reclaimed && heap_reclaim) {  // (its BOs' release takes the lock)
+      reclaimed = true;
+      guard.unlock();
+      bool freed = heap_reclaim();
+      guard.lock();
+      if (freed) continue;
     }
+    if (m_heap_fixed)
+      shim_err(ENOSPC,
+               "a DEV BO of {:.1f} MB does not fit the NPU's device heap ({:.1f} of {} MB in use): this NPU driver "
+               "gives a process one device heap of {} MB (Linux before 7.2); Linux 7.2+ or AMD's xdna-driver grow it "
+               "to {} MB",
+               cbo.size / 1048576.0, m_heap_used / 1048576.0, heap >> 20, heap_bo_size >> 20, heap_max_size >> 20);
+    shim_err(ENOSPC, "a DEV BO of {:.1f} MB does not fit the NPU's device heap ({:.1f} of {} MB in use: the maximum)",
+             cbo.size / 1048576.0, m_heap_used / 1048576.0, heap >> 20);
   }
+  m_heap_used += dev_bo_bytes(cbo.size);
+}
+
+void pdev::dev_bo_released(size_t size) const {
+  std::lock_guard guard(m_heap_lock);
+  m_heap_used -= std::min(m_heap_used, dev_bo_bytes(size));
+}
+
+void pdev::context_heap(int delta) const {
+  std::lock_guard guard(m_heap_lock);
+  m_heap_used = delta > 0 ? m_heap_used + context_heap_bytes : m_heap_used - std::min(m_heap_used, context_heap_bytes);
+}
+
+size_t pdev::heap_free() const {
+  std::lock_guard guard(m_heap_lock);
+  size_t heap = m_heap_bos.size() * heap_bo_size;
+  return heap - std::min(heap, m_heap_used);
+}
+
+bool pdev::heap_fixed() const {
+  std::lock_guard guard(m_heap_lock);
+  return m_heap_fixed;
+}
+
+bool pdev::grow_heap() const {
+  std::lock_guard guard(m_heap_lock);
+  return !m_heap_fixed && try_add_heap_bo();
 }
 
 void* pdev::dev_bo_address(uint64_t xdna_addr) const { return m_heap_cpu + (xdna_addr - m_heap_xdna_addr); }

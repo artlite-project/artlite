@@ -100,6 +100,7 @@ void bo::release() noexcept {
     drm_gem_close close_bo = {m_handle, 0};
     m_pdev.try_ioctl(DRM_IOCTL_GEM_CLOSE, &close_bo);
     m_handle = AMDXDNA_INVALID_BO_HANDLE;
+    if (m_type == AMDXDNA_BO_DEV) m_pdev.dev_bo_released(m_aligned_size);
   }
 }
 

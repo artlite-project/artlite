@@ -39,6 +39,7 @@ Kernel = _native.Kernel
 Error = _native.Error
 ExecutableError = _native.ExecutableError
 DispatchError = _native.DispatchError
+HeapFullError = _native.HeapFullError
 Device = _native.Device
 
 

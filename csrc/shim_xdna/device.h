@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,13 +31,17 @@ struct pdev {
   int m_dev_fd = -1;
   // The device heap (DEV BOs are ranges of it): heap BOs of 64 MB mapped one after the other into
   // a reservation of the driver's maximum, as the driver wants the heap contiguous in the NPU's and
-  // the CPU's addresses. It grows when a DEV BO does not fit (a driver without heap expansion
-  // refuses a second heap BO).
+  // the CPU's addresses. It grows when a DEV BO does not fit, unless the driver refuses a second
+  // heap BO (Linux before 7.2: one 64 MB heap per process; m_heap_fixed).
   void* m_heap_range = nullptr;  // the reservation, m_heap_range_size bytes
   size_t m_heap_range_size = 0;
   char* m_heap_cpu = nullptr;  // the heap's CPU address (64 MB aligned in the reservation)
   uint64_t m_heap_xdna_addr = AMDXDNA_INVALID_ADDR;  // and its device address
   mutable std::vector<std::unique_ptr<bo>> m_heap_bos;  // (m_heap_lock)
+  // The heap the process uses as the driver spends it: each DEV BO rounded up to 32 KB, 128 KB per
+  // hardware context (its 4 command buffers); and whether the driver refused a heap BO.
+  mutable size_t m_heap_used = 0;  // (m_heap_lock)
+  mutable bool m_heap_fixed = false;  // (m_heap_lock)
   mutable std::mutex m_heap_lock;
 
   explicit pdev(uint32_t device_index = 0);
@@ -52,14 +57,31 @@ struct pdev {
   // For destructors: returns 0 or the errno.
   int try_ioctl(unsigned long cmd, void* arg) const noexcept;
   void* mmap(void* addr, size_t len, int prot, int flags, off_t offset) const;
-  // CREATE_BO of a DEV BO, adding heap BOs while it does not fit.
+  // CREATE_BO of a DEV BO, adding heap BOs while it does not fit; a full heap throws ENOSPC.
   void create_dev_bo(amdxdna_drm_create_bo& cbo) const;
+  // The heap's accounting: a DEV BO of `size` bytes released; a hardware context created (+1) or
+  // destroyed (-1).
+  void dev_bo_released(size_t size) const;
+  void context_heap(int delta) const;
+  // Bytes of the heap BOs the process does not use yet (m_heap_used).
+  size_t heap_free() const;
+  // The driver refused a heap BO: the heap cannot grow.
+  bool heap_fixed() const;
+  // Adds a heap BO; false where the driver cannot grow the heap (then heap_fixed) or at its maximum.
+  bool grow_heap() const;
+  // Called, without the heap's lock, when a DEV BO does not fit a heap that cannot grow: frees DEV BOs the process
+  // can spare (true: the BO is tried once more). One for the process (set_heap_reclaim).
+  inline static std::function<bool()> heap_reclaim;
   // The CPU address of a DEV BO at device address xdna_addr.
   void* dev_bo_address(uint64_t xdna_addr) const;
 
  private:
   void add_heap_bo() const;
+  // add_heap_bo (m_heap_lock held); false where the driver refuses one (m_heap_fixed set) or at the maximum.
+  bool try_add_heap_bo() const;
 };
+
+inline void set_heap_reclaim(std::function<bool()> f) { pdev::heap_reclaim = std::move(f); }
 
 // NPU clocks in MHz (the driver's PMF reading, else the nominal value of the DPM level).
 struct clocks {
@@ -89,6 +111,10 @@ struct device {
   // mailbox send to response, summed over the commands; 0 from a driver without the fdinfo line
   // (Linux's own driver). Reads a /proc file: keep it out of timed regions.
   uint64_t busy_ns() const;
+  // The process's device heap (pdev): bytes not in use yet, whether it cannot grow, add a heap BO.
+  size_t heap_free() const { return m_pdev->heap_free(); }
+  bool heap_fixed() const { return m_pdev->heap_fixed(); }
+  bool grow_heap() const { return m_pdev->grow_heap(); }
   // The most recent asynchronous AIE error the firmware reported (device-wide), if any. Uses
   // the management mailbox: only after a clean failure, never while a job may be hung.
   std::optional<amdxdna_async_error> last_async_error() const;

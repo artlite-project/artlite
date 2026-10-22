@@ -93,6 +93,7 @@ void hw_ctx::destroy() noexcept {
     amdxdna_drm_destroy_hwctx arg = {.handle = m_handle};
     p.try_ioctl(DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &arg);
     m_handle = AMDXDNA_INVALID_CTX_HANDLE;
+    p.context_heap(-1);
   }
   if (m_syncobj != AMDXDNA_INVALID_FENCE_HANDLE) {
     drm_syncobj_destroy dsobj = {.handle = m_syncobj};
@@ -117,6 +118,7 @@ void hw_ctx::create_ctx_on_device() {
   arg.log_buf_bo = AMDXDNA_INVALID_BO_HANDLE;
   m_device.get_pdev().ioctl(DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &arg);
   m_handle = arg.handle;
+  m_device.get_pdev().context_heap(1);
   m_syncobj = arg.syncobj_handle;
   if (m_syncobj == AMDXDNA_INVALID_FENCE_HANDLE) {
     destroy();

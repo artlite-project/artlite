@@ -29,8 +29,8 @@ from ... import txn
 from . import ctrlpkt
 from .elf import ShimBd
 
-# Bytes of a program's piece (a dispatch: ``Library.run``): two instruction BOs of this size share the process's device
-# heap with the library's PDIs (one 64 MB heap BO before Linux 7.2)
+# Bytes of a program's piece (a dispatch: ``Library.run``) at most: the process's two piece BOs share its device heap
+# with the PDIs (smaller on a heap that cannot grow: ``library.Pieces``)
 PIECE_BYTES = 24 << 20
 
 Item = tuple[int, Sequence[int]]  # (entry, the device addresses of its arguments)
@@ -362,9 +362,9 @@ class Assembler:
         out[2], out[3] = n_ops, 4 * out.size
         return out
 
-    def bounds(self, items: Sequence[Item], splits: Collection[int]) -> list[int]:
+    def bounds(self, items: Sequence[Item], splits: Collection[int], limit: int = PIECE_BYTES) -> list[int]:
         """The item bounds of a program's pieces: ``splits``, and a cut at the last change of design before a piece
-        would exceed PIECE_BYTES."""
+        would exceed ``limit`` bytes."""
         def nbytes(i: int, prev: int | None) -> int:  # (as ``assemble`` emits it, all memory-tile BDs written)
             blk = self.blocks[items[i][0]]
             if self._configure(items[i][0], prev):
@@ -381,7 +381,7 @@ class Assembler:
             n = nbytes(i, prev)
             if prev is None or self.blocks[e].design != self.blocks[prev].design:
                 last_change = i
-            if size + n > PIECE_BYTES and i > bounds[-1]:
+            if size + n > limit and i > bounds[-1]:
                 cut = last_change if last_change > bounds[-1] else i
                 bounds.append(cut)
                 size, prev = empty, None

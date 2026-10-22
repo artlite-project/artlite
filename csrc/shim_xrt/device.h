@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -17,6 +18,9 @@ class device;
 }
 
 namespace shim_xdna {
+
+// XRT places instruction buffers itself: no device heap to reclaim.
+inline void set_heap_reclaim(std::function<bool()>) {}
 
 // NPU clocks in MHz (XRT does not report them: 0).
 struct clocks {
@@ -43,6 +47,10 @@ struct device {
 
   clocks query_clocks() const;
   uint64_t busy_ns() const;
+  // No device heap of the process's own: XRT places instruction buffers.
+  size_t heap_free() const { return SIZE_MAX; }
+  bool heap_fixed() const { return false; }
+  bool grow_heap() const { return true; }
   std::optional<amdxdna_async_error> last_async_error() const;
 
   xrt::device& xrt_device() const { return *m_dev; }

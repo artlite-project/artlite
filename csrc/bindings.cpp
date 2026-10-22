@@ -418,6 +418,14 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           },
           "(MP-NPU clock, H clock) in MHz as the driver reports them.",
           nb::sig("def clocks(self) -> tuple[int, int]"))
+      .def("heap_free", &shim_xdna::device::heap_free,
+           "Bytes of the process's device heap (DEV BOs: alloc_insts_buffer) not in use yet, as the driver spends it "
+           "(each BO rounded up to 32 KB, 128 KB per hardware context), of the heap BOs mapped so far.")
+      .def_prop_ro("heap_fixed", &shim_xdna::device::heap_fixed,
+                   "The driver refused to grow the device heap: one 64 MB heap per process (Linux before 7.2).")
+      .def("grow_heap", &shim_xdna::device::grow_heap,
+           "Add a 64 MB heap BO to the device heap; False where the driver cannot grow it (then heap_fixed) or at its "
+           "maximum.")
       .def("busy_ns", &shim_xdna::device::busy_ns,
            "Device busy time of this Device's commands so far (fdinfo drm-engine, mailbox send to "
            "response). Reads a /proc file: keep it out of timed regions.")
@@ -758,12 +766,32 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
         }
       },
       exc_dispatch.ptr());
+  m.def(
+      "set_heap_reclaim",
+      [](nb::callable f) {
+        // (the function stays referenced for the process: a static's release would follow the interpreter's end)
+        PyObject* fn = f.release().ptr();
+        shim_xdna::set_heap_reclaim([fn] {
+          nb::gil_scoped_acquire gil;
+          return nb::cast<bool>(nb::handle(fn)());
+        });
+      },
+      "f"_a,
+      "f() is called when a DEV BO does not fit a device heap that cannot grow (Linux before 7.2): it frees DEV BOs "
+      "the process can spare and returns True for the allocation to be tried once more.");
+  // A full device heap (ENOSPC: a DEV BO that does not fit): HeapFullError, an Error.
+  static PyObject* heap_full = PyErr_NewException("artlite._native.HeapFullError", exc_error.ptr(), nullptr);
+  m.attr("HeapFullError") = nb::handle(heap_full);
   // A request the driver does not serve (EOPNOTSUPP: e.g. reading AIE tiles on Linux's own driver):
   // NotImplementedError, a RuntimeError.
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
     try {
       std::rethrow_exception(p);
     } catch (const std::system_error& e) {
+      if (e.code().value() == ENOSPC) {
+        PyErr_SetString(heap_full, e.what());
+        return;
+      }
       if (e.code().value() != EOPNOTSUPP) throw;
       PyErr_SetString(PyExc_NotImplementedError, e.what());
     }

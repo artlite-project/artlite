@@ -7,19 +7,88 @@ are allocated: the items address the caller's buffers.
 """
 
 import itertools
+import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
-from ... import portable, txn
+from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
 from ..base import ArtcOperator
 from ..overlay.runtime import SPIN_MARGIN_US, irq_cpu
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
 from .program import PIECE_BYTES, Assembler, Item
+
+
+class Pieces:
+    """The instruction BOs of the process's Library programs: two (piece k + 1 assembled while k runs), one pair for
+    every Library (one runs at a time: ``lock``), allocated by a run. A piece takes PIECE_BYTES where the device heap
+    holds both and RESERVE besides (allocations after them: a vision encoder's PDIs), the heap grown if it must; a heap
+    that cannot grow (Linux before 7.2: one 64 MB heap per process) gets pieces of what it has left but RESERVE, in
+    whole MB, at least MIN_BYTES: a smaller piece only adds dispatches (a gap of tens of us each). An allocation that
+    does not fit such a heap frees the pair between runs (``release``), and the next run takes what is left then."""
+
+    RESERVE = 8 << 20
+    MIN_BYTES = 4 << 20
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.bos: list = []
+        self.nbytes = 0
+        # (per BO, the program a Library left there for a run again: (weakref to the Library, its key, bytes, parity
+        # after it))
+        self.held: list[tuple | None] = [None, None]
+
+    def ensure(self, device: Any) -> int:
+        """The pair on ``device`` (allocated at the first call); returns a piece's bytes."""
+        if self.bos:
+            return self.nbytes
+        nbytes = PIECE_BYTES
+        if device.heap_free() < 2 * PIECE_BYTES + self.RESERVE and not device.grow_heap() and device.heap_fixed:
+            nbytes = min(PIECE_BYTES, max(self.MIN_BYTES, (device.heap_free() - self.RESERVE) // 2 >> 20 << 20))
+        while True:
+            try:
+                self.bos = [device.alloc_insts_buffer(nbytes) for _ in range(2)]
+                break
+            except _native.HeapFullError:  # (a fragmented heap)
+                if not device.heap_fixed or nbytes <= self.MIN_BYTES:
+                    raise
+                nbytes = max(self.MIN_BYTES, nbytes - (2 << 20))
+        self.nbytes = nbytes
+        return nbytes
+
+    def release(self) -> bool:
+        """Free the pair unless a run holds it (the shim's heap reclaim: ``_native.set_heap_reclaim``); returns
+        whether it did."""
+        if not self.bos or not self.lock.acquire(blocking=False):
+            return False
+        try:
+            self.bos, self.held, self.nbytes = [], [None, None], 0
+        finally:
+            self.lock.release()
+        return True
+
+    def holds(self, slot: int, lib: "Library", key: tuple) -> tuple | None:
+        """What BO ``slot`` holds for ``lib``'s program of ``key``: (bytes, parity after it), or None."""
+        held = self.held[slot]
+        return held[2:] if held is not None and held[0]() is lib and held[1] == key else None
+
+    def write(self, slot: int, piece: np.ndarray, held: tuple | None) -> Any:
+        """Copy ``piece`` into BO ``slot`` (``held``: (Library, key, parity after it) of a program run again, or
+        None); returns the BO."""
+        bo = self.bos[slot]
+        np.copyto(bo.map()[:piece.nbytes], piece.view(np.uint8))
+        bo.sync_to_device(piece.nbytes, 0)
+        self.held[slot] = None if held is None else (weakref.ref(held[0]), held[1], piece.nbytes, held[2])
+        return bo
+
+
+_PIECES = Pieces()
+_native.set_heap_reclaim(_PIECES.release)
 
 
 class Library(FusedElf):
@@ -37,8 +106,6 @@ class Library(FusedElf):
                                              for e, op in enumerate(ops)])
         self._entry = {id(op): e for e, op in enumerate(ops)}
         self._asm: Assembler | None = None
-        self._piece_bos: list = []  # (two instruction BOs: piece k + 1 assembled while k runs)
-        self._held: list[tuple | None] = [None, None]  # (per piece BO: the program, bytes and parity after it holds)
         # (assembled pieces: (id(items), a, b, parity) -> (items, piece, parity after); a program's items are a list the
         # caller keeps, e.g. ChunkPrefill's per chunk size)
         self._pieces: dict[tuple[int, int, int, int], tuple[Sequence[Item], np.ndarray, int]] = {}
@@ -50,7 +117,6 @@ class Library(FusedElf):
         if self._pieces_bytes + entry[1].nbytes > self.PIECES_KEPT:
             self._pieces.clear()
             self._pieces_bytes = 0
-        self._ends: dict[tuple[int, int, int], float] = {}  # ((id(items), a, b) -> a piece's shortest seen duration)
         self._pieces[key] = entry
         self._pieces_bytes += entry[1].nbytes
 
@@ -85,34 +151,33 @@ class Library(FusedElf):
     def run(self, items: Sequence[Item], *, splits: Iterable[int] = (), bufs: Sequence[Any],
             hooks: Mapping[int, Callable[[], None]] | None = None) -> int:
         """Dispatch the program of ``items`` (``items()``; consecutive items of one design share its configuration): a
-        new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed
-        PIECE_BYTES. ``bufs``: the data BOs the items address. ``hooks``: per item index of ``splits``, a host function
-        called before the piece it starts is dispatched (while the previous one runs: e.g. inputs that only later
-        items read). Returns the dispatches.
+        new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed the
+        process's piece BOs (``Pieces``). ``bufs``: the data BOs the items address. ``hooks``: per item index of
+        ``splits``, a host function called before the piece it starts is dispatched (while the previous one runs: e.g.
+        inputs that only later items read). Returns the dispatches.
 
         The calling thread runs on the CPU that takes the NPU's interrupts meanwhile (``irq_cpu``): it waits for each
         piece there (napping, then polling from shortly before its shortest seen end), and the host work between
         pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU the scheduler
         woke for it)."""
         cpu = irq_cpu()
-        with portable.on_cpu(cpu):
+        with portable.on_cpu(cpu), _PIECES.lock:
             return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
 
     def _run(self, items: Sequence[Item], *, splits: Iterable[int], bufs: Sequence[Any],
              hooks: Mapping[int, Callable[[], None]] | None, cpu: int) -> int:
         asm = self.load()._asm
         kern = self._kernel()
-        bounds = asm.bounds(items, set(splits))
+        limit = _PIECES.ensure(self._device)
+        bounds = asm.bounds(items, set(splits), limit)
         refs = self._dispatch_bufs + [b for b in bufs if all(b is not d for d in self._dispatch_bufs)]
-        if not self._piece_bos:
-            self._piece_bos = [self._device.alloc_insts_buffer(PIECE_BYTES) for _ in range(2)]
         key = None
         if len(bounds) == 2 and not hooks:  # (a program of one piece run again: still in the BO of its parity)
             key = (hash(tuple((e, tuple(addrs)) for e, addrs in items)), asm.parity)
-            held = self._held[asm.parity]
-            if held is not None and held[0] == key:
-                kern.dispatch_elf_async(self._piece_bos[asm.parity], refs, held[1])
-                asm.parity = held[2]
+            held = _PIECES.holds(asm.parity, self, key)
+            if held is not None:
+                kern.dispatch_elf_async(_PIECES.bos[asm.parity], refs, held[0])
+                asm.parity = held[1]
                 kern.dispatch_wait()
                 return 1
         k, starts = 0, []
@@ -135,11 +200,10 @@ class Library(FusedElf):
             else:
                 piece = asm.assemble(items[a:b])
                 self._keep(ck, (items, piece, asm.parity))
-            assert piece.nbytes <= PIECE_BYTES, piece.nbytes
-            bo = self._piece_bos[slot]
-            np.copyto(bo.map()[:piece.nbytes], piece.view(np.uint8))
-            bo.sync_to_device(piece.nbytes, 0)
-            self._held[slot] = (key, piece.nbytes, asm.parity) if key is not None else None
+            if piece.nbytes > limit:
+                raise ValueError(f"{self.name}: items {a}..{b} take {piece.nbytes} bytes of control code, more than "
+                                 f"a piece BO's {limit}")
+            bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
                 hooks[a]()
             if k:
@@ -167,8 +231,7 @@ class Library(FusedElf):
         second chunk of a size: 6 ms)."""
         p = asm.parity
         key = (key[0], p)  # (the key of a run that starts at this parity)
-        held = self._held[p]
-        if held is not None and held[0] == key:
+        if _PIECES.holds(p, self, key) is not None:
             return
         ck = (id(items), 0, len(items), p)
         hit = self._pieces.get(ck)
@@ -178,7 +241,4 @@ class Library(FusedElf):
             piece = asm.assemble(items)
             end, asm.parity = asm.parity, p
             self._keep(ck, (items, piece, end))
-        bo = self._piece_bos[p]
-        np.copyto(bo.map()[:piece.nbytes], piece.view(np.uint8))
-        bo.sync_to_device(piece.nbytes, 0)
-        self._held[p] = (key, piece.nbytes, end)
+        _PIECES.write(p, piece, (self, key, end))

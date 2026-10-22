@@ -13,7 +13,7 @@ The NPU reads the weights from system memory, so a model needs about its file's 
 
 | | |
 |---|---|
-| Linux with the `amdxdna` driver | AMD's [xdna-driver](https://github.com/amd/xdna-driver) builds the driver module and installs the NPU firmware; Artlite is developed with it. Linux has its own `amdxdna` since 6.14, with the same ioctls (tested with Linux 7.2; before 7.2 a process's control code and PDIs must fit in 64 MB) |
+| Linux with the `amdxdna` driver | AMD's [xdna-driver](https://github.com/amd/xdna-driver) builds the driver module and installs the NPU firmware; Artlite is developed with it. Linux has its own `amdxdna` since 6.14, with the same ioctls (tested with Linux 7.2, and with Linux 7.0's driver: before 7.2 it gives a process one 64 MB device heap, where Artlite runs a prompt's control code in smaller pieces) |
 | access to `/dev/accel/accel0` | the device node belongs to the `render` group: `sudo usermod -aG render $USER`, then log in again |
 | libdrm | the runtime's build links it (`pkg-config libdrm`) |
 | CMake 3.20 or newer, a C++23 compiler (GCC 13+, Clang 17+) | the runtime and its Python bindings |
