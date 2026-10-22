@@ -114,17 +114,19 @@ def _power() -> str:
 
 
 def system() -> list[str]:
-    """Lines describing the machine, OS, driver, firmware and power settings."""
+    """Lines describing the machine, OS, driver, firmware and power settings (Linux; elsewhere what the OS tells)."""
     dmi = " ".join(x for x in (_read("/sys/class/dmi/id/sys_vendor"), _read("/sys/class/dmi/id/product_name"),
                                _read("/sys/class/dmi/id/product_version")) if x)
     cpu_name = _read("/proc/cpuinfo", "model name") or platform.processor()
     mem = _read("/proc/meminfo", "MemTotal").removesuffix(" kB")
-    machine = f"machine: {dmi or platform.node()}; {cpu_name}, {os.cpu_count()} CPUs; " + (
-        f"{int(mem) / (1 << 20):.1f} GB of memory" if mem.isdigit() else "memory ?")
+    machine = f"machine: {dmi or platform.node()}; {cpu_name}, {os.cpu_count()} CPUs" + (
+        f"; {int(mem) / (1 << 20):.1f} GB of memory" if mem.isdigit() else "")
+    if platform.system() != "Linux":
+        return [machine, f"OS: {platform.system()} {platform.version()} (driver, firmware, power mode: xrt-smi examine)"]
     dev = artlite.Device()
-    driver = _driver(dev) if platform.system() == "Linux" else ""
+    # (a heap BO more: refused by a driver that gives a process one, silently on Linux 7.0 / 7.1)
+    heap = "grows" if dev.grow_heap() else "one 64 MB heap BO per process" if dev.heap_fixed else "at its maximum"
     fw = _read("/sys/class/accel/accel0/device/fw_version") or "?"
-    lines = [machine, f"OS: {platform.system()} {platform.release()}; {driver}, firmware {fw}", f"power: {_power()}"]
     try:
         code = dev.power_mode()
     except (NotImplementedError, artlite.Error):
@@ -132,11 +134,9 @@ def system() -> list[str]:
     mode = POWER_MODES[code] if 0 <= code < len(POWER_MODES) else "?"
     cpu = irq_cpu()
     cpu_mhz = _read(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq") if cpu >= 0 else ""
-    # (a heap BO more: refused by a driver that gives a process one, silently on Linux 7.0 / 7.1)
-    heap = "grows" if dev.grow_heap() else "one 64 MB heap BO per process" if dev.heap_fixed else "at its maximum"
-    lines.append(f"NPU{' (through XRT)' if backend.XRT else ''}: power mode {mode}; interrupts on CPU {cpu if cpu >= 0 else '?'}"
-                 f"{f' (max {int(cpu_mhz) // 1000} MHz)' if cpu_mhz else ''}; device heap: {heap}")
-    return lines
+    irq = f"CPU {cpu}" + (f" (max {int(cpu_mhz) // 1000} MHz)" if cpu_mhz else "") if cpu >= 0 else "a CPU not known yet"
+    return [machine, f"OS: Linux {platform.release()}; {_driver(dev)}, firmware {fw}", f"power: {_power()}",
+            f"NPU{' (through XRT)' if backend.XRT else ''}: power mode {mode}; interrupts on {irq}; device heap: {heap}"]
 
 
 def main(argv: list[str] | None = None) -> None:
