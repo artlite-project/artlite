@@ -133,6 +133,17 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   / Q4_1 tiles of 1024 columns: the header expanded per k-tile slot; their planar GemmQd padded 1024 tokens to 1152 on
   3 rows: a 4096-token chunk 507 -> 465 ms). Did not: a C pingpong with one C object; deeper FIFOs on DMA-bound
   operators.
+- An MoE layer's limits (Qwen3.6-35B-A3B, `moe.prefill`; a 4096-token chunk ~2.1 s, the expert GEMMs ~31% at ~48 GB/s):
+  for a design built from scratch:
+  - a work item of a fixed 192 pairs streams its expert's weights once, so hot experts stream theirs again: 1.45x the
+    experts hit at 4096 tokens, 2.06x at 8192 (items of 384 pairs: 1.15x / 1.42x). Size the items to the expert's
+    pairs (more tokens per weight pass), which GemmQd's L1 (A, D, C and the SiLU scratch at 64 tokens per MAC row)
+    does not hold;
+  - the down's outputs (bf16, 4 KB per pair) are ~40% of its bytes and ~80% of the combine's: rows of bfp16 blocks
+    halve them, if each C object's per-token run is whole blocks the DMA can move (multiples of 32 values: Q6_K's
+    11-row tiles in pairs give runs of 88);
+  - the router's rows per column (32 experts x [hi, lo] and the shared gate's pair: 66) take a second 64-row pass
+    for one pair (0.8 of its 2.0 ms per layer at 4096): a router that fits one pass, the shared gate elsewhere.
 
 ## Pitfalls
 

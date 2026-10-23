@@ -97,6 +97,8 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Weights over 2 shim channels per column | 50.0 vs 49.9 GB/s; 56 GB/s for 8 and for 16 streams: one channel per column already reaches the ceiling |
 | Deeper L1 / L2 FIFOs, pinned layouts, AxCACHE hints on a DMA-bound operator | no e2e change |
 | Gemma decode overlay: A memtile depth 20 / 22 (channels pinned to both parities), X depth 2 in the main core's L1 or 4 in the memtile | 55.6-56.4 ms vs 55.6-56.2 at depth 12, alternated processes: its boundaries are not prefetch-bound |
+| qwen35 decode overlay (35B-A3B): A memtile depth 12 / 16 / 20 instead of 8 | S = 1 41.4-41.7 ms, S = 3 66.1-66.6 at every depth |
+| An MoE layer's router as a phase before the shared expert's gate / up (the logits' sync and the route object beside its tiles; 35B-A3B decode) | +0.2-0.6 ms per step at S 1-4: the extra phase and the shared down's input round trip after the routing cost more than the overlap |
 | Gemma decode overlay: each column's X fills waited at a sync (one wait per run of columns) instead of before each fill | 57.06 vs 57.02 ms (A / B in one process) |
 | Prefetching the FFN down-projection weights behind gate / up on the same channel | no e2e change |
 | Streaming a residual update's v and r from two regions at once | a core must hold both: aiecc rejects a release that does not match an acquire of the same loop body; interleave pairs in one stream |
