@@ -85,7 +85,7 @@ from ..overlay.decode import (
     XPAY,
     interleave,
 )
-from ..overlay.model import ModelOverlay
+from ..overlay.model import ModelOverlay, paged_formats
 from ..overlay.runtime import Sequence, Transaction, WeightBuffer
 from ..overlay.vring import substeps, tails
 from . import attn, gdn
@@ -105,7 +105,8 @@ from .decode import (
 )
 from .image import NORMS, QwenImage, gdn_v_heads
 
-FLAGS = {"gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
+FLAGS = {"eh": F_RESID | F_EMITR,  # (a drafter's first phase: ``draft``)
+         "gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
          "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM, "moe_in": F_NORM, "sdown": F_RESID | F_WS}
 MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32, "sgate": B_PAIR | B_KEEP}  # (moe_in's blocks: ``overlay.decode``)
 MOE_MAX_K = 2048  # (an MoE model's K groups at most: ``image.payload``)
@@ -140,7 +141,8 @@ def _text_rope(n: int) -> np.ndarray:
 class QwenOverlay(ModelOverlay):
     """A qwen35 GGUF model on the multi-slot decode overlay. ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the KV caches' capacity, ``weights``: the
-    image's buffer allocated ahead (its image's layers and vocabulary).
+    image's buffer allocated ahead (its image's layers and vocabulary), ``formats``: tile formats the design runs
+    besides the image's (a drafter's: ``draft``; past three formats, all but the model's largest as code pages).
 
     ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot, which the step's and the prefill's
     rotations take; the slot's index (text from position 0) until a model writes others (an image's tokens, the
@@ -149,7 +151,7 @@ class QwenOverlay(ModelOverlay):
     CONFIG, IMAGE = QwenConfig, QwenImage
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, weights: WeightBuffer | None = None):
+                 max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = ()):
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
         cfg, img = self.cfg, self.image
         att = [cfg.attention[L] for L in self.layers]
@@ -159,11 +161,11 @@ class QwenOverlay(ModelOverlay):
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
-        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks}
+        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
-                                      max_k=MOE_MAX_K if cfg.moe else MAX_K)
+                                      max_k=MOE_MAX_K if cfg.moe else MAX_K, paged=paged_formats(gguf, fmts))
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
@@ -554,6 +556,7 @@ class QwenOverlay(ModelOverlay):
         runs = self._runs(lm) if self.image.column_major else []
         if runs:
             self._weight_run(seq, runs[0])
+        self._head(seq, S)
         ffn = "moe_in" if self.moe else "gate_up"
         for i, L in enumerate(self.layers):
             if cfg.attention[L]:
@@ -574,6 +577,9 @@ class QwenOverlay(ModelOverlay):
         seq.sync(fills=True)
         st.tr = Transaction(dev, seq.words())
         return st
+
+    def _head(self, seq: Sequence, S: int) -> None:
+        """Phases before the first layer's (a drafter's eh: ``draft``)."""
 
     def subs(self, p: int, S: int) -> tuple[tuple[int, int, bool], ...]:
         """The attention's sub-steps of a step at p .. p + S - 1 (``overlay.vring.substeps``): (first slot, slots,

@@ -44,7 +44,7 @@ PANEL = 72  # bytes of a bfp16 8x8 panel
 XS_SLOT = 192  # bytes of a slot of sum panels (two panels, 64-byte aligned: a panel stream must start aligned)
 Y_FLOATS = 64  # a tile's output: [g 2][slot 4][r 8] fp32 (tiles of up to 32 rows in the super-block split: [g 4], 128)
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
-RG_FORMATS = ("Q4_K", "Q6_K")  # (``render(rg=)``) the formats of row-group tiles
+RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K")  # (``render(rg=)``) the formats of row-group tiles
 B_G4 = 8192  # (``overlay.decode``'s block format word bit of row groups of 4)
 
 
@@ -251,8 +251,8 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 {% if f in paged %}
     if (fmt == {{ fid[f] }}) {
         {{ p }}_pg_need<H>({{ paged.index(f) + 1 }});
-        ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *))(intptr_t)
-             ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr);
+        ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if f in rg_fmts else "" }}))(intptr_t)
+             ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
         return;
     }
 {% else %}
@@ -269,9 +269,9 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 // (a page: format {{ f }}'s half {{ h }}, entered through the pager's state words only; external, so that it stays in
 // the object for ``paging.link``)
 void {{ p }}_pgf{{ h }}_{{ f | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
-                                        float *__restrict y, uint8_t *__restrict scr)
+                                        float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if f in rg_fmts else "" }})
 {
-    {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr);
+    {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
 }
 {% endfor %}
 {% endfor %}
@@ -310,7 +310,7 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     after 2 H's instead of adding them."""
     assert all(supported(f, nsb) for f in fmts), (fmts, nsb)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
-    assert not rg or (nsb == 4 and not paged), (rg, nsb, paged)
+    assert not rg or nsb == 4, (rg, nsb)
     parts: list[str] = []
     var: dict[str, int] = {}
     for s in FORMAT_SLOTS:

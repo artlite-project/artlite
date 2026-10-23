@@ -379,7 +379,7 @@ int main(int argc, char ** argv) {
             batch.pos[i] = p + i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = logits_mode != "none" || p + i == n - 1;
+            batch.logits[i] = logits_mode != "none" || !mtp_path.empty() || p + i == n - 1;  // (--mtp: every row's h)
         }
         st.n_tokens = nb;
         st.seen.clear();

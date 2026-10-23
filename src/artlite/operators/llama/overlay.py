@@ -36,7 +36,6 @@ import torch
 from ...gguf_model import GGUFFile
 from ...model_config import LlamaConfig
 from ..design import COLS
-from ..formats import has_tile_format, tile_format
 from ..overlay import gemv, kv
 from ..overlay.attn import (
     F_ATT,
@@ -80,7 +79,7 @@ from ..overlay.decode import (
     interleave,
     packed_slots,
 )
-from ..overlay.model import ModelOverlay
+from ..overlay.model import ModelOverlay, paged_formats
 from ..overlay.runtime import Sequence, Transaction, WeightBuffer
 from .decode import LlamaDecodeOperator
 from .image import LlamaImage
@@ -98,22 +97,6 @@ def check_formats(image: LlamaImage) -> set[str]:
     if missing:
         raise NotImplementedError(f"{', '.join(missing)} tiles: the decode GEMV has no kernels for them")
     return fmts
-
-
-def paged_formats(gguf: GGUFFile, fmts: set[str]) -> tuple[str, ...]:
-    """The formats whose kernels are code pages (``LlamaDecodeOperator(paged=)``): the main cores' program memory holds
-    the kernels of three formats; of four or more (Q3_K_M: Q3_K, Q4_K, Q5_K, Q6_K) the one of the most bytes in the file
-    stays and the others share a page slot (two would leave the slot less than a page: the pager and the paged
-    dispatch take ~0.5 KB). A page loads when a tile of another paged format comes (Q3_K_M: Q5_K and Q4_K in the first
-    layers, Q4_K for the rest, the LM head's Q6_K, a few per step). By the whole file: the same choice for any layers and
-    vocabulary the overlay runs."""
-    if len(fmts) < 4:
-        return ()
-    nbytes = dict.fromkeys(fmts, 0)
-    for _, qtype, _, n in gguf.tensor_info.values():
-        if has_tile_format(qtype) and tile_format(qtype) in nbytes:
-            nbytes[tile_format(qtype)] += n
-    return tuple(sorted(sorted(fmts, key=lambda f: -nbytes[f])[1:]))
 
 
 @dataclass

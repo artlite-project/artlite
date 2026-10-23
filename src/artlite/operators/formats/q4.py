@@ -397,7 +397,7 @@ __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t 
 // 2 H + 1 against xp (their 64 panels)
 template <int H>
 __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *tab = (bfloat16 *)(scr + 4096);
     bfloat16 *c = (bfloat16 *)(scr + 4608);
@@ -405,8 +405,8 @@ __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t 
     {{ p }}_dtab<2, 2>((const bfloat16 *)a + 16 * H, tab);
     {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
     AIE_LOOP_NO_UNROLL
-    for (int u = 0; u < 2; u++)
-        {{ p }}_sc1<2>(c + 512 * u, tab + 128 * u, y);
+    for (int u = 0; u < 2; u++)  // (rg: super-block 2 H + 1's rows into y + ys, rows of their own)
+        {{ p }}_sc1<2>(c + 512 * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
 }
 {% endif %}
 """

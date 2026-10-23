@@ -41,15 +41,17 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
-                 max_k: int = OD.MAX_K, win: str = ""):
+                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = ""):
         """moe: (experts, experts per token) of an MoE model (``overlay.decode``'s "MoE"; its router's BFP16 tiles),
-        max_k: the K of a phase's group at most."""
-        assert set(rows) <= {"Q4_K", "Q5_K", "Q6_K"} | ({"BFP16"} if moe else set()) and tile_bytes == 9280, rows
+        max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``overlay.model.paged_formats``:
+        a drafter's Q4_0 beside the model's three)."""
+        assert set(rows) <= {"Q4_K", "Q5_K", "Q6_K", "Q4_0"} | ({"BFP16"} if moe else set()) and tile_bytes == 9280, rows
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
         self.msg, self.relay = gdn is not None, attn is not None
-        super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k, win=win)
+        super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
+                         paged=paged, win=win)
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
