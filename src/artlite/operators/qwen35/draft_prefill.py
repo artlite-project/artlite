@@ -10,8 +10,8 @@ writes the records (``AttnPrepOperator``) into the drafter's KV cache at the chu
   (``PrefillNormOperator(pre=)``);
 - eh_proj in two K parts (``prefill.gemm.plan_phase(k_part=)``: the enorm half, the hnorm half) into DY's two regions
   of R0 rows, the hnorm half's one row later: row q of the second region holds the projection of h_{q - 1} (its row
-  0 the previous chunk's last valid row: ``carry``, zeros at position 0); the residual norm adds both parts to a zero
-  x (DZ) in fp32 and writes attn_norm(x0)'s panels (DPN);
+  0 the previous chunk's last valid row: ``carry``, zeros at position 0, after decode steps the host's: ``carry_of``);
+  the residual norm adds both parts to a zero x (DZ) in fp32 and writes attn_norm(x0)'s panels (DPN);
 - the drafter's attn_in GEMMs (DG), then the attention prep into the drafter's cache (its q / k norms in the prefill's
   PQN; its Q slots into QS, unused).
 
@@ -43,6 +43,7 @@ class DraftPrefill:
         self.d_pitch = PG.d_pitch(img, prefill.SUB)
         assert self.d_pitch == H // 8, "eh's rows dense (the residual norm's deltas)"
         self.carry = np.zeros(2 * H, np.uint8)  # (DY's second region's row 0: the last chunk's last valid row)
+        self._w_h: np.ndarray | None = None  # (eh_proj's hnorm half, fp32: ``carry_of``)
         self.ops = {t: self._ops(t) for t in sorted({prefill._t(T) for T in prefill.sizes})}
 
     def _ops(self, t: int) -> SimpleNamespace:
@@ -136,6 +137,19 @@ class DraftPrefill:
         o = 2 * self.H * self.R0
         dev.view("DY")[o:o + self.carry.size] = self.carry
         dev.flush("DY", o, self.carry.size)
+
+    def carry_of(self, h: torch.Tensor) -> None:
+        """The carry of a chunk after decode steps (not after a chunk): eh_proj's hnorm half of hnorm(h), h (hidden,) the
+        model's output-normed hidden state of the position before the chunk."""
+        if self._w_h is None:
+            g = self.d.gguf
+            w = g.tensor(f"blk.{self.L}.nextn.eh_proj.weight").dequantize().numpy().reshape(self.H, 2 * self.H)
+            self._w_h = np.ascontiguousarray(w[:, self.H:])
+        x = h.float().numpy().astype(np.float32)
+        x = x / np.sqrt((x * x).mean(dtype=np.float32) + np.float32(self.eps)) * self.d._f32(
+            f"blk.{self.L}.nextn.hnorm.weight")
+        y = torch.from_numpy(self._w_h @ x).bfloat16()
+        self.carry[:] = y.view(torch.uint8).numpy()
 
     def after(self, dev: object, n: int) -> None:
         """The next chunk's carry: this one's projection of its last valid row's h; the drafter's cache records of the

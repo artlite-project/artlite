@@ -65,11 +65,28 @@ def test_draft_steps(setup: tuple, S: int) -> None:
     assert (lg.argmax(-1) == r["logits"].argmax(-1))[clear].all()
 
 
+def test_interleaved(setup: tuple) -> None:
+    """The app's order of dispatches: drafter steps between the model's (lazy steps of two tokens, one accepted) on
+    the same hardware context; the drafter's logits bit for bit those of drafter steps alone."""
+    draft, emb, h, _, _ = setup
+    target, n = draft.target, 12
+    draft.reset()
+    alone = [draft.step(emb[p:p + 1], h[p:p + 1], p).clone() for p in range(n)]
+    draft.reset()
+    target.reset()
+    for p in range(n):
+        target.step(emb[p:p + 2], p, logits=False, commit=False)
+        target.accept(1)
+        assert torch.equal(draft.step(emb[p:p + 1], h[p:p + 1], p), alone[p]), p
+
+
 def test_draft_prefill() -> None:
     """Three 256-token chunks of an essay through the slice's prefill with the drafter's records (the carry between
     chunks: the last row's h), then the drafter's step at the next position; the same step after drafter steps of 4
     rows wrote the records from the same inputs (the embeddings, the model's h of the prefill's output rows): within
-    1% rms (h ~0.67%, logits ~0.69%: bfp16 vs bf16 roundings of the records' inputs), the same argmax."""
+    1% rms (h ~0.67%, logits ~0.69%: bfp16 vs bf16 roundings of the records' inputs), the same argmax. The last
+    chunk's carry as the host computes it after decode steps (``carry_of``, fp32) within 2% of the device's (1.2%: its
+    GEMM's bfp16 panels of hnorm(h))."""
     mtp = qwen_mtp_of(MODEL) if os.path.exists(MODEL) else None
     if mtp is None:
         pytest.skip("no Qwen3.6-35B-A3B model file or MTP drafter")
@@ -93,6 +110,10 @@ def test_draft_prefill() -> None:
     h = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + target.cfg.rms_norm_eps) * torch.from_numpy(
         target._f32("output_norm.weight"))
     hp = torch.cat([torch.zeros(1, draft.H), h])  # (row q: the model's h of q - 1)
+    dev_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
+    pf.dp.carry_of(h[n - 1])  # (the host's, after decode steps)
+    host_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
+    assert float((dev_carry - host_carry).norm() / host_carry.norm()) < 2e-2
     a = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
     ha = draft.hidden_state(0).numpy()
     draft.reset()

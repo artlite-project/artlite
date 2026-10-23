@@ -65,6 +65,16 @@ class DraftImage(QwenImage):
         return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
 
 
+def _formats(img: QwenImage) -> set[str]:
+    return {b.fmt for r in img.regions + img.slabs for b in r.blocks}
+
+
+def draft_formats(gguf: GGUFFile, *, vocab: int = HEAD_ROWS) -> tuple[str, ...]:
+    """The tile formats of a drafter file's image: its model's design runs them (``QwenOverlay(formats=)``)."""
+    cfg = mtp_config(gguf)
+    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1], vocab=vocab))))
+
+
 class _DraftConfig:
     from_gguf = staticmethod(mtp_config)
 
@@ -86,10 +96,10 @@ class QwenDraft(QwenOverlay):
         self.L = cfg.num_hidden_layers - 1
         super().__init__(gguf, layers=[self.L], vocab=vocab, max_positions=target.max_positions)
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
-        fmts = {b.fmt for r in self.image.regions + self.image.slabs for b in r.blocks}
+        fmts = _formats(self.image)
         if not fmts <= set(target.op.rows):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
-                             f"QwenOverlay(formats=)")
+                             f"QwenOverlay(formats=draft_formats(gguf))")
         self.target, self.op = target, target.op  # (the model's design and hardware context: ``load``)
 
     def _phases(self) -> list[tuple[int, str]]:
@@ -140,4 +150,4 @@ class QwenDraft(QwenOverlay):
         return torch.from_numpy(x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight"))
 
 
-__all__ = ["HEAD_ROWS", "DraftImage", "QwenDraft", "mtp_config"]
+__all__ = ["HEAD_ROWS", "DraftImage", "QwenDraft", "draft_formats", "mtp_config"]

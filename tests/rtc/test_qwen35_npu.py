@@ -101,3 +101,48 @@ def test_prefill(size: str) -> None:
           f"{float(kl_llama[0]):.4f}), mean over {K} positions {float(kl.mean()):.4f} ({float(kl_llama.mean()):.4f}); "
           f"argmax agreement {agree:.3f} ({agree_llama:.3f})")
     assert float(kl.mean()) < 1.5 * float(kl_llama.mean()) + 2e-3 and agree > agree_llama - 0.05
+
+
+def test_mtp() -> None:
+    """Qwen3.6-35B-A3B with its MTP drafter (``NpuQwen.generate``, up to 3 drafts per step): greedy replies to two user
+    turns of a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's
+    carry). Every token is the argmax of the model's one-token steps over the same text, but where a multi-token step
+    flips a near tie (its experts summed in another order: KL ~0.001 against steps of one here); most drafts are
+    accepted in both replies (the drafter's cache follows the model's positions)."""
+    from artlite.model_config import qwen_mtp_of
+    from models.common import Sampling
+    from models.qwen35.qwen import Qwen
+
+    path = _path("35B-A3B")
+    if qwen_mtp_of(path) is None:
+        pytest.skip(f"no MTP drafter of {path}")
+    qwen = Qwen(path)
+    model = qwen.load(capacity=4096)
+    assert model.drafter is not None and model.DRAFTS == 3
+    first = qwen.prompt(essay("apple.txt")[:4000] + "\n\nSummarize the essay above in a few paragraphs.")
+    greedy, N = Sampling(temp=0.0, greedy=True), 48
+    out1 = list(model.generate(model.forward(first), N, greedy))
+    stats1 = (model.drafted, model.accepted)
+    pos = model.position  # (the reply's last token is not cached)
+    turn = ("<|im_end|>\n<|im_start|>user\nNow list the three most important arguments of the essay as short bullet "
+            "points, each with one sentence of explanation, and say whether you agree with the author.<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    ids = first + out1 + qwen.tokenizer.encode(turn)
+    assert model.prefill.group - pos % model.prefill.group + 3 < len(ids) - pos  # (decode steps, then a chunk)
+    out2 = list(model.generate(model.forward(ids[pos:]), N, greedy))
+    stats2 = (model.drafted - stats1[0], model.accepted - stats1[1])
+    model.DRAFTS = 0
+    model.reset()
+    flips = []
+    for prompt, out in ((first, out1), (ids[pos:], out2)):
+        lg = model.forward(prompt)
+        for i, t in enumerate(out):
+            top = torch.topk(lg.float(), 2)
+            if int(top.indices[0]) != t:
+                flips.append(float(top.values[0] - top.values[1]))
+            if i + 1 < len(out):
+                lg = model.step(t)
+    print(f"drafts (drafted, accepted): {stats1}, {stats2}; tokens not the argmax of one-token steps (their top-2 "
+          f"gaps): {flips}")
+    assert len(flips) <= 3 and all(g <= 0.5 for g in flips)
+    assert all(a >= 0.5 * d for d, a in (stats1, stats2))

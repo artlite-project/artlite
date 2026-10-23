@@ -331,16 +331,16 @@ class OverlayModel(NpuModel):
         self.dispatches += 1
         return out
 
-    def steps(self, tokens: list[int], *, logits: bool = True) -> torch.Tensor | None:
+    def steps(self, tokens: list[int], *, logits: bool = True, **step: Any) -> torch.Tensor | None:
         """Run up to ``overlay.SLOTS`` tokens at the next positions in one dispatch: the overlay's logits (n, vocab)
         bf16 after each of them (a view of the NPU's buffer, valid until the next dispatch), or None (``logits=False``:
-        prompt tokens)."""
+        prompt tokens); ``step``: the overlay step's other keywords."""
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
         t0 = time.perf_counter()
         args = self._step_inputs(tokens)
         self.t_host += time.perf_counter() - t0
-        out = self._dispatch(lambda: self.overlay.step(*args, self.position, logits=logits))
+        out = self._dispatch(lambda: self.overlay.step(*args, self.position, logits=logits, **step))
         self.position += len(tokens)
         if logits:
             self.slot = len(tokens) - 1
@@ -358,6 +358,16 @@ class OverlayModel(NpuModel):
             return penalties.top(raw, k, self.cap)
         v, i = topk_bf16(raw, k)
         return self.cap(v), i
+
+    def stale(self) -> None:
+        """Another hardware context ran on the device (a prefill chunk, an image encoder): the overlay's state on the
+        array comes back before its next dispatch (``OverlayDevice.set_prologue``)."""
+        self.overlay.dev.stale = True
+
+    def _prefill_run(self, args: tuple, T: int, n: int) -> None:
+        """A prompt chunk of n tokens at the next position through the prefill's chunk of T (its inputs ``args``)."""
+        self.prefill.run(*args, self.position, T)
+        self.stale()
 
     def _chunk(self, left: int, position: int | None = None) -> int:
         """The size of the next prefill chunk at ``position`` (default: the next) when ``left`` tokens remain (0: the
@@ -402,8 +412,7 @@ class OverlayModel(NpuModel):
             m = self._chunk(len(tokens) - i - n, self.position + n)  # (the next chunk: its inputs meanwhile)
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
                                     tokens[i + n:i + n + m]) if m else None
-            self.prefill.run(*args, self.position, T)
-            self.overlay.dev.stale = True  # (another hardware context ran: ``OverlayDevice.set_prologue``)
+            self._prefill_run(args, T, n)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches

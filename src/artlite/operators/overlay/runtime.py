@@ -263,9 +263,12 @@ class OverlayDevice:
     """The compiled decode design on the NPU and its host buffers."""
 
     def __init__(self, op: OverlayOperator, *, max_instruction_bytes: int = 1 << 22, device: object = None):
-        """device: an ``artlite.Device`` to share (buffers of both designs, one per hardware context)."""
+        """device: an ``artlite.Device`` to share (buffers of both designs, one per hardware context). An op that
+        another OverlayDevice attached keeps its program: the devices' dispatches share its hardware context (a
+        second context of the same design would make every switch between them a reconfiguration)."""
         self.op = op
-        op.compile(device=device)
+        if op._program is None or device is not None and getattr(op._program, "_device", None) is not device:
+            op.compile(device=device)
         prog = op._program
         prog._ensure_loaded()
         op.check_endpoints(np.fromfile(prog.insts_path, np.uint32))
