@@ -133,6 +133,14 @@ def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int) -> np.ndarray:
     return mac(mac(mul(p, 2.0 ** (shift - 64)), pf, k1), pf2, hi)
 
 
+def vexp2(a: np.ndarray) -> np.ndarray:
+    """``al::exp2_acc`` (the vexp2 LUT): Schraudolph's exp of a truncated to bf16, t: the bf16 bits floor(128 t) +
+    16256, for t < 0 16255 - trunc(128 |t|) (one's complement; probed over every bf16 and fp32 inputs)."""
+    t = (np.asarray(a, np.float32).view(np.uint32) & 0xFFFF0000).view(np.float32).astype(np.float64)
+    k = np.where(t >= 0, np.floor(128 * t), -np.trunc(128 * -t) - 1)
+    return (((k + 16256).astype(np.int64) & 0xFFFF).astype(np.uint32) << 16).view(np.float32)
+
+
 def log2e(x: np.ndarray) -> np.ndarray:
     """``al::log2e``: x log2(e) (bf16 hi + lo constant)."""
     return mul_hilo(x, 1.4453125, -0.00262451171875)
@@ -198,6 +206,11 @@ def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     if fn.func == "exp2":
         if p["bias"] is None:
             return _exp2_f32(x, p["prec"], p["below"])
+        if p["bias"] == 0:
+            a = _f32(x)
+            if p["prec"] == "chord":
+                return vexp2(a)
+            return mac(mul(vexp2(a), kmath.CHORD2_C[0]), vexp2(add(a, 0.5)), kmath.CHORD2_C[1])
         return _exp2_acc(x, p["below"], p["above"], p["shift"])
     if fn.func == "recip":
         return _recip(x, p["domain"], p["steps"])
@@ -220,7 +233,9 @@ def exact(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
         "silu": lambda: x * sig(x),
     }
     if fn.func == "exp2":
-        return np.exp2(x - (fn.params["bias"] or 0) + fn.params["shift"])
+        p = fn.params
+        scale = kmath.CHORD2_SCALE if p["prec"] == "chord2" else 1.0
+        return scale * np.exp2(x - (p["bias"] or 0) + p["shift"])
     if fn.func in funcs:
         return funcs[fn.func]()
     raise ValueError(f"{fn.name}: no exact function")

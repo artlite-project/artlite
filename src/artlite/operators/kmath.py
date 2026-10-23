@@ -78,7 +78,9 @@ def _bound(ulp: float | None, rel: float | None) -> str:
     """A bound as the comments state it (none: the variant's is not measured, e.g. with a caller's exp_fn)."""
     if ulp is not None:
         return f"max {ulp:.2f} bf16 ULP"
-    return "bound not measured" if rel is None else f"max 2^{math.log2(rel):.1f} relative"
+    if rel is None:
+        return "bound not measured"
+    return f"max {rel:.1%}" if rel >= 0.01 else f"max 2^{math.log2(rel):.1f} relative"
 
 
 # exp2 ---------------------------------------------------------------------------------------------------------------
@@ -88,6 +90,10 @@ LN2 = (0.69140625, 0.001739501953125)  # ln 2 as bf16 hi + lo
 TAYLOR = tuple(np.float32(1) / np.float32(k) for k in (720, 120, 24, 6, 2, 1, 1))  # e^t to t^6, highest first
 CUBIC = (0.24022650695910071, 0.0555041086648216, 0.69314718055994531)  # 2^f ~ 1 + f (c1 + f (c2 + c3 f)): c2, c3, c1
 ACC_C = (0.69140625, 0.2412109375, 0.0625)  # 2^f ~ 1 + c1 f + f^2 (c2 + c3 f), bf16 (fitted in this order)
+# CHORD2_SCALE 2^x ~ c1 vexp2(x) + c2 vexp2(x + 1/2): c1 = 1 (the caller's 1.0 register shared), c2 = 1 / sqrt 2 (the
+# chords' errors, half a period apart, cancel: the SD 1.5 UNet's error 1.19e-2; the pair minimax for |x| <= 2, 1.28e-2)
+CHORD2_C = (1.0, 0.70703125)
+CHORD2_SCALE = 2.0677  # (the middle of the ratio's range for |x| <= 2)
 
 _EXP2_F32 = r"""
 // 2^x of {{ N }} fp32 lanes (kmath.exp2: {{ bound }} for x in [-126, 127.5)): n = round(x) by the 1.5 2^23 split, 2^f
@@ -205,9 +211,29 @@ _BELOW_ACC = {
 }
 
 
+_EXP2_CHORD = r"""
+// {{ "%g " % scale if scale != 1 else "" }}2^x of {{ N }} lanes, x an fp32 accumulator (kmath.exp2: {{ bound }} for x in [-2, 2], {{ wider }}):
+// {{ "the chords of vexp2 at x and x + 1/2, the second times 1 / sqrt 2" if two else "vexp2" }}, Schraudolph's exp: 2^n (1 + f) of x truncated to bf16 (n + f, f
+// to 7 bits; negative x in one's complement), so in steps of 2^-6 .. 1/4 from |x| = 2 .. 32
+{{ attr }} aie::{{ "accum<accfloat" if two else "vector<bfloat16" }}, {{ N }}> {{ name }}(aie::accum<accfloat, {{ N }}> A)
+{
+{% if two %}
+    return aie::mac(aie::mul(al::exp2_acc<{{ N }}>(A), aie::broadcast<bfloat16, {{ N }}>({{ c[0] }}f)),
+                    al::exp2_acc<{{ N }}>(aie::add(A, aie::broadcast<float, {{ N }}>(0.5f))), aie::broadcast<bfloat16, {{ N }}>({{ c[1] }}f));
+{% else %}
+    return al::exp2_acc<{{ N }}>(A);
+{% endif %}
+}
+"""
+
+
 def exp2(lanes: int, *, bias: int | None = None, prec: str = "bf16", below: str = "clamp", above: str = "none",
          shift: int = 0, inline: bool = False) -> Fn:
     """2^x of ``lanes`` lanes.
+
+    ``bias=0``: x an fp32 accumulator, through vexp2 (the LUT: x truncated to bf16), coarse: ``prec`` "chord" (one
+    vexp2 -> a bf16 vector, 2^x to +6.2% / -0.6% for |x| <= 2) or "chord2" (two, weighted -> an fp32 accumulator,
+    2.068 2^x to 1.2% for |x| <= 2: a softmax's P, whose scale cancels).
 
     ``bias=None``: x an fp32 vector -> an fp32 vector, x in [-126, 127.5); ``prec`` "bf16" (a cubic: 0.4 bf16 ULP) or
     "fp32" (degree 6 in fp32 products: 2^-16.5); ``below``: "clamp" (2^-126 below -126, masked lanes too), "zero"
@@ -220,8 +246,23 @@ def exp2(lanes: int, *, bias: int | None = None, prec: str = "bf16", below: str 
     ~2^63); ``shift`` 64: 2^(x + 64) (a softmax's scale cancels; one constant register less). Its ``parts``:
     ``reduce`` (A -> P, f) and ``poly`` (P, f -> 2^x), for a caller that stores P and f between two loops."""
     _check("lanes", lanes, LANES)
-    _check("bias", bias, (None, 192))
+    _check("bias", bias, (None, 0, 192))
     params = {"bias": bias, "prec": prec, "below": below, "above": above, "shift": shift}
+    if bias == 0:
+        _check("prec", prec, ("chord", "chord2"))
+        _check("below", below, ("clamp",))
+        _check("above", above, ("none",))
+        _check("shift", shift, (0,))
+        two = prec == "chord2"
+        rel = 1.2e-2 if two else 6.2e-2
+        wider = "2.0% for |x| <= 4, 3.6% for |x| <= 8" if two else "7.9% for |x| <= 8"
+        text = _ENV.from_string(_EXP2_CHORD).render(N=lanes, two=two, c=CHORD2_C, scale=CHORD2_SCALE if two else 1,
+                                                    bound=_bound(None, rel), wider=wider, name="{{ name }}",
+                                                    attr="{{ attr }}")
+        local = f"exp2_{prec}_{lanes}" + ("_i" if inline else "")
+        return _fn(local, text, inline=inline, lanes=lanes, arg="accum",
+                   ret="accum" if two else "bfloat16", func="exp2", params=params, domain=(-2.0, 2.0),
+                   valid=(-120.0, 120.0), rel=rel)
     if bias is None:
         _check("prec", prec, ("bf16", "fp32"))
         _check("below", below, ("clamp", "zero", "int") if prec == "bf16" else ("clamp",))

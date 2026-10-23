@@ -24,6 +24,8 @@ CASES = {  # id: the function and its arguments
     "exp2-b192-sat": ("exp2", {"lanes": 32, "bias": 192, "above": "clamp"}),
     "exp2-b192-bounded": ("exp2", {"lanes": 32, "bias": 192, "below": "bounded"}),
     "exp2-b192-s64": ("exp2", {"lanes": 32, "bias": 192, "shift": 64}),
+    "exp2-chord": ("exp2", {"lanes": 32, "bias": 0, "prec": "chord"}),
+    "exp2-chord2": ("exp2", {"lanes": 32, "bias": 0, "prec": "chord2"}),
     "recip-n2": ("recip", {"lanes": 32, "unroll": True}),
     "recip-n3": ("recip", {"lanes": 16, "steps": 3, "inline": False}),
     "recip-normal": ("recip", {"lanes": 16, "domain": "normal", "steps": 3, "inline": False}),
@@ -60,6 +62,7 @@ def _contracts() -> list[kmath.Fn]:
     for lanes, inline in itertools.product(kmath.LANES, (False, True)):
         fns += [kmath.exp2(lanes, prec="bf16", below=b, inline=inline) for b in ("clamp", "zero", "int")]
         fns += [kmath.exp2(lanes, prec="fp32", inline=inline), kmath.silu(lanes, inline=inline)]
+        fns += [kmath.exp2(lanes, bias=0, prec=p, inline=inline) for p in ("chord", "chord2")]
         fns += [kmath.recip(lanes, domain=d, steps=n, unroll=u, inline=inline)
                 for d, n, u in itertools.product(("unit", "normal"), (2, 3), (False, True))]
         fns += [f(lanes, inline=inline) for f in (kmath.expneg, kmath.expm1, kmath.softplus, kmath.sigmoid)]
@@ -81,8 +84,9 @@ def test_kmath_sources() -> None:
             ks = KernelSource(f.src)
             assert f.name in ks.names, f.name
             assert names.setdefault(f.name, f.src) == f.src, f"{f.name}: two definitions"
-    for bad in ({"lanes": 8}, {"lanes": 32, "prec": "fp32", "below": "zero"}, {"lanes": 32, "bias": 128}, {"lanes": 32, "shift": 64},
-                {"lanes": 32, "bias": 192, "prec": "fp32"}, {"lanes": 32, "above": "clamp"}):
+    for bad in ({"lanes": 8}, {"lanes": 32, "prec": "fp32", "below": "zero"}, {"lanes": 32, "bias": 128},
+                {"lanes": 32, "shift": 64}, {"lanes": 32, "bias": 192, "prec": "fp32"}, {"lanes": 32, "above": "clamp"},
+                {"lanes": 32, "bias": 0}, {"lanes": 32, "bias": 0, "prec": "chord", "below": "zero"}):
         with pytest.raises(ValueError):
             kmath.exp2(**bad)
     for bad in (lambda: kmath.silu(32, exp_fn=kmath.exp2(32, below="int")),  # (silu's argument reaches -3e38)

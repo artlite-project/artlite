@@ -1093,22 +1093,24 @@ static __attribute__((noinline, minsize)) void {{ p }}_first40(float *__restrict
   if (nk < 64) {{ p }}_mask40(sm, bias, nk);
 }
 
+{% set chord2 = km.exp2(32, bias=0, prec="chord2", inline=True) %}
+{{ chord2.src }}
+
 // P = 2^(S + bias) of a pair's 16 panels (S [2 q panels: 512 floats apart][8 key panels][64], bias [2 q panels][64]
-// bf16: -m) as bfp16 panels [key panel][q panel], times 2.06 .. 2.09 (the vexp2 chords at y and y + 1/2, the second
-// times 1 / sqrt 2: within 0.75% of 2.075 2^y; y truncated to bf16)
+// bf16: -m) as bfp16 panels [key panel][q panel], times 2.068 (o / l cancels it; kmath.exp2's two vexp2 chords: within
+// 1.2% for |S + bias| <= 2, the keys near the row's maximum that make the sums)
 static __attribute__((noinline)) void {{ p }}_exp40(const float *__restrict sm, const bfloat16 *__restrict bias,
                                                bfp16ebs8 *__restrict pp) {
   al::BOut<> po(pp);
-  const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), h = aie::broadcast<bfloat16, 32>(0.70703125f);
-  const aie::vector<float, 32> half = aie::broadcast<float, 32>(0.5f);
+  const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
   AIE_LOOP_MIN_ITERATION_COUNT(16)
   for (int i = 0; i < 16; i++) {  // (panel i: key panel i / 2, q panel i % 2)
     const float *s = sm + 512 * (i & 1) + 64 * (i >> 1);
     const bfloat16 *b = bias + 64 * (i & 1);
     const aie::accum<accfloat, 32> A0 = aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(s)), aie::load_v<32>(b), one);
     const aie::accum<accfloat, 32> A1 = aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(s + 32)), aie::load_v<32>(b + 32), one);
-    const aie::accum<accfloat, 32> p0 = aie::mac(aie::mul(al::exp2_acc<32>(A0), one), al::exp2_acc<32>(aie::add(A0, half)), h);
-    const aie::accum<accfloat, 32> p1 = aie::mac(aie::mul(al::exp2_acc<32>(A1), one), al::exp2_acc<32>(aie::add(A1, half)), h);
+    const aie::accum<accfloat, 32> p0 = {{ chord2 }}(A0);
+    const aie::accum<accfloat, 32> p1 = {{ chord2 }}(A1);
     po.push(aie::concat(p0, p1).template to_vector<bfp16ebs8>());
   }
 }

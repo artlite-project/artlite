@@ -114,7 +114,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
   - no scalar soft-float math (`al::inv_rms`);
   - the idea of warning about library arithmetic (`checks.py`).
 - **Kept Artlite's**:
-  - exp2 (`al::exp2`, exact to 1 bf16 ULP; upstream's polynomial exp2 is ~15 cycles per element,
+  - exp2 (`km.exp2`, 0.4 bf16 ULP; upstream's polynomial exp2 is ~15 cycles per element,
     its softmax uses the chord vexp2);
   - SiLU (upstream: plain vtanh, same small-|x| error).
 - **Rejected**: the bf16-staging MAC loop (above).

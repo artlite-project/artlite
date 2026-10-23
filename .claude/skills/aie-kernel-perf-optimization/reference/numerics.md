@@ -61,10 +61,13 @@ x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
 | `vtanh` | 16 | mv | coarse (max 8.5% rel.); returns its argument below |x| = 0.5; bf16 saturation near 1 |
 | gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`act_lut.py`) |
 
-- vexp2 is Schraudolph's exp bit for bit (probed over every bf16): bits =
-  128 y + 16256 of y truncated to bf16, the fraction's 7 bits truncated. Exact at non-negative integers (an exact
-  2^n: the exp2 recipe below); at negative integers 2^n (1 - 2^-8) (a one's-complement fraction). Its error depends
-  on the fraction only: a correction needs the fraction, i.e. the range split anyway.
+- vexp2 is Schraudolph's exp bit for bit (probed over every bf16 and fp32 accumulators): bits = floor(128 y) +
+  16256, for y < 0 16255 - trunc(128 |y|) (one's complement), y the argument truncated to bf16 (steps of 1/4 from
+  |y| = 32: up to 19%). Exact at non-negative integers (an exact 2^n: the exp2 recipe below); at negative integers
+  2^n (1 - 2^-8). Its error depends on the fraction only: a correction needs the fraction, i.e. the range split
+  anyway. Where a softmax's scale-free P suffices, two chords (`km.exp2(bias=0, prec="chord2")`: vexp2(x) +
+  vexp2(x + 1/2) / sqrt 2, two vexp2, an add, two products) are within 1.2% of 2.068 2^x for |x| <= 2 (1 / sqrt 2:
+  the chords' errors cancel; weights minimax for |x| <= 2 gave SD's UNet more error).
 - The gather: lane k of an instruction reads table ab (k % 4 < 2) or cd, its odd lanes 32 bytes further; offset bits
   5:4 select the entry of a 64-byte group, bits 3:0 are ignored. So a table is 4 copies: groups of 4 entries stored
   twice, in ab and cd (cd aliased onto ab: half the memory, 9% slower for SiLU). The reads carry no memory operand.
@@ -101,7 +104,7 @@ No branches, no -inf handling. 64 lanes per step, about
 
 Max 0.585 ULP, 99.80% correctly rounded over the bf16 y in [-63, 63); II 10 per 32 lanes (its 10 MACs: the vec
 bound), ~370 cycles per 1024 on the NPU, bit-exact against its numpy emulation. A quadratic (hi' constant: c1 0.703125, c2 0.2412109375)
-saves 2 MACs: max 0.85 ULP, mean 0.26 (the cubic's 0.56 / 0.21). `al::exp2`: 1 ULP, ~880 cycles, not
+saves 2 MACs: max 0.85 ULP, mean 0.26 (the cubic's 0.56 / 0.21). `km.exp2`'s fp32 cubic: 0.4 ULP, ~880 cycles, not
 pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 
 ### Softmax in the MMUL panel layout (decode attention)

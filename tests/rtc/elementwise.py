@@ -228,21 +228,19 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
     aie::set_rounding(aie::rounding_mode::conv_even);
     for (int j = 0; j < {{ ts }}; j += {{ fn.lanes }}) {
         const aie::vector<float, {{ fn.lanes }}> x = aie::load_v<{{ fn.lanes }}>(input + j);
-{% if fn.arg == "accum" %}
-        aie::store_v(output + j, {{ fn }}(aie::accum<accfloat, {{ fn.lanes }}>(x)).template to_vector<float>());
-{% elif fn.arg == "bfloat16" %}
-        aie::store_v(output + j, {{ fn }}(aie::accum<accfloat, {{ fn.lanes }}>(x).template to_vector<bfloat16>()));
-{% else %}
-        aie::store_v(output + j, {{ fn }}(x));
-{% endif %}
+{% set arg = {"accum": "aie::accum<accfloat, " ~ fn.lanes ~ ">(x)",
+               "bfloat16": "aie::accum<accfloat, " ~ fn.lanes ~ ">(x).template to_vector<bfloat16>()"}.get(fn.arg, "x") %}
+{% set r = fn ~ "(" ~ arg ~ ")" %}
+        aie::store_v(output + j, {{ {"accum": r ~ ".template to_vector<float>()",
+                                     "bfloat16": "aie::accum<accfloat, " ~ fn.lanes ~ ">(" ~ r ~ ").template to_vector<float>()"}.get(fn.ret, r) }});
     }
 }
 """)
 
 
 class KmOperator(StreamOperator):
-    """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument, an fp32
-    vector or accumulator result) on a 1-D fp32 vector, one core."""
+    """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument and result)
+    on a 1-D fp32 vector, one core."""
 
     def __init__(self, *, size: int, func: str, **kwargs: object):
         self.func, self.kwargs = func, kwargs

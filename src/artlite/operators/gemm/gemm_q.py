@@ -236,6 +236,9 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 // loop for A and B does not pipeline. ``zero`` is a runtime 0: B's second loads of x (not merged with the
 // first) keep its lifetimes short.
 {% set mp = m // sxp %}
+{% set chord = km.exp2(32, bias=0, prec="chord", inline=True) %}
+{{ chord.src }}
+
 void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
                   int32_t zero)
 {
@@ -266,7 +269,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             aie::vector<bfloat16, 32> t = al::tanh_acc<32>(a_acc);
             aie::vector<bfloat16, 32> body = aie::mac(a_acc, a, t).template to_vector<bfloat16>();
             aie::vector<bfloat16, 32> a1t = aie::msc(a_acc, a, t).template to_vector<bfloat16>();
-            aie::vector<bfloat16, 32> tail = aie::mul(a1t, al::exp2_acc<32>(aie::mul(x, kl))).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> tail = aie::mul(a1t, {{ chord }}(aie::mul(x, kl))).template to_vector<bfloat16>();
             aie::store_v(py, aie::select(body, tail, aie::lt(x, kt)));
             py += 32;
         }
