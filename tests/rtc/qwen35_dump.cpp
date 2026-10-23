@@ -4,7 +4,7 @@
 // Built against a prebuilt llama.cpp tree (include/, ggml/include/, build/bin/libllama.so) by qwen35_ref.py.
 //
 //   qwen35_dump -m MODEL -t TOKENS -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]
-//               [--logits f32|f16|none] [--states last|all] [--threads N]
+//               [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]
 //
 // TOKENS: raw little-endian int32 token ids. The tokens run in ubatches of UBATCH (default: all of them in
 // one); --split P: the first P in ubatches of UBATCH, then the rest one per ubatch (prompt, then decode
@@ -17,6 +17,11 @@
 // (STATE_NAMES) have no token axis: the last ubatch's (--states last) or all of them (--states all: (ubatches,
 // ...)). A name computed twice in a ubatch (Kcur before and after RoPE) gets ".1", ".2", ... from the second on.
 // OUTDIR/logits.npy: (tokens, vocab) of every position. OUTDIR/meta.json: what ran.
+//
+// --mtp: then the model's multi-token-prediction block (a qwen35moe MTP file, llama.cpp's LLAMA_CONTEXT_TYPE_MTP
+// context) over the same tokens, positions and ubatches, as llama.cpp's draft-mtp keeps its cache: the row at position
+// p takes token p and the model's output-normed hidden state h_nextn of row p - 1 (zeros for p = 0); its tensors of
+// LAYERS / REGEX (the MTP layer's index, "g") as OUTDIR/mtp.<name>-<il>.npy, its logits as OUTDIR/mtp.logits.npy.
 //
 // Backend: CPU only (no devices), F32 KV cache, flash attention off.
 
@@ -103,6 +108,9 @@ struct State {
     std::map<std::string, int> seen;  // names computed in the current ubatch
     std::map<std::string, Npy> files;
     std::map<std::string, std::pair<std::vector<int64_t>, std::vector<float>>> last;  // states: the last capture
+    std::string prefix;              // of the files' names
+    bool capture_h = false;          // keep h_nextn of every token (--mtp: the MTP block's inputs)
+    std::vector<float> h, h_result;  // (h_nextn; result_norm: the same tensor when every row is an output)
 };
 
 // "attn_norm-3" -> ("attn_norm", 3); "result_norm" -> ("result_norm", -1)
@@ -158,10 +166,17 @@ static std::vector<float> to_f32(const ggml_tensor * t) {
     return out;
 }
 
+static bool is_h(const ggml_tensor * t) { return strcmp(t->name, "h_nextn") == 0 || strcmp(t->name, "result_norm") == 0; }
+
 static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
     State & st = *(State *) user;
     if (ask) {
-        return wanted(st, t);
+        return wanted(st, t) || (st.capture_h && is_h(t));
+    }
+    if (st.capture_h && is_h(t)) {
+        const std::vector<float> v = to_f32(t);
+        std::vector<float> & h = strcmp(t->name, "h_nextn") == 0 ? st.h : st.h_result;
+        h.insert(h.end(), v.begin(), v.end());
     }
     if (!wanted(st, t)) {
         return true;
@@ -178,7 +193,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
         if (st.states_all) {
             Npy & f = st.files[name];
             if (!f.f) {
-                f.open(st.outdir + "/" + name + ".npy");
+                f.open(st.outdir + "/" + st.prefix + name + ".npy");
                 f.tail = rev;
             }
             f.write(v.data(), v.size() * 4);
@@ -200,7 +215,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
     }
     Npy & f = st.files[name];
     if (!f.f) {
-        f.open(st.outdir + "/" + name + ".npy");
+        f.open(st.outdir + "/" + st.prefix + name + ".npy");
         if (t->type == GGML_TYPE_I32) {
             f.dtype = "<i4";
         }
@@ -220,12 +235,12 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 static void usage() {
     fprintf(stderr,
             "usage: qwen35_dump -m MODEL -t TOKENS.i32 -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]\n"
-            "                   [--logits f32|f16|none] [--states last|all] [--threads N]\n");
+            "                   [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]\n");
     exit(1);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, tokens_path, layers_arg, regex_arg = "", logits_mode = "f32";
+    std::string model_path, tokens_path, layers_arg, regex_arg = "", logits_mode = "f32", mtp_path;
     State st;
     int ubatch = 0, split = -1, threads = 16;
     for (int i = 1; i < argc; i++) {
@@ -256,6 +271,8 @@ int main(int argc, char ** argv) {
             st.states_all = next() == "all";
         } else if (a == "--threads") {
             threads = std::atoi(next().c_str());
+        } else if (a == "--mtp") {
+            mtp_path = next();
         } else {
             usage();
         }
@@ -335,6 +352,7 @@ int main(int argc, char ** argv) {
     cp.op_offload = false;
     cp.cb_eval = eval_cb;
     cp.cb_eval_user_data = &st;
+    st.capture_h = !mtp_path.empty();
     cp.no_perf = true;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
@@ -389,24 +407,116 @@ int main(int argc, char ** argv) {
     if (logits.f) {
         logits.close();
     }
-    for (auto & [name, f] : st.files) {
-        f.close();
+    State sm;  // (the MTP block's run: the same ubatches)
+    llama_model * mtp = nullptr;
+    llama_context * cx = nullptr;
+    if (!mtp_path.empty()) {
+        const int n_embd = llama_model_n_embd(model);
+        if (st.h.size() != (size_t) n * n_embd) {  // (no row cropped: the tensor was renamed result_norm)
+            st.h.swap(st.h_result);
+        }
+        if (st.h.size() != (size_t) n * n_embd) {
+            fprintf(stderr, "h_nextn: %zu values for %d tokens of %d\n", st.h.size(), n, n_embd);
+            return 1;
+        }
+        llama_model_params mpm = mp;
+        mpm.load_mtp = true;
+        mtp = llama_model_load_from_file(mtp_path.c_str(), mpm);
+        if (!mtp) {
+            fprintf(stderr, "cannot load %s\n", mtp_path.c_str());
+            return 1;
+        }
+        sm.outdir = st.outdir;
+        sm.names = st.names;
+        sm.layers = st.layers;
+        sm.all_layers = st.all_layers;
+        sm.prefix = "mtp.";
+        llama_context_params cm = cp;
+        cm.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cm.cb_eval_user_data = &sm;
+        cx = llama_init_from_model(mtp, cm);
+        if (!cx) {
+            fprintf(stderr, "cannot create the MTP context\n");
+            return 1;
+        }
+        Npy ml;
+        if (logits_mode != "none") {
+            ml.open(st.outdir + "/mtp.logits.npy");
+            ml.tail = {n_vocab};
+            if (logits_mode == "f16") {
+                ml.dtype = "<f2";
+                ml.elem = 2;
+            }
+        }
+        const std::vector<float> zero(n_embd, 0.0f);
+        llama_batch_ext * be = llama_batch_ext_init(cx);
+        for (int p = 0; p < n;) {
+            const int nb = p < n_prompt ? std::min(ubatch, n_prompt - p) : 1;
+            llama_batch_ext_clear(be);
+            for (int i = 0; i < nb; i++) {
+                const llama_pos pos = p + i;
+                const int32_t idx = llama_batch_ext_add_token(be, 0, tokens[p + i]);
+                const float * h = pos ? st.h.data() + (size_t) (pos - 1) * n_embd : zero.data();
+                if (idx < 0 || !llama_batch_ext_set_pos(be, idx, &pos) ||
+                    !llama_batch_ext_set_embd_state(be, idx, {h, 1, (size_t) n_embd}) ||
+                    !llama_batch_ext_set_output_logits(be, idx, logits_mode != "none" || pos == n - 1)) {
+                    fprintf(stderr, "MTP batch at position %d\n", pos);
+                    return 1;
+                }
+            }
+            sm.n_tokens = nb;
+            sm.seen.clear();
+            if (llama_process(cx, LLAMA_PROCESS_TYPE_DECODE, be) != 0) {
+                fprintf(stderr, "llama_process (MTP) failed at position %d\n", p);
+                return 1;
+            }
+            if (ml.f) {
+                for (int i = 0; i < nb; i++) {
+                    const float * l = llama_get_logits_ith(cx, i);
+                    if (ml.elem == 2) {
+                        for (int k = 0; k < n_vocab; k++) {
+                            half[k] = ggml_fp32_to_fp16(l[k]);
+                        }
+                        ml.write(half.data(), half.size() * 2);
+                    } else {
+                        ml.write(l, (size_t) n_vocab * 4);
+                    }
+                    ml.rows++;
+                }
+            }
+            sm.ubatch++;
+            p += nb;
+        }
+        llama_batch_ext_free(be);
+        if (ml.f) {
+            ml.close();
+        }
     }
-    for (auto & [name, sv] : st.last) {
-        Npy f;
-        f.open(st.outdir + "/" + name + ".npy");
-        f.tail = {sv.first.begin() + 1, sv.first.end()};
-        f.rows = sv.first[0];
-        f.write(sv.second.data(), sv.second.size() * 4);
-        f.close();
+    for (State * s : {&st, &sm}) {
+        for (auto & [name, f] : s->files) {
+            f.close();
+        }
+        for (auto & [name, sv] : s->last) {
+            Npy f;
+            f.open(s->outdir + "/" + s->prefix + name + ".npy");
+            f.tail = {sv.first.begin() + 1, sv.first.end()};
+            f.rows = sv.first[0];
+            f.write(sv.second.data(), sv.second.size() * 4);
+            f.close();
+        }
     }
     {
         FILE * f = fopen((st.outdir + "/meta.json").c_str(), "w");
-        fprintf(f, "{\"model\": \"%s\", \"tokens\": %d, \"ubatch\": %d, \"split\": %d, \"ubatches\": %d, \"logits\": \"%s\"}\n",
-                model_path.c_str(), n, ubatch, split, st.ubatch, logits_mode.c_str());
+        fprintf(f, "{\"model\": \"%s\", \"tokens\": %d, \"ubatch\": %d, \"split\": %d, \"ubatches\": %d, \"logits\": \"%s\", "
+                   "\"mtp\": \"%s\"}\n",
+                model_path.c_str(), n, ubatch, split, st.ubatch, logits_mode.c_str(), mtp_path.c_str());
         fclose(f);
     }
     llama_batch_free(batch);
+    if (cx) {
+        llama_free(cx);
+        llama_model_free(mtp);
+    }
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();

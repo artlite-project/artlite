@@ -9,7 +9,9 @@ full-attention layers -, ``new_state``, ``final_output``, ``Qcur_full``, ``Kcur.
 ``src/models/qwen35moe.cpp``: ``attn_post_norm`` - its input -, ``ffn_moe_logits``, ``ffn_moe_probs``, ``ffn_moe_topk``
 - the experts' ids, int32 -, ``ffn_moe_weights_norm``, ``ffn_moe_gate`` / ``_up`` / ``_down`` (tokens, k, ...),
 ``ffn_moe_weighted``, ``ffn_moe_out``, ``ffn_shexp``, ``shared_expert_gate``, ``ffn_out``), and the logits of every
-position. They are cached under ``tests/rtc/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs``
+position; with an MTP file (``mtp``) its block over the same positions (``src/models/qwen35moe.cpp``'s ``graph_mtp``:
+``mtp_eh_proj``, ``mtp_attn_out``, ``mtp_attn_residual``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``, its logits:
+``g.mtp(name, layer)``, ``g.mtp_logits``), each row fed the model's ``h_nextn`` of the row before. They are cached under ``tests/rtc/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs``
 recomputes). llama.cpp quantizes the activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that
 error, and its prompt and one-token graphs differ by ~1% after a few layers: compare layers by tolerance, the model
 by KL. In a ``qwen35moe`` model they differ by ~15% at the last layer and in the top 8 of 40-70% of the tokens
@@ -19,7 +21,7 @@ reaches the same KL), so its layers are compared where the routing agrees.
 Oracles: the exact math of each block in float32 (llama.cpp's CPU ops), on numpy arrays with tokens as the
 leading axis: ``rms_norm``, ``conv_seq``, ``l2norm``, ``gdn_gates``, ``gdn_seq`` / ``gdn_step``,
 ``gated_norm``, ``rope_partial``, ``attention_gqa``, ``q_and_gate``; the MoE FFN: ``moe_route``, ``moe_ffn`` (over
-``experts``), ``shared_expert``.
+``experts``), ``shared_expert``; a multi-token-prediction block: ``mtp_block``.
 
 The cores' arithmetic (their rounding points, float64 elsewhere): ``core_gdn_step`` (the decode's GDN core),
 ``core_gdn_scan`` / ``core_gdn_out`` (the prefill's GDN scan and gated output), ``core_attention`` (a decode
@@ -134,18 +136,29 @@ class Golden:
     def logits(self) -> np.ndarray:
         return self["logits"]
 
+    def mtp(self, name: str, layer: int | None = None) -> np.ndarray:
+        """A tensor of the MTP block's run (``golden(mtp=)``)."""
+        return self[("mtp." + name, layer) if layer is not None else "mtp." + name]
+
+    @property
+    def mtp_logits(self) -> np.ndarray:
+        return self["mtp.logits"]
+
 
 def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split: int = -1,
            layers: tuple[int | str, ...] = (), names: str = "", logits: str = "f16", states: str = "last",
-           threads: int = 16) -> Golden:
+           threads: int = 16, mtp: str = "") -> Golden:
     """llama.cpp's tensors for the token sequence (teacher forcing). ``ubatch``: tokens per graph (0: all in
     one; 1: decode graphs); ``split`` = P: the first P tokens in ubatches of ``ubatch``, then one per graph.
     ``layers``: layer indices whose tensors matching ``names`` (a regex over the names without the layer
     suffix) are dumped ("g": the tensors without a layer, "all": every layer). ``logits``: "f32", "f16" or
-    "none". ``states``: the recurrent states ("new_state", ...) of the last ubatch, or "all" of them."""
+    "none". ``states``: the recurrent states ("new_state", ...) of the last ubatch, or "all" of them. ``mtp``: an MTP
+    file whose block then runs over the same rows (its ``layers`` / ``names`` tensors, its logits)."""
     tokens = np.ascontiguousarray(tokens, np.int32)
     key = (common.model_key(model), hashlib.sha256(tokens.tobytes()).hexdigest(), ubatch, split,
            tuple(str(x) for x in layers), names, logits, states, _lib_identity())
+    if mtp:
+        key += (common.model_key(mtp),)
     h = hashlib.sha256(repr(key).encode())
     with open(DUMP_SRC, "rb") as f:
         h.update(f.read())
@@ -162,6 +175,8 @@ def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split
                "--split", str(split), "--logits", logits, "--states", states, "--threads", str(threads)]
         if layers:
             cmd += ["-l", ",".join(str(x) for x in layers), "-n", names or ".*"]
+        if mtp:
+            cmd += ["--mtp", mtp]
         r = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if r.returncode:
             raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
@@ -366,6 +381,52 @@ def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndar
     """The shared expert times its gate (``ffn_shexp_gated``): sigmoid(gate_inp . x) swiglu(x); gate_inp (H,) (the
     GGUF's ``ffn_gate_inp_shexp``). A layer's FFN output is ``moe_ffn`` + this."""
     return sigmoid(f32(x) @ f32(gate_inp).reshape(-1, 1)) * swiglu(x, gate, up, down)
+
+
+def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos: np.ndarray, *,
+              head_rows: int = 0) -> dict[str, np.ndarray]:
+    """A ``qwen35moe`` MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP
+    file) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the rows after it: emb (T, H) the
+    rows' token embeddings, h (T, H) the model's output-normed hidden state of the position before each (zeros at 0).
+    Returns its tensors by llama.cpp's names (``mtp_eh_proj``: the layer's input x0, ``mtp_attn_residual``,
+    ``mtp_attn_post_norm``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``: the next draft's h), the experts' ids and
+    weights (``ids``, ``weights``) and the logits of the head's first ``head_rows`` rows (0: none)."""
+    L, eps = cfg.num_hidden_layers, cfg.rms_norm_eps
+    b = f"blk.{L}."
+
+    def mat(name: str) -> np.ndarray:
+        t = gguf.tensor(b + name)
+        return f32(t.dequantize().numpy()).reshape(t.rows, t.cols)
+
+    def vec(name: str) -> np.ndarray:
+        return f32(gguf.tensor(b + name).dequantize().numpy()).reshape(-1)
+
+    T, d = emb.shape[0], cfg.head_dim
+    nh, nkv = cfg.num_attention_heads, cfg.num_key_value_heads
+    out = {}
+    cat = np.concatenate([rms_norm(emb, vec("nextn.enorm.weight"), eps), rms_norm(h, vec("nextn.hnorm.weight"), eps)], -1)
+    x0 = out["mtp_eh_proj"] = cat @ mat("nextn.eh_proj.weight").T
+    xa = rms_norm(x0, vec("attn_norm.weight"), eps)
+    q, gate = q_and_gate(xa @ mat("attn_q.weight").T, nh)
+    k = (xa @ mat("attn_k.weight").T).reshape(T, nkv, d)
+    v = (xa @ mat("attn_v.weight").T).reshape(T, nkv, d)
+    theta = cfg.rope_theta(pos)
+    q = rope_partial(rms_norm(q, vec("attn_q_norm.weight"), eps), theta)
+    k = rope_partial(rms_norm(k, vec("attn_k_norm.weight"), eps), theta)
+    o = attention_gqa(q, k, v, scale=1 / np.sqrt(d), q_pos=np.asarray(pos))
+    x1 = out["mtp_attn_residual"] = (o * sigmoid(gate)).reshape(T, -1) @ mat("attn_output.weight").T + x0
+    xm = out["mtp_attn_post_norm"] = rms_norm(x1, vec("post_attention_norm.weight"), eps)
+    ids, w = moe_route(xm @ mat("ffn_gate_inp.weight").T, cfg.n_experts_used)
+    out["ids"], out["weights"] = ids, w
+    y = moe_ffn(xm, ids, w, experts(gguf, L)) + shared_expert(
+        xm, mat("ffn_gate_shexp.weight"), mat("ffn_up_shexp.weight"), mat("ffn_down_shexp.weight"),
+        vec("ffn_gate_inp_shexp.weight"))
+    out["mtp_ffn_out"] = y
+    x2 = out["mtp_post_ffn"] = x1 + y
+    hn = out["h_nextn"] = rms_norm(x2, vec("nextn.shared_head_norm.weight"), eps)
+    if head_rows:
+        out["logits"] = hn @ f32(gguf.rows("output.weight", np.arange(head_rows)).numpy()).T
+    return out
 
 
 def rel_err(a: np.ndarray, b: np.ndarray) -> float:

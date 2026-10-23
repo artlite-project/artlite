@@ -85,6 +85,27 @@ def assistant_of(model: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(model)), "mtp-" + os.path.basename(model))
 
 
+MTP_QUANTS = ("Q4_0", "Q8_0")  # (a qwen35 drafter file by preference: Artlite's Q4_0 GEMV and GEMMs, Q8_0's GEMV)
+
+
+def qwen_mtp_of(model: str) -> str | None:
+    """The multi-token-prediction drafter (``mtp-*.gguf``) of a qwen35 / qwen35moe model file without a block of its
+    own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
+    the drafters apart from other uploaders' models); of several, the first of ``MTP_QUANTS``. None: there is none."""
+    d = os.path.dirname(os.path.abspath(model))
+    root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d)
+    others = sorted(os.path.join(root, org, repo) for org in os.listdir(root) if os.path.isdir(os.path.join(root, org, repo)))
+
+    def rank(f: str) -> int:
+        return next((i for i, q in enumerate(MTP_QUANTS) if f.endswith(f"-{q}.gguf")), len(MTP_QUANTS))
+
+    for x in dict.fromkeys([d, *others]):
+        files = [f for f in os.listdir(x) if f.startswith("mtp-") and f.endswith(".gguf")]
+        if files:
+            return os.path.join(x, min(sorted(files), key=rank))
+    return None
+
+
 def sd15_dir() -> str:
     """The diffusers directory of Stable Diffusion 1.5 (``model_index.json``, ``tokenizer/``, ``text_encoder/``,
     ``unet/``, ``vae/``, ``scheduler/``)."""
