@@ -131,11 +131,10 @@ __attribute__((noinline)) void {{ p }}_scores(const uint8_t *__restrict k, const
     aie::store_v(so, aie::add(c.template extract<32>(0), c.template extract<32>(1)));  // q rows hi + lo
 }
 
-// 2^x of 32 lanes: exactly 0 for the masked scores (-1e30)
-__attribute__((noinline)) aie::vector<float, 32> {{ p }}_exp2(aie::vector<float, 32> x)
-{
-    return al::exp2f<32, true>(x);
-}
+{# 2^x of 32 lanes: exactly 0 for the masked scores (-1e30); inlined in the gate's sigmoid #}
+{% set exp2, exp2i = km.exp2(32, below="zero"), km.exp2(32, inline=True) %}
+{{ exp2.src }}
+{{ exp2i.src }}
 
 // y[db][8 r + i] += P V of one record: v its first V panel, pp its P panel
 __attribute__((noinline)) void {{ p }}_pv(const uint8_t *__restrict v, const uint8_t *__restrict pp,
@@ -160,7 +159,7 @@ __attribute__((noinline)) void {{ p }}_pv(const uint8_t *__restrict v, const uin
 __attribute__((noinline)) void {{ p }}_pslot(const float *__restrict sc, const float *__restrict m, float *__restrict l,
                                              uint8_t *__restrict pp, uint32_t rows)
 {
-    const aie::vector<float, 32> P = aie::select(aie::zeros<float, 32>(), {{ p }}_exp2(aie::sub(aie::load_v<32>(sc), aie::load_v<32>(m))),
+    const aie::vector<float, 32> P = aie::select(aie::zeros<float, 32>(), {{ exp2 }}(aie::sub(aie::load_v<32>(sc), aie::load_v<32>(m))),
                                                  aie::mask<32>::from_uint32(rows));
     aie::store_v(l, aie::add(aie::load_v<32>(l), P));
     al::BOut<> o((bfp16ebs8 *)pp);
@@ -355,7 +354,7 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
             aie::store_v(q + i, al::mul_hilo<32, {{ qc[0] }}f, {{ qc[1] }}f>(aie::load_v<32>(q + i)));
             // sigmoid(gate) = 1 / (1 + 2^(-gate log2 e)) (bf16-level: the output is rounded to bf16)
             const aie::vector<float, 32> gv = aie::accum<accfloat, 32>(aie::load_v<32>(pay + {{ 2 * HD }} * h + {{ HD }} + i)).template to_vector<float>();
-            const aie::vector<float, 32> e = al::exp2f<32>(al::log2e<32>(aie::sub(aie::zeros<float, 32>(), gv)));
+            const aie::vector<float, 32> e = {{ exp2i }}(al::log2e<32>(aie::sub(aie::zeros<float, 32>(), gv)));
             aie::store_v(AW(bfloat16, {{ a.gs }}) + {{ HD }} * r + i,
                          aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>());
         }
@@ -476,7 +475,7 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
         // would be a soft-float call, __gtsf2)
         if (__builtin_bit_cast(int32_t, (float)aie::reduce_max(aie::sub(mn, m0))) > 0)
             {{ p }}_mrg((const float __aie_dm_resource_a *)y, y, (const float __aie_dm_resource_b *)y,
-                        {{ p }}_exp2(aie::sub(m0, mn)), aie::zeros<float, 32>());
+                        {{ exp2 }}(aie::sub(m0, mn)), aie::zeros<float, 32>());
         AIE_LOOP_NO_UNROLL
         for (int k = 0; k < 4 && 4 * g + k < rp; k++) {  // (the records before the open ones)
             {{ p }}_pslot(ss + 32 * k, ml, y + {{ 32 * ND }}, AW(uint8_t, {{ a.pp }}), ~0u);
@@ -510,7 +509,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
         float *__restrict y = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set;
         const float *__restrict ye = (const float *)pw + {{ a.y // 4 }} + {{ 32 * (ND + 1) }} * set;
         {{ p }}_mrg((const float __aie_dm_resource_a *)y, y, (const float __aie_dm_resource_b *)ye,
-                    {{ p }}_exp2(aie::sub(m0, mx)), {{ p }}_exp2(aie::sub(m1, mx)));
+                    {{ exp2 }}(aie::sub(m0, mx)), {{ exp2 }}(aie::sub(m1, mx)));
     }
     if (st[{{ A_TP }}])  // (a split step's core with an east neighbour: its partial stays for it)
         return;

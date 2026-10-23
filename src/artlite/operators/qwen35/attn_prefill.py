@@ -463,6 +463,11 @@ _ATTN = JINJA_ENV.from_string(r"""
 // f [8][32] bf16 (or a rescale's row maxima [64] fp32)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
+{% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="bounded") %}
+{{ exp2.src }}
+{{ e192.parts.reduce.src }}
+{{ e192.parts.poly.src }}
+
 namespace {
 
 // Rows whose maximum grew: o, l scaled by 2^(m - mn), m = mn = max(m, rm) (rm: the rows' group maxima)
@@ -471,7 +476,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
 {
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
     const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
-    const aie::vector<float, 64> a = al::exp2f<64>(aie::max(aie::sub(m, mn), aie::broadcast<float, 64>(-126.0f)));
+    const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
     for (int db = 0; db < {{ ND }}; db++)
         aie::store_v(o + 64 * db, al::mulff<64>(aie::load_v<64>(o + 64 * db), a));
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
@@ -492,22 +497,21 @@ __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int
     }
 }
 
-// pass 1 of P = 2^(s - m) over a head's 4 panels of A = s + 192 - m, 32 lanes a step: v = bf16(A) (an integer for
-// 128 <= A < 256), f = bf16(A - v), P = 2^(max(v, 129) - 192) exactly (vexp2 of max(v, 129) - 128: the 2^-64 in pass
-// 2's constants; below 129 2^-63, f small: P ~ 0) -> pP, pF; whether every v <= 208 (s <= m + 16)
+// pass 1 of P = 2^(s - m) over a head's 4 panels of A = s + 192 - m, 32 lanes a step: the first step of kmath.exp2
+// (P = 2^(round(s - m) + 64) exactly, f = s - m - round(s - m); masked keys -16384: P ~ 0) -> pP, pF; whether
+// every bf16(A) <= 208 (s <= m + 16)
 [[clang::always_inline]] inline bool {{ p }}_pexp1(const float *__restrict sl, bfloat16 *__restrict pP,
                                                    bfloat16 *__restrict pF)
 {
-    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), lo = aie::broadcast<bfloat16, 32>(129.0f);
-    aie::vector<bfloat16, 32> mx = lo;
+    aie::vector<bfloat16, 32> mx = aie::broadcast<bfloat16, 32>(128.0f);  // (the clamp's constant)
     AIE_LOOP_UNROLL(2)
     for (int t = 0; t < 8; t++) {
         aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
-        const aie::vector<bfloat16, 32> v0 = A.template to_vector<bfloat16>();
-        mx = aie::max(mx, v0);
-        aie::store_v(pF, aie::msc(A, v0, one).template to_vector<bfloat16>());
-        aie::store_v(pP, al::exp2_acc<32>(aie::mac(aie::mul(aie::max(v0, lo), one), aie::broadcast<bfloat16, 32>(-128.0f),
-                                                   one)));
+        mx = aie::max(mx, A.template to_vector<bfloat16>());
+        aie::vector<bfloat16, 32> P, f;
+        {{ e192.parts.reduce }}(A, P, f);
+        aie::store_v(pF, f);
+        aie::store_v(pP, P);
         sl += 32;
         pP += 32;
         pF += 32;
@@ -520,11 +524,9 @@ __attribute__((noinline)) bool {{ p }}_pass1(const float *__restrict s, float *_
     return {{ p }}_pexp1(s, (bfloat16 *)pw, (bfloat16 *)pw + 256);
 }
 
-// pass 2, a panel a step: 2^f = 1 + c1 f + f^2 (c2 + c3 f) (c1 fitted first, then c2, c3 with its rounding: 0.59 bf16
-// ULP), times P: the panel's P as bfp16 into pp, l += P
+// pass 2, a panel a step: the second step of kmath.exp2 (2^-64 P 2^f, bias 192): the panel's P as bfp16 into pp, l += P
 __attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *__restrict pl, uint8_t *__restrict pp)
 {
-    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
     const bfloat16 *__restrict pP = (const bfloat16 *)pw;
     const bfloat16 *__restrict pF = (const bfloat16 *)pw + 256;
     al::BOut<> po((bfp16ebs8 *)pp);
@@ -534,15 +536,7 @@ __attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *
         aie::accum<accfloat, 32> r[2];
         AIE_LOOP_UNROLL_FULL
         for (int u = 0; u < 2; u++) {
-            const aie::vector<bfloat16, 32> P = aie::load_v<32>(pP + 32 * u), f = aie::load_v<32>(pF + 32 * u);
-            const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f * 0x1p-64f)),
-                                                          aie::broadcast<bfloat16, 32>(0.2412109375f * 0x1p-64f), one)
-                                                     .template to_vector<bfloat16>();
-            const aie::vector<bfloat16, 32> p1 = aie::mul(P, f).template to_vector<bfloat16>();
-            const aie::vector<bfloat16, 32> p2 = aie::mul(p1, f).template to_vector<bfloat16>();
-            r[u] = aie::mul(P, aie::broadcast<bfloat16, 32>(0x1p-64f));
-            r[u] = aie::mac(r[u], p1, aie::broadcast<bfloat16, 32>(0.69140625f * 0x1p-64f));
-            r[u] = aie::mac(r[u], p2, hi);
+            r[u] = {{ e192.parts.poly }}(aie::load_v<32>(pP + 32 * u), aie::load_v<32>(pF + 32 * u));
         }
         l0 = aie::add(l0, r[0]);
         l1 = aie::add(l1, r[1]);

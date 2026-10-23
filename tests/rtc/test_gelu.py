@@ -18,7 +18,7 @@ def _domain() -> torch.Tensor:
 
 class TestRtcGELU:
     def test_gelu_lut(self):
-        """al::gelu_lut (the Gemma kernels' activation) over every finite bf16 in [-12, 12] against the tanh form
+        """kmath.gelu (the Gemma kernels' activation) over every finite bf16 in [-12, 12] against the tanh form
         in f64. Measured: 97.8% correctly rounded, mean 0.041 ULPs, within 1.7 ULPs everywhere."""
         x = _domain()
         op = GeluOperator(size=len(x), num_columns=1, tile_size=1024).compile()

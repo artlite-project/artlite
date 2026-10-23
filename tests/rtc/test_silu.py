@@ -8,7 +8,7 @@ from .elementwise import SiluOperator, emulate
 
 class TestRtcSiLU:
     def test_silu_exact(self):
-        """al::silu (the qwen35 decode GDN core's SiLU) over every finite bf16 in [-30, 30] (but the tiny ones
+        """kmath.silu (the qwen35 decode GDN core's SiLU) over every finite bf16 in [-30, 30] (but the tiny ones
         whose SiLU is denormal: flushed): 98.7% correctly rounded, within 1.17 bf16 ULPs (measured; the
         excess on the negative side is exp(-|x|) at bf16 precision)."""
         x = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)

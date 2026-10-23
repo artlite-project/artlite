@@ -19,6 +19,7 @@ import torch
 from jinja2 import Environment, StrictUndefined
 
 from .. import backend, portable, profiling
+from . import kmath
 from .kernel_source import KernelSource, translation_unit
 
 if TYPE_CHECKING:
@@ -92,7 +93,9 @@ def _tool_env() -> dict[str, str] | None:
 # trim_blocks removes the newline after a block tag; lstrip_blocks strips
 # leading whitespace before a block tag. Both keep the generated C++ clean.
 # StrictUndefined: a variable the render call does not pass is an error, not an empty string.
+# km: the math functions generated per contract (kmath.py), in every template.
 JINJA_ENV = Environment(trim_blocks=True, lstrip_blocks=True, undefined=StrictUndefined)
+JINJA_ENV.globals["km"] = kmath
 
 
 # Internal helpers

@@ -1,4 +1,5 @@
-// Kernel helpers shared by the operators' templates (namespace al).
+// Kernel helpers shared by the operators' templates (namespace al); math functions with variants (exp2,
+// SiLU, GELU) are generated per contract in kmath.py.
 //
 // Included by operators.h, so every kernel gets them through the precompiled header, and a fused
 // ELF (one translation unit for all its operators) has one copy. Everything is inline: a helper
@@ -161,51 +162,9 @@ template <unsigned N>
 }
 
 // ---------------------------------------------------------------------------------------------
-// exp2 and SiLU in software (the hardware vexp2 is the chord 2^n (1 + f): up to +6% on bf16
-// inputs; vtanh is a coarse LUT)
+// Reciprocal, LUT activations (exp2, SiLU, GELU in software: kmath.py; the hardware vexp2 is the
+// chord 2^n (1 + f): up to +6% on bf16 inputs; vtanh is a coarse LUT)
 // ---------------------------------------------------------------------------------------------
-
-// 2^x in fp32 for x >= -126: n = round(x) by the 1.5 * 2^23 split, 2^f (|f| <= 0.5) by a cubic
-// in bf16 products (to ~1 bf16 ULP), n added to the exponent bits. Below: 2^-126, or with ZERO
-// exactly 0 from x <= -127 on (masked lanes: -1e30; between: below 2^-126, inexact)
-template <unsigned N, bool ZERO = false>
-[[clang::always_inline]] inline aie::vector<float, N> exp2f(aie::vector<float, N> x)
-{
-    x = aie::max(x, aie::broadcast<float, N>(ZERO ? -127.0f : -126.0f));  // (-127: 1.0 with the exponent bits cleared)
-    const aie::vector<float, N> magic = aie::broadcast<float, N>(12582912.0f);  // 1.5 * 2^23
-    aie::vector<float, N> y = aie::add(x, magic);
-    aie::vector<float, N> f = aie::sub(x, aie::sub(y, magic));
-    aie::vector<int32, N> n = aie::sub(y.template cast_to<int32>(), aie::broadcast<int32, N>(0x4B400000));
-    aie::vector<bfloat16, N> fb = aie::accum<accfloat, N>(f).template to_vector<bfloat16>();
-    aie::accum<accfloat, N> q2(aie::broadcast<float, N>(0.24022650695910071f));
-    q2 = aie::mac(q2, fb, aie::broadcast<bfloat16, N>(0.0555041086648216f));
-    aie::accum<accfloat, N> q1(aie::broadcast<float, N>(0.69314718055994531f));
-    q1 = aie::mac(q1, fb, q2.template to_vector<bfloat16>());
-    aie::accum<accfloat, N> pa(aie::broadcast<float, N>(1.0f));
-    aie::vector<float, N> pf = aie::add(pa, mulc<N>(f, q1.template to_vector<bfloat16>())).template to_vector<float>();
-    return aie::add(pf.template cast_to<int32>(), aie::upshift(n, 23)).template cast_to<float>();
-}
-
-// 2^x in fp32 to ~2^-16 for x >= -126 (exp2f's split, then e^(f ln 2) by its Taylor polynomial of degree 6 in fp32
-// products, mulff): where exp2f's bf16-level error shows, e.g. an MoE router's weights
-template <unsigned N>
-[[clang::always_inline]] inline aie::vector<float, N> exp2_fp32(aie::vector<float, N> x)
-{
-    x = aie::max(x, aie::broadcast<float, N>(-126.0f));
-    const aie::vector<float, N> magic = aie::broadcast<float, N>(12582912.0f);  // 1.5 * 2^23
-    const aie::vector<float, N> y = aie::add(x, magic);
-    const aie::vector<float, N> f = aie::sub(x, aie::sub(y, magic));
-    const aie::vector<int32, N> n = aie::sub(y.template cast_to<int32>(), aie::broadcast<int32, N>(0x4B400000));
-    const aie::vector<float, N> t = mul_hilo<N, 0.69140625f, 0.001739501953125f>(f);  // (f ln 2)
-    aie::vector<float, N> p = aie::broadcast<float, N>(1.0f / 720);
-    p = aie::add(aie::broadcast<float, N>(1.0f / 120), mulff<N>(t, p));
-    p = aie::add(aie::broadcast<float, N>(1.0f / 24), mulff<N>(t, p));
-    p = aie::add(aie::broadcast<float, N>(1.0f / 6), mulff<N>(t, p));
-    p = aie::add(aie::broadcast<float, N>(0.5f), mulff<N>(t, p));
-    p = aie::add(aie::broadcast<float, N>(1.0f), mulff<N>(t, p));
-    p = aie::add(aie::broadcast<float, N>(1.0f), mulff<N>(t, p));
-    return aie::add(p.template cast_to<int32>(), aie::upshift(n, 23)).template cast_to<float>();
-}
 
 // 1 / x in fp32 to ~2^-16 for normal x > 0: the mantissa's reciprocal (a linear guess on [1, 2), 6%, and three Newton
 // steps in mulff), its exponent negated in the bits (no scalar division: a soft-float call)
@@ -222,33 +181,6 @@ template <unsigned N>
     for (int i = 0; i < 3; i++)
         r = mulff<N>(r, aie::sub(two, mulff<N>(m, r)));
     return aie::sub(r.template cast_to<int32>(), e).template cast_to<float>();
-}
-
-// the same 2^x rounded to bf16
-template <unsigned N>
-[[clang::always_inline]] inline aie::vector<bfloat16, N> exp2(aie::vector<float, N> x)
-{
-    return aie::accum<accfloat, N>(exp2f<N>(x)).template to_vector<bfloat16>();
-}
-
-// silu(x) = x sigmoid(x): t = exp(-|x|), r = 1 / (1 + t) from a linear guess on [1, 2] and two
-// Newton steps, sigmoid = x >= 0 ? r : t r. Rounded to bf16: 98.7% correctly rounded, max 1.17
-// ULPs (x < 0, where t's bf16-level error passes through; tests/rtc/test_silu.py).
-template <unsigned N>
-[[clang::always_inline]] inline aie::vector<float, N> silu(aie::vector<bfloat16, N> x)
-{
-    aie::vector<float, N> xf = aie::accum<accfloat, N>(x).template to_vector<float>();
-    aie::vector<float, N> nax = aie::min(xf, aie::sub(aie::zeros<float, N>(), xf));
-    aie::vector<float, N> t = aie::accum<accfloat, N>(exp2<N>(log2e<N>(nax))).template to_vector<float>();
-    const aie::vector<float, N> one = aie::broadcast<float, N>(1.0f);
-    const aie::vector<float, N> two = aie::broadcast<float, N>(2.0f);
-    aie::vector<float, N> d = aie::add(t, one);
-    aie::vector<float, N> r = aie::sub(aie::broadcast<float, N>(1.4117647f),
-                                       mulc<N>(d, aie::broadcast<bfloat16, N>(0.47058824f)).template to_vector<float>());
-    r = mulff<N>(r, aie::sub(two, mulff<N>(d, r)));
-    r = mulff<N>(r, aie::sub(two, mulff<N>(d, r)));
-    aie::vector<float, N> sg = aie::select(r, mulff<N>(t, r), aie::lt(xf, aie::zeros<float, N>()));
-    return mulff<N>(xf, sg);
 }
 
 // vtanh / vexp2 of an fp32 accumulator (16 lanes per instruction; the LUTs take the argument truncated
@@ -291,52 +223,6 @@ template <unsigned N>
     aie::accum<accfloat, 32> acc = aie::mac(aie::mul(xr, kh), s, p0);
     acc = aie::mac(acc, aie::mul(s, s).template to_vector<bfloat16>(), aie::mac(p1, s, p2).template to_vector<bfloat16>());
     return aie::select(y, acc.template to_vector<bfloat16>(), aie::lt(aie::abs(xm), aie::broadcast<bfloat16, 32>(2.5f)));
-}
-
-// gelu(x) in its tanh form, a (1 + tanh(w)), a = x / 2, w = sqrt(2 / pi) (x + 0.044715 x^3) (gelu_pytorch_tanh,
-// ggml_gelu: Gemma's activation) with the vtanh LUT, bf16: w = x (C1 + C2 x^2) in fp32 through bf16 hi / lo products
-// (C1 = sqrt(2 / pi), C2 = 0.044715 C1), T = tanh(|w|) (al::silu_small's fit tanh(w) / w in w^2 below |w| = 1.25, the
-// LUT above); a (1 + T) for x >= 0, a 2^(-2 |w| log2e) (1 + T) for x < 0 (1 + tanh(w) = e^(2 w) (1 + |tanh
-// w|) for w < 0: no cancellation anywhere; 2^y by the 1.5 2^23 split and exp2f's polynomial, the exponent
-// clamped as integers). xr: x again (a second load: shorter lifetimes, as in silu_small).
-[[clang::always_inline]] inline aie::vector<bfloat16, 32> gelu_lut(aie::vector<bfloat16, 32> x, aie::vector<bfloat16, 32> xr)
-{
-    const aie::vector<float, 32> sq = aie::mul(x, x).template to_vector<float>();  // exact
-    const aie::vector<float, 32> u = aie::add(aie::broadcast<float, 32>(0.7978845608f),
-                                              mul_hilo<32, 0.03564453125f, 3.2901763916015625e-05f>(sq));
-    const aie::vector<float, 32> aw = aie::abs(mulc<32>(u, xr).template to_vector<float>());  // |w|
-    // T = tanh(|w|)
-    const aie::vector<bfloat16, 32> wb = aie::accum<accfloat, 32>(aw).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> s = aie::mul(wb, wb).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> p0 = aie::broadcast<bfloat16, 32>(0.99609375f);
-    const aie::vector<bfloat16, 32> p2 = aie::broadcast<bfloat16, 32>(0.06298828125f);
-    const aie::accum<accfloat, 32> p1 = aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-0.30078125f));
-    const aie::vector<bfloat16, 32> tp = aie::mac(aie::mul(wb, p0), aie::mul(wb, s).template to_vector<bfloat16>(),
-                                                  aie::mac(p1, s, p2).template to_vector<bfloat16>()).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> tl = aie::tanh<bfloat16>(aw);
-    const aie::vector<bfloat16, 32> t = aie::select(tl, tp, aie::lt(wb, aie::broadcast<bfloat16, 32>(1.25f)));
-    // x >= 0: a (1 + T)
-    const auto a_acc = aie::mul(x, aie::broadcast<bfloat16, 32>(0.5f));
-    const aie::vector<bfloat16, 32> a = a_acc.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pos = aie::mac(a_acc, a, t).template to_vector<bfloat16>();
-    // x < 0: a e (1 + T), e = 2^y, y = -2 |w| log2e = n + f
-    const aie::vector<float, 32> y = mul_hilo<32, -2.890625f, 0.0052490234375f>(aw);
-    const aie::vector<float, 32> magic = aie::broadcast<float, 32>(12582912.0f);  // 1.5 2^23
-    const aie::vector<float, 32> yy = aie::add(y, magic);
-    const aie::vector<float, 32> f = aie::sub(y, aie::sub(yy, magic));
-    aie::vector<int32, 32> n = aie::sub(yy.template cast_to<int32>(), aie::broadcast<int32, 32>(0x4B400000));
-    n = aie::upshift(aie::max(n, aie::broadcast<int32, 32>(-126)), 23);
-    const aie::vector<bfloat16, 32> fb = aie::accum<accfloat, 32>(f).template to_vector<bfloat16>();
-    aie::accum<accfloat, 32> q2(aie::broadcast<float, 32>(0.24022650695910071f));
-    q2 = aie::mac(q2, fb, aie::broadcast<bfloat16, 32>(0.0555041086648216f));
-    aie::accum<accfloat, 32> q1(aie::broadcast<float, 32>(0.69314718055994531f));
-    q1 = aie::mac(q1, fb, q2.template to_vector<bfloat16>());
-    const aie::vector<float, 32> pf = aie::add(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(1.0f)),
-                                               mulc<32>(f, q1.template to_vector<bfloat16>())).template to_vector<float>();
-    const aie::vector<float, 32> e = aie::add(pf.template cast_to<int32>(), n).template cast_to<float>();
-    const auto pe = aie::mul(a, aie::accum<accfloat, 32>(e).template to_vector<bfloat16>());
-    const aie::vector<bfloat16, 32> neg = aie::mac(pe, pe.template to_vector<bfloat16>(), t).template to_vector<bfloat16>();
-    return aie::select(pos, neg, aie::lt(x, aie::zeros<bfloat16, 32>()));
 }
 
 // ---------------------------------------------------------------------------------------------

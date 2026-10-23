@@ -9,7 +9,7 @@ bf16; minimax over the segment's bf16 points, in units of the result's bf16 ULP)
     y = bf16(c0 + c1 r + c2 bf16(r^2) + max(x, 0))
     table byte offset = 64 v - 2048 (``bfloat16_to_int(v, 6)``: ``vfloor``)
 Max 0.59 bf16 ULP over [-24, inf), 99.84% correctly rounded (below -24: silu(-24), within 1e-9 of the exact value).
-The vtanh / vexp2 form: 6.6 ULP; ``al::silu``: 1.17 ULP at ~16 cycles per element. 873 cycles per 1024
+The vtanh / vexp2 form: 6.6 ULP; ``kmath.silu``: 1.17 ULP at ~16 cycles per element. 873 cycles per 1024
 elements on the NPU (the vtanh / vexp2 form: 2682), in two loops: t into y (II 2), then the table pass in place (II 16
 per 32 lanes; bound 9: 8 table reads, the shuffles). Fewer, longer loops ran slower: the constant vectors (1, 24, the
 abs mask, 0, the lanes' table pointers) take 5 of the 12 x registers, and the post-pipeliner's allocation fails.
@@ -391,7 +391,7 @@ __attribute__((noinline)) void {{ p }}_{{ name }}_lut(const bfloat16 *__restrict
 
 SILU = ActTable("silu", silu64, 0.25, 32.0, 24.0)
 # GELU: 65 segments of 1/8 over [0, 8] (g(-8) ~ -4e-21): within 0.58 bf16 ULP for |x| < 4, 1.42 in [-6, -4) (absolute
-# 1.4e-7), below: within 6e-13; al::gelu_lut: 1.7 ULP at ~7 cycles per element
+# 1.4e-7), below: within 6e-13; kmath.gelu: 1.7 ULP at ~7 cycles per element
 GELU = ActTable("gelu", gelu64, 0.125, 16.0, 8.0)
 GELU_ERF = ActTable("gelu_erf", gelu_erf64, 0.125, 16.0, 8.0)
 SIGMOID = ActTable("sigmoid", sigmoid64, 0.25, 48.0, 16.0, full=True)

@@ -53,26 +53,13 @@ F_GDN = 1 << 8  # M_FLAGS of the first GDN object of a step (the other cores ski
 G_WORDS = 16
 
 
-# The GDN math (fp32 to ~2^-16 through bf16 hi / lo products; rendered with p, eps, ln2 in an anonymous namespace):
+# The GDN math (fp32 to ~2^-16 through bf16 hi / lo products; rendered with p, eps in an anonymous namespace):
 # the decode's GDN core and the prefill scan (gdn_prefill.py: under GDN, one copy for its operators)
 GDN = kernel_prefix("gdn")
 HELPERS = r"""// fp32 math to ~2^-16 through bf16 hi / lo products (al::mulff), 16 lanes
 
-// 2^y for y >= -126: n = round(y) by the 1.5 2^23 split, 2^f = e^(f ln 2) by its Taylor polynomial of degree 6
-__attribute__((noinline)) aie::vector<float, 16> {{ p }}_exp2(aie::vector<float, 16> y)
-{
-    y = aie::max(y, aie::broadcast<float, 16>(-126.0f));
-    const aie::vector<float, 16> magic = aie::broadcast<float, 16>(12582912.0f);
-    const aie::vector<float, 16> yy = aie::add(y, magic);
-    const aie::vector<float, 16> f = aie::sub(y, aie::sub(yy, magic));
-    const aie::vector<int32, 16> n = aie::sub(yy.template cast_to<int32>(), aie::broadcast<int32, 16>(0x4B400000));
-    const aie::vector<float, 16> t = al::mul_hilo<16, {{ ln2[0] }}f, {{ ln2[1] }}f>(f);
-    aie::vector<float, 16> p = aie::broadcast<float, 16>({{ 1 / 720 }}f);
-{% for c in [1 / 120, 1 / 24, 1 / 6, 0.5, 1.0, 1.0] %}
-    p = aie::add(aie::broadcast<float, 16>({{ c }}f), al::mulff<16>(t, p));
-{% endfor %}
-    return aie::add(p.template cast_to<int32>(), aie::upshift(n, 23)).template cast_to<float>();
-}
+{% set exp2 = km.exp2(16, prec="fp32") %}
+{{ exp2.src }}
 
 // e^g - 1 for g <= 0: its Taylor polynomial below |g| = 0.5 (no cancellation), else 2^(g log2 e) - 1
 __attribute__((noinline)) aie::vector<float, 16> {{ p }}_expm1(aie::vector<float, 16> g)
@@ -82,7 +69,7 @@ __attribute__((noinline)) aie::vector<float, 16> {{ p }}_expm1(aie::vector<float
     p = aie::add(aie::broadcast<float, 16>({{ c }}f), al::mulff<16>(g, p));
 {% endfor %}
     const aie::vector<float, 16> small = aie::add(g, al::mulff<16>(al::mulff<16>(g, g), p));
-    const aie::vector<float, 16> big = aie::sub({{ p }}_exp2(al::log2e<16>(g)), aie::broadcast<float, 16>(1.0f));
+    const aie::vector<float, 16> big = aie::sub({{ exp2 }}(al::log2e<16>(g)), aie::broadcast<float, 16>(1.0f));
     return aie::select(big, small, aie::gt(g, aie::broadcast<float, 16>(-0.5f)));
 }
 
@@ -100,7 +87,7 @@ __attribute__((noinline)) aie::vector<float, 16> {{ p }}_expm1(aie::vector<float
 [[clang::always_inline]] inline aie::vector<float, 16> {{ p }}_expneg(aie::vector<float, 16> x)
 {
     const aie::vector<float, 16> ax = aie::max(x, aie::sub(aie::zeros<float, 16>(), x));
-    return {{ p }}_exp2(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), ax)));
+    return {{ exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), ax)));
 }
 
 // softplus(x) = max(x, 0) + log1p(e^(-|x|)); log1p(t) = 2 atanh(s), s = t / (2 + t) <= 1/3, odd series to s^11
@@ -128,11 +115,9 @@ __attribute__((noinline)) aie::vector<float, 16> {{ p }}_sigmoid(aie::vector<flo
     return aie::select(r, al::mulff<16>(t, r), aie::lt(x, aie::zeros<float, 16>()));
 }
 
-// silu(x) of 32 bf16 lanes (one copy of al::silu: inlined it needs a large frame)
-__attribute__((noinline)) aie::vector<float, 32> {{ p }}_silu(aie::vector<bfloat16, 32> x)
-{
-    return al::silu<32>(x);
-}
+{# silu(x) of 32 bf16 lanes: one copy (inlined it needs a large frame) #}
+{% set silu = km.silu(32) %}
+{{ silu.src }}
 
 // x (64 fp32) -> its bf16 hi and lo parts
 [[clang::always_inline]] inline void {{ p }}_split(aie::vector<float, 64> x, aie::vector<bfloat16, 64> &hi,
@@ -174,7 +159,7 @@ def _helpers() -> str:
     """gdn.HELPERS without its sigmoid (the core derives it from softplus)."""
     h = HELPERS
     a = h.index("// sigmoid(x) = r or t r")
-    b = h.index("// silu(x) of 32 bf16 lanes")
+    b = h.index("{# silu(x) of 32 bf16 lanes")
     return h[:a] + h[b:]
 
 
@@ -282,7 +267,7 @@ __attribute__((noinline)) void {{ p }}_ggates(int32_t *__restrict ws)
         aie::store_v(gt, {{ p }}_expm1(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
         // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
         const aie::vector<float, 16> sn = {{ p }}_softplus(aie::sub(aie::zeros<float, 16>(), be));
-        aie::store_v(gt + 16, {{ p }}_exp2(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
+        aie::store_v(gt + 16, {{ exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
     }
 }
 
@@ -382,7 +367,7 @@ void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat1
         }
         AIE_LOOP_NO_UNROLL
         for (int c = 0; c < {{ D }}; c += 32)  // silu
-            aie::store_v(y + c, {{ p }}_silu(aie::accum<accfloat, 32>(aie::load_v<32>(y + c)).template to_vector<bfloat16>()));
+            aie::store_v(y + c, {{ silu }}(aie::accum<accfloat, 32>(aie::load_v<32>(y + c)).template to_vector<bfloat16>()));
         // kq: [k, q][slot 4][head 2][hi | lo][128]
         bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 4 * D }} * s;
         if (b < 4)
@@ -492,7 +477,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
             AIE_LOOP_NO_UNROLL
             for (int i = 0; i < {{ D }}; i += 32) {
                 aie::vector<float, 32> t = al::mulff<32>(al::mulff<32>(aie::load_v<32>(o + i), iv), aie::load_v<32>(nw + i));
-                t = al::mulff<32>(t, {{ p }}_silu(aie::load_v<32>(z + i)));
+                t = al::mulff<32>(t, {{ silu }}(aie::load_v<32>(z + i)));
                 aie::store_v(g + {{ D }} * s + i, aie::accum<accfloat, 32>(t).template to_vector<bfloat16>());
             }
         }
@@ -544,7 +529,7 @@ class GdnShape:
     def render(self, p: str, consts: dict[str, int]) -> str:
         return _SRC.render(p=p, g=Attr(self.workspace()), CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
-                           PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps), ln2=bf16_hilo(math.log(2)),
+                           PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps),
                            rs=bf16_hilo(1 / math.sqrt(D)), **consts,
                            **{k: v for k, v in globals().items() if k.startswith("G_")})
 

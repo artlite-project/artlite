@@ -771,26 +771,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_apply_gn({{ p }}_st &s, i
   {{ p }}_apply_run(s, cb, ws, tab);
 }
 
-// 2^y of 32 lanes, A = y + 192 (an fp32 accumulator): the LLM prefill attentions' exp2 (0.59 bf16 ULP; vexp2 of n + 64,
-// exact for a non-negative integer, the 2^-64 in the constants; 2^f = 1 + c1 f + f^2 (c2 + c3 f)), y clamped to [-63,
-// 63] in bf16 (v = bf16(A) to [129, 255], f to [-1/2, 1/2]: fp32 min / max are emulated and keep the loop from
-// pipelining): 2^-63 for masked keys, a score past the reference by 2^63 saturates
-inline __attribute__((always_inline)) aie::accum<accfloat, 32> {{ p }}_exp2(aie::accum<accfloat, 32> A) {
-  const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
-  const aie::vector<bfloat16, 32> v0 = A.template to_vector<bfloat16>();
-  const aie::vector<bfloat16, 32> f = aie::min(aie::max(aie::msc(A, v0, one).template to_vector<bfloat16>(),
-                                                        aie::broadcast<bfloat16, 32>(-0.5f)), aie::broadcast<bfloat16, 32>(0.5f));
-  const aie::vector<bfloat16, 32> v = aie::min(aie::max(v0, aie::broadcast<bfloat16, 32>(129.0f)), aie::broadcast<bfloat16, 32>(255.0f));
-  const aie::vector<bfloat16, 32> P = al::exp2_acc<32>(aie::mac(aie::mul(v, one), aie::broadcast<bfloat16, 32>(-128.0f), one));
-  const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f * 0x1p-64f)),
-                                                aie::broadcast<bfloat16, 32>(0.2412109375f * 0x1p-64f), one)
-                                           .template to_vector<bfloat16>();
-  const aie::vector<bfloat16, 32> pf = aie::mul(P, f).template to_vector<bfloat16>();
-  const aie::vector<bfloat16, 32> pf2 = aie::mul(pf, f).template to_vector<bfloat16>();
-  aie::accum<accfloat, 32> r = aie::mul(P, aie::broadcast<bfloat16, 32>(0x1p-64f));
-  r = aie::mac(r, pf, aie::broadcast<bfloat16, 32>(0.69140625f * 0x1p-64f));
-  return aie::mac(r, pf2, hi);
-}
+{# 2^y of 32 lanes, A = y + 192: 2^-63 for masked keys, a score past the reference by 2^63 saturates (the clamps in
+   bf16: fp32 min / max are emulated and keep the loop from pipelining) #}
+{% set exp2 = km.exp2(32, bias=192, above="clamp", inline=True) %}
+{{ exp2.src }}
 
 // P = 2^(S - m) in place of 4 key panels ([q panel: QS floats apart][key panel 4 (of the group's, 64 floats apart)][64],
 // 32 lanes per step: A = S + mb, mb [q panel][8 q][8]); sl, ss: S as distinct restrict parameters (each read before it
@@ -804,7 +788,7 @@ static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, f
   for (int t = 0; t < 16; t++) {
     aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
     A = aie::add(A, aie::load_v<32>(mb + 64 * (t >> 3) + 32 * (t & 1)));
-    aie::store_v(ss, {{ p }}_exp2(A).template to_vector<float>());
+    aie::store_v(ss, {{ exp2 }}(A).template to_vector<float>());
     sl = add_2d_ptr(sl, QS - 224, 7, cl, 32);
     ss = add_2d_ptr(ss, QS - 224, 7, cs, 32);
   }
@@ -867,7 +851,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *_
     const aie::mask<16> up = aie::ge(aie::add(rm, mf), aie::broadcast<float, 16>(208.0f));  // (rm - m >= 16)
     const aie::vector<float, 16> mn = aie::select(mf, mn0, up);
     const aie::vector<float, 16> A = aie::add(aie::sub(mn, mf), aie::broadcast<float, 16>(192.0f));
-    const aie::vector<bfloat16, 16> a = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::concat(A, aie::broadcast<float, 16>(192.0f))))
+    const aie::vector<bfloat16, 16> a = {{ exp2 }}(aie::accum<accfloat, 32>(aie::concat(A, aie::broadcast<float, 16>(192.0f))))
                                             .template to_vector<bfloat16>().template extract<16>(0);
     for (int db = 0; db < nd; db++)
       aie::store_v(oq + 64 * db, al::mulc<16>(aie::load_v<16>(oq + 64 * db), a).template to_vector<float>());
@@ -1070,7 +1054,7 @@ static __attribute__((noinline)) void {{ p }}_qk40(const int32_t *__restrict q, 
 }
 
 // a pair's keys from nk on masked: S := v (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept); v: per lane, or none:
-// -126 - bias (2^-126 for P: vexp2 is exact there, and garbage far below)
+// -126 - bias (P ~ 2^-126: vexp2 is off by 2^-8 at negative integers, garbage far below)
 static void {{ p }}_mask40(float *__restrict sm, const bfloat16 *__restrict bias, int nk) {
   for (int kp = 0; kp < 8; kp++) {
     const int v = nk - 8 * kp;
@@ -1287,7 +1271,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_sm512(float *__restrict s
   for (int h = 0; h < 4; h++) {
     aie::accum<accfloat, 32> A(aie::load_v<32>(sm + 32 * h));
     A = aie::add(A, aie::load_v<32>(mb + 32 * (h & 1)));
-    aie::store_v(sm + 32 * h, {{ p }}_exp2(A).template to_vector<float>());
+    aie::store_v(sm + 32 * h, {{ exp2 }}(A).template to_vector<float>());
   }
   const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
   const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(sm)).template to_vector<bfp16ebs8>();
@@ -1397,7 +1381,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_wsm(const float *__restri
     const aie::vector<float, 32> v = aie::load_v<32>(dd + 32 * i);  // ([j][w])
     const aie::vector<float, 8> m = aie::max(aie::max(v.template extract<8>(0), v.template extract<8>(1)),
                                              aie::max(v.template extract<8>(2), v.template extract<8>(3)));
-    const aie::vector<float, 32> e = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::add(
+    const aie::vector<float, 32> e = {{ exp2 }}(aie::accum<accfloat, 32>(aie::add(
         aie::sub(v, aie::concat(m, m, m, m)), aie::broadcast<float, 32>(192.0f)))).template to_vector<float>();
     const aie::vector<float, 8> inv = aie::inv(aie::add(aie::add(e.template extract<8>(0), e.template extract<8>(1)),
                                                         aie::add(e.template extract<8>(2), e.template extract<8>(3))));

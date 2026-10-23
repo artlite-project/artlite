@@ -1,7 +1,7 @@
 """1-D elementwise operators for the tests: harnesses of the activations the model kernels call (``SiluOperator``:
-``al::silu`` and act_lut's table SiLU; ``GeluOperator``: ``al::gelu_lut``) and the simplest operators for the
-infrastructure tests (fused ELFs, profiling, the render manifest). ``StreamOperator``: every core streams its chunk
-of all arguments through one kernel."""
+``kmath.silu`` and act_lut's table SiLU; ``GeluOperator``: ``kmath.gelu``; ``KmOperator``: any kmath function of
+fp32 vectors) and the simplest operators for the infrastructure tests (fused ELFs, profiling, the render manifest).
+``StreamOperator``: every core streams its chunk of all arguments through one kernel."""
 
 from collections.abc import Sequence
 from typing import ClassVar
@@ -14,7 +14,7 @@ from aie.iron.controlflow import range_
 from aie.iron.device import NPU2
 from ml_dtypes import bfloat16
 
-from artlite.operators import act_lut
+from artlite.operators import act_lut, kmath
 from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
 from artlite.operators.design import COLS, ROWS, linear_tap
 
@@ -128,6 +128,10 @@ class StreamOperator(ArtcOperator):
 
 
 _SILU = JINJA_ENV.from_string(r"""
+{% if not lut %}
+{% set silu = km.silu(16, inline=True) %}
+{{ silu.src }}
+{% endif %}
 extern "C"
 void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
 {
@@ -136,10 +140,10 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 {% if lut %}
     {{ lut }}_{{ table }}_lut<{{ ts }}>(input, output);
 {% else %}
-    // al::silu, 16 lanes per step (see kernel_lib.h)
+    // kmath.silu, 16 lanes per step
     for (int j = 0; j < {{ ts }}; j += 16) {
         aie::vector<bfloat16, 16> x = aie::load_v<16>(input); input += 16;
-        aie::store_v(output, aie::accum<accfloat, 16>(al::silu<16>(x)).template to_vector<bfloat16>());
+        aie::store_v(output, aie::accum<accfloat, 16>({{ silu }}(x)).template to_vector<bfloat16>());
         output += 16;
     }
 {% endif %}
@@ -149,7 +153,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 
 
 class SiluOperator(StreamOperator):
-    """SiLU on a 1-D bf16 vector: ``lut`` act_lut's table SiLU (~0.85 cycles per element), else ``al::silu``
+    """SiLU on a 1-D bf16 vector: ``lut`` act_lut's table SiLU (~0.85 cycles per element), else ``kmath.silu``
     (software exp2, two Newton steps for the reciprocal; not pipelined: one long fp32 chain per 16 lanes, spilling,
     ~16 cycles per element)."""
 
@@ -175,16 +179,18 @@ class SiluOperator(StreamOperator):
 
 
 _GELU = JINJA_ENV.from_string(r"""
+{% set gelu = km.gelu(inline=True) %}
+{{ gelu.src }}
 extern "C"
 void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
 {
     event0();
     aie::set_rounding(aie::rounding_mode::conv_even);
-    // al::gelu_lut, 32 lanes per step (see kernel_lib.h)
+    // kmath.gelu, 32 lanes per step
     for (int j = 0; j < {{ ts }}; j += 32) {
         aie::vector<bfloat16, 32> x = aie::load_v<32>(input), xr = aie::load_v<32>(input);
         input += 32;
-        aie::store_v(output, al::gelu_lut(x, xr));
+        aie::store_v(output, {{ gelu }}(x, xr));
         output += 32;
     }
     event1();
@@ -193,7 +199,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 
 
 class GeluOperator(StreamOperator):
-    """GELU in its tanh form (``al::gelu_lut``) on a 1-D bf16 vector, up to 4 cores per column."""
+    """GELU in its tanh form (``kmath.gelu``) on a 1-D bf16 vector, up to 4 cores per column."""
 
     MAX_TILE_BYTES = 16384
     MAX_CHANNELS = 4
@@ -212,6 +218,42 @@ class GeluOperator(StreamOperator):
 
     def get_kernel_src(self) -> str:
         return _GELU.render(name=self.kernel_name, ts=self.tile)
+
+
+_KM = JINJA_ENV.from_string(r"""
+{{ fn.src }}
+extern "C"
+void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_resource_b *__restrict output)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int j = 0; j < {{ ts }}; j += {{ fn.lanes }}) {
+        const aie::vector<float, {{ fn.lanes }}> x = aie::load_v<{{ fn.lanes }}>(input + j);
+{% if fn.arg == "accum" %}
+        aie::store_v(output + j, {{ fn }}(aie::accum<accfloat, {{ fn.lanes }}>(x)).template to_vector<float>());
+{% else %}
+        aie::store_v(output + j, {{ fn }}(x));
+{% endif %}
+    }
+}
+""")
+
+
+class KmOperator(StreamOperator):
+    """A kmath function (``km.<func>(**kwargs)``: an fp32 vector or accumulator argument and result) on a 1-D fp32
+    vector, one core."""
+
+    def __init__(self, *, size: int, func: str, **kwargs: object):
+        self.func, self.kwargs = func, kwargs
+        self.fn = getattr(kmath, func)(**kwargs)
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(torch.float32,),
+                         dtypes_out=(torch.float32,))
+
+    @property
+    def kernel_name(self) -> str:
+        return "kmtest_" + self.fn.name.removeprefix(kmath.KM + "_")
+
+    def get_kernel_src(self) -> str:
+        return _KM.render(fn=self.fn, name=self.kernel_name, ts=self.tile)
 
 
 def emulate(table: act_lut.ActTable, x: np.ndarray) -> np.ndarray:

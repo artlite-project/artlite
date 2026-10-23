@@ -52,7 +52,7 @@ Why they are slow: an fp32 multiply is emulated (3 bf16 MACs plus 2 conversions:
 reduction, polynomial and Newton steps is latency-bound (II = the chain length): it never software-pipelines, because
 each value must be consumed within II cycles and the chain reuses the 5 `dm`.
 
-What took GELU from 622 to 223 cycles per 32 lanes (`al::gelu_lut`; the recipe: numerics.md):
+What took GELU from 622 to 223 cycles per 32 lanes (`km.gelu`; the recipe: numerics.md):
 - **A LUT where accurate enough, a short bf16 polynomial where not** (`vtanh` above |w| = 1.25, a fit below it).
 - **Identities without cancellation**: for w < 0, 1 + tanh(w) = e^(2w) (1 + |tanh w|).
 - **fp32 only where it matters**: x² exact as bf16 x bf16 -> fp32; fp32 x constant by `al::mul_hilo` (3 products);

@@ -2,7 +2,9 @@
 
 What the vector unit does natively, how to get fp32-level results from bf16 operations, and the
 accuracy traps met in Artlite's models. The helpers live in `operators/kernel_lib.h`
-(namespace `al`).
+(namespace `al`: exact building blocks) and `operators/kmath.py` (`km.exp2`, `km.silu`, `km.gelu`: generated per
+contract, each variant tested on the NPU bit-exact against its numpy model, `tests/rtc/kmath_sim.py`, which also
+models the fp32 adder, bf16 rounding and the hi / lo products for precision studies).
 
 ## Contents
 - What is native
@@ -18,7 +20,10 @@ accuracy traps met in Artlite's models. The helpers live in `operators/kernel_li
 
 - **bf16 x bf16 -> fp32 multiply / MAC** (`vmul.f`, `vmac.f`): the result lands at +6 cycles.
   Dependent MACs on one accumulator run every 2 cycles.
-- **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op.
+- **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op. Not IEEE: the smaller operand
+  is rounded (to nearest even) onto the larger's grid of 23 fractional bits before the add (AM027),
+  so a cancellation keeps only that grid: x - round(x) loses x's last bit where round(x) is a power
+  of two above x. A MAC's sum (accumulator + exact bf16 product) is the same adder.
 - **fp32 max** lowers to a bf16 compare plus a select. Float min / max / abs are expensive:
   - a 64-lane clamp cost ~25 cycles and spilled;
   - float `aie::neg` / `abs` may not legalize (G_FNEG): use `min(x, 0 - x)`, or integer ops on
@@ -66,16 +71,18 @@ x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
 
 ## Recipes
 
-### exp2 exact to 1 bf16 ULP (`al::exp2`; the attention cores' `_exp2`)
+### exp2 of fp32 x to 0.4 bf16 ULP (`km.exp2(N)`)
 
 1. n = round(x): add 1.5·2^23, read the float's bits, subtract 0x4B400000.
 2. f = x - n, with |f| ≤ 0.5.
 3. 2^f by a polynomial (degree 2 with its bf16 rounding points fitted: c1 = 0.6996, c2 = 0.236;
-   or exp2f's cubic).
-4. Clamp n **as an integer** to [-126, 100], shift it into the exponent field (`upshift(n, 23)`)
-   and add it to the polynomial's bits.
+   or `km.exp2`'s cubic).
+4. Shift n into the exponent field (`upshift(n, 23)`) and add it to the polynomial's bits. The
+   range: x clamped at -126 in fp32 first (a masked score of -1e30 becomes 2^-126, or exactly 0
+   from -127 on: `below="zero"`), or n clamped **as an integer** (`below="int"`: no fp32 max,
+   arguments above -2^22).
 
-A masked score of -1e30 becomes 2^-126: no branches, no -inf handling. 64 lanes per step, about
+No branches, no -inf handling. 64 lanes per step, about
 55 cycles per 64 lanes; it does not software-pipeline, so batch the work.
 
 ### exp2 without a table or fp32 vectors
@@ -143,14 +150,14 @@ and reciprocal).
 
 ### e^x of fp32 x in a pipelined loop
 
-``al::exp2<32>(al::log2e<32>(x))`` does not pipeline (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
+``km.exp2``'s fp32 forms (``{{ e }}(al::log2e<32>(x))``) do not pipeline (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
 two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f by a quadratic in bf16 MACs (minimax
 on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238
 cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error is invisible (3.14e-3 vs 3.08e-3).
 
 ### GELU, tanh form (Gemma)
 
-`al::gelu_lut(x, xr)`, 223 cycles per 32 lanes, within 1.7 bf16 ULPs of the fp32 tanh form over
+`km.gelu()` (x, xr), 223 cycles per 32 lanes, within 1.7 bf16 ULPs of the fp32 tanh form over
 all bf16 inputs (`test_gelu.py`: max ≤ 2 ULPs, ≥ 97% correctly rounded):
 
 1. a = x / 2; w = z / 2 = x (C1 + C2 x²) / 2, in fp32: x² exact, `mul_hilo` for the constant
@@ -162,7 +169,7 @@ all bf16 inputs (`test_gelu.py`: max ≤ 2 ULPs, ≥ 97% correctly rounded):
 5. Select by the sign of x.
 
 Rejected forms:
-- An exact form (a sigmoid with Newton steps as `al::silu`'s, all fp32 splits): accurate, but 622 cycles per 32
+- An exact form (a sigmoid with Newton steps as `km.silu`'s, all fp32 splits): accurate, but 622 cycles per 32
   lanes, never pipelined, a 2.3 KB frame and 7.3 KB of stack when inlined.
 - A LUT form with w in bf16 and vexp2 of a bf16 argument: 12.5 ULPs off in the negative tail,
   prefill KL 0.00061 (the accurate LUT form 0.00047, the exact one 0.00037).

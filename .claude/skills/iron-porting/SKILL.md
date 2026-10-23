@@ -55,9 +55,10 @@ A standalone 1-D elementwise operator is a test harness, not an Artlite operator
 
 ## 2. The kernel
 
-Inline the kernel in a template, build it from the shared helpers of `kernel_lib.h` (namespace `al`: exp2, SiLU,
-GELU, `inv_rms`, bfp16 panels, lane shuffles, `al::div_small`), or copy IRON's kernel and turn its runtime sizes into
-template parameters. Shapes, trip counts and strides rendered as constants let Peano fold, unroll and pipeline (zero
+Inline the kernel in a template, build it from the shared helpers of `kernel_lib.h` (namespace `al`: `inv_rms`,
+bfp16 panels, lane shuffles, `al::div_small`) and the math functions of `kmath.py` (`km` in every template: exp2,
+SiLU, GELU per contract, `{% set e = km.exp2(32) %}{{ e.src }}` then `{{ e }}(x)`), or copy IRON's kernel and turn
+its runtime sizes into template parameters. Shapes, trip counts and strides rendered as constants let Peano fold, unroll and pipeline (zero
 overhead loops, no runtime trip counts); use `constexpr` for derived values.
 
 ```python
@@ -65,6 +66,8 @@ from ..base import JINJA_ENV  # StrictUndefined: a misspelled template variable 
 from ..kernel_source import kernel_prefix
 
 _KERNEL = JINJA_ENV.from_string(r"""
+{% set gelu = km.gelu(inline=True) %}
+{{ gelu.src }}
 extern "C"
 void {{ p }}_gelu(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
 {
@@ -72,7 +75,7 @@ void {{ p }}_gelu(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie
     for (int j = 0; j < {{ ts }}; j += 32) {
         aie::vector<bfloat16, 32> x = aie::load_v<32>(input), xr = aie::load_v<32>(input);
         input += 32;
-        aie::store_v(output, al::gelu_lut(x, xr));
+        aie::store_v(output, {{ gelu }}(x, xr));
         output += 32;
     }
 }

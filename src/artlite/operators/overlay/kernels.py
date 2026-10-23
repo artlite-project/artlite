@@ -389,10 +389,13 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 
 {% endif %}
 {% if act == "gelu" %}
-// bf16(gelu(g)) of the 32 bf16 at g (al::gelu_lut; the values loaded twice: shorter lifetimes)
+{% set gelu = km.gelu(inline=True) %}
+{{ gelu.src }}
+
+// bf16(gelu(g)) of the 32 bf16 at g (kmath.gelu; the values loaded twice: shorter lifetimes)
 __attribute__((noinline)) aie::vector<bfloat16, 32> {{ p }}_gelu(const bfloat16 *__restrict g)
 {
-    return al::gelu_lut(aie::load_v<32>(g), aie::load_v<32>(g));
+    return {{ gelu }}(aie::load_v<32>(g), aie::load_v<32>(g));
 }
 
 {% endif %}

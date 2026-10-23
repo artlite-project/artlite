@@ -158,12 +158,10 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
     }
 }
 
-// 2^x of 64 lanes (al::exp2f: one copy for the softmax and the merge; two records or two partials at a time, two
-// independent chains in one body: 88 cycles, 70 for 32 lanes): exactly 0 for the masked scores (-1e30)
-__attribute__((noinline)) aie::vector<float, 64> {{ p }}_exp2(aie::vector<float, 64> x)
-{
-    return al::exp2f<64, true>(x);
-}
+{# 2^x of 64 lanes, one copy for the softmax and the merge (two records or two partials at a time, two independent
+   chains in one body: 88 cycles, 70 for 32 lanes), exactly 0 for the masked scores (-1e30) #}
+{% set exp2 = km.exp2(64, below="zero") %}
+{{ exp2.src }}
 
 // Q (the set's panels) against {{ DB }} d-blocks of K panels: two MMUL chains (even, odd d-blocks), two panel streams
 [[clang::always_inline]] inline aie::accum<accfloat, 64> {{ p }}_qk(const uint8_t *__restrict k, const uint8_t *__restrict qa)
@@ -508,7 +506,7 @@ __attribute__((noinline)) void {{ p }}_pexp(float *__restrict ss, aie::vector<fl
     for (int r = 0; r < nc; r += 2) {
         const aie::vector<float, 32> s1 = aie::select(aie::load_v<32>(se + 32), aie::broadcast<float, 32>(-1e30f),
                                                       aie::mask<32>::from_uint32(r + 1 < nc ? 0u : ~0u));
-        const aie::vector<float, 64> e = {{ p }}_exp2(aie::concat(aie::sub(aie::load_v<32>(se), mn), aie::sub(s1, mn)));
+        const aie::vector<float, 64> e = {{ exp2 }}(aie::concat(aie::sub(aie::load_v<32>(se), mn), aie::sub(s1, mn)));
         lv = aie::add(lv, aie::add(e.template extract<32>(0), e.template extract<32>(1)));
         aie::store_v(se, e.template extract<32>(0));
         if (r + 1 < nc)  // (an odd count: the next record is open, its scores stay)
@@ -548,7 +546,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
         // (else alpha = 1; y and l zero before the first P V terms. A set's rows rescaled together: the rows whose
         // maximum stayed, alpha = 1, keep their y and l exactly: + y (alpha - 1))
         if (st[{{ A_YNZ }}] && aie::lt(m0b, mnb).to_uint32()) {
-            const aie::vector<float, 32> alpha = {{ p }}_exp2(aie::concat(aie::sub(m0, mn), aie::zeros<float, 32>())).template extract<32>(0);
+            const aie::vector<float, 32> alpha = {{ exp2 }}(aie::concat(aie::sub(m0, mn), aie::zeros<float, 32>())).template extract<32>(0);
             float *__restrict y = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set;
             {{ p }}_mrg((const float __aie_dm_resource_a *)y, y, (const float __aie_dm_resource_b *)y, alpha,
                         aie::zeros<float, 32>(), {{ ND + 1 }});
@@ -597,7 +595,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
         // (else alpha = 1; y and l zero before the first P V terms. A set's rows rescaled together: the rows whose
         // maximum stayed, alpha = 1, keep their y and l exactly: + y (alpha - 1))
         if (st[{{ A_YNZ }}] && aie::lt(m0b, mnb).to_uint32()) {
-            const aie::vector<float, 32> alpha = {{ p }}_exp2(aie::concat(aie::sub(m0, mn), aie::zeros<float, 32>())).template extract<32>(0);
+            const aie::vector<float, 32> alpha = {{ exp2 }}(aie::concat(aie::sub(m0, mn), aie::zeros<float, 32>())).template extract<32>(0);
             float *__restrict y = AW(float, {{ a.y }}) + 32 * (nd + 1) * set;
             {{ p }}_mrg((const float __aie_dm_resource_a *)y, y, (const float __aie_dm_resource_b *)y, alpha,
                         aie::zeros<float, 32>(), nd + 1);
@@ -613,7 +611,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
         AIE_LOOP_NO_UNROLL
         for (int r = 0; r < nc; r += 2) {  // (two records: an odd count's partner zero)
             const aie::vector<float, 32> s1 = r + 1 < nc ? aie::load_v<32>(ss + 32 * r + 32) : aie::broadcast<float, 32>(-1e30f);
-            const aie::vector<float, 64> e = {{ p }}_exp2(aie::concat(aie::sub(aie::load_v<32>(ss + 32 * r), mn), aie::sub(s1, mn)));
+            const aie::vector<float, 64> e = {{ exp2 }}(aie::concat(aie::sub(aie::load_v<32>(ss + 32 * r), mn), aie::sub(s1, mn)));
             l = aie::add(l, aie::add(e.template extract<32>(0), e.template extract<32>(1)));
             {{ p }}_ppan(e, pp + 72 * r);
         }
@@ -631,7 +629,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
 __attribute__((noinline)) void {{ p }}_pslot(const float *__restrict sc, const float *__restrict m, float *__restrict l,
                                              uint8_t *__restrict pp, uint32_t rows)
 {
-    const aie::vector<float, 32> e = {{ p }}_exp2(aie::concat(aie::sub(aie::load_v<32>(sc), aie::load_v<32>(m)),
+    const aie::vector<float, 32> e = {{ exp2 }}(aie::concat(aie::sub(aie::load_v<32>(sc), aie::load_v<32>(m)),
                                                               aie::zeros<float, 32>())).template extract<32>(0);
     const aie::vector<float, 32> P = aie::select(aie::zeros<float, 32>(), e, aie::mask<32>::from_uint32(rows));
     aie::store_v(l, aie::add(aie::load_v<32>(l), P));
@@ -1025,7 +1023,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
         const float *__restrict mw = (const float *)pw + {{ a.m // 4 }} + 32 * set;
         const aie::vector<float, 32> m0 = aie::load_v<32>(ml), m1 = aie::load_v<32>(mw);
         const aie::vector<float, 32> mx = aie::max(m0, m1);
-        const aie::vector<float, 64> a01 = {{ p }}_exp2(aie::concat(aie::sub(m0, mx), aie::sub(m1, mx)));
+        const aie::vector<float, 64> a01 = {{ exp2 }}(aie::concat(aie::sub(m0, mx), aie::sub(m1, mx)));
         const aie::vector<float, 32> a0 = a01.template extract<32>(0), a1 = a01.template extract<32>(1);
         aie::store_v(ml, mx);
         float *__restrict y = AW(float, {{ a.y }}) + 32 * (nd + 1) * set;

@@ -473,24 +473,12 @@ _ATTN = JINJA_ENV.from_string(r"""
 // maxima), st [16] int32 (the group's first record relative to the core's queries, skip)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
-namespace {
+{# P = 2^(A - 192) (pexp clamps A at 129 itself: 2^-63) #}
+{% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="none", inline=True) %}
+{{ exp2.src }}
+{{ e192.src }}
 
-// 2^y of 32 lanes, y = A - 192 (|y| < 64; A an fp32 accumulator): qwen35's attn_prefill exp2 (0.59 bf16 ULP)
-[[clang::always_inline]] inline aie::accum<accfloat, 32> {{ p }}_exp2(aie::accum<accfloat, 32> A)
-{
-    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
-    const aie::vector<bfloat16, 32> v = A.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> f = aie::msc(A, v, one).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> P = al::exp2_acc<32>(aie::mac(aie::mul(v, one), aie::broadcast<bfloat16, 32>(-128.0f), one));
-    const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f * 0x1p-64f)),
-                                                  aie::broadcast<bfloat16, 32>(0.2412109375f * 0x1p-64f), one)
-                                             .template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf = aie::mul(P, f).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf2 = aie::mul(pf, f).template to_vector<bfloat16>();
-    aie::accum<accfloat, 32> r = aie::mul(P, aie::broadcast<bfloat16, 32>(0x1p-64f));
-    r = aie::mac(r, pf, aie::broadcast<bfloat16, 32>(0.69140625f * 0x1p-64f));
-    return aie::mac(r, pf2, hi);
-}
+namespace {
 
 // Rows whose maximum grew: o, l scaled by 2^(m - mn), m = mn = max(m, rm) (rm: the rows' group maxima)
 __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__restrict pl, float *__restrict pm,
@@ -498,7 +486,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
 {
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
     const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
-    const aie::vector<float, 64> a = al::exp2f<64>(aie::max(aie::sub(m, mn), aie::broadcast<float, 64>(-126.0f)));
+    const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
     for (int db = 0; db < {{ ND }}; db++)
         aie::store_v(o + 64 * db, al::mulff<64>(aie::load_v<64>(o + 64 * db), a));
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
@@ -515,8 +503,8 @@ __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *_
     const aie::vector<float, 32> lo = aie::broadcast<float, 32>(129.0f);
     aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
     for (int k = 0; k < {{ RG }}; k++) {
-        const aie::accum<accfloat, 32> p0 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl), b0), lo)));
-        const aie::accum<accfloat, 32> p1 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl + 32), b1), lo)));
+        const aie::accum<accfloat, 32> p0 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl), b0), lo)));
+        const aie::accum<accfloat, 32> p1 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl + 32), b1), lo)));
         l0 = aie::add(l0, p0);
         l1 = aie::add(l1, p1);
         aie::store_v(ss, p0.template to_vector<float>());

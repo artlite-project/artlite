@@ -341,8 +341,7 @@ class GdnPrepOperator(ArtcOperator):
         return regions(sizes)
 
     def get_kernel_src(self) -> str:
-        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps),
-                                                           ln2=bf16_hilo(math.log(2)), D=D)
+        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D)
         return _PREP.render(p=self.pfx, g=GD.GDN, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT,
                             w=Attr(self.workspace()), D=D, HC=self.hc, VH=self.vh, T=self.T, PAN=PAN,
                             KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps), rs=bf16_hilo(1 / math.sqrt(D)))

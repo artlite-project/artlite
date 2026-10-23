@@ -22,11 +22,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 # The smoke set (``pytest tests/rtc -m smoke``, about a minute with the designs cached): the host-side tests, the
 # apps' full designs build, and one or two NPU cases per component (each model's decode slice, attention, prefill
-# GEMM / attention / norm, the shared GEMV, fused ELFs, the activation table). Entries: test files or test ids.
+# GEMM / attention / norm, the shared GEMV, fused ELFs, the activation table, kmath's variants). Entries: test files or
+# test ids.
 SMOKE = (
     "test_app_designs.py", "test_overlay_kv.py", "test_overlay_runtime.py", "test_gemma_host.py", "test_llama_image.py", "test_qwen35_image.py",
     "test_gemm_q_dma.py", "test_render_cache.py", "test_server.py", "test_sampling.py", "test_minicpmv_host.py",
-    "test_minicpmv_npu.py", "test_probe.py",
+    "test_minicpmv_npu.py", "test_probe.py", "test_kmath.py",
     "test_router.py::test_catalog", "test_router.py::test_preset", "test_router.py::test_router",
     "test_silu.py::TestRtcSiLU::test_silu_lut",
     "test_fused.py::test_library_program", "test_fused.py::test_library_program_memory_variants",
@@ -45,7 +46,7 @@ SMOKE = (
     "test_gemma_npu.py::test_gemma_overlay_layers[shared-kv-one-token-single]",
     "test_prefill_gemm.py::test_prefill_gemm[gemma4-E4B-Q4_0-L0-gate_up-T256]",
     "test_prefill_norm.py::test_residual_norm[post-E2560-d1-p320]",
-    "test_prefill_norm.py::test_residual_norm[add-E3072-d2-p384]",
+    "test_prefill_norm.py::test_residual_norm[plain-E2560-d2-p384]",
     "test_gemma_prefill.py::test_attn_prefill[hd512-p96-T64]", "test_gemma_prefill.py::test_ple",
     "test_qwen35_decode.py::test_overlay_slice[s3-9B]", "test_qwen35_decode.py::test_overlay_slice[split-1B]",
     "test_qwen35_decode.py::test_attention[27B-150-2-True-True]", "test_qwen35_decode.py::test_attention[1B-150-2-True-True]",
@@ -57,17 +58,23 @@ SMOKE = (
     "test_qwen35_attn_prefill.py::test_attn_prefill[9B-64]", "test_qwen35_attn_prefill.py::test_attn_prefill[1B-192]",
     "test_qwen35_gdn_prefill.py::test_gdn_scan[64-9B]", "test_prefill_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
     "test_sd15_unet.py::test_gemm[16-2-640-640-True-bf16]", "test_sd15_unet.py::test_conv[16-1-640-640-True]",
-    "test_sd15_unet.py::test_norm[gnsilu-64-640-2-4]", "test_sd15_unet.py::test_attention[16-80-2-2]",
+    "test_sd15_unet.py::test_norm[gnsilu-64-640-2-4]", "test_sd15_unet.py::test_attention[16-80-2-2-False-8-False]",
     "test_sd15_vae.py::test_conv[512-128-128]",
 )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Tests marked slow run on demand: with --run-slow, or when -m selects them (or the smoke set)."""
+    """Tests marked slow run on demand: with --run-slow, or when -m selects them (or the smoke set). A smoke entry
+    that names no test of a collected file (a renamed parameter) is reported (``pytest_terminal_summary``)."""
+    hit: set[str] = set()
     for item in items:
         name = item.nodeid.removeprefix("tests/rtc/")
-        if any(name == s or name.startswith(s + "::") for s in SMOKE):
-            item.add_marker(pytest.mark.smoke)
+        for s in SMOKE:
+            if name == s or name.startswith(s + "::"):
+                item.add_marker(pytest.mark.smoke)
+                hit.add(s)
+    files = {item.nodeid.removeprefix("tests/rtc/").split("::")[0] for item in items}
+    _stale_smoke[:] = [s for s in SMOKE if s not in hit and s.split("::")[0] in files]
     selected = config.getoption("-m") or ""
     if config.getoption("--run-slow") or "slow" in selected or "smoke" in selected:
         return
@@ -75,6 +82,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+_stale_smoke: list[str] = []
 
 
 # Parallel compilation ---------------------------------------------------------------------------
@@ -105,6 +115,8 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    if _stale_smoke and "smoke" in (terminalreporter.config.getoption("-m") or ""):
+        terminalreporter.write_line(f"SMOKE entries naming no collected test: {', '.join(_stale_smoke)}", red=True)
     for pre in _precompiler:
         terminalreporter.write_line(
             f"artlite.parallel_compile: {pre.queue.submitted} design(s) of the selected tests compiled in the "

@@ -456,36 +456,20 @@ _ATTN = JINJA_ENV.from_string(r"""
 // the core's first block, skip, the pass's first record)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
+{# 2^(A - 128) of 32 lanes (A below 256: 2^(s - m) times 2^64, which o / l cancels), 2^1 below 128.5 (masked -1e30 too) #}
+{% set exp2 = km.exp2(32, bias=192, shift=64, inline=True) %}
+{{ exp2.src }}
+
 namespace {
 
-// 2^(A - 192) of 32 lanes (A an fp32 accumulator below 256): v = bf16(A) (an integer from 128 on) at least 129 (2^-63:
-// a masked -1e30 too), f = A - v at least -0.5; 2^(v - 192) by vexp2 (exact at integers), 2^f by qwen35's attn_prefill
-// cubic (0.59 bf16 ULP)
-[[clang::always_inline]] inline aie::accum<accfloat, 32> {{ p }}_exp2(aie::accum<accfloat, 32> A)
-{
-    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
-    const aie::vector<bfloat16, 32> v = aie::max(A.template to_vector<bfloat16>(), aie::broadcast<bfloat16, 32>(129.0f));
-    const aie::vector<bfloat16, 32> f = aie::max(aie::msc(A, v, one).template to_vector<bfloat16>(),
-                                                 aie::broadcast<bfloat16, 32>(-0.5f));
-    const aie::vector<bfloat16, 32> P = al::exp2_acc<32>(aie::mac(aie::mul(v, one), aie::broadcast<bfloat16, 32>(-192.0f), one));
-    const aie::vector<bfloat16, 32> hi = aie::mac(aie::mul(f, aie::broadcast<bfloat16, 32>(0.0625f)),
-                                                  aie::broadcast<bfloat16, 32>(0.2412109375f), one)
-                                             .template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf = aie::mul(P, f).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> pf2 = aie::mul(pf, f).template to_vector<bfloat16>();
-    aie::accum<accfloat, 32> r = aie::mul(P, one);
-    r = aie::mac(r, pf, aie::broadcast<bfloat16, 32>(0.69140625f));
-    return aie::mac(r, pf2, hi);
-}
-
-// P = 2^(A - 192) of the chunk's panels s (``exp2``) as bfp16 panels into pp, in their order
+// P = 2^(A - 128) of the chunk's panels s (``exp2``: 2^(s - m) times 2^64) as bfp16 panels into pp, in their order
 __attribute__((noinline)) void {{ p }}_ppan(const float *__restrict s, uint8_t *__restrict pp)
 {
     al::BOut<> po((bfp16ebs8 *)pp);
     AIE_TRY_INITIATION_INTERVAL(20)  // (post-RA II 25; the default pre-RA schedule: 38, spilling)
     for (int i = 0; i < {{ RB * CR }}; i++) {
-        const aie::accum<accfloat, 32> p0 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::load_v<32>(s)));
-        const aie::accum<accfloat, 32> p1 = {{ p }}_exp2(aie::accum<accfloat, 32>(aie::load_v<32>(s + 32)));
+        const aie::accum<accfloat, 32> p0 = {{ exp2 }}(aie::accum<accfloat, 32>(aie::load_v<32>(s)));
+        const aie::accum<accfloat, 32> p1 = {{ exp2 }}(aie::accum<accfloat, 32>(aie::load_v<32>(s + 32)));
         po.push(aie::concat(p0, p1).template to_vector<bfp16ebs8>());
         s += 64;
     }
@@ -511,8 +495,9 @@ __attribute__((noinline, minsize)) void {{ p }}_mask(float *__restrict sc, int32
 }
 
 // Row blocks with a row whose chunk maximum exceeds its reference by 2^16 (rare, and at a pass's first chunk): each row
-// whose maximum (bf16: an integer from 128 on) exceeds its reference takes it, m' - m = d >= 0 an integer: o, l scaled by
-// 2^-d (vexp2: exact), the bias and the chunk's A lowered by d (per half row block: 4 rows in 32 lanes)
+// whose maximum (bf16: an integer from 128 on) exceeds its reference takes it, m' - m = d >= 0 an integer (< 64: A <
+// 256): o, l scaled by 2^-d = vexp2(64 - d) 2^-64 (vexp2 is exact at non-negative integers only), the bias and the
+// chunk's A lowered by d (per half row block: 4 rows in 32 lanes)
 __attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, float *__restrict wo)
 {
     for (int b = 0; b < {{ RB }}; b++) {
@@ -525,8 +510,8 @@ __attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, floa
                 continue;
             const aie::vector<float, 32> am = al::max8(aie::accum<accfloat, 32>(v).template to_vector<float>());
             const aie::vector<float, 32> d = aie::max(aie::sub(am, aie::broadcast<float, 32>(192.0f)), aie::zeros<float, 32>());
-            const aie::vector<bfloat16, 32> a = al::exp2_acc<32>(aie::accum<accfloat, 32>(
-                aie::max(aie::sub(aie::zeros<float, 32>(), d), aie::broadcast<float, 32>(-126.0f))));
+            const aie::vector<bfloat16, 32> a = aie::mul(al::exp2_acc<32>(aie::accum<accfloat, 32>(
+                aie::sub(aie::broadcast<float, 32>(64.0f), d))), aie::broadcast<bfloat16, 32>(0x1p-64f)).template to_vector<bfloat16>();
             float *__restrict o = wo + {{ 64 * ND }} * b + 32 * hf;
             for (int db = 0; db < {{ ND }}; db++)
                 aie::store_v(o + 64 * db, al::mulc<32>(aie::load_v<32>(o + 64 * db), a).template to_vector<float>());

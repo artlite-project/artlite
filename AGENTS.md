@@ -92,6 +92,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/operators/vision/` | vision encoders on sd15's design: MiniCPM-V 4.7's (`minicpmv.py`: the whole encoder per dispatch, ``Encoder``) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
+| `src/artlite/operators/kmath.py` | math functions generated per contract (`km.exp2`, `km.silu`, `km.gelu` in every template), each variant's bit-exact numpy model in `tests/rtc/kmath_sim.py` (`test_kmath.py`) |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
@@ -112,10 +113,11 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
     counts and strides as compile-time constants, its names under `kernel_prefix` (Rules);
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
-- Reuse the shared pieces instead of copying: `kernel_lib.h` (exp2, SiLU, GELU, `inv_rms`, bfp16 panels, lane
-  shuffles), `act_lut.py` (activations through the gather LUT), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops
-  with an i32 induction variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels),
-  `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`).
+- Reuse the shared pieces instead of copying: `kmath.py` (exp2, SiLU, GELU: `km.exp2(...)` in a template),
+  `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles), `act_lut.py` (activations through the gather LUT),
+  `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction variable, `linear_tap`), `bfp16.py`
+  (host bfp16ebs8 conversions and panels), `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace
+  `regions`, bf16 constants, `arg_bytes`).
 - New operators are exported from `operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. Tests need no
   compile plumbing: pytest plans the selected tests in a subprocess and builds their designs in the background.
 - `compile()` = render (`build_spec()`, in the calling thread) + build (Peano: `kernel.cc` -> `kernel.o`; `aiecc`:
@@ -191,7 +193,10 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   tolerance test.
 - Refactoring check: `pytest tests/rtc --dump-designs DIR` before and after, then
   `python tests/rtc/design_diff.py BEFORE AFTER --asm` (identical MLIR; changed kernel sources compile to the same
-  asm). The apps' full designs are dumped too (`test_app_designs.py`); the slow tests are not.
+  asm). The apps' full designs are dumped too (`test_app_designs.py`); the slow tests are not. A change of shared
+  kernel code (`kmath.py`, `kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
+  BEFORE before the change, `--partial --asm` after (`design_diff.py`'s docstring); on the NPU then only the tests of
+  the designs whose code changed.
 - Data layouts (shim taps, memtile walks, joins) are tested on the host with `tests/rtc/dma_model.py`
   (`tests/rtc/test_gemm_q_dma.py` is the pattern).
 - Long prompts use the essay corpus (`tests/datasets/`): the essays concatenated in file-name order.
