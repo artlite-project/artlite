@@ -584,6 +584,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   }
 
   std::atomic<size_t> next{0}, done_bytes{0};
+  std::atomic<size_t> needed{0};  // (tensors 0 .. needed - 1: a claimed item reads them; the prefetchers never hold
+                                  // them back)
   std::atomic<bool> failed{false}, finished{false};
   std::mutex mutex;  // (the tensors' counts, the first error)
   std::exception_ptr error;
@@ -602,6 +604,11 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
         const bool f32 = b.fmt == TileFormat::BFP16_F32;
         const int tile_rows = b.R * b.G;
         const size_t bb = kBlockBytes[static_cast<int>(b.fmt)], row_bytes = size_t(b.row_sb) * bb;
+        for (size_t t : block_tensors[it.block]) {
+          size_t n = needed;
+          while (n < t + 1 && !needed.compare_exchange_weak(n, t + 1)) {
+          }
+        }
         for (size_t t : block_tensors[it.block])  // (read by the prefetchers: no page fault reads it in 128 KB)
           while (tensors[t].pending > 0 && !failed) std::this_thread::sleep_for(std::chrono::microseconds(100));
         std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
@@ -707,7 +714,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   // prefetch: the tensors in pieces, in order of first use, each read into the page cache by one of kPrefetchThreads
   // threads unless mincore finds it resident (pread: the device's 128 KB readahead makes page faults and
   // MADV_WILLNEED / POPULATE_READ stream at 1.2 - 1.8 GB/s, 16 threads of 8 MB reads at 3.5 GB/s: a cold 27B packs
-  // in 5.3 s), at most a window ahead of the workers; a worker starts an item once its tensors are read
+  // in 5.3 s), at most a window ahead of the workers but for the tensors of claimed items (the window counts the
+  // items' rows, which can fall behind the tensors' bytes: workers waiting on a held-back tensor would never finish
+  // one); a worker starts an item once its tensors are read
   std::unique_ptr<platform::File> file;
   if (!opt.file.empty()) file = std::make_unique<platform::File>(opt.file);
   const bool prefetching = file != nullptr;
@@ -730,7 +739,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     std::vector<unsigned char> resident(kPrefetchPiece / ps + 2);
     for (size_t k; !finished && !failed && (k = next_piece++) < pieces.size();) {
       const Piece& pc = pieces[k];
-      while (!finished && !failed && issued > done_bytes + window)
+      while (!finished && !failed && issued > done_bytes + window && pc.tensor >= needed)
         std::this_thread::sleep_for(std::chrono::microseconds(200));
       issued += pc.bytes;
       auto [a, len] = pages(pc.data, pc.bytes, false);
