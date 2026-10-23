@@ -72,8 +72,8 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
 - **Models.** Each GGUF file of the directory that Artlite runs, named `<account>/<repository>:<quantization>`
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
-  says why. Drafters (`mtp-`) and vision encoders are not models of their own: Gemma 4 finds its drafter, and
-  MiniCPM-V 4.7 gets the `mmproj` file of its directory (`mmproj-model-f16.gguf` before the 4x one).
+  says why. Drafters (`mtp-`) and vision encoders are not models of their own: Gemma 4 and Qwen3.6 35B-A3B find their
+  drafters, and MiniCPM-V 4.7 gets the `mmproj` file of its directory (`mmproj-model-f16.gguf` before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the

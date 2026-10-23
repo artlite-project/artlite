@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="1061" viewBox="0 0 880 1061" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="1080" viewBox="0 0 880 1080" role="img" aria-labelledby="t d">
 <title id="t">Decode speed, tokens/s</title>
 <desc id="d">Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file. Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</desc>
 <style>text{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;font-size:11px;fill:#9198a1;font-variant-numeric:tabular-nums}.title{font-size:18px;font-weight:600;fill:#f0f6fc}.sub{font-size:12.5px}.h{font-size:12.5px;font-weight:600;fill:#f0f6fc}.lbl{font-size:12px;fill:#f0f6fc}.lbl2{font-size:12px}.strong{font-weight:600;fill:#f0f6fc}.muted{fill:#6e7681}.small{font-size:10px}.halo{paint-order:stroke;stroke:#0d1117;stroke-width:3px;stroke-linejoin:round}.grid{stroke:#1b2129}.axis{stroke:#3d444d}.guide{stroke:#2d333b}.bracket{stroke:#9198a1;fill:none}.ft{fill:#1c5cab}.detail{font-size:12px;font-weight:400;fill:#9198a1}.tile{fill:#1b2129;stroke:#9198a1;stroke-width:1}.cut{stroke:#9198a1;stroke-width:.75;fill:none}.f0{fill:#3987e5}.l0{stroke:#3987e5;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d0{fill:#3987e5;stroke:#0d1117;stroke-width:1.5}.b0{fill:#3987e5;fill-opacity:.16}.f1{fill:#d95926}.l1{stroke:#d95926;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d1{fill:#d95926;stroke:#0d1117;stroke-width:1.5}.b1{fill:#d95926;fill-opacity:.16}.f2{fill:#199e70}.l2{stroke:#199e70;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d2{fill:#199e70;stroke:#0d1117;stroke-width:1.5}.b2{fill:#199e70;fill-opacity:.16}.f3{fill:#8f4801}.l3{stroke:#8f4801;stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.d3{fill:#8f4801;stroke:#0d1117;stroke-width:1.5}.b3{fill:#8f4801;fill-opacity:.16}</style>
-<rect x="0.5" y="0.5" width="879" height="1060" rx="8" fill="#0d1117" stroke="#3d444d"/>
+<rect x="0.5" y="0.5" width="879" height="1079" rx="8" fill="#0d1117" stroke="#3d444d"/>
 <text x="24.0" y="40.0" class="title">Decode speed, tokens/s</text>
 <text x="24.0" y="59.0" class="sub">Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file.</text>
 <text x="24.0" y="78.0" class="sub">Where another runtime runs the same model with comparable weights, its bar sits under Artlite's.</text>
@@ -16,22 +16,22 @@
 <text x="525.5" y="108.0" class="lbl">OpenFlowLM 0.1.0-99fe7e4</text>
 <text x="162.7" y="142.0" class="h">1k-token prompt</text>
 <text x="524.4" y="142.0" class="h">32k-token prompt</text>
-<line x1="162.7" y1="154.0" x2="162.7" y2="925.0" class="axis"/>
-<text x="162.7" y="939.0" text-anchor="middle">0</text>
-<line x1="252.5" y1="154.0" x2="252.5" y2="925.0" class="grid"/>
-<text x="252.5" y="939.0" text-anchor="middle">25</text>
-<line x1="342.3" y1="154.0" x2="342.3" y2="925.0" class="grid"/>
-<text x="342.3" y="939.0" text-anchor="middle">50</text>
-<line x1="432.0" y1="154.0" x2="432.0" y2="925.0" class="grid"/>
-<text x="432.0" y="939.0" text-anchor="middle">75</text>
-<line x1="524.4" y1="154.0" x2="524.4" y2="925.0" class="axis"/>
-<text x="524.4" y="939.0" text-anchor="middle">0</text>
-<line x1="614.1" y1="154.0" x2="614.1" y2="925.0" class="grid"/>
-<text x="614.1" y="939.0" text-anchor="middle">25</text>
-<line x1="703.9" y1="154.0" x2="703.9" y2="925.0" class="grid"/>
-<text x="703.9" y="939.0" text-anchor="middle">50</text>
-<line x1="793.7" y1="154.0" x2="793.7" y2="925.0" class="grid"/>
-<text x="793.7" y="939.0" text-anchor="middle">75</text>
+<line x1="162.7" y1="154.0" x2="162.7" y2="944.0" class="axis"/>
+<text x="162.7" y="958.0" text-anchor="middle">0</text>
+<line x1="252.5" y1="154.0" x2="252.5" y2="944.0" class="grid"/>
+<text x="252.5" y="958.0" text-anchor="middle">25</text>
+<line x1="342.3" y1="154.0" x2="342.3" y2="944.0" class="grid"/>
+<text x="342.3" y="958.0" text-anchor="middle">50</text>
+<line x1="432.0" y1="154.0" x2="432.0" y2="944.0" class="grid"/>
+<text x="432.0" y="958.0" text-anchor="middle">75</text>
+<line x1="524.4" y1="154.0" x2="524.4" y2="944.0" class="axis"/>
+<text x="524.4" y="958.0" text-anchor="middle">0</text>
+<line x1="614.1" y1="154.0" x2="614.1" y2="944.0" class="grid"/>
+<text x="614.1" y="958.0" text-anchor="middle">25</text>
+<line x1="703.9" y1="154.0" x2="703.9" y2="944.0" class="grid"/>
+<text x="703.9" y="958.0" text-anchor="middle">50</text>
+<line x1="793.7" y1="154.0" x2="793.7" y2="944.0" class="grid"/>
+<text x="793.7" y="958.0" text-anchor="middle">75</text>
 <text x="24" y="168.0" class="h">Llama 3.2 1B Instruct</text>
 <text x="152.7" y="186.5" text-anchor="end" class="lbl">Q4_0</text>
 <path d="M162.7,176.0h240.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-240.2z" class="f0"><title>Artlite, Llama 3.2 1B Instruct Q4_0, 1k-token prompt: 68.0</title></path>
@@ -174,8 +174,8 @@
 <line x1="24" y1="797.0" x2="856" y2="797.0" class="grid"/>
 <text x="24" y="815.0" class="h">Qwen3.6 35B-A3B</text>
 <text x="152.7" y="833.5" text-anchor="end" class="lbl">Q4_K_M</text>
-<path d="M162.7,823.0h81.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-81.5z" class="f0"><title>Artlite, Qwen3.6 35B-A3B Q4_K_M, 1k-token prompt: 23.8</title></path>
-<text x="253.2" y="833.5">23.8</text>
+<path d="M162.7,823.0h80.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-80.7z" class="f0"><title>Artlite, Qwen3.6 35B-A3B Q4_K_M, 1k-token prompt: 23.6</title></path>
+<text x="252.5" y="833.5">23.6</text>
 <path d="M524.4,823.0h62.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-62.1z" class="f0"><title>Artlite, Qwen3.6 35B-A3B Q4_K_M, 32k-token prompt: 18.4</title></path>
 <text x="595.4" y="833.5">18.4</text>
 <text x="152.7" y="848.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
@@ -183,21 +183,26 @@
 <text x="227.1" y="848.5">16.5<tspan dx="10" class="strong">Artlite 1.4× faster</tspan></text>
 <path d="M524.4,838.0h34.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-34.5z" class="f1"><title>FastFlowLM, Qwen3.6 35B-A3B q4nx, 32k-token prompt: 10.7</title></path>
 <text x="567.8" y="848.5">10.7<tspan dx="10" class="strong">Artlite 1.7× faster</tspan></text>
-<line x1="24" y1="865.0" x2="856" y2="865.0" class="grid"/>
-<text x="24" y="883.0" class="h">MiniCPM-V 4.7 1B</text>
-<text x="152.7" y="901.5" text-anchor="end" class="lbl">Q4_K_M</text>
-<path d="M162.7,891.0h293.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-293.7z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 1k-token prompt: 82.9</title></path>
-<text x="465.4" y="901.5">82.9</text>
-<path d="M524.4,891.0h194.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-194.9z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 32k-token prompt: 55.4</title></path>
-<text x="728.3" y="901.5">55.4</text>
-<text x="152.7" y="916.5" text-anchor="end" class="lbl2">FastFlowLM 1.0.9 q4nx</text>
-<path d="M162.7,906.0h146.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-146.1z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 1k-token prompt: 41.8</title></path>
-<text x="317.8" y="916.5">41.8<tspan dx="10" class="strong">Artlite 2.0× faster</tspan></text>
-<path d="M524.4,906.0h76.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-76.6z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 32k-token prompt: 22.4</title></path>
-<text x="610.0" y="916.5">22.4<tspan dx="10" class="strong">Artlite 2.5× faster</tspan></text>
-<text x="24.0" y="969.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
-<text x="24.0" y="985.0">† stopped at an end-of-sequence token after 143 of the 256 tokens</text>
-<text x="24.0" y="1001.0">‡ DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
-<text x="24.0" y="1017.0">§ with its MTP head: 7 drafts per step, 2.76 accepted</text>
-<text x="24.0" y="1033.0">¶ FastFlowLM loads it with at most 8192 positions</text>
+<text x="152.7" y="867.5" text-anchor="end" class="lbl">Q4_K_M + MTP</text>
+<path d="M162.7,857.0h100.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-100.9z" class="ft"><title>Artlite with its drafter, Qwen3.6 35B-A3B Q4_K_M, 1k-token prompt: 29.2</title></path>
+<text x="272.6" y="867.5">29.2<tspan dx="6" class="muted">S=3</tspan></text>
+<path d="M524.4,857.0h70.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-70.3z" class="ft"><title>Artlite with its drafter, Qwen3.6 35B-A3B Q4_K_M, 32k-token prompt: 20.7</title></path>
+<text x="603.7" y="867.5">20.7<tspan dx="6" class="muted">S=2</tspan></text>
+<line x1="24" y1="884.0" x2="856" y2="884.0" class="grid"/>
+<text x="24" y="902.0" class="h">MiniCPM-V 4.7 1B</text>
+<text x="152.7" y="920.5" text-anchor="end" class="lbl">Q4_K_M</text>
+<path d="M162.7,910.0h293.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-293.7z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 1k-token prompt: 82.9</title></path>
+<text x="465.4" y="920.5">82.9</text>
+<path d="M524.4,910.0h194.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-194.9z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, 32k-token prompt: 55.4</title></path>
+<text x="728.3" y="920.5">55.4</text>
+<text x="152.7" y="935.5" text-anchor="end" class="lbl2">FastFlowLM 1.0.9 q4nx</text>
+<path d="M162.7,925.0h146.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-146.1z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 1k-token prompt: 41.8</title></path>
+<text x="317.8" y="935.5">41.8<tspan dx="10" class="strong">Artlite 2.0× faster</tspan></text>
+<path d="M524.4,925.0h76.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-76.6z" class="f1"><title>FastFlowLM, MiniCPM-V 4.7 1B q4nx, 32k-token prompt: 22.4</title></path>
+<text x="610.0" y="935.5">22.4<tspan dx="10" class="strong">Artlite 2.5× faster</tspan></text>
+<text x="24.0" y="988.0">* not measured: a run at this length would take OpenFlowLM over 5 minutes</text>
+<text x="24.0" y="1004.0">† stopped at an end-of-sequence token after 143 of the 256 tokens</text>
+<text x="24.0" y="1020.0">‡ DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>
+<text x="24.0" y="1036.0">§ with its MTP head: 7 drafts per step, 2.76 accepted</text>
+<text x="24.0" y="1052.0">¶ FastFlowLM loads it with at most 8192 positions</text>
 </svg>

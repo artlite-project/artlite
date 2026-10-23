@@ -15,6 +15,7 @@ $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf 
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
+$ARTLITE_MODELS_DIR/ggml-org/Qwen3.6-35B-A3B-GGUF/mtp-Qwen3.6-35B-A3B-Q4_0.gguf          (its MTP drafter)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf     (MiniCPM-V's language model)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf            (its vision encoder, 16x)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf         (the same, 4x: finer detail)
@@ -22,7 +23,9 @@ $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf      
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
 the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"). The NPU path reads Q4_K,
-Q5_K and Q6_K tensors (and an MoE router's F32 ones).
+Q5_K and Q6_K tensors (and an MoE router's F32 ones). A qwen35moe model's drafter (`model_config.qwen_mtp_of`): an
+`mtp-*.gguf` next to the model, else in another account's repository of the same name (ggml-org publishes its drafters
+apart from the models), Q4_0 first.
 
 ## How the NPU path works
 
@@ -45,7 +48,8 @@ driver's hang detection. The prompt's last logits come from the LM head alone. T
 (inside a 32-position cache group, e.g. after a generated reply; fewer than 3 left) run as decode steps.
 
 Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's,
-21.02 GB of the 35B-A3B's) are re-laid-out into a device buffer at load, in memory, at their quantization's size.
+21.02 GB of the 35B-A3B's, and 0.56 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at
+their quantization's size.
 Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.97 GB (the
 35B-A3B, 0.66 GB of them its experts' inputs and outputs).
 
@@ -62,6 +66,22 @@ expert, dealt to the columns in turn) as control packets: the gather's while the
 GEMMs' and the combine's while the gather runs; the columns then gather their chunks' rows, run the experts' gate / up
 and down on them (moving only the 64-row strips of a chunk that hold valid rows: most experts get a few dozen of a
 chunk's 192), and the combine adds the routed and shared experts' outputs (`moe/prefill.py`).
+
+## Multi-token prediction (Qwen3.6-35B-A3B)
+
+With its drafter (the model's MTP layer: an attention layer and an MoE layer of its own, and an LM head), a generation
+step takes up to three draft tokens along (`qwen35/draft.py`, `NpuQwen.generate`): the drafter's guesses of what
+follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows),
+while the product of their probabilities stays at least 0.5. The step runs the token and its drafts, and a draft is
+kept where the model's own token at its position is that draft; the GDN states stay uncommitted until the next step,
+which replays the accepted tokens. The drafter's head is the first 65536 rows of its LM head (the most frequent
+tokens: 98-99% of essay and code tokens). Its row at a position takes that position's token and the model's hidden
+state of the position before, so its KV cache follows the model's: a prompt chunk also writes the drafter's records
+of its rows (its eh_proj, attn_norm and K / V after the model's last layer: `qwen35/draft_prefill.py`), and the
+accepted tokens' rows run with the next draft. The design runs the drafter's Q4_0 as a code page.
+
+A step of several tokens sums the experts' outputs in another order than a step of one, so greedy text with drafts can
+differ from greedy text without where the top two logits are within ~0.1 of each other.
 
 ## Images (MiniCPM-V 4.7)
 

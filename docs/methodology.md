@@ -6,7 +6,7 @@ prompt's time to first token also with llama.cpp on the iGPU:
 
 | chart | what |
 |---|---|
-| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4 also with its drafter (MTP) |
+| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4 and Qwen3.6 35B-A3B also with their drafters (MTP) |
 | prefill | tokens/s of a 1k- and a 32k-token prompt |
 | TTFT | time to first token against prompt length, 1k to 128k tokens, log-log |
 | image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
@@ -34,7 +34,7 @@ One NPU job at a time, with no other heavy CPU load.
 | TTFT | `artlite-bench -p 1024,8192,32768,65536 -n 0 -r 3` (MiniCPM-V 4.7 1B also 131072): `avg_ns` of each `pp<n>` (the prompt's chunks and the last token's logits) |
 | prefill | the same run: `avg_ts` of `pp1024`, `pp32768` |
 | decode | `artlite-cli -n 256 --greedy` on a prompt of 1023 / 32767 tokens: its generation speed |
-| decode with MTP | the same at the best tokens per step for each length (Gemma 4: 1 to 4) |
+| decode with MTP | the same at the best tokens per step for each length (1 to 4) |
 | image TTFT | `artlite-server --mmproj FILE`, streaming `/v1/chat/completions` requests of an image and "Describe this image in detail.", thinking off, greedy: the client's time to the first token, median of 3 after a warmup |
 
 The prompts are Paul Graham's essays (`tests/datasets/paul_graham_essays` in file-name order, fetched by
@@ -73,7 +73,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
 | Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-21 |
-| Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf` | `4ac6a06bce55` | 2026-10-22 |
+| Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf`, its drafter [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/blob/main/mtp-Qwen3.6-35B-A3B-Q4_0.gguf) `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | `4ac6a06bce55`, `606fca331adc` | 2026-10-24 |
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the

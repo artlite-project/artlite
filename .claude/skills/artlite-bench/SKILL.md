@@ -62,9 +62,9 @@ spends loading the prefill's library ELF (`Library.load`), which artlite-bench's
 
 ## 4. MTP: the best S
 
-For a model with a drafter (`NpuModel.DRAFTS`: Gemma 4 with its `mtp-<file>` next to the model), S = drafts + 1 tokens
-per dispatch. `artlite-cli` uses the maximum; `drafts.py` sets the count (0: steps of one token, the entry's
-`decode_tps`):
+For a model with a drafter (`NpuModel.DRAFTS`: Gemma 4 with its `mtp-<file>` next to the model, Qwen3.6 35B-A3B with
+ggml-org's `mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch.
+`artlite-cli` uses the maximum; `drafts.py` sets the count (0: steps of one token, the entry's `decode_tps`):
 
 ```bash
 for D in 0 1 2 3; do

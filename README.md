@@ -89,7 +89,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 |---|---|---|
 | [Llama 3.2 1B, 3B, Llama 3.1 8B Instruct](docs/models/llama3.md) | GGUF Q2_K to Q6_K, Q4_0, Q4_1, BF16 | prefill, decode |
 | [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0 | prefill, decode with its MTP drafter |
-| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B](docs/models/qwen35.md) | GGUF Q4_K_M | prefill, decode; MiniCPM-V's vision encoder |
+| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B](docs/models/qwen35.md) | GGUF Q4_K_M | prefill, decode; Qwen3.6 35B-A3B with its MTP drafter; MiniCPM-V's vision encoder |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).
