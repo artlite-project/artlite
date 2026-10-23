@@ -122,7 +122,7 @@ source .venv/bin/activate  # in the repo root
 # per-dispatch sampling:
 ARTLITE_PROFILE=1 ARTLITE_PROFILE_COUNTERS=33:34,34:33 \
   ARTLITE_PROFILE_SAMPLE_EVERY=10 \
-  pytest -s "tests/rtc/test_gelu.py::TestRtcGELU::test_gelu_lut"
+  pytest -s "tests/rtc/test_fused.py::TestFusedOperator::test_silu_add"
 
 # Full waveform trace of a single-column GELU kernel (then open the .json in
 # Perfetto — synthesized X slices = named kernel windows):

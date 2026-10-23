@@ -341,9 +341,12 @@ class TestFusedLifecycle:
         assert in_ext == 2, f"expected the two reads of w, got {in_ext}"
 
     def test_async_dispatches(self):
-        """Several dispatches in flight; a wait whose timeout expires leaves them pending."""
-        SIZE = 1 << 20  # ~9 ms per dispatch (one column)
-        fused = FusedOperator(name="test_async_silu", runlist=[(SiluOperator(size=SIZE), "in", "out")],
+        """Several dispatches in flight; a wait whose timeout expires leaves them pending. Each dispatch is compute
+        bound and long (SiLU 48 times over each tile on one core: ~22 ms) against what bounds the work still queued at
+        the wait: a 1 ms wait returns 4-8 ms late (the driver's tick) and a submit blocks once a few dispatches are
+        queued (~1 ms each)."""
+        SIZE = 1 << 20
+        fused = FusedOperator(name="test_async_silu", runlist=[(SiluOperator(size=SIZE, repeat=48), "in", "out")],
                               input_args=["in"], output_args=["out"]).compile()
         torch.manual_seed(0)
         inp = torch.randn(SIZE, dtype=torch.bfloat16)

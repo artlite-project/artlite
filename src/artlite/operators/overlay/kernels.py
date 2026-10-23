@@ -388,18 +388,11 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 }
 
 {% endif %}
-{% if act == "silu" %}
-{% set silu = km.act(km.SILU) %}
-{{ silu.src }}
+{% set lut = km.act(km.SILU if act == "silu" else km.GELU) %}
+{{ lut.src }}
 
-{% elif act == "gelu" %}
-{# bf16(gelu(g)) of the 32 bf16 at g, one copy (the values loaded twice inside: shorter lifetimes) #}
-{% set gelu = km.gelu(ptr=True) %}
-{{ gelu.src }}
-
-{% endif %}
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms; F_GU
-// ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0{{ " (the gather-LUT SiLU)" if act == "silu" else "" }}{{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
+// ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0 (kmath.act: the gather LUT, through gs){{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
 __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if act == "silu" and YT == 128 else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -421,7 +414,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int h = 0; h < 64 * ng; h += 64) {  // (the ng windows of [8 gate | 8 up] rows completed)
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + h)).template to_vector<bfloat16>());
-            {{ silu }}<32>(gs, gs + 32);
+            {{ lut }}<32>(gs, gs + 32);
             aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
         }
     }
@@ -429,7 +422,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
     if (flags & {{ F_GU }}) {
         bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
         aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt)).template to_vector<bfloat16>());
-        {{ silu }}<32>(gs, gs + 32);
+        {{ lut }}<32>(gs, gs + 32);
         aie::store_v(yt, al::mulc<32>(aie::load_v<32>(yt + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
     }
 {% else %}
@@ -438,7 +431,8 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int h = 0; h < {{ YT }}; h += 64) {
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + h)).template to_vector<bfloat16>());
-            aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), {{ gelu }}(gs)).template to_vector<float>());
+            {{ lut }}<32>(gs, gs + 32);
+            aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
         }
     }
 {% endif %}
@@ -448,7 +442,8 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int g = 0; g < {{ YT }}; g += 32) {
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + g)).template to_vector<bfloat16>());
-            aie::store_v(yt + g, aie::mul({{ gelu }}(gs), aie::load_v<32>(pl + g)).template to_vector<float>());
+            {{ lut }}<32>(gs, gs + 32);
+            aie::store_v(yt + g, aie::mul(aie::load_v<32>(gs + 32), aie::load_v<32>(pl + g)).template to_vector<float>());
         }
     }
 {% endif %}

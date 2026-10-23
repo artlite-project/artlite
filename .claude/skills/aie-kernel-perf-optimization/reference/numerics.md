@@ -70,7 +70,8 @@ x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
   the chords' errors cancel; weights minimax for |x| <= 2 gave SD's UNet more error).
 - The gather: lane k of an instruction reads table ab (k % 4 < 2) or cd, its odd lanes 32 bytes further; offset bits
   5:4 select the entry of a 64-byte group, bits 3:0 are ignored. So a table is 4 copies: groups of 4 entries stored
-  twice, in ab and cd (cd aliased onto ab: half the memory, 9% slower for SiLU). The reads carry no memory operand.
+  twice, in ab and cd, the two copies in two 16 KB regions (bank-conflicts.md). Each base of the address vector must
+  be a global or a pointer parameter of its own, or the reads carry no memory operand (compiler-feedback.md).
 
 - Both take the argument truncated to bf16. They share the mv slot with compares, selects and
   min / max.
@@ -125,13 +126,13 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
   from its centre (c0 fp32, c1, c2 bf16: one 64-bit entry; minimax on the segment's bf16 points, in result ULPs).
 - Range reduction in bf16: v = bf16(t + 32) rounds t to the grid ([32, 56] is a binade of ULP 1/4), r = (32 - v) + t
   exactly ((32 - v) first, or tiny t lose their bits), the table offset is vfloor(64 v).
-- Max 0.59 ULP, 99.84% correctly rounded, 873 cycles per 1024 elements on the NPU; the vtanh / vexp2 form below:
+- Max 0.59 ULP, 99.84% correctly rounded, 3287 cycles per 4096 elements on the NPU; the vtanh / vexp2 form below:
   6.6 ULP (at x = -2.2), 2682 cycles. Its emulation in numpy is bit-exact (`emulate` in `tests/rtc/elementwise.py`).
 - What set the II (~550 variants): register pressure, not slots. In one loop the
   constant vectors (1, 24, the abs mask, 0, the lanes' table pointers) took 5 of the 12 x registers, and the
   post-pipeliner's allocation failed (II 23-30 at ResMII 12-15; constants parked in lf / bm registers and moved back
-  every iteration). Fission: t = min(|x|, 24) in a loop of its own (II 2), the table pass reads it in place (II 16,
-  bound 9). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
+  every iteration). Fission: t = min(|x|, 24) in a loop of its own (II 2), the table pass reads it in place (II 22,
+  bound 9: the post-pipeliner's register allocation fails below). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
   halves (moves).
 
 ### Sigmoid through the gather LUT (`km.SIGMOID`: the qwen35 attention prep's gate)
@@ -164,34 +165,15 @@ two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f
 on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238
 cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error is invisible (3.14e-3 vs 3.08e-3).
 
-### GELU, tanh form (Gemma)
-
-`km.gelu()` (x, xr), 223 cycles per 32 lanes, within 1.7 bf16 ULPs of the fp32 tanh form over
-all bf16 inputs (`test_gelu.py`: max ≤ 2 ULPs, ≥ 97% correctly rounded):
-
-1. a = x / 2; w = z / 2 = x (C1 + C2 x²) / 2, in fp32: x² exact, `mul_hilo` for the constant
-   times x², `mulc` for the product with x (xr: x passed a second time).
-2. T = tanh(|w|): silu_small's polynomial below |w| = 1.25, vtanh above, one select.
-3. x ≥ 0: a (1 + T).
-4. x < 0: a e^(-2|w|) (1 + T). This is the identity 1 + tanh(w) = e^(2w) (1 + |tanh w|), with no
-   cancellation. e^y comes from the exp2 recipe with y = -2 log2(e) |w| by `mul_hilo`.
-5. Select by the sign of x.
-
-Rejected forms:
-- An exact form (a sigmoid with Newton steps as `km.silu`'s, all fp32 splits): accurate, but 622 cycles per 32
-  lanes, never pipelined, a 2.3 KB frame and 7.3 KB of stack when inlined.
-- A LUT form with w in bf16 and vexp2 of a bf16 argument: 12.5 ULPs off in the negative tail,
-  prefill KL 0.00061 (the accurate LUT form 0.00047, the exact one 0.00037).
-
-The decode overlay's GELU epilogue uses it (`overlay/kernels.py`).
-
 ### GELU through the gather LUT (`km.GELU`: the Gemma prefill's gate/up epilogue and per-layer-input op)
 
 The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
 segments of 1/8 over [0, 8]: within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
 faster than a quadratic per segment follows, so `floor` sets an absolute error target there), ~2.2 KB of table, as
 a worker `Buffer` argument (`km.table_pass(table_arg=True)`: SKILL.md section 2). `gate_up=True` renders the GEMM epilogue's
-form (the gate halves of a gate/up C tile).
+form (the gate halves of a gate/up C tile). The decode overlay's GELU (`overlay/kernels.py`) is `km.act(km.GELU)`,
+32 values at a time: 2.4x faster than the tanh form through `vtanh` (a bf16 fit below |w| = 1.25, e^(2w) (1 + |tanh w|)
+for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 
 ## Block float (bfp16ebs8)
 

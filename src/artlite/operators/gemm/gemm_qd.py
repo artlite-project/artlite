@@ -47,6 +47,7 @@ from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
 REGION = 0x4000  # a core's data memory: four 16 KB regions of two interleaved banks
+MAC_STACK = 0x400  # a MAC core's stack (its deepest call: the gate/up epilogue, ~320 B with the control code)
 # Planar MAC cores' buffers by region (``GemmQdOperator._planar_layout``): A0 / A1 / D0 / D1 the A and D objects, T0 / T1
 # the C tiles the MAC accumulates in (acc and the second half's or the pingpong's accb; the C objects when there is no
 # acc), the stack before region 0's; the other buffers first-fit after them. A window streams A, D and a C tile while
@@ -98,7 +99,8 @@ class GemmQdOperator(GemmQOperator):
                 "acc": ((2 if self.pingpong or self.halves == 2 or self.slots == 2 else 1) if self.silu or self.c_pack
                         else 0, m * nm * 2),
                 "sx": (1 if self.silu else 0, m * nm // self.sxp),
-                "lut": (1 if self.silu and self.act == "gelu" else 0, kmath.GELU.table_buffer().nbytes)}
+                "lut": (1 if self.silu and self.act == "gelu" else 0, kmath.GELU.table_words().nbytes),
+                "lutb": (1 if self.silu and self.act == "gelu" else 0, kmath.GELU.table_words().nbytes)}
 
     def _l1_bytes(self, m: int) -> int:
         """Data memory of the larger role (MAC core: ``_buffers``, dequantizing core: ``_dq_buffers``), the
@@ -158,7 +160,7 @@ class GemmQdOperator(GemmQOperator):
 
         lay = {"A": place(0x4000, *mac["A"]), "D": place(0x8000, *mac["D"]), "B": place(0x4000, *dq["B"]),
                "ws": place(0xC000, *dq["ws"]), "hb": place(0x0800, *dq["hb"])}
-        lo = 0x0800  # region 0 after the stack: the MAC core's cold buffers
+        lo = MAC_STACK  # region 0 after the stack: the MAC core's cold buffers
         if self.silu:  # the C tiles in regions 3 and 0, the SiLU scratch after the A objects
             lay["acc"], lay["accb"] = [0xC000], [lo]
             lo += (mac["acc"][1] + 63) // 64 * 64
@@ -192,7 +194,7 @@ class GemmQdOperator(GemmQOperator):
         mac, dq = self._buffers(m), self._dq_buffers()
         tiles = [("acc", 0), ("accb", 0)] if two else [("acc", 0)] if mac["acc"][0] else [("C", 0)]
         sizes = {k: (v[1] + 63) // 64 * 64 for k, v in {**mac, "accb": mac["acc"]}.items()}
-        nxt = [0x0800, REGION, 2 * REGION, 3 * REGION]  # (after the stack)
+        nxt = [MAC_STACK, REGION, 2 * REGION, 3 * REGION]  # (after the stack)
         lay: dict[str, list[int]] = {}
 
         def put(key: str, i: int, regions: list[int]) -> bool:
@@ -210,6 +212,8 @@ class GemmQdOperator(GemmQOperator):
         if not (all(put(*named[x], [g]) for g, members in enumerate(PLANAR_PLANS[plan]) for x in members)
                 and all(put(key, i, [3, 2, 1, 0]) for key, i in cold)):
             return None
+        if mac["lutb"][0] and not put("lutb", 0, [g for g in (3, 2, 1, 0) if g != lay["lut"][0] // REGION]):
+            return None  # (the table's second copy in another region than the first)
         # the dequantizing core: first-fit in the gaps around its D objects
         d_size = (dq["D"][1] + 63) // 64 * 64
         edges = [0x0800] + [e for a in sorted(lay["D"]) for e in (a, a + d_size)] + [0x10000]
@@ -262,9 +266,12 @@ class GemmQdOperator(GemmQOperator):
         p = self.p
         k_zero = Kernel(f"{p}_zero", "kernel.o", [acc_ty])
         gelu = self.silu and self.act == "gelu"
-        lut_ty = np.ndarray[(kmath.GELU.table_buffer().size,), np.dtype[np.uint32]]
-        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, lut_ty if gelu else np.int32]) \
+        lut_ty = np.ndarray[(kmath.GELU.table_words().size,), np.dtype[np.uint32]]
+        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, *([lut_ty] * 2 if gelu else [np.int32])]) \
             if self.silu else None
+        # the table's two copies (gelu): in two regions where the layout is pinned (``_place_plan``); else where aiecc
+        # puts them (a mem_bank for them reshuffled aiecc's placement of the MAC loop's streams: memory stall +42%)
+        lay = self._l1_layout()
         dk = slot(self.fmt).qd_kernels(self, lambda name, args: Kernel(f"{p}_{name}", "kernel.o", args),
                                        B_l1_ty=B_l1_ty, ws_ty=ws_ty, hb_ty=hb_ty, D_ty=D_ty)
         k_mm = (Kernel(f"{p}_mm2", "kernel.o", [A_l1_ty, D_ty, acc_ty, acc_ty]) if self.pingpong else
@@ -347,7 +354,7 @@ class GemmQdOperator(GemmQOperator):
         pingpong = self.pingpong
 
         def mac_fn(prm, dfi, af, cf, zero, mm, *extra):
-            act_arg = extra[-1] if gelu else 0  # (gelu: the table buffer; silu: the kernel's opaque runtime zero)
+            act_args = tuple(extra[-2:]) if gelu else (0,)  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
             if self.G > 1:  # row groups: per pass vp C objects of ``slots`` slots, each over the whole A strip
                 for _ in self._chunk_passes(prm):
                     for _ in range_(self.vp):
@@ -379,7 +386,7 @@ class GemmQdOperator(GemmQOperator):
                         af.release(1)
                     for acc in accs:
                         c = cf.acquire(1)
-                        extra[0](acc, c, extra[2], act_arg)
+                        extra[0](acc, c, extra[2], *act_args)
                         cf.release(1)
                 return
             for _ in self._chunk_passes(prm):
@@ -402,7 +409,7 @@ class GemmQdOperator(GemmQOperator):
                         af.release(1)
                         dfi.release(1)
                 if silu:
-                    extra[0](acc, c, extra[2], act_arg)
+                    extra[0](acc, c, extra[2], *act_args)
                 elif c_pack:
                     extra[0](acc, c)
                 cf.release(1)
@@ -423,10 +430,11 @@ class GemmQdOperator(GemmQOperator):
                 if pingpong or halves > 1 or self.slots == 2:
                     extra.append(Buffer(acc_ty, name=f"gq_accb_{c}_{row}"))
                 if gelu:
-                    extra.append(Buffer(lut_ty, name=f"gq_lut_{c}_{row}", initial_value=kmath.GELU.table_buffer()))
+                    extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.GELU.table_words())
+                              for key in ("lut", "lutb")]
                 workers.append(Worker(mac_fn, [prm, d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero,
                                                k_mm, *extra],
-                                      tile=Tile(c, 3 + row), stack_size=2048, dynamic_objfifo_lowering=True))
+                                      tile=Tile(c, 3 + row), stack_size=MAC_STACK, dynamic_objfifo_lowering=True))
 
         A_ty = np.ndarray[(self.M * self.a_K * 9 // 16,), np.dtype[bfloat16]]
         W_ty = np.ndarray[(self.w_bytes // 2,), np.dtype[bfloat16]]
@@ -437,7 +445,7 @@ class GemmQdOperator(GemmQOperator):
         sequence = self._sequence(a_prods, b_prods, c_conses, MR)
         rt = Runtime(sequence, [A_ty, W_ty, C_ty, [a_prods, b_prods, c_conses]])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
-        layout = self._l1_layout()
+        layout = lay
         if layout is not None:
             roles = {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqD": "D"}
 

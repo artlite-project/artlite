@@ -52,7 +52,7 @@ Why they are slow: an fp32 multiply is emulated (3 bf16 MACs plus 2 conversions:
 reduction, polynomial and Newton steps is latency-bound (II = the chain length): it never software-pipelines, because
 each value must be consumed within II cycles and the chain reuses the 5 `dm`.
 
-What took GELU from 622 to 223 cycles per 32 lanes (`km.gelu`; the recipe: numerics.md):
+What took a GELU (tanh form) from 622 to 223 cycles per 32 lanes (the gather table below does better: 26):
 - **A LUT where accurate enough, a short bf16 polynomial where not** (`vtanh` above |w| = 1.25, a fit below it).
 - **Identities without cancellation**: for w < 0, 1 + tanh(w) = e^(2w) (1 + |tanh w|).
 - **fp32 only where it matters**: x² exact as bf16 x bf16 -> fp32; fp32 x constant by `al::mul_hilo` (3 products);
@@ -63,7 +63,7 @@ What took GELU from 622 to 223 cycles per 32 lanes (`km.gelu`; the recipe: numer
 - **`noinline`** when called from several places (one copy in program memory).
 
 **A gather table is often both faster and more accurate**: AIE2P's gather (`load_4x64_lo / hi`, 4 entries of 64 bits
-per instruction) with a quadratic per segment: SiLU 0.59 ULP at 873 cycles per 1024 vs the vtanh form's 6.6 ULP at
+per instruction) with a quadratic per segment: SiLU 0.59 ULP at 822 cycles per 1024 vs the vtanh form's 6.6 ULP at
 2682 (`km.act`, `operators/kmath.py`). It costs 32 bytes of L1 per segment (4 copies).
 
 If it still does not pipeline, split it by **loop fission** through an L1 scratch: loop 1 stores the main result,

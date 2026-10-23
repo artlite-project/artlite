@@ -15,6 +15,7 @@ Reference files (read the one the step points to):
 | [reference/restructurings.md](reference/restructurings.md) | applying a section-3 restructuring: the case studies and their numbers |
 | [reference/loop-hints.md](reference/loop-hints.md) | choosing `AIE_*` pragmas, per-loop hints, global `-mllvm` flags |
 | [reference/numerics.md](reference/numerics.md) | fp32 via bf16 splits, exp2 / SiLU / GELU recipes, bfp16 precision, rounding, accuracy studies |
+| [reference/bank-conflicts.md](reference/bank-conflicts.md) | memory stalls: the DM regions and banks, lookup-table copies, finding the conflicting region, placement, case studies |
 | [reference/data-movement.md](reference/data-movement.md) | a DMA-bound operator: port and DDR rates, layouts, broadcasts, BD limits, task queues, overlays, libraries |
 | [reference/rejected.md](reference/rejected.md) | before trying an idea: what was measured and did not help |
 
@@ -105,7 +106,7 @@ Violating any of these usually costs more than any micro-tuning gains.
   result.
 - **Tables as worker `Buffer`s** (a LUT's coefficients: `Buffer(initial_value=...)`,
   `km.table_pass(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
-  pinned at fixed addresses (`pin_l1_buffers`).
+  pinned at fixed addresses (`pin_l1_buffers`). A gather table's two copies in two 16 KB regions (bank-conflicts.md).
 - **Every name at namespace scope is `{{ p }}_...`** (`p = kernel_prefix(stem)`, AGENTS.md "Rules"), helpers too:
   the build names each definition by its code, so the operators of a library or fused ELF (one translation unit)
   share equal helpers and never collide. A helper renderer several operators use renders under its own stem
@@ -200,46 +201,13 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 
 - **Signature**: cycles per window above the static schedule, MEMORY_STALL (event 23) inside the window,
   `CONFLICT_DM_BANK_*` (events 77-84) high on one pair.
-- **Causes, most expensive first**: two streamed loads from one bank in a bundle; read-modify-write of an L1
-  accumulator buffer, or spills / reloads (stack bank), next to streamed loads; DMA writes into a bank the loop streams
-  from; occasional loads and stores against a stream.
 - **Fixes, in this order**:
   1. registers instead of L1 (R1);
-  2. the hot loop's streams in different 16 KB regions with `pin_l1_buffers` (`operators/l1_layout.py`);
+  2. the hot loop's streams in different 16 KB regions (`pin_l1_buffers`, `Buffer(mem_bank=)`), a lookup table's two
+     copies too;
   3. DMA-written buffers next to buffers that only a cold loop reads.
-  Examples: a Q4_K GEMM, memory stalls halved, -8%; the GemmQ MAC 900 -> 783 cycles, GEMM -9%; planar GemmQd MAC cores
-  (3B Q2_K down), where aiecc put a k-tile's A and D objects in one region (32% of the MAC window in memory stalls),
-  pinned (`gemm_qd.PLANAR_PLANS`) 5.74 -> 5.15 ms.
-- **Where aiecc put things**: `design.mlir.prj/checked_bank_placement.mlir` in the cache dir (when aiecc dumps
-  intermediates); otherwise `llvm-nm -n` on the core's ELF lists the buffer symbols at the core's addresses, its own
-  memory at 0x70000. `pin_l1_buffers` gives each core-tile ObjectFifo pool its own `aie.buffer`s with an `address` (it
-  runs `aie-objectfifo-split` in-process); Worker `Buffer`s take an `address` attribute. Derive the addresses from the
-  same buffer list as the L1 budget (`GemmQOperator._l1_layout`).
-- The bank counters come in near-equal pairs: AIE2P's 8 banks are 32 B wide and pairs interleave at 32 B (AM027), so
-  every 64-byte access uses both banks of its 16 KB region. Any two accesses to one region in a cycle conflict: place
-  at 16 KB granularity.
-- **The MAC loop's C tile** (`gemm/mac.py`: loaded and stored every 16x16 block) puts ~16% memory stall into a GemmQd
-  MAC window when the C loads and stores hit one region (974 cycles per k-tile window vs 792 scheduled). A second C
-  tile in another region (`pingpong`, alternating k-tiles) removes it: free where the operator has one anyway
-  (gate/up's epilogue scratch), not worth a C object's double buffering where it does not (rejected.md). Or one C tile
-  across two regions (its halves at 0x4000 -/+ half) walked so that consecutive blocks alternate halves (`pats` walks:
-  band pairs (0, 2), (1, 3) block by block): sd15's fp32 C at m = 64, conflicts in the C regions 15.9K -> 0.4K
-  cycles per 1280 x 1280 GEMM op, the op -8%. It needs a two-stage loop (NS 2): with NS 3 a block's stores meet the
-  loads two blocks later.
-- **An object read in two parts, each part paired with another stream** (an m-64 A object's two k-tiles, each against
-  its own B slot): split it over two regions (two chained BDs: aie2p-coding section 8) so that part j sits in region
-  2 + j, and keep the other stream's parity (the op's command in B slot 0, so that k-tile i is in B slot (i + 1) % 2).
-  sd15's 16x16 GEMM: memory stall 7.6 -> 3.6 us, -12% per op; with the parity off by one every k-tile conflicts.
-  Where one object feeds several calls (a conv's rows, in two regions), order the calls so that their regions
-  alternate with the B slots (sd15 `Gemm.ORDER2`, rotated by one in odd chunks of 9 taps: memory stall -37%).
-- **A bank annotation is also a scheduling hint**: the fp32-C MAC with its second 8-row panel's C loads annotated as
-  bank b (the same addresses, still on slot A: machine-model.md) pipelines at II 41 instead of 43 (`render_mac(c2_bank=)`;
-  the stores annotated too, or every load: not pipelined or II 43-44). Sweep annotations like pragmas.
-- **When the streams outnumber the regions** (double-buffered A and D, a C tile, DMA writes of the next objects), list
-  per window which buffers the core streams (hard: never two in one region) and which the DMA writes (soft: keep them
-  out of the streamed regions), then pick the assignment with the fewest soft pairs that fits. Crossing the pairs (A0
-  with D1, A1 with D0) keeps a window's two streams apart when a region cannot hold both D objects. Measure each
-  candidate (pin by role and address in a throwaway patch of the design), one process each, alternating.
+- The region model, the gather rule, finding the region that conflicts, the placement tools and the case studies (C
+  tiles, objects read in two parts, annotations as hints, more streams than regions): reference/bank-conflicts.md.
 
 ## 6. Data-movement levers (rates and details: data-movement.md)
 

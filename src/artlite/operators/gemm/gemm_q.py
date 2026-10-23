@@ -240,6 +240,12 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
                   int32_t zero)
 {
+{% if "act" in ablate %}
+    return;
+{% endif %}
+{% if "ev_act" in ablate %}
+    event0();
+{% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if sxp > 1 %}
     // ({{ sxp }} parts of {{ mp }} rows: the scratch holds one part's)
@@ -267,19 +273,25 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 {% if sxp > 1 %}
     }
 {% endif %}
+{% if "ev_act" in ablate %}
+    event1();
+{% endif %}
 }
 
 {% endif %}
 {% if silu and act == "gelu" %}
 // gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
 // panels). Three pipelined loops through the scratch: A: t = min(|gate|, {{ gelu_tmax }}); B: kmath's GELU table pass in place
-// (``tab``: the core's copy of the tables); C: times up (as SiLU's).
+// (``tab_ab``, ``tab_cd``: the core's copies of the table, in two 16 KB regions); C: times up (as SiLU's).
 {% set mp = m // sxp %}
 void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
-                  const uint32_t *__restrict tab)
+                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
 {
 {% if "act" in ablate %}
     return;
+{% endif %}
+{% if "ev_act" in ablate %}
+    event0();
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if sxp > 1 %}
@@ -303,7 +315,7 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             py += 32;
         }
     }
-    {{ gtab }}<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab);
+    {{ gtab }}<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab_ab, tab_cd);
     {
         const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
         const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
@@ -318,6 +330,9 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     }
 {% if sxp > 1 %}
     }
+{% endif %}
+{% if "ev_act" in ablate %}
+    event1();
 {% endif %}
 }
 
@@ -522,8 +537,9 @@ class GemmQOperator(ArtcOperator):
         nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
-        kernel bodies out ("hdr": GemmQd's Q4_K header expansion), "ev_dq" / "ev_mm" / "ev_kt" put event0/1 markers around dq, mm or
-        dq..mm of a k-tile, "noperm" drops the memtile transposes."""
+        kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
+        "ev_kt" / "ev_act" put event0/1 markers around dq, mm, dq..mm of a k-tile or the gate/up epilogue, "noperm"
+        drops the memtile transposes."""
         self.planar = planar(fmt, rows, kc)
         assert self.planar or tile_major(fmt, rows, kc), f"no GEMM path reads {fmt} tiles of {rows} rows x {kc}"
         assert not self.planar or self.DQ_CORE, f"{fmt} tiles of {rows} rows x {kc}: GemmQdOperator"

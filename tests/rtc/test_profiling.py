@@ -78,7 +78,7 @@ def test_profiling_counters(tmp_path):
     # 64 kernel calls (tiles) per dispatch; each window is tens of cycles
     assert all(e["args"]["value"] == 64 for e in counts)
     assert all(0 < e["args"]["value"] for e in busy)
-    # windows sum: 64 calls x ~3.6K cycles, well below 64 x 10k
+    # windows sum: 64 calls x ~0.5K cycles, well below 64 x 10k
     assert all(e["args"]["value"] < 64 * 10_000 for e in busy)
 
     meta = [e for e in events if e.get("ph") == "M"]

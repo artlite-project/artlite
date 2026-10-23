@@ -71,13 +71,14 @@ runs one).
 | post-RA II far above ResMII, no spills | a value carried across iterations, a pointer used at both ends of the iteration, or an unproven memory dependence | load inside the iteration; separate walking load / store pointers; distinct `__restrict` parameters (SKILL.md section 4) |
 | alu-bound loop (`lshl`, `and`, `or`) | indices decoded from a flat loop counter | `add_2d_ptr` / `add_3d_ptr` walks (restructurings.md R8) |
 | "Minimal Initiation Interval too large" / RecMII = the whole chain | loads and stores through pointers into one buffer (no noalias scopes) | the loop in its own function with distinct `__restrict` parameters (SKILL.md section 2) |
+| gathers (`vldb.4x64`) in a loop that does not pipeline: RecMII through the next iteration's loads | the gathers carry no memory operand, so each orders against every load and store: llvm-aie gives them one only when each base of the address vector is a global or a pointer parameter of its own (not one pointer plus an offset, not one pointer used twice) | static tables, or each table copy a parameter (`km.table_pass(table_arg=True)`: II 49 -> 22) |
 | not pipelined, "Not a single basic block" | a branch, a switch (runtime lane index) or a call in the body | select instead of if; unroll lane loops; hoist the branch; loop fission |
 | not pipelined, "The loop structure is not supported" | a runtime trip count or a call-like construct | constant trip count (Jinja), mask the tail |
 | a long elementwise chain, II = its latency | fp32-emulated steps in one dependence chain | the LUT / identity rewrite or loop fission (restructurings.md R3) |
 | II jumps after adding a stream | a third bank shares a load slot with the heaviest stream, or a third panel stream | reorder the first loads or change bank annotations (machine-model.md); two panel streams per loop (SKILL.md section 4) |
 | ZOL false | several exits or an unknown trip count | constant trip count |
 | large prologue + epilogue vs `iters * II` | high NS on a short trip | fewer stages, a longer trip (merge loops), or accept |
-| fine schedule, slow on the NPU (cycles per window 20-30% above) | bank conflicts, read-modify-write of L1 accumulators, spills next to streams | accumulators in registers; `pin_l1_buffers` (SKILL.md section 5) |
+| fine schedule, slow on the NPU (cycles per window 20-30% above) | bank conflicts, read-modify-write of L1 accumulators, spills next to streams | accumulators in registers; `pin_l1_buffers` (bank-conflicts.md) |
 | a compiler crash, wrong results only in some variants | a Peano / aie_api trap | aie2p-coding section 9 |
 | `section '.text' will not fit in region 'program'` | inlined copies of big helpers, unrolls, control code | SKILL.md section 7 |
 | stack check fails after a change | an inlined fp32 chain or an unroll of pipelined code | `noinline` the helper; re-measure `stack N B` |

@@ -1,5 +1,5 @@
-"""1-D elementwise operators for the tests: harnesses of the activations the model kernels call (``SiluOperator``:
-``kmath.silu`` and kmath's table SiLU; ``GeluOperator``: ``kmath.gelu``; ``KmOperator``: any kmath function of
+"""1-D elementwise operators for the tests: harnesses of the activations the model kernels call (``SiluOperator``,
+``GeluOperator``: kmath's table activations, ``kmath.act``; ``KmOperator``: any kmath function of
 fp32 vectors) and the simplest operators for the infrastructure tests (fused ELFs, profiling, the render manifest).
 ``StreamOperator``: every core streams its chunk of all arguments through one kernel."""
 
@@ -127,75 +127,38 @@ class StreamOperator(ArtcOperator):
                              depth=1 if self.tile * self.itemsize > 8192 else 2, stack_size=self.stack_size)
 
 
-_SILU = JINJA_ENV.from_string(r"""
-{% if lut %}
-{{ lut.src }}
-{% else %}
-{% set silu = km.silu(16, inline=True) %}
-{{ silu.src }}
-{% endif %}
+_ACT = JINJA_ENV.from_string(r"""
+{{ act.src }}
 extern "C"
 void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
 {
     event0();
-    aie::set_rounding(aie::rounding_mode::conv_even);
-{% if lut %}
-    {{ lut }}<{{ ts }}>(input, output);
-{% else %}
-    // kmath.silu, 16 lanes per step
-    for (int j = 0; j < {{ ts }}; j += 16) {
-        aie::vector<bfloat16, 16> x = aie::load_v<16>(input); input += 16;
-        aie::store_v(output, aie::accum<accfloat, 16>({{ silu }}(x)).template to_vector<bfloat16>());
-        output += 16;
-    }
+{% if repeat > 1 %}
+    AIE_LOOP_NO_UNROLL
+    for (int r = 0; r < {{ repeat }}; r++)
 {% endif %}
+    {{ act }}<{{ ts }}>(input, output);
     event1();
 }
 """)
 
 
 class SiluOperator(StreamOperator):
-    """SiLU on a 1-D bf16 vector: ``lut`` kmath's table SiLU (``kmath.act``: ~0.85 cycles per element), else ``kmath.silu``
-    (software exp2, two Newton steps for the reciprocal; not pipelined: one long fp32 chain per 16 lanes, spilling,
-    ~16 cycles per element)."""
+    """SiLU (or another kmath table's activation: ``table``) on a 1-D bf16 vector (``kmath.act``: ~0.8 cycles per
+    element); ``repeat``: computed that many times per tile (the same output: a long compute-bound dispatch)."""
 
-    def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, lut: bool = False,
-                 table: str = "silu"):
-        """``table``: the kmath table of the lut form (silu, sigmoid)."""
-        self.lut, self.table = lut, table
+    def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, table: str = "silu",
+                 repeat: int = 1):
+        self.table, self.repeat = table, repeat
         super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, dtypes_in=(torch.bfloat16,),
                          dtypes_out=(torch.bfloat16,))
 
     @property
     def kernel_name(self) -> str:
-        return f"{self.table}_{'lut' if self.lut else 'exact'}_bf16_{self.tile}"
-
-    @property
-    def stack_size(self) -> int | None:
-        return 0xA00  # a 2.2 KB frame
+        return f"{self.table}_lut_bf16_{self.tile}" + (f"_r{self.repeat}" if self.repeat > 1 else "")
 
     def get_kernel_src(self) -> str:
-        return _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and kmath.act(kmath.TABLES[self.table]))
-
-
-_GELU = JINJA_ENV.from_string(r"""
-{% set gelu = km.gelu(inline=True) %}
-{{ gelu.src }}
-extern "C"
-void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
-{
-    event0();
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    // kmath.gelu, 32 lanes per step
-    for (int j = 0; j < {{ ts }}; j += 32) {
-        aie::vector<bfloat16, 32> x = aie::load_v<32>(input), xr = aie::load_v<32>(input);
-        input += 32;
-        aie::store_v(output, {{ gelu }}(x, xr));
-        output += 32;
-    }
-    event1();
-}
-""")
+        return _ACT.render(name=self.kernel_name, ts=self.tile, act=kmath.act(kmath.TABLES[self.table]), repeat=self.repeat)
 
 
 _VTANH = JINJA_ENV.from_string(r"""
@@ -224,7 +187,7 @@ class VtanhOperator(StreamOperator):
 
 
 class GeluOperator(StreamOperator):
-    """GELU in its tanh form (``kmath.gelu``) on a 1-D bf16 vector, up to 4 cores per column."""
+    """GELU in its tanh form (``kmath.act(kmath.GELU)``) on a 1-D bf16 vector, up to 4 cores per column."""
 
     MAX_TILE_BYTES = 16384
     MAX_CHANNELS = 4
@@ -237,12 +200,8 @@ class GeluOperator(StreamOperator):
     def kernel_name(self) -> str:
         return f"gelu_lut_bf16_{self.tile}"
 
-    @property
-    def stack_size(self) -> int | None:
-        return 0xD00
-
     def get_kernel_src(self) -> str:
-        return _GELU.render(name=self.kernel_name, ts=self.tile)
+        return _ACT.render(name=self.kernel_name, ts=self.tile, act=kmath.act(kmath.GELU), repeat=1)
 
 
 _KM = JINJA_ENV.from_string(r"""

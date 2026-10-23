@@ -194,7 +194,7 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int, nrows: int
                                         ddr=(npu.address("rec", c * 1024), 1024, None))]) for c in range(COLS)}, {})
         s.ddr_sync()
         npu.alloc("zeros", D.Q)
-    tabs = table_rows(npu, "tab", np.asarray(kmath.SILU.table_buffer()).view(np.uint8)) if mode == "gnsilu" else {}
+    tabs = table_rows(npu, "tab", np.tile(kmath.SILU.table_words(), 2).view(np.uint8)) if mode == "gnsilu" else {}
     if tabs:
         s.op({}, tabs)
     npr = 4 // len(a.rows)  # (the producer cores whose records the i-th core sums: [npr i, ..))

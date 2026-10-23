@@ -66,18 +66,12 @@ from ..base import JINJA_ENV  # StrictUndefined: a misspelled template variable 
 from ..kernel_source import kernel_prefix
 
 _KERNEL = JINJA_ENV.from_string(r"""
-{% set gelu = km.gelu(inline=True) %}
+{% set gelu = km.act(km.GELU) %}
 {{ gelu.src }}
 extern "C"
-void {{ p }}_gelu(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_dm_resource_b *__restrict output)
+void {{ p }}_gelu(bfloat16 *__restrict input, bfloat16 *__restrict output)
 {
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    for (int j = 0; j < {{ ts }}; j += 32) {
-        aie::vector<bfloat16, 32> x = aie::load_v<32>(input), xr = aie::load_v<32>(input);
-        input += 32;
-        aie::store_v(output, {{ gelu }}(x, xr));
-        output += 32;
-    }
+    {{ gelu }}<{{ ts }}>(input, output);  // (two pipelined passes over a constant count)
 }
 """)
 ```

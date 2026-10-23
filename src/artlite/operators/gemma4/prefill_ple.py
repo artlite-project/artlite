@@ -35,7 +35,7 @@ extern "C" {
 
 // 8 tokens: y (8 x {{ 8 * SLOT }} bf16), pli (8 x {{ 8 * PER }} bf16) -> 64 panels (8 tokens x 8 columns) of h in the slots
 void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, bfloat16 *__restrict t,
-                 const uint32_t *__restrict tab, bfloat16 *__restrict out)
+                 const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     {  // the slots' values, contiguous: t = min(|y|, {{ tmax }})
@@ -49,7 +49,7 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, b
         }
     }
     // gelu of the values (x: the slots of y, {{ SLOT }} apart)
-    {{ gtab }}<{{ 8 * 8 * PER }}>(y, t, t, t, tab);
+    {{ gtab }}<{{ 8 * 8 * PER }}>(y, t, t, t, tab_ab, tab_cd);
     {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values, 4 of zeros
         const bfloat16 *__restrict pg = t;
         al::BOut<> o((bfp16ebs8 *)out);
@@ -100,26 +100,27 @@ class PleOperator(ArtcOperator):
         l_ty = np.ndarray[(8 * COLS * PER,), bf]
         t_ty = np.ndarray[(8 * COLS * PER,), bf]
         o_ty = np.ndarray[(8 * COLS * SLOT * 9 // 16,), bf]
-        tab = kmath.GELU.table_buffer()
+        tab = kmath.GELU.table_words()  # (its two copies in banks 2 and 3: kmath.table_pass)
         tab_ty = np.ndarray[(tab.size,), np.dtype[np.uint32]]
-        k_ple = Kernel(f"{p}_ple", "kernel.o", [y_ty, l_ty, t_ty, tab_ty, o_ty])
+        k_ple = Kernel(f"{p}_ple", "kernel.o", [y_ty, l_ty, t_ty, tab_ty, tab_ty, o_ty])
         yf = [ObjectFifo(y_ty, name=f"pl_y{c}", depth=2) for c in range(cols)]
         lf = [ObjectFifo(l_ty, name=f"pl_l{c}", depth=2) for c in range(cols)]
         of = [ObjectFifo(o_ty, name=f"pl_o{c}", depth=2) for c in range(cols)]
 
-        def core(y_f, l_f, o_f, ple, t, tb, n_g):
+        def core(y_f, l_f, o_f, ple, t, ta, tb, n_g):
             for _ in forever_():
                 for _ in range_(n_g):
                     y = y_f.acquire(1)
                     pli = l_f.acquire(1)
                     o = o_f.acquire(1)
-                    ple(y, pli, t, tb, o)
+                    ple(y, pli, t, ta, tb, o)
                     o_f.release(1)
                     l_f.release(1)
                     y_f.release(1)
 
         workers = [Worker(core, [yf[c].cons(), lf[c].cons(), of[c].prod(), k_ple, Buffer(t_ty, name=f"pl_t{c}"),
-                                 Buffer(tab_ty, name=f"pl_tab{c}", initial_value=tab), n_gs[c]],
+                                 Buffer(tab_ty, name=f"pl_tab{c}", initial_value=tab, mem_bank=2),
+                                 Buffer(tab_ty, name=f"pl_tabb{c}", initial_value=tab, mem_bank=3), n_gs[c]],
                           tile=Tile(c, 2), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(cols)]
         ny, nl, no = T * COLS * SLOT, T * COLS * PER, T * COLS * SLOT * 9 // 16

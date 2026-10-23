@@ -60,7 +60,8 @@ def free(bd: Builder, t: Tensor) -> None:
 
 @functools.cache
 def _silu() -> np.ndarray:
-    return np.asarray(kmath.SILU.table_buffer()).view(np.uint8)
+    w = kmath.SILU.table_words()
+    return np.concatenate([w, w]).view(np.uint8)
 
 
 def silu_table(bd: Builder) -> None:

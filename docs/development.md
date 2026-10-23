@@ -40,7 +40,7 @@ design in IRON (`get_mlir_artifact()`) and its buffer arguments (`get_arg_spec()
 
 ```bash
 # rebuild one test's designs, print the Peano / aiecc commands, keep the assembly (kernel.cc.s in the cache)
-ARTLITE_IGNORE_CACHE=1 ARTLITE_LOG_COMMANDS=1 ARTLITE_GENERATE_ASM=1 pytest tests/rtc/test_silu.py -v -s
+ARTLITE_IGNORE_CACHE=1 ARTLITE_LOG_COMMANDS=1 ARTLITE_GENERATE_ASM=1 pytest tests/rtc/test_fused.py -v -s
 
 # the final schedule of each loop of a kernel: II, stages, trip counts, spills, the resource bound
 ARTLITE_MEASURE_II=1 python <<EOF

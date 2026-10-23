@@ -169,8 +169,9 @@ inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(co
 }
 }  // namespace
 
-{% set tabu = km.table_pass(km.SILU, unroll=640) %}
-{{ tabu.src }}
+{% set stab = km.table_pass(km.SILU, table_arg=True, n=640) %}
+{% set tw = km.SILU.table_words() | length %}
+{{ stab.src }}
 
 
 // (an fp32 C tile of nbr 16-row bands: a k-tile from A at a with the walks pa (A, bytes), pb (B, bytes), pl (C))
@@ -350,7 +351,7 @@ __attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32
       zz += 64;
       tt += 64;
     }
-    {{ tabu }}(z, t, t, t, tab);
+    {{ stab }}(z, t, t, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -382,7 +383,7 @@ __attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_
       zz += 64;
       tt += 64;
     }
-    {{ tabu }}(z, t, t, t, tab);
+    {{ stab }}(z, t, t, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -684,7 +685,7 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
     }
   }
   zz = z0;
-  if (mode == {{ A_GNSILU }}) {{ tabu }}(zz, t0, t0, zz, tab);
+  if (mode == {{ A_GNSILU }}) {{ stab }}(zz, t0, t0, zz, tab, tab + {{ tw }});
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(pan);
   AIE_LOOP_MIN_ITERATION_COUNT(10)
   for (int cb = 0; cb < 10; cb++) o.push(aie::accum<accfloat, 64>(aie::load_v<64>(zz + 64 * cb)).template to_vector<bfp16ebs8>());
