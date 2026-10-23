@@ -85,6 +85,10 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Llama prefill gate/up at T = 128 on pair GemmQ instead of a 2-row GemmQd | 119.9 vs 117.9 ms (3B, 128 tokens) |
 | Plain planar GemmQd (Gemma prefill qkv / o / down) with a C pingpong: one C object and a C tile `acc`, the first k-tile in acc alone, then acc -> C -> acc | the MAC window 974 -> 927 cycles (memory stall 159 -> 112), qkv alone 0.242 -> 0.232 ms, the 1152-token chunk unchanged (391 ms; 288 tokens +1%): the single C object's drain waits offset it. Its "separate" placement (both A, both D in one region each): 0.275 ms |
 | Gemma prefill GEMMs with 128 k per C round trip (simulated) or the C tile in fp32 | 128 k: no measurable accuracy gain; fp32 C: does not fit L1 at 96 tokens per MAC row (24 KB per C tile) |
+| Dequant pair (GemmQ): one A object instead of two, so the DMA refills it only during the next k-tile's dequant (the A conflicts in the MAC loop's region) | +29% (Llama 3B gate/up 6.69 -> 8.62 ms): A is broadcast to the 8 columns, one object puts the columns in lockstep |
+| The dequant pair's stack out of region 0 (`stack_address`: its reloads meet the X writes there) | aiecc refuses a stack outside bank A when kernels are compiled separately (Artlite's kernel.o) |
+| The dequant pair's last spilled constant (-128) as a load from a bank-1 table walked by two copies | reloads 2 -> 0, II 40 -> 42: the saved conflicts and the 2 cycles cancel |
+| SD 1.5's activation table copies in two regions | its fixed L1 layout has no 1.6 KB in another region; the tables' stalls are ~0.1-0.2% of a UNet step |
 
 ## Data movement
 

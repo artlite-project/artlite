@@ -59,9 +59,9 @@ SKILL.md section 5 has the workflow; machine-model.md the load-slot binding the 
 2. **Give them regions**: any two accessors that can meet in a cycle need different regions. With at most four per
    loop there is an assignment with zero conflicts: one region each. With more, some must share; keep apart, in this
    order: the core's own streams (they meet in every bundle), the core's streams and the DMA or neighbour writes, then
-   the two sides of a tile loaded and stored every block (split it over two regions: case studies). A loop of GemmQd's
-   MAC core has six (A and D read, the C tile loaded and stored, the next A and the next D written): its pinned plan
-   leaves 0.2-0.4 M conflicts per region and dispatch.
+   the two sides of a tile loaded and stored every block (its halves in two regions, the blocks alternating: case
+   studies). Attribute before moving anything: compile pieces out (GemmQ's ``ablate``: "mm", "dq", "act") and count
+   per region; a count that is the same in every run is a loop's own pattern, one that varies involves a DMA.
 3. **Pin every buffer by address**, from the same buffer list as the L1 budget, so that the plan is the layout. A plan
    that does not fit must fail loudly or fall back measured: GemmQd's planar plan returned "no layout" when a table's
    second copy needed a region of its own (64 bytes short at Gemma's T = 1024), aiecc then placed the whole core, and
@@ -91,6 +91,16 @@ Tools:
 - **A Q4_K GEMM, the GemmQ MAC, planar GemmQd**: memory stalls halved, -8%; the GemmQ MAC 900 -> 783 cycles, GEMM -9%;
   planar GemmQd MAC cores (3B Q2_K down), where aiecc put a k-tile's A and D objects in one region (32% of the MAC
   window in memory stalls), pinned (`gemm_qd.PLANAR_PLANS`) 5.74 -> 5.15 ms.
+- **GemmQd's C tiles in halves** (`csplit`, plan g1s): a two-halves gate/up pass (m 96) loaded and stored each C
+  tile in one region, 220800 conflicts per tile, core and dispatch, the same in every run. Each tile's halves 16 KB
+  apart (regions 1 and 2) and the `pats` walks pairing bands b and b + m / 32 block by block (the MAC loop has two
+  stages: a block's stores meet only the next block's loads): those regions 0, MAC memory stall 0.87 -> 0.52 M cycles,
+  Gemma E4B 8K TTFT -1.35%, Llama Q5_K_M / Q6_K gate/up -2%. The scratch in two parts where that is what makes the
+  pinned plan fit (`_l1_bytes`); not the C depth (one C object: -20% / +8% at two sizes).
+- **A spilled constant reloaded next to a stream**: the dequant pair's dequant loop reloaded two spilled 64-lane
+  constants from the stack (region 0) while pushing its output into X (region 0): 114K conflicts per core and dispatch.
+  `mac(accum(M), D, k128)` instead of `mac(mul(D, k128), M, ones)` needs no ones vector (4 reloads -> 2): 31K, the pair
+  GEMM -1% (Llama 3B / Qwen 9B gate/up). The stack itself cannot move (rejected.md).
 - **The MAC loop's C tile** (`gemm/mac.py`: loaded and stored every 16x16 block) puts ~16% memory stall into a GemmQd
   MAC window when the C loads and stores hit one region (974 cycles per k-tile window vs 792 scheduled). A second C
   tile in another region (`pingpong`, alternating k-tiles) removes it: free where the operator has one anyway

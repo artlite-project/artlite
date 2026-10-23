@@ -248,7 +248,6 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
     const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
 {% if parts == 2 %}
     const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
-    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
 {% else %}
     const aie::vector<bfloat16, 64> k136 = aie::broadcast<bfloat16, 64>(-136.0f);
 {% endif %}
@@ -260,8 +259,8 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
 {% if parts == 2 %}
         aie::vector<bfloat16, 64> M0, M1;
         al::expand16(aie::load_v<16>(pa + (2 * ii + 1) * {{ n }} + 16 * nb), M0, M1);
-        const aie::accum<accfloat, 64> C0 = aie::mac(aie::mul(D0, k128), M0, one);
-        const aie::accum<accfloat, 64> C1 = aie::mac(aie::mul(D1, k128), M1, one);
+        const aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
+        const aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
 {% else %}
         const aie::accum<accfloat, 64> C0 = aie::mul(D0, k136);
         const aie::accum<accfloat, 64> C1 = aie::mul(D1, k136);

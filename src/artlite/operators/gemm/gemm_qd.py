@@ -57,6 +57,7 @@ PLANAR_PLANS: dict[str, tuple[tuple[str, ...], ...]] = {
     "separate": (("A0", "A1"), ("D0", "D1"), ("T0",), ()),
     "g4": (("A0", "A1"), ("T0", "D1"), ("T1",), ("D0",)),  # two (half 0: D0 into acc, half 1: D1 into accb)
     "g1": (("A0", "A1"), ("T0",), ("T1",), ("D0", "D1")),
+    "g1s": (("A0", "A1"), ("T0", "T1"), ("T0h", "T1h"), ("D0", "D1")),  # two, each in halves (``csplit``)
 }
 
 
@@ -85,9 +86,17 @@ class GemmQdOperator(GemmQOperator):
         self.c_depth = 2
         self.T = kw.pop("M")
         step = mac_rows * m
+        self.csplit = 0
         super().__init__(nrows=mac_rows, M=-(-self.T // step) * step, m=m, **kw)
         assert self.dequant, "GemmQd: dequantized tile formats"
         assert not self.pingpong or self.n_kc * (self.kc // KT) % 2 == 0
+        # two C tiles (a pass's halves), each in halves 16 KB apart (``csplit``, plan g1s): the MAC loop's blocks
+        # alternate regions, so a block's C stores never meet the next block's C loads (one region per tile: a
+        # conflict per C access)
+        if self.halves == 2 and self.planar and self.m % 32 == 0 and "nosplit" not in self.ablate:
+            self.csplit = REGION
+            if self._planar_layout(self.m) is None:
+                self.csplit = 0
 
     def _buffers(self, m: int) -> dict[str, tuple[int, int]]:
         """(count, bytes) of the MAC core's buffers (the dequantizing core's: ``_dq_buffers``): A, the
@@ -107,14 +116,21 @@ class GemmQdOperator(GemmQOperator):
         2 KB stacks included; picks the C depth (2 if it fits) and the SiLU scratch's parts (``sxp``: the
         epilogue in 2 parts of m / 2 rows if the whole one does not fit). (Trading the C depth for a pinned planar
         layout was not consistent: 1B Q3_K_L's O at T = 256 -20%, at T = 2048 +8%.)"""
-        # (the GELU epilogue's table: two C objects and the scratch in two parts beat one C object, 1.19 vs 1.23 ms on
-        # Gemma's gate/up at T = 256)
-        auto = ((2, 1), (2, 2), (1, 1), (1, 2)) if self.silu and self.act == "gelu" else ((2, 1), (1, 1), (1, 2))
-        for cd, sxp in auto:
-            self.c_depth, self.sxp = cd, sxp
-            if super()._l1_bytes(m) <= L1_BUDGET:
-                break
-        return max(super()._l1_bytes(m), self._dq_bytes())
+        # (two C objects and the scratch in two parts beat one C object, 1.19 vs 1.23 ms on Gemma's gate/up at T = 256;
+        # planar: of the first C depth in budget, the scratch's parts whose pinned layout fits, else the first in
+        # budget (aiecc's placement))
+        auto = ((2, 1), (2, 2), (1, 1), (1, 2)) if self.silu else ((2, 1), (1, 1), (1, 2))
+        dq = self._dq_bytes()  # (picks the dequantizing core's weight objects first: the layouts place them too)
+        fits = [(cd, sxp) for cd, sxp in auto if self._try(m, cd, sxp) <= L1_BUDGET]
+        pinned = [c for c in fits if self.planar and c[0] == fits[0][0] and self._try(m, *c)
+                  and self._planar_layout(m) is not None]
+        self._try(m, *(pinned or fits or auto[-1:])[0])
+        return max(super()._l1_bytes(m), dq)
+
+    def _try(self, m: int, c_depth: int, sxp: int) -> int:
+        """Set the C depth and the scratch's parts; the MAC core's data memory with them."""
+        self.c_depth, self.sxp = c_depth, sxp
+        return super()._l1_bytes(m)
 
     def _dq_bytes(self) -> int:
         """The dequantizing core's data memory, stack included; picks its weight objects (two, or one if two do not
@@ -177,12 +193,15 @@ class GemmQdOperator(GemmQOperator):
 
     def _planar_layout(self, m: int) -> dict[str, list[int]] | None:
         """Planar tiles: the MAC cores' buffers by ``PLANAR_PLANS`` (crossed, else separate, for one
-        C tile, g4, else g1, for a pass's two halves, g1 for pingpong), the other buffers first-fit in regions 3 .. 0; the dequantizing core's D objects
+        C tile, g4, else g1, for a pass's two halves, g1 for pingpong; g1s for C tiles in halves, ``csplit``), the other
+        buffers first-fit in regions 3 .. 0; the dequantizing core's D objects
         at the MAC cores' addresses, its other buffers first-fit around them. None if nothing fits. Measured at T = 2048
         against aiecc's placement (alternating runs): 3B Q2_K down (Q3_K, m 64, n 128, crossed) 5.74 -> 5.15 ms (aiecc
         put A and D of one k-tile in one region: the MAC cores' memory stall 1.58 -> 0.62 ms), gate/up (g4) 7.41 -> 7.13,
         3B Q3_K_M gate/up 7.32 -> 6.99, 1B Q3_K_L 4.99 -> 4.78; 3B Q5_K (crossed) unchanged."""
         two = self.halves == 2 or self.pingpong or self.slots == 2
+        if self.csplit:
+            return self._place_plan(m, "g1s", two)
         # (pingpong: both C tiles in every window, D alternating as A: g4's acc and D1 would meet)
         auto = ["g1"] if self.pingpong else ["g4", "g1"] if two else ["crossed", "separate"]
         for plan in auto:
@@ -194,6 +213,8 @@ class GemmQdOperator(GemmQOperator):
         mac, dq = self._buffers(m), self._dq_buffers()
         tiles = [("acc", 0), ("accb", 0)] if two else [("acc", 0)] if mac["acc"][0] else [("C", 0)]
         sizes = {k: (v[1] + 63) // 64 * 64 for k, v in {**mac, "accb": mac["acc"]}.items()}
+        if self.csplit:  # (the tiles' first halves acc, accb; their second halves acch, accbh)
+            sizes.update(dict.fromkeys(("acc", "accb", "acch", "accbh"), (m * self.nm + 63) // 64 * 64))
         nxt = [MAC_STACK, REGION, 2 * REGION, 3 * REGION]  # (after the stack)
         lay: dict[str, list[int]] = {}
 
@@ -206,7 +227,8 @@ class GemmQdOperator(GemmQOperator):
                     return True
             return False
 
-        named = {"A0": ("A", 0), "A1": ("A", 1), "D0": ("D", 0), "D1": ("D", 1), "T0": tiles[0], "T1": tiles[-1]}
+        named = {"A0": ("A", 0), "A1": ("A", 1), "D0": ("D", 0), "D1": ("D", 1), "T0": tiles[0], "T1": tiles[-1],
+                 "T0h": ("acch", 0), "T1h": ("accbh", 0)}
         cold = ([("C", i) for i in range(mac["C"][0]) if ("C", i) not in tiles] + [("sx", 0)] * mac["sx"][0]
                 + [("lut", 0)] * mac["lut"][0])
         if not (all(put(*named[x], [g]) for g, members in enumerate(PLANAR_PLANS[plan]) for x in members)
@@ -214,6 +236,8 @@ class GemmQdOperator(GemmQOperator):
             return None
         if mac["lutb"][0] and not put("lutb", 0, [g for g in (3, 2, 1, 0) if g != lay["lut"][0] // REGION]):
             return None  # (the table's second copy in another region than the first)
+        if self.csplit and any(lay[h][0] - lay[t][0] != self.csplit for t, h in (("acc", "acch"), ("accb", "accbh"))):
+            return None
         # the dequantizing core: first-fit in the gaps around its D objects
         d_size = (dq["D"][1] + 63) // 64 * 64
         edges = [0x0800] + [e for a in sorted(lay["D"]) for e in (a, a + d_size)] + [0x10000]
@@ -230,8 +254,9 @@ class GemmQdOperator(GemmQOperator):
 
     def get_kernel_src(self) -> str:
         # (without forcing the post-RA pipeliner: II 33 per block instead of 34)
-        mac = render_mac(k=KT)
-        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
+        mac = render_mac(k=KT) + (render_mac(name=f"{MAC}s", k=KT, pats=True) if self.csplit else "")
+        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", macs=f"{MAC}s<{self.m}, {self.nm}>",
+                                  csplit=self.csplit, m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
                                   act=self.act, gelu_tmax=repr(kmath.GELU.t_max), fmt=self.fmt,
                                   nsb=self.nsb,
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,
@@ -257,7 +282,7 @@ class GemmQdOperator(GemmQOperator):
         c_elems = df.c_l1
         C_l1_ty = np.ndarray[(c_elems,) if cb else (m, self.n_c), np.dtype[bfloat16]]
         C_l2_ty = np.ndarray[(MR * c_elems,) if cb else (MR * m, self.n_c), np.dtype[bfloat16]]
-        acc_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
+        acc_ty = np.ndarray[(m // 2 if self.csplit else m, n), np.dtype[bfloat16]]  # (csplit: a tile's first half)
         sx_ty = np.ndarray[(m * n // 2 // self.sxp,), np.dtype[bfloat16]]
         dqb = self._dq_buffers()
         ws_ty = np.ndarray[(dqb["ws"][1] // 2,), np.dtype[bfloat16]]
@@ -429,6 +454,8 @@ class GemmQdOperator(GemmQOperator):
                          if silu else [k_pack, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if c_pack else [])
                 if pingpong or halves > 1 or self.slots == 2:
                     extra.append(Buffer(acc_ty, name=f"gq_accb_{c}_{row}"))
+                if self.csplit:  # (the tiles' second halves: the kernels reach them 16 KB on)
+                    extra += [Buffer(acc_ty, name=f"gq_{h}_{c}_{row}") for h in ("acch", "accbh")]
                 if gelu:
                     extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.GELU.table_words())
                               for key in ("lut", "lutb")]

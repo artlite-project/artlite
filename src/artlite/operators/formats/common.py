@@ -345,7 +345,6 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
     // w = d q + m = (128 + q) d + (m - 128 d), exact in fp32 (Q4_K: d = d sc, m = -dmin mn)
     const bfloat16 __aie_dm_resource_d *__restrict hm = (const bfloat16 __aie_dm_resource_d *)(hd + {{ 128 * tq * nsb }});
     const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
-    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
 {% else %}
     // w = d (q - 8) = (128 + q) d - 136 d, exact in fp32
     const aie::vector<bfloat16, 64> k136 = aie::broadcast<bfloat16, 64>(-136.0f);
@@ -359,8 +358,8 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
         aie::vector<bfloat16, 64> M0, M1;
         al::expand16_bc(aie::load_v<16>(hm), M0, M1);
         hm += 16;
-        aie::accum<accfloat, 64> C0 = aie::mac(aie::mul(D0, k128), M0, one);
-        aie::accum<accfloat, 64> C1 = aie::mac(aie::mul(D1, k128), M1, one);
+        aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
+        aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
 {% else %}
         aie::accum<accfloat, 64> C0 = aie::mul(D0, k136);
         aie::accum<accfloat, 64> C1 = aie::mul(D1, k136);

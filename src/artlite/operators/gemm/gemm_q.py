@@ -152,10 +152,19 @@ namespace {
 
 extern "C" {
 
+{% if csplit %}
+// (the tile's halves {{ csplit }} bytes apart: rows {{ m // 2 }}.. after the first half's 16 KB region)
+void {{ p }}_zero(bfloat16 *__restrict out)
+{
+    al::zero<{{ m * n // 2 }}, 32>(out);
+    al::zero<{{ m * n // 2 }}, 32>(out + {{ csplit // 2 }});
+}
+{% else %}
 void {{ p }}_zero(bfloat16 *__restrict out)
 {
     al::zero<{{ m * n }}, 32>(out);
 }
+{% endif %}
 
 {# the dequantizing kernels: n = the pass's MMUL columns, a dq call converts n_mac of them (halves: one half) #}
 {% set n_mac = n %}
@@ -233,7 +242,8 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 // Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
 // cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
 // (II 4 per 64 values).
-{% set mp = m // sxp %}
+{% set parts = 2 if csplit else sxp %}
+{% set mp = m // parts %}
 {% set silu_t = km.silu_tanh(gate_up=True) %}
 {{ silu_t.src }}
 
@@ -247,11 +257,11 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     event0();
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
-{% if sxp > 1 %}
-    // ({{ sxp }} parts of {{ mp }} rows: the scratch holds one part's)
+{% if parts > 1 %}
+    // ({{ parts }} parts of {{ mp }} rows: the scratch holds one part's{{ "; the C tile's halves" if csplit else "" }})
     AIE_LOOP_NO_UNROLL
-    for (int part = 0; part < {{ sxp }}; part++) {
-    const bfloat16 *__restrict cacc = cacc_ + part * {{ mp * n }};
+    for (int part = 0; part < {{ parts }}; part++) {
+    const bfloat16 *__restrict cacc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
     bfloat16 *__restrict hout = hout_ + part * {{ mp * n // 2 * 9 // 16 }};
 {% else %}
     const bfloat16 *__restrict cacc = cacc_;
@@ -270,7 +280,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             py += 64;
         }
     }
-{% if sxp > 1 %}
+{% if parts > 1 %}
     }
 {% endif %}
 {% if "ev_act" in ablate %}
@@ -283,7 +293,8 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 // gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
 // panels). Three pipelined loops through the scratch: A: t = min(|gate|, {{ gelu_tmax }}); B: kmath's GELU table pass in place
 // (``tab_ab``, ``tab_cd``: the core's copies of the table, in two 16 KB regions); C: times up (as SiLU's).
-{% set mp = m // sxp %}
+{% set parts = 2 if csplit else sxp %}
+{% set mp = m // parts %}
 void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
                   const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
 {
@@ -294,10 +305,10 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     event0();
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
-{% if sxp > 1 %}
+{% if parts > 1 %}
     AIE_LOOP_NO_UNROLL
-    for (int part = 0; part < {{ sxp }}; part++) {
-    const bfloat16 *__restrict cacc = cacc_ + part * {{ mp * n }};
+    for (int part = 0; part < {{ parts }}; part++) {
+    const bfloat16 *__restrict cacc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
     bfloat16 *__restrict hout = hout_ + part * {{ mp * n // 2 * 9 // 16 }};
 {% else %}
     const bfloat16 *__restrict cacc = cacc_;
@@ -328,7 +339,7 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             py += 64;
         }
     }
-{% if sxp > 1 %}
+{% if parts > 1 %}
     }
 {% endif %}
 {% if "ev_act" in ablate %}
@@ -372,8 +383,20 @@ void {{ p }}_mm(const bfloat16 *__restrict pA_in, const void *__restrict stage, 
     // (every entry sets the rounding: BFP16 tiles have no dq kernel that would, and
     // the default truncates the C tiles and B conversions: 5.7e-2 instead of 1.2e-2 rel-rms)
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if csplit %}
+{% set nb, half, band = n // 16, m // 32, 16 * 72 %}
+    // C's halves {{ csplit }} bytes apart (two 16 KB regions): the blocks of bands b and b + {{ half }} alternate, so a block's
+    // C stores (the loop's second stage) meet the next block's C loads in the other region
+    dims_3d_t patA(1, {{ (half - 1) * band }}, {{ nb - 1 }}, {{ -(half + 1) * band }}, {{ -half * band }});
+    dims_3d_t patB(1, {{ -band }}, {{ nb - 1 }}, 0, {{ -nb * band }});
+    dims_3d_t patL(1, {{ csplit // 2 }}, {{ nb - 1 }}, {{ 128 - csplit // 2 }}, {{ 16 * n - (nb - 1) * 128 - csplit // 2 }});
+    dims_3d_t patS = patL;
+    {{ macs }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
+                (bfloat16 __aie_dm_resource_c *)pC, patA, patB, patL, patS);
+{% else %}
     {{ mac }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
                 (bfloat16 __aie_dm_resource_c *)pC);
+{% endif %}
 {% if "ev_mm" in ablate or "ev_kt" in ablate %}
     event1();
 {% endif %}
@@ -539,7 +562,7 @@ class GemmQOperator(ArtcOperator):
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
         "ev_kt" / "ev_act" put event0/1 markers around dq, mm, dq..mm of a k-tile or the gate/up epilogue, "noperm"
-        drops the memtile transposes."""
+        drops the memtile transposes, "nosplit" keeps GemmQd's C tiles whole (``csplit``)."""
         self.planar = planar(fmt, rows, kc)
         assert self.planar or tile_major(fmt, rows, kc), f"no GEMM path reads {fmt} tiles of {rows} rows x {kc}"
         assert not self.planar or self.DQ_CORE, f"{fmt} tiles of {rows} rows x {kc}: GemmQdOperator"
@@ -769,7 +792,7 @@ class GemmQOperator(ArtcOperator):
                                   fmt=self.fmt,
                                   nsb=self.nsb, dqb=False,
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
-                                  c_pack=False, pingpong=False, planar=False, sxp=1, tq=self.tq, pair=self.pair,
+                                  c_pack=False, pingpong=False, planar=False, sxp=1, csplit=0, tq=self.tq, pair=self.pair,
                                   c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1)
 
     def dataflow(self) -> GemmQDataflow:
