@@ -59,7 +59,8 @@ class Kernel {
                     std::span<const std::reference_wrapper<shim_xdna::bo>> data_bufs,
                     uint32_t timeout_ms = 0, size_t instr_bytes = 0);
 
-  // Asynchronous dispatch_elf: submit the command and return immediately.
+  // Asynchronous dispatch_elf: submit the command and return immediately (its submit time is the one dispatch_wait's
+  // spin counts from).
   void dispatch_elf_async(shim_xdna::bo& instr_bo,
                           std::span<const std::reference_wrapper<shim_xdna::bo>> data_bufs,
                           size_t instr_bytes = 0);
@@ -72,9 +73,10 @@ class Kernel {
   // the timeout expired (timeout_ms 0: none; the commands then stay pending).
   void dispatch_wait(uint32_t timeout_ms = 0);
 
-  // dispatch_wait, first sleeping until spin_after_us after the last dispatch_async's submit and polling on CPU
-  // spin_cpu (as the spinning dispatch does).
-  void dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu);
+  // dispatch_wait, first sleeping until spin_after_us after the last asynchronous dispatch's submit and polling on CPU
+  // spin_cpu (as the spinning dispatch does); keep: return once at most that many dispatches are pending (the last
+  // ones submitted: they run on after the wait, in order).
+  void dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu, size_t keep = 0);
 
   // Whether every pending dispatch has finished (no syscall: reads the command states).
   bool dispatch_poll() const;

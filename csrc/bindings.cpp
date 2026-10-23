@@ -518,14 +518,15 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           nb::sig("def dispatch_async(self, ctrl_code: Buffer, data_bufs: list[Buffer]) -> None"))
       .def(
           "dispatch_wait",
-          [](artlite::Kernel& self, uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu) {
-            retire(self, [&] { self.dispatch_wait(timeout_ms, spin_after_us, spin_cpu); });
+          [](artlite::Kernel& self, uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu, size_t keep) {
+            retire(self, [&] { self.dispatch_wait(timeout_ms, spin_after_us, spin_cpu, keep); });
           },
-          "timeout_ms"_a = 0, "spin_after_us"_a = -1, "spin_cpu"_a = 0,
-          "Wait for every pending dispatch; raises DispatchError on a failure or when the timeout "
-          "expires (0: none). spin_after_us >= 0: sleep until that long after the last dispatch_async's submit, then "
-          "poll on CPU spin_cpu (as dispatch does).",
-          nb::sig("def dispatch_wait(self, timeout_ms: int = 0, spin_after_us: int = -1, spin_cpu: int = 0) -> None"))
+          "timeout_ms"_a = 0, "spin_after_us"_a = -1, "spin_cpu"_a = 0, "keep"_a = 0,
+          "Wait for every pending dispatch but the last ``keep`` (they run on, in order); raises DispatchError on a "
+          "failure or when the timeout expires (0: none). spin_after_us >= 0: sleep until that long after the last "
+          "asynchronous dispatch's submit, then poll on CPU spin_cpu (as dispatch does).",
+          nb::sig("def dispatch_wait(self, timeout_ms: int = 0, spin_after_us: int = -1, spin_cpu: int = 0, "
+                  "keep: int = 0) -> None"))
       .def("dispatch_poll", &artlite::Kernel::dispatch_poll,
            "Whether every pending dispatch has finished (reads the command states, no syscall).");
 

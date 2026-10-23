@@ -120,10 +120,10 @@ struct Kernel::Impl {
     return DispatchError(msg, state, health);
   }
 
-  // Retire the finished commands, all of them after a completed wait; throws the first failure.
-  void reap() {
+  // Retire the first n commands (all: n = pending's size), finished after a completed wait; throws the first failure.
+  void reap(size_t n) {
     std::optional<DispatchError> first;
-    while (!pending.empty()) {
+    for (; n && !pending.empty(); n--) {
       Command& c = pending.front();
       uint32_t state = state_of(*c.cmd);
       if (!ert_cmd_state_is_terminal(state)) {
@@ -144,9 +144,11 @@ struct Kernel::Impl {
     if (first) throw *first;
   }
 
-  void wait_all(uint32_t timeout_ms) {
-    if (pending.empty()) return;
-    const Command& last = pending.back();
+  // Wait until at most `keep` commands are pending (the last submitted ones), retiring the others.
+  void wait_all(uint32_t timeout_ms, size_t keep = 0) {
+    if (pending.size() <= keep) return;
+    const size_t n = pending.size() - keep;
+    const Command& last = pending[n - 1];
     uint32_t state = state_of(*last.cmd);
     if (!ert_cmd_state_is_terminal(state) && !ctx.wait(last.seq, timeout_ms)) {
       state = state_of(*last.cmd);
@@ -155,11 +157,12 @@ struct Kernel::Impl {
                                       timeout_ms, ert_cmd_state_name(state)),
                           state, std::nullopt);
     }
-    reap();
+    reap(n);
   }
 
-  bool done() const {
-    return std::all_of(pending.begin(), pending.end(),
+  // Whether every pending command but the last `keep` has finished.
+  bool done(size_t keep = 0) const {
+    return std::all_of(pending.begin(), pending.end() - static_cast<ptrdiff_t>(std::min(keep, pending.size())),
                        [](const Command& c) { return ert_cmd_state_is_terminal(state_of(*c.cmd)); });
   }
 
@@ -233,6 +236,7 @@ void Kernel::dispatch_elf(bo& instr_bo, std::span<const std::reference_wrapper<b
 
 void Kernel::dispatch_elf_async(bo& instr_bo, std::span<const std::reference_wrapper<bo>> data_bufs,
                                 size_t instr_bytes) {
+  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_elf(instr_bo, data_bufs, instr_bytes);
 }
 
@@ -243,9 +247,10 @@ void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrappe
 
 void Kernel::dispatch_wait(uint32_t timeout_ms) { impl_->wait_all(timeout_ms); }
 
-void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu) {
-  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
-  impl_->wait_all(timeout_ms);
+void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu, size_t keep) {
+  if (spin_after_us >= 0)
+    spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this, keep] { return impl_->done(keep); });
+  impl_->wait_all(timeout_ms, keep);
 }
 
 bool Kernel::dispatch_poll() const { return impl_->done(); }

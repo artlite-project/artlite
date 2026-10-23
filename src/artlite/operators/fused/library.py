@@ -153,13 +153,16 @@ class Library(FusedElf):
         """Dispatch the program of ``items`` (``items()``; consecutive items of one design share its configuration): a
         new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed the
         process's piece BOs (``Pieces``). ``bufs``: the data BOs the items address. ``hooks``: per item index of
-        ``splits``, a host function called before the piece it starts is dispatched (while the previous one runs: e.g.
-        inputs that only later items read). Returns the dispatches.
+        ``splits``, a host function called before the piece it starts is dispatched (while the previous one runs, the
+        one before it ended: e.g. inputs that only later items read, outputs of two pieces back). Returns the
+        dispatches.
 
-        The calling thread runs on the CPU that takes the NPU's interrupts meanwhile (``irq_cpu``): it waits for each
-        piece there (napping, then polling from shortly before its shortest seen end), and the host work between
-        pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU the scheduler
-        woke for it)."""
+        Each piece is dispatched as soon as it is assembled and its hook ran, then the previous one is waited for: the
+        firmware starts it at the previous one's end (a boundary waited for first: ~35 us more of idle NPU, the wait's
+        wake-up and the submit). The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
+        (``irq_cpu``): it waits there (napping, then polling from shortly before the piece's shortest seen end), and the
+        host work between pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU
+        the scheduler woke for it)."""
         cpu = irq_cpu()
         with portable.on_cpu(cpu), _PIECES.lock:
             return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
@@ -172,24 +175,30 @@ class Library(FusedElf):
         bounds = asm.bounds(items, set(splits), limit)
         refs = self._dispatch_bufs + [b for b in bufs if all(b is not d for d in self._dispatch_bufs)]
         key = None
+        submit = 0.0
+
+        def wait(piece: tuple[tuple[int, int, int], float], keep: int) -> float:
+            """Wait for ``piece`` ((id(items), a, b), its start on the NPU) until ``keep`` pieces after it are pending:
+            napping on the interrupts' CPU, then polling from shortly before its shortest seen end; returns its end."""
+            pkey, start = piece
+            est = self._ends.get(pkey)
+            after = int((start + est - submit) * 1e6) - self.SPIN_US if est is not None else 1 << 30  # (from submit)
+            kern.dispatch_wait(0, max(0, after) if cpu >= 0 else -1, max(cpu, 0), keep)
+            end = time.perf_counter()
+            self._ends[pkey] = min(end - start, est) if est is not None else end - start
+            return end
+
         if len(bounds) == 2 and not hooks:  # (a program of one piece run again: still in the BO of its parity)
             key = (hash(tuple((e, tuple(addrs)) for e, addrs in items)), asm.parity)
             held = _PIECES.holds(asm.parity, self, key)
             if held is not None:
+                submit = time.perf_counter()
                 kern.dispatch_elf_async(_PIECES.bos[asm.parity], refs, held[0])
                 asm.parity = held[1]
-                kern.dispatch_wait()
+                wait(((id(items), 0, len(items)), submit), 0)
                 return 1
         k, starts = 0, []
-        submit, pkey = 0.0, None
-
-        def wait() -> None:  # (the dispatched piece: napping on the interrupts' CPU, then polling near its end)
-            est = self._ends.get(pkey)
-            after = int(est * 1e6) - self.SPIN_US if est is not None else 1 << 30
-            kern.dispatch_wait(0, max(0, after) if cpu >= 0 else -1, max(cpu, 0))
-            d = time.perf_counter() - submit
-            self._ends[pkey] = min(d, est) if est is not None else d
-
+        last, end = None, 0.0  # (the piece dispatched last; the end of the one before it)
         for k, (a, b) in enumerate(itertools.pairwise(bounds)):
             starts.append(asm.parity)
             slot = asm.parity if key is not None else k % 2
@@ -203,17 +212,19 @@ class Library(FusedElf):
             if piece.nbytes > limit:
                 raise ValueError(f"{self.name}: items {a}..{b} take {piece.nbytes} bytes of control code, more than "
                                  f"a piece BO's {limit}")
+            # (slot k % 2: piece k - 2's, which has ended)
             bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
                 hooks[a]()
-            if k:
-                wait()  # (piece k - 1; meanwhile piece k was assembled)
-            submit, pkey = time.perf_counter(), (id(items), a, b)
+            submit = time.perf_counter()
             kern.dispatch_elf_async(bo, refs, piece.nbytes)
+            if last is not None:
+                end = wait(last, 1)  # (piece k - 1; piece k runs on from its end)
+            last = ((id(items), a, b), max(submit, end))
         if key is not None and asm.parity != slot:
             self._ahead(items, key, asm)
         elif asm.parity != starts[0]:  # (the next run's pieces start at the other parities: assembled while this one ends)
-            end = asm.parity
+            parity = asm.parity
             for (a, b), p in zip(itertools.pairwise(bounds), starts):
                 ck = (id(items), a, b, p ^ 1)
                 hit = self._pieces.get(ck)
@@ -221,8 +232,8 @@ class Library(FusedElf):
                     asm.parity = p ^ 1
                     piece = asm.assemble(items[a:b])
                     self._keep(ck, (items, piece, asm.parity))
-            asm.parity = end
-        wait()
+            asm.parity = parity
+        wait(last, 0)
         return k + 1
 
     def _ahead(self, items: Sequence[Item], key: tuple, asm: Assembler) -> None:

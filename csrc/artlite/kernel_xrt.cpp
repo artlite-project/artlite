@@ -125,10 +125,10 @@ struct Kernel::Impl {
     return DispatchError(msg, state, std::nullopt);
   }
 
-  // Retire the finished runs, all of them after a completed wait; throws the first failure.
-  void reap() {
+  // Retire the first n runs (all: n = pending's size), finished after a completed wait; throws the first failure.
+  void reap(size_t n) {
     std::optional<DispatchError> first;
-    while (!pending.empty()) {
+    for (; n && !pending.empty(); n--) {
       xrt::run& r = pending.front().first;
       uint32_t state = state_of(r);
       if (state != shim_xdna::ERT_CMD_STATE_COMPLETED && !first) first = failure(r, state);
@@ -138,12 +138,15 @@ struct Kernel::Impl {
     if (first) throw *first;
   }
 
-  // One deadline for all the runs (timeout_ms 0: none). XRT's wait returns TIMEOUT for an expired wait and may return
-  // late (the Windows timer's 15.6 ms), so each run's own state decides.
-  void wait_all(uint32_t timeout_ms) {
-    if (pending.empty()) return;
+  // Wait until at most `keep` runs are pending (the last submitted ones), retiring the others: one deadline for all
+  // the runs (timeout_ms 0: none). XRT's wait returns TIMEOUT for an expired wait and may return late (the Windows
+  // timer's 15.6 ms), so each run's own state decides.
+  void wait_all(uint32_t timeout_ms, size_t keep = 0) {
+    if (pending.size() <= keep) return;
+    const size_t count = pending.size() - keep;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    for (auto& [r, n] : pending) {
+    for (size_t i = 0; i < count; i++) {
+      xrt::run& r = pending[i].first;
       uint32_t state = state_of(r);
       const auto left =
           std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
@@ -162,11 +165,12 @@ struct Kernel::Impl {
                                         timeout_ms, shim_xdna::ert_cmd_state_name(state)),
                             state, std::nullopt);
     }
-    reap();
+    reap(count);
   }
 
-  bool done() const {
-    return std::all_of(pending.begin(), pending.end(),
+  // Whether every pending run but the last `keep` has finished.
+  bool done(size_t keep = 0) const {
+    return std::all_of(pending.begin(), pending.end() - static_cast<ptrdiff_t>(std::min(keep, pending.size())),
                        [](const auto& p) { return shim_xdna::ert_cmd_state_is_terminal(state_of(p.first)); });
   }
 };
@@ -205,6 +209,7 @@ void Kernel::dispatch_elf(bo& instr_bo, std::span<const std::reference_wrapper<b
 
 void Kernel::dispatch_elf_async(bo& instr_bo, std::span<const std::reference_wrapper<bo>> data_bufs,
                                 size_t instr_bytes) {
+  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_elf(instr_bo, data_bufs, instr_bytes);
 }
 
@@ -215,9 +220,10 @@ void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrappe
 
 void Kernel::dispatch_wait(uint32_t timeout_ms) { impl_->wait_all(timeout_ms); }
 
-void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu) {
-  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
-  impl_->wait_all(timeout_ms);
+void Kernel::dispatch_wait(uint32_t timeout_ms, int64_t spin_after_us, int spin_cpu, size_t keep) {
+  if (spin_after_us >= 0)
+    spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this, keep] { return impl_->done(keep); });
+  impl_->wait_all(timeout_ms, keep);
 }
 
 bool Kernel::dispatch_poll() const { return impl_->done(); }

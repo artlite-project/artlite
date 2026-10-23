@@ -294,6 +294,9 @@ offsets): aie2p-coding section 8. For speed:
   ran 2-3x faster alone); split it so that each piece's inputs come first and the rest overlaps the next piece (two
   hooks), and keep assembled pieces (`Library.PIECES_KEPT`, bytes: a cache of too few re-assembled a 1 MB piece,
   ~1.3 ms, every time).
+- **Keep the next dispatch queued**: submit piece k, then wait for k - 1 (`dispatch_wait(keep=1)`): the firmware
+  starts k at k - 1's end. Waited for first, a boundary left the NPU idle ~35 us (the wait's wake-up and the submit)
+  on top of the next piece's ConfigureOp; the qwen35 35B-A3B's 4096-token chunk (124 pieces) -0.3%.
 - **The first dispatch after new host buffers** takes ~0.15 s more (the driver maps them): a model's load ends with an
   empty dispatch (sd15 `Sd15Device.warm`), or its first step pays it.
 - **Overlap host work**: prepare the next chunk's inputs on a worker thread while the NPU runs
