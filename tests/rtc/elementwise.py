@@ -230,6 +230,8 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
         const aie::vector<float, {{ fn.lanes }}> x = aie::load_v<{{ fn.lanes }}>(input + j);
 {% if fn.arg == "accum" %}
         aie::store_v(output + j, {{ fn }}(aie::accum<accfloat, {{ fn.lanes }}>(x)).template to_vector<float>());
+{% elif fn.arg == "bfloat16" %}
+        aie::store_v(output + j, {{ fn }}(aie::accum<accfloat, {{ fn.lanes }}>(x).template to_vector<bfloat16>()));
 {% else %}
         aie::store_v(output + j, {{ fn }}(x));
 {% endif %}
@@ -239,8 +241,8 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
 
 
 class KmOperator(StreamOperator):
-    """A kmath function (``km.<func>(**kwargs)``: an fp32 vector or accumulator argument and result) on a 1-D fp32
-    vector, one core."""
+    """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument, an fp32
+    vector or accumulator result) on a 1-D fp32 vector, one core."""
 
     def __init__(self, *, size: int, func: str, **kwargs: object):
         self.func, self.kwargs = func, kwargs
@@ -251,6 +253,10 @@ class KmOperator(StreamOperator):
     @property
     def kernel_name(self) -> str:
         return "kmtest_" + self.fn.name.removeprefix(kmath.KM + "_")
+
+    @property
+    def stack_size(self) -> int | None:
+        return 0x1000  # (softplus inlined: 3.4 KB)
 
     def get_kernel_src(self) -> str:
         return _KM.render(fn=self.fn, name=self.kernel_name, ts=self.tile)

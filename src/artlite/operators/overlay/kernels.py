@@ -389,14 +389,9 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 
 {% endif %}
 {% if act == "gelu" %}
-{% set gelu = km.gelu(inline=True) %}
+{# bf16(gelu(g)) of the 32 bf16 at g, one copy (the values loaded twice inside: shorter lifetimes) #}
+{% set gelu = km.gelu(ptr=True) %}
 {{ gelu.src }}
-
-// bf16(gelu(g)) of the 32 bf16 at g (kmath.gelu; the values loaded twice: shorter lifetimes)
-__attribute__((noinline)) aie::vector<bfloat16, 32> {{ p }}_gelu(const bfloat16 *__restrict g)
-{
-    return {{ gelu }}(aie::load_v<32>(g), aie::load_v<32>(g));
-}
 
 {% endif %}
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms; F_GU
@@ -439,7 +434,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int h = 0; h < {{ YT }}; h += 64) {
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + h)).template to_vector<bfloat16>());
-            aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), {{ p }}_gelu(gs)).template to_vector<float>());
+            aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), {{ gelu }}(gs)).template to_vector<float>());
         }
     }
 {% endif %}
@@ -449,7 +444,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         AIE_LOOP_NO_UNROLL
         for (int g = 0; g < {{ YT }}; g += 32) {
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + g)).template to_vector<bfloat16>());
-            aie::store_v(yt + g, aie::mul({{ p }}_gelu(gs), aie::load_v<32>(pl + g)).template to_vector<float>());
+            aie::store_v(yt + g, aie::mul({{ gelu }}(gs), aie::load_v<32>(pl + g)).template to_vector<float>());
         }
     }
 {% endif %}

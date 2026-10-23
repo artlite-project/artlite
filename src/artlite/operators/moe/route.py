@@ -4,7 +4,7 @@ it on the route object), model-independent: E experts, the top K of each token s
 
 Per slot the core takes the K largest logits (fp32, compared as ordered integer keys of their bits: ties go to the
 lower id) and their weights w = e^(l - l_max) / sum over the K (fp32 to ~2^-16: ``kmath.exp2``,
-``al::recip_fp32``). The union U of the slots' experts (by id) is dealt over the COLS columns (``deal``): U[i] whole to
+``kmath.recip``). The union U of the slots' experts (by id) is dealt over the COLS columns (``deal``): U[i] whole to
 column i % COLS for i < COLS nw (nw = |U| // COLS), the remaining r experts' 2 r halves j = 2 t + h to column j % COLS;
 so every column gets ceil(2 |U| / COLS) halves at most, in at most nw + 2 <= MAX_ITEMS runs (items), the same deal on
 every core. An item's weight in a slot: its expert's weight in the slot's top K, else 0.
@@ -128,8 +128,9 @@ _SRC = JINJA_ENV.from_string(r"""
 alignas(64) static const uint32_t {{ p }}_ech[{{ 2 * MAX_ITEMS }}] = { {% for h in ch %}{{ h }}u, {% endfor %}};  // (the BDs' control headers)
 alignas(64) static const int32_t {{ p }}_ebd[{{ MAX_ITEMS + 1 }}] = { {% for b in bds %}{{ b }}, {% endfor %}0 };
 
-{% set exp2 = km.exp2(16, prec="fp32", inline=True) %}
+{% set exp2, recip = km.exp2(16, prec="fp32", inline=True), km.recip(16, domain="normal", steps=3) %}
 {{ exp2.src }}
+{{ recip.src }}
 
 // v (16 fp32, in place) -> e^v, 1 / v (fp32 to ~2^-16; one copy each)
 __attribute__((noinline)) void {{ p }}_rexp(float *__restrict v)
@@ -141,7 +142,7 @@ __attribute__((noinline)) void {{ p }}_rexp(float *__restrict v)
 __attribute__((noinline)) void {{ p }}_rrcp(float *__restrict v)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::store_v(v, al::recip_fp32<16>(aie::load_v<16>(v)));
+    aie::store_v(v, {{ recip }}(aie::load_v<16>(v)));
 }
 
 // v (16 fp32, in place) -> the softmax of its lanes (e^(v - v[0]) / sum; v[0] the largest; t: 16 fp32 of scratch)

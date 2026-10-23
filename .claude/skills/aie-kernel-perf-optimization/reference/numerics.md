@@ -2,7 +2,7 @@
 
 What the vector unit does natively, how to get fp32-level results from bf16 operations, and the
 accuracy traps met in Artlite's models. The helpers live in `operators/kernel_lib.h`
-(namespace `al`: exact building blocks) and `operators/kmath.py` (`km.exp2`, `km.silu`, `km.gelu`: generated per
+(namespace `al`: exact building blocks) and `operators/kmath.py` (`km.exp2`, `km.recip`, `km.sigmoid`, ...: generated per
 contract, each variant tested on the NPU bit-exact against its numpy model, `tests/rtc/kmath_sim.py`, which also
 models the fp32 adder, bf16 rounding and the hi / lo products for precision studies).
 
@@ -24,6 +24,11 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
   is rounded (to nearest even) onto the larger's grid of 23 fractional bits before the add (AM027),
   so a cancellation keeps only that grid: x - round(x) loses x's last bit where round(x) is a power
   of two above x. A MAC's sum (accumulator + exact bf16 product) is the same adder.
+- **Denormals are flushed to zero**, judged by the exact result: a product, a MAC's sum (of the exact product, not
+  flushed itself) before its rounding, a conversion. So x hi / lo splits lose the lo part where it falls below 2^-126
+  (`km.sigmoid`'s error rises below x = -79).
+- **A bf16 constant written as a float literal** that is no bf16 value is rounded at compile time
+  (`aie::broadcast<bfloat16>`): write the exact bf16 value.
 - **fp32 max** lowers to a bf16 compare plus a select. Float min / max / abs are expensive:
   - a 64-lane clamp cost ~25 cycles and spilled;
   - float `aie::neg` / `abs` may not legalize (G_FNEG): use `min(x, 0 - x)`, or integer ops on
@@ -150,7 +155,8 @@ and reciprocal).
 
 ### e^x of fp32 x in a pipelined loop
 
-``km.exp2``'s fp32 forms (``{{ e }}(al::log2e<32>(x))``) do not pipeline (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
+``km.exp2``'s fp32 forms (``{{ e }}(al::log2e<32>(x))``) do not pipeline; ``al::log2e`` is ~2^-16 relative, so e^x this
+way is off by ~1.6e-5 |x| (2^-9.5 at |x| = 87: ``km.expneg``) (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
 two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f by a quadratic in bf16 MACs (minimax
 on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238
 cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error is invisible (3.14e-3 vs 3.08e-3).

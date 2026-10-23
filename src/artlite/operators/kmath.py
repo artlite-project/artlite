@@ -75,8 +75,10 @@ def _check(what: str, value: object, allowed: tuple) -> None:
 
 
 def _bound(ulp: float | None, rel: float | None) -> str:
-    """A bound as the comments state it."""
-    return f"max {ulp:.2f} bf16 ULP" if ulp is not None else f"max 2^{math.log2(rel):.1f} relative"
+    """A bound as the comments state it (none: the variant's is not measured, e.g. with a caller's exp_fn)."""
+    if ulp is not None:
+        return f"max {ulp:.2f} bf16 ULP"
+    return "bound not measured" if rel is None else f"max 2^{math.log2(rel):.1f} relative"
 
 
 # exp2 ---------------------------------------------------------------------------------------------------------------
@@ -260,39 +262,222 @@ def exp2(lanes: int, *, bias: int | None = None, prec: str = "bf16", below: str 
     return Fn(**{**fn.__dict__, "parts": parts})
 
 
-# Activations built on exp2 -----------------------------------------------------------------------------------------
+# Reciprocal and functions built on exp2 ---------------------------------------------------------------------------
+
+def _local(fn: Fn) -> str:
+    return fn.name.removeprefix(KM + "_")
+
+
+def _take(what: str, fn: Fn | None, default: Fn, **need: object) -> tuple[Fn, str]:
+    """The function a composite calls for ``what``: ``fn`` (a caller's, e.g. one its template already defines) or
+    ``default``, checked against what the composite needs (``func``, ``lanes``, ``params``; a set: any of its values);
+    and the suffix it adds to the composite's name (none for the default)."""
+    fn = default if fn is None else fn
+    for k, v in need.items():
+        have = getattr(fn, k) if k in ("func", "lanes") else fn.params.get(k)
+        if have not in (v if isinstance(v, set) else {v}):
+            raise ValueError(f"kmath: {what} = {fn.name}: its {k} is {have!r}, not {v!r}")
+    return fn, "" if fn.name == default.name else f"__{_local(fn)}"
+
+
+_RECIP = r"""
+// 1 / x of {{ N }} fp32 lanes (kmath.recip: {{ bound }} for x in {{ dom }}): {{ "the mantissa's reciprocal: " if normal else "" }}a linear guess on [1, 2] (6%,
+// its slope a bf16 product), {{ steps }} Newton steps in fp32 products (al::mulff){{ ", the exponent negated in the bits (no scalar division: a\n// soft-float call)" if normal else "" }}
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+{% if normal %}
+    const aie::vector<int32, {{ N }}> b = x.template cast_to<int32>();
+    const aie::vector<int32, {{ N }}> e = aie::sub(aie::bit_and(b, aie::broadcast<int32, {{ N }}>(0x7F800000)),
+                                             aie::broadcast<int32, {{ N }}>(0x3F800000));
+    const aie::vector<float, {{ N }}> m = aie::sub(b, e).template cast_to<float>();  // (in [1, 2))
+{% set m = "m" %}
+{% else %}
+{% set m = "x" %}
+{% endif %}
+    const aie::vector<float, {{ N }}> two = aie::broadcast<float, {{ N }}>(2.0f);
+    aie::vector<float, {{ N }}> r = aie::sub(aie::broadcast<float, {{ N }}>(1.4117647f),
+                                     al::mulc<{{ N }}>({{ m }}, aie::broadcast<bfloat16, {{ N }}>(0.47058824f)).template to_vector<float>());
+{% if unroll %}
+{% for i in range(steps) %}
+    r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>({{ m }}, r)));
+{% endfor %}
+{% else %}
+    for (int i = 0; i < {{ steps }}; i++)
+        r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>({{ m }}, r)));
+{% endif %}
+    return {{ "aie::sub(r.template cast_to<int32>(), e).template cast_to<float>()" if normal else "r" }};
+}
+"""
+
+# recip's bound per steps (relative; the Newton steps square a 1/17 guess's error, the fp32 products' rounding stays)
+_RECIP_REL = {2: 4.1e-5, 3: 1.5e-5}
+
+
+def recip(lanes: int, *, domain: str = "unit", steps: int = 2, unroll: bool = False, inline: bool = True) -> Fn:
+    """1 / x of ``lanes`` fp32 lanes to ~2^-16: ``domain`` "unit" (x in [1, 2]) or "normal" (normal x > 0: the
+    mantissa's reciprocal, the exponent negated in the bits); ``steps`` Newton steps after a linear guess (2 or 3), a
+    loop (each step needs the last: not pipelined; ~80 bundles less than unrolled at the same cycles in gdn's
+    softplus, sigmoid) or ``unroll``ed (inlined in silu: ~7% faster)."""
+    _check("lanes", lanes, LANES)
+    _check("domain", domain, ("unit", "normal"))
+    _check("steps", steps, (2, 3))
+    rel = _RECIP_REL[steps]
+    dom = (1.0, 2.0) if domain == "unit" else (2.0 ** -126, 2.0 ** 125)
+    text = _ENV.from_string(_RECIP).render(N=lanes, normal=domain == "normal", steps=steps, unroll=unroll,
+                                           bound=_bound(None, rel),
+                                           dom="[1, 2]" if domain == "unit" else "[2^-126, 2^125]", name="{{ name }}",
+                                           attr="{{ attr }}")
+    local = f"recip_{lanes}" + ("_normal" if domain == "normal" else "") + f"_n{steps}" + ("_u" if unroll else "")
+    local += "" if inline else "_o"
+    return _fn(local, text, inline=inline, lanes=lanes, arg="float", ret="float", func="recip",
+               params={"domain": domain, "steps": steps, "unroll": unroll}, domain=(dom[0], np.nextafter(dom[1], np.inf)),
+               valid=(dom[0], np.nextafter(dom[1], np.inf)), rel=rel)
+
+
+_EXPNEG = r"""
+// e^(-|x|) of {{ N }} fp32 lanes (kmath.expneg, in (0, 1]: {{ bound }} for x in [-87, 87]; the error of x log2 e, ~2^-16
+// relative, grows with |x|: 2^-15.8 for |x| <= 1)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    const aie::vector<float, {{ N }}> ax = aie::max(x, aie::sub(aie::zeros<float, {{ N }}>(), x));
+    return {{ exp2 }}(al::log2e<{{ N }}>(aie::sub(aie::zeros<float, {{ N }}>(), ax)));
+}
+"""
+
+
+def expneg(lanes: int, *, exp_fn: Fn | None = None, inline: bool = True) -> Fn:
+    """e^(-|x|) of ``lanes`` fp32 lanes through ``exp_fn`` (an exp2 of fp32 arguments; default: the fp32 one)."""
+    _check("lanes", lanes, LANES)
+    e, tag = _take("exp_fn", exp_fn, exp2(lanes, prec="fp32"), func="exp2", lanes=lanes, bias=None,
+                   below={"clamp", "zero"})
+    rel = None if tag else 1.4e-3
+    text = _ENV.from_string(_EXPNEG).render(N=lanes, exp2=e.name, bound=_bound(None, rel), name="{{ name }}",
+                                            attr="{{ attr }}")
+    return _fn(f"expneg_{lanes}{tag}" + ("" if inline else "_o"), text, inline=inline, deps=(e,), lanes=lanes,
+               arg="float", ret="float", func="expneg", params={"exp_fn": e}, domain=(-87.0, 87.0),
+               valid=(-1e38, 1e38), rel=rel)
+
+
+_EXPM1 = r"""
+// e^g - 1 of {{ N }} fp32 lanes for g <= 0 (kmath.expm1: {{ bound }} for g in [-87, 0]): its Taylor polynomial in fp32
+// products below |g| = 1/2 (no cancellation), else 2^(g log2 e) - 1
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> g)
+{
+    aie::vector<float, {{ N }}> p = aie::broadcast<float, {{ N }}>({{ c[0] }}f);
+{% for k in c[1:] %}
+    p = aie::add(aie::broadcast<float, {{ N }}>({{ k }}f), al::mulff<{{ N }}>(g, p));
+{% endfor %}
+    const aie::vector<float, {{ N }}> small = aie::add(g, al::mulff<{{ N }}>(al::mulff<{{ N }}>(g, g), p));
+    const aie::vector<float, {{ N }}> big = aie::sub({{ exp2 }}(al::log2e<{{ N }}>(g)), aie::broadcast<float, {{ N }}>(1.0f));
+    return aie::select(big, small, aie::gt(g, aie::broadcast<float, {{ N }}>(-0.5f)));
+}
+"""
+EXPM1_C = tuple(np.float32(1) / np.float32(k) for k in (5040, 720, 120, 24, 6, 2))  # (e^g - 1 - g) / g^2, highest first
+
+
+def expm1(lanes: int, *, exp_fn: Fn | None = None, inline: bool = False) -> Fn:
+    """e^g - 1 of ``lanes`` fp32 lanes for g <= 0 to 2^-15.6 (``exp_fn``: an exp2 of fp32 arguments, default the
+    fp32 one)."""
+    _check("lanes", lanes, LANES)
+    e, tag = _take("exp_fn", exp_fn, exp2(lanes, prec="fp32"), func="exp2", lanes=lanes, bias=None,
+                   below={"clamp", "zero"})
+    rel = None if tag else 2.0e-5
+    text = _ENV.from_string(_EXPM1).render(N=lanes, exp2=e.name, c=[str(k) for k in EXPM1_C],
+                                           bound=_bound(None, rel), name="{{ name }}", attr="{{ attr }}")
+    return _fn(f"expm1_{lanes}{tag}" + ("_i" if inline else ""), text, inline=inline, deps=(e,), lanes=lanes,
+               arg="float", ret="float", func="expm1", params={"exp_fn": e}, domain=(-87.0, 0.0),
+               valid=(-1e38, 0.0), rel=rel)
+
+
+_SOFTPLUS = r"""
+// softplus(x) = max(x, 0) + log1p(e^(-|x|)) of {{ N }} fp32 lanes (kmath.softplus: {{ bound }} for x in [-80, 80], 2^-14.6 for
+// |x| <= 1: as kmath.expneg's): log1p(t) = 2 atanh(s), s = t / (2 + t) <= 1/3, its odd series to s^11 in fp32 products
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    const aie::vector<float, {{ N }}> t = {{ expneg }}(x);
+    const aie::vector<float, {{ N }}> half = aie::broadcast<float, {{ N }}>(0.5f);
+    // 1 / (2 + t) = (1 / (1 + t / 2)) / 2
+    const aie::vector<float, {{ N }}> r = al::mulff<{{ N }}>({{ recip }}(aie::add(aie::broadcast<float, {{ N }}>(1.0f), al::mulff<{{ N }}>(t, half))), half);
+    const aie::vector<float, {{ N }}> s = al::mulff<{{ N }}>(t, r);
+    const aie::vector<float, {{ N }}> s2 = al::mulff<{{ N }}>(s, s);
+    aie::vector<float, {{ N }}> p = aie::broadcast<float, {{ N }}>({{ c[0] }}f);
+{% for k in c[1:] %}
+    p = aie::add(aie::broadcast<float, {{ N }}>({{ k }}f), al::mulff<{{ N }}>(s2, p));
+{% endfor %}
+    const aie::vector<float, {{ N }}> l = al::mulff<{{ N }}>(aie::add(s, s), p);
+    return aie::add(aie::max(x, aie::zeros<float, {{ N }}>()), l);
+}
+"""
+ATANH_C = tuple(np.float32(1) / np.float32(k) for k in (11, 9, 7, 5, 3, 1))  # atanh(s) / s in s^2, highest first
+
+_SIGMOID = r"""
+// sigmoid(x) of {{ N }} fp32 lanes (kmath.sigmoid: {{ bound }} for x in [-80, 80], 2^-15.0 for |x| <= 1: as kmath.expneg's): r
+// or t r (x < 0), t = e^(-|x|), r = 1 / (1 + t)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    const aie::vector<float, {{ N }}> t = {{ expneg }}(x);
+    const aie::vector<float, {{ N }}> r = {{ recip }}(aie::add(aie::broadcast<float, {{ N }}>(1.0f), t));
+    return aie::select(r, al::mulff<{{ N }}>(t, r), aie::lt(x, aie::zeros<float, {{ N }}>()));
+}
+"""
+
+
+def _logistic(func: str, text: str, lanes: int, exp_fn: Fn | None, recip_fn: Fn | None, inline: bool,
+              rel: float) -> Fn:
+    _check("lanes", lanes, LANES)
+    t = expneg(lanes, exp_fn=exp_fn)
+    r, rtag = _take("recip_fn", recip_fn, recip(lanes, steps=3), func="recip", lanes=lanes, domain="unit")
+    etag = "" if exp_fn is None else _take("exp_fn", exp_fn, exp2(lanes, prec="fp32"))[1]
+    rel = None if etag or rtag else rel
+    src = _ENV.from_string(text).render(N=lanes, expneg=t.name, recip=r.name, c=[str(k) for k in ATANH_C],
+                                        bound=_bound(None, rel), name="{{ name }}", attr="{{ attr }}")
+    return _fn(f"{func}_{lanes}{etag}{rtag}" + ("_i" if inline else ""), src, inline=inline, deps=(t, r),
+               lanes=lanes, arg="float", ret="float", func=func, params={"expneg": t, "recip_fn": r},
+               domain=(-80.0, 80.0), valid=(-1e38, 1e38), rel=rel)
+
+
+def softplus(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, inline: bool = False) -> Fn:
+    """softplus(x) = log(1 + e^x) of ``lanes`` fp32 lanes: 2^-14.6 for |x| <= 1, 2^-8.8 at |x| = 80 (the error of x
+    log2 e grows with |x|; ``exp_fn``: an exp2 of fp32 arguments, default the fp32 one; ``recip_fn``: a recip on [1, 2],
+    default 3 steps)."""
+    return _logistic("softplus", _SOFTPLUS, lanes, exp_fn, recip_fn, inline, 2.3e-3)
+
+
+def sigmoid(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, inline: bool = False) -> Fn:
+    """sigmoid(x) = 1 / (1 + e^-x) of ``lanes`` fp32 lanes, as accurate as softplus (``exp_fn``, ``recip_fn``: as
+    softplus')."""
+    return _logistic("sigmoid", _SIGMOID, lanes, exp_fn, recip_fn, inline, 1.8e-3)
+
 
 _SILU = r"""
-// silu(x) = x sigmoid(x) of {{ N }} bf16 lanes in fp32 (kmath.silu): t = e^-|x| (2^x to bf16), r = 1 / (1 + t) from a linear
-// guess on [1, 2] and two Newton steps, sigmoid = x >= 0 ? r : t r. Rounded to bf16: 98.7% correctly rounded, max
-// 1.17 ULPs (x < 0, where t's bf16-level error passes through; tests/rtc/test_silu.py).
+// silu(x) = x sigmoid(x) of {{ N }} bf16 lanes in fp32 (kmath.silu): t = e^-|x| (2^x to bf16), r = 1 / (1 + t), sigmoid = x
+// >= 0 ? r : t r. Rounded to bf16: 98.7% correctly rounded, max 1.17 ULPs (x < 0, where t's bf16-level error passes
+// through; tests/rtc/test_silu.py).
 {{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<bfloat16, {{ N }}> x)
 {
     aie::vector<float, {{ N }}> xf = aie::accum<accfloat, {{ N }}>(x).template to_vector<float>();
     aie::vector<float, {{ N }}> nax = aie::min(xf, aie::sub(aie::zeros<float, {{ N }}>(), xf));
     aie::vector<bfloat16, {{ N }}> tb = aie::accum<accfloat, {{ N }}>({{ exp2 }}(al::log2e<{{ N }}>(nax))).template to_vector<bfloat16>();
     aie::vector<float, {{ N }}> t = aie::accum<accfloat, {{ N }}>(tb).template to_vector<float>();
-    const aie::vector<float, {{ N }}> one = aie::broadcast<float, {{ N }}>(1.0f);
-    const aie::vector<float, {{ N }}> two = aie::broadcast<float, {{ N }}>(2.0f);
-    aie::vector<float, {{ N }}> d = aie::add(t, one);
-    aie::vector<float, {{ N }}> r = aie::sub(aie::broadcast<float, {{ N }}>(1.4117647f),
-                                     al::mulc<{{ N }}>(d, aie::broadcast<bfloat16, {{ N }}>(0.47058824f)).template to_vector<float>());
-    r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>(d, r)));
-    r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>(d, r)));
+    aie::vector<float, {{ N }}> r = {{ recip }}(aie::add(t, aie::broadcast<float, {{ N }}>(1.0f)));
     aie::vector<float, {{ N }}> sg = aie::select(r, al::mulff<{{ N }}>(t, r), aie::lt(xf, aie::zeros<float, {{ N }}>()));
     return al::mulff<{{ N }}>(xf, sg);
 }
 """
 
 
-def silu(lanes: int, *, inline: bool = False) -> Fn:
+def silu(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, inline: bool = False) -> Fn:
     """silu(x) of ``lanes`` bf16 lanes -> fp32 (~16 cycles per element: fp32 math through bf16 products; the gather
-    table's SiLU, ``act_lut``, is ~1)."""
+    table's SiLU, ``act_lut``, is ~1). ``exp_fn``: an exp2 of fp32 arguments that clamps (the argument reaches -3e38;
+    default the bf16-level one, inlined); ``recip_fn``: a recip on [1, 2] (default 2 steps unrolled, inlined)."""
     _check("lanes", lanes, LANES)
-    e = exp2(lanes, inline=True)
-    text = _ENV.from_string(_SILU).render(N=lanes, exp2=e.name, name="{{ name }}", attr="{{ attr }}")
-    return _fn(f"silu_{lanes}" + ("_i" if inline else ""), text, inline=inline, deps=(e,), lanes=lanes,
-               arg="bfloat16", ret="float", func="silu")
+    e, etag = _take("exp_fn", exp_fn, exp2(lanes, inline=True), func="exp2", lanes=lanes, bias=None,
+                    below={"clamp", "zero"})
+    r, rtag = _take("recip_fn", recip_fn, recip(lanes, unroll=True), func="recip", lanes=lanes, domain="unit")
+    text = _ENV.from_string(_SILU).render(N=lanes, exp2=e.name, recip=r.name, name="{{ name }}", attr="{{ attr }}")
+    return _fn(f"silu_{lanes}{etag}{rtag}" + ("_i" if inline else ""), text, inline=inline, deps=(e, r), lanes=lanes,
+               arg="bfloat16", ret="float", func="silu", params={"exp_fn": e, "recip_fn": r}, domain=(-80.0, 80.0),
+               valid=(-1e38, 1e38), rel=None if etag or rtag else 4.5e-3)
 
 
 _GELU = r"""
@@ -300,10 +485,16 @@ _GELU = r"""
 // (gelu_pytorch_tanh, ggml_gelu: Gemma's activation) with the vtanh LUT, bf16: w = x (C1 + C2 x^2) in fp32 through bf16
 // hi / lo products (C1 = sqrt(2 / pi), C2 = 0.044715 C1), T = tanh(|w|) (al::silu_small's fit tanh(w) / w in w^2
 // below |w| = 1.25, the LUT above); a (1 + T) for x >= 0, a 2^(-2 |w| log2e) (1 + T) for x < 0 (1 + tanh(w) = e^(2 w)
-// (1 + |tanh w|) for w < 0: no cancellation anywhere; 2^y with the exponent clamped as an integer). xr: x again (a
-// second load: shorter lifetimes, as in al::silu_small).
+// (1 + |tanh w|) for w < 0: no cancellation anywhere). {{ "x loaded twice from g" if ptr else "xr: x again" }} (a second load: shorter lifetimes, as in
+// al::silu_small).{{ " Valid for x >= -344 (the exp2's exponent clamped as an integer)." if int_exp else "" }}
+{% if ptr %}
+{{ attr }} aie::vector<bfloat16, 32> {{ name }}(const bfloat16 *__restrict g)
+{
+    const aie::vector<bfloat16, 32> x = aie::load_v<32>(g), xr = aie::load_v<32>(g);
+{% else %}
 {{ attr }} aie::vector<bfloat16, 32> {{ name }}(aie::vector<bfloat16, 32> x, aie::vector<bfloat16, 32> xr)
 {
+{% endif %}
     const aie::vector<float, 32> sq = aie::mul(x, x).template to_vector<float>();  // exact
     const aie::vector<float, 32> u = aie::add(aie::broadcast<float, 32>(0.7978845608f),
                                               al::mul_hilo<32, 0.03564453125f, 3.2901763916015625e-05f>(sq));
@@ -331,9 +522,12 @@ _GELU = r"""
 """
 
 
-def gelu(*, inline: bool = False) -> Fn:
-    """gelu(x) (tanh form) of 32 bf16 lanes -> bf16; called with x twice (x, xr: two loads of the same data)."""
-    e = exp2(32, below="int", inline=True)
-    text = _ENV.from_string(_GELU).render(exp2=e.name, name="{{ name }}", attr="{{ attr }}")
-    return _fn("gelu_32" + ("_i" if inline else ""), text, inline=inline, deps=(e,), lanes=32, arg="bfloat16",
-               ret="bfloat16", func="gelu")
+def gelu(*, ptr: bool = False, exp_fn: Fn | None = None, inline: bool = False) -> Fn:
+    """gelu(x) (tanh form) of 32 bf16 lanes -> bf16: called with x twice (x, xr: two loads of the same data), or with
+    ``ptr`` a pointer to them (it loads them twice itself). ``exp_fn``: an exp2 of 32 fp32 lanes (default: the
+    exponent clamped as an integer, inlined: x >= -344; a clamping one for any x)."""
+    e, tag = _take("exp_fn", exp_fn, exp2(32, below="int", inline=True), func="exp2", lanes=32, bias=None)
+    text = _ENV.from_string(_GELU).render(exp2=e.name, ptr=ptr, int_exp=e.params["below"] == "int",
+                                          name="{{ name }}", attr="{{ attr }}")
+    return _fn("gelu_32" + ("_p" if ptr else "") + tag + ("_i" if inline else ""), text, inline=inline, deps=(e,),
+               lanes=32, arg="bfloat16", ret="bfloat16", func="gelu", params={"exp_fn": e, "ptr": ptr})

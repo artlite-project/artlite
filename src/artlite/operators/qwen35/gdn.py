@@ -35,6 +35,7 @@ import math
 import numpy as np
 
 from ...model_config import QwenConfig
+from .. import kmath
 from ..base import JINJA_ENV
 from ..design import COLS
 from ..kernel_source import kernel_prefix
@@ -53,71 +54,20 @@ F_GDN = 1 << 8  # M_FLAGS of the first GDN object of a step (the other cores ski
 G_WORDS = 16
 
 
-# The GDN math (fp32 to ~2^-16 through bf16 hi / lo products; rendered with p, eps in an anonymous namespace):
-# the decode's GDN core and the prefill scan (gdn_prefill.py: under GDN, one copy for its operators)
+# The GDN math in fp32 (kmath, 16 lanes: one out-of-line exp2 for all of it; ``gm`` in the templates) and the helpers
+# rendered with p, eps, gm, sigmoid (whether to define it) in an anonymous namespace: the decode's GDN core and the
+# prefill scan (gdn_prefill.py: under GDN, one copy for its operators)
 GDN = kernel_prefix("gdn")
-HELPERS = r"""// fp32 math to ~2^-16 through bf16 hi / lo products (al::mulff), 16 lanes
-
-{% set exp2 = km.exp2(16, prec="fp32") %}
-{{ exp2.src }}
-
-// e^g - 1 for g <= 0: its Taylor polynomial below |g| = 0.5 (no cancellation), else 2^(g log2 e) - 1
-__attribute__((noinline)) aie::vector<float, 16> {{ p }}_expm1(aie::vector<float, 16> g)
-{
-    aie::vector<float, 16> p = aie::broadcast<float, 16>({{ 1 / 5040 }}f);
-{% for c in [1 / 720, 1 / 120, 1 / 24, 1 / 6, 0.5] %}
-    p = aie::add(aie::broadcast<float, 16>({{ c }}f), al::mulff<16>(g, p));
-{% endfor %}
-    const aie::vector<float, 16> small = aie::add(g, al::mulff<16>(al::mulff<16>(g, g), p));
-    const aie::vector<float, 16> big = aie::sub({{ exp2 }}(al::log2e<16>(g)), aie::broadcast<float, 16>(1.0f));
-    return aie::select(big, small, aie::gt(g, aie::broadcast<float, 16>(-0.5f)));
-}
-
-// 1 / x for x in [1, 2]: a linear guess (6%) and three Newton steps
-[[clang::always_inline]] inline aie::vector<float, 16> {{ p }}_recip(aie::vector<float, 16> x)
-{
-    const aie::vector<float, 16> two = aie::broadcast<float, 16>(2.0f);
-    aie::vector<float, 16> r = aie::sub(aie::broadcast<float, 16>(1.4117647f), al::mulff<16>(x, aie::broadcast<float, 16>(0.47058824f)));
-    for (int i = 0; i < 3; i++)
-        r = al::mulff<16>(r, aie::sub(two, al::mulff<16>(x, r)));
-    return r;
-}
-
-// e^(-|x|) (in (0, 1])
-[[clang::always_inline]] inline aie::vector<float, 16> {{ p }}_expneg(aie::vector<float, 16> x)
-{
-    const aie::vector<float, 16> ax = aie::max(x, aie::sub(aie::zeros<float, 16>(), x));
-    return {{ exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), ax)));
-}
-
-// softplus(x) = max(x, 0) + log1p(e^(-|x|)); log1p(t) = 2 atanh(s), s = t / (2 + t) <= 1/3, odd series to s^11
-__attribute__((noinline)) aie::vector<float, 16> {{ p }}_softplus(aie::vector<float, 16> x)
-{
-    const aie::vector<float, 16> t = {{ p }}_expneg(x);
-    const aie::vector<float, 16> half = aie::broadcast<float, 16>(0.5f);
-    // 1 / (2 + t) = (1 / (1 + t / 2)) / 2
-    const aie::vector<float, 16> r = al::mulff<16>({{ p }}_recip(aie::add(aie::broadcast<float, 16>(1.0f), al::mulff<16>(t, half))), half);
-    const aie::vector<float, 16> s = al::mulff<16>(t, r);
-    const aie::vector<float, 16> s2 = al::mulff<16>(s, s);
-    aie::vector<float, 16> p = aie::broadcast<float, 16>({{ 1 / 11 }}f);
-{% for c in [1 / 9, 1 / 7, 1 / 5, 1 / 3, 1.0] %}
-    p = aie::add(aie::broadcast<float, 16>({{ c }}f), al::mulff<16>(s2, p));
-{% endfor %}
-    const aie::vector<float, 16> l = al::mulff<16>(aie::add(s, s), p);
-    return aie::add(aie::max(x, aie::zeros<float, 16>()), l);
-}
-
-// sigmoid(x) = r or t r (x < 0), t = e^(-|x|), r = 1 / (1 + t)
-__attribute__((noinline)) aie::vector<float, 16> {{ p }}_sigmoid(aie::vector<float, 16> x)
-{
-    const aie::vector<float, 16> t = {{ p }}_expneg(x);
-    const aie::vector<float, 16> r = {{ p }}_recip(aie::add(aie::broadcast<float, 16>(1.0f), t));
-    return aie::select(r, al::mulff<16>(t, r), aie::lt(x, aie::zeros<float, 16>()));
-}
-
+EXP2 = kmath.exp2(16, prec="fp32")
+MATH = {"exp2": EXP2, "expm1": kmath.expm1(16, exp_fn=EXP2), "softplus": kmath.softplus(16, exp_fn=EXP2),
+        "sigmoid": kmath.sigmoid(16, exp_fn=EXP2), "silu": kmath.silu(32)}
+HELPERS = r"""{{ gm.expm1.src }}
+{{ gm.softplus.src }}
+{% if sigmoid %}
+{{ gm.sigmoid.src }}
+{% endif %}
 {# silu(x) of 32 bf16 lanes: one copy (inlined it needs a large frame) #}
-{% set silu = km.silu(32) %}
-{{ silu.src }}
+{{ gm.silu.src }}
 
 // x (64 fp32) -> its bf16 hi and lo parts
 [[clang::always_inline]] inline void {{ p }}_split(aie::vector<float, 64> x, aie::vector<bfloat16, 64> &hi,
@@ -155,21 +105,13 @@ __attribute__((noinline)) void {{ p }}_l2(const float *__restrict x, bfloat16 *_
 }
 """
 
-def _helpers() -> str:
-    """gdn.HELPERS without its sigmoid (the core derives it from softplus)."""
-    h = HELPERS
-    a = h.index("// sigmoid(x) = r or t r")
-    b = h.index("{# silu(x) of 32 bf16 lanes")
-    return h[:a] + h[b:]
-
-
 _SRC = JINJA_ENV.from_string(r"""
 // The GDN core's workspace (offsets in bytes: GdnShape.workspace())
 #define GW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
 
-""" + _helpers() + r"""
+""" + HELPERS + r"""
 
 // pass 1 of a panel sp (16 i-blocks x [j 8][i 8] fp32): uw[0 .. 8) = S^T k, uw[8 .. 16) = S^T q (k, q: [hi | lo] x 128
 // of the token's k head)
@@ -263,11 +205,11 @@ __attribute__((noinline)) void {{ p }}_ggates(int32_t *__restrict ws)
         be[{{ h }}] = ab[{{ HC + h }}];
 {% endfor %}
         float *__restrict gt = GW(float, {{ g.gt }}) + 48 * s;
-        const aie::vector<float, 16> sp = {{ p }}_softplus(aie::add(al_, aie::load_v<16>(prm)));
-        aie::store_v(gt, {{ p }}_expm1(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
+        const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::add(al_, aie::load_v<16>(prm)));
+        aie::store_v(gt, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
         // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
-        const aie::vector<float, 16> sn = {{ p }}_softplus(aie::sub(aie::zeros<float, 16>(), be));
-        aie::store_v(gt + 16, {{ exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
+        const aie::vector<float, 16> sn = {{ gm.softplus }}(aie::sub(aie::zeros<float, 16>(), be));
+        aie::store_v(gt + 16, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
     }
 }
 
@@ -367,7 +309,7 @@ void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat1
         }
         AIE_LOOP_NO_UNROLL
         for (int c = 0; c < {{ D }}; c += 32)  // silu
-            aie::store_v(y + c, {{ silu }}(aie::accum<accfloat, 32>(aie::load_v<32>(y + c)).template to_vector<bfloat16>()));
+            aie::store_v(y + c, {{ gm.silu }}(aie::accum<accfloat, 32>(aie::load_v<32>(y + c)).template to_vector<bfloat16>()));
         // kq: [k, q][slot 4][head 2][hi | lo][128]
         bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 4 * D }} * s;
         if (b < 4)
@@ -477,7 +419,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
             AIE_LOOP_NO_UNROLL
             for (int i = 0; i < {{ D }}; i += 32) {
                 aie::vector<float, 32> t = al::mulff<32>(al::mulff<32>(aie::load_v<32>(o + i), iv), aie::load_v<32>(nw + i));
-                t = al::mulff<32>(t, {{ silu }}(aie::load_v<32>(z + i)));
+                t = al::mulff<32>(t, {{ gm.silu }}(aie::load_v<32>(z + i)));
                 aie::store_v(g + {{ D }} * s + i, aie::accum<accfloat, 32>(t).template to_vector<bfloat16>());
             }
         }
@@ -527,7 +469,7 @@ class GdnShape:
         return regions(sizes)
 
     def render(self, p: str, consts: dict[str, int]) -> str:
-        return _SRC.render(p=p, g=Attr(self.workspace()), CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
+        return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
                            PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps),
                            rs=bf16_hilo(1 / math.sqrt(D)), **consts,

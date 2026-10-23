@@ -24,6 +24,14 @@ CASES = {  # id: the function and its arguments
     "exp2-b192-sat": ("exp2", {"lanes": 32, "bias": 192, "above": "clamp"}),
     "exp2-b192-bounded": ("exp2", {"lanes": 32, "bias": 192, "below": "bounded"}),
     "exp2-b192-s64": ("exp2", {"lanes": 32, "bias": 192, "shift": 64}),
+    "recip-n2": ("recip", {"lanes": 32, "unroll": True}),
+    "recip-n3": ("recip", {"lanes": 16, "steps": 3, "inline": False}),
+    "recip-normal": ("recip", {"lanes": 16, "domain": "normal", "steps": 3, "inline": False}),
+    "expneg": ("expneg", {"lanes": 16}),
+    "expm1": ("expm1", {"lanes": 16}),
+    "softplus": ("softplus", {"lanes": 16}),
+    "sigmoid": ("sigmoid", {"lanes": 16}),
+    "silu": ("silu", {"lanes": 32}),
 }
 
 EDGES = np.float32([-np.inf, -1e30, -4e6, -32000, -16384, -1000, -200, -127.5, -127.25, -127, -126.9, -126.5, -126.1, 0, 100,
@@ -32,13 +40,18 @@ EDGES = np.float32([-np.inf, -1e30, -4e6, -32000, -16384, -1000, -200, -127.5, -
 
 def _arguments(fn: kmath.Fn) -> tuple[np.ndarray, np.ndarray]:
     """The domain's arguments (every bf16 there, for an accumulator argument every bf16 exponent plus the bias, and
-    2^18 fp32 ones between) and the edges in ``fn.valid``."""
+    2^18 fp32 ones between: log-uniform over a wide positive range; for a bf16 argument those rounded to bf16) and the
+    edges in ``fn.valid``."""
     lo, hi = fn.domain
     bias = np.float32(192 if fn.arg == "accum" else 0)
     b = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).float().numpy()
     b = b[np.isfinite(b)] + bias
     rng = np.random.default_rng(0)
-    dom = np.concatenate([b[(b >= lo) & (b < hi)], rng.uniform(lo, hi, 1 << 18)]).astype(np.float32)
+    wide = lo > 0 and hi / lo > 1e3
+    r = np.exp2(rng.uniform(np.log2(lo), np.log2(hi), 1 << 18)) if wide else rng.uniform(lo, hi, 1 << 18)
+    dom = np.concatenate([b[(b >= lo) & (b < hi)], r]).astype(np.float32)
+    if fn.arg == "bfloat16":
+        dom = kmath_sim.bf16(dom)
     return dom, EDGES[(EDGES >= fn.valid[0]) & (EDGES < fn.valid[1]) & ((EDGES < lo) | (EDGES >= hi))]
 
 
@@ -47,9 +60,16 @@ def _contracts() -> list[kmath.Fn]:
     for lanes, inline in itertools.product(kmath.LANES, (False, True)):
         fns += [kmath.exp2(lanes, prec="bf16", below=b, inline=inline) for b in ("clamp", "zero", "int")]
         fns += [kmath.exp2(lanes, prec="fp32", inline=inline), kmath.silu(lanes, inline=inline)]
+        fns += [kmath.recip(lanes, domain=d, steps=n, unroll=u, inline=inline)
+                for d, n, u in itertools.product(("unit", "normal"), (2, 3), (False, True))]
+        fns += [f(lanes, inline=inline) for f in (kmath.expneg, kmath.expm1, kmath.softplus, kmath.sigmoid)]
+        fns += [kmath.sigmoid(lanes, recip_fn=kmath.recip(lanes), inline=inline),
+                kmath.silu(lanes, exp_fn=kmath.exp2(lanes, below="zero"), inline=inline),
+                kmath.expm1(lanes, exp_fn=kmath.exp2(lanes, inline=True), inline=inline)]
         fns += [kmath.exp2(lanes, bias=192, below=b, above=a, shift=s, inline=inline)
                 for b, a, s in itertools.product(("clamp", "bounded", "none"), ("none", "clamp"), (0, 64))]
-    return fns + [kmath.gelu(inline=i) for i in (False, True)]
+    return fns + [kmath.gelu(ptr=p, exp_fn=e, inline=i)
+                  for p, e, i in itertools.product((False, True), (None, kmath.exp2(32)), (False, True))]
 
 
 def test_kmath_sources() -> None:
@@ -65,6 +85,17 @@ def test_kmath_sources() -> None:
                 {"lanes": 32, "bias": 192, "prec": "fp32"}, {"lanes": 32, "above": "clamp"}):
         with pytest.raises(ValueError):
             kmath.exp2(**bad)
+    for bad in (lambda: kmath.silu(32, exp_fn=kmath.exp2(32, below="int")),  # (silu's argument reaches -3e38)
+                lambda: kmath.silu(32, exp_fn=kmath.exp2(16)), lambda: kmath.sigmoid(16, recip_fn=kmath.exp2(16)),
+                lambda: kmath.softplus(16, recip_fn=kmath.recip(16, domain="normal")), lambda: kmath.recip(16, steps=1)):
+        with pytest.raises(ValueError):
+            bad()
+
+
+def test_kmath_shared_dependency() -> None:
+    """Two functions calling one exp2 (softplus, expm1): a source rendering both defines it once."""
+    tu = KernelSource(kmath.softplus(16).src + kmath.expm1(16).src).text
+    assert tu.count("__attribute__((noinline)) aie::vector<float, 16> km_exp2_v16_fp32_") == 1
 
 
 @pytest.mark.parametrize("case", list(CASES))
@@ -76,10 +107,12 @@ def test_kmath(case: str) -> None:
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
     out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(torch.from_numpy(xp)).numpy()[:len(x)]
     em = kmath_sim.emulate(fn, x)
-    same = out.view(np.uint32) == em.view(np.uint32)
+    same = (out == em) | (np.isnan(out) & np.isnan(em))  # (zeros of either sign alike)
     assert same.all(), (f"{(~same).sum()} results differ from the emulation; at {x[~same][:4]}: {out[~same][:4]} vs "
                         f"{em[~same][:4]}")
     o, ref = out[:len(dom)].astype(np.float64), kmath_sim.exact(fn, dom)
+    keep = np.abs(ref) >= 2.0 ** -125  # (results below 2^-126 are flushed to zero, and those just above it may be)
+    o, ref, dom = o[keep], ref[keep], dom[keep]
     if fn.ulp is not None:
         e = np.abs(o - ref) / np.exp2(np.floor(np.log2(ref)) - 7)
         print(f"\n{fn.name}: max {e.max():.3f} bf16 ULP, mean {e.mean():.3f}")

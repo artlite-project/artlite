@@ -1,5 +1,5 @@
 // Kernel helpers shared by the operators' templates (namespace al); math functions with variants (exp2,
-// SiLU, GELU) are generated per contract in kmath.py.
+// reciprocal, expm1, softplus, sigmoid, SiLU, GELU) are generated per contract in kmath.py.
 //
 // Included by operators.h, so every kernel gets them through the precompiled header, and a fused
 // ELF (one translation unit for all its operators) has one copy. Everything is inline: a helper
@@ -86,7 +86,7 @@ template <unsigned N, float Hi, float Lo>
 template <unsigned N>
 [[clang::always_inline]] inline aie::vector<float, N> log2e(aie::vector<float, N> x)
 {
-    return mul_hilo<N, 1.4453125f, -0.00261688232421875f>(x);
+    return mul_hilo<N, 1.4453125f, -0.00262451171875f>(x);
 }
 
 // a * b for fp32 a, b via bf16 hi / lo splits (~2^-16 relative error)
@@ -162,26 +162,9 @@ template <unsigned N>
 }
 
 // ---------------------------------------------------------------------------------------------
-// Reciprocal, LUT activations (exp2, SiLU, GELU in software: kmath.py; the hardware vexp2 is the
-// chord 2^n (1 + f): up to +6% on bf16 inputs; vtanh is a coarse LUT)
+// LUT activations (exp2, reciprocal, SiLU, GELU, sigmoid in software: kmath.py; the hardware vexp2
+// is the chord 2^n (1 + f): up to +6% on bf16 inputs; vtanh is a coarse LUT)
 // ---------------------------------------------------------------------------------------------
-
-// 1 / x in fp32 to ~2^-16 for normal x > 0: the mantissa's reciprocal (a linear guess on [1, 2), 6%, and three Newton
-// steps in mulff), its exponent negated in the bits (no scalar division: a soft-float call)
-template <unsigned N>
-[[clang::always_inline]] inline aie::vector<float, N> recip_fp32(aie::vector<float, N> x)
-{
-    const aie::vector<int32, N> b = x.template cast_to<int32>();
-    const aie::vector<int32, N> e = aie::sub(aie::bit_and(b, aie::broadcast<int32, N>(0x7F800000)),
-                                             aie::broadcast<int32, N>(0x3F800000));
-    const aie::vector<float, N> m = aie::sub(b, e).template cast_to<float>();  // (in [1, 2))
-    const aie::vector<float, N> two = aie::broadcast<float, N>(2.0f);
-    aie::vector<float, N> r = aie::sub(aie::broadcast<float, N>(1.4117647f),
-                                       mulc<N>(m, aie::broadcast<bfloat16, N>(0.47058824f)).template to_vector<float>());
-    for (int i = 0; i < 3; i++)
-        r = mulff<N>(r, aie::sub(two, mulff<N>(m, r)));
-    return aie::sub(r.template cast_to<int32>(), e).template cast_to<float>();
-}
 
 // vtanh / vexp2 of an fp32 accumulator (16 lanes per instruction; the LUTs take the argument truncated
 // to bf16)

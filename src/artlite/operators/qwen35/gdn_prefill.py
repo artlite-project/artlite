@@ -292,11 +292,11 @@ void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
             bi[t] = (int32_t)ab[64 * t + {{ HC }} + h0] << 16;
             bi[8 + t] = (int32_t)ab[64 * t + {{ HC }} + h1] << 16;
         }
-        const aie::vector<float, 16> sp = {{ g }}_softplus(
+        const aie::vector<float, 16> sp = {{ gm.softplus }}(
             aie::add(ai.template cast_to<float>(), aie::concat(aie::broadcast<float, 8>(gp[{{ 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ h1 }}]))));
         const aie::vector<float, 16> d = al::mulff<16>(
-            {{ g }}_expm1(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[{{ 16 + 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ 16 + h1 }}])))), m);
-        const aie::vector<float, 16> be = al::mulff<16>({{ g }}_sigmoid(bi.template cast_to<float>()), m);
+            {{ gm.expm1 }}(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[{{ 16 + 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ 16 + h1 }}])))), m);
+        const aie::vector<float, 16> be = al::mulff<16>({{ gm.sigmoid }}(bi.template cast_to<float>()), m);
         aie::store_v(gt + {{ 64 * hp }}, d.template extract<8>(0));
         aie::store_v(gt + {{ 64 * hp + 16 }}, be.template extract<8>(0));
 {% if 2 * hp + 1 < VH %}
@@ -341,8 +341,9 @@ class GdnPrepOperator(ArtcOperator):
         return regions(sizes)
 
     def get_kernel_src(self) -> str:
-        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D)
-        return _PREP.render(p=self.pfx, g=GD.GDN, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT,
+        helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D, gm=GD.MATH,
+                                                           sigmoid=True)
+        return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT,
                             w=Attr(self.workspace()), D=D, HC=self.hc, VH=self.vh, T=self.T, PAN=PAN,
                             KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps), rs=bf16_hilo(1 / math.sqrt(D)))
 
