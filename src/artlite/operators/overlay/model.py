@@ -100,6 +100,7 @@ class ModelOverlay:
         self._layout: dict[str, int] = {}  # (buffer -> bytes so far: ``_take``)
         self._steps: dict[tuple, Any] = {}  # (S, logits, start, sub-steps) -> the step's transaction
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
+        self._meta_bytes: dict[tuple[int, int], tuple] = {}  # (S, start) -> the objects' ACT bytes (``_metas``)
         self._last_s = 1
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
@@ -187,14 +188,24 @@ class ModelOverlay:
         """The K groups of a phase for S slots (``phases.groups``)."""
         return mp.groups(self.image.region(L, name), self._flags(L, name), S)
 
+    def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
+        """The phases' metadata objects for S slots: (ACT offset, bytes) each."""
+        return [(rg.off, self._meta(L, name, rg, gr.meta).view(np.uint8))
+                for (L, name), regs in self.inp.items() for rg, gr in zip(regs, self._groups(L, name, S))]
+
     def _metas(self, S: int) -> None:
-        """The phases' metadata objects for S slots (from layer ``start`` on)."""
-        act = self.dev.view("ACT")
-        for (L, name), regs in self.inp.items():
-            for rg, gr in zip(regs, self._groups(L, name, S)):
-                act[rg.off:rg.off + 4 * META] = self._meta(L, name, rg, gr.meta).view(np.uint8)
-        self.dev.flush("ACT")
-        self._metas_s = (S, self.start)
+        """The phases' metadata objects for S slots (from layer ``start`` on): ``_meta_writes``' bytes, kept per S and
+        start (a generation with drafts changes S every few steps)."""
+        key = (S, self.start)
+        if (w := self._meta_bytes.get(key)) is None:
+            writes = self._meta_writes(S)[::-1]  # (a byte written twice: the last write's)
+            idx, first = np.unique(np.concatenate([o + np.arange(b.size) for o, b in writes]), return_index=True)
+            val = np.concatenate([b for _, b in writes])[first]
+            w = self._meta_bytes[key] = (idx, val, int(idx[0]), int(idx[-1]))
+        idx, val, lo, hi = w
+        self.dev.view("ACT")[idx] = val
+        self.dev.flush("ACT", lo, hi + 1 - lo)
+        self._metas_s = key
 
     def _sp(self, S: int) -> int:
         """The slots of an input k block in a step of S slots (``decode.packed_slots`` in a packed design)."""

@@ -186,12 +186,12 @@ class QwenOverlay(ModelOverlay):
             m[M_XC0] = self.op.max_g - 1
         return m
 
-    def _metas(self, S: int) -> None:
+    def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
         """(and an MoE model's: per layer its route object's and expert objects' templates, the combine's)"""
-        super()._metas(S)
+        out = super()._meta_writes(S)
         if not self.moe:
-            return
-        act, img = self.dev.view("ACT"), self.image
+            return out
+        img = self.image
         for L in self.layers:
             gu, dn = img.region(L, "exp_gu"), img.region(L, "exp_down")
             m = np.zeros(META, np.int32)
@@ -200,16 +200,14 @@ class QwenOverlay(ModelOverlay):
             m[M_RBASE:M_RBASE + 2] = np.array([a & 0xFFFFFFFF, a >> 32], np.uint32).view(np.int32)
             m[M_RSTR], m[M_RTGU], m[M_RTDN] = gu.col_stride, gu.n_rt * gu.n_kc, dn.n_rt * dn.n_kc
             assert gu.col_stride % 4 == 0 and 2 * self.cfg.n_experts * gu.col_stride < 1 << 32
-            act[self.xch[L]:self.xch[L] + 4 * META] = m.view(np.uint8)
-            tpl = np.concatenate([mp.groups(gu, F_GU, S)[0].meta, mp.groups(dn, 0, S)[0].meta])
+            out.append((self.xch[L], m.view(np.uint8)))
+            tpl = np.concatenate([mp.groups(gu, F_GU, S)[0].meta, mp.groups(dn, 0, S)[0].meta]).view(np.uint8)
             for c in range(COLS):  # (the expert object's payload: the gate / up and down templates)
-                o = self.cp[L] + c * (CP_BYTES + XB) + CP_BYTES
-                act[o:o + tpl.nbytes] = tpl.view(np.uint8)
+                out.append((self.cp[L] + c * (CP_BYTES + XB) + CP_BYTES, tpl))
         m = np.zeros(META, np.int32)
         m[M_FLAGS], m[M_NS], m[M_NX] = F_MAIN | F_COMB, S, S
-        for c in range(COLS):
-            act[self.part + c * self.part_col:][:4 * META] = m.view(np.uint8)
-        self.dev.flush("ACT")
+        out += [(self.part + c * self.part_col, m.view(np.uint8)) for c in range(COLS)]
+        return out
 
     def _phases(self) -> list[tuple[int, str]]:
         cfg = self.cfg

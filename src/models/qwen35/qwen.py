@@ -107,6 +107,16 @@ class NpuQwen(OverlayModel):
     def capacity(self) -> int:
         return self.overlay.max_positions
 
+    def prepare(self, prompt_len: int) -> None:
+        """(with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
+        drafter's: 1.3 s on the 35B-A3B; else, and without ``prepare``, each is built at its first use)"""
+        if not self._drafting:
+            return
+        for S in range(1, self.DRAFTS + 2):
+            self.overlay.prepare(S)
+            for logits in (True, False):
+                self.drafter.prepare(S, logits=logits)
+
     def describe(self) -> str:
         ov = self.overlay
         d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
