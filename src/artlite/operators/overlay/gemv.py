@@ -92,14 +92,6 @@ class Chunk:
 _SRC = r"""
 namespace {
 
-[[clang::always_inline]] inline v8int8 {{ p }}_e8(int e)
-{
-    v2int32 v;
-    v[0] = e * 0x01010101;
-    v[1] = e * 0x01010101;
-    return (v8int8)v;
-}
-
 // 8 rows' 32-byte chunks (row r at p + r ST) -> o0 .. o3 = [panel 2 k | panel 2 k + 1], panel c = word c of the 8 rows
 template <int ST, typename T>
 [[clang::always_inline]] inline void {{ p }}_tr8(const T *p, v16int32 &o0, v16int32 &o1, v16int32 &o2, v16int32 &o3)
@@ -137,7 +129,7 @@ template <typename T>
 {
     v64bfp16ebs8 n;
     n.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_b *)p);
-    n.exponent = {{ p }}_e8(e);
+    n.exponent = al::e8(e);
     return n;
 }
 
@@ -147,22 +139,8 @@ template <typename T>
 {
     v64bfp16ebs8 n;
     n.mantissa = *(const v64int8 __aie_dm_resource_d *)p;
-    n.exponent = {{ p }}_e8(e);
+    n.exponent = al::e8(e);
     return n;
-}
-
-// 8 bf16 (one per row r) -> 64 lanes [a 8][r 8]
-[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_rep8v(aie::vector<bfloat16, 8> v)
-{
-    const v32bfloat16 b = (v32bfloat16)broadcast_elem_128((v16int32)(v32bfloat16)v.template grow<32>(), 0);
-    return aie::concat(aie::vector<bfloat16, 32>(b), aie::vector<bfloat16, 32>(b));
-}
-
-// 8 bf16 (one per row r) -> 32 lanes [slot 4][r 8]
-template <typename T>
-[[clang::always_inline]] inline aie::vector<bfloat16, 32> {{ p }}_rep4(const T *p)
-{
-    return aie::vector<bfloat16, 32>((v32bfloat16)broadcast_elem_128((v16int32)(v32bfloat16)aie::load_v<8>(p).template grow<32>(), 0));
 }
 
 // the 64 lanes [a][r] of an MMUL result -> bf16 of the hi and lo rows' sums: 32 lanes [slot][r]
@@ -227,8 +205,8 @@ __attribute__((noinline)) void {{ p }}_sc(const bfloat16 *__restrict c, const bf
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < N; i++) {
         const aie::vector<bfloat16, 32> c0 = aie::load_v<32>(pc), c1 = aie::load_v<32>(pc + 32);
-        Y0 = aie::mac(aie::mac(Y0, c0, {{ p }}_rep4(ph)), c0, {{ p }}_rep4(ph + 64));
-        Y1 = aie::mac(aie::mac(Y1, c1, {{ p }}_rep4(ph + TG)), c1, {{ p }}_rep4(ph + TG + 64));
+        Y0 = aie::mac(aie::mac(Y0, c0, aie::load_v<8>(ph).template grow_replicate<32>()), c0, aie::load_v<8>(ph + 64).template grow_replicate<32>());
+        Y1 = aie::mac(aie::mac(Y1, c1, aie::load_v<8>(ph + TG).template grow_replicate<32>()), c1, aie::load_v<8>(ph + TG + 64).template grow_replicate<32>());
         pc += CS;
         ph += TN;
     }

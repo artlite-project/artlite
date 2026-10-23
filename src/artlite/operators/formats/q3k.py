@@ -33,11 +33,11 @@ void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int3
     aie::set_rounding(aie::rounding_mode::conv_even);
     const {{ p }}_BV I = al::eye();
     {{ p }}_BV L, C0, C1, N;
-    L.exponent = {{ p }}_e8(0x85);
-    C0.exponent = {{ p }}_e8(0x89);  // c of sub-blocks 0 .. 7: x 16
-    C1.exponent = {{ p }}_e8(0x87);  // 4 c of 8 .. 15: x 4
+    L.exponent = al::e8(0x85);
+    C0.exponent = al::e8(0x89);  // c of sub-blocks 0 .. 7: x 16
+    C1.exponent = al::e8(0x87);  // 4 c of 8 .. 15: x 4
     N.mantissa = broadcast_to_v64int8(-1);  // -32
-    N.exponent = {{ p }}_e8(0x8A);
+    N.exponent = al::e8(0x8A);
     const v64int8 m3 = broadcast_to_v64int8(3), m12 = broadcast_to_v64int8(12);
     const uint32_t *__restrict lw = hb + ({{ hpad }} + 2 * sb) * {{ n }};  // low nibbles h 0, h 1
     const uint32_t *__restrict cw = hb + ({{ hpad + 2 * nsb }} + sb) * {{ n }};  // crumbs
@@ -105,7 +105,7 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
             }
 {% endfor %}
 {% for u, o in ((0, 0), (1, 64), (2, 8), (3, 72)) %}
-            aie::store_v((bfloat16 *)(pc + {{ 512 + 128 * u }}), {{ p }}_x8(aie::load_v<8>(ps + {{ o }})));
+            aie::store_v((bfloat16 *)(pc + {{ 512 + 128 * u }}), al::expand8(aie::load_v<8>(ps + {{ o }})));
 {% endfor %}
             pw = add_2d_byte(pw, {{ 64 - 12 * n }}, 1, cw, {{ 12 * n }});  // (the next quad's words, or the next block's)
             ps = add_2d_ptr(ps, 240, 1, cs, 16);
@@ -163,11 +163,11 @@ __attribute__((noinline)) void {{ p }}_q3k_tab(const uint8_t *__restrict hw, bfl
     aie::set_rounding(aie::rounding_mode::conv_even);
     const v64bfp16ebs8 I = al::eye();
     v64bfp16ebs8 L0, L1, C0, C1, N;
-    L0.exponent = L1.exponent = {{ p }}_e8(0x85);
-    C0.exponent = {{ p }}_e8(0x89);
-    C1.exponent = {{ p }}_e8(0x87);
+    L0.exponent = L1.exponent = al::e8(0x85);
+    C0.exponent = al::e8(0x89);
+    C1.exponent = al::e8(0x87);
     N.mantissa = broadcast_to_v64int8(-1);  // (-32)
-    N.exponent = {{ p }}_e8(0x8A);
+    N.exponent = al::e8(0x8A);
     const v64int8 m3 = broadcast_to_v64int8(3), m12 = broadcast_to_v64int8(12);
     const uint8_t __aie_dm_resource_a *pl = (const uint8_t __aie_dm_resource_a *)(hw + 256 * u);
     const uint8_t __aie_dm_resource_b *pc = (const uint8_t __aie_dm_resource_b *)(hw + 512 + 128 * u);
@@ -214,9 +214,9 @@ __attribute__((noinline)) void {{ p }}_q3k_mm(const uint8_t *__restrict xp, cons
 {% endfor %}
     v64bfp16ebs8 N4, W0, W1, W2, W3;  // (the zero point; blocks 0 .. 3)
     N4.mantissa = broadcast_to_v64int8(-4);
-    N4.exponent = {{ p }}_e8(0x85);
-    W0.exponent = W1.exponent = W2.exponent = {{ p }}_e8(0x85);
-    W3.exponent = {{ p }}_e8(0x82);
+    N4.exponent = al::e8(0x85);
+    W0.exponent = W1.exponent = W2.exponent = al::e8(0x85);
+    W3.exponent = al::e8(0x82);
     AIE_LOOP_NO_UNROLL
     for (int g = 0; g < 3; g++) {
         al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);

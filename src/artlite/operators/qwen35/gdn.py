@@ -69,21 +69,6 @@ HELPERS = r"""{{ gm.expm1.src }}
 {# silu(x) of 32 bf16 lanes: one copy (inlined it needs a large frame) #}
 {{ gm.silu.src }}
 
-// x (64 fp32) -> its bf16 hi and lo parts
-[[clang::always_inline]] inline void {{ p }}_split(aie::vector<float, 64> x, aie::vector<bfloat16, 64> &hi,
-                                                   aie::vector<bfloat16, 64> &lo)
-{
-    hi = aie::accum<accfloat, 64>(x).template to_vector<bfloat16>();
-    lo = aie::accum<accfloat, 64>(aie::sub(x, aie::accum<accfloat, 64>(hi).template to_vector<float>())).template to_vector<bfloat16>();
-}
-
-// 8 bf16 at p -> 64 lanes, lane 8 j + i = p[i]
-[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_tile8(const bfloat16 *p)
-{
-    const v32bfloat16 b = (v32bfloat16)broadcast_elem_128((v16int32)(v32bfloat16)aie::load_v<8>(p).template grow<32>(), 0);
-    return aie::concat(aie::vector<bfloat16, 32>(b), aie::vector<bfloat16, 32>(b));
-}
-
 // 128 fp32 x -> x / sqrt(sum x^2 + eps) as bf16 hi, lo at h, l (64 B aligned)
 __attribute__((noinline)) void {{ p }}_l2(const float *__restrict x, bfloat16 *__restrict h, bfloat16 *__restrict l)
 {
@@ -91,14 +76,14 @@ __attribute__((noinline)) void {{ p }}_l2(const float *__restrict x, bfloat16 *_
     aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
     aie::vector<bfloat16, 64> xh[2], xl[2];
     for (int k = 0; k < 2; k++) {
-        {{ p }}_split(aie::load_v<64>(x + 64 * k), xh[k], xl[k]);
+        al::split2<64>(aie::load_v<64>(x + 64 * k), xh[k], xl[k]);
         ss = aie::mac(aie::mac(aie::mac(ss, xh[k], xh[k]), xh[k], xl[k]), xh[k], xl[k]);
     }
     const float inv = al::inv_rms<1>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
     const aie::vector<float, 64> iv = aie::broadcast<float, 64>(inv);
     for (int k = 0; k < 2; k++) {
         aie::vector<bfloat16, 64> a, b;
-        {{ p }}_split(al::mulff<64>(aie::load_v<64>(x + 64 * k), iv), a, b);
+        al::split2<64>(al::mulff<64>(aie::load_v<64>(x + 64 * k), iv), a, b);
         aie::store_v(h + 64 * k, a);
         aie::store_v(l + 64 * k, b);
     }
@@ -125,10 +110,10 @@ __attribute__((noinline)) void {{ p }}_p1(const float *__restrict sp, const bflo
     const bfloat16 *__restrict pq = q;
     for (int b = 0; b < 16; b++) {
         aie::vector<bfloat16, 64> sh, sl;
-        {{ p }}_split(aie::load_v<64>(ps), sh, sl);
+        al::split2<64>(aie::load_v<64>(ps), sh, sl);
         ps += 64;
-        const aie::vector<bfloat16, 64> kh_ = {{ p }}_tile8(pk), kl = {{ p }}_tile8(pk + {{ D }});
-        const aie::vector<bfloat16, 64> qh = {{ p }}_tile8(pq), ql = {{ p }}_tile8(pq + {{ D }});
+        const aie::vector<bfloat16, 64> kh_ = aie::load_v<8>(pk).template grow_replicate<64>(), kl = aie::load_v<8>(pk + {{ D }}).template grow_replicate<64>();
+        const aie::vector<bfloat16, 64> qh = aie::load_v<8>(pq).template grow_replicate<64>(), ql = aie::load_v<8>(pq + {{ D }}).template grow_replicate<64>();
         pk += 8;
         pq += 8;
         au = aie::mac(aie::mac(aie::mac(au, sh, kh_), sh, kl), sl, kh_);
@@ -152,7 +137,7 @@ __attribute__((noinline)) void {{ p }}_p2(const float *sp, float *out, const bfl
         el = al::expand8(dlo.template extract<8>(0));
     }
     aie::vector<bfloat16, 64> gh, gl;  // d as bf16 hi + lo
-    {{ p }}_split(aie::broadcast<float, 64>(d), gh, gl);
+    al::split2<64>(aie::broadcast<float, 64>(d), gh, gl);
     const float *ps = sp;
     const bfloat16 *__restrict pk = k;
     float *po = out;
@@ -160,8 +145,8 @@ __attribute__((noinline)) void {{ p }}_p2(const float *sp, float *out, const bfl
         const aie::vector<float, 64> s = aie::load_v<64>(ps);
         ps += 64;
         aie::vector<bfloat16, 64> sh, sl;
-        {{ p }}_split(s, sh, sl);
-        const aie::vector<bfloat16, 64> kh_ = {{ p }}_tile8(pk), kl = {{ p }}_tile8(pk + {{ D }});
+        al::split2<64>(s, sh, sl);
+        const aie::vector<bfloat16, 64> kh_ = aie::load_v<8>(pk).template grow_replicate<64>(), kl = aie::load_v<8>(pk + {{ D }}).template grow_replicate<64>();
         pk += 8;
         aie::accum<accfloat, 64> acc(s);
         acc = aie::mac(aie::mac(aie::mac(acc, sh, gh), sl, gh), sh, gl);
@@ -412,7 +397,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
             aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
             for (int i = 0; i < {{ D }}; i += 64) {
                 aie::vector<bfloat16, 64> a, b;
-                {{ p }}_split(aie::load_v<64>(o + i), a, b);
+                al::split2<64>(aie::load_v<64>(o + i), a, b);
                 ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
             }
             const aie::vector<float, 32> iv = aie::broadcast<float, 32>(al::inv_rms<{{ D }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f));

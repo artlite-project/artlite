@@ -28,9 +28,9 @@ Per chunk of CR records (QB, CR: the most that L1 holds, ``Shape.blocks``):
   streams (Q | K0, K1: four chains, MMUL-bound; hi + lo K: a loop for K hi, then one for K lo);
 - the softmax with a running maximum per row, raised (o, l rescaled) only when the chunk's maximum exceeds it by 2^16
   (qwen35's ``attn_prefill``; the chunk's maxima in bf16: m is only the reference of 2^(s - m)); masks only on a
-  diagonal chunk; P = 2^(s - m) by the vexp2 exp2, clamped at 2^-63 on its bf16 parts (masked scores -1e30), as single
-  bfp16 panels (half the P V MMULs of hi + lo; single Q and P are accurate enough for Llama: KL(same) over six
-  sequences);
+  diagonal chunk; P = 2^(s - m) times 2^64 (o / l cancels it) by ``km.exp2``, clamped at 2^-63 of that (masked scores
+  -1e30), as single bfp16 panels (half the P V MMULs of hi + lo). Known error, cause open: the keys below a row's
+  reference weigh ~0.4% too much (test_llama_npu_teacher_forced[Q3_K_L-1B-hilo] fails);
 - o += P V per pair of row blocks (each V panel popped once for both: two MMUL chains), and the row sums l += P J on
   the MMUL (J a ones panel: no accumulator in the exp2 loop);
 

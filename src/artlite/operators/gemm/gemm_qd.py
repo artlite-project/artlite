@@ -257,7 +257,7 @@ class GemmQdOperator(GemmQOperator):
         mac = render_mac(k=KT) + (render_mac(name=f"{MAC}s", k=KT, pats=True) if self.csplit else "")
         return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", macs=f"{MAC}s<{self.m}, {self.nm}>",
                                   csplit=self.csplit, m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
-                                  act=self.act, gelu_tmax=repr(kmath.GELU.t_max), fmt=self.fmt,
+                                  act=self.act, fmt=self.fmt,
                                   nsb=self.nsb,
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,
                                   mac_src=mac, c_pack=self.c_pack, n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,

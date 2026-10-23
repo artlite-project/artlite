@@ -250,19 +250,19 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, co
         for (int u = 0; u < 2; u++) {  // sb = 2 HI + u
             const v64bfp16ebs8 X = u ? X1 : X0;
             v64bfp16ebs8 Sl, Sc, Ml, Mc;
-            Sl.exponent = Ml.exponent = {{ p }}_e8(0x85);
-            Sc.exponent = Mc.exponent = {{ p }}_e8(HI ? 0x87 : 0x89);
+            Sl.exponent = Ml.exponent = al::e8(0x85);
+            Sc.exponent = Mc.exponent = al::e8(HI ? 0x87 : 0x89);
             Sl.mantissa = (v64int8)unpack(*(const v64uint4 *)(hw + 32 * (2 * HI + u)));
             Ml.mantissa = (v64int8)unpack(*(const v64uint4 *)(hw + 128 + 32 * (2 * HI + u)));
             Sc.mantissa = (v64int8)band(unpack(*(const v64uint4 *)(hw + 256 + 32 * u)), msk);
             Mc.mantissa = (v64int8)band(unpack(*(const v64uint4 *)(hw + 320 + 32 * u)), msk);
             const aie::vector<bfloat16, 8> d8 = u ? aie::filter_odd(dp, 1) : aie::filter_even(dp, 1);
             const aie::vector<bfloat16, 8> m8 = u ? aie::filter_odd(mp, 1) : aie::filter_even(mp, 1);
-            const aie::vector<bfloat16, 64> D = {{ p }}_rep8v(d8);
+            const aie::vector<bfloat16, 64> D = d8.template grow_replicate<64>();
             {{ p }}_td(mac_8x8_8x8T(I, 1, Sc, 0, mul_8x8_8x8T(I, 1, Sl, 0)), D, tab + 256 * u + 128 * g);
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)),
                            aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(), Y);
-            Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), {{ p }}_rep8v(m8), Y);
+            Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), m8.template grow_replicate<64>(), Y);
 {% if rg %}
             {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (per super-block: its rows of their own with ys)
             Y = aie::zeros<accfloat, 64>();

@@ -113,9 +113,9 @@ From a quantized GEMV on bf16 MACs; the zips, shifts and slot budget apply to ev
 
 ## R6 Per-lane scales of small sub-blocks (planar dequant, `formats/k23.py`)
 
-- A scale per row and 16-k sub-block repeats over the row's 8 lanes of a panel. `al::expand8` (zips) costs ~5 mv ops
-  per 64 lanes; one `broadcast_elem_128` (`vextbcst`, the 8 values 4 times) and two `shuffle(b, b, T16_8x8_lo / hi)`
-  cost 3: Q2_K's dequant II 44 -> 29 per 4 panels.
+- A scale per row and 16-k sub-block repeats over the row's 8 lanes of a panel. Three zips cost ~5 mv ops per 64
+  lanes; one `broadcast_elem_128` (`vextbcst`, the 8 values 4 times) and two `shuffle(b, b, T16_8x8_lo / hi)`
+  (`al::expand8`) cost 3: Q2_K's dequant II 44 -> 29 per 4 panels.
 - Keep the scales in the order the MMUL produced them (lanes [s][r]) and load each 8-value chunk where needed (the
   load slots are idle): an interleave into [sub-block][rows] cost the header pass 448 -> 841 cycles per super-block.
 - Scales through the MMUL (column one-hot panels against the nibbles) are exact, but each needs conversions to bf16 on
@@ -132,8 +132,8 @@ From a quantized GEMV on bf16 MACs; the zips, shifts and slot budget apply to ev
 per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 46 with its mv slot at 30
 (variant_search's `port` column, machine-model.md "Shared ports"). The pushes are fixed, so cut shuffles:
 - **Expand by a broadcast and two 8x8 transposes** (`al::expand8_of`, `al::expand16_bc`: `vextbcst.128` is not on the
-  port, 2 shuffles per 64 lanes instead of the zips' 3-4): GemmQ's tile-major dequant II 46 -> 40, bit-exact. In an
-  alu-bound loop the zips schedule better (Q6_K's dequant: II 46 with zips, 88 with transposes): measure.
+  port, 2 shuffles per 64 lanes instead of the zips' 3-4): GemmQ's tile-major dequant II 46 -> 40, bit-exact; the
+  GemmQd dequants 5-20% per call (Q4_0 / Q4_1, Q5_K, Q6_K). In Q4_K's header pass the two are mixed: measure.
 - **Repeat a 128-bit vector with `grow_replicate<N>()`** (one `vextbcst.128`), not `aie::concat(v, v, ...)`: aie_api
   concatenates 128-bit pieces with one `vshift` each, in sequence. K2 / K3 scales repeated to 64 lanes (`formats/k23.py`
   `_d64`): the GemmQd super-block header's loop II 22 -> 18 (the prefill level: not its bound).
@@ -160,7 +160,11 @@ per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 
   runs once on 32 lanes for all panels between two passes over them, not on 16 lanes per panel (a token-pair GDN
   scan: 2548 instead of 4 x 747 cycles per pair, bit-exact: the same per-lane arithmetic).
 - **One call for independent small reductions**: 4 l2 norms (reduce -> invsqrt -> scale chains) in one call: 424 vs
-  4 x 150 cycles; 4 dot products: 136 vs 4 x 76.
+  4 x 150 cycles; 4 dot products: 136 vs 4 x 76. Several tokens' 1 / rms in one `al::inv_rms<N, K>` (the mean and
+  eps on 16 lanes once, then K scalar invsqrt): the prefill norm's 8 tokens 282 cycles less per call. Their sums of
+  32 lanes each go through L1 (a rolled loop folding two tokens to 8 lanes by two unzips, then `group8`: 706 -> 191
+  cycles): a 64-lane fp32 vector assembled in registers from eight folds lives in the accumulators and spilled them
+  whole (1.3-2.1 KB of stack, more than a core's 1 KB).
 - **Packed lanes**: the GDN gates (softplus, expm1 in fp32: they feed the fp32 state) of two heads per call
   (`GdnPrepOperator`).
 - **A RecMII-bound loop: two blocks per iteration**, two independent chains in one body (a split + MMUL chain of

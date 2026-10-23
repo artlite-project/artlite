@@ -237,7 +237,7 @@ def _act(table: kmath.ActTable, x: np.ndarray) -> np.ndarray:
 
 
 def _silu_tanh(x: np.ndarray) -> np.ndarray:
-    """``kmath.silu_tanh``: A (vtanh, the chord tail below -3), then B (al::silu_small below |x| = 2.5)."""
+    """``kmath.silu_tanh``: A (vtanh, the chord tail below -3), then B (its silu_small below |x| = 2.5)."""
     x = bf16(x)
     a_acc = mul(x, 0.5)
     a, t = bf16(a_acc), vtanh(a_acc)

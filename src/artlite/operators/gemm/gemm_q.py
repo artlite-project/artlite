@@ -144,9 +144,24 @@ namespace {
 
 {{ mac_src }}
 {% if silu and act == "gelu" %}
-{% set gtab = km.table_pass(km.GELU, table_arg=True, gate_up=True) %}
-{{ gtab.src }}
+{% set gact = km.act(km.GELU, table_arg=True, walk=(2, 128)) %}
+{{ gact.src }}
 {% endif %}
+{# the gate/up epilogues' last loop: h = y up (y in the scratch, up the C tile's up halves) -> hout as bfp16 panels #}
+{% macro times_up(mp_) %}
+    {
+        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
+        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
+        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)hout);
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < {{ mp_ * n // 128 }}; i++) {
+            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
+            out.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
+            pu += 128;
+            py += 64;
+        }
+    }
+{%- endmacro %}
 
 }  // namespace
 
@@ -241,10 +256,10 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 // 64 | up 64] per 128 values); h = silu(gate) * up -> hout (m x {{ n // 2 }}, 8x8 sub-blocks; as bfp16ebs8 panels (8 tokens x 8 outputs)).
 // Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
 // cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
-// (II 4 per 64 values).
+// (II 4 per 64 values: ``times_up``).
 {% set parts = 2 if csplit else sxp %}
 {% set mp = m // parts %}
-{% set silu_t = km.silu_tanh(gate_up=True) %}
+{% set silu_t = km.silu_tanh(walk=(2, 128)) %}
 {{ silu_t.src }}
 
 void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
@@ -268,18 +283,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     bfloat16 *__restrict hout = hout_;
 {% endif %}
     {{ silu_t }}<{{ mp * n // 2 }}>(cacc, scratch, zero);
-    {
-        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
-        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
-        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)hout);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int i = 0; i < {{ mp * n // 128 }}; i++) {
-            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
-            out.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
-            pu += 128;
-            py += 64;
-        }
-    }
+{{ times_up(mp) }}
 {% if parts > 1 %}
     }
 {% endif %}
@@ -291,8 +295,8 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 {% endif %}
 {% if silu and act == "gelu" %}
 // gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
-// panels). Three pipelined loops through the scratch: A: t = min(|gate|, {{ gelu_tmax }}); B: kmath's GELU table pass in place
-// (``tab_ab``, ``tab_cd``: the core's copies of the table, in two 16 KB regions); C: times up (as SiLU's).
+// panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
+// table, in two 16 KB regions), then times up.
 {% set parts = 2 if csplit else sxp %}
 {% set mp = m // parts %}
 void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
@@ -314,31 +318,8 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     const bfloat16 *__restrict cacc = cacc_;
     bfloat16 *__restrict hout = hout_;
 {% endif %}
-    {
-        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ gelu_tmax }}f);
-        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)cacc;
-        bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)scratch;
-        int cg = 0;
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int j = 0; j < {{ mp * n // 64 }}; j++) {
-            aie::store_v(py, aie::min(aie::abs(aie::load_v<32>(pg)), hi));
-            pg = add_2d_ptr(pg, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
-            py += 32;
-        }
-    }
-    {{ gtab }}<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab_ab, tab_cd);
-    {
-        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
-        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
-        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)hout);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int i = 0; i < {{ mp * n // 128 }}; i++) {
-            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
-            out.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
-            pu += 128;
-            py += 64;
-        }
-    }
+    {{ gact }}<{{ mp * n // 2 }}>(cacc, scratch, tab_ab, tab_cd);
+{{ times_up(mp) }}
 {% if parts > 1 %}
     }
 {% endif %}

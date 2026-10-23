@@ -76,15 +76,6 @@ _SRC = JINJA_ENV.from_string(r"""
 
 namespace {
 
-// x (rows 0..3 of 8) -> the MMUL A panel [bfp16(x); bfp16(x - bfp16(x))]: 14 bits below a row's maximum
-[[clang::always_inline]] inline al::BV {{ p }}_ahilo(aie::accum<accfloat, 32> x, const al::BV &nI)
-{
-    const aie::accum<accfloat, 64> xx = aie::concat(x, x);
-    al::MM8 t(xx);
-    t.mac(xx.template to_vector<bfp16ebs8>(), aie::op_transpose(nI));
-    return aie::concat(x, t.to_accum().template extract<32>(1)).template to_vector<bfp16ebs8>();
-}
-
 // 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each)
 __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
                                                  const float *__restrict cs, const float *__restrict sn,
@@ -163,7 +154,7 @@ __attribute__((noinline)) void {{ p }}_pslot(const float *__restrict sc, const f
                                                  aie::mask<32>::from_uint32(rows));
     aie::store_v(l, aie::add(aie::load_v<32>(l), P));
     al::BOut<> o((bfp16ebs8 *)pp);
-    o.push({{ p }}_ahilo(aie::accum<accfloat, 32>(P), al::neg_eye()));
+    o.push(al::hilo4(aie::accum<accfloat, 32>(P), al::neg_eye()));
 }
 
 // y, l of a set (ND + 1 blocks) = yi + yi (a0 - 1) + yw a1 (al::merge: a row whose factor is 1 keeps its values)
@@ -379,7 +370,7 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
             if (4 * set + {{ qq }} < nr)
                 v.insert({{ qq }}, aie::load_v<8>(q + {{ HD }} * (4 * set + {{ qq }}) + 8 * db));
 {% endfor %}
-            o.push({{ p }}_ahilo(aie::accum<accfloat, 32>(v), nI));
+            o.push(al::hilo4(aie::accum<accfloat, 32>(v), nI));
         }
         aie::store_v(AW(float, {{ a.ml }}) + 64 * set, aie::broadcast<float, 32>(-8192.0f));  // (bf16-exact)
     }

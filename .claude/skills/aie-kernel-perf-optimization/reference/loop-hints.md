@@ -50,9 +50,7 @@ and left the rest unchanged:
 
 - wins: a post-RA pipelined loop that the default rewrite left above its slot
   bound (the Q3_K dequant's code-byte loop: II 34 -> 28, the mv bound), a
-  pre-RA pipelined transpose loop (the decode GEMV's `_dtab`: II 13 -> 11), a
-  spilling scalar loop (the norms' eight `inv_rms`: 4 spill / reload
-  instructions -> 1);
+  pre-RA pipelined transpose loop (the decode GEMV's `_dtab`: II 13 -> 11);
 - losses on a whole file: up to +39% per kernel (the GemmQ SiLU and SD 1.5
   row epilogues, `silu_lut`).
 

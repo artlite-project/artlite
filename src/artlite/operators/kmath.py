@@ -726,6 +726,21 @@ GELU_ERF = ActTable("gelu_erf", gelu_erf64, 0.125, 16.0, 8.0)
 SIGMOID = ActTable("sigmoid", sigmoid64, 0.25, 48.0, 16.0, full=True)
 TABLES = {t.name: t for t in (SILU, GELU, GELU_ERF, SIGMOID)}
 
+def _walk(walk: tuple[int, int], ptr: str, counter: str) -> dict[str, str]:
+    """A pointer's walk over x in groups of ``walk[0]`` vectors of 32 values, ``walk[1]`` values apart (a gate/up C
+    tile's gate halves: (2, 128)): its counter's declaration and the step after each vector."""
+    count, period = walk
+    if count < 1 or period % 32 or period < 32 * count:
+        raise ValueError(f"kmath: walk = {walk}: groups of whole vectors (period a multiple of 32, >= 32 x count)")
+    if count == 1:
+        return {"decl": "", "step": f"{ptr} += {period};"}
+    return {"decl": f"    int {counter} = 0;", "step": f"{ptr} = add_2d_ptr({ptr}, {period - 32 * (count - 1)}, {count - 1}, {counter}, 32);"}
+
+
+def _walk_tag(walk: tuple[int, int]) -> str:
+    return "" if walk == (1, 32) else f"_w{walk[0]}x{walk[1]}"
+
+
 _LUT16 = r"""
 // 16 table reads: lanes 0-7 into q0, 8-15 into q1
 {{ attr }} void {{ name }}(v16int32 ptr, v32bfloat16 &q0, v32bfloat16 &q1)
@@ -749,7 +764,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
 
 {% endif %}
 // y = c0 + c1 r + c2 r^2{{ " + max(x, 0) of t = min(|x|, %d)" % (t_max | float | int) if not full else " of t = x clamped to +-%d" % (t_max | float | int) }} (kmath.table_pass, {{ table }}'s table; in t_ and t2_: y, read before it
-// is written){{ "; x: the gate halves of a gate/up C tile" if gate_up }}
+// is written){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
 {{ "template <int N>" if not n }}
 {{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, const bfloat16 *__restrict t_, const bfloat16 *__restrict t2_,
                 bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
@@ -762,9 +777,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
     const v16int32 base = ::sel(broadcast_s32((long){{ '{{ name }}' }}_ab - {{ bias }}), broadcast_s32((long){{ '{{ name }}' }}_cd - {{ bias }}),
                                 0xCCCC);
 {% endif %}
-{% if gate_up %}
-    int cg = 0;
-{% endif %}
+{{ wx.decl }}
     const bfloat16 __aie_dm_resource_d *__restrict px = (const bfloat16 __aie_dm_resource_d *)x;
     const bfloat16 __aie_dm_resource_a *__restrict pt = (const bfloat16 __aie_dm_resource_a *)t_;
     const bfloat16 __aie_dm_resource_c *__restrict pt2 = (const bfloat16 __aie_dm_resource_c *)t2_;
@@ -790,11 +803,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
         acc = aie::mac(acc, aie::max(aie::load_v<32>(px), aie::zeros<bfloat16, 32>()), one);
 {% endif %}
         aie::store_v(py, acc.template to_vector<bfloat16>());
-{% if gate_up %}
-        px = add_2d_ptr(px, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
-{% else %}
-        px += {{ x_step }};
-{% endif %}
+        {{ wx.step }}
         pt += 32;
         pt2 += 32;
         py += 32;
@@ -802,17 +811,15 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
 }
 """
 
-def table_pass(table: ActTable, *, table_arg: bool = False, gate_up: bool = False, x_step: int = 32,
-               n: int | None = None) -> Fn:
+def table_pass(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None) -> Fn:
     """The table pass of ``table`` (an ActTable): a noinline template ``<N>(x, t_, t2_, y[, tab_ab, tab_cd])``, y = the
     table's quadratic of t (t_, t2_: t = min(|x|, t_max) as bf16, or x clamped for a full table; may be y) plus relu(x).
     The table's two copies in two 16 KB regions: static, in the linker's sections of banks 0 and 1 (one section per
     table: a core links only the tables it reads), or (``table_arg``)
     the core's buffers ``tab_ab``, ``tab_cd`` (``table_words`` each; two parameters: llvm-aie gives the gathers a memory
     operand only when each base of their address vector is a pointer of its own: from one pointer and an offset of it,
-    each gather orders against every load and store, and the loop does not pipeline). ``gate_up``: x the gate halves of a
-    GEMM's gate/up C tile ([gate 64 | up 64] per 128 values); ``x_step``: x's 32 values of an iteration that many
-    elements apart (otherwise). ``n``: a plain function of n values (a multiple of 32), not a template (a kernel of a
+    each gather orders against every load and store, and the loop does not pipeline). ``walk``: x in groups of
+    ``walk[0]`` vectors of 32 values, ``walk[1]`` apart (a GEMM's gate/up C tile [gate 64 | up 64]: (2, 128)). ``n``: a plain function of n values (a multiple of 32), not a template (a kernel of a
     program-memory-patched design must be emitted where it is defined)."""
     if not isinstance(table, ActTable):
         raise TypeError(f"kmath: table = {table!r}, not an ActTable")
@@ -823,43 +830,44 @@ def table_pass(table: ActTable, *, table_arg: bool = False, gate_up: bool = Fals
           "full": table.full}
     if n is not None and (n <= 0 or n % 32):
         raise ValueError(f"kmath: a table pass of n = {n} values (a multiple of 32)")
-    if gate_up and x_step != 32:
-        raise ValueError("kmath: gate_up walks x itself (no x_step)")
     text = _ENV.from_string(_TABLE_PASS).render(**kw, words=words, bias=int(table.base * 2 ** shift),
-                                                table_arg=table_arg, gate_up=gate_up, x_step=x_step, n=n)
-    local = f"{table.name}_tab" + ("_t" if table_arg else "") + ("_gu" if gate_up else "")
-    local += (f"_x{x_step}" if x_step != 32 else "") + (f"_n{n}" if n else "")
-    params = {"table": table, "table_arg": table_arg, "gate_up": gate_up, "x_step": x_step, "n": n}
+                                                table_arg=table_arg, walk=walk, wx=_walk(walk, "px", "cx"), n=n)
+    local = f"{table.name}_tab" + ("_t" if table_arg else "") + _walk_tag(walk) + (f"_n{n}" if n else "")
+    params = {"table": table, "table_arg": table_arg, "walk": walk, "n": n}
     return _fn(local, text, inline=False, deps=(l16,), lanes=32, arg="ptr", ret="void", func="table_pass",
                params=params)
 
 
 _ACT = r"""
-// {{ table }} of N bf16 (a multiple of 32) into y through its table (kmath.act: {{ bound }}): t = {{ "x clamped to +-%d" % (t_max | float | int) if full else "min(|x|, %d)" % (t_max | float | int) }} into y,
-// then the table pass in place (sets the rounding mode)
-template <int N>
-{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y)
+// {{ what }} of N bf16 (a multiple of 32) into y (kmath.act: {{ bound }}): t = {{ t_text }} into y,
+// then the table pass in place (sets the rounding mode){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
+{{ "template <int N>" if not n }}
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     {
-        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ t_max }}f);
+        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ clamp }}f);
 {% if full %}
-        const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ t_max }}f);
+        const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ clamp }}f);
 {% endif %}
         const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)x;
         bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
+{{ wx.decl }}
         AIE_PREPARE_FOR_POSTPIPELINING
-        for (int j = 0; j < N / 32; j++) {
+        for (int j = 0; j < {{ n or "N" }} / 32; j++) {
 {% if full %}
             aie::store_v(pw, aie::min(aie::max(aie::load_v<32>(px), lo), hi));
+{% elif scale == 2 %}
+            const aie::vector<bfloat16, 32> a = aie::abs(aie::load_v<32>(px));
+            aie::store_v(pw, aie::min(aie::add(a, a), hi));
 {% else %}
             aie::store_v(pw, aie::min(aie::abs(aie::load_v<32>(px)), hi));
 {% endif %}
-            px += 32;
+            {{ wx.step }}
             pw += 32;
         }
     }
-    {{ tab }}<N>(x, y, y, y);
+    {{ tab }}{{ "<N>" if not n }}(x, y, y, y{{ ", tab_ab, tab_cd" if table_arg }});
 }
 """
 
@@ -868,25 +876,61 @@ _ACT_BOUND = {"silu": (0.59, (-24.0, np.inf)), "sigmoid": (0.54, (-16.0, 16.0)),
               "gelu_erf": (0.59, (-4.0, np.inf))}
 
 
-def act(table: ActTable) -> Fn:
-    """``table``'s activation (an ActTable: SILU, GELU, GELU_ERF, SIGMOID) of N bf16 into y (x, y distinct; static
-    tables): a noinline template ``<N>(x, y)``, two loops (t = min(|x|, t_max) into y, then the table pass in place):
-    ~0.8 cycles per element (SiLU: 3287 per 4096 on the NPU)."""
-    tab = table_pass(table)
-    ulp, dom = _ACT_BOUND[table.name]
-    text = _ENV.from_string(_ACT).render(table=table.name, tab=tab.name, t_max=repr(table.t_max), full=table.full,
-                                         bound=f"{_bound(ulp, None)} for x in [{dom[0]:g}, {dom[1]:g})")
-    return _fn(f"{table.name}_lut", text, inline=False, deps=(tab,), lanes=32, arg="ptr", ret="void", func="act",
-               params={"table": table}, domain=dom, valid=(-3e38, 3e38), ulp=ulp)
+def act(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None,
+        scale: int = 1, clamp: float | None = None, inline: bool = False) -> Fn:
+    """``table``'s activation (an ActTable: SILU, GELU, GELU_ERF, SIGMOID) of N bf16 into y (x, y distinct): a noinline
+    template ``<N>(x, y[, tab_ab, tab_cd])``, two loops (t = min(|x|, t_max) into y, then the table pass in place):
+    ~0.8 cycles per element (SiLU: 3287 per 4096 on the NPU). ``table_arg``, ``walk`` (x's), ``n`` (a plain function
+    of n values): ``table_pass``'s. ``scale`` 2, ``clamp``: the table fed t = min(2 |x|, clamp) (a table of another
+    function on this one's grid: sd15's GELU, ``unet.gelu_table``; its words the caller's buffers). ``inline``: the
+    clamp pass inlined into the caller (a call per few thousand values costs ~7 cycles: the PLE's 0.25%)."""
+    _check("scale", scale, (1, 2))
+    clamp = table.t_max * scale if clamp is None else clamp
+    if table.full and (scale, clamp) != (1, table.t_max):
+        raise ValueError(f"kmath: {table.name} (a full table) takes x itself, clamped to its range")
+    tab = table_pass(table, table_arg=table_arg, walk=walk, n=n)
+    ulp, dom = _ACT_BOUND[table.name] if (scale, clamp) == (1, table.t_max) else (None, (-np.inf, np.inf))
+    t_text = (f"x clamped to +-{clamp:g}" if table.full else f"min({scale} |x|, {clamp:g})" if scale > 1
+              else f"min(|x|, {clamp:g})")
+    bound = f"{_bound(ulp, None)} for x in [{dom[0]:g}, {dom[1]:g})" if ulp else "the caller's words"
+    what = f"{table.name} through its table" if ulp else f"a table on {table.name}'s grid"
+    text = _ENV.from_string(_ACT).render(what=what, table=table.name, tab=tab.name, clamp=repr(float(clamp)), full=table.full,
+                                         bound=bound, t_text=t_text, scale=scale, n=n, table_arg=table_arg, walk=walk,
+                                         wx=_walk(walk, "px", "cx"))
+    local = (f"{table.name}_lut" + ("_t" if table_arg else "") + _walk_tag(walk) + (f"_n{n}" if n else "")
+             + (f"_s{scale}c{clamp:g}" if (scale, clamp) != (1, table.t_max) else "") + ("_i" if inline else ""))
+    return _fn(local, text, inline=inline, deps=(tab,), lanes=32, arg="ptr", ret="void", func="act",
+               params={"table": table, "table_arg": table_arg, "walk": walk, "n": n, "scale": scale, "clamp": clamp,
+                       "inline": inline},
+               domain=dom, valid=(-3e38, 3e38), ulp=ulp)
 
+
+_SILU_SMALL = r"""
+// silu(x) for |x| < 2.5 as u + s (P0 + P1 s + P2 s^2), s = u^2, u = x / 2 (tanh(u) / u fitted in bf16 arithmetic); x
+// again through xr (a second load of the same data, not merged with x's by the compiler: shorter lifetimes, II 10
+// instead of 14-18) and xm (the select's). Returns y where |x| >= 2.5.
+{{ attr }} aie::vector<bfloat16, 32> {{ name }}(aie::vector<bfloat16, 32> x, aie::vector<bfloat16, 32> xr,
+                                             aie::vector<bfloat16, 32> xm, aie::vector<bfloat16, 32> y)
+{
+    const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
+    const aie::vector<bfloat16, 32> p0 = aie::broadcast<bfloat16, 32>(0.99609375f);
+    const aie::vector<bfloat16, 32> p2 = aie::broadcast<bfloat16, 32>(0.06298828125f);
+    const aie::accum<accfloat, 32> p1 = aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-0.30078125f));
+    aie::vector<bfloat16, 32> u = aie::mul(x, kh).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> s = aie::mul(u, u).template to_vector<bfloat16>();
+    aie::accum<accfloat, 32> acc = aie::mac(aie::mul(xr, kh), s, p0);
+    acc = aie::mac(acc, aie::mul(s, s).template to_vector<bfloat16>(), aie::mac(p1, s, p2).template to_vector<bfloat16>());
+    return aie::select(y, acc.template to_vector<bfloat16>(), aie::lt(aie::abs(xm), aie::broadcast<bfloat16, 32>(2.5f)));
+}
+"""
 
 _SILU_TANH = r"""
 // silu of N bf16 into y in two passes (kmath.silu_tanh: max 0.92 bf16 ULP from x = 2.5 on, 6.6 (mean 0.04) in (-2.5,
 // 2.5), 7.7 in [-3, -2.5), 38 (mean 8.6) in [-24, -3); kmath.act(SILU): 0.59): A: u (1 + t), t = vtanh(u), u = x / 2,
 // below x = -3 u (1 - t) 2^(x log2e) by one vexp2 chord (the tail factor u (1 - t) formed first: II 10; 14 with the
-// exp2 product first); B: al::silu_small for |x| < 2.5 in place (II 10; the vtanh LUT alone costs 2.6x the first-token
+// exp2 product first); B: silu_small for |x| < 2.5 in place (II 10; the vtanh LUT alone costs 2.6x the first-token
 // KL of a 1000-token prompt). One loop for A and B does not pipeline. ``zero`` is a runtime 0: B's second loads of x
-// (not merged with the first) keep its lifetimes short.{{ " x: the gate halves of a gate/up C tile." if gate_up else "" }}
+// (not merged with the first) keep its lifetimes short.{{ " x: groups of %d vectors of 32, %d apart." % walk if walk != (1, 32) else "" }}
 template <int N>
 {{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y, int32_t zero)
 {
@@ -896,16 +940,10 @@ template <int N>
         const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
         const aie::vector<bfloat16, 32> kl = aie::broadcast<bfloat16, 32>(1.44269504f);
         const aie::vector<bfloat16, 32> kt = aie::broadcast<bfloat16, 32>(-3.0f);
-{% if gate_up %}
-        int cg = 0;
-{% endif %}
+{{ wg.decl }}
         for (int j = 0; j < N / 32; j++) {  // (no pragma: post-RA II 10; post-RA only: 25)
             aie::vector<bfloat16, 32> x = aie::load_v<32>(pg);
-{% if gate_up %}
-            pg = add_2d_ptr(pg, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
-{% else %}
-            pg += {{ x_step }};
-{% endif %}
+            {{ wg.step }}
             aie::accum<accfloat, 32> a_acc = aie::mul(x, kh);
             aie::vector<bfloat16, 32> a = a_acc.template to_vector<bfloat16>();
             aie::vector<bfloat16, 32> t = al::tanh_acc<32>(a_acc);
@@ -920,18 +958,12 @@ template <int N>
         const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)x;
         const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)y;
         bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
-{% if gate_up %}
-        int cg = 0;
-{% endif %}
+{{ wg.decl }}
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < N / 32; j++) {
-            aie::store_v(pw, al::silu_small(aie::load_v<32>(pg), aie::load_v<32>(pg + zero), aie::load_v<32>(pg + zero),
-                                            aie::load_v<32>(py)));
-{% if gate_up %}
-            pg = add_2d_ptr(pg, 96, 1, cg, 32);
-{% else %}
-            pg += {{ x_step }};
-{% endif %}
+            aie::store_v(pw, {{ small }}(aie::load_v<32>(pg), aie::load_v<32>(pg + zero), aie::load_v<32>(pg + zero),
+                                       aie::load_v<32>(py)));
+            {{ wg.step }}
             py += 32;
             pw += 32;
         }
@@ -940,16 +972,14 @@ template <int N>
 """
 
 
-def silu_tanh(*, gate_up: bool = False, x_step: int = 32, inline: bool = True) -> Fn:
+def silu_tanh(*, walk: tuple[int, int] = (1, 32), inline: bool = True) -> Fn:
     """silu of N bf16 into y (a template ``<N>(x, y, zero)``, ``zero`` a runtime 0) in two pipelined passes through
-    vtanh, one vexp2 chord and al::silu_small: ~0.6 cycles per element against ``act(SILU)``'s ~0.8, but up to 38 bf16
-    ULP below x = -2.5 (``act``: 0.59 everywhere). ``gate_up``: x the gate halves of a GEMM's gate/up C tile ([gate 64 |
-    up 64] per 128 values); ``x_step``: x's 32 values of an iteration that many elements apart (otherwise)."""
-    if gate_up and x_step != 32:
-        raise ValueError("kmath: gate_up walks x itself (no x_step)")
+    vtanh, one vexp2 chord and a fit for |x| < 2.5: ~0.6 cycles per element against ``act(SILU)``'s ~0.8, but up to 38 bf16
+    ULP below x = -2.5 (``act``: 0.59 everywhere). ``walk``: x's walk (``table_pass``)."""
     chord = exp2(32, bias=0, prec="chord", inline=True)
-    text = _ENV.from_string(_SILU_TANH).render(chord=chord.name, gate_up=gate_up, x_step=x_step)
-    local = "silu_tanh" + ("_gu" if gate_up else "") + (f"_x{x_step}" if x_step != 32 else "") + ("_i" if inline else "")
-    return _fn(local, text, inline=inline, deps=(chord,), lanes=32, arg="ptr", ret="void", func="silu_tanh",
-               params={"gate_up": gate_up, "x_step": x_step, "zero": True}, domain=(2.5, 3e38), valid=(-3e38, 3e38),
+    small = _fn("silu_small", _SILU_SMALL, inline=True, lanes=32, arg="bfloat16", ret="bfloat16")
+    text = _ENV.from_string(_SILU_TANH).render(chord=chord.name, small=small.name, walk=walk, wg=_walk(walk, "pg", "cg"))
+    local = "silu_tanh" + _walk_tag(walk) + ("_i" if inline else "")
+    return _fn(local, text, inline=inline, deps=(chord, small), lanes=32, arg="ptr", ret="void", func="silu_tanh",
+               params={"walk": walk, "zero": True}, domain=(2.5, 3e38), valid=(-3e38, 3e38),
                ulp=0.92)

@@ -77,8 +77,8 @@ __attribute__((noinline)) void {{ p }}_expand(const bfloat16 *__restrict ws, bfl
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int it = 0; it < {{ n // 8 }}; it++) {  // (16-row block, word ii) = (it / 2, it % 2)
         aie::vector<bfloat16, 64> A0, A1, B0, B1;
-        al::expand16(aie::load_v<16>(pa), A0, A1);
-        al::expand16(aie::load_v<16>(pb), B0, B1);
+        al::expand16_bc(aie::load_v<16>(pa), A0, A1);
+        al::expand16_bc(aie::load_v<16>(pb), B0, B1);
         aie::store_v(pe, A0);
         aie::store_v(pe + 64, A1);
         aie::store_v((float *)(pe + 128), aie::mac(aie::mul(A0, k128), B0, one).template to_vector<float>());
@@ -207,21 +207,21 @@ __attribute__((noinline)) void {{ p }}_q5k_tab(const uint8_t *__restrict a, cons
         }
         const v64uint8 cr = unpack(extract_v64uint4((v128uint4)o2, 0));  // crumbs of sb
         v64bfp16ebs8 Sl, Sc, Ml, Mc;
-        Sl.exponent = Ml.exponent = {{ p }}_e8(0x85);
-        Sc.exponent = {{ p }}_e8(0x89);
-        Mc.exponent = {{ p }}_e8(0x87);
+        Sl.exponent = Ml.exponent = al::e8(0x85);
+        Sc.exponent = al::e8(0x89);
+        Mc.exponent = al::e8(0x87);
         Sl.mantissa = (v64int8)unpack(extract_v64uint4((v128uint4)o0, 0));
         Ml.mantissa = (v64int8)unpack(extract_v64uint4((v128uint4)o1, 0));
         Sc.mantissa = (v64int8)band(cr, m3);
         Mc.mantissa = (v64int8)band(cr, m12);
         const aie::vector<bfloat16, 32> dp = aie::vector<bfloat16, 32>((v32bfloat16)o3);  // [d pairs | -dmin pairs]
         const aie::vector<bfloat16, 16> dq = dp.template extract<16>(0), mq = dp.template extract<16>(1);
-        const aie::vector<bfloat16, 64> D = {{ p }}_rep8v({{ p }}_pick(dq, sbl));
+        const aie::vector<bfloat16, 64> D = {{ p }}_pick(dq, sbl).template grow_replicate<64>();
         {{ p }}_td(mac_8x8_8x8T(I, 1, Sc, 0, mul_8x8_8x8T(I, 1, Sl, 0)), D, tab + 128 * g);
         aie::accum<accfloat, 64> Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)),
                                                 aie::mul(D, aie::broadcast<bfloat16, 64>(16.0f)).template to_vector<bfloat16>(),
                                                 aie::zeros<accfloat, 64>());
-        Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), {{ p }}_rep8v({{ p }}_pick(mq, sbl)), Y);
+        Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), {{ p }}_pick(mq, sbl).template grow_replicate<64>(), Y);
         {{ p }}_yadd(y + 32 * g, Y);
     }
 }

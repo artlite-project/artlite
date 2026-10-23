@@ -170,20 +170,22 @@ template <bool Q>
 __attribute__((noinline)) void {{ p }}_l2rows(const bfloat16 *__restrict ys, float *__restrict xf)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    float s[8];
+    aie::vector<float, 64> p;  // lane 8 t + e: token t's squares folded to 8
     AIE_LOOP_UNROLL_FULL
     for (int t = 0; t < 8; t++) {
-        const aie::accum<accfloat, 64> ss = aie::mac_square(aie::mul_square(aie::load_v<64>(ys + 128 * t)),
-                                                            aie::load_v<64>(ys + 128 * t + 64));
-        s[t] = aie::reduce_add(ss.template to_vector<float>());
+        const aie::vector<float, 64> q = aie::mac_square(aie::mul_square(aie::load_v<64>(ys + 128 * t)),
+                                                         aie::load_v<64>(ys + 128 * t + 64)).template to_vector<float>();
+        const aie::vector<float, 32> h = aie::add(q.template extract<32>(0), q.template extract<32>(1));
+        const aie::vector<float, 16> g = aie::add(h.template extract<16>(0), h.template extract<16>(1));
+        p.insert(t, aie::add(g.template extract<8>(0), g.template extract<8>(1)));
     }
+    aie::vector<float, 16> iv = al::inv_rms<1, 8>(al::group8<false>(p).template grow<16>(), {{ eps }}f);
+    if constexpr (Q)
+        iv = al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(iv);
     AIE_LOOP_UNROLL_FULL
     for (int t = 0; t < 8; t++) {
-        float iv = al::inv_rms<1>(s[t], {{ eps }}f);
-        if constexpr (Q)
-            iv = al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(aie::broadcast<float, 16>(iv))[0];
         aie::vector<bfloat16, 64> ih, il;
-        al::bf16_hilo<64>(iv, ih, il);
+        al::bf16_hilo<64>(iv[t], ih, il);
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
             const aie::vector<bfloat16, 64> x = aie::load_v<64>(ys + 128 * t + 64 * k);
@@ -503,15 +505,6 @@ template <typename T, int N>
     return aie::select(aie::broadcast<T, N>(a), aie::broadcast<T, N>(b), aie::mask<N>::from_uint64(hi));
 }
 
-// lanes 8 r + c = v[r] (each of 8 values over a row of 8 lanes)
-[[clang::always_inline]] inline aie::vector<float, 64> {{ p }}_rows8(aie::vector<float, 8> v)
-{
-    return aie::concat(aie::concat(aie::concat(aie::broadcast<float, 8>(v[0]), aie::broadcast<float, 8>(v[1])),
-                                   aie::concat(aie::broadcast<float, 8>(v[2]), aie::broadcast<float, 8>(v[3]))),
-                       aie::concat(aie::concat(aie::broadcast<float, 8>(v[4]), aie::broadcast<float, 8>(v[5])),
-                                   aie::concat(aie::broadcast<float, 8>(v[6]), aie::broadcast<float, 8>(v[7]))));
-}
-
 // an 8 x 8 block of fp32 rows at stride n -> 64 lanes [r][c]
 template <int N>
 [[clang::always_inline]] inline aie::vector<float, 64> {{ p }}_blk(const float *__restrict p)
@@ -645,7 +638,7 @@ __attribute__((noinline)) void {{ p }}_decays(const float *__restrict gt, float 
     // E10[t][s] = E00[7][s] (+) F[t]; E15[s] = E[15][s]: row 7 of E10 (s < 8), row 7 of block 1 (s >= 8)
     {
         const aie::vector<float, 64> ra = aie::load_v<8>(er + 224).template grow_replicate<64>();
-        const aie::vector<float, 64> rb = {{ p }}_rows8(f8);
+        const aie::vector<float, 64> rb = al::bcast8(f8);
         const aie::vector<float, 64> e10 = aie::add(aie::add(ra, rb), al::mulff<64>(ra, rb));
         aie::store_v(ed + 64, e10);
         aie::store_v(fv + 128, e10.template extract<8>(7).template grow_replicate<64>());
@@ -677,7 +670,7 @@ __attribute__((noinline)) void {{ p }}_lm(const float *__restrict gt, const floa
     for (int b = 0; b < 3; b++) {  // (block b: 00, 10, 11; its rows' token block b > 0)
         const aie::vector<float, 64> kk = aie::load_v<64>(g + 64 * b), q = aie::load_v<64>(g + 192 + 64 * b);
         const aie::vector<float, 64> e = aie::load_v<64>(ed + 64 * b);
-        const aie::vector<float, 64> l = al::mulff<64>({{ p }}_rows8(aie::load_v<8>(gt + 16 + 8 * (b > 0))), aie::add(kk, al::mulff<64>(e, kk)));
+        const aie::vector<float, 64> l = al::mulff<64>(al::bcast8(aie::load_v<8>(gt + 16 + 8 * (b > 0))), aie::add(kk, al::mulff<64>(e, kk)));
         const bool diag = b != 1;
         const aie::mask<64> strict = aie::mask<64>::from_uint64(diag ? 0x{{ strict }}ull : ~0ull);
         const aie::mask<64> lower = aie::mask<64>::from_uint64(diag ? 0x{{ lower }}ull : ~0ull);

@@ -63,16 +63,20 @@ namespace {
 // st: ss[8][32] -> inv_hi[64] | inv_lo[64] at st + 256 (bf16, lane 8 t + e = token t's 1 / rms)
 __attribute__((noinline)) void {{ p }}_inv(float *__restrict st)
 {
-    bfloat16 *__restrict ih = (bfloat16 *)(st + 256);
-    bfloat16 *__restrict il = ih + 64;
-    for (int t = 0; t < 8; t++) {
-        float inv = al::inv_rms<{{ E }}>(aie::reduce_add(aie::load_v<32>(st + 32 * t)), {{ eps }}f);
-        aie::vector<float, 16> iv = aie::broadcast<float, 16>(inv);
-        aie::vector<bfloat16, 16> hi = aie::accum<accfloat, 16>(iv).template to_vector<bfloat16>();
-        aie::vector<float, 16> r = aie::sub(iv, aie::accum<accfloat, 16>(hi).template to_vector<float>());
-        aie::store_v(ih + 8 * t, hi.template extract<8>(0));
-        aie::store_v(il + 8 * t, aie::accum<accfloat, 16>(r).template to_vector<bfloat16>().template extract<8>(0));
+    float *__restrict q = st + 256;  // (fp32 scratch under the output: the tokens' sums folded to 8 lanes, 8 t + e)
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 4; t++) {  // (two tokens: their chunks of 8 summed by two unzips; a 64-lane fp32 vector built
+                                   // in registers spills whole accumulators)
+        const aie::vector<float, 64> v = aie::load_v<64>(st + 64 * t);
+        const auto [a, b] = aie::interleave_unzip(v.template extract<32>(0), v.template extract<32>(1), 8);
+        const aie::vector<float, 32> h = aie::add(a, b);
+        const auto [c, d] = aie::interleave_unzip(h.template extract<16>(0), h.template extract<16>(1), 8);
+        aie::store_v(q + 16 * t, aie::add(c, d));
     }
+    aie::vector<bfloat16, 16> hi, lo;
+    al::split2<16>(al::inv_rms<{{ E }}, 8>(al::group8<false>(aie::load_v<64>(q)).template grow<16>(), {{ eps }}f), hi, lo);
+    aie::store_v((bfloat16 *)(st + 256), al::expand8(hi.template extract<8>(0)));
+    aie::store_v((bfloat16 *)(st + 256) + 64, al::expand8(lo.template extract<8>(0)));
 }
 }  // namespace
 

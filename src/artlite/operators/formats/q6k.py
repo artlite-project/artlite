@@ -208,9 +208,9 @@ __attribute__((noinline)) void {{ p }}_q6k_tab(const uint8_t *__restrict a, bflo
         // d of the rows: [row 8][sb 4] bf16
         const aie::vector<bfloat16, 32> dv = aie::load_v<32>((const bfloat16 *)(a + 64 * g));
         const aie::vector<bfloat16, 16> d2 = (sb >> 1) ? aie::filter_odd(dv, 2) : aie::filter_even(dv, 2);
-        const aie::vector<bfloat16, 64> D = {{ p }}_rep8v({{ p }}_pick(d2, sbl));
+        const aie::vector<bfloat16, 64> D = {{ p }}_pick(d2, sbl).template grow_replicate<64>();
         v64bfp16ebs8 H;
-        H.exponent = {{ p }}_e8(0x85);
+        H.exponent = al::e8(0x85);
         H.mantissa = (v64int8)shuffle(o0, o0, T32_2x8);  // [row 8][words 2] = int8 [row][i 8]
         {{ p }}_td(mul_8x8_8x8T(I, 1, H, 1), D, tab + 256 * g);
         H.mantissa = (v64int8)shuffle(o1, o1, T32_2x8);

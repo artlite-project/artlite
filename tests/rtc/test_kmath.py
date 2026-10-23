@@ -81,9 +81,11 @@ def _contracts() -> list[kmath.Fn]:
         fns += [kmath.exp2(lanes, bias=192, below=b, above=a, shift=s, inline=inline)
                 for b, a, s in itertools.product(("clamp", "bounded", "none"), ("none", "clamp"), (0, 64))]
     for t in kmath.TABLES.values():
-        fns += [kmath.act(t)] + [kmath.table_pass(t, table_arg=a, gate_up=g, x_step=x)
-                                 for a, (g, x) in itertools.product((False, True), ((False, 32), (False, 64), (True, 32)))]
-    return fns + [kmath.table_pass(kmath.SILU, table_arg=True, n=640)]
+        fns += [kmath.act(t)] + [kmath.table_pass(t, table_arg=a, walk=w)
+                                 for a, w in itertools.product((False, True), ((1, 32), (1, 64), (2, 128)))]
+        fns += [kmath.act(t, table_arg=True, walk=(2, 128))]
+    return fns + [kmath.table_pass(kmath.SILU, table_arg=True, n=640), kmath.silu_tanh(walk=(2, 128)),
+                  kmath.act(kmath.SILU, table_arg=True, n=640, scale=2, clamp=16.0, walk=(10, 640))]
 
 
 def test_kmath_sources() -> None:
@@ -103,8 +105,9 @@ def test_kmath_sources() -> None:
     for bad in (lambda: kmath.silu(32, exp_fn=kmath.exp2(32, below="int")),  # (silu's argument reaches -3e38)
                 lambda: kmath.silu(32, exp_fn=kmath.exp2(16)), lambda: kmath.sigmoid(16, recip_fn=kmath.exp2(16)),
                 lambda: kmath.softplus(16, recip_fn=kmath.recip(16, domain="normal")), lambda: kmath.recip(16, steps=1),
-                lambda: kmath.table_pass(kmath.GELU, gate_up=True, x_step=64), lambda: kmath.table_pass(kmath.SILU, n=48),
-                lambda: kmath.silu_tanh(gate_up=True, x_step=64)):
+                lambda: kmath.table_pass(kmath.GELU, walk=(2, 48)), lambda: kmath.table_pass(kmath.SILU, n=48),
+                lambda: kmath.silu_tanh(walk=(0, 32)), lambda: kmath.act(kmath.SILU, scale=3),
+                lambda: kmath.act(kmath.SIGMOID, scale=2)):
         with pytest.raises(ValueError):
             bad()
 

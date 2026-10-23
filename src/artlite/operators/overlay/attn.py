@@ -460,18 +460,6 @@ __attribute__((noinline, minsize)) void {{ p }}_kobj(uint8_t *__restrict a, int3
 }
 {% endif %}
 
-// per row r < 4 (lanes 8 r ..): the maximum of its 8 lanes, in all 8
-[[clang::always_inline]] inline aie::vector<bfloat16, 32> {{ p }}_max8(aie::vector<bfloat16, 32> v)
-{
-    v = aie::max(v, aie::shuffle_down_rotate(v, 1));
-    v = aie::max(v, aie::shuffle_down_rotate(v, 2));
-    v = aie::max(v, aie::shuffle_down_rotate(v, 4));  // lane 8 r: the max of lanes 8 r .. 8 r + 7
-    aie::vector<bfloat16, 32> r = aie::broadcast<bfloat16, 32>(v[0]);
-    r = aie::select(r, aie::broadcast<bfloat16, 32>(v[8]), aie::mask<32>::from_uint32(0x0000FF00u));
-    r = aie::select(r, aie::broadcast<bfloat16, 32>(v[16]), aie::mask<32>::from_uint32(0x00FF0000u));
-    return aie::select(r, aie::broadcast<bfloat16, 32>(v[24]), aie::mask<32>::from_uint32(0xFF000000u));
-}
-
 // Two records' P panels (e: their P, 32 lanes each) -> pp (2 x 72 B: per record [P hi rows | P lo rows])
 __attribute__((noinline)) void {{ p }}_ppan(aie::vector<float, 64> e, uint8_t *__restrict pp)
 {
@@ -540,7 +528,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
         // (in bf16, native: the maxima only bound the exponents, y / l is the same with any; m0 is bf16-exact)
         const aie::vector<float, 32> m0 = aie::load_v<32>(ml);
         const aie::vector<bfloat16, 32> m0b = aie::accum<accfloat, 32>(m0).template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 32> mnb = {{ p }}_max8({{ p }}_gmax((const float __aie_dm_resource_a *)(sc + {{ 32 * RG_MAX }} * set), m0b, nv));
+        const aie::vector<bfloat16, 32> mnb = al::max8({{ p }}_gmax((const float __aie_dm_resource_a *)(sc + {{ 32 * RG_MAX }} * set), m0b, nv));
         const aie::vector<float, 32> mn = aie::accum<accfloat, 32>(mnb).template to_vector<float>();
         aie::store_v(ml, mn);
         // (else alpha = 1; y and l zero before the first P V terms. A set's rows rescaled together: the rows whose
@@ -589,7 +577,7 @@ __attribute__((noinline, minsize)) void {{ p }}_vobj(uint8_t *__restrict a, int3
         AIE_LOOP_NO_UNROLL
         for (int r = 0; r < nv; r++)
             mg = aie::max(mg, aie::accum<accfloat, 32>(aie::load_v<32>(ss + 32 * r)).template to_vector<bfloat16>());
-        const aie::vector<bfloat16, 32> m0b = aie::accum<accfloat, 32>(m0).template to_vector<bfloat16>(), mnb = {{ p }}_max8(mg);
+        const aie::vector<bfloat16, 32> m0b = aie::accum<accfloat, 32>(m0).template to_vector<bfloat16>(), mnb = al::max8(mg);
         const aie::vector<float, 32> mn = aie::accum<accfloat, 32>(mnb).template to_vector<float>();
         aie::store_v(ml, mn);
         // (else alpha = 1; y and l zero before the first P V terms. A set's rows rescaled together: the rows whose

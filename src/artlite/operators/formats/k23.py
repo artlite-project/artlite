@@ -7,7 +7,7 @@ b (a: its two blocks of 8, b = 0 .. 7).
 Prefill (GemmQd's planar gather, ``gemm/k23``): k-tile objects [word][row] (a k-tile is 4 Q2_K / 6 Q3_K words), the
 header word-major too (row-direct, ``hdr_direct``) in slice-sized units from before the tile: ``_hcp`` collects them,
 ``_hdr_sb`` turns a super-block's scales into bf16 per row and sub-block (an MMUL against I), ``_dq`` expands them per
-lane (``_x8``: a broadcast and two 8x8 transposes, 3 shuffles per 64 lanes, expand8's zips 5) and computes
+lane (``al::expand8``) and computes
 w = S (128 + q) + C, rounded once to bfp16 (Q2_K 9, Q3_K 10 cycles per row and k-tile)."""
 
 from typing import ClassVar
@@ -61,14 +61,6 @@ alignas(64) static const int8_t {{ p }}_onehot[8][64] = {
 {% endfor %}
 };
 
-[[clang::always_inline]] inline v8int8 {{ p }}_e8(int e)
-{
-    v2int32 v;
-    v[0] = e * 0x01010101;
-    v[1] = e * 0x01010101;
-    return (v8int8)v;
-}
-
 // the nibbles of 8 rows' words (32 B at w) as bytes [r][nibble]
 [[clang::always_inline]] inline v64int8 {{ p }}_nib(const uint32_t *w)
 {
@@ -82,13 +74,6 @@ alignas(64) static const int8_t {{ p }}_onehot[8][64] = {
     const aie::vector<bfloat16, 16> v = aie::load_v<16>((const bfloat16 *)w);
     lo = aie::filter_even(v, 1).template grow_replicate<64>();
     hi = aie::filter_odd(v, 1).template grow_replicate<64>();
-}
-
-// lanes [r][8]: 8 values (r), each repeated over its row's 8 lanes (a broadcast and two 8x8 transposes)
-[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_x8(aie::vector<bfloat16, 8> v)
-{
-    const v32bfloat16 b = (v32bfloat16)broadcast_elem_128((v16int32)(v32bfloat16)v.template grow<32>(), 0);  // v 4 times
-    return aie::concat(aie::vector<bfloat16, 32>(shuffle(b, b, T16_8x8_lo)), aie::vector<bfloat16, 32>(shuffle(b, b, T16_8x8_hi)));
 }
 
 // S = bf16(d T) (T: integer scales of 8 rows, lanes [s][r])
@@ -151,7 +136,7 @@ __attribute__((noinline)) void {{ p }}_k23al(const uint8_t *src, uint8_t *__rest
 {
     const aie::vector<bfloat16, 32> h = Y.template to_vector<bfloat16>();
     const aie::vector<bfloat16, 32> l = aie::msc(Y, h, aie::broadcast<bfloat16, 32>(1.0f)).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> D = {{ p }}_rep4(d);
+    const aie::vector<bfloat16, 32> D = aie::load_v<8>(d).template grow_replicate<32>();
     aie::store_v(y, aie::mac(aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(y)), h, D), l, D).template to_vector<float>());
 }
 
@@ -168,10 +153,10 @@ __attribute__((noinline)) void {{ p }}_k23sc(const bfloat16 *__restrict c, const
     const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int j = 0; j < 16; j++) {
-        Y0 = aie::mac(Y0, aie::load_v<32>(pc), {{ p }}_rep4(ps));
-        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), {{ p }}_rep4(ps + 128));
-        Y2 = aie::mac(Y2, aie::load_v<32>(pc + 64), {{ p }}_rep4(ps + 256));
-        Y3 = aie::mac(Y3, aie::load_v<32>(pc + 96), {{ p }}_rep4(ps + 384));
+        Y0 = aie::mac(Y0, aie::load_v<32>(pc), aie::load_v<8>(ps).template grow_replicate<32>());
+        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), aie::load_v<8>(ps + 128).template grow_replicate<32>());
+        Y2 = aie::mac(Y2, aie::load_v<32>(pc + 64), aie::load_v<8>(ps + 256).template grow_replicate<32>());
+        Y3 = aie::mac(Y3, aie::load_v<32>(pc + 96), aie::load_v<8>(ps + 384).template grow_replicate<32>());
         pc += 128;
         ps += 8;
     }

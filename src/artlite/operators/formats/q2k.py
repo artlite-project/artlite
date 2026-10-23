@@ -30,7 +30,7 @@ void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int3
     aie::set_rounding(aie::rounding_mode::conv_even);
     const {{ p }}_BV I = al::eye();
     {{ p }}_BV H;
-    H.exponent = {{ p }}_e8(0x85);  // (value = mantissa)
+    H.exponent = al::e8(0x85);  // (value = mantissa)
     const uint32_t *__restrict hw = hb + ({{ hpad }} + 4 * sb) * {{ n }};  // sc h 0, sc h 1, mn h 0, mn h 1
     const uint32_t *__restrict dw = hb + ({{ hpad + 4 * nsb }} + sb) * {{ n }};  // d | dmin
     bfloat16 *__restrict o = ws;
@@ -52,7 +52,7 @@ void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int3
 // k-tile kt of super-block sb -> {{ n_mac }} x 64 bfp16 panels in the MAC pop order [16-row block][k-step 2 jj + a][8-row
 // half]: word jj = sub-block j = 4 kt + jj, nibble b = c(16 j + b) + 4 c(16 j + 8 + b) (a = 0: n & 3, a = 1: n & 12).
 // w = A c + B = A (128 + c) + (B - 128 A) (a = 1: the byte 4 c zipped with 0x42 is 32 + c, + (B - 32 A)), exact in fp32,
-// rounded once; A, B per lane (_x8)
+// rounded once; A, B per lane (al::expand8)
 void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
                 int32_t sb, int32_t kt{{ half_arg }})
 {
@@ -85,14 +85,14 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
         // per 8-row half: A, C = B - 128 A per lane; the panels in pop order (a = 1 of the first half waits in w10)
         {{ p }}_BV w10;
         {
-            const aie::vector<bfloat16, 64> A = {{ p }}_x8(aie::load_v<8>(ps));
-            const aie::accum<accfloat, 64> C = aie::mac(aie::mul(A, k128), {{ p }}_x8(aie::load_v<8>(ps + 128)), one);
+            const aie::vector<bfloat16, 64> A = al::expand8(aie::load_v<8>(ps));
+            const aie::accum<accfloat, 64> C = aie::mac(aie::mul(A, k128), al::expand8(aie::load_v<8>(ps + 128)), one);
             out.push(aie::mac(C, al::zipw(q0.template extract<64>(0), c43), A).template to_vector<bfp16ebs8>());
             w10 = aie::mac(aie::mac(C, A, k96), al::zipw(q1.template extract<64>(0), c42), A).template to_vector<bfp16ebs8>();
         }
         {
-            const aie::vector<bfloat16, 64> A = {{ p }}_x8(aie::load_v<8>(ps + 64));
-            const aie::accum<accfloat, 64> C = aie::mac(aie::mul(A, k128), {{ p }}_x8(aie::load_v<8>(ps + 192)), one);
+            const aie::vector<bfloat16, 64> A = al::expand8(aie::load_v<8>(ps + 64));
+            const aie::accum<accfloat, 64> C = aie::mac(aie::mul(A, k128), al::expand8(aie::load_v<8>(ps + 192)), one);
             out.push(aie::mac(C, al::zipw(q0.template extract<64>(1), c43), A).template to_vector<bfp16ebs8>());
             out.push(w10);
             out.push(aie::mac(aie::mac(C, A, k96), al::zipw(q1.template extract<64>(1), c42), A).template to_vector<bfp16ebs8>());
@@ -133,7 +133,7 @@ __attribute__((noinline)) void {{ p }}_q2k_tab(const uint8_t *__restrict hw, con
     bfloat16 *__restrict pt = sct, *__restrict pg = dg;
     float *__restrict pu = yu, *__restrict py = y;
     v64bfp16ebs8 S0, S1, M0, M1;
-    S0.exponent = S1.exponent = M0.exponent = M1.exponent = {{ p }}_e8(0x85);
+    S0.exponent = S1.exponent = M0.exponent = M1.exponent = al::e8(0x85);
     AIE_LOOP_NO_UNROLL  // (pointers walked: recomputed ones chained the y store to the next group's loads, RecMII 39)
     for (int g = 0; g < 4; g++) {
         S0.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_a *)ps);
@@ -152,7 +152,7 @@ __attribute__((noinline)) void {{ p }}_q2k_tab(const uint8_t *__restrict hw, con
         const aie::vector<float, 32> m2 = aie::add(ms.template extract<32>(0), ms.template extract<32>(1));
         aie::store_v(pu, aie::add(m2, m2));
         pu += 32;
-        const aie::vector<bfloat16, 64> Dm = aie::mul({{ p }}_rep8v(aie::filter_odd(dm, 1)), aie::broadcast<bfloat16, 64>(-1.0f)).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> Dm = aie::mul(aie::filter_odd(dm, 1).template grow_replicate<64>(), aie::broadcast<bfloat16, 64>(-1.0f)).template to_vector<bfloat16>();
         {{ p }}_yadd(py, {{ p }}_mo(mac_8x8_8x8T(X1, 1, M1, 0, mul_8x8_8x8T(X0, 1, M0, 0)), Dm, aie::zeros<accfloat, 64>()));
         py += 32;
     }
@@ -169,9 +169,9 @@ __attribute__((noinline)) void {{ p }}_q2k_mm(const uint8_t *__restrict xp, cons
     const v64uint8 m3 = broadcast_to_v64uint8((unsigned char)3), m12 = broadcast_to_v64uint8((unsigned char)12);
     v64bfp16ebs8 N2, A0, A1, A2, A3, B0, B1, B2, B3;  // (the zero point, the codes & 3, the codes & 12 per row group)
     N2.mantissa = broadcast_to_v64int8(-2);
-    N2.exponent = {{ p }}_e8(0x85);
-    A0.exponent = A1.exponent = A2.exponent = A3.exponent = {{ p }}_e8(0x85);
-    B0.exponent = B1.exponent = B2.exponent = B3.exponent = {{ p }}_e8(0x83);
+    N2.exponent = al::e8(0x85);
+    A0.exponent = A1.exponent = A2.exponent = A3.exponent = al::e8(0x85);
+    B0.exponent = B1.exponent = B2.exponent = B3.exponent = al::e8(0x83);
     uintptr_t o = (uintptr_t)w;
     bfloat16 *__restrict pc = c;
     AIE_PREPARE_FOR_POSTPIPELINING

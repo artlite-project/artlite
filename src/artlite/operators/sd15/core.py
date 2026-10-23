@@ -171,7 +171,13 @@ inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(co
 
 {% set stab = km.table_pass(km.SILU, table_arg=True, n=640) %}
 {% set tw = km.SILU.table_words() | length %}
+{# GELU through a GELU table on SiLU's grid (``unet.gelu_table``: fed 2 |x|, clamped at 2 t_max): of a row block, and
+   of two row blocks' gate blocks in a GEGLU tile (groups of 320 values, 640 apart) #}
+{% set gelu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax) %}
+{% set geglu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax, walk=(10, 640)) %}
 {{ stab.src }}
+{{ gelu_act.src }}
+{{ geglu_act.src }}
 
 
 // (an fp32 C tile of nbr 16-row bands: a k-tile from A at a with the walks pa (A, bytes), pb (B, bytes), pl (C))
@@ -330,28 +336,16 @@ __attribute__((noinline)) void {{ p }}_lnst(const bfloat16 *__restrict c, float 
 }
 
 // GEGLU of a C tile: rb's channels [hid 5 cb | gate 5 cb] -> hid gelu(gate) as bfp16 panels [rb][5] at out (the tile's
-// buffer: the panels trail the reads); z, t: scratch (640 bf16 each: gate, 2 |gate| -> gelu(gate)), tab: the GELU table
-// (fed 2 |x|); two row blocks per table pass, the gate and hid blocks walked by 2-D pointers
-__attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict z,
-                                        bfloat16 *__restrict t, const uint32_t *__restrict tab, int nrb) {
+// buffer: the panels trail the reads); t: scratch (640 bf16: gelu(gate) of two row blocks), tab: the GELU table on SiLU's
+// grid (``geglu_act``: fed 2 |x|, the gate blocks read in place); the hid blocks walked by a 2-D pointer
+__attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict t,
+                                        const uint32_t *__restrict tab, int nrb) {
   aie::set_rounding(aie::rounding_mode::conv_even);
-  const bfloat16 *g = (const bfloat16 *)in + 320, *h = (const bfloat16 *)in;
-  int cg = 0, ch = 0;
-  const aie::vector<bfloat16, 64> hi = aie::broadcast<bfloat16, 64>({{ 2 * gelu_tmax }}f);
+  const bfloat16 *h = (const bfloat16 *)in;
+  int ch = 0;
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o((bfp16ebs8 *)out);
   for (int rb = 0; rb < nrb; rb += 2) {
-    bfloat16 *zz = z, *tt = t;
-    AIE_LOOP_MIN_ITERATION_COUNT(10)
-    for (int i = 0; i < 10; i++) {  // (row block rb's gate blocks, then rb + 1's)
-      const aie::vector<bfloat16, 64> gv = aie::load_v<64>(g);
-      aie::store_v(zz, gv);
-      const aie::vector<bfloat16, 64> ga = aie::abs(gv);
-      aie::store_v(tt, aie::min(aie::add(ga, ga), hi));
-      g = add_2d_ptr(g, 384, 4, cg, 64);
-      zz += 64;
-      tt += 64;
-    }
-    {{ stab }}(z, t, t, t, tab, tab + {{ tw }});
+    {{ geglu_act }}((const bfloat16 *)in + 320 + 640 * rb, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -363,27 +357,13 @@ __attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32
 }
 
 // GELU of a C tile: rb's 10 channel blocks -> gelu as bfp16 panels [rb][10] at out (the tile's buffer: the panels trail
-// the reads); z, t: scratch (640 bf16 each: x, 2 |x| -> gelu(x)), tab: the GELU table (fed 2 |x|); a row block per table
-// pass
-__attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict z,
-                                       bfloat16 *__restrict t, const uint32_t *__restrict tab, int nrb) {
+// the reads); t: scratch (640 bf16: gelu of a row block), tab: the GELU table on SiLU's grid (``gelu_act``: fed 2 |x|)
+__attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict t,
+                                       const uint32_t *__restrict tab, int nrb) {
   aie::set_rounding(aie::rounding_mode::conv_even);
-  const bfloat16 *g = (const bfloat16 *)in;
-  const aie::vector<bfloat16, 64> hi = aie::broadcast<bfloat16, 64>({{ 2 * gelu_tmax }}f);
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o((bfp16ebs8 *)out);
   for (int rb = 0; rb < nrb; rb++) {
-    bfloat16 *zz = z, *tt = t;
-    AIE_LOOP_MIN_ITERATION_COUNT(10)
-    for (int i = 0; i < 10; i++) {
-      const aie::vector<bfloat16, 64> gv = aie::load_v<64>(g);
-      aie::store_v(zz, gv);
-      const aie::vector<bfloat16, 64> ga = aie::abs(gv);
-      aie::store_v(tt, aie::min(aie::add(ga, ga), hi));
-      g += 64;
-      zz += 64;
-      tt += 64;
-    }
-    {{ stab }}(z, t, t, t, tab, tab + {{ tw }});
+    {{ gelu_act }}((const bfloat16 *)in + 640 * rb, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -512,13 +492,13 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
         nbytes = m * 90;
       } else if (om == {{ O_GEGLU }}) {
         // (page ln's second entry: ``seq``; scratch: no statistics in a GEGLU op)
-        ((void (*)(const int32_t *, int32_t *, bfloat16 *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[2])(
-            cb, cb, (bfloat16 *)s.s0, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
+        ((void (*)(const int32_t *, int32_t *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[2])(
+            cb, cb, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
         nbytes = m * 45;
       } else if (om == {{ O_GELU }}) {
         // (page ln's third entry: ``seq``; scratch: no statistics in a GELU op)
-        ((void (*)(const int32_t *, int32_t *, bfloat16 *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[3])(
-            cb, cb, (bfloat16 *)s.s0, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
+        ((void (*)(const int32_t *, int32_t *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[3])(
+            cb, cb, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
         nbytes = m * 90;
       }
       if (om == {{ O_DS }}) {  // (a stride-2 conv's tile: groups 0 and 2, row blocks 0, 1 and 4, 5)

@@ -269,9 +269,9 @@ __attribute__((noinline)) void {{ p }}_sc1(const bfloat16 *__restrict c, const b
     const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < 8; i++) {
-        Y0 = aie::mac(Y0, aie::load_v<32>(pc), {{ p }}_rep4(ph));
+        Y0 = aie::mac(Y0, aie::load_v<32>(pc), aie::load_v<8>(ph).template grow_replicate<32>());
         if constexpr (G == 2)
-            Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), {{ p }}_rep4(ph + 64));
+            Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), aie::load_v<8>(ph + 64).template grow_replicate<32>());
         pc += 32 * G;
         ph += 8;
     }

@@ -16,7 +16,7 @@ template <typename T>
 {
     v64bfp16ebs8 n;
     n.mantissa = *(const v64int8 __aie_dm_resource_b *)p;
-    n.exponent = {{ p }}_e8(0x85);
+    n.exponent = al::e8(0x85);
     return n;
 }
 

@@ -28,8 +28,8 @@ SLOT = 64  # the gate outputs' and proj inputs' column slots
 PER = 32  # values per slot
 
 _SRC = JINJA_ENV.from_string(r"""
-{% set gtab = km.table_pass(km.GELU, table_arg=True, x_step=SLOT) %}
-{{ gtab.src }}
+{% set gact = km.act(km.GELU, table_arg=True, walk=(1, SLOT), inline=True) %}
+{{ gact.src }}
 
 extern "C" {
 
@@ -38,18 +38,8 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, b
                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {  // the slots' values, contiguous: t = min(|y|, {{ tmax }})
-        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ tmax }}f);
-        const bfloat16 *__restrict py = y;
-        bfloat16 *__restrict pt = t;
-        for (int j = 0; j < {{ 8 * 8 }}; j++) {  // (row, slot)
-            aie::store_v(pt, aie::min(aie::abs(aie::load_v<32>(py)), hi));
-            py += {{ SLOT }};
-            pt += 32;
-        }
-    }
-    // gelu of the values (x: the slots of y, {{ SLOT }} apart)
-    {{ gtab }}<{{ 8 * 8 * PER }}>(y, t, t, t, tab_ab, tab_cd);
+    // gelu of the slots' values (y's slots, {{ SLOT }} apart) into t, contiguous
+    {{ gact }}<{{ 8 * 8 * PER }}>(y, t, tab_ab, tab_cd);
     {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values, 4 of zeros
         const bfloat16 *__restrict pg = t;
         al::BOut<> o((bfp16ebs8 *)out);
@@ -85,7 +75,7 @@ class PleOperator(ArtcOperator):
         super().__init__()
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, SLOT=SLOT, PER=PER, tmax=repr(kmath.GELU.t_max))
+        return _SRC.render(p=self.p, SLOT=SLOT, PER=PER)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T

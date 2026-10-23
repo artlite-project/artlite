@@ -95,15 +95,6 @@ __attribute__((noinline)) void {{ p }}_put_bf16(bfloat16 *__restrict dst, aie::v
 }
 {% endif %}
 
-// x (32 lanes [slot 4][8]) -> the MMUL A panel [bfp16(x); bfp16(x - bfp16(x))] (the slots' hi rows, then lo rows)
-[[clang::always_inline]] inline al::BV {{ p }}_hilo(aie::accum<accfloat, 32> x, const al::BV &nI)
-{
-    const aie::accum<accfloat, 64> xx = aie::concat(x, x);
-    al::MM8 t(xx);
-    t.mac(xx.template to_vector<bfp16ebs8>(), aie::op_transpose(nI));  // xx - hi exactly
-    return aie::concat(x, t.to_accum().template extract<32>(1)).template to_vector<bfp16ebs8>();
-}
-
 // B_j: the 8x8 panel [n][k] of ones in row n = j (value 1: mantissa 1 at exponent 133): A B_j^T sums each row of A
 // into lane j
 // B_j (block j ones, the others zero; exponent 133: values 1) as bfp16 panels in memory order ([E, m0 .. m7] per block):
@@ -186,7 +177,7 @@ __attribute__((noinline)) void {{ p }}_hstrip(const bfloat16 *__restrict x, cons
             o.push(p1);
             v64bfp16ebs8 b;
             b.mantissa = *(const v64int8 __aie_dm_resource_d *)pb;
-            b.exponent = {{ mp }}_e8(0x85);
+            b.exponent = al::e8(0x85);
             pb += 64;
             T = mac_8x8_8x8T((v64bfp16ebs8)p0, 1, b, 0, T);
             T = mac_8x8_8x8T((v64bfp16ebs8)p1, 1, b, 0, T);
@@ -207,15 +198,15 @@ __attribute__((noinline)) void {{ p }}_xs_sb(const float *__restrict t, uint8_t 
     const aie::vector<float, 32> t0 = aie::load_v<32>(t), t1 = aie::load_v<32>(t + 32);
     {
         al::BOut<> o((bfp16ebs8 *)(xs + {{ gv.XS_SLOT }} * ({{ gv.NSB // 2 }} + sb)));
-        o.push({{ p }}_hilo(aie::accum<accfloat, 32>(t0), nI));
-        o.push({{ p }}_hilo(aie::accum<accfloat, 32>(t1), nI));
+        o.push(al::hilo4(aie::accum<accfloat, 32>(t0), nI));
+        o.push(al::hilo4(aie::accum<accfloat, 32>(t1), nI));
     }
     // the 32-k sums [slot 4][32-k block 8]: block 4 g + i of a slot = t_g[slot][2 i] + t_g[slot][2 i + 1]
     const aie::vector<float, 16> s0 = aie::add(aie::filter_even(t0, 1), aie::filter_odd(t0, 1));
     const aie::vector<float, 16> s1 = aie::add(aie::filter_even(t1, 1), aie::filter_odd(t1, 1));
     const auto [z0, z1] = aie::interleave_zip(s0, s1, 4);
     al::BOut<> o((bfp16ebs8 *)(xs + {{ gv.XS_SLOT }} * (sb >> 1) + {{ gv.PANEL }} * (sb & 1)));
-    o.push({{ p }}_hilo(aie::accum<accfloat, 32>(aie::concat(z0, z1)), nI));
+    o.push(al::hilo4(aie::accum<accfloat, 32>(aie::concat(z0, z1)), nI));
 }
 
 // The helper: an input's sum panels (nsb super-blocks: T16 at t) -> xs; with norm the slots' 1 / rms -> r (8 lanes
@@ -230,15 +221,11 @@ __attribute__((noinline)) void {{ p }}_hinput(uint8_t *__restrict xs, const floa
     if (!norm)
         return;
     const aie::vector<float, 8> ss = al::group8<false>(aie::concat(aie::load_v<32>(sq), aie::zeros<float, 32>()));
-    aie::vector<float, 32> iv = aie::zeros<float, 32>();
-{% for s in range(SLOTS) %}
 {% if post %}
-    iv.insert({{ s }}, aie::broadcast<float, 8>(al::inv_rms(ss[{{ s }}], ih, {{ eps }}f)));
+    aie::store_v(r, al::rows4(al::inv_rms<{{ SLOTS }}>(ss.template grow<16>(), ih, {{ eps }}f)));
 {% else %}
-    iv.insert({{ s }}, aie::broadcast<float, 8>(al::inv_rms<{{ H }}>(ss[{{ s }}], {{ eps }}f)));
+    aie::store_v(r, al::rows4(al::inv_rms<{{ H }}, {{ SLOTS }}>(ss.template grow<16>(), {{ eps }}f)));
 {% endif %}
-{% endfor %}
-    aie::store_v(r, iv);
 }
 
 {% if post %}
@@ -677,11 +664,7 @@ __attribute__((minsize)) void {{ p }}_psums(const bfloat16 *__restrict x, int32_
     for (int c = 1; c < {{ COLS }}; c++)
         t = aie::add(t, aie::load_v<32>(ps + 32 * c));
     const aie::vector<float, 8> ss = al::group8<false>(aie::concat(t, aie::zeros<float, 32>()));
-    aie::vector<float, 32> iv = aie::zeros<float, 32>();
-{% for s in range(SLOTS) %}
-    iv.insert({{ s }}, aie::broadcast<float, 8>(al::inv_rms(ss[{{ s }}], ih, {{ eps }}f)));
-{% endfor %}
-    aie::store_v(WS(float, {{ w_.ivv }}), iv);
+    aie::store_v(WS(float, {{ w_.ivv }}), al::rows4(al::inv_rms<{{ SLOTS }}>(ss.template grow<16>(), ih, {{ eps }}f)));
 }
 {% endif %}
 

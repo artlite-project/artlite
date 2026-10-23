@@ -142,7 +142,7 @@ reduction as SiLU's with x + 48 in one binade of ULP 1/4 (129 segments), beyond 
 99.9% correctly rounded (`test_sigmoid_lut`); 1718 instead of 10273 cycles per 8 tokens of 256 gates (an fp32 exp2
 and reciprocal).
 
-### SiLU (GemmQ's gate/up epilogue: the vtanh form + `al::silu_small`)
+### SiLU (GemmQ's gate/up epilogue: the vtanh form + a small-|x| fit, `km.silu_tanh`)
 
 - vtanh form (`al::tanh_acc` / `al::exp2_acc`): u (1 + tanh(u)), u = x / 2. Below x = -3,
   u 2^(x log2e) (1 + |t|): the exp2 tail avoids cancellation against vtanh's saturation. II 10 per
@@ -153,7 +153,7 @@ and reciprocal).
 - Too coarse for a recurrent state: in a 128-token GDN state it put 2.6x the exact SiLU's error
   (6.7e-3 vs 2.6e-3; the vexp2 tail from -2.5 on: 3.4x). The exact identity a (1 + t) for x >= 0,
   a e^x (1 - t) for x < 0 (1 + t = e^x (1 - t): no cancellation), e^x in a loop of its own (below),
-  `al::silu_small` below |x| = 2.5: 1.2x, 3.2K cycles per 8 tokens x 288 values. The table SiLU
+  the `silu_tanh` fit below |x| = 2.5: 1.2x, 3.2K cycles per 8 tokens x 288 values. The table SiLU
   (above) has the exact SiLU's error and is faster (the 27B scan 4.57 vs 4.84 ms per layer, GdnOut
   0.72 vs 0.89).
 
@@ -170,8 +170,11 @@ cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error 
 The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
 segments of 1/8 over [0, 8]: within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
 faster than a quadratic per segment follows, so `floor` sets an absolute error target there), ~2.2 KB of table, as
-a worker `Buffer` argument (`km.table_pass(table_arg=True)`: SKILL.md section 2). `gate_up=True` renders the GEMM epilogue's
-form (the gate halves of a gate/up C tile). The decode overlay's GELU (`overlay/kernels.py`) is `km.act(km.GELU)`,
+a worker `Buffer` argument (`km.act(table_arg=True)`: SKILL.md section 2). `walk=(2, 128)` reads a GEMM epilogue's
+gate halves of a gate/up C tile in place, `walk=(1, 64)` the PLE's slots; sd15 feeds a GELU table on SiLU's grid 2 |x|
+(`scale=2`, `clamp`). The clamp pass is a noinline function of its own; `inline=True` puts it into the caller, which
+only the PLE takes (its call cost 7 cycles; inlined, the GEMM epilogue and sd15's row loops spill more). The decode
+overlay's GELU (`overlay/kernels.py`) is `km.act(km.GELU)`,
 32 values at a time: 2.4x faster than the tanh form through `vtanh` (a bf16 fit below |w| = 1.25, e^(2w) (1 + |tanh w|)
 for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 

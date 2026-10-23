@@ -255,10 +255,10 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
     for (int it = 0; it < {{ n_mac // 8 }}; it++) {  // (16-row block, word ii) = (it / 2, it % 2)
         const int nb = it >> 1, ii = it & 1;
         aie::vector<bfloat16, 64> D0, D1;
-        al::expand16(aie::load_v<16>(pa + 2 * ii * {{ n }} + 16 * nb), D0, D1);
+        al::expand16_bc(aie::load_v<16>(pa + 2 * ii * {{ n }} + 16 * nb), D0, D1);
 {% if parts == 2 %}
         aie::vector<bfloat16, 64> M0, M1;
-        al::expand16(aie::load_v<16>(pa + (2 * ii + 1) * {{ n }} + 16 * nb), M0, M1);
+        al::expand16_bc(aie::load_v<16>(pa + (2 * ii + 1) * {{ n }} + 16 * nb), M0, M1);
         const aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
         const aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
 {% else %}

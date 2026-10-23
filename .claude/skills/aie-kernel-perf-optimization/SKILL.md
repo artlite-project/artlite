@@ -105,7 +105,7 @@ Violating any of these usually costs more than any micro-tuning gains.
   power-of-two scales into the SRS shift (`to_vector<T>(shift)`); reduce in the native type and convert the scalar
   result.
 - **Tables as worker `Buffer`s** (a LUT's coefficients: `Buffer(initial_value=...)`,
-  `km.table_pass(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
+  `km.act(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
   pinned at fixed addresses (`pin_l1_buffers`). A gather table's two copies in two 16 KB regions (bank-conflicts.md).
 - **Every name at namespace scope is `{{ p }}_...`** (`p = kernel_prefix(stem)`, AGENTS.md "Rules"), helpers too:
   the build names each definition by its code, so the operators of a library or fused ELF (one translation unit)

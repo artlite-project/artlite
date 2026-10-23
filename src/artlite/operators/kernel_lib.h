@@ -137,28 +137,48 @@ template <unsigned N>
              .template to_vector<bfloat16>();
 }
 
-// 1 / sqrt(ss / N + eps) for the sum of squares ss of N values. The scalar unit has no floating
-// point (a scalar product or sum is a soft-float call, ~1 KB of program memory each), so the mean
-// and eps go through vector lanes: ss / N as bf16 products (~2^-16; 1 / N is a bf16 for N a power
-// of two, else hi / lo parts)
-template <unsigned N>
-[[clang::always_inline]] inline float inv_rms(float ss, float eps)
+// 1 / sqrt(ms + eps) in lanes 0 .. K - 1 (the others 0): one scalar invsqrt per lane
+template <unsigned K>
+[[clang::always_inline]] inline aie::vector<float, 16> inv_sqrt_eps(aie::accum<accfloat, 16> ms, float eps)
 {
-    aie::accum<accfloat, 16> ms;
+    const aie::vector<float, 16> m = aie::add(ms, aie::accum<accfloat, 16>(aie::broadcast<float, 16>(eps))).template to_vector<float>();
+    aie::vector<float, 16> r = aie::zeros<float, 16>();
+    AIE_LOOP_UNROLL_FULL
+    for (unsigned i = 0; i < K; i++)
+        r[i] = aie::invsqrt(m[i]);
+    return r;
+}
+
+// 1 / sqrt(ss / N + eps) of the sums of squares ss of N values, lanes 0 .. K - 1 (the others 0). The scalar unit has
+// no floating point (a scalar product or sum is a soft-float call, ~1 KB of program memory each), so the mean and eps
+// go through vector lanes: ss / N as bf16 products (~2^-16; 1 / N is a bf16 for N a power of two, else hi / lo parts).
+// Several sums at once share that chain (8 tokens' norms: ~280 cycles less than 8 scalar calls).
+template <unsigned N, unsigned K>
+[[clang::always_inline]] inline aie::vector<float, 16> inv_rms(aie::vector<float, 16> ss, float eps)
+{
     if constexpr ((N & (N - 1)) == 0)
-        ms = mulc<16>(aie::broadcast<float, 16>(ss), aie::broadcast<bfloat16, 16>(1.0f / N));
+        return inv_sqrt_eps<K>(mulc<16>(ss, aie::broadcast<bfloat16, 16>(1.0f / N)), eps);
     else
-        ms = aie::accum<accfloat, 16>(mulff<16>(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(1.0f / N)));
-    ms = aie::add(ms, aie::accum<accfloat, 16>(aie::broadcast<float, 16>(eps)));
-    return aie::invsqrt(ms.template to_vector<float>()[0]);
+        return inv_sqrt_eps<K>(aie::accum<accfloat, 16>(mulff<16>(ss, aie::broadcast<float, 16>(1.0f / N))), eps);
 }
 
 // inv_rms of a length known at run time: inv_n = 1 / N (as inv_rms<N> for N not a power of two)
+template <unsigned K>
+[[clang::always_inline]] inline aie::vector<float, 16> inv_rms(aie::vector<float, 16> ss, float inv_n, float eps)
+{
+    return inv_sqrt_eps<K>(aie::accum<accfloat, 16>(mulff<16>(ss, aie::broadcast<float, 16>(inv_n))), eps);
+}
+
+// one sum
+template <unsigned N>
+[[clang::always_inline]] inline float inv_rms(float ss, float eps)
+{
+    return inv_rms<N, 1>(aie::broadcast<float, 16>(ss), eps)[0];
+}
+
 [[clang::always_inline]] inline float inv_rms(float ss, float inv_n, float eps)
 {
-    aie::accum<accfloat, 16> ms(mulff<16>(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(inv_n)));
-    ms = aie::add(ms, aie::accum<accfloat, 16>(aie::broadcast<float, 16>(eps)));
-    return aie::invsqrt(ms.template to_vector<float>()[0]);
+    return inv_rms<1>(aie::broadcast<float, 16>(ss), inv_n, eps)[0];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -188,43 +208,13 @@ template <unsigned N>
     }
 }
 
-// silu(x) for |x| < 2.5 as u + s (P0 + P1 s + P2 s^2), s = u^2, u = x / 2 (tanh(u) / u fitted in bf16
-// arithmetic; with the vtanh / vexp2 form elsewhere, as in gemm_q's gate/up epilogue: max 0.98 ULP for
-// x >= -1.5, mean 0.079 for |x| <= 8, against the LUT form's 9.7 / 0.12). x again through xr (a second load of the same data, not merged with x's by the
-// compiler: shorter lifetimes, II 10 instead of 14-18). Returns y where |x| >= 2.5.
-[[clang::always_inline]] inline aie::vector<bfloat16, 32> silu_small(aie::vector<bfloat16, 32> x,
-                                                                   aie::vector<bfloat16, 32> xr,
-                                                                   aie::vector<bfloat16, 32> xm,
-                                                                   aie::vector<bfloat16, 32> y)
-{
-    const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
-    const aie::vector<bfloat16, 32> p0 = aie::broadcast<bfloat16, 32>(0.99609375f);
-    const aie::vector<bfloat16, 32> p2 = aie::broadcast<bfloat16, 32>(0.06298828125f);
-    const aie::accum<accfloat, 32> p1 = aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-0.30078125f));
-    aie::vector<bfloat16, 32> u = aie::mul(x, kh).template to_vector<bfloat16>();
-    aie::vector<bfloat16, 32> s = aie::mul(u, u).template to_vector<bfloat16>();
-    aie::accum<accfloat, 32> acc = aie::mac(aie::mul(xr, kh), s, p0);
-    acc = aie::mac(acc, aie::mul(s, s).template to_vector<bfloat16>(), aie::mac(p1, s, p2).template to_vector<bfloat16>());
-    return aie::select(y, acc.template to_vector<bfloat16>(), aie::lt(aie::abs(xm), aie::broadcast<bfloat16, 32>(2.5f)));
-}
-
 // ---------------------------------------------------------------------------------------------
 // Lane shuffles
 // ---------------------------------------------------------------------------------------------
 
-// 8 bf16 -> 64 lanes, each repeated 8 times (lane 8 i + j = s_i)
-[[clang::always_inline]] inline aie::vector<bfloat16, 64> expand8(aie::vector<bfloat16, 8> s8)
-{
-    aie::vector<bfloat16, 32> v = aie::zeros<bfloat16, 32>();
-    v.insert(0, s8);
-    auto [a, a1] = aie::interleave_zip(v, v, 1);
-    auto [b, b1] = aie::interleave_zip(a, a, 1);
-    auto [c, c1] = aie::interleave_zip(b, b, 1);
-    return aie::concat(c, c1);
-}
-
 // 16 bf16 (rows 0..15 of one group) -> the two 64-lane scale vectors of rows 0..7 and 8..15, lane
-// 8 i + j = s_i (7 shuffles; upper input lanes unused)
+// 8 i + j = s_i (7 shuffles; upper input lanes unused). expand16_bc schedules better in the dequant loops (Q4_0 / Q4_1 /
+// Q5_K: 5-13% per call); in Q4_K's header pass the two are mixed (+7% / -2%).
 [[clang::always_inline]] inline void expand16(aie::vector<bfloat16, 16> s16, aie::vector<bfloat16, 64> &D0,
                                               aie::vector<bfloat16, 64> &D1)
 {
@@ -238,14 +228,20 @@ template <unsigned N>
 }
 
 // lanes 8 e .. 8 e + 7 of v (e < 4) -> 64 lanes, each repeated 8 times (lane 8 i + j = v[8 e + i]): the 128-bit
-// element broadcast 4 times (vextbcst: no L_RM_PORT) and two 8x8 transposes, 2 shuffles instead of the zips' 3 - 4.
-// For loops bound by L_RM_PORT (shuffles and a bfp16 stream's pushes / flushes: GemmQ's dequant II 46 -> 40 per 8
-// panels); in Q6_K's alu-bound dequant (runtime index math) the zips' schedule was better (II 46 vs 88).
+// element broadcast 4 times (vextbcst: no L_RM_PORT) and two 8x8 transposes, 2 shuffles instead of the zips' 3 - 4
+// (loops bound by L_RM_PORT, shuffles and a bfp16 stream's pushes / flushes: GemmQ's dequant II 46 -> 40 per 8 panels).
 [[clang::always_inline]] inline aie::vector<bfloat16, 64> expand8_of(aie::vector<bfloat16, 32> v, int e)
 {
     const v32bfloat16 b = (v32bfloat16)broadcast_elem_128((v16int32)(v32bfloat16)v, e);
     return aie::concat(aie::vector<bfloat16, 32>(shuffle(b, b, T16_8x8_lo)),
                        aie::vector<bfloat16, 32>(shuffle(b, b, T16_8x8_hi)));
+}
+
+// 8 bf16 -> 64 lanes, each repeated 8 times (lane 8 i + j = s_i): expand8_of's 2 shuffles (three zips cost 20-60 more
+// cycles per call in gdn's and Q2_K's loops)
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> expand8(aie::vector<bfloat16, 8> s8)
+{
+    return expand8_of(s8.template grow<32>(), 0);
 }
 
 // expand16 by expand8_of (4 shuffles)
@@ -302,6 +298,15 @@ template <aie_dm_resource R = aie_dm_resource::none>
 using BInR = aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, 64, R>;
 template <aie_dm_resource R = aie_dm_resource::none>
 using BOut = aie::block_vector_output_buffer_stream<bfp16ebs8, 64, R>;
+
+// The 8 block exponents of a panel, all e (a mantissa m then has the value m 2^(e - 133))
+[[clang::always_inline]] inline v8int8 e8(int e)
+{
+    v2int32 v;
+    v[0] = e * 0x01010101;
+    v[1] = e * 0x01010101;
+    return (v8int8)v;
+}
 
 // -I as a bfp16 panel (diagonal mantissa -64 at exponent 127: value m 2^(E - 133) = -1)
 [[clang::always_inline]] inline BV neg_eye()
@@ -364,17 +369,16 @@ using BOut = aie::block_vector_output_buffer_stream<bfp16ebs8, 64, R>;
 }
 
 // per row r < 4 (lanes 8 r ..): the maximum of its 8 lanes, in all 8
-[[clang::always_inline]] inline aie::vector<float, 32> max8(aie::vector<float, 32> v)
+template <typename T>
+[[clang::always_inline]] inline aie::vector<T, 32> max8(aie::vector<T, 32> v)
 {
     v = aie::max(v, aie::shuffle_down_rotate(v, 1));
     v = aie::max(v, aie::shuffle_down_rotate(v, 2));
     v = aie::max(v, aie::shuffle_down_rotate(v, 4));  // lane 8 r: the max of lanes 8 r .. 8 r + 7
-    aie::vector<float, 16> m = aie::zeros<float, 16>();
-    m[0] = v[0];
-    m[1] = v[8];
-    m[2] = v[16];
-    m[3] = v[24];
-    return rows4(m);
+    aie::vector<T, 32> r = aie::broadcast<T, 32>(v[0]);
+    r = aie::select(r, aie::broadcast<T, 32>(v[8]), aie::mask<32>::from_uint32(0x0000FF00u));
+    r = aie::select(r, aie::broadcast<T, 32>(v[16]), aie::mask<32>::from_uint32(0x00FF0000u));
+    return aie::select(r, aie::broadcast<T, 32>(v[24]), aie::mask<32>::from_uint32(0xFF000000u));
 }
 
 // per row r < 4 (lanes 8 r ..): the sum of its 8 lanes (lanes 0 .. 3 of the result; the others 1)
