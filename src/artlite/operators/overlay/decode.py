@@ -36,7 +36,7 @@ The main core's program, per X object (``_begin``):
   chunks, a row tile's chunks in a row; blocks of row tiles ``M_B``: end row tile, format (| ``B_F32``), valid
   rows). Per tile the main core posts the helper's command, runs its half, adds the helper's partial rows; a
   complete row tile's rows per slot: ``F_RESID`` into the residual (fp32), ``F_GU`` (rows 0 .. 7 gate, 8 .. 15 up) ->
-  bf16(act(bf16(gate))) up (``act_lut``'s SiLU), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
+  bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
   after the tiles the residual goes out (bf16).
 
 Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``kernels.py`` (and ``gemv.py``).
@@ -82,7 +82,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ... import txn
-from .. import act_lut, paging
+from .. import paging
 from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, linear_tap
 from ..formats import FORMATS
@@ -319,14 +319,12 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not self.xh or OBJ_K * 2 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
                           pg=self._page_spec() if self.paged else None, rg=self.moe)
-        if self.act == "silu":
-            src += "\nnamespace {\n" + act_lut.render_silu() + "\n}  // namespace\n"
         src += self._extra_src(p, consts)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs, "XS_SLOT": gemv.XS_SLOT,
               "XPH": self.max_g * self.chunk.xp // 2, "XPHC": self.chunk.xp // 2,
               "PANEL": gemv.PANEL,
               "Y_FLOATS": gemv.Y_FLOATS}
-        return src + _SRC.render(p=p, lut=act_lut.LUT, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
+        return src + _SRC.render(p=p, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
                                  WIN=WINS.get(self.win, 0),
                                  RES_PITCH=self.res_pitch, eps=repr(self.eps), META=META, C_LEN=C_LEN, NBLK=NBLK,
                                  SLOTS=SLOTS, XPAY=XPAY, OBJ_K=OBJ_K, NX_PER_NORM=NX_PER_NORM, gv=Attr(gv),

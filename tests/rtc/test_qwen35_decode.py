@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.operators import act_lut
+from artlite.operators import kmath
 from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
 from artlite.operators.overlay import decode as OD
@@ -20,10 +20,9 @@ from artlite.operators.overlay.vring import ring_rows, tails
 from artlite.operators.qwen35 import decode as MD
 from artlite.operators.qwen35.image import QwenImage
 
-from . import mmv
+from . import kmath_sim, mmv
 from . import qwen35_ref as ref
 from .common import essay
-from .elementwise import emulate
 
 T = 6  # tokens of the golden decode run; slot s takes token T - S + s
 NAMES = ("attn_norm|linear_attn_qkv_mixed|z|alpha|beta|final_output|attn_residual|ffn_swiglu|l_out|Qcur_full|Kcur|"
@@ -225,7 +224,8 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         sw = _t(G["ffn_swiglu", Lg][t]).reshape(S, -1)
         for c in range(COLS):
             y = mmv.ref_rows(img, r, c, xn)[0].reshape(S, -1, 2, 8) * inv[:, None, None, None]
-            kern = mmv.bf(emulate(act_lut.SILU, mmv.bf(y[:, :, 0])).astype(np.float64) * y[:, :, 1]).reshape(S, -1)
+            kern = mmv.bf(kmath_sim.emulate(kmath.act(kmath.SILU), mmv.bf(y[:, :, 0])).astype(np.float64)
+                          * y[:, :, 1]).reshape(S, -1)
             check(_bf16(out[c, :, :ffn]), kern, sw[:, ffn * c:ffn * (c + 1)])
     check.done()
 

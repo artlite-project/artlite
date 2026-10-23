@@ -103,13 +103,13 @@ Violating any of these usually costs more than any micro-tuning gains.
 - **Short conversion chains**: convert directly (`aie::to_float`, `accum<accfloat>(v).to_vector<bfloat16>()`); fold
   power-of-two scales into the SRS shift (`to_vector<T>(shift)`); reduce in the native type and convert the scalar
   result.
-- **Tables as worker `Buffer`s** (a LUT's coefficients: `Buffer(initial_value=...)`, `act_lut`
-  `render(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
+- **Tables as worker `Buffer`s** (a LUT's coefficients: `Buffer(initial_value=...)`,
+  `km.table_pass(table_arg=True)`), scratch too (AGENTS.md: no kernel statics); a static array also collides with L1 buffers
   pinned at fixed addresses (`pin_l1_buffers`).
 - **Every name at namespace scope is `{{ p }}_...`** (`p = kernel_prefix(stem)`, AGENTS.md "Rules"), helpers too:
   the build names each definition by its code, so the operators of a library or fused ELF (one translation unit)
   share equal helpers and never collide. A helper renderer several operators use renders under its own stem
-  (`act_lut.LUT`, `gemm.mac.MAC`) and a helper that differs only in constants can take them as template parameters
+  (`kmath`: `km`, `gemm.mac.MAC`) and a helper that differs only in constants can take them as template parameters
   (`mac<M, N>`): one definition for all of them. Keep templates and helpers out of `extern "C"` blocks.
 - **`noinline` boundaries** cost a call, a return and argument moves (~10-20 cycles). Use one when a loop pipelines
   standalone but not inside a big function (II 64 / 111 inlined vs 11 / 16); for a helper called from several places
@@ -292,7 +292,7 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   split such code across ops or cores); vector compares against a lane-index table instead of 64-bit mask arithmetic;
   runtime parameters instead of template instances (each instance is a copy: one dequant routine with a runtime
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
-  sub-block); a table activation (`act_lut`) instead of a polynomial chain: smaller and faster.
+  sub-block); a table activation (`km.act`) instead of a polynomial chain: smaller and faster.
 - No runtime-library arithmetic (`checks.py` warns when a kernel calls it).
 - **Pages: code the cores load themselves** (`operators/paging.py`, its docstring the hazards and their guards; sd15):
   the resident code (aiecc's link of the core) and pages of what only a page's entries reach, each linked at the slot

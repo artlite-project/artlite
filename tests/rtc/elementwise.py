@@ -1,5 +1,5 @@
 """1-D elementwise operators for the tests: harnesses of the activations the model kernels call (``SiluOperator``:
-``kmath.silu`` and act_lut's table SiLU; ``GeluOperator``: ``kmath.gelu``; ``KmOperator``: any kmath function of
+``kmath.silu`` and kmath's table SiLU; ``GeluOperator``: ``kmath.gelu``; ``KmOperator``: any kmath function of
 fp32 vectors) and the simplest operators for the infrastructure tests (fused ELFs, profiling, the render manifest).
 ``StreamOperator``: every core streams its chunk of all arguments through one kernel."""
 
@@ -14,7 +14,7 @@ from aie.iron.controlflow import range_
 from aie.iron.device import NPU2
 from ml_dtypes import bfloat16
 
-from artlite.operators import act_lut, kmath
+from artlite.operators import kmath
 from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
 from artlite.operators.design import COLS, ROWS, linear_tap
 
@@ -128,7 +128,9 @@ class StreamOperator(ArtcOperator):
 
 
 _SILU = JINJA_ENV.from_string(r"""
-{% if not lut %}
+{% if lut %}
+{{ lut.src }}
+{% else %}
 {% set silu = km.silu(16, inline=True) %}
 {{ silu.src }}
 {% endif %}
@@ -138,7 +140,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
     event0();
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if lut %}
-    {{ lut }}_{{ table }}_lut<{{ ts }}>(input, output);
+    {{ lut }}<{{ ts }}>(input, output);
 {% else %}
     // kmath.silu, 16 lanes per step
     for (int j = 0; j < {{ ts }}; j += 16) {
@@ -153,13 +155,13 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 
 
 class SiluOperator(StreamOperator):
-    """SiLU on a 1-D bf16 vector: ``lut`` act_lut's table SiLU (~0.85 cycles per element), else ``kmath.silu``
+    """SiLU on a 1-D bf16 vector: ``lut`` kmath's table SiLU (``kmath.act``: ~0.85 cycles per element), else ``kmath.silu``
     (software exp2, two Newton steps for the reciprocal; not pipelined: one long fp32 chain per 16 lanes, spilling,
     ~16 cycles per element)."""
 
     def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, lut: bool = False,
                  table: str = "silu"):
-        """``table``: the act_lut table of the lut form (silu, sigmoid)."""
+        """``table``: the kmath table of the lut form (silu, sigmoid)."""
         self.lut, self.table = lut, table
         super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, dtypes_in=(torch.bfloat16,),
                          dtypes_out=(torch.bfloat16,))
@@ -173,9 +175,7 @@ class SiluOperator(StreamOperator):
         return 0xA00  # a 2.2 KB frame
 
     def get_kernel_src(self) -> str:
-        tab = {"silu": act_lut.SILU, "sigmoid": act_lut.SIGMOID}[self.table]
-        return ((tab.render() if self.lut else "")
-                + _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and act_lut.LUT, table=self.table))
+        return _SILU.render(name=self.kernel_name, ts=self.tile, lut=self.lut and kmath.act(kmath.TABLES[self.table]))
 
 
 _GELU = JINJA_ENV.from_string(r"""
@@ -196,6 +196,31 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
     event1();
 }
 """)
+
+
+_VTANH = JINJA_ENV.from_string(r"""
+extern "C"
+void {{ name }}(bfloat16 *__restrict input, bfloat16 *__restrict output)
+{
+    for (int j = 0; j < {{ ts }}; j += 32)
+        aie::store_v(output + j, al::tanh_acc<32>(aie::accum<accfloat, 32>(aie::load_v<32>(input + j))));
+}
+""")
+
+
+class VtanhOperator(StreamOperator):
+    """vtanh (``al::tanh_acc``) of a bf16 vector: the hardware's table, read for ``kmath_sim.load_vtanh``."""
+
+    def __init__(self, *, size: int):
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(torch.bfloat16,),
+                         dtypes_out=(torch.bfloat16,))
+
+    @property
+    def kernel_name(self) -> str:
+        return f"vtanh_bf16_{self.tile}"
+
+    def get_kernel_src(self) -> str:
+        return _VTANH.render(name=self.kernel_name, ts=self.tile)
 
 
 class GeluOperator(StreamOperator):
@@ -222,6 +247,14 @@ class GeluOperator(StreamOperator):
 
 _KM = JINJA_ENV.from_string(r"""
 {{ fn.src }}
+{% if fn.arg == "ptr" %}
+extern "C"
+void {{ name }}(bfloat16 *__restrict input, bfloat16 *__restrict output)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {{ fn }}<{{ ts }}>(input, output{{ ", 0" if fn.params.get("zero") else "" }});
+}
+{% else %}
 extern "C"
 void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_resource_b *__restrict output)
 {
@@ -235,18 +268,20 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
                                      "bfloat16": "aie::accum<accfloat, " ~ fn.lanes ~ ">(" ~ r ~ ").template to_vector<float>()"}.get(fn.ret, r) }});
     }
 }
+{% endif %}
 """)
 
 
 class KmOperator(StreamOperator):
     """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument and result)
-    on a 1-D fp32 vector, one core."""
+    on a 1-D fp32 vector, one core; an array function (``kmath.act``: a table's name as ``table``) on a bf16 one."""
 
     def __init__(self, *, size: int, func: str, **kwargs: object):
         self.func, self.kwargs = func, kwargs
-        self.fn = getattr(kmath, func)(**kwargs)
-        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(torch.float32,),
-                         dtypes_out=(torch.float32,))
+        args = {k: kmath.TABLES[v] if k == "table" else v for k, v in kwargs.items()}
+        self.fn = getattr(kmath, func)(**args)
+        dt = torch.bfloat16 if self.fn.arg == "ptr" else torch.float32
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(dt,), dtypes_out=(dt,))
 
     @property
     def kernel_name(self) -> str:
@@ -258,14 +293,3 @@ class KmOperator(StreamOperator):
 
     def get_kernel_src(self) -> str:
         return _KM.render(fn=self.fn, name=self.kernel_name, ts=self.tile)
-
-
-def emulate(table: act_lut.ActTable, x: np.ndarray) -> np.ndarray:
-    """A table activation's kernel result (``ActTable.render``; bit-exact on the NPU)."""
-    x = act_lut._bf16(x)
-    tm = np.float32(table.t_max)
-    v, r, r2 = table._reduce(np.clip(x, -tm, tm) if table.full else np.minimum(np.abs(x), tm))
-    s = ((v - table.base) / table.seg).astype(np.int64)
-    c0, c1, c2 = (act_lut._f32(table.coefficients[s, i]) for i in range(3))
-    acc = act_lut._f32(act_lut._f32(c0 + act_lut._f32(c1 * r)) + act_lut._f32(c2 * r2))
-    return act_lut._bf16(acc if table.full else act_lut._f32(acc + np.maximum(x, np.float32(0))))

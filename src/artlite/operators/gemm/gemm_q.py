@@ -144,7 +144,8 @@ namespace {
 
 {{ mac_src }}
 {% if silu and act == "gelu" %}
-{{ gelu_src }}
+{% set gtab = km.table_pass(km.GELU, table_arg=True, gate_up=True) %}
+{{ gtab.src }}
 {% endif %}
 
 }  // namespace
@@ -230,14 +231,11 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 // gate/up epilogue: C 8x8 sub-block pairs (2 t, 2 t + 1) of a tile are 8 gate and 8 up rows (acc: [gate
 // 64 | up 64] per 128 values); h = silu(gate) * up -> hout (m x {{ n // 2 }}, 8x8 sub-blocks; as bfp16ebs8 panels (8 tokens x 8 outputs)).
 // Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
-// cycles per pass at m = n = 64, no spills: A: the vtanh
-// SiLU with its exp2 tail per gate half (II 10); B: al::silu_small for |x| < 2.5 in place (II 10; the vtanh
-// LUT alone costs 2.6x the first-token KL of a 1000-token prompt); C: times up (II 4 per 64 values). One
-// loop for A and B does not pipeline. ``zero`` is a runtime 0: B's second loads of x (not merged with the
-// first) keep its lifetimes short.
+// cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
+// (II 4 per 64 values).
 {% set mp = m // sxp %}
-{% set chord = km.exp2(32, bias=0, prec="chord", inline=True) %}
-{{ chord.src }}
+{% set silu_t = km.silu_tanh(gate_up=True) %}
+{{ silu_t.src }}
 
 void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
                   int32_t zero)
@@ -253,41 +251,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     const bfloat16 *__restrict cacc = cacc_;
     bfloat16 *__restrict hout = hout_;
 {% endif %}
-    {  // A: u (1 + t), below x = -3 u (1 - t) 2^(x log2e) (the tail factor u (1 - t) formed first: II 10;
-       // 14 with the exp2 product first)
-        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)cacc;
-        bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)scratch;
-        const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
-        const aie::vector<bfloat16, 32> kl = aie::broadcast<bfloat16, 32>(1.44269504f);
-        const aie::vector<bfloat16, 32> kt = aie::broadcast<bfloat16, 32>(-3.0f);
-        int cg = 0;
-        for (int j = 0; j < {{ mp * n // 64 }}; j++) {  // (no pragma: post-RA II 10; post-RA only: 25)
-            aie::vector<bfloat16, 32> x = aie::load_v<32>(pg);
-            pg = add_2d_ptr(pg, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
-            aie::accum<accfloat, 32> a_acc = aie::mul(x, kh);
-            aie::vector<bfloat16, 32> a = a_acc.template to_vector<bfloat16>();
-            aie::vector<bfloat16, 32> t = al::tanh_acc<32>(a_acc);
-            aie::vector<bfloat16, 32> body = aie::mac(a_acc, a, t).template to_vector<bfloat16>();
-            aie::vector<bfloat16, 32> a1t = aie::msc(a_acc, a, t).template to_vector<bfloat16>();
-            aie::vector<bfloat16, 32> tail = aie::mul(a1t, {{ chord }}(aie::mul(x, kl))).template to_vector<bfloat16>();
-            aie::store_v(py, aie::select(body, tail, aie::lt(x, kt)));
-            py += 32;
-        }
-    }
-    {
-        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)cacc;
-        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
-        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)scratch;
-        int cg = 0;
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int j = 0; j < {{ mp * n // 64 }}; j++) {
-            aie::store_v(pw, al::silu_small(aie::load_v<32>(pg), aie::load_v<32>(pg + zero), aie::load_v<32>(pg + zero),
-                                            aie::load_v<32>(py)));
-            pg = add_2d_ptr(pg, 96, 1, cg, 32);
-            py += 32;
-            pw += 32;
-        }
-    }
+    {{ silu_t }}<{{ mp * n // 2 }}>(cacc, scratch, zero);
     {
         const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
         const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
@@ -308,7 +272,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 {% endif %}
 {% if silu and act == "gelu" %}
 // gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
-// panels). Three pipelined loops through the scratch: A: t = min(|gate|, {{ gelu_tmax }}); B: act_lut's GELU table in place
+// panels). Three pipelined loops through the scratch: A: t = min(|gate|, {{ gelu_tmax }}); B: kmath's GELU table pass in place
 // (``tab``: the core's copy of the tables); C: times up (as SiLU's).
 {% set mp = m // sxp %}
 void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
@@ -339,7 +303,7 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
             py += 32;
         }
     }
-    {{ lut }}_gelu_tab<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab);
+    {{ gtab }}<{{ mp * n // 2 }}>(cacc, scratch, scratch, scratch, tab);
     {
         const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
         const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
@@ -582,7 +546,7 @@ class GemmQOperator(ArtcOperator):
         self.TR = self.tiles * rows  # weight rows per pass
         self.silu = silu  # tiles of 8 gate + 8 up rows -> C = act(gate) * up (N counts outputs)
         assert act in ("silu", "gelu") and (silu or act == "silu"), act
-        self.act = act  # the gate/up epilogue's activation: silu, or gelu (tanh form, act_lut.GELU: Gemma)
+        self.act = act  # the gate/up epilogue's activation: silu, or gelu (tanh form, kmath.GELU: Gemma)
         assert act == "silu" or self.DQ_CORE, "the GELU epilogue: GemmQd"
         # rows the memtile reads per pass: a planar SiLU pass of a whole group (128 rows and the padding rows
         # of the group's last tile) drops the padding rows when every part of the tile, header included, maps

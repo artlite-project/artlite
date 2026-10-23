@@ -194,7 +194,7 @@ result = y.to_torch()  # one sync at the end
 **Operators** (`src/artlite/operators/`, exported from its `__init__.py`), by purpose:
 the framework at the top (``base``, ``design``, ``checks``, ``render_cache``, ``l1_layout``, `FusedOperator` in
 ``fused``, which links several operators into one program and checks that the host initializes every buffer the
-program reads; ``kernel_lib.h``, ``kmath``, ``act_lut``, ``bfp16``); the GGUF tile formats (``formats/``, one slot per format:
+program reads; ``kernel_lib.h``, ``kmath``, ``bfp16``); the GGUF tile formats (``formats/``, one slot per format:
 Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, BFP16 for BF16 / F16 tensors); the prefill GEMMs on the decode
 tiles (``gemm/``: GemmQ, GemmQd, their MAC loop); the decode overlay run by host-built transactions
 (``overlay/``: GEMV cores, the KV record format, the attention core of Gemma and Llama, the models' shared host

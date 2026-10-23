@@ -37,7 +37,7 @@ from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from .. import act_lut
+from .. import kmath
 from ..design import COLS
 from ..formats import FORMATS, KC, slot
 from ..kernel_source import kernel_prefix
@@ -98,7 +98,7 @@ class GemmQdOperator(GemmQOperator):
                 "acc": ((2 if self.pingpong or self.halves == 2 or self.slots == 2 else 1) if self.silu or self.c_pack
                         else 0, m * nm * 2),
                 "sx": (1 if self.silu else 0, m * nm // self.sxp),
-                "lut": (1 if self.silu and self.act == "gelu" else 0, act_lut.GELU.table_buffer().nbytes)}
+                "lut": (1 if self.silu and self.act == "gelu" else 0, kmath.GELU.table_buffer().nbytes)}
 
     def _l1_bytes(self, m: int) -> int:
         """Data memory of the larger role (MAC core: ``_buffers``, dequantizing core: ``_dq_buffers``), the
@@ -227,9 +227,8 @@ class GemmQdOperator(GemmQOperator):
     def get_kernel_src(self) -> str:
         # (without forcing the post-RA pipeliner: II 33 per block instead of 34)
         mac = render_mac(k=KT)
-        gelu = act_lut.GELU.render(table_arg=True, gate_up=True) if self.silu and self.act == "gelu" else ""
-        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", lut=act_lut.LUT, m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
-                                  act=self.act, gelu_src=gelu, gelu_tmax=repr(act_lut.GELU.t_max), fmt=self.fmt,
+        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.nm}>", m=self.m, n=self.nm, nd=self.n, halves=self.halves, k=KT, silu=self.silu,
+                                  act=self.act, gelu_tmax=repr(kmath.GELU.t_max), fmt=self.fmt,
                                   nsb=self.nsb,
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,
                                   mac_src=mac, c_pack=self.c_pack, n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
@@ -263,7 +262,7 @@ class GemmQdOperator(GemmQOperator):
         p = self.p
         k_zero = Kernel(f"{p}_zero", "kernel.o", [acc_ty])
         gelu = self.silu and self.act == "gelu"
-        lut_ty = np.ndarray[(act_lut.GELU.table_buffer().size,), np.dtype[np.uint32]]
+        lut_ty = np.ndarray[(kmath.GELU.table_buffer().size,), np.dtype[np.uint32]]
         k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, lut_ty if gelu else np.int32]) \
             if self.silu else None
         dk = slot(self.fmt).qd_kernels(self, lambda name, args: Kernel(f"{p}_{name}", "kernel.o", args),
@@ -424,7 +423,7 @@ class GemmQdOperator(GemmQOperator):
                 if pingpong or halves > 1 or self.slots == 2:
                     extra.append(Buffer(acc_ty, name=f"gq_accb_{c}_{row}"))
                 if gelu:
-                    extra.append(Buffer(lut_ty, name=f"gq_lut_{c}_{row}", initial_value=act_lut.GELU.table_buffer()))
+                    extra.append(Buffer(lut_ty, name=f"gq_lut_{c}_{row}", initial_value=kmath.GELU.table_buffer()))
                 workers.append(Worker(mac_fn, [prm, d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero,
                                                k_mm, *extra],
                                       tile=Tile(c, 3 + row), stack_size=2048, dynamic_objfifo_lowering=True))

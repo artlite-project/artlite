@@ -12,7 +12,7 @@ gives them back.
 A command is one B slot: the header words ``C_*`` and, from word ``C_BIAS``, the op's biases (bf16 [pass][80]); the
 core copies it into its workspace and releases the slot. Kinds:
 - ``K_NOP``: nothing (the host's parity filler: an op's command in B slot 0, ``seq``);
-- ``K_TABLE``: the next B slot's first ``TAB`` bytes -> the activation table (``act_lut``: SiLU, or GELU fed 2 |x|);
+- ``K_TABLE``: the next B slot's first ``TAB`` bytes -> the activation table (``kmath``'s: SiLU, or GELU fed 2 |x|);
 - ``K_GEMM``: per token tile (C_NTILE) and pass (C_NPASS: 80 output channels each): C := the pass's bias; per k-tile
   (C_NKT) an A k-tile (``A_OBJ`` objects hold 128 / m of them, in two halves: ``design.R23``) and a B slot -> the MAC
   (m = C_M tokens, 64 or 16: an fp32 C tile, rounded to bf16 once after the residual); a conv (C_CONV, the tile = the
@@ -53,7 +53,7 @@ import functools
 
 import numpy as np
 
-from .. import act_lut, paging
+from .. import kmath, paging
 from ..base import JINJA_ENV
 from ..gemm.mac import render_mac
 from ..kernel_source import kernel_prefix
@@ -169,7 +169,8 @@ inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(co
 }
 }  // namespace
 
-{{ tabu }}
+{% set tabu = km.table_pass(km.SILU, unroll=640) %}
+{{ tabu.src }}
 
 
 // (an fp32 C tile of nbr 16-row bands: a k-tile from A at a with the walks pa (A, bytes), pb (B, bytes), pl (C))
@@ -349,7 +350,7 @@ __attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32
       zz += 64;
       tt += 64;
     }
-    {{ lut }}_tabu(z, t, t, t, tab);
+    {{ tabu }}(z, t, t, t, tab);
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -381,7 +382,7 @@ __attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_
       zz += 64;
       tt += 64;
     }
-    {{ lut }}_tabu(z, t, t, t, tab);
+    {{ tabu }}(z, t, t, t, tab);
     const bfloat16 *tv = t;
     AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
@@ -683,7 +684,7 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
     }
   }
   zz = z0;
-  if (mode == {{ A_GNSILU }}) {{ lut }}_tabu(zz, t0, t0, zz, tab);
+  if (mode == {{ A_GNSILU }}) {{ tabu }}(zz, t0, t0, zz, tab);
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(pan);
   AIE_LOOP_MIN_ITERATION_COUNT(10)
   for (int cb = 0; cb < 10; cb++) o.push(aie::accum<accfloat, 64>(aie::load_v<64>(zz + 64 * cb)).template to_vector<bfp16ebs8>());
@@ -1568,6 +1569,5 @@ def source(*, win: str = "") -> str:
         p=P, pager=paging.source(P, wake=d.L_WAKE, send=d.L_SEND), header=paging.header(), lock_base=paging.LOCK_BASE,
         L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
-        tabu=act_lut.SILU.render_unrolled(640), lut=act_lut.LUT,
-        gelu_tmax=act_lut.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
+        gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
         **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_") or k[:3] in ("REC", "ST_")})

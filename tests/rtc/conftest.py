@@ -29,7 +29,6 @@ SMOKE = (
     "test_gemm_q_dma.py", "test_render_cache.py", "test_server.py", "test_sampling.py", "test_minicpmv_host.py",
     "test_minicpmv_npu.py", "test_probe.py", "test_kmath.py",
     "test_router.py::test_catalog", "test_router.py::test_preset", "test_router.py::test_router",
-    "test_silu.py::TestRtcSiLU::test_silu_lut",
     "test_fused.py::test_library_program", "test_fused.py::test_library_program_memory_variants",
     "test_fused.py::TestFusedOperator::test_silu_add",
     "test_overlay_gemv.py::test_gemv[Q4_0-9216-4]",

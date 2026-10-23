@@ -15,7 +15,7 @@ shares a name (a hash collision is an error). Identical items under different lo
 and its copy in another bank).
 
 The stem is the readable part of the names; a helper renderer shared by several operators renders under its own stem
-(``act_lut``: ``lut``, ``gemm.mac``: ``mac``), so that its items are shared across operator classes too.
+(``kmath``: ``km``, ``gemm.mac``: ``mac``), so that its items are shared across operator classes too.
 
 Macros without the placeholder (``#define AW(T, off) ...``) are context: an item's hash includes the definitions of
 the ones it uses, and ``translation_unit`` emits a definition before the first item that needs it in force. Items

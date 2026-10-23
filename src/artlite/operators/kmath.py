@@ -20,7 +20,12 @@ bit-exact.
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import inspect
 import math
+import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -509,7 +514,7 @@ _SILU = r"""
 
 def silu(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, inline: bool = False) -> Fn:
     """silu(x) of ``lanes`` bf16 lanes -> fp32 (~16 cycles per element: fp32 math through bf16 products; the gather
-    table's SiLU, ``act_lut``, is ~1). ``exp_fn``: an exp2 of fp32 arguments that clamps (the argument reaches -3e38;
+    table's SiLU, ``act(SILU)``, is ~1). ``exp_fn``: an exp2 of fp32 arguments that clamps (the argument reaches -3e38;
     default the bf16-level one, inlined); ``recip_fn``: a recip on [1, 2] (default 2 steps unrolled, inlined)."""
     _check("lanes", lanes, LANES)
     e, etag = _take("exp_fn", exp_fn, exp2(lanes, inline=True), func="exp2", lanes=lanes, bias=None,
@@ -572,3 +577,487 @@ def gelu(*, ptr: bool = False, exp_fn: Fn | None = None, inline: bool = False) -
                                           name="{{ name }}", attr="{{ attr }}")
     return _fn("gelu_32" + ("_p" if ptr else "") + tag + ("_i" if inline else ""), text, inline=inline, deps=(e,),
                lanes=32, arg="bfloat16", ret="bfloat16", func="gelu", params={"exp_fn": e, "ptr": ptr})
+
+
+# Activations through the gather LUT -----------------------------------------------------------------------------------
+#
+# AIE2P's gather (``load_4x64_lo / hi`` = ``vldb.4x64``: four 64-bit table reads per instruction, ldb slot; probed on
+# the NPU): lane k of an instruction reads table ab (k % 4 < 2) or cd, its odd lanes 32 bytes further; offset bits 5:4
+# select the entry of a 64-byte group, bits 3:0 are ignored. A table is stored as groups of 4 entries, each group twice
+# (64 bytes per 4 segments), in two copies (ab, cd): 32 bytes per segment, 3.2 KB for SiLU (cd aliased onto ab: half the
+# memory, 9% slower). Entries: [c2 bf16 | c1 bf16 | c0 fp32] (``shuffle(.., T16_16x4_lo)`` gives c2 | c1 per 16 lanes,
+# ``T32_16x2_hi`` c0).
+#
+# SiLU: silu(x) = relu(x) + g(t), g(t) = silu(-t), t = min(|x|, 24) (silu(x) - silu(-x) = x). g is a table of 97
+# segments of 1/4 over [0, 24], each a quadratic in the offset r from its centre: c0 + c1 r + c2 r^2 (c0 fp32, c1 and c2
+# bf16; minimax over the segment's bf16 points, in units of the result's bf16 ULP):
+#     v = bf16(t + 32)              t rounded to the 1/4 grid ([32, 56] is a binade of ULP 1/4)
+#     r = bf16((32 - v) + t)        exact ((32 - v) first: tiny t stay exact)
+#     y = bf16(c0 + c1 r + c2 bf16(r^2) + max(x, 0))
+#     table byte offset = 64 v - 2048 (``bfloat16_to_int(v, 6)``: ``vfloor``)
+# Max 0.59 bf16 ULP over [-24, inf), 99.84% correctly rounded (below -24: silu(-24), within 1e-9 of the exact value).
+# The vtanh / vexp2 form: 6.6 ULP; ``silu``: 1.17 ULP at ~16 cycles per element. 873 cycles per 1024 elements on the
+# NPU (the vtanh / vexp2 form: 2682), in two loops: t into y (II 2), then the table pass in place (II 16 per 32 lanes;
+# bound 9: 8 table reads, the shuffles). Fewer, longer loops ran slower: the constant vectors (1, 24, the abs mask, 0,
+# the lanes' table pointers) take 5 of the 12 x registers, and the post-pipeliner's allocation fails.
+#
+# Sigmoid (``full``: the function itself over [-16, 16], x + 48 in the binade [32, 64] of ULP 1/4: 129 segments, no
+# symmetry, x clamped to the range): within 0.6 bf16 ULP, ~1 cycle per element (an fp32 exp2 and reciprocal: ~5).
+
+
+def _bf16(x: object) -> np.ndarray:
+    """fp32 -> bf16 rounded to nearest even, as fp32 (finite values)."""
+    b = np.asarray(x, np.float32).view(np.uint32).astype(np.uint64)
+    return (((b + 0x7FFF + ((b >> 16) & 1)) >> 16) << 16).astype(np.uint32).view(np.float32)
+
+
+def _f32(x: object) -> np.ndarray:
+    return np.asarray(x, np.float32)
+
+
+def bf16_values() -> np.ndarray:
+    """Every finite bf16 value, as float32 (bit patterns 0x8000 .. 0xFFFF, then 0x0000 .. 0x7FFF)."""
+    x = (np.arange(-32768, 32768).astype(np.int16).view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    return x[np.isfinite(x)]
+
+
+def silu64(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, np.float64)
+    return x / (1.0 + np.exp(np.minimum(-x, 700.0)))
+
+
+def sigmoid64(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(np.minimum(-np.asarray(x, np.float64), 700.0)))
+
+
+def gelu64(x: np.ndarray) -> np.ndarray:
+    """gelu in its tanh form (gelu_pytorch_tanh, ggml_gelu) as x sigmoid(z), z = 2 sqrt(2 / pi) (x + 0.044715 x^3)."""
+    x = np.asarray(x, np.float64)
+    z = 2.0 * np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)
+    return x / (1.0 + np.exp(np.minimum(-z, 700.0)))
+
+
+def gelu_erf64(x: np.ndarray) -> np.ndarray:
+    """gelu in its erf form (x Phi(x): MiniCPM-V's final merger)."""
+    x = np.asarray(x, np.float64)
+    return 0.5 * x * (1.0 + np.vectorize(math.erf)(x / np.sqrt(2.0)))
+
+
+def ulp_bf16(t: np.ndarray) -> np.ndarray:
+    """The bf16 ULP at t (normal range)."""
+    return np.exp2(np.floor(np.log2(np.maximum(np.abs(t), 2.0 ** -126))) - 7)
+
+
+def _minimax(cols: list[np.ndarray], f: np.ndarray, w: np.ndarray, fixed: np.ndarray) -> np.ndarray:
+    """Coefficients c of sum c_k col_k minimizing max |w (sum c_k col_k + fixed - f)| (Lawson's iteration)."""
+    A = np.stack(cols, 1) * w[:, None]
+    b = (f - fixed) * w
+    u = np.full(len(f), 1.0 / len(f))
+    c = np.linalg.lstsq(A, b, rcond=None)[0]
+    for _ in range(300):
+        s = np.sqrt(u)
+        c = np.linalg.lstsq(A * s[:, None], b * s, rcond=None)[0]
+        e = np.abs(A @ c - b)
+        if e.max() <= 1e-9 * max(np.abs(b).max(), 1e-30):
+            break
+        u = u * e
+        u /= u.sum()
+    return c
+
+
+def _round_bf16(c: float) -> float:
+    return float(_bf16(np.float32([c]))[0])
+
+
+@dataclass(frozen=True)
+class ActTable:
+    """An activation f with f(x) - f(-x) = x (x sigmoid of an odd function: SiLU, GELU) as relu(x) + g(t), g(t) =
+    f(-t), t = min(|x|, t_max), g a table of segments of ``seg`` over [0, t_max] (t + m in one binade of ULP seg).
+    ``full``: f itself over [-t_max, t_max] (x clamped; x + m in the binade [m - t_max, m + t_max]: sigmoid).
+    ``floor``: the error that counts in units of the result's ULP is at least this absolute one (GELU's tail, below
+    1e-7 at t = 5, decays faster than a quadratic per segment follows; relative accuracy there is irrelevant)."""
+
+    name: str
+    f64: Callable[[np.ndarray], np.ndarray]
+    seg: float
+    m: float
+    t_max: float
+    floor: float = 0.0
+    full: bool = False
+
+    @property
+    def base(self) -> float:
+        """The reduced argument's binade start (its first segment's)."""
+        return self.m - self.t_max if self.full else self.m
+
+    @property
+    def segs(self) -> int:
+        return int((2 if self.full else 1) * self.t_max / self.seg) + 1
+
+    @property
+    def groups(self) -> int:
+        return -(-self.segs // 4)
+
+    def reduce(self, t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The kernel's v, r, bf16(r^2) of t (bf16 values in [0, t_max])."""
+        v = _bf16(_f32(self.m) + _f32(t))
+        r = _bf16(_f32(_f32(self.m) - v) + _f32(t))
+        return v, r, _bf16(_f32(r) * _f32(r))
+
+    @functools.cached_property
+    def coefficients(self) -> np.ndarray:
+        """(segs, 3): c0 (fp32 values), c1, c2 (bf16 values) of g's segments (cached on disk: ~1 s to fit, keyed by the
+        table's parameters and the fitting code)."""
+        from .base import CACHE_DIR  # (base imports this module)
+
+        code = [inspect.getsource(f) for f in (self.f64, ActTable._fit, ActTable.reduce, _minimax, _round_bf16, _bf16, _f32,
+                                               bf16_values, ulp_bf16)]
+        key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, self.full, code)).encode()).hexdigest()[:16]
+        path = os.path.join(CACHE_DIR, "kmath", f"{self.name}_{key}.npy")
+        if os.path.exists(path):
+            return np.load(path)
+        coef = self._fit()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.npy"
+        np.save(tmp, coef)
+        os.replace(tmp, path)
+        return coef
+
+    def _fit(self) -> np.ndarray:
+        x = bf16_values()
+        if self.full:
+            t = x[(np.abs(x) <= self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
+            v, r, r2 = self.reduce(t)
+            f = self.f64(t)
+            w = 1.0 / np.maximum(ulp_bf16(f), self.floor)
+        else:
+            t = -x[(x <= 0) & (x >= -self.t_max) & ((x == 0) | (np.abs(x) >= 2.0 ** -40))]
+            v, r, r2 = self.reduce(t)
+            f = self.f64(-t)
+            # (the error of y = relu(x) + g on both sides)
+            w = 1.0 / np.maximum(np.minimum(ulp_bf16(f), ulp_bf16(self.f64(t))), self.floor)
+        s = ((v - self.base) / self.seg).astype(np.int64)
+        coef = np.zeros((self.segs, 3))
+        for k in range(self.segs):
+            sel = (s == k) & ((t != 0) | self.full)
+            rk, r2k, fk, wk = r[sel].astype(np.float64), r2[sel].astype(np.float64), f[sel], w[sel]
+            ones, zero = np.ones_like(rk), np.zeros_like(fk)
+            if k == 0 and not self.full:  # c0 = 0: tiny t stay relative-accurate
+                c2 = _round_bf16(_minimax([rk, r2k], fk, wk, zero)[1])
+                c1 = _round_bf16(_minimax([rk], fk, wk, c2 * r2k)[0])
+                coef[k] = 0.0, c1, c2
+                continue
+            c2 = _round_bf16(_minimax([ones, rk, r2k], fk, wk, zero)[2])
+            c1 = _round_bf16(_minimax([ones, rk], fk, wk, c2 * r2k)[1])
+            c0 = _minimax([ones], fk, wk, c1 * rk + c2 * r2k)[0]
+            coef[k] = float(np.float32(c0)), c1, c2
+        return coef
+
+    def table_words(self, coefficients: np.ndarray | None = None) -> np.ndarray:
+        """One table copy as uint32 words: entries [c2 | c1 (high half), c0], groups of 4 entries stored twice (the
+        gather's odd lanes read 32 bytes further); of ``coefficients`` (default: the table's)."""
+        coef = self.coefficients if coefficients is None else coefficients
+
+        def bits(c: np.ndarray) -> np.ndarray:
+            return _bf16(_f32(c)).view(np.uint32) >> 16
+
+        words = np.zeros((self.groups * 4, 2), np.uint32)
+        words[:len(coef), 0] = bits(coef[:, 1]) << 16 | bits(coef[:, 2])
+        words[:len(coef), 1] = _f32(coef[:, 0]).view(np.uint32)
+        g = words.reshape(self.groups, 8)
+        return np.concatenate([g, g], 1).reshape(-1)
+
+    def table_buffer(self) -> np.ndarray:
+        """The two table copies (ab, cd) as one uint32 array: a kernel's ``tab`` (``table_pass(table_arg=True)``)."""
+        w = self.table_words()
+        return np.concatenate([w, w])
+
+
+SILU = ActTable("silu", silu64, 0.25, 32.0, 24.0)
+# GELU: 65 segments of 1/8 over [0, 8] (g(-8) ~ -4e-21): within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute
+# 1.4e-7), below: within 6e-13; gelu (vtanh): 1.7 ULP at ~7 cycles per element
+GELU = ActTable("gelu", gelu64, 0.125, 16.0, 8.0)
+GELU_ERF = ActTable("gelu_erf", gelu_erf64, 0.125, 16.0, 8.0)
+SIGMOID = ActTable("sigmoid", sigmoid64, 0.25, 48.0, 16.0, full=True)
+TABLES = {t.name: t for t in (SILU, GELU, GELU_ERF, SIGMOID)}
+
+_LUT16 = r"""
+// 16 table reads: lanes 0-7 into q0, 8-15 into q1
+{{ attr }} void {{ name }}(v16int32 ptr, v32bfloat16 &q0, v32bfloat16 &q1)
+{
+    q0 = insert(q0, 0, (v16bfloat16)load_4x64_lo(extract_v8int32(ptr, 0)));
+    q0 = insert(q0, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 0)));
+    q1 = insert(q1, 0, (v16bfloat16)load_4x64_lo(extract_v8int32(ptr, 1)));
+    q1 = insert(q1, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 1)));
+}
+"""
+
+
+def _lut16() -> Fn:
+    return _fn("lut16", _LUT16, inline=True, lanes=16, arg="ptr", ret="void")
+
+
+_TABLE_PASS = r"""
+{% if not table_arg %}
+alignas(64) static const uint32_t {{ '{{ name }}' }}_ab[{{ words | length }}] = { {{ words | join(", ") }} };
+alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] = { {{ words | join(", ") }} };
+
+{% endif %}
+// y = c0 + c1 r + c2 r^2{{ " + max(x, 0) of t = min(|x|, %d)" % (t_max | float | int) if not full else " of t = x clamped to +-%d" % (t_max | float | int) }} (kmath.table_pass, {{ table }}'s table; in t_ and t2_: y, read before it
+// is written){{ "; x: the gate halves of a gate/up C tile" if gate_up }}
+template <int N>
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, const bfloat16 *__restrict t_, const bfloat16 *__restrict t2_,
+                bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab" if table_arg }})
+{
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const aie::accum<accfloat, 32> k(aie::broadcast<float, 32>({{ M }}f));
+{% if table_arg %}
+    const v16int32 base = ::sel(broadcast_s32((long)tab - {{ bias }}), broadcast_s32((long)(tab + {{ words | length }}) - {{ bias }}),
+                                0xCCCC);
+{% else %}
+    const v16int32 base = ::sel(broadcast_s32((long){{ '{{ name }}' }}_ab - {{ bias }}), broadcast_s32((long){{ '{{ name }}' }}_cd - {{ bias }}),
+                                0xCCCC);
+{% endif %}
+{% if gate_up %}
+    int cg = 0;
+{% endif %}
+    const bfloat16 __aie_dm_resource_d *__restrict px = (const bfloat16 __aie_dm_resource_d *)x;
+    const bfloat16 __aie_dm_resource_a *__restrict pt = (const bfloat16 __aie_dm_resource_a *)t_;
+    const bfloat16 __aie_dm_resource_c *__restrict pt2 = (const bfloat16 __aie_dm_resource_c *)t2_;
+    bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)y;
+    AIE_PREPARE_FOR_POSTPIPELINING AIE_LOOP_REG_REWRITE_SWPAWARE
+    for (int j = 0; j < N / 32; j++) {
+        const aie::vector<bfloat16, 32> t = aie::load_v<32>(pt);
+        const aie::vector<bfloat16, 32> t2 = aie::load_v<32>(pt2);
+        const aie::vector<bfloat16, 32> v = aie::mac(k, t, one).template to_vector<bfloat16>();  // t on the grid
+        v32bfloat16 q0, q1, q2, q3;
+        {{ lut16 }}(::add(base, bfloat16_to_int(v.extract<16>(0), {{ shift }})), q0, q1);
+        {{ lut16 }}(::add(base, bfloat16_to_int(v.extract<16>(1), {{ shift }})), q2, q3);
+        const aie::vector<bfloat16, 32> r = aie::mac(aie::msc(k, v, one), t2, one).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> r2 = aie::mul(r, r).template to_vector<bfloat16>();
+        const v32bfloat16 s0 = ::shuffle(q0, q1, T16_16x4_lo);  // c2 | c1 of lanes 0-15
+        const v32bfloat16 s1 = ::shuffle(q2, q3, T16_16x4_lo);
+        aie::accum<accfloat, 32> acc;
+        acc.insert(0, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q0, q1, T32_16x2_hi)));  // c0
+        acc.insert(1, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q2, q3, T32_16x2_hi)));
+        acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_hi)), r);
+        acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_lo)), r2);
+{% if not full %}
+        acc = aie::mac(acc, aie::max(aie::load_v<32>(px), aie::zeros<bfloat16, 32>()), one);
+{% endif %}
+        aie::store_v(py, acc.template to_vector<bfloat16>());
+{% if gate_up %}
+        px = add_2d_ptr(px, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
+{% else %}
+        px += {{ x_step }};
+{% endif %}
+        pt += 32;
+        pt2 += 32;
+        py += 32;
+    }
+}
+"""
+
+_TABLE_PASS_UNROLLED = r"""
+// {{ table }}'s table pass over {{ 64 * n64 }} values (kmath.table_pass, unrolled: two 32-lane halves per iteration, every load before
+// the gathers: they carry no memory operand, so each memory operation orders them: one chain per iteration ran at 30
+// cycles per 32 lanes, two at ~22); t = t2 = min(|x|, t_max) as bf16, y may be t; tab: ``table_buffer``
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, const bfloat16 *__restrict t_, const bfloat16 *__restrict t2_,
+                bfloat16 *__restrict y, const uint32_t *__restrict tab)
+{
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const aie::accum<accfloat, 32> k(aie::broadcast<float, 32>({{ M }}f));
+    const v16int32 base = ::sel(broadcast_s32((long)tab - {{ bias }}), broadcast_s32((long)(tab + {{ nw }}) - {{ bias }}), 0xCCCC);
+    const bfloat16 __aie_dm_resource_d *__restrict px = (const bfloat16 __aie_dm_resource_d *)x;
+    const bfloat16 __aie_dm_resource_a *__restrict pt = (const bfloat16 __aie_dm_resource_a *)t_;
+    const bfloat16 __aie_dm_resource_c *__restrict pt2 = (const bfloat16 __aie_dm_resource_c *)t2_;
+    bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)y;
+    AIE_PREPARE_FOR_POSTPIPELINING AIE_LOOP_REG_REWRITE_SWPAWARE
+    for (int j = 0; j < {{ n64 }}; j++) {
+{% for u in range(2) %}
+        const aie::vector<bfloat16, 32> t{{ u }} = aie::load_v<32>(pt + {{ 32 * u }});
+        const aie::vector<bfloat16, 32> t2{{ u }} = aie::load_v<32>(pt2 + {{ 32 * u }});
+        const aie::vector<bfloat16, 32> xr{{ u }} = aie::max(aie::load_v<32>(px + {{ 32 * u }}), aie::zeros<bfloat16, 32>());
+{% endfor %}
+{% for u in range(2) %}
+        const aie::vector<bfloat16, 32> v{{ u }} = aie::mac(k, t{{ u }}, one).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> r{{ u }} = aie::mac(aie::msc(k, v{{ u }}, one), t2{{ u }}, one).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> r2{{ u }} = aie::mul(r{{ u }}, r{{ u }}).template to_vector<bfloat16>();
+{% endfor %}
+{% for u in range(2) %}
+        v32bfloat16 q0{{ u }}, q1{{ u }}, q2{{ u }}, q3{{ u }};
+        {{ lut16 }}(::add(base, bfloat16_to_int(v{{ u }}.extract<16>(0), {{ shift }})), q0{{ u }}, q1{{ u }});
+        {{ lut16 }}(::add(base, bfloat16_to_int(v{{ u }}.extract<16>(1), {{ shift }})), q2{{ u }}, q3{{ u }});
+{% endfor %}
+{% for u in range(2) %}
+        aie::accum<accfloat, 32> acc{{ u }};
+        {
+            const v32bfloat16 s0 = ::shuffle(q0{{ u }}, q1{{ u }}, T16_16x4_lo);
+            const v32bfloat16 s1 = ::shuffle(q2{{ u }}, q3{{ u }}, T16_16x4_lo);
+            acc{{ u }}.insert(0, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q0{{ u }}, q1{{ u }}, T32_16x2_hi)));
+            acc{{ u }}.insert(1, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q2{{ u }}, q3{{ u }}, T32_16x2_hi)));
+            acc{{ u }} = aie::mac(acc{{ u }}, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_hi)), r{{ u }});
+            acc{{ u }} = aie::mac(acc{{ u }}, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_lo)), r2{{ u }});
+            acc{{ u }} = aie::mac(acc{{ u }}, xr{{ u }}, one);
+        }
+{% endfor %}
+{% for u in range(2) %}
+        aie::store_v(py + {{ 32 * u }}, acc{{ u }}.template to_vector<bfloat16>());
+{% endfor %}
+        px += 64;
+        pt += 64;
+        pt2 += 64;
+        py += 64;
+    }
+}
+"""
+
+
+def table_pass(table: ActTable, *, table_arg: bool = False, gate_up: bool = False, x_step: int = 32,
+               unroll: int | None = None) -> Fn:
+    """The table pass of ``table`` (an ActTable): a noinline template ``<N>(x, t_, t2_, y[, tab])``, y = the table's
+    quadratic of t (t_, t2_: t = min(|x|, t_max) as bf16, or x clamped for a full table; may be y) plus relu(x).
+    ``table_arg``: no static tables (a core's .rodata lands after the stack, over the buffers a design pins there): the
+    tables (``table_buffer``, a worker buffer of the core) as its last parameter. ``gate_up``: x the gate halves of a
+    GEMM's gate/up C tile ([gate 64 | up 64] per 128 values); ``x_step``: x's 32 values of an iteration that many
+    elements apart (otherwise). ``unroll=n``: a plain function of n values (a multiple of 64; table_arg), two 32-lane
+    halves per iteration (a kernel of a program-memory-patched design must be emitted where it is defined)."""
+    if not isinstance(table, ActTable):
+        raise TypeError(f"kmath: table = {table!r}, not an ActTable")
+    shift = int(np.log2(16 / table.seg))  # 16 bytes of offset per segment
+    words = [f"0x{w:08x}u" for w in table.table_words()]
+    l16 = _lut16()
+    kw = {"table": table.name, "lut16": l16.name, "M": repr(table.m), "shift": shift, "t_max": table.t_max,
+          "full": table.full}
+    if unroll is not None:
+        if unroll % 64 or table.full or gate_up or x_step != 32:
+            raise ValueError(f"kmath: an unrolled table pass of {unroll} values (a multiple of 64, a relu table, plain x)")
+        text = _ENV.from_string(_TABLE_PASS_UNROLLED).render(**kw, n64=unroll // 64, bias=int(table.m * 2 ** shift),
+                                                             nw=len(words))
+        return _fn(f"{table.name}_tabu{unroll}", text, inline=False, deps=(l16,), lanes=32, arg="ptr", ret="void",
+                   func="table_pass", params={"table": table, "unroll": unroll})
+    text = _ENV.from_string(_TABLE_PASS).render(**kw, words=words, bias=int(table.base * 2 ** shift),
+                                                table_arg=table_arg, gate_up=gate_up, x_step=x_step)
+    local = f"{table.name}_tab" + ("_t" if table_arg else "") + ("_gu" if gate_up else "")
+    local += f"_x{x_step}" if x_step != 32 else ""
+    return _fn(local, text, inline=False, deps=(l16,), lanes=32, arg="ptr", ret="void", func="table_pass",
+               params={"table": table, "table_arg": table_arg, "gate_up": gate_up, "x_step": x_step})
+
+
+_ACT = r"""
+// {{ table }} of N bf16 (a multiple of 32) into y through its table (kmath.act: {{ bound }}): t = {{ "x clamped to +-%d" % (t_max | float | int) if full else "min(|x|, %d)" % (t_max | float | int) }} into y,
+// then the table pass in place (sets the rounding mode)
+template <int N>
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {
+        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ t_max }}f);
+{% if full %}
+        const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ t_max }}f);
+{% endif %}
+        const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)x;
+        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < N / 32; j++) {
+{% if full %}
+            aie::store_v(pw, aie::min(aie::max(aie::load_v<32>(px), lo), hi));
+{% else %}
+            aie::store_v(pw, aie::min(aie::abs(aie::load_v<32>(px)), hi));
+{% endif %}
+            px += 32;
+            pw += 32;
+        }
+    }
+    {{ tab }}<N>(x, y, y, y);
+}
+"""
+
+# act's bounds (bf16 ULPs of the exact value) and where they hold (below: tests/rtc/test_kmath.py)
+_ACT_BOUND = {"silu": (0.59, (-24.0, np.inf)), "sigmoid": (0.54, (-16.0, 16.0)), "gelu": (0.59, (-4.0, np.inf)),
+              "gelu_erf": (0.59, (-4.0, np.inf))}
+
+
+def act(table: ActTable) -> Fn:
+    """``table``'s activation (an ActTable: SILU, GELU, GELU_ERF, SIGMOID) of N bf16 into y (x, y distinct; static
+    tables): a noinline template ``<N>(x, y)``, two loops (t = min(|x|, t_max) into y, then the table pass in place):
+    ~0.85 cycles per element (SiLU; 873 per 1024 on the NPU)."""
+    tab = table_pass(table)
+    ulp, dom = _ACT_BOUND[table.name]
+    text = _ENV.from_string(_ACT).render(table=table.name, tab=tab.name, t_max=repr(table.t_max), full=table.full,
+                                         bound=f"{_bound(ulp, None)} for x in [{dom[0]:g}, {dom[1]:g})")
+    return _fn(f"{table.name}_lut", text, inline=False, deps=(tab,), lanes=32, arg="ptr", ret="void", func="act",
+               params={"table": table}, domain=dom, valid=(-3e38, 3e38), ulp=ulp)
+
+
+_SILU_TANH = r"""
+// silu of N bf16 into y in two passes (kmath.silu_tanh: max 0.92 bf16 ULP from x = 2.5 on, 6.6 (mean 0.04) in (-2.5,
+// 2.5), 7.7 in [-3, -2.5), 38 (mean 8.6) in [-24, -3); kmath.act(SILU): 0.59): A: u (1 + t), t = vtanh(u), u = x / 2,
+// below x = -3 u (1 - t) 2^(x log2e) by one vexp2 chord (the tail factor u (1 - t) formed first: II 10; 14 with the
+// exp2 product first); B: al::silu_small for |x| < 2.5 in place (II 10; the vtanh LUT alone costs 2.6x the first-token
+// KL of a 1000-token prompt). One loop for A and B does not pipeline. ``zero`` is a runtime 0: B's second loads of x
+// (not merged with the first) keep its lifetimes short.{{ " x: the gate halves of a gate/up C tile." if gate_up else "" }}
+template <int N>
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y, int32_t zero)
+{
+    {  // A
+        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)x;
+        bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)y;
+        const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
+        const aie::vector<bfloat16, 32> kl = aie::broadcast<bfloat16, 32>(1.44269504f);
+        const aie::vector<bfloat16, 32> kt = aie::broadcast<bfloat16, 32>(-3.0f);
+{% if gate_up %}
+        int cg = 0;
+{% endif %}
+        for (int j = 0; j < N / 32; j++) {  // (no pragma: post-RA II 10; post-RA only: 25)
+            aie::vector<bfloat16, 32> x = aie::load_v<32>(pg);
+{% if gate_up %}
+            pg = add_2d_ptr(pg, 96, 1, cg, 32);  // the pair's second gate half, then the next pair
+{% else %}
+            pg += {{ x_step }};
+{% endif %}
+            aie::accum<accfloat, 32> a_acc = aie::mul(x, kh);
+            aie::vector<bfloat16, 32> a = a_acc.template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> t = al::tanh_acc<32>(a_acc);
+            aie::vector<bfloat16, 32> body = aie::mac(a_acc, a, t).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> a1t = aie::msc(a_acc, a, t).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> tail = aie::mul(a1t, {{ chord }}(aie::mul(x, kl))).template to_vector<bfloat16>();
+            aie::store_v(py, aie::select(body, tail, aie::lt(x, kt)));
+            py += 32;
+        }
+    }
+    {  // B
+        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)x;
+        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)y;
+        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
+{% if gate_up %}
+        int cg = 0;
+{% endif %}
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < N / 32; j++) {
+            aie::store_v(pw, al::silu_small(aie::load_v<32>(pg), aie::load_v<32>(pg + zero), aie::load_v<32>(pg + zero),
+                                            aie::load_v<32>(py)));
+{% if gate_up %}
+            pg = add_2d_ptr(pg, 96, 1, cg, 32);
+{% else %}
+            pg += {{ x_step }};
+{% endif %}
+            py += 32;
+            pw += 32;
+        }
+    }
+}
+"""
+
+
+def silu_tanh(*, gate_up: bool = False, x_step: int = 32, inline: bool = True) -> Fn:
+    """silu of N bf16 into y (a template ``<N>(x, y, zero)``, ``zero`` a runtime 0) in two pipelined passes through
+    vtanh, one vexp2 chord and al::silu_small: ~0.6 cycles per element against ``act(SILU)``'s ~0.85, but up to 38 bf16
+    ULP below x = -2.5 (``act``: 0.59 everywhere). ``gate_up``: x the gate halves of a GEMM's gate/up C tile ([gate 64 |
+    up 64] per 128 values); ``x_step``: x's 32 values of an iteration that many elements apart (otherwise)."""
+    chord = exp2(32, bias=0, prec="chord", inline=True)
+    text = _ENV.from_string(_SILU_TANH).render(chord=chord.name, gate_up=gate_up, x_step=x_step)
+    local = "silu_tanh" + ("_gu" if gate_up else "") + (f"_x{x_step}" if x_step != 32 else "") + ("_i" if inline else "")
+    return _fn(local, text, inline=inline, deps=(chord,), lanes=32, arg="ptr", ret="void", func="silu_tanh",
+               params={"gate_up": gate_up, "x_step": x_step, "zero": True}, domain=(2.5, 3e38), valid=(-3e38, 3e38),
+               ulp=0.92)

@@ -107,7 +107,7 @@ matvec = Kernel(f"my_op_matvec_bf16_{params}", "kernel.o", [np.int32, np.int32, 
 silu_mul = Kernel(f"my_op_silu_mul_bf16_{params}", "kernel.o", [L1_C_ty, np.int32])
 ```
 
-- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `act_lut.py`: drop IRON's `lut_based_ops.o`.
+- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `kmath.py` (`km.act`): drop IRON's `lut_based_ops.o`.
 
 ## 4. The test
 
@@ -134,7 +134,7 @@ def test_my_op(size: int, tile_size: int):
 ## Patterns
 
 - **Elementwise** (GELU, SiLU, add, mul): fuse it into the kernel that produces or consumes the data (GemmQ / GemmQd's
-  gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kernel_lib.h` / `act_lut.py`;
+  gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kmath.py`;
   accuracy over the bf16 domain through a `StreamOperator` harness (`tests/rtc/elementwise.py`).
 - **GEMV / GEMM** on the GGUF tile formats (`formats/`, one slot per format): the decode overlay's GEMV kernels
   (`overlay/gemv.py`, harness `MmvOperator` in `tests/rtc/mmv.py`), the prefill GEMMs `GemmQOperator` /

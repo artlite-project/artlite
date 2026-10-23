@@ -59,7 +59,7 @@ x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
 |---|---|---|---|
 | `vexp2` | 16 | mv | the chord 2^n (1 + f) between integer powers: up to +6% on bf16 inputs, 15% on fp32 |
 | `vtanh` | 16 | mv | coarse (max 8.5% rel.); returns its argument below |x| = 0.5; bf16 saturation near 1 |
-| gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`act_lut.py`) |
+| gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`km.act`, `kmath.py`) |
 
 - vexp2 is Schraudolph's exp bit for bit (probed over every bf16 and fp32 accumulators): bits = floor(128 y) +
   16256, for y < 0 16255 - trunc(128 |y|) (one's complement), y the argument truncated to bf16 (steps of 1/4 from
@@ -119,7 +119,7 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 - Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
   bf16 rounding can put the largest argument above 0.
 
-### SiLU through the gather LUT (`act_lut.py`: the GDN prefill's)
+### SiLU through the gather LUT (`km.act(km.SILU)`: the GDN prefill's)
 
 - silu(x) = relu(x) + g(|x|), g(t) = silu(-t) on [0, 24] in segments of 1/4, a quadratic per segment in the offset r
   from its centre (c0 fp32, c1, c2 bf16: one 64-bit entry; minimax on the segment's bf16 points, in result ULPs).
@@ -134,7 +134,7 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
   bound 9). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
   halves (moves).
 
-### Sigmoid through the gather LUT (`act_lut.SIGMOID`: the qwen35 attention prep's gate)
+### Sigmoid through the gather LUT (`km.SIGMOID`: the qwen35 attention prep's gate)
 
 No odd symmetry to fold: `ActTable(full=True)` tabulates f itself over [-t_max, t_max] (here 16), the range
 reduction as SiLU's with x + 48 in one binade of ULP 1/4 (129 segments), beyond it clamped: within 0.54 bf16 ULP,
@@ -185,12 +185,12 @@ Rejected forms:
 
 The decode overlay's GELU epilogue uses it (`overlay/kernels.py`).
 
-### GELU through the gather LUT (`act_lut.GELU`: the Gemma prefill's gate/up epilogue and per-layer-input op)
+### GELU through the gather LUT (`km.GELU`: the Gemma prefill's gate/up epilogue and per-layer-input op)
 
-The SiLU table's scheme (`act_lut.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
-segments of 1/8 over [0, 8]: within 0.58 bf16 ULP for |x| < 4, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
+The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
+segments of 1/8 over [0, 8]: within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
 faster than a quadratic per segment follows, so `floor` sets an absolute error target there), ~2.2 KB of table, as
-a worker `Buffer` argument (`render(table_arg=True)`: SKILL.md section 2). `gate_up=True` renders the GEMM epilogue's
+a worker `Buffer` argument (`km.table_pass(table_arg=True)`: SKILL.md section 2). `gate_up=True` renders the GEMM epilogue's
 form (the gate halves of a gate/up C tile).
 
 ## Block float (bfp16ebs8)

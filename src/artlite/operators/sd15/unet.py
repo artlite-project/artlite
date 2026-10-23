@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .. import act_lut
+from .. import kmath
 from ..design import COLS, ROWS
 from . import design as D
 from . import layout as L
@@ -60,7 +60,7 @@ def free(bd: Builder, t: Tensor) -> None:
 
 @functools.cache
 def _silu() -> np.ndarray:
-    return np.asarray(act_lut.SILU.table_buffer()).view(np.uint8)
+    return np.asarray(kmath.SILU.table_buffer()).view(np.uint8)
 
 
 def silu_table(bd: Builder) -> None:
@@ -68,17 +68,14 @@ def silu_table(bd: Builder) -> None:
 
 
 @functools.cache
-def gelu_table(table: act_lut.ActTable = act_lut.GELU) -> np.ndarray:
-    """A GELU's table (act_lut.GELU, or GELU_ERF) for the GEGLU / GELU epilogues' table pass (the SiLU table's form, fed
+def gelu_table(table: kmath.ActTable = kmath.GELU) -> np.ndarray:
+    """A GELU's table (kmath.GELU, or GELU_ERF) for the GEGLU / GELU epilogues' table pass (the SiLU table's form, fed
     t' = 2 t: its segment index and remainder exactly 2x GELU's, so c1 / 2, c2 / 4; each copy padded to SiLU's words)."""
-    import copy
-    g = copy.copy(table)
     c = table.coefficients.copy()
     c[:, 1] /= 2
     c[:, 2] /= 4
-    g.__dict__["coefficients"] = c
-    w = g.table_words()
-    w = np.concatenate([w, np.zeros(len(act_lut.SILU.table_words()) - len(w), np.uint32)])
+    w = table.table_words(c)
+    w = np.concatenate([w, np.zeros(len(kmath.SILU.table_words()) - len(w), np.uint32)])
     return np.concatenate([w, w]).view(np.uint8)
 
 

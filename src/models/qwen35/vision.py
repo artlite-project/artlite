@@ -27,7 +27,7 @@ from .sequence import Sequence
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the transactions)
 _SOURCES = ("artlite/operators/sd15", "artlite/operators/vision", "artlite/txn.py", "artlite/operators/bfp16.py",
-            "artlite/operators/act_lut.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
+            "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
             "artlite/operators/overlay/runtime.py", "models/qwen35/vision.py")
 KEEP = 8  # images whose embeddings are kept
 PROJECTORS = ("minicpmv4_7",)  # the mmproj projector types (``clip.projector_type``) of the encoder

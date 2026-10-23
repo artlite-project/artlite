@@ -351,7 +351,7 @@ class NpuEncoder(Encoder):
     lo those of ``minicpmv.HILO``), C over the whole K from the bf16 bias plus a bf16 residual, rounded once (bf16 C
     tiles: the residual stream, a LayerNorm's input; bfp16 panels: a GEMM's or the attention's input, V^T blocked over
     8 tokens); LayerNorm statistics S1, S2 of the bf16 values in fp32, var = max(S2 / n - mean^2, 0); GELU of bf16
-    values to bf16 (act_lut); attention with q (x log2 e / sqrt d) and k single bfp16, P = 2^(s - max) in bf16 as bfp16
+    values to bf16 (kmath's table); attention with q (x log2 e / sqrt d) and k single bfp16, P = 2^(s - max) in bf16 as bfp16
     panels, l their sums, o / l as panels."""
 
     def __init__(self, mmproj: str):

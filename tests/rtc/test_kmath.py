@@ -12,7 +12,7 @@ from artlite.operators import kmath
 from artlite.operators.kernel_source import KernelSource
 
 from . import kmath_sim
-from .elementwise import KmOperator
+from .elementwise import KmOperator, VtanhOperator
 
 CASES = {  # id: the function and its arguments
     "exp2": ("exp2", {"lanes": 32}),
@@ -34,6 +34,11 @@ CASES = {  # id: the function and its arguments
     "softplus": ("softplus", {"lanes": 16}),
     "sigmoid": ("sigmoid", {"lanes": 16}),
     "silu": ("silu", {"lanes": 32}),
+    "act-silu": ("act", {"table": "silu"}),
+    "act-sigmoid": ("act", {"table": "sigmoid"}),
+    "act-gelu": ("act", {"table": "gelu"}),
+    "act-gelu_erf": ("act", {"table": "gelu_erf"}),
+    "silu_tanh": ("silu_tanh", {}),
 }
 
 EDGES = np.float32([-np.inf, -1e30, -4e6, -32000, -16384, -1000, -200, -127.5, -127.25, -127, -126.9, -126.5, -126.1, 0, 100,
@@ -45,6 +50,10 @@ def _arguments(fn: kmath.Fn) -> tuple[np.ndarray, np.ndarray]:
     2^18 fp32 ones between: log-uniform over a wide positive range; for a bf16 argument those rounded to bf16) and the
     edges in ``fn.valid``."""
     lo, hi = fn.domain
+    if fn.arg == "ptr":  # (an array function: every finite bf16 but the tiny ones whose result is denormal)
+        b = kmath.bf16_values()
+        b = b[(np.abs(b) >= 1e-30) | (b == 0)]
+        return b[(b >= lo) & (b < hi)], b[(b < lo) | (b >= hi)]
     bias = np.float32(192 if fn.arg == "accum" else 0)
     b = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).float().numpy()
     b = b[np.isfinite(b)] + bias
@@ -71,8 +80,12 @@ def _contracts() -> list[kmath.Fn]:
                 kmath.expm1(lanes, exp_fn=kmath.exp2(lanes, inline=True), inline=inline)]
         fns += [kmath.exp2(lanes, bias=192, below=b, above=a, shift=s, inline=inline)
                 for b, a, s in itertools.product(("clamp", "bounded", "none"), ("none", "clamp"), (0, 64))]
-    return fns + [kmath.gelu(ptr=p, exp_fn=e, inline=i)
-                  for p, e, i in itertools.product((False, True), (None, kmath.exp2(32)), (False, True))]
+    fns += [kmath.gelu(ptr=p, exp_fn=e, inline=i)
+            for p, e, i in itertools.product((False, True), (None, kmath.exp2(32)), (False, True))]
+    for t in kmath.TABLES.values():
+        fns += [kmath.act(t)] + [kmath.table_pass(t, table_arg=a, gate_up=g, x_step=x)
+                                 for a, g, x in itertools.product((False, True), (False, True), (32, 64))]
+    return fns + [kmath.table_pass(kmath.SILU, unroll=640)]
 
 
 def test_kmath_sources() -> None:
@@ -102,14 +115,27 @@ def test_kmath_shared_dependency() -> None:
     assert tu.count("__attribute__((noinline)) aie::vector<float, 16> km_exp2_v16_fp32_") == 1
 
 
+@pytest.fixture(scope="module")
+def vtanh_table() -> np.ndarray:
+    """vtanh of every bf16 (by its bits) as the NPU computes it: the model's (``kmath_sim.load_vtanh``)."""
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    return VtanhOperator(size=65536).compile().run(bits).float().numpy()
+
+
 @pytest.mark.parametrize("case", list(CASES))
-def test_kmath(case: str) -> None:
+def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     func, kwargs = CASES[case]
-    fn = getattr(kmath, func)(**kwargs)
+    if func == "silu_tanh":
+        kmath_sim.load_vtanh(request.getfixturevalue("vtanh_table"))
+    fn = getattr(kmath, func)(**{k: kmath.TABLES[v] if k == "table" else v for k, v in kwargs.items()})
     dom, edges = _arguments(fn)
     x = np.concatenate([dom, edges])
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
-    out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(torch.from_numpy(xp)).numpy()[:len(x)]
+    if fn.arg == "ptr":
+        xt = torch.from_numpy(xp).bfloat16()
+        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(xt).float().numpy()[:len(x)]
+    else:
+        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(torch.from_numpy(xp)).numpy()[:len(x)]
     em = kmath_sim.emulate(fn, x)
     same = (out == em) | (np.isnan(out) & np.isnan(em))  # (zeros of either sign alike)
     assert same.all(), (f"{(~same).sum()} results differ from the emulation; at {x[~same][:4]}: {out[~same][:4]} vs "
@@ -118,7 +144,7 @@ def test_kmath(case: str) -> None:
     keep = np.abs(ref) >= 2.0 ** -125  # (results below 2^-126 are flushed to zero, and those just above it may be)
     o, ref, dom = o[keep], ref[keep], dom[keep]
     if fn.ulp is not None:
-        e = np.abs(o - ref) / np.exp2(np.floor(np.log2(ref)) - 7)
+        e = np.abs(o - ref) / np.exp2(np.floor(np.log2(np.abs(ref))) - 7)
         print(f"\n{fn.name}: max {e.max():.3f} bf16 ULP, mean {e.mean():.3f}")
         assert e.max() <= fn.ulp, f"max {e.max():.3f} bf16 ULP at {dom[np.argmax(e)]}"
     if fn.rel is not None:

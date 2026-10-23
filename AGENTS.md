@@ -92,7 +92,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/operators/vision/` | vision encoders on sd15's design: MiniCPM-V 4.7's (`minicpmv.py`: the whole encoder per dispatch, ``Encoder``) |
 | `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
-| `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu, gelu), each variant's bit-exact numpy model in `tests/rtc/kmath_sim.py` (`test_kmath.py`) |
+| `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu, gelu; arrays through the gather LUT: `act`, `table_pass` and the tables), each variant's bit-exact numpy model in `tests/rtc/kmath_sim.py` (`test_kmath.py`) |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
@@ -114,8 +114,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
 - Reuse the shared pieces instead of copying: `kmath.py` (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a
-  template), `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles), `act_lut.py` (activations through the gather
-  LUT), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction variable, `linear_tap`),
+  template; arrays through the gather LUT: `km.act(km.SILU)`, `km.table_pass`), `kernel_lib.h` (`inv_rms`, bfp16
+  panels, lane shuffles), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction variable, `linear_tap`),
   `bfp16.py` (host bfp16ebs8 conversions and panels), `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`,
   workspace `regions`, bf16 constants, `arg_bytes`).
 - New operators are exported from `operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. Tests need no

@@ -4,7 +4,7 @@ the per-layer projection (``proj``).
 ``PleOperator`` runs over T tokens: y the gate GEMM's output (T rows of 8 column slots of ``SLOT`` values: column c's
 32 outputs at 64 c, ``prefill.gemm`` layout of the gate phase), pli the layer's per-layer inputs (T x 256 bf16, the
 host's), h as proj's A: bfp16 panels [T / 8][512 / 8][72 B] in the same slots (column c's 32 values at 64 c, zeros
-after them: the image's proj tiles hold zero weights there, ``gemma4.image``). GELU through act_lut's table (a worker
+after them: the image's proj tiles hold zero weights there, ``gemma4.image``). GELU through kmath's table pass (a worker
 buffer of the core: no static tables), bf16 like the decode's F_PLI epilogue: bf16(bf16(gelu(bf16(y))) pli).
 
 ``cols`` cores (one per column) take the token groups of 8 in turn.
@@ -19,7 +19,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from .. import act_lut
+from .. import kmath
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS
 from ..kernel_source import kernel_prefix
@@ -28,9 +28,8 @@ SLOT = 64  # the gate outputs' and proj inputs' column slots
 PER = 32  # values per slot
 
 _SRC = JINJA_ENV.from_string(r"""
-namespace {
-{{ gelu }}
-}  // namespace
+{% set gtab = km.table_pass(km.GELU, table_arg=True, x_step=SLOT) %}
+{{ gtab.src }}
 
 extern "C" {
 
@@ -50,7 +49,7 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, b
         }
     }
     // gelu of the values (x: the slots of y, {{ SLOT }} apart)
-    {{ lut }}_gelu_tab<{{ 8 * 8 * PER }}>(y, t, t, t, tab);
+    {{ gtab }}<{{ 8 * 8 * PER }}>(y, t, t, t, tab);
     {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values, 4 of zeros
         const bfloat16 *__restrict pg = t;
         al::BOut<> o((bfp16ebs8 *)out);
@@ -86,8 +85,7 @@ class PleOperator(ArtcOperator):
         super().__init__()
 
     def get_kernel_src(self) -> str:
-        gelu = act_lut.GELU.render(table_arg=True, x_step=SLOT)
-        return _SRC.render(p=self.p, lut=act_lut.LUT, gelu=gelu, SLOT=SLOT, PER=PER, tmax=repr(act_lut.GELU.t_max))
+        return _SRC.render(p=self.p, SLOT=SLOT, PER=PER, tmax=repr(kmath.GELU.t_max))
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -102,7 +100,7 @@ class PleOperator(ArtcOperator):
         l_ty = np.ndarray[(8 * COLS * PER,), bf]
         t_ty = np.ndarray[(8 * COLS * PER,), bf]
         o_ty = np.ndarray[(8 * COLS * SLOT * 9 // 16,), bf]
-        tab = act_lut.GELU.table_buffer()
+        tab = kmath.GELU.table_buffer()
         tab_ty = np.ndarray[(tab.size,), np.dtype[np.uint32]]
         k_ple = Kernel(f"{p}_ple", "kernel.o", [y_ty, l_ty, t_ty, tab_ty, o_ty])
         yf = [ObjectFifo(y_ty, name=f"pl_y{c}", depth=2) for c in range(cols)]

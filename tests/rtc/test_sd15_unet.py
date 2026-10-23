@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from artlite.operators import act_lut
+from artlite.operators import kmath
 from artlite.operators.sd15 import design as D
 from artlite.operators.sd15 import layout as L
 from artlite.operators.sd15.build import Builder, Level
@@ -194,7 +194,7 @@ def test_norm(npu: Sd15Device, mode: str, m: int, C: int, ntile: int, nrows: int
                                         ddr=(npu.address("rec", c * 1024), 1024, None))]) for c in range(COLS)}, {})
         s.ddr_sync()
         npu.alloc("zeros", D.Q)
-    tabs = table_rows(npu, "tab", np.asarray(act_lut.SILU.table_buffer()).view(np.uint8)) if mode == "gnsilu" else {}
+    tabs = table_rows(npu, "tab", np.asarray(kmath.SILU.table_buffer()).view(np.uint8)) if mode == "gnsilu" else {}
     if tabs:
         s.op({}, tabs)
     npr = 4 // len(a.rows)  # (the producer cores whose records the i-th core sums: [npr i, ..))

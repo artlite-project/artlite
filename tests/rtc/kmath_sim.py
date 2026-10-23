@@ -3,7 +3,7 @@ NPU), and of the AIE2P arithmetic they are built from: bf16 rounding, the accumu
 products through bf16 hi / lo parts (``mulc``, ``mul_hilo``, ``mulff``).
 
     emulate(fn, x)   the results of ``fn`` (a kmath.Fn) for the arguments x (fp32, in ``fn.valid``; bf16 values for a
-                     bf16 argument)
+                     bf16 argument; an array function's: its result per element)
     exact(fn, x)     the function ``fn`` computes, in float64
 
 The fp32 adder (accumulator add / sub, fp32 vector add / sub, a MAC's sum) is not IEEE: it aligns the smaller operand
@@ -26,7 +26,8 @@ def _ftz(x: np.ndarray) -> np.ndarray:
 
 
 def _f32(x: object) -> np.ndarray:
-    return _ftz(np.asarray(x, np.float32))
+    with np.errstate(over="ignore"):  # (past the fp32 range: inf, as on the NPU)
+        return _ftz(np.asarray(x, np.float32))
 
 
 def bf16(x: object) -> np.ndarray:
@@ -134,11 +135,35 @@ def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int) -> np.ndarray:
 
 
 def vexp2(a: np.ndarray) -> np.ndarray:
-    """``al::exp2_acc`` (the vexp2 LUT): Schraudolph's exp of a truncated to bf16, t: the bf16 bits floor(128 t) +
-    16256, for t < 0 16255 - trunc(128 |t|) (one's complement; probed over every bf16 and fp32 inputs)."""
+    """``al::exp2_acc`` (the vexp2 LUT): Schraudolph's exp of a truncated to bf16, t: k = floor(128 t), for t < 0
+    -trunc(128 |t|) - 1 (one's complement), the value 2^e (1 + m / 128) of e = floor(k / 128), m = k - 128 e: the bf16
+    bits k + 16256, below 2^-126 a denormal (the value rounded to nearest on its grid, at most 127 units: 2^-126 (1 -
+    2^-7) at t = -126; 0 from t = -134 on; probed over every bf16 and fp32 inputs)."""
     t = (np.asarray(a, np.float32).view(np.uint32) & 0xFFFF0000).view(np.float32).astype(np.float64)
-    k = np.where(t >= 0, np.floor(128 * t), -np.trunc(128 * -t) - 1)
-    return (((k + 16256).astype(np.int64) & 0xFFFF).astype(np.uint32) << 16).view(np.float32)
+    t = np.clip(np.nan_to_num(t, nan=0.0), -1024.0, 1024.0)  # (beyond the range: garbage anyway)
+    k = np.where(t >= 0, np.floor(128 * t), -np.trunc(128 * -t) - 1).astype(np.int64)
+    normal = ((((k + 16256) & 0xFFFF).astype(np.uint32)) << 16).view(np.float32)
+    e = np.floor_divide(k, 128)
+    den = np.minimum(np.round((128 + k - 128 * e) * np.exp2(np.minimum(e + 126, 0).astype(np.float64))), 127)  # (2^-133)
+    sub = (den.astype(np.uint32) << 16).view(np.float32)
+    return np.where(e >= -126, normal, sub)
+
+
+_VTANH: np.ndarray | None = None  # (load_vtanh)
+
+
+def load_vtanh(table: np.ndarray) -> None:
+    """vtanh (``al::tanh_acc``: a LUT of the argument truncated to bf16, probed) as read on the NPU: its results for
+    every bf16 input, indexed by the input's bits."""
+    global _VTANH
+    _VTANH = np.asarray(table, np.float32)
+
+
+def vtanh(a: np.ndarray) -> np.ndarray:
+    """``al::tanh_acc``: the loaded table (``load_vtanh``) at a truncated to bf16."""
+    if _VTANH is None:
+        raise RuntimeError("kmath_sim.vtanh: no table loaded (load_vtanh)")
+    return _VTANH[(np.asarray(a, np.float32).view(np.uint32) >> 16).astype(np.int64)]
 
 
 def log2e(x: np.ndarray) -> np.ndarray:
@@ -200,6 +225,32 @@ def _silu(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     return mulff(xf, np.where(xf < 0, mulff(t, r), r))
 
 
+def _act(table: kmath.ActTable, x: np.ndarray) -> np.ndarray:
+    """``kmath.act(table)``: t = min(|x|, t_max) (x clamped for a full table), its segment's quadratic plus relu(x)."""
+    x = bf16(x)
+    tm = np.float32(table.t_max)
+    v, r, r2 = table.reduce(np.clip(x, -tm, tm) if table.full else np.minimum(np.abs(x), tm))
+    s = ((v - table.base) / table.seg).astype(np.int64)
+    c0, c1, c2 = (_f32(table.coefficients[s, i]) for i in range(3))
+    acc = mac(mac(c0, c1, r), c2, r2)
+    return bf16(acc if table.full else mac(acc, np.maximum(x, np.float32(0)), 1.0))
+
+
+def _silu_tanh(x: np.ndarray) -> np.ndarray:
+    """``kmath.silu_tanh``: A (vtanh, the chord tail below -3), then B (al::silu_small below |x| = 2.5)."""
+    x = bf16(x)
+    a_acc = mul(x, 0.5)
+    a, t = bf16(a_acc), vtanh(a_acc)
+    body = bf16(mac(a_acc, a, t))
+    a1t = bf16(mac(a_acc, a, -t.astype(np.float64)))
+    tail = bf16(mul(a1t, vexp2(mul(x, bf16(np.float32(1.44269504))))))
+    y = np.where(x < -3, tail, body)
+    s = bf16(mul(bf16(mul(x, 0.5)), bf16(mul(x, 0.5))))
+    acc = mac(mul(x, 0.5), s, 0.99609375)
+    acc = mac(acc, bf16(mul(s, s)), bf16(mac(np.float32(-0.30078125), s, 0.06298828125)))
+    return np.where(np.abs(x) < 2.5, bf16(acc), y)
+
+
 def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     """``fn``'s results for the arguments x."""
     p = fn.params
@@ -214,6 +265,10 @@ def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
         return _exp2_acc(x, p["below"], p["above"], p["shift"])
     if fn.func == "recip":
         return _recip(x, p["domain"], p["steps"])
+    if fn.func == "act":
+        return _act(p["table"], x)
+    if fn.func == "silu_tanh":
+        return _silu_tanh(x)
     models = {"expneg": _expneg, "expm1": _expm1, "sigmoid": _logistic, "softplus": _logistic, "silu": _silu}
     if fn.func in models:
         return models[fn.func](fn, x)
@@ -232,6 +287,10 @@ def exact(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
         "sigmoid": lambda: sig(x),
         "silu": lambda: x * sig(x),
     }
+    if fn.func == "act":
+        return fn.params["table"].f64(x)
+    if fn.func == "silu_tanh":
+        return kmath.silu64(x)
     if fn.func == "exp2":
         p = fn.params
         scale = kmath.CHORD2_SCALE if p["prec"] == "chord2" else 1.0

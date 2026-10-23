@@ -58,7 +58,6 @@ from ml_dtypes import bfloat16
 
 from ...gguf_model import GGUFFile
 from ...model_config import QwenConfig
-from .. import act_lut
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS
 from ..gemm.gemm_q import ChainPart, chained_fill
@@ -134,7 +133,8 @@ _PREP = JINJA_ENV.from_string(r"""
 namespace {
 
 {{ helpers }}
-{{ silu }}
+{% set silu = km.act(km.SILU) %}
+{{ silu.src }}
 // y[t][0 .. 128) = bf16(sum over the taps of w (hi + lo) x) of 8 tokens t: x rows t .. t + 3 of r (pitch 128: the
 // window's 3 rows, then the tokens'), w [tap 4][hi, lo][128]
 __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const bfloat16 *__restrict w,
@@ -223,7 +223,7 @@ template <bool Q>
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
     bfloat16 *__restrict ys = SW(bfloat16, {{ w.ys }});
     {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc);
-    {{ lut }}_silu_lut<{{ 8 * 128 }}>(yc, ys);
+    {{ silu }}<{{ 8 * 128 }}>(yc, ys);
     al::copy<{{ 3 * 128 }}, 32>(r, r + {{ 8 * 128 }});  // (the last 3 tokens: the next block's window)
     {{ p }}_l2rows<Q>(ys, SW(float, {{ w.xf }}));
     {{ p }}_panels(SW(float, {{ w.xf }}), out);
@@ -343,9 +343,9 @@ class GdnPrepOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D, gm=GD.MATH,
                                                            sigmoid=True)
-        return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, silu=act_lut.render_silu(), lut=act_lut.LUT,
-                            w=Attr(self.workspace()), D=D, HC=self.hc, VH=self.vh, T=self.T, PAN=PAN,
-                            KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps), rs=bf16_hilo(1 / math.sqrt(D)))
+        return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, w=Attr(self.workspace()), D=D, HC=self.hc,
+                            VH=self.vh, T=self.T, PAN=PAN, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
+                            rs=bf16_hilo(1 / math.sqrt(D)))
 
     @property
     def jobj(self) -> int:
@@ -465,7 +465,8 @@ _SCAN = JINJA_ENV.from_string(r"""
 
 namespace {
 
-{{ silu }}
+{% set silu = km.act(km.SILU) %}
+{{ silu.src }}
 // y[t][0 .. 32) = bf16(sum over the taps of w (hi + lo) x) of 8 tokens t: x rows t .. t + 3 of r (pitch 32: the
 // window's 3 rows, then the tokens'), w [tap 4][hi, lo][32]
 __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const bfloat16 *__restrict w,
@@ -933,7 +934,7 @@ __attribute__((noinline)) void {{ p }}_vblock(const bfloat16 *__restrict v, int3
     al::copy<256, 32>(r + 96, v);
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
     {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc);
-    {{ lut }}_silu_lut<256>(yc, ys);
+    {{ silu }}<256>(yc, ys);
     al::copy<96, 32>(r, r + 256);
 }
 
@@ -1055,7 +1056,7 @@ class GdnScanOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         strict = sum(1 << (8 * t + s) for t in range(8) for s in range(t))
         lower = sum(1 << (8 * t + s) for t in range(8) for s in range(t + 1))
-        return _SCAN.render(p=self.pfx, silu=act_lut.render_silu(), lut=act_lut.LUT, w=Attr(self.workspace()),
+        return _SCAN.render(p=self.pfx, w=Attr(self.workspace()),
                             PART=PART, PAN=PAN, KP_BYTES=KP_BYTES, strict=f"{strict:016X}", lower=f"{lower:016X}",
                             ablate=self.ablate)
 
@@ -1173,7 +1174,8 @@ class GdnScanOperator(ArtcOperator):
 
 _OUT = JINJA_ENV.from_string(r"""
 namespace {
-{{ silu }}
+{% set silu = km.act(km.SILU) %}
+{{ silu.src }}
 }  // namespace
 
 extern "C" {
@@ -1253,7 +1255,7 @@ void {{ p }}_pair(const bfloat16 *__restrict u, float *__restrict ws, bfloat16 *
     bfloat16 *__restrict zs = (bfloat16 *)(ws + {{ D + 8 * 256 }});  // silu(z) [8][256]
     bfloat16 *__restrict ivt = (bfloat16 *)(ws + {{ D + 8 * 256 + 4 * 256 }});  // [16][hi 32 | lo 32]
     bfloat16 *__restrict nwt = ivt + 1024;  // [{{ D // 32 }}][hi 32 | lo 32]
-    {{ lut }}_silu_lut<{{ OBJ }}>(z, zs);
+    {{ silu }}<{{ OBJ }}>(z, zs);
     for (int i = 0; i < {{ D // 32 }}; i++) {
         const aie::vector<float, 32> w = aie::load_v<32>(nw + 32 * i);
         const aie::vector<bfloat16, 32> h = aie::accum<accfloat, 32>(w).template to_vector<bfloat16>();
@@ -1304,7 +1306,7 @@ class GdnOutOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         p = self.pfx
-        return _OUT.render(p=p, silu=act_lut.render_silu(), lut=act_lut.LUT, D=D, OBJ=self.OBJ, eps=repr(self.cfg.rms_norm_eps))
+        return _OUT.render(p=p, D=D, OBJ=self.OBJ, eps=repr(self.cfg.rms_norm_eps))
 
     def conv_offset(self, n: int) -> int:
         """The ``gdn_conv`` parameter of a chunk of n valid tokens: GC's first element of row n - 3."""

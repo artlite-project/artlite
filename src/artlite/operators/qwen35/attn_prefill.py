@@ -53,7 +53,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ...model_config import QwenConfig
-from .. import act_lut
+from .. import kmath
 from ..base import JINJA_ENV, ArgSpec, ArtcOperator
 from ..design import COLS, range32, stream_walk
 from ..gemm.gemm_q import ChainPart, chained_fill
@@ -127,9 +127,10 @@ _PREP = JINJA_ENV.from_string(r"""
 // The prep cores' workspace (bytes): nrm [q_norm | k_norm] fp32, row (256 fp32), stage [db 32][row 8][8] fp32
 #define PW(T, off) ((T *)((uint8_t *)ws + (off)))
 
-namespace {
+{% set sigmoid = km.table_pass(km.SIGMOID) %}
+{{ sigmoid.src }}
 
-{{ sigmoid }}
+namespace {
 
 // x (256 bf16) -> row = x / rms(x) w (fp32), dims 0 .. 63 rotated by cs [cos 32 | sin 32] (NeoX pairs i, i + 32)
 __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
@@ -221,7 +222,7 @@ void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, flo
 
 // sigmoid(gate) of the 8 tokens in the panel order of the attention's output: per 8 dims db a block [query 8][8] and 8
 // zeros (72 values: the slot's layout of a Q panel pair), sg. The gates clamped to the table's range into the stage
-// (bf16 [8][256]), the table pass in place (act_lut.SIGMOID: within 0.54 bf16 ULP), then the blocks
+// (bf16 [8][256]), the table pass in place (kmath.SIGMOID: within 0.54 bf16 ULP), then the blocks
 void {{ p }}_sg(const bfloat16 *__restrict q, float *__restrict ws, bfloat16 *__restrict sg)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -235,7 +236,7 @@ void {{ p }}_sg(const bfloat16 *__restrict q, float *__restrict ws, bfloat16 *__
         g += {{ 2 * HD }};
         t += {{ HD }};
     }
-    {{ lut }}_sigmoid_tab<{{ 8 * HD }}>(st, st, st, st);
+    {{ sigmoid }}<{{ 8 * HD }}>(st, st, st, st);
     const bfloat16 *__restrict ps = st;
     bfloat16 *__restrict po = sg;
     for (int db = 0; db < {{ ND }}; db++) {
@@ -315,8 +316,7 @@ class AttnPrepOperator(ArtcOperator):
         p = self.pfx
         qs = bf16_hilo(math.log2(math.e) / 16)
         return _PREP.render(p=p, HD=HD, ND=ND, w=Attr(self.workspace()), eps=repr(self.cfg.rms_norm_eps), qs=qs,
-                            AT_REC_K=AT.REC_K, sigmoid=act_lut.SIGMOID.render(), lut=act_lut.LUT,
-                            tmax=repr(act_lut.SIGMOID.t_max))
+                            AT_REC_K=AT.REC_K, tmax=repr(kmath.SIGMOID.t_max))
 
     def kv_job(self, c: int) -> tuple[str, int] | None:
         """Column c's KV core's job: ("k" or "v", the KV head), or None (one every COLS / (2 KV heads) columns)."""

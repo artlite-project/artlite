@@ -119,7 +119,7 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   leave the 512-bit port half used. [measured: v16 vs v32 assembly of the same kernels]
 - The `tanh` / `exp2` intrinsics consume 16-element float vectors (512b of float): for bf16, split into 16-element
   halves, compute, then `concat`. AIE2P has hardware `vtanh` and `vexp2`, both approximate (their errors and the
-  LUT-based replacements: `operators/act_lut.py`, aie-kernel-perf-optimization `reference/numerics.md`).
+  LUT-based replacements: `operators/kmath.py` (`km.act`, `km.table_pass`), aie-kernel-perf-optimization `reference/numerics.md`).
 - BFP16 (`bfp16ebs8`): 8 mantissas share one 8-bit exponent, 9 bytes per 8 elements. [ATB]
 - Block vector types of the NPU2 target model: `v8bfp16ebs8` and `v16bfp16ebs16`.
   [mlir-aie `lib/Dialect/AIE/IR/AIETargetModel.cpp`]

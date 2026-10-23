@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from .. import act_lut
+from .. import kmath
 from ..design import COLS
 from ..overlay.runtime import Transaction
 from ..sd15 import core as K
@@ -707,7 +707,7 @@ def _final_mlp(bd: Builder, w: dict[str, torch.Tensor], name: str, mc: Tensor) -
         bd.apply(a, w["in_g"], w["in_b"], name=f"{name}.in_ln{h}")
     bd.mem.release(rec, ln_rec(l16))
     free(bd, mc)
-    bd.table("gelu_erf", gelu_table(act_lut.GELU_ERF))
+    bd.table("gelu_erf", gelu_table(kmath.GELU_ERF))
     g = alloc(bd, l16, FUP, "pn")
     n3 = FUP // 3  # (3 GEMMs of 5 passes a row: a command's biases reach 14)
     for k in range(3):

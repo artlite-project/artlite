@@ -64,7 +64,7 @@ What took GELU from 622 to 223 cycles per 32 lanes (`km.gelu`; the recipe: numer
 
 **A gather table is often both faster and more accurate**: AIE2P's gather (`load_4x64_lo / hi`, 4 entries of 64 bits
 per instruction) with a quadratic per segment: SiLU 0.59 ULP at 873 cycles per 1024 vs the vtanh form's 6.6 ULP at
-2682 (`operators/act_lut.py`). It costs 32 bytes of L1 per segment (4 copies).
+2682 (`km.act`, `operators/kmath.py`). It costs 32 bytes of L1 per segment (4 copies).
 
 If it still does not pipeline, split it by **loop fission** through an L1 scratch: loop 1 stores the main result,
 loop 2 patches a range in place, each loop walking its own `__restrict` pointers. SiLU with its small-|x| fix: one loop
