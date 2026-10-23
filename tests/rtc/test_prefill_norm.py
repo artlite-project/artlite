@@ -80,6 +80,32 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     assert torch.equal(xb.to_torch().view(T, E), xs.float().bfloat16())
 
 
+@pytest.mark.parametrize("T", [64, 256])
+def test_prefill_norm_pre_pitch(T: int) -> None:
+    """Two norms into one A of 2 E columns (``out_pitch``, ``out_col``: an MTP drafter's eh_proj input [enorm(emb) |
+    hnorm(h)]): a plain one into columns 0 .., ``pre`` into E ..: (x w1) w2 / rms(x w1), x w1 rounded to bf16 (h =
+    the model's output norm of its residual, then the drafter's hnorm); each within the bfp16 panels' rounding."""
+    E = 2048
+    g = torch.Generator().manual_seed(T)
+    e, x = (torch.randn(T, E, generator=g) * 2).bfloat16(), (torch.randn(T, E, generator=g) * 3).bfloat16()
+    we, w1, w2 = ((torch.rand(E, generator=g) + 0.5).bfloat16() for _ in range(3))
+    a = PrefillNormOperator(T=T, add=False, E=E, out_pitch=2 * E, out_col=0).compile()
+    b = PrefillNormOperator(T=T, add=False, E=E, pre=True, out_pitch=2 * E, out_col=E).compile(device=a.device)
+    dev = a.device
+    xn = artlite.empty((T * 2 * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
+    a.dispatch(artlite.from_torch(e.clone().flatten(), dev), artlite.from_torch(we.clone(), dev), xn)
+    b.dispatch(artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(torch.cat([w1, w2]), dev), xn)
+    xn.sync_from_device()
+    both = _from_panels(xn.to_torch(), T, 2 * E).double()
+    ef = e.double()
+    ref_e = ef * torch.rsqrt((ef ** 2).mean(-1, keepdim=True) + 1e-5) * we.double()
+    xw = (x.float() * w1.float()).bfloat16().double()
+    ref_h = xw * torch.rsqrt((xw ** 2).mean(-1, keepdim=True) + 1e-5) * w2.double()
+    for got, ref in ((both[:, :E], ref_e), (both[:, E:], ref_h)):
+        rel = ((got - ref).norm() / ref.norm()).item()
+        assert rel < 1e-2, rel
+
+
 # (T, E, d_pitch, cols, rows, deltas): Llama's and qwen35's projections in K parts
 DELTAS = [(64, 5120, 660, 4, 96, 2), (256, 4096, 528, 8, 256, 2), (64, 4096, 0, 2, 64, 2),
           (1024, 3072, 396, 8, 1024, 2), (2048, 4096, 528, 8, 2048, 2), (512, 2048, 264, 8, 512, 2),

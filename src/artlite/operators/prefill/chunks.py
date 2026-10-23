@@ -134,7 +134,7 @@ class ChunkPrefill:
         """The sizes of the prefill's own buffers (``own``: the largest reference of any size's runlist, then the
         model's ``_own_sizes``), in 4 KB."""
         own: dict[str, int] = {}
-        ovb = {"W", *self.ov.sizes}
+        ovb = {"W", *self.ov.sizes, *self._external()}
         for rl in self.runlists.values():
             for op, *bufs in rl:
                 for i, b in enumerate(bufs):
@@ -148,6 +148,14 @@ class ChunkPrefill:
 
     def _own_sizes(self, own: dict[str, int]) -> None:
         """The model's changes to the sizes of its own buffers (in place)."""
+
+    def _external(self) -> set[str]:
+        """Names of buffers the items address beyond the overlay's and the prefill's own (``_buffers``)."""
+        return set()
+
+    def _buffers(self) -> dict[str, Any]:
+        """The device buffers the items address by name: the overlay's (the prefill's own among them)."""
+        return self.ov.dev.buffers
 
     def bind(self) -> ChunkPrefill:
         """Allocate the prefill's buffers on the (loaded) overlay's device, write the static ones."""
@@ -166,7 +174,7 @@ class ChunkPrefill:
     def _program(self, T: int) -> list[tuple[int, list[int]]]:
         """The items of a chunk's program: (library entry, device addresses of its arguments' slices)."""
         if T not in self._items:
-            self._items[T] = self.lib.items(self.runlists[T], self.ov.dev.buffers)
+            self._items[T] = self.lib.items(self.runlists[T], self._buffers())
         return self._items[T]
 
     # ------------------------------------------------------------------
@@ -229,7 +237,7 @@ class ChunkPrefill:
         self.lib.set_params(params)
         self.ov.ready()
         self.dispatches = self.lib.run(self._program(T), splits=[*self._splits(T, p0), *(hooks or {})],
-                                       bufs=list(self.ov.dev.buffers.values()), hooks=hooks)
+                                       bufs=list(self._buffers().values()), hooks=hooks)
         self.ov.vring.from_prefill.update(self.kv_layers)
 
     # ------------------------------------------------------------------

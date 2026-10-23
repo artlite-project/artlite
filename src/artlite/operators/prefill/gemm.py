@@ -42,9 +42,9 @@ from ..util import arg_bytes
 
 MAX_CHAIN_BDS = 14  # shim BDs of a GEMM's chained weight fill (Llama-3.1-8B's down, 14 chunks, the largest built)
 ROWS = 64  # rows of a tile-major pass (gemm_q: 4 tiles of 16 rows, 8 BFP16 tiles of 8)
-OUT = {"gdn_out", "attn_out", "down", "o", "proj"}  # projections into the residual stream
+OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh"}  # projections into the residual stream (eh: an MTP drafter's)
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
-         "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o"}
+         "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o"}
 
 
 @dataclass(frozen=True)

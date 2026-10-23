@@ -1,7 +1,8 @@
 """The multi-token-prediction drafter of Qwen3.6-35B-A3B (``qwen35.draft.QwenDraft``, the Q4_0 MTP file) on the decode
 overlay of a 2-layer slice (layers 0 and 3: the model's design, its formats with the drafter's), against
 ``qwen35_ref.mtp_block`` on llama.cpp's hidden states of an essay (golden(mtp=): the rows' h and the drafter file's
-token embeddings): per row the next draft's h and the head's logits, in steps of S rows from position 0."""
+token embeddings): per row the next draft's h and the head's logits, in steps of S rows from position 0. The prompt's
+records (``QwenPrefill(draft=)``, ``draft_prefill``) against those of drafter steps from the same inputs."""
 
 import os
 
@@ -13,6 +14,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.operators.qwen35.draft import QwenDraft
 from artlite.operators.qwen35.overlay import QwenOverlay
+from artlite.operators.qwen35.prefill import QwenPrefill
 
 from . import qwen35_ref as ref
 from .common import essay
@@ -61,3 +63,43 @@ def test_draft_steps(setup: tuple, S: int) -> None:
     top2 = np.sort(r["logits"], -1)[:, -2:]
     clear = (top2[:, 1] - top2[:, 0] > 0.1) & ~tied
     assert (lg.argmax(-1) == r["logits"].argmax(-1))[clear].all()
+
+
+def test_draft_prefill() -> None:
+    """Three 256-token chunks of an essay through the slice's prefill with the drafter's records (the carry between
+    chunks: the last row's h), then the drafter's step at the next position; the same step after drafter steps of 4
+    rows wrote the records from the same inputs (the embeddings, the model's h of the prefill's output rows): within
+    1% rms (h ~0.67%, logits ~0.69%: bfp16 vs bf16 roundings of the records' inputs), the same argmax."""
+    mtp = qwen_mtp_of(MODEL) if os.path.exists(MODEL) else None
+    if mtp is None:
+        pytest.skip("no Qwen3.6-35B-A3B model file or MTP drafter")
+    T, nch = 256, 3
+    g = GGUFFile(MODEL)
+    target = QwenOverlay(g, layers=[0, 3], vocab=4096, max_positions=4096, formats=("Q4_0",))
+    draft = QwenDraft(target, GGUFFile(mtp))
+    pf = QwenPrefill(target, sizes=(T,), draft=draft)
+    pf.compile()
+    target.load()
+    draft.load()
+    pf.bind()
+    n = T * nch
+    emb = g.rows("token_embd.weight", ref.llama_tokenize(MODEL, essay("apple.txt"))[:n + 1]).float()
+    target.rope[:n + 4] = np.arange(n + 4)[:, None]
+    xs = []
+    for c in range(nch):
+        pf.run(emb[c * T:(c + 1) * T], c * T, T)
+        xs.append(pf.hidden(0, T))
+    x = torch.cat(xs)
+    h = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + target.cfg.rms_norm_eps) * torch.from_numpy(
+        target._f32("output_norm.weight"))
+    hp = torch.cat([torch.zeros(1, draft.H), h])  # (row q: the model's h of q - 1)
+    a = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
+    ha = draft.hidden_state(0).numpy()
+    draft.reset()
+    for p in range(0, n, 4):
+        draft.step(emb[p:p + 4], hp[p:p + 4], p)
+    b = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
+    hb = draft.hidden_state(0).numpy()
+    for u, v in ((ha, hb), (a, b)):
+        assert np.sqrt(((u - v) ** 2).mean() / (v ** 2).mean()) < 1e-2
+    assert a.argmax() == b.argmax()

@@ -128,6 +128,33 @@ void {{ p }}_a(const bfloat16 *__restrict x, const bfloat16 *__restrict d, bfloa
 }
 
 // the same without the residual add
+{% if pre %}
+// pass A without a delta, its rms over x w1 (``pre``): g[t][256 kc + j] = x w1 (bf16), ss[t][32 lanes] += its squares
+void {{ p }}_a0p(const bfloat16 *__restrict x, bfloat16 *__restrict g, const bfloat16 *__restrict w1, float *__restrict ss,
+                 int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int t = 0; t < 8; t++) {
+        const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)(x + {{ C }} * t);
+        const bfloat16 __aie_dm_resource_b *__restrict pw = (const bfloat16 __aie_dm_resource_b *)(w1 + {{ C }} * kc);
+        bfloat16 *__restrict pg = g + {{ E }} * t + {{ C }} * kc;
+        aie::accum<accfloat, 32> acc(aie::load_v<32>(ss + 32 * t));
+        if (kc == 0)
+            acc = aie::zeros<accfloat, 32>();
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < {{ C // 32 }}; j++) {
+            const aie::vector<bfloat16, 32> v = aie::mul(aie::load_v<32>(px), aie::load_v<32>(pw)).template to_vector<bfloat16>();
+            px += 32;
+            pw += 32;
+            aie::store_v(pg, v);
+            pg += 32;
+            acc = aie::mac_square(acc, v);
+        }
+        aie::store_v(ss + 32 * t, acc.template to_vector<float>());
+    }
+}
+
+{% endif %}
 void {{ p }}_a0(const bfloat16 *__restrict x, bfloat16 *__restrict g, float *__restrict ss, int32_t kc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -456,13 +483,16 @@ class PrefillNormOperator(ArtcOperator):
     p = kernel_prefix("pn")
 
     def __init__(self, *, T: int, add: bool = True, E: int = 2048, eps: float = 1e-5, d_pitch: int = 0,
-                 cols: int = COLS, deltas: int = 1, d_stride: int = 0, lo: bool = False):
+                 cols: int = COLS, deltas: int = 1, d_stride: int = 0, lo: bool = False, pre: bool = False,
+                 out_pitch: int = 0, out_col: int = 0):
         """cols: cores (one per column) taking the token groups in turn: few for short prompts, where the
         op's reconfiguration costs more than its work. deltas = 2 (replay mode): x += d + d2 (a projection in two
         K parts: summed in fp32, rounded once), both at d_pitch, d2 ``d_stride`` elements after d
         in the delta argument (default T 8 d_pitch; e.g. the C size of a GEMM that pads the tokens). lo: xn as
         hi + lo panels (an MoE router's x), panels of 2 E columns: per token group [bfp16(v) | bfp16(v - bfp16(v))]
-        (one delta, E <= 2048)."""
+        (one delta, E <= 2048). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
+        norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
+        panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them)."""
         assert T % (8 * cols) == 0 and T > 0 and E % 1024 == 0 and 1 <= cols <= COLS
         self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
@@ -480,6 +510,11 @@ class PrefillNormOperator(ArtcOperator):
         self.ch = min(CH, E // 8)  # (columns per chunk)
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
         assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
+        self.pre = pre
+        self.out_pitch, self.out_col = out_pitch or E, out_col
+        assert not pre or not add, "pre: a norm without a delta"
+        assert (self.out_pitch, out_col) == (E, 0) or not (lo or self.replay or self.hold) and (
+            out_col % 8 == 0 and out_col + E <= self.out_pitch), (out_pitch, out_col)
         super().__init__()
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -489,17 +524,17 @@ class PrefillNormOperator(ArtcOperator):
         if self.add:  # (two deltas: one argument, [delta | delta2])
             specs.append(ArgSpec("in", ((self.deltas - 1) * self.d_stride + self.T * COLS * self.d_pitch,),
                                  torch.bfloat16))
-        specs.append(ArgSpec("in", (EMB,), torch.bfloat16))
+        specs.append(ArgSpec("in", ((2 if self.pre else 1) * EMB,), torch.bfloat16))
         if self.add:
             specs.append(ArgSpec("out", (n,), torch.bfloat16))
-        specs.append(ArgSpec("out", ((2 if self.lo else 1) * n * 9 // 16,), torch.bfloat16))
+        specs.append(ArgSpec("out", ((2 if self.lo else 1) * self.T * self.out_pitch * 9 // 16,), torch.bfloat16))
         return specs
 
     def get_kernel_src(self) -> str:
         if self.hold:
             return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
         # (the same source for add and no add: one copy in a fused ELF)
-        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo)
+        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo, pre=self.pre)
 
     def get_mlir_artifact(self) -> Module:
         if self.hold:
@@ -520,8 +555,10 @@ class PrefillNormOperator(ArtcOperator):
         E = EMB
         k_w = Kernel(f"{p}_w", "kernel.o", [chunk_ty, w_ty])
         k_a = (Kernel(f"{p}_a", "kernel.o", [chunk_ty, chunk_ty, grp_ty, st_ty, np.int32]) if add else
+               Kernel(f"{p}_a0p", "kernel.o", [chunk_ty, grp_ty, w_ty, st_ty, np.int32]) if self.pre else
                Kernel(f"{p}_a0", "kernel.o", [chunk_ty, grp_ty, st_ty, np.int32]))
         k_b = Kernel(f"{p}_bl" if self.lo else f"{p}_b", "kernel.o", [grp_ty, w_ty, st_ty, pan_ty, np.int32])
+        pre, P, col = self.pre, self.out_pitch, self.out_col
 
         xf = [ObjectFifo(chunk_ty, name=f"pn_x{c}", depth=2) for c in range(self.cols)]
         df = [ObjectFifo(chunk_ty, name=f"pn_d{c}", depth=2) for c in range(self.cols)] if add else []
@@ -531,9 +568,15 @@ class PrefillNormOperator(ArtcOperator):
         def core(x_f, p_f, kw, ka, kb, wb, st, *rest):
             if add:
                 d_f, o_f = rest
+            elif pre:
+                gb, w1 = rest
             else:
                 (gb,) = rest
             for _ in forever_():
+                if pre:  # (pre: w1, then w2)
+                    w = x_f.acquire(1)
+                    kw(w, w1)
+                    x_f.release(1)
                 w = x_f.acquire(1)
                 kw(w, wb)
                 x_f.release(1)
@@ -545,6 +588,8 @@ class PrefillNormOperator(ArtcOperator):
                             d = d_f.acquire(1)
                             ka(x, d, g, st, kc)
                             d_f.release(1)
+                        elif pre:
+                            ka(x, g, w1, st, kc)
                         else:
                             ka(x, g, st, kc)
                         x_f.release(1)
@@ -560,6 +605,7 @@ class PrefillNormOperator(ArtcOperator):
             args = [xf[c].cons(), pf[c].prod(), k_w, k_a, k_b, Buffer(w_ty, name=f"pn_w{c}"),
                     Buffer(st_ty, name=f"pn_st{c}")]
             args += [df[c].cons(), of[c].prod()] if add else [Buffer(grp_ty, name=f"pn_g{c}")]
+            args += [Buffer(w_ty, name=f"pn_w1{c}")] if pre else []
             workers.append(Worker(core, args, tile=Tile(c, 2), stack_size=self.STACK, while_true=False))
 
         n = T * E
@@ -587,7 +633,8 @@ class PrefillNormOperator(ArtcOperator):
             tg = TaskGroup()
             for c in range(self.cols):
                 # (a shim BD's inner dimension is <= 1023 words: rows of <= 512 words below)
-                xh[c].fill(w, TensorAccessPattern((E,), 0, [1, 1, E // 1024, 1024], [0, 0, 1024, 1]), group=tg)
+                nw = (2 if pre else 1) * E
+                xh[c].fill(w, TensorAccessPattern((nw,), 0, [1, 1, nw // 1024, 1024], [0, 0, 1024, 1]), group=tg)
                 xh[c].fill(x, grp(c), group=tg)
                 if add:
                     dh[c].fill(d, dgrp(c), group=tg)
@@ -599,14 +646,15 @@ class PrefillNormOperator(ArtcOperator):
                                                         [self.cols * (E // 4) * 36, E // 64 * 36, E // 8 * 36, 1]),
                                 group=tg, wait=True)
                     continue
-                ph[c].drain(xn, TensorAccessPattern((n * 9 // 16,), c * (E // 8) * 36,
-                                                    [1, n_g, 8, E // 64 * 36], [0, self.cols * (E // 8) * 36, E // 64 * 36, 1]),
+                ph[c].drain(xn, TensorAccessPattern((T * P * 9 // 16,), (c * (P // 8) + col // 8) * 36,
+                                                    [1, n_g, 8, E // 64 * 36], [0, self.cols * (P // 8) * 36, E // 64 * 36, 1]),
                             group=tg, wait=True)
             tg.finish()
 
         vt = np.ndarray[(n,), bf]
-        types = [vt] + ([np.ndarray[(nd,), bf]] if add else []) + [np.ndarray[(E,), bf]] + ([vt] if add else [])
-        types.append(np.ndarray[((2 if self.lo else 1) * n * 9 // 16,), bf])
+        types = [vt] + ([np.ndarray[(nd,), bf]] if add else []) + [np.ndarray[((2 if pre else 1) * E,), bf]]
+        types += [vt] if add else []
+        types.append(np.ndarray[((2 if self.lo else 1) * T * P * 9 // 16,), bf])
         rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
