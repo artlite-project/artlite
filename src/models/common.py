@@ -231,7 +231,7 @@ class NpuModel:
     dispatches = 0
 
     def prepare(self, prompt_len: int) -> None:
-        """Compile what a prompt of ``prompt_len`` tokens needs (before it is timed)."""
+        """Compile and open what a prompt of ``prompt_len`` tokens needs (before it is timed)."""
 
     def describe(self) -> str:
         """What the model holds in memory (weights, caches)."""
@@ -308,6 +308,13 @@ class OverlayModel(NpuModel):
     @functools.cached_property
     def _pool(self) -> ThreadPoolExecutor:
         return ThreadPoolExecutor(1)  # (a prompt chunk's inputs while the previous chunk runs)
+
+    def prepare(self, prompt_len: int) -> None:
+        """(the overlay's and the prefill's hardware contexts, the prefill's piece BOs and its chunks' items: else the
+        first prompt of a process pays them, ~50 ms, most of it the first context waking the NPU)"""
+        self.overlay.dev.open()
+        if self.prefill is not None:
+            self.prefill.prepare(self.position, prompt_len)
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
         """The overlay step's arguments before the position for the tokens (their embeddings, ...)."""

@@ -14,8 +14,8 @@ A prompt runs in chunks of up to 2048 tokens through the prefill (``artlite.oper
 layer-major, control code assembled per chunk from one library ELF; the GEMMs read the same weight image, the chunk's K /
 V, GDN states and conv states land in the decode's buffers), each chunk in pieces of a few layers (dispatches of one HW
 context); its last token's logits come from the LM head alone (``QwenOverlay.logits_of``). Tokens where a chunk cannot
-start (a position inside a 32-position cache group, after a generated reply; fewer than 3 tokens left) run as decode
-steps of up to 4 tokens. An MoE model's chunk routes its tokens on the host between the router and the experts
+start (a position inside a 32-position cache group, after a generated reply), and a prompt's last 4 or fewer, run as
+decode steps of up to 4 tokens. An MoE model's chunk routes its tokens on the host between the router and the experts
 (``artlite.operators.moe.prefill``).
 
 Multi-token prediction (a qwen35moe model with its MTP drafter, ``model_config.qwen_mtp_of``:
@@ -108,8 +108,9 @@ class NpuQwen(OverlayModel):
         return self.overlay.max_positions
 
     def prepare(self, prompt_len: int) -> None:
-        """(with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
+        """(also, with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
         drafter's: 1.3 s on the 35B-A3B; else, and without ``prepare``, each is built at its first use)"""
+        super().prepare(prompt_len)
         if not self._drafting:
             return
         for S in range(1, self.DRAFTS + 2):

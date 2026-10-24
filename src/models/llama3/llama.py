@@ -10,7 +10,8 @@ A prompt runs in chunks of up to 4096 tokens (8B: 2048) through the prefill
 (``artlite.operators.llama.prefill.LlamaPrefill``: layer-major, control code assembled per chunk from one library ELF;
 the GEMMs read the same weight image, the chunk's K / V land in the decode's caches), each chunk in pieces of a few
 layers; its last token's logits come from the LM head alone. Tokens where a chunk cannot start (inside a cache group of
-64 positions at head_dim 128, 128 at 64: after a generated reply) run as decode steps of up to 4 tokens.
+64 positions at head_dim 128, 128 at 64: after a generated reply), and a prompt's last 4 or fewer, run as decode steps
+of up to 4 tokens.
 
 The KV caches hold K as one bfp16 block per 8 dims (``kv_k="single"``, the default: 18 / 64.5 / 73.7 KB per position
 for 1B / 3B / 8B) or as hi + lo blocks ("hilo": +50% of the caches' bytes, and of their read time at long contexts).

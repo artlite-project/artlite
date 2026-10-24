@@ -60,8 +60,8 @@ artlite-cli -m MODEL.gguf -f OUT_DIR/prompt32768.txt -n 256 --greedy > /dev/null
 
 The stderr line `prompt: ... generation: N tokens in T s (R tokens/s): D dispatches of X ms ...` gives R. If the
 model stops early (N well below 256, an end-of-sequence token), say so next to the number. The prompt's speed on that
-line cross-checks step 1 (TTFT there excludes tokenization, as in step 1), less the ~1 s a process's first prompt
-spends loading the prefill's library ELF (`Library.load`), which artlite-bench's warmup absorbs.
+line cross-checks step 1 (TTFT there excludes tokenization, as in step 1), less the ~5-10 ms a process's first prompt
+spends assembling its chunks' control code, which artlite-bench's warmup absorbs.
 
 ## 4. MTP: the best S
 

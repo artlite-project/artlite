@@ -148,6 +148,13 @@ class Library(FusedElf):
             bo.sync_to_device()
             self._dispatch_bufs.append(bo)
 
+    def prepare(self) -> None:
+        """The hardware context and the process's piece BOs now (else at the first run): before a timed run, as the
+        first context of a process wakes the NPU (~40 ms) and the BOs take ~8 ms."""
+        self._kernel()
+        with _PIECES.lock:
+            _PIECES.ensure(self._device)
+
     def run(self, items: Sequence[Item], *, splits: Iterable[int] = (), bufs: Sequence[Any],
             hooks: Mapping[int, Callable[[], None]] | None = None) -> int:
         """Dispatch the program of ``items`` (``items()``; consecutive items of one design share its configuration): a

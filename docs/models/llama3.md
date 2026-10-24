@@ -37,7 +37,7 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 - Prompts run through the prefill (`artlite.operators.llama.prefill`): chunks of up to 4096 tokens (8B: 2048), layer-major
   programs assembled from one library ELF (GEMMs on the decode's weight image, the bf16 residual stream, a flash
   attention writing the decode's KV caches); short prompts in chunks of 64 / 128 tokens (1B: 128). Tokens where a chunk cannot
-  start (inside a cache group: after a reply) run as decode steps of up to 4 tokens.
+  start (inside a cache group: after a reply), and a prompt's last 4 or fewer, run as decode steps of up to 4 tokens.
 - The KV cache (`-c`, up to the model's 131072 positions) holds K and V in bfp16ebs8: 18 KB per position for 1B,
   64.5 / 73.7 KB for 3B / 8B (2.4 / 8.5 / 9.7 GB at 128K). `--kv-k hilo` stores K as bfp16 hi + lo blocks: 1.5x the
   cache and its read time at long contexts, with no measured quality gain for Llama.

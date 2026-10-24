@@ -12,8 +12,8 @@ in pieces of whole layers (dispatches of one HW context), each well within the d
 
 Chunks start at multiples of ``group`` positions (whole cache groups: ``GROUP``, or a model's own, Llama's 64 / 128);
 ``plan`` covers a prompt with full chunks of the largest size that fits, then the tail with the sizes of the least
-estimated time. The padding tokens after a chunk's valid ones write cache records that later tokens overwrite (masked
-until then).
+estimated time, but a prompt's last few tokens (a decode step's SLOTS at most) for one decode step. The padding tokens
+after a chunk's valid ones write cache records that later tokens overwrite (masked until then).
 
 A model's prefill supplies its runlist per sub-chunk count (``_runlist``, built with ``_sl`` / ``_tok``; chunk sizes below
 SUB, ``SMALL``: one sub-chunk of operators of their own size, ``_runlist_of``), the bytes per token of its own buffers
@@ -188,6 +188,13 @@ class ChunkPrefill:
         self.lib.load()
         return self
 
+    def prepare(self, p0: int, n: int) -> None:
+        """Before a prompt of n tokens at p0 is timed: the library's hardware context and piece BOs, the items of the
+        plan's chunks (else the first chunk's)."""
+        self.lib.prepare()
+        for T in set(self.plan(p0, n)):
+            self._program(T)
+
     def fits(self, T: int, p0: int) -> bool:
         """Whether a chunk of size T may start at p0: inside the caches, within the budget (``_fits_budget``)."""
         return p0 % self.group == 0 and p0 + T <= self.ov.max_positions and self._fits_budget(T, p0)
@@ -198,10 +205,11 @@ class ChunkPrefill:
 
     def plan(self, p0: int, n: int) -> list[int]:
         """The chunk sizes (in order) that run the first tokens of n from position p0: full chunks of the largest size
-        that fits, then the tail as the sizes of the least estimated time; tokens left (fewer than ``MIN_TOKENS``, or
-        no size fits) are for decode steps."""
+        that fits, then the tail as the sizes of the least estimated time; tokens left (the overlay's SLOTS at most:
+        one decode step, which streams the weights once as a chunk does, without its ConfigureOps and the LM head's
+        dispatch; fewer than ``MIN_TOKENS``; or no size fits) are for decode steps."""
         out: list[int] = []
-        while n >= self.MIN_TOKENS:
+        while n >= max(self.MIN_TOKENS, self.ov.SLOTS + 1):
             ok = [T for T in self.sizes if self.fits(T, p0)]
             if not ok:
                 break
@@ -216,8 +224,6 @@ class ChunkPrefill:
                     best[k] = min((cost[T] + best[max(0, k - T // unit)][0], T) for T in ok)
                 T = best[u][1]
             m = min(T, n)
-            if m < self.MIN_TOKENS:
-                break
             out.append(T)
             p0, n = p0 + m, n - m
         return out

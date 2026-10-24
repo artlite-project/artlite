@@ -45,7 +45,7 @@ layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through
 the prefill GEMMs, which read the same weight image, the Gated DeltaNet scan and the flash attention. A chunk's K / V,
 GDN states and conv states land in the decode's buffers; a chunk runs as dispatches of whole layers, each within the
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
-(inside a 32-position cache group, e.g. after a generated reply; fewer than 3 left) run as decode steps.
+(inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
 Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's,
 21.02 GB of the 35B-A3B's, and 0.56 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at

@@ -289,6 +289,11 @@ class OverlayDevice:
         self._prologue = Transaction(self, words)
         self.stale = True
 
+    def open(self) -> None:
+        """The hardware context now (else at the first dispatch): before a timed dispatch, as the first context of a
+        process wakes the NPU (~40 ms)."""
+        self._prog._kernel()
+
     def _fresh(self) -> None:
         if self.stale and self._prologue is not None:
             self.stale = False
