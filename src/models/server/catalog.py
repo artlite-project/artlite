@@ -96,7 +96,7 @@ def header(path: str) -> dict[str, Any]:
     return {"arch": arch, "n_ctx_train": int(meta.get(f"{arch}.context_length", 0)),
             "n_embd": int(meta.get(f"{arch}.embedding_length", 0)),
             "n_vocab": g.string_count("tokenizer.ggml.tokens") if "tokenizer.ggml.tokens" in g._string_arrays else 0,
-            "n_params": sum(math.prod(dims) for dims, _, _, _ in tensors), "size": sum(n for _, _, _, n in tensors),
+            "n_params": sum(math.prod(dims) for dims, _, _, _ in tensors), "size": sum(n or 0 for _, _, _, n in tensors),
             "ftype": file_type_name(meta.get("general.file_type")),
             "size_label": str(meta.get("general.size_label", "")),
             "unsupported": sorted({t for dims, t, _, _ in tensors if len(dims) >= 2 and t != "F32"
@@ -297,7 +297,7 @@ class Catalog:
         for path in self.files() if os.path.isdir(self.models_dir) else []:
             rel = self.rel(path)
             stem = os.path.basename(path).removesuffix(".gguf")
-            if stem.startswith(DRAFTERS):
+            if stem.startswith(DRAFTERS) or "-mtp-" in stem:  # (an uploader's prefixed drafter: occamy-1.0-mtp-Q8_0)
                 continue
             if m := SPLIT.search(stem):
                 if m[1] == "00001":
@@ -305,7 +305,7 @@ class Catalog:
                 continue
             try:
                 h = self._header(path)
-            except (OSError, ValueError, AssertionError, KeyError) as e:
+            except (OSError, ValueError, AssertionError, KeyError, NotImplementedError) as e:
                 self._skip(rel, e)
                 continue
             if h["arch"] == "clip":

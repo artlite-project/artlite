@@ -600,7 +600,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       },
       "qtype"_a, "raw"_a, "out"_a,
       nb::sig("def dequant_rows(qtype: str, raw: numpy.ndarray[numpy.uint8], out: numpy.ndarray[numpy.float32]) -> None"),
-      "GGUF rows (raw: (n, row bytes) of a Q4_0, Q4_K or Q6_K tensor's blocks) dequantized into out (n, cols) fp32, "
+      "GGUF rows (raw: (n, row bytes) of a Q4_0, Q4_K, Q6_K or Q3_K tensor's blocks) dequantized into out (n, cols) fp32, "
       "its first cols columns: the values of gguf_model.QTensor.dequantize (its fp32 operations in their order).");
   m.def(
       "dequant_supported", [](std::string qtype) { return artlite::dequant_supported(qtype); }, "qtype"_a,

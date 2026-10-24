@@ -20,12 +20,13 @@ from . import mmv
 
 # per GGUF block: (columns, bytes, the offsets of its fp16 fields)
 BLOCK = {"Q4_0": (32, 18, (0,)), "Q4_1": (32, 20, (0, 2)), "Q8_0": (32, 34, (0,)), "Q4_K": (256, 144, (0, 2)),
-         "Q5_K": (256, 176, (0, 2)), "Q6_K": (256, 210, (208,)), "Q2_K": (256, 84, (80, 82)), "Q3_K": (256, 110, (108,))}
+         "Q5_K": (256, 176, (0, 2)), "Q6_K": (256, 210, (208,)), "Q2_K": (256, 84, (80, 82)), "Q3_K": (256, 110, (108,)),
+         "IQ3_XXS": (256, 98, (0,))}
 # (GGUF type, tile bytes, super-blocks per tile) the packer is checked at: Gemma's 512-column tiles, Llama's and Qwen's
 # 1024 (the tile sizes of the images that hold them)
 PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_0", 9280, 4),
         ("Q4_1", 9280, 4), ("Q4_1", 10240, 4), ("Q2_K", 9408, 4), ("Q3_K", 9408, 4), ("Q3_K", 9856, 4), ("BF16", 9216, 4),
-        ("F16", 9216, 4)]
+        ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4)]
 
 
 def _random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:
@@ -69,7 +70,8 @@ def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
 
 
 # (GGUF type, tile bytes, rows per tile row G): an MoE's downs (K 256 and 512 in tiles of 1024 columns)
-GROUPS = [("Q4_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_K", 9280, 2), ("Q6_K", 9280, 2)]
+GROUPS = [("Q4_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_K", 9280, 2), ("Q6_K", 9280, 2), ("Q3_K", 9280, 4),
+          ("IQ3_XXS", 9280, 4), ("Q5_K", 9280, 2)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "G"), GROUPS, ids=[f"{f}-G{g}" for f, _, g in GROUPS])

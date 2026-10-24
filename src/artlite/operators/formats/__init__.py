@@ -2,7 +2,8 @@
 slots.
 
 A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
-(of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0, decode only); ``k23``: their shared parts, a slot without formats)
+(of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0, decode only), ``iq3`` (IQ3_XXS); ``k23``: their shared parts, a slot
+without formats)
 holds for its formats the ``TileFormat`` records (tile geometry), the host-side packing (a lossless re-layout of the
 GGUF fields; only fp16 -> bf16 scales change, BFP16 rounds bf16 weights once), the kernel-source fragments of the
 prefill GEMMs (``gemm/<fmt>``: ``gemm_q``, ``gemm_qd``) and of the decode GEMV (``mmv/<fmt>``: ``overlay.gemv``, which
@@ -25,14 +26,15 @@ import math
 import numpy as np
 from jinja2 import FunctionLoader, Template
 
-from . import bf16, common, k23, q2k, q3k, q4, q4k, q5k, q6k, q8
+from . import bf16, common, iq3, k23, q2k, q3k, q4, q4k, q5k, q6k, q8
 from .common import KC, KT, SB, DqKernels, Slot, TileFormat
 
 __all__ = ["FORMATS", "KC", "KT", "SB", "SLOTS", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
            "has_tile_format", "kernel_template", "pack_tile", "slice_fields", "slot", "tile_format"]
 
 # the slots
-SLOTS: tuple[Slot, ...] = (q4.SLOT, bf16.SLOT, q4k.SLOT, q5k.SLOT, q6k.SLOT, k23.SLOT, q2k.SLOT, q3k.SLOT, q8.SLOT)
+SLOTS: tuple[Slot, ...] = (q4.SLOT, bf16.SLOT, q4k.SLOT, q5k.SLOT, q6k.SLOT, k23.SLOT, q2k.SLOT, q3k.SLOT, q8.SLOT,
+                           iq3.SLOT)
 
 FORMATS: dict[str, TileFormat] = {f.name: f for f in sorted((f for s in SLOTS for f in s.formats), key=lambda f: f.fid)}
 _SLOT_OF = {f.name: s for s in SLOTS for f in s.formats}

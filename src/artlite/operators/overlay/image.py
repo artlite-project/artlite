@@ -204,7 +204,8 @@ class TileImage:
         blocks = []
         for bname, tensors, rows in parts:
             fmts = {self.fmt(t) for t in tensors}
-            assert len(fmts) == 1, f"{tensors}: one tile format per block ({fmts})"
+            if len(fmts) > 1:
+                raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(fmts)}")
             fmt = fmts.pop()
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)

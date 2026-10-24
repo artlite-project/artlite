@@ -65,6 +65,13 @@ def qwen_gguf(quant: str = "Q4_K_M", size: str = "27B") -> str:
     return os.path.join(MODELS_DIR, "lmstudio-community", f"{name}-GGUF", f"{name}-{quant}.gguf")
 
 
+def occamy_gguf() -> str:
+    """IsValorum's Occamy 1.0 (Accio-Lab's fine-tune of Qwen3.6-35B-A3B, abliterated) in its APEX-I-MiniPlus V2.1
+    quantization (GGUF architecture ``qwen35moe``: IQ3_XXS and Q3_K experts, Q3_K, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
+    return os.path.join(MODELS_DIR, "IsValorum", "Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF",
+                        "Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf")
+
+
 def minicpmv_gguf(quant: str = "Q4_K_M") -> str:
     """A file of openbmb's MiniCPM-V 4.7 1B GGUF repository: the language model of a quantization (GGUF architecture
     ``qwen35``)."""
@@ -89,8 +96,8 @@ MTP_QUANTS = ("Q4_0", "Q8_0")  # (a qwen35 drafter file by preference: Artlite's
 
 
 def qwen_mtp_of(model: str) -> str | None:
-    """The multi-token-prediction drafter (``mtp-*.gguf``) of a qwen35 / qwen35moe model file without a block of its
-    own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
+    """The multi-token-prediction drafter (``mtp-*.gguf``, or an uploader's ``<name>-mtp-*.gguf``) of a qwen35 /
+    qwen35moe model file without a block of its own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
     the drafters apart from other uploaders' models); of several, the first of ``MTP_QUANTS``. None: there is none."""
     d = os.path.dirname(os.path.abspath(model))
     root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d)
@@ -100,7 +107,7 @@ def qwen_mtp_of(model: str) -> str | None:
         return next((i for i, q in enumerate(MTP_QUANTS) if f.endswith(f"-{q}.gguf")), len(MTP_QUANTS))
 
     for x in dict.fromkeys([d, *others]):
-        files = [f for f in os.listdir(x) if f.startswith("mtp-") and f.endswith(".gguf")]
+        files = [f for f in os.listdir(x) if (f.startswith("mtp-") or "-mtp-" in f) and f.endswith(".gguf")]
         if files:
             return os.path.join(x, min(sorted(files), key=rank))
     return None

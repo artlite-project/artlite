@@ -71,6 +71,21 @@ void q6_k(const uint8_t* b, float* o) {
     }
 }
 
+// Q3_K (110 B per 256): w = (d sc_j) (q - 4), j = the 16-value sub-block; value 128 n + 32 j + 16 h + l: crumb j of
+// qs[32 n + 16 h + l], high bit 4 n + j of hmask[16 h + l]; the 6-bit scales sc + 32: low nibbles of bytes 0 .. 7
+// (scales 0 .. 7) then their high nibbles, the high crumbs of scale 4 k + i in bits 2 k of byte 8 + i
+void q3_k(const uint8_t* b, float* o) {
+  const uint8_t *hm = b, *qs = b + 32, *s = b + 96;
+  const float d = f16(b + 108);
+  for (int e = 0; e < 256; e++) {
+    const int n = e >> 7, j = (e >> 5) & 3, hl = e & 31, sb = e >> 4;
+    const int lo = sb < 8 ? s[sb] & 15 : s[sb - 8] >> 4, hi = (s[8 + (sb & 3)] >> (2 * (sb >> 2))) & 3;
+    const int q = ((qs[32 * n + hl] >> (2 * j)) & 3) | (((hm[hl] >> (4 * n + j)) & 1) << 2);
+    const float a = d * float((lo | hi << 4) - 32);
+    o[e] = a * (float(q) - 4.0f);
+  }
+}
+
 void rows_of(bool q40, size_t bb, const uint8_t* raw, size_t r0, size_t r1, size_t row_bytes, size_t cols, size_t per,
              float* out) {
   for (size_t r = r0; r < r1; r++)
@@ -81,6 +96,8 @@ void rows_of(bool q40, size_t bb, const uint8_t* raw, size_t r0, size_t r1, size
         q4_0(b, o);
       else if (bb == 144)
         q4_k(b, o);
+      else if (bb == 110)
+        q3_k(b, o);
       else
         q6_k(b, o);
     }
@@ -88,12 +105,14 @@ void rows_of(bool q40, size_t bb, const uint8_t* raw, size_t r0, size_t r1, size
 
 }  // namespace
 
-bool dequant_supported(std::string_view qtype) { return qtype == "Q4_0" || qtype == "Q4_K" || qtype == "Q6_K"; }
+bool dequant_supported(std::string_view qtype) {
+  return qtype == "Q4_0" || qtype == "Q4_K" || qtype == "Q6_K" || qtype == "Q3_K";
+}
 
 void dequant_rows(std::string_view qtype, const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* out) {
   const bool q40 = qtype == "Q4_0";
   if (!dequant_supported(qtype)) throw Error("dequant_rows: no native " + std::string(qtype));
-  const size_t per = q40 ? 32 : 256, bb = q40 ? 18 : qtype == "Q4_K" ? 144 : 210;
+  const size_t per = q40 ? 32 : 256, bb = q40 ? 18 : qtype == "Q4_K" ? 144 : qtype == "Q3_K" ? 110 : 210;
   if (cols % per || cols / per * bb > row_bytes)
     throw Error("dequant_rows: " + std::to_string(cols) + " columns of rows of " + std::to_string(row_bytes) + " B");
   // (a prompt's rows on threads of 64 rows at least: a decode step's one row on the caller's)

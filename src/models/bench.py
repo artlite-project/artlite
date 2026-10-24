@@ -171,7 +171,7 @@ def file_info(path: str, *, gguf: GGUFFile | None = None) -> tuple[dict[str, obj
     info = {"model_filename": path,
             "model_type": f"{f.arch} {f.meta.get('general.size_label', '?B')} "
                           f"{file_type_name(f.meta.get('general.file_type'))}",
-            "model_size": sum(nbytes for _, _, _, nbytes in f.tensor_info.values()),
+            "model_size": sum(nbytes or 0 for _, _, _, nbytes in f.tensor_info.values()),
             "model_n_params": sum(math.prod(dims) for dims, _, _, _ in f.tensor_info.values())}
     return info, f.string_count("tokenizer.ggml.tokens")
 

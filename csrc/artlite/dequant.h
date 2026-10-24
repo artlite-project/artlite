@@ -6,7 +6,7 @@
 
 namespace artlite {
 
-/// Whether ``dequant_rows`` reads a GGUF type ("Q4_0", "Q4_K", "Q6_K").
+/// Whether ``dequant_rows`` reads a GGUF type ("Q4_0", "Q4_K", "Q6_K", "Q3_K").
 bool dequant_supported(std::string_view qtype);
 
 /// n GGUF rows of ``qtype`` (row_bytes apart from raw) dequantized into out (n x cols fp32, its first cols columns: a

@@ -1,4 +1,4 @@
-// The tile packers of ``artlite.operators.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, bf16.py:
+// The tile packers of ``artlite.operators.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
@@ -32,8 +32,8 @@ namespace artlite {
 namespace {
 
 constexpr int kMaxNsb = 16;
-// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BF16, F16, F32
-constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 512, 512, 1024};
+// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, BF16, F16, F32
+constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 98, 512, 512, 1024};
 constexpr int64_t kItemRows = 2048;                // rows of a work item
 constexpr size_t kPrefetchWindow = size_t(2) << 30;
 constexpr size_t kPrefetchPiece = size_t(8) << 20;
@@ -398,6 +398,31 @@ void tile_q3k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// IQ3_XXS (iq3.py, word-major): header words [sb pair] bf16 d of both, then per super-block 24 code words [k-tile kt]
+/// [j 6]: j < 4 the index bytes 16 kt + 4 j .. + 3 (the block's qs), j = 4, 5 the sign / scale word of 32-k group
+/// 2 kt + j - 4: byte l = its sign field l (bits 7 l .. 7 l + 6) | bit l of its scale (bits 28 ..) at bit 7.
+void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  uint32_t* hw = reinterpret_cast<uint32_t*>(t);
+  uint32_t* cw = hw + size_t(nsb / 2) * R;
+  for (int r = 0; r < R; r++) {
+    for (int p = 0; p < nsb / 2; p++)
+      hw[size_t(p) * R + r] = uint32_t(bf16_of(src[r] + 196 * p)) | (uint32_t(bf16_of(src[r] + 196 * p + 98)) << 16);
+    for (int sb = 0; sb < nsb; sb++) {
+      const uint8_t* b = src[r] + 98 * sb;
+      uint32_t* c = cw + size_t(sb) * 24 * R + r;
+      for (int kt = 0; kt < 4; kt++) {
+        for (int j = 0; j < 4; j++) std::memcpy(c + size_t(6 * kt + j) * R, b + 2 + 16 * kt + 4 * j, 4);
+        for (int h = 0; h < 2; h++) {
+          uint32_t w, o = 0;
+          std::memcpy(&w, b + 66 + 4 * (2 * kt + h), 4);
+          for (int l = 0; l < 4; l++) o |= (((w >> (7 * l)) & 0x7F) | (((w >> (28 + l)) & 1) << 7)) << (8 * l);
+          c[size_t(6 * kt + 4 + h) * R] = o;
+        }
+      }
+    }
+  }
+}
+
 /// 16 values (two blocks of 8) -> their bfp16ebs8 blocks as ``operators.bfp16.blocks`` rounds them: the exponent of
 /// the block's maximum (at least 2^-120), mantissas rint(x 2^(6 - e)), a positive maximum rounded up to 128 raises
 /// the exponent (a negative one stays at -128), an all-zero block has exponent byte 0.
@@ -482,6 +507,8 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
       return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R;
     case TileFormat::Q3_K:
       return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
+    case TileFormat::IQ3_XXS:
+      return 98 * size_t(nsb) * R;
     case TileFormat::BFP16_BF16:
     case TileFormat::BFP16_F16:
     case TileFormat::BFP16_F32:
@@ -525,6 +552,7 @@ TileFormat tile_format(std::string_view name) {
   if (name == "Q4_1") return TileFormat::Q4_1;
   if (name == "Q2_K") return TileFormat::Q2_K;
   if (name == "Q3_K") return TileFormat::Q3_K;
+  if (name == "IQ3_XXS") return TileFormat::IQ3_XXS;
   if (name == "BFP16/BF16") return TileFormat::BFP16_BF16;
   if (name == "BFP16/F16") return TileFormat::BFP16_F16;
   if (name == "BFP16/F32") return TileFormat::BFP16_F32;
@@ -549,7 +577,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   for (size_t bi = 0; bi < blocks.size(); bi++) {
     const PackBlock& b = blocks[bi];
     const size_t row_bytes = size_t(b.row_sb) * kBlockBytes[static_cast<int>(b.fmt)];
-    const bool pairs = b.fmt <= TileFormat::Q6_K || b.fmt == TileFormat::Q3_K;  // (scales of super-block pairs)
+    const bool pairs = b.fmt <= TileFormat::Q6_K || b.fmt == TileFormat::Q3_K ||
+                       b.fmt == TileFormat::IQ3_XXS;  // (scales of super-block pairs)
     const bool bfp = b.fmt >= TileFormat::BFP16_BF16, f32 = b.fmt == TileFormat::BFP16_F32;
     const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
     if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
@@ -674,6 +703,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
                 break;
               case TileFormat::Q3_K:
                 tile_q3k(tile.get(), src, b.R, b.nsb);
+                break;
+              case TileFormat::IQ3_XXS:
+                tile_iq3xxs(tile.get(), src, b.R, b.nsb);
                 break;
               case TileFormat::BFP16_BF16:
                 tile_bfp16<false>(tile.get(), src, b.R, b.nsb);

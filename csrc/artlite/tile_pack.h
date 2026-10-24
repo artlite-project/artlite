@@ -11,10 +11,10 @@ namespace artlite {
 
 /// The tile formats of ``artlite.operators.formats`` with a native packer (every slot's ``pack``; BFP16 of BF16, F16 and
 /// F32 tensors).
-enum class TileFormat { Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, BFP16_BF16, BFP16_F16, BFP16_F32 };
+enum class TileFormat { Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, BFP16_BF16, BFP16_F16, BFP16_F32 };
 
-/// "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q8_0", "Q4_1", "Q2_K", "Q3_K", "BFP16/BF16", "BFP16/F16", "BFP16/F32" -> the format
-/// (throws on others).
+/// "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q8_0", "Q4_1", "Q2_K", "Q3_K", "IQ3_XXS", "BFP16/BF16", "BFP16/F16", "BFP16/F32" ->
+/// the format (throws on others).
 TileFormat tile_format(std::string_view name);
 
 /// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512, F32: 1024).

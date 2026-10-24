@@ -8,7 +8,9 @@ ggml blocks along the row (the reduction dimension K of a linear layer).
 losslessly (only fp16 scales become bf16, NPU side). ``dequantize`` gives
 the fp32 weights the ggml reference would compute.
 
-Supported: F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+Supported: F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS (its grid: gguf-py's table,
+``iq3xxs_grid``). A tensor of another type is listed (``tensor_info``: its size unknown, None) and raises
+NotImplementedError when read.
 
 llama.cpp's converter permutes the rows of a Llama's attn_q / attn_k per head (interleaved rotary pairs):
 :func:`unpermute_rows` gives the rotate-half order (the weight images take the rows in that order).
@@ -61,6 +63,10 @@ class QTensor:
                                                          w = d sc_j q - dmin mn_j (j = 16-group)
         Q3_K:  d (rows, cols/256), sc (rows, cols/256, 16) i8 in [-32, 31], q u8 in [0, 7] (the
                low 2 bits | 4 x the hmask bit);           w = d sc_j (q - 4) (j = 16-group)
+        IQ3_XXS: d (rows, cols/256), ls (rows, cols/32) u8 in [0, 15], idx (rows, cols/4) u8 grid indices
+               (``iq3xxs_grid``: 4 values per entry), signs (rows, cols/8) u8 7-bit sign fields (bit j: value j
+               negative; the 8th sign their parity), q (rows, cols) i8 in [-62, 62] the signed grid values;
+                                                         w = d (2 ls_j + 1) / 4 q (j = 32-group)
         BF16:  w (rows, cols) u16 bf16 bit patterns
         F16:   w (rows, cols) float16
         F32:   w (rows, cols) float32
@@ -134,6 +140,20 @@ class QTensor:
             sc = lo | (hi.transpose(0, 1, 3, 2).reshape(self.rows, nb, 16) << 4)
             return {"d": _f16(b[..., 108:110]), "sc": (sc.astype(np.int16) - 32).astype(np.int8),
                     "q": q.reshape(self.rows, self.cols)}
+        if t == "IQ3_XXS":
+            # 98 B per 256: d, qs[0 .. 63] the grid indices (4 values each, in k order), 8 words (one per 32 k): four
+            # 7-bit sign fields (bits 7 l .., 8 values each) and ls (bits 28 .. 31)
+            b = self.blocks(98)
+            nb = b.shape[1]
+            idx = np.ascontiguousarray(b[..., 2:66])
+            words = np.ascontiguousarray(b[..., 66:98]).view("<u4")  # (rows, nb, 8)
+            sg = ((words[..., None] >> np.array([0, 7, 14, 21], np.uint32)) & 0x7F).astype(np.uint8)  # (rows, nb, 8, 4)
+            s8 = sg | (_PARITY7[sg] << 7)
+            neg = ((s8[..., None] >> np.arange(8, dtype=np.uint8)) & 1).astype(bool)  # (rows, nb, 8, 4, 8)
+            g = iq3xxs_grid()[idx].reshape(neg.shape)
+            return {"d": _f16(b[..., 0:2]), "ls": (words >> 28).astype(np.uint8).reshape(self.rows, nb * 8),
+                    "idx": idx.reshape(self.rows, nb * 64), "signs": sg.reshape(self.rows, nb * 32),
+                    "q": np.where(neg, -g, g).reshape(self.rows, self.cols)}
         raise ValueError(f"{self.name}: no quantization fields for {t}")
 
     def dequantize(self) -> torch.Tensor:
@@ -162,6 +182,9 @@ class QTensor:
             a = f["d"][..., None] * f["sc"].astype(np.float32)  # (r, nb, 16)
             b = f["dmin"][..., None] * f["mn"].astype(np.float32)
             w = a[..., None] * f["q"].reshape(r, -1, 16, 16).astype(np.float32) - b[..., None]
+        elif t == "IQ3_XXS":  # (db = d (0.5 + ls) 0.5: ggml's operation order, exact in fp32)
+            db = (np.repeat(f["d"], 8, axis=-1) * (np.float32(0.5) + f["ls"].astype(np.float32))) * np.float32(0.5)
+            w = db[..., None] * f["q"].reshape(r, -1, 32).astype(np.float32)
         else:
             raise ValueError(t)
         return torch.from_numpy(np.ascontiguousarray(w, dtype=np.float32).reshape(r, self.cols))
@@ -171,6 +194,18 @@ class QTensor:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)  # torch warns about non-writable arrays
             return torch.from_numpy(np.ascontiguousarray(self.raw).view(np.int16)).view(torch.bfloat16)
+
+
+_PARITY7 = np.array([i.bit_count() & 1 for i in range(128)], np.uint8)  # (IQ3_XXS: a sign field's 8th sign)
+
+
+def iq3xxs_grid() -> np.ndarray:
+    """IQ3_XXS's grid (ggml's ``iq3xxs_grid``, from gguf-py): (256, 4) int8, entry i = the 4 values of index i, each in
+    {4, 12, 20, 28, 36, 44, 52, 62}."""
+    from gguf.quants import IQ3_XXS
+
+    IQ3_XXS.init_grid()
+    return IQ3_XXS.grid.reshape(256, 4).astype(np.int8)
 
 
 def unpermute_rows(n_heads: int, rows: int) -> np.ndarray:
@@ -186,7 +221,7 @@ _KV_STRING, _KV_ARRAY = 8, 9
 # ggml tensor types: name, (weights per block, bytes per block)
 _GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20), 8: ("Q8_0", 32, 34),
                10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
-               14: ("Q6_K", 256, 210), 30: ("BF16", 1, 2)}
+               14: ("Q6_K", 256, 210), 18: ("IQ3_XXS", 256, 98), 30: ("BF16", 1, 2)}
 _BLOCKS = {name: (per, nb) for name, per, nb in _GGML_TYPES.values()}
 
 
@@ -245,11 +280,12 @@ class GGUFFile:
             infos.append((name, dims, ttype, off))
         align = int(self.meta.get("general.alignment", 32))
         base = -(-pos // align) * align
-        self.tensor_info: dict[str, tuple[tuple[int, ...], str, int, int]] = {}  # name -> (dims, type, offset, bytes)
+        # name -> (dims, type, offset, bytes; None: a type gguf_model does not read, "type<N>")
+        self.tensor_info: dict[str, tuple[tuple[int, ...], str, int, int | None]] = {}
         for name, dims, ttype, off in infos:
-            tname, per, nb = _GGML_TYPES.get(ttype, (f"type{ttype}", 1, 0))
+            tname, per, nb = _GGML_TYPES.get(ttype, (f"type{ttype}", 1, None))
             n = math.prod(dims)
-            self.tensor_info[name] = (dims, tname, base + off, n // per * nb)
+            self.tensor_info[name] = (dims, tname, base + off, None if nb is None else n // per * nb)
 
     def strings(self, key: str, first: int = 0) -> list[str]:
         """A string array of the metadata (e.g. ``tokenizer.ggml.tokens``), from index ``first`` on (the ones before
@@ -286,6 +322,8 @@ class GGUFFile:
     def tensor(self, name: str) -> QTensor:
         """The tensor as (rows, cols) with the ggml blocks along the columns (a vector: one row)."""
         dims, qtype, off, nbytes = self.tensor_info[name]
+        if nbytes is None:
+            raise NotImplementedError(f"{name}: GGUF tensor type {qtype} is not supported")
         cols = dims[0]
         rows = math.prod(dims[1:]) if len(dims) > 1 else 1
         raw = self.data[off:off + nbytes]
@@ -297,7 +335,7 @@ class GGUFFile:
 
     def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0) -> torch.Tensor:
         """Rows ``idx`` of a tensor dequantized (len(idx), cols) fp32, of its first ``cols`` columns (default all; a
-        multiple of the format's block): an embedding lookup in the mapped file. Q4_0, Q4_K and Q6_K in C++
+        multiple of the format's block): an embedding lookup in the mapped file. Q4_0, Q4_K, Q6_K and Q3_K in C++
         (``_native.dequant_rows``: a decode step's lookup in a few us), the others through ``QTensor.dequantize``."""
         t = self.tensor(name)
         cols, idx = cols or t.cols, np.asarray(idx)
