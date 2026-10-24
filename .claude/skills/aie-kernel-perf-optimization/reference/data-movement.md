@@ -41,8 +41,10 @@ the A channels starved on memory half the time, backpressured 1%); the remaining
 (speculative decoding on the multi-token step, MoE, low-bit formats, tile padding). On Krackan the same decode reads
 64-70 GB/s (Llama 1B, Gemma E4B, Qwen 27B), ~70% of that chip's 16-channel rate. Two limits sit there that Halo's port
 hides. Each column streams its weights on one shim channel (A: MM2S 0): Halo's 8 such channels read 56.4 GB/s (the
-port), Krackan's are not measured yet. The main core's work per tile (its half-tile GEMV, the helper's handoff, the
-collect) caps a column at ~5.9 B per array cycle on Q4_K and ~4.3 on Q6_K, against ~12 on Q4_0. Measured in Halo's
+port), Krackan's 76.5-80.1 (~5.5 B per array cycle per column: a 9280-B tile every ~1700 cycles). The main core's work
+per tile (its half-tile GEMV, the helper's handoff, the collect) caps a column at ~5.9 B per array cycle on Q4_K and
+~4.3 on Q6_K (a period of ~2150 cycles), against ~12 on Q4_0: on Krackan the Q6_K tiles bind, 26-42% of a Q4_K_M
+file's bytes. Measured in Halo's
 steps with the event windows: 1B 10.9 of 14.7 ms, 27B 200 of 296 ms, Gemma 25 of 55 ms. A second weight channel per
 column and a cheaper K-quant tile on the main core would speed up a chip with a wider path, not Halo.
 

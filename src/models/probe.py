@@ -45,16 +45,17 @@ CASES: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]], Rows | None
     ("gather 256 B rows 64 KB + 256 B apart", all_channels(range(8)), [], Rows(256, 256, (64 << 10) + 256)),
 ]
 CLOCK = "array clock, measured (MHz)"
+CLOCK_LOAD = "array clock, 32 cores of MMULs (MHz)"
 PER_CYCLE = "16-channel read per array cycle (B)"
 ROUND_TRIP = "dispatch round trip (us)"
 # (column, its values in the table's order): Strix Halo (Ryzen AI Max+ 395, LPDDR5X-8000 256-bit; xdna-driver), Krackan
 # Point (Ryzen AI 7 350, LPDDR5X-7500 128-bit; Linux 7.0's amdxdna); both NPU power mode default, plugged in
-ROWS = [CLOCK, ROUND_TRIP, *(name for name, *_ in CASES), PER_CYCLE]
+ROWS = [CLOCK, CLOCK_LOAD, ROUND_TRIP, *(name for name, *_ in CASES), PER_CYCLE]
 REFERENCES: list[tuple[str, dict[str, str]]] = [
-    ("Strix Halo", dict(zip(ROWS, ("1810", "49", "13.9", "26.9", "56.8", "56.4", "57.6", "76.1", "15.6", "30.8",
-                                   "56.6", "56.9", "31.4"), strict=True))),
-    ("Krackan Point", dict(zip(ROWS, ("1808", "56", "14.2", "28.1", "97.8", "?", "87.2", "88.2", "28.6", "55.9",
-                                      "95.6", "89.6", "54.1"), strict=True))),
+    ("Strix Halo", dict(zip(ROWS, ("1810", "1809", "49", "13.9", "26.9", "56.8", "56.4", "57.6", "76.1", "15.6",
+                                   "30.8", "56.6", "56.9", "31.4"), strict=True))),
+    ("Krackan Point", dict(zip(ROWS, ("1808", "?", "56", "14.2", "28.1", "97.8", "80.1", "87.2", "88.2", "28.6",
+                                      "55.9", "95.6", "89.6", "54.1"), strict=True))),
 ]
 
 
@@ -72,7 +73,8 @@ def timed(fn: Callable[[], None], *, seconds: float, warmup: int = 2) -> float:
 
 
 def array_clock(op: ClockProbeOperator, *, seconds: float) -> tuple[float, float]:
-    """(MHz, dispatch round trip in us): one core spinning for n cycles of its counter, timed at two n."""
+    """(MHz, dispatch round trip in us): one core spinning for n cycles of its counter (``op.load``: all cores, with
+    MMULs), timed at two n."""
     out = artlite.empty((ClockProbeOperator.WORDS,), dtype=torch.int32, device=op.device)
     durations = {}
     for n in (1 << 10, 1 << 24, 1 << 27):
@@ -150,11 +152,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
     args = p.parse_args(argv)
     lines = system()
-    clock, dma = ClockProbeOperator(), DmaProbeOperator()
-    compile_all([clock, dma])
+    clock, loaded, dma = ClockProbeOperator(), ClockProbeOperator(load=True), DmaProbeOperator()
+    compile_all([clock, loaded, dma])
     mhz, round_trip = array_clock(clock, seconds=args.seconds)
+    mhz_load, _ = array_clock(loaded, seconds=2 * args.seconds)
     rates = ddr_rates(dma, seconds=args.seconds)
-    rows = [(CLOCK, f"{mhz:.0f}"), (ROUND_TRIP, f"{round_trip:.0f}"),
+    rows = [(CLOCK, f"{mhz:.0f}"), (CLOCK_LOAD, f"{mhz_load:.0f}"), (ROUND_TRIP, f"{round_trip:.0f}"),
             *((name, f"{gbps:.1f}") for name, gbps in rates.items()),
             (PER_CYCLE, f"{rates[CASES[2][0]] * 1e3 / mhz:.1f}")]
     print("artlite-probe")

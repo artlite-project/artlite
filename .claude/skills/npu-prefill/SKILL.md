@@ -124,7 +124,11 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - Other chips: a Krackan Point laptop runs Gemma E4B's Q4_0 prefill at 0.96x Strix Halo's speed, the Q4_K_M files'
   at 0.51x (Llama 1B) and 0.73x (Qwen 27B). It has the same array and clock, and a faster DRAM path in every
   `artlite-probe` pattern. Not the cause: Linux 7.0's driver (the same speed on Halo), control-code density (per ms of
-  a 1024-token chunk: 1B 75 syncs and 1.2 configurations, Gemma 41 and 0.85, 27B 19 and 0.31). Not known yet.
+  a 1024-token chunk: 1B 75 syncs and 1.2 configurations, Gemma 41 and 0.85, 27B 19 and 0.31), the memory path: the
+  Q4_K_M GEMMs are compute-bound on Halo already (Llama 1B's gate / up: its busiest core 2.15 ms per layer of 1024
+  tokens against 0.28 ms of DRAM; Gemma's GEMM items are within ~10% of their DMA floor). The same array at the same
+  clock cannot run those slower unless the clock drops under load: `artlite-probe`'s "32 cores of MMULs" row
+  measures that (Halo: 1809 MHz).
 - Levers that worked: the A strip resident through K parts (`prefill.gemm.resident_k_part`); reading each weight byte once (header units); more
   queries per attention pass where L1 allows (sliding window: 2 blocks of 32); a broadcast KV stream on both of each
   core's input channels (full attention at 30K: -41%); the last token from the prefill's last

@@ -2,7 +2,8 @@
 
 ``ClockProbeOperator``: one core spins until its timer has advanced by the count in its input, and writes the cycles it
 counted; the host times two counts, whose difference cancels the dispatch: the array (H-) clock as the cores
-see it, not the driver's table.
+see it, not the driver's table. ``load=True``: all 32 cores run MMULs meanwhile (the clock under load: a power or
+thermal limit lowers it there and not for one idle-looking core).
 
 ``DmaProbeOperator``: a design with no cores. Every column's two shim MM2S channels stream DDR into its memtile's
 S2MM channels 0 / 1, whose BDs loop on a 64 KB buffer with no locks (a sink that never back-pressures); the memtile's
@@ -18,7 +19,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from aie.dialects.aiex import npu_maskwrite32
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU2, Tile
 
 from .. import txn
@@ -54,45 +55,116 @@ extern "C" void {{ p }}_spin(const int32_t *__restrict n, int32_t *__restrict ou
         t = {{ p }}_cycles();
     out[0] = (int32_t)(t - t0);
 }
+
+// 64 MMULs: 4 accumulators over 2 x 2 panels loaded from data ({{ LOAD_BYTES }} B of random mantissas)
+__attribute__((noinline)) void {{ p }}_mmuls(const int8_t *__restrict data, v64accfloat *__restrict acc)
+{
+    v2int32 ev;
+    ev[0] = ev[1] = 0x70707070;
+    const v8int8 e = (v8int8)ev;
+    v64accfloat a0 = acc[0], a1 = acc[1], a2 = acc[2], a3 = acc[3];
+    const int8_t *p = data;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 16; i++) {
+        v64bfp16ebs8 x0, x1, w0, w1;
+        x0.mantissa = *(const v64int8 __aie_dm_resource_a *)p;
+        x1.mantissa = *(const v64int8 __aie_dm_resource_b *)(p + 64);
+        w0.mantissa = *(const v64int8 __aie_dm_resource_a *)(p + 128);
+        w1.mantissa = *(const v64int8 __aie_dm_resource_b *)(p + 192);
+        x0.exponent = x1.exponent = w0.exponent = w1.exponent = e;
+        a0 = mac_8x8_8x8T(x0, 1, w0, 1, a0);
+        a1 = mac_8x8_8x8T(x0, 1, w1, 1, a1);
+        a2 = mac_8x8_8x8T(x1, 1, w0, 1, a2);
+        a3 = mac_8x8_8x8T(x1, 1, w1, 1, a3);
+        p += 256;
+    }
+    acc[0] = a0;
+    acc[1] = a1;
+    acc[2] = a2;
+    acc[3] = a3;
+}
+
+// the spin with MMULs: blocks of 64 until the core's counter has advanced n[0] cycles (the sums after data's panels)
+extern "C" void {{ p }}_load(const int32_t *__restrict n, int8_t *__restrict data, int32_t *__restrict out)
+{
+    const unsigned long long t0 = {{ p }}_cycles();
+    const unsigned long long want = (unsigned)n[0];
+    v64accfloat *acc = (v64accfloat *)(data + {{ LOAD_BYTES }});
+    unsigned long long t = t0;
+    while (t - t0 < want) {
+        {{ p }}_mmuls(data, acc);
+        t = {{ p }}_cycles();
+    }
+    out[0] = (int32_t)(t - t0);
+}
 """)
+LOAD_BYTES = 4096  # (16 x 256 B of panels; the 4 accumulators' 1 KB after them)
 
 CORE_PROCESSOR_BUS = 0x32038  # (bit 0: the core reaches its tile's registers with read_tm / write_tm)
 
 
 class ClockProbeOperator(ArtcOperator):
     """One core (column 0, row 2) spinning for ``n[0]`` cycles of its cycle counter; ``out[0]``: the cycles it
-    counted."""
+    counted. ``load``: every core of the array (4 rows x 8 columns, ``n`` broadcast in each column) runs MMULs on random
+    data meanwhile, until its own counter has advanced as far: the clock under the power a prefill's GEMMs draw."""
 
     WORDS = 16
 
+    def __init__(self, *, load: bool = False):
+        self.load = load
+        super().__init__()
+
     def get_kernel_src(self) -> str:
-        return _SPIN.render(p=P)
+        return _SPIN.render(p=P, LOAD_BYTES=LOAD_BYTES)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (self.WORDS,), torch.int32), ArgSpec("out", (self.WORDS,), torch.int32)]
 
     def get_mlir_artifact(self) -> object:
         t = np.ndarray[(self.WORDS,), np.dtype[np.int32]]
-        n_in, n_out = ObjectFifo(t, name="n", depth=1), ObjectFifo(t, name="c", depth=1)
+        cols, rows = (range(COLS), range(2, 6)) if self.load else (range(1), range(2, 3))
+        n_in = [ObjectFifo(t, name=f"n{c}", depth=1) for c in cols]
+        n_out = ObjectFifo(t, name="c", depth=1)
+        d_ty = np.ndarray[(LOAD_BYTES + 1024,), np.dtype[np.int8]]
         spin = Kernel(f"{P}_spin", "kernel.o", [t, t])
+        load = Kernel(f"{P}_load", "kernel.o", [t, d_ty, t])
 
         def core(i: object, o: object, k: object) -> None:
             k(i.acquire(1), o.acquire(1))
             i.release(1)
             o.release(1)
 
-        worker = Worker(core, [n_in.cons(), n_out.prod(), spin], tile=Tile(0, 2))
-        fill, drain = n_in.prod(), n_out.cons()
+        def busy(i: object, o: object, k: object, d: object) -> None:  # (o: the counted cycles' object, or scratch)
+            k(i.acquire(1), d, o.acquire(1) if not isinstance(o, Buffer) else o)
+            i.release(1)
+            if not isinstance(o, Buffer):
+                o.release(1)
+
+        rng = np.random.default_rng(0)
+        workers = []
+        for c in cols:
+            for r in rows:
+                if not self.load:
+                    workers.append(Worker(core, [n_in[c].cons(), n_out.prod(), spin], tile=Tile(c, r)))
+                    continue
+                o = n_out.prod() if (c, r) == (0, 2) else Buffer(t, name=f"o{c}_{r}")
+                data = Buffer(d_ty, name=f"d{c}_{r}", initial_value=np.concatenate(
+                    [rng.integers(-128, 128, LOAD_BYTES, np.int8), np.zeros(1024, np.int8)]))
+                workers.append(Worker(busy, [n_in[c].cons(), o, load, data], tile=Tile(c, r)))
+        fills, drain = [f.prod() for f in n_in], n_out.cons()
 
         def seq(a: object, b: object, handles: object) -> None:
-            npu_maskwrite32(CORE_PROCESSOR_BUS, 1, 1, column=0, row=2)
+            for c in cols:
+                for r in rows:
+                    npu_maskwrite32(CORE_PROCESSOR_BUS, 1, 1, column=c, row=r)
             tg = TaskGroup()
-            fill.fill(a, group=tg)
+            for f in fills:
+                f.fill(a, group=tg)
             drain.drain(b, wait=True, group=tg)
             tg.finish()
 
-        rt = Runtime(seq, [t, t, [fill, drain]])
-        return Program(NPU2(), rt, workers=[worker]).resolve_program()
+        rt = Runtime(seq, [t, t, [*fills, drain]])
+        return Program(NPU2(), rt, workers=workers).resolve_program()
 
 
 SINK_WORDS = 16384  # (64 KB per memtile buffer)

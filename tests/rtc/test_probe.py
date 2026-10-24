@@ -12,6 +12,7 @@ def test_probe(capsys: pytest.CaptureFixture[str]) -> None:
             if line.startswith("| ") and len(cells := line.split("|")) == 4 + len(probe.REFERENCES)}
     assert all(set(ref) <= set(rows) for _, ref in probe.REFERENCES), out
     assert 400 < float(rows[probe.CLOCK]) < 3000, out
+    assert 400 < float(rows[probe.CLOCK_LOAD]) < 3000, out
     assert 0 < float(rows[probe.ROUND_TRIP]) < 10000, out
     one, all16 = float(rows[probe.CASES[0][0]]), float(rows[probe.CASES[2][0]])
     assert 2 < one < all16, out

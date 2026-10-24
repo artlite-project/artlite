@@ -117,6 +117,10 @@ Core module (AM029 `Performance_Control0/1`):
 
 - For memory stalls use `23 | 23` (MEMORY_STALL) in counter 1.
 - STREAM_STALL is 24 and CASCADE_STALL 25.
+- **A core's compute with free memory** (what an operator would take if DMA never kept it waiting): ACTIVE (28)
+  minus LOCK_STALL (26), memory stalls included, its busiest core the operator's floor. The two are read one at a
+  time and over one dispatch their difference drifts by tens of us (a 12 us GEMM item read 12-37): sample every 10
+  dispatches or more (`ARTLITE_PROFILE_SAMPLE_EVERY`), then it repeats within ~1%. In turbo.
 - **Power mode**: in the driver's default mode (clock gating) a stalled core's counters stop: a core waiting 10 ms on
   a lock counted a 0.02 M-cycle window and 0.2 M cycles of TRUE; in turbo the window was 18.5 M cycles (the lock
   stall inside it) and the stall counters account for it. Count in turbo (`xrt-smi configure --pmode turbo` with no
