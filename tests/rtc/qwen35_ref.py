@@ -40,7 +40,7 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.model_config import LLAMA_CPP_DIR, QwenConfig, qwen_gguf  # noqa: F401 (tests import them from here)
+from artlite.model_config import LLAMA_CPP_DIR, QwenConfig, occamy_gguf, qwen_gguf  # (tests import them from here)
 from artlite.operators.base import CACHE_DIR
 from artlite.operators.qwen35.attn import HD, ROT
 from artlite.operators.qwen35.gdn import D
@@ -49,6 +49,12 @@ from . import common
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DUMP_SRC = os.path.join(HERE, "qwen35_dump.cpp")
+
+
+def size_gguf(size: str) -> str:
+    """The file a test runs for a size: lmstudio's Q4_K_M of it (``qwen_gguf``), or "occamy": Occamy 1.0 APEX
+    (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
+    return occamy_gguf() if size == "occamy" else qwen_gguf("Q4_K_M", size)
 
 
 # ----------------------------------------------------------------------

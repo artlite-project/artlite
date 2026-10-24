@@ -145,6 +145,11 @@ in near-equal pairs (banks 2i and 2i + 1 share 16 KB region i).
   compare its cycles with the static cost, and the step with the region ablated or doubled.
 - **Share of the dispatch**: counter 0 / counter 2 per core. Sum the regions of one core type to
   see what is left unaccounted (control code, waits).
+- **A tile loop** (the decode overlays' main core): window a tile's period, from its command to the end of its
+  epilogue (the wait for the A object outside), per format and phase kind, against the DMA's time per tile (9280 B
+  per column at 3.87 B / cycle: ~2400 cycles). Above it the tiles are compute-bound even when both cores' kernels
+  are below it (restructurings.md R9: the MoE frame's epilogue). Ablate one format's compute (its page loads kept)
+  for its share of the step.
 - Example: restructurings.md R1 (570 -> 437 cycles per unit, memory stall 7.25 -> 0.24 ms per core and chunk).
 
 ## Reading core L1 from the host

@@ -29,7 +29,9 @@ traps).
    compute-bound.
    - Ablate: build variants with one piece compiled out (a loop's compute, a phase, the whole kernel = the DMA
      floor), inside the real design (library program, overlay), not standalone. Full minus ablated is that piece's
-     cost in context.
+     cost in context. Ablate through a parameter or a replaced method of the operator's class: a patched module
+     global (a slot's `formats.SOURCES` entry, a template) keeps the render manifest's key and reruns the unpatched
+     build (`render_cache.py`).
    - Count per core: `event0()` / `event1()` around one region, then read cycles in the region, window count, lock
      stall, memory stall and the memory module's bank conflicts. Cycles per window vs the static schedule shows
      memory stalls; lock stall shows waiting for data.
@@ -143,7 +145,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **R8 Pointer walks instead of index math** (`add_3d_ptr` walks: II 46 -> 30, alu 0) and small scalar gathers
   unrolled to constant offsets (4660 -> 281 cycles).
 - **R9 Batched small calls, filled lanes**: scalar-ish math once for all panels, independent small reductions in one
-  call, two heads per call, two blocks per iteration of a RecMII-bound loop.
+  call, two heads per call, two blocks per iteration of a RecMII-bound loop, a tile's epilogue on its own rows in
+  one call.
 - **R10 Sequential recurrences** (the GDN scan): chunkwise (WY / UT form), 16 tokens per state read and write, the
   state products and the update on the MMUL, the intra-chunk solve in fp32 by 8-token blocks (a 1B chunk's scan
   70 -> 24 ms).
@@ -269,7 +272,10 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   the resident code (aiecc's link of the core) and pages of what only a page's entries reach, each linked at the slot
   (the resident end: `_main_init`, the crt's startup code, is linked last and the slot starts there) from a copy of
   `kernel.o` with the page's sections renamed; `paging.link` checks the resident code and data against aiecc's on every
-  core, the page within 16 KB, no page data, no page reaching the pager, the stack with the entries. The core triggers a
+  core, the page within 16 KB, no page data, no page reaching the pager, the stack with the entries. Every core's
+  kernels must lie at the same addresses behind its control code (`core_<col>_<row>`, linked first): a per-core
+  constant that one core can fold (column 0's index 0) changes that core's control-code size (decode overlays pass
+  COLS + the column). The core triggers a
   page and sleeps on its wake lock in one resident function and enters page code through the pager's state words.
   Self-DMA (sd15: the page in two B slots of its input stream, its MM2S 1 into its own TileControl): ~2.4 B / cycle of
   slots, 2.7 µs for two 5760-B slots whatever the code; the host knows each row's role and puts the page before the op

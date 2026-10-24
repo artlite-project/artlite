@@ -165,7 +165,8 @@ class QwenOverlay(ModelOverlay):
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
-                                      max_k=MOE_MAX_K if cfg.moe else MAX_K, paged=paged_formats(gguf, fmts))
+                                      max_k=MOE_MAX_K if cfg.moe else MAX_K,
+                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16))
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True

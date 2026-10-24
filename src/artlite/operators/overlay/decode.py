@@ -338,7 +338,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                            if gemv.helper_y(f, self.chunk.nsb)],
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
-                                 COLS=COLS,
+                                 COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
                                  moe=self.moe, **self._moe_vars(p, consts), **consts)
 
@@ -602,6 +602,8 @@ class DecodeOverlayOperator(ArtcOperator):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
                                           address=iq3.TAB[h][i] - 0x70000, initial_value=iq3.grid_words())
                                    for i in range(2)]
+        # (paged: the main cores take COLS + their column, not a constant 0 in column 0, which can give its control code
+        # another size: every core's resident kernels must lie where the pages were linked, ``paging.link``)
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}")
             moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
@@ -614,7 +616,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, k_begin, k_nbegin,
                                             k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
-                                            *([k_psums] if self.post else []), ws, xp, xs, c, *pg_main.get(c, []),
+                                            *([k_psums] if self.post else []), ws, xp, xs,
+                                            (COLS if self.paged else 0) + c, *pg_main.get(c, []),
                                             *grids.get((c, 0), [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))

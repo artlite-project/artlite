@@ -378,9 +378,9 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 {% set lut = km.act(km.SILU if act == "silu" else km.GELU) %}
 {{ lut.src }}
 
-// A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms; F_GU
+// A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
 // ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0 (kmath.act: the gather LUT, through gs){{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
-__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if act == "silu" and YB == 128 else "" }})
+__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if act == "silu" and YB == 128 else "" }}{{ ", int nf" if moe else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     float *__restrict yt = WS(float, {{ w_.yt }});
@@ -392,7 +392,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         const aie::vector<float, 32> iv = aie::load_v<32>(WS(float, {{ w_.inv }}));
 {% endif %}
         AIE_LOOP_NO_UNROLL
-        for (int g = 0; g < {{ YT }}; g += 32)
+        for (int g = 0; g < {{ "nf" if moe else YT }}; g += 32)
             aie::store_v(yt + g, al::mulff<32>(aie::load_v<32>(yt + g), iv));
     }
 {% if act == "silu" and YB == 128 %}
@@ -460,6 +460,7 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
         aie::store_v(ph + {{ 32 * (OBJ_K // 16) }}, o);
         return nv;
     }
+{% if YB != 128 %}
     if (flags & {{ F_ACCUM }}) {  // (into acc [slot][H] bf16 at row q: a window of 32 at its 16-aligned base, in two
         // 32-byte halves (a 64-byte access is 64-byte aligned); F_ACC0 stores)
         bfloat16 *__restrict pa = acc + {{ H }} * s + (q & ~15);
@@ -477,6 +478,7 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
         aie::store_v(pa + 16, nw.template extract<16>(1));
         return 0;
     }
+{% endif %}
 {% endif %}
 {% if post %}
     if (flags & {{ F_RESID + F_VOUT }}) {  // (a window of 32 floats at the 16-aligned base; F_VOUT: into pend)
@@ -502,6 +504,47 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
     {{ p }}_put_bf16(ps, aie::accum<accfloat, 16>(y).template to_vector<bfloat16>(), nv);
     return nv;
 }
+{% if moe and YB == 128 %}
+
+// (an expert's down, F_ACCUM) rows 0 .. nv - 1 of a tile of G row groups of R <= 32 rows (group j's in yt's block j) of
+// every slot into acc at row q ([slot][H] bf16; F_ACC0 stores): _slot's sums, a group at a time (its 32 rows shifted
+// onto a window of 48 at its 16-aligned base: lanes 0 .. 31, then 32 .. 47 where its rows reach them)
+__attribute__((noinline)) void {{ p }}_accum(int32_t *__restrict ws, int S, int flags, int nv, int q, int R, int G,
+                                            bfloat16 *__restrict acc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict yt = WS(float, {{ w_.yt }});
+    const aie::vector<int16, 32> li = aie::load_v<32>({{ p }}_iota);
+    const bool st0 = flags & {{ F_ACC0 }};
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < G; j++) {
+            const int k = nv - R * j > R ? R : nv - R * j, qj = q + R * j, sh = qj & 15;
+            if (k <= 0)
+                break;
+            const float *__restrict yb = yt + {{ YB }} * j + 8 * s;
+            const aie::vector<float, 32> y = aie::concat(aie::load_v<8>(yb), aie::load_v<8>(yb + 32), aie::load_v<8>(yb + 64),
+                                                         aie::load_v<8>(yb + 96));  // rows 0 .. 31
+            bfloat16 *__restrict pa = acc + {{ H }} * s + (qj & ~15);
+            const aie::vector<float, 32> v0 = aie::shuffle_up_fill(y, aie::zeros<float, 32>(), sh);
+            const aie::vector<bfloat16, 32> o0 = aie::concat(aie::load_v<16>(pa), aie::load_v<16>(pa + 16));
+            const aie::accum<accfloat, 32> s0 = st0 ? aie::accum<accfloat, 32>(v0) : aie::add(aie::accum<accfloat, 32>(o0), v0);
+            const aie::vector<bfloat16, 32> n0 = aie::select(o0, s0.template to_vector<bfloat16>(),
+                                                             aie::ge(li, (int16)sh) & aie::lt(li, (int16)(sh + k)));
+            aie::store_v(pa, n0.template extract<16>(0));
+            aie::store_v(pa + 16, n0.template extract<16>(1));
+            if (sh + k > 32) {  // (rows 32 - sh .. k - 1)
+                const aie::vector<float, 16> v1 = aie::shuffle_down_fill(y, aie::zeros<float, 32>(), 32 - sh).template extract<16>(0);
+                const aie::vector<bfloat16, 16> o1 = aie::load_v<16>(pa + 32);
+                const aie::accum<accfloat, 16> s1 = st0 ? aie::accum<accfloat, 16>(v1) : aie::add(aie::accum<accfloat, 16>(o1), v1);
+                aie::store_v(pa + 32, aie::select(o1, s1.template to_vector<bfloat16>(),
+                                                  aie::lt(li.template extract<16>(0), (int16)(sh + k - 32))));
+            }
+        }
+    }
+}
+{% endif %}
 {% if gu_win and YB == 128 %}
 
 // F_GU tiles of R != 16 rows (gu_win: their [8 gate | 8 up] row groups cross tiles; R <= 32): the tile's R rows of each
@@ -545,7 +588,7 @@ __attribute__((noinline)) int {{ p }}_guwin(int32_t *__restrict ws, int S, int R
         aie::store_v(gw + 64 * s, last ? aie::zeros<float, 32>() : n0);
         aie::store_v(gw + 64 * s + 32, last ? aie::zeros<float, 32>() : n1);
     }
-    {{ p }}_rows(ws, {{ F_GU }}, nw);
+    {{ p }}_rows(ws, {{ F_GU }}, nw{{ ", 0" if moe else "" }});
     return nw;
 }
 {% elif gu_win %}
@@ -583,7 +626,7 @@ __attribute__((noinline)) int {{ p }}_guwin(int32_t *__restrict ws, int S, int R
         aie::store_v(yt + 32 + 8 * s, w.template extract<8>(1));
         aie::store_v(gw + 32 * s, last ? aie::zeros<float, 32>() : aie::concat(w.template extract<16>(1), aie::zeros<float, 16>()));
     }
-    {{ p }}_rows(ws, {{ F_GU }});
+    {{ p }}_rows(ws, {{ F_GU }}{{ ", 0" if moe else "" }});
     return 8;
 }
 {% endif %}
@@ -598,6 +641,9 @@ extern "C" {
 __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t *__restrict cmd,
                                            int32_t col)
 {
+{% if paged %}
+    col -= {{ COLS }};  // (paged designs pass COLS + the column: ``decode``)
+{% endif %}
 {% if WIN == 8 %}
     event1();
 {% endif %}
@@ -866,12 +912,15 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     float *__restrict yt = WS(float, {{ w_.yt }});
 {% if moe %}
-    if (st[{{ S_FMT }}] & {{ B_G2 + B_G4 }}) {  // (row groups: the helper's rows are rows of their own, after ours)
-        float *__restrict yh = yt + ((st[{{ S_FMT }}] & {{ B_G4 }}) ? {{ 2 * YB }} : {{ YB }});
-        for (int i = 0; i < {{ YN }}; i += 32)
-            aie::store_v(yh + i, aie::load_v<32>(r + i));
-    } else
-        for (int i = 0; i < {{ YN }}; i += 32)
+    const int fm = st[{{ S_FMT }}];
+    if (fm & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
+        for (int i = 0; i < {{ 2 * YB }}; i += 32)
+            aie::store_v(yt + {{ 2 * YB }} + i, aie::load_v<32>(r + i));
+    else if (fm & {{ B_G2 }})  // (its group's block)
+        for (int i = 0; i < {{ YB }}; i += 32)
+            aie::store_v(yt + {{ YB }} + i, aie::load_v<32>(r + i));
+    else  // (its partial sums of our block)
+        for (int i = 0; i < {{ YB }}; i += 32)
             aie::store_v(yt + i, aie::add(aie::load_v<32>(yt + i), aie::load_v<32>(r + i)));
 {% elif rowsplit %}
     float *__restrict yh = yt + {{ p }}_hy(st[{{ S_FMT }}]);  // (a row-split tile: the helper's rows)
@@ -916,31 +965,35 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
 {% if moe %}
     const int gu = (flags & {{ F_GU }}) | ((fw & {{ B_GU }}) ? {{ F_GU }} : 0);  // (F_GU, or this block's B_GU)
 {% if YB == 128 %}
-    {{ p }}_rows(ws, flags & ~{{ F_GU }}, 0);
+    {{ p }}_rows(ws, flags & ~{{ F_GU }}, 0, {{ YB }} * G);
     const int nw = gu ? {{ p }}_guwin(ws, S, R) : 0;  // (gate / up: the windows completed, [8 gate | 8 up] each)
     int add = 0;
-    AIE_LOOP_NO_UNROLL
-    for (int s = 0; s < S; s++) {  // (per 16 rows: a row group's rows 0 .. 15, 16 .. (block j: halves 2 j, 2 j + 1),
-        // a window's 8 outputs)
-        int a = 0;
-        if (gu) {
-            AIE_LOOP_NO_UNROLL
-            for (int w = 0; w < nw; w++)
-                a += {{ p }}_slot(ws, s, flags, fw, 8, 0, n + a, w, acc);
-        } else {
-            AIE_LOOP_NO_UNROLL
-            for (int j = 0; j < G; j++) {
-                const int k = nv - R * j > R ? R : nv - R * j;
-                if (k > 0)
-                    a += {{ p }}_slot(ws, s, flags, fw, k > 16 ? 16 : k, row0 + r0 + R * j, n + a, 2 * j, acc);
-                if (k > 16)
-                    a += {{ p }}_slot(ws, s, flags, fw, k - 16, row0 + r0 + R * j + 16, n + a, 2 * j + 1, acc);
+    if (flags & {{ F_ACCUM }})  // (an expert's down: its rows into acc)
+        {{ p }}_accum(ws, S, flags, nv, row0 + r0, R, G, acc);
+    else {
+        AIE_LOOP_NO_UNROLL
+        for (int s = 0; s < S; s++) {  // (per 16 rows: a row group's rows 0 .. 15, 16 .. (block j: halves 2 j, 2 j + 1),
+            // a window's 8 outputs)
+            int a = 0;
+            if (gu) {
+                AIE_LOOP_NO_UNROLL
+                for (int w = 0; w < nw; w++)
+                    a += {{ p }}_slot(ws, s, flags, fw, 8, 0, n + a, w, acc);
+            } else {
+                AIE_LOOP_NO_UNROLL
+                for (int j = 0; j < G; j++) {
+                    const int k = nv - R * j > R ? R : nv - R * j;
+                    if (k > 0)
+                        a += {{ p }}_slot(ws, s, flags, fw, k > 16 ? 16 : k, row0 + r0 + R * j, n + a, 2 * j, acc);
+                    if (k > 16)
+                        a += {{ p }}_slot(ws, s, flags, fw, k - 16, row0 + r0 + R * j + 16, n + a, 2 * j + 1, acc);
+                }
             }
+            add = a;
         }
-        add = a;
     }
 {% else %}
-    {{ p }}_rows(ws, flags | gu);
+    {{ p }}_rows(ws, flags | gu, {{ YB }} * G);
     int add = 0;
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {  // (per block of 16 rows: R rows of a row group, or a tile's rows; F_GU: 8 outputs)
@@ -954,9 +1007,11 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
         add = a;
     }
 {% endif %}
-    AIE_LOOP_UNROLL_FULL
-    for (int i = 0; i < {{ YT }}; i += 16)
-        aie::store_v(yt + i, aie::zeros<float, 16>());
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < G; b++)  // (the tile's row blocks; the others are zero)
+        AIE_LOOP_UNROLL_FULL
+        for (int i = 0; i < {{ YB }}; i += 16)
+            aie::store_v(yt + {{ YB }} * b + i, aie::zeros<float, 16>());
 {% else %}
     {{ p }}_rows(ws, {{ "flags & ~%d" % F_GU if gu_win else "flags" }}{{ ", 2" if act == "silu" and YB == 128 else "" }});
 {% endif %}

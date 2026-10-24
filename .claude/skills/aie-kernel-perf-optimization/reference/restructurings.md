@@ -168,6 +168,13 @@ per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 
   whole (1.3-2.1 KB of stack, more than a core's 1 KB).
 - **Packed lanes**: the GDN gates (softplus, expm1 in fp32: they feed the fp32 state) of two heads per call
   (`GdnPrepOperator`).
+- **Epilogues sized to the tile**: a decode tile's row epilogue (the main core's `collect`) ran after the slower
+  core's half on every tile. In the MoE frame of 32-row blocks it scaled all four blocks of yt (`al::mulff`, II 27
+  per 32 floats: 440 cycles) for a tile of one block, and an expert down's 4 row groups went into acc by two
+  `_slot` calls (16 + 7 rows) per group and slot (~130 cycles each). Scaling the tile's blocks only and one
+  `_accum` call per tile (a group's 32 rows onto one 48-lane window): Q3_K downs 3503 -> 2965 cycles per tile at
+  S 1, 5984 -> 3626 at S 4; the whole step -2.4 ms of 44 at S 1, bit-exact. Time a tile's period (its command to
+  the end of its epilogue) against the DMA's time per tile (measuring.md), not only the kernel.
 - **A RecMII-bound loop: two blocks per iteration**, two independent chains in one body (a split + MMUL chain of
   RecMII 11 per block: II 12-14 per two blocks), written out by hand (`AIE_LOOP_UNROLL` in an inlined helper breaks
   measure_ii's build: aie2p-coding section 9).

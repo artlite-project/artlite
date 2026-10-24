@@ -7,6 +7,7 @@ import os
 
 import numpy as np
 import pytest
+import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.operators import kmath
@@ -665,7 +666,7 @@ def interleave_bits(v: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy"])
 @pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
@@ -675,10 +676,11 @@ def test_overlay_slice(size: str, mode: str) -> None:
     (its Q8_K activations) of its decode. The 1B's noise is ~3x the 9B's: its layer 0 against float64 math on the same
     weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's
     routing differs from llama.cpp's (a near tie of its 8th and 9th logits) its layer output moves by 10-40%; none here
-    (0.5-0.9% on average, 3.4% at most)."""
+    (0.5-0.9% on average, 3.4% at most). Occamy (its Q3_K experts in these layers) within the 35B-A3B's bounds: its
+    routing flips move a layer's output by up to ~2% (``test_moe_slice``)."""
     from artlite.operators.qwen35.overlay import QwenOverlay
 
-    path = ref.qwen_gguf("Q4_K_M", size)
+    path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     La = ref.QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
@@ -703,8 +705,79 @@ def test_overlay_slice(size: str, mode: str) -> None:
         ov.accept(acc)
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split")
-    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2)}[size]
+    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
+
+
+@pytest.mark.parametrize("first", [0, 10])
+def test_moe_slice(first: int) -> None:
+    """Occamy's layers first .. first + 3 (0-3: Q3_K experts, 10-13: IQ3_XXS; 3 and 11 attention layers) over 16
+    positions, fed llama.cpp's residual stream before them token by token: each layer's routing (the top 8 of the route
+    object's logits) llama.cpp's wherever no pair of an expert in and one out of its top 8 lies within their logits'
+    errors (the NPU's against llama.cpp's; a nearer tie flips on either side's rounding: here a few per slice), and the
+    residual after every layer within llama.cpp's noise of its decode, until a flip in the token's layers so far (one
+    moves the layer's output by up to ~2% and the next layers' by up to ~5%)."""
+    from artlite.operators.qwen35.overlay import QwenOverlay
+
+    path = ref.size_gguf("occamy")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    layers, n = list(range(first, first + 4)), 16
+    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = ref.golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
+                    names="l_out|model.input_embed|ffn_moe_logits|ffn_moe_topk", logits="none")
+    ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
+    ov.load(release=False)
+    E, k = ov.cfg.n_experts, ov.cfg.n_experts_used
+    errs = np.zeros((n, len(layers)))
+    clean = np.ones((n, len(layers)), bool)  # (no flip in the token's layers so far)
+    checked = 0
+    for t in range(n):
+        x = G_["model.input_embed"][t] if first == 0 else G_["l_out", first - 1][t]
+        ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
+        for i, L in enumerate(layers):
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1).numpy()
+            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+            o = ov.xch[L] + 4 * OD.META  # (the route object's payload: [slot][expert] fp32)
+            ov.dev.fetch("ACT", o, 4 * E)
+            lg = ov.dev.view("ACT")[o:o + 4 * E].view(np.float32)
+            want = np.asarray(G_["ffn_moe_logits", L][t], np.float32)
+            top = np.asarray(G_["ffn_moe_topk", L][t])
+            ins = np.isin(np.arange(E), top)
+            e = np.abs(lg - want)
+            flip = set(np.argsort(-lg)[:k].tolist()) != set(top.tolist())
+            if (want[ins][:, None] - want[~ins][None, :] > e[ins][:, None] + e[~ins][None, :]).all():
+                checked += 1
+                assert not flip, (t, L)
+            clean[t, i:] &= not flip
+    mean = np.array([errs[clean[:, i], i].mean() for i in range(len(layers))])
+    print(f"layers {layers}: mean error per layer {errs.mean(0)} (tokens without a flip so far: {mean}), max "
+          f"{errs.max():.3f} ({errs[clean].max():.3f}); routing checked in {checked} of {n * len(layers)}, flips "
+          f"{int((~clean[:, 1:] & clean[:, :-1]).sum() + (~clean[:, 0]).sum())}")
+    assert errs[clean].max() < 4e-2 and mean.max() < 1.5e-2 and errs.max() < 1e-1, (errs.max(), mean)
+    assert checked >= n * len(layers) // 3
+
+
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+def test_lm_head(size: str) -> None:
+    """The LM head alone (``logits_of``: the output norm, every vocabulary row) on llama.cpp's last residual of T
+    tokens: the logits within llama.cpp's own error (its Q8_K activations) of its logits, the same argmax."""
+    from artlite.operators.qwen35.overlay import QwenOverlay
+
+    path = ref.size_gguf(size)
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    L = ref.QwenConfig.from_gguf(g).num_hidden_layers - 1
+    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T]
+    G_ = ref.golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
+    ov = QwenOverlay(g, layers=[L], max_positions=64)
+    ov.load(release=False)
+    for t in range(T):
+        got = ov.logits_of(torch.from_numpy(np.asarray(G_["l_out", L][t], np.float32).copy())).float().numpy()
+        want = np.asarray(G_.logits[t], np.float32)
+        assert got.shape == want.shape and int(got.argmax()) == int(want.argmax()), t
+        assert ref.rel_err(got, want) < 2e-2, (t, ref.rel_err(got, want))
 
 
 # ----------------------------------------------------------------------
@@ -712,25 +785,27 @@ def test_overlay_slice(size: str, mode: str) -> None:
 # ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(("size", "L"), [("35B-A3B", 0), ("occamy", 0), ("occamy", 10)])
 @pytest.mark.parametrize("S", [1, 2, 3, 4])
-def test_moe_layer(S: int) -> None:
-    """Qwen3.6-35B-A3B's layer 0 (GDN, then its MoE) in one step of S slots: on the NPU's own input to the MoE (moe_in's
-    x), the router's logits (the route object's payload) within 3e-5 of fp32 math (the norm weight's bf16 rounding
-    corrected in the router's rows: ``image.QwenImage.pack``), the slots' top 8 the oracle's (``moe_route``); every
-    column's control packets and expert object as the host's routing of the NPU's logits makes them (``moe.route``:
-    the union dealt as whole experts and halves; the items' weights to 1e-5: the cores' fp32 to ~2^-16); each slot's
-    layer output within 1% of the
-    oracle's (``moe_ffn`` + ``shared_expert`` on x)."""
+def test_moe_layer(size: str, L: int, S: int) -> None:
+    """A layer L (GDN, then its MoE) of Qwen3.6-35B-A3B or Occamy (layer 0: Q3_K experts, 10: IQ3_XXS) as a slice of
+    its own in one step of S slots: on the NPU's own input to the MoE (moe_in's x), the router's logits (the route
+    object's payload) within 3e-5 of fp32 math (the norm weight's bf16 rounding corrected in the router's rows:
+    ``image.QwenImage.pack``), the slots' top 8 the oracle's (``moe_route``); every column's control packets and expert
+    object as the host's routing of the NPU's logits makes them (``moe.route``: the union dealt as whole experts and
+    halves; the items' weights to 1e-5: the cores' fp32 to ~2^-16); each slot's layer output within 1% of the oracle's
+    (``moe_ffn`` + ``shared_expert`` on x; Occamy's layer 10: 1.5%, its shared expert's output 2.6x the routed experts'
+    and x small: 1.1% from the oracle, 0.8% from one with the cores' bf16 gate and h = silu(gate) up)."""
     from artlite.operators.moe import route as MR
     from artlite.operators.qwen35.overlay import CP_BYTES, QwenOverlay
 
-    path = ref.qwen_gguf("Q4_K_M", "35B-A3B")
+    path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     g = GGUFFile(path)
-    ov = QwenOverlay(g, layers=[0], vocab=COLS * 64, max_positions=128)
+    ov = QwenOverlay(g, layers=[L], vocab=COLS * 64, max_positions=128)
     ov.load(release=False)
-    cfg, H, L = ov.cfg, ov.H, 0
+    cfg, H = ov.cfg, ov.H
     x = g.rows("token_embd.weight", ref.llama_tokenize(path, essay("apple.txt"))[:S])
     ov.step(x, 0, logits=False)
     dev = ov.dev
@@ -769,7 +844,7 @@ def test_moe_layer(S: int) -> None:
     want = xin + ref.moe_ffn(xn, rids, rw, ex) + shared
     for s in range(S):
         got = ov.hidden(-1, slot=s).numpy()
-        assert ref.rel_err(got, want[s]) < 1e-2, (s, ref.rel_err(got, want[s]))
+        assert ref.rel_err(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, ref.rel_err(got, want[s]))
 
 
 # ----------------------------------------------------------------------
