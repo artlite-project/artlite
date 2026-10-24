@@ -256,10 +256,11 @@ __attribute__((noinline)) void {{ p }}_q3k_mm(const uint8_t *__restrict xp, cons
     }
 }
 
-// super-blocks 2 H, 2 H + 1 of a Q3_K tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels)
+// super-blocks 2 H, 2 H + 1 of a Q3_K tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; ys:
+// the second super-block's rows at y + ys (row groups)" if rg else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_q3k(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     uint8_t *hw = scr;
     bfloat16 *sct = (bfloat16 *)(scr + 1152), *dg = (bfloat16 *)(scr + 2688), *c = (bfloat16 *)(scr + 2752);
@@ -271,7 +272,7 @@ __attribute__((noinline)) void {{ p }}_q3k(uint8_t *__restrict a, const uint8_t 
     for (int u = 0; u < 2; u++) {
         {{ p }}_q3k_tab(hw, sct, yu, dg, H, u);
         {{ p }}_q3k_mm(xp + {{ 32 * PANEL }} * u, a + {{ 4 * R3 * NW3 }} + {{ 4 * R3 * 24 }} * (2 * H + u), c, mt);
-        {{ p }}_k23sc(c, sct, yu, dg, y);
+        {{ p }}_k23sc(c, sct, yu, dg, y{{ " + u * ys" if rg else "" }});
     }
 }
 """

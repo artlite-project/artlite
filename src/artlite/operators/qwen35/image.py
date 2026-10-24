@@ -5,7 +5,9 @@ Per-column rows (the columns' work is independent up to each output projection):
 - GDN layers ("gdn_in"): column c holds q / k heads {2c, 2c + 1} (``QwenConfig.ssm_k_heads`` / 8 per column) and
   the v heads j with j % k_heads in that set (27B: 6 heads, 9B: 4), in increasing j: its rows of ``attn_qkv``
   ([q heads | k heads | v heads] of the column), of ``attn_gate`` (z of its v heads) and one tile of
-  ``ssm_alpha`` | ``ssm_beta`` (its v heads' rows). The conv channels, the delta-rule state and the gated norm
+  ``ssm_alpha`` | ``ssm_beta`` (its v heads' rows: block "ab"; of two tile formats, an F32 alpha's (Occamy's): blocks
+  "alpha", its BFP16 planes (``overlay.image.Block``: per head its hi and lo rows, whose outputs the decode adds,
+  packed times w / bf16(w) as the router's below, w the layer's ``attn_norm``), and "beta"). The conv channels, the delta-rule state and the gated norm
   of a v head stay in its column; the column's GDN output (its v heads, 128 each) lands at the heads' places
   of the ``ssm_out`` input (pairs of consecutive heads: whole Q4_K super-blocks).
 - attention layers ("attn_in"): column c holds q heads 3c .. (27B; 9B: 2 per column) with their gate rows
@@ -115,17 +117,24 @@ class QwenImage(TileImage):
         self._place()
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
-        """(an MoE model's router tensors as their copies times w / bf16(w), module docstring; dropped after)"""
+        """(an MoE model's router tensors and an F32 alpha as their copies times w / bf16(w), module docstring; dropped
+        after)"""
         names = []
-        for L in self.layers if self.cfg.moe else []:
-            w = self.gguf.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy().reshape(-1)
-            bw = torch.from_numpy(w).bfloat16().float().numpy()
-            ratio = np.where(bw != 0, w / np.where(bw != 0, bw, 1), 1).astype(np.float32)
-            for name in (f"blk.{L}.ffn_gate_inp.weight", f"blk.{L}.ffn_gate_inp_shexp.weight"):
-                t = self.gguf.tensor(name)
-                raw = (np.asarray(t.raw, np.float32).reshape(t.rows, t.cols) * ratio).astype(np.float32)
-                self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
-                names.append(name)
+        for L in self.layers:
+            b = f"blk.{L}."
+            planes = [(b + "post_attention_norm", (b + "ffn_gate_inp.weight", b + "ffn_gate_inp_shexp.weight"))] \
+                if self.cfg.moe else []
+            if not self.cfg.attention[L] and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
+                planes.append((b + "attn_norm", (b + "ssm_alpha.weight",)))
+            for norm, tensors in planes:
+                w = self.gguf.tensor(norm + ".weight").dequantize().numpy().reshape(-1)
+                bw = torch.from_numpy(w).bfloat16().float().numpy()
+                ratio = np.where(bw != 0, w / np.where(bw != 0, bw, 1), 1).astype(np.float32)
+                for name in tensors:
+                    t = self.gguf.tensor(name)
+                    raw = (np.asarray(t.raw, np.float32).reshape(t.rows, t.cols) * ratio).astype(np.float32)
+                    self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
+                    names.append(name)
         try:
             return super().pack(out, threads=threads, release=release)
         finally:
@@ -159,9 +168,17 @@ class QwenImage(TileImage):
                 qkv.append(np.concatenate([qk, hk * d + qk, v]))
                 z.append(np.concatenate([j * d + np.arange(d) for j in vh]))
                 ab.append(np.concatenate([vh, cfg.ssm_v_heads + np.asarray(vh)]))  # (alpha | beta stacked)
+            alpha, beta = b + "ssm_alpha.weight", b + "ssm_beta.weight"
+            ab = np.stack(ab)
+            if self.fmt(alpha) == self.fmt(beta):
+                abp = [("ab", (alpha, beta), ab)]
+            else:  # (an F32 alpha: its planes [hi, lo] per head, module docstring; their sums: an MoE design's B_PAIR)
+                assert cfg.moe and self.gguf.tensor_info[alpha][1] == "F32", (alpha, self.fmt(alpha), self.fmt(beta))
+                a = ab[:, :ab.shape[1] // 2]
+                abp = [("alpha", (alpha,), np.stack([2 * a, 2 * a + 1], -1).reshape(COLS, -1)),
+                       ("beta", (beta,), ab[:, ab.shape[1] // 2:] - cfg.ssm_v_heads)]
             self._add(layer, "gdn_in", [("qkv", (b + "attn_qkv.weight",), np.stack(qkv)),
-                                        ("z", (b + "attn_gate.weight",), np.stack(z)),
-                                        ("ab", (b + "ssm_alpha.weight", b + "ssm_beta.weight"), np.stack(ab))], H)
+                                        ("z", (b + "attn_gate.weight",), np.stack(z)), *abp], H)
             self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
         if cfg.moe:
             self._moe(layer)

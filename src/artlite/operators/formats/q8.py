@@ -1,7 +1,8 @@
 """Q8_0 tiles (272 bytes per row and super-block): d [row][sb][i] bf16 | codes as the decode GEMV's MMUL panels
 [sb][row group R / 8][group i][step s][row 8][8 B] (codes 8 s .. 8 s + 7 of group i of the 8 rows: one 64-byte B
-panel each, no transposition in the kernel). Decode only (``overlay.gemv``, the Gemma LM head): no prefill GEMM
-reads them."""
+panel each, no transposition in the kernel). Decode only (``overlay.gemv``): Gemma's LM head in 512-column tiles of 16
+rows (the row split: a core per row group), Qwen's GDN z in 1024-column tiles of 8 rows (the super-block split, as the
+K-quants': pageable). No prefill GEMM reads them."""
 
 from typing import ClassVar
 
@@ -20,11 +21,12 @@ template <typename T>
     return n;
 }
 
-// ---- Q8_0 ({{ R80 }} rows): d [row][sb][i] bf16 | codes [sb][g][i][s][row 8][8 B] (MMUL panels). Core H: row group H
-// (y[32 H ..]). Scratch: tab [sb][i][r] (128 B per sb) | c [sb][i][32] (512 B per sb)
+// ---- Q8_0 ({{ R80 }} rows): d [row][sb][i] bf16 | codes [sb][g][i][s][row 8][8 B] (MMUL panels). {{ "Core H: super-blocks 2 H, 2 H + 1 of the row group (y[0 ..])" if R80 == 8 else "Core H: row group H (y[32 H ..])" }}.
+// Scratch: tab [sb][i][r] (128 B per sb) | c [sb][i][32] (512 B per sb)
 
-// c_sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][32]; C = sum_s X(sb, i, s) W(sb, i, s); groups i, i + 1 in two
-// chains
+// c_sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][32] for NS super-blocks (their slices of the row group SK bytes
+// apart); C = sum_s X(sb, i, s) W(sb, i, s); groups i, i + 1 in two chains
+template <int NS, int SK>
 __attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, const uint8_t *__restrict w, bfloat16 *__restrict c)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -32,7 +34,7 @@ __attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, cons
     const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
     bfloat16 *__restrict pc = c;
     AIE_LOOP_NO_UNROLL
-    for (int sb = 0; sb < {{ NSB }}; sb++) {
+    for (int sb = 0; sb < NS; sb++) {
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int i = 0; i < 8; i += 2) {
             const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
@@ -50,7 +52,7 @@ __attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, cons
             pw += 512;
             pc += 64;
         }
-        pw += {{ 256 * R80 - 2048 }};  // (the next super-block's slice, the same row group)
+        pw += SK;  // (the next super-block's slice, the same row group)
     }
 }
 
@@ -60,11 +62,19 @@ __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t 
 {
     bfloat16 *tab = (bfloat16 *)scr;
     bfloat16 *c = (bfloat16 *)(scr + 1024);
+{% if R80 == 8 %}
+    {{ p }}_dtab<1, 2>((const bfloat16 *)a + 16 * H, tab);  // (the rows' d of super-blocks 2 H, 2 H + 1)
+    {{ p }}_q80_mm<2, 0>(xp, a + {{ 16 * NSB * R80 }} + 4096 * H, c);
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < 2; sb++)
+        {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y);
+{% else %}
     {{ p }}_dtab<1>((const bfloat16 *)a + {{ 64 * NSB }} * H, tab);
-    {{ p }}_q80_mm(xp, a + {{ 16 * NSB * R80 }} + 2048 * H, c);
+    {{ p }}_q80_mm<{{ NSB }}, {{ 256 * R80 - 2048 }}>(xp, a + {{ 16 * NSB * R80 }} + 2048 * H, c);
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < {{ NSB }}; sb++)
         {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y + 32 * H);
+{% endif %}
 }
 """
 
@@ -86,14 +96,15 @@ class Q8Slot(Slot):
         return True
 
     def mmv_split(self, fmt: str, nsb: int) -> int:
-        return 16  # (each core one row group of every super-block)
+        # (512-column tiles: each core one row group of every super-block; 1024: 8 rows, the super-block split)
+        return 16 if nsb == 2 else 0
 
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
         return ("mmv/dtab", f"mmv/{fmt}")
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, int]:
         R = self.format(fmt).rows(tile_bytes, nsb, self.mmv_split(fmt, nsb))
-        assert R == 16, R
+        assert R == (16 if nsb == 2 else 8), (R, nsb)
         return {"R80": R}
 
 

@@ -380,7 +380,7 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms; F_GU
 // ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0 (kmath.act: the gather LUT, through gs){{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
-__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if act == "silu" and YT == 128 else "" }})
+__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if act == "silu" and YB == 128 else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     float *__restrict yt = WS(float, {{ w_.yt }});
@@ -395,7 +395,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         for (int g = 0; g < {{ YT }}; g += 32)
             aie::store_v(yt + g, al::mulff<32>(aie::load_v<32>(yt + g), iv));
     }
-{% if act == "silu" and YT == 128 %}
+{% if act == "silu" and YB == 128 %}
     if (flags & {{ F_GU }}) {
         bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
         AIE_LOOP_NO_UNROLL
@@ -502,7 +502,7 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
     {{ p }}_put_bf16(ps, aie::accum<accfloat, 16>(y).template to_vector<bfloat16>(), nv);
     return nv;
 }
-{% if gu_win and YT == 128 %}
+{% if gu_win and YB == 128 %}
 
 // F_GU tiles of R != 16 rows (gu_win: their [8 gate | 8 up] row groups cross tiles; R <= 32): the tile's R rows of each
 // slot onto the slot's window (gw [slot][64] fp32, st[S_GN] rows); per 16 rows it holds, the window's 16 w .. 16 w + 15
@@ -867,7 +867,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
     float *__restrict yt = WS(float, {{ w_.yt }});
 {% if moe %}
     if (st[{{ S_FMT }}] & {{ B_G2 + B_G4 }}) {  // (row groups: the helper's rows are rows of their own, after ours)
-        float *__restrict yh = yt + ((st[{{ S_FMT }}] & {{ B_G4 }}) ? 128 : 64);
+        float *__restrict yh = yt + ((st[{{ S_FMT }}] & {{ B_G4 }}) ? {{ 2 * YB }} : {{ YB }});
         for (int i = 0; i < {{ YN }}; i += 32)
             aie::store_v(yh + i, aie::load_v<32>(r + i));
     } else
@@ -915,6 +915,31 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
     const int n = st[{{ S_STG }}];
 {% if moe %}
     const int gu = (flags & {{ F_GU }}) | ((fw & {{ B_GU }}) ? {{ F_GU }} : 0);  // (F_GU, or this block's B_GU)
+{% if YB == 128 %}
+    {{ p }}_rows(ws, flags & ~{{ F_GU }}, 0);
+    const int nw = gu ? {{ p }}_guwin(ws, S, R) : 0;  // (gate / up: the windows completed, [8 gate | 8 up] each)
+    int add = 0;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {  // (per 16 rows: a row group's rows 0 .. 15, 16 .. (block j: halves 2 j, 2 j + 1),
+        // a window's 8 outputs)
+        int a = 0;
+        if (gu) {
+            AIE_LOOP_NO_UNROLL
+            for (int w = 0; w < nw; w++)
+                a += {{ p }}_slot(ws, s, flags, fw, 8, 0, n + a, w, acc);
+        } else {
+            AIE_LOOP_NO_UNROLL
+            for (int j = 0; j < G; j++) {
+                const int k = nv - R * j > R ? R : nv - R * j;
+                if (k > 0)
+                    a += {{ p }}_slot(ws, s, flags, fw, k > 16 ? 16 : k, row0 + r0 + R * j, n + a, 2 * j, acc);
+                if (k > 16)
+                    a += {{ p }}_slot(ws, s, flags, fw, k - 16, row0 + r0 + R * j + 16, n + a, 2 * j + 1, acc);
+            }
+        }
+        add = a;
+    }
+{% else %}
     {{ p }}_rows(ws, flags | gu);
     int add = 0;
     AIE_LOOP_NO_UNROLL
@@ -928,11 +953,12 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
         }
         add = a;
     }
+{% endif %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YT }}; i += 16)
         aie::store_v(yt + i, aie::zeros<float, 16>());
 {% else %}
-    {{ p }}_rows(ws, {{ "flags & ~%d" % F_GU if gu_win else "flags" }}{{ ", 2" if act == "silu" and YT == 128 else "" }});
+    {{ p }}_rows(ws, {{ "flags & ~%d" % F_GU if gu_win else "flags" }}{{ ", 2" if act == "silu" and YB == 128 else "" }});
 {% endif %}
 {% if moe %}
 {% elif YT == 128 %}
@@ -1237,11 +1263,20 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
                 aie::store_v(pl + 32 * g + 8 * s, aie::load_v<8>(src + {{ 32 * COLS }} * s + 8 * g));
     }
 {% endif %}
-{% if gu_win %}
+{% if gu_win and moe %}
+    int gub = flags & {{ F_GU }};
+    for (int i = 0; i < m[{{ M_NB }}]; i++)
+        gub |= m[{{ M_B + 1 }} + 3 * i] & {{ B_GU }};
+    if (gub) {  // (the slots' gate / up windows: ``guwin``; F_GU or a B_GU block)
+        st[{{ S_GN }}] = 0;
+        st[{{ S_GK }}] = 0;
+        {{ p }}_zv(WS(int32_t, {{ w_.gw }}), {{ (64 if YB == 128 else 32) * SLOTS * 4 // 64 }});
+    }
+{% elif gu_win %}
     if (flags & {{ F_GU }}) {  // (the slots' gate / up windows: ``guwin``)
         st[{{ S_GN }}] = 0;
         st[{{ S_GK }}] = 0;
-        {{ p }}_zv(WS(int32_t, {{ w_.gw }}), {{ (64 if YT == 128 else 32) * SLOTS * 4 // 64 }});
+        {{ p }}_zv(WS(int32_t, {{ w_.gw }}), {{ (64 if YB == 128 else 32) * SLOTS * 4 // 64 }});
     }
 {% endif %}
     {{ p }}_zv(WS(int32_t, {{ w_.yt }}), {{ YT * 4 // 64 }});

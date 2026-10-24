@@ -172,8 +172,8 @@ S_NSUB, S_NLS, S_XC0, S_SUB, S_SG = 44, 45, 46, 47, 48
 S_WORDS = 64
 assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS and S_SG + SLOTS <= S_WORDS
 # paged formats (module docstring): the memtile's page channel, its first page BD (none of aiecc's: ``Store.check``), the
-# store's bytes; the pager's state words (data memory of the main and helper cores) and wake lock; the stream ids of
-# the pages' and the requests' routes (main, helper)
+# store's bytes (of up to 4 paged formats; of more: ``pg_store``); the pager's state words (data memory of the main and
+# helper cores) and wake lock; the stream ids of the pages' and the requests' routes (main, helper)
 PG_CH, PG_BD, PG_STORE, PG_STORE_BYTES = 5, 40, 0x78000, 0x8000
 PG_STATE, PG_WAKE = 0xFFE0, 15  # (32-byte aligned: aiecc)
 PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
@@ -242,7 +242,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.max_k = max_k
         self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
         assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= max_k
-        assert not moe or not (post or pli or packed or tok or gu_win) and act == "silu" and nsb == 4
+        assert not moe or not (post or pli or packed or tok) and act == "silu" and nsb == 4
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert act in ("silu", "gelu") and (not pli or act == "gelu")
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
@@ -257,8 +257,12 @@ class DecodeOverlayOperator(ArtcOperator):
         self.yt = 128 if any(r > 16 for r in rows.values()) else 64  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
         self.yn = 128 if any(r > 16 and f not in self.rowsplit for f, r in rows.items()) else gemv.Y_FLOATS
-        if self.moe:  # (row groups: a tile's 4 blocks of 16 rows, the helper's two)
-            self.yt, self.yn = 256, 128
+        self.yb = self.yt  # (floats of a tile's row block: 16 rows [g 2][slot][r], 32 rows [g 4][slot][r])
+        if self.moe:  # (row groups: a tile's 4 blocks, the helper's two; tiles of more than 16 rows: blocks of 32 rows,
+            # their gate / up rows through the windows, ``gu_win``)
+            self.yb = 128 if any(r > 16 for r in rows.values()) else 64
+            self.yt, self.yn = 4 * self.yb, 2 * self.yb
+            self.gu_win = self.gu_win or self.yb == 128
             self.PACKET, self.BD_COUNT = {"X": XID}, {"A": 3}  # (shim BD 3: the experts' tasks, ``moe``)
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
@@ -285,7 +289,7 @@ class DecodeOverlayOperator(ArtcOperator):
         if self.pli:
             sizes += [("pli", 2 * 4 * SLOTS * 8)]
         if self.gu_win:
-            sizes += [("gw", 4 * SLOTS * (64 if self.yt == 128 else 32))]
+            sizes += [("gw", 4 * SLOTS * (64 if self.yb == 128 else 32))]
         if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
             # routing's C objects (control packets, the expert object's metadata), the expert object's plan)
             sizes += [("wsc", 4 * 32), ("hold", 2 * SLOTS * OBJ_K), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
@@ -318,7 +322,7 @@ class DecodeOverlayOperator(ArtcOperator):
         fmts = list(self.rows)
         assert not self.xh or OBJ_K * 2 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
-                          pg=self._page_spec() if self.paged else None, rg=self.moe)
+                          pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb)
         src += self._extra_src(p, consts)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs, "XS_SLOT": gemv.XS_SLOT,
               "XPH": self.max_g * self.chunk.xp // 2, "XPHC": self.chunk.xp // 2,
@@ -332,7 +336,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  rowsplit=bool(self.rowsplit), rows_split=self.rowsplit,
                                  helper_y=[(f, gemv.helper_y(f, self.chunk.nsb)) for f in self.rowsplit
                                            if gemv.helper_y(f, self.chunk.nsb)],
-                                 YT=self.yt, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
+                                 YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS,
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
@@ -348,11 +352,20 @@ class DecodeOverlayOperator(ArtcOperator):
         return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
                 "ITEM_WORDS": ITEM_WORDS}
 
+    @property
+    def pg_store(self) -> tuple[int, int, int]:
+        """(first BD, store address, bytes) of the page store: PG_BD, PG_STORE, PG_STORE_BYTES for up to 4 paged
+        formats; of more, the BDs from 48 - 2 n (the odd channels' last) and 48 KB (6 formats' pages of ~3-4 KB per
+        core half)."""
+        n = len(self.paged)
+        return (PG_BD, PG_STORE, PG_STORE_BYTES) if n <= 4 else (48 - 2 * n, 0x74000, 0xC000)
+
     def _page_spec(self) -> gemv.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
         (h0, ctl), (h1, _) = (paging.request(stream_id=i, channel=PG_CH) for i in PG_REQ_ID)
+        bd0 = self.pg_store[0]
         return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1),
-                             bd0=(PG_BD, PG_BD + len(self.paged)), ctl=ctl)
+                             bd0=(bd0, bd0 + len(self.paged)), ctl=ctl)
 
     def page_store(self) -> paging.Store | None:
         """The compiled design's page store (the paged formats' pages of the main cores, then of the helpers), checked
@@ -369,7 +382,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
                                stream_id=PG_PAGE_ID[h])
-        store = paging.Store(base=PG_STORE, size=PG_STORE_BYTES, channel=PG_CH, bd0=PG_BD,
+        bd0, base, size = self.pg_store
+        store = paging.Store(base=base, size=size, channel=PG_CH, bd0=bd0,
                              pagers=(pager(0, self.MAIN_ROW, self.STACK), pager(1, self.HELPER_ROW, self.HELPER_STACK)))
         store.check(wd, range(COLS))
         return store
@@ -569,7 +583,8 @@ class DecodeOverlayOperator(ArtcOperator):
             if not self.paged:
                 break
             mem, main, helper = Tile(c, 1), Tile(c, mr), Tile(c, hr)
-            store = Buffer(np.ndarray[(PG_STORE_BYTES // 4,), i32], tile=mem, name=f"{P}_pgstore{c}", address=PG_STORE)
+            store = Buffer(np.ndarray[(self.pg_store[2] // 4,), i32], tile=mem, name=f"{P}_pgstore{c}",
+                           address=self.pg_store[1])
             pg_main[c] = [Buffer(st_ty, tile=main, name=f"{P}_pgst{c}_{mr}", address=PG_STATE), store]
             pg_help[c] = [Buffer(st_ty, tile=helper, name=f"{P}_pgst{c}_{hr}", address=PG_STATE)]
             pg_locks += [Lock(main, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{mr}"),

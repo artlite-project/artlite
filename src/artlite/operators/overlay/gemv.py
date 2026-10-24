@@ -44,7 +44,7 @@ PANEL = 72  # bytes of a bfp16 8x8 panel
 XS_SLOT = 192  # bytes of a slot of sum panels (two panels, 64-byte aligned: a panel stream must start aligned)
 Y_FLOATS = 64  # a tile's output: [g 2][slot 4][r 8] fp32 (tiles of up to 32 rows in the super-block split: [g 4], 128)
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
-RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K")  # (``render(rg=)``) the formats of row-group tiles
+RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS")  # (``render(rg=)``) the formats of row-group tiles
 B_G4 = 8192  # (``overlay.decode``'s block format word bit of row groups of 4)
 
 
@@ -233,7 +233,7 @@ __attribute__((noinline)) void {{ p }}_pg_need(int page)
 {% endif %}
 
 // One tile of format fmt, super-blocks 2 H, 2 H + 1: y[g][32] += their rows against xp (the 64 panels of those
-// super-blocks) and xs (the chunk's sum panels){{ "; rg: fmt's B_G4 (row groups of 4: super-block 2 H + 1's rows into y + 64, rows of their own)" if rg else "" }}
+// super-blocks) and xs (the chunk's sum panels){{ "; rg: fmt's B_G4 (row groups of 4: super-block 2 H + 1's rows into y + %d, rows of their own)" % yb if rg else "" }}
 {% if rowsplit %}
 // (a row-split format, ``row_split``: rows 16 H .. of all its super-blocks, xp the chunk's panels; Q8_0: its row
 // group H into y[32 H ..])
@@ -244,7 +244,7 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
                                            int32_t fmt)
 {
 {% if rg %}
-    const int ys = (fmt & {{ B_G4 }}) ? 64 : 0;
+    const int ys = (fmt & {{ B_G4 }}) ? {{ yb }} : 0;
     fmt &= 255;
 {% endif %}
 {% for f in fmts %}
@@ -263,6 +263,16 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 }
 
 }  // namespace
+{% if keep %}
+
+// (every format paged: the resident code keeps the inline tables of kernel_lib their pages read; a page brings no data)
+__attribute__((noinline, used, retain)) void {{ p }}_keep(v64int8 *o)
+{
+    const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();
+    o[0] = a.mantissa;
+    o[1] = b.mantissa;
+}
+{% endif %}
 {% for f in paged %}
 {% for h in (0, 1) %}
 
@@ -302,12 +312,12 @@ def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str,
 
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
-           pg: PageSpec | None = None, rg: bool = False) -> str:
+           pg: PageSpec | None = None, rg: bool = False, yb: int = 64) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
     are code pages (``pg``: their pager), in page-id order (from 1). ``rg``: the format word's B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``overlay.image.Block.G``) put super-block 2 H + 1's rows
-    after 2 H's instead of adding them."""
+    ``yb`` floats after 2 H's instead of adding them."""
     assert all(supported(f, nsb) for f in fmts), (fmts, nsb)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
     assert not rg or nsb == 4, (rg, nsb)
@@ -322,8 +332,9 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     # (retain: the frame's table in every link where formats are paged, used or not by resident code: a page brings no
     # data of its own)
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
+                            keep=bool(paged) and set(paged) == set(fmts),
                             retain="__attribute__((used, retain)) " if paged else "", rg=rg,
-                            rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4,
+                            rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4, yb=yb,
                             rowsplit=any(row_split(f, nsb) for f in fmts),
                             fid={f: FORMATS[f].fid for f in FORMATS}, fn={f: FORMATS[f].mmv for f in FORMATS}, NSB=nsb,
                             PANEL=PANEL, XS_SLOT=XS_SLOT, **var)

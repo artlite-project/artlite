@@ -22,6 +22,7 @@ from ml_dtypes import bfloat16
 
 from ..design import COLS, range32
 from ..overlay import decode as OD
+from ..overlay import gemv
 from ..overlay.decode import C_LEN, META, NX_PER_NORM, XPAY, DecodeOverlayOperator, _Streams
 from . import attn as AT
 from . import gdn as GD
@@ -31,8 +32,8 @@ M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
-    """The qwen35 decode overlay design (module docstring): ``rows``: {tile format: rows per tile} of Q4_K, Q5_K,
-    Q6_K tiles of 1024 columns (``tile_bytes`` 9280); ``gdn``, ``attn``: the shapes of the GDN and attention cores
+    """The qwen35 decode overlay design (module docstring): ``rows``: {tile format: rows per tile} of tiles of 1024
+    columns (``tile_bytes`` 9280; formats the decode GEMV reads, ``gemv.supported``); ``gdn``, ``attn``: the shapes of the GDN and attention cores
     (None: without)."""
 
     PREFIX = "q35m"
@@ -45,7 +46,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         """moe: (experts, experts per token) of an MoE model (``overlay.decode``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``overlay.model.paged_formats``:
         a drafter's Q4_0 beside the model's three)."""
-        assert set(rows) <= {"Q4_K", "Q5_K", "Q6_K", "Q4_0"} | ({"BFP16"} if moe else set()) and tile_bytes == 9280, rows
+        assert all(gemv.supported(f, 4) for f in rows) and tile_bytes == 9280, rows
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn

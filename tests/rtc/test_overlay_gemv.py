@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile, QTensor
-from artlite.model_config import gemma_gguf, llama_gguf
+from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf
 from artlite.operators import bfp16
 from artlite.operators.formats import FORMATS, pack_tile, slice_fields, tile_format
 from artlite.operators.overlay import gemv
@@ -163,10 +163,13 @@ GEMV = [
     ("Q2_K", 9408, 4, ("llama", "Q2_K", "3B"), "blk.0.ffn_gate.weight"),  # (26 rows)
     ("Q3_K", 9408, 4, ("llama", "Q2_K", "3B"), "blk.0.attn_v.weight"),  # (21 rows)
     ("Q3_K", 9856, 4, ("llama", "Q3_K_M", "3B"), "blk.0.ffn_gate.weight"),  # (22 rows)
+    ("Q8_0", 9280, 4, ("occamy",), "blk.0.attn_gate.weight"),  # (8 rows: the super-block split)
 ]
 
 
 def _path(key: tuple[str, ...]) -> str:
+    if key[0] == "occamy":
+        return occamy_gguf()
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])
 
 
