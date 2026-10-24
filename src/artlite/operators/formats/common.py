@@ -22,7 +22,8 @@ class TileFormat:
     Q4 nibbles 4, Q5_K 5, Q6_K 6; word-major Q2_K 2, Q3_K 3: 2 planes words per k-tile; 0: no codes); plane_major:
     the slice is [plane][row][32 B] (else [row][plane][32 B]): the prefill GEMM's memtile gathers either into
     [plane][row] (``gemm_q``);
-    fixed_rows: rows of a fixed-size tile (BFP16: 8-row MMUL panels; the object size follows); ws_planes: GemmQ's expanded
+    fixed_rows: rows of a fixed-size tile (BFP16: 8-row MMUL panels; the object size follows); pad8_row: code bytes per row
+    and super-block stored for the rows rounded up to a multiple of 8 (IQ3_XXS: its indices in 8-row panels); ws_planes: GemmQ's expanded
     scale planes (tile-major formats); dq_row_cycles: GemmQd's planar dequant, cycles per row (MMUL
     column) and k-tile on the dequantizing core (measured; ``gemm_qd.k_tile_cycles``). Methods take
     ``nsb``, the super-blocks of a tile (8: 2048 columns); word_major: the tile is stored [word][row][4 B] (header words, then each
@@ -40,6 +41,7 @@ class TileFormat:
     planes: int = 0
     plane_major: bool = False
     fixed_rows: int | None = None
+    pad8_row: int = 0
     header_pad32: bool = False
     ws_planes: int = 0
     dq_row_cycles: float | None = None
@@ -68,7 +70,7 @@ class TileFormat:
         return self.slice_row * rows
 
     def used_bytes(self, rows: int, nsb: int = 8) -> int:
-        return self.header_bytes(rows, nsb) + nsb * self.slice_bytes(rows)
+        return self.header_bytes(rows, nsb) + nsb * (self.slice_bytes(rows) + self.pad8_row * (-rows % 8))
 
     def rows(self, tile_bytes: int, nsb: int = 8, max_rows: int = 0) -> int:
         """Rows per tile of ``tile_bytes`` (0: does not fit), at most ``max_rows`` (default: the format's)."""

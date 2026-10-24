@@ -398,26 +398,33 @@ void tile_q3k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// IQ3_XXS (iq3.py, word-major): header words [sb pair] bf16 d of both, then per super-block 24 code words [k-tile kt]
-/// [j 6]: j < 4 the index bytes 16 kt + 4 j .. + 3 (the block's qs), j = 4, 5 the sign / scale word of 32-k group
-/// 2 kt + j - 4: byte l = its sign field l (bits 7 l .. 7 l + 6) | bit l of its scale (bits 28 ..) at bit 7.
+/// IQ3_XXS (iq3.py): the index bytes [sb][32-k group i][panel pair h][row group g][8-k panel l' 2][row 8][2] (the
+/// block's qs; rows past R stay zero), the header words [sb pair][row] (bf16 d of both), the sign / scale words
+/// [sb][i][row]: byte l = the prefix XOR of sign field l (bits 7 l .. 7 l + 6) | bit l of the scale (bits 28 ..) at
+/// bit 7.
 void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
-  uint32_t* hw = reinterpret_cast<uint32_t*>(t);
-  uint32_t* cw = hw + size_t(nsb / 2) * R;
+  const int ng = (R + 7) / 8;  // (row groups)
+  uint32_t* hw = reinterpret_cast<uint32_t*>(t + size_t(nsb) * 512 * ng);
+  uint32_t* sw = hw + size_t(nsb / 2) * R;
   for (int r = 0; r < R; r++) {
     for (int p = 0; p < nsb / 2; p++)
       hw[size_t(p) * R + r] = uint32_t(bf16_of(src[r] + 196 * p)) | (uint32_t(bf16_of(src[r] + 196 * p + 98)) << 16);
     for (int sb = 0; sb < nsb; sb++) {
       const uint8_t* b = src[r] + 98 * sb;
-      uint32_t* c = cw + size_t(sb) * 24 * R + r;
-      for (int kt = 0; kt < 4; kt++) {
-        for (int j = 0; j < 4; j++) std::memcpy(c + size_t(6 * kt + j) * R, b + 2 + 16 * kt + 4 * j, 4);
-        for (int h = 0; h < 2; h++) {
-          uint32_t w, o = 0;
-          std::memcpy(&w, b + 66 + 4 * (2 * kt + h), 4);
-          for (int l = 0; l < 4; l++) o |= (((w >> (7 * l)) & 0x7F) | (((w >> (28 + l)) & 1) << 7)) << (8 * l);
-          c[size_t(6 * kt + 4 + h) * R] = o;
+      for (int i = 0; i < 8; i++) {
+        for (int l = 0; l < 4; l++)
+          std::memcpy(t + ((((size_t(sb) * 8 + i) * 2 + l / 2) * ng + r / 8) * 2 + l % 2) * 16 + 2 * (r % 8),
+                      b + 2 + 8 * i + 2 * l, 2);
+        uint32_t w, o = 0;
+        std::memcpy(&w, b + 66 + 4 * i, 4);
+        for (int l = 0; l < 4; l++) {
+          uint32_t c = (w >> (7 * l)) & 0x7F;
+          c ^= c << 1;
+          c ^= c << 2;
+          c ^= c << 4;
+          o |= ((c & 0x7F) | (((w >> (28 + l)) & 1) << 7)) << (8 * l);
         }
+        sw[(size_t(sb) * 8 + i) * R + r] = o;
       }
     }
   }
@@ -508,7 +515,7 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
     case TileFormat::Q3_K:
       return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
     case TileFormat::IQ3_XXS:
-      return 98 * size_t(nsb) * R;
+      return 98 * size_t(nsb) * R + 64 * size_t(nsb) * ((8 - R % 8) % 8);  // (the indices of 8-row panels)
     case TileFormat::BFP16_BF16:
     case TileFormat::BFP16_F16:
     case TileFormat::BFP16_F32:

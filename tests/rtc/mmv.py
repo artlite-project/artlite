@@ -19,7 +19,7 @@ from artlite.operators import bfp16
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import blocks
 from artlite.operators.design import COLS
-from artlite.operators.formats import FORMATS, slice_fields
+from artlite.operators.formats import FORMATS, iq3, slice_fields
 from artlite.operators.overlay.decode import C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.operators.overlay.gemv import (
     KB,
@@ -226,6 +226,18 @@ def _q3k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
+def _iq3(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (w = d (2 ls + 1) / 4 q: per super-block hilo(sum c (2 ls + 1) / 4) d, c = bf16(sum q X_a) per 32-k group; sums in
+    # fp32)
+    q = f["q"].astype(np.float64)
+    R, K = q.shape
+    C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32))
+    nsb = K // 256
+    S = (2 * f["ls"].astype(np.float64) + 1) / 4
+    Y = np.einsum("sbir,rbi->sbr", _csum(C).reshape(4, nsb, 8, R), S.reshape(R, nsb, 8))
+    return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
+
+
 def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     w = f["w"]  # (a BF16 tensor's bit patterns or an F16 tensor's values)
     w = w.astype(np.float32) if w.dtype == np.float16 else \
@@ -235,7 +247,7 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
-         "BFP16": _bfp16}
+         "IQ3_XXS": _iq3, "BFP16": _bfp16}
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
@@ -328,8 +340,9 @@ class MmvOperator(ArtcOperator):
     Args: A (n_tiles tile_bytes uint8), X (x panels + sum panels of a chunk, uint8), OUT (n_tiles x ``y_floats`` fp32:
     [g][slot][r])."""
 
-    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4):
-        self.fmt, self.n_tiles, self.tile_bytes, self.chunk = fmt, n_tiles, tile_bytes, Chunk(nsb)
+    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False):
+        """win: event0 / event1 around each core's half tile (the profiling skill's counters)."""
+        self.fmt, self.n_tiles, self.tile_bytes, self.chunk, self.win = fmt, n_tiles, tile_bytes, Chunk(nsb), win
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
         self.hy = helper_y(fmt, nsb)  # (where the second core's rows go)
         self.yn = 128 if self.rows > 16 and not row_split(fmt, nsb) else Y_FLOATS  # (a core's output)
@@ -359,14 +372,18 @@ void mmvh_tile0(uint8_t *__restrict a, const uint8_t *__restrict x, int32_t *__r
 {{
     cmd[0] = (int32_t)(uintptr_t)a - 0x30000;
     al::zero<{self.yn}, 32>(y);
+    {"event0();" if self.win else ""}
     mmvh_mmv<0>(a, x, x + {ch.xp}, y, scr, {fid});
+    {"event1();" if self.win else ""}
 }}
 
 void mmvh_tile1(const int32_t *__restrict cmd, const uint8_t *__restrict x, uint8_t *__restrict scr,
                 float *__restrict y)
 {{
     al::zero<{self.yn}, 32>(y);
+    {"event0();" if self.win else ""}
     mmvh_mmv<1>((uint8_t *)(uintptr_t)cmd[0], x + {x1}, x + {ch.xp}, y, scr, {fid});
+    {"event1();" if self.win else ""}
 }}
 
 // the tile's output: the second core's rows added (K-quants) or after the first's (row-split formats)
@@ -407,7 +424,7 @@ void mmvh_add(const float *__restrict r, const float *__restrict y, float *__res
         scr0, scr1, yb = Buffer(s_ty, name="m_scr0"), Buffer(s_ty, name="m_scr1"), Buffer(y_ty, name="m_y0")
         n = self.n_tiles
 
-        def core0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka):
+        def body0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka):
             x = xf.acquire(1)
             kc(x, xb)
             xf.release(1)
@@ -423,7 +440,7 @@ void mmvh_add(const float *__restrict r, const float *__restrict y, float *__res
                 rf.release(1)
                 af.release(1)
 
-        def core1(cf, rf, xb, s, kt):
+        def body1(cf, rf, xb, s, kt):
             for _ in range_(n):
                 c = cf.acquire(1)
                 r = rf.acquire(1)
@@ -431,9 +448,22 @@ void mmvh_add(const float *__restrict r, const float *__restrict y, float *__res
                 rf.release(1)
                 cf.release(1)
 
+        grid = []  # (IQ3_XXS: the cores' grid tables, placed, used through their addresses only)
+        if self.fmt == "IQ3_XXS":
+            t_ty = np.ndarray[(iq3.TAB_BYTES // 4,), np.dtype[np.uint32]]
+            grid = [[Buffer(t_ty, tile=Tile(0, 2 + h), name=f"m_grid{h}{i}", address=iq3.TAB[h][i] - 0x70000,
+                            initial_value=iq3.grid_words()) for i in range(2)] for h in range(2)]
+
+        def core0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka, *tabs):
+            body0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka)
+
+        def core1(cf, rf, xb, s, kt, *tabs):
+            body1(cf, rf, xb, s, kt)
+
         w0 = Worker(core0, [a_fifo.cons(), x_fifo.cons(), cmd.prod(), res.cons(), y_fifo.prod(), x_buf, scr0, yb,
-                            k_copy, k0, k_add], tile=Tile(0, 2), stack_size=2048)
-        w1 = Worker(core1, [cmd.cons(), res.prod(), x_buf, scr1, k1], tile=Tile(0, 3), stack_size=2048)
+                            k_copy, k0, k_add, *(grid[0] if grid else [])], tile=Tile(0, 2), stack_size=2048)
+        w1 = Worker(core1, [cmd.cons(), res.prod(), x_buf, scr1, k1, *(grid[1] if grid else [])], tile=Tile(0, 3),
+                    stack_size=2048)
         n_a = n * self.tile_bytes
 
         def seq(A, X, OUT, a_h, x_h, y_h):

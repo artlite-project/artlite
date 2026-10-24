@@ -140,6 +140,8 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         return per(f["d"], 32) * q + per(f["m"], 32)
     if fmt == "Q8_0":
         return per(f["d"], 32) * q
+    if fmt == "IQ3_XXS":
+        return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 4, 32, 1) * q
     sub = 32 if fmt in ("Q4_K", "Q5_K") else 16
     sc = np.repeat(f["sc"].astype(np.float64).reshape(q.shape[0], -1), sub, 1)
     if fmt in ("Q4_K", "Q5_K", "Q2_K"):
@@ -164,6 +166,8 @@ GEMV = [
     ("Q3_K", 9408, 4, ("llama", "Q2_K", "3B"), "blk.0.attn_v.weight"),  # (21 rows)
     ("Q3_K", 9856, 4, ("llama", "Q3_K_M", "3B"), "blk.0.ffn_gate.weight"),  # (22 rows)
     ("Q8_0", 9280, 4, ("occamy",), "blk.0.attn_gate.weight"),  # (8 rows: the super-block split)
+    ("IQ3_XXS", 9280, 4, ("occamy",), "blk.10.ffn_gate_exps.weight"),  # (23 rows)
+    ("Q3_K", 9280, 4, ("occamy",), "blk.0.attn_qkv.weight"),  # (21 rows)
 ]
 
 

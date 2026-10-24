@@ -85,7 +85,7 @@ from ... import txn
 from .. import paging
 from ..base import ArgSpec, ArtcOperator
 from ..design import COLS, linear_tap
-from ..formats import FORMATS
+from ..formats import FORMATS, iq3
 from ..kernel_source import kernel_prefix
 from ..moe import route as moe_k
 from ..util import Attr, regions
@@ -459,6 +459,8 @@ class DecodeOverlayOperator(ArtcOperator):
 
         def main_fn(a_f, x_f, c_f, cmd_f, res_f, *rest):
             rest = list(rest)
+            if "IQ3_XXS" in self.rows:  # (the grid tables: placed, read through their addresses)
+                rest = rest[:-2]
             if self.paged:  # (the pager's state words and the column's page store: placed, used by no code here)
                 rest = rest[:-2]
             m_f = rest.pop(0) if self.msg else None
@@ -592,6 +594,14 @@ class DecodeOverlayOperator(ArtcOperator):
             for h, t in enumerate((main, helper)):
                 pg_flows += [paging.page_flow(mem, t, channel=PG_CH, stream_id=PG_PAGE_ID[h]),
                              paging.request_flow(t, mem, stream_id=PG_REQ_ID[h])]
+        grids = {}  # (IQ3_XXS: per core the grid table's two copies at iq3.TAB, used through their addresses only)
+        if "IQ3_XXS" in self.rows:
+            t_ty = np.ndarray[(iq3.TAB_BYTES // 4,), np.dtype[np.uint32]]
+            for c in range(COLS):
+                for h, r in enumerate((mr, hr)):
+                    grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
+                                          address=iq3.TAB[h][i] - 0x70000, initial_value=iq3.grid_words())
+                                   for i in range(2)]
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}")
             moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
@@ -604,10 +614,12 @@ class DecodeOverlayOperator(ArtcOperator):
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, k_begin, k_nbegin,
                                             k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
-                                            *([k_psums] if self.post else []), ws, xp, xs, c, *pg_main.get(c, [])],
+                                            *([k_psums] if self.post else []), ws, xp, xs, c, *pg_main.get(c, []),
+                                            *grids.get((c, 0), [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
-            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *pg_help.get(c, [])],
+            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *pg_help.get(c, []),
+                                              *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos)
