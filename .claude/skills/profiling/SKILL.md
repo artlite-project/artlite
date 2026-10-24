@@ -18,7 +18,7 @@ sequence) are outside the hook: program the same counters by hand (aie-kernel-pe
 
 Kernels emit pulses on core events `INSTR_EVENT_0` (0x21=33) / `INSTR_EVENT_1` (0x22=34) via the `event0()` /
 `event1()` intrinsics. At compile time Artlite places the design with aie-opt, then injects `aiex.npu.write32` ops
-into the runtime sequence that program each core tile's 4 performance counters (AM029 `Performance_Control0/1` at
+into the runtime sequence that program each core tile's 4 performance counters (`Performance_Control0/1` at
 0x31500/0x31504, values at 0x31520..0x3152C). After every sampled dispatch the C++ runtime
 (`artlite._native.Profiler`) reads the counters through the context-scoped `AMDXDNA_AIE_TILE_READ` ioctl (no root
 needed; xdna-driver's module only: Linux's own driver and the XRT backend raise NotImplementedError; traces work on
@@ -62,7 +62,7 @@ Limitations (validated on hardware):
 |---|---|---|
 | `ARTLITE_PROFILE` | unset | `1`/`counters`/`trace`; unset/`0`/`off` disables (zero cost, no hook installed) |
 | `ARTLITE_PROFILE_DIR` | `./artlite_profile` | output directory |
-| `ARTLITE_PROFILE_COUNTERS` | `33:34,34:33,33:33,34:34` | perf-counter `start:stop` pairs. Core module: max 4. Prefix `m:` selects the core-tile **memory module** (max 2) for DM bank conflicts / DMA events; `mt:` the **memory tile** (row 1, max 4), `sh:` the **shim/PL tile** (row 0, max 4); each class dumps to its own `_mt_counters.json` / `_sh_counters.json`. Event **names** accepted from the matching enum (CoreEvent / MemEvent / MemTileEvent / ShimTileEvent). Fewer pairs = less readback overhead |
+| `ARTLITE_PROFILE_COUNTERS` | `33:34,34:33,33:33,34:34` | perf-counter `start:stop` pairs. Core module: max 4. Prefix `m:` selects the core-tile **memory module** (max 2) for DM bank conflicts / DMA events; `mt:` the **memory tile** (row 1, max 4), `sh:` the **shim/PL tile** (row 0, max 2); each class dumps to its own `_mt_counters.json` / `_sh_counters.json`. Event **names** accepted from the matching enum (CoreEvent / MemEvent / MemTileEvent / ShimTileEvent). Fewer pairs = less readback overhead |
 | `ARTLITE_PROFILE_SAMPLE_EVERY` | `1` | sample counters every Nth dispatch; deltas cover the N preceding dispatches |
 | `ARTLITE_PROFILE_TRACE_SIZE` | `4194304` | trace buffer bytes per program (trace mode) |
 | `ARTLITE_PROFILE_EVENTS` | mlir-aie defaults | comma list for `coretile_events`: names from `aie.utils.trace.events.CoreEvent` or hex. Defaults: INSTR_EVENT_0/1, INSTR_VECTOR, MEMORY_STALL, STREAM_STALL, LOCK_STALL, PORT_RUNNING_0/1 |
@@ -73,13 +73,13 @@ Limitations (validated on hardware):
 
 Manual conversion: `python -m artlite.profiling dump.ttbin <rtc_dir>/design.mlir.prj/input_with_addresses.mlir`
 
-Counter limits of the KMD (hence the 4-counter cap):
-- **Reading memtile counter registers ≥ 0x91030 hangs the KMD context permanently** (ETIME, then ENODEV; the NPU
-  needs a driver reload or a reboot). Reading core register 0x38004 (AM029's Core_Status offset) did the same, and the
-  driver reload then failed to start the NPU (SMU): a reboot. Read only registers the tools already read (core and
-  memory-module counters, lock values from 0x1F000, 0x32004, data memory).
+Counter limits (aie-rt's AIE2P map, mlir-aie's `third_party/aie-rt/driver/src/global/xaie2pgbl_params.h`: memtiles
+have 4 counters, shims 2; AM029's 6 are Versal's):
+- **Reading an address that is no register hangs the KMD context permanently** (ETIME, then ENODEV; the NPU needs a
+  driver reload or a reboot): memtile counters ≥ 0x91030 did, and core 0x38004 (AM029's Core_Status; AIE2P's is
+  0x32004) did too, after which the driver reload failed to start the NPU (SMU): a reboot. Look an address up in the
+  AIE2P map before reading it.
 - Memtile per-task START->FINISHED window pairs count 0: use GROUP_DMA_ACTIVITY dwell and stall levels instead.
-- The 3rd start/stop control register (counters 4/5) silently ignores write32.
 
 ## Performance overhead (measured on Strix Point, NPU2)
 

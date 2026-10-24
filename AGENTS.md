@@ -211,4 +211,6 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   intrinsics: its `clang/include/clang/Basic/BuiltinsAIE2P.def`.
 - AMD manuals, cited by number: AM027 / AM029 (AIE-ML v2 = AIE2P architecture manual / register reference), AM020 /
   AM025 (AIE-ML v1 = AIE2), UG1079 / UG1076 (AI Engine kernel and graph programming, tools and flows; chess /
-  Vitis, AIE1-oriented).
+  Vitis, AIE1-oriented). AM029 is Versal's register layout: its memory-module and memtile offsets are the NPU's, its
+  shim (NOC / PL module) and core register-file, debug and counter offsets are not (Core_Status: 0x38004 there,
+  0x32004 here). The NPU's map: mlir-aie's `third_party/aie-rt/driver/src/global/xaie2pgbl_params.h`.

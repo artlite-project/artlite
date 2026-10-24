@@ -149,6 +149,45 @@ def test_profiling_counters_mem_module(tmp_path):
     assert busy and all(e["args"]["value"] > 0 for e in busy)
 
 
+def test_counter_limits():
+    """Each tile module takes at most its AIE2P counters: core 4, memory module 2, memtile 4, shim 2."""
+    from artlite.profiling import _parse_counter_specs
+
+    for prefix, n in (("", 4), ("m:", 2), ("mt:", 4), ("sh:", 2)):
+        _parse_counter_specs(",".join([f"{prefix}1:1"] * n))
+        with pytest.raises(ValueError, match="at most"):
+            _parse_counter_specs(",".join([f"{prefix}1:1"] * (n + 1)))
+
+
+def test_profiling_counters_shim(tmp_path):
+    """Shim counters (sh: prefix) count the shim DMA's tasks."""
+    out_dir = _run_profiled(
+        tmp_path,
+        {
+            "ARTLITE_PROFILE": "1",
+            "ARTLITE_PROFILE_COUNTERS": (
+                "INSTR_EVENT_0:INSTR_EVENT_1,"
+                "sh:DMA_MM2S_0_START_TASK:DMA_MM2S_0_START_TASK,"
+                "sh:DMA_S2MM_0_FINISHED_TASK:DMA_S2MM_0_FINISHED_TASK"
+            ),
+        },
+        ONE_CORE_SCRIPT,
+    )
+    files = [f for f in os.listdir(out_dir) if f.endswith("_sh_counters.json")]
+    assert len(files) == 1, f"expected 1 shim counters json, got {os.listdir(out_dir)}"
+    with open(os.path.join(out_dir, files[0])) as f:
+        events = json.load(f)
+    counts = {}
+    for e in events:
+        if e.get("ph") == "C":
+            counts.setdefault(e["name"], []).append(e["args"]["value"])
+    assert sorted(counts) == [
+        "DMA_MM2S_0_START_TASK->DMA_MM2S_0_START_TASK count",
+        "DMA_S2MM_0_FINISHED_TASK->DMA_S2MM_0_FINISHED_TASK count",
+    ]
+    assert all(v > 0 for vs in counts.values() for v in vs), counts
+
+
 def test_profiling_counters_multi_column(tmp_path):
     """Counters mode instruments every core of a design on the whole array."""
     out_dir = _run_profiled(tmp_path, {"ARTLITE_PROFILE": "counters"}, ARRAY_SCRIPT)

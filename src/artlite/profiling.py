@@ -73,26 +73,25 @@ _HOOK_INSTALLED = False
 _PROFILERS: list[_native.Profiler] = []
 _TRACE_DUMPS: list[tuple[str, str]] = []  # (ttbin path, physical mlir path)
 
-# AIE2P performance counter registers (AM029).
+# AIE2P performance counter registers (aie-rt's xaie2pgbl_params.h; AM029 is
+# Versal's layout: its core offsets differ, its memtile and shim have 6).
 # Core module (per core tile): 4 counters. Memory module (per core tile's 64KB
-# DM + locks/DMAs): 2 counters. Memory-tile module (row 1): 6 counters.
-# PL module (shim tile, row 0): 6 counters; start/stop ctrl regs are at
-# 0x31000/0x3100C/0x31014 (odd ctrl indices are reset-event regs).
+# DM + locks/DMAs): 2 counters. Memory-tile module (row 1): 4 counters.
+# PL module (shim tile, row 0): 2 counters. A start/stop ctrl reg serves two
+# counters; the reset-event regs follow them (0x31508, 0x11008, 0x91008,
+# 0x31008). Reading an address past a module's counters (no register there,
+# e.g. 0x91030) wedges the context.
 _CORE_CTRL0 = 0x31500  # core counters 0/1 start/stop events
 _CORE_CTRL1 = 0x31504  # core counters 2/3
 _CORE_CNT_BASE = 0x31520  # 4 x u32, +4 each
 _MEM_CTRL0 = 0x11000  # memory-module counters 0/1 (2 max)
 _MEM_CNT_BASE = 0x11020
-# ctrl layout: counters 1-0 / 3-2 start-stop (AM029). Counters 4/5 are not
-# used: the 3rd start/stop register (0x9100C / 0x31014) silently ignores
-# writes32 from the runtime sequence on this KMD, and reading counter
-# registers >= 4 wedges the context.
 _MT_CTRL_BASES = (0x91000, 0x91004)
 _MT_CNT_BASE = 0x91020
-_SH_CTRL_BASES = (0x31000, 0x3100C)
+_SH_CTRL_BASES = (0x31000,)
 _SH_CNT_BASE = 0x31020
 
-_MAX_COUNTERS = {"core": 4, "mem": 2, "mt": 4, "sh": 4}
+_MAX_COUNTERS = {"core": 4, "mem": 2, "mt": 4, "sh": 2}
 # module name -> (trace-events enum attr, counter value base)
 _MOD_ENUM = {
     "core": "CoreEvent",
@@ -357,8 +356,8 @@ def instrumented_tiles_of(
 _CTRL_PLANS: dict[str, tuple[tuple[int, ...], int]] = {
     "core": ((_CORE_CTRL0, _CORE_CTRL1), 4),
     "mem": ((_MEM_CTRL0,), 2),
-    "mt": (_MT_CTRL_BASES, 6),
-    "sh": (_SH_CTRL_BASES, 6),
+    "mt": (_MT_CTRL_BASES, 4),
+    "sh": (_SH_CTRL_BASES, 2),
 }
 # module -> tile classes that carry it
 _MOD_TILE_CLASSES = {"core": ("core",), "mem": ("core",), "mt": ("mt",), "sh": ("sh",)}
