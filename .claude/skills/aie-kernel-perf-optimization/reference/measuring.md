@@ -140,6 +140,9 @@ in near-equal pairs (banks 2i and 2i + 1 share 16 KB region i).
   - Equal: the schedule is the truth, and further gains come from the schedule.
 - **Lock stall** over the whole dispatch = waiting for data or for output space. When it dominates
   the GEMM cores, the stream (or the producer core) paces them.
+- The stall counters (start == stop) count the whole dispatch, not the window: per window only where the windows
+  cover the dispatch (a harness). For a window on some of a design's calls (one format's tiles in an overlay),
+  compare its cycles with the static cost, and the step with the region ablated or doubled.
 - **Share of the dispatch**: counter 0 / counter 2 per core. Sum the regions of one core type to
   see what is left unaccounted (control code, waits).
 - Example: restructurings.md R1 (570 -> 437 cycles per unit, memory stall 7.25 -> 0.24 ms per core and chunk).

@@ -155,6 +155,9 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   interleaves the rest), every pop for as many MMULs as the accumulators allow (two row panels x two records: the
   MMUL bound), P V over pairs of row blocks, the softmax in pipelined passes with no per-lane constants, o in two
   copies, rare paths out of line (88 -> 15.1 ms per layer; qwen35 1B 9.95 -> 4.95).
+- **R14 Weight panels from gathers** (IQ3_XXS's grid): indices upshifted into an accumulator on the load, one vector
+  load of masks per several panels, no FIFO in the gather loop, a lossless re-encoding that removes decode steps,
+  the MMUL in a loop of its own (4596 -> ~2300 cycles per half tile).
 
 ## 4. Pipelining playbook
 

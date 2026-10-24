@@ -17,6 +17,7 @@ what to expect.
 - R11 Several tokens per decode step
 - R12 Neighbour cores sharing derived data
 - R13 Flash attention with several query heads per core
+- R14 Weight panels from gathers
 
 ## R1 Accumulators in registers across the reduction
 
@@ -283,3 +284,33 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   place in one region put P V 50% above its schedule (548 vs 364 cycles).
 - 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
   pops (each K panel once per head) and its in-place o (no L1 for a second copy).
+
+## R14 Weight panels from gathers (IQ3_XXS, `formats/iq3.py`)
+
+An IQ3_XXS weight is a grid entry (4 values per 8-bit index) with a sign: an 8x8 MMUL panel is 16 entries, 4
+`load_4x32` gathers (entry i at byte 8 i, lanes 0, 1 from one table copy, 2, 3 from the other: numerics.md, the
+bank-conflicts.md copies), one compaction shuffle (the gather fills the even 32-bit lanes), the signs by `vaddsub8`
+(zero - w where a mask bit is set: a row's 8 signs one byte of the 64-bit mask). Per core's half tile (two super-blocks
+of 23 rows) 4596 -> ~2300 cycles:
+- **The move slot is the budget**: per panel the address lanes out of the accumulator (`vmov`), the tables' bases
+  (`vadd`: the gathers keep their memory operand only as add(.., sel(bcast(pointer parameter)))), the shuffle,
+  `vaddsub8`, the mask `vextract.64`: 5 ops; the gathers and the panel's store share QEY_RS, the gathers and slot A's
+  loads DM_ADA. Peano schedules ~6.5 cycles per panel (2, 3 or 6 panels per iteration; 4: 7.75, extra `vmov`s).
+- **Offsets on the load**: `ups_to_v32acc32(*p, 3, 0)` (`vlda.ups`, slot A) loads 32 index bytes as 8 idx into an
+  accumulator: no vector register, no MMUL multiply, no shuffle when the indices are stored in panel order.
+- **Masks**: two scalar `lda` per panel cost DM_ADA (II 13 instead of 10 per 2 panels) and met the panels' stores in
+  the scratch's region (memory stall 254 vs 73 cycles per window with them compiled out); one 64-byte vector load
+  per 6 panels and `ext_v2int32`: 101.
+- **No FIFO in the gather loop**: a `fifo_ld_*` stream there made a recurrence through its registers (post-RA RecMII
+  45); two streams in one loop spill the FIFO state every iteration (136 bytes). Realign in a loop of its own, read
+  unaligned words as aligned blocks and `shift_bytes` (`_k23w2`), or store the data aligned (the tile layout is
+  ours: the indices in 8-row panels, padded to 24 rows from the tile's spare bytes).
+- **The MMUL in a loop of its own**: built panels to the scratch, multiplied by the next loop (II 17 per 12 panels);
+  fused with the gathers the loop ran out of registers (post-RA) or took 869 instead of 639 + 164 cycles.
+- **Re-encode losslessly**: the 7-bit sign field and its implied parity stored as the prefix XOR c (the 8 signs are
+  c ^ (c << 1)): 5 ops per 64 fields instead of a sum of 6 shifts. Write the XOR as (c | t) - (c & t) with the
+  subtraction a `vaddsub8` of an all-ones mask: LLVM folds a plain subtraction back into `^`, which AIE2P expands
+  into 5 ops.
+- Peano: a 128-bit vector load fed to `ext_v2int32` (through `set_v16int32`) fails to legalize (`G_UNMERGE_VALUES`
+  <4 x s32> -> <2 x s32>).
+
