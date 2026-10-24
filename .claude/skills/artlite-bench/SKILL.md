@@ -26,8 +26,11 @@ model in its own process; the first load after a code change compiles the design
 run a throwaway `artlite-cli -n 8` first when the cache may be cold, or `artlite-bench` warms up by itself.
 
 Embedding rows come from the mapped GGUF file (`GGUFFile.rows`), and a table that is not part of the NPU image (Llama
-8B's untied `token_embd`, Qwen's, Gemma's per-layer table) is not read at load: after a reboot a test's random prompt
-tokens read their rows from disk (Llama 8B 1k TTFT +0.1 s). Read the file once first (`cat MODEL.gguf > /dev/null`).
+8B's untied `token_embd`, Qwen's, Gemma's per-layer table) is not read at load: after a reboot, or on a machine whose
+page cache other models' files evicted, a test's random prompt tokens read their rows from disk. `GGUFFile.rows` asks
+for all of a lookup's rows at once (1024 of Gemma's per-layer rows: ~15 ms cold, 152 ms when they faulted in one by
+one, which took Gemma's pp1024 from ~2700 to 1100-2000 t/s); still, read the file once first (`cat MODEL.gguf >
+/dev/null`).
 
 ## 1. TTFT and prefill
 
