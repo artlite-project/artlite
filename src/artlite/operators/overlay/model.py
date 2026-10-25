@@ -45,8 +45,8 @@ def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tupl
     """The formats whose kernels are code pages (``DecodeOverlayOperator(paged=)``): the main cores' program memory holds
     the kernels of three formats; of four (Llama's Q3_K_M: Q3_K, Q4_K, Q5_K, Q6_K; Qwen3.6-35B-A3B's Q4_K, Q6_K,
     BFP16 with its drafter's Q4_0) the one of the most bytes in the file stays and the others share a page slot (two would leave the slot less than a page: the pager and the paged
-    dispatch take ~0.5 KB); of five or more (Occamy's Q3_K, IQ3_XXS, Q5_K, Q6_K, Q8_0, BFP16), or of four in an MoE
-    design with tiles of more than 16 rows (``wide``: Occamy's attention layers alone), all are pages: their dispatch
+    dispatch take ~0.5 KB); of five or more (Occamy's Q3_K, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0, BFP16), or of four in an
+    MoE design with tiles of more than 16 rows (``wide``: Occamy's attention layers alone), all are pages: their dispatch
     and an MoE's wide frame (gate / up windows) leave no room for a resident one next to the slot. A page loads
     when a tile of another paged format comes (Q3_K_M: Q5_K and Q4_K in the first layers, Q4_K for the rest, the LM
     head's Q6_K, a few per step). By the whole file: the same choice for any layers and vocabulary the overlay runs."""

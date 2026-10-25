@@ -67,7 +67,8 @@ def qwen_gguf(quant: str = "Q4_K_M", size: str = "27B") -> str:
 
 def occamy_gguf() -> str:
     """IsValorum's Occamy 1.0 (Accio-Lab's fine-tune of Qwen3.6-35B-A3B, abliterated) in its APEX-I-MiniPlus V2.1
-    quantization (GGUF architecture ``qwen35moe``: IQ3_XXS and Q3_K experts, Q3_K, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
+    quantization (GGUF architecture ``qwen35moe``: IQ3_XXS and Q3_K experts, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32
+    tensors)."""
     return os.path.join(MODELS_DIR, "IsValorum", "Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF",
                         "Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf")
 
@@ -92,7 +93,7 @@ def assistant_of(model: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(model)), "mtp-" + os.path.basename(model))
 
 
-MTP_QUANTS = ("Q4_0", "Q8_0")  # (a qwen35 drafter file by preference: Artlite's Q4_0 GEMV and GEMMs, Q8_0's GEMV)
+MTP_QUANTS = ("Q4_0", "Q4_K_M", "Q8_0")  # (a qwen35 drafter file by preference: the fewest bytes per draft first)
 
 
 def qwen_mtp_of(model: str) -> str | None:

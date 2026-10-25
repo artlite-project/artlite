@@ -107,17 +107,20 @@ def test_prefill(size: str) -> None:
     assert float(kl.mean()) < 1.5 * float(kl_llama.mean()) + 2e-3 and agree > agree_llama - 0.05
 
 
-def test_mtp() -> None:
-    """Qwen3.6-35B-A3B with its MTP drafter (``NpuQwen.generate``, up to 3 drafts per step): greedy replies to two user
-    turns of a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's
-    carry). Every token is the argmax of the model's one-token steps over the same text, but where a multi-token step
-    flips a near tie (its experts summed in another order: KL ~0.001 against steps of one here); most drafts are
-    accepted in both replies (the drafter's cache follows the model's positions)."""
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+def test_mtp(size: str) -> None:
+    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters (``NpuQwen.generate``, up to 3 drafts per step): greedy
+    replies to two user turns of a chat, the second after the first reply (decode steps up to a cache group, then a
+    chunk from the host's carry). Every token is the argmax of the model's one-token steps over the same text, but where
+    a multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps of one here;
+    Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the flips of its
+    40 layers' routing near ties move the top two logits by up to ~0.6); most drafts are accepted in both replies (the
+    drafter's cache follows the model's positions)."""
     from artlite.model_config import qwen_mtp_of
     from models.common import Sampling
     from models.qwen35.qwen import Qwen
 
-    path = _path("35B-A3B")
+    path = _path(size)
     if qwen_mtp_of(path) is None:
         pytest.skip(f"no MTP drafter of {path}")
     qwen = Qwen(path)
@@ -148,5 +151,6 @@ def test_mtp() -> None:
                 lg = model.step(t)
     print(f"drafts (drafted, accepted): {stats1}, {stats2}; tokens not the argmax of one-token steps (their top-2 "
           f"gaps): {flips}")
-    assert len(flips) <= 3 and all(g <= 0.5 for g in flips)
+    flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
+    assert len(flips) <= 3 and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
     assert all(a >= 0.5 * d for d, a in (stats1, stats2))

@@ -53,7 +53,7 @@ DUMP_SRC = os.path.join(HERE, "qwen35_dump.cpp")
 
 def size_gguf(size: str) -> str:
     """The file a test runs for a size: lmstudio's Q4_K_M of it (``qwen_gguf``), or "occamy": Occamy 1.0 APEX
-    (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
+    (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
     return occamy_gguf() if size == "occamy" else qwen_gguf("Q4_K_M", size)
 
 

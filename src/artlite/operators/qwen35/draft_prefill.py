@@ -93,9 +93,9 @@ class DraftPrefill:
                    for j in range(S)]
         rl += [(o.nx, tok("DZ", j, o.nx, i=0), sl("DY", j * t * row, o.nx, i=1), self._norm(3), tok("DX0", j, o.nx, i=3),
                 tok("DPN", j, o.nx, i=4)) for j in range(S)]
-        (g,) = o.attn.gemms
         g_rb = self.rows()["DG"]
-        rl += [(g.op, tok("DPN", j, g.op, i=0), self._w(g), tok("DG", j, g.op, i=2, row=g_rb)) for j in range(S)]
+        rl += [(g.op, tok("DPN", j, g.op, i=0), self._w(g), tok("DG", j, g.op, i=2, row=g_rb))
+               for g in o.attn.gemms for j in range(S)]
         prep = self.pf._prep(o.attn.layout, T)
         d, L = self.d, self.L
         kv0, hb = d.kv_off[L], d.ash.kvh * d.ash.head_bytes

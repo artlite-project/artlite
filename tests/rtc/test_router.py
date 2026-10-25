@@ -114,6 +114,9 @@ def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPa
     # two files of one quantization in a directory: ids by file name
     write_gguf(f"{models_dir}/org/a-GGUF/b-Q4_0.gguf")
     assert {"org/a-GGUF:a-Q4_0", "org/a-GGUF:b-Q4_0"} <= set(catalog_of(models_dir, tmp_path).scan())
+    # a file name without a quantization: the file's type
+    write_gguf(f"{models_dir}/org/c-GGUF/c-1.0.Tuned-Abliterated.gguf")
+    assert "org/c-GGUF:Q4_0" in catalog_of(models_dir, tmp_path).scan()
 
 
 def test_preset(models_dir: str, tmp_path: object) -> None:

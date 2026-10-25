@@ -48,3 +48,5 @@ def test_qwen_mtp_of(tmp_path: object) -> None:
     assert qwen_mtp_of(str(model)) == str(other / "mtp-Model-Q4_0.gguf")
     (repo / "model-1.0-mtp-Q8_0.gguf").touch()
     assert qwen_mtp_of(str(model)) == str(repo / "model-1.0-mtp-Q8_0.gguf")
+    (repo / "model-1.0-mtp-Q4_K_M.gguf").touch()
+    assert qwen_mtp_of(str(model)) == str(repo / "model-1.0-mtp-Q4_K_M.gguf")

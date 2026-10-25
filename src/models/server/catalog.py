@@ -3,9 +3,10 @@ encoder of its directory that it takes, and the options and models of a preset f
 
 A model's id is ``<directory>:<quantization>`` - ``lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0``, as
 llama-server names the files of its Hugging Face cache, which the web UI groups by repository - with the file name's
-last ``-`` / ``.`` part as the quantization; ``<directory>:<file name>`` when the directory has two of one
-quantization, the file name alone at the directory's top. Its path in the directory (what ``-m`` takes) and its file
-name (when no other file has it) resolve to it too.
+last ``-`` / ``.`` part as the quantization when it names one, else the file's type (``general.file_type``:
+``Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf`` is ``:IQ3_XXS``); ``<directory>:<file name>`` when the directory
+has two of one quantization, the file name alone at the directory's top. Its path in the directory (what ``-m`` takes)
+and its file name (when no other file has it) resolve to it too.
 
 A file is served when Artlite has its architecture (``models.ARCHITECTURES``) and a tile format for the type of each
 of its matrices (``formats.has_tile_format``); a file Artlite cannot run is skipped with a log line that says why.
@@ -49,6 +50,7 @@ VERSION = 1  # of the cache file
 DRAFTERS = ("mtp-", "dspark-", "dflash-", "eagle3-")
 SPLIT = re.compile(r"-(\d{5})-of-\d{5}$")
 TAG = re.compile(r"[-.]([A-Za-z0-9_]+)$")
+QUANT = re.compile(r"[IPT]?Q\d|B?F(16|32|64)|MXFP\d|NVFP\d", re.IGNORECASE)  # (a quantization's name)
 PRESET_KEYS = ("model", "alias", "load-on-startup")  # a preset's keys that are no options of a model's server
 TRUE, FALSE = ("1", "true", "on", "yes", "enabled"), ("0", "false", "off", "no", "disabled")
 
@@ -77,9 +79,12 @@ class Entry:
 
     @property
     def tag(self) -> str:
-        """The quantization of the id (the file name's, else "")."""
+        """The quantization of the id: the file name's, else the file's type, else ""."""
         m = TAG.search(self.name)
-        return m[1].upper() if m else ""
+        if m and QUANT.match(m[1]):
+            return m[1].upper()
+        ftype = self.header.get("ftype", "unknown")
+        return "" if ftype == "unknown" else re.sub(r"_K - ([SML])[a-z]*$", r"_K_\1", ftype)
 
 
 def header(path: str) -> dict[str, Any]:
