@@ -24,6 +24,7 @@ by kernel II.
 | reads and writes at once | ~76 GB/s together (Krackan 88.2: no more than its writes alone) |
 | DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate. Krackan the same in proportion: 28.6 / 55.9 / 95.6 GB/s for 256 B / 512 B / 1 KB rows, 89.6 skewed by 256 B |
 | short DDR write rows | a GemmQ pass's C (64 columns per token: 128 B rows) costs a short-K GEMM ~25%: the qwen35 1B's gdn_in (K 1024) 0.22 vs 0.17 ms per item when each pass's C is written whole; rows at the column's pitch (2.3 KB stride) instead of the full row (18 KB) did not help: the row length binds |
+| DDR writes of parts of lines | a row starting or ending inside a 64-byte line writes part of it, merged into the line by the memory: 132 B rows sharing their end lines 41.4 GB/s on Halo against 57.2 for whole-line 128 B rows (`artlite-probe`'s write rows); a laptop without a cache in front of DRAM may pay more. Prefill sources: planar GemmQd passes of 66 columns, gate/up's 288 B panel rows per pass |
 | BD fields | 64 B bursts -16%, ≥ 128 B full; AxCACHE 0 halves the rate (Artlite: 512 B, AxCACHE 2) |
 
 On Strix Halo all shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (31.7 B

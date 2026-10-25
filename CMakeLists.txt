@@ -49,6 +49,9 @@ endif()
 if(MSVC)
   add_compile_options(/Zc:__cplusplus /utf-8)  # (XRT's headers pick std::any by __cplusplus)
 endif()
+if(WIN32)  # every source that includes windows.h (platform.h): no min / max macros
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+endif()
 
 # --- C++ libraries (a static library per backend: artlite_xdna, artlite_xrt) ---
 add_subdirectory(csrc)

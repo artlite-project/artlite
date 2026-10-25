@@ -148,6 +148,12 @@ def _dump(out: str, op: object) -> None:
             f.write(json.dumps({"test": _dump_state["test"], "op": type(op).__name__, "design": name}) + "\n")
 
 
+def pytest_report_header(config: pytest.Config) -> str | None:
+    from models.common import stale_toolchain
+
+    return f"WARNING: {stale}" if (stale := stale_toolchain()) else None
+
+
 def pytest_configure(config: pytest.Config) -> None:
     if config.getoption("--refresh-refs"):
         from . import common

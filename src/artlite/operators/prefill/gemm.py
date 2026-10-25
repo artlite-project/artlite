@@ -130,12 +130,14 @@ def _extents(region: Region, run: list[int], T: int, K: int, few: bool) -> list[
 
 
 def d_pitch(image: TileImage, T: int) -> int:
-    """The output projections' column pitch: the widest column block of any layer."""
+    """The output projections' column pitch: the widest column block of any layer, in whole 64-byte lines (at a
+    planar block's extent, e.g. 4 passes of 66 Q6_K rows, the other layers' 64-column passes would write parts of
+    lines, which the memory merges into each line: on Strix Halo 28% slower than whole lines, ``artlite-probe``)."""
     p = 0
     for r in image.regions:
         if r.name in OUT:
             p = max(p, *_extents(r, [0], T, r.K, r.name == "down"))
-    return p
+    return -(-p // 32) * 32
 
 
 def _in_layout(region: Region, T: int, pitch: int = 0) -> Layout:

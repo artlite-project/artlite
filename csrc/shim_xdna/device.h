@@ -55,6 +55,9 @@ struct pdev {
 
   // Throws std::system_error with the ioctl's errno.
   void ioctl(unsigned long cmd, void* arg) const;
+  // ", as ulimit -l is N KB ..." when the locked-memory limit is finite, else "": the driver pins a
+  // user BO's pages within it, and a MAP_LOCKED mapping is locked within it.
+  static std::string memlock_hint();
   // For destructors: returns 0 or the errno.
   int try_ioctl(unsigned long cmd, void* arg) const noexcept;
   void* mmap(void* addr, size_t len, int prot, int flags, off_t offset) const;

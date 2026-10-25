@@ -40,7 +40,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import open_model
-from .common import NpuModel, auto_capacity
+from .common import NpuModel, auto_capacity, stale_toolchain
 
 # a result's fields (llama-bench's that apply, plus n_ctx); json and jsonl add samples_ns and samples_ts
 FIELDS = ("build_commit", "build_number", "cpu_info", "gpu_info", "backends", "model_filename", "model_type",
@@ -313,6 +313,8 @@ def main(argv: list[str] | None = None) -> None:
     args = arg_parser().parse_args(argv)
     if args.repetitions < 1:
         sys.exit("artlite-bench: --repetitions must be at least 1")
+    if stale := stale_toolchain():
+        sys.stderr.write(f"artlite-bench: warning: {stale}\n")
     tests = plan(args)
     env = environment()
     printers = [PRINTERS[fmt](out, env) for fmt, out in ((args.output, sys.stdout), (args.output_err, sys.stderr))

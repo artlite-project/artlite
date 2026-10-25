@@ -97,18 +97,19 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   (cannot be set while an NPU context is active). `sudo xrt-smi configure --pmode performance --device
   0000:c5:00.1` is safe at any time.
 - Measured with the cores' counters: 1.81 GHz in turbo under any load; the reported `h_clock` is a lagging average.
-- Off-chip bandwidth is the chip's, not the array's. Measured (`artlite-probe`, power mode `default`, both at 1.81 GHz):
+- Off-chip bandwidth is the chip's, not the array's. Measured (`artlite-probe`, power mode `default`, all at 1.81 GHz,
+  also with all 32 cores running MMULs):
 
-  | | Strix Halo (256-bit LPDDR5X-8000) | Krackan Point (128-bit LPDDR5X-7500) |
-  |---|---|---|
-  | one shim MM2S channel / one shim's two | 13.9 / 26.9 GB/s | 14.2 / 28.1 GB/s |
-  | all 16 channels: read / write / 8 read + 8 write | 56.8 / 57.6 / 76.1 | 97.8 / 87.2 / 88.2 |
-  | read per array cycle | 31.4 B: one 32 B port at the array clock | 54.1 B: 81% of its 120 GB/s bus |
+  | | Strix Halo (256-bit LPDDR5X-8000) | Krackan Point (128-bit LPDDR5X-7500) | Strix Point (DDR5-5600, Windows) |
+  |---|---|---|---|
+  | one shim MM2S channel / one shim's two | 13.9 / 26.9 GB/s | 14.2 / 28.1 GB/s | 11.5 / 21.4 GB/s |
+  | all 16 channels: read / write / 8 read + 8 write | 56.8 / 57.6 / 76.1 | 97.8 / 87.2 / 88.2 | 53.2 / 39.9 / 53.4 |
+  | read per array cycle | 31.4 B: one 32 B port at the array clock | 54.1 B: 81% of its 120 GB/s bus | 29.4 B: 59% of its 90 GB/s |
 
   A DMA channel and a stream-switch port carry 8 B per cycle (14.4 GB/s), a shim's 128-bit AXI master 16 B, on both;
   what all 8 shims reach is the SoC's. AMD's Strix Point slide gives "NPU Datapath - 32B/cycle" (Hot Chips 2024 Zen 5
   talk, p. 20) with no clock, direction or port count; Krackan's NPU reads more than 32 B per cycle at any fabric
-  clock. Strix Point is not measured here. Papers: ~65 GB/s effective on Strix Point [ATB], ~50 GB/s in GEMM-shaped
+  clock. Papers: ~65 GB/s effective on Strix Point [ATB], ~50 GB/s in GEMM-shaped
   transfers on a DDR5-5600 Krackan [GEMM-gen]. The full table: aie-kernel-perf-optimization
   `reference/data-movement.md`.
 

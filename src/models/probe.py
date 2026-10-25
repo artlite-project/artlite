@@ -1,8 +1,8 @@
 """``artlite-probe``: the machine and its NPU's hardware numbers in one table, next to those of the Strix Halo that
-Artlite is measured on and of a Krackan Point laptop (issue #5): the array clock as the cores count it, the dispatch
-round trip, the DDR read and write rates of the shim DMA channels (one, one shim, all 16), and small-row gathers
-(``artlite.operators.probe``). About a minute, no model file. A report on another machine pastes its output: model
-numbers alone cannot tell a slower clock from a narrower memory path."""
+Artlite is measured on and of a Krackan Point and a Strix Point laptop (issue #5): the array clock as the cores count
+it, the dispatch round trip, the DDR read and write rates of the shim DMA channels (one, one shim, all 16), and
+small-row gathers (``artlite.operators.probe``). About a minute, no model file. A report on another machine pastes its
+output: model numbers alone cannot tell a slower clock from a narrower memory path."""
 
 import argparse
 import glob
@@ -21,6 +21,7 @@ from artlite.operators.probe import ClockProbeOperator, DmaProbeOperator, Rows, 
 from artlite.parallel_compile import compile_all
 
 from .bench import _git, _read
+from .common import stale_toolchain
 
 MB = 1 << 20
 CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)
@@ -43,19 +44,25 @@ CASES: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]], Rows | None
     ("gather 512 B rows 64 KB apart", all_channels(range(8)), [], Rows(512, 256, 64 << 10)),
     ("gather 1 KB rows 64 KB apart", all_channels(range(8)), [], Rows(1024, 256, 64 << 10)),
     ("gather 256 B rows 64 KB + 256 B apart", all_channels(range(8)), [], Rows(256, 256, (64 << 10) + 256)),
+    # (a row next to the previous group's: 128 B rows cover whole 64-byte lines, 132 B rows share their end lines)
+    ("write 128 B rows 64 KB + 128 B apart, 16 channels", [], all_channels(range(8)), Rows(128, 256, (64 << 10) + 128)),
+    ("write 132 B rows 64 KB + 132 B apart", [], all_channels(range(8)), Rows(132, 256, (64 << 10) + 132)),
 ]
 CLOCK = "array clock, measured (MHz)"
 CLOCK_LOAD = "array clock, 32 cores of MMULs (MHz)"
 PER_CYCLE = "16-channel read per array cycle (B)"
 ROUND_TRIP = "dispatch round trip (us)"
 # (column, its values in the table's order): Strix Halo (Ryzen AI Max+ 395, LPDDR5X-8000 256-bit; xdna-driver), Krackan
-# Point (Ryzen AI 7 350, LPDDR5X-7500 128-bit; Linux 7.0's amdxdna); both NPU power mode default, plugged in
+# Point (Ryzen AI 7 350, LPDDR5X-7500 128-bit; Linux 7.0's amdxdna), Strix Point (Ryzen AI 9 HX PRO 370, two DDR5-5600
+# SO-DIMMs; Windows 11, XRT); all NPU power mode default, plugged in
 ROWS = [CLOCK, CLOCK_LOAD, ROUND_TRIP, *(name for name, *_ in CASES), PER_CYCLE]
 REFERENCES: list[tuple[str, dict[str, str]]] = [
     ("Strix Halo", dict(zip(ROWS, ("1810", "1809", "49", "13.9", "26.9", "56.8", "56.4", "57.6", "76.1", "15.6",
-                                   "30.8", "56.6", "56.9", "31.4"), strict=True))),
-    ("Krackan Point", dict(zip(ROWS, ("1808", "?", "56", "14.2", "28.1", "97.8", "80.1", "87.2", "88.2", "28.6",
-                                      "55.9", "95.6", "89.6", "54.1"), strict=True))),
+                                   "30.8", "56.6", "56.9", "57.2", "41.4", "31.4"), strict=True))),
+    ("Krackan Point", dict(zip(ROWS, ("1808", "1810", "56", "14.2", "28.1", "97.8", "80.1", "87.2", "88.2", "28.6",
+                                      "55.9", "95.6", "89.6", "?", "?", "54.1"), strict=True))),
+    ("Strix Point", dict(zip(ROWS, ("1809", "1808", "94", "11.5", "21.4", "53.2", "47.3", "39.9", "53.4", "12.5",
+                                    "25.1", "41.9", "14.0", "?", "?", "29.4"), strict=True))),
 ]
 
 
@@ -96,8 +103,9 @@ def ddr_rates(op: DmaProbeOperator, *, seconds: float) -> dict[str, float]:
     src, dst = dev.address("src"), dev.address("dst")
     out = {}
     for i, (name, reads, writes, rows) in enumerate([CASES[2], *CASES]):  # (first: the DPM ramp's warm-up)
-        words, total = dma_transaction(reads=reads, writes=writes, src=src, dst=dst, nbytes=CHANNEL_BYTES,
-                                       repeat=2, rows=rows)
+        group = 4 if rows is None else rows.n * rows.nbytes  # (a task moves whole groups of rows)
+        words, total = dma_transaction(reads=reads, writes=writes, src=src, dst=dst,
+                                       nbytes=CHANNEL_BYTES // group * group, repeat=2, rows=rows)
         tr = Transaction(dev, words)
         t = timed(lambda tr=tr: dev.dispatch(tr), seconds=seconds)
         if i:
@@ -151,7 +159,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="artlite-probe", description=__doc__.split("\n\n")[0])
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
     args = p.parse_args(argv)
-    lines = system()
+    lines = system() + ([f"warning: {stale}"] if (stale := stale_toolchain()) else [])
     clock, loaded, dma = ClockProbeOperator(), ClockProbeOperator(load=True), DmaProbeOperator()
     compile_all([clock, loaded, dma])
     mhz, round_trip = array_clock(clock, seconds=args.seconds)

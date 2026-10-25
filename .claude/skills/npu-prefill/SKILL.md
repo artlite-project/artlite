@@ -122,13 +122,15 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   layer whose V and down are Q6_K costs ~2.2 ms more than a Q4_K one (planar GemmQd: a dequantizing core per column,
   66 of 80 MAC columns, 1024 tokens as 1152): ~9% of the chunk.
 - Other chips: a Krackan Point laptop runs Gemma E4B's Q4_0 prefill at 0.96x Strix Halo's speed, the Q4_K_M files'
-  at 0.51x (Llama 1B) and 0.73x (Qwen 27B). It has the same array and clock, and a faster DRAM path in every
-  `artlite-probe` pattern. Not the cause: Linux 7.0's driver (the same speed on Halo), control-code density (per ms of
-  a 1024-token chunk: 1B 75 syncs and 1.2 configurations, Gemma 41 and 0.85, 27B 19 and 0.31), the memory path: the
-  Q4_K_M GEMMs are compute-bound on Halo already (Llama 1B's gate / up: its busiest core 2.15 ms per layer of 1024
-  tokens against 0.28 ms of DRAM; Gemma's GEMM items are within ~10% of their DMA floor). The same array at the same
-  clock cannot run those slower unless the clock drops under load: `artlite-probe`'s "32 cores of MMULs" row
-  measures that (Halo: 1809 MHz).
+  at 0.51x (Llama 1B), 0.59x (8B), 0.55x (35B-A3B), 0.73x (27B); a Strix Point laptop (Windows) the 27B at ~0.5x. The
+  same array, at the same clock with all 32 cores busy (`artlite-probe`), and a faster DRAM path in every streaming and
+  gather pattern. Not the cause: Linux 7.0's driver (the same speed on Halo), control-code density, the clock. The
+  lead: writes of parts of 64-byte lines (the memory merges each into its line; on Halo 132 B rows sharing their end
+  lines write 28% below whole lines, and a laptop has no cache in front of DRAM). Per 1024-token chunk, Llama 1B
+  4.4 M of them, the 8B 10.8 M, the 27B 83 M, Gemma 1.1 M (count them with the dispatched shim BDs' row starts and
+  ends). Their sources: planar GemmQd passes (66 columns of 11-row Q6_K tiles: 132 B per token), gate/up's
+  bfp16 panel rows (32 outputs: 288 B per pass), and output projections at a pitch off whole lines (`d_pitch` rounds to
+  them). Write whole lines where a layout allows; `artlite-probe`'s write rows tell what one costs on a machine.
 - Levers that worked: the A strip resident through K parts (`prefill.gemm.resident_k_part`); reading each weight byte once (header units); more
   queries per attention pass where L1 allows (sliding window: 2 blocks of 32); a broadcast KV stream on both of each
   core's input channels (full attention at 30K: -41%); the last token from the prefill's last

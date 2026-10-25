@@ -25,7 +25,7 @@ import torch
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
-from .common import MEDIA_MARKER, StreamDecoder, auto_capacity
+from .common import MEDIA_MARKER, StreamDecoder, auto_capacity, performance_mode, stale_toolchain
 from .sd15.pipeline import BACKENDS, check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
@@ -122,6 +122,9 @@ def generate_image(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = arg_parser().parse_args(argv)
+    if stale := stale_toolchain():
+        sys.stderr.write(f"artlite-cli: warning: {stale}\n")
+    performance_mode(lambda line: sys.stderr.write(line + "\n"))
     if is_diffusers(args.model):
         generate_image(args)
         return

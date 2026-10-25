@@ -7,6 +7,7 @@
 #include <drm/drm.h>
 #include <emmintrin.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -181,7 +182,11 @@ bo::bo(const pdev& p, size_t size, user_memory)
     std::memcpy(tbl.data() + sizeof(head), &entry, sizeof(entry));
     amdxdna_drm_create_bo cbo = {.vaddr = reinterpret_cast<uintptr_t>(tbl.data()), .size = m_aligned_size,
                                  .type = static_cast<uint32_t>(AMDXDNA_BO_SHARE)};
-    m_pdev.ioctl(DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo);
+    if (::ioctl(m_pdev.m_dev_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo) == -1) {
+      int err = errno;
+      shim_err(err, "a user BO of {} MB: DRM_IOCTL_AMDXDNA_CREATE_BO failed{}", m_aligned_size >> 20,
+               err == ENOMEM ? pdev::memlock_hint() : "");
+    }
     m_handle = cbo.handle;
     amdxdna_drm_get_bo_info info = {.handle = m_handle};
     m_pdev.ioctl(DRM_IOCTL_AMDXDNA_GET_BO_INFO, &info);

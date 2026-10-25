@@ -15,11 +15,22 @@ The NPU reads the weights from system memory, so a model needs about its file's 
 |---|---|
 | Linux with the `amdxdna` driver | AMD's [xdna-driver](https://github.com/amd/xdna-driver) builds the driver module and installs the NPU firmware; Artlite is developed with it. Linux has its own `amdxdna` since 6.14, with the same ioctls (tested with Linux 7.2, and with Linux 7.0's driver: before 7.2 it gives a process one 64 MB device heap, where Artlite runs a prompt's control code in smaller pieces) |
 | access to `/dev/accel/accel0` | the device node belongs to the `render` group: `sudo usermod -aG render $USER`, then log in again |
+| the locked-memory limit unlimited | the driver pins the NPU's buffers (a model's weights: GBs) within `ulimit -l`, which is 8 MB on many distributions: below |
 | libdrm | the runtime's build links it (`pkg-config libdrm`) |
 | CMake 3.20 or newer, a C++23 compiler (GCC 13+, Clang 17+) | the runtime and its Python bindings |
 | Python 3.12 or newer, [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
 
 `uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed.
+
+If `ulimit -l` prints a number, not `unlimited`, raise the limit (Artlite raises its own up to the hard limit, which
+only root can raise), then log in again:
+
+```bash
+printf '* soft memlock unlimited\n* hard memlock unlimited\n' | sudo tee /etc/security/limits.d/99-memlock.conf
+```
+
+A shell or tmux server started before keeps the old limit. A systemd service (`artlite-server` as one) takes its own:
+`LimitMEMLOCK=infinity` in its unit.
 
 ## Build (Linux)
 
@@ -39,6 +50,10 @@ uv pip install --no-build-isolation --no-deps -ve .
 - `--no-deps`: without it uv reinstalls `llvm_aie`, and the new `clang++` timestamp invalidates every cached design.
 - `--no-build-isolation`: builds against the venv's nanobind, so its headers stay for IDEs (an isolated build
   removes them afterwards).
+
+After a `git pull`, run `uv sync --extra examples` and then the rebuild: a commit may pin other toolchain wheels.
+`artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe` and the tests warn when the venv's `mlir_aie` or
+`llvm_aie` is not the version `pyproject.toml` pins.
 
 ## Windows
 
@@ -65,10 +80,11 @@ uv pip install --no-build-isolation -ve .
 Remove-Item Env:XILINX_XRT
 ```
 
-- Speed: the NPU driver's default power mode may keep the NPU below its top clock, which bounds both its compute and
-  its memory reads (on Linux the default is the top level; its balanced level costs about 30% of prefill and decode
-  speed). `xrt-smi configure --pmode performance` (`C:\Windows\System32\AMD\xrt-smi.exe`) sets the top level, as
-  FastFlowLM does at its start.
+- Power mode: `artlite-cli` and `artlite-server` raise the NPU's power mode from `default` to `performance` at their
+  start (`xrt-smi configure --pmode performance`, as FastFlowLM does), and keep any other mode set by hand;
+  `artlite-bench` measures the mode that is set. On a Strix Point laptop (driver 32.0.20102.3930) `default` and
+  `performance` ran the array at its top clock alike; `turbo` cut the dispatch round trip from 94 to 58 us;
+  `balanced` runs the array at 1267 MHz, `powersaver` at 800 (`artlite-probe`).
 - A hardware context opens from an xclbin that the runtime builds around the program's PDI in memory (aiecc's
   sections): programs are built as on Linux.
 - A fused ELF's control program (fused operators, the prefill's library programs) runs as a transaction of the
@@ -117,4 +133,5 @@ what they need).
 |---|---|
 | no `/dev/accel/accel0` | the driver is not loaded: `sudo modprobe amdxdna`; `dmesg \| grep amdxdna` shows why (firmware not found, unsupported device) |
 | `Permission denied` on `/dev/accel/accel0` | your user is not in the `render` group (above) |
+| `Cannot allocate memory` / `Resource temporarily unavailable` from a BO, "as ulimit -l is 8192 KB" | the locked-memory limit (above) |
 | `artlite.DispatchError` with state `TIMEOUT` | the driver's hang detection stopped a command; its `health` is the firmware's report ([Design: error handling](design.md#error-handling)) |

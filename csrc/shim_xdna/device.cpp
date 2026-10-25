@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -71,6 +72,11 @@ size_t dev_bo_bytes(size_t size) { return (size + dev_bo_align - 1) & ~(dev_bo_a
 namespace shim_xdna {
 
 pdev::pdev(uint32_t device_index) {
+  rlimit memlock;  // (the soft limit up to the hard one: memlock_hint)
+  if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0 && memlock.rlim_cur < memlock.rlim_max) {
+    memlock.rlim_cur = memlock.rlim_max;
+    ::setrlimit(RLIMIT_MEMLOCK, &memlock);
+  }
   std::string path = "/dev/accel/accel" + std::to_string(device_index);
   m_dev_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (m_dev_fd < 0) shim_err(errno, "Failed to open device {}", path);
@@ -199,11 +205,20 @@ int pdev::try_ioctl(unsigned long cmd, void* arg) const noexcept {
   return err;
 }
 
+std::string pdev::memlock_hint() {
+  rlimit memlock;
+  if (::getrlimit(RLIMIT_MEMLOCK, &memlock) || memlock.rlim_cur == RLIM_INFINITY) return "";
+  return std::format(", as ulimit -l is {} KB: the NPU's buffers need the locked-memory limit unlimited (Artlite's "
+                     "docs/install.md)", memlock.rlim_cur >> 10);
+}
+
 void* pdev::mmap(void* addr, size_t len, int prot, int flags, off_t offset) const {
   void* ret = ::mmap(addr, len, prot, flags, m_dev_fd, offset);
-  if (ret == MAP_FAILED)
-    shim_err(errno, "mmap(addr={}, len={}, prot={}, flags={}, offset={}) failed", addr, len, prot,
-             flags, offset);
+  if (ret == MAP_FAILED) {
+    int err = errno;
+    shim_err(err, "mmap(addr={}, len={}, prot={}, flags={}, offset={}) failed{}", addr, len, prot, flags, offset,
+             err == EAGAIN && (flags & MAP_LOCKED) ? memlock_hint() : "");
+  }
   return ret;
 }
 

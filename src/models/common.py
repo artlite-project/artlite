@@ -6,8 +6,14 @@ default KV cache capacity."""
 import collections
 import copy
 import functools
+import importlib.metadata
 import math
+import os
+import re
+import subprocess
+import threading
 import time
+import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -17,6 +23,8 @@ from typing import Any, Protocol, TypeVar
 import jinja2.sandbox
 import numpy as np
 import torch
+
+from artlite import backend, portable
 
 R = TypeVar("R")
 MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
@@ -176,6 +184,56 @@ def auto_capacity(tokens: int) -> int:
     while cap < need:
         cap *= 2
     return cap
+
+
+def stale_toolchain() -> str | None:
+    """What differs when the installed AIE toolchain (mlir_aie, llvm_aie) is not the one the checkout's pyproject.toml
+    pins (a ``git pull`` without updating the venv: designs compile with another toolchain, and a measurement is not
+    this commit's), else None. Without a checkout (an installed wheel): the pins of the installed artlite."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, "pyproject.toml")
+    try:
+        with open(path, "rb") as f:
+            deps = tomllib.load(f)["project"]["dependencies"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        deps = importlib.metadata.requires("artlite") or []
+    stale = []
+    for dep in deps:
+        if pin := re.match(r"(mlir_aie|llvm_aie)\s*==\s*([^\s;]+)", dep.strip()):
+            try:
+                have = importlib.metadata.version(pin[1])
+            except importlib.metadata.PackageNotFoundError:
+                have = "not installed"
+            if have != pin[2]:
+                stale.append(f"{pin[1]} {have} (pyproject.toml: {pin[2]})")
+    if not stale:
+        return None
+    return (f"the installed AIE toolchain is not this checkout's: {', '.join(stale)}; update the venv: "
+            "uv sync --extra examples, then uv pip install --no-build-isolation --no-deps -ve . (docs/install.md)")
+
+
+def performance_mode(report: Callable[[str], None]) -> None:
+    """Windows: raise the NPU's power mode from ``default`` to ``performance`` (``xrt-smi configure --pmode``, as
+    FastFlowLM does at its start), in a thread while the model loads; ``report``: told the change. A mode set by hand
+    stays (``turbo`` among them). Not on Linux: its driver takes a power mode from root only, and in ``default`` it runs
+    a context at the top DPM level."""
+    if not portable.WINDOWS:
+        return
+
+    def run() -> None:
+        smi = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "AMD", "xrt-smi.exe")
+        smi = smi if os.path.exists(smi) else backend.xrt_tool("xrt-smi")
+        try:
+            out = subprocess.run([smi, "examine", "-r", "platform"], capture_output=True, text=True, timeout=60,
+                                 check=True)
+            mode = re.search(r"Power Mode\s*:\s*(\w+)", out.stdout)
+            if mode is None or mode[1].lower() != "default":
+                return
+            subprocess.run([smi, "configure", "--pmode", "performance"], capture_output=True, timeout=60, check=True)
+            report("NPU power mode: default -> performance (xrt-smi)")
+        except (OSError, TypeError, subprocess.SubprocessError):
+            pass  # (no xrt-smi, or it failed: the mode stays)
+
+    threading.Thread(target=run, name="power-mode", daemon=True).start()
 
 
 def _raise(message: str) -> None:
