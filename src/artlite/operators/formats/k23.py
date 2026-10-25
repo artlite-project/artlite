@@ -44,13 +44,7 @@ void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t 
     const int w0 = {{ cw }} * unit + {{ W }} * kt - {{ skip - hpad }};  // (the hb word of the slot's first)
     if (w0 < 0)
         return;  // (codes of the previous tile)
-    const bfloat16 *__restrict s = b;  // (walked pointers)
-    bfloat16 *__restrict d = hb + {{ 2 * n }} * w0;
-    for (int i = 0; i < {{ W * n // 16 }}; i++) {
-        aie::store_v(d, aie::load_v<32>(s));
-        s += 32;
-        d += 32;
-    }
+    al::copy<{{ 2 * W * n }}, 32>(hb + {{ 2 * n }} * w0, b);
 }
 
 using {{ p }}_BV = v64bfp16ebs8;

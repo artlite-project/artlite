@@ -629,8 +629,7 @@ __attribute__((minsize)) void {{ p }}_qsel(const bfloat16 *__restrict u, bfloat1
         const bfloat16 *__restrict a = u + 144 * pp;
         bfloat16 *__restrict d = q + {{ QUNIT }} * pr + {{ QUNIT // 2 }} * (i & 1);
         for (int j = 0; j < {{ ND // 4 }}; j++) {
-            for (int e = 0; e < 144; e += 16)
-                aie::store_v(d + e, aie::load_v<16>(a + e));
+            al::copy<144, 16>(d, a);
             a += 288;
             d += 144;
         }

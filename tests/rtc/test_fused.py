@@ -134,8 +134,7 @@ class TestFusedOperator:
 _SHIFT_SRC = JINJA_ENV.from_string("""
 extern "C"
 void {{ name }}(bfloat16 *__restrict a, bfloat16 *__restrict c) {
-    for (int i = 0; i < {{ n }} / 32; i++)
-        aie::store_v(c + 32 * i, aie::load_v<32>(a + 32 * i));
+    al::copy<{{ n }}, 32>(c, a);
 }
 """)
 

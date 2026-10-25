@@ -1054,14 +1054,7 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int e = st[{{ A_EIDX }}];
     st[{{ A_EIDX }}] = e + 1;
-    const bfloat16 *__restrict o = AW(bfloat16, {{ a.qa }}) + {{ D_LEN }} * e;
-{% if D_LEN >= 64 %}
-{% for i in range(0, D_LEN, 64) %}
-    aie::store_v(d{{ " + %d" % i if i else "" }}, aie::load_v<64>(o{{ " + %d" % i if i else "" }}));
-{% endfor %}
-{% else %}
-    aie::store_v(d, aie::load_v<{{ D_LEN }}>(o));
-{% endif %}
+    al::copy<{{ D_LEN }}, {{ [D_LEN, 64] | min }}>(d, AW(bfloat16, {{ a.qa }}) + {{ D_LEN }} * e);
 {% if WIN == 40 %}
     if (e + 1 == st[{{ A_NE }}])
         event1();

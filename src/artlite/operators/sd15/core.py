@@ -347,7 +347,6 @@ __attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32
   for (int rb = 0; rb < nrb; rb += 2) {
     {{ geglu_act }}((const bfloat16 *)in + 320 + 640 * rb, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
-    AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
       o.push(aie::mul(aie::load_v<64>(tv), aie::load_v<64>(h)).template to_vector<bfp16ebs8>());
       h = add_2d_ptr(h, 384, 4, ch, 64);
@@ -365,7 +364,6 @@ __attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_
   for (int rb = 0; rb < nrb; rb++) {
     {{ gelu_act }}((const bfloat16 *)in + 640 * rb, t, tab, tab + {{ tw }});
     const bfloat16 *tv = t;
-    AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int i = 0; i < 10; i++) {
       o.push(aie::accum<accfloat, 64>(aie::load_v<64>(tv)).template to_vector<bfp16ebs8>());
       tv += 64;
@@ -635,7 +633,6 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
   if (mode != {{ A_LN }}) {
     const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), hi = aie::broadcast<bfloat16, 32>(24.0f);
     int cc = 0;
-    AIE_LOOP_MIN_ITERATION_COUNT(20)
     for (int i = 0; i < 20; i++) {  // (post-RA pipelined, II 8)
       const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x);
       const aie::accum<accfloat, 32> ta = aie::mac(aie::mul(aie::load_v<8>(cf + 16).grow_replicate<32>(), one),
@@ -653,7 +650,6 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
     const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
     const aie::vector<bfloat16, 64> ah = {{ p }}_tok64(tk), al_ = {{ p }}_tok64(tk + 8);
     const aie::accum<accfloat, 64> bt = aie::mac(aie::mul({{ p }}_tok64(tk + 16), one), {{ p }}_tok64(tk + 24), one);
-    AIE_LOOP_MIN_ITERATION_COUNT(10)
     for (int cb = 0; cb < 10; cb++) {  // (pipelined, II 30)
       const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x);
       const aie::vector<bfloat16, 64> v = aie::mac(aie::mac(bt, xv, ah), xv, al_).template to_vector<bfloat16>();
@@ -667,7 +663,6 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
   zz = z0;
   if (mode == {{ A_GNSILU }}) {{ stab }}(zz, t0, t0, zz, tab, tab + {{ tw }});
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(pan);
-  AIE_LOOP_MIN_ITERATION_COUNT(10)
   for (int cb = 0; cb < 10; cb++) o.push(aie::accum<accfloat, 64>(aie::load_v<64>(zz + 64 * cb)).template to_vector<bfp16ebs8>());
 }
 
@@ -1007,7 +1002,6 @@ static __attribute__((noinline)) void {{ p }}_qk40(const int32_t *__restrict q, 
                                               float *__restrict sm) {
   al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
   AIE_PREPARE_FOR_POSTPIPELINING
-  AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int blk = 0; blk < 4; blk++) {
     al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
     al::BV A0 = qs.pop(), A1 = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
@@ -1085,7 +1079,6 @@ static __attribute__((noinline)) void {{ p }}_exp40(const float *__restrict sm, 
                                                bfp16ebs8 *__restrict pp) {
   al::BOut<> po(pp);
   const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
-  AIE_LOOP_MIN_ITERATION_COUNT(16)
   for (int i = 0; i < 16; i++) {  // (panel i: key panel i / 2, q panel i % 2)
     const float *s = sm + 512 * (i & 1) + 64 * (i >> 1);
     const bfloat16 *b = bias + 64 * (i & 1);
@@ -1109,7 +1102,6 @@ static __attribute__((noinline)) void {{ p }}_pv40(const bfp16ebs8 *__restrict p
     al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(o0))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(o0 + 64)));
     al::MM8 c2(aie::accum<accfloat, 64>(aie::load_v<64>(o1))), c3(aie::accum<accfloat, 64>(aie::load_v<64>(o1 + 64)));
     AIE_PREPARE_FOR_POSTPIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(8)
     for (int kp = 0; kp < 8; kp++) {
       const al::BV P0 = ps.pop(), P1 = ps.pop(), V0 = vs.pop(), V1 = vs.pop();
       c0.mac(P0, aie::op_transpose(V0));
@@ -1127,7 +1119,6 @@ static __attribute__((noinline)) void {{ p }}_pv40(const bfp16ebs8 *__restrict p
   al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(o + 256))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(o + 576)));
   al::MM8 l0(aie::accum<accfloat, 64>(al::bcast8(aie::load_v<8>(l)))), l1(aie::accum<accfloat, 64>(al::bcast8(aie::load_v<8>(l + 8))));
   AIE_PREPARE_FOR_POSTPIPELINING
-  AIE_LOOP_MIN_ITERATION_COUNT(8)
   for (int kp = 0; kp < 8; kp++) {
     const al::BV P0 = ps.pop(), P1 = ps.pop(), V = vs.pop();
     c0.mac(P0, aie::op_transpose(V));
@@ -1203,7 +1194,6 @@ static __attribute__((noinline)) void {{ p }}_qk512(const int32_t *__restrict q,
   al::MM8 c0(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm)) : aie::zeros<accfloat, 64>());
   al::MM8 c1(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)) : aie::zeros<accfloat, 64>());
   AIE_PREPARE_FOR_POSTPIPELINING
-  AIE_LOOP_MIN_ITERATION_COUNT(32)
   for (int d = 0; d < 32; d++) {
     const al::BV A = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
     c0.mac(A, aie::op_transpose(B0));
@@ -1220,7 +1210,6 @@ static __attribute__((noinline)) void {{ p }}_pv512(const bfp16ebs8 *__restrict 
   const al::BV P0 = ps.pop(), P1 = ps.pop();
   al::BInR<aie_dm_resource::b> vs((const bfp16ebs8 *)vt);
   AIE_PREPARE_FOR_POSTPIPELINING
-  AIE_LOOP_MIN_ITERATION_COUNT(16)
   for (int d = 0; d < 32; d += 2) {
     al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(ol))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(ol + 64)));
     const al::BV V0 = vs.pop(), V1 = vs.pop(), V2 = vs.pop(), V3 = vs.pop();

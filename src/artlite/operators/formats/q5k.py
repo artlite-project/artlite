@@ -34,13 +34,8 @@ _GEMM = r"""// Q5_K: _hdr_sb expands a super-block's 6-bit scales of 16 rows at 
 // (2 + sb % 2), crumbs (4 + sb % 2), d pair (6), -dmin pair (7).
 void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
 {
-    const bfloat16 *__restrict s = b + {{ 4 * hp0 * n }};  // (walked pointers)
-    bfloat16 *__restrict d = hb + {{ 2 * hs }} * kt;
-    for (int i = 0; i < {{ 2 * hs // 32 }}; i++) {
-        aie::store_v(d, aie::load_v<32>(s));
-        s += 32;
-        d += 32;
-    }
+    const bfloat16 *s = b + {{ 4 * hp0 * n }};  // (before the call: al::copy)
+    al::copy<{{ 2 * hs }}, 32>(hb + {{ 2 * hs }} * kt, s);
 }
 
 // super-block sb's scales of the pass's rows: ws [16-row block][A | B][group i 8][row 16] = bf16(d sc), bf16(-dmin mn)

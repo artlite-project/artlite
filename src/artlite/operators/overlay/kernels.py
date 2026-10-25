@@ -914,11 +914,14 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
 {% if moe %}
     const int fm = st[{{ S_FMT }}];
     if (fm & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
-        for (int i = 0; i < {{ 2 * YB }}; i += 32)
-            aie::store_v(yt + {{ 2 * YB }} + i, aie::load_v<32>(r + i));
+        al::copy<{{ 2 * YB }}, 32>(yt + {{ 2 * YB }}, r);
     else if (fm & {{ B_G2 }})  // (its group's block)
-        for (int i = 0; i < {{ YB }}; i += 32)
+{% if YB <= 64 %}
+        for (int i = 0; i < {{ YB }}; i += 32)  // (as al::copy: one tail with the unrolled copy above, 6 cycles more)
             aie::store_v(yt + {{ YB }} + i, aie::load_v<32>(r + i));
+{% else %}
+        al::copy<{{ YB }}, 32>(yt + {{ YB }}, r);
+{% endif %}
     else  // (its partial sums of our block)
         for (int i = 0; i < {{ YB }}; i += 32)
             aie::store_v(yt + i, aie::add(aie::load_v<32>(yt + i), aie::load_v<32>(r + i)));

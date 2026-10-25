@@ -32,12 +32,20 @@ template <int D>
 
 // dst[0 .. N) = src[0 .. N) in vectors of V elements (N a multiple of V). Walked pointers pipeline
 // at II 1 (one load, one store per bundle); a loop that indexes both as base + i shares one index
-// register between them and ran at II 6-9. (Pointer helpers are templates on the pointee type: a
-// __aie_dm_resource_x qualifier is an address space, and a plain T * parameter casts it away.)
+// register between them and ran at II 6-9. Up to 8 loads (of 64 bytes or less) the copy is
+// unrolled: the compiler keeps a short constant loop as a zero-overhead loop (~180 bytes, also in
+// minsize code), while straight-line code takes ~8 bytes per load and 2-7 cycles less. Not beyond:
+// when dst and src are offsets of one base (r, r + 1024) the straight-line accesses take an offset
+// register each (a movxm per access) and lose to the loop from ~10 loads on. When both addresses
+// need arithmetic, computing src before the call saves a bundle (register allocation).
+// (Pointer helpers are templates on the pointee type: a __aie_dm_resource_x qualifier is an
+// address space, and a plain T * parameter casts it away.)
 template <int N, int V, typename TD, typename TS>
 [[clang::always_inline]] inline void copy(TD *__restrict dst, const TS *__restrict src)
 {
     static_assert(N % V == 0, "whole vectors");
+    constexpr int LOADS = N / V * ((V * int(sizeof(TS)) + 63) / 64);
+    AIE_LOOP_UNROLL(LOADS <= 8 ? N / V : 1)
     for (int i = 0; i < N / V; i++) {
         aie::store_v(dst, aie::load_v<V>(src));
         src += V;

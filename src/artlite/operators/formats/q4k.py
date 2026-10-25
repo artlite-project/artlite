@@ -89,14 +89,7 @@ _GEMM = r"""// Q4_K: the header unit holds the per-row scale records (formats.pa
 // super-block span all four slots, so _hdr_q4k expands them once the header is complete
 void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
 {
-    // (walked pointers: II 1; indexed b + 32 i, hb + 32 i shared one index register, II 6-9)
-    const bfloat16 *__restrict s = b;
-    bfloat16 *__restrict d = hb + {{ 256 * tq }} * kt;
-    for (int i = 0; i < {{ 8 * tq }}; i++) {
-        aie::store_v(d, aie::load_v<32>(s));
-        s += 32;
-        d += 32;
-    }
+    al::copy<{{ 256 * tq }}, 32>(hb + {{ 256 * tq }} * kt, b);
 }
 
 {% macro hdr_body() %}
