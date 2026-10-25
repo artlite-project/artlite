@@ -46,7 +46,8 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
   decoding) and fewer bytes per token (MoE, lower-bit weights).
 - **Prefill** is compute-bound and on par, at a fraction of the iGPU's power.
 - **Both decoding at once** reach ~204 GB/s in total, 7% above the iGPU alone: they compete for the bus.
-- **Smaller platforms.** Strix Point and Krackan Point have a 128-bit bus (~120 GB/s peak). On a Krackan Point laptop
+- **Smaller platforms.** Strix Point and Krackan Point have a 128-bit bus (~90 GB/s with DDR5-5600, ~120 with
+  LPDDR5X-7500). On a Krackan Point laptop
   (Ryzen AI 7 350, LPDDR5X-7500, Radeon 860M) llama.cpp's Vulkan decode leads Artlite's by 1.44x (Llama 3.2 1B
   Q4_K_M: 113.5 vs 78.7 tokens/s), 1.25x (Gemma 4 E4B Q4_0: 29.3 vs 23.4) and 1.36x (Qwen3.8 27B Q4_K_M: 5.77 vs
   4.24), plugged in and on battery alike: that laptop's iGPU holds its clocks on battery.
