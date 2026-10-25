@@ -69,7 +69,7 @@ def test_teacher_forced(size: str) -> None:
     tokens = _tokens(path, 128)
     dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
     pro = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
-    model = NpuQwen(GGUFFile(path), capacity=256, prefill=size != "occamy")  # (Occamy's formats: decode steps only)
+    model = NpuQwen(GGUFFile(path), capacity=256)
     got = model.forced_logits(tokens)
     kl, kl_llama = float(_kl(dec, got).mean()), float(_kl(dec, pro).mean())
     # (an MoE model's routing flips near-tied experts, and then the next token where its top two are near ties: either
@@ -85,7 +85,7 @@ def test_teacher_forced(size: str) -> None:
     assert kl < 1.5 * kl_llama and agree > agree_llama - tol
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B", "occamy"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches

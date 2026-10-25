@@ -1,6 +1,7 @@
 """An MoE layer's prefill operators (operators/moe: the router, the shared expert, the experts' work lists, the
-combine) on Qwen3.6-35B-A3B's decode image (``qwen35.image.QwenImage``, layers packed in host memory, each GEMM's W
-argument copied to the device), against fp64 models on the operators' own inputs."""
+combine) on the decode images (``qwen35.image.QwenImage``, layers packed in host memory, each GEMM's W argument copied
+to the device) of Qwen3.6-35B-A3B Q4_K_M (layers 3, 5: Q6_K / Q4_K downs) and Occamy 1.0 APEX (layers 3, 13: Q3_K /
+IQ3_XXS experts, a Q5_K shared expert), against fp64 models on the operators' own inputs."""
 
 import os
 
@@ -10,6 +11,7 @@ import torch
 
 import artlite
 from artlite.gguf_model import GGUFFile
+from artlite.model_config import occamy_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.operators.moe import gemm as MG
@@ -17,22 +19,25 @@ from artlite.operators.prefill.norm import PrefillNormOperator
 
 from . import qwen35_ref as ref
 
-PATH = ref.qwen_gguf("Q4_K_M", "35B-A3B")
+# (model, layer): the layers each image holds
+MODELS = {"35B-A3B": (lambda: ref.qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13))}
+LAYERS = [(m, L) for m, (_, ls) in MODELS.items() for L in ls]
 _state: dict[str, object] = {}
 
 
-def _image(layers: tuple[int, ...] = (3, 5)) -> tuple[GGUFFile, object, np.ndarray]:
-    """The 35B's image of the layers (an attention layer with Q6_K downs, a GDN layer with Q4_K), packed (cached per module)."""
-    if not os.path.exists(PATH):
-        pytest.skip(f"{PATH} missing")
-    if _state.get("layers") != layers:
+def _image(model: str = "35B-A3B") -> tuple[GGUFFile, object, np.ndarray]:
+    """A model's image of its two layers, packed (cached per module)."""
+    path, layers = MODELS[model][0](), MODELS[model][1]
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    if _state.get("model") != model:
         from artlite.operators.qwen35.image import QwenImage
 
-        g = GGUFFile(PATH)
+        g = GGUFFile(path)
         img = QwenImage(g, layers=list(layers), vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W, release=False)
-        _state.update(layers=layers, g=g, img=img, W=W)
+        _state.update(model=model, g=g, img=img, W=W)
     return _state["g"], _state["img"], _state["W"]
 
 
@@ -49,14 +54,14 @@ def _f32(g: GGUFFile, name: str) -> np.ndarray:
     return np.asarray(t.dequantize().numpy(), np.float64).reshape(t.rows, t.cols)
 
 
-@pytest.mark.parametrize("L", [3, 5])
-def test_router(L: int) -> None:
+@pytest.mark.parametrize(("model", "L"), LAYERS)
+def test_router(model: str, L: int) -> None:
     """The post-attention norm with lo panels (``PrefillNormOperator(lo=True)``), then the router GEMM
     (``moe.gemm.router``: BFP16 hi / lo rows against x hi + lo, fp32 pairs): the logits within 5e-5 of fp64 math on the
     bf16 residual (rms, the fp32 norm weight, the F32 rows; x hi + lo carries ~2^-16 of each block's maximum: 2.6e-5, the
     logits 3.1-4.2e-5), the shared gate's within 8e-5 (one row: 4.6-5.8e-5); the top 8 the oracle's where the 8th / 9th
     gap exceeds 1e-3."""
-    g, img, W = _image()
+    g, img, W = _image(model)
     cfg = img.cfg
     T, H, E = 256, cfg.hidden_size, cfg.n_experts
     region = img.region(L, "moe_in")
@@ -97,10 +102,10 @@ def router_gate(region: object) -> int:
     return MG.PASS // 2
 
 
-def _normed(L: int, T: int) -> tuple[object, object, np.ndarray, np.ndarray]:
+def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.ndarray]:
     """The post-attention norm (lo panels) of random bf16 x on the device: (its device, xn [hi | lo] panels, x fp64,
     x / rms(x) w fp64)."""
-    g, img, _ = _image()
+    g, img, _ = _image(model)
     cfg = img.cfg
     H = cfg.hidden_size
     norm = PrefillNormOperator(T=T, E=H, eps=cfg.rms_norm_eps, lo=True).compile()
@@ -116,16 +121,22 @@ def _normed(L: int, T: int) -> tuple[object, object, np.ndarray, np.ndarray]:
     return dev, xn, xd, xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
 
 
-@pytest.mark.parametrize(("L", "T"), [(3, 256), (5, 256), (3, 128), (5, 64)])
-def test_shared_gate_up(L: int, T: int) -> None:
-    """The shared expert's gate / up (``moe.gemm.shared_gate_up``, Q4_K) on the norm's hi panels: silu(gate) up within
-    3.5e-2 of fp64 on those panels' values (the bfp16 weights and the bfp16 output panels; as the dense gate/up)."""
-    g, img, W = _image()
+SHARED = [("35B-A3B", 3, 256), ("35B-A3B", 5, 256), ("35B-A3B", 3, 128), ("35B-A3B", 5, 64), ("occamy", 3, 128),
+          ("occamy", 13, 64)]
+
+
+@pytest.mark.parametrize(("model", "L", "T"), SHARED)
+def test_shared_gate_up(model: str, L: int, T: int) -> None:
+    """The shared expert's gate / up (``moe.gemm.shared_gate_up``: Q4_K, Occamy's Q5_K planar SiLU groups) on the
+    norm's hi panels: silu(gate) up within 2.5e-2 rms of fp64 on those panels' values (the bfp16 weights, the bf16 C tile
+    over 32 k-tiles, the bfp16 output panels: ~2.0e-2 in both formats), its largest error within 4.5e-2 of the largest
+    value (Occamy's layer 3: 4.1e-2 at that value itself)."""
+    g, img, W = _image(model)
     cfg = img.cfg
     H, F = cfg.hidden_size, cfg.shared_ffn
     gm = MG.shared_gate_up(img, img.region(L, "moe_in"), T, width=F)
     gm.op.compile()
-    dev, xn, _, _ = _normed(L, T)
+    dev, xn, _, _ = _normed(model, L, T)
     out = artlite.empty((T * F * 9 // 16,), dtype=torch.bfloat16, device=dev)
     gm.op.dispatch(xn, _w_arg(gm.op, W, gm.w_off, dev), out)
     out.sync_from_device()
@@ -135,17 +146,18 @@ def test_shared_gate_up(L: int, T: int) -> None:
     b = f"blk.{L}."
     gate, up = xh @ _f32(g, b + "ffn_gate_shexp.weight").T, xh @ _f32(g, b + "ffn_up_shexp.weight").T
     want = gate / (1 + np.exp(-gate)) * up
-    err = ref.rel_err(got, want)
-    print(f"layer {L} T {T}: shared silu(gate) up err {err:.2e}")
-    assert err < 3.5e-2
+    err, rms = ref.rel_err(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
+    print(f"layer {L} T {T}: shared silu(gate) up err {err:.2e}, rms {rms:.2e}")
+    assert err < 4.5e-2 and rms < 2.5e-2
 
 
-@pytest.mark.parametrize(("L", "T"), [(3, 256), (5, 256), (3, 128), (5, 64)])
-def test_shared_down(L: int, T: int) -> None:
-    """The shared expert's down (``moe.gemm.row_group_gemm``: row groups of 2, GemmQd; Q6_K in layer 3, Q4_K in 5) on
-    random bfp16 panels of the shared width: every column's outputs at its pitch within 1.7e-2 of the exact product
-    on the panels' values (the largest error over the largest value: ~0.9e-2 for Q6_K, 1.4-1.5e-2 for Q4_K)."""
-    g, img, W = _image()
+@pytest.mark.parametrize(("model", "L", "T"), SHARED)
+def test_shared_down(model: str, L: int, T: int) -> None:
+    """The shared expert's down (``moe.gemm.row_group_gemm``: row groups of 2, GemmQd; Q6_K / Q4_K in the 35B's layers
+    3 / 5, Occamy's Q5_K of 13 rows) on random bfp16 panels of the shared width: every column's outputs at its pitch
+    within 1.7e-2 of the exact product on the panels' values (the largest error over the largest value: ~0.9e-2 for
+    Q6_K, 1.4-1.5e-2 for Q4_K)."""
+    g, img, W = _image(model)
     cfg = img.cfg
     H, F = cfg.hidden_size, cfg.shared_ffn
     region = img.region(L, "sdown")
@@ -168,24 +180,25 @@ def test_shared_down(L: int, T: int) -> None:
     assert err < 1.7e-2
 
 
-@pytest.mark.parametrize("L", [3, 5])
-def test_expert_gemms(L: int) -> None:
+@pytest.mark.parametrize(("model", "L"), LAYERS)
+def test_expert_gemms(model: str, L: int) -> None:
     """The experts' gate / up and down (``moe.expert_gemm``: per column a work list of 192-token chunks, each of a
     random expert, rows 64 .. 191 active or not; the weights, A strips and drains pushed by the column's control stream)
     in one program: per chunk H = silu(gate) up within 3.5e-2 of fp64 on the chunk's A panels, the down within 3.4e-2
-    of the exact product of the NPU's H (both halves; Q6_K in layer 3, Q4_K in 5), on the rows that move; an inactive
-    chunk's rows 64 .. (but the column's last chunk's) untouched; columns of 1 .. cap chunks."""
+    of the exact product of the NPU's H (both halves; the 35B's Q4_K gate / up, Q6_K / Q4_K downs; Occamy's Q3_K and
+    IQ3_XXS), on the rows that move; an inactive chunk's rows 64 .. (but the column's last chunk's) untouched; columns of
+    1 .. cap chunks."""
     from artlite.operators.fused import Library
     from artlite.operators.moe.expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
     from artlite.txn import device_address
 
-    g, img, W = _image()
+    g, img, W = _image(model)
     cfg = img.cfg
     H, F, cap = cfg.hidden_size, cfg.expert_ffn, 3
     gu_r, dn_r = img.region(L, "exp_gu"), img.region(L, "exp_down")
     gu = ExpertGemmOperator.of("gu", gu_r, cap=cap, out=F)
     dn = ExpertGemmOperator.of("down", dn_r, cap=cap, out=H)
-    lib = Library(f"t_moe_eg{L}", [gu, dn]).compile().load()
+    lib = Library(f"t_moe_eg_{model}{L}", [gu, dn]).compile().load()
     dev = lib.device
     rng = np.random.default_rng(L)
     ns = rng.integers(1, cap + 1, size=COLS)
@@ -243,11 +256,11 @@ def test_expert_gemms(L: int) -> None:
     assert max(errs_h) < 3.5e-2 and max(errs_y) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
 
 
-@pytest.mark.parametrize("L", [3, 5])
-def test_moe_block(L: int) -> None:
+@pytest.mark.parametrize(("model", "L"), LAYERS)
+def test_moe_block(model: str, L: int) -> None:
     """A whole MoE block of 256 tokens (random bf16 residual) in two programs around the host's routing (``plan``):
-    the norm with lo panels, the router, the shared expert (gate / up, down); then the gathered norm (XP), the experts'
-    gate / up and down (work lists), the combine and the residual norm. The routing from the NPU's logits equals the
+    the norm with lo panels, the router, the shared expert (gate / up, down: the prefill's whole-chunk designs); then the
+    gathered norm (XP), the experts' gate / up and down (work lists), the combine and the residual norm. The routing from the NPU's logits equals the
     oracle's top 8 where the gaps are clear; the delta (routed + shared, ``moe_ffn`` + ``shared_expert`` on the routing
     the NPU's logits give) within 2.5e-2 of fp64 (the experts' bfp16 inputs and weights, bf16 H and y); the residual
     x + delta exactly the bf16 sum."""
@@ -257,22 +270,22 @@ def test_moe_block(L: int) -> None:
     from artlite.operators.moe.gather import CHAIN, CombineOperator, GatherNormOperator, ds_row
     from artlite.txn import device_address
 
-    g, img, W = _image()
+    g, img, W = _image(model)
     cfg = img.cfg
     T, H, F, Fs, E, K = 256, cfg.hidden_size, cfg.expert_ffn, cfg.shared_ffn, cfg.n_experts, cfg.n_experts_used
     eps, cap = cfg.rms_norm_eps, 34
     mi, sd = img.region(L, "moe_in"), img.region(L, "sdown")
     pitch = MG.shared_pitch(img, [L])
     norm_lo = PrefillNormOperator(T=T, E=H, eps=eps, lo=True)
-    router, sgu = MG.router(img, mi, T), MG.shared_gate_up(img, mi, T, width=Fs)
-    sdown = MG.row_group_gemm(sd, T, pitch=pitch, row=ds_row(H, pitch))
+    router, sgu = MG.router(img, mi, T, whole=True), MG.shared_gate_up(img, mi, T, width=Fs, whole=True)
+    sdown = MG.row_group_gemm(sd, T, pitch=pitch, row=ds_row(H, pitch), whole=True)
     gnorm = GatherNormOperator(E=H, eps=eps, cap=cap)
     gu = ExpertGemmOperator.of("gu", img.region(L, "exp_gu"), cap=cap, out=F)
     dn = ExpertGemmOperator.of("down", img.region(L, "exp_down"), cap=cap, out=H)
     comb = CombineOperator(E=H, T=T, ds_pitch=pitch, y_layout=dn.y_layout)
     norm = PrefillNormOperator(T=T, E=H, eps=eps)
     ops = [norm_lo, router.op, sgu.op, sdown.op, gnorm, gu, dn, comb, norm]
-    lib = Library(f"t_moe_block{L}", ops).compile().load()
+    lib = Library(f"t_moe_block_{model}{L}", ops).compile().load()
     dev = lib.device
     rng = np.random.default_rng(10 + L)
     x = torch.from_numpy((rng.standard_normal((T, H)) * 2).astype(np.float32)).bfloat16()
@@ -302,6 +315,7 @@ def test_moe_block(L: int) -> None:
     buf("XN", T * H * 9 // 16)
     a = {k: device_address(b, 0, lib._ctx) for k, b in bufs.items()}
     raw = [b._raw for b in bufs.values()]
+    lib.set_params({MG.CHUNK_PARAM: T // MG.CHUNK_UNIT})
     lib.run([(0, [a["PX"], a["D"], a["WN"], a["PX"], a["XN2"]]),
              (1, [a["XN2"], a["W"] + router.w_off, a["LG"]]),
              (2, [a["XN2"], a["W"] + sgu.w_off, a["HS"]]),

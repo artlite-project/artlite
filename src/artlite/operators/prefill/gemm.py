@@ -9,7 +9,9 @@ the image) and the layout of their output (``Layout``):
 - input projections (qwen35 gdn_in: qkv | z | alpha, beta; attn_in: q + gate | k half | v half; gemma4 qkv: q | the
   column's quarter of [K; V], gate): C rows of ``COLS`` column slices of ``pitch`` columns, block b of column c from
   c pitch + off[b] (its valid rows contiguous, the tile and pass padding after them): the attention (and GDN) cores
-  of column c read their column's slice;
+  of column c read their column's slice. A block of F32 rows as plane pairs (``Block.pairs``: Occamy's GDN alpha) runs
+  as GemmQ with ``c_pairs`` (fp32 sums, two bf16 units each); the next block follows its values directly (its own GEMM
+  after it overwrites the pass's other outputs: qwen35's [alpha | beta] slot);
 - output projections (``OUT``: into the residual stream): column c's rows (hidden / 8) at c d_pitch (``d_pitch``: one
   pitch for every layer, the residual add reads it);
 - gate_up: act(gate) up as bfp16 panels (the down projection's A; ``act``: silu, or gelu for Gemma), column c's
@@ -141,15 +143,17 @@ def d_pitch(image: TileImage, T: int) -> int:
 
 
 def _in_layout(region: Region, T: int, pitch: int = 0) -> Layout:
-    """An input projection's output layout: per column [block 0 | block 1 | ...], each from a 32-column boundary,
-    at a pitch of at least ``pitch``."""
+    """An input projection's output layout: per column [block 0 | block 1 | ...], each from a 32-column boundary (after
+    a block of plane pairs: right after its values, ``Block.pairs``), at a pitch of at least ``pitch``."""
     off: dict[str, int] = {}
-    col = 0
+    col = end = 0  # (end: of every block's pass outputs, a pair block's whole pass included)
     for run in _runs(region):
         for i, e in zip(run, _extents(region, run, T, region.K, False)):
-            off[region.blocks[i].name] = col
-            col = -(-(col + e) // 32) * 32
-    return Layout(max(-(-col // 64) * 64, pitch), off)
+            b = region.blocks[i]
+            off[b.name] = col
+            end = max(end, col + e)
+            col = col + int((b.rows[0] >= 0).sum()) if b.pairs else -(-(col + e) // 32) * 32
+    return Layout(max(-(-max(col, end) // 64) * 64, pitch), off)
 
 
 def phase_pitch(image: TileImage, name: str, T: int) -> int:
@@ -303,6 +307,10 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         else:
             oc = [[lay.pitch * c + o + 64 * p for i, o in zip(run, col0s)
                    for p in range(-(-region.blocks[i].tiles // _tp(region.blocks[i])))] for c in range(COLS)]
-        op = _gemm(_kw(region, run, T, K, lay.N, oc, few=False, plan_T=TL), T, which, ops)
+        kw = _kw(region, run, T, K, lay.N, oc, few=False, plan_T=TL)
+        if b0.pairs:
+            assert len(run) == 1 and b0.fmt == "BFP16", "plane pairs: one BFP16 block"
+            kw["c_pairs"] = True
+        op = _gemm(kw, T, which, ops)
         gemms.append(Gemm(op, region.offset - op.hdr_skip))
     return PhasePlan(gemms, lay)

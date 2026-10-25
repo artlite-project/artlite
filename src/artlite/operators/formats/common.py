@@ -23,7 +23,9 @@ class TileFormat:
     the slice is [plane][row][32 B] (else [row][plane][32 B]): the prefill GEMM's memtile gathers either into
     [plane][row] (``gemm_q``);
     fixed_rows: rows of a fixed-size tile (BFP16: 8-row MMUL panels; the object size follows); pad8_row: code bytes per row
-    and super-block stored for the rows rounded up to a multiple of 8 (IQ3_XXS: its indices in 8-row panels); ws_planes: GemmQ's expanded
+    and super-block stored for the rows rounded up to a multiple of 8 (IQ3_XXS: its indices in 8-row panels); unit_align:
+    each super-block's slice padded to a multiple of these bytes (``unit_bytes``; IQ3_XXS: a super-block unit holds the
+    slice's indices, sign / scale words and d); ws_planes: GemmQ's expanded
     scale planes (tile-major formats); dq_row_cycles: GemmQd's planar dequant, cycles per row (MMUL
     column) and k-tile on the dequantizing core (measured; ``gemm_qd.k_tile_cycles``). Methods take
     ``nsb``, the super-blocks of a tile (8: 2048 columns); word_major: the tile is stored [word][row][4 B] (header words, then each
@@ -42,6 +44,7 @@ class TileFormat:
     plane_major: bool = False
     fixed_rows: int | None = None
     pad8_row: int = 0
+    unit_align: int = 0
     header_pad32: bool = False
     ws_planes: int = 0
     dq_row_cycles: float | None = None
@@ -69,8 +72,13 @@ class TileFormat:
         """Bytes of the codes of one super-block (all rows) after the header."""
         return self.slice_row * rows
 
+    def unit_bytes(self, rows: int) -> int:
+        """Bytes of one super-block's slice as stored (its padding rows and ``unit_align`` included)."""
+        n = self.slice_bytes(rows) + self.pad8_row * (-rows % 8)
+        return -(-n // self.unit_align) * self.unit_align if self.unit_align else n
+
     def used_bytes(self, rows: int, nsb: int = 8) -> int:
-        return self.header_bytes(rows, nsb) + nsb * (self.slice_bytes(rows) + self.pad8_row * (-rows % 8))
+        return self.header_bytes(rows, nsb) + nsb * self.unit_bytes(rows)
 
     def rows(self, tile_bytes: int, nsb: int = 8, max_rows: int = 0) -> int:
         """Rows per tile of ``tile_bytes`` (0: does not fit), at most ``max_rows`` (default: the format's)."""
@@ -93,7 +101,10 @@ class DqKernels:
     then per super-block ``sb(hb, ws, sb)`` and per k-tile ``dq(b, ws, d, sb, kt, [half,] [ex])`` (GemmQ ``hg`` > 1:
     the header unit once per group of K chunks, ``sb(hb, ws, sb, q)`` with the chunk q in the group); ``ex_ty``:
     the type of a buffer of the core that ``dq`` takes last. The optional kernels and the ``ex`` buffer are
-    the Worker's arguments after ``hb``, in this order."""
+    the Worker's arguments after ``hb``, in this order. ``units`` (``Slot.unit_bytes``): no header kernel (``hdr``
+    None); per unit ``sb(b, ws, hb, sb)`` on the weight object, then ``dq`` per k-tile on the same object. ``tables``:
+    (type, words) of a lookup table the core holds twice (buffers "tab", "tabb" of ``Slot.qd_scratch``, in two 16 KB
+    regions: IQ3_XXS's grid for the gathers), passed to ``dq`` after ``ex``."""
 
     hdr: object
     dq: object
@@ -102,6 +113,8 @@ class DqKernels:
     sb: object = None
     chunk: object = None
     ex_ty: object = None
+    units: bool = False
+    tables: tuple[object, np.ndarray] | None = None
 
 
 class Slot:
@@ -133,6 +146,17 @@ class Slot:
     def tile_major(self, fmt: str, rows: int, kc: int) -> bool:
         """GemmQ and GemmQd read these tiles through the tile-major permutation."""
         return False
+
+    def pass_tiles(self, fmt: str, rows: int, tiles: int) -> bool:
+        """GemmQd's planar passes may hold ``tiles`` tiles of ``rows`` rows (the planner's other limits aside)."""
+        return True
+
+    def unit_bytes(self, fmt: str, rows: int, nsb: int) -> int:
+        """Planar tiles of super-block units (a unit holds one super-block's codes and scales of every row, nothing
+        else is in the tile): the unit's bytes, else 0. GemmQd's weight object is then one unit of the pass's tiles,
+        each tile's padded to whole 32-byte lines (``unit_pitch``); the dequantizing core calls ``sb(b, ws, hb, sb)``
+        once per unit and ``dq`` per k-tile on it (``DqKernels.units``), and reads no header units."""
+        return 0
 
     def hdr_direct(self, fmt: str, nsb: int) -> bool:
         """Planar tiles whose gathered rows hold tile row r's header at row r too."""

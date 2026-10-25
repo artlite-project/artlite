@@ -52,6 +52,7 @@ ND = HD // 8  # d-blocks (panels per record part)
 REC = Records(HD)
 REC_K, REC_V, ROWS_B = REC.k_bytes, REC.v_bytes, REC.rows_bytes  # bytes of a K record, a V record, its rows (a ring slot)
 POS_PER_GROUP = 32  # 4 records: two K objects and a V object
+OBJ_BYTES = 9280  # the overlay's objects: a weight tile (1024 columns: 16 rows of Q4_0, Q4_K) and a cache object
 ROT = 32  # rotated pairs (dims i, i + 32 for i < 32)
 F_ATT = 1 << 10  # M_FLAGS of an attention core's object
 SMAX = 4
@@ -550,7 +551,7 @@ class AttnShape:
     """The attention core's sizes for a model: QC query heads per column, NPH columns per KV head (a chain), the
     query-row sets, the cache's capacity."""
 
-    def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = 9280, xpay: int = 4096):
+    def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096):
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.kvh = cfg.num_key_value_heads
         assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay

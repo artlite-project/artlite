@@ -40,13 +40,13 @@ class QwenDecodeOperator(DecodeOverlayOperator):
     GDN_STACK, ATTN_STACK = 4864, 3456
     GDN_ROW, ATTN_ROW = 2, 5
 
-    def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6,
+    def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
                  max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = ""):
         """moe: (experts, experts per token) of an MoE model (``overlay.decode``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``overlay.model.paged_formats``:
         a drafter's Q4_0 beside the model's three)."""
-        assert all(gemv.supported(f, 4) for f in rows) and tile_bytes == 9280, rows
+        assert all(gemv.supported(f, 4) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn

@@ -10,7 +10,7 @@ import pytest
 
 from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, llama_gguf, qwen_gguf, sd15_dir
+from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf, sd15_dir
 
 
 def _llama(size: str, quant: str, kv_k: str) -> tuple[str, Callable[[str], None]]:
@@ -58,6 +58,7 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
+    "occamy-1.0-APEX": (occamy_gguf(), _qwen),
     "sd15": (sd15_dir(), _sd15),
 }
 

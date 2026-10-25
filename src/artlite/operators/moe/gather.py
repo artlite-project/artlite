@@ -420,23 +420,23 @@ class CombineOperator(_Gathered):
     takes tokens c T / COLS .. ; ``ds_pitch``: the shared down's column pitch; ``y_layout``: Y's chunk slots
     (``ExpertGemmOperator.y_layout``)."""
 
-    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int]):
+    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int, int]):
         assert T % COLS == 0 and ds_pitch % 32 == 0
         self.T, self.y_layout = T, tuple(y_layout)
-        passes, vp, tiles, run = self.y_layout
-        assert passes * vp * tiles * run >= E and run % 2 == 0
+        passes, vp, tiles, run, row = self.y_layout
+        assert passes * vp * tiles * run >= E and run % 2 == 0 and row >= tiles * run
         super().__init__(E=E, ds_pitch=ds_pitch)
 
     @property
     def row_n(self) -> int:
-        passes, vp, tiles, run = self.y_layout
+        passes, vp, tiles, run, _ = self.y_layout
         return passes * vp * tiles * run
 
     def row_tap(self) -> TensorAccessPattern:
         """A row of Y from its address (``ExpertGemmOperator.y_offset``): passes x vp runs of tiles x run values, a
-        chunk's tokens apart."""
-        passes, vp, tiles, run = self.y_layout
-        return TensorAccessPattern((1, 1 << 30), 0, [1, 1, passes * vp, tiles * run], [0, 0, CHUNK * tiles * run, 1])
+        chunk's tokens (rows of ``row`` values) apart."""
+        passes, vp, tiles, run, row = self.y_layout
+        return TensorAccessPattern((1, 1 << 30), 0, [1, 1, passes * vp, tiles * run], [0, 0, CHUNK * row, 1])
 
     @property
     def cb_words(self) -> int:
@@ -459,7 +459,7 @@ class CombineOperator(_Gathered):
         out_ty = np.ndarray[(E,), bf]
         k_co = Kernel(f"{p}_co", "kernel.o", [acc_ty, out_ty])
         # (Y's rows: shim -> memtile -> the core in output order: per pass, tile and C object its run)
-        passes, vp, tiles, run = self.y_layout
+        passes, vp, tiles, run, _ = self.y_layout
         order = stream_walk(self.row_n, [(passes, vp * tiles * run), (tiles, run), (vp, tiles * run), (run, 1)])
         y3 = [ObjectFifo(row_ty, name=f"mcy{c}", depth=2, packet=True, packet_id=ctl.XID) for c in range(COLS)]
         yf = [y3[c].cons().forward(obj_type=row_ty, name=f"mcy1{c}", depth=2, tile=Tile(c, 1), to_stream=order)

@@ -68,6 +68,7 @@ class GemmQdOperator(GemmQOperator):
 
     DQ_CORE = True
     p = kernel_prefix("gqd")
+    mac_stack = MAC_STACK  # (the MAC cores' Worker stack: the pinned layouts start after it)
 
     def __init__(self, *, mac_rows: int = 3, m: int = 64, pingpong: bool | None = None, **kw: object):
         """``M``: the tokens the caller uses; the operator runs ``M`` padded to a multiple of
@@ -176,7 +177,7 @@ class GemmQdOperator(GemmQOperator):
 
         lay = {"A": place(0x4000, *mac["A"]), "D": place(0x8000, *mac["D"]), "B": place(0x4000, *dq["B"]),
                "ws": place(0xC000, *dq["ws"]), "hb": place(0x0800, *dq["hb"])}
-        lo = MAC_STACK  # region 0 after the stack: the MAC core's cold buffers
+        lo = self.mac_stack  # region 0 after the stack: the MAC core's cold buffers
         if self.silu:  # the C tiles in regions 3 and 0, the SiLU scratch after the A objects
             lay["acc"], lay["accb"] = [0xC000], [lo]
             lo += (mac["acc"][1] + 63) // 64 * 64
@@ -215,7 +216,7 @@ class GemmQdOperator(GemmQOperator):
         sizes = {k: (v[1] + 63) // 64 * 64 for k, v in {**mac, "accb": mac["acc"]}.items()}
         if self.csplit:  # (the tiles' first halves acc, accb; their second halves acch, accbh)
             sizes.update(dict.fromkeys(("acc", "accb", "acch", "accbh"), (m * self.nm + 63) // 64 * 64))
-        nxt = [MAC_STACK, REGION, 2 * REGION, 3 * REGION]  # (after the stack)
+        nxt = [self.mac_stack, REGION, 2 * REGION, 3 * REGION]  # (after the stack)
         lay: dict[str, list[int]] = {}
 
         def put(key: str, i: int, regions: list[int]) -> bool:
@@ -238,18 +239,44 @@ class GemmQdOperator(GemmQOperator):
             return None  # (the table's second copy in another region than the first)
         if self.csplit and any(lay[h][0] - lay[t][0] != self.csplit for t, h in (("acc", "acch"), ("accb", "accbh"))):
             return None
-        # the dequantizing core: first-fit in the gaps around its D objects
+        # the dequantizing core: first-fit in the gaps around its D objects; a gather table's two copies each within one
+        # region, "tabb" in another region than "tab", both out of the D objects' regions where they fit (the DMA
+        # reading a D object meets the gathers: an IQ3_XXS expert gate / up 360 -> 347 us per chunk), the core's other
+        # buffers then within one region where they fit
         d_size = (dq["D"][1] + 63) // 64 * 64
         edges = [0x0800] + [e for a in sorted(lay["D"]) for e in (a, a + d_size)] + [0x10000]
         free = [[lo, hi] for lo, hi in zip(edges[::2], edges[1::2]) if hi > lo]
+        tables = "tab" in dq
+
+        def regions(lo: int, size: int) -> set[int]:
+            return set(range(lo // REGION, (lo + size - 1) // REGION + 1))
+
+        def fit(size: int, one: bool, avoid: set[int]) -> tuple[list[int], int] | None:
+            """(gap, start) of the lowest place for a buffer (one: within one region; avoid: in none of these)."""
+            for iv in free:
+                lo = iv[0]
+                while lo + size <= iv[1]:
+                    if (not one or len(regions(lo, size)) == 1) and not regions(lo, size) & avoid:
+                        return iv, lo
+                    lo = (lo // REGION + 1) * REGION
+            return None
+
+        d_regions = {r for a in lay["D"] for r in regions(a, d_size)}
         for key in (k for k in dq if k != "D"):
             n, size = dq[key][0], (dq[key][1] + 63) // 64 * 64
             for _ in range(n):
-                iv = next((iv for iv in free if iv[1] - iv[0] >= size), None)
-                if iv is None:
+                if key in ("tab", "tabb"):
+                    other = regions(lay["tab"][0], size) if key == "tabb" else set()
+                    found = fit(size, True, other | d_regions) or fit(size, True, other)
+                else:
+                    found = (tables and fit(size, True, set())) or fit(size, False, set())
+                if found is None:
                     return None
-                lay.setdefault(key, []).append(iv[0])
-                iv[0] += size
+                iv, lo = found
+                if lo > iv[0]:  # (the gap before it stays free)
+                    free.insert(free.index(iv), [iv[0], lo])
+                lay.setdefault(key, []).append(lo)
+                iv[0] = lo + size
         return lay
 
     def get_kernel_src(self) -> str:
@@ -374,6 +401,19 @@ class GemmQdOperator(GemmQOperator):
                                 extra[0](hb, ws, sb)
                             dq_tiles(bf, dfo, dq, ws, ex, sb)
 
+        def units_fn(prm, bf, dfo, sbk, dq, ws, hb, *ex):  # (super-block units: a weight object per unit; ex: ``ex``, tables)
+            for _ in self._chunk_passes(prm):
+                for _ in range_(n_kc):
+                    for sb in range_(nsb):
+                        b = bf.acquire(1)
+                        sbk(b, ws, hb, sb)
+                        for kt in range_(4):
+                            for h in range(halves):
+                                d = dfo.acquire(1)
+                                dq(b, ws, d, sb, kt, *([h] if halves > 1 else []), *ex)
+                                dfo.release(1)
+                        bf.release(1)
+
         c_pack = self.c_pack
 
         pingpong = self.pingpong
@@ -444,11 +484,17 @@ class GemmQdOperator(GemmQOperator):
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"gq_ws_{c}")
             hb = Buffer(hb_ty, name=f"gq_hb_{c}")
-            workers.append(Worker(dq_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
-                                          *([dk.sb] if dk.sb is not None else []),
-                                          *([dk.chunk] if dk.chunk is not None else []),
-                                          *([Buffer(dk.ex_ty, name=f"gq_ex_{c}")] if dk.ex_ty is not None else [])],
-                                  tile=Tile(c, 2), stack_size=2048, dynamic_objfifo_lowering=True))
+            ex_buf = [Buffer(dk.ex_ty, name=f"gq_ex_{c}")] if dk.ex_ty is not None else []
+            if dk.tables is not None:  # (a lookup table's two copies: ``_place_plan`` puts them in two regions)
+                ex_buf += [Buffer(dk.tables[0], name=f"gq_{key}_{c}", initial_value=dk.tables[1]) for key in ("tab", "tabb")]
+            if dk.units:
+                workers.append(Worker(units_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.sb, dk.dq, ws, hb, *ex_buf],
+                                      tile=Tile(c, 2), stack_size=2048, dynamic_objfifo_lowering=True))
+            else:
+                workers.append(Worker(dq_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
+                                              *([dk.sb] if dk.sb is not None else []),
+                                              *([dk.chunk] if dk.chunk is not None else []), *ex_buf],
+                                      tile=Tile(c, 2), stack_size=2048, dynamic_objfifo_lowering=True))
             for row in range(MR):
                 extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}"), Buffer(sx_ty, name=f"gq_sx_{c}_{row}")]
                          if silu else [k_pack, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if c_pack else [])
@@ -461,7 +507,7 @@ class GemmQdOperator(GemmQOperator):
                               for key in ("lut", "lutb")]
                 workers.append(Worker(mac_fn, [prm, d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero,
                                                k_mm, *extra],
-                                      tile=Tile(c, 3 + row), stack_size=MAC_STACK, dynamic_objfifo_lowering=True))
+                                      tile=Tile(c, 3 + row), stack_size=self.mac_stack, dynamic_objfifo_lowering=True))
 
         A_ty = np.ndarray[(self.M * self.a_K * 9 // 16,), np.dtype[bfloat16]]
         W_ty = np.ndarray[(self.w_bytes // 2,), np.dtype[bfloat16]]
@@ -521,14 +567,15 @@ class PlanarPlan:
         return [p // self.width for p in self.pitches]
 
 
-def plan_planar(block_rows: list[int], R: int, *, few_passes: bool = False, n_max: int = 128) -> PlanarPlan:
+def plan_planar(block_rows: list[int], R: int, *, few_passes: bool = False, n_max: int = 128,
+                fmt: str = "") -> PlanarPlan:
     """Passes over a column's consecutive blocks of R-row tiles (``block_rows`` rows each, the last tile of a
     block padded: e.g. a QKV projection's Q, K and V heads): one tile count per pass for all blocks, each block
     padded to whole passes (its last pass reads the next row tiles; their outputs land in the block's padding),
     the rows of a block contiguous (an odd row count per pass only for blocks of one pass).
     The count minimizes a port-bound estimate: per pass and k-tile max(A, D port: 9 cycles per MMUL column,
     MAC) at 64 tokens per MAC row, with the A strip refetched from DDR per pass when ``few_passes`` (down);
-    ties: fewer blocks, then less padding."""
+    ties: fewer blocks, then less padding. ``fmt``: the tile format's own limits (``Slot.pass_tiles``)."""
     nts = [-(-r // R) for r in block_rows]
     best = None
     for t in range(1, 17):
@@ -537,6 +584,8 @@ def plan_planar(block_rows: list[int], R: int, *, few_passes: bool = False, n_ma
             break
         passes = [-(-nt // t) for nt in nts]
         if t * R % 2 and max(passes) > 1:  # (an odd row count packs a zero column: a gap after every pass)
+            continue
+        if fmt and not slot(fmt).pass_tiles(fmt, R, t):
             continue
         width = t * R + t * R % 2
         uniform = all(nt % t == 0 for nt in nts[:-1])
@@ -557,8 +606,8 @@ def choose_planar_plan(block_rows: list[int], R: int, *, few_passes: bool, T: in
     tokens per MAC row fit L1: the dequant costs more per weight than the MAC, more tokens per weight pass), or up to
     128 rows when ``planar_seconds`` estimates them 15% faster."""
     if T < 256:
-        return plan_planar(block_rows, R, few_passes=few_passes)
-    plans = [plan_planar(block_rows, R, few_passes=few_passes, n_max=n) for n in (80, 128)]
+        return plan_planar(block_rows, R, few_passes=few_passes, fmt=fmt)
+    plans = [plan_planar(block_rows, R, few_passes=few_passes, n_max=n, fmt=fmt) for n in (80, 128)]
     if plans[1] == plans[0]:
         return plans[0]
 

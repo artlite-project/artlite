@@ -110,31 +110,36 @@ def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
 
     for p in range(op.passes):
         for base in units(p):
-                for kt in range(4):
-                    if op.planar and FORMATS[fmt].word_major:  # [word][row g]: word 2 P kt + i of tile row g
-                        R, P = op.R, FORMATS[fmt].planes
-                        rows = [(g // R, g % R) for g in range(op.n_read)] + [(None, 0)] * (op.n - op.n_read)
-                        w = [0 if t is None else base[t] + (2 * P * kt + i) * R + r
-                             for i in range(2 * P) for t, r in rows]
-                    elif op.planar:  # [plane][word ii][row g]: word 2 kt + ii of plane pl of tile row g; padding rows 0
-                        R, P, pm = op.R, FORMATS[fmt].planes, FORMATS[fmt].plane_major
-                        if op.us > 1:  # (sub-units: gathered rows [sub-unit][tile][row 16])
-                            rows = [((g % (op.tiles * 16)) // 16, g // (op.tiles * 16) * 16 + g % 16)
-                                    for g in range(op.n_read)]
-                        else:
-                            rows = [(g // R, g % R) for g in range(op.n_read)]
-                        rows += [(None, 0)] * (op.n - op.n_read)
-                        at = [b if isinstance(b, list) else [b + r * P * 8 for r in range(R)] for b in base]  # (unit rows)
-                        w = [0 if t is None else (base[t] + (pl * R + r) * 8 if pm else at[t][r] + pl * 8) + 2 * kt + ii
-                             for pl in range(P) for ii in range(2) for t, r in rows]
-                    elif fmt == "BFP16":  # [16-row block][k8][8-row half][panel of 18 words]
-                        w = [base[2 * b + h] + (8 * kt + q) * 18 + e
-                             for b in range(4) for q in range(8) for h in range(2) for e in range(18)]
-                    else:  # [tile][i % 2][s][row 16]: word (s, i = 2 kt + i % 2) of each row
-                        w = [base[t] + r * 32 + s * 8 + 2 * kt + il
-                             for t in range(half * op.tq, (half + 1) * op.tq)
-                             for il in range(2) for s in range(4) for r in range(16)]
-                    words.append(np.array(w))
+            if op.units:  # (super-block units: one object of the pass's tiles' units, each padded to whole lines)
+                uw, pw = op.units // 4, op.unit_pitch // 4
+                words.append(np.concatenate([np.r_[base[t] + np.arange(uw), np.zeros(pw - uw, np.int64)]
+                                             for t in range(op.tiles)]))
+                continue
+            for kt in range(4):
+                if op.planar and FORMATS[fmt].word_major:  # [word][row g]: word 2 P kt + i of tile row g
+                    R, P = op.R, FORMATS[fmt].planes
+                    rows = [(g // R, g % R) for g in range(op.n_read)] + [(None, 0)] * (op.n - op.n_read)
+                    w = [0 if t is None else base[t] + (2 * P * kt + i) * R + r
+                         for i in range(2 * P) for t, r in rows]
+                elif op.planar:  # [plane][word ii][row g]: word 2 kt + ii of plane pl of tile row g; padding rows 0
+                    R, P, pm = op.R, FORMATS[fmt].planes, FORMATS[fmt].plane_major
+                    if op.us > 1:  # (sub-units: gathered rows [sub-unit][tile][row 16])
+                        rows = [((g % (op.tiles * 16)) // 16, g // (op.tiles * 16) * 16 + g % 16)
+                                for g in range(op.n_read)]
+                    else:
+                        rows = [(g // R, g % R) for g in range(op.n_read)]
+                    rows += [(None, 0)] * (op.n - op.n_read)
+                    at = [b if isinstance(b, list) else [b + r * P * 8 for r in range(R)] for b in base]  # (unit rows)
+                    w = [0 if t is None else (base[t] + (pl * R + r) * 8 if pm else at[t][r] + pl * 8) + 2 * kt + ii
+                         for pl in range(P) for ii in range(2) for t, r in rows]
+                elif fmt == "BFP16":  # [16-row block][k8][8-row half][panel of 18 words]
+                    w = [base[2 * b + h] + (8 * kt + q) * 18 + e
+                         for b in range(4) for q in range(8) for h in range(2) for e in range(18)]
+                else:  # [tile][i % 2][s][row 16]: word (s, i = 2 kt + i % 2) of each row
+                    w = [base[t] + r * 32 + s * 8 + 2 * kt + il
+                         for t in range(half * op.tq, (half + 1) * op.tq)
+                         for il in range(2) for s in range(4) for r in range(16)]
+                words.append(np.array(w))
     return words
 
 
@@ -322,6 +327,9 @@ CASES_PLANAR = [
     ("Q4_0", 32, 9216, 512, {"M": 288, "K": 4096, "tiles": 2, "blocks": ((0, 2),), "region_rt": 4, "kc_group": 4,
                              "m": 96}),
     ("Q4_0", 32, 9216, 512, {"M": 288, "K": 512, "tiles": 2, "blocks": ((0, 3),), "region_rt": 6, "m": 96}),
+    # super-block units (Q8_0 of 1024 columns: 8-row tiles, 2176-byte units; IQ3_XXS: 2320 bytes, padded to 2336)
+    ("Q8_0", 8, 9280, 1024, {"M": 192, "K": 2048, "tiles": 8, "blocks": ((0, 2), (16, 1)), "region_rt": 24}),
+    ("Q8_0", 8, 9280, 1024, {"M": 64, "K": 3072, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12, "mac_rows": 1}),
 ]
 
 

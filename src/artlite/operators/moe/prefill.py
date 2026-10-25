@@ -22,6 +22,7 @@ import numpy as np
 
 from ... import txn
 from ..design import COLS
+from ..prefill import gemm as PG
 from ..prefill.norm import PrefillNormOperator
 from . import gemm as MG
 from . import plan as MP
@@ -51,7 +52,10 @@ class MoEPrefill:
         self.comb = {(T, op.y_layout): CombineOperator(E=self.H, T=T, ds_pitch=self.pitch, y_layout=op.y_layout)
                      for T in sizes for op in self.dn.values()}
         self.y_pitch = max(op.N for op in self.dn.values())
-        self.ln = {t: PrefillNormOperator(T=t, E=self.H, eps=eps, lo=True) for t in {min(T, sub) for T in sizes}}
+        # (the post-attention norm with lo panels: the out projection's output at the prefill's column pitch)
+        dp = {t: PG.d_pitch(image, t) for t in {min(T, sub) for T in sizes}}
+        self.ln = {t: PrefillNormOperator(T=t, E=self.H, eps=eps, lo=True,
+                                          **({"d_pitch": p} if p != self.H // COLS else {})) for t, p in dp.items()}
 
     def _op(self, op: ExpertGemmOperator) -> ExpertGemmOperator:
         """One object per distinct design (the layers share them)."""
@@ -85,10 +89,11 @@ class MoEPrefill:
 
     def fixed(self) -> dict[str, int]:
         """Bytes of the chunk-independent buffers (the control streams, XP, H, Y)."""
-        gu, dn = next(iter(self.gu.values())), max(self.dn.values(), key=lambda op: op.cb_words)
-        return {"CBG": 4 * COLS * self.gnorm.cb_words, "CBU": 4 * COLS * gu.cb_words, "CBD": 4 * COLS * dn.cb_words,
+        gu, dn = self.gu.values(), self.dn.values()  # (the layers' formats differ: the largest of each)
+        return {"CBG": 4 * COLS * self.gnorm.cb_words, "CBU": 4 * COLS * max(op.cb_words for op in gu),
+                "CBD": 4 * COLS * max(op.cb_words for op in dn),
                 "CBC": 4 * COLS * max(op.cb_words for op in self.comb.values()),
-                "XP": 2 * COLS * self.cap * self.gnorm.slot, "H": 2 * COLS * self.cap * gu.c_slot,
+                "XP": 2 * COLS * self.cap * self.gnorm.slot, "H": 2 * COLS * self.cap * max(op.c_slot for op in gu),
                 "Y": 2 * COLS * self.cap * CHUNK * self.y_pitch}
 
     def items(self, L: int, T: int, *, tok: object, sl: object, w: object, norm: str

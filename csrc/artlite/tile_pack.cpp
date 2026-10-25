@@ -277,20 +277,23 @@ void tile_q4_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// Q8_0 (q8.py): per row [sb][group 8] bf16 d (16 nsb bytes), then the codes as the decode's MMUL panels:
-/// [sb][row group R / 8][group i][step s][row 8][8 bytes] (codes 8 s .. 8 s + 7 of group i).
+/// Q8_0 (q8.py): the codes as the decode's MMUL panels [row group R / 8][group i][step s][row 8][8 bytes] per super-block
+/// (codes 8 s .. 8 s + 7 of group i) and the bf16 d: 1024-column tiles (nsb 4) as super-block units [codes | d [row][i]],
+/// others d [row][sb][i] first, then the super-blocks' codes.
 void tile_q8_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
-  uint8_t* codes = t + 16 * nsb * R;
-  for (int r = 0; r < R; r++) {
-    uint8_t* h = t + 16 * nsb * r;
-    for (int sb = 0; sb < nsb; sb++)
+  const bool units = nsb == 4;
+  const size_t unit = 272 * size_t(R);
+  for (int r = 0; r < R; r++)
+    for (int sb = 0; sb < nsb; sb++) {
+      uint8_t* codes = units ? t + unit * sb : t + 16 * size_t(nsb) * R + size_t(sb) * R * 256;
+      uint8_t* h = units ? t + unit * sb + 256 * size_t(R) + 16 * r : t + 16 * (size_t(nsb) * r + sb);
       for (int i = 0; i < 8; i++) {
         const uint8_t* b = src[r] + 272 * sb + 34 * i;
-        put16(h + 16 * sb + 2 * i, bf16_of(b));
-        uint8_t* c = codes + size_t(sb) * R * 256 + (r / 8) * 2048 + 256 * i + 8 * (r % 8);
+        put16(h + 2 * i, bf16_of(b));
+        uint8_t* c = codes + (r / 8) * 2048 + 256 * i + 8 * (r % 8);
         for (int s = 0; s < 4; s++) std::memcpy(c + 64 * s, b + 2 + 8 * s, 8);
       }
-  }
+    }
 }
 
 /// Q4_1 (q4.py): per row [sb][group 8] bf16 d, then m (16 nsb bytes each), then the codes as Q4_0's.
@@ -333,6 +336,9 @@ inline uint32_t nib_word(const uint32_t* v) {
 /// Header words per row of Q2_K (q2k.py ``header_words``) and Q3_K (q3k.py's).
 inline int q2k_header_words(int nsb) { return 5 * nsb; }
 inline int q3k_header_words(int nsb) { return (7 * nsb + 1) / 2; }
+/// IQ3_XXS: bytes of a super-block's unit (iq3.py ``Iq3Slot.unit``): the indices of 8-row panels, the sign / scale words
+/// and d, padded to 16 bytes.
+inline size_t iq3xxs_unit(int R) { return (512 * size_t((R + 7) / 8) + 34 * size_t(R) + 15) / 16 * 16; }
 
 /// Q2_K (q2k.py, word-major [word][row] 4 bytes): header words [sb][sc h 0, sc h 1, mn h 0, mn h 1] (nibble s: sub-block
 /// 8 h + s) | [sb] bf16 d | bf16 dmin << 16, then per super-block 16 code words, word j:
@@ -398,23 +404,24 @@ void tile_q3k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// IQ3_XXS (iq3.py): the index bytes [sb][32-k group i][panel pair h][row group g][8-k panel l' 2][row 8][2] (the
-/// block's qs; rows past R stay zero), the header words [sb pair][row] (bf16 d of both), the sign / scale words
-/// [sb][i][row]: byte l = the prefix XOR of sign field l (bits 7 l .. 7 l + 6) | bit l of the scale (bits 28 ..) at
-/// bit 7.
+/// IQ3_XXS (iq3.py): per super-block a unit of ``iq3xxs_unit`` bytes: the index bytes [32-k group i][panel pair h][8-k
+/// panel l' 2][row group g][row 8][2] (the block's qs; rows past R stay zero), the sign / scale words [i][row]: byte l =
+/// the prefix XOR of sign field l (bits 7 l .. 7 l + 6) | bit l of the scale (bits 28 ..) at bit 7, then d [row] bf16;
+/// odd super-blocks' units in the reverse order of the three parts (the indices at the unit's end).
 void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   const int ng = (R + 7) / 8;  // (row groups)
-  uint32_t* hw = reinterpret_cast<uint32_t*>(t + size_t(nsb) * 512 * ng);
-  uint32_t* sw = hw + size_t(nsb / 2) * R;
-  for (int r = 0; r < R; r++) {
-    for (int p = 0; p < nsb / 2; p++)
-      hw[size_t(p) * R + r] = uint32_t(bf16_of(src[r] + 196 * p)) | (uint32_t(bf16_of(src[r] + 196 * p + 98)) << 16);
-    for (int sb = 0; sb < nsb; sb++) {
+  const size_t I = 512 * size_t(ng), S = 32 * size_t(R), U = iq3xxs_unit(R);
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* u = t + U * sb;
+    uint8_t* ix = sb % 2 ? u + U - I : u;
+    uint32_t* sw = reinterpret_cast<uint32_t*>(sb % 2 ? u + U - I - S : u + I);
+    uint8_t* d = sb % 2 ? u : u + I + S;
+    for (int r = 0; r < R; r++) {
       const uint8_t* b = src[r] + 98 * sb;
+      put16(d + 2 * r, bf16_of(b));
       for (int i = 0; i < 8; i++) {
         for (int l = 0; l < 4; l++)
-          std::memcpy(t + ((((size_t(sb) * 8 + i) * 2 + l / 2) * ng + r / 8) * 2 + l % 2) * 16 + 2 * (r % 8),
-                      b + 2 + 8 * i + 2 * l, 2);
+          std::memcpy(ix + ((((size_t(i) * 2 + l / 2) * 2 + l % 2) * ng + r / 8) * 8 + r % 8) * 2, b + 2 + 8 * i + 2 * l, 2);
         uint32_t w, o = 0;
         std::memcpy(&w, b + 66 + 4 * i, 4);
         for (int l = 0; l < 4; l++) {
@@ -424,7 +431,7 @@ void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
           c ^= c << 4;
           o |= ((c & 0x7F) | (((w >> (28 + l)) & 1) << 7)) << (8 * l);
         }
-        sw[(size_t(sb) * 8 + i) * R + r] = o;
+        sw[size_t(i) * R + r] = o;
       }
     }
   }
@@ -515,7 +522,7 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
     case TileFormat::Q3_K:
       return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
     case TileFormat::IQ3_XXS:
-      return 98 * size_t(nsb) * R + 64 * size_t(nsb) * ((8 - R % 8) % 8);  // (the indices of 8-row panels)
+      return iq3xxs_unit(R) * size_t(nsb);
     case TileFormat::BFP16_BF16:
     case TileFormat::BFP16_F16:
     case TileFormat::BFP16_F32:

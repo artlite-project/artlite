@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import QwenConfig, qwen_gguf
+from artlite.model_config import QwenConfig
 from artlite.operators import FusedOperator
 from artlite.operators.design import COLS
 from artlite.operators.prefill import gemm as PG
@@ -29,10 +29,16 @@ def _bf(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
-@pytest.mark.parametrize("size", ["9B", "1B"])
+def _bits(x: np.ndarray) -> np.ndarray:
+    """bf16 bits (uint16) of values."""
+    return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)
+
+
+@pytest.mark.parametrize("size", ["9B", "1B", "occamy"])
 @pytest.mark.parametrize("T", [64])
 def test_gdn_scan(T: int, size: str) -> None:
-    path = qwen_gguf("Q4_K_M", size)
+    """(Occamy: its F32 alpha in the ab slot as fp32, ``gdn_prefill.ab_f32``)"""
+    path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
@@ -47,7 +53,8 @@ def test_gdn_scan(T: int, size: str) -> None:
     G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta|attn_output|new_state",
                     logits="none")
     qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(len(tokens), -1))
-    alpha = _bf(np.asarray(G_["alpha", L], np.float32).reshape(len(tokens), -1))
+    alpha = np.asarray(G_["alpha", L], np.float32).reshape(len(tokens), -1)
+    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)  # (the ab slot's values: fp32 or bf16)
     beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(len(tokens), -1))
     op = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay)
     prep = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay)
@@ -69,16 +76,21 @@ def test_gdn_scan(T: int, size: str) -> None:
     s_err = []
     for chunk, (t0, n) in enumerate([(0, T), (T, n2)]):
         final: list[np.ndarray] = []
-        Gb = np.zeros((T, lay.N), np.float32)
+        Gb = np.zeros((T, lay.N), np.uint16)  # (bf16 bits)
         for c in range(COLS):
             rows = blk.rows[c][blk.rows[c] >= 0]
             vh = gdn_v_heads(cfg, c)
-            Gb[:n, c * lay.pitch + lay.off["qkv"] + np.arange(rows.size)] = qkv[t0:t0 + n][:, rows]
-            ab = np.concatenate([alpha[t0:t0 + n][:, vh], beta[t0:t0 + n][:, vh]], 1)
-            Gb[:n, c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = ab
+            Gb[:n, c * lay.pitch + lay.off["qkv"] + np.arange(rows.size)] = _bits(qkv[t0:t0 + n][:, rows])
+            if GP.ab_f32(lay):  # (alpha fp32: two bf16 units each, beta after them)
+                a32 = np.ascontiguousarray(alpha[t0:t0 + n][:, vh], np.float32).view(np.uint16)
+                Gb[:n, c * lay.pitch + lay.off["alpha"] + np.arange(a32.shape[1])] = a32
+                Gb[:n, c * lay.pitch + lay.off["beta"] + np.arange(len(vh))] = _bits(beta[t0:t0 + n][:, vh])
+            else:
+                ab = np.concatenate([alpha[t0:t0 + n][:, vh], beta[t0:t0 + n][:, vh]], 1)
+                Gb[:n, c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = _bits(ab)
             o = c * lay.pitch + lay.off["qkv"]  # (this chunk's conv state: the reference's, in G's row layout)
             cv[:3, o:o + sh.ch] = torch.from_numpy(cs[c]).bfloat16().view(torch.int16).numpy()
-        fused.get_buffer("G")[:] = torch.from_numpy(Gb.reshape(-1)).bfloat16()
+        fused.get_buffer("G").view(torch.int16)[:] = torch.from_numpy(Gb.reshape(-1).view(np.int16))
         mask[:T] = np.arange(T) < n
         fused.sync_inputs()
         fused()
@@ -122,7 +134,7 @@ def test_gdn_out(size: str) -> None:
     the conv state = G's qkv rows of the last three valid tokens, bit for bit."""
     from artlite.operators import bfp16
 
-    path = qwen_gguf("Q4_K_M", size)
+    path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)

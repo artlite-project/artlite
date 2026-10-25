@@ -28,6 +28,7 @@ from ...model_config import QwenConfig
 from ..overlay.decode import interleave, norm_objects
 from ..overlay.image import column_rows
 from ..overlay.runtime import Sequence
+from .attn import OBJ_BYTES
 from .image import QwenImage
 from .overlay import QwenOverlay
 
@@ -51,7 +52,7 @@ class DraftImage(QwenImage):
     ``nextn.shared_head_norm``; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None):
-        super().__init__(gguf, cfg, layers=layers, vocab=vocab, tile_bytes=9280)
+        super().__init__(gguf, cfg, layers=layers, vocab=vocab, tile_bytes=OBJ_BYTES)
 
     def _layer(self, layer: int) -> None:
         H = self.cfg.hidden_size

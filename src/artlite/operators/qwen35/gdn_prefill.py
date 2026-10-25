@@ -70,7 +70,7 @@ from .image import gdn_v_heads
 D, PANEL = GD.D, GD.PANEL
 CONV_OFF = "gdn_conv"  # scratchpad parameter: GC's bf16 offset of the conv state rows (``conv_offset``)
 C = 16  # tokens per chunk of the scan
-B_ELEMS = 2560  # bf16 of a GdnPrep input object: 8 tokens x [ab slot 64 (alpha, beta bf16) | q 128 | k 128]
+B_ELEMS = 2560  # bf16 of a GdnPrep input object: 8 tokens x [ab slot 64 (alpha, beta) | q 128 | k 128]
 QB_ELEMS = 1536  # (its q core's part: [ab | q]; the k core's: k)
 PART = 512  # bf16 of a scan split / joined part (1 KB: a chunk's v or o quarter, 16 tokens x 32)
 N_SPART = 4 * PANEL // (2 * PART)  # parts of a state quarter (16)
@@ -79,6 +79,16 @@ KP_BYTES = 16 * 2 * 2 * PAN  # a chunk's K (or Q) panels: [ib 16][tb 2][hi, lo]
 PREP_P = 2 * B_ELEMS  # bytes of a (column, k head) record of P: the prep's first object [q part | k part]
 V_P = 4 * 2 * PART  # bytes of a (column, v head) record of P: per quarter a part, its v conv weights (512 B) first
 P_HEAD = 4096  # P: ssm_norm (fp32) first
+
+
+def ab_f32(layout: Layout) -> bool:
+    """gdn_in's alpha as fp32 (an F32 ``ssm_alpha``: its own block of plane pairs, ``prefill.gemm``), else bf16."""
+    return "alpha" in layout.off
+
+
+def ab_off(layout: Layout) -> int:
+    """The column offset of the ab slot in gdn_in's output: alpha (2 HC bf16 units when fp32), then beta."""
+    return layout.off["alpha"] if ab_f32(layout) else layout.off["ab"]
 
 
 def jobj_bytes(vh: int) -> int:
@@ -267,7 +277,7 @@ void {{ p }}_kblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
     {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb);
 }
 
-// Token block tb of chunk i (q core): b = [ab slot 8 x 64 (alpha HC | beta HC bf16) | q rows 8 x 128] -> the Q panels
+// Token block tb of chunk i (q core): b = [ab slot 8 x 64 ({{ "alpha HC fp32 | beta HC bf16" if F32A else "alpha HC | beta HC bf16" }}) | q rows 8 x 128] -> the Q panels
 // and the gates of the k head's v heads h = kh + 2 hh: d = expm1(ssm_a softplus(alpha + dt)), beta = sigmoid(beta),
 // times the mask, at the record's [hh][d 16 | beta 16] (fp32: the block's 8 tokens at 8 tb); two heads per call
 // (lanes [head 2][the 8 tokens])
@@ -289,10 +299,17 @@ void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
         aie::vector<int32, 16> ai, bi;
         AIE_LOOP_UNROLL_FULL
         for (int t = 0; t < 8; t++) {
+{% if F32A %}
+            ai[t] = ((const int32_t *)ab)[32 * t + h0];
+            ai[8 + t] = ((const int32_t *)ab)[32 * t + h1];
+            bi[t] = (int32_t)ab[64 * t + {{ 2 * HC }} + h0] << 16;
+            bi[8 + t] = (int32_t)ab[64 * t + {{ 2 * HC }} + h1] << 16;
+{% else %}
             ai[t] = (int32_t)ab[64 * t + h0] << 16;
             ai[8 + t] = (int32_t)ab[64 * t + h1] << 16;
             bi[t] = (int32_t)ab[64 * t + {{ HC }} + h0] << 16;
             bi[8 + t] = (int32_t)ab[64 * t + {{ HC }} + h1] << 16;
+{% endif %}
         }
         const aie::vector<float, 16> sp = {{ gm.softplus }}(
             aie::add(ai.template cast_to<float>(), aie::concat(aie::broadcast<float, 8>(gp[{{ 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ h1 }}]))));
@@ -333,8 +350,8 @@ class GdnPrepOperator(ArtcOperator):
         self.sh = GD.GdnShape(cfg)
         self.hc = self.sh.hc
         self.vh = self.hc // 2
-        assert {"qkv", "z", "ab"} <= set(layout.off) and self.hc % 2 == 0 and self.hc <= 6, \
-            "two k heads of up to 3 v heads per column"
+        assert {"qkv", "z"} <= set(layout.off) and ("ab" in layout.off or {"alpha", "beta"} <= set(layout.off)) \
+            and self.hc % 2 == 0 and self.hc <= 6, "two k heads of up to 3 v heads per column"
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
@@ -346,6 +363,7 @@ class GdnPrepOperator(ArtcOperator):
         helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D, gm=GD.MATH,
                                                            sigmoid=True)
         return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, w=Attr(self.workspace()), D=D, HC=self.hc,
+                            F32A=ab_f32(self.layout),
                             VH=self.vh, T=self.T, PAN=PAN, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
                             rs=bf16_hilo(1 / math.sqrt(D)))
 
@@ -444,7 +462,7 @@ class GdnPrepOperator(ArtcOperator):
                                          TensorAccessPattern((n_cv,), qkv + 2 * D + D * kh, [1, 1, 8, D], [0, 0, N, 1])],
                                  tg)
                     f.fill(M, TensorAccessPattern((self.MASK_ELEMS,), 0, [1, 1, 1, B_ELEMS], [0, 0, 0, 1]), group=tg)
-                    chained_fill(f, G, [TensorAccessPattern((T * N,), c * pitch + lay.off["ab"], [n_g, 1, 8, 64],
+                    chained_fill(f, G, [TensorAccessPattern((T * N,), c * pitch + ab_off(lay), [n_g, 1, 8, 64],
                                                             [8 * N, 0, N, 1]),
                                         TensorAccessPattern((T * N,), qkv + D * kh, [n_g, 1, 8, D], [8 * N, 0, N, 1]),
                                         TensorAccessPattern((T * N,), qkv + 2 * D + D * kh, [n_g, 1, 8, D],
@@ -1027,7 +1045,7 @@ class GdnScanOperator(ArtcOperator):
         self.sh = GD.GdnShape(cfg)
         self.hc, self.ch, self.hv = self.sh.hc, self.sh.ch, cfg.ssm_v_heads
         self.vh = self.hc // 2
-        assert {"qkv", "z", "ab"} <= set(layout.off) and self.hc % 2 == 0 and self.hc <= 6
+        assert {"qkv", "z"} <= set(layout.off) and self.hc % 2 == 0 and self.hc <= 6
         super().__init__()
 
     def workspace(self) -> dict[str, int]:

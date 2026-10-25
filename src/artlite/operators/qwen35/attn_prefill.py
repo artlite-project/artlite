@@ -66,7 +66,7 @@ from . import attn as AT
 HD = AT.HD
 ND = AT.ND
 SLOT = AT.REC_K  # bytes per head of a token group's Q panels (and of its sigmoid(gate): 4096 B used)
-GROUP = 3 * 9280  # bytes of a cache group (32 positions: two K objects, a V object)
+GROUP = 3 * AT.OBJ_BYTES  # bytes of a cache group (32 positions: two K objects, a V object)
 # Scratchpad parameters. QA_KV and QA_OFF are one per operator size ("qa_kv<T>"): a parameter's range is the tightest
 # of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
 QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
@@ -415,7 +415,7 @@ class AttnPrepOperator(ArtcOperator):
         n_cs, n_kv = self.cs_positions * 128, self.kvh * self.head_bytes // 2
         nph, per = self.nph, self.per
         n_qs, blk = self.n_qs, 4 * self.qg * qc * SLOT  # (bf16 of a column's slots in a pass)
-        hb, g2, o2 = self.head_bytes // 2, GROUP // 2, 9280 // 2
+        hb, g2, o2 = self.head_bytes // 2, GROUP // 2, AT.OBJ_BYTES // 2
 
         def seq(G, CS, NRM, QS, KV, ah, bh, oh, khs):
             kh = dict(zip(k, khs))

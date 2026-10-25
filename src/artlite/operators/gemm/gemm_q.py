@@ -556,6 +556,8 @@ class GemmQOperator(ArtcOperator):
         self.kc = kc
         self.nsb = kc // 256  # super-block slices per K chunk
         self.fmt, self.R = fmt, rows
+        # planar tiles of super-block units (``Slot.unit_bytes``): the weight objects are units of the pass's tiles
+        self.units = slot(fmt).unit_bytes(fmt, rows, self.nsb) if self.planar else 0
         self.M, self.K, self.N = M, K, N
         self.k_rep, self.c_pairs, self.G = k_rep, c_pairs, groups
         assert groups == 1 or (self.DQ_CORE and k_rep == 1 and not silu and kc // 256 % groups == 0), groups
@@ -624,12 +626,12 @@ class GemmQOperator(ArtcOperator):
         assert self.n_out % 2 == 0, "C rows of whole 32-bit words"
         # packed C object rows: whole 16-byte items, the memtile drops the columns past n_out
         self.n_c = -(-self.n_out // 8) * 8 if self.c_pack else self.n_out
-        self.slice = FORMATS[fmt].slice_bytes(rows)
+        self.slice = self.units or FORMATS[fmt].slice_bytes(rows)
         # header units of a slice each (d; d, m for Q4_1; Q4_K records). A header shorter than whole
         # slices (Q4_K of 1024 columns: 1 KB) is read as a slice-sized unit that starts hdr_skip bytes
         # before the tile (its first part belongs to the previous tile): every unit the memtile permutes
         # is one slice of the pass's tiles, at the cost of hdr_skip extra bytes per tile
-        hb = FORMATS[fmt].header_bytes(rows, self.nsb)
+        hb = 0 if self.units else FORMATS[fmt].header_bytes(rows, self.nsb)
         self.hdr_units = -(-hb // self.slice)
         self.hdr_skip = self.hdr_units * self.slice - hb
         assert self.hdr_skip == 0 or (fmt in ("Q4_K", "Q4_0") and self.nsb == 4) or self.planar, (fmt, self.nsb)
@@ -693,12 +695,21 @@ class GemmQOperator(ArtcOperator):
     @property
     def hdr_direct(self) -> bool:
         """Planar tiles whose gathered rows hold tile row r's header at row r too (Q5_K's scale planes,
-        Q4_0 / Q4_1 headers of 2048 columns; not Q6_K's d chunks or a half-slice Q4 header row pair)."""
-        return slot(self.fmt).hdr_direct(self.fmt, self.nsb)
+        Q4_0 / Q4_1 headers of 2048 columns; not Q6_K's d chunks or a half-slice Q4 header row pair); tiles of units
+        (the dequant takes the rows it converts from the unit)."""
+        return bool(self.units) or slot(self.fmt).hdr_direct(self.fmt, self.nsb)
+
+    @property
+    def unit_pitch(self) -> int:
+        """Bytes of a tile's unit in the dequantizing core's weight object (whole 32-byte lines: aligned loads)."""
+        return -(-self.units // 32) * 32
 
     @property
     def b_l1_words(self) -> int:
-        """Words of an L1 weight object (one k-tile; planar: [plane][word 2][rows padded to n])."""
+        """Words of an L1 weight object (one k-tile; planar: [plane][word 2][rows padded to n]; units: a unit of the
+        pass's tiles, [tile][``unit_pitch``])."""
+        if self.units:
+            return self.tiles * self.unit_pitch // 4
         return 2 * FORMATS[self.fmt].planes * self.n if self.planar else \
             (self.tq if self.pair else self.tiles) * self.slice // 16
 
@@ -789,7 +800,11 @@ class GemmQOperator(ArtcOperator):
             # k-tile objects [plane][word ii 2][g] (words 2 kt + ii: groups 2 kt + ii) of the first n_read rows,
             # zero-padded to n (64-byte aligned runs of 16 rows for the dequant's loads)
             R, T, TR, P = self.R, self.tiles, self.TR, FORMATS[self.fmt].planes
-            if FORMATS[self.fmt].word_major:
+            if self.units:  # (the unit of the pass's tiles as it arrives, each tile's padded to whole lines)
+                uw, pw = self.units // 4, self.unit_pitch // 4
+                wdims, rdims = None, [(T, uw), (uw, 1)]
+                rpad = [(0, 0), (0, pw - uw)] if pw > uw else None
+            elif FORMATS[self.fmt].word_major:
                 # word-major slices ([word][row R], Q2_K / Q3_K: 2 P words per k-tile): S2MM writes [word][g];
                 # MM2S reads k-tile objects [word 2 P][g] (words 2 P kt ..)
                 wdims = [(T, R), (8 * P, TR), (R, 1)]
@@ -804,7 +819,7 @@ class GemmQOperator(ArtcOperator):
                 rdims = [(4, 2), (P, 8 * TR), (2, 1), (self.n_read, 8)]
             # (a padded MM2S BD moves its padded walk, not the object: reading fewer rows than the memtile
             # holds needs a padding, if only of zeros)
-            if self.n > self.n_read or self.n_read < TR:
+            if not self.units and (self.n > self.n_read or self.n_read < TR):
                 rpad = [(0, 0)] * (len(rdims) - 1) + [(0, self.n - self.n_read)]
         elif (dims := slot(self.fmt).tile_major_dims(self)) is not None:  # (BFP16)
             wdims, rdims = dims
@@ -829,7 +844,8 @@ class GemmQOperator(ArtcOperator):
         c_l1 = m * no * 9 // 16 if cb else m * self.n_c
         parts = 2 if self.pair else 1
         return GemmQDataflow(
-            b_obj=obj_w, b_l1=self.b_l1_words, b_wdims=None if noperm else stream_walk(obj_w // parts, wdims),
+            b_obj=obj_w, b_l1=self.b_l1_words,
+            b_wdims=None if noperm or wdims is None else stream_walk(obj_w // parts, wdims),
             b_rdims=None if noperm else stream_walk(obj_w // parts, rdims, rpad), b_parts=parts,
             a_res=a_res, a_obj=a_obj, a_l1=m * 36, a_wdims=stream_walk(a_obj, a_wdims),
             a_repeat=self.passes * self.G if a_res and self.passes * self.G > 1 else 1,

@@ -7,14 +7,15 @@ GemmQd, ``prefill.gemm``), model-independent.
   E / 8 logits from c ``router_pitch`` on, then the shared gate's logit (the second pass's first pair; the rest of
   that pass: the zero rows of the gate's tile and the next region's tiles, never read).
 - ``shared_gate_up``: the shared expert's gate / up rows ("sgu", ``overlay.image.gate_up_rows``) on the hi panels, its
-  silu(gate) up as bfp16 panels of the shared width.
+  silu(gate) up as bfp16 panels of the shared width (tile-major passes of 64 rows, or a planar format's SiLU groups).
 - ``shared_down``: the shared expert's down ("sdown": row groups of G = kc / width rows per tile row,
   ``overlay.image.group_rows``) on those panels: GemmQd with ``groups`` (per pass G slots over the whole A strip),
   ``ROW_GROUP_TILES`` tiles per pass, column c's outputs from c ``pitch`` on (Q6_K's 11-row tiles: G R = 22 rows per
-  tile, the column's last tile padded: a pitch of whole tiles).
+  tile, the column's last tile padded: a pitch of whole passes).
 """
 
 from ..design import COLS
+from ..formats import gu_tiles
 from ..gemm.gemm_q import planar
 from ..gemm.gemm_qd import GemmQdOperator
 from ..prefill import gemm as PG
@@ -63,28 +64,40 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
     ``whole``: as ``router``'s."""
     b = region.block("sgu")
     per = width // COLS  # (outputs per column)
-    tp = PASS // b.R  # (tiles per pass: 4 x [8 gate | 8 up] rows, 32 outputs)
+    pl = planar(b.fmt, b.R, region.kc)
+    # (tiles and outputs per pass: 4 x [8 gate | 8 up] rows, 32 outputs; planar: a SiLU group, 64)
+    tp, w = (gu_tiles(b.R), PASS) if pl else (PASS // b.R, PASS // 2)
     passes = b.tiles // tp
-    assert passes * PASS // 2 == per, (passes, per)
+    assert passes * w == per, (passes, per)
     kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": region.K, "N": width, "tile_bytes": region.tile_bytes,
           "col_bytes": region.col_stride, "passes": passes,
-          "out_cols": [[per * c + PASS // 2 * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
+          "out_cols": [[per * c + w * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
           "kc_group": region.kc_group, "silu": True, "act": "silu", "c_bfp16": True,
           "blocks": ((region.rt0["sgu"], passes),), "region_rt": min(region.n_rt, region.rt0["sgu"] + b.tiles),
           "a_cols": (0, 2 * region.K)}
+    if pl:
+        kw["tiles"] = tp
     if whole:
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
-    op = PG._gemm(kw, T, "gu", ops)
+    if pl and whole:  # (token chunks of CHUNK_UNIT: 2 MAC rows of 64, as ``row_group_gemm``)
+        key = repr((sorted(kw.items()), 2, 64))
+        op = ops.get(key) if ops is not None else None
+        if op is None:
+            op = GemmQdOperator(mac_rows=2, m=64, **kw)
+            if ops is not None:
+                ops[key] = op
+    else:
+        op = PG._gemm(kw, T, "gu", ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)
 
 
 def shared_pitch(image: object, layers: list[int]) -> int:
-    """The shared down's output column pitch over the layers: the widest column of row-group tiles, in whole 32 values
-    (the combine's 64-byte loads of a column's block)."""
+    """The shared down's output column pitch over the layers: the widest column of row-group tiles in whole passes
+    (``row_group_gemm``), in whole 32 values (the combine's 64-byte loads of a column's block)."""
     out = 0
     for L in layers:
         b = image.region(L, "sdown").blocks[0]
-        out = max(out, b.tiles * b.G * b.R)
+        out = max(out, -(-b.tiles // ROW_GROUP_TILES) * ROW_GROUP_TILES * b.G * b.R)
     return -(-out // 32) * 32
 
 

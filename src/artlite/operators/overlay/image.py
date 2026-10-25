@@ -63,7 +63,7 @@ class Block:
     ``tensors`` (their rows one after the other; -1: a zero padding row), n a multiple of R G: tile row v holds rows
     v G .. v G + G - 1 of them one after the other along K (G > 1: row groups, ``group_rows``). F32 tensors (an MoE
     router's) are BFP16 tiles of two planes per row: index 2 i + p is plane p of row i (0: hi = bfp16(w), 1: lo =
-    bfp16(w - hi); ``formats.bf16``)."""
+    bfp16(w - hi); ``formats.bf16``): ``pairs``, the sum of a pair's outputs is the row's."""
 
     name: str
     tensors: tuple[str, ...]
@@ -71,6 +71,7 @@ class Block:
     fmt: str
     R: int
     G: int = 1
+    pairs: bool = False
 
     @property
     def tiles(self) -> int:
@@ -209,7 +210,8 @@ class TileImage:
             fmt = fmts.pop()
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
-            blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G))
+            pairs = all(self.gguf.tensor_info[t][1] == "F32" for t in tensors)
+            blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs))
         n_kc = -(-K // self.kc)
         return Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes, self.kc,
                       cols=parts[0][2].shape[0])
