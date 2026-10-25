@@ -28,8 +28,8 @@ always: its drains carry the tokens the sequence waits for). The control stream'
 planar format's: one SiLU group, in two halves) in the halves' order: H = silu(gate) up as bfp16 panels of the expert's
 width. "down": the slab's "exp_down" (all hidden rows over a half's columns, row groups of 4), the halves as two K
 chunks one slab stride apart (A: the expert's H, 512 columns), two slots per C object (``GemmQOperator.slots``), passes
-of 4 tiles (2 of more than 16 rows: L1). Tile formats: Q4_K and BFP16 (tile-major), the planar ones (Q6_K, Q5_K, Q3_K,
-IQ3_XXS's units: ``formats.Slot.unit_bytes``).
+of up to 4 tiles of at most 64 rows (21-row tiles 3: 9 passes instead of 13 of 2, 195 -> 168 us per chunk). Tile
+formats: Q4_K and BFP16 (tile-major), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS's units: ``formats.Slot.unit_bytes``).
 """
 
 import functools
@@ -122,7 +122,7 @@ class ExpertGemmOperator(GemmQdOperator):
                   "blocks": ((0, 2 * ph),), "tiles": tp, "pingpong": self.GU_ROWS == 64}
             self.ph = ph
         else:
-            tiles = 4 if R <= 16 else 2
+            tiles = min(4, 64 // R)  # (the C packing's MAC columns: at most 64; Q3_K's 21 rows 3, IQ3_XXS's 23 2)
             passes = -(-row_tiles // tiles)
             row = -(-2 * tiles * R // 8) * 8  # (a C object's token row: two slots' rows, whole 8-value items)
             kw = {"fmt": fmt, "rows": R, "K": 2 * kc, "N": max(out, passes * G // 2 * row), "passes": passes,

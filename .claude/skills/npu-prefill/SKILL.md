@@ -158,6 +158,10 @@ section 8's (join offsets, memtile channels, chained fills within 14 shim BDs, z
 - A GemmQd stays within 64 passes per block.
 - A bigger Worker `stack_size` costs L1 the operator's budget must still fit.
 - Test fixtures: the overlay's capacity must hold a chunk plus its padding (`max_positions`).
+- A script or test that calls the prefill's `run` itself (not `OverlayModel.prompt`) marks the overlay stale before
+  its next dispatch (`OverlayModel.stale`, or `dev.stale = True`): the chunk's configurations replace the overlay's code
+  pages, so a paged overlay (Qwen3.6-35B-A3B, Occamy) runs stale pages and hangs (TDR) at its second dispatch after a
+  chunk.
 - A GEMM's weight argument spans its region's 8 columns: in a column-major image that is nearly the whole image
   (Llama 8B: 4.3 GB, past the 4 GB argument limit). `TileImage` lays a column-major image out in blocks of whole
   layers under 3 GiB (`BLOCK_BYTES`); the decode's weight runs take a task per block.
