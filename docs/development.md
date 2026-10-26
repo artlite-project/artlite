@@ -6,11 +6,11 @@ are accepted under the agreement in [CONTRIBUTING.md](../CONTRIBUTING.md). Build
 ## Tests
 
 ```bash
-pytest tests/rtc/test_<operator>.py -k <config-id>   # one operator's tests (NPU)
-pytest tests/rtc -m smoke                            # after a change: about a minute with the designs cached (NPU)
-pytest tests/rtc --run-slow ...                      # also the whole-model tests
-pytest tests/rtc --dump-designs DIR                  # render every design, no NPU
-ruff check <changed files>                           # the tree passes: fix whatever it reports
+pytest tests/<package>/test_<module>.py -k <config-id>   # one module's tests (NPU)
+pytest tests -m smoke                                    # after a change: about a minute with the designs cached (NPU)
+pytest tests --run-slow ...                              # also the whole-model tests
+pytest tests --dump-designs DIR                          # render every design, no NPU
+ruff check <changed files>                               # the tree passes: fix whatever it reports
 ```
 
 GitHub runs `ruff check` on each push to `main` and each pull request; the tests need an NPU, so they run on your
@@ -20,7 +20,7 @@ background while the tests run. Whole-model tests (`slow`) need the model files;
 corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp CPU build
 (`ARTLITE_LLAMA_CPP_DIR`) and skip without one.
 
-The C++ runtime's tests (gtest, `tests/npu_test.cpp`) build in their own tree, with the venv active (`build/` belongs
+The C++ runtime's tests (gtest, `tests/csrc/npu_test.cpp`) build in their own tree, with the venv active (`build/` belongs
 to the editable install):
 
 ```bash
@@ -32,19 +32,21 @@ ctest --test-dir build-tests --output-on-failure
 ## Operators
 
 An operator is one file: an `ArtcOperator` subclass that renders its kernel's C++ (`get_kernel_src()`), its array
-design in IRON (`get_mlir_artifact()`) and its buffer arguments (`get_arg_spec()`), exported from
-`src/artlite/operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. How they compile and load:
-[Design](design.md#kernel-compilation-pipeline); the shared pieces to reuse: AGENTS.md's "How an operator works".
+design in IRON (`get_mlir_artifact()`) and its buffer arguments (`get_arg_spec()`). It lives with what it serves: a
+subsystem the models share (`src/artlite/`: `gemm/`, `decode/`, `prefill/`, `moe/`, `vision/`) or one model's package
+(`src/models/<model>/`), and is tested in `tests/<package>/test_<module>.py`. How they compile and load:
+[Design](design.md#kernel-compilation-pipeline); the framework and the shared pieces to reuse: AGENTS.md's map and
+"How an operator works".
 
 ## Kernel tools
 
 ```bash
 # rebuild one test's designs, print the Peano / aiecc commands, keep the assembly (kernel.cc.s in the cache)
-ARTLITE_IGNORE_CACHE=1 ARTLITE_LOG_COMMANDS=1 ARTLITE_GENERATE_ASM=1 pytest tests/rtc/test_fused.py -v -s
+ARTLITE_IGNORE_CACHE=1 ARTLITE_LOG_COMMANDS=1 ARTLITE_GENERATE_ASM=1 pytest tests/operators/test_fused.py -v -s
 
 # the final schedule of each loop of a kernel: II, stages, trip counts, spills, the resource bound
 ARTLITE_MEASURE_II=1 python <<EOF
-from tests.rtc.mmv import MmvOperator
+from tests.decode.mmv import MmvOperator
 MmvOperator(fmt="Q4_K", n_tiles=4).compile()
 EOF
 

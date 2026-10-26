@@ -1,4 +1,4 @@
-// An MoE layer's host step in the prefill (``operators/moe/prefill.py``): the routing of a chunk's tokens, its plan of
+// An MoE layer's host step in the prefill (``moe/prefill.py``): the routing of a chunk's tokens, its plan of
 // expert chunks, the columns' control streams.
 
 #include "artlite/moe_host.h"

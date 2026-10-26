@@ -9,7 +9,7 @@
 
 namespace artlite {
 
-/// The tile formats of ``artlite.operators.formats`` with a native packer (every slot's ``pack``; BFP16 of BF16, F16 and
+/// The tile formats of ``artlite.formats`` with a native packer (every slot's ``pack``; BFP16 of BF16, F16 and
 /// F32 tensors).
 enum class TileFormat { Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, BFP16_BF16, BFP16_F16, BFP16_F32 };
 
@@ -20,7 +20,7 @@ TileFormat tile_format(std::string_view name);
 /// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512, F32: 1024).
 size_t block_bytes(TileFormat f);
 
-/// A run of row tiles in every column block of a weight image's region (``overlay.image.Block``): column c's
+/// A run of row tiles in every column block of a weight image's region (``decode.image.Block``): column c's
 /// n rows (indices into the stacked tensors, -1: a zero row) as n / (R G) row tiles of S bytes over n_kc K chunks
 /// of 256 nsb columns, row tile rt's tile of chunk kc at ``Region.tile(rt0 + rt, kc)`` of the column block
 /// (column c's block at offset + c col_stride). A tensor row holds row_sb super-blocks (at most n_kc nsb): the

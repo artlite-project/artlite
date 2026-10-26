@@ -122,17 +122,17 @@ source .venv/bin/activate  # in the repo root
 # per-dispatch sampling:
 ARTLITE_PROFILE=1 ARTLITE_PROFILE_COUNTERS=33:34,34:33 \
   ARTLITE_PROFILE_SAMPLE_EVERY=10 \
-  pytest -s "tests/rtc/test_fused.py::TestFusedOperator::test_silu_add"
+  pytest -s "tests/operators/test_fused.py::TestFusedOperator::test_silu_add"
 
 # Full waveform trace of a single-column GELU kernel (then open the .json in
 # Perfetto — synthesized X slices = named kernel windows):
 ARTLITE_PROFILE=trace ARTLITE_PROFILE_TRACE_SIZE=262144 \
-  python -c "import torch; from tests.rtc.elementwise import GeluOperator; \
+  python -c "import torch; from tests.operators.elementwise import GeluOperator; \
              GeluOperator(size=65536, tile_size=1024).compile().run(torch.zeros(65536, dtype=torch.bfloat16))"
 ```
 
 Kernel side: `event0();` / `event1();` around the code of interest (the GELU / SiLU harnesses of
-`tests/rtc/elementwise.py` have them; operators put them behind switches: the prefill attention under
+`tests/operators/elementwise.py` have them; operators put them behind switches: the prefill attention under
 `ablate=("ev_...",)`, the decode overlay under `win=`). In an operator with several kernel calls per step, put
 `event0()` at the start of one kernel and `event1()` at the end of another to time the whole step (GemmQ:
 `GemmQOperator(ablate=("ev_kt",))`, also "ev_dq" / "ev_mm"); per-window averages are 33:34 / 33:33. Counter labels in
@@ -227,7 +227,7 @@ lagging average).
   device-wide READ/WRITE_AIE_REG ioctls return EOPNOTSUPP, and SET_STATE is root-only).
 - `src/artlite/operators/base.py` — compile-time integration; the cache key includes all profiling parameters.
 - `src/artlite/profile_analysis.py` — slice synthesis + counter summaries.
-- Tests: `tests/rtc/test_profiling.py`.
+- Tests: `tests/test_profiling.py`.
 
 Reference docs: AM027 §"Profiling (Performance Counters)", AM029 CORE_MODULE `Performance_Control0..2` /
 `Performance_Counter0..3`, mlir-aie `programming_guide/section-4/section-4b/README.md`,

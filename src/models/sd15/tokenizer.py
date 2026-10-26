@@ -7,7 +7,7 @@ NFC-normalized and lowercased, then split into words: the contractions ``'s 't '
 words and is dropped. Each word's UTF-8 bytes, mapped to
 GPT-2's byte characters, go through BPE with ``</w>`` marking the word's end. A prompt's ids: ``<|startoftext|>``,
 at most 75 word tokens, ``<|endoftext|>``, padded with ``<|endoftext|>`` to 77. Checked against ``CLIPTokenizer``
-(tests/rtc/test_sd15_tokenizer.py).
+(tests/sd15/test_tokenizer.py).
 """
 
 import functools

@@ -1,7 +1,7 @@
 """``artlite-probe``: the machine and its NPU's hardware numbers in one table, next to those of the Strix Halo that
 Artlite is measured on and of a Krackan Point and a Strix Point laptop (issue #5): the array clock as the cores count
 it, the dispatch round trip, the DDR read and write rates of the shim DMA channels (one, one shim, all 16), and
-small-row gathers (``artlite.operators.probe``). About a minute, no model file. A report on another machine pastes its
+small-row gathers (``artlite.probe``). About a minute, no model file. A report on another machine pastes its
 output: model numbers alone cannot tell a slower clock from a narrower memory path."""
 
 import argparse
@@ -16,9 +16,9 @@ import torch
 
 import artlite
 from artlite import backend
-from artlite.operators.overlay.runtime import OverlayDevice, Transaction, irq_cpu
-from artlite.operators.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
+from artlite.overlay import OverlayDevice, Transaction, irq_cpu
 from artlite.parallel_compile import compile_all
+from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
 
 from .bench import _git, _read
 from .common import stale_toolchain

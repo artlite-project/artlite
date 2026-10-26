@@ -22,7 +22,7 @@ default: the CPU count; 1 builds serially):
   (``ARTLITE_PLANNING=1``: every ``compile()`` hands its spec to this process instead of building, the
   first access to a device raises ``PlanStop``; its subprocesses inherit it and plan too) and build the designs
   it renders in the background, so that the real run finds them in the cache.
-  The test session does this for the selected tests (``tests/rtc/conftest.py``). From a shell:
+  The test session does this for the selected tests (``tests/conftest.py``). From a shell:
   ``python -m artlite.parallel_compile CMD ...`` builds everything CMD would compile, then exits.
 
 A task already running on the pool runs a nested ``parallel_map`` / ``compile_all`` inline.

@@ -292,7 +292,7 @@ def classic() -> Fig:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# 2. sd15's overlay: one design, the operations' commands and weights in the rows' B streams
+# 2. the vision overlay: one design, the operations' commands and weights in the rows' B streams
 
 RY = {5: 108, 4: 168, 3: 228, 2: 288}  # core rows' centers (the array and the column)
 MEM_Y, SHIM_Y = 356, 460  # the column's memory and shim tiles' tops
@@ -303,7 +303,7 @@ def gx(c: int) -> float:
 
 
 def overlay() -> Fig:
-    f = Fig(600, "sd15's overlay design",
+    f = Fig(600, "The vision overlay's design",
             "One configuration runs every operation of Stable Diffusion's UNet. Each row of 8 cores receives one "
             "broadcast B stream, commands and the weights of its channel slice, from the shim tile of column 0, 2, 4 "
             "or 6. In each column the memory tile holds the activations of that column's tokens: it sends the A "
@@ -368,7 +368,7 @@ def overlay() -> Fig:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# 3. an sd15 core's program memory: the resident code and the slot its roles' pages share
+# 3. a vision overlay core's program memory: the resident code and the slot its roles' pages share
 
 RESIDENT = 8976
 PAGES = [("a", "attention, heads of 80, 160", 5776), ("c", "attention, heads of 40", 5216),
@@ -383,8 +383,8 @@ def bx(nbytes: float) -> float:
 
 def budget() -> Fig:
     total = RESIDENT + sum(n for *_, n in PAGES)
-    f = Fig(356, "Program memory of an sd15 core",
-            f"A core has 16 KB of program memory. sd15's cores need {total} bytes of code in all: {RESIDENT} bytes of "
+    f = Fig(356, "Program memory of a vision overlay core",
+            f"A core has 16 KB of program memory. For Stable Diffusion its cores need {total} bytes of code in all: {RESIDENT} bytes of "
             "resident code (startup, main loop, GEMM and convolution, the pager) and five roles' code, which together "
             "do not fit. As pages, each role is linked at the slot, the 7408 bytes after the resident code, and only "
             "one is loaded at a time: attention with heads of 80 and 160 (5776 bytes), attention with heads of 40 "
@@ -701,7 +701,7 @@ def memtile() -> Fig:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# 8. sd15's rows in time: host role switches against pages (schematic)
+# 8. the vision overlay's rows in time: host role switches against pages (schematic)
 
 OPS_SWITCH = [  # (label, units, rows that run it, kind)
     ("LN", 4, (4, 5), "op"), ("GEMM", 7, (2, 3, 4, 5), "op"), ("switch", 2, (4, 5), "switch"),
@@ -718,7 +718,7 @@ UNIT = 15.5
 
 
 def timeline() -> Fig:
-    f = Fig(372, "sd15's rows in time",
+    f = Fig(372, "The vision overlay's rows in time",
             "A schematic of part of a transformer block on the 4 core rows. With host role switches, the LayerNorm "
             "runs on rows 4 and 5 only and cross-attention on rows 2 and 3 only, and every switch of rows 4 and 5 "
             "to attention and back waits for the array to drain. With pages, every row runs every operation, and a "

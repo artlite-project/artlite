@@ -20,7 +20,7 @@ by kernel II.
 | a core's input DMA channel (S2MM) | 8 B per cycle: every consumer of a broadcast receives the whole stream at this rate |
 | one shim MM2S channel reading DDR alone | ~13.8 GB/s: 7.7 B per array cycle (its 8 B stream); Krackan 14.2 |
 | one shim tile, both MM2S channels | ~27 GB/s: 15.5 B per cycle (the shim DMA's 128-bit AXI master, AM020); Krackan 28.1 |
-| all shim channels together | ~57 GB/s read or write: Strix Halo's one 32 B / cycle fabric port (Krackan: 97.8 read, 87.2 write, 54 B per cycle: 81% of its 120 GB/s bus). Not full from 4 channels on 4 shims: one MM2S channel each into memtiles ~50 GB/s together, on 8 shims ~55; sd15's 4 B streams into cores (5760-byte core BDs) 11.2 GB/s each, MAC on or off |
+| all shim channels together | ~57 GB/s read or write: Strix Halo's one 32 B / cycle fabric port (Krackan: 97.8 read, 87.2 write, 54 B per cycle: 81% of its 120 GB/s bus). Not full from 4 channels on 4 shims: one MM2S channel each into memtiles ~50 GB/s together, on 8 shims ~55; the vision overlay's 4 B streams into cores (5760-byte core BDs) 11.2 GB/s each, MAC on or off |
 | reads and writes at once | ~76 GB/s together (Krackan 88.2: no more than its writes alone) |
 | DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate. Krackan the same in proportion: 28.6 / 55.9 / 95.6 GB/s for 256 B / 512 B / 1 KB rows, 89.6 skewed by 256 B |
 | short DDR write rows | a GemmQ pass's C (64 columns per token: 128 B rows) costs a short-K GEMM ~25%: the qwen35 1B's gdn_in (K 1024) 0.22 vs 0.17 ms per item when each pass's C is written whole; rows at the column's pitch (2.3 KB stride) instead of the full row (18 KB) did not help: the row length binds |
@@ -50,7 +50,7 @@ steps with the event windows: 1B 10.9 of 14.7 ms, 27B 200 of 296 ms, Gemma 25 of
 column and a cheaper K-quant tile on the main core would speed up a chip with a wider path, not Halo.
 
 Where the columns' streams start in DRAM matters, though no microbenchmark showed it: the 8 column streams of a
-column-major image at an odd multiple of 256 KB apart (`overlay/image.py` `_col_stride`: each in its own 256 KB slot
+column-major image at an odd multiple of 256 KB apart (`decode/image.py` `_col_stride`: each in its own 256 KB slot
 of a 2 MB span) decode 1B Q4_K_M in 15.0 instead of 15.4 ms and Gemma 4 E4B in 55.8 instead of 57.5; starts near one
 offset modulo 2 MB, or a third or a half of it apart, cost up to 3%.
 
@@ -82,7 +82,7 @@ bandwidth.
   column's 3 heads, halved them: -25%, then compute-bound.
 - **Every column reads every input** (the decode overlays): a phase's input goes to all 8 columns, each from its own
   shim: 8 copies through the one port and 8 fill tasks at every phase boundary. Per step: Gemma E4B 42 MB of 3.1 GB
-  (95% of it the same bytes in every column; packed to the step's slots, `overlay.decode.packed_slots`, from 100 MB),
+  (95% of it the same bytes in every column; packed to the step's slots, `decode.design.packed_slots`, from 100 MB),
   qwen35 9B 124 MB of 5.2 GB, 27B 351 MB of 16.4 GB (half of it per-column GDN states). One broadcast copy would save
   ~1-1.7%: the bytes, and 7 of the 8 fills between a drain wait and the next phase (their firmware ops are ~60% on
   the critical path). The overlays cannot take it as they are: the X stream also carries per-column objects
@@ -179,7 +179,7 @@ offsets): aie2p-coding section 8. For speed:
 
 ## Task queues and transactions (host-built sequences)
 
-`artlite.txn` and `overlay.runtime.Sequence`:
+`artlite.txn` and `overlay.Sequence`:
 - **Addresses**: shim BDs carry final addresses (paddr + 0x80000000).
 - **Queue limit**: at most 4 queued tasks per shim channel between syncs. A BD is reusable once
   its task completed.
@@ -213,7 +213,7 @@ offsets): aie2p-coding section 8. For speed:
   Gemma step 3751 -> 1366 waits, -0.25 ms (qwen35: no change). Extra BD writes on the X fills cost ~60% of their
   firmware time in step time; on the weight runs nothing (issued far ahead). Fewer tasks per boundary (one broadcast
   fill instead of one per column) is a design-time lever.
-- **An op's fixed cost** (sd15: per column a gate, then the op's tasks): an empty op 4.6 µs, a fill-only op of
+- **An op's fixed cost** (the vision overlay: per column a gate, then the op's tasks): an empty op 4.6 µs, a fill-only op of
   16 KB per column 7.9 µs, a band's conv ~13 µs above its B-stream time. Many small ops: the next op's input fills
   (and its output's allocation) merged into the current op where the memtile holds both, double buffering across ops
   (sd15 `vae.prefetch`: the VAE decoder's convs and norms 282 -> 258 ms).
@@ -301,7 +301,7 @@ offsets): aie2p-coding section 8. For speed:
   starts k at k - 1's end. Waited for first, a boundary left the NPU idle ~35 us (the wait's wake-up and the submit)
   on top of the next piece's ConfigureOp; the qwen35 35B-A3B's 4096-token chunk (124 pieces) -0.3%.
 - **The first dispatch after new host buffers** takes ~0.15 s more (the driver maps them): a model's load ends with an
-  empty dispatch (sd15 `Sd15Device.warm`), or its first step pays it.
+  empty dispatch (the vision overlay's `VisionDevice.warm`), or its first step pays it.
 - **Overlap host work**: prepare the next chunk's inputs on a worker thread while the NPU runs
   (gemma `NpuGemma.prompt`); what depends only on a step's index (SD's per-step time biases, 2.6 ms of GEMVs) for all
   steps before the first (`NpuUNet.prepare`, started before the text encoder). A decode step's position patches (cache ranges, tails, token objects: ~0.15 ms of numpy)

@@ -1,6 +1,6 @@
 # Loop pragmas and per-loop hints (Peano)
 
-All macros live in `src/artlite/operators/operators.h` (auto-included into
+All macros live in `src/artlite/include/operators.h` (auto-included into
 every RTC kernel). Place them immediately before the `for` statement; they
 apply to that loop only. Never write raw `#pragma clang loop`.
 
@@ -14,7 +14,7 @@ apply to that loop only. Never write raw `#pragma clang loop`.
 | macro | effect |
 |---|---|
 | `AIE_LOOP_RANGE(min,)` / `AIE_LOOP_RANGE(min, max)` | trip-count bounds; gate pipelining, ZOL, guard removal. Unneeded when the bound is a Jinja-rendered constant (the hardware-loop pass attaches a constant trip count as the same metadata: same asm) |
-| `AIE_LOOP_MIN_ITERATION_COUNT(N)` / `AIE_LOOP_MAX_ITERATION_COUNT(N)` | the two halves of `AIE_LOOP_RANGE`. The minimum also caps the post-RA pipeliner's stages ("trip count too small for the stages" in `variant_search --why`): give the smallest real trip count, not a safe small one (sd15's epilogue loops 4 -> 16: II 4 -> 2, 3 -> 2, 2 -> 1). A loop entered with fewer iterations than the minimum runs wrong |
+| `AIE_LOOP_MIN_ITERATION_COUNT(N)` / `AIE_LOOP_MAX_ITERATION_COUNT(N)` | the two halves of `AIE_LOOP_RANGE`. The minimum also caps the post-RA pipeliner's stages ("trip count too small for the stages" in `variant_search --why`): give the smallest real trip count, not a safe small one (the vision overlay's epilogue loops 4 -> 16: II 4 -> 2, 3 -> 2, 2 -> 1). A loop entered with fewer iterations than the minimum runs wrong |
 | `AIE_PREPARE_FOR_POSTPIPELINING` | `pipeline(disable)`: skip the pre-RA pipeliner so the post-RA pipeliner schedules the loop |
 | `AIE_TRY_INITIATION_INTERVAL(N)` | pre-RA pipeliner: search II from the MII up to N (Peano turns on `-pipeliner-pragma-as-max-ii`), with no stage-count cap and no hand-off to the post-RA pipeliner; post-RA: the exact solver's target II. The per-loop form of `-aie-pipeliner-max-stagecount` (below). Compile error together with `AIE_PREPARE_FOR_POSTPIPELINING` |
 | `AIE_LOOP_UNROLL(N)` / `AIE_LOOP_UNROLL_FULL` / `AIE_LOOP_NO_UNROLL` | unrolling control. `UNROLL_FULL` on a short loop whose index selects vector lanes (`extract<8>(j)`, `insert(j, ...)`) turns a switch into constant lanes (the same schedule as the copies written out: IQ3_XXS's gather and MMUL loops); `NO_UNROLL` on outer loops keeps program memory and stack in check. Peano leaves a short constant loop rolled, also at -O2 and in `minsize` code: a ZOL of ~180 B with its setup, where straight-line loads and stores take ~8 B per load and fewer cycles (the thresholds: `al::copy`, which unrolls itself) |

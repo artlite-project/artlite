@@ -1,0 +1,1543 @@
+"""The cores' program of the vision overlay (``design``): a C++ main reading commands from the row's B stream. The main
+loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
+d 80 / 160, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
+"ln" the LayerNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's window
+attention; together they do not fit 16 KB
+of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the pager's state
+words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third). A page arrives in the B stream
+(``device.VisionDevice``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
+core holds both slots, its MM2S 1 streams them into its own program memory while it sleeps in ``sd15_pg_self``, then it
+gives them back.
+
+A command is one B slot: the header words ``C_*`` and, from word ``C_BIAS``, the op's biases (bf16 [pass][80]); the
+core copies it into its workspace and releases the slot. Kinds:
+- ``K_NOP``: nothing (the host's parity filler: an op's command in B slot 0, ``seq``);
+- ``K_TABLE``: the next B slot's first ``TAB`` bytes -> the activation table (``kmath``'s: SiLU, or GELU fed 2 |x|);
+- ``K_GEMM``: per token tile (C_NTILE) and pass (C_NPASS: 80 output channels each): C := the pass's bias; per k-tile
+  (C_NKT) an A k-tile (``A_OBJ`` objects hold 128 / m of them, in two halves: ``design.R23``) and a B slot -> the MAC
+  (m = C_M tokens, 64 or 16: an fp32 C tile, rounded to bf16 once after the residual); a conv (C_CONV, the tile = the
+  column's tokens: C_R rows of groups, x = g + groups lane): per chunk of 64 input channels (C_NCH) an A object of its
+  input band rows (the halo rows included) and per tap a B slot, in the host's tap order: the taps' A are the object's
+  groups or lane-shifted copies (``sd15_shift``) of its edge groups, their MAC calls, walks and shift phases host-built
+  (``ops.Gemm.conv_words``, ``sd15_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
+  C; statistics of the result (C_STATS: GroupNorm group sums of the
+  op (C_STF: carried over from / to the next op), LayerNorm per-token sums of a tile, each emitted as one output
+  chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B; O_DS: its groups 0 and 2, a
+  stride-2 conv's x, in 2 x 2 chunks), its bfp16 panels (m x 90 B,
+  [rb][cb]), their transposes (V^T: [rb][cb] of [8 channels][8 tokens], the exponent per channel), GEGLU (the
+  pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) or GELU (gelu of the 80: bfp16 panels
+  [rb][10]) in ``OCH`` chunks (the last one padded);
+- ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
+  stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
+  beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
+  image's halves, their sums added): the B slots after it C_NREC
+  group records (``REC_SLOT`` per slot, summed); LayerNorm: the first A object the tile's per-token records of the
+  column's 4 cores;
+- ``K_ATTN`` (role a): per unit (C_NUNIT: an image and head of d 160) its queries (an A object: C_NQP query
+  panels (1, 2 or 4) as pairs [pair][d-block 20][2], a pair per half; a single panel's pair partner is junk), per key
+  group (C_NG of 32
+  keys, C_NK of them valid in the last one) a K slot [key pair 2][d-block 20][2] and a V^T slot [d-block pair 10][key
+  block 4][2] (8 dims x 8 keys): per query pair S = Q K^T (the GEMM MAC loop, m 16) and the softmax, then P V^T of the
+  pairs (m 16 npair); K is given back before V is taken (the next K arrives during P V^T). The softmax: the reference
+  max of each query from the first group (with C_RAISE raised, O and l rescaled, where a later group's scores exceed
+  it by 2^16: attention sinks; else never, P saturating at 2^63 above it; q pre-scaled by log2 e / sqrt d), P = 2^(s - m) to 0.59 bf16 ULP, l = the row sums of the bfp16 P;
+  out: O / l as panels [query panel][d-block]. A group whose keys are all masked (C_KMASK) is streamed and skipped
+  (the first group computed sets the reference max).
+
+Statistics records (``REC`` bytes, an output chunk): GroupNorm [image 2][S1, S2][16 groups] fp32 of groups of C_GSIZE
+channels counted from C_G0 (the core's first output channel C_CH0 + its passes); LayerNorm [S1 m | S2 m] fp32.
+Token panels: (image row, group, image): row block rb of a tile is image rb % 2.
+"""
+
+import functools
+
+import numpy as np
+
+from ..gemm.mac import render_mac
+from ..operators import kmath, paging
+from ..operators.base import JINJA_ENV
+from ..operators.kernel_source import kernel_prefix
+
+# command header words
+(C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
+ C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
+C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
+C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
+# groups; -1: all; around the command's walks)
+C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
+C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
+C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
+CALL, NCALL = 10, 11  # (words of a call, the most calls)
+CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk crosses between cbuf and the object)
+C_PATS = C_CALLS + CALL * NCALL  # (the MAC's walks of B and C, a dims_3d_t each: a conv's, a GEMM's, attention's P V^T)
+C_WALKS = C_PATS - 7  # (a GEMM's and attention's P V^T: the MAC's walk of A)
+C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
+C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a sd15_shift's offsets)
+SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
+ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a statistics record continued from / kept for the next op: one record over several
+# ops; LayerNorm's: ops of one tile)
+C_BIAS = 64  # (word of the biases: bf16 [pass][80])
+C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
+C_ZERO = 48  # (16 zero words: a residual of zeros)
+K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN = 1, 2, 3, 4, 5, 6
+O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU = 0, 1, 2, 3, 4, 5
+S_NONE, S_GN, S_LN = 0, 1, 2
+A_GN, A_GNSILU, A_LN = 1, 2, 3
+REC_GN = 256  # (bytes of a GroupNorm record)
+REC_SLOT = 22  # (GroupNorm records per B slot)
+P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
+ROLES = ("a", "c", "v", "gn", "ln", "w")
+WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
+
+_SRC = r"""
+{{ macf }}
+{{ pvm }}
+
+struct {{ p }}_st {  // the static chains' positions (A ping-pong, B slots, output ring), the scratch buffers, the pager's
+  // state words (the loaded page's entries)
+  int32_t *a0, *a1, *b0, *b1, *outr, *s0, *s1;
+  int apar, bpos, opos;
+  const volatile int32_t *ext;
+};
+
+namespace {
+constexpr unsigned {{ p }}_L_AF = 48, {{ p }}_L_AA = 49, {{ p }}_L_BF = 50, {{ p }}_L_BB = 51, {{ p }}_L_OF = 52, {{ p }}_L_OO = 53;  // (the core's locks 0..5)
+
+// (take: the next slot, its position advanced; give: release it: two slots may be held at once)
+inline __attribute__((always_inline)) int32_t *{{ p }}_take_a({{ p }}_st &s) {
+  int32_t *p = s.apar ? s.a1 : s.a0;
+  s.apar ^= 1;
+{% if win == "acqa" %}
+  event0();
+{% endif %}
+  acquire_greater_equal(p, {{ p }}_L_AA, 1);
+{% if win == "acqa" %}
+  event1();
+{% endif %}
+  return p;
+}
+inline __attribute__((always_inline)) void {{ p }}_give_a({{ p }}_st &, int32_t *p) { release(p, {{ p }}_L_AF, 1); }
+inline __attribute__((always_inline)) int32_t *{{ p }}_take_b({{ p }}_st &s) {
+  int32_t *p = s.bpos ? s.b1 : s.b0;
+  s.bpos ^= 1;
+{% if win == "acqb" %}
+  event0();
+{% endif %}
+  acquire_greater_equal(p, {{ p }}_L_BB, 1);
+{% if win == "acqb" %}
+  event1();
+{% endif %}
+  return p;
+}
+inline __attribute__((always_inline)) void {{ p }}_give_b({{ p }}_st &, int32_t *p) { release(p, {{ p }}_L_BF, 1); }
+
+// word w / byte o of the A object at a (its halves in two regions, ``design.R23``)
+inline __attribute__((always_inline)) int32_t *{{ p }}_aw(int32_t *a, int w) {
+  return a + w + (w >= {{ A_OBJ // 8 }} ? {{ A_HI // 4 }} : 0);
+}
+inline __attribute__((always_inline)) const uint8_t *{{ p }}_ab(const uint8_t *a, int o) {
+  return a + o + (o >= {{ A_OBJ // 2 }} ? {{ A_HI }} : 0);
+}
+
+// 64 lanes [8 tokens][8 ch] (fp32) -> per channel the sum over the tokens
+inline __attribute__((always_inline)) aie::vector<float, 8> {{ p }}_chsum(aie::accum<accfloat, 64> a) {
+  const aie::vector<float, 64> v = a.template to_vector<float>();
+  const aie::vector<float, 32> h = aie::add(v.template extract<32>(0), v.template extract<32>(1));
+  const aie::vector<float, 16> q = aie::add(h.template extract<16>(0), h.template extract<16>(1));
+  return aie::add(q.template extract<8>(0), q.template extract<8>(1));
+}
+
+// the first n lanes
+inline __attribute__((always_inline)) aie::mask<8> {{ p }}_lo(int n) {
+  return aie::mask<8>::from_uint32(n >= 8 ? 0xFFu : (n <= 0 ? 0u : (1u << n) - 1));
+}
+
+// 8 values -> 64 lanes [8 tokens][8 ch] (the 8 channels' values repeated per token)
+inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_rep(const bfloat16 *c) {
+  return aie::load_v<8>(c).grow_replicate<64>();
+}
+
+// 8 per-token values -> 64 lanes [token][8 ch]
+inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(const bfloat16 *v) {
+  aie::vector<bfloat16, 8> x = aie::load_v<8>(v);
+  const auto z1 = aie::interleave_zip(x, x, 1);
+  const aie::vector<bfloat16, 16> x16 = aie::concat(z1.first, z1.second);
+  const auto z2 = aie::interleave_zip(x16, x16, 1);
+  const aie::vector<bfloat16, 32> x32 = aie::concat(z2.first, z2.second);
+  const auto z3 = aie::interleave_zip(x32, x32, 1);
+  return aie::concat(z3.first, z3.second);
+}
+}  // namespace
+
+{% set stab = km.table_pass(km.SILU, table_arg=True, n=640) %}
+{% set tw = km.SILU.table_words() | length %}
+{# GELU through a GELU table on SiLU's grid (``layers.gelu_table``: fed 2 |x|, clamped at 2 t_max): of a row block, and
+   of two row blocks' gate blocks in a GEGLU tile (groups of 320 values, 640 apart) #}
+{% set gelu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax) %}
+{% set geglu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax, walk=(10, 640)) %}
+{{ stab.src }}
+{{ gelu_act.src }}
+{{ geglu_act.src }}
+
+
+// (an fp32 C tile of nbr 16-row bands: a k-tile from A at a with the walks pa (A, bytes), pb (B, bytes), pl (C))
+__attribute__((noinline)) void {{ p }}_ktf(const int32_t *__restrict a, const int32_t *__restrict b, float *__restrict c, int nbr,
+                                      const dims_3d_t &pa, const dims_3d_t &pb, const dims_3d_t &pl) {
+{% if win == "nomac" %}
+  (void)a, (void)b, (void)c, (void)nbr, (void)pa, (void)pb, (void)pl;
+{% else %}
+  dims_3d_t patA = pa, patB = pb, patL = pl, patS = pl;
+  {{ p }}_macf<64, 80>((const bfp16ebs8 *)a, b, (const float __aie_dm_resource_c *)c, (float __aie_dm_resource_c *)c, nbr, patA, patB, patL,
+          patS);
+{% endif %}
+}
+
+// the lane shifts of two groups of 16 panels (1152 B: [kb 8][image 2]): sd one lane down into dd (lane j <- j - 1,
+// lane 0 zero), su one lane up into du (lane j <- j + 1, lane 7 zero): 9-byte moves across 64-byte vectors, each
+// panel's cut lane cleared by the byte masks mk (a 576-B cycle: down, then up; the conv command's, ``C_MASKS``): the
+// 64 bytes before sd and after su land in cut lanes (loaded again, not carried: post-RA pipelined, II 5)
+__attribute__((noinline)) void {{ p }}_shift(const uint8_t *__restrict sd, uint8_t *__restrict dd, const uint8_t *__restrict su,
+                                        uint8_t *__restrict du, const uint8_t *__restrict mk) {
+  int cm = 0;
+  for (int k = 0; k < 18; k++) {
+    const aie::vector<uint8, 64> v = aie::load_v<64>(sd), pv = aie::load_v<64>(sd - 64);
+    const aie::vector<uint8, 64> u = aie::load_v<64>(su), nu = aie::load_v<64>(su + 64);
+    aie::store_v(dd, aie::bit_and(aie::shuffle_up_fill(v, pv, 9), aie::load_v<64>(mk)));
+    aie::store_v(du, aie::bit_and(aie::shuffle_down_fill(u, nu, 9), aie::load_v<64>(mk + 576)));
+    sd += 64;
+    dd += 64;
+    su += 64;
+    du += 64;
+    mk = add_2d_ptr(mk, 64 - 576, 8, cm, 64);
+  }
+}
+
+// fp32 C := the pass's bias over nrb row blocks
+__attribute__((noinline)) void {{ p }}_bias_f(const bfloat16 *__restrict bias, float *__restrict c, int nrb) {
+  for (int cb = 0; cb < 10; cb++) {
+    const aie::vector<float, 16> v16 = aie::accum<accfloat, 16>(aie::load_v<8>(bias + 8 * cb).grow_replicate<16>()).template to_vector<float>();
+    float *p = c + 64 * cb;
+    AIE_LOOP_MIN_ITERATION_COUNT(2)
+    for (int rb = 0; rb < nrb; rb++) {
+      aie::store_v(p, v16);
+      aie::store_v(p + 16, v16);
+      aie::store_v(p + 32, v16);
+      aie::store_v(p + 48, v16);
+      p += 640;
+    }
+  }
+}
+
+// bf16(cl[i] + residual value i) -> cs[i], i < n (a multiple of 32): the fp32 C tile to bf16 in place with an A
+// object's values (rs 32, rj its halves' gap: ``design.A_HI`` / 2), or with zeros (rs, rj 0, r 32 zeros) (cl, cs: the
+// same values as distinct restrict parameters, each read before it is written; the residual a MAC operand: a plain load,
+// beside cl's two accumulator loads on load slot A; n >= 512: post-RA II 2)
+__attribute__((noinline)) void {{ p }}_res_f2b(const bfloat16 *__restrict r, const float *__restrict cl, bfloat16 *__restrict cs, int n,
+                                          int rs, int rj) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+  int cr = 0;
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int i = 0; i < n / 32; i++) {
+    aie::accum<accfloat, 32> s(aie::load_v<32>(cl));
+    s = aie::mac(s, aie::load_v<32>(r), one);
+    aie::store_v(cs, s.template to_vector<bfloat16>());
+    cl += 32;
+    r = add_2d_ptr(r, rs + rj, {{ A_OBJ // 128 - 1 }}, cr, rs);
+    cs += 32;
+  }
+}
+
+// the C tile's first n (>= 16) 8x8 sub-blocks (bf16) -> bfp16 panels in place, in their order (panel i at 72 i, read at
+// 128 i: src and dst the same buffer, each sub-block read before its panel is written; post-RA II 2)
+__attribute__((noinline)) void {{ p }}_bfp(const int32_t *__restrict src_, int32_t *__restrict dst, int n) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *src = (const bfloat16 *)src_;
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out((bfp16ebs8 *)dst);
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int i = 0; i < n; i++) {
+    out << aie::accum<accfloat, 64>(aie::load_v<64>(src)).template to_vector<bfp16ebs8>();
+    src += 64;
+  }
+}
+
+// the C tile's first n 8x8 sub-blocks (bf16 [8 tokens][8 ch]) -> bfp16 panels of their transposes in place (as {{ p }}_bfp)
+__attribute__((noinline)) void {{ p }}_vt(const int32_t *__restrict src_, int32_t *__restrict dst, int n) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *src = (const bfloat16 *)src_;
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out((bfp16ebs8 *)dst);
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int i = 0; i < n; i++) {
+    out << aie::accum<accfloat, 64>(aie::transpose(aie::load_v<64>(src), 8, 8)).template to_vector<bfp16ebs8>();
+    src += 64;
+  }
+}
+
+// n (a multiple of 8, >= 128) words between 32-B aligned addresses
+__attribute__((noinline)) void {{ p }}_copy8(const int32_t *__restrict s, int32_t *__restrict d, int n) {
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int i = 0; i < n; i += 8) {
+    aie::store_v(d, aie::load_v<8>(s));
+    s += 8;
+    d += 8;
+  }
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_zero(int32_t *__restrict d, int n) {
+  for (int i = 0; i < n; i += 16) aie::store_v(d + i, aie::zeros<int32, 16>());
+}
+
+// GroupNorm sums of a pass: C [rb][cb][64] (bf16, nrb row blocks, rb of image rb % 2) -> rec [img][S1, S2][16
+// groups] fp32 (+=): channel ch0 + k of the pass is in group (ch0 + k) / gs - g0
+__attribute__((noinline)) void {{ p }}_gnst(const bfloat16 *__restrict c, float *__restrict rec, int nrb, int ch0, int gs,
+                                       unsigned gi, int g0) {
+  const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+  const aie::vector<float, 8> z8 = aie::zeros<float, 8>();
+  for (int cb = 0; cb < 10; cb++) {
+    const unsigned c0 = ch0 + 8 * cb;
+    const int ga = c0 * gi >> 20, gb = (c0 + 7) * gi >> 20;
+    const aie::mask<8> m = {{ p }}_lo((ga + 1) * gs - c0);
+    const aie::mask<16> oa = aie::mask<16>::from_uint32(1u << (ga - g0)), ob = aie::mask<16>::from_uint32(1u << (gb - g0));
+    for (int img = 0; img < 2; img++) {
+      aie::accum<accfloat, 64> a1 = aie::zeros<accfloat, 64>(), a2 = aie::zeros<accfloat, 64>();
+      for (int k = img; k < nrb; k += 2) {
+        const aie::vector<bfloat16, 64> v = aie::load_v<64>(c + 640 * k + 64 * cb);
+        a1 = aie::mac(a1, v, one);
+        a2 = aie::mac(a2, v, v);
+      }
+      for (int st = 0; st < 2; st++) {
+        const aie::vector<float, 8> s = {{ p }}_chsum(st ? a2 : a1);
+        const float sa = aie::reduce_add(aie::select(z8, s, m)), sb = aie::reduce_add(aie::select(s, z8, m));
+        float *g = rec + 32 * img + 16 * st;
+        aie::vector<float, 16> gv = aie::load_v<16>(g);
+        gv = aie::select(gv, aie::add(gv, aie::broadcast<float, 16>(sa)), oa);
+        gv = aie::select(gv, aie::add(gv, aie::broadcast<float, 16>(sb)), ob);
+        aie::store_v(g, gv);
+      }
+    }
+  }
+}
+
+// LayerNorm sums of a pass: per token of the tile S1, S2 over the pass's 80 channels added to rec [S1 m | S2 m]
+__attribute__((noinline)) void {{ p }}_lnst(const bfloat16 *__restrict c, float *__restrict rec, int nrb) {
+  const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+  const int m = 8 * nrb;
+  for (int rb = 0; rb < nrb; rb++) {
+    aie::accum<accfloat, 64> a1 = aie::zeros<accfloat, 64>(), a2 = aie::zeros<accfloat, 64>();
+    for (int cb = 0; cb < 10; cb++) {
+      const aie::vector<bfloat16, 64> v = aie::load_v<64>(c + 640 * rb + 64 * cb);
+      a1 = aie::mac(a1, v, one);
+      a2 = aie::mac(a2, v, v);
+    }
+    float *p1 = rec + 8 * rb, *p2 = rec + m + 8 * rb;
+    aie::store_v(p1, aie::add(aie::load_v<8>(p1), al::group8<false>(a1.template to_vector<float>())));
+    aie::store_v(p2, aie::add(aie::load_v<8>(p2), al::group8<false>(a2.template to_vector<float>())));
+  }
+}
+
+// GEGLU of a C tile: rb's channels [hid 5 cb | gate 5 cb] -> hid gelu(gate) as bfp16 panels [rb][5] at out (the tile's
+// buffer: the panels trail the reads); t: scratch (640 bf16: gelu(gate) of two row blocks), tab: the GELU table on SiLU's
+// grid (``geglu_act``: fed 2 |x|, the gate blocks read in place); the hid blocks walked by a 2-D pointer
+__attribute__((noinline)) void {{ p }}_geglu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict t,
+                                        const uint32_t *__restrict tab, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *h = (const bfloat16 *)in;
+  int ch = 0;
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o((bfp16ebs8 *)out);
+  for (int rb = 0; rb < nrb; rb += 2) {
+    {{ geglu_act }}((const bfloat16 *)in + 320 + 640 * rb, t, tab, tab + {{ tw }});
+    const bfloat16 *tv = t;
+    for (int i = 0; i < 10; i++) {
+      o.push(aie::mul(aie::load_v<64>(tv), aie::load_v<64>(h)).template to_vector<bfp16ebs8>());
+      h = add_2d_ptr(h, 384, 4, ch, 64);
+      tv += 64;
+    }
+  }
+}
+
+// GELU of a C tile: rb's 10 channel blocks -> gelu as bfp16 panels [rb][10] at out (the tile's buffer: the panels trail
+// the reads); t: scratch (640 bf16: gelu of a row block), tab: the GELU table on SiLU's grid (``gelu_act``: fed 2 |x|)
+__attribute__((noinline)) void {{ p }}_gelu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict t,
+                                       const uint32_t *__restrict tab, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o((bfp16ebs8 *)out);
+  for (int rb = 0; rb < nrb; rb++) {
+    {{ gelu_act }}((const bfloat16 *)in + 640 * rb, t, tab, tab + {{ tw }});
+    const bfloat16 *tv = t;
+    for (int i = 0; i < 10; i++) {
+      o.push(aie::accum<accfloat, 64>(aie::load_v<64>(tv)).template to_vector<bfp16ebs8>());
+      tv += 64;
+    }
+  }
+}
+
+// nbytes from src through the output ring, in OCH chunks (the last one padded with what follows src)
+__attribute__((noinline, minsize)) void {{ p }}_out({{ p }}_st &s, const int32_t *src, int nbytes) {
+{% if win == "out" %}
+  event0();
+{% endif %}
+  for (int off = 0; off < nbytes; off += {{ OCH }}) {
+    int32_t *o = s.outr + s.opos * {{ OSL // 4 }};
+    acquire_greater_equal(o, {{ p }}_L_OF, 1);
+    {{ p }}_copy8(src + off / 4, o, {{ OCH // 4 }});
+    release(o, {{ p }}_L_OO, 1);
+    s.opos = s.opos == {{ NO - 1 }} ? 0 : s.opos + 1;
+  }
+{% if win == "out" %}
+  event1();
+{% endif %}
+}
+
+// a conv pass (``K_GEMM`` with C_CONV, the module docstring): per chunk of 64 input channels its A object (band rows
+// [groups][kb 8][2] each, whole rows in each half) and its taps in the host's order (``ops.Gemm.tap_order``: rotated by
+// one in odd chunks where C_ROT), per tap (C_TAPW: its first call | calls << 10 | phase << 12): its shift phase if any
+// (C_PHASE: per output row r < C_R the {{ p }}_shift of two object groups into cbuf, one lane down / up), a B slot and its
+// MAC calls (C_CALLS: the first band's source (bit 31: cbuf, else the object; bits 0..15: its byte offset), bit 30:
+// the second group's C bands, bits 16..23: the bands; the A walk (a dims_3d_t); its last step per A slot (the walk
+// may cross between cbuf and the object: set per chunk); the B and C walks: C_PATS); the row tiles (``ops.Gemm`` rc): an
+// A object per dy (bit 15 of its first tap: the next object), its shift phase's destinations in the object (SH_OBJ)
+// (per tile its half of the tap words: C_TPAR bit t, the high one where set)
+__attribute__((noinline, minsize)) void {{ p }}_conv({{ p }}_st &s, int32_t *ws, float *cf, uint8_t *cbuf, int par) {
+  static_assert(sizeof(dims_3d_t) == 28);
+  const int nch = ws[{{ C_NCH }}], R = ws[{{ C_R }}], rot = ws[{{ C_ROT }}];
+  const dims_3d_t &pb = *(const dims_3d_t *)(ws + {{ C_PATS }}), &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
+  const uint8_t *mk = (const uint8_t *)(ws + {{ C_MASKS }});
+  int32_t *const e0 = ws + {{ C_CALLS }};
+  for (int ch = 0; ch < nch; ch++) {
+    const uint8_t *a = (const uint8_t *){{ p }}_take_a(s);
+    const int k = {{ CALL - 1 }} - s.apar;  // (the calls whose walk crosses between cbuf and the object: their last step)
+{% for i in CROSS %}
+    e0[{{ CALL * i + 5 }}] = e0[{{ CALL * i }} + k];
+{% endfor %}
+    for (int t = 0, i = rot & ch; t < 9; t++, i = i == 8 ? 0 : i + 1) {
+      const unsigned tw = (par ? (unsigned)ws[{{ C_TAPW }} + i] >> 16 : ws[{{ C_TAPW }} + i]) & 0xFFFF;
+      if (tw >> 15) {  // (the row tiles: the next dy's object)
+        {{ p }}_give_a(s, (int32_t *)a);
+        a = (const uint8_t *){{ p }}_take_a(s);
+      }
+      if ((tw >> 12) & 7) {
+        const int32_t *pw = ws + {{ C_PHASE }} + 8 * (((tw >> 12) & 7) - 1);
+        for (int r = 0; r < R; r++, pw += 4)
+          {{ p }}_shift(a + pw[0], (pw[1] < 0 ? (uint8_t *)a : cbuf) + (pw[1] & 0xFFFF), a + pw[2],
+                   (pw[3] < 0 ? (uint8_t *)a : cbuf) + (pw[3] & 0xFFFF), mk);
+      }
+      int32_t *b = {{ p }}_take_b(s);
+      const int32_t *e = e0 + (tw & 0x3FF);
+      for (int n = (tw >> 10) & 3; n > 0; n--, e += {{ CALL }}) {
+        const unsigned w = e[0];
+        {{ p }}_ktf((const int32_t *)((w >> 31 ? cbuf : a) + (w & 0xFFFF)), b, cf + (w & 0x40000000 ? 1280 : 0), (w >> 16) & 0xFF,
+               *(const dims_3d_t *)(e + 1), pb, pl);
+      }
+      {{ p }}_give_b(s, b);
+    }
+    {{ p }}_give_a(s, (int32_t *)a);
+  }
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], npass = ws[{{ C_NPASS }}], nkt = ws[{{ C_NKT }}];
+  const int nres = ws[{{ C_NRES }}], om = ws[{{ C_OUT }}], stats = ws[{{ C_STATS }}], stf = ws[{{ C_STF }}];
+  const int kpo = m == 64 ? 2 : 8, nrb = m / 8;  // (k-tiles per A object, row blocks)
+  // (the MAC's walks; m 64: the band pairs (0, 2), (1, 3) alternate per block, C's halves in two L1 regions)
+  const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
+  const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});  // (the MAC's walks: the command's, ``ops.mac_walks``)
+  bfloat16 *c = (bfloat16 *)cb;
+  float *cf = (float *)cb;  // (the C tile in fp32, rounded to bf16 in place before the epilogue)
+  float *rec = (float *)s.s1;
+  if (stats == {{ S_GN }} && !(stf & {{ ST_KEEP }})) {{ p }}_zero(s.s1, {{ REC_GN // 4 }});
+  for (int t = 0; t < ntile; t++) {
+    if (stats == {{ S_LN }} && !(stf & {{ ST_KEEP }})) {{ p }}_zero(s.s1, 2 * m);
+    for (int p = 0; p < npass; p++) {
+      {{ p }}_bias_f((const bfloat16 *)(ws + {{ C_BIAS }}) + 80 * p, cf, nrb);
+      if (ws[{{ C_CONV }}])
+        {{ p }}_conv(s, ws, cf, (uint8_t *)tab, (unsigned)ws[{{ C_TPAR }}] >> t & 1);
+      else
+      for (int kt = 0; kt < nkt; kt += kpo) {
+        int32_t *a = {{ p }}_take_a(s);
+        const int n = nkt - kt < kpo ? nkt - kt : kpo;
+        for (int j = 0; j < n; j++) {
+          int32_t *b = {{ p }}_take_b(s);
+{% if win == "mac" %}
+          event0();
+{% endif %}
+          {{ p }}_ktf({{ p }}_aw(a, 18 * m * j), b, cf, m / 16, pa, pb, pl);
+{% if win == "mac" %}
+          event1();
+{% endif %}
+          {{ p }}_give_b(s, b);
+        }
+        {{ p }}_give_a(s, a);
+      }
+      int left = m * 80;  // (the residual tile's bf16 values, with the conversion to bf16)
+      for (int i = 0; i < nres; i++) {
+        int32_t *a = {{ p }}_take_a(s);
+        const int n = left < {{ A_OBJ // 2 }} ? left : {{ A_OBJ // 2 }};
+        {{ p }}_res_f2b((const bfloat16 *)a, cf + i * {{ A_OBJ // 2 }}, c + i * {{ A_OBJ // 2 }}, n, 32, {{ A_HI // 2 }});
+        left -= n;
+        {{ p }}_give_a(s, a);
+      }
+      if (!nres) {{ p }}_res_f2b((const bfloat16 *)(ws + {{ C_ZERO }}), cf, c, m * 80, 0, 0);  // (zeros: the command's)
+      if (stats == {{ S_GN }})
+        {{ p }}_gnst(c, rec, nrb, ws[{{ C_CH0 }}] + 80 * p, ws[{{ C_GSIZE }}], ws[{{ C_GINV }}], ws[{{ C_G0 }}]);
+      else if (stats == {{ S_LN }})
+        {{ p }}_lnst(c, rec, nrb);
+      int nbytes = m * 160;
+      if (om == {{ O_BFP16 }}) {
+        {{ p }}_bfp(cb, cb, nrb * 10);
+        nbytes = m * 90;
+      } else if (om == {{ O_VT }}) {
+        {{ p }}_vt(cb, cb, nrb * 10);
+        nbytes = m * 90;
+      } else if (om == {{ O_GEGLU }}) {
+        // (page ln's second entry: ``seq``; scratch: no statistics in a GEGLU op)
+        ((void (*)(const int32_t *, int32_t *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[2])(
+            cb, cb, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
+        nbytes = m * 45;
+      } else if (om == {{ O_GELU }}) {
+        // (page ln's third entry: ``seq``; scratch: no statistics in a GELU op)
+        ((void (*)(const int32_t *, int32_t *, bfloat16 *, const uint32_t *, int))(intptr_t)s.ext[3])(
+            cb, cb, (bfloat16 *)s.s1, (const uint32_t *)tab, nrb);
+        nbytes = m * 90;
+      }
+      if (om == {{ O_DS }}) {  // (a stride-2 conv's tile: groups 0 and 2, row blocks 0, 1 and 4, 5)
+        {{ p }}_out(s, cb, 2560);
+        {{ p }}_out(s, cb + 1280, 2560);
+      } else
+        {{ p }}_out(s, cb, nbytes);
+    }
+    if (stats == {{ S_LN }} && !(stf & {{ ST_HOLD }})) {{ p }}_out(s, s.s1, 8 * m);
+  }
+  if (stats == {{ S_GN }} && !(stf & {{ ST_HOLD }})) {{ p }}_out(s, s.s1, {{ REC_GN }});
+}
+
+// rstd = 1 / sqrt(max(s2 inv_n - mean^2, 0) + eps), mean = s1 inv_n (16 lanes; the lanes' invsqrt unrolled)
+static __attribute__((noinline, minsize)) void {{ p }}_mrstd(const float *__restrict s1, const float *__restrict s2, const int32_t *ws,
+                                               float *__restrict mean, float *__restrict rstd) {
+  const aie::vector<float, 16> inv_n = aie::broadcast<int32, 16>(ws[{{ C_INVN }}]).template cast_to<float>();
+  const aie::vector<float, 16> eps = aie::broadcast<int32, 16>(ws[{{ C_EPS }}]).template cast_to<float>();
+  const aie::vector<float, 16> m1 = al::mulff<16>(aie::load_v<16>(s1), inv_n);
+  const aie::vector<float, 16> ve = aie::add(aie::max(aie::sub(al::mulff<16>(aie::load_v<16>(s2), inv_n), al::mulff<16>(m1, m1)),
+                                                      aie::zeros<float, 16>()), eps);
+  aie::vector<float, 16> r;
+  AIE_LOOP_UNROLL_FULL
+  for (int k = 0; k < 16; k++) r.set(aie::invsqrt(ve[k]), k);
+  aie::store_v(mean, m1);
+  aie::store_v(rstd, r);
+}
+
+// 16 fp32 s, t -> coef [8 ch: s_hi | s_lo][t_hi | t_lo] bf16 (the first 8 lanes)
+static inline __attribute__((always_inline)) void {{ p }}_split_st(aie::vector<float, 16> sv, aie::vector<float, 16> tv,
+                                                              bfloat16 *cf) {
+  aie::vector<bfloat16, 16> sh, sl, th, tl;
+  al::split2<16>(sv, sh, sl);
+  al::split2<16>(tv, th, tl);
+  aie::store_v(cf, aie::concat(sh.extract<8>(0), sl.extract<8>(0)));
+  aie::store_v(cf + 16, aie::concat(th.extract<8>(0), tl.extract<8>(0)));
+}
+
+// GroupNorm coefficients of n16 x 16 channels (s = gamma rstd, t = beta - mean s): mr = mean [16] | rstd [16] of the
+// record window's groups, tw: per 16 channels two words, the indices in it of their groups in lane order (up to four:
+// groups of 4 channels), the fourth's first lane, the lanes of the first and of the third (``group_words``), gb =
+// gamma, beta [c16][16 | 16] fp32 -> coef [c8][s_hi 8 | s_lo 8 | t_hi 8 | t_lo 8] (gb and coef may be one buffer: an
+// iteration reads its 128 B before it writes them; pipelined)
+static __attribute__((noinline)) void {{ p }}_gnc16(const float *__restrict gb, const float *__restrict mr, bfloat16 *__restrict coef,
+                                              const int32_t *__restrict tw, int n16) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  AIE_LOOP_MIN_ITERATION_COUNT(5)
+  for (int k = 0; k < n16; k++) {
+    const unsigned w = *tw++, wm = *tw++, ia = w & 31, ib = (w >> 5) & 31, ic = (w >> 10) & 31, id = (w >> 15) & 31;
+    const aie::mask<16> ma = aie::mask<16>::from_uint32(wm & 0xFFFF), mc = aie::mask<16>::from_uint32(wm >> 16);
+    const aie::mask<16> md = aie::mask<16>::from_uint32(0xFFFFu << ((w >> 20) & 31));
+    const aie::vector<float, 16> rs = aie::select(aie::select(aie::select(aie::broadcast<float, 16>(mr[16 + ib]), aie::broadcast<float, 16>(mr[16 + ic]), mc),
+                                                              aie::broadcast<float, 16>(mr[16 + id]), md),
+                                                  aie::broadcast<float, 16>(mr[16 + ia]), ma);
+    const aie::vector<float, 16> mu = aie::select(aie::select(aie::select(aie::broadcast<float, 16>(mr[ib]), aie::broadcast<float, 16>(mr[ic]), mc),
+                                                              aie::broadcast<float, 16>(mr[id]), md),
+                                                  aie::broadcast<float, 16>(mr[ia]), ma);
+    const aie::vector<float, 16> sv = al::mulff<16>(rs, aie::load_v<16>(gb));
+    const aie::vector<float, 16> tv = aie::sub(aie::load_v<16>(gb + 16), al::mulff<16>(mu, sv));
+    aie::vector<bfloat16, 16> sh, sl, th, tl;
+    al::split2<16>(sv, sh, sl);
+    al::split2<16>(tv, th, tl);
+    aie::store_v(coef, aie::concat(sh.extract<8>(0), sl.extract<8>(0)));
+    aie::store_v(coef + 16, aie::concat(th.extract<8>(0), tl.extract<8>(0)));
+    aie::store_v(coef + 32, aie::concat(sh.extract<8>(1), sl.extract<8>(1)));
+    aie::store_v(coef + 48, aie::concat(th.extract<8>(1), tl.extract<8>(1)));
+    gb += 32;
+    coef += 64;
+  }
+}
+
+// st [0, 64) += n records of 64 fp32 at r (pipelined)
+static __attribute__((noinline)) void {{ p }}_recsum(const float *__restrict r, float *__restrict st, int n) {
+  aie::vector<float, 16> s0 = aie::load_v<16>(st), s1 = aie::load_v<16>(st + 16), s2 = aie::load_v<16>(st + 32),
+                         s3 = aie::load_v<16>(st + 48);
+  for (int k = 0; k < n; k++) {
+    s0 = aie::add(s0, aie::load_v<16>(r));
+    s1 = aie::add(s1, aie::load_v<16>(r + 16));
+    s2 = aie::add(s2, aie::load_v<16>(r + 32));
+    s3 = aie::add(s3, aie::load_v<16>(r + 48));
+    r += 64;
+  }
+  aie::store_v(st, s0);
+  aie::store_v(st + 16, s1);
+  aie::store_v(st + 32, s2);
+  aie::store_v(st + 48, s3);
+}
+
+// LayerNorm: gamma, beta per channel -> coef [ch / 8][32]
+static __attribute__((noinline, minsize)) void {{ p }}_ch_coef(const float *__restrict gam, const float *__restrict bet,
+                                                 bfloat16 *__restrict coef, int nch) {
+  for (int c8 = 0; c8 < nch; c8 += 8)
+    {{ p }}_split_st(aie::concat(aie::load_v<8>(gam + c8), aie::load_v<8>(gam + c8)), aie::concat(aie::load_v<8>(bet + c8), aie::load_v<8>(bet + c8)),
+                coef + 32 * (c8 / 8));
+}
+
+// LayerNorm per token: a tile's records of the column's 4 cores ([core][S1 m | S2 m], 144 floats apart) -> tokc [rb][a_hi 8 |
+// a_lo 8 | b_hi 8 | b_lo 8] (a = rstd, b = -mean rstd); st: scratch (mean 16 | rstd 16)
+static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__restrict ra, const int32_t *ws, float *__restrict st,
+                                                bfloat16 *__restrict tokc, int m) {
+  for (int k = 0; k < m; k += 16) {
+    aie::vector<float, 16> s1 = aie::zeros<float, 16>(), s2 = aie::zeros<float, 16>();
+    for (int q = 0; q < 4; q++) {
+      const float *r = ra + 144 * q;
+      s1 = aie::add(s1, aie::load_v<16>(r + k));
+      s2 = aie::add(s2, aie::load_v<16>(r + m + k));
+    }
+    aie::store_v(st + 32, s1);
+    aie::store_v(st + 48, s2);
+    {{ p }}_mrstd(st + 32, st + 48, ws, st, st + 16);
+    const aie::vector<float, 16> rs = aie::load_v<16>(st + 16);
+    const aie::vector<float, 16> bb = aie::sub(aie::zeros<float, 16>(), al::mulff<16>(aie::load_v<16>(st), rs));
+    aie::vector<bfloat16, 16> ah, al_, bh, bl;
+    al::split2<16>(rs, ah, al_);
+    al::split2<16>(bb, bh, bl);
+    for (int h = 0; h < 2; h++) {
+      bfloat16 *o = tokc + 32 * (k / 8 + h);
+      aie::store_v(o, aie::concat(ah.extract<8>(h), al_.extract<8>(h)));
+      aie::store_v(o + 16, aie::concat(bh.extract<8>(h), bl.extract<8>(h)));
+    }
+  }
+}
+
+// one row block x (10 sub-blocks [8 tokens][8 ch], bf16) -> its 10 panels pushed at pan: z = x s + t (GroupNorm,
+// mode 1 / 2: then SiLU (the table)) or z = (x a + b) s + t (LayerNorm, mode 3: a, b the row block's token coefficients
+// tk [a_hi | a_lo | b_hi | b_lo], expanded once); s, t: the channels' cf [cb][s_hi | s_lo | t_hi | t_lo]; zz: z (x
+// itself: each read before it is written), tt: scratch (640). GroupNorm 32 lanes a step (64-lane vectors take two x
+// registers each: the coefficients' replicas and x spilled, II 26 per 64)
+static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restrict x, bfloat16 *__restrict zz, bfloat16 *__restrict tt,
+                                                  const bfloat16 *__restrict cf, const bfloat16 *__restrict tk,
+                                                  const uint32_t *__restrict tab, bfp16ebs8 *__restrict pan, int mode) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  bfloat16 *z0 = zz, *t0 = tt;
+  if (mode != {{ A_LN }}) {
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), hi = aie::broadcast<bfloat16, 32>(24.0f);
+    int cc = 0;
+    for (int i = 0; i < 20; i++) {  // (post-RA pipelined, II 8)
+      const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x);
+      const aie::accum<accfloat, 32> ta = aie::mac(aie::mul(aie::load_v<8>(cf + 16).grow_replicate<32>(), one),
+                                                   aie::load_v<8>(cf + 24).grow_replicate<32>(), one);
+      const aie::vector<bfloat16, 32> z = aie::mac(aie::mac(ta, xv, aie::load_v<8>(cf).grow_replicate<32>()), xv,
+                                                   aie::load_v<8>(cf + 8).grow_replicate<32>()).template to_vector<bfloat16>();
+      aie::store_v(zz, z);
+      aie::store_v(tt, aie::min(aie::abs(z), hi));
+      x += 32;
+      zz += 32;
+      tt += 32;
+      cf = add_2d_ptr(cf, 32, 1, cc, 0);
+    }
+  } else {
+    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+    const aie::vector<bfloat16, 64> ah = {{ p }}_tok64(tk), al_ = {{ p }}_tok64(tk + 8);
+    const aie::accum<accfloat, 64> bt = aie::mac(aie::mul({{ p }}_tok64(tk + 16), one), {{ p }}_tok64(tk + 24), one);
+    for (int cb = 0; cb < 10; cb++) {  // (pipelined, II 30)
+      const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x);
+      const aie::vector<bfloat16, 64> v = aie::mac(aie::mac(bt, xv, ah), xv, al_).template to_vector<bfloat16>();
+      const aie::accum<accfloat, 64> ta = aie::mac(aie::mul({{ p }}_rep(cf + 16), one), {{ p }}_rep(cf + 24), one);
+      aie::store_v(zz, aie::mac(aie::mac(ta, v, {{ p }}_rep(cf)), v, {{ p }}_rep(cf + 8)).template to_vector<bfloat16>());
+      x += 64;
+      zz += 64;
+      cf += 32;
+    }
+  }
+  zz = z0;
+  if (mode == {{ A_GNSILU }}) {{ stab }}(zz, t0, t0, zz, tab, tab + {{ tw }});
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o(pan);
+  for (int cb = 0; cb < 10; cb++) o.push(aie::accum<accfloat, 64>(aie::load_v<64>(zz + 64 * cb)).template to_vector<bfp16ebs8>());
+}
+
+// GroupNorm / LayerNorm apply (the module docstring): the row blocks in place in their A objects (``ops.Apply``: per
+// block and tile nrb + 1 slots of 3 per half, the last one the C-tile object's padding). C holds:
+// the coefficients (GN: [img][ch / 8][s_hi s_lo t_hi t_lo] from 0; LN: [ch / 8][..] from 0), LN's token coefficients
+// [tile][rb][a_hi a_lo b_hi b_lo] (from 8192 B), t (640 at 16640 B), the output chunk's panels (at 17920 B)
+static __attribute__((noinline, minsize)) void {{ p }}_apply_run({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
+  const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], nblk = ws[{{ C_NBLK }}], mode = ws[{{ C_MODE }}];
+  const int nrb = m / 8, nch = 80 * nblk, ln = mode == {{ A_LN }};
+  bfloat16 *coef = (bfloat16 *)cb, *tokc = (bfloat16 *)((uint8_t *)cb + 8192);
+  bfloat16 *tt = (bfloat16 *)((uint8_t *)cb + 16640);
+  int32_t *pan = (int32_t *)((uint8_t *)cb + 17920);
+  int32_t *a = nullptr;
+  int h = 0;  // (the slot's place in its A object: half h / 3, row block h % 3)
+  for (int blk = 0; blk < nblk; blk++)
+    for (int t = 0; t < ntile; t++) {
+      for (int rb = 0; rb < nrb; rb++) {
+{% if win == "apply" %}
+        event0();
+{% endif %}
+        if (h == 0) {
+          if (a) {{ p }}_give_a(s, a);
+          a = {{ p }}_take_a(s);
+        }
+        bfloat16 *x = (bfloat16 *)(a + (h < 3 ? 320 * h : {{ (A_OBJ // 2 + A_HI) // 4 }} + 320 * (h - 3)));
+        const bfloat16 *cf = coef + 32 * ((ln ? 0 : nch / 8 * (rb & 1)) + 10 * blk);
+        {{ p }}_apply_rb(x, x, tt, cf, tokc + 32 * (nrb * t + rb), tab, (bfp16ebs8 *)((uint8_t *)pan + 720 * (rb & 1)), mode);
+{% if win == "apply" %}
+        event1();
+{% endif %}
+        if (rb & 1) {{ p }}_out(s, pan, {{ OCH }});  // (two row blocks: 20 panels, an output chunk)
+        h = h == 5 ? 0 : h + 1;
+      }
+      h = h == 5 ? 0 : h + 1;  // (the tile's padding slot)
+    }
+  if (a) {{ p }}_give_a(s, a);
+}
+
+// LayerNorm apply: the coefficients (gamma, beta per channel, the tiles' per-token ones: their records in one A object,
+// 2304 B per tile), then the row blocks (``{{ p }}_apply_run``)
+static __attribute__((noinline, minsize)) void {{ p }}_apply_ln({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
+  const int nch = 80 * ws[{{ C_NBLK }}], m = ws[{{ C_M }}];
+  int32_t *gb = {{ p }}_take_b(s);
+  {{ p }}_ch_coef((const float *)gb, (const float *)gb + nch, (bfloat16 *)cb, nch);
+  {{ p }}_give_b(s, gb);
+  int32_t *ra = {{ p }}_take_a(s);
+  for (int t = 0; t < ws[{{ C_NTILE }}]; t++)
+    {{ p }}_ln_tok((const float *){{ p }}_aw(ra, 576 * t), ws, (float *)s.s1, (bfloat16 *)((uint8_t *)cb + 8192) + 4 * m * t, m);
+  {{ p }}_give_a(s, ra);
+  {{ p }}_apply_run(s, cb, ws, tab);
+}
+
+// GroupNorm (+ SiLU) apply: gamma, beta (the B slot [c16][gamma 16 | beta 16] fp32, parked in the coefficients'
+// second image), then the records (C_NREC in B slots of REC_SLOT, taken one at a time: two B slots, none may be held
+// while another cycles) summed into the scratch -> mean / rstd per image (st + 64) -> the coefficients (the second
+// image's in place of what it parks), the row blocks
+static __attribute__((noinline, minsize)) void {{ p }}_apply_gn({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
+  const int nch = 80 * ws[{{ C_NBLK }}];
+  float *st = (float *)s.s1, *gp = (float *)cb + 2 * nch;  // (gp: the second image's coefficients)
+{% if win == "gnc" %}
+  event0();
+{% endif %}
+  int32_t *gb = {{ p }}_take_b(s);
+  {{ p }}_copy8(gb, (int32_t *)gp, 2 * nch);
+  {{ p }}_give_b(s, gb);
+  {{ p }}_zero(s.s1, 64);
+  for (int left = ws[{{ C_NREC }}]; left > 0; left -= {{ REC_SLOT }}) {
+    const float *rb_ = (const float *){{ p }}_take_b(s);
+    {{ p }}_recsum(rb_, st, left < {{ REC_SLOT }} ? left : {{ REC_SLOT }});
+    {{ p }}_give_b(s, (int32_t *)rb_);
+  }
+  const int join = ws[{{ C_JOIN }}];
+  if (join) {{ p }}_recsum(st + 32, st, 1);  // (the images are one image's halves: image 0's sums += image 1's)
+  for (int img = 0; img < 2; img++) {
+    const float *si = st + (join ? 0 : 32 * img);
+    {{ p }}_mrstd(si, si + 16, ws, st + 64 + 32 * img, st + 80 + 32 * img);
+    {{ p }}_gnc16(gp, st + 64 + 32 * img, (bfloat16 *)cb + 4 * nch * img, ws + {{ C_GTAB }}, nch / 16);
+  }
+{% if win == "gnc" %}
+  event1();
+{% endif %}
+  {{ p }}_apply_run(s, cb, ws, tab);
+}
+
+{# 2^y of 32 lanes, A = y + 192: 2^-63 for masked keys, a score past the reference by 2^63 saturates (the clamps in
+   bf16: fp32 min / max are emulated and keep the loop from pipelining) #}
+{% set exp2 = km.exp2(32, bias=192, above="clamp", inline=True) %}
+{{ exp2.src }}
+
+// P = 2^(S - m) in place of 4 key panels ([q panel: QS floats apart][key panel 4 (of the group's, 64 floats apart)][64],
+// 32 lanes per step: A = S + mb, mb [q panel][8 q][8]); sl, ss: S as distinct restrict parameters (each read before it
+// is written: the loop pipelines, II 23; a runtime trip count or walk leaves it unpipelined)
+template <int QS>
+static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict mb) {
+{% if win == "aexp" %}
+  event0();
+{% endif %}
+  int cl = 0, cs = 0;
+  for (int t = 0; t < 16; t++) {
+    aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
+    A = aie::add(A, aie::load_v<32>(mb + 64 * (t >> 3) + 32 * (t & 1)));
+    aie::store_v(ss, {{ exp2 }}(A).template to_vector<float>());
+    sl = add_2d_ptr(sl, QS - 224, 7, cl, 32);
+    ss = add_2d_ptr(ss, QS - 224, 7, cs, 32);
+  }
+{% if win == "aexp" %}
+  event1();
+{% endif %}
+}
+
+// the softmax's masked keys (``{{ p }}_attn_sm``): key k of the group kept where bit k of km (two words) is set, else
+// S = -2^14
+template <int QS>
+static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict sm, const int32_t *km, int nkp) {
+  for (int kp = 0; kp < nkp; kp++) {  // (32 lanes [4 q][8 keys]: the panel's byte of the mask)
+    const unsigned lo = ((unsigned)km[kp >> 2] >> (8 * (kp & 3))) & 0xFFu;
+    const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
+    for (int h = 0; h < 4; h++) {  // (q panel h / 2, its half h % 2)
+      float *p = sm + QS * (h >> 1) + 64 * kp + 32 * (h & 1);
+      aie::store_v(p, aie::select(aie::broadcast<float, 32>(-16384.0f), aie::load_v<32>(p), mk));
+    }
+  }
+}
+
+// a query pair's reference max per key group: the first group's maximum per query in bf16 (a reference, not the exact
+// max: mb = 192 - m, [q panel][8 q][8]); in a later group a score past it by 2^16 (an attention sink: P saturates at
+// 2^63 above the reference) raises the query's to its group maximum (rarely), its o [2 q panels][nd][64] and l [2][8
+// q][8] lanes scaled by a = 2^(m - m') (bf16: a <= 2^-16 where raised, 1 elsewhere: within 2^-16 there); the check over
+// both q panels, then 16 lanes (2 queries) at a time
+template <int QS>
+static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *__restrict sm, float *__restrict mb,
+                                                             float *__restrict o, float *__restrict l, int nkp, int nd,
+                                                             int first) {
+  bool ok = !first;
+  for (int qp = 0; ok && qp < 2; qp++) {
+    const float *ps = sm + QS * qp;
+    aie::vector<bfloat16, 64> v = aie::accum<accfloat, 64>(aie::load_v<64>(ps)).template to_vector<bfloat16>();
+    for (int kp = 1; kp < nkp; kp++)
+      v = aie::max(v, aie::accum<accfloat, 64>(aie::load_v<64>(ps + 64 * kp)).template to_vector<bfloat16>());
+    const aie::vector<bfloat16, 64> lim = aie::accum<accfloat, 64>(
+        aie::sub(aie::broadcast<float, 64>(208.0f), aie::load_v<64>(mb + 64 * qp))).template to_vector<bfloat16>();  // (m + 16)
+    ok = aie::lt(v, lim).full();
+  }
+  if (ok)
+    return;
+  for (int i = 0; i < 8; i++) {
+    const int qp = i >> 2, c = 16 * (i & 3);
+    const float *ps = sm + QS * qp + c;
+    float *mbq = mb + 64 * qp + c, *oq = o + 64 * nd * qp + c, *lq = l + 64 * qp + c;
+    aie::vector<bfloat16, 16> v = aie::accum<accfloat, 16>(aie::load_v<16>(ps)).template to_vector<bfloat16>();
+    for (int kp = 1; kp < nkp; kp++)
+      v = aie::max(v, aie::accum<accfloat, 16>(aie::load_v<16>(ps + 64 * kp)).template to_vector<bfloat16>());
+    const aie::vector<bfloat16, 16> rmb = aie::concat(aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(0))),
+                                                      aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(1))));
+    const aie::vector<float, 16> rm = aie::accum<accfloat, 16>(rmb).template to_vector<float>();
+    const aie::vector<float, 16> mn0 = aie::sub(aie::broadcast<float, 16>(192.0f), rm);
+    if (first) {
+      aie::store_v(mbq, mn0);
+      continue;
+    }
+    const aie::vector<float, 16> mf = aie::load_v<16>(mbq);  // (192 - m)
+    const aie::mask<16> up = aie::ge(aie::add(rm, mf), aie::broadcast<float, 16>(208.0f));  // (rm - m >= 16)
+    const aie::vector<float, 16> mn = aie::select(mf, mn0, up);
+    const aie::vector<float, 16> A = aie::add(aie::sub(mn, mf), aie::broadcast<float, 16>(192.0f));
+    const aie::vector<bfloat16, 16> a = {{ exp2 }}(aie::accum<accfloat, 32>(aie::concat(A, aie::broadcast<float, 16>(192.0f))))
+                                            .template to_vector<bfloat16>().template extract<16>(0);
+    for (int db = 0; db < nd; db++)
+      aie::store_v(oq + 64 * db, al::mulc<16>(aie::load_v<16>(oq + 64 * db), a).template to_vector<float>());
+    aie::store_v(lq, al::mulc<16>(aie::load_v<16>(lq), a).template to_vector<float>());
+    aie::store_v(mbq, mn);
+  }
+}
+
+// the softmax of a query pair and key group (``K_ATTN``): S [2 q panels, QS floats apart][nkp key panels][64] fp32 (keys
+// from nk on: -2^14), the reference max (mb = 192 - m per query, [2][8 q][8]: ``{{ p }}_attn_raise`` in the first group,
+// in later ones with ``raise``; o the pair's [2][nd][64]), P = 2^(S - m) (``{{ p }}_pexp`` per 4 key panels) -> pp (bfp16 panels
+// [key panel][q panel]: the P V^T MAC's A order; QPM: [q panel][key panel]), l [2][8 q][8] += the row sums of those
+// panels (a MAC with ones: the P that multiplies V)
+template <int QS, bool QPM>
+static __attribute__((noinline)) void {{ p }}_attn_sm(float *__restrict sm, float *__restrict mb, float *__restrict l,
+                                                 bfp16ebs8 *__restrict pp, const int32_t *km, int nkp, float *o, int nd,
+                                                 int first, int raise) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  if ((km[0] & km[1]) != -1) {{ p }}_attn_mm<QS>(sm, km, nkp);
+  if (first || raise) {{ p }}_attn_raise<QS>(sm, mb, o, l, nkp, nd, first);
+  for (int k = 0; k < nkp; k += 4) {{ p }}_pexp<QS>(sm + 64 * k, sm + 64 * k, mb);
+  const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
+  al::MM8 a0(aie::accum<accfloat, 64>(aie::load_v<64>(l))), a1(aie::accum<accfloat, 64>(aie::load_v<64>(l + 64)));
+  al::BOut<> po(pp), pq((bfp16ebs8 *)((uint8_t *)pp + 72 * nkp));
+  const float *s0 = sm, *s1 = sm + QS;
+  AIE_LOOP_MIN_ITERATION_COUNT(4)
+  for (int kp = 0; kp < nkp; kp++) {
+    const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(s0)).template to_vector<bfp16ebs8>();
+    const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(s1)).template to_vector<bfp16ebs8>();
+    po.push(p0);
+    if (QPM)
+      pq.push(p1);
+    else
+      po.push(p1);
+    a0.mac(p0, aie::op_transpose(ones));
+    a1.mac(p1, aie::op_transpose(ones));
+    s0 += 64;
+    s1 += 64;
+  }
+  aie::store_v(l, a0.template to_vector<float>());
+  aie::store_v(l + 64, a1.template to_vector<float>());
+}
+
+// a query pair and key group: S := Q K^T (16 queries, 16 nkb keys, k 8 nd; Q [d-block nd][2 panels], K [key block nkb][d-block
+// nd][2 panels]) as S [q panel: QS floats apart][key panel 2 nkb][64]: per block of 16 keys four accumulators [q panel][key
+// panel] over the d-blocks (post-RA pipelined, II 4)
+template <int QS>
+static __attribute__((noinline)) void {{ p }}_attn_qk(const int32_t *__restrict q, const int32_t *__restrict k, float *__restrict sm,
+                                                 int nkb, int nd) {
+  using MM = aie::mmul<8, 8, 8, bfp16ebs8, bfp16ebs8>;
+  aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+  for (int blk = 0; blk < nkb; blk++) {
+    aie::block_vector_restrict_input_buffer_stream<bfp16ebs8, 64, aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+    aie::block_vector<bfp16ebs8, 64> A0 = qs.pop(), A1 = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
+    MM c0, c1, c2, c3;
+    c0.mul(A0, aie::op_transpose(B0));
+    c1.mul(A0, aie::op_transpose(B1));
+    c2.mul(A1, aie::op_transpose(B0));
+    c3.mul(A1, aie::op_transpose(B1));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(9)
+    for (int d = 1; d < nd; d++) {
+      A0 = qs.pop();
+      A1 = qs.pop();
+      B0 = ks.pop();
+      B1 = ks.pop();
+      c0.mac(A0, aie::op_transpose(B0));
+      c1.mac(A0, aie::op_transpose(B1));
+      c2.mac(A1, aie::op_transpose(B0));
+      c3.mac(A1, aie::op_transpose(B1));
+    }
+    float *o = sm + 128 * blk;
+    aie::store_v(o, c0.template to_vector<float>());
+    aie::store_v(o + 64, c1.template to_vector<float>());
+    aie::store_v(o + QS, c2.template to_vector<float>());
+    aie::store_v(o + QS + 64, c3.template to_vector<float>());
+  }
+}
+
+// O += P V^T of d 160 (m 16 npair, n 160, k 32)
+static __attribute__((noinline)) void {{ p }}_attn_pv(const bfp16ebs8 *__restrict pp, const int32_t *__restrict v,
+                                                 float *__restrict o, int npair) {
+  {{ p }}_pvm<32, 160>(pp, v, (const float __aie_dm_resource_c *)o, (float __aie_dm_resource_c *)o, npair);
+}
+
+// O / l -> bfp16 panels [qp][db < nd] at out (O's buffer: panel i at 72 i, read at 256 i): O rounded to bf16, times 1 / l
+// as bf16 hi + lo (pipelined)
+static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o, const float *__restrict l, int nqp,
+                                                  bfp16ebs8 *__restrict out, int nd) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> po(out);
+  for (int qp = 0; qp < nqp; qp++) {
+    aie::vector<bfloat16, 64> rh, rl;
+    al::split2<64>(al::bcast8(aie::inv(aie::filter_even(aie::filter_even(aie::filter_even(aie::load_v<64>(l + 64 * qp)))))), rh, rl);
+    AIE_LOOP_MIN_ITERATION_COUNT(10)
+    for (int db = 0; db < nd; db++) {
+      const aie::vector<bfloat16, 64> ob = aie::accum<accfloat, 64>(aie::load_v<64>(o)).template to_vector<bfloat16>();
+      po.push(aie::mac(aie::mul(ob, rh), ob, rl).template to_vector<bfp16ebs8>());
+      o += 64;
+    }
+  }
+}
+
+// K_ATTN (the module docstring): O in the C buffer (fp32 [qp][nd][64]), S of a pair in the Q object's halves' tails
+// (after the pair, from the next 64-B boundary: one q panel's per half), the pairs' P (d 160: in s1, 576 B each; d 80: pair 0's in s0, pair 1's in s1),
+// 192 - m and l ([qp][8 q][8] each) in the workspace after the header
+static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
+  const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}];
+  const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}], d160 = nd == 20;
+  const int npair = (nqp + 1) / 2;
+  float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
+  // (P V^T at d 80: the GEMM MAC of one band, its walks the command's)
+  const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
+  const dims_3d_t &pl = *(const dims_3d_t *)(ws + {{ C_PATS + 7 }});
+  for (int u = 0; u < nunit; u++) {
+    const int32_t *km = ws + (u >= nunit / 2 ? {{ C_KMASK[1] }} : {{ C_KMASK[0] }});  // (the unit's image's key masks)
+    int32_t *q = {{ p }}_take_a(s);
+    {{ p }}_zero(cb, 128 * nd * npair);
+    {{ p }}_zero((int32_t *)l, 128 * npair);
+    int first = 1;  // (no group computed yet: the next one sets the reference max)
+    for (int g = 0; g < ng; g++) {  // (K given back before V is taken: the next K arrives during the PVs)
+      int32_t *k = {{ p }}_take_b(s);
+      const int live = km[2 * g] != 0 || (!d160 && km[2 * g + 1] != 0);  // (a group of masked keys only: streamed, skipped)
+{% if win == "aqk" %}
+      event0();
+{% endif %}
+      for (int pr = 0; live && pr < npair; pr++) {
+        int32_t *qa = {{ p }}_aw(q, {{ A_OBJ // 8 }} * pr);
+        float *sm = (float *)(q + (36 * nd + 15) / 16 * 16);  // (64-B aligned: the 2048-bit stores' unit)
+        bfp16ebs8 *pp = (bfp16ebs8 *)(d160 ? s.s1 + {{ 8 * 18 }} * pr : (pr ? s.s1 : s.s0));
+        {{ p }}_attn_qk<{{ QS }}>(qa, k, sm, nkp / 2, nd);
+        {{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, km + 2 * g, nkp, o + 128 * nd * pr, nd,
+                                         first, ws[{{ C_RAISE }}]);
+      }
+{% if win == "aqk" %}
+      event1();
+{% endif %}
+      {{ p }}_give_b(s, k);
+      int32_t *v = {{ p }}_take_b(s);
+{% if win == "apv" %}
+      event0();
+{% endif %}
+      if (!live)
+        ;
+      else if (d160)
+        {{ p }}_attn_pv((const bfp16ebs8 *)s.s1, v, o, npair);
+      else
+        for (int pr = 0; pr < npair; pr++)
+          {{ p }}_ktf(pr ? s.s1 : s.s0, v, o + 1280 * pr, 1, pa, pb, pl);
+{% if win == "apv" %}
+      event1();
+{% endif %}
+      {{ p }}_give_b(s, v);
+      first &= !live;
+    }
+    {{ p }}_give_a(s, q);
+{% if win == "afin" %}
+    event0();
+{% endif %}
+    {{ p }}_attn_fin(o, l, nqp, (bfp16ebs8 *)o, nd);
+{% if win == "afin" %}
+    event1();
+{% endif %}
+    {{ p }}_out(s, cb, 72 * nd * nqp);
+  }
+}
+
+// S [2 q panels: 512 floats apart][8 key panels][64] := Q K^T of a d-40 query pair (Q [d-block 5][2 panels], K [key
+// block 4][d-block 5][2 panels]): per key block four chains over the 5 d-blocks
+static __attribute__((noinline)) void {{ p }}_qk40(const int32_t *__restrict q, const int32_t *__restrict k,
+                                              float *__restrict sm) {
+  al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+  AIE_PREPARE_FOR_POSTPIPELINING
+  for (int blk = 0; blk < 4; blk++) {
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+    al::BV A0 = qs.pop(), A1 = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
+    al::MM8 c0, c1, c2, c3;
+    c0.mul(A0, aie::op_transpose(B0));
+    c1.mul(A0, aie::op_transpose(B1));
+    c2.mul(A1, aie::op_transpose(B0));
+    c3.mul(A1, aie::op_transpose(B1));
+    AIE_LOOP_UNROLL_FULL
+    for (int d = 1; d < 5; d++) {
+      A0 = qs.pop();
+      A1 = qs.pop();
+      B0 = ks.pop();
+      B1 = ks.pop();
+      c0.mac(A0, aie::op_transpose(B0));
+      c1.mac(A0, aie::op_transpose(B1));
+      c2.mac(A1, aie::op_transpose(B0));
+      c3.mac(A1, aie::op_transpose(B1));
+    }
+    float *o = sm + 128 * blk;
+    aie::store_v(o, c0.template to_vector<float>());
+    aie::store_v(o + 64, c1.template to_vector<float>());
+    aie::store_v(o + 512, c2.template to_vector<float>());
+    aie::store_v(o + 576, c3.template to_vector<float>());
+  }
+}
+
+// a pair's keys from nk on masked: S := v (32 lanes [4 q][8 keys]: keys j < nk - 8 kp kept); v: per lane, or none:
+// -126 - bias (P ~ 2^-126: vexp2 is off by 2^-8 at negative integers, garbage far below)
+static void {{ p }}_mask40(float *__restrict sm, const bfloat16 *__restrict bias, int nk) {
+  for (int kp = 0; kp < 8; kp++) {
+    const int v = nk - 8 * kp;
+    const unsigned lo = v >= 8 ? 0xFFu : (v <= 0 ? 0u : (1u << v) - 1);
+    const aie::mask<32> mk = aie::mask<32>::from_uint32(lo * 0x01010101u);
+    for (int h = 0; h < 4; h++) {
+      float *p = sm + 512 * (h >> 1) + 64 * kp + 32 * (h & 1);
+      const aie::vector<float, 32> m = bias ? aie::msc(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-126.0f)),
+                                                       aie::load_v<32>(bias + 64 * (h >> 1) + 32 * (h & 1)),
+                                                       aie::broadcast<bfloat16, 32>(1.0f)).template to_vector<float>()
+                                            : aie::broadcast<float, 32>(-16384.0f);
+      aie::store_v(p, aie::select(m, aie::load_v<32>(p), mk));
+    }
+  }
+}
+
+// a pair's rare steps (``{{ p }}_qk40``'s S): keys from nk on masked, the first group's reference max per query (the
+// bf16 max of its unmasked scores, not raised later: P saturates above it): bias := -it
+static __attribute__((noinline, minsize)) void {{ p }}_first40(float *__restrict sm, bfloat16 *__restrict bias, int first,
+                                                          int nk) {
+  if (first && nk < 64) {{ p }}_mask40(sm, nullptr, nk);  // (out of the max)
+  if (first)
+    for (int qp = 0; qp < 2; qp++) {
+      const float *p = sm + 512 * qp;
+      aie::vector<bfloat16, 64> m = aie::accum<accfloat, 64>(aie::load_v<64>(p)).template to_vector<bfloat16>();
+      for (int kp = 1; kp < 8; kp++)
+        m = aie::max(m, aie::accum<accfloat, 64>(aie::load_v<64>(p + 64 * kp)).template to_vector<bfloat16>());
+      auto [e1, o1] = aie::interleave_unzip(m.template extract<32>(0), m.template extract<32>(1), 1);
+      const aie::vector<bfloat16, 32> m1 = aie::max(e1, o1);
+      auto [e2, o2] = aie::interleave_unzip(m1.template extract<16>(0), m1.template extract<16>(1), 1);
+      const aie::vector<bfloat16, 16> m2 = aie::max(e2, o2);
+      auto [e3, o3] = aie::interleave_unzip(m2.template extract<8>(0), m2.template extract<8>(1), 1);
+      const aie::vector<float, 8> nm = aie::mul(aie::max(e3, o3), aie::broadcast<bfloat16, 8>(-1.0f)).template to_vector<float>();
+      aie::store_v(bias + 64 * qp, aie::accum<accfloat, 64>(al::bcast8(nm)).template to_vector<bfloat16>());
+    }
+  if (nk < 64) {{ p }}_mask40(sm, bias, nk);
+}
+
+{% set chord2 = km.exp2(32, bias=0, prec="chord2", inline=True) %}
+{{ chord2.src }}
+
+// P = 2^(S + bias) of a pair's 16 panels (S [2 q panels: 512 floats apart][8 key panels][64], bias [2 q panels][64]
+// bf16: -m) as bfp16 panels [key panel][q panel], times 2.068 (o / l cancels it; kmath.exp2's two vexp2 chords: within
+// 1.2% for |S + bias| <= 2, the keys near the row's maximum that make the sums)
+static __attribute__((noinline)) void {{ p }}_exp40(const float *__restrict sm, const bfloat16 *__restrict bias,
+                                               bfp16ebs8 *__restrict pp) {
+  al::BOut<> po(pp);
+  const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+  for (int i = 0; i < 16; i++) {  // (panel i: key panel i / 2, q panel i % 2)
+    const float *s = sm + 512 * (i & 1) + 64 * (i >> 1);
+    const bfloat16 *b = bias + 64 * (i & 1);
+    const aie::accum<accfloat, 32> A0 = aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(s)), aie::load_v<32>(b), one);
+    const aie::accum<accfloat, 32> A1 = aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(s + 32)), aie::load_v<32>(b + 32), one);
+    const aie::accum<accfloat, 32> p0 = {{ chord2 }}(A0);
+    const aie::accum<accfloat, 32> p1 = {{ chord2 }}(A1);
+    po.push(aie::concat(p0, p1).template to_vector<bfp16ebs8>());
+  }
+}
+
+// O += P V^T, l += P J of a d-40 pair (P [key panel 8][q panel 2], V^T [d-block pair 2][key panel 8][2] then [key panel
+// 8] of d-block 4, O [q panel 2][d-block 5][64], l [2 q panels][8]): passes over the key panels of four chains each,
+// d-blocks (0, 1), (2, 3), then d-block 4 and the row sums (J a ones panel)
+static __attribute__((noinline)) void {{ p }}_pv40(const bfp16ebs8 *__restrict pp, const int32_t *__restrict vt,
+                                              float *__restrict o, float *__restrict l) {
+  al::BInR<aie_dm_resource::b> vs((const bfp16ebs8 *)vt);
+  for (int d = 0; d < 4; d += 2) {
+    al::BInR<aie_dm_resource::a> ps(pp);
+    float *o0 = o + 64 * d, *o1 = o + 320 + 64 * d;
+    al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(o0))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(o0 + 64)));
+    al::MM8 c2(aie::accum<accfloat, 64>(aie::load_v<64>(o1))), c3(aie::accum<accfloat, 64>(aie::load_v<64>(o1 + 64)));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int kp = 0; kp < 8; kp++) {
+      const al::BV P0 = ps.pop(), P1 = ps.pop(), V0 = vs.pop(), V1 = vs.pop();
+      c0.mac(P0, aie::op_transpose(V0));
+      c1.mac(P0, aie::op_transpose(V1));
+      c2.mac(P1, aie::op_transpose(V0));
+      c3.mac(P1, aie::op_transpose(V1));
+    }
+    aie::store_v(o0, c0.template to_vector<float>());
+    aie::store_v(o0 + 64, c1.template to_vector<float>());
+    aie::store_v(o1, c2.template to_vector<float>());
+    aie::store_v(o1 + 64, c3.template to_vector<float>());
+  }
+  al::BInR<aie_dm_resource::a> ps(pp);
+  const al::BV J = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
+  al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(o + 256))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(o + 576)));
+  al::MM8 l0(aie::accum<accfloat, 64>(al::bcast8(aie::load_v<8>(l)))), l1(aie::accum<accfloat, 64>(al::bcast8(aie::load_v<8>(l + 8))));
+  AIE_PREPARE_FOR_POSTPIPELINING
+  for (int kp = 0; kp < 8; kp++) {
+    const al::BV P0 = ps.pop(), P1 = ps.pop(), V = vs.pop();
+    c0.mac(P0, aie::op_transpose(V));
+    c1.mac(P1, aie::op_transpose(V));
+    l0.mac(P0, aie::op_transpose(J));
+    l1.mac(P1, aie::op_transpose(J));
+  }
+  aie::store_v(o + 256, c0.template to_vector<float>());
+  aie::store_v(o + 576, c1.template to_vector<float>());
+  aie::store_v(l, aie::filter_even(aie::filter_even(aie::filter_even(l0.template to_vector<float>()))));
+  aie::store_v(l + 8, aie::filter_even(aie::filter_even(aie::filter_even(l1.template to_vector<float>()))));
+}
+
+// K_ATTN of d 40 (role c, the module docstring's K_ATTN with these shapes): per unit (C_NUNIT: an image and head) 128
+// queries (an A object: pairs [pair 8][d-block 8 (5 used)][2 panels], 4 pairs per half; a pair's -m as bf16 [2][64] in
+// its unused d-blocks), per key group of 64 (C_NG, C_NK valid in the last) one B slot: K [key block 4][d-block 5][2
+// panels], then V^T (``{{ p }}_pv40``'s); per pair S = Q K^T in the table buffer (attention clobbers the activation
+// table; ``{{ p }}_qk40``), P = 2^(S - m) (``{{ p }}_exp40``) in the scratch buffer of the other region than the B slot's,
+// O [qp 16][d-block 5][64] += P V^T and l += P J (``{{ p }}_pv40``; l compact in the workspace); then O / l -> bfp16
+// panels [qp][d-block 5]
+static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
+  float *o = (float *)cb, *lc = (float *)(ws + 64), *sm = (float *)tab;
+  for (int u = 0; u < nunit; u++) {
+    const int32_t *km = ws + (u >= nunit / 2 ? {{ C_KMASK[1] }} : {{ C_KMASK[0] }});  // (the unit's image's key masks)
+    int32_t *q = {{ p }}_take_a(s);
+    {{ p }}_zero(cb, 5120);
+    {{ p }}_zero((int32_t *)lc, 128);
+    for (int g = 0; g < ng; g++) {
+      int32_t *kv = {{ p }}_take_b(s);
+      bfp16ebs8 *pp = (bfp16ebs8 *)(kv == s.b0 ? s.s1 : s.s0);
+      const int nk = g == ng - 1 ? nkl : 64;
+      for (int pr = 0; pr < 8; pr++) {
+        const int32_t *qa = {{ p }}_aw(q, 288 * pr);
+        bfloat16 *bias = (bfloat16 *)(qa + 192);
+{% if win == "a40qk" %}
+        event0();
+{% endif %}
+        {{ p }}_qk40(qa, kv, sm);
+{% if win == "a40qk" %}
+        event1();
+{% endif %}
+        if (!g || nk < 64) {{ p }}_first40(sm, bias, !g, nk);
+{% if win == "aexp" %}
+        event0();
+{% endif %}
+        {{ p }}_exp40(sm, bias, pp);
+{% if win == "aexp" %}
+        event1();
+{% elif win == "apv" %}
+        event0();
+{% endif %}
+        {{ p }}_pv40(pp, kv + 720, o + 640 * pr, lc + 16 * pr);
+{% if win == "apv" %}
+        event1();
+{% endif %}
+      }
+      {{ p }}_give_b(s, kv);
+    }
+    {{ p }}_give_a(s, q);
+    for (int i = 0; i < 16; i++) aie::store_v(sm + 64 * i, al::bcast8(aie::load_v<8>(lc + 8 * i)));
+    {{ p }}_attn_fin(o, sm, 16, (bfp16ebs8 *)o, 5);
+    {{ p }}_out(s, cb, 5760);
+  }
+}
+
+// S [key panel 2][64] (+)= Q K^T over 32 d-blocks of one query panel (Q [d-block 32] panels, K [d-block 32][key panel
+// 2]): two chains (acc: S's values their start)
+static __attribute__((noinline)) void {{ p }}_qk512(const int32_t *__restrict q, const int32_t *__restrict k,
+                                               float *__restrict sm, int acc) {
+  al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+  al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+  al::MM8 c0(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm)) : aie::zeros<accfloat, 64>());
+  al::MM8 c1(acc ? aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)) : aie::zeros<accfloat, 64>());
+  AIE_PREPARE_FOR_POSTPIPELINING
+  for (int d = 0; d < 32; d++) {
+    const al::BV A = qs.pop(), B0 = ks.pop(), B1 = ks.pop();
+    c0.mac(A, aie::op_transpose(B0));
+    c1.mac(A, aie::op_transpose(B1));
+  }
+  aie::store_v(sm, c0.template to_vector<float>());
+  aie::store_v(sm + 64, c1.template to_vector<float>());
+}
+
+// O [d-block 32][64] += P V^T of one query panel and 16 keys (P [key panel 2], V^T [d-block 32][key panel 2])
+static __attribute__((noinline)) void {{ p }}_pv512(const bfp16ebs8 *__restrict pp, const int32_t *__restrict vt,
+                                               const float *__restrict ol, float *__restrict os) {
+  al::BInR<aie_dm_resource::a> ps(pp);
+  const al::BV P0 = ps.pop(), P1 = ps.pop();
+  al::BInR<aie_dm_resource::b> vs((const bfp16ebs8 *)vt);
+  AIE_PREPARE_FOR_POSTPIPELINING
+  for (int d = 0; d < 32; d += 2) {
+    al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(ol))), c1(aie::accum<accfloat, 64>(aie::load_v<64>(ol + 64)));
+    const al::BV V0 = vs.pop(), V1 = vs.pop(), V2 = vs.pop(), V3 = vs.pop();
+    c0.mac(P0, aie::op_transpose(V0));
+    c1.mac(P0, aie::op_transpose(V2));
+    c0.mac(P1, aie::op_transpose(V1));
+    c1.mac(P1, aie::op_transpose(V3));
+    aie::store_v(os, c0.template to_vector<float>());
+    aie::store_v(os + 64, c1.template to_vector<float>());
+    ol += 128;
+    os += 128;
+  }
+}
+
+// a query panel's softmax step on 16 keys: S [key panel 2][64] (first: the reference max per query, mb = 192 - it [8 q][8],
+// not raised later: P saturates above it), P = 2^(S - m) -> pp (bfp16 [key panel 2]), l [8 q][8] += the row sums of
+// those panels (a MAC with ones)
+static __attribute__((noinline, minsize)) void {{ p }}_sm512(float *__restrict sm, float *__restrict mb, float *__restrict l,
+                                                         bfp16ebs8 *__restrict pp, int first) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  if (first) {
+    const aie::vector<bfloat16, 64> m = aie::max(aie::accum<accfloat, 64>(aie::load_v<64>(sm)).template to_vector<bfloat16>(),
+                                                 aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)).template to_vector<bfloat16>());
+    auto [e1, o1] = aie::interleave_unzip(m.template extract<32>(0), m.template extract<32>(1), 1);
+    const aie::vector<bfloat16, 32> m1 = aie::max(e1, o1);
+    auto [e2, o2] = aie::interleave_unzip(m1.template extract<16>(0), m1.template extract<16>(1), 1);
+    const aie::vector<bfloat16, 16> m2 = aie::max(e2, o2);
+    auto [e3, o3] = aie::interleave_unzip(m2.template extract<8>(0), m2.template extract<8>(1), 1);
+    const aie::vector<float, 8> mx = aie::accum<accfloat, 8>(aie::max(e3, o3)).template to_vector<float>();
+    aie::store_v(mb, al::bcast8(aie::sub(aie::broadcast<float, 8>(192.0f), mx)));
+  }
+  for (int h = 0; h < 4; h++) {
+    aie::accum<accfloat, 32> A(aie::load_v<32>(sm + 32 * h));
+    A = aie::add(A, aie::load_v<32>(mb + 32 * (h & 1)));
+    aie::store_v(sm + 32 * h, {{ exp2 }}(A).template to_vector<float>());
+  }
+  const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
+  const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(sm)).template to_vector<bfp16ebs8>();
+  const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(sm + 64)).template to_vector<bfp16ebs8>();
+  al::BOut<> po(pp);
+  po.push(p0);
+  po.push(p1);
+  al::MM8 a(aie::accum<accfloat, 64>(aie::load_v<64>(l)));
+  a.mac(p0, aie::op_transpose(ones));
+  a.mac(p1, aie::op_transpose(ones));
+  aie::store_v(l, a.template to_vector<float>());
+}
+
+// K_ATTN of d 512 (role v: a single head, the VAE decoder's mid block): per unit (C_NUNIT) a query panel (8 queries, a
+// half of its A object: [d-block 64] panels, scaled by log2 e / sqrt d; two units an object), per key group of 16 (C_NG)
+// four B slots: K of d-blocks 0..31 [d-block 32][key panel 2], of 32..63, then V^T likewise; O [d-block 64][64] (the C
+// buffer) += P V^T, l += P J; then O / l -> bfp16 panels [d-block 64]. S, 192 - m, l and P in the workspace after the
+// header.
+static __attribute__((noinline, minsize)) void {{ p }}_attn512({{ p }}_st &s, int32_t *cb, int32_t *ws) {
+  const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}];
+  float *o = (float *)cb, *sm = (float *)(ws + 64), *mb = sm + 128, *l = mb + 64;
+  bfp16ebs8 *pp = (bfp16ebs8 *)(l + 64);
+  int32_t *q = nullptr;
+  for (int u = 0; u < nunit; u++) {
+    if (!(u & 1)) q = {{ p }}_take_a(s);
+    const int32_t *qu = {{ p }}_aw(q, {{ A_OBJ // 8 }} * (u & 1));
+    {{ p }}_zero(cb, 4096);
+    {{ p }}_zero((int32_t *)l, 64);
+    for (int g = 0; g < ng; g++) {
+      int32_t *k0 = {{ p }}_take_b(s), *k1 = {{ p }}_take_b(s);
+      {{ p }}_qk512(qu, k0, sm, 0);
+      {{ p }}_qk512(qu + 576, k1, sm, 1);
+      {{ p }}_give_b(s, k0);
+      {{ p }}_give_b(s, k1);
+      {{ p }}_sm512(sm, mb, l, pp, g == 0);
+      for (int h = 0; h < 2; h++) {
+        int32_t *v = {{ p }}_take_b(s);
+        {{ p }}_pv512(pp, v, o + 2048 * h, o + 2048 * h);
+        {{ p }}_give_b(s, v);
+      }
+    }
+    if (u & 1 || u == nunit - 1) {{ p }}_give_a(s, q);
+    {{ p }}_attn_fin(o, l, 1, (bfp16ebs8 *)o, 64);
+    {{ p }}_out(s, cb, 4608);
+  }
+}
+
+// ---- K_WATTN (role w): MiniCPM-V's ViT merger's attention inside its 2 x 2 windows (``models.minicpmv.encoder``)
+
+// a row's scores: per source i a pass over the d-blocks of the A objects' row ([d-block 10][source 4]: Q_i's and every
+// K_j's panels), the 4 C tiles Q_i K_j^T in accumulators -> sc [i][j][64] (lane 8 w + w': only the diagonal w = w', a
+// window per lane, is used)
+static __attribute__((noinline)) void {{ p }}_wsc(const bfp16ebs8 *__restrict q, const bfp16ebs8 *__restrict k,
+                                             float *__restrict sc) {
+{% for i in range(4) %}
+  {
+    al::BIn<aie_dm_resource::a> qs(q);
+    al::BIn<aie_dm_resource::b> ks(k);
+    al::MM8 c0, c1, c2, c3;
+    for (int db = 0; db < 10; db++) {
+{% for s in range(4) %}
+      const al::BV q{{ s }} = qs.pop();
+{% endfor %}
+      const al::BV k0 = ks.pop(), k1 = ks.pop(), k2 = ks.pop(), k3 = ks.pop();
+      if (db == 0) {
+        c0.mul(q{{ i }}, aie::op_transpose(k0));
+        c1.mul(q{{ i }}, aie::op_transpose(k1));
+        c2.mul(q{{ i }}, aie::op_transpose(k2));
+        c3.mul(q{{ i }}, aie::op_transpose(k3));
+      } else {
+        c0.mac(q{{ i }}, aie::op_transpose(k0));
+        c1.mac(q{{ i }}, aie::op_transpose(k1));
+        c2.mac(q{{ i }}, aie::op_transpose(k2));
+        c3.mac(q{{ i }}, aie::op_transpose(k3));
+      }
+    }
+    aie::store_v(sc + {{ 256 * i }}, c0.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 64 }}, c1.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 128 }}, c2.template to_vector<float>());
+    aie::store_v(sc + {{ 256 * i + 192 }}, c3.template to_vector<float>());
+  }
+{% endfor %}
+}
+
+// the diagonals of a row's 16 C tiles (sc [i][j], lane 8 w + w') -> dd [i][j][8]: per half of 4 rows the masked lanes
+// summed by rows
+static __attribute__((noinline)) void {{ p }}_wdg(const float *__restrict sc, float *__restrict dd) {
+  const aie::vector<float, 32> z = aie::zeros<float, 32>();
+  for (int t = 0; t < 32; t++) {  // (half t % 2 of tile t / 2: rows 4 (t % 2) .., their diagonal lanes 9 r + 4 (t % 2))
+    const aie::mask<32> dg = aie::mask<32>::from_uint32(t & 1 ? 0x80402010u : 0x08040201u);
+    const aie::vector<float, 32> v = aie::select(z, aie::load_v<32>(sc + 32 * t), dg);
+    auto [e1, o1] = aie::interleave_unzip(v.template extract<16>(0), v.template extract<16>(1), 1);
+    const aie::vector<float, 16> r1 = aie::add(e1, o1);
+    auto [e2, o2] = aie::interleave_unzip(r1.template extract<8>(0), r1.template extract<8>(1), 1);
+    const aie::vector<float, 8> r2 = aie::add(e2, o2);
+    auto [e3, o3] = aie::interleave_unzip(r2.template extract<4>(0), r2.template extract<4>(1), 1);
+    aie::store_v(dd + 4 * t, aie::add(e3, o3));
+  }
+}
+
+// a row's softmax: per source i and window the 4 scores (dd [i][j][8]; q pre-scaled by log2 e / sqrt d), P_ij = 2^(s_ij
+// - max_j) / l in bf16 as diagonal panels pd [i][j] (lane 9 w = P of window w; one value a row: exact in bfp16)
+static __attribute__((noinline, minsize)) void {{ p }}_wsm(const float *__restrict dd, bfp16ebs8 *__restrict pd) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  al::BOut<> po(pd);
+  for (int i = 0; i < 4; i++) {
+    const aie::vector<float, 32> v = aie::load_v<32>(dd + 32 * i);  // ([j][w])
+    const aie::vector<float, 8> m = aie::max(aie::max(v.template extract<8>(0), v.template extract<8>(1)),
+                                             aie::max(v.template extract<8>(2), v.template extract<8>(3)));
+    const aie::vector<float, 32> e = {{ exp2 }}(aie::accum<accfloat, 32>(aie::add(
+        aie::sub(v, aie::concat(m, m, m, m)), aie::broadcast<float, 32>(192.0f)))).template to_vector<float>();
+    const aie::vector<float, 8> inv = aie::inv(aie::add(aie::add(e.template extract<8>(0), e.template extract<8>(1)),
+                                                        aie::add(e.template extract<8>(2), e.template extract<8>(3))));
+    const aie::vector<bfloat16, 32> pb = aie::accum<accfloat, 32>(al::mulff<32>(e, aie::concat(inv, inv, inv, inv)))
+                                             .template to_vector<bfloat16>();
+{% for j in range(4) %}
+    {
+      aie::vector<bfloat16, 64> d = aie::zeros<bfloat16, 64>();
+{% for w in range(8) %}
+      d.set(pb.get({{ 8 * j + w }}), {{ 9 * w }});
+{% endfor %}
+      po.push(aie::accum<accfloat, 64>(d).template to_vector<bfp16ebs8>());
+    }
+{% endfor %}
+  }
+}
+
+// a row's output: per d-block the 4 sources' V^T panels ([8 dims][8 windows]); o_i = sum_j diag(P_ij) V_j -> bfp16 panels
+// [d-block][i] at out
+static __attribute__((noinline)) void {{ p }}_wpv(const bfp16ebs8 *__restrict pd, const bfp16ebs8 *__restrict vt,
+                                             bfp16ebs8 *__restrict out) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  al::BIn<aie_dm_resource::b> vs(vt);
+  al::BOut<> po(out);
+  for (int db = 0; db < 10; db++) {
+    const al::BV v0 = vs.pop(), v1 = vs.pop(), v2 = vs.pop(), v3 = vs.pop();
+    al::BIn<aie_dm_resource::a> ps(pd);
+    for (int i = 0; i < 4; i++) {
+      al::MM8 c;
+      c.mul(ps.pop(), aie::op_transpose(v0));
+      c.mac(ps.pop(), aie::op_transpose(v1));
+      c.mac(ps.pop(), aie::op_transpose(v2));
+      c.mac(ps.pop(), aie::op_transpose(v3));
+      po.push(c.template to_vector<bfp16ebs8>());
+    }
+  }
+}
+
+// K_WATTN: per unit (C_NUNIT: a head of the op's two token panels) the A objects Q, K, V^T, each a row (token panel) per
+// half [d-block 10][source 4] (the half's rest junk): per row the scores (sc: 16 C tiles in cb, dd their diagonals),
+// the softmax (pd: per row 16 diagonal panels), then o (ob: [row][d-block][source]) out
+static __attribute__((noinline, minsize)) void {{ p }}_wattn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
+  const int nunit = ws[{{ C_NUNIT }}];
+  float *sc = (float *)cb;
+  bfp16ebs8 *pd = (bfp16ebs8 *)(cb + 1024);  // (2 rows of 16 panels: 1152 B each)
+  bfp16ebs8 *ob = (bfp16ebs8 *)(cb + 2048);  // (2 rows of 40 panels: 2880 B each)
+  float *dd = (float *)(cb + 3584);  // (a row's 16 diagonals of 8)
+  for (int u = 0; u < nunit; u++) {
+    int32_t *q = {{ p }}_take_a(s);
+    int32_t *k = {{ p }}_take_a(s);
+    for (int row = 0; row < 2; row++) {
+      {{ p }}_wsc((const bfp16ebs8 *){{ p }}_aw(q, {{ A_OBJ // 8 }} * row), (const bfp16ebs8 *){{ p }}_aw(k, {{ A_OBJ // 8 }} * row), sc);
+      {{ p }}_wdg(sc, dd);
+      {{ p }}_wsm(dd, (bfp16ebs8 *)((uint8_t *)pd + 1152 * row));
+    }
+    {{ p }}_give_a(s, q);
+    {{ p }}_give_a(s, k);
+    int32_t *v = {{ p }}_take_a(s);
+    for (int row = 0; row < 2; row++)
+      {{ p }}_wpv((const bfp16ebs8 *)((const uint8_t *)pd + 1152 * row), (const bfp16ebs8 *){{ p }}_aw(v, {{ A_OBJ // 8 }} * row),
+                  (bfp16ebs8 *)((uint8_t *)ob + 2880 * row));
+    {{ p }}_give_a(s, v);
+    {{ p }}_out(s, (int32_t *)ob, 5760);
+  }
+}
+
+{{ pager }}
+
+// the cores' main loop (resident): commands from the B stream; GEMMs / convs and tables here, the other kinds by the
+// role's page through its entry (ext[1]); a page (its first word the packets' header: ``paging``) into program memory
+__attribute__((noinline, minsize)) void {{ p }}_run(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
+                                                const volatile int32_t *ext) {
+  {{ p }}_st s{r23 + {{ R23.a0 // 4 }}, r23 + {{ R23.a1 // 4 }}, r23 + {{ R23.b0 // 4 }}, r23 + {{ R23.b1 // 4 }}, outr,
+          r23 + {{ R23.s0 // 4 }}, r23 + {{ R23.s1 // 4 }}, 0, 0, 0, ext};
+  for (;;) {
+    int32_t *b = {{ p }}_take_b(s);
+    if (b[0] == (int32_t){{ header }}u) {  // (its second slot: B slot 1; MM2S 1 sends both, then they are free)
+      acquire_greater_equal({{ p }}_L_BB, 1);
+      s.bpos = 0;
+      {{ p }}_pg_self();
+      acquire_greater_equal({{ lock_base + L_DONE }}, 2);
+      release({{ p }}_L_BF, 2);
+      continue;
+    }
+    {{ p }}_copy8(b, ws, {{ WS // 4 }});
+    {{ p }}_give_b(s, b);
+    const int kind = ws[{{ C_KIND }}];
+    if (kind == {{ K_GEMM }}) {
+      {{ p }}_gemm(s, cb, ws, tab);
+    } else if (kind == {{ K_TABLE }}) {
+      int32_t *t = {{ p }}_take_b(s);
+      {{ p }}_copy8(t, tab, {{ TAB // 4 }});
+      {{ p }}_give_b(s, t);
+    } else if (kind != {{ K_NOP }}) {
+      ((void (*)({{ p }}_st &, int32_t *, int32_t *, int32_t *))(intptr_t)ext[1])(s, cb, ws, tab);
+    }
+  }
+}
+
+// the roles' entries (pages: only the pager's state words reach them)
+__attribute__((noinline, minsize)) void {{ p }}_ext_a({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_attn(s, cb, ws);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_c({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  {{ p }}_attn40(s, cb, ws, tab);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_v({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_attn512(s, cb, ws);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_gn({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  {{ p }}_apply_gn(s, cb, ws, (const uint32_t *)tab);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_ln({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
+  {{ p }}_apply_ln(s, cb, ws, (const uint32_t *)tab);
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_ext_w({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_wattn(s, cb, ws);
+}
+
+extern "C" {
+
+// the start of every core (its first command's role arrives as a page before it)
+__attribute__((noinline, minsize)) void {{ p }}_main(int32_t *r23, int32_t *outr, int32_t *cb, int32_t *ws, int32_t *tab,
+                                                 int32_t *ext) {
+  {{ p }}_run(r23, outr, cb, ws, tab, ext);
+}
+
+}  // extern "C"
+"""
+
+
+def group_words(ch0: int, nch: int, gsize: int, g0: int, nreal: int = 0) -> np.ndarray:
+    """C_GTAB of a GroupNorm apply core (channels [ch0, ch0 + nch) in groups of gsize >= 4, its record window from group
+    g0; nreal: only the first that many are real, the rest pads in the last real channel's group): per 16 channels from
+    ch0 the window indices of their groups in lane order (up to four: bits 0..4, 5..9, 10..14, 15..19; a third or
+    fourth repeats the last) and the fourth's first lane (bits 20..24, 16: none), then the lanes of the first group and
+    of the third (masks, bits 0..15, 16..31: the second group's lanes are the rest)."""
+    assert gsize >= 4 and nch % 16 == 0
+    nreal = nreal or nch
+    out = []
+    for c in range(ch0, ch0 + nch, 16):
+        grp = [min(c + j, ch0 + nreal - 1) // gsize for j in range(16)]
+        gs = sorted(set(grp))
+        assert len(gs) <= 4 and all(0 <= g - g0 < 16 for g in gs), (c, gs, g0)
+        ga, gb, gc, gd = (gs + [gs[-1]] * 3)[:4] if len(gs) > 2 else (gs[0], gs[0], gs[-1], gs[-1])
+        ma = sum(1 << j for j in range(16) if grp[j] == ga)
+        mc = sum(1 << j for j in range(16) if grp[j] == gc and gc != ga)
+        e3 = grp.index(gd) if len(gs) == 4 else 16
+        out += [(ga - g0) | (gb - g0) << 5 | (gc - g0) << 10 | (gd - g0) << 15 | e3 << 20, ma | mc << 16]
+    return np.array(out, np.uint32).view(np.int32)
+
+
+@functools.cache
+def group_inv(gsize: int) -> int:
+    """C_GINV: ceil(2^20 / gsize), exact as c // gsize for every channel index c < 4096."""
+    gi = -(-(1 << 20) // gsize)
+    assert all(c * gi >> 20 == c // gsize for c in range(4096)), gsize
+    return gi
+
+
+@functools.cache
+def shift_masks(joined: bool = False) -> bytes:
+    """``sd15_shift``'s byte masks (``C_MASKS``): per byte of a 576-byte cycle (8 panels [kb][image 2]) 0xFF where kept
+    after a shift down (lane 0 of each panel cleared), then up (lane 7 cleared). joined: the two images are one image's
+    halves side by side, a cut lane of image 1 down / image 0 up the pixel across the seam: only image 0's lane 0 (down)
+    and image 1's lane 7 (up) cleared."""
+    def cut(d: int, i: int) -> bool:
+        img = i // 72 % 2
+        return (i % 72 < 9 and not (joined and img)) if d == 0 else (i % 72 >= 63 and not (joined and not img))
+    return bytes(0 if cut(d, i) else 0xFF for d in range(2) for i in range(576))
+
+
+def source(*, win: str = "") -> str:
+    from . import design as d
+    assert win in ("",) + WINS, win
+    return JINJA_ENV.from_string(_SRC).render(
+        p=P, pager=paging.source(P, wake=d.L_WAKE, send=d.L_SEND), header=paging.header(), lock_base=paging.LOCK_BASE,
+        L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
+        pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
+        gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
+        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_") or k[:3] in ("REC", "ST_")})

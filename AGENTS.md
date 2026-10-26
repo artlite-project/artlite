@@ -3,10 +3,11 @@
 Artlite is a lightweight, fully open replacement for XRT on AMD Ryzen AI NPUs. A small C++ shim (`csrc/`) talks to
 the `amdxdna` driver directly: no xclbin, no plugin layers, zero-copy buffers. Operators are compiled at runtime
 ("RTC") from Jinja2 C++ templates specialized per shape, plus an IRON (`aie.iron`) array design lowered through
-MLIR-AIE. Python package: `artlite` (nanobind bindings `artlite._native`, operators `artlite.operators`), with
-the models in package `models` (`src/models/`, commands `artlite-cli` and `artlite-bench`), built with
-scikit-build-core. On Windows 11 the same runtime goes through XRT (the XRT backend, `csrc/shim_xrt/`; on Linux too
-where XRT is installed: `ARTLITE_BACKEND=xrt`; setup and differences: `docs/install.md`, Windows).
+MLIR-AIE. Python packages: `artlite` (nanobind bindings `artlite._native`, the operator framework
+`artlite.operators`, the subsystems the models share) and `models` (`src/models/`: each model on the NPU and its host
+side, the commands `artlite-cli`, `artlite-bench`, `artlite-server`), built with scikit-build-core. On Windows 11 the
+same runtime goes through XRT (the XRT backend, `csrc/shim_xrt/`; on Linux too where XRT is installed:
+`ARTLITE_BACKEND=xrt`; setup and differences: `docs/install.md`, Windows).
 
 Target: AIE2P (NPU2) only, i.e. AMD Strix Point, Strix Halo and Krackan. All these CPUs are znver5, so `csrc/` may
 use any modern SIMD (AVX-512 included).
@@ -23,8 +24,14 @@ use any modern SIMD (AVX-512 included).
 - **Weights stay at their quantization's size.** Never expand them on the host; prefill and decode read one weight
   image in place. Lossless, same-size re-layouts are fine (images are packed at every load: nothing on disk).
 - Operators are self-contained: never import IRON operators.
+- Layers (Map): `models` -> `artlite`'s subsystems (`decode`, `prefill`, `moe`, `vision`, `gemm`, `formats`) -> the
+  framework (`artlite.operators`, `artlite.overlay`) -> the runtime. Code that two models share lives in `artlite`, in
+  the subsystem it belongs to, never in one model's package for another to import (a model package imports another
+  only to run that model: qwen35 runs MiniCPM-V's vision encoder); `artlite` never imports `models`.
 - `src/` holds what the apps and tools run: test harnesses (standalone operators of one kernel), CPU references and
-  other test-only code live in `tests/rtc/`. Layout inverses and readbacks stay next to the code they mirror.
+  other test-only code live in `tests/`, a directory per package of `src/`
+  (`tests/<subsystem or model>/test_<module>.py`; the top-level modules' tests at the top). Layout inverses and
+  readbacks stay next to the code they mirror.
 - No absolute paths in code, tests or scripts: derive them from `__file__` or package constants. Model files only
   through `artlite.model_config` (below).
 - Licenses: Artlite is LGPL-2.1-or-later and its own files carry no license header. Code from another project keeps
@@ -59,11 +66,11 @@ artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds
 artlite-server -m <org>/<repo>/<file>.gguf                          # OpenAI API + web chat on :8080, as llama-server (NPU)
 artlite-server                                                      # router mode: the models dir's models, one process each
 artlite-probe                                                       # the NPU's clock, dispatch and DRAM rates vs Strix Halo's
-pytest tests/rtc/test_<operator>.py -k <config-id>                  # needs the NPU
-pytest tests/rtc -m smoke                                           # after a change: ~1 min with cached designs (NPU)
-ARTLITE_BACKEND=xrt pytest tests/rtc -m smoke                       # the same on the XRT backend (Windows' code path)
-pytest tests/rtc --run-slow ...                                     # also the whole-model tests
-pytest tests/rtc --dump-designs DIR                                 # render every design, no NPU
+pytest tests/<package>/test_<module>.py -k <config-id>              # needs the NPU
+pytest tests -m smoke                                               # after a change: ~1 min with cached designs (NPU)
+ARTLITE_BACKEND=xrt pytest tests -m smoke                           # the same on the XRT backend (Windows' code path)
+pytest tests --run-slow ...                                         # also the whole-model tests
+pytest tests --dump-designs DIR                                     # render every design, no NPU
 ruff check <changed files>                                          # the tree passes: fix all it reports
 cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests -j \
   && ctest --test-dir build-tests                                   # C++ runtime gtests (NPU)
@@ -85,23 +92,26 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 |---|---|
 | `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, profiler); API and errors: `docs/design.md`; the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
 | `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
-| `src/artlite/operators/base.py` | `ArtcOperator`: render, compile, cache, dispatch |
-| `src/artlite/operators/kernel_source.py` | kernel names by content (`kernel_prefix`) and the translation unit `kernel.cc` of one or several operators |
-| `src/artlite/operators/{gemm,prefill,overlay,moe,llama,gemma4,qwen35}/` | operators by purpose and model (`moe`: the MoE routing on the decode overlay's cores, the prefill's expert work lists) |
-| `src/artlite/operators/sd15/` | the SD 1.5 UNet step as one dispatch of a static design (host-built transactions, core roles as code pages the cores load): the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`); the VAE decoder on the same design (`vae.py`) |
-| `src/artlite/operators/vision/` | vision encoders on sd15's design: MiniCPM-V 4.7's (`minicpmv.py`: the whole encoder per dispatch, ``Encoder``) |
-| `src/artlite/operators/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
-| `src/artlite/operators/kernel_lib.h`, `operators.h` | shared kernel helpers (namespace `al`), loop-pragma macros |
-| `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu; arrays through the gather LUT: `act`, `table_pass` and the tables; `silu_tanh`), each variant's bit-exact numpy model in `tests/rtc/kmath_sim.py` (`test_kmath.py`) |
+| `src/artlite/{txn,elf_parser}.py`, `overlay.py` | control programs: transactions built on the host (the `insts.bin` format), full ELFs and the patching of their control code; the host runtime of the overlays, designs run by host-built transactions (`Sequence`, `OverlayDevice`, `Transaction`, `WeightBuffer`) |
+| `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, cache, dispatch), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py`, `render_cache.py`, and the pieces operators share (How an operator works) |
+| `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu; arrays through the gather LUT: `act`, `table_pass` and the tables; `silu_tanh`), each variant's bit-exact numpy model in `tests/operators/kmath_sim.py` (`tests/operators/test_kmath.py`) |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`) |
+| `src/artlite/include/` | the kernels' headers: `operators.h` (loop-pragma macros; the precompiled header of every kernel), `kernel_lib.h` (shared kernel helpers, namespace `al`) |
+| `src/artlite/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
+| `src/artlite/gemm/` | the GEMMs on the weight tiles: GemmQ, GemmQd (a dequantizing core per column), their MAC loop |
+| `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma and Llama (`attn.py`), the models' shared host side (`model.py`) |
+| `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs, the GEMM planner, the residual norms, the attention of a column per KV head (Llama's) |
+| `src/artlite/moe/` | MoE layers: the routing on the decode overlay's cores, the prefill's router, expert work lists and gathers |
+| `src/artlite/vision/` | the vision overlay: a whole image network per dispatch on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
-| `src/artlite/{txn,model_config,measure_ii,variant_search,profiling}.py` | transactions, model files, schedule tools, profiling |
-| `src/models/{llama3,gemma4,qwen35}/` | the models on the NPU and their host side (tokenizers, chat templates, inputs); `models.open_model` picks one by a GGUF file's architecture |
-| `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) |
+| `src/artlite/{model_config,gguf_model,measure_ii,variant_search,profiling,probe}.py` | model files, schedule tools, profiling, `artlite-probe`'s designs |
+| `src/models/{llama,gemma4,qwen35}/` | the language models, a package per GGUF architecture: on the NPU (the weight image `image.py`, the decode design `decode.py` and its host side `overlay.py`, the prefill `prefill.py`, the model's own operators) and on the host (tokenizer, chat template, inputs); `models.open_model` picks one by a GGUF file's architecture |
+| `src/models/minicpmv/` | MiniCPM-V 4.7's vision side (its mmproj): the encoder on the vision overlay (`encoder.py`), an image's embeddings and tokens (`npu.py`), its slices and positions (`host.py`); qwen35's language model takes them (`models/sequence.py`: token ids and embedding rows) |
+| `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) on the vision overlay: the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`), the VAE decoder (`vae.py`) |
 | `src/models/server/` | `artlite-server`: the HTTP API (FastAPI: llama-server's routes and shapes), the NPU worker and its prompt cache, llama.cpp's prebuilt web UI (pinned); router mode (`router.py`: a model server process per model, `child.py`; `catalog.py`: the models directory's models, presets) |
-| `src/models/common.py`, `cli.py`, `bench.py`, `probe.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli`, `artlite-bench` and `artlite-probe` (its designs: `artlite.operators.probe`) |
-| `tests/rtc/` | operator and model tests (`common.py`: the essay corpus, cached CPU references; `llama_ref.py`, `gemma_ref.py`, `qwen35_ref.py`: model references; `llama_cpu.py`, `gemma_cpu.py`: fp32 CPU models; `elementwise.py`: 1-D stream operators, the activations' harnesses; `mmv.py`: the decode GEMV's host model and its harness `MmvOperator`; `dma_model.py`: the host DMA model) |
+| `src/models/common.py`, `cli.py`, `bench.py`, `probe.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling; `OverlayModel`: steps and prompts on an overlay), `artlite-cli`, `artlite-bench` and `artlite-probe` (its designs: `artlite.probe`) |
+| `tests/` | the tests, a directory per package of `src/` (`operators/`, `decode/`, ..., `llama/`, `qwen35/`, ...; the top-level modules' at the top): `conftest.py` (the smoke set, `--dump-designs`), `common.py` (the essay corpus, cached CPU references in `refs/`, gitignored), `<model>/ref.py` (model references), `llama/cpu.py`, `gemma4/cpu.py` (fp32 CPU models), `decode/attn_ref.py` (the decode attention cores' host model), `llama_cpp.py` (llama.cpp's CPU build), `operators/elementwise.py` (1-D stream operators, the activations' harnesses), `decode/mmv.py` (the decode GEMV's host model and its harness `MmvOperator`), `dma_model.py` (the host DMA model), `design_diff.py` (design dumps compared), `csrc/` (the C++ runtime's gtests) |
 | `tests/datasets/` | the long-prompt corpus (gitignored; `fetch_datasets.py` fetches it, `common.essay()` reads it) |
 | `.github/` | GitHub: the `ruff check` workflow (on pushes to `main` and pull requests), the issue and pull request templates, the security policy |
 | `docs/` | the user documentation (index: `docs/README.md`): installation, the tools' options, models (`models/`: tested files, plans, one page per model), benchmark methodology (the charts' test system and measured files), design, development; the README's performance charts: `data/*.json` (Artlite's and other runtimes' measurements), `charts.py` draws them as `images/*.svg`; `diagram.py` draws the README's how-it-works diagram; `images/`: also the logo and the docs' pictures |
@@ -113,13 +123,15 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
     counts and strides as compile-time constants, its names under `kernel_prefix` (Rules);
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
-- Reuse the shared pieces instead of copying: `kmath.py` (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a
-  template; arrays through the gather LUT: `km.act(km.SILU)`, `km.table_pass`), `kernel_lib.h` (`inv_rms`, bfp16
-  panels, lane shuffles), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction variable, `linear_tap`),
-  `bfp16.py` (host bfp16ebs8 conversions and panels), `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`,
-  workspace `regions`, bf16 constants, `arg_bytes`).
-- New operators are exported from `operators/__init__.py` and tested in `tests/rtc/test_<name>.py`. Tests need no
-  compile plumbing: pytest plans the selected tests in a subprocess and builds their designs in the background.
+- Reuse the shared pieces instead of copying (`artlite/operators/`, the headers in `artlite/include/`): `kmath.py`
+  (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a template; arrays through the gather LUT:
+  `km.act(km.SILU)`, `km.table_pass`), `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles), `design.py` (`COLS`,
+  `ROWS`, `range32`: Worker loops with an i32 induction variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions
+  and panels), `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants,
+  `arg_bytes`).
+- A new operator lives with what it serves (an `artlite` subsystem, or its model's package: Layers) and is tested in
+  `tests/<package>/test_<module>.py`. Tests need no compile plumbing: pytest plans the selected tests in a subprocess
+  and builds their designs in the background.
 - `compile()` = render (`build_spec()`, in the calling thread) + build (Peano: `kernel.cc` -> `kernel.o`; `aiecc`:
   `design.mlir` -> `main.pdi` + `insts.bin`). `kernel.cc` has a section per operator (a fused ELF's: each definition
   in the first section that uses it, a later one lists what it shares). `compile_all(ops)` builds many in
@@ -148,12 +160,14 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   `<models dir>/<HF org>/<HF repo>/`; the models dir (`ARTLITE_MODELS_DIR`, default `~/.artlite/models`) is spelled
   only in `model_config.MODELS_DIR`: get paths from its helpers (`llama_gguf`, `gemma_gguf`, `qwen_gguf`, ...), in
   tests and research scripts too.
-- Decode: each model runs one overlay design whose cores interpret metadata in their inputs, driven by
-  host-built transactions (`operators/overlay/`: the models' shared host side `model.py`, the KV record format
-  `kv.py`, the attention core of Gemma and Llama `attn.py`).
-- Prefill: layer-major chunk programs (`operators/prefill/chunks.py`) of GEMMs on the decode's weight image
-  (`operators/prefill/gemm.py`), the residual norms (`norm.py`: bf16 for Qwen and Llama, fp32 for Gemma) and Llama's
+- Decode: each language model runs one overlay design whose cores interpret metadata in their inputs, driven by
+  host-built transactions (`artlite/decode/`: the models' shared host side `model.py`, the KV record format `kv.py`,
+  the attention core of Gemma and Llama `attn.py`).
+- Prefill: layer-major chunk programs (`artlite/prefill/chunks.py`) of GEMMs on the decode's weight image
+  (`artlite/prefill/gemm.py`), the residual norms (`norm.py`: bf16 for Qwen and Llama, fp32 for Gemma) and Llama's
   attention (`attn.py`), writing the caches the decode continues from (the `npu-prefill` skill).
+- Image networks (Stable Diffusion's UNet and VAE decoder, MiniCPM-V's vision encoder) run whole on the vision overlay
+  (`artlite/vision/`), a dispatch per network.
 - Each model's design is in its package's module docstrings.
 
 ## Pitfalls
@@ -191,14 +205,14 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   reps, an idle CPU (a memory-heavy CPU job slows DMA-bound NPU work a lot). Cycles convert at 1.81 GHz.
 - A change that keeps the per-element arithmetic order must produce bit-identical output, not just pass the
   tolerance test.
-- Refactoring check: `pytest tests/rtc --dump-designs DIR` before and after, then
-  `python tests/rtc/design_diff.py BEFORE AFTER --asm` (identical MLIR; changed kernel sources compile to the same
+- Refactoring check: `pytest tests --dump-designs DIR` before and after, then
+  `python tests/design_diff.py BEFORE AFTER --asm` (identical MLIR; changed kernel sources compile to the same
   asm). The apps' full designs are dumped too (`test_app_designs.py`); the slow tests are not. A change of shared
-  kernel code (`kmath.py`, `kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
+  kernel code (`kmath.py`, `include/kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
   BEFORE before the change, `--partial --asm` after (`design_diff.py`'s docstring); on the NPU then only the tests of
   the designs whose code changed.
-- Data layouts (shim taps, memtile walks, joins) are tested on the host with `tests/rtc/dma_model.py`
-  (`tests/rtc/test_gemm_q_dma.py` is the pattern).
+- Data layouts (shim taps, memtile walks, joins) are tested on the host with `tests/dma_model.py`
+  (`tests/gemm/test_dma.py` is the pattern).
 - Long prompts use the essay corpus (`tests/datasets/`): the essays concatenated in file-name order.
 - Research scripts and reports stay outside the repo: move conclusions that must survive into docstrings or a
   skill.

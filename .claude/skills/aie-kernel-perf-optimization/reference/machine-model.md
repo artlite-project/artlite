@@ -130,7 +130,7 @@ post-RA pipeliner runs, the materializer binds them per basic block:
 Loads into accumulator registers (`vlda` into `bm` / `cm`, `vlda.conv`) issue on slot A only, whatever their bank
 annotation: an fp32 C tile's loads all sit on slot A. A bf16 value added to an accumulator (`aie::add(acc, load)`)
 fuses into a `vlda.conv`; as a MAC operand with ones (`aie::mac(acc, load, ones)`, the same exact sum) it is a plain
-load that slot B can take (sd15's `sd15_res_f2b`: slot A 3 -> 2 ops, II 4 -> 2).
+load that slot B can take (the vision overlay's `sd15_res_f2b`: slot A 3 -> 2 ops, II 4 -> 2).
 
 Consequences:
 - A loop with three banks puts two of them on the same slot. Put the

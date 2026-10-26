@@ -13,7 +13,7 @@ each II failed (the report says when that build's commit is not the wheel's). Wi
 runs on the NPU, one process per build, one at a time: the time of one dispatch and the event-window counters of
 named regions next to their static cycles.
 
-    python -m artlite.variant_search 'tests.rtc.mmv.MmvOperator(fmt="Q5_K", n_tiles=4)' \\
+    python -m artlite.variant_search 'tests.decode.mmv.MmvOperator(fmt="Q5_K", n_tiles=4)' \\
         --fn _q5k --pragmas post,none,ii44 [--sub NAME OLD NEW] [--define NAME FN @def.cc] \\
         [--param NAME key=value] [--variants FILE.py] [--why] [--npu --region codes=_q5k]
 
@@ -1275,9 +1275,9 @@ def _worker(spec_path: str, *, compile_only: bool) -> None:
 
 
 def parse_operator(expression: str) -> tuple[Callable[..., Any], dict[str, Any]]:
-    """'Name(key=literal, ...)': Name from artlite.operators (also a submodule's attribute: overlay.gemv.render) or a
-    dotted import path."""
-    from . import operators
+    """'Name(key=literal, ...)': Name a submodule's attribute of the artlite package (gemm.gemm_q.GemmQOperator,
+    decode.gemv.render) or a dotted import path (tests.decode.mmv.MmvOperator)."""
+    package = __name__.rpartition(".")[0]
 
     call = ast.parse(expression, mode="eval").body
     if not isinstance(call, ast.Call) or call.args:
@@ -1290,13 +1290,11 @@ def parse_operator(expression: str) -> tuple[Callable[..., Any], dict[str, Any]]
         except ImportError:
             return None
 
-    # (the longest prefix that is a submodule of artlite.operators: overlay.gemv.render)
-    sub = next((i for i in range(len(parts), 0, -1) if module(".".join([operators.__name__, *parts[:i]])) is not None), 0)
-    if hasattr(operators, parts[0]):
-        base: Any = getattr(operators, parts[0])
-        rest = parts[1:]
-    elif sub:
-        base, rest = module(".".join([operators.__name__, *parts[:sub]])), parts[sub:]
+    # (the longest prefix that is a submodule of artlite: decode.gemv.render)
+    sub = next((i for i in range(len(parts), 0, -1) if module(".".join([package, *parts[:i]])) is not None), 0)
+    if sub:
+        base: Any = module(".".join([package, *parts[:sub]]))
+        rest = parts[sub:]
     else:
         index = next((i for i in range(len(parts), 0, -1) if module(".".join(parts[:i])) is not None), 0)
         if not index:
@@ -1347,8 +1345,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         prog="python -m artlite.variant_search",
         description="Compile kernel variants of an operator and rank the loops of target functions.",
     )
-    parser.add_argument("operator", nargs="?", help="Name(key=value, ...): an operator class of artlite.operators "
-                        "or a function returning kernel source (overlay.gemv.render)")
+    parser.add_argument("operator", nargs="?", help="Name(key=value, ...): an operator class (gemm.gemm_q.GemmQOperator, "
+                        "tests.decode.mmv.MmvOperator) or a function returning kernel source (decode.gemv.render)")
     parser.add_argument("--fn", action="append", default=[], help="target function (name substring); repeatable")
     parser.add_argument("--total", action="append", default=[], help="also report this function's cycles per call")
     parser.add_argument("--pragmas", default="", help="variants named by pragma shorthands: base,post,none,ii44")

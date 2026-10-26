@@ -63,7 +63,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests/rtc"]
+testpaths = ["tests"]
 markers = [
     "slow: whole-model tests (minutes each); skipped unless --run-slow or -m slow",
     "smoke: the quick check after a change (conftest.SMOKE): host tests and one NPU case per component",

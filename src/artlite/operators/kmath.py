@@ -14,8 +14,8 @@ equal contracts render equal text, so a fused ELF holds one copy whichever opera
 runs several of them one body. They assume ``aie::rounding_mode::conv_even``.
 
 An ``Fn`` also carries its contract (``func``, ``params``), its domain and its error bound there (stated in its
-comment): tests/rtc/test_kmath.py checks them on the NPU against the variant's numpy model (tests/rtc/kmath_sim.py),
-bit-exact.
+comment): tests/operators/test_kmath.py checks them on the NPU against the variant's numpy model
+(tests/operators/kmath_sim.py), bit-exact.
 """
 
 from __future__ import annotations
@@ -142,10 +142,10 @@ _BELOW_F32 = {
 }
 
 
-# The bias-192 form's first step per contract, each the form its callers' loops schedule best: below "clamp" alone
-# takes f from the clamped v (one bf16 max each; prefill/attn's P panels: II 25); with a clamp above or "bounded", f
-# is the residual of the unclamped v (a shorter chain: sd15's pexp pipelines, II 23; qwen35's pass 1 II 8), and v is
-# clamped at 128 (bf16(A) rounds A in [127.5, 128.5] to 128: v and f agree; vexp2(0) = 1).
+# The bias-192 form's first step per contract, each the form its callers' loops schedule best: below "clamp" alone takes
+# f from the clamped v (one bf16 max each; prefill/attn's P panels: II 25); with a clamp above or "bounded", f is the
+# residual of the unclamped v (a shorter chain: the vision overlay's pexp pipelines, II 23; qwen35's pass 1 II 8), and v
+# is clamped at 128 (bf16(A) rounds A in [127.5, 128.5] to 128: v and f agree; vexp2(0) = 1).
 _EXP2_ACC_REDUCE = r"""
 {% macro reduce(N, out_P, out_f) %}
     const aie::vector<bfloat16, {{ N }}> one = aie::broadcast<bfloat16, {{ N }}>(1.0f);
@@ -871,7 +871,7 @@ _ACT = r"""
 }
 """
 
-# act's bounds (bf16 ULPs of the exact value) and where they hold (below: tests/rtc/test_kmath.py)
+# act's bounds (bf16 ULPs of the exact value) and where they hold (below: tests/operators/test_kmath.py)
 _ACT_BOUND = {"silu": (0.59, (-24.0, np.inf)), "sigmoid": (0.54, (-16.0, 16.0)), "gelu": (0.59, (-4.0, np.inf)),
               "gelu_erf": (0.59, (-4.0, np.inf))}
 
@@ -879,11 +879,12 @@ _ACT_BOUND = {"silu": (0.59, (-24.0, np.inf)), "sigmoid": (0.54, (-16.0, 16.0)),
 def act(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None,
         scale: int = 1, clamp: float | None = None, inline: bool = False) -> Fn:
     """``table``'s activation (an ActTable: SILU, GELU, GELU_ERF, SIGMOID) of N bf16 into y (x, y distinct): a noinline
-    template ``<N>(x, y[, tab_ab, tab_cd])``, two loops (t = min(|x|, t_max) into y, then the table pass in place):
-    ~0.8 cycles per element (SiLU: 3287 per 4096 on the NPU). ``table_arg``, ``walk`` (x's), ``n`` (a plain function
-    of n values): ``table_pass``'s. ``scale`` 2, ``clamp``: the table fed t = min(2 |x|, clamp) (a table of another
-    function on this one's grid: sd15's GELU, ``unet.gelu_table``; its words the caller's buffers). ``inline``: the
-    clamp pass inlined into the caller (a call per few thousand values costs ~7 cycles: the PLE's 0.25%)."""
+    template ``<N>(x, y[, tab_ab, tab_cd])``, two loops (t = min(|x|, t_max) into y, then the table pass in place): ~0.8
+    cycles per element (SiLU: 3287 per 4096 on the NPU). ``table_arg``, ``walk`` (x's), ``n`` (a plain function of n
+    values): ``table_pass``'s. ``scale`` 2, ``clamp``: the table fed t = min(2 |x|, clamp) (a table of another function
+    on this one's grid: the vision overlay's GELU, ``vision.layers.gelu_table``; its words the caller's buffers).
+    ``inline``: the clamp pass inlined into the caller (a call per few thousand values costs ~7 cycles: the PLE's
+    0.25%)."""
     _check("scale", scale, (1, 2))
     clamp = table.t_max * scale if clamp is None else clamp
     if table.full and (scale, clamp) != (1, table.t_max):

@@ -5,12 +5,12 @@ description: Build, extend or speed up a model's prompt prefill on the NPU on to
 
 # Prefill on the decode image
 
-Reference implementations: `operators/qwen35/prefill.py` (`QwenPrefill`), `operators/gemma4/prefill.py`
-(`GemmaPrefill`) and `operators/llama/prefill.py` (`LlamaPrefill`: pre-norm residual adds, one column per KV head, the
-shared attention on the decode's KV record format `operators/prefill/attn.py`); their module docstrings describe each
-layer's operators. Read the one closer to the new model first, then `operators/prefill/gemm.py` (the GEMM planner they
-use), `operators/prefill/norm.py` (the residual norms: bf16 `PrefillNormOperator`, fp32 `ResidualNormOperator`)
-and `operators/prefill/chunks.py` (`ChunkPrefill`, their base: chunk plan, pieces, buffer slices, library program; a
+Reference implementations: `models/qwen35/prefill.py` (`QwenPrefill`), `models/gemma4/prefill.py`
+(`GemmaPrefill`) and `models/llama/prefill.py` (`LlamaPrefill`: pre-norm residual adds, one column per KV head, the
+shared attention on the decode's KV record format `prefill/attn.py`); their module docstrings describe each
+layer's operators. Read the one closer to the new model first, then `prefill/gemm.py` (the GEMM planner they
+use), `prefill/norm.py` (the residual norms: bf16 `PrefillNormOperator`, fp32 `ResidualNormOperator`)
+and `prefill/chunks.py` (`ChunkPrefill`, their base: chunk plan, pieces, buffer slices, library program; a
 model supplies its runlist, static buffers and time model). Kernel and data-movement work inside it: the
 **aie-kernel-perf-optimization** skill.
 
@@ -68,9 +68,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 
 ## Gates (test each before building on it)
 
-1. **GEMMs alone** on the real image at the sub-chunk size: output against the host model (`test_prefill_gemm`),
+1. **GEMMs alone** on the real image at the sub-chunk size: output against the host model (`tests/prefill/test_gemm.py`),
    time and TMAC/s per phase, the plans (passes, tiles, m, A resident). New tile shapes: the DMA layout first, on
-   the host (`tests/rtc/test_gemm_q_dma.py`: add cases with the model's tile geometry).
+   the host (`tests/gemm/test_dma.py`: add cases with the model's tile geometry).
 2. **Each other operator** against an fp64 model at the kernel's rounding points: norms within ~2^-16 for the fp32
    residual and within 1.1x the error of the exact values rounded to the output format (bfp16 panels); the
    attention within 1.1x the bfp16 rounding of the exact attention on the cores' own operands (their Q panels, the

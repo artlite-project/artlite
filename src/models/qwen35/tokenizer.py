@@ -4,7 +4,7 @@
 API) from a tokenizer.json built from the file's vocabulary and merges (``gguf_model.bpe_tokenizer_json``). The split
 regex is the tokenizer.json form of llama.cpp's (``src/llama-vocab.cpp``, ``LLAMA_VOCAB_PRE_TYPE_QWEN35``); control and
 user-defined tokens (``<|im_start|>``, ``<think>``, ...) written in a text become their ids, as llama.cpp's
-``parse_special``. No BOS. Checked against ``llama-tokenize`` (tests/rtc/test_qwen35_tokenizer.py).
+``parse_special``. No BOS. Checked against ``llama-tokenize`` (tests/qwen35/test_tokenizer.py).
 """
 
 import gigatoken

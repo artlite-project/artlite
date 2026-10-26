@@ -179,7 +179,7 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **Constant bfp16 operands: pop them, do not assemble them.** A panel built in the loop from a mantissa load and a
   constant exponent (`b.mantissa = load; b.exponent = e8(0x85)`) pins its `ex` register pair, and the next
   iteration's loads into the same `x` register wait for the MMUL that reads it: RecMII 33. The same panels stored as
-  bfp16 blocks and popped from a `BIn` stream: II 18, the panel pushes' floor (`overlay/decode.py` `_ohp`).
+  bfp16 blocks and popped from a `BIn` stream: II 18, the panel pushes' floor (`decode/design.py` `_ohp`).
 - **Loop-invariant constants that spill: load them.** Masks held in registers across a loop compete with the
   iteration's values (the compiler parks them in accumulator registers and moves them back: `vmov x, bmlh` per
   iteration). Stored as a small L1 table (two copies, walked with `add_2d_ptr` so the loads cannot be hoisted), they
@@ -268,7 +268,7 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
   sub-block); a table activation (`km.act`) instead of a polynomial chain: smaller and faster.
 - No runtime-library arithmetic (`checks.py` warns when a kernel calls it).
-- **Pages: code the cores load themselves** (`operators/paging.py`, its docstring the hazards and their guards; sd15):
+- **Pages: code the cores load themselves** (`operators/paging.py`, its docstring the hazards and their guards; the vision overlay):
   the resident code (aiecc's link of the core) and pages of what only a page's entries reach, each linked at the slot
   (the resident end: `_main_init`, the crt's startup code, is linked last and the slot starts there) from a copy of
   `kernel.o` with the page's sections renamed; `paging.link` checks the resident code and data against aiecc's on every
@@ -277,7 +277,7 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   constant that one core can fold (column 0's index 0) changes that core's control-code size (decode overlays pass
   COLS + the column). The core triggers a
   page and sleeps on its wake lock in one resident function and enters page code through the pager's state words.
-  Self-DMA (sd15: the page in two B slots of its input stream, its MM2S 1 into its own TileControl): ~2.4 B / cycle of
+  Self-DMA (the vision overlay: the page in two B slots of its input stream, its MM2S 1 into its own TileControl): ~2.4 B / cycle of
   slots, 2.7 µs for two 5760-B slots whatever the code; the host knows each row's role and puts the page before the op
   that needs it. Memtile (the core's request packet pushes a page BD on a memtile MM2S channel of its own): 86 cycles
   + ~0.39 µs per KB of code, at most 4 cores per channel; its store and BDs reloaded after another hardware context ran

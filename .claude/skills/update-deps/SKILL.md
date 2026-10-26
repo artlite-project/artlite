@@ -21,7 +21,7 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 
 - No cache clearing needed: RTC cache keys include the `mlir_aie`/`llvm_aie` versions, so kernels recompile automatically. Old `rtc_*` dirs in `~/.cache/artlite/` just become orphaned; delete them to reclaim disk if desired.
 - If `uv sync` dropped the editable C++ build, rebuild with `uv pip install --no-build-isolation -ve .`.
-- Run `pytest tests/rtc -m smoke` (one NPU case per component and the apps' full designs: a bump can push a core past
+- Run `pytest tests -m smoke` (one NPU case per component and the apps' full designs: a bump can push a core past
   its program memory), not the full suite unless asked.
 - Regenerate the issue slot / shared port tables of `variant_search` and the `ARTLITE_MEASURE_II` report from the new
   llvm-aie commit: `python -m artlite.gen_isa_tables` (reads the .td files of the wheel's commit from the `../llvm-aie`

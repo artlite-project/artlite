@@ -99,5 +99,5 @@ nanobind_add_stub(
 if(ARTLITE_BUILD_TESTS)
   find_package(GTest REQUIRED)
   enable_testing()
-  add_subdirectory(tests)
+  add_subdirectory(tests/csrc)
 endif()

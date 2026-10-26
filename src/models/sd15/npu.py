@@ -1,6 +1,6 @@
 """Stable Diffusion 1.5's UNet and VAE decoder on the NPU: ``NpuUNet``, the pipeline's noise predictor
-(``artlite.operators.sd15``'s ``model.UNet``: the whole step as one dispatch of its static design, its weights in
-DDR images), and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: one dispatch).
+(``model.UNet``: the whole step as one dispatch of the vision overlay, ``artlite.vision``, its weights in DDR images),
+and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: one dispatch).
 
 Per step the host writes the latents and the 22 resnets' time biases (``host``: the steps' computed ahead on a worker
 thread, ``NpuUNet.prepare``), runs the dispatch and reads the 4 output channels; per prompt (a new context) it writes
@@ -14,12 +14,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
-from artlite.operators.sd15.model import UNet
-from artlite.operators.sd15.runtime import Sd15Device, load_state, save_state, state_dir
-from artlite.operators.sd15.vae import Decoder
+from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
 
 from . import reference
 from .host import resnet_time_biases
+from .model import UNet
+from .vae import Decoder
 from .weights import load_safetensors
 
 
@@ -27,7 +27,7 @@ class NpuUNet:
     """The UNet of a diffusers directory's ``unet`` on the NPU: (x (2, 4, 64, 64) scaled, t, context (2, 77, 768))
     -> the predicted noise (2, 4, 64, 64)."""
 
-    def __init__(self, directory: str, *, npu: Sd15Device | None = None, state: dict | None = None):
+    def __init__(self, directory: str, *, npu: VisionDevice | None = None, state: dict | None = None):
         with open(os.path.join(directory, "config.json")) as f:
             cfg = json.load(f)
         assert cfg["block_out_channels"] == [320, 640, 1280, 1280] and cfg["attention_head_dim"] == 8, \
@@ -35,7 +35,7 @@ class NpuUNet:
         path = os.path.join(directory, "diffusion_pytorch_model.safetensors")
         if state is None:
             self.w = load_safetensors(path)
-            self.net = UNet(npu or Sd15Device(), self.w, eps=cfg["norm_eps"])
+            self.net = UNet(npu or VisionDevice(), self.w, eps=cfg["norm_eps"])
             self.net.npu.warm()
         else:  # (a restored device's: ``load``)
             self.w = load_safetensors(path, contains=UNet.RUNTIME)
@@ -64,7 +64,7 @@ class NpuVae:
     """The VAE decoder of a diffusers directory's ``vae`` on the NPU (the device of a ``NpuUNet``'s design, one
     dispatch): the sampler's latents (B, 4, 64, 64) -> the images (B, 3, 512, 512), one at a time."""
 
-    def __init__(self, directory: str, npu: Sd15Device, *, state: dict | None = None):
+    def __init__(self, directory: str, npu: VisionDevice, *, state: dict | None = None):
         with open(os.path.join(directory, "config.json")) as f:
             cfg = json.load(f)
         assert cfg["block_out_channels"] == [128, 256, 512, 512] and cfg["layers_per_block"] == 2 and \
@@ -81,16 +81,17 @@ class NpuVae:
 
 
 # (what the cache's key covers besides the model's files: the code that builds the images and the transactions)
-_SOURCES = ("artlite/operators/sd15", "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
-            "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/operators/overlay/runtime.py",
-            "models/sd15/npu.py",
-            "models/sd15/reference.py", "models/sd15/weights.py")
+_SOURCES = ("artlite/vision", "models/sd15/unet.py", "models/sd15/level64.py", "models/sd15/model.py",
+            "models/sd15/vae.py", "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
+            "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/overlay.py",
+            "models/sd15/npu.py", "models/sd15/reference.py", "models/sd15/weights.py")
 
 
 def load(path: str) -> tuple[NpuUNet, NpuVae]:
-    """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache (``runtime.state_dir``:
-    the device's layout, the images the builds wrote (weights, commands, tables), the transactions with their shim
-    addresses relocated; keyed by the model's files and the code), else built and cached (one entry per model)."""
+    """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache
+    (``artlite.vision.device.state_dir``: the device's layout, the images the builds wrote (weights, commands, tables),
+    the transactions with their shim addresses relocated; keyed by the model's files and the code), else built and
+    cached (one entry per model)."""
     files = [os.path.join(path, sub, f) for sub in ("unet", "vae") for f in ("config.json", "diffusion_pytorch_model.safetensors")]
     cache = state_dir("sd15", path, _SOURCES, files)
     if (got := load_state(cache)) is not None:

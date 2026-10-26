@@ -112,7 +112,7 @@ sessions (a server start and its requests) differ by up to 8%: take the best of 
 `model` names the chart group (the same string for every file of a model; groups keep the file's order). TTFT with 3
 significant digits (0.44, 3.14, 16.7), prefill in whole tok/s, decode with one decimal. Without a drafter: no `mtp`.
 Image prompts: `"image_ttft_s": {"16x": {"airplane.jpeg": 0.570, ...}, "4x": {...}}`, the encoders and images those of
-`image_prompts` (a new image there needs its size and slice grid, `minicpmv.slice_image`'s `Grid.grid`).
+`image_prompts` (a new image there needs its size and slice grid, `models.minicpmv.host.slice_image`'s `Grid.grid`).
 A run to explain goes in `notes` (`"notes": {"decode_tps": {"1024": "stopped at an end-of-sequence token after 143 of
 the 256 tokens"}}`: a footnote on that bar). Then `python docs/charts.py` redraws `docs/images` (light and dark SVGs;
 commit both), and the model table in `docs/models/README.md` gets the file. `docs/methodology.md`'s "Measured files"

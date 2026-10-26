@@ -114,7 +114,7 @@ Tools:
   2 + j, and keep the other stream's parity (the op's command in B slot 0, so that k-tile i is in B slot (i + 1) % 2).
   sd15's 16x16 GEMM: memory stall 7.6 -> 3.6 us, -12% per op; with the parity off by one every k-tile conflicts.
   Where one object feeds several calls (a conv's rows, in two regions), order the calls so that their regions
-  alternate with the B slots (sd15 `Gemm.ORDER2`, rotated by one in odd chunks of 9 taps: memory stall -37%).
+  alternate with the B slots (the vision overlay's `ops.Gemm.ORDER2`, rotated by one in odd chunks of 9 taps: memory stall -37%).
 - **A bank annotation is also a scheduling hint**: the fp32-C MAC with its second 8-row panel's C loads annotated as
   bank b (the same addresses, still on slot A: machine-model.md) pipelines at II 41 instead of 43 (`render_mac(c2_bank=)`;
   the stores annotated too, or every load: not pipelined or II 43-44). Sweep annotations like pragmas.

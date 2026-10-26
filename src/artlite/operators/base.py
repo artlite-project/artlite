@@ -30,8 +30,9 @@ if TYPE_CHECKING:
 
 # Toolchain paths
 
-OPERATORS_DIR = os.path.dirname(os.path.abspath(__file__))
-OPERATORS_H = os.path.join(OPERATORS_DIR, "operators.h")
+PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (the artlite package)
+INCLUDE_DIR = os.path.join(PACKAGE_DIR, "include")  # the kernels' headers
+OPERATORS_H = os.path.join(INCLUDE_DIR, "operators.h")
 
 CACHE_DIR = os.environ.get(
     "ARTLITE_CACHE_DIR",
@@ -66,7 +67,7 @@ CLANG_CMD_COMMON = [
     "-Wno-deprecated-declarations",
     "-D__AIE_API_AIE_ADF_HPP__",
     "-DNDEBUG",
-    "-I" + OPERATORS_DIR,
+    "-I" + INCLUDE_DIR,
     f"-I{MLIR_AIE_INCLUDE}",
     f"-I{AIE_RUNTIME_LIB_INCLUDE}",
 ]
@@ -173,7 +174,7 @@ def _compile_pch(*, clang_cmd: list[str]) -> str:
     aiecc_mtime = os.path.getmtime(AIECC)
     clangpp_mtime = os.path.getmtime(CLANGPP)
     # operators.h and the headers it includes (kernel_lib.h): contents and modification times
-    headers = sorted(glob.glob(os.path.join(OPERATORS_DIR, "*.h")))
+    headers = sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h")))
     header_keys = []
     for path in headers:
         with open(path, "rb") as f:
@@ -427,8 +428,9 @@ class ArtcOperator:
     def kernel_label(self) -> str:
         """The operator's section header in a translation unit: its class and file."""
         mod = sys.modules[type(self).__module__].__file__ or ""
-        where = os.path.relpath(mod, os.path.dirname(OPERATORS_DIR)) if mod.startswith(OPERATORS_DIR) else \
-            os.path.basename(mod)
+        top = os.path.dirname(PACKAGE_DIR)  # (artlite's and models' directory)
+        where = os.path.relpath(mod, top) if mod.startswith((os.path.join(top, "artlite", ""),
+                                                             os.path.join(top, "models", ""))) else os.path.basename(mod)
         return f"{type(self).__name__} ({where})"
 
     def kernel_detail(self) -> str:

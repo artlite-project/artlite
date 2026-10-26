@@ -129,7 +129,7 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
 
 - There is no native bf16 mmul: `aie::mmul<*,8,8,bfloat16>` lowers to elementwise-emulated intrinsics (II 34 for a
   4-MAC k-step loop). The hardware 8x8x8 path is bfp16ebs8 (`mac_8x8_8x8T`), as in the GEMMs
-  (`operators/gemm/mac.py`). [measured, `artlite.measure_ii`, ATB]
+  (`gemm/mac.py`). [measured, `artlite.measure_ii`, ATB]
 - IRON's bf16 `kernels.mm(...)` uses the `(4, 8, 8)` mmul geometry on AIE2P; with
   `emulate_bf16_mmul_with_bfp16=True` it switches to `(8, 8, 8)`. [mlir-aie `python/iron/kernels/linalg.py`]
 - Use `kernels.mm(...).mac_dims` instead of hardcoding tiling: the returned `ExternalFunction` knows the layout the
@@ -173,8 +173,8 @@ Walks:
 - IRON zeroes the stride of an outer tap dimension of size 1: a parameterized length over a [1, 1, d1, d0] tap re-reads
   its first pass. Give that dimension size 2 and the unit explicitly (`ChainPart(length_unit=d1 d0)`).
 - A small-shape bring-up (K == mtk, one strip per fill) can be correct while the multi-window path (K > mtk)
-  misdelivers: verify layout changes at a shape with window refills, on the host first (`tests/rtc/dma_model.py`,
-  `tests/rtc/test_gemm_q_dma.py`).
+  misdelivers: verify layout changes at a shape with window refills, on the host first (`tests/dma_model.py`,
+  `tests/gemm/test_dma.py`).
 
 Links and FIFOs:
 - `cons().split` and `prod().join` offsets are in **elements**, not bytes.
@@ -224,7 +224,7 @@ BDs:
 - A core's DMA can stream into its own TileControl (a packet flow inside its switchbox: `paging.loop_flow`; one packet
   id on all 32 cores routes, the flows never meet). `get_coreid()` is col << 16 | row.
 - A core-tile BD takes no lock or exactly one acquire and one release (aiecc). A buffer filled by two BDs in turn (an
-  object split over two L1 regions: sd15's `design.R23`): the first acquires the free lock and releases a lock only
+  object split over two L1 regions: the vision overlay's `design.R23`): the first acquires the free lock and releases a lock only
   the DMA uses, the second acquires that one and releases the full lock.
 - Core BD sizes are at most 255 per dimension, and IRON coalesces contiguous tap dimensions first (a [2, 9, 128] walk
   of 1152-word runs becomes [2, 1152]: "Size may not exceed 255"). A long contiguous run is a length-only BD (rank 1,
@@ -303,7 +303,7 @@ Silent wrong results:
 - **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B
   aligned** is accessed 32 B lower (the low address bits dropped): its stores overwrite the 32 B before the buffer
   (sd15's d-80 attention scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B
-  boundaries, or access a 32-B-aligned window as two 32-B halves (`overlay/kernels.py`'s MoE accumulator).
+  boundaries, or access a 32-B-aligned window as two 32-B halves (`decode/kernels.py`'s MoE accumulator).
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
   array) reads garbage (NaN state), and so does a `seek` to such a position (a rewind by a panel count not a multiple
   of 8: 5 panels, 360 B). Open one stream at the array's start and pop in order.
@@ -351,20 +351,20 @@ Address spaces and layout:
 ## 11. Quantization formats
 
 - The GGUF-derived tile formats (Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, BF16, BFP16): geometry, lossless packing,
-  reference numerics and each format's kernel fragments are in its slot in `src/artlite/operators/formats/`; the
+  reference numerics and each format's kernel fragments are in its slot in `src/artlite/formats/`; the
   decode GEMV kernels and the prefill GEMM (`gemm/gemm_q.py`) document their dequant arithmetic (unsigned codes
   zipped with 0x43 into bf16 128 + q, offsets folded into the accumulator). bfp16ebs8 host helpers:
   `src/artlite/operators/bfp16.py`.
 
 ## 12. A design to copy
 
-- **The GEMM MAC loop** (`src/artlite/operators/gemm/mac.py`, GemmQ / GemmQd): `aie::mmul<8,8,8,bfp16ebs8>` over
+- **The GEMM MAC loop** (`src/artlite/gemm/mac.py`, GemmQ / GemmQd): `aie::mmul<8,8,8,bfp16ebs8>` over
   aie_api block-vector streams with explicit bank annotations (`__aie_dm_resource_*`), one flat II 32 loop per
   stripe (persistent streams rewound by 2-D seeks, separate `__restrict` C load / store pointers).
 
 ## 13. Numerical verification
 
-- Compare with absolute and relative tolerances (`tests/rtc/common.py` `verify_close`; ATB's GEMM: `abs_tol=0.5`,
+- Compare with absolute and relative tolerances (`tests/common.py` `verify_close`; ATB's GEMM: `abs_tol=0.5`,
   `rel_tol=0.10` for 2x bf16), the reference rounded to bf16 first; `torch.equal` where the arithmetic order is the
   kernel's. [ATB]
 - For large outputs a stochastic 1000-sample check is acceptable.
@@ -378,7 +378,7 @@ Address spaces and layout:
 - `dmesg` shows `amdxdna ... IO_PAGE_FAULT` when DMA addresses or buffer layouts are wrong.
 - Bring designs up incrementally: one block / layer at a time, then the host handoff between dispatches, then the
   whole chain. [mlir-aie `skills/aie-hw-bringup`]
-- Before blaming the compiler, rule out the stack (section 10), the layout (`tests/rtc/dma_model.py`) and the DMA
+- Before blaming the compiler, rule out the stack (section 10), the layout (`tests/dma_model.py`) and the DMA
   patterns. When a stored value reads back as the buffer's initial value, check the store's address in the `.s`.
 - Program memory overflow (`_XAie_LoadProgMemSection: Overflow of program memory`, or "section '.text' will not fit
   in region 'program'"): aie-kernel-perf-optimization section 7.

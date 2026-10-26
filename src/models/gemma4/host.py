@@ -3,7 +3,7 @@ from the GGUF file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
 
 ``GemmaHost`` reads matrices dequantized to fp32 on first use, embedding rows by a lookup in the mapped file
 (``GGUFFile.rows``). Its ``mm`` and ``norm`` are methods so that models of other arithmetic can override them (the fp32
-reference of the whole model, tests/rtc/gemma_cpu.py, derives from it).
+reference of the whole model, tests/gemma4/cpu.py, derives from it).
 """
 
 import math

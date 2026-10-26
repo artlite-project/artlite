@@ -11,7 +11,7 @@ $ARTLITE_MODELS_DIR/lmstudio-community/
   Llama-3.2-1B-Instruct-GGUF/     unsloth/Llama-3.2-1B-Instruct-GGUF
     Llama-3.2-1B-Instruct-Q4_K_M.gguf, ...
   Llama-3.2-1B-Instruct/          unsloth/Llama-3.2-1B-Instruct (= meta-llama, ungated; optional)
-    tokenizer.json                (test_llama_tokenizer compares the GGUF vocabulary's ids with it)
+    tokenizer.json                (tests/llama/test_tokenizer.py compares the GGUF vocabulary's ids with it)
   Llama-3.2-3B-Instruct-GGUF/     unsloth/Llama-3.2-3B-Instruct-GGUF
     Llama-3.2-3B-Instruct-Q4_K_M.gguf, ...
   Meta-Llama-3.1-8B-Instruct-GGUF/  lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF
@@ -32,9 +32,9 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 
 ## On the NPU
 
-- Decode runs on the shared decode overlay (`artlite.operators.llama.overlay`), up to 4 tokens per dispatch. The
+- Decode runs on the shared decode overlay (`models.llama.overlay`), up to 4 tokens per dispatch. The
   weights are re-laid-out at load into a device buffer at their quantization's size; nothing is written to disk.
-- Prompts run through the prefill (`artlite.operators.llama.prefill`): chunks of up to 4096 tokens (8B: 2048), layer-major
+- Prompts run through the prefill (`models.llama.prefill`): chunks of up to 4096 tokens (8B: 2048), layer-major
   programs assembled from one library ELF (GEMMs on the decode's weight image, the bf16 residual stream, a flash
   attention writing the decode's KV caches); short prompts in chunks of 64 / 128 tokens (1B: 128). Tokens where a chunk cannot
   start (inside a cache group: after a reply), and a prompt's last 4 or fewer, run as decode steps of up to 4 tokens.
@@ -49,4 +49,4 @@ Time to first token at 1K / 8K / 32K prompt tokens: 1B Q4_0 0.109 / 1.07 / 8.59 
 on the same weights (three chat prompts and three essay windows through the prefill, their continuations
 teacher-forced): KL 0.0016 / 0.0011 / 0.0011 for 1B / 3B / 8B.
 
-NPU code: `src/models/llama3/llama.py` (the model objects `Llama` and `NpuLlama`).
+NPU code: `src/models/llama/` (the model objects `Llama` and `NpuLlama`: `llama.py`).

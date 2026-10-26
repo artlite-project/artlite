@@ -7,7 +7,7 @@ Run it after a toolchain upgrade (skill ``update-deps``). It needs an llvm-aie c
 (default: ``llvm-aie`` next to Artlite; ``git fetch`` there when the commit is missing) and its ``llvm-tblgen``
 (default: the checkout's ``build/bin``). The .td files are read from git at the wheel's commit, so the checkout's
 HEAD and working tree do not matter. ``--check`` changes nothing and exits 1 when ``aie2p_isa.py`` is stale
-(``tests/rtc/test_variant_search.py`` runs it when a checkout is there).
+(``tests/test_variant_search.py`` runs it when a checkout is there).
 
 Per mnemonic (the first word of an AsmString, non-pseudo instructions with a slot): its slots, and per port the
 cycles it occupies the port's unit (InstrItinData stages of its Itinerary, Reserved stages skipped), common to every

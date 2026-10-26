@@ -7,8 +7,10 @@ Components:
 - **artlite** - C++ library (Device, Buffer, HwContext, Executable, Kernel)
 - **artlite._native** - Python bindings via nanobind (C++ extension)
 - **artlite.operators** - Python AIE runtime compiler (JIT compilation, HIP RTC style)
-- **models** - the models on the NPU (Llama 3.x, Gemma 4, Qwen3.5 / 3.6 / 3.8, Stable Diffusion 1.5) and the tools
-  `artlite-cli`, `artlite-server`, `artlite-bench`
+- **artlite**'s subsystems - what the models share: tile formats, GEMMs, the decode overlay, the prefill, MoE layers,
+  the vision overlay
+- **models** - the models on the NPU (Llama 3.x, Gemma 4, Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, Stable Diffusion 1.5)
+  and the tools `artlite-cli`, `artlite-server`, `artlite-bench`
 
 Building: [Installation](install.md); tests and kernel tools: [Development](development.md).
 
@@ -18,8 +20,9 @@ Building: [Installation](install.md); tests and kernel tools: [Development](deve
 
 ```mermaid
 flowchart TB
-    tools["artlite-cli, artlite-server, artlite-bench<br>(package models)"] --> ops
+    tools["artlite-cli, artlite-server, artlite-bench<br>(package models: the models)"] --> sub
     tools --> py
+    sub["artlite's subsystems: tile formats, GEMMs, decode<br>overlay, prefill, MoE, vision overlay"] --> ops
     ops["artlite.operators: render, compile,<br>cache, dispatch"] --> py
     ops -.->|build| tc["Peano, aiecc: kernel.cc, design.mlir<br>to main.pdi + insts.bin, or an ELF"]
     py["artlite: Device, Tensor, Program"] --> nat["artlite._native (nanobind)"]
@@ -191,20 +194,22 @@ result = y.to_torch()  # one sync at the end
 - **`Tensor`** - Device-resident tensor with explicit sync control
 - **`Program`** - Compiled AIE program ready for dispatch
 
-**Operators** (`src/artlite/operators/`, exported from its `__init__.py`), by purpose:
-the framework at the top (``base``, ``design``, ``checks``, ``render_cache``, ``l1_layout``, `FusedOperator` in
-``fused``, which links several operators into one program and checks that the host initializes every buffer the
-program reads; ``kernel_lib.h``, ``kmath``, ``bfp16``); the GGUF tile formats (``formats/``, one slot per format:
-Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, BFP16 for BF16 / F16 tensors); the prefill GEMMs on the decode
-tiles (``gemm/``: GemmQ, GemmQd, their MAC loop); the decode overlay run by host-built transactions
-(``overlay/``: GEMV cores, the KV record format, the attention core of Gemma and Llama, the models' shared host
-side); the prefill's chunk programs, GEMM planner, norms and attention (``prefill/``); the models' own operators
-(``llama/``: weight image, decode overlay, prefill; ``qwen35/``; ``gemma4/``; ``sd15/``).
+**Operators**, in layers (`src/artlite/`, then `src/models/`): the framework (``operators/``: ``base``, ``design``,
+``checks``, ``render_cache``, ``l1_layout``, `FusedOperator` in ``fused``, which links several operators into one
+program and checks that the host initializes every buffer the program reads; ``kmath``, ``bfp16``; the kernels'
+headers in ``include/``), and the runtime of the designs run by host-built transactions (``overlay.py``); the
+subsystems the models share: the GGUF tile formats (``formats/``, one slot per format: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K,
+Q6_K, Q2_K, Q3_K, IQ3_XXS, BFP16 for BF16 / F16 tensors), the GEMMs on the decode tiles (``gemm/``: GemmQ, GemmQd,
+their MAC loop), the decode overlay (``decode/``: GEMV cores, the weight image, the KV record format, the attention
+core of Gemma and Llama, the models' shared host side), the prefill's chunk programs, GEMM planner, norms and
+attention (``prefill/``), MoE layers (``moe/``), the vision overlay (``vision/``: an image network per dispatch); then
+each model's own (``models/llama/``: weight image, decode design, prefill; ``models/qwen35/``; ``models/gemma4/``;
+``models/minicpmv/``; ``models/sd15/``).
 
 Build-time checks (``operators/checks.py``, every compile): kernel stack depth vs
 each core's ``stack_size``, kernel signatures vs the design's declarations, and a
 warning for rounding kernels that do not set the rounding mode. Data layouts can be
-tested without an NPU with the host DMA model ``tests/rtc/dma_model.py`` (``test_gemm_q_dma.py``).
+tested without an NPU with the host DMA model ``tests/dma_model.py`` (``tests/gemm/test_dma.py``).
 
 ---
 
@@ -234,7 +239,7 @@ main.pdi + insts.bin  (loaded by artlite.Program)
 A fused program (`FusedOperator`, `Library`) builds its designs into one ELF the same way, its operators' kernels as
 one `kernel.cc`: a section per operator, each definition once (a name is a hash of its code, so the same helper of two
 operators, or of two configurations of one, is one function; a section lists what it shares with earlier ones). The C++ test build
-(`tests/CMakeLists.txt`) runs the same `aiecc` step through its `add_aie_target()` function.
+(`tests/csrc/CMakeLists.txt`) runs the same `aiecc` step through its `add_aie_target()` function.
 
 The first run of a model compiles its designs, from seconds to a few minutes per model (Stable Diffusion's UNet
 program: about 2 minutes); later runs load them from the cache (`ARTLITE_CACHE_DIR` moves it). Uncached designs

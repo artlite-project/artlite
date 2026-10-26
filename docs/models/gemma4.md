@@ -10,18 +10,18 @@ default sampling: the model's (temperature 1.0, top-k 64, top-p 0.95).
 $ARTLITE_MODELS_DIR/ggml-org/gemma-4-E4B-it-GGUF/     ggml-org/gemma-4-E4B-it-GGUF
     gemma-4-E4B-it-Q4_0.gguf                          (the NPU path: Q4_0 layers, Q8_0 embedding)
     mtp-gemma-4-E4B-it-Q4_0.gguf                      (the model's drafter, gemma4-assistant: multi-token prediction)
-    gemma-4-E4B-it-Q8_0.gguf, gemma-4-E4B-it-BF16.gguf   (the fp32 reference only, for now: tests/rtc/gemma_cpu.py)
+    gemma-4-E4B-it-Q8_0.gguf, gemma-4-E4B-it-BF16.gguf   (the fp32 reference only, for now: tests/gemma4/cpu.py)
 ```
 
 The models directory: [Installation](../install.md#models-directory).
 
 ## How the NPU path works
 
-Paths below are under `src/artlite/operators/`. One design, compiled once: the decode overlay shared with Qwen3.5 and
-Llama (`artlite.operators.overlay`), with the attention cores it shares with Llama in Gemma's configuration
-(`overlay/attn.py`, `gemma4/attn.py`). The host builds every dispatch's transaction (`gemma4/overlay.py`,
-`GemmaOverlay`); the cores read what to do from the metadata of their input objects. The host computes the tokens'
-scaled embeddings and per-layer inputs (`src/models/gemma4/host.py`).
+Paths below are under `src/models/` (Gemma's own code: `gemma4/`) and `src/artlite/` (what the models share). One
+design, compiled once: the decode overlay shared with Qwen3.5 and Llama (`artlite.decode`), with the attention cores it
+shares with Llama in Gemma's configuration (`decode/attn.py`, `gemma4/attn.py`). The host builds every dispatch's
+transaction (`gemma4/overlay.py`, `GemmaOverlay`); the cores read what to do from the metadata of their input objects.
+The host computes the tokens' scaled embeddings and per-layer inputs (`src/models/gemma4/host.py`).
 - A dispatch runs up to 4 token slots through all 42 layers and the LM head, streaming the weights
   once for all of them.
 - Cores per column: the main core and its helper run the projections (Q4_0 / Q8_0 tiles on the
@@ -53,4 +53,4 @@ Speed and accuracy (E4B Q4_0, Strix):
 | after a prompt through the prefill | KL 0.00020 (34 tokens); its KV caches within 1-3% of the decode path's at every position through layer 11 (deeper layers amplify the prefill's rounding at a few positions) |
 | determinism | a token's logits depend on the tokens up to it only: not on the other slots of its dispatch, nor on rejected drafts; steps of 1-4 tokens give the same logits bit for bit (greedy text with drafts is the text without) |
 
-Design: the module docstrings of `overlay/decode.py` and `gemma4/`.
+Design: the module docstrings of `decode/design.py` and `gemma4/`.

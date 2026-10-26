@@ -272,7 +272,7 @@ renders the operator's kernel, patches the target functions per variant, measure
 parallel and ranks them in one table per loop.
 
 ```bash
-python -m artlite.variant_search 'tests.rtc.mmv.MmvOperator(fmt="Q5_K", n_tiles=4)' \
+python -m artlite.variant_search 'tests.decode.mmv.MmvOperator(fmt="Q5_K", n_tiles=4)' \
     --fn _q5k --pragmas none [--sub NAME OLD NEW] [--why] [--npu --region codes=_q5k]
 ```
 ```
@@ -338,4 +338,4 @@ mmvh_q5k_mm loop 1/1: for.body @kernel.cc:261, depth 1 (in base); ranked by cycl
 ## Improvements
 
 measure_ii is error-prone. When the assembly or the compiler's remarks disagree with its report, do not just note
-it: fix `src/artlite/measure_ii.py` (tests in `tests/rtc/test_measure_ii.py`), so that the next report is right.
+it: fix `src/artlite/measure_ii.py` (tests in `tests/test_measure_ii.py`), so that the next report is right.

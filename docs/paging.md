@@ -4,8 +4,8 @@ An AIE2P core runs only the code in its own program memory: 16 KB. In a classic 
 configuration, so a core's program is fixed until the next configuration. Artlite instead runs a whole network on
 one static design whose cores execute commands (an overlay). When the code of every command no longer fits in
 16 KB, the cores load the part they need next themselves, as **code pages**. A design is then a universal program:
-one configuration for every operation, whatever the size of its code. This page explains the mechanism with Stable
-Diffusion 1.5's UNet as the example, and the decode overlays' variant after it.
+one configuration for every operation, whatever the size of its code. This page explains the mechanism with the
+vision overlay and Stable Diffusion 1.5's UNet as the example, and the decode overlays' variant after it.
 
 ## A classic design
 
@@ -36,10 +36,10 @@ step cannot afford that between each pair.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/paging-overlay-dark.svg">
-  <img alt="sd15's overlay: each row of 8 cores receives a broadcast B stream of commands and weights from one shim tile; in each column the memory tile sends the A stream to its 4 cores and receives their O streams, and the shim tile fills and drains it" src="images/paging-overlay.svg">
+  <img alt="The vision overlay: each row of 8 cores receives a broadcast B stream of commands and weights from one shim tile; in each column the memory tile sends the A stream to its 4 cores and receives their O streams, and the shim tile fills and drains it" src="images/paging-overlay.svg">
 </picture>
 
-Artlite's sd15 design is configured once, and every operation of the UNet and the VAE decoder runs on it. Every stream
+Artlite's vision overlay is configured once, and every operation of the UNet and the VAE decoder runs on it. Every stream
 runs on every call:
 
 - **B** (green): each core row has one broadcast stream from a shim tile (columns 0, 2, 4, 6 for rows 2-5) to the
@@ -59,12 +59,12 @@ holds the code for every command.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/paging-budget-dark.svg">
-  <img alt="Program memory of an sd15 core: 8976 bytes of resident code and five roles of 3360 to 5984 bytes need 34192 bytes, 2.1 times the 16 KB; with pages, each role is linked at the slot after the resident code and loaded one at a time" src="images/paging-budget.svg">
+  <img alt="Program memory of a vision overlay core: 8976 bytes of resident code and Stable Diffusion's five roles of 3360 to 5984 bytes need 34192 bytes, 2.1 times the 16 KB; with pages, each role is linked at the slot after the resident code and loaded one at a time" src="images/paging-budget.svg">
 </picture>
 
-sd15's cores need 34 KB of code: the main loop, GEMM and convolution, plus five roles' code. The roles are attention
-of heads of 80 and 160 (`a`), attention of heads of 40 (`c`), the VAE's attention (`v`), GroupNorm (`gn`) and
-LayerNorm with GEGLU (`ln`). Only one role is needed at a time. Each role becomes a **page**: code linked at the
+For Stable Diffusion the vision overlay's cores need 34 KB of code: the main loop, GEMM and convolution, plus five
+roles' code. The roles are attention of heads of 80 and 160 (`a`), attention of heads of 40 (`c`), the VAE's attention
+(`v`), GroupNorm (`gn`) and LayerNorm with GEGLU (`ln`); MiniCPM-V's window attention (`w`) is a sixth. Only one role is needed at a time. Each role becomes a **page**: code linked at the
 **slot**, the program memory after the resident code, and loaded into it when an operation needs it.
 
 ## Two ways to change the code at run time
@@ -148,7 +148,7 @@ The link runs once per design and is cached next to it.
 | Page data | Data memory holds only the resident ELF's data | `link` refuses a page that needs data of its own |
 | A stale page after a configuration | A PDI load rewrites the slot's start but keeps the state words | The state words are cleared after one (memory tile transport), or a dispatch always sends its first page (self-DMA) |
 | A packet across slots | A slot's BD ends with TLAST and cuts the packet | `Pager.slots` packs whole packets per slot |
-| A dispatch ending with tasks queued | The next dispatch rewrites the BDs, and the queued task streams its data: a page twice or out of place | sd15 waits for the last push of every B stream at the end |
+| A dispatch ending with tasks queued | The next dispatch rewrites the BDs, and the queued task streams its data: a page twice or out of place | the vision overlay waits for the last push of every B stream at the end |
 | A full task queue (memory tile transport) | A push to a full queue is dropped | One channel serves at most 4 cores, with one request in flight each |
 | A queue shared with waiting tasks (memory tile transport) | A task that waits for the cores blocks the page the cores wait for | Pages have a channel of their own |
 
@@ -159,7 +159,7 @@ The link runs once per design and is cached next to it.
   <img alt="The decode overlay's main core sends a 3-word request from its stream port to its memory tile's TileControl, which queues the page's BD on MM2S 5; MM2S 5 streams the page from the memory tile's page store into the core's TileControl, which writes the slot, the state words and the wake lock; the host loads the store in the dispatch's prologue when it is stale" src="images/paging-memtile.svg">
 </picture>
 
-sd15 carries its pages in the B streams: its memory tiles have neither a free channel nor room for a store, and the
+The vision overlay carries its pages in the B streams: its memory tiles have neither a free channel nor room for a store, and the
 host knows each row's role. The decode overlays are the other way round: the cores decide what they need (a weight
 tile's format is in the metadata they read), and their memory tiles have free channels and room. Here, the core asks
 for its page. Before a tile of a paged format whose page is not loaded, it sends three words through its stream port:
@@ -182,16 +182,16 @@ one format's tiles would run on the helper core alone.
   <img alt="Schematic of part of a transformer block on rows 2-5: with host role switches the norms run on rows 4 and 5 only, cross-attention on rows 2 and 3 only, and each switch drains the array; with pages every row runs every operation, a short page load before each change of role" src="images/paging-timeline.svg">
 </picture>
 
-Without pages, sd15's code must be split between rows: rows 2 and 3 hold attention and rows 4 and 5 the norms. A
+Without pages, the vision overlay's code must be split between rows: rows 2 and 3 hold attention and rows 4 and 5 the norms. A
 norm then runs on half the array, and self-attention needs rows 4 and 5 switched by the host and switched back. With
 pages, every row runs every operation, and a row loads a role's page whenever its next operation needs another role.
 
 | | host role switches / without pages | pages |
 |---|---|---|
-| sd15 UNet step (512x512) | 108.3 ms | 104.4 ms: 868 page loads, 1.65 ms of it |
+| SD 1.5 UNet step (512x512) | 108.3 ms | 104.4 ms: 868 page loads, 1.65 ms of it |
 | Llama 3.2 3B Q3_K_M decode step | 32.4 ms | 32.15 ms; the main core's free program memory 240 B to 2.4 KB |
 
-Pages pay only where code does not fit. Each load costs time on the critical path, about 1.9 µs per page in sd15's
+Pages pay only where code does not fit. Each load costs time on the critical path, about 1.9 µs per page in the vision overlay's
 UNet. The other models' decode overlays fit their cores without pages.
 
 ## Code map
@@ -199,9 +199,9 @@ UNet. The other models' decode overlays fit their cores without pages.
 | File | What |
 |---|---|
 | `src/artlite/operators/paging.py` | the page linker and its checks, `Pager` (page streams, slots), the pager's C++ (`pg_self`, `pg_request`), the routes (`loop_flow`, `page_flow`, `request_flow`), the memory tile's `Store` |
-| `src/artlite/operators/sd15/` | `core.py` (the roles, the main loop's page branch), `design.py` (the loop routes, MM2S 1's chain, locks 7-9), `seq.py` (pages in the B runs), `runtime.py` (the roles' page images) |
-| `src/artlite/operators/overlay/` | `decode.py` (`paged=`, the page store and prologue), `gemv.py` (the paged formats' entries), `runtime.py` (`OverlayDevice.set_prologue`) |
-| `src/artlite/operators/llama/overlay.py` | `paged_formats`: which formats are pages |
-| `tests/rtc/test_paging.py` | the linker's refusals; every core of the array paging by self-DMA and from its memory tile |
+| `src/artlite/vision/` | `core.py` (the roles, the main loop's page branch), `design.py` (the loop routes, MM2S 1's chain, locks 7-9), `seq.py` (pages in the B runs), `device.py` (the roles' page images) |
+| `src/artlite/decode/` | `design.py` (`paged=`, the page store and prologue), `gemv.py` (the paged formats' entries); `src/artlite/overlay.py` (`OverlayDevice.set_prologue`) |
+| `src/models/llama/overlay.py` | `paged_formats`: which formats are pages |
+| `tests/operators/test_paging.py` | the linker's refusals; every core of the array paging by self-DMA and from its memory tile |
 
 `docs/paging_diagrams.py` draws this page's figures.

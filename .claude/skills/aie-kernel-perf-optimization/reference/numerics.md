@@ -1,9 +1,9 @@
 # Numerics on AIE2P: fast and accurate enough
 
 What the vector unit does natively, how to get fp32-level results from bf16 operations, and the
-accuracy traps met in Artlite's models. The helpers live in `operators/kernel_lib.h`
+accuracy traps met in Artlite's models. The helpers live in `include/kernel_lib.h`
 (namespace `al`: exact building blocks) and `operators/kmath.py` (`km.exp2`, `km.recip`, `km.sigmoid`, ...: generated per
-contract, each variant tested on the NPU bit-exact against its numpy model, `tests/rtc/kmath_sim.py`, which also
+contract, each variant tested on the NPU bit-exact against its numpy model, `tests/operators/kmath_sim.py`, which also
 models the fp32 adder, bf16 rounding and the hi / lo products for precision studies).
 
 ## Contents
@@ -116,7 +116,7 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
   above, and no O rescaling.
 - Not with attention sinks past the first chunk: MiniCPM-V's ViT scores reach 71 log2 units above its first 32 keys'
   maximum (P saturates at 2^63; embeddings' KL 0.0090 -> 0.0074 once raised). Check each later group against m + 16
-  in bf16 and rescale o and l on the rare raise (sd15 `ops.Attention(raise_max=)`, the qwen35 prefill attention).
+  in bf16 and rescale o and l on the rare raise (the vision overlay's `ops.Attention(raise_max=)`, the qwen35 prefill attention).
 - Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
   bf16 rounding can put the largest argument above 0.
 
@@ -127,7 +127,7 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 - Range reduction in bf16: v = bf16(t + 32) rounds t to the grid ([32, 56] is a binade of ULP 1/4), r = (32 - v) + t
   exactly ((32 - v) first, or tiny t lose their bits), the table offset is vfloor(64 v).
 - Max 0.59 ULP, 99.84% correctly rounded, 3287 cycles per 4096 elements on the NPU; the vtanh / vexp2 form below:
-  6.6 ULP (at x = -2.2), 2682 cycles. Its emulation in numpy is bit-exact (`emulate` in `tests/rtc/elementwise.py`).
+  6.6 ULP (at x = -2.2), 2682 cycles. Its emulation in numpy is bit-exact (`emulate` in `tests/operators/elementwise.py`).
 - What set the II (~550 variants): register pressure, not slots. In one loop the
   constant vectors (1, 24, the abs mask, 0, the lanes' table pointers) took 5 of the 12 x registers, and the
   post-pipeliner's allocation failed (II 23-30 at ResMII 12-15; constants parked in lf / bm registers and moved back
@@ -171,10 +171,10 @@ The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) f
 segments of 1/8 over [0, 8]: within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
 faster than a quadratic per segment follows, so `floor` sets an absolute error target there), ~2.2 KB of table, as
 a worker `Buffer` argument (`km.act(table_arg=True)`: SKILL.md section 2). `walk=(2, 128)` reads a GEMM epilogue's
-gate halves of a gate/up C tile in place, `walk=(1, 64)` the PLE's slots; sd15 feeds a GELU table on SiLU's grid 2 |x|
+gate halves of a gate/up C tile in place, `walk=(1, 64)` the PLE's slots; the vision overlay feeds a GELU table on SiLU's grid 2 |x|
 (`scale=2`, `clamp`). The clamp pass is a noinline function of its own; `inline=True` puts it into the caller, which
-only the PLE takes (its call cost 7 cycles; inlined, the GEMM epilogue and sd15's row loops spill more). The decode
-overlay's GELU (`overlay/kernels.py`) is `km.act(km.GELU)`,
+only the PLE takes (its call cost 7 cycles; inlined, the GEMM epilogue and the vision overlay's row loops spill more). The decode
+overlay's GELU (`decode/kernels.py`) is `km.act(km.GELU)`,
 32 values at a time: 2.4x faster than the tanh form through `vtanh` (a bf16 fit below |w| = 1.25, e^(2w) (1 + |tanh w|)
 for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 
@@ -198,7 +198,7 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 - **Idempotence**: conversion is not idempotent. A -128 mantissa keeps its exponent; converting
   the value again raises it. Host models insert the kernel's blocks; they do not re-round values.
 - **Exact integers**: integers in [-128, 127] are exact with exponent byte 133 (a scale of 1), which `bfp16.blocks`
-  does not pick for a block holding -128 (`sd15.layout.int_panels`). MiniCPM-V's encoder takes the 8-bit pixels so,
+  does not pick for a block holding -128 (`artlite.vision.layout.int_panels`). MiniCPM-V's encoder takes the 8-bit pixels so,
   as p - 128, with the normalization folded into the patch embedding's weights and its offset on a constant input in
   a block of its own: no rounding of the input, and cheaper host packing than float panels.
 - **Host packing**: round to nearest even when packing on the host (`bfp16.blocks`), not truncate
@@ -226,7 +226,7 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
   last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046). In a DMA-bound
   attention the second MMUL per record costs nothing measurable; give the lo products their own accumulator chain
   when one chain would serialize (QB = 1).
-- **hi + lo weights** where a GEMM is sensitive and cheap: `sd15.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
+- **hi + lo weights** where a GEMM is sensitive and cheap: `artlite.vision.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
   the lo ones on the A panels walked again). MiniCPM-V's encoder takes them at its patch embedding and its final
   merger (a quarter of its weights' error between them); any other layer's weights held 1-3% each and did not pay.
 - **A GEMM's bf16 C tile between k-tiles** (`gemm/mac.py`: C stored as bf16 after every 64 k) rounds the running sum

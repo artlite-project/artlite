@@ -37,9 +37,9 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from artlite.formats import has_tile_format
 from artlite.gguf_model import GGUFFile
 from artlite.operators.base import CACHE_DIR
-from artlite.operators.formats import has_tile_format
 
 from .. import ARCHITECTURES, model_class
 from .main import ENV, MODEL, ROUTER, env_name

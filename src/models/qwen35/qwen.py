@@ -2,7 +2,7 @@
 same with a mixture of experts as the FFN) on the NPU.
 
 A dispatch runs up to 4 tokens through every layer and the LM head on one stream of the weights
-(``artlite.operators.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers (the MMUL
+(``models.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers (the MMUL
 against exact-integer weight panels), the Gated DeltaNet steps (conv states and fp32 states in DDR) on the GDN cores,
 the full attention and its KV cache on the attention cores. The host reads the tokens' embedding rows from the mapped
 file and samples from the logits.
@@ -10,16 +10,16 @@ file and samples from the logits.
 A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows with M-RoPE positions: MiniCPM-V's
 images): each cache slot's position (``QwenOverlay.rope``) comes from it, the text after it from its ``next`` on.
 
-A prompt runs in chunks of up to 2048 tokens through the prefill (``artlite.operators.qwen35.prefill.QwenPrefill``:
+A prompt runs in chunks of up to 2048 tokens through the prefill (``models.qwen35.prefill.QwenPrefill``:
 layer-major, control code assembled per chunk from one library ELF; the GEMMs read the same weight image, the chunk's K /
 V, GDN states and conv states land in the decode's buffers), each chunk in pieces of a few layers (dispatches of one HW
 context); its last token's logits come from the LM head alone (``QwenOverlay.logits_of``). Tokens where a chunk cannot
 start (a position inside a 32-position cache group, after a generated reply), and a prompt's last 4 or fewer, run as
 decode steps of up to 4 tokens. An MoE model's chunk routes its tokens on the host between the router and the experts
-(``artlite.operators.moe.prefill``).
+(``artlite.moe.prefill``).
 
 Multi-token prediction (a qwen35moe model with its MTP drafter, ``model_config.qwen_mtp_of``:
-``artlite.operators.qwen35.draft.QwenDraft``, ``NpuQwen.generate``): the sampled token's step takes up to three draft
+``models.qwen35.draft.QwenDraft``, ``NpuQwen.generate``): the sampled token's step takes up to three draft
 tokens along - the drafter's guesses of what follows, a dispatch of the same design each (2.4-3.4 ms on the
 35B-A3B), while their chain's probability stays at least ``P_MIN`` - and a draft is kept where the token sampled from
 the model's logits at its position is that draft. The step leaves the GDN states uncommitted: the next one replays
@@ -40,20 +40,20 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
-from artlite.operators.overlay.decode import SLOTS
-from artlite.operators.overlay.runtime import WeightBuffer
-from artlite.operators.qwen35.draft import QwenDraft, draft_formats
-from artlite.operators.qwen35.image import QwenImage
-from artlite.operators.qwen35.overlay import QwenOverlay
-from artlite.operators.qwen35.prefill import QwenPrefill
+from artlite.overlay import WeightBuffer
 
 from ..common import Model, OverlayModel, Penalties, Sampling, topk_bf16
-from .minicpmv import image_prompt
-from .sequence import Sequence
+from ..minicpmv.host import image_prompt
+from ..minicpmv.npu import PROJECTORS, NpuVision
+from ..sequence import Sequence
+from .draft import QwenDraft, draft_formats
+from .image import QwenImage
+from .overlay import QwenOverlay
+from .prefill import QwenPrefill
 from .tokenizer import QwenTokenizer, chat_prompt
-from .vision import PROJECTORS, NpuVision
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
 # set): the language model of openbmb's files, marked by the M-RoPE order of its vision
@@ -352,7 +352,8 @@ class Qwen(Model):
     """A qwen35 model from a GGUF file (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7's language model): the architecture,
     tokenizer and chat template from its metadata. Opening the file allocates the weight image's buffer and packs it in
     a thread (``WeightBuffer``) while the tokenizer and the designs load. ``mmproj``: MiniCPM-V's vision encoder file
-    (``vision.NpuVision``: images in prompts; ``max_slices``: an image's slices at most, default the file's)."""
+    (``models.minicpmv.npu.NpuVision``: images in prompts; ``max_slices``: an image's slices at most, default the
+    file's)."""
 
     name = "Qwen3.5"
     thinks = True

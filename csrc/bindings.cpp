@@ -656,7 +656,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
               "release: bool = False, file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None) -> None"),
       "Pack weight tiles (every tile format: bit-identical to the formats' pack_tile) into out. A block: "
       "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb, G) as "
-      "overlay.image.TileImage.pack builds it (format: a tile format, BFP16 as \"BFP16/BF16\", \"BFP16/F16\" or "
+      "decode.image.TileImage.pack builds it (format: a tile format, BFP16 as \"BFP16/BF16\", \"BFP16/F16\" or "
       "\"BFP16/F32\" by its tensors' type; tensors: (rows, row bytes) uint8 arrays of GGUF blocks, stacked; rows: "
       "(columns, n) int64 stacked row indices, -1 a zero row (BFP16/F32: 2 i + p is plane p of row i); row_sb: a "
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
@@ -664,7 +664,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       "MADV_DONTNEED each tensor's pages when done (file mappings only); file: (path, its whole mapping) of the "
       "tensors: read into the page cache ahead of the workers.");
 
-  // --- The MoE prefill's host step (operators/moe: plan, ctl) ---
+  // --- The MoE prefill's host step (artlite/moe: plan, ctl) ---
   m.def(
       "moe_route",
       [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> logits, int64_t n, int64_t row,

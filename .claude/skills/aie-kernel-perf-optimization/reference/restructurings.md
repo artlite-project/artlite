@@ -110,7 +110,7 @@ From a quantized GEMV on bf16 MACs; the zips, shifts and slot budget apply to ev
 - **A streaming GEMV competes with its own DMA**: the S2MM fills core L1 at ~4 B / cycle, and the kernel's L1 traffic
   (scratch round trips, stack reloads) in the regions it writes stalls it (memory-module event 39,
   `DMA_S2MM_0_MEMORY_BACKPRESSURE`). Measure a harness with the real design's placement (`MmvOperator` in
-  `tests/rtc/mmv.py`: two cores as the decode places them).
+  `tests/decode/mmv.py`: two cores as the decode places them).
 
 ## R6 Per-lane scales of small sub-blocks (planar dequant, `formats/k23.py`)
 
@@ -215,7 +215,7 @@ about as much as a step of one (qwen35 27B: 297 ms for one token, 310 for four).
   hi): ~14 bits below each block's maximum), against exact-integer weight panels (R4). Round the partial sums once per
   quantization sub-block, with the codes centered (q - 8, q - 32) so the sums stay small, then scale them (the scale
   exact in fp32, applied as bf16 hi + lo). Zero points and mins multiply the tokens' sums of x per sub-block (row
-  sums, R4). `overlay/gemv.py`.
+  sums, R4). `decode/gemv.py`.
 - **The tokens' inputs interleaved per 8-element block** ([k block][token][8] bf16): one 64-element load is the
   tokens' rows of a panel, and the producers drain straight into that layout.
 - **Recurrent state (SSM, delta-rule layers) without per-token snapshots**: read the state from buffer A, run the S

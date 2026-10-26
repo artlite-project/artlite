@@ -9,9 +9,9 @@ build directory it produced:
   them), its clang flags;
 - a fused ELF (``FusedOperator``, ``Library``): its operators' keys, the runlist (which operator object, buffer
   names) and what else its render depends on (``render_args``);
-- a hash of the artlite package's sources (and of the files defining the classes involved, for classes defined
-  outside it, with the user-code files their modules import from), the toolchain's versions and modification times
-  (as the builds' keys).
+- a hash of the artlite and models packages' sources (and of the files defining the classes involved, for classes
+  defined outside them, with the user-code files their modules import from), the toolchain's versions and
+  modification times (as the builds' keys).
 
 A hit attaches the build directory (when its artifacts are there: a fused ELF's ``artifacts``).
 Rendered every time (no key): an argument the key cannot describe (a function, an object without plain data, an
@@ -45,7 +45,9 @@ from .base import AIECC, CACHE_DIR, CLANGPP, ArtcOperator
 if TYPE_CHECKING:
     from .fused.elf import FusedElf
 
-_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (the artlite package)
+_TOP = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # (the packages' directory)
+_PKGS = tuple(os.path.join(_TOP, p) for p in ("artlite", "models"))  # (the packages whose sources a render reads)
+_IN_PKGS = tuple(p + os.sep for p in _PKGS)
 _MAX_ARRAY = 16 << 20
 _ENV = ("ARTLITE_IGNORE_CACHE", "ARTLITE_MEASURE_II", "ARTLITE_GENERATE_ASM")
 
@@ -56,14 +58,14 @@ class _NoKey(Exception):
 
 @functools.cache
 def _sources() -> str:
-    """Hash of the artlite package's sources (Python, kernel headers)."""
+    """Hash of the artlite and models packages' sources (Python, kernel headers)."""
     h = hashlib.sha256()
-    for root, dirs, files in os.walk(_PKG):
+    for root, dirs, files in (w for p in _PKGS for w in os.walk(p)):
         dirs[:] = sorted(d for d in dirs if d != "__pycache__")
         for name in sorted(files):
             if not name.endswith((".so", ".pyc")):
                 path = os.path.join(root, name)
-                h.update(os.path.relpath(path, _PKG).encode())
+                h.update(os.path.relpath(path, _TOP).encode())
                 with open(path, "rb") as f:
                     h.update(hashlib.sha256(f.read()).digest())
     return h.hexdigest()
@@ -76,26 +78,26 @@ def _file_hash(path: str) -> str:
 
 
 def _user_file(x: Any) -> str | None:
-    """The source file of a module, class or function outside the artlite package and the installed packages (user
-    code: experiments, scripts), else None."""
+    """The source file of a module, class or function outside the artlite and models packages and the installed
+    packages (user code: experiments, scripts), else None."""
     try:
         path = os.path.abspath(inspect.getfile(x))
     except (TypeError, OSError):
         return None
-    if path.startswith(_PKG + os.sep) or not path.endswith(".py") or any(
+    if path.startswith(_IN_PKGS) or not path.endswith(".py") or any(
             path.startswith(os.path.abspath(p) + os.sep) for p in (sys.prefix, sys.base_prefix)):
         return None
     return path
 
 
 def _class(cls: type, files: set[str]) -> str:
-    """A class's name; the file defining it joins the key when it is outside the artlite package, with the user-code
+    """A class's name; the file defining it joins the key when it is outside those packages, with the user-code
     files its module imports from (a design rendered by helpers of a sibling module)."""
     try:
         path = os.path.abspath(inspect.getfile(cls))
     except (TypeError, OSError) as e:
         raise _NoKey(f"{cls.__qualname__}: no source file") from e
-    if not path.startswith(_PKG + os.sep):
+    if not path.startswith(_IN_PKGS):
         files.add(path)
         module = sys.modules.get(cls.__module__)
         for v in vars(module).values() if module is not None else ():

@@ -34,9 +34,10 @@ same name (ggml-org publishes its drafters apart from the models); of several, Q
 
 ## How the NPU path works
 
-Paths below are under `src/artlite/operators/`. One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch
-through every layer and the LM head; the host builds the dispatch's transaction (`qwen35/overlay.py`), and the cores
-read what to do from their input streams. Per column:
+Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
+share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head; the host
+builds the dispatch's transaction (`qwen35/overlay.py`), and the cores read what to do from their input streams. Per
+column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);
 - the GDN core runs the Gated DeltaNet step: conv, gates, the delta rule on the fp32 state that it
@@ -64,7 +65,7 @@ Each layer's FFN is 256 experts (8 per token) and a shared expert. A decode step
 on every column, then each column's cores pick every token's top 8 themselves and point the column's weight stream at
 the experts they take (control packets the column writes and its shim reads back); each column computes whole experts
 or halves of them, and the next phase adds the columns' results into the residual stream (`moe/route.py`,
-`overlay/decode.py`). A step streams 1.96 GB of the image at one token (8 of the 256 experts in every layer; Occamy's
+`decode/design.py`). A step streams 1.96 GB of the image at one token (8 of the 256 experts in every layer; Occamy's
 file 1.79 GB).
 A prompt's chunk routes its tokens on the host: each MoE layer's dispatch ends after the router, the host reads the
 logits back, picks every token's top 8 (AVX-512) and writes each column's work list (chunks of up to 192 pairs of one
@@ -110,12 +111,12 @@ overview of about 448 x 448 pixels and, for a larger image, a grid of up to `--m
 the model card uses 36), each entry 64 tokens or a few more (the 4x file: 256). Its tokens take the official M-RoPE
 positions (transformers' `get_rope_index`; llama.cpp numbers the markers like text, its PR #30510).
 
-The encoder (`vision/minicpmv.py`) runs on Stable Diffusion's static design (`sd15/`, in a hardware context of its own):
-one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final merger) on two entries, or on
-one larger than 64 tokens alone, in about 60 ms: about 30 ms per entry (llama.cpp on the CPU: ~0.2 s per entry). The 4x
-file has no ViT merger, so its 27 layers all run on 1024 tokens per entry: about 65 ms per entry. Its weights are
-converted to bfp16 at the first load (the most sensitive ones, the patch embedding's and the final merger's, as bfp16
-hi + lo pairs; the pixels enter as their exact 8-bit values) and cached with the dispatches, as Stable Diffusion's
-(~0.7 GB, the cache directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next turns do not run
-it again.
+The encoder (`minicpmv/encoder.py`) runs on the vision overlay, Stable Diffusion's static design (`vision/`, in a
+hardware context of its own): one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final
+merger) on two entries, or on one larger than 64 tokens alone, in about 60 ms: about 30 ms per entry (llama.cpp on the
+CPU: ~0.2 s per entry). The 4x file has no ViT merger, so its 27 layers all run on 1024 tokens per entry: about 65 ms
+per entry. Its weights are converted to bfp16 at the first load (the most sensitive ones, the patch embedding's and the
+final merger's, as bfp16 hi + lo pairs; the pixels enter as their exact 8-bit values) and cached with the dispatches, as
+Stable Diffusion's (~0.7 GB, the cache directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next
+turns do not run it again.
 

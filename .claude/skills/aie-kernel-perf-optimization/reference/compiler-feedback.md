@@ -19,7 +19,7 @@
   `!Passed pipeliner/schedule` remark (after register allocation) describes the code that runs; a loop of several
   blocks is never pipelined.
 - **If measure_ii disagrees with the assembly, fix measure_ii** (`src/artlite/measure_ii.py`, tests in
-  `tests/rtc/test_measure_ii.py`). It is the tool everyone reads.
+  `tests/test_measure_ii.py`). It is the tool everyone reads.
 
 ## Remark flags (clang)
 

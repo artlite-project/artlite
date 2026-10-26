@@ -1,4 +1,4 @@
-// The tile packers of ``artlite.operators.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, bf16.py:
+// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).

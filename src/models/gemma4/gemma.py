@@ -1,16 +1,16 @@
 """Gemma 4 (E4B) inference on the NPU from a GGUF file (Q4_0 layers, Q8_0 embedding).
 
 A decode dispatch runs up to four consecutive tokens on one stream of the weights
-(``artlite.operators.gemma4.overlay.GemmaOverlay``, the decode overlay): every layer's projections and the LM head on
+(``models.gemma4.overlay.GemmaOverlay``, the decode overlay): every layer's projections and the LM head on
 the main and helper cores, the attention and the KV cache on the attention cores. A prompt runs in chunks of up to
-2048 tokens through the prefill (``artlite.operators.gemma4.prefill.GemmaPrefill``: GEMMs on the same weight image,
+2048 tokens through the prefill (``models.gemma4.prefill.GemmaPrefill``: GEMMs on the same weight image,
 its caches the decode's), only the layers that own a KV cache (24 of E4B's 42: the others read the caches of layers
 22 / 23); its last token runs as a decode step (the logits). The host computes what enters them - the tokens'
 embedding rows and per-layer inputs (``per_layer_model_proj`` of the embedding plus the per-layer embedding row; a
 chunk's on a worker thread while the previous chunk runs) - and samples from the logits.
 
 Multi-token prediction (``NpuGemma.generate``, with the model's ``gemma4-assistant`` drafter, ``mtp-<model file>`` next
-to it: ``artlite.operators.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
+to it: ``models.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
 sampled token takes three draft tokens along - the drafter's guesses of what follows, a dispatch of the same design each
 (~1 ms) - and every draft that the model's own choice at its position confirms is a token without a dispatch of its
 own. The text is the model's: a draft is only kept where the token sampled from the model's logits is that draft.
@@ -30,15 +30,15 @@ from collections.abc import Iterator, Sequence
 import torch
 
 from artlite import parallel_compile
+from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
-from artlite.operators.gemma4.draft import GemmaDraft, argmax_bf16, output_norm
-from artlite.operators.gemma4.overlay import GemmaOverlay
-from artlite.operators.gemma4.prefill import GemmaPrefill
-from artlite.operators.overlay.decode import SLOTS as BATCH  # tokens per dispatch
 
 from ..common import Model, OverlayModel, Penalties, Sampling
+from .draft import GemmaDraft, argmax_bf16, output_norm
 from .host import GemmaHost, softcap
+from .overlay import GemmaOverlay
+from .prefill import GemmaPrefill
 from .tokenizer import GemmaTokenizer, chat_prompt
 
 

@@ -345,8 +345,8 @@ class NpuModel:
 
 
 class OverlayModel(NpuModel):
-    """A model on its decode overlay (``overlay``: an ``artlite.operators.overlay.model.ModelOverlay``) with a chunk
-    prefill (``prefill``: an ``artlite.operators.prefill.chunks.ChunkPrefill``, or None: prompts as decode steps).
+    """A model on its decode overlay (``overlay``: an ``artlite.decode.model.ModelOverlay``) with a chunk
+    prefill (``prefill``: an ``artlite.prefill.chunks.ChunkPrefill``, or None: prompts as decode steps).
 
     ``steps`` runs up to ``overlay.SLOTS`` tokens per dispatch; ``prompt`` runs a prompt's tokens in prefill chunks
     where one can start (a whole cache group: the prefill's ``plan``), as decode steps before them and after, each

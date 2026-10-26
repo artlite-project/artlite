@@ -7,7 +7,7 @@ description: Port an IRON operator (XRT / xclbin, several files - op.py, design.
 
 | | IRON | Artlite |
 |---|---|---|
-| files | `iron/operators/<name>/` in IRON: `op.py`, `design.py`, `reference.py`, `test.py` | one file `src/artlite/operators/<purpose>/<name>.py` + `tests/rtc/test_<name>.py` |
+| files | `iron/operators/<name>/` in IRON: `op.py`, `design.py`, `reference.py`, `test.py` | one file in the package of what it serves (`src/artlite/<subsystem>/` or `src/models/<model>/`) + `tests/<package>/test_<module>.py` |
 | base classes | `MLIROperator`, `ChanneledUnaryOperator`, `BinaryElementwiseOperator` | `ArtcOperator` |
 | kernel | a C++ file in `aie_kernels/{aie2,aie2p,generic}/` | `get_kernel_src()`: a Jinja template rendered per shape (one `str`) |
 | design | `design.py` via `PythonGeneratedMLIRArtifact` | `get_mlir_artifact()`, the same `aie.iron` API |
@@ -50,8 +50,8 @@ class MyOperator(ArtcOperator):
 ```
 
 A standalone 1-D elementwise operator is a test harness, not an Artlite operator: subclass `StreamOperator` in
-`tests/rtc/elementwise.py` (validation, arg spec and the whole design; the subclass supplies `kernel_name` and
-`get_kernel_src()`: `SiluOperator`, `GeluOperator`; two inputs: `AddOperator` in `tests/rtc/test_fused.py`).
+`tests/operators/elementwise.py` (validation, arg spec and the whole design; the subclass supplies `kernel_name` and
+`get_kernel_src()`: `SiluOperator`, `GeluOperator`; two inputs: `AddOperator` in `tests/operators/test_fused.py`).
 
 ## 2. The kernel
 
@@ -123,15 +123,14 @@ def test_my_op(size: int, tile_size: int):
 - Parametrize over the sizes and tile sizes IRON tests (edge cases included); `torch.equal` for bit-identical
   results, `verify_close` for floating point. Keep the body before `compile()` cheap: the planning pass runs it up to
   the first use of the NPU.
-- Export the operator from `src/artlite/operators/__init__.py` (import and `__all__`).
 
 ## Patterns
 
 - **Elementwise** (GELU, SiLU, add, mul): fuse it into the kernel that produces or consumes the data (GemmQ / GemmQd's
   gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kmath.py`;
-  accuracy over the bf16 domain through a `StreamOperator` harness (`tests/rtc/elementwise.py`).
+  accuracy over the bf16 domain through a `StreamOperator` harness (`tests/operators/elementwise.py`).
 - **GEMV / GEMM** on the GGUF tile formats (`formats/`, one slot per format): the decode overlay's GEMV kernels
-  (`overlay/gemv.py`, harness `MmvOperator` in `tests/rtc/mmv.py`), the prefill GEMMs `GemmQOperator` /
+  (`decode/gemv.py`, harness `MmvOperator` in `tests/decode/mmv.py`), the prefill GEMMs `GemmQOperator` /
   `GemmQdOperator` (MAC loop `gemm/mac.py`).
 - **Several operators in one dispatch**: `FusedOperator` (a runlist in one ELF) or `fused.Library` (programs assembled
   on the host), `operators/fused/`.

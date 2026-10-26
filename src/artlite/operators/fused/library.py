@@ -17,8 +17,8 @@ import numpy as np
 
 from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
+from ...overlay import SPIN_MARGIN_US, irq_cpu
 from ..base import ArtcOperator
-from ..overlay.runtime import SPIN_MARGIN_US, irq_cpu
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
 from .program import PIECE_BYTES, Assembler, Item
