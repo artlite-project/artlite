@@ -83,15 +83,17 @@ per second):
 | write: 4 / 16 / 64 / 256 pages per channel | 215 / 220 / 220 / 220 | 215 / 220 / 152 / 137 |
 | 128 B rows, a page each: read / write | 437 / 436 | 178 / 146 |
 | 512 B, 1 KB, 2 KB rows, a page each | as many bytes as a stream | the same |
-| 128 B rows 512 B apart (8 rows a page): read / write | 437 / 436 | 439 / 435 |
+| 128 B rows 512 B apart (8 rows a page, 32 pages per channel visited again): read / write | 437 / 436 | 439 / 435 |
 
 - **One limit for the whole NPU**, not per channel: one or two channels never reach it; from four on, all channels
   together get ~140-170 million page visits a second on Strix Halo, about 50 million on the Windows laptops.
-- **A translation cache.** While all channels cycle through no more than ~1000 pages (reads) or ~250 (writes), page
-  visits cost nothing.
+- **A translation cache**, one for all channels: while they cycle through no more than ~500-1000 pages together,
+  page visits cost nothing.
 - **Page-table locality.** Rows 64 KB apart (each row's page-table entry on another 64-byte line of the page table)
   cost more than rows 4 KB apart: 95 against 146 million 128-byte write rows a second.
-- **Rows that share a page are free**, however short.
+- **Rows that share a page are free** once its translation is cached. Written to a page whose translation is not,
+  back-to-back rows each pay one: 8 rows of 128 B on each of 512 pages per channel read at 406 million rows a second
+  and write at 251; on 8 pages per channel visited again, 433 / 434 (`artlite-probe --pages`).
 
 A 1024-token prefill chunk of Llama 3.2 1B Q4_K_M visits 7.5 million pages:
 
@@ -149,9 +151,9 @@ better (writing a short-K GEMM's output in long rows is already faster there: ~2
 
 ### Plan
 
-1. **Measure Windows' side**: `artlite-probe` rows with small and large page working sets (the table above, on
-   Windows), to see whether its translation cache is as large as Strix Halo's. If it is, bricks are enough; if not,
-   only long contiguous rows are.
+1. **Measure Windows' side**: `artlite-probe --pages` ([probe](probe.md#pages---pages)) on Windows, to see whether
+   its translation cache is as large as Strix Halo's and what rows sharing a page cost there. If it is, bricks are
+   enough; if not, only long contiguous rows are.
 2. **Design**: G, F and Tb per buffer, and for every prefill operator (GEMMs, norms, attention preps and attentions,
    the recurrent layers' operators, the mixture-of-experts gathers) its DMA patterns in the new layout, with BD counts
    and page visits per chunk.
@@ -164,7 +166,8 @@ on Windows by a report in [issue #5](https://github.com/artlite-project/artlite/
 
 ## Measuring on your machine
 
-- `artlite-probe` prints the page size of Artlite's buffers and the rows above. On Linux, `host buffers: 4 KB pages`
-  means transparent huge pages are off (see [Installation](install.md)).
+- `artlite-probe` prints the page size of Artlite's buffers and the rows above; `artlite-probe --pages`, what the
+  translations cost. On Linux, `host buffers: 4 KB pages` means transparent huge pages are off (see
+  [Installation](install.md)).
 - On Linux, `echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled` gives Artlite 4 KB pages (restore
   `madvise` afterwards): a stand-in for Windows, whose page visits cost about twice Strix Halo's.

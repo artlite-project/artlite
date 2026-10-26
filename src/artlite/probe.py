@@ -223,32 +223,53 @@ class DmaProbeOperator(ArtcOperator):
 
 
 class Rows(NamedTuple):
-    """A channel's transfer as rows of ``nbytes`` at a stride of ``stride`` bytes, in groups of ``n`` rows (each group
-    one row past the previous one's start)."""
+    """A channel's transfer as rows of ``nbytes`` at a stride of ``stride`` bytes, in groups of ``n`` rows, each group
+    ``step`` bytes past the previous one's start (0: one row on)."""
 
     nbytes: int
     n: int
     stride: int
+    step: int = 0
+
+    def dims(self) -> tuple[int, int, int, int]:
+        """The shim BD's dimensions (``txn.Txn.shim_bd``): dim 0 a row's words, dim 1 n rows at the stride, dim 2
+        the groups."""
+        assert self.nbytes % 4 == 0 and self.stride % 4 == 0 and self.step % 4 == 0, self
+        return self.nbytes // 4, self.n, self.stride // 4, (self.step or self.nbytes) // 4
+
+    @property
+    def run(self) -> int:
+        """Bytes of a row as the DMA meets it: a group's rows join into one where the stride is the row."""
+        return self.nbytes * self.n if self.stride == self.nbytes else self.nbytes
+
+    def span(self, nbytes: int) -> int:
+        """Bytes from the first row's start to the last row's end of a transfer of ``nbytes``."""
+        groups = nbytes // (self.n * self.nbytes)
+        return (self.n - 1) * self.stride + (groups - 1) * (self.step or self.nbytes) + self.nbytes
 
 
 def dma_transaction(*, reads: list[tuple[int, int]], writes: list[tuple[int, int]], src: int, dst: int,
-                    nbytes: int, repeat: int, rows: Rows | None = None) -> tuple[np.ndarray, int]:
+                    nbytes: int, repeat: int, rows: Rows | None = None, region: int = 0, skew: int = 0,
+                    iteration: tuple[int, int] | None = None) -> tuple[np.ndarray, int]:
     """A transaction in which each (column, channel) of ``reads`` (MM2S) and ``writes`` (S2MM) moves ``nbytes`` from
-    / to its own ``nbytes`` region of the buffers at device addresses ``src`` / ``dst``, ``repeat`` times (``rows``:
-    as rows at a stride; the region then spans n x stride). Returns the words and the bytes moved."""
+    / to its own region of the buffers at device addresses ``src`` / ``dst``, ``repeat`` times (over 256: up to
+    ``txn.QUEUE_DEPTH`` queued tasks). The regions are ``region`` bytes apart (0: ``nbytes``), the i-th channel's
+    (i * ``skew``) mod 4 KB further: at another offset in its pages, on other DRAM channels. ``rows``: as rows at a
+    stride (the region then spans ``rows.span(nbytes)``); ``iteration`` = (bytes, count): repeat j starts (j mod
+    count) * bytes further. Returns the words and the bytes moved."""
     t = txn.Txn()
     total = 0
+    pushes = [min(256, repeat - r) for r in range(0, repeat, 256)]
+    assert 0 < len(pushes) <= txn.QUEUE_DEPTH, repeat
     tasks = [(c, k, txn.MM2S, src) for c, k in reads] + [(c, k, txn.S2MM, dst) for c, k in writes]
     for i, (c, k, d, base) in enumerate(tasks):
-        dims = None
-        if rows is not None:  # (dim 0: a row's words, dim 1: n rows at the stride, dim 2: the next group a row on)
-            w = rows.nbytes // 4
-            assert rows.nbytes % 4 == 0 and rows.stride % 4 == 0 and nbytes // (rows.n * rows.nbytes) * w <= rows.stride
-            dims = (w, rows.n, rows.stride // 4, w)
         t.token_controller(c, d, k)
         bd = 2 * k + (0 if d == txn.MM2S else 8)
-        t.shim_bd(c, bd, address=base + i * nbytes, nbytes=nbytes, dims=dims)
-        t.shim_push(c, d, k, bd, token=True, repeat=repeat)
+        t.shim_bd(c, bd, address=base + i * (region or nbytes) + i * skew % 4096, nbytes=nbytes,
+                  dims=None if rows is None else rows.dims(),
+                  iteration=None if iteration is None else (iteration[0] // 4, iteration[1]))
+        for j, r in enumerate(pushes):  # (the token on the last: a channel's tasks finish in order)
+            t.shim_push(c, d, k, bd, token=j == len(pushes) - 1, repeat=r)
         total += nbytes * repeat
     for c, k, d, _ in tasks:
         t.sync(col=c, direction=d, channel=k)

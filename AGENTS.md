@@ -66,6 +66,7 @@ artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds
 artlite-server -m <org>/<repo>/<file>.gguf                          # OpenAI API + web chat on :8080, as llama-server (NPU)
 artlite-server                                                      # router mode: the models dir's models, one process each
 artlite-probe                                                       # the NPU's clock, dispatch and DRAM rates vs Strix Halo's
+artlite-probe --pages                                               # what the NPU's address translations cost DMA rows
 pytest tests/<package>/test_<module>.py -k <config-id>              # needs the NPU
 pytest tests -m smoke                                               # after a change: ~1 min with cached designs (NPU)
 ARTLITE_BACKEND=xrt pytest tests -m smoke                           # the same on the XRT backend (Windows' code path)

@@ -67,7 +67,29 @@ trip through Windows and XRT is 94 us (58 in the `turbo` power mode).
 The first lines name the machine, the kernel, which `amdxdna` runs (`amdxdna_accel_driver` 0.6 / 0.8 / 0.10 are Linux
 7.0 / 7.1 / 7.2's own), the NPU firmware, the platform profile and the power adapter, the NPU's power mode, the CPU
 that takes the NPU's interrupts, and whether the device heap can grow (Linux before 7.2: one 64 MB heap per process).
+On Windows: the NPU driver, firmware and power mode as `xrt-smi` tells them.
+
+## Pages: `--pages`
+
+`artlite-probe --pages` prints a second table instead (a minute and a half): what the NPU's address translation costs
+rows on pages of their own. On Windows it runs in the `performance` power mode (from `default`, which runs a Krackan
+Point's array at 1.4 GHz; `default` again after). Millions of rows a second, read / write; unless a row says
+otherwise, rows of 256 B, each on a page of its own, a channel's pages 4 KB apart (the rows 4 KB + 256 B, so that they
+spread over the DRAM channels) and visited in turn. The reference columns are Strix Halo with 2 MB pages (no
+translations: the DMA's own rates for each pattern) and with 4 KB pages (transparent huge pages `never`).
+
+| rows | what they tell | Strix Halo, 4 KB pages |
+|---|---|---|
+| n pages per channel, 16 channels | how many pages the translation cache holds: past them, every row pays a translation | up to 32 per channel free, from 64 on 160 / 130 |
+| n pages per channel, 4 channels | per channel or shared: 4 channels with 4x the pages each | shared: 64 per channel free, 256 not; 512-1024 pages in all |
+| 4096 pages per channel, 1, 2, 4, 8 channels | the rate of translations, one channel to all | 47-55 for one channel, 120-160 for 4-16 together |
+| 256 pages per channel 16 KB, 64 KB, 1 MB apart | page-table locality: 8 neighbouring pages share a 64-byte line of the page table | 119 / 117 at 16 KB, 113 / 87 at 1 MB |
+| 128 B rows, k a page | rows sharing a page (256 B apart) not visited before: pages next to each other or 64 KB apart; or 8 pages per channel visited again | reads: 163, 370, 406 at 1, 2, 8 a page; writes: 143, 162, 251 (back-to-back rows on a page whose translation is not back yet each pay one); visited again: 433 / 434 |
+| 4 KB, 16 KB rows | rows of whole pages | as many bytes as a stream |
+| 2 KB rows 9280 B apart | the prefill's reads of the decode image's tiles | as many bytes as a stream |
+| 8 channels read + 8 write | whether reads and writes share the rate | 162 in all |
 
 | option | |
 |---|---|
 | `--seconds S` | seconds of dispatches per measurement (default 1) |
+| `--pages` | the page table instead of the hardware numbers |

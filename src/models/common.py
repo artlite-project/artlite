@@ -216,6 +216,23 @@ def stale_install() -> str | None:
     return "; ".join(s for s in (stale_toolchain(), backend.stale_native()) if s) or None
 
 
+def xrt_smi(*args: str) -> str | None:
+    """Windows: the output of ``xrt-smi`` with ``args`` (the driver's copy, else XRT's); None without one, or when it
+    fails."""
+    smi = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "AMD", "xrt-smi.exe")
+    smi = smi if os.path.exists(smi) else backend.xrt_tool("xrt-smi")
+    try:
+        return subprocess.run([smi, *args], capture_output=True, text=True, timeout=60, check=True).stdout
+    except (OSError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+def windows_power_mode() -> str:
+    """Windows: the NPU's power mode as ``xrt-smi`` tells it (``default``, ``performance``, ...; '' unknown)."""
+    mode = re.search(r"Power Mode\s*:\s*(\w+)", xrt_smi("examine", "-r", "platform") or "")
+    return mode[1].lower() if mode else ""
+
+
 def performance_mode(report: Callable[[str], None]) -> None:
     """Windows: raise the NPU's power mode from ``default`` to ``performance`` (``xrt-smi configure --pmode``, as
     FastFlowLM does at its start), in a thread while the model loads; ``report``: told the change. A mode set by hand
@@ -224,19 +241,9 @@ def performance_mode(report: Callable[[str], None]) -> None:
     if not portable.WINDOWS:
         return
 
-    def run() -> None:
-        smi = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "AMD", "xrt-smi.exe")
-        smi = smi if os.path.exists(smi) else backend.xrt_tool("xrt-smi")
-        try:
-            out = subprocess.run([smi, "examine", "-r", "platform"], capture_output=True, text=True, timeout=60,
-                                 check=True)
-            mode = re.search(r"Power Mode\s*:\s*(\w+)", out.stdout)
-            if mode is None or mode[1].lower() != "default":
-                return
-            subprocess.run([smi, "configure", "--pmode", "performance"], capture_output=True, timeout=60, check=True)
+    def run() -> None:  # (no xrt-smi, or it failed: the mode stays)
+        if windows_power_mode() == "default" and xrt_smi("configure", "--pmode", "performance") is not None:
             report("NPU power mode: default -> performance (xrt-smi)")
-        except (OSError, TypeError, subprocess.SubprocessError):
-            pass  # (no xrt-smi, or it failed: the mode stays)
 
     threading.Thread(target=run, name="power-mode", daemon=True).start()
 
