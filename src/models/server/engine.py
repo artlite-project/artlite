@@ -49,6 +49,7 @@ class Job:
     stop: list[str] = field(default_factory=list)
     reasoning: bool = False  # split the thoughts off (the model's ``reasoning`` markers)
     inside: bool = False  # the prompt ends inside a thought (it opened one)
+    think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
     cache_prompt: bool = True  # continue from the cached prefix
     progress: bool = False  # send prompt_progress events
@@ -113,7 +114,7 @@ class ReasoningSplitter:
     back until what follows decides. A close marker outside a thought is dropped (Gemma may end an answer with one).
     ``inside``: the text starts inside a thought (the prompt opened it); ``ends``: text that ends a thought and begins
     the answer (kept: a Qwen tool call without the close marker); ``once``: a thought only begins the text (Qwen's),
-    markers after it are answer."""
+    markers after it are answer. ``answering``: the answer has begun (a thought ended, or answer text came)."""
 
     def __init__(self, markers: tuple[str, str], *, inside: bool = False, ends: tuple[str, ...] = (),
                  once: bool = False):
@@ -123,6 +124,7 @@ class ReasoningSplitter:
         self._held = ""
         self._lead = True  # (a part begins: its leading white space is dropped)
         self._over = False  # (once: the thought is over, or the text began outside one)
+        self.answering = False
 
     @property
     def kind(self) -> str:
@@ -134,8 +136,9 @@ class ReasoningSplitter:
             self._lead = not text
         if text:
             out.append((self.kind, text))
-            if self.once and not self.inside:
-                self._over = True
+            if not self.inside:
+                self._over = self.once
+                self.answering = True
 
     def _marks(self) -> list[str]:
         if self.inside:
@@ -153,6 +156,7 @@ class ReasoningSplitter:
             i, m = min(hits)
             self._part(out, s[:i].rstrip())
             s = s[i:] if m in self.ends and self.inside else s[i + len(m):]
+            self.answering = self.answering or self.inside
             self.inside = m == self.open
             self._over = self.once and not self.inside
             self._lead = True
@@ -353,9 +357,10 @@ class Engine:
 
         tools = job.tools
         force = tools.force if tools is not None else None
-        # (a forced call: its opener ends the prompt, or follows the thought the prompt opened)
-        early = model.tokenizer.encode(force) if force and not job.inside else []
-        late = tools.syntax.gap + force if force and job.inside else ""
+        # (a forced call: its opener ends the prompt, or follows the thought where one may come first)
+        thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
+        early = model.tokenizer.encode(force) if force and not thought else []
+        late = (tools.syntax.gap if job.inside else "") + force if force and thought else ""
         job.state = "prompt"
         gen: list[int] = []
         try:
@@ -403,8 +408,8 @@ class Engine:
                         break
                     if job.cancel.is_set():
                         raise Cancelled
-                    # (the thought is over and no call began: the forced call's opener follows)
-                    forcing = bool(late) and split is not None and not split.inside and not calls.started
+                    # (the answer began and no call did: the forced call's opener follows)
+                    forcing = bool(late) and split is not None and split.answering and not calls.started
                     # the answer is complete, or the opener goes next: end where every token but the last ran (a
                     # step of drafts runs several; the parser drops what follows a call when parallel is off)
                     if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):

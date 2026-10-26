@@ -86,6 +86,7 @@ QWEN = [
     (qwen_call("mixed", n="seven", flag="maybe", any="plain text", items="not json"), "",
      [("mixed", {"n": "seven", "flag": "maybe", "any": "plain text", "items": "not json"})]),
     (qwen_call("mixed", n='"7"'), "", [("mixed", {"n": '"7"'})]),  # (a string's text as written)
+    (qwen_call("mixed", flag="True", items="(1, 2)"), "", [("mixed", {"flag": True, "items": [1, 2]})]),
     (qwen_call("unknown", x="1"), "", [("unknown", {"x": 1})]),
     # lenient: no newlines around a value, no </tool_call>
     ("<tool_call><function=get_time><parameter=city>Rome</parameter></function>", "", [("get_time", {"city": "Rome"})]),

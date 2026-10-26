@@ -12,8 +12,9 @@ model writes a call, parsed as the text streams (``Parser``: text in, content an
 
 A Qwen parameter's value is the text up to ``</parameter>`` (one newline after the tag and one before the closing tag
 are the syntax's): a string where the function's schema allows only strings, streamed as it comes; otherwise JSON when
-it parses to a type the schema allows, else the text (llama.cpp's rule). A Gemma or Llama call goes out whole at its
-end. A call that does not parse is content."""
+it parses to a type the schema allows, else the text (llama.cpp's rule), a Python literal where the schema allows no
+string (Qwen writes True and False). A Gemma or Llama call goes out whole at its end, its arguments typed the same way
+(``typed``). A call that does not parse is content."""
 
 from __future__ import annotations
 
@@ -126,7 +127,10 @@ def _allows(value: object, types: set[str]) -> bool:
 def typed(value: object, schema: object) -> object:
     """A value the model wrote as a string where its schema allows none (Llama 3 quotes numbers, booleans and lists):
     the value the string encodes when it is of an allowed type (JSON, else a Python literal), else the string."""
-    types = _types(schema)
+    return _typed(value, _types(schema))
+
+
+def _typed(value: object, types: set[str]) -> object:
     if not isinstance(value, str) or not types or "string" in types:
         return value
     for parse in (json.loads, ast.literal_eval):
@@ -343,7 +347,7 @@ class QwenParser(Parser):
         try:
             v = json.loads(text)
         except ValueError:
-            return text
+            return _typed(text, types)  # (Qwen writes True and False as Python does)
         if isinstance(v, str) or (types and "string" in types and not _allows(v, types)):
             return text
         return v

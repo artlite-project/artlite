@@ -39,11 +39,12 @@ reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, model dow
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
 arguments) with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8,
-MiniCPM-V 4.7 and Occamy (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 (one call per message) have them; a template
-without tools (Llama 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the
-prompt, nothing is parsed), `required` and a named function (the answer begins with the call, after the model's
-thought), and `parallel_tool_calls: false` ends the answer after its first call. Calls are not constrained by a
-grammar: a call the model writes malformed stays text.
+MiniCPM-V 4.7 and Occamy (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 have them; a template without tools (Llama
+3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt, nothing is
+parsed), `required` and a named function (the answer begins with the call, after the model's thought; a named
+function's call is the only one), and `parallel_tool_calls: false` ends the answer after its first call. Calls are
+not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema allows
+no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
 
 ## Web chat
 

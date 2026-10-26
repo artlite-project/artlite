@@ -520,6 +520,29 @@ def test_tool_choice(tooled: tuple) -> None:
     text = model.tokenizer.decode_bytes(npu.seq).decode()
     assert "Need Oslo</think>\n\n<tool_call>\n<function=get_weather>\n" in text and "No call" not in text
     assert engine.cached == npu.seq[:npu.position]
+    npu.replies = [call_pieces("get_time")[2:] + ["\n"] + call_pieces("get_weather", city="X")]  # (a named call alone)
+    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice={"type": "function", "function": {"name": "get_time"}})
+    assert [c["function"]["name"] for c in r.json()["choices"][0]["message"]["tool_calls"]] == ["get_time"]
+
+
+def test_tool_choice_own_thought() -> None:
+    """A model that opens its thought itself (Gemma): the forced opener follows the thought, or the answer's first
+    text when it does not think."""
+    model, npu, engine = make(reasoning=GEMMA)
+    with TestClient(app_of(engine, template=TOOLS_TEMPLATE)) as client:
+        assert engine.wait_ready(5)
+        body = {"tools": [WEATHER], "tool_choice": "required", "chat_template_kwargs": {"enable_thinking": True}}
+        rest = call_pieces("get_weather", city="Rome")[1:]
+        rest[0] = "get_weather>"
+        npu.replies = [["<|channel>thought", "\n", "Hmm", "<channel|>", "Text"], rest]
+        msg = chat(client, "Q", **body).json()["choices"][0]["message"]
+        assert msg["reasoning_content"] == "Hmm" and msg["content"] is None
+        assert [c["function"]["arguments"] for c in msg["tool_calls"]] == ['{"city": "Rome"}']
+        assert "Hmm<channel|><tool_call>\n<function=get_weather>" in model.tokenizer.decode_bytes(npu.seq).decode()
+        npu.replies = [["Sure", ",", " later"], rest]
+        msg = chat(client, "Q", **body).json()["choices"][0]["message"]
+        assert msg["content"] == "Sure" and [c["function"]["name"] for c in msg["tool_calls"]] == ["get_weather"]
+        assert engine.cached == npu.seq[:npu.position]
 
 
 def test_tool_calls_drafts() -> None:

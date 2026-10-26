@@ -501,7 +501,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             req.n_predict if req.n_predict is not None else options.n_predict
         j = Job(ids=ids, emit=emit, sampling=request_sampling(req, think), max_tokens=n,
                 seed=req.seed if req.seed is not None else options.seed, stop=stops(req), reasoning=reasoning,
-                inside=reasoning and inside(ids),
+                inside=reasoning and inside(ids), think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
                 progress=bool(req.return_progress), conv_id=conv_id, tools=tools)
         try:
@@ -563,7 +563,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     def calls_of(req: ChatRequest) -> tuple[list[dict[str, Any]], Calls | None]:
         """A request's functions for the template and how to read its answer's calls (None: as text: no tools, or
         ``tool_choice`` none). ``tool_choice`` required or a named function: the answer begins with a call (its opener
-        forced). A template that takes no tools: they are ignored (the web UI sends its own)."""
+        forced; a named function's call alone). A template that takes no tools: they are ignored (the web UI sends its
+        own)."""
         try:
             fns = functions(req.tools)
         except ValueError as e:
@@ -592,7 +593,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         if choice == "none":
             return fns, None
         force = syntax.opener(name) if choice == "required" or name else None
-        return fns, Calls(syntax, fns, parallel=req.parallel_tool_calls is not False, force=force)
+        parallel = req.parallel_tool_calls is not False and name is None  # (a named function: that call alone)
+        return fns, Calls(syntax, fns, parallel=parallel, force=force)
 
     def ping_of(req: Generation) -> float:
         return options.sse_ping_interval if req.sse_ping_interval is None else req.sse_ping_interval
