@@ -335,8 +335,9 @@ class GGUFFile:
 
     def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0) -> torch.Tensor:
         """Rows ``idx`` of a tensor dequantized (len(idx), cols) fp32, of its first ``cols`` columns (default all; a
-        multiple of the format's block): an embedding lookup in the mapped file. Q4_0, Q4_K, Q6_K and Q3_K in C++
-        (``_native.dequant_rows``: a decode step's lookup in a few us), the others through ``QTensor.dequantize``."""
+        multiple of the format's block): an embedding lookup in the mapped file. In C++ (``_native.dequant_rows``: a
+        decode step's lookup in a few us) the types of ``_native.dequant_supported`` (the plain ones, Q4_0, Q4_1, Q8_0,
+        Q3_K .. Q6_K), the others through ``QTensor.dequantize``."""
         t = self.tensor(name)
         cols, idx = cols or t.cols, np.asarray(idx)
         per, nb = _BLOCKS[t.qtype]
@@ -346,7 +347,7 @@ class GGUFFile:
         raw = np.ascontiguousarray(t.raw[idx, :width])
         if _native.dequant_supported(t.qtype):
             out = np.empty((len(idx), cols), np.float32)
-            _native.dequant_rows(t.qtype, raw, out)
+            _native.dequant_rows(t.qtype, raw.view(np.uint8), out)
             return torch.from_numpy(out)
         return QTensor(name=name, qtype=t.qtype, rows=len(idx), cols=cols, raw=raw).dequantize()
 

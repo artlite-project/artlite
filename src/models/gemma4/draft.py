@@ -71,6 +71,7 @@ from artlite.operators.design import COLS
 from artlite.operators.util import bf16_bits, rup
 from artlite.overlay import Sequence, Transaction
 
+from ..common import argmax
 from . import attn as AT
 from .image import FORMATS, KC, TILE_BYTES
 from .overlay import GemmaOverlay
@@ -229,7 +230,7 @@ class GemmaDraft:
         self.d, self.vocab, self.T, self.H = img.d, img.vocab, TILE_BYTES, self.cfg.hidden_size
         self.src = [self.cfg.kv_layers - (2 if s else 1) for s in img.swa]  # (the model's caches the layers attend to)
         self.nq = img.heads // AT.KV_HEADS
-        self.rows = torch.from_numpy(img.logit_rows())
+        self.rows = img.logit_rows().astype(np.int32)
         self._pos = -1
         self._tr: Transaction | None = None
         self._fills: list[tuple[int, int, int]] = []  # (BD word index, layer, column) of the cache fills
@@ -486,25 +487,12 @@ class GemmaDraft:
 
     def token(self, logits: torch.Tensor) -> int:
         """The most likely token of a step's logits."""
-        return int(self.rows[argmax_bf16(logits)])
-
-    def logits(self, raw: torch.Tensor) -> torch.Tensor:
-        """A step's logits in vocabulary order (vocab,) fp32."""
-        out = torch.empty(self.vocab)
-        out[self.rows] = raw.float()
-        return out
+        return int(self.rows[argmax(logits)])
 
     def reset(self) -> None:
         """(the token objects and the tail fills are rewritten at the next step)"""
         self._pos = -1
         self._tkey = None
-
-
-def argmax_bf16(x: torch.Tensor) -> int:
-    """The index of the largest of bf16 values (the first of equal ones; ~25x faster than torch's bf16 argmax): their
-    bits as int16 with the magnitude bits of the negative ones flipped compare as the values do."""
-    b = x.view(torch.int16).numpy()
-    return int(np.argmax(b ^ ((b >> 15) & 0x7FFF)))
 
 
 def output_norm(r: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -513,4 +501,4 @@ def output_norm(r: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return (r * torch.rsqrt(r.pow(2).mean() + eps) * w).bfloat16()
 
 
-__all__ = ["DraftImage", "GemmaDraft", "argmax_bf16", "output_norm", "pair_rows"]
+__all__ = ["DraftImage", "GemmaDraft", "output_norm", "pair_rows"]

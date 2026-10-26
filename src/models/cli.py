@@ -20,12 +20,10 @@ import os
 import sys
 import time
 
-import torch
-
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
-from .common import MEDIA_MARKER, StreamDecoder, auto_capacity, performance_mode, stale_install
+from .common import MEDIA_MARKER, StreamDecoder, auto_capacity, performance_mode, seed, stale_install
 from .sd15.pipeline import BACKENDS, check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
@@ -128,7 +126,7 @@ def main(argv: list[str] | None = None) -> None:
     if is_diffusers(args.model):
         generate_image(args)
         return
-    torch.manual_seed(args.seed)
+    seed(args.seed)
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
     options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices}

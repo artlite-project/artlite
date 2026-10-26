@@ -45,7 +45,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Model, OverlayModel, Penalties, Sampling, topk_bf16
+from ..common import Model, OverlayModel, Penalties, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
@@ -292,12 +292,11 @@ class NpuQwen(OverlayModel):
         out: list[int] = []
         chain, slot = 1.0, len(rows) - 1
         while len(out) < n:
-            x = raw[slot].float()
-            v, i = x.max(-1)
-            chain /= float(torch.exp(x - v).sum())
+            i, p = max_prob(raw[slot])
+            chain *= p
             if chain < self.P_MIN:
                 break
-            out.append(int(i))
+            out.append(i)
             if out[-1] in self.eos_token_ids or len(out) == n:
                 break
             h = self.drafter.hidden_state(slot)
@@ -330,8 +329,7 @@ class NpuQwen(OverlayModel):
             raw = self.steps([token, *d], commit=False)
             new: list[int] = []
             for i in range(len(d) + 1):
-                new.append(sampling.pick(*(penalties.top(raw[i], sampling.k) if penalties.active else
-                                           topk_bf16(raw[i], sampling.k))))
+                new.append(sampling.pick(*penalties.top(raw[i], sampling.k)))
                 penalties.accept(new[i])
                 if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
                     break

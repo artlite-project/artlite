@@ -20,9 +20,14 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from models.gemma4 import host
-from models.gemma4.host import GemmaHost, rms_norm, softcap
+from models.gemma4.host import GemmaHost, rms_norm
 
 SOURCES = [__file__, host.__file__]  # the reference's code (tests' cached_ref)
+
+
+def softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    """Final logit soft-capping: cap * tanh(logits / cap) (monotonic)."""
+    return torch.tanh(logits / cap) * cap if cap else logits
 
 
 def rope_angles(inv_freq: np.ndarray, positions: np.ndarray | range | list[int]) -> torch.Tensor:

@@ -24,7 +24,7 @@ import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER, Model, NpuModel, Penalties, Sampling
+from models.common import MEDIA_MARKER, Model, NpuModel, Penalties, Sampling, top_logits
 from models.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
@@ -174,10 +174,10 @@ class FakeNpu(NpuModel):
         self._next = iter([self.tok.id(p) for p in pieces] + [EOS])
         return self._logits(next(self._next))
 
-    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[np.ndarray, np.ndarray]:
         self._run([token])
         logits = self._logits(next(self._next, EOS))
-        return torch.topk(logits, k) if penalties is None else penalties.top(logits, k)
+        return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
 
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)

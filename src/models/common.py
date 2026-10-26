@@ -9,6 +9,7 @@ import functools
 import importlib.metadata
 import math
 import os
+import random
 import re
 import subprocess
 import threading
@@ -24,10 +25,17 @@ import jinja2.sandbox
 import numpy as np
 import torch
 
-from artlite import backend, portable
+from artlite import _native, backend, portable
 
 R = TypeVar("R")
 MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
+LogitsLike = torch.Tensor | np.ndarray  # a vocabulary's logits: bf16 (an overlay's) or fp32
+_rng = random.Random()  # (sampling's draws: ``seed``)
+
+
+def seed(n: int | None = None) -> None:
+    """Seed sampling's draws (None: from the operating system's randomness)."""
+    _rng.seed(n)
 
 
 @dataclass(frozen=True)
@@ -64,38 +72,30 @@ class Sampling:
         return self.repeat_last_n > 0 and (self.repeat_penalty != 1.0 or self.presence_penalty != 0.0
                                            or self.frequency_penalty != 0.0)
 
-    def pick(self, values: torch.Tensor, ids: torch.Tensor) -> int:
-        """The next token from the ``k`` largest logits (values descending) and their token ids."""
+    def pick(self, values: np.ndarray, ids: np.ndarray) -> int:
+        """The next token from the ``k`` largest logits (values descending, fp32) and their token ids
+        (``_native.pick``; the draw: ``seed``)."""
         if self.k == 1:
             return int(ids[0])
-        p = torch.softmax(values.float() / self.temp, -1)
-        if self.top_p < 1.0 or self.min_p > 0.0:
-            keep = (torch.cumsum(p, -1) - p < self.top_p) & (p >= self.min_p * p[0])  # (top_p: the smallest prefix)
-            keep[0] = True  # (the most likely token stays)
-            p = torch.where(keep, p, torch.zeros_like(p))
-        return int(ids[torch.multinomial(p / p.sum(), 1)])
+        return int(ids[_native.pick(values, self.temp, self.top_p, self.min_p, _rng.random())])
 
 
-def topk_bf16(x: torch.Tensor, k: int, exclude: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """The k largest of bf16 values x (a vocabulary's logits) as fp32, descending, and their indices (as torch.topk of
-    x.float(), 3-10x faster): the values' bits as int16 with the negative ones' magnitude bits flipped compare as the
-    values do; k = 1: their argmax, else the k blocks of 256 with the largest maxima hold the k largest. ``exclude``:
-    indices that rank last."""
-    b = x.view(torch.int16).numpy()
-    key = b ^ ((b >> 15) & 0x7FFF)
-    if exclude is not None:
-        key[exclude.numpy()] = np.iinfo(np.int16).min
-    if k == 1:
-        i = int(np.argmax(key))
-        return x[i:i + 1].float(), torch.tensor([i])
-    n = key.size // 256
-    blocks = key[:256 * n].reshape(n, 256).max(1)
-    top = np.argpartition(blocks, -k)[-k:] if n > k else np.arange(n)
-    idx = np.concatenate([(256 * top[:, None] + np.arange(256)).reshape(-1), np.arange(256 * n, key.size)])
-    sel = key[idx]
-    j = np.argpartition(sel, -k)[-k:]
-    i = torch.from_numpy(idx[j[np.argsort(-sel[j].astype(np.int32), kind="stable")]])
-    return x[i].float(), i
+def top_logits(logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray | None = None
+               ) -> tuple[np.ndarray, np.ndarray]:
+    """The k largest of a vocabulary's logits after a soft cap (``cap`` > 0: cap tanh(l / cap)), fp32, descending
+    (equal ones: the lower index first), and their token ids (int32; ``rows``: the token of each logit, else its index):
+    one pass over the logits (``_native.top_logits``)."""
+    return _native.top_logits(logits, k, cap, rows=rows)
+
+
+def argmax(logits: LogitsLike) -> int:
+    """The index of the largest logit (the first of equal ones)."""
+    return int(_native.top_logits(logits, 1)[1][0])
+
+
+def max_prob(logits: LogitsLike) -> tuple[int, float]:
+    """The largest of bf16 logits (its index: the first of equal ones) and its probability (softmax)."""
+    return _native.max_prob(logits)
 
 
 class Penalties:
@@ -140,41 +140,18 @@ class Penalties:
             if not self.counts[old]:
                 del self.counts[old]
 
-    def top(self, logits: torch.Tensor, k: int, cap: Callable[[torch.Tensor], torch.Tensor] | None = None, *,
-            rows: torch.Tensor | None = None, where: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def top(self, logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray | None = None,
+            where: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         """The ``k`` largest penalized logits (fp32, descending) and their token ids, of a token's logits (vocab,), fp32
-        or the overlay's bf16; ``cap``: the model's logits of those (monotonic: applied to the candidates alone);
-        ``rows``, ``where``: the token of each logit and the logit of each token (logits in another order: a drafter's).
-        The candidates: the recent tokens and the ``k`` largest logits of the others."""
-        at = None
-        if self.counts:
-            ids = torch.tensor(list(self.counts))
-            at = ids if where is None else where[ids]
-        if logits.dtype == torch.bfloat16:
-            v, i = topk_bf16(logits, k, exclude=at)
-        else:
-            x = logits.float()
-            if at is not None:
-                x = x.clone()
-                x[at] = -math.inf
-            v, i = torch.topk(x, k)
-        if cap is not None:
-            v = cap(v)
-        if rows is not None:
-            i = rows[i]
-        if at is None:
-            return v, i
-        if k > logits.numel() - len(ids):  # (fewer other tokens than k: recent ones among them, unpenalized)
-            keep = ~torch.isin(i, ids)
-            v, i = v[keep], i[keep]
-        x = logits[at].float()
-        x = (x if cap is None else cap(x)).numpy()
+        or the overlay's bf16 (``top_logits``; ``cap``: the model's soft cap); ``rows``, ``where``: the token of each
+        logit and the logit of each token (logits in another order: a drafter's). The candidates: the recent tokens
+        and the ``k`` largest logits of the others."""
+        if not self.counts:
+            return top_logits(logits, k, cap, rows=rows)
+        ids = np.fromiter(self.counts, np.int32, len(self.counts))
         s, count = self.sampling, np.fromiter(self.counts.values(), np.float32, len(ids))
-        x = np.where(x <= 0, x * s.repeat_penalty, x / s.repeat_penalty) - s.presence_penalty \
-            - count * s.frequency_penalty
-        v, i = torch.cat([v, torch.from_numpy(x.astype(np.float32))]), torch.cat([i, ids.to(i.dtype)])
-        v, j = torch.topk(v, min(k, v.numel()))
-        return v, i[j]
+        return _native.top_logits(logits, k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
+                                  s.presence_penalty, s.frequency_penalty, rows)
 
 
 def auto_capacity(tokens: int) -> int:
@@ -331,11 +308,11 @@ class NpuModel:
         """Run ``token`` at the next position: the logits (vocab,) of the next token."""
         raise NotImplementedError
 
-    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Run ``token`` at the next position: the ``k`` largest logits of the next token (fp32, descending) and their
         token ids (``penalties``: of the penalized logits)."""
-        logits = self.step(token).float()
-        return torch.topk(logits, k) if penalties is None else penalties.top(logits, k)
+        logits = self.step(token)
+        return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = ()
                  ) -> Iterator[int]:
@@ -365,15 +342,16 @@ class OverlayModel(NpuModel):
     chunk's inputs prepared on a worker thread while the previous chunk runs; ``forward`` is a prompt with its last
     token's logits (a decode step's, or of a chunk's last token: ``_chunk_logits``). A model supplies a step's inputs
     (``_step_inputs``: the overlay step's arguments before the position), a chunk's (``_chunk_inputs``: the prefill
-    run's), the logits of a chunk's last token and its final logits of the overlay's (``cap``: monotonic)."""
+    run's), the logits of a chunk's last token and the soft cap of its final logits (``softcap``)."""
 
     overlay: Any
     prefill: Any
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
+    softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
 
     def cap(self, logits: torch.Tensor) -> torch.Tensor:
-        """The model's logits of the overlay's (fp32): a soft cap, or none."""
-        return logits
+        """The model's logits of the overlay's (fp32): the soft cap, if any."""
+        return torch.tanh(logits / self.softcap) * self.softcap if self.softcap else logits
 
     @functools.cached_property
     def _pool(self) -> ThreadPoolExecutor:
@@ -428,13 +406,10 @@ class OverlayModel(NpuModel):
         out = self.steps([token], logits=logits)
         return None if out is None else self.cap(out[0].float())
 
-    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """(``cap`` is monotonic: applied to the candidates alone)"""
+    def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """(from the overlay's bf16 logits: the soft cap on the candidates alone)"""
         raw = self.steps([token])[0]
-        if penalties is not None:
-            return penalties.top(raw, k, self.cap)
-        v, i = topk_bf16(raw, k)
-        return self.cap(v), i
+        return top_logits(raw, k, self.softcap) if penalties is None else penalties.top(raw, k, self.softcap)
 
     def stale(self) -> None:
         """Another hardware context ran on the device (a prefill chunk, an image encoder): the overlay's state on the

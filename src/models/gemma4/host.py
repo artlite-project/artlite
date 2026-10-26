@@ -20,11 +20,6 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tenso
     return y if w is None else y * w
 
 
-def softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
-    """Final logit soft-capping: cap * tanh(logits / cap) (monotonic)."""
-    return torch.tanh(logits / cap) * cap if cap else logits
-
-
 class GemmaHost:
     """The tensors of a GGUF file the host reads, and the inputs it computes from them."""
 

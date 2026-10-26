@@ -24,12 +24,13 @@ def test_iq3xxs_dequantize() -> None:
     assert ((q < 0).reshape(t.rows, -1, 8).sum(-1) % 2 == 0).all()
 
 
-@pytest.mark.parametrize("qtype", ["Q4_0", "Q4_K", "Q6_K", "Q3_K"])
+@pytest.mark.parametrize("qtype", ["BF16", "F16", "Q4_0", "Q4_1", "Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K"])
 def test_dequant_rows(qtype: str) -> None:
     """The native rows (``_native.dequant_rows``: an embedding lookup) bit-identical to ``QTensor.dequantize``."""
+    assert _native.dequant_supported(qtype)
     t = _random_tensor(qtype, 33, 1024, 1)
     out = np.empty((t.rows, t.cols), np.float32)
-    _native.dequant_rows(qtype, np.ascontiguousarray(t.raw), out)
+    _native.dequant_rows(qtype, np.ascontiguousarray(t.raw).view(np.uint8), out)
     assert np.array_equal(out.view(np.uint32), t.dequantize().numpy().view(np.uint32))
 
 

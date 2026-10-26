@@ -25,7 +25,6 @@ from artlite.model_config import assistant_of, gemma_gguf
 from models.common import Sampling
 from models.gemma4 import attn as AT
 from models.gemma4.gemma import NpuGemma
-from models.gemma4.host import softcap
 from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 
@@ -204,7 +203,7 @@ def test_gemma_prefill(cpu: _Cpu, npu: object) -> None:
     for li in layers:
         for name, got, want in zip("KV", npu.overlay.read_kv(li, range(first)), want_kv[li]):
             worst[f"{name}.{li}"] = round(float(_rel_positions(got, want).max()), 4)
-    got = torch.cat([softcap(npu.steps(seq[i:i + NB]).float(), npu.cfg.final_logit_softcapping)
+    got = torch.cat([gemma_cpu.softcap(npu.steps(seq[i:i + NB]).float(), npu.cfg.final_logit_softcapping)
                      for i in range(first, len(seq), NB)])
     want = cpu.logits(seq, slice(first, None))
     kl = float(_kl(want, got).mean())
@@ -278,7 +277,8 @@ def test_gemma_draft(cpu: _Cpu, npu: object) -> None:
         t, x_h = ids[p], npu.hidden_state()
         for _ in range(3):
             want = next(wants)
-            got = npu.drafter.logits(npu.drafter.step(npu.inputs(t)[0], x_h, p))
+            got = torch.empty(npu.drafter.vocab)  # (the drafter's logits in vocabulary order)
+            got[torch.from_numpy(npu.drafter.rows)] = npu.drafter.step(npu.inputs(t)[0], x_h, p).float()
             kls.append(float(_kl(want, got)))
             agree.append(int(want.argmax()) == int(got.argmax()))
             t, x_h = int(want.argmax()), None  # both sides continue with the reference's draft
@@ -304,7 +304,7 @@ def test_gemma_mtp_generation(npu: object) -> None:
         p0 = npu.position
         raw = steps(tokens, logits=logits)
         if raw is not None:
-            log.append((p0, list(tokens), softcap(raw.float(), npu.cfg.final_logit_softcapping)))
+            log.append((p0, list(tokens), gemma_cpu.softcap(raw.float(), npu.cfg.final_logit_softcapping)))
         return raw
 
     npu.reset()

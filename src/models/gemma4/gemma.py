@@ -27,6 +27,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 
+import numpy as np
 import torch
 
 from artlite import parallel_compile
@@ -35,8 +36,8 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
 from ..common import Model, OverlayModel, Penalties, Sampling
-from .draft import GemmaDraft, argmax_bf16, output_norm
-from .host import GemmaHost, softcap
+from .draft import GemmaDraft, output_norm
+from .host import GemmaHost
 from .overlay import GemmaOverlay
 from .prefill import GemmaPrefill
 from .tokenizer import GemmaTokenizer, chat_prompt
@@ -61,6 +62,7 @@ class NpuGemma(OverlayModel):
         self._inputs: OrderedDict[int, tuple[torch.Tensor, torch.Tensor | None]] = OrderedDict()
         self.cfg = self.host.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
+        self.softcap = self.cfg.final_logit_softcapping
         if capacity > self.cfg.max_position_embeddings:
             raise ValueError(f"capacity {capacity} exceeds the model's context of {self.cfg.max_position_embeddings}")
         self.capacity = capacity
@@ -122,9 +124,6 @@ class NpuGemma(OverlayModel):
         self._inputs.move_to_end(token)
         return self._inputs[token]
 
-    def cap(self, logits: torch.Tensor) -> torch.Tensor:
-        return softcap(logits, self.cfg.final_logit_softcapping)
-
     def _step_inputs(self, tokens: list[int]) -> tuple:
         """(the tokens' kept inputs: ``inputs``)"""
         self._prepare(tokens)
@@ -169,11 +168,11 @@ class NpuGemma(OverlayModel):
         return output_norm(self.overlay.residual(slot), self.host.mat("output_norm.weight"), self.cfg.rms_norm_eps)
 
     @functools.cached_property
-    def _draft_where(self) -> torch.Tensor:
+    def _draft_where(self) -> np.ndarray:
         """The drafter's logit of each token (the inverse of its ``rows``)."""
         rows = self.drafter.rows
-        out = torch.empty_like(rows)
-        out[rows] = torch.arange(len(rows), dtype=rows.dtype)
+        out = np.empty_like(rows)
+        out[rows] = np.arange(len(rows), dtype=rows.dtype)
         return out
 
     def draft(self, token: int, h: torch.Tensor, n: int, penalties: Penalties | None = None) -> list[int]:
@@ -190,7 +189,7 @@ class NpuGemma(OverlayModel):
             if recent is None:
                 token = self.drafter.token(raw)
             else:
-                token = int(recent.top(raw, 1, self.cap, rows=self.drafter.rows, where=self._draft_where)[1][0])
+                token = int(recent.top(raw, 1, self.softcap, rows=self.drafter.rows, where=self._draft_where)[1][0])
                 recent.accept(token)
             out.append(token)  # (its per-layer inputs: with the verifying step's others, in one pass)
         self.t_draft += time.perf_counter() - t0
@@ -208,7 +207,6 @@ class NpuGemma(OverlayModel):
             return
         if max_tokens == 0:
             return
-        cap = self.cfg.final_logit_softcapping
         penalties = Penalties(sampling, prompt)
         token = sampling.pick(*penalties.top(logits, sampling.k))
         penalties.accept(token)
@@ -220,14 +218,8 @@ class NpuGemma(OverlayModel):
             d = self.draft(token, h, k, penalties) if k > 0 else []
             raw = self.steps([token, *d])
             new: list[int] = []
-            for i in range(len(d) + 1):  # (the soft cap is monotonic: applied to the top k alone)
-                if penalties.active:
-                    new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.cap)))
-                elif sampling.k == 1:
-                    new.append(argmax_bf16(raw[i]))
-                else:
-                    v, ids = torch.topk(raw[i].float(), sampling.k)
-                    new.append(sampling.pick(softcap(v, cap), ids))
+            for i in range(len(d) + 1):
+                new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.softcap)))
                 penalties.accept(new[i])
                 if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
                     break

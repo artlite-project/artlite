@@ -309,6 +309,12 @@ offsets): aie2p-coding section 8. For speed:
   for the next step while this one runs, on a second transaction buffer (`ModelOverlay.AHEAD`, `OverlayDevice.submit`
   / `wait`; a patched step runs only at its position and ring state); the embedding row in C++
   (`_native.dequant_rows`): Llama 1B's step 14.92 -> 14.75 ms.
+- **Host ops between dispatches in C++, not torch**: torch's OpenMP threads spin for milliseconds after every parallel
+  op (a vocabulary's 128K-262K logits are one), through the next dispatch. Sampling's top-k, argmax and a draft's
+  probability as torch ops cost the MTP loops 160-400 us per call and 71-98 ms of host CPU per token (Gemma E4B, Qwen3.6
+  35B-A3B); as one AVX-512 pass over the bf16 logits (`_native.top_logits`, `max_prob`: a threshold of the k-th
+  largest key so far, almost no logit passes it after the first few thousand) 10-40 us, 6 ms of CPU per token (Qwen),
+  and 1-2.5% shorter steps.
 - **The first chunk's late inputs**: start the program with what its first operators read and write the rest
   before the piece that first reads it (`Library.run(hooks={item: fn})`: a hook runs before that piece is
   dispatched, while the previous one runs; the item starts a piece). The Gemma prefill's per-layer inputs (a 15 ms

@@ -12,9 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
-
-from ..common import Model, NpuModel, Sampling, StreamDecoder
+from ..common import Model, NpuModel, Sampling, StreamDecoder, argmax, seed
 
 log = logging.getLogger("artlite.server")
 
@@ -319,7 +317,7 @@ class Engine:
         ids = self.model.encode("The quick brown fox jumps over the lazy dog.")
         npu.reset()
         logits = npu.forward(ids)
-        npu.top_k(int(logits.argmax()), 1)
+        npu.top_k(argmax(logits), 1)
         npu.reset()
         log.info("warmup: %.2f s", time.perf_counter() - t0)
 
@@ -330,10 +328,7 @@ class Engine:
             raise Cancelled
         npu, model = self.npu, self.model
         t0 = time.perf_counter()
-        if job.seed >= 0:
-            torch.manual_seed(job.seed % 2**64)
-        else:
-            torch.seed()
+        seed(job.seed if job.seed >= 0 else None)
         ids = job.ids
         n = min(common_prefix(self.cached, ids), len(ids) - 1) if job.cache_prompt else 0
         kept = npu.rewind(n) if n > 0 else 0
