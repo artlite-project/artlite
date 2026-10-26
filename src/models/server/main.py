@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from artlite.model_config import MODELS_DIR, model_path
 
 from .. import open_model
-from ..common import Model, NpuModel, Sampling, performance_mode, stale_toolchain
+from ..common import Model, NpuModel, Sampling, performance_mode, stale_install
 from . import ui
 from .api import PENALTIES, ModelInfo, Options, create_app
 from .engine import Engine
@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None, *, report: Report | None = None) -> None
         p.error("-np/--parallel: only 1 (the NPU runs one sequence at a time)")
     setup_logging(args, child=report is not None)
     if report is None:  # (a router's children: its checks, under its mode)
-        if stale := stale_toolchain():
+        if stale := stale_install():
             log.warning("%s", stale)
         performance_mode(log.info)
     if args.model is None:

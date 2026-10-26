@@ -21,7 +21,7 @@ from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
 
 from .bench import _git, _read
-from .common import stale_toolchain
+from .common import stale_install
 
 MB = 1 << 20
 CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)
@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="artlite-probe", description=__doc__.split("\n\n")[0])
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
     args = p.parse_args(argv)
-    lines = system() + ([f"warning: {stale}"] if (stale := stale_toolchain()) else [])
+    lines = system() + ([f"warning: {stale}"] if (stale := stale_install()) else [])
     clock, loaded, dma = ClockProbeOperator(), ClockProbeOperator(load=True), DmaProbeOperator()
     compile_all([clock, loaded, dma])
     mhz, round_trip = array_clock(clock, seconds=args.seconds)

@@ -68,10 +68,27 @@ if(NOT SKBUILD AND NOT nanobind_ROOT)
 endif()
 find_package(nanobind CONFIG REQUIRED)
 
+# The hash of the modules' sources (_native.source_hash(): backend.stale_native compares it with the checkout's, a
+# module built before a git pull): SHA-256 of "<path> <SHA-256>\n" per file, sorted. The files are configure
+# dependencies (an edit re-runs this at the next build); the hash is a translation unit of its own (only it recompiles).
+file(GLOB_RECURSE ARTLITE_SOURCES RELATIVE "${CMAKE_SOURCE_DIR}" CONFIGURE_DEPENDS
+     csrc/*.cpp csrc/*.h csrc/*.hpp csrc/CMakeLists.txt)
+list(APPEND ARTLITE_SOURCES CMakeLists.txt)
+list(SORT ARTLITE_SOURCES)
+set(ARTLITE_SOURCE_LIST "")
+foreach(source IN LISTS ARTLITE_SOURCES)
+  file(SHA256 "${CMAKE_SOURCE_DIR}/${source}" sha)
+  string(APPEND ARTLITE_SOURCE_LIST "${source} ${sha}\n")
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ARTLITE_SOURCES})
+string(SHA256 ARTLITE_SOURCE_HASH "${ARTLITE_SOURCE_LIST}")
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/source_hash.cpp"
+     CONTENT "extern const char artlite_source_hash[] = \"${ARTLITE_SOURCE_HASH}\";\n")
+
 # A module per backend: the platform's own as _native, Linux's XRT one as _native_xrt (its own nanobind domain: the
 # same C++ types)
 function(artlite_module name backend)
-  nanobind_add_module(${name} STABLE_ABI ${ARGN} csrc/bindings.cpp)
+  nanobind_add_module(${name} STABLE_ABI ${ARGN} csrc/bindings.cpp "${CMAKE_BINARY_DIR}/source_hash.cpp")
   target_link_libraries(${name} PRIVATE artlite_${backend})
   target_compile_definitions(${name} PRIVATE ARTLITE_MODULE=${name})
   install(TARGETS ${name} LIBRARY DESTINATION artlite)

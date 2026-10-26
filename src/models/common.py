@@ -211,6 +211,11 @@ def stale_toolchain() -> str | None:
             "uv sync --extra examples, then uv pip install --no-build-isolation --no-deps -ve . (docs/install.md)")
 
 
+def stale_install() -> str | None:
+    """What of the install is not this checkout's (``stale_toolchain``, ``backend.stale_native``), else None."""
+    return "; ".join(s for s in (stale_toolchain(), backend.stale_native()) if s) or None
+
+
 def performance_mode(report: Callable[[str], None]) -> None:
     """Windows: raise the NPU's power mode from ``default`` to ``performance`` (``xrt-smi configure --pmode``, as
     FastFlowLM does at its start), in a thread while the model loads; ``report``: told the change. A mode set by hand

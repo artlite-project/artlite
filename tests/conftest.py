@@ -158,6 +158,10 @@ def pytest_report_header(config: pytest.Config) -> str | None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    from artlite.backend import stale_native
+
+    if stale := stale_native():  # (the tests would test the previous native code: packers, dequantization, the shim)
+        raise pytest.UsageError(stale)
     if config.getoption("--refresh-refs"):
         from . import common
 

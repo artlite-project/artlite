@@ -13,6 +13,7 @@
 ``ARTLITE_BACKEND`` picks one (default: the platform's own, ``xdna`` on Linux); ``artlite`` imports this module first.
 """
 
+import hashlib
 import importlib
 import os
 import shutil
@@ -40,6 +41,33 @@ NAME: str = _native.BACKEND
 XRT = NAME == "xrt"
 # A buffer's device address needs an open context (txn.device_address of a context's buffers)
 ADDRESSES_NEED_CONTEXT = XRT
+
+
+def _source_hash(root: str) -> str:
+    """CMakeLists.txt's ARTLITE_SOURCE_HASH of the native module's sources in the checkout at root."""
+    files = ["CMakeLists.txt"]
+    for d, _, names in os.walk(os.path.join(root, "csrc")):
+        rel = os.path.relpath(d, root).replace(os.sep, "/")
+        files += [f"{rel}/{n}" for n in names if n.endswith((".cpp", ".h", ".hpp")) or n == "CMakeLists.txt"]
+    listing = ""
+    for f in sorted(files):
+        with open(os.path.join(root, f), "rb") as fh:
+            listing += f"{f} {hashlib.sha256(fh.read()).hexdigest()}\n"
+    return hashlib.sha256(listing.encode()).hexdigest()
+
+
+def stale_native() -> str | None:
+    """Why the native module is not built from the checkout's csrc/ (a ``git pull`` or an edit without a rebuild: the
+    Python side runs on another native side, e.g. another weight packer), else None. Without a checkout around the
+    package (an installed wheel) there is nothing to compare."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir)
+    if not os.path.isdir(os.path.join(root, "csrc")):
+        return None
+    built = _native.source_hash() if hasattr(_native, "source_hash") else None
+    if built == _source_hash(root):
+        return None
+    return (f"the native module ({_native.__file__}) is not built from this checkout's csrc/; rebuild it: "
+            "uv pip install --no-build-isolation --no-deps -ve . (docs/install.md)")
 
 
 def xrt_tool(name: str) -> str | None:

@@ -51,9 +51,10 @@ uv pip install --no-build-isolation --no-deps -ve .
 - `--no-build-isolation`: builds against the venv's nanobind, so its headers stay for IDEs (an isolated build
   removes them afterwards).
 
-After a `git pull`, run `uv sync --extra examples` and then the rebuild: a commit may pin other toolchain wheels.
-`artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe` and the tests warn when the venv's `mlir_aie` or
-`llvm_aie` is not the version `pyproject.toml` pins.
+After a `git pull`, run `uv sync --extra examples` and then the rebuild: a commit may pin other toolchain wheels or
+change `csrc/`. `artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe` and the tests warn when the venv's
+`mlir_aie` or `llvm_aie` is not the version `pyproject.toml` pins; the tools warn, and the tests do not start, when the
+native module is not built from the checkout's `csrc/` (a build records the hash of its sources).
 
 ## Windows
 

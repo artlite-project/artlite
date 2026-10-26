@@ -35,6 +35,8 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
+extern const char artlite_source_hash[];  // (source_hash.cpp, generated: CMakeLists.txt's ARTLITE_SOURCE_HASH)
+
 class ParameterScratchpad {
  public:
   /// Construct from a raw buffer and its size in bytes (Python bindings /
@@ -241,6 +243,10 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
 #else
   m.attr("BACKEND") = "xdna";
 #endif
+  m.def(
+      "source_hash", [] { return std::string(artlite_source_hash); },
+      "The hash of the sources the module was built from (CMakeLists.txt's ARTLITE_SOURCE_HASH; "
+      "artlite.backend.stale_native compares it with the checkout's).");
 
   // Zero-copy numpy/torch views of Buffer mappings (map()) keep their
   // Buffer/Device wrappers alive until after nanobind's exit-time leak audit,
