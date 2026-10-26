@@ -10,6 +10,7 @@
 | [Models](models/README.md) | tested files, plans, and how each model runs on the NPU: [Llama 3](models/llama3.md), [Gemma 4](models/gemma4.md), [Qwen3.5 / 3.6 / 3.8](models/qwen35.md), [Stable Diffusion 1.5](models/sd15.md) |
 | [Benchmark methodology](methodology.md) | how the README's charts are measured: test system, files, other runtimes |
 | [Where the NPU fits](npu-vs-igpu.md) | bandwidth and power against the iGPU, workloads to explore |
+| [Page-local bricks](page-local-bricks.md) | memory lines and 4 KB pages on Krackan Point and Windows: what the NPU's DMA pays, what Artlite does, the planned prefill layout |
 | [Design](design.md) | runtime layers, C++ and Python API, kernel compilation, error handling, driver behaviour |
 | [Universal programs](paging.md) | code pages: cores that load their own code, compared with classic designs |
 | [Development](development.md) | tests, operators, kernel tools, environment variables, skills |

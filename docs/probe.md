@@ -61,8 +61,8 @@ Each row on a page of its own costs the NPU an address translation. Artlite's ho
 (transparent huge pages, `madvise` or `always`; the `host buffers` line says so); Windows maps system memory for the
 NPU in 4 KB pages, and there the skewed gather and the write rows run at 14-16 and 5-6 GB/s (Strix Point and a Krackan
 Point laptop on Windows: some 50 million rows a second at most, whatever their size), as on Strix Halo with huge
-pages off (29.3 and 12.2). The dispatch round trip through Windows and XRT is 94 us (58 in the `turbo` power
-mode).
+pages off (29.3 and 12.2); what that costs the prefill: [Page-local bricks](page-local-bricks.md). The dispatch round
+trip through Windows and XRT is 94 us (58 in the `turbo` power mode).
 
 The first lines name the machine, the kernel, which `amdxdna` runs (`amdxdna_accel_driver` 0.6 / 0.8 / 0.10 are Linux
 7.0 / 7.1 / 7.2's own), the NPU firmware, the platform profile and the power adapter, the NPU's power mode, the CPU
