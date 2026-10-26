@@ -243,6 +243,21 @@ def test_gemma_forward(cpu: _Cpu, npu: object) -> None:
     assert (out["forward"].argmax(-1) == want.argmax(-1)).all()
 
 
+def test_gemma_kept_projections(npu: object) -> None:
+    """Steps of tokens whose per-layer projections the host kept (``NpuGemma.steps``: it writes them, the step runs
+    without the projection phase) give the logits of the steps that projected them, bit for bit."""
+    g = npu.gguf
+    ids = GemmaTokenizer(g).encode(chat_prompt(g, [{"role": "user", "content": PROMPT}]))[:12]
+    npu._p.clear()
+    runs = []
+    for _ in range(2):
+        npu.reset()
+        runs.append([npu.steps(ids[i:i + NB]).clone() for i in range(0, len(ids), NB)])
+    assert not npu.overlay.ple
+    for a, b in zip(*runs, strict=True):
+        assert torch.equal(a, b)
+
+
 def test_gemma_draft(cpu: _Cpu, npu: object) -> None:
     """Draft steps of the drafter on the NPU (on the NPU's caches, from the NPU's hidden state)
     against the fp32 drafter on the fp32 model's."""

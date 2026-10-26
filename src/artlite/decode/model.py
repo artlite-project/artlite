@@ -283,12 +283,17 @@ class ModelOverlay:
     def _transaction(self, S: int, logits: bool, subs: tuple, b: int = 0) -> Any:
         """The transaction of a step (built at its first use); ``b``: which of its two buffers (``AHEAD``: the next
         step's is patched while one runs; the builder reads ``_b``)."""
-        key = (S, logits, self.start, subs, b)
+        key = (S, logits, self._variant(), subs, b)
         if key not in self._steps:
             self._b = b
             self._steps[key] = st = self._build(S, logits, subs)
             st.b = b
         return self._steps[key]
+
+    def _variant(self) -> tuple:
+        """What besides S, logits and the sub-steps selects a step's transaction: its first layer (``_mode``; a model's
+        own variants after it)."""
+        return (self.start,)
 
     def _mode(self, start: int | None) -> int:
         """Set the step's first layer (None: the first of ``layers``)."""
@@ -342,7 +347,7 @@ class ModelOverlay:
         at position + S, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or
         None."""
         subs = self.subs(position, S)
-        key = (S, logits, self.start, subs)
+        key = (S, logits, self._variant(), subs)
         if self._ahead is not None and self._ahead[0] == (key, position, self._ring_state()):
             st = self._ahead[1]
         else:
@@ -357,7 +362,7 @@ class ModelOverlay:
             if self.AHEAD and p + S <= self.max_positions:
                 nxt = self._transaction(S, logits, self.subs(p, S), 1 - st.b)
                 if self._set_position(nxt, p, ahead=True):
-                    self._ahead = (((S, logits, self.start, self.subs(p, S)), p, self._ring_state()), nxt)
+                    self._ahead = (((S, logits, self._variant(), self.subs(p, S)), p, self._ring_state()), nxt)
         finally:
             self.dev.wait()
         self._last_s = S

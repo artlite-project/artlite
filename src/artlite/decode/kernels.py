@@ -735,20 +735,23 @@ __attribute__((minsize)) void {{ p }}_nbegin(const uint8_t *__restrict a, int32_
 {% endif %}
 {% if pli %}
     if ((st[{{ S_FLAGS }}] & {{ F_PLI }}) && st[{{ S_XD }}] == 0) {  // (the phase's first) the column's per-layer
-        // inputs pl = bf16(p / rms(p) w + e), w its weights / sqrt 2 (fp32) after [w1 | w_post]
+        // inputs pl = bf16(p / rms(p) w + e), w its weights / sqrt 2 after [w1 | w_post] (bf16 hi [32] | lo [32])
         aie::set_rounding(aie::rounding_mode::conv_even);
         bfloat16 *__restrict pl = WS(bfloat16, {{ w_.pli }});
-        const aie::vector<float, 32> iv = aie::load_v<32>(WS(float, {{ w_.pli + 4 * 4 * SLOTS * 8 }}));
-        const float *__restrict w = (const float *)(a + {{ 4 * NX_PER_NORM * POST_K }});
+        const bfloat16 *__restrict ivb = WS(bfloat16, {{ w_.pli + 4 * 4 * SLOTS * 8 }});
+        const aie::vector<bfloat16, 32> ih = aie::load_v<32>(ivb), il = aie::load_v<32>(ivb + 32);
+        const bfloat16 *__restrict w = (const bfloat16 *)(a + {{ 4 * NX_PER_NORM * POST_K }});
         const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
         AIE_LOOP_NO_UNROLL
         for (int g = 0; g < 4; g++) {
-            const aie::vector<float, 8> w8 = aie::load_v<8>(w + 8 * g);
-            aie::vector<bfloat16, 32> sh, sl;  // (1 / rms w per [slot][r] as bf16 hi + lo)
-            al::split2<32>(al::mulff<32>(iv, aie::concat(w8, w8, w8, w8)), sh, sl);
+            const aie::vector<bfloat16, 8> h8 = aie::load_v<8>(w + 8 * g), l8 = aie::load_v<8>(w + 32 + 8 * g);
+            const aie::vector<bfloat16, 32> wh = aie::concat(h8, h8, h8, h8), wl = aie::concat(l8, l8, l8, l8);
+            const aie::accum<accfloat, 32> c = aie::mac(aie::mac(aie::mul(ih, wh), ih, wl), il, wh);  // (1 / rms w)
+            const aie::vector<bfloat16, 32> ch = c.template to_vector<bfloat16>();
+            const aie::vector<bfloat16, 32> cl = aie::msc(c, ch, one).template to_vector<bfloat16>();
             const aie::vector<bfloat16, 32> pv = aie::load_v<32>(pl + 32 * g);
             const aie::accum<accfloat, 32> y = aie::mac(aie::mac(aie::mul(aie::load_v<32>(pl + {{ 4 * SLOTS * 8 }} + 32 * g), one),
-                                                                 pv, sh), pv, sl);
+                                                                 pv, ch), pv, cl);
             aie::store_v(pl + 32 * g, y.template to_vector<bfloat16>());
         }
     }
@@ -1333,10 +1336,10 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
 {% endif %}
 {% if pli %}
     if (flags & {{ F_PLI }}) {  // the per-layer inputs ([p: slot][{{ 32 * COLS }}] | [e: slot][{{ 32 * COLS }}] bf16): the
-        // column's p and e -> [g][slot][r], the slots' 1 / rms(p) -> [slot][r] (``nbegin`` completes them)
+        // column's p and e -> [g][slot][r], the slots' 1 / rms(p) -> [slot][r] as bf16 hi | lo (``nbegin`` completes them)
         const bfloat16 *__restrict src = x + {{ 2 * META }};
         bfloat16 *__restrict pl = WS(bfloat16, {{ w_.pli }});
-        float *__restrict iv = WS(float, {{ w_.pli + 4 * 4 * SLOTS * 8 }});
+        float *__restrict ss = WS(float, {{ w_.pli + 4 * 4 * SLOTS * 8 }});  // ([slot][8] partial sums of squares)
         AIE_LOOP_NO_UNROLL
         for (int s = 0; s < {{ SLOTS }}; s++) {
             const bfloat16 *__restrict ps = src + {{ 32 * COLS }} * s;
@@ -1346,14 +1349,19 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
                 const aie::vector<bfloat16, 32> v = aie::load_v<32>(ps + i);
                 sq = aie::mac(sq, v, v);
             }
-            iv[s] = aie::reduce_add(sq.template to_vector<float>());
+            const aie::accum<accfloat, 16> h = aie::add(sq.template extract<16>(0), sq.template extract<16>(1));
+            aie::store_v(ss + 8 * s, aie::add(h.template extract<8>(0), h.template extract<8>(1)).template to_vector<float>());
             for (int g = 0; g < 4; g++) {
                 aie::store_v(pl + 32 * g + 8 * s, aie::load_v<8>(ps + 32 * col + 8 * g));
                 aie::store_v(pl + {{ 4 * SLOTS * 8 }} + 32 * g + 8 * s,
                              aie::load_v<8>(ps + {{ 32 * COLS * SLOTS }} + 32 * col + 8 * g));
             }
         }
-        aie::store_v(iv, al::rows4(al::inv_rms<{{ 32 * COLS }}, {{ SLOTS }}>(aie::load_v<16>(iv), {{ ple_eps }}f)));
+        const aie::vector<float, 8> t = al::group8<false>(aie::concat(aie::load_v<32>(ss), aie::zeros<float, 32>()));
+        aie::vector<bfloat16, 32> ih, il;
+        al::split2<32>(al::rows4(al::inv_rms<{{ 32 * COLS }}, {{ SLOTS }}>(t.template grow<16>(), {{ ple_eps }}f)), ih, il);
+        aie::store_v((bfloat16 *)ss, ih);
+        aie::store_v((bfloat16 *)ss + 32, il);
     }
 {% endif %}
 {% if gu_win and moe %}

@@ -25,6 +25,7 @@ file, as is the token embedding's row.
 import functools
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 
 import numpy as np
@@ -53,11 +54,13 @@ class NpuGemma(OverlayModel):
     per 8 dims)."""
 
     DRAFTS = BATCH - 1  # draft tokens per dispatch
+    P_CACHE = 1024  # tokens whose per-layer projections are kept (21 KB each: ``steps``)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 8, prefill: bool = True,
                  drafter: str | None = "", kv_k: str = "hilo"):
         self.gguf = gguf
         self.host = GemmaHost(gguf, threads=threads)
+        self._p: OrderedDict[int, np.ndarray] = OrderedDict()  # (token -> its per-layer projection, bf16 bits)
         self.cfg = self.host.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.final_logit_softcapping
@@ -114,6 +117,25 @@ class NpuGemma(OverlayModel):
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
         return self.inputs(tokens)
+
+    def steps(self, tokens: list[int], *, logits: bool = True, **step: object) -> torch.Tensor | None:
+        """(a step of tokens whose per-layer projections are kept writes them instead of projecting the embeddings,
+        ``GemmaOverlay.step(p=)``: 0.6 ms less; one that projects keeps its tokens')"""
+        if not self.cfg.per_layer_dim:
+            return super().steps(tokens, logits=logits, **step)
+        kept = all(t in self._p for t in tokens)
+        out = super().steps(tokens, logits=logits, p=np.stack([self._p[t] for t in tokens]) if kept else None, **step)
+        t0 = time.perf_counter()
+        if kept:
+            for t in tokens:
+                self._p.move_to_end(t)
+        else:
+            for t, row in zip(tokens, self.overlay.read_p(len(tokens)), strict=True):
+                self._p[t] = row.copy()
+            while len(self._p) > self.P_CACHE:
+                self._p.popitem(last=False)
+        self.t_host += time.perf_counter() - t0
+        return out
 
     def chunk_inputs(self, tokens: list[int], x: torch.Tensor | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor | None]:

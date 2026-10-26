@@ -20,8 +20,8 @@ Per-column rows (layer L, column c, KV head h = c / 4, j = c % 4; hd: the layer'
 - "ple" (layer -1, before layer 0: the step's first phase), E2B / E4B: the per-layer projection
   (``per_layer_model_proj``, BF16 in the files: a Q8_0 copy, ``_ple``), column c's rows the 32 c .. of each layer's
   per_layer_dim (the per-layer inputs its gate phases take), an even number of layers (a padding one: zero rows); the
-  gate phases' first norm-weight object holds the column's 32 per_layer_proj_norm weights / sqrt(2) (fp32) after
-  [w1 | w_post] (``PLW``).
+  gate phases' first norm-weight object holds the column's 32 per_layer_proj_norm weights / sqrt(2) after [w1 | w_post]
+  as bf16 hi [32] | lo [32] (``PLW``).
 """
 
 import dataclasses
@@ -29,6 +29,7 @@ import math
 
 import numpy as np
 import torch
+from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.decode import gemv
@@ -137,8 +138,11 @@ class GemmaImage(TileImage):
             return out
         assert b.shape[1] == PLW and PLW + 4 * PLE <= T
         w = (self._vec("per_layer_proj_norm.weight") / np.float32(math.sqrt(2.0))).astype(np.float32)
+        hi = w.astype(bfloat16)
+        lo = (w - hi.astype(np.float32)).astype(bfloat16)
+        hl = np.stack([hi.reshape(COLS, PLE), lo.reshape(COLS, PLE)], 1)  # (column, hi | lo, PLE)
         per = np.repeat(out[None], COLS, 0)  # (each column's own: its PLE weights)
-        per[:, 0, PLW:PLW + 4 * PLE] = w.reshape(COLS, PLE).view(np.uint8).reshape(COLS, -1)
+        per[:, 0, PLW:PLW + 4 * PLE] = hl.view(np.uint8).reshape(COLS, -1)
         return per
 
     def _ple(self) -> str:

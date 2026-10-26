@@ -129,7 +129,7 @@ F_POST = 1 << 12  # a header: [partial sums | v, r] input, res = (res + v / rms(
 F_VOUT = 1 << 13  # the rows add into pend (the sub-layer's output v); with F_EMITR v and its partial sums go out
 F_PLI = 1 << 14  # the rows' outputs gelu(bf16(y)) pli, pli = bf16(p / rms(p) w + e): the meta object's payload
 # [p: slot 4][256] | [e: slot 4][256] bf16 (p: the per-layer projection's rows, ``gemma4.overlay``; rms over the 256),
-# w (fp32) after [w1 | w_post] in the phase's first norm-weight object
+# w (bf16 hi | lo) after [w1 | w_post] in the phase's first norm-weight object
 F_PZERO = 1 << 15  # pend = 0 first (an F_VOUT phase's first K group)
 F_TOK = 1 << 16  # (another core's object) a token object: the main core keeps M_TOK_NG + col (its cache A objects)
 F_KPAIR = 1 << 18  # (a header) its tiles hold row pairs of a matrix of K = POST_K (a row's super-blocks: two rows), run
@@ -288,7 +288,8 @@ class DecodeOverlayOperator(ArtcOperator):
                  ("yt", 4 * self.yt), ("stg", 2 * SLOTS * 2 * C_LEN), ("gs", 2 * 64), ("scr", gemv.SCR_BYTES)]
         if self.post:
             sizes += [("pend", 4 * SLOTS * self.res_pitch), ("ivv", 4 * 32)]
-        if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; the slots' 1 / rms(p) [slot][r 8] fp32)
+        if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; [slot][8] fp32 sums, then the slots' 1 / rms(p) [slot][r 8]
+            # bf16 hi | lo)
             sizes += [("pli", 2 * 2 * 4 * SLOTS * 8 + 4 * 32)]
         if self.gu_win:
             sizes += [("gw", 4 * SLOTS * (64 if self.yb == 128 else 32))]
