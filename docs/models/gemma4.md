@@ -21,7 +21,8 @@ Paths below are under `src/models/` (Gemma's own code: `gemma4/`) and `src/artli
 design, compiled once: the decode overlay shared with Qwen3.5 and Llama (`artlite.decode`), with the attention cores it
 shares with Llama in Gemma's configuration (`decode/attn.py`, `gemma4/attn.py`). The host builds every dispatch's
 transaction (`gemma4/overlay.py`, `GemmaOverlay`); the cores read what to do from the metadata of their input objects.
-The host computes the tokens' scaled embeddings and per-layer inputs (`src/models/gemma4/host.py`).
+The host reads the tokens' embedding rows and per-layer embedding rows (`src/models/gemma4/host.py`); a dispatch's
+first phase projects the embeddings to the per-layer inputs (the prefill's chunks: on the host).
 - A dispatch runs up to 4 token slots through all 42 layers and the LM head, streaming the weights
   once for all of them.
 - Cores per column: the main core and its helper run the projections (Q4_0 / Q8_0 tiles on the
@@ -37,8 +38,8 @@ The host computes the tokens' scaled embeddings and per-layer inputs (`src/model
   model's own choice at its position is that draft.
 
 Memory:
-- The weights the NPU streams (3.01 GB of the 4.59 GB file) are re-laid-out into a device buffer
-  at load, in memory, at their quantization's size. Nothing is written to disk.
+- The weights the NPU streams (3.04 GB of the 4.59 GB file, the per-layer projection as a Q8_0 copy among them) are
+  re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.
 - The per-layer token embedding (1.6 GB) stays in the mapped file: one row per token is read.
 - The KV cache: 222 MB at 4096 positions (every cache linear in the positions, the sliding-window
   ones too: the prefill writes and reads them as the decode does).

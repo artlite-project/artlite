@@ -14,4 +14,8 @@ bool dequant_supported(std::string_view qtype);
 /// fused multiply-adds): the same values.
 void dequant_rows(std::string_view qtype, const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* out);
 
+/// n rows of cols bf16 values (their bits) quantized into Q8_0 blocks (out: n x cols / 32 x 34 bytes), as ggml's
+/// quantize_row_q8_0_ref: per 32 values d = max |v| / 127 (stored as fp16), q = round(v / d).
+void quantize_q8_0(const uint16_t* bf16, size_t n, size_t cols, uint8_t* out);
+
 }  // namespace artlite

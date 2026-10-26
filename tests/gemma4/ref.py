@@ -4,7 +4,8 @@ residual updates, the attention cores): fp32 math on the dequantized weights wit
 - main cores: the residual stream in fp32 (each column's slice), updated exactly at every header: (r + v / rms(v)
   w_post) scale with v the sub-layer's fp32 rows; a header's GEMV input from the bf16 copies, (bf16(r) + bf16(v) /
   rms(v) w_post) w1, scaled by 1 / rms of those values (``header``); every other GEMV output rounded to bf16;
-  gelu(bf16(gate)) up, gelu(bf16(y)) pli. (Not modelled: the MMUL panels keep 14 bits below the largest of 8
+  gelu(bf16(gate)) up, gelu(bf16(y)) pli with pli = bf16(p / rms(p) w / sqrt(2) + bf16(e)), p the bf16 rows of the
+  per-layer projection's Q8_0 copy (``npu_pli``). (Not modelled: the MMUL panels keep 14 bits below the largest of 8
   elements; the sums of 32 products are rounded to bf16 before their scale.)
 - attention cores (``decode.attn_ref.AttentionRef`` with its norms): q, k normed and rotated in fp32 (fp32 cos / sin), k
   cached as bfp16 hi + lo blocks (or one), v normed to bf16 and cached as bfp16 blocks per dim over the 8 positions of a
@@ -15,8 +16,13 @@ residual updates, the attention cores): fp32 math on the dequantized weights wit
 ``GemmaNpuRef`` runs a list of layers of a GGUF file (and a truncated LM head) that way, one token after the other.
 """
 
+import math
+
 import numpy as np
 import torch
+
+from artlite import _native
+from artlite.gguf_model import QTensor
 
 from ..decode.attn_ref import AttentionRef, bf, inv_rms
 from .cpu import GemmaCpu, gelu
@@ -30,6 +36,19 @@ class GemmaNpuRef(GemmaCpu):
     def __init__(self, gguf: object, layers: list[int], vocab: int, *, kp: int = 2):
         super().__init__(gguf)
         self.layers, self.vocab, self.kp = layers, vocab, kp
+
+    def npu_pli(self, tokens: list[int], x: torch.Tensor) -> torch.Tensor:
+        """(T, layers, per_layer_dim) the decode's per-layer inputs: p = bf16(bf16(x) W^T) of the projection's Q8_0
+        copy (``gemma4.image``), bf16(p / rms(p) w / sqrt(2) + bf16(e)) (e: ``layer_rows``)."""
+        cfg, d = self.cfg, self.cfg.per_layer_dim
+        t = self.gguf.tensor("per_layer_model_proj.weight")
+        raw = np.empty((t.rows, t.cols // 32 * 34), np.uint8)
+        _native.quantize_q8_0(np.ascontiguousarray(t.raw), raw)
+        w = QTensor(name="ple", qtype="Q8_0", rows=t.rows, cols=t.cols, raw=raw).dequantize()
+        p = bf(bf(x) @ w.T).view(len(tokens), -1, d)
+        inv = torch.rsqrt(p.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps * cfg.hidden_size)
+        wn = self.mat("per_layer_proj_norm.weight") / math.sqrt(2.0)
+        return bf(p * inv * wn + bf(torch.from_numpy(self.layer_rows(tokens))))
 
     def mv(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """W x in fp32 (the GEMV's rows before their rounding)."""
@@ -52,7 +71,7 @@ class GemmaNpuRef(GemmaCpu):
         f = np.asarray(cfg.rope_freq_factors) if cfg.rope_freq_factors is not None else np.ones(hds[1] // 2)
         rot = {True: hds[0] // 2, False: int((f[:hds[1] // 2] < 1e10).sum())}
         x = self.embed(tokens)
-        pli = bf(self.per_layer_inputs(tokens, x))
+        pli = self.npu_pli(tokens, x) if cfg.per_layer_dim else None
         r, v = x.clone(), None
         prev: tuple[torch.Tensor, float] | None = None  # (post norm weight, scale) of the update that ends a layer
         self.caches: dict[int, AttentionRef] = {}

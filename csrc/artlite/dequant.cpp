@@ -1,11 +1,13 @@
 // GGUF rows dequantized on the host (``gguf_model.GGUFFile.rows``: a decode step's embedding lookup), the fp32
-// operations of ``gguf_model.QTensor.dequantize`` in their order: compiled with -ffp-contract=off (CMakeLists.txt).
+// operations of ``gguf_model.QTensor.dequantize`` in their order: compiled with -ffp-contract=off (CMakeLists.txt);
+// bf16 rows quantized to Q8_0 (a weight image's copy of a BF16 matrix in a format its cores read).
 
 #include "artlite/dequant.h"
 
-#include <bit>
-#include <cstring>
 #include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +26,15 @@ float f16(const uint8_t* p) {
   if (e) return std::bit_cast<float>(s | (e + 112) << 23 | m << 13);
   const float v = float(m) * 0x1p-24f;  // (subnormal: m 2^-24, exact)
   return s ? -v : v;
+}
+
+// fp32 -> fp16 bits, rounded to nearest even
+uint16_t to_f16(float f) {
+  const uint32_t x = std::bit_cast<uint32_t>(f), s = (x >> 16) & 0x8000, a = x & 0x7FFFFFFF;
+  if (a >= 0x7F800000) return uint16_t(s | 0x7C00 | (a > 0x7F800000 ? 0x200 : 0));
+  if (a >= 0x477FF000) return uint16_t(s | 0x7C00);  // (65520 and up: infinity)
+  if (a < 0x38800000) return uint16_t(s | uint32_t(std::nearbyint(std::bit_cast<float>(a) * 0x1p24f)));  // (subnormal)
+  return uint16_t(s | (a - 0x38000000 + 0xFFF + ((a >> 13) & 1)) >> 13);
 }
 
 // Q4_0 (18 B per 32): w = (q - 8) d; values 0 .. 15 the low nibbles, 16 .. 31 the high
@@ -151,6 +162,33 @@ void dequant_rows(std::string_view qtype, const uint8_t* raw, size_t n, size_t r
   }
   std::vector<std::thread> ts;
   for (size_t i = 0; i < nt; i++) ts.emplace_back(rows_of, t, raw, n * i / nt, n * (i + 1) / nt, row_bytes, cols, out);
+  for (auto& th : ts) th.join();
+}
+
+void quantize_q8_0(const uint16_t* bf16, size_t n, size_t cols, uint8_t* out) {
+  if (cols % 32) throw Error("quantize_q8_0: " + std::to_string(cols) + " columns (blocks of 32)");
+  const size_t blocks = n * cols / 32;
+  auto run = [&](size_t b0, size_t b1) {
+    for (size_t b = b0; b < b1; b++) {
+      float v[32], amax = 0.0f;
+      for (int j = 0; j < 32; j++) {
+        v[j] = std::bit_cast<float>(uint32_t(bf16[32 * b + j]) << 16);
+        amax = std::max(amax, std::fabs(v[j]));
+      }
+      const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+      uint8_t* o = out + 34 * b;
+      const uint16_t h = to_f16(d);
+      std::memcpy(o, &h, 2);
+      for (int j = 0; j < 32; j++) o[2 + j] = uint8_t(int8_t(std::round(v[j] * id)));
+    }
+  };
+  const size_t nt = std::min<size_t>(blocks / 4096, std::max(1u, std::thread::hardware_concurrency() / 2));
+  if (nt <= 1) {
+    run(0, blocks);
+    return;
+  }
+  std::vector<std::thread> ts;
+  for (size_t i = 0; i < nt; i++) ts.emplace_back(run, blocks * i / nt, blocks * (i + 1) / nt);
   for (auto& th : ts) th.join();
 }
 

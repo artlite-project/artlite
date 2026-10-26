@@ -207,16 +207,16 @@ def test_prefill_caches(n: int, p0: int) -> None:
     x = host.embed(ids)
     pli = host.per_layer_inputs(ids, x, bf16=True)
     x = x.bfloat16().float()  # (the app's inputs: bf16)
-    pli = pli.bfloat16()
+    pli, e = pli.bfloat16(), host.layer_rows(ids)
     ov = GemmaOverlay(g, layers=layers, vocab=COLS * 64, max_positions=1024)
     ov.load()
     for t in range(0, p0 + n, 4):  # the decode path
         s = min(4, p0 + n - t)
-        ov.step(x[t:t + s], pli[t:t + s], t, logits=False)
+        ov.step(x[t:t + s], e[t:t + s], t, logits=False)
     want = {L: ov.read_kv(L, range(p0 + n)) for L in layers}
     ov.reset()
     for t in range(0, p0, 4):
-        ov.step(x[t:t + 4], pli[t:t + 4], t, logits=False)
+        ov.step(x[t:t + 4], e[t:t + 4], t, logits=False)
     pf = GemmaPrefill(ov).compile().bind()
     t = p0
     for T in pf.plan(p0, n):

@@ -5,9 +5,10 @@ A decode dispatch runs up to four consecutive tokens on one stream of the weight
 the main and helper cores, the attention and the KV cache on the attention cores. A prompt runs in chunks of up to
 2048 tokens through the prefill (``models.gemma4.prefill.GemmaPrefill``: GEMMs on the same weight image,
 its caches the decode's), only the layers that own a KV cache (24 of E4B's 42: the others read the caches of layers
-22 / 23); its last token runs as a decode step (the logits). The host computes what enters them - the tokens'
-embedding rows and per-layer inputs (``per_layer_model_proj`` of the embedding plus the per-layer embedding row; a
-chunk's on a worker thread while the previous chunk runs) - and samples from the logits.
+22 / 23); its last token runs as a decode step (the logits). The host reads what enters them - the tokens' embedding
+rows and per-layer embedding rows (a decode step's per-layer inputs: the NPU projects the embeddings, ``GemmaOverlay``;
+a prefill chunk's per-layer inputs, ``per_layer_model_proj`` of the embedding plus the per-layer embedding row, on a
+worker thread while the previous chunk runs) - and samples from the logits.
 
 Multi-token prediction (``NpuGemma.generate``, with the model's ``gemma4-assistant`` drafter, ``mtp-<model file>`` next
 to it: ``models.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
@@ -24,7 +25,6 @@ file, as is the token embedding's row.
 import functools
 import os
 import time
-from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 
 import numpy as np
@@ -52,14 +52,12 @@ class NpuGemma(OverlayModel):
     when it is there; None: none); ``kv_k``: the caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block
     per 8 dims)."""
 
-    INPUT_CACHE = 1024  # tokens whose inputs are kept (24 KB each)
     DRAFTS = BATCH - 1  # draft tokens per dispatch
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 8, prefill: bool = True,
                  drafter: str | None = "", kv_k: str = "hilo"):
         self.gguf = gguf
         self.host = GemmaHost(gguf, threads=threads)
-        self._inputs: OrderedDict[int, tuple[torch.Tensor, torch.Tensor | None]] = OrderedDict()
         self.cfg = self.host.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.final_logit_softcapping
@@ -85,8 +83,9 @@ class NpuGemma(OverlayModel):
             self.overlay.prepare(S, logits=False)
         if self.prefill is not None:  # (a prompt's last token after its chunk)
             self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
-        if self.cfg.per_layer_dim:
-            self.inputs(0)  # (the per-layer projection's bf16 copy before timing)
+        if self.cfg.per_layer_dim and self.prefill is not None:  # (the prefill's per-layer projection, a bf16 copy:
+            # before timing)
+            self.host.per_layer_inputs([0], self.host.embed([0]), bf16=True)
         gguf.release()
         self.position = 0
         self.t_draft = 0.0
@@ -107,30 +106,14 @@ class NpuGemma(OverlayModel):
         """Forget the cached positions."""
         self.position = 0
 
-    def _prepare(self, tokens: list[int]) -> None:
-        """The inputs of the tokens that are not kept, in one pass over the per-layer projection."""
-        new = list(dict.fromkeys(t for t in tokens if t not in self._inputs))
-        if not new:
-            return
-        x = self.host.embed(new)
-        pli = self.host.per_layer_inputs(new, x, bf16=True)
-        for i, t in enumerate(new):
-            self._inputs[t] = (x[i].bfloat16(), None if pli is None else pli[i].bfloat16())
-
-    def inputs(self, token: int) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """What the NPU needs of a token: its scaled embedding (hidden,) and its per-layer inputs
-        (layers, per_layer_dim), bf16. They depend on the token alone: the last ones are kept."""
-        self._prepare([token])
-        self._inputs.move_to_end(token)
-        return self._inputs[token]
+    def inputs(self, tokens: list[int]) -> tuple[torch.Tensor, np.ndarray | None]:
+        """What a decode step needs of its tokens: their scaled embeddings (n, hidden) as bf16 values, and their
+        per-layer token rows (n, layers, per_layer_dim; ``GemmaHost.layer_rows``) or None."""
+        e = self.host.layer_rows(tokens) if self.cfg.per_layer_dim else None
+        return self.host.embed(tokens).bfloat16().float(), e
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
-        """(the tokens' kept inputs: ``inputs``)"""
-        self._prepare(tokens)
-        ins = [self.inputs(t) for t in tokens]
-        while len(self._inputs) > self.INPUT_CACHE:
-            self._inputs.popitem(last=False)
-        return torch.stack([i[0] for i in ins]), None if ins[0][1] is None else torch.stack([i[1] for i in ins])
+        return self.inputs(tokens)
 
     def chunk_inputs(self, tokens: list[int], x: torch.Tensor | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -152,10 +135,10 @@ class NpuGemma(OverlayModel):
         layers, ~25 ms less than a decode step -, its input the chunk's residual stream)"""
         t0 = time.perf_counter()
         x = self.prefill.residual(n - 1)
-        pli = self.inputs(token)[1]
+        emb, e = self.inputs([token])
         self.t_host += time.perf_counter() - t0
-        return self._dispatch(lambda: self.overlay.step(x, None if pli is None else pli[None], self.position + n - 1,
-                                                        start=self.prefill.layers[-1])[0])
+        return self._dispatch(lambda: self.overlay.step(x, e, self.position + n - 1, start=self.prefill.layers[-1],
+                                                        emb=emb)[0])
 
     # ------------------------------------------------------------------
     # Multi-token prediction
@@ -184,7 +167,7 @@ class NpuGemma(OverlayModel):
         out: list[int] = []
         recent = penalties.copy() if penalties is not None and penalties.active else None
         while len(out) < n and token not in self.eos_token_ids:
-            x = self._inputs[token][0] if token in self._inputs else self.host.embed([token])[0]
+            x = self.host.embed([token])[0]
             raw = self.drafter.step(x, h if not out else None, self.position)
             if recent is None:
                 token = self.drafter.token(raw)

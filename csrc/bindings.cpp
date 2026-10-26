@@ -642,6 +642,19 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
   m.def(
       "dequant_supported", [](std::string qtype) { return artlite::dequant_supported(qtype); }, "qtype"_a,
       "Whether dequant_rows reads the GGUF type.");
+  m.def(
+      "quantize_q8_0",
+      [](nb::ndarray<const uint16_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> bf16,
+         nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> out) {
+        if (out.shape(0) != bf16.shape(0) || out.shape(1) != bf16.shape(1) / 32 * 34)
+          throw artlite::Error("quantize_q8_0: out is (rows, cols / 32 x 34)");
+        nb::gil_scoped_release release;
+        artlite::quantize_q8_0(bf16.data(), bf16.shape(0), bf16.shape(1), out.data());
+      },
+      "bf16"_a, "out"_a,
+      nb::sig("def quantize_q8_0(bf16: numpy.ndarray[numpy.uint16], out: numpy.ndarray[numpy.uint8]) -> None"),
+      "bf16 rows (their bits, (rows, cols)) as Q8_0 blocks into out (rows, cols / 32 x 34): ggml's "
+      "quantize_row_q8_0_ref.");
 
   // --- Sampling (models.common) ---
   m.def(

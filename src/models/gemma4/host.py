@@ -1,5 +1,6 @@
-"""What the host computes for Gemma 4 on the NPU: the scaled token embeddings and the per-layer inputs (E2B / E4B),
-from the GGUF file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
+"""What the host computes for Gemma 4 on the NPU: the scaled token embeddings, the per-layer token rows (E2B / E4B: the
+decode's per-layer inputs then come from the NPU's projection, ``gemma4.overlay``) and a prefill chunk's per-layer
+inputs, from the GGUF file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
 
 ``GemmaHost`` reads matrices dequantized to fp32 on first use, embedding rows by a lookup in the mapped file
 (``GGUFFile.rows``). Its ``mm`` and ``norm`` are methods so that models of other arithmetic can override them (the fp32
@@ -8,6 +9,7 @@ reference of the whole model, tests/gemma4/cpu.py, derives from it).
 
 import math
 
+import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
@@ -49,6 +51,13 @@ class GemmaHost:
     def embed(self, tokens: list[int]) -> torch.Tensor:
         """(T, hidden): the token embeddings * sqrt(hidden)."""
         return self.gguf.rows("token_embd.weight", tokens) * math.sqrt(self.cfg.hidden_size)
+
+    def layer_rows(self, tokens: list[int]) -> np.ndarray:
+        """(T, layers, per_layer_dim) fp32: the per-layer token embedding rows times sqrt(per_layer_dim / 2), the
+        per-layer inputs' token part (``per_layer_inputs``)."""
+        d = self.cfg.per_layer_dim
+        rows = self.gguf.rows("per_layer_token_embd.weight", tokens).numpy()
+        return (rows * np.float32(math.sqrt(d / 2))).reshape(len(tokens), -1, d)
 
     def per_layer_inputs(self, tokens: list[int], x: torch.Tensor, *, bf16: bool = False,
                          layers: int = 0) -> torch.Tensor | None:

@@ -123,7 +123,7 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: s
     trace: dict[str, torch.Tensor] = {}
     want = model.run(ids, trace)
     x = model.embed(ids)
-    pli = model.per_layer_inputs(ids, x)
+    e = model.layer_rows(ids)
 
     ov = GemmaOverlay(g, layers=layers, vocab=VOCAB, max_positions=64, kv_k=kv_k)
     ov.load()
@@ -134,7 +134,7 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: s
 
     for t0 in range(0, len(ids), batch):
         n = min(batch, len(ids) - t0)
-        logits = ov.step(x[t0:t0 + n], pli[t0:t0 + n], t0).float()
+        logits = ov.step(x[t0:t0 + n], e[t0:t0 + n], t0).float()
         ov.dev.fetch("ACT")
         act = ov.dev.view("ACT")
         for s in range(n):
@@ -278,7 +278,7 @@ def test_gemma_draft(cpu: _Cpu, npu: object) -> None:
         for _ in range(3):
             want = next(wants)
             got = torch.empty(npu.drafter.vocab)  # (the drafter's logits in vocabulary order)
-            got[torch.from_numpy(npu.drafter.rows)] = npu.drafter.step(npu.inputs(t)[0], x_h, p).float()
+            got[torch.from_numpy(npu.drafter.rows)] = npu.drafter.step(npu.inputs([t])[0][0], x_h, p).float()
             kls.append(float(_kl(want, got)))
             agree.append(int(want.argmax()) == int(got.argmax()))
             t, x_h = int(want.argmax()), None  # both sides continue with the reference's draft

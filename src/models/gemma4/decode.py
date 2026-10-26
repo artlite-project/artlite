@@ -2,7 +2,8 @@
 their GEMV phases on the image's Q4_0 / Q8_0 tiles, ``gemma4.image``) with Gemma's options and its attention cores:
 
 - the GEMV tiles split by rows between the main and helper cores (``decode.gemv.row_split``);
-- gate / up: gelu(bf16(gate)) up; the per-layer input gate: gelu(bf16(y)) pli (``F_PLI``);
+- gate / up: gelu(bf16(gate)) up; the per-layer input gate: gelu(bf16(y)) pli (``F_PLI``: pli from the per-layer
+  projection's rows, a phase of its own, and the host's per-layer token rows);
 - post-norm residual updates (``F_POST`` headers, ``F_VOUT`` outputs: the residual stays fp32 in the main cores);
 - packed inputs (``packed_slots``: the step's slots only);
 - the attention cores (c, 5) (``decode.attn``, Gemma's shapes ``gemma4/attn.py``): per KV head a chain of 4 columns

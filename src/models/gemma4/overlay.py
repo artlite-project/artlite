@@ -3,7 +3,11 @@ slots, the step.
 
 Per step (one dispatch; the weights stream once for all slots) the columns read the token objects (``attn``: per
 layer kind and sub-step its positions and cache ranges, the RoPE tables) and the slots' residual slices (F_LOADR: the
-embeddings, fp32), then per layer L (column c, KV head h = c / 4):
+embeddings, fp32); E2B / E4B then run the per-layer projection of the embeddings ("ple": column c's rows the 32 c .. of
+each layer's 256, ``image``), its rows drained as p into the gate phases' metadata objects [p: slot][256] (one BD per
+column: the gate input regions sit ``gate_pitch`` apart; e, the host's per-layer token rows sqrt(256 / 2), in the
+other half), from which each gate phase completes its column's per-layer inputs (``decode.design.F_PLI``); then per
+layer L (column c, KV head h = c / 4):
 
 - qkv: the input norm (layer 0: of x; later layers: a header, below), the rows of query head c and the column's
   quarter of [K_h; V_h] -> the KV head's attention region [q objects SLOTS | raw K / V objects SLOTS];
@@ -43,6 +47,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode import kv
 from artlite.decode.design import (
@@ -75,14 +80,15 @@ from artlite.decode.model import InputRegion, ModelOverlay
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
-from artlite.operators.util import bf16_bits, bf16_value
+from artlite.operators.util import bf16_bits, bf16_value, rup
 from artlite.overlay import Sequence, Transaction, WeightBuffer
 
 from . import attn as AT
 from .decode import GemmaDecodeOperator
-from .image import TILE_BYTES, GemmaImage
+from .image import PLE, TILE_BYTES, GemmaImage
 
 PHASES = ("qkv", "att", "o", "gate_up", "down", "gate", "proj")
+PLE_PHASE = (-1, "ple")  # (E2B / E4B: the per-layer projection, the step's first phase)
 GUARD = 16  # cache groups before a sliding-window cache's first one (the prefill attention reads its window's 16
 # groups before a position from there on, also before position 0: positions it masks)
 KV_PAD = 2048  # positions past the caches (the last layer's): the prefill's sub-chunk slices of a cache
@@ -131,7 +137,7 @@ class GemmaOverlay(ModelOverlay):
         self.max_positions = self.n_full * pg_f
         self.n_swa = GUARD + -(-self.max_positions // pg_s)  # (a sliding-window cache: linear, after its guard)
         self.period = max(at.pg.values())  # (the steps' sub-steps repeat with the groups)
-        self._pli_idx: np.ndarray | None = None
+        self._e_idx: np.ndarray | None = None
         self._trec: dict[tuple[int, int], int] = {}  # (M_ATREC as the F_ATT objects hold it, per layer and first slot)
         self._plan()
 
@@ -144,6 +150,7 @@ class GemmaOverlay(ModelOverlay):
         cache)."""
         out = [(L, n) for L in self.layers if L >= self.start for n in PHASES
                if n not in ("gate", "proj") or self.cfg.per_layer_dim]
+        out = [PLE_PHASE, *out] if self.cfg.per_layer_dim else out
         if not lm:
             own = [L for L in self.layers if self.cfg.kv_source(L) == L]
             return out[:out.index((own[-1], "att")) + 1] if own else []
@@ -154,7 +161,7 @@ class GemmaOverlay(ModelOverlay):
         return {"qkv": F_NORM | (F_POST if L != self.layers[0] else 0) | (F_PZERO if L == self.start != self.layers[0]
                                                                          else 0), "o": F_VOUT | F_PZERO | F_EMITR,
                 "gate_up": F_POST | F_NORM | F_GU, "down": F_VOUT | F_PZERO | F_EMITR, "gate": F_POST | F_PLI,
-                "proj": F_VOUT | F_PZERO | F_EMITR, "lm": F_POST | F_NORM}[name]
+                "proj": F_VOUT | F_PZERO | F_EMITR, "lm": F_POST | F_NORM, "ple": 0}[name]
 
     def _scale(self, L: int, name: str) -> float:
         sc = self.image.norms(L, name)[2]
@@ -167,8 +174,16 @@ class GemmaOverlay(ModelOverlay):
         take = self._take
         self.tok = take("ACT", AT.TOKENS * XB)
         self.loadr = take("ACT", COLS * SLOTS * XB)
+        if cfg.per_layer_dim:  # (the gate inputs gate_pitch apart: the per-layer projection's drains, ``_outputs``)
+            for L in self.layers:
+                self._add_inputs((L, "gate"), post=True)
+            offs = [self.inp[(L, "gate")][0].off for L in self.layers]
+            self.gate_pitch = rup(post_region_bytes(H))
+            assert offs == [offs[0] + i * self.gate_pitch for i in range(len(offs))]
+            if len(offs) % 2:
+                take("ACT", self.gate_pitch)  # (the padding layer's rows: a sink)
         for L, name in self.phases():
-            if name != "att":
+            if name not in ("att", "gate"):
                 self._add_inputs((L, name), post=bool(self._flags(L, name) & F_POST))
         self.final = take("ACT", post_region_bytes(H))  # (the LM header's updated residual)
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
@@ -304,6 +319,11 @@ class GemmaOverlay(ModelOverlay):
                 self._values_to(seq, c, (L, "down"), e0=ffn * c, n=ffn, S=S)
             elif name == "gate":
                 self._values_to(seq, c, (L, "proj"), e0=64 * c, n=C_LEN, S=S)
+            elif name == "ple":  # (C object j: the 32 rows of layers 2 j, 2 j + 1 -> their gate inputs' p [slot][256])
+                pairs, pw = -(-len(self.layers) // 2), self.gate_pitch // 4
+                g0 = self.inp[(self.layers[0], "gate")][0].off + 4 * META + 2 * PLE * c
+                seq.drain("C", c, dev.address("ACT", g0), S * 2 * C_LEN, (PLE // 2, 2, pw, 2 * PLE * COLS // 4), pairs,
+                          (2 * pw, pairs))
             elif name == "lm":
                 self._logits_out(seq, c, S)
 
@@ -369,8 +389,10 @@ class GemmaOverlay(ModelOverlay):
             if name == "att":
                 self._attention(seq, st, L, run(i + 1))
                 continue
-            if i == 0:
-                self._weight_run(seq, run(0))
+            if (L, name) == PLE_PHASE:  # (a run of its own: a step from a later layer on skips the layers between)
+                self._weight_run(seq, [PLE_PHASE])
+            elif i == 0 or ph[i - 1] == PLE_PHASE:
+                self._weight_run(seq, run(i))
             self._gemv(seq, st, (L, name))
         seq.sync(fills=True)
         st.tr = Transaction(dev, seq.words())
@@ -509,15 +531,17 @@ class GemmaOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: torch.Tensor, pli: torch.Tensor | None, position: int, *, logits: bool = True,
-             start: int | None = None) -> torch.Tensor | None:
-        """One step of S = len(x) <= 4 token slots: x (S, hidden) the scaled embeddings, pli (S, layers, per_layer_dim)
-        the per-layer inputs, at positions position .. position + S - 1 (the positions before are cached). Returns the
-        raw logits (S, vocab) bf16 (before the soft cap; a view of the NPU's buffer, valid until the next step), or
-        without ``logits`` None (only the caches are updated). ``start``: the step from that layer on, x its input (e.g.
-        a prompt's last token after a prefill chunk: ``GemmaPrefill.residual``): its qkv phase is a header whose update
-        adds nothing (F_PZERO: pend = 0; v and the partial sums 0: 1 / rms(v) stays finite) to res = x / (the previous
-        layer's output scale), so the header's residual is x."""
+    def step(self, x: torch.Tensor, e: np.ndarray | None, position: int, *, logits: bool = True,
+             start: int | None = None, emb: torch.Tensor | None = None) -> torch.Tensor | None:
+        """One step of S = len(x) <= 4 token slots: x (S, hidden) the scaled embeddings, e (S, layers, per_layer_dim)
+        the model's per-layer token rows times sqrt(per_layer_dim / 2) (``GemmaHost.layer_rows``; E2B / E4B), at positions
+        position .. position + S - 1 (the positions before are cached). Returns the raw logits (S, vocab) bf16 (before
+        the soft cap; a view of the NPU's buffer, valid until the next step), or without ``logits`` None (only the
+        caches are updated). ``start``: the step from that layer on, x its input (e.g. a prompt's last token after a
+        prefill chunk: ``GemmaPrefill.residual``; ``emb``: the scaled embeddings, the per-layer projection's input):
+        its qkv phase is a header whose update adds nothing (F_PZERO: pend = 0; v and the partial sums 0: 1 / rms(v)
+        stays finite) to res = x / (the previous layer's output scale), so the header's residual is x."""
+        emb = (x if emb is None else emb).reshape(-1, self.H).float()
         x = x.reshape(-1, self.H).float()
         S = x.shape[0]
         assert 1 <= S <= SLOTS
@@ -542,21 +566,23 @@ class GemmaOverlay(ModelOverlay):
         if start != self.layers[0]:
             hx[:, 0] = 0
         dev.flush("ACT", h0 - XPAY, XPAY + 4 * sp * H)
-        if self.cfg.per_layer_dim and pli is not None:
-            self._write_pli(pli.reshape(S, -1, self.cfg.per_layer_dim))
+        if self.cfg.per_layer_dim:
+            self._write_input(self.inp[PLE_PHASE][0], interleave(emb.numpy(), sp).view(np.uint8).reshape(-1))
+            self._write_e(np.asarray(e, np.float32).reshape(S, -1, self.cfg.per_layer_dim))
         return self._run(S, position, logits)
 
-    def _write_pli(self, pli: torch.Tensor) -> None:
-        """Each layer's gate meta object: [slot 4][column 8][32] bf16 of the slots' per-layer inputs."""
-        S, d = pli.shape[0], self.cfg.per_layer_dim
-        b = pli.bfloat16().view(torch.int16).numpy().view(np.uint16)  # (S, layers, ple)
-        offs = [self.inp[(L, "gate")][0].off + 4 * META for L in self.layers]
-        if self._pli_idx is None:  # (per layer its slots' elements in ACT, as uint16 indices)
-            self._pli_idx = (np.array(offs)[:, None, None] // 2 + d * np.arange(SLOTS)[None, :, None]
-                             + np.arange(d)[None, None, :])
-        self.dev.view("ACT").view(np.uint16)[self._pli_idx[:, :S]] = b[:, self.layers].transpose(1, 0, 2)
+    def _write_e(self, e: np.ndarray) -> None:
+        """Each layer's gate meta object: e [slot 4][per_layer_dim] bf16 after p (``decode.design.F_PLI``; e: the model's
+        layers)."""
+        S, d = e.shape[0], self.cfg.per_layer_dim
+        b = e[:, self.layers].astype(bfloat16).view(np.uint16)  # (S, the overlay's layers, d)
+        offs = [self.inp[(L, "gate")][0].off + 4 * META + 2 * SLOTS * d for L in self.layers]
+        if self._e_idx is None:  # (per layer its slots' elements in ACT, as uint16 indices)
+            self._e_idx = (np.array(offs)[:, None, None] // 2 + d * np.arange(SLOTS)[None, :, None]
+                           + np.arange(d)[None, None, :])
+        self.dev.view("ACT").view(np.uint16)[self._e_idx[:, :S]] = b.transpose(1, 0, 2)
         for off in offs:
-            self.dev.flush("ACT", off, 2 * SLOTS * d)
+            self.dev.flush("ACT", off, 2 * S * d)
 
     def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions of an own-cache layer: K normed and rotated

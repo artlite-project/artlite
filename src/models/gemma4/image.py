@@ -16,12 +16,21 @@ Per-column rows (layer L, column c, KV head h = c / 4, j = c % 4; hd: the layer'
 - "proj" reads its input (per_layer values) in column slots of 64: the gate phase's column c drains its 32 outputs and
   32 zeros to elements 64 c ..; its tiles hold ``proj``'s columns 32 c .. at 64 c .. and zero weights between (the
   re-laid-out copy ``_slotted``: GGUF blocks of 32 columns, a zero block after each);
-- "lm": rows vocab / 8 c .. of the LM head (``token_embd``, tied).
+- "lm": rows vocab / 8 c .. of the LM head (``token_embd``, tied);
+- "ple" (layer -1, before layer 0: the step's first phase), E2B / E4B: the per-layer projection
+  (``per_layer_model_proj``, BF16 in the files: a Q8_0 copy, ``_ple``), column c's rows the 32 c .. of each layer's
+  per_layer_dim (the per-layer inputs its gate phases take), an even number of layers (a padding one: zero rows); the
+  gate phases' first norm-weight object holds the column's 32 per_layer_proj_norm weights / sqrt(2) (fp32) after
+  [w1 | w_post] (``PLW``).
 """
+
+import dataclasses
+import math
 
 import numpy as np
 import torch
 
+from artlite import _native
 from artlite.decode import gemv
 from artlite.decode.design import MAX_K, NX_PER_NORM, OBJ_K, POST_K
 from artlite.decode.image import TileImage, column_rows, gate_up_rows
@@ -33,6 +42,9 @@ KC = 512  # K chunk of a tile
 TILE_BYTES = 9216
 FORMATS = ("Q4_0", "Q8_0")  # (the decode GEMV's row-split tiles at KC)
 SLOT = 64  # the proj input's column slots
+PLE = 32  # per-layer inputs per column (per_layer_dim / COLS)
+PLW = 4 * NX_PER_NORM * POST_K  # (bytes) where a gate phase's first norm-weight object holds the column's PLE weights
+PLE_Q8 = "per_layer_model_proj.weight/Q8_0"  # (the per-layer projection's copy: ``_ple``)
 
 
 def kv_rows(hd: int) -> np.ndarray:
@@ -58,6 +70,9 @@ class GemmaImage(TileImage):
                          vocab=cfg.vocab_size if vocab is None else vocab, max_rows=gemv.row_splits(KC // 256),
                          column_major=True)
         assert self.vocab % (COLS * 16) == 0 and H % (COLS * 64) == 0
+        if cfg.per_layer_dim:
+            assert cfg.per_layer_dim == COLS * PLE, "per-layer inputs: 32 per column"
+            self._add(-1, "ple", [("ple", (self._ple(),), self.ple_rows())], H)
         for L in self.layers:
             self._layer(L)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
@@ -118,7 +133,40 @@ class GemmaImage(TileImage):
         b = torch.from_numpy(np.ascontiguousarray(objs)).bfloat16().view(torch.int16).numpy().view(np.uint8)
         out = np.zeros((n, T), np.uint8)
         out[:, :b.shape[1]] = b
-        return out
+        if name != "gate":
+            return out
+        assert b.shape[1] == PLW and PLW + 4 * PLE <= T
+        w = (self._vec("per_layer_proj_norm.weight") / np.float32(math.sqrt(2.0))).astype(np.float32)
+        per = np.repeat(out[None], COLS, 0)  # (each column's own: its PLE weights)
+        per[:, 0, PLW:PLW + 4 * PLE] = w.reshape(COLS, PLE).view(np.uint8).reshape(COLS, -1)
+        return per
+
+    def _ple(self) -> str:
+        """The per-layer projection as a Q8_0 copy (``_native.quantize_q8_0``: ggml's rounding)."""
+        t = self.gguf.tensor("per_layer_model_proj.weight")
+        assert t.qtype == "BF16", t.qtype
+        raw = np.empty((t.rows, t.cols // 32 * 34), np.uint8)
+        _native.quantize_q8_0(np.ascontiguousarray(t.raw), raw)
+        self._own[PLE_Q8] = QTensor(name=PLE_Q8, qtype="Q8_0", rows=t.rows, cols=t.cols, raw=raw)
+        return PLE_Q8
+
+    def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
+        """(once: the per-layer projection's copy is dropped after it)"""
+        dirty = super().pack(out, threads=threads, release=release)
+        if PLE_Q8 in self._own:
+            t = self._own[PLE_Q8]
+            assert t.raw.size, "the image is packed once"
+            self._own[PLE_Q8] = dataclasses.replace(t, raw=t.raw[:0])
+        return dirty
+
+    def ple_rows(self) -> np.ndarray:
+        """(COLS, PLE n) rows of the per-layer projection: column c's the PLE c .. of each of the n layers (an even
+        number: a padding layer of -1 after an odd count)."""
+        d = self.cfg.per_layer_dim
+        rows = [L * d + PLE * np.arange(COLS)[:, None] + np.arange(PLE)[None] for L in self.layers]
+        if len(rows) % 2:
+            rows.append(np.full((COLS, PLE), -1, np.int64))
+        return np.concatenate(rows, 1)
 
     def fmt(self, name: str) -> str:
         f = super().fmt(name)

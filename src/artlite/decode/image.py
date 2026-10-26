@@ -166,9 +166,13 @@ class TileImage:
         self._views[name] = QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
                                     raw=t.raw.reshape(t.rows * n, -1))
 
+    def qtype(self, name: str) -> str:
+        """A tensor's GGUF type (a substitute's: ``_own``)."""
+        return self._own[name].qtype if name in self._own else self.gguf.tensor_info[name][1]
+
     def fmt(self, name: str) -> str:
         """A tensor's tile format (F32: BFP16 planes, ``Block``)."""
-        qtype = self.gguf.tensor_info[name][1]
+        qtype = self.qtype(name)
         return "BFP16" if qtype == "F32" else tile_format(qtype)
 
     def _choose_tile_bytes(self) -> int:
@@ -210,7 +214,7 @@ class TileImage:
             fmt = fmts.pop()
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
-            pairs = all(self.gguf.tensor_info[t][1] == "F32" for t in tensors)
+            pairs = all(self.qtype(t) == "F32" for t in tensors)
             blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs))
         n_kc = -(-K // self.kc)
         return Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes, self.kc,
@@ -278,16 +282,18 @@ class TileImage:
         return out
 
     def norm_objects(self, layer: int, name: str) -> np.ndarray:
-        """The norm-weight objects of phase ``name`` (uint8, the bytes of its data region "<name>_norm"; the model's)."""
+        """The norm-weight objects of phase ``name`` (uint8, the bytes of its data region "<name>_norm", or (COLS, ...):
+        each column's own; the model's)."""
         raise NotImplementedError
 
     def _fill_data(self, out: np.ndarray) -> None:
-        """Write the data regions: every column's copy of a phase's ``norm_objects``."""
+        """Write the data regions: every column's copy of a phase's ``norm_objects`` (or its own)."""
         for r in self.regions:
             if r.data:
-                objs = self.norm_objects(r.layer, r.name.removesuffix("_norm")).reshape(-1)
+                objs = self.norm_objects(r.layer, r.name.removesuffix("_norm"))
+                per = objs.reshape(COLS, -1) if objs.ndim == 3 else np.broadcast_to(objs.reshape(1, -1), (COLS, objs.size))
                 for c in range(COLS):
-                    out[r.offset + c * r.col_stride:][:objs.size] = objs
+                    out[r.offset + c * r.col_stride:][:per.shape[1]] = per[c]
 
     def region(self, layer: int, name: str) -> Region:
         return self._index[(layer, name)]

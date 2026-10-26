@@ -127,7 +127,9 @@ F_MSG = 64  # the outputs go to the model's core on M instead of C
 # (``post`` designs: post-norm residual updates, Gemma)
 F_POST = 1 << 12  # a header: [partial sums | v, r] input, res = (res + v / rms(v) w_post) scale, x = r w1
 F_VOUT = 1 << 13  # the rows add into pend (the sub-layer's output v); with F_EMITR v and its partial sums go out
-F_PLI = 1 << 14  # the rows' outputs gelu(bf16(y)) pli (pli: the meta object's payload, [slot 4][column][32] bf16)
+F_PLI = 1 << 14  # the rows' outputs gelu(bf16(y)) pli, pli = bf16(p / rms(p) w + e): the meta object's payload
+# [p: slot 4][256] | [e: slot 4][256] bf16 (p: the per-layer projection's rows, ``gemma4.overlay``; rms over the 256),
+# w (fp32) after [w1 | w_post] in the phase's first norm-weight object
 F_PZERO = 1 << 15  # pend = 0 first (an F_VOUT phase's first K group)
 F_TOK = 1 << 16  # (another core's object) a token object: the main core keeps M_TOK_NG + col (its cache A objects)
 F_KPAIR = 1 << 18  # (a header) its tiles hold row pairs of a matrix of K = POST_K (a row's super-blocks: two rows), run
@@ -286,8 +288,8 @@ class DecodeOverlayOperator(ArtcOperator):
                  ("yt", 4 * self.yt), ("stg", 2 * SLOTS * 2 * C_LEN), ("gs", 2 * 64), ("scr", gemv.SCR_BYTES)]
         if self.post:
             sizes += [("pend", 4 * SLOTS * self.res_pitch), ("ivv", 4 * 32)]
-        if self.pli:
-            sizes += [("pli", 2 * 4 * SLOTS * 8)]
+        if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; the slots' 1 / rms(p) [slot][r 8] fp32)
+            sizes += [("pli", 2 * 2 * 4 * SLOTS * 8 + 4 * 32)]
         if self.gu_win:
             sizes += [("gw", 4 * SLOTS * (64 if self.yb == 128 else 32))]
         if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
@@ -330,7 +332,8 @@ class DecodeOverlayOperator(ArtcOperator):
               "Y_FLOATS": gemv.Y_FLOATS}
         return src + _SRC.render(p=p, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
                                  WIN=WINS.get(self.win, 0),
-                                 RES_PITCH=self.res_pitch, eps=repr(self.eps), META=META, C_LEN=C_LEN, NBLK=NBLK,
+                                 RES_PITCH=self.res_pitch, eps=repr(self.eps), ple_eps=repr(self.eps * self.hidden),
+                                 META=META, C_LEN=C_LEN, NBLK=NBLK,
                                  SLOTS=SLOTS, XPAY=XPAY, OBJ_K=OBJ_K, NX_PER_NORM=NX_PER_NORM, gv=Attr(gv),
                                  rows=list(self.rows.items()), fid={n: f.fid for n, f in FORMATS.items()},
                                  rowsplit=bool(self.rowsplit), rows_split=self.rowsplit,
