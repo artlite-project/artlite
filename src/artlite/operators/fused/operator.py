@@ -83,7 +83,7 @@ class FusedOperator(FusedElf):
     # ------------------------------------------------------------------
 
     def _load(self, elf: ParsedElf) -> None:
-        """The data BOs (SHMEM: PASID-based DMA; the external buffers live in other BOs) and the control program with
+        """The data BOs (PASID-based DMA; the external buffers live in other BOs) and the control program with
         every BD address patched, in an instruction BO."""
         super()._load(elf)
         dev, sizes = self._device, self.layout.space_bytes

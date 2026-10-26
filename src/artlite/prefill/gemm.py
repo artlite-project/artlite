@@ -124,10 +124,11 @@ def _plan(region: Region, run: list[int], T: int, K: int, few: bool) -> object:
 
 
 def _extents(region: Region, run: list[int], T: int, K: int, few: bool) -> list[int]:
-    """Output columns per column of each block of a run (whole passes)."""
+    """Output columns per column of each block of a run (whole passes; planar: to the end of the last whole-line
+    window, ``PlanarPlan.line_pitches``)."""
     b = region.blocks[run[0]]
     if is_planar(b.fmt, b.R, region.kc):
-        return list(_plan(region, run, T, K, few).pitches)
+        return list(_plan(region, run, T, K, few).line_pitches)
     return [ROWS * -(-region.blocks[i].tiles // _tp(region.blocks[i])) for i in run]
 
 
@@ -176,7 +177,7 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
     if is_planar(b0.fmt, b0.R, region.kc):
         plan = _plan(region, run, plan_T or T, region.K, few)
         blocks = tuple((rt0 + r, n) for r, n in plan.blocks)
-        kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks)
+        kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks, lines=True)
         rt_end = max(r + plan.tiles * n for r, n in blocks)
     else:
         blocks = tuple((region.rt0[region.blocks[i].name], -(-region.blocks[i].tiles // _tp(region.blocks[i])))
@@ -249,7 +250,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
             kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": -(-ffn * COLS // KC) * KC, "tile_bytes": S,
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
-                  "blocks": ((tp * p0, p1 - p0),)}
+                  "blocks": ((tp * p0, p1 - p0),), "lines": True}
             if is_planar(b.fmt, b.R, KC):
                 kw["tiles"] = tp
             op = _gemm(kw, T, which, ops)

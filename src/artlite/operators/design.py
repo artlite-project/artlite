@@ -58,12 +58,13 @@ _check_walk_size = _objectfifo._check_walk_size
 
 def _check_padded_walk_size(tap: TensorAccessPattern | None, sizes: list[int], emits: int, what: str) -> None:
     """IRON's check that a padded ``to_stream`` emits exactly one consumer object, relaxed to whole objects:
-    a memtile object may pad into several (GemmQd's planar weights: 4 k-tiles -> 4 L1 objects); a partial read
-    (all-zero padding, ``stream_walk``) may emit less than an object: only towards a shim, whose drains set the
-    transfer lengths (GemmQd's packed C rows)."""
+    a memtile object may pad into several (GemmQd's planar weights: 4 k-tiles -> 4 L1 objects); a walk with all-zero
+    padding (``stream_walk``) may emit less than an object (a partial read) or more (rows read past their end, into
+    the next): only towards a shim, whose drains set the transfer lengths (GemmQd's packed C rows, whole-line
+    windows)."""
     if tap is not None and tap.padding is not None:
         n = math.prod(tap.padded_sizes)
-        partial = not any(b or a for b, a in tap.padding) and n < emits
+        partial = not any(b or a for b, a in tap.padding)
         if n % emits == 0 or partial:
             emits = n
     _check_walk_size(tap, sizes, emits, what)

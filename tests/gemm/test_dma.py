@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from artlite.formats import FORMATS
-from artlite.gemm.gemm_q import COLS, KT, GemmQOperator
+from artlite.gemm.gemm_q import COLS, KT, LINE, GemmQOperator, line_window
 from artlite.gemm.gemm_qd import GemmQdOperator
 
 from .. import dma_model as dm
@@ -19,7 +19,7 @@ TILE_BYTES = {"Q4_0": 18496, "Q4_1": 20480, "Q4_K": 18496, "BFP16": 18432}
 
 
 def _op(fmt: str, *, M: int, K: int, passes: int, nrows: int = 4, silu: bool = False,
-        cb: bool = False) -> GemmQOperator:
+        cb: bool = False, lines: bool = False) -> GemmQOperator:
     """Tiles of 2048 columns, a column's K chunks outer (``kc_group`` 1: chunk kc's row tiles after chunk kc - 1's)."""
     R = 8 if fmt == "BFP16" else 16
     S = TILE_BYTES[fmt]
@@ -30,7 +30,8 @@ def _op(fmt: str, *, M: int, K: int, passes: int, nrows: int = 4, silu: bool = F
     N = COLS * passes * step
     out_cols = [[c * passes * step + step * p for p in range(passes)] for c in range(COLS)]
     return GemmQOperator(fmt=fmt, rows=R, M=M, K=K, N=N, tile_bytes=S, col_bytes=col_bytes, passes=passes,
-                         out_cols=out_cols, kc_group=1 if n_kc > 1 else 0, silu=silu, nrows=nrows, c_bfp16=cb)
+                         out_cols=out_cols, kc_group=1 if n_kc > 1 else 0, silu=silu, nrows=nrows, c_bfp16=cb,
+                         lines=lines)
 
 
 def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False, fmt: str = "Q4_K") -> GemmQOperator:
@@ -46,20 +47,25 @@ def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False,
 
 
 def _op_planar(fmt: str, *, R: int, S: int, kc: int, M: int, K: int, tiles: int, blocks: tuple[tuple[int, int], ...],
-               region_rt: int, kc_group: int = 0, silu: bool = False, mac_rows: int = 3, m: int = 64) -> GemmQdOperator:
+               region_rt: int, kc_group: int = 0, silu: bool = False, mac_rows: int = 3, m: int = 64,
+               lines: bool = False) -> GemmQdOperator:
     """GemmQd on planar tiles (``gemm_q.planar``): ``blocks`` of passes of ``tiles`` row tiles each, packed C (or the
     SiLU groups' outputs), a column's region of ``region_rt`` row tiles (a row tile's K chunks consecutive, or in
-    groups of ``kc_group``)."""
+    groups of ``kc_group``); ``lines``: whole-line drains, a column's passes from a line boundary."""
     n_kc = K // kc
     g = kc_group or n_kc
     col_bytes = region_rt * n_kc * S
     passes = sum(n for _, n in blocks)
     w = 64 if silu else tiles * R + tiles * R % 2  # C columns per pass
     pitch = passes * w
+    if lines and not silu:  # (room for the last pass's window)
+        win = line_window(tuple((w * p % LINE, 0) for p in range(passes)), w)
+        pitch = -(-max(pitch, w * (passes - 1) // LINE * LINE + win) // LINE) * LINE
     out_cols = [[c * pitch + w * p for p in range(passes)] for c in range(COLS)]
     return GemmQdOperator(fmt=fmt, rows=R, M=M, K=K, N=COLS * pitch, tile_bytes=S, col_bytes=col_bytes, passes=passes,
                           out_cols=out_cols, silu=silu, c_bfp16=silu, kc=kc, kc_group=g,
-                          tiles=tiles, c_pack=not silu, region_rt=region_rt, blocks=blocks, mac_rows=mac_rows, m=m)
+                          tiles=tiles, c_pack=not silu, region_rt=region_rt, blocks=blocks, mac_rows=mac_rows, m=m,
+                          lines=lines)
 
 
 def _tile(op: GemmQOperator, c: int, p: int, kc: int, t: int) -> int:
@@ -158,6 +164,7 @@ def _expected_a(op: GemmQOperator, ch: int, row: int) -> list[np.ndarray]:
 CASES = [
     ("Q4_0", {"M": 256, "K": 2048, "passes": 3}),
     ("Q4_0", {"M": 512, "K": 2048, "passes": 2, "silu": True, "cb": True}),
+    ("Q4_0", {"M": 512, "K": 2048, "passes": 4, "silu": True, "cb": True, "lines": True}),  # (pairs of passes)
     ("Q4_0", {"M": 256, "K": 8192, "passes": 2}),  # down: A refetched per pass in K chunks
     ("Q4_0", {"M": 64, "K": 2048, "passes": 2, "nrows": 2}),
     ("Q4_1", {"M": 256, "K": 2048, "passes": 2, "silu": True, "cb": True}),
@@ -185,6 +192,7 @@ ALL = CASES + [("Q4_K-3B", kw) for kw in CASES_3B] + [("Q4_0-1K", kw) for kw in 
 @pytest.mark.parametrize("fmt,kw", ALL, ids=[f"{f}-" + "-".join(f"{k}{v}" for k, v in kw.items()) for f, kw in ALL])
 def test_gemm_q_dataflow(fmt: str, kw: dict) -> None:
     op = _op3b(**kw) if fmt == "Q4_K-3B" else _op3b(**kw, fmt="Q4_0") if fmt == "Q4_0-1K" else _op(fmt, **kw)
+    assert (op.c_parts == 2) == kw.get("lines", False)
     df = op.dataflow()
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
@@ -254,10 +262,18 @@ def _check_outputs(op: GemmQOperator, df: object) -> None:
                     objs[row].append(ids)
                     t0 = (ch * op.nrows + row) * m
                     cols = col0 + np.arange(no)
-                    if op.c_bfp16:  # panels [group][col block][36 units]
-                        v = ids.reshape(m // 8, no // 8, 36)
+                    if op.carry is not None:  # windows of win columns from each row (into the next row or the
+                        # object's tail) at the pass's line boundary; a later pass overwrites
+                        start = col0 - op.carry[p][0]
+                        assert start % LINE == 0 and op.win % LINE == 0 and N % LINE == 0
+                        for tok in range(m):
+                            expect[(t0 + tok) * N + start + np.arange(op.win)] = ids[tok * op.n_c + np.arange(op.win)]
+                    elif op.c_bfp16:  # panels [group][col block][36 units] (two parts: [part][group][...], a
+                        # group's row of both parts' panels in C)
+                        v = ids.reshape(op.c_parts, m // 8, no // 8, 36).transpose(1, 0, 2, 3).reshape(m // 8, -1, 36)
+                        cols = col0 + np.arange(no * op.c_parts)
                         for g in range(m // 8):
-                            for j in range(no // 8):
+                            for j in range(no * op.c_parts // 8):
                                 dst = ((t0 // 8 + g) * (N // 8) + cols[8 * j] // 8) * 36
                                 expect[dst:dst + 36] = v[g, j]
                     elif op.c_pack:  # row-major rows of n_c columns, the first n_out reach C
@@ -302,12 +318,19 @@ def test_check_shim_tap() -> None:
 CASES_PLANAR = [
     ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 5, "blocks": ((0, 4), (20, 1), (25, 1)), "region_rt": 30}),
     ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 10, "blocks": ((0, 4),), "region_rt": 40, "silu": True}),
+    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 10, "blocks": ((0, 4),), "region_rt": 40, "silu": True,
+                               "lines": True}),  # (a pass's halves in one C object)
     ("Q5_K", 13, 9280, 1024, {"M": 64, "K": 3072, "tiles": 10, "blocks": ((0, 3),), "region_rt": 30, "silu": True,
                               "mac_rows": 1}),
     ("Q4_1", 14, 18496, 2048, {"M": 192, "K": 8192, "tiles": 4, "blocks": ((0, 5),), "region_rt": 19, "kc_group": 1}),
     ("Q4_1", 14, 9280, 1024, {"M": 128, "K": 8192, "tiles": 4, "blocks": ((0, 7),), "region_rt": 28, "kc_group": 2,
                               "mac_rows": 2}),
     ("Q6_K", 11, 9280, 1024, {"M": 192, "K": 3072, "tiles": 6, "blocks": ((0, 2),), "region_rt": 12}),
+    # whole-line drains (passes of 66 columns: carries of 0, 2, 4, 6 columns; of 65 rows and a zero column, in blocks)
+    ("Q6_K", 11, 9280, 1024, {"M": 288, "K": 2048, "tiles": 6, "blocks": ((0, 4),), "region_rt": 24, "m": 96,
+                              "lines": True}),
+    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 5, "blocks": ((0, 4), (20, 1), (25, 1)), "region_rt": 30,
+                               "lines": True}),
     # SiLU groups whose padding rows reach the MMUL (Q6_K's d chunks; a half-slice Q4 header): outputs dropped
     ("Q6_K", 11, 9280, 1024, {"M": 144, "K": 3072, "tiles": 12, "blocks": ((0, 2),), "region_rt": 24, "silu": True,
                               "m": 48}),
@@ -338,9 +361,10 @@ CASES_PLANAR = [
                               for f, r, _, k, kw in CASES_PLANAR])
 def test_gemm_qd_planar_dataflow(fmt: str, R: int, S: int, kc: int, kw: dict) -> None:
     """The planar gather: [plane][row] k-tile objects of the pass's rows (any row count, zero-padded to the
-    MMUL's n), blocks of passes, packed C rows (odd row counts: one column more), SiLU passes of whole groups."""
+    MMUL's n), blocks of passes, packed C rows (odd row counts: one column more; whole-line windows), SiLU passes of
+    whole groups."""
     op = _op_planar(fmt, R=R, S=S, kc=kc, **kw)
-    assert op.planar
+    assert op.planar and (op.carry is not None or op.c_parts == 2) == kw.get("lines", False)
     df = op.dataflow()
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)

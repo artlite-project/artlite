@@ -106,7 +106,7 @@ void bo::release() noexcept {
 }
 
 bo::bo(const pdev& pdev, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type type, void* at)
-    : m_pdev(pdev), m_aligned_size(size), m_flags(flags), m_type(type) {
+    : m_pdev(pdev), m_aligned_size(size), m_size(size), m_flags(flags), m_type(type) {
   if (m_type == AMDXDNA_BO_INVALID) shim_err(EINVAL, "Invalid BO flags: {:#x}", flags.all);
 
   amdxdna_drm_create_bo cbo = {.size = size, .type = static_cast<uint32_t>(m_type)};
@@ -134,7 +134,7 @@ bo::bo(const pdev& pdev, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type t
 }
 
 bo::bo(const pdev& p, size_t size, user_memory)
-    : m_pdev(p), m_aligned_size((size + 4095) & ~size_t(4095)), m_type(AMDXDNA_BO_SHARE), m_user(true) {
+    : m_pdev(p), m_aligned_size((size + 4095) & ~size_t(4095)), m_size(size), m_type(AMDXDNA_BO_SHARE), m_user(true) {
   constexpr size_t huge = size_t(2) << 20;
   if (!size) shim_err(EINVAL, "user BO of 0 bytes");
   m_parent_size = (m_aligned_size + huge - 1) / huge * huge + huge;  // (room to align to 2 MB)
@@ -146,9 +146,11 @@ bo::bo(const pdev& p, size_t size, user_memory)
   char* mem = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(m_parent) + huge - 1) & ~(huge - 1));
   m_aligned = mem;
   try {
-    ::madvise(mem, m_aligned_size, MADV_HUGEPAGE);  // (no THP: 4 KB pages)
+    // (the advice up to the next 2 MB boundary: the buffer's last part is a 2 MB page as well)
+    const size_t advised = (m_aligned_size + huge - 1) / huge * huge;
+    ::madvise(mem, advised, MADV_HUGEPAGE);  // (no THP: 4 KB pages)
     // no copy of the pinned pages in a forked child (a subprocess started without vfork)
-    if (::madvise(mem, m_aligned_size, MADV_DONTFORK)) shim_err(errno, "madvise(MADV_DONTFORK) failed");
+    if (::madvise(mem, advised, MADV_DONTFORK)) shim_err(errno, "madvise(MADV_DONTFORK) failed");
     // fault in (zeroed pages) and write back the zeroes: the NPU's DMA must not find stale DRAM under dirty lines,
     // nor have its output overwritten by their eviction later (as a SHMEM BO's clflush at allocation). In pieces:
     // a populate holds mmap_lock, which other threads' mmap / brk wait for (a tokenizer loading meanwhile: 2x).
@@ -210,7 +212,7 @@ properties bo::get_properties() const {
   return {m_flags, m_aligned_size, get_paddr(), get_drm_bo_handle()};
 }
 
-size_t bo::size() const { return m_aligned_size; }
+size_t bo::size() const { return m_size; }
 
 void* bo::map() const { return m_aligned; }
 

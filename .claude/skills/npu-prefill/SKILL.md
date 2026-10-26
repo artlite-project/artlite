@@ -121,16 +121,16 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - Llama 3B Q4_K_M, 1024 tokens at p0 = 0 (341 ms): GEMMs ~70%, design switches ~13%, norms ~7%, attention ~6%. A
   layer whose V and down are Q6_K costs ~2.2 ms more than a Q4_K one (planar GemmQd: a dequantizing core per column,
   66 of 80 MAC columns, 1024 tokens as 1152): ~9% of the chunk.
-- Other chips: a Krackan Point laptop runs Gemma E4B's Q4_0 prefill at 0.96x Strix Halo's speed, the Q4_K_M files'
-  at 0.51x (Llama 1B), 0.59x (8B), 0.55x (35B-A3B), 0.73x (27B); a Strix Point laptop (Windows) the 27B at ~0.5x. The
-  same array, at the same clock with all 32 cores busy (`artlite-probe`), and a faster DRAM path in every streaming and
-  gather pattern. Not the cause: Linux 7.0's driver (the same speed on Halo), control-code density, the clock. The
-  lead: writes of parts of 64-byte lines (the memory merges each into its line; on Halo 132 B rows sharing their end
-  lines write 28% below whole lines, and a laptop has no cache in front of DRAM). Per 1024-token chunk, Llama 1B
-  4.4 M of them, the 8B 10.8 M, the 27B 83 M, Gemma 1.1 M (count them with the dispatched shim BDs' row starts and
-  ends). Their sources: planar GemmQd passes (66 columns of 11-row Q6_K tiles: 132 B per token), gate/up's
-  bfp16 panel rows (32 outputs: 288 B per pass), and output projections at a pitch off whole lines (`d_pitch` rounds to
-  them). Write whole lines where a layout allows; `artlite-probe`'s write rows tell what one costs on a machine.
+- Other chips: Krackan Point and Strix Point have the same array at the same clock, also with all 32 cores busy, and
+  on Krackan a faster DRAM path in every streaming and gather pattern (`artlite-probe`), but no cache in front of DRAM:
+  a write of part of a 64-byte line costs 4.7x a whole line's there (132 B rows 15.6 GB/s, 128 B rows 73.2; Halo 41.4
+  / 57.2). The prefill writes whole lines: planar packed passes in whole-line windows (`lines`; the previous pass's
+  last columns carried in the C object), gate/up's 32-output parts two per C object (576 B rows), output projections
+  at `d_pitch` in whole lines; a layout gives room for the last window (`PlanarPlan.line_pitches`). Count partial lines
+  with the dispatched shim BDs' row starts and ends: per 1024-token chunk the 1B and 8B write none, Gemma none, the
+  27B 8.2 M (its gdn_in's 96-column windows do not fit L1). Windows maps the NPU's memory in 4 KB pages: every DMA row
+  on a page of its own costs a translation (~50 M rows/s in all), which the prefill's short rows (128-576 B at strides
+  of KBs) pay; longer contiguous rows would.
 - Levers that worked: the A strip resident through K parts (`prefill.gemm.resident_k_part`); reading each weight byte once (header units); more
   queries per attention pass where L1 allows (sliding window: 2 blocks of 32); a broadcast KV stream on both of each
   core's input channels (full attention at 30K: -41%); the last token from the prefill's last

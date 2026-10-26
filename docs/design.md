@@ -110,7 +110,9 @@ auto* out_span = static_cast<int32_t*>(buf_out->map());
   `alloc_bo(size, XRT_BO_FLAGS_CACHEABLE)` (cacheable). `alloc_user_bo(size)` (Python
   `Device.alloc_user_buffer`) is a host-only BO in the process's own memory: 2 MB pages faulted in and
   flushed by several threads, then pinned by the driver (a userptr BO); 16 GB in ~0.3 s, where the driver
-  allocates a SHMEM BO's pages in one thread (1.7 s). `OverlayDevice.alloc` uses it from 64 MB on. `artlite::read_file` (Python
+  allocates a SHMEM BO's pages in one thread (1.7 s). Python's `Device.alloc_host_buffer` uses it from 2 MB on: a
+  SHMEM BO has 4 KB pages, and the NPU translates each page a DMA row touches (rows on pages of their own write at a
+  fifth of the rate, `docs/probe.md`). `artlite::read_file` (Python
   `Buffer.read_file`) loads a file range into a BO: parallel preads through cache-resident
   bounce buffers and non-temporal AVX-512 stores (a page-cached 2 GB weight image: ~34 ms,
   `read()` 124 ms).

@@ -24,12 +24,13 @@ by kernel II.
 | reads and writes at once | ~76 GB/s together (Krackan 88.2: no more than its writes alone) |
 | DDR gathers | rows ≤ 256 B at a multiple-of-4 KB stride share one DRAM channel: ~15 GB/s in all (512 B: ~31), when the channels' rows start alike; offset per column (a GEMM's output slices) they run at the port rate. Krackan the same in proportion: 28.6 / 55.9 / 95.6 GB/s for 256 B / 512 B / 1 KB rows, 89.6 skewed by 256 B |
 | short DDR write rows | a GemmQ pass's C (64 columns per token: 128 B rows) costs a short-K GEMM ~25%: the qwen35 1B's gdn_in (K 1024) 0.22 vs 0.17 ms per item when each pass's C is written whole; rows at the column's pitch (2.3 KB stride) instead of the full row (18 KB) did not help: the row length binds |
-| DDR writes of parts of lines | a row starting or ending inside a 64-byte line writes part of it, merged into the line by the memory: 132 B rows sharing their end lines 41.4 GB/s on Halo against 57.2 for whole-line 128 B rows (`artlite-probe`'s write rows); a laptop without a cache in front of DRAM may pay more. Prefill sources: planar GemmQd passes of 66 columns, gate/up's 288 B panel rows per pass |
+| DDR writes of parts of lines | a row starting or ending inside a 64-byte line writes part of it, merged into the line by the memory: 132 B rows sharing their end lines 41.4 GB/s on Halo against 57.2 for whole-line 128 B rows, on Krackan Point (no cache in front of DRAM) 15.6 against 73.2 (`artlite-probe`'s write rows). The prefill writes whole lines: planar passes in windows from line boundaries (`GemmQOperator` `lines`: the previous pass's last columns carried in the C object), gate/up's 32-output parts two per C object (576 B rows), `d_pitch` in whole lines |
+| a row per page | the NPU translates each page a DMA row touches: rows on pages of their own (a stride ≥ 4 KB) run at ~45-60 M rows/s in all with 4 KB pages (Windows, which maps system memory for the NPU in 4 KB pages; Linux with transparent huge pages off): the skewed 256 B gather 14-16 GB/s, 128 B write rows 5-6 (Halo, THP off: 29.3 / 12.2). Linux host buffers from 2 MB on have 2 MB pages (`Device.alloc_host_buffer`); a stream of 4 KB pages loses little (Windows Krackan: 81 vs 97 GB/s read) |
 | BD fields | 64 B bursts -16%, ≥ 128 B full; AxCACHE 0 halves the rate (Artlite: 512 B, AxCACHE 2) |
 
 On Strix Halo all shims' DDR traffic goes through one port to the Infinity Fabric, 32 B per array cycle (31.7 B
-measured at 800, 1267 and 1810 MHz): not the fabric or memory clocks, not IOMMU translation (4 KB vs 2 MB pages: the
-same rate), not latency. Gathers of rows ≥ 1 KB, or at a stride off 4 KB multiples by 64-256 B, run at the port rate.
+measured at 800, 1267 and 1810 MHz): not the fabric or memory clocks, not address translation (a stream: 4 KB vs
+2 MB pages the same rate; rows on pages of their own, above), not latency. Gathers of rows ≥ 1 KB, or at a stride off 4 KB multiples by 64-256 B, run at the port rate.
 No setting raises it: `ME_AXIMM_CONFIG.MASTER_SEL` (0x1E020) picks AXI-MM or streaming for the shim's one NMU, not
 a second master (AM025), and AM029's `NMU_Switches_Config` belongs to another array-interface layout (its shim BDs
 at 0x9000, NPU2's at 0x1D000). The SMU's `average_ipu_reads` (amdgpu `gpu_metrics`, MB/s) reads the rate directly. The port is

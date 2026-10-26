@@ -136,3 +136,4 @@ what they need).
 | `Permission denied` on `/dev/accel/accel0` | your user is not in the `render` group (above) |
 | `Cannot allocate memory` / `Resource temporarily unavailable` from a BO, "as ulimit -l is 8192 KB" | the locked-memory limit (above) |
 | `artlite.DispatchError` with state `TIMEOUT` | the driver's hang detection stopped a command; its `health` is the firmware's report ([Design: error handling](design.md#error-handling)) |
+| `artlite-probe` says `host buffers: 4 KB pages` on Linux | transparent huge pages are off (`/sys/kernel/mm/transparent_hugepage/enabled` reads `[never]`): the NPU then translates a page per short DMA row, and its write rows run at a fifth of their rate. `madvise` (most distributions' default) or `always` gives Artlite's buffers 2 MB pages |

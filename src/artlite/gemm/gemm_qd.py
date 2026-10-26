@@ -21,7 +21,8 @@ scales before its k-tiles (``_hdr_sb``; Q6_K: d once per K chunk, ``_hdr_d``; Q5
 groups' scales per MAC lane, ``_expand``). A column's projection runs in passes of whole tiles
 (``plan_planar``: blocks of passes, the last tile of a block ends in padding rows), ``c_pack``: the MAC cores
 copy the pass's rows out of the MMUL tile in 16-byte items (``_pack``; the memtile drops the columns past the
-pass's rows). gate/up: a pass is one SiLU group (128 rows and its padding rows: dropped by the memtile's read
+pass's rows), or with ``lines`` behind the previous pass's last columns, so that each pass drains whole 64-byte lines
+(``gemm_q.line_carry``). gate/up: a pass is one SiLU group (128 rows and its padding rows: dropped by the memtile's read
 when every part of the tile maps row r to gathered row r, else skipped by the dequant) in two halves of 64 rows
 (``halves``: two D objects per k-tile, a C tile of 64 columns each on the MAC cores, so that m = 96 fits L1: 3B
 Q5_K at T = 256 one weight sweep instead of two, gate/up 1.88 -> 1.11 ms), or half a group when R divides 64
@@ -42,7 +43,7 @@ from ..operators import kmath
 from ..operators.design import COLS
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import pin_l1_buffers
-from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, GemmQOperator, L1Error, pack_plan, planar
+from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, LINE, GemmQOperator, L1Error, line_window, pack_plan, planar
 from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
@@ -105,7 +106,8 @@ class GemmQdOperator(GemmQOperator):
         (silu only)."""
         nm = self.nm
         return {"A": (2, m * 72), "D": (D_DEPTH, nm * KT * 9 // 8),
-                "C": (self.c_depth, m * self.n_out * 9 // 8 if self.c_bfp16 else m * self.n_c * 2),
+                "C": (self.c_depth, m * self.n_out * 9 // 8 * self.c_parts if self.c_bfp16 else
+                      (m * self.n_c + self.c_tail) * 2),
                 "acc": ((2 if self.pingpong or self.halves == 2 or self.slots == 2 else 1) if self.silu or self.c_pack
                         else 0, m * nm * 2),
                 "sx": (1 if self.silu else 0, m * nm // self.sxp),
@@ -120,7 +122,10 @@ class GemmQdOperator(GemmQOperator):
         # (two C objects and the scratch in two parts beat one C object, 1.19 vs 1.23 ms on Gemma's gate/up at T = 256;
         # planar: of the first C depth in budget, the scratch's parts whose pinned layout fits, else the first in
         # budget (aiecc's placement))
-        auto = ((2, 1), (2, 2), (1, 1), (1, 2)) if self.silu else ((2, 1), (1, 1), (1, 2))
+        # (whole-line drains: one C object, which keeps the carry for the next pass, ``line_carry``, or holds two parts,
+        # taken after the MAC loop)
+        auto = ((1, 1), (1, 2)) if self.carry is not None or self.c_parts == 2 else \
+            ((2, 1), (2, 2), (1, 1), (1, 2)) if self.silu else ((2, 1), (1, 1), (1, 2))
         dq = self._dq_bytes()  # (picks the dequantizing core's weight objects first: the layouts place them too)
         fits = [(cd, sxp) for cd, sxp in auto if self._try(m, cd, sxp) <= L1_BUDGET]
         pinned = [c for c in fits if self.planar and c[0] == fits[0][0] and self._try(m, *c)
@@ -220,11 +225,19 @@ class GemmQdOperator(GemmQOperator):
         lay: dict[str, list[int]] = {}
 
         def put(key: str, i: int, regions: list[int]) -> bool:
+            # (a C object with whole-line rows, ``lines``, may start in the free end of a region and fill the next,
+            # empty one: its DMA reads meet that region's stream only in its first part)
+            span = key == "C" and self.carry is not None and sizes[key] > REGION
             for g in regions:
-                if nxt[g] + sizes[key] <= (g + 1) * REGION:
+                end = (g + 2 if span and g < 3 and nxt[g + 1] == (g + 1) * REGION else g + 1) * REGION
+                if nxt[g] + sizes[key] <= end:
                     lay[key] = lay.get(key, []) + [0] * (i + 1 - len(lay.get(key, [])))
                     lay[key][i] = nxt[g]
-                    nxt[g] += sizes[key]
+                    if end > (g + 1) * REGION:
+                        nxt[g + 1] = nxt[g] + sizes[key]
+                        nxt[g] = (g + 1) * REGION
+                    else:
+                        nxt[g] += sizes[key]
                     return True
             return False
 
@@ -287,7 +300,8 @@ class GemmQdOperator(GemmQOperator):
                                   act=self.act, fmt=self.fmt,
                                   nsb=self.nsb,
                                   dqb=True, c_bfp16=self.c_bfp16, ablate=self.ablate,
-                                  mac_src=mac, c_pack=self.c_pack, n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
+                                  mac_src=mac, c_pack=self.c_pack, carry=self.carry, win=self.win, c_parts=self.c_parts,
+                                  n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
                                   TR=self.TR, pingpong=self.pingpong, planar=self.planar, hu=self.hdr_units,
                                   hp0=self._hdr_plane0, hs=self._hdr_slot_words, sxp=self.sxp, tq=self.tq, pair=False,
                                   us=self.us, c_pairs=False, macf="", slots=self.slots,
@@ -307,8 +321,9 @@ class GemmQdOperator(GemmQOperator):
         A_l2_ty = np.ndarray[(df.a_obj,), np.dtype[bfloat16]]
         A_l1_ty = np.ndarray[(df.a_l1,), np.dtype[bfloat16]]
         c_elems = df.c_l1
-        C_l1_ty = np.ndarray[(c_elems,) if cb else (m, self.n_c), np.dtype[bfloat16]]
-        C_l2_ty = np.ndarray[(MR * c_elems,) if cb else (MR * m, self.n_c), np.dtype[bfloat16]]
+        flat = cb or self.c_tail  # (whole-line windows: rows and the tail the memtile's last window reads)
+        C_l1_ty = np.ndarray[(c_elems,) if flat else (m, self.n_c), np.dtype[bfloat16]]
+        C_l2_ty = np.ndarray[(MR * c_elems,) if flat else (MR * m, self.n_c), np.dtype[bfloat16]]
         acc_ty = np.ndarray[(m // 2 if self.csplit else m, n), np.dtype[bfloat16]]  # (csplit: a tile's first half)
         sx_ty = np.ndarray[(m * n // 2 // self.sxp,), np.dtype[bfloat16]]
         dqb = self._dq_buffers()
@@ -319,8 +334,8 @@ class GemmQdOperator(GemmQOperator):
         k_zero = Kernel(f"{p}_zero", "kernel.o", [acc_ty])
         gelu = self.silu and self.act == "gelu"
         lut_ty = np.ndarray[(kmath.GELU.table_words().size,), np.dtype[np.uint32]]
-        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, *([lut_ty] * 2 if gelu else [np.int32])]) \
-            if self.silu else None
+        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, *([lut_ty] * 2 if gelu else [np.int32]),
+                                                         *[np.int32] * (self.c_parts - 1)]) if self.silu else None
         # the table's two copies (gelu): in two regions where the layout is pinned (``_place_plan``); else where aiecc
         # puts them (a mem_bank for them reshuffled aiecc's placement of the MAC loop's streams: memory stall +42%)
         lay = self._l1_layout()
@@ -329,7 +344,8 @@ class GemmQdOperator(GemmQOperator):
         k_mm = (Kernel(f"{p}_mm2", "kernel.o", [A_l1_ty, D_ty, acc_ty, acc_ty]) if self.pingpong else
                 Kernel(f"{p}_mm", "kernel.o", [A_l1_ty, D_ty, acc_ty]))
         k_pack = (Kernel(f"{p}_pack2", "kernel.o", [acc_ty, acc_ty, C_l1_ty]) if self.slots == 2 else
-                  Kernel(f"{p}_pack", "kernel.o", [acc_ty, C_l1_ty])) if self.c_pack else None
+                  Kernel(f"{p}_pack", "kernel.o", [acc_ty, C_l1_ty, *([np.int32] if self.carry else [])])) \
+            if self.c_pack else None
 
         # B: shim -> memtile -> the column's dequantizing core (k-tile objects in dequant order)
         b_l3 = [ObjectFifo(B_l2_ty, name=f"gqB_{c}", depth=2, from_stream_per_cons=df.b_wdims)
@@ -415,6 +431,7 @@ class GemmQdOperator(GemmQOperator):
                         bf.release(1)
 
         c_pack = self.c_pack
+        lines = self.carry is not None
 
         pingpong = self.pingpong
 
@@ -449,14 +466,19 @@ class GemmQdOperator(GemmQOperator):
                             mm(a, d, acc)
                             dfi.release(1)
                         af.release(1)
+                    if self.c_parts == 2:  # (both halves in one C object: 576-byte rows)
+                        c = cf.acquire(1)
+                        for h, acc in enumerate(accs):
+                            extra[0](acc, c, extra[2], *act_args, h)
+                        cf.release(1)
+                        continue
                     for acc in accs:
                         c = cf.acquire(1)
                         extra[0](acc, c, extra[2], *act_args)
                         cf.release(1)
                 return
-            for _ in self._chunk_passes(prm):
-                c = cf.acquire(1)
-                acc = extra[1] if silu or c_pack else c
+
+            def mac_loop(acc: object) -> None:  # (a pass's k-tiles into its C tile)
                 zero(acc)
                 if pingpong:  # acc -> accb -> acc: an even k-tile count ends in acc
                     for _ in range_(n_kc * (self.kc // KT) // 2):
@@ -473,8 +495,27 @@ class GemmQdOperator(GemmQOperator):
                         mm(a, d, acc)
                         af.release(1)
                         dfi.release(1)
+
+            if silu and self.c_parts == 2:  # (pairs of passes in one C object, taken after the first one's MAC loop:
+                # the previous object's drain done by then)
+                for _ in self._chunk_passes(prm, step=2):
+                    mac_loop(extra[1])
+                    c = cf.acquire(1)
+                    extra[0](extra[1], c, extra[2], *act_args, 0)
+                    mac_loop(extra[1])
+                    extra[0](extra[1], c, extra[2], *act_args, 1)
+                    cf.release(1)
+                return
+            for p_ in self._chunk_passes(prm, index=lines):
+                if not lines:  # (whole-line drains: the C object after the MAC loop, its last drain done by then)
+                    c = cf.acquire(1)
+                acc = extra[1] if silu or c_pack else c
+                mac_loop(acc)
                 if silu:
                     extra[0](acc, c, extra[2], *act_args)
+                elif lines:
+                    c = cf.acquire(1)
+                    extra[0](acc, c, p_)
                 elif c_pack:
                     extra[0](acc, c)
                 cf.release(1)
@@ -565,6 +606,15 @@ class PlanarPlan:
     def block_passes(self) -> list[int]:
         """Passes of each logical block (also when they run as one uniform block)."""
         return [p // self.width for p in self.pitches]
+
+    @property
+    def line_pitches(self) -> tuple[int, ...]:
+        """Each block's columns with whole-line drains (``GemmQOperator``'s ``lines``, blocks from line boundaries): at
+        least to the end of its last pass's window, ``line_window`` columns from that pass's line boundary."""
+        carry = tuple((self.width * p % LINE, 0) for n in self.block_passes for p in range(n))
+        win = line_window(carry, self.width)
+        return tuple(max(pitch, self.width * (n - 1) // LINE * LINE + win)
+                     for pitch, n in zip(self.pitches, self.block_passes, strict=True))
 
 
 def plan_planar(block_rows: list[int], R: int, *, few_passes: bool = False, n_max: int = 128,

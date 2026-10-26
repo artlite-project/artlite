@@ -125,6 +125,45 @@ def pack_plan(n: int, n_out: int, n_c: int, tiles: int, R: int) -> PackPlan:
     return PackPlan(tuple(items), halves)
 
 
+LINE = 32  # C columns of a 64-byte memory line
+
+
+def line_carry(out_cols: list[list[int]], n_out: int) -> tuple[tuple[int, int], ...] | None:
+    """Whole-line C drains of packed passes (``lines``): per pass (cr, sh), its first column's offset in its line (the
+    previous pass's last cr columns, which its drain repeats) and where they start in the previous pass's row (0: a
+    pass that starts a run of contiguous passes, at a line boundary). None when a run starts inside a line or the
+    columns' passes differ (their windows would not be one design's)."""
+    out = None
+    for cols in out_cols:
+        carry = []
+        for p, o in enumerate(cols):
+            cr = o % LINE if p and o == cols[p - 1] + n_out else 0
+            if (o - cr) % LINE:
+                return None
+            carry.append((cr, (o - cr) - (cols[p - 1] - carry[-1][0]) if cr else 0))
+        if out is not None and tuple(carry) != out:
+            return None
+        out = tuple(carry)
+    return out
+
+
+def two_parts(out_cols: list[list[int]], halves: int) -> bool:
+    """Whether every C object of 32-output bfp16 parts can hold two from a 64-output boundary (576-byte panel rows,
+    whole lines: ``lines``): a pass's halves, or the passes in pairs (an even count, each pair's outputs contiguous)."""
+    for cols in out_cols:
+        if halves == 2:
+            if any(o % 64 for o in cols):
+                return False
+        elif len(cols) % 2 or any(cols[p] % 64 or cols[p + 1] != cols[p] + 32 for p in range(0, len(cols), 2)):
+            return False
+    return True
+
+
+def line_window(carry: tuple[tuple[int, int], ...], n_out: int) -> int:
+    """Columns of every pass's whole-line drain: the most a pass carries and its own columns, in whole lines."""
+    return -(-(max(cr for cr, _ in carry) + n_out) // LINE) * LINE
+
+
 def planar(fmt: str, rows: int, kc: int) -> bool:
     """GemmQdOperator reads these tiles through the planar gather (any row count: the memtile collects a
     k-tile's 32-byte planes, or words of word-major tiles, of the pass's rows, ``TileFormat.planes``): Q5_K, Q6_K,
@@ -189,7 +228,60 @@ void {{ p }}_zero(bfloat16 *__restrict out)
 {% include "gemm/" ~ fmt %}
 
 {% set n = n_mac %}
-{% if c_pack %}
+{% if c_pack and carry %}
+{% set nv = (n_c + 31) // 32 %}
+// whole-line drains: C (m x {{ n_c }} row-major; the memtile drains windows of {{ win }} columns from each row) row t =
+// [the previous pass's last cr columns, from column sh of the row it left in this C object | the pass's {{ n_out }}
+// columns of the MAC tile (m x {{ n }}, 8x8 row-major sub-blocks)]; (cr, sh) of each pass from the tables
+static const int8_t {{ p }}_cr[{{ carry | length }}] = { {% for cr, sh in carry %}{{ cr }}{{ ", " if not loop.last }}{% endfor %} };
+static const int16_t {{ p }}_sh[{{ carry | length }}] = { {% for cr, sh in carry %}{{ sh }}{{ ", " if not loop.last }}{% endfor %} };
+
+void {{ p }}_pack(const bfloat16 *__restrict acc, bfloat16 *c, int32_t pass)
+{
+    const int cr = {{ p }}_cr[pass];
+    const int sh = {{ p }}_sh[pass];
+    if (cr == 0) {  // (the pass's columns from column 0: 16-byte items, the source walking [band][row][block])
+        const bfloat16 __aie_dm_resource_a *__restrict src = (const bfloat16 __aie_dm_resource_a *)acc;
+        bfloat16 *__restrict dst = c;
+        dims_3d_t d = dims_3d_from_steps({{ n_c // 8 }}, 64, 8, 8, {{ 8 * n }});
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < {{ m * n_c // 8 }}; i++) {
+            aie::store_v(dst, aie::load_v<8>(src));
+            dst += 8;
+            src = add_3d_ptr(src, d);
+        }
+        return;
+    }
+    const aie::vector<bfloat16, 8> z8 = aie::zeros<bfloat16, 8>();
+    const aie::vector<bfloat16, 32> z = aie::zeros<bfloat16, 32>();
+    const aie::mask<32> head = aie::mask<32>::from_uint32((1u << cr) - 1u);
+    const unsigned up = 2 * (32 - cr);  // (bytes: the own columns move cr lanes up)
+    const int ks = std::min(sh, {{ n_c - 32 }});  // (the carry's 4 items within the row: its columns are)
+    const unsigned kb = 2 * (sh - ks);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < {{ m }}; t++) {
+        const bfloat16 __aie_dm_resource_a *s = (const bfloat16 __aie_dm_resource_a *)acc + (t / 8) * {{ 8 * n }} + (t % 8) * 8;
+        bfloat16 *row = c + t * {{ n_c }};
+        // (own columns 32 j.. : 8-column items of the token's sub-block row; zeros past the MAC tile)
+{% for j in range(nv) %}
+        const aie::vector<bfloat16, 32> o{{ j }} = aie::concat({% for i in range(4) %}{{ "aie::load_v<8>(s + %d)" % (64 * (4 * j + i)) if 4 * j + i < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+{% endfor %}
+        // (the carry, loaded before the stores overwrite where it was)
+        const aie::vector<bfloat16, 32> k = aie::vector<bfloat16, 32>(::shift_bytes(aie::concat({% for i in range(4) %}aie::load_v<8>(row + ks + {{ 8 * i }}){{ ", " if not loop.last }}{% endfor %}), z, kb));
+{% for j in range(nv) %}
+{% if j == 0 %}
+        const aie::vector<bfloat16, 32> w0 = aie::select(aie::vector<bfloat16, 32>(::shift_bytes(z, o0, up)), k, head);
+{% else %}
+        const aie::vector<bfloat16, 32> w{{ j }} = aie::vector<bfloat16, 32>(::shift_bytes(o{{ j - 1 }}, o{{ j }}, up));
+{% endif %}
+{% for i in range(4) if 32 * j + 8 * i < n_c %}
+        aie::store_v(row + {{ 32 * j + 8 * i }}, w{{ j }}.extract<8>({{ i }}));
+{% endfor %}
+{% endfor %}
+    }
+}
+
+{% elif c_pack %}
 // C (m x {{ n_c }} row-major; the memtile drains its first {{ n_out }} columns) = the first {{ n_c }} columns of the
 // MAC tile (m x {{ n }}, 8x8 row-major sub-blocks): 16-byte items (8 columns of a sub-block row), the source
 // walking [band][row][block]
@@ -263,7 +355,7 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 {{ silu_t.src }}
 
 void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
-                  int32_t zero)
+                  int32_t zero{{ ", int32_t c_part" if c_parts == 2 else "" }})
 {
 {% if "act" in ablate %}
     return;
@@ -272,6 +364,9 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     event0();
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if c_parts == 2 %}
+    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};  // (the C object's part: a pass of two, or a pass's half)
+{% endif %}
 {% if parts > 1 %}
     // ({{ parts }} parts of {{ mp }} rows: the scratch holds one part's{{ "; the C tile's halves" if csplit else "" }})
     AIE_LOOP_NO_UNROLL
@@ -300,7 +395,7 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 {% set parts = 2 if csplit else sxp %}
 {% set mp = m // parts %}
 void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
-                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd{{ ", int32_t c_part" if c_parts == 2 else "" }})
 {
 {% if "act" in ablate %}
     return;
@@ -309,6 +404,9 @@ void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     event0();
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if c_parts == 2 %}
+    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};  // (the C object's part: a pass of two, or a pass's half)
+{% endif %}
 {% if parts > 1 %}
     AIE_LOOP_NO_UNROLL
     for (int part = 0; part < {{ parts }}; part++) {
@@ -520,6 +618,7 @@ class GemmQOperator(ArtcOperator):
         slots: int = 0,
         mc_param: str = "",
         mc_unit: int = 0,
+        lines: bool = False,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -527,6 +626,13 @@ class GemmQOperator(ArtcOperator):
         ``c_pack``: C objects of the pass's rows only (row-major, packed from the MAC tile by an epilogue:
         the MMUL padding rows never leave the core; an odd row count gets one zero column more, whole
         32-bit words);
+        ``lines``: C rows of whole 64-byte lines where they fit (a row that starts or ends inside a line makes the
+        memory read and merge that line: on a machine without a cache in front of DRAM, Krackan Point, 15.6 instead of
+        73.2 GB/s, ``artlite-probe``). Packed passes (``line_carry``): each pass writes ``win`` columns from the line
+        boundary at or before its first column, the previous pass's last columns (kept in the C object, whose rows the
+        memtile reads ``win`` columns of, into the next row) first, stale columns after its own (the next pass's, or
+        padding: the caller leaves room for the last window, ``line_window``). Gate/up (``c_parts``): C objects of two
+        32-output parts, drained as 576-byte rows;
         ``a_cols`` = (k0, width): A is the columns k0 .. k0 + K of panels ``width`` columns wide (a projection split
         over K: each part a GEMM of its chunks; default (0, K)). ``nrows``: even for dequantized tiles (pairs).
         ``k_rep``: A has k_rep K columns, the weights' K chunks stream k_rep times (BFP16 tiles: an MoE router's rows
@@ -626,6 +732,18 @@ class GemmQOperator(ArtcOperator):
         assert self.n_out % 2 == 0, "C rows of whole 32-bit words"
         # packed C object rows: whole 16-byte items, the memtile drops the columns past n_out
         self.n_c = -(-self.n_out // 8) * 8 if self.c_pack else self.n_out
+        # whole-line drains (where they fit: below): C object rows of a pass's carry and its own columns, drained in
+        # windows of ``win`` columns
+        self.carry = line_carry(out_cols, self.n_out) \
+            if lines and self.c_pack and groups == 1 and self.slots == 1 and N % LINE == 0 else None
+        n_c, self.win = self.n_c, self.n_out
+        if self.carry is not None:
+            self.n_c = -(-(max(cr for cr, _ in self.carry) + self.n_out) // 8) * 8
+            self.win = line_window(self.carry, self.n_out)
+        # gate/up (bfp16 C, 32 outputs a pass or half: 288-byte panel rows, half of them ending inside a line): C objects
+        # of two such parts, [part][group][4 panels], which the memtile drains as 576-byte rows (``lines``)
+        self.c_parts = 2 if lines and self.c_bfp16 and self.n_out == 32 and N % 64 == 0 and two_parts(out_cols,
+                                                                                                    self.halves) else 1
         self.slice = self.units or FORMATS[fmt].slice_bytes(rows)
         # header units of a slice each (d; d, m for Q4_1; Q4_K records). A header shorter than whole
         # slices (Q4_K of 1024 columns: 1 KB) is read as a slice-sized unit that starts hdr_skip bytes
@@ -668,25 +786,73 @@ class GemmQOperator(ArtcOperator):
         # tokens per core row and chunk (the weights stream once per chunk): the largest that
         # divides the prompt and fits L1
         # (m: GemmQd's tokens per MAC row, chosen by the caller)
-        ms = [m_ for m_ in ((m,) if m else (64, 48, 32, 16))
-              if (m or m_ <= M_MAX) and M % (nrows * m_) == 0 and self._l1_bytes(m_) <= L1_BUDGET]
+        def fit() -> list[int]:
+            return [m_ for m_ in ((m,) if m else (64, 48, 32, 16))
+                    if (m or m_ <= M_MAX) and M % (nrows * m_) == 0 and self._l1_bytes(m_) <= L1_BUDGET]
+
+        ms = fit()
+        if self.carry is not None or self.c_parts == 2:  # (whole-line drains where they keep the tokens per core row,
+            # the pinned L1 layout, the A strip resident in the memtile and the drains' queue)
+            lines_on = self.carry, self.n_c, self.win, self.c_parts
+            lines_off = None, n_c, self.n_out, 1
+            self.carry, self.n_c, self.win, self.c_parts = lines_off
+            plain = fit()
+            if ms and ms[:1] == plain[:1] and (lines_on[0] is None or self._drains_fit(lines_on[0])):
+                self.m = plain[0]
+                pinned, a_res = self._l1_layout() is not None, self.dataflow().a_res
+                self.carry, self.n_c, self.win, self.c_parts = lines_on
+                self._l1_bytes(self.m)
+                if (pinned and self._l1_layout() is None) or (a_res and not self.dataflow().a_res):
+                    self.carry, self.n_c, self.win, self.c_parts = lines_off
+                    ms = plain
+            else:
+                ms = plain
         if not ms:
             raise L1Error(f"no token count per core row fits L1 ({m or 'any'})")
         self.m = ms[0]
+        self._l1_bytes(self.m)  # (the chosen variant's buffers)
         self.mc = M // (nrows * self.m)
         super().__init__()
 
-    def _chunk_passes(self, prm: object) -> Iterator[None]:
-        """The cores' loop over token chunks and passes: mc chunks, or ``mc_param``'s (prm: its handle)."""
+    @property
+    def c_tail(self) -> int:
+        """Elements after a packed C object's rows (whole-line windows: the memtile reads the last row's window into
+        them, ``lines``)."""
+        return self.win - self.n_c if self.carry is not None else 0
+
+    def _drains_fit(self, carry: tuple[tuple[int, int], ...]) -> bool:
+        """Whether whole-line windows (``carry``) keep a column's C drains within its shim channel's task queue (4: two
+        token chunks in flight, up to 2 drains each, or no more drains than without windows) and its tile's 16 BDs (the
+        weight fills', an A strip's, the drains' per chunk in flight; ``_sequence``)."""
+        cols = self.c_out_cols(0)
+        runs = len(_runs([o - cr for o, (cr, _) in zip(cols, carry, strict=True)]))
+        if runs <= len(_runs(cols)):
+            return True
+        if runs > 2:
+            return False
+        chains = [self.b_chain(c) for c in range(COLS)]
+        depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > 4 else 2
+        fills = max(sum(map(len, ch)) if ch is not None else len(self.b_taps(c)) for c, ch in enumerate(chains))
+        return depth * (fills + 1 + runs) <= 16
+
+    def _chunk_passes(self, prm: object, index: bool = False, step: int = 1) -> Iterator[object]:
+        """The cores' loop over token chunks and passes: mc chunks, or ``mc_param``'s (prm: its handle); ``index``:
+        yields the pass's index (else None); ``step``: one iteration per that many passes."""
+        passes = self.passes // step
         if prm is None:
-            for _ in range_(self.mc * self.passes):
-                yield
+            if index:
+                for _ in range_(self.mc):
+                    for p in range_(passes):
+                        yield p
+                return
+            for _ in range_(self.mc * passes):
+                yield None
             return
         n, scale = prm.read(), (self.mc_unit or self.nrows * self.m) // (self.nrows * self.m)
         assert scale * self.nrows * self.m == (self.mc_unit or self.nrows * self.m), (self.mc_unit, self.nrows, self.m)
         for _ in range32(times_i32(n, scale) if scale > 1 else n):
-            for _ in range_(self.passes):
-                yield
+            for p in range_(passes):
+                yield p if index else None
 
     def _mc_prm(self) -> object:
         """``mc_param``'s handle for the workers (None without it)."""
@@ -722,13 +888,13 @@ class GemmQOperator(ArtcOperator):
         this."""
         if self.pair:
             return {"A": (2, m * 72), "B": (B_DEPTH, 4 * self.b_l1_words),
-                    "C": (2, m * self.n_out * 9 // 8 if self.c_bfp16 else m * self.n_c * 2),
+                    "C": (2, m * self.n_out * 9 // 8 * self.c_parts if self.c_bfp16 else m * self.n_c * 2),
                     "acc": (1 if self.silu else 0, m * self.n * 2),
                     "ws": (1, 1024 * self.nsb * self.ws_planes * self.tq // TILES),
                     "st": (1, max(m * self.n * 2, 16 * self.b_l1_words if slot(self.fmt).gemm_q_collects else 0)),
                     "X": (2, self.n // 2 * KT * 9 // 8)}
         return {"A": (2, m * 72), "B": (B_DEPTH, 4 * self.b_l1_words),
-                "C": (2, m * self.n_out * 9 // 8 if self.c_bfp16 else m * self.n_c * 2),
+                "C": (2, m * self.n_out * 9 // 8 * self.c_parts if self.c_bfp16 else m * self.n_c * 2),
                 "acc": (1 if self.silu or self.c_pairs else 0, m * self.n * (4 if self.c_pairs else 2)),
                 "st": (1, max(64, m * self.n if self.silu else 0))}
 
@@ -784,7 +950,8 @@ class GemmQOperator(ArtcOperator):
                                   fmt=self.fmt,
                                   nsb=self.nsb, dqb=False,
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
-                                  c_pack=False, pingpong=False, planar=False, sxp=1, csplit=0, tq=self.tq, pair=self.pair,
+                                  c_pack=False, carry=None, win=0, c_parts=self.c_parts, pingpong=False, planar=False,
+                                  sxp=1, csplit=0, tq=self.tq, pair=self.pair,
                                   c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1)
 
     def dataflow(self) -> GemmQDataflow:
@@ -833,7 +1000,7 @@ class GemmQOperator(ArtcOperator):
             rdims = [(4, 128), (self.tq, 512), (2, 64), (64, 1)]
         # A strip of a core row: resident in the memtile and resent per pass when it fits next to the
         # column's B and C FIFOs, else refetched per pass in K chunks
-        c_obj = m * no * 9 // 8 if cb else m * self.n_c * 2
+        c_obj = m * no * 9 // 8 * self.c_parts if cb else (m * self.n_c + self.c_tail) * 2
         others = 2 * obj_w * 4 + 2 * self.nrows * c_obj  # (B, C: depth 2)
         a_res = m * K * 9 // 8 <= min(A_RESIDENT_MAX, MEMTILE_BYTES - others - 4096)
         ak = K if a_res else self.kc
@@ -841,7 +1008,7 @@ class GemmQOperator(ArtcOperator):
         # pattern); the memtile stores them [kt][band][k-step][half][panel] = the MAC pop order
         a_wdims = [(ak // KT * (m // 16), 8 * 72), (2, 36), (8, 72), (36, 1)]
         a_obj = m * ak * 9 // 16
-        c_l1 = m * no * 9 // 16 if cb else m * self.n_c
+        c_l1 = m * no * 9 // 16 * self.c_parts if cb else m * self.n_c + self.c_tail
         parts = 2 if self.pair else 1
         return GemmQDataflow(
             b_obj=obj_w, b_l1=self.b_l1_words,
@@ -853,7 +1020,12 @@ class GemmQOperator(ArtcOperator):
             # the join of the 4 cores' 8x8 sub-blocks is un-panelized to row-major on the way to the shim
             # (packed C objects: row-major already, the columns past n_out dropped: a partial read of each
             # core's segment of the join)
-            c_dims=(stream_walk(c_l1, [(m, self.n_c), (no, 1)], [(0, 0), (0, 0)]) if self.n_c > no else
+            # (whole-line windows: win columns of each row, the rest from the next row's or the object's tail, ``lines``)
+            # (two bfp16 parts: [part][group][panels] to the groups' rows of both parts' panels)
+            c_dims=(stream_walk(c_l1, [(m // 8, no // 8 * 36), (2, m // 8 * no // 8 * 36), (no // 8 * 36, 1)])
+                    if self.c_parts == 2 else
+                    stream_walk(c_l1, [(m, self.n_c), (self.win, 1)], [(0, 0), (0, 0)])
+                    if self.n_c != self.win else
                     None if cb or self.c_pack or self.c_pairs else
                     stream_walk(c_l1, [(m // r, r * no), (r, t), (no // t, r * t), (t, 1)])))
 
@@ -985,14 +1157,19 @@ class GemmQOperator(ArtcOperator):
                 for v in range(self.vp)]
 
     def c_out_cols(self, c: int) -> list[int]:
-        """The first output column of each C object of column c (``out_cols``; two per pass in halves)."""
+        """The first output column of each C object of column c (``out_cols``; two per pass in halves; of two parts:
+        one per pass, or per pair of passes)."""
+        if self.c_parts == 2:
+            return list(self.out_cols[c]) if self.halves == 2 else list(self.out_cols[c][0::2])
         return [o + self.n_out * h for o in self.out_cols[c] for h in range(self.halves)]
 
     def c_taps(self, ch: int, c: int) -> list[TensorAccessPattern]:
         """The C drains of column c for token chunk ``ch`` (bf16 units): one per run of evenly
         spaced C objects' outputs."""
-        m, no, rows = self.m, self.n_out, self.nrows
+        m, no, rows = self.m, self.n_out * self.c_parts, self.nrows
         cols = self.c_out_cols(c)
+        if self.carry is not None:  # (whole-line windows from each pass's line boundary)
+            cols, no = [o - cr for o, (cr, _) in zip(cols, self.carry, strict=True)], self.win
         taps = []
         for p0, cnt, step in _runs(cols):
             if self.c_bfp16:  # panels [group][N / 8][36]: [pass][the chunk's groups][no / 8 blocks][panel]
@@ -1068,7 +1245,8 @@ class GemmQOperator(ArtcOperator):
 
         p = self.p
         k_zero = Kernel(f"{p}_zerof" if self.c_pairs else f"{p}_zero", "kernel.o", [acc_ty])
-        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, np.int32]) if self.silu else None
+        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, np.int32,
+                                                         *[np.int32] * (self.c_parts - 1)]) if self.silu else None
         pair = self.pair
         if pair:
             ws_ty = np.ndarray[(bufs["ws"][1] // 2,), np.dtype[bfloat16]]  # planes x nsb x 128 tq
@@ -1124,53 +1302,60 @@ class GemmQOperator(ArtcOperator):
 
         c_pairs = self.c_pairs
 
+        parts = self.c_parts  # (C objects of two passes: their outputs in turn)
+
         def core_fn(prm, bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
-            for _ in self._chunk_passes(prm):  # token chunks x passes
+            for _ in self._chunk_passes(prm, step=parts):  # token chunks x passes
                 c = cf.acquire(1)
-                acc = extra[1] if silu or c_pairs else c
-                zero(acc)
-                for _ in range_(self.k_rep * n_kc * (self.kc // KT)):
-                    b = bf.acquire(1)
-                    a = af.acquire(1)
-                    mm(a, b, acc)
-                    af.release(1)
-                    bf.release(1)
-                if silu:
-                    extra[0](acc, c, st, 0)  # (0: the kernel's opaque runtime zero)
-                elif c_pairs:
-                    extra[0](acc, c)
+                for h in range(parts):
+                    acc = extra[1] if silu or c_pairs else c
+                    zero(acc)
+                    for _ in range_(self.k_rep * n_kc * (self.kc // KT)):
+                        b = bf.acquire(1)
+                        a = af.acquire(1)
+                        mm(a, b, acc)
+                        af.release(1)
+                        bf.release(1)
+                    if silu:
+                        extra[0](acc, c, st, 0, *([h] if parts == 2 else []))  # (0: the kernel's opaque runtime zero)
+                    elif c_pairs:
+                        extra[0](acc, c)
                 cf.release(1)
 
         def pair_fn(prm, bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
-            for _ in self._chunk_passes(prm):  # token chunks x passes
+            for _ in self._chunk_passes(prm, step=parts):  # token chunks x passes
                 c = cf.acquire(1)
-                acc = extra[1] if silu else c
-                zero(acc)
-                for _ in range_(n_kc):
-                    for pl in range(planes):  # header planes, one k-tile slot per L1 object (this half's tiles)
-                        for kt in range_(4):
-                            b = bf.acquire(1)
-                            hdr(b, st if q4k else ws, *([] if q4k else [pl]), kt)
-                            bf.release(1)
-                    if q4k:
-                        extra[-1](st, ws)
-                    for sb in range_(self.nsb):
-                        for kt in range_(4):
-                            b = bf.acquire(1)
-                            x = xo.acquire(1)
-                            dq(b, ws, x, sb, kt)
-                            # (the partner may read x now; this core keeps reading it: the FIFO hands the object back
-                            # for the next k-tile but one, after the partner's release)
-                            xo.release(1)
-                            bf.release(1)
-                            a = af.acquire(1)
-                            y = xi.acquire(1)
-                            mm(a, x, y, acc, st, h, kt)  # (the C tiles acc and st in turn: an even count per chunk)
-                            xi.release(1)
-                            af.release(1)
-                if silu:
-                    extra[0](acc, c, st, 0)  # (0: the kernel's opaque runtime zero)
+                for part in range(parts):
+                    pass_fn(bf, af, xo, xi, zero, hdr, dq, mm, ws, st, h, c, part, *extra)
                 cf.release(1)
+
+        def pass_fn(bf, af, xo, xi, zero, hdr, dq, mm, ws, st, h, c, part, *extra):
+            acc = extra[1] if silu else c
+            zero(acc)
+            for _ in range_(n_kc):
+                for pl in range(planes):  # header planes, one k-tile slot per L1 object (this half's tiles)
+                    for kt in range_(4):
+                        b = bf.acquire(1)
+                        hdr(b, st if q4k else ws, *([] if q4k else [pl]), kt)
+                        bf.release(1)
+                if q4k:
+                    extra[-1](st, ws)
+                for sb in range_(self.nsb):
+                    for kt in range_(4):
+                        b = bf.acquire(1)
+                        x = xo.acquire(1)
+                        dq(b, ws, x, sb, kt)
+                        # (the partner may read x now; this core keeps reading it: the FIFO hands the object back
+                        # for the next k-tile but one, after the partner's release)
+                        xo.release(1)
+                        bf.release(1)
+                        a = af.acquire(1)
+                        y = xi.acquire(1)
+                        mm(a, x, y, acc, st, h, kt)  # (the C tiles acc and st in turn: an even count per chunk)
+                        xi.release(1)
+                        af.release(1)
+            if silu:
+                extra[0](acc, c, st, 0, *([part] if parts == 2 else []))  # (0: the kernel's opaque runtime zero)
 
         workers = []
         prm = self._mc_prm()

@@ -37,6 +37,8 @@ using namespace nb::literals;
 
 extern const char artlite_source_hash[];  // (source_hash.cpp, generated: CMakeLists.txt's ARTLITE_SOURCE_HASH)
 
+constexpr size_t kUserBoBytes = size_t(2) << 20;  // (alloc_host_buffer: from this size on, alloc_user_bo)
+
 class ParameterScratchpad {
  public:
   /// Construct from a raw buffer and its size in bytes (Python bindings /
@@ -378,9 +380,16 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       .def(
           "alloc_host_buffer",
           [](shim_xdna::device& self, size_t size) {
+            if (size >= kUserBoBytes) {
+              nb::gil_scoped_release release;
+              return self.alloc_user_bo(size);
+            }
             return self.alloc_bo(size, static_cast<uint32_t>(XCL_BO_FLAGS_HOST_ONLY));
           },
-          "size"_a, nb::keep_alive<0, 1>())
+          "size"_a, nb::keep_alive<0, 1>(),
+          "A zeroed host buffer the NPU reads and writes; from 2 MB on in this process's memory, as "
+          "alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows on pages of their own run at a "
+          "fraction of the rate: on Strix Halo 12 instead of 57 GB/s for 128-byte rows).")
       .def(
           "alloc_user_buffer",
           [](shim_xdna::device& self, size_t size) {
@@ -389,7 +398,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           },
           "size"_a, nb::keep_alive<0, 1>(),
           "A zeroed host buffer in this process's memory (2 MB pages faulted in by several threads, pinned by the "
-          "driver): for large buffers (16 GB: ~0.3 s, alloc_host_buffer 1.7 s). Like alloc_host_buffer otherwise.")
+          "driver): for large buffers (16 GB: ~0.3 s, a driver's BO 1.7 s). Like alloc_host_buffer otherwise.")
       .def(
           "alloc_insts_buffer",
           [](shim_xdna::device& self, size_t size) {

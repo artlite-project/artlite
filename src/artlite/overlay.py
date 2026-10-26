@@ -28,9 +28,6 @@ import numpy as np
 from . import backend, parallel_compile, txn
 from ._native import Buffer, Device, DispatchError
 
-# buffers from this size on are user-memory BOs: 2 MB pages faulted in by several threads (a SHMEM BO's pages are
-# allocated and mapped by the driver in one thread: 16 GB 1.7 s, a user BO ~0.35 s)
-USER_BO_BYTES = 64 << 20
 SPIN_MARGIN_US = 1000  # a transaction's spin starts this long before its shortest recent duration
 
 
@@ -302,11 +299,9 @@ class OverlayDevice:
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
         """A zeroed host buffer the NPU can read and write; returns its uint8 view. The NPU's DMA
         bypasses the CPU caches: ``flush`` what the host wrote before a dispatch reads it, ``fetch``
-        what a dispatch wrote before the host reads it. From USER_BO_BYTES on a user-memory BO
-        (``Device.alloc_user_buffer``)."""
+        what a dispatch wrote before the host reads it."""
         assert name not in self.buffers and nbytes % 4 == 0, name
-        alloc = self.device.alloc_user_buffer if nbytes >= USER_BO_BYTES else self.device.alloc_host_buffer
-        self.buffers[name] = alloc(nbytes)
+        self.buffers[name] = self.device.alloc_host_buffer(nbytes)
         return self.buffers[name].map()
 
     def adopt(self, name: str, buffer: object) -> np.ndarray:

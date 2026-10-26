@@ -60,7 +60,7 @@ REFERENCES: list[tuple[str, dict[str, str]]] = [
     ("Strix Halo", dict(zip(ROWS, ("1810", "1809", "49", "13.9", "26.9", "56.8", "56.4", "57.6", "76.1", "15.6",
                                    "30.8", "56.6", "56.9", "57.2", "41.4", "31.4"), strict=True))),
     ("Krackan Point", dict(zip(ROWS, ("1808", "1810", "56", "14.2", "28.1", "97.8", "80.1", "87.2", "88.2", "28.6",
-                                      "55.9", "95.6", "89.6", "?", "?", "54.1"), strict=True))),
+                                      "55.9", "95.6", "89.6", "73.2", "15.6", "54.1"), strict=True))),
     ("Strix Point", dict(zip(ROWS, ("1809", "1808", "94", "11.5", "21.4", "53.2", "47.3", "39.9", "53.4", "12.5",
                                     "25.1", "41.9", "14.0", "?", "?", "29.4"), strict=True))),
 ]
@@ -129,6 +129,17 @@ def _power() -> str:
     return f"platform profile {legacy or '-'} ({', '.join(profiles) or '-'}), {adapter}"
 
 
+def host_pages() -> str:
+    """The page size of the host buffers the NPU reads and writes (a DMA row on a page of its own costs a translation:
+    with 4 KB pages 128-byte rows write at a fifth of the rate, ``docs/probe.md``)."""
+    if platform.system() == "Windows":
+        return "4 KB (Windows maps system memory for the NPU in 4 KB pages)"
+    thp = _read("/sys/kernel/mm/transparent_hugepage/enabled")
+    if "[never]" in thp:
+        return "4 KB (transparent huge pages are off: /sys/kernel/mm/transparent_hugepage/enabled)"
+    return "2 MB" if thp else "?"
+
+
 def system() -> list[str]:
     """Lines describing the machine, OS, driver, firmware and power settings (Linux; elsewhere what the OS tells)."""
     dmi = " ".join(x for x in (_read("/sys/class/dmi/id/sys_vendor"), _read("/sys/class/dmi/id/product_name"),
@@ -138,7 +149,8 @@ def system() -> list[str]:
     machine = f"machine: {dmi or platform.node()}; {cpu_name}, {os.cpu_count()} CPUs" + (
         f"; {int(mem) / (1 << 20):.1f} GB of memory" if mem.isdigit() else "")
     if platform.system() != "Linux":
-        return [machine, f"OS: {platform.system()} {platform.version()} (driver, firmware, power mode: xrt-smi examine)"]
+        return [machine, f"OS: {platform.system()} {platform.version()} (driver, firmware, power mode: xrt-smi examine)",
+                f"host buffers: {host_pages()} pages"]
     dev = artlite.Device()
     # (a heap BO more: refused by a driver that gives a process one, silently on Linux 7.0 / 7.1)
     heap = "grows" if dev.grow_heap() else "one 64 MB heap BO per process" if dev.heap_fixed else "at its maximum"
@@ -152,7 +164,8 @@ def system() -> list[str]:
     cpu_mhz = _read(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq") if cpu >= 0 else ""
     irq = f"CPU {cpu}" + (f" (max {int(cpu_mhz) // 1000} MHz)" if cpu_mhz else "") if cpu >= 0 else "a CPU not known yet"
     return [machine, f"OS: Linux {platform.release()}; {_driver(dev)}, firmware {fw}", f"power: {_power()}",
-            f"NPU{' (through XRT)' if backend.XRT else ''}: power mode {mode}; interrupts on {irq}; device heap: {heap}"]
+            (f"NPU{' (through XRT)' if backend.XRT else ''}: power mode {mode}; interrupts on {irq}; device heap: {heap}; "
+             f"host buffers: {host_pages()} pages")]
 
 
 def main(argv: list[str] | None = None) -> None:

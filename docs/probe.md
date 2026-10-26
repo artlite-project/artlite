@@ -12,7 +12,7 @@ artlite-probe
 machine: ASUSTeK COMPUTER INC. ROG Flow Z13 GZ302EA_GZ302EA 1.0; AMD RYZEN AI MAX+ 395 w/ Radeon 8060S, 32 CPUs; 121.5 GB of memory
 OS: Linux 7.2.9-gentoo-dist-bin; amdxdna_accel_driver 0.18.0 (xdna-driver), firmware 1.1.2.65
 power: platform profile performance (performance), plugged in
-NPU: power mode default; interrupts on CPU 0 (max 5187 MHz); device heap: grows
+NPU: power mode default; interrupts on CPU 0 (max 5187 MHz); device heap: grows; host buffers: 2 MB pages
 
 | | this machine | Strix Halo | Krackan Point | Strix Point |
 |---|---:|---:|---:|---:|
@@ -29,8 +29,8 @@ NPU: power mode default; interrupts on CPU 0 (max 5187 MHz); device heap: grows
 | gather 512 B rows 64 KB apart | 31.0 | 30.8 | 55.9 | 25.1 |
 | gather 1 KB rows 64 KB apart | 56.9 | 56.6 | 95.6 | 41.9 |
 | gather 256 B rows 64 KB + 256 B apart | 57.1 | 56.9 | 89.6 | 14.0 |
-| write 128 B rows 64 KB + 128 B apart, 16 channels | 57.3 | 57.2 | ? | ? |
-| write 132 B rows 64 KB + 132 B apart | 41.5 | 41.4 | ? | ? |
+| write 128 B rows 64 KB + 128 B apart, 16 channels | 57.3 | 57.2 | 73.2 | ? |
+| write 132 B rows 64 KB + 132 B apart | 41.5 | 41.4 | 15.6 | ? |
 | 16-channel read per array cycle (B) | 31.3 | 31.4 | 54.1 | 29.4 |
 
 build: ef8477758 (140)
@@ -43,7 +43,7 @@ build: ef8477758 (140)
 | dispatch round trip | a dispatch of almost no work, from submit to its completion seen on the host |
 | DDR read / write | shim DMA channels streaming DRAM to the memory tiles (or back) on a design with no cores: one channel, one column's two, all 16, one per column (as the decode streams its weights); a read and a write stream in every column at once |
 | gather | 16 channels reading rows of 256 B to 1 KB, 64 KB apart: rows of 256 B or less at a stride of a multiple of 4 KB fall on one DRAM channel, a skewed stride spreads them |
-| write rows | 16 channels writing short rows, each next to a row written later: 128 B rows cover whole 64-byte lines, 132 B rows write parts of their first and last line, as a prefill GEMM's output rows of 66 columns do (the memory merges such a write into its line) |
+| write rows | 16 channels writing short rows, each next to a row written later: 128 B rows cover whole 64-byte lines, 132 B rows write parts of their first and last line, as the rows of a GEMM pass of 66 output columns would (the memory merges such a write into its line) |
 | per array cycle | the 16-channel read rate over the measured clock: Strix Halo's NPU moves at most 32 B per array cycle to DRAM |
 
 The reference columns: Strix Halo is a Ryzen AI Max+ 395 (256-bit LPDDR5X-8000, 256 GB/s; AMD's xdna-driver), Krackan
@@ -53,9 +53,16 @@ power mode `default`. Their arrays are the same, at the same clock, also with al
 path to DRAM. Strix Halo's NPU reaches it through a port of 32 B per array cycle (its rate follows the array clock in
 every power mode), 22% of that bus; Krackan Point's reads 81% of its bus, 1.7x as much; Strix Point's 59%. Small rows
 at a stride of a multiple of 4 KB cost all three alike, 71-77% below a stream at 256 B and 43-53% at 512 B, so a
-layout that is fast on one is fast on the others; on Strix Point's DDR5 a skewed stride does not spread them. The
-dispatch round trip through Windows and XRT is 94 us (58 in the `turbo` power mode). On Strix Halo a write of 132 B
-rows that share their end lines runs 28% below whole lines (`?`: not measured on that machine).
+layout that is fast on one is fast on the others. A write of 132 B rows that share their end lines runs 28% below whole
+lines on Strix Halo (its cache in front of DRAM merges them) and 79% below on Krackan Point (15.6 instead of 73.2
+GB/s): Artlite's prefill writes whole lines (`?`: not measured on that machine).
+
+Each row on a page of its own costs the NPU an address translation. Artlite's host buffers have 2 MB pages on Linux
+(transparent huge pages, `madvise` or `always`; the `host buffers` line says so); Windows maps system memory for the
+NPU in 4 KB pages, and there the skewed gather and the write rows run at 14-16 and 5-6 GB/s (Strix Point and a Krackan
+Point laptop on Windows: some 50 million rows a second at most, whatever their size), as on Strix Halo with huge
+pages off (29.3 and 12.2). The dispatch round trip through Windows and XRT is 94 us (58 in the `turbo` power
+mode).
 
 The first lines name the machine, the kernel, which `amdxdna` runs (`amdxdna_accel_driver` 0.6 / 0.8 / 0.10 are Linux
 7.0 / 7.1 / 7.2's own), the NPU firmware, the platform profile and the power adapter, the NPU's power mode, the CPU

@@ -52,6 +52,7 @@ struct bo {
   void* m_aligned = nullptr;  // CPU address
   size_t m_parent_size = 0;
   size_t m_aligned_size = 0;
+  size_t m_size = 0;  // the size asked for (a user BO pins and maps whole 4 KB pages: m_aligned_size)
   shim_xcl_bo_flags m_flags{};
   amdxdna_bo_type m_type = AMDXDNA_BO_INVALID;
   uint32_t m_handle = AMDXDNA_INVALID_BO_HANDLE;
