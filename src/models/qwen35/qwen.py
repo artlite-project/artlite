@@ -356,6 +356,7 @@ class Qwen(Model):
     name = "Qwen3.5"
     thinks = True
     reasoning = ("<think>", "</think>")
+    thought_first = True
     projectors = PROJECTORS
 
     def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None):
@@ -379,8 +380,9 @@ class Qwen(Model):
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int] | Sequence:
-        text = chat_prompt(self.gguf, messages, enable_thinking=think)
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False,
+             tools: list[dict[str, object]] | None = None) -> list[int] | Sequence:
+        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools)
         images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
                   if isinstance(p, dict) and p.get("type") == "image"]
         if not images:

@@ -68,9 +68,14 @@ def load_tokenizer(model_path: str, tokenizer_path: str | None = None) -> Tokeni
     return Tokenizer(gigatoken.Tokenizer.from_json(bpe_tokenizer_json(g, LLAMA3_PATTERN, ignore_merges=True)), special)
 
 
-def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, date: str | None = None) -> str:
+def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, date: str | None = None,
+                tools: list[dict[str, object]] | None = None) -> str:
     """The prompt text of a conversation, rendered with the file's chat template (it begins with the BOS: encode it
     as it is) up to the assistant's turn; ``date`` ("26 Jul 2024") replaces today's date in the system header
-    (reproducible prompts)."""
-    return chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, bos_token=BOS,
+    (reproducible prompts); ``tools``: the functions the model may call. The template takes one tool call per
+    message: a message of several is rendered as one message per call."""
+    messages = [one for m in messages
+                for one in ([{**m, "tool_calls": [c]} for c in m["tool_calls"]] if len(m.get("tool_calls") or []) > 1
+                            else [m])]
+    return chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools, bos_token=BOS,
                          **({"date_string": date} if date else {}))

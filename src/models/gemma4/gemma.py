@@ -255,8 +255,9 @@ class Gemma(Model):
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_bos=True)
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think))
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False,
+             tools: list[dict[str, object]] | None = None) -> list[int]:
+        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools))
 
     def sampling(self, *, think: bool = False) -> Sampling:
         return Sampling(temp=1.0, top_k=64, top_p=0.95)  # (the model card's)

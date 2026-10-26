@@ -226,7 +226,8 @@ class GemmaConfig:
         kv = m("attention.head_count_kv")
         kv = (int(kv),) * n if np.isscalar(kv) else tuple(int(x) for x in kv)
         tokens = gguf.strings("tokenizer.ggml.tokens")
-        eog = [i for i, t in enumerate(tokens[:1024]) if t in ("<eos>", "<turn|>")]
+        # (llama.cpp's end-of-generation tokens: <|tool_response>, where a tool call's result would follow)
+        eog = [i for i, t in enumerate(tokens[:1024]) if t in ("<eos>", "<turn|>", "<|tool_response>")]
         freqs = gguf.tensor("rope_freqs.weight").raw.reshape(-1) if "rope_freqs.weight" in gguf else None
         return cls(
             vocab_size=len(tokens),

@@ -37,6 +37,7 @@ BOS, EOS = 0, 1
 QWEN = ("<think>", "</think>")
 GEMMA = ("<|channel>thought", "<channel|>")
 TEMPLATE = "{% if enable_thinking %}<think>{% endif %}"  # (/props: the UI shows its thinking toggle)
+TOOLS_TEMPLATE = TEMPLATE + "{# <tool_call> <function= <parameter= #}"  # (Qwen's tool-call syntax)
 
 
 class FakeTokenizer:
@@ -74,12 +75,22 @@ class FakeModel(Model):
         self.eos_token_ids = (EOS,)
         self.reasoning = reasoning
         self.thinks = reasoning is not None
+        self.thought_first = reasoning == QWEN
+        self.rendered: tuple[list[dict[str, object]], list[dict[str, object]] | None] = ([], None)
 
     def encode(self, text: str) -> list[int]:
         return [BOS] + self.tokenizer.encode(text)
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
-        text = "<s>" + "".join(f"<|{m['role']}|>{m['content']}" for m in messages) + "<|assistant|>"
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False,
+             tools: list[dict[str, object]] | None = None) -> list[int]:
+        """(tools: their names in a system turn; an assistant's tool calls after its content)"""
+        self.rendered = (messages, tools)
+        text = "<s>" + (f"<|system|>tools: {' '.join(t['function']['name'] for t in tools)}" if tools else "")
+        for m in messages:
+            calls = "".join(f" call {c['function']['name']} {json.dumps(c['function']['arguments'])}"
+                            for c in m.get("tool_calls") or [])
+            text += f"<|{m['role']}|>{m['content']}{calls}"
+        text += "<|assistant|>"
         if self.reasoning == QWEN:
             text += "<think>\n" if think else "<think>\n\n</think>\n\n"
         return self.tokenizer.encode(text)
@@ -98,7 +109,8 @@ class FakeVision(FakeModel):
         super().__init__()
         self.threads: list[str] = []
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int] | Sequence:
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False,
+             tools: list[dict[str, object]] | None = None) -> list[int] | Sequence:
         seq, text = Sequence.text([], 8), "<s>"
         for m in messages:
             text += f"<|{m['role']}|>"
@@ -119,10 +131,11 @@ class FakeNpu(NpuModel):
     positions or none (Qwen); ``chunk``: prompt tokens per dispatch; ``delay``: seconds per dispatch."""
 
     def __init__(self, model: FakeModel, *, capacity: int = 512, group: int = 4, exact: bool = False, chunk: int = 8,
-                 delay: float = 0.0):
+                 delay: float = 0.0, drafts: int = 0):
         self.tok = model.tokenizer
         self.eos_token_ids = model.eos_token_ids
         self.capacity, self.group, self.exact, self.chunk, self.delay = capacity, group, exact, chunk, delay
+        self.drafts = drafts  # (> 0: steps of drafts, every draft accepted: tokens run before they are yielded)
         self.position = 0
         self.seq: list[int] = []
         self.replies: list[list[str]] = []
@@ -179,6 +192,23 @@ class FakeNpu(NpuModel):
         logits = self._logits(next(self._next, EOS))
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = ()
+                 ) -> Iterator[int]:
+        """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded)"""
+        if not self.drafts:
+            yield from super().generate(logits, max_tokens, sampling, prompt)
+            return
+        token, n = int(logits.argmax()), 1
+        yield token
+        while n != max_tokens and token not in self.eos_token_ids:
+            new = []
+            while len(new) <= self.drafts and (not new or new[-1] != EOS):
+                new.append(next(self._next, EOS))
+            self._run([token, *new[:-1]])
+            for token in new:
+                n += 1
+                yield token
+
 
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)
 
@@ -202,9 +232,9 @@ def make(*, reasoning: tuple[str, str] | None = None, load: object = None, visio
     return model, npu, engine
 
 
-def app_of(engine: Engine, **options: object) -> object:
+def app_of(engine: Engine, *, template: str = TEMPLATE, **options: object) -> object:
     opts = {"alias": "fake", "n_ctx": 512, "sse_ping_interval": 0.05} | options
-    return create_app(engine, Options(**opts), ModelInfo(path="/models/org/repo/fake.gguf", chat_template=TEMPLATE,
+    return create_app(engine, Options(**opts), ModelInfo(path="/models/org/repo/fake.gguf", chat_template=template,
                                                          n_ctx_train=4096, n_vocab=VOCAB))
 
 
@@ -357,6 +387,14 @@ def test_splitter_and_stops() -> None:
     s = ReasoningSplitter(GEMMA)
     parts = [p for t in ["Plain <|chan", "nel", " not a marker"] for p in s.feed(t)] + s.flush()
     assert "".join(t for _, t in parts) == "Plain <|channel not a marker" and {k for k, _ in parts} == {"content"}
+    # a Qwen call that ends the thought without its close marker; a thought only begins the answer (Qwen's)
+    s = ReasoningSplitter(QWEN, inside=True, ends=("<tool_call>",), once=True)
+    parts = [p for t in ["Need to look.\n<tool", "_call>\n<function=f>", " text </think> <think> more"]
+             for p in s.feed(t)] + s.flush()
+    assert parts[0] == ("reasoning_content", "Need to look.") and {k for k, _ in parts[1:]} == {"content"}
+    assert "".join(t for _, t in parts[1:]) == "<tool_call>\n<function=f> text </think> <think> more"
+    s = ReasoningSplitter(QWEN, once=True)
+    assert s.feed("</think>\n\nA <think>") + s.flush() == [("content", "A <think>")]
     m = StopMatcher(["STOP", "\n\n"])
     assert [m.feed(t) for t in ["Hello", " wor", "ld ST", "O"]] == [("Hello", False), (" wor", False), ("ld ", False),
                                                                      ("", False)]
@@ -373,6 +411,207 @@ def test_stop_strings(fake: tuple) -> None:
     assert npu.position == len(engine.cached) and engine.cached == npu.seq[:npu.position]
     evs = events(chat(client, "Hi", stream=True, stop=["STOP"]))
     assert deltas(evs) == "START ok"
+
+
+# ----------------------------------------------------------------------
+# Tool calls
+# ----------------------------------------------------------------------
+
+WEATHER = {"type": "function", "function": {"name": "get_weather", "description": "The weather in a city",
+                                            "parameters": {"type": "object", "properties": {"city": {"type": "string"},
+                                                                                            "days": {"type": "integer"}},
+                                                           "required": ["city"]}}}
+TIME = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+
+
+def call_pieces(name: str, **args: str) -> list[str]:
+    """A Qwen tool call as the fake model's pieces."""
+    out = ["<tool_call>", f"\n<function={name}>"]
+    for k, v in args.items():
+        out += [f"\n<parameter={k}>", f"\n{v}", "\n</parameter>"]
+    return out + ["\n</function>", "\n</tool_call>"]
+
+
+@pytest.fixture
+def tooled() -> Iterator[tuple[FakeModel, FakeNpu, Engine, TestClient]]:
+    model, npu, engine = make(reasoning=QWEN)
+    with TestClient(app_of(engine, template=TOOLS_TEMPLATE)) as client:
+        assert engine.wait_ready(5)
+        yield model, npu, engine, client
+
+
+def streamed_calls(evs: list[object]) -> list[dict[str, object]]:
+    """The tool calls of a stream's deltas, joined as clients join them."""
+    calls: dict[int, dict[str, object]] = {}
+    for e in evs:
+        if not isinstance(e, dict) or not e.get("choices"):
+            continue
+        for d in e["choices"][0]["delta"].get("tool_calls") or []:
+            if "id" in d:
+                assert d["index"] not in calls and d["type"] == "function" and d["function"]["name"]
+                calls[d["index"]] = {"id": d["id"], "name": d["function"]["name"], "arguments": ""}
+            else:
+                assert set(d) == {"index", "function"} and set(d["function"]) == {"arguments"}
+            calls[d["index"]]["arguments"] += d["function"]["arguments"]
+    return [calls[i] for i in sorted(calls)]
+
+
+def test_tool_calls(tooled: tuple) -> None:
+    """A call after content and thoughts, streamed and whole; the tools reach the template."""
+    model, npu, _engine, client = tooled
+    reply = ["Checking", " the", " sky", "\n", "</think>", "\n\n", "Let", " me", " look.", "\n\n"] + \
+        call_pieces("get_weather", city="Paris", days="3")
+    npu.replies = [reply, reply]
+    body = {"tools": [WEATHER, TIME], "chat_template_kwargs": {"enable_thinking": True}}
+    r = chat(client, "Weather?", **body).json()
+    msg = r["choices"][0]["message"]
+    assert r["choices"][0]["finish_reason"] == "tool_calls"
+    assert msg["content"] == "Let me look." and msg["reasoning_content"] == "Checking the sky"
+    (call,) = msg["tool_calls"]
+    assert call["type"] == "function" and call["id"].startswith("call_")
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Paris", "days": 3}'}
+    assert [t["function"]["name"] for t in model.rendered[1]] == ["get_weather", "get_time"]
+    assert model.rendered[1][1]["function"] == {"name": "get_time", "description": "",
+                                                 "parameters": {"type": "object", "properties": {}}}
+    evs = events(chat(client, "Weather?", stream=True, **body))
+    assert deltas(evs) == "Let me look." and deltas(evs, "reasoning_content") == "Checking the sky"
+    (c,) = streamed_calls(evs)
+    assert (c["name"], json.loads(c["arguments"])) == ("get_weather", {"city": "Paris", "days": 3})
+    assert evs[-2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_calls_parallel(tooled: tuple) -> None:
+    """Two calls in one answer, or the first alone (parallel_tool_calls false: the generation ends after it)."""
+    _model, npu, _engine, client = tooled
+    reply = call_pieces("get_weather", city="Oslo") + ["\n"] + call_pieces("get_time") + ["\n", "Extra"]
+    npu.replies = [reply, reply]
+    msg = chat(client, "Q", tools=[WEATHER, TIME]).json()["choices"][0]["message"]
+    assert [(c["function"]["name"], c["function"]["arguments"]) for c in msg["tool_calls"]] == \
+        [("get_weather", '{"city": "Oslo"}'), ("get_time", "{}")]
+    assert msg["content"] == "Extra"
+    r = chat(client, "Q", tools=[WEATHER, TIME], parallel_tool_calls=False).json()
+    assert [c["function"]["name"] for c in r["choices"][0]["message"]["tool_calls"]] == ["get_weather"]
+    assert r["choices"][0]["message"]["content"] is None and r["usage"]["completion_tokens"] < len(reply)
+
+
+def test_tool_choice(tooled: tuple) -> None:
+    """none: the call stays text; required and a named function: the call's opener is forced, after the thought when
+    the model thinks (the generation runs it and continues)."""
+    model, npu, engine, client = tooled
+    raw = call_pieces("get_time")
+    npu.replies = [raw]
+    msg = chat(client, "Q", tools=[TIME], tool_choice="none").json()["choices"][0]["message"]
+    assert "tool_calls" not in msg and msg["content"].startswith("<tool_call>")
+    assert model.rendered[1] is not None  # (the tools stay in the prompt)
+    npu.replies = [call_pieces("get_time")[1:]]  # (after the forced "<tool_call>\n<function=")
+    npu.replies[0][0] = "get_time>"
+    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice="required").json()
+    assert [c["function"]["name"] for c in r["choices"][0]["message"]["tool_calls"]] == ["get_time"]
+    assert ("<|assistant|><think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n</function>"
+            in model.tokenizer.decode_bytes(npu.seq).decode())
+    npu.replies = [["Need", " Oslo", "</think>", "No", " call"], ["\n<parameter=city>", "\nOslo", "\n</parameter>",
+                                                                 "\n</function>", "\n</tool_call>"]]
+    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice={"type": "function", "function": {"name": "get_weather"}},
+             chat_template_kwargs={"enable_thinking": True}).json()
+    msg = r["choices"][0]["message"]
+    assert msg["reasoning_content"] == "Need Oslo" and msg["content"] is None
+    assert [(c["function"]["name"], c["function"]["arguments"]) for c in msg["tool_calls"]] == \
+        [("get_weather", '{"city": "Oslo"}')]
+    text = model.tokenizer.decode_bytes(npu.seq).decode()
+    assert "Need Oslo</think>\n\n<tool_call>\n<function=get_weather>\n" in text and "No call" not in text
+    assert engine.cached == npu.seq[:npu.position]
+
+
+def test_tool_calls_drafts() -> None:
+    """Steps of several tokens (a drafter): the forced opener and the end after a call wait for a step's end, so the
+    cache holds exactly the tokens of the answer."""
+    _model, npu, engine = make(reasoning=QWEN, drafts=3)
+    with TestClient(app_of(engine, template=TOOLS_TEMPLATE)) as client:
+        assert engine.wait_ready(5)
+        npu.replies = [["Need", " Oslo", "</think>", "\n\n", "Fine."], call_pieces("get_weather", city="Oslo")[2:]]
+        r = chat(client, "Q", tools=[WEATHER], tool_choice={"type": "function", "function": {"name": "get_weather"}},
+                 chat_template_kwargs={"enable_thinking": True}).json()
+        msg = r["choices"][0]["message"]
+        assert msg["reasoning_content"] == "Need Oslo" and msg["content"] == "Fine."
+        assert [c["function"]["arguments"] for c in msg["tool_calls"]] == ['{"city": "Oslo"}']
+        assert engine.cached == npu.seq[:npu.position] and npu.position == len(engine.cached)
+        reply = call_pieces("get_time") + ["\n"] + call_pieces("get_weather", city="X")
+        npu.replies = [reply]
+        r = chat(client, "Q", tools=[WEATHER, TIME], parallel_tool_calls=False).json()
+        assert [c["function"]["name"] for c in r["choices"][0]["message"]["tool_calls"]] == ["get_time"]
+        assert engine.cached == npu.seq[:npu.position] and npu.position == len(engine.cached)
+
+
+def test_tool_messages(tooled: tuple) -> None:
+    """A conversation with calls and their results: arguments as objects for the template."""
+    model, npu, _engine, client = tooled
+    messages = [{"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather",
+                                                                      "arguments": '{"city": "Paris"}'}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}]
+    npu.replies = [["Sunny", " in", " Paris."]]
+    msg = chat(client, messages, tools=[WEATHER]).json()["choices"][0]["message"]
+    assert msg == {"role": "assistant", "content": "Sunny in Paris."}
+    rendered = model.rendered[0]
+    assert rendered[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert rendered[2] == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}
+    prompt = client.post("/apply-template", json={"messages": messages, "tools": [WEATHER]}).json()["prompt"]
+    assert 'call get_weather {"city": "Paris"}' in prompt and "tools: get_weather" in prompt
+
+
+def test_content_parts() -> None:
+    """A message's text parts go to a template that renders lists as a list (Qwen's, Gemma's), else joined by
+    newlines."""
+    parts = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    listing = "{% for m in messages %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endfor %}"
+    for template, want in [(listing, parts), (TEMPLATE, "a\nb")]:
+        model, _npu, engine = make()
+        with TestClient(app_of(engine, template=template)) as client:
+            assert chat(client, [{"role": "user", "content": parts}]).status_code == 200
+            assert model.rendered[0][0]["content"] == want
+
+
+def test_tool_errors(tooled: tuple, fake: tuple) -> None:
+    client = tooled[3]
+    bad = [({"tools": [{"type": "function", "function": {"description": "no name"}}]}, "a tool must be"),
+           ({"tools": [WEATHER], "tool_choice": "any"}, "tool_choice"),
+           ({"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "nope"}}}, "not one of"),
+           ({"tool_choice": "required"}, "without tools")]
+    for body, says in bad:
+        r = chat(client, "Q", **body)
+        assert r.status_code == 400 and says in r.json()["error"]["message"], body
+    r = chat(client, [{"role": "user", "content": "Q"}, {"role": "assistant", "tool_calls": [
+        {"id": "1", "type": "function", "function": {"name": "f", "arguments": "{oops"}}]}], tools=[WEATHER])
+    assert r.status_code == 400 and "not JSON" in r.json()["error"]["message"]
+    fake[1].replies = [call_pieces("get_weather", city="X")]  # (a template without tools: they are ignored)
+    msg = chat(fake[3], "Q", tools=[WEATHER]).json()["choices"][0]["message"]
+    assert "tool_calls" not in msg and msg["content"].startswith("<tool_call>") and fake[0].rendered[1] is None
+    r = chat(fake[3], "Q", tools=[WEATHER], tool_choice="required")
+    assert r.status_code == 400 and "takes no tools" in r.json()["error"]["message"]
+    assert fake[3].get("/props").json()["chat_template_caps"]["supports_tools"] is False
+    assert client.get("/props").json()["chat_template_caps"] == {
+        "supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True}
+
+
+def test_tool_calls_openai_client() -> None:
+    """The openai package's stream of a call."""
+    _model, npu, engine = make(reasoning=QWEN)
+    with live(engine, template=TOOLS_TEMPLATE) as url:
+        client = openai.OpenAI(base_url=f"{url}/v1", api_key="none")
+        npu.replies = [call_pieces("get_weather", city="Rome", days="2")] * 2
+        args = {"model": "fake", "messages": [{"role": "user", "content": "Rome?"}], "tools": [WEATHER]}
+        calls: dict[int, dict[str, str]] = {}
+        finish = None
+        for c in client.chat.completions.create(**args, stream=True):
+            for d in (c.choices[0].delta.tool_calls or []) if c.choices else []:
+                e = calls.setdefault(d.index, {"name": "", "arguments": ""})
+                e["name"] += d.function.name or ""
+                e["arguments"] += d.function.arguments or ""
+            finish = c.choices[0].finish_reason if c.choices else finish
+        assert finish == "tool_calls" and calls == {0: {"name": "get_weather", "arguments": '{"city": "Rome", "days": 2}'}}
+        r = client.chat.completions.create(**args)
+        assert r.choices[0].message.tool_calls[0].function.name == "get_weather"
 
 
 # ----------------------------------------------------------------------
@@ -706,11 +945,11 @@ def test_utilities(fake: tuple) -> None:
 
 
 @contextlib.contextmanager
-def live(engine: Engine) -> Iterator[str]:
-    """The app of ``engine`` under uvicorn on a free port: its URL."""
+def live(engine: Engine, **app: object) -> Iterator[str]:
+    """The app of ``engine`` (``app``: ``app_of``'s keywords) under uvicorn on a free port: its URL."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(app_of(engine), log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app_of(engine, **app), log_level="warning"))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]})
     thread.start()
     try:

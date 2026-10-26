@@ -1,6 +1,7 @@
 """The server's NPU side: one worker thread owns the model and runs the requests' generations one at a time, in
-arrival order (``Engine``); the prompt cache across requests; the generated text's stop strings (``StopMatcher``) and
-its split into thoughts and answer (``ReasoningSplitter``); the timings of a generation as llama-server reports them."""
+arrival order (``Engine``); the prompt cache across requests; the generated text's stop strings (``StopMatcher``), its
+split into thoughts and answer (``ReasoningSplitter``) and the answer's tool calls (``tools.Parser``); the timings of a
+generation as llama-server reports them."""
 
 import collections
 import concurrent.futures
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..common import Model, NpuModel, Sampling, StreamDecoder, argmax, seed
+from .tools import Calls, held
 
 log = logging.getLogger("artlite.server")
 
@@ -30,11 +32,12 @@ class Job:
 
     - ``progress``: the prompt's ``prompt_progress`` (``total``, ``cache``, ``processed``, ``time_ms``), when
       ``progress`` is set: at the start and after each chunk;
-    - ``delta``: ``parts``, the new text as (kind, text) pairs, kind ``content`` or ``reasoning_content``, and the
+    - ``delta``: ``parts``, the new output as (kind, value) pairs: kind ``content`` or ``reasoning_content`` with
+      text, ``tool_call`` with a ``tools.ToolCall`` (``tools``: a call's start and its arguments' fragments), and the
       ``timings`` so far;
     - ``done``: ``finish_reason`` (``stop``: an end-of-sequence token or a stop string, ``length``: ``max_tokens`` or a
-      full cache), ``stop_word``, ``timings``, ``n_prompt`` (the prompt's tokens) and ``n_cached`` (positions cached
-      after it);
+      full cache, ``tool_calls``: the answer has complete calls), ``stop_word``, ``timings``, ``n_prompt`` (the
+      prompt's tokens), ``n_cached`` (positions cached after it) and ``n_calls`` (the complete tool calls);
     - ``error``: ``message``, a failure in the model (the job ends);
     - ``cancelled``: the job ended early (``cancel`` set)."""
 
@@ -46,6 +49,7 @@ class Job:
     stop: list[str] = field(default_factory=list)
     reasoning: bool = False  # split the thoughts off (the model's ``reasoning`` markers)
     inside: bool = False  # the prompt ends inside a thought (it opened one)
+    tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
     cache_prompt: bool = True  # continue from the cached prefix
     progress: bool = False  # send prompt_progress events
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
@@ -73,17 +77,6 @@ def common_prefix(a: list[int], b: list[int]) -> int:
     return next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), min(len(a), len(b)))
 
 
-def _held(text: str, words: list[str]) -> int:
-    """The length of the longest end of ``text`` that begins one of ``words`` (without being all of it)."""
-    best = 0
-    for w in words:
-        for k in range(min(len(w) - 1, len(text)), best, -1):
-            if text.endswith(w[:k]):
-                best = k
-                break
-    return best
-
-
 class StopMatcher:
     """Stop strings in a stream of text: ``feed`` returns the text that may be sent and whether a stop string ended it
     (the text is cut before the stop string, ``word``). Text that may begin a stop string is held back until what
@@ -103,7 +96,7 @@ class StopMatcher:
             i, self.word = min(hits)
             self._held = ""
             return s[:i], True
-        k = _held(s, self.stops)
+        k = held(s, self.stops)
         self._held = s[len(s) - k:]
         return s[:len(s) - k], False
 
@@ -118,13 +111,18 @@ class ReasoningSplitter:
     its thought markers (``Model.reasoning``): ``feed`` returns the (kind, text) parts a text completes. The markers
     are dropped, and so is the white space around them; text that may begin a marker and trailing white space are held
     back until what follows decides. A close marker outside a thought is dropped (Gemma may end an answer with one).
-    ``inside``: the text starts inside a thought (the prompt opened it)."""
+    ``inside``: the text starts inside a thought (the prompt opened it); ``ends``: text that ends a thought and begins
+    the answer (kept: a Qwen tool call without the close marker); ``once``: a thought only begins the text (Qwen's),
+    markers after it are answer."""
 
-    def __init__(self, markers: tuple[str, str], *, inside: bool = False):
+    def __init__(self, markers: tuple[str, str], *, inside: bool = False, ends: tuple[str, ...] = (),
+                 once: bool = False):
         self.open, self.close = markers
         self.inside = inside
+        self.ends, self.once = ends, once
         self._held = ""
         self._lead = True  # (a part begins: its leading white space is dropped)
+        self._over = False  # (once: the thought is over, or the text began outside one)
 
     @property
     def kind(self) -> str:
@@ -136,21 +134,29 @@ class ReasoningSplitter:
             self._lead = not text
         if text:
             out.append((self.kind, text))
+            if self.once and not self.inside:
+                self._over = True
+
+    def _marks(self) -> list[str]:
+        if self.inside:
+            return [self.close, *self.ends]
+        return [] if self._over else [self.open, self.close]
 
     def feed(self, text: str) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         s = self._held + text
         while True:
-            marks = [self.close] if self.inside else [self.open, self.close]
+            marks = self._marks()
             hits = [(i, m) for m in marks if (i := s.find(m)) >= 0]
             if not hits:
                 break
             i, m = min(hits)
             self._part(out, s[:i].rstrip())
-            s = s[i + len(m):]
+            s = s[i:] if m in self.ends and self.inside else s[i + len(m):]
             self.inside = m == self.open
+            self._over = self.once and not self.inside
             self._lead = True
-        k = _held(s, marks)
+        k = held(s, marks)
         body = s[:len(s) - k]
         text = body.rstrip()
         self._held = body[len(text):] + s[len(s) - k:]
@@ -340,16 +346,22 @@ class Engine:
 
         def progress(i: int) -> None:
             if job.progress:
-                job.emit("progress", {"total": len(ids), "cache": kept, "processed": kept + i,
+                job.emit("progress", {"total": len(ids), "cache": kept, "processed": min(kept + i, len(ids)),
                                       "time_ms": (time.perf_counter() - t0) * 1e3})
             if job.cancel.is_set():
                 raise Cancelled
 
+        tools = job.tools
+        force = tools.force if tools is not None else None
+        # (a forced call: its opener ends the prompt, or follows the thought the prompt opened)
+        early = model.tokenizer.encode(force) if force and not job.inside else []
+        late = tools.syntax.gap + force if force and job.inside else ""
         job.state = "prompt"
         gen: list[int] = []
         try:
             progress(0)
-            logits = npu.forward(ids[kept:], progress=progress)
+            logits = npu.forward(ids[kept:] + early, progress=progress)
+            gen += early
             t1 = time.perf_counter()
             d1, t_npu1, t_host1 = npu.dispatches, npu.t_npu, npu.t_host
             job.state = "generating"
@@ -361,38 +373,62 @@ class Engine:
 
             text = StreamDecoder(model.tokenizer)
             stop = StopMatcher(job.stop)
-            split = ReasoningSplitter(model.reasoning, inside=job.inside) \
+            split = ReasoningSplitter(model.reasoning, inside=job.inside, once=model.thought_first,
+                                      ends=tools.syntax.ends if tools is not None else ()) \
                 if job.reasoning and model.reasoning is not None else None
+            calls = tools.parser() if tools is not None else None
 
-            def send(s: str) -> None:
+            def parse(s: str) -> list[tuple[str, Any]]:
                 parts = split.feed(s) if split is not None else [("content", s)] if s else []
+                return calls.parts(parts) if calls is not None else parts
+
+            def send(parts: list[tuple[str, Any]]) -> None:
                 if parts:
                     job.emit("delta", {"parts": parts, "timings": times(time.perf_counter())})
 
+            send(parse(force) if early else [])
             finish = "length"
-            for token in npu.generate(logits, job.max_tokens, job.sampling, ids):
-                gen.append(token)
-                job.n_gen = len(gen)
-                if token in model.eos_token_ids:
-                    finish = "stop"
+            while True:
+                left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
+                for token in npu.generate(logits, left, job.sampling, ids + gen):
+                    gen.append(token)
+                    job.n_gen = len(gen)
+                    if token in model.eos_token_ids:
+                        finish = "stop"
+                        break
+                    s, hit = stop.feed(text.feed(token))
+                    send(parse(s))
+                    if hit:
+                        finish = "stop"
+                        break
+                    if job.cancel.is_set():
+                        raise Cancelled
+                    # (the thought is over and no call began: the forced call's opener follows)
+                    forcing = bool(late) and split is not None and not split.inside and not calls.started
+                    # the answer is complete, or the opener goes next: end where every token but the last ran (a
+                    # step of drafts runs several; the parser drops what follows a call when parallel is off)
+                    if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):
+                        break
+                if not forcing or finish == "stop":
                     break
-                s, hit = stop.feed(text.feed(token))
-                send(s)
-                if hit:
-                    finish = "stop"
-                    break
-                if job.cancel.is_set():
-                    raise Cancelled
+                n = npu.rewind(npu.position)  # (the generation stopped where the next request would continue)
+                forced = model.tokenizer.encode(late)
+                logits = npu.forward((ids + gen)[n:] + forced)
+                gen += forced
+                send(parse(late))
+                late = ""
             if stop.word is None:
-                send(stop.flush())
-            if split is not None and (parts := split.flush()):
-                job.emit("delta", {"parts": parts, "timings": times(time.perf_counter())})
+                send(parse(stop.flush()))
+            tail = split.flush() if split is not None else []
+            send(calls.parts(tail) + calls.flush() if calls is not None else tail)
+            if calls is not None and calls.calls and not calls.calling:
+                finish = "tool_calls"
         finally:
             self.cached = (ids + gen)[:npu.position]
         t2 = time.perf_counter()
         t = times(t2)
         job.emit("done", {"finish_reason": finish, "stop_word": stop.word, "timings": t, "n_prompt": len(ids),
-                          "n_cached": len(self.cached)})
+                          "n_cached": len(self.cached), "n_calls": calls.calls if calls is not None else 0})
         # (artlite-cli's report: the generation's dispatches, the time of each, the host's inputs)
         passes = max(npu.dispatches - d1, 1)
         host = f", {(npu.t_host - t_host1) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > t_host1 else ""

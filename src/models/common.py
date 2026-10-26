@@ -7,6 +7,7 @@ import collections
 import copy
 import functools
 import importlib.metadata
+import json
 import math
 import os
 import random
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
+import jinja2.ext
 import jinja2.sandbox
 import numpy as np
 import torch
@@ -229,18 +231,37 @@ def _raise(message: str) -> None:
     raise jinja2.TemplateError(message)
 
 
-def chat_template(template: str, messages: list[dict[str, object]], **variables: object) -> str:
+def _tojson(value: object, ensure_ascii: bool = False, indent: int | None = None,
+            separators: tuple[str, str] | None = None, sort_keys: bool = False) -> str:
+    """The templates' ``tojson`` as transformers and llama.cpp render it: the keys in their order, no HTML escapes
+    (Jinja2's own sorts the keys and escapes ``<>&'``)."""
+    return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
+
+
+def chat_template(template: str, messages: list[dict[str, object]], *, tools: list[dict[str, object]] | None = None,
+                  **variables: object) -> str:
     """The prompt text of a conversation rendered with a model's chat template (a GGUF file's
-    ``tokenizer.chat_template``, Jinja2 in a sandbox) up to the assistant's turn; ``variables``: the template's own
-    (``enable_thinking``, ``bos_token``, ``date_string``, ...)."""
-    env = jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    ``tokenizer.chat_template``, Jinja2 in a sandbox, as transformers renders it) up to the assistant's turn;
+    ``tools``: the functions the model may call (OpenAI's ``{"type": "function", "function": {...}}``; a tool call's
+    ``arguments`` in the messages are objects); ``variables``: the template's own (``enable_thinking``, ``bos_token``,
+    ``date_string``, ...)."""
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                                       extensions=[jinja2.ext.loopcontrols])
+    env.filters["tojson"] = _tojson
     env.globals["raise_exception"] = _raise
     env.globals["strftime_now"] = lambda fmt: datetime.now().astimezone().strftime(fmt)
-    return env.from_string(template).render(messages=messages, add_generation_prompt=True, tools=None, **variables)
+    return env.from_string(template).render(messages=messages, add_generation_prompt=True, tools=tools or None,
+                                            **variables)
 
 
 class Detokenizer(Protocol):
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes: ...
+
+
+class Tokenizer(Detokenizer, Protocol):
+    def encode(self, text: str) -> list[int]:
+        """Token ids of ``text`` (special tokens written in it become their ids; no BOS)."""
+        ...
 
 
 class StreamDecoder:
@@ -498,18 +519,21 @@ class Model:
     projectors: tuple[str, ...] = ()  # the projector types (``clip.projector_type``) of the mmproj files it takes
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
-    tokenizer: Detokenizer
+    thought_first = False  # a thought only begins an answer (its markers later in the answer are text)
+    tokenizer: Tokenizer
     eos_token_ids: tuple[int, ...] | set[int]
 
     def encode(self, text: str) -> list[int]:
         """Token ids of a raw text (no chat template), after the model's BOS if it has one."""
         raise NotImplementedError
 
-    def chat(self, messages: list[dict[str, object]], *, think: bool = False) -> list[int]:
+    def chat(self, messages: list[dict[str, object]], *, think: bool = False,
+             tools: list[dict[str, object]] | None = None) -> list[int]:
         """Token ids of a conversation through the chat template, up to the assistant's turn (``think``: let it
-        think first; otherwise an empty thought where the template has one). A message's content may be a list of
-        parts: ``{"type": "text", "text": ...}``, ``{"type": "image", "image": a file, its bytes or a PIL image}``
-        (a model with ``vision``: its prompt then a sequence of ids and embedding rows; the encoder runs on the NPU)."""
+        think first; otherwise an empty thought where the template has one; ``tools``: the functions it may call,
+        ``chat_template``). A message's content may be a list of parts: ``{"type": "text", "text": ...}``,
+        ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model with ``vision``: its prompt then a
+        sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError
 
     def sampling(self, *, think: bool = False) -> Sampling:

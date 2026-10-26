@@ -48,8 +48,10 @@ class QwenTokenizer:
         return self.decode_bytes(ids, special=special).decode("utf-8", errors="replace")
 
 
-def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thinking: bool = False) -> str:
+def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thinking: bool = False,
+                tools: list[dict[str, object]] | None = None) -> str:
     """The prompt text of a conversation, rendered with the file's ``tokenizer.chat_template``, up to the
     assistant's turn: ``<|im_start|>assistant\\n<think>\\n`` (thinking), or with an empty thought
-    ``<think>\\n\\n</think>\\n\\n``."""
-    return chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, enable_thinking=enable_thinking)
+    ``<think>\\n\\n</think>\\n\\n``; ``tools``: the functions the model may call."""
+    return chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
+                         enable_thinking=enable_thinking)

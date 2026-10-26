@@ -24,7 +24,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | route | |
 |---|---|
-| `/v1/chat/completions` | chat, streamed or not, with `reasoning_content`, `timings`, `prompt_progress`, `usage` |
+| `/v1/chat/completions` | chat, streamed or not, with `reasoning_content`, tool calls, `timings`, `prompt_progress`, `usage` |
 | `/v1/completions`, `/completion` | raw prompts (OpenAI's and llama-server's shapes) |
 | `/v1/models`, `/props`, `/health`, `/slots` | the model, the server's settings, its state |
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
@@ -33,9 +33,17 @@ Sampling has the repetition, presence and frequency penalties, the temperature, 
 sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
 settings for them have no effect.
 Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
-`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: tool calls,
-embeddings, reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, model downloads; their routes answer
-501.
+`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: embeddings,
+reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, model downloads; their routes answer 501.
+
+Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
+writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
+arguments) with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8,
+MiniCPM-V 4.7 and Occamy (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 (one call per message) have them; a template
+without tools (Llama 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the
+prompt, nothing is parsed), `required` and a named function (the answer begins with the call, after the model's
+thought), and `parallel_tool_calls: false` ends the answer after its first call. Calls are not constrained by a
+grammar: a call the model writes malformed stays text.
 
 ## Web chat
 

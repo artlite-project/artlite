@@ -27,8 +27,9 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
-from ..common import MEDIA_MARKER, Sampling
+from ..common import MEDIA_MARKER, Sampling, chat_template
 from .engine import Engine, Job
+from .tools import Calls, ToolCall, call_arguments, functions, syntax_of
 
 log = logging.getLogger("artlite.server")
 
@@ -40,7 +41,7 @@ NEUTRAL: dict[str, object] = {
     "typical_p": 1.0, "typ_p": 1.0, "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0,
     "dynatemp_range": 0.0, "top_n_sigma": -1.0, "n_probs": 0, "logprobs": False, "top_logprobs": 0,
     "ignore_eos": False, "logit_bias": None, "grammar": None, "json_schema": None, "response_format": None,
-    "tools": None, "thinking_budget_tokens": None,
+    "thinking_budget_tokens": None,
 }
 # llama-server's other sampler settings, as /props reports them (the parameters of samplers that are off)
 OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": -1.0, "xtc_probability": 0.0,
@@ -143,6 +144,17 @@ def bad_request(message: str) -> ApiError:
     return ApiError(400, "invalid_request_error", message)
 
 
+def takes_parts(template: str) -> bool:
+    """Whether a chat template renders a message's content given as a list of text parts (Qwen's and Gemma's join
+    them their own way; others take text, which the server joins with newlines: llama.cpp's rule)."""
+    parts = [{"type": "text", "text": "\x01a"}, {"type": "text", "text": "\x01b"}]
+    try:
+        text = chat_template(template, [{"role": "user", "content": parts}])
+    except Exception:  # noqa: BLE001 (any failure: it does not)
+        return False
+    return "\x01a" in text and "\x01b" in text and "'type'" not in text
+
+
 # ----------------------------------------------------------------------
 # Requests
 # ----------------------------------------------------------------------
@@ -189,6 +201,9 @@ class ChatRequest(Generation):
     chat_template_kwargs: dict[str, Any] | None = None
     reasoning_format: str | None = None
     continue_final_message: bool | None = False
+    tools: list[Any] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class CompletionRequest(Generation):
@@ -208,6 +223,7 @@ class DetokenizeRequest(BaseModel):
 class TemplateRequest(BaseModel):
     messages: list[Message]
     chat_template_kwargs: dict[str, Any] | None = None
+    tools: list[Any] | None = None
 
 
 class EventStream(StreamingResponse):
@@ -226,6 +242,13 @@ class EventStream(StreamingResponse):
 
 def sse(data: object) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def call_delta(c: ToolCall) -> dict[str, Any]:
+    """A tool call's part as a streamed ``delta.tool_calls`` entry (its first part: id, type and name)."""
+    if c.id is None:
+        return {"index": c.index, "function": {"arguments": c.arguments}}
+    return {"index": c.index, "id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
 
 
 # ----------------------------------------------------------------------
@@ -320,6 +343,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     app = new_app(build_info=options.build_info, cors_origins=options.cors_origins)
     authorized = key_check(options.api_keys)
     warned: set[tuple[str, str]] = set()
+    syntax = syntax_of(info.chat_template)  # (the template's tool calls, None: it takes no tools)
+    typed = takes_parts(info.chat_template)
 
     async def loaded() -> None:
         if not engine.ready:
@@ -389,9 +414,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                            n_ctx=capacity)
 
     def messages_of(messages: list[Message], *, media: bool = False) -> list[dict[str, object]]:
-        """The messages for the chat template: text content (parts joined by newlines), with images (``image_url``
-        parts of data URIs, a model with a vision encoder) as parts ``{"type": "image", "image": bytes}`` among the
-        text parts; ``media``: images as the text ``MEDIA_MARKER`` (the template's text alone)."""
+        """The messages for the chat template: content as text parts if the template takes them (else joined by
+        newlines), with images (``image_url`` parts of data URIs, a model with a vision encoder) as parts
+        ``{"type": "image", "image": bytes}`` among the text parts; ``media``: images as the text ``MEDIA_MARKER``
+        (the template's text alone)."""
         out = []
         vision = engine.model.vision is not None
         for m in messages:
@@ -410,11 +436,15 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     else:
                         raise bad_request(f"content of type {kind!r} is not supported: this server's model takes "
                                           f"text{' and images (image_url)' if vision else ' only'}")
-                content = parts if any(p["type"] == "image" for p in parts) else "\n".join(p["text"] for p in parts)
+                content = parts if typed or any(p["type"] == "image" for p in parts) else \
+                    "\n".join(p["text"] for p in parts)
             d: dict[str, object] = {**(m.model_extra or {}), "role": m.role, "content": content or ""}
             if m.reasoning_content:
                 d["reasoning_content"] = m.reasoning_content
-            out.append(d)
+            try:
+                out.append(call_arguments(d))
+            except ValueError as e:
+                raise bad_request(str(e)) from None
         if not out:
             raise bad_request("no messages")
         return out
@@ -428,16 +458,19 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         think = bool(kw["enable_thinking"]) if "enable_thinking" in kw else default_think()
         return think and engine.model.thinks
 
-    async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, media: bool = False
-                     ) -> tuple[list[int], bool]:
+    async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, media: bool = False,
+                     tools: list[dict[str, Any]] | None = None) -> tuple[list[int], bool]:
         """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
-        engine's worker between its jobs; ``media``: images as text, ``messages_of``), and whether the model thinks."""
+        engine's worker between its jobs; ``media``: images as text, ``messages_of``; ``tools``: the functions the
+        model may call), and whether the model thinks."""
         think = thinking(kwargs)
         msgs = messages_of(messages, media=media)
+        tools = tools or None
         try:
-            if any(isinstance(m["content"], list) for m in msgs):
-                return await asyncio.wrap_future(engine.run(lambda: engine.model.chat(msgs, think=think))), think
-            return await run_in_threadpool(engine.model.chat, msgs, think=think), think
+            if any(p.get("type") == "image" for m in msgs if isinstance(m["content"], list) for p in m["content"]):
+                return await asyncio.wrap_future(engine.run(lambda: engine.model.chat(msgs, think=think, tools=tools))
+                                                 ), think
+            return await run_in_threadpool(engine.model.chat, msgs, think=think, tools=tools), think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
         except (OSError, ValueError) as e:  # (an image that does not open, or does not fit the prompt)
@@ -453,7 +486,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         return tail.rstrip().endswith(markers[0])
 
     def job(req: Generation, ids: list[int], *, think: bool, reasoning: bool = False, max_tokens: int | None = None,
-            conv_id: str | None = None) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
+            conv_id: str | None = None, tools: Calls | None = None
+            ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread)."""
         loop, events = asyncio.get_running_loop(), asyncio.Queue()
 
@@ -469,7 +503,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 seed=req.seed if req.seed is not None else options.seed, stop=stops(req), reasoning=reasoning,
                 inside=reasoning and inside(ids),
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
-                progress=bool(req.return_progress), conv_id=conv_id)
+                progress=bool(req.return_progress), conv_id=conv_id, tools=tools)
         try:
             engine.submit(j)
         except RuntimeError as e:
@@ -488,10 +522,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             if kind in ("done", "error", "cancelled"):
                 return
 
-    async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[dict[str, str], dict[str, Any]]:
-        """A job's text by kind and its last event (a response without streaming); the client going away cancels
-        it."""
+    async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+        """A job's output (a response without streaming) and its last event: the text by kind and ``tool_calls``, the
+        complete calls in OpenAI's shape; the client going away cancels it."""
         texts: dict[str, list[str]] = {"content": [], "reasoning_content": []}
+        calls: dict[int, dict[str, Any]] = {}
         loop = asyncio.get_running_loop()
         check = loop.time()
         try:
@@ -501,10 +536,17 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     if await request.is_disconnected():
                         j.cancel.set()
                 if kind == "delta":
-                    for k, t in data["parts"]:
-                        texts[k].append(t)
+                    for k, v in data["parts"]:
+                        if k == "tool_call":
+                            c = calls.setdefault(v.index, {"id": v.id, "type": "function",
+                                                           "function": {"name": v.name, "arguments": ""}})
+                            c["function"]["arguments"] += v.arguments
+                        else:
+                            texts[k].append(v)
                 elif kind == "done":
-                    return {k: "".join(v) for k, v in texts.items()}, data
+                    out: dict[str, Any] = {k: "".join(v) for k, v in texts.items()}
+                    out["tool_calls"] = [calls[i] for i in sorted(calls)][:data["n_calls"]]
+                    return out, data
                 elif kind == "error":
                     raise ApiError(500, "server_error", data["message"])
                 elif kind == "cancelled":
@@ -517,6 +559,40 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         e = ApiError(500, "server_error", data["message"]) if kind == "error" else \
             ApiError(503, "unavailable_error", "the request was cancelled")
         return sse(e.body())
+
+    def calls_of(req: ChatRequest) -> tuple[list[dict[str, Any]], Calls | None]:
+        """A request's functions for the template and how to read its answer's calls (None: as text: no tools, or
+        ``tool_choice`` none). ``tool_choice`` required or a named function: the answer begins with a call (its opener
+        forced). A template that takes no tools: they are ignored (the web UI sends its own)."""
+        try:
+            fns = functions(req.tools)
+        except ValueError as e:
+            raise bad_request(str(e)) from None
+        choice = "auto" if req.tool_choice is None else req.tool_choice
+        name = None
+        if isinstance(choice, dict):
+            name = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
+            if not isinstance(name, str):
+                raise bad_request('tool_choice: "auto", "none", "required" or {"type": "function", "function": '
+                                  '{"name": ...}}')
+            if name not in {f["function"]["name"] for f in fns}:
+                raise bad_request(f"tool_choice names {name!r}, not one of the tools")
+        elif choice not in ("auto", "none", "required"):
+            raise bad_request(f'tool_choice {choice!r} (one of "auto", "none", "required" or a function)')
+        if fns and syntax is None:
+            if ("tools", "") not in warned:
+                warned.add(("tools", ""))
+                log.info("tools are ignored: this model's chat template takes none")
+            fns = []
+        if not fns:
+            if choice not in ("auto", "none"):
+                raise bad_request("tool_choice without tools" if syntax is not None else
+                                  f"tool_choice {choice!r}: this model's chat template takes no tools")
+            return [], None
+        if choice == "none":
+            return fns, None
+        force = syntax.opener(name) if choice == "required" or name else None
+        return fns, Calls(syntax, fns, parallel=req.parallel_tool_calls is not False, force=force)
 
     def ping_of(req: Generation) -> float:
         return options.sse_ping_interval if req.sse_ping_interval is None else req.sse_ping_interval
@@ -547,6 +623,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
                 "ui": options.ui is not None, "ui_settings": {},
                 "chat_template": info.chat_template, "bos_token": info.bos_token, "eos_token": info.eos_token,
+                "chat_template_caps": {"supports_tools": syntax is not None, "supports_tool_calls": syntax is not None,
+                                       "supports_parallel_tool_calls": syntax is not None},
                 "build_info": options.build_info, "is_sleeping": False, "cors_proxy_enabled": False}
 
     @listed.get("/v1/models")
@@ -589,18 +667,22 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         check(req)
         if req.continue_final_message:
             raise bad_request("continue_final_message is not supported")
-        ids, think = await render(req.messages, req.chat_template_kwargs)
+        fns, calls = calls_of(req)
+        ids, think = await render(req.messages, req.chat_template_kwargs, tools=fns)
         fits(ids)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
         max_tokens = req.max_completion_tokens if req.max_completion_tokens is not None else None
-        j, events = job(req, ids, think=think, reasoning=reasoning, max_tokens=max_tokens, conv_id=x_conversation_id)
+        j, events = job(req, ids, think=think, reasoning=reasoning, max_tokens=max_tokens, conv_id=x_conversation_id,
+                        tools=calls)
         cid, created, name = f"chatcmpl-{secrets.token_hex(16)}", int(time.time()), options.alias
         head = {"created": created, "id": cid, "model": name, "system_fingerprint": options.build_info}
         if not req.stream:
-            texts, done = await collect(j, events, request)
-            message = {"role": "assistant", "content": texts["content"]}
-            if texts["reasoning_content"]:
-                message["reasoning_content"] = texts["reasoning_content"]
+            out, done = await collect(j, events, request)
+            message = {"role": "assistant", "content": out["content"] or (None if out["tool_calls"] else "")}
+            if out["reasoning_content"]:
+                message["reasoning_content"] = out["reasoning_content"]
+            if out["tool_calls"]:
+                message["tool_calls"] = out["tool_calls"]
             return {"choices": [{"finish_reason": done["finish_reason"], "index": 0, "message": message}], **head,
                     "object": "chat.completion", "usage": usage(done), "timings": done["timings"]}
         include_usage = bool((req.stream_options or {}).get("include_usage"))
@@ -618,9 +700,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     yield sse(chunk({"role": "assistant", "content": None}, prompt_progress=data))
                 elif kind == "delta":
                     parts = data["parts"]
-                    for i, (k, text) in enumerate(parts):
+                    for i, (k, v) in enumerate(parts):
                         last = req.timings_per_token and i == len(parts) - 1
-                        yield sse(chunk({k: text}, **({"timings": data["timings"]} if last else {})))
+                        yield sse(chunk({"tool_calls": [call_delta(v)]} if k == "tool_call" else {k: v},
+                                        **({"timings": data["timings"]} if last else {})))
                 elif kind == "done":
                     end = [chunk({}, data["finish_reason"])]
                     if include_usage:
@@ -760,7 +843,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
     @api.post("/apply-template")
     async def apply_template(req: TemplateRequest) -> dict[str, str]:
-        ids, _ = await render(req.messages, req.chat_template_kwargs, media=True)
+        try:
+            fns = functions(req.tools) if syntax is not None else []
+        except ValueError as e:
+            raise bad_request(str(e)) from None
+        ids, _ = await render(req.messages, req.chat_template_kwargs, media=True, tools=fns)
         return {"prompt": engine.model.tokenizer.decode_bytes(ids, special=True).decode("utf-8", errors="replace")}
 
     # ------------------------------------------------------------------
