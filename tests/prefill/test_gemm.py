@@ -108,7 +108,7 @@ def _run(op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a_off: int = 0,
          C: torch.Tensor | None = None) -> torch.Tensor:
     """One GEMM: A (op.M, K) as panels from element a_off on (a K part's columns), the W argument from the image
     (zeros outside it), C (bf16 (M, N); default zeros: the columns another GEMM of the phase writes; given: the
-    previous GEMMs' output, which this one's writes overwrite)."""
+    phase's output so far, at least op.M rows, which this one's writes overwrite)."""
     dev = op.device
     w = np.zeros(op.w_bytes, np.uint8)
     a, b = max(w_off, 0), min(w_off + op.w_bytes, W.size)
@@ -147,8 +147,8 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
     M, K = max(gm.op.M for gm in pp.gemms), region.K  # (GemmQd pads the tokens to whole passes)
     A = (torch.randn(M, K, generator=torch.Generator().manual_seed(T + K)) * 0.5).bfloat16()
     Aq = bfp16.from_panels(bfp16.to_panels(A), M, K)  # (the GEMM's operand values)
-    if pp.layout is not None:  # (an input projection's GEMMs write one output in turn, as the prefill's)
-        Cb = None
+    if pp.layout is not None:  # (an input projection's GEMMs write one output in turn, as the prefill's: M rows)
+        Cb = torch.zeros((M, pp.gemms[0].op.N), dtype=torch.bfloat16)
         for gm in pp.gemms:
             Cb = _run(gm.op, A[:gm.op.M], W, gm.w_off, gm.a_off, Cb)
         C = Cb[:T].float()

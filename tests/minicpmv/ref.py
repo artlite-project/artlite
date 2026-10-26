@@ -1,7 +1,7 @@
 """References of MiniCPM-V 4.7's vision path (the mmproj of projector ``minicpmv4_7``): llama.cpp goldens and the
 encoder in torch.
 
-Goldens: ``golden`` runs an image prompt through llama.cpp's libmtmd on the CPU (``minicpmv_dump.cpp``, built against
+Goldens: ``golden`` runs an image prompt through llama.cpp's libmtmd on the CPU (``dump.cpp``, built against
 the llama.cpp tree of ``model_config.LLAMA_CPP_DIR``): the prompt's chunks (text tokens; image chunks with llama.cpp's
 decoder positions, which for MiniCPM-V 4.7 differ from the official ``get_rope_index`` at the markers and after the
 image: llama.cpp PR #30510), each image's embeddings, the encoder's tensors per entry (the overview, then the slices

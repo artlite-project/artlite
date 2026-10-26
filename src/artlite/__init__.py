@@ -171,6 +171,7 @@ class Program:
         self.pdi_path = pdi_path
         self.insts_path = insts_path
         self.arg_specs = arg_specs
+        self._arg_bytes = [_get_buffer_nbytes(shape, dtype) for _, shape, dtype in arg_specs]
         self._device = device
         self._exe = None
         self._kern = None
@@ -268,8 +269,12 @@ class Program:
         No host<->device sync is performed.
 
         Args:
-            *buffers: Buffer instances in MLIR sequence order.
+            *buffers: Buffer instances in MLIR sequence order, each at least its ArgSpec's
+                size (the NPU writes past a smaller one into the host memory after it).
         """
+        for i, (b, nbytes) in enumerate(zip(buffers, self._arg_bytes)):
+            if b._raw.size < nbytes:
+                raise ValueError(f"Buffer {i}: {b._raw.size} bytes, its ArgSpec {nbytes}")
         kern = self._kernel()
         raw_bufs = [b._raw for b in buffers]
         if self._prof_cfg is not None and self._prof_cfg.mode == "trace":

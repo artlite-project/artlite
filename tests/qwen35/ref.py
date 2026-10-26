@@ -1,6 +1,6 @@
 """References of the qwen35 models (Qwen3.5 / 3.6 / 3.8): llama.cpp goldens and numpy oracles of the blocks.
 
-Goldens: ``golden`` runs a token sequence through llama.cpp on the CPU (``qwen35_dump.cpp``, built against the
+Goldens: ``golden`` runs a token sequence through llama.cpp on the CPU (``dump.cpp``, built against the
 llama.cpp tree of ``model_config.LLAMA_CPP_DIR``) and returns the tensors it dumped: per layer the named
 intermediates of llama.cpp's graph (``src/models/qwen35.cpp``: e.g. ``attn_norm``, ``linear_attn_qkv_mixed``,
 ``z``, ``alpha``, ``beta``, ``conv_output_silu``, ``attn_output`` - the GDN core output, but after W_o in the

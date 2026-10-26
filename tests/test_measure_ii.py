@@ -143,7 +143,7 @@ __attribute__((noinline)) void init(float *__restrict y, const float *__restrict
     } else if (k == 1) {
         al::copy<192, 16>(y + 512, x);  // copy 1
     } else {
-        al::copy<64, 16>(y + 1024, x);  // copy 2
+        al::copy<256, 16>(y + 1024, x);  // copy 2
     }
 }
 
