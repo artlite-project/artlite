@@ -36,7 +36,7 @@ from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
-from ..common import Mask, Model, OverlayModel, Penalties, Sampling
+from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Sampling
 from .draft import GemmaDraft, output_norm
 from .host import GemmaHost
 from .overlay import GemmaOverlay
@@ -108,6 +108,12 @@ class NpuGemma(OverlayModel):
     def reset(self) -> None:
         """Forget the cached positions."""
         self.position = 0
+
+    def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        """(the drafter's steps patch their caches' fills again)"""
+        super().restore(position, checkpoint)
+        if self.drafter is not None:
+            self.drafter.reset()
 
     def inputs(self, tokens: list[int]) -> tuple[torch.Tensor, np.ndarray | None]:
         """What a decode step needs of its tokens: their scaled embeddings (n, hidden) as bf16 values, and their

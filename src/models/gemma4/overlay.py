@@ -207,7 +207,9 @@ class GemmaOverlay(ModelOverlay):
                 self.kv_off[L] = take("KV", AT.KV_HEADS * self._kv_bytes(L))
         for L in self.layers:
             assert cfg.kv_source(L) in self.kv_off, f"layer {L} attends to the cache of layer {cfg.kv_source(L)}"
+        r0 = self._layout["KV"]
         self.ring_off = {L: take("KV", AT.KV_HEADS * 2 * self.T) for L in self.kv_off}  # (per KV head: 2 slots)
+        self.rings = (r0, self._layout["KV"] - r0)
         take("KV", KV_PAD // min(self.at.pg.values()) * self.G * self.T)
         self._sizes()
         # the headers in order; v: the F_VOUT phase that feeds each one
@@ -231,6 +233,12 @@ class GemmaOverlay(ModelOverlay):
     def kv_base(self, L: int, h: int) -> int:
         """Byte offset in KV of group 0 of KV head h's cache of (own-cache) layer L."""
         return self.kv_off[L] + h * self._kv_bytes(L) + (GUARD * self.G * self.T if self.cfg.swa[L] else 0)
+
+    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
+        """(the sliding-window layers' caches, then the full layers')"""
+        return [(np.array([self.kv_base(L, h) for L in self.kv_off if self.cfg.swa[L] == swa
+                           for h in range(AT.KV_HEADS)]), self.G * self.T, self.at.pg[256 if swa else 512])
+                for swa in (True, False)]
 
     def ring(self, L: int, h: int) -> int:
         """Byte offset in KV of KV head h's ring of (own-cache) layer L: 2 slots of T bytes, slot r & 1 the V values of

@@ -12,8 +12,9 @@ Where the conversions differ from llama-server's:
 - Anthropic's ``tool_choice`` ``tool`` names its function, ``none`` and ``disable_parallel_tool_use`` apply;
   ``thinking`` ``enabled`` and ``adaptive`` turn the model's thought on, ``disabled`` off (absent: the server's
   ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off); thinking budgets are not enforced;
-- Claude Code's billing header has a stamp per request (``cch=``, which llama.cpp fixes) and its version's build hash,
-  which differs between sessions: both are fixed, so the system prompt's tokens stay a cached prefix;
+- Claude Code's billing header has a stamp per request (``cch=``, which llama.cpp fixes), its version's build hash,
+  which differs between sessions, and on the requests its scheduled wakeups send a ``cc_workload``: the stamp and the
+  hash are fixed, the workload dropped, so the system prompt's tokens stay a cached prefix;
 - a Responses request may continue a stored response (``previous_response_id``, ``Store``; llama-server refuses
   it); a reasoning item without content gives its summary, an assistant message needs no ``type``;
 - tools other than functions (Anthropic's server tools, Codex's ``namespace`` and ``web_search``) are left out.
@@ -135,10 +136,12 @@ def arguments(block: Block) -> dict[str, Any]:
 
 
 def billing(text: str) -> str:
-    """Claude Code's billing header with its per-request stamp (``cch=``) and its version's build hash fixed."""
+    """Claude Code's billing header with its per-request stamp (``cch=``) and its version's build hash fixed, its
+    ``cc_workload`` dropped."""
     if not text.startswith(BILLING):
         return text
     text = re.sub(r"(cc_version=\d+\.\d+\.\d+)\.[0-9a-f]+;", r"\1;", text, count=1)
+    text = re.sub(r" ?\bcc_workload=[^;]*;", "", text, count=1)
     return re.sub(r"\bcch=[^;]{5};", "cch=fffff;", text, count=1)
 
 

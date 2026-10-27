@@ -185,6 +185,8 @@ def test_messages_conversion(agent: tuple) -> None:
     assert "<think>\n\n</think>" in model.tokenizer.decode_bytes(npu.seq).decode()  # (thinking disabled)
     assert billing("x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You") == \
         "x-anthropic-billing-header: cc_version=2.1.101; cc_entrypoint=cli; cch=fffff;You"
+    assert billing("x-anthropic-billing-header: cc_version=2.1.311.2db; cc_entrypoint=sdk-cli; cc_workload=cron;") == \
+        "x-anthropic-billing-header: cc_version=2.1.311; cc_entrypoint=sdk-cli;"  # (a scheduled wakeup's request)
 
 
 def test_messages_tool_choice(agent: tuple) -> None:

@@ -1,7 +1,7 @@
 """What the models share: the host side of a model file (``Model``: tokenizer, chat template, default sampling), the
-generation loop of a model on the NPU (``NpuModel``), a model on a decode overlay with a chunk prefill
-(``OverlayModel``: its steps, prompts and accounting), sampling, chat templates, incremental detokenization and the
-default KV cache capacity."""
+generation loop of a model on the NPU (``NpuModel``; a sequence's state as host copies, ``Checkpoint`` and the KV
+records), a model on a decode overlay with a chunk prefill (``OverlayModel``: its steps, prompts and accounting),
+sampling, chat templates, incremental detokenization and the default KV cache capacity."""
 
 import collections
 import copy
@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import jinja2.ext
 import jinja2.sandbox
@@ -28,6 +28,9 @@ import numpy as np
 import torch
 
 from artlite import _native, backend, portable
+
+if TYPE_CHECKING:
+    from artlite.decode.model import Records
 
 R = TypeVar("R")
 MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
@@ -323,16 +326,44 @@ class StreamDecoder:
         return text
 
 
+def nbytes(x: object) -> int:
+    """Bytes of the tensors and of the objects with ``nbytes`` (arrays, ``Records``) in nested lists, tuples and
+    dicts."""
+    if isinstance(x, torch.Tensor):
+        return x.numel() * x.element_size()
+    if isinstance(x, dict):
+        return sum(nbytes(v) for v in x.values())
+    if isinstance(x, (list, tuple)):
+        return sum(nbytes(v) for v in x)
+    n = getattr(x, "nbytes", 0)
+    return n if isinstance(n, int) else 0
+
+
+@dataclass(eq=False)
+class Checkpoint:
+    """A sequence's state at ``position`` as host copies (``NpuModel.checkpoint``): what continuing from there needs
+    besides the KV caches' records of the positions before it; ``nbytes`` of host memory."""
+
+    position: int
+    state: Any
+    nbytes: int
+
+
 class NpuModel:
     """A model on the NPU. ``forward`` runs a prompt after the cached positions and returns its last token's logits,
     ``step`` / ``top_k`` run one token; ``generate`` samples from them. ``t_npu``: seconds in dispatches, ``t_host``:
-    host work on their inputs, ``dispatches``: their count."""
+    host work on their inputs, ``dispatches``: their count.
+
+    A sequence's state as host copies (a prompt cache's): ``checkpoint`` / ``restore`` (the state at a position besides
+    the KV records), ``read_records`` / ``write_records`` (the records of positions)."""
 
     capacity: int  # KV cache positions
     position: int  # cached positions
     eos_token_ids: tuple[int, ...] | set[int]
     t_npu = t_host = 0.0
     dispatches = 0
+    recurrent = False  # positions are kept only where a checkpoint was taken (states that hold the whole sequence)
+    group = 1  # ``rewind`` and a ``restore`` without a checkpoint land on its multiples
 
     def prepare(self, prompt_len: int) -> None:
         """Compile and open what a prompt of ``prompt_len`` tokens needs (before it is timed)."""
@@ -359,6 +390,32 @@ class NpuModel:
         """Run tokens after the cached positions: the logits (vocab,) fp32 of the last. ``progress``: called with the
         number of tokens done as they run (an exception it raises stops the prompt between dispatches, the positions
         run so far cached)."""
+        raise NotImplementedError
+
+    def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None
+               ) -> torch.Tensor | None:
+        """Run tokens after the cached positions (``forward``); ``logits``: return the last one's."""
+        out = self.forward(tokens, progress=progress)
+        return out if logits else None
+
+    def checkpoint(self) -> Checkpoint:
+        """The state at the current position that continuing from it needs besides the KV caches' records of the
+        positions before it (any position: inside a cache group, after a step whose drafts were rejected)."""
+        raise NotImplementedError
+
+    def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        """Continue from ``position``: the caches hold the records of the positions before it (this sequence's, or
+        ``write_records``'), ``checkpoint`` (taken there) the rest of the state; without one, a position a rewind
+        lands on (a multiple of ``group``; of a recurrent model: 0, a new sequence)."""
+        raise NotImplementedError
+
+    def read_records(self, start: int, end: int) -> "list[Records]":
+        """Host copies of the KV caches' records of positions start .. end - 1 (whole groups; one per cache: the
+        model's, a drafter's)."""
+        raise NotImplementedError
+
+    def write_records(self, records: "list[Records]", start: int, end: int) -> None:
+        """The caches' records of positions start .. end - 1 from ``read_records``' copies (which hold them)."""
         raise NotImplementedError
 
     def step(self, token: int) -> torch.Tensor:
@@ -485,13 +542,56 @@ class OverlayModel(NpuModel):
         plan = self.prefill.plan(p, left) if self.prefill is not None else []
         return plan[0] if plan else 0
 
+    @property
+    def group(self) -> int:
+        """(a whole cache group of the prefill, or 8 positions without one: a step at a multiple of 8 opens a new V
+        record, so the ring holds what it reads; a prompt from a group runs in chunks at once, while one inside a
+        group runs as decode steps up to the next)"""
+        return self.prefill.group if self.prefill is not None else 8
+
     def rewind(self, n: int) -> int:
-        """(down to a whole cache group of the prefill, or of 8 positions without one: a step at a multiple of 8 opens
-        a new V record, so the ring holds what it reads; a prompt from a group runs in chunks at once, while one inside
-        a group runs as decode steps up to the next)"""
+        """(down to a multiple of ``group``)"""
         keep = min(n, self.position)
-        self.position = keep - keep % (self.prefill.group if self.prefill is not None else 8)
+        self.position = keep - keep % self.group
         return self.position
+
+    def _overlays(self) -> list[Any]:
+        """The overlays that hold the sequence's caches and states (the model's, a drafter's)."""
+        return [self.overlay]
+
+    def _state(self) -> dict[str, Any]:
+        """The model's own part of a checkpoint (its overlays' are theirs: ``ModelOverlay.snapshot``)."""
+        return {}
+
+    def _set_state(self, state: dict[str, Any]) -> None:
+        """Back to ``_state``'s."""
+
+    def checkpoint(self) -> Checkpoint:
+        state = ([ov.snapshot(self.position) for ov in self._overlays()], self._state())
+        return Checkpoint(self.position, state, nbytes(state))
+
+    def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        if checkpoint is None:
+            if position % self.group or (self.recurrent and position):
+                raise ValueError(f"position {position}: a restore without a checkpoint keeps a multiple of "
+                                 f"{self.group}{' (0: the model is recurrent)' if self.recurrent else ''}")
+            if self.recurrent:
+                self.reset()
+            self.position = position
+            return
+        assert checkpoint.position == position, (checkpoint.position, position)
+        snapshots, state = checkpoint.state
+        for ov, snap in zip(self._overlays(), snapshots, strict=True):
+            ov.restore(snap)
+        self._set_state(state)
+        self.position = position
+
+    def read_records(self, start: int, end: int) -> "list[Records]":
+        return [ov.read_records(start, end) for ov in self._overlays()]
+
+    def write_records(self, records: "list[Records]", start: int, end: int) -> None:
+        for ov, r in zip(self._overlays(), records, strict=True):
+            ov.write_records(r, start, end)
 
     def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None
                ) -> torch.Tensor | None:
@@ -556,6 +656,8 @@ class Model:
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
     thought_first = False  # a thought only begins an answer (its markers later in the answer are text)
+    turn: str | None = None  # the text that begins every message in the chat template (a prompt cache's marks)
+    user_turn: str | None = None  # the text that begins a user message
     tokenizer: Tokenizer
     eos_token_ids: tuple[int, ...] | set[int]
 

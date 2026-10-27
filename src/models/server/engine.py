@@ -1,8 +1,8 @@
 """The server's NPU side: one worker thread owns the model and runs the requests' generations one at a time, in
-arrival order (``Engine``); the prompt cache across requests; the generated text's stop strings (``StopMatcher``), its
-split into thoughts and answer (``ReasoningSplitter``) and the answer's tool calls (``tools.Parser``; their names kept
-the functions' by ``tools.NameMask`` as the tokens are sampled); the timings of a generation as llama-server reports
-them."""
+arrival order (``Engine``), each from what the prompt cache keeps of its prompt (``cache.PromptCache``); the generated
+text's stop strings (``StopMatcher``), its split into thoughts and answer (``ReasoningSplitter``) and the answer's tool
+calls (``tools.Parser``; their names kept the functions' by ``tools.NameMask`` as the tokens are sampled); the timings
+of a generation as llama-server reports them."""
 
 import collections
 import concurrent.futures
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..common import Model, NpuModel, Sampling, StreamDecoder, argmax, seed
+from .cache import PromptCache
 from .tools import Calls, held
 
 log = logging.getLogger("artlite.server")
@@ -71,12 +72,6 @@ class Call:
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
     conv_id: str | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
-
-
-def common_prefix(a: list[int], b: list[int]) -> int:
-    """The length of the longest common prefix of two prompts' tokens (ids; a sequence's given rows by their bytes)."""
-    a, b = (getattr(x, "cache_keys", lambda x=x: x)() for x in (a, b))
-    return next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), min(len(a), len(b)))
 
 
 class StopMatcher:
@@ -195,20 +190,22 @@ class Engine:
     """The worker thread that owns the model: it opens and loads it (``load``: the ``Model`` and its ``NpuModel``),
     runs one token through it (``warmup``), then runs the jobs one at a time in arrival order.
 
-    The prompt cache: ``cached`` holds the tokens whose K / V the caches hold (the last sampled token never ran). A job
-    keeps the prefix its prompt shares with them (``NpuModel.rewind``: a cache group's multiple, or for Qwen only an
-    exact continuation) and runs the rest; a prompt that is all cached runs its last token again (``forward`` needs
-    one). ``on_ready``: called on the worker once the model is loaded (after the warmup); ``on_exit``: when the worker
-    ends on its own (the load failed)."""
+    The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory, ``checkpoints`` per sequence): a job
+    continues from what it keeps of its prompt (the device's sequence, a checkpoint, a sequence saved in RAM) and runs
+    the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``); ``cached``: the
+    tokens whose K / V the caches hold (the last sampled token never ran). ``on_ready``: called on the worker once the
+    model is loaded (after the warmup); ``on_exit``: when the worker ends on its own (the load failed)."""
 
     def __init__(self, load: Callable[[], tuple[Model, NpuModel]], *, warmup: bool = True,
-                 on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None):
+                 on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None,
+                 cache_ram: int = 8192 << 20, checkpoints: int = 32):
         self.model: Model | None = None
         self.npu: NpuModel | None = None
+        self.cache: PromptCache | None = None
         self.error: str | None = None  # why the load failed
-        self.cached: list[int] = []
         self.current: Job | None = None
         self._load, self._warmup, self._on_ready, self._on_exit = load, warmup, on_ready, on_exit
+        self._cache_ram, self._checkpoints = cache_ram, checkpoints
         self._queue: collections.deque[Job] = collections.deque()
         self._cv = threading.Condition()
         self._stopping = False
@@ -216,6 +213,11 @@ class Engine:
         self._ready = threading.Event()
         self._ids = itertools.count(1)
         self._thread = threading.Thread(target=self._run, name="artlite-npu")
+
+    @property
+    def cached(self) -> list[int]:
+        """The tokens at the cached positions."""
+        return self.cache.tokens if self.cache is not None else []
 
     @property
     def ready(self) -> bool:
@@ -278,6 +280,9 @@ class Engine:
             self.model, self.npu = self._load()
             if self._warmup and not self._stopping:
                 self._warm()
+            turns = [self.model.tokenizer.encode(t) if t else None for t in (self.model.turn, self.model.user_turn)]
+            self.cache = PromptCache(self.npu, ram=self._cache_ram, checkpoints=self._checkpoints, turn=turns[0],
+                                     user_turn=turns[1])
         except Exception as e:  # (any failure of the load: reported, the server exits)
             log.exception("loading the model failed")
             self.error = f"{type(e).__name__}: {e}"
@@ -312,7 +317,8 @@ class Engine:
                 job.emit("cancelled", {})
             except Exception as e:  # (a failure in the model: the job's error; the caches start over)
                 log.exception("%s failed", job.name)
-                self.cached, self._dirty = [], True
+                self.cache.clear()
+                self._dirty = True
                 job.emit("error", {"message": f"{type(e).__name__}: {e}"})
             finally:
                 job.state = "done"
@@ -340,12 +346,12 @@ class Engine:
         npu, model = self.npu, self.model
         t0 = time.perf_counter()
         seed(job.seed if job.seed >= 0 else None)
-        ids = job.ids
-        n = min(common_prefix(self.cached, ids), len(ids) - 1) if job.cache_prompt else 0
-        kept = npu.rewind(n) if n > 0 else 0
-        if kept == 0 and (npu.position or self._dirty):
+        ids, cache = job.ids, self.cache
+        if self._dirty:
             npu.reset()
-        self.cached, self._dirty, job.kept = ids[:kept], False, kept
+            self._dirty = False
+        kept, how = cache.prepare(ids, enabled=job.cache_prompt)
+        job.kept = kept
         drafted0, accepted0 = getattr(npu, "drafted", 0), getattr(npu, "accepted", 0)
         d0 = npu.dispatches
 
@@ -373,7 +379,12 @@ class Engine:
         job.state = "prompt"
         try:
             progress(0)
-            logits = npu.forward(ids[kept:] + early, progress=progress)
+            at = kept
+            for m in cache.marks(ids, kept):  # (the prompt in parts: a checkpoint after each)
+                npu.prompt(ids[at:m], progress=lambda i, b=at - kept: progress(b + i))
+                at = m
+                cache.checkpoint(ids[:m])
+            logits = npu.forward(ids[at:] + early, progress=lambda i, b=at - kept: progress(b + i))
             forced(early)
             t1 = time.perf_counter()
             d1, t_npu1, t_host1 = npu.dispatches, npu.t_npu, npu.t_host
@@ -437,7 +448,7 @@ class Engine:
             if calls is not None and calls.calls and not calls.calling:
                 finish = "tool_calls"
         finally:
-            self.cached = (ids + gen)[:npu.position]
+            cache.ran((ids + gen)[:npu.position])
         t2 = time.perf_counter()
         t = times(t2)
         job.emit("done", {"finish_reason": finish, "stop_word": stop.word, "timings": t, "n_prompt": len(ids),
@@ -446,7 +457,8 @@ class Engine:
         passes = max(npu.dispatches - d1, 1)
         host = f", {(npu.t_host - t_host1) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > t_host1 else ""
         drafts = f"; {t['draft_n']} draft tokens, {t['draft_n_accepted']} accepted" if "draft_n" in t else ""
-        log.info(f"{job.name}: {kept} cached tokens; prompt: {len(ids) - kept} tokens in {t1 - t0:.2f} s "
+        how = f" ({how})" if how else ""
+        log.info(f"{job.name}: {kept} cached tokens{how}; prompt: {len(ids) - kept} tokens in {t1 - t0:.2f} s "
                  f"({t['prompt_per_second']:.1f} tokens/s, {d1 - d0} dispatches); generation: {len(gen)} tokens in "
                  f"{t2 - t1:.2f} s ({t['predicted_per_second']:.2f} tokens/s): {passes} dispatches of "
                  f"{(npu.t_npu - t_npu1) / passes * 1e3:.1f} ms{host}{drafts}; finish: {finish}")

@@ -70,6 +70,7 @@ class NpuQwen(OverlayModel):
 
     DRAFTS = SLOTS - 1  # draft tokens per dispatch at most (with a drafter; set before the first prompt)
     P_MIN = 0.5  # a round's drafts stop where the probability of their chain (the drafter's) falls below it
+    recurrent = True  # (the GDN layers' states hold the whole sequence)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = ""):
@@ -144,11 +145,32 @@ class NpuQwen(OverlayModel):
             self.drafter.dev.stale = True
 
     def rewind(self, n: int) -> int:
-        """(all cached positions or none: the GDN layers' states hold the whole sequence and cannot go back)"""
+        """(all cached positions or none: the GDN layers' states hold the whole sequence and cannot go back; a
+        ``checkpoint`` keeps a position)"""
         if n >= self.position:
             return self.position
         self.reset()
         return 0
+
+    def _overlays(self) -> list[QwenOverlay]:
+        return [self.overlay] + ([self.drafter] if self.drafter is not None else [])
+
+    def _state(self) -> dict[str, object]:
+        """(the text's next M-RoPE position; with the drafter its rows and the prefill's carry)"""
+        out: dict[str, object] = {"rope_next": self.rope_next}
+        if self.drafter is not None:
+            out |= {"pend": list(self._pend), "dpos": self._dpos, "h": self._h, "carry_at": self._carry_at}
+            if self.prefill is not None:
+                out["carry"] = self.prefill.dp.carry.copy()
+        return out
+
+    def _set_state(self, state: dict[str, object]) -> None:
+        self.rope_next = state["rope_next"]
+        if self.drafter is not None:
+            self._pend, self._dpos, self._h, self._carry_at = list(state["pend"]), state["dpos"], state["h"], \
+                state["carry_at"]
+            if self.prefill is not None:
+                self.prefill.dp.carry[:] = state["carry"]
 
     def _rows(self, tokens: list[int] | Sequence) -> torch.Tensor:
         """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
@@ -357,6 +379,7 @@ class Qwen(Model):
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
+    turn, user_turn = "<|im_start|>", "<|im_start|>user"
     projectors = PROJECTORS
 
     def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None):

@@ -80,7 +80,7 @@ from artlite.decode.design import (
     XPAY,
     interleave,
 )
-from artlite.decode.model import ModelOverlay, paged_formats
+from artlite.decode.model import ModelOverlay, host_bytes, paged_formats
 from artlite.decode.vring import substeps, tails
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
@@ -259,8 +259,10 @@ class QwenOverlay(ModelOverlay):
                 self.xch[L] = take("ACT", XB)
                 self.cp[L] = take("ACT", COLS * (CP_BYTES + XB))
             self.part = take("ACT", COLS * self.part_col)
+        r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
+        self.rings = (r0, self._layout["KV"] - r0)
         if self.ash is not None:  # (the prefill's slices past the end; a step's second record; a tail fill's T bytes)
             take("KV", (KV_PAD // attn.POS_PER_GROUP + 1) * 3 * self.T)
         self._sizes()
@@ -762,6 +764,35 @@ class QwenOverlay(ModelOverlay):
         else:
             self.nrep, self.cshift = n, n
         self._accepted = True
+
+    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
+        """(per attention layer and KV head: groups of 32 positions, 3 objects each)"""
+        if self.ash is None:
+            return []
+        rows = [self.kv_off[L] + h * self.ash.head_bytes for L in self.kv_off for h in range(self.ash.kvh)]
+        return [(np.array(rows), 3 * self.T, attn.POS_PER_GROUP)]
+
+    def snapshot(self, position: int) -> dict[str, object]:
+        """(and the GDN layers' states, conv objects with their replay objects, and conv states of the prefill, the lazy
+        commit's fields, ``rope``)"""
+        out = super().snapshot(position)
+        if self.gsh is not None:
+            for name in ("GSTATE", "GOBJ", "GHDR"):
+                self.dev.fetch(name)
+                out[name] = host_bytes(self.dev.view(name).shape)
+                out[name][:] = self.dev.view(name)
+        out["fields"] = (self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted)
+        out["rope"] = self.rope.copy()
+        return out
+
+    def restore(self, snapshot: dict[str, object]) -> None:
+        super().restore(snapshot)
+        if self.gsh is not None:
+            for name in ("GSTATE", "GOBJ", "GHDR"):
+                self.dev.view(name)[:] = snapshot[name]
+                self.dev.flush(name)
+        self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted = snapshot["fields"]
+        self.rope[:] = snapshot["rope"]
 
     def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""

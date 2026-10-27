@@ -50,6 +50,16 @@ class VRing:
         self.slots.clear()
         self.from_prefill.clear()
 
+    def copy(self) -> "VRing":
+        out = VRing()
+        out.assign(self)
+        return out
+
+    def assign(self, other: "VRing") -> None:
+        """Hold what ``other`` holds (a copy)."""
+        self.slots = {L: dict(d) for L, d in other.slots.items()}
+        self.from_prefill = set(other.from_prefill)
+
     def check(self, layer: int, p: int, end: int) -> None:
         """A step at p reads the rows of record p >> 3 up to ``end`` (exclusive) from the ring of ``layer``: the ring
         holds them (a step continues from the last one's positions, at most its own back, as a generation loop's

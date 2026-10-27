@@ -87,6 +87,12 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("-np", "--parallel", type=int, default=1, help="sequences at a time (1 only: the NPU runs one)")
     gen.add_argument("--cache-prompt", action=argparse.BooleanOptionalAction, default=True,
                      help="continue from the prefix a prompt shares with the cached tokens (default: on)")
+    gen.add_argument("-cram", "--cache-ram", type=int, default=8192,
+                     help="MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints "
+                          "(default: 8192; -1: no limit, 0: the device's conversation alone)")
+    gen.add_argument("-ctxcp", "--ctx-checkpoints", type=int, default=32,
+                     help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8 and MiniCPM-V that "
+                          "a prompt continues from; default: 32)")
     gen.add_argument("--temp", type=float, help="sampling temperature (default: the model's; 0: greedy)")
     gen.add_argument("--top-k", type=int, help="sample among the k most likely tokens (default: the model's)")
     gen.add_argument("--top-p", type=float, help="nucleus sampling threshold (default: the model's)")
@@ -332,7 +338,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
             time.sleep(0.01)
         report({"ready": {"name": engine.model.name, "n_ctx": engine.npu.capacity, "describe": engine.npu.describe()}})
 
-    engine = Engine(load, warmup=args.warmup, on_ready=ready, on_exit=failed)
+    engine = Engine(load, warmup=args.warmup, on_ready=ready, on_exit=failed,
+                    cache_ram=args.cache_ram << 20 if args.cache_ram >= 0 else -1, checkpoints=args.ctx_checkpoints)
     config = uvicorn.Config(create_app(engine, options, info), host=args.host, port=args.port, log_config=None,
                             access_log=args.verbose, timeout_keep_alive=int(args.timeout), lifespan="off")
     server = Server(config, engine.stop)

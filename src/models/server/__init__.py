@@ -7,9 +7,9 @@
 
 Modules: ``main`` (the command line, uvicorn, the shutdown), ``api`` (the FastAPI routes, server-sent events, API
 keys), ``agents`` (Anthropic's Messages and OpenAI's Responses APIs: their requests as chat completions, their
-responses and streams, the stored responses), ``engine`` (the NPU worker, the prompt cache, stop strings, the
-reasoning split, timings), ``tools`` (tool calls: a template's syntax, the parsers of generated calls, the mask of
-their names), ``ui`` (llama.cpp's prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml
+responses and streams, the stored responses), ``engine`` (the NPU worker, stop strings, the reasoning split,
+timings), ``cache`` (the prompt cache), ``tools`` (tool calls: a template's syntax, the parsers of generated calls,
+the mask of their names), ``ui`` (llama.cpp's prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml
 authors); router mode: ``router`` (a model server process per model, loads and unloads, the proxy), ``child`` (a
 model server under the router), ``catalog`` (the directory's models, their ids, presets).
 
@@ -22,12 +22,14 @@ waiting request gets SSE pings. A request's events cross to the event loop throu
 each dispatch releases the GIL, so the loop keeps serving while a step or a prompt chunk runs. Tokenizing a prompt
 runs in a thread of the event loop's pool.
 
-The prompt cache: the KV caches keep the tokens of the last request (its prompt and the generated tokens that ran).
-The next request keeps the prefix its prompt shares with them - rounded down to the prefill's cache group, where a
-chunk can start (``NpuModel.rewind``) - and runs the rest: a chat's next turn runs only its new messages. Qwen keeps
-only an exact continuation (its Gated DeltaNet states cannot go back), so the earlier answers keep their thoughts
-(``--reasoning-preserve``: the templates' ``preserve_thinking``, Qwen3.6's and Gemma 4's; Qwen3.5's template drops them
-and each thinking turn runs its whole prompt again). ``cache_prompt: false`` starts from an empty cache.
+The prompt cache (``cache``): the KV caches keep the tokens of the last request (its prompt and the generated tokens
+that ran), host RAM the conversations before it (``--cache-ram``: their KV records and states) and, for the Qwen
+hybrids, checkpoints of the Gated DeltaNet states (``--ctx-checkpoints``), which cannot go back. A request continues
+from what keeps the most of its prompt - the device's conversation (to the prefill's cache group where a chunk can
+start, ``NpuModel.rewind``; Qwen: its end or a checkpoint), a conversation copied back from RAM - and runs the rest: a
+chat's next turn runs only its new messages, an agent's subagents and side requests do not cost its main conversation
+its cache. The earlier answers keep their thoughts (``--reasoning-preserve``: the templates' ``preserve_thinking``,
+Qwen3.6's and Gemma 4's), so a turn extends the last one. ``cache_prompt: false`` starts from an empty cache.
 
 Cancelling: a client that goes away, the UI's Stop (``DELETE /v1/stream?conv_id=``, matched by the chat request's
 ``X-Conversation-Id``) and the shutdown stop the request at its next token or prompt chunk; a dispatch is never

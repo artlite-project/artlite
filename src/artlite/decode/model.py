@@ -4,13 +4,15 @@ layout (``_take``), the residual-slice objects (F_LOADR), the phases' K-group in
 metadata objects, a K group's input fills, the drains of a column's outputs into a phase's x and of the LM head's into
 LOGITS, a column-major image's weight runs, the transaction of a step per slot count, first layer and pattern of
 sub-steps (built at its first use or ahead: ``prepare``) and its vectorized BD patches (``_bd_words``), a step's x and
-logits, the LM head alone (``logits_of``).
+logits, the LM head alone (``logits_of``); a sequence's state as host copies (a prompt cache's: ``read_records`` /
+``write_records``, the KV caches' records of positions; ``snapshot`` / ``restore``, the rest).
 
 A model's overlay supplies its config and image classes (``CONFIG``, ``IMAGE``), its design (``op``), its phases and
 their flags (``_flags``; the metadata words of its own: ``_meta``), its static objects (``_load``), the layout of its
 buffers (``_plan``: ``_layout``'s buffers, ``loadr``, the phases' input regions, its attention's; then ``_sizes``), a
 step's transaction (``_build``), its sub-steps (``subs``, repeating every ``period`` positions), per-step patches
-(``_set_position``) and ring bookkeeping (``_ran``), the LM head's phase alone (``_lm_phase``).
+(``_set_position``) and ring bookkeeping (``_ran``), the LM head's phase alone (``_lm_phase``), its caches' rows
+(``cache_rows``) and rings (``rings``).
 """
 
 from dataclasses import dataclass
@@ -73,6 +75,38 @@ class InputRegion:
     post: bool = False
 
 
+def host_bytes(shape: tuple[int, ...]) -> np.ndarray:
+    """An uninitialized uint8 host array in 4 KB pages: numpy asks for huge pages for large arrays, and when RAM runs
+    short of free pages (a model's file in the page cache) the kernel compacts memory for them first - a copy of
+    600 MB then takes ~1 s instead of ~0.15 s."""
+    return torch.empty(shape, dtype=torch.uint8).numpy()
+
+
+@dataclass(eq=False)
+class Records:
+    """Host copies of an overlay's KV records of positions start .. end - 1 (``ModelOverlay.read_records``): per cache
+    kind (``ModelOverlay.cache_rows``) its positions per group and the groups that hold those positions, (rows, groups,
+    bytes per group) uint8 from group start // positions per group on."""
+
+    start: int
+    end: int
+    parts: list[tuple[int, np.ndarray]]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.nbytes for _, a in self.parts)
+
+    def cut(self, end: int) -> "Records":
+        """The records of positions start .. end - 1 alone (end <= self.end; copies: the rest is freed)."""
+        assert self.start <= end <= self.end
+        parts = []
+        for pg, a in self.parts:
+            b = host_bytes((a.shape[0], -(-end // pg) - self.start // pg, a.shape[2]))
+            b[:] = a[:, :b.shape[1]]
+            parts.append((pg, b))
+        return Records(self.start, end, parts)
+
+
 class ModelOverlay:
     """A GGUF model on its decode overlay (module docstring). ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``weights``: the image's buffer allocated ahead (its image's
@@ -84,6 +118,7 @@ class ModelOverlay:
     # (the next step's position patched into a second transaction while a step runs: ``_run``; the model's
     # ``_set_position`` takes ``ahead`` and its transactions their buffer, ``_transaction``)
     AHEAD: ClassVar[bool] = False
+    rings = (0, 0)  # (byte offset, bytes) in KV of the attention layers' rings (``vring``), set by ``_plan``
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None):
         self.gguf = gguf
@@ -388,3 +423,62 @@ class ModelOverlay:
         self.ready()
         self.dev.dispatch(self._tr_lm)
         return self._logits(1)[0]
+
+    # ------------------------------------------------------------------
+    # A sequence's state
+    # ------------------------------------------------------------------
+
+    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
+        """The KV caches in KV, per kind: each row's byte offset (a KV head's cache of a layer), the bytes and the
+        positions of a group (a row's groups follow each other from its offset)."""
+        return []
+
+    def read_records(self, start: int, end: int) -> Records:
+        """Host copies of the caches' records of positions start .. end - 1 (the groups that hold them)."""
+        dev, kv, parts = self.dev, self.dev.view("KV"), []
+        for offs, gb, pg in self.cache_rows():
+            g0, g1 = start // pg, -(-end // pg)
+            a = host_bytes((len(offs), g1 - g0, gb))
+            for i, o in enumerate(offs):
+                dev.fetch("KV", o + g0 * gb, (g1 - g0) * gb)
+                a[i] = kv[o + g0 * gb:o + g1 * gb].reshape(g1 - g0, gb)
+            parts.append((pg, a))
+        return Records(start, end, parts)
+
+    def write_records(self, records: Records, start: int, end: int) -> None:
+        """The caches' records of positions start .. end - 1 from ``records`` (which hold them; whole groups, so the
+        positions around them in their groups too)."""
+        assert records.start <= start and end <= records.end
+        if end <= start:
+            return
+        dev, kv = self.dev, self.dev.view("KV")
+        for (offs, gb, pg), (_, a) in zip(self.cache_rows(), records.parts, strict=True):
+            g0, g1, r0 = start // pg, -(-end // pg), records.start // pg
+            for i, o in enumerate(offs):
+                kv[o + g0 * gb:o + g1 * gb] = a[i, g0 - r0:g1 - r0].reshape(-1)
+                dev.flush("KV", o + g0 * gb, (g1 - g0) * gb)
+        self._ahead = None
+
+    def snapshot(self, position: int) -> dict[str, Any]:
+        """What continuing a sequence from ``position`` needs of the overlay besides its caches' records before it: the
+        open records' rings (their bytes, ``vring``), the records of the groups that hold positions position - SLOTS ..
+        position (the open records: after a prefill their V panels are the exact values the rings hold otherwise,
+        and the steps re-encode them; a drafter's rows that are not records yet) and the last step's slot count
+        (``restore``)."""
+        o, n = self.rings
+        self.dev.fetch("KV", o, n)
+        lo, hi = max(position - SLOTS, 0), min(position + 1, self.max_positions)
+        rings = host_bytes((n,))
+        rings[:] = self.dev.view("KV")[o:o + n]
+        return {"rings": rings, "vring": self.vring.copy(), "last_s": self._last_s,
+                "open": (lo, hi, self.read_records(lo, hi))}
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Back to a ``snapshot`` (the caches hold the records of the positions before it)."""
+        o, n = self.rings
+        self.dev.view("KV")[o:o + n] = snapshot["rings"]
+        self.dev.flush("KV", o, n)
+        lo, hi, records = snapshot["open"]
+        self.write_records(records, lo, hi)
+        self.vring.assign(snapshot["vring"])
+        self._last_s, self._ahead = snapshot["last_s"], None

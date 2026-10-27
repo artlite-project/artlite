@@ -1,7 +1,8 @@
 """artlite-server on the host (no NPU): its routes through FastAPI's TestClient and a live uvicorn (the ``openai``
 client), with a scripted fake model - a tokenizer of words and special tokens, a chat template of role tags, and an
 ``NpuModel`` that replies with given pieces and keeps rewind / position semantics (a cache group of 4 positions, or
-Qwen's exact continuation). Serving the fake model with the web UI, for a manual check in a browser:
+Qwen's exact continuation), its checkpoints and records the tokens they stand for. Serving the fake model with the web
+UI, for a manual check in a browser:
 
     python tests/server/test_server.py [--port 8080] [--thinking]
 """
@@ -24,7 +25,8 @@ import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER, Mask, Model, NpuModel, Penalties, Sampling, top_logits
+from artlite.decode.model import Records
+from models.common import MEDIA_MARKER, Checkpoint, Mask, Model, NpuModel, Penalties, Sampling, top_logits
 from models.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
@@ -129,14 +131,17 @@ class FakeVision(FakeModel):
 
 class FakeNpu(NpuModel):
     """Replies with the pieces of ``replies`` (one list per generation, then an end-of-sequence token; default
-    "ok"); ``seq``: the tokens at the cached positions; ``fail``: an exception for forward to raise. ``group``: rewinds keep multiples of it; ``exact``: all
-    positions or none (Qwen); ``chunk``: prompt tokens per dispatch; ``delay``: seconds per dispatch."""
+    "ok"); ``seq``: the tokens at the cached positions; ``fail``: an exception for forward to raise. ``group``: rewinds
+    keep multiples of it; ``exact``: all positions or none (Qwen: recurrent); ``chunk``: prompt tokens per dispatch;
+    ``delay``: seconds per dispatch. A checkpoint is the tokens before its position, the records the tokens of their
+    positions: a restore checks that the device holds the checkpoint's tokens."""
 
     def __init__(self, model: FakeModel, *, capacity: int = 512, group: int = 4, exact: bool = False, chunk: int = 8,
                  delay: float = 0.0, drafts: int = 0):
         self.tok = model.tokenizer
         self.eos_token_ids = model.eos_token_ids
         self.capacity, self.group, self.exact, self.chunk, self.delay = capacity, group, exact, chunk, delay
+        self.recurrent = exact
         self.drafts = drafts  # (> 0: steps of drafts, every draft accepted: tokens run before they are yielded)
         self.position = 0
         self.seq: list[int] = []
@@ -163,6 +168,41 @@ class FakeNpu(NpuModel):
         self.calls.append(("rewind", n, keep))
         self.position, self.seq = keep, self.seq[:keep]
         return keep
+
+    def checkpoint(self) -> Checkpoint:
+        self.calls.append(("checkpoint", self.position))
+        return Checkpoint(self.position, list(self.seq[:self.position]), 8 * self.position)
+
+    def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        self.calls.append(("restore", position, checkpoint is not None))
+        assert position <= len(self.seq)
+        if checkpoint is None:
+            assert position % self.group == 0 and not (self.exact and position), position
+        else:
+            assert checkpoint.position == position and checkpoint.state == self.seq[:position], \
+                "the caches hold another sequence than the checkpoint's"
+        self.position, self.seq = position, self.seq[:position]
+
+    def read_records(self, start: int, end: int) -> list[Records]:
+        self.calls.append(("read", start, end))
+        return [Records(start, end, [(1, np.array(self.seq[start:end], np.int64).view(np.uint8).reshape(1, -1, 8))])]
+
+    def write_records(self, records: list[Records], start: int, end: int) -> None:
+        self.calls.append(("write", start, end))
+        r = records[0]
+        assert r.start <= start <= len(self.seq) and end <= r.end
+        tokens = r.parts[0][1].reshape(-1).view(np.int64)[start - r.start:end - r.start]
+        self.seq[start:end] = [int(t) for t in tokens]
+        self.position = min(self.position, start)  # (positions past the records written: another sequence's)
+
+    def prompt(self, tokens: list[int], *, logits: bool = False, progress: object = None) -> torch.Tensor | None:
+        assert not logits
+        self.calls.append(("prompt", len(tokens)))
+        for i in range(0, len(tokens), self.chunk):
+            self._run(tokens[i:i + self.chunk])
+            if progress is not None:
+                progress(min(i + self.chunk, len(tokens)))
+        return None
 
     def _logits(self, token: int) -> torch.Tensor:
         out = torch.full((VOCAB,), -100.0)
@@ -224,11 +264,15 @@ def _stop_engines() -> Iterator[None]:
         e.join(5)
 
 
-def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, **kw: object
+def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False,
+         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, **kw: object
          ) -> tuple[FakeModel, FakeNpu, Engine]:
+    """A fake model's engine, started: ``turns``: the model's ``turn`` and ``user_turn`` (its prompt cache's marks),
+    ``cache``: the prompt cache's options; ``kw``: the ``FakeNpu``'s."""
     model = FakeVision() if vision else FakeModel(reasoning=reasoning)
+    model.turn, model.user_turn = turns or (None, None)
     npu = FakeNpu(model, **kw)
-    engine = Engine(load or (lambda: (model, npu)), warmup=False)
+    engine = Engine(load or (lambda: (model, npu)), warmup=False, **(cache or {}))
     ENGINES.append(engine)
     engine.start()
     return model, npu, engine
@@ -691,17 +735,18 @@ def test_prompt_cache(fake: tuple) -> None:
     turn2 = turn1 + [{"role": "assistant", "content": "Reply one"}, {"role": "user", "content": "more"}]
     b2 = chat(client, turn2).json()
     ids2 = model.chat(turn2)
-    rewind = [c for c in npu.calls if c[0] == "rewind"][-1]
-    kept = rewind[2]
-    assert b2["timings"]["cache_n"] == kept > 0 and kept % npu.group == 0 and rewind[1] - kept < npu.group
+    kept = len(model.chat(turn1)) + 2  # (the reply's tokens ran; its end-of-sequence token did not)
+    assert b2["timings"]["cache_n"] == kept and not [c for c in npu.calls if c[0] == "rewind"]
     assert b2["timings"]["prompt_n"] == len(ids2) - kept and b2["usage"]["prompt_tokens_details"]["cached_tokens"] == kept
     assert npu.seq[:len(ids2)] == ids2
-    # the same prompt again: all cached but its last token, which runs again
+    # another answer to it: the multiple of the group below its last token (which runs again)
     b3 = chat(client, turn2).json()
-    assert [c for c in npu.calls if c[0] == "rewind"][-1][1] == len(ids2) - 1 and b3["timings"]["prompt_n"] >= 1
+    n = len(ids2) - 1 - (len(ids2) - 1) % npu.group
+    assert npu.calls[-1 - [c[0] for c in reversed(npu.calls)].index("rewind")] == ("rewind", n, n)
+    assert b3["timings"]["cache_n"] == n and b3["timings"]["prompt_n"] == len(ids2) - n
     # without the cache
     b4 = chat(client, turn2, cache_prompt=False).json()
-    assert b4["timings"]["cache_n"] == 0 and npu.calls[-2] == ("reset",)
+    assert b4["timings"]["cache_n"] == 0 and ("restore", 0, False) in npu.calls[-3:]
 
 
 def _image(data: bytes) -> dict[str, object]:
@@ -759,7 +804,7 @@ def test_prompt_images() -> None:
 
 
 def test_prompt_cache_exact() -> None:
-    """Qwen keeps an exact continuation of the cached tokens, else nothing."""
+    """Qwen keeps an exact continuation of the cached tokens, else what a checkpoint holds."""
     model, npu, engine = make(exact=True)
     with TestClient(app_of(engine)) as client:
         npu.replies = [["a"], ["b"], ["c"]]
@@ -770,7 +815,7 @@ def test_prompt_cache_exact() -> None:
         cont = client.post("/completion", json={"prompt": ids + model.tokenizer.encode("a more")}).json()
         assert cont["timings"]["cache_n"] == n
         other = client.post("/completion", json={"prompt": model.encode("one two four")}).json()
-        assert other["timings"]["cache_n"] == 0 and ("reset",) in npu.calls
+        assert other["timings"]["cache_n"] == 0 and ("restore", 0, False) in npu.calls[-4:]  # (none below "four")
 
 
 # ----------------------------------------------------------------------
@@ -913,12 +958,12 @@ def test_model_failure(fake: tuple) -> None:
     assert chat(client, "a").status_code == 200 and engine.cached == npu.seq[:npu.position]
     assert ("reset",) in npu.calls[n:]  # (after a failure the caches start over)
 
-    def broken(n: int) -> int:
-        raise RuntimeError("rewind failed")
+    def broken(position: int, checkpoint: object = None) -> None:
+        raise RuntimeError("restore failed")
 
-    npu.rewind = broken  # (a failure before the prompt runs: the worker survives it too)
-    assert chat(client, "a").json()["error"]["message"] == "RuntimeError: rewind failed"
-    del npu.rewind
+    npu.restore = broken  # (a failure before the prompt runs: the worker survives it too)
+    assert chat(client, "a").json()["error"]["message"] == "RuntimeError: restore failed"
+    del npu.restore
     npu.replies = [["back"]]
     assert chat(client, "a").json()["choices"][0]["message"]["content"] == "back"
 

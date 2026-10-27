@@ -175,13 +175,19 @@ class LlamaOverlay(ModelOverlay):
         self.att_reg = {(L, c): take("ACT", 2 * SLOTS * XB) for L in self.layers for c in range(COLS)}
         self.kv_bytes = self.n_groups * self.rec.objects * self.T  # (a KV head's cache of a layer)
         self.kv_off = {L: take("KV", COLS * self.kv_bytes) for L in self.layers}
+        r0 = self._layout["KV"]
         self.ring_off = {L: take("KV", COLS * 2 * self.T) for L in self.layers}  # (per KV head: 2 slots)
+        self.rings = (r0, self._layout["KV"] - r0)
         take("KV", 2 * KV_PAD // self.pg * self.rec.objects * self.T)  # (the prefill's slices past the last layer's)
         self._sizes()
 
     def kv_base(self, L: int, c: int) -> int:
         """Byte offset in KV of group 0 of KV head c's cache of layer L."""
         return self.kv_off[L] + c * self.kv_bytes
+
+    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
+        return [(np.array([self.kv_base(L, c) for L in self.layers for c in range(COLS)]), self.rec.objects * self.T,
+                 self.pg)]
 
     def ring(self, L: int, c: int) -> int:
         """Byte offset in KV of KV head c's ring of layer L: 2 slots of T bytes, slot r & 1 the V values of record r
