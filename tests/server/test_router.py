@@ -261,6 +261,14 @@ def test_router(models_dir: str, tmp_path: object) -> None:
         assert r["ui"] is True  # (the router's web UI: a model's server has none, and the UI hides "ui": false)
         assert httpx.get(f"{url}/props", params={"model": B, "autoload": "false"}).status_code == 400
         assert httpx.post(f"{url}/tokenize", json={"model": A, "content": "a b"}).json()["tokens"]
+        r = httpx.post(f"{url}/v1/messages", json={"model": A, "max_tokens": 9, "messages": [
+            {"role": "user", "content": "hi"}]}, timeout=60).json()  # (the agents' APIs)
+        assert r["content"] == [{"type": "text", "text": "a-Q4_0"}]
+        r = httpx.post(f"{url}/v1/responses", json={"model": A, "input": "hi"}, timeout=60).json()
+        assert r["output"][0]["content"][0]["text"] == "a-Q4_0"
+        assert httpx.get(f"{url}/v1/responses/{r['id']}").json()["id"] == r["id"]
+        r = httpx.post(f"{url}/v1/messages", json={"model": "nope", "messages": []}, timeout=60)
+        assert r.status_code == 400 and r.json()["type"] == "error" and "not found" in r.json()["error"]["message"]
         assert reply(ask(url, None)) == "a-Q4_0"  # (no model: the one running)
         # requests on a kept-alive connection, the router's and a model's (no wait for delayed ACKs: TCP_NODELAY)
         with httpx.Client() as client:

@@ -62,7 +62,8 @@ log = logging.getLogger("artlite.server")
 
 # the routes of a model: POST by the body's "model", GET by the "model" parameter
 POSTED = ["/v1/chat/completions", "/chat/completions", "/v1/completions", "/completion", "/completions", "/tokenize",
-          "/detokenize", "/apply-template"]
+          "/detokenize", "/apply-template", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses",
+          "/responses", "/v1/responses/input_tokens", "/responses/input_tokens"]
 CONVERSATIONS = 1024  # conversations whose model the router remembers (the UI's Stop)
 PROGRESS_S = 0.5  # seconds between a load's progress events
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer",
@@ -747,6 +748,14 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
 
     @api.get("/slots")
     async def slots(request: Request, model: str | None = None) -> Response:
+        return await route(request, model)
+
+    @api.get("/v1/responses/{rid}")
+    @api.get("/responses/{rid}")
+    @api.delete("/v1/responses/{rid}")
+    @api.delete("/responses/{rid}")
+    async def stored_response(request: Request, rid: str, model: str | None = None) -> Response:
+        """A stored response (the Responses API's): at the model's server (``?model=``, else the one loaded)."""
         return await route(request, model)
 
     @api.delete("/v1/stream")

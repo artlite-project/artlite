@@ -25,6 +25,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | route | |
 |---|---|
 | `/v1/chat/completions` | chat, streamed or not, with `reasoning_content`, tool calls, `timings`, `prompt_progress`, `usage` |
+| `/v1/messages`, `/v1/messages/count_tokens` | Anthropic's Messages API ([agents](#agents)) |
+| `/v1/responses`, `/v1/responses/input_tokens` | OpenAI's Responses API ([agents](#agents)) |
 | `/v1/completions`, `/completion` | raw prompts (OpenAI's and llama-server's shapes) |
 | `/v1/models`, `/props`, `/health`, `/slots` | the model, the server's settings, its state |
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
@@ -34,7 +36,7 @@ sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, an
 settings for them have no effect.
 Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
 `image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: embeddings,
-reranking, infill, the Responses and Anthropic APIs, `/metrics`, LoRA, model downloads; their routes answer 501.
+reranking, infill, `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
@@ -47,6 +49,31 @@ name is always one of the request's functions: while the model writes it, only t
 (with `required` where no function fits, the model calls the closest one instead of inventing a name). The arguments
 are not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema
 allows no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
+
+## Agents
+
+Coding agents and other clients that call tools use the API they speak: chat completions (opencode, Open WebUI, the
+web chat), Anthropic's Messages API at `/v1/messages` (Claude Code, the Anthropic SDKs) or OpenAI's Responses API at
+`/v1/responses` (Codex CLI, the OpenAI Agents SDK). All three run as the same chat request: tool calls, thoughts and
+the prompt cache work alike.
+
+```bash
+artlite-server -m lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf -rea on -c 131072
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=none claude          # Claude Code
+codex -c model_provider=artlite -c 'model_providers.artlite={name="artlite", base_url="http://127.0.0.1:8080/v1", wire_api="responses"}'
+```
+
+- Messages API: `system`, the blocks `text`, `image` (base64), `thinking`, `tool_use` and `tool_result`, `tools`,
+  `tool_choice`, `stop_sequences`, and Anthropic's event stream. `thinking` turns the model's thought on (`enabled`,
+  `adaptive`) or off (`disabled`; without it, `-rea` decides); its budget is not enforced. A prompt longer than the
+  context answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
+- Responses API: `instructions`, the items `message`, `reasoning`, `function_call` and `function_call_output`,
+  function tools (others, such as `web_search`, are left out), `tool_choice`, `reasoning.effort` (`none`: no
+  thought), `max_output_tokens`, and OpenAI's event stream. `previous_response_id` continues one of the last 1024
+  responses the server keeps (not those with `store: false`); `GET` and `DELETE /v1/responses/{id}` read and drop
+  one. A prompt longer than the context fails with the code `context_length_exceeded`.
+- On every route a `developer` message is a system message, and where a template takes a system message only first
+  (Qwen's), the later ones become user messages: Claude Code and Codex send them during a conversation.
 
 ## Web chat
 

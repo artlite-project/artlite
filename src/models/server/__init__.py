@@ -6,11 +6,12 @@
     artlite-server                                                            # the models directory's models
 
 Modules: ``main`` (the command line, uvicorn, the shutdown), ``api`` (the FastAPI routes, server-sent events, API
-keys), ``engine`` (the NPU worker, the prompt cache, stop strings, the reasoning split, timings), ``tools`` (tool
-calls: a template's syntax, the parsers of generated calls, the mask of their names), ``ui`` (llama.cpp's
-prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml authors); router mode: ``router`` (a
-model server process per model, loads and unloads, the proxy), ``child`` (a model server under the router),
-``catalog`` (the directory's models, their ids, presets).
+keys), ``agents`` (Anthropic's Messages and OpenAI's Responses APIs: their requests as chat completions, their
+responses and streams, the stored responses), ``engine`` (the NPU worker, the prompt cache, stop strings, the
+reasoning split, timings), ``tools`` (tool calls: a template's syntax, the parsers of generated calls, the mask of
+their names), ``ui`` (llama.cpp's prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml
+authors); router mode: ``router`` (a model server process per model, loads and unloads, the proxy), ``child`` (a
+model server under the router), ``catalog`` (the directory's models, their ids, presets).
 
 What follows is one model's server (router mode runs one per loaded model).
 
@@ -38,6 +39,7 @@ The API (llama-server's shapes): ``/v1/chat/completions`` (streamed or not, ``re
 temperature, top-k, top-p, min-p); the sampler fields the NPU path does not have (DRY, XTC, typical-p, mirostat, ...)
 are accepted and ignored, logged when not neutral. Tool calls: ``tools`` (the template's syntax and the parsers of
 the generated calls); the engine parses them after the thoughts, and their names are masked to the functions' as the
-tokens are sampled. Not provided: embeddings, reranking, infill, the Responses and Anthropic APIs, ``/metrics``, LoRA,
-resumable streams.
+tokens are sampled. Agent clients: ``/v1/messages`` and ``/v1/messages/count_tokens`` (Anthropic's: Claude Code),
+``/v1/responses`` and ``/v1/responses/input_tokens`` (OpenAI's: Codex), on the same jobs. Not provided: embeddings,
+reranking, infill, ``/metrics``, LoRA, resumable streams.
 """

@@ -1,7 +1,14 @@
 """The server's HTTP side (FastAPI): llama-server's routes that apply to one model on the NPU, their request and
-response shapes, server-sent events, the API keys, CORS and OpenAI's error shape. The generations run on the engine's
-worker (``engine.Engine``); a route renders the prompt (in a thread: a long prompt's tokenizer takes a while), checks
-that it fits the KV cache, queues a job and turns its events into the response."""
+response shapes, server-sent events, the API keys, CORS and OpenAI's error shape (Anthropic's on its routes). The
+generations run on the engine's worker (``engine.Engine``); a route renders the prompt (in a thread: a long prompt's
+tokenizer takes a while), checks that it fits the KV cache, queues a job and turns its events into the response. The
+Anthropic and Responses routes convert their requests to chat completions and the job's parts to their own shapes
+(``agents``).
+
+A chat's messages go to the template as llama-server hands them over, and more: ``developer`` is ``system``
+(llama.cpp's rule), and a template that takes a system message only first (Qwen's raise otherwise) gets the leading
+ones joined and the later ones as user messages - Claude Code sends system messages between the turns, Codex its
+``instructions`` and a developer message."""
 
 from __future__ import annotations
 
@@ -22,12 +29,14 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, Sampling, chat_template
+from . import agents
+from .agents import Blocks
 from .engine import Engine, Job
 from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
 
@@ -50,6 +59,7 @@ OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": 
                 "mirostat_eta": 0.1, "n_keep": 0, "ignore_eos": False, "n_probs": 0, "min_keep": 0,
                 "post_sampling_probs": False, "backend_sampling": False, "lora": []}
 ROLES = ("system", "developer", "user", "assistant", "tool")
+ANTHROPIC = "/v1/messages"  # (the routes under it answer errors in Anthropic's shape)
 
 
 @dataclass
@@ -156,6 +166,24 @@ def takes_parts(template: str) -> bool:
     return "\x01a" in text and "\x01b" in text and "'type'" not in text
 
 
+def system_first(template: str) -> bool:
+    """Whether a chat template takes a system message only as the first message (Qwen's raise for a later one)."""
+    try:
+        chat_template(template, [{"role": "user", "content": "a"}, {"role": "system", "content": "b"}])
+    except jinja2.TemplateError:
+        return True
+    except Exception:  # noqa: BLE001 (another failure: not this one)
+        return False
+    return False
+
+
+def text_of(content: object) -> str:
+    """A message's text: its content, or its text parts joined by blank lines."""
+    if isinstance(content, list):
+        return "\n\n".join(str(p.get("text", "")) for p in content if p.get("type") == "text")
+    return str(content or "")
+
+
 # ----------------------------------------------------------------------
 # Requests
 # ----------------------------------------------------------------------
@@ -257,30 +285,43 @@ def call_delta(c: ToolCall) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+def validation_message(errors: list[dict[str, Any]], *, skip: int = 1) -> str:
+    """A request's validation errors as one line (``skip``: the leading parts of their locations, FastAPI's
+    ``body``)."""
+    return "; ".join(f"{'.'.join(str(x) for x in err['loc'][skip:])}: {err['msg']}" for err in errors) or \
+        "invalid request"
+
+
+def error_response(request: Request, e: ApiError) -> JSONResponse:
+    """An error in the shape of the request's API: Anthropic's on its routes, else OpenAI's."""
+    if request.url.path.startswith(ANTHROPIC):
+        return JSONResponse(agents.anthropic_error(e.status, e.message), status_code=e.status)
+    return JSONResponse(e.body(), status_code=e.status)
+
+
 def new_app(*, build_info: str, cors_origins: list[str], lifespan: Callable | None = None) -> FastAPI:
-    """A FastAPI app whose errors all answer in OpenAI's shape, with CORS."""
+    """A FastAPI app whose errors all answer in the API's shape (``error_response``), with CORS."""
     app = FastAPI(title="artlite-server", version=build_info, docs_url="/docs", redoc_url=None, lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_methods=["*"], allow_headers=["*"])
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, e: ApiError) -> JSONResponse:
-        return JSONResponse(e.body(), status_code=e.status)
+        return error_response(request, e)
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request: Request, e: RequestValidationError) -> JSONResponse:
-        errors = "; ".join(f"{'.'.join(str(x) for x in err['loc'][1:])}: {err['msg']}" for err in e.errors())
-        return JSONResponse(bad_request(errors or "invalid request").body(), status_code=400)
+        return error_response(request, bad_request(validation_message(e.errors())))
 
     @app.exception_handler(Exception)
     async def failure(request: Request, e: Exception) -> JSONResponse:
         log.exception("%s %s failed", request.method, request.url.path)
-        return JSONResponse(ApiError(500, "server_error", f"{type(e).__name__}: {e}").body(), status_code=500)
+        return error_response(request, ApiError(500, "server_error", f"{type(e).__name__}: {e}"))
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, e: StarletteHTTPException) -> JSONResponse:
         kind = {401: "authentication_error", 403: "permission_error", 404: "not_found_error"}.get(e.status_code,
                                                                                                  "invalid_request_error")
-        return JSONResponse(ApiError(e.status_code, kind, str(e.detail)).body(), status_code=e.status_code)
+        return error_response(request, ApiError(e.status_code, kind, str(e.detail)))
 
     return app
 
@@ -300,10 +341,9 @@ def key_check(api_keys: frozenset[str]) -> Callable[..., Awaitable[None]]:
     return authorized
 
 
-NOT_SUPPORTED = ["/v1/chat/completions/control", "/v1/responses", "/responses", "/v1/messages",
-                 "/v1/messages/count_tokens", "/v1/embeddings", "/embeddings", "/embedding", "/rerank", "/reranking",
-                 "/v1/rerank", "/v1/reranking", "/infill", "/v1/audio/transcriptions", "/audio/transcriptions",
-                 "/lora-adapters", "/metrics"]
+NOT_SUPPORTED = ["/v1/chat/completions/control", "/v1/embeddings", "/embeddings", "/embedding", "/rerank",
+                 "/reranking", "/v1/rerank", "/v1/reranking", "/infill", "/v1/audio/transcriptions",
+                 "/audio/transcriptions", "/lora-adapters", "/metrics"]
 
 
 def add_unsupported(router: APIRouter) -> None:
@@ -346,6 +386,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     warned: set[tuple[str, str]] = set()
     syntax = syntax_of(info.chat_template)  # (the template's tool calls, None: it takes no tools)
     typed = takes_parts(info.chat_template)
+    first = system_first(info.chat_template)
+    store = agents.Store()  # (the Responses API's, for previous_response_id)
     vocab: list[Vocabulary] = []  # (the model's tokens for the calls' names: built on the first request with tools)
     vocab_lock = asyncio.Lock()
 
@@ -407,11 +449,17 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     def stops(req: Generation) -> list[str]:
         return [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
 
-    def fits(ids: list[int]) -> None:
+    def fits(ids: list[int], api: str = "chat") -> None:
+        """A prompt that fits the KV cache (and its first token); an overflow in the words of ``api``'s clients."""
         capacity = engine.npu.capacity
         if not ids:
             raise bad_request("the prompt is empty")
         if len(ids) + 1 > capacity:
+            if api == "anthropic":
+                raise bad_request(agents.overflow(len(ids), capacity, api))
+            if api == "responses":
+                raise ApiError(400, "invalid_request_error", agents.overflow(len(ids), capacity, api),
+                               code="context_length_exceeded", param="input")
             raise ApiError(400, "exceed_context_size_error", f"request ({len(ids)} tokens) exceeds the available "
                            f"context size ({capacity} tokens), try increasing it", n_prompt_tokens=len(ids),
                            n_ctx=capacity)
@@ -426,6 +474,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         for m in messages:
             if m.role not in ROLES:
                 raise bad_request(f"message role {m.role!r} (one of {', '.join(ROLES)})")
+            role = "system" if m.role == "developer" else m.role
             content = m.content
             if isinstance(content, list):
                 parts: list[dict[str, object]] = []
@@ -441,7 +490,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                                           f"text{' and images (image_url)' if vision else ' only'}")
                 content = parts if typed or any(p["type"] == "image" for p in parts) else \
                     "\n".join(p["text"] for p in parts)
-            d: dict[str, object] = {**(m.model_extra or {}), "role": m.role, "content": content or ""}
+            d: dict[str, object] = {**(m.model_extra or {}), "role": role, "content": content or ""}
             if m.reasoning_content:
                 d["reasoning_content"] = m.reasoning_content
             try:
@@ -450,6 +499,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 raise bad_request(str(e)) from None
         if not out:
             raise bad_request("no messages")
+        if first:  # (the template takes a system message only first)
+            lead = next((i for i, d in enumerate(out) if d["role"] != "system"), len(out))
+            if lead > 1:
+                out[:lead] = [{"role": "system",
+                               "content": "\n\n".join(text_of(d["content"]) for d in out[:lead]).strip()}]
+            for d in out[1:]:
+                if d["role"] == "system":
+                    d["role"] = "user"
         return out
 
     def template_options(kwargs: dict[str, Any] | None) -> tuple[bool, bool]:
@@ -534,11 +591,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             if kind in ("done", "error", "cancelled"):
                 return
 
-    async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
-        """A job's output (a response without streaming) and its last event: the text by kind and ``tool_calls``, the
-        complete calls in OpenAI's shape; the client going away cancels it."""
-        texts: dict[str, list[str]] = {"content": [], "reasoning_content": []}
-        calls: dict[int, dict[str, Any]] = {}
+    async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[Blocks, dict[str, Any]]:
+        """A job's output (a response without streaming) as the blocks of its message, and its last event; the client
+        going away cancels it."""
+        blocks = Blocks()
         loop = asyncio.get_running_loop()
         check = loop.time()
         try:
@@ -548,17 +604,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     if await request.is_disconnected():
                         j.cancel.set()
                 if kind == "delta":
-                    for k, v in data["parts"]:
-                        if k == "tool_call":
-                            c = calls.setdefault(v.index, {"id": v.id, "type": "function",
-                                                           "function": {"name": v.name, "arguments": ""}})
-                            c["function"]["arguments"] += v.arguments
-                        else:
-                            texts[k].append(v)
+                    blocks.feed(data["parts"])
                 elif kind == "done":
-                    out: dict[str, Any] = {k: "".join(v) for k, v in texts.items()}
-                    out["tool_calls"] = [calls[i] for i in sorted(calls)][:data["n_calls"]]
-                    return out, data
+                    blocks.end()
+                    return blocks, data
                 elif kind == "error":
                     raise ApiError(500, "server_error", data["message"])
                 elif kind == "cancelled":
@@ -683,10 +732,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     # Generation
     # ------------------------------------------------------------------
 
-    @api.post("/v1/chat/completions")
-    @api.post("/chat/completions")
-    async def chat_completions(req: ChatRequest, request: Request,
-                               x_conversation_id: str | None = Header(None)) -> Any:
+    async def start(req: ChatRequest, *, api: str = "chat", conv_id: str | None = None
+                    ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
+        """The job of a chat request (of ``api``: its overflow's words) and its queue of events."""
         check(req)
         if req.continue_final_message:
             raise bad_request("continue_final_message is not supported")
@@ -694,20 +742,27 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         if calls is not None:
             calls = dataclasses.replace(calls, vocab=await vocabulary())
         ids, think = await render(req.messages, req.chat_template_kwargs, tools=fns)
-        fits(ids)
+        fits(ids, api)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
-        max_tokens = req.max_completion_tokens if req.max_completion_tokens is not None else None
-        j, events = job(req, ids, think=think, reasoning=reasoning, max_tokens=max_tokens, conv_id=x_conversation_id,
-                        tools=calls)
+        return job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens, conv_id=conv_id,
+                   tools=calls)
+
+    @api.post("/v1/chat/completions")
+    @api.post("/chat/completions")
+    async def chat_completions(req: ChatRequest, request: Request,
+                               x_conversation_id: str | None = Header(None)) -> Any:
+        j, events = await start(req, conv_id=x_conversation_id)
         cid, created, name = f"chatcmpl-{secrets.token_hex(16)}", int(time.time()), options.alias
         head = {"created": created, "id": cid, "model": name, "system_fingerprint": options.build_info}
         if not req.stream:
-            out, done = await collect(j, events, request)
-            message = {"role": "assistant", "content": out["content"] or (None if out["tool_calls"] else "")}
-            if out["reasoning_content"]:
-                message["reasoning_content"] = out["reasoning_content"]
-            if out["tool_calls"]:
-                message["tool_calls"] = out["tool_calls"]
+            blocks, done = await collect(j, events, request)
+            calls = [{"id": b.call.id, "type": "function", "function": {"name": b.call.name, "arguments": b.text}}
+                     for b in blocks.complete(done["n_calls"]) if b.kind == "call"]
+            message = {"role": "assistant", "content": blocks.text("text") or (None if calls else "")}
+            if blocks.text("thinking"):
+                message["reasoning_content"] = blocks.text("thinking")
+            if calls:
+                message["tool_calls"] = calls
             return {"choices": [{"finish_reason": done["finish_reason"], "index": 0, "message": message}], **head,
                     "object": "chat.completion", "usage": usage(done), "timings": done["timings"]}
         include_usage = bool((req.stream_options or {}).get("include_usage"))
@@ -742,6 +797,149 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
         return EventStream(stream(), j)
 
+    # ------------------------------------------------------------------
+    # The agents' APIs: Anthropic's Messages, OpenAI's Responses
+    # ------------------------------------------------------------------
+
+    def ignored(route: str) -> agents.Note:
+        """A field of ``route``'s requests that the server ignores, logged once."""
+
+        def note(name: str) -> None:
+            if (route, name) not in warned:
+                warned.add((route, name))
+                log.info("%s: %s is not supported: ignored", route, name)
+
+        return note
+
+    def chat_request(body: dict[str, Any]) -> ChatRequest:
+        """A converted request as the chat route's."""
+        try:
+            return ChatRequest.model_validate(body)
+        except ValidationError as e:
+            raise bad_request(validation_message(e.errors(), skip=0)) from None
+
+    def anthropic_request(body: dict[str, Any]) -> ChatRequest:
+        try:
+            return chat_request(agents.anthropic_chat(body, ignored(ANTHROPIC)))
+        except ValueError as e:
+            raise bad_request(str(e)) from None
+
+    async def counted(req: ChatRequest) -> int:
+        """The prompt tokens of a chat request."""
+        ids, _ = await render(req.messages, req.chat_template_kwargs, tools=calls_of(req)[0])
+        return len(ids)
+
+    @api.post("/v1/messages")
+    async def messages(body: dict[str, Any], request: Request) -> Any:
+        """Anthropic's Messages (``agents.Anthropic``)."""
+        req = anthropic_request(body)
+        req.return_progress = bool(req.stream)  # (the job's start: its message_start, with the cached tokens)
+        j, events = await start(req, api="anthropic")
+        out = agents.Anthropic(options.alias)
+        if not req.stream:
+            out.blocks, done = await collect(j, events, request)
+            return out.message(done)
+
+        async def stream() -> AsyncIterator[str]:
+            async for kind, data in events_of(events, ping_of(req)):
+                if kind == "ping":
+                    yield agents.event("ping", {"type": "ping"})
+                elif kind == "progress":
+                    if not out.started:
+                        yield "".join(out.start(n_prompt=data["total"], cached=data["cache"]))
+                elif kind == "delta":
+                    yield "".join(out.parts(data["parts"]))
+                elif kind == "done":
+                    yield "".join(out.end(data))
+                else:
+                    e = ApiError(500, "server_error", data["message"]) if kind == "error" else \
+                        ApiError(503, "unavailable_error", "the request was cancelled")
+                    yield agents.event("error", agents.anthropic_error(e.status, e.message))
+
+        return EventStream(stream(), j)
+
+    @api.post("/v1/messages/count_tokens")
+    async def count_tokens(body: dict[str, Any]) -> dict[str, int]:
+        return {"input_tokens": await counted(anthropic_request(body))}
+
+    def responses_request(body: dict[str, Any]) -> tuple[ChatRequest, list[dict[str, Any]]]:
+        """A Responses request as a chat request, after the response it continues (``previous_response_id``), and its
+        own input items."""
+        prev = body.get("previous_response_id")
+        try:
+            history = store.items(prev) if prev else []
+        except KeyError:
+            raise ApiError(400, "invalid_request_error", f"Previous response with id '{prev}' not found.",
+                           code="previous_response_not_found", param="previous_response_id") from None
+        try:
+            return chat_request(agents.responses_chat(body, history, ignored("/v1/responses"))), \
+                agents.input_items(body.get("input"))
+        except ValueError as e:
+            raise bad_request(str(e)) from None
+
+    @api.post("/v1/responses")
+    @api.post("/responses")
+    async def responses(body: dict[str, Any], request: Request) -> Any:
+        """OpenAI's Responses (``agents.Responses``); a response is stored unless ``store`` is false."""
+        req, inputs = responses_request(body)
+        out = agents.Responses(options.alias, body)
+        keep = body.get("store") is not False
+        try:
+            j, events = await start(req, api="responses")
+        except ApiError as e:  # (an overflow while streaming: response.failed, as clients expect it)
+            if not req.stream or e.extra.get("code") != "context_length_exceeded":
+                raise
+            lines = out.start() + out.failed("context_length_exceeded", e.message)
+
+            async def failed() -> AsyncIterator[str]:
+                yield "".join(lines)
+
+            return StreamingResponse(failed(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+        if not req.stream:
+            out.blocks, done = await collect(j, events, request)
+            r = out.response(done)
+            if keep:
+                store.put(r, inputs)
+            return r
+
+        async def stream() -> AsyncIterator[str]:
+            yield "".join(out.start())
+            async for kind, data in events_of(events, ping_of(req)):
+                if kind == "ping":
+                    yield ":\n\n"
+                elif kind == "delta":
+                    yield "".join(out.parts(data["parts"]))
+                elif kind == "done":
+                    end, r = out.end(data)
+                    if keep:
+                        store.put(r, inputs)
+                    yield "".join(end)
+                elif kind != "progress":
+                    yield "".join(out.failed("server_error", data["message"] if kind == "error" else
+                                             "the request was cancelled"))
+
+        return EventStream(stream(), j)
+
+    @api.post("/v1/responses/input_tokens")
+    @api.post("/responses/input_tokens")
+    async def input_tokens(body: dict[str, Any]) -> dict[str, Any]:
+        return {"object": "response.input_tokens", "input_tokens": await counted(responses_request(body)[0])}
+
+    @api.get("/v1/responses/{rid}")
+    @api.get("/responses/{rid}")
+    async def stored_response(rid: str) -> dict[str, Any]:
+        r = store.get(rid)
+        if r is None:
+            raise ApiError(404, "not_found_error", f"No response with id '{rid}' found.")
+        return r
+
+    @api.delete("/v1/responses/{rid}")
+    @api.delete("/responses/{rid}")
+    async def delete_response(rid: str) -> dict[str, Any]:
+        if not store.delete(rid):
+            raise ApiError(404, "not_found_error", f"No response with id '{rid}' found.")
+        return {"id": rid, "object": "response.deleted", "deleted": True}
+
     def valid(ids: list[int]) -> list[int]:
         """Token ids within the vocabulary."""
         bad = [t for t in ids if not 0 <= t < info.n_vocab]
@@ -775,8 +973,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     **extra}
 
         if not req.stream:
-            texts, done = await collect(j, events, request)
-            return body(texts["content"], done["finish_reason"], usage=usage(done), timings=done["timings"])
+            blocks, done = await collect(j, events, request)
+            return body(blocks.text("text"), done["finish_reason"], usage=usage(done), timings=done["timings"])
 
         async def stream() -> AsyncIterator[str]:
             async for kind, data in events_of(events, ping_of(req)):
@@ -816,8 +1014,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     "stopping_word": done["stop_word"] or "", "tokens_cached": done["n_cached"], "timings": t}
 
         if not req.stream:
-            texts, done = await collect(j, events, request)
-            return final(texts["content"], done)
+            blocks, done = await collect(j, events, request)
+            return final(blocks.text("text"), done)
 
         async def stream() -> AsyncIterator[str]:
             async for kind, data in events_of(events, ping_of(req)):

@@ -44,6 +44,7 @@ dev = [
     "ruff>=0.16.2",
     "httpx>=0.28",
     "openai>=1.60",
+    "anthropic>=0.60",
 ]
 
 [tool.scikit-build]
