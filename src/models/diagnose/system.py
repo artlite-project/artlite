@@ -209,6 +209,28 @@ def root_readings() -> dict[str, object]:
             "debugfs": debugfs(), "kernel_log": kernel_log(), "npu_users": npu_users()}
 
 
+def invoking_environment() -> dict[str, str]:
+    """As root under sudo: the environment the user ran sudo with (sudo resets its command's), read from the nearest
+    ancestor process whose real user is SUDO_UID - sudo itself; {} when none is found."""
+    uid = os.environ.get("SUDO_UID")
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1 or uid is None:
+            break
+        status = _read(f"/proc/{pid}/status")
+        m = re.search(r"^Uid:\s*(\d+)", status, re.MULTILINE)
+        if m and m[1] == uid:
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    raw = f.read()
+            except OSError:
+                return {}
+            return dict(kv.split("=", 1) for kv in raw.decode(errors="replace").split("\0") if "=" in kv)
+        m = re.search(r"^PPid:\s*(\d+)", status, re.MULTILINE)
+        pid = int(m[1]) if m else 0
+    return {}
+
+
 def drop_privileges() -> str | None:
     """Become the user who ran sudo (SUDO_UID / SUDO_GID, their groups and HOME), with an unlimited RLIMIT_MEMLOCK
     first (the NPU's pinned buffers); returns their name, or None when not run through sudo."""

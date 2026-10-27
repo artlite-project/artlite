@@ -37,6 +37,7 @@ def become_user(argv: list[str]) -> None:
 
     if not os.environ.get("SUDO_UID"):
         return
+    invoking = system.invoking_environment()  # (sudo reset the environment: the user's own, before root drops)
     readings = system.root_readings()
     fd, path = tempfile.mkstemp(prefix="artlite-diagnose-root-", suffix=".json")
     with os.fdopen(fd, "w") as f:
@@ -44,6 +45,8 @@ def become_user(argv: list[str]) -> None:
     os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
     user = system.drop_privileges()
     env = {k: v for k, v in os.environ.items() if not k.startswith("SUDO_")}
+    # (the user's PATH (their aiecc first, as without sudo) and settings: ARTLITE_MODELS_DIR, ARTLITE_CACHE_DIR, ...)
+    env.update({k: v for k, v in invoking.items() if k == "PATH" or k.startswith("ARTLITE_")})
     env[ROOT_ENV] = path
     sys.stderr.write(f"artlite-probe --diagnose: root readings taken; continuing as {user}\n")
     os.execve(sys.executable, [sys.executable, "-m", "models.probe", *argv], env)

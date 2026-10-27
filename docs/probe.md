@@ -96,7 +96,8 @@ translations: the DMA's own rates for each pattern) and with 4 KB pages (transpa
 slower on a machine, so that a slower number comes with what explains it. It reads as root what only root can (the
 memory devices, the NPU's PCI capabilities, the data fabric's DRAM interleaving unless the kernel is locked down, the
 SMU's enabled features, this boot's kernel lines about the NPU and the IOMMU, other processes on the NPU), then runs
-on as the user who ran sudo (their caches and models directory). Through every step it samples what the SoC reports
+on as the user who ran sudo, with the `PATH` and `ARTLITE_*` settings (`ARTLITE_MODELS_DIR`, ...) they ran sudo with: their
+caches and models directory. Through every step it samples what the SoC reports
 (amdgpu's `gpu_metrics`: fabric and memory clocks, the NPU's clock, DRAM traffic, power, limits, temperatures; the
 driver's NPU sensors where it has them; the clock of the CPU that takes the NPU's interrupts; other processes' CPU
 load). It measures:
