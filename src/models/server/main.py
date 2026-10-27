@@ -87,9 +87,10 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("-np", "--parallel", type=int, default=1, help="sequences at a time (1 only: the NPU runs one)")
     gen.add_argument("--cache-prompt", action=argparse.BooleanOptionalAction, default=True,
                      help="continue from the prefix a prompt shares with the cached tokens (default: on)")
-    gen.add_argument("-cram", "--cache-ram", type=int, default=8192,
+    gen.add_argument("-cram", "--cache-ram", type=int,
                      help="MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints "
-                          "(default: 8192; -1: no limit, 0: the device's conversation alone)")
+                          "(default: 8192, at most half of the RAM still available once the model is loaded; -1: no "
+                          "limit, 0: the device's conversation alone)")
     gen.add_argument("-ctxcp", "--ctx-checkpoints", type=int, default=32,
                      help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8 and MiniCPM-V that "
                           "a prompt continues from; default: 32)")
@@ -339,7 +340,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         report({"ready": {"name": engine.model.name, "n_ctx": engine.npu.capacity, "describe": engine.npu.describe()}})
 
     engine = Engine(load, warmup=args.warmup, on_ready=ready, on_exit=failed,
-                    cache_ram=args.cache_ram << 20 if args.cache_ram >= 0 else -1, checkpoints=args.ctx_checkpoints)
+                    cache_ram=None if args.cache_ram is None else args.cache_ram << 20 if args.cache_ram >= 0 else -1,
+                    checkpoints=args.ctx_checkpoints)
     config = uvicorn.Config(create_app(engine, options, info), host=args.host, port=args.port, log_config=None,
                             access_log=args.verbose, timeout_keep_alive=int(args.timeout), lifespan="off")
     server = Server(config, engine.stop)

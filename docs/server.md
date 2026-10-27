@@ -89,16 +89,19 @@ button and the shutdown stop a request at its next token or prompt chunk.
 
 A chat's next turn continues from the KV cache: the server keeps the prefix a prompt shares with the cached tokens,
 rounded down to where a prefill chunk can start, and runs the rest. Other conversations stay in host RAM, as in
-llama-server (`--cache-ram`, 8 GiB by default): when a request continues one of them (an agent's subagent, a title
-request, another chat in the web UI), its cache is copied back to the NPU (~15 GB/s: 30-45 ms for 32K positions of
-the 35B-A3B) instead of running its prompt again. The Qwen models' Gated DeltaNet states cannot go back, so for them
-the server saves the states (checkpoints, `--ctx-checkpoints`) where a prompt's last message and its first user
-message begin: a prompt continues from the latest one it shares, and a new conversation with the same system prompt
-and tools continues from the second (Qwen3.6-35B-A3B: 80 MB, a few milliseconds each). The earlier answers keep their
-thoughts in the prompt, as llama-server does (`--reasoning-preserve`, on by default, where the template can: Qwen3.6 /
-3.8, Occamy, Gemma 4), so a turn extends the last one when the client sends the thoughts back (`reasoning_content`, as
-the web UI does); Qwen3.5's and MiniCPM-V's templates drop them, so a thinking turn there continues from the
-checkpoint before the last answer. A request's `cache_prompt: false` starts from an empty cache.
+llama-server (`--cache-ram`: 8 GiB by default, or half of the RAM left once the model is loaded where that is less):
+when a request continues one of them (an agent's subagent, a title request, another chat in the web UI), its cache is
+copied back to the NPU (~15 GB/s: 30-45 ms for 32K positions of the 35B-A3B) instead of running its prompt again. The
+Qwen models' Gated DeltaNet states cannot go back, so for them the server saves the states (checkpoints,
+`--ctx-checkpoints`; Qwen3.6-35B-A3B: 80 MB, a few milliseconds each) at the end of each prompt and where its first
+user message begins: a prompt continues from the latest one it shares (the client's own rendering of the last answer,
+another answer to the same prompt), and a new conversation with the same system prompt and tools from the second. The
+earlier answers keep their thoughts in the prompt, as llama-server does (`--reasoning-preserve`, on by default, where
+the template can: Qwen3.6 / 3.8, Occamy, Gemma 4), so a turn extends the last one when the client sends the thoughts
+back (`reasoning_content`, as the web UI does). Where they are dropped (Qwen3.5's and MiniCPM-V's templates,
+`--no-reasoning-preserve`), the next user message renders the last answer from its start otherwise: the server also
+saves the state where each prompt's last message begins, and a turn continues from there. A request's
+`cache_prompt: false` starts from an empty cache.
 
 ## Several models (router mode)
 
@@ -193,7 +196,7 @@ Generation:
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
 | `-np N`, `--parallel` | sequences at a time (1 only: the NPU runs one) |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
-| `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192; -1: no limit, 0: none saved) |
+| `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V; default 32) |
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |

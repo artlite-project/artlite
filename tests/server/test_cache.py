@@ -15,6 +15,8 @@ from models.server import cache
 from models.server.engine import Engine
 
 from .test_server import (  # noqa: F401 (_stop_engines: the engines' cleanup, autouse)
+    QWEN,
+    TEMPLATE,
     FakeModel,
     FakeNpu,
     _stop_engines,
@@ -25,6 +27,7 @@ from .test_server import (  # noqa: F401 (_stop_engines: the engines' cleanup, a
 
 TURNS = ("<|assistant|>", "<|user|>")  # (the fake template's: the answer's tag, the user's)
 GROUP = 4  # (the fake's cache group: a checkpoint's mark rounded down to it)
+KEEPS = TEMPLATE + "{# preserve_thinking #}"  # (a template that keeps the earlier answers' thoughts)
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +36,10 @@ def _min_save(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextlib.contextmanager
-def served(**kw: object) -> Iterator[tuple[FakeModel, FakeNpu, Engine, TestClient]]:
+def served(*, template: str = KEEPS, **kw: object) -> Iterator[tuple[FakeModel, FakeNpu, Engine, TestClient]]:
+    """The fake model served (``template``: the chat template the server sees; ``kw``: ``make``'s)."""
     model, npu, engine = make(capacity=4096, **kw)
-    with TestClient(app_of(engine, n_ctx=4096)) as client:
+    with TestClient(app_of(engine, n_ctx=4096, template=template)) as client:
         assert engine.wait_ready(5)
         yield model, npu, engine, client
 
@@ -50,20 +54,38 @@ def words(n: int, w: str = "w") -> str:
     return " ".join(f"{w}{i}" for i in range(n))
 
 
-def test_last_message() -> None:
-    """A recurrent model continues from the checkpoint where the last prompt's answer began when the next prompt
-    re-renders the answer otherwise (a client's own echo of it), and when it asks again (another answer)."""
+def test_prompt_end() -> None:
+    """A recurrent model continues from the checkpoint of the last prompt's end when the next prompt re-renders the
+    answer otherwise (a client's own echo of it), and asks again from its logits: the prompt runs whole, no part."""
     with served(exact=True, turns=TURNS) as (model, npu, engine, client):
         turn = [{"role": "user", "content": words(40)}]
         ids = model.chat(turn)
-        npu.replies = [["x", " y"], ["z"], ["w"]]
+        npu.replies = [["x", " y"], ["z"]]
         chat(client, turn)
-        at = (len(ids) - 1) // GROUP * GROUP
-        assert ("checkpoint", at) in npu.calls
+        assert ("checkpoint", len(ids)) in npu.calls and not [c for c in npu.calls if c[0] == "prompt"]
         r = chat(client, turn + [{"role": "assistant", "content": "x z"}, {"role": "user", "content": "more"}]).json()
-        assert r["timings"]["cache_n"] == at and ("restore", at, True) in npu.calls
+        assert r["timings"]["cache_n"] == len(ids) and ("restore", len(ids), True) in npu.calls
+        n = sum(c[0] == "forward" for c in npu.calls)
         r = chat(client, turn).json()
-        assert r["timings"]["cache_n"] == at and r["timings"]["prompt_n"] == len(ids) - at
+        assert r["timings"]["cache_n"] == len(ids) and r["timings"]["prompt_n"] == 0
+        assert sum(c[0] == "forward" for c in npu.calls) == n and r["choices"][0]["message"]["content"] == "x"
+        assert engine.cached == npu.seq[:npu.position]
+
+
+def test_answer_mark() -> None:
+    """A template that drops the earlier answers' thoughts renders the answer's opener otherwise in the next prompt
+    (before the last prompt's end): a checkpoint where the last message began, at its token."""
+    with served(exact=True, turns=TURNS, reasoning=QWEN, template=TEMPLATE) as (model, npu, engine, client):
+        think = {"chat_template_kwargs": {"enable_thinking": True}}
+        turn = [{"role": "user", "content": words(40)}]
+        ids = model.chat(turn, think=True)
+        at = len(ids) - 1 - ids[::-1].index(model.tokenizer.id("<|assistant|>"))
+        npu.replies = [["Hmm", "</think>", "x"], ["z"]]
+        chat(client, turn, **think)
+        assert ("checkpoint", at) in npu.calls and ("checkpoint", len(ids)) in npu.calls
+        r = chat(client, turn + [{"role": "assistant", "content": "x"}, {"role": "user", "content": "more"}],
+                 **think).json()
+        assert r["timings"]["cache_n"] == at and ("restore", at, True) in npu.calls
         assert engine.cached == npu.seq[:npu.position]
 
 
@@ -104,7 +126,7 @@ def test_first_user_message() -> None:
 def test_ram_limit() -> None:
     """Within the RAM limit: the least recently used conversations cut back to their first checkpoint (held once:
     by the device's conversation when it shares it), then dropped."""
-    ram = 1600  # (bytes: the fake's 8 per position of records and of each checkpoint)
+    ram = 6000  # (bytes: the fake's 8 per position of records and of each checkpoint, 4 KB of a prompt end's logits)
     with served(exact=True, turns=TURNS, cache={"cache_ram": ram}) as (model, npu, engine, client):
         system = {"role": "system", "content": words(20, "s")}
         at = model.chat([system, {"role": "user", "content": "q"}]).index(model.tokenizer.id("<|user|>"))
@@ -159,7 +181,7 @@ def test_failure_keeps_saved() -> None:
 
 
 def test_images() -> None:
-    """An image prompt's checkpoints (a sequence of ids and embedding rows): the next turn after the same image."""
+    """An image prompt's checkpoint (a sequence of ids and embedding rows): the next turn after the same image."""
     with served(exact=True, vision=True, turns=TURNS) as (_model, npu, _engine, client):
         url = "data:image/png;base64," + base64.b64encode(b"c" * 24).decode()
         image = {"type": "image_url", "image_url": {"url": url}}
@@ -169,5 +191,4 @@ def test_images() -> None:
         n = chat(client, turn).json()["timings"]["prompt_n"]
         more = [{"role": "assistant", "content": "a dog"}, {"role": "user", "content": "sure?"}]
         r = chat(client, turn + more).json()
-        at = (n - 1) // GROUP * GROUP
-        assert r["timings"]["cache_n"] == at and ("restore", at, True) in npu.calls
+        assert r["timings"]["cache_n"] == n and ("restore", n, True) in npu.calls

@@ -14,11 +14,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from artlite import portable
+
 from ..common import Model, NpuModel, Sampling, StreamDecoder, argmax, seed
 from .cache import PromptCache
 from .tools import Calls, held
 
 log = logging.getLogger("artlite.server")
+CACHE_RAM = 8192 << 20  # the prompt cache's host memory by default at most (llama-server's --cache-ram)
 
 Emit = Callable[[str, dict[str, Any]], None]  # (event, data) -> None: a job's events to its request
 
@@ -54,6 +57,7 @@ class Job:
     think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
     cache_prompt: bool = True  # continue from the cached prefix
+    answer_mark: bool = False  # the next prompt re-renders this answer's opener (its template drops earlier thoughts)
     progress: bool = False  # send prompt_progress events
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
     name: str = ""  # for the log
@@ -190,15 +194,17 @@ class Engine:
     """The worker thread that owns the model: it opens and loads it (``load``: the ``Model`` and its ``NpuModel``),
     runs one token through it (``warmup``), then runs the jobs one at a time in arrival order.
 
-    The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory, ``checkpoints`` per sequence): a job
-    continues from what it keeps of its prompt (the device's sequence, a checkpoint, a sequence saved in RAM) and runs
-    the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``); ``cached``: the
-    tokens whose K / V the caches hold (the last sampled token never ran). ``on_ready``: called on the worker once the
-    model is loaded (after the warmup); ``on_exit``: when the worker ends on its own (the load failed)."""
+    The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory - None: ``CACHE_RAM``, at most half of
+    what is still available once the model is loaded (its weights and caches are host memory too) -, ``checkpoints``
+    per sequence): a job continues from what it keeps of its prompt (the device's sequence, a checkpoint, a sequence
+    saved in RAM) and runs the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``), with a
+    checkpoint at its end; ``cached``: the tokens whose K / V the caches hold (the last sampled token never ran).
+    ``on_ready``: called on the worker once the model is loaded (after the warmup); ``on_exit``: when the worker ends
+    on its own (the load failed)."""
 
     def __init__(self, load: Callable[[], tuple[Model, NpuModel]], *, warmup: bool = True,
                  on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None,
-                 cache_ram: int = 8192 << 20, checkpoints: int = 32):
+                 cache_ram: int | None = None, checkpoints: int = 32):
         self.model: Model | None = None
         self.npu: NpuModel | None = None
         self.cache: PromptCache | None = None
@@ -281,7 +287,12 @@ class Engine:
             if self._warmup and not self._stopping:
                 self._warm()
             turns = [self.model.tokenizer.encode(t) if t else None for t in (self.model.turn, self.model.user_turn)]
-            self.cache = PromptCache(self.npu, ram=self._cache_ram, checkpoints=self._checkpoints, turn=turns[0],
+            ram = self._cache_ram
+            if ram is None:
+                free = portable.available_memory()
+                ram = CACHE_RAM if free is None else min(CACHE_RAM, free // 2)
+                log.info("prompt cache: up to %.1f GiB of host RAM (--cache-ram)", ram / 2**30)
+            self.cache = PromptCache(self.npu, ram=ram, checkpoints=self._checkpoints, turn=turns[0],
                                      user_turn=turns[1])
         except Exception as e:  # (any failure of the load: reported, the server exits)
             log.exception("loading the model failed")
@@ -350,7 +361,7 @@ class Engine:
         if self._dirty:
             npu.reset()
             self._dirty = False
-        kept, how = cache.prepare(ids, enabled=job.cache_prompt)
+        kept, last, how = cache.prepare(ids, enabled=job.cache_prompt)
         job.kept = kept
         drafted0, accepted0 = getattr(npu, "drafted", 0), getattr(npu, "accepted", 0)
         d0 = npu.dispatches
@@ -380,11 +391,15 @@ class Engine:
         try:
             progress(0)
             at = kept
-            for m in cache.marks(ids, kept):  # (the prompt in parts: a checkpoint after each)
+            for m in cache.marks(ids, kept, answer=job.answer_mark):  # (the prompt in parts: a checkpoint after each)
                 npu.prompt(ids[at:m], progress=lambda i, b=at - kept: progress(b + i))
                 at = m
                 cache.checkpoint(ids[:m])
-            logits = npu.forward(ids[at:] + early, progress=lambda i, b=at - kept: progress(b + i))
+            if last is not None and not early:  # (all of it cached: a checkpoint of its end, with its logits)
+                logits = last
+            else:
+                logits = npu.forward(ids[at:] + early, progress=lambda i, b=at - kept: progress(b + i))
+                cache.checkpoint(ids + early, logits)
             forced(early)
             t1 = time.perf_counter()
             d1, t_npu1, t_host1 = npu.dispatches, npu.t_npu, npu.t_host

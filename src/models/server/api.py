@@ -555,9 +555,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         return tail.rstrip().endswith(markers[0])
 
     def job(req: Generation, ids: list[int], *, think: bool, reasoning: bool = False, max_tokens: int | None = None,
-            conv_id: str | None = None, tools: Calls | None = None
+            conv_id: str | None = None, tools: Calls | None = None, answer_mark: bool = False
             ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
-        """A job for the prompt and its queue of events (filled from the worker thread)."""
+        """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
+        ``Job.answer_mark``)."""
         loop, events = asyncio.get_running_loop(), asyncio.Queue()
 
         def emit(kind: str, data: dict[str, Any]) -> None:
@@ -572,7 +573,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 seed=req.seed if req.seed is not None else options.seed, stop=stops(req), reasoning=reasoning,
                 inside=reasoning and inside(ids), think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
-                progress=bool(req.return_progress), conv_id=conv_id, tools=tools)
+                progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark)
         try:
             engine.submit(j)
         except RuntimeError as e:
@@ -744,8 +745,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         ids, think = await render(req.messages, req.chat_template_kwargs, tools=fns)
         fits(ids, api)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
+        # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
+        keeps = template_options(req.chat_template_kwargs)[1] and "preserve_thinking" in info.chat_template
         return job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens, conv_id=conv_id,
-                   tools=calls)
+                   tools=calls, answer_mark=not keeps)
 
     @api.post("/v1/chat/completions")
     @api.post("/chat/completions")

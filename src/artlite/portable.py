@@ -1,5 +1,5 @@
 """The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups, a
-thread's CPU.
+thread's CPU, the memory still available.
 (``gguf_model``'s page hints test for ``mmap.madvise`` themselves.)"""
 
 import contextlib
@@ -86,3 +86,24 @@ def on_cpu(cpu: int) -> Iterator[None]:
         yield
     finally:
         put(0, old)
+
+
+def available_memory() -> int | None:
+    """Bytes of RAM the system can still give processes without swapping (Linux: MemAvailable; Windows: the available
+    physical memory), or None when unknown."""
+    if WINDOWS:
+        import ctypes
+
+        class Status(ctypes.Structure):  # (MEMORYSTATUSEX)
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + \
+                [(name, ctypes.c_ulonglong) for name in ("total", "avail", "total_page", "avail_page", "total_virtual",
+                                                          "avail_virtual", "avail_extended")]
+
+        st = Status()
+        st.length = ctypes.sizeof(st)
+        return int(st.avail) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)) else None
+    try:
+        with open("/proc/meminfo") as f:
+            return next((int(line.split()[1]) * 1024 for line in f if line.startswith("MemAvailable:")), None)
+    except OSError:
+        return None
