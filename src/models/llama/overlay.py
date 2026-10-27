@@ -266,7 +266,8 @@ class LlamaOverlay(ModelOverlay):
         """The attention of layer L, per sub-step (each after the last one's records are in DDR): per column its cache
         range and tail objects (A, patched), the F_ATT object and the sub-step's q and K / V objects (X), the records
         (D, patched) and o (D, into the sub-step's slots of o's input). The weights of the GEMV phases after it go before
-        the sync of its inputs: the A stream keeps streaming them while the attention waits for them."""
+        the sync of its inputs (their first layout block: ``_weight_run``): the A stream keeps streaming them while the
+        attention waits for them."""
         dev, S, T = self.dev, st.S, self.T
         o, sp, nk = self.inp[(L, "o")][0], packed_slots(S), self.nh * self.hd // 8  # (o: the KV head's k blocks)
         for u, (a, n) in enumerate(st.subs):
@@ -276,13 +277,17 @@ class LlamaOverlay(ModelOverlay):
                 st.fills.append((seq.fill("A", c, dev.address("KV", self.kv_off[L]), T), L, c, u))
                 st.tails += [(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t)
                              for t in range(tails(n))]
-            if u == len(st.subs) - 1 and weights:
-                self._weight_run(seq, weights)
+            last = u == len(st.subs) - 1 and weights
+            if last:
+                self._weight_run(seq, weights, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
             if u == 0:
                 seq.sync()  # (the q and K / V objects in DDR)
             for c in range(COLS):  # (its q objects, then its K / V objects: half objects, the second strip SLOTS XB on)
                 reg = self.att_reg[(L, c)] + a * XB
                 seq.fill("X", c, dev.address("ACT", reg), 2 * n * XB, (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
+            if last:
+                self._weight_run(seq, weights, blocks=slice(1, None))
+            for c in range(COLS):
                 for i in range(len(kv.emit_order(p=0, S=n, hd=self.hd, a_bytes=T, kp=self.kp))):
                     hdl = seq.drain("D", c, dev.address("KV", self.kv_off[L]), 2 * self.at.d_len)
                     st.recs.append((hdl, L, c, u, i))

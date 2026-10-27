@@ -473,8 +473,9 @@ class QwenOverlay(ModelOverlay):
                 if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T), L, c, u, t)
                                  for t in range(tails(n))]
-            if u == len(st.subs) - 1 and run:
-                self._weight_run(seq, run)
+            last = u == len(st.subs) - 1 and run
+            if last:
+                self._weight_run(seq, run, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
             if u == 0:
                 seq.sync()  # (attn_in's q, K, V in DDR)
             for c in range(COLS):
@@ -485,6 +486,8 @@ class QwenOverlay(ModelOverlay):
                 else:
                     seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
                 seq.fill("X", c, dev.address("ACT", self.rawkv[L] + a * XB), n * XB)
+            if last:
+                self._weight_run(seq, run, blocks=slice(1, None))
             for c in range(COLS):  # o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's
                 # last column's of the chain's), then the records (addresses: _set_position)
                 role = ash.role(c)

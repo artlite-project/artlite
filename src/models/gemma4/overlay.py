@@ -358,8 +358,8 @@ class GemmaOverlay(ModelOverlay):
         """The attention of layer L, per sub-step (``attn.substeps``; a layer with its own cache: each after the last
         one's records are in DDR): per column its cache range (A, patched), the F_ATT object and the sub-step's q and
         K / V objects (X), the records (D, patched) and o (D, into the sub-step's slots of o's input). The weights of
-        the GEMV phases after it go before the sync of its inputs: the A stream keeps streaming them while the
-        attention waits for them."""
+        the GEMV phases after it go before the sync of its inputs (their first layout block: ``_weight_run``): the A
+        stream keeps streaming them while the attention waits for them."""
         cfg, dev, S, T = self.cfg, self.dev, st.S, self.T
         hd, src, own = cfg.head_dim(L), cfg.kv_source(L), cfg.kv_source(L) == L
         subs = st.subs[0 if cfg.swa[L] else 1]
@@ -372,17 +372,21 @@ class GemmaOverlay(ModelOverlay):
                 if c % AT.QH == AT.QH - 1:  # (one object each: the slots of its records, ``_tails``)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring_off[src]), T), L, c, u, t)
                                  for t in range(AT.tails(n))]
-            if u == len(subs) - 1 and weights:
-                self._weight_run(seq, weights)
+            last = u == len(subs) - 1 and weights
+            if last:
+                self._weight_run(seq, weights, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
             if u == 0:
                 seq.sync()  # (the q and K / V objects in DDR)
             for c in range(COLS):
-                h, j = c // AT.QH, c % AT.QH
-                reg = self.att_reg[(L, h)] + a * XB
+                reg = self.att_reg[(L, c // AT.QH)] + a * XB
                 if own:  # (its q objects, then its K / V objects: half objects, the second strip SLOTS XB on)
                     seq.fill("X", c, dev.address("ACT", reg), 2 * n * XB, (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
                 else:
                     seq.fill("X", c, dev.address("ACT", reg), n * XB)
+            if last:
+                self._weight_run(seq, weights, blocks=slice(1, None))
+            for c in range(COLS):
+                h, j = c // AT.QH, c % AT.QH
                 if j < AT.QH - 1:
                     continue
                 if own:

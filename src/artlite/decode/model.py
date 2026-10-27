@@ -251,14 +251,21 @@ class ModelOverlay:
         return packed_slots(S) if self.op.packed else SLOTS
 
     def _weight_run(self, seq: Sequence, phases: list[tuple[int, str]], *, image: TileImage | None = None,
-                    buf: str = "W") -> None:
+                    buf: str = "W", blocks: slice = slice(None)) -> None:
         """The A fills of consecutive GEMV phases of a column-major image (default: the model's, in W): per column one
-        run of it (their norm-weight data regions and tiles; one per layout block, ``TileImage.runs``)."""
+        run of it (their norm-weight data regions and tiles; one per layout block, ``TileImage.runs``; ``blocks``: of
+        these runs only those).
+
+        After an attention's cache fills a run's first block goes before the sync of the attention's inputs (A keeps
+        streaming it while the attention waits for them), its later ones after the attention's X objects: a column's
+        cache range and two tail objects hold three of A's 4 queued tasks, and a fifth task waits for the oldest, the
+        cache's, which the core consumes only with those X objects (once the range outgrows the buffers on its way: a
+        hang)."""
         img = image or self.image
         first = phases[0]
         norm = (first[0], first[1] + "_norm")
         r0 = img.region(*norm) if norm in img._index else img.region(*first)
-        for r, n in img.runs(r0, img.region(*phases[-1])):
+        for r, n in img.runs(r0, img.region(*phases[-1]))[blocks]:
             for c in range(COLS):
                 seq.fill("A", c, self.dev.address(buf, r.offset + c * r.col_stride), n)
 
