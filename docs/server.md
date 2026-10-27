@@ -42,9 +42,11 @@ arguments) with `finish_reason: tool_calls`; the results go back as `role: tool`
 MiniCPM-V 4.7 and Occamy (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 have them; a template without tools (Llama
 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt, nothing is
 parsed), `required` and a named function (the answer begins with the call, after the model's thought; a named
-function's call is the only one), and `parallel_tool_calls: false` ends the answer after its first call. Calls are
-not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema allows
-no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
+function's call is the only one), and `parallel_tool_calls: false` ends the answer after its first call. A call's
+name is always one of the request's functions: while the model writes it, only the tokens that spell one can come
+(with `required` where no function fits, the model calls the closest one instead of inventing a name). The arguments
+are not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema
+allows no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
 
 ## Web chat
 
@@ -59,9 +61,12 @@ retries. A model's requests run one at a time, in arrival order; a waiting strea
 button and the shutdown stop a request at its next token or prompt chunk.
 
 A chat's next turn continues from the KV cache: the server keeps the prefix a prompt shares with the cached tokens,
-rounded down to where a prefill chunk can start, and runs the rest. Qwen3.5 / 3.6 keep only a prompt that extends the
-cached tokens exactly (their Gated DeltaNet states cannot go back), so a thinking chat, whose template drops the old
-thoughts, runs whole every turn. A request's `cache_prompt: false` starts from an empty cache.
+rounded down to where a prefill chunk can start, and runs the rest. The Qwen models keep only a prompt that extends the
+cached tokens exactly (their Gated DeltaNet states cannot go back). The earlier answers keep their thoughts in the
+prompt, as llama-server does (`--reasoning-preserve`, on by default, where the template can: Qwen3.6 / 3.8, Occamy,
+Gemma 4), so a turn extends the last one when the client sends the thoughts back (`reasoning_content`, as the web UI
+does); Qwen3.5's and MiniCPM-V's templates drop them, so a thinking chat there runs whole every turn. A request's
+`cache_prompt: false` starts from an empty cache.
 
 ## Several models (router mode)
 
@@ -160,7 +165,8 @@ Generation:
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
 | `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |
-| `--chat-template-kwargs JSON` | chat template variables, under each request's own |
+| `--reasoning-preserve`, `--no-reasoning-preserve` | earlier answers keep their thoughts in the prompt where the template can (the templates' `preserve_thinking`; default on); a request's `chat_template_kwargs.preserve_reasoning` (or `preserve_thinking`) overrides it |
+| `--chat-template-kwargs JSON` | chat template variables, under each request's own (`enable_thinking`, `preserve_reasoning`) |
 
 NPU:
 

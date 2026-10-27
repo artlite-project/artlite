@@ -45,7 +45,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Model, OverlayModel, Penalties, Sampling, max_prob
+from ..common import Mask, Model, OverlayModel, Penalties, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
@@ -305,19 +305,19 @@ class NpuQwen(OverlayModel):
         self.drafted += len(out)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Seq[int] = ()
-                 ) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Seq[int] = (),
+                 mask: Mask | None = None) -> Iterator[int]:
         """With the drafter: multi-token prediction. The sampled token's step takes the drafts along (``draft``:
         greedy, without penalties); the model's logits after a token give its own next token (sampled), and as long
         as that is the draft that ran behind it, the draft's logits are valid too. The step commits no GDN state:
         the next one replays the accepted tokens (``QwenOverlay.accept``); the rejected drafts' positions are
         forgotten (later steps overwrite their cache records)."""
         if not self._drafting:
-            yield from super().generate(logits, max_tokens, sampling, prompt)
+            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
             return
         if max_tokens == 0:
             return
-        penalties = Penalties(sampling, prompt)
+        penalties = Penalties(sampling, prompt, mask)
         token = sampling.pick(*penalties.top(logits, sampling.k))
         penalties.accept(token)
         n = 1
@@ -381,8 +381,8 @@ class Qwen(Model):
         return self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int] | Sequence:
-        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools)
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int] | Sequence:
+        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve)
         images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
                   if isinstance(p, dict) and p.get("type") == "image"]
         if not images:

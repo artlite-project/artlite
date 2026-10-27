@@ -110,7 +110,7 @@ class Llama(Model):
         return [self.tokenizer.special[BOS]] + self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int]:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
         return self.tokenizer.encode(chat_prompt(self.gguf, messages, tools=tools))
 
     def sampling(self, *, think: bool = False) -> Sampling:

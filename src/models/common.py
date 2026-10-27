@@ -100,17 +100,31 @@ def max_prob(logits: LogitsLike) -> tuple[int, float]:
     return _native.max_prob(logits)
 
 
+class Mask(Protocol):
+    """A constraint on a generation's tokens (a tool call's name: ``server.tools.NameMask``)."""
+
+    def allowed(self) -> np.ndarray | None:
+        """The tokens the next one may be (sorted ids), or None: any."""
+        ...
+
+    def accept(self, token: int) -> None:
+        """The sequence's next token."""
+        ...
+
+
 class Penalties:
     """llama.cpp's penalties sampler over a generation: the tokens among the last ``repeat_last_n`` of the prompt
     (``prompt``: its ids; an image's rows, negative, are none) and of the generated ones (``accept``) have their logits
     divided by ``repeat_penalty`` (multiplied when <= 0), less ``presence_penalty`` and ``frequency_penalty`` times
-    their count. Nothing when the sampling has no penalties (``Sampling.penalized``)."""
+    their count. Nothing when the sampling has no penalties (``Sampling.penalized``). ``mask``: the candidates are only
+    the tokens it allows (it follows the accepted tokens too)."""
 
-    def __init__(self, sampling: Sampling, prompt: Sequence[int] = ()):
+    def __init__(self, sampling: Sampling, prompt: Sequence[int] = (), mask: Mask | None = None):
         self.sampling = sampling
         self.n = sampling.repeat_last_n if sampling.penalized else 0
         self.last: collections.deque[int] = collections.deque()
         self.counts: collections.Counter[int] = collections.Counter()
+        self.mask: Mask | None = None
         tail: list[int] = []
         for t in reversed(getattr(prompt, "ids", prompt)):
             if len(tail) == self.n:
@@ -119,19 +133,22 @@ class Penalties:
                 tail.append(int(t))
         for t in reversed(tail):
             self.accept(t)
+        self.mask = mask
 
     @property
     def active(self) -> bool:
         return self.n > 0
 
     def copy(self) -> "Penalties":
-        """Another window of the same tokens (a draft's)."""
+        """Another window of the same tokens (a draft's: without the mask)."""
         out = copy.copy(self)
-        out.last, out.counts = self.last.copy(), self.counts.copy()
+        out.last, out.counts, out.mask = self.last.copy(), self.counts.copy(), None
         return out
 
     def accept(self, token: int) -> None:
         """The sequence's next token."""
+        if self.mask is not None:
+            self.mask.accept(token)
         if not self.n:
             return
         self.last.append(token)
@@ -147,13 +164,32 @@ class Penalties:
         """The ``k`` largest penalized logits (fp32, descending) and their token ids, of a token's logits (vocab,), fp32
         or the overlay's bf16 (``top_logits``; ``cap``: the model's soft cap); ``rows``, ``where``: the token of each
         logit and the logit of each token (logits in another order: a drafter's). The candidates: the recent tokens
-        and the ``k`` largest logits of the others."""
+        and the ``k`` largest logits of the others; with the mask, the tokens it allows (logits in the vocabulary's
+        order)."""
+        allowed = self.mask.allowed() if self.mask is not None else None
+        if allowed is not None:
+            return self._top_of(logits, k, cap, allowed)
         if not self.counts:
             return top_logits(logits, k, cap, rows=rows)
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
         s, count = self.sampling, np.fromiter(self.counts.values(), np.float32, len(ids))
         return _native.top_logits(logits, k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, rows)
+
+    def _top_of(self, logits: LogitsLike, k: int, cap: float, allowed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The ``k`` largest penalized logits of the ``allowed`` tokens (sorted ids) and their ids."""
+        sub = logits[torch.from_numpy(allowed.astype(np.int64))] if isinstance(logits, torch.Tensor) else \
+            logits[allowed]
+        k = min(k, len(allowed))
+        if not self.counts:
+            return top_logits(sub, k, cap, rows=allowed)
+        ids = np.fromiter(self.counts, np.int32, len(self.counts))
+        count = np.fromiter(self.counts.values(), np.float32, len(ids))
+        at = np.minimum(np.searchsorted(allowed, ids), len(allowed) - 1)
+        hit = allowed[at] == ids
+        s = self.sampling
+        return _native.top_logits(sub, k, cap, at[hit].astype(np.int32), count[hit], s.repeat_penalty,
+                                  s.presence_penalty, s.frequency_penalty, allowed)
 
 
 def auto_capacity(tokens: int) -> int:
@@ -266,24 +302,24 @@ class Tokenizer(Detokenizer, Protocol):
 
 class StreamDecoder:
     """Incremental detokenizer: ``feed`` returns the text completed by a token (a multi-byte character split over
-    byte tokens appears once its last byte arrives)."""
+    byte tokens appears once its last byte arrives; ``pending``: its bytes so far)."""
 
     def __init__(self, tokenizer: Detokenizer, *, special: bool = False):
         self.tokenizer = tokenizer
         self.special = special
-        self._pending = b""
+        self.pending = b""
 
     def feed(self, token: int) -> str:
-        data = self._pending + self.tokenizer.decode_bytes([token], special=self.special)
+        data = self.pending + self.tokenizer.decode_bytes([token], special=self.special)
         try:
             text = data.decode("utf-8")
-            self._pending = b""
+            self.pending = b""
         except UnicodeDecodeError as e:
             text = data[:e.start].decode("utf-8", errors="replace")
-            self._pending = data[e.start:]
-            if len(self._pending) > 4:  # not an incomplete character: invalid bytes
-                text += self._pending.decode("utf-8", errors="replace")
-                self._pending = b""
+            self.pending = data[e.start:]
+            if len(self.pending) > 4:  # not an incomplete character: invalid bytes
+                text += self.pending.decode("utf-8", errors="replace")
+                self.pending = b""
         return text
 
 
@@ -335,14 +371,14 @@ class NpuModel:
         logits = self.step(token)
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = ()
-                 ) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
+                 mask: Mask | None = None) -> Iterator[int]:
         """Sample up to ``max_tokens`` tokens (< 0: no limit) after the cached positions; ``logits``: of the last
-        cached one; ``prompt``: the prompt's tokens (the penalties' first). Ends after an end-of-sequence token or when
-        the cache is full."""
+        cached one; ``prompt``: the prompt's tokens (the penalties' first); ``mask``: the tokens each may be (told
+        each token as it is sampled). Ends after an end-of-sequence token or when the cache is full."""
         if max_tokens == 0:
             return
-        penalties = Penalties(sampling, prompt)
+        penalties = Penalties(sampling, prompt, mask)
         token = sampling.pick(*penalties.top(logits, sampling.k))
         penalties.accept(token)
         n = 1
@@ -528,10 +564,11 @@ class Model:
         raise NotImplementedError
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int]:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
         """Token ids of a conversation through the chat template, up to the assistant's turn (``think``: let it
         think first; otherwise an empty thought where the template has one; ``tools``: the functions it may call,
-        ``chat_template``). A message's content may be a list of parts: ``{"type": "text", "text": ...}``,
+        ``chat_template``; ``preserve``: the earlier answers keep their thoughts, the template's ``preserve_thinking``,
+        where it has one). A message's content may be a list of parts: ``{"type": "text", "text": ...}``,
         ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model with ``vision``: its prompt then a
         sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError

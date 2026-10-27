@@ -36,7 +36,7 @@ from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
-from ..common import Model, OverlayModel, Penalties, Sampling
+from ..common import Mask, Model, OverlayModel, Penalties, Sampling
 from .draft import GemmaDraft, output_norm
 from .host import GemmaHost
 from .overlay import GemmaOverlay
@@ -201,18 +201,18 @@ class NpuGemma(OverlayModel):
         self.drafted += len(out)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = ()
-                 ) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
+                 mask: Mask | None = None) -> Iterator[int]:
         """With the drafter: multi-token prediction. The sampled token's dispatch takes up to ``DRAFTS`` draft tokens
         along; the model's logits after a token give its own next token (sampled), and as long as that is the draft that
         ran behind it, the draft's logits are valid too. The rejected drafts' positions are forgotten (the next steps
         overwrite their cache records)."""
         if self.drafter is None:
-            yield from super().generate(logits, max_tokens, sampling, prompt)
+            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
             return
         if max_tokens == 0:
             return
-        penalties = Penalties(sampling, prompt)
+        penalties = Penalties(sampling, prompt, mask)
         token = sampling.pick(*penalties.top(logits, sampling.k))
         penalties.accept(token)
         h = self.hidden_state()
@@ -256,8 +256,9 @@ class Gemma(Model):
         return self.tokenizer.encode(text, add_bos=True)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int]:
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools))
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
+        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools,
+                                                 preserve_thinking=preserve))
 
     def sampling(self, *, think: bool = False) -> Sampling:
         return Sampling(temp=1.0, top_k=64, top_p=0.95)  # (the model card's)

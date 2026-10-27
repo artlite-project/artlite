@@ -106,6 +106,10 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                           "request's chat_template_kwargs.enable_thinking overrides it")
     gen.add_argument("--reasoning-format", choices=("auto", "deepseek", "none"), default="auto",
                      help="thoughts in reasoning_content (auto, deepseek) or in content (none) (default: auto)")
+    gen.add_argument("--reasoning-preserve", action=argparse.BooleanOptionalAction, default=True,
+                     help="earlier answers keep their thoughts in the prompt where the chat template can (Qwen3.6, "
+                          "Gemma 4): every turn extends the cached tokens (default: on); a request's "
+                          "chat_template_kwargs.preserve_reasoning overrides it")
     gen.add_argument("--chat-template-kwargs", type=json.loads, default={},
                      help="chat template variables as a JSON object, under each request's (enable_thinking)")
     vis = p.add_argument_group("images (MiniCPM-V 4.7)")
@@ -298,7 +302,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     options = Options(alias=args.alias or name, n_ctx=n_ctx, api_keys=keys, n_predict=args.n_predict, temp=args.temp,
                       top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, **penalties, seed=args.seed,
                       reasoning=args.reasoning, reasoning_format="none" if args.reasoning_format == "none" else "auto",
-                      chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
+                      preserve_reasoning=args.reasoning_preserve, chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
                       sse_ping_interval=args.sse_ping_interval, slots=args.slots,
                       cors_origins=[o.strip() for o in args.cors_origins.split(",") if o.strip()],
                       build_info=build_info())

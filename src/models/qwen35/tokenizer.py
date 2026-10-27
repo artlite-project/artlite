@@ -49,9 +49,10 @@ class QwenTokenizer:
 
 
 def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thinking: bool = False,
-                tools: list[dict[str, object]] | None = None) -> str:
+                tools: list[dict[str, object]] | None = None, preserve_thinking: bool = False) -> str:
     """The prompt text of a conversation, rendered with the file's ``tokenizer.chat_template``, up to the
     assistant's turn: ``<|im_start|>assistant\\n<think>\\n`` (thinking), or with an empty thought
-    ``<think>\\n\\n</think>\\n\\n``; ``tools``: the functions the model may call."""
+    ``<think>\\n\\n</think>\\n\\n``; ``tools``: the functions the model may call; ``preserve_thinking``: the
+    answers before the last user message keep their thoughts (Qwen3.6's template and later; Qwen3.5's drops them)."""
     return chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
-                         enable_thinking=enable_thinking)
+                         enable_thinking=enable_thinking, preserve_thinking=preserve_thinking)

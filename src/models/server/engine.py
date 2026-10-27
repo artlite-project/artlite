@@ -1,7 +1,8 @@
 """The server's NPU side: one worker thread owns the model and runs the requests' generations one at a time, in
 arrival order (``Engine``); the prompt cache across requests; the generated text's stop strings (``StopMatcher``), its
-split into thoughts and answer (``ReasoningSplitter``) and the answer's tool calls (``tools.Parser``); the timings of a
-generation as llama-server reports them."""
+split into thoughts and answer (``ReasoningSplitter``) and the answer's tool calls (``tools.Parser``; their names kept
+the functions' by ``tools.NameMask`` as the tokens are sampled); the timings of a generation as llama-server reports
+them."""
 
 import collections
 import concurrent.futures
@@ -361,12 +362,19 @@ class Engine:
         thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
         early = model.tokenizer.encode(force) if force and not thought else []
         late = (tools.syntax.gap if job.inside else "") + force if force and thought else ""
-        job.state = "prompt"
+        mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
         gen: list[int] = []
+
+        def forced(tokens: list[int]) -> None:
+            gen.extend(tokens)
+            for t in tokens if mask is not None else ():
+                mask.accept(t)
+
+        job.state = "prompt"
         try:
             progress(0)
             logits = npu.forward(ids[kept:] + early, progress=progress)
-            gen += early
+            forced(early)
             t1 = time.perf_counter()
             d1, t_npu1, t_host1 = npu.dispatches, npu.t_npu, npu.t_host
             job.state = "generating"
@@ -395,7 +403,7 @@ class Engine:
             finish = "length"
             while True:
                 left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-                for token in npu.generate(logits, left, job.sampling, ids + gen):
+                for token in npu.generate(logits, left, job.sampling, ids + gen, mask):
                     gen.append(token)
                     job.n_gen = len(gen)
                     if token in model.eos_token_ids:
@@ -417,9 +425,9 @@ class Engine:
                 if not forcing or finish == "stop":
                     break
                 n = npu.rewind(npu.position)  # (the generation stopped where the next request would continue)
-                forced = model.tokenizer.encode(late)
-                logits = npu.forward((ids + gen)[n:] + forced)
-                gen += forced
+                opener = model.tokenizer.encode(late)
+                logits = npu.forward((ids + gen)[n:] + opener)
+                forced(opener)
                 send(parse(late))
                 late = ""
             if stop.word is None:

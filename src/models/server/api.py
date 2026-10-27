@@ -29,7 +29,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, Sampling, chat_template
 from .engine import Engine, Job
-from .tools import Calls, ToolCall, call_arguments, functions, syntax_of
+from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
 
 log = logging.getLogger("artlite.server")
 
@@ -72,6 +72,7 @@ class Options:
     seed: int = -1  # a request's default seed (< 0: random)
     reasoning: str = "off"  # think: on, off, auto (when the model can)
     reasoning_format: str = "auto"  # auto: thoughts in reasoning_content; none: in content
+    preserve_reasoning: bool = True  # earlier answers keep their thoughts (the templates' preserve_thinking)
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)  # under each request's
     cache_prompt: bool = True
     sse_ping_interval: float = 30.0  # seconds between pings while a stream waits (<= 0: none)
@@ -345,6 +346,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     warned: set[tuple[str, str]] = set()
     syntax = syntax_of(info.chat_template)  # (the template's tool calls, None: it takes no tools)
     typed = takes_parts(info.chat_template)
+    vocab: list[Vocabulary] = []  # (the model's tokens for the calls' names: built on the first request with tools)
+    vocab_lock = asyncio.Lock()
 
     async def loaded() -> None:
         if not engine.ready:
@@ -449,28 +452,37 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             raise bad_request("no messages")
         return out
 
-    def thinking(kwargs: dict[str, Any] | None) -> bool:
+    def template_options(kwargs: dict[str, Any] | None) -> tuple[bool, bool]:
+        """Whether the model thinks (``enable_thinking``) and the earlier answers keep their thoughts
+        (``preserve_reasoning``, llama-server's, or the templates' own ``preserve_thinking``), of a request's
+        ``chat_template_kwargs`` over the server's."""
         kw = {**options.chat_template_kwargs, **(kwargs or {})}
-        for k in kw.keys() - {"enable_thinking"}:
+        for k in kw.keys() - {"enable_thinking", "preserve_reasoning", "preserve_thinking"}:
             if ("chat_template_kwargs", k) not in warned:
                 warned.add(("chat_template_kwargs", k))
                 log.info("chat_template_kwargs.%s is not supported: ignored", k)
         think = bool(kw["enable_thinking"]) if "enable_thinking" in kw else default_think()
-        return think and engine.model.thinks
+        given = next((d[k] for d in (kwargs or {}, options.chat_template_kwargs)
+                      for k in ("preserve_thinking", "preserve_reasoning") if k in d), None)
+        preserve = options.preserve_reasoning if given is None else bool(given)
+        return think and engine.model.thinks, preserve
 
     async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, media: bool = False,
                      tools: list[dict[str, Any]] | None = None) -> tuple[list[int], bool]:
         """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
         engine's worker between its jobs; ``media``: images as text, ``messages_of``; ``tools``: the functions the
         model may call), and whether the model thinks."""
-        think = thinking(kwargs)
+        think, preserve = template_options(kwargs)
         msgs = messages_of(messages, media=media)
         tools = tools or None
+
+        def chat() -> list[int]:
+            return engine.model.chat(msgs, think=think, tools=tools, preserve=preserve)
+
         try:
             if any(p.get("type") == "image" for m in msgs if isinstance(m["content"], list) for p in m["content"]):
-                return await asyncio.wrap_future(engine.run(lambda: engine.model.chat(msgs, think=think, tools=tools))
-                                                 ), think
-            return await run_in_threadpool(engine.model.chat, msgs, think=think, tools=tools), think
+                return await asyncio.wrap_future(engine.run(chat)), think
+            return await run_in_threadpool(chat), think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
         except (OSError, ValueError) as e:  # (an image that does not open, or does not fit the prompt)
@@ -596,6 +608,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         parallel = req.parallel_tool_calls is not False and name is None  # (a named function: that call alone)
         return fns, Calls(syntax, fns, parallel=parallel, force=force)
 
+    async def vocabulary() -> Vocabulary | None:
+        """The model's tokens by their text (``tools.Vocabulary``: a few tenths of a second, in a thread, once), or
+        None without the vocabulary's size."""
+        async with vocab_lock:
+            if not vocab and info.n_vocab:
+                vocab.append(await run_in_threadpool(Vocabulary, engine.model.tokenizer, info.n_vocab))
+        return vocab[0] if vocab else None
+
     def ping_of(req: Generation) -> float:
         return options.sse_ping_interval if req.sse_ping_interval is None else req.sse_ping_interval
 
@@ -626,7 +646,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 "ui": options.ui is not None, "ui_settings": {},
                 "chat_template": info.chat_template, "bos_token": info.bos_token, "eos_token": info.eos_token,
                 "chat_template_caps": {"supports_tools": syntax is not None, "supports_tool_calls": syntax is not None,
-                                       "supports_parallel_tool_calls": syntax is not None},
+                                       "supports_parallel_tool_calls": syntax is not None,
+                                       "supports_preserve_reasoning": "preserve_thinking" in info.chat_template},
                 "build_info": options.build_info, "is_sleeping": False, "cors_proxy_enabled": False}
 
     @listed.get("/v1/models")
@@ -670,6 +691,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         if req.continue_final_message:
             raise bad_request("continue_final_message is not supported")
         fns, calls = calls_of(req)
+        if calls is not None:
+            calls = dataclasses.replace(calls, vocab=await vocabulary())
         ids, think = await render(req.messages, req.chat_template_kwargs, tools=fns)
         fits(ids)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"

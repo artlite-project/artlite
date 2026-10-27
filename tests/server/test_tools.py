@@ -1,16 +1,31 @@
 """The tool-call syntaxes of ``models.server.tools`` on the host: llama.cpp's test vectors (``tests/test-chat.cpp``)
 for each syntax, each output fed whole, in pieces of 3 characters and one character at a time (the content and the
-arguments' fragments join to the same result); detection from the templates of the model files; requests' functions
-and call arguments."""
+arguments' fragments join to the same result); where a call's name is written (``Parser.naming``) and the mask that
+keeps it a function's, over a vocabulary and as random walks over the model files' tokenizers; detection from the
+templates of the model files, their thoughts kept or dropped; requests' functions and call arguments."""
 
 import json
 import os
+import random
 
+import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
-from models.server.tools import GEMMA4, LLAMA3, QWEN_XML, Syntax, ToolCall, call_arguments, functions, syntax_of, typed
+from models.server.tools import (
+    GEMMA4,
+    LLAMA3,
+    QWEN_XML,
+    NameMask,
+    Syntax,
+    ToolCall,
+    Vocabulary,
+    call_arguments,
+    functions,
+    syntax_of,
+    typed,
+)
 
 
 def tool(name: str, props: dict[str, object] | None = None) -> dict[str, object]:
@@ -209,6 +224,131 @@ def test_openers() -> None:
         check(syntax, syntax.opener(name) + rest, "", [("get_time", {"city": "Oslo"})])
 
 
+def namings(syntax: Syntax, text: str) -> set[str]:
+    """What ``naming`` says after each character of a text."""
+    p = syntax.parser(TOOLS)
+    out = set()
+    for c in text:
+        p.parts([("content", c)])
+        if (w := p.naming()) is not None:
+            out.add(w)
+    return out
+
+
+def heads(head: str) -> set[str]:
+    return {head[:k] for k in range(len(head))}
+
+
+def test_naming() -> None:
+    """A call's name is written after its marker until the name's end; not in content, in arguments or in a value that
+    holds a call's text."""
+    q = qwen_call("python", code="<tool_call>\n<function=x>")
+    assert namings(QWEN_XML, "Hi " + q + "\n" + qwen_call("get_time")) == \
+        heads("\n<function=python>") | heads("\n<function=get_time>")
+    g = '<|tool_call>call:get_time{city:<|"|><|tool_call>call:x{<|"|>}<tool_call|>'
+    assert namings(GEMMA4, "Hi " + g + g) == heads("call:get_time{")
+    j = '{"name": "get_time", "parameters": {"name": "x", "o": {"name": "y"}}}; ' \
+        '{"type": "function", "name": "get_weather", "parameters": {}}'
+    assert namings(LLAMA3, j) == heads('get_time"') | heads('get_weather"')
+    assert namings(LLAMA3, 'The {"name": "x"} object') == set()
+
+
+class Pieces:
+    """A detokenizer of given pieces (an empty one: a control token)."""
+
+    def __init__(self, pieces: list[bytes]):
+        self.pieces = pieces
+
+    def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
+        return b"".join(self.pieces[i] for i in ids)
+
+
+def test_vocabulary() -> None:
+    """The tokens that may come where a text must follow: its parts from its start, it and more (bytes up to 0xff)."""
+    pieces = [b"", b"a", b"ab", b"ab>", b"ab>\n", b"abc", b"b", b">", b"a\xff", b"a\xff\xff", b"b\x00", b"ab"]
+    v = Vocabulary(Pieces(pieces), len(pieces))
+    fit = lambda text: sorted(pieces[i] for g in v.fitting(text) for i in g)
+    assert fit(b"ab>") == [b"a", b"ab", b"ab", b"ab>", b"ab>\n"]
+    assert fit(b"a\xff") == [b"a", b"a\xff", b"a\xff\xff"] and fit(b"zz") == [] and fit(b">") == [b">"]
+
+
+def test_name_mask() -> None:
+    """The mask over a vocabulary: a name the model writes token by token stays a function's (one that begins
+    another's too), the head's end comes with what follows it; elsewhere nothing is masked."""
+    pieces = [b"", b"<tool_call>", b"\n", b"<", b"function", b"=get", b"_time", b"_t", b">", b">\n", b"x", b"=x",
+              b"\n<function=python>", b"ime"]
+    fns = functions([tool("get"), tool("get_time"), tool("python")])
+    mask = NameMask(QWEN_XML.parser(fns), Pieces(pieces), Vocabulary(Pieces(pieces), len(pieces)))
+    ids = {p: i for i, p in enumerate(pieces)}
+    allowed = lambda: None if (a := mask.allowed()) is None else sorted(pieces[i] for i in a)
+    assert allowed() is None
+    mask.accept(ids[b"x"])
+    assert allowed() is None
+    mask.accept(ids[b"<tool_call>"])
+    assert allowed() == [b"\n", b"\n<function=python>"]
+    for p in (b"\n", b"<", b"function"):
+        mask.accept(ids[p])
+    assert allowed() == [b"=get"]
+    mask.accept(ids[b"=get"])
+    assert allowed() == [b">", b">\n", b"_t", b"_time"]
+    mask.accept(ids[b"_t"])
+    assert allowed() == [b"ime"]
+    mask.accept(ids[b"ime"])
+    mask.accept(ids[b">\n"])
+    assert allowed() is None and mask.parser.state == "args"
+
+
+WALKS = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML, "<tool_call>"),
+         "gemma": (gemma_gguf, GEMMA4, "<|tool_call>"),
+         "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3, '{"name": "')}  # (the text after which a name's head comes)
+
+
+def tokenizer_of(family: str, path: str) -> object:
+    if family == "qwen":
+        from models.qwen35.tokenizer import QwenTokenizer
+        return QwenTokenizer(GGUFFile(path))
+    if family == "gemma":
+        from models.gemma4.tokenizer import GemmaTokenizer
+        return GemmaTokenizer(GGUFFile(path))
+    from models.llama.tokenizer import load_tokenizer
+    return load_tokenizer(path)
+
+
+@pytest.mark.parametrize("family", WALKS)
+def test_name_mask_walks(family: str) -> None:
+    """Walks over a model file's vocabulary, from the call's marker (the model wrote it) or the forced opener, each
+    token one of those allowed until the mask ends: random ones end in a function's head, and each function's head
+    can be written (a walk towards it: the longest allowed token that it begins with or that begins it)."""
+    path, syntax, marker = WALKS[family][0](), WALKS[family][1], WALKS[family][2]
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not here")
+    tok = tokenizer_of(family, path)
+    vocab = Vocabulary(tok, GGUFFile(path).string_count("tokenizer.ggml.tokens"))
+    fns = functions([tool("get"), tool("get_time"), tool("get_weather_2"), tool("python")])
+    rng = random.Random(0)
+    targets = syntax.parser(fns).heads()
+    for walk in range(40 + 2 * len(targets)):
+        target = targets[walk // 2 % len(targets)] if walk < 2 * len(targets) else None
+        mask = NameMask(syntax.parser(fns), tok, vocab)
+        start = marker if walk % 2 else syntax.opener()
+        for t in tok.encode(start):
+            mask.accept(t)
+        text = start
+        while (a := mask.allowed()) is not None:
+            assert len(a) and np.all(np.diff(a) > 0)
+            if target is None:
+                t = int(a[rng.randrange(len(a))])
+            else:
+                rest = target[len(text) - text.index(marker) - len(marker):]
+                t = max((int(i) for i in a if (s := tok.decode_bytes([int(i)]).decode()) and
+                         (rest.startswith(s) or s.startswith(rest))), key=lambda i: len(tok.decode_bytes([i])))
+            text += tok.decode_bytes([t]).decode("utf-8", errors="replace")
+            mask.accept(t)
+        after = text[text.index(marker) + len(marker):]
+        head = next((h for h in sorted(targets, key=len, reverse=True) if after.startswith(h)), None)
+        assert head is not None and head == (target or head), f"walk {walk}: {text!r}"
+
+
 def test_detection() -> None:
     """The three syntaxes from templates like the model files' (their marker lines), none from a template without
     tools."""
@@ -244,7 +384,9 @@ FILES = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML), "minicpmv":
 
 @pytest.mark.parametrize("family", FILES)
 def test_model_templates(family: str) -> None:
-    """The model files' templates: their syntax, and a call with its result rendered as the model writes it."""
+    """The model files' templates: their syntax, a call with its result rendered as the model writes it, and the
+    call's thought before a later user message kept with preserve_thinking (Qwen3.6's and Gemma's templates; MiniCPM-V's
+    drops it)."""
     path, syntax = FILES[family][0](), FILES[family][1]
     if not os.path.exists(path):
         pytest.skip(f"{path}: not here")
@@ -275,3 +417,8 @@ def test_model_templates(family: str) -> None:
         assert "<tool_call>\n<function=get_time>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>" in text
         assert '"name": "get_time"' in text
     assert "09:30" in text
+    if family != "llama":
+        later = [msgs[0], {**msgs[1], "reasoning_content": "Oslo's clock."}, msgs[2], {"role": "assistant",
+                 "content": "09:30."}, {"role": "user", "content": "And Rome?"}]
+        kept = [("Oslo's clock." in chat_prompt(g, later, tools=fns, preserve_thinking=p)) for p in (False, True)]
+        assert kept == [False, family != "minicpmv"]

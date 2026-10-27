@@ -7,7 +7,7 @@
 
 Modules: ``main`` (the command line, uvicorn, the shutdown), ``api`` (the FastAPI routes, server-sent events, API
 keys), ``engine`` (the NPU worker, the prompt cache, stop strings, the reasoning split, timings), ``tools`` (tool
-calls: a template's syntax, the parsers of generated calls), ``ui`` (llama.cpp's
+calls: a template's syntax, the parsers of generated calls, the mask of their names), ``ui`` (llama.cpp's
 prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml authors); router mode: ``router`` (a
 model server process per model, loads and unloads, the proxy), ``child`` (a model server under the router),
 ``catalog`` (the directory's models, their ids, presets).
@@ -23,9 +23,10 @@ runs in a thread of the event loop's pool.
 
 The prompt cache: the KV caches keep the tokens of the last request (its prompt and the generated tokens that ran).
 The next request keeps the prefix its prompt shares with them - rounded down to the prefill's cache group, where a
-chunk can start (``NpuModel.rewind``) - and runs the rest: a chat's next turn runs only its new messages. Qwen3.5 /
-3.6 keeps only an exact continuation (its Gated DeltaNet states cannot go back): with thinking, whose old thoughts
-the template drops, each turn runs its whole prompt again. ``cache_prompt: false`` starts from an empty cache.
+chunk can start (``NpuModel.rewind``) - and runs the rest: a chat's next turn runs only its new messages. Qwen keeps
+only an exact continuation (its Gated DeltaNet states cannot go back), so the earlier answers keep their thoughts
+(``--reasoning-preserve``: the templates' ``preserve_thinking``, Qwen3.6's and Gemma 4's; Qwen3.5's template drops them
+and each thinking turn runs its whole prompt again). ``cache_prompt: false`` starts from an empty cache.
 
 Cancelling: a client that goes away, the UI's Stop (``DELETE /v1/stream?conv_id=``, matched by the chat request's
 ``X-Conversation-Id``) and the shutdown stop the request at its next token or prompt chunk; a dispatch is never
@@ -36,6 +37,7 @@ The API (llama-server's shapes): ``/v1/chat/completions`` (streamed or not, ``re
 ``/health``, ``/slots``, ``/tokenize``, ``/detokenize``, ``/apply-template``. Sampling is the model's (penalties,
 temperature, top-k, top-p, min-p); the sampler fields the NPU path does not have (DRY, XTC, typical-p, mirostat, ...)
 are accepted and ignored, logged when not neutral. Tool calls: ``tools`` (the template's syntax and the parsers of
-the generated calls); the engine parses them after the thoughts. Not provided: embeddings, reranking, infill, the
-Responses and Anthropic APIs, ``/metrics``, LoRA, resumable streams.
+the generated calls); the engine parses them after the thoughts, and their names are masked to the functions' as the
+tokens are sampled. Not provided: embeddings, reranking, infill, the Responses and Anthropic APIs, ``/metrics``, LoRA,
+resumable streams.
 """

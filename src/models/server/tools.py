@@ -14,17 +14,27 @@ A Qwen parameter's value is the text up to ``</parameter>`` (one newline after t
 are the syntax's): a string where the function's schema allows only strings, streamed as it comes; otherwise JSON when
 it parses to a type the schema allows, else the text (llama.cpp's rule), a Python literal where the schema allows no
 string (Qwen writes True and False). A Gemma or Llama call goes out whole at its end, its arguments typed the same way
-(``typed``). A call that does not parse is content."""
+(``typed``). A call that does not parse is content.
+
+A call's name is one of the request's functions: while the model writes it, the sampling's candidates are the tokens
+that continue the text towards one of them (``NameMask``, over the tokens by their text: ``Vocabulary``), as
+llama.cpp's grammars constrain it. Without it a model invents names (``tool_choice`` required where no function fits:
+``tool_call``, ``none``). The arguments are not constrained."""
 
 from __future__ import annotations
 
 import ast
+import bisect
 import json
 import re
 import secrets
 import string
 from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
+
+from ..common import Detokenizer, StreamDecoder
 
 ALNUM = string.ascii_letters + string.digits
 
@@ -147,7 +157,10 @@ class Parser:
     """A generation's text split into content and tool calls as it streams: ``parts`` passes the reasoning parts and
     parses the content parts; ``flush`` at the end. ``calls``: the calls complete so far; ``calling``: a call has
     begun; ``done``: the generation ends (a call is complete and ``parallel`` is off: what follows is dropped).
-    Subclasses parse ``_feed`` / ``_flush``."""
+    Subclasses parse ``_feed`` / ``_flush`` and say where a call's name is written (``naming``): ``NAME_HEAD``, the
+    name, then ``NAME_END``, a name having none of ``NAME_BAD``."""
+
+    NAME_HEAD, NAME_END, NAME_BAD = "", "", ""
 
     def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
         self.functions = {f["function"]["name"]: f["function"] for f in functions}
@@ -177,6 +190,16 @@ class Parser:
 
     def flush(self) -> list[Part]:
         return self._flush()
+
+    def naming(self) -> str | None:
+        """The text of the call being written from where ``NAME_HEAD`` begins, while it may still be before the
+        name's end; None elsewhere."""
+        raise NotImplementedError
+
+    def heads(self) -> list[str]:
+        """The text from ``NAME_HEAD`` to the name's end of a call of each function that can be written."""
+        return [self.NAME_HEAD + name + self.NAME_END for name in self.functions
+                if not any(c in self.NAME_BAD for c in name)]
 
     def _feed(self, text: str) -> list[Part]:
         raise NotImplementedError
@@ -229,6 +252,7 @@ class QwenParser(Parser):
     FUNCTION = re.compile(r"\s*<function=([^>\n]+)>")
     PARAMETER = re.compile(r"\s*<parameter=([^>\n]+)>")
     END = "</parameter>"
+    NAME_HEAD, NAME_END, NAME_BAD = "\n<function=", ">", ">\n"  # (the template's: one newline after <tool_call>)
 
     def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
         super().__init__(functions, parallel=parallel)
@@ -246,6 +270,9 @@ class QwenParser(Parser):
 
     def _arg(self, out: list[Part], text: str) -> None:
         out.append(("tool_call", ToolCall(self.started - 1, arguments=text)))
+
+    def naming(self) -> str | None:
+        return self.buf if self.state == "function" else None  # (the text after <tool_call>)
 
     def _feed(self, text: str) -> list[Part]:
         self.buf += text
@@ -448,10 +475,14 @@ class _GemmaValue:
 class GemmaParser(Parser):
     OPEN, CLOSE = "<|tool_call>", "<tool_call|>"
     CALL = re.compile(r"\s*call:([^{\s]+)\s*(?={)")
+    NAME_HEAD, NAME_END, NAME_BAD = "call:", "{", "{" + string.whitespace
 
     def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
         super().__init__(functions, parallel=parallel)
         self.in_call = False
+
+    def naming(self) -> str | None:
+        return self.buf if self.in_call and "{" not in self.buf else None  # (the text after <|tool_call>)
 
     def _call(self, out: list[Part], body: str) -> None:
         """A call's text between its markers as a call, or as content when it does not parse."""
@@ -498,11 +529,36 @@ class GemmaParser(Parser):
 class LlamaParser(Parser):
     """Llama 3's calls: a message that is JSON objects ``{"name": ..., "parameters": {...}}`` (``arguments`` taken
     too), one or more (``;`` or white space between them); held until the end, content when it is anything else.
-    The arguments typed by the schema (``typed``: Llama 3.1 writes most values as strings)."""
+    The arguments typed by the schema (``typed``: Llama 3.1 writes most values as strings). A name is the string
+    value of an object's ``"name"`` key after its other plain keys (``"type": "function"``)."""
+
+    NAME_END, NAME_BAD = '"', '"\\'
+    NAMING = re.compile(r'\{\s*(?:"[^"\\]*"\s*:\s*(?:"[^"\\]*"|[-+.\w]+)\s*,\s*)*"name"\s*:\s*"([^"\\]*)')
 
     def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
         super().__init__(functions, parallel=parallel)
         self.state = "start"  # start, json (held), text
+        self._at = 0  # (where the call after the complete ones begins)
+        self._tried = 0  # (the text up to here could end no more calls)
+
+    def naming(self) -> str | None:
+        if self.state != "json":
+            return None
+        s = self.buf
+        while True:
+            i = self._at
+            while i < len(s) and (s[i].isspace() or s[i] == ";"):
+                i += 1
+            m = self.NAMING.match(s, i)
+            if m and m.end() == len(s):
+                return m.group(1)
+            if "}" not in s[self._tried:]:  # (a call ends at a "}" only)
+                return None
+            self._tried = len(s)
+            try:
+                self._at = self._tried = json.JSONDecoder().raw_decode(s, i)[1]
+            except ValueError:
+                return None
 
     def _feed(self, text: str) -> list[Part]:
         out: list[Part] = []
@@ -577,15 +633,77 @@ class Syntax:
 @dataclass(frozen=True)
 class Calls:
     """The tool calls of a request's answer: its ``functions``, the template's ``syntax``, ``parallel_tool_calls``,
-    and ``force``: the text the answer's call begins with (``tool_choice`` required or a named function), or None."""
+    ``force``: the text the answer's call begins with (``tool_choice`` required or a named function), or None, and
+    ``vocab``: the model's tokens for the names' mask (None: names not constrained)."""
 
     syntax: Syntax
     functions: list[dict[str, Any]]
     parallel: bool = True
     force: str | None = None
+    vocab: Vocabulary | None = None
 
     def parser(self) -> Parser:
         return self.syntax.parser(self.functions, parallel=self.parallel)
+
+    def mask(self, tokenizer: Detokenizer) -> NameMask | None:
+        """A mask over a generation's tokens that keeps its calls' names the functions' (``tokenizer``: the
+        model's)."""
+        return NameMask(self.parser(), tokenizer, self.vocab) if self.vocab is not None else None
+
+
+class Vocabulary:
+    """A model's tokens by their text as the server decodes them (``decode_bytes`` of each of the ``n`` ids; control
+    tokens, which decode to nothing, left out), sorted: ``fitting`` finds the tokens that may come where a text must
+    follow."""
+
+    def __init__(self, tokenizer: Detokenizer, n: int):
+        pairs = sorted((b, i) for i in range(n) if (b := tokenizer.decode_bytes([i])))
+        self.texts = [b for b, _ in pairs]
+        self.ids = np.fromiter((i for _, i in pairs), np.int32, len(pairs))
+
+    def fitting(self, rest: bytes) -> list[np.ndarray]:
+        """The tokens whose text is a part of ``rest`` from its start, or ``rest`` and more (ids, in groups)."""
+        texts, out = self.texts, []
+        for k in range(1, len(rest)):
+            p = rest[:k]
+            lo = bisect.bisect_left(texts, p)
+            if lo == len(texts) or not texts[lo].startswith(p):
+                return out  # (no token begins with p: none is longer)
+            if texts[lo] == p:
+                out.append(self.ids[lo:bisect.bisect_right(texts, p, lo)])
+        lo = bisect.bisect_left(texts, rest)
+        end = rest.rstrip(b"\xff")  # (the texts that begin with rest end before the next prefix of its length)
+        hi = bisect.bisect_left(texts, end[:-1] + bytes([end[-1] + 1]), lo) if end else len(texts)
+        out.append(self.ids[lo:hi])
+        return out
+
+
+class NameMask:
+    """The tokens that keep a call's name one of the functions' (``common.Mask``): ``parser``, a parser of the answer's
+    syntax, follows the generated text (``accept``, each token as it is sampled: the thoughts' text too, where a call
+    does not begin); while it is in a call's name (``Parser.naming``), the tokens ``allowed`` are those that continue
+    the text towards a function's head (a part of the rest, or the rest and more), else any."""
+
+    def __init__(self, parser: Parser, tokenizer: Detokenizer, vocab: Vocabulary):
+        self.parser, self.vocab = parser, vocab
+        self.text = StreamDecoder(tokenizer)
+        self.heads = [h.encode() for h in parser.heads()]
+        self._memo: dict[bytes, np.ndarray | None] = {}
+
+    def accept(self, token: int) -> None:
+        self.parser.parts([("content", self.text.feed(token))])
+
+    def allowed(self) -> np.ndarray | None:
+        w = self.parser.naming()
+        if w is None:
+            return None
+        w = w.encode() + self.text.pending
+        if w not in self._memo:
+            groups = [g for h in self.heads if len(h) > len(w) and h.startswith(w)
+                      for g in self.vocab.fitting(h[len(w):])]
+            ids = np.unique(np.concatenate(groups)) if groups else np.empty(0, np.int32)
+            self._memo[w] = ids if len(ids) else None  # (no head fits: the text left them, nothing to mask)
+        return self._memo[w]
 
 
 QWEN_XML = Syntax("qwen-xml", QwenParser, "<tool_call>\n<function=", "<tool_call>\n<function={name}>\n", gap="\n\n",

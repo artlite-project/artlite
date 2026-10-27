@@ -1,7 +1,7 @@
 """Sampling on the host: the native top-k of a vocabulary's logits (``models.common.top_logits``, ``max_prob``), llama.cpp's
-penalties (``models.common.Penalties``) on a few candidates against their definition on the whole vocabulary, the
-choice among the candidates (``Sampling.pick``), and the generation loops' window of recent tokens
-(``NpuModel.generate``, the overlay models' bf16 logits with a soft cap)."""
+penalties (``models.common.Penalties``) on a few candidates against their definition on the whole vocabulary, with a
+mask of the tokens allowed, the choice among the candidates (``Sampling.pick``), and the generation loops' window of
+recent tokens (``NpuModel.generate``, the overlay models' bf16 logits with a soft cap)."""
 
 import collections
 
@@ -189,3 +189,46 @@ def test_generate(model: type[NpuModel]) -> None:
         Sampling(repeat_penalty=0.0)
     with pytest.raises(ValueError, match="repeat_last_n"):
         Sampling(repeat_last_n=-1)
+
+
+class Allowed:
+    """A mask of a fixed set of tokens; ``seen``: the tokens it was told."""
+
+    def __init__(self, ids: list[int]):
+        self.ids = np.asarray(sorted(ids), np.int32)
+        self.seen: list[int] = []
+
+    def allowed(self) -> np.ndarray:
+        return self.ids
+
+    def accept(self, token: int) -> None:
+        self.seen.append(token)
+
+
+@pytest.mark.parametrize("dtype", ["bf16-cap", "fp32", "torch"])
+def test_mask(dtype: str) -> None:
+    """With a mask, the candidates are the k largest penalized logits of the tokens it allows (recent tokens among
+    them and not; fewer than k), of numpy and torch logits; the mask is told the accepted tokens (not the prompt's), a
+    draft's copy has none; a generation's tokens are the allowed ones."""
+    rng = np.random.default_rng(2)
+    logits = (rng.standard_normal(VOCAB) * 4).astype(np.float32)
+    s = Sampling(top_k=8, repeat_penalty=1.3, repeat_last_n=16, presence_penalty=0.5, frequency_penalty=0.2)
+    order = np.argsort(-logits, kind="stable").tolist()
+    allowed = sorted({*order[:3], *rng.choice(VOCAB, 20, replace=False).tolist()})
+    prompt = [order[0], order[5], allowed[4], allowed[4]]
+    cap = CAP if dtype == "bf16-cap" else 0.0
+    raw = bf16(logits) if cap else torch.from_numpy(logits) if dtype == "torch" else logits
+    full = reference(softcap(values(bf16(logits))) if cap else logits, prompt, s)
+    mask = Allowed(allowed)
+    p = Penalties(s, prompt, mask)
+    v, i = p.top(raw, s.top_k, cap)
+    np.testing.assert_allclose(v, np.sort(full[allowed])[::-1][:s.top_k], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(full[i], v, rtol=1e-6, atol=1e-6)
+    assert set(i.tolist()) <= set(allowed) and mask.seen == []
+    p.accept(order[1])
+    q = p.copy()
+    q.accept(order[2])
+    assert mask.seen == [order[1]] and q.mask is None
+    v, i = Penalties(Sampling(top_k=64), (), Allowed([3, 9])).top(raw, 64, cap)
+    assert sorted(i.tolist()) == [3, 9] and len(v) == 2
+    assert list(Steps().generate(Steps().step(0), 4, Sampling(greedy=True), mask=Allowed([6, 7, 9]))) == [6] * 4

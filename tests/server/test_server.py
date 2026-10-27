@@ -24,7 +24,7 @@ import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER, Model, NpuModel, Penalties, Sampling, top_logits
+from models.common import MEDIA_MARKER, Mask, Model, NpuModel, Penalties, Sampling, top_logits
 from models.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
@@ -62,7 +62,8 @@ class FakeTokenizer:
         return out
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
-        return "".join(self.pieces[i] for i in ids if special or i not in (BOS, EOS)).encode()
+        return "".join(self.pieces[i] if i < len(self.pieces) else "" for i in ids
+                       if special or i not in (BOS, EOS)).encode()
 
 
 class FakeModel(Model):
@@ -77,14 +78,15 @@ class FakeModel(Model):
         self.thinks = reasoning is not None
         self.thought_first = reasoning == QWEN
         self.rendered: tuple[list[dict[str, object]], list[dict[str, object]] | None] = ([], None)
+        self.preserved: bool | None = None  # (the last chat's preserve)
 
     def encode(self, text: str) -> list[int]:
         return [BOS] + self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int]:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
         """(tools: their names in a system turn; an assistant's tool calls after its content)"""
-        self.rendered = (messages, tools)
+        self.rendered, self.preserved = (messages, tools), preserve
         text = "<s>" + (f"<|system|>tools: {' '.join(t['function']['name'] for t in tools)}" if tools else "")
         for m in messages:
             calls = "".join(f" call {c['function']['name']} {json.dumps(c['function']['arguments'])}"
@@ -110,7 +112,7 @@ class FakeVision(FakeModel):
         self.threads: list[str] = []
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None) -> list[int] | Sequence:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int] | Sequence:
         seq, text = Sequence.text([], 8), "<s>"
         for m in messages:
             text += f"<|{m['role']}|>"
@@ -192,11 +194,11 @@ class FakeNpu(NpuModel):
         logits = self._logits(next(self._next, EOS))
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = ()
-                 ) -> Iterator[int]:
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = (),
+                 mask: Mask | None = None) -> Iterator[int]:
         """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded)"""
         if not self.drafts:
-            yield from super().generate(logits, max_tokens, sampling, prompt)
+            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
             return
         token, n = int(logits.argmax()), 1
         yield token
@@ -380,6 +382,25 @@ def test_reasoning_gemma() -> None:
         assert deltas(evs, "reasoning_content") == "Hmm, yes" and deltas(evs) == "Yes."
 
 
+def test_preserve_reasoning() -> None:
+    """The earlier answers' thoughts stay in the prompt (the templates' preserve_thinking) unless the server's option
+    or a request's chat_template_kwargs (preserve_reasoning, llama-server's, or preserve_thinking) says otherwise."""
+    model, _npu, engine = make(reasoning=QWEN)
+    for options, kwargs, want in [({}, None, True), ({"preserve_reasoning": False}, None, False),
+                                  ({}, {"preserve_reasoning": False}, False), ({}, {"preserve_thinking": False}, False),
+                                  ({"preserve_reasoning": False}, {"preserve_thinking": True}, True),
+                                  ({"chat_template_kwargs": {"preserve_reasoning": False}}, None, False),
+                                  ({"chat_template_kwargs": {"preserve_reasoning": False}},
+                                   {"preserve_thinking": True}, True)]:
+        with TestClient(app_of(engine, **options)) as client:
+            assert engine.wait_ready(5)
+            body = {"chat_template_kwargs": kwargs} if kwargs is not None else {}
+            assert chat(client, "Hi", **body).status_code == 200
+            assert model.preserved is want, (options, kwargs)
+            client.post("/apply-template", json={"messages": [{"role": "user", "content": "Hi"}], **body})
+            assert model.preserved is want, (options, kwargs)
+
+
 def test_splitter_and_stops() -> None:
     s = ReasoningSplitter(QWEN, inside=True)
     parts = [p for t in ["\nA", " b\n", "\n</th", "ink>", "\n", "\nC", "\n\nD", "\n"] for p in s.feed(t)] + s.flush()
@@ -545,6 +566,24 @@ def test_tool_choice_own_thought() -> None:
         assert engine.cached == npu.seq[:npu.position]
 
 
+def test_tool_call_names(tooled: tuple) -> None:
+    """A call's name is one of the functions': where the model writes another (none fits), the tokens that write a
+    function's name win; the arguments stay the model's."""
+    model, npu, _engine, client = tooled
+    for piece in ("get_time>", "\n<function=get_weather>"):  # (the vocabulary's: before the first request with tools)
+        model.tokenizer.id(piece)
+    npu.replies = [["none>", "\n</function>", "\n</tool_call>"]]  # (after the forced "<tool_call>\n<function=")
+    r = chat(client, "Hi!", tools=[WEATHER, TIME], tool_choice="required").json()
+    assert [(c["function"]["name"], c["function"]["arguments"]) for c in r["choices"][0]["message"]["tool_calls"]] == \
+        [("get_time", "{}")]
+    npu.replies = [["Sure.", "\n\n", "<tool_call>", "\n<function=lookup>", "\n<parameter=city>", "\nOslo",
+                    "\n</parameter>", "\n</function>", "\n</tool_call>"]]
+    msg = chat(client, "Hi!", tools=[WEATHER, TIME]).json()["choices"][0]["message"]
+    assert msg["content"] == "Sure." and [(c["function"]["name"], c["function"]["arguments"])
+                                          for c in msg["tool_calls"]] == [("get_weather", '{"city": "Oslo"}')]
+    assert "<tool_call>\n<function=get_weather>\n<parameter=city>" in model.tokenizer.decode_bytes(npu.seq).decode()
+
+
 def test_tool_calls_drafts() -> None:
     """Steps of several tokens (a drafter): the forced opener and the end after a call wait for a step's end, so the
     cache holds exactly the tokens of the answer."""
@@ -614,7 +653,8 @@ def test_tool_errors(tooled: tuple, fake: tuple) -> None:
     assert r.status_code == 400 and "takes no tools" in r.json()["error"]["message"]
     assert fake[3].get("/props").json()["chat_template_caps"]["supports_tools"] is False
     assert client.get("/props").json()["chat_template_caps"] == {
-        "supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True}
+        "supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True,
+        "supports_preserve_reasoning": False}
 
 
 def test_tool_calls_openai_client() -> None:

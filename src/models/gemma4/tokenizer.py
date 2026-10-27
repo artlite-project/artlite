@@ -126,13 +126,14 @@ class GemmaTokenizer:
 
 
 def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thinking: bool = False,
-                tools: list[dict[str, object]] | None = None) -> str:
+                tools: list[dict[str, object]] | None = None, preserve_thinking: bool = False) -> str:
     """The prompt text of a conversation, rendered with the file's ``tokenizer.chat_template``
     (it begins with ``<bos>``: encode it without ``add_bos``), up to the model's turn (``enable_thinking``: the
-    model thinks first; ``tools``: the functions it may call)."""
+    model thinks first; ``tools``: the functions it may call; ``preserve_thinking``: the answers with tool calls
+    before the last user message keep their thoughts)."""
     bos = gguf.strings("tokenizer.ggml.tokens")[int(gguf.meta["tokenizer.ggml.bos_token_id"])]
     text = chat_template(str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
-                         enable_thinking=enable_thinking, bos_token=bos)
+                         enable_thinking=enable_thinking, preserve_thinking=preserve_thinking, bos_token=bos)
     # (an answer with content after its tool calls' results closes the model's turn, and the template opens no new
     # one: the model's turn goes before the generation prompt, as llama.cpp does)
     head, end, tail = text.rpartition("<turn|>\n")
