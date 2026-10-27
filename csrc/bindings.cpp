@@ -7,6 +7,8 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -38,7 +40,7 @@ using namespace nb::literals;
 
 extern const char artlite_source_hash[];  // (source_hash.cpp, generated: CMakeLists.txt's ARTLITE_SOURCE_HASH)
 
-constexpr size_t kUserBoBytes = size_t(2) << 20;  // (alloc_host_buffer: from this size on, alloc_user_bo)
+static std::atomic<size_t> user_bo_bytes{size_t(2) << 20};  // (alloc_host_buffer: from this size on, alloc_user_bo)
 
 // Sampling's arguments: a vocabulary's logits (any dtype: checked by logits_arg), candidates' ids and values
 using Vector = nb::ndarray<nb::ndim<1>, nb::c_contig, nb::device::cpu>;
@@ -268,6 +270,11 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
   m.attr("BACKEND") = "xdna";
 #endif
   m.def(
+      "set_user_bo_bytes", [](size_t nbytes) { user_bo_bytes = nbytes; }, "nbytes"_a,
+      "Device.alloc_host_buffer's buffers from this size on are user BOs (2 MB pages; 2 MB by default), smaller ones "
+      "the driver's (4 KB pages): artlite-probe --diagnose measures both.");
+  m.def("user_bo_bytes", [] { return size_t(user_bo_bytes); }, "set_user_bo_bytes' size.");
+  m.def(
       "source_hash", [] { return std::string(artlite_source_hash); },
       "The hash of the sources the module was built from (CMakeLists.txt's ARTLITE_SOURCE_HASH; "
       "artlite.backend.stale_native compares it with the checkout's).");
@@ -402,15 +409,15 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       .def(
           "alloc_host_buffer",
           [](shim_xdna::device& self, size_t size) {
-            if (size >= kUserBoBytes) {
+            if (size >= user_bo_bytes) {
               nb::gil_scoped_release release;
               return self.alloc_user_bo(size);
             }
             return self.alloc_bo(size, static_cast<uint32_t>(XCL_BO_FLAGS_HOST_ONLY));
           },
           "size"_a, nb::keep_alive<0, 1>(),
-          "A zeroed host buffer the NPU reads and writes; from 2 MB on in this process's memory, as "
-          "alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows on pages of their own run at a "
+          "A zeroed host buffer the NPU reads and writes; from 2 MB on (set_user_bo_bytes) in this process's "
+          "memory, as alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows on pages of their own run at a "
           "fraction of the rate: on Strix Halo 12 instead of 57 GB/s for 128-byte rows).")
       .def(
           "alloc_user_buffer",
@@ -458,6 +465,18 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       .def("driver_version", &shim_xdna::device::driver_version,
            "The DRM driver's name and version: amdxdna_accel_driver 0.6 / 0.8 / 0.10 are Linux 7.0 / 7.1 / 7.2's "
            "own (\"\" on XRT).")
+      .def(
+          "get_info",
+          [](const shim_xdna::device& self, uint32_t param, nb::bytes query) {
+            std::vector<uint8_t> buf(static_cast<const uint8_t*>(query.data()),
+                                     static_cast<const uint8_t*>(query.data()) + query.size());
+            size_t n = self.get_info(param, buf);
+            return nb::bytes(reinterpret_cast<const char*>(buf.data()), std::min(n, buf.size()));
+          },
+          "param"_a, "query"_a,
+          "The driver's GET_INFO answer for param (DRM_AMDXDNA_QUERY_*) in a buffer of query's size that starts as "
+          "query (the input of queries that take one: telemetry's type), cut to the size the driver reports "
+          "(artlite-probe --diagnose: sensors, firmware telemetry). NotImplementedError on XRT.")
       .def("power_mode", &shim_xdna::device::power_mode,
            "The NPU's power mode: 0 default, 1 low, 2 medium, 3 high, 4 turbo (-1 on XRT: xrt-smi reports it).")
       .def("heap_free", &shim_xdna::device::heap_free,

@@ -115,6 +115,9 @@ struct device {
   int power_mode() const;
   // The DRM driver's name and version ("amdxdna_accel_driver 0.6.0": Linux 7.0's).
   std::string driver_version() const;
+  // GET_INFO for `param` (DRM_AMDXDNA_QUERY_*: sensors, telemetry, ...) in `buf`, which may carry the query's input
+  // (telemetry: its type); returns the driver's buffer_size.
+  size_t get_info(uint32_t param, std::span<uint8_t> buf) const;
   // Device busy time of this DRM client (all the process's contexts on the device), from fdinfo:
   // mailbox send to response, summed over the commands; 0 from a driver without the fdinfo line
   // (Linux's own driver). Reads a /proc file: keep it out of timed regions.

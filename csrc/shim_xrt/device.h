@@ -1,6 +1,7 @@
 #ifndef SHIM_XRT_DEVICE_H
 #define SHIM_XRT_DEVICE_H
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "shim_xrt/bo.h"
@@ -49,6 +51,9 @@ struct device {
   clocks query_clocks() const;
   int power_mode() const { return -1; }  // (xrt-smi reports it)
   std::string driver_version() const { return {}; }
+  size_t get_info(uint32_t, std::span<uint8_t>) const {
+    throw std::system_error(EOPNOTSUPP, std::generic_category(), "GET_INFO is not available through XRT");
+  }
   uint64_t busy_ns() const;
   // No device heap of the process's own: XRT places instruction buffers.
   size_t heap_free() const { return SIZE_MAX; }

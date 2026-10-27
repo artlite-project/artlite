@@ -42,6 +42,7 @@ from ..gemm.gemm_qd import GemmQdOperator, choose_planar_plan, gemm_mac_rows, pl
 from ..operators.design import COLS
 from ..operators.util import arg_bytes
 
+LINES = True  # packed C drains in whole 64-byte lines (GemmQOperator lines=; artlite-probe --diagnose measures both)
 MAX_CHAIN_BDS = 14  # shim BDs of a GEMM's chained weight fill (Llama-3.1-8B's down, 14 chunks, the largest built)
 ROWS = 64  # rows of a tile-major pass (gemm_q: 4 tiles of 16 rows, 8 BFP16 tiles of 8)
 OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh"}  # projections into the residual stream (eh: an MTP drafter's)
@@ -177,7 +178,7 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
     if is_planar(b0.fmt, b0.R, region.kc):
         plan = _plan(region, run, plan_T or T, region.K, few)
         blocks = tuple((rt0 + r, n) for r, n in plan.blocks)
-        kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks, lines=True)
+        kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks, lines=LINES)
         rt_end = max(r + plan.tiles * n for r, n in blocks)
     else:
         blocks = tuple((region.rt0[region.blocks[i].name], -(-region.blocks[i].tiles // _tp(region.blocks[i])))
@@ -250,7 +251,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
             kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": -(-ffn * COLS // KC) * KC, "tile_bytes": S,
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
-                  "blocks": ((tp * p0, p1 - p0),), "lines": True}
+                  "blocks": ((tp * p0, p1 - p0),), "lines": LINES}
             if is_planar(b.fmt, b.R, KC):
                 kw["tiles"] = tp
             op = _gemm(kw, T, which, ops)

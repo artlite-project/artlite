@@ -122,8 +122,8 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   layer whose V and down are Q6_K costs ~2.2 ms more than a Q4_K one (planar GemmQd: a dequantizing core per column,
   66 of 80 MAC columns, 1024 tokens as 1152): ~9% of the chunk.
 - Other chips: Krackan Point and Strix Point have the same array at the same clock, also with all 32 cores busy, and
-  on Krackan a faster DRAM path in every streaming and gather pattern (`artlite-probe`), but no cache in front of DRAM:
-  a write of part of a 64-byte line costs 4.7x a whole line's there (132 B rows 15.6 GB/s, 128 B rows 73.2; Halo 41.4
+  on Krackan a faster DRAM path in every streaming and gather pattern (`artlite-probe`), but a write of part of a
+  64-byte line (an LPDDR5 masked write: a read-modify-write in the DRAM) costs 4.7x a whole line's there (132 B rows 15.6 GB/s, 128 B rows 73.2; Halo 41.4
   / 57.2). The prefill writes whole lines: planar packed passes in whole-line windows (`lines`; the previous pass's
   last columns carried in the C object), gate/up's 32-output parts two per C object (576 B rows), output projections
   at `d_pitch` in whole lines; a layout gives room for the last window (`PlanarPlan.line_pitches`). Count partial lines

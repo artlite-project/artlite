@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import statistics
+import sys
 import time
 from collections.abc import Callable
 from typing import NamedTuple
@@ -347,7 +348,25 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
     p.add_argument("--pages", action="store_true",
                    help="instead: what the NPU's address translation costs rows on pages of their own (~2 minutes)")
+    p.add_argument("--diagnose", action="store_true",
+                   help="instead: everything that can make Artlite slower here, measured and recorded (~5 minutes; "
+                        "Linux: as root, sudo $(which artlite-probe) --diagnose); prints a report and writes a JSON "
+                        "file to attach")
+    p.add_argument("--model", default="", help="--diagnose: Llama 3.2 1B Q4_K_M's file (default: the issue #5 file "
+                                               "in the models directory)")
+    p.add_argument("--out-dir", default=".", help="--diagnose: where the JSON file goes (default: here)")
     args = p.parse_args(argv)
+    if args.diagnose:
+        from . import diagnose
+
+        if platform.system() == "Linux" and os.geteuid() != 0 and not os.environ.get(diagnose.ROOT_ENV):
+            raise SystemExit("artlite-probe --diagnose reads what only root can (memory devices, the data fabric, "
+                             "the kernel log): run sudo $(which artlite-probe) --diagnose")
+        if platform.system() == "Linux" and os.geteuid() == 0:
+            diagnose.become_user(sys.argv[1:] if argv is None else argv)  # (as the sudo user: does not return)
+        diagnose.run(model_file=args.model or diagnose.model.default_file(), seconds=args.seconds,
+                     out_dir=args.out_dir)
+        return
     lines = system() + ([f"warning: {stale}"] if (stale := stale_install()) else [])
     if args.pages:
         more, rows = pages(args.seconds)

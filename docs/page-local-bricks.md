@@ -44,8 +44,8 @@ Strix Halo with 4 KB pages: Linux with transparent huge pages off (`echo never >
 
 ## Parts of lines: whole-line writes
 
-On Krackan Point, which has no cache in front of DRAM, 132-byte rows write at 15.6 GB/s against 73.2 for whole-line
-128-byte rows (4.7x); Strix Halo's cache merges them (41.4 against 57.2). Writing each GEMM pass's own columns where
+On Krackan Point 132-byte rows write at 15.6 GB/s against 73.2 for whole-line 128-byte rows (4.7x; LPDDR5 runs a
+masked write as a read-modify-write inside the DRAM); on Strix Halo 41.4 against 57.2. Writing each GEMM pass's own columns where
 they fall, a 1024-token prefill chunk writes parts of 4.4 million lines for Llama 3.2 1B Q4_K_M, 10.8 M for Llama 3.1
 8B, 83 M for Qwen3.8 27B and 1.1 M for Gemma 4 E4B (counted from the dispatched control code's BDs: every row's start
 and end). Their sources and what Artlite does:

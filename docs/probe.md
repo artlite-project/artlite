@@ -54,8 +54,9 @@ path to DRAM. Strix Halo's NPU reaches it through a port of 32 B per array cycle
 every power mode), 22% of that bus; Krackan Point's reads 81% of its bus, 1.7x as much; Strix Point's 59%. Small rows
 at a stride of a multiple of 4 KB cost all three alike, 71-77% below a stream at 256 B and 43-53% at 512 B, so a
 layout that is fast on one is fast on the others. A write of 132 B rows that share their end lines runs 28% below whole
-lines on Strix Halo (its cache in front of DRAM merges them) and 79% below on Krackan Point (15.6 instead of 73.2
-GB/s): Artlite's prefill writes whole lines (`?`: not measured on that machine).
+lines on Strix Halo and 79% below on Krackan Point (15.6 instead of 73.2 GB/s): a part of a line is a masked write,
+which LPDDR5 runs as a read-modify-write inside the DRAM, at 4x a write's command spacing (tCCDMW). Artlite's prefill
+writes whole lines (`?`: not measured on that machine).
 
 Each row on a page of its own costs the NPU an address translation. Artlite's host buffers have 2 MB pages on Linux
 (transparent huge pages, `madvise` or `always`; the `host buffers` line says so); Windows maps system memory for the
@@ -89,7 +90,35 @@ translations: the DMA's own rates for each pattern) and with 4 KB pages (transpa
 | 2 KB rows 9280 B apart | the prefill's reads of the decode image's tiles | as many bytes as a stream |
 | 8 channels read + 8 write | whether reads and writes share the rate | 162 in all |
 
+## Diagnosis: `--diagnose`
+
+`sudo $(which artlite-probe) --diagnose` (about 5 minutes; Linux: root) records everything that can make Artlite
+slower on a machine, so that a slower number comes with what explains it. It reads as root what only root can (the
+memory devices, the NPU's PCI capabilities, the data fabric's DRAM interleaving unless the kernel is locked down, the
+SMU's enabled features, this boot's kernel lines about the NPU and the IOMMU, other processes on the NPU), then runs
+on as the user who ran sudo (their caches and models directory). Through every step it samples what the SoC reports
+(amdgpu's `gpu_metrics`: fabric and memory clocks, the NPU's clock, DRAM traffic, power, limits, temperatures; the
+driver's NPU sensors where it has them; the clock of the CPU that takes the NPU's interrupts; other processes' CPU
+load). It measures:
+
+- the DMA rows above on host buffers of 2 MB pages and again of 4 KB pages, rows of channel placement (regions at
+  other offsets in their 2 MB pages) and of the prefill's row shapes;
+- the NPU's command path: what its control processor spends per operation of control code (no-op, write, 1 KB block
+  write, a small DMA task and its wait), a dispatch, NOP dispatches back to back; the array clock under load, also
+  with a busy CPU;
+- Llama 3.2 1B Q4_K_M's 1024-token prompt in variants, two rounds: host buffers of 2 MB or 4 KB pages, the prefill's
+  output rows in whole 64-byte lines or not, and with one CPU kept busy; for the first two the chunk's time per
+  operator kind and a design switch's cost; the host's embedding lookups; the huge pages the process got;
+- `xrt-smi validate` where XRT is installed.
+
+It prints a report, its verdicts first (each candidate cause with the numbers that decide it, and how many ms of the
+1B chunk's difference to Strix Halo each explains), and writes every number to `artlite-diagnose-<time>.json`: attach
+that file to the report.
+
 | option | |
 |---|---|
 | `--seconds S` | seconds of dispatches per measurement (default 1) |
 | `--pages` | the page table instead of the hardware numbers |
+| `--diagnose` | the diagnosis instead (root on Linux) |
+| `--model FILE` | `--diagnose`: Llama 3.2 1B Q4_K_M's file (default: the one in the models directory) |
+| `--out-dir DIR` | `--diagnose`: where the JSON file goes (default: the current directory) |

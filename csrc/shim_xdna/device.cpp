@@ -264,6 +264,14 @@ int device::power_mode() const {
   return get_info<amdxdna_drm_get_power_mode>(*m_pdev, DRM_AMDXDNA_GET_POWER_MODE).power_mode;
 }
 
+size_t device::get_info(uint32_t param, std::span<uint8_t> buf) const {
+  amdxdna_drm_get_info arg = {.param = param,
+                              .buffer_size = static_cast<uint32_t>(buf.size()),
+                              .buffer = reinterpret_cast<uintptr_t>(buf.data())};
+  m_pdev->ioctl(DRM_IOCTL_AMDXDNA_GET_INFO, &arg);
+  return arg.buffer_size;
+}
+
 std::string device::driver_version() const {
   char name[64] = {};
   drm_version v = {};
