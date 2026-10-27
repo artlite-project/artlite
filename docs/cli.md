@@ -41,6 +41,7 @@ and generation speeds go to stderr.
 | `--greedy` | always the most likely token |
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
+| `--no-lookup` | no draft tokens from the prompt, below |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Gemma 4), below |
 | `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
@@ -52,6 +53,15 @@ the file's `general.sampling.*`, else its model card's.
 `--kv-k` stores K as one bfp16 value per 8 dims (`single`) or as bfp16 hi + lo (`hilo`: 1.5x the cache and its read
 time). Llama's default is `single`: `hilo` makes decode at 32K 1.2x slower with no measured quality gain. Gemma 4's
 default is `hilo`: `single` takes 2/3 of the cache at KL 0.00028 instead of 0.00023 against the same file on the CPU.
+
+Generation runs in steps of up to 4 tokens: the next token and draft tokens after it, which a step checks at a
+fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
+far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
+model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.6 35B-A3B's and Occamy's); each step takes the
+ones that pay at the model's measured step times, none where nothing does. A draft is kept only where the model's own
+token at its position is that draft, so the text is the one without drafts (greedy: the same tokens, except at near
+ties on Qwen3.6 35B-A3B and Occamy, whose steps of several tokens sum their experts in another order). The summary on
+stderr counts each kind's draft tokens and the accepted ones.
 
 ## Images
 

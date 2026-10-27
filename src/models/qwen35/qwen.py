@@ -18,12 +18,12 @@ start (a position inside a 32-position cache group, after a generated reply), an
 decode steps of up to 4 tokens. An MoE model's chunk routes its tokens on the host between the router and the experts
 (``artlite.moe.prefill``).
 
-Multi-token prediction (a qwen35moe model with its MTP drafter, ``model_config.qwen_mtp_of``:
-``models.qwen35.draft.QwenDraft``, ``NpuQwen.generate``): the sampled token's step takes up to three draft
-tokens along - the drafter's guesses of what follows, a dispatch of the same design each (2.4-3.4 ms on the
+Multi-token steps (``OverlayModel.generate``): the sampled token's step takes up to three draft tokens along - the
+context's (``models.drafts``), or with a qwen35moe model's MTP drafter (``model_config.qwen_mtp_of``:
+``models.qwen35.draft.QwenDraft``) its guesses of what follows, a dispatch of the same design each (2.4-3.4 ms on the
 35B-A3B), while their chain's probability stays at least ``P_MIN`` - and a draft is kept where the token sampled from
-the model's logits at its position is that draft. The step leaves the GDN states uncommitted: the next one replays
-the accepted tokens.
+the model's logits at its position is that draft. A step of drafts leaves the GDN states uncommitted: the next one
+replays the accepted tokens.
 
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to disk. Load (27B, the
@@ -33,8 +33,7 @@ the designs (found through the render manifest) and the overlay's other buffers 
 
 import os
 import time
-from collections.abc import Callable, Iterator
-from collections.abc import Sequence as Seq
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -45,7 +44,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Mask, Model, OverlayModel, Penalties, Sampling, max_prob
+from ..common import Model, OverlayModel, Penalties, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
@@ -68,7 +67,6 @@ class NpuQwen(OverlayModel):
     ``drafter``: a qwen35moe model's multi-token-prediction drafter file ("": ``model_config.qwen_mtp_of``, when there
     is one; None: none)."""
 
-    DRAFTS = SLOTS - 1  # draft tokens per dispatch at most (with a drafter; set before the first prompt)
     P_MIN = 0.5  # a round's drafts stop where the probability of their chain (the drafter's) falls below it
     recurrent = True  # (the GDN layers' states hold the whole sequence)
 
@@ -83,7 +81,9 @@ class NpuQwen(OverlayModel):
                                    formats=draft_formats(mtp) if mtp is not None else ())
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
-        self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else None
+        self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else None  # (OverlayModel's)
+        if cfg.moe:
+            self.STEP_COST = (1.0, 1.31, 1.60, 1.94)  # (35B-A3B at 1K: the slots route to different experts)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
@@ -100,8 +100,6 @@ class NpuQwen(OverlayModel):
         self.position = 0
         self.rope_next = 0  # (the M-RoPE position of the next text token)
         self._prompting = False
-        self.t_draft = 0.0
-        self.drafted = self.accepted = 0
         self._records()
 
     @property
@@ -112,11 +110,9 @@ class NpuQwen(OverlayModel):
         """(also, with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
         drafter's: 1.3 s on the 35B-A3B; else, and without ``prepare``, each is built at its first use)"""
         super().prepare(prompt_len)
-        if not self._drafting:
-            return
-        for S in range(1, self.DRAFTS + 2):
+        for S in range(1, self.DRAFTS + 2) if self.lookup or self._drafting else ():
             self.overlay.prepare(S)
-            for logits in (True, False):
+            for logits in (True, False) if self._drafting else ():
                 self.drafter.prepare(S, logits=logits)
 
     def describe(self) -> str:
@@ -124,12 +120,6 @@ class NpuQwen(OverlayModel):
         d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
         return (f"{ov.image.nbytes / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
                 f"({self.capacity} positions), {ov.sizes['GSTATE'] / 1e6:.0f} MB of GDN states{d}")
-
-    def stats(self) -> str:
-        if not self.drafted:
-            return ""
-        return (f"{self.drafted} draft tokens ({self.t_draft / self.drafted * 1e3:.2f} ms each), {self.accepted} "
-                f"accepted")
 
     def reset(self) -> None:
         """A new sequence: no cached positions, the GDN states zeroed."""
@@ -238,13 +228,10 @@ class NpuQwen(OverlayModel):
     # cache record at q and guesses token q + 1. Its records follow the model's positions: a prompt chunk writes its
     # rows' (``QwenPrefill(draft=)``); after the model's steps their rows wait in ``_pend`` (records from ``_dpos`` on,
     # at most SLOTS - 1 of them) until a drafter step runs them with the next ones; ``_h`` is the model's hidden state
-    # of the last cached position. A round (``generate``): one drafter step of the pending rows and the sampled
-    # token's (its first draft), one-row steps for the next drafts, the model's step of the token and the drafts
-    # (``commit=False``), then the accepted tokens' rows pending (they rewrite the draft rows' records).
-
-    @property
-    def _drafting(self) -> bool:
-        return self.drafter is not None and self.DRAFTS > 0
+    # of the last cached position. A drafter's round (``OverlayModel.generate``): one drafter step of the pending rows
+    # and the sampled token's (its first draft), one-row steps for the next drafts, the model's step of the token and
+    # the drafts (``commit=False``), then the accepted tokens' rows pending (they rewrite the draft rows' records); a
+    # round of the context's drafts leaves the token's row pending with the accepted ones'.
 
     def _records(self) -> None:
         """No drafter rows pending, nothing cached."""
@@ -263,10 +250,10 @@ class NpuQwen(OverlayModel):
         return (self._x,)
 
     def _follow(self, n: int) -> None:
-        """After the model's step of n tokens (all cached): their drafter rows pending."""
+        """After the model's step: the drafter rows of its first n tokens (cached) pending."""
         hs = self._hidden(n)
         h = torch.cat([self._h[None], hs[:-1]])
-        self._pend += list(zip(self._x, h, strict=True))
+        self._pend += list(zip(self._x[:n], h, strict=True))
         self._h = hs[-1]
         while len(self._pend) >= SLOTS:
             self._run_pending(SLOTS)
@@ -327,45 +314,28 @@ class NpuQwen(OverlayModel):
         self.drafted += len(out)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Seq[int] = (),
-                 mask: Mask | None = None) -> Iterator[int]:
-        """With the drafter: multi-token prediction. The sampled token's step takes the drafts along (``draft``:
-        greedy, without penalties); the model's logits after a token give its own next token (sampled), and as long
-        as that is the draft that ran behind it, the draft's logits are valid too. The step commits no GDN state:
-        the next one replays the accepted tokens (``QwenOverlay.accept``); the rejected drafts' positions are
-        forgotten (later steps overwrite their cache records)."""
-        if not self._drafting:
-            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
+    def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
+        return self.draft(token, k)
+
+    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
+        """(a step of drafts, or a drafter's round, commits no GDN state: ``_kept`` accepts its kept tokens, which the
+        next step replays, ``QwenOverlay.accept``)"""
+        return self.steps(tokens, commit=len(tokens) == 1 and not mtp)
+
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool) -> None:
+        """(a drafter's round: its kept drafts' rows pending, the token's ran with the drafts; another lazy step: its
+        kept tokens' rows pending)"""
+        if len(tokens) == 1 and not mtp:  # (a committed step: its row pending, ``steps``)
             return
-        if max_tokens == 0:
-            return
-        penalties = Penalties(sampling, prompt, mask)
-        token = sampling.pick(*penalties.top(logits, sampling.k))
-        penalties.accept(token)
-        n = 1
-        yield token
-        while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else SLOTS)
-            d = self.draft(token, k)
-            p = self.position
-            raw = self.steps([token, *d], commit=False)
-            new: list[int] = []
-            for i in range(len(d) + 1):
-                new.append(sampling.pick(*penalties.top(raw[i], sampling.k)))
-                penalties.accept(new[i])
-                if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
-                    break
-            m = len(new)  # (the step's tokens kept: the token and m - 1 drafts)
-            self.overlay.accept(m)
-            self.position = p + m
-            self.rope_next -= len(d) + 1 - m
-            self.accepted += m - 1
+        self.overlay.accept(m)
+        self.position = p + m
+        self.rope_next -= len(tokens) - m
+        if mtp:
             hs = self._hidden(m)
-            self._pend = [(self._rows([t])[0], hs[i]) for i, t in enumerate(d[:m - 1])]
+            self._pend = [(self._rows([t])[0], hs[i]) for i, t in enumerate(tokens[1:m])]
             self._dpos, self._h = p + 1, hs[m - 1]
-            for token in new:
-                n += 1
-                yield token
+        elif self._drafting:
+            self._follow(m)
 
 
 class Qwen(Model):

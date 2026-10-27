@@ -10,11 +10,12 @@ rows and per-layer embedding rows (a decode step's per-layer inputs: the NPU pro
 a prefill chunk's per-layer inputs, ``per_layer_model_proj`` of the embedding plus the per-layer embedding row, on a
 worker thread while the previous chunk runs) - and samples from the logits.
 
-Multi-token prediction (``NpuGemma.generate``, with the model's ``gemma4-assistant`` drafter, ``mtp-<model file>`` next
-to it: ``models.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
+Multi-token prediction (``OverlayModel.generate``, with the model's ``gemma4-assistant`` drafter, ``mtp-<model file>``
+next to it: ``models.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
 sampled token takes three draft tokens along - the drafter's guesses of what follows, a dispatch of the same design each
-(~1 ms) - and every draft that the model's own choice at its position confirms is a token without a dispatch of its
-own. The text is the model's: a draft is only kept where the token sampled from the model's logits is that draft.
+(~1 ms), or the context's (``models.drafts``) - and every draft that the model's own choice at its position confirms is
+a token without a dispatch of its own. The text is the model's: a draft is only kept where the token sampled from the
+model's logits is that draft.
 
 Memory: the weights the NPU streams (the layers and the LM head: 3.0 GB of E4B's Q4_0 file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to
@@ -26,7 +27,6 @@ import functools
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
@@ -36,7 +36,7 @@ from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
-from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Sampling
+from ..common import Checkpoint, Model, OverlayModel, Penalties, Sampling
 from .draft import GemmaDraft, output_norm
 from .host import GemmaHost
 from .overlay import GemmaOverlay
@@ -53,7 +53,7 @@ class NpuGemma(OverlayModel):
     when it is there; None: none); ``kv_k``: the caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block
     per 8 dims)."""
 
-    DRAFTS = BATCH - 1  # draft tokens per dispatch
+    STEP_COST = (1.0, 1.03, 1.07, 1.09)  # (E4B Q4_0 at 1K)
     P_CACHE = 1024  # tokens whose per-layer projections are kept (21 KB each: ``steps``)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 8, prefill: bool = True,
@@ -70,7 +70,7 @@ class NpuGemma(OverlayModel):
         self.overlay = GemmaOverlay(gguf, max_positions=capacity + BATCH, kv_k=kv_k)
         self.prefill = GemmaPrefill(self.overlay) if prefill else None
         path = assistant_of(gguf.path) if drafter == "" else drafter
-        self.drafter: GemmaDraft | None = None
+        self.drafter: GemmaDraft | None = None  # (OverlayModel's)
         if path and (drafter or os.path.exists(path)):
             self.drafter = GemmaDraft(self.overlay, GGUFFile(path))
         parallel_compile.compile_all([self.overlay.op] + ([self.prefill.lib] if prefill else []))
@@ -82,7 +82,7 @@ class NpuGemma(OverlayModel):
             self.prefill.bind()
             self.prefill.lib._kernel()  # (its HW context before timing, as the decode's)
         for S in range(1, BATCH + 1):  # (the steps' transactions; with drafts every S has logits)
-            self.overlay.prepare(S, logits=S == 1 or self.drafter is not None)
+            self.overlay.prepare(S, logits=True)
             self.overlay.prepare(S, logits=False)
         if self.prefill is not None:  # (a prompt's last token after its chunk)
             self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
@@ -91,19 +91,11 @@ class NpuGemma(OverlayModel):
             self.host.per_layer_inputs([0], self.host.embed([0]), bf16=True)
         gguf.release()
         self.position = 0
-        self.t_draft = 0.0
-        self.drafted = self.accepted = 0
 
     def describe(self) -> str:
         d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
         return (f"{self.overlay.image.streamed_bytes() / 1e9:.2f} GB of weights, {self.overlay.sizes['KV'] / 1e6:.0f} MB "
                 f"of KV cache ({self.capacity} positions){d}")
-
-    def stats(self) -> str:
-        if not self.drafted:
-            return ""
-        return (f"{self.drafted} draft tokens ({self.t_draft / self.drafted * 1e3:.2f} ms each), {self.accepted} "
-                f"accepted")
 
     def reset(self) -> None:
         """Forget the cached positions."""
@@ -207,39 +199,18 @@ class NpuGemma(OverlayModel):
         self.drafted += len(out)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
-                 mask: Mask | None = None) -> Iterator[int]:
-        """With the drafter: multi-token prediction. The sampled token's dispatch takes up to ``DRAFTS`` draft tokens
-        along; the model's logits after a token give its own next token (sampled), and as long as that is the draft that
-        ran behind it, the draft's logits are valid too. The rejected drafts' positions are forgotten (the next steps
-        overwrite their cache records)."""
-        if self.drafter is None:
-            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
-            return
-        if max_tokens == 0:
-            return
-        penalties = Penalties(sampling, prompt, mask)
-        token = sampling.pick(*penalties.top(logits, sampling.k))
-        penalties.accept(token)
-        h = self.hidden_state()
-        n = 1
-        yield token
-        while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else BATCH)
-            d = self.draft(token, h, k, penalties) if k > 0 else []
-            raw = self.steps([token, *d])
-            new: list[int] = []
-            for i in range(len(d) + 1):
-                new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.softcap)))
-                penalties.accept(new[i])
-                if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
-                    break
-            self.position -= len(d) + 1 - len(new)
-            self.accepted += len(new) - 1
-            h = self.hidden_state(len(new) - 1)
-            for token in new:
-                n += 1
-                yield token
+    def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
+        return self.draft(token, self._h, k, penalties)
+
+    def _begin(self) -> None:
+        """(the hidden state a draft continues from: the prompt's last token's)"""
+        if self.drafter is not None:
+            self._h = self.hidden_state()
+
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool) -> None:
+        super()._kept(p, tokens, m, mtp)
+        if self.drafter is not None:
+            self._h = self.hidden_state(m - 1)
 
 
 class Gemma(Model):

@@ -478,6 +478,17 @@ def test_stop_strings(fake: tuple) -> None:
     assert deltas(evs) == "START ok"
 
 
+def test_stop_strings_drafts() -> None:
+    """A stop string inside a step of several tokens: the cache holds the tokens the step ran past it too."""
+    _model, npu, engine = make(drafts=3)
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        npu.replies = [["Hello", " STO", "P", " more", " text", " end"]]
+        body = chat(client, "Hi", stop="STOP").json()
+        assert body["choices"][0]["message"]["content"] == "Hello "
+        assert npu.position == len(engine.cached) and engine.cached == npu.seq[:npu.position]
+
+
 # ----------------------------------------------------------------------
 # Tool calls
 # ----------------------------------------------------------------------

@@ -11,7 +11,7 @@ A model's entry in `docs/data/artlite.json` and where each number comes from (ke
 |---|---|---|
 | `ttft_s`: 1024 8192 32768 65536 (and 131072 where a compared runtime has it) | `artlite-bench -p 1024,8192,32768,65536 -n 0` | `avg_ns` / 1e9 of `pp<n>` (the prompt's chunks and the last token's logits) |
 | `prefill_tps`: 1024 32768 | the same run | `avg_ts` of `pp1024`, `pp32768` |
-| `decode_tps`: 1024 32768 | `artlite-cli` on an essay prompt of 1023 / 32767 tokens, `-n 256 --greedy` | its `generation: ... tokens/s` |
+| `decode_tps`: 1024 32768 | `artlite-cli` on an essay prompt of 1023 / 32767 tokens, `-n 256 --greedy --no-lookup` | its `generation: ... tokens/s` |
 | `mtp`: `decode_tps`, `tokens_per_step` | the decode runs again per draft count | the best S at each length, and its speed |
 | `image_ttft_s`: encoder, then image | `image_ttft.py` against `artlite-server --mmproj FILE` | the median per image (section 5) |
 
@@ -54,8 +54,8 @@ depends on the tokenizer.
 ## 3. Decode
 
 ```bash
-artlite-cli -m MODEL.gguf -f OUT_DIR/prompt1024.txt  -n 256 --greedy > /dev/null   # (the speeds go to stderr)
-artlite-cli -m MODEL.gguf -f OUT_DIR/prompt32768.txt -n 256 --greedy > /dev/null
+artlite-cli -m MODEL.gguf -f OUT_DIR/prompt1024.txt  -n 256 --greedy --no-lookup > /dev/null   # (the speeds go to stderr)
+artlite-cli -m MODEL.gguf -f OUT_DIR/prompt32768.txt -n 256 --greedy --no-lookup > /dev/null
 ```
 
 The stderr line `prompt: ... generation: N tokens in T s (R tokens/s): D dispatches of X ms ...` gives R. If the
@@ -65,13 +65,14 @@ spends assembling its chunks' control code, which artlite-bench's warmup absorbs
 
 ## 4. MTP: the best S
 
-For a model with a drafter (`NpuModel.DRAFTS`: Gemma 4 with its `mtp-<file>` next to the model, Qwen3.6 35B-A3B with
-ggml-org's `mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch.
-`artlite-cli` uses the maximum; `drafts.py` sets the count (0: steps of one token, the entry's `decode_tps`):
+For a model with a drafter (`OverlayModel.drafter`: Gemma 4 with its `mtp-<file>` next to the model, Qwen3.6 35B-A3B
+with ggml-org's `mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch.
+`artlite-cli` takes up to the maximum (`OverlayModel.DRAFTS`; per step the drafts that pay, `models.drafts`);
+`drafts.py` sets it (0: steps of one token, the entry's `decode_tps`):
 
 ```bash
 for D in 0 1 2 3; do
-  python .claude/skills/artlite-bench/drafts.py $D -m MODEL.gguf -f OUT_DIR/prompt1024.txt -n 256 --greedy 2>&1 >/dev/null | grep prompt:
+  python .claude/skills/artlite-bench/drafts.py $D -m MODEL.gguf -f OUT_DIR/prompt1024.txt -n 256 --greedy --no-lookup 2>&1 >/dev/null | grep prompt:
 done   # and the same for prompt32768.txt
 ```
 

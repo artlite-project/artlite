@@ -32,7 +32,8 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 
 ## On the NPU
 
-- Decode runs on the shared decode overlay (`models.llama.overlay`), up to 4 tokens per dispatch. The
+- Decode runs on the shared decode overlay (`models.llama.overlay`), up to 4 tokens per dispatch (a generation's:
+  the next one and draft tokens from the prompt, `models/drafts.py`). The
   weights are re-laid-out at load into a device buffer at their quantization's size; nothing is written to disk.
 - Prompts run through the prefill (`models.llama.prefill`): chunks of up to 4096 tokens (8B: 2048), layer-major
   programs assembled from one library ELF (GEMMs on the decode's weight image, the bf16 residual stream, a flash

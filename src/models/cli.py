@@ -59,6 +59,8 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--greedy", action="store_true", help="always the most likely token")
     p.add_argument("-s", "--seed", type=int, default=1608560892, help="sampling seed")
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
+    p.add_argument("--no-lookup", action="store_true",
+                   help="no draft tokens from the context (prompt lookup) in the multi-token steps")
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Gemma): one bfp16 block per 8 dims (Llama's default), or "
                         "hi + lo blocks (Gemma's default; +50%% cache bytes and read time)")
@@ -153,6 +155,7 @@ def main(argv: list[str] | None = None) -> None:
         npu = model.load(capacity=capacity, prefill=not args.no_prefill)
     except NotImplementedError as e:
         sys.exit(f"artlite-cli: {name}: not supported yet: {e}")
+    npu.lookup = not args.no_lookup
     npu.prepare(len(ids))
     sys.stderr.write(f"{name} ({model.name}): {len(ids)} prompt tokens; loaded in {time.perf_counter() - t0:.1f} s: "
                      f"{npu.describe()}\n")

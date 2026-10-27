@@ -74,6 +74,9 @@ codex -c model_provider=artlite -c 'model_providers.artlite={name="artlite", bas
   one. A prompt longer than the context fails with the code `context_length_exceeded`.
 - On every route a `developer` message is a system message, and where a template takes a system message only first
   (Qwen's), the later ones become user messages: Claude Code and Codex send them during a conversation.
+- Agents copy their context (an edit's old text, a file they rewrite, a command again): generation takes draft tokens
+  from it ([artlite-cli](cli.md#text)), so on recorded agent sessions Qwen3.6-27B, Qwen3.5-9B and Llama 3.1 8B generate
+  1.46-1.52x faster and MiniCPM-V 1.25x (Qwen3.6-35B-A3B and Gemma 4 guess with their drafters: +0-4% more).
 
 ## Web chat
 
@@ -198,6 +201,7 @@ Generation:
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V; default 32) |
+| `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |

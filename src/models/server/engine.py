@@ -339,11 +339,12 @@ class Engine:
     def _warm(self) -> None:
         """A short prompt and one step (as llama-server's warmup): the first request's dispatches find their HW
         contexts and transactions ready (the prompt's tokens through the prefill: a few, Qwen's chunks take 3 at
-        least)."""
+        least; ``NpuModel.prepare``: the steps of drafts)."""
         t0 = time.perf_counter()
         npu = self.npu
         ids = self.model.encode("The quick brown fox jumps over the lazy dog.")
         npu.reset()
+        npu.prepare(len(ids))
         logits = npu.forward(ids)
         npu.top_k(argmax(logits), 1)
         npu.reset()
@@ -381,6 +382,7 @@ class Engine:
         late = (tools.syntax.gap if job.inside else "") + force if force and thought else ""
         mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
         gen: list[int] = []
+        it = None  # (the generation's tokens)
 
         def forced(tokens: list[int]) -> None:
             gen.extend(tokens)
@@ -429,7 +431,8 @@ class Engine:
             finish = "length"
             while True:
                 left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-                for token in npu.generate(logits, left, job.sampling, ids + gen, mask):
+                it = npu.generate(logits, left, job.sampling, ids + gen, mask)
+                for token in it:
                     gen.append(token)
                     job.n_gen = len(gen)
                     if token in model.eos_token_ids:
@@ -463,7 +466,12 @@ class Engine:
             if calls is not None and calls.calls and not calls.calling:
                 finish = "tool_calls"
         finally:
-            cache.ran((ids + gen)[:npu.position])
+            rest: list[int] = []  # (a step of drafts ran tokens past a stop string or a cancel: the device holds them)
+            while it is not None and len(ids) + len(gen) + len(rest) < npu.position:
+                if (t := next(it, None)) is None:
+                    break
+                rest.append(t)
+            cache.ran((ids + gen + rest)[:npu.position])
         t2 = time.perf_counter()
         t = times(t2)
         job.emit("done", {"finish_reason": finish, "stop_word": stop.word, "timings": t, "n_prompt": len(ids),

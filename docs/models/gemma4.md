@@ -36,7 +36,8 @@ tokens writes them instead; the prefill's chunks: on the host).
 - Generation with the model's drafter (`mtp-<model file>` next to it; `gemma4/draft.py`): a draft step
   (~1.2 ms, a dispatch of the same design on the drafter's weights and the model's caches) guesses the
   next three tokens; one dispatch of four slots verifies them, and a draft is kept only where the
-  model's own choice at its position is that draft.
+  model's own choice at its position is that draft. Where the prompt promises more (a reply that copies
+  it), or without the drafter, the drafts are the prompt's (`models/drafts.py`).
 
 Memory:
 - The weights the NPU streams (3.04 GB of the 4.59 GB file, the per-layer projection as a Q8_0 copy among them) are

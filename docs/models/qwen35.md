@@ -84,7 +84,7 @@ super-block of the rows a pass dequantizes. Alpha runs as two BFP16 planes (hi +
 ## Multi-token prediction (Qwen3.6-35B-A3B, Occamy 1.0)
 
 With its drafter (the model's MTP layer: an attention layer and an MoE layer of its own, and an LM head), a generation
-step takes up to three draft tokens along (`qwen35/draft.py`, `NpuQwen.generate`): the drafter's guesses of what
+step takes up to three draft tokens along (`qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
 follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
 ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one), while the product of their probabilities stays at least
 0.5. The step runs the token and its drafts, and a draft is kept where the model's own token at its position is that
@@ -97,6 +97,10 @@ as code pages.
 
 A step of several tokens sums the experts' outputs in another order than a step of one, so greedy text with drafts can
 differ from greedy text without where the top two logits are within ~0.1 of each other.
+
+Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
+(`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's
+does, and with a drafter its rows follow the step's kept tokens.
 
 ## Images (MiniCPM-V 4.7)
 

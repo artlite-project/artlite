@@ -94,6 +94,8 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("-ctxcp", "--ctx-checkpoints", type=int, default=32,
                      help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8 and MiniCPM-V that "
                           "a prompt continues from; default: 32)")
+    gen.add_argument("--lookup", action=argparse.BooleanOptionalAction, default=True,
+                     help="draft tokens from the context (prompt lookup) for the multi-token steps (default: on)")
     gen.add_argument("--temp", type=float, help="sampling temperature (default: the model's; 0: greedy)")
     gen.add_argument("--top-k", type=int, help="sample among the k most likely tokens (default: the model's)")
     gen.add_argument("--top-p", type=float, help="nucleus sampling threshold (default: the model's)")
@@ -323,6 +325,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
         npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)
+        npu.lookup = args.lookup
         log.info("%s (%s): loaded in %.1f s: %s", name, model.name, time.perf_counter() - t0, npu.describe())
         return model, npu
 

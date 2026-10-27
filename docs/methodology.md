@@ -33,7 +33,7 @@ One NPU job at a time, with no other heavy CPU load.
 |---|---|
 | TTFT | `artlite-bench -p 1024,8192,32768,65536 -n 0 -r 3` (MiniCPM-V 4.7 1B also 131072): `avg_ns` of each `pp<n>` (the prompt's chunks and the last token's logits) |
 | prefill | the same run: `avg_ts` of `pp1024`, `pp32768` |
-| decode | `artlite-cli -n 256 --greedy` on a prompt of 1023 / 32767 tokens: its generation speed |
+| decode | `artlite-cli -n 256 --greedy --no-lookup` on a prompt of 1023 / 32767 tokens: its generation speed (no draft tokens from the context: the other runtimes run none by default) |
 | decode with MTP | the same at the best tokens per step for each length (1 to 4) |
 | image TTFT | `artlite-server --mmproj FILE`, streaming `/v1/chat/completions` requests of an image and "Describe this image in detail.", thinking off, greedy: the client's time to the first token, median of 3 after a warmup |
 

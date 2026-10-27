@@ -29,6 +29,8 @@ import torch
 
 from artlite import _native, backend, portable
 
+from .drafts import Lookup, Planner
+
 if TYPE_CHECKING:
     from artlite.decode.model import Records
 
@@ -456,12 +458,43 @@ class OverlayModel(NpuModel):
     chunk's inputs prepared on a worker thread while the previous chunk runs; ``forward`` is a prompt with its last
     token's logits (a decode step's, or of a chunk's last token: ``_chunk_logits``). A model supplies a step's inputs
     (``_step_inputs``: the overlay step's arguments before the position), a chunk's (``_chunk_inputs``: the prefill
-    run's), the logits of a chunk's last token and the soft cap of its final logits (``softcap``)."""
+    run's), the logits of a chunk's last token and the soft cap of its final logits (``softcap``).
+
+    ``generate`` runs a generation in rounds: a step of the sampled token and up to ``DRAFTS`` draft tokens - the
+    context's (``lookup``: ``drafts.Lookup``) or a drafter's (multi-token prediction: ``_mtp``), as ``planner``
+    chooses -, and as long as the token the model's logits give after a token is the draft that ran behind it, the
+    draft's logits are valid too. A model with a drafter or lazy states supplies the round's step (``_verify``) and
+    what follows its kept tokens (``_kept``)."""
 
     overlay: Any
     prefill: Any
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
+    DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
+    STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. 4 tokens' time relative to one's, until measured
+    lookup = True  # drafts from the context
+    drafter: Any = None  # a multi-token-prediction drafter
+    t_draft = 0.0  # seconds in the drafter's steps
+    drafted = accepted = 0  # draft tokens run and accepted (of both kinds)
+    drafted_ctx = accepted_ctx = 0  # the context's of them
+
+    @functools.cached_property
+    def planner(self) -> Planner:
+        """(across the model's generations: its steps' times, the drafts' acceptance)"""
+        return Planner(self.STEP_COST)
+
+    @property
+    def _drafting(self) -> bool:
+        return self.drafter is not None and self.DRAFTS > 0
+
+    def stats(self) -> str:
+        out = []
+        if mtp := self.drafted - self.drafted_ctx:
+            out.append(f"{mtp} draft tokens ({self.t_draft / mtp * 1e3:.2f} ms each), "
+                       f"{self.accepted - self.accepted_ctx} accepted")
+        if self.drafted_ctx:
+            out.append(f"{self.drafted_ctx} context draft tokens, {self.accepted_ctx} accepted")
+        return "; ".join(out)
 
     def cap(self, logits: torch.Tensor) -> torch.Tensor:
         """The model's logits of the overlay's (fp32): the soft cap, if any."""
@@ -637,6 +670,70 @@ class OverlayModel(NpuModel):
     def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> torch.Tensor:
         """Run the tokens after the cached positions: the logits (vocab,) of the last."""
         return self.prompt(tokens, logits=True, progress=progress)
+
+    def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
+        """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""
+        raise NotImplementedError
+
+    def _begin(self) -> None:
+        """A generation's rounds begin (after its prompt's last step)."""
+
+    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
+        """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab)."""
+        return self.steps(tokens)
+
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool) -> None:
+        """After a round's step of ``tokens`` at p: its first m tokens are the sequence's (the rejected drafts'
+        positions are forgotten: later steps overwrite their cache records)."""
+        self.position = p + m
+
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
+                 mask: Mask | None = None) -> Iterator[int]:
+        """(in rounds of a step of drafts each: the class docstring)"""
+        if max_tokens == 0:
+            return
+        penalties = Penalties(sampling, prompt, mask)
+        token = sampling.pick(*penalties.top(logits, sampling.k))
+        penalties.accept(token)
+        n = 1
+        yield token
+        ctx = Lookup(getattr(prompt, "ids", prompt)) if self.lookup and self.DRAFTS > 0 else None
+        if ctx is not None:
+            ctx.extend([token])
+        self._begin()
+        plan = self.planner
+        while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
+            k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else 4)
+            t0 = time.perf_counter()
+            m, d = ctx.draft(k) if ctx is not None else (0, [])
+            j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
+            mtp = j is None
+            d = self._mtp(token, k, penalties) if mtp else d[:j]
+            p = self.position
+            t1 = time.perf_counter()
+            raw = self._verify([token, *d], mtp)
+            t2 = time.perf_counter()
+            new: list[int] = []
+            for i in range(len(d) + 1):
+                new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.softcap)))
+                penalties.accept(new[i])
+                if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
+                    break
+            self._kept(p, [token, *d], len(new), mtp)
+            plan.ran(len(d) + 1, t2 - t1)
+            self.accepted += len(new) - 1
+            if mtp:
+                plan.drafted(m, len(new), t2 - t0)
+            elif d:
+                plan.accepted(m, len(d), len(new) - 1)
+                self.drafted += len(d)
+                self.drafted_ctx += len(d)
+                self.accepted_ctx += len(new) - 1
+            if ctx is not None:
+                ctx.extend(new)
+            for token in new:
+                n += 1
+                yield token
 
     def forced_logits(self, tokens: list[int], first: int = 0, *, batch: int = 1) -> torch.Tensor:
         """Teacher-forced logits (len(tokens) - first, vocab) fp32 of tokens[first:], from position 0, ``batch`` tokens
