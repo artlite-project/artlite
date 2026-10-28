@@ -159,6 +159,10 @@ offsets): aie2p-coding section 8. For speed:
 - **Release early**: split work across kernel calls so an input object can be released as soon as its stage is done
   (a per-k-tile stage in its own call). A core that gathers what it needs from a shared stream copies it out and
   releases the object.
+- **Work between a release and the next acquire overlaps the next object's transfer** into a one-buffer FIFO (a core
+  without L1 for a second buffer): a kernel call after the release. qwen35's decode attention runs a group's softmax
+  (it needs only the scores) after the second K object's release, while the V object streams in (`attn.asoft`):
+  ~1100 of the ~1400 cycles a 9280-B object takes at 8 B / cycle.
 - **A shim producer can broadcast across columns**: one KV head's stream feeds the 8 cores of its two columns (qwen35
   prefill attention), halving the shim reads.
 - **Deeper L1 / memtile FIFOs do not help a DMA-bound operator**, and they cost BD ids (24 per memtile channel

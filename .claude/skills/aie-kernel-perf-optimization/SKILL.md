@@ -187,8 +187,13 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   (`formats/q3k.py` `_q3k_mm`).
 - **At most two bfp16 panel streams per loop** (2 `lf` registers). A third `BIn` stream's load state is spilled and
   reloaded every iteration: three streams (Q, K hi, K lo) II 12 per d-block, as two loops of two streams II 4 each.
-  A stream's pops all sit on one load slot. Output streams likewise: the push / flush chain of one `BOut` bounds a loop
-  pushing two panels per iteration at II ~16-17 (slot bound 7); two `BOut`s spilled their state (II 22).
+  A stream's pops all sit on one load slot; a loop body of fewer than 8 pops per stream also carries a
+  `vlda.fill.512` per pop (machine-model.md): a panel per 2 cycles, so a loop whose MMULs each pop an operand is bound
+  at 2 cycles per MMUL. Reuse every popped panel for two or more MMULs (R13). Output streams
+  likewise: the push / flush chain of one `BOut` bounds a loop pushing two panels per iteration at II ~16-17 (slot
+  bound 7); two `BOut`s spilled their state (II 22).
+- **Panels held across a loop in 1-D arrays**: `BV P[2][4]` popped before a P V loop spilled a panel every
+  iteration (II 13); the same 8 panels as four `BV x[2]` arrays held, II 8 = the MMUL bound.
 - **Chains**: a single long dependence chain (dequant -> scale -> MAC) has II ≈ its latency. Unroll it 2x into
   independent chains and pipeline post-RA (a fused dequant GEMV: 14 per group -> 13 per two groups). 4x bodies exceed
   the pipeliner (> ~70 bundles).

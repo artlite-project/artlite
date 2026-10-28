@@ -88,7 +88,7 @@ With its drafter (the model's MTP layer: an attention layer and an FFN of its ow
 file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three
 draft tokens along (`qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what follows, one dispatch of
 the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with ggml-org's Q4_0 drafter,
-3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 15 ms at 32K), as long as their chain's probability pays for what
+3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 14 ms at 32K), as long as their chain's probability pays for what
 they cost: a draft's slot in the step and the drafter's step for the next one, against the tokens per second the model's
 rounds give (`OverlayModel._worth`; a dense model's slot costs ~1.5% of its step, so its chains go on down to a
 probability of ~0.1, an MoE's slots route to more experts: ~0.4-0.5). The step runs the token and its drafts, and a

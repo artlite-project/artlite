@@ -291,6 +291,13 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   place in one region put P V 50% above its schedule (548 vs 364 cycles).
 - 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
   pops (each K panel once per head) and its in-place o (no L1 for a second copy).
+- **The same in decode** (`models/qwen35/attn.py`: up to 12 query rows, 3 sets of [4 rows hi | 4 rows lo], against
+  a pass over the whole cache): every K panel popped once for all sets (Q panels [d-block][set]: II 6 for 3 MMULs per
+  K half, the Q stream's pops), P V over octets (two sets' 8 rows, P hi and P lo two MMULs into one 8-row accumulator:
+  no fold of hi into lo rows, which bound the mv slot; records 2k, 2k + 1 per y round trip on two V streams: II 8 for 8
+  MMULs), the softmax's exp2 the bias-192 form, and the softmax while the V object streams in (data-movement.md
+  "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.54 / 3.23 -> 2.12 / 2.14 ms per layer (2 /
+  3 sets), the DMA floor (2.11).
 
 ## R14 Weight panels from gathers (IQ3_XXS, `formats/iq3.py`)
 

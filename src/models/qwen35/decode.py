@@ -159,11 +159,12 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             k_aqpan = Kernel(f"{p}_aqpan", "kernel.o", [aws_ty])
             k_akv = Kernel(f"{p}_akv", "kernel.o", [x_ty, aws_ty, np.int32])
             k_aobj = Kernel(f"{p}_aobj", "kernel.o", [a_ty, aws_ty])
+            k_asoft = Kernel(f"{p}_asoft", "kernel.o", [aws_ty])
             k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
             tok_ty = np.ndarray[(16,), i32]
             k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, c_ty])
 
-            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, aend, aemit, ws, pw, col):
+            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, col):
                 # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
                 # attention step: a core produces its east token around its scores (a split step's partial stays in its
                 # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
@@ -201,6 +202,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             a = a_f.acquire(1)
                             aobj(a, ws)
                             a_f.release(1)
+                            asoft(ws)  # (a group's softmax while its V object streams in)
                         if t_in:
                             t_in[0].acquire(1)
                             aend(ws, pw)
@@ -223,7 +225,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                 t_in = [toks[c - 1].cons()] if c % n else []
                 t_out = [toks[c].prod()] if c in toks else []
                 workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=1), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(),
-                                                t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_aend,
+                                                t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
                                                 k_aemit, aws[c], aws[c - 1 if c % n else c], c],
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
