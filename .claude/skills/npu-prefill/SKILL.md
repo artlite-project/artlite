@@ -131,6 +131,13 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   27B 8.2 M (its gdn_in's 96-column windows do not fit L1). Windows maps the NPU's memory in 4 KB pages: every DMA row
   on a page of its own costs a translation (~50 M rows/s in all), which the prefill's short rows (128-576 B at strides
   of KBs) pay; longer contiguous rows would.
+- Platform throttles: a Krackan Point laptop asserts PROCHOT (the whole SoC at its lowest clocks) within about a
+  millisecond of each GEMM that runs its MMULs at 35-51% of their peak while it streams weights (the Q4_K GEMMs: 2.3x
+  slower), on any power source; MMULs alone at that duty, DMA alone at 97 GB/s, the Q6_K GEMMs (29-33%), attention and
+  norms do not trip it. So every GEMM of a prefill is a paced design (`gemm_q`'s "Pacing": a new one gets its class
+  from `prefill.gemm._gemm`), its levels calibrated per machine (`prefill.pace`). A design-wide runtime switch costs
+  nothing only as one branch per item between two copies of the core's loop nest: branches around each acquire cost
+  GemmQ 3%.
 - Levers that worked: the A strip resident through K parts (`prefill.gemm.resident_k_part`); reading each weight byte once (header units); more
   queries per attention pass where L1 allows (sliding window: 2 blocks of 32); a broadcast KV stream on both of each
   core's input channels (full attention at 30K: -41%); the last token from the prefill's last

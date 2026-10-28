@@ -84,11 +84,12 @@ def test_control_rates() -> None:
 
 def _data(control_scale: float = 1.0, v1_ms: float | None = None, prochot: float = 0.0) -> dict:
     """A diagnosis' data from Strix Halo's reference numbers (the control path scaled; V1's prompt time set; the
-    platform holding PROCHOT for ``prochot`` of the prompts, of the Q4_K kinds run alone and of the full-duty sweep)."""
+    platform holding PROCHOT for ``prochot`` of the prompts, of the Q4_K kinds run alone and of the pace levels below 3,
+    which then run 2.3x slower; V5 at the calibrated level 3 as fast as Strix Halo's V0 over its duty)."""
     from models.diagnose import reference
 
     ref = reference.HALO
-    ms = {k: 1024 / v * 1e3 for k, v in ref["pp1024"].items()}
+    ms = {k: 1024 / v * 1e3 for k, v in ref["pp1024"].items() if not k.startswith("V5")}  # (V5: below)
     if v1_ms is not None:
         ms[next(k for k in ms if k.startswith("V1"))] = v1_ms
     runs = []
@@ -112,10 +113,22 @@ def _data(control_scale: float = 1.0, v1_ms: float | None = None, prochot: float
     v0 = next(r for r in runs if r["variant"].startswith("V0"))
     for k in v0["kinds"]["kinds"]:
         tel[f"{v0['variant']}, round 1: kinds: {k}"] = step(prochot if "Q4_K" in k else 0.0)
-    v0["duty"] = {"kind": "GemmQOperator Q4_K 2048x8192", "items": 16, "duties": {}}
-    for d, share in (("100%", prochot), ("50%", 0.0)):
-        v0["duty"]["duties"][d] = {"item_ms": 2.2, "items_run": 600}
-        tel[f"{v0['variant']}, round 1: duty {d}"] = step(share)
+    from artlite.gemm.gemm_q import PACE_IDLE, pace_word
+
+    v0["pace_sweep"] = {"kind": "GemmQOperator Q4_K 2048x8192", "items": 16, "class": 4, "levels": {}}
+    for level, idle in enumerate(PACE_IDLE):
+        duty = 16 / (16 + idle)
+        held = prochot if level < 3 else 0.0
+        v0["pace_sweep"]["levels"][str(level)] = {"ms": 36.0 / duty * (2.3 if held else 1.0), "duty": duty}
+        tel[f"{v0['variant']}, round 1: pace {level}"] = step(held)
+    word = pace_word({4: 3}) if prochot else 0
+    v0["calibration"] = {"word": word, "levels": "gu 3" if prochot else "", "table": {"seconds": 1.2}}
+    v0_ms = ms[next(k for k in ms if k.startswith("V0"))]
+    for rnd in (1, 2):
+        runs.append({"variant": "V5: V0 at the calibrated paces", "round": rnd,
+                     "pp1024_ms": [v0_ms / (2.3 if prochot else 1.0) * 1.3 if prochot else v0_ms] * 5,
+                     "lookups_ms_per_prompt": 2.0, "anon_huge_mb": 1100.0, "holds": "", "pace_word": word})
+        tel[f"V5: V0 at the calibrated paces, round {rnd}"] = step(0.0)
     return {"code": {"local_commits": [], "changed_files": [], "stale_install": ""},
             "dma": ref["dma"], "control": control, "model": {"runs": runs, "resident_before": 1.0},
             "telemetry": tel, "dpm_mhz": {"fclk": [400, 2000]}, "identity": {"cpus": {}, "npu": {}},
@@ -125,8 +138,9 @@ def _data(control_scale: float = 1.0, v1_ms: float | None = None, prochot: float
 def test_verdicts() -> None:
     """Strix Halo's own numbers point to no cause; a control path 1.6x slower to H11, its cost on the 1B chunk the
     control code's bytes times the extra ns per byte and the configurations times the extra switch; 4 KB pages faster
-    than 2 MB to H2's possibility; PROCHOT for most of the prompts to H12, with the kinds that held it alone."""
-    from models.diagnose import report, verdict
+    than 2 MB to H2's possibility; PROCHOT for most of the prompts to H12, with the kinds that held it alone, and to H13
+    where a pace level lets the largest kind run unthrottled."""
+    from models.diagnose import reference, report, verdict
 
     v = {x["cause"][:3]: x for x in verdict.evaluate(_data())}
     assert all(not x["verdict"].startswith("yes") for x in v.values()), v
@@ -137,12 +151,16 @@ def test_verdicts() -> None:
     assert pages["H2 "]["verdict"] == "possible", pages["H2 "]
     hot = {x["cause"][:3]: x for x in verdict.evaluate(_data(prochot=0.84))}
     assert hot["H12"]["verdict"] == "yes" and "84% of the prompts" in hot["H12"]["evidence"], hot["H12"]
-    assert "held during ['GemmQOperator Q4_K" in hot["H12"]["evidence"] and "50% 0%" in hot["H12"]["evidence"]
+    assert "held during ['GemmQOperator Q4_K" in hot["H12"]["evidence"]
     assert v["H12"]["verdict"] == "no", v["H12"]
+    assert hot["H13"]["verdict"] == "yes" and "fastest at 3" in hot["H13"]["evidence"], hot["H13"]
+    assert "calibrated: gu 3" in hot["H13"]["evidence"] and "PROCHOT 0%" in hot["H13"]["evidence"], hot["H13"]
+    assert v["H13"]["verdict"] == "no" and "fastest at 0" in v["H13"]["evidence"], v["H13"]
     d = _data(prochot=0.84)
     d.update(verdicts=verdict.evaluate(d), identity={**d["identity"], "dmi": dict.fromkeys(
         ("sys_vendor", "product_name", "product_version", "board_name", "bios_vendor", "bios_version", "bios_date"), ""),
         "cpus": {"model": "?"}, "ip_versions": {}, "kernel": "?", "thp": {"enabled": "?"}, "platform_profile": {},
         "power_supplies": {}}, code={**d["code"], "commit": "x", "describe": "x"})
     md = report.markdown(d, "x.json")
-    assert "### Verdicts" in md and "| 100% | 2.2 | 600 | 2.9 | 84% |" in md, md
+    ref_pace3 = reference.HALO["pace_ms"]["3"]
+    assert "### Verdicts" in md and f"| 3 | 0.7 | 49.5 | {ref_pace3} | 0% |" in md and "Calibrated paces" in md, md

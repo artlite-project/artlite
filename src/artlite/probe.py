@@ -24,7 +24,7 @@ from aie.iron.device import NPU2, Tile
 
 from . import txn
 from .operators.base import JINJA_ENV, ArgSpec, ArtcOperator
-from .operators.design import COLS
+from .operators.design import COLS, CORE_PROCESSOR_BUS
 from .operators.kernel_source import kernel_prefix
 
 P = kernel_prefix("probe")
@@ -100,13 +100,13 @@ extern "C" void {{ p }}_load(const int32_t *__restrict n, int8_t *__restrict dat
 """)
 LOAD_BYTES = 4096  # (16 x 256 B of panels; the 4 accumulators' 1 KB after them)
 
-CORE_PROCESSOR_BUS = 0x32038  # (bit 0: the core reaches its tile's registers with read_tm / write_tm)
 
 
 class ClockProbeOperator(ArtcOperator):
     """One core (column 0, row 2) spinning for ``n[0]`` cycles of its cycle counter; ``out[0]``: the cycles it
     counted. ``load``: every core of the array (4 rows x 8 columns, ``n`` broadcast in each column) runs MMULs on random
-    data meanwhile, until its own counter has advanced as far: the clock under the power a prefill's GEMMs draw."""
+    data meanwhile (II 5 for 4 MMULs: about half the MMUL peak, a prefill GEMM's MAC duty, without its weight streams),
+    until its own counter has advanced as far: the clock under compute alone."""
 
     WORDS = 16
 

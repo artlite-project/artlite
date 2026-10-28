@@ -27,7 +27,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 SMOKE = (
     "test_app_designs.py", "decode/test_kv.py", "test_overlay.py", "gemma4/test_attn.py", "llama/test_image.py",
     "qwen35/test_image.py", "gemm/test_dma.py", "operators/test_render_cache.py", "server/test_server.py",
-    "test_sampling.py", "minicpmv/test_host.py", "minicpmv/test_npu.py", "test_probe.py", "operators/test_kmath.py",
+    "test_sampling.py", "prefill/test_pace.py", "minicpmv/test_host.py", "minicpmv/test_npu.py", "test_probe.py", "operators/test_kmath.py",
     "server/test_router.py::test_catalog", "server/test_router.py::test_preset", "server/test_router.py::test_router",
     "operators/test_fused.py::test_library_program", "operators/test_fused.py::test_library_program_memory_variants",
     "operators/test_fused.py::TestFusedOperator::test_silu_add",

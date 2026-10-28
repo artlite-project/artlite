@@ -102,7 +102,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/gemm/` | the GEMMs on the weight tiles: GemmQ, GemmQd (a dequantizing core per column), their MAC loop |
 | `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma and Llama (`attn.py`), the models' shared host side (`model.py`) |
-| `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs, the GEMM planner, the residual norms, the attention of a column per KV head (Llama's) |
+| `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs, the GEMM planner, the GEMMs' pace calibration (`pace.py`), the residual norms, the attention of a column per KV head (Llama's) |
 | `src/artlite/moe/` | MoE layers: the routing on the decode overlay's cores, the prefill's router, expert work lists and gathers |
 | `src/artlite/vision/` | the vision overlay: a whole image network per dispatch on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
@@ -165,8 +165,9 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   host-built transactions (`artlite/decode/`: the models' shared host side `model.py`, the KV record format `kv.py`,
   the attention core of Gemma and Llama `attn.py`).
 - Prefill: layer-major chunk programs (`artlite/prefill/chunks.py`) of GEMMs on the decode's weight image
-  (`artlite/prefill/gemm.py`), the residual norms (`norm.py`: bf16 for Qwen and Llama, fp32 for Gemma) and Llama's
-  attention (`attn.py`), writing the caches the decode continues from (the `npu-prefill` skill).
+  (`artlite/prefill/gemm.py`, paced where a machine throttles them: `pace.py`), the residual norms (`norm.py`: bf16
+  for Qwen and Llama, fp32 for Gemma) and Llama's attention (`attn.py`), writing the caches the decode continues from
+  (the `npu-prefill` skill).
 - Image networks (Stable Diffusion's UNet and VAE decoder, MiniCPM-V's vision encoder) run whole on the vision overlay
   (`artlite/vision/`), a dispatch per network.
 - Each model's design is in its package's module docstrings.

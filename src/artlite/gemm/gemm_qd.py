@@ -43,7 +43,19 @@ from ..operators import kmath
 from ..operators.design import COLS
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import pin_l1_buffers
-from .gemm_q import _KERNEL_TPL, B_DEPTH, KT, L1_BUDGET, LINE, GemmQOperator, L1Error, line_window, pack_plan, planar
+from .gemm_q import (
+    _KERNEL_TPL,
+    B_DEPTH,
+    KT,
+    L1_BUDGET,
+    LINE,
+    GemmQOperator,
+    L1Error,
+    line_window,
+    pack_plan,
+    planar,
+    run_paced,
+)
 from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
@@ -99,6 +111,11 @@ class GemmQdOperator(GemmQOperator):
             self.csplit = REGION
             if self._planar_layout(self.m) is None:
                 self.csplit = 0
+
+    def pace_cores(self) -> list[tuple[int, int]]:
+        """(column 0's dequantizing core and its first MAC core: whichever of the two kinds is the slower sets the rate,
+        and a paced core with slack would idle into its waits)"""
+        return [(0, 2), (0, 3)] if self.pace is not None else []
 
     def _buffers(self, m: int) -> dict[str, tuple[int, int]]:
         """(count, bytes) of the MAC core's buffers (the dequantizing core's: ``_dq_buffers``): A, the
@@ -307,7 +324,7 @@ class GemmQdOperator(GemmQOperator):
                                   us=self.us, c_pairs=False, macf="", slots=self.slots,
                                   pack_plan=pack_plan(self.nm, self.n_out, self.n_c, self.tiles, self.R)
                                   if self.c_pack and self.slots == 2 else None,
-                                  **slot(self.fmt).qd_template_vars(self))
+                                  **self._pace_vars(), **slot(self.fmt).qd_template_vars(self))
 
     def get_mlir_artifact(self) -> Module:
         MR = self.nrows  # MAC rows
@@ -388,7 +405,10 @@ class GemmQdOperator(GemmQOperator):
                     dfo.release(1)
                 bf.release(1)
 
-        def dq_fn(prm, bf, dfo, hdr, dq, ws, hb, *extra):  # extra: dk.sb, dk.chunk, the ex buffer (those present)
+        def dq_fn(pc, prm, bf, dfo, hdr, dq, ws, hb, *extra):  # extra: dk.sb, dk.chunk, the ex buffer (those present)
+            run_paced(pc, self.pace, lambda b: dq_item(prm, b, dfo, hdr, dq, ws, hb, *extra), bf)
+
+        def dq_item(prm, bf, dfo, hdr, dq, ws, hb, *extra):
             ex = extra[-1:] if dk.ex_ty is not None else ()
             for _ in self._chunk_passes(prm):  # token chunks x passes: the weights stream once per chunk
                 if self.hg > 1:  # a header unit per group of K chunks, then its chunks
@@ -417,7 +437,10 @@ class GemmQdOperator(GemmQOperator):
                                 extra[0](hb, ws, sb)
                             dq_tiles(bf, dfo, dq, ws, ex, sb)
 
-        def units_fn(prm, bf, dfo, sbk, dq, ws, hb, *ex):  # (super-block units: a weight object per unit; ex: ``ex``, tables)
+        def units_fn(pc, prm, bf, dfo, sbk, dq, ws, hb, *ex):  # (super-block units: a weight object per unit; ex: ``ex``, tables)
+            run_paced(pc, self.pace, lambda b: units_item(prm, b, dfo, sbk, dq, ws, hb, *ex), bf)
+
+        def units_item(prm, bf, dfo, sbk, dq, ws, hb, *ex):
             for _ in self._chunk_passes(prm):
                 for _ in range_(n_kc):
                     for sb in range_(nsb):
@@ -435,7 +458,10 @@ class GemmQdOperator(GemmQOperator):
 
         pingpong = self.pingpong
 
-        def mac_fn(prm, dfi, af, cf, zero, mm, *extra):
+        def mac_fn(pc, prm, dfi, af, cf, zero, mm, *extra):
+            run_paced(pc, self.pace, lambda d: mac_item(prm, d, af, cf, zero, mm, *extra), dfi)
+
+        def mac_item(prm, dfi, af, cf, zero, mm, *extra):
             act_args = tuple(extra[-2:]) if gelu else (0,)  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
             if self.G > 1:  # row groups: per pass vp C objects of ``slots`` slots, each over the whole A strip
                 for _ in self._chunk_passes(prm):
@@ -522,6 +548,7 @@ class GemmQdOperator(GemmQOperator):
 
         workers = []
         prm = self._mc_prm()
+        pcs = self._pace_args()
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"gq_ws_{c}")
             hb = Buffer(hb_ty, name=f"gq_hb_{c}")
@@ -529,10 +556,11 @@ class GemmQdOperator(GemmQOperator):
             if dk.tables is not None:  # (a lookup table's two copies: ``_place_plan`` puts them in two regions)
                 ex_buf += [Buffer(dk.tables[0], name=f"gq_{key}_{c}", initial_value=dk.tables[1]) for key in ("tab", "tabb")]
             if dk.units:
-                workers.append(Worker(units_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.sb, dk.dq, ws, hb, *ex_buf],
+                workers.append(Worker(units_fn, [pcs.get((c, 2)), prm, b_l1[c].cons(), d_f[c].prod(), dk.sb, dk.dq, ws, hb,
+                                                 *ex_buf],
                                       tile=Tile(c, 2), stack_size=2048, dynamic_objfifo_lowering=True))
             else:
-                workers.append(Worker(dq_fn, [prm, b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
+                workers.append(Worker(dq_fn, [pcs.get((c, 2)), prm, b_l1[c].cons(), d_f[c].prod(), dk.hdr, dk.dq, ws, hb,
                                               *([dk.sb] if dk.sb is not None else []),
                                               *([dk.chunk] if dk.chunk is not None else []), *ex_buf],
                                       tile=Tile(c, 2), stack_size=2048, dynamic_objfifo_lowering=True))
@@ -546,7 +574,8 @@ class GemmQdOperator(GemmQOperator):
                 if gelu:
                     extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.GELU.table_words())
                               for key in ("lut", "lutb")]
-                workers.append(Worker(mac_fn, [prm, d_f[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero,
+                workers.append(Worker(mac_fn, [pcs.get((c, 3 + row)), prm, d_f[c].cons(), a_l1[row].cons(),
+                                               c_l1[row][c].prod(), k_zero,
                                                k_mm, *extra],
                                       tile=Tile(c, 3 + row), stack_size=self.mac_stack, dynamic_objfifo_lowering=True))
 

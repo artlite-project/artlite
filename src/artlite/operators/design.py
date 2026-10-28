@@ -11,6 +11,8 @@ from aie.iron.dataflow import objectfifo as _objectfifo
 
 COLS = 8  # array columns
 ROWS = 4  # compute rows per column (rows 2-5; memtile row 1, shim row 0)
+CORE_PROCESSOR_BUS = 0x32038  # (a core tile register, bit 0: the core reaches its tile's registers with read_tm / write_tm;
+# a core that reads its timer without it stalls)
 
 
 def range32(stop: object, *, unroll: bool = True) -> Iterator[object]:

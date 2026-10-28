@@ -1,9 +1,10 @@
 """The diagnosis' model part: Llama 3.2 1B's prompt of 1024 tokens in variants - host buffers of 2 MB pages (user BOs
 from 2 MB on) or of 4 KB pages (the driver's BOs below 64 MB), packed C drains in whole 64-byte lines or not
-(``prefill.gemm.LINES``), a busy CPU - in two rounds, with each run's state: the chunk's time per operator kind (each
-kind alone, in a telemetry step of its own: which kinds the platform throttles), the largest kind at lower duties, a
-design switch's cost inside its program, the host's row lookups, the huge pages the process got, how much of the file
-the page cache holds."""
+(``prefill.gemm.LINES``), a busy CPU, the dense GEMMs paced as ``prefill.pace`` calibrates them on this machine - in
+two rounds, with each run's state: the chunk's time per operator kind (each kind alone, in a telemetry step of its own:
+which kinds the platform throttles), the largest kind at each pace level, the calibration, a design switch's cost inside
+its program, the host's row lookups, the huge pages the process got, how much of the file the page cache holds. V0-V4
+run unpaced (``ARTLITE_PACE=off`` for the whole diagnosis: comparable with Strix Halo's reference)."""
 
 from __future__ import annotations
 
@@ -22,21 +23,25 @@ import numpy as np
 import torch
 
 from artlite import _native as native
+from artlite.gemm.gemm_q import PACE, PACE_IDLE, pace_word
 from artlite.gguf_model import GGUFFile
 from artlite.prefill import gemm as prefill_gemm
+from artlite.prefill import pace as pacing
 
 from .. import open_model
 from ..bench import Test, file_info, measure, token_source
 
 MB = 1 << 20
 FILE = "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-# (name, host pages, whole-line drains, a busy CPU): V0 is Artlite's own, V4 V0 with one CPU spinning elsewhere (CPU
-# load raises the fabric clock on Phoenix; it keeps cores out of deep C-states)
-VARIANTS = [("V0: 2 MB pages, whole lines", "2 MB", True, False),
-            ("V1: 4 KB pages, whole lines", "4 KB", True, False),
-            ("V2: 2 MB pages, partial lines", "2 MB", False, False),
-            ("V3: 4 KB pages, partial lines", "4 KB", False, False),
-            ("V4: V0 with a busy CPU", "2 MB", True, True)]
+# (name, host pages, whole-line drains, a busy CPU, paced): V0 is Artlite's own unpaced, V4 V0 with one CPU spinning
+# elsewhere (CPU load raises the fabric clock on Phoenix; it keeps cores out of deep C-states), V5 V0 at the paces the
+# calibration (V0's first round) found
+VARIANTS = [("V0: 2 MB pages, whole lines", "2 MB", True, False, False),
+            ("V1: 4 KB pages, whole lines", "4 KB", True, False, False),
+            ("V2: 2 MB pages, partial lines", "2 MB", False, False, False),
+            ("V3: 4 KB pages, partial lines", "4 KB", False, False, False),
+            ("V4: V0 with a busy CPU", "2 MB", True, True, False),
+            ("V5: V0 at the calibrated paces", "2 MB", True, False, True)]
 
 
 def default_file() -> str:
@@ -137,7 +142,6 @@ def kind_of(pf: object, op: object) -> str:
 
 
 KIND_SECONDS, IDLE_SECONDS = 1.5, 1.5  # (a kind looped alone; idle before it, so that a throttle it set off lets go)
-DUTIES = (1.0, 0.75, 0.5, 0.25)  # (the duty sweep's shares of time the NPU runs)
 
 
 def _run_ms(pf: object, prog: list, reps: int) -> float:
@@ -200,31 +204,25 @@ def kinds(npu: object, *, step: Callable[[str], None], end: Callable[[str], None
     return out
 
 
-def duty_sweep(npu: object, kind: str, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
+def pace_sweep(npu: object, kind: str, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
                T: int = 1024) -> dict[str, object]:
-    """The items of one operator kind of the chunk run one at a time, each followed by sleep for duty d ((1 - d) / d
-    of its time) for KIND_SECONDS per duty in DUTIES (telemetry steps ``{tag}: duty {d}``): a throttle that follows
-    the NPU's average power over milliseconds lets go at a lower duty (the items then run at full speed), one that
-    follows each item's load holds at every duty."""
+    """The items of one operator kind of the chunk (a paced GEMM's) as a program of their own at each pace level
+    (``gemm_q.PACE_IDLE``), each for KIND_SECONDS after IDLE_SECONDS idle (telemetry steps ``{tag}: pace {level}``): the
+    level from which the platform lets the kind run unthrottled, and its time there."""
     pf = npu.prefill
     T = min(s for s in pf.sizes if s >= T)
     items = pf._program(T)
-    prog = [it for it, (op, *_) in zip(items, pf.runlists[T]) if kind_of(pf, op) == kind]
-    bufs = list(pf.ov.dev.buffers.values())
-    out: dict[str, object] = {"kind": kind, "items": len(prog), "duties": {}}
-    for d in DUTIES:
+    pairs = [(it, op) for it, (op, *_) in zip(items, pf.runlists[T]) if kind_of(pf, op) == kind]
+    cls = pairs[0][1].pace
+    out: dict[str, object] = {"kind": kind, "items": len(pairs), "class": cls, "levels": {}}
+    for level in range(len(PACE_IDLE)):
+        pf.lib.set_params({PACE: pace_word({cls: level})})
         time.sleep(IDLE_SECONDS)
-        step(f"{tag}: duty {d:.0%}")
-        t = []
-        stop = time.perf_counter() + KIND_SECONDS
-        while time.perf_counter() < stop or len(t) < 3:
-            t0 = time.perf_counter()
-            pf.lib.run([prog[len(t) % len(prog)]], splits=[], bufs=bufs)
-            t.append(time.perf_counter() - t0)
-            if d < 1:
-                time.sleep(t[-1] * (1 - d) / d)
-        end(f"{tag}: duty {d:.0%}")
-        out["duties"][f"{d:.0%}"] = {"item_ms": statistics.median(t) * 1e3, "items_run": len(t)}
+        step(f"{tag}: pace {level}")
+        ms = _loop_ms(pf, [it for it, _ in pairs], KIND_SECONDS)
+        end(f"{tag}: pace {level}")
+        out["levels"][str(level)] = {"ms": ms, "duty": 16 / (16 + PACE_IDLE[level])}
+    pf.lib.set_params({PACE: 0})
     return out
 
 
@@ -244,52 +242,77 @@ def design_switch_us(npu: object, T: int = 1024, reps: int = 5) -> float | None:
     return (tab - (ta + tb) / 2) / 63 * 1e3
 
 
+def paced_kinds(npu: object, T: int = 1024) -> set[str]:
+    """The operator kinds of the chunk that are paced designs."""
+    pf = npu.prefill
+    T = min(s for s in pf.sizes if s >= T)
+    return {kind_of(pf, op) for op, *_ in pf.runlists[T] if getattr(op, "pace", None) is not None}
+
+
 def run(path: str, *, step: Callable[[str], None], end: Callable[[str], None], irq_cpu: int, rounds: int = 2,
         reps: int = 5) -> dict[str, object]:
     """Each variant ``rounds`` times in turn (V0 V1 V2 V3 V0 ...): its pp1024 samples (ms; a warmup first), its
-    lookups, huge pages; per-kind times and the design switch for V0 and V1 (their first round), V0's largest kind at
-    lower duties (``duty_sweep``). ``step`` / ``end``:
-    the telemetry sampler's (``Sampler.step``, ``Sampler.end``)."""
+    lookups, huge pages; per-kind times and the design switch for V0 and V1 (their first round), V0's largest paced kind
+    at each pace level (``pace_sweep``) and the calibration (``prefill.pace.calibrate``), whose levels V5 runs at.
+    ``step`` / ``end``: the telemetry sampler's (``Sampler.step``, ``Sampler.end``)."""
     out: dict[str, object] = {"file": path, "resident_before": resident(path), "runs": []}
     rng = torch.Generator().manual_seed(0)
-    step("compile")  # (each design set once before anything is timed: whole-line drains and not)
-    for lines in (True, False):
-        with variant("2 MB", lines):
-            npu = open_model(path).load(capacity=4096)
-            npu.prepare(1024)
-        del npu
-        gc.collect()
-    end("compile")
-    for r in range(rounds):
-        for name, pages, lines, busy in VARIANTS:
-            tag = f"{name}, round {r + 1}"
-            step(f"{tag}: load")
-            with variant(pages, lines):
-                t0 = time.perf_counter()
-                model = open_model(path)
-                npu = model.load(capacity=4096)
-                load_s = time.perf_counter() - t0
-            tokens = token_source(file_info(path)[1], model.encode("")[:1], rng)
-            end(f"{tag}: load")
-            step(tag)
-            lookups: list[float] = []
-            with timed_lookups(lookups), busy_cpu(busy, irq_cpu):
-                samples = measure(npu, Test(path, 1024, 0, 0), tokens, reps=reps, warmup=True, progress=None)
-            entry: dict[str, object] = {"variant": name, "round": r + 1, "load_s": load_s,
-                                        "pp1024_ms": [s / 1e6 for s in samples],
-                                        "lookups_ms_per_prompt": sum(lookups) * 1e3 / (reps + 1),
-                                        "anon_huge_mb": anon_huge_kb() / 1024, "holds": npu.describe()}
-            end(tag)
-            if r == 0 and lines and not busy:  # (V0 and V1: what the page size moves, per kind)
-                entry["kinds"] = kinds(npu, step=step, end=end, tag=tag)
-                step(f"{tag}: design switch")
-                entry["design_switch_us"] = design_switch_us(npu)
-                end(f"{tag}: design switch")
-                if pages == "2 MB":  # (V0: the largest kind's items at lower duties)
-                    gemm = max(entry["kinds"]["kinds"].items(), key=lambda kv: kv[1]["ms"])[0]
-                    entry["duty"] = duty_sweep(npu, gemm, step=step, end=end, tag=tag)
-            out["runs"].append(entry)
-            del model, npu, tokens
+    spec = os.environ.get("ARTLITE_PACE")
+    os.environ["ARTLITE_PACE"] = "off"  # (the paces the variants run at are set here: none, or V5's calibrated ones)
+    try:
+        step("compile")  # (each design set once before anything is timed: whole-line drains and not)
+        for lines in (True, False):
+            with variant("2 MB", lines):
+                npu = open_model(path).load(capacity=4096)
+                npu.prepare(1024)
+            del npu
             gc.collect()
+        end("compile")
+        word = 0
+        for r in range(rounds):
+            for name, pages, lines, busy, paced in VARIANTS:
+                tag = f"{name}, round {r + 1}"
+                step(f"{tag}: load")
+                with variant(pages, lines):
+                    t0 = time.perf_counter()
+                    model = open_model(path)
+                    npu = model.load(capacity=4096)
+                    load_s = time.perf_counter() - t0
+                npu.prefill.pace = word if paced else 0
+                tokens = token_source(file_info(path)[1], model.encode("")[:1], rng)
+                end(f"{tag}: load")
+                step(tag)
+                lookups: list[float] = []
+                with timed_lookups(lookups), busy_cpu(busy, irq_cpu):
+                    samples = measure(npu, Test(path, 1024, 0, 0), tokens, reps=reps, warmup=True, progress=None)
+                entry: dict[str, object] = {"variant": name, "round": r + 1, "load_s": load_s,
+                                            "pp1024_ms": [s / 1e6 for s in samples],
+                                            "lookups_ms_per_prompt": sum(lookups) * 1e3 / (reps + 1),
+                                            "anon_huge_mb": anon_huge_kb() / 1024, "holds": npu.describe(),
+                                            "pace_word": npu.prefill.pace}
+                end(tag)
+                if r == 0 and lines and not busy and not paced:  # (V0 and V1: what the page size moves, per kind)
+                    entry["kinds"] = kinds(npu, step=step, end=end, tag=tag)
+                    step(f"{tag}: design switch")
+                    entry["design_switch_us"] = design_switch_us(npu)
+                    end(f"{tag}: design switch")
+                    if pages == "2 MB":  # (V0: the largest paced kind at each level, then the calibration)
+                        pk = paced_kinds(npu)
+                        gemm = max((kv for kv in entry["kinds"]["kinds"].items() if kv[0] in pk),
+                                   key=lambda kv: kv[1]["ms"])[0]
+                        entry["pace_sweep"] = pace_sweep(npu, gemm, step=step, end=end, tag=tag)
+                        time.sleep(IDLE_SECONDS)
+                        step(f"{tag}: calibration")
+                        word, table = pacing.calibrate(npu.prefill)
+                        end(f"{tag}: calibration")
+                        entry["calibration"] = {"word": word, "levels": pacing.describe(word), "table": table}
+                out["runs"].append(entry)
+                del model, npu, tokens
+                gc.collect()
+    finally:
+        if spec is None:
+            os.environ.pop("ARTLITE_PACE", None)
+        else:
+            os.environ["ARTLITE_PACE"] = spec
     out["resident_after"] = resident(path)
     return out

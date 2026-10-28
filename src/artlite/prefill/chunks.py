@@ -21,6 +21,9 @@ SUB, ``SMALL``: one sub-chunk of operators of their own size, ``_runlist_of``), 
 its own ``_layer_starts``;
 ``_fits_budget``; the sub-chunks S a fraction for a small size) and the layers whose caches a chunk writes
 (``kv_layers``).
+
+The dense GEMMs are paced designs (``gemm.gemm_q``'s "Pacing"): every chunk's parameters carry the machine's ``PACE``
+word (``pace.resolve``: before the first chunk, or at ``prepare``; 0 where nothing throttles them).
 """
 
 from __future__ import annotations
@@ -30,10 +33,12 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 from .. import parallel_compile
+from ..gemm.gemm_q import PACE, PACE_IDLE, pace_levels
 from ..operators.base import ArtcOperator
 from ..operators.fused import Library
 from ..operators.util import arg_bytes, rup
 from . import gemm as PG
+from . import pace as PACING
 
 PIECE_BUDGET_S = 0.8  # estimated seconds per dispatch (the hang detection: 2 s; DDR contention adds up to 40%)
 CONFIG_S = 0.15e-3  # a ConfigureOp (~80-90 us alone: the PDI load's reset ~40 us, the rest's operations; the cores'
@@ -64,12 +69,14 @@ class ChunkPrefill:
         self._items: dict[int, list] = {}
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
+        self.pace: int | None = None  # (the PACE word, once resolved: ``pace_ready``)
 
     def _library(self) -> None:
         """The runlists of the chunk sizes, the prefill's own buffers, the library of their operators."""
         self.runlists = {T: self._runlist_of(T) for T in self.sizes}
         self._sizes()
         self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
+        self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)
 
     # ------------------------------------------------------------------
     # The runlists
@@ -113,12 +120,13 @@ class ChunkPrefill:
         return starts
 
     def _splits(self, T: int, p0: int) -> list[int]:
-        """The program items (``_runlist``) that start a piece: whole layers, each piece under PIECE_BUDGET_S at p0
-        (``Library.run`` also cuts where a piece's control code would exceed its BOs)."""
-        S, starts = self.subs(T), self._layer_starts(T)
+        """The program items (``_runlist``) that start a piece: whole layers, each piece under PIECE_BUDGET_S at p0, the
+        pace's slowdown included (``pace_factor``; ``Library.run`` also cuts where a piece's control code would exceed
+        its BOs)."""
+        S, starts, f = self.subs(T), self._layer_starts(T), self.pace_factor()
         splits, t = [], 0.0
         for k, L in enumerate(self.layers):
-            s = self.layer_seconds(L, p0, S)
+            s = self.layer_seconds(L, p0, S) * f
             if k and t + s > PIECE_BUDGET_S:
                 splits.append(starts[k])
                 t = 0.0
@@ -194,6 +202,19 @@ class ChunkPrefill:
         self.lib.prepare()
         for T in set(self.plan(p0, n)):
             self._program(T)
+        self.pace_ready()
+
+    def pace_factor(self) -> float:
+        """At most how much slower than its estimate a layer runs at the resolved pace (1 / its deepest level's duty: a
+        level forced by ``ARTLITE_PACE`` on a machine that does not throttle; 1 before it is resolved)."""
+        return 1 + max((PACE_IDLE[v] for v in pace_levels(self.pace or 0).values()), default=0) / 16
+
+    def pace_ready(self) -> int:
+        """The PACE word (``pace.resolve``: calibrated once per machine and library, a fraction of a second where
+        nothing throttles, then cached), resolved at the first call; 0 for a library without paced designs."""
+        if self.pace is None:
+            self.pace = PACING.resolve(self) if self.paced else 0
+        return self.pace
 
     def fits(self, T: int, p0: int) -> bool:
         """Whether a chunk of size T may start at p0: inside the caches, within the budget (``_fits_budget``)."""
@@ -201,7 +222,7 @@ class ChunkPrefill:
 
     def _fits_budget(self, T: int, p0: int) -> bool:
         """Whether a chunk of size T at p0 runs in pieces within PIECE_BUDGET_S (one layer each at least)."""
-        return max(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers) <= PIECE_BUDGET_S
+        return max(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers) * self.pace_factor() <= PIECE_BUDGET_S
 
     def plan(self, p0: int, n: int) -> list[int]:
         """The chunk sizes (in order) that run the first tokens of n from position p0: full chunks of the largest size
@@ -240,7 +261,7 @@ class ChunkPrefill:
         """Dispatch a chunk's program (its inputs written): the scratchpad ``params``, the pieces of ``_splits`` (and
         one from each item index of ``hooks`` on, its host function called before it); the cache layers' rings then
         hold no rows of the chunk's last record (``kv_layers``: record mode)."""
-        self.lib.set_params(params)
+        self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
         self.dispatches = self.lib.run(self._program(T), splits=[*self._splits(T, p0), *(hooks or {})],
                                        bufs=list(self._buffers().values()), hooks=hooks)

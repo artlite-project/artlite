@@ -39,7 +39,7 @@ build: ef8477758 (140)
 | row | what it measures |
 |---|---|
 | array clock | one core spins until its timer has advanced by a given count of cycles; two counts timed on the host, so the dispatch cancels out |
-| array clock, 32 cores of MMULs | the same while every core of the array runs MMULs on random data (more NPU power than a Llama 3.2 1B prefill draws): a power or thermal limit shows here, not with one core spinning |
+| array clock, 32 cores of MMULs | the same while every core of the array runs MMULs on random data (about half the MMUL peak, as a prefill GEMM's MAC cores, without its weight streams): a power or thermal limit on compute alone shows here, not with one core spinning |
 | dispatch round trip | a dispatch of almost no work, from submit to its completion seen on the host |
 | DDR read / write | shim DMA channels streaming DRAM to the memory tiles (or back) on a design with no cores: one channel, one column's two, all 16, one per column (as the decode streams its weights); a read and a write stream in every column at once |
 | gather | 16 channels reading rows of 256 B to 1 KB, 64 KB apart: rows of 256 B or less at a stride of a multiple of 4 KB fall on one DRAM channel, a skewed stride spreads them |
@@ -110,9 +110,8 @@ load). It measures:
 - Llama 3.2 1B Q4_K_M's 1024-token prompt in variants, two rounds: host buffers of 2 MB or 4 KB pages, the prefill's
   output rows in whole 64-byte lines or not, and with one CPU kept busy; for the first two the chunk's time per
   operator kind (each kind looped alone after an idle pause, with its own telemetry: which kinds the platform
-  throttles) and a design switch's cost; the largest kind one item at a time at duties of 100, 75, 50 and 25%
-  (whether a throttle follows the NPU's average power or each item's load); the host's embedding lookups; the huge
-  pages the process got;
+  throttles) and a design switch's cost; the largest dense GEMM at each pace level (below), the calibration of the
+  paces, and the prompt at the calibrated paces; the host's embedding lookups; the huge pages the process got;
 - the power path: the supplies online (a USB-C source's PD contract), the battery's state and charge thresholds,
   Lenovo's battery conservation mode, the platform profiles on offer, the vendor's firmware attributes;
 - `xrt-smi validate` where XRT is installed.
@@ -129,14 +128,21 @@ regulator, for the power path (input current above the adapter's or the USB-C su
 or a hot part (HWiNFO shows that as "PROCHOT EXT"). While it is held, CPUs, fabric, memory and NPU run at their
 lowest clocks (the CPUs at ~500 MHz). `gpu_metrics` counts the time it is held (`throttle_residency_prochot`, ms).
 `artlite-bench` and `artlite-probe` warn when it was held for 5% or more of a measurement, and the diagnosis
-reports its share of the prompts, of each operator kind run alone and of each duty.
+reports its share of the prompts, of each operator kind run alone and of each pace level.
 
-Measured on a Krackan Point laptop (Lenovo Yoga Slim 7 14AKP10, on a USB-C supply): held for 84% of every 1024-token
-prompt at SoC temperatures of 45-54 °C, never under 32 cores of MMULs alone, the DMA rows alone or a 46 W CPU load;
-its Q4_K GEMMs ran 2.2-2.5x slower than on Strix Halo, its other operator kinds at Strix Halo's speed. Ryzen Master's
-"Disable PROCHOT" and the SMU's overclocking commands exist only for overclockable processors; on Ryzen AI 300
-laptops what changes it is the power path (the laptop's own adapter, plugged in directly; battery charge settings)
-and the platform's firmware.
+Measured on a Krackan Point laptop (Lenovo Yoga Slim 7 14AKP10; through a USB-C dock, on its own adapter and on
+battery alike): held for 84-86% of every 1024-token prompt at SoC temperatures of 45-58 °C, never under 32 cores of
+MMULs alone, the DMA rows alone or a 46 W CPU load; its Q4_K GEMMs ran 2.2-2.5x slower than on Strix Halo, its other
+operator kinds at Strix Halo's speed. Each Q4_K GEMM sets it off within about a millisecond and it lets go a few
+milliseconds after, so pauses between dispatches do not avoid it. Ryzen Master's "Disable PROCHOT" and the SMU's
+overclocking commands exist only for overclockable processors.
+
+Artlite paces the prefill's dense GEMMs where that is faster: one core of each GEMM idles a share of its work after
+every weight tile (levels 0-7, duty 1 to 0.38) and the array follows it, at a lower current. The first prefill of a
+model on a machine calibrates the levels by timing (a fraction of a second where nothing throttles, a few seconds
+where something does) and keeps them in the cache directory (`pace.json`, per machine, power source and model);
+`artlite-bench` prints the levels it ran at. `ARTLITE_PACE`: `off` (level 0), `recalibrate`, or levels by GEMM class
+(`gu=3,qkv=2`; `4` for every class).
 
 | option | |
 |---|---|

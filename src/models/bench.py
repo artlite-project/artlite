@@ -38,6 +38,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, model_path
+from artlite.prefill import pace
 
 from . import open_model
 from .common import NpuModel, auto_capacity, stale_install
@@ -358,6 +359,11 @@ def main(argv: list[str] | None = None) -> None:
             for p in printers:
                 p.test(r)
                 p.out.flush()
+        if (pf := getattr(npu, "prefill", None)) is not None and pf.pace:
+            why = ("ARTLITE_PACE" if pace.parse(os.environ.get("ARTLITE_PACE", "")) is not None else
+                   "calibrated: this machine throttles them at full rate")
+            sys.stderr.write(f"artlite-bench: {name}: the prefill's dense GEMMs ran paced ({pace.describe(pf.pace)}; "
+                             f"{why}; docs/probe.md, PROCHOT)\n")
         del model, npu, tokens
         gc.collect()  # (the model's NPU buffers and context before the next model's)
     for p in printers:

@@ -1,4 +1,4 @@
-"""Which candidate cause the measurements point to (H0-H12 of the diagnosis), each from several measurements and with
+"""Which candidate cause the measurements point to (H0-H13 of the diagnosis), each from several measurements and with
 the numbers that decide it, and how many ms of the 1B chunk's difference to Strix Halo each measured cause explains.
 
 A variant counts as faster or slower only beyond its noise: the largest of the samples' spread, the two rounds'
@@ -13,8 +13,8 @@ import statistics
 from . import reference
 from .telemetry import PROCHOT_WARN
 
-V0, V1, V2, V3, V4 = "V0", "V1", "V2", "V3", "V4"
-PROMPTS = re.compile(r"V\d: .*, round \d+$")  # (the telemetry tags of a run's prompts, not its load, kinds, duties)
+V0, V1, V2, V3, V4, V5 = "V0", "V1", "V2", "V3", "V4", "V5"
+PROMPTS = re.compile(r"V[0-4]: .*, round \d+$")  # (the telemetry tags of the unpaced runs' prompts, not their load, kinds)
 
 
 def _pp_ms(data: dict[str, object]) -> dict[str, list[float]]:
@@ -85,8 +85,8 @@ def _power_state(ident: dict[str, object]) -> str:
 
 
 def prochot(data: dict[str, object]) -> dict[str, str]:
-    """H12: the platform holds the SoC's external PROCHOT input during the prompts (its EC, charger or a voltage
-    regulator), which kinds set it off alone, whether a lower duty lets it go."""
+    """H12: the platform holds the SoC's external PROCHOT input during the (unpaced) prompts (its EC, charger or a
+    voltage regulator), which kinds set it off alone."""
     tel = data["telemetry"]
     share = prochot_shares(tel)
     prompts = [share[t] for t in tel if PROMPTS.match(t) and t in share]
@@ -101,18 +101,36 @@ def prochot(data: dict[str, object]) -> dict[str, str]:
     alone = {t.split(": kinds: ", 1)[1]: v for t, v in share.items() if t.startswith(V0) and ": kinds: " in t}
     trips = sorted(k for k, v in alone.items() if v >= 0.2 and k != "whole program")
     calm = sorted(k for k, v in alone.items() if v < 0.05 and k != "whole program")
-    duty = {t.rsplit(": duty ", 1)[1]: v for t, v in share.items() if t.startswith(V0) and ": duty " in t}
-    sweep = next((r.get("duty") for r in data["model"]["runs"] if r.get("duty")), None)
-    duty_text = ""
-    if duty and sweep:
-        cells = [f"{d} {duty.get(d, 0):.0%} ({v['item_ms']:.2f} ms an item)" for d, v in sweep["duties"].items()]
-        duty_text = f"; {sweep['kind']} one item at a time at duty " + ", ".join(cells)
     return _v("H12 the platform holds PROCHOT (its external throttle) while the NPU works",
               "yes" if held >= PROCHOT_WARN else "no",
               f"PROCHOT held for {held:.0%} of the prompts (thermal limits {thermal} ms meanwhile, SoC up to "
               f"{soc if soc is None else round(soc)} °C: the platform's input, not the chip's temperature); kinds run "
-              f"alone: held during {trips or 'none'}, not during {calm or 'none'}{duty_text}; power: "
+              f"alone: held during {trips or 'none'}, not during {calm or 'none'}; power: "
               f"{_power_state(data['identity'])}")
+
+
+def pacing(data: dict[str, object]) -> dict[str, str]:
+    """H13: pacing the dense GEMMs (``prefill.pace``) lets them run unthrottled: the largest paced kind at each level
+    (its time, PROCHOT's share), the calibration's levels, V5 (V0 at them) against V0."""
+    cause = "H13 the dense GEMMs run faster paced (prefill.pace: the platform throttles them at full rate)"
+    runs = data["model"]["runs"]
+    sweep = next((r["pace_sweep"] for r in runs if r.get("pace_sweep")), None)
+    cal = next((r["calibration"] for r in runs if r.get("calibration")), None)
+    if sweep is None or cal is None:
+        return _v(cause, "?", "no pace sweep")
+    share = prochot_shares(data["telemetry"])
+    lv = sweep["levels"]
+    cells = []
+    for level, v in lv.items():
+        p = next((share[t] for t in share if t.startswith(V0) and t.endswith(f": pace {level}")), None)
+        cells.append(f"{level} {v['ms']:.1f} ms" + (f" (PROCHOT {p:.0%})" if p is not None else ""))
+    best = min(lv, key=lambda level: lv[level]["ms"])
+    gain = lv["0"]["ms"] / lv[best]["ms"]
+    pp = {k: statistics.median(v) for k, v in _pp_ms(data).items()}
+    v5 = f"; pp1024 V5 {pp[V5]:.1f} ms vs V0 {pp[V0]:.1f}" if V5 in pp and V0 in pp else ""
+    return _v(cause, "yes" if best != "0" and gain >= 1.1 else "no",
+              f"{sweep['kind']} at pace levels {', '.join(cells)}: fastest at {best} ({gain:.2f}x level 0's speed); "
+              f"calibrated: {cal['levels'] or 'every level 0'} ({cal['table']['seconds']:.1f} s){v5}")
 
 
 def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
@@ -194,6 +212,7 @@ def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
                   f"{later:.3f}; throttle residency increments during the prompts (ms) {thr or 'none'} (fast PPT and "
                   f"thm_core tick on Strix Halo with no effect; PROCHOT: H12)"))
     out.append(prochot(data))
+    out.append(pacing(data))
     runs = data["model"]["runs"]
     look = statistics.median(r["lookups_ms_per_prompt"] for r in runs)
     other = max((tel[t].get("other_cpu_load") or 0) for t in tel)

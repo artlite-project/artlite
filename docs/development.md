@@ -73,6 +73,7 @@ Chromium JSON for Perfetto) is switched on by `ARTLITE_PROFILE` (below).
 | `ARTLITE_MEASURE_II=1` | print the per-loop schedule report of every kernel compiled ([measure-ii skill](../.claude/skills/measure-ii/SKILL.md)) |
 | `ARTLITE_SKIP_CHECKS=1` | skip the build-time design checks (stack depth, kernel signatures, rounding mode) |
 | `ARTLITE_PM_PACKETS=0` | a library configuration's tile writes all in the transaction, none as control packets |
+| `ARTLITE_PACE` | the prefill GEMMs' pace levels: `auto` (default: calibrated per machine, `prefill/pace.py`), `off`, `recalibrate`, or levels (`gu=3,qkv=2`; [probe.md](probe.md#prochot)) |
 | `ARTLITE_PROFILE=1`, `counters`, `trace` | on-NPU profiling; `ARTLITE_PROFILE_DIR` (default `./artlite_profile`) and the other `ARTLITE_PROFILE_*` variables tune it ([profiling skill](../.claude/skills/profiling/SKILL.md)) |
 | `ARTLITE_DEBUG_CLANG` | an assertions build of llvm-aie's `clang++`, for `variant_search`'s post-pipeliner traces |
 | `ARTLITE_LLAMA_CPP_DIR` | the llama.cpp build the Qwen reference tests load |

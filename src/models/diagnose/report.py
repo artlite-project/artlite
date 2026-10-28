@@ -84,13 +84,17 @@ def markdown(data: dict[str, object], path: str) -> str:
                         rows)
         lines.append(f"\nA design switch inside a program: {_f(k0.get('design_switch_us'))} us "
                      f"(Strix Halo {_f(ref.get('design_switch_us'))})")
-        if (sweep := k0.get("duty")):
-            lines += ["", (f"{sweep['kind']}, one item at a time, each followed by sleep for a duty (ms an item; "
-                           "PROCHOT's share of the run):"), ""]
-            lines += _table(["duty", "ms an item", "items run", "Strix Halo ms", "PROCHOT"],
-                            [[d, v["item_ms"], str(v["items_run"]), ref.get("duty_item_ms", {}).get(d),
-                              next((f"{share[t]:.0%}" for t in share if t.startswith("V0") and t.endswith(f": duty {d}")),
-                                   "?")] for d, v in sweep["duties"].items()])
+        if (sweep := k0.get("pace_sweep")):
+            lines += ["", (f"{sweep['kind']} ({sweep['items']} items) at each pace level: the paced core idles a "
+                           "share of its work, the array follows (ms per run of the items; PROCHOT's share of the "
+                           "run):"), ""]
+            lines += _table(["level", "duty", "ms", "Strix Halo ms", "PROCHOT"],
+                            [[lv, v["duty"], v["ms"], ref.get("pace_ms", {}).get(lv),
+                              next((f"{share[t]:.0%}" for t in share if t.startswith("V0") and t.endswith(f": pace {lv}")),
+                                   "?")] for lv, v in sweep["levels"].items()])
+        if (cal := k0.get("calibration")):
+            lines.append(f"\nCalibrated paces (prefill.pace, {cal['table']['seconds']:.1f} s): "
+                         f"{cal['levels'] or 'every level 0 (nothing throttles)'}; V5 runs V0 at them")
     lines += ["", "### Telemetry per step (median; max)", ""]
     tel = data["telemetry"]
     fields = ("fclk_mhz", "uclk_mhz", "npu_clk_mhz", "npu_h_clk_mhz", "npu_column_util_max", "dram_read_mbs",

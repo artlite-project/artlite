@@ -56,24 +56,36 @@ channel stall the controller before the A fills are issued (a hang).
 also reads every other dequantized tile through the planar gather (``planar``: Q5_K, Q6_K, Q2_K, Q3_K, and
 Q4_0 / Q4_1 tiles of other than 16 rows or of 512 columns; ``tiles`` per pass, ``blocks``, ``c_pack``,
 ``region_rt``: see GemmQd).
+
+Pacing (``pace``: the GEMM's class, ``PACE_CLASSES``): some laptops' power delivery asserts PROCHOT while the array
+runs MMULs and streams weights at a prefill GEMM's rate (a Krackan Point laptop: every Q4_K GEMM item, on any power
+source, within about a millisecond; the whole SoC then runs at its lowest clocks, the GEMMs 2.3x slower). A paced design
+reads the scratchpad parameter ``PACE`` (a level per class, ``PACE_BITS`` each) on the cores that set its rate
+(``pace_cores``): before each acquire of its input the core idles ``PACE_IDLE[level]`` sixteenths of the cycles it
+worked since the previous acquire returned (the tile's timer), and the array follows it through its FIFOs: duty 1 ..
+0.38, with every core's current and the weight stream's. Level 0 runs the unpaced code (``prefill.pace``: the levels a
+machine needs, by timing).
 """
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+from aie.dialects import arith
+from aie.dialects.aie import T as IrT
+from aie.dialects.aiex import npu_maskwrite32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter, TaskGroup, Worker
-from aie.iron.controlflow import range_
+from aie.iron.controlflow import else_, if_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ..formats import FORMATS, KC, KT, kernel_template, slot
 from ..operators.base import ArgSpec, ArtcOperator
-from ..operators.design import COLS, ROWS, range32, stream_walk, times_i32
+from ..operators.design import COLS, CORE_PROCESSOR_BUS, ROWS, range32, stream_walk, times_i32
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import pin_l1_buffers
 from .mac import MAC, render_mac
@@ -88,6 +100,63 @@ MEMTILE_BYTES = 512 * 1024
 M_MAX = 64  # GemmQ's tokens per core row and chunk (L1: A and C scale with it; see _l1_bytes)
 L1_BUDGET = 62 * 1024  # bytes of core data memory the buffers may use (incl. the 2 KB stack)
 B_DEPTH = 2  # L1 weight objects (one k-tile each)
+PACE = "gq_pace"  # the scratchpad parameter of paced designs: PACE_BITS per class, class c at bit PACE_BITS c
+PACE_BITS = 3
+PACE_ROLES = ("qkv", "o", "gu", "down")  # (``prefill.gemm.WHICH``'s); a class per role and tile kind
+PACE_CLASSES = tuple(f"{r}{k}" for r in PACE_ROLES for k in ("", ".planar"))  # class 2 i + planar
+PACE_IDLE = (0, 2, 4, 6, 9, 13, 18, 26)  # sixteenths of its work a paced core idles per level: duty 1 .. 0.38
+PACE_CAP = 1 << 16  # cycles: a longer interval between two acquires holds a pause (between dispatches), not work
+
+
+def pace_class(which: str, planar_tiles: bool) -> int:
+    """The pace class of a prefill GEMM of role ``which`` (``PACE_ROLES``) on planar tiles or not."""
+    return 2 * PACE_ROLES.index(which) + int(planar_tiles)
+
+
+def pace_word(levels: dict[int, int]) -> int:
+    """The ``PACE`` parameter of the levels per class (0 .. len(PACE_IDLE) - 1)."""
+    assert all(0 <= c < len(PACE_CLASSES) and 0 <= v < len(PACE_IDLE) for c, v in levels.items()), levels
+    return sum(v << PACE_BITS * c for c, v in levels.items())
+
+
+def pace_levels(word: int) -> dict[int, int]:
+    """The nonzero levels per class of a ``PACE`` word."""
+    m = (1 << PACE_BITS) - 1
+    return {c: word >> PACE_BITS * c & m for c in range(len(PACE_CLASSES)) if word >> PACE_BITS * c & m}
+
+
+class _Paced:
+    """A paced core's input FIFO (``pc``: the PACE parameter's handle, the core's timestamp buffer, the kernels
+    ``_pace0`` / ``_pace1``; ``cls``): each acquire idles first (its level's share of the work since the previous one
+    returned) and notes when it returned."""
+
+    def __init__(self, h: object, pc: tuple, cls: int):
+        self.h = h
+        prm, self.st, self.k0, self.k1 = pc
+        self.level = arith.andi(arith.shrui(prm.read(), arith.constant(IrT.i32(), PACE_BITS * cls)),
+                                arith.constant(IrT.i32(), (1 << PACE_BITS) - 1))
+
+    def acquire(self, n: int) -> object:
+        self.k1(self.st, self.level)
+        x = self.h.acquire(n)
+        self.k0(self.st)
+        return x
+
+    def release(self, n: int) -> None:
+        self.h.release(n)
+
+
+def run_paced(pc: tuple | None, cls: int | None, body: Callable[[object], None], h: object) -> None:
+    """A worker's item: ``body`` of its input FIFO handle h; on the core ``pc`` is given to (``_pace_args``) in two
+    copies, the one of the paced handle at a nonzero level (level 0 runs the unpaced code: a branch per item)."""
+    if pc is None:
+        body(h)
+        return
+    w = _Paced(h, pc, cls)
+    with if_(arith.cmpi(arith.CmpIPredicate.ne, w.level, arith.constant(IrT.i32(), 0))) as branch:
+        body(w)
+    with else_(branch):
+        body(h)
 
 
 class L1Error(ValueError):
@@ -531,6 +600,35 @@ void {{ p }}_mm2(const bfloat16 *__restrict pA_in, const void *__restrict stage,
 }
 
 {% endif %}
+{% if pace is not none %}
+// pacing (a paced core: ``pace_cores``): st[0] = the tile's Timer_Low when its last acquire returned
+static inline unsigned {{ p }}_now()
+{
+    const unsigned t = read_tm(0x340F8);  // (the runtime sequence enables the core's processor bus)
+    __builtin_aie2p_sched_barrier();
+    return t;
+}
+
+// an acquire returned: the core works from now
+void {{ p }}_pace0(int32_t *__restrict st)
+{
+    st[0] = (int32_t){{ p }}_now();
+}
+
+// before an acquire: idle PACE_IDLE[level] / 16 of the cycles worked since the last one returned (not after a pause;
+// the levels' sixteenths a byte each of one immediate: no table in data memory)
+void {{ p }}_pace1(int32_t *__restrict st, int32_t level)
+{
+    const unsigned t = {{ p }}_now();
+    const unsigned busy = t - (unsigned)st[0];
+    if (busy >= {{ pace_cap }}u)
+        return;
+    const unsigned idle = busy * (unsigned)(({{ pace_idle }}ull >> 8 * level) & 0xFF) >> 4;
+    while ({{ p }}_now() - t < idle) {
+    }
+}
+
+{% endif %}
 }  // extern "C"
 """)
 
@@ -619,6 +717,7 @@ class GemmQOperator(ArtcOperator):
         mc_param: str = "",
         mc_unit: int = 0,
         lines: bool = False,
+        pace: int | None = None,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -644,7 +743,8 @@ class GemmQOperator(ArtcOperator):
         GEMM of the A strip with its super-blocks (the strip resent per slot), C objects of ``slots`` slots
         (default: one, two for tiles of an odd row count; GemmQd only). ``mc_param``: the cores run as many token
         chunks as this scratchpad parameter says, in units of ``mc_unit`` tokens (a multiple of nrows m; default
-        nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks).
+        nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks). ``pace``: the design's pace
+        class (``PACE_CLASSES``; None: unpaced), its level from the ``PACE`` parameter (the module's "Pacing").
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -654,6 +754,8 @@ class GemmQOperator(ArtcOperator):
         assert self.planar or tile_major(fmt, rows, kc), f"no GEMM path reads {fmt} tiles of {rows} rows x {kc}"
         assert not self.planar or self.DQ_CORE, f"{fmt} tiles of {rows} rows x {kc}: GemmQdOperator"
         self.ablate = tuple(ablate)
+        assert pace is None or 0 <= pace < len(PACE_CLASSES), pace
+        self.pace = pace
         self.mc_param = mc_param
         self.mc_unit = mc_unit
         self.nrows = nrows  # core rows used (fewer rows: a smaller program image, cheaper reconfiguration)
@@ -858,6 +960,27 @@ class GemmQOperator(ArtcOperator):
         """``mc_param``'s handle for the workers (None without it)."""
         return ScratchpadParameter(self.mc_param, np.int32) if self.mc_param else None
 
+    def _pace_vars(self) -> dict[str, object]:
+        return {"pace": self.pace, "pace_idle": hex(sum(v << 8 * i for i, v in enumerate(PACE_IDLE))),
+                "pace_cap": PACE_CAP}
+
+    def pace_cores(self) -> list[tuple[int, int]]:
+        """(column, row) of the cores a paced design paces: the one that sets the array's rate through the FIFOs
+        (GemmQ: every core does the same work; column 0's first core: its A row reaches every column, its column's B
+        every row)."""
+        return [(0, 2)] if self.pace is not None else []
+
+    def _pace_args(self) -> dict[tuple[int, int], tuple]:
+        """Per paced core its worker argument ``pc`` (``run_paced``): the PACE parameter, its timestamp buffer, the
+        kernels; other cores get None."""
+        if self.pace is None:
+            return {}
+        prm = ScratchpadParameter(PACE, np.int32)
+        st_ty = np.ndarray[(16,), np.dtype[np.int32]]
+        k0 = Kernel(f"{self.p}_pace0", "kernel.o", [st_ty])
+        k1 = Kernel(f"{self.p}_pace1", "kernel.o", [st_ty, np.int32])
+        return {(c, r): (prm, Buffer(st_ty, name=f"gq_pace_{c}_{r}"), k0, k1) for c, r in self.pace_cores()}
+
     @property
     def hdr_direct(self) -> bool:
         """Planar tiles whose gathered rows hold tile row r's header at row r too (Q5_K's scale planes,
@@ -952,7 +1075,8 @@ class GemmQOperator(ArtcOperator):
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
                                   c_pack=False, carry=None, win=0, c_parts=self.c_parts, pingpong=False, planar=False,
                                   sxp=1, csplit=0, tq=self.tq, pair=self.pair,
-                                  c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1)
+                                  c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1,
+                                  **self._pace_vars())
 
     def dataflow(self) -> GemmQDataflow:
         m, K, no = self.m, self.KA, self.n_out
@@ -1191,6 +1315,8 @@ class GemmQOperator(ArtcOperator):
             # per-pass ones: 1B down), A strips and C drains (one drain BD per run of evenly spaced
             # pass outputs covers many C objects); at most 2 chunks in flight. A chunk's last drain
             # completing proves its fills completed, so its BDs are recycled then.
+            for c, r in self.pace_cores():  # (the paced cores read their timer)
+                npu_maskwrite32(CORE_PROCESSOR_BUS, 1, 1, column=c, row=r)
             taps = [self.b_taps(c) for c in range(COLS)]
             chains = [self.b_chain(c) for c in range(COLS)]
             assert all(ch_ is not None for ch_ in chains) or max(len(t) for t in taps) <= 4, \
@@ -1304,7 +1430,10 @@ class GemmQOperator(ArtcOperator):
 
         parts = self.c_parts  # (C objects of two passes: their outputs in turn)
 
-        def core_fn(prm, bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
+        def core_fn(pc, prm, bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
+            run_paced(pc, self.pace, lambda b: core_item(prm, b, af, cf, zero, mm, st, *extra), bf)
+
+        def core_item(prm, bf, af, cf, zero, mm, st, *extra):
             for _ in self._chunk_passes(prm, step=parts):  # token chunks x passes
                 c = cf.acquire(1)
                 for h in range(parts):
@@ -1322,7 +1451,10 @@ class GemmQOperator(ArtcOperator):
                         extra[0](acc, c)
                 cf.release(1)
 
-        def pair_fn(prm, bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
+        def pair_fn(pc, prm, bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
+            run_paced(pc, self.pace, lambda b: pair_item(prm, b, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra), bf)
+
+        def pair_item(prm, bf, af, cf, xo, xi, zero, hdr, dq, mm, ws, st, h, *extra):
             for _ in self._chunk_passes(prm, step=parts):  # token chunks x passes
                 c = cf.acquire(1)
                 for part in range(parts):
@@ -1359,8 +1491,10 @@ class GemmQOperator(ArtcOperator):
 
         workers = []
         prm = self._mc_prm()
+        pcs = self._pace_args()
         for row in range(ROWS):
             for c in range(COLS):
+                pc = pcs.get((c, row + 2))
                 st = Buffer(st_ty, name=f"gq_st_{c}_{row}")
                 extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.silu else
                          [k_pairs, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.c_pairs else [])
@@ -1369,12 +1503,12 @@ class GemmQOperator(ArtcOperator):
                 if pair:
                     h = row % 2
                     ws = Buffer(ws_ty, name=f"gq_ws_{c}_{row}")
-                    args = [prm, b_l1[c][h].cons(), a_l1[row].cons(), c_l1[row][c].prod(), x_f[c, row].prod(),
+                    args = [pc, prm, b_l1[c][h].cons(), a_l1[row].cons(), c_l1[row][c].prod(), x_f[c, row].prod(),
                             x_f[c, row ^ 1].cons(), k_zero, k_hdr, k_dq, k_mm, ws, st, h, *extra]
                     workers.append(Worker(pair_fn, args, tile=Tile(c, row + 2), stack_size=2048,
                                           dynamic_objfifo_lowering=True))
                     continue
-                workers.append(Worker(core_fn, [prm, b_l1[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero, k_mm,
+                workers.append(Worker(core_fn, [pc, prm, b_l1[c].cons(), a_l1[row].cons(), c_l1[row][c].prod(), k_zero, k_mm,
                                                  st, *extra],
                                       tile=Tile(c, row + 2), stack_size=2048, dynamic_objfifo_lowering=True))
 

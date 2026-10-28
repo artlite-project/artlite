@@ -100,9 +100,8 @@ def prochot_warning(share: float | None) -> str | None:
         return None
     return (f"the platform held PROCHOT for {share:.0%} of the measurement: its external throttle input (the laptop's "
             "embedded controller, charger or a voltage regulator; not the chip's temperature) kept the whole SoC at its "
-            "lowest clocks, so the numbers are the platform's, not the NPU's. Laptops assert it for their power path (adapter, "
-            "USB-C supply or dock, battery) or a hot part: check the power source (the laptop's own adapter, plugged "
-            "in directly); docs/probe.md, PROCHOT")
+            "lowest clocks, so the numbers are the platform's, not the NPU's. On the laptop measured it follows the NPU's "
+            "load (the dense prefill GEMMs), on any power source; docs/probe.md, PROCHOT")
 
 
 def dpm_levels(name: str) -> list[int]:

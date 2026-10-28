@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 from ..decode.image import Block, Region, TileImage
 from ..formats import gu_tiles
-from ..gemm.gemm_q import GemmQOperator
+from ..gemm.gemm_q import GemmQOperator, pace_class
 from ..gemm.gemm_q import planar as is_planar
 from ..gemm.gemm_qd import GemmQdOperator, choose_planar_plan, gemm_mac_rows, planar_gemm
 from ..operators.design import COLS
@@ -78,12 +78,14 @@ class PhasePlan:
 
 
 def _gemm(kw: dict[str, object], T: int, which: str, ops: dict[str, GemmQOperator] | None = None) -> GemmQOperator:
-    """GemmQ or GemmQd by the tokens and format (``gemm_qd.gemm_mac_rows``); with ``ops``, one object per
-    distinct GEMM (the layers of a fused prefill share them: one design each in the ELF)."""
+    """GemmQ or GemmQd by the tokens and format (``gemm_qd.gemm_mac_rows``), paced as its role and tile kind
+    (``gemm_q.pace_class``); with ``ops``, one object per distinct GEMM (the layers of a fused prefill share them: one
+    design each in the ELF)."""
     key = repr((sorted(kw.items()), T, which))
     if ops is not None and key in ops:
         return ops[key]
     planar = is_planar(kw["fmt"], kw["rows"], kw["kc"])
+    kw = {**kw, "pace": pace_class(which, planar)}
     assert kw["passes"] <= 64, kw["passes"]
     mac_rows = gemm_mac_rows(T, which, kw["fmt"], planar)
     if planar and mac_rows == 3 and T >= 256:

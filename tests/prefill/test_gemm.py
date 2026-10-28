@@ -4,7 +4,9 @@ model's prefill plans them, with random bfp16 activations, against the dequantiz
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
 Q4_1 (planar at 1024 columns; Gemma's at 512), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
-file), Q8_0 (super-block units, Occamy's GDN z), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums)."""
+file), Q8_0 (super-block units, Occamy's GDN z), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums). The GEMMs
+run in a library program as the prefill's do, paced (``gemm_q``'s "Pacing") at level 0 and at ``LEVEL``, and as unpaced
+twins: their outputs bit-identical."""
 
 import os
 
@@ -13,11 +15,15 @@ import pytest
 import torch
 
 import artlite
+from artlite.gemm.gemm_q import PACE, pace_word
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
+from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
+
+LEVEL = 3  # (a paced level: the paced copy of each worker body)
 
 # (model, GGUF quantization, size, layers to pack, the layer and phase tested, tokens)
 CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1B", (0, 3), 3, "gate_up", 256),
@@ -104,12 +110,18 @@ def _rows(img: object, tensors: tuple[str, ...], rows: np.ndarray, K: int = 0) -
     return torch.nn.functional.pad(w, (0, max(K - w.shape[1], 0)))
 
 
-def _run(op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a_off: int = 0,
+def _twin(op: object) -> object:
+    """The operator unpaced (its constructor's arguments, pace None)."""
+    args, kwargs = op._ctor
+    return type(op)(*args, **{**kwargs, "pace": None})
+
+
+def _run(lib: Library, op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a_off: int = 0,
          C: torch.Tensor | None = None) -> torch.Tensor:
-    """One GEMM: A (op.M, K) as panels from element a_off on (a K part's columns), the W argument from the image
-    (zeros outside it), C (bf16 (M, N); default zeros: the columns another GEMM of the phase writes; given: the
-    phase's output so far, at least op.M rows, which this one's writes overwrite)."""
-    dev = op.device
+    """One GEMM of the library: A (op.M, K) as panels from element a_off on (a K part's columns), the W argument from
+    the image (zeros outside it), C (bf16 (M, N); default zeros: the columns another GEMM of the phase writes; given:
+    the phase's output so far, at least op.M rows, which this one's writes overwrite)."""
+    dev = artlite.Device()
     w = np.zeros(op.w_bytes, np.uint8)
     a, b = max(w_off, 0), min(w_off + op.w_bytes, W.size)
     w[a - w_off:b - w_off] = W[a:b]
@@ -117,8 +129,9 @@ def _run(op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a_off: int = 0,
                                                dtype=torch.bfloat16)
     out = artlite.from_torch(init.clone(), dev)
     pan = bfp16.to_panels(A)
-    op.dispatch(artlite.from_torch(torch.cat([pan[a_off:], torch.zeros(a_off, dtype=pan.dtype)]), dev),
-                artlite.from_torch(torch.from_numpy(w).view(torch.bfloat16), dev), out)
+    bufs = [artlite.from_torch(torch.cat([pan[a_off:], torch.zeros(a_off, dtype=pan.dtype)]), dev),
+            artlite.from_torch(torch.from_numpy(w).view(torch.bfloat16), dev), out]
+    lib.run(lib.items([(op, "A", "W", "C")], dict(zip("AWC", (x._raw for x in bufs)))), bufs=[x._raw for x in bufs])
     out.sync_from_device()
     c = out.to_torch()
     return bfp16.from_panels(c, op.M, op.N) if op.silu else c
@@ -142,22 +155,40 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
     cfg = img.cfg
     region = img.region(layer, phase)
     pp = _plan(model, img, region, T)
-    for gm in pp.gemms:
-        gm.op.compile()
+    ops = list(dict.fromkeys(gm.op for gm in pp.gemms))
+    twins = {id(op): _twin(op) for op in ops}
+    lib = Library("t_prefill_gemm", [*ops, *twins.values()]).compile().load()
     M, K = max(gm.op.M for gm in pp.gemms), region.K  # (GemmQd pads the tokens to whole passes)
     A = (torch.randn(M, K, generator=torch.Generator().manual_seed(T + K)) * 0.5).bfloat16()
     Aq = bfp16.from_panels(bfp16.to_panels(A), M, K)  # (the GEMM's operand values)
-    if pp.layout is not None:  # (an input projection's GEMMs write one output in turn, as the prefill's: M rows)
-        Cb = torch.zeros((M, pp.gemms[0].op.N), dtype=torch.bfloat16)
-        for gm in pp.gemms:
-            Cb = _run(gm.op, A[:gm.op.M], W, gm.w_off, gm.a_off, Cb)
-        C = Cb[:T].float()
-    else:
+
+    def outputs(level: int | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """C (T rows, fp32) and an input projection's whole bf16 output Cb: paced at ``level`` (None: the twins)."""
+        lib.set_params({PACE: pace_word({op.pace: level or 0 for op in ops})})
+        run = (lambda op: twins[id(op)]) if level is None else (lambda op: op)
+        if pp.layout is not None:  # (an input projection's GEMMs write one output in turn, as the prefill's: M rows)
+            Cb = torch.zeros((M, pp.gemms[0].op.N), dtype=torch.bfloat16)
+            for gm in pp.gemms:
+                Cb = _run(lib, run(gm.op), A[:gm.op.M], W, gm.w_off, gm.a_off, Cb)
+            return Cb[:T].float(), Cb
         Cs: list[torch.Tensor | None] = [None] * pp.parts
         for gm in pp.gemms:  # (the GEMMs of a part write disjoint columns)
-            C = _run(gm.op, A[:gm.op.M], W, gm.w_off, gm.a_off)[:T].float()
+            C = _run(lib, run(gm.op), A[:gm.op.M], W, gm.w_off, gm.a_off)[:T].float()
             Cs[gm.part] = C if Cs[gm.part] is None else Cs[gm.part] + C
-        C = sum(Cs)
+        return sum(Cs), None
+
+    variants = {level: outputs(level) for level in (0, None, LEVEL)}
+    C, Cb = variants[0]
+
+    def agree(f: object) -> None:
+        """The values checked (``f(C, Cb)``) bit-identical in every variant (as bits: fp32 halves can be NaN)."""
+        def bits(x: torch.Tensor) -> torch.Tensor:
+            return x.contiguous().view(torch.int16 if x.element_size() == 2 else torch.int32)
+
+        ref = bits(f(C, Cb))
+        for level, out in variants.items():
+            assert torch.equal(bits(f(*out)), ref), f"{'unpaced' if level is None else f'paced at {level}'} != level 0"
+
     if phase == "gate_up":
         (b,) = region.blocks
         ffn = cfg.intermediate_size // COLS
@@ -168,6 +199,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
             torch.nn.functional.silu
         want = act(y_g.bfloat16().float()) * y_u
         assert _rel(C[:, idx], want) < 3.5e-2  # (and the bfp16 C panels)
+        agree(lambda C, Cb: C[:, idx])
         return
     if phase in PG.OUT:
         (b,) = region.blocks
@@ -176,6 +208,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         rows = np.concatenate([b.rows[c][b.rows[c] >= 0] for c in range(COLS)])
         want = Aq[:T] @ _rows(img, b.tensors, rows, K).T
         assert _rel(C[:, cols], want) < _tol(K)
+        agree(lambda C, Cb: C[:, cols])
         return
     lay = pp.layout
     for b in region.blocks:
@@ -186,9 +219,11 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
                 got = Cb[:T, o:o + rows.size].contiguous().view(torch.float32).float()
                 want = Aq[:T] @ (_rows(img, b.tensors, rows[0::2] // 2) * _ratio(img, region)[None]).T
                 assert _rel(got, want) < 5e-5, (b.name, c, _rel(got, want))  # (hi + lo: ~2^-16 of a row)
+                agree(lambda C, Cb, o=o, n=rows.size: Cb[:T, o:o + n])
                 continue
             got = C[:, o + np.arange(rows.size)]
             assert _rel(got, Aq[:T] @ _rows(img, b.tensors, rows).T) < _tol(K), (b.name, c)
+            agree(lambda C, Cb, o=o, n=rows.size: C[:, o:o + n])
 
 
 def _ratio(img: object, region: object) -> torch.Tensor:
