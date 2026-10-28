@@ -10,7 +10,7 @@ from collections.abc import Iterator
 
 import numpy as np
 
-import artlite._native as native
+from artlite import _native as native
 from artlite import txn
 from artlite.overlay import OverlayDevice, Transaction
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction

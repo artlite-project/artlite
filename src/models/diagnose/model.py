@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator
 import numpy as np
 import torch
 
-import artlite._native as native
+from artlite import _native as native
 from artlite.gguf_model import GGUFFile
 from artlite.prefill import gemm as prefill_gemm
 
