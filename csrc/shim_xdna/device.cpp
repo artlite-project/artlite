@@ -223,7 +223,7 @@ void* pdev::mmap(void* addr, size_t len, int prot, int flags, off_t offset) cons
 }
 
 template <typename T>
-static T get_info(const pdev& dev, uint32_t param) {
+static T query(const pdev& dev, uint32_t param) {
   T value = {};
   amdxdna_drm_get_info arg = {.param = param,
                               .buffer_size = sizeof(value),
@@ -233,7 +233,7 @@ static T get_info(const pdev& dev, uint32_t param) {
 }
 
 device::device(uint32_t device_index) : m_pdev(pdev::open(device_index)) {
-  auto metadata = shim_xdna::get_info<amdxdna_drm_query_aie_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_AIE_METADATA);
+  auto metadata = query<amdxdna_drm_query_aie_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_AIE_METADATA);
   n_rows = metadata.core.row_count;
   n_cols = metadata.cols;
 }
@@ -256,12 +256,12 @@ std::unique_ptr<bo> device::alloc_user_bo(size_t size) {
 }
 
 clocks device::query_clocks() const {
-  auto c = shim_xdna::get_info<amdxdna_drm_query_clock_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA);
+  auto c = query<amdxdna_drm_query_clock_metadata>(*m_pdev, DRM_AMDXDNA_QUERY_CLOCK_METADATA);
   return {c.mp_npu_clock.freq_mhz, c.h_clock.freq_mhz};
 }
 
 int device::power_mode() const {
-  return shim_xdna::get_info<amdxdna_drm_get_power_mode>(*m_pdev, DRM_AMDXDNA_GET_POWER_MODE).power_mode;
+  return query<amdxdna_drm_get_power_mode>(*m_pdev, DRM_AMDXDNA_GET_POWER_MODE).power_mode;
 }
 
 size_t device::get_info(uint32_t param, std::span<uint8_t> buf) const {
