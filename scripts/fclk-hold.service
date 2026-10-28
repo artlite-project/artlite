@@ -1,0 +1,16 @@
+# Holds a Strix Halo's FCLK at its top level at boot and after every resume (fclk-hold; docs/install.md, "Strix Halo:
+# resets under NPU and iGPU load"). From the checkout:
+#   sudo install -m 755 scripts/fclk-hold /usr/local/sbin/
+#   sudo install -m 644 scripts/fclk-hold.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fclk-hold.service
+# A oneshot that keeps nothing running (inactive between runs). Undo: systemctl disable it, then fclk-hold release.
+[Unit]
+Description=Hold the data fabric clock (FCLK) at its top level for NPU work beside the iGPU
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fclk-hold hold
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

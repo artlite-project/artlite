@@ -14,6 +14,8 @@ import struct
 import subprocess
 from importlib import metadata
 
+from .telemetry import soc_gpu
+
 
 def _read(path: str, default: str = "") -> str:
     try:
@@ -170,10 +172,17 @@ def df_dram_map() -> dict[str, object]:
 
 
 def debugfs() -> dict[str, str]:
-    """amdgpu's pm info (the SMU's enabled features, clocks) and amd_pmf's power limits (root)."""
+    """The SoC GPU's pm info (the SMU's enabled features, clocks) and its SMU firmware's (PMFW) version, amd_pmf's
+    power limits (root)."""
     out = {}
-    for path in sorted(glob.glob("/sys/kernel/debug/dri/*/amdgpu_pm_info"))[:1]:
-        out["amdgpu_pm_info"] = _read(path)
+    gpu = soc_gpu()
+    for name in glob.glob("/sys/kernel/debug/dri/*/name") if gpu else ():
+        if f"dev={os.path.basename(gpu)}" in _read(name):
+            d = os.path.dirname(name)
+            out["amdgpu_pm_info"] = _read(f"{d}/amdgpu_pm_info")
+            if m := re.search(r"^SMC .*\((.*)\)$", _read(f"{d}/amdgpu_firmware_info"), re.MULTILINE):
+                out["pmfw"] = m[1]
+            break
     for path in ("/sys/kernel/debug/amd_pmf/current_power_limits",):
         if (v := _read(path)):
             out[os.path.basename(path)] = v
@@ -325,7 +334,8 @@ def _free_2mb_blocks() -> int:
 def _ip_versions() -> dict[str, str]:
     """The SoC's IP blocks as amdgpu's discovery table names them (MP1: the SMU; UMC; DF; GC: the iGPU)."""
     out = {}
-    for d in sorted(glob.glob("/sys/class/drm/card*/device/ip_discovery/die/0/*/0"))[:64]:
+    gpu = soc_gpu()
+    for d in sorted(glob.glob(f"{gpu}/ip_discovery/die/0/*/0"))[:64] if gpu else ():
         name = d.split("/")[-2]
         if name in ("MP1", "UMC", "DF", "GC", "NBIO", "SMUIO", "MP0", "VCN"):
             out[name] = ".".join(_read(f"{d}/{k}") for k in ("major", "minor", "revision"))
@@ -391,8 +401,7 @@ def identity() -> dict[str, object]:
                                  for p in glob.glob("/sys/class/platform-profile/*/profile")}
             | {"legacy": _read("/sys/firmware/acpi/platform_profile")},
             "power_supplies": supplies, "power_path": power_path(),
-            "amdgpu_perf_level": _read(next(iter(glob.glob("/sys/class/drm/card*/device/"
-                                                           "power_dpm_force_performance_level")), ""))}
+            "amdgpu_perf_level": _read(f"{gpu}/power_dpm_force_performance_level") if (gpu := soc_gpu()) else ""}
 
 
 QUERY_SENSORS, QUERY_FIRMWARE_VERSION = 4, 8  # (DRM_AMDXDNA_QUERY_*)

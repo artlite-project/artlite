@@ -55,9 +55,23 @@ FIELDS = {
 THROTTLE = ("prochot", "spl", "fppt", "sppt", "thm_core", "thm_gfx", "thm_soc")
 
 
+def soc_gpu() -> str | None:
+    """The sysfs directory of the SoC's own GPU: the amdgpu device with GC 11.5 graphics (the RDNA 3.5 iGPU of these
+    APUs), not a discrete GPU or an eGPU beside it."""
+    for d in sorted(glob.glob("/sys/bus/pci/drivers/amdgpu/*:*")):
+        try:
+            with open(f"{d}/ip_discovery/die/0/GC/0/major") as major, open(f"{d}/ip_discovery/die/0/GC/0/minor") as minor:
+                if (major.read().strip(), minor.read().strip()) == ("11", "5"):
+                    return d
+        except OSError:
+            pass
+    return None
+
+
 def gpu_metrics_path() -> str | None:
-    """The amdgpu device's ``gpu_metrics`` (world-readable), if the APU's iGPU driver is loaded."""
-    return next(iter(sorted(glob.glob("/sys/class/drm/card*/device/gpu_metrics"))), None)
+    """The SoC GPU's ``gpu_metrics`` (world-readable), if the iGPU's driver is loaded."""
+    d = soc_gpu()
+    return f"{d}/gpu_metrics" if d and os.path.exists(f"{d}/gpu_metrics") else None
 
 
 def read_gpu_metrics(path: str) -> GpuMetricsV3 | None:
@@ -107,16 +121,17 @@ def prochot_warning(share: float | None) -> str | None:
 def dpm_levels(name: str) -> list[int]:
     """The MHz levels of amdgpu's ``pp_dpm_<name>`` (fclk, mclk, socclk): the SMU's DPM table."""
     out = []
-    for path in sorted(glob.glob(f"/sys/class/drm/card*/device/pp_dpm_{name}"))[:1]:
-        try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 2 and parts[1].lower().endswith("mhz"):
-                    out.append(int(parts[1][:-3]))
-        except (OSError, ValueError):
-            pass
+    if (d := soc_gpu()) is None:
+        return out
+    try:
+        with open(f"{d}/pp_dpm_{name}") as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lower().endswith("mhz"):
+                out.append(int(parts[1][:-3]))
+    except (OSError, ValueError):
+        pass
     return out
 
 

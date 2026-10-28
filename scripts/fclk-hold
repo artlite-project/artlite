@@ -1,0 +1,97 @@
+#!/bin/sh
+# Holds the data fabric clock (FCLK) of a Strix Halo at its top level, or releases it: NPU work while the iGPU is busy
+# can reset the machine unless it is held (docs/install.md, "Strix Halo: resets under NPU and iGPU load").
+#
+#   fclk-hold [status]           the hold's state and the SMU firmware's (PMFW) version; exit 0 when held
+#   fclk-hold hold               hold it and wait until the SMU runs it (~7 s); exit 0 when held
+#   fclk-hold release [--force]  give it back to the driver: the performance level the hold found, or auto; refused
+#                                while a process has the NPU open (the clock would change under its work)
+#
+# hold and release as root. The SoC's GPU is the amdgpu device with GC 11.5 graphics (the RDNA 3.5 iGPU): a discrete
+# GPU or an eGPU is left alone. The hold is amdgpu's own control: performance level manual, the top pp_dpm_fclk level.
+set -u
+
+SAVED=/run/fclk-hold.level  # (the level a hold replaced; /run empties at boot, where amdgpu starts at auto)
+
+gpu() {
+    for d in /sys/bus/pci/drivers/amdgpu/*:*; do
+        gc=$d/ip_discovery/die/0/GC/0
+        if [ "$(cat "$gc/major" 2>/dev/null).$(cat "$gc/minor" 2>/dev/null)" = 11.5 ] && [ -e "$d/pp_dpm_fclk" ]; then
+            echo "$d"
+            return
+        fi
+    done
+}
+
+top_level() { grep . "$1/pp_dpm_fclk" | tail -n 1; }
+
+perf_level() { cat "$1/power_dpm_force_performance_level"; }
+
+# Held: a forced performance level (manual, high, profile_peak) and only the top FCLK level marked current. On auto
+# the SMU also runs the top level while the NPU works, and leaves it when the work stops.
+held() {
+    [ "$(perf_level "$1")" != auto ] && [ "$(grep -c '\*' "$1/pp_dpm_fclk")" = 1 ] && top_level "$1" | grep -q '\*'
+}
+
+pmfw() {
+    for n in /sys/kernel/debug/dri/*/name; do
+        if grep -q "dev=${1##*/}" "$n" 2>/dev/null; then
+            sed -n 's/^SMC .*(\(.*\))$/\1/p' "${n%/name}/amdgpu_firmware_info" 2>/dev/null
+            return
+        fi
+    done
+}
+
+status() {
+    if held "$1"; then
+        echo "${1##*/}: FCLK held at $(top_level "$1" | tr -d ' *' | cut -d: -f2) ($(perf_level "$1"))"
+    else
+        echo "${1##*/}: FCLK not held ($(perf_level "$1"))"
+    fi
+    v=$(pmfw "$1")
+    [ -n "$v" ] && echo "PMFW $v"
+    held "$1"
+}
+
+hold() {
+    held "$1" && { status "$1"; return; }
+    was=$(perf_level "$1")
+    [ "$was" = manual ] || echo "$was" > "$SAVED"
+    index=$(top_level "$1" | cut -d: -f1)
+    echo manual > "$1/power_dpm_force_performance_level" || return 1
+    for i in $(seq 60); do  # (every 0.5 s, the level written again every 10 s)
+        [ $((i % 20)) = 1 ] && echo "$index" > "$1/pp_dpm_fclk"
+        sleep 0.5
+        held "$1" && { status "$1"; return; }
+    done
+    echo "fclk-hold: the SMU does not run the top level after 30 s:" >&2
+    cat "$1/pp_dpm_fclk" >&2
+    return 1
+}
+
+release() {
+    users=$(find /proc/[0-9]*/fd -lname '/dev/accel/*' 2>/dev/null | cut -d/ -f3 | sort -u | tr '\n' ' ')
+    if [ -n "$users" ] && [ "$2" != --force ]; then
+        echo "fclk-hold: processes have the NPU open (pid ${users% }): releasing would change the clock under their" \
+             "work. Stop them first, or release --force" >&2
+        return 1
+    fi
+    was=$(cat "$SAVED" 2>/dev/null || echo auto)
+    echo "$was" > "$1/power_dpm_force_performance_level" || return 1
+    rm -f "$SAVED"
+    status "$1"
+    return 0
+}
+
+cmd=${1:-status}
+case $cmd in
+    status) ;;
+    hold|release) [ "$(id -u)" = 0 ] || { echo "fclk-hold: $cmd needs root (sudo)" >&2; exit 2; } ;;
+    *) echo "usage: fclk-hold [status | hold | release [--force]]" >&2; exit 2 ;;
+esac
+dev=$(gpu)
+if [ -z "$dev" ] && [ "$cmd" = hold ]; then  # (at boot amdgpu may still be loading)
+    for i in $(seq 30); do sleep 1; dev=$(gpu); [ -n "$dev" ] && break; done
+fi
+[ -n "$dev" ] || { echo "fclk-hold: no amdgpu device with GC 11.5 graphics and pp_dpm_fclk" >&2; exit 2; }
+$cmd "$dev" "${2:-}"

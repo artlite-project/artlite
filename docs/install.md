@@ -146,14 +146,29 @@ As far as known only Strix Halo is affected: other machines can skip this. Befor
 (`journalctl -k`) usually has deferred errors: `[Hardware Error]: Deferred error, no action required.`, with
 `MC28_STATUS` and `Syndrome: 0x000000005b000000`. In a stress test (an NPU prefill beside llama.cpp on the iGPU) the
 errors and the resets stopped with the data fabric's clock (FCLK) held at its top level, 2000 MHz, and came back when
-it was released. The hold costs power and heat: use it on mains power, while the NPU works. On some other boards the
-hold was not enough ([ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)): there the BIOS's "Eco Mode"
-disabled, or no NPU work while the iGPU computes, stopped the resets.
+it was released. `scripts/fclk-hold` holds it:
 
 ```bash
-D=/sys/class/drm/card0/device                                  # the iGPU (amdgpu)
-echo manual | sudo tee $D/power_dpm_force_performance_level
-echo 7 | sudo tee $D/pp_dpm_fclk                               # the top level
-grep '\*' $D/pp_dpm_fclk                                       # ~8 s later: 7: 2000Mhz * (another level: write 7 again)
-echo auto | sudo tee $D/power_dpm_force_performance_level      # the release (a reboot also releases it)
+sudo scripts/fclk-hold hold      # held within ~7 s
+sudo scripts/fclk-hold status    # held or not, and the SMU firmware's (PMFW) version
+sudo scripts/fclk-hold release   # back to the level the hold found (auto); refused while a process has the NPU open
 ```
+
+It writes the SoC GPU's own controls (`manual` to its `power_dpm_force_performance_level`, the top level's index to
+its `pp_dpm_fclk`) and leaves a discrete GPU or an eGPU alone. A reboot releases the hold; to hold it at every boot
+and after every resume, install the script with its systemd unit:
+
+```bash
+sudo install -m 755 scripts/fclk-hold /usr/local/sbin/
+sudo install -m 644 scripts/fclk-hold.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now fclk-hold.service
+```
+
+The NPU's own work runs FCLK at its top level, so the hold costs power when the NPU is idle: on the ROG Flow Z13
+measured, an idle desktop drew ~2 W more with it (package power 9.9-11.5 W, held 11.5-13.9 W, on mains power).
+
+On some other boards the hold was not enough ([ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)):
+there the BIOS's "Eco Mode" disabled, or no NPU work while the iGPU computes, stopped the resets. AMD names a BIOS
+with AGESA 1.0.0.2b as the fix, from a passing run with PMFW 100.9.0; boards with AGESA 1.0.0.2b and PMFW 100.7.0
+(ROG Flow Z13 BIOS 314, Bosgame M5 BIOS 3.11) still reset on Linux. On Windows 11, AMD's driver 26.10.1 with a
+1.0.0.2b BIOS stopped them on a ROG Flow Z13.
