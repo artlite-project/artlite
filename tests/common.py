@@ -3,10 +3,12 @@ import os
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
 from artlite.model_config import llama_gguf  # noqa: F401 (the tests import it from here)
+from models.common import Sampling
 
 # CPU reference results of the slow tests (whole-model logits), cached across runs in a folder per model: gitignored
 REFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs")
@@ -30,6 +32,55 @@ def essays() -> str:
     if not names:
         pytest.skip(f"{ESSAYS_DIR} missing: run tests/datasets/fetch_datasets.py")
     return "".join(essay(n) for n in names)
+
+
+def draft_prompts(host: Any) -> dict[str, tuple[list[int], tuple[int, ...]]]:
+    """The drafter gate's prompts (``draft_gate``) as a model's host side (``models.common.Model``) tokenizes them: the
+    ids and where later prompts start (``OverlayModel.forced_drafts(turns=)``). Replies that copy their context (a
+    summary, a quote: the drafter attends to the prompt's positions), the quote's second half as a later prompt (decode
+    steps up to a cache group, then a chunk after them), a question without context (the prefill's smallest chunks) and
+    an essay to continue (no chat template)."""
+    quote = host.prompt(essay("founders.txt")[:3000] + "\n\nQuote the essay's first two paragraphs exactly, then "
+                        "explain their main point in one sentence.")
+    return {
+        "summary": (host.prompt(essay("apple.txt")[:3000] + "\n\nSummarize the essay above in a few paragraphs."), ()),
+        "quote": (quote, (len(quote) // 2 | 1,)),  # (an odd position: inside a cache group)
+        "question": (host.prompt("Explain how photosynthesis works in plants, step by step."), ()),
+        "essay": (host.prompt(essay("gba.txt")[:3500], raw=True), ()),
+    }
+
+
+def draft_gate(model: Any, prompts: dict[str, tuple[list[int], tuple[int, ...]]], n: int = 128
+               ) -> dict[str, np.ndarray]:
+    """A drafter's teacher-forced drafts (``OverlayModel.forced_drafts``) after each prompt through the prefill and as
+    decode steps, over the model's greedy reply of up to n tokens after the decode steps' prompt (the reference the
+    prefill is held to). Per path ("prefill", "steps"), per position of the replies: the tokens a round starting there
+    gives (1 + the leading guesses the reply has), whether the first guess is the model's argmax and its probability
+    under the model (temperature 1: a draft is kept where the sampled token is it) (positions, 3)."""
+    out: dict[str, list[np.ndarray]] = {"prefill": [], "steps": []}
+    for name, (ids, turns) in prompts.items():
+        model.reset()
+        pf, model.prefill = model.prefill, None
+        try:
+            reply = list(model.generate(model.forward(ids), n, Sampling(greedy=True), ids))
+        finally:
+            model.prefill = pf
+        seq = ids + reply
+        line = f"{name}: prompt {len(ids)}, reply {len(reply)}:"
+        for path, rows in out.items():
+            r = []
+            for q, (d, logits) in enumerate(model.forced_drafts(seq, len(ids), turns=turns, prefill=path == "prefill")):
+                after = seq[len(ids) + q + 1:]
+                a = next((i for i, (x, y) in enumerate(zip(d, after)) if x != y), min(len(d), len(after)))
+                r.append((1 + a, bool(d) and d[0] == int(logits.argmax()),
+                          float(torch.softmax(logits, -1)[d[0]]) if d else 0.0))
+            rows.append(np.array(r, np.float64))
+            line += f"  {path} " + " / ".join(f"{x:.3f}" for x in rows[-1].mean(0))
+        print(line)
+    got = {k: np.concatenate(v) for k, v in out.items()}
+    print(f"{len(got['steps'])} positions (tokens per round / first guess the argmax / its probability): " +
+          ", ".join(f"{k} " + " / ".join(f"{x:.4f}" for x in v.mean(0)) for k, v in got.items()))
+    return got
 
 
 def _compact(obj: Any) -> Any:

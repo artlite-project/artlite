@@ -80,7 +80,15 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
    layer within a few % rms (K and V separately), KL(same) of the text after it against the fp32 reference (Gemma:
    <= ~0.0005), argmax agreement; `forward`'s last-token logits vs a whole decode step's. Once the numbers are known,
    tighten the asserts to just above them.
-5. **The app** against the previous commit, run from a worktree in alternated processes (aie-kernel-perf-optimization
+5. **The drafter** of a model with one: its teacher-forced drafts after a fixed prompt set through the prefill vs as
+   decode steps (`tests/common.py` `draft_gate` over `OverlayModel.forced_drafts`: per position of the model's greedy
+   replies the tokens a round would give, the first guess = the model's argmax, its probability). The drafter reads
+   what the prefill wrote (Qwen: its own records of the prompt's rows, from the prefill's hidden states and the
+   host's carry after decode steps; Gemma: the caches of the last own-cache layers), which the model's KL does not
+   see: on the 35B-A3B the records' h with 20% rms noise cost 2% of the tokens per round, without h 25%, at a model
+   KL of 0. Tokens per round react first (the later guesses of a round); a prefill path the drafter reads gets a
+   prompt in the set.
+6. **The app** against the previous commit, run from a worktree in alternated processes (aie-kernel-perf-optimization
    `reference/measuring.md` "Comparing against another commit"); a ~1K and an ~8K prompt (the essay corpus).
 
 ## Accuracy
@@ -90,7 +98,8 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   Llama meets its gates with less: a bf16 residual (`PrefillNormOperator`, the deltas summed in fp32 and rounded once:
   half the norms' bytes) and single bfp16 Q, K and P panels.
 - Judge a precision change on KL means over several sequences (Llama: three chat prompts, three essay windows): one
-  or two prompts move by ~30% with small rounding changes.
+  or two prompts move by ~30% with small rounding changes. With a drafter, also on its gate (Gates 5): a prompt's
+  tokens per round move by up to ~2% between equivalent paths, the set's mean by up to ~0.6%.
 - An MoE model is chaotic: any rounding change moves a near-tied expert (Qwen3.6-35B-A3B: llama.cpp's own prompt and
   one-token graphs pick another top 8 for 40-70% of the tokens by the last layers), and a 1e-7 change of the router's
   logits already reaches llama.cpp's prompt-vs-decode KL. So KL cannot rank its formats: rank them by their error in

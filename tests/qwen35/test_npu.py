@@ -18,7 +18,7 @@ import torch
 from artlite.gguf_model import GGUFFile
 from models.qwen35.qwen import NpuQwen
 
-from ..common import essay
+from ..common import draft_gate, draft_prompts, essay
 from . import ref
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
@@ -154,3 +154,22 @@ def test_mtp(size: str) -> None:
     flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
     assert len(flips) <= 3 and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
     assert all(a >= 0.5 * d for d, a in (stats1, stats2))
+
+
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+def test_mtp_prefill(size: str) -> None:
+    """The drafter after prompts through the prefill drafts as after the same prompts as decode steps
+    (``common.draft_gate``: teacher-forced over the model's greedy replies): the prefill writes the drafter's records of
+    the prompt's rows from its own hidden states (``qwen35.draft_prefill``), which the model's KL does not see. Tokens
+    per round 2.640 vs 2.648 (35B-A3B), 2.738 vs 2.721 (Occamy); a prompt's differ by up to ~2%, the first guesses at
+    ~2% of the positions."""
+    from artlite.model_config import qwen_mtp_of
+    from models.qwen35.qwen import Qwen
+
+    path = _path(size)
+    if qwen_mtp_of(path) is None:
+        pytest.skip(f"no MTP drafter of {path}")
+    qwen = Qwen(path)
+    got = draft_gate(qwen.load(capacity=2048), draft_prompts(qwen))
+    pre, steps = got["prefill"].mean(0), got["steps"].mean(0)
+    assert pre[0] > 0.985 * steps[0] and (pre[1:] > steps[1:] - 0.02).all(), (pre, steps)

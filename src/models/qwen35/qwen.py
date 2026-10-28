@@ -326,6 +326,13 @@ class NpuQwen(OverlayModel):
                 see((token,))
             yield token
 
+    def forced_drafts(self, tokens: list[int], first: int, *, turns: abc.Sequence[int] = (), prefill: bool = True
+                      ) -> Iterator[tuple[list[int], torch.Tensor]]:
+        """(the drafter's table sees all the tokens first: runs over the same tokens draft from the same rows)"""
+        if self._drafting:
+            self.drafter.see(tokens)
+        return super().forced_drafts(tokens, first, turns=turns, prefill=prefill)
+
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         return self.draft(token, k)
 

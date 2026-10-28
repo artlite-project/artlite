@@ -9,7 +9,8 @@
   layers that share a cache;
 - multi-token prediction: the drafter on the NPU against the fp32 drafter; a generated text is
   the model's own (every token the argmax of the logits of its position, which agree with the
-  same text's steps of one token), in fewer dispatches than tokens;
+  same text's steps of one token), in fewer dispatches than tokens; its drafts after prompts through
+  the prefill as after decode steps;
 - the tokenizer and the chat template on fixed examples (ids as llama.cpp's llama-tokenize).
 """
 
@@ -24,11 +25,11 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import assistant_of, gemma_gguf
 from models.common import Sampling
 from models.gemma4 import attn as AT
-from models.gemma4.gemma import NpuGemma
+from models.gemma4.gemma import Gemma, NpuGemma
 from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 
-from ..common import cached_ref, model_key
+from ..common import cached_ref, draft_gate, draft_prompts, model_key
 from . import cpu as gemma_cpu
 from . import ref
 
@@ -349,6 +350,18 @@ def test_gemma_mtp_generation(npu: object) -> None:
     print(f"{len(out)} tokens in {dispatches} dispatches; KL(same) {kl:.5f}, argmax agreement {agree:.3f}")
     assert len(out) == 48 and dispatches <= 40, f"{len(out)} tokens in {dispatches} dispatches"
     assert kl < 0.001 and agree > 0.95, f"KL(same) {kl:.5f}, argmax agreement {agree:.3f}"
+
+
+def test_gemma_mtp_prefill(npu: object) -> None:
+    """The drafter after prompts through the prefill drafts as after the same prompts as decode steps
+    (``common.draft_gate``: teacher-forced over the model's greedy replies; the drafter attends to the caches of the
+    prefill's last layers): 2.571 vs 2.557 tokens per round."""
+
+    if npu.drafter is None:
+        pytest.skip("no drafter next to the model")
+    got = draft_gate(npu, draft_prompts(Gemma(npu.gguf.path)))
+    pre, steps = got["prefill"].mean(0), got["steps"].mean(0)
+    assert pre[0] > 0.985 * steps[0] and (pre[1:] > steps[1:] - 0.02).all(), (pre, steps)
 
 
 def test_gemma_tokenizer() -> None:

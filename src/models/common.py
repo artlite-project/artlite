@@ -742,6 +742,32 @@ class OverlayModel(NpuModel):
         self.prompt(tokens[:first])
         return torch.cat([self.cap(self.steps(tokens[i:i + batch]).float()) for i in range(first, len(tokens), batch)])
 
+    def forced_drafts(self, tokens: list[int], first: int, *, turns: Sequence[int] = (), prefill: bool = True
+                      ) -> Iterator[tuple[list[int], torch.Tensor]]:
+        """Teacher-forced drafts of the drafter (quality tooling): tokens[:first] from position 0 as prompts that start
+        at 0 and at ``turns`` (a later one after the cached positions, as a chat's next turn; with ``prefill`` False all
+        as decode steps), then per position of tokens[first:-1] the drafter's guesses after its token (``_mtp``, as a
+        generation's round: up to ``DRAFTS``) and the model's step of the token alone (a round that keeps it): the
+        guesses (of the tokens after it) and the model's logits (vocab,) fp32 of the next token."""
+        assert self._drafting, "a drafter"
+        self.reset()
+        pf = self.prefill
+        if not prefill:
+            self.prefill = None
+        try:
+            for a, b in zip((0, *turns), (*turns, first)):
+                self.prompt(tokens[a:b], logits=b == first)
+        finally:
+            self.prefill = pf
+        penalties = Penalties(Sampling(greedy=True))
+        self._begin()
+        for token in tokens[first:-1]:
+            p = self.position
+            d = self._mtp(token, self.DRAFTS, penalties)
+            logits = self.cap(self._verify([token], True)[0].float())
+            self._kept(p, [token], 1, True)
+            yield d, logits
+
 
 class Model:
     """A model file opened on the host: its tokenizer, chat template and default sampling; ``load`` puts it on the NPU.
