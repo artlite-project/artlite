@@ -60,7 +60,33 @@ the prompt cache work alike.
 ```bash
 artlite-server -m lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf -rea on -c 131072
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=none claude          # Claude Code
-codex -c model_provider=artlite -c 'model_providers.artlite={name="artlite", base_url="http://127.0.0.1:8080/v1", wire_api="responses"}'
+codex -m qwen3.6-35b-a3b -c model_provider=artlite \
+    -c 'model_providers.artlite={name="artlite", base_url="http://127.0.0.1:8080/v1", wire_api="responses"}'
+```
+
+Codex needs a model name it does not know (`-m`; a server started with `-m` answers to any name): for its own models
+it sends a JavaScript tool of its own instead of functions, which the server refuses. opencode takes the server as a
+provider in
+`~/.config/opencode/opencode.json`, without a timeout (its default ends a request after 5 minutes, and a turn that
+thinks can take longer):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "artlite": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Artlite",
+      "options": {"baseURL": "http://127.0.0.1:8080/v1", "timeout": false},
+      "models": {
+        "qwen3.6-35b-a3b": {"name": "Qwen3.6 35B-A3B", "tool_call": true, "reasoning": true,
+                            "limit": {"context": 131072, "output": 32768}}
+      }
+    }
+  },
+  "model": "artlite/qwen3.6-35b-a3b",
+  "small_model": "artlite/qwen3.6-35b-a3b"
+}
 ```
 
 - Messages API: `system`, the blocks `text`, `image` (base64), `thinking`, `tool_use` and `tool_result`, `tools`,
@@ -77,6 +103,16 @@ codex -c model_provider=artlite -c 'model_providers.artlite={name="artlite", bas
 - Agents copy their context (an edit's old text, a file they rewrite, a command again): generation takes draft tokens
   from it ([artlite-cli](cli.md#text)), so on recorded agent sessions Qwen3.6-27B, Qwen3.5-9B and Llama 3.1 8B generate
   1.46-1.52x faster and MiniCPM-V 1.25x (Qwen3.6-35B-A3B and Gemma 4 guess with their drafters: +0-4% more).
+- Models: Qwen3.6-35B-A3B is the one these three clients ran whole tasks on (each fixed a bug in a Python package, its
+  tests run); with its drafter it generates ~29 tokens/s after a 1K-token prompt and ~21 after 32K. Occamy 1.0, a
+  fine-tune of it for agentic tool use, takes 15.8 GB instead of 21. On 150 function-calling cases (BFCL's simple,
+  multiple and parallel calls) Qwen3.6-35B-A3B, Gemma 4 E4B and Llama 3.1 8B call right in 131, 134 and 129, none
+  malformed. Most of a session's time is generation, most of it the model's thoughts: a client's own thinking
+  setting, or `-rea off`, turns them off.
+- Context and memory: the clients' first prompts are 7-12K tokens (their instructions and tools), and a task's
+  conversation often grows past the default 32K positions: give `-c 131072`. The weights stay in host RAM (21 GB for
+  Qwen3.6-35B-A3B), with the KV cache (its 131072 positions: 2.3 GB) and the prompt cache (`--cache-ram`,
+  [below](#requests)).
 
 ## Web chat
 

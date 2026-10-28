@@ -31,6 +31,8 @@ device rather than for portability.
 - **Tools in llama.cpp's style.** `artlite-cli`, `artlite-server` (an OpenAI-compatible API and llama.cpp's web chat,
   for one model or with a model picker over all of yours) and `artlite-bench`, with llama.cpp's option names where
   they apply.
+- **A local model for coding agents.** Claude Code, Codex and opencode work against `artlite-server`, with tool calls
+  and a prompt cache, so each turn reads only what is new ([Agents](docs/server.md#agents)).
 
 > [!NOTE]
 > Artlite is mostly research into how far this hardware can be pushed, and where the NPU is the right device for the

@@ -42,9 +42,15 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
 
 - **Decode** reads every weight once per token, so each device decodes at its own read limit and the tokens/s ratio
   (3.6-3.7x) is the bandwidth ratio. Artlite's decode is close to the NPU's limit already: what remains is more tokens
-  per weight pass (a step of 4 tokens costs ~5% more than a step of one: multi-token prediction, speculative
-  decoding) and fewer bytes per token (MoE, lower-bit weights).
+  per weight pass (a step of 4 tokens costs ~5% more than a step of one: the draft tokens Artlite's generation takes
+  from a drafter or from the context) and fewer bytes per token (MoE, lower-bit weights).
 - **Prefill** is compute-bound and on par, at a fraction of the iGPU's power.
+- **Agents** are decode-bound once a prompt cache keeps their conversations: in recorded sessions of Claude Code,
+  Codex and opencode on Qwen3.6 35B-A3B, the turns read 5.5 new prompt tokens per generated token, and 70% of the
+  generated tokens were thoughts. From both devices' measured rates, the iGPU would finish those sessions ~1.85x
+  sooner on Strix Halo (the NPU prefills 2.3x faster, decodes 2.6x slower); at a Krackan Point's rates (Gemma 4
+  E4B's, an estimate) the two finish about together, the NPU ~1.3x sooner without the thoughts. On Strix Halo the
+  NPU's case for agents is the free iGPU and the energy.
 - **Both decoding at once** reach ~204 GB/s in total, 7% above the iGPU alone: they compete for the bus.
 - **Smaller platforms.** Strix Point and Krackan Point have a 128-bit bus (~90 GB/s with DDR5-5600, ~120 with
   LPDDR5X-7500). On a Krackan Point laptop
@@ -59,7 +65,7 @@ than speed. Not tried yet, ranked by expected value per effort:
 
 | | candidate | why the NPU could win |
 |---|---|---|
-| 1 | Prefill-only work: an LLM as a classifier, decision models (JEV-27B-VL), rerankers, guard models; prefill-heavy agents and RAG | compute-bound; prefill on par at a fraction of the power |
+| 1 | Prefill-only work: an LLM as a classifier, decision models (JEV-27B-VL), rerankers, guard models; RAG | compute-bound; prefill on par at a fraction of the power |
 | 2 | Prefill on the NPU, decode on the iGPU | each device on its strength, overlapped in a server |
 | 3 | Multimodal encoders (vision and audio projectors, Whisper) | ViT and conformer encoders are compute-bound |
 | 4 | Image generation (UNet, DiT) | many compute-bound steps |
