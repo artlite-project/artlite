@@ -108,14 +108,15 @@ __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, c
     aie::store_v(out + 32, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
 }
 
-// Scores of one record (8 positions) against every set: so[128 s + 8 r + j] (row r < 4 of set s, position j), log2
-// units. Each K panel is popped once for all sets (Q: [d-block][set]); K hi, then K lo (a loop of three panel streams
-// spills their state), one MMUL chain per set
+// Scores of one record (8 positions) against NS sets: so[128 s + 8 r + j] (row r < 4 of set s, position j), log2
+// units. Each K panel is popped once for all sets (Q: [d-block][set of NS]); K hi, then K lo (a loop of three panel
+// streams spills their state), one MMUL chain per set: a row's scores the same sums whatever NS
+template <int NS>
 __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
 {
-    al::MM8 a[{{ SETS }}];
+    al::MM8 a[NS];
     AIE_LOOP_UNROLL_FULL
-    for (int s = 0; s < {{ SETS }}; s++)
+    for (int s = 0; s < NS; s++)
         a[s] = al::MM8(aie::zeros<accfloat, 64>());
     al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
     AIE_LOOP_UNROLL_FULL
@@ -125,12 +126,12 @@ __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uin
         for (int d = 0; d < {{ ND }}; d++) {
             const al::BV K = ks.pop();
             AIE_LOOP_UNROLL_FULL
-            for (int s = 0; s < {{ SETS }}; s++)
+            for (int s = 0; s < NS; s++)
                 a[s].mac(qs.pop(), aie::op_transpose(K));
         }
     }
     AIE_LOOP_UNROLL_FULL
-    for (int s = 0; s < {{ SETS }}; s++) {  // (q rows hi + lo)
+    for (int s = 0; s < NS; s++) {  // (q rows hi + lo)
         const aie::vector<float, 64> c = a[s].to_accum().template to_vector<float>();
         aie::store_v(so + 128 * s, aie::add(c.template extract<32>(0), c.template extract<32>(1)));
     }
@@ -424,10 +425,11 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
     const al::BV nI = al::neg_eye();
     float *__restrict q = AW(float, {{ a.y }});
     al::BOut<> o((bfp16ebs8 *)AW(uint8_t, {{ a.qa }}));
+    const int ns = {{ "nr <= 4 ? 1 : " if SETS == 2 }}{{ SETS }};  // (the sets ``qk`` scores)
     AIE_LOOP_NO_UNROLL
     for (int db = 0; db < {{ ND }}; db++) {  // ([d-block][set]: the scores' one stream)
         AIE_LOOP_NO_UNROLL
-        for (int set = 0; set < {{ SETS }}; set++) {  // (all of them: their y must be zero, as o of unused rows)
+        for (int set = 0; set < ns; set++) {
             aie::vector<float, 32> v = aie::zeros<float, 32>();
 {% for qq in range(4) %}
             if (4 * set + {{ qq }} < nr)
@@ -501,8 +503,14 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
             if (!att)
                 continue;
             float *__restrict so = sc + 32 * (2 * ph + k);  // (every set's, the unused ones' too: their P stays finite)
+{% if SETS == 2 %}
+            if (r <= rl && QR * S <= 4)  // (a sub-step of one set's rows: the other set's scores stay as they were, its
+                {{ p }}_qk<1>(rec, AW(uint8_t, {{ a.qa }}), so);  // rows unused)
+            else if (r <= rl)
+{% else %}
             if (r <= rl)
-                {{ p }}_qk(rec, AW(uint8_t, {{ a.qa }}), so);
+{% endif %}
+                {{ p }}_qk<{{ SETS }}>(rec, AW(uint8_t, {{ a.qa }}), so);
             AIE_LOOP_NO_UNROLL
             for (int set = 0; set < (r >= rp ? {{ SETS }} : 0); set++)  // (masked: -16384, P 0)
                 aie::store_v(so + 128 * set, r > rl ? aie::broadcast<float, 32>(-16384.0f) :
