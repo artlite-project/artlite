@@ -84,7 +84,7 @@ void bo::mmap_bo(void* at) {
     m_aligned = m_pdev.mmap(at, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, m_map_offset);
     return;
   }
-  m_aligned = m_pdev.mmap(nullptr, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED, m_map_offset);
+  m_aligned = m_pdev.mmap(nullptr, m_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_map_offset);
 }
 
 void bo::release() noexcept {
@@ -187,7 +187,7 @@ bo::bo(const pdev& p, size_t size, user_memory)
     if (::ioctl(m_pdev.m_dev_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo) == -1) {
       int err = errno;
       shim_err(err, "a user BO of {} MB: DRM_IOCTL_AMDXDNA_CREATE_BO failed{}", m_aligned_size >> 20,
-               err == ENOMEM ? pdev::memlock_hint() : "");
+               err == ENOMEM || err == EPERM ? pdev::memlock_hint() : "");  // (EPERM: a limit of 0)
     }
     m_handle = cbo.handle;
     amdxdna_drm_get_bo_info info = {.handle = m_handle};

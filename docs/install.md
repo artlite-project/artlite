@@ -134,7 +134,7 @@ what they need).
 |---|---|
 | no `/dev/accel/accel0` | the driver is not loaded: `sudo modprobe amdxdna`; `dmesg \| grep amdxdna` shows why (firmware not found, unsupported device) |
 | `Permission denied` on `/dev/accel/accel0` | your user is not in the `render` group (above) |
-| `Cannot allocate memory` / `Resource temporarily unavailable` from a BO, "as ulimit -l is 8192 KB" | the locked-memory limit (above) |
+| `Cannot allocate memory` / `Operation not permitted` from a user BO, "as ulimit -l is 8192 KB" | the locked-memory limit (above) |
 | `artlite.DispatchError` with state `TIMEOUT` | the driver's hang detection stopped a command; its `health` is the firmware's report ([Design: error handling](design.md#error-handling)) |
 | Strix Halo: the machine resets during NPU work while the iGPU is busy too (a browser, a video call, llama.cpp); the next boot's kernel log says `Previous system reset reason [0x08000800]: an uncorrected error caused a data fabric sync flood event` | an AMD bug in Strix Halo's data fabric under GPU and NPU load at once, not Artlite's ([ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)); holding FCLK avoided it in Artlite's tests, though not on every board ([below](#strix-halo-resets-under-npu-and-igpu-load)) |
 | opening `/dev/accel/accel0` fails; `dmesg` says `SVA bind device failed` | the IOMMU is off (`amd_iommu=off` on the kernel command line, a common iGPU tuning tip): the NPU needs it. Remove the parameter; `iommu=pt` keeps the NPU working |

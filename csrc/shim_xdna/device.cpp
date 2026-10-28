@@ -214,11 +214,8 @@ std::string pdev::memlock_hint() {
 
 void* pdev::mmap(void* addr, size_t len, int prot, int flags, off_t offset) const {
   void* ret = ::mmap(addr, len, prot, flags, m_dev_fd, offset);
-  if (ret == MAP_FAILED) {
-    int err = errno;
-    shim_err(err, "mmap(addr={}, len={}, prot={}, flags={}, offset={}) failed{}", addr, len, prot, flags, offset,
-             err == EAGAIN && (flags & MAP_LOCKED) ? memlock_hint() : "");
-  }
+  if (ret == MAP_FAILED)
+    shim_err(errno, "mmap(addr={}, len={}, prot={}, flags={}, offset={}) failed", addr, len, prot, flags, offset);
   return ret;
 }
 
