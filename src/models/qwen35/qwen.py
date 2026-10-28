@@ -19,10 +19,11 @@ decode steps of up to 4 tokens. An MoE model's chunk routes its tokens on the ho
 (``artlite.moe.prefill``).
 
 Multi-token steps (``OverlayModel.generate``): the sampled token's step takes up to three draft tokens along - the
-context's (``models.drafts``), or with a qwen35moe model's MTP drafter (``model_config.qwen_mtp_of``:
-``models.qwen35.draft.QwenDraft``) its guesses of what follows, a dispatch of the same design each (2.4-3.4 ms on the
-35B-A3B), while their chain's probability stays at least ``P_MIN`` - and a draft is kept where the token sampled from
-the model's logits at its position is that draft. A step of drafts leaves the GDN states uncommitted: the next one
+context's (``models.drafts``), or with an MTP drafter (``models.qwen35.draft.QwenDraft``: a Qwen3.8 file's own block, a
+qwen35moe model's MTP file, ``model_config.qwen_mtp_of``) its guesses of what follows, a dispatch of the same design
+each (2.4-3.4 ms on the 35B-A3B), while their chain's probability pays for the step's slot and the drafter's step
+(``OverlayModel._worth``) - and a draft is kept where the token sampled from the model's logits at its position is that
+draft. A step of drafts leaves the GDN states uncommitted: the next one
 replays the accepted tokens.
 
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
@@ -65,10 +66,9 @@ MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95, "penalty_repeat":
 class NpuQwen(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full-attention layers' caches hold; ``prefill``: prompts
     in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``QwenPrefill``'s);
-    ``drafter``: a qwen35moe model's multi-token-prediction drafter file ("": ``model_config.qwen_mtp_of``, when there
-    is one; None: none)."""
+    ``drafter``: a qwen35moe model's multi-token-prediction drafter file ("": the model file's own MTP block, else
+    ``model_config.qwen_mtp_of``'s file, when there is one; None: none)."""
 
-    P_MIN = 0.5  # a round's drafts stop where the probability of their chain (the drafter's) falls below it
     recurrent = True  # (the GDN layers' states hold the whole sequence)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
@@ -82,15 +82,19 @@ class NpuQwen(OverlayModel):
                                    formats=draft_formats(mtp) if mtp is not None else ())
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
-        self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else None  # (OverlayModel's)
+        own = drafter == "" and self.overlay.image.draft_cols > 0  # (the file's own block)
+        self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None
         if cfg.moe:
             self.STEP_COST = (1.0, 1.31, 1.60, 1.94)  # (35B-A3B at 1K: the slots route to different experts)
+        else:
+            self.STEP_COST = (1.0, 1.015, 1.03, 1.045)  # (27B at 1K: the weights stream once)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
             self.overlay.load(threads=threads)
             if self.drafter is not None:
                 self.drafter.load(threads=threads)
+            if mtp is not None:
                 mtp.release()
             if build is not None:
                 build.result()  # (its error, if any)
@@ -118,7 +122,8 @@ class NpuQwen(OverlayModel):
 
     def describe(self) -> str:
         ov = self.overlay
-        d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
+        d = "" if self.drafter is None else ", its MTP block as the drafter" if self.drafter.w_of is not None else \
+            f", drafter {os.path.basename(self.drafter.gguf.path)}"
         return (f"{ov.image.nbytes / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
                 f"({self.capacity} positions), {ov.sizes['GSTATE'] / 1e6:.0f} MB of GDN states{d}")
 
@@ -293,26 +298,32 @@ class NpuQwen(OverlayModel):
     def draft(self, token: int, n: int) -> list[int]:
         """The drafter's guesses of up to n tokens after ``token`` (the token of the next position, not run yet; its
         row runs with the pending ones): the most likely one, the most likely one after it, ... while their chain's
-        probability stays at least ``P_MIN`` (ends with an end-of-sequence token)."""
+        probability pays for the round's slot of each and the drafter's step of the next (``_worth``, ``_more``) (ends
+        with an end-of-sequence token)."""
         t0 = time.perf_counter()
         rows = [*self._pend, (self._rows([token])[0], self._h)]
         assert self._dpos + len(rows) == self.position + 1 and len(rows) <= SLOTS
         self._pend = []
         raw = self._draft_step(rows, logits=n > 0)
         out: list[int] = []
+        chains: list[float] = []
         chain, slot = 1.0, len(rows) - 1
         while len(out) < n:
             i, p = max_prob(raw[slot])
             chain *= p
-            if chain < self.P_MIN:
+            if not self._keep(chain, len(out)):
                 break
             out.append(int(self.drafter.ids[i]))
-            if out[-1] in self.eos_token_ids or len(out) == n:
+            chains.append(chain)
+            if out[-1] in self.eos_token_ids or len(out) == n or not self._more(chain, p, len(out)):
                 break
             h = self.drafter.hidden_state(slot)
+            t = time.perf_counter()
             raw, slot = self._draft_step([(self._rows(out[-1:])[0], h)], logits=True), 0
+            self._row_time(time.perf_counter() - t)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
+        self._chains = tuple(chains)
         return out
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),

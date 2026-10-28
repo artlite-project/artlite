@@ -1,9 +1,10 @@
-"""The multi-token-prediction drafter of Qwen3.6-35B-A3B (``qwen35.draft.QwenDraft``, ggml-org's Q4_0 MTP file) and
-of Occamy 1.0 (its Q4_K_M MTP file: Q4_K and Q6_K) on the decode overlay of a 2-layer slice (layers 0 and 3: the
-model's design, its formats with the drafter's), against
-``ref.mtp_block`` on llama.cpp's hidden states of an essay (golden(mtp=): the rows' h and the drafter file's
-token embeddings): per row the next draft's h and the head's logits, in steps of S rows from position 0. The prompt's
-records (``QwenPrefill(draft=)``, ``draft_prefill``) against those of drafter steps from the same inputs."""
+"""The multi-token-prediction drafter (``qwen35.draft.QwenDraft``) of Qwen3.6-35B-A3B (ggml-org's Q4_0 MTP file), of
+Occamy 1.0 (its Q4_K_M MTP file: Q4_K and Q6_K) and of Qwen3.8-27B (its file's own block, on the model's image: its
+head the first rows of the model's, the vocabulary whole) on the decode overlay of a 2-layer slice (layers 0 and 3: the
+model's design, its formats with the drafter's), against ``ref.mtp_block`` on llama.cpp's hidden states of an essay
+(golden(mtp=): the rows' h and the drafter's token embeddings): per row the next draft's h and the head's logits, in
+steps of S rows from position 0. The prompt's records (``QwenPrefill(draft=)``, ``draft_prefill``) against those of
+drafter steps from the same inputs."""
 
 import os
 
@@ -22,37 +23,57 @@ from . import ref
 
 N = 100
 # (per model: the router gap below which a row's 8th and 9th experts tie, h's median and largest error elsewhere;
-# Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median)
-TOL = {"35B-A3B": (0.01, 7e-3, 1.5e-2), "occamy": (0.02, 1.5e-2, 2.5e-2)}
+# Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median; the
+# 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%)
+TOL = {"35B-A3B": (0.01, 7e-3, 1.5e-2), "occamy": (0.02, 1.5e-2, 2.5e-2), "3.8-27B": (0.0, 1.5e-2, 3e-2)}
+SIZES = ["35B-A3B", "occamy", "3.8-27B"]
+PREFILL_TOL = {"3.8-27B": (1.5e-2, 3e-2)}  # (test_draft_prefill's records and carry, where not 1% and 2%)
 
 
 def _files(size: str) -> tuple[str, str]:
-    """The model file of a size ("35B-A3B", "occamy") and its drafter's."""
+    """The model file of a size ("35B-A3B", "occamy", "3.8-27B") and its drafter's (the model's own, with a block)."""
     model = ref.size_gguf(size)
-    mtp = qwen_mtp_of(model) if os.path.exists(model) else None
+    if not os.path.exists(model):
+        pytest.skip(f"no {model}")
+    mtp = model if QwenConfig.from_gguf(GGUFFile(model)).nextn_layers else qwen_mtp_of(model)
     if mtp is None:
-        pytest.skip(f"no {model} or its MTP drafter")
+        pytest.skip(f"no MTP drafter of {model}")
     return model, mtp
 
 
-@pytest.fixture(scope="module", params=["35B-A3B", "occamy"])
+def _slice(model: str, mtp: str, max_positions: int) -> tuple[QwenOverlay, QwenDraft]:
+    """Layers 0 and 3 of the model and its drafter (an MTP file's: the vocabulary's first 4096 rows; the model's own
+    block: on the model's image, its head the first rows of the model's whole one)."""
+    if mtp == model:
+        target = QwenOverlay(GGUFFile(model), layers=[0, 3], max_positions=max_positions)
+        return target, QwenDraft(target)
+    gm = GGUFFile(mtp)
+    target = QwenOverlay(GGUFFile(model), layers=[0, 3], vocab=4096, max_positions=max_positions,
+                         formats=draft_formats(gm))
+    return target, QwenDraft(target, gm)
+
+
+@pytest.fixture(scope="module", params=SIZES)
 def setup(request: pytest.FixtureRequest) -> tuple:
     model, mtp = _files(request.param)
+    gm = GGUFFile(mtp)
+    cfg = QwenConfig.from_gguf(gm)
+    L = cfg.num_hidden_layers
     tokens = ref.llama_tokenize(model, essay("apple.txt"))[:N]
-    G = ref.golden(model, tokens, layers=(40, "g"), names="mtp_tok_embd|result_norm", logits="none", mtp=mtp)
-    emb = np.asarray(G.mtp("mtp_tok_embd", 40), np.float32).reshape(N, -1)
+    G = ref.golden(model, tokens, layers=(L, "g"), names="mtp_tok_embd|result_norm", logits="none", mtp=mtp)
+    emb = np.asarray(G.mtp("mtp_tok_embd", L), np.float32).reshape(N, -1)
     hr = np.asarray(G["result_norm"], np.float32).reshape(N, -1)
     h = np.concatenate([np.zeros_like(hr[:1]), hr[:-1]])
-    gm = GGUFFile(mtp)
-    target = QwenOverlay(GGUFFile(model), layers=[0, 3], vocab=4096, max_positions=1024, formats=draft_formats(gm))
+    target, draft = _slice(model, mtp, 1024)
     target.load()
-    draft = QwenDraft(target, gm)
     draft.load()
-    r = ref.mtp_block(gm, QwenConfig.from_gguf(gm), emb, h, np.arange(N), head=draft.ids)
-    wr = gm.tensor("blk.40.ffn_gate_inp.weight").dequantize().numpy().reshape(gm.tensor("blk.40.ffn_gate_inp.weight").rows, -1)
-    p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ wr.T), -1)[:, ::-1]
+    r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.ids)
     tie, *tol = TOL[request.param]
-    tied = (p[:, 7] - p[:, 8]) / p[:, 7] < tie  # (rows whose 8th and 9th experts nearly tie: either may win)
+    tied = np.zeros(N, bool)
+    if cfg.moe:
+        t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
+        p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ t.dequantize().numpy().reshape(t.rows, -1).T), -1)[:, ::-1]
+        tied = (p[:, 7] - p[:, 8]) / p[:, 7] < tie  # (rows whose 8th and 9th experts nearly tie: either may win)
     return draft, torch.from_numpy(emb), torch.from_numpy(h), r, tied, tol
 
 
@@ -77,13 +98,15 @@ def test_draft_steps(setup: tuple, S: int) -> None:
 
 
 def test_table(setup: tuple) -> None:
-    """The head's table (``QwenDraft.see``), on a drafter of its own: the special tokens are fixed rows; after a
+    """The head's table (``QwenDraft.see``), on a drafter of its own (a model's own block: the module's, whose table has
+    seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
     2% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks."""
     draft, emb, h, r, tied, _ = setup
-    d = QwenDraft(draft.target, draft.gguf)
-    d.load()
+    d = draft if draft.w_of is not None else QwenDraft(draft.target, draft.gguf)  # (the model's own block: its buffer)
+    if d is not draft:
+        d.load()
     types = np.asarray(d.gguf.meta["tokenizer.ggml.token_type"])
     assert np.isin(np.flatnonzero((types == 3) | (types == 4)), d.ids).all()
     rare = np.setdiff1d(np.arange(70000, 248000, 211), d.ids)[:TABLE_ROWS + 100]
@@ -115,19 +138,20 @@ def test_interleaved(setup: tuple) -> None:
         assert torch.equal(draft.step(emb[p:p + 1], h[p:p + 1], p), alone[p]), p
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", SIZES)
 def test_draft_prefill(size: str) -> None:
     """Three 256-token chunks of an essay through the slice's prefill with the drafter's records (the carry between
     chunks: the last row's h), then the drafter's step at the next position; the same step after drafter steps of 4
     rows wrote the records from the same inputs (the embeddings, the model's h of the prefill's output rows): within
     1% rms (h ~0.67%, logits ~0.69%: bfp16 vs bf16 roundings of the records' inputs), the same argmax. The last
     chunk's carry as the host computes it after decode steps (``carry_of``, fp32) within 2% of the device's (1.2%: its
-    GEMM's bfp16 panels of hnorm(h))."""
+    GEMM's bfp16 panels of hnorm(h)). The 27B (``PREFILL_TOL``): its hnorm(h) has a dimension at ~68 times its rms, whose
+    bfp16 blocks cost 2.2% of the carry (2.4%), the records 1.1%."""
     model, mtp = _files(size)
+    rec, carry = PREFILL_TOL.get(size, (1e-2, 2e-2))
     T, nch = 256, 3
-    g, gm = GGUFFile(model), GGUFFile(mtp)
-    target = QwenOverlay(g, layers=[0, 3], vocab=4096, max_positions=4096, formats=draft_formats(gm))
-    draft = QwenDraft(target, gm)
+    target, draft = _slice(model, mtp, 4096)
+    g = target.gguf
     pf = QwenPrefill(target, sizes=(T,), draft=draft)
     pf.compile()
     target.load()
@@ -147,7 +171,7 @@ def test_draft_prefill(size: str) -> None:
     dev_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
     pf.dp.carry_of(h[n - 1])  # (the host's, after decode steps)
     host_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
-    assert float((dev_carry - host_carry).norm() / host_carry.norm()) < 2e-2
+    assert float((dev_carry - host_carry).norm() / host_carry.norm()) < carry
     a = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
     ha = draft.hidden_state(0).numpy()
     draft.reset()
@@ -156,5 +180,5 @@ def test_draft_prefill(size: str) -> None:
     b = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
     hb = draft.hidden_state(0).numpy()
     for u, v in ((ha, hb), (a, b)):
-        assert np.sqrt(((u - v) ** 2).mean() / (v ** 2).mean()) < 1e-2
+        assert np.sqrt(((u - v) ** 2).mean() / (v ** 2).mean()) < rec
     assert a.argmax() == b.argmax()

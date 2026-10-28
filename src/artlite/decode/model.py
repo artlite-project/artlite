@@ -110,7 +110,7 @@ class Records:
 class ModelOverlay:
     """A GGUF model on its decode overlay (module docstring). ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``weights``: the image's buffer allocated ahead (its image's
-    layers and vocabulary)."""
+    layers and vocabulary), ``image``: an image laid out already (a drafter's view of its model's image: ``w_of``)."""
 
     CONFIG: ClassVar[Any]  # the model's config class (``from_gguf``)
     IMAGE: ClassVar[type[TileImage]]  # its image class: (gguf, cfg, layers=, vocab=)
@@ -120,16 +120,18 @@ class ModelOverlay:
     AHEAD: ClassVar[bool] = False
     rings = (0, 0)  # (byte offset, bytes) in KV of the attention layers' rings (``vring``), set by ``_plan``
 
-    def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None):
+    def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None,
+                 image: TileImage | None = None):
         self.gguf = gguf
         self.cfg = cfg = weights.image.cfg if weights is not None else self.CONFIG.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         self.weights = weights
+        self.w_of: ModelOverlay | None = None  # (the overlay whose weight buffer ``load`` adopts: ``image``'s)
         if weights is not None:
             assert weights.image.layers == self.layers and vocab in (None, weights.image.vocab)
             self.image = weights.image
         else:
-            self.image = self.IMAGE(gguf, cfg, layers=self.layers, vocab=vocab)
+            self.image = image or self.IMAGE(gguf, cfg, layers=self.layers, vocab=vocab)
         self.H, self.vocab, self.T = cfg.hidden_size, self.image.vocab, self.image.tile_bytes
         assert self.vocab % (COLS * C_LEN) == 0, "the logits drain whole C objects per column"
         self.start = self.layers[0]  # (the layer whose input is x: ``_mode``)
@@ -181,8 +183,8 @@ class ModelOverlay:
         """Compile the design, allocate the buffers, pack the weight image (or adopt the ``WeightBuffer``'s), write the
         static objects."""
         img = self.image
-        if self.weights is not None:
-            device, buf = self.weights.buffer()
+        if self.weights is not None or self.w_of is not None:
+            device, buf = self.weights.buffer() if self.w_of is None else (self.w_of.dev.device, self.w_of.dev.buffers["W"])
             self.dev = dev = OverlayDevice(self.op, device=device)
             dev.adopt("W", buf)
         else:
@@ -214,6 +216,8 @@ class ModelOverlay:
         """Until the weight image is packed (``WeightBuffer``)."""
         if self.weights is not None:
             self.weights.wait()
+        if self.w_of is not None:
+            self.w_of.ready()
 
     # ------------------------------------------------------------------
     # The transaction of a step

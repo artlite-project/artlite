@@ -301,6 +301,62 @@ void {{ p }}_rb{{ sfx }}(const bfloat16 *__restrict x, {{ "const bfloat16 *__res
 {% endif %}
 }
 {% endfor %}
+{% if pre %}
+
+// replay mode, pass A without a delta, its rms over x w1 (``pre``): ss[t][32 lanes] += squares of bf16(x w1)
+void {{ p }}_ra0p(const bfloat16 *__restrict x, const bfloat16 *__restrict w1, float *__restrict ss, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int t = 0; t < 8; t++) {
+        const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)(x + {{ C }} * t);
+        const bfloat16 __aie_dm_resource_b *__restrict pw = (const bfloat16 __aie_dm_resource_b *)(w1 + {{ C }} * kc);
+        aie::accum<accfloat, 32> acc(aie::load_v<32>(ss + 32 * t));
+        if (kc == 0)
+            acc = aie::zeros<accfloat, 32>();
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < {{ C // 32 }}; j++) {
+            const aie::vector<bfloat16, 32> v = aie::mul(aie::load_v<32>(px), aie::load_v<32>(pw)).template to_vector<bfloat16>();
+            px += 32;
+            pw += 32;
+            acc = aie::mac_square(acc, v);
+        }
+        aie::store_v(ss + 32 * t, acc.template to_vector<float>());
+    }
+}
+
+// replay mode, pass B without a delta (``pre``), chunk kc: 32 panels of bf16(x w1) * w * (1 / rms) -> out
+void {{ p }}_rb0p(const bfloat16 *__restrict x, const bfloat16 *__restrict w1, const bfloat16 *__restrict w,
+                  float *__restrict st, bfloat16 *__restrict out, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *__restrict ih = (bfloat16 *)(st + 256);
+    bfloat16 *__restrict il = ih + 64;
+    if (kc == 0)
+        {{ p }}_inv(st);
+    const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
+    const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    const bfloat16 *__restrict px = x;
+    const bfloat16 *__restrict pw1 = w1 + {{ C }} * kc;
+    const bfloat16 *__restrict pw = w + {{ C }} * kc;
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ C // 8 }}; kb++) {
+        const aie::vector<bfloat16, 64> xp = aie::concat(
+            aie::concat(aie::load_v<8>(px), aie::load_v<8>(px + {{ C }})),
+            aie::concat(aie::load_v<8>(px + {{ 2 * C }}), aie::load_v<8>(px + {{ 3 * C }})),
+            aie::concat(aie::load_v<8>(px + {{ 4 * C }}), aie::load_v<8>(px + {{ 5 * C }})),
+            aie::concat(aie::load_v<8>(px + {{ 6 * C }}), aie::load_v<8>(px + {{ 7 * C }})));
+        const aie::vector<bfloat16, 64> g = aie::mul(xp, aie::load_v<8>(pw1).template grow_replicate<64>())
+                                                .template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> xw = aie::mul(g, aie::load_v<8>(pw).template grow_replicate<64>())
+                                                 .template to_vector<bfloat16>();
+        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        px += 8;
+        pw1 += 8;
+        pw += 8;
+    }
+}
+{% endif %}
 {% else %}
 // pass B, chunk kc: 32 panels (8 tokens x 8 columns) of g * w * (1 / rms) as bfp16ebs8 -> out.
 // st: ss[8][32] | inv_hi[64] | inv_lo[64] (bf16, lane 8 t + e = the token's 1 / rms)
@@ -492,7 +548,8 @@ class PrefillNormOperator(ArtcOperator):
         hi + lo panels (an MoE router's x), panels of 2 E columns: per token group [bfp16(v) | bfp16(v - bfp16(v))]
         (one delta, E <= 2048). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
         norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
-        panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them)."""
+        panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them; not
+        in the hold design)."""
         assert T % (8 * cols) == 0 and T > 0 and E % 1024 == 0 and 1 <= cols <= COLS
         self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
@@ -513,7 +570,7 @@ class PrefillNormOperator(ArtcOperator):
         self.pre = pre
         self.out_pitch, self.out_col = out_pitch or E, out_col
         assert not pre or not add, "pre: a norm without a delta"
-        assert (self.out_pitch, out_col) == (E, 0) or not (lo or self.replay or self.hold) and (
+        assert (self.out_pitch, out_col) == (E, 0) or not (lo or self.hold) and (
             out_col % 8 == 0 and out_col + E <= self.out_pitch), (out_pitch, out_col)
         super().__init__()
 
@@ -659,8 +716,10 @@ class PrefillNormOperator(ArtcOperator):
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
     def _replay_design(self) -> Module:
-        """E > 2048: x (and delta) groups through the memtile, sent twice (pass A, pass B)."""
-        T, add, E, p, nd = self.T, self.add, self.E, self.p, self.deltas
+        """E > 2048: x (and delta) groups through the memtile, sent twice (pass A, pass B); ``pre``: the weight objects
+        w1, then w2."""
+        T, add, E, p, nd, pre = self.T, self.add, self.E, self.p, self.deltas, self.pre
+        P, col = self.out_pitch, self.out_col
         n_g = T // (8 * self.cols)
         n_kc = E // CH
         bf = np.dtype[bfloat16]
@@ -669,11 +728,12 @@ class PrefillNormOperator(ArtcOperator):
         w_ty = np.ndarray[(E,), bf]
         st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
         k_w = Kernel(f"{p}_wc", "kernel.o", [chunk_ty, w_ty, np.int32])
-        sfx = {0: "0", 1: "", 2: "2"}[nd]
+        sfx = {0: "0p" if pre else "0", 1: "", 2: "2"}[nd]
         dch = [np.ndarray[(8 * CH * nd,), bf]] if nd else []  # (two deltas: one object of both chunks)
-        k_a = Kernel(f"{p}_ra{sfx}", "kernel.o", [chunk_ty, *dch, st_ty, np.int32])
+        w1 = [w_ty] if pre else []  # (pre: w1 before the deltas' place)
+        k_a = Kernel(f"{p}_ra{sfx}", "kernel.o", [chunk_ty, *dch, *w1, st_ty, np.int32])
         k_b = Kernel(f"{p}_rb{sfx}", "kernel.o",
-                     [chunk_ty, *dch, w_ty, st_ty, pan_ty, *([chunk_ty] if add else []), np.int32])
+                     [chunk_ty, *dch, *w1, w_ty, st_ty, pan_ty, *([chunk_ty] if add else []), np.int32])
         # memtile: a group [8 tokens][E] -> the core as chunks [kc][8 tokens][CH], twice; two deltas: their groups
         # side by side, as chunk pairs [kc][delta][8 tokens][CH] (a core has two input DMA channels, a shim two
         # output channels)
@@ -692,13 +752,15 @@ class PrefillNormOperator(ArtcOperator):
 
         def core(x_f, p_f, kw, ka, kb, wb, st, *rest):
             d_f, o_f = rest if add else (None, None)
+            wp = list(rest) if pre else []  # (pre: w1's buffer)
             for _ in forever_():
-                for rep in range(2):  # the weight object (w in every row), sent twice
-                    for kc in range_(n_kc):
-                        w = x_f.acquire(1)
-                        if rep == 0:
-                            kw(w, wb, kc)
-                        x_f.release(1)
+                for wt in [*wp, wb]:  # the weight objects (w in every row), each sent twice
+                    for rep in range(2):
+                        for kc in range_(n_kc):
+                            w = x_f.acquire(1)
+                            if rep == 0:
+                                kw(w, wt, kc)
+                            x_f.release(1)
                 for _ in range_(n_g):
                     for kc in range_(n_kc):
                         x = x_f.acquire(1)
@@ -707,7 +769,7 @@ class PrefillNormOperator(ArtcOperator):
                             ka(x, d, st, kc)
                             d_f.release(1)
                         else:
-                            ka(x, st, kc)
+                            ka(x, *wp, st, kc)
                         x_f.release(1)
                     for kc in range_(n_kc):
                         x = x_f.acquire(1)
@@ -719,7 +781,7 @@ class PrefillNormOperator(ArtcOperator):
                             o_f.release(1)
                             d_f.release(1)
                         else:
-                            kb(x, wb, st, pn, kc)
+                            kb(x, *wp, wb, st, pn, kc)
                         p_f.release(1)
                         x_f.release(1)
 
@@ -729,6 +791,8 @@ class PrefillNormOperator(ArtcOperator):
                     Buffer(st_ty, name=f"pn_st{c}")]
             if add:
                 args += [df[c][1].cons(), of[c].prod()]
+            elif pre:
+                args.append(Buffer(w_ty, name=f"pn_w1{c}"))
             workers.append(Worker(core, args, tile=Tile(c, 2), stack_size=self.STACK, while_true=False))
 
         n = T * E
@@ -760,8 +824,10 @@ class PrefillNormOperator(ArtcOperator):
                 x, w, xn, xh, ph = a
             tg = TaskGroup()
             for c in range(self.cols):
-                # w as a group-shaped object (8 copies)
-                xh[c].fill(w, TensorAccessPattern((E,), 0, [1, 8, E // 1024, 1024], [0, 0, 1024, 1]), group=tg)
+                # w as a group-shaped object (8 copies; pre: w1's, then w2's)
+                nw = 2 if pre else 1
+                xh[c].fill(w, TensorAccessPattern((nw * E,), 0, [nw, 8, E // 1024, 1024], [E if pre else 0, 0, 1024, 1]),
+                           group=tg)
                 xh[c].fill(x, groups(c), group=tg)
                 if add:
                     dg = dgroups(c)
@@ -772,15 +838,16 @@ class PrefillNormOperator(ArtcOperator):
                     # x_out chunks [group][kc][8 tokens][CH]
                     oh[c].drain(xo, TensorAccessPattern((n,), 8 * E * c, [n_g, n_kc, 8, CH], [8 * self.cols * E, CH, E, 1]),
                                 group=tg, wait=True)
-                ph[c].drain(xn, TensorAccessPattern((n * 9 // 16,), c * (E // 8) * 36,
-                                                    [1, n_g, 8, E // 64 * 36], [0, self.cols * (E // 8) * 36, E // 64 * 36, 1]),
+                ph[c].drain(xn, TensorAccessPattern((T * P * 9 // 16,), (c * (P // 8) + col // 8) * 36,
+                                                    [1, n_g, 8, E // 64 * 36], [0, self.cols * (P // 8) * 36, E // 64 * 36, 1]),
                             group=tg, wait=True)
             tg.finish()
 
         vt = np.ndarray[(n,), bf]
         n_ds = (nd - 1) * self.d_stride + n_d
-        types = [vt] + ([np.ndarray[(n_ds,), bf]] if add else []) + [np.ndarray[(E,), bf]] + ([vt] if add else [])
-        types.append(np.ndarray[(n * 9 // 16,), bf])
+        types = [vt] + ([np.ndarray[(n_ds,), bf]] if add else []) + [np.ndarray[((2 if pre else 1) * E,), bf]]
+        types += [vt] if add else []
+        types.append(np.ndarray[(T * P * 9 // 16,), bf])
         rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 

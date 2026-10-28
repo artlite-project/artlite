@@ -1,13 +1,15 @@
-"""The multi-token-prediction drafter of a qwen35moe model (an MTP file: ``model_config.qwen_mtp_of``; llama.cpp's
-``graph_mtp`` in ``src/models/qwen35moe.cpp``) on the model's decode overlay: a draft step is one dispatch of the
-model's design (its formats include the drafter's: ``QwenOverlay(formats=)``) and hardware context, with the
-drafter's weights, inputs and KV cache in buffers of its own.
+"""The multi-token-prediction drafter of a qwen35 / qwen35moe model on the model's decode overlay (llama.cpp's
+``graph_mtp`` in ``src/models/qwen35moe.cpp`` / ``qwen35.cpp``): a draft step is one dispatch of the model's design and
+hardware context, with the drafter's inputs and KV cache in buffers of its own. Its block comes from an MTP file
+(``model_config.qwen_mtp_of``: Qwen3.6-35B-A3B's; the design runs the file's formats too, ``QwenOverlay(formats=)``),
+its weights in a buffer of their own, or from the model file itself (Qwen3.8-27B: ``QwenImage``'s MTP block, which
+the drafter streams from the model's buffer, its head the first rows of the model's: ``QwenImage.mtp_view``).
 
-The block (the file's layer L = the model's layer count): x0 = eh_proj [enorm(emb(t_q)) | hnorm(h_{q-1})], then a
-full-attention layer on its own cache and an MoE layer, both as the model's (``QwenOverlay``'s phases on the drafter's
-image: attn_in, the attention, attn_out, moe_in, the routing, sdown, the experts, the combine), then the head over the
-residual normed by ``nextn.shared_head_norm``: rows of the file's ``output.weight``, ``QwenDraft.ids`` the token of each
-logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
+The block (layer L = the model's layer count): x0 = eh_proj [enorm(emb(t_q)) | hnorm(h_{q-1})], then a full-attention
+layer on its own cache and an FFN (an MoE layer, or a dense one), both as the model's (``QwenOverlay``'s phases on the
+drafter's image: attn_in, the attention, attn_out, then moe_in, the routing, sdown, the experts, the combine; or
+gate_up, down), then the head over the residual normed by ``nextn.shared_head_norm``: rows of the file's
+``output.weight``, ``QwenDraft.ids`` the token of each logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
 the first ids (the tokenizer's BPE merges, a frequency order: 98.6% of essay tokens, 97.9% of agents' generated ones);
 then a table of ``TABLE_ROWS`` of the sequence's own tokens past them (``QwenDraft.see``: the most recently seen;
 identifiers of the code an agent reads leave 0.2% of its tokens out of the head, against 2.1% without; text in other
@@ -37,31 +39,16 @@ from artlite.operators.design import COLS
 from artlite.overlay import Sequence
 
 from .attn import OBJ_BYTES
-from .image import QwenImage
+from .image import HEAD_ROWS, TABLE_ROWS, QwenImage, head_tokens
 from .overlay import QwenOverlay
-
-HEAD_ROWS = 65536  # the draft head's fixed rows: the special tokens and the first ids of the vocabulary
-TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``QwenDraft.see``), 64 per column
-
-
-def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
-    """The head's fixed tokens (rows,) and the table's before any sequence (table,), ascending: the control and
-    user-defined tokens (GGUF token types 3, 4), the first other ids to fill the rows, then the next ones (never the
-    unused ids, type 5)."""
-    types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
-    special = np.flatnonzero((types == 3) | (types == 4))
-    other = np.flatnonzero((types != 3) & (types != 4) & (types != 5))
-    n = rows - len(special)
-    return np.union1d(special, other[:n]), other[n:n + table]
 
 
 def mtp_config(gguf: GGUFFile) -> QwenConfig:
-    """The drafter file's config with its block as a layer of its own: layer ``num_hidden_layers`` (an attention layer)
-    after the trunk's (which the file does not hold)."""
+    """The config of a file with one MTP block (an MTP file, or a model's own) with its block as a layer of its own:
+    layer ``num_hidden_layers`` (an attention layer) after the trunk's."""
     cfg = QwenConfig.from_gguf(gguf)
-    if not cfg.moe or cfg.nextn_layers != 1:
-        raise NotImplementedError(f"{gguf.path}: a qwen35moe file with one MTP block (moe {cfg.moe}, blocks "
-                                  f"{cfg.nextn_layers})")
+    if cfg.nextn_layers != 1:
+        raise NotImplementedError(f"{gguf.path}: a file with one MTP block, not {cfg.nextn_layers}")
     return dataclasses.replace(cfg, num_hidden_layers=cfg.num_hidden_layers + 1, attention=(*cfg.attention, True),
                                nextn_layers=0)
 
@@ -107,13 +94,16 @@ class _DraftConfig:
 
 
 class QwenDraft(QwenOverlay):
-    """The drafter ``gguf`` (a qwen35moe MTP file) of the model on ``target`` (whose design runs the drafter's formats:
-    ``QwenOverlay(formats=)``). ``load`` after the target's (its program and context). ``ids`` (vocab,): the token of
-    each of the head's logits; ``table_rows``: the logits of the table (``see``)."""
+    """The drafter ``gguf`` (an MTP file; None: the block of the model's own file, ``QwenImage.mtp_view``) of the model
+    on ``target`` (whose design runs the drafter's formats: ``QwenOverlay(formats=)``). ``load`` after the target's
+    (its program and context; the model's own block: its weight buffer). ``ids`` (vocab,): the token of each of the
+    head's logits; ``table_rows``: the logits of the table (``see``)."""
 
     CONFIG, IMAGE = _DraftConfig, DraftImage
 
-    def __init__(self, target: QwenOverlay, gguf: GGUFFile):
+    def __init__(self, target: QwenOverlay, gguf: GGUFFile | None = None):
+        own = gguf is None
+        gguf = target.gguf if own else gguf
         cfg = mtp_config(gguf)
         tc = target.cfg
         if (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.n_experts,
@@ -122,7 +112,9 @@ class QwenDraft(QwenOverlay):
                 tc.n_experts_used, tc.expert_ffn, tc.shared_ffn):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         self.L = cfg.num_hidden_layers - 1
-        super().__init__(gguf, layers=[self.L], max_positions=target.max_positions)
+        super().__init__(gguf, layers=[self.L], max_positions=target.max_positions,
+                         image=target.image.mtp_view(cfg) if own else None)
+        self.w_of = target if own else None
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
         fmts = _formats(self.image)
         if not fmts <= set(target.op.rows):

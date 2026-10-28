@@ -29,7 +29,7 @@ import torch
 
 from artlite import _native, backend, portable
 
-from .drafts import Lookup, Planner
+from .drafts import EWMA, Lookup, Planner
 
 if TYPE_CHECKING:
     from artlite.decode.model import Records
@@ -472,6 +472,11 @@ class OverlayModel(NpuModel):
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. 4 tokens' time relative to one's, until measured
+    P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
+    # (a drafter step of one row's seconds; a round's kept drafts and its drafts' chain probabilities: running averages)
+    _t_row = 0.0
+    _kept_drafts = _chain_sum = 0.0
+    _chains: tuple[float, ...] = ()  # (the chain probabilities of the drafter's last drafts: ``_calibrate``)
     lookup = True  # drafts from the context
     drafter: Any = None  # a multi-token-prediction drafter
     t_draft = 0.0  # seconds in the drafter's steps
@@ -675,6 +680,45 @@ class OverlayModel(NpuModel):
         """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""
         raise NotImplementedError
 
+    def _worth(self, c: float, s: int, extra: float = 0.0) -> bool:
+        """Whether a draft that the model keeps with probability c (its chain's: the drafter's probability of it and of
+        the drafts before it) pays for a round's step of s + 1 tokens instead of s and ``extra`` seconds more (a drafter
+        step to guess it): c tokens against what that time gives at the drafter's rounds' rate (``Planner.rate``;
+        ``P_MIN`` until it is measured). A dense model's slots cost little: its chains go on while c is ~0.1 or more;
+        an MoE's slots route to more experts: ~0.4-0.5."""
+        rate = self.planner.rate()
+        if rate is None:
+            return c >= self.P_MIN
+        plan = self.planner
+        return c >= rate * (plan.step_time(s + 1) - plan.step_time(s) + extra)
+
+    def _keep(self, chain: float, n: int) -> bool:
+        """With n drafts so far, whether the drafter's next guess (chain: the probability of all n + 1) joins them (the
+        chain's probability as the model keeps such chains: ``_kappa``)."""
+        return self._worth(chain * self._kappa, n + 1)
+
+    def _more(self, chain: float, p: float, n: int) -> bool:
+        """With n drafts (their chain's probability, the last one's p), whether the drafter guesses another (its
+        probability taken as the last one's: a confident chain goes on confidently, as code or a copy does; before its
+        rounds are measured, always)."""
+        return self.planner.rate() is None or self._worth(chain * self._kappa * p, n + 1, self._t_row)
+
+    @property
+    def _kappa(self) -> float:
+        """The drafts the model keeps per their chains' probability (the drafter's calibration; 1 before its rounds)."""
+        return self._kept_drafts / self._chain_sum if self._chain_sum else 1.0
+
+    def _calibrate(self, kept: int) -> None:
+        """A drafter's round kept its first ``kept`` drafts (``_chains``: the probabilities the drafter gave them)."""
+        if self._chains:
+            w = EWMA if self._chain_sum else 1.0
+            self._kept_drafts += w * (kept - self._kept_drafts)
+            self._chain_sum += w * (sum(self._chains) - self._chain_sum)
+
+    def _row_time(self, seconds: float) -> None:
+        """A drafter step of one row took ``seconds``."""
+        self._t_row = seconds if not self._t_row else self._t_row + EWMA * (seconds - self._t_row)
+
     def _begin(self) -> None:
         """A generation's rounds begin (after its prompt's last step)."""
 
@@ -724,6 +768,7 @@ class OverlayModel(NpuModel):
             self.accepted += len(new) - 1
             if mtp:
                 plan.drafted(m, len(new), t2 - t0)
+                self._calibrate(len(new) - 1)
             elif d:
                 plan.accepted(m, len(d), len(new) - 1)
                 self.drafted += len(d)

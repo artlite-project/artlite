@@ -6,7 +6,7 @@ prompt's time to first token also with llama.cpp on the iGPU:
 
 | chart | what |
 |---|---|
-| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4, Qwen3.6 35B-A3B and Occamy 1.0 also with their drafters (MTP) |
+| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4, Qwen3.8 27B, Qwen3.6 35B-A3B and Occamy 1.0 also with their drafters (MTP) |
 | prefill | tokens/s of a 1k- and a 32k-token prompt |
 | TTFT | time to first token against prompt length, 1k to 128k tokens, log-log |
 | image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
@@ -72,8 +72,8 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | Llama 3.1 8B Instruct | Q4_K_M | [lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | `f2be3e1a239c` | 2026-10-15 |
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
-| Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-21 |
-| Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf`, its drafter [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/blob/main/mtp-Qwen3.6-35B-A3B-Q4_0.gguf) `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | `4ac6a06bce55`, `606fca331adc` | 2026-10-24 |
+| Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf` | `e00082f779fa` | 2026-10-21; MTP 2026-10-29 |
+| Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf`, its drafter [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/blob/main/mtp-Qwen3.6-35B-A3B-Q4_0.gguf) `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | `4ac6a06bce55`, `606fca331adc` | 2026-10-24; MTP at 1K 2026-10-29 |
 | Occamy 1.0 (35B-A3B) | APEX-I-MiniPlus | [IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf) `Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf` (as re-uploaded on 2026-10-23), its drafter [`occamy-1.0-mtp-Q4_K_M.gguf`](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/occamy-1.0-mtp-Q4_K_M.gguf) | `ba40cdc039c6`, `f8b0e6174daa` | 2026-10-25 |
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 
@@ -87,6 +87,7 @@ runs, with the toolchain pinned then:
 | 2026-10-22 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-10-24 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-10-25 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
+| 2026-10-29 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 
 ## FastFlowLM and OpenFlowLM
 

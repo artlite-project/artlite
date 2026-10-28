@@ -80,12 +80,12 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     assert torch.equal(xb.to_torch().view(T, E), xs.float().bfloat16())
 
 
-@pytest.mark.parametrize("T", [64, 256])
-def test_prefill_norm_pre_pitch(T: int) -> None:
+@pytest.mark.parametrize(("T", "E"), [(64, 2048), (256, 2048), (64, 5120), (256, 5120)])
+def test_prefill_norm_pre_pitch(T: int, E: int) -> None:
     """Two norms into one A of 2 E columns (``out_pitch``, ``out_col``: an MTP drafter's eh_proj input [enorm(emb) |
     hnorm(h)]): a plain one into columns 0 .., ``pre`` into E ..: (x w1) w2 / rms(x w1), x w1 rounded to bf16 (h =
-    the model's output norm of its residual, then the drafter's hnorm); each within the bfp16 panels' rounding."""
-    E = 2048
+    the model's output norm of its residual, then the drafter's hnorm); each within the bfp16 panels' rounding (E
+    5120: the replay design)."""
     g = torch.Generator().manual_seed(T)
     e, x = (torch.randn(T, E, generator=g) * 2).bfloat16(), (torch.randn(T, E, generator=g) * 3).bfloat16()
     we, w1, w2 = ((torch.rand(E, generator=g) + 0.5).bfloat16() for _ in range(3))

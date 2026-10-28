@@ -34,6 +34,14 @@ An MoE layer (``qwen35moe``: ``QwenConfig.moe``) has instead of gate_up and down
   Expert e's two halves are one run of the image (``Region.col_stride`` apart: half 2 e + 1 right after half 2 e):
   a decode column streams a whole expert, or one half of one.
 
+A file with a multi-token-prediction block of its own (Qwen3.8: ``QwenConfig.nextn_layers``, the block at layer
+``num_hidden_layers``) holds it after the LM head: "eh" (``nextn.eh_proj``, rows hidden / 8 c .. over K 2 hidden), then
+the block's attention layer and its FFN as a layer's regions; only its drafter's steps stream them
+(``draft.QwenDraft``). Its drafter's head is the first ``draft_cols`` rows of each column of the model's "lm" region
+(``mtp_view``): the head's fixed tokens (``head_tokens``: the special tokens and the first ids), then ``TABLE_ROWS`` /
+8 rows of a table of the sequence's own tokens (the drafter's alone: they repeat other rows), then the column's other
+tokens; ``order``: the LM row of each token id (the model's logits, ``QwenOverlay._logits``).
+
 Column-major (``decode.image``: a column's regions in step order, each normed phase's norm-weight objects before its
 tiles, data region "<name>_norm") when every region's decode K groups are whole chunk groups of the image
 (``contiguous``: the 9B, MiniCPM-V), so that a decode step streams a column's weights between two attentions as one run;
@@ -47,11 +55,13 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 (``decode.design``'s "MoE").
 """
 
+import math
+
 import numpy as np
 import torch
 
 from artlite.decode.design import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
-from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows, group_rows
+from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
 from artlite.decode.phases import group_chunks
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
@@ -60,6 +70,19 @@ from artlite.operators.design import COLS
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
+HEAD_ROWS = 65536  # a drafter head's fixed rows: the special tokens and the first ids of the vocabulary
+TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``draft.QwenDraft.see``), 64 per column
+
+
+def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
+    """A drafter head's fixed tokens (rows,) and its table's before any sequence (table,), ascending: the control and
+    user-defined tokens (GGUF token types 3, 4), the first other ids to fill the rows, then the next ones (never the
+    unused ids, type 5)."""
+    types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
+    special = np.flatnonzero((types == 3) | (types == 4))
+    other = np.flatnonzero((types != 3) & (types != 4) & (types != 5))
+    n = rows - len(special)
+    return np.union1d(special, other[:n]), other[n:n + table]
 
 
 def payload(hidden: int, moe: bool = False) -> int:
@@ -81,16 +104,22 @@ def contiguous(region: Region) -> bool:
 
 
 class QwenImage(TileImage):
-    """The weight image of a qwen35 GGUF file."""
+    """The weight image of a qwen35 GGUF file. ``draft_cols``: its MTP block's drafter's head rows per column (0: no
+    block laid out; module docstring)."""
+
+    order: np.ndarray | None = None  # (the LM row of each token id when they are not in id order)
+    draft_cols = 0
+    mtp_layer = -1
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
-        fewer)."""
+        fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         self._expert_rows: dict[tuple[str, int], np.ndarray] = {}  # (every layer's slab blocks share them)
         H, I = cfg.hidden_size, cfg.intermediate_size
+        self.n_ids = cfg.vocab_size if vocab is None else vocab  # (the token ids of the LM rows: 0 .. ids - 1)
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes, vocab=vocab)
@@ -103,8 +132,21 @@ class QwenImage(TileImage):
         assert self.vocab % COLS == 0
         for layer in self.layers:
             self._layer(layer)
+        trunk = all(contiguous(r) for r in self.regions)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
+        if cfg.nextn_layers == 1 and not cfg.moe and not trunk:  # (its head: a view of a region-major image's rows)
+            self.draft_cols = self._draft_cols(self.R[self.fmt(lm)])
+        if self.draft_cols:
+            F = COLS * self.draft_cols - TABLE_ROWS
+            self.fixed, self.table = (head_tokens(gguf, F) if self.n_ids == cfg.vocab_size else
+                                      (np.arange(F), np.arange(F, F + TABLE_ROWS)))
+            self.vocab = self.n_ids + TABLE_ROWS
         self._add(-1, "lm", [("lm", (lm,), self.head_rows())], H)
+        if self.draft_cols:
+            self.mtp_layer = L = cfg.num_hidden_layers
+            self.order = self._order()
+            self._add(L, "eh", [("eh", (f"blk.{L}.nextn.eh_proj.weight",), column_rows(H))], 2 * H)
+            self._layer(L, attention=True)
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
         self.column_major = all(contiguous(r) for r in self.regions)
         if self.column_major:  # (each normed phase's norm-weight objects before its tiles)
@@ -115,10 +157,39 @@ class QwenImage(TileImage):
                 self.regions.append(r)
         self._place()
 
+    def _draft_cols(self, R: int) -> int:
+        """The drafter head's rows per column: whole tiles of R rows and whole C objects, at least the fixed and the
+        table's rows (``HEAD_ROWS``, ``TABLE_ROWS``) or as many as the image's ids hold (0: none)."""
+        m = math.lcm(R, C_LEN)
+        P = -(-(HEAD_ROWS + TABLE_ROWS) // (COLS * m)) * m
+        while P and COLS * P - TABLE_ROWS > self.n_ids:
+            P -= m
+        assert not P or self.n_ids % (COLS * C_LEN) == 0, "the LM rows of an MTP model: whole C objects per column"
+        return P
+
     def head_rows(self) -> np.ndarray:
-        """The LM rows' tokens (COLS, vocab / COLS): column c's are vocab / 8 c .. (-1: a padding row)."""
-        rows = column_rows(self.vocab)
-        return np.where(rows < self.cfg.vocab_size, rows, -1)
+        """The LM rows' tokens (COLS, vocab / COLS): column c's are vocab / 8 c .. (-1: a padding row); with an MTP
+        block (``draft_cols``) its share of the drafter head's fixed tokens, of the table's, then of the other ids."""
+        if not self.draft_cols:
+            rows = column_rows(self.vocab)
+            return np.where(rows < self.cfg.vocab_size, rows, -1)
+        other = np.setdiff1d(np.arange(self.n_ids), self.fixed)
+        return np.concatenate([self.fixed.reshape(COLS, -1), self.table.reshape(COLS, -1), other.reshape(COLS, -1)], 1)
+
+    def _order(self) -> np.ndarray:
+        """The LM row of each token id (``n_ids``,): its fixed or other row (the table's repeat them)."""
+        rows = self.head_rows()
+        per = rows.shape[1]
+        own = np.ones(per, bool)
+        own[self.draft_cols - TABLE_ROWS // COLS:self.draft_cols] = False
+        out = np.empty(self.n_ids, np.int64)
+        out[rows[:, own]] = np.arange(COLS * per).reshape(COLS, per)[:, own]
+        return out
+
+    def mtp_view(self, cfg: QwenConfig) -> "MtpView":
+        """The image of the MTP block's drafter (``cfg``: its config, the block as a layer): ``MtpView``."""
+        assert self.draft_cols, "a file with an MTP block of its own"
+        return MtpView(self, cfg)
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
         """(an MoE model's router tensors and an F32 alpha as their copies times w / bf16(w), module docstring; dropped
@@ -150,10 +221,11 @@ class QwenImage(TileImage):
         w = self.gguf.tensor("output_norm.weight" if layer < 0 else f"blk.{layer}.{NORMS[name]}.weight").dequantize()
         return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
 
-    def _layer(self, layer: int) -> None:
+    def _layer(self, layer: int, attention: bool | None = None) -> None:
+        """(``attention``: whether it is a full-attention layer, default ``cfg.attention``'s: an MTP block's is)"""
         cfg, b = self.cfg, f"blk.{layer}."
         H, I, cols = cfg.hidden_size, cfg.intermediate_size, np.arange(COLS)[:, None]
-        if cfg.attention[layer]:
+        if cfg.attention[layer] if attention is None else attention:
             qh, hd = cfg.num_attention_heads // COLS, cfg.head_dim
             q = 2 * qh * hd * cols + np.arange(2 * qh * hd)[None]  # (per head [q | gate])
             kv = (cfg.num_key_value_heads * hd // COLS) * cols + np.arange(cfg.num_key_value_heads * hd // COLS)[None]
@@ -223,3 +295,38 @@ class QwenImage(TileImage):
                 rows = group_rows(2 * (H * (k // 2) + np.arange(H)[None]) + k % 2, R, 2 * KC // F)
             self._expert_rows[(name, R)] = rows
         return self._expert_rows[(name, R)]
+
+
+class MtpView:
+    """The image an MTP block's drafter runs on (``QwenImage.mtp_view``): the block's regions in the model's image (its
+    eh, attention layer and FFN) and the drafter's head, the first ``draft_cols`` rows of each column of the model's
+    "lm" region (its fixed tokens, then its table's: ``head_rows``); in the model's buffer (``draft.QwenDraft``)."""
+
+    order = None
+    column_major = False
+
+    def __init__(self, image: QwenImage, cfg: QwenConfig):
+        self.model, self.cfg, self.gguf = image, cfg, image.gguf
+        self.slabs: list[Region] = []
+        self.layers = [image.mtp_layer]
+        self.tile_bytes, self.R, self.kc, self.n_norm = image.tile_bytes, image.R, image.kc, image.n_norm
+        self.fixed, self.table = image.fixed, image.table
+        lm = image.region(-1, "lm")
+        b = lm.block("lm")
+        P = image.draft_cols
+        assert lm.kc_group == lm.n_kc, "a row tile's K chunks consecutive: the head's rows a prefix of each column"
+        head = Region(-1, "lm", [Block(b.name, b.tensors, b.rows[:, :P], b.fmt, b.R, b.G)], lm.n_kc, lm.kc_group,
+                      lm.tile_bytes, lm.kc, offset=lm.offset, col_stride=lm.col_stride)
+        self.regions = [r for r in image.regions if r.layer == image.mtp_layer]
+        self.vocab = COLS * P
+        self._index = {(r.layer, r.name): r for r in self.regions} | {(-1, "lm"): head}
+
+    def region(self, layer: int, name: str) -> Region:
+        return self._index[(layer, name)]
+
+    def head_rows(self) -> np.ndarray:
+        """The head's tokens (COLS, draft_cols): per column its fixed tokens, then its table's (the model's LM rows)."""
+        return self.region(-1, "lm").block("lm").rows
+
+    def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
+        return self.model.repack(out, r, b, col, rt)

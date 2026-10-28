@@ -105,6 +105,7 @@ class Planner:
         # seconds as running averages; the rounds since its last)
         self.mtp_rounds, self.mtp_tokens, self.mtp_s = np.zeros(n, np.int64), np.zeros(n), np.zeros(n)
         self.since_mtp = np.zeros(n, np.int64)
+        self.rate_n, self.rate_tokens, self.rate_s = 0, 0.0, 0.0  # (every drafter round's, running averages)
 
     def step_time(self, S: int) -> float:
         """A step of S tokens' seconds: measured, else the prior ratio to the nearest measured S (relative units
@@ -150,8 +151,16 @@ class Planner:
         self.tried[b, :min(a + 1, k)] += 1
         self.kept[b, :a] += 1
 
+    def rate(self) -> float | None:
+        """A drafter's rounds' tokens per second (any match), None before ``WARM`` of them."""
+        return self.rate_tokens / self.rate_s if self.rate_n >= WARM else None
+
     def drafted(self, m: int, tokens: int, seconds: float) -> None:
         """A drafter's round (the context matched m tokens) gave ``tokens`` in ``seconds`` (its drafts and the step)."""
+        w = 1.0 if not self.rate_n else EWMA
+        self.rate_n += 1
+        self.rate_tokens = (1 - w) * self.rate_tokens + w * tokens
+        self.rate_s = (1 - w) * self.rate_s + w * seconds
         b = _mtp_bucket(m)
         w = 1.0 if not self.mtp_rounds[b] else EWMA
         self.mtp_rounds[b] += 1

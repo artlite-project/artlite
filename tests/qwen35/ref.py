@@ -9,7 +9,8 @@ full-attention layers -, ``new_state``, ``final_output``, ``Qcur_full``, ``Kcur.
 ``src/models/qwen35moe.cpp``: ``attn_post_norm`` - its input -, ``ffn_moe_logits``, ``ffn_moe_probs``, ``ffn_moe_topk``
 - the experts' ids, int32 -, ``ffn_moe_weights_norm``, ``ffn_moe_gate`` / ``_up`` / ``_down`` (tokens, k, ...),
 ``ffn_moe_weighted``, ``ffn_moe_out``, ``ffn_shexp``, ``shared_expert_gate``, ``ffn_out``), and the logits of every
-position; with an MTP file (``mtp``) its block over the same positions (``src/models/qwen35moe.cpp``'s ``graph_mtp``:
+position; with an MTP block (``mtp``: an MTP file, or a model file with a block of its own: Qwen3.8) its block over
+the same positions (``src/models/qwen35moe.cpp``'s / ``qwen35.cpp``'s ``graph_mtp``:
 ``mtp_eh_proj``, ``mtp_attn_out``, ``mtp_attn_residual``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``, its logits:
 ``g.mtp(name, layer)``, ``g.mtp_logits``), each row fed the model's ``h_nextn`` of the row before. They are cached under ``tests/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs``
 recomputes). llama.cpp quantizes the activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that
@@ -363,12 +364,13 @@ def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndar
 
 def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos: np.ndarray, *,
               head: np.ndarray | None = None) -> dict[str, np.ndarray]:
-    """A ``qwen35moe`` MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP
-    file) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the rows after it: emb (T, H) the
-    rows' token embeddings, h (T, H) the model's output-normed hidden state of the position before each (zeros at 0).
+    """An MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP file, or of a
+    model file with a block of its own) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the
+    rows after it: emb (T, H) the rows' token embeddings, h (T, H) the model's output-normed hidden state of the
+    position before each (zeros at 0). Its FFN: a ``qwen35moe`` file's MoE, a ``qwen35`` file's dense SwiGLU.
     Returns its tensors by llama.cpp's names (``mtp_eh_proj``: the layer's input x0, ``mtp_attn_residual``,
-    ``mtp_attn_post_norm``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``: the next draft's h), the experts' ids and
-    weights (``ids``, ``weights``) and the logits of the tokens ``head`` (None: none)."""
+    ``mtp_attn_post_norm``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``: the next draft's h), an MoE's experts' ids
+    and weights (``ids``, ``weights``) and the logits of the tokens ``head`` (None: none)."""
     L, eps = cfg.num_hidden_layers, cfg.rms_norm_eps
     b = f"blk.{L}."
 
@@ -394,11 +396,14 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
     o = attention_gqa(q, k, v, scale=1 / np.sqrt(d), q_pos=np.asarray(pos))
     x1 = out["mtp_attn_residual"] = (o * sigmoid(gate)).reshape(T, -1) @ mat("attn_output.weight").T + x0
     xm = out["mtp_attn_post_norm"] = rms_norm(x1, vec("post_attention_norm.weight"), eps)
-    ids, w = moe_route(xm @ mat("ffn_gate_inp.weight").T, cfg.n_experts_used)
-    out["ids"], out["weights"] = ids, w
-    y = moe_ffn(xm, ids, w, experts(gguf, L)) + shared_expert(
-        xm, mat("ffn_gate_shexp.weight"), mat("ffn_up_shexp.weight"), mat("ffn_down_shexp.weight"),
-        vec("ffn_gate_inp_shexp.weight"))
+    if cfg.moe:
+        ids, w = moe_route(xm @ mat("ffn_gate_inp.weight").T, cfg.n_experts_used)
+        out["ids"], out["weights"] = ids, w
+        y = moe_ffn(xm, ids, w, experts(gguf, L)) + shared_expert(
+            xm, mat("ffn_gate_shexp.weight"), mat("ffn_up_shexp.weight"), mat("ffn_down_shexp.weight"),
+            vec("ffn_gate_inp_shexp.weight"))
+    else:
+        y = swiglu(xm, mat("ffn_gate.weight"), mat("ffn_up.weight"), mat("ffn_down.weight"))
     out["mtp_ffn_out"] = y
     x2 = out["mtp_post_ffn"] = x1 + y
     hn = out["h_nextn"] = rms_norm(x2, vec("nextn.shared_head_norm.weight"), eps)

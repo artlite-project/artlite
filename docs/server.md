@@ -104,7 +104,7 @@ thinks can take longer):
   from it ([artlite-cli](cli.md#text)), so on recorded agent sessions Qwen3.6-27B, Qwen3.5-9B and Llama 3.1 8B generate
   1.46-1.52x faster and MiniCPM-V 1.25x (Qwen3.6-35B-A3B and Gemma 4 guess with their drafters: +0-4% more).
 - Models: Qwen3.6-35B-A3B is the one these three clients ran whole tasks on (each fixed a bug in a Python package, its
-  tests run); with its drafter it generates ~29 tokens/s after a 1K-token prompt and ~21 after 32K. Occamy 1.0, a
+  tests run); with its drafter it generates ~30 tokens/s after a 1K-token prompt and ~21 after 32K. Occamy 1.0, a
   fine-tune of it for agentic tool use, takes 15.8 GB instead of 21. On 150 function-calling cases (BFCL's simple,
   multiple and parallel calls) Qwen3.6-35B-A3B, Gemma 4 E4B and Llama 3.1 8B call right in 131, 134 and 129, none
   malformed. Most of a session's time is generation, most of it the model's thoughts: a client's own thinking
@@ -161,7 +161,7 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
   says why. Drafters (`mtp-`, `<name>-mtp-`) and vision encoders are not models of their own: Gemma 4 and the
-  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters, and MiniCPM-V 4.7 gets the `mmproj` file of its
+  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B's is in its own file), and MiniCPM-V 4.7 gets the `mmproj` file of its
   directory (`mmproj-model-f16.gguf` before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for

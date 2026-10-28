@@ -23,7 +23,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Gemma 4 31B it | | lmstudio-community QAT Q4_0; HauhauCS QAT Uncensored Balanced Q4_K_M (with MTP); vision |
 | qwen35 | ✅ Qwen3.5 9B | lmstudio-community Q4_K_M | |
 | | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M | vision |
-| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M | MTP, vision |
+| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter | vision |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
 | qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0) | vision |
 | | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M) | vision |

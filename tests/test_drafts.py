@@ -1,6 +1,6 @@
-"""Context drafts (models/drafts.py: ``Lookup``, ``Planner``) and the generation's rounds of drafts
-(``OverlayModel.generate``) on a fake overlay model whose text is fixed; on the NPU (slow) greedy replies with drafts
-against steps of one token."""
+"""Context drafts (models/drafts.py: ``Lookup``, ``Planner``), the generation's rounds of drafts
+(``OverlayModel.generate``) on a fake overlay model whose text is fixed and a drafter's stop rule; on the NPU (slow)
+greedy replies with drafts against steps of one token."""
 
 import os
 
@@ -130,6 +130,32 @@ def test_generate_drafts() -> None:
     short = Text(text)
     assert list(short.generate(short.first(P), 7, GREEDY, text[:P])) == out[:7] and short.position <= P + 6
 
+
+def test_draft_stop() -> None:
+    """A drafter's chain (``OverlayModel._keep``, ``_more``): ``P_MIN`` until ``WARM`` drafter rounds ran (the next
+    drafter step always); then a draft joins where its chain's probability, calibrated (``_kappa``: kept drafts per
+    their chains' probability), beats the rounds' rate times its slot's time, and the drafter guesses another where the
+    chain times the last guess's probability beats the rate times the slot and its step: a dense model's (7.1 tokens/s,
+    slots of 5 ms, draft steps of 11 ms) chains go on to ~0.04 and ~0.11, an MoE's (30 tokens/s, slots of 12 ms) stop
+    at ~0.36."""
+    dense = Text([1])
+    assert dense._keep(0.6, 0) and not dense._keep(0.4, 0) and dense._more(0.01, 0.01, 1)
+    for S, t in enumerate((0.300, 0.305, 0.310, 0.315), 1):
+        dense.planner.ran(S, t)
+    for _ in range(WARM):
+        dense.planner.drafted(0, 2, 0.280)
+    dense._row_time(0.011)
+    assert dense._keep(0.05, 1) and not dense._keep(0.03, 1)
+    assert dense._more(0.2, 0.9, 1) and not dense._more(0.2, 0.5, 1)
+    dense._chains = (0.8, 0.4)  # (both kept: the drafter is underconfident, kappa 2 / 1.2)
+    dense._calibrate(2)
+    assert dense._kappa == pytest.approx(2 / 1.2) and dense._keep(0.03, 1)
+    moe = Text([1])
+    for S, t in enumerate((0.040, 0.054, 0.066, 0.080), 1):
+        moe.planner.ran(S, t)
+    for _ in range(WARM):
+        moe.planner.drafted(0, 2, 2 / 30)
+    assert moe._keep(0.4, 1) and not moe._keep(0.3, 1)
 
 
 # the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model; Qwen3.5-9B: its

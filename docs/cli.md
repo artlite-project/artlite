@@ -57,8 +57,8 @@ default is `hilo`: `single` takes 2/3 of the cache at KL 0.00028 instead of 0.00
 Generation runs in steps of up to 4 tokens: the next token and draft tokens after it, which a step checks at a
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
 far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
-model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.6 35B-A3B's and Occamy's); each step takes the
-ones that pay at the model's measured step times, none where nothing does. A draft is kept only where the model's own
+model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's own MTP layer, Qwen3.6 35B-A3B's and
+Occamy's); each step takes the ones that pay at the model's measured step times, none where nothing does. A draft is kept only where the model's own
 token at its position is that draft, so the text is the one without drafts (greedy: the same tokens, except at near
 ties on Qwen3.6 35B-A3B and Occamy, whose steps of several tokens sum their experts in another order). The summary on
 stderr counts each kind's draft tokens and the accepted ones.

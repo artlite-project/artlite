@@ -1,6 +1,6 @@
 # Qwen3.5 / 3.6 / 3.8 and MiniCPM-V 4.7 on the NPU
 
-Qwen3.6-27B, Qwen3.8-27B (without its MTP layer), Qwen3.5-9B and MiniCPM-V 4.7 1B (its language model, and images
+Qwen3.6-27B, Qwen3.8-27B (with its MTP layer as the drafter), Qwen3.5-9B and MiniCPM-V 4.7 1B (its language model, and images
 through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (llama.cpp architecture `qwen35`: Gated
 DeltaNet layers with a full-attention layer every fourth), and Qwen3.6-35B-A3B (`qwen35moe`: the same layers with a
 mixture of experts as the FFN: [below](#mixture-of-experts-qwen36-35b-a3b)), also as Occamy 1.0 (Accio-Lab's fine-tune
@@ -14,7 +14,7 @@ repetition penalty 1.03).
 
 ```
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
-$ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+$ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf   (with its MTP layer)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/ggml-org/Qwen3.6-35B-A3B-GGUF/mtp-Qwen3.6-35B-A3B-Q4_0.gguf          (its MTP drafter)
@@ -28,7 +28,8 @@ $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf      
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
 the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"; Occamy's:
 `model_config.occamy_gguf()`). The NPU path reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and IQ3_XXS tensors, Q4_0 ones (a
-drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha). A qwen35moe model's drafter (`model_config.qwen_mtp_of`):
+drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha). Qwen3.8's drafter is its file's own MTP layer; a
+qwen35moe model's (`model_config.qwen_mtp_of`):
 an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in another account's repository of the
 same name (ggml-org publishes its drafters apart from the models); of several, Q4_0, then Q4_K_M, then Q8_0.
 
@@ -53,9 +54,9 @@ GDN states and conv states land in the decode's buffers; a chunk runs as dispatc
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
-Memory: the weights the NPU streams (15.95 GB of the 27B's file, 5.09 GB of the 9B's, 0.53 GB of MiniCPM-V's,
-21.02 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and 0.66 GB of its drafter's) are
-re-laid-out into a device buffer at load, in memory, at their quantization's size.
+Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qwen3.8's MTP layer; 5.09 GB of the
+9B's, 0.53 GB of MiniCPM-V's, 21.02 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and
+0.66 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at their quantization's size.
 Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.97 GB (the
 35B-A3B, 0.66 GB of them its experts' inputs and outputs).
 
@@ -81,24 +82,31 @@ needs it. IQ3_XXS stores indices into a 256-entry grid of 4 values each: the cor
 of the grid in their own memory (`formats/iq3.py`): in a decode step per 8 x 8 weight panel, in a prompt's GEMMs per
 super-block of the rows a pass dequantizes. Alpha runs as two BFP16 planes (hi + lo) summed in fp32.
 
-## Multi-token prediction (Qwen3.6-35B-A3B, Occamy 1.0)
+## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
-With its drafter (the model's MTP layer: an attention layer and an MoE layer of its own, and an LM head), a generation
-step takes up to three draft tokens along (`qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
-follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
-ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one), while the product of their probabilities stays at least
-0.5. The step runs the token and its drafts, and a draft is kept where the model's own token at its position is that
-draft; the GDN states stay uncommitted until the next step, which replays the accepted tokens. The drafter's head is
-66048 rows of its LM head: the special tokens (the turn's end, tool calls, a thought's end), the first ids (the most
-frequent tokens) and 512 of the sequence's own tokens past them, the most recently seen (an agent's turns repeat the
-identifiers of the code it reads: 0.2% of their tokens are outside the head, 2.7% outside the first 65536 ids). Its row
+With its drafter (the model's MTP layer: an attention layer and an FFN of its own - Qwen3.8-27B's dense, in its model
+file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three
+draft tokens along (`qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what follows, one dispatch of
+the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with ggml-org's Q4_0 drafter,
+3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 15 ms at 32K), as long as their chain's probability pays for what
+they cost: a draft's slot in the step and the drafter's step for the next one, against the tokens per second the model's
+rounds give (`OverlayModel._worth`; a dense model's slot costs ~1.5% of its step, so its chains go on down to a
+probability of ~0.1, an MoE's slots route to more experts: ~0.4-0.5). The step runs the token and its drafts, and a
+draft is kept where the model's own token at its position is that draft; the GDN states stay uncommitted until the
+next step, which replays the accepted tokens. The drafter's head is about 66048 rows of its LM head: the special tokens
+(the turn's end, tool calls, a thought's end), the first ids (the most frequent tokens) and 512 of the sequence's own
+tokens past them, the most recently seen (an agent's turns repeat the identifiers of the code it reads: 0.2% of their
+tokens are outside the head, 2.7% outside the first 65536 ids). Qwen3.8-27B's MTP layer shares the model's LM head:
+the model's head rows put those first in each column (67584 rows: whole tiles), so the drafter streams the first rows
+of the model's own head, and the model's logits are gathered back into token order. Its row
 at a position takes that position's token and the model's hidden state of the position before, so its KV cache follows
 the model's: a prompt chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the
 model's last layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs
 the drafter's formats as code pages.
 
-A step of several tokens sums the experts' outputs in another order than a step of one, so greedy text with drafts can
-differ from greedy text without where the top two logits are within ~0.1 of each other.
+On the 35B-A3B models a step of several tokens sums the experts' outputs in another order than a step of one, so
+greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the
+dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
 
 Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
 (`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's

@@ -143,7 +143,8 @@ class QwenOverlay(ModelOverlay):
     """A qwen35 GGUF model on the multi-slot decode overlay. ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the KV caches' capacity, ``weights``: the
     image's buffer allocated ahead (its image's layers and vocabulary), ``formats``: tile formats the design runs
-    besides the image's (a drafter's: ``draft``; past three formats, all but the model's largest as code pages).
+    besides the image's (a drafter's: ``draft``; past three formats, all but the model's largest as code pages),
+    ``image``: an image laid out already (``ModelOverlay``'s: a drafter's view of its model's).
 
     ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot, which the step's and the prefill's
     rotations take; the slot's index (text from position 0) until a model writes others (an image's tokens, the
@@ -152,8 +153,9 @@ class QwenOverlay(ModelOverlay):
     CONFIG, IMAGE = QwenConfig, QwenImage
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = ()):
-        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
+                 max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
+                 image: QwenImage | None = None):
+        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg) if not all(att) else None
@@ -171,6 +173,7 @@ class QwenOverlay(ModelOverlay):
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
+        self._order = None if img.order is None else torch.from_numpy(img.order)  # (``_logits``)
         self._plan()
 
     # ------------------------------------------------------------------
@@ -752,6 +755,15 @@ class QwenOverlay(ModelOverlay):
         self.nrep, self.cshift = 0, 0
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
+
+    def _logits(self, S: int) -> torch.Tensor:
+        """(an image whose LM rows are not in id order, ``QwenImage.order``: a copy in id order, the ids' rows; an MTP
+        drafter's table rows left out)"""
+        if self._order is None:
+            return super()._logits(S)
+        self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
+        x = torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
+        return x[:, self._order]
 
     def _lm_phase(self, seq: Sequence) -> None:
         if self.image.column_major:

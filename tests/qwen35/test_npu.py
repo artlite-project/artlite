@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
+from artlite.model_config import QwenConfig
 from models.qwen35.qwen import NpuQwen
 
 from ..common import draft_gate, draft_prompts, essay
@@ -28,6 +29,14 @@ def _path(size: str) -> str:
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     return path
+
+
+def _drafter(path: str) -> None:
+    """Skip a model without an MTP drafter (its file's own block, or an MTP file: ``qwen_mtp_of``)."""
+    from artlite.model_config import qwen_mtp_of
+
+    if not QwenConfig.from_gguf(GGUFFile(path)).nextn_layers and qwen_mtp_of(path) is None:
+        pytest.skip(f"no MTP drafter of {path}")
 
 
 def _tokens(path: str, n: int, name: str = "founders.txt") -> list[int]:
@@ -85,7 +94,7 @@ def test_teacher_forced(size: str) -> None:
     assert kl < 1.5 * kl_llama and agree > agree_llama - tol
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
@@ -107,22 +116,21 @@ def test_prefill(size: str) -> None:
     assert float(kl.mean()) < 1.5 * float(kl_llama.mean()) + 2e-3 and agree > agree_llama - 0.05
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
 def test_mtp(size: str) -> None:
-    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters (``NpuQwen.generate``, up to 3 drafts per step): greedy
-    replies to two user turns of a chat, the second after the first reply (decode steps up to a cache group, then a
-    chunk from the host's carry). Every token is the argmax of the model's one-token steps over the same text, but where
-    a multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps of one here;
-    Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the flips of its
-    40 layers' routing near ties move the top two logits by up to ~0.6); most drafts are accepted in both replies (the
-    drafter's cache follows the model's positions)."""
-    from artlite.model_config import qwen_mtp_of
+    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B with its file's own block
+    (``NpuQwen.generate``, up to 3 drafts per step): greedy replies to two user turns of a chat, the second after the
+    first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
+    model's one-token steps over the same text (the dense 27B's steps of S slots give the numbers of S steps of one),
+    but where an MoE's multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps
+    of one here; Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the
+    flips of its 40 layers' routing near ties move the top two logits by up to ~0.6); most drafts are accepted in both
+    replies (the drafter's cache follows the model's positions)."""
     from models.common import Sampling
     from models.qwen35.qwen import Qwen
 
     path = _path(size)
-    if qwen_mtp_of(path) is None:
-        pytest.skip(f"no MTP drafter of {path}")
+    _drafter(path)
     qwen = Qwen(path)
     model = qwen.load(capacity=4096)
     assert model.drafter is not None and model.DRAFTS == 3
@@ -152,23 +160,21 @@ def test_mtp(size: str) -> None:
     print(f"drafts (drafted, accepted): {stats1}, {stats2}; tokens not the argmax of one-token steps (their top-2 "
           f"gaps): {flips}")
     flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
-    assert len(flips) <= 3 and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
+    assert len(flips) <= (3 if model.cfg.moe else 0) and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
     assert all(a >= 0.5 * d for d, a in (stats1, stats2))
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
 def test_mtp_prefill(size: str) -> None:
     """The drafter after prompts through the prefill drafts as after the same prompts as decode steps
     (``common.draft_gate``: teacher-forced over the model's greedy replies): the prefill writes the drafter's records of
     the prompt's rows from its own hidden states (``qwen35.draft_prefill``), which the model's KL does not see. Tokens
     per round 2.640 vs 2.648 (35B-A3B), 2.738 vs 2.721 (Occamy); a prompt's differ by up to ~2%, the first guesses at
     ~2% of the positions."""
-    from artlite.model_config import qwen_mtp_of
     from models.qwen35.qwen import Qwen
 
     path = _path(size)
-    if qwen_mtp_of(path) is None:
-        pytest.skip(f"no MTP drafter of {path}")
+    _drafter(path)
     qwen = Qwen(path)
     got = draft_gate(qwen.load(capacity=2048), draft_prompts(qwen))
     pre, steps = got["prefill"].mean(0), got["steps"].mean(0)

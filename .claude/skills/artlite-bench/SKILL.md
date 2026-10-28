@@ -65,8 +65,9 @@ spends assembling its chunks' control code, which artlite-bench's warmup absorbs
 
 ## 4. MTP: the best S
 
-For a model with a drafter (`OverlayModel.drafter`: Gemma 4 with its `mtp-<file>` next to the model, Qwen3.6 35B-A3B
-with ggml-org's `mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch.
+For a model with a drafter (`OverlayModel.drafter`: Gemma 4 with its `mtp-<file>` next to the model, Qwen3.8 27B with
+the MTP layer of its own file, Qwen3.6 35B-A3B with ggml-org's `mtp-Qwen3.6-35B-A3B-Q4_0.gguf`:
+`model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch.
 `artlite-cli` takes up to the maximum (`OverlayModel.DRAFTS`; per step the drafts that pay, `models.drafts`);
 `drafts.py` sets it (0: steps of one token, the entry's `decode_tps`):
 

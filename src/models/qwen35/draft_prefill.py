@@ -15,7 +15,8 @@ writes the records (``AttnPrepOperator``) into the drafter's KV cache at the chu
 - the drafter's attn_in GEMMs (DG), then the attention prep into the drafter's cache (its q / k norms in the prefill's
   PQN; its Q slots into QS, unused).
 
-Buffers of the drafter's device by "D" + their name (``buffers``): its weight image DW, its KV cache DKV.
+Buffers of the drafter's device by "D" + their name (``buffers``): its weight image DW (a model's own block: the
+model's W), its KV cache DKV.
 """
 
 from types import SimpleNamespace
@@ -41,15 +42,17 @@ class DraftPrefill:
         self.L, self.H, self.eps = draft.L, H, cfg.rms_norm_eps
         self.R0 = max(prefill.sizes) + 64  # (rows of each of DY's regions: a chunk, its GEMMs' padding, the carry)
         self.pitch = PG.phase_pitch(img, "attn_in", prefill.SUB)
-        self.d_pitch = PG.d_pitch(img, prefill.SUB)
+        self.d_pitch = PG.d_pitch(SimpleNamespace(regions=[img.region(self.L, "eh")]), prefill.SUB)  # (eh's own)
         assert self.d_pitch == H // 8, "eh's rows dense (the residual norm's deltas)"
+        self.wbuf = "W" if draft.w_of is not None else "DW"  # (the buffer of the drafter's weights)
         self.carry = np.zeros(2 * H, np.uint8)  # (DY's second region's row 0: the last chunk's last valid row)
         self._w_h: np.ndarray | None = None  # (eh_proj's hnorm half, fp32: ``carry_of``)
         self.ops = {t: self._ops(t) for t in sorted({prefill._t(T) for T in prefill.sizes})}
 
     def _ops(self, t: int) -> SimpleNamespace:
         img, H, eps = self.d.image, self.H, self.eps
-        eh = PG.plan_phase(img, img.region(self.L, "eh"), t, pitch=self.d_pitch, ops=self.pf._gemms, k_part=2)
+        r = img.region(self.L, "eh")
+        eh = PG.plan_phase(img, r, t, pitch=self.d_pitch, ops=self.pf._gemms, k_part=r.n_kc // 2)
         assert eh.parts == 2, "eh_proj as [enorm half | hnorm half]"
         return SimpleNamespace(
             eh=eh, attn=PG.plan_phase(img, img.region(self.L, "attn_in"), t, pitch=self.pitch, ops=self.pf._gemms),
@@ -64,15 +67,15 @@ class DraftPrefill:
 
     def buffers(self) -> dict[str, object]:
         """The drafter's device buffers by the names the items use."""
-        return {"D" + k: v for k, v in self.d.dev.buffers.items()}
+        return {"D" + k: v for k, v in self.d.dev.buffers.items() if k != "W" or self.wbuf == "DW"}
 
     def external(self) -> set[str]:
         """(their names before the drafter is loaded)"""
-        return {"D" + k for k in ("W", *self.d.sizes)}
+        names = {"D" + k for k in ("W", *self.d.sizes)}
+        return names - {"DW"} if self.wbuf == "W" else names
 
-    @staticmethod
-    def _w(g: PG.Gemm) -> str:
-        return f"DW[{g.w_off}:{g.w_off + g.op.w_bytes}]"
+    def _w(self, g: PG.Gemm) -> str:
+        return f"{self.wbuf}[{g.w_off}:{g.w_off + g.op.w_bytes}]"
 
     def start_items(self, T: int, tok: object) -> list[tuple]:
         """A chunk's first items (PX: the embeddings): enorm(emb) into PEH. ``tok(buf, j, op, i=, row=, extra=)``:
