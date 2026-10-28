@@ -64,7 +64,7 @@ def test_mtp_block() -> None:
     emb = np.asarray(G.mtp("mtp_tok_embd", 40), np.float32).reshape(n, -1)
     h = np.asarray(G["result_norm"], np.float32).reshape(n, -1)
     r = ref.mtp_block(g, QwenConfig.from_gguf(g), emb, np.concatenate([np.zeros_like(h[:1]), h[:-1]]), np.arange(n),
-                      head_rows=V)
+                      head=np.arange(V))
 
     def rms(a: np.ndarray, b: np.ndarray) -> float:
         a, b = np.asarray(a, np.float64).reshape(n, -1), np.asarray(b, np.float64).reshape(n, -1)

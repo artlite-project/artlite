@@ -6,10 +6,14 @@ drafter's weights, inputs and KV cache in buffers of its own.
 The block (the file's layer L = the model's layer count): x0 = eh_proj [enorm(emb(t_q)) | hnorm(h_{q-1})], then a
 full-attention layer on its own cache and an MoE layer, both as the model's (``QwenOverlay``'s phases on the drafter's
 image: attn_in, the attention, attn_out, moe_in, the routing, sdown, the experts, the combine), then the head over the
-residual normed by ``nextn.shared_head_norm``: the first ``HEAD_ROWS`` rows of the file's ``output.weight`` (the ids
-follow the tokenizer's BPE merges, a frequency order: 98-99% of essay and code tokens). The row at position q (token
-t_q, the model's output-normed hidden state of q - 1) writes its cache record at q and predicts t_{q+1}; the next
-draft's h is its own residual normed by shared_head_norm (``hidden_state``).
+residual normed by ``nextn.shared_head_norm``: rows of the file's ``output.weight``, ``QwenDraft.ids`` the token of each
+logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
+the first ids (the tokenizer's BPE merges, a frequency order: 98.6% of essay tokens, 97.9% of agents' generated ones);
+then a table of ``TABLE_ROWS`` of the sequence's own tokens past them (``QwenDraft.see``: the most recently seen;
+identifiers of the code an agent reads leave 0.2% of its tokens out of the head, against 2.1% without; text in other
+scripts, CJK or Cyrillic, keeps 6-17% out: tokens it had not used before). The row at position q (token t_q, the model's
+output-normed hidden state of q - 1) writes its cache record at q and predicts t_{q+1}; the next draft's h is its own
+residual normed by shared_head_norm (``hidden_state``).
 
 Per step of S slots (``step``): the host writes the eh phase's input [enorm(emb) | hnorm(h)] (K 2 hidden: two K
 groups) and zero residual slices; the eh phase (F_RESID | F_EMITR) adds eh_proj's rows into them and sends the
@@ -19,6 +23,8 @@ draft) rewrites the rows the last round's drafts wrote, then one-slot steps (the
 """
 
 import dataclasses
+from collections import OrderedDict
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -27,13 +33,26 @@ from artlite.decode.design import interleave, norm_objects
 from artlite.decode.image import column_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
+from artlite.operators.design import COLS
 from artlite.overlay import Sequence
 
 from .attn import OBJ_BYTES
 from .image import QwenImage
 from .overlay import QwenOverlay
 
-HEAD_ROWS = 65536  # the draft head's rows: the first ids of the vocabulary
+HEAD_ROWS = 65536  # the draft head's fixed rows: the special tokens and the first ids of the vocabulary
+TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``QwenDraft.see``), 64 per column
+
+
+def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
+    """The head's fixed tokens (rows,) and the table's before any sequence (table,), ascending: the control and
+    user-defined tokens (GGUF token types 3, 4), the first other ids to fill the rows, then the next ones (never the
+    unused ids, type 5)."""
+    types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
+    special = np.flatnonzero((types == 3) | (types == 4))
+    other = np.flatnonzero((types != 3) & (types != 4) & (types != 5))
+    n = rows - len(special)
+    return np.union1d(special, other[:n]), other[n:n + table]
 
 
 def mtp_config(gguf: GGUFFile) -> QwenConfig:
@@ -49,11 +68,17 @@ def mtp_config(gguf: GGUFFile) -> QwenConfig:
 
 class DraftImage(QwenImage):
     """The drafter's weights: per its layer "eh" (``nextn.eh_proj``, rows hidden / 8 c .. over K 2 hidden), then the
-    layer's regions (an attention layer and its MoE: ``QwenImage``'s), the head's first ``vocab`` rows normed by
-    ``nextn.shared_head_norm``; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
+    layer's regions (an attention layer and its MoE: ``QwenImage``'s), the head normed by ``nextn.shared_head_norm``:
+    ``vocab`` rows (default ``HEAD_ROWS`` + ``TABLE_ROWS``), per column its share of the fixed tokens (``head_tokens``)
+    then of the table's; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None):
-        super().__init__(gguf, cfg, layers=layers, vocab=vocab, tile_bytes=OBJ_BYTES)
+        self.fixed, self.table = head_tokens(gguf, (vocab or HEAD_ROWS + TABLE_ROWS) - TABLE_ROWS)
+        super().__init__(gguf, cfg, layers=layers, vocab=len(self.fixed) + len(self.table), tile_bytes=OBJ_BYTES)
+
+    def head_rows(self) -> np.ndarray:
+        """(per column: its fixed tokens, then its table's)"""
+        return np.concatenate([self.fixed.reshape(COLS, -1), self.table.reshape(COLS, -1)], 1)
 
     def _layer(self, layer: int) -> None:
         H = self.cfg.hidden_size
@@ -71,10 +96,10 @@ def _formats(img: QwenImage) -> set[str]:
     return {b.fmt for r in img.regions + img.slabs for b in r.blocks}
 
 
-def draft_formats(gguf: GGUFFile, *, vocab: int = HEAD_ROWS) -> tuple[str, ...]:
+def draft_formats(gguf: GGUFFile) -> tuple[str, ...]:
     """The tile formats of a drafter file's image: its model's design runs them (``QwenOverlay(formats=)``)."""
     cfg = mtp_config(gguf)
-    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1], vocab=vocab))))
+    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1]))))
 
 
 class _DraftConfig:
@@ -83,11 +108,12 @@ class _DraftConfig:
 
 class QwenDraft(QwenOverlay):
     """The drafter ``gguf`` (a qwen35moe MTP file) of the model on ``target`` (whose design runs the drafter's formats:
-    ``QwenOverlay(formats=)``); ``vocab``: the head's rows. ``load`` after the target's (its program and context)."""
+    ``QwenOverlay(formats=)``). ``load`` after the target's (its program and context). ``ids`` (vocab,): the token of
+    each of the head's logits; ``table_rows``: the logits of the table (``see``)."""
 
     CONFIG, IMAGE = _DraftConfig, DraftImage
 
-    def __init__(self, target: QwenOverlay, gguf: GGUFFile, *, vocab: int = HEAD_ROWS):
+    def __init__(self, target: QwenOverlay, gguf: GGUFFile):
         cfg = mtp_config(gguf)
         tc = target.cfg
         if (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.n_experts,
@@ -96,13 +122,58 @@ class QwenDraft(QwenOverlay):
                 tc.n_experts_used, tc.expert_ffn, tc.shared_ffn):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         self.L = cfg.num_hidden_layers - 1
-        super().__init__(gguf, layers=[self.L], vocab=vocab, max_positions=target.max_positions)
+        super().__init__(gguf, layers=[self.L], max_positions=target.max_positions)
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
         fmts = _formats(self.image)
         if not fmts <= set(target.op.rows):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
                              f"QwenOverlay(formats=draft_formats(gguf))")
         self.target, self.op = target, target.op  # (the model's design and hardware context: ``load``)
+        img = self.image
+        self.ids = img.head_rows().reshape(-1)
+        self._per = self.vocab // COLS  # (a column's logits)
+        self.table_rows = np.flatnonzero(np.arange(self.vocab) % self._per >= len(img.fixed) // COLS)
+        self._fixed = np.zeros(cfg.vocab_size, bool)
+        self._fixed[img.fixed] = True
+        idle = sorted(zip(self.ids[self.table_rows].tolist(), self.table_rows.tolist()), reverse=True)
+        self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
+
+    def see(self, ids: Iterable[int]) -> None:
+        """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
+        recently seen ones outside the fixed rows (the least recently seen leaves), the head's rows of those that
+        enter packed into the weight image (the next step's)."""
+        a = np.fromiter(ids, np.int64)
+        a = a[(a >= 0) & (a < len(self._fixed))]
+        a = a[~self._fixed[a]]
+        if not a.size:
+            return
+        u, last = np.unique(a[::-1], return_index=True)
+        order = u[np.argsort(-last)][-len(self.table_rows):].tolist()  # (the last ones, by their last occurrence)
+        lru = self._lru
+        for t in order:
+            if t in lru:
+                lru.move_to_end(t)  # (they stay: the others leave first)
+        new = [t for t in order if t not in lru]
+        for t in new:
+            lru[t] = lru.popitem(last=False)[1]
+        for t in order:
+            lru.move_to_end(t)
+        if new:
+            self._write([lru[t] for t in new], new)
+
+    def _write(self, rows: list[int], tokens: list[int]) -> None:
+        """The head's logits ``rows`` are the ``tokens``' now: their row tiles packed again, flushed."""
+        r = self.image.region(-1, "lm")
+        b = r.block("lm")
+        tiles = set()
+        for i, t in zip(rows, tokens, strict=True):
+            c, j = divmod(i, self._per)
+            self.ids[i] = b.rows[c, j] = t
+            tiles.add((c, j // (b.R * b.G)))
+        w = self.dev.view("W")
+        for c, rt in sorted(tiles):
+            for off, n in self.image.repack(w, r, b, c, rt):
+                self.dev.flush("W", off, n)
 
     def _phases(self) -> list[tuple[int, str]]:
         return [(self.L, "eh"), *super()._phases()]
@@ -132,7 +203,8 @@ class QwenDraft(QwenOverlay):
              ) -> torch.Tensor | None:
         """A step of S = len(emb) <= 4 rows at positions position .. position + S - 1 (their cache records): emb (S,
         hidden) their tokens' embeddings, h (S, hidden) the hidden states of the positions before them. Returns the
-        head's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or None."""
+        head's logits (S, vocab) bf16 (the tokens ``ids``; a view of the NPU's buffer, valid until the next step), or
+        None."""
         x = self.inputs(emb.reshape(-1, self.H), h.reshape(-1, self.H))
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
@@ -152,4 +224,4 @@ class QwenDraft(QwenOverlay):
         return torch.from_numpy(x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight"))
 
 
-__all__ = ["HEAD_ROWS", "DraftImage", "QwenDraft", "draft_formats", "mtp_config"]
+__all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "QwenDraft", "draft_formats", "head_tokens", "mtp_config"]

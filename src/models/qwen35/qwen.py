@@ -33,7 +33,8 @@ the designs (found through the render manifest) and the overlay's other buffers 
 
 import os
 import time
-from collections.abc import Callable
+from collections import abc
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -44,7 +45,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Model, OverlayModel, Penalties, Sampling, max_prob
+from ..common import Mask, Model, OverlayModel, Penalties, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
@@ -305,7 +306,7 @@ class NpuQwen(OverlayModel):
             chain *= p
             if chain < self.P_MIN:
                 break
-            out.append(i)
+            out.append(int(self.drafter.ids[i]))
             if out[-1] in self.eos_token_ids or len(out) == n:
                 break
             h = self.drafter.hidden_state(slot)
@@ -313,6 +314,17 @@ class NpuQwen(OverlayModel):
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
         return out
+
+    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
+                 mask: Mask | None = None) -> Iterator[int]:
+        """(the drafter's table follows the prompt and each token: ``QwenDraft.see``)"""
+        see = self.drafter.see if self._drafting else None
+        if see is not None:
+            see(getattr(prompt, "ids", prompt))
+        for token in super().generate(logits, max_tokens, sampling, prompt, mask):
+            if see is not None:
+                see((token,))
+            yield token
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         return self.draft(token, k)

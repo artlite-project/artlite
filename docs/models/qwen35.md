@@ -88,12 +88,14 @@ step takes up to three draft tokens along (`qwen35/draft.py`, `OverlayModel.gene
 follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
 ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one), while the product of their probabilities stays at least
 0.5. The step runs the token and its drafts, and a draft is kept where the model's own token at its position is that
-draft; the GDN states stay uncommitted until the next step, which replays the accepted tokens. The drafter's head is the
-first 65536 rows of its LM head (the most frequent tokens: 98-99% of essay and code tokens). Its row at a position takes
-that position's token and the model's hidden state of the position before, so its KV cache follows the model's: a prompt
-chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the model's last layer:
-`qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs the drafter's formats
-as code pages.
+draft; the GDN states stay uncommitted until the next step, which replays the accepted tokens. The drafter's head is
+66048 rows of its LM head: the special tokens (the turn's end, tool calls, a thought's end), the first ids (the most
+frequent tokens) and 512 of the sequence's own tokens past them, the most recently seen (an agent's turns repeat the
+identifiers of the code it reads: 0.2% of their tokens are outside the head, 2.7% outside the first 65536 ids). Its row
+at a position takes that position's token and the model's hidden state of the position before, so its KV cache follows
+the model's: a prompt chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the
+model's last layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs
+the drafter's formats as code pages.
 
 A step of several tokens sums the experts' outputs in another order than a step of one, so greedy text with drafts can
 differ from greedy text without where the top two logits are within ~0.1 of each other.

@@ -362,13 +362,13 @@ def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndar
 
 
 def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos: np.ndarray, *,
-              head_rows: int = 0) -> dict[str, np.ndarray]:
+              head: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """A ``qwen35moe`` MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP
     file) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the rows after it: emb (T, H) the
     rows' token embeddings, h (T, H) the model's output-normed hidden state of the position before each (zeros at 0).
     Returns its tensors by llama.cpp's names (``mtp_eh_proj``: the layer's input x0, ``mtp_attn_residual``,
     ``mtp_attn_post_norm``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``: the next draft's h), the experts' ids and
-    weights (``ids``, ``weights``) and the logits of the head's first ``head_rows`` rows (0: none)."""
+    weights (``ids``, ``weights``) and the logits of the tokens ``head`` (None: none)."""
     L, eps = cfg.num_hidden_layers, cfg.rms_norm_eps
     b = f"blk.{L}."
 
@@ -402,8 +402,8 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
     out["mtp_ffn_out"] = y
     x2 = out["mtp_post_ffn"] = x1 + y
     hn = out["h_nextn"] = rms_norm(x2, vec("nextn.shared_head_norm.weight"), eps)
-    if head_rows:
-        out["logits"] = hn @ f32(gguf.rows("output.weight", np.arange(head_rows)).numpy()).T
+    if head is not None:
+        out["logits"] = hn @ f32(gguf.rows("output.weight", head).numpy()).T
     return out
 
 

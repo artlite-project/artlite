@@ -328,6 +328,18 @@ class TileImage:
         self._fill_data(out)
         return any(r.data for r in self.regions)
 
+    def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
+        """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer):
+        the (offset, bytes) of its tiles, one per K chunk."""
+        blk = list(self._native_block(r, b))
+        n = b.R * b.G
+        blk[7] += rt
+        blk[8] += col * r.col_stride
+        blk[11] = np.ascontiguousarray(b.rows[col, rt * n:(rt + 1) * n]).reshape(1, -1)
+        _native.pack_tiles(out, [tuple(blk)], threads=1)
+        t = r.rt0[b.name] + rt
+        return [(r.offset + col * r.col_stride + r.tile(t, k) * r.tile_bytes, r.tile_bytes) for k in range(r.n_kc)]
+
 
 # ----------------------------------------------------------------------
 # Tiles of row groups

@@ -104,8 +104,7 @@ class QwenImage(TileImage):
         for layer in self.layers:
             self._layer(layer)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
-        rows = column_rows(self.vocab)
-        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
+        self._add(-1, "lm", [("lm", (lm,), self.head_rows())], H)
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
         self.column_major = all(contiguous(r) for r in self.regions)
         if self.column_major:  # (each normed phase's norm-weight objects before its tiles)
@@ -115,6 +114,11 @@ class QwenImage(TileImage):
                     self._add_data(r.layer, r.name + "_norm", self.n_norm * self.tile_bytes)
                 self.regions.append(r)
         self._place()
+
+    def head_rows(self) -> np.ndarray:
+        """The LM rows' tokens (COLS, vocab / COLS): column c's are vocab / 8 c .. (-1: a padding row)."""
+        rows = column_rows(self.vocab)
+        return np.where(rows < self.cfg.vocab_size, rows, -1)
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
         """(an MoE model's router tensors and an F32 alpha as their copies times w / bf16(w), module docstring; dropped

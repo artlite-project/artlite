@@ -13,7 +13,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
-from models.qwen35.draft import QwenDraft, draft_formats
+from models.qwen35.draft import TABLE_ROWS, QwenDraft, draft_formats
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.prefill import QwenPrefill
 
@@ -48,7 +48,7 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     target.load()
     draft = QwenDraft(target, gm)
     draft.load()
-    r = ref.mtp_block(gm, QwenConfig.from_gguf(gm), emb, h, np.arange(N), head_rows=draft.vocab)
+    r = ref.mtp_block(gm, QwenConfig.from_gguf(gm), emb, h, np.arange(N), head=draft.ids)
     wr = gm.tensor("blk.40.ffn_gate_inp.weight").dequantize().numpy().reshape(gm.tensor("blk.40.ffn_gate_inp.weight").rows, -1)
     p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ wr.T), -1)[:, ::-1]
     tie, *tol = TOL[request.param]
@@ -74,6 +74,30 @@ def test_draft_steps(setup: tuple, S: int) -> None:
     top2 = np.sort(r["logits"], -1)[:, -2:]
     clear = (top2[:, 1] - top2[:, 0] > 0.1) & ~tied
     assert (lg.argmax(-1) == r["logits"].argmax(-1))[clear].all()
+
+
+def test_table(setup: tuple) -> None:
+    """The head's table (``QwenDraft.see``), on a drafter of its own: the special tokens are fixed rows; after a
+    sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
+    their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
+    2% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks."""
+    draft, emb, h, r, tied, _ = setup
+    d = QwenDraft(draft.target, draft.gguf)
+    d.load()
+    types = np.asarray(d.gguf.meta["tokenizer.ggml.token_type"])
+    assert np.isin(np.flatnonzero((types == 3) | (types == 4)), d.ids).all()
+    rare = np.setdiff1d(np.arange(70000, 248000, 211), d.ids)[:TABLE_ROWS + 100]
+    seq = [*rare[:300], 5, *rare[300:], *rare[:50]]
+    d.see(seq)
+    assert set(d.ids[d.table_rows].tolist()) == {*rare[:50].tolist(), *rare[150:].tolist()}
+    ids = d.ids.copy()
+    d.see(seq)
+    assert np.array_equal(d.ids, ids)
+    lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).float().numpy()[:, d.table_rows] for p in range(0, N, 4)])
+    w = d.gguf.rows("output.weight", d.ids[d.table_rows]).numpy().astype(np.float64)
+    want = r["h_nextn"].astype(np.float64) @ w.T
+    e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
+    assert e[~tied].max() < 2e-2, (np.median(e), e[~tied].max())
 
 
 def test_interleaved(setup: tuple) -> None:
