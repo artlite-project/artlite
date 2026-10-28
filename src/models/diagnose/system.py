@@ -183,7 +183,8 @@ def debugfs() -> dict[str, str]:
 def kernel_log() -> list[str]:
     """This boot's kernel lines about the NPU, the IOMMU, amd_pmf and memory errors (root)."""
     text = _run("journalctl", "-k", "-b", "-o", "short-monotonic", "--no-pager") or _run("dmesg") or ""
-    pat = re.compile(r"amdxdna|iommu|AMD-Vi|amd[-_]pmf|IO_PAGE_FAULT|TDR|timeout|Data Fabric|mce", re.IGNORECASE)
+    pat = re.compile(r"amdxdna|iommu|AMD-Vi|amd[-_]pmf|IO_PAGE_FAULT|TDR|timeout|Data Fabric|mce|WARNING: CPU|BUG:|"
+                     r"Oops|RIP: |Hardware Error|throttl|prochot", re.IGNORECASE)
     host = platform.node()
     return [line.replace(f" {host} ", " ") if host else line for line in text.splitlines() if pat.search(line)][-200:]
 
@@ -331,6 +332,26 @@ def _ip_versions() -> dict[str, str]:
     return out
 
 
+SUPPLY = ("type", "online", "status", "capacity", "usb_type", "voltage_now", "current_now", "voltage_max",
+          "current_max", "power_now", "charge_control_start_threshold", "charge_control_end_threshold",
+          "charge_types", "charge_behaviour")  # (a USB-C source's max: its PD contract)
+
+
+def power_path() -> dict[str, object]:
+    """What a laptop's firmware throttles the SoC for besides heat: Lenovo's battery conservation mode
+    (``ideapad_acpi``), the platform profiles on offer, the vendor's firmware attributes (power limits; Lenovo's
+    ``lenovo-wmi-other``, ...)."""
+    out: dict[str, object] = {"platform_profile_choices": _read("/sys/firmware/acpi/platform_profile_choices")}
+    for p in glob.glob("/sys/bus/platform/devices/VPC2004:*/conservation_mode"):
+        out["conservation_mode"] = _read(p)
+    attrs = {}
+    for p in sorted(glob.glob("/sys/class/firmware-attributes/*/attributes/*/current_value"))[:60]:
+        attrs[os.path.relpath(os.path.dirname(p), "/sys/class/firmware-attributes")] = _read(p)
+    if attrs:
+        out["firmware_attributes"] = attrs
+    return out
+
+
 def identity() -> dict[str, object]:
     """The machine, its firmware, the kernel and its settings, the NPU, power."""
     dmi = {k: _read(f"/sys/class/dmi/id/{k}") for k in ("sys_vendor", "product_name", "product_version",
@@ -359,7 +380,7 @@ def identity() -> dict[str, object]:
             for line in _read("/proc/interrupts").splitlines() if "amdxdna" in line or "xdna" in line]
     iommu = {os.path.basename(os.path.dirname(os.path.dirname(p))): _read(p)
              for p in glob.glob("/sys/class/iommu/*/amd-iommu/features")}
-    supplies = {os.path.basename(p): {k: _read(f"{p}/{k}") for k in ("type", "online", "status", "capacity")}
+    supplies = {os.path.basename(p): {k: v for k in SUPPLY if (v := _read(f"{p}/{k}"))}
                 for p in glob.glob("/sys/class/power_supply/*")}
     return {"dmi": dmi, "kernel": platform.release(), "kernel_version": platform.version(),
             "cmdline": _read("/proc/cmdline"), "cpus": _cpus(), "memory": _meminfo(),
@@ -369,7 +390,7 @@ def identity() -> dict[str, object]:
             "platform_profile": {os.path.basename(os.path.dirname(p)): _read(p)
                                  for p in glob.glob("/sys/class/platform-profile/*/profile")}
             | {"legacy": _read("/sys/firmware/acpi/platform_profile")},
-            "power_supplies": supplies,
+            "power_supplies": supplies, "power_path": power_path(),
             "amdgpu_perf_level": _read(next(iter(glob.glob("/sys/class/drm/card*/device/"
                                                            "power_dpm_force_performance_level")), ""))}
 

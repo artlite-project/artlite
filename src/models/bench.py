@@ -41,6 +41,7 @@ from artlite.model_config import MODELS_DIR, model_path
 
 from . import open_model
 from .common import NpuModel, auto_capacity, stale_install
+from .diagnose import telemetry
 
 # a result's fields (llama-bench's that apply, plus n_ctx); json and jsonl add samples_ns and samples_ts
 FIELDS = ("build_commit", "build_number", "cpu_info", "gpu_info", "backends", "model_filename", "model_type",
@@ -345,11 +346,14 @@ def main(argv: list[str] | None = None) -> None:
             if args.delay:
                 time.sleep(args.delay)
             test_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            p0, t1 = telemetry.prochot_ms(), time.perf_counter()
             try:
                 samples = measure(npu, test, tokens, reps=args.repetitions, warmup=not args.no_warmup,
                                   progress=progress)
             except (ValueError, NotImplementedError) as e:
                 sys.exit(f"artlite-bench: {name}: {test.name}: {e}")
+            if note := telemetry.prochot_warning(telemetry.prochot_share(p0, time.perf_counter() - t1)):
+                sys.stderr.write(f"artlite-bench: warning: {name}: {test.name}: {note}\n")
             r = result(test, samples, **env, **info, n_ctx=capacity, test_time=test_time)
             for p in printers:
                 p.test(r)

@@ -73,6 +73,38 @@ def read_gpu_metrics(path: str) -> GpuMetricsV3 | None:
     return GpuMetricsV3.from_buffer_copy(raw[:size].ljust(size, b"\0"))
 
 
+PROCHOT_WARN = 0.05  # (share of a measurement; Strix Halo never asserts it)
+
+
+def prochot_ms() -> int | None:
+    """The SMU's PROCHOT residency counter (ms; compare two readings): how long the platform has held the SoC's
+    PROCHOT_L input, its external throttle (the laptop's embedded controller, charger or a voltage regulator), which
+    puts CPUs, fabric, memory and NPU at their lowest clocks. The chip's own temperature limits count in the thm_*
+    counters instead. None without gpu_metrics v3."""
+    path = gpu_metrics_path()
+    m = read_gpu_metrics(path) if path else None
+    return None if m is None else m.throttle_residency_prochot
+
+
+def prochot_share(start: int | None, seconds: float) -> float | None:
+    """The share of the last ``seconds`` the platform held PROCHOT, from a ``prochot_ms`` reading at their start."""
+    now = prochot_ms()
+    if start is None or now is None or seconds <= 0:
+        return None
+    return min(1.0, (now - start) / 1e3 / seconds)
+
+
+def prochot_warning(share: float | None) -> str | None:
+    """What to tell the user when the platform held PROCHOT for ``share`` of a measurement (None below PROCHOT_WARN)."""
+    if share is None or share < PROCHOT_WARN:
+        return None
+    return (f"the platform held PROCHOT for {share:.0%} of the measurement: its external throttle input (the laptop's "
+            "embedded controller, charger or a voltage regulator; not the chip's temperature) kept the whole SoC at its "
+            "lowest clocks, so the numbers are the platform's, not the NPU's. Laptops assert it for their power path (adapter, "
+            "USB-C supply or dock, battery) or a hot part: check the power source (the laptop's own adapter, plugged "
+            "in directly); docs/probe.md, PROCHOT")
+
+
 def dpm_levels(name: str) -> list[int]:
     """The MHz levels of amdgpu's ``pp_dpm_<name>`` (fclk, mclk, socclk): the SMU's DPM table."""
     out = []

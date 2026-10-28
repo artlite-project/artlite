@@ -27,6 +27,11 @@ import math
 import os
 import time
 
+# Idle OpenMP threads sleep instead of spinning (libgomp reads this as torch loads it; a value already set stays):
+# spinning, torch's pool keeps ~1.2 CPUs busy while the NPU works (Llama 1B prefill: 1.16 vs 0.11 CPUs; prefill and
+# decode no slower asleep)
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import numpy as np
 import torch
 

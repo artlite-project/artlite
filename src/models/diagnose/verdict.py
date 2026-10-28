@@ -1,4 +1,4 @@
-"""Which candidate cause the measurements point to (H0-H11 of the diagnosis), each from several measurements and with
+"""Which candidate cause the measurements point to (H0-H12 of the diagnosis), each from several measurements and with
 the numbers that decide it, and how many ms of the 1B chunk's difference to Strix Halo each measured cause explains.
 
 A variant counts as faster or slower only beyond its noise: the largest of the samples' spread, the two rounds'
@@ -11,9 +11,10 @@ import re
 import statistics
 
 from . import reference
+from .telemetry import PROCHOT_WARN
 
 V0, V1, V2, V3, V4 = "V0", "V1", "V2", "V3", "V4"
-PHASES = (": load", ": kinds")  # (telemetry tags of a run's other phases than its prompts)
+PROMPTS = re.compile(r"V\d: .*, round \d+$")  # (the telemetry tags of a run's prompts, not its load, kinds, duties)
 
 
 def _pp_ms(data: dict[str, object]) -> dict[str, list[float]]:
@@ -28,14 +29,16 @@ NOISE_FLOOR = 0.03  # (Strix Halo: one variant's medians 1.7-3.6% apart between 
 
 
 def _noise(data: dict[str, object]) -> float:
-    """The relative noise of a variant's median: the larger of the samples' spread (stdev / median) and the rounds'
-    difference of one variant, at least NOISE_FLOOR."""
+    """The relative noise of a variant's median: the larger of the samples' spread (1.4826 median absolute deviations
+    over the median: a stdev that one stray sample does not set) and the rounds' difference of one variant, at least
+    NOISE_FLOOR."""
     worst = NOISE_FLOOR
     by: dict[str, list[float]] = {}
     for r in data["model"]["runs"]:
         s = r["pp1024_ms"]
         if len(s) > 1:
-            worst = max(worst, statistics.stdev(s) / statistics.median(s))
+            med = statistics.median(s)
+            worst = max(worst, 1.4826 * statistics.median(abs(x - med) for x in s) / med)
         by.setdefault(r["variant"][:2], []).append(statistics.median(s))
     for meds in by.values():
         if len(meds) > 1:
@@ -54,6 +57,62 @@ def _cmp(a: float, b: float, noise: float) -> str:
 
 def _v(cause: str, verdict: str, evidence: str) -> dict[str, str]:
     return {"cause": cause, "verdict": verdict, "evidence": evidence}
+
+
+def prochot_shares(tel: dict[str, dict[str, object]]) -> dict[str, float]:
+    """Each telemetry step's share of time under PROCHOT (its residency increment, ms, over the step's length)."""
+    return {t: e["throttle"]["prochot"] / (e["seconds"] * 1e3) for t, e in tel.items()
+            if (e.get("throttle") or {}).get("prochot") is not None and e.get("seconds")}
+
+
+def _power_state(ident: dict[str, object]) -> str:
+    """Plugged in or on battery and through what (a USB-C source's PD contract), the system battery's state (not a
+    mouse's), Lenovo's conservation mode."""
+    sup = ident.get("power_supplies", {})
+    online = []
+    for name, v in sup.items():
+        if v.get("type") in ("Mains", "USB") and v.get("online") == "1":
+            vmax, imax = v.get("voltage_max", "0") or "0", v.get("current_max", "0") or "0"
+            online.append(name + (f" {int(vmax) / 1e6:.0f} V x {int(imax) / 1e6:.2f} A" if int(vmax) and int(imax)
+                                  else ""))
+    mains = [v.get("online") for v in sup.values() if v.get("type") == "Mains"]
+    out = (f"plugged in ({', '.join(online)})" if online else "on battery" if mains else "adapter unknown")
+    if (bat := next((v for k, v in sup.items() if v.get("type") == "Battery" and k.startswith("BAT")), None)):
+        out += f", battery {bat.get('status')} {bat.get('capacity')}%"
+    if (cm := ident.get("power_path", {}).get("conservation_mode")):
+        out += f", conservation mode {cm}"
+    return out
+
+
+def prochot(data: dict[str, object]) -> dict[str, str]:
+    """H12: the platform holds the SoC's external PROCHOT input during the prompts (its EC, charger or a voltage
+    regulator), which kinds set it off alone, whether a lower duty lets it go."""
+    tel = data["telemetry"]
+    share = prochot_shares(tel)
+    prompts = [share[t] for t in tel if PROMPTS.match(t) and t in share]
+    if not prompts:
+        return _v("H12 the platform holds PROCHOT (its external throttle) while the NPU works", "?",
+                  "no PROCHOT residency counter (gpu_metrics v3)")
+    held = statistics.median(prompts)
+    thermal = sum(sum((tel[t].get("throttle") or {}).get(k, 0) for k in ("thm_core", "thm_gfx", "thm_soc"))
+                  for t in tel if PROMPTS.match(t))
+    soc = max((tel[t]["soc_c"]["max"] for t in tel if PROMPTS.match(t) and isinstance(tel[t].get("soc_c"), dict)),
+              default=None)
+    alone = {t.split(": kinds: ", 1)[1]: v for t, v in share.items() if t.startswith(V0) and ": kinds: " in t}
+    trips = sorted(k for k, v in alone.items() if v >= 0.2 and k != "whole program")
+    calm = sorted(k for k, v in alone.items() if v < 0.05 and k != "whole program")
+    duty = {t.rsplit(": duty ", 1)[1]: v for t, v in share.items() if t.startswith(V0) and ": duty " in t}
+    sweep = next((r.get("duty") for r in data["model"]["runs"] if r.get("duty")), None)
+    duty_text = ""
+    if duty and sweep:
+        cells = [f"{d} {duty.get(d, 0):.0%} ({v['item_ms']:.2f} ms an item)" for d, v in sweep["duties"].items()]
+        duty_text = f"; {sweep['kind']} one item at a time at duty " + ", ".join(cells)
+    return _v("H12 the platform holds PROCHOT (its external throttle) while the NPU works",
+              "yes" if held >= PROCHOT_WARN else "no",
+              f"PROCHOT held for {held:.0%} of the prompts (thermal limits {thermal} ms meanwhile, SoC up to "
+              f"{soc if soc is None else round(soc)} °C: the platform's input, not the chip's temperature); kinds run "
+              f"alone: held during {trips or 'none'}, not during {calm or 'none'}{duty_text}; power: "
+              f"{_power_state(data['identity'])}")
 
 
 def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
@@ -97,7 +156,7 @@ def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
                       f"Halo 1.4x)"))
 
     tel = data["telemetry"]
-    steps = [t for t in tel if t.startswith("V0") and not t.endswith(PHASES)]  # (V0's prompts, not its loads)
+    steps = [t for t in tel if t.startswith(V0) and PROMPTS.match(t)]
     top_f = max(data["dpm_mhz"].get("fclk") or [0]) or None
     fclk = [tel[t]["fclk_mhz"]["median"] for t in steps if isinstance(tel[t].get("fclk_mhz"), dict)]
     busy = _cmp(pp[V4], pp[V0], noise) if V4 in pp and V0 in pp else "?"
@@ -108,7 +167,7 @@ def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
                       f"FCLK during V0's prompts median {statistics.median(fclk):.0f} MHz of {top_f} (threshold 90%); "
                       f"with a busy CPU (V4) the prompt is {busy}"))
     thr: dict[str, int] = {}
-    for t in [t for t in tel if t.startswith(("V0", "V4")) and not t.endswith(PHASES)]:
+    for t in [t for t in tel if t.startswith((V0, V4)) and PROMPTS.match(t)]:
         for k, v in (tel[t].get("throttle") or {}).items():
             thr[k] = thr.get(k, 0) + v
     ctl = data["control"]
@@ -132,8 +191,9 @@ def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
                   "yes: " + "; ".join(effects) if effects else "no",
                   f"array clock under load {clk:.0f} MHz, with a busy CPU {clk_busy:.0f}; the SMU's NPU clock during "
                   f"the prompts {clk_prompts}; with a busy CPU (V4) the prompt is {busy}; round 2 / round 1 "
-                  f"{later:.3f}; throttle residency increments during the prompts {thr or 'none'} (context only: on "
-                  f"Strix Halo they tick with no effect)"))
+                  f"{later:.3f}; throttle residency increments during the prompts (ms) {thr or 'none'} (fast PPT and "
+                  f"thm_core tick on Strix Halo with no effect; PROCHOT: H12)"))
+    out.append(prochot(data))
     runs = data["model"]["runs"]
     look = statistics.median(r["lookups_ms_per_prompt"] for r in runs)
     other = max((tel[t].get("other_cpu_load") or 0) for t in tel)
@@ -182,6 +242,9 @@ def evaluate(data: dict[str, object]) -> list[dict[str, str]]:
                       f"of its {gap:+.1f} ms difference to Strix Halo"))
     if k0 and ref["kinds"]:
         diffs = sorted(((v["ms"] - ref["kinds"].get(k, v["ms"]), k) for k, v in k0["kinds"].items()), reverse=True)
+        share = prochot_shares(tel)
+        held = {k: share.get(t) for k in k0["kinds"] for t in tel if t.startswith(V0) and t.endswith(f": kinds: {k}")}
         out.append(_v("where the 1B chunk's time goes (vs Strix Halo, its kinds alone)", "per kind",
-                      "; ".join(f"{k} {d:+.1f} ms" for d, k in diffs[:5])))
+                      "; ".join(f"{k} {d:+.1f} ms" + (f" (PROCHOT {held[k]:.0%})" if held.get(k) else "")
+                                for d, k in diffs[:5])))
     return out

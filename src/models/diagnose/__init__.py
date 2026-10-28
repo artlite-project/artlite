@@ -25,8 +25,6 @@ import sys
 import tempfile
 import time
 
-from . import model
-
 ROOT_ENV = "ARTLITE_DIAGNOSE_ROOT"
 
 
@@ -85,7 +83,7 @@ def run(*, model_file: str, seconds: float, out_dir: str) -> str:
     from artlite.parallel_compile import compile_all
     from artlite.probe import ClockProbeOperator, DmaProbeOperator
 
-    from . import report, rows, system, telemetry, verdict
+    from . import model, report, rows, system, telemetry, verdict
 
     data: dict[str, object] = {"version": 1, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                                "platform": platform.system()}

@@ -6,6 +6,7 @@ from __future__ import annotations
 import statistics
 
 from . import reference
+from .verdict import _power_state, prochot_shares
 
 
 def _f(x: object, digits: int = 1) -> str:
@@ -18,15 +19,6 @@ def _table(head: list[str], rows: list[list[object]]) -> list[str]:
     out = ["| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
     out += ["| " + " | ".join(_f(c) if not isinstance(c, str) else c for c in r) + " |" for r in rows]
     return out
-
-
-def _supply(ident: dict[str, object]) -> str:
-    """Plugged in or on battery, and the system battery's state (not a mouse's)."""
-    sup = ident["power_supplies"].values()
-    mains = [v["online"] for v in sup if v["type"] == "Mains"]
-    bat = next((v for k, v in ident["power_supplies"].items() if v["type"] == "Battery" and k.startswith("BAT")), None)
-    state = "plugged in" if "1" in mains else "on battery" if mains else "adapter unknown"
-    return state + (f", battery {bat['status']} {bat['capacity']}%" if bat else "")
 
 
 def _pp(run: dict[str, object]) -> float:
@@ -49,7 +41,9 @@ def markdown(data: dict[str, object], path: str) -> str:
               (f"- Linux {ident['kernel']}; THP {ident['thp']['enabled']}; NPU {npu.get('driver')} firmware "
                f"{npu.get('firmware')}, PCI rev {ident['npu'].get('revision')}, power mode {npu.get('power_mode')}, "
                f"interrupts on CPU {data.get('irq_cpu')}"),
-              f"- power: platform profile {sorted(set(ident['platform_profile'].values()) - {''})}; {_supply(ident)}",
+              (f"- power: platform profile {sorted(set(ident['platform_profile'].values()) - {''})}; "
+               f"{_power_state(ident)}; firmware attributes "
+               f"{ident.get('power_path', {}).get('firmware_attributes') or 'none'}"),
               (f"- Artlite {code['commit']} ({code['describe']}); not upstream: {len(code['local_commits'])} "
                f"commits; changed files: {len(code['changed_files'])}; "
                f"{code['stale_install'] or 'native build current'}")]
@@ -73,15 +67,30 @@ def markdown(data: dict[str, object], path: str) -> str:
     k0 = next((r for r in runs if "kinds" in r and r["variant"].startswith("V0")), None)
     k1 = next((r for r in runs if "kinds" in r and r["variant"].startswith("V1")), None)
     if k0:
-        lines += ["", f"Chunk of {k0['kinds']['T']} tokens, ms per operator kind (its items run alone):", ""]
+        share = prochot_shares(data["telemetry"])
+
+        def held(k: str) -> str:
+            v = next((share[t] for t in share if t.startswith("V0") and t.endswith(f": kinds: {k}")), None)
+            return "?" if v is None else f"{v:.0%}"
+
+        lines += ["", (f"Chunk of {k0['kinds']['T']} tokens, ms per operator kind (its items run alone), and the share "
+                       "of each kind's run the platform held PROCHOT (2 MB pages):"), ""]
         rows = [["whole program", "", "", k0["kinds"]["whole_ms"], k1["kinds"]["whole_ms"] if k1 else None,
-                 ref["kinds"].get("whole program")]]
+                 ref["kinds"].get("whole program"), held("whole program")]]
         for k, v in k0["kinds"]["kinds"].items():
             rows.append([k, str(v["items"]), str(v["configurations"]), v["ms"],
-                         k1["kinds"]["kinds"].get(k, {}).get("ms") if k1 else None, ref["kinds"].get(k)])
-        lines += _table(["kind", "items", "configurations", "2 MB pages", "4 KB pages", "Strix Halo 2 MB"], rows)
+                         k1["kinds"]["kinds"].get(k, {}).get("ms") if k1 else None, ref["kinds"].get(k), held(k)])
+        lines += _table(["kind", "items", "configurations", "2 MB pages", "4 KB pages", "Strix Halo 2 MB", "PROCHOT"],
+                        rows)
         lines.append(f"\nA design switch inside a program: {_f(k0.get('design_switch_us'))} us "
                      f"(Strix Halo {_f(ref.get('design_switch_us'))})")
+        if (sweep := k0.get("duty")):
+            lines += ["", (f"{sweep['kind']}, one item at a time, each followed by sleep for a duty (ms an item; "
+                           "PROCHOT's share of the run):"), ""]
+            lines += _table(["duty", "ms an item", "items run", "Strix Halo ms", "PROCHOT"],
+                            [[d, v["item_ms"], str(v["items_run"]), ref.get("duty_item_ms", {}).get(d),
+                              next((f"{share[t]:.0%}" for t in share if t.startswith("V0") and t.endswith(f": duty {d}")),
+                                   "?")] for d, v in sweep["duties"].items()])
     lines += ["", "### Telemetry per step (median; max)", ""]
     tel = data["telemetry"]
     fields = ("fclk_mhz", "uclk_mhz", "npu_clk_mhz", "npu_h_clk_mhz", "npu_column_util_max", "dram_read_mbs",

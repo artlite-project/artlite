@@ -82,8 +82,9 @@ def test_control_rates() -> None:
     assert 10 < r["NOP dispatch, blocking (us)"] < 1000 and 1000 < r["NOP dispatches, 3 queued (per s)"] < 500000
 
 
-def _data(control_scale: float = 1.0, v1_ms: float | None = None) -> dict:
-    """A diagnosis' data from Strix Halo's reference numbers (the control path scaled; V1's prompt time set)."""
+def _data(control_scale: float = 1.0, v1_ms: float | None = None, prochot: float = 0.0) -> dict:
+    """A diagnosis' data from Strix Halo's reference numbers (the control path scaled; V1's prompt time set; the
+    platform holding PROCHOT for ``prochot`` of the prompts, of the Q4_K kinds run alone and of the full-duty sweep)."""
     from models.diagnose import reference
 
     ref = reference.HALO
@@ -103,8 +104,18 @@ def _data(control_scale: float = 1.0, v1_ms: float | None = None) -> dict:
                 r["design_switch_us"] = ref["design_switch_us"] * control_scale
             runs.append(r)
     control = {k: v * control_scale if "ns per" in k else v for k, v in ref["control"].items()}
-    tel = {f"{r['variant']}, round {r['round']}": {"fclk_mhz": {"median": 2000, "max": 2000},
-                                                     "npu_clk_mhz": {"median": 1810, "max": 1810}} for r in runs}
+    def step(share: float) -> dict:
+        return {"fclk_mhz": {"median": 2000, "max": 2000}, "npu_clk_mhz": {"median": 1810, "max": 1810},
+                "seconds": 1.5, "throttle": {"prochot": int(1500 * share), "thm_core": 0}}
+
+    tel = {f"{r['variant']}, round {r['round']}": step(prochot) for r in runs}
+    v0 = next(r for r in runs if r["variant"].startswith("V0"))
+    for k in v0["kinds"]["kinds"]:
+        tel[f"{v0['variant']}, round 1: kinds: {k}"] = step(prochot if "Q4_K" in k else 0.0)
+    v0["duty"] = {"kind": "GemmQOperator Q4_K 2048x8192", "items": 16, "duties": {}}
+    for d, share in (("100%", prochot), ("50%", 0.0)):
+        v0["duty"]["duties"][d] = {"item_ms": 2.2, "items_run": 600}
+        tel[f"{v0['variant']}, round 1: duty {d}"] = step(share)
     return {"code": {"local_commits": [], "changed_files": [], "stale_install": ""},
             "dma": ref["dma"], "control": control, "model": {"runs": runs, "resident_before": 1.0},
             "telemetry": tel, "dpm_mhz": {"fclk": [400, 2000]}, "identity": {"cpus": {}, "npu": {}},
@@ -114,7 +125,7 @@ def _data(control_scale: float = 1.0, v1_ms: float | None = None) -> dict:
 def test_verdicts() -> None:
     """Strix Halo's own numbers point to no cause; a control path 1.6x slower to H11, its cost on the 1B chunk the
     control code's bytes times the extra ns per byte and the configurations times the extra switch; 4 KB pages faster
-    than 2 MB to H2's possibility."""
+    than 2 MB to H2's possibility; PROCHOT for most of the prompts to H12, with the kinds that held it alone."""
     from models.diagnose import report, verdict
 
     v = {x["cause"][:3]: x for x in verdict.evaluate(_data())}
@@ -124,9 +135,14 @@ def test_verdicts() -> None:
     pages = {x["cause"][:3]: x for x in verdict.evaluate(_data(v1_ms=100.0))}
     assert pages["H1 "]["verdict"].startswith("no: 2 MB pages are slower"), pages["H1 "]
     assert pages["H2 "]["verdict"] == "possible", pages["H2 "]
-    d = _data()
+    hot = {x["cause"][:3]: x for x in verdict.evaluate(_data(prochot=0.84))}
+    assert hot["H12"]["verdict"] == "yes" and "84% of the prompts" in hot["H12"]["evidence"], hot["H12"]
+    assert "held during ['GemmQOperator Q4_K" in hot["H12"]["evidence"] and "50% 0%" in hot["H12"]["evidence"]
+    assert v["H12"]["verdict"] == "no", v["H12"]
+    d = _data(prochot=0.84)
     d.update(verdicts=verdict.evaluate(d), identity={**d["identity"], "dmi": dict.fromkeys(
         ("sys_vendor", "product_name", "product_version", "board_name", "bios_vendor", "bios_version", "bios_date"), ""),
         "cpus": {"model": "?"}, "ip_versions": {}, "kernel": "?", "thp": {"enabled": "?"}, "platform_profile": {},
         "power_supplies": {}}, code={**d["code"], "commit": "x", "describe": "x"})
-    assert "### Verdicts" in report.markdown(d, "x.json")
+    md = report.markdown(d, "x.json")
+    assert "### Verdicts" in md and "| 100% | 2.2 | 600 | 2.9 | 84% |" in md, md

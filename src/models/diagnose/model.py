@@ -1,6 +1,7 @@
 """The diagnosis' model part: Llama 3.2 1B's prompt of 1024 tokens in variants - host buffers of 2 MB pages (user BOs
 from 2 MB on) or of 4 KB pages (the driver's BOs below 64 MB), packed C drains in whole 64-byte lines or not
-(``prefill.gemm.LINES``), a busy CPU - in two rounds, with each run's state: the chunk's time per operator kind, a
+(``prefill.gemm.LINES``), a busy CPU - in two rounds, with each run's state: the chunk's time per operator kind (each
+kind alone, in a telemetry step of its own: which kinds the platform throttles), the largest kind at lower duties, a
 design switch's cost inside its program, the host's row lookups, the huge pages the process got, how much of the file
 the page cache holds."""
 
@@ -135,6 +136,10 @@ def kind_of(pf: object, op: object) -> str:
     return type(op).__name__ + (f":{op.mode}" if hasattr(op, "mode") else "")
 
 
+KIND_SECONDS, IDLE_SECONDS = 1.5, 1.5  # (a kind looped alone; idle before it, so that a throttle it set off lets go)
+DUTIES = (1.0, 0.75, 0.5, 0.25)  # (the duty sweep's shares of time the NPU runs)
+
+
 def _run_ms(pf: object, prog: list, reps: int) -> float:
     """The median ms of a library program run ``reps`` times (after one), in pieces of at most 400 items."""
     bufs = list(pf.ov.dev.buffers.values())
@@ -147,9 +152,26 @@ def _run_ms(pf: object, prog: list, reps: int) -> float:
     return statistics.median(t[1:]) * 1e3
 
 
-def kinds(npu: object, T: int = 1024, reps: int = 3) -> dict[str, object]:
+def _loop_ms(pf: object, prog: list, seconds: float) -> float:
+    """The median ms of a library program run for ``seconds`` (after one run), in pieces of at most 400 items."""
+    bufs = list(pf.ov.dev.buffers.values())
+    splits = list(range(400, len(prog), 400))
+    pf.lib.run(prog, splits=splits, bufs=bufs)
+    t = []
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end or len(t) < 3:
+        t0 = time.perf_counter()
+        pf.lib.run(prog, splits=splits, bufs=bufs)
+        t.append(time.perf_counter() - t0)
+    return statistics.median(t) * 1e3
+
+
+def kinds(npu: object, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
+          T: int = 1024) -> dict[str, object]:
     """The chunk program's ms as a whole and per operator kind (each kind's items run as a program of their own:
-    wrong results, a configuration per design change), with the items and configurations of each."""
+    wrong results, a configuration per design change), with the items and configurations of each. Each runs for
+    KIND_SECONDS after IDLE_SECONDS idle, in a telemetry step of its own (``{tag}: kinds: {kind}``): which kinds the
+    platform throttles when they run alone."""
     pf = npu.prefill
     T = min(s for s in pf.sizes if s >= T)
     items = pf._program(T)
@@ -159,14 +181,50 @@ def kinds(npu: object, T: int = 1024, reps: int = 3) -> dict[str, object]:
     parity = asm.parity
     code = asm.assemble(items)  # (the whole chunk's control code, as one piece would hold it)
     asm.parity = parity
-    configs = sum(1 for i, (e, _) in enumerate(items) if i == 0 or blocks[e].design != blocks[items[i - 1][0]].design)
-    out: dict[str, object] = {"T": T, "whole_ms": _run_ms(pf, items, reps), "items": len(items),
-                              "configurations": configs, "txn_ops": int(code[2]), "control_bytes": int(code[3]),
-                              "kinds": {}}
-    for k in sorted(set(names)):
-        prog = [it for it, kk in zip(items, names) if kk == k]
-        configs = sum(1 for i, (e, _) in enumerate(prog) if i == 0 or blocks[e].design != blocks[prog[i - 1][0]].design)
-        out["kinds"][k] = {"items": len(prog), "configurations": configs, "ms": _run_ms(pf, prog, reps)}
+
+    def configurations(prog: list) -> int:
+        return sum(1 for i, (e, _) in enumerate(prog) if i == 0 or blocks[e].design != blocks[prog[i - 1][0]].design)
+
+    out: dict[str, object] = {"T": T, "whole_ms": 0.0, "items": len(items), "configurations": configurations(items),
+                              "txn_ops": int(code[2]), "control_bytes": int(code[3]), "kinds": {}}
+    progs = {"whole program": items} | {k: [it for it, kk in zip(items, names) if kk == k] for k in sorted(set(names))}
+    for k, prog in progs.items():
+        time.sleep(IDLE_SECONDS)
+        step(f"{tag}: kinds: {k}")
+        ms = _loop_ms(pf, prog, KIND_SECONDS)
+        end(f"{tag}: kinds: {k}")
+        if k == "whole program":
+            out["whole_ms"] = ms
+        else:
+            out["kinds"][k] = {"items": len(prog), "configurations": configurations(prog), "ms": ms}
+    return out
+
+
+def duty_sweep(npu: object, kind: str, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
+               T: int = 1024) -> dict[str, object]:
+    """The items of one operator kind of the chunk run one at a time, each followed by sleep for duty d ((1 - d) / d
+    of its time) for KIND_SECONDS per duty in DUTIES (telemetry steps ``{tag}: duty {d}``): a throttle that follows
+    the NPU's average power over milliseconds lets go at a lower duty (the items then run at full speed), one that
+    follows each item's load holds at every duty."""
+    pf = npu.prefill
+    T = min(s for s in pf.sizes if s >= T)
+    items = pf._program(T)
+    prog = [it for it, (op, *_) in zip(items, pf.runlists[T]) if kind_of(pf, op) == kind]
+    bufs = list(pf.ov.dev.buffers.values())
+    out: dict[str, object] = {"kind": kind, "items": len(prog), "duties": {}}
+    for d in DUTIES:
+        time.sleep(IDLE_SECONDS)
+        step(f"{tag}: duty {d:.0%}")
+        t = []
+        stop = time.perf_counter() + KIND_SECONDS
+        while time.perf_counter() < stop or len(t) < 3:
+            t0 = time.perf_counter()
+            pf.lib.run([prog[len(t) % len(prog)]], splits=[], bufs=bufs)
+            t.append(time.perf_counter() - t0)
+            if d < 1:
+                time.sleep(t[-1] * (1 - d) / d)
+        end(f"{tag}: duty {d:.0%}")
+        out["duties"][f"{d:.0%}"] = {"item_ms": statistics.median(t) * 1e3, "items_run": len(t)}
     return out
 
 
@@ -189,7 +247,8 @@ def design_switch_us(npu: object, T: int = 1024, reps: int = 5) -> float | None:
 def run(path: str, *, step: Callable[[str], None], end: Callable[[str], None], irq_cpu: int, rounds: int = 2,
         reps: int = 5) -> dict[str, object]:
     """Each variant ``rounds`` times in turn (V0 V1 V2 V3 V0 ...): its pp1024 samples (ms; a warmup first), its
-    lookups, huge pages; per-kind times and the design switch for V0 and V1 (their first round). ``step`` / ``end``:
+    lookups, huge pages; per-kind times and the design switch for V0 and V1 (their first round), V0's largest kind at
+    lower duties (``duty_sweep``). ``step`` / ``end``:
     the telemetry sampler's (``Sampler.step``, ``Sampler.end``)."""
     out: dict[str, object] = {"file": path, "resident_before": resident(path), "runs": []}
     rng = torch.Generator().manual_seed(0)
@@ -222,10 +281,13 @@ def run(path: str, *, step: Callable[[str], None], end: Callable[[str], None], i
                                         "anon_huge_mb": anon_huge_kb() / 1024, "holds": npu.describe()}
             end(tag)
             if r == 0 and lines and not busy:  # (V0 and V1: what the page size moves, per kind)
-                step(f"{tag}: kinds")
-                entry["kinds"] = kinds(npu)
+                entry["kinds"] = kinds(npu, step=step, end=end, tag=tag)
+                step(f"{tag}: design switch")
                 entry["design_switch_us"] = design_switch_us(npu)
-                end(f"{tag}: kinds")
+                end(f"{tag}: design switch")
+                if pages == "2 MB":  # (V0: the largest kind's items at lower duties)
+                    gemm = max(entry["kinds"]["kinds"].items(), key=lambda kv: kv[1]["ms"])[0]
+                    entry["duty"] = duty_sweep(npu, gemm, step=step, end=end, tag=tag)
             out["runs"].append(entry)
             del model, npu, tokens
             gc.collect()

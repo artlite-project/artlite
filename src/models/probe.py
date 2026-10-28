@@ -30,6 +30,7 @@ from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transa
 
 from .bench import _git, _read
 from .common import stale_install, windows_power_mode, xrt_smi
+from .diagnose import telemetry
 
 MB = 1 << 20
 CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)
@@ -358,16 +359,18 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     if args.diagnose:
         from . import diagnose
+        from .diagnose import model as diagnose_model
 
         if platform.system() == "Linux" and os.geteuid() != 0 and not os.environ.get(diagnose.ROOT_ENV):
             raise SystemExit("artlite-probe --diagnose reads what only root can (memory devices, the data fabric, "
                              "the kernel log): run sudo $(which artlite-probe) --diagnose")
         if platform.system() == "Linux" and os.geteuid() == 0:
             diagnose.become_user(sys.argv[1:] if argv is None else argv)  # (as the sudo user: does not return)
-        diagnose.run(model_file=args.model or diagnose.model.default_file(), seconds=args.seconds,
+        diagnose.run(model_file=args.model or diagnose_model.default_file(), seconds=args.seconds,
                      out_dir=args.out_dir)
         return
     lines = system() + ([f"warning: {stale}"] if (stale := stale_install()) else [])
+    p0, t0 = telemetry.prochot_ms(), time.perf_counter()
     if args.pages:
         more, rows = pages(args.seconds)
         lines += more
@@ -382,6 +385,8 @@ def main(argv: list[str] | None = None) -> None:
                 *((name, f"{gbps:.1f}") for name, gbps in rates.items()),
                 (PER_CYCLE, f"{rates[CASES[2][0]] * 1e3 / mhz:.1f}")]
         references = REFERENCES
+    if note := telemetry.prochot_warning(telemetry.prochot_share(p0, time.perf_counter() - t0)):
+        lines.append(f"warning: {note}")
     print("artlite-probe" + " --pages" * args.pages)
     for line in lines:
         print(line)
