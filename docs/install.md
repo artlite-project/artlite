@@ -136,4 +136,21 @@ what they need).
 | `Permission denied` on `/dev/accel/accel0` | your user is not in the `render` group (above) |
 | `Cannot allocate memory` / `Resource temporarily unavailable` from a BO, "as ulimit -l is 8192 KB" | the locked-memory limit (above) |
 | `artlite.DispatchError` with state `TIMEOUT` | the driver's hang detection stopped a command; its `health` is the firmware's report ([Design: error handling](design.md#error-handling)) |
+| Strix Halo: the machine resets during NPU work while the iGPU is busy too (a browser, a video call, llama.cpp); the next boot's kernel log says `Previous system reset reason [0x08000800]: an uncorrected error caused a data fabric sync flood event` | an AMD bug in Strix Halo's data fabric under GPU and NPU load at once, not Artlite's ([ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)); holding FCLK avoids it ([below](#strix-halo-resets-under-npu-and-igpu-load)) |
 | `artlite-probe` says `host buffers: 4 KB pages` on Linux | transparent huge pages are off (`/sys/kernel/mm/transparent_hugepage/enabled` reads `[never]`): the NPU then translates a page per short DMA row, and its write rows run at a fifth of their rate. `madvise` (most distributions' default) or `always` gives Artlite's buffers 2 MB pages |
+
+### Strix Halo: resets under NPU and iGPU load
+
+As far as known only Strix Halo is affected: other machines can skip this. Before a reset the kernel log
+(`journalctl -k`) usually has deferred errors: `[Hardware Error]: Deferred error, no action required.`, with
+`MC28_STATUS` and `Syndrome: 0x000000005b000000`. In a stress test (an NPU prefill beside llama.cpp on the iGPU) the
+errors and the resets stopped with the data fabric's clock (FCLK) held at its top level, 2000 MHz, and came back when
+it was released. The hold costs power and heat: use it on mains power, while the NPU works.
+
+```bash
+D=/sys/class/drm/card0/device                                  # the iGPU (amdgpu)
+echo manual | sudo tee $D/power_dpm_force_performance_level
+echo 7 | sudo tee $D/pp_dpm_fclk                               # the top level
+grep '\*' $D/pp_dpm_fclk                                       # ~8 s later: 7: 2000Mhz * (another level: write 7 again)
+echo auto | sudo tee $D/power_dpm_force_performance_level      # the release (a reboot also releases it)
+```
