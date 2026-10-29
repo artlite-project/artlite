@@ -174,8 +174,8 @@
 <text x="155.7" y="799.5" text-anchor="end" class="lbl">Q4_K_M + MTP</text>
 <path d="M165.7,789.0h22.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-22.0z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 1k-token prompt: 7.3</title></path>
 <text x="196.7" y="799.5">7.3<tspan dx="6" class="muted">S=4</tspan></text>
-<path d="M525.8,789.0h18.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-18.1z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 32k-token prompt: 6.2</title></path>
-<text x="552.9" y="799.5">6.2<tspan dx="6" class="muted">S=4</tspan></text>
+<path d="M525.8,789.0h18.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-18.5z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 32k-token prompt: 6.3</title></path>
+<text x="553.3" y="799.5">6.3<tspan dx="6" class="muted">S=4</tspan></text>
 <line x1="24" y1="816.0" x2="856" y2="816.0" class="grid"/>
 <text x="24" y="834.0" class="h">Qwen3.6 35B-A3B</text>
 <text x="155.7" y="852.5" text-anchor="end" class="lbl">Q4_K_M</text>
@@ -203,8 +203,8 @@
 <text x="155.7" y="958.5" text-anchor="end" class="lbl">APEX-I-MiniPlus + MTP</text>
 <path d="M165.7,948.0h109.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-109.0z" class="ft"><title>Artlite with its drafter, Occamy 1.0 (35B-A3B) APEX-I-MiniPlus, 1k-token prompt: 31.7</title></path>
 <text x="283.7" y="958.5">31.7<tspan dx="6" class="muted">S=4</tspan></text>
-<path d="M525.8,948.0h82.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-82.6z" class="ft"><title>Artlite with its drafter, Occamy 1.0 (35B-A3B) APEX-I-MiniPlus, 32k-token prompt: 24.3</title></path>
-<text x="617.5" y="958.5">24.3<tspan dx="6" class="muted">S=4</tspan></text>
+<path d="M525.8,948.0h79.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-79.8z" class="ft"><title>Artlite with its drafter, Occamy 1.0 (35B-A3B) APEX-I-MiniPlus, 32k-token prompt: 23.5</title></path>
+<text x="614.6" y="958.5">23.5<tspan dx="6" class="muted">S=4</tspan></text>
 <line x1="24" y1="975.0" x2="856" y2="975.0" class="grid"/>
 <text x="24" y="993.0" class="h">MiniCPM-V 4.7 1B</text>
 <text x="155.7" y="1011.5" text-anchor="end" class="lbl">Q4_K_M</text>
