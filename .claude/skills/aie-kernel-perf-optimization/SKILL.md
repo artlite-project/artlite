@@ -151,7 +151,10 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   state products and the update on the MMUL, the intra-chunk solve in fp32 by 8-token blocks (a 1B chunk's scan
   70 -> 24 ms).
 - **R11 Several tokens per decode step**: a DMA-bound step of S tokens costs about one (tokens on the MMUL's A rows,
-  inputs interleaved per 8-element block, recurrent state replayed instead of snapshotted).
+  inputs interleaved per 8-element block, recurrent state replayed instead of snapshotted). Past 4 tokens the A rows
+  hold single bfp16 x instead of hi + lo (``decode.gemv``), and a core's per-slot arrays outgrow L1: put what only
+  cold code touches in a neighbour's memory (``decode.design``'s "Designs of 8 slots": slots 4-7's residual in the
+  helper's, the helper's scratch in the GDN core's).
 - **R12 Neighbour cores sharing derived data** through shared memory (GemmQ's dequant pairs: per k-tile 980 -> ~800
   cycles, the 9B prefill chunk -7%).
 - **R13 Flash attention with several query heads per core**: at most two panel streams per loop (the memtile

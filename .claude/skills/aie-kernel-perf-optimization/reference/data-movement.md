@@ -82,7 +82,9 @@ bandwidth.
   with the compute compiled out); 64-query blocks, each of the 4 core rows taking 16 queries of the
   column's 3 heads, halved them: -25%, then compute-bound.
 - **Every column reads every input** (the decode overlays): a phase's input goes to all 8 columns, each from its own
-  shim: 8 copies through the one port and 8 fill tasks at every phase boundary. Per step: Gemma E4B 42 MB of 3.1 GB
+  shim: 8 copies through the one port and 8 fill tasks at every phase boundary. A phase's input is on the critical path
+  (its tiles wait for it): read the step's slots only (``decode.design.packed_slots``; the 27B's 8-slot design read 8
+  slots at every S: S 1 303.6 -> 298.5 ms packed). Per step: Gemma E4B 42 MB of 3.1 GB
   (95% of it the same bytes in every column; packed to the step's slots, `decode.design.packed_slots`, from 100 MB),
   qwen35 9B 124 MB of 5.2 GB, 27B 351 MB of 16.4 GB (half of it per-column GDN states). One broadcast copy would save
   ~1-1.7%: the bytes, and 7 of the 8 fills between a drain wait and the next phase (their firmware ops are ~60% on
@@ -211,7 +213,14 @@ offsets): aie2p-coding section 8. For speed:
 - **Task cost**: a BD write ~0.08 µs, a queue push ~0.15 µs, a token wait ~0.3 µs per column
   (timed in a host-built transaction); one column's fill -> the cores take it -> token -> the
   firmware's wait: 2.3 µs. On the Gemma decode step most waits were not the limit (a token and a wait per task vs per
-  channel and sync: the same 57 ms): count tasks as well as bytes, but measure before cutting them.
+  channel and sync: the same 57 ms): count tasks as well as bytes, but measure before cutting them. Where the cores
+  take a stream's objects as fast as they come (the 27B's GDN state panels at S 1, DMA-bound), each task of it is
+  in the step time: its panel fills split into 8 / 32 tasks per pair and column cost +4 / +24 ms a step (~0.5-0.65 µs
+  a task, round-robin over the columns).
+- **Hold an output object only while writing it**: a core that acquires a D object early (a GDN conv block's history
+  built in it across two X objects) runs its next outputs single-buffered until that drain is queued: the 8-slot GDN
+  core's S 4 step 331.7 -> 313.8 ms with the history built in its workspace and drained with the head's deltas after
+  its panels (gdn_in's 5 drains as 3 in the same change).
 - **The ops between a drain wait and the next phase's fills are on the critical path**: each one delays the next
   phase (a queue wait ~0.3 µs, a BD ~0.08, a push ~0.15, per column). `Sequence(inputs=("X",))` waits for the input
   fills before the drain wait (they are complete when the drains are), so the fills after it find empty queues:
