@@ -56,6 +56,22 @@ change `csrc/`. `artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe
 `mlir_aie` or `llvm_aie` is not the version `pyproject.toml` pins; the tools warn, and the tests do not start, when the
 native module is not built from the checkout's `csrc/` (a build records the hash of its sources).
 
+### NixOS
+
+The checkout's `flake.nix` is a shell with CMake, pkg-config, libdrm and uv; in it the build is the one above:
+
+```bash
+nix develop                                 # in the checkout, in every shell
+uv venv && source .venv/bin/activate
+uv sync --extra examples
+uv pip install --no-build-isolation -ve .
+```
+
+The Python that uv installs and the toolchain wheels' programs (Peano's `clang`, `aie-opt`) are built for other
+distributions: NixOS runs them through nix-ld, `programs.nix-ld.enable = true;` in the system's configuration. The
+device's group and the locked-memory limit are set there too: `users.users.<name>.extraGroups = [ "render" ];`,
+`security.pam.loginLimits = [ { domain = "*"; type = "-"; item = "memlock"; value = "unlimited"; } ];`.
+
 ## Windows
 
 Artlite runs on Windows 11 through XRT instead of the driver's ioctls (the XRT backend, `csrc/shim_xrt/`). What

@@ -55,7 +55,7 @@ device rather than for portability.
 
 Requirements: a Ryzen AI processor with an XDNA 2 NPU, Linux with the `amdxdna` driver, libdrm, CMake, a C++23
 compiler and [uv](https://docs.astral.sh/uv/). Details: [Installation](docs/install.md) (Windows 11: [through
-XRT](docs/install.md#windows)).
+XRT](docs/install.md#windows); NixOS: [a development shell](docs/install.md#nixos)).
 
 ```bash
 git clone https://github.com/artlite-project/artlite && cd artlite
