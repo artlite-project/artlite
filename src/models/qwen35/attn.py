@@ -46,9 +46,9 @@ rows' gates (0.5 KB a row). Regions the core reads rarely (the gates, ...: ``Att
 memory, which the core reads through shared memory: the main core's workspace past its residual (``EXT_W`` bytes: GEMV
 scratch, idle while an attention sub-step runs; its next phase starts after a sync on the attention's outputs).
 
-Time (the 27B, one layer, 32K positions, a split sub-step of the chain's 2 cores): ~2.1 ms for one or two slots, the
-DMA floor of the cache's 9280-byte objects (2.11 with the cores' work compiled out: every column's share of the DRAM
-port).
+Time (the 27B, one layer, 32K positions, a split sub-step of the chain's 2 cores): 2.04 / 2.07 ms for one / two slots,
+the DMA floor of the cache's 9280-byte objects (every column's share of the DRAM port); 2.64 for three or four (24
+rows: ~9.3K cycles per group against ~7.2K of DMA, QK per octet bound by its Q panels' pops).
 """
 
 import math

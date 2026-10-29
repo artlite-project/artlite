@@ -192,8 +192,11 @@ Links and FIFOs:
 - A release must match an acquire of the same loop body (aiecc): two regions a core must hold at once cannot stream
   separately; interleave them into one stream of pairs.
 - Pool sizes: a pool is sized from the acquires (largest + 1): `acquire(2)` deepens a depth-2 pool by one (also with
-  `cons(depth=2)`); `forward(depth=3)` with `acquire(1)` still gives 2 objects; `cons(depth=3)` (a depth per endpoint)
-  is taken at its word. Budget L1 for it, or take the objects one at a time.
+  `cons(depth=2)`); `forward(depth=3)` with `acquire(1)` still gives 2 objects. Each endpoint's depth is taken at its
+  word only when IRON emits per-endpoint depths, i.e. when the endpoints' depths differ (all equal: one number,
+  sized from the acquires): a core that holds both objects of a depth-2 consumer gets 2 buffers with the producer's
+  depth set apart (the qwen35 decode's A forward `depth=3`, consumers 2 and 2: ``decode.design.A_FWD``). An acquire is
+  cumulative (``acquire(1)`` twice holds one object): hold two as one ``acquire(2)``.
 - A FIFO between vertical neighbours lowers to shared memory: a pool in the producer's memory and locks, no DMA, no
   BDs (aie-kernel-perf-optimization `reference/restructurings.md` R12).
 - FIFO depth: depth 2 on weights enables pipelining; depth > 1 on B / C can explode program memory through unrolled
@@ -305,8 +308,9 @@ Silent wrong results:
   (sd15's d-80 attention scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B
   boundaries, or access a 32-B-aligned window as two 32-B halves (`decode/kernels.py`'s MoE accumulator).
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
-  array) reads garbage (NaN state), and so does a `seek` to such a position (a rewind by a panel count not a multiple
-  of 8: 5 panels, 360 B). Open one stream at the array's start and pop in order.
+  array) reads garbage (NaN state, or wrong values: the qwen35 decode's second pair of P panels at 3 x 288 B), and so
+  does a `seek` to such a position (a rewind by a panel count not a multiple of 8: 5 panels, 360 B). Open one stream at
+  the array's start and pop in order, or pad each array of panels to 64 B.
 - **Sub-byte and block-float pointer arithmetic**: loop-carried or large-offset `uint4*` advancement can return zeros
   or garbage, and `sizeof(bfp16ebs8)` is 9, `sizeof(uint4)` 1. Offset a `uint8_t *` and cast at the load or the stream
   constructor (`uint8_t[N*9]` for blocks). `aie::load_v<N>(uint4*)` + `.unpack()` yields linear nibble order (lane

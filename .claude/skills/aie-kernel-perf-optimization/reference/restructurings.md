@@ -296,8 +296,11 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   K half, the Q stream's pops), P V over octets (two sets' 8 rows, P hi and P lo two MMULs into one 8-row accumulator:
   no fold of hi into lo rows, which bound the mv slot; records 2k, 2k + 1 per y round trip on two V streams: II 8 for 8
   MMULs), the softmax's exp2 the bias-192 form, and the softmax while the V object streams in (data-movement.md
-  "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.54 / 3.23 -> 2.12 / 2.14 ms per layer (2 /
-  3 sets), the DMA floor (2.11). Llama's cores (`decode/attn.py`, one head dim: 16 rows, A depth 2) with the octet softmax
+  "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.04 / 2.07 ms per layer (2 / 3 sets), the
+  DMA floor. 24 rows (the 27B's 4 slots: 6 sets) fit one pass with the A stream at depth 2, the records read from the
+  two held last objects, the gates applied by the main core and the Q panels of octets 1-2 in the main core's memory
+  (models/qwen35/attn.py docstring): 2.64 ms against 4.15 for two passes, compute-bound (~9.3K cycles per group: QK
+  per octet at II 4 ~3.9K, the softmax's P panels ~1.4K, its maxima ~1.0K, P V ~1.3K). Llama's cores (`decode/attn.py`, one head dim: 16 rows, A depth 2) with the octet softmax
   and P V: 1B at 16K a step of 4 tokens 32.8 -> 26.4 ms (its pexp's per-pair exp2 calls were the largest part).
 
 ## R14 Weight panels from gathers (IQ3_XXS, `formats/iq3.py`)

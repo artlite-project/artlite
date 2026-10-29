@@ -33,7 +33,9 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
   - a 64-lane clamp cost ~25 cycles and spilled;
   - float `aie::neg` / `abs` may not legalize (G_FNEG): use `min(x, 0 - x)`, or integer ops on
     the bits.
-- **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. **Scalar float math** is
+- **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. `aie::inv` / `aie::invsqrt` of an fp32 vector is one
+  scalar `inv` per lane (aie_api's elementary fallback): ~3 instructions a lane of program memory; invert only the lanes
+  that matter (4 rows of a set, not 16 lanes). **Scalar float math** is
   soft-float (`__mulsf3`, `__gtsf2`: calls, 0.9 KB of program memory). `checks.py` warns about
   both.
 - **The bfp16 8x8x8 MMUL** (`mac_8x8_8x8T`) is the only hardware matrix path; bf16 `aie::mmul`

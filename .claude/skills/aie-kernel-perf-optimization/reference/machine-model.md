@@ -106,7 +106,7 @@ Values read this way:
 | `vmul.f` (bf16 x bf16) | dst @6, sources read @1 -> a dependent SRS / mul 5 cycles later |
 | `vconv.bf16.fp32` (SRS, store slot) | dst @2, source read @1 |
 | `vtanh` / `vexp2` (mv slot, 16 fp32 lanes -> 16 bf16) | dst @2, source read @1 |
-| `vlda.pop.576` / `vldb.pop.576` | dst @8; FIFO state @7 -> one pop per cycle per stream, plus its `vlda.fill.512`s on the same slot: one per 8 pops where a loop body pops 8 per stream (unrolled), one per pop where it pops fewer (a panel per 2 cycles) |
+| `vlda.pop.576` / `vldb.pop.576` | dst @8; FIFO state @7 -> one pop per cycle per stream, plus its `vlda.fill.512`s on the same slot: a 576-bit pop takes 1.125 fills of 512 bits, and the schedule carries one per pop at any unroll (the qwen35 decode's qk<2> unrolled 2 / 4 / 8: 16 fills for 16 pops per iteration): a panel per 2 cycles on its slot |
 
 Consequences:
 - One MMUL accumulator chain issues at most every 2 cycles: two independent
