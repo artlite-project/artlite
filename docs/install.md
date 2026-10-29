@@ -18,7 +18,7 @@ The NPU reads the weights from system memory, so a model needs about its file's 
 | the locked-memory limit unlimited | the driver pins the NPU's buffers (a model's weights: GBs) within `ulimit -l`, which is 8 MB on many distributions: below |
 | libdrm | the runtime's build links it (`pkg-config libdrm`) |
 | CMake 3.20 or newer, a C++23 compiler (GCC 13+, Clang 17+) | the runtime and its Python bindings |
-| Python 3.12 or newer, [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
+| Python 3.12 to 3.14 (the toolchain wheels' versions), [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
 
 `uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed.
 

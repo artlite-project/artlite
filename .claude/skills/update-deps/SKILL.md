@@ -21,6 +21,8 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 
 - No cache clearing needed: RTC cache keys include the `mlir_aie`/`llvm_aie` versions, so kernels recompile automatically. Old `rtc_*` dirs in `~/.cache/artlite/` just become orphaned; delete them to reclaim disk if desired.
 - If `uv sync` dropped the editable C++ build, rebuild with `uv pip install --no-build-isolation -ve .`.
+- `requires-python` in `pyproject.toml` ends below the first Python without an `mlir_aie` wheel (uv picks the newest
+  allowed Python): raise it when the new wheels add a Python version, then `uv lock`.
 - Run `pytest tests -m smoke` (one NPU case per component and the apps' full designs: a bump can push a core past
   its program memory), not the full suite unless asked.
 - Regenerate the issue slot / shared port tables of `variant_search` and the `ARTLITE_MEASURE_II` report from the new

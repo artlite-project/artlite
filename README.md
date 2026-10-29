@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: LGPL-2.1-or-later" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-2a78d6"></a>
-  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-2a78d6">
+  <img alt="Python 3.12-3.14" src="https://img.shields.io/badge/python-3.12--3.14-2a78d6">
   <img alt="Linux, Windows" src="https://img.shields.io/badge/OS-Linux%20%7C%20Windows-2a78d6">
   <img alt="NPU: XDNA 2 (AIE2P)" src="https://img.shields.io/badge/NPU-XDNA%202%20(AIE2P)-2a78d6">
 </p>
