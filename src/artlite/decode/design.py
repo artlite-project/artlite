@@ -119,6 +119,7 @@ M_FLAGS, M_NS, M_NX, M_K, M_NT, M_G, M_NRT, M_NB, M_B = range(9)  # M_B + 3 i: b
 M_SKIP = M_B + 3 * NBLK  # (20) X objects after this one that belong to another core
 M_NASKIP, M_NREL, M_SLOT = 21, 22, 23
 M_MODEL = 24  # the first word of the model cores' own
+M_SP = 39  # (packed designs of 8 slots) a phase input's slots per k block (``packed_slots``; the host's per phase)
 # (``post`` designs) an F_POST phase's layer output scale (bf16 bits); (``tok`` designs) a token object's index
 # (M_TOK_KIND, < N_TOK) and per column its cache objects (M_TOK_NG + c); an object of another core with M_NASKIP = -1 -
 # index: that token's count; (``post``) a phase's residual slice per column (M_H8) and 1 / the length of its norms
@@ -209,9 +210,10 @@ def hidden_meta(m: np.ndarray, hidden: int) -> None:
 
 
 def packed_slots(S: int) -> int:
-    """(``packed`` designs) The slots of an input k block in a step of S slots: 1, 2 or 4 (S = 3 pads a slot). An
-    input object then holds the k blocks of 4 / SP strips (the helper's input commands: OBJ_K or POST_K k each)."""
-    return 1 if S == 1 else (2 if S == 2 else 4)
+    """(``packed`` designs) The slots of an input k block in a step of S slots: 1, 2 or 4 (S = 3 pads a slot; a design
+    of 8: 8 from S 5 on). An input object then holds the k blocks of slots / SP strips (the helper's input commands:
+    OBJ_K or POST_K k each)."""
+    return 1 if S == 1 else (2 if S == 2 else (4 if S <= 4 else 8))
 
 
 
@@ -260,7 +262,7 @@ class DecodeOverlayOperator(ArtcOperator):
         combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
         the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
         slots")."""
-        assert slots in (4, 8) and (slots == 4 or not (post or pli or packed or tok or gu_win or paged or moe)), slots
+        assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or gu_win or paged or moe)), slots
         self.slots = slots
         self.obj_k = XPAY // (2 * slots)  # (k of an input object)
         self.nx_per_norm = NORM_K // self.obj_k  # (input objects per norm-weight object)

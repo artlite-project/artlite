@@ -60,14 +60,17 @@ class _Phases:
         """x (S, K) bf16 values; resid (S, H) fp32. Returns the outputs (COLS, S, objects x C_LEN) as raw bf16 bits."""
         dev, op, S, slots = self.dev, self.op, x.shape[0], self.slots
         groups = mp.groups(region, flags, S, f32_ab=f32_ab, slots=slots)
+        sp = OD.packed_slots(S) if op.packed else slots  # (a packed design: the step's slots per k block)
+        for gr in groups:
+            gr.meta[OD.M_SP] = sp
         act = dev.view("ACT")
         act[:] = 0
         h8 = self.H // COLS
         inputs, off = [], 0
         for gr in groups:  # per group its region [metadata object | x interleaved]
             act[off:off + 4 * OD.META] = gr.meta.view(np.uint8)
-            xi = OD.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K], slots)
-            act[off + OD.XB:off + OD.region_bytes(gr.K, slots)] = xi.view(np.uint8).reshape(-1)
+            xi = OD.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K], sp)
+            act[off + OD.XB:off + OD.XB + xi.nbytes] = xi.view(np.uint8).reshape(-1)
             inputs.append((off, gr.K))
             off += -(-OD.region_bytes(gr.K, slots) // 64) * 64
         loadr = off
@@ -98,7 +101,7 @@ class _Phases:
                 for s in range(S):
                     seq.fill("X", c, dev.address("ACT", loadr + (c * slots + s) * OD.XB), OD.XB)
             for i, gr in enumerate(groups):
-                nbytes, dims = OD.input_fill(gr.K, slots, slots)
+                nbytes, dims = OD.input_fill(gr.K, sp, slots)
                 seq.fill("X", c, dev.address("ACT", inputs[i][0]), nbytes, dims)
                 if n_norm and i == 0:
                     seq.fill("A", c, dev.address("NORM"), n_norm * op.tile_bytes)
@@ -242,13 +245,16 @@ def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
     return _Phases(path, [Lg, La], request.param), Lg, La
 
 
+@pytest.mark.parametrize("S", [1, 3, 8])
 @pytest.mark.parametrize("phase", ["gdn_in", "attn_in", "attn_out", "down", "gate_up"])
-def test_phase_27b(setup27: tuple, phase: str) -> None:
+def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
     """The 27B's K groups (attn_out: 6 chunks as 3 + 3, down: 17 chunk-major as 5 + 5 + 5 + 2; gdn_in: Q6_K qkv) on
-    random inputs, against the cores' numerics: S 3 on the 4-slot design, S 8 on the 8-slot one (x as single bfp16
-    rows, ``decode.gemv``)."""
+    random inputs, against the cores' numerics: on the 4-slot design and on the 8-slot one (x as single bfp16 rows,
+    ``decode.gemv``; its inputs packed: 1, 4, 8 slots per k block)."""
     P, Lg, La = setup27
-    S, H, slots = (3 if P.slots == 4 else 8), P.H, P.slots
+    H, slots = P.H, P.slots
+    if S > slots:
+        pytest.skip(f"a design of {slots} slots")
     h8 = H // COLS
     rng = np.random.default_rng(1)
     L = La if phase.startswith("attn") else Lg

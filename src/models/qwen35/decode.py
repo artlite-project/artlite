@@ -57,7 +57,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
-                         paged=paged, win=win, slots=slots)
+                         paged=paged, win=win, slots=slots, packed=slots == 8)
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
@@ -71,7 +71,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             assert W["size"] - W["inv"] >= AT.EXT_W and (not self.attn.main_gates or self.xs_bytes >= AT.EXT_X), W
             assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
             src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                    | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"])
+                                    | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"],
+                                    packed8=self.packed and self.slots == 8)
         return src
 
     @property
@@ -291,10 +292,10 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                     for _ in range32(2, unroll=False):  # the k heads
                         block()  # q
                         emit(ghist)
-                        block()  # k
-                        emit(ghist)
                         take(gkold)
+                        block()  # k
                         emit(gknew)
+                        emit(ghist)
                         for _ in range32(nv, unroll=False):  # its v heads
                             block()
                             take(gdl)

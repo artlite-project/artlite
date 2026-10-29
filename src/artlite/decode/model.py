@@ -253,8 +253,9 @@ class ModelOverlay:
         self.dev.flush("ACT", lo, hi + 1 - lo)
         self._metas_s = key
 
-    def _sp(self, S: int) -> int:
-        """The slots of an input k block in a step of S slots (``design.packed_slots`` in a packed design)."""
+    def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
+        """The slots of an input k block in a step of S slots (``design.packed_slots`` in a packed design) of a phase's
+        input."""
         return packed_slots(S) if self.op.packed else self.SLOTS
 
     def _weight_run(self, seq: Sequence, phases: list[tuple[int, str]], *, image: TileImage | None = None,
@@ -276,9 +277,9 @@ class ModelOverlay:
             for c in range(COLS):
                 seq.fill("A", c, self.dev.address(buf, r.offset + c * r.col_stride), n)
 
-    def _inputs(self, seq: Sequence, rg: InputRegion, S: int) -> None:
-        """The X fills of a K group's input (``design.input_fill``, a header's ``post_input_fill``)."""
-        sp = self._sp(S)
+    def _inputs(self, seq: Sequence, rg: InputRegion, S: int, phase: tuple[int, str] | None = None) -> None:
+        """The X fills of a K group's input (``design.input_fill``, a header's ``post_input_fill``) of a phase."""
+        sp = self._sp(S, phase)
         nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)
         for c in range(COLS):
             seq.fill("X", c, self.dev.address("ACT", rg.off), nbytes, dims)
@@ -287,7 +288,7 @@ class ModelOverlay:
                    stream: str = "C") -> None:
         """n output values per slot of column c (objects (j, slot) of C_LEN values) -> the input elements e0 .. e0 + n
         of a phase's plain x ([k block][slot sp][8])."""
-        sp = self._sp(S)
+        sp = self._sp(S, phase)
         for rg in self.inp[phase]:
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
             j = a

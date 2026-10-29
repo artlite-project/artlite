@@ -98,6 +98,7 @@ MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E = range(56, 62)
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
  A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_TREC, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = range(32)
 A_QA, A_HP, A_RW = 32, 36, 38  # (A_QA: up to 4 octets)
+A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
 A_WORDS = 40
 ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 
@@ -432,11 +433,20 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     if (flags & {{ F_MAIN }}) {
         if (!(flags & {{ F_LOADR }})) {  // its input objects (under its norm-weight objects), its tiles
             const int nx = m[{{ M_NX }}];
+{% if PACKED8 %}
+            // (a packed design of 8 slots: input objects of 8 / M_SP strips each)
+            const int sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));
+            st[{{ A_LPER }}] = lper;
+{% endif %}
             if (flags & {{ F_NORM }}) {
                 st[{{ A_NNO }}] = (nx + {{ NX_PER_NORM - 1 }}) / {{ NX_PER_NORM }};
                 st[{{ A_XL }}] = nx;
             } else {
+{% if PACKED8 %}
+                st[{{ A_NXSKIP }}] = (nx + (1 << lper) - 1) >> lper;
+{% else %}
                 st[{{ A_NXSKIP }}] = nx;
+{% endif %}
             }
             st[{{ A_NASKIP }}] = m[{{ M_NT }}];
         }
@@ -482,7 +492,11 @@ __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
 {
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int left = st[{{ A_XL }}], n = left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left;
+{% if PACKED8 %}
+    st[{{ A_NXN }}] = (n + (1 << st[{{ A_LPER }}]) - 1) >> st[{{ A_LPER }}];
+{% else %}
     st[{{ A_NXN }}] = n;
+{% endif %}
     st[{{ A_XL }}] = left - n;
 }
 
@@ -959,12 +973,13 @@ class AttnShape:
         panels [d-block][set 2] (the first one's, done with, in record mode the open record's rows)."""
         return dict(self._ws)
 
-    def render(self, p: str, consts: dict[str, int], *, tail: int) -> str:
+    def render(self, p: str, consts: dict[str, int], *, tail: int, packed8: bool = False) -> str:
+        """packed8: the main core's inputs packed in a design of 8 slots (``decode.design.M_SP``)."""
         names = {"ws": "ws", "mw": "mw", "mx": "mx"}
         at = [(w, (names[r], off)) for w, (r, off) in self.at(tail)]
         v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=SMAX,
                  HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps), C_LEN=self.c_len,
-                 GATE_MAIN=self.main_gates, qc=bf16_hilo(math.log2(math.e) / 16),
+                 GATE_MAIN=self.main_gates, qc=bf16_hilo(math.log2(math.e) / 16), PACKED8=packed8,
                  **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k.startswith(("A_", "ROLE_", "MG_"))}))
         return _SRC.render(**v) + (_MAIN_SRC.render(**v) if self.main_gates else "")
 

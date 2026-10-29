@@ -125,7 +125,7 @@ def test_mtp(size: str) -> None:
     but where an MoE's multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps
     of one here; Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the
     flips of its 40 layers' routing near ties move the top two logits by up to ~0.6); most drafts are accepted in both
-    replies (the drafter's cache follows the model's positions)."""
+    replies (the drafter's cache follows the model's positions; up to 7 drafts: 40%)."""
     from models.common import Sampling
     from models.qwen35.qwen import Qwen
 
@@ -161,7 +161,8 @@ def test_mtp(size: str) -> None:
           f"gaps): {flips}")
     flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
     assert len(flips) <= (3 if model.cfg.moe else 0) and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
-    assert all(a >= 0.5 * d for d, a in (stats1, stats2))
+    # (up to 7 drafts: the chains run deeper while their probability pays a slot, about half of them kept)
+    assert all(a >= (0.5 if model.DRAFTS == 3 else 0.4) * d for d, a in (stats1, stats2))
 
 
 @pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])

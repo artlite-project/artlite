@@ -134,11 +134,11 @@ template <typename T>
 }
 
 {% if SLOTS == 8 %}
-// The helper: a strip of {{ OBJ_K // 8 }} k blocks of x ([k block][slot 8][8] bf16, times the norm weights w (bf16 per
+// The helper: a strip of {{ OBJ_K // 8 }} k blocks of x ([k block][slot SP][8] bf16, times the norm weights w (bf16 per
 // k) when NORM) -> their x panels at xp (per k block the slots' x as single bfp16, ``gemv``) and the slots' 16-k sums
 // at t ([128-k group][slot 8][16-k block 8] fp32: the panels' rows summed on the MMUL against B_j); sq_ += the squares
-// ([slot 8][8] lanes)
-template <bool NORM>
+// ([slot 8][8] lanes). The rows and lanes of the slots past SP are undefined (as _kb's)
+template <bool NORM, int SP>
 __attribute__((noinline)) void {{ p }}_hstrip(const bfloat16 *__restrict x, const bfloat16 *__restrict w,
                                               float *__restrict sq_, uint8_t *__restrict xp, float *__restrict t)
 {
@@ -154,8 +154,13 @@ __attribute__((noinline)) void {{ p }}_hstrip(const bfloat16 *__restrict x, cons
         const int8_t __aie_dm_resource_d *__restrict pb = (const int8_t __aie_dm_resource_d *){{ p }}_onehot[0];
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < 8; j++) {  // 16-k block j: k blocks 2 j, 2 j + 1
-            const aie::vector<bfloat16, 64> v0 = aie::load_v<64>(px), v1 = aie::load_v<64>(px + 64);
-            px += 128;
+            aie::vector<bfloat16, 64> v0, v1;
+            if constexpr (SP == 8) {
+                v0 = aie::load_v<64>(px), v1 = aie::load_v<64>(px + 64);
+            } else {
+                v0 = aie::load_v<8 * SP>(px).template grow<64>(), v1 = aie::load_v<8 * SP>(px + 8 * SP).template grow<64>();
+            }
+            px += 16 * SP;
             sq = aie::mac_square(aie::mac_square(sq, v0), v1);
             aie::accum<accfloat, 64> x0, x1;
             if constexpr (NORM) {  // (the 8 weights of a k block for every slot)
@@ -624,6 +629,53 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
     {{ p }}_put_bf16(ps, aie::accum<accfloat, 16>(y).template to_vector<bfloat16>(), nv);
     return nv;
 }
+{% if SLOTS == 8 %}
+
+// _slot of the slots s < S in one call (their rows 2 C_LEN apart in the staging, their residual windows at the same
+// row: one shift and mask for all)
+__attribute__((noinline)) int {{ p }}_slots(int32_t *__restrict ws, int S, int flags, int fw, int nv, int q, int n,
+                                            float *__restrict hres)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict yt = WS(float, {{ w_.yt }});
+    if (flags & {{ F_RESID }}) {  // (a window of 32 floats at the 16-aligned base)
+        const int b = q & ~15, sh = q & 15;
+        const aie::mask<16> m = aie::mask<16>::from_uint32(0xFFFFu << nv);
+        AIE_LOOP_NO_UNROLL
+        for (int s = 0; s < S; s++) {
+            aie::vector<float, 16> y = aie::concat(aie::load_v<8>(yt + 8 * s), aie::load_v<8>(yt + 64 + 8 * s));
+            y = aie::select(y, aie::zeros<float, 16>(), m);
+            aie::vector<float, 32> v = aie::zeros<float, 32>();
+            v.insert(0, y);
+            v = aie::shuffle_up_fill(v, aie::zeros<float, 32>(), sh);
+            float *__restrict pr = {{ p }}_res(ws, hres, s) + b;
+            aie::store_v(pr, aie::add(aie::load_v<32>(pr), v));
+        }
+        return 0;
+    }
+    bfloat16 *__restrict stg = WS(bfloat16, {{ w_.stg }});
+    if (fw & {{ B_F32 }}) {  // fp32 rows: two bf16 slots each
+        AIE_LOOP_NO_UNROLL
+        for (int s = 0; s < S; s++)
+            {{ p }}_slot(ws, s, flags, fw, nv, q, n, hres);
+        return 2 * nv;
+    }
+    bfloat16 *__restrict pw = (bfloat16 *)((uintptr_t)(stg + n) & ~(uintptr_t)63);  // (put_bf16's window)
+    const int sh = (int)((stg + n) - pw);
+    const aie::vector<int16, 64> li = aie::load_v<64>({{ p }}_iota);
+    const aie::mask<64> m = aie::ge(li, (int16)sh) & aie::lt(li, (int16)(sh + nv));
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        const aie::vector<float, 16> y = aie::concat(aie::load_v<8>(yt + 8 * s), aie::load_v<8>(yt + 64 + 8 * s));
+        aie::vector<bfloat16, 64> v = aie::zeros<bfloat16, 64>();
+        v.insert(0, aie::accum<accfloat, 16>(y).template to_vector<bfloat16>());
+        v = aie::shuffle_up_fill(v, aie::zeros<bfloat16, 64>(), sh);
+        bfloat16 *__restrict pd = pw + {{ 2 * C_LEN }} * s;
+        aie::store_v(pd, aie::select(aie::load_v<64>(pd), v, m));
+    }
+    return nv;
+}
+{% endif %}
 {% if moe and wide %}
 
 // (an expert's down, F_ACCUM) rows 0 .. nv - 1 of a tile of G row groups of R <= 32 rows (group j's in yt's block j) of
@@ -844,7 +896,11 @@ __attribute__((minsize)) void {{ p }}_nbegin(const uint8_t *__restrict a, int32_
     const int left = st[{{ S_NX }}] - st[{{ S_XD }}], n = left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left;
 {% if packed %}
     const int per = st[{{ S_NXS }}];
+{% if SLOTS == 8 %}
+    st[{{ S_NXN }}] = (n + per - 1) >> ((per >> 1) - (per >> 3));  // (input objects of per = 1, 2, 4, 8 strips)
+{% else %}
     st[{{ S_NXN }}] = (n + per - 1) >> (per >> 1);  // (input objects of per = 1, 2, 4 strips)
+{% endif %}
 {% else %}
     st[{{ S_NXN }}] = n;
 {% endif %}
@@ -1199,10 +1255,14 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
 {% else %}
         nv = 8;
 {% endif %}
+{% if SLOTS == 8 %}
+    const int add = {{ p }}_slots(ws, S, flags, fw, nv, row0 + r0, n, hres);
+{% else %}
     int add = 0;
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++)
-        add = {{ p }}_slot(ws, s, flags, fw, nv, row0 + r0, n{{ ", hres" if SLOTS == 8 else "" }});
+        add = {{ p }}_slot(ws, s, flags, fw, nv, row0 + r0, n);
+{% endif %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YT }}; i += 16)
         aie::store_v(yt + i, aie::zeros<float, 16>());
@@ -1412,8 +1472,12 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
 {% endif %}
     const int nx = m[{{ M_NX }}];
     st[{{ S_NS }}] = m[{{ M_NS }}];
-{% if packed %}
+{% if packed and SLOTS == 8 %}
+    const int sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));  // (the host's: gdn_out 8)
+{% elif packed %}
     const int sp = m[{{ M_NS }}] == 1 ? 1 : (m[{{ M_NS }}] == 2 ? 2 : 4), lper = sp == 1 ? 2 : (sp == 2 ? 1 : 0);
+{% endif %}
+{% if packed %}
     st[{{ S_SP }}] = sp;
     st[{{ S_NXS }}] = 1 << lper;
     st[{{ S_NXS1 }}] = (1 << lper) - 1;
@@ -1576,10 +1640,16 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 {% endif %}
         float *t = (float *)scr + {{ OBJ_K * SLOTS // 16 }} * d;
 {% if SLOTS == 8 %}
-        if (cmd[1])
-            {{ p }}_hstrip<true>(x, (const bfloat16 *)(uintptr_t)cmd[1], sq, xpk, t);
-        else
-            {{ p }}_hstrip<false>(x, nullptr, sq, xpk, t);
+        const bfloat16 *w = (const bfloat16 *)(uintptr_t)cmd[1];
+        const int sp = cmd[{{ C_SP }}];
+{% for sp in (1, 2, 4, 8) %}
+        {{ "else " if not loop.first else "" }}if (sp == {{ sp }}) {
+            if (w)
+                {{ p }}_hstrip<true, {{ sp }}>(x, w, sq, xpk, t);
+            else
+                {{ p }}_hstrip<false, {{ sp }}>(x, nullptr, sq, xpk, t);
+        }
+{% endfor %}
 {% else %}
         const int sp = {{ "cmd[%d]" % C_SP if packed else 4 }};
         if (cmd[1])

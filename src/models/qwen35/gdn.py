@@ -36,17 +36,17 @@ head's q, k and K objects in the workspace at a time), and gdn_in's rows reach i
 into the step's objects (3 drains per column, its objects (half, slot) as [half][slot 8][64]: the q / k blocks', the v
 blocks' then z, ab), then a sync. A column's objects of a layer are payload slots of XPAY bytes (each object's metadata
 the 256 bytes before it): the header H (F_GDN, M_SKIP; the slots' ab, dt, A, ssm_norm, the previous step's d per token
-from the last gated outputs' D object), per k head [q A, q B, k A, k B, K], per v head [A, B, DL, Z]. A conv block's
+from the last gated outputs' D object), per k head [q A, q B, K, k A, k B], per v head [A, B, DL, Z]. A conv block's
 two objects: A = [weights (2 KB) | its history's rows 0 .. 7], B = [the history's rows 8 .. 10 | the step's S rows]:
 the history (3 + 8 rows, 2816 bytes, after the weights) holds the previous step's [base 3 | S rows], from which the core
 takes the step's base rows at cshift, so the host patches nothing per step; the new history [base 3 | the step's S rows]
 goes out over it (D: from A's second half on). The step's words (S, M_NREP, M_CSHIFT, M_COMMIT) come from the gdn_in
-phase's metadata object (``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q and k blocks (their
-histories out), the K objects (the previous step's in, the step's out), then per v head its block, deltas and z, its 16
-state panels, and its history, deltas and gated outputs out ([k block 16][slot 8][8] bf16: gdn_out's x of the head;
+phase's metadata object (``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q block, the previous
+step's K object, its k block (then the q history, the step's K object and the k history out: 6 KB apart, one drain),
+then per v head its block, deltas and z, its 16 state panels, and its history, deltas and gated outputs out ([k block 16][slot 8][8] bf16: gdn_out's x of the head;
 the 2 KB after them the step's d per token, into the header from the last head, else the sink). A column's DMA tasks
 per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
-panels) and 23 drains.
+panels) and 21 drains.
 """
 
 import math
@@ -74,7 +74,7 @@ F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the G
 G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (8 slots) the k head, its v heads done, the v head in the column
 G_WORDS = 16
 # (8 slots) a column's objects of a GDN layer: payload slots of XPAY bytes (each object's metadata the 256 bytes before
-# its payload): the header (H_SLOT), per k head kh its group [q A, q B, k A, k B, K] (from KH_SLOT + KH_SPAN kh), per v
+# its payload): the header (H_SLOT), per k head kh its group [q A, q B, K, k A, k B] (from KH_SLOT + KH_SPAN kh), per v
 # head h its group [A, B, DL, Z] (from V_SLOT + V_SPAN h); the header's payload: the slots' ab at H_AB (a gdn_in object
 # each: 128 bytes), dt 16 | A 16 | ssm_norm 128 fp32 at H_PRM, the step's d per token ([token 8][8] fp32: the last
 # gated outputs' D object's second half) at H_DOLD
@@ -525,10 +525,12 @@ void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
     if (flags & {{ F_GDN }}) {
         {{ p }}_ghead(x, ws);
         st[{{ G_ON }}] = 1;
-    } else if (!(flags & {{ F_MAIN }}))
+    } else if (!(flags & {{ F_MAIN }})) {
         st[{{ G_NSKIP }}] = m[{{ M_SKIP }}];
-    else if (!(flags & {{ F_LOADR }}))
-        st[{{ G_NSKIP }}] = m[{{ M_NX }}];
+    } else if (!(flags & {{ F_LOADR }})) {  // (its input objects: of 8 / M_SP strips)
+        const int sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));
+        st[{{ G_NSKIP }}] = (m[{{ M_NX }}] + (1 << lper) - 1) >> lper;
+    }
 }
 
 // A conv block's first object ([weights: tap 4 x (hi 128 | lo 128) bf16 | its history's rows 0 .. 7]): the weights ->
@@ -762,7 +764,7 @@ class GdnShape:
         return V_SLOT + V_SPAN * self.hc
 
     def kh_slot(self, kh: int) -> int:
-        """(8 slots) The first payload slot of k head kh's group [q A, q B, k A, k B, K]."""
+        """(8 slots) The first payload slot of k head kh's group [q A, q B, K, k A, k B]."""
         return KH_SLOT + KH_SPAN * kh
 
     def v_slot(self, h: int) -> int:
@@ -771,7 +773,7 @@ class GdnShape:
 
     def block_slot(self, b: int) -> int:
         """(8 slots) The A object's payload slot of conv block b (q heads 0, 1, k heads 0, 1, then the v heads)."""
-        return self.kh_slot(b % 2) + 2 * (b // 2) if b < 4 else self.v_slot(b - 4)
+        return self.kh_slot(b % 2) + 3 * (b // 2) if b < 4 else self.v_slot(b - 4)
 
     def workspace(self) -> dict[str, int]:
         if self.slots == 8:

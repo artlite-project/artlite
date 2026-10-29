@@ -71,6 +71,7 @@ from artlite.decode.design import (
     M_RTDN,
     M_RTGU,
     M_SKIP,
+    M_SP,
     M_XC0,
     MAX_K,
     META,
@@ -197,8 +198,16 @@ class QwenOverlay(ModelOverlay):
         return self.flags[name]
 
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
-        return mp.groups(self.image.region(L, name), self.flags[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None,
-                         f32_ab=name == "gdn_in" and self.g8, slots=self.SLOTS)
+        out = mp.groups(self.image.region(L, name), self.flags[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None,
+                        f32_ab=name == "gdn_in" and self.g8, slots=self.SLOTS)
+        if self.op.packed and self.SLOTS == 8:  # (the input's slots per k block, the host's per phase)
+            for g in out:
+                g.meta[M_SP] = self._sp(S, (L, name))
+        return out
+
+    def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
+        """(a design of 8 slots: gdn_out's input of 8, the GDN cores' outputs whole heads of 8 slots)"""
+        return self.SLOTS if phase is not None and phase[1] == "gdn_out" else super()._sp(S, phase)
 
     def _meta(self, L: int, name: str, rg: object, m: np.ndarray) -> np.ndarray:
         if name == "sdown":  # (its panels in the side chunk: the expert's gate / up reads moe_in's)
@@ -400,11 +409,13 @@ class QwenOverlay(ModelOverlay):
             for o, n, dims, rep, it in mp.a_reads(region, c, gr):
                 seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
 
-    def _x_at(self, phase: tuple[int, str], e: int) -> tuple[int, int]:
-        """(ACT offset of input element e's k block in a phase's x, the bytes left in its K group's x)."""
+    def _x_at(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int]:
+        """(ACT offset of input element e's k block in a phase's x of a step of S slots, the bytes left in its K
+        group's x)."""
+        sp = self._sp(S, phase)
         for rg in self.inp[phase]:
             if rg.k0 <= e < rg.k0 + rg.K:
-                return rg.off + XB + 2 * self.SLOTS * (e - rg.k0), 2 * self.SLOTS * (rg.k0 + rg.K - e)
+                return rg.off + XB + 2 * sp * (e - rg.k0), 2 * sp * (rg.k0 + rg.K - e)
         raise ValueError(e)
 
     def _phase(self, seq: Sequence, phase: tuple[int, str], S: int, to: tuple[int, str] | str | None) -> None:
@@ -416,7 +427,7 @@ class QwenOverlay(ModelOverlay):
             self._weights(seq, phase, gi)
             if gi == 0:
                 seq.sync()
-            self._inputs(seq, rg, S)
+            self._inputs(seq, rg, S, phase)
         if to is None:
             return
         for c in range(COLS):
@@ -453,7 +464,7 @@ class QwenOverlay(ModelOverlay):
                 seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, 7 + 3 * p)), MG.D_BYTES)
                 # the pair's outputs (2 KB) at its heads in gdn_out's x, its padding (2 KB) in the sink past that K
                 # group's x (its x bytes on)
-                at, left = self._x_at((L, "gdn_out"), gdn.D * h0)
+                at, left = self._x_at((L, "gdn_out"), gdn.D * h0, S)
                 xg = next(8 * rg.K for rg in self.inp[(L, "gdn_out")] if rg.k0 <= gdn.D * h0 < rg.k0 + rg.K)
                 assert left >= 2048
                 seq.drain("D", c, dev.address("ACT", at), MG.D_BYTES, (512, 2, xg // 4, 1024))
@@ -468,7 +479,7 @@ class QwenOverlay(ModelOverlay):
         X = XPAY // 4  # (words)
         self._weights(seq, (L, "gdn_in"), 0)
         seq.sync()
-        self._inputs(seq, self.inp[(L, "gdn_in")][0], S)
+        self._inputs(seq, self.inp[(L, "gdn_in")][0], S, (L, "gdn_in"))
         # (a block's objects (half, slot) as [half][slot 8][64]: half 0's S rows, then half 1's 1 KB on; per execution its
         # pair of blocks of the two k heads, or the 6 v blocks; then the next: k after q, z after v)
         hb = 2 * 64 * 8 // 4  # (words between the halves)
@@ -489,10 +500,9 @@ class QwenOverlay(ModelOverlay):
             g0 = sh.kh_slot(kh) - (1 if kh == 0 else 0)
             seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, g0) - 256), (gdn.KH_SPAN + 1 - kh) * XB, DIMS_OBJ)
 
-        def kh_d(kh: int, c: int) -> None:  # (its q, k histories, its K object)
+        def kh_d(kh: int, c: int) -> None:  # (the q history, the step's K object, the k history: 6 KB apart)
             a = dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh)) + 2048)
-            seq.drain("D", c, a, 2 * gdn.D_BYTES, (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, 2 * X))
-            seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh) + 4)), gdn.D_BYTES)
+            seq.drain("D", c, a, 3 * gdn.D_BYTES, (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
 
         def v_x(h: int, c: int) -> None:  # (its group, its panels)
             seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) - 256), gdn.V_SPAN * XB, DIMS_OBJ)
@@ -506,7 +516,7 @@ class QwenOverlay(ModelOverlay):
                       (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
             # its gated outputs (2 KB) at its head in gdn_out's x, the step's d per token after them (2 KB): of the last
             # head into the header, else into the sink past that K group's x
-            at, left = self._x_at((L, "gdn_out"), gdn.D * vh[c][h])
+            at, left = self._x_at((L, "gdn_out"), gdn.D * vh[c][h], S)
             xg = next(2 * self.SLOTS * rg.K for rg in self.inp[(L, "gdn_out")] if rg.k0 <= gdn.D * vh[c][h] < rg.k0 + rg.K)
             assert left >= 2048
             if h == last:
@@ -550,7 +560,7 @@ class QwenOverlay(ModelOverlay):
         per = ash.kvh * attn.HD // COLS  # (K and V rows of a column: its part of KV head per c // HD)
         self._weights(seq, (L, "attn_in"), 0)
         seq.sync()
-        self._inputs(seq, self.inp[(L, "attn_in")][0], S)
+        self._inputs(seq, self.inp[(L, "attn_in")][0], S, (L, "attn_in"))
         for c in range(COLS):  # [q + gate | K part | V part] per slot -> its q object, the slot's raw K, V object
             h, e0 = divmod(per * c, attn.HD)
             q0 = self._q(L, c, 0) + 4 * META
@@ -592,11 +602,12 @@ class QwenOverlay(ModelOverlay):
                 role = ash.role(c)
                 if not split or role == attn.ROLE_V:
                     h0, nh = (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc)
-                    at, left = self._x_at((L, "attn_out"), attn.HD * h0)
-                    assert left >= 4 * self.SLOTS * 128 * nh
-                    sw = 4 * self.SLOTS  # (words of an x k block: [slot][8] bf16)
+                    sp = self._sp(S, (L, "attn_out"))
+                    at, left = self._x_at((L, "attn_out"), attn.HD * h0, S)
+                    assert left >= 4 * sp * 128 * nh
+                    sw = 4 * sp  # (words of an x k block: [slot sp][8] bf16)
                     seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * n * 32 * nh,
-                              None if n == self.SLOTS else (4 * n, 32 * nh, sw, sw * 32 * nh))
+                              None if n == sp else (4 * n, 32 * nh, sw, sw * 32 * nh))
                 sizes = {attn.ROLE_K: (attn.REC_K,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
                 for k, nb in enumerate(sizes):  # (a V record's panels into its pair: V_SCATTER)
                     dims = attn.V_SCATTER if role == attn.ROLE_V and k % 2 == 0 else None
@@ -799,7 +810,8 @@ class QwenOverlay(ModelOverlay):
         self._committed = commit
         xf = x.numpy()
         self._write_loadr(xf)
-        self._write_input(self.inp[self._input(self.layers[0])][0], interleave(xf, self._sp(S)).view(np.uint8).reshape(-1))
+        first = self._input(self.layers[0])
+        self._write_input(self.inp[first][0], interleave(xf, self._sp(S, first)).view(np.uint8).reshape(-1))
         out = self._run(S, position, logits)
         self._accepted = False
         if commit:  # (all S accepted)
@@ -910,9 +922,9 @@ class QwenOverlay(ModelOverlay):
 
     def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""
-        off = self.inp[self._input(L)][0].off + XB
-        self.dev.fetch("ACT", off, 2 * self.SLOTS * self.H)
-        v = self.dev.view("ACT")[off:off + 2 * self.SLOTS * self.H].view(np.uint16).reshape(-1, self.SLOTS, 8)[:, slot].reshape(-1)
+        off, sp = self.inp[self._input(L)][0].off + XB, self._sp(self._last_s, self._input(L))
+        self.dev.fetch("ACT", off, 2 * sp * self.H)
+        v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, slot].reshape(-1)
         return torch.from_numpy(v.copy()).view(torch.bfloat16).float()
 
 

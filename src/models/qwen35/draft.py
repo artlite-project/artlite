@@ -204,7 +204,7 @@ class QwenDraft(QwenOverlay):
             self._metas(S)
         self._write_loadr(np.zeros((S, self.H), np.float32))
         for rg in self.inp[(self.L, "eh")]:
-            self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K], self._sp(S)).view(np.uint8).reshape(-1))
+            self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K], self._sp(S, (self.L, "eh"))).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
     def hidden_state(self, slot: int = 0) -> torch.Tensor:
