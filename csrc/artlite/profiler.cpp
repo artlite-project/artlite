@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -75,8 +76,10 @@ struct Profiler::Impl {
 
   // The footer ("]") is rewritten after every event so the file is always a
   // valid JSON document, even if the process dies mid-profile.
-  template <typename... Args>
-  void event(const char* fmt, Args... args) {
+#if defined(__GNUC__)
+  __attribute__((format(printf, 2, 3)))  // (GCC / Clang check each call's arguments against its format)
+#endif
+  void event(const char* fmt, ...) {
     if (wrote_event) {
       std::fseek(file, -2, SEEK_END);  // step over "\n]"
       std::fputs(",\n", file);
@@ -84,7 +87,10 @@ struct Profiler::Impl {
       std::fputs("\n", file);
       wrote_event = true;
     }
-    std::fprintf(file, fmt, args...);
+    std::va_list args;
+    va_start(args, fmt);
+    std::vfprintf(file, fmt, args);
+    va_end(args);
     std::fputs("\n]", file);
     std::fflush(file);
   }

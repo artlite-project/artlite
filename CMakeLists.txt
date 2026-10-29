@@ -49,6 +49,13 @@ endif()
 if(MSVC)
   add_compile_options(/Zc:__cplusplus /utf-8)  # (XRT's headers pick std::any by __cplusplus)
 endif()
+# A printf format that is not a literal and has no arguments is an error, as in distributions' hardened builds (Debian,
+# Fedora and Nix pass these flags): where the compiler takes them
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-Werror=format-security ARTLITE_FORMAT_SECURITY)
+if(ARTLITE_FORMAT_SECURITY)
+  add_compile_options(-Wformat -Werror=format-security)
+endif()
 if(WIN32)  # every source that includes windows.h (platform.h): no min / max macros
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
