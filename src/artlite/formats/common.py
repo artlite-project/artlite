@@ -197,6 +197,10 @@ class Slot:
         """The decode GEMV's kernels take tiles of nsb super-blocks."""
         return False
 
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        """The designs' token slots the decode GEMV's kernels take (``decode.gemv``: 8, x as single bfp16 rows)."""
+        return (4,)
+
     def mmv_split(self, fmt: str, nsb: int) -> int:
         """Rows of a row-split tile (core H takes rows R / 2 H .. of every super-block), or 0: the super-block split
         (core H takes super-blocks nsb / 2 H .. of every row)."""

@@ -19,6 +19,12 @@ x panels: per k-block (8 consecutive k) one 8x8 bfp16 panel, rows a = [hi of slo
 two panels (``XS_SLOT``): slot j < nsb / 2: the 32-k panels of super-blocks 2 j, 2 j + 1; slot nsb / 2 + sb: the two
 16-k panels of super-block sb.
 
+Designs of 8 slots (``render(slots=8)``: Q4_K, Q6_K) take x as single bfp16, rows a = slot 0 .. 7 (the prefill
+GEMMs' activations; [hi | lo] of 8 slots would be two panels per k block: twice the MMULs and 92 KB of x panels for
+a K group of 5120): the same panels and MMULs. Their sums stay exact as two panels each, [hi rows of the slots] then
+[lo rows] (the codes' centering subtracts z XS from the codes' sums: XS must be the sum of the quantized x), in slots
+of four panels (``xs_slot(8)``) in the same order; c is bf16(C) (64 lanes [slot][r]), y [g][slot 8][r 8].
+
 A weight panel is 8 rows x 8 k of the tile's integer codes as bfp16 mantissas at exponent 133 (value = code), so the
 MMUL sums exact products: C[a][r] = sum_k X[a][k] W[r][k] in fp32. The codes of a row are words of 8 consecutive k
 (``formats``' layouts), so 8 rows' words are transposed into panels first (``_tr8``: two shuffle stages per 8x8
@@ -28,7 +34,7 @@ start each chain; Q2_K, Q3_K: x against a constant -z panel), so that c stays sm
 (exact in fp32) as bf16 hi + lo (``_sc``; Q2_K, Q3_K: the integer scales, ``formats.k23``). Each core
 keeps its transposed codes, its tables and partial sums in its scratch (``SCR_BYTES``; Q4_K: the codes in place).
 
-Output: y [g 2][slot 4][r 8] fp32 (rows 8 g ..), accumulated.
+Output: y [g 2][slot][r 8] fp32 (rows 8 g ..), accumulated.
 """
 
 from dataclasses import dataclass
@@ -38,19 +44,35 @@ from ..formats import SLOTS as FORMAT_SLOTS
 from ..formats.common import MMV_SLOTS
 from ..operators import paging
 
-SLOTS = MMV_SLOTS  # token slots of an x panel
+SLOTS = MMV_SLOTS  # token slots of an x panel (designs of 8: ``render(slots=8)``)
 KB = 8  # k per block
 PANEL = 72  # bytes of a bfp16 8x8 panel
 XS_SLOT = 192  # bytes of a slot of sum panels (two panels, 64-byte aligned: a panel stream must start aligned)
 Y_FLOATS = 64  # a tile's output: [g 2][slot 4][r 8] fp32 (tiles of up to 32 rows in the super-block split: [g 4], 128)
+
+
+def xs_slot(slots: int = SLOTS) -> int:
+    """Bytes of a slot of sum panels: two panels of 4 slots' [hi | lo] rows, or four of 8 slots' (hi, lo each)."""
+    return XS_SLOT if slots == 4 else 320
+
+
+def y_floats(slots: int = SLOTS) -> int:
+    """A 16-row tile's output: [g 2][slot][r 8] fp32."""
+    return 16 * slots
+
+
+def scr_bytes(slots: int = SLOTS) -> int:
+    """A core's scratch (Q6_K's of 8 slots: c [i][h][g][64] bf16 after its 5 KB of codes and tables)."""
+    return SCR_BYTES if slots == 4 else 9216
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
 RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS")  # (``render(rg=)``) the formats of row-group tiles
 B_G4 = 8192  # (``decode.design``'s block format word bit of row groups of 4)
 
 
-def supported(fmt: str, nsb: int) -> bool:
-    """The decode GEMV reads tiles of this format over nsb super-blocks (its slot's kernels)."""
-    return bool(FORMATS[fmt].mmv) and slot(fmt).mmv_supports(fmt, nsb)
+def supported(fmt: str, nsb: int, slots: int = SLOTS) -> bool:
+    """The decode GEMV reads tiles of this format over nsb super-blocks for designs of ``slots`` slots (its slot's
+    kernels)."""
+    return bool(FORMATS[fmt].mmv) and slot(fmt).mmv_supports(fmt, nsb) and slots in slot(fmt).mmv_slots(fmt)
 
 
 def row_split(fmt: str, nsb: int) -> int:
@@ -80,13 +102,13 @@ def tile_rows_of(fmt: str, tile_bytes: int, nsb: int) -> int:
 
 class Chunk:
     """The K chunk of a tile: ``nsb`` super-blocks, ``k`` columns, the bytes of its x panels (``xp``) and of its sum
-    panels (``xs``: nsb / 2 slots of 32-k panels, nsb of 16-k ones)."""
+    panels (``xs``: nsb / 2 slots of 32-k panels, nsb of 16-k ones) for designs of ``slots`` slots."""
 
-    def __init__(self, nsb: int = 4):
-        assert nsb % 2 == 0, nsb
-        self.nsb, self.k = nsb, 256 * nsb
+    def __init__(self, nsb: int = 4, slots: int = SLOTS):
+        assert nsb % 2 == 0 and slots in (4, 8), (nsb, slots)
+        self.nsb, self.k, self.slots = nsb, 256 * nsb, slots
         self.xp = self.k // KB * PANEL
-        self.xs = (nsb // 2 + nsb) * XS_SLOT
+        self.xs = (nsb // 2 + nsb) * xs_slot(slots)
 
 
 _SRC = r"""
@@ -192,26 +214,40 @@ alignas(64) {{ retain }}static const int8_t {{ p }}_nz[3][8][64] = {
 {% endfor %}
 };
 
-// Pass 4 of every format: y[g] += sum over 8 sub-blocks of c_g (TD hi + lo)_g; c: of g 0 at c + CS n, g 1 at + 32;
-// tab: TD hi of g 0 at tab + TN n, lo at + 64, g 1 at + TG (one copy for every format: runtime strides)
+{% if slots == 8 %}
+// (8 slots) the 64 lanes [slot][r] of an MMUL result -> bf16: a sub-block's c
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_c8(v64accfloat C)
+{
+    return aie::accum<accfloat, 64>(C).template to_vector<bfloat16>();
+}
+
+// (8 slots) y[0 .. 64) += a
+[[clang::always_inline]] inline void {{ p }}_yadd8(float *__restrict y, aie::accum<accfloat, 64> a)
+{
+    aie::store_v(y, aie::add(aie::load_v<64>(y), a.template to_vector<float>()));
+}
+
+{% endif %}
+// Pass 4 of every format: y[g] += sum over 8 sub-blocks of c_g (TD hi + lo)_g; c: of g 0 at c + CS n, g 1 at + {{ L }};
+// tab: TD hi of g 0 at tab + TN n, lo at + 64, g 1 at + TG (one copy for every format: runtime strides){{ "; 64 lanes\n// [slot 8][r 8] (a 64-lane MAC is one op, as a 32-lane one)" if slots == 8 else "" }}
 __attribute__((noinline)) void {{ p }}_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y,
                                           int TG, int TN, int CS)
 {
     constexpr int N = 8;
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 32> Y0(aie::load_v<32>(y)), Y1(aie::load_v<32>(y + 32));
+    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
     const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
     const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < N; i++) {
-        const aie::vector<bfloat16, 32> c0 = aie::load_v<32>(pc), c1 = aie::load_v<32>(pc + 32);
-        Y0 = aie::mac(aie::mac(Y0, c0, aie::load_v<8>(ph).template grow_replicate<32>()), c0, aie::load_v<8>(ph + 64).template grow_replicate<32>());
-        Y1 = aie::mac(aie::mac(Y1, c1, aie::load_v<8>(ph + TG).template grow_replicate<32>()), c1, aie::load_v<8>(ph + TG + 64).template grow_replicate<32>());
+        const aie::vector<bfloat16, {{ L }}> c0 = aie::load_v<{{ L }}>(pc), c1 = aie::load_v<{{ L }}>(pc + {{ L }});
+        Y0 = aie::mac(aie::mac(Y0, c0, aie::load_v<8>(ph).template grow_replicate<{{ L }}>()), c0, aie::load_v<8>(ph + 64).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(aie::mac(Y1, c1, aie::load_v<8>(ph + TG).template grow_replicate<{{ L }}>()), c1, aie::load_v<8>(ph + TG + 64).template grow_replicate<{{ L }}>());
         pc += CS;
         ph += TN;
     }
     aie::store_v(y, Y0.template to_vector<float>());
-    aie::store_v(y + 32, Y1.template to_vector<float>());
+    aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
 }
 
 {% for part in parts %}
@@ -312,15 +348,15 @@ def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str,
 
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
-           pg: PageSpec | None = None, rg: bool = False, yb: int = 64) -> str:
+           pg: PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
     are code pages (``pg``: their pager), in page-id order (from 1). ``rg``: the format word's B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``decode.image.Block.G``) put super-block 2 H + 1's rows
-    ``yb`` floats after 2 H's instead of adding them."""
-    assert all(supported(f, nsb) for f in fmts), (fmts, nsb)
+    ``yb`` floats after 2 H's instead of adding them. ``slots``: the design's token slots (module docstring)."""
+    assert all(supported(f, nsb, slots) for f in fmts), (fmts, nsb, slots)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
-    assert not rg or nsb == 4, (rg, nsb)
+    assert not rg or (nsb == 4 and slots == 4), (rg, nsb, slots)
     parts: list[str] = []
     var: dict[str, int] = {}
     for s in FORMAT_SLOTS:
@@ -337,4 +373,4 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
                             rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4, yb=yb,
                             rowsplit=any(row_split(f, nsb) for f in fmts),
                             fid={f: FORMATS[f].fid for f in FORMATS}, fn={f: FORMATS[f].mmv for f in FORMATS}, NSB=nsb,
-                            PANEL=PANEL, XS_SLOT=XS_SLOT, **var)
+                            PANEL=PANEL, XS_SLOT=xs_slot(slots), slots=slots, L=8 * slots, **var)

@@ -183,7 +183,18 @@ def test_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str,
     _check_gemv(fmt, S_BYTES, NSB, key, name, S)
 
 
-def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int) -> None:
+GEMV8 = [c for c in GEMV if c[0] in ("Q4_K", "Q6_K")]
+
+
+@pytest.mark.parametrize("S", [1, 5, 8])
+@pytest.mark.parametrize(("fmt", "S_BYTES", "NSB", "key", "name"), GEMV8, ids=[f"{c[0]}-{c[1]}" for c in GEMV8])
+def test_gemv8(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int) -> None:
+    """Designs of 8 slots (x as single bfp16 rows, the sums as hi and lo panels): against their arithmetic and the
+    exact product (with the activations' bfp16 rounding: 0.9-1.2e-2 rel-rms on these heavy-tailed x, 2e-3 as hi + lo)."""
+    _check_gemv(fmt, S_BYTES, NSB, key, name, S, slots=8)
+
+
+def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int, slots: int = 4) -> None:
     path = _path(key)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
@@ -191,7 +202,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
     assert tile_format(t.qtype) == fmt
     KC = 256 * NSB
     n_tiles = 3
-    op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB)
+    op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB, slots=slots)
     R = op.rows
     t.rows, t.raw = n_tiles * R, t.raw[:n_tiles * R]
     f = t.fields()
@@ -202,12 +213,14 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
     for i in range(n_tiles):
         fc = slice_fields(f, np.arange(R * i, R * (i + 1)), k0=KC, cols=t.cols, kc=KC)  # (the second K chunk)
         tiles.append(pack_tile(fmt, fc, S_BYTES))
-        ref.append(mmv.ref_tile(fmt, fc, x)[:S])
+        ref.append(mmv.ref_tile(fmt, fc, x, slots)[:S])
         exact.append(x.astype(np.float64) @ _weights(fmt, fc).T)
-    X = np.concatenate([mmv.x_panels(x).reshape(-1), mmv.xs_panels(x, NSB).reshape(-1)])
+    X = np.concatenate([mmv.x_panels(x, slots).reshape(-1), mmv.xs_panels(x, NSB, slots).reshape(-1)])
     got = op.compile().run(torch.from_numpy(np.concatenate(tiles)), torch.from_numpy(X)).numpy()
-    gs = mmv.tile_rows(got.reshape(n_tiles, op.y_floats), R)[:, :S]
+    gs = mmv.tile_rows(got.reshape(n_tiles, op.y_floats), R, slots)[:, :S]
     rs, ex = np.stack(ref), np.stack(exact)
     assert np.abs(gs - rs).max() <= 1e-5 * np.abs(rs).max(), np.argwhere(np.abs(gs - rs) > 1e-5 * np.abs(rs).max())[:8]
-    # (vs the exact product: the sub-block sums rounded to bf16 once each, 1.5-2.0e-3 rel-rms for every integer format)
-    assert np.sqrt(((gs - ex) ** 2).mean() / (ex ** 2).mean()) < 2.5e-3
+    # (vs the exact product: the sub-block sums rounded to bf16 once each, 1.5-2.0e-3 rel-rms for every integer format;
+    # x as single bfp16 (8 slots): its rounding too)
+    err = np.sqrt(((gs - ex) ** 2).mean() / (ex ** 2).mean())
+    assert err < (2.5e-3 if slots == 4 else 1.5e-2), err

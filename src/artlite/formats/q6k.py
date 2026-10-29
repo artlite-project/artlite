@@ -152,7 +152,7 @@ _MMV = r"""// ---- Q6_K (R = {{ R6 }} rows, row group 1 = rows 8 .. and junk): d
 // the low nibbles of steps 2 h, 2 h + 1, then qh (nibble = c(2 h) + 4 c(2 h + 1), c the codes' high bits); lane l = 8 i +
 // j of a plane is k = 256 sb + 32 i + 8 s + j. A code panel is two MMULs: the low nibbles and the masked qh at x 16 (n &
 // 3) or x 4 (n & 12): 16 c. Scratch per super-block: [i][h][g][ql0 | ql1 | c0 | c1] (4 KB) | tab [g][h][hl][i][r] (1 KB)
-// | c [i][h][g][32] (2 KB)
+// | c [i][h][g][{{ L }}] ({{ L // 16 }} KB)
 
 // Pass 1: the codes of super-block sb -> scr (c0, c1: the qh nibbles masked, still packed)
 __attribute__((noinline)) void {{ p }}_q6k_tr(const uint8_t *__restrict src, uint8_t *__restrict scr)
@@ -213,8 +213,13 @@ __attribute__((noinline)) void {{ p }}_q6k_tab(const uint8_t *__restrict a, bflo
     }
 }
 
+{% if slots == 8 %}
+// Pass 3: c_g,i,h = bf16(C) -> c [i][h][g][64]; C = -32 XS16_2i+h + sum over the two steps of X (ql + 16 c) (XS16: the
+// sums' hi and lo panels)
+{% else %}
 // Pass 3: c_g,i,h = bf16(C[hi rows] + C[lo rows]) -> c [i][h][g][32]; C = -32 XS16_2i+h + sum over the two steps of
 // X (ql + 16 c)
+{% endif %}
 __attribute__((noinline)) void {{ p }}_q6k_mm(const uint8_t *__restrict xp, const uint8_t *__restrict xsum,
                                               const uint8_t *__restrict w, bfloat16 *__restrict c)
 {
@@ -226,14 +231,22 @@ __attribute__((noinline)) void {{ p }}_q6k_mm(const uint8_t *__restrict xp, cons
     AIE_LOOP_NO_UNROLL
     for (int k = 0; k < 2; k++) {  // the sum panels of sub-blocks 0 .. 7, 8 .. 15
         const v64bfp16ebs8 Z = xz.pop();
+{% if slots == 8 %}
+        const v64bfp16ebs8 ZL = xz.pop();
+{% endif %}
         const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[2][0];
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int t = 0; t < 8; t++) {  // (i, h): sub-block 2 i + h = 8 k + t
             const v64bfp16ebs8 N = {{ p }}_np(pn);
             pn += 64;
             const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop();
+{% if slots == 8 %}
+            v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+            v64accfloat C1 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+{% else %}
             v64accfloat C0 = mul_8x8_8x8T(Z, 1, N, 1);
             v64accfloat C1 = mul_8x8_8x8T(Z, 1, N, 1);
+{% endif %}
             C0 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw), 0, C0);
             C1 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw + 128), 0, C1);
             C0 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw + 64, 0x89), 0, C0);
@@ -242,10 +255,15 @@ __attribute__((noinline)) void {{ p }}_q6k_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 160), 0, C1);
             C0 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 96, 0x87), 0, C0);
             C1 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 224, 0x87), 0, C1);
+{% if slots == 8 %}
+            aie::store_v(pc, {{ p }}_c8(C0));
+            aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
             aie::store_v(pc, {{ p }}_sum2(C0));
             aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
             pw += 256;
-            pc += 64;
+            pc += {{ 2 * L }};
         }
     }
 }
@@ -255,7 +273,7 @@ __attribute__((noinline)) void {{ p }}_q6k(uint8_t *__restrict a, const uint8_t 
                                            const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *__restrict tab = (bfloat16 *)(scr + 4096);  // [g][h][hl][i][r]
-    bfloat16 *__restrict c = (bfloat16 *)(scr + 5120);  // [i][h][g][32]
+    bfloat16 *__restrict c = (bfloat16 *)(scr + 5120);  // [i][h][g][{{ L }}]
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         const int sb = 2 * HI + u;
@@ -266,8 +284,8 @@ __attribute__((noinline)) void {{ p }}_q6k(uint8_t *__restrict a, const uint8_t 
         {{ p }}_q6k_tab(a, tab, sb);
         {{ p }}_q6k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * (2 + sb), scr, c);
         // (sub-blocks n = 2 i + h in c's order; their tables at 128 h + 8 i: the h = 0 ones, then the h = 1 ones)
-        {{ p }}_sc(c, tab, {{ "yu" if rg else "y" }}, 256, 8, 128);
-        {{ p }}_sc(c + 64, tab + 128, {{ "yu" if rg else "y" }}, 256, 8, 128);
+        {{ p }}_sc(c, tab, {{ "yu" if rg else "y" }}, 256, 8, {{ 4 * L }});
+        {{ p }}_sc(c + {{ 2 * L }}, tab + 128, {{ "yu" if rg else "y" }}, 256, 8, {{ 4 * L }});
     }
 }
 """
@@ -312,6 +330,9 @@ class Q6KSlot(Slot):
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, int]:
         R6 = self.format(fmt).rows(tile_bytes, nsb)

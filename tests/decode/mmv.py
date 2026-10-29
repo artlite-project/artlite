@@ -19,15 +19,15 @@ from artlite.decode.design import C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.decode.gemv import (
     KB,
     PANEL,
-    SCR_BYTES,
     SLOTS,
-    XS_SLOT,
-    Y_FLOATS,
     Chunk,
     helper_y,
     render,
     row_split,
+    scr_bytes,
     tile_rows_of,
+    xs_slot,
+    y_floats,
 )
 from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
@@ -76,32 +76,77 @@ def _panel_bytes(x: np.ndarray) -> np.ndarray:
     return _bytes(e, m).transpose(1, 0, 2).reshape(-1, PANEL)
 
 
-def _sums(x: np.ndarray, sub: int) -> np.ndarray:
-    """The slots' sums over sub-blocks of ``sub`` k of the x panels' values (hi + lo: the decode sums the panels on
-    the MMUL), fp32 (SLOTS, K / sub)."""
-    X = hilo_rows(x)
-    return (X[:SLOTS] + X[SLOTS:]).reshape(SLOTS, x.shape[1] // sub, sub).sum(-1).astype(np.float32)
+def _x8_blocks(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(S <= 8, K) float -> the 8-slot panel rows' blocks (8, K / 8) exponents, (8, K / 8, 8) mantissas: the slots' x as
+    single bfp16 (zero rows for unused slots: ``decode.gemv``'s designs of 8 slots)."""
+    S, K = x.shape
+    assert S <= 8 and K % KB == 0
+    xs = np.zeros((8, K), np.float32)
+    xs[:S] = x
+    return blocks(xs.reshape(8, K // KB, KB))
 
 
-def xs_rows(x: np.ndarray, sub: int = 32) -> np.ndarray:
-    """The sum panels' row values (8, K / sub) of x (S, K): ``_sums`` as hi + lo rows."""
-    return hilo_rows(_sums(x, sub))
+def x_rows(x: np.ndarray, slots: int = SLOTS) -> np.ndarray:
+    """(S, K) float -> (8, K) the x panels' row values: [hi of the slots | their lo] (4 slots), the slots' x (8)."""
+    if slots == 4:
+        return hilo_rows(x)
+    e, m = _x8_blocks(x)
+    return _vals(e, m).reshape(8, -1)
 
 
-def x_panels(x: np.ndarray) -> np.ndarray:
-    """The x panels (K / 8, 72) uint8 of S <= 4 slots' x (S, K)."""
-    return _panel_bytes(x)
+def _sums(x: np.ndarray, sub: int, slots: int = SLOTS) -> np.ndarray:
+    """The slots' sums over sub-blocks of ``sub`` k of the x panels' values (4 slots: hi + lo, the decode sums the panels
+    on the MMUL), fp32 (slots, K / sub)."""
+    X = x_rows(x, slots)
+    if slots == 4:
+        X = X[:SLOTS] + X[SLOTS:]
+    return X.reshape(slots, x.shape[1] // sub, sub).sum(-1).astype(np.float32)
 
 
-def xs_panels(x: np.ndarray, nsb: int = 4) -> np.ndarray:
-    """The sum panels per chunk of x (S, K): (K / (256 nsb), ``Chunk(nsb).xs``) uint8 (the chunk's slots)."""
-    K, ch = x.shape[1], Chunk(nsb)
+def _sum_hilo(t: np.ndarray) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """(8, n) fp32 sums -> the blocks (exponents, mantissas) of their hi and lo panels (8 slots: two panels per sum
+    panel, rows = slots)."""
+    e, m = blocks(t.reshape(8, -1, 8))
+    hi = _vals(e, m).reshape(8, -1)
+    return (e, m), blocks((t - hi).astype(np.float32).reshape(8, -1, 8))
+
+
+def xs_rows(x: np.ndarray, sub: int = 32, slots: int = SLOTS) -> np.ndarray:
+    """The sum panels' row values (8, K / sub) of x (S, K): ``_sums`` as hi + lo rows (4 slots), or each slot's row the
+    sum of its hi and lo panels' values (8)."""
+    if slots == 4:
+        return hilo_rows(_sums(x, sub))
+    (e, m), (e2, m2) = _sum_hilo(_sums(x, sub, 8))
+    return (_vals(e, m) + _vals(e2, m2)).reshape(8, -1)
+
+
+def x_panels(x: np.ndarray, slots: int = SLOTS) -> np.ndarray:
+    """The x panels (K / 8, 72) uint8 of S <= ``slots`` slots' x (S, K)."""
+    if slots == 4:
+        return _panel_bytes(x)
+    e, m = _x8_blocks(x)
+    return _bytes(e, m).transpose(1, 0, 2).reshape(-1, PANEL)
+
+
+def _sum_panels(t: np.ndarray, slots: int) -> np.ndarray:
+    """(slots, 8 n) fp32 sums -> their n sum panels' bytes (n, 72 [4 slots] or 144 [8: hi panel, lo panel])."""
+    if slots == 4:
+        return _panel_bytes(t)
+    (e, m), (e2, m2) = _sum_hilo(t)
+    return np.concatenate([_bytes(e, m).transpose(1, 0, 2).reshape(-1, PANEL),
+                           _bytes(e2, m2).transpose(1, 0, 2).reshape(-1, PANEL)], 1)
+
+
+def xs_panels(x: np.ndarray, nsb: int = 4, slots: int = SLOTS) -> np.ndarray:
+    """The sum panels per chunk of x (S, K): (K / (256 nsb), ``Chunk(nsb, slots).xs``) uint8 (the chunk's slots)."""
+    K, ch = x.shape[1], Chunk(nsb, slots)
     n = K // ch.k
-    p32 = _panel_bytes(_sums(x, 32)).reshape(n, nsb // 2, 2 * PANEL)
-    p16 = _panel_bytes(_sums(x, 16)).reshape(n, nsb, 2 * PANEL)
-    out = np.zeros((n, nsb // 2 + nsb, XS_SLOT), np.uint8)
-    out[:, :nsb // 2, :2 * PANEL] = p32
-    out[:, nsb // 2:, :2 * PANEL] = p16
+    pb = PANEL * (1 if slots == 4 else 2)  # (a sum panel's bytes: [hi | lo] rows, or a hi and a lo panel)
+    p32 = _sum_panels(_sums(x, 32, slots), slots).reshape(n, nsb // 2, 2 * pb)
+    p16 = _sum_panels(_sums(x, 16, slots), slots).reshape(n, nsb, 2 * pb)
+    out = np.zeros((n, nsb // 2 + nsb, xs_slot(slots)), np.uint8)
+    out[:, :nsb // 2, :2 * pb] = p32
+    out[:, nsb // 2:, :2 * pb] = p16
     return out.reshape(n, ch.xs)
 
 
@@ -112,13 +157,22 @@ def xs_panels(x: np.ndarray, nsb: int = 4) -> np.ndarray:
 
 @dataclass(frozen=True)
 class MmvX:
-    """x of S <= SLOTS token slots over one K chunk as the decode GEMV's MMUL sees it: ``X`` (8, K) the x panels' rows
-    [hi of the slots | their lo] and ``xs32``, ``xs16`` (8, K / 32), (8, K / 16) the sum panels' rows (the slots' sums
-    of the panels' values over 32-k / 16-k sub-blocks, as hi + lo rows), float64."""
+    """x of S <= ``slots`` token slots over one K chunk as the decode GEMV's MMUL sees it: ``X`` (8, K) the x panels'
+    rows (``x_rows``) and ``xs32``, ``xs16`` (8, K / 32), (8, K / 16) the sum panels' rows (``xs_rows``), float64."""
 
     X: np.ndarray
     xs32: np.ndarray
     xs16: np.ndarray
+    slots: int = SLOTS
+
+    def csum(self, C: np.ndarray) -> np.ndarray:
+        """(8 rows a, ...) MMUL sums -> a sub-block's c (slots, ...): the slots' sums of their hi and lo rows, rounded to
+        bf16 (4 slots), or the rows rounded (8)."""
+        return _csum(C) if self.slots == 4 else _bf64(C)
+
+    def fold(self, o: np.ndarray) -> np.ndarray:
+        """(8 rows a, ...) -> (slots, ...): the hi and lo rows added (4 slots)."""
+        return o[:SLOTS] + o[SLOTS:] if self.slots == 4 else o
 
 
 def _bf64(x: np.ndarray) -> np.ndarray:
@@ -174,12 +228,12 @@ def _scale_min(f: dict[str, np.ndarray], x: MmvX, z: int) -> np.ndarray:
     d = _bf64(f["d"]).reshape(R, nsb)
     dm = _bf64(f["dmin"]).reshape(R, nsb)
     TD = _hilo(np.repeat(d, 8, 1) * sc)  # (R, sub-block)
-    y = (_csum(C) * TD.T[None]).sum(1)
+    y = (x.csum(C) * TD.T[None]).sum(1)
     XS = x.xs32.reshape(8, nsb, 8)
     Ms = np.einsum("asi,rsi->asr", XS, sc.reshape(R, nsb, 8))
     Mm = np.einsum("asi,rsi->asr", XS, f["mn"].astype(np.float64).reshape(R, nsb, 8))
     o = (_hilo(Ms) * (z * d).T[None] - _hilo(Mm) * dm.T[None]).sum(1)
-    return y + o[:SLOTS] + o[SLOTS:]
+    return y + x.fold(o)
 
 
 def _q4k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
@@ -196,7 +250,7 @@ def _q6k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     R, K = q.shape
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 16, 16), q.reshape(R, K // 16, 16)) - 32 * x.xs16[..., None]
     TD = _hilo(np.repeat(_bf64(f["d"]).reshape(R, K // 256), 16, 1) * f["sc"].astype(np.float64).reshape(R, K // 16))
-    return (_csum(C) * TD.T[None]).sum(1)
+    return (x.csum(C) * TD.T[None]).sum(1)
 
 
 def _q2k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
@@ -250,17 +304,18 @@ _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_
          "IQ3_XXS": _iq3, "BFP16": _bfp16}
 
 
-def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
-    """The kernels' arithmetic on one tile and K chunk (the fields ``f`` of its R rows): (SLOTS, R) float64 against
-    x (S, 256 nsb)."""
-    return _REFS[fmt](fmt, f, MmvX(hilo_rows(x), xs_rows(x, 32), xs_rows(x, 16)))
+def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:
+    """The kernels' arithmetic on one tile and K chunk (the fields ``f`` of its R rows): (slots, R) float64 against
+    x (S, 256 nsb), for designs of ``slots`` slots."""
+    assert slots == 4 or fmt in ("Q4_K", "Q6_K"), (fmt, slots)
+    return _REFS[fmt](fmt, f, MmvX(x_rows(x, slots), xs_rows(x, 32, slots), xs_rows(x, 16, slots), slots))
 
 
-def tile_rows(y: np.ndarray, R: int) -> np.ndarray:
-    """A tile's output (..., 32 g) [g][slot][r] (g row groups) -> (..., SLOTS, R)."""
-    g = y.shape[-1] // (8 * SLOTS)
-    y = np.asarray(y).reshape(*y.shape[:-1], g, SLOTS, 8)
-    return np.swapaxes(y, -3, -2).reshape(*y.shape[:-3], SLOTS, 8 * g)[..., :R]
+def tile_rows(y: np.ndarray, R: int, slots: int = SLOTS) -> np.ndarray:
+    """A tile's output (..., 8 slots g) [g][slot][r] (g row groups) -> (..., slots, R)."""
+    g = y.shape[-1] // (8 * slots)
+    y = np.asarray(y).reshape(*y.shape[:-1], g, slots, 8)
+    return np.swapaxes(y, -3, -2).reshape(*y.shape[:-3], slots, 8 * g)[..., :R]
 
 
 # ----------------------------------------------------------------------
@@ -340,12 +395,16 @@ class MmvOperator(ArtcOperator):
     Args: A (n_tiles tile_bytes uint8), X (x panels + sum panels of a chunk, uint8), OUT (n_tiles x ``y_floats`` fp32:
     [g][slot][r])."""
 
-    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False):
-        """win: event0 / event1 around each core's half tile (the profiling skill's counters)."""
-        self.fmt, self.n_tiles, self.tile_bytes, self.chunk, self.win = fmt, n_tiles, tile_bytes, Chunk(nsb), win
+    def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False,
+                 slots: int = SLOTS):
+        """win: event0 / event1 around each core's half tile (the profiling skill's counters); slots: the design's token
+        slots (``decode.gemv``)."""
+        self.fmt, self.n_tiles, self.tile_bytes, self.win, self.slots = fmt, n_tiles, tile_bytes, win, slots
+        self.chunk = Chunk(nsb, slots)
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
         self.hy = helper_y(fmt, nsb)  # (where the second core's rows go)
-        self.yn = 128 if self.rows > 16 and not row_split(fmt, nsb) else Y_FLOATS  # (a core's output)
+        self.yn = 128 if self.rows > 16 and not row_split(fmt, nsb) else y_floats(slots)  # (a core's output)
+        assert slots == 4 or self.rows <= 16, (fmt, slots)
         self.y_floats = self.yn + self.hy
         super().__init__()
 
@@ -358,7 +417,7 @@ class MmvOperator(ArtcOperator):
         fid, ch = FORMATS[self.fmt].fid, self.chunk
         n = ch.xp + ch.xs
         x1 = 0 if row_split(self.fmt, ch.nsb) else ch.xp // 2  # (the second core's panels)
-        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb) + f"""
+        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb, slots=self.slots) + f"""
 extern "C" {{
 void mmvh_copy(const uint8_t *__restrict x, uint8_t *__restrict xb)
 {{
@@ -408,7 +467,7 @@ void mmvh_add(const float *__restrict r, const float *__restrict y, float *__res
         x_ty = np.ndarray[(self.chunk.xp + self.chunk.xs,), u8]
         y_ty = np.ndarray[(self.yn,), f32]
         o_ty = np.ndarray[(self.y_floats,), f32]
-        s_ty = np.ndarray[(SCR_BYTES,), u8]
+        s_ty = np.ndarray[(scr_bytes(self.slots),), u8]
         cmd_ty = np.ndarray[(16,), i32]
         k_copy = Kernel("mmvh_copy", "kernel.o", [x_ty, x_ty])
         k0 = Kernel("mmvh_tile0", "kernel.o", [a_ty, x_ty, cmd_ty, s_ty, y_ty])
