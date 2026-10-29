@@ -19,7 +19,7 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
 ## What is native
 
 - **bf16 x bf16 -> fp32 multiply / MAC** (`vmul.f`, `vmac.f`): the result lands at +6 cycles.
-  Dependent MACs on one accumulator run every 2 cycles.
+  Dependent MACs on one accumulator run every 3 cycles (machine-model.md).
 - **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op. Not IEEE: the smaller operand
   is rounded (to nearest even) onto the larger's grid of 23 fractional bits before the add (AM027),
   so a cancellation keeps only that grid: x - round(x) loses x's last bit where round(x) is a power

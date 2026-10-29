@@ -40,8 +40,8 @@ A Q4_0 GEMM unit (8 weight rows x 256 k against 4 groups of 8 tokens):
 
 - Order the loops so that the operand reused across the inner loop is popped once into registers and the other
   operand streams exactly once.
-- A dependent MMUL on one accumulator issues at best every 2 cycles: split the work over two accumulators on
-  alternating blocks.
+- A dependent MMUL on one accumulator issues at best every 3 cycles: split the work over two or more accumulators
+  on alternating blocks.
 - A P·V kernel (per row set its 2-4 P panels in registers, the V object streamed once, two chains over alternating dim
   blocks): II 19 per 2 dim blocks, 1344 instead of 2155 cycles per object.
 - The gemm MAC loop (`gemm/mac.py`): 4 staggered accumulator chains in k-step order, II 32 = ResMII
@@ -291,17 +291,20 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   place in one region put P V 50% above its schedule (548 vs 364 cycles).
 - 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
   pops (each K panel once per head) and its in-place o (no L1 for a second copy).
-- **The same in decode** (`models/qwen35/attn.py`: up to 12 query rows, 3 sets of [4 rows hi | 4 rows lo], against
-  a pass over the whole cache): every K panel popped once for all sets (Q panels [d-block][set]: II 6 for 3 MMULs per
-  K half, the Q stream's pops), P V over octets (two sets' 8 rows, P hi and P lo two MMULs into one 8-row accumulator:
-  no fold of hi into lo rows, which bound the mv slot; records 2k, 2k + 1 per y round trip on two V streams: II 8 for 8
-  MMULs), the softmax's exp2 the bias-192 form, and the softmax while the V object streams in (data-movement.md
-  "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.04 / 2.07 ms per layer (2 / 3 sets), the
-  DMA floor. 24 rows (the 27B's 4 slots: 6 sets) fit one pass with the A stream at depth 2, the records read from the
-  two held last objects, the gates applied by the main core and the Q panels of octets 1-2 in the main core's memory
-  (models/qwen35/attn.py docstring): 2.64 ms against 4.15 for two passes, compute-bound (~9.3K cycles per group: QK
-  per octet at II 4 ~3.9K, the softmax's P panels ~1.4K, its maxima ~1.0K, P V ~1.3K). Llama's cores (`decode/attn.py`, one head dim: 16 rows, A depth 2) with the octet softmax
-  and P V: 1B at 16K a step of 4 tokens 32.8 -> 26.4 ms (its pexp's per-pair exp2 calls were the largest part).
+- **The same in decode** (`models/qwen35/attn.py`: up to 24 query rows, octets of two sets of [4 rows hi | 4 rows lo],
+  against a pass over the whole cache): the cache d-block major (``decode.kv``: K records [d-block][hi | lo], V records
+  in pairs [d-block][record 2], the order the prefill's stream reads), so per d-block K hi, K lo and an octet's two Q
+  panels are each popped once, a chain per set and K half: II 4 for 4 MMULs, 158 cycles per record and octet (K hi then
+  K lo with each Q panel popped twice: 288; on two chains II 6), P V over octets (two sets' 8 rows, P hi and P lo two
+  MMULs into one 8-row accumulator: no fold of hi into lo rows, which bound the mv slot; a pair of records per y round
+  trip on one V stream: II 8 for 8 MMULs), the softmax's exp2 the bias-192 form, and the softmax while the V object
+  streams in (data-movement.md "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.04 / 2.07 ms per
+  layer (2 / 3 sets), the DMA floor. 24 rows (the 27B's 4 slots: 6 sets) fit one pass with the A stream at depth 2, the
+  records read from the two held last objects, the gates applied by the main core and the Q panels of octets 1-2 in the
+  main core's memory (models/qwen35/attn.py docstring): 2.13 ms against 4.15 for two passes, near the 2.04 of the DMA
+  floor (with K hi then K lo per record and each Q panel popped twice: 2.64, ~9.3K cycles per group, QK ~3.9K of it).
+  Llama's cores (`decode/attn.py`, one head dim: 16 rows, A depth 2) with the octet softmax and P V: 1B at 16K a step of
+  4 tokens 32.8 -> 26.4 ms (its pexp's per-pair exp2 calls were the largest part).
 
 ## R14 Weight panels from gathers (IQ3_XXS, `formats/iq3.py`)
 

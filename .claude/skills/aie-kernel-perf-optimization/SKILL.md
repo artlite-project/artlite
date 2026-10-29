@@ -126,9 +126,9 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **R1 Accumulators in registers across the reduction**: a loop that loads, updates and stores an L1 output every
   group, or spills, runs 20-30% above its schedule with bank conflicts. Reorder so fewer outputs are live and stay in
   accumulators for the whole reduction, even if an operand is rebuilt twice (II 56 -> 21, memory stall 7.25 -> 0.24 ms).
-- **R2 The reused operand popped once, two independent MMUL chains**: one accumulator chain issues every 2 cycles at
-  best; alternate two accumulators over blocks (P·V 2155 -> 1344 cycles per object; the gemm MAC loop's 4 staggered
-  chains: II 32 = ResMII).
+- **R2 The reused operand popped once, two independent MMUL chains**: one accumulator chain issues every 3 cycles at
+  best; alternate two or more accumulators over blocks (P·V 2155 -> 1344 cycles per object; the gemm MAC loop's 4
+  staggered chains: II 32 = ResMII).
 - **R3 Long elementwise chains** (fp32 emulated, latency-bound, never pipelined): a gather LUT or a short bf16
   polynomial, identities without cancellation, fp32 only where it matters, both branches then one select, x passed
   twice, loop fission (GELU 622 -> 223 cycles per 32; recipes: numerics.md).
@@ -186,7 +186,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   become iteration-local loads on idle load slots: the Q3_K decode MMUL loop II 20 (3 spills) -> 13, none
   (`formats/q3k.py` `_q3k_mm`).
 - **At most two bfp16 panel streams per loop** (2 `lf` registers). A third `BIn` stream's load state is spilled and
-  reloaded every iteration: three streams (Q, K hi, K lo) II 12 per d-block, as two loops of two streams II 4 each.
+  reloaded every iteration: three streams (Q, K hi, K lo) II 12 per d-block, as two loops of two streams II 4 each;
+  with K stored [d-block][hi | lo] (one stream) one loop pops each Q panel once for both: II 4 for 4 MMULs (R13).
   A stream's pops all sit on one load slot, each with a `vlda.fill.512` (machine-model.md: unrolling does not
   amortize them): a panel per 2 cycles, so a loop whose MMULs each pop an operand is bound at 2 cycles per MMUL. Reuse every popped panel for two or more MMULs (R13). Output streams
   likewise: the push / flush chain of one `BOut` bounds a loop pushing two panels per iteration at II ~16-17 (slot

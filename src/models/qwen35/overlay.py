@@ -6,8 +6,8 @@ every phase's input (ACT: per K group [metadata object | x slot-interleaved], ``
 drains its outputs straight into its consumer's x), the residual-slice objects (F_LOADR), the GDN layers' objects (GOBJ:
 per column [header | conv q / k | K | per pair of v heads: conv v, deltas], ``gdn``) and states (GSTATE: per column its
 panels, as the prefill reads them), the attention layers' objects (per column an F_ATT object per sub-step, then per
-column its q objects; the raw K / V objects) and KV caches (KV, ``decode.kv``'s layout, and per KV head a ring of
-the open V records' values: ``decode.vring``), and the logits ([slot][vocab] bf16).
+column its q objects; the raw K / V objects) and KV caches (KV, ``decode.kv``'s d-block-major layout, and per KV head a
+ring of the open V records' values: ``decode.vring``), and the logits ([slot][vocab] bf16).
 
 A step is one dispatch of the transaction of its slot count and the attention's sub-steps (``subs``; built on first
 use), patched per step with the positions (the KV cache and ring reads, the record drains, the F_ATT objects) and the
@@ -505,8 +505,9 @@ class QwenOverlay(ModelOverlay):
                     seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * n * 32 * nh,
                               None if n == SLOTS else (4 * n, 32 * nh, 16, 16 * 32 * nh))
                 sizes = {attn.ROLE_K: (attn.REC_K,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
-                for k, nb in enumerate(sizes):
-                    hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb)
+                for k, nb in enumerate(sizes):  # (a V record's panels into its pair: V_SCATTER)
+                    dims = attn.V_SCATTER if role == attn.ROLE_V and k % 2 == 0 else None
+                    hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb, dims)
                     st.drains.append((hd, L, c, u, k))
 
     def _moe(self, seq: Sequence, L: int, S: int, to: tuple[int, str], run: list[tuple[int, str]] | None) -> None:
@@ -654,8 +655,8 @@ class QwenOverlay(ModelOverlay):
         for at, L, c, u, t in st.tails:  # (the ring slots of the sub-step's first and last records, or the first's V
             a, n, _ = st.subs[u]  # panels in record mode)
             r = (p + a + (n - 1 if t else 0)) >> 3
-            if rec_mode[L] and u == 0 and t == 0:
-                off = self.kv_off[L] + c // nph * ash.head_bytes + 3 * (r // 4) * T + 2 * T + r % 4 * attn.REC_V
+            if rec_mode[L] and u == 0 and t == 0:  # (its pair of records)
+                off = self.kv_off[L] + c // nph * ash.head_bytes + 3 * (r // 4) * T + 2 * T + r % 4 // 2 * 2 * attn.REC_V
             else:
                 off = self.ring(L, c // nph) + (r & 1) * T
             w[at:at + 3] = txn.bd_words(dev.address("KV", off), T)
@@ -668,7 +669,7 @@ class QwenOverlay(ModelOverlay):
             if not v:
                 off, nb = head + j // 2 * T + j % 2 * attn.REC_K, attn.REC_K
             elif k % 2 == 0:
-                off, nb = head + 2 * T + j * attn.REC_V, attn.REC_V
+                off, nb = head + 2 * T + j // 2 * 2 * attn.REC_V + j % 2 * 72, attn.REC_V
             else:
                 off, nb = self.ring(L, c // nph) + (r & 1) * T, attn.ROWS_B
             w[hd[0]:hd[0] + 3] = txn.bd_words(dev.address("KV", off), nb)

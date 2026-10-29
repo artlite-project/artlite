@@ -530,7 +530,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     kc = rng.standard_normal((kvh, P, HD)).astype(np.float32)
     vc = mmv.bf(rng.standard_normal((kvh, P, HD)).astype(np.float32))
     kc[:, p:] = vc[:, p:] = 0
-    groups = [KV.kv_groups(kc[h], vc[h], T) for h in range(kvh)]
+    groups = [KV.kv_groups(kc[h], vc[h], T, dmajor=True) for h in range(kvh)]
     hb = groups[0].nbytes
     rb = 2 * T  # (a head's ring)
     kv_bytes = kvh * (hb + rb) + T
@@ -542,8 +542,8 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         o = kvh * hb + h * rb + (rp & 1) * T
         kvv[o:o + A1.ROWS_B] = interleave_bits(rows.reshape(-1))
     dev.flush("KV")
-    kc_s = [KV.kv_from_groups(gr, HD)[0] for gr in groups]  # (as stored)
-    vc_s = [KV.kv_from_groups(gr, HD)[1] for gr in groups]
+    kc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[0] for gr in groups]  # (as stored)
+    vc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[1] for gr in groups]
     qg = mmv.bf(rng.standard_normal((COLS, S, qc, 2 * HD)).astype(np.float32))  # [q | gate] per head
     kv = mmv.bf(rng.standard_normal((S, kvh, 2 * HD)).astype(np.float32))  # [K | V] per KV head
     qn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
@@ -599,7 +599,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         if not split or role == A1.ROLE_V:  # (the tail objects)
             for t in range(nt):
                 r = rl if t else rp
-                v0 = base + 3 * (rp // 4) * T + 2 * T + rp % 4 * A1.REC_V
+                v0 = base + 3 * (rp // 4) * T + 2 * T + rp % 4 // 2 * 2 * A1.REC_V  # (its pair of records)
                 seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T)
         if not split and k == 0:
             seq.fill("A", c, base + 3 * g * T, 2 * T)
@@ -652,7 +652,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
             for i, r in enumerate(recs_c):
                 kg = np.zeros((P // 32, 3, T), np.uint8)
                 kg[r // 4, (r % 4) // 2, (r % 2) * A1.REC_K:(r % 2 + 1) * A1.REC_K] = recs[c, i * A1.REC_K:(i + 1) * A1.REC_K]
-                got_k = KV.kv_from_groups(kg, HD)[0][8 * r:min(8 * r + 8, p + S)]
+                got_k = KV.kv_from_groups(kg, HD, dmajor=True)[0][8 * r:min(8 * r + 8, p + S)]
                 assert ref.rel_err(got_k, k_all[8 * r:min(8 * r + 8, p + S)]) < 1e-2, (c, r)
         elif ash.role(c) == A1.ROLE_V:  # per record its V panels up to the last new position and its rows
             for i, r in enumerate(recs_c):

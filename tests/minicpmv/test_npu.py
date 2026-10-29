@@ -88,7 +88,7 @@ def _k_cache(model: NpuQwen, n: int) -> np.ndarray:
     for o in ov.kv_off.values():
         for h in range(ov.ash.kvh):
             a = o + h * ov.ash.head_bytes
-            out.append(KV.kv_from_groups(kv[a:a + ov.ash.head_bytes].reshape(-1, 3, ov.T), AT.HD)[0][:n])
+            out.append(KV.kv_from_groups(kv[a:a + ov.ash.head_bytes].reshape(-1, 3, ov.T), AT.HD, dmajor=True)[0][:n])
     return np.stack(out)
 
 

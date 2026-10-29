@@ -95,12 +95,13 @@ grep -n "InstrItinData<II_VMAC_f_vmac_bf_vmul_bf_core_X_X" AIE2PGenSchedule.td
 
 The operand list gives the cycle each operand is written/read, e.g.
 `[/*dst*/6, /*acc1*/4, ...]`: result written at 6, accumulator input read
-at 4, so dependent MACs on one accumulator can issue every 6-4 = 2 cycles.
+at 4; a dependence's latency is def - use + 1 (LLVM's itineraries), so dependent MACs on one accumulator issue every
+3 cycles.
 Values read this way:
 
 | op | latency |
 |---|---|
-| `vmac.f` (bfp16/bf16 MMUL) | dst @6, acc-in @4 -> chained every 2 cycles |
+| `vmac.f` (bfp16/bf16 MMUL) | dst @6, acc-in @4 -> chained every 3 cycles: the post-pipeliner's RecMII 3 per MMUL of an accumulator chain in an iteration |
 | `vlda.conv.fp32.bf16` | dst @7 |
 | `vconv.fp32.bf16` (mv slot) | dst @2 |
 | `vmul.f` (bf16 x bf16) | dst @6, sources read @1 -> a dependent SRS / mul 5 cycles later |
@@ -109,8 +110,10 @@ Values read this way:
 | `vlda.pop.576` / `vldb.pop.576` | dst @8; FIFO state @7 -> one pop per cycle per stream, plus its `vlda.fill.512`s on the same slot: a 576-bit pop takes 1.125 fills of 512 bits, and the schedule carries one per pop at any unroll (the qwen35 decode's qk<2> unrolled 2 / 4 / 8: 16 fills for 16 pops per iteration): a panel per 2 cycles on its slot |
 
 Consequences:
-- One MMUL accumulator chain issues at most every 2 cycles: two independent
-  chains fill the vector slot.
+- One MMUL accumulator chain issues at most every 3 cycles: three independent
+  chains fill the vector slot, and k MMULs per iteration on one chain bound the
+  II at 3 k (the qwen35 decode's qk: a set's K hi and K lo products on one chain,
+  II 6; a chain per set and K half, II 4 = its pops).
 - An fp32-emulated multiply (bf16 split, 3 MACs, 2 conversions) is ~20
   cycles of latency. A chain of them bounds the II by its length, however
   empty the slots are.

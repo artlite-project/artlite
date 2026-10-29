@@ -59,7 +59,7 @@ class Records:
         return 8 * self.rg(a_bytes)
 
 
-def kv_groups(k: np.ndarray, v: np.ndarray, a_bytes: int, kp: int = 2) -> np.ndarray:
+def kv_groups(k: np.ndarray, v: np.ndarray, a_bytes: int, kp: int = 2, *, dmajor: bool = False) -> np.ndarray:
     """K, V (P, hd) of a KV head (P whole groups) -> its cache (groups, kp + 1, a_bytes) uint8 (module docstring)."""
     P, hd = k.shape
     rec = Records(hd, kp)
@@ -72,20 +72,27 @@ def kv_groups(k: np.ndarray, v: np.ndarray, a_bytes: int, kp: int = 2) -> np.nda
     kb = np.stack(parts, 2).transpose(0, 1, 2, 4, 3, 5)  # [g][r][hi / lo][db][position][9]
     vr = np.asarray(v, np.float32).reshape(n, rg, 8, nd, 8)
     vp = block_bytes(vr.transpose(0, 1, 3, 4, 2))  # [g][r][db][i][9]: a block over the positions
+    if dmajor:
+        assert kp == 2 and rg % 2 == 0
+        kb = kb.transpose(0, 1, 3, 2, 4, 5)  # [g][r][db][hi / lo][position][9]
+        vp = vp.reshape(n, rg // 2, 2, nd, 8, 9).transpose(0, 1, 3, 2, 4, 5)  # [g][pair][db][record of 2][i][9]
     out = np.zeros((n, kp + 1, a_bytes), np.uint8)
     out[:, :kp, :kper * rec.k_bytes] = kb.reshape(n, kp, kper * rec.k_bytes)
     out[:, kp, :rg * rec.v_bytes] = vp.reshape(n, rg * rec.v_bytes)
     return out
 
 
-def kv_from_groups(groups: np.ndarray, hd: int) -> tuple[np.ndarray, np.ndarray]:
+def kv_from_groups(groups: np.ndarray, hd: int, *, dmajor: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Inverse of ``kv_groups`` (kp: the groups' objects - 1): K, V (P, hd) float32 as stored."""
     n, no, a_bytes = groups.shape
     rec = Records(hd, no - 1)
     nd, kper, rg, kp = rec.nd, rec.kper(a_bytes), rec.rg(a_bytes), rec.kp
-    kb = groups[:, :kp, :kper * rec.k_bytes].reshape(n, rg, kp, nd, 8, 9)
+    kb = groups[:, :kp, :kper * rec.k_bytes]
+    kb = kb.reshape(n, rg, nd, kp, 8, 9).swapaxes(2, 3) if dmajor else kb.reshape(n, rg, kp, nd, 8, 9)
     k = sum(block_values(kb[:, :, i]) for i in range(kp)).transpose(0, 1, 3, 2, 4)  # [g][r][position][db][i]
-    vp = groups[:, kp, :rg * rec.v_bytes].reshape(n, rg, nd, 8, 9)
+    vp = groups[:, kp, :rg * rec.v_bytes]
+    vp = vp.reshape(n, rg // 2, nd, 2, 8, 9).swapaxes(2, 3) if dmajor else vp.reshape(n, rg, nd, 8, 9)
+    vp = vp.reshape(n, rg, nd, 8, 9)
     v = block_values(vp).transpose(0, 1, 4, 2, 3)
     return k.reshape(n * 8 * rg, hd), np.ascontiguousarray(v).reshape(n * 8 * rg, hd)
 
@@ -139,7 +146,7 @@ def records(*, p: int, S: int, hd: int, a_bytes: int, kp: int = 2) -> list[tuple
 
 
 def v_offset(p: int, *, hd: int, a_bytes: int, kp: int = 2) -> int:
-    """Byte offset from group 0 of a KV head's cache of the V panels of record p >> 3."""
+    """Byte offset from group 0 of a KV head's cache of the V panels of record p >> 3 (not ``dmajor``)."""
     rec = Records(hd, kp)
     rg, r = rec.rg(a_bytes), p // 8
     return r // rg * rec.objects * a_bytes + kp * a_bytes + r % rg * rec.v_bytes

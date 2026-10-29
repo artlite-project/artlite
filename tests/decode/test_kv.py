@@ -44,6 +44,23 @@ def test_kv_groups_layout() -> None:
     assert np.abs(vals - k[8 * 5 + 3, 56:64]).max() < 2 ** -6 * np.abs(k[8 * 5 + 3, 56:64]).max() + 1e-6
 
 
+def test_kv_groups_dmajor() -> None:
+    """The d-block-major layout (qwen35's): the same values; a K record [d-block][hi | lo], a V object's records in
+    pairs [d-block][record of 2]."""
+    rng = np.random.default_rng(1)
+    k = rng.standard_normal((64, 256)).astype(np.float32)
+    v = rng.standard_normal((64, 256)).astype(np.float32)
+    g, gd = kv.kv_groups(k, v, 9280), kv.kv_groups(k, v, 9280, dmajor=True)
+    for a, b in zip(kv.kv_from_groups(g, 256), kv.kv_from_groups(gd, 256, dmajor=True), strict=True):
+        assert np.array_equal(a, b)
+    rk, rv = kv.Records(256).k_bytes, kv.Records(256).v_bytes
+    # record 5 (group 1, its first K object's second record), d-block 7: hi, lo panels; record 6's (the V object's
+    # third: its second pair's first) V panel of d-block 7
+    assert np.array_equal(gd[1, 0, rk + 144 * 7:rk + 144 * 8], np.concatenate(
+        [g[1, 0, rk + 72 * 7:rk + 72 * 8], g[1, 0, rk + 72 * 39:rk + 72 * 40]]))
+    assert np.array_equal(gd[1, 2, 2 * rv + 144 * 7:2 * rv + 144 * 7 + 72], g[1, 2, 2 * rv + 72 * 7:2 * rv + 72 * 8])
+
+
 @pytest.mark.parametrize(("first", "g"), [(0, 0), (0, 1), (0, 2), (0, 5), (3, 19), (2, 4)])
 def test_ranges(first: int, g: int) -> None:
     """The columns cover first .. g once, in order; the last column holds g; with fewer groups than columns the empty

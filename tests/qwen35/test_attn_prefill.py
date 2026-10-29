@@ -28,25 +28,19 @@ def _bf(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
-def _slot_order(slots: np.ndarray, two: bool) -> np.ndarray:
-    """QS slots (..., SLOT) uint8 as stored ([half 2][value 2][d-block 16][72 B], two streams [quarter 4][value 2]
-    [d-block 8][72 B]: ``AP.slot_walk``) -> [d-block 32][the two values' 144 B]."""
-    lead, n = slots.shape[:-1], 4 if two else 2
-    return np.ascontiguousarray(slots.reshape(*lead, n, 2, AP.ND // n, 72).swapaxes(-3, -2)).reshape(*lead, AP.ND, 144)
-
-
-def _q_panels(slots: np.ndarray, two: bool) -> np.ndarray:
-    """Q slots (..., SLOT) uint8 -> (..., 8 queries, 256) the Q values they hold (hi + lo)."""
+def _q_panels(slots: np.ndarray) -> np.ndarray:
+    """Q slots (..., SLOT) uint8 ([d-block 32][hi | lo panel]) -> (..., 8 queries, 256) the Q values they hold (hi +
+    lo)."""
     lead = slots.shape[:-1]
-    p = _slot_order(slots, two).reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
+    p = slots.reshape(*lead, AP.ND, 2, 8, 9)  # [db][hi / lo][query][block]
     v = bfp16.block_values(p[..., 0, :, :]) + bfp16.block_values(p[..., 1, :, :])  # [db][query][8]
     return np.moveaxis(v, -3, -2).reshape(*lead, 8, AP.HD)
 
 
-def _gate_sigmoid(slots: np.ndarray, two: bool) -> np.ndarray:
+def _gate_sigmoid(slots: np.ndarray) -> np.ndarray:
     """sigmoid(gate) slots (..., SLOT) uint8 -> (..., 8, 256) (fp32 of the bf16 stored: per d-block [query][8])."""
     lead = slots.shape[:-1]
-    g = _slot_order(slots, two).view(np.uint16).reshape(*lead, AP.ND, 72)[..., :64].astype(np.uint32) << 16
+    g = np.ascontiguousarray(slots).view(np.uint16).reshape(*lead, AP.ND, 72)[..., :64].astype(np.uint32) << 16
     g = g.view(np.float32).reshape(*lead, AP.ND, 8, 8)  # [db][query][8]
     return np.moveaxis(g, -3, -2).reshape(*lead, 8, AP.HD)
 
@@ -135,8 +129,8 @@ def test_attn_prep(size: str) -> None:
         _run(fused, op.params(t0), s.G(t0, n))
         pos = np.arange(t0, t0 + n)
         slots = _qs_slots(fused, T, qc, op.qg)
-        q = _q_panels(slots[:, :, 0], op.two).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]  # [head][token]
-        sg = _gate_sigmoid(slots[:, :, 1], op.two).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
+        q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]  # [head][token]
+        sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
         qg = s.qfull[t0:t0 + n].reshape(n, -1, 2, hd)
         q_want = s.nr(qg[:, :, 0], s.qn, pos).transpose(1, 0, 2) * np.log2(np.e) / 16
         assert ref.rel_err(q, q_want) < 2e-4, t0  # (hi + lo panels: ~14 bits below a block's maximum)
@@ -150,7 +144,7 @@ def test_attn_prep(size: str) -> None:
     kr = s.k[:T + n2].reshape(T + n2, s.kvh, hd)
     k_want = s.nr(kr, s.kn, pos)
     for h in range(s.kvh):
-        K, V = KV.kv_from_groups(kv[h, :(T + n2 + 31) // 32], AT.HD)
+        K, V = KV.kv_from_groups(kv[h, :(T + n2 + 31) // 32], AT.HD, dmajor=True)
         assert ref.rel_err(K[:T + n2], k_want[:, h]) < 2e-4, h
         assert ref.rel_err(V[:T + n2], s.v[:T + n2, 256 * h:256 * (h + 1)]) < 1e-2, h
         k_gold = np.asarray(s.gold["Kcur.1", s.L], np.float32).reshape(-1, s.kvh, hd)[:T + n2, h]
@@ -178,12 +172,12 @@ def test_attn_prefill(size: str, T: int) -> None:
         _run(fused, prep.params(t0) | attn.params(t0), s.G(t0, n))
         A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
         slots = _qs_slots(fused, T, qc, prep.qg)
-        q = _q_panels(slots[:, :, 0], prep.two).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
-        sg = _gate_sigmoid(slots[:, :, 1], prep.two).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
+        q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
+        sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
         kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
         want = np.zeros((n, H, hd))
         for h in range(s.kvh):
-            K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD))
+            K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD, dmajor=True))
             for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
                 sc = q[g].astype(np.float64) @ K.T / 16
                 sc[np.arange(t0, t0 + n)[:, None] < np.arange(t0 + n)[None]] = -np.inf
