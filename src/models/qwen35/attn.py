@@ -1,6 +1,6 @@
 """The attention core of the multi-slot decode overlay (``qwen35/decode.py``): the full-attention layers (head_dim 256,
 NeoX RoPE on the first 64 dims, q / k RMS-normed per head, a sigmoid output gate) for S <= 4 token slots at positions
-p .. p + S - 1.
+p .. p + S - 1 (a sub-step: a step of a design of 8 slots has up to three).
 
 The KV heads' columns form chains of NPH = 8 / KV heads (9B / 27B NPH 2, MiniCPM-V 4): column c attends with its QC
 query heads (27B 3, 9B 2, MiniCPM-V 1) to KV head c // NPH over the whole cache (``decode.kv``'s d-block-major layout:
@@ -10,7 +10,7 @@ whose S x QC query rows (row s QC + h: slot s, head h) go 4 to a set of MMUL pan
 two sets to an octet. Per sub-step the core gets:
 
 - from the X stream (the others skip them: ``M_SKIP``): the ``F_ATT`` object [q_norm, k_norm (256 fp32 each) | cos, sin
-  per slot of the step (4 x 64 fp32)], the slots' q objects ([q | gate] x QC heads, bf16, as attn_in drained them),
+  per slot of the sub-step (up to 4 x 64 fp32)], the slots' q objects ([q | gate] x QC heads, bf16, as attn_in drained them),
   then the slots' raw K, V objects ([K 256 | V 256] per KV head, bf16);
 - from the A stream (broadcast from the main core's, whose objects it skips; two buffers: an object streams in while
   the core works on the last one): the cache of its head up to the sub-step's group, then (a core that attends to that
@@ -88,8 +88,8 @@ MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E = range(56, 62)
 
 
 # metadata words of an F_ATT object: decode.py's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A
-# objects and the tail objects), M_NREL (R objects to relay), M_POS (the first slot's position), M_SA (its slot in the
-# step), M_ATREC (record mode: the first tail object is the open record's V panels), M_NTAIL (tail objects)
+# objects and the tail objects), M_NREL (R objects to relay), M_POS (the first slot's position), M_SA (the first slot's
+# row of angles in the object: 0, each sub-step's object holds its own slots'), M_ATREC (record mode: the first tail object is the open record's V panels), M_NTAIL (tail objects)
 
 # state words of the attention core (the first ones are trip counts of its program). A_NOBJ: the A objects before the
 # held ones; A_NKH: the sub-step group's K objects after the tails (a chain's first column, not split); A_NRM, A_VN, A_GS,
@@ -848,7 +848,9 @@ class AttnShape:
     slots of a sub-step and their query-row sets, the cache's capacity, the workspace and its regions in the main core's
     memory."""
 
-    def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096):
+    def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
+                 slots: int = SMAX):
+        """slots: a step's slots at most (its sub-steps of up to ``sub``: SMAX at most)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.kvh = cfg.num_key_value_heads
         assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay
@@ -861,7 +863,7 @@ class AttnShape:
         # the gates: then the core takes more rows)
         self.sub = min(SMAX, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
         assert self.sub >= 1
-        self.u = -(-(SMAX - 1) // self.sub) + 1
+        self.u = -(-(slots - 1) // self.sub) + 1  # (a step's sub-steps at most)
         self.rows = self.sub * self.nph * self.qc  # (a sub-step's query rows at most)
         self.main_gates = self.rows > MAX_ROWS
         self.octets = -(-self.rows // 8)

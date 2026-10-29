@@ -34,15 +34,15 @@ NAMES = ("attn_norm|linear_attn_qkv_mixed|z|alpha|beta|final_output|attn_residua
 class _Phases:
     """One phase per dispatch on the overlay's main and helper cores (inputs shared by the columns)."""
 
-    def __init__(self, path: str, layers: list[int]):
-        self.path = path
+    def __init__(self, path: str, layers: list[int], slots: int = OD.SLOTS):
+        self.path, self.slots = path, slots
         self.g = GGUFFile(path)
         self.cfg = cfg = ref.QwenConfig.from_gguf(self.g)
         self.H = cfg.hidden_size
         self.img = img = QwenImage(self.g, cfg, layers=layers, vocab=COLS * 1024)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
         self.op = MD.QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in fmts}, tile_bytes=img.tile_bytes,
-                                         eps=cfg.rms_norm_eps)
+                                         eps=cfg.rms_norm_eps, slots=slots)
         self.dev = dev = OverlayDevice(self.op)
         img.pack(dev.alloc("W", img.nbytes), release=False)
         dev.flush("W")
@@ -58,23 +58,23 @@ class _Phases:
     def run(self, region: object, x: np.ndarray, flags: int, *, norm: str | None = None,
             resid: np.ndarray | None = None, f32_ab: bool = False) -> np.ndarray:
         """x (S, K) bf16 values; resid (S, H) fp32. Returns the outputs (COLS, S, objects x C_LEN) as raw bf16 bits."""
-        dev, op, S = self.dev, self.op, x.shape[0]
-        groups = mp.groups(region, flags, S, f32_ab=f32_ab)
+        dev, op, S, slots = self.dev, self.op, x.shape[0], self.slots
+        groups = mp.groups(region, flags, S, f32_ab=f32_ab, slots=slots)
         act = dev.view("ACT")
         act[:] = 0
         h8 = self.H // COLS
         inputs, off = [], 0
         for gr in groups:  # per group its region [metadata object | x interleaved]
             act[off:off + 4 * OD.META] = gr.meta.view(np.uint8)
-            xi = OD.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K])
-            act[off + OD.XB:off + OD.region_bytes(gr.K)] = xi.view(np.uint8).reshape(-1)
+            xi = OD.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K], slots)
+            act[off + OD.XB:off + OD.region_bytes(gr.K, slots)] = xi.view(np.uint8).reshape(-1)
             inputs.append((off, gr.K))
-            off += -(-OD.region_bytes(gr.K) // 64) * 64
+            off += -(-OD.region_bytes(gr.K, slots) // 64) * 64
         loadr = off
         if resid is not None:  # per column and slot an F_LOADR object
             for c in range(COLS):
                 for s in range(S):
-                    o = loadr + (c * OD.SLOTS + s) * OD.XB
+                    o = loadr + (c * slots + s) * OD.XB
                     act[o:o + 4 * OD.META] = mp.loadr_meta(s).view(np.uint8)
                     act[o + 4 * OD.META:o + 4 * OD.META + 4 * h8] = \
                         np.asarray(resid[s, h8 * c:h8 * (c + 1)], np.float32).view(np.uint8)
@@ -88,7 +88,7 @@ class _Phases:
             n_norm = len(objs)
             dev.flush("NORM")
         n_obj = mmv.out_objects(region, flags, self.H, f32_ab=f32_ab)
-        assert OD.SLOTS * n_obj * 2 * OD.C_LEN <= self.ob
+        assert slots * n_obj * 2 * OD.C_LEN <= self.ob
         seq = Sequence(op, rolling=True)
         for c in range(COLS):  # drains [slot][objects]: object j of every slot, then j + 1
             seq.drain("C", c, dev.address("OUT", c * self.ob), S * n_obj * 2 * OD.C_LEN,
@@ -96,9 +96,9 @@ class _Phases:
         for c in range(COLS):
             if resid is not None:
                 for s in range(S):
-                    seq.fill("X", c, dev.address("ACT", loadr + (c * OD.SLOTS + s) * OD.XB), OD.XB)
+                    seq.fill("X", c, dev.address("ACT", loadr + (c * slots + s) * OD.XB), OD.XB)
             for i, gr in enumerate(groups):
-                nbytes, dims = OD.input_fill(gr.K)
+                nbytes, dims = OD.input_fill(gr.K, slots, slots)
                 seq.fill("X", c, dev.address("ACT", inputs[i][0]), nbytes, dims)
                 if n_norm and i == 0:
                     seq.fill("A", c, dev.address("NORM"), n_norm * op.tile_bytes)
@@ -232,22 +232,23 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
     check.done()
 
 
-@pytest.fixture(scope="module")
-def setup27() -> tuple[_Phases, int, int]:
+@pytest.fixture(scope="module", params=[4, 8])
+def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
     path = ref.qwen_gguf("Q4_K_M", "27B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
     Lg, La = cfg.gdn_layers[0], cfg.attention_layers[0]
-    return _Phases(path, [Lg, La]), Lg, La
+    return _Phases(path, [Lg, La], request.param), Lg, La
 
 
-@pytest.mark.parametrize("phase", ["gdn_in", "attn_in", "attn_out", "down"])
+@pytest.mark.parametrize("phase", ["gdn_in", "attn_in", "attn_out", "down", "gate_up"])
 def test_phase_27b(setup27: tuple, phase: str) -> None:
     """The 27B's K groups (attn_out: 6 chunks as 3 + 3, down: 17 chunk-major as 5 + 5 + 5 + 2; gdn_in: Q6_K qkv) on
-    random inputs, against the cores' numerics."""
+    random inputs, against the cores' numerics: S 3 on the 4-slot design, S 8 on the 8-slot one (x as single bfp16
+    rows, ``decode.gemv``)."""
     P, Lg, La = setup27
-    S, H = 3, P.H
+    S, H, slots = (3 if P.slots == 4 else 8), P.H, P.slots
     h8 = H // COLS
     rng = np.random.default_rng(1)
     L = La if phase.startswith("attn") else Lg
@@ -258,14 +259,26 @@ def test_phase_27b(setup27: tuple, phase: str) -> None:
         xn, inv = mmv.norm_input(x, P.norm_w(norm), P.cfg.rms_norm_eps)
         out = P.run(r, x, OD.F_NORM, norm=norm)
         for c in range(COLS):
-            kern = np.concatenate([mmv.bf(y * inv[:, None]) for y in mmv.ref_rows(P.img, r, c, xn)], -1)
+            kern = np.concatenate([mmv.bf(y * inv[:, None]) for y in mmv.ref_rows(P.img, r, c, xn, slots)], -1)
             got = _bf16(out[c, :, :kern.shape[1]])
             assert ref.rel_err(got, kern) < 4e-3, (c, ref.rel_err(got, kern))
+        return
+    if phase == "gate_up":
+        norm = f"blk.{L}.post_attention_norm.weight"
+        xn, inv = mmv.norm_input(x, P.norm_w(norm), P.cfg.rms_norm_eps)
+        out = P.run(r, x, OD.F_NORM | OD.F_GU, norm=norm)
+        ffn = P.cfg.intermediate_size // COLS
+        for c in range(COLS):
+            y = mmv.ref_rows(P.img, r, c, xn, slots)[0].reshape(S, -1, 2, 8) * inv[:, None, None, None]
+            kern = mmv.bf(kmath_sim.emulate(kmath.act(kmath.SILU), mmv.bf(y[:, :, 0])).astype(np.float64)
+                          * y[:, :, 1]).reshape(S, -1)
+            got = _bf16(out[c, :, :ffn])
+            assert ref.rel_err(got, kern) < 1e-2, (c, ref.rel_err(got, kern))
         return
     resid = rng.standard_normal((S, H)).astype(np.float32)
     out = P.run(r, x, OD.F_RESID | OD.F_EMITR, resid=resid)
     for c in range(COLS):
-        kern = mmv.bf(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(P.img, r, c, x)[0])
+        kern = mmv.bf(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(P.img, r, c, x, slots)[0])
         assert ref.rel_err(_bf16(out[c, :, :h8]), kern) < 4e-3, (c, ref.rel_err(_bf16(out[c, :, :h8]), kern))
 
 
@@ -675,8 +688,8 @@ def interleave_bits(v: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy"])
-@pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B"])
+@pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "s7", "lazy8"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
     token (s1), three committed tokens (s3), or four tokens of which two are accepted (lazy: the next step replays
@@ -686,12 +699,16 @@ def test_overlay_slice(size: str, mode: str) -> None:
     weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's
     routing differs from llama.cpp's (a near tie of its 8th and 9th logits) its layer output moves by 10-40%; none here
     (0.5-0.9% on average, 3.4% at most). Occamy (its Q3_K experts in these layers) within the 35B-A3B's bounds: its
-    routing flips move a layer's output by up to ~2% (``test_moe_slice``)."""
+    routing flips move a layer's output by up to ~2% (``test_moe_slice``). Qwen3.8-27B on its design of 8 slots (x as
+    single bfp16 rows, ``decode.gemv``) also by steps of seven committed tokens (s7) and of eight tokens of which three
+    are accepted (lazy8)."""
     from models.qwen35.overlay import QwenOverlay
 
     path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
+    if mode in ("s7", "lazy8") and size != "3.8-27B":
+        pytest.skip("steps of more than 4 tokens: designs of 8 slots")
     La = ref.QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
     n, layers = 104 if mode == "split" else 34, list(range(La + 1))
     tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
@@ -702,7 +719,8 @@ def test_overlay_slice(size: str, mode: str) -> None:
     t = 0
     while t < n:
         S, commit, acc = {"s1": (1, True, 1), "s3": (min(3, n - t), True, min(3, n - t)),
-                          "lazy": (min(4, n - t), False, min(2, n - t)), "split": (2, True, 2)}[mode]
+                          "lazy": (min(4, n - t), False, min(2, n - t)), "split": (2, True, 2),
+                          "s7": (min(7, n - t), True, min(7, n - t)), "lazy8": (min(8, n - t), False, min(3, n - t))}[mode]
         x = ov.gguf.rows("token_embd.weight", tokens[t:t + S])
         if t == 0:
             assert np.array_equal(x[0].numpy(), np.asarray(G_["model.input_embed"][0], np.float32))
@@ -714,7 +732,8 @@ def test_overlay_slice(size: str, mode: str) -> None:
         ov.accept(acc)
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split")
-    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2)}[size]
+    top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
+                 "3.8-27B": (5.6e-2, 2.1e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 

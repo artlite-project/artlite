@@ -1,9 +1,9 @@
 """Draft tokens from the context for a generation's multi-token steps (prompt lookup), and the choice of a step's
 drafts by the tokens per second they are expected to give.
 
-A step of S <= 4 tokens streams the weights once, so the tokens it checks along with the sampled one cost little on a
-dense model (+2-35% for 4 on Strix Halo at 1K, more at long contexts, where the attention runs per token) and more on
-an MoE (the slots route to different experts: ~+30% per slot). A draft is kept where the token sampled from the
+A step of S <= SLOTS (4, or 8) tokens streams the weights once, so the tokens it checks along with the sampled one
+cost little on a dense model (+2-35% for 4 on Strix Halo at 1K, more at long contexts, where the attention runs per
+token) and more on an MoE (the slots route to different experts: ~+30% per slot). A draft is kept where the token sampled from the
 model's logits at its position is that draft: the text is the model's, sampled as without drafts.
 
 ``Lookup``: the longest suffix of the sequence so far (the prompt and the generated tokens, at most ``NMAX``) that
@@ -29,8 +29,9 @@ NMAX = 32  # a match's tokens at most
 # P(the i-th context draft is accepted | the ones before it were) after a match of m tokens, per bucket of m (1, 2, 3,
 # 4, 5, 6-8, 9-16, 17 on): agent sessions' (Claude Code, Codex and opencode on Qwen3.6-35B-A3B, temperature 1)
 BUCKETS = (0, 0, 1, 2, 3, 4, 5, 5, 5)  # (m <= 8: its bucket; then 6 up to 16, 7 above)
-PRIOR = np.array([(0.23, 0.46, 0.55), (0.36, 0.54, 0.62), (0.44, 0.59, 0.65), (0.51, 0.64, 0.70), (0.62, 0.70, 0.77),
-                  (0.72, 0.78, 0.82), (0.81, 0.82, 0.83), (0.89, 0.91, 0.92)])
+# (drafts past the third: the third's, up to an 8-slot step's 7)
+PRIOR = np.pad(np.array([(0.23, 0.46, 0.55), (0.36, 0.54, 0.62), (0.44, 0.59, 0.65), (0.51, 0.64, 0.70), (0.62, 0.70, 0.77),
+                         (0.72, 0.78, 0.82), (0.81, 0.82, 0.83), (0.89, 0.91, 0.92)]), ((0, 0), (0, 4)), mode="edge")
 PRIOR_N = 8  # the prior's weight in rounds
 EWMA = 0.2  # a new measurement's weight in a running average
 WARM = 4  # a drafter's rounds before its rate competes (its drafts until then)
@@ -93,8 +94,8 @@ class Lookup:
 
 
 class Planner:
-    """A model's choice of each round's drafts (module docstring): ``cost``, a step of S = 1 .. 4 tokens' time relative
-    to one's until measured."""
+    """A model's choice of each round's drafts (module docstring): ``cost``, a step of S = 1 .. SLOTS tokens' time
+    relative to one's until measured."""
 
     def __init__(self, cost: tuple[float, ...]):
         self.cost = cost

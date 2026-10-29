@@ -44,6 +44,7 @@ import numpy as np
 import torch
 
 from artlite import txn
+from artlite.decode import gemv
 from artlite.decode import phases as mp
 from artlite.decode.design import (
     B_F32,
@@ -75,7 +76,6 @@ from artlite.decode.design import (
     META,
     NX_PER_NORM,
     OBJ_K,
-    SLOTS,
     XB,
     XPAY,
     interleave,
@@ -135,6 +135,13 @@ class _Step:
         self.drains: list[tuple[list[int], int, int, int, int]] = []
 
 
+def slots_of(cfg: QwenConfig, fmts: set[str]) -> int:
+    """A step's token slots at most: 8 for a dense model with its own MTP block (its drafter's chains go deep: the
+    verify's slots pay where the drafter is right) whose formats the decode GEMV runs at 8 slots (``decode.gemv``),
+    else 4."""
+    return 8 if cfg.nextn_layers == 1 and not cfg.moe and all(gemv.supported(f, 4, 8) for f in fmts) else 4
+
+
 def _text_rope(n: int) -> np.ndarray:
     return np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
 
@@ -154,22 +161,27 @@ class QwenOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 image: QwenImage | None = None):
+                 image: QwenImage | None = None, slots: int | None = None):
+        """slots: a step's token slots at most (default ``slots_of``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
+        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
+        slots = slots or slots_of(cfg, fmts)
         att = [cfg.attention[L] for L in self.layers]
-        self.gsh = gdn.GdnShape(cfg) if not all(att) else None
-        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes) if any(att) else None
+        self.gsh = gdn.GdnShape(cfg, slots=slots) if not all(att) else None
+        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
-        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
-                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16))
+                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16),
+                                      slots=slots)
+        self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
+        self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
@@ -182,10 +194,11 @@ class QwenOverlay(ModelOverlay):
     # ------------------------------------------------------------------
 
     def _flags(self, L: int, name: str) -> int:
-        return FLAGS[name]
+        return self.flags[name]
 
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
-        return mp.groups(self.image.region(L, name), FLAGS[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None)
+        return mp.groups(self.image.region(L, name), self.flags[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None,
+                         f32_ab=name == "gdn_in" and self.g8, slots=self.SLOTS)
 
     def _meta(self, L: int, name: str, rg: object, m: np.ndarray) -> np.ndarray:
         if name == "sdown":  # (its panels in the side chunk: the expert's gate / up reads moe_in's)
@@ -231,9 +244,9 @@ class QwenOverlay(ModelOverlay):
         cfg = self.cfg
         self._layout = dict.fromkeys(("ACT", "NORM", "GOBJ", "GSTATE", "KV", "GHDR"), 0)
         take = self._take
-        self.loadr = take("ACT", COLS * SLOTS * XB)  # [column][slot]
+        self.loadr = take("ACT", COLS * self.SLOTS * XB)  # [column][slot]
         for L, name in self._phases():  # (gdn_out: the GDN pads' sink past each x)
-            self._add_inputs((L, name), extra=2 * SLOTS if name == "gdn_out" else 0)
+            self._add_inputs((L, name), extra=2 * self.SLOTS if name == "gdn_out" else 0)
         self.norm_off: dict[tuple[int, str], int] = {}
         self.n_norm = -(-self.H // (NX_PER_NORM * OBJ_K))  # norm-weight A objects of a phase
         nw = 2 * NX_PER_NORM * OBJ_K * (self.n_norm - 1) + self.T  # (the last object's extent)
@@ -245,13 +258,13 @@ class QwenOverlay(ModelOverlay):
         self.hslot = HSLOT
         if self.gsh is not None:
             self.npair = self.gsh.hc // 2
-            self.gcol = 256 + XPAY * (5 + 3 * self.npair)
+            self.gcol = 256 + XPAY * (self.gsh.n_slots if self.g8 else 5 + 3 * self.npair)
             self.ps = self.gsh.hc * 16 * gdn.PANEL
             take("GSTATE", 256)  # (the first panel object's header bytes)
         for L in self.layers:
             if cfg.attention[L]:  # ([column][F_ATT per sub-step], then [column][q objects SLOTS])
-                self.fatt[L] = take("ACT", COLS * (self.ash.u + SLOTS) * XB)
-                self.rawkv[L] = take("ACT", SLOTS * XB)
+                self.fatt[L] = take("ACT", COLS * (self.ash.u + self.SLOTS) * XB)
+                self.rawkv[L] = take("ACT", self.SLOTS * XB)
                 self.kv_off[L] = take("KV", self.ash.kvh * self.ash.head_bytes)
             else:
                 self.gobj[L] = take("GOBJ", COLS * self.gcol)
@@ -276,7 +289,7 @@ class QwenOverlay(ModelOverlay):
         """PART's bytes per column: the combine's metadata object, then per slot the 8 columns' partials of the
         column's slice ([slot][column][hidden / 8] bf16: one object's payload per slot)."""
         assert self.H * 2 == XPAY, "a slot's partials of a slice in one X object's payload"
-        return XB + SLOTS * XPAY
+        return XB + self.SLOTS * XPAY
 
     def ring(self, L: int, h: int) -> int:
         """Byte offset in KV of KV head h's ring of attention layer L: 2 slots of T bytes, slot r & 1 the V values of
@@ -289,10 +302,11 @@ class QwenOverlay(ModelOverlay):
 
     def _q(self, L: int, c: int, s: int) -> int:
         """ACT offset of column c's q object of slot s of layer L."""
-        return self.fatt[L] + (COLS * self.ash.u + c * SLOTS + s) * XB
+        return self.fatt[L] + (COLS * self.ash.u + c * self.SLOTS + s) * XB
 
     def _gpay(self, L: int, c: int, k: int) -> int:
-        """GOBJ offset of layer L's column c's object k's payload (k: conv q / k 0 .. 3, K 4, pair p 5 + 3 p ..)."""
+        """GOBJ offset of layer L's column c's object k's payload (k: conv q / k 0 .. 3, K 4, pair p 5 + 3 p ..; 8 slots:
+        its payload slot, ``gdn``'s "8 slots")."""
         return self.gobj[L] + c * self.gcol + 256 + XPAY * k
 
     # ------------------------------------------------------------------
@@ -341,6 +355,13 @@ class QwenOverlay(ModelOverlay):
             o = self.gobj[L] + c * self.gcol
             gobj[o:o + self.gcol] = 0
             gobj[o:o + 4 * META] = m.view(np.uint8)
+            if self.g8:  # (the header's dt, A, ssm_norm; per conv block its weights)
+                h = self._gpay(L, c, gdn.H_SLOT) + gdn.H_PRM
+                gobj[h:h + 640] = gdn.head_payload(dt[vh], A[vh], norm)
+                for b, w in enumerate(gdn.conv_weights(cw[rows])):
+                    a = self._gpay(L, c, sh.block_slot(b))
+                    gobj[a:a + w.size] = w
+                continue
             for b, pay in enumerate(gdn.conv_payloads(sh, cw[rows], dt[vh], A[vh], norm)):
                 k = b if b < 4 else 5 + 3 * ((b - 4) // 2) + (b - 4) % 2
                 gobj[self._gpay(L, c, k):self._gpay(L, c, k) + XPAY] = pay
@@ -383,7 +404,7 @@ class QwenOverlay(ModelOverlay):
         """(ACT offset of input element e's k block in a phase's x, the bytes left in its K group's x)."""
         for rg in self.inp[phase]:
             if rg.k0 <= e < rg.k0 + rg.K:
-                return rg.off + XB + 8 * (e - rg.k0), 8 * (rg.k0 + rg.K - e)
+                return rg.off + XB + 2 * self.SLOTS * (e - rg.k0), 2 * self.SLOTS * (rg.k0 + rg.K - e)
         raise ValueError(e)
 
     def _phase(self, seq: Sequence, phase: tuple[int, str], S: int, to: tuple[int, str] | str | None) -> None:
@@ -408,6 +429,9 @@ class QwenOverlay(ModelOverlay):
 
     def _gdn(self, seq: Sequence, L: int, S: int) -> None:
         """gdn_in and the GDN step."""
+        if self.g8:
+            self._gdn8(seq, L, S)
+            return
         dev, MG, sh = self.dev, gdn, self.gsh
         self._weights(seq, (L, "gdn_in"), 0)
         seq.sync()
@@ -434,6 +458,74 @@ class QwenOverlay(ModelOverlay):
                 assert left >= 2048
                 seq.drain("D", c, dev.address("ACT", at), MG.D_BYTES, (512, 2, xg // 4, 1024))
         assert sh.ch == (4 + sh.hc) * gdn.D
+
+    def _gdn8(self, seq: Sequence, L: int, S: int) -> None:
+        """gdn_in and the GDN step of an 8-slot design (``gdn``'s "8 slots"): gdn_in's rows per slot into the conv
+        blocks' second objects, z into the v heads' Z objects, ab into the header (a sync), then per k head its group
+        and per v head its group and panels, each round over the columns before its drains (the D objects that the
+        core's later X objects wait for)."""
+        dev, sh, hc = self.dev, self.gsh, self.gsh.hc
+        X = XPAY // 4  # (words)
+        self._weights(seq, (L, "gdn_in"), 0)
+        seq.sync()
+        self._inputs(seq, self.inp[(L, "gdn_in")][0], S)
+        # (a block's objects (half, slot) as [half][slot 8][64]: half 0's S rows, then half 1's 1 KB on; per execution its
+        # pair of blocks of the two k heads, or the 6 v blocks; then the next: k after q, z after v)
+        hb = 2 * 64 * 8 // 4  # (words between the halves)
+        for c in range(COLS):
+            pay = lambda k, c=c: dev.address("GOBJ", self._gpay(L, c, k))
+            b0 = pay(sh.block_slot(0) + 1) + 3 * 2 * gdn.D  # (q0's rows)
+            seq.drain("C", c, b0, 2 * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.KH_SPAN * X), 2,
+                      ((pay(sh.block_slot(2)) - pay(sh.block_slot(0))) // 4, 2))  # q, then k rows
+            v0 = pay(sh.block_slot(4) + 1) + 3 * 2 * gdn.D
+            seq.drain("C", c, v0, hc * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.V_SPAN * X), 2,
+                      ((pay(sh.v_slot(0) + 3) - v0) // 4, 2))  # v rows, then z
+            seq.drain("C", c, pay(gdn.H_SLOT) + gdn.H_AB, 2 * S * C_LEN)  # ab
+        seq.sync()
+        vh = [gdn_v_heads(self.cfg, c) for c in range(COLS)]
+        last = hc - 1  # (the last v head the core runs: k head 1's last)
+
+        def kh_x(kh: int, c: int) -> None:  # (k head 0's group after the header)
+            g0 = sh.kh_slot(kh) - (1 if kh == 0 else 0)
+            seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, g0) - 256), (gdn.KH_SPAN + 1 - kh) * XB, DIMS_OBJ)
+
+        def kh_d(kh: int, c: int) -> None:  # (its q, k histories, its K object)
+            a = dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh)) + 2048)
+            seq.drain("D", c, a, 2 * gdn.D_BYTES, (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, 2 * X))
+            seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh) + 4)), gdn.D_BYTES)
+
+        def v_x(h: int, c: int) -> None:  # (its group, its panels)
+            seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) - 256), gdn.V_SPAN * XB, DIMS_OBJ)
+            seq.fill("X", c, dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL - 256), 16 * XB,
+                     DIMS_OBJ)
+
+        def v_d(h: int, c: int) -> None:
+            v = self._gpay(L, c, sh.v_slot(h))
+            seq.drain("D", c, dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL), 16 * gdn.PANEL)
+            seq.drain("D", c, dev.address("GOBJ", v + 2048), 2 * gdn.D_BYTES,  # its history, its deltas
+                      (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
+            # its gated outputs (2 KB) at its head in gdn_out's x, the step's d per token after them (2 KB): of the last
+            # head into the header, else into the sink past that K group's x
+            at, left = self._x_at((L, "gdn_out"), gdn.D * vh[c][h])
+            xg = next(2 * self.SLOTS * rg.K for rg in self.inp[(L, "gdn_out")] if rg.k0 <= gdn.D * vh[c][h] < rg.k0 + rg.K)
+            assert left >= 2048
+            if h == last:
+                seq.drain("D", c, dev.address("ACT", at), gdn.D_BYTES // 2)
+                seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, gdn.H_SLOT) + gdn.H_DOLD), gdn.D_BYTES // 2)
+            else:
+                seq.drain("D", c, dev.address("ACT", at), gdn.D_BYTES, (512, 2, xg // 4, 512))
+
+        # the core's units in its order (per k head its group, then its v heads), each unit's fills one unit ahead of
+        # the drains of the one before (a channel's fifth task waits for its oldest: the core then has its next objects
+        # queued while the firmware waits for drains)
+        units = [u for kh in range(2) for u in [(kh_x, kh_d, kh)] + [(v_x, v_d, h) for h in range(kh, hc, 2)]]
+        for i in range(len(units) + 1):
+            if i < len(units):
+                for c in range(COLS):
+                    units[i][0](units[i][2], c)
+            if i:
+                for c in range(COLS):
+                    units[i - 1][1](units[i - 1][2], c)
 
     def _runs(self, lm: bool) -> list[list[tuple[int, str]]]:
         """A column-major step's weight runs: its phases up to the first attention's attn_in, then from each
@@ -489,7 +581,7 @@ class QwenOverlay(ModelOverlay):
                 seq.fill("X", c, dev.address("ACT", self._fatt(L, c, u)), XB)
                 if split:  # (the q objects of the chain's columns, in order)
                     seq.fill("X", c, dev.address("ACT", self._q(L, c - c % nph, a)), nph * n * XB,
-                             (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
+                             (XB // 8, 2 * n, XB // 8, self.SLOTS * XB // 4))
                 else:
                     seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
                 seq.fill("X", c, dev.address("ACT", self.rawkv[L] + a * XB), n * XB)
@@ -501,9 +593,10 @@ class QwenOverlay(ModelOverlay):
                 if not split or role == attn.ROLE_V:
                     h0, nh = (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc)
                     at, left = self._x_at((L, "attn_out"), attn.HD * h0)
-                    assert left >= 2048 * nh
+                    assert left >= 4 * self.SLOTS * 128 * nh
+                    sw = 4 * self.SLOTS  # (words of an x k block: [slot][8] bf16)
                     seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * n * 32 * nh,
-                              None if n == SLOTS else (4 * n, 32 * nh, 16, 16 * 32 * nh))
+                              None if n == self.SLOTS else (4 * n, 32 * nh, sw, sw * 32 * nh))
                 sizes = {attn.ROLE_K: (attn.REC_K,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
                 for k, nb in enumerate(sizes):  # (a V record's panels into its pair: V_SCATTER)
                     dims = attn.V_SCATTER if role == attn.ROLE_V and k % 2 == 0 else None
@@ -565,7 +658,7 @@ class QwenOverlay(ModelOverlay):
                 for lk in (MR.LOCK_CP, MR.LOCK_DONE):
                     seq.txn.write32(txn.tile_address(c, 0, txn.SHIM_LOCK0 + 16 * lk), 0)
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
+            seq.fill("X", c, dev.address("ACT", self.loadr + c * self.SLOTS * XB), S * XB)
         runs = self._runs(lm) if self.image.column_major else []
         if runs:
             self._weight_run(seq, runs[0])
@@ -615,7 +708,7 @@ class QwenOverlay(ModelOverlay):
         dev, ash, T = self.dev, self.ash, self.T
         nph = ash.nph
         act = dev.view("ACT")
-        cs = np.zeros((SLOTS, 64), np.float32)
+        cs = np.zeros((S, 64), np.float32)
         for s in range(S):
             cs[s] = np.concatenate(attn.rope_cs(self.cfg, self.rope[p + s]))
         groups, rec_mode = [], {}
@@ -635,7 +728,7 @@ class QwenOverlay(ModelOverlay):
                     m = act[o:o + 4 * META].view(np.int32)
                     k = c % nph
                     nt = attn.TAILS if not split or ash.role(c) == attn.ROLE_V else 0
-                    m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, a, (nph + 1 if split else 2) * n, int(split)
+                    m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, 0, (nph + 1 if split else 2) * n, int(split)
                     m[M_NREL], m[M_NTAIL], m[M_ATREC] = ash.n_rel(c, split, n), nt, int(rec_mode[L] and u == 0)
                     if not split:  # (a chain's first column: then group g's K objects again, for its K records)
                         m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * G + nt + (2 if k == 0 else 0), 0, 1 << 20, 0
@@ -643,8 +736,8 @@ class QwenOverlay(ModelOverlay):
                         m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * b[1] + 2, 0, b[1], g
                     else:
                         m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
-                    q0 = o + 4 * META + 4 * 2 * attn.HD
-                    act[q0:q0 + cs.nbytes] = cs.view(np.uint8).reshape(-1)
+                    q0 = o + 4 * META + 4 * 2 * attn.HD  # (the sub-step's slots' angles)
+                    act[q0:q0 + 4 * 64 * n] = cs[a:a + n].view(np.uint8).reshape(-1)
         for L in self.fatt:
             dev.flush("ACT", self.fatt[L], COLS * self.ash.u * XB)
         w = st.tr.words
@@ -697,7 +790,7 @@ class QwenOverlay(ModelOverlay):
         or without ``logits`` None."""
         x = x.reshape(-1, self.H).float()
         S = x.shape[0]
-        assert 1 <= S <= SLOTS
+        assert 1 <= S <= self.SLOTS
         assert self._committed or self._accepted, "accept() the previous lazy step's tokens first"
         self._conv_for_decode()
         if self._metas_s != (S, self.start):
@@ -706,7 +799,7 @@ class QwenOverlay(ModelOverlay):
         self._committed = commit
         xf = x.numpy()
         self._write_loadr(xf)
-        self._write_input(self.inp[self._input(self.layers[0])][0], interleave(xf).view(np.uint8).reshape(-1))
+        self._write_input(self.inp[self._input(self.layers[0])][0], interleave(xf, self._sp(S)).view(np.uint8).reshape(-1))
         out = self._run(S, position, logits)
         self._accepted = False
         if commit:  # (all S accepted)
@@ -726,6 +819,8 @@ class QwenOverlay(ModelOverlay):
             b = j // gdn.D
             k = np.where(b < 4, b, 5 + 3 * ((b - 4) // 2) + (b - 4) % 2)
             src, dst = [], []
+            if self.g8:  # (the history's rows from the A object's second half on, through the B object's)
+                k = np.array([self.gsh.block_slot(int(i)) for i in b])
             for L in self.gobj:
                 for c in range(COLS):
                     src.append(self._gpay(L, c, 0) + XPAY * k + 2048 + 2 * (gdn.D * r + j % gdn.D))
@@ -816,8 +911,8 @@ class QwenOverlay(ModelOverlay):
     def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""
         off = self.inp[self._input(L)][0].off + XB
-        self.dev.fetch("ACT", off, 8 * self.H)
-        v = self.dev.view("ACT")[off:off + 8 * self.H].view(np.uint16).reshape(-1, SLOTS, 8)[:, slot].reshape(-1)
+        self.dev.fetch("ACT", off, 2 * self.SLOTS * self.H)
+        v = self.dev.view("ACT")[off:off + 2 * self.SLOTS * self.H].view(np.uint16).reshape(-1, self.SLOTS, 8)[:, slot].reshape(-1)
         return torch.from_numpy(v.copy()).view(torch.bfloat16).float()
 
 

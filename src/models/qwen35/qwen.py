@@ -1,9 +1,9 @@
 """Qwen3.5 / Qwen3.6 (GGUF architectures ``qwen35``: Gated DeltaNet and full-attention layers, and ``qwen35moe``: the
 same with a mixture of experts as the FFN) on the NPU.
 
-A dispatch runs up to 4 tokens through every layer and the LM head on one stream of the weights
-(``models.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers (the MMUL
-against exact-integer weight panels), the Gated DeltaNet steps (conv states and fp32 states in DDR) on the GDN cores,
+A dispatch runs up to 4 tokens (Qwen3.8-27B: 8, ``overlay.slots_of``) through every layer and the LM head on one
+stream of the weights (``models.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers
+(the MMUL against exact-integer weight panels), the Gated DeltaNet steps (conv states and fp32 states in DDR) on the GDN cores,
 the full attention and its KV cache on the attention cores. The host reads the tokens' embedding rows from the mapped
 file and samples from the logits.
 
@@ -18,7 +18,7 @@ start (a position inside a 32-position cache group, after a generated reply), an
 decode steps of up to 4 tokens. An MoE model's chunk routes its tokens on the host between the router and the experts
 (``artlite.moe.prefill``).
 
-Multi-token steps (``OverlayModel.generate``): the sampled token's step takes up to three draft tokens along - the
+Multi-token steps (``OverlayModel.generate``): the sampled token's step takes up to SLOTS - 1 draft tokens along - the
 context's (``models.drafts``), or with an MTP drafter (``models.qwen35.draft.QwenDraft``: a Qwen3.8 file's own block, a
 qwen35moe model's MTP file, ``model_config.qwen_mtp_of``) its guesses of what follows, a dispatch of the same design
 each (2.4-3.4 ms on the 35B-A3B), while their chain's probability pays for the step's slot and the drafter's step
@@ -41,7 +41,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
-from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
 from artlite.overlay import WeightBuffer
@@ -84,10 +83,11 @@ class NpuQwen(OverlayModel):
         self.eos_token_ids = self.cfg.eos_token_ids
         own = drafter == "" and self.overlay.image.draft_cols > 0  # (the file's own block)
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None
+        self.DRAFTS = self.overlay.SLOTS - 1
         if cfg.moe:
             self.STEP_COST = (1.0, 1.31, 1.60, 1.94)  # (35B-A3B at 1K: the slots route to different experts)
-        else:
-            self.STEP_COST = (1.0, 1.015, 1.03, 1.045)  # (27B at 1K: the weights stream once)
+        else:  # (27B at 1K: the weights stream once)
+            self.STEP_COST = (1.0, 1.015, 1.03, 1.045, 1.06, 1.075, 1.09, 1.105)[:self.overlay.SLOTS]
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
@@ -261,8 +261,8 @@ class NpuQwen(OverlayModel):
         h = torch.cat([self._h[None], hs[:-1]])
         self._pend += list(zip(self._x[:n], h, strict=True))
         self._h = hs[-1]
-        while len(self._pend) >= SLOTS:
-            self._run_pending(SLOTS)
+        while len(self._pend) >= self.overlay.SLOTS:
+            self._run_pending(self.overlay.SLOTS)
 
     def _draft_step(self, rows: list[tuple[torch.Tensor, torch.Tensor]], logits: bool) -> torch.Tensor | None:
         """A drafter step of rows at ``_dpos`` on (their records; the drafter's logits (n, vocab) bf16, or None)."""
@@ -286,7 +286,7 @@ class NpuQwen(OverlayModel):
         """(the drafter's records of the rows before the chunk first; the chunk's carry after decode steps)"""
         if self._drafting:
             while self._pend:
-                self._run_pending(SLOTS)
+                self._run_pending(self.overlay.SLOTS)
             if self.position and self._carry_at != self.position:
                 self.prefill.dp.carry_of(self._h)
         super()._prefill_run(args, T, n)
@@ -302,7 +302,7 @@ class NpuQwen(OverlayModel):
         with an end-of-sequence token)."""
         t0 = time.perf_counter()
         rows = [*self._pend, (self._rows([token])[0], self._h)]
-        assert self._dpos + len(rows) == self.position + 1 and len(rows) <= SLOTS
+        assert self._dpos + len(rows) == self.position + 1 and len(rows) <= self.overlay.SLOTS
         self._pend = []
         raw = self._draft_step(rows, logits=n > 0)
         out: list[int] = []

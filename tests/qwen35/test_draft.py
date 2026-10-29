@@ -26,8 +26,11 @@ N = 100
 # Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median; the
 # 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%)
 TOL = {"35B-A3B": (0.01, 7e-3, 1.5e-2), "occamy": (0.02, 1.5e-2, 2.5e-2), "3.8-27B": (0.0, 1.5e-2, 3e-2)}
+# (designs of 8 slots: x as single bfp16 rows, ``decode.gemv``; the 27B's h 1.4% median, 4.3% at most)
+TOL8 = {"3.8-27B": (0.0, 2e-2, 5e-2)}
 SIZES = ["35B-A3B", "occamy", "3.8-27B"]
 PREFILL_TOL = {"3.8-27B": (1.5e-2, 3e-2)}  # (test_draft_prefill's records and carry, where not 1% and 2%)
+PREFILL_TOL8 = {"3.8-27B": (2.5e-2, 3e-2)}  # (designs of 8 slots: the steps' records 1.7% from the prefill's)
 
 
 def _files(size: str) -> tuple[str, str]:
@@ -68,7 +71,7 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     target.load()
     draft.load()
     r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.ids)
-    tie, *tol = TOL[request.param]
+    tie, *tol = (TOL8 if draft.SLOTS == 8 else TOL)[request.param]
     tied = np.zeros(N, bool)
     if cfg.moe:
         t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
@@ -77,11 +80,14 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     return draft, torch.from_numpy(emb), torch.from_numpy(h), r, tied, tol
 
 
-@pytest.mark.parametrize("S", [1, 3, 4])
+@pytest.mark.parametrize("S", [1, 3, 4, 8])
 def test_draft_steps(setup: tuple, S: int) -> None:
     """Rows within 1.5% rms of the oracle's h (median 0.5%) but where the router's 8th and 9th experts tie within 1%
-    (Occamy's: ``TOL``); the head's argmax the oracle's on those rows where its top two logits are 0.1 apart."""
+    (Occamy's: ``TOL``); the head's argmax the oracle's on those rows where its top two logits are 0.1 apart. S 8: the
+    designs of 8 slots (the 27B's)."""
     draft, emb, h, r, tied, (med, top) = setup
+    if S > draft.SLOTS:
+        pytest.skip(f"a design of {draft.SLOTS} slots")
     draft.reset()
     lg, hs = [], []
     for p in range(0, N, S):
@@ -102,7 +108,8 @@ def test_table(setup: tuple) -> None:
     seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
-    2% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks."""
+    2% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks (8 slots:
+    4%)."""
     draft, emb, h, r, tied, _ = setup
     d = draft if draft.w_of is not None else QwenDraft(draft.target, draft.gguf)  # (the model's own block: its buffer)
     if d is not draft:
@@ -120,7 +127,7 @@ def test_table(setup: tuple) -> None:
     w = d.gguf.rows("output.weight", d.ids[d.table_rows]).numpy().astype(np.float64)
     want = r["h_nextn"].astype(np.float64) @ w.T
     e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
-    assert e[~tied].max() < 2e-2, (np.median(e), e[~tied].max())
+    assert e[~tied].max() < (2e-2 if d.SLOTS == 4 else 4e-2), (np.median(e), e[~tied].max())  # (8 slots: 3.6%)
 
 
 def test_interleaved(setup: tuple) -> None:
@@ -141,16 +148,16 @@ def test_interleaved(setup: tuple) -> None:
 @pytest.mark.parametrize("size", SIZES)
 def test_draft_prefill(size: str) -> None:
     """Three 256-token chunks of an essay through the slice's prefill with the drafter's records (the carry between
-    chunks: the last row's h), then the drafter's step at the next position; the same step after drafter steps of 4
+    chunks: the last row's h), then the drafter's step at the next position; the same step after drafter steps of SLOTS
     rows wrote the records from the same inputs (the embeddings, the model's h of the prefill's output rows): within
     1% rms (h ~0.67%, logits ~0.69%: bfp16 vs bf16 roundings of the records' inputs), the same argmax. The last
     chunk's carry as the host computes it after decode steps (``carry_of``, fp32) within 2% of the device's (1.2%: its
     GEMM's bfp16 panels of hnorm(h)). The 27B (``PREFILL_TOL``): its hnorm(h) has a dimension at ~68 times its rms, whose
     bfp16 blocks cost 2.2% of the carry (2.4%), the records 1.1%."""
     model, mtp = _files(size)
-    rec, carry = PREFILL_TOL.get(size, (1e-2, 2e-2))
     T, nch = 256, 3
     target, draft = _slice(model, mtp, 4096)
+    rec, carry = (PREFILL_TOL8 if target.SLOTS == 8 else PREFILL_TOL).get(size, (1e-2, 2e-2))
     g = target.gguf
     pf = QwenPrefill(target, sizes=(T,), draft=draft)
     pf.compile()
@@ -175,8 +182,8 @@ def test_draft_prefill(size: str) -> None:
     a = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
     ha = draft.hidden_state(0).numpy()
     draft.reset()
-    for p in range(0, n, 4):
-        draft.step(emb[p:p + 4], hp[p:p + 4], p)
+    for p in range(0, n, draft.SLOTS):
+        draft.step(emb[p:p + draft.SLOTS], hp[p:p + draft.SLOTS], p)
     b = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
     hb = draft.hidden_state(0).numpy()
     for u, v in ((ha, hb), (a, b)):

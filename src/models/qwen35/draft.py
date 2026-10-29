@@ -113,7 +113,7 @@ class QwenDraft(QwenOverlay):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         self.L = cfg.num_hidden_layers - 1
         super().__init__(gguf, layers=[self.L], max_positions=target.max_positions,
-                         image=target.image.mtp_view(cfg) if own else None)
+                         image=target.image.mtp_view(cfg) if own else None, slots=target.SLOTS)
         self.w_of = target if own else None
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
         fmts = _formats(self.image)
@@ -193,7 +193,7 @@ class QwenDraft(QwenOverlay):
 
     def step(self, emb: torch.Tensor, h: torch.Tensor, position: int, *, logits: bool = True
              ) -> torch.Tensor | None:
-        """A step of S = len(emb) <= 4 rows at positions position .. position + S - 1 (their cache records): emb (S,
+        """A step of S = len(emb) <= SLOTS rows at positions position .. position + S - 1 (their cache records): emb (S,
         hidden) their tokens' embeddings, h (S, hidden) the hidden states of the positions before them. Returns the
         head's logits (S, vocab) bf16 (the tokens ``ids``; a view of the NPU's buffer, valid until the next step), or
         None."""
@@ -204,7 +204,7 @@ class QwenDraft(QwenOverlay):
             self._metas(S)
         self._write_loadr(np.zeros((S, self.H), np.float32))
         for rg in self.inp[(self.L, "eh")]:
-            self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K]).view(np.uint8).reshape(-1))
+            self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K], self._sp(S)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
     def hidden_state(self, slot: int = 0) -> torch.Tensor:

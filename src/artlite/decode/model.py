@@ -30,7 +30,6 @@ from . import phases as mp
 from .design import (
     C_LEN,
     META,
-    SLOTS,
     XB,
     input_fill,
     interleave,
@@ -114,7 +113,6 @@ class ModelOverlay:
 
     CONFIG: ClassVar[Any]  # the model's config class (``from_gguf``)
     IMAGE: ClassVar[type[TileImage]]  # its image class: (gguf, cfg, layers=, vocab=)
-    SLOTS: ClassVar[int] = SLOTS  # token slots of a step at most
     # (the next step's position patched into a second transaction while a step runs: ``_run``; the model's
     # ``_set_position`` takes ``ahead`` and its transactions their buffer, ``_transaction``)
     AHEAD: ClassVar[bool] = False
@@ -146,6 +144,11 @@ class ModelOverlay:
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
 
+    @property
+    def SLOTS(self) -> int:
+        """Token slots of a step at most (the design's)."""
+        return self.op.slots
+
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
@@ -167,13 +170,13 @@ class ModelOverlay:
         regs = []
         for k0, g in mp.group_chunks(r):
             K = g * r.kc
-            n = (post_region_bytes(K) if post else region_bytes(K)) + extra * K
+            n = (post_region_bytes(K) if post else region_bytes(K, self.SLOTS)) + extra * K
             regs.append(InputRegion(self._take("ACT", n), k0 * r.kc, K, post))
         self.inp[phase] = regs
 
     def _sizes(self) -> None:
         """The buffers' sizes (``sizes``): the layout's (64 bytes at least), LOGITS [slot][vocab] bf16."""
-        self.sizes = {k: max(v, 64) for k, v in self._layout.items()} | {"LOGITS": 2 * SLOTS * self.vocab}
+        self.sizes = {k: max(v, 64) for k, v in self._layout.items()} | {"LOGITS": 2 * self.SLOTS * self.vocab}
 
     # ------------------------------------------------------------------
     # Load
@@ -195,8 +198,8 @@ class ModelOverlay:
             dev.alloc(name, n)
         act = dev.view("ACT")
         for c in range(COLS):
-            for s in range(SLOTS):
-                act[self.loadr + (c * SLOTS + s) * XB:][:4 * META] = mp.loadr_meta(s).view(np.uint8)
+            for s in range(self.SLOTS):
+                act[self.loadr + (c * self.SLOTS + s) * XB:][:4 * META] = mp.loadr_meta(s).view(np.uint8)
         self._load()
         dev.flush("ACT")
         if (store := self.op.page_store()) is not None:  # (paged formats: their pages loadable before every dispatch)
@@ -229,7 +232,7 @@ class ModelOverlay:
 
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
         """The K groups of a phase for S slots (``phases.groups``)."""
-        return mp.groups(self.image.region(L, name), self._flags(L, name), S)
+        return mp.groups(self.image.region(L, name), self._flags(L, name), S, slots=self.SLOTS)
 
     def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
         """The phases' metadata objects for S slots: (ACT offset, bytes) each."""
@@ -252,7 +255,7 @@ class ModelOverlay:
 
     def _sp(self, S: int) -> int:
         """The slots of an input k block in a step of S slots (``design.packed_slots`` in a packed design)."""
-        return packed_slots(S) if self.op.packed else SLOTS
+        return packed_slots(S) if self.op.packed else self.SLOTS
 
     def _weight_run(self, seq: Sequence, phases: list[tuple[int, str]], *, image: TileImage | None = None,
                     buf: str = "W", blocks: slice = slice(None)) -> None:
@@ -276,7 +279,7 @@ class ModelOverlay:
     def _inputs(self, seq: Sequence, rg: InputRegion, S: int) -> None:
         """The X fills of a K group's input (``design.input_fill``, a header's ``post_input_fill``)."""
         sp = self._sp(S)
-        nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp)
+        nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)
         for c in range(COLS):
             seq.fill("X", c, self.dev.address("ACT", rg.off), nbytes, dims)
 
@@ -371,9 +374,9 @@ class ModelOverlay:
     def _write_loadr(self, x: np.ndarray) -> None:
         """The slots' residual slices (F_LOADR payloads, fp32) of x (S, hidden) fp32."""
         S, h8 = x.shape[0], self.H // COLS
-        lr = self.dev.view("ACT")[self.loadr:self.loadr + COLS * SLOTS * XB].reshape(COLS, SLOTS, XB)
+        lr = self.dev.view("ACT")[self.loadr:self.loadr + COLS * self.SLOTS * XB].reshape(COLS, self.SLOTS, XB)
         lr[:, :S, 4 * META:4 * META + 4 * h8] = x.reshape(S, COLS, h8).transpose(1, 0, 2).view(np.uint8).reshape(COLS, S, -1)
-        self.dev.flush("ACT", self.loadr, COLS * SLOTS * XB)
+        self.dev.flush("ACT", self.loadr, COLS * self.SLOTS * XB)
 
     def _write_input(self, rg: InputRegion, xi: np.ndarray) -> None:
         """A plain input's x (``design.interleave``, as bytes) -> the x of its (first) K group's region."""
@@ -478,7 +481,7 @@ class ModelOverlay:
         (``restore``)."""
         o, n = self.rings
         self.dev.fetch("KV", o, n)
-        lo, hi = max(position - SLOTS, 0), min(position + 1, self.max_positions)
+        lo, hi = max(position - self.SLOTS, 0), min(position + 1, self.max_positions)
         rings = host_bytes((n,))
         rings[:] = self.dev.view("KV")[o:o + n]
         return {"rings": rings, "vring": self.vring.copy(), "last_s": self._last_s,

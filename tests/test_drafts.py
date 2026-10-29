@@ -50,7 +50,7 @@ def test_planner() -> None:
     assert moe.choose(1, 3, drafter=False) == 0 and moe.choose(20, 3, drafter=False) == 3
     assert moe.step_time(4) == pytest.approx(0.080)
     e0 = moe.expected(5, 3)
-    assert e0 == pytest.approx(1 + PRIOR[4, 0] + PRIOR[4, 0] * PRIOR[4, 1] + np.prod(PRIOR[4]))
+    assert e0 == pytest.approx(1 + PRIOR[4, 0] + PRIOR[4, 0] * PRIOR[4, 1] + np.prod(PRIOR[4, :3]))
     assert moe.choose(5, 3, drafter=False) == 2
     for _ in range(50):
         moe.accepted(5, 3, 0)

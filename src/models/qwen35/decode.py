@@ -2,7 +2,7 @@
 cores of every column, their GEMV phases) with the qwen35 cores:
 
 - GDN (c, 2), with ``gdn``: the Gated DeltaNet step of S slots (``qwen35/gdn.py``) on the gdn_in phase's rows (the main
-  core's M stream), outputs on D;
+  core's M stream; 8 slots: through DDR, the core's memory also holding the helper's scratch), outputs on D;
 - attention (c, 5), with ``attn``: the full-attention layers' attention of S slots (``qwen35/attn.py``), the KV cache
   through A (broadcast with the main core's), outputs relayed by the main core (shared-memory FIFO R) to C; a KV head's
   chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair.
@@ -10,7 +10,7 @@ cores of every column, their GEMV phases) with the qwen35 cores:
 Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
 ``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
 KV head's chain divides the cache's groups (1); the core's first group, the end of its attention groups, the first
-group past them (a chain's first core's: the sub-step's group, for its records only); its first slot in the step;
+group past them (a chain's first core's: the sub-step's group, for its records only); its first slot's row of angles;
 record mode (the first tail object is the open record's V panels); the tail objects.
 """
 
@@ -22,7 +22,7 @@ from ml_dtypes import bfloat16
 
 from artlite.decode import design as OD
 from artlite.decode import gemv
-from artlite.decode.design import C_LEN, META, NX_PER_NORM, XPAY, DecodeOverlayOperator, _Streams
+from artlite.decode.design import C_LEN, META, XPAY, DecodeOverlayOperator, _Streams
 from artlite.operators.design import COLS, range32
 
 from . import attn as AT
@@ -45,19 +45,19 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
-                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = ""):
+                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = OD.SLOTS):
         """moe: (experts, experts per token) of an MoE model (``decode.design``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``decode.model.paged_formats``:
-        a drafter's Q4_0 beside the model's three)."""
-        assert all(gemv.supported(f, 4) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
-        assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META)
+        a drafter's Q4_0 beside the model's three); slots: a step's token slots at most (4, 8)."""
+        assert all(gemv.supported(f, 4, slots) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
+        assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META and gdn.slots == slots)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
-        self.msg, self.relay = gdn is not None, attn is not None
+        self.msg, self.relay = gdn is not None and slots == 4, attn is not None
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
-                         paged=paged, win=win)
+                         paged=paged, win=win, slots=slots)
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
@@ -71,7 +71,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             assert W["size"] - W["inv"] >= AT.EXT_W and (not self.attn.main_gates or self.xs_bytes >= AT.EXT_X), W
             assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
             src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                    | {"META": META, "NX_PER_NORM": NX_PER_NORM}, tail=W["inv"])
+                                    | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"])
         return src
 
     @property
@@ -85,7 +85,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         gr = self.GDN_ROW
         workers: list[Worker] = []
         d_fifos: list[tuple[int, ObjectFifo]] = []
-        if gdn is not None:
+        if gdn is not None and gdn.slots == 8:
+            self._gdn8_workers(s, workers, d_fifos)
+        elif gdn is not None:
             G = GD
             GW = gdn.workspace()
             gws_ty = np.ndarray[(GW["size"] // 4,), i32]
@@ -246,3 +248,70 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
+
+    def _gdn8_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
+        """The GDN cores of an 8-slot design (``gdn``'s "8 slots"): per step (after the header) per k head its q and k blocks
+        (their histories out) and K objects, then its v heads (a block, the deltas and z, 16 state panels; the history,
+        the deltas and the gated outputs out)."""
+        p, P, gdn = s.p, self.PREFIX, self.gdn
+        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
+        x_ty = s.x_ty
+        GW = gdn.workspace()
+        gws_ty = np.ndarray[(GW["size"] // 4,), i32]
+        d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
+        i_g = GW["st"] // 4
+        kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
+        kxd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty, d_ty])
+        kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
+        ks = [kx("gbegin"), kx("gw"), kx("gconv"), kd("ghist"), kx("gkold"), kd("gknew"), kx("gdl"), kx("gz"),
+              kxd("gpanel"), kd("gdlout"), kd("gout")]
+        nv = gdn.hc // 2
+
+        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gpanel, gdlout, gout, ws):
+            def take(k: Kernel) -> None:  # an X object into the workspace
+                x = x_f.acquire(1)
+                k(x, ws)
+                x_f.release(1)
+
+            def emit(k: Kernel) -> None:  # a D object from the workspace
+                d = d_f.acquire(1)
+                k(ws, d)
+                d_f.release(1)
+
+            def block() -> None:  # a conv block's two objects (its new history in the workspace)
+                take(gw)
+                take(gconv)
+
+            for _ in forever_():
+                take(gbegin)
+                for _ in range_(ws[i_g + GD.G_NSKIP]):
+                    x_f.acquire(1)
+                    x_f.release(1)
+                for _ in range_(ws[i_g + GD.G_ON]):  # (after the header: ``gbegin``)
+                    for _ in range32(2, unroll=False):  # the k heads
+                        block()  # q
+                        emit(ghist)
+                        block()  # k
+                        emit(ghist)
+                        take(gkold)
+                        emit(gknew)
+                        for _ in range32(nv, unroll=False):  # its v heads
+                            block()
+                            take(gdl)
+                            take(gz)
+                            for _ in range32(16, unroll=False):
+                                x = x_f.acquire(1)
+                                d = d_f.acquire(1)
+                                gpanel(x, ws, d)
+                                d_f.release(1)
+                                x_f.release(1)
+                            emit(ghist)  # (its history and deltas: one drain)
+                            emit(gdlout)
+                            emit(gout)
+
+        for c in range(COLS):
+            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
+            gws = Buffer(gws_ty, name=f"{P}_gws{c}", initial_value=np.zeros(GW["size"] // 4, np.int32))
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks, gws],
+                                  tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
+                                  while_true=False))

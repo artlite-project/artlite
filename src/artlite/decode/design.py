@@ -1,7 +1,8 @@
 """The decode overlay shared by the models run on host-built transactions (qwen35, gemma4, llama): one design whose
-cores interpret their inputs, run by host-built transactions (``artlite.overlay``), computing up to ``SLOTS`` tokens per
-stream of the weights. A model's design (``DecodeOverlayOperator`` subclass) adds its own cores (qwen35: the GDN and
-attention cores; gemma4, llama: the attention cores) to the main and helper cores of every column:
+cores interpret their inputs, run by host-built transactions (``artlite.overlay``), computing up to ``SLOTS`` (4) tokens
+per stream of the weights (8: "Designs of 8 slots"). A model's design (``DecodeOverlayOperator`` subclass) adds its own
+cores (qwen35: the GDN and attention cores; gemma4, llama: the attention cores) to the main and helper cores of every
+column:
 
 - main (c, 4): the GEMV phases: X objects, its half of every weight tile (``gemv``: super-blocks 0, 1), residuals,
   outputs (C), with ``msg`` a phase's rows to another core (M), with ``relay`` another core's outputs (R) to C;
@@ -59,6 +60,14 @@ stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side c
 - the combine (F_COMB): its input objects are the 8 columns' partials of a slot's residual slice, which the helper adds
   into the residual (K_ACC); the residual then goes out.
 
+Designs of 8 slots (``slots=8``: a dense model whose formats run at 8 slots, ``gemv``): x per k block one panel of the
+8 slots' single bfp16 rows (``gemv``'s "Designs of 8 slots"; the sum panels a hi and a lo panel each), an input object
+of ``obj_k`` 256 k ([k block][slot 8][8] bf16; a strip of the helper's is a super-block), a norm-weight object over 16 of
+them, a row tile's outputs [g 2][slot 8][r 8]. L1 (the main core's own regions are its 4-slot design's at twice the
+slots, but the residual): the main core's workspace holds the residual of slots 0 .. 3, the helper's memory that of 4
+.. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums)
+lies in the core south of it (``HS8_ROW``: the model's core there leaves it room). No moe, post, packed, paged designs.
+
 Paged formats (``paged``: a model whose formats' kernels do not fit the cores together): their kernels are code pages
 (``paging``, the memtile transport): per column the main and helper cores request a format's page for their half
 before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes; the
@@ -88,16 +97,18 @@ from ..operators import paging
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, linear_tap
 from ..operators.kernel_source import kernel_prefix
+from ..operators.l1_layout import pin_l1_buffers
 from ..operators.util import Attr, regions
 from . import gemv
 from .kernels import SRC as _SRC
 
-SLOTS = gemv.SLOTS
+SLOTS = gemv.SLOTS  # token slots of a design (4; ``DecodeOverlayOperator(slots=8)``: 8)
 META = 64  # int32 metadata words at the start of an X object
 XB = 4352  # bytes of an X object
 XPAY = XB - 4 * META  # payload bytes of an X object
-OBJ_K = XPAY // (2 * SLOTS)  # k of an input object (512: 64 k blocks of the slots' 8 values)
-NX_PER_NORM = 8  # input objects per norm-weight object (8 x 512 bf16 weights)
+OBJ_K = XPAY // (2 * SLOTS)  # k of an input object (512: 64 k blocks of the slots' 8 values; 8 slots: 256, ``obj_k``)
+NX_PER_NORM = 8  # input objects per norm-weight object (8 x 512 bf16 weights; 8 slots: 16 x 256, ``nx_per_norm``)
+NORM_K = NX_PER_NORM * OBJ_K  # weights of a norm-weight object
 C_LEN = 64  # bf16 elements of a C object
 NBLK = 4  # blocks of row tiles a phase may have
 MAX_K = 5120  # k of a phase's K group: its x panels (46 KB) in the helper's memory
@@ -178,6 +189,7 @@ assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS and S
 # helper cores) and wake lock; the stream ids of the pages' and the requests' routes (main, helper)
 PG_CH, PG_BD, PG_STORE, PG_STORE_BYTES = 5, 40, 0x78000, 0x8000
 PG_STATE, PG_WAKE = 0xFFE0, 15  # (32-byte aligned: aiecc)
+WS8_AT = 0x4800  # (8 slots) the main core's workspace (region 1 past its bank-B tables; then the sum panels)
 PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 # the event windows of a stats build (DecodeOverlayOperator(win=)): main's half tile, the helper's, main's row
 # epilogue (collect), the helper's input objects
@@ -221,6 +233,8 @@ class DecodeOverlayOperator(ArtcOperator):
     A_L1, A_FWD = 2, 2
     STACK, HELPER_STACK = 2048, 2048
     MAIN_ROW, HELPER_ROW = 4, 3
+    HS8_ROW = 2  # (8 slots: the core whose memory holds the helper's scratch, its south neighbour: a model core there
+    # leaves it room)
     SHM = {1: -0x10000, -1: -0x30000}[MAIN_ROW - HELPER_ROW]  # the main core's memory as the helper sees it
     ENDPOINTS: ClassVar[dict[str, tuple[int, int]]] = {"A": (txn.MM2S, 0), "X": (txn.MM2S, 1), "C": (txn.S2MM, 0),
                                                        "D": (txn.S2MM, 1)}
@@ -235,7 +249,7 @@ class DecodeOverlayOperator(ArtcOperator):
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
-                 max_k: int = MAX_K, win: str = ""):
+                 max_k: int = MAX_K, win: str = "", slots: int = SLOTS):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -244,8 +258,13 @@ class DecodeOverlayOperator(ArtcOperator):
         code pages (module docstring); moe: (experts, experts used per token) of the MoE layers' phases (module
         docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
         combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
-        the side chunk)."""
-        self.chunk = gemv.Chunk(nsb)
+        the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
+        slots")."""
+        assert slots in (4, 8) and (slots == 4 or not (post or pli or packed or tok or gu_win or paged or moe)), slots
+        self.slots = slots
+        self.obj_k = XPAY // (2 * slots)  # (k of an input object)
+        self.nx_per_norm = NORM_K // self.obj_k  # (input objects per norm-weight object)
+        self.chunk = gemv.Chunk(nsb, slots)
         self.moe = moe is not None
         self.experts, self.top = moe or (0, 0)
         assert max_k % self.chunk.k == 0 and max_k <= MAX_K
@@ -254,6 +273,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= max_k
         assert not moe or not (post or pli or packed or tok) and act == "silu" and nsb == 4
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
+        assert all(gemv.supported(f, nsb, slots) for f in rows), (rows, slots)
         assert act in ("silu", "gelu") and (not pli or act == "gelu")
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
@@ -264,9 +284,11 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
         # memory, not one chunk's 128 panels in a row: their reads at once conflict; a 512-k input strip is a half)
         self.xh = nsb == 4 and not self.rowsplit and not post
-        self.yt = 128 if any(r > 16 for r in rows.values()) else 64  # (floats of a row tile's outputs)
+        self.wide = any(r > 16 for r in rows.values())  # (tiles of more than 16 rows: 4-slot designs)
+        assert slots == 4 or not self.wide, rows
+        self.yt = (128 if self.wide else 64) * slots // 4  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
-        self.yn = 128 if any(r > 16 and f not in self.rowsplit for f, r in rows.items()) else gemv.Y_FLOATS
+        self.yn = 128 if any(r > 16 and f not in self.rowsplit for f, r in rows.items()) else gemv.y_floats(slots)
         self.yb = self.yt  # (floats of a tile's row block: 16 rows [g 2][slot][r], 32 rows [g 4][slot][r])
         if self.moe:  # (row groups: a tile's 4 blocks, the helper's two; tiles of more than 16 rows: blocks of 32 rows,
             # their gate / up rows through the windows, ``gu_win``)
@@ -278,6 +300,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
         self.h8 = hidden // COLS
         self.res_pitch = -(-(self.h8 + 32) // 16) * 16  # (fp32 per slot: the window adds reach 32 past a row)
+        self.res_slots = min(slots, 4)  # (the slots of the residual in the main core's workspace; the others' in hres)
         super().__init__()
 
     @property
@@ -290,10 +313,21 @@ class DecodeOverlayOperator(ArtcOperator):
         """The sum panels of a K group (in the main core's memory)."""
         return self.max_g * self.chunk.xs
 
+    @property
+    def hs_bytes(self) -> int:
+        """The helper's scratch: its GEMV scratch and a K group's 16-k sums (fp32: 8 slots' 2 MAX_K bytes)."""
+        return max(gemv.scr_bytes(self.slots), MAX_K * self.slots // 4)
+
+    @property
+    def hres_bytes(self) -> int:
+        """(8 slots) The residual of slots 4 .. 7 (fp32, in the helper's memory: ``hres``)."""
+        return 4 * (self.slots - self.res_slots) * self.res_pitch
+
     def workspace(self) -> dict[str, int]:
         """Byte offsets of the main core's workspace regions (and "size")."""
-        sizes = [("st", 4 * S_WORDS), ("res", 4 * SLOTS * self.res_pitch), ("inv", 4 * 32),
-                 ("yt", 4 * self.yt), ("stg", 2 * SLOTS * 2 * C_LEN), ("gs", 2 * 64), ("scr", gemv.SCR_BYTES)]
+        S = self.slots
+        sizes = [("st", 4 * S_WORDS), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
+                 ("yt", 4 * self.yt), ("stg", 2 * S * 2 * C_LEN), ("gs", 2 * 16 * S), ("scr", gemv.scr_bytes(S))]
         if self.post:
             sizes += [("pend", 4 * SLOTS * self.res_pitch), ("ivv", 4 * 32)]
         if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; [slot][8] fp32 sums, then the slots' 1 / rms(p) [slot][r 8]
@@ -306,7 +340,8 @@ class DecodeOverlayOperator(ArtcOperator):
             sizes += [("wsc", 4 * 32), ("hold", 2 * SLOTS * OBJ_K), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
                       ("plan", 4 * moe_k.PLAN_WORDS)]
         out = regions(sizes)
-        assert MAX_K + 2048 <= gemv.SCR_BYTES  # (the 16-k sums of a K group, fp32, and hpstrip's nb in the helper's scratch)
+        assert self.slots == 8 or MAX_K + 2048 <= self.hs_bytes  # (the 16-k sums of a K group, fp32, and hpstrip's nb
+        # in the helper's scratch)
         return out
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -331,11 +366,12 @@ class DecodeOverlayOperator(ArtcOperator):
         p = self.pfx
         consts = self._consts()
         fmts = list(self.rows)
-        assert not self.xh or OBJ_K * 2 == self.chunk.k
+        assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
-                          pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb)
+                          pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb, slots=self.slots)
         src += self._extra_src(p, consts)
-        gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs, "XS_SLOT": gemv.XS_SLOT,
+        gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
+              "XS_SLOT": gemv.xs_slot(self.slots),
               "XPH": self.max_g * self.chunk.xp // 2, "XPHC": self.chunk.xp // 2,
               "PANEL": gemv.PANEL,
               "Y_FLOATS": gemv.Y_FLOATS}
@@ -343,7 +379,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                  WIN=WINS.get(self.win, 0),
                                  RES_PITCH=self.res_pitch, eps=repr(self.eps), ple_eps=repr(self.eps * self.hidden),
                                  META=META, C_LEN=C_LEN, NBLK=NBLK,
-                                 SLOTS=SLOTS, XPAY=XPAY, OBJ_K=OBJ_K, NX_PER_NORM=NX_PER_NORM, gv=Attr(gv),
+                                 SLOTS=self.slots, XPAY=XPAY, OBJ_K=self.obj_k, NX_PER_NORM=self.nx_per_norm,
+                                 RES_SLOTS=self.res_slots, wide=self.wide, gv=Attr(gv),
                                  rows=list(self.rows.items()), fid={n: f.fid for n, f in FORMATS.items()},
                                  rowsplit=bool(self.rowsplit), rows_split=self.rowsplit,
                                  helper_y=[(f, gemv.helper_y(f, self.chunk.nsb)) for f in self.rowsplit
@@ -433,8 +470,10 @@ class DecodeOverlayOperator(ArtcOperator):
         ws_ty = np.ndarray[(W["size"] // 4,), i32]
         xp_ty = np.ndarray[(self.xp_bytes,), u8]
         xs_ty = np.ndarray[(self.xs_bytes,), u8]
-        hs_ty = np.ndarray[(gemv.SCR_BYTES,), u8]
-        sq_ty = np.ndarray[(32,), f32]
+        hs_ty = np.ndarray[(self.hs_bytes,), u8]
+        sq_ty = np.ndarray[(8 * self.slots,), f32]
+        hres_ty = np.ndarray[(max(self.hres_bytes, 4) // 4,), f32]  # (8 slots: slots 4 .. 7's residual)
+        s8 = self.slots == 8
         i_st = W["st"] // 4
 
         k_begin = Kernel(f"{p}_begin", "kernel.o", [x_ty, ws_ty, cmd_ty, np.int32])
@@ -445,12 +484,12 @@ class DecodeOverlayOperator(ArtcOperator):
         k_inv = Kernel(f"{p}_inv", "kernel.o", [r_ty, ws_ty])
         k_cmd = Kernel(f"{p}_cmd", "kernel.o", [a_ty, ws_ty, cmd_ty, xs_ty])
         k_tile = Kernel(f"{p}_tile", "kernel.o", [a_ty, ws_ty, xp_ty, xs_ty])
-        k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty])
-        k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty])
+        k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty, *[hres_ty] * s8])
+        k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, *[hres_ty] * s8])
         k_relay = (Kernel(f"{p}_mrelay", "kernel.o", [rr_ty, c_ty, ws_ty, xp_ty]) if self.gate else
                    Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
         k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
-        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty])
+        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
         if self.moe:  # (acc: the experts' partials of the column, in the helper's memory)
             acc_ty = np.ndarray[(SLOTS * self.hidden,), bf]
@@ -482,9 +521,11 @@ class DecodeOverlayOperator(ArtcOperator):
             r_f = rest.pop(0) if self.relay else None
             if self.moe:
                 sub, lstrip, acc, *rest = rest
+            elif s8:
+                acc, *rest = rest  # (8 slots: hres)
             xgate = rest.pop(0) if self.gate else None
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
-            ea = (acc,) if self.moe else ()  # (collect's and emit's last argument: moe's acc)
+            ea = (acc,) if self.moe or s8 else ()  # (collect's and emit's last argument: moe's acc, 8 slots' hres)
 
             def command(call: object) -> None:  # a strip of the input object: the helper's command
                 c = cmd_f.acquire(1)
@@ -592,11 +633,12 @@ class DecodeOverlayOperator(ArtcOperator):
                         c_f.release(1)
                         r_f.release(1)
 
-        def helper_fn(cmd_f, res_f, htask, hs, sq, xp, *pg):
+        def helper_fn(cmd_f, res_f, htask, hs, sq, xp, *rest):
+            eh = rest[:1] if s8 else ()  # (8 slots: hres; else the pager's state words, the grid tables: placed)
             for _ in forever_():
                 c = cmd_f.acquire(1)
                 r = res_f.acquire(1)
-                htask(c, r, hs, sq, xp)
+                htask(c, r, hs, sq, xp, *eh)
                 res_f.release(1)
                 cmd_f.release(1)
 
@@ -630,14 +672,15 @@ class DecodeOverlayOperator(ArtcOperator):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}", **({"tile": Tile(c, mr)} if self.LENDS_WS else {}))
             m_ws.append(ws)
             moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
+            hres = [Buffer(hres_ty, name=f"{P}_hres{c}", tile=Tile(c, hr))] if s8 else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
             xs = Buffer(xs_ty, name=f"{P}_xs{c}", tile=Tile(c, mr))
             m_xs.append(xs)
-            hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, hr))
+            hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, hr))
             workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=1), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
-                                            *([r_fifos[c].cons()] if self.relay else []), *moe_args,
+                                            *([r_fifos[c].cons()] if self.relay else []), *moe_args, *hres,
                                             *([k_xgate] if self.gate else []), k_begin, k_nbegin,
                                             k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
@@ -646,8 +689,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                             *grids.get((c, 0), [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
-            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *pg_help.get(c, []),
-                                              *grids.get((c, 1), [])],
+            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres,
+                                              *pg_help.get(c, []), *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
@@ -677,7 +720,12 @@ class DecodeOverlayOperator(ArtcOperator):
             rt.add_flow(f)
         for lk in pg_locks:
             rt.add_lock(lk)
-        return Program(NPU2(), rt, workers=workers).resolve_program()
+        module = Program(NPU2(), rt, workers=workers).resolve_program()
+        if s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
+            at = {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)}
+            assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000
+            pin_l1_buffers(module, fifo=lambda name, depth: None, buffer=at.get)
+        return module
 
     def check_endpoints(self, insts: np.ndarray) -> None:
         """Assert that aiecc gave every stream the shim channel ``ENDPOINTS`` names (the probe's queue pushes)."""
@@ -714,22 +762,23 @@ class _Streams:
 # ----------------------------------------------------------------------
 
 
-def n_inputs(K: int) -> int:
-    """Input objects of a phase of K elements per slot (after its metadata object)."""
-    assert K % OBJ_K == 0, K
-    return K // OBJ_K
+def n_inputs(K: int, slots: int = SLOTS) -> int:
+    """Input objects of a phase of K elements per slot (after its metadata object) of a design of ``slots``."""
+    k = XPAY // (2 * slots)
+    assert K % k == 0, K
+    return K // k
 
 
-def region_bytes(K: int) -> int:
-    """Bytes of a phase's input in DDR: [metadata object | x: [k block K / 8][slot 4][8] bf16]."""
-    return XB + 2 * SLOTS * K
+def region_bytes(K: int, slots: int = SLOTS) -> int:
+    """Bytes of a phase's input in DDR: [metadata object | x: [k block K / 8][slot ``slots``][8] bf16]."""
+    return XB + 2 * slots * K
 
 
-def input_fill(K: int, sp: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
+def input_fill(K: int, sp: int = SLOTS, slots: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
     """(bytes, shim BD dims) of the X fill of a phase's input from the start of its region: the metadata object, then
     object i = the XB bytes that end with x's i-th XPAY bytes (strides of XPAY, extents of XB); x of sp slots per k
-    block (``packed_slots``)."""
-    return (1 + -(-n_inputs(K) * sp // SLOTS)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
+    block (``packed_slots``) of a design of ``slots``."""
+    return (1 + -(-n_inputs(K, slots) * sp // slots)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
 
 
 def post_region_bytes(K: int) -> int:
@@ -756,7 +805,7 @@ def interleave(x: np.ndarray, sp: int = SLOTS) -> np.ndarray:
 def norm_objects(w: np.ndarray, tile_bytes: int) -> np.ndarray:
     """The norm-weight A objects of a weight vector (bf16 values): object n holds the weights of input objects
     ``NX_PER_NORM`` n .. at its start."""
-    per = NX_PER_NORM * OBJ_K
+    per = NORM_K
     n = -(-len(w) // per)
     out = np.zeros((n, tile_bytes // 2), np.uint16)
     wb = torch.from_numpy(np.array(w, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)

@@ -1,5 +1,5 @@
 """The GDN core of the multi-slot decode overlay (``qwen35/decode.py``): one Gated DeltaNet step of S <= 4 token
-slots per GDN layer and column, with a lazy commit of the recurrent state.
+slots (8 slots: below) per GDN layer and column, with a lazy commit of the recurrent state.
 
 Column c holds q / k heads {2c, 2c + 1} and its HC v heads (``image.gdn_v_heads``; v head h of the column reads local
 k head h & 1). The heads come in pairs (2 c + 16 p, + 1). Per step the core gets:
@@ -28,6 +28,25 @@ writes the state after the step's tokens instead (S = 1 decoding, before a prefi
 histories, the 32 state panels, the delta object of the step's tokens and the gated outputs rms(o) ssm_norm silu(z)
 of the pair's heads, slot-interleaved as the gdn_out phase reads them ([head 2][k block 16][slot 4][8] bf16, then
 2 KB of padding).
+
+8 slots (``GdnShape(slots=8)``, designs of steps of up to 8 tokens): the message of 8 slots (34 KB) and the per-pair
+arrays twice the size do not fit the core's L1 (which also holds the helper's scratch: ``decode.design``'s 8-slot
+partition), so the core runs per v head, its v heads grouped by k head (k head kh's v heads h = kh, kh + 2, ..: one k
+head's q, k and K objects in the workspace at a time), and gdn_in's rows reach it through DDR: gdn_in drains them (C)
+into the step's objects (3 drains per column, its objects (half, slot) as [half][slot 8][64]: the q / k blocks', the v
+blocks' then z, ab), then a sync. A column's objects of a layer are payload slots of XPAY bytes (each object's metadata
+the 256 bytes before it): the header H (F_GDN, M_SKIP; the slots' ab, dt, A, ssm_norm, the previous step's d per token
+from the last gated outputs' D object), per k head [q A, q B, k A, k B, K], per v head [A, B, DL, Z]. A conv block's
+two objects: A = [weights (2 KB) | its history's rows 0 .. 7], B = [the history's rows 8 .. 10 | the step's S rows]:
+the history (3 + 8 rows, 2816 bytes, after the weights) holds the previous step's [base 3 | S rows], from which the core
+takes the step's base rows at cshift, so the host patches nothing per step; the new history [base 3 | the step's S rows]
+goes out over it (D: from A's second half on). The step's words (S, M_NREP, M_CSHIFT, M_COMMIT) come from the gdn_in
+phase's metadata object (``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q and k blocks (their
+histories out), the K objects (the previous step's in, the step's out), then per v head its block, deltas and z, its 16
+state panels, and its history, deltas and gated outputs out ([k block 16][slot 8][8] bf16: gdn_out's x of the head;
+the 2 KB after them the step's d per token, into the header from the last head, else the sink). A column's DMA tasks
+per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
+panels) and 23 drains.
 """
 
 import math
@@ -44,14 +63,23 @@ from artlite.operators.util import Attr, bf16_hilo, regions
 D = 128  # ssm_state: k and v dims of a head
 PANEL = 4096  # bytes of a state panel (128 i x 8 j fp32)
 D_BYTES = 4096  # bytes of a D object
-SMAX = 4  # token slots
+SMAX = 4  # token slots (of a 4-slot design's core)
 HIST = 3 + SMAX  # history rows of a conv object
 F_GDN = 1 << 8  # M_FLAGS of the first GDN object of a step (the other cores skip it and M_SKIP objects after it)
+F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the GDN core takes the step's words from it
 
 # state words of the GDN core's workspace (the first ones are trip counts of its program)
 (G_NSKIP, G_NMSG, G_ON, G_NCP, G_KO, G_PO, G_NS, G_NREP, G_CSHIFT, G_COMMIT, G_MJ, G_MS, G_CB, G_PAIR,
  G_PANEL) = range(15)
+G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (8 slots) the k head, its v heads done, the v head in the column
 G_WORDS = 16
+# (8 slots) a column's objects of a GDN layer: payload slots of XPAY bytes (each object's metadata the 256 bytes before
+# its payload): the header (H_SLOT), per k head kh its group [q A, q B, k A, k B, K] (from KH_SLOT + KH_SPAN kh), per v
+# head h its group [A, B, DL, Z] (from V_SLOT + V_SPAN h); the header's payload: the slots' ab at H_AB (a gdn_in object
+# each: 128 bytes), dt 16 | A 16 | ssm_norm 128 fp32 at H_PRM, the step's d per token ([token 8][8] fp32: the last
+# gated outputs' D object's second half) at H_DOLD
+H_SLOT, KH_SLOT, KH_SPAN, V_SLOT, V_SPAN = 0, 1, 5, 11, 4
+H_AB, H_PRM, H_DOLD = 0, 1024, 2048
 
 
 # The GDN math in fp32 (kmath, 16 lanes: one out-of-line exp2 for all of it; ``gm`` in the templates) and the helpers
@@ -90,15 +118,8 @@ __attribute__((noinline)) void {{ p }}_l2(const float *__restrict x, bfloat16 *_
 }
 """
 
-_SRC = JINJA_ENV.from_string(r"""
-// The GDN core's workspace (offsets in bytes: GdnShape.workspace())
-#define GW(T, off) ((T *)((uint8_t *)ws + (off)))
-
-namespace {
-
-""" + HELPERS + r"""
-
-// pass 1 of a panel sp (16 i-blocks x [j 8][i 8] fp32): uw[0 .. 8) = S^T k, uw[8 .. 16) = S^T q (k, q: [hi | lo] x 128
+# The state panels' passes and the small copies, shared by the 4- and 8-slot cores
+PANELS = r"""// pass 1 of a panel sp (16 i-blocks x [j 8][i 8] fp32): uw[0 .. 8) = S^T k, uw[8 .. 16) = S^T q (k, q: [hi | lo] x 128
 // of the token's k head)
 __attribute__((noinline)) void {{ p }}_p1(const float *__restrict sp, const bfloat16 *__restrict k,
                                           const bfloat16 *__restrict q, float *__restrict uw)
@@ -176,7 +197,17 @@ __attribute__((noinline)) float {{ p }}_kdotq(const bfloat16 *__restrict k, cons
     return aie::reduce_add(a.template to_vector<float>());
 }
 
-// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) ([slot][d 16 | beta 16 | k . q 16] fp32; prm:
+"""
+
+_SRC = JINJA_ENV.from_string(r"""
+// The GDN core's workspace (offsets in bytes: GdnShape.workspace())
+#define GW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+""" + HELPERS + r"""
+
+""" + PANELS + r"""// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) ([slot][d 16 | beta 16 | k . q 16] fp32; prm:
 // dt 16 | A 16)
 __attribute__((noinline)) void {{ p }}_ggates(int32_t *__restrict ws)
 {
@@ -421,11 +452,285 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
 """)
 
 
-class GdnShape:
-    """The GDN core's sizes for a model: HC v heads and CH conv channels per column, the message, the workspace."""
+# The core of steps of up to 8 slots (``GdnShape(slots=8)``, module docstring "8 slots")
+_SRC8 = JINJA_ENV.from_string(r"""
+// The GDN core's workspace (offsets in bytes: GdnShape.workspace())
+#define GW(T, off) ((T *)((uint8_t *)ws + (off)))
 
-    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64):
+namespace {
+
+""" + HELPERS + r"""
+
+""" + PANELS + r"""// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) ([slot][d 16 | beta 16 | k . q 16] fp32; prm:
+// dt 16 | A 16) of the header's ab (per slot its gdn_in object: alpha HC | beta HC fp32)
+__attribute__((noinline)) void {{ p }}_ggates(const float *__restrict hab, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int S = GW(int32_t, {{ g.st }})[{{ G_NS }}];
+    const float *__restrict prm = GW(float, {{ g.prm }});
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        const float *__restrict ab = hab + {{ C_LEN // 2 }} * s;
+        aie::vector<float, 16> al_ = aie::zeros<float, 16>(), be = aie::zeros<float, 16>();
+{% for h in range(HC) %}
+        al_[{{ h }}] = ab[{{ h }}];
+        be[{{ h }}] = ab[{{ HC + h }}];
+{% endfor %}
+        float *__restrict gt = GW(float, {{ g.gt }}) + 48 * s;
+        const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::add(al_, aie::load_v<16>(prm)));
+        aie::store_v(gt, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
+        // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
+        const aie::vector<float, 16> sn = {{ gm.softplus }}(aie::sub(aie::zeros<float, 16>(), be));
+        aie::store_v(gt + 16, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
+    }
+}
+
+// The header's payload: dt, A, ssm_norm, the previous step's d per token (the replay's), the slots' ab -> the gates
+__attribute__((noinline)) void {{ p }}_ghead(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const float *__restrict pay = (const float *)(x + {{ 2 * META }});
+    al::copy<160, 16>(GW(float, {{ g.prm }}), pay + {{ H_PRM // 4 }});
+    for (int r = 0; r < {{ SMAX }}; r++)
+        aie::store_v(GW(float, {{ g.dold }}) + 16 * r, aie::concat(aie::load_v<8>(pay + {{ H_DOLD // 4 }} + 8 * r), aie::zeros<float, 8>()));
+    {{ p }}_ggates(pay + {{ H_AB // 4 }}, ws);
+    st[{{ G_CB }}] = 0;
+    st[{{ G_PANEL }}] = 0;
+    st[{{ G_KH }}] = 0;
+    st[{{ G_VI }}] = 0;
+    st[{{ G_VH }}] = 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+// A new X object: the gdn_in phase's metadata object (F_GIN: the step's S, replay, shift and commit words; its input
+// objects follow: skipped), another main core phase's (skipped too), the header (F_GDN: ``ghead``, the step's objects
+// follow), or another core's first object (M_SKIP more follow)
+void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict m = (const int32_t *)x;
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int flags = m[{{ M_FLAGS }}];
+    st[{{ G_NSKIP }}] = 0;
+    st[{{ G_ON }}] = 0;
+    if (flags & {{ F_GIN }}) {
+        st[{{ G_NS }}] = m[{{ M_NS }}];
+        st[{{ G_NREP }}] = m[{{ M_NREP }}];
+        st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
+        st[{{ G_COMMIT }}] = m[{{ M_COMMIT }}];
+    }
+    if (flags & {{ F_GDN }}) {
+        {{ p }}_ghead(x, ws);
+        st[{{ G_ON }}] = 1;
+    } else if (!(flags & {{ F_MAIN }}))
+        st[{{ G_NSKIP }}] = m[{{ M_SKIP }}];
+    else if (!(flags & {{ F_LOADR }}))
+        st[{{ G_NSKIP }}] = m[{{ M_NX }}];
+}
+
+// A conv block's first object ([weights: tap 4 x (hi 128 | lo 128) bf16 | its history's rows 0 .. 7]): the weights ->
+// cw, the step's base rows (the history's rows cshift .. cshift + 2) among them -> rows 0 .. 2 of the block's new
+// history hb
+void {{ p }}_gw(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
+    const bfloat16 *__restrict w = x + {{ 2 * META }};
+    al::copy<{{ 8 * D }}, 64>(GW(bfloat16, {{ g.cw }}), w);
+    const int c0 = st[{{ G_CSHIFT }}];
+    for (int i = 0; i < 3; i++)
+        if (c0 + i < 8)
+            al::copy<{{ D }}, 64>(h + {{ D }} * i, w + {{ 8 * D }} + {{ D }} * (c0 + i));
+}
+
+// A conv block's second object ([its history's rows 8 .. 10 | the step's S rows as [half 2][slot 8][64]]): the rest of
+// the base rows and the step's rows into hb ([base 3 | S rows]: the next step's history; its rows past 3 + S stale),
+// the conv of the S slots on hb's rows (silu; q (block 0 of a k head), k (1) l2-normed as bf16 hi + lo into kq, then
+// k . q per slot; a v head's fp32 into v)
+void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
+    const int b = st[{{ G_CB }}];
+    st[{{ G_CB }}] = b + 1;
+    const int S = st[{{ G_NS }}], c0 = st[{{ G_CSHIFT }}];
+    const bfloat16 *__restrict r8 = x + {{ 2 * META }};
+    for (int i = 0; i < 3; i++)
+        if (c0 + i >= 8)
+            al::copy<{{ D }}, 64>(h + {{ D }} * i, r8 + {{ D }} * (c0 + i - 8));
+    const bfloat16 *__restrict w = GW(bfloat16, {{ g.cw }});
+    float *__restrict y = GW(float, {{ g.y }});
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        aie::store_v(h + {{ D }} * (3 + s), aie::load_v<64>(r8 + {{ 3 * D }} + 64 * s));
+        aie::store_v(h + {{ D }} * (3 + s) + 64, aie::load_v<64>(r8 + {{ 3 * D + 64 * SMAX }} + 64 * s));
+        AIE_LOOP_NO_UNROLL
+        for (int v = 0; v < {{ D }}; v += 64) {
+            aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
+            for (int t = 0; t < 4; t++) {
+                const aie::vector<bfloat16, 64> xt = aie::load_v<64>(h + {{ D }} * (s + t) + v);
+                acc = aie::mac(aie::mac(acc, xt, aie::load_v<64>(w + {{ 2 * D }} * t + v)),
+                               xt, aie::load_v<64>(w + {{ 2 * D }} * t + {{ D }} + v));
+            }
+            aie::store_v(y + v, acc.template to_vector<float>());
+        }
+        AIE_LOOP_NO_UNROLL
+        for (int c = 0; c < {{ D }}; c += 32)  // silu
+            aie::store_v(y + c, {{ gm.silu }}(aie::accum<accfloat, 32>(aie::load_v<32>(y + c)).template to_vector<bfloat16>()));
+        // kq: [k, q][slot 8][hi | lo][128]
+        bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 2 * D }} * s;
+        if (b < 2)
+            {{ p }}_l2(y, kq + (b ? 0 : {{ 2 * D * SMAX }}), kq + (b ? 0 : {{ 2 * D * SMAX }}) + {{ D }});
+        else
+            al::copy<{{ D }}, 64>(GW(float, {{ g.v }}) + {{ D }} * s, y);
+        if (b == 1)  // k . q of the slot's heads
+            GW(float, {{ g.gt }})[48 * s + 32] = {{ p }}_kdotq(kq, kq + {{ 2 * D * SMAX }});
+    }
+}
+
+// A conv block's new history (hb: [base 3 | S rows], 11 rows) -> d
+void {{ p }}_ghist(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    al::copy<{{ 11 * D }}, 64>(d, GW(bfloat16, {{ g.hb }}));
+}
+
+// The K object of the previous step's tokens of the k head ([token 8][k hi | k lo]) -> the workspace
+void {{ p }}_gkold(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    {{ p }}_cp4k(GW(int32_t, {{ g.kold }}), (const int32_t *)(x + {{ 2 * META }}));
+}
+
+// The step's K object of the k head ([slot 8][k hi | k lo])
+void {{ p }}_gknew(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k((int32_t *)d, GW(int32_t, {{ g.kq }}));
+}
+
+// A v head's delta object of the previous step ([token 8][128] fp32) -> the workspace
+void {{ p }}_gdl(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    {{ p }}_cp4k(GW(int32_t, {{ g.dl }}), (const int32_t *)(x + {{ 2 * META }}));
+}
+
+// A v head's z object ([half 2][slot 8][64] bf16) -> the workspace ([slot 8][128])
+void {{ p }}_gz(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const bfloat16 *__restrict z = x + {{ 2 * META }};
+    bfloat16 *__restrict zb = GW(bfloat16, {{ g.zb }});
+    for (int s = 0; s < {{ SMAX }}; s++) {
+        aie::store_v(zb + {{ D }} * s, aie::load_v<64>(z + 64 * s));
+        aie::store_v(zb + {{ D }} * s + 64, aie::load_v<64>(z + {{ 64 * SMAX }} + 64 * s));
+    }
+}
+
+// State panel x of the v head (its next one): the replay, the base out (or the state after the step's tokens: commit),
+// the step's tokens (their deltas, o)
+void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int pj = st[{{ G_PANEL }}];
+    st[{{ G_PANEL }}] = pj + 1;
+    const int h = st[{{ G_VH }}];  // (the v head in the column: its gates)
+    const int S = st[{{ G_NS }}], nrep = st[{{ G_NREP }}], commit = st[{{ G_COMMIT }}];
+    float *sp = (float *)(x + {{ 2 * META }});
+    float *__restrict dl = GW(float, {{ g.dl }}) + 8 * pj;  // [token][128]
+    for (int r = 0; r < nrep; r++)
+        {{ p }}_p2(sp, sp, GW(bfloat16, {{ g.kold }}) + {{ 2 * D }} * r, dl + {{ D }} * r, GW(float, {{ g.dold }})[16 * r + h]);
+    if (!commit)
+        {{ p }}_cp4k((int32_t *)out, (const int32_t *)sp);
+    float *__restrict uw = GW(float, {{ g.uw }});
+    for (int s = 0; s < S; s++) {
+        const bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 2 * D }} * s;  // (its k)
+        {{ p }}_p1(sp, kq, kq + {{ 2 * D * SMAX }}, uw);
+        const float *__restrict gt = GW(float, {{ g.gt }}) + 48 * s;
+        const aie::vector<float, 16> sw = aie::load_v<16>(uw);  // [S^T k | S^T q] -> (1 + d) of both
+        const aie::vector<float, 16> uw2 = aie::add(sw, al::mulff<16>(aie::broadcast<float, 16>(gt[h]), sw));
+        const float *__restrict v = GW(float, {{ g.v }}) + {{ D }} * s + 8 * pj;
+        const aie::vector<float, 16> de = al::mulff<16>(aie::broadcast<float, 16>(gt[16 + h]),
+                                                        aie::concat(aie::sub(aie::load_v<8>(v), uw2.template extract<8>(0)), aie::zeros<float, 8>()));
+        const aie::vector<float, 16> oo = aie::add(aie::concat(uw2.template extract<8>(1), aie::zeros<float, 8>()),
+                                                   al::mulff<16>(aie::broadcast<float, 16>(gt[32]), de));
+        aie::store_v(GW(float, {{ g.o }}) + {{ D }} * s + 8 * pj,
+                     al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(oo).template extract<8>(0));
+        aie::store_v(dl + {{ D }} * s, de.template extract<8>(0));
+        if (s + 1 < S)
+            {{ p }}_p2(sp, sp, kq, dl + {{ D }} * s, gt[h]);
+        else if (commit)
+            {{ p }}_p2(sp, out, kq, dl + {{ D }} * s, gt[h]);
+    }
+}
+
+// The v head's deltas of the step's tokens (the next step's replay)
+void {{ p }}_gdlout(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k((int32_t *)d, GW(int32_t, {{ g.dl }}));
+}
+
+// The v head's gated outputs rms(o) ssm_norm silu(z) -> d ([k block 16][slot 8][8] bf16), then the step's d per token
+// ([token 8][8] fp32: the next step's replay, from the last head's into the header); the next v head (of the next k
+// head after the last of this one's)
+void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int S = st[{{ G_NS }}];
+    const float *__restrict nw = GW(float, {{ g.prm }}) + 32;
+    bfloat16 *__restrict g = GW(bfloat16, {{ g.y }});  // [slot 8][128]
+    al::zero<{{ SMAX * D }}, 64>(g);
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        const float *__restrict o = GW(float, {{ g.o }}) + {{ D }} * s;
+        const bfloat16 *__restrict z = GW(bfloat16, {{ g.zb }}) + {{ D }} * s;
+        aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+        for (int i = 0; i < {{ D }}; i += 64) {
+            aie::vector<bfloat16, 64> a, b;
+            al::split2<64>(aie::load_v<64>(o + i), a, b);
+            ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
+        }
+        const aie::vector<float, 32> iv = aie::broadcast<float, 32>(al::inv_rms<{{ D }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f));
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ D }}; i += 32) {
+            aie::vector<float, 32> t = al::mulff<32>(al::mulff<32>(aie::load_v<32>(o + i), iv), aie::load_v<32>(nw + i));
+            t = al::mulff<32>(t, {{ gm.silu }}(aie::load_v<32>(z + i)));
+            aie::store_v(g + {{ D }} * s + i, aie::accum<accfloat, 32>(t).template to_vector<bfloat16>());
+        }
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < 16; kb++)
+        aie::store_v(d + 64 * kb, aie::concat(aie::concat(aie::load_v<8>(g + 8 * kb), aie::load_v<8>(g + {{ D }} + 8 * kb),
+                                                          aie::load_v<8>(g + {{ 2 * D }} + 8 * kb), aie::load_v<8>(g + {{ 3 * D }} + 8 * kb)),
+                                              aie::concat(aie::load_v<8>(g + {{ 4 * D }} + 8 * kb), aie::load_v<8>(g + {{ 5 * D }} + 8 * kb),
+                                                          aie::load_v<8>(g + {{ 6 * D }} + 8 * kb), aie::load_v<8>(g + {{ 7 * D }} + 8 * kb))));
+    float *__restrict dd = (float *)(d + {{ 16 * 64 }});
+    for (int r = 0; r < {{ SMAX }}; r++)
+        aie::store_v(dd + 8 * r, aie::load_v<8>(GW(float, {{ g.gt }}) + 48 * r));
+    st[{{ G_PANEL }}] = 0;
+    const int vi = st[{{ G_VI }}] + 1, last = vi == {{ HC // 2 }};
+    const int kh = st[{{ G_KH }}] + last;
+    st[{{ G_VI }}] = last ? 0 : vi;
+    st[{{ G_KH }}] = kh;
+    st[{{ G_VH }}] = 2 * (last ? 0 : vi) + kh;
+    if (last)
+        st[{{ G_CB }}] = 0;
+}
+
+}  // extern "C"
+""")
+
+
+class GdnShape:
+    """The GDN core's sizes for a model: HC v heads and CH conv channels per column, the message, the workspace; the
+    core of steps of up to ``slots`` (4: the message on M; 8: module docstring "8 slots")."""
+
+    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SMAX):
         assert cfg.ssm_state == D and cfg.ssm_k_heads == 2 * COLS and cfg.ssm_v_heads % (2 * COLS) == 0
+        assert slots in (SMAX, 8)
+        self.slots = slots
         self.hc = cfg.ssm_v_heads // COLS
         self.ch = (4 + self.hc) * D
         self.nb = self.ch // D  # conv blocks
@@ -436,7 +741,9 @@ class GdnShape:
         self.eps = cfg.rms_norm_eps
         assert 8 * D * 2 + HIST * D * 2 + 4 * SMAX * 16 <= xpay  # a conv object
         assert SMAX * 2 * 2 * D * 2 <= xpay and 2 * SMAX * D * 4 <= xpay  # the K and delta objects
-        assert self.hc <= 8
+        assert self.hc <= 8 and self.hc % 2 == 0
+        # (8 slots: the gdn_in objects of a slot: qkv rows, z, ab; the ab object at a C object's start)
+        assert slots == SMAX or (self.ch + D * self.hc) % c_len == 0 and 4 * self.hc <= c_len
 
     @property
     def n_panels(self) -> int:
@@ -445,16 +752,45 @@ class GdnShape:
 
     @property
     def n_objects(self) -> int:
-        """X objects of a step (after the gdn_in phase's): conv q / k 4, K, per pair 2 conv + delta + 32 panels."""
-        return 5 + self.hc // 2 * 35
+        """X objects of a step (after the gdn_in phase's): conv q / k 4, K, per pair 2 conv + delta + 32 panels; 8 slots:
+        the header, per k head 5, per v head [A, B, DL, Z] + 16 panels."""
+        return 5 + self.hc // 2 * 35 if self.slots == SMAX else 1 + 2 * KH_SPAN + self.hc * (V_SPAN + 16)
+
+    @property
+    def n_slots(self) -> int:
+        """(8 slots) Payload slots of a column's objects of a layer (module docstring "8 slots")."""
+        return V_SLOT + V_SPAN * self.hc
+
+    def kh_slot(self, kh: int) -> int:
+        """(8 slots) The first payload slot of k head kh's group [q A, q B, k A, k B, K]."""
+        return KH_SLOT + KH_SPAN * kh
+
+    def v_slot(self, h: int) -> int:
+        """(8 slots) The first payload slot of v head h's group [A, B, DL, Z]."""
+        return V_SLOT + V_SPAN * h
+
+    def block_slot(self, b: int) -> int:
+        """(8 slots) The A object's payload slot of conv block b (q heads 0, 1, k heads 0, 1, then the v heads)."""
+        return self.kh_slot(b % 2) + 2 * (b // 2) if b < 4 else self.v_slot(b - 4)
 
     def workspace(self) -> dict[str, int]:
+        if self.slots == 8:
+            S = self.slots
+            sizes = [("st", 4 * G_WORDS), ("prm", 4 * 160), ("gt", 4 * S * 48), ("kq", 2 * 2 * S * 2 * D),
+                     ("kold", 2 * S * 2 * D), ("v", 4 * S * D), ("o", 4 * S * D), ("dl", 4 * S * D), ("dold", 4 * S * 16),
+                     ("cw", 2 * 8 * D), ("zb", 2 * S * D), ("y", 2 * S * D), ("uw", 4 * 16), ("hb", 2 * 11 * D)]
+            return regions(sizes)
         sizes = [("st", 4 * G_WORDS), ("prm", 4 * 160), ("msg", 2 * SMAX * self.msgp), ("kq", 2 * SMAX * 8 * D),
                  ("gt", 4 * SMAX * 48), ("v", 4 * 2 * SMAX * D), ("o", 4 * 2 * SMAX * D), ("dl", 4 * 2 * SMAX * D),
                  ("kold", 2 * SMAX * 4 * D), ("dold", 4 * SMAX * 16), ("y", max(4 * D, 2 * SMAX * D)), ("uw", 4 * 16)]
         return regions(sizes)
 
     def render(self, p: str, consts: dict[str, int]) -> str:
+        if self.slots == 8:
+            return _SRC8.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, HC=self.hc, D=D, C_LEN=self.c_len,
+                                META=self.meta, SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)),
+                                F_GIN=F_GIN, F_GDN=F_GDN, H_AB=H_AB, H_PRM=H_PRM, H_DOLD=H_DOLD, **consts,
+                                **{k: v for k, v in globals().items() if k.startswith("G_")})
         return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
                            PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps),
@@ -492,6 +828,22 @@ def state_from_panels(p: np.ndarray, hc: int) -> np.ndarray:
     """Inverse of ``state_panels``."""
     s = np.asarray(p, np.float32).reshape(hc, 16, 16, 8, 8).transpose(0, 1, 3, 2, 4)
     return np.ascontiguousarray(s).reshape(hc, D, D)
+
+
+def conv_weights(w: np.ndarray) -> np.ndarray:
+    """(8 slots) The conv blocks' weights (CH, 4) fp32 -> per block its A object's first 2 KB: [tap 4][hi 128 | lo 128]
+    bf16 (NB, 2048) uint8."""
+    hi, lo = hilo_bits(np.asarray(w, np.float32).T)  # (4, CH)
+    nb = hi.shape[1] // D
+    wb = np.stack([hi.reshape(4, nb, D), lo.reshape(4, nb, D)], 2).transpose(1, 0, 2, 3)  # (NB, 4, 2, 128)
+    return np.ascontiguousarray(wb).view(np.uint8).reshape(nb, -1)
+
+
+def head_payload(dt: np.ndarray, ssm_a: np.ndarray, norm: np.ndarray) -> np.ndarray:
+    """(8 slots) The header's static part (at H_PRM): dt, A of the column's heads (16 fp32 each), ssm_norm (128 fp32)."""
+    out = np.zeros(160, np.float32)
+    out[:len(dt)], out[16:16 + len(ssm_a)], out[32:] = dt, ssm_a, norm
+    return out.view(np.uint8)
 
 
 def conv_payloads(sh: GdnShape, w: np.ndarray, dt: np.ndarray, ssm_a: np.ndarray, norm: np.ndarray) -> np.ndarray:

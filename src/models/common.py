@@ -471,7 +471,7 @@ class OverlayModel(NpuModel):
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
-    STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. 4 tokens' time relative to one's, until measured
+    STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
     # (a drafter step of one row's seconds; a round's kept drafts and its drafts' chain probabilities: running averages)
     _t_row = 0.0
@@ -747,7 +747,8 @@ class OverlayModel(NpuModel):
         self._begin()
         plan = self.planner
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            k = min(self.DRAFTS, self.capacity - self.position - 1, max_tokens - n - 1 if max_tokens > 0 else 4)
+            k = min(self.DRAFTS, self.capacity - self.position - 1,
+                    max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
             t0 = time.perf_counter()
             m, d = ctx.draft(k) if ctx is not None else (0, [])
             j = plan.choose(m, len(d), drafter=self._drafting and k > 0)

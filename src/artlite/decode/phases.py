@@ -1,10 +1,10 @@
 """Host side of the decode overlay's GEMV phases (``decode.design``): the K groups of a phase, their
 metadata and weight reads.
 
-A phase is one region of the image (``image.Region``) against S <= 4 slots' inputs. Its K chunks run in groups of at
-most ``design.MAX_K`` elements (the x panels of a group live in the helper core's memory): each group is an input of its
-own (a metadata object and the slots' x interleaved: ``design.input_fill``) followed by its tiles, a row tile's chunks
-of the group in a row.
+A phase is one region of the image (``image.Region``) against the inputs of S <= ``slots`` (the design's) slots. Its K
+chunks run in groups of at most ``design.MAX_K`` elements (the x panels of a group live in the helper core's memory):
+each group is an input of its own (a metadata object and the slots' x interleaved: ``design.input_fill``) followed by
+its tiles, a row tile's chunks of the group in a row.
 """
 
 from dataclasses import dataclass
@@ -84,12 +84,12 @@ def group_chunks(region: Region) -> list[tuple[int, int]]:
 
 
 def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
-           block_flags: dict[str, int] | None = None) -> list[Group]:
+           block_flags: dict[str, int] | None = None, slots: int = gemv.SLOTS) -> list[Group]:
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
     header: input objects of POST_K). The "ab" block (alpha, beta; or "alpha" of BFP16 planes, B_PAIR, and "beta")
     goes out as fp32 with F_MSG (the GDN core's) or ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block
-    of row groups (``Block.G``) gets B_G2 / B_G4."""
-    assert len(region.blocks) <= NBLK and 1 <= S <= gemv.SLOTS
+    of row groups (``Block.G``) gets B_G2 / B_G4; ``slots``: the design's (its input objects of ``design.n_inputs``)."""
+    assert len(region.blocks) <= NBLK and 1 <= S <= slots
     blk, rt = [], 0
     for b, nv in zip(region.blocks, valid_rows(region)):
         rt += b.tiles
@@ -105,7 +105,7 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
         last = i + 1 == len(parts)
         first = F_NORM | F_POST | F_PZERO
         f = F_MAIN | flags & ~(first | F_EMITR) | (flags & first if i == 0 else 0) | (flags & F_EMITR if last else 0)
-        nx = g * region.kc // POST_K if flags & F_POST else n_inputs(g * region.kc)
+        nx = g * region.kc // POST_K if flags & F_POST else n_inputs(g * region.kc, slots)
         m[M_FLAGS], m[M_NS], m[M_NX], m[M_K] = f, S, nx, g * region.kc
         m[M_NT], m[M_G], m[M_NRT], m[M_NB] = region.n_rt * g, g, region.n_rt, len(region.blocks)
         m[M_B:M_B + len(blk)] = blk

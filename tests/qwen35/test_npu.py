@@ -72,7 +72,7 @@ def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
     return (lw.exp() * (lw - lg)).sum(-1)
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B", "35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy"])
 def test_teacher_forced(size: str) -> None:
     path = _path(size)
     tokens = _tokens(path, 128)
@@ -119,8 +119,8 @@ def test_prefill(size: str) -> None:
 @pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
 def test_mtp(size: str) -> None:
     """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B with its file's own block
-    (``NpuQwen.generate``, up to 3 drafts per step): greedy replies to two user turns of a chat, the second after the
-    first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
+    (``NpuQwen.generate``, up to SLOTS - 1 drafts per step: 3, the 27B's design 7): greedy replies to two user turns of
+    a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
     model's one-token steps over the same text (the dense 27B's steps of S slots give the numbers of S steps of one),
     but where an MoE's multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps
     of one here; Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the
@@ -133,7 +133,7 @@ def test_mtp(size: str) -> None:
     _drafter(path)
     qwen = Qwen(path)
     model = qwen.load(capacity=4096)
-    assert model.drafter is not None and model.DRAFTS == 3
+    assert model.drafter is not None and model.DRAFTS == model.overlay.SLOTS - 1
     first = qwen.prompt(essay("apple.txt")[:4000] + "\n\nSummarize the essay above in a few paragraphs.")
     greedy, N = Sampling(temp=0.0, greedy=True), 48
     out1 = list(model.generate(model.forward(first), N, greedy))

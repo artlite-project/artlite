@@ -334,9 +334,10 @@ def norm_input(x: np.ndarray, w: np.ndarray, eps: float) -> tuple[np.ndarray, np
     return (x * bf(w)).astype(np.float32), inv
 
 
-def ref_rows(image: TileImage, region: Region, c: int, x: np.ndarray) -> list[np.ndarray]:
+def ref_rows(image: TileImage, region: Region, c: int, x: np.ndarray, slots: int = SLOTS) -> list[np.ndarray]:
     """The rows of column c's blocks against S slots' inputs x (S, K) (fp32 values as the cores take them): per block
-    (S, valid rows) float64, as the cores compute them (``ref_tile`` per tile and K chunk, summed)."""
+    (S, valid rows) float64, as the cores of a design of ``slots`` compute them (``ref_tile`` per tile and K chunk,
+    summed)."""
     S, KC = x.shape[0], region.kc
     g = image.gguf
     out = []
@@ -348,7 +349,7 @@ def ref_rows(image: TileImage, region: Region, c: int, x: np.ndarray) -> list[np
         y = np.zeros((S, len(rows)))
         for t0 in range(0, len(rows), b.R):
             grp = rows[t0:t0 + b.R]
-            acc = np.zeros((SLOTS, len(grp)))
+            acc = np.zeros((slots, len(grp)))
             for k in range(region.n_kc):
                 parts = []
                 lo = 0
@@ -360,7 +361,7 @@ def ref_rows(image: TileImage, region: Region, c: int, x: np.ndarray) -> list[np
                 for sel, f in parts:
                     for key, v in fc.items():
                         v[sel] = f[key]
-                acc += ref_tile(b.fmt, fc, x[:, k * KC:(k + 1) * KC])
+                acc += ref_tile(b.fmt, fc, x[:, k * KC:(k + 1) * KC], slots)
             y[:, t0:t0 + len(grp)] = acc[:S]
         out.append(y)
     return out
