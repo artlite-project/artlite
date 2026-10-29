@@ -12,7 +12,7 @@ import torch
 from artlite.decode import design as OD
 from artlite.decode import kv as KV
 from artlite.decode import phases as mp
-from artlite.decode.vring import ring_rows, tails
+from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.operators import kmath
 from artlite.operators.bfp16 import block_bytes, block_values
@@ -494,7 +494,13 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("1B", 150, 2, True, True), ("1B", 1001, 2, True, False),
                                                              ("1B", 129, 1, True, False), ("35B-A3B", 38, 2, False, False),
                                                              ("35B-A3B", 150, 1, True, True),
-                                                             ("35B-A3B", 1001, 1, True, False)])
+                                                             ("35B-A3B", 1001, 1, True, False), ("35B-A3B", 1001, 2, True, True),
+                                                             ("9B", 150, 4, True, True), ("9B", 1001, 3, True, False),
+                                                             ("1B", 1001, 4, True, False), ("9B", 37, 4, False, False),
+                                                             ("27B", 36, 4, False, True), ("35B-A3B", 768, 1, True, True),
+                                                             ("35B-A3B", 768, 1, True, False), ("35B-A3B", 384, 2, True, False),
+                                                             ("27B", 150, 4, True, False), ("27B", 1001, 3, True, True),
+                                                             ("27B", 1000, 4, True, False)])
 def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
@@ -502,7 +508,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
     records of the new positions; its last: their records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
-    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of one slot)."""
+    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots)."""
     from models.qwen35 import attn as A1
 
     path = ref.qwen_gguf("Q4_K_M", size)
@@ -545,7 +551,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     cs = [A1.rope_cs(cfg, p + s) for s in range(S)]
     G = g + 1
     b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
-    nt = tails(S)
+    nt = A1.TAILS
     # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared)
     per = (1 + OD.SLOTS) * OD.XB
     act = dev.alloc("ACT", COLS * per + S * OD.XB)
@@ -556,10 +562,10 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (nph + 1 if split else 2) * S
         m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, split, S), p, int(split)
         m[MD.M_NTAIL], m[MD.M_ATREC] = tl, int(rec)
-        if not split:
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * G + tl, 0, 1 << 20
-        elif k == 0:
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = 3 * (b[1] + 1), 0, b[1], g
+        if not split:  # (a chain's first column: then group g's K objects again)
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * G + tl + (2 if k == 0 else 0), 0, 1 << 20
+        elif k == 0:  # (then group g's K objects)
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = 3 * b[1] + 2, 0, b[1], g
         else:
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
         o = c * per
@@ -589,12 +595,14 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         else:
             seq.fill("A", c, base + 3 * b[k] * T, 3 * (b[k + 1] - b[k]) * T)
             if k == 0:
-                seq.fill("A", c, base + 3 * g * T, 3 * T)
+                seq.fill("A", c, base + 3 * g * T, 2 * T)
         if not split or role == A1.ROLE_V:  # (the tail objects)
             for t in range(nt):
                 r = rl if t else rp
                 v0 = base + 3 * (rp // 4) * T + 2 * T + rp % 4 * A1.REC_V
                 seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T)
+        if not split and k == 0:
+            seq.fill("A", c, base + 3 * g * T, 2 * T)
     for c in range(COLS):
         seq.fill("X", c, dev.address("ACT", c * per), OD.XB)
         if split:  # (the q objects of the chain's columns in order)

@@ -38,7 +38,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
     (None: without)."""
 
     PREFIX = "q35m"
-    GDN_STACK, ATTN_STACK = 4864, 3456
+    GDN_STACK, ATTN_STACK = 4864, AT.STACK
+    A_FWD = 3  # (the attention core holds its last two A objects: decode.design's A_FWD)
+    LENDS_WS = True  # (the attention core's regions in the main core's memory)
     GDN_ROW, ATTN_ROW = 2, 5
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
@@ -52,6 +54,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
         self.msg, self.relay = gdn is not None, attn is not None
+        self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
+        self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
                          paged=paged, win=win)
 
@@ -63,8 +67,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         if self.gdn is not None:
             src += self.gdn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")})
         if self.attn is not None:
+            W = self.workspace()  # (the main core's: its regions past the residual, idle in an attention sub-step)
+            assert W["size"] - W["inv"] >= AT.EXT_W and (not self.attn.main_gates or self.xs_bytes >= AT.EXT_X), W
+            assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
             src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                    | {"META": META, "NX_PER_NORM": NX_PER_NORM})
+                                    | {"META": META, "NX_PER_NORM": NX_PER_NORM}, tail=W["inv"])
         return src
 
     @property
@@ -153,7 +160,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             AWs = attn.workspace()
             aws_ty = np.ndarray[(AWs["size"] // 4,), i32]
             i_a = AWs["st"] // 4
-            k_abegin = Kernel(f"{p}_abegin", "kernel.o", [x_ty, aws_ty, np.int32])
+            mws_ty = np.ndarray[(self.workspace()["size"] // 4,), i32]
+            mxs_ty = np.ndarray[(self.xs_bytes,), np.dtype[np.uint8]]
+            k_abegin = Kernel(f"{p}_abegin", "kernel.o", [x_ty, aws_ty, np.int32, mws_ty, mxs_ty])
             k_anb = Kernel(f"{p}_anb", "kernel.o", [aws_ty])
             k_aq = Kernel(f"{p}_aq", "kernel.o", [x_ty, aws_ty])
             k_aqpan = Kernel(f"{p}_aqpan", "kernel.o", [aws_ty])
@@ -162,16 +171,17 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             k_asoft = Kernel(f"{p}_asoft", "kernel.o", [aws_ty])
             k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
             tok_ty = np.ndarray[(16,), i32]
-            k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, c_ty])
+            k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, s.r_ty])
 
-            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, col):
+            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, mws, mxs,
+                        col):
                 # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
                 # attention step: a core produces its east token around its scores (a split step's partial stays in its
                 # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
-                # of the west partial, pw)
+                # of the west partial, pw); mws, mxs: the main core's workspace and sum panels (attn.AttnShape.ext)
                 for _ in forever_():
                     x = x_f.acquire(1)
-                    abegin(x, ws, col)
+                    abegin(x, ws, col, mws, mxs)
                     x_f.release(1)
                     for _ in range_(ws[i_a + AT.A_NNO]):  # (a main core's normed phase: as it consumes them)
                         a_f.acquire(1)
@@ -202,7 +212,12 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             a = a_f.acquire(1)
                             aobj(a, ws)
                             a_f.release(1)
-                            asoft(ws)  # (a group's softmax while its V object streams in)
+                            asoft(ws)  # (a group's softmax after its K objects)
+                        h = a_f.acquire(AT.HOLD)  # (the last two: held until the emission, which reads records from them)
+                        aobj(h[0], ws)
+                        asoft(ws)
+                        aobj(h[1], ws)
+                        asoft(ws)
                         if t_in:
                             t_in[0].acquire(1)
                             aend(ws, pw)
@@ -216,6 +231,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             r = r_f.acquire(1)
                             aemit(ws, r)
                             r_f.release(1)
+                        a_f.release(AT.HOLD)
 
             aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
                           tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
@@ -224,9 +240,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             for c in range(COLS):
                 t_in = [toks[c - 1].cons()] if c % n else []
                 t_out = [toks[c].prod()] if c in toks else []
-                workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=1), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(),
+                workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(),
                                                 t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
-                                                k_aemit, aws[c], aws[c - 1 if c % n else c], c],
+                                                k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c],
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos

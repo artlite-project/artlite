@@ -216,6 +216,9 @@ class DecodeOverlayOperator(ArtcOperator):
 
     PREFIX = "ovd"
     A_DEPTH, X_DEPTH = 8, 2  # memtile objects of the A and X streams
+    # (the A stream's L1 objects: the main core's; A_FWD, the forward's own depth, differs where a model core holds two of
+    # them at once: MLIR-AIE then takes each end's depth at its word instead of its largest acquire + 1)
+    A_L1, A_FWD = 2, 2
     STACK, HELPER_STACK = 2048, 2048
     MAIN_ROW, HELPER_ROW = 4, 3
     SHM = {1: -0x10000, -1: -0x30000}[MAIN_ROW - HELPER_ROW]  # the main core's memory as the helper sees it
@@ -223,6 +226,11 @@ class DecodeOverlayOperator(ArtcOperator):
                                                        "D": (txn.S2MM, 1)}
     BD_BASE: ClassVar[dict[str, int]] = {"A": 0, "X": 4, "C": 8, "D": 12}
     msg = relay = False
+    # gate: a model's attention whose gates the main core applies (its source: ``{p}_gbegin`` for begin, ``{p}_mgate`` on
+    # each skipped X object, ``{p}_mrelay`` for the R objects, R_LEN bf16 elements each: o as fp32, records as bf16)
+    gate = False
+    R_LEN = C_LEN
+    LENDS_WS = False  # (a model core uses the main core's workspace: _Streams.ws, placed on the main core's tile)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -344,7 +352,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
-                                 moe=self.moe, **self._moe_vars(p, consts), **consts)
+                                 moe=self.moe, gate=self.gate, **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
         """(moe) The template variables of the MoE paths: the routing's source (``moe.route``), the side chunk, the
@@ -418,6 +426,7 @@ class DecodeOverlayOperator(ArtcOperator):
         a_ty = np.ndarray[(self.tile_bytes,), u8]
         x_ty = np.ndarray[(XB // 2,), bf]
         c_ty = np.ndarray[(C_LEN,), bf]
+        rr_ty = np.ndarray[(self.R_LEN,), bf]  # (an R object)
         cmd_ty = np.ndarray[(CMD_WORDS,), i32]
         r_ty = np.ndarray[(self.yn,), f32]
         W = self.workspace()
@@ -438,7 +447,9 @@ class DecodeOverlayOperator(ArtcOperator):
         k_tile = Kernel(f"{p}_tile", "kernel.o", [a_ty, ws_ty, xp_ty, xs_ty])
         k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty])
         k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty])
-        k_relay = Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty])
+        k_relay = (Kernel(f"{p}_mrelay", "kernel.o", [rr_ty, c_ty, ws_ty, xp_ty]) if self.gate else
+                   Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
+        k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
         if self.moe:  # (acc: the experts' partials of the column, in the helper's memory)
@@ -450,7 +461,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
         a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH) for c in range(COLS)]
-        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH).forward(tile=Tile(c, 1), depth=2, name=f"{P}_a{c}") for c in range(COLS)]
+        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}") for c in range(COLS)]
         # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
         x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH, **({"packet": True, "packet_id": XID} if self.moe
                                                                             else {})) for c in range(COLS)]
@@ -458,7 +469,7 @@ class DecodeOverlayOperator(ArtcOperator):
         c_fifos = [ObjectFifo(c_ty, name=f"{P}_C{c}", depth=2) for c in range(COLS)]
         cmds = [ObjectFifo(cmd_ty, name=f"{P}_cmd{c}", depth=2) for c in range(COLS)]
         m_fifos = [ObjectFifo(c_ty, name=f"{P}_M{c}", depth=2) for c in range(COLS)] if self.msg else []
-        r_fifos = [ObjectFifo(c_ty, name=f"{P}_R{c}", depth=2) for c in range(COLS)] if self.relay else []
+        r_fifos = [ObjectFifo(rr_ty, name=f"{P}_R{c}", depth=2) for c in range(COLS)] if self.relay else []
         ress = [ObjectFifo(r_ty, name=f"{P}_res{c}", depth=2) for c in range(COLS)]
 
         def main_fn(a_f, x_f, c_f, cmd_f, res_f, *rest):
@@ -471,6 +482,7 @@ class DecodeOverlayOperator(ArtcOperator):
             r_f = rest.pop(0) if self.relay else None
             if self.moe:
                 sub, lstrip, acc, *rest = rest
+            xgate = rest.pop(0) if self.gate else None
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
             ea = (acc,) if self.moe else ()  # (collect's and emit's last argument: moe's acc)
 
@@ -561,8 +573,10 @@ class DecodeOverlayOperator(ArtcOperator):
                             answer()
                         inputs()
                         tiles()
-                for _ in range_(ws[i_st + S_NSKIP]):  # the other cores' X objects
-                    x_f.acquire(1)
+                for _ in range_(ws[i_st + S_NSKIP]):  # the other cores' X objects (gate: a q object's gates)
+                    x = x_f.acquire(1)
+                    if xgate is not None:
+                        xgate(x, ws, xp)
                     x_f.release(1)
                 for _ in range_(ws[i_st + S_NASKIP]):  # and A objects
                     a_f.acquire(1)
@@ -571,7 +585,10 @@ class DecodeOverlayOperator(ArtcOperator):
                     for _ in range_(ws[i_st + S_NR]):  # the model core's outputs -> C
                         r = r_f.acquire(1)
                         o = c_f.acquire(1)
-                        relay(r, o)
+                        if self.gate:
+                            relay(r, o, ws, xp)
+                        else:
+                            relay(r, o)
                         c_f.release(1)
                         r_f.release(1)
 
@@ -584,6 +601,7 @@ class DecodeOverlayOperator(ArtcOperator):
                 cmd_f.release(1)
 
         workers, pg_flows, pg_locks, pg_main, pg_help = [], [], [], {}, {}
+        m_ws, m_xs = [], []
         st_ty = np.ndarray[(paging.STATE_WORDS,), i32]
         for c in range(COLS):  # (paged formats: per core its state words and wake lock, per column its store and routes)
             if not self.paged:
@@ -609,15 +627,18 @@ class DecodeOverlayOperator(ArtcOperator):
         # (paged: the main cores take COLS + their column, not a constant 0 in column 0, which can give its control code
         # another size: every core's resident kernels must lie where the pages were linked, ``paging.link``)
         for c in range(COLS):
-            ws = Buffer(ws_ty, name=f"{P}_ws{c}")
+            ws = Buffer(ws_ty, name=f"{P}_ws{c}", **({"tile": Tile(c, mr)} if self.LENDS_WS else {}))
+            m_ws.append(ws)
             moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
             xs = Buffer(xs_ty, name=f"{P}_xs{c}", tile=Tile(c, mr))
+            m_xs.append(xs)
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, hr))
-            workers.append(Worker(main_fn, [a_l1[c].cons(), x_l1[c].cons(depth=1), c_fifos[c].prod(), cmds[c].prod(),
+            workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=1), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
-                                            *([r_fifos[c].cons()] if self.relay else []), *moe_args, k_begin, k_nbegin,
+                                            *([r_fifos[c].cons()] if self.relay else []), *moe_args,
+                                            *([k_xgate] if self.gate else []), k_begin, k_nbegin,
                                             k_strip_n,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
                                             *([k_psums] if self.post else []), ws, xp, xs,
@@ -629,7 +650,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                               *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
-        s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos)
+        s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
+                     ws=m_ws, xs=m_xs)
         extra, d_fifos = self._extra_workers(s)
         workers += extra
         a_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["A"][1]) for c, f in enumerate(a_l3)]
@@ -678,10 +700,13 @@ class _Streams:
     a_ty: object
     x_ty: object
     c_ty: object
+    r_ty: object  # an R object
     a_l1: list  # per column the A stream's L1 ObjectFifo (broadcast: a model core may consume it)
     x_l1: list
     m_fifos: list  # the main cores' M streams (msg)
     r_fifos: list  # the R streams to the main cores (relay)
+    ws: list  # per column the main core's workspace and sum panels (``workspace``, xs: a model core may use the regions
+    xs: list  # idle while its objects run; LENDS_WS)
 
 
 # ----------------------------------------------------------------------

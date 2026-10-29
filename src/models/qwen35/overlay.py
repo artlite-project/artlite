@@ -81,7 +81,7 @@ from artlite.decode.design import (
     interleave,
 )
 from artlite.decode.model import ModelOverlay, host_bytes, paged_formats
-from artlite.decode.vring import substeps, tails
+from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
@@ -170,6 +170,7 @@ class QwenOverlay(ModelOverlay):
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
                                       paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16))
+        self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
@@ -354,6 +355,7 @@ class QwenOverlay(ModelOverlay):
             self._load_gdn(L)
         dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
+        self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
 
@@ -469,16 +471,18 @@ class QwenOverlay(ModelOverlay):
             if u:
                 seq.sync()  # (sub-step u - 1's records in DDR)
             for c in range(COLS):  # the cache of the column's KV head (address, length: _set_position), its ring
+                head = dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes)
                 kinds = ("all",) if not split else ("run", "new") if c % nph == 0 else ("run",)
-                for kind in kinds:  # (split: the chain's first column its run, then the new positions' for their records)
-                    at = seq.fill("A", c, dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes), 3 * T)
-                    st.fills.append((at, L, c, u, kind))
+                for kind in kinds:  # (split: the chain's first column its run, then the new positions' K objects)
+                    st.fills.append((seq.fill("A", c, head, 3 * T), L, c, u, kind))
                 if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T), L, c, u, t)
-                                 for t in range(tails(n))]
+                                 for t in range(attn.TAILS)]
+                if not split and c % nph == 0:  # (then the new positions' K objects again, for their records)
+                    st.fills.append((seq.fill("A", c, head, 3 * T), L, c, u, "new"))
             last = u == len(st.subs) - 1 and run
-            if last:
-                self._weight_run(seq, run, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
+            if last and self._a_bds > 1 + attn.TAILS:  # (a later block's after the X objects: ``_weight_run``)
+                self._weight_run(seq, run, blocks=slice(1))
             if u == 0:
                 seq.sync()  # (attn_in's q, K, V in DDR)
             for c in range(COLS):
@@ -490,7 +494,7 @@ class QwenOverlay(ModelOverlay):
                     seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
                 seq.fill("X", c, dev.address("ACT", self.rawkv[L] + a * XB), n * XB)
             if last:
-                self._weight_run(seq, run, blocks=slice(1, None))
+                self._weight_run(seq, run, blocks=slice(1 if self._a_bds > 1 + attn.TAILS else 0, None))
             for c in range(COLS):  # o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's
                 # last column's of the chain's), then the records (addresses: _set_position)
                 role = ash.role(c)
@@ -595,10 +599,8 @@ class QwenOverlay(ModelOverlay):
         if self.ash is None:
             return ()
         out = []
-        for a, n in substeps(p, S, attn.POS_PER_GROUP, attn.SUB):
-            split = attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)
-            r = self.ash.split_sub if split else n  # (a split sub-step's slots at most: ``AttnShape.split_sub``)
-            out += [(a + i, min(r, n - i), split) for i in range(0, n, r)]
+        for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub):
+            out.append((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
         return tuple(out)
 
     def _set_position(self, st: _Step, p: int) -> None:
@@ -631,13 +633,13 @@ class QwenOverlay(ModelOverlay):
                     o = self._fatt(L, c, u)
                     m = act[o:o + 4 * META].view(np.int32)
                     k = c % nph
-                    nt = tails(n) if not split or ash.role(c) == attn.ROLE_V else 0
+                    nt = attn.TAILS if not split or ash.role(c) == attn.ROLE_V else 0
                     m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, a, (nph + 1 if split else 2) * n, int(split)
                     m[M_NREL], m[M_NTAIL], m[M_ATREC] = ash.n_rel(c, split, n), nt, int(rec_mode[L] and u == 0)
-                    if not split:
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * G + nt, 0, 1 << 20, 0
-                    elif k == 0:  # (then group g for its K records)
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[1] + 1), 0, b[1], g
+                    if not split:  # (a chain's first column: then group g's K objects again, for its K records)
+                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * G + nt + (2 if k == 0 else 0), 0, 1 << 20, 0
+                    elif k == 0:  # (then group g's K objects for its K records)
+                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * b[1] + 2, 0, b[1], g
                     else:
                         m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
                     q0 = o + 4 * META + 4 * 2 * attn.HD
@@ -645,10 +647,10 @@ class QwenOverlay(ModelOverlay):
         for L in self.fatt:
             dev.flush("ACT", self.fatt[L], COLS * self.ash.u * XB)
         w = st.tr.words
-        for at, L, c, u, kind in st.fills:
+        for at, L, c, u, kind in st.fills:  # ("new": the group's K objects)
             g0, g1 = groups[u][(c, kind)]
             w[at:at + 3] = txn.bd_words(dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes + 3 * g0 * T),
-                                        3 * (g1 - g0) * T)
+                                        (2 if kind == "new" else 3 * (g1 - g0)) * T)
         for at, L, c, u, t in st.tails:  # (the ring slots of the sub-step's first and last records, or the first's V
             a, n, _ = st.subs[u]  # panels in record mode)
             r = (p + a + (n - 1 if t else 0)) >> 3
@@ -753,6 +755,7 @@ class QwenOverlay(ModelOverlay):
         dev.view("GOBJ").view(np.uint16)[src] = dev.view("GHDR").view(np.uint16)[dst]
         dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
+        self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
 

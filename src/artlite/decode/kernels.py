@@ -668,6 +668,9 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
         st[{{ S_NSKIP }}] = m[{{ M_SKIP }}];
         st[{{ S_NASKIP }}] = m[{{ M_NASKIP }}];
         st[{{ S_NR }}] = m[{{ M_NREL }}];
+{% if gate %}
+        {{ p }}_gbegin(m, st, col);  // (the model's: the gates its relay applies)
+{% endif %}
 {% if tok %}
         if (flags & {{ F_TOK }})  // a layer kind's token object: the column's cache objects of its attentions
             st[{{ S_NAS }} + m[{{ M_TOK_KIND }}]] = m[{{ M_TOK_NG }} + col];

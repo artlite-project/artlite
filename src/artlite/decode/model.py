@@ -264,7 +264,7 @@ class ModelOverlay:
         streaming it while the attention waits for them), its later ones after the attention's X objects: a column's
         cache range and two tail objects hold three of A's 4 queued tasks, and a fifth task waits for the oldest, the
         cache's, which the core consumes only with those X objects (once the range outgrows the buffers on its way: a
-        hang)."""
+        hang). Where A has 3 BDs for the host (an MoE design's), the whole run goes after the X objects."""
         img = image or self.image
         first = phases[0]
         norm = (first[0], first[1] + "_norm")
