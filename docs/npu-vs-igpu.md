@@ -43,7 +43,7 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
 - **Decode** reads every weight once per token, so each device decodes at its own read limit and the tokens/s ratio
   (3.6-3.7x) is the bandwidth ratio. Artlite's decode is close to the NPU's limit already: what remains is more tokens
   per weight pass (a step of 4 tokens costs ~5-8% more than a step of one: the draft tokens Artlite's generation takes
-  from a drafter or from the context; Qwen3.8 27B with its MTP layer: 7.3 tokens/s after a 1K-token prompt instead of
+  from a drafter or from the context; Qwen3.8 27B with its MTP layer: 7.4 tokens/s after a 1K-token prompt instead of
   3.3) and fewer bytes per token (MoE, lower-bit weights).
 - **Prefill** is compute-bound and on par with llama.cpp, at a fraction of the iGPU's power. Engines tuned for this
   iGPU go further: [a gufo fork](https://github.com/mikealanni/gufo) publishes GPU-only rates at 8192-token prompts of
