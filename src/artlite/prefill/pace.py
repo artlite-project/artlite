@@ -6,10 +6,14 @@ Point laptop's Q4_K GEMMs 2.3x slower, on any power source), while at a lower du
 heaviest pace class (by its items' MACs) at levels 0 and ``QUICK``; if none of those runs clearly faster than
 level 0 (``GAIN``), nothing throttles and every level stays 0 (two or three runs of the class's items: ~0.1-0.3 s).
 Else each class from level 0 up keeps the fastest level (``MARGIN``: a higher level only when clearly faster; the scan
-stops two levels past a level faster than 0), and the GEMMs of all classes together, the levels against level 0,
-confirm them. The items are a chunk's GEMMs (``T``) with their outputs in a scratch buffer: calibrating never writes the
-prefill's or the overlay's buffers. GEMMs that read a parameter of the chunk (``mc_param``: an MoE layer's token chunks)
-run paced at their class's level, not in the calibration.
+stops two levels past a level faster than 0), and the GEMMs of all classes together confirm them: those levels or every
+class one level deeper (when clearly faster: classes unthrottled alone can still trip it together), against level 0.
+The items are a chunk's GEMMs (``T``) on random activations (``activations``), with their outputs in a scratch buffer:
+calibrating never writes the prefill's or the overlay's buffers. The activations matter: the array's current follows
+its operands' bits (Strix Halo, the 1B's gate/up at the same speed: 26-29 W socket power on zeros, 35-36 on random or a
+prompt's activations), and the prefill's buffers hold zeros until a first chunk, on which a throttling laptop's GEMMs
+run unthrottled. GEMMs that read a parameter of the chunk (``mc_param``: an MoE layer's token chunks) run paced at
+their class's level, not in the calibration.
 
 ``ARTLITE_PACE``: unset or ``auto`` (the cached or calibrated levels), ``off`` (level 0), ``recalibrate`` (calibrate
 again), or levels: ``<class>=<level>`` by ``PACE_CLASSES`` name, comma-separated, or one level for every class (e.g.
@@ -28,11 +32,14 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from ..gemm.gemm_q import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
 from ..operators.base import CACHE_DIR
 from ..operators.util import arg_bytes
 
 CACHE = os.path.join(CACHE_DIR, "pace.json")
+VERSION = 2  # (of the calibration: a cached entry of another version calibrates again)
 T_MAX = 1024  # tokens of the chunk whose GEMMs calibrate (the largest size up to it)
 ITEMS = 16  # items of a class at most
 QUICK = (3, 5)  # levels against level 0 of the heaviest class: a throttle shows as a faster paced run
@@ -133,28 +140,51 @@ def search(classes: list[int], measure: Callable[[list[int] | None, int], float]
         if best:
             levels[c] = best
     if levels:
-        both = measure(None, 0), measure(None, pace_word(levels))
-        table["all"] = {"s": {"level 0": both[0], "levels": both[1]}}
-        if both[1] > both[0] * (1 - MARGIN):
+        deeper = {c: min(levels.get(c, 0) + 1, len(PACE_IDLE) - 1) for c in classes}
+        s = {"level 0": measure(None, 0), "levels": measure(None, pace_word(levels)),
+             "deeper": measure(None, pace_word(deeper))}
+        table["all"] = {"s": s}
+        t = s["levels"]
+        if s["deeper"] < t * (1 - MARGIN):
+            levels, t = deeper, s["deeper"]
+        if t > s["level 0"] * (1 - MARGIN):
             note("paced, the GEMMs together are not faster: unpaced")
             return {}, table
     note(f"paced: {describe(pace_word(levels)) or 'none'}")
     return levels, table
 
 
+def activations(n: int, seed: int = 0) -> np.ndarray:
+    """n bytes of activation panels (bfp16ebs8 blocks [E, m0..m7], ``operators.bfp16``) of N(0, 1) values: a pattern
+    of 64 K blocks, repeated."""
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((min(1 << 16, -(-n // 9)), 8), np.float32)
+    e = np.floor(np.log2(np.abs(x).max(1))).astype(np.int32)
+    blocks = np.empty((len(x), 9), np.uint8)
+    blocks[:, 0] = e + 127
+    m = np.clip(np.rint(x * np.ldexp(np.float32(1), 6 - e)[:, None]), -128, 127)
+    blocks[:, 1:] = m.astype(np.int8).view(np.uint8)
+    return np.resize(blocks.reshape(-1), n)
+
+
 def _items(pf: Any) -> tuple[dict[int, list], dict[int, float], dict[str, Any], int]:
-    """Per pace class the calibration items of the prefill ``pf`` (its GEMMs' of chunk size ``T``, C in the scratch
-    buffer), their MACs, the buffers they address, T."""
+    """Per pace class the calibration items of the prefill ``pf`` (its GEMMs' of chunk size ``T``, A and C in the
+    scratch buffers, A random ``activations``), their MACs, the buffers they address, T."""
     T = max([t for t in pf.sizes if t <= T_MAX] or [min(pf.sizes)])
-    runlist = [(op, a, w, f"PACE_C[0:{arg_bytes(op, 2)}]") for op, a, w, *_ in pf.runlists[T]
+    runlist = [(op, f"PACE_A[0:{arg_bytes(op, 0)}]", w, f"PACE_C[0:{arg_bytes(op, 2)}]")
+               for op, _, w, *_ in pf.runlists[T]
                if getattr(op, "pace", None) is not None and not op.mc_param]  # (mc_param: a chunk's own parameter)
     by: dict[int, list] = {}
     for item in runlist:
         if len(by.setdefault(item[0].pace, [])) < ITEMS:
             by[item[0].pace].append(item)
     macs = {c: float(sum(op.M * op.K * op.N for op, *_ in rl)) for c, rl in by.items()}
-    scratch = pf.ov.dev.device.alloc_host_buffer(max(arg_bytes(op, 2) for op, *_ in runlist))
-    buffers = {**pf._buffers(), "PACE_C": scratch}
+    dev = pf.ov.dev.device
+    pa = dev.alloc_host_buffer(max(arg_bytes(op, 0) for op, *_ in runlist))
+    pa.write(activations(pa.size))
+    pa.sync_to_device()
+    pc = dev.alloc_host_buffer(max(arg_bytes(op, 2) for op, *_ in runlist))
+    buffers = {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}
     return {c: pf.lib.items(rl, buffers) for c, rl in by.items()}, macs, buffers, T
 
 
@@ -195,9 +225,10 @@ def resolve(pf: Any) -> int:
     if fixed is not None:
         return pace_word(fixed)
     key = f"{machine_key()}|{os.path.basename(os.path.dirname(pf.lib.elf_path))}"
-    if spec.strip().lower() != "recalibrate" and (hit := _cache().get(key)) is not None:
+    hit = _cache().get(key)
+    if spec.strip().lower() != "recalibrate" and hit is not None and hit.get("version") == VERSION:
         return int(hit["word"])
     word, table = calibrate(pf)
-    _store(key, {"word": word, "levels": describe(word), "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                 "seconds": round(table["seconds"], 3)})
+    _store(key, {"word": word, "levels": describe(word), "version": VERSION,
+                 "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seconds": round(table["seconds"], 3)})
     return word

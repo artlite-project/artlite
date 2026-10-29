@@ -4,9 +4,11 @@ while its duty is above a trip point)."""
 
 from collections.abc import Callable
 
+import numpy as np
 import pytest
 
 from artlite.gemm.gemm_q import PACE_BITS, PACE_CLASSES, PACE_IDLE, pace_class, pace_levels, pace_word
+from artlite.operators import bfp16
 from artlite.prefill import pace as P
 
 
@@ -77,3 +79,28 @@ def test_search_unconfirmed() -> None:
 
     levels, table = P.search([gu, qkv], together)
     assert levels == {} and table["all"]["s"]["levels"] > table["all"]["s"]["level 0"]
+
+
+def test_search_deeper_together() -> None:
+    """Classes unthrottled alone at their levels that trip together (a trip duty lower for the whole program): every
+    class one level deeper."""
+    gu, qkv = pace_class("gu", False), pace_class("qkv", False)
+    alone, _ = _machine({gu: 36.0, qkv: 9.0}, {gu: 0.9, qkv: 0.9})
+    together, _ = _machine({gu: 36.0, qkv: 9.0}, {gu: 0.85, qkv: 0.85})
+
+    def measure(classes: list[int] | None, word: int) -> float:
+        return (together if classes is None else alone)(classes, word)
+
+    levels, table = P.search([gu, qkv], measure)
+    duty = [16 / (16 + i) for i in PACE_IDLE]
+    first = next(L for L, d in enumerate(duty) if d <= 0.9)
+    assert duty[first] > 0.85 and levels == {gu: first + 1, qkv: first + 1}
+    assert table["all"]["s"]["deeper"] < table["all"]["s"]["levels"]
+
+
+def test_activations() -> None:
+    """Random activation panels: valid bfp16ebs8 blocks of N(0, 1) values, any length."""
+    b = P.activations(9 * 4096 + 5)
+    assert b.dtype == np.uint8 and b.size == 9 * 4096 + 5
+    v = bfp16.block_values(b[:9 * 4096].reshape(-1, 9))
+    assert abs(float(v.std()) - 1) < 0.05 and abs(float(v.mean())) < 0.05 and np.count_nonzero(v) > 0.99 * v.size
