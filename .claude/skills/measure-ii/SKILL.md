@@ -303,7 +303,7 @@ mmvh_q5k_mm loop 1/1: for.body @kernel.cc:261, depth 1 (in base); ranked by cycl
 - Columns: `iters` = ZOL count + peeled iterations; `cycles` per entry with prologue and epilogue; the
   loop body's ops per slot (llvm-aie's slot of each mnemonic; a `lng` op takes alu and mv); `port`: the busiest
   register / memory port that ops of several slots share (`rm` L_RM_PORT: shuffles, selects, broadcasts and every
-  bfp16 push / flush; `wm`, `qwa`, `qwb`, `qrs`, `dwm`, `ada`: aie-kernel-perf-optimization
+  bfp16 push / flush; `wm`, `qwa`, `qwb`, `qrs`, `dwm`, `ada`, `lck`: aie-kernel-perf-optimization
   `reference/machine-model.md`); `res bound` = the busiest slot or port, `*` on the binding ones, whose ops are
   listed below the table. A loop with II far above its slots and "out of resources" at every II is often port-bound.
 - A one-block loop left unpipelined (every loop with `--why`) is compiled again by the debug build of

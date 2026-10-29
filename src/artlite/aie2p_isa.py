@@ -78,6 +78,7 @@ PORT_UNITS = {
     "qrs": "QEY_RS_L0_PORT",
     "dwm": "DM_WM_L0_PORT",
     "ada": "DM_ADA",
+    "lck": "LCKREQ",
 }
 PORT_MNEMONICS = {
     "rm": (
@@ -130,5 +131,8 @@ PORT_MNEMONICS = {
         "vlda.pop.512.2d vlda.pop.512.3d vlda.pop.544 vlda.pop.544.2d vlda.pop.544.3d vlda.pop.576 vlda.pop.576.2d "
         "vlda.pop.576.3d vlda.pop.640 vlda.pop.640.2d vlda.pop.640.3d vlda.pop.704 vlda.pop.704.2d vlda.pop.704.3d "
         "vlda.ups.2x vlda.ups.4x vldb.4x16.hi vldb.4x16.lo vldb.4x32.hi vldb.4x32.lo vldb.4x64.hi vldb.4x64.lo"
+    ),
+    "lck": (
+        "acq*4 acq.cond*4 rel*4 rel.cond*4"
     ),
 }

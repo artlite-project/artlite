@@ -159,6 +159,14 @@ def test_count_ports() -> None:
     assert slots.describe("rm") == "vshuffle 3, vst.push.576.conv.bfp16ebs8.fp32 1, vst.flush.512.conv 1"
 
 
+def test_lock_port() -> None:
+    """A lock op holds the core's lock-request unit 4 cycles: an acquire + release loop (an ObjectFifo drain) is
+    bound at 8 by it, not by its scalar ops."""
+    slots = count_slots([["acq\t#53, r1"], ["add\tr0, r0, #-1"], ["jnz\tr0, #0x0"], ["rel\t#52, r2"]])
+    assert slots.count("alu") == 3 and slots.count("lck") == 8  # (jnz: lng)
+    assert slots.bound == 8 and slots.binding == ["lck"]
+
+
 def test_pragma_variants() -> None:
     """A pragma replaces the pipelining pragma of the target's innermost rolled loops, other pragmas stay;
     unrolled loops, calls and other functions are left alone."""
@@ -397,3 +405,24 @@ def test_search_report(tmp_path: Path) -> None:
     (loop,) = [loop for loop in base.loops if "vs_scale" in loop.function]
     assert loop.asm_body and len(loop.asm_body) == loop.body_bundles
     assert f" {loop.ii} " in rows["base"]
+
+
+class _Flagged:
+    """An operator stand-in whose parameter only changes its compiler flags."""
+
+    def __init__(self, flags: tuple[str, ...] = ()):
+        self.clang_flags = list(flags)
+
+    def get_kernel_src(self) -> str:
+        return KERNEL
+
+
+def test_search_flags(tmp_path: Path) -> None:
+    """Variants of one source with different compiler flags are compiled each; equal flags share a report."""
+    variants = [Variant("base"), Variant("same", params={"flags": ()}),
+                Variant("flag", params={"flags": ("-mllvm", "--enable-aie-zol-without-minitercount=false")})]
+    result = search(_Flagged, {}, functions=["vs_scale"], variants=variants, out_dir=tmp_path)
+    by_name = {item.variant.name: item for item in result.variants}
+    assert all(item.error is None for item in result.variants), [item.error for item in result.variants]
+    assert by_name["same"].same_as == "base" and by_name["flag"].same_as is None
+    assert by_name["flag"].clang_cmd[-1] == "--enable-aie-zol-without-minitercount=false"

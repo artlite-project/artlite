@@ -38,6 +38,7 @@ PORTS = {
     "qrs": "QEY_RS_L0_PORT",
     "dwm": "DM_WM_L0_PORT",
     "ada": "DM_ADA",
+    "lck": "LCKREQ",
 }
 SLOTS = ("lda", "ldb", "st", "vec", "mv", "alu", "lng")
 

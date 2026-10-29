@@ -700,7 +700,7 @@ class VariantResult:
     kernel_source: str = ""
     clang_cmd: list[str] = field(default_factory=list)
     pragma_lines: list[int] = field(default_factory=list)
-    same_as: str | None = None  # an earlier variant with the identical source (its report is shared)
+    same_as: str | None = None  # an earlier variant with the identical source and flags (its report is shared)
     report: KernelReport | None = None
     error: str | None = None
     traces: dict[tuple[str, int], PipelinerTrace] | None = None
@@ -773,17 +773,18 @@ def search(
     if len(set(names)) != len(names) or not names:
         raise ValueError(f"variant names must be unique and not empty: {names}")
     rendered = [render_variant(factory, kwargs, variant, functions=functions) for variant in variants]
-    key = hashlib.sha256(repr((_label(factory, kwargs), [r.source for r in rendered])).encode()).hexdigest()[:12]
+    builds = [(r.source, r.clang_cmd) for r in rendered]
+    key = hashlib.sha256(repr((_label(factory, kwargs), builds)).encode()).hexdigest()[:12]
     out = Path(out_dir) if out_dir is not None else Path(CACHE_DIR) / "variant_search" / key
     results = []
-    by_source: dict[str, VariantResult] = {}
+    by_source: dict[tuple[str, tuple[str, ...]], VariantResult] = {}
     for variant, item in zip(variants, rendered):
         directory = out / re.sub(r"[^\w.+-]", "_", variant.name)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "kernel.cc"
         path.write_text(item.source)
         result = VariantResult(variant, path, item.kernel_source, item.clang_cmd, item.pragma_lines)
-        first = by_source.setdefault(item.source, result)
+        first = by_source.setdefault((item.source, tuple(item.clang_cmd)), result)
         if first is not result:
             result.same_as = first.variant.name
         results.append(result)
