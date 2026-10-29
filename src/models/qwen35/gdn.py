@@ -105,9 +105,10 @@ __attribute__((noinline)) void {{ p }}_p1(const float *__restrict sp, const bflo
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     aie::accum<accfloat, 64> au = aie::zeros<accfloat, 64>(), aw = aie::zeros<accfloat, 64>();
-    const float *__restrict ps = sp;
-    const bfloat16 *__restrict pk = k;
-    const bfloat16 *__restrict pq = q;
+    const float __aie_dm_resource_a *__restrict ps = (const float __aie_dm_resource_a *)sp;
+    const bfloat16 __aie_dm_resource_b *__restrict pk = (const bfloat16 __aie_dm_resource_b *)k;
+    const bfloat16 __aie_dm_resource_b *__restrict pq = (const bfloat16 __aie_dm_resource_b *)q;
+    AIE_PREPARE_FOR_POSTPIPELINING
     for (int b = 0; b < 16; b++) {
         aie::vector<bfloat16, 64> sh, sl;
         al::split2<64>(aie::load_v<64>(ps), sh, sl);
@@ -123,8 +124,9 @@ __attribute__((noinline)) void {{ p }}_p1(const float *__restrict sp, const bflo
                                  al::group8<false>(aw.template to_vector<float>())));
 }
 
-// pass 2 of a panel: out = S + d S + k delta^T (k: [k hi | k lo] x 128; dl: the 8 deltas of the panel's j); out may be sp
-__attribute__((noinline)) void {{ p }}_p2(const float *sp, float *out, const bfloat16 *__restrict k,
+// pass 2 of a panel: out = (S + d S) + k delta^T (k: [k hi | k lo] x 128; dl: the 8 deltas of the panel's j; the two
+// terms in accumulators of their own: chains of three MACs); out may be sp (each block is read before it is written)
+__attribute__((noinline)) void {{ p }}_p2(const float *__restrict sp, float *__restrict out, const bfloat16 *__restrict k,
                                           const float *__restrict dl, float d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -138,9 +140,10 @@ __attribute__((noinline)) void {{ p }}_p2(const float *sp, float *out, const bfl
     }
     aie::vector<bfloat16, 64> gh, gl;  // d as bf16 hi + lo
     al::split2<64>(aie::broadcast<float, 64>(d), gh, gl);
-    const float *ps = sp;
-    const bfloat16 *__restrict pk = k;
-    float *po = out;
+    const float __aie_dm_resource_a *__restrict ps = (const float __aie_dm_resource_a *)sp;
+    const bfloat16 __aie_dm_resource_b *__restrict pk = (const bfloat16 __aie_dm_resource_b *)k;
+    float *__restrict po = out;
+    AIE_PREPARE_FOR_POSTPIPELINING
     for (int b = 0; b < 16; b++) {
         const aie::vector<float, 64> s = aie::load_v<64>(ps);
         ps += 64;
@@ -148,10 +151,9 @@ __attribute__((noinline)) void {{ p }}_p2(const float *sp, float *out, const bfl
         al::split2<64>(s, sh, sl);
         const aie::vector<bfloat16, 64> kh_ = aie::load_v<8>(pk).template grow_replicate<64>(), kl = aie::load_v<8>(pk + {{ D }}).template grow_replicate<64>();
         pk += 8;
-        aie::accum<accfloat, 64> acc(s);
-        acc = aie::mac(aie::mac(aie::mac(acc, sh, gh), sl, gh), sh, gl);
-        acc = aie::mac(aie::mac(aie::mac(acc, kh_, eh), kh_, el), kl, eh);
-        aie::store_v(po, acc.template to_vector<float>());
+        const aie::accum<accfloat, 64> a1 = aie::mac(aie::mac(aie::mul(kh_, eh), kh_, el), kl, eh);
+        const aie::accum<accfloat, 64> a0 = aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(s), sh, gh), sl, gh), sh, gl);
+        aie::store_v(po, aie::add(a0, a1).template to_vector<float>());
         po += 64;
     }
 }
@@ -353,14 +355,13 @@ void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__res
         const bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 4 * D }} * s + {{ 2 * D }} * hl;  // (its k)
         {{ p }}_p1(sp, kq, kq + {{ 4 * D * SMAX }}, uw);
         const float *__restrict gt = GW(float, {{ g.gt }}) + 48 * s;
-        const aie::vector<float, 16> dv = aie::broadcast<float, 16>(gt[h]);
-        const aie::vector<float, 16> ut = aie::concat(aie::load_v<8>(uw), aie::zeros<float, 8>());
-        const aie::vector<float, 16> wt = aie::concat(aie::load_v<8>(uw + 8), aie::zeros<float, 8>());
+        const aie::vector<float, 16> sw = aie::load_v<16>(uw);  // [S^T k | S^T q] -> (1 + d) of both
+        const aie::vector<float, 16> uw2 = aie::add(sw, al::mulff<16>(aie::broadcast<float, 16>(gt[h]), sw));
         const float *__restrict v = GW(float, {{ g.v }}) + {{ SMAX * D }} * hl + {{ D }} * s + 8 * pj;
-        const aie::vector<float, 16> u = aie::add(ut, al::mulff<16>(dv, ut));
         const aie::vector<float, 16> de = al::mulff<16>(aie::broadcast<float, 16>(gt[16 + h]),
-                                                        aie::sub(aie::concat(aie::load_v<8>(v), aie::zeros<float, 8>()), u));
-        const aie::vector<float, 16> oo = aie::add(aie::add(wt, al::mulff<16>(dv, wt)), al::mulff<16>(aie::broadcast<float, 16>(gt[32 + h]), de));
+                                                        aie::concat(aie::sub(aie::load_v<8>(v), uw2.template extract<8>(0)), aie::zeros<float, 8>()));
+        const aie::vector<float, 16> oo = aie::add(aie::concat(uw2.template extract<8>(1), aie::zeros<float, 8>()),
+                                                   al::mulff<16>(aie::broadcast<float, 16>(gt[32 + h]), de));
         aie::store_v(GW(float, {{ g.o }}) + {{ SMAX * D }} * hl + {{ D }} * s + 8 * pj,
                      al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(oo).template extract<8>(0));
         aie::store_v(dl + {{ D }} * s, de.template extract<8>(0));
