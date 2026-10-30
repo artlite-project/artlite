@@ -67,8 +67,6 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         self.msg, self.relay = gdn is not None and slots == 4, attn is not None
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
-        if attn is not None and attn.one:
-            self.gate_words = kmath.SIGMOID.table_words()
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
                          paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast)
 

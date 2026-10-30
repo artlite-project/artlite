@@ -468,7 +468,7 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 }
 
 {% endif %}
-{% set lut = km.act(km.SILU if act == "silu" else km.GELU) %}
+{% set lut = km.act(km.SILU if act == "silu" else km.GELU, table_arg=SLOTS == 8) %}
 {{ lut.src }}
 
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
@@ -515,7 +515,8 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
         aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt)).template to_vector<bfloat16>());
         aie::store_v(gs + 32, aie::accum<accfloat, 32>(aie::load_v<32>(yt + 32)).template to_vector<bfloat16>());
-        {{ lut }}<64>(gs, gs + 64);
+        volatile int32_t ta[2] = {{ "{%d, %d}" % (SILU8[0], SILU8[1]) }};  // (the helper's copies: the gathers' operands need pointers)
+        {{ lut }}<64>(gs, gs + 64, (const uint32_t *)(intptr_t)ta[0], (const uint32_t *)(intptr_t)ta[1]);
         aie::store_v(yt, al::mulc<32>(aie::load_v<32>(yt + 64), aie::load_v<32>(gs + 64)).template to_vector<float>());
         aie::store_v(yt + 32, al::mulc<32>(aie::load_v<32>(yt + 96), aie::load_v<32>(gs + 96)).template to_vector<float>());
     }
@@ -561,6 +562,14 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
 [[clang::always_inline]] inline float *{{ p }}_res(int32_t *ws, float *hres, int s)
 {
     return s < {{ RES_SLOTS }} ? WS(float, {{ w_.res }}) + {{ RES_PITCH }} * s : hres + {{ RES_PITCH }} * (s - {{ RES_SLOTS }});
+}
+
+// 8 lanes of 4 consecutive slots' residual slices -> bf16
+[[clang::always_inline]] inline void {{ p }}_rows4(const float *__restrict r, bfloat16 *__restrict o)
+{
+    const aie::vector<float, 32> v = aie::concat(aie::load_v<8>(r), aie::load_v<8>(r + {{ RES_PITCH }}), aie::load_v<8>(r + {{ 2 * RES_PITCH }}),
+                                                 aie::load_v<8>(r + {{ 3 * RES_PITCH }}));
+    aie::store_v(o, aie::accum<accfloat, 32>(v).template to_vector<bfloat16>());
 }
 
 {% endif %}
@@ -1338,18 +1347,22 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
 {% endif %}
 {% if SLOTS == 8 %}
         // (the next input's x, [k block][slot SP][8]: a column's whole rows in DDR, not 16 bytes of a slot at a time)
-        const int ls = {{ p }}_lsp(S), nb = 8 >> ls;
-        const int q = 8 * nb * j, nsp = 1 << ls;
+        const int ls = {{ p }}_lsp(S), q = (64 >> ls) * j;
         st[{{ S_EJ }}] = j + 1;
-        bfloat16 *__restrict o = c;
-        AIE_LOOP_NO_UNROLL
-        for (int b = 0; b < nb; b++) {
+        const float *__restrict pa = WS(float, {{ w_.res }}) + q;
+        if (ls == 0) {
+            aie::store_v(c, aie::accum<accfloat, 64>(aie::load_v<64>(pa)).template to_vector<bfloat16>());
+        } else if (ls == 1) {
             AIE_LOOP_NO_UNROLL
-            for (int i = 0; i < nsp; i++) {
-                const aie::vector<float, 16> v = aie::load_v<8>({{ p }}_res(ws, hres, i) + q + 8 * b).template grow<16>();
-                aie::store_v(o, aie::accum<accfloat, 16>(v).template to_vector<bfloat16>().template extract<8>(0));
-                o += 8;
+            for (int b = 0; b < 32; b += 8) {
+                const aie::vector<float, 32> v = aie::concat(aie::load_v<8>(pa + b), aie::load_v<8>(pa + {{ RES_PITCH }} + b),
+                                                             aie::load_v<8>(pa + b + 8), aie::load_v<8>(pa + {{ RES_PITCH }} + b + 8));
+                aie::store_v(c + 2 * b, aie::accum<accfloat, 32>(v).template to_vector<bfloat16>());
+                b += 8;
             }
+        } else {
+            {{ p }}_rows4(pa, c);
+            {{ p }}_rows4(ls == 2 ? pa + 8 : hres + q, c + 32);
         }
 {% else %}
         const float *__restrict pr = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * s + {{ C_LEN }} * j;

@@ -38,6 +38,7 @@ column's weights between two attentions (their caches on A) as one run, its phas
 region-major one per phase and K group (the norm-weight objects from NORM).
 """
 
+import itertools
 import math
 import os
 
@@ -192,7 +193,7 @@ class QwenOverlay(ModelOverlay):
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
-        self._order = None if img.order is None else torch.from_numpy(img.order)  # (``_logits``)
+        self._order = None if img.order is None else self._id_runs(img.order)  # (``_logits``)
         self._plan()
 
     # ------------------------------------------------------------------
@@ -899,14 +900,23 @@ class QwenOverlay(ModelOverlay):
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
 
+    @staticmethod
+    def _id_runs(order: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
+        """The buffer of ``_logits``'s copy and an LM order's runs of consecutive rows (id, its end, row)."""
+        cuts = [0, *(np.flatnonzero(np.diff(order) != 1) + 1).tolist(), len(order)]
+        return np.empty((8, len(order)), np.uint16), [(a, b, int(order[a])) for a, b in itertools.pairwise(cuts)]
+
     def _logits(self, S: int) -> torch.Tensor:
-        """(an image whose LM rows are not in id order, ``QwenImage.order``: a copy in id order, the ids' rows; an MTP
-        drafter's table rows left out)"""
+        """(an image whose LM rows are not in id order, ``QwenImage.order``: in id order, the ids' rows, in a buffer valid
+        until the next dispatch as the NPU's; an MTP drafter's table rows left out)"""
         if self._order is None:
             return super()._logits(S)
         self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
-        x = torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
-        return x[:, self._order]
+        x = self.dev.view("LOGITS")[:2 * S * self.vocab].view(np.uint16).reshape(S, self.vocab)
+        out, runs = self._order
+        for a, b, r in runs:
+            out[:S, a:b] = x[:, r:r + b - a]
+        return torch.from_numpy(out[:S]).view(torch.bfloat16)
 
     def _lm_phase(self, seq: Sequence) -> None:
         if self.image.column_major:

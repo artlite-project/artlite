@@ -96,8 +96,9 @@ bandwidth.
   a broadcast fill follows a sync that drained the phase before, and a step's first phase stays local.
 - **A core's X at depth 1 adds the object's DMA to its work.** The next object cannot arrive while the core holds this
   one: 544 cycles per 4352 B object on top of the strip. At 8 rows per k block `down` takes twice the objects (+1.4 ms
-  per step on the 27B from S 4 to S 5). Depth 2 needs 4352 B the 27B's main core does not have: ~770 B short around its
-  bank-pinned tables.
+  per step on the 27B from S 4 to S 5). A main core's depth 2 took ~2 ms off the 27B's step at every S; its 4352 B came from
+  moving its SiLU table's copies to the helper's memory (a neighbour's memory reads like its own; the gathers run between
+  the helper's tiles) and a sigmoid gather table out of L1.
 - **Broadcast what every column needs**: a GEMM's activations per core row from one shim channel to its memtile,
   then to that core row of all 8 columns, are read once for all columns instead of 8 times (0.14 vs 1.15 GB per
   chunk). One stream per core row, from different shims: one shim channel for all rows paced the GEMMs at 96 tokens.
