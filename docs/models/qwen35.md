@@ -37,7 +37,7 @@ same name (ggml-org publishes its drafters apart from the models); of several, Q
 
 Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
 share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head (Qwen3.8
-27B's up to 8, for its drafter's long chains: a step of 8 costs 1.04x a step of one at 1K and 1.09x at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
+27B's up to 8, for its drafter's long chains: a step of 8 costs 1.04x a step of one at 1K and 1.07x at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
 cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);

@@ -172,10 +172,10 @@
 <text x="179.6" y="780.5">2.5<tspan dx="10" class="strong">Artlite 1.3× faster</tspan></text>
 <text x="530.8" y="780.5">—*</text>
 <text x="155.7" y="799.5" text-anchor="end" class="lbl">Q4_K_M + MTP</text>
-<path d="M165.7,789.0h22.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-22.4z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 1k-token prompt: 7.4</title></path>
-<text x="197.1" y="799.5">7.4<tspan dx="6" class="muted">S=8</tspan></text>
-<path d="M525.8,789.0h17.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-17.7z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 32k-token prompt: 6.1</title></path>
-<text x="552.6" y="799.5">6.1<tspan dx="6" class="muted">S=4</tspan></text>
+<path d="M165.7,789.0h24.5a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-24.5z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 1k-token prompt: 8.0</title></path>
+<text x="199.2" y="799.5">8.0<tspan dx="6" class="muted">S=8</tspan></text>
+<path d="M525.8,789.0h19.2a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-19.2z" class="ft"><title>Artlite with its drafter, Qwen3.8 27B Q4_K_M, 32k-token prompt: 6.5</title></path>
+<text x="554.0" y="799.5">6.5<tspan dx="6" class="muted">S=4</tspan></text>
 <line x1="24" y1="816.0" x2="856" y2="816.0" class="grid"/>
 <text x="24" y="834.0" class="h">Qwen3.6 35B-A3B</text>
 <text x="155.7" y="852.5" text-anchor="end" class="lbl">Q4_K_M</text>

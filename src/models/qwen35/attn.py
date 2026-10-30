@@ -50,7 +50,7 @@ objects, and a broadcast's objects wait for every consumer), and no partials mov
 Q and P as one panel of 8 rows, as an 8-slot design's x, at the model's KL: half the MMULs and of the panels' L1), a
 group's P V one pass over its V object per octet (``pv4``: four MMULs per read of y), and a group that raises no row's
 maximum costs a compare. The first core's K objects come after the tails: the last core, holding its tails until its
-emission, then skips them (``A_NAF``). A step's slots at 32K positions: 2.13 ms a layer at 2 octets (S 3 .. 5), 3.2 at 3.
+emission, then skips them (``A_NAF``). S 3 .. 5 take 2 octets, S 6 .. 8 take 3: at 32K positions +12 ms a step on the 27B.
 
 L1: a sub-step's rows need per set ~5.3 KB (y and l fp32, scores, maxima, P panels) plus its Q panels (2.3 KB) and the
 rows' gates (0.5 KB a row). Regions the core reads rarely (the gates, ...: ``AttnShape.ext``) lie in the main core's

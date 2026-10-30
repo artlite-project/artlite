@@ -513,11 +513,11 @@ _SILU = r"""
 
 
 def silu(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, inline: bool = False) -> Fn:
-    """silu(x) of ``lanes`` bf16 lanes -> fp32 (~16 cycles per element: fp32 math through bf16 products; the gather
-    table's SiLU, ``act(SILU)``, is ~1 but rounds to bf16). For fp32 consumers: ~5e-4 relative for x >= 0, where the
-    table's bf16 result is off by up to 2^-8 (the qwen35 decode GDN state of test_gdn_steps_27b: 3.9e-3 through the
-    table, bound 2e-3). ``exp_fn``: an exp2 of fp32 arguments that clamps (the argument reaches -3e38;
-    default the bf16-level one, inlined); ``recip_fn``: a recip on [1, 2] (default 2 steps unrolled, inlined)."""
+    """silu(x) of ``lanes`` bf16 lanes -> fp32 (~16 cycles per element: fp32 math through bf16 products; relative
+    error up to 1.7e-3 for x >= 0, 3.9e-3 below). The gather table is ~1 cycle: ``act(SILU)``'s bf16 is off by up to
+    2^-8, ``act(SILU, f32=True)`` by 4.8e-4 and 6.9e-4, so a core with room for the table uses that. ``exp_fn``: an exp2 of fp32
+    arguments that clamps (the argument reaches -3e38; default the bf16-level one, inlined); ``recip_fn``: a recip on
+    [1, 2] (default 2 steps unrolled, inlined)."""
     _check("lanes", lanes, LANES)
     e, etag = _take("exp_fn", exp_fn, exp2(lanes, inline=True), func="exp2", lanes=lanes, bias=None,
                     below={"clamp", "zero"})
