@@ -433,6 +433,9 @@ class GemmaOverlay(ModelOverlay):
         assert max(len(x) for x in out) <= AT.U, (p, S)
         return out
 
+    def passes(self, p: int, S: int) -> int:
+        return max(len(x) for x in self.subs(p, S))
+
     def _ranges(self, swa: bool, p: int) -> list[tuple[int, int]]:
         """The columns' (first group, groups) of a layer kind's cache for a sub-step whose slots are in the group of
         position p: those of its group (a sliding-window cache: from the GUARD groups before it on, the window of any

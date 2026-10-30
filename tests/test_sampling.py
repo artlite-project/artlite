@@ -172,6 +172,9 @@ class OverlaySteps(OverlayModel):
         self.position += len(tokens)
         return Steps().step(0).bfloat16()[None].repeat(len(tokens), 1)
 
+    def _crossing(self) -> tuple[bool, ...]:
+        return (False,) * (self.DRAFTS + 1)
+
 
 @pytest.mark.parametrize("model", [Steps, OverlaySteps])
 def test_generate(model: type[NpuModel]) -> None:

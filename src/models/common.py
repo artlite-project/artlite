@@ -682,6 +682,12 @@ class OverlayModel(NpuModel):
         """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""
         raise NotImplementedError
 
+    def _crossing(self) -> tuple[bool, ...]:
+        """Per step of S = 1 .. DRAFTS + 1 tokens at the position: whether it takes one more pass over the KV caches
+        than at a cache group's start."""
+        ov = self.overlay
+        return tuple(ov.passes(self.position, S) > ov.passes(0, S) for S in range(1, self.DRAFTS + 2))
+
     def _worth(self, c: float, s: int, extra: float = 0.0) -> bool:
         """Whether a draft that the model keeps with probability c (its chain's: the drafter's probability of it and of
         the drafts before it) pays for a round's step of s + 1 tokens instead of s and ``extra`` seconds more (a drafter
@@ -758,6 +764,7 @@ class OverlayModel(NpuModel):
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
             k = min(self.DRAFTS, self.capacity - self.position - 1,
                     max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
+            plan.crossing = self._crossing()
             t0 = time.perf_counter()
             m, d = ctx.draft(k) if ctx is not None else (0, [])
             j = plan.choose(m, len(d), drafter=self._drafting and k > 0)

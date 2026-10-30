@@ -74,6 +74,29 @@ def test_planner() -> None:
     assert p.choose(20, 3, drafter=True) is None
 
 
+def test_planner_crossing() -> None:
+    """A step across a cache group measures the second pass, not S: S stays as cheap as it is (a first sample of a
+    crossing kept for S would keep S from running again); the rule sees the pass where the position brings it."""
+    p = Planner((1.0, 1.01, 1.015, 1.02))
+    p.ran(1, 0.330)
+    p.crossing = (False, False, True, True)
+    p.ran(4, 0.384)  # (S 4's first step)
+    assert p.t[3] is None and p.again == pytest.approx(0.384 - 0.330 * 1.02)
+    assert p.step_time(4) == pytest.approx(0.384) and p.step_time(2) == pytest.approx(0.3333)
+    p.crossing = (False,) * 4
+    assert p.step_time(4) == pytest.approx(0.3366)
+    p.ran(4, 0.340)
+    assert p.t[3] == 0.340
+    p.crossing = (False, False, False, True)
+    p.ran(4, 0.390)
+    assert p.t[3] == 0.340 and p.again == pytest.approx(0.8 * (0.384 - 0.3366) + 0.2 * 0.050)
+    assert not Planner((1.0, 1.1)).t[1]  # (nothing measured: no crossing's measure in relative units)
+    q = Planner((1.0, 1.1))
+    q.crossing = (False, True)
+    q.ran(2, 0.3)
+    assert q.again == 0.0 and q.t == [None, None]
+
+
 class Text(OverlayModel):
     """A model whose next token after position q is ``text[q + 1]`` (bf16 logits from ``steps``); ``calls``: each
     step's tokens."""
@@ -92,6 +115,9 @@ class Text(OverlayModel):
         for i in range(len(tokens)):  # (past the text: its end)
             out[i, self.text[min(p + i + 1, len(self.text) - 1)]] = 8.0
         return out.bfloat16()
+
+    def _crossing(self) -> tuple[bool, ...]:
+        return tuple((self.position % 32) + S > 32 for S in range(1, self.DRAFTS + 2))
 
     def first(self, n: int) -> torch.Tensor:
         """The prompt's last logits after positions 0 .. n - 1 ran."""
@@ -164,6 +190,11 @@ def test_draft_stop() -> None:
     for _ in range(WARM):
         moe.planner.drafted(0, 2, 2 / 30)
     assert moe._keep(0.4, 1) and not moe._keep(0.3, 1)
+    dense.planner.ran(1, 0.300)
+    dense.planner.again = 0.045
+    keep = dense._keep(0.1, 1)
+    dense.planner.crossing = (False, False, True, True)  # (a step of 3 crosses a group: 0.33 tokens of a pass)
+    assert keep and not dense._keep(0.3, 1) and dense._keep(0.1, 2)
 
 
 # the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model; Qwen3.5-9B: its

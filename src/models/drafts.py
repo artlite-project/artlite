@@ -12,8 +12,10 @@ text is a span of a file they read, a rewritten file is mostly the old one, a co
 
 ``Planner`` (one per model, across its generations) chooses a round's drafts: k of the context's are worth
 E(m, k) = 1 + a1 + a1 a2 + ... tokens (a_i: how often the i-th draft after a match of m tokens was accepted when the
-ones before it were: ``PRIOR``, then counted), against the time of a step of k + 1 tokens (an average per S as the steps
-run; before, the model's ``STEP_COST`` ratios to a measured one); a drafter's rounds (multi-token prediction) by their
+ones before it were: ``PRIOR``, then counted), against the time of a step of k + 1 tokens at the round's position (an
+average per S as the steps run, before, the model's ``STEP_COST`` ratios to a measured one; a step across a KV cache
+group adds a second attention pass, a measure of its own: the position decides, and such a step's time must not stand
+for S's, or S looks dear and never runs again to correct it); a drafter's rounds (multi-token prediction) by their
 measured tokens per second after matches of the same length (where the text repeats the context, the drafter guesses
 it as well: its average rate would undersell it there), again every ``RETRY`` rounds of that length without it. The
 context's drafts take a round for ``MARGIN`` times the tokens per second of the drafter's round (a context round also
@@ -99,7 +101,9 @@ class Planner:
 
     def __init__(self, cost: tuple[float, ...]):
         self.cost = cost
-        self.t: list[float | None] = [None] * len(cost)  # (seconds of a step of S, a running average)
+        self.t: list[float | None] = [None] * len(cost)  # (seconds of a step of S within a cache group, a running average)
+        self.again = 0.0  # (the seconds a step adds by crossing a group, a running average)
+        self.crossing = (False,) * len(cost)  # (per S: whether a step of S at the round's position crosses a group)
         self.tried = np.full(PRIOR.shape, float(PRIOR_N))
         self.kept = PRIOR * PRIOR_N
         n = len(PRIOR) + 1  # (per context-match bucket, ``_mtp_bucket``: a drafter round's count, and its tokens and
@@ -109,8 +113,12 @@ class Planner:
         self.rate_n, self.rate_tokens, self.rate_s = 0, 0.0, 0.0  # (every drafter round's, running averages)
 
     def step_time(self, S: int) -> float:
-        """A step of S tokens' seconds: measured, else the prior ratio to the nearest measured S (relative units
-        while none is)."""
+        """A step of S tokens' seconds at the round's position."""
+        return self._within(S) + self.again * self.crossing[S - 1]
+
+    def _within(self, S: int) -> float:
+        """A step of S tokens' seconds within a cache group: measured, else the prior ratio to the nearest measured S
+        (relative units while none is)."""
         if self.t[S - 1] is not None:
             return self.t[S - 1]
         known = [s for s in range(len(self.t)) if self.t[s] is not None]
@@ -143,6 +151,11 @@ class Planner:
 
     def ran(self, S: int, seconds: float) -> None:
         """A step of S tokens took ``seconds``."""
+        if self.crossing[S - 1]:
+            if any(t is not None for t in self.t):
+                x = seconds - self._within(S)
+                self.again = x if not self.again else (1 - EWMA) * self.again + EWMA * x
+            return
         t = self.t[S - 1]
         self.t[S - 1] = seconds if t is None else (1 - EWMA) * t + EWMA * seconds
 

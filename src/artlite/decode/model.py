@@ -240,16 +240,11 @@ class ModelOverlay:
                 for (L, name), regs in self.inp.items() for rg, gr in zip(regs, self._groups(L, name, S))]
 
     def _metas(self, S: int) -> None:
-        """The phases' metadata objects for S slots (from layer ``start`` on): ``_meta_writes``' bytes, kept per S and
-        start (a generation with drafts changes S every few steps: after another S of the same start only the bytes
-        that differ, a few words per phase, are written and flushed; the objects' span takes ~6 ms to flush)."""
+        """The phases' metadata objects for S slots (from layer ``start`` on): a generation with drafts changes S every
+        few steps: after another S of the same start only the bytes that differ, a few words per phase, are written and
+        flushed; the objects' span takes ~6 ms to flush."""
         key = (S, self.start)
-        if (w := self._meta_bytes.get(key)) is None:
-            writes = self._meta_writes(S)[::-1]  # (a byte written twice: the last write's)
-            idx, first = np.unique(np.concatenate([o + np.arange(b.size) for o, b in writes]), return_index=True)
-            val = np.concatenate([b for _, b in writes])[first]
-            w = self._meta_bytes[key] = (idx, val)
-        idx, val = w
+        idx, val = self._meta_of(S)
         old = self._meta_bytes.get(self._metas_s)
         if old is not None and self._metas_s[1] == self.start:
             ch = val != old[1]
@@ -259,6 +254,16 @@ class ModelOverlay:
             self.dev.view("ACT")[idx] = val
             self.dev.flush("ACT", int(idx[0]), int(idx[-1]) + 1 - int(idx[0]))
         self._metas_s = key
+
+    def _meta_of(self, S: int) -> tuple[np.ndarray, np.ndarray]:
+        """``_meta_writes``' bytes (ACT offsets, values) for S slots, kept per S and start."""
+        key = (S, self.start)
+        if (w := self._meta_bytes.get(key)) is None:
+            writes = self._meta_writes(S)[::-1]  # (a byte written twice: the last write's)
+            idx, first = np.unique(np.concatenate([o + np.arange(b.size) for o, b in writes]), return_index=True)
+            val = np.concatenate([b for _, b in writes])[first]
+            w = self._meta_bytes[key] = (idx, val)
+        return w
 
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
         """The slots of an input k block in a step of S slots (``design.packed_slots`` in a packed design) of a phase's
@@ -322,6 +327,10 @@ class ModelOverlay:
         """The attention's sub-steps of a step at p .. p + S - 1 (the key of its transaction)."""
         raise NotImplementedError
 
+    def passes(self, p: int, S: int) -> int:
+        """The passes over a KV cache of a step at p .. p + S - 1."""
+        return len(self.subs(p, S))
+
     def _set_position(self, st: Any, p: int, ahead: bool = False) -> bool:
         """A step's position-dependent objects and transfers (the patches of its transaction ``st``). ``ahead``: while
         the previous step runs (``AHEAD``), only objects of st's own buffer: False when the step needs more (it is
@@ -361,8 +370,9 @@ class ModelOverlay:
 
     def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
         """Build the transactions of a step of S slots (from layer ``start`` on: one per pattern of sub-steps over the
-        positions, ``period``) ahead (a step builds one at its first use)."""
+        positions, ``period``) and its metadata ahead (a step builds them at its first use)."""
         start = self._mode(start)
+        self._meta_of(S)
         for subs in {self.subs(p, S) for p in range(self.period)}:
             for b in range(2 if self.AHEAD else 1):
                 self._transaction(S, logits, subs, b)
