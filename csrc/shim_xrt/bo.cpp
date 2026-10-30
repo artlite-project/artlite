@@ -157,6 +157,10 @@ properties bo::get_properties() const {
 
 void bo::sync(direction dir) { sync(dir, m_size, 0); }
 
+void bo::sync_lines(const int64_t* offsets, size_t count) {
+  for (size_t i = 0; i < count; i++) sync(direction::host2device, 64, static_cast<size_t>(offsets[i]));
+}
+
 void bo::sync(direction dir, size_t size, size_t offset) {
   if (offset > m_size || size > m_size - offset) throw std::out_of_range("bo::sync: range exceeds the buffer");
   if (m_kind == kind::instructions) {

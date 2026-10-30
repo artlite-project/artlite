@@ -346,6 +346,12 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
             self.sync(shim_xdna::direction::device2host, size, offset);
           },
           "size"_a, "offset"_a)
+      .def(
+          "sync_lines",
+          [](shim_xdna::bo& self, nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig> offsets) {
+            self.sync_lines(offsets.data(), offsets.size());
+          },
+          "offsets"_a, "Host writes of 64-byte cache lines (their byte offsets) -> DDR.")
       .def_prop_ro("paddr", [](shim_xdna::bo& self) -> uint64_t { return self.get_paddr(); })
       .def(
           "paddr_in", [](shim_xdna::bo& self, const shim_xdna::hw_ctx& ctx) -> uint64_t { return self.paddr_in(ctx); },

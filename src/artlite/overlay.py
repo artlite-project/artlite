@@ -318,6 +318,15 @@ class OverlayDevice:
         b = self.buffers[name]
         b.sync_to_device(b.size - offset if nbytes is None else nbytes, offset)
 
+    def flush_lines(self, name: str, offsets: np.ndarray) -> None:
+        """Host writes of a buffer's scattered bytes (byte offsets, in any order) -> DDR, line by line: per S and
+        position the steps rewrite a few bytes of buffers whose whole span would take milliseconds to flush."""
+        self.buffers[name].sync_lines(np.unique(np.asarray(offsets, np.int64).ravel() & ~63))
+
+    def flush_at(self, name: str, lines: np.ndarray) -> None:
+        """``flush_lines`` of line offsets given without repeats (int64)."""
+        self.buffers[name].sync_lines(lines.ravel())
+
     def fetch(self, name: str, offset: int = 0, nbytes: int | None = None) -> None:
         """Drop the CPU's cached copy of a buffer range the NPU wrote."""
         b = self.buffers[name]
@@ -396,6 +405,10 @@ class Transaction:
 
     def flush(self) -> None:
         self.buffer.sync_to_device(self.words.nbytes, 0)
+
+    def flush_lines(self, lines: np.ndarray) -> None:
+        """Flush the lines (byte offsets, int64, no repeats) that a step patched: a step's control code is megabytes."""
+        self.buffer.sync_lines(lines)
 
 
 class WeightBuffer:

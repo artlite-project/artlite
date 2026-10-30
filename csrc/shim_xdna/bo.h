@@ -76,6 +76,8 @@ struct bo {
   void* map() const;
   void sync(direction, size_t size, size_t offset);
   void sync(direction);
+  // The 64-byte lines at these byte offsets, host -> device
+  void sync_lines(const int64_t* offsets, size_t count);
   properties get_properties() const;
   size_t size() const;
   uint32_t get_drm_bo_handle() const;

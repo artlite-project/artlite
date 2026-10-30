@@ -241,16 +241,23 @@ class ModelOverlay:
 
     def _metas(self, S: int) -> None:
         """The phases' metadata objects for S slots (from layer ``start`` on): ``_meta_writes``' bytes, kept per S and
-        start (a generation with drafts changes S every few steps)."""
+        start (a generation with drafts changes S every few steps: after another S of the same start only the bytes
+        that differ, a few words per phase, are written and flushed; the objects' span takes ~6 ms to flush)."""
         key = (S, self.start)
         if (w := self._meta_bytes.get(key)) is None:
             writes = self._meta_writes(S)[::-1]  # (a byte written twice: the last write's)
             idx, first = np.unique(np.concatenate([o + np.arange(b.size) for o, b in writes]), return_index=True)
             val = np.concatenate([b for _, b in writes])[first]
-            w = self._meta_bytes[key] = (idx, val, int(idx[0]), int(idx[-1]))
-        idx, val, lo, hi = w
-        self.dev.view("ACT")[idx] = val
-        self.dev.flush("ACT", lo, hi + 1 - lo)
+            w = self._meta_bytes[key] = (idx, val)
+        idx, val = w
+        old = self._meta_bytes.get(self._metas_s)
+        if old is not None and self._metas_s[1] == self.start:
+            ch = val != old[1]
+            self.dev.view("ACT")[idx[ch]] = val[ch]
+            self.dev.flush_lines("ACT", idx[ch])
+        else:
+            self.dev.view("ACT")[idx] = val
+            self.dev.flush("ACT", int(idx[0]), int(idx[-1]) + 1 - int(idx[0]))
         self._metas_s = key
 
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:

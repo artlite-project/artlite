@@ -241,4 +241,10 @@ void bo::sync(direction, size_t size, size_t offset) {
 
 void bo::sync(direction dir) { sync(dir, size(), 0); }
 
+void bo::sync_lines(const int64_t* offsets, size_t count) {
+  _mm_mfence();
+  for (size_t i = 0; i < count; i++) _mm_clflush(static_cast<const char*>(m_aligned) + offsets[i]);
+  _mm_mfence();
+}
+
 }  // namespace shim_xdna

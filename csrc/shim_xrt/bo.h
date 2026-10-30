@@ -74,6 +74,7 @@ struct bo {
   // Both directions on Linux write back and invalidate the range's cache lines (the NPU's DMA does not snoop them).
   void sync(direction dir, size_t size, size_t offset);
   void sync(direction dir);
+  void sync_lines(const int64_t* offsets, size_t count);
   properties get_properties() const;
   // The address the NPU's DMA uses for the first byte (XRT's, not the host's). It exists once the buffer has an XRT
   // handle, which needs a hardware context in the process: throws without one.

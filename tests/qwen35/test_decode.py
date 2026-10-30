@@ -567,7 +567,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     kv = mmv.bf(rng.standard_normal((S, kvh, 2 * HD)).astype(np.float32))  # [K | V] per KV head
     qn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     kn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
-    cs = [A1.rope_cs(cfg, p + s) for s in range(S)]
+    cs = [tuple(v[0] for v in A1.rope_cs(cfg, [p + s])) for s in range(S)]
     G = g + 1
     b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
     nt = A1.TAILS

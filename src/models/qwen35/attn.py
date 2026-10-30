@@ -989,7 +989,7 @@ class AttnShape:
 # ----------------------------------------------------------------------
 
 
-def rope_cs(cfg: QwenConfig, position: int | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """cos, sin (32 fp32) of a position's angles (``QwenConfig.rope_theta``: a text position or (T, H, W))."""
-    th = cfg.rope_theta(np.reshape(position, (1, -1)) if np.ndim(position) else [position])[0].astype(np.float64)
+def rope_cs(cfg: QwenConfig, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """cos, sin (n, 32) fp32 of positions' angles (``QwenConfig.rope_theta``: (n,) text positions or (n, 3) (T, H, W))."""
+    th = cfg.rope_theta(positions).astype(np.float64)
     return np.cos(th).astype(np.float32), np.sin(th).astype(np.float32)

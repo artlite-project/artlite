@@ -117,6 +117,8 @@ KV_PAD = 4096 - 256  # positions past the caches (the last layer's): the prefill
 CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (prefill.CS_OFF)
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
 DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart (the overlapping regions)
+FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
+F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ])  # (an F_ATT object's)
 
 
 class _Step:
@@ -134,6 +136,7 @@ class _Step:
         # (BD handle, layer, column, sub-step, i-th record drain: a chain's first column's K records 0, 1; its last
         # column's V panels and rows of record 0, then of record 1)
         self.drains: list[tuple[list[int], int, int, int, int]] = []
+        self.patch: dict[str, np.ndarray] | None = None  # (``_patch_tables``)
 
 
 def slots_of(cfg: QwenConfig, fmts: set[str]) -> int:
@@ -285,6 +288,9 @@ class QwenOverlay(ModelOverlay):
                 self.xch[L] = take("ACT", XB)
                 self.cp[L] = take("ACT", COLS * (CP_BYTES + XB))
             self.part = take("ACT", COLS * self.part_col)
+        self._fobj = np.array([[[(self.fatt[L] + (c * self.ash.u + u) * XB) // 4 for u in range(self.ash.u)]
+                                for c in range(COLS)] for L in self.fatt], np.int64)  # ([layer][column][sub-step], words)
+        self._gin = np.array([self.inp[(L, "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
         r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
@@ -717,6 +723,22 @@ class QwenOverlay(ModelOverlay):
             out.append((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
         return tuple(out)
 
+    def _patch_tables(self, st: _Step) -> dict[str, np.ndarray]:
+        """A step's cache fills, tail fills and record drains as arrays: BD word index, sub-step, the layer's index among
+        the attention layers, the column's place in its chain, byte offsets in KV of group 0 of its KV head and of its
+        ring, a fill's kind (``FILLS``), a tail's object, a drain's index."""
+        ash, nph = self.ash, self.ash.nph
+        ix = {L: i for i, L in enumerate(self.fatt)}
+
+        def where(L: int, c: int) -> tuple[int, int, int, int]:
+            return ix[L], c % nph, self.kv_off[L] + c // nph * ash.head_bytes, self.ring(L, c // nph)
+
+        f = np.array([(at, u, *where(L, c), FILLS.index(kind)) for at, L, c, u, kind in st.fills], np.int64).reshape(-1, 7)
+        t = np.array([(at, u, *where(L, c), k) for at, L, c, u, k in st.tails], np.int64).reshape(-1, 7)
+        r = np.array([(hd[0], u, *where(L, c), k) for hd, L, c, u, k in st.drains], np.int64).reshape(-1, 7)
+        at = np.concatenate([x[:, 0] for x in (f, t, r)] + [x[:, 0] + 2 for x in (f, t, r)])
+        return {"f": f, "t": t, "r": r, "lines": np.unique(4 * at & ~63)}
+
     def _set_position(self, st: _Step, p: int) -> None:
         """The F_ATT objects (per sub-step: its positions, cache objects, rotations) and the step's cache and ring
         transfers."""
@@ -726,76 +748,70 @@ class QwenOverlay(ModelOverlay):
         assert 0 <= p and p + S <= self.max_positions, (p, S)
         assert st.subs == self.subs(p, S), (p, S, st.subs)
         dev, ash, T = self.dev, self.ash, self.T
-        nph = ash.nph
+        nph, U = ash.nph, len(st.subs)
         act = dev.view("ACT")
-        cs = np.zeros((S, 64), np.float32)
-        for s in range(S):
-            cs[s] = np.concatenate(attn.rope_cs(self.cfg, self.rope[p + s]))
-        groups, rec_mode = [], {}
-        for L in self.fatt:
-            rec_mode[L] = L in self.vring.from_prefill
-            if not rec_mode[L]:
+        c0, s0 = attn.rope_cs(self.cfg, self.rope[p:p + S])
+        cs = np.concatenate([c0, s0], 1)
+        rec = np.array([L in self.vring.from_prefill for L in self.fatt])
+        for L, r in zip(self.fatt, rec):
+            if not r:
                 self.vring.check(L, p, p)
+        w = np.zeros((U, nph, len(F_WORDS)), np.int32)  # (per sub-step and column of its chain)
+        gr = np.zeros((U, len(FILLS), nph, 2), np.int64)  # (a fill's groups)
+        su = np.zeros((U, 2), np.int64)  # (a sub-step's first position, slots)
         for u, (a, n, split) in enumerate(st.subs):
             q, g = p + a, (p + a) // attn.POS_PER_GROUP
             G = g + 1  # (groups through g; split: chain core k's attention groups b[k] .. b[k + 1] - 1)
             b = ash.bounds(g) if split else [0] * (nph + 1)
-            groups.append({(c, "all"): (0, G) for c in range(COLS)} | {(c, "new"): (g, g + 1) for c in range(COLS)}
-                          | {(c, "run"): (b[c % nph], b[c % nph + 1]) for c in range(COLS)})
-            for L in self.fatt:
-                for c in range(COLS):
-                    o = self._fatt(L, c, u)
-                    m = act[o:o + 4 * META].view(np.int32)
-                    k = c % nph
-                    nt = attn.TAILS if not split or ash.role(c) == attn.ROLE_V else 0
-                    m[M_POS], m[M_NS], m[M_SA], m[M_SKIP], m[M_SPLIT] = q, n, 0, (nph + 1 if split else 2) * n, int(split)
-                    m[M_NREL], m[M_NTAIL], m[M_ATREC] = ash.n_rel(c, split, n), nt, int(rec_mode[L] and u == 0)
-                    if not split:  # (a chain's first column: then group g's K objects again, for its K records)
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * G + nt + (2 if k == 0 else 0), 0, 1 << 20, 0
-                    elif k == 0:  # (then group g's K objects for its K records)
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * b[1] + 2, 0, b[1], g
-                    else:
-                        m[M_NASKIP], m[M_G0], m[M_GATT], m[M_GJ] = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
-                    q0 = o + 4 * META + 4 * 2 * attn.HD  # (the sub-step's slots' angles)
-                    act[q0:q0 + 4 * 64 * n] = cs[a:a + n].view(np.uint8).reshape(-1)
-        for L in self.fatt:
-            dev.flush("ACT", self.fatt[L], COLS * self.ash.u * XB)
-        w = st.tr.words
-        for at, L, c, u, kind in st.fills:  # ("new": the group's K objects)
-            g0, g1 = groups[u][(c, kind)]
-            w[at:at + 3] = txn.bd_words(dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes + 3 * g0 * T),
-                                        (2 if kind == "new" else 3 * (g1 - g0)) * T)
-        for at, L, c, u, t in st.tails:  # (the ring slots of the sub-step's first and last records, or the first's V
-            a, n, _ = st.subs[u]  # panels in record mode)
-            r = (p + a + (n - 1 if t else 0)) >> 3
-            if rec_mode[L] and u == 0 and t == 0:  # (its pair of records)
-                off = self.kv_off[L] + c // nph * ash.head_bytes + 3 * (r // 4) * T + 2 * T + r % 4 // 2 * 2 * attn.REC_V
-            else:
-                off = self.ring(L, c // nph) + (r & 1) * T
-            w[at:at + 3] = txn.bd_words(dev.address("KV", off), T)
-        for hd, L, c, u, k in st.drains:
-            a, n, _ = st.subs[u]
-            v = ash.role(c) == attn.ROLE_V
-            r = (p + a + (n - 1 if (k >= 2 if v else k) else 0)) >> 3
-            g, j = r // 4, r % 4
-            head = self.kv_off[L] + c // nph * ash.head_bytes + 3 * g * T
-            if not v:
-                off, nb = head + j // 2 * T + j % 2 * attn.REC_K, attn.REC_K
-            elif k % 2 == 0:
-                off, nb = head + 2 * T + j // 2 * 2 * attn.REC_V + j % 2 * 72, attn.REC_V
-            else:
-                off, nb = self.ring(L, c // nph) + (r & 1) * T, attn.ROWS_B
-            w[hd[0]:hd[0] + 3] = txn.bd_words(dev.address("KV", off), nb)
-        st.tr.flush()
+            su[u] = q, n
+            for k in range(nph):
+                nt = attn.TAILS if not split or ash.role(k) == attn.ROLE_V else 0
+                if not split:  # (a chain's first column: then group g's K objects again, for its K records)
+                    na, g0, ga, gj = 3 * G + nt + (2 if k == 0 else 0), 0, 1 << 20, 0
+                elif k == 0:  # (then group g's K objects for its K records)
+                    na, g0, ga, gj = 3 * b[1] + 2, 0, b[1], g
+                else:
+                    na, g0, ga, gj = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
+                w[u, k] = q, n, 0, (nph + 1 if split else 2) * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj
+                gr[u, :, k] = (0, G), (g, g + 1), (b[k], b[k + 1])
+        fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
+        a32 = act.view(np.int32)
+        a32[fo[..., None] + F_WORDS] = w[np.arange(U), np.arange(COLS)[:, None] % nph]
+        a32[fo + M_ATREC] = 0
+        a32[fo[rec, :, 0] + M_ATREC] = 1
+        q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)
+        af = act.view(np.float32)
+        for u, (a, n, _) in enumerate(st.subs):
+            af[fo[..., u, None] + q0 + np.arange(64 * n)] = cs[a:a + n].reshape(-1)
+        lines = np.concatenate([np.arange(0, 192, 64), 4 * q0 + np.arange(0, 4 * 64 * max(n for _, n, _ in st.subs) + 64, 64)])
+        dev.flush_at("ACT", 4 * fo[..., None] + lines)
+        if st.patch is None:
+            st.patch = self._patch_tables(st)
+        t, kv0, words = st.patch, dev.address("KV"), st.tr.words
+        f = t["f"]  # (at, u, layer, k, base, ring, kind)
+        g = gr[f[:, 1], f[:, 6], f[:, 3]]
+        self._bd_words(words, f[:, 0], kv0 + f[:, 4] + 3 * g[:, 0] * T, np.where(f[:, 6] == 1, 2, 3 * (g[:, 1] - g[:, 0])) * T)
+        f = t["t"]  # (the ring slots of the sub-step's first and last records, or the first's V panels in record mode)
+        r = (su[f[:, 1], 0] + np.where(f[:, 6], su[f[:, 1], 1] - 1, 0)) >> 3
+        trec = rec[f[:, 2]] & (f[:, 1] == 0) & (f[:, 6] == 0)  # (its pair of records)
+        off = np.where(trec, f[:, 4] + 3 * (r // 4) * T + 2 * T + (r % 4 // 2) * 2 * attn.REC_V, f[:, 5] + (r & 1) * T)
+        self._bd_words(words, f[:, 0], kv0 + off, np.full(len(off), T, np.int64))
+        f = t["r"]  # (the first column's K records; the last's V panels (into their pairs) and rows, of record 0, 1)
+        v = f[:, 3] == nph - 1
+        r = (su[f[:, 1], 0] + np.where(np.where(v, f[:, 6] >= 2, f[:, 6] > 0), su[f[:, 1], 1] - 1, 0)) >> 3
+        head, j = f[:, 4] + 3 * (r // 4) * T, r % 4
+        kind = np.where(v, 1 + f[:, 6] % 2, 0)  # (K, V panels, rows)
+        off = np.choose(kind, [head + j // 2 * T + j % 2 * attn.REC_K, head + 2 * T + j // 2 * 2 * attn.REC_V + j % 2 * 72,
+                               f[:, 5] + (r & 1) * T])
+        self._bd_words(words, f[:, 0], kv0 + off, np.array([attn.REC_K, attn.REC_V, attn.ROWS_B])[kind])
+        st.tr.flush_lines(t["lines"])
 
     def _set_gdn(self, *, nrep: int, cshift: int, commit: bool) -> None:
         """The GDN layers' gdn_in metadata words of the lazy commit."""
-        act = self.dev.view("ACT")
-        for L in self.gobj:
-            off = self.inp[(L, "gdn_in")][0].off
-            m = act[off:off + 4 * META].view(np.int32)
-            m[M_NREP], m[M_CSHIFT], m[M_COMMIT] = nrep, cshift, int(commit)
-            self.dev.flush("ACT", off, 4 * META)
+        if self.gobj:
+            a32 = self.dev.view("ACT").view(np.int32)
+            a32[self._gin + M_NREP], a32[self._gin + M_CSHIFT], a32[self._gin + M_COMMIT] = nrep, cshift, int(commit)
+            self.dev.flush_at("ACT", 4 * (self._gin + M_NREP) & ~63)
 
     # ------------------------------------------------------------------
     # Run
