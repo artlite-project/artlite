@@ -716,12 +716,10 @@ class OverlayModel(NpuModel):
         """A drafter's round kept its first ``kept`` drafts (``_chains``: the probabilities the drafter gave them)."""
         k, c = list(self._kept_at), list(self._chain_at)
         for d, chain in enumerate(self._chains):
-            if d == len(c) == 0:  # (the first round's first draft: as measured)
-                k, c = [float(kept > 0)], [chain]
-                continue
-            if d == len(c):  # (a new depth: from the depth before it, as one round of its calibration and chains)
-                k.append(c[-1] * k[-1] / c[-1])
-                c.append(c[-1])
+            if d == len(c):  # (a new depth: from the depth before it, as one round of its calibration and chains; the
+                # first from 1: a rejected first draft must not stop the drafts that would measure it again)
+                k.append(k[-1] if d else chain)
+                c.append(c[-1] if d else chain)
             k[d] += EWMA * ((kept > d) - k[d])
             c[d] += EWMA * (chain - c[d])
         self._kept_at, self._chain_at = tuple(k), tuple(c)
