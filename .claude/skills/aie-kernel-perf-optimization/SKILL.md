@@ -272,7 +272,8 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   code too); a Python helper called twice in the IRON program inlines its loops twice; the work split between
   neighbour cores by kind (one core builds the input panels, the other computes and keeps the outputs).
 - **Smaller functions**: shared helpers out of line (`noinline`); `minsize` on cold dispatchers, rolled
-  (`AIE_LOOP_NO_UNROLL`) call loops and copies (it shrank nothing on the GDN gate helpers and the scan's copy kernels:
+  (`AIE_LOOP_NO_UNROLL`) call loops and copies, per function by compiling the kernels alone, no link (on a GDN core's constants
+  and transposes -130 B each, nothing or more on its gate helpers and the scan's copy kernels, an unrolled solve +32 B:
   split such code across ops or cores); vector compares against a lane-index table instead of 64-bit mask arithmetic;
   runtime parameters instead of template instances (each instance is a copy: one dequant routine with a runtime
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per

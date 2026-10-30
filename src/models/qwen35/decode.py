@@ -43,7 +43,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     PREFIX = "q35m"
     GDN_STACK, ATTN_STACK = 4864, AT.STACK
-    GWS8_AT = 0x4000  # (8 slots) the GDN workspace: regions 1 .. 3 whole, below the helper's scratch and a SiLU table copy
+    GWS8_AT = 0x4000  # (chunkwise) the GDN workspace: regions 1 .. 3 whole, below the helper's scratch (8 slots) and a SiLU
+    # table copy
     A_FWD = 3  # (the attention core holds its last two A objects: decode.design's A_FWD)
     LENDS_WS = True  # (the attention core's regions in the main core's memory)
     GDN_ROW, ATTN_ROW = 2, 5
@@ -99,6 +100,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         d_fifos: list[tuple[int, ObjectFifo]] = []
         if gdn is not None and gdn.slots == 8:
             self._gdn8_workers(s, workers, d_fifos)
+        elif gdn is not None and gdn.chunk:
+            self._gdn4_workers(s, workers, d_fifos)
         elif gdn is not None:
             G = GD
             GW = gdn.workspace()
@@ -278,7 +281,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return (*[self.GDN_ROW] * (self.gdn is not None), *[self.ATTN_ROW] * (self.attn is not None))
 
     def _gws_of(self, c: int) -> Buffer:
-        """Column c's GDN workspace (8 slots; the helper's ``_help`` takes it too)."""
+        """Column c's GDN workspace (chunkwise; the helper's ``_help`` of 8 slots takes it too)."""
         if c not in self._gws:
             GW = self.gdn.workspace()
             self._gws[c] = Buffer(np.ndarray[(GW["size"] // 4,), np.dtype[np.int32]], name=f"{self.PREFIX}_gws{c}",
@@ -358,9 +361,77 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))
             self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
                             Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
-            for i, a in enumerate(GD.SILU_TAB):  # (used through their addresses only)
-                self._tabs.append(Buffer(np.ndarray[(1600 // 4,), np.dtype[np.uint32]], name=f"{P}_gtab{c}_{i}",
-                                         tile=Tile(c, self.GDN_ROW), address=a - 0x70000, initial_value=kmath.SILU.table_words()))
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._tabs[-2:]],
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._gtabs(c)],
+                                  tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
+                                  while_true=False))
+
+    def _gtabs(self, c: int) -> list[Buffer]:
+        """Column c's SiLU table copies in the GDN core's memory (used through their addresses only)."""
+        P = self.PREFIX
+        self._tabs += [Buffer(np.ndarray[(1600 // 4,), np.dtype[np.uint32]], name=f"{P}_gtab{c}_{i}", tile=Tile(c, self.GDN_ROW),
+                              address=a - 0x70000, initial_value=kmath.SILU.table_words()) for i, a in enumerate(GD.SILU_TAB)]
+        return self._tabs[-2:]
+
+    def _gdn4_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
+        """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "4 slots, chunkwise"): the step's message on M, then per k
+        head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, U] objects, 16 state
+        panels, its outputs, history and deltas out."""
+        p, P, gdn = s.p, self.PREFIX, self.gdn
+        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
+        x_ty = s.x_ty
+        GW = gdn.workspace()
+        assert self.GWS8_AT + GW["size"] <= GD.SILU_TAB[1] - 0x70000, GW
+        gws_ty = np.ndarray[(GW["size"] // 4,), i32]
+        d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
+        i_g = GW["st"] // 4
+        kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
+        kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
+        ks = [kx("gbegin"), Kernel(f"{p}_gmsg", "kernel.o", [s.c_ty, gws_ty]), kx("gq"), kx("gqw"), kx("gk"), kx("gv"), kx("gdl"),
+              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kd("ghq"), kd("ghk"), kd("gdlout"), kd("gout")]
+        nv = gdn.hc // 2
+
+        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gdl, gpanel, ghq, ghk, gdlout, gout, ws, *_tabs):
+            def take(k: Kernel) -> None:  # an X object into the workspace
+                x = x_f.acquire(1)
+                k(x, ws)
+                x_f.release(1)
+
+            def emit(k: Kernel) -> None:  # a D object from the workspace
+                d = d_f.acquire(1)
+                k(ws, d)
+                d_f.release(1)
+
+            for _ in forever_():
+                take(gbegin)
+                for _ in range_(ws[i_g + GD.G_NSKIP]):
+                    x_f.acquire(1)
+                    x_f.release(1)
+                for _ in range_(ws[i_g + GD.G_NMSG]):
+                    m = m_f.acquire(1)
+                    gmsg(m, ws)
+                    m_f.release(1)
+                for _ in range_(ws[i_g + GD.G_ON]):
+                    for _ in range32(2, unroll=False):  # the k heads
+                        take(gq)
+                        take(gqw)
+                        emit(ghq)
+                        take(gk)
+                        emit(ghk)
+                        for _ in range32(nv, unroll=False):  # its v heads
+                            take(gv)
+                            take(gdl)
+                            for _ in range32(16, unroll=False):
+                                x = x_f.acquire(1)
+                                d = d_f.acquire(1)
+                                gpanel(x, ws, d)
+                                d_f.release(1)
+                                x_f.release(1)
+                            emit(gout)  # (its outputs and history, then its deltas: one drain for the two)
+                            emit(gdlout)
+
+        for c in range(COLS):
+            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), s.m_fifos[c].cons(), d_fifos[c][1].prod(), *ks, self._gws_of(c),
+                                           *self._gtabs(c)],
                                   tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))

@@ -482,7 +482,7 @@ class DecodeOverlayOperator(ArtcOperator):
         return [], []
 
     def _pins(self) -> dict[str, int]:
-        """(8 slots) L1 addresses of the model cores' buffers (their symbol names)."""
+        """L1 addresses of the model cores' buffers (their symbol names)."""
         return {}
 
     def _x_rows(self) -> tuple[int, ...]:
@@ -786,9 +786,11 @@ class DecodeOverlayOperator(ArtcOperator):
         for lk in pg_locks + self._locks:
             rt.add_lock(lk)
         module = Program(NPU2(), rt, workers=workers).resolve_program()
+        at = self._pins()
         if s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
-            at = {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)} | self._pins()
+            at |= {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)}
             assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000
+        if at:
             pin_l1_buffers(module, fifo=lambda name, depth: None, buffer=at.get)
         if self.bcast:  # (on the placed design: the placer takes a flow from a shim channel an ObjectFifo uses for a channel more)
             packet_flow(module, BC_ID, (BC_COL, 0), self.ENDPOINTS["X"][1],

@@ -301,18 +301,20 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
 
 class _Gdn:
     """A GDN layer's step of S slots on all columns: its gdn_in phase to C (the exact message values), then with F_MSG
-    to the GDN cores with their X objects (conv, K, deltas, state panels) and D drains."""
+    to the GDN cores with their X objects (conv, K, deltas, state panels; the model's core: ``overlay.chunk_of``) and D
+    drains."""
 
     def __init__(self, path: str, layer: int):
         from models.qwen35 import gdn as GD
         from models.qwen35.image import gdn_v_heads
+        from models.qwen35.overlay import chunk_of
 
         self.MG = GD
         self.g = g = GGUFFile(path)
         self.cfg = cfg = ref.QwenConfig.from_gguf(g)
         self.H, self.L = cfg.hidden_size, layer
         img = QwenImage(g, cfg, layers=[layer], vocab=COLS * 64)
-        self.sh = sh = GD.GdnShape(cfg)
+        self.sh = sh = GD.GdnShape(cfg, chunk=chunk_of(cfg))
         self.op = op = MD.QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in {b.fmt for r in img.regions
                                                                                         for b in r.blocks}},
                                               tile_bytes=img.tile_bytes, eps=cfg.rms_norm_eps, gdn=sh)
@@ -330,11 +332,11 @@ class _Gdn:
         self.ob = OD.SLOTS * self.n_c * 2 * OD.C_LEN
         dev.alloc("OUT", COLS * self.ob)
         self.npair = sh.hc // 2
-        self.gcol = 256 + 4096 * (5 + 3 * self.npair)  # a column's GDN objects [header | payloads]
+        self.gcol = 256 + 4096 * (sh.n_slots if sh.chunk else 5 + 3 * self.npair)  # a column's GDN objects [header | payloads]
         gobj = dev.alloc("GOBJ", COLS * self.gcol)
         self.ps = sh.hc * 16 * GD.PANEL  # a column's state panels
         dev.alloc("GSTATE", 256 + COLS * self.ps)
-        dev.alloc("GO", COLS * self.npair * GD.D_BYTES)
+        dev.alloc("GO", COLS * sh.hc * GD.D_BYTES // 2)  # (per v head 2 KB; a chunkwise core's: its 1 KB, 1 KB of padding)
         blk = r.block("qkv")
         cw = np.asarray(g.tensor(f"blk.{layer}.ssm_conv1d.weight").raw, np.float32)
         dt = np.asarray(g.tensor(f"blk.{layer}.ssm_dt.bias").raw, np.float32).reshape(-1)
@@ -348,16 +350,52 @@ class _Gdn:
             rows = blk.rows[c][blk.rows[c] >= 0]
             o = c * self.gcol
             gobj[o:o + 4 * OD.META] = meta.view(np.uint8)
-            for b, pay in enumerate(GD.conv_payloads(sh, cw[rows], dt[vh], A[vh], norm)):
-                k = b if b < 4 else 5 + 3 * ((b - 4) // 2) + (b - 4) % 2
-                gobj[self.pay(c, k):self.pay(c, k) + sh.xpay] = pay
+            if sh.chunk:
+                h_ = self.pay(c, 0) + GD.P_PRM
+                gobj[h_:h_ + 640] = GD.head_payload(dt[vh], A[vh], norm)
+                for b, w in enumerate(GD.conv_weights(cw[rows])):
+                    gobj[self.pay(c, 0) + sh.weights_at(b):self.pay(c, 0) + sh.weights_at(b) + w.size] = w
+            else:
+                for b, pay in enumerate(GD.conv_payloads(sh, cw[rows], dt[vh], A[vh], norm)):
+                    k = b if b < 4 else 5 + 3 * ((b - 4) // 2) + (b - 4) % 2
+                    gobj[self.pay(c, k):self.pay(c, k) + sh.xpay] = pay
             self.vh.append(vh)
             self.params.append({"conv_w": cw[rows], "dt": dt[vh], "ssm_a": A[vh], "norm": norm})
         dev.flush("GOBJ")
 
     def pay(self, c: int, k: int) -> int:
-        """Byte offset of column c's GDN object k's payload in GOBJ (k: q / k blocks 0 .. 3, K 4, pair p 5 + 3 p ..)."""
+        """Byte offset of column c's GDN object k's payload in GOBJ (k: q / k blocks 0 .. 3, K 4, pair p 5 + 3 p ..; a
+        chunkwise core's: its payload slot)."""
         return c * self.gcol + 256 + 4096 * k
+
+    def _chunk_units(self, seq: Sequence) -> None:
+        """A chunkwise core's objects and drains (``overlay._gdn4``), its outputs into GO."""
+        dev, MG, sh = self.dev, self.MG, self.sh
+        dims4 = (OD.XB // 8, 2, OD.XB // 8, OD.XPAY // 4)
+        units = [u for kh in range(2) for u in [("k", kh)] + [("v", h) for h in range(kh, sh.hc, 2)]]
+
+        def fills(kind: str, i: int, c: int) -> None:
+            if kind == "k":
+                seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i)) - 256), MG.KH_SPAN4 * OD.XB, dims4)
+                return
+            seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) - 256), MG.V_SPAN4 * OD.XB, dims4)
+            seq.fill("X", c, dev.address("GSTATE", c * self.ps + 16 * i * MG.PANEL), 16 * OD.XB, dims4)
+
+        def drains(kind: str, i: int, c: int) -> None:
+            if kind == "k":
+                seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i))), 2 * MG.D_BYTES, (512, 2, 512, 2048))
+                return
+            seq.drain("D", c, dev.address("GSTATE", 256 + c * self.ps + 16 * i * MG.PANEL), 16 * MG.PANEL)
+            seq.drain("D", c, dev.address("GO", (c * sh.hc + i) * MG.D_BYTES // 2), MG.D_BYTES // 2)
+            seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) + 2048), 3 * MG.D_BYTES // 2)
+
+        for n in range(len(units) + 1):
+            if n < len(units):
+                for c in range(COLS):
+                    fills(*units[n], c)
+            if n:
+                for c in range(COLS):
+                    drains(*units[n - 1], c)
 
     def _transaction(self, S: int, msg: bool) -> Transaction:
         dev, op, r = self.dev, self.op, self.r
@@ -375,8 +413,12 @@ class _Gdn:
         for c in range(COLS):
             nbytes, dims = OD.input_fill(self.H)
             seq.fill("X", c, dev.address("ACT"), nbytes, dims)
-            if msg:
+            if msg and not self.sh.chunk:
                 seq.fill("X", c, dev.address("GOBJ", c * self.gcol), 5 * OD.XB, dims4)
+        if msg and self.sh.chunk:
+            self._chunk_units(seq)
+            seq.sync(fills=True)
+            return Transaction(dev, seq.words())
         for c in range(COLS):
             if not msg:
                 seq.drain("C", c, dev.address("OUT", c * self.ob), S * self.n_c * 2 * OD.C_LEN,
@@ -424,6 +466,12 @@ class _Gdn:
                                   "beta": ab[hc:]})
                     msgs.append(m)
         dev.fetch("GO")
+        if self.sh.chunk:
+            go = dev.view("GO").view(np.uint16).reshape(COLS, hc, -1)[:, :, :16 * OD.SLOTS * 8]
+            for c in range(COLS):
+                for h in range(hc):
+                    out.append(_bf16(go[c, h]).reshape(16, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
+            return msgs, np.stack(out, 1)
         go = dev.view("GO").view(np.uint16).reshape(COLS, self.npair, -1)[:, :, :2 * 16 * OD.SLOTS * 8]
         for c in range(COLS):
             for p in range(self.npair):
@@ -484,6 +532,17 @@ def test_gdn_steps(setup: tuple) -> None:
     after token 4) within 2e-3; the outputs within llama.cpp's noise of its final_output."""
     P, G_, Lg, _ = setup
     _gdn_steps(P.path, Lg, _t(G_["model.input_embed"][:5]), G_["final_output", Lg])
+
+
+def test_gdn_steps_a3b() -> None:
+    """The same steps on the 35B-A3B's first GDN layer (the chunkwise core of 4 slots, 4 v heads per column) on random
+    inputs."""
+    path = ref.size_gguf("35B-A3B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    x = mmv.bf(np.random.default_rng(3).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
+    _gdn_steps(path, cfg.gdn_layers[0], x, None)
 
 
 def test_gdn_steps_27b() -> None:

@@ -39,6 +39,15 @@ different shape, or a fixed tool.
 | SiLU's Newton steps or `mulff` out of line (noinline helper, rolled loop) | -96..+368 B and 1.0-1.4x the cycles; one 64-lane pass won instead (352 cycles, +384 B) |
 | `minsize` on the per-tile wrappers (mv_qkv / mv_acc / mv_gu, qkv_in, resid, ...) | 0 B, mv_qkv +96 B |
 | The tile dispatch as one noinline function per format, tail-called | +0..+16 B |
+| Cold helpers out of line taking 64-lane vectors or accumulators by value (`mulff<64>`, a panel push) | +1.5 KB on the GDN core: the call sites cost more than the inlined bodies |
+| A 4-token solve's identity and substitution rolled | +320 B against unrolled (`x[t]`'s scalar stores, the loop) |
+
+## GDN core of 4 slots at S 1
+
+| idea | result |
+|---|---|
+| A head's group and panels fills as one BD chain (one push, one wait) | GDN 0.94 -> 0.98 ms on the 1B: two chains fill the channel's 4 BDs, nothing queued ahead |
+| SiLU on the 4 rows before panel order (512 elements, not 1024) | no change in the GDN window (2.82 -> 2.81 ms): that compute overlaps the DMA; kept for its code size |
 
 ## Planar dequant (Q2_K / Q3_K GemmQd)
 

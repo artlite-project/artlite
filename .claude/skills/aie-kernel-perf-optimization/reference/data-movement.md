@@ -206,6 +206,8 @@ offsets): aie2p-coding section 8. For speed:
 - **Issue order decides deadlock.** A wait for the oldest weight fill needs the cores to consume
   it, and they need their X inputs first. Issue a phase's X fills and C drains before the bulk of
   its weight fills; prefetch the next command and first fills before a sync.
+  - A round over the columns holds at most 4 tasks of a channel per column: a fifth waits for the round's own first, column
+    after column, so the columns run one at a time (a GDN layer's last v head: 59 -> 142 us a layer).
   - Many tasks per column: issue them in rounds over the columns, each round's drains before the next
     round's fills, so the oldest task a fifth one waits for never depends on a later round (all fills
     first hung: a fill waited for objects the core could only take after its drains).
@@ -223,7 +225,9 @@ offsets): aie2p-coding section 8. For speed:
   channel and sync: the same 57 ms): count tasks as well as bytes, but measure before cutting them. Where the cores
   take a stream's objects as fast as they come (the 27B's GDN state panels at S 1, DMA-bound), each task of it is
   in the step time: its panel fills split into 8 / 32 tasks per pair and column cost +4 / +24 ms a step (~0.5-0.65 µs
-  a task, round-robin over the columns).
+  a task, round-robin over the columns). Many units a layer: their tasks in rounds of one task over the columns, not a
+  column's tasks in a row (a chunkwise GDN core with 4 v heads: 3.24 -> 2.82 ms a step at every S; the last column's first task
+  ~10 µs behind the first's at every unit otherwise).
 - **Hold an output object only while writing it**: a core that acquires a D object early (a GDN conv block's history
   built in it across two X objects) runs its next outputs single-buffered until that drain is queued: the 8-slot GDN
   core's S 4 step 331.7 -> 313.8 ms with the history built in its workspace and drained with the head's deltas after
