@@ -297,6 +297,12 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   place in one region put P V 50% above its schedule (548 vs 364 cycles).
 - 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
   pops (each K panel once per head) and its in-place o (no L1 for a second copy).
+- **One pass whatever a step's S** (`models/qwen35/attn.py`, designs of 8 slots): rows head-major, octet h = head h's 8
+  slots, so a step's compute does not follow S. K hi alone, as pairs of records: 2 objects a group, not 3, a pass -1/3.
+  Row maxima from the first group for the whole pass (no rescale, P clamps), then QK from the baseline 192 - m and the
+  group's P in two pipelined passes (756 against 1068 cycles a group at 3 octets; one loop spills the exp's constants).
+  A new K by the popped panels' lanes (900 cycles a record against a byte loop's 43,000). A step across a group: the
+  first group's open record keeps its scores in the slot the second does not write. 27B at 32K: V(8) / V(1) 1.071 -> 1.016.
 - **The same in decode** (`models/qwen35/attn.py`: up to 24 query rows, octets of two sets of [4 rows hi | 4 rows lo],
   against a pass over the whole cache): the cache d-block major (``decode.kv``: K records [d-block][hi | lo], V records
   in pairs [d-block][record 2], the order the prefill's stream reads), so per d-block K hi, K lo and an octet's two Q

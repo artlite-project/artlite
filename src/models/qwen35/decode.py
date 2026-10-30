@@ -5,7 +5,8 @@ cores of every column, their GEMV phases) with the qwen35 cores:
   core's M stream; 8 slots: through DDR, the core's memory also holding the helper's scratch), outputs on D;
 - attention (c, 5), with ``attn``: the full-attention layers' attention of S slots (``qwen35/attn.py``), the KV cache
   through A (broadcast with the main core's), outputs relayed by the main core (shared-memory FIFO R) to C; a KV head's
-  chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair.
+  chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair (one
+  pass, a design of 8 slots: each core emits its own rows, no tokens).
 
 Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
 ``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the

@@ -89,9 +89,15 @@ bandwidth.
   qwen35 9B 124 MB of 5.2 GB, 27B 351 MB of 16.4 GB (half of it per-column GDN states). One broadcast copy would save
   ~1-1.7%: the bytes, and 7 of the 8 fills between a drain wait and the next phase (their firmware ops are ~60% on
   the critical path). The overlays cannot take it as they are: the X stream also carries per-column objects
-  (residual slices, attention and GDN objects), and each core's two input channels are taken (A, X). **A new design**:
-  phase inputs on one broadcast stream from one shim (over 2-4 shims if one channel's 13.8 GB/s would pace a phase),
-  per-column objects on another channel (the weight stream, or a neighbour core's free input channels).
+  (residual slices, attention and GDN objects), and each core's two input channels are taken (A, X). **What works**
+  (`decode.design` "Broadcast inputs", designs of 8 slots): the memtile -> cores segments packet-switched, so a core's X
+  channel takes a column's objects and a phase's input as a packet flow from one shim to all X consumers: -3 ms per step
+  at every S on the 27B. The flows share receivers, so aiecc wants `--allow-deadlock-prone-routing`; right here because
+  a broadcast fill follows a sync that drained the phase before, and a step's first phase stays local.
+- **A core's X at depth 1 adds the object's DMA to its work.** The next object cannot arrive while the core holds this
+  one: 544 cycles per 4352 B object on top of the strip. At 8 rows per k block `down` takes twice the objects (+1.4 ms
+  per step on the 27B from S 4 to S 5). Depth 2 needs 4352 B the 27B's main core does not have: ~770 B short around its
+  bank-pinned tables.
 - **Broadcast what every column needs**: a GEMM's activations per core row from one shim channel to its memtile,
   then to that core row of all 8 columns, are read once for all columns instead of 8 times (0.14 vs 1.15 GB per
   chunk). One stream per core row, from different shims: one shim channel for all rows paced the GEMMs at 96 tokens.

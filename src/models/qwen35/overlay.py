@@ -142,10 +142,10 @@ class _Step:
 
 
 def slots_of(cfg: QwenConfig, fmts: set[str]) -> int:
-    """A step's token slots at most: 8 for a dense model with its own MTP block (its drafter's chains go deep: the
-    verify's slots pay where the drafter is right) whose formats the decode GEMV runs at 8 slots (``decode.gemv``),
-    else 4."""
-    return 8 if cfg.nextn_layers == 1 and not cfg.moe and all(gemv.supported(f, 4, 8) for f in fmts) else 4
+    """A step's token slots at most: 8 for a dense model of a KV head per 2 columns whose formats the decode GEMV runs at
+    8 slots (``decode.gemv``): no slower at S 1, S 4 3% faster. Else 4: an MoE design has no broadcast input, a KV head
+    per 4 columns makes the one-pass attention slower at S 1."""
+    return 8 if not cfg.moe and COLS // cfg.num_key_value_heads == 2 and all(gemv.supported(f, 4, 8) for f in fmts) else 4
 
 
 def _text_rope(n: int) -> np.ndarray:
@@ -924,7 +924,7 @@ class QwenOverlay(ModelOverlay):
         self._accepted = True
 
     def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
-        """(per attention layer and KV head: groups of 32 positions, 3 objects each)"""
+        """(per attention layer and KV head: groups of 32 positions, 2 objects each)"""
         if self.ash is None:
             return []
         rows = [self.kv_off[L] + h * self.ash.head_bytes for L in self.kv_off for h in range(self.ash.kvh)]

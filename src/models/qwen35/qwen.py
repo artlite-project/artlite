@@ -1,7 +1,7 @@
 """Qwen3.5 / Qwen3.6 (GGUF architectures ``qwen35``: Gated DeltaNet and full-attention layers, and ``qwen35moe``: the
 same with a mixture of experts as the FFN) on the NPU.
 
-A dispatch runs up to 4 tokens (Qwen3.8-27B: 8, ``overlay.slots_of``) through every layer and the LM head on one
+A dispatch runs up to 4 tokens (the 27B models: 8, ``overlay.slots_of``) through every layer and the LM head on one
 stream of the weights (``models.qwen35.overlay.QwenOverlay``): the projections on the main cores and their helpers
 (the MMUL against exact-integer weight panels), the Gated DeltaNet steps (conv states and fp32 states in DDR) on the GDN cores,
 the full attention and its KV cache on the attention cores. The host reads the tokens' embedding rows from the mapped
@@ -87,7 +87,7 @@ class NpuQwen(OverlayModel):
         if cfg.moe:
             self.STEP_COST = (1.0, 1.31, 1.60, 1.94)  # (35B-A3B at 1K: the slots route to different experts)
         else:  # (27B at 1K: the weights stream once)
-            self.STEP_COST = (1.0, 1.01, 1.015, 1.02, 1.03, 1.035, 1.04, 1.045)[:self.overlay.SLOTS]
+            self.STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)[:self.overlay.SLOTS]
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
