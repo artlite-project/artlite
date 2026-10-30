@@ -36,13 +36,15 @@ same name (ggml-org publishes its drafters apart from the models); of several, Q
 ## How the NPU path works
 
 Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
-share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head; the host
-builds the dispatch's transaction (`qwen35/overlay.py`), and the cores read what to do from their input streams. Per
-column:
+share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head (Qwen3.8
+27B's up to 8, for its drafter's long chains: a step of 8 costs 1.08x a step of one at 1K and 1.18x at 32K, where steps
+of 5-8 take a second pass over the KV cache); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
+cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);
 - the GDN core runs the Gated DeltaNet step: conv, gates, the delta rule on the fp32 state that it
-  reads and writes back to DDR every token;
+  reads and writes back to DDR every token (in a design of 8 tokens the main core's helper, idle then, runs half
+  of the state's panels);
 - the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
   share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core.
@@ -85,24 +87,24 @@ super-block of the rows a pass dequantizes. Alpha runs as two BFP16 planes (hi +
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
 With its drafter (the model's MTP layer: an attention layer and an FFN of its own - Qwen3.8-27B's dense, in its model
-file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three
-draft tokens along (`qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what follows, one dispatch of
-the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with ggml-org's Q4_0 drafter,
-3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 14 ms at 32K), as long as their chain's probability pays for what
-they cost: a draft's slot in the step and the drafter's step for the next one, against the tokens per second the model's
-rounds give (`OverlayModel._worth`; a dense model's slot costs ~1.5% of its step, so its chains go on down to a
-probability of ~0.1, an MoE's slots route to more experts: ~0.4-0.5). The step runs the token and its drafts, and a
-draft is kept where the model's own token at its position is that draft; the GDN states stay uncommitted until the
-next step, which replays the accepted tokens. The drafter's head is about 66048 rows of its LM head: the special tokens
-(the turn's end, tool calls, a thought's end), the first ids (the most frequent tokens) and 512 of the sequence's own
-tokens past them, the most recently seen (an agent's turns repeat the identifiers of the code it reads: 0.2% of their
-tokens are outside the head, 2.7% outside the first 65536 ids). Qwen3.8-27B's MTP layer shares the model's LM head:
-the model's head rows put those first in each column (67584 rows: whole tiles), so the drafter streams the first rows
-of the model's own head, and the model's logits are gathered back into token order. Its row
-at a position takes that position's token and the model's hidden state of the position before, so its KV cache follows
-the model's: a prompt chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the
-model's last layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs
-the drafter's formats as code pages.
+file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three draft
+tokens along (Qwen3.8-27B up to seven; `qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
+follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
+ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 14 ms at 32K), as long as their
+chain's probability pays for what they cost: a draft's slot in the step and the drafter's step for the next one, against
+the tokens per second the model's rounds give (`OverlayModel._worth`; a dense model's slot costs ~1.5% of its step, so
+its chains go on down to a probability of ~0.1, an MoE's slots route to more experts: ~0.4-0.5). The step runs the token
+and its drafts, and a draft is kept where the model's own token at its position is that draft; the GDN states stay
+uncommitted until the next step, which replays the accepted tokens. The drafter's head is about 66048 rows of its LM
+head: the special tokens (the turn's end, tool calls, a thought's end), the first ids (the most frequent tokens) and 512
+of the sequence's own tokens past them, the most recently seen (an agent's turns repeat the identifiers of the code it
+reads: 0.2% of their tokens are outside the head, 2.7% outside the first 65536 ids). Qwen3.8-27B's MTP layer shares the
+model's LM head: the model's head rows put those first in each column (67584 rows: whole tiles), so the drafter streams
+the first rows of the model's own head, and the model's logits are gathered back into token order. Its row at a position
+takes that position's token and the model's hidden state of the position before, so its KV cache follows the model's: a
+prompt chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the model's last
+layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs the drafter's
+formats as code pages.
 
 On the 35B-A3B models a step of several tokens sums the experts' outputs in another order than a step of one, so
 greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the

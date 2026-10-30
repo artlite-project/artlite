@@ -54,7 +54,7 @@ the file's `general.sampling.*`, else its model card's.
 time). Llama's default is `single`: `hilo` makes decode at 32K 1.2x slower with no measured quality gain. Gemma 4's
 default is `hilo`: `single` takes 2/3 of the cache at KL 0.00028 instead of 0.00023 against the same file on the CPU.
 
-Generation runs in steps of up to 4 tokens: the next token and draft tokens after it, which a step checks at a
+Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and draft tokens after it, which a step checks at a
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
 far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
 model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's own MTP layer, Qwen3.6 35B-A3B's and
