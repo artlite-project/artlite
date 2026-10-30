@@ -551,6 +551,12 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
 }
 
 {% if SLOTS == 8 %}
+// log2 of the slots of an input k block in a step of S slots (``decode.design.packed_slots``)
+[[clang::always_inline]] inline int {{ p }}_lsp(int S)
+{
+    return S == 1 ? 0 : (S == 2 ? 1 : (S <= 4 ? 2 : 3));
+}
+
 // Slot s's residual slice (fp32): slots 0 .. 3 in the workspace, 4 .. 7 in hres (the helper's memory)
 [[clang::always_inline]] inline float *{{ p }}_res(int32_t *ws, float *hres, int s)
 {
@@ -1097,7 +1103,11 @@ __attribute__((noinline, minsize)) void {{ p }}_fin(int32_t *__restrict st)
 {% else %}
         st[{{ S_ESRC }}] = 1;
         st[{{ S_EJ }}] = 0;
+{% if SLOTS == 8 %}
+        st[{{ S_NE }}] = {{ H8 // C_LEN }} << {{ p }}_lsp(S);
+{% else %}
         st[{{ S_NE }}] = S * {{ H8 // C_LEN }};
+{% endif %}
 {% endif %}
         return;
     }
@@ -1327,11 +1337,24 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
         }
 {% endif %}
 {% if SLOTS == 8 %}
-        const float *__restrict pr = {{ p }}_res(ws, hres, s) + {{ C_LEN }} * j;
+        // (the next input's x, [k block][slot SP][8]: a column's whole rows in DDR, not 16 bytes of a slot at a time)
+        const int ls = {{ p }}_lsp(S), nb = 8 >> ls;
+        const int q = 8 * nb * j, nsp = 1 << ls;
+        st[{{ S_EJ }}] = j + 1;
+        bfloat16 *__restrict o = c;
+        AIE_LOOP_NO_UNROLL
+        for (int b = 0; b < nb; b++) {
+            AIE_LOOP_NO_UNROLL
+            for (int i = 0; i < nsp; i++) {
+                const aie::vector<float, 16> v = aie::load_v<8>({{ p }}_res(ws, hres, i) + q + 8 * b).template grow<16>();
+                aie::store_v(o, aie::accum<accfloat, 16>(v).template to_vector<bfloat16>().template extract<8>(0));
+                o += 8;
+            }
+        }
 {% else %}
         const float *__restrict pr = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * s + {{ C_LEN }} * j;
-{% endif %}
         aie::store_v(c, aie::accum<accfloat, 64>(aie::load_v<64>(pr)).template to_vector<bfloat16>());
+{% endif %}
         return;
     }
 {% endif %}

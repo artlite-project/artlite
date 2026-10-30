@@ -302,12 +302,16 @@ class ModelOverlay:
             seq.fill("X", c, self.dev.address("ACT", rg.off), nbytes, dims)
 
     def _values_to(self, seq: Sequence, c: int, phase: tuple[int, str], *, e0: int, n: int, S: int,
-                   stream: str = "C") -> None:
+                   stream: str = "C", whole: bool = False) -> None:
         """n output values per slot of column c (objects (j, slot) of C_LEN values) -> the input elements e0 .. e0 + n
-        of a phase's plain x ([k block][slot sp][8])."""
+        of a phase's plain x ([k block][slot sp][8]). whole: the outputs as x lies (a residual of a design of 8 slots)."""
         sp = self._sp(S, phase)
         for rg in self.inp[phase]:
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
+            if whole:
+                if a < b:
+                    seq.drain(stream, c, self.dev.address("ACT", rg.off + XB + 2 * sp * (a - rg.k0)), 2 * sp * (b - a))
+                continue
             j = a
             while j < b:  # (repeated BDs: at most 64 iterations)
                 m = min(b - j, 64 * C_LEN)

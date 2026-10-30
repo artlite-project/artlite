@@ -93,9 +93,13 @@ class _Phases:
         n_obj = mmv.out_objects(region, flags, self.H, f32_ab=f32_ab)
         assert slots * n_obj * 2 * OD.C_LEN <= self.ob
         seq = Sequence(op, rolling=True)
+        whole = slots == 8 and flags & OD.F_EMITR  # (the residual as the next input's x lies: [k block][slot sp][8])
         for c in range(COLS):  # drains [slot][objects]: object j of every slot, then j + 1
-            seq.drain("C", c, dev.address("OUT", c * self.ob), S * n_obj * 2 * OD.C_LEN,
-                      (OD.C_LEN // 2, S, n_obj * OD.C_LEN // 2, OD.C_LEN // 2))
+            if whole:
+                seq.drain("C", c, dev.address("OUT", c * self.ob), sp * n_obj * 2 * OD.C_LEN)
+            else:
+                seq.drain("C", c, dev.address("OUT", c * self.ob), S * n_obj * 2 * OD.C_LEN,
+                          (OD.C_LEN // 2, S, n_obj * OD.C_LEN // 2, OD.C_LEN // 2))
         for c in range(COLS):
             if resid is not None:
                 for s in range(S):
@@ -111,6 +115,8 @@ class _Phases:
         dev.dispatch(Transaction(dev, seq.words()))
         dev.fetch("OUT")
         out = dev.view("OUT").view(np.uint16).reshape(COLS, -1)
+        if whole:
+            return out[:, :sp * n_obj * OD.C_LEN].reshape(COLS, -1, sp, 8)[:, :, :S].transpose(0, 2, 1, 3).reshape(COLS, S, -1).copy()
         return out[:, :S * n_obj * OD.C_LEN].reshape(COLS, S, -1).copy()
 
 

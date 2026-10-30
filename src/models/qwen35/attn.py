@@ -871,20 +871,9 @@ template <int NO>
     }
 }
 
-{# 2^x of 32 lanes: the gates'; P's (bias 192: pipelines, masked scores -16384) #}
-{% set exp2, e192 = km.exp2(32, below="zero"), km.exp2(64, bias=192, below="bounded", above="clamp", inline=True) %}
-{{ exp2.src }}
+{# P's 2^x (bias 192: pipelines, masked scores -16384) #}
+{% set e192 = km.exp2(64, bias=192, below="bounded", above="clamp", inline=True) %}
 {{ e192.src }}
-
-// 32 gates: sigmoid(g) = 1 / (1 + 2^(-g log2 e)) (bf16-level: the output is rounded to bf16; -g log2 e: al::log2e's
-// products of the bf16 g, negated)
-[[clang::always_inline]] inline void {{ p }}_gate(const bfloat16 *__restrict g, bfloat16 *__restrict out)
-{
-    const aie::vector<bfloat16, 32> gb = aie::load_v<32>(g);
-    const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
-                                                 aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
-    aie::store_v(out, aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>());
-}
 
 // y += P V of two pairs of records v, vb (a V object's, or one twice) for NO octets, one read and one write of y per
 // d-block for the four records' MMULs: pp [octet][P0 | P1 | P2 | P3]; y in place (yl, ys the same buffer as distinct
@@ -1483,6 +1472,9 @@ __attribute__((minsize)) void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloa
 
 # The main core's part of one pass: the gates of the query rows, per step (the attention core's L1 holds none)
 _MAIN_ONE = JINJA_ENV.from_string(r"""
+{% set sig = km.act(km.SIGMOID, table_arg=True) %}
+{{ sig.src }}
+
 namespace {
 
 // An object of another core (the main core's begin): an F_ATT object: its q objects' gates and its o's R objects
@@ -1501,8 +1493,9 @@ namespace {
 extern "C" {
 
 // A skipped X object: a q object: its heads' sigmoid(gate) into the gate table gt ([row 8 h + s][256] bf16 in the helper's x
-// panels, idle in the attention)
-__attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat16 *__restrict gt)
+// panels, idle in the attention), through the table's copies ta, tb (the core's and the helper's memory)
+__attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat16 *__restrict gt,
+                                            const uint32_t *__restrict ta, const uint32_t *__restrict tb)
 {
     int32_t *__restrict st = ws;
     const int i = st[{{ MG_I }}];
@@ -1512,12 +1505,8 @@ __attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_
     st[{{ MG_I }}] = i + 1;
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     AIE_LOOP_NO_UNROLL
-    for (int h = 0; h < {{ QC }}; h++) {
-        bfloat16 *__restrict g = gt + {{ HD }} * (8 * h + i);
-        AIE_LOOP_NO_UNROLL
-        for (int j = 0; j < {{ HD }}; j += 32)
-            {{ p }}_gate(pay + {{ 2 * HD }} * h + {{ HD }} + j, g + j);
-    }
+    for (int h = 0; h < {{ QC }}; h++)
+        {{ sig }}<{{ HD }}>(pay + {{ 2 * HD }} * h + {{ HD }}, gt + {{ HD }} * (8 * h + i), ta, tb);
 }
 
 // An R object -> a C object: of o (fp32 y / l [slot 8][8] of a head's k block: the gates' products, bf16), or a record's

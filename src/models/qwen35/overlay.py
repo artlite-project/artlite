@@ -449,7 +449,7 @@ class QwenOverlay(ModelOverlay):
             elif name == "lm":
                 self._logits_out(seq, c, S)
             else:  # the residual
-                self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S)
+                self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S, whole=self.SLOTS == 8)
 
     def _gdn(self, seq: Sequence, L: int, S: int) -> None:
         """gdn_in and the GDN step."""

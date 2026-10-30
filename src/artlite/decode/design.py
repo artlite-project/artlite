@@ -63,7 +63,8 @@ stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side c
 Designs of 8 slots (``slots=8``: a dense model whose formats run at 8 slots, ``gemv``): x per k block one panel of the
 8 slots' single bfp16 rows (``gemv``'s "Designs of 8 slots"; the sum panels a hi and a lo panel each), an input object
 of ``obj_k`` 256 k ([k block][slot 8][8] bf16; a strip of the helper's is a super-block), a norm-weight object over 16 of
-them, a row tile's outputs [g 2][slot 8][r 8]. L1 (the main core's own regions are its 4-slot design's at twice the
+them, a row tile's outputs [g 2][slot 8][r 8]. The residual goes out as the next input's x lies ([k block][slot SP][8]: a column's
+whole rows in DDR, where a slot's objects scattered 16-byte rows, ~22 us a phase at S 8). L1 (the main core's own regions are its 4-slot design's at twice the
 slots, but the residual): the main core's workspace holds the residual of slots 0 .. 3, the helper's memory that of 4
 .. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums)
 lies in the core south of it (``HS8_ROW``: the model's core there leaves it room). No moe, post, packed, paged designs.
@@ -253,8 +254,10 @@ class DecodeOverlayOperator(ArtcOperator):
     BD_BASE: ClassVar[dict[str, int]] = {"A": 0, "X": 4, "C": 8, "D": 12}
     msg = relay = False
     # gate: a model's attention whose gates the main core applies (its source: ``{p}_gbegin`` for begin, ``{p}_mgate`` on
-    # each skipped X object, ``{p}_mrelay`` for the R objects, R_LEN bf16 elements each: o as fp32, records as bf16)
+    # each skipped X object, ``{p}_mrelay`` for the R objects, R_LEN bf16 elements each: o as fp32, records as bf16);
+    # gate_words: the words of a table of ``{p}_mgate``'s, a copy in the main core's memory and one in the helper's
     gate = False
+    gate_words: np.ndarray | None = None
     R_LEN = C_LEN
     LENDS_WS = False  # (a model core uses the main core's workspace: _Streams.ws, placed on the main core's tile)
     # help_flag: an object of another core whose work the helper shares: the main core's begin commands it (K_HELP:
@@ -519,7 +522,9 @@ class DecodeOverlayOperator(ArtcOperator):
         k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, *[hres_ty] * s8])
         k_relay = (Kernel(f"{p}_mrelay", "kernel.o", [rr_ty, c_ty, ws_ty, xp_ty]) if self.gate else
                    Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
-        k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
+        gt = self.gate_words
+        gt_ty = None if gt is None else np.ndarray[(gt.size,), np.dtype[np.uint32]]
+        k_xgate = (Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty, *[gt_ty] * (2 * (gt is not None))]) if self.gate else None)
         hst_ty = np.ndarray[(4,), i32]  # (help_flag: the helper's count of model work)
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8,
                                                     *[hst_ty] * bool(self.help_flag)])
@@ -564,6 +569,8 @@ class DecodeOverlayOperator(ArtcOperator):
             elif s8:
                 acc, *rest = rest  # (8 slots: hres)
             xgate = rest.pop(0) if self.gate else None
+            gtab = rest[-2:] if gt is not None else []  # (placed, read through the kernel's arguments)
+            rest = rest[:-2] if gt is not None else rest
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
             ea = (acc,) if self.moe or s8 else ()  # (collect's and emit's last argument: moe's acc, 8 slots' hres)
 
@@ -657,7 +664,7 @@ class DecodeOverlayOperator(ArtcOperator):
                 for _ in range_(ws[i_st + S_NSKIP]):  # the other cores' X objects (gate: a q object's gates)
                     x = x_f.acquire(1)
                     if xgate is not None:
-                        xgate(x, ws, xp)
+                        xgate(x, ws, xp, *gtab)
                     x_f.release(1)
                 for _ in range_(ws[i_st + S_NASKIP]):  # and A objects
                     a_f.acquire(1)
@@ -713,6 +720,9 @@ class DecodeOverlayOperator(ArtcOperator):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
                                           address=iq3.TAB[h][i] - 0x70000, initial_value=iq3.grid_words())
                                    for i in range(2)]
+        def gate_tab(c: int) -> list[Buffer]:  # (the main core's copy, the helper's)
+            return [] if gt is None else [Buffer(gt_ty, name=f"{P}_gtab{c}_{r}", tile=Tile(c, r), initial_value=gt) for r in (mr, hr)]
+
         # (paged: the main cores take COLS + their column, not a constant 0 in column 0, which can give its control code
         # another size: every core's resident kernels must lie where the pages were linked, ``paging.link``)
         for c in range(COLS):
@@ -734,7 +744,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
                                             *([k_psums] if self.post else []), ws, xp, xs,
                                             (COLS if self.paged else 0) + c, *pg_main.get(c, []),
-                                            *grids.get((c, 0), [])],
+                                            *grids.get((c, 0), []), *gate_tab(c)],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
             help_args = []
