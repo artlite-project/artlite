@@ -38,6 +38,7 @@ column's weights between two attentions (their caches on A) as one run, its phas
 region-major one per phase and K group (the norm-weight objects from NORM).
 """
 
+import math
 import os
 
 import numpy as np
@@ -103,7 +104,6 @@ from .decode import (
     M_NTAIL,
     M_POS,
     M_SA,
-    M_SINV,
     M_SPLIT,
     QwenDecodeOperator,
 )
@@ -120,7 +120,7 @@ CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (pref
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
 DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart (the overlapping regions)
 FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
-F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ, M_ANA, M_SINV])  # (an F_ATT object's)
+F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ, M_ANA])  # (an F_ATT object's)
 
 
 class _Step:
@@ -185,7 +185,7 @@ class QwenOverlay(ModelOverlay):
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
                                       paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16),
-                                      slots=slots)
+                                      slots=slots, bcast=slots == 8)
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
         self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
@@ -211,8 +211,10 @@ class QwenOverlay(ModelOverlay):
         return out
 
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
-        """(a design of 8 slots: gdn_out's input of 8, the GDN cores' outputs whole heads of 8 slots)"""
-        return self.SLOTS if phase is not None and phase[1] == "gdn_out" else super()._sp(S, phase)
+        """(a design of 8 slots: gdn_out's input of 8, the GDN cores' outputs whole heads of 8 slots; attn_out's, one pass:
+        an octet's rows)"""
+        whole = phase is not None and (phase[1] == "gdn_out" or (phase[1] == "attn_out" and self.ash.one))
+        return self.SLOTS if whole else super()._sp(S, phase)
 
     def _meta(self, L: int, name: str, rg: object, m: np.ndarray) -> np.ndarray:
         if name == "sdown":  # (its panels in the side chunk: the expert's gate / up reads moe_in's)
@@ -298,7 +300,7 @@ class QwenOverlay(ModelOverlay):
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
         self.rings = (r0, self._layout["KV"] - r0)
         if self.ash is not None:  # (the prefill's slices past the end; a step's second record; a tail fill's T bytes)
-            take("KV", (KV_PAD // attn.POS_PER_GROUP + 1) * 3 * self.T)
+            take("KV", (KV_PAD // attn.POS_PER_GROUP + 1) * attn.OBJS * self.T)
         self._sizes()
 
     @property
@@ -347,7 +349,8 @@ class QwenOverlay(ModelOverlay):
 
     def _load_attention(self, L: int) -> None:
         act = self.dev.view("ACT")
-        norms = np.concatenate([self._f32(f"blk.{L}.attn_q_norm.weight"), self._f32(f"blk.{L}.attn_k_norm.weight")])
+        qn = self._f32(f"blk.{L}.attn_q_norm.weight") * (np.float32(math.log2(math.e) / 16) if self.ash.one else 1)
+        norms = np.concatenate([qn, self._f32(f"blk.{L}.attn_k_norm.weight")])
         for c in range(COLS):
             for u in range(self.ash.u):
                 o = self._fatt(L, c, u)
@@ -456,7 +459,7 @@ class QwenOverlay(ModelOverlay):
         dev, MG, sh = self.dev, gdn, self.gsh
         self._weights(seq, (L, "gdn_in"), 0)
         seq.sync()
-        self._inputs(seq, self.inp[(L, "gdn_in")][0], S)
+        self._inputs(seq, self.inp[(L, "gdn_in")][0], S, (L, "gdn_in"))
         for c in range(COLS):
             seq.fill("X", c, dev.address("GOBJ", self.gobj[L] + c * self.gcol), 5 * XB, DIMS_OBJ)
         for c in range(COLS):
@@ -587,13 +590,13 @@ class QwenOverlay(ModelOverlay):
                 # _set_position), its ring (one pass: the chain's first column's stream, to both cores)
                 head = dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes)
                 kinds = ("all",) if not split else ("run", "new") if c % nph == 0 else ("run",)
-                for kind in kinds:  # (split: the chain's first column its run, then the new positions' K objects)
-                    st.fills.append((seq.fill("A", c, head, 3 * T), L, c, u, kind))
+                for kind in kinds:  # (split: the chain's first column its run, then the new positions' group's K and V objects)
+                    st.fills.append((seq.fill("A", c, head, attn.OBJS * T), L, c, u, kind))
                 if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T), L, c, u, t)
                                  for t in range(attn.TAILS)]
-                if not split and c % nph == 0:  # (then the new positions' K objects again, for their records)
-                    st.fills.append((seq.fill("A", c, head, 3 * T), L, c, u, "new"))
+                if not ash.one and not split and c % nph == 0:  # (then the new positions' group again, for their records)
+                    st.fills.append((seq.fill("A", c, head, attn.OBJS * T), L, c, u, "new"))
             last = u == len(st.subs) - 1 and run
             if last and self._a_bds > 1 + attn.TAILS:  # (a later block's after the X objects: ``_weight_run``)
                 self._weight_run(seq, run, blocks=slice(1))
@@ -617,12 +620,13 @@ class QwenOverlay(ModelOverlay):
                     sp = self._sp(S, (L, "attn_out"))
                     at, left = self._x_at((L, "attn_out"), attn.HD * h0, S)
                     assert left >= 4 * sp * 128 * nh
-                    sw = 4 * sp  # (words of an x k block: [slot sp][8] bf16)
-                    seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * n * 32 * nh,
-                              None if n == sp else (4 * n, 32 * nh, sw, sw * 32 * nh))
-                sizes = {attn.ROLE_K: (attn.REC_K,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
-                for k, nb in enumerate(sizes):  # (a V record's panels into its pair: V_SCATTER)
-                    dims = attn.V_SCATTER if role == attn.ROLE_V and k % 2 == 0 else None
+                    sw, m = 4 * sp, sp if ash.one else n  # (words of an x k block: [slot sp][8] bf16; the slots out)
+                    seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * m * 32 * nh,
+                              None if m == sp else (4 * m, 32 * nh, sw, sw * 32 * nh))
+                nk = attn.REC_K if ash.one else 2 * attn.REC_K  # (one pass: a K record; sub-steps: its pair)
+                sizes = {attn.ROLE_K: (nk,) * 2, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * 2, attn.ROLE_O: ()}[role]
+                for k, nb in enumerate(sizes):  # (a record's panels into its pair: V_SCATTER)
+                    dims = attn.V_SCATTER if nb == attn.REC_V else None  # (REC_K == REC_V)
                     hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb, dims)
                     st.drains.append((hd, L, c, u, k))
 
@@ -715,9 +719,11 @@ class QwenOverlay(ModelOverlay):
         whether the chains divide the cache: by its group alone)."""
         if self.ash is None:
             return ()
+        if self.ash.one:
+            return ((0, S, False),)
         out = []
         for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub):
-            out.append((a, n, not self.ash.one and attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
+            out.append((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
         return tuple(out)
 
     def _patch_tables(self, st: _Step) -> dict[str, np.ndarray]:
@@ -758,19 +764,20 @@ class QwenOverlay(ModelOverlay):
         su = np.zeros((U, 2), np.int64)  # (a sub-step's first position, slots)
         for u, (a, n, split) in enumerate(st.subs):
             q, g = p + a, (p + a) // attn.POS_PER_GROUP
-            G = g + 1  # (groups through g; split: chain core k's attention groups b[k] .. b[k + 1] - 1)
+            G = (q + n - 1) // attn.POS_PER_GROUP + 1  # (groups through the last slot's; split: chain core k's attention groups b[k] .. b[k + 1] - 1)
             b = ash.bounds(g) if split else [0] * (nph + 1)
             su[u] = q, n
             for k in range(nph):
                 nt = attn.TAILS if not split or ash.role(k) == attn.ROLE_V else 0
-                if not split:  # (a chain's first column: then group g's K objects again, for its K records)
-                    na, g0, ga, gj = 3 * G + nt + (2 if k == 0 else 0), 0, 1 << 20, 0
-                elif k == 0:  # (then group g's K objects for its K records)
-                    na, g0, ga, gj = 3 * b[1] + 2, 0, b[1], g
+                o = attn.OBJS
+                if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
+                    na, g0, ga, gj = o * G + nt + (2 if k == 0 and not ash.one else 0), 0, 1 << 20, 0
+                elif k == 0:  # (then group g's K and V objects for its K records)
+                    na, g0, ga, gj = o * b[1] + 2, 0, b[1], g
                 else:
-                    na, g0, ga, gj = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
+                    na, g0, ga, gj = o * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
                 ana, na = na, 0 if ash.one and k else na  # (one pass: the chain's cores on the first column's stream)
-                w[u, k] = q, n, 0, (nph + 1 if split else 2) * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj, ana, -(-65536 // n)
+                w[u, k] = q, n, 0, (nph + 1 if split else 2) * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj, ana
                 gr[u, :, k] = (0, G), (g, g + 1), (b[k], b[k + 1])
         fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
         a32 = act.view(np.int32)
@@ -788,20 +795,22 @@ class QwenOverlay(ModelOverlay):
         t, kv0, words = st.patch, dev.address("KV"), st.tr.words
         f = t["f"]  # (at, u, layer, k, base, ring, kind)
         g = gr[f[:, 1], f[:, 6], f[:, 3]]
-        self._bd_words(words, f[:, 0], kv0 + f[:, 4] + 3 * g[:, 0] * T, np.where(f[:, 6] == 1, 2, 3 * (g[:, 1] - g[:, 0])) * T)
+        o = attn.OBJS
+        self._bd_words(words, f[:, 0], kv0 + f[:, 4] + o * g[:, 0] * T, np.where(f[:, 6] == 1, 2, o * (g[:, 1] - g[:, 0])) * T)
         f = t["t"]  # (the ring slots of the sub-step's first and last records, or the first's V panels in record mode)
         r = (su[f[:, 1], 0] + np.where(f[:, 6], su[f[:, 1], 1] - 1, 0)) >> 3
         trec = rec[f[:, 2]] & (f[:, 1] == 0) & (f[:, 6] == 0)  # (its pair of records)
-        off = np.where(trec, f[:, 4] + 3 * (r // 4) * T + 2 * T + (r % 4 // 2) * 2 * attn.REC_V, f[:, 5] + (r & 1) * T)
+        off = np.where(trec, f[:, 4] + o * (r // 4) * T + T + (r % 4 // 2) * 2 * attn.REC_V, f[:, 5] + (r & 1) * T)
         self._bd_words(words, f[:, 0], kv0 + off, np.full(len(off), T, np.int64))
         f = t["r"]  # (the first column's K records; the last's V panels (into their pairs) and rows, of record 0, 1)
         v = f[:, 3] == nph - 1
         r = (su[f[:, 1], 0] + np.where(np.where(v, f[:, 6] >= 2, f[:, 6] > 0), su[f[:, 1], 1] - 1, 0)) >> 3
-        head, j = f[:, 4] + 3 * (r // 4) * T, r % 4
+        head, j = f[:, 4] + o * (r // 4) * T, r % 4
         kind = np.where(v, 1 + f[:, 6] % 2, 0)  # (K, V panels, rows)
-        off = np.choose(kind, [head + j // 2 * T + j % 2 * attn.REC_K, head + 2 * T + j // 2 * 2 * attn.REC_V + j % 2 * 72,
-                               f[:, 5] + (r & 1) * T])
-        self._bd_words(words, f[:, 0], kv0 + off, np.array([attn.REC_K, attn.REC_V, attn.ROWS_B])[kind])
+        pair = j // 2 * 2 * attn.REC_K  # (a record in its pair; sub-steps: the K records' pairs whole)
+        off = np.choose(kind, [head + pair + (j % 2 * 72 if ash.one else 0), head + T + pair + j % 2 * 72, f[:, 5] + (r & 1) * T])
+        nk = attn.REC_K if ash.one else 2 * attn.REC_K
+        self._bd_words(words, f[:, 0], kv0 + off, np.array([nk, attn.REC_V, attn.ROWS_B])[kind])
         st.tr.flush_lines(t["lines"])
 
     def _set_gdn(self, *, nrep: int, cshift: int, commit: bool) -> None:
@@ -919,7 +928,7 @@ class QwenOverlay(ModelOverlay):
         if self.ash is None:
             return []
         rows = [self.kv_off[L] + h * self.ash.head_bytes for L in self.kv_off for h in range(self.ash.kvh)]
-        return [(np.array(rows), 3 * self.T, attn.POS_PER_GROUP)]
+        return [(np.array(rows), attn.OBJS * self.T, attn.POS_PER_GROUP)]
 
     def snapshot(self, position: int) -> dict[str, object]:
         """(and the GDN layers' states, conv objects with their replay objects, and conv states of the prefill, the lazy

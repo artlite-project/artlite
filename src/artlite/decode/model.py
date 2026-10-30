@@ -28,6 +28,8 @@ from ..operators.util import rup
 from ..overlay import OverlayDevice, Sequence, Transaction, WeightBuffer
 from . import phases as mp
 from .design import (
+    BC_COL,
+    BC_ID,
     C_LEN,
     META,
     XB,
@@ -293,6 +295,9 @@ class ModelOverlay:
         """The X fills of a K group's input (``design.input_fill``, a header's ``post_input_fill``) of a phase."""
         sp = self._sp(S, phase)
         nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)
+        if self.op.bcast and phase != self._input(self.start):  # (a step's first phase: ``design``'s "Broadcast inputs")
+            seq.fill("X", BC_COL, self.dev.address("ACT", rg.off), nbytes, dims, packet=BC_ID)
+            return
         for c in range(COLS):
             seq.fill("X", c, self.dev.address("ACT", rg.off), nbytes, dims)
 

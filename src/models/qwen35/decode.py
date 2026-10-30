@@ -32,7 +32,7 @@ from . import gdn as GD
 
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
 M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 11)  # (an F_ATT object's)
-M_ANA, M_SINV = 36, 37  # (an F_ATT object's, one pass: the core's A objects through its held ones, 65536 / the slots)
+M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
@@ -49,10 +49,12 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
-                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = OD.SLOTS):
+                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = OD.SLOTS,
+                 bcast: bool = False):
         """moe: (experts, experts per token) of an MoE model (``decode.design``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``decode.model.paged_formats``:
-        a drafter's Q4_0 beside the model's three); slots: a step's token slots at most (4, 8)."""
+        a drafter's Q4_0 beside the model's three); slots: a step's token slots at most (4, 8); bcast: phase inputs on
+        one broadcast stream (``decode.design``)."""
         assert all(gemv.supported(f, 4, slots) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META and gdn.slots == slots)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
@@ -65,7 +67,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
-                         paged=paged, win=win, slots=slots, packed=slots == 8)
+                         paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast)
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
@@ -162,7 +164,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             for c in range(COLS):
                 d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
                 gws = Buffer(gws_ty, name=f"{P}_gws{c}", initial_value=np.zeros(GW["size"] // 4, np.int32))
-                workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), s.m_fifos[c].cons(), d_fifos[c][1].prod(), k_gbegin,
+                workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), s.m_fifos[c].cons(), d_fifos[c][1].prod(), k_gbegin,
                                                k_gmsg, k_gconv, k_gkold, k_gknew, k_gdl, k_gpanel, k_gdlout, k_gout,
                                                gws],
                                       tile=Tile(c, gr), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
@@ -226,9 +228,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             asoft(ws)  # (a group's softmax after its K objects)
                         h = a_f.acquire(AT.HOLD)  # (the last two: held until the emission, which reads records from them)
                         aobj(h[0], ws)
-                        asoft(ws)
+                        if not attn.one:
+                            asoft(ws)
                         aobj(h[1], ws)
-                        asoft(ws)
+                        if not attn.one:
+                            asoft(ws)
                         if t_in:
                             t_in[0].acquire(1)
                             aend(ws, pw)
@@ -245,10 +249,6 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             aemit(ws, r)
                             r_f.release(1)
                         a_f.release(AT.HOLD)
-                        if attn.one:  # (a chain's last core: the K objects of its first core's records)
-                            for _ in range_(ws[i_a + AT.A_NAF]):
-                                a_f.acquire(1)
-                                a_f.release(1)
 
             aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
                           tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
@@ -258,7 +258,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             for c in range(COLS):
                 t_in = [toks[c - 1].cons()] if c % n and not attn.one else []
                 t_out = [toks[c].prod()] if c in toks else []
-                workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1),
+                workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1, **s.x_kw),
                                                 s.r_fifos[c].prod(),
                                                 t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
                                                 k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c],
@@ -272,6 +272,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def _pins(self) -> dict[str, int]:
         return {f"{self.PREFIX}_gws{c}": self.GWS8_AT for c in self._gws}
+
+    def _x_rows(self) -> tuple[int, ...]:
+        return (*[self.GDN_ROW] * (self.gdn is not None), *[self.ATTN_ROW] * (self.attn is not None))
 
     def _gws_of(self, c: int) -> Buffer:
         """Column c's GDN workspace (8 slots; the helper's ``_help`` takes it too)."""
@@ -357,6 +360,6 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             for i, a in enumerate(GD.SILU_TAB):  # (used through their addresses only)
                 self._tabs.append(Buffer(np.ndarray[(1600 // 4,), np.dtype[np.uint32]], name=f"{P}_gtab{c}_{i}",
                                          tile=Tile(c, self.GDN_ROW), address=a - 0x70000, initial_value=kmath.SILU.table_words()))
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._tabs[-2:]],
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._tabs[-2:]],
                                   tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))

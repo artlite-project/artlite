@@ -117,19 +117,19 @@ class Sequence:
         self._pending[(col, stream)] = 0
 
     def fill(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None = None, repeat: int = 1,
-             iteration: tuple[int, int] | None = None, *, packet: bool = True,
+             iteration: tuple[int, int] | None = None, *, packet: bool | int = True,
              acquire: tuple[int, int] | None = None) -> int:
         """Read ``nbytes`` at the device address into a column's A or X stream (``dims``: gathered,
         see ``txn.Txn.shim_bd``), ``repeat`` times in a row (``iteration``: each from a further address). A
         channel queues 4 tasks: the fourth fill since the last sync carries a token, a fifth one first waits
         for it. On a packet-switched stream (``PACKET``) the fill gets the stream's packet header unless ``packet``
-        is False (words that carry their own headers: control packets); acquire (shim lock, value): the task waits
-        for the lock (rolling)."""
+        is False (words that carry their own headers: control packets) or another packet id (a route of its own);
+        acquire (shim lock, value): the task waits for the lock (rolling)."""
         direction, channel = self.op.ENDPOINTS[stream]
         assert direction == txn.MM2S, stream
         if self.rolling:
-            return self._task(stream, col, address, nbytes, dims, repeat, iteration,
-                              packet=self._packet.get(stream) if packet else None, acquire=acquire)
+            pid = self._packet.get(stream) if packet is True else None if packet is False else packet
+            return self._task(stream, col, address, nbytes, dims, repeat, iteration, packet=pid, acquire=acquire)
         assert stream not in self._packet and acquire is None, "packet-switched streams, locks: rolling sequences"
         if self._pending.get((col, stream), 0) == txn.QUEUE_DEPTH:
             self._wait_fill(stream, col)

@@ -521,7 +521,8 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("27B", 150, 4, True, False), ("27B", 1001, 3, True, True),
                                                              ("27B", 1000, 4, True, False), ("3.8-27B", 39, 2, False, False),
                                                              ("3.8-27B", 1001, 7, False, False), ("3.8-27B", 160, 8, False, True),
-                                                             ("3.8-27B", 1000, 5, False, True)])
+                                                             ("3.8-27B", 1000, 5, False, True), ("3.8-27B", 62, 5, False, False),
+                                                             ("3.8-27B", 94, 8, False, True), ("3.8-27B", 30, 2, False, False)])
 def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
@@ -531,7 +532,8 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
     emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots). The
     3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
-    column's stream."""
+    column's stream, a step across a cache group too; what a position sees of an open record is its panels up to the
+    step's last position, o an octet's 8 rows."""
     from models.qwen35 import attn as A1
 
     path = ref.size_gguf(size)
@@ -540,8 +542,8 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
     g = p // 32
     one = size == "3.8-27B"
-    assert (p + S - 1) // 32 == g and (one or A1.AttnShape.splits(g) == split)
-    P = 32 * (g + 1)  # (cache positions: whole groups)
+    assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == split)
+    P = 32 * ((p + S - 1) // 32 + 1)  # (cache positions: whole groups)
     slots = 8 if one else A1.SMAX
     ash = A1.AttnShape(cfg, P, slots=slots)
     op = MD.QwenDecodeOperator(hidden=cfg.hidden_size, rows={"Q4_K": 16}, eps=cfg.rms_norm_eps, attn=ash, slots=slots)
@@ -555,7 +557,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     kc = rng.standard_normal((kvh, P, HD)).astype(np.float32)
     vc = mmv.bf(rng.standard_normal((kvh, P, HD)).astype(np.float32))
     kc[:, p:] = vc[:, p:] = 0
-    groups = [KV.kv_groups(kc[h], vc[h], T, dmajor=True) for h in range(kvh)]
+    groups = [KV.kv_groups(kc[h], vc[h], T, 1, dmajor=True) for h in range(kvh)]
     hb = groups[0].nbytes
     rb = 2 * T  # (a head's ring)
     kv_bytes = kvh * (hb + rb) + T
@@ -574,8 +576,9 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     qn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     kn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     cs = [tuple(v[0] for v in A1.rope_cs(cfg, [p + s])) for s in range(S)]
-    G = g + 1
+    G = (p + S - 1) // 32 + 1
     b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
+    o_k = A1.OBJS  # (a group's cache objects)
     nt = A1.TAILS
     # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared)
     per = (1 + slots) * OD.XB
@@ -587,18 +590,18 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (nph + 1 if split else 2) * S
         m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, split, S), p, int(split)
         m[MD.M_NTAIL], m[MD.M_ATREC] = tl, int(rec)
-        if not split:  # (a chain's first column: then group g's K objects again)
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * G + tl + (2 if k == 0 else 0), 0, 1 << 20
-        elif k == 0:  # (then group g's K objects)
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = 3 * b[1] + 2, 0, b[1], g
+        if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
+        elif k == 0:  # (then group g's K and V objects)
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
         else:
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
         if one:  # (on the first column's stream)
-            m[MD.M_ANA], m[MD.M_SINV], m[OD.M_NASKIP] = m[OD.M_NASKIP], -(-65536 // S), 0 if k else m[OD.M_NASKIP]
+            m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
         o = c * per
         act[o:o + 4 * OD.META] = m.view(np.uint8)
         nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
-        nrm[:HD], nrm[HD:2 * HD] = qn, kn
+        nrm[:HD], nrm[HD:2 * HD] = qn * (np.float32(np.log2(np.e) / 16) if one else 1), kn
         for s in range(S):
             nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
         act[o + 4 * OD.META:o + 4 * OD.META + nrm.nbytes] = nrm.view(np.uint8)
@@ -609,7 +612,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         k0 = COLS * per + s * OD.XB + 4 * OD.META
         act[k0:k0 + 2 * kvh * 2 * HD] = interleave_bits(kv[s].reshape(-1))
     dev.flush("ACT")
-    ob = nph * qc * 32 * S * 16  # (o of a chain's heads)
+    ob = nph * qc * 32 * (8 if one else S) * 16  # (o of a chain's heads)
     nr = 2 * (A1.REC_V + A1.ROWS_B)  # (the relayed records' bytes at most)
     dev.alloc("OUT", COLS * ob)
     dev.alloc("REC", COLS * nr)
@@ -618,18 +621,18 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         k, role = c % nph, ash.role(c)
         base, ring = dev.address("KV", c // nph * hb), dev.address("KV", kvh * hb + c // nph * rb)
         if not split:
-            seq.fill("A", c, base, 3 * G * T)
+            seq.fill("A", c, base, o_k * G * T)
         else:
-            seq.fill("A", c, base + 3 * b[k] * T, 3 * (b[k + 1] - b[k]) * T)
+            seq.fill("A", c, base + o_k * b[k] * T, o_k * (b[k + 1] - b[k]) * T)
             if k == 0:
-                seq.fill("A", c, base + 3 * g * T, 2 * T)
+                seq.fill("A", c, base + o_k * g * T, 2 * T)
         if not split or role == A1.ROLE_V:  # (the tail objects)
             for t in range(nt):
                 r = rl if t else rp
-                v0 = base + 3 * (rp // 4) * T + 2 * T + rp % 4 // 2 * 2 * A1.REC_V  # (its pair of records)
+                v0 = base + o_k * (rp // 4) * T + T + rp % 4 // 2 * 2 * A1.REC_V  # (its pair of records)
                 seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T)
-        if not split and k == 0:
-            seq.fill("A", c, base + 3 * g * T, 2 * T)
+        if not split and k == 0 and not one:
+            seq.fill("A", c, base + o_k * g * T, 2 * T)
     for c in range(COLS):
         seq.fill("X", c, dev.address("ACT", c * per), OD.XB)
         if split:  # (the q objects of the chain's columns in order)
@@ -643,7 +646,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         no = (ob if role == A1.ROLE_V else 0) if split else ob // nph
         if no:
             seq.drain("C", c, dev.address("OUT", c * ob), no)
-        rb_c = {A1.ROLE_K: 2 * A1.REC_K, A1.ROLE_V: 2 * (A1.REC_V + A1.ROWS_B), A1.ROLE_O: 0}[role]
+        rb_c = {A1.ROLE_K: (2 if one else 4) * A1.REC_K, A1.ROLE_V: 2 * (A1.REC_V + A1.ROWS_B), A1.ROLE_O: 0}[role]
         if rb_c:
             seq.drain("C", c, dev.address("REC", c * nr), rb_c)
     seq.sync(fills=True)
@@ -655,7 +658,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     for c in range(COLS):
         h, k = c // nph, c % nph
         o_c = outs[c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
-            outs[c, :ob // (2 * nph)].reshape(qc, 32, S, 8)
+            outs[c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
         # the open records' rows: the ring's (or the panels' in record mode) before p, then the new ones
         rows = {r: (vc_s[h] if rec else vc[h])[8 * r:8 * r + 8].copy() for r in {rp, rl}}
         for s in range(S):
@@ -664,9 +667,9 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         for s in range(S):
             q = p + s
             v_seen = vc_s[h][:q].copy()
-            for r in sorted(rows):  # (an open record up to q: encoded from its rows)
+            for r in sorted(rows):  # (an open record up to q, or one pass: up to the step's last position: encoded from its rows)
                 if 8 * r <= q:
-                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min(q - 8 * r + 1, 8))])[:q + 1]
+                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min((p + S if one else q + 1) - 8 * r, 8))])[:q + 1]
             k_prev = np.concatenate([kc_s[h][:p], *[x[None] for x in kn_all]]) if kn_all else kc_s[h][:p]
             want, knew = ref.core_attention(qg[c, s], kv[s, h, :HD], v_seen[q], k_prev, v_seen[:q], q_norm=qn,
                                             k_norm=kn, cs=cs[s], eps=cfg.rms_norm_eps)
@@ -677,15 +680,19 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
         if ash.role(c) == A1.ROLE_K:  # the K records of positions p .. p + S - 1 (as the cache holds them now)
             k_all = np.concatenate([kc_s[h][:p], np.stack(kn_all)])
             for i, r in enumerate(recs_c):
-                kg = np.zeros((P // 32, 3, T), np.uint8)
-                kg[r // 4, (r % 4) // 2, (r % 2) * A1.REC_K:(r % 2 + 1) * A1.REC_K] = recs[c, i * A1.REC_K:(i + 1) * A1.REC_K]
+                kg = np.zeros((P // 32, 2, T), np.uint8)
+                if one:  # (a record: into its pair)
+                    b_ = recs[c, i * A1.REC_K:(i + 1) * A1.REC_K].reshape(A1.ND, 72)
+                    kg[r // 4, 0, (r % 4) // 2 * 2 * A1.REC_K:][:2 * A1.REC_K].reshape(A1.ND, 2, 72)[:, r % 2] = b_
+                else:  # (its pair)
+                    kg[r // 4, 0, (r % 4) // 2 * 2 * A1.REC_K:][:2 * A1.REC_K] = recs[c, 2 * i * A1.REC_K:2 * (i + 1) * A1.REC_K]
                 got_k = KV.kv_from_groups(kg, HD, dmajor=True)[0][8 * r:min(8 * r + 8, p + S)]
                 assert ref.rel_err(got_k, k_all[8 * r:min(8 * r + 8, p + S)]) < 1e-2, (c, r)
         elif ash.role(c) == A1.ROLE_V:  # per record its V panels up to the last new position and its rows
             for i, r in enumerate(recs_c):
                 b_ = recs[c, i * (A1.REC_V + A1.ROWS_B):(i + 1) * (A1.REC_V + A1.ROWS_B)]
-                vg = np.zeros((P // 32, 3, T), np.uint8)
-                vg[r // 4, 2, (r % 4) * A1.REC_V:(r % 4 + 1) * A1.REC_V] = b_[:A1.REC_V]
+                vg = np.zeros((P // 32, 2, T), np.uint8)
+                vg[r // 4, 1, (r % 4) * A1.REC_V:(r % 4 + 1) * A1.REC_V] = b_[:A1.REC_V]
                 n = min(p + S - 8 * r, 8)
                 assert np.array_equal(KV.kv_from_groups(vg, HD)[1][8 * r:8 * r + 8], _enc(rows[r], n)), (c, r)
                 got_rows = ring_rows(b_[A1.REC_V:], HD)

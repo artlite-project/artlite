@@ -269,6 +269,7 @@ class BuildSpec:
     clang_flags: tuple[str, ...] = ()
     profile_key: tuple | None = None  # rtc: the profiling configuration the design was rendered with
     expand_load_pdis: bool = False  # fused
+    aiecc_flags: tuple[str, ...] = ()  # rtc: ``ArtcOperator.AIECC_FLAGS``
 
     @property
     def clang_cmd(self) -> list[str]:
@@ -286,7 +287,7 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
     # --unified: every core of a device lowered once (default: a clone of the design per core); the same outputs, aiecc
     # -55% (the Llama prefill library 52 -> 21 s, the SD 1.5 UNet program 22 -> 8 s)
     aiecc_opts = [*([f"-j{aiecc_jobs}"] if aiecc_jobs else []), "--unified", f"--peano={PEANO_DIR}",
-                  *(f"-Xllc={flag}" for flag in CORE_LLC_FLAGS)]
+                  *(f"-Xllc={flag}" for flag in CORE_LLC_FLAGS), *spec.aiecc_flags]
     if spec.kind == "fused":
         key = _cache_key(spec.source, spec.mlir, pch_path, version("mlir_aie"), version("llvm_aie"),
                          spec.expand_load_pdis, CORE_LLC_FLAGS)
@@ -313,7 +314,7 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
     if not buildable(spec):
         raise RuntimeError(f"{spec.label}: rendered with profiling {spec.profile_key}, this process has "
                            f"{profile_key(profiling_cfg)}")
-    key = _cache_key(spec.source, *spec.clang_flags, spec.mlir, pch_path, spec.profile_key, CORE_LLC_FLAGS)
+    key = _cache_key(spec.source, *spec.clang_flags, spec.mlir, pch_path, spec.profile_key, CORE_LLC_FLAGS, *spec.aiecc_flags)
     work_dir = os.path.join(CACHE_DIR, f"rtc_{key}")
     os.makedirs(work_dir, exist_ok=True)
     pdi_path = os.path.join(work_dir, "main.pdi")
@@ -392,6 +393,8 @@ class ArtcOperator:
         op_b.dispatch(tmp, out)
         result = out.to_torch()
     """
+
+    AIECC_FLAGS: tuple[str, ...] = ()  # (aiecc options of the design)
 
     def __new__(cls, *args: object, **kwargs: object) -> Self:
         self = super().__new__(cls)
@@ -478,7 +481,8 @@ class ArtcOperator:
         source_code = None if ks is None else translation_unit([ks])
 
         return BuildSpec(kind="rtc", label=type(self).__name__, source=source_code, mlir=self.mlir_text(),
-                         clang_flags=tuple(self.clang_flags), profile_key=profile_key(profiling_cfg))
+                         clang_flags=tuple(self.clang_flags), profile_key=profile_key(profiling_cfg),
+                         aiecc_flags=self.AIECC_FLAGS)
 
     def compile(self, device: Device | None = None) -> ArtcOperator:
         """Compile the operator and prepare for dispatch (cached on disk, the render too: ``render_cache``; several

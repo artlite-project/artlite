@@ -68,6 +68,13 @@ slots, but the residual): the main core's workspace holds the residual of slots 
 .. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums)
 lies in the core south of it (``HS8_ROW``: the model's core there leaves it room). No moe, post, packed, paged designs.
 
+Broadcast inputs (``bcast``): a phase's [metadata object | x] are the same bytes for every column, and the cores of a column
+take the same objects, so one shim (``BC_COL``) reads them once for all (a fill with the packet id ``BC_ID``): a packet flow to
+every column's X consumers, on the channels the X objects of a column (residual slices, a model core's objects) reach from their
+memtile, packet-switched past it too. Their flows share receivers, which the router refuses (arbiters held across
+switchboxes): they never overlap here, each broadcast comes after a sync on the drains of what ran before. Only a step's first
+phase comes after local objects with no drains in between: its inputs stay per column (``ModelOverlay._inputs``).
+
 Paged formats (``paged``: a model whose formats' kernels do not fit the cores together): their kernels are code pages
 (``paging``, the memtile transport): per column the main and helper cores request a format's page for their half
 before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes; the
@@ -87,6 +94,7 @@ import torch
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import forever_, range_
+from aie.iron.dataflow.objectfifo import ObjectFifoLink
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
@@ -97,7 +105,7 @@ from ..operators import paging
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, linear_tap
 from ..operators.kernel_source import kernel_prefix
-from ..operators.l1_layout import pin_l1_buffers
+from ..operators.l1_layout import packet_flow, pin_l1_buffers
 from ..operators.util import Attr, regions
 from . import gemv
 from .kernels import SRC as _SRC
@@ -159,7 +167,8 @@ F_HOUT = 1 << 23  # (an expert's gate / up sub-phase) the outputs into the hold 
 F_ACCUM = 1 << 24  # (a down sub-phase) the rows add into acc ([slot][hidden] bf16; F_ACC0: stored), F_EMITA: then out
 F_ACC0 = 1 << 25
 F_EMITA = 1 << 26
-XID = 3  # (moe) the X stream's packet id (its channel also carries the routing's control packets: ``moe.route.CID``)
+XID = 3  # (moe, bcast) the X stream's packet id (moe: its channel also carries the routing's control packets: ``moe.route.CID``)
+XC_ID, BC_ID, BC_COL, X_CH = 4, 5, 3, 1  # (bcast) the X objects' packet id past the memtile, the broadcast's, its shim, the cores' X channel
 # (moe) metadata words: a phase's first chunk of x / sum panels; the route object's (the layer's expert halves at
 # M_RBASE (device address lo, hi) + k M_RSTR, M_RTGU + M_RTDN A objects each); the expert object's items (M_NITEM,
 # then per item: e | h0 << 8 | h1 << 9, its weights per slot, fp32 bits)
@@ -255,7 +264,7 @@ class DecodeOverlayOperator(ArtcOperator):
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
-                 max_k: int = MAX_K, win: str = "", slots: int = SLOTS):
+                 max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -265,9 +274,12 @@ class DecodeOverlayOperator(ArtcOperator):
         docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
         combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
         the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
-        slots")."""
+        slots"); bcast: phase inputs on one broadcast stream (module docstring "Broadcast inputs")."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or gu_win or paged or moe)), slots
-        self.slots = slots
+        self.slots, self.bcast = slots, bcast
+        assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
+        if bcast:
+            self.PACKET, self.AIECC_FLAGS = {"X": XID}, ("--allow-deadlock-prone-routing",)  # (module docstring)
         self.obj_k = XPAY // (2 * slots)  # (k of an input object)
         self.nx_per_norm = NORM_K // self.obj_k  # (input objects per norm-weight object)
         self.chunk = gemv.Chunk(nsb, slots)
@@ -468,6 +480,10 @@ class DecodeOverlayOperator(ArtcOperator):
         """(8 slots) L1 addresses of the model cores' buffers (their symbol names)."""
         return {}
 
+    def _x_rows(self) -> tuple[int, ...]:
+        """(bcast) The rows of the model's cores that take the X stream."""
+        return ()
+
     def _help(self, c: int) -> tuple[Kernel, Buffer]:
         """(help_flag) Column c's helper's model kernel (kernel(buffer, the x panels)) and its buffer."""
         raise NotImplementedError
@@ -519,9 +535,16 @@ class DecodeOverlayOperator(ArtcOperator):
         a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH) for c in range(COLS)]
         a_l1 = [a_l3[c].cons(depth=self.A_DEPTH).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}") for c in range(COLS)]
         # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
-        x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH, **({"packet": True, "packet_id": XID} if self.moe
-                                                                            else {})) for c in range(COLS)]
-        x_l1 = [x_l3[c].cons(depth=self.X_DEPTH).forward(tile=Tile(c, 1), depth=1, name=f"{P}_x{c}") for c in range(COLS)]
+        x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH,
+                           **({"packet": True, "packet_id": XID} if self.moe or self.bcast else {})) for c in range(COLS)]
+        if self.bcast:  # (past the memtile too: the broadcast shares the cores' channels)
+            x_l1 = [ObjectFifo(x_ty, name=f"{P}_x{c}", depth=1, packet=True, packet_id=XC_ID) for c in range(COLS)]
+            for c in range(COLS):
+                ObjectFifoLink(x_l3[c].cons(depth=self.X_DEPTH), x_l1[c].prod(), Tile(c, 1))
+        else:
+            x_l1 = [x_l3[c].cons(depth=self.X_DEPTH).forward(tile=Tile(c, 1), depth=1, name=f"{P}_x{c}")
+                    for c in range(COLS)]
+        x_kw = {"channel": X_CH} if self.bcast else {}  # (a consumer's X channel: the broadcast's route names it)
         c_fifos = [ObjectFifo(c_ty, name=f"{P}_C{c}", depth=2) for c in range(COLS)]
         cmds = [ObjectFifo(cmd_ty, name=f"{P}_cmd{c}", depth=2) for c in range(COLS)]
         m_fifos = [ObjectFifo(c_ty, name=f"{P}_M{c}", depth=2) for c in range(COLS)] if self.msg else []
@@ -703,7 +726,7 @@ class DecodeOverlayOperator(ArtcOperator):
             m_xs.append(xs)
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, hr))
-            workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=1), c_fifos[c].prod(), cmds[c].prod(),
+            workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=1, **x_kw), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, *hres,
                                             *([k_xgate] if self.gate else []), k_begin, k_nbegin,
@@ -724,7 +747,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
-                     ws=m_ws, xs=m_xs, xp=xps)
+                     ws=m_ws, xs=m_xs, xp=xps, x_kw=x_kw)
         extra, d_fifos = self._extra_workers(s)
         workers += extra
         a_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["A"][1]) for c, f in enumerate(a_l3)]
@@ -755,6 +778,9 @@ class DecodeOverlayOperator(ArtcOperator):
             at = {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)} | self._pins()
             assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000
             pin_l1_buffers(module, fifo=lambda name, depth: None, buffer=at.get)
+        if self.bcast:  # (on the placed design: the placer takes a flow from a shim channel an ObjectFifo uses for a channel more)
+            packet_flow(module, BC_ID, (BC_COL, 0), self.ENDPOINTS["X"][1],
+                        [(c, r, X_CH) for c in range(COLS) for r in (mr, *self._x_rows())])
         return module
 
     def check_endpoints(self, insts: np.ndarray) -> None:
@@ -786,6 +812,7 @@ class _Streams:
     ws: list  # per column the main core's workspace and sum panels (``workspace``, xs: a model core may use the regions
     xs: list  # idle while its objects run; LENDS_WS)
     xp: list  # per column the helper's x panels (a model core may use them while its objects run)
+    x_kw: dict  # the arguments of a consumer's handle of x_l1
 
 
 # ----------------------------------------------------------------------

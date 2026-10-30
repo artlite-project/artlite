@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 from aie import ir
 from aie.dialects import aie
+from aie.dialects._aie_enum_gen import WireBundle
 from aie.passmanager import PassManager
 
 
@@ -58,3 +59,16 @@ def pin_l1_buffers(
                 if addr is not None:
                     op.attributes["address"] = ir.IntegerAttr.get(i32, addr)
     return pinned
+
+
+def packet_flow(module: ir.Module, pkt_id: int, src: tuple[int, int], channel: int,
+                dsts: list[tuple[int, int, int]]) -> None:
+    """A packet flow from tile ``src``'s DMA ``channel`` to ``dsts`` (column, row, DMA channel) in a placed ``module``
+    (``pin_l1_buffers``); its tiles exist."""
+    with module.context, ir.Location.unknown():
+        device = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
+        block = device.regions[0].blocks[0]
+        tiles = {(t.col.value, t.row.value): t for t in block.operations if isinstance(t, aie.TileOp)}
+        aie.packetflow(pkt_id=pkt_id, source=tiles[src], source_port=WireBundle.DMA, source_channel=channel,
+                       dests=[{"dest": tiles[d[:2]], "port": WireBundle.DMA, "channel": d[2]} for d in dsts],
+                       keep_pkt_header=False, ip=ir.InsertionPoint.at_block_terminator(block))

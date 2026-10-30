@@ -95,3 +95,21 @@ def test_emit_order(hd: int, p: int, S: int) -> None:
     assert out[len(recs):] == [x for r in recs for x in (("V", r), ("R", r))]
     rg = kv.Records(hd).rg(9216)
     assert [r // rg for r in k] == sorted(r // rg for r in k)
+
+
+def test_kv_groups_pairs() -> None:
+    """One K panel per 8 dims (qwen35's): 2 objects a group, a K object of pairs of records [d-block][record of 2] as a V
+    object's."""
+    rng = np.random.default_rng(2)
+    k = rng.standard_normal((64, 256)).astype(np.float32)
+    v = rng.standard_normal((64, 256)).astype(np.float32)
+    g = kv.kv_groups(k, v, 9280, 1, dmajor=True)
+    assert g.shape == (2, 2, 9280)
+    k2, v2 = kv.kv_from_groups(g, 256, dmajor=True)
+    assert np.abs(k2 - k).max() < 2 ** -6 * np.abs(k).max()
+    assert np.array_equal(v2, kv.kv_from_groups(kv.kv_groups(k, v, 9280, dmajor=True), 256, dmajor=True)[1])
+    r = kv.Records(256, 1).k_bytes
+    # record 7 (group 1's last: its second pair's second), d-block 5, position 2
+    blk = g[1, 0, 2 * r + 144 * 5 + 72 + 9 * 2:][:9]
+    vals = blk[1:].view(np.int8).astype(np.float32) * 2.0 ** (int(blk[0]) - 133)
+    assert np.abs(vals - k[8 * 7 + 2, 40:48]).max() < 2 ** -6 * np.abs(k[8 * 7 + 2, 40:48]).max() + 1e-6

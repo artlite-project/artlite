@@ -60,7 +60,9 @@ class Records:
 
 
 def kv_groups(k: np.ndarray, v: np.ndarray, a_bytes: int, kp: int = 2, *, dmajor: bool = False) -> np.ndarray:
-    """K, V (P, hd) of a KV head (P whole groups) -> its cache (groups, kp + 1, a_bytes) uint8 (module docstring)."""
+    """K, V (P, hd) of a KV head (P whole groups) -> its cache (groups, kp + 1, a_bytes) uint8 (module docstring). dmajor:
+    d-block major: a K record [d-block][hi | lo], or with kp = 1 a K object of pairs of records [d-block][record 2], and a
+    V object of pairs of records [d-block][record 2]."""
     P, hd = k.shape
     rec = Records(hd, kp)
     nd, kper, rg = rec.nd, rec.kper(a_bytes), rec.rg(a_bytes)
@@ -73,8 +75,9 @@ def kv_groups(k: np.ndarray, v: np.ndarray, a_bytes: int, kp: int = 2, *, dmajor
     vr = np.asarray(v, np.float32).reshape(n, rg, 8, nd, 8)
     vp = block_bytes(vr.transpose(0, 1, 3, 4, 2))  # [g][r][db][i][9]: a block over the positions
     if dmajor:
-        assert kp == 2 and rg % 2 == 0
-        kb = kb.transpose(0, 1, 3, 2, 4, 5)  # [g][r][db][hi / lo][position][9]
+        assert rg % 2 == 0
+        kb = (kb.transpose(0, 1, 3, 2, 4, 5) if kp == 2 else  # [g][r][db][hi / lo][position][9]
+              kb.reshape(n, rg // 2, 2, nd, 8, 9).transpose(0, 1, 3, 2, 4, 5))  # [g][pair][db][record of 2][position][9]
         vp = vp.reshape(n, rg // 2, 2, nd, 8, 9).transpose(0, 1, 3, 2, 4, 5)  # [g][pair][db][record of 2][i][9]
     out = np.zeros((n, kp + 1, a_bytes), np.uint8)
     out[:, :kp, :kper * rec.k_bytes] = kb.reshape(n, kp, kper * rec.k_bytes)
@@ -88,7 +91,10 @@ def kv_from_groups(groups: np.ndarray, hd: int, *, dmajor: bool = False) -> tupl
     rec = Records(hd, no - 1)
     nd, kper, rg, kp = rec.nd, rec.kper(a_bytes), rec.rg(a_bytes), rec.kp
     kb = groups[:, :kp, :kper * rec.k_bytes]
-    kb = kb.reshape(n, rg, nd, kp, 8, 9).swapaxes(2, 3) if dmajor else kb.reshape(n, rg, kp, nd, 8, 9)
+    if dmajor and kp == 1:
+        kb = kb.reshape(n, rg // 2, nd, 2, 8, 9).swapaxes(2, 3).reshape(n, rg, kp, nd, 8, 9)
+    else:
+        kb = kb.reshape(n, rg, nd, kp, 8, 9).swapaxes(2, 3) if dmajor else kb.reshape(n, rg, kp, nd, 8, 9)
     k = sum(block_values(kb[:, :, i]) for i in range(kp)).transpose(0, 1, 3, 2, 4)  # [g][r][position][db][i]
     vp = groups[:, kp, :rg * rec.v_bytes]
     vp = vp.reshape(n, rg // 2, nd, 2, 8, 9).swapaxes(2, 3) if dmajor else vp.reshape(n, rg, nd, 8, 9)

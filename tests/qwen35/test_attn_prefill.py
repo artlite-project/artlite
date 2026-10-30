@@ -139,13 +139,13 @@ def test_attn_prep(size: str) -> None:
         sg_want = 1 / (1 + np.exp(-np.asarray(qg[:, :, 1], np.float64))).transpose(1, 0, 2)
         assert np.abs(sg - sg_want).max() < 2 ** -8, t0
     # the cache: both chunks' positions of every KV head (K normed, rotated; V as stored)
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
+    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
     pos = np.arange(T + n2)
     kr = s.k[:T + n2].reshape(T + n2, s.kvh, hd)
     k_want = s.nr(kr, s.kn, pos)
     for h in range(s.kvh):
         K, V = KV.kv_from_groups(kv[h, :(T + n2 + 31) // 32], AT.HD, dmajor=True)
-        assert ref.rel_err(K[:T + n2], k_want[:, h]) < 2e-4, h
+        assert ref.rel_err(K[:T + n2], k_want[:, h]) < 1e-2, h  # (single bfp16: 8 bits below a block's maximum)
         assert ref.rel_err(V[:T + n2], s.v[:T + n2, 256 * h:256 * (h + 1)]) < 1e-2, h
         k_gold = np.asarray(s.gold["Kcur.1", s.L], np.float32).reshape(-1, s.kvh, hd)[:T + n2, h]
         assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
@@ -174,7 +174,7 @@ def test_attn_prefill(size: str, T: int) -> None:
         slots = _qs_slots(fused, T, qc, prep.qg)
         q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
-        kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, 3, 9280)
+        kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
         want = np.zeros((n, H, hd))
         for h in range(s.kvh):
             K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD, dmajor=True))
