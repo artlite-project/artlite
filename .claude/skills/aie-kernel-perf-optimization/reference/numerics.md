@@ -157,7 +157,8 @@ and reciprocal).
   a e^x (1 - t) for x < 0 (1 + t = e^x (1 - t): no cancellation), e^x in a loop of its own (below),
   the `silu_tanh` fit below |x| = 2.5: 1.2x, 3.2K cycles per 8 tokens x 288 values. The table SiLU
   (above) has the exact SiLU's error and is faster (the 27B scan 4.57 vs 4.84 ms per layer, GdnOut
-  0.72 vs 0.89).
+  0.72 vs 0.89). Its quadratic unrounded (`km.act(f32=True)`, ~0.09 bf16 ULP of the exact value) is the best SiLU for a
+  fp32 consumer at any speed: max rel. error 7e-4 against `km.silu`'s 3.9e-3, ~1 cycle per element against 16.
 
 ### e^x of fp32 x in a pipelined loop
 
@@ -227,7 +228,9 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
   share an exponent: the small weights of a block lose their bits) doubled the Gemma prefill's cache error at the
   last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046). In a DMA-bound
   attention the second MMUL per record costs nothing measurable; give the lo products their own accumulator chain
-  when one chain would serialize (QB = 1).
+  when one chain would serialize (QB = 1). A decode step's Q and P as single panels of 8 rows (qwen35's designs of 8
+  slots, where hi + lo do not fit): Qwen3.8-27B's teacher-forced KL 0.0022-0.0023, llama.cpp's prompt vs decode 0.0022:
+  no cost there, against K hi alone (no lo panels in the scores): the same KL, argmax agreement 0.938 against 0.969.
 - **hi + lo weights** where a GEMM is sensitive and cheap: `artlite.vision.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
   the lo ones on the A panels walked again). MiniCPM-V's encoder takes them at its patch embedding and its final
   merger (a quarter of its weights' error between them); any other layer's weights held 1-3% each and did not pay.

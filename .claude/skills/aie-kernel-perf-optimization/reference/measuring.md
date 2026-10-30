@@ -60,6 +60,11 @@ stream that the full design keeps busy).
   bytes or cycles.
 - Typical harnesses: a decode step with transaction pieces left out; one prefill GEMM with "dq" / "mm" / "act"
   compiled out, plus its cores' window cycles and stalls through the profiling hook.
+- **A step per phase kind, before any ablation**: one build whose main core closes a window at every new object and opens
+  one where a metadata word asks (the host marks a phase kind per run), so one build gives a table of phase kinds against
+  S (ms, summing to the step). The 27B's S 1 -> 8 at 1K: the GDN step and the attention +8.7 and +8.5 of +25 ms, windows
+  in which the weights' stream waits; `down` +3.9 its input's bytes. Ablations had blamed other pieces. A window that
+  ends at the next dispatch (the last phase) holds the host's time between dispatches: time the host apart.
 
 ## Per-core event windows and counters
 

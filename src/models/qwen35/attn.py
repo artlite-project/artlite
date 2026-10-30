@@ -149,21 +149,34 @@ __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, c
 // NS]), each popped once; per set an MMUL chain over the K hi panels and one over the K lo panels (a chain's MMULs
 // issue 3 cycles apart: 2 NS chains for II 4), summed at the end: a row's scores the same sums whatever NS
 {% if ONE %}
-// (one pass: an octet's single panels of 8 rows: so[64 r + j])
+// (one pass: NO octets' single panels of 8 rows, [d-block][octet NO], each K panel popped once for them: so[256 o + 64 r + j])
+template <int NO>
 [[clang::always_inline]] inline void {{ p }}_qk1(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
 {
-    al::MM8 h(aie::zeros<accfloat, 64>()), l(aie::zeros<accfloat, 64>());
+    al::MM8 h[NO], l[NO];
+    AIE_LOOP_UNROLL_FULL
+    for (int o = 0; o < NO; o++) {
+        h[o] = al::MM8(aie::zeros<accfloat, 64>());
+        l[o] = al::MM8(aie::zeros<accfloat, 64>());
+    }
     al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
     al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)qa);
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int d = 0; d < {{ ND }}; d++) {
-        const al::BV Kh = ks.pop(), Kl = ks.pop(), Q = qs.pop();
-        h.mac(Q, aie::op_transpose(Kh));
-        l.mac(Q, aie::op_transpose(Kl));
+        const al::BV Kh = ks.pop(), Kl = ks.pop();
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            const al::BV Q = qs.pop();
+            h[o].mac(Q, aie::op_transpose(Kh));
+            l[o].mac(Q, aie::op_transpose(Kl));
+        }
     }
-    const aie::vector<float, 64> c = aie::add(h.to_accum(), l.to_accum()).template to_vector<float>();
-    aie::store_v(so, c.template extract<32>(0));
-    aie::store_v(so + 128, c.template extract<32>(1));
+    AIE_LOOP_UNROLL_FULL
+    for (int o = 0; o < NO; o++) {
+        const aie::vector<float, 64> c = aie::add(h[o].to_accum(), l[o].to_accum()).template to_vector<float>();
+        aie::store_v(so + 256 * o, c.template extract<32>(0));
+        aie::store_v(so + 256 * o + 128, c.template extract<32>(1));
+    }
 }
 {% else %}
 template <int NS>
@@ -648,18 +661,28 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
     const al::BV nI = al::neg_eye();
 {% endif %}
     float *__restrict q = AW(float, {{ a.y }});
+{% if ONE %}
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < (no > 2 ? 2 : 1); i++) {  // (octets 0 and 1 in one stream: the rows past the sub-step's zero, abegin; then 2)
+        al::BOut<> po((bfp16ebs8 *)AP(uint8_t, {{ A_QA }} + i));
+        AIE_LOOP_NO_UNROLL
+        for (int db = 0; db < {{ ND }}; db++) {
+            AIE_LOOP_NO_UNROLL
+            for (int o = 2 * i; o < (i ? 3 : 2); o++) {
+                aie::vector<float, 64> v;
+{% for qq in range(8) %}
+                v.insert({{ qq }}, aie::load_v<8>(q + {{ HD }} * (8 * o + {{ qq }}) + 8 * db));
+{% endfor %}
+                po.push(aie::accum<accfloat, 64>(v).template to_vector<bfp16ebs8>());
+            }
+        }
+    }
+{% else %}
     AIE_LOOP_NO_UNROLL
     for (int o = 0; o < no; o++) {
         al::BOut<> po((bfp16ebs8 *)AP(uint8_t, {{ A_QA }} + o));
         AIE_LOOP_NO_UNROLL
         for (int db = 0; db < {{ ND }}; db++) {
-{% if ONE %}
-            aie::vector<float, 64> v;  // (a panel of the octet's 8 rows; the rows past the sub-step's zero: abegin)
-{% for qq in range(8) %}
-            v.insert({{ qq }}, aie::load_v<8>(q + {{ HD }} * (8 * o + {{ qq }}) + 8 * db));
-{% endfor %}
-            po.push(aie::accum<accfloat, 64>(v).template to_vector<bfp16ebs8>());
-{% else %}
             AIE_LOOP_NO_UNROLL
             for (int set = 2 * o; set < 2 * o + 2; set++) {  // (the rows past the sub-step's zero: abegin)
                 aie::vector<float, 32> v;
@@ -668,9 +691,9 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
 {% endfor %}
                 po.push(al::hilo4(aie::accum<accfloat, 32>(v), nI));
             }
-{% endif %}
         }
     }
+{% endif %}
     for (int set = 0; set < {{ SETS }}; set++)
         aie::store_v(AW(float, {{ a.ml }}) + 64 * set, aie::broadcast<float, 32>(-8192.0f));  // (bf16-exact)
     al::zero<{{ 32 * (ND + 1) * SETS }}, 32>(q);
@@ -744,9 +767,19 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
             const int r = 4 * g + 2 * ph + k;
             const uint8_t *__restrict rec = a + {{ REC_K }} * k;
             float *__restrict so = sc + 32 * (2 * ph + k);
+{% if ONE %}
+            if (r <= rl) {
+                {{ p }}_qk1<2>(rec, AP(const uint8_t, {{ A_QA }}), so);
+{% if NO > 2 %}
+                if (no > 2)
+                    {{ p }}_qk1<1>(rec, AP(const uint8_t, {{ A_QA }} + 1), so + 512);
+{% endif %}
+            }
+{% else %}
             AIE_LOOP_NO_UNROLL
             for (int o = 0; o < (r <= rl ? no : 0); o++)
-                {{ p }}_qk{{ "1" if ONE else "<2>" }}(rec, AP(const uint8_t, {{ A_QA }} + o), so + 256 * o);
+                {{ p }}_qk<2>(rec, AP(const uint8_t, {{ A_QA }} + o), so + 256 * o);
+{% endif %}
             AIE_LOOP_NO_UNROLL
             for (int set = 0; set < (r >= rp ? 2 * no : 0); set++)  // (masked: -16384, P 0)
                 aie::store_v(so + 128 * set, r > rl ? aie::broadcast<float, 32>(-16384.0f) :
@@ -1064,10 +1097,11 @@ class AttnShape:
                 put(name, n)
             put("rws", ROWS_B, ("mx", "mw"))
             pan = 72 * ND
-            n_own = (L1 - fixed - regions(own)["size"]) // pan
-            own += [(f"qa{o}", pan) for o in range(min(n_own, self.octets))]
-            for o in range(n_own, self.octets):
-                put(f"qa{o}", pan, ("mx", "mw"))
+            own.append(("qa0", 2 * pan))  # (octets 0 and 1: [d-block][octet 2]; qa1: octet 2)
+            if regions(own)["size"] + pan + fixed <= L1:
+                own.append(("qa1", pan))
+            else:
+                put("qa1", pan, ("mx", "mw"))
         else:
             qa = [(f"qa{o}", 2 * 72 * ND) for o in range(self.octets)]
             if not self.main_gates:
@@ -1093,7 +1127,7 @@ class AttnShape:
         bases = {"mw": ("mw", tail), "mx": ("mx", 0)}
         out = []
         names = [(A_NRM, "nrm"), (A_VN, "vn")] + [(A_GS, "gs")] * (not self.main_gates) + [(A_RWS, "rws")] * self.one
-        for w, name in names + [(A_QA + o, f"qa{o}") for o in range(self.octets)]:
+        for w, name in names + [(A_QA + o, f"qa{o}") for o in range(2 if self.one else self.octets)]:
             if name in self.ext:
                 r, off = self.ext[name]
                 out.append((w, (bases[r][0], bases[r][1] + off)))

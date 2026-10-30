@@ -337,5 +337,10 @@ offsets): aie2p-coding section 8. For speed:
   (`GemmaOverlay.step(start=)`; x from the chunk's residual) instead of a whole decode step: 19 of 42 layers' weights
   (-25 ms per prompt). If the overlay's image expects a header (post-norm update) at that layer, keep it and make
   the update zero.
+- **A step's patches by cache lines**: a rewrite of a few words per step followed by a flush of their buffer's span is
+  milliseconds of clflush on the critical path: the 27B's metadata objects 6.2-6.7 ms at every change of S (nearly every
+  round of a generation; invisible in a step table of one S), a 2.2 MB transaction 1.2 ms per step. Write what differs
+  from the last S, patch by index arrays, flush the touched lines with one fence (`OverlayDevice.flush_lines`,
+  `Transaction.flush_lines`).
 - **Read only what the host needs**: top-k from block maxima, not 128K logits. numpy beats torch
   for 2-3K-element work.

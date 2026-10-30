@@ -267,6 +267,12 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   4 K pops for 8 MMULs, the accumulators starting at the rows' bias): ~350 cycles per call.
 - **P V over pairs of row blocks**: each V panel popped once for two blocks, one chain per block, the O update's load
   and store pointers distinct `__restrict` parameters of a helper: II 8 for 8 MMULs (2339 -> 648).
+- **One pass for twice the rows** (`qwen35/attn.py` "One pass"): a step of 8 tokens is 48 query rows per KV head. Position
+  splits leave each core all 48 rows (two passes over the cache: +38 ms at 32K); instead both cores of a chain take one
+  broadcast stream, each with its own heads' 24 rows, and Q, P go single bfp16 (one panel of 8 rows, half the MMULs, no
+  KL cost at model level). What then binds is not arithmetic: a group's ~2600 of ~6500 cycles were the object loop and
+  the maxima; a compare of the group's maximum against the rows' skips the maxima's 270 cycles a set, and P V of a whole
+  V object takes y once for four records (S 5 at 32K 377.8 -> 342.7 ms).
 - **Row sums on the MMUL** (l += P J next to P V): the exp loop holds no accumulators. With the softmax's fp32 max /
   clamp moved to the exp2's bf16 parts (v = max(bf16(A), 129), f = max(A - v, -0.5)), the maxima in bf16 and the rare
   paths (masks, rescale) in functions of their own, the softmax took ~1200 instead of 7161 cycles per chunk (6 row

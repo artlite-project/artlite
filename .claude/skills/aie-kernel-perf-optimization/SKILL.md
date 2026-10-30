@@ -149,10 +149,11 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   one call.
 - **R10 Sequential recurrences** (the GDN scan): chunkwise (WY / UT form), 16 tokens per state read and write, the
   state products and the update on the MMUL, the intra-chunk solve in fp32 by 8-token blocks (a 1B chunk's scan
-  70 -> 24 ms).
+  70 -> 24 ms). The same for a decode step's tokens: one pass per state panel at any S (~690 cycles against ~6000 token
+  by token at S 8), a step's tokens' grouping then showing at the rounding level.
 - **R11 Several tokens per decode step**: a DMA-bound step of S tokens costs about one (tokens on the MMUL's A rows,
   inputs interleaved per 8-element block, recurrent state replayed instead of snapshotted). Past 4 tokens the A rows
-  hold single bfp16 x instead of hi + lo (``decode.gemv``), and a core's per-slot arrays outgrow L1: put what only
+  hold single bfp16 x, Q and P instead of hi + lo (``decode.gemv``, ``qwen35.attn``'s "One pass"), and a core's per-slot arrays outgrow L1: put what only
   cold code touches in a neighbour's memory (``decode.design``'s "Designs of 8 slots": slots 4-7's residual in the
   helper's, the helper's scratch in the GDN core's).
 - **R12 Neighbour cores sharing derived data** through shared memory (GemmQ's dequant pairs: per k-tile 980 -> ~800
@@ -229,7 +230,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   weight pass (GemmQ 32 -> 64 tokens per core row: GEMMs -15..26%; several tokens per decode step, R11); more queries
   per pass over a KV cache (Llama 3B prefill attention 32 -> 64: -25%).
 - **Two cores that need the same stream: split it, don't broadcast it** once a core's stream or compute binds (decode
-  attention at long context): each core takes half the positions and they merge partial softmax results.
+  attention at long context): each core takes half the positions and they merge partial softmax results. Past that
+  core's rows the other way pays: both on one broadcast stream, each with half the rows (R13's "One pass").
 - **A broadcast is bounded by each consumer's input port** (8 B / cycle): feed each core on both its input channels
   (two streams, each with half of every object): Gemma's full attention -41%.
 - **Read every byte once**: fixed-size gather units waste bytes when a part is smaller (a 1 KB tile header in a 4 KB

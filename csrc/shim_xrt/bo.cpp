@@ -158,7 +158,9 @@ properties bo::get_properties() const {
 void bo::sync(direction dir) { sync(dir, m_size, 0); }
 
 void bo::sync_lines(const int64_t* offsets, size_t count) {
-  for (size_t i = 0; i < count; i++) sync(direction::host2device, 64, static_cast<size_t>(offsets[i]));
+  if (!count) return;
+  const auto [lo, hi] = std::minmax_element(offsets, offsets + count);  // (one copy of the range: an instruction BO's)
+  sync(direction::host2device, static_cast<size_t>(*hi - *lo) + 64, static_cast<size_t>(*lo));
 }
 
 void bo::sync(direction dir, size_t size, size_t offset) {
