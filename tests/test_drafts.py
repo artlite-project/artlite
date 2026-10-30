@@ -133,8 +133,8 @@ def test_generate_drafts() -> None:
 
 def test_draft_stop() -> None:
     """A drafter's chain (``OverlayModel._keep``, ``_more``): ``P_MIN`` until ``WARM`` drafter rounds ran (the next
-    drafter step always); then a draft joins where its chain's probability, calibrated (``_kappa``: kept drafts per
-    their chains' probability), beats the rounds' rate times its slot's time, and the drafter guesses another where the
+    drafter step always); then a draft joins where its chain's probability, calibrated (``_kappa``: per depth the kept
+    drafts per their chains' probability; a new depth from the one before it), beats the rounds' rate times its slot's time, and the drafter guesses another where the
     chain times the last guess's probability beats the rate times the slot and its step: a dense model's (7.1 tokens/s,
     slots of 5 ms, draft steps of 11 ms) chains go on to ~0.04 and ~0.11, an MoE's (30 tokens/s, slots of 12 ms) stop
     at ~0.36."""
@@ -147,9 +147,13 @@ def test_draft_stop() -> None:
     dense._row_time(0.011)
     assert dense._keep(0.05, 1) and not dense._keep(0.03, 1)
     assert dense._more(0.2, 0.9, 1) and not dense._more(0.2, 0.5, 1)
-    dense._chains = (0.8, 0.4)  # (both kept: the drafter is underconfident, kappa 2 / 1.2)
+    dense._chains = (0.8, 0.4)  # (both kept: the drafter is underconfident: depth 0 1 / 0.8, depth 1 from it)
     dense._calibrate(2)
-    assert dense._kappa == pytest.approx(2 / 1.2) and dense._keep(0.03, 1)
+    assert dense._kappa(0) == pytest.approx(1.25) and dense._kappa(1) == pytest.approx(1 / 0.72)
+    assert dense._kappa(5) == dense._kappa(1) and dense._keep(0.03, 1)
+    dense._chains = (0.9, 0.6, 0.3)  # (the first kept: the deeper calibrations fall)
+    dense._calibrate(1)
+    assert dense._kappa(2) < dense._kappa(1) < dense._kappa(0)
     moe = Text([1])
     for S, t in enumerate((0.040, 0.054, 0.066, 0.080), 1):
         moe.planner.ran(S, t)

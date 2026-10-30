@@ -473,9 +473,11 @@ class OverlayModel(NpuModel):
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
-    # (a drafter step of one row's seconds; a round's kept drafts and its drafts' chain probabilities: running averages)
+    # (a drafter step of one row's seconds; per draft depth the rounds that kept a draft there and their chains'
+    # probabilities there: running averages)
     _t_row = 0.0
-    _kept_drafts = _chain_sum = 0.0
+    _kept_at: tuple[float, ...] = ()
+    _chain_at: tuple[float, ...] = ()
     _chains: tuple[float, ...] = ()  # (the chain probabilities of the drafter's last drafts: ``_calibrate``)
     lookup = True  # drafts from the context
     drafter: Any = None  # a multi-token-prediction drafter
@@ -695,25 +697,34 @@ class OverlayModel(NpuModel):
     def _keep(self, chain: float, n: int) -> bool:
         """With n drafts so far, whether the drafter's next guess (chain: the probability of all n + 1) joins them (the
         chain's probability as the model keeps such chains: ``_kappa``)."""
-        return self._worth(chain * self._kappa, n + 1)
+        return self._worth(chain * self._kappa(n), n + 1)
 
     def _more(self, chain: float, p: float, n: int) -> bool:
         """With n drafts (their chain's probability, the last one's p), whether the drafter guesses another (its
         probability taken as the last one's: a confident chain goes on confidently, as code or a copy does; before its
         rounds are measured, always)."""
-        return self.planner.rate() is None or self._worth(chain * self._kappa * p, n + 1, self._t_row)
+        return self.planner.rate() is None or self._worth(chain * self._kappa(n) * p, n + 1, self._t_row)
 
-    @property
-    def _kappa(self) -> float:
-        """The drafts the model keeps per their chains' probability (the drafter's calibration; 1 before its rounds)."""
-        return self._kept_drafts / self._chain_sum if self._chain_sum else 1.0
+    def _kappa(self, d: int) -> float:
+        """The drafts the model keeps at depth d (0: a round's first draft) per their chains' probability (the
+        drafter's calibration: its guesses after its own guesses are overconfident, Qwen3.8-27B's on prose 1.0 at
+        depth 0 to 0.24 at depth 6; a depth not drafted yet takes the deepest one's; 1 before its rounds)."""
+        d = min(d, len(self._chain_at) - 1)
+        return self._kept_at[d] / self._chain_at[d] if d >= 0 else 1.0
 
     def _calibrate(self, kept: int) -> None:
         """A drafter's round kept its first ``kept`` drafts (``_chains``: the probabilities the drafter gave them)."""
-        if self._chains:
-            w = EWMA if self._chain_sum else 1.0
-            self._kept_drafts += w * (kept - self._kept_drafts)
-            self._chain_sum += w * (sum(self._chains) - self._chain_sum)
+        k, c = list(self._kept_at), list(self._chain_at)
+        for d, chain in enumerate(self._chains):
+            if d == len(c) == 0:  # (the first round's first draft: as measured)
+                k, c = [float(kept > 0)], [chain]
+                continue
+            if d == len(c):  # (a new depth: from the depth before it, as one round of its calibration and chains)
+                k.append(c[-1] * k[-1] / c[-1])
+                c.append(c[-1])
+            k[d] += EWMA * ((kept > d) - k[d])
+            c[d] += EWMA * (chain - c[d])
+        self._kept_at, self._chain_at = tuple(k), tuple(c)
 
     def _row_time(self, seconds: float) -> None:
         """A drafter step of one row took ``seconds``."""
