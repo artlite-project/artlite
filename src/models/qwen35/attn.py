@@ -150,7 +150,7 @@ __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, c
 // issue 3 cycles apart: 2 NS chains for II 4), summed at the end: a row's scores the same sums whatever NS
 {% if ONE %}
 // (one pass: an octet's single panels of 8 rows: so[64 r + j])
-__attribute__((noinline)) void {{ p }}_qk1(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
+[[clang::always_inline]] inline void {{ p }}_qk1(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
 {
     al::MM8 h(aie::zeros<accfloat, 64>()), l(aie::zeros<accfloat, 64>());
     al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);

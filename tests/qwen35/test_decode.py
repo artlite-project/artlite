@@ -519,7 +519,9 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("27B", 36, 4, False, True), ("35B-A3B", 768, 1, True, True),
                                                              ("35B-A3B", 768, 1, True, False), ("35B-A3B", 384, 2, True, False),
                                                              ("27B", 150, 4, True, False), ("27B", 1001, 3, True, True),
-                                                             ("27B", 1000, 4, True, False)])
+                                                             ("27B", 1000, 4, True, False), ("3.8-27B", 39, 2, False, False),
+                                                             ("3.8-27B", 1001, 7, False, False), ("3.8-27B", 160, 8, False, True),
+                                                             ("3.8-27B", 1000, 5, False, True)])
 def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
@@ -527,18 +529,22 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
     records of the new positions; its last: their records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
-    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots)."""
+    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots). The
+    3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
+    column's stream."""
     from models.qwen35 import attn as A1
 
-    path = ref.qwen_gguf("Q4_K_M", size)
+    path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
     g = p // 32
-    assert (p + S - 1) // 32 == g and A1.AttnShape.splits(g) == split
+    one = size == "3.8-27B"
+    assert (p + S - 1) // 32 == g and (one or A1.AttnShape.splits(g) == split)
     P = 32 * (g + 1)  # (cache positions: whole groups)
-    ash = A1.AttnShape(cfg, P)
-    op = MD.QwenDecodeOperator(hidden=cfg.hidden_size, rows={"Q4_K": 16}, eps=cfg.rms_norm_eps, attn=ash)
+    slots = 8 if one else A1.SMAX
+    ash = A1.AttnShape(cfg, P, slots=slots)
+    op = MD.QwenDecodeOperator(hidden=cfg.hidden_size, rows={"Q4_K": 16}, eps=cfg.rms_norm_eps, attn=ash, slots=slots)
     dev = OverlayDevice(op)
     rng = np.random.default_rng(3)
     qc, HD, T, nph = ash.qc, A1.HD, op.tile_bytes, ash.nph
@@ -572,7 +578,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
     nt = A1.TAILS
     # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared)
-    per = (1 + OD.SLOTS) * OD.XB
+    per = (1 + slots) * OD.XB
     act = dev.alloc("ACT", COLS * per + S * OD.XB)
     for c in range(COLS):
         k, role = c % nph, ash.role(c)
@@ -587,9 +593,11 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = 3 * b[1] + 2, 0, b[1], g
         else:
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = 3 * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
+        if one:  # (on the first column's stream)
+            m[MD.M_ANA], m[MD.M_SINV], m[OD.M_NASKIP] = m[OD.M_NASKIP], -(-65536 // S), 0 if k else m[OD.M_NASKIP]
         o = c * per
         act[o:o + 4 * OD.META] = m.view(np.uint8)
-        nrm = np.zeros(2 * HD + 64 * A1.SMAX, np.float32)
+        nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
         nrm[:HD], nrm[HD:2 * HD] = qn, kn
         for s in range(S):
             nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
@@ -606,7 +614,7 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     dev.alloc("OUT", COLS * ob)
     dev.alloc("REC", COLS * nr)
     seq = Sequence(op, rolling=True)
-    for c in range(COLS):
+    for c in range(0, COLS, nph if one else 1):
         k, role = c % nph, ash.role(c)
         base, ring = dev.address("KV", c // nph * hb), dev.address("KV", kvh * hb + c // nph * rb)
         if not split:

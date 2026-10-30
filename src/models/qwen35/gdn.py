@@ -36,15 +36,16 @@ head's q, k and K objects in the workspace at a time), and gdn_in's rows reach i
 into the step's objects (3 drains per column, its objects (half, slot) as [half][slot 8][64]: the q / k blocks', the v
 blocks' then z, ab), then a sync. A column's objects of a layer are payload slots of XPAY bytes (each object's metadata
 the 256 bytes before it): the header H (F_GDN, M_SKIP; the slots' ab, dt, A, ssm_norm, the previous step's d per token
-from the last gated outputs' D object), per k head [q A, q B, K, k A, k B], per v head [A, B, DL, Z]. A conv block's
+from the last gated outputs' D object), per k head [q A, q B, K (K^T panels), k A, k B], per v head [A, B, DL (U), Z]. A conv block's
 two objects: A = [weights (2 KB) | its history's rows 0 .. 7], B = [the history's rows 8 .. 10 | the step's S rows]:
 the history (3 + 8 rows, 2816 bytes, after the weights) holds the previous step's [base 3 | S rows], from which the core
 takes the step's base rows at cshift, so the host patches nothing per step; the new history [base 3 | the step's S rows]
 goes out over it (D: from A's second half on). The step's words (S, M_NREP, M_CSHIFT, M_COMMIT) come from the gdn_in
 phase's metadata object (``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q block, the previous
 step's K object, its k block (then the q history, the step's K object and the k history out: 6 KB apart, one drain),
-then per v head its block, deltas and z, its 16 state panels, and its history, deltas and gated outputs out ([k block 16][slot 8][8] bf16: gdn_out's x of the head;
-the 2 KB after them the step's d per token, into the header from the last head, else the sink). A column's DMA tasks
+then per v head its block, U and z, its 16 state panels, and its history, U and gated outputs out ([k block 16][slot 8][8]
+bf16: gdn_out's x of the head; the 2 KB after them the step's d per token, into the header from the last head, else the
+sink). A column's DMA tasks
 per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
 panels) and 21 drains.
 
@@ -53,9 +54,9 @@ docstring has the equations): a step costs about one pass per panel, whatever it
 took ~6000 cycles at S 8 against the panel's ~2170 of DMA, and held the weights' stream for it). Per k head the Gram
 blocks of its K, Q panels and per v head T = (I + L)^-1 and M (on the helper core, ``hgdn``, which reaches the core's
 memory and is idle in a GDN step: asked by the core's lock ``L_HRDY`` after the head's objects, ``L_HDONE`` before they are
-used; the header's ``M_HPAN`` tells it the heads of a step through a K_HELP command of the main core), per panel: the previous step's accepted tokens' update in
-one pass (the replay, from the kept K^T panels and U), the base out, X^T, Y^T of the step's tokens on the MMUL, R, U, O
-from T, M. Token rows past S are zero (K, Q, beta, d). A token's numbers then depend on how the tokens were grouped
+used; the header's ``M_HPAN`` tells it the heads of a step through a K_HELP command of the main core), per panel: the
+previous step's accepted tokens' update in one pass (the replay, from the kept K^T panels and U), the base out, X^T, Y^T
+of the step's tokens on the MMUL, R, U, O from T, M: ~690 cycles at every S. Token rows past S are zero (K, Q, beta, d). A token's numbers then depend on how the tokens were grouped
 into steps at the rounding level (hi + lo panels: ~3e-5 of o, ~70x below its bf16 rounding).
 """
 

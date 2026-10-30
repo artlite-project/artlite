@@ -87,7 +87,7 @@ class NpuQwen(OverlayModel):
         if cfg.moe:
             self.STEP_COST = (1.0, 1.31, 1.60, 1.94)  # (35B-A3B at 1K: the slots route to different experts)
         else:  # (27B at 1K: the weights stream once)
-            self.STEP_COST = (1.0, 1.015, 1.03, 1.045, 1.06, 1.075, 1.09, 1.105)[:self.overlay.SLOTS]
+            self.STEP_COST = (1.0, 1.01, 1.015, 1.02, 1.03, 1.035, 1.04, 1.045)[:self.overlay.SLOTS]
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
