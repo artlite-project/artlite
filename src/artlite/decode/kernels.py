@@ -843,6 +843,12 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
 {% if gate %}
         {{ p }}_gbegin(m, st, col);  // (the model's: the gates its relay applies)
 {% endif %}
+{% if help_flag %}
+        if (flags & {{ help_flag }}) {  // (the model core's work the helper shares)
+            cmd[1] = m[{{ help_word }}];
+            cmd[{{ C_KIND }}] = {{ K_HELP }};
+        }
+{% endif %}
 {% if tok %}
         if (flags & {{ F_TOK }})  // a layer kind's token object: the column's cache objects of its attentions
             st[{{ S_NAS }} + m[{{ M_TOK_KIND }}]] = m[{{ M_TOK_NG }} + col];
@@ -1585,10 +1591,15 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
 // object (its x panels into xp, its 16-k sums into the scratch); K_INPUT: the sum panels of every chunk (into the main
 // core's xs), the slots' 1 / rms -> r (8 lanes per slot); K_BEGIN: a phase's metadata (hbegin)
 void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *__restrict scr, float *__restrict sq,
-                   uint8_t *__restrict xp{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
+                   uint8_t *__restrict xp{{ ", float *__restrict hres" if SLOTS == 8 else "" }}{{ ", int32_t *__restrict hst" if help_flag else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int kind = cmd[{{ C_KIND }}];
+{% if help_flag %}
+    hst[0] = kind == {{ K_HELP }} ? cmd[1] : 0;  // (the model core's work after this command: K_HELP)
+    if (kind == {{ K_HELP }})
+        return;
+{% endif %}
     if (kind == {{ K_NOP }})
         return;
     if (kind == {{ K_BEGIN }}) {

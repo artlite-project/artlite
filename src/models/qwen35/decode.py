@@ -15,7 +15,8 @@ record mode (the first tail object is the open record's V panels); the tail obje
 """
 
 import numpy as np
-from aie.iron import Buffer, Kernel, ObjectFifo, Worker
+from aie.ir import Module
+from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Worker
 from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
@@ -53,6 +54,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META and gdn.slots == slots)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
+        if gdn is not None and gdn.split:  # (the helper runs half of the GDN core's state panels: gdn's "split")
+            self.help_flag, self.help_word = GD.F_GDN, GD.M_HPAN
+        self._gws: dict[int, Buffer] = {}
         self.msg, self.relay = gdn is not None and slots == 4, attn is not None
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
@@ -61,6 +65,10 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
+
+    def get_mlir_artifact(self) -> Module:
+        self._gws = {}  # (made per program: ``_gws_of``)
+        return super().get_mlir_artifact()
 
     def _extra_src(self, p: str, consts: dict[str, int]) -> str:
         src = ""
@@ -250,6 +258,21 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
 
+    def _gws_of(self, c: int) -> Buffer:
+        """Column c's GDN workspace (8 slots; the helper's ``_help`` takes it too)."""
+        if c not in self._gws:
+            GW = self.gdn.workspace()
+            self._gws[c] = Buffer(np.ndarray[(GW["size"] // 4,), np.dtype[np.int32]], name=f"{self.PREFIX}_gws{c}",
+                                  initial_value=np.zeros(GW["size"] // 4, np.int32), tile=Tile(c, self.GDN_ROW))
+        return self._gws[c]
+
+    def _help(self, c: int) -> tuple[Kernel, Buffer]:
+        """(split) The helper's GDN panels: ``hgdn`` on column c's GDN workspace."""
+        GW = self.gdn.workspace()
+        k = Kernel(f"{self.pfx}_hgdn", "kernel.o", [np.ndarray[(GW["size"] // 4,), np.dtype[np.int32]],
+                                                    np.ndarray[(self.xp_bytes,), np.dtype[np.uint8]]])
+        return k, self._gws_of(c)
+
     def _gdn8_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
         """The GDN cores of an 8-slot design (``gdn``'s "8 slots"): per step (after the header) per k head its q and k blocks
         (their histories out) and K objects, then its v heads (a block, the deltas and z, 16 state panels; the history,
@@ -266,9 +289,16 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
         ks = [kx("gbegin"), kx("gw"), kx("gconv"), kd("ghist"), kx("gkold"), kd("gknew"), kx("gdl"), kx("gz"),
               kxd("gpanel"), kd("gdlout"), kd("gout")]
+        hs_ty = np.ndarray[(self.xp_bytes,), np.dtype[np.uint8]]  # (split: the helper's x panels, its slot)
+        if gdn.split:
+            assert self.xp_bytes >= 4 * (GD.H_OUT + 1024), self.xp_bytes
+            ks += [Kernel(f"{p}_ghand", "kernel.o", [x_ty, gws_ty, d_ty, hs_ty]),
+                   Kernel(f"{p}_gown", "kernel.o", [x_ty, gws_ty, hs_ty]), Kernel(f"{p}_gwait", "kernel.o", [gws_ty]),
+                   Kernel(f"{p}_gput", "kernel.o", [hs_ty, d_ty])]
         nv = gdn.hc // 2
 
-        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gpanel, gdlout, gout, ws):
+        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gpanel, gdlout, gout, *rest):
+            ghand, gown, gwait, gput, hs, ws = rest if gdn.split else (None,) * 5 + (rest[0],)
             def take(k: Kernel) -> None:  # an X object into the workspace
                 x = x_f.acquire(1)
                 k(x, ws)
@@ -300,19 +330,38 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             block()
                             take(gdl)
                             take(gz)
-                            for _ in range32(16, unroll=False):
-                                x = x_f.acquire(1)
-                                d = d_f.acquire(1)
-                                gpanel(x, ws, d)
-                                d_f.release(1)
-                                x_f.release(1)
+                            if gdn.split:  # (per pair: panel i to the helper, panel 8 + i here; their D objects in order)
+                                for _ in range32(8, unroll=False):
+                                    x = x_f.acquire(1)
+                                    d = d_f.acquire(1)
+                                    ghand(x, ws, d, hs)
+                                    x_f.release(1)
+                                    x = x_f.acquire(1)
+                                    gown(x, ws, hs)
+                                    x_f.release(1)
+                                    gwait(ws)
+                                    d_f.release(1)
+                                    d = d_f.acquire(1)
+                                    gput(hs, d)
+                                    d_f.release(1)
+                            else:
+                                for _ in range32(16, unroll=False):
+                                    x = x_f.acquire(1)
+                                    d = d_f.acquire(1)
+                                    gpanel(x, ws, d)
+                                    d_f.release(1)
+                                    x_f.release(1)
                             emit(ghist)  # (its history and deltas: one drain)
                             emit(gdlout)
                             emit(gout)
 
         for c in range(COLS):
             d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
-            gws = Buffer(gws_ty, name=f"{P}_gws{c}", initial_value=np.zeros(GW["size"] // 4, np.int32))
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks, gws],
+            gws = self._gws_of(c)
+            if gdn.split:  # (the panels' locks: handed over, done)
+                self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
+                                Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks,
+                                           *([s.xp[c], gws] if gdn.split else [gws])],
                                   tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))

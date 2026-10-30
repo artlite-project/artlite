@@ -47,6 +47,15 @@ then per v head its block, deltas and z, its 16 state panels, and its history, d
 the 2 KB after them the step's d per token, into the header from the last head, else the sink). A column's DMA tasks
 per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
 panels) and 21 drains.
+
+Split (``GdnShape(split=True)``, 8 slots): the helper core (idle in a GDN step) runs half of a v head's state panels.
+The X objects bring them in pairs (i, 8 + i); the core copies panel i into the helper's x panels (its north
+neighbour's memory) with the D object it holds for the helper's out, and releases its lock ``L_HRDY``; the helper runs
+the panel on the core's workspace while the core runs panel 8 + i, its out in the helper's memory (``H_OUT``); after the
+helper's ``L_HDONE`` the core's out follows into the next D object (the core holds one D object at a time: an acquire
+of two gives the fifo a third buffer). The header's ``M_HPAN`` (the helper's panels per step) reaches the helper as a
+K_HELP command from the main core's begin (``decode.design``'s ``help_flag``). The panels are the same arithmetic on
+either core: the outputs are the unsplit core's bit for bit.
 """
 
 import math
@@ -72,6 +81,12 @@ F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the G
 (G_NSKIP, G_NMSG, G_ON, G_NCP, G_KO, G_PO, G_NS, G_NREP, G_CSHIFT, G_COMMIT, G_MJ, G_MS, G_CB, G_PAIR,
  G_PANEL) = range(15)
 G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (8 slots) the k head, its v heads done, the v head in the column
+G_HPJ = G_KO  # (8 slots, split) the helper's next panel of the head
+# (8 slots, split) the GDN tile's locks of the panels the helper runs (``GdnShape(split=)``): handed over, done; the
+# header's metadata word of the helper's panels per step
+L_HRDY, L_HDONE = 12, 13
+M_HPAN = 35
+H_OUT = 1088  # (split) words into the helper's slot of the GDN core's panel out (4 KB after it)
 G_WORDS = 16
 # (8 slots) a column's objects of a GDN layer: payload slots of XPAY bytes (each object's metadata the 256 bytes before
 # its payload): the header (H_SLOT), per k head kh its group [q A, q B, K, k A, k B] (from KH_SLOT + KH_SPAN kh), per v
@@ -496,7 +511,8 @@ __attribute__((noinline)) void {{ p }}_ghead(const bfloat16 *__restrict x, int32
         aie::store_v(GW(float, {{ g.dold }}) + 16 * r, aie::concat(aie::load_v<8>(pay + {{ H_DOLD // 4 }} + 8 * r), aie::zeros<float, 8>()));
     {{ p }}_ggates(pay + {{ H_AB // 4 }}, ws);
     st[{{ G_CB }}] = 0;
-    st[{{ G_PANEL }}] = 0;
+    st[{{ G_PANEL }}] = {{ 8 if split else 0 }};
+    st[{{ G_HPJ }}] = 0;
     st[{{ G_KH }}] = 0;
     st[{{ G_VI }}] = 0;
     st[{{ G_VH }}] = 0;
@@ -629,23 +645,24 @@ void {{ p }}_gz(const bfloat16 *__restrict x, int32_t *__restrict ws)
     }
 }
 
-// State panel x of the v head (its next one): the replay, the base out (or the state after the step's tokens: commit),
-// the step's tokens (their deltas, o)
-void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
+}  // extern "C"
+
+namespace {
+
+// State panel pj of the v head at sp (in place): the replay, the base out (or the state after the step's tokens:
+// commit), the step's tokens (their deltas, o); ws: the GDN core's workspace, uw: the running core's scratch
+__attribute__((noinline)) void {{ p }}_gpan(float *sp, float *__restrict out, int32_t *__restrict ws, int pj,
+                                            float *__restrict uw)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    const int pj = st[{{ G_PANEL }}];
-    st[{{ G_PANEL }}] = pj + 1;
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
     const int h = st[{{ G_VH }}];  // (the v head in the column: its gates)
     const int S = st[{{ G_NS }}], nrep = st[{{ G_NREP }}], commit = st[{{ G_COMMIT }}];
-    float *sp = (float *)(x + {{ 2 * META }});
     float *__restrict dl = GW(float, {{ g.dl }}) + 8 * pj;  // [token][128]
     for (int r = 0; r < nrep; r++)
         {{ p }}_p2(sp, sp, GW(bfloat16, {{ g.kold }}) + {{ 2 * D }} * r, dl + {{ D }} * r, GW(float, {{ g.dold }})[16 * r + h]);
     if (!commit)
         {{ p }}_cp4k((int32_t *)out, (const int32_t *)sp);
-    float *__restrict uw = GW(float, {{ g.uw }});
     for (int s = 0; s < S; s++) {
         const bfloat16 *__restrict kq = GW(bfloat16, {{ g.kq }}) + {{ 2 * D }} * s;  // (its k)
         {{ p }}_p1(sp, kq, kq + {{ 2 * D * SMAX }}, uw);
@@ -666,6 +683,67 @@ void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__res
             {{ p }}_p2(sp, out, kq, dl + {{ D }} * s, gt[h]);
     }
 }
+
+}  // namespace
+
+extern "C" {
+
+// State panel x of the v head (its next one; split: of its second half): ``gpan``
+void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int pj = st[{{ G_PANEL }}];
+    st[{{ G_PANEL }}] = pj + 1;
+    {{ p }}_gpan((float *)(x + {{ 2 * META }}), out, ws, pj, GW(float, {{ g.uw }}));
+}
+{% if split %}
+
+// (split) Panel x of the v head's first half, for the helper: copied into the helper's slot hs ([panel 1024 words |
+// its D object d, its panel | the helper's scratch | the GDN core's panel out: H_OUT]: hs the helper's x panels, idle
+// in a GDN step), then the helper is told
+void {{ p }}_ghand(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat16 *__restrict d, uint8_t *__restrict hs8)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    int32_t *__restrict hs = (int32_t *)hs8;
+    const int pj = st[{{ G_HPJ }}];
+    st[{{ G_HPJ }}] = pj + 1;
+    {{ p }}_cp4k(hs, (const int32_t *)(x + {{ 2 * META }}));
+    hs[1024] = (int32_t)(uintptr_t)d;
+    hs[1025] = pj;
+    release(hs, {{ 48 + L_HRDY }}, 1);
+}
+
+// (split) Panel x of the v head's second half, its out into hs (one D object at a time: the helper's is held)
+void {{ p }}_gown(bfloat16 *__restrict x, int32_t *__restrict ws, uint8_t *__restrict hs8)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int pj = st[{{ G_PANEL }}];
+    st[{{ G_PANEL }}] = pj + 1;
+    {{ p }}_gpan((float *)(x + {{ 2 * META }}), (float *)hs8 + {{ H_OUT }}, ws, pj, GW(float, {{ g.uw }}));
+}
+
+// (split) The helper's panel is out
+void {{ p }}_gwait(int32_t *__restrict ws)
+{
+    acquire_greater_equal(ws, {{ 48 + L_HDONE }}, 1);
+}
+
+// (split) The GDN core's panel out of hs -> d
+void {{ p }}_gput(uint8_t *__restrict hs8, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k((int32_t *)d, (const int32_t *)hs8 + {{ H_OUT }});
+}
+
+// (split, the helper) The panel the GDN core handed over in hs (the D object's address as the GDN core sees it: its
+// memory is the helper's south neighbour's), on the GDN core's workspace gws
+void {{ p }}_hgdn(int32_t *__restrict gws, uint8_t *__restrict hs8)
+{
+    int32_t *__restrict hs = (int32_t *)hs8;
+    acquire_greater_equal(hs, {{ L_HRDY }}, 1);  // (the GDN tile's locks: the helper's 0 .. 15)
+    {{ p }}_gpan((float *)hs, (float *)(uintptr_t)(hs[1024] - 0x30000), gws, hs[1025], (float *)(hs + 1040));
+    release(hs, {{ L_HDONE }}, 1);
+}
+{% endif %}
 
 // The v head's deltas of the step's tokens (the next step's replay)
 void {{ p }}_gdlout(int32_t *__restrict ws, bfloat16 *__restrict d)
@@ -711,7 +789,8 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
     float *__restrict dd = (float *)(d + {{ 16 * 64 }});
     for (int r = 0; r < {{ SMAX }}; r++)
         aie::store_v(dd + 8 * r, aie::load_v<8>(GW(float, {{ g.gt }}) + 48 * r));
-    st[{{ G_PANEL }}] = 0;
+    st[{{ G_PANEL }}] = {{ 8 if split else 0 }};
+    st[{{ G_HPJ }}] = 0;
     const int vi = st[{{ G_VI }}] + 1, last = vi == {{ HC // 2 }};
     const int kh = st[{{ G_KH }}] + last;
     st[{{ G_VI }}] = last ? 0 : vi;
@@ -729,10 +808,11 @@ class GdnShape:
     """The GDN core's sizes for a model: HC v heads and CH conv channels per column, the message, the workspace; the
     core of steps of up to ``slots`` (4: the message on M; 8: module docstring "8 slots")."""
 
-    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SMAX):
+    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SMAX,
+                 split: bool = False):
         assert cfg.ssm_state == D and cfg.ssm_k_heads == 2 * COLS and cfg.ssm_v_heads % (2 * COLS) == 0
-        assert slots in (SMAX, 8)
-        self.slots = slots
+        assert slots in (SMAX, 8) and (not split or slots == 8)
+        self.slots, self.split = slots, split
         self.hc = cfg.ssm_v_heads // COLS
         self.ch = (4 + self.hc) * D
         self.nb = self.ch // D  # conv blocks
@@ -791,7 +871,8 @@ class GdnShape:
         if self.slots == 8:
             return _SRC8.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, HC=self.hc, D=D, C_LEN=self.c_len,
                                 META=self.meta, SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)),
-                                F_GIN=F_GIN, F_GDN=F_GDN, H_AB=H_AB, H_PRM=H_PRM, H_DOLD=H_DOLD, **consts,
+                                F_GIN=F_GIN, F_GDN=F_GDN, H_AB=H_AB, H_PRM=H_PRM, H_DOLD=H_DOLD, split=self.split,
+                                L_HRDY=L_HRDY, L_HDONE=L_HDONE, H_OUT=H_OUT, **consts,
                                 **{k: v for k, v in globals().items() if k.startswith("G_")})
         return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,

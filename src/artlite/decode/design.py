@@ -197,7 +197,8 @@ PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}  # (gap: a phase's last tile to the next X object; gapm: to the next phase's)  # (pre: a phase's begin to its first tile)
 # the helper's commands: CMD words 0 .. 3 (by kind), the kind at C_KIND
 C_KIND = 4
-K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC = range(8)  # (K_SUB, K_ACC: moe)
+K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC, K_HELP = range(9)  # (K_SUB, K_ACC: moe; K_HELP:
+# ``help_flag``)
 C_SP = 5  # (K_STRIP, K_PSTRIP) the input's slots per k block (K_PSTRIP: + C_MIRROR: strip 0 into slot 1, F_KPAIR)
 C_MIRROR = 8
 POST_K = 256  # (post designs) k of a header phase's input object: [k block 32][v | r][slot 4][8] bf16
@@ -247,6 +248,9 @@ class DecodeOverlayOperator(ArtcOperator):
     gate = False
     R_LEN = C_LEN
     LENDS_WS = False  # (a model core uses the main core's workspace: _Streams.ws, placed on the main core's tile)
+    # help_flag: an object of another core whose work the helper shares: the main core's begin commands it (K_HELP:
+    # the count at metadata word help_word), then the helper runs ``_help``'s kernel that many times
+    help_flag, help_word = 0, 0
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -391,7 +395,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate,
-                                 moe=self.moe, gate=self.gate, **self._moe_vars(p, consts), **consts)
+                                 moe=self.moe, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
+                                 **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
         """(moe) The template variables of the MoE paths: the routing's source (``moe.route``), the side chunk, the
@@ -456,8 +461,12 @@ class DecodeOverlayOperator(ArtcOperator):
 
     def _extra_workers(self, s: _Streams) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
         """The model cores' workers and their D streams (column, ObjectFifo, in ``d_cols`` order), on the shared
-        streams ``s``."""
+        streams ``s`` (their locks: ``_locks``)."""
         return [], []
+
+    def _help(self, c: int) -> tuple[Kernel, Buffer]:
+        """(help_flag) Column c's helper's model kernel (kernel(buffer, the x panels)) and its buffer."""
+        raise NotImplementedError
 
     def get_mlir_artifact(self) -> Module:
         p, P = self.pfx, self.PREFIX
@@ -491,7 +500,9 @@ class DecodeOverlayOperator(ArtcOperator):
         k_relay = (Kernel(f"{p}_mrelay", "kernel.o", [rr_ty, c_ty, ws_ty, xp_ty]) if self.gate else
                    Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
         k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
-        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8])
+        hst_ty = np.ndarray[(4,), i32]  # (help_flag: the helper's count of model work)
+        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8,
+                                                    *[hst_ty] * bool(self.help_flag)])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
         if self.moe:  # (acc: the experts' partials of the column, in the helper's memory)
             acc_ty = np.ndarray[(SLOTS * self.hidden,), bf]
@@ -637,14 +648,21 @@ class DecodeOverlayOperator(ArtcOperator):
 
         def helper_fn(cmd_f, res_f, htask, hs, sq, xp, *rest):
             eh = rest[:1] if s8 else ()  # (8 slots: hres; else the pager's state words, the grid tables: placed)
+            hp = rest[1:4] if self.help_flag else ()  # (hst, the model's kernel, its buffer)
             for _ in forever_():
                 c = cmd_f.acquire(1)
                 r = res_f.acquire(1)
-                htask(c, r, hs, sq, xp, *eh)
+                htask(c, r, hs, sq, xp, *eh, *hp[:1])
                 res_f.release(1)
                 cmd_f.release(1)
+                if hp:
+                    hst, hk, hb = hp
+                    for _ in range_(hst[0]):  # (the model core's work, K_HELP)
+                        hk(hb, xp)
 
         workers, pg_flows, pg_locks, pg_main, pg_help = [], [], [], {}, {}
+        self._locks: list[Lock] = []  # (the model's: ``_extra_workers``)
+        xps = []
         m_ws, m_xs = [], []
         st_ty = np.ndarray[(paging.STATE_WORDS,), i32]
         for c in range(COLS):  # (paged formats: per core its state words and wake lock, per column its store and routes)
@@ -676,6 +694,7 @@ class DecodeOverlayOperator(ArtcOperator):
             moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
             hres = [Buffer(hres_ty, name=f"{P}_hres{c}", tile=Tile(c, hr))] if s8 else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
+            xps.append(xp)
             xs = Buffer(xs_ty, name=f"{P}_xs{c}", tile=Tile(c, mr))
             m_xs.append(xs)
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
@@ -691,12 +710,17 @@ class DecodeOverlayOperator(ArtcOperator):
                                             *grids.get((c, 0), [])],
                                   tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
-            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres,
+            help_args = []
+            if self.help_flag:
+                hk, hb = self._help(c)
+                help_args = [Buffer(hst_ty, name=f"{P}_hst{c}", tile=Tile(c, hr), initial_value=np.zeros(4, np.int32)),
+                             hk, hb]
+            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres, *help_args,
                                               *pg_help.get(c, []), *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
-                     ws=m_ws, xs=m_xs)
+                     ws=m_ws, xs=m_xs, xp=xps)
         extra, d_fifos = self._extra_workers(s)
         workers += extra
         a_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["A"][1]) for c, f in enumerate(a_l3)]
@@ -720,7 +744,7 @@ class DecodeOverlayOperator(ArtcOperator):
                            a_prod, x_prod, c_cons, d_cons])
         for f in pg_flows:
             rt.add_flow(f)
-        for lk in pg_locks:
+        for lk in pg_locks + self._locks:
             rt.add_lock(lk)
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         if s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
@@ -757,6 +781,7 @@ class _Streams:
     r_fifos: list  # the R streams to the main cores (relay)
     ws: list  # per column the main core's workspace and sum panels (``workspace``, xs: a model core may use the regions
     xs: list  # idle while its objects run; LENDS_WS)
+    xp: list  # per column the helper's x panels (a model core may use them while its objects run)
 
 
 # ----------------------------------------------------------------------
