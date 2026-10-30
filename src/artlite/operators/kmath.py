@@ -767,7 +767,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
 // is written){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
 {{ "template <int N>" if not n }}
 {{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, const bfloat16 *__restrict t_, const bfloat16 *__restrict t2_,
-                bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
+                {{ T }} *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
 {
     const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
     const aie::accum<accfloat, 32> k(aie::broadcast<float, 32>({{ M }}f));
@@ -781,7 +781,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
     const bfloat16 __aie_dm_resource_d *__restrict px = (const bfloat16 __aie_dm_resource_d *)x;
     const bfloat16 __aie_dm_resource_a *__restrict pt = (const bfloat16 __aie_dm_resource_a *)t_;
     const bfloat16 __aie_dm_resource_c *__restrict pt2 = (const bfloat16 __aie_dm_resource_c *)t2_;
-    bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)y;
+    {{ T }} __aie_dm_resource_b *__restrict py = ({{ T }} __aie_dm_resource_b *)y;
     AIE_PREPARE_FOR_POSTPIPELINING AIE_LOOP_REG_REWRITE_SWPAWARE
     for (int j = 0; j < {{ n or "N" }} / 32; j++) {
         const aie::vector<bfloat16, 32> t = aie::load_v<32>(pt);
@@ -802,7 +802,7 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
 {% if not full %}
         acc = aie::mac(acc, aie::max(aie::load_v<32>(px), aie::zeros<bfloat16, 32>()), one);
 {% endif %}
-        aie::store_v(py, acc.template to_vector<bfloat16>());
+        aie::store_v(py, acc.template to_vector<{{ T }}>());
         {{ wx.step }}
         pt += 32;
         pt2 += 32;
@@ -811,9 +811,11 @@ alignas(64) static const uint32_t {{ '{{ name }}' }}_cd[{{ words | length }}] __
 }
 """
 
-def table_pass(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None) -> Fn:
+def table_pass(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None,
+               f32: bool = False) -> Fn:
     """The table pass of ``table`` (an ActTable): a noinline template ``<N>(x, t_, t2_, y[, tab_ab, tab_cd])``, y = the
-    table's quadratic of t (t_, t2_: t = min(|x|, t_max) as bf16, or x clamped for a full table; may be y) plus relu(x).
+    table's quadratic of t (t_, t2_: t = min(|x|, t_max) as bf16, or x clamped for a full table; may be y) plus relu(x)
+    (``f32``: y fp32, not rounded to bf16; t_, t2_ then buffers of their own).
     The table's two copies in two 16 KB regions: static, in the linker's sections of banks 0 and 1 (one section per
     table: a core links only the tables it reads), or (``table_arg``)
     the core's buffers ``tab_ab``, ``tab_cd`` (``table_words`` each; two parameters: llvm-aie gives the gathers a memory
@@ -830,10 +832,10 @@ def table_pass(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int
           "full": table.full}
     if n is not None and (n <= 0 or n % 32):
         raise ValueError(f"kmath: a table pass of n = {n} values (a multiple of 32)")
-    text = _ENV.from_string(_TABLE_PASS).render(**kw, words=words, bias=int(table.base * 2 ** shift),
+    text = _ENV.from_string(_TABLE_PASS).render(**kw, words=words, bias=int(table.base * 2 ** shift), T="float" if f32 else "bfloat16",
                                                 table_arg=table_arg, walk=walk, wx=_walk(walk, "px", "cx"), n=n)
-    local = f"{table.name}_tab" + ("_t" if table_arg else "") + _walk_tag(walk) + (f"_n{n}" if n else "")
-    params = {"table": table, "table_arg": table_arg, "walk": walk, "n": n}
+    local = f"{table.name}_tab" + ("_t" if table_arg else "") + _walk_tag(walk) + (f"_n{n}" if n else "") + ("_f" if f32 else "")
+    params = {"table": table, "table_arg": table_arg, "walk": walk, "n": n, "f32": f32}
     return _fn(local, text, inline=False, deps=(l16,), lanes=32, arg="ptr", ret="void", func="table_pass",
                params=params)
 
@@ -842,7 +844,7 @@ _ACT = r"""
 // {{ what }} of N bf16 (a multiple of 32) into y (kmath.act: {{ bound }}): t = {{ t_text }} into y,
 // then the table pass in place (sets the rounding mode){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
 {{ "template <int N>" if not n }}
-{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, bfloat16 *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
+{{ '{{ attr }}' }} void {{ '{{ name }}' }}(const bfloat16 *__restrict x, {{ "bfloat16 *__restrict t, float *__restrict y" if f32 else "bfloat16 *__restrict y" }}{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     {
@@ -851,7 +853,7 @@ _ACT = r"""
         const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ clamp }}f);
 {% endif %}
         const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)x;
-        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
+        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *){{ "t" if f32 else "y" }};
 {{ wx.decl }}
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < {{ n or "N" }} / 32; j++) {
@@ -867,7 +869,7 @@ _ACT = r"""
             pw += 32;
         }
     }
-    {{ tab }}{{ "<N>" if not n }}(x, y, y, y{{ ", tab_ab, tab_cd" if table_arg }});
+    {{ tab }}{{ "<N>" if not n }}(x, {{ "t, t" if f32 else "y, y" }}, y{{ ", tab_ab, tab_cd" if table_arg }});
 }
 """
 
@@ -876,11 +878,16 @@ _ACT_BOUND = {"silu": (0.59, (-24.0, np.inf)), "sigmoid": (0.54, (-16.0, 16.0)),
               "gelu_erf": (0.59, (-4.0, np.inf))}
 
 
+_ACT_REL = {"silu": 7e-4}  # (the same, relative, of ``f32`` results: tests/operators/test_kmath.py)
+
+
 def act(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1, 32), n: int | None = None,
-        scale: int = 1, clamp: float | None = None, inline: bool = False) -> Fn:
+        scale: int = 1, clamp: float | None = None, inline: bool = False, f32: bool = False) -> Fn:
     """``table``'s activation (an ActTable: SILU, GELU, GELU_ERF, SIGMOID) of N bf16 into y (x, y distinct): a noinline
     template ``<N>(x, y[, tab_ab, tab_cd])``, two loops (t = min(|x|, t_max) into y, then the table pass in place): ~0.8
-    cycles per element (SiLU: 3287 per 4096 on the NPU). ``table_arg``, ``walk`` (x's), ``n`` (a plain function of n
+    cycles per element (SiLU: 3287 per 4096 on the NPU). ``f32``: ``<N>(x, t, y)``, y fp32 (the quadratic not rounded to
+    bf16: the table's fit, ~0.09 bf16 ULP of the exact value, where a fp32 consumer takes ``silu``'s 16 cycles per element
+    otherwise), t a bf16 scratch of N values. ``table_arg``, ``walk`` (x's), ``n`` (a plain function of n
     values): ``table_pass``'s. ``scale`` 2, ``clamp``: the table fed t = min(2 |x|, clamp) (a table of another function
     on this one's grid: the vision overlay's GELU, ``vision.layers.gelu_table``; its words the caller's buffers).
     ``inline``: the clamp pass inlined into the caller (a call per few thousand values costs ~7 cycles: the PLE's
@@ -889,7 +896,7 @@ def act(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1,
     clamp = table.t_max * scale if clamp is None else clamp
     if table.full and (scale, clamp) != (1, table.t_max):
         raise ValueError(f"kmath: {table.name} (a full table) takes x itself, clamped to its range")
-    tab = table_pass(table, table_arg=table_arg, walk=walk, n=n)
+    tab = table_pass(table, table_arg=table_arg, walk=walk, n=n, f32=f32)
     ulp, dom = _ACT_BOUND[table.name] if (scale, clamp) == (1, table.t_max) else (None, (-np.inf, np.inf))
     t_text = (f"x clamped to +-{clamp:g}" if table.full else f"min({scale} |x|, {clamp:g})" if scale > 1
               else f"min(|x|, {clamp:g})")
@@ -897,13 +904,14 @@ def act(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int] = (1,
     what = f"{table.name} through its table" if ulp else f"a table on {table.name}'s grid"
     text = _ENV.from_string(_ACT).render(what=what, table=table.name, tab=tab.name, clamp=repr(float(clamp)), full=table.full,
                                          bound=bound, t_text=t_text, scale=scale, n=n, table_arg=table_arg, walk=walk,
-                                         wx=_walk(walk, "px", "cx"))
+                                         wx=_walk(walk, "px", "cx"), f32=f32)
     local = (f"{table.name}_lut" + ("_t" if table_arg else "") + _walk_tag(walk) + (f"_n{n}" if n else "")
-             + (f"_s{scale}c{clamp:g}" if (scale, clamp) != (1, table.t_max) else "") + ("_i" if inline else ""))
+             + (f"_s{scale}c{clamp:g}" if (scale, clamp) != (1, table.t_max) else "") + ("_i" if inline else "")
+             + ("_f" if f32 else ""))
     return _fn(local, text, inline=inline, deps=(tab,), lanes=32, arg="ptr", ret="void", func="act",
                params={"table": table, "table_arg": table_arg, "walk": walk, "n": n, "scale": scale, "clamp": clamp,
-                       "inline": inline},
-               domain=dom, valid=(-3e38, 3e38), ulp=ulp)
+                       "inline": inline, "f32": f32},
+               domain=dom, valid=(-3e38, 3e38), ulp=None if f32 else ulp, rel=_ACT_REL.get(table.name) if f32 else None)
 
 
 _SILU_SMALL = r"""

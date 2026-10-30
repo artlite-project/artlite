@@ -35,6 +35,7 @@ CASES = {  # id: the function and its arguments
     "sigmoid": ("sigmoid", {"lanes": 16}),
     "silu": ("silu", {"lanes": 32}),
     "act-silu": ("act", {"table": "silu"}),
+    "act-silu-f32": ("act", {"table": "silu", "f32": True}),
     "act-sigmoid": ("act", {"table": "sigmoid"}),
     "act-gelu": ("act", {"table": "gelu"}),
     "act-gelu_erf": ("act", {"table": "gelu_erf"}),
@@ -81,8 +82,8 @@ def _contracts() -> list[kmath.Fn]:
         fns += [kmath.exp2(lanes, bias=192, below=b, above=a, shift=s, inline=inline)
                 for b, a, s in itertools.product(("clamp", "bounded", "none"), ("none", "clamp"), (0, 64))]
     for t in kmath.TABLES.values():
-        fns += [kmath.act(t)] + [kmath.table_pass(t, table_arg=a, walk=w)
-                                 for a, w in itertools.product((False, True), ((1, 32), (1, 64), (2, 128)))]
+        fns += [kmath.act(t), kmath.act(t, f32=True)] + [kmath.table_pass(t, table_arg=a, walk=w)
+                                                          for a, w in itertools.product((False, True), ((1, 32), (1, 64), (2, 128)))]
         fns += [kmath.act(t, table_arg=True, walk=(2, 128))]
     return fns + [kmath.table_pass(kmath.SILU, table_arg=True, n=640), kmath.silu_tanh(walk=(2, 128)),
                   kmath.act(kmath.SILU, table_arg=True, n=640, scale=2, clamp=16.0, walk=(10, 640))]
@@ -134,13 +135,15 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     dom, edges = _arguments(fn)
     x = np.concatenate([dom, edges])
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
-    if fn.arg == "ptr":
+    if fn.arg == "ptr" and not fn.params.get("f32"):
         xt = torch.from_numpy(xp).bfloat16()
         out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(xt).float().numpy()[:len(x)]
     else:
         out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(torch.from_numpy(xp)).numpy()[:len(x)]
     em = kmath_sim.emulate(fn, x)
     same = (out == em) | (np.isnan(out) & np.isnan(em))  # (zeros of either sign alike)
+    if fn.params.get("f32"):  # (unrounded: the accumulator's sum, which the model takes in fp32 steps)
+        same |= np.abs(out - em) <= 4 * np.spacing(np.abs(em))
     assert same.all(), (f"{(~same).sum()} results differ from the emulation; at {x[~same][:4]}: {out[~same][:4]} vs "
                         f"{em[~same][:4]}")
     o, ref = out[:len(dom)].astype(np.float64), kmath_sim.exact(fn, dom)

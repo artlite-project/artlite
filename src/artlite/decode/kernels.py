@@ -137,10 +137,10 @@ template <typename T>
 // The helper: a strip of {{ OBJ_K // 8 }} k blocks of x ([k block][slot SP][8] bf16, times the norm weights w (bf16 per
 // k) when NORM) -> their x panels at xp (per k block the slots' x as single bfp16, ``gemv``) and the slots' 16-k sums
 // at t ([128-k group][slot 8][16-k block 8] fp32: the panels' rows summed on the MMUL against B_j); sq_ += the squares
-// ([slot 8][8] lanes). The rows and lanes of the slots past SP are undefined (as _kb's)
-template <bool NORM, int SP>
+// ([slot 8][8] lanes). The rows and lanes of the slots past SP are undefined (as _kb's); SP8: SP is 8, else sp <= 4
+template <bool NORM, bool SP8>
 __attribute__((noinline)) void {{ p }}_hstrip(const bfloat16 *__restrict x, const bfloat16 *__restrict w,
-                                              float *__restrict sq_, uint8_t *__restrict xp, float *__restrict t)
+                                              float *__restrict sq_, uint8_t *__restrict xp, float *__restrict t, int sp)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     al::BOut<> o((bfp16ebs8 *)xp);
@@ -155,12 +155,13 @@ __attribute__((noinline)) void {{ p }}_hstrip(const bfloat16 *__restrict x, cons
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < 8; j++) {  // 16-k block j: k blocks 2 j, 2 j + 1
             aie::vector<bfloat16, 64> v0, v1;
-            if constexpr (SP == 8) {
+            if constexpr (SP8) {
                 v0 = aie::load_v<64>(px), v1 = aie::load_v<64>(px + 64);
+                px += 128;
             } else {
-                v0 = aie::load_v<8 * SP>(px).template grow<64>(), v1 = aie::load_v<8 * SP>(px + 8 * SP).template grow<64>();
+                v0 = {{ p }}_kbr(px).template grow<64>(), v1 = {{ p }}_kbr(px + 8 * sp).template grow<64>();
+                px += 16 * sp;
             }
-            px += 16 * SP;
             sq = aie::mac_square(aie::mac_square(sq, v0), v1);
             aie::accum<accfloat, 64> x0, x1;
             if constexpr (NORM) {  // (the 8 weights of a k block for every slot)
@@ -1653,14 +1654,16 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 {% if SLOTS == 8 %}
         const bfloat16 *w = (const bfloat16 *)(uintptr_t)cmd[1];
         const int sp = cmd[{{ C_SP }}];
-{% for sp in (1, 2, 4, 8) %}
-        {{ "else " if not loop.first else "" }}if (sp == {{ sp }}) {
+        if (sp == 8) {
             if (w)
-                {{ p }}_hstrip<true, {{ sp }}>(x, w, sq, xpk, t);
+                {{ p }}_hstrip<true, true>(x, w, sq, xpk, t, sp);
             else
-                {{ p }}_hstrip<false, {{ sp }}>(x, nullptr, sq, xpk, t);
+                {{ p }}_hstrip<false, true>(x, nullptr, sq, xpk, t, sp);
+        } else if (w) {
+            {{ p }}_hstrip<true, false>(x, w, sq, xpk, t, sp);
+        } else {
+            {{ p }}_hstrip<false, false>(x, nullptr, sq, xpk, t, sp);
         }
-{% endfor %}
 {% else %}
         const int sp = {{ "cmd[%d]" % C_SP if packed else 4 }};
         if (cmd[1])

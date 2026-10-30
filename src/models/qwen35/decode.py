@@ -24,6 +24,7 @@ from ml_dtypes import bfloat16
 from artlite.decode import design as OD
 from artlite.decode import gemv
 from artlite.decode.design import C_LEN, META, XPAY, DecodeOverlayOperator, _Streams
+from artlite.operators import kmath
 from artlite.operators.design import COLS, range32
 
 from . import attn as AT
@@ -40,6 +41,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     PREFIX = "q35m"
     GDN_STACK, ATTN_STACK = 4864, AT.STACK
+    GWS8_AT = 0x4000  # (8 slots) the GDN workspace: regions 1 .. 3 whole, below the helper's scratch and a SiLU table copy
     A_FWD = 3  # (the attention core holds its last two A objects: decode.design's A_FWD)
     LENDS_WS = True  # (the attention core's regions in the main core's memory)
     GDN_ROW, ATTN_ROW = 2, 5
@@ -54,9 +56,10 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META and gdn.slots == slots)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
-        if gdn is not None and gdn.split:  # (the helper runs half of the GDN core's state panels: gdn's "split")
+        if gdn is not None and slots == 8:  # (the helper computes the v heads' constants: gdn's ``vhead``)
             self.help_flag, self.help_word = GD.F_GDN, GD.M_HPAN
         self._gws: dict[int, Buffer] = {}
+        self._tabs: list[Buffer] = []
         self.msg, self.relay = gdn is not None and slots == 4, attn is not None
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
@@ -65,10 +68,6 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
-
-    def get_mlir_artifact(self) -> Module:
-        self._gws = {}  # (made per program: ``_gws_of``)
-        return super().get_mlir_artifact()
 
     def _extra_src(self, p: str, consts: dict[str, int]) -> str:
         src = ""
@@ -258,6 +257,13 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
 
+    def get_mlir_artifact(self) -> Module:
+        self._gws, self._tabs = {}, []  # (made per program: ``_gws_of``, ``_gdn8_workers``)
+        return super().get_mlir_artifact()
+
+    def _pins(self) -> dict[str, int]:
+        return {f"{self.PREFIX}_gws{c}": self.GWS8_AT for c in self._gws}
+
     def _gws_of(self, c: int) -> Buffer:
         """Column c's GDN workspace (8 slots; the helper's ``_help`` takes it too)."""
         if c not in self._gws:
@@ -267,7 +273,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return self._gws[c]
 
     def _help(self, c: int) -> tuple[Kernel, Buffer]:
-        """(split) The helper's GDN panels: ``hgdn`` on column c's GDN workspace."""
+        """The helper's GDN work: ``hgdn`` on column c's GDN workspace."""
         GW = self.gdn.workspace()
         k = Kernel(f"{self.pfx}_hgdn", "kernel.o", [np.ndarray[(GW["size"] // 4,), np.dtype[np.int32]],
                                                     np.ndarray[(self.xp_bytes,), np.dtype[np.uint8]]])
@@ -288,17 +294,10 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         kxd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty, d_ty])
         kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
         ks = [kx("gbegin"), kx("gw"), kx("gconv"), kd("ghist"), kx("gkold"), kd("gknew"), kx("gdl"), kx("gz"),
-              kxd("gpanel"), kd("gdlout"), kd("gout")]
-        hs_ty = np.ndarray[(self.xp_bytes,), np.dtype[np.uint8]]  # (split: the helper's x panels, its slot)
-        if gdn.split:
-            assert self.xp_bytes >= 4 * (GD.H_OUT + 1024), self.xp_bytes
-            ks += [Kernel(f"{p}_ghand", "kernel.o", [x_ty, gws_ty, d_ty, hs_ty]),
-                   Kernel(f"{p}_gown", "kernel.o", [x_ty, gws_ty, hs_ty]), Kernel(f"{p}_gwait", "kernel.o", [gws_ty]),
-                   Kernel(f"{p}_gput", "kernel.o", [hs_ty, d_ty])]
+              Kernel(f"{p}_gwait", "kernel.o", [gws_ty]), kxd("gpanel"), kd("gdlout"), kd("gout")]
         nv = gdn.hc // 2
 
-        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gpanel, gdlout, gout, *rest):
-            ghand, gown, gwait, gput, hs, ws = rest if gdn.split else (None,) * 5 + (rest[0],)
+        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gwait, gpanel, gdlout, gout, ws, *_tabs):
             def take(k: Kernel) -> None:  # an X object into the workspace
                 x = x_f.acquire(1)
                 k(x, ws)
@@ -324,44 +323,31 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                         emit(ghist)
                         take(gkold)
                         block()  # k
+                        gwait(ws)
                         emit(gknew)
                         emit(ghist)
                         for _ in range32(nv, unroll=False):  # its v heads
                             block()
                             take(gdl)
                             take(gz)
-                            if gdn.split:  # (per pair: panel i to the helper, panel 8 + i here; their D objects in order)
-                                for _ in range32(8, unroll=False):
-                                    x = x_f.acquire(1)
-                                    d = d_f.acquire(1)
-                                    ghand(x, ws, d, hs)
-                                    x_f.release(1)
-                                    x = x_f.acquire(1)
-                                    gown(x, ws, hs)
-                                    x_f.release(1)
-                                    gwait(ws)
-                                    d_f.release(1)
-                                    d = d_f.acquire(1)
-                                    gput(hs, d)
-                                    d_f.release(1)
-                            else:
-                                for _ in range32(16, unroll=False):
-                                    x = x_f.acquire(1)
-                                    d = d_f.acquire(1)
-                                    gpanel(x, ws, d)
-                                    d_f.release(1)
-                                    x_f.release(1)
+                            gwait(ws)
+                            for _ in range32(16, unroll=False):
+                                x = x_f.acquire(1)
+                                d = d_f.acquire(1)
+                                gpanel(x, ws, d)
+                                d_f.release(1)
+                                x_f.release(1)
                             emit(ghist)  # (its history and deltas: one drain)
                             emit(gdlout)
                             emit(gout)
 
         for c in range(COLS):
-            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
-            gws = self._gws_of(c)
-            if gdn.split:  # (the panels' locks: handed over, done)
-                self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
-                                Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks,
-                                           *([s.xp[c], gws] if gdn.split else [gws])],
+            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))
+            self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
+                            Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
+            for i, a in enumerate(GD.SILU_TAB):  # (used through their addresses only)
+                self._tabs.append(Buffer(np.ndarray[(1600 // 4,), np.dtype[np.uint32]], name=f"{P}_gtab{c}_{i}",
+                                         tile=Tile(c, self.GDN_ROW), address=a - 0x70000, initial_value=kmath.SILU.table_words()))
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._tabs[-2:]],
                                   tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))

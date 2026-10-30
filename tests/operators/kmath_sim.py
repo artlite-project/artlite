@@ -225,15 +225,17 @@ def _silu(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     return mulff(xf, np.where(xf < 0, mulff(t, r), r))
 
 
-def _act(table: kmath.ActTable, x: np.ndarray) -> np.ndarray:
-    """``kmath.act(table)``: t = min(|x|, t_max) (x clamped for a full table), its segment's quadratic plus relu(x)."""
+def _act(table: kmath.ActTable, x: np.ndarray, f32: bool = False) -> np.ndarray:
+    """``kmath.act(table)``: t = min(|x|, t_max) (x clamped for a full table), its segment's quadratic plus relu(x)
+    (``f32``: not rounded to bf16)."""
     x = bf16(x)
     tm = np.float32(table.t_max)
     v, r, r2 = table.reduce(np.clip(x, -tm, tm) if table.full else np.minimum(np.abs(x), tm))
     s = ((v - table.base) / table.seg).astype(np.int64)
     c0, c1, c2 = (_f32(table.coefficients[s, i]) for i in range(3))
     acc = mac(mac(c0, c1, r), c2, r2)
-    return bf16(acc if table.full else mac(acc, np.maximum(x, np.float32(0)), 1.0))
+    y = acc if table.full else mac(acc, np.maximum(x, np.float32(0)), 1.0)
+    return y if f32 else bf16(y)
 
 
 def _silu_tanh(x: np.ndarray) -> np.ndarray:
@@ -266,7 +268,7 @@ def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     if fn.func == "recip":
         return _recip(x, p["domain"], p["steps"])
     if fn.func == "act":
-        return _act(p["table"], x)
+        return _act(p["table"], x, p["f32"])
     if fn.func == "silu_tanh":
         return _silu_tanh(x)
     models = {"expneg": _expneg, "expm1": _expm1, "sigmoid": _logistic, "softplus": _logistic, "silu": _silu}

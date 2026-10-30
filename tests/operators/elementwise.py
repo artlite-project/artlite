@@ -206,7 +206,17 @@ class GeluOperator(StreamOperator):
 
 _KM = JINJA_ENV.from_string(r"""
 {{ fn.src }}
-{% if fn.arg == "ptr" %}
+{% if fn.params.get("f32") %}
+extern "C"
+void {{ name }}(float *__restrict input, float *__restrict output)
+{  // (x bf16 values as fp32)
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    alignas(64) bfloat16 x[{{ ts }}], t[{{ ts }}];
+    for (int j = 0; j < {{ ts }}; j += 32)
+        aie::store_v(x + j, aie::accum<accfloat, 32>(aie::load_v<32>(input + j)).template to_vector<bfloat16>());
+    {{ fn }}<{{ ts }}>(x, t, output);
+}
+{% elif fn.arg == "ptr" %}
 extern "C"
 void {{ name }}(bfloat16 *__restrict input, bfloat16 *__restrict output)
 {
@@ -239,7 +249,7 @@ class KmOperator(StreamOperator):
         self.func, self.kwargs = func, kwargs
         args = {k: kmath.TABLES[v] if k == "table" else v for k, v in kwargs.items()}
         self.fn = getattr(kmath, func)(**args)
-        dt = torch.bfloat16 if self.fn.arg == "ptr" else torch.float32
+        dt = torch.bfloat16 if self.fn.arg == "ptr" and not self.fn.params.get("f32") else torch.float32
         super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(dt,), dtypes_out=(dt,))
 
     @property
@@ -248,7 +258,7 @@ class KmOperator(StreamOperator):
 
     @property
     def stack_size(self) -> int | None:
-        return 0x1000  # (softplus inlined: 3.4 KB)
+        return 0x2000 if self.fn.params.get("f32") else 0x1000  # (softplus inlined: 3.4 KB; f32: x and t in the frame)
 
     def get_kernel_src(self) -> str:
         return _KM.render(fn=self.fn, name=self.kernel_name, ts=self.tile)

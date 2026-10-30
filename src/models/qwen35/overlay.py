@@ -172,7 +172,7 @@ class QwenOverlay(ModelOverlay):
         fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
         slots = slots or slots_of(cfg, fmts)
         att = [cfg.attention[L] for L in self.layers]
-        self.gsh = gdn.GdnShape(cfg, slots=slots, split=slots == 8) if not all(att) else None
+        self.gsh = gdn.GdnShape(cfg, slots=slots) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.rope = _text_rope(self.max_positions)
@@ -364,8 +364,8 @@ class QwenOverlay(ModelOverlay):
         norm = self._f32(f"blk.{L}.ssm_norm.weight")
         m = np.zeros(META, np.int32)
         m[M_FLAGS], m[M_SKIP] = gdn.F_GDN, sh.n_objects - 1
-        if sh.split:  # (the panels the helper runs per step)
-            m[gdn.M_HPAN] = 8 * sh.hc
+        if self.g8:  # (the helper's heads per step: ``gdn``'s ``hgdn``)
+            m[gdn.M_HPAN] = sh.hc + 2
         for c in range(COLS):
             vh = gdn_v_heads(cfg, c)
             rows = blk.rows[c][blk.rows[c] >= 0]
@@ -512,21 +512,15 @@ class QwenOverlay(ModelOverlay):
             a = dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh)) + 2048)
             seq.drain("D", c, a, 3 * gdn.D_BYTES, (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
 
-        # (split: the panels in pairs, panel i (the helper's) then 8 + i)
-        pairs = ((XB // 8, 2, XB // 8, 8 * X), 8, (X, 8)) if sh.split else (DIMS_OBJ, 1, None)
-
         def v_x(h: int, c: int) -> None:  # (its group, its panels)
             seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) - 256), gdn.V_SPAN * XB, DIMS_OBJ)
             p0 = dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL - 256)
-            seq.fill("X", c, p0, (2 if sh.split else 16) * XB, *pairs)
+            seq.fill("X", c, p0, 16 * XB, DIMS_OBJ)
 
         def v_d(h: int, c: int) -> None:
             v = self._gpay(L, c, sh.v_slot(h))
             p0 = dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL)
-            if sh.split:
-                seq.drain("D", c, p0, 2 * gdn.PANEL, (gdn.PANEL // 8, 2, gdn.PANEL // 8, 8 * X), 8, (X, 8))
-            else:
-                seq.drain("D", c, p0, 16 * gdn.PANEL)
+            seq.drain("D", c, p0, 16 * gdn.PANEL)
             seq.drain("D", c, dev.address("GOBJ", v + 2048), 2 * gdn.D_BYTES,  # its history, its deltas
                       (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
             # its gated outputs (2 KB) at its head in gdn_out's x, the step's d per token after them (2 KB): of the last

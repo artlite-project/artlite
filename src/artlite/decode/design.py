@@ -464,6 +464,10 @@ class DecodeOverlayOperator(ArtcOperator):
         streams ``s`` (their locks: ``_locks``)."""
         return [], []
 
+    def _pins(self) -> dict[str, int]:
+        """(8 slots) L1 addresses of the model cores' buffers (their symbol names)."""
+        return {}
+
     def _help(self, c: int) -> tuple[Kernel, Buffer]:
         """(help_flag) Column c's helper's model kernel (kernel(buffer, the x panels)) and its buffer."""
         raise NotImplementedError
@@ -748,7 +752,7 @@ class DecodeOverlayOperator(ArtcOperator):
             rt.add_lock(lk)
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         if s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
-            at = {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)}
+            at = {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)} | self._pins()
             assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000
             pin_l1_buffers(module, fifo=lambda name, depth: None, buffer=at.get)
         return module
