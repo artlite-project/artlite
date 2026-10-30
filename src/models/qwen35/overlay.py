@@ -92,6 +92,7 @@ from artlite.overlay import Sequence, Transaction, WeightBuffer
 
 from . import attn, gdn
 from .decode import (
+    M_ANA,
     M_ATREC,
     M_COMMIT,
     M_CSHIFT,
@@ -102,6 +103,7 @@ from .decode import (
     M_NTAIL,
     M_POS,
     M_SA,
+    M_SINV,
     M_SPLIT,
     QwenDecodeOperator,
 )
@@ -118,7 +120,7 @@ CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (pref
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
 DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart (the overlapping regions)
 FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
-F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ])  # (an F_ATT object's)
+F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ, M_ANA, M_SINV])  # (an F_ATT object's)
 
 
 class _Step:
@@ -581,7 +583,8 @@ class QwenOverlay(ModelOverlay):
         for u, (a, n, split) in enumerate(st.subs):
             if u:
                 seq.sync()  # (sub-step u - 1's records in DDR)
-            for c in range(COLS):  # the cache of the column's KV head (address, length: _set_position), its ring
+            for c in range(0, COLS, nph if ash.one else 1):  # the cache of the column's KV head (address, length:
+                # _set_position), its ring (one pass: the chain's first column's stream, to both cores)
                 head = dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes)
                 kinds = ("all",) if not split else ("run", "new") if c % nph == 0 else ("run",)
                 for kind in kinds:  # (split: the chain's first column its run, then the new positions' K objects)
@@ -714,7 +717,7 @@ class QwenOverlay(ModelOverlay):
             return ()
         out = []
         for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub):
-            out.append((a, n, attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
+            out.append((a, n, not self.ash.one and attn.AttnShape.splits((p + a) // attn.POS_PER_GROUP)))
         return tuple(out)
 
     def _patch_tables(self, st: _Step) -> dict[str, np.ndarray]:
@@ -766,7 +769,8 @@ class QwenOverlay(ModelOverlay):
                     na, g0, ga, gj = 3 * b[1] + 2, 0, b[1], g
                 else:
                     na, g0, ga, gj = 3 * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
-                w[u, k] = q, n, 0, (nph + 1 if split else 2) * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj
+                ana, na = na, 0 if ash.one and k else na  # (one pass: the chain's cores on the first column's stream)
+                w[u, k] = q, n, 0, (nph + 1 if split else 2) * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj, ana, -(-65536 // n)
                 gr[u, :, k] = (0, G), (g, g + 1), (b[k], b[k + 1])
         fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
         a32 = act.view(np.int32)

@@ -1,6 +1,6 @@
 """The attention core of the multi-slot decode overlay (``qwen35/decode.py``): the full-attention layers (head_dim 256,
 NeoX RoPE on the first 64 dims, q / k RMS-normed per head, a sigmoid output gate) for S <= 4 token slots at positions
-p .. p + S - 1 (a sub-step: a step of a design of 8 slots has up to three).
+p .. p + S - 1 (a sub-step; a design of 8 slots: 8, "One pass").
 
 The KV heads' columns form chains of NPH = 8 / KV heads (9B / 27B NPH 2, MiniCPM-V 4): column c attends with its QC
 query heads (27B 3, 9B 2, MiniCPM-V 1) to KV head c // NPH over the whole cache (``decode.kv``'s d-block-major layout:
@@ -43,6 +43,15 @@ neighbour (shared memory) has merged it into its own, and the last core emits o 
 ObjectFifo orders each neighbour pair). So a slot's attention is the same in every step it can be part of: a step of
 S slots gives each the numbers of a step of one.
 
+One pass (a design of 8 slots, ``AttnShape.one``): a sub-step holds all of a step's slots in its group, and a core attends
+with its own QC query heads only (up to 24 rows) over the whole cache, which the chain reads once: the first column's A
+stream reaches both cores of a KV head's chain (the last core's memtile link: the two columns' metadata count the same
+objects, and a broadcast's objects wait for every consumer), and no partials move. The rows are single bfp16 (an octet's
+Q and P as one panel of 8 rows, as an 8-slot design's x, at the model's KL: half the MMULs and of the panels' L1), a
+group's P V one pass over its V object per octet (``pv4``: four MMULs per read of y), and a group that raises no row's
+maximum costs a compare. The first core's K objects come after the tails: the last core, holding its tails until its
+emission, then skips them (``A_NAF``). A step's slots at 32K positions: 2.13 ms a layer at 2 octets (S 3 .. 5), 3.2 at 3.
+
 L1: a sub-step's rows need per set ~5.3 KB (y and l fp32, scores, maxima, P panels) plus its Q panels (2.3 KB) and the
 rows' gates (0.5 KB a row). Regions the core reads rarely (the gates, ...: ``AttnShape.ext``) lie in the main core's
 memory, which the core reads through shared memory: the main core's workspace past its residual (``EXT_W`` bytes: GEMV
@@ -82,9 +91,10 @@ STACK = 1536  # the core's stack (its deepest kernel call: ~1.2 KB)
 L1 = 65536
 EXT_W = 9728  # bytes of the main core's workspace past its residual (``decode.design``: inv .. scr), idle in a sub-step
 EXT_X = 5760  # bytes of a dense design's main core's sum panels (``decode.design.xs_bytes``), idle in a sub-step
+EXT_W8, EXT_X8 = 12288, 9600  # (the same of a design of 8 slots)
 # state words of the main core for the gates (main_gates: its workspace's words past decode.design's of a dense design):
 # the q objects to gate, those seen, the slots, the query rows per slot, the R objects of o, those relayed
-MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E = range(56, 62)
+MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = range(56, 63)
 
 
 # metadata words of an F_ATT object: decode.py's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A
@@ -100,6 +110,7 @@ MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E = range(56, 62)
 A_QA, A_HP, A_RW = 32, 36, 38  # (A_QA: up to 4 octets)
 A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
 A_WORDS = 40
+A_NAF, A_SI, A_RWS = 40, 41, 42  # (one pass) the A objects after the held ones, 65536 / S, the record rows' scratch
 ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 
 _SRC = JINJA_ENV.from_string(r"""
@@ -137,6 +148,24 @@ __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, c
 // units. Per d-block the record's K hi and lo panels ([d-block][hi | lo]) and the sets' Q panels ([d-block][set of
 // NS]), each popped once; per set an MMUL chain over the K hi panels and one over the K lo panels (a chain's MMULs
 // issue 3 cycles apart: 2 NS chains for II 4), summed at the end: a row's scores the same sums whatever NS
+{% if ONE %}
+// (one pass: an octet's single panels of 8 rows: so[64 r + j])
+__attribute__((noinline)) void {{ p }}_qk1(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
+{
+    al::MM8 h(aie::zeros<accfloat, 64>()), l(aie::zeros<accfloat, 64>());
+    al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)qa);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int d = 0; d < {{ ND }}; d++) {
+        const al::BV Kh = ks.pop(), Kl = ks.pop(), Q = qs.pop();
+        h.mac(Q, aie::op_transpose(Kh));
+        l.mac(Q, aie::op_transpose(Kl));
+    }
+    const aie::vector<float, 64> c = aie::add(h.to_accum(), l.to_accum()).template to_vector<float>();
+    aie::store_v(so, c.template extract<32>(0));
+    aie::store_v(so + 128, c.template extract<32>(1));
+}
+{% else %}
 template <int NS>
 __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uint8_t *__restrict qa, float *__restrict so)
 {
@@ -164,6 +193,7 @@ __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uin
         aie::store_v(so + 128 * s, aie::add(c.template extract<32>(0), c.template extract<32>(1)));
     }
 }
+{% endif %}
 
 {# 2^x of 32 lanes: the rescale and merge factors, the gate's sigmoid (exactly 0 from -127 on); P's (bias 192:
    pipelines, masked scores -16384) #}
@@ -187,6 +217,7 @@ __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uin
 // y). pp: per octet [P0 hi | P0 lo | P1 hi | P1 lo]; y in place (yl, ys the same buffer as distinct restrict
 // parameters, each block read before it is written). (At most two octets: three octets' 12 P panels spill, and the
 // spilled panels come back wrong.)
+{% if not ONE %}
 template <int NO>
 __attribute__((noinline)) void {{ p }}_pv(const uint8_t *__restrict v, const uint8_t *__restrict pp,
                                           const float __aie_dm_resource_c *__restrict yl,
@@ -221,16 +252,66 @@ __attribute__((noinline)) void {{ p }}_pv(const uint8_t *__restrict v, const uin
         ys += 32;
     }
 }
+{% endif %}
 
-// P V (``pv``) of a pair of records v for the sub-step's no octets: the first two (the second past the rows of a
-// sub-step of one: stale products into rows no one reads), then a third alone
-[[clang::always_inline]] inline void {{ p }}_pvs(const uint8_t *__restrict v, const uint8_t *__restrict pp,
+{% if ONE %}
+// y += P V of two pairs of records v0, v1 (a V object's, or one twice) for NO octets, one read and one write of y per
+// d-block for the four records' MMULs: pp [pair 2][octet (a pair's PS bytes)][P0 | P1]; y in place (yl, ys the same buffer
+// as distinct restrict parameters, each block read before it is written)
+template <int NO>
+__attribute__((noinline)) void {{ p }}_pv4(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp,
+                                           const float __aie_dm_resource_c *__restrict yl,
+                                           float __aie_dm_resource_d *__restrict ys)
+{
+    al::BV P0[NO], P1[NO], P2[NO], P3[NO];
+    {
+        al::BIn<> pa((const bfp16ebs8 *)pp);
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            P0[o] = pa.pop();
+            P1[o] = pa.pop();
+        }
+    }
+    {
+        al::BIn<> pb((const bfp16ebs8 *)(pp + {{ PS }}));
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            P2[o] = pb.pop();
+            P3[o] = pb.pop();
+        }
+    }
+    al::BInR<aie_dm_resource::b> v0((const bfp16ebs8 *)v);
+    al::BIn<> v1((const bfp16ebs8 *)vb);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int d = 0; d < {{ ND }}; d++) {
+        const al::BV A = v0.pop(), B = v0.pop(), C = v1.pop(), D = v1.pop();
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            al::MM8 c(aie::accum<accfloat, 64>(aie::concat(aie::load_v<32>(yl + {{ 64 * (ND + 1) }} * o),
+                                                           aie::load_v<32>(yl + {{ 64 * (ND + 1) }} * o + {{ 32 * (ND + 1) }}))));
+            c.mac(P0[o], aie::op_transpose(A));
+            c.mac(P1[o], aie::op_transpose(B));
+            c.mac(P2[o], aie::op_transpose(C));
+            c.mac(P3[o], aie::op_transpose(D));
+            const aie::vector<float, 64> r = c.to_accum().template to_vector<float>();
+            aie::store_v(ys + {{ 64 * (ND + 1) }} * o, r.template extract<32>(0));
+            aie::store_v(ys + {{ 64 * (ND + 1) }} * o + {{ 32 * (ND + 1) }}, r.template extract<32>(1));
+        }
+        yl += 32;
+        ys += 32;
+    }
+}
+
+{% endif %}
+// P V (``pv``, ``pv4``) of a pair of records v (of two: vb too) for the sub-step's no octets: the first two (the second
+// past the rows of a sub-step of one: stale products into rows no one reads), then a third alone
+[[clang::always_inline]] inline void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp,
                                                  float *__restrict y, int no)
 {
-    {{ p }}_pv<2>(v, pp, (const float __aie_dm_resource_c *)y, (float __aie_dm_resource_d *)y);
+    {{ p }}_pv{{ "4" if ONE else "" }}<2>({{ "v, vb" if ONE else "v" }}, pp, (const float __aie_dm_resource_c *)y, (float __aie_dm_resource_d *)y);
 {% if NO > 2 %}
     if (no > 2)
-        {{ p }}_pv<1>(v, pp + 576, (const float __aie_dm_resource_c *)(y + {{ 128 * (ND + 1) }}),
+        {{ p }}_pv{{ "4" if ONE else "" }}<1>({{ "v, vb" if ONE else "v" }}, pp + {{ 2 * PO }}, (const float __aie_dm_resource_c *)(y + {{ 128 * (ND + 1) }}),
                       (float __aie_dm_resource_d *)(y + {{ 128 * (ND + 1) }}));
 {% endif %}
 }
@@ -253,11 +334,15 @@ __attribute__((noinline)) void {{ p }}_psoft(int32_t *__restrict ws, int k, int 
     const aie::vector<float, 64> P = aie::select(aie::zeros<float, 64>(), {{ e192 }}(A).template to_vector<float>(), keep);
     aie::store_v(l, aie::add(aie::load_v<32>(l), P.template extract<32>(0)));
     aie::store_v(l + {{ 32 * (ND + 1) }}, aie::add(aie::load_v<32>(l + {{ 32 * (ND + 1) }}), P.template extract<32>(1)));
+    al::BOut<> po((bfp16ebs8 *)pp);
+{% if ONE %}
+    po.push(aie::accum<accfloat, 64>(P).template to_vector<bfp16ebs8>());
+{% else %}
     al::BV hi, lo;
     al::split_hilo(aie::accum<accfloat, 64>(P), al::neg_eye(), hi, lo);
-    al::BOut<> po((bfp16ebs8 *)pp);
     po.push(hi);
     po.push(lo);
+{% endif %}
 }
 
 // The lanes of query rows lo .. hi - 1 in set q (8 per row)
@@ -267,11 +352,13 @@ __attribute__((noinline)) void {{ p }}_psoft(int32_t *__restrict ws, int k, int 
     return a >= b ? 0u : (b == 4 ? ~0u : (1u << (8 * b)) - 1u) & ~((1u << (8 * a)) - 1u);
 }
 
+{% if not ONE %}
 // c / S of a slot count S <= 4
 [[clang::always_inline]] inline int {{ p }}_divs(int c, int S)
 {
     return S == 3 ? al::div_small<3>(c) : c >> (S >> 1);
 }
+{% endif %}
 
 // The octets of a sub-step's query rows
 [[clang::always_inline]] inline int {{ p }}_octets(const int32_t *__restrict st)
@@ -384,20 +471,32 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
     if (t && r1 == r0)
         return;
     const int P0 = 8 * (t ? r1 : r0), last = p + S - 1 - P0 < 7 ? p + S - 1 - P0 : 7;  // (the step's last row of the record)
+{% if ONE %}
+    bfloat16 *__restrict rows = st[{{ A_TREC }}] && !t ? AP(bfloat16, {{ A_RWS }}) : (bfloat16 *)a;
+{% else %}
     bfloat16 *__restrict rows = st[{{ A_TREC }}] && !t ? AP(bfloat16, {{ A_QA }}) : (bfloat16 *)a;
+{% endif %}
     st[{{ A_RW }} + t] = (int32_t)(uintptr_t)rows;
     if (st[{{ A_TREC }}] && !t)
         {{ p }}_vrows(a, rows, r0 & 1);
     AIE_LOOP_NO_UNROLL
     for (int j = P0 > p ? 0 : p - P0; j <= last; j++)  // (row j: slot P0 + j - p)
         {{ p }}_rowput(rows + 8 * j, AP(bfloat16, {{ A_VN }}) + {{ HD }} * (P0 + j - p));
+{% if ONE %}
+    uint8_t *v = a + {{ ROWS_B }}, *e = a + {{ OBJ - REC_V }};  // (the object past its rows: read by no one; the pair is
+    // made from its end up, each record's panels read before the pair reaches them)
+{% else %}
     uint8_t *__restrict v = AP(uint8_t, {{ A_QA }} + 1);  // (the second octet's Q panels, done with)
     uint8_t *__restrict e = a + {{ 2 * REC_V }};  // (the object past its rows or pair of records: read by no one)
+{% endif %}
     float *__restrict y = AW(float, {{ a.y }});
     uint8_t *__restrict pp = AW(uint8_t, {{ a.pp }});
     const int no = {{ p }}_octets(st);
+{% if ONE %}
+    al::zero<{{ 2 * PS }}, 64>(pp);  // (the other records' P panels 0: their bytes)
+{% endif %}
     AIE_LOOP_NO_UNROLL
-    for (int s = -1; s < S; s++) {  // (s = -1: the second record's P panels 0, once)
+    for (int s = {{ 0 if ONE else -1 }}; s < S; s++) {  // (s = -1: the second record's P panels 0, once)
         const int j = p + s - P0;
         if (s >= 0 && j < 0)  // (a slot before the record)
             continue;
@@ -408,9 +507,9 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
         AIE_LOOP_NO_UNROLL
         for (int o = 0; o < no; o++)  // (the slot's rows: P 0 elsewhere, their y and l as they are)
             {{ p }}_psoft(ws, (P0 >> 3) & 3, o, s < 0 ? 0u : {{ p }}_rowmask(2 * o, QR * s, QR * s + QR),
-                          s < 0 ? 0u : {{ p }}_rowmask(2 * o + 1, QR * s, QR * s + QR), pp + 288 * o + (s < 0 ? 144 : 0));
+                          s < 0 ? 0u : {{ p }}_rowmask(2 * o + 1, QR * s, QR * s + QR), pp + {{ PO }} * o + (s < 0 ? {{ PO // 2 }} : 0));
         if (s >= 0)
-            {{ p }}_pvs(v, pp, y, no);
+            {{ p }}_pvs(v, v, pp, y, no);
     }
 }
 
@@ -464,7 +563,13 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_NQ }}] = split ? {{ NPH }} * S : S;
     st[{{ A_NQP }}] = 1;
     st[{{ A_NKV }}] = S;
+{% if ONE %}
+    st[{{ A_NOBJ }}] = m[{{ M_ANA }}] - {{ HOLD }};
+    st[{{ A_NAF }}] = last ? {{ HOLD }} : 0;  // (a chain's last core: the first's K objects after its held ones)
+    st[{{ A_SI }}] = m[{{ M_SINV }}];
+{% else %}
     st[{{ A_NOBJ }}] = m[{{ M_NASKIP }}] - {{ HOLD }};
+{% endif %}
     st[{{ A_P }}] = m[{{ M_POS }}];
     st[{{ A_SA }}] = m[{{ M_SA }}];
     st[{{ A_TREC }}] = m[{{ M_ATREC }}];
@@ -509,7 +614,11 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int i = st[{{ A_QS }}], S = st[{{ A_S }}], QR = st[{{ A_QR }}];
     st[{{ A_QS }}] = i + 1;
+{% if ONE %}
+    const int s = i, h0 = 0;
+{% else %}
     const int kc = QR == {{ QC }} ? 0 : {{ p }}_divs(i, S), s = i - S * kc, h0 = {{ QC }} * kc;
+{% endif %}
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     const float *__restrict nrm = AP(float, {{ A_NRM }});
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * (st[{{ A_SA }}] + s);
@@ -535,13 +644,22 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int no = {{ p }}_octets(st);
+{% if not ONE %}
     const al::BV nI = al::neg_eye();
+{% endif %}
     float *__restrict q = AW(float, {{ a.y }});
     AIE_LOOP_NO_UNROLL
     for (int o = 0; o < no; o++) {
         al::BOut<> po((bfp16ebs8 *)AP(uint8_t, {{ A_QA }} + o));
         AIE_LOOP_NO_UNROLL
         for (int db = 0; db < {{ ND }}; db++) {
+{% if ONE %}
+            aie::vector<float, 64> v;  // (a panel of the octet's 8 rows; the rows past the sub-step's zero: abegin)
+{% for qq in range(8) %}
+            v.insert({{ qq }}, aie::load_v<8>(q + {{ HD }} * (8 * o + {{ qq }}) + 8 * db));
+{% endfor %}
+            po.push(aie::accum<accfloat, 64>(v).template to_vector<bfp16ebs8>());
+{% else %}
             AIE_LOOP_NO_UNROLL
             for (int set = 2 * o; set < 2 * o + 2; set++) {  // (the rows past the sub-step's zero: abegin)
                 aie::vector<float, 32> v;
@@ -550,6 +668,7 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
 {% endfor %}
                 po.push(al::hilo4(aie::accum<accfloat, 32>(v), nI));
             }
+{% endif %}
         }
     }
     for (int set = 0; set < {{ SETS }}; set++)
@@ -587,7 +706,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
 // after the column's range, from their scores, still in sc)), a tail object (``tobj``), or the sub-step group's K object
 // again (A_NKH: the slots' K in, for the emission). The K objects of the sub-step's group that a column reads only for
 // its records are its last two: held (A_HP)
-__attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
+{{ "" if ONE else "__attribute__((minsize)) " }}void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -627,7 +746,7 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
             float *__restrict so = sc + 32 * (2 * ph + k);
             AIE_LOOP_NO_UNROLL
             for (int o = 0; o < (r <= rl ? no : 0); o++)
-                {{ p }}_qk<2>(rec, AP(const uint8_t, {{ A_QA }} + o), so + 256 * o);
+                {{ p }}_qk{{ "1" if ONE else "<2>" }}(rec, AP(const uint8_t, {{ A_QA }} + o), so + 256 * o);
             AIE_LOOP_NO_UNROLL
             for (int set = 0; set < (r >= rp ? 2 * no : 0); set++)  // (masked: -16384, P 0)
                 aie::store_v(so + 128 * set, r > rl ? aie::broadcast<float, 32>(-16384.0f) :
@@ -640,16 +759,20 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
     if (!att)
         return;
     const int no = {{ p }}_octets(st);
+{% if ONE %}
+    {{ p }}_pvs(a, a + {{ 2 * REC_V }}, AW(uint8_t, {{ a.pp }}), AW(float, {{ a.y }}), no);  // (P 0 from the open records on)
+{% else %}
     AIE_LOOP_NO_UNROLL
     for (int k = 0; k < rp - 4 * g && k < 4; k += 2)  // (the records before the open ones: their P in pp, ``asoft``)
-        {{ p }}_pvs(a + {{ REC_V }} * k, AW(uint8_t, {{ a.pp }}) + {{ PS // 2 }} * k, AW(float, {{ a.y }}), no);
+        {{ p }}_pvs(a + {{ REC_V }} * k, nullptr, AW(uint8_t, {{ a.pp }}) + {{ PS // 2 }} * k, AW(float, {{ a.y }}), no);
+{% endif %}
 }
 
 // After a cache object: when it was the second K object of an attended group, the group's softmax: per set the group's
 // maximum per row, y and l rescaled by 2^(m - m_new) when one rises (a row whose maximum stayed keeps its y and l
 // exactly), the P panels of the records before the open ones (pp: per pair of records [octet][P0 hi | P0 lo | P1 hi |
 // P1 lo]; a lone record's second P 0)
-__attribute__((minsize)) void {{ p }}_asoft(int32_t *__restrict ws)
+{{ "" if ONE else "__attribute__((minsize)) " }}void {{ p }}_asoft(int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -668,6 +791,10 @@ __attribute__((minsize)) void {{ p }}_asoft(int32_t *__restrict ws)
         const aie::vector<float, 32> m0 = aie::load_v<32>(ml);
         const aie::vector<float, 32> mg = aie::max(aie::max(aie::load_v<32>(ss), aie::load_v<32>(ss + 32)),
                                                    aie::max(aie::load_v<32>(ss + 64), aie::load_v<32>(ss + 96)));
+{% if ONE %}
+        if (aie::lt(m0, mg).empty())  // (no row's maximum rises: most groups, at depth)
+            continue;
+{% endif %}
         const aie::vector<float, 32> mn = aie::max(m0, al::max8(mg));
         float *__restrict ys = y + {{ 32 * (ND + 1) }} * set;
         // (else alpha = 1. mn >= m0: one rose where their bits differ, an integer compare; a float compare would be
@@ -682,7 +809,7 @@ __attribute__((minsize)) void {{ p }}_asoft(int32_t *__restrict ws)
         const uint32_t keep = 4 * g + k < rp ? ~0u : 0u;
         AIE_LOOP_NO_UNROLL
         for (int o = 0; o < no; o++)
-            {{ p }}_psoft(ws, k, o, keep, keep, AW(uint8_t, {{ a.pp }}) + {{ PS // 2 }} * (k & 2) + 288 * o + 144 * (k & 1));
+            {{ p }}_psoft(ws, k, o, keep, keep, AW(uint8_t, {{ a.pp }}) + {{ PS // 2 }} * (k & 2) + {{ PO }} * o + {{ PO // 2 }} * (k & 1));
     }
 }
 
@@ -698,6 +825,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
     const int role = st[{{ A_ROLE }}];
     st[{{ A_NE }}] = st[{{ A_NO }}] + (role == {{ ROLE_V }} ? {{ 2 * (REC_V + ROWS_B) // (2 * C_LEN) }} :
                                        role == {{ ROLE_K }} ? {{ 2 * REC_K // (2 * C_LEN) }} : 0);
+{% if not ONE %}
     for (int set = 0; set < (st[{{ A_TC }}] ? nsets : 0); set++) {  // m = max(m_e, m_o): y, l = both rescaled, summed
         float *__restrict ml = AW(float, {{ a.ml }}) + 64 * set;
         const float *__restrict me = (const float *)pw + {{ a.ml // 4 }} + 64 * set;
@@ -711,6 +839,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
     }
     if (st[{{ A_TP }}])  // (a split step's core with an east neighbour: its partial stays for it)
         return;
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < nsets; set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + {{ 32 * ND }};
@@ -762,7 +891,11 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
 {% endif %}
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
+{% if ONE %}
+            const int c = 8 * e + i + k, hk = (c * st[{{ A_SI }}]) >> 16, s = c - S * hk, row = QR * s + (hk >> 5), db = hk & 31;
+{% else %}
             const int c = 8 * e + i + k, hk = {{ p }}_divs(c, S), s = c - S * hk, row = QR * s + (hk >> 5), db = hk & 31;
+{% endif %}
             const int set = row >> 2, q = row & 3;
             yv.insert(k, aie::load_v<8>(AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + 32 * db + 8 * q));
             il.insert(k, aie::broadcast<float, 8>(AW(float, {{ a.ml }})[64 * set + 32 + 8 * q]));
@@ -799,6 +932,9 @@ namespace {
     st[{{ MG_QR }}] = qr;
     st[{{ MG_NO }}] = emit ? 4 * S * qr : 0;
     st[{{ MG_E }}] = 0;
+{% if ONE %}
+    st[{{ MG_SI }}] = m[{{ M_SINV }}];
+{% endif %}
 }
 
 }  // namespace
@@ -816,7 +952,11 @@ __attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_
     aie::set_rounding(aie::rounding_mode::conv_even);
     st[{{ MG_I }}] = i + 1;
     const int S = st[{{ MG_S }}], QR = st[{{ MG_QR }}];
+{% if ONE %}
+    const int s = i, h0 = 0;
+{% else %}
     const int kc = QR == {{ QC }} ? 0 : {{ p }}_divs(i, S), s = i - S * kc, h0 = {{ QC }} * kc;
+{% endif %}
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     AIE_LOOP_NO_UNROLL
     for (int h = 0; h < {{ QC }}; h++) {
@@ -845,7 +985,11 @@ __attribute__((minsize)) void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloa
         aie::vector<bfloat16, 16> g;
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
+{% if ONE %}
+            const int c = 8 * e + i + k, hk = (c * st[{{ MG_SI }}]) >> 16, s = c - S * hk;
+{% else %}
             const int c = 8 * e + i + k, hk = {{ p }}_divs(c, S), s = c - S * hk;
+{% endif %}
             g.insert(k, aie::load_v<8>(gt + {{ HD }} * (QR * s + (hk >> 5)) + 8 * (hk & 31)));
         }
         // (g bf16: mulff's products less g's lo part, 0)
@@ -864,25 +1008,28 @@ class AttnShape:
 
     def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
                  slots: int = SMAX):
-        """slots: a step's slots at most (its sub-steps of up to ``sub``: SMAX at most)."""
+        """slots: a step's slots at most (a design of 8: ``one``)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
+        self.one = slots == 8  # (module docstring "One pass")
+        self.smax = slots if self.one else SMAX
         self.kvh = cfg.num_key_value_heads
         assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay
         self.nph = COLS // self.kvh
         self.qc = cfg.num_attention_heads // COLS
-        assert 1 <= self.qc <= 4 and 2 * 2 * self.qc * HD <= xpay and 4 * (2 * HD + 64 * SMAX) <= xpay
+        assert 1 <= self.qc <= 4 and 2 * 2 * self.qc * HD <= xpay and 4 * (2 * HD + 64 * self.smax) <= xpay
         assert REC.pg(a_bytes) == POS_PER_GROUP
         # (a sub-step's slots: as many as the core holds the chain's query rows for; then a step takes up to u
         # sub-steps, one more where its slots cross a group. A dense model's main core has the program memory to apply
         # the gates: then the core takes more rows)
-        self.sub = min(SMAX, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
+        self.sub = slots if self.one else min(SMAX, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
         assert self.sub >= 1
         self.u = -(-(slots - 1) // self.sub) + 1  # (a step's sub-steps at most)
-        self.rows = self.sub * self.nph * self.qc  # (a sub-step's query rows at most)
+        self.rows = self.sub * self.qc if self.one else self.sub * self.nph * self.qc  # (a sub-step's query rows at most)
         self.main_gates = self.rows > MAX_ROWS
         self.octets = -(-self.rows // 8)
         self.sets = 2 * self.octets
-        self.ps = rup(288 * self.octets, 64)  # (a pair of records' P panels: a panel stream starts 64-byte aligned)
+        self.po = 144 if self.one else 288  # (an octet's P panels of a pair of records)
+        self.ps = rup(self.po * self.octets, 64)  # (a pair of records' P panels: a panel stream starts 64-byte aligned)
         assert A_QA + self.octets <= A_HP and self.octets <= 3  # (pvs)
         self.c_len, self.a_bytes = c_len, a_bytes
         self.r_bytes = 2 * c_len * (2 if self.main_gates else 1)  # (an R object: o fp32 when the main core gates it)
@@ -898,42 +1045,54 @@ class AttnShape:
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
-        own = [("st", 4 * A_WORDS), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
-               ("pp", 2 * self.ps), ("kb", 18 * ND * SMAX)]
-        cold = [("nrm", 4 * (2 * HD + 64 * SMAX)), ("vn", 2 * HD * SMAX)]
-        qa = [(f"qa{o}", 2 * 72 * ND) for o in range(self.octets)]
+        own = [("st", 4 * (A_RWS + 1 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
+               ("pp", 2 * self.ps)]
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK
-        free = {"mw": EXT_W, "mx": EXT_X}
+        self.ext_w, self.ext_x = (EXT_W8, EXT_X8) if self.one else (EXT_W, EXT_X)
+        free = {"mw": self.ext_w, "mx": self.ext_x}
         self.ext: dict[str, tuple[str, int]] = {}
 
         def put(name: str, n: int, order: tuple[str, ...] = ("mw", "mx")) -> None:
             r = next(r for r in order if free[r] >= n)
-            self.ext[name] = (r, (EXT_W if r == "mw" else EXT_X) - free[r])
+            self.ext[name] = (r, (self.ext_w if r == "mw" else self.ext_x) - free[r])
             free[r] -= n
 
-        if not self.main_gates:
-            put("gs", 2 * self.rows * HD)
-            own += cold + qa
-        else:
+        own.append(("kb", 18 * ND * self.smax))
+        cold = [("nrm", 4 * (2 * HD + 64 * self.smax)), ("vn", 2 * HD * self.smax)]
+        if self.one:
             for name, n in cold:
                 put(name, n)
-            n_own = (L1 - fixed - regions(own)["size"]) // qa[0][1]
-            own += qa[:n_own]
-            for name, n in qa[n_own:]:
-                put(name, n, ("mx", "mw"))
+            put("rws", ROWS_B, ("mx", "mw"))
+            pan = 72 * ND
+            n_own = (L1 - fixed - regions(own)["size"]) // pan
+            own += [(f"qa{o}", pan) for o in range(min(n_own, self.octets))]
+            for o in range(n_own, self.octets):
+                put(f"qa{o}", pan, ("mx", "mw"))
+        else:
+            qa = [(f"qa{o}", 2 * 72 * ND) for o in range(self.octets)]
+            if not self.main_gates:
+                put("gs", 2 * self.rows * HD)
+                own += cold + qa
+            else:
+                for name, n in cold:
+                    put(name, n)
+                n_own = (L1 - fixed - regions(own)["size"]) // qa[0][1]
+                own += qa[:n_own]
+                for name, n in qa[n_own:]:
+                    put(name, n, ("mx", "mw"))
+            assert "qa0" in dict(own) and self.octets >= 2  # (tobj: in record mode the open record's rows in the first
+            assert ROWS_B <= 2 * 72 * ND and 2 * REC_V <= 2 * 72 * ND  # octet's Q panels, a slot's V pair in the second's,
+            assert max(ROWS_B, 2 * REC_V) + REC_V <= self.a_bytes  # its V panels in the tail object past its rows / pair)
         self._ws = regions(own)
         assert self._ws["size"] + fixed <= L1, (self._ws["size"], fixed)
         assert 4 * 128 * self.sets >= 4 * HD  # (kf: the scores' region)
-        assert "qa0" in self._ws and self.octets >= 2  # (tobj: in record mode the open record's rows in the first
-        assert ROWS_B <= 2 * 72 * ND and 2 * REC_V <= 2 * 72 * ND  # octet's Q panels, a slot's V pair in the second's,
-        assert max(ROWS_B, 2 * REC_V) + REC_V <= self.a_bytes  # its V panels in the tail object past its rows / pair)
 
     def at(self, tail: int) -> list[tuple[int, tuple[str, int]]]:
         """The address state words abegin sets: (word, (base, offset)); tail: the main core's workspace offset past its
         residual."""
         bases = {"mw": ("mw", tail), "mx": ("mx", 0)}
         out = []
-        names = [(A_NRM, "nrm"), (A_VN, "vn")] + [(A_GS, "gs")] * (not self.main_gates)
+        names = [(A_NRM, "nrm"), (A_VN, "vn")] + [(A_GS, "gs")] * (not self.main_gates) + [(A_RWS, "rws")] * self.one
         for w, name in names + [(A_QA + o, f"qa{o}") for o in range(self.octets)]:
             if name in self.ext:
                 r, off = self.ext[name]
@@ -977,8 +1136,9 @@ class AttnShape:
         """packed8: the main core's inputs packed in a design of 8 slots (``decode.design.M_SP``)."""
         names = {"ws": "ws", "mw": "mw", "mx": "mx"}
         at = [(w, (names[r], off)) for w, (r, off) in self.at(tail)]
-        v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=SMAX,
-                 HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps), C_LEN=self.c_len,
+        v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
+                 HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, PO=self.po, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps),
+                 C_LEN=self.c_len, ONE=self.one, OBJ=self.a_bytes,
                  GATE_MAIN=self.main_gates, qc=bf16_hilo(math.log2(math.e) / 16), PACKED8=packed8,
                  **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k.startswith(("A_", "ROLE_", "MG_"))}))
         return _SRC.render(**v) + (_MAIN_SRC.render(**v) if self.main_gates else "")

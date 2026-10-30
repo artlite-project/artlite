@@ -737,7 +737,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
                 errs[t + s, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t + s], np.float32))
         ov.accept(acc)
         t += acc
-    assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split")
+    assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split" and not ov.ash.one)
     top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
                  "3.8-27B": (5.6e-2, 2.1e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))

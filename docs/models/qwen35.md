@@ -37,8 +37,7 @@ same name (ggml-org publishes its drafters apart from the models); of several, Q
 
 Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
 share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head (Qwen3.8
-27B's up to 8, for its drafter's long chains: a step of 8 costs 1.08x a step of one at 1K and 1.18x at 32K, where steps
-of 5-8 take a second pass over the KV cache); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
+27B's up to 8, for its drafter's long chains: a step of 8 costs 1.04x a step of one at 1K and 1.09x at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
 cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);
@@ -47,7 +46,7 @@ cores read what to do from their input streams. Per column:
   tokens, as the prefill; the main core's helper, idle then, computes the heads' constants);
 - the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
-  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core.
+  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step).
 
 The prompt runs in chunks of up to 2048 tokens (the 35B-A3B: 4096, its experts' weights streamed once per chunk;
 layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the prefill (`qwen35/prefill.py`):

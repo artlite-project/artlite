@@ -32,6 +32,7 @@ from . import gdn as GD
 
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
 M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 11)  # (an F_ATT object's)
+M_ANA, M_SINV = 36, 37  # (an F_ATT object's, one pass: the core's A objects through its held ones, 65536 / the slots)
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
@@ -75,7 +76,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             src += self.gdn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")})
         if self.attn is not None:
             W = self.workspace()  # (the main core's: its regions past the residual, idle in an attention sub-step)
-            assert W["size"] - W["inv"] >= AT.EXT_W and (not self.attn.main_gates or self.xs_bytes >= AT.EXT_X), W
+            assert W["size"] - W["inv"] >= self.attn.ext_w and (not self.attn.main_gates or self.xs_bytes >= self.attn.ext_x), W
             assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
             src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
                                     | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"],
@@ -234,23 +235,31 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             t_in[0].release(1)
                             for t in t_out:
                                 t.release(1)
-                        else:
+                        elif t_out:
                             t_out[0].release(1)
+                            aend(ws, pw)
+                        else:
                             aend(ws, pw)
                         for _ in range_(ws[i_a + AT.A_NE]):
                             r = r_f.acquire(1)
                             aemit(ws, r)
                             r_f.release(1)
                         a_f.release(AT.HOLD)
+                        if attn.one:  # (a chain's last core: the K objects of its first core's records)
+                            for _ in range_(ws[i_a + AT.A_NAF]):
+                                a_f.acquire(1)
+                                a_f.release(1)
 
             aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
                           tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
             n = attn.nph
-            toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS) if c % n < n - 1}  # (c -> c + 1)
+            toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS)
+                    if c % n < n - 1 and not attn.one}  # (c -> c + 1)
             for c in range(COLS):
-                t_in = [toks[c - 1].cons()] if c % n else []
+                t_in = [toks[c - 1].cons()] if c % n and not attn.one else []
                 t_out = [toks[c].prod()] if c in toks else []
-                workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1), s.r_fifos[c].prod(),
+                workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1),
+                                                s.r_fifos[c].prod(),
                                                 t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
                                                 k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c],
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
