@@ -85,7 +85,7 @@ class NpuQwen(OverlayModel):
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None
         self.DRAFTS = self.overlay.SLOTS - 1
         if cfg.moe:
-            self.STEP_COST = (1.0, 1.32, 1.58, 1.84)  # (35B-A3B at 1K: the slots route to different experts)
+            self.STEP_COST = (1.0, 1.33, 1.60, 1.86)  # (35B-A3B at 1K: the slots route to different experts)
         else:  # (27B at 1K: the weights stream once)
             self.STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)[:self.overlay.SLOTS]
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=self.drafter) if prefill else None
