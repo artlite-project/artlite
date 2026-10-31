@@ -42,11 +42,11 @@ cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);
 - the GDN core runs the Gated DeltaNet step: conv, gates, the delta rule on the fp32 state that it
-  reads and writes back to DDR every token (in a design of 8 tokens chunkwise, one pass over the state for a step's
-  tokens, as the prefill; the main core's helper, idle then, computes the heads' constants);
+  reads and writes back to DDR every token (in a design of 8 tokens and on the MoE models chunkwise, one pass over the state
+  for a step's tokens, as the prefill; in a design of 8 tokens the main core's helper, idle then, computes the heads' constants);
 - the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
-  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step).
+  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step; on the 35B-A3B and Occamy steps of 3 and 4 tokens split a chain of 4 into two halves on shared streams, also one pass).
 
 The prompt runs in chunks of up to 2048 tokens (the 35B-A3B: 4096, its experts' weights streamed once per chunk;
 layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the prefill (`qwen35/prefill.py`):

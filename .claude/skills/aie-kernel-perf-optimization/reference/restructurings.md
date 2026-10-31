@@ -309,8 +309,8 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   both halves: 35B-A3B at 32K, S 3 / 4 83.8 / 97.0 -> 77.2 / 89.2 ms with what follows. Two streams read ~46 GB/s against the chain's 56, so a shorter sub-step stays on the whole
   chain: the share is chosen per fill. A stream shared by two cores also ends what hid their compute: a group of two octets
   ran at ~4360 cycles against ~2900 of stream, 30% over its schedule. So the one-pass core's single bfp16 Q and P came across
-  (QK 624 -> 316 cycles a group, P V 582 -> 365, the Q panels 5100 -> 594 a sub-step), with m held from a core's first
-  group (no rescale: 35B-A3B and Occamy at 32K: a few score vectors past m + 24, none past m + 40; MiniCPM-V none past m + 24; partials of different m merge rescaled), the gates by a table, V encoded once. Not its K
+  (QK 624 -> 316 cycles a group, P V 582 -> 365, the Q panels 5100 -> 594 a sub-step), the rows' maxima still rising group by group
+  (numerics.md: a held m broke a chat at 32K), the gates by a table, V encoded once. Not its K
   path (1.4 KB of code) or its head-major rows (a chain's S 1 would run two octets). Count a port's bytes first: this core
   had 176 B of program memory left, and a helper taken out of line to save code (`e192`, 64 B) spilled around its call on the
   hottest path (`psoft` +37%): read the frame in measure_ii.

@@ -119,11 +119,9 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 - Not with attention sinks past the first chunk: MiniCPM-V's ViT scores reach 71 log2 units above its first 32 keys'
   maximum (P saturates at 2^63; embeddings' KL 0.0090 -> 0.0074 once raised). Check each later group against m + 16
   in bf16 and rescale o and l on the rare raise (the vision overlay's `ops.Attention(raise_max=)`, the qwen35 prefill attention).
-  A text model's scores come near it only through a step's own keys. At 32K positions, with m held from the first group: Qwen3.8-27B
-  a few vectors in 16 steps past m + 56, none past m + 64 (P clamps at 63.5; a lone dominant key loses nothing there); the
-  sub-step core, m per core from its own first group (partials merge rescaled), 35B-A3B and Occamy a few past m + 24, none
-  past m + 40. Count such scores on the NPU, with a low threshold as a control and the step's own keys in (the largest:
-  without them Occamy has 1 vector past 24, with them 11), before dropping a rescale.
+  Holding m from the first keys broke the 35B-A3B's sub-step core on a chat at 32K: garbage tokens in steps of 2 and more, with
+  raw essays clean at every threshold (their first keys are text like the rest; a chat's are its system prompt). Keep the
+  rescale unless the prompts tested have a chat's first keys; compare a real generation's text with and without drafts.
 - Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
   bf16 rounding can put the largest argument above 0.
 

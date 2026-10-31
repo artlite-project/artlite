@@ -591,6 +591,16 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("35B-A3B", 1001, 4, 2, False), ("35B-A3B", 1001, 3, 2, True),
                                                              ("35B-A3B", 150, 4, 2, False), ("35B-A3B", 384, 3, 2, False)])
 def test_attention(size: str, p: int, S: int, split: int, rec: bool) -> None:
+    _attention(size, p, S, split, rec)
+
+
+@pytest.mark.parametrize(("size", "p", "S", "split"), [("35B-A3B", 90, 2, False), ("35B-A3B", 150, 2, True)])
+def test_attention_later_keys(size: str, p: int, S: int, split: int) -> None:
+    """Keys past the first group far above it, as a chat's text above its system prompt: the softmax follows them."""
+    _attention(size, p, S, split, False, far=30.0, tol=0.1)
+
+
+def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.0, tol: float = 3e-2) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
     holds them, the open ones encoded from their exact rows up to the step's last position: the ring slot's rows before p,
@@ -626,6 +636,7 @@ def test_attention(size: str, p: int, S: int, split: int, rec: bool) -> None:
     kc = rng.standard_normal((kvh, P, HD)).astype(np.float32)
     vc = mmv.bf(rng.standard_normal((kvh, P, HD)).astype(np.float32))
     kc[:, p:] = vc[:, p:] = 0
+    kc[:, 32:] *= far
     groups = [KV.kv_groups(kc[h], vc[h], T, 1, dmajor=True) for h in range(kvh)]
     hb = groups[0].nbytes
     rb = 2 * T  # (a head's ring)
@@ -752,7 +763,7 @@ def test_attention(size: str, p: int, S: int, split: int, rec: bool) -> None:
                                             k_norm=kn, cs=cs[s], eps=cfg.rms_norm_eps)
             kn_all.append(knew)
             got = _bf16(o_c[:, :, s].reshape(qc, HD))
-            assert ref.rel_err(got, want) < 3e-2, (c, s, ref.rel_err(got, want))
+            assert ref.rel_err(got, want) < tol, (c, s, ref.rel_err(got, want))
         recs_c = [rp, rl][:nt]
         if ash.role(c) == A1.ROLE_K:  # the K records of positions p .. p + S - 1 (as the cache holds them now)
             k_all = np.concatenate([kc_s[h][:p], np.stack(kn_all)])
