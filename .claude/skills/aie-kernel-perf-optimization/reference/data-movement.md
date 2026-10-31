@@ -174,6 +174,14 @@ offsets): aie2p-coding section 8. For speed:
   ~1100 of the ~1400 cycles a 9280-B object takes at 8 B / cycle.
 - **A shim producer can broadcast across columns**: one KV head's stream feeds the 8 cores of its two columns (qwen35
   prefill attention), halving the shim reads.
+- **A broadcast chosen per fill** (`decode.design` "Shared A objects"): the shim -> memtile segment packet-switched, a
+  second packet id whose flow reaches two memtiles. Nothing past the memtiles changes (the cores of both columns take the
+  objects as their own, MoE's per-column object counts included) and every other fill stays local, so a step that gains
+  from one read for two columns takes it and the others keep a stream per column. Two sources keep no order between them:
+  a shared fill follows a sync, the other column's next fills wait for its fills (`Sequence.wait_fills`).
+- **A stream is one shim channel**: a chain of cores on one stream reads at ~13.8 GB/s whatever the port has left. N
+  columns sharing a KV head trade rows per core against groups per core against streams: N streams and all the rows
+  (what L1 limits), one stream and N-th of the rows (half the port at 2 heads), or the product in between.
 - **Deeper L1 / memtile FIFOs do not help a DMA-bound operator**, and they cost BD ids (24 per memtile channel
   parity): the Gemma decode overlay at A depth 20-22 instead of 12 was unchanged (rejected.md).
 - **Strided fills**: a pass that needs rows [r0, r0 + n) of every super-block of a tile reads them with one 4-D

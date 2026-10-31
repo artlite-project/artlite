@@ -5,8 +5,10 @@ import numpy as np
 import pytest
 
 from artlite import txn
+from artlite.decode.model import ModelOverlay
 from artlite.moe import route as MR
 from artlite.operators.design import COLS
+from artlite.operators.fused.ctrlpkt import _slot
 
 from ..qwen35 import ref
 
@@ -37,6 +39,34 @@ def test_deal(u: int) -> None:
     for col in items:  # (whole experts, then halves)
         whole = [h1 - h0 == 1 for _, h0, h1 in col]
         assert whole == sorted(whole, reverse=True)
+
+
+def test_check_route() -> None:
+    """The configuration may leave the control route's arbiter unused only: a stream on it would feed TileControl, a written
+    route register would be overwritten."""
+    MR.check_route({}, range(COLS))
+    other = txn.tile_address(1, 0, MR.SW_SLOTS[20])
+    MR.check_route({other: _slot(3, MR.CTL_ARB + 1)}, range(COLS))
+    with pytest.raises(AssertionError, match="control route"):
+        MR.check_route({other: _slot(3, MR.CTL_ARB)}, range(COLS))
+    with pytest.raises(AssertionError, match="writes"):
+        MR.check_route({txn.tile_address(2, 0, MR.SW_MASTER_TILE_CTRL): 0}, range(COLS))
+
+
+def test_bd_words_packet() -> None:
+    """A step's patches of a BD (address, length) keep its packet header's bits."""
+    words = np.zeros(8, np.uint32)
+    words[2] = 1 << 30 | 6 << 19 | 0x12
+    ModelOverlay._bd_words(words, np.array([0]), np.array([0x34_5678_9ABC], np.int64), np.array([64], np.int64))
+    assert words[:3].tolist() == [16, 0x5678_9ABC, 1 << 30 | 6 << 19 | 0x34]
+
+
+def test_packet_words_header() -> None:
+    """On a packet-switched A stream the items' BDs enable its header (word 2), nothing else differs."""
+    items = [(7, 0, 1), (200, 1, 1)]
+    a, b = (MR.packet_words(items, base=0x8000_0001_2340_0000, stride=0x10_0000, a_packet=p) for p in (None, 6))
+    d = np.flatnonzero(a != b)
+    assert len(d) == len(items) and all(b[i] ^ a[i] == 1 << 30 | 6 << 19 for i in d)
 
 
 def test_packet_words() -> None:

@@ -231,7 +231,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   per pass over a KV cache (Llama 3B prefill attention 32 -> 64: -25%).
 - **Two cores that need the same stream: split it, don't broadcast it** once a core's stream or compute binds (decode
   attention at long context): each core takes half the positions and they merge partial softmax results. Past that
-  core's rows the other way pays: both on one broadcast stream, each with half the rows (R13's "One pass").
+  core's rows the other way pays: both on one broadcast stream, each with half the rows (R13's "One pass"). Four cores
+  can take both: two halves, each splitting the positions, on two streams (R13's "chain's halves").
 - **A broadcast is bounded by each consumer's input port** (8 B / cycle): feed each core on both its input channels
   (two streams, each with half of every object): Gemma's full attention -41%.
 - **Read every byte once**: fixed-size gather units waste bytes when a part is smaller (a 1 KB tile header in a 4 KB

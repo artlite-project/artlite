@@ -200,12 +200,12 @@ class Sequence:
         if None in q:
             del q[:len(q) - q[::-1].index(None)]
 
-    def _retire(self, streams: list[str]) -> None:
-        """Rolling: wait for every queued task of the streams: a token on each channel's last one, one wait per run
-        of columns."""
+    def _retire(self, streams: list[str], only: tuple[int, ...] | None = None) -> None:
+        """Rolling: wait for every queued task of the streams (only: of those columns): a token on each channel's last
+        one, one wait per run of columns."""
         for stream in streams:
             direction, channel = self.op.ENDPOINTS[stream]
-            cols = sorted(c for (c, s), q in self._queued.items() if s == stream and q)
+            cols = sorted(c for (c, s), q in self._queued.items() if s == stream and q and (only is None or c in only))
             for c in cols:
                 last = self._queued[(c, stream)][-1]
                 assert last is not None, f"stream {stream}, column {c}: no host task after the array's to wait for"
@@ -216,6 +216,11 @@ class Sequence:
                 if i == len(cols) or cols[i] != cols[i - 1] + 1:
                     self.txn.sync(col=cols[start], direction=direction, channel=channel, ncol=i - start)
                     start = i
+
+    def wait_fills(self, stream: str, cols: tuple[int, ...]) -> None:
+        """Rolling: wait for the columns' fills of a stream (a fill of another column may follow them into its memtile:
+        a packet-switched stream's sources keep no order between them)."""
+        self._retire([stream], cols)
 
     def sync(self, fills: bool = False) -> None:
         """Issue the drains collected since the last sync and wait for them (a channel's last

@@ -388,11 +388,12 @@ class ModelOverlay:
 
     @staticmethod
     def _bd_words(words: np.ndarray, at: np.ndarray, address: np.ndarray, nbytes: np.ndarray) -> None:
-        """``txn.bd_words`` of many BDs at once: length in words, address low, high at words[at ..]."""
+        """``txn.bd_words`` of many BDs at once: length in words, address low, high at words[at ..] (the word's packet
+        bits stay: a fill on a packet-switched stream keeps its header)."""
         assert np.all(nbytes > 0) and np.all(nbytes % 4 == 0)
         words[at] = nbytes // 4
         words[at + 1] = address & 0xFFFFFFFF
-        words[at + 2] = address >> 32
+        words[at + 2] = words[at + 2] & 0xFFFF0000 | address >> 32
 
     # ------------------------------------------------------------------
     # Run

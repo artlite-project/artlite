@@ -69,7 +69,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         self.gate = attn is not None and attn.main_gates  # (the main core applies the attention's gates)
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
-                         paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast)
+                         paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast,
+                         a_bcast=attn.a_bcast if attn is not None else ())
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
@@ -80,7 +81,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             src += self.gdn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")})
         if self.attn is not None:
             W = self.workspace()  # (the main core's: its regions past the residual, idle in an attention sub-step)
-            assert W["size"] - W["inv"] >= self.attn.ext_w and (not self.attn.main_gates or self.xs_bytes >= self.attn.ext_x), W
+            assert W["size"] - W["inv"] >= self.attn.ext_w and self.xs_bytes >= self.attn.mx_bytes, W
             assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
             src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
                                     | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"],
@@ -181,7 +182,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             mxs_ty = np.ndarray[(self.xs_bytes,), np.dtype[np.uint8]]
             k_abegin = Kernel(f"{p}_abegin", "kernel.o", [x_ty, aws_ty, np.int32, mws_ty, mxs_ty])
             k_anb = Kernel(f"{p}_anb", "kernel.o", [aws_ty])
-            k_aq = Kernel(f"{p}_aq", "kernel.o", [x_ty, aws_ty])
+            gt = kmath.SIGMOID.table_words()
+            gt_ty = np.ndarray[(gt.size,), np.dtype[np.uint32]]
+            k_aq = Kernel(f"{p}_aq", "kernel.o", [x_ty, aws_ty, *[gt_ty] * (2 * attn.gate_tab)])
             k_aqpan = Kernel(f"{p}_aqpan", "kernel.o", [aws_ty])
             k_akv = Kernel(f"{p}_akv", "kernel.o", [x_ty, aws_ty, np.int32])
             k_aobj = Kernel(f"{p}_aobj", "kernel.o", [a_ty, aws_ty])
@@ -191,7 +194,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
             k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, s.r_ty])
 
             def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, mws, mxs,
-                        col):
+                        col, tabs):
                 # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
                 # attention step: a core produces its east token around its scores (a split step's partial stays in its
                 # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
@@ -218,7 +221,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             t.acquire(1)
                         for _ in range_(ws[i_a + AT.A_NQ]):
                             x = x_f.acquire(1)
-                            aq(x, ws)
+                            aq(x, ws, *tabs)
                             x_f.release(1)
                         aqpan(ws)
                         for _ in range_(ws[i_a + AT.A_NKV]):
@@ -256,6 +259,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
             aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
                           tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
+            tabs = {c: [Buffer(gt_ty, name=f"{P}_agt{c}", tile=Tile(c, self.ATTN_ROW), initial_value=gt)] * 2 if attn.gate_tab else []
+                    for c in range(COLS)}
             n = attn.nph
             toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS)
                     if c % n < n - 1 and not attn.one}  # (c -> c + 1)
@@ -265,7 +270,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                 workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1, **s.x_kw),
                                                 s.r_fifos[c].prod(),
                                                 t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
-                                                k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c],
+                                                k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c, tabs[c]],
                                       tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos

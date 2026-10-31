@@ -323,9 +323,14 @@ class Store:
 
 
 def cdo_writes(work_dir: str) -> set[int]:
-    """The register and memory addresses a compiled design's configuration writes (aiecc's CDO files: writes,
-    masked writes and block writes, 64-bit addresses)."""
-    out: set[int] = set()
+    """The register and memory addresses a compiled design's configuration writes."""
+    return set(cdo_values(work_dir))
+
+
+def cdo_values(work_dir: str) -> dict[int, int]:
+    """Address -> the last value a compiled design's configuration writes there (aiecc's CDO files: writes, masked
+    writes and block writes, 64-bit addresses)."""
+    out: dict[int, int] = {}
     prj = os.path.join(work_dir, "design.mlir.prj")
     for name in ("main_aie_cdo_init.bin", "main_aie_cdo_enable.bin", "main_aie_cdo_elfs.bin"):
         path = next((p for p in (os.path.join(prj, "cdo_main", name), os.path.join(prj, name)) if os.path.exists(p)), None)
@@ -343,7 +348,7 @@ def cdo_writes(work_dir: str) -> set[int]:
             p = w[i:i + n]
             if api in (5, 7, 8):  # (block write, masked write, write: the address in two words)
                 a = p[0] << 32 | p[1]
-                out.update(a + 4 * k for k in range(n - 2 if api == 5 else 1))
+                out.update({a + 4 * k: p[2 + k] for k in range(n - 2)} if api == 5 else {a: p[-1]})
             i += n
     return out
 

@@ -40,10 +40,11 @@ PLAN_SUBS, PLAN_META, PLAN_WORDS = 192, 208, 272
 BD_W4, BD_W5, BD_VALID, BD_USE_NEXT = 3 << 30, 2 << 24, 1 << 25, 1 << 26
 
 
-# the control packets' route on a shim's MM2S1 (stream-switch slave South 7; aiecc: slot 0, the X objects' id -> arbiter 0
-# -> North; its control-packet overlay: arbiter 5): slot 1 (CID) -> arbiter 1 -> master Tile_Ctrl, packet mode, the
-# header kept (AM029 PL_MODULE Stream_Switch_*)
-SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL, CTL_ARB = 0x3F294, 0x3F000, 1
+# the control packets' route on a shim's MM2S1 (stream-switch slave South 7; aiecc: slot 0, the X objects' id -> a low
+# arbiter -> North, each packet flow of the shim its own from 0 up; its control-packet overlay: arbiter 5): slot 1 (CID) ->
+# arbiter 4 -> master Tile_Ctrl, packet mode, the header kept (AM029 PL_MODULE Stream_Switch_*)
+SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL, CTL_ARB = 0x3F294, 0x3F000, 4
+SW_SLOTS = range(0x3F200, 0x3F400, 4)  # (the slave ports' slots)
 
 
 def control_route(t: txn.Txn, col: int) -> None:
@@ -52,11 +53,15 @@ def control_route(t: txn.Txn, col: int) -> None:
     t.write32(txn.tile_address(col, 0, SW_MASTER_TILE_CTRL), 1 << 31 | 1 << 30 | 1 << 3 | CTL_ARB)
 
 
-def check_route(writes: set[int], cols: range) -> None:
-    """The configuration (``paging.cdo_writes``) leaves the control route's registers to ``control_route``."""
+def check_route(values: dict[int, int], cols: range) -> None:
+    """The configuration (``paging.cdo_values``) leaves the control route's registers to ``control_route`` and no stream
+    on its arbiter: the words of such a stream would reach TileControl."""
     for c in cols:
         for reg in (SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL):
-            assert txn.tile_address(c, 0, reg) not in writes, f"column {c}: the configuration writes {reg:#x}"
+            assert txn.tile_address(c, 0, reg) not in values, f"column {c}: the configuration writes {reg:#x}"
+        for reg in SW_SLOTS:
+            v = values.get(txn.tile_address(c, 0, reg), 0)
+            assert not (v >> 8 & 1 and v & 7 == CTL_ARB and not v >> 4 & 3), f"column {c}: {reg:#x} = {v:#x} on the control route's arbiter"
 
 
 def top_k(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -98,10 +103,10 @@ def _ctl(addr: int, n: int) -> int:
     return _parity(((n - 1) << 20) | (addr & 0xFFFFF))
 
 
-def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int) -> np.ndarray:
+def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int, a_packet: int | None = None) -> np.ndarray:
     """The control packets of a column's items (``PACKET_WORDS`` uint32, as the core writes them): the halves of item i
     (k = 2 e + h0 .. 2 e + h1) at base + k stride, in BD EXPERT_BDS[i] chained to the next item's; the unused BDs'
-    words zero (never pushed)."""
+    words zero (never pushed). a_packet: the A stream's packet id, where it is packet-switched."""
     sh = _parity(CID)
     out: list[int] = []
     n = len(items)
@@ -111,7 +116,8 @@ def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int) -
         if i < n:
             e, h0, h1 = items[i]
             a = base + (2 * e + h0) * stride
-            w = [(h1 - h0 + 1) * stride // 4, a & 0xFFFFFFFF, (a >> 32) & 0xFFFF, 0, BD_W4, BD_W5, 0,
+            w2 = 0 if a_packet is None else 1 << 30 | a_packet << 19
+            w = [(h1 - h0 + 1) * stride // 4, a & 0xFFFFFFFF, (a >> 32) & 0xFFFF | w2, 0, BD_W4, BD_W5, 0,
                  BD_VALID | (BD_USE_NEXT | EXPERT_BDS[i + 1] << 27 if i + 1 < n else 0)]
         reg = txn.SHIM_BD0 + txn.BD_BYTES * bd
         out += [sh, _ctl(reg, 4), *w[:4], sh, _ctl(reg + 16, 4), *w[4:]]
@@ -270,7 +276,7 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
             const int h0 = (it[i] >> 8) & 1, h1 = (it[i] >> 9) & 1;
             const uint32_t off = (uint32_t)(2 * (it[i] & 255) + h0) * str;
             w1 = blo + off;
-            w2 = (bhi + (w1 < off ? 1u : 0u)) & 0xFFFFu;
+            w2 = ((bhi + (w1 < off ? 1u : 0u)) & 0xFFFFu) | {{ bd_w2 }}u;
             w0 = (uint32_t)(h1 - h0 + 1) * (str >> 2);
             w4 = {{ BD_W4 }}u;
             w5 = {{ BD_W5 }}u;
@@ -305,9 +311,10 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
 """)
 
 
-def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: int) -> str:
+def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: int, a_packet: int | None = None) -> str:
     """The routing kernel ``{p}_route`` (in the helper's anonymous namespace; ``WS``, ``{p}_zv`` and the workspace
-    regions ``w_`` from the overlay's kernel source; ``consts``: its M_ / F_ / S_ words, META, SLOTS)."""
+    regions ``w_`` from the overlay's kernel source; ``consts``: its M_ / F_ / S_ words, META, SLOTS; a_packet: the A
+    stream's packet id where it is packet-switched: the items' BDs carry its header)."""
     assert experts % 32 == 0 and experts <= 256 and top <= 8 and cols == 8
     assert RBUF_META + consts["META"] <= 32 * RBUF_OBJECTS and PACKET_WORDS <= RBUF_META
     regs = [txn.SHIM_BD0 + txn.BD_BYTES * bd for bd in EXPERT_BDS]
@@ -316,4 +323,5 @@ def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: i
                        sh=_parity(CID), ch_push=_ctl(txn.QUEUE[txn.MM2S][0], 1),
                        ch_lock=_ctl(txn.SHIM_LOCK0 + 16 * LOCK_DONE, 1), RBUF_OBJECTS=RBUF_OBJECTS,
                        RBUF_META=RBUF_META, BD_W4=BD_W4, BD_W5=BD_W5, BD_VALID=BD_VALID, BD_USE_NEXT=BD_USE_NEXT,
+                       bd_w2=0 if a_packet is None else 1 << 30 | a_packet << 19,
                        **consts)

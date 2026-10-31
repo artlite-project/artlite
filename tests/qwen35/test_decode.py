@@ -587,15 +587,18 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
                                                              ("27B", 1000, 4, True, False), ("3.8-27B", 39, 2, False, False),
                                                              ("3.8-27B", 1001, 7, False, False), ("3.8-27B", 160, 8, False, True),
                                                              ("3.8-27B", 1000, 5, False, True), ("3.8-27B", 62, 5, False, False),
-                                                             ("3.8-27B", 94, 8, False, True), ("3.8-27B", 30, 2, False, False)])
-def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
+                                                             ("3.8-27B", 94, 8, False, True), ("3.8-27B", 30, 2, False, False),
+                                                             ("35B-A3B", 1001, 4, 2, False), ("35B-A3B", 1001, 3, 2, True),
+                                                             ("35B-A3B", 150, 4, 2, False), ("35B-A3B", 384, 3, 2, False)])
+def test_attention(size: str, p: int, S: int, split: int, rec: bool) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
-    holds them, the open ones encoded from their exact rows up to its position: the ring slot's rows before p, or with
-    ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
+    holds them, the open ones encoded from their exact rows up to the step's last position: the ring slot's rows before p,
+    or with ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
     records of the new positions; its last: their records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
-    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots). The
+    emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots; split 2:
+    of 3 or 4 on the chain's halves, each half's two cores with its heads, on the streams of the chain's first two). The
     3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
     column's stream, a step across a cache group too; what a position sees of an open record is its panels up to the
     step's last position, o an octet's 8 rows."""
@@ -607,7 +610,8 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
     g = p // 32
     one = size == "3.8-27B"
-    assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == split)
+    assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == bool(split))
+    half = split == A1.SPLIT_HALF
     P = 32 * ((p + S - 1) // 32 + 1)  # (cache positions: whole groups)
     slots = 8 if one else A1.SMAX
     ash = A1.AttnShape(cfg, P, slots=slots)
@@ -642,31 +646,32 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     kn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     cs = [tuple(v[0] for v in A1.rope_cs(cfg, [p + s])) for s in range(S)]
     G = (p + S - 1) // 32 + 1
-    b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
+    b = ash.bounds(g, split) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
     o_k = A1.OBJS  # (a group's cache objects)
-    nt = A1.TAILS
+    nt = ash.records(S)
     # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared)
     per = (1 + slots) * OD.XB
     act = dev.alloc("ACT", COLS * per + S * OD.XB)
     for c in range(COLS):
         k, role = c % nph, ash.role(c)
-        tl = nt if not split or role == A1.ROLE_V else 0
+        kr = k & 1 if half else k  # (its run of the groups)
+        tl = nt if not split or (kr if half else role == A1.ROLE_V) else 0
         m = np.zeros(OD.META, np.int32)
-        m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (nph + 1 if split else 2) * S
+        m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (3 if half else nph + 1 if split else 2) * S
         m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, split, S), p, int(split)
         m[MD.M_NTAIL], m[MD.M_ATREC] = tl, int(rec)
         if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
-        elif k == 0:  # (then group g's K and V objects)
+        elif kr == 0:  # (then group g's K and V objects)
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
         else:
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
+            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[kr + 1] - b[kr]) + tl, b[kr], 1 << 20
         if one:  # (on the first column's stream)
             m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
         o = c * per
         act[o:o + 4 * OD.META] = m.view(np.uint8)
         nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
-        nrm[:HD], nrm[HD:2 * HD] = qn * (np.float32(np.log2(np.e) / 16) if one else 1), kn
+        nrm[:HD], nrm[HD:2 * HD] = qn * np.float32(np.log2(np.e) / 16), kn
         for s in range(S):
             nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
         act[o + 4 * OD.META:o + 4 * OD.META + nrm.nbytes] = nrm.view(np.uint8)
@@ -684,34 +689,38 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     seq = Sequence(op, rolling=True)
     for c in range(0, COLS, nph if one else 1):
         k, role = c % nph, ash.role(c)
+        if half and k >= 2:  # (the column two to the west's stream)
+            continue
+        pk = {"packet": OD.AB_ID + ash.a_bcast.index((c, c + 2))} if half else {}
         base, ring = dev.address("KV", c // nph * hb), dev.address("KV", kvh * hb + c // nph * rb)
         if not split:
             seq.fill("A", c, base, o_k * G * T)
         else:
-            seq.fill("A", c, base + o_k * b[k] * T, o_k * (b[k + 1] - b[k]) * T)
+            seq.fill("A", c, base + o_k * b[k] * T, o_k * (b[k + 1] - b[k]) * T, **pk)
             if k == 0:
-                seq.fill("A", c, base + o_k * g * T, 2 * T)
-        if not split or role == A1.ROLE_V:  # (the tail objects)
+                seq.fill("A", c, base + o_k * g * T, 2 * T, **pk)
+        if not split or (k if half else role == A1.ROLE_V):  # (the tail objects)
             for t in range(nt):
                 r = rl if t else rp
                 v0 = base + o_k * (rp // 4) * T + T + rp % 4 // 2 * 2 * A1.REC_V  # (its pair of records)
-                seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T)
+                seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T, **pk)
         if not split and k == 0 and not one:
             seq.fill("A", c, base + o_k * g * T, 2 * T)
     for c in range(COLS):
         seq.fill("X", c, dev.address("ACT", c * per), OD.XB)
         if split:  # (the q objects of the chain's columns in order)
-            for c1 in range(c - c % nph, c - c % nph + nph):
+            nc = 2 if half else nph
+            for c1 in range(c - c % nc, c - c % nc + nc):
                 seq.fill("X", c, dev.address("ACT", c1 * per + OD.XB), S * OD.XB)
         else:
             seq.fill("X", c, dev.address("ACT", c * per + OD.XB), S * OD.XB)
         seq.fill("X", c, dev.address("ACT", COLS * per), S * OD.XB)
     for c in range(COLS):
         role = ash.role(c)
-        no = (ob if role == A1.ROLE_V else 0) if split else ob // nph
+        no = (ob // 2 if c & 1 else 0) if half else (ob if role == A1.ROLE_V else 0) if split else ob // nph
         if no:
             seq.drain("C", c, dev.address("OUT", c * ob), no)
-        rb_c = {A1.ROLE_K: (2 if one else 4) * A1.REC_K, A1.ROLE_V: 2 * (A1.REC_V + A1.ROWS_B), A1.ROLE_O: 0}[role]
+        rb_c = nt * {A1.ROLE_K: (1 if one else 2) * A1.REC_K, A1.ROLE_V: A1.REC_V + A1.ROWS_B, A1.ROLE_O: 0}[role]
         if rb_c:
             seq.drain("C", c, dev.address("REC", c * nr), rb_c)
     seq.sync(fills=True)
@@ -722,8 +731,11 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
     recs = dev.view("REC").reshape(COLS, -1)
     for c in range(COLS):
         h, k = c // nph, c % nph
-        o_c = outs[c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
-            outs[c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
+        if half:
+            o_c = outs[c | 1, :ob // 4].reshape(2 * qc, 32, S, 8)[qc * (k & 1):qc * ((k & 1) + 1)]
+        else:
+            o_c = outs[c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
+                outs[c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
         # the open records' rows: the ring's (or the panels' in record mode) before p, then the new ones
         rows = {r: (vc_s[h] if rec else vc[h])[8 * r:8 * r + 8].copy() for r in {rp, rl}}
         for s in range(S):
@@ -734,14 +746,14 @@ def test_attention(size: str, p: int, S: int, split: bool, rec: bool) -> None:
             v_seen = vc_s[h][:q].copy()
             for r in sorted(rows):  # (an open record up to q, or one pass: up to the step's last position: encoded from its rows)
                 if 8 * r <= q:
-                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min((p + S if one else q + 1) - 8 * r, 8))])[:q + 1]
+                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min(p + S - 8 * r, 8))])[:q + 1]
             k_prev = np.concatenate([kc_s[h][:p], *[x[None] for x in kn_all]]) if kn_all else kc_s[h][:p]
             want, knew = ref.core_attention(qg[c, s], kv[s, h, :HD], v_seen[q], k_prev, v_seen[:q], q_norm=qn,
                                             k_norm=kn, cs=cs[s], eps=cfg.rms_norm_eps)
             kn_all.append(knew)
             got = _bf16(o_c[:, :, s].reshape(qc, HD))
             assert ref.rel_err(got, want) < 3e-2, (c, s, ref.rel_err(got, want))
-        recs_c = [rp, rl]
+        recs_c = [rp, rl][:nt]
         if ash.role(c) == A1.ROLE_K:  # the K records of positions p .. p + S - 1 (as the cache holds them now)
             k_all = np.concatenate([kc_s[h][:p], np.stack(kn_all)])
             for i, r in enumerate(recs_c):
@@ -775,12 +787,13 @@ def interleave_bits(v: np.ndarray) -> np.ndarray:
 
 
 @pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B"])
-@pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "s7", "lazy8"])
+@pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "split4", "s7", "lazy8"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
     token (s1), three committed tokens (s3), or four tokens of which two are accepted (lazy: the next step replays
     them); over 104 positions by steps of two (split: from 96 positions on, the attention's chains divide their
-    caches: 9B pairs, 1B chains of 4): the residual stream after every layer and accepted token within llama.cpp's noise
+    caches: 9B pairs, 1B chains of 4) or of four (split4: the 35B-A3B's halves of a chain): the residual stream after every
+    layer and accepted token within llama.cpp's noise
     (its Q8_K activations) of its decode. The 1B's noise is ~3x the 9B's: its layer 0 against float64 math on the same
     weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's
     routing differs from llama.cpp's (a near tie of its 8th and 9th logits) its layer output moves by 10-40%; none here
@@ -796,7 +809,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     if mode in ("s7", "lazy8") and size != "3.8-27B":
         pytest.skip("steps of more than 4 tokens: designs of 8 slots")
     La = ref.QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
-    n, layers = 104 if mode == "split" else 34, list(range(La + 1))
+    n, layers = 104 if mode.startswith("split") else 34, list(range(La + 1))
     tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = ref.golden(path, tokens, ubatch=1, layers=("g", *layers), names="l_out|model.input_embed", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=128)
@@ -806,6 +819,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     while t < n:
         S, commit, acc = {"s1": (1, True, 1), "s3": (min(3, n - t), True, min(3, n - t)),
                           "lazy": (min(4, n - t), False, min(2, n - t)), "split": (2, True, 2),
+                          "split4": (min(4, n - t), True, min(4, n - t)),
                           "s7": (min(7, n - t), True, min(7, n - t)), "lazy8": (min(8, n - t), False, min(3, n - t))}[mode]
         x = ov.gguf.rows("token_embd.weight", tokens[t:t + S])
         if t == 0:
@@ -817,7 +831,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
                 errs[t + s, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t + s], np.float32))
         ov.accept(acc)
         t += acc
-    assert any(split for key in ov._steps for _, _, split in key[3]) == (mode == "split" and not ov.ash.one)
+    assert any(split for key in ov._steps for _, _, split in key[3]) == (mode.startswith("split") and not ov.ash.one)
     top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
                  "3.8-27B": (5.6e-2, 2.1e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
@@ -941,8 +955,8 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     gu = ov.image.region(L, "exp_gu")
     for c in range(COLS):
         cp = act[ov.cp[L] + c * (CP_BYTES + OD.XB):][:CP_BYTES].view(np.uint32)
-        assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset),
-                                                                     stride=gu.col_stride)), c
+        assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset), stride=gu.col_stride,
+                                                                     a_packet=ov.op.PACKET.get("A"))), c
         em = cp[MR.RBUF_META:MR.RBUF_META + OD.META].view(np.int32)
         dn = ov.image.region(L, "exp_down")
         nh = sum(h1 - h0 + 1 for _, h0, h1 in items[c])

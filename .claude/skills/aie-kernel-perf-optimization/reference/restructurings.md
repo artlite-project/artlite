@@ -303,6 +303,17 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   group's P in two pipelined passes (756 against 1068 cycles a group at 3 octets; one loop spills the exp's constants).
   A new K by the popped panels' lanes (900 cycles a record against a byte loop's 43,000). A step across a group: the
   first group's open record keeps its scores in the slot the second does not write. 27B at 32K: V(8) / V(1) 1.071 -> 1.016.
+- **A chain of 4 on two streams** (`models/qwen35/attn.py` `SPLIT_HALF`; `decode.design` "Shared A objects"): 32 query rows per
+  KV head against a core's 16. Positions split alone took two passes; one pass on one stream reads at half the port. Two
+  halves, each two cores with its heads and the groups split between them, on two streams, each read once and delivered to
+  both halves: 35B-A3B at 32K, S 3 / 4 83.8 / 97.0 -> 77.2 / 89.2 ms with what follows. Two streams read ~46 GB/s against the chain's 56, so a shorter sub-step stays on the whole
+  chain: the share is chosen per fill. A stream shared by two cores also ends what hid their compute: a group of two octets
+  ran at ~4360 cycles against ~2900 of stream, 30% over its schedule. So the one-pass core's single bfp16 Q and P came across
+  (QK 624 -> 316 cycles a group, P V 582 -> 365, the Q panels 5100 -> 594 a sub-step), with m held from a core's first
+  group (no rescale: 35B-A3B and Occamy at 32K: a few score vectors past m + 24, none past m + 40; MiniCPM-V none past m + 24; partials of different m merge rescaled), the gates by a table, V encoded once. Not its K
+  path (1.4 KB of code) or its head-major rows (a chain's S 1 would run two octets). Count a port's bytes first: this core
+  had 176 B of program memory left, and a helper taken out of line to save code (`e192`, 64 B) spilled around its call on the
+  hottest path (`psoft` +37%): read the frame in measure_ii.
 - **The same in decode** (`models/qwen35/attn.py`: up to 24 query rows, octets of two sets of [4 rows hi | 4 rows lo],
   against a pass over the whole cache): the cache d-block major (``decode.kv``: K records [d-block][hi | lo], V records
   in pairs [d-block][record 2], the order the prefill's stream reads), so per d-block K hi, K lo and an octet's two Q

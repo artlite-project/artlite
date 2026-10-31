@@ -71,6 +71,16 @@ and the sum of squares lie in the core south of it (``HS8_ROW``: the model's cor
 table in the helper's memory (``SILU8_AT``): the main core holds a second X object, so that the next object comes in while
 the helper converts this one's strips (at 8 rows per k block the objects double). No moe, post, packed, paged designs.
 
+Shared A objects (``a_bcast``): a fill on column c's A stream with a pair's packet id reaches the memtile of column c and of
+the pair's other column, whose cores take the objects as their own, one read of DDR for both. A stream's shim -> memtile
+segment is packet-switched for it (so that a memtile input takes two sources), the memtile's A channel pinned (``A_MT``); past
+the memtiles nothing changes, and every other fill stays on its column (the stream's own id). Two sources keep no order
+between them: a shared fill follows a sync that drained what the columns' objects before it fed, the columns' next
+fills wait for it (``Sequence.wait_fills``): the flows never meet, which the router cannot see (it refuses flows that share
+receivers: ``--allow-deadlock-prone-routing``). On a shim each packet flow takes an arbiter from 0 up, so the MoE control
+route's arbiter stays above them (``moe.route.check_route`` refuses a configuration where a stream uses it: that stream's words
+would reach the shim's TileControl).
+
 Broadcast inputs (``bcast``): a phase's [metadata object | x] are the same bytes for every column, and the cores of a column
 take the same objects, so one shim (``BC_COL``) reads them once for all (a fill with the packet id ``BC_ID``): a packet flow to
 every column's X consumers, on the channels the X objects of a column (residual slices, a model core's objects) reach from their
@@ -172,6 +182,7 @@ F_ACC0 = 1 << 25
 F_EMITA = 1 << 26
 XID = 3  # (moe, bcast) the X stream's packet id (moe: its channel also carries the routing's control packets: ``moe.route.CID``)
 XC_ID, BC_ID, BC_COL, X_CH = 4, 5, 3, 1  # (bcast) the X objects' packet id past the memtile, the broadcast's, its shim, the cores' X channel
+AID, AB_ID, A_MT = 6, 10, 0  # (a_bcast) the A stream's packet id, its first broadcast's, the memtiles' A channel
 # (moe) metadata words: a phase's first chunk of x / sum panels; the route object's (the layer's expert halves at
 # M_RBASE (device address lo, hi) + k M_RSTR, M_RTGU + M_RTDN A objects each); the expert object's items (M_NITEM,
 # then per item: e | h0 << 8 | h1 << 9, its weights per slot, fp32 bits)
@@ -269,7 +280,8 @@ class DecodeOverlayOperator(ArtcOperator):
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
-                 max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False):
+                 max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
+                 a_bcast: tuple[tuple[int, int], ...] = ()):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -279,7 +291,9 @@ class DecodeOverlayOperator(ArtcOperator):
         docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
         combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
         the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
-        slots"); bcast: phase inputs on one broadcast stream (module docstring "Broadcast inputs")."""
+        slots"); bcast: phase inputs on one broadcast stream (module docstring "Broadcast inputs"); a_bcast: pairs of columns
+        (c, d): a fill of column c's A stream with the packet id AB_ID + i (i: the pair's index) reaches both columns'
+        memtiles, the same objects in both columns (module docstring "Shared A objects")."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or gu_win or paged or moe)), slots
         self.slots, self.bcast = slots, bcast
         assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
@@ -319,6 +333,9 @@ class DecodeOverlayOperator(ArtcOperator):
             self.yt, self.yn = 4 * self.yb, 2 * self.yb
             self.gu_win = self.gu_win or self.yb == 128
             self.PACKET, self.BD_COUNT = {"X": XID}, {"A": 3}  # (shim BD 3: the experts' tasks, ``moe``)
+        self.a_bcast = a_bcast
+        if a_bcast:
+            self.PACKET, self.AIECC_FLAGS = getattr(self, "PACKET", {}) | {"A": AID}, ("--allow-deadlock-prone-routing",)
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
         self.h8 = hidden // COLS
@@ -421,7 +438,8 @@ class DecodeOverlayOperator(ArtcOperator):
         if not self.moe:
             return {}
         route = moe_k.render(p, consts | {"META": META, "SLOTS": SLOTS, "ITEM_WORDS": ITEM_WORDS,
-                                          "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS)
+                                          "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS,
+                             a_packet=AID if self.a_bcast else None)
         return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
                 "ITEM_WORDS": ITEM_WORDS}
 
@@ -537,8 +555,10 @@ class DecodeOverlayOperator(ArtcOperator):
             k_lstrip = Kernel(f"{p}_lstrip", "kernel.o", [ws_ty, cmd_ty])
 
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
-        a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH) for c in range(COLS)]
-        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}") for c in range(COLS)]
+        akw, amt = ({"packet": True, "packet_id": AID}, {"channel": A_MT}) if self.a_bcast else ({}, {})
+        a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH, **akw) for c in range(COLS)]
+        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH, **amt).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}")
+                for c in range(COLS)]
         # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
         x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH,
                            **({"packet": True, "packet_id": XID} if self.moe or self.bcast else {})) for c in range(COLS)]
@@ -795,6 +815,10 @@ class DecodeOverlayOperator(ArtcOperator):
         if self.bcast:  # (on the placed design: the placer takes a flow from a shim channel an ObjectFifo uses for a channel more)
             packet_flow(module, BC_ID, (BC_COL, 0), self.ENDPOINTS["X"][1],
                         [(c, r, X_CH) for c in range(COLS) for r in (mr, *self._x_rows())])
+        if self.a_bcast and not s8:  # (placed: ``packet_flow``)
+            pin_l1_buffers(module, fifo=lambda name, depth: None)
+        for i, (c, d) in enumerate(self.a_bcast):
+            packet_flow(module, AB_ID + i, (c, 0), self.ENDPOINTS["A"][1], [(c, 1, A_MT), (d, 1, A_MT)])
         return module
 
     def check_endpoints(self, insts: np.ndarray) -> None:
