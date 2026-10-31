@@ -119,6 +119,9 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
 - Not with attention sinks past the first chunk: MiniCPM-V's ViT scores reach 71 log2 units above its first 32 keys'
   maximum (P saturates at 2^63; embeddings' KL 0.0090 -> 0.0074 once raised). Check each later group against m + 16
   in bf16 and rescale o and l on the rare raise (the vision overlay's `ops.Attention(raise_max=)`, the qwen35 prefill attention).
+  A text model's scores stay far from it: Qwen3.8-27B's decode at 32K positions, no score more than 24 log2 units above the
+  first group's maximum (P clamps at 63.5: the one-pass core holds m, no rescale). Count such scores on the NPU, with a low
+  threshold as a control, before dropping a rescale.
 - Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
   bf16 rounding can put the largest argument above 0.
 
@@ -219,8 +222,11 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 
 - A scale that multiplies a whole vector (1 / rms) goes in as bf16 hi + lo (`al::bf16_hilo`),
   never rounded to bf16.
-- Cached K needs bfp16 hi + lo blocks: one 7-bit block shifts a position's scores coherently,
-  and the softmax turns that into an output error. V tolerates single blocks.
+- Cached K: one 7-bit bfp16 block per 8 dims shifts a position's scores coherently, and the softmax turns that into an
+  output error on short vectors (Gemma's, Llama's K keep hi + lo blocks). At head_dim 256 it averages out: qwen35's K is
+  one block per 8 dims. Qwen3.8-27B, K hi alone against hi + lo: 512 teacher-forced tokens KL 0.0029 / 0.0030, agreement
+  0.953 / 0.951 (llama.cpp prompt vs decode 0.0031, 0.957); 128 steps after a prefill of 4096 KL 0.0040 / 0.0032,
+  agreement 0.961 / 0.945. Judge on hundreds of tokens: its first 128 alone read 0.938 / 0.969. V tolerates single blocks.
 - GEMM inputs as single bfp16 panels are acceptable: simulated KL 0.00059 vs 0.00042 with hi / lo.
 - Judge by KL over several prompts or rounding variants. Single short runs vary up to 40x with
   rounding luck.
@@ -230,7 +236,7 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
   attention the second MMUL per record costs nothing measurable; give the lo products their own accumulator chain
   when one chain would serialize (QB = 1). A decode step's Q and P as single panels of 8 rows (qwen35's designs of 8
   slots, where hi + lo do not fit): Qwen3.8-27B's teacher-forced KL 0.0022-0.0023, llama.cpp's prompt vs decode 0.0022:
-  no cost there, against K hi alone (no lo panels in the scores): the same KL, argmax agreement 0.938 against 0.969.
+  no cost there.
 - **hi + lo weights** where a GEMM is sensitive and cheap: `artlite.vision.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
   the lo ones on the A panels walked again). MiniCPM-V's encoder takes them at its patch embedding and its final
   merger (a quarter of its weights' error between them); any other layer's weights held 1-3% each and did not pay.
