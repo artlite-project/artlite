@@ -153,30 +153,12 @@ _MMV = r"""// ---- Q5_K (R = {{ R5 }} rows, row group 1 = rows 8 .. and junk): s
 // (sb 2 p), (2 p + 1) | mn lo | mn lo | crumbs (2 p) | (2 p + 1) (nibble i = c_sc + 4 c_mn) | d pair | -dmin pair] | codes
 // [sb][plane 5][row R][32 B]: the low nibbles of step s (plane s), then qh (nibble of lane l: bit s = the high bit h
 // of step s). A code panel is two MMULs: the low nibbles and the masked qh at x 16 / 2^s (16 h). Scratch per
-// super-block: [i][g][ql 0 .. 3 | h 0 .. 3: 32 B each] (4 KB) | tab [g][hl][i][r] | c [i][g][32]
+// super-block: [i][step pair][g][ql s | ql s + 1 | h s | h s + 1: 32 B each] (4 KB) | tab [g][hl][i][r] | c [i][g][32]
 
-// Pass 1: the codes of super-block sb -> scr
+// Pass 1: the codes of super-block sb -> scr (h 0 .. 3: the qh nibbles masked by 1 .. 8)
 __attribute__((noinline)) void {{ p }}_q5k_tr(const uint8_t *__restrict src, uint8_t *__restrict scr)
 {
-    const v16int32 m1 = broadcast_to_v16int32((int)0x11111111), m2 = broadcast_to_v16int32((int)0x22222222);
-    const v16int32 m4 = broadcast_to_v16int32((int)0x44444444), m8 = broadcast_to_v16int32((int)0x88888888);
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < 8; t++) {  // (g, plane): src + {{ 32 * R5 }} plane + 256 g
-        const int g = t >> 2, pl = t & 3;
-        v16int32 o0, o1, o2, o3;
-        {{ p }}_tr8<32>(src + {{ 32 * R5 }} * pl + 256 * g, o0, o1, o2, o3);
-        {{ p }}_put8<512>(scr + 256 * g + 32 * pl, o0, o1, o2, o3);
-    }
-    AIE_LOOP_NO_UNROLL
-    for (int g = 0; g < 2; g++) {
-        v16int32 o0, o1, o2, o3;
-        {{ p }}_tr8<32>(src + {{ 4 * 32 * R5 }} + 256 * g, o0, o1, o2, o3);
-        uint8_t *d = scr + 256 * g + 128;
-        {{ p }}_put8<512>(d, band(o0, m1), band(o1, m1), band(o2, m1), band(o3, m1));
-        {{ p }}_put8<512>(d + 32, band(o0, m2), band(o1, m2), band(o2, m2), band(o3, m2));
-        {{ p }}_put8<512>(d + 64, band(o0, m4), band(o1, m4), band(o2, m4), band(o3, m4));
-        {{ p }}_put8<512>(d + 96, band(o0, m8), band(o1, m8), band(o2, m8), band(o3, m8));
-    }
+    {{ p }}_trq(src, src + {{ 4 * 32 * R5 }}, scr, {{ 32 * R5 }}, 0, 0, 0x11111111, 0x22222222, 2);
 }
 
 // Pass 2: the table TD = d sc of super-block sb -> tab [g][hl][i][r]; y[g] += hilo(XS sc) 16 d + hilo(XS mn) (-dmin)
@@ -195,11 +177,9 @@ __attribute__((noinline)) void {{ p }}_q5k_tab(const uint8_t *__restrict a, cons
     for (int g = 0; g < 2; g++) {
         v16int32 o0, o1, o2, o3;  // word panels of the pair's scale planes, rows 8 g ..: [w0 | w1], [w2 | w3], ..
         {{ p }}_tr8<32>(a + {{ 32 * R5 }} * (sb >> 1) + 256 * g, o0, o1, o2, o3);
-        if (sbl) {  // (the words of sb: the second of each pair)
-            o0 = shift_bytes(o0, o0, 32);
-            o1 = shift_bytes(o1, o1, 32);
-            o2 = shift_bytes(o2, o2, 32);
-        }
+        o0 = shift_bytes(o0, o0, 32 * sbl);  // (the words of sb: of each pair the first or the second)
+        o1 = shift_bytes(o1, o1, 32 * sbl);
+        o2 = shift_bytes(o2, o2, 32 * sbl);
         const v64uint8 cr = unpack(extract_v64uint4((v128uint4)o2, 0));  // crumbs of sb
         v64bfp16ebs8 Sl, Sc, Ml, Mc;
         Sl.exponent = Ml.exponent = al::e8(0x85);
@@ -244,10 +224,11 @@ __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, cons
 {% for st in range(4) %}
         {
             const v64bfp16ebs8 x = xs.pop();
-            C0 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ 32 * st }}), 0, C0);
-            C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ 256 + 32 * st }}), 0, C1);
-            C0 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ 128 + 32 * st }}, {{ 0x89 - st }}), 0, C0);
-            C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ 384 + 32 * st }}, {{ 0x89 - st }}), 0, C1);
+{% set o = 256 * (st // 2) + 32 * (st % 2) %}
+            C0 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o }}), 0, C0);
+            C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o + 128 }}), 0, C1);
+            C0 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o + 64 }}, {{ 0x89 - st }}), 0, C0);
+            C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o + 192 }}, {{ 0x89 - st }}), 0, C1);
         }
 {% endfor %}
         aie::store_v(pc, {{ p }}_sum2(C0));
@@ -315,6 +296,9 @@ class Q5KSlot(Slot):
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)
+
+    def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
+        return ("mmv/trq", f"mmv/{fmt}")
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, int]:
         R5 = self.format(fmt).rows(tile_bytes, nsb)

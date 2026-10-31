@@ -271,6 +271,42 @@ def sb_major(b: np.ndarray, R: int, n: int) -> np.ndarray:
 SOURCES = {
 # the decode GEMV's scale tables and per-super-block scaling of the formats with a bf16 scale per 32-k group (Q4_0, Q4_1,
 # Q8_0)
+"mmv/trq": r"""// ---- Q5_K, Q6_K: Pass 1: a super-block's code planes of ps B -> scr [i][h][g][ql0 | ql1 | c0 | c1], per half h of its
+// steps: the low nibbles of its two steps (the planes from src on), the high bits of its two steps (the plane from q on,
+// masked by m0, m1 (<< ms per half), still packed); sa, qa: past a half's low planes, to the next half's
+__attribute__((noinline)) void {{ p }}_trq(const uint8_t *__restrict src, const uint8_t *__restrict q, uint8_t *__restrict scr,
+                                           int ps, int sa, int qa, int m0, int m1, int ms)
+{
+    const uint8_t *s = src, *ph = q;
+    uint8_t *d = scr;
+    AIE_LOOP_NO_UNROLL
+    for (int h = 0; h < 2; h++) {
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < 2; j++) {  // the low-nibble planes of the half's steps, both row groups (256 B apart)
+            v16int32 o0, o1, o2, o3, u0, u1, u2, u3;
+            {{ p }}_tr8<32>(s, o0, o1, o2, o3);
+            {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
+            {{ p }}_put8<512>(d, o0, o1, o2, o3);
+            {{ p }}_put8<512>(d + 128, u0, u1, u2, u3);
+            s += ps;
+            d += 32;
+        }
+        const v16int32 a = broadcast_to_v16int32(m0), b = broadcast_to_v16int32(m1);
+        v16int32 o0, o1, o2, o3, u0, u1, u2, u3;  // qh
+        {{ p }}_tr8<32>(ph, o0, o1, o2, o3);
+        {{ p }}_tr8<32>(ph + 256, u0, u1, u2, u3);
+        {{ p }}_put8<512>(d, band(o0, a), band(o1, a), band(o2, a), band(o3, a));
+        {{ p }}_put8<512>(d + 32, band(o0, b), band(o1, b), band(o2, b), band(o3, b));
+        {{ p }}_put8<512>(d + 128, band(u0, a), band(u1, a), band(u2, a), band(u3, a));
+        {{ p }}_put8<512>(d + 160, band(u0, b), band(u1, b), band(u2, b), band(u3, b));
+        s += sa;
+        ph += qa;
+        d += 256 - 64;
+        m0 <<= ms;
+        m1 <<= ms;
+    }
+}
+""",
 "mmv/dtab": r"""// ---- Q4_0, Q4_1, Q8_0: per 32-k group i one exact sum c = bf16(C[hi rows] + C[lo rows]), y += c d (d exact in bf16).
 
 // The scales d [row][sb][i] (rows of 8 NSB bf16) of G row groups and NS super-blocks from d -> tab [sb][g][i][r] (64

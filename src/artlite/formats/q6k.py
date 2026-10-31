@@ -154,34 +154,10 @@ _MMV = r"""// ---- Q6_K (R = {{ R6 }} rows, row group 1 = rows 8 .. and junk): d
 // 3) or x 4 (n & 12): 16 c. Scratch per super-block: [i][h][g][ql0 | ql1 | c0 | c1] (4 KB) | tab [g][h][hl][i][r] (1 KB)
 // | c [i][h][g][{{ L }}] ({{ L // 16 }} KB)
 
-// Pass 1: the codes of super-block sb -> scr (c0, c1: the qh nibbles masked, still packed)
+// Pass 1: the codes of super-block sb -> scr (c0, c1: the qh nibbles masked by 3, 12, still packed)
 __attribute__((noinline)) void {{ p }}_q6k_tr(const uint8_t *__restrict src, uint8_t *__restrict scr)
 {
-    const v16int32 m3 = broadcast_to_v16int32((int)0x33333333), m12 = broadcast_to_v16int32((int)0xCCCCCCCC);
-    const uint8_t *s = src;
-    uint8_t *d = scr;
-    AIE_LOOP_NO_UNROLL
-    for (int h = 0; h < 2; h++) {
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int q = 0; q < 2; q++) {  // the low-nibble planes of steps 2 h + q, both row groups (256 B apart)
-            v16int32 o0, o1, o2, o3, u0, u1, u2, u3;
-            {{ p }}_tr8<32>(s, o0, o1, o2, o3);
-            {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
-            {{ p }}_put8<512>(d, o0, o1, o2, o3);
-            {{ p }}_put8<512>(d + 128, u0, u1, u2, u3);
-            s += {{ 32 * R6 }};
-            d += 32;
-        }
-        v16int32 o0, o1, o2, o3, u0, u1, u2, u3;  // qh
-        {{ p }}_tr8<32>(s, o0, o1, o2, o3);
-        {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
-        {{ p }}_put8<512>(d, band(o0, m3), band(o1, m3), band(o2, m3), band(o3, m3));
-        {{ p }}_put8<512>(d + 32, band(o0, m12), band(o1, m12), band(o2, m12), band(o3, m12));
-        {{ p }}_put8<512>(d + 128, band(u0, m3), band(u1, m3), band(u2, m3), band(u3, m3));
-        {{ p }}_put8<512>(d + 160, band(u0, m12), band(u1, m12), band(u2, m12), band(u3, m12));
-        s += {{ 32 * R6 }};
-        d += 256 - 64;
-    }
+    {{ p }}_trq(src, src + {{ 2 * 32 * R6 }}, scr, {{ 32 * R6 }}, {{ 32 * R6 }}, {{ 3 * 32 * R6 }}, 0x33333333, (int)0xCCCCCCCC, 0);
 }
 
 // Pass 2: the tables of super-block sb: TD = sc d (I against the rows' sc: [i][r]) -> tab [g][h][hl][i][r]
@@ -333,6 +309,9 @@ class Q6KSlot(Slot):
 
     def mmv_slots(self, fmt: str) -> tuple[int, ...]:
         return (4, 8)
+
+    def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
+        return ("mmv/trq", f"mmv/{fmt}")
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, int]:
         R6 = self.format(fmt).rows(tile_bytes, nsb)
