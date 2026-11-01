@@ -717,7 +717,7 @@ class DecodeOverlayOperator(ArtcOperator):
         workers, pg_flows, pg_locks, pg_main, pg_help = [], [], [], {}, {}
         self._locks: list[Lock] = []  # (the model's: ``_extra_workers``)
         xps = []
-        m_ws, m_xs = [], []
+        m_ws, m_xs, sqs = [], [], []
         st_ty = np.ndarray[(paging.STATE_WORDS,), i32]
         for c in range(COLS):  # (paged formats: per core its state words and wake lock, per column its store and routes)
             if not self.paged:
@@ -758,6 +758,7 @@ class DecodeOverlayOperator(ArtcOperator):
             m_xs.append(xs)
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
+            sqs.append(sq)
             workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=2 if s8 else 1, **x_kw), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, *hres,
@@ -779,7 +780,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                   tile=Tile(c, hr),
                                   stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
-                     ws=m_ws, xs=m_xs, xp=xps, x_kw=x_kw)
+                     ws=m_ws, xs=m_xs, xp=xps, sq=sqs, x_kw=x_kw)
         extra, d_fifos = self._extra_workers(s)
         workers += extra
         a_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["A"][1]) for c, f in enumerate(a_l3)]
@@ -850,6 +851,7 @@ class _Streams:
     ws: list  # per column the main core's workspace and sum panels (``workspace``, xs: a model core may use the regions
     xs: list  # idle while its objects run; LENDS_WS)
     xp: list  # per column the helper's x panels (a model core may use them while its objects run)
+    sq: list  # per column the input's sums of squares of a normed phase, the helper's (8 slots: in the HS8_ROW core's memory)
     x_kw: dict  # the arguments of a consumer's handle of x_l1
 
 

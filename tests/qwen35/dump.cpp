@@ -5,6 +5,7 @@
 //
 //   qwen35_dump -m MODEL -t TOKENS -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]
 //               [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]
+//               [--dflash DFLASH_MODEL --dflash-at P [--dflash-names REGEX] [--dflash-random]]
 //
 // TOKENS: raw little-endian int32 token ids. The tokens run in ubatches of UBATCH (default: all of them in
 // one); --split P: the first P in ubatches of UBATCH, then the rest one per ubatch (prompt, then decode
@@ -23,10 +24,19 @@
 // p takes token p and the model's output-normed hidden state h_nextn of row p - 1 (zeros for p = 0); its tensors of
 // LAYERS / REGEX (the MTP layer's index, "g") as OUTDIR/mtp.<name>-<il>.npy, its logits as OUTDIR/mtp.logits.npy.
 //
+// --dflash: then the DFlash2 drafter as llama.cpp's draft-dflash runs it (``common/speculative.cpp``'s
+// common_speculative_impl_draft_dflash): the model's rows 0 .. P - 1 injected (their target layers' inputs, in ubatches of
+// UBATCH), then the block at P: tokens[P] and mask tokens at P .. P + block_size - 1, non-causal. OUTDIR/dflash.taps.npy:
+// (P, taps, hidden); its tensors matching REGEX (of every layer and without one) as OUTDIR/dflash.<name>-<il>.npy, stacked
+// over the rows of each graph (the injection's, the block's); OUTDIR/dflash.lattice.npy: (block_size, hidden): per block
+// position the candidates' ids (as float32 values), then their scores [predecessor][candidate]. --dflash-random: the taps
+// are normal numbers (1 / 16 of unit variance, the model does not run: for the attention past the window).
+//
 // Backend: CPU only (no devices), F32 KV cache, flash attention off.
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "llama-ext.h"
 #include "llama.h"
 
 #include <sys/resource.h>
@@ -36,6 +46,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <regex>
 #include <set>
 #include <string>
@@ -235,14 +246,16 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 static void usage() {
     fprintf(stderr,
             "usage: qwen35_dump -m MODEL -t TOKENS.i32 -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]\n"
-            "                   [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]\n");
+            "                   [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]\n"
+            "                   [--dflash DFLASH_MODEL --dflash-at P [--dflash-names REGEX] [--dflash-random]]\n");
     exit(1);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, tokens_path, layers_arg, regex_arg = "", logits_mode = "f32", mtp_path;
+    std::string model_path, tokens_path, layers_arg, regex_arg = "", logits_mode = "f32", mtp_path, dflash_path, dflash_names;
     State st;
-    int ubatch = 0, split = -1, threads = 16;
+    int ubatch = 0, split = -1, threads = 16, dflash_at = -1;
+    bool dflash_random = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -273,6 +286,14 @@ int main(int argc, char ** argv) {
             threads = std::atoi(next().c_str());
         } else if (a == "--mtp") {
             mtp_path = next();
+        } else if (a == "--dflash") {
+            dflash_path = next();
+        } else if (a == "--dflash-at") {
+            dflash_at = std::atoi(next().c_str());
+        } else if (a == "--dflash-names") {
+            dflash_names = next();
+        } else if (a == "--dflash-random") {
+            dflash_random = true;
         } else {
             usage();
         }
@@ -371,7 +392,22 @@ int main(int argc, char ** argv) {
     }
     llama_batch batch = llama_batch_init(ubatch, 0, 1);
     std::vector<ggml_fp16_t> half(n_vocab);
-    for (int p = 0; p < n;) {
+    llama_model * dfm = nullptr;
+    std::vector<int32_t> tap_layers;
+    std::vector<float> taps;  // [row][tap][hidden]
+    const int n_embd_t = llama_model_n_embd(model);
+    if (!dflash_path.empty()) {
+        dfm = llama_model_load_from_file(dflash_path.c_str(), mp);
+        if (!dfm || dflash_at < 0 || dflash_at >= n) {
+            fprintf(stderr, "cannot load %s, or --dflash-at past the tokens\n", dflash_path.c_str());
+            return 1;
+        }
+        tap_layers.assign(llama_model_target_layer_ids(dfm), llama_model_target_layer_ids(dfm) + llama_model_target_layer_ids_n(dfm));
+        for (const int32_t l : tap_layers) {
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) l, true);
+        }
+    }
+    for (int p = 0; p < n && !dflash_random;) {
         const int nb = p < n_prompt ? std::min(ubatch, n_prompt - p) : 1;
         batch.n_tokens = nb;
         for (int i = 0; i < nb; i++) {
@@ -399,6 +435,16 @@ int main(int argc, char ** argv) {
                     logits.write(l, (size_t) n_vocab * 4);
                 }
                 logits.rows++;
+            }
+        }
+        for (int i = 0; i < nb && dfm; i++) {
+            for (const int32_t l : tap_layers) {
+                const float * x = llama_get_embeddings_layer_inp(ctx, (uint32_t) l);
+                if (!x) {
+                    fprintf(stderr, "layer %d's input not extracted\n", l);
+                    return 1;
+                }
+                taps.insert(taps.end(), x + (size_t) i * n_embd_t, x + (size_t) (i + 1) * n_embd_t);
             }
         }
         st.ubatch++;
@@ -492,7 +538,91 @@ int main(int argc, char ** argv) {
             ml.close();
         }
     }
-    for (State * s : {&st, &sm}) {
+    State sd;  // (the drafter's run)
+    llama_context * cd = nullptr;
+    if (dfm) {
+        const int P = dflash_at, nt = (int) tap_layers.size(), row = nt * n_embd_t;
+        if (dflash_random) {
+            std::mt19937 gen(1);
+            std::normal_distribution<float> normal(0.0f, 1.0f / 16);
+            taps.resize((size_t) P * row);
+            for (float & v : taps) {
+                v = normal(gen);
+            }
+        }
+        sd.outdir = st.outdir;
+        sd.prefix = "dflash.";
+        sd.names = std::regex(dflash_names.empty() ? "$^" : dflash_names);
+        sd.all_layers = true;
+        sd.layers = {-1};
+        char buf[32] = {};
+        llama_model_meta_val_str(dfm, "dflash.block_size", buf, sizeof(buf));
+        const int block = std::atoi(buf);
+        llama_context_params cf = cp;
+        cf.ctx_other = ctx;
+        cf.n_ctx = (uint32_t) ((P + block + 255) / 256 * 256);
+        cf.n_batch = cf.n_ubatch = (uint32_t) std::max(ubatch, block);
+        cf.n_outputs_max = (uint32_t) block;
+        cf.cb_eval_user_data = &sd;
+        cd = llama_init_from_model(dfm, cf);
+        if (!cd) {
+            fprintf(stderr, "cannot create the drafter's context\n");
+            return 1;
+        }
+        llama_set_embeddings_nextn(cd, true, false);
+        llama_set_causal_attn(cd, false);
+        Npy tf;
+        tf.open(st.outdir + "/dflash.taps.npy");
+        tf.tail = {nt, n_embd_t};
+        tf.rows = P;
+        tf.write(taps.data(), (size_t) P * row * 4);
+        tf.close();
+        llama_batch_ext * be = llama_batch_ext_init(cd);
+        for (int p = 0; p < P;) {
+            const int nb = std::min((int) cf.n_ubatch, P - p);
+            llama_batch_ext_clear(be);
+            for (int i = 0; i < nb; i++) {
+                const llama_pos pos[4] = {p + i, p + i, p + i, 0};
+                const int32_t idx = llama_batch_ext_add_embd(be, 0, {taps.data() + (size_t) (p + i) * row, 1, (size_t) row});
+                if (idx < 0 || !llama_batch_ext_set_pos(be, idx, pos)) {
+                    fprintf(stderr, "injection batch at position %d\n", p + i);
+                    return 1;
+                }
+            }
+            sd.n_tokens = nb;
+            sd.seen.clear();
+            if (llama_process(cd, LLAMA_PROCESS_TYPE_DECODE, be) != 0) {
+                fprintf(stderr, "llama_process (injection) failed at position %d\n", p);
+                return 1;
+            }
+            sd.ubatch++;
+            p += nb;
+        }
+        llama_batch_ext_clear(be);
+        const llama_token mask = llama_vocab_mask(llama_model_get_vocab(dfm));
+        for (int i = 0; i < block; i++) {
+            const llama_pos pos = P + i;
+            const int32_t idx = llama_batch_ext_add_token(be, 0, i == 0 ? tokens[P] : mask);
+            if (idx < 0 || !llama_batch_ext_set_pos(be, idx, &pos)) {
+                fprintf(stderr, "block batch\n");
+                return 1;
+            }
+        }
+        sd.n_tokens = block;
+        sd.seen.clear();
+        if (llama_process(cd, LLAMA_PROCESS_TYPE_DECODE, be) != 0) {
+            fprintf(stderr, "llama_process (block) failed\n");
+            return 1;
+        }
+        llama_batch_ext_free(be);
+        Npy lf;
+        lf.open(st.outdir + "/dflash.lattice.npy");
+        lf.tail = {n_embd_t};
+        lf.rows = block;
+        lf.write(llama_get_embeddings_nextn(cd), (size_t) block * n_embd_t * 4);
+        lf.close();
+    }
+    for (State * s : {&st, &sm, &sd}) {
         for (auto & [name, f] : s->files) {
             f.close();
         }
@@ -516,6 +646,12 @@ int main(int argc, char ** argv) {
     if (cx) {
         llama_free(cx);
         llama_model_free(mtp);
+    }
+    if (dfm) {
+        if (cd) {
+            llama_free(cd);
+        }
+        llama_model_free(dfm);
     }
     llama_free(ctx);
     llama_model_free(model);

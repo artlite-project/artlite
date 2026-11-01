@@ -61,6 +61,8 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
     p.add_argument("--no-lookup", action="store_true",
                    help="no draft tokens from the context (prompt lookup) in the multi-token steps")
+    p.add_argument("--dflash", action="store_true",
+                   help="Qwen3.8 27B: draft with its DFlash2 block drafter (a file of its own) instead of its MTP layer")
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Gemma): one bfp16 block per 8 dims (Llama's default), or "
                         "hi + lo blocks (Gemma's default; +50%% cache bytes and read time)")
@@ -131,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
     seed(args.seed)
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
-    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices}
+    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
     try:
         text = prompt_text(args)
         model = open_model(args.model, **{k: v for k, v in options.items() if v})

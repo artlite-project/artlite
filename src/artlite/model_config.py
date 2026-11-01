@@ -114,6 +114,19 @@ def qwen_mtp_of(model: str) -> str | None:
     return None
 
 
+def qwen_dflash_of(model: str) -> str | None:
+    """The DFlash2 drafter (GGUF architecture ``dflash``) of a qwen35 model file: the Q4_K_M file of a repository
+    ``<model's repository>-DFlash2-GGUF`` of any organization (z-lab's for Qwen3.8-27B), or None."""
+    d = os.path.dirname(os.path.abspath(model))
+    root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d).removesuffix("-GGUF")
+    for org in sorted(os.listdir(root)):
+        x = os.path.join(root, org, f"{repo}-DFlash2-GGUF")
+        files = sorted(f for f in os.listdir(x) if f.endswith("-Q4_K_M.gguf")) if os.path.isdir(x) else []
+        if files:
+            return os.path.join(x, files[0])
+    return None
+
+
 def sd15_dir() -> str:
     """The diffusers directory of Stable Diffusion 1.5 (``model_index.json``, ``tokenizer/``, ``text_encoder/``,
     ``unet/``, ``vae/``, ``scheduler/``)."""
@@ -407,6 +420,62 @@ class QwenConfig:
         out = np.empty((th.shape[0], n), np.float32)
         for i in range(n):
             out[:, i] = th[:, comp[i]]
+            th = (th * scale).astype(np.float32)
+        return out
+
+
+@dataclass(frozen=True)
+class DFlashConfig:
+    """A DFlash2 block drafter (GGUF architecture ``dflash``, llama.cpp's ``src/models/dflash.cpp``), from the metadata of
+    its file: ``layers`` of ``hidden`` with ``ffn``, ``heads`` query heads over ``kv_heads`` KV heads of ``head_dim``
+    (RMS-normed per dim, NeoX pairs on all of them), a block of ``block`` positions (``mask_token`` past the anchor),
+    each layer's attention over the ``window`` positions before a row and the whole block; per group of ``conv_group``
+    channels a conv of ``conv_kernel`` taps along the block; a selector of the ``top_k`` best logits per position in
+    ``rank`` dims; ``taps``: the model's layers whose inputs feed its cache."""
+
+    layers: int
+    hidden: int
+    ffn: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    block: int
+    window: int
+    conv_kernel: int
+    conv_group: int
+    rank: int
+    top_k: int
+    taps: tuple[int, ...]
+    mask_token: int
+    rms_norm_eps: float
+    rope_base: float
+
+    @property
+    def hidden_size(self) -> int:
+        return self.hidden
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> DFlashConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch == "dflash", f"{gguf.path}: architecture {gguf.arch!r}, expected dflash"
+        m = gguf.arch_meta
+        return cls(layers=int(m("block_count")), hidden=int(m("embedding_length")), ffn=int(m("feed_forward_length")),
+                   heads=int(m("attention.head_count")), kv_heads=int(m("attention.head_count_kv")),
+                   head_dim=int(m("attention.key_length")), block=int(m("block_size")),
+                   window=int(m("attention.sliding_window")), conv_kernel=int(m("conv_kernel_size")),
+                   conv_group=int(m("conv_group_size")), rank=int(m("selector_rank")), top_k=int(m("selector_top_k")),
+                   taps=tuple(int(x) for x in m("target_layers")),
+                   mask_token=int(gguf.meta["tokenizer.ggml.mask_token_id"]),
+                   rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")), rope_base=float(m("rope.freq_base")))
+
+    def rope_theta(self, positions: np.ndarray | range | list) -> np.ndarray:
+        """(n, head_dim / 2) float32 angles of positions (n,): pair i turns by p * base^(-2 i / head_dim), the factor
+        built by repeated float32 multiplication as llama.cpp's CPU RoPE."""
+        scale = np.float32(np.power(np.float32(self.rope_base), np.float32(-2.0 / self.head_dim)))
+        th = np.asarray(positions, np.float32).reshape(-1)
+        out = np.empty((th.size, self.head_dim // 2), np.float32)
+        for i in range(self.head_dim // 2):
+            out[:, i] = th
             th = (th * scale).astype(np.float32)
         return out
 

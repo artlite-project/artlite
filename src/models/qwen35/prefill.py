@@ -56,6 +56,7 @@ from . import attn_prefill as AP
 from . import gdn as GD
 from . import gdn_prefill as GP
 from .decode import META
+from .dflash_prefill import DFlashPrefill
 from .draft_prefill import DraftPrefill
 from .overlay import KV_PAD, QwenOverlay
 
@@ -92,7 +93,9 @@ class QwenPrefill(ChunkPrefill):
 
     SUB, SMALL, MAX_T, MIN_TOKENS, NAME = SUB, SMALL, MAX_T, 3, "qwen_prefill"
 
-    def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None, draft: object = None):
+    def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None, draft: object = None,
+                 dflash: object = None):
+        """draft, dflash: an MTP drafter, a DFlash2 drafter whose records a chunk writes."""
         default = MOE_SIZES if overlay.cfg.moe else SIZES
         super().__init__(overlay, sizes or default)
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
@@ -120,6 +123,7 @@ class QwenPrefill(ChunkPrefill):
         self.qn_off = {L: i * 4 * 2 * AP.HD for i, L in enumerate(self.att + ([draft.L] if draft is not None else []))}
         # (an MTP drafter's cache records of the prompt: ``draft_prefill``)
         self.dp = DraftPrefill(draft, self) if draft is not None else None
+        self.fp = DFlashPrefill(dflash, self) if dflash is not None else None
         self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes) for T in self.sizes} \
             if self.att else {}
         self._starts: dict[int, list[int]] = {}
@@ -205,6 +209,8 @@ class QwenPrefill(ChunkPrefill):
             self.rb["HP"] = 9 * self.img.region(self.layers[0], "down").K // 8
         if self.dp is not None:
             self.rb |= self.dp.rows()
+        if self.fp is not None:
+            self.rb |= self.fp.rows()
         self.rb_g = {k: 2 * COLS * p for k, p in self.pitch.items()}  # (gdn_in / attn_in rows)
         self.rb_a = {"gdn_in": 9 * cfg.ssm_v_heads * GD.D // 8, "attn_in": 9 * cfg.num_attention_heads * AP.HD // 8}
         self.rb_o = 2 * cfg.ssm_v_heads * GD.D
@@ -243,6 +249,8 @@ class QwenPrefill(ChunkPrefill):
         marks = []
         for L in self.layers:
             starts.append(len(rl))
+            if self.fp is not None:
+                rl += self.fp.tap_items(L, T, tok)
             kind = self._phases(L)[0]
             p_in = o.plans[(L, kind)]
             g_rb, a_rb = self.rb_g[kind], self.rb_a[kind]
@@ -320,6 +328,8 @@ class QwenPrefill(ChunkPrefill):
                         tok("PXN", j, pn, i=4)) for j in range(S)]
         if self.dp is not None:
             rl += self.dp.end_items(T, tok, lambda b, off, op, i: sl(b, off, op, i=i))
+        if self.fp is not None:
+            rl += self.fp.end_items(T, tok, lambda b, off, op, i: sl(b, off, op, i=i))
         self._starts[T] = [*starts, len(rl)]
         self._moe_marks[T] = marks
         return rl
@@ -352,14 +362,17 @@ class QwenPrefill(ChunkPrefill):
             dev.flush("PCS")
         if self.dp is not None:
             self.dp.static(dev, ov)
+        if self.fp is not None:
+            self.fp.static(dev)
         if self.gdn:
             self._conv_index()
 
     def _external(self) -> set[str]:
-        return self.dp.external() if self.dp is not None else set()
+        return (self.dp.external() if self.dp is not None else set()) | (self.fp.external() if self.fp is not None else set())
 
     def _buffers(self) -> dict[str, object]:
-        return self.ov.dev.buffers | (self.dp.buffers() if self.dp is not None else {})
+        return self.ov.dev.buffers | (self.dp.buffers() if self.dp is not None else {}) | \
+            (self.fp.buffers() if self.fp is not None else {})
 
     def _conv_index(self) -> None:
         """The GHDR bytes of the GDN layers' conv states (3 rows x the column's channels, bf16) and their places in CVL
@@ -400,6 +413,8 @@ class QwenPrefill(ChunkPrefill):
         if self.att:
             prep = self._prep(self.sz[self._t(T)].plans[(self.att[0], "attn_in")].layout, T)
             out |= prep.params(p0, cs_row) | self.attn[T].params(p0)
+        if self.fp is not None:
+            out |= self.fp.params(T, p0)
         return out
 
     def _cs_row(self, p0: int, n: int) -> int:
@@ -439,6 +454,8 @@ class QwenPrefill(ChunkPrefill):
             self._conv_states()
         if self.dp is not None:
             self.dp.before(dev, p0)
+        if self.fp is not None:
+            self.fp.before(dev, p0, T)
         hooks = {}
         for L, (_, i_e, i_g) in self._moe_marks.get(T, ()):
             hooks[i_e] = functools.partial(self.moe.host_route, L, n=n, T=T, dev=dev, lib=self.lib)
@@ -446,6 +463,8 @@ class QwenPrefill(ChunkPrefill):
         self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks or None)
         if self.dp is not None:
             self.dp.after(dev, n)
+        if self.fp is not None:
+            self.fp.after(p0, n, T)
 
     def _splits(self, T: int, p0: int) -> list[int]:
         """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""
@@ -492,6 +511,8 @@ class QwenPrefill(ChunkPrefill):
             s += self.moe.layer_seconds(L, round(S * SUB), weight_s=MOE_WEIGHT_S, row_s=MOE_ROW_S)
         if self.dp is not None and L == self.layers[-1]:  # (the drafter's records after the last layer)
             s += self.dp.seconds(Ss, weight_s=WEIGHT_S, gemm_s=GEMM_S, norm_s=NORM_S, prep_s=PREP_S, cfg_s=CFG_S)
+        if self.fp is not None and L == self.layers[-1]:
+            s += self.fp.seconds(Ss, weight_s=WEIGHT_S, gemm_s=GEMM_S, norm_s=NORM_S, prep_s=PREP_S, cfg_s=CFG_S)
         return s + CFG_S * self.layer_configs(L)
 
     def layer_configs(self, L: int) -> int:

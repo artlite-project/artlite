@@ -88,10 +88,15 @@ __attribute__((noinline)) void {{ p }}_inv(float *__restrict st)
         const auto [c, d] = aie::interleave_unzip(h.template extract<16>(0), h.template extract<16>(1), 8);
         aie::store_v(q + 16 * t, aie::add(c, d));
     }
+{% if raw %}
+    aie::store_v((bfloat16 *)(st + 256), aie::broadcast<bfloat16, 64>(1.0f));
+    aie::store_v((bfloat16 *)(st + 256) + 64, aie::zeros<bfloat16, 64>());
+{% else %}
     aie::vector<bfloat16, 16> hi, lo;
     al::split2<16>(al::inv_rms<{{ E }}, 8>(al::group8<false>(aie::load_v<64>(q)).template grow<16>(), {{ eps }}f), hi, lo);
     aie::store_v((bfloat16 *)(st + 256), al::expand8(hi.template extract<8>(0)));
     aie::store_v((bfloat16 *)(st + 256) + 64, al::expand8(lo.template extract<8>(0)));
+{% endif %}
 }
 }  // namespace
 
@@ -540,7 +545,7 @@ class PrefillNormOperator(ArtcOperator):
 
     def __init__(self, *, T: int, add: bool = True, E: int = 2048, eps: float = 1e-5, d_pitch: int = 0,
                  cols: int = COLS, deltas: int = 1, d_stride: int = 0, lo: bool = False, pre: bool = False,
-                 out_pitch: int = 0, out_col: int = 0):
+                 out_pitch: int = 0, out_col: int = 0, raw: bool = False):
         """cols: cores (one per column) taking the token groups in turn: few for short prompts, where the
         op's reconfiguration costs more than its work. deltas = 2 (replay mode): x += d + d2 (a projection in two
         K parts: summed in fp32, rounded once), both at d_pitch, d2 ``d_stride`` elements after d
@@ -549,7 +554,7 @@ class PrefillNormOperator(ArtcOperator):
         (one delta, E <= 2048). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
         norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
         panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them; not
-        in the hold design)."""
+        in the hold design). raw (no add): xn = x w, without the norm (a drafter's taps as panels: w of ones)."""
         assert T % (8 * cols) == 0 and T > 0 and E % 1024 == 0 and 1 <= cols <= COLS
         self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
@@ -567,7 +572,8 @@ class PrefillNormOperator(ArtcOperator):
         self.ch = min(CH, E // 8)  # (columns per chunk)
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
         assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
-        self.pre = pre
+        self.pre, self.raw = pre, raw
+        assert not raw or not (add or pre or lo), "raw: x's own panels"
         self.out_pitch, self.out_col = out_pitch or E, out_col
         assert not pre or not add, "pre: a norm without a delta"
         assert (self.out_pitch, out_col) == (E, 0) or not (lo or self.hold) and (
@@ -591,7 +597,8 @@ class PrefillNormOperator(ArtcOperator):
         if self.hold:
             return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
         # (the same source for add and no add: one copy in a fused ELF)
-        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo, pre=self.pre)
+        return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo, pre=self.pre,
+                           raw=self.raw)
 
     def get_mlir_artifact(self) -> Module:
         if self.hold:

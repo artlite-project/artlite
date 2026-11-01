@@ -15,6 +15,7 @@ repetition penalty 1.03).
 ```
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf   (with its MTP layer)
+$ARTLITE_MODELS_DIR/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   (its DFlash2 drafter, optional: --dflash)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/ggml-org/Qwen3.6-35B-A3B-GGUF/mtp-Qwen3.6-35B-A3B-Q4_0.gguf          (its MTP drafter)
@@ -108,6 +109,12 @@ formats as code pages.
 On the 35B-A3B models a step of several tokens sums the experts' outputs in another order than a step of one, so
 greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the
 dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
+
+Qwen3.8-27B also runs z-lab's DFlash2 block drafter (`--dflash`, 1.07 GB more in memory; `qwen35/dflash.py`): instead of a chain of drafts, one
+dispatch guesses a whole block of 7 tokens at once for ~30 ms (~11 ms per draft for the MTP layer), on a design of its own. Its cache takes
+the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt chunk; the head is the
+MTP drafter's rows, and a selector on the host picks the block's path among each position's 16 best logits. On 256 greedy tokens it
+gives 1.2-1.6x the MTP layer's rate on general text, code, JSON and math, and 1.06x on essays. The server does not use it yet.
 
 Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
 (`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's
