@@ -21,7 +21,9 @@ reaches every core of a KV head's chain. Per step a core gets
 The slots' K rows (normed, rotated) wait as one panel per d-block by position & 7, a step's at most 8 positions apart there
 (``kr``, ``kn``); each open record takes its rows as its K object passes (``kmerge``: lanes of the popped panels, in the core's
 copy, the last core's and the first's own), and a K object scores both pairs of records against the octets, each K panel
-popped once (``qk1``). Each row's positions past its own are masked; P = 2^(s - m), m the row's maximum in the first group,
+popped once (``qk1``). Each row's positions past its own are masked, and a branching step's (``M_BRANCH``: its last slots follow an
+earlier slot than the one before them, ``QwenOverlay.step``'s branch) branch rows also the positions of the slots off their branch:
+two words, the lanes of those positions in the rows of slots 4 .. 7 for the step's first two records; P = 2^(s - m), m the row's maximum in the first group,
 held for the whole pass (scores span less than P's 2^63.5: no rescale; QK starts from the baseline 192 - m), y += P V over the V object's records. A step may cross a group: the first group's open record keeps its scores in ``sc`` past the
 second group's (its slot is the group's last, the second group's open record its first). The tail objects are the open
 records' rows (the ring: ``decode.vring``, or after a prefill the record's V panels, ``M_ATREC``): the core puts the slots' V in,
@@ -134,7 +136,8 @@ SPLIT_CHAIN, SPLIT_HALF = 1, 2  # M_SPLIT: the chain divides the cache (0: each 
 A_QA, A_HP, A_RW = 32, 36, 38  # (A_QA: up to 4 octets)
 A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
 A_WORDS = 40
-A_RWS, A_KR, A_KN, A_KM = 40, 41, 42, 43  # (one pass) the record rows' scratch; the new K's rows, panels; the merged records
+A_RWS, A_KR, A_KN, A_KM, A_BR = 40, 41, 42, 43, 44  # (one pass) the record rows' scratch; the new K's rows, panels; the merged
+# records; from A_BR two words: the branch slots' hidden lanes of the step's first two records (``M_BRANCH``)
 ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 
 # (kernels both cores use)
@@ -1120,7 +1123,7 @@ __attribute__((noinline, minsize)) void {{ p }}_kmask(int32_t *__restrict ws, in
         if (q < rp || (((rp ^ rl) >> 2) && q > rl && (q & 3) == 3))
             continue;
         const aie::mask<32> m0 = aie::mask<32>::from_uint32(q > rl ? ~0u : {{ p }}_past(0, q, p));
-        const aie::mask<32> m1 = aie::mask<32>::from_uint32(q > rl ? ~0u : {{ p }}_past(4, q, p));
+        const aie::mask<32> m1 = aie::mask<32>::from_uint32(q > rl ? ~0u : {{ p }}_past(4, q, p) | st[{{ A_BR }} + q - rp]);
         float *__restrict so = AW(float, {{ a.sc }}) + 32 * (q & 3);
         AIE_LOOP_NO_UNROLL
         for (int set = 0; set < {{ SETS }}; set += 2) {
@@ -1198,6 +1201,8 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_NOBJ }}] = m[{{ M_ANA }}] - {{ HOLD }};
     st[{{ A_P }}] = m[{{ M_POS }}];
     st[{{ A_TREC }}] = m[{{ M_ATREC }}];
+    st[{{ A_BR }}] = m[{{ M_BRANCH }}];
+    st[{{ A_BR + 1 }}] = m[{{ M_BRANCH + 1 }}];
     st[{{ A_I }}] = 0;
     st[{{ A_ROLE }}] = k == 0 ? {{ ROLE_K }} : k == {{ NPH - 1 }} ? {{ ROLE_V }} : {{ ROLE_O }};
     st[{{ A_QS }}] = 0;
@@ -1604,7 +1609,7 @@ class AttnShape:
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
-        own = [("st", 4 * (A_KM + 1 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
+        own = [("st", 4 * (A_BR + 2 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
                ("pp", self.ps)]
         self.gate_tab = not self.one and not self.main_gates  # (the sigmoid's table in the core's L1)
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK + (SIGMOID.table_words().nbytes if self.gate_tab else 0)

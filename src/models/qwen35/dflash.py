@@ -16,14 +16,23 @@ A dispatch holds up to two parts:
 
   then, normed by output_norm, gate (``selector_hidden``, the selector's 256 dims) and lm: the head, the first rows of the model's
   LM head per column in the model's weight buffer (``QwenImage.mtp_view``: the fixed tokens and the table of the sequence's own,
-  ``QwenDraft.see``).
+  ``draft.HeadTable``).
 
-The selector runs on the host (``select``): per position the top 16 logits, their rows of the file's ``selector_successor`` /
-``selector_predecessor`` (dequantized on demand from the mapped file), a greedy walk.
+The selector runs on the host (``Selector``): per position the top 16 logits, their rows of the file's ``selector_successor`` /
+``selector_predecessor`` (dequantized on demand from the mapped file, read ahead after the load), a greedy walk; in a generation's
+rounds also a sibling branch where the first draft is uncertain: two tokens from the first position's second candidate on, which the
+round's step runs in its last two slots, branching off the round's token (``NpuQwen._sibling``).
 
 The main cores' residual is a scratch here: aout's, down's and fc's K groups sum into it (zero-loaded objects first) and go out
 as whole x; the phases need no kernel of their own.
+
+A sequence's state (``snapshot``, ``restore``) holds the ring itself, and the KV records of the prompt cache none of the drafter's: the
+ring keeps a window and a chunk's padding, so a position a few hundred back is already losing its window, while a restore in place, the
+prompt cache's usual one, goes back over a whole answer.
 """
+
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -51,7 +60,7 @@ from artlite.decode.design import (
     input_fill,
 )
 from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
-from artlite.decode.model import InputRegion, ModelOverlay
+from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
@@ -89,6 +98,7 @@ from .dflash_core import (
     DFlashOperator,
     DFlashShape,
 )
+from .draft import HeadTable
 from .image import KC, payload
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
@@ -144,23 +154,60 @@ class DFlashImage(TileImage):
 class Selector:
     """DFlash2's selector on the host (llama.cpp's ``build_dflash2_selector`` and its greedy walk): the drafts of a block from its logits and
     gates. Of the candidates' scores only the chosen predecessor's row is needed: per position the rows of its top_k candidates in
-    ``selector_successor`` and of the predecessor in ``selector_predecessor``."""
+    ``selector_successor`` and of the predecessor in ``selector_predecessor``, read for all positions at once (the predecessors': the
+    anchor's and every candidate's but the last position's)."""
+
+    TABLES = ("selector_successor.weight", "selector_predecessor.weight")
+    SIBLING = 2.0  # a sibling's probability against this times its chain's (``walk``)
 
     def __init__(self, gguf: GGUFFile, cfg: DFlashConfig):
         self.gguf, self.top_k = gguf, cfg.top_k
+        self.sibling: list[int] | None = None
 
-    def walk(self, logits: torch.Tensor, gates: np.ndarray, anchor: int, ids: np.ndarray, n: int, stop: set[int]) -> list[int]:
-        """Up to n drafts after the anchor token (logits (block, vocab): rows of the tokens ``ids``), ending with a token of ``stop``."""
+    def resident(self) -> None:
+        """The tables' pages read ahead (after the drafter's load released the file's): ~200 scattered rows a round."""
+        for name in self.TABLES:
+            self.gguf.willneed(name)
+
+    def walk(self, logits: torch.Tensor, gates: np.ndarray, anchor: int, ids: np.ndarray, n: int, stop: set[int], *,
+             sibling: int = 0) -> list[int]:
+        """Up to n drafts after the anchor token (logits (block, vocab): rows of the tokens ``ids``), ending with a token of ``stop``.
+        ``sibling`` > 0: also ``self.sibling``, a branch of that many tokens from the first position's second candidate on (its
+        walk) when that candidate's probability exceeds ``SIBLING`` times the n drafts' (the probabilities: the lattice's softmax
+        over a position's candidates), else None: the drafts that a step gives their slots are the last ones, kept with the
+        chain's probability, the branch where the first draft is not (prose: a third of first drafts at 32K, of which the
+        second candidate is right in a third to a half)."""
+        self.sibling = None
+        if n <= 0:
+            return []
+        k = self.top_k
+        top = [top_logits(logits[i], k, rows=ids) for i in range(1, n + 1)]
+        c = np.stack([c for _, c in top])
+        succ = self.gguf.rows(self.TABLES[0], c.reshape(-1), prefetch=False).numpy().reshape(n, k, -1)
+        pred = self.gguf.rows(self.TABLES[1], np.concatenate([[anchor], c[:-1].reshape(-1)]), prefetch=False).numpy()
         out: list[int] = []
-        prev = anchor
-        for i in range(1, n + 1):
-            u, c = top_logits(logits[i], self.top_k, rows=ids)
-            succ = self.gguf.rows("selector_successor.weight", c).numpy()
-            pred = self.gguf.rows("selector_predecessor.weight", [prev]).numpy()[0]
-            prev = int(c[np.argmax(succ @ (pred * gates[i]) + u)])
-            out.append(prev)
-            if prev in stop:
+        j = 0  # (the predecessor's row)
+        chain, p2, b = 1.0, 0.0, 0
+        for i in range(n):
+            sc = succ[i] @ (pred[j] * gates[i + 1]) + top[i][0]
+            a = int(np.argmax(sc))
+            if sibling:
+                e = np.exp(sc - sc[a])
+                chain /= e.sum()
+                if i == 0:
+                    e[a] = 0.0
+                    b = int(np.argmax(e))
+                    p2 = e[b] * chain
+            out.append(int(c[i, a]))
+            if out[-1] in stop:
                 break
+            j = 1 + i * k + a
+        if sibling and len(out) == n and p2 > self.SIBLING * chain:
+            self.sibling, j = [int(c[0, b])], 1 + b
+            for i in range(1, sibling):
+                a = int(np.argmax(succ[i] @ (pred[j] * gates[i + 1]) + top[i][0]))
+                self.sibling.append(int(c[i, a]))
+                j = 1 + i * k + a
         return out
 
 
@@ -181,6 +228,7 @@ class DFlashOverlay(ModelOverlay):
 
     CONFIG = DFlashConfig
     IMAGE = DFlashImage
+    SLOTS_OF = 8  # (the model's step: the drafter's injections read its slots' x)
 
     def __init__(self, target: object, gguf: GGUFFile):
         self.target = target
@@ -189,9 +237,14 @@ class DFlashOverlay(ModelOverlay):
         if (cfg.hidden != tc.hidden_size or len(cfg.taps) * cfg.hidden != gguf.tensor("fc.weight").cols
                 or max(cfg.taps) >= tc.num_hidden_layers):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
+        if not target.image.draft_cols or target.SLOTS != self.SLOTS_OF:
+            raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of steps of {self.SLOTS_OF} tokens and a drafter head "
+                             f"(an MTP block), not {target.gguf.path}")
         self.shape = DFlashShape(cfg)
         self.image = DFlashImage(gguf, cfg)
-        self.head = target.image.mtp_view(target.cfg).region(-1, "lm")
+        view = target.image.mtp_view(target.cfg)
+        self.table = HeadTable(view, tc.vocab_size, lambda: target.dev)
+        self.head = view.region(-1, "lm")
         self.image.vocab = self.head.n_rt * self.head.blocks[0].R * COLS
         super().__init__(gguf, layers=list(range(cfg.layers)), vocab=None, weights=None, image=self.image)
         fmts = self.image.formats() | {self.head.blocks[0].fmt}
@@ -199,6 +252,7 @@ class DFlashOverlay(ModelOverlay):
         self.flags = FLAGS
         self.n_norm = -(-cfg.hidden // (NX_PER_NORM * OBJ_K))
         self.selector = Selector(gguf, cfg)
+        self._cs: dict[int, np.ndarray] = {}  # (``_angles``)
         self._plan()
 
     # ------------------------------------------------------------------
@@ -303,6 +357,7 @@ class DFlashOverlay(ModelOverlay):
         self.dev = dev = OverlayDevice(self.op, device=dev0.device)
         if img.pack(dev.alloc("W", img.nbytes), threads=threads, release=release):
             dev.flush("W")
+        self.selector.resident()
         dev.adopt("MW", dev0.buffers["W"])
         dev.adopt("MACT", dev0.buffers["ACT"])
         for name, n in self.sizes.items():
@@ -561,11 +616,23 @@ class DFlashOverlay(ModelOverlay):
         m[:] = 0
         m[M_FLAGS], m[M_NS], m[M_POS], m[M_INJ], m[M_KEEP], m[M_ANOBJ], m[M_G0] = F_ATT, S, p, kind, keep, nobj, g0
         m[M_SKIP], m[M_NASKIP], m[M_NREL] = 2 + S, 1 + nobj, NE_INJ if kind else NE_BLOCK
-        th = self.cfg.rope_theta(np.arange(p, p + S)).astype(np.float64)
         cs = np.zeros((self.SLOTS, HD), np.float32)
-        cs[:S, :HD // 2], cs[:S, HD // 2:] = np.cos(th), np.sin(th)
+        cs[:S] = self._angles(p, S)
         act[o + XB + 4 * META:][:cs.nbytes] = cs.view(np.uint8).reshape(-1)
         self.dev.flush("ACT", o, 2 * XB)
+
+    def _angles(self, p: int, S: int) -> np.ndarray:
+        """[cos | sin] (S, HD) fp32 of positions p .. p + S - 1, from tables of 64 positions (``rope_theta``'s loop over a head's pairs
+        costs ~0.1 ms a call: a round's two dispatches read two or three tables)."""
+        out = []
+        for c in range(p >> 6, ((p + S - 1) >> 6) + 1):
+            if c not in self._cs:
+                if len(self._cs) > 8:
+                    self._cs.clear()
+                th = self.cfg.rope_theta(np.arange(64 * c, 64 * c + 64)).astype(np.float64)
+                self._cs[c] = np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+            out.append(self._cs[c])
+        return np.concatenate(out)[p & 63:(p & 63) + S]
 
     def _window(self, p: int) -> tuple[list[tuple[int, int]], int]:
         """A block at p: the ring's two runs (first object's slot, objects; an empty run the pad object) and the first object."""
@@ -616,10 +683,10 @@ class DFlashOverlay(ModelOverlay):
             self._transaction_of(S, False)
             self._meta_of(S)
 
-    def step(self, S: int, keep: int, q: int, x: np.ndarray | None, p: int) -> None:
+    def step(self, S: int, keep: int, q: int, x: np.ndarray | None, p: int, *, meanwhile: Callable[[], None] | None = None) -> None:
         """A dispatch: the injection of the first ``keep`` rows at q .. of the model's last step of S slots (S 0: none), then with rows x
         (8, hidden) fp32 (the anchor's and the mask token's embeddings; None: no block) the block at p. The results: ``logits``,
-        ``gates``."""
+        ``gates``. ``meanwhile``: host work run while the dispatch runs (the model's next step patched ahead)."""
         assert not S or q == self.next, (q, self.next)
         st = self._transaction_of(S, x is not None)
         rec = None
@@ -638,7 +705,14 @@ class DFlashOverlay(ModelOverlay):
             self._fatt(0, p, 8, nobj=nobj, g0=first)
             self._write_rows(x)
         self.ready()
-        self.dev.dispatch(st.tr)
+        if meanwhile is None:
+            self.dev.dispatch(st.tr)
+            return
+        self.dev.submit(st.tr)
+        try:
+            meanwhile()
+        finally:
+            self.dev.wait()
 
     def _write_rows(self, x: np.ndarray) -> None:
         """The block's rows (8, hidden) fp32 -> the conv cores' res ([column][k block][slot 8][8])."""
@@ -648,6 +722,34 @@ class DFlashOverlay(ModelOverlay):
             o = self.cload + c * (XB + NOBJ_R * XPAY)
             act[o + XB:][:n[c].nbytes] = n[c].view(np.uint8).reshape(-1)
         self.dev.flush("ACT", self.cload, COLS * (XB + NOBJ_R * XPAY))
+
+    def snapshot(self, position: int) -> dict[str, Any]:
+        """What continuing from ``position`` needs of the drafter (the module docstring): the ring's objects of the positions before it,
+        the open objects, the next position."""
+        assert position == self.next, (position, self.next)
+        dev, kv, T = self.dev, self.dev.view("KV"), self.T
+        n, heads = min(-(-position // POS_PER_GROUP), self.shape.ring), self.cfg.layers * COLS
+        ring, opened = host_bytes((heads, n, T)), host_bytes((heads * T,))
+        for i in range(heads):
+            o = self.ring_off + i * self.ring_bytes
+            dev.fetch("KV", o, n * T)
+            ring[i] = kv[o:o + n * T].reshape(n, T)
+        dev.fetch("KV", self.open_off, heads * T)
+        opened[:] = kv[self.open_off:self.open_off + heads * T]
+        return {"ring": ring, "open": opened, "next": self.next}
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Back to a ``snapshot``."""
+        dev, kv, T = self.dev, self.dev.view("KV"), self.T
+        ring, opened = snapshot["ring"], snapshot["open"]
+        n = ring.shape[1]
+        for i in range(ring.shape[0]):
+            o = self.ring_off + i * self.ring_bytes
+            kv[o:o + n * T] = ring[i].reshape(-1)
+            dev.flush("KV", o, n * T)
+        kv[self.open_off:self.open_off + opened.size] = opened
+        dev.flush("KV", self.open_off, opened.size)
+        self.next = snapshot["next"]
 
     def logits(self) -> torch.Tensor:
         """The block's head logits (8, vocab) bf16 (a view of the NPU's buffer; [slot][the head's rows])."""

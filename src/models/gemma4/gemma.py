@@ -207,8 +207,8 @@ class NpuGemma(OverlayModel):
         if self.drafter is not None:
             self._h = self.hidden_state()
 
-    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool) -> None:
-        super()._kept(p, tokens, m, mtp)
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
+        super()._kept(p, tokens, m, mtp, won)
         if self.drafter is not None:
             self._h = self.hidden_state(m - 1)
 

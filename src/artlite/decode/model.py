@@ -386,6 +386,16 @@ class ModelOverlay:
             for b in range(2 if self.AHEAD else 1):
                 self._transaction(S, logits, subs, b)
 
+    def patch_ahead(self, S: int, p: int) -> None:
+        """Patch the step of S slots at p (with logits) while another hardware context's dispatch runs (a drafter's, before the
+        round's step): that step's ``_run`` then patches nothing, unless what ``_set_position`` reads changed meanwhile."""
+        if p + S > self.max_positions:
+            return
+        subs = self.subs(p, S)
+        st = self._transaction(S, True, subs)
+        self._set_position(st, p)
+        self._ahead = (((S, True, self._variant(), subs), p, self._ring_state()), st)
+
     @staticmethod
     def _bd_words(words: np.ndarray, at: np.ndarray, address: np.ndarray, nbytes: np.ndarray) -> None:
         """``txn.bd_words`` of many BDs at once: length in words, address low, high at words[at ..] (the word's packet

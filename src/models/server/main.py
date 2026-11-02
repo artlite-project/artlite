@@ -130,6 +130,9 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     npu.add_argument("--no-prefill", action="store_true", help="run prompts as decode steps")
     npu.add_argument("--kv-k", choices=("single", "hilo"),
                      help="K precision of the KV cache (Llama, Gemma), as artlite-cli's --kv-k")
+    npu.add_argument("--dflash", action=argparse.BooleanOptionalAction,
+                     help="Qwen3.8 27B: draft with its DFlash2 block drafter, a file of its own, instead of its MTP layer "
+                          "(default: where that file exists)")
     npu.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
                      help="run one token after loading (default: on)")
     out = p.add_argument_group("logging")
@@ -320,8 +323,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
 
     def load() -> tuple[Model, NpuModel]:
         t0 = time.perf_counter()
-        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices}
-        model = open_model(args.model, **{k: v for k, v in opts.items() if v})
+        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
+        model = open_model(args.model, **{k: v for k, v in opts.items() if v is not None})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
         npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)

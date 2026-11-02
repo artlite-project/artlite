@@ -30,7 +30,8 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |
-| dflash | 🤔 MiniCPM-V 4.7 1B's DSpark drafter | | openbmb F16, Q4_K_M |
+| dflash | ✅ Qwen3.8 27B's DFlash2 drafter | z-lab Q4_K_M | |
+| | 🤔 MiniCPM-V 4.7 1B's DSpark drafter | | openbmb F16, Q4_K_M |
 | qwen3 | 🤔 Qwen3 0.6B | | unsloth Q4_1 |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
 | speech recognition | 🤔 Whisper base.en | | whisper.cpp `ggml-base.en.bin` |

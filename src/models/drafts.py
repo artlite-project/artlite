@@ -21,7 +21,9 @@ it as well: its average rate would undersell it there), again every ``RETRY`` ro
 context's drafts take a round for ``MARGIN`` times the tokens per second of the drafter's round (a context round also
 leaves the drafter the rows of its kept tokens to run), from a drafter only after a match of ``DRAFTER_MATCH`` tokens
 (shorter ones' estimates are too noisy to beat a drafter round by round), and for up to ``MARGIN`` times a step of
-one's (as their bucket's rounds are counted, less); where nothing pays, the round is a step of one token."""
+one's (as their bucket's rounds are counted, less); where nothing pays, the round is a step of one token. A bucket's
+drafter rounds below a step of one's tokens per second stop the drafter there, until ``RETRY`` rounds later (a text it
+cannot guess: a block drafter's dispatch costs ~10% of a round, and a round keeps nothing of it)."""
 
 from collections.abc import Sequence
 
@@ -142,8 +144,10 @@ class Planner:
                 best_k, best = j, r
         if drafter:
             b = _mtp_bucket(m)
-            if (m < DRAFTER_MATCH or self.mtp_rounds[b] < WARM or self.since_mtp[b] >= RETRY
-                    or MARGIN * self.mtp_tokens[b] / self.mtp_s[b] >= best):
+            if self.mtp_rounds[b] < WARM or self.since_mtp[b] >= RETRY:
+                return None
+            rate = self.mtp_tokens[b] / self.mtp_s[b]
+            if rate * self.step_time(1) >= 1 and (m < DRAFTER_MATCH or MARGIN * rate >= best):
                 return None
             self.since_mtp[b] += 1
         margin = 1 + (MARGIN - 1) * PRIOR_N / self.tried[bucket(m), 0] if m else 1.0

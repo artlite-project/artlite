@@ -333,16 +333,17 @@ class GGUFFile:
             raw = raw.reshape(rows, -1)
         return QTensor(name=name, qtype=qtype, rows=rows, cols=cols, raw=raw)
 
-    def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0) -> torch.Tensor:
+    def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0, *, prefetch: bool = True) -> torch.Tensor:
         """Rows ``idx`` of a tensor dequantized (len(idx), cols) fp32, of its first ``cols`` columns (default all; a
         multiple of the format's block): an embedding lookup in the mapped file. In C++ (``_native.dequant_rows``: a
         decode step's lookup in a few us) the types of ``_native.dequant_supported`` (the plain ones, Q4_0, Q4_1, Q8_0,
-        Q3_K .. Q6_K), the others through ``QTensor.dequantize``."""
+        Q3_K .. Q6_K), the others through ``QTensor.dequantize``. ``prefetch``: ask for the rows' pages at once first
+        (``_prefetch``: a syscall per row, ~1 us each; False for a table read every round, whose pages stay mapped)."""
         t = self.tensor(name)
         cols, idx = cols or t.cols, np.asarray(idx)
         per, nb = _BLOCKS[t.qtype]
         width = cols // per * nb if per > 1 else cols
-        if len(idx) > 1:
+        if prefetch and len(idx) > 1:
             self._prefetch(self.tensor_info[name][2], t.raw.strides[0], idx, width * t.raw.itemsize)
         raw = np.ascontiguousarray(t.raw[idx, :width])
         if _native.dequant_supported(t.qtype):
@@ -378,6 +379,14 @@ class GGUFFile:
         lo, hi = -(-off // mmap.PAGESIZE) * mmap.PAGESIZE, (off + nbytes) // mmap.PAGESIZE * mmap.PAGESIZE
         if hi > lo:
             self.data._mmap.madvise(mmap.MADV_DONTNEED, lo, hi - lo)
+
+    def willneed(self, name: str) -> None:
+        """Ask for a tensor's pages at once, read ahead into the page cache (a table read by scattered rows every
+        decode step: its first reads would fault each page in from disk, one at a time)."""
+        if not hasattr(mmap.mmap, "madvise"):
+            return
+        _, _, off, nbytes = self.tensor_info[name]
+        self.data._mmap.madvise(mmap.MADV_WILLNEED, off // mmap.PAGESIZE * mmap.PAGESIZE, off % mmap.PAGESIZE + nbytes)
 
 
 def bpe_tokenizer_json(gguf: GGUFFile, pattern: str, *, ignore_merges: bool = False) -> bytes:

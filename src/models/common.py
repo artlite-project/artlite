@@ -479,9 +479,13 @@ class OverlayModel(NpuModel):
     _kept_at: tuple[float, ...] = ()
     _chain_at: tuple[float, ...] = ()
     _chains: tuple[float, ...] = ()  # (the chain probabilities of the drafter's last drafts: ``_calibrate``)
+    rounds = False  # a generation's rounds are running (a drafter may offer a sibling: ``_sibling``)
+    _rounds_of: object = None  # (the running generation's: ``_abandon``)
+    carry: tuple[int, ...] = ()  # tokens kept, not run yet: a won sibling, which the next round's step runs before its token
     lookup = True  # drafts from the context
     drafter: Any = None  # a multi-token-prediction drafter
     t_draft = 0.0  # seconds in the drafter's steps
+    blocks = 0  # dispatches of a block drafter (its drafts of a round in one)
     drafted = accepted = 0  # draft tokens run and accepted (of both kinds)
     drafted_ctx = accepted_ctx = 0  # the context's of them
 
@@ -497,8 +501,8 @@ class OverlayModel(NpuModel):
     def stats(self) -> str:
         out = []
         if mtp := self.drafted - self.drafted_ctx:
-            out.append(f"{mtp} draft tokens ({self.t_draft / mtp * 1e3:.2f} ms each), "
-                       f"{self.accepted - self.accepted_ctx} accepted")
+            cost = f"{self.t_draft / self.blocks * 1e3:.1f} ms a block" if self.blocks else f"{self.t_draft / mtp * 1e3:.2f} ms each"
+            out.append(f"{mtp} draft tokens ({cost}), {self.accepted - self.accepted_ctx} accepted")
         if self.drafted_ctx:
             out.append(f"{self.drafted_ctx} context draft tokens, {self.accepted_ctx} accepted")
         return "; ".join(out)
@@ -591,6 +595,7 @@ class OverlayModel(NpuModel):
 
     def rewind(self, n: int) -> int:
         """(down to a multiple of ``group``)"""
+        self._abandon()
         keep = min(n, self.position)
         self.position = keep - keep % self.group
         return self.position
@@ -607,10 +612,12 @@ class OverlayModel(NpuModel):
         """Back to ``_state``'s."""
 
     def checkpoint(self) -> Checkpoint:
+        self._abandon()
         state = ([ov.snapshot(self.position) for ov in self._overlays()], self._state())
         return Checkpoint(self.position, state, nbytes(state))
 
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        self._abandon()
         if checkpoint is None:
             if position % self.group or (self.recurrent and position):
                 raise ValueError(f"position {position}: a restore without a checkpoint keeps a multiple of "
@@ -637,6 +644,7 @@ class OverlayModel(NpuModel):
                ) -> torch.Tensor | None:
         """Run tokens after the cached positions (prefill chunks, else decode steps); ``logits``: return the last
         token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps."""
+        self._abandon()
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
         out, i, nxt = None, 0, None
@@ -741,10 +749,27 @@ class OverlayModel(NpuModel):
         """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab)."""
         return self.steps(tokens)
 
-    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool) -> None:
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
         """After a round's step of ``tokens`` at p: its first m tokens are the sequence's (the rejected drafts'
-        positions are forgotten: later steps overwrite their cache records)."""
+        positions are forgotten: later steps overwrite their cache records); ``won``: so are the first won tokens of its
+        sibling branch (``_sibling``), run again by the next step (``carry``)."""
         self.position = p + m
+
+    def _sibling(self) -> list[int] | None:
+        """The round's sibling branch: tokens from one the drafter ranks second after the round's token on, which its step
+        runs in slots of their own after the drafts (``_verify``), branching off them; the drafts gave them their last
+        slots. None: a chain of drafts."""
+        return None
+
+    def _drop_carry(self) -> None:
+        """A generation ends with a kept sibling branch not run again (``carry``): the model forgets that it was kept."""
+
+    def _abandon(self) -> None:
+        """Whatever runs next on the sequence ends a generation whose reader stopped (a stop string, a call: ``generate``'s
+        finally runs later, or never): a kept sibling branch that no step ran again is forgotten (``_drop_carry``)."""
+        if self.carry:
+            self._drop_carry()
+        self.rounds, self.carry, self._rounds_of = False, (), None
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
                  mask: Mask | None = None) -> Iterator[int]:
@@ -761,41 +786,60 @@ class OverlayModel(NpuModel):
             ctx.extend([token])
         self._begin()
         plan = self.planner
-        while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            k = min(self.DRAFTS, self.capacity - self.position - 1,
-                    max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
-            plan.crossing = self._crossing()
-            t0 = time.perf_counter()
-            m, d = ctx.draft(k) if ctx is not None else (0, [])
-            j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
-            mtp = j is None
-            d = self._mtp(token, k, penalties) if mtp else d[:j]
-            p = self.position
-            t1 = time.perf_counter()
-            raw = self._verify([token, *d], mtp)
-            t2 = time.perf_counter()
-            new: list[int] = []
-            for i in range(len(d) + 1):
-                new.append(sampling.pick(*penalties.top(raw[i], sampling.k, self.softcap)))
-                penalties.accept(new[i])
-                if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
-                    break
-            self._kept(p, [token, *d], len(new), mtp)
-            plan.ran(len(d) + 1, t2 - t1)
-            self.accepted += len(new) - 1
-            if mtp:
-                plan.drafted(m, len(new), t2 - t0)
-                self._calibrate(len(new) - 1)
-            elif d:
-                plan.accepted(m, len(d), len(new) - 1)
-                self.drafted += len(d)
-                self.drafted_ctx += len(d)
-                self.accepted_ctx += len(new) - 1
-            if ctx is not None:
-                ctx.extend(new)
-            for token in new:
-                n += 1
-                yield token
+        self._abandon()
+        tag = object()
+        self.rounds, self._rounds_of = True, tag
+        try:
+            while n != max_tokens and token not in self.eos_token_ids and self.position + len(self.carry) < self.capacity:
+                c = len(self.carry)
+                k = min(self.DRAFTS - c, self.capacity - self.position - 1 - c,
+                        max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
+                plan.crossing = self._crossing()
+                t0 = time.perf_counter()
+                m, d = ctx.draft(k) if ctx is not None else (0, [])
+                j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
+                mtp = j is None
+                d = self._mtp(token, k, penalties) if mtp else d[:j]
+                sib = self._sibling() if mtp else None
+                p = self.position
+                t1 = time.perf_counter()
+                raw = self._verify([*self.carry, token, *d], mtp)
+                t2 = time.perf_counter()
+                new: list[int] = []
+                for i in range(len(d) + 1):
+                    new.append(sampling.pick(*penalties.top(raw[c + i], sampling.k, self.softcap)))
+                    penalties.accept(new[i])
+                    if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
+                        break
+                won = 0  # (the sibling branch's tokens kept: their own logits, the token after each)
+                if sib is not None and new == [sib[0]] and sib[0] not in self.eos_token_ids:
+                    won = 1
+                    while True:
+                        new.append(sampling.pick(*penalties.top(raw[c + len(d) + won], sampling.k, self.softcap)))
+                        penalties.accept(new[-1])
+                        if won == len(sib) or new[-1] != sib[won] or new[-1] in self.eos_token_ids:
+                            break
+                        won += 1
+                self._kept(p, [*self.carry, token, *d], c + 1 if won else c + len(new), mtp, won)
+                self.carry = tuple(new[:won])
+                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1)
+                self.accepted += len(new) - 1
+                if mtp:
+                    plan.drafted(m, len(new), t2 - t0)
+                    self._calibrate(len(new) - 1)
+                elif d:
+                    plan.accepted(m, len(d), len(new) - 1)
+                    self.drafted += len(d)
+                    self.drafted_ctx += len(d)
+                    self.accepted_ctx += len(new) - 1
+                if ctx is not None:
+                    ctx.extend(new)
+                for token in new:
+                    n += 1
+                    yield token
+        finally:
+            if self._rounds_of is tag:
+                self._abandon()
 
     def forced_logits(self, tokens: list[int], first: int = 0, *, batch: int = 1) -> torch.Tensor:
         """Teacher-forced logits (len(tokens) - first, vocab) fp32 of tokens[first:], from position 0, ``batch`` tokens

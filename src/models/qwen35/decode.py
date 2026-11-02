@@ -34,6 +34,8 @@ from . import gdn as GD
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
 M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 11)  # (an F_ATT object's)
 M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
+M_BRANCH = 37  # (a step whose last slots branch off an earlier one: an F_ATT object's two words, the gdn_in object's one: their
+# kernels' ``M_BRANCH``)
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):

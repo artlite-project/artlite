@@ -20,8 +20,8 @@ def main() -> None:
 
         def loaded(**kw: object) -> NpuModel:
             npu = load(**kw)
-            if getattr(npu, "drafter", None) is None:
-                sys.exit(f"drafts.py: {model.name} has no drafter (OverlayModel.drafter)")
+            if not getattr(npu, "_drafting", False):
+                sys.exit(f"drafts.py: {model.name} has no drafter (OverlayModel._drafting)")
             if not 0 <= drafts <= npu.DRAFTS:
                 sys.exit(f"drafts.py: {model.name} takes 0 .. {npu.DRAFTS} draft tokens per dispatch")
             npu.DRAFTS = drafts

@@ -160,8 +160,8 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
 - **Models.** Each GGUF file of the directory that Artlite runs, named `<account>/<repository>:<quantization>`
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
-  says why. Drafters (`mtp-`, `<name>-mtp-`) and vision encoders are not models of their own: Gemma 4 and the
-  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B's is in its own file), and MiniCPM-V 4.7 gets the `mmproj` file of its
+  says why. Drafters (`mtp-`, `<name>-mtp-`, z-lab's `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
+  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file), and MiniCPM-V 4.7 gets the `mmproj` file of its
   directory (`mmproj-model-f16.gguf` before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
@@ -251,6 +251,7 @@ NPU:
 |---|---|
 | `--no-prefill` | run prompts as decode steps |
 | `--kv-k single\|hilo` | the KV cache's K precision (Llama, Gemma 4), as [artlite-cli](cli.md)'s |
+| `--dflash`, `--no-dflash` | Qwen3.8 27B's drafter, as [artlite-cli](cli.md)'s (default: its DFlash2 block drafter where the file is in the models directory, else its MTP layer) |
 | `--warmup`, `--no-warmup` | run one token after loading (default on) |
 
 Images:

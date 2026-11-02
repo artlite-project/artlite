@@ -413,14 +413,14 @@ def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: t
             if any(r.mtp(key, n) is not None for n in contexts):
                 mtp = True
                 steps = r.raw["mtp"].get("tokens_per_step", {})
-                items.append(BarRow(f"{r.quant} + MTP", "ft", {n: r.mtp(key, n) for n in contexts},
+                items.append(BarRow(f"{r.quant} + {r.raw['mtp'].get('drafter', 'MTP')}", "ft", {n: r.mtp(key, n) for n in contexts},
                                     f"Artlite with its drafter, {g} {r.quant}",
                                     suffix={n: f"S={steps[str(n)]}" for n in contexts if str(n) in steps}))
 
     svg = Svg(title, subtitle)
     legend = [("box", f"f{data.color(k)}", v) for k, v in data.legend.items() if k in shown]
     if mtp:
-        legend.insert(1, ("box", "ft", "Artlite with its MTP drafter, S tokens per step"))
+        legend.insert(1, ("box", "ft", "Artlite with its drafter, S tokens per step"))
     svg.legend(legend)
     draw_bars(svg, items, [(n, f"{tokens(n)}-token prompt") for n in contexts], fmt)
     svg.footer(notes)

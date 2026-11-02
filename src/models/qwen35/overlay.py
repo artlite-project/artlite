@@ -97,6 +97,7 @@ from . import attn, gdn
 from .decode import (
     M_ANA,
     M_ATREC,
+    M_BRANCH,
     M_COMMIT,
     M_CSHIFT,
     M_G0,
@@ -305,6 +306,7 @@ class QwenOverlay(ModelOverlay):
         self._fobj = np.array([[[(self.fatt[L] + (c * self.ash.u + u) * XB) // 4 for u in range(self.ash.u)]
                                 for c in range(COLS)] for L in self.fatt], np.int64)  # ([layer][column][sub-step], words)
         self._gin = np.array([self.inp[(L, "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
+        self._branch: bool | int = False  # (M_BRANCH words that are not zeros: ``_set_branch``; -1: unknown)
         r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
@@ -891,6 +893,42 @@ class QwenOverlay(ModelOverlay):
         self._bd_words(words, f[:, 0], kv0 + off, np.array([nk, attn.REC_V, attn.ROWS_B])[kind])
         st.tr.flush_lines(t["lines"])
 
+    @property
+    def can_branch(self) -> bool:
+        """Whether its steps of 8 slots may branch (``step``)."""
+        return self.SLOTS == 8 and self.ash is not None and self.ash.one and self.gsh is not None and self.gsh.slots == 8
+
+    def _metas(self, S: int) -> None:
+        """(the M_BRANCH words as the metadata objects left them: ``_set_branch`` writes them at the next step)"""
+        super()._metas(S)
+        self._branch = -1
+
+    def _branch_angles(self, p: int, L: int) -> None:
+        """The F_ATT objects' angles of a step's last L slots at p (one pass: the step's slots' rows) from ``rope``."""
+        c0, s0 = attn.rope_cs(self.cfg, self.rope[p + 8 - L:p + 8])
+        at = self._fobj[:, :, 0, None] + META + 2 * attn.HD + 64 * (8 - L) + np.arange(64 * L)
+        self.dev.view("ACT").view(np.float32)[at] = np.concatenate([c0, s0], 1).reshape(-1)
+        self.dev.flush_at("ACT", np.unique(4 * at.ravel() & ~63))
+
+    def _set_branch(self, branch: tuple[int, int] | None, p: int) -> None:
+        """A step's M_BRANCH words, the branch (parent c, its L slots) at p hiding the chain's slots c + 1 .. 7 - L from its slots: in the
+        F_ATT objects per record of the step's first two the lanes of those positions in the rows of its slots 4 .. 7 (attn.py's
+        ``kmask``), in the gdn_in objects those slots as lanes | c + 1 << 8 | L << 12 (gdn.py: the branch slots' conv windows,
+        decays and L / M rows); None: zeros."""
+        w, g = np.zeros(2, np.int64), 0
+        if branch is not None:
+            c, L = branch
+            for s in range(8 - L, 8):
+                for q in range(p + c + 1, p + 8 - L):
+                    w[(q >> 3) - (p >> 3)] |= 1 << (8 * (s - 4) + (q & 7))
+            g = ((1 << (8 - L)) - (1 << (c + 1))) | (c + 1) << 8 | L << 12
+        a32 = self.dev.view("ACT").view(np.int32)
+        fo = self._fobj[:, :, 0] + M_BRANCH
+        a32[fo], a32[fo + 1] = w.astype(np.uint32).view(np.int32)
+        a32[self._gin + M_BRANCH] = g
+        self.dev.flush_at("ACT", np.unique(np.concatenate([4 * fo.ravel(), 4 * fo.ravel() + 4, 4 * self._gin + 4 * M_BRANCH]) & ~63))
+        self._branch = branch is not None
+
     def _set_gdn(self, *, nrep: int, cshift: int, commit: bool) -> None:
         """The GDN layers' gdn_in metadata words of the lazy commit."""
         if self.gobj:
@@ -902,20 +940,31 @@ class QwenOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: torch.Tensor, position: int, *, logits: bool = True, commit: bool = True) -> torch.Tensor | None:
+    def step(self, x: torch.Tensor, position: int, *, logits: bool = True, commit: bool = True,
+             branch: tuple[int, int] | None = None) -> torch.Tensor | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the first layer's inputs (embeddings) at positions
         position .. position + S - 1 (the positions before are in the caches, the GDN states hold the committed ones and
         the previous step's accepted tokens: ``accept``). ``commit``: the GDN states after the step's tokens are written
         (all of them must then be accepted, ``accept(S)``), else the step's tokens are replayed by the next step as far
-        as accepted. Returns the slots' logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step),
-        or without ``logits`` None."""
+        as accepted. ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
+        at position + parent + 1 .. (a tree of two branches: ``_set_branch``); None: a chain. Returns the slots' logits
+        (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits`` None."""
         x = x.reshape(-1, self.H).float()
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
         assert self._committed or self._accepted, "accept() the previous lazy step's tokens first"
+        assert branch is None or (S == 8 and self.can_branch and not commit and branch[1] in (1, 2)
+                                  and 0 <= branch[0] < 7 - branch[1]), (S, branch)
         self._conv_for_decode()
+        if branch is not None:  # (after a prefill's text rope; a step patched ahead: its branch slots' angles again)
+            c, L = branch
+            self.rope[position + 8 - L:position + 8] = self.rope[position + c + 1:position + c + 1 + L]
+            if self._ahead is not None:
+                self._branch_angles(position, L)
         if self._metas_s != (S, self.start):
             self._metas(S)
+        if self._branch and self.can_branch or branch is not None:
+            self._set_branch(branch, position)
         self._set_gdn(nrep=self.nrep, cshift=self.cshift, commit=commit)
         self._committed = commit
         xf = x.numpy()
@@ -931,6 +980,10 @@ class QwenOverlay(ModelOverlay):
     def _ran(self, p: int, S: int) -> None:
         for L in self.fatt:
             self.vring.ran(L, p, S)
+
+    def _ring_state(self) -> tuple:
+        """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``)"""
+        return (*super()._ring_state(), self._conv_in_ghdr)
 
     def _conv_index(self) -> tuple[np.ndarray, np.ndarray]:
         """bf16 indices of the GDN layers' conv states: (GOBJ history rows 0 .. 2 of every block, GHDR's [row][channel])
@@ -963,6 +1016,7 @@ class QwenOverlay(ModelOverlay):
         dev.view("GHDR").view(np.uint16)[dst] = dev.view("GOBJ").view(np.uint16)[src + gdn.D * self.cshift]
         dev.flush("GHDR")
         self._conv_in_ghdr = True
+        self._branch = -1  # (a prompt chunk in between: the next step writes the M_BRANCH words)
 
     def _conv_for_decode(self) -> None:
         """Before a decode step after a prefill: GHDR's conv states into the conv objects' base rows."""

@@ -61,8 +61,9 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
     p.add_argument("--no-lookup", action="store_true",
                    help="no draft tokens from the context (prompt lookup) in the multi-token steps")
-    p.add_argument("--dflash", action="store_true",
-                   help="Qwen3.8 27B: draft with its DFlash2 block drafter (a file of its own) instead of its MTP layer")
+    p.add_argument("--dflash", action=argparse.BooleanOptionalAction,
+                   help="Qwen3.8 27B: draft with its DFlash2 block drafter, a file of its own, instead of its MTP layer "
+                        "(default: where that file exists)")
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Gemma): one bfp16 block per 8 dims (Llama's default), or "
                         "hi + lo blocks (Gemma's default; +50%% cache bytes and read time)")
@@ -136,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
     options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
     try:
         text = prompt_text(args)
-        model = open_model(args.model, **{k: v for k, v in options.items() if v})
+        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
         ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image)
         sampling = model.sampling(think=args.think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,

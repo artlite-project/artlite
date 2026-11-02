@@ -71,7 +71,8 @@ KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
 HEAD_ROWS = 65536  # a drafter head's fixed rows: the special tokens and the first ids of the vocabulary
-TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``draft.QwenDraft.see``), 64 per column
+DFLASH_HEAD_ROWS = 80000  # a DFlash2 drafter's: one pass a round, so 1.3 ms for the rare tokens that end a chain of drafts (code, JSON)
+TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``draft.HeadTable.see``), 64 per column
 
 
 def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
@@ -112,9 +113,10 @@ class QwenImage(TileImage):
     mtp_layer = -1
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
-                 vocab: int | None = None, tile_bytes: int = 0):
+                 vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
-        fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides)."""
+        fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
+        (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         self._expert_rows: dict[tuple[str, int], np.ndarray] = {}  # (every layer's slab blocks share them)
@@ -135,7 +137,7 @@ class QwenImage(TileImage):
         trunk = all(contiguous(r) for r in self.regions)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         if cfg.nextn_layers == 1 and not cfg.moe and not trunk:  # (its head: a view of a region-major image's rows)
-            self.draft_cols = self._draft_cols(self.R[self.fmt(lm)])
+            self.draft_cols = self._draft_cols(self.R[self.fmt(lm)], HEAD_ROWS if mtp else DFLASH_HEAD_ROWS)
         if self.draft_cols:
             F = COLS * self.draft_cols - TABLE_ROWS
             self.fixed, self.table = (head_tokens(gguf, F) if self.n_ids == cfg.vocab_size else
@@ -143,8 +145,9 @@ class QwenImage(TileImage):
             self.vocab = self.n_ids + TABLE_ROWS
         self._add(-1, "lm", [("lm", (lm,), self.head_rows())], H)
         if self.draft_cols:
-            self.mtp_layer = L = cfg.num_hidden_layers
             self.order = self._order()
+        if self.draft_cols and mtp:
+            self.mtp_layer = L = cfg.num_hidden_layers
             self._add(L, "eh", [("eh", (f"blk.{L}.nextn.eh_proj.weight",), column_rows(H))], 2 * H)
             self._layer(L, attention=True)
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
@@ -157,11 +160,11 @@ class QwenImage(TileImage):
                 self.regions.append(r)
         self._place()
 
-    def _draft_cols(self, R: int) -> int:
-        """The drafter head's rows per column: whole tiles of R rows and whole C objects, at least the fixed and the
-        table's rows (``HEAD_ROWS``, ``TABLE_ROWS``) or as many as the image's ids hold (0: none)."""
+    def _draft_cols(self, R: int, rows: int) -> int:
+        """The drafter head's rows per column: whole tiles of R rows and whole C objects, at least ``rows`` fixed ones and the
+        table's (``TABLE_ROWS``) or as many as the image's ids hold (0: none)."""
         m = math.lcm(R, C_LEN)
-        P = -(-(HEAD_ROWS + TABLE_ROWS) // (COLS * m)) * m
+        P = -(-(rows + TABLE_ROWS) // (COLS * m)) * m
         while P and COLS * P - TABLE_ROWS > self.n_ids:
             P -= m
         assert not P or self.n_ids % (COLS * C_LEN) == 0, "the LM rows of an MTP model: whole C objects per column"

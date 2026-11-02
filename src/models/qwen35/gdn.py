@@ -49,6 +49,11 @@ sink). A column's DMA tasks
 per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
 panels) and 21 drains.
 
+Branch (8 slots, ``M_BRANCH`` in gdn_in's metadata, ``QwenOverlay.step``'s branch): the step's last L slots follow slot c instead of
+slot 7 - L. Their conv windows take the history rows of slot c's window from their first row on, then their own (``conv1``); their
+rows of the decays come from the slots' d with the slots c + 1 .. 7 - L zeroed (factors 1: the products along the branch), and L, M
+hide those slots from them (the helper's ``vhead``). The other rows are the chain's: row t of T = (I + L)^-1 reads rows before it.
+
 The 8-slot core's delta rule is chunkwise (the WY / UT form, the prefill's ``gdn_prefill``, on one block of 8 tokens: its
 docstring has the equations): a step costs about one pass per panel, whatever its S (a token-by-token pass per panel
 took ~6000 cycles at S 8 against the panel's ~2170 of DMA, and held the weights' stream for it). Per k head the Gram
@@ -101,6 +106,8 @@ F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the G
  G_PANEL) = range(15)
 G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (8 slots) the k head, its v heads done, the v head in the column
 G_HK = G_KO  # (8 slots) the helper's next work: a k head's (1), a v head's (0)
+G_BR = 15  # (8 slots) a branching step's word (``M_BRANCH``: the lanes hidden from its branch | its parent slot + 1 << 8 | its
+# slots << 12, or 0)
 G_WORDS = 16
 G_TA = G_WORDS  # (8 slots) the SiLU table's addresses
 PAN = 72  # bytes of a bfp16 panel (8 x 8)
@@ -527,6 +534,19 @@ __attribute__((noinline)) void {{ p }}_cp4k(int32_t *__restrict dst, const int32
 {
     al::copy<1024, 16>(dst, src);
 }
+
+// n lines of 64 B (once per head: program memory)
+__attribute__((noinline, minsize)) void {{ p }}_cpl(void *__restrict dst, const void *__restrict src, int n)
+{
+    int32_t *__restrict d = (int32_t *)dst;
+    const int32_t *__restrict s = (const int32_t *)src;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < n; i++) {
+        aie::store_v(d, aie::load_v<16>(s));
+        d += 16;
+        s += 16;
+    }
+}
 {% else %}
 // n lines of 64 B
 __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__restrict src, int n = 64)
@@ -621,6 +641,25 @@ __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const
         }
     }
 }
+{% if SMAX == 8 %}
+
+// One slot's y (``conv8``'s arithmetic) whose window is rows a .. a + na - 1, then rows b ..: a branch slot of a step (its
+// parent's rows, then the branch's)
+__attribute__((noinline, minsize)) void {{ p }}_conv1(const bfloat16 *__restrict a, int na, const bfloat16 *__restrict b,
+                                                    const bfloat16 *__restrict w, bfloat16 *__restrict y)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int c = 0; c < {{ D }}; c += 32) {
+        aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 4; k++) {
+            const aie::vector<bfloat16, 32> xk = aie::load_v<32>((k < na ? a + {{ D }} * k : b + {{ D }} * (k - na)) + c);
+            acc = aie::mac(aie::mac(acc, xk, aie::load_v<32>(w + {{ 2 * D }} * k + c)), xk, aie::load_v<32>(w + {{ 2 * D }} * k + {{ D }} + c));
+        }
+        aie::store_v(y + c, acc.template to_vector<bfloat16>());
+    }
+}
+{% endif %}
 
 """
 
@@ -798,7 +837,7 @@ __attribute__(({{ cold }})) void {{ p }}_decays(const float *__restrict d, float
 // L = beta (1 + E) K K^T (s < t), M = (1 + E) Q K^T (s <= t) from the Gram blocks g and er: L as bf16 hi, lo (lb: [hi |
 // lo][t][s]), M's panels at pn + 2 panels
 __attribute__((noinline)) void {{ p }}_lm(const float *__restrict be, const float *__restrict g, const float *__restrict er,
-                                        bfloat16 *__restrict lb, uint8_t *__restrict pn)
+                                        bfloat16 *__restrict lb, uint8_t *__restrict pn, uint64_t hide)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const al::BV nI = al::neg_eye();
@@ -806,11 +845,11 @@ __attribute__((noinline)) void {{ p }}_lm(const float *__restrict be, const floa
     const aie::vector<float, 64> kk = aie::load_v<64>(g), q = aie::load_v<64>(g + 64);
     const aie::vector<float, 64> l = al::mulff<64>(al::bcast8(aie::load_v<8>(be)), aie::add(kk, al::mulff<64>(e, kk)));
     aie::vector<bfloat16, 64> h, lo;
-    al::split2<64>(aie::select(aie::zeros<float, 64>(), l, aie::mask<64>::from_uint64(0x{{ strict }}ull)), h, lo);
+    al::split2<64>(aie::select(aie::zeros<float, 64>(), l, aie::mask<64>::from_uint64(0x{{ strict }}ull & ~hide)), h, lo);
     aie::store_v(lb, h);
     aie::store_v(lb + 64, lo);
     {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)),
-                                                      aie::mask<64>::from_uint64(0x{{ lower }}ull))), nI, pn + {{ 2 * PAN }});
+                                                      aie::mask<64>::from_uint64(0x{{ lower }}ull & ~hide))), nI, pn + {{ 2 * PAN }});
 }
 
 // T = (I + L)^-1 by row substitution, r[t] = e_t - sum_{s < t} L[t][s] r[s]: per s three bf16 products into the row's
@@ -892,9 +931,28 @@ __attribute__(({{ cold }})) void {{ p }}_vhead(int32_t *__restrict ws)
         tv[t] = gt[32 * t + h];
         tv[16 + t] = gt[32 * t + 16 + h];
     }
+{% if SMAX == 8 %}
+    const int br = st[{{ G_BR }}], hm = br & 0xFF, r0 = 8 - (br >> 12);  // (the hidden lanes, the branch's first row)
+    float *__restrict fb = GW(float, {{ g.fv }});
+    if (br) {  // (a branching step: its branch rows' decays along the parent's tokens, kept in fv meanwhile)
+        aie::store_v(fb, aie::select(aie::load_v<16>(tv), aie::zeros<float, 16>(), aie::mask<16>::from_uint32(hm)));
+        {{ p }}_decays(fb, er);
+        for (int r = r0; r < 8; r++)
+            aie::store_v(fb + 16 * r, aie::load_v<16>(er + 16 * r));
+    }
     {{ p }}_decays(tv, er);
+    uint64_t hide = 0;  // (the branch rows' lanes off it)
+    if (br)
+        for (int r = r0; r < 8; r++) {
+            aie::store_v(er + 16 * r, aie::load_v<16>(fb + 16 * r));
+            hide |= (uint64_t)hm << (8 * r);
+        }
+{% else %}
+    {{ p }}_decays(tv, er);
+    const uint64_t hide = 0;
+{% endif %}
     uint8_t *__restrict pn = GW(uint8_t, {{ g.pn }});
-    {{ p }}_lm(tv + 16, GW(float, {{ g.gg }}), er, GW(bfloat16, {{ g.lb }}), pn);
+    {{ p }}_lm(tv + 16, GW(float, {{ g.gg }}), er, GW(bfloat16, {{ g.lb }}), pn, hide);
     {{ p }}_tinv(GW(bfloat16, {{ g.lb }}), GW(float, {{ g.xy }}), GW(bfloat16, {{ g.rb }}), pn);  // (xy: free between panels)
     float *__restrict fv = GW(float, {{ g.fv }});
 {% if SMAX == 8 %}
@@ -1077,12 +1135,19 @@ __attribute__((noinline)) void {{ p }}_ggates(const float *__restrict hab, int32
     al::zero<{{ 32 * SMAX }}, 16>(gt);
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {
+{% if 2 * HC <= 16 %}
+        const aie::vector<float, 16> ab = aie::load_v<16>(hab + {{ C_LEN // 2 }} * s);  // (alpha HC | beta HC | ..)
+        const aie::mask<16> hc = aie::mask<16>::from_uint32({{ 2 ** HC - 1 }}u);
+        const aie::vector<float, 16> al_ = aie::select(aie::zeros<float, 16>(), ab, hc);
+        const aie::vector<float, 16> be = aie::select(aie::zeros<float, 16>(), aie::shuffle_down(ab, {{ HC }}), hc);
+{% else %}
         const float *__restrict ab = hab + {{ C_LEN // 2 }} * s;
         aie::vector<float, 16> al_ = aie::zeros<float, 16>(), be = aie::zeros<float, 16>();
 {% for h in range(HC) %}
         al_[{{ h }}] = ab[{{ h }}];
         be[{{ h }}] = ab[{{ HC + h }}];
 {% endfor %}
+{% endif %}
         const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::add(al_, aie::load_v<16>(prm)));
         aie::store_v(gt, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
         // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
@@ -1129,6 +1194,7 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
         st[{{ G_NREP }}] = m[{{ M_NREP }}];
         st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
         st[{{ G_COMMIT }}] = m[{{ M_COMMIT }}];
+        st[{{ G_BR }}] = m[{{ M_BRANCH }}];
     }
     if (flags & {{ F_GDN }}) {
         {{ p }}_ghead(x, ws);
@@ -1181,6 +1247,11 @@ void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws)
     bfloat16 *__restrict yc = GW(bfloat16, {{ g.zb }}), *__restrict t = GW(bfloat16, {{ g.y }});
     float *__restrict ys = GW(float, {{ g.o }}), *__restrict vt = GW(float, {{ g.vt }});
     {{ p }}_conv8(h, GW(bfloat16, {{ g.cw }}), yc);
+    if (const int br = st[{{ G_BR }}]) {  // (a branching step's branch slots j: its parent's rows from j on, then the branch's)
+        const int c1 = (br >> 8) & 15, L = br >> 12;
+        for (int j = 0; j < L; j++)
+            {{ p }}_conv1(h + {{ D }} * (c1 + j), 3 - j, h + {{ D }} * (11 - L), GW(bfloat16, {{ g.cw }}), yc + {{ D }} * (8 - L + j));
+    }
     if (b >= 2) {
         {{ p }}_tr8(yc, (bfloat16 *)ys, 8, {{ D }});
         {{ p }}_tr8(yc + 64, (bfloat16 *)ys + 512, 8, {{ D }});
@@ -1200,19 +1271,19 @@ void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws)
 // A conv block's new history (hb: [base 3 | S rows], 11 rows) -> d
 void {{ p }}_ghist(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
-    al::copy<{{ 11 * D }}, 64>(d, GW(bfloat16, {{ g.hb }}));
+    {{ p }}_cpl(d, GW(bfloat16, {{ g.hb }}), {{ 11 * D * 2 // 64 }});
 }
 
 // The K^T panels of the previous step's tokens of the k head -> the workspace
 void {{ p }}_gkold(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
-    al::copy<{{ 16 * 2 * PAN // 4 }}, 16>(GW(int32_t, {{ g.kold }}), (const int32_t *)(x + {{ 2 * META }}));
+    {{ p }}_cpl(GW(int32_t, {{ g.kold }}), x + {{ 2 * META }}, {{ 16 * 2 * PAN // 64 }});
 }
 
 // The step's K^T panels of the k head
 void {{ p }}_gknew(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
-    al::copy<{{ 16 * 2 * PAN // 4 }}, 16>((int32_t *)d, GW(int32_t, {{ g.kt }}));
+    {{ p }}_cpl(d, GW(int32_t, {{ g.kt }}), {{ 16 * 2 * PAN // 64 }});
 }
 
 // A v head's U of the previous step ([panel 16][j 8][t 8] fp32) -> the workspace

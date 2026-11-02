@@ -9,9 +9,9 @@ The block (layer L = the model's layer count): x0 = eh_proj [enorm(emb(t_q)) | h
 layer on its own cache and an FFN (an MoE layer, or a dense one), both as the model's (``QwenOverlay``'s phases on the
 drafter's image: attn_in, the attention, attn_out, then moe_in, the routing, sdown, the experts, the combine; or
 gate_up, down), then the head over the residual normed by ``nextn.shared_head_norm``: rows of the file's
-``output.weight``, ``QwenDraft.ids`` the token of each logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
+``output.weight``, ``HeadTable.ids`` the token of each logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
 the first ids (the tokenizer's BPE merges, a frequency order: 98.6% of essay tokens, 97.9% of agents' generated ones);
-then a table of ``TABLE_ROWS`` of the sequence's own tokens past them (``QwenDraft.see``: the most recently seen;
+then a table of ``TABLE_ROWS`` of the sequence's own tokens past them (``HeadTable.see``: the most recently seen;
 identifiers of the code an agent reads leave 0.2% of its tokens out of the head, against 2.1% without; text in other
 scripts, CJK or Cyrillic, keeps 6-17% out: tokens it had not used before). The row at position q (token t_q, the model's
 output-normed hidden state of q - 1) writes its cache record at q and predicts t_{q+1}; the next draft's h is its own
@@ -26,7 +26,7 @@ draft) rewrites the rows the last round's drafts wrote, then one-slot steps (the
 
 import dataclasses
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 import torch
@@ -36,7 +36,7 @@ from artlite.decode.image import column_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
-from artlite.overlay import Sequence
+from artlite.overlay import OverlayDevice, Sequence
 
 from .attn import OBJ_BYTES
 from .image import HEAD_ROWS, TABLE_ROWS, QwenImage, head_tokens
@@ -89,6 +89,60 @@ def draft_formats(gguf: GGUFFile) -> tuple[str, ...]:
     return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1]))))
 
 
+class HeadTable:
+    """A drafter head's tokens: ``ids`` (the token of each logit) and its table of the sequence's own (module docstring), of a
+    ``view`` of the image (``DraftImage``, ``QwenImage.mtp_view``) for a model of ``vocab_size`` tokens; ``device``: the device that
+    holds the view's weights."""
+
+    def __init__(self, view: object, vocab_size: int, device: Callable[[], OverlayDevice]):
+        self.view, self.device = view, device
+        self.ids = view.head_rows().reshape(-1)
+        self._per = view.vocab // COLS  # (a column's logits)
+        self.rows = np.flatnonzero(np.arange(view.vocab) % self._per >= len(view.fixed) // COLS)  # (the table's logits)
+        self._fixed = np.zeros(vocab_size, bool)
+        self._fixed[view.fixed] = True
+        idle = sorted(zip(self.ids[self.rows].tolist(), self.rows.tolist()), reverse=True)
+        self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
+
+    def see(self, ids: Iterable[int]) -> None:
+        """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
+        recently seen ones outside the fixed rows (the least recently seen leaves), the head's rows of those that
+        enter packed into the weight image (the next step's)."""
+        a = np.fromiter(ids, np.int64)
+        a = a[(a >= 0) & (a < len(self._fixed))]
+        a = a[~self._fixed[a]]
+        if not a.size:
+            return
+        u, last = np.unique(a[::-1], return_index=True)
+        order = u[np.argsort(-last)][-len(self.rows):].tolist()  # (the last ones, by their last occurrence)
+        lru = self._lru
+        for t in order:
+            if t in lru:
+                lru.move_to_end(t)  # (they stay: the others leave first)
+        new = [t for t in order if t not in lru]
+        for t in new:
+            lru[t] = lru.popitem(last=False)[1]
+        for t in order:
+            lru.move_to_end(t)
+        if new:
+            self._write([lru[t] for t in new], new)
+
+    def _write(self, rows: list[int], tokens: list[int]) -> None:
+        """The head's logits ``rows`` are the ``tokens``' now: their row tiles packed again, flushed."""
+        view, dev = self.view, self.device()
+        r = view.region(-1, "lm")
+        b = r.block("lm")
+        tiles = set()
+        for i, t in zip(rows, tokens, strict=True):
+            c, j = divmod(i, self._per)
+            self.ids[i] = b.rows[c, j] = t
+            tiles.add((c, j // (b.R * b.G)))
+        w = dev.view("W")
+        for c, rt in sorted(tiles):
+            for off, n in view.repack(w, r, b, c, rt):
+                dev.flush("W", off, n)
+
+
 class _DraftConfig:
     from_gguf = staticmethod(mtp_config)
 
@@ -96,8 +150,7 @@ class _DraftConfig:
 class QwenDraft(QwenOverlay):
     """The drafter ``gguf`` (an MTP file; None: the block of the model's own file, ``QwenImage.mtp_view``) of the model
     on ``target`` (whose design runs the drafter's formats: ``QwenOverlay(formats=)``). ``load`` after the target's
-    (its program and context; the model's own block: its weight buffer). ``ids`` (vocab,): the token of each of the
-    head's logits; ``table_rows``: the logits of the table (``see``)."""
+    (its program and context; the model's own block: its weight buffer). ``table``: its head's tokens."""
 
     CONFIG, IMAGE = _DraftConfig, DraftImage
 
@@ -121,51 +174,7 @@ class QwenDraft(QwenOverlay):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
                              f"QwenOverlay(formats=draft_formats(gguf))")
         self.target, self.op = target, target.op  # (the model's design and hardware context: ``load``)
-        img = self.image
-        self.ids = img.head_rows().reshape(-1)
-        self._per = self.vocab // COLS  # (a column's logits)
-        self.table_rows = np.flatnonzero(np.arange(self.vocab) % self._per >= len(img.fixed) // COLS)
-        self._fixed = np.zeros(cfg.vocab_size, bool)
-        self._fixed[img.fixed] = True
-        idle = sorted(zip(self.ids[self.table_rows].tolist(), self.table_rows.tolist()), reverse=True)
-        self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
-
-    def see(self, ids: Iterable[int]) -> None:
-        """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
-        recently seen ones outside the fixed rows (the least recently seen leaves), the head's rows of those that
-        enter packed into the weight image (the next step's)."""
-        a = np.fromiter(ids, np.int64)
-        a = a[(a >= 0) & (a < len(self._fixed))]
-        a = a[~self._fixed[a]]
-        if not a.size:
-            return
-        u, last = np.unique(a[::-1], return_index=True)
-        order = u[np.argsort(-last)][-len(self.table_rows):].tolist()  # (the last ones, by their last occurrence)
-        lru = self._lru
-        for t in order:
-            if t in lru:
-                lru.move_to_end(t)  # (they stay: the others leave first)
-        new = [t for t in order if t not in lru]
-        for t in new:
-            lru[t] = lru.popitem(last=False)[1]
-        for t in order:
-            lru.move_to_end(t)
-        if new:
-            self._write([lru[t] for t in new], new)
-
-    def _write(self, rows: list[int], tokens: list[int]) -> None:
-        """The head's logits ``rows`` are the ``tokens``' now: their row tiles packed again, flushed."""
-        r = self.image.region(-1, "lm")
-        b = r.block("lm")
-        tiles = set()
-        for i, t in zip(rows, tokens, strict=True):
-            c, j = divmod(i, self._per)
-            self.ids[i] = b.rows[c, j] = t
-            tiles.add((c, j // (b.R * b.G)))
-        w = self.dev.view("W")
-        for c, rt in sorted(tiles):
-            for off, n in self.image.repack(w, r, b, c, rt):
-                self.dev.flush("W", off, n)
+        self.table = HeadTable(self.image, cfg.vocab_size, lambda: self.dev)
 
     def _phases(self) -> list[tuple[int, str]]:
         return [(self.L, "eh"), *super()._phases()]
@@ -216,4 +225,4 @@ class QwenDraft(QwenOverlay):
         return torch.from_numpy(x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight"))
 
 
-__all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "QwenDraft", "draft_formats", "head_tokens", "mtp_config"]
+__all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "HeadTable", "QwenDraft", "draft_formats", "head_tokens", "mtp_config"]

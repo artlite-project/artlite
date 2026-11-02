@@ -65,16 +65,18 @@ def model_class(arch: str) -> type[Model]:
 
 
 def open_model(path: str, **options: object) -> Model:
-    """Open a GGUF file with the ``Model`` of its architecture; ``options``: that class's keyword arguments."""
+    """Open a GGUF file with the ``Model`` of its architecture; ``options``: that class's keyword arguments (one given as
+    False: where the class has it, a flag that turns a feature off applies to every model)."""
     arch = architecture(path)
     try:
         cls = model_class(arch)
     except NotImplementedError as e:
         raise NotImplementedError(f"{path}: {e}") from None
-    unknown = set(options) - set(inspect.signature(cls).parameters)
+    params = inspect.signature(cls).parameters
+    unknown = {k for k, v in options.items() if k not in params and v is not False}
     if unknown:
         raise ValueError(f"{cls.name} has no option {', '.join(sorted(unknown))}")
-    return cls(path, **options)
+    return cls(path, **{k: v for k, v in options.items() if k in params})
 
 
 def is_diffusers(path: str) -> bool:

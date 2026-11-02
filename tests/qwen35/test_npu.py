@@ -131,7 +131,7 @@ def test_mtp(size: str) -> None:
 
     path = _path(size)
     _drafter(path)
-    qwen = Qwen(path)
+    qwen = Qwen(path, dflash=False)
     model = qwen.load(capacity=4096)
     assert model.drafter is not None and model.DRAFTS == model.overlay.SLOTS - 1
     first = qwen.prompt(essay("apple.txt")[:4000] + "\n\nSummarize the essay above in a few paragraphs.")
@@ -176,7 +176,7 @@ def test_mtp_prefill(size: str) -> None:
 
     path = _path(size)
     _drafter(path)
-    qwen = Qwen(path)
+    qwen = Qwen(path, dflash=False)
     got = draft_gate(qwen.load(capacity=2048), draft_prompts(qwen))
     pre, steps = got["prefill"].mean(0), got["steps"].mean(0)
     assert pre[0] > 0.985 * steps[0] and (pre[1:] > steps[1:] - 0.02).all(), (pre, steps)

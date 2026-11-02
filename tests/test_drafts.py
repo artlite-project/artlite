@@ -10,7 +10,7 @@ import torch
 
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.common import OverlayModel, Sampling
+from models.common import OverlayModel, Penalties, Sampling
 from models.drafts import DRAFTER_MATCH, NMAX, PRIOR, RETRY, WARM, Lookup, Planner, bucket
 
 from .common import essay
@@ -60,7 +60,7 @@ def test_planner() -> None:
     for m in (1, 3, 20):
         for _ in range(WARM):
             p.ran(4, 0.105)
-            p.drafted(m, 3 if m > 1 else 1, 0.110)  # (27 tokens/s; after matches of 1: 9)
+            p.drafted(m, 3 if m > 1 else 2, 0.110)  # (27 tokens/s; after matches of 1: 18)
     assert p.choose(1, 3, drafter=True) is None  # (E 1.39 per 0.105 s, but short matches: the drafter's)
     assert p.choose(DRAFTER_MATCH, 3, drafter=True) is None  # (no drafter rounds after matches of 6 yet)
     assert [p.choose(20, 3, drafter=True) for _ in range(RETRY + 1)] == [3] * RETRY + [None]  # (E 3.4 per 0.105 s)
@@ -72,6 +72,23 @@ def test_planner() -> None:
     for _ in range(10):
         p.drafted(20, 4, 0.110)  # (where the context repeats, the drafter guesses it too: 36 tokens/s)
     assert p.choose(20, 3, drafter=True) is None
+
+
+def test_planner_stop() -> None:
+    """A text the drafter cannot guess: rounds under a step of one's tokens per second stop it in that bucket, a step of one or the
+    context's drafts run instead, and every ``RETRY`` rounds it drafts again; a drafter that pays stays however few it keeps."""
+    p = Planner((1.0, 1.002, 1.006, 1.008))
+    p.ran(1, 0.300)
+    for _ in range(WARM):
+        p.drafted(0, 1, 0.330)  # (a block's 30 ms for nothing)
+    assert [p.choose(0, 0, drafter=True) for _ in range(RETRY + 1)] == [0] * RETRY + [None]
+    p.drafted(0, 1, 0.330)
+    assert p.choose(0, 0, drafter=True) == 0
+    q = Planner((1.0, 1.002, 1.006, 1.008))
+    q.ran(1, 0.340)
+    for _ in range(3 * WARM):
+        q.drafted(0, 2, 0.353)  # (prose at 32K: ~2.4 tokens a round, against 1 token in 340 ms)
+    assert q.choose(0, 0, drafter=True) is None
 
 
 def test_planner_crossing() -> None:
@@ -195,6 +212,101 @@ def test_draft_stop() -> None:
     keep = dense._keep(0.1, 1)
     dense.planner.crossing = (False, False, True, True)  # (a step of 3 crosses a group: 0.33 tokens of a pass)
     assert keep and not dense._keep(0.3, 1) and dense._keep(0.1, 2)
+
+
+class Branchy(Text):
+    """``Text`` with a drafter of k tokens a round whose first draft is wrong every third round, a sibling branch then (the
+    text's next ``L`` tokens: every other time, its second token wrong) in the place of the chain's last ``L`` drafts; a
+    step's branch slots predict as their positions (``branch``: its parent slot, its slots); ``drops``: carries dropped."""
+
+    DRAFTS, L = 7, 2
+    STEP_COST = (1.0,) * 8
+    prefill = None
+
+    def __init__(self, text: list[int]):
+        super().__init__(text)
+        self.rounds_n, self.won, self.drops, self.sib, self.branches = 0, [], 0, None, []
+
+    @property
+    def _drafting(self) -> bool:
+        return True
+
+    def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
+        q = self.position + len(self.carry)  # (the token's position)
+        d = (self.text[q + 1:q + 1 + k] + [VOCAB - 1] * k)[:k]  # (past the text: wrong)
+        self.rounds_n += 1
+        self.sib = None
+        if self.rounds_n % 3 == 0 and k == self.DRAFTS - len(self.carry) and k > self.L:
+            d = [VOCAB - 1, *d[1:]]
+            self.sib = (self.text[q + 1:q + 1 + self.L] + [VOCAB - 1] * self.L)[:self.L]
+            if self.rounds_n % 2:
+                self.sib = [self.sib[0], VOCAB - 1][:self.L]
+            d = d[:k - self.L]
+        return d
+
+    def _sibling(self) -> list[int] | None:
+        return self.sib
+
+    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
+        if self.sib is None:
+            return self.steps(tokens)
+        self.branches.append((self.position, len(self.carry), list(tokens), list(self.sib)))
+        return self.steps([*tokens, *self.sib], branch=(len(self.carry), len(self.sib)))
+
+    def steps(self, tokens: list[int], *, logits: bool = True, branch: tuple[int, int] | None = None) -> torch.Tensor:
+        out = super().steps(tokens, logits=logits)
+        if branch is not None:  # (branch slot j at position p + c + 1 + j: the text's token after it)
+            p, (c, L) = self.position - len(tokens), branch
+            out = out.float()
+            for j in range(L):
+                out[len(tokens) - L + j] = -8.0
+                out[len(tokens) - L + j, self.text[min(p + c + 2 + j, len(self.text) - 1)]] = 8.0
+            out = out.bfloat16()
+        return out
+
+    def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
+        super()._kept(p, tokens, m, mtp, won)
+        if won:
+            self.won.append(won)
+
+    def _drop_carry(self) -> None:
+        self.drops += 1
+
+
+def test_sibling() -> None:
+    """A drafter's sibling branch (``OverlayModel._sibling``): a round whose first draft is wrong keeps the branch's tokens
+    that the model's own logits confirm, then the token after them (its slots' logits); the next step runs them again
+    before its token (``carry``) and drafts a slot fewer each; the text is greedy's. A generation that ends right after a
+    kept branch drops its carry, and so does whatever runs next after a reader that stopped reading (``_abandon``)."""
+    rng = np.random.default_rng(3)
+    text = rng.integers(1, VOCAB - 1, 120).tolist() + [0]
+    m = Branchy(text)
+    out = list(m.generate(m.first(10), -1, GREEDY, text[:10]))
+    assert out == text[10:]
+    assert m.won and set(m.won) == {1, 2} and m.drops == 0
+    p = 10
+    for c in m.calls:  # (each step at the text's next position, its carry first; a branch's slots after its chain)
+        assert c[0] == text[p], (c, p)
+        p += next((i for i in range(1, len(c)) if c[i] != text[p + i]), len(c))
+        if p > len(text) - 2:
+            break
+    for pos, c, tokens, sib in m.branches:
+        assert len(tokens) + len(sib) == 8 and tokens[:c + 1] == text[pos:pos + c + 1]
+    assert m.accepted == len(out) - 1 - len(m.calls)  # (a round: its token and its kept drafts or branch)
+    drops = 0
+    for n in range(30, 120):  # (texts that end in rounds of all kinds: some right after a kept branch)
+        b = Branchy(text[:n] + [0])
+        assert list(b.generate(b.first(10), -1, GREEDY, text[:10])) == text[10:n] + [0]
+        drops += b.drops
+    assert drops, "a generation that ends with a kept branch's carry"
+    left = Branchy(text)  # (a reader that stops right after a kept branch, then a rewind: the carry forgotten once)
+    it = left.generate(left.first(10), -1, GREEDY, text[:10])
+    while not left.carry:
+        next(it)
+    left.rewind(left.position)
+    assert left.drops == 1 and not left.carry and not left.rounds
+    it.close()
+    assert left.drops == 1
 
 
 # the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model; Qwen3.5-9B: its

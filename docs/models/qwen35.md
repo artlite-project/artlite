@@ -15,7 +15,7 @@ repetition penalty 1.03).
 ```
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf   (with its MTP layer)
-$ARTLITE_MODELS_DIR/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   (its DFlash2 drafter, optional: --dflash)
+$ARTLITE_MODELS_DIR/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   (its DFlash2 drafter, optional, the default where it is here)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
 $ARTLITE_MODELS_DIR/ggml-org/Qwen3.6-35B-A3B-GGUF/mtp-Qwen3.6-35B-A3B-Q4_0.gguf          (its MTP drafter)
@@ -110,11 +110,23 @@ On the 35B-A3B models a step of several tokens sums the experts' outputs in anot
 greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the
 dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
 
-Qwen3.8-27B also runs z-lab's DFlash2 block drafter (`--dflash`, 1.07 GB more in memory; `qwen35/dflash.py`): instead of a chain of drafts, one
-dispatch guesses a whole block of 7 tokens at once for ~30 ms (~11 ms per draft for the MTP layer), on a design of its own. Its cache takes
-the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt chunk; the head is the
-MTP drafter's rows, and a selector on the host picks the block's path among each position's 16 best logits. On 256 greedy tokens it
-gives 1.2-1.6x the MTP layer's rate on general text, code, JSON and math, and 1.06x on essays. The server does not use it yet.
+Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory (`--no-dflash`: with its MTP layer, whose
+263 MB the image otherwise leaves out; the drafter takes 1.07 GB; `qwen35/dflash.py`). Instead of a chain of drafts, one dispatch guesses a whole
+block of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a design of its own, which adds under 1 s to a load and no visible time
+to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt
+chunk; its head is the first 84480 rows of the model's LM head (the special tokens, the first ids and 512 of the sequence's own tokens: a few
+rows' cost, for the rare tokens that end a chain), and a selector on the host picks the block's path among each position's 16 best logits.
+Where the selector's first guess is uncertain (its second candidate over twice as likely as the whole chain), the round's step gives the
+chain's last two slots to a branch: the second candidate and its successor, after the round's token (the attention and GDN cores keep the
+drafts' slots out of the branch's view: `QwenOverlay.step`'s branch). When the first draft is wrong and the branch right, the round keeps
+the branch's tokens and the one after them, from the branch's own logits. On prose a quarter to a third of the first drafts are wrong:
+on the same texts branches save 5% of the rounds (32K prompts, the sampler held to each prompt's text: 6.73 to 7.05 tokens/s; essays
++5%, general text +4%, JSON +4%), while code, math and thinking rarely branch. A block's cost pays on 256 greedy tokens after short
+prompts: 1.4x the MTP layer's rate on code (23.5 tokens/s) and thinking, 1.6x on math, 1.3x on JSON, 1.2x on general text, 1.04x on
+essays without branches. On long prose it is ahead of the MTP layer (32K-token prompts: 6.73 against 6.64 tokens/s on three prompts) and
+slightly ahead on recorded agent sessions (11.8 against 11.6), whose text reaches back past its window. It takes no drafts from the context:
+wherever the context could guess, the block already does. A prompt cache's checkpoints hold its cache (27 MB each). A model with images
+(an mmproj file) drafts without it: its positions in an image are not the drafter's.
 
 Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
 (`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's

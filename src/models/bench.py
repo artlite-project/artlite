@@ -104,6 +104,7 @@ def arg_parser() -> argparse.ArgumentParser:
                    help="output format printed to stderr (default: none)")
     p.add_argument("--progress", action="store_true", help="print test progress indicators")
     p.add_argument("--no-warmup", action="store_true", help="skip the warmup run before each test")
+    p.add_argument("--no-dflash", action="store_true", help="no DFlash2 block drafter (Qwen3.8 27B: where its file exists)")
     return p
 
 
@@ -332,7 +333,7 @@ def main(argv: list[str] | None = None) -> None:
         capacity = auto_capacity(max(t.n_depth + t.n_prompt + t.n_gen for t in group))
         try:
             info, n_vocab = file_info(path)
-            model = open_model(path)
+            model = open_model(path, **({"dflash": False} if args.no_dflash else {}))
             npu = model.load(capacity=capacity)
         except (OSError, ValueError, NotImplementedError) as e:
             sys.exit(f"artlite-bench: {name}: {e}")

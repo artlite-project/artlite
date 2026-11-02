@@ -70,7 +70,7 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     target, draft = _slice(model, mtp, 1024)
     target.load()
     draft.load()
-    r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.ids)
+    r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids)
     tie, *tol = (TOL8 if draft.SLOTS == 8 else TOL)[request.param]
     tied = np.zeros(N, bool)
     if cfg.moe:
@@ -104,7 +104,7 @@ def test_draft_steps(setup: tuple, S: int) -> None:
 
 
 def test_table(setup: tuple) -> None:
-    """The head's table (``QwenDraft.see``), on a drafter of its own (a model's own block: the module's, whose table has
+    """The head's table (``HeadTable.see``), on a drafter of its own (a model's own block: the module's, whose table has
     seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
@@ -114,17 +114,18 @@ def test_table(setup: tuple) -> None:
     d = draft if draft.w_of is not None else QwenDraft(draft.target, draft.gguf)  # (the model's own block: its buffer)
     if d is not draft:
         d.load()
+    t = d.table
     types = np.asarray(d.gguf.meta["tokenizer.ggml.token_type"])
-    assert np.isin(np.flatnonzero((types == 3) | (types == 4)), d.ids).all()
-    rare = np.setdiff1d(np.arange(70000, 248000, 211), d.ids)[:TABLE_ROWS + 100]
+    assert np.isin(np.flatnonzero((types == 3) | (types == 4)), t.ids).all()
+    rare = np.setdiff1d(np.arange(70000, 248000, 211), t.ids)[:TABLE_ROWS + 100]
     seq = [*rare[:300], 5, *rare[300:], *rare[:50]]
-    d.see(seq)
-    assert set(d.ids[d.table_rows].tolist()) == {*rare[:50].tolist(), *rare[150:].tolist()}
-    ids = d.ids.copy()
-    d.see(seq)
-    assert np.array_equal(d.ids, ids)
-    lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).float().numpy()[:, d.table_rows] for p in range(0, N, 4)])
-    w = d.gguf.rows("output.weight", d.ids[d.table_rows]).numpy().astype(np.float64)
+    t.see(seq)
+    assert set(t.ids[t.rows].tolist()) == {*rare[:50].tolist(), *rare[150:].tolist()}
+    ids = t.ids.copy()
+    t.see(seq)
+    assert np.array_equal(t.ids, ids)
+    lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).float().numpy()[:, t.rows] for p in range(0, N, 4)])
+    w = d.gguf.rows("output.weight", t.ids[t.rows]).numpy().astype(np.float64)
     want = r["h_nextn"].astype(np.float64) @ w.T
     e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
     assert e[~tied].max() < (2e-2 if d.SLOTS == 4 else 4e-2), (np.median(e), e[~tied].max())  # (8 slots: 3.6%)

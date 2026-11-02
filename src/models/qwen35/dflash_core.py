@@ -52,6 +52,7 @@ REC = Records(HD, 1)
 REC_K, REC_V, ROWS_B = REC.k_bytes, REC.v_bytes, REC.rows_bytes
 POS_PER_GROUP = 32  # an A object of the ring: 4 records [K pairs 2 | V pairs 2]
 MAX_CHUNK = 2048  # a prefill chunk's positions at most
+MAX_PADDING = 256  # a prefill chunk's padding rows at most (they write records too: over the ring's oldest slots, not the window's)
 OPEN_BYTES = 4 * ROWS_B  # the open object's rows
 PAIR = 2 * REC_K  # a pair of records
 PO = 288  # an octet's P panels of 4 records
@@ -657,7 +658,8 @@ class DFlashShape:
         assert 3 * H8 * 2 <= XPAY and 8 * DYN_ROWS * 2 <= XPAY and 8 * 128 * 4 <= XPAY
         self.cfg, self.a_bytes = cfg, a_bytes
         self.window = cfg.window
-        self.ring = -(-(cfg.window + 8) // POS_PER_GROUP) + 1  # (objects: a window's closed records in distinct ones)
+        # (objects: a window's closed records in distinct ones, what a chunk's padding rows overwrite past them)
+        self.ring = -(-(cfg.window + 8 + MAX_PADDING) // POS_PER_GROUP) + 1
         self.over = MAX_CHUNK // POS_PER_GROUP  # (objects past the ring that a prefill chunk's writes reach)
         self.sets = 2 * QC
         self.eps = cfg.rms_norm_eps

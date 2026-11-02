@@ -42,7 +42,7 @@ and generation speeds go to stderr.
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |
-| `--dflash` | Qwen3.8 27B: draft with its DFlash2 block drafter ([qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)) instead of its MTP layer |
+| `--dflash`, `--no-dflash` | Qwen3.8 27B: draft with its DFlash2 block drafter ([qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)) or with its MTP layer (default: the block drafter where its file is in the models directory) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Gemma 4), below |
 | `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
