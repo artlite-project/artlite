@@ -54,7 +54,7 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
     units, the cache they read): within 1.5 x the error of the exact output rounded to bfp16 (P as single bfp16 panels).
     ``norm``: q and k RMS-normed per head with random weights per dim (Qwen3's: up to ~100) before RoPE, Q hi + lo
     (within its ~14 bits)."""
-    shape = PA.Shape(hd, qh, kp, A_BYTES, 2 if norm else 1)
+    shape = PA.Shape(hd, qh, kp, A_BYTES, 2 if norm else 1, 2 if norm else 1)
     max_pos = max(1024, p0 + T)
     n_groups = max_pos // shape.pg
     kvb = n_groups * shape.group

@@ -95,8 +95,10 @@ class QwenPrefill(ChunkPrefill):
     SUB, SMALL, MAX_T, MIN_TOKENS, NAME = SUB, SMALL, MAX_T, 3, "qwen_prefill"
 
     def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None, draft: object = None,
-                 dflash: object = None):
-        """draft, dflash: an MTP drafter, a DFlash2 drafter whose records a chunk writes."""
+                 dflash: object = None, precise: bool = False):
+        """draft, dflash: an MTP drafter, a DFlash2 drafter whose records a chunk writes; precise: the attention's P as
+        hi + lo panels (``attn_prefill.PrefillAttnOperator``'s ``pp``; d3-lite's attention error 9e-3 -> 4e-3, the
+        output's own rounding: the readout models)."""
         default = MOE_SIZES if overlay.cfg.moe else SIZES
         super().__init__(overlay, sizes or default)
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
@@ -128,7 +130,8 @@ class QwenPrefill(ChunkPrefill):
         # (an MTP drafter's cache records of the prompt: ``draft_prefill``)
         self.dp = DraftPrefill(draft, self) if draft is not None else None
         self.fp = DFlashPrefill(dflash, self) if dflash is not None else None
-        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal)
+        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
+                                               pp=2 if precise else 1)
                      for T in self.sizes} if self.att else {}
         self._starts: dict[int, list[int]] = {}
         self._rows()

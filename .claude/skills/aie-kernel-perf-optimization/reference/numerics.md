@@ -232,8 +232,11 @@ for w < 0), which is within 1.7 ULP at ~7 cycles per element.
   rounding luck.
 - **Flash attention: P = 2^(s - m) as bfp16 hi + lo panels**, like Q and K. Single bfp16 P blocks (8 positions
   share an exponent: the small weights of a block lose their bits) doubled the Gemma prefill's cache error at the
-  last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046). In a DMA-bound
-  attention the second MMUL per record costs nothing measurable; give the lo products their own accumulator chain
+  last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046); with hi + lo P an
+  attention's error is its output's own bfp16 rounding (the Llama path's 1.13-1.39x of it with single P, qwen35's 1.5-3x:
+  ``prefill.attn.Shape.pp``, ``attn_prefill``'s ``pp``). In a DMA-bound attention the second MMUL per record costs
+  nothing measurable (Qwen3 0.6B's shape at 512 tokens: +1.3%); where the cores bind it does (Llama 3B's 2048-token
+  chunk at p0 8K: 14.5 -> 17.6 ms per layer, +50% of a record's MMULs). Give the lo products their own accumulator chain
   when one chain would serialize (QB = 1). A decode step's Q and P as single panels of 8 rows (qwen35's designs of 8
   slots, where hi + lo do not fit): Qwen3.8-27B's teacher-forced KL 0.0022-0.0023, llama.cpp's prompt vs decode 0.0022:
   no cost there.

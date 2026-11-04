@@ -152,18 +152,20 @@ def test_attn_prep(size: str) -> None:
         assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
 
 
-@pytest.mark.parametrize(("size", "T"), [("9B", 64), ("27B", 64), ("1B", 64), ("1B", 192), ("35B-A3B", 64)])
-def test_attn_prefill(size: str, T: int) -> None:
+@pytest.mark.parametrize(("size", "T", "pp"), [("9B", 64, 1), ("27B", 64, 1), ("1B", 64, 1), ("1B", 192, 1),
+                                              ("35B-A3B", 64, 1), ("9B", 64, 2), ("1B", 192, 2)])
+def test_attn_prefill(size: str, T: int, pp: int) -> None:
     """AttnPrep then PrefillAttn (one fused runlist) over two chunks: the output panels against the exact attention
     of the cores' own operands (their Q panels, the cache they wrote, their sigmoid(gate): within 0.7%, the bfp16
-    output and P panels) and llama.cpp's attn_gated (~1% rms). The 1B: passes of 64 queries (one head per column)."""
+    output and P panels; hi + lo P, ``pp`` 2: the output's rounding alone) and llama.cpp's attn_gated (~1% rms). The
+    1B: passes of 64 queries (one head per column)."""
     from artlite.operators import bfp16
 
     n2 = 45
     s = _Setup(size, T, n2)
     prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
-    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes)
-    fused = FusedOperator(name="attn_prefill", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=pp)
+    fused = FusedOperator(name=f"attn_prefill{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
     fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
     fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
@@ -186,23 +188,26 @@ def test_attn_prefill(size: str, T: int) -> None:
                 want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
         # (1B: a peakier softmax, its largest P 0.45 on average (9B 0.28): single V rows carry more of an output, the
         # largest error ~2 ULPs of a bfp16 block; the rms error as the 9B's)
+        eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+        print(f"{size} T {T} pp {pp} chunk at {t0}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
         assert ref.rel_err(A, want) < (1.5e-2 if size == "1B" else 1e-2), t0
         assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2, t0
         gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[t0:t0 + n]
         assert ref.rel_err(A, gold) < 3e-2, t0
 
 
-@pytest.mark.parametrize(("size", "T", "n"), [("d3-lite", 128, 99), ("d3-lite", 96, 70)])
-def test_attn_prefill_noncausal(size: str, T: int, n: int) -> None:
+@pytest.mark.parametrize(("size", "T", "n", "pp"), [("d3-lite", 128, 99, 1), ("d3-lite", 96, 70, 1), ("d3-lite", 128, 99, 2),
+                                                   ("d3-lite", 96, 70, 2)])
+def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
     """A non-causal chunk (vllm-d3's prompt: every query sees every key) of n valid tokens at position 0: against the
     exact attention of the cores' own operands and llama.cpp's attn_gated of the whole prompt. T 128: passes of 64
-    queries on two streams; T 96: of 32 on one."""
+    queries on two streams; T 96: of 32 on one. ``pp`` 2: hi + lo P."""
     s = _Setup(size, T, 0, tokens=n)
     assert not s.cfg.causal
     prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
-    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=False)
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=False, pp=pp)
     assert attn.two == (T % 64 == 0)
-    fused = FusedOperator(name="attn_prefill_nc", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
+    fused = FusedOperator(name=f"attn_prefill_nc{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
     fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
     fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
@@ -221,6 +226,8 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int) -> None:
             sc = q[g].astype(np.float64) @ K.T / 16
             pr = np.exp(sc - sc.max(-1, keepdims=True))
             want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
+    eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T} n {n} pp {pp}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
     assert ref.rel_err(A, want) < 1.5e-2
     assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2
     gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[:n]

@@ -106,9 +106,12 @@ class LlamaPrefill(ChunkPrefill):
 
     SUB, SMALL, MAX_T, NAME = SUB, SMALL, MAX_T, "llama_prefill"
 
-    def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES):
+    def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = False):
+        """``precise``: the attention's P as hi + lo panels (``prefill.attn.Shape.pp``: P V's error gone, at +1% of the
+        attention at 512 tokens but +20% at 8K: the readout models' prompts are short)."""
         ov = overlay
-        s = PA.Shape(ov.hd, ov.nh, ov.kp, ov.T, 2 if ov.cfg.qk_norm else 1)  # (Qwen3: Q hi + lo, ``prefill.attn``)
+        s = PA.Shape(ov.hd, ov.nh, ov.kp, ov.T, 2 if ov.cfg.qk_norm else 1,  # (Qwen3: Q hi + lo, ``prefill.attn``)
+                     2 if precise else 1)
         pq = 32 * s.blocks[0]  # (the flash attention's queries per pass: at most 64 passes a chunk, 8B's 2048 tokens)
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and t // pq <= 64))
         self.layers = ov.layers

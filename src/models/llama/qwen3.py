@@ -14,6 +14,7 @@ from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
 from ..common import Model, Sampling
+from ..readouts import readout_model
 from ..tokenizer import QwenTokenizer, chat_prompt
 from .image import LlamaImage
 from .llama import NpuLlama
@@ -58,4 +59,5 @@ class Qwen3(Model):
         return Sampling(temp=s["temp"], top_k=s["top_k"], top_p=s["top_p"])
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
-        return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
+        return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
+                        precise=readout_model(self.gguf.meta, self.gguf.arch))

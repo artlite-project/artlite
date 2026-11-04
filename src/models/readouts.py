@@ -22,6 +22,13 @@ def pooling_of(meta: Mapping[str, object], arch: str) -> str | None:
     return POOLING[int(v)] if v is not None and 0 <= int(v) < len(POOLING) else None
 
 
+def readout_model(meta: Mapping[str, object], arch: str) -> bool:
+    """Whether a model file is read out, not generated from: an embedding or rerank model (``pooling_of``) or a decision
+    model (``{arch}.decision.type``). Its prompts are short and prefill only, so its prefill takes the precise variants
+    of its operators (``NpuModel``'s ``precise``)."""
+    return pooling_of(meta, arch) is not None or meta.get(f"{arch}.decision.type") is not None
+
+
 def rows_of(pooling: str, n: int) -> np.ndarray:
     """The rows of a prompt of n tokens a pooling reads (rank: a causal model's last token, as llama.cpp's)."""
     if pooling in ("none", "mean"):

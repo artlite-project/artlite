@@ -54,6 +54,7 @@ from artlite.overlay import WeightBuffer
 from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
+from ..readouts import readout_model
 from ..sequence import Sequence
 from ..tokenizer import QwenTokenizer, chat_prompt
 from .dflash import DFlashOverlay
@@ -82,8 +83,9 @@ class NpuQwen(OverlayModel):
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = "",
-                 dflash: str | None = None):
-        """weights: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
+                 dflash: str | None = None, precise: bool = False):
+        """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); precise: the prefill's precise
+        variants (``QwenPrefill``'s: a readout model, ``models.readouts.readout_model``)."""
         self.gguf = gguf
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
@@ -107,7 +109,7 @@ class NpuQwen(OverlayModel):
         self._inj: tuple[int, int, int, list[int] | None] | None = None
         self._sib: list[int] | None = None  # (the round's sibling branch: ``_sibling``)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
-                                   dflash=self.dflash) if prefill else None
+                                   dflash=self.dflash, precise=precise) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
             self.overlay.load(threads=threads)
@@ -571,5 +573,6 @@ class Qwen(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
-        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, dflash=self.dflash)
+        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, dflash=self.dflash,
+                            precise=readout_model(self.gguf.meta, self.gguf.arch))
         return self._npu

@@ -33,7 +33,8 @@ its own Q units). A unit is 144 ND bytes: a hi + lo K record (two single ones), 
 - the softmax with a running maximum per row, raised (o, l rescaled) only when the chunk's maximum exceeds it by 2^16
   (qwen35's ``attn_prefill``; the chunk's maxima in bf16: m is only the reference of 2^(s - m)); masks only on a
   diagonal chunk; P = 2^(s - m) times 2^64 (o / l cancels it) by ``km.exp2``, clamped at 2^-63 of that (masked scores
-  -1e30), as single bfp16 panels (half the P V MMULs of hi + lo). Known error, cause open: the keys below a row's
+  -1e30), as single bfp16 panels (half the P V MMULs of hi + lo), or hi + lo (``Shape.pp`` 2: the readout models'; the
+  output then within its own bfp16 rounding, against 1.13-1.39x of it). Known error, cause open: the keys below a row's
   reference weigh ~0.4% too much (test_llama_npu_teacher_forced[Q3_K_L-1B-hilo] fails);
 - o += P V per pair of row blocks (each V panel popped once for both: two MMUL chains), and the row sums l += P J on
   the MMUL (J a ones panel: no accumulator in the exp2 loop);
@@ -92,13 +93,14 @@ L1 = 0x10000 - 512  # a core's data memory for its buffers (a margin for aiecc's
 @dataclass(frozen=True)
 class Shape:
     """The attention's shapes: head_dim, query heads per KV head (a column's), K panels per record, the cache's object
-    bytes, Q panels per row block (``qp``: 1 single bfp16, 2 hi + lo)."""
+    bytes, Q panels per row block (``qp``: 1 single bfp16, 2 hi + lo), P panels per row block and record (``pp``: 1, 2)."""
 
     hd: int
     qh: int
     kp: int
     a_bytes: int
     qp: int = 1
+    pp: int = 1
 
     @cached_property
     def nd(self) -> int:
@@ -143,7 +145,7 @@ class Shape:
     def l1(self, qb: int, cr: int) -> int:
         """L1 bytes of an attention core at qb row blocks per head and chunks of cr records (``AttnOperator``)."""
         rows = qb * self.qh
-        ws = regions(AttnOperator.regions(rows, cr))["size"]
+        ws = regions(AttnOperator.regions(rows, cr, self.pp))["size"]
         return (AttnOperator.STACK + 4 * self.unit + 2 * qb * self.nd * 72 + rows * self.qunit + rows * self.nd * 256
                 + ws)
 
@@ -510,7 +512,7 @@ _ATTN = JINJA_ENV.from_string(r"""
 // of row blocks 2 p, 2 p + 1); q: per pair its Q panels [d-block pair ND / 2][hi 2 p, lo 2 p, hi 2 p + 1, lo 2 p + 1]
 // [d-block 2]; ws (bytes): sc [pair][record CR][row block 2][8 x 8] fp32 (A = s + 192 - m: s the scores in log2 units,
 // lane 8 q + k; m the row's reference maximum), bias [row block][64] (192 - m), l [row block][64] (P's row sums, in
-// every lane of the row), pp [pair][record][row block 2] P panels, vm [64] bf16 (the chunk's maximum A per lane), st
+// every lane of the row), pp [pair][record][row block 2]{{ "[hi, lo]" if PP == 2 else "" }} P panels, vm [64] bf16 (the chunk's maximum A per lane), st
 // [16] int32 (the chunk's first record relative to
 // the core's first block, skip, the pass's first record)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
@@ -521,15 +523,25 @@ _ATTN = JINJA_ENV.from_string(r"""
 
 namespace {
 
-// P = 2^(A - 128) of the chunk's panels s (``exp2``: 2^(s - m) times 2^64) as bfp16 panels into pp, in their order
+// P = 2^(A - 128) of the chunk's panels s (``exp2``: 2^(s - m) times 2^64) as bfp16 panels into pp, in their order{{ " (each as hi, lo: the exact split on the MMUL)" if PP == 2 else "" }}
 __attribute__((noinline)) void {{ p }}_ppan(const float *__restrict s, uint8_t *__restrict pp)
 {
     al::BOut<> po((bfp16ebs8 *)pp);
+{% if PP == 2 %}
+    const al::BV nI = al::neg_eye();
+{% endif %}
     AIE_TRY_INITIATION_INTERVAL(20)  // (post-RA II 25; the default pre-RA schedule: 38, spilling)
     for (int i = 0; i < {{ RB * CR }}; i++) {
         const aie::accum<accfloat, 32> p0 = {{ exp2 }}(aie::accum<accfloat, 32>(aie::load_v<32>(s)));
         const aie::accum<accfloat, 32> p1 = {{ exp2 }}(aie::accum<accfloat, 32>(aie::load_v<32>(s + 32)));
+{% if PP == 2 %}
+        al::BV h, l;
+        al::split_hilo(aie::concat(p0, p1), nI, h, l);
+        po.push(h);
+        po.push(l);
+{% else %}
         po.push(aie::concat(p0, p1).template to_vector<bfp16ebs8>());
+{% endif %}
         s += 64;
     }
 }
@@ -593,7 +605,7 @@ __attribute__((noinline)) void {{ p }}_pvh(const uint8_t *__restrict pp, const u
     float __aie_dm_resource_d *__restrict os = (float __aie_dm_resource_d *)os_;
     al::BInR<aie_dm_resource::a> ps((const bfp16ebs8 *)pp);
     al::BInR<aie_dm_resource::b> vs((const bfp16ebs8 *)v);
-    dims_2d_t pat_p({{ ND // 4 - 1 }}, {{ -2 * CR }}, 0);  // (the pair's P per d-block pair, then the next pair's)
+    dims_2d_t pat_p({{ ND // 4 - 1 }}, {{ -2 * PP * CR }}, 0);  // (the pair's P per d-block pair, then the next pair's)
     dims_2d_t pat_v({{ ND // 4 - 1 }}, 0, {{ -ND // 4 * 2 * CR }});  // (the half's V once per pair)
     int cl = 0, cs = 0;
     for (int it = 0; it < {{ RB // 2 * ND // 4 }}; it++) {
@@ -603,11 +615,21 @@ __attribute__((noinline)) void {{ p }}_pvh(const uint8_t *__restrict pp, const u
         al::MM8 c11(aie::accum<accfloat, 64>(aie::load_v<64>(ol + {{ 64 * ND + 64 }})));
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < {{ CR }}; k++) {
+{% if PP == 2 %}
+            const al::BV P0 = ps.pop(), L0 = ps.pop(), P1 = ps.pop(), L1 = ps.pop(), V0 = vs.pop(), V1 = vs.pop();
+{% else %}
             const al::BV P0 = ps.pop(), P1 = ps.pop(), V0 = vs.pop(), V1 = vs.pop();
+{% endif %}
             c00.mac(P0, aie::op_transpose(V0));
             c01.mac(P0, aie::op_transpose(V1));
             c10.mac(P1, aie::op_transpose(V0));
             c11.mac(P1, aie::op_transpose(V1));
+{% if PP == 2 %}
+            c00.mac(L0, aie::op_transpose(V0));
+            c01.mac(L0, aie::op_transpose(V1));
+            c10.mac(L1, aie::op_transpose(V0));
+            c11.mac(L1, aie::op_transpose(V1));
+{% endif %}
         }
         aie::store_v(os, c00.template to_vector<float>());
         aie::store_v(os + 64, c01.template to_vector<float>());
@@ -630,9 +652,17 @@ __attribute__((noinline)) void {{ p }}_lsum(const uint8_t *__restrict pp, const 
         al::MM8 e1(aie::accum<accfloat, 64>(aie::load_v<64>(ll + 64)));
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < {{ CR }}; k++) {
+{% if PP == 2 %}
+            const al::BV P0 = ps.pop(), L0 = ps.pop(), P1 = ps.pop(), L1 = ps.pop();
+            e0.mac(P0, aie::op_transpose(J));
+            e1.mac(P1, aie::op_transpose(J));
+            e0.mac(L0, aie::op_transpose(J));
+            e1.mac(L1, aie::op_transpose(J));
+{% else %}
             const al::BV P0 = ps.pop(), P1 = ps.pop();
             e0.mac(P0, aie::op_transpose(J));
             e1.mac(P1, aie::op_transpose(J));
+{% endif %}
         }
         aie::store_v(ls, e0.template to_vector<float>());
         aie::store_v(ls + 64, e1.template to_vector<float>());
@@ -922,20 +952,21 @@ class AttnOperator(ArtcOperator):
         super().__init__()
 
     @staticmethod
-    def regions(rows: int, cr: int) -> list[tuple[str, int]]:
-        """The workspace's regions at ``rows`` row blocks and chunks of ``cr`` records (the kernels' comment)."""
-        return [("sc", 256 * rows * cr), ("bias", 256 * rows), ("l", 256 * rows), ("pp", 72 * rows * cr), ("vm", 128),
-                ("st", 64)]
+    def regions(rows: int, cr: int, pp: int = 1) -> list[tuple[str, int]]:
+        """The workspace's regions at ``rows`` row blocks, chunks of ``cr`` records and ``pp`` P panels per row block
+        and record (the kernels' comment)."""
+        return [("sc", 256 * rows * cr), ("bias", 256 * rows), ("l", 256 * rows), ("pp", 72 * rows * cr * pp),
+                ("vm", 128), ("st", 64)]
 
     def workspace(self) -> dict[str, int]:
-        return regions(self.regions(self.qb * self.shape.qh, self.cr))
+        return regions(self.regions(self.qb * self.shape.qh, self.cr, self.shape.pp))
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         s = self.shape
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
-                            KP=s.kp, QP=s.qp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
+                            KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
 
     @property
     def n_qs(self) -> int:

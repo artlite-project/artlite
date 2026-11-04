@@ -39,15 +39,17 @@ from .tokenizer import BOS, chat_prompt, load_tokenizer
 class NpuLlama(OverlayModel):
     """The model on the NPU (Llama 3.x, or Qwen3: ``qwen3.Qwen3`` loads it). ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("single",
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``
-    (default ``prefill.SIZES``); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
+    (default ``prefill.SIZES``); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``); ``precise``:
+    the prefill's precise variants (``LlamaPrefill``'s: a readout model, ``models.readouts.readout_model``)."""
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
-                 prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):
+                 prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
+                 precise: bool = False):
         self.gguf = gguf
         self.overlay = LlamaOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
-        self.prefill = LlamaPrefill(self.overlay, sizes=sizes) if prefill else None
+        self.prefill = LlamaPrefill(self.overlay, sizes=sizes, precise=precise) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
             self.overlay.load(threads=threads)

@@ -56,7 +56,7 @@ SMOKE = (
     "qwen35/test_decode.py::test_overlay_slice[lazy-35B-A3B]",
     "qwen35/test_prefill.py::test_prefill_slice[9B]", "qwen35/test_prefill.py::test_prefill_slice[27B]",
     "qwen35/test_prefill.py::test_prefill_slice[35B-A3B]", "qwen35/test_prefill.py::test_prefill_slice[occamy]",
-    "qwen35/test_attn_prefill.py::test_attn_prefill[9B-64]", "qwen35/test_attn_prefill.py::test_attn_prefill[1B-192]",
+    "qwen35/test_attn_prefill.py::test_attn_prefill[9B-64-1]", "qwen35/test_attn_prefill.py::test_attn_prefill[1B-192-2]",
     "qwen35/test_gdn_prefill.py::test_gdn_scan[64-9B]",
     "prefill/test_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
     "vision/test_ops.py::test_gemm[16-2-640-640-True-bf16]", "vision/test_ops.py::test_conv[16-1-640-640-True]",

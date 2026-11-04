@@ -102,6 +102,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   Llama meets its gates with less: a bf16 residual (`PrefillNormOperator`, the deltas summed in fp32 and rounded once:
   half the norms' bytes) and single bfp16 Q, K and P panels. Per-dim q / k norm weights (Qwen3's reach ~100: a block's
   dims ~1e5 apart) need hi + lo Q and K (`prefill.attn.Shape.qp`, `kv_k` hilo: Qwen3 0.6B's chat KL 0.0053 -> 0.0037).
+  The readout models (embedding, rerank and decision files: `models.readouts.readout_model`) take hi + lo P too (the
+  prefills' `precise`): their prompts are short, where it costs ~1% of the attention; a chat model's long prompts keep
+  single P (its cores bind there: +20% at 8K).
 - The GEMMs' floor is their 8-bit operands: weights dequantized into bfp16 blocks (Q8_0's bf16(d) q needs ~15 bits)
   and bfp16 activations, ~0.15% of a row after 28 layers (a CPU model with those roundings matches the NPU's error);
   llama.cpp's CPU and Vulkan builds differ by ~0.05%. Embeddings and decision probabilities show it, the tokens rarely.

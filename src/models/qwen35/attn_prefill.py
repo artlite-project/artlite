@@ -23,9 +23,10 @@ two streams, ``two_streams``: one stream's memtile channel bound the history's r
 the MMUL (Q hi + lo against K, two products: one loop over a pair of records' panels [d-block][record 2], the Q slots'
 [d-block][hi | lo]; P V over the V object's pairs of records [d-block][record 2]), per group of 32 positions the softmax (a
 row's maximum is raised, rescaling o and l, only when the group's exceeds it by 2^16: the per-dimension norm weights
-leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2 builds an exact 2^n; 0.59 ULP) as bfp16 panels, o += P
-V; at the pass's end o / l sigmoid(gate) as the attn_out GEMM's bfp16 A panels. Within 0.7% of the exact attention of
-its own operands, ~1% rms of llama.cpp's attn_gated.
+leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2 builds an exact 2^n; 0.59 ULP) as bfp16 panels (hi + lo
+with ``pp`` 2: the readout models'), o += P V; at the pass's end o / l sigmoid(gate) as the attn_out GEMM's bfp16 A
+panels. Within 0.7% of the exact attention of its own operands (hi + lo P: its output's own rounding, against 1.5-3x of
+it), ~1% rms of llama.cpp's attn_gated.
 
 Time (T = 512, per layer alone, at p0 = 0 / 4K / 16K): the 27B 1.38 / 6.89 / 22.1 ms (its compute compiled out at
 16K: 20.6, the KV re-streams of the 32-query passes at the DDR ceiling), the 1B 0.97 / 2.47 / 7.23 (5.99: the cores'
@@ -478,7 +479,7 @@ class AttnPrepOperator(ArtcOperator):
 _ATTN = JINJA_ENV.from_string(r"""
 // The attention core's workspace (bytes, PrefillAttnOperator.workspace()): per row panel (R = QC QG: head h = i / QG,
 // token group QG r + i % QG of the pass) sc [panel][record 4][8 x 8] fp32 (A = s + 192 - m: the scores s in log2
-// units against the row's maximum; after the softmax its first 288 B the P panels), m, b, l [panel][64] (lane 8 q + k:
+// units against the row's maximum; after the softmax its first 288 B the P panels{{ ", the lo panels from byte 320 on" if PP == 2 else "" }}), m, b, l [panel][64] (lane 8 q + k:
 // query q's running maximum, 192 - m, the partial sums), o [panel][db 32][8 x 8] fp32{{ ", ob its second copy (P V
 // reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, its own buffer): P [8][32],
 // f [8][32] bf16 (or a rescale's row maxima [64] fp32)
@@ -565,12 +566,16 @@ __attribute__((noinline)) bool {{ p }}_pass1(const float *__restrict s, float *_
     return {{ p }}_pexp1(s, (bfloat16 *)pw, (bfloat16 *)pw + 256);
 }
 
-// pass 2, a panel a step: the second step of kmath.exp2 (2^-64 P 2^f, bias 192): the panel's P as bfp16 into pp, l += P
+// pass 2, a panel a step: the second step of kmath.exp2 (2^-64 P 2^f, bias 192): the panel's P as bfp16 into pp{{ " (hi; lo from pp + 320: the exact split on the MMUL)" if PP == 2 else "" }}, l += P
 __attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *__restrict pl, uint8_t *__restrict pp)
 {
     const bfloat16 *__restrict pP = (const bfloat16 *)pw;
     const bfloat16 *__restrict pF = (const bfloat16 *)pw + 256;
     al::BOut<> po((bfp16ebs8 *)pp);
+{% if PP == 2 %}
+    al::BOut<> pol((bfp16ebs8 *)(pp + 320));
+    const al::BV nI = al::neg_eye();
+{% endif %}
     aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int t = 0; t < 4; t++) {
@@ -581,7 +586,14 @@ __attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *
         }
         l0 = aie::add(l0, r[0]);
         l1 = aie::add(l1, r[1]);
+{% if PP == 2 %}
+        al::BV h, lo;
+        al::split_hilo(aie::concat(r[0], r[1]), nI, h, lo);
+        po.push(h);
+        pol.push(lo);
+{% else %}
         po.push(aie::concat(r[0], r[1]).template to_vector<bfp16ebs8>());
+{% endif %}
         pP += 64;
         pF += 64;
     }
@@ -606,10 +618,10 @@ __attribute__((noinline)) void {{ p }}_raise(float *__restrict s, float *__restr
         aie::store_v(s + 64 * k, aie::add(aie::load_v<64>(s + 64 * k), d));
 }
 
-// a head's o += P0 V0 + P1 V1 (v: per d-block the two records' panels, interleaved by the memtile; o in place: ol, os
+// a head's o += P0 V0 + P1 V1{{ " + L0 V0 + L1 V1 (L: P's lo panels)" if PP == 2 else "" }} (v: per d-block the two records' panels, interleaved by the memtile; o in place: ol, os
 // the same panels as distinct restrict parameters, each read before it is written, so the loop pipelines)
 template <int NB>
-[[clang::always_inline]] inline void {{ p }}_pvh(const al::BV &P0, const al::BV &P1, const uint8_t *__restrict v,
+[[clang::always_inline]] inline void {{ p }}_pvh(const al::BV &P0, const al::BV &P1,{% if PP == 2 %} const al::BV &L0, const al::BV &L1,{% endif %} const uint8_t *__restrict v,
                                                  const float *__restrict ol_, float *__restrict os_)
 {
     al::BInR<aie_dm_resource::a> sv((const bfp16ebs8 *)v);
@@ -618,8 +630,16 @@ template <int NB>
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int db = 0; db < NB; db++) {
         al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(ol)));
+{% if PP == 2 %}
+        const al::BV V0 = sv.pop(), V1 = sv.pop();
+        c.mac(P0, aie::op_transpose(V0));
+        c.mac(P1, aie::op_transpose(V1));
+        c.mac(L0, aie::op_transpose(V0));
+        c.mac(L1, aie::op_transpose(V1));
+{% else %}
         c.mac(P0, aie::op_transpose(sv.pop()));
         c.mac(P1, aie::op_transpose(sv.pop()));
+{% endif %}
         aie::store_v(os, c.template to_vector<float>());
         ol += 64;
         os += 64;
@@ -806,6 +826,9 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws)
     event0();
 {% endif %}
     {{ p }}_pv2((const uint8_t *)v, AW(uint8_t, {{ w.sc }}), AW(float, {{ w.o }}), AW(float, {{ w.o }}));
+{% if PP == 2 %}
+    {{ p }}_pv2((const uint8_t *)v, AW(uint8_t, {{ w.sc }} + 320), AW(float, {{ w.o }}), AW(float, {{ w.o }}));  // (P's lo panels)
+{% endif %}
 {% if "ev_pv" in ablate %}
     event1();
 {% endif %}
@@ -831,9 +854,13 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half
     for (int h = 0; h < {{ R }}; h++) {
         al::BIn<> ps((const bfp16ebs8 *)(AW(uint8_t, {{ w.sc }}) + 1024 * h + 144 * half));
         const al::BV P0 = ps.pop(), P1 = ps.pop();
+{% if PP == 2 %}
+        al::BIn<> ls((const bfp16ebs8 *)(AW(uint8_t, {{ w.sc }}) + 1024 * h + 320 + 144 * half));
+        const al::BV L0 = ls.pop(), L1 = ls.pop();
+{% endif %}
         const float *__restrict ol = src + 2048 * h;
         float *__restrict os = dst + 2048 * h;
-        {{ p }}_pvh<{{ ND }}>(P0, P1, (const uint8_t *)v, ol, os);
+        {{ p }}_pvh<{{ ND }}>(P0, P1,{% if PP == 2 %} L0, L1,{% endif %} (const uint8_t *)v, ol, os);
     }
 {% if "ev_pv" in ablate %}
     event1();
@@ -908,14 +935,16 @@ class PrefillAttnOperator(ArtcOperator):
     STACK = 3072
     pfx = kernel_prefix("qaa")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True):
+    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
+                 pp: int = 1):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_qk",
         "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
-        two streams only)."""
+        two streams only). ``pp``: P as single bfp16 panels (1) or hi + lo (2: P V's error gone; one stream: the lo pair
+        in the same loop, two streams: P V once per part)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0
-        self.T, self.cfg, self.head_bytes, self.causal = T, cfg, head_bytes, causal
+        self.T, self.cfg, self.head_bytes, self.causal, self.pp = T, cfg, head_bytes, causal, pp
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
@@ -940,7 +969,7 @@ class PrefillAttnOperator(ArtcOperator):
         keys = [f"{sum(1 << (8 * q + k) for q in range(8) for k in range(v, 8)):016X}" for v in range(8)]
         return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
                             tri=f"{tri:016X}", keys=keys, ablate=self.ablate, TWO=self.two, OB=self.ob,
-                            CAUSAL=self.causal)
+                            CAUSAL=self.causal, PP=self.pp)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
