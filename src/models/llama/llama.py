@@ -58,6 +58,7 @@ class NpuLlama(OverlayModel):
                 build.result()  # (its error, if any)
                 self.prefill.bind()
         self.overlay.ready()  # (the weights' thread packs meanwhile)
+        self._w_out = gguf.tensor("output_norm.weight").dequantize().float()
         gguf.release()
         self.position = 0
 

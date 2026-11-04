@@ -1,6 +1,6 @@
 """llama.cpp's CPU build (``model_config.LLAMA_CPP_DIR``, ``ARTLITE_LLAMA_CPP_DIR``) for the references: its files
-(a test without the build skips), the identity of its library (a rebuild invalidates what it computed) and its
-tokenizer (``llama-tokenize``)."""
+(a test without the build skips), the identity of its library (a rebuild invalidates what it computed), its
+tokenizer (``llama-tokenize``) and its embeddings (``llama-embedding``)."""
 
 import json
 import os
@@ -42,3 +42,15 @@ def llama_tokenize(model: str, text: str) -> list[int]:
     finally:
         os.unlink(path)
     return json.loads(out.strip().splitlines()[-1])
+
+
+def llama_embeddings(model: str, texts: list[str], pooling: str) -> list[list[float]]:
+    """llama.cpp's embeddings of texts on the CPU (``llama-embedding``: tokens with the vocabulary's BOS / EOS, the
+    pooling's rows of the output-normed hidden states, not normalized), one per text."""
+    exe = llama_cpp_bin("llama-embedding")
+    sep = "<#artlite#>"
+    out = subprocess.run([exe, "-m", model, "-ngl", "0", "--pooling", pooling, "--embd-normalize", "-1",
+                          "--embd-output-format", "json", "-c", "4096", "-b", "4096", "-ub", "4096",
+                          "--embd-separator", sep, "-p", sep.join(texts)],
+                         capture_output=True, text=True, check=True).stdout
+    return [d["embedding"] for d in json.loads(out[out.index("{"):])["data"]]

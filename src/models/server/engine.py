@@ -8,15 +8,18 @@ import collections
 import concurrent.futures
 import itertools
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from artlite import portable
+import numpy as np
 
-from ..common import Model, NpuModel, Sampling, StreamDecoder, argmax, seed
+from artlite import _native, portable
+
+from ..common import Detokenizer, LogitsLike, Model, NpuModel, Sampling, StreamDecoder, argmax, seed, top_logits
 from .cache import PromptCache
 from .tools import Calls, held
 
@@ -38,11 +41,13 @@ class Job:
     - ``progress``: the prompt's ``prompt_progress`` (``total``, ``cache``, ``processed``, ``time_ms``), when
       ``progress`` is set: at the start and after each chunk;
     - ``delta``: ``parts``, the new output as (kind, value) pairs: kind ``content`` or ``reasoning_content`` with
-      text, ``tool_call`` with a ``tools.ToolCall`` (``tools``: a call's start and its arguments' fragments), and the
-      ``timings`` so far;
+      text, ``tool_call`` with a ``tools.ToolCall`` (``tools``: a call's start and its arguments' fragments), the
+      ``timings`` so far, and with ``n_probs``: ``probs``, llama-server's entries of the sampled tokens since the last
+      delta (``prob_entry``);
     - ``done``: ``finish_reason`` (``stop``: an end-of-sequence token or a stop string, ``length``: ``max_tokens`` or a
       full cache, ``tool_calls``: the answer has complete calls), ``stop_word``, ``timings``, ``n_prompt`` (the
-      prompt's tokens), ``n_cached`` (positions cached after it) and ``n_calls`` (the complete tool calls);
+      prompt's tokens), ``n_cached`` (positions cached after it), ``n_calls`` (the complete tool calls), and
+      ``probs``: the entries no delta carried;
     - ``error``: ``message``, a failure in the model (the job ends);
     - ``cancelled``: the job ended early (``cancel`` set)."""
 
@@ -59,6 +64,8 @@ class Job:
     cache_prompt: bool = True  # continue from the cached prefix
     answer_mark: bool = False  # the next prompt re-renders this answer's opener (its template drops earlier thoughts)
     progress: bool = False  # send prompt_progress events
+    n_probs: int = 0  # per sampled token its probability and the n_probs most likely ones' (0: none; ``prob_entry``)
+    post_sampling: bool = False  # the probabilities the sampler drew from (its candidates), not the model's
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
     name: str = ""  # for the log
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -76,6 +83,39 @@ class Call:
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
     conv_id: str | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
+
+
+def _text(b: bytes) -> str:
+    """A token's text: its bytes but an unfinished character at the end (llama-server's ``validate_utf8``)."""
+    for k in range(4):
+        try:
+            return b[:len(b) - k].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", errors="replace")
+
+
+def prob_entry(tokenizer: Detokenizer, row: LogitsLike, token: int, cap: float, cand: tuple[np.ndarray, np.ndarray],
+               *, n: int, sampling: Sampling | None = None) -> dict[str, Any]:
+    """llama-server's ``probs`` entry of a sampled token: its id, text and bytes, its log-probability under the model's
+    logits ``row`` (soft cap ``cap``) and the ``n`` most likely tokens' (``top_logprobs``); with ``sampling``
+    (``post_sampling_probs``) the probabilities ``sampling`` drew from among its candidates ``cand`` (``prob``,
+    ``top_probs``)."""
+
+    def tok(t: int, key: str, v: float) -> dict[str, Any]:
+        b = tokenizer.decode_bytes([t])
+        return {"id": t, "token": _text(b), "bytes": list(b), key: v}
+
+    if sampling is not None:
+        q, ids = sampling.probs(cand[0]), cand[1]
+        top = [tok(int(i), "prob", float(p)) for i, p in zip(ids[:n], q[:n], strict=True) if p > 0]
+        return {**tok(token, "prob", float(q[ids == token].sum())), "top_probs": top}
+    lse = _native.logsumexp(row, cap)
+    v = float(row[token])
+    own = (math.tanh(v / cap) * cap if cap else v) - lse
+    values, ids = top_logits(row, n, cap)
+    return {**tok(token, "logprob", own),
+            "top_logprobs": [tok(int(i), "logprob", float(x) - lse) for x, i in zip(values, ids, strict=True)]}
 
 
 class StopMatcher:
@@ -252,6 +292,35 @@ class Engine:
         self.submit(call)
         return call.future
 
+    def readouts(self, inputs: list[list[int]], rows: list[np.ndarray], *, cache_prompt: bool = True,
+                 name: str = "readout") -> concurrent.futures.Future:
+        """Output rows of prompts (``NpuModel.outputs``, output-normed) on the worker after the queued jobs: per input
+        its tokens' rows at ``rows`` (indices), one after another, each after what the prompt cache keeps of it before
+        its first row; the result: a list of (len(rows), hidden) fp32."""
+        return self.run(lambda: self._readouts(inputs, rows, cache_prompt, name))
+
+    def _readouts(self, inputs: list[list[int]], rows: list[np.ndarray], cache_prompt: bool, name: str
+                  ) -> list[np.ndarray]:
+        npu, cache = self.npu, self.cache
+        t0, out, kept = time.perf_counter(), [], 0
+        try:
+            if self._dirty:
+                npu.reset()
+                self._dirty = False
+            for ids, at in zip(inputs, rows, strict=True):
+                k, _, _ = cache.prepare(ids[:int(at.min())], enabled=cache_prompt)
+                out.append(npu.outputs(ids[k:], at - k))
+                cache.ran(ids)
+                kept += k
+        except Exception:  # (the device's state is unknown: the caches start over)
+            cache.clear()
+            self._dirty = True
+            raise
+        n = sum(map(len, inputs))
+        log.info(f"{name}: {len(inputs)} input{'s' * (len(inputs) != 1)}, {n - kept} tokens ({kept} cached) in "
+                 f"{time.perf_counter() - t0:.3f} s")
+        return out
+
     def waiting(self) -> int:
         """Jobs in the queue (not running)."""
         return len(self._queue)
@@ -424,16 +493,27 @@ class Engine:
                 return calls.parts(parts) if calls is not None else parts
 
             def send(parts: list[tuple[str, Any]]) -> None:
+                nonlocal sent
                 if parts:
-                    job.emit("delta", {"parts": parts, "timings": times(time.perf_counter())})
+                    data = {"parts": parts, "timings": times(time.perf_counter())}
+                    if probs is not None:  # (the sampled tokens up to here, whose text this delta holds)
+                        data["probs"], sent = entries[sent:sampled], sampled
+                    job.emit("delta", data)
 
+            entries: list[dict[str, Any]] = []  # (llama-server's probs: one per sampled token)
+            sent = sampled = 0
+            post = job.sampling if job.post_sampling else None
+            probs = (lambda row, t, cap, cand: entries.append(prob_entry(model.tokenizer, row, t, cap, cand,
+                                                                         n=job.n_probs, sampling=post))
+                     ) if job.n_probs > 0 else None
             send(parse(force) if early else [])
             finish = "length"
             while True:
                 left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-                it = npu.generate(logits, left, job.sampling, ids + gen, mask)
+                it = npu.generate(logits, left, job.sampling, ids + gen, mask, probs)
                 for token in it:
                     gen.append(token)
+                    sampled += 1
                     job.n_gen = len(gen)
                     if token in model.eos_token_ids:
                         finish = "stop"
@@ -475,7 +555,8 @@ class Engine:
         t2 = time.perf_counter()
         t = times(t2)
         job.emit("done", {"finish_reason": finish, "stop_word": stop.word, "timings": t, "n_prompt": len(ids),
-                          "n_cached": len(self.cached), "n_calls": calls.calls if calls is not None else 0})
+                          "n_cached": len(self.cached), "n_calls": calls.calls if calls is not None else 0,
+                          "probs": entries[sent:sampled]})
         # (artlite-cli's report: the generation's dispatches, the time of each, the host's inputs)
         passes = max(npu.dispatches - d1, 1)
         host = f", {(npu.t_host - t_host1) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > t_host1 else ""

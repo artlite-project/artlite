@@ -28,6 +28,7 @@ from artlite.model_config import MODELS_DIR, model_path
 
 from .. import open_model
 from ..common import Model, NpuModel, Sampling, performance_mode, stale_install
+from ..readouts import POOLING
 from . import ui
 from .api import PENALTIES, ModelInfo, Options, create_app
 from .engine import Engine
@@ -126,6 +127,18 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      "in chat messages (image_url parts of data URIs)")
     vis.add_argument("--max-slices", type=int,
                      help="an image's slices at most (default: the mmproj's, 9; the model card uses 36)")
+    emb = p.add_argument_group("embeddings and rerank")
+    emb.add_argument("--embedding", "--embeddings", action="store_true",
+                     help="the embedding routes (/v1/embeddings, /embeddings), as llama-server's: --pooling's, else the "
+                          "model file's (a generative model has none: one row per token, /embeddings only)")
+    emb.add_argument("--pooling", choices=POOLING,
+                     help="the embeddings' pooling (default: the model file's)")
+    emb.add_argument("--rerank", "--reranking", action="store_true",
+                     help="the rerank routes (/v1/rerank, ...): --embedding with pooling rank (a reranker's file: its "
+                          "classifier head)")
+    emb.add_argument("--embd-normalize", type=int, default=2,
+                     help="the embeddings' normalization (-1: none, 0: max absolute as int16, 2: Euclidean, any other "
+                          "p: the p-norm; default: 2; a request's embd_normalize overrides it)")
     npu = p.add_argument_group("NPU")
     npu.add_argument("--no-prefill", action="store_true", help="run prompts as decode steps")
     npu.add_argument("--kv-k", choices=("single", "hilo"),
@@ -306,7 +319,11 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         keys = api_keys(args)
         penalties = {k: getattr(args, k) for k in PENALTIES if getattr(args, k) is not None}
         Sampling(**penalties)  # (ValueError: out of range)
-    except (OSError, ValueError) as e:
+        pooling = "rank" if args.rerank else args.pooling or info.readouts.pooling
+        if pooling == "rank" and info.readouts.head is None:
+            raise ValueError(f"{name}: rank pooling (--rerank) needs a reranker's file: this one has no classifier head "
+                             f"(cls.output)")
+    except (OSError, ValueError, NotImplementedError) as e:
         if report is not None:
             report({"error": f"{type(e).__name__}: {e}"})
         sys.exit(f"artlite-server: {e}")
@@ -315,6 +332,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
                       top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, **penalties, seed=args.seed,
                       reasoning=args.reasoning, reasoning_format="none" if args.reasoning_format == "none" else "auto",
                       preserve_reasoning=args.reasoning_preserve, chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
+                      embedding=args.embedding or args.rerank, pooling=pooling, embd_normalize=args.embd_normalize,
                       sse_ping_interval=args.sse_ping_interval, slots=args.slots,
                       cors_origins=[o.strip() for o in args.cors_origins.split(",") if o.strip()],
                       build_info=build_info())

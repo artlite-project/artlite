@@ -21,8 +21,9 @@ else()
   set_source_files_properties(artlite/dequant.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
-# A backend: its shim, the Kernel on it and the code over its buffers and contexts (file reads, the profiler)
-set(ARTLITE_ON_SHIM artlite/file_io.cpp artlite/profiler.cpp $<TARGET_OBJECTS:artlite_core>)
+# A backend: its shim, the Kernel on it and the code over its buffers and contexts (file reads, the profiler, the NPU's
+# turn between processes)
+set(ARTLITE_ON_SHIM artlite/file_io.cpp artlite/profiler.cpp artlite/turn.cpp $<TARGET_OBJECTS:artlite_core>)
 
 if(NOT WIN32)  # the amdxdna driver's ioctls
   add_library(artlite_xdna STATIC

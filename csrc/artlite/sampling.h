@@ -36,4 +36,8 @@ size_t pick(const float* values, size_t n, float temp, float top_p, float min_p,
 /// The largest of n bf16 logits (its index: the first of equal ones) and its probability, 1 / sum(exp(l - max)).
 std::pair<size_t, float> max_prob(const uint16_t* x, size_t n);
 
+/// log(sum(exp(l))) of a vocabulary's logits after a soft cap (cap > 0: tanh(l / cap) cap): a token's log-probability
+/// is its (capped) logit minus it (``logprobs``).
+float logsumexp(Logits x, float cap);
+
 }  // namespace artlite

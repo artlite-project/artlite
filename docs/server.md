@@ -30,13 +30,19 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/v1/completions`, `/completion` | raw prompts (OpenAI's and llama-server's shapes) |
 | `/v1/models`, `/props`, `/health`, `/slots` | the model, the server's settings, its state |
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
+| `/v1/embeddings`, `/embeddings`, `/embedding` | embeddings (with `--embedding`: [below](#embeddings-and-rerank)) |
+| `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | a reranker's scores of documents (with `--rerank`) |
 
 Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
 sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
-settings for them have no effect.
+settings for them have no effect. Log-probabilities come as llama-server's: chat's `logprobs: true` with
+`top_logprobs` (default 20) and `/v1/completions`' `logprobs: N` give each generated token's (`logprobs.content`:
+`id`, `token`, `bytes`, `logprob` and the `top_logprobs`), `/completion`'s `n_probs` gives them as
+`completion_probabilities`, and `post_sampling_probs` the probabilities the sampler drew from instead (`prob`,
+`top_probs`).
 Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
-`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: embeddings,
-reranking, infill, `/metrics`, LoRA, model downloads; their routes answer 501.
+`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: infill,
+`/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
@@ -120,6 +126,26 @@ llama.cpp's own web UI (MIT license, copyright The ggml authors), prebuilt, pinn
 on the first start into the build cache (later starts need no network). `--path DIR` serves another build, `--no-ui`
 none.
 
+## Embeddings and rerank
+
+With `--embedding` the server returns embeddings as llama-server does: `/v1/embeddings` (OpenAI's: `input` a text, a
+list of texts or token ids; `encoding_format` `float` or `base64`; OpenAI's `dimensions`: the first N values,
+normalized again) and `/embeddings` (llama-server's own: `content`). An embedding is the last layer's output after the
+model's final norm, pooled by `--pooling` (else the model file's `pooling_type`): `mean` over the tokens, `cls` the
+first token's, `last` the last token's, `none` every token's (`/embeddings` only), normalized by `embd_normalize`
+(Euclidean by default: `--embd-normalize`). A generative model (Llama 3.x, Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7) has no
+pooling of its own: give one. Gemma 4 has no embeddings (501).
+
+```bash
+artlite-server -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf --embedding --pooling mean
+curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d '{"input": ["a text", "another"]}'
+```
+
+A request's texts run one after another, each entirely as prefill chunks (no decode steps, no LM head), after the
+prefix the prompt cache keeps of it. `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
+`{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file: its classifier head
+(`cls.output`) on the last token of its rerank prompt; none of the architectures Artlite runs has one yet.
+
 ## Requests
 
 With `-m`, the model loads after the server starts; until then the API answers 503 `Loading model`, which the UI
@@ -167,7 +193,10 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
   command line's model options (`-c`, `-rea`, `--temp`, `--kv-k`, ...); unloading ends that process, which gives all
-  its memory back. One process is kept started ahead, so a load does not wait for Python to start (~1.5 s).
+  its memory back. One process is kept started ahead, so a load does not wait for Python to start (~1.5 s). Loaded
+  models take turns on the NPU: one process's dispatches run while no other's do, and another process's request waits
+  for the running dispatch, or for the next piece boundary of a long prompt (up to two pieces, ~1.6 s, during a
+  32K prompt of a 3B).
 - **API.** `GET /v1/models` lists every model with its status: `unloaded` (`failed` and the reason when its last load
   failed), `loading`, `loaded`; `?reload=1` reads the directory again, and a running model whose file changed
   unloads. `POST /models/load` and `/models/unload` take `{"model": ...}` (an unload cancels the model's running
@@ -253,6 +282,15 @@ NPU:
 | `--kv-k single\|hilo` | the KV cache's K precision (Llama, Gemma 4), as [artlite-cli](cli.md)'s |
 | `--dflash`, `--no-dflash` | Qwen3.8 27B's drafter, as [artlite-cli](cli.md)'s (default: its DFlash2 block drafter where the file is in the models directory, else its MTP layer) |
 | `--warmup`, `--no-warmup` | run one token after loading (default on) |
+
+Embeddings and rerank ([above](#embeddings-and-rerank)):
+
+| option | |
+|---|---|
+| `--embedding`, `--embeddings` | the embedding routes |
+| `--pooling none\|mean\|cls\|last\|rank` | the embeddings' pooling (default: the model file's) |
+| `--rerank`, `--reranking` | the rerank routes: `--embedding` with pooling `rank` (a reranker's file) |
+| `--embd-normalize N` | the embeddings' normalization: -1 none, 0 the largest magnitude to 32760, 2 Euclidean, any other p the p-norm (default 2; a request's `embd_normalize` overrides it) |
 
 Images:
 

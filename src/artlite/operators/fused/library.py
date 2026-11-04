@@ -6,6 +6,7 @@ Every argument of an operator is its own slot in the ELF's scratch (a BD's addre
 are allocated: the items address the caller's buffers.
 """
 
+import contextlib
 import itertools
 import threading
 import time
@@ -17,7 +18,7 @@ import numpy as np
 
 from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
-from ...overlay import SPIN_MARGIN_US, irq_cpu
+from ...overlay import SPIN_MARGIN_US, irq_cpu, npu_turn
 from ..base import ArtcOperator
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
@@ -166,13 +167,20 @@ class Library(FusedElf):
 
         Each piece is dispatched as soon as it is assembled and its hook ran, then the previous one is waited for: the
         firmware starts it at the previous one's end (a boundary waited for first: ~35 us more of idle NPU, the wait's
-        wake-up and the submit). The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
+        wake-up and the submit), unless another process waits for the NPU's turn (``overlay.npu_turn``): then the
+        previous one ends first and that process's dispatches run before this one (each piece configures the array
+        again). The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
         (``irq_cpu``): it waits there (napping, then polling from shortly before the piece's shortest seen end), and the
         host work between pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU
         the scheduler woke for it)."""
         cpu = irq_cpu()
         with portable.on_cpu(cpu), _PIECES.lock:
-            return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
+            try:
+                return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
+            except BaseException:  # (a hook's exception: the pieces dispatched end first, and with them the NPU's turn)
+                with contextlib.suppress(_native.DispatchError):
+                    self._kernel().dispatch_wait()
+                raise
 
     def _run(self, items: Sequence[Item], *, splits: Iterable[int], bufs: Sequence[Any],
              hooks: Mapping[int, Callable[[], None]] | None, cpu: int) -> int:
@@ -199,8 +207,9 @@ class Library(FusedElf):
             key = (hash(tuple((e, tuple(addrs)) for e, addrs in items)), asm.parity)
             held = _PIECES.holds(asm.parity, self, key)
             if held is not None:
-                submit = time.perf_counter()
-                kern.dispatch_elf_async(_PIECES.bos[asm.parity], refs, held[0])
+                with npu_turn():
+                    submit = time.perf_counter()
+                    kern.dispatch_elf_async(_PIECES.bos[asm.parity], refs, held[0])
                 asm.parity = held[1]
                 wait(((id(items), 0, len(items)), submit), 0)
                 return 1
@@ -223,8 +232,13 @@ class Library(FusedElf):
             bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
                 hooks[a]()
-            submit = time.perf_counter()
-            kern.dispatch_elf_async(bo, refs, piece.nbytes)
+            if last is not None and _native.turn_contended():  # (another process's dispatches between the pieces)
+                end = wait(last, 0)
+                last = None
+                _native.turn_pass()
+            with npu_turn():  # (the piece's submit time: once the turn is this process's)
+                submit = time.perf_counter()
+                kern.dispatch_elf_async(bo, refs, piece.nbytes)
             if last is not None:
                 end = wait(last, 1)  # (piece k - 1; piece k runs on from its end)
             last = ((id(items), a, b), max(submit, end))

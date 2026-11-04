@@ -12,6 +12,7 @@
 
 #include "artlite/error.h"
 #include "artlite/spin.h"
+#include "artlite/turn.h"
 #include "shim_xdna/bo.h"
 #include "shim_xdna/device.h"
 #include "shim_xdna/ert.h"
@@ -45,7 +46,7 @@ struct Kernel::Impl {
   std::vector<std::unique_ptr<bo>> idle;  // exec buffers to reuse
   std::deque<Command> pending;            // submitted, in timeline order
   std::vector<uint32_t> arg_handles;
-  std::chrono::steady_clock::time_point t_submit;  // the last dispatch_async's
+  std::chrono::steady_clock::time_point t_submit;  // the last submit's (once the NPU's turn was this process's)
 
   Impl(device& d, hw_ctx& c, std::string_view name)
       : dev(d), ctx(c), cu_mask(1u << c.cu_index(name.empty() ? c.m_cu_info[0].m_name : name)) {}
@@ -57,10 +58,12 @@ struct Kernel::Impl {
       ctx.wait(pending.back().seq, 0);
     } catch (...) {
     }
+    turn::leave(pending.size());
   }
 
-  // Fill an exec buffer (header, CU mask, payload) and submit it. Every word the driver reads is
-  // rewritten, which also restores a buffer whose payload the driver wiped after a failure.
+  // Fill an exec buffer (header, CU mask, payload) and submit it in the NPU's turn (turn.h: held until the command is
+  // retired). Every word the driver reads is rewritten, which also restores a buffer whose payload the driver wiped
+  // after a failure.
   void submit(uint32_t opcode, std::span<const uint32_t> payload, const bo& first,
               std::span<const std::reference_wrapper<bo>> bufs) {
     if (payload.size() + 2 > kCmdBoSize / sizeof(uint32_t))
@@ -86,10 +89,13 @@ struct Kernel::Impl {
     std::ranges::sort(arg_handles);
     arg_handles.erase(std::ranges::unique(arg_handles).begin(), arg_handles.end());
     uint64_t seq;
+    turn::enter();
+    t_submit = std::chrono::steady_clock::now();
     try {
       seq = ctx.submit(*cmd, arg_handles);
     } catch (...) {
       idle.push_back(std::move(cmd));
+      turn::leave();
       throw;
     }
     pending.push_back({std::move(cmd), seq, opcode});
@@ -123,7 +129,12 @@ struct Kernel::Impl {
   // Retire the first n commands (all: n = pending's size), finished after a completed wait; throws the first failure.
   void reap(size_t n) {
     std::optional<DispatchError> first;
-    for (; n && !pending.empty(); n--) {
+    size_t retired = 0;
+    struct Leave {
+      size_t& n;
+      ~Leave() { turn::leave(n); }
+    } leave{retired};
+    for (; n && !pending.empty(); n--, retired++) {
       Command& c = pending.front();
       uint32_t state = state_of(*c.cmd);
       if (!ert_cmd_state_is_terminal(state)) {
@@ -222,9 +233,8 @@ void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>>
 
 void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs, uint32_t timeout_ms,
                       int64_t spin_after_us, int spin_cpu) {
-  const auto t0 = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
-  if (spin_after_us >= 0) spin_on_cpu(t0, spin_after_us, spin_cpu, [this] { return impl_->done(); });
+  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 
@@ -236,12 +246,10 @@ void Kernel::dispatch_elf(bo& instr_bo, std::span<const std::reference_wrapper<b
 
 void Kernel::dispatch_elf_async(bo& instr_bo, std::span<const std::reference_wrapper<bo>> data_bufs,
                                 size_t instr_bytes) {
-  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_elf(instr_bo, data_bufs, instr_bytes);
 }
 
 void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs) {
-  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
 }
 

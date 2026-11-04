@@ -6,7 +6,8 @@ the transaction of a dispatch; ``sync`` closes a group of transfers that must co
 issued (an output that the next phase reads back from DDR). ``OverlayDevice`` owns the compiled design's hardware
 context and dispatches transactions on host buffers; ``Transaction`` keeps one in an instruction buffer of its
 own, to be patched (``txn.bd_words``) and dispatched again (its last durations time a spin on the CPU of the NPU's
-interrupts near its end: ``irq_cpu``). ``WeightBuffer`` packs a weight image in a thread.
+interrupts near its end: ``irq_cpu``). ``WeightBuffer`` packs a weight image in a thread. ``npu_turn`` holds the NPU's
+turn between processes (``csrc/artlite/turn.h``) across a check and the dispatches it decides.
 
 The design's operator (``OverlayOperator``) names its streams: ``ENDPOINTS`` (stream -> (direction, shim
 channel)), ``BD_BASE`` (stream -> the first of the shim BDs its transfers use in turn: 16 BDs per shim tile;
@@ -17,15 +18,17 @@ packet-switched channel), and checks with ``check_endpoints`` that aiecc gave ea
 from __future__ import annotations
 
 import collections
+import contextlib
 import functools
 import os
 import threading
 import time
+from collections.abc import Iterator
 from typing import ClassVar, Protocol
 
 import numpy as np
 
-from . import backend, parallel_compile, txn
+from . import _native, backend, parallel_compile, txn
 from ._native import Buffer, Device, DispatchError
 
 SPIN_MARGIN_US = 1000  # a transaction's spin starts this long before its shortest recent duration
@@ -47,6 +50,17 @@ def irq_cpu() -> int:
     except (OSError, ValueError):
         return -1
     return counts.index(max(counts)) if any(counts) else -1
+
+
+@contextlib.contextmanager
+def npu_turn() -> Iterator[None]:
+    """This process's turn on the NPU meanwhile: no other process's dispatch runs between the dispatches inside (each
+    pending dispatch holds it too, until a wait retires it)."""
+    _native.turn_enter()
+    try:
+        yield
+    finally:
+        _native.turn_leave()
 
 
 class OverlayOperator(Protocol):
@@ -283,11 +297,13 @@ class OverlayDevice:
         self._submitted: tuple[Transaction, float] | None = None  # (``submit``: the running one, its start)
         self._prologue: Transaction | None = None
         self.stale = False  # (``set_prologue``)
+        self._turns = -1  # (``turn_foreign`` at the last dispatch)
 
     def set_prologue(self, words: np.ndarray) -> None:
         """A transaction run before the next dispatch whenever ``stale``: state the design keeps on the array beyond its
-        configuration (code pages' stores: ``paging.Store``), lost when another hardware context ran on the device (its
-        owner then sets ``stale``). Stale from here on."""
+        configuration (code pages' stores: ``paging.Store``), lost when another hardware context ran on the device: of
+        this process (its owner then sets ``stale``) or of another (the NPU's turn says so: ``npu_turn``). Stale from
+        here on."""
         self._prologue = Transaction(self, words)
         self.stale = True
 
@@ -297,9 +313,12 @@ class OverlayDevice:
         self._prog._kernel()
 
     def _fresh(self) -> None:
-        if self.stale and self._prologue is not None:
+        """(In the NPU's turn, before a dispatch.)"""
+        turns = _native.turn_foreign()
+        if self._prologue is not None and (self.stale or turns != self._turns):
             self.stale = False
             self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
+        self._turns = turns
 
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
         """A zeroed host buffer the NPU can read and write; returns its uint8 view. The NPU's DMA
@@ -352,13 +371,14 @@ class OverlayDevice:
         """Run a transaction (default: the loaded one); blocking. The DispatchError of a transaction
         the driver's hang detection stopped names the operations where the firmware was."""
         try:
-            self._fresh()
-            if transaction is None:
-                self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
-                return
-            t0 = time.perf_counter()
-            self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
-                                          spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
+            with npu_turn():
+                self._fresh()
+                if transaction is None:
+                    self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
+                    return
+                t0 = time.perf_counter()
+                self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
+                                              spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
             transaction.durations.append(time.perf_counter() - t0)
         except DispatchError as e:
             self._note(e, transaction)
@@ -367,9 +387,10 @@ class OverlayDevice:
     def submit(self, transaction: Transaction) -> None:
         """Start a transaction and return: ``wait`` waits for it (the host prepares the next one meanwhile)."""
         assert self._submitted is None, "a transaction is running"
-        self._fresh()
-        self._submitted = (transaction, time.perf_counter())
-        self._prog._kernel().dispatch_async(transaction.buffer, list(self.buffers.values()))
+        with npu_turn():
+            self._fresh()
+            self._submitted = (transaction, time.perf_counter())
+            self._prog._kernel().dispatch_async(transaction.buffer, list(self.buffers.values()))
 
     def wait(self) -> None:
         """Wait for the submitted transaction (``submit``), polling near its end as ``dispatch`` does."""

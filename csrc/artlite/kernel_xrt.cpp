@@ -11,6 +11,7 @@
 #include "artlite/kernel.h"
 #include "artlite/shim.h"
 #include "artlite/spin.h"
+#include "artlite/turn.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
@@ -51,6 +52,7 @@ struct Kernel::Impl {
       } catch (...) {
       }
     }
+    turn::leave(pending.size());
   }
 
   // The NPU reaches only the XRT buffers its command lists, at most kMaxBuffers, even where the transaction holds the
@@ -93,7 +95,14 @@ struct Kernel::Impl {
       run.set_arg(kArgInstr, ctrl_code.xrt_for(ctx, kArgInstr));
       run.set_arg(kArgWords, static_cast<uint32_t>((instr_bytes ? instr_bytes : ctrl_code.size()) / sizeof(uint32_t)));
       for (size_t i = 0; i < args.size(); i++) run.set_arg(kArgFirstBuffer + static_cast<unsigned>(i), *args[i]);
-      run.start();
+      turn::enter();  // (turn.h: held until the run is retired)
+      t_submit = std::chrono::steady_clock::now();
+      try {
+        run.start();
+      } catch (...) {
+        turn::leave();
+        throw;
+      }
       pending.emplace_back(std::move(run), args.size());
     } catch (const DispatchError&) {
       throw;
@@ -128,7 +137,12 @@ struct Kernel::Impl {
   // Retire the first n runs (all: n = pending's size), finished after a completed wait; throws the first failure.
   void reap(size_t n) {
     std::optional<DispatchError> first;
-    for (; n && !pending.empty(); n--) {
+    size_t retired = 0;
+    struct Leave {
+      size_t& n;
+      ~Leave() { turn::leave(n); }
+    } leave{retired};
+    for (; n && !pending.empty(); n--, retired++) {
       xrt::run& r = pending.front().first;
       uint32_t state = state_of(r);
       if (state != shim_xdna::ERT_CMD_STATE_COMPLETED && !first) first = failure(r, state);
@@ -195,9 +209,8 @@ void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>>
 
 void Kernel::dispatch(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs, uint32_t timeout_ms,
                       int64_t spin_after_us, int spin_cpu) {
-  const auto t0 = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
-  if (spin_after_us >= 0) spin_on_cpu(t0, spin_after_us, spin_cpu, [this] { return impl_->done(); });
+  if (spin_after_us >= 0) spin_on_cpu(impl_->t_submit, spin_after_us, spin_cpu, [this] { return impl_->done(); });
   impl_->wait_all(timeout_ms);
 }
 
@@ -209,12 +222,10 @@ void Kernel::dispatch_elf(bo& instr_bo, std::span<const std::reference_wrapper<b
 
 void Kernel::dispatch_elf_async(bo& instr_bo, std::span<const std::reference_wrapper<bo>> data_bufs,
                                 size_t instr_bytes) {
-  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_elf(instr_bo, data_bufs, instr_bytes);
 }
 
 void Kernel::dispatch_async(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs) {
-  impl_->t_submit = std::chrono::steady_clock::now();
   impl_->submit_cu(ctrl_code, data_bufs);
 }
 

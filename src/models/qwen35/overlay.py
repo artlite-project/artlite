@@ -282,6 +282,7 @@ class QwenOverlay(ModelOverlay):
                 self.norm_off[(L, name)] = take("NORM", nw)
         self.norm_off[(-1, "output_norm")] = take("NORM", nw)
         self.gobj, self.gstate, self.fatt, self.rawkv, self.kv_off, self.ghdr, self.ring_off = {}, {}, {}, {}, {}, {}, {}
+        self._gobj0: dict[int, np.ndarray] = {}  # (``reset``: a GDN layer's objects as loaded)
         self.hslot = HSLOT
         if self.gsh is not None:
             self.npair = self.gsh.hc // 2
@@ -401,13 +402,19 @@ class QwenOverlay(ModelOverlay):
                 gobj[self._gpay(L, c, k):self._gpay(L, c, k) + XPAY] = pay
 
     def reset(self) -> None:
-        """A new sequence: the GDN layers' conv histories, replay objects and states, the KV caches zeroed."""
+        """A new sequence: the GDN layers' conv histories, replay objects and states zeroed (a layer's objects as
+        ``_load_gdn`` wrote them first: their conv weights take it ~0.5 ms a layer)."""
         super().reset()
         dev = self.dev
         dev.view("GSTATE")[:] = 0
         dev.flush("GSTATE")
-        for L in self.gobj:
-            self._load_gdn(L)
+        gobj, n = dev.view("GOBJ"), COLS * self.gcol if self.gobj else 0
+        for L, o in self.gobj.items():
+            if L in self._gobj0:
+                gobj[o:o + n] = self._gobj0[L]
+            else:
+                self._load_gdn(L)
+                self._gobj0[L] = gobj[o:o + n].copy()
         dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)

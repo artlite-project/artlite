@@ -212,9 +212,8 @@ class ModelOverlay:
         """The model's static objects (ACT is flushed after)."""
 
     def reset(self) -> None:
-        """A new sequence: the KV caches zeroed."""
-        self.dev.view("KV")[:] = 0
-        self.dev.flush("KV")
+        """A new sequence. The KV caches keep their bytes: a step or chunk reads only the positions before its own,
+        written by then (zeroing them would flush the whole cache: milliseconds)."""
         self.vring.clear()
 
     def ready(self) -> None:

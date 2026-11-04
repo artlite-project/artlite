@@ -26,7 +26,8 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from artlite.decode.model import Records
-from models.common import MEDIA_MARKER, Checkpoint, Mask, Model, NpuModel, Penalties, Sampling, top_logits
+from models.common import MEDIA_MARKER, Checkpoint, Mask, Model, NpuModel, Penalties, Probs, Sampling, top_logits
+from models.readouts import Readouts
 from models.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
@@ -129,6 +130,12 @@ class FakeVision(FakeModel):
         return seq + self.tokenizer.encode(text + "<|assistant|>")
 
 
+def fake_row(seq: list[int]) -> np.ndarray:
+    """A fake model's output row (8 values) of a sequence's last token: from all of its tokens, as a causal model's."""
+    s = sum((i + 1) * t for i, t in enumerate(seq))
+    return np.cos(np.arange(8) * (s % 101 + 1) / 7).astype(np.float32)
+
+
 class FakeNpu(NpuModel):
     """Replies with the pieces of ``replies`` (one list per generation, then an end-of-sequence token; default
     "ok"); ``seq``: the tokens at the cached positions; ``fail``: an exception for forward to raise. ``group``: rewinds
@@ -204,6 +211,18 @@ class FakeNpu(NpuModel):
                 progress(min(i + self.chunk, len(tokens)))
         return None
 
+    def outputs(self, tokens: list[int], at: object = None, *, norm: bool = True, progress: object = None
+                ) -> np.ndarray:
+        """(a causal model's rows: each a function of the tokens up to it, ``fake_row``)"""
+        self.calls.append(("outputs", len(tokens)))
+        if self.fail is not None:
+            raise self.fail
+        p0 = self.position
+        for i in range(0, len(tokens), self.chunk):
+            self._run(tokens[i:i + self.chunk])
+        idx = np.arange(len(tokens)) if at is None else np.asarray(at) % len(tokens)
+        return np.stack([fake_row(self.seq[:p0 + i + 1]) for i in idx])
+
     def _logits(self, token: int) -> torch.Tensor:
         out = torch.full((VOCAB,), -100.0)
         out[token] = 0.0
@@ -234,11 +253,15 @@ class FakeNpu(NpuModel):
         logits = self._logits(next(self._next, EOS))
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
+    def step(self, token: int) -> torch.Tensor:
+        self._run([token])
+        return self._logits(next(self._next, EOS))
+
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = (),
-                 mask: Mask | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
         """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded)"""
         if not self.drafts:
-            yield from super().generate(logits, max_tokens, sampling, prompt, mask)
+            yield from super().generate(logits, max_tokens, sampling, prompt, mask, probs)
             return
         token, n = int(logits.argmax()), 1
         yield token
@@ -248,6 +271,9 @@ class FakeNpu(NpuModel):
                 new.append(next(self._next, EOS))
             self._run([token, *new[:-1]])
             for token in new:
+                if probs is not None:
+                    row = self._logits(token)
+                    probs(row, token, 0.0, top_logits(row, 1))
                 n += 1
                 yield token
 
@@ -278,10 +304,12 @@ def make(*, reasoning: tuple[str, str] | None = None, load: object = None, visio
     return model, npu, engine
 
 
-def app_of(engine: Engine, *, template: str = TEMPLATE, **options: object) -> object:
+def app_of(engine: Engine, *, template: str = TEMPLATE, readouts: Readouts | None = None, **options: object
+           ) -> object:
     opts = {"alias": "fake", "n_ctx": 512, "sse_ping_interval": 0.05} | options
     return create_app(engine, Options(**opts), ModelInfo(path="/models/org/repo/fake.gguf", chat_template=template,
-                                                         n_ctx_train=4096, n_vocab=VOCAB))
+                                                         n_ctx_train=4096, n_vocab=VOCAB,
+                                                         readouts=readouts or Readouts()))
 
 
 @pytest.fixture

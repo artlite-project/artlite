@@ -130,6 +130,13 @@ auto* out_span = static_cast<int32_t*>(buf_out->map());
   returns at once (several may be pending), then `dispatch_poll` (no syscall) /
   `dispatch_wait`. The caller keeps a pending dispatch's buffers alive (the driver does not;
   the Python binding holds references until the wait).
+- **`turn`** - The NPU's turn between processes (`artlite/turn.h`): a process holds it while any of its
+  commands is pending (a `Kernel`'s submit takes it, the wait that retires the command gives it back), so another
+  process's commands never run between two of its own; `turn::foreign()` counts the turns other processes took in
+  between (Python: `artlite.overlay.npu_turn`, `_native.turn_foreign`). A switch to another process's hardware
+  context loses what a design keeps on the array beyond its configuration: an overlay with code pages loads its page
+  store again after one. A pipelined run of pieces (`Library.run`) lets a waiting process in between its pieces. A
+  lock file every user's processes share (`/dev/shm/artlite-npu.lock`; Windows: the temp directory).
 
 ---
 

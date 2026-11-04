@@ -34,6 +34,7 @@
 #include "artlite/sampling.h"
 #include "artlite/shim.h"
 #include "artlite/tile_pack.h"
+#include "artlite/turn.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -305,6 +306,29 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       "The hash of the sources the module was built from (CMakeLists.txt's ARTLITE_SOURCE_HASH; "
       "artlite.backend.stale_native compares it with the checkout's).");
 
+  // --- The NPU's turn between processes (turn.h) ---
+  m.def(
+      "turn_enter",
+      [] {
+        nb::gil_scoped_release release;
+        artlite::turn::enter();
+      },
+      "Until this process holds the NPU's turn (nested holds count, each pending dispatch's among them): no other "
+      "process's dispatch runs meanwhile. turn_leave gives a hold back.");
+  m.def("turn_leave", [] { artlite::turn::leave(); }, "Give back a turn_enter hold.");
+  m.def("turn_foreign", &artlite::turn::foreign,
+        "The turns this process took after another process's: a change means another process's hardware context "
+        "may have run on the NPU since.");
+  m.def("turn_contended", &artlite::turn::contended, "Whether another process waits for the NPU's turn.");
+  m.def(
+      "turn_pass",
+      [] {
+        nb::gil_scoped_release release;
+        artlite::turn::pass();
+      },
+      "Holding nothing: until a process waiting for the NPU's turn has taken it (at most 50 ms), so that this "
+      "process's next dispatch comes after its turn.");
+
   // Zero-copy numpy/torch views of Buffer mappings (map()) keep their
   // Buffer/Device wrappers alive until after nanobind's exit-time leak audit,
   // producing false "leaked N instances" reports even though gc finds zero
@@ -572,7 +596,11 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           "dispatch_elf_async",
           [](artlite::Kernel& self, nb::handle instr_bo, nb::list data_bufs, size_t instr_bytes) {
             auto refs = buffer_refs(data_bufs);
-            self.dispatch_elf_async(nb::cast<shim_xdna::bo&>(instr_bo), refs, instr_bytes);
+            auto& bo = nb::cast<shim_xdna::bo&>(instr_bo);
+            {
+              nb::gil_scoped_release release;  // (the NPU's turn may be another process's)
+              self.dispatch_elf_async(bo, refs, instr_bytes);
+            }
             nb::handle py_self = nb::find(self);
             nb::object inflight = nb::getattr(py_self, "_inflight", nb::none());
             if (inflight.is_none()) {
@@ -590,7 +618,11 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
           "dispatch_async",
           [](artlite::Kernel& self, nb::handle ctrl_code, nb::list data_bufs) {
             auto refs = buffer_refs(data_bufs);
-            self.dispatch_async(nb::cast<shim_xdna::bo&>(ctrl_code), refs);
+            auto& bo = nb::cast<shim_xdna::bo&>(ctrl_code);
+            {
+              nb::gil_scoped_release release;  // (the NPU's turn may be another process's)
+              self.dispatch_async(bo, refs);
+            }
             nb::handle py_self = nb::find(self);
             nb::object inflight = nb::getattr(py_self, "_inflight", nb::none());
             if (inflight.is_none()) {
@@ -761,6 +793,16 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       },
       "logits"_a, nb::sig("def max_prob(logits: numpy.ndarray | object) -> tuple[int, float]"),
       "The largest of bf16 logits (its index, the first of equal ones) and its probability: artlite::max_prob.");
+  m.def(
+      "logsumexp",
+      [](Vector logits, float cap) {
+        const artlite::Logits x = logits_arg(logits);
+        nb::gil_scoped_release release;
+        return artlite::logsumexp(x, cap);
+      },
+      "logits"_a, "cap"_a = 0.0f, nb::sig("def logsumexp(logits: numpy.ndarray | object, cap: float = 0.0) -> float"),
+      "log(sum(exp(l))) of a vocabulary's logits (bf16 or fp32, as top_logits takes them) after a soft cap (cap > 0: "
+      "tanh(l / cap) cap): artlite::logsumexp.");
 
   m.def(
       "pack_tiles",

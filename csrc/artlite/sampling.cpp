@@ -221,4 +221,39 @@ std::pair<size_t, float> max_prob(const uint16_t* x, size_t n) {
   return {i, 1.0f / s};
 }
 
+float logsumexp(Logits x, float cap) {
+  if (!x.n) return -INFINITY;
+  const float top = logit(x, index_of(best(x, 1)[0]));
+  const float mx = cap > 0 ? std::tanh(top / cap) * cap : top;
+  const __m512 vmx = _mm512_set1_ps(mx), l2e = _mm512_set1_ps(1.4426950408889634f);
+  const __m512 inv = _mm512_set1_ps(cap > 0 ? 1.0f / cap : 0.0f), vcap = _mm512_set1_ps(cap);
+  auto term = [&](__m512 l) {  // (exp(capped l - max); tanh(y) = 1 - 2 / (exp(2 y) + 1), y within +-9: +-1 in fp32)
+    if (cap > 0) {
+      const __m512 y = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(l, inv), _mm512_set1_ps(-9.0f)), _mm512_set1_ps(9.0f));
+      const __m512 e = exp2_ps(_mm512_mul_ps(_mm512_add_ps(y, y), l2e));  // (exp(2 y); 2^t holds for t <= 26 too)
+      const __m512 t = _mm512_sub_ps(_mm512_set1_ps(1.0f),
+                                     _mm512_div_ps(_mm512_set1_ps(2.0f), _mm512_add_ps(e, _mm512_set1_ps(1.0f))));
+      l = _mm512_mul_ps(t, vcap);
+    }
+    return exp2_ps(_mm512_mul_ps(_mm512_sub_ps(l, vmx), l2e));
+  };
+  auto load = [&](size_t j, __mmask16 lanes) {
+    if (x.bf16)
+      return _mm512_castsi512_ps(_mm512_slli_epi32(
+          _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(lanes, static_cast<const uint16_t*>(x.data) + j)), 16));
+    return _mm512_maskz_loadu_ps(lanes, static_cast<const float*>(x.data) + j);
+  };
+  __m512 s0 = _mm512_setzero_ps(), s1 = s0;
+  size_t j = 0;
+  for (; j + 32 <= x.n; j += 32) {
+    s0 = _mm512_add_ps(s0, term(load(j, 0xFFFF)));
+    s1 = _mm512_add_ps(s1, term(load(j + 16, 0xFFFF)));
+  }
+  for (; j < x.n; j += 16) {
+    const __mmask16 lanes = x.n - j >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << (x.n - j)) - 1);
+    s0 = _mm512_mask_add_ps(s0, lanes, s0, term(load(j, lanes)));
+  }
+  return mx + std::log(_mm512_reduce_add_ps(_mm512_add_ps(s0, s1)));
+}
+
 }  // namespace artlite

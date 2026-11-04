@@ -330,12 +330,13 @@ class LlamaPrefill(ChunkPrefill):
         dev.flush("PX", 0, 2 * T * H)
         self._launch(T, p0, self.params(T, p0))
 
-    def hidden(self, i: int) -> torch.Tensor:
-        """Row i (hidden,) of the last chunk's output residual (bf16 values; the LM head's input before its norm)."""
+    def hidden(self, i: int, n: int = 1) -> torch.Tensor:
+        """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
+        before its norm)."""
         H, dev = self.H, self.ov.dev
-        dev.fetch("PX", 2 * i * H, 2 * H)
-        row = dev.view("PX")[2 * i * H:2 * (i + 1) * H].view(np.int16).copy()
-        return torch.from_numpy(row).view(torch.bfloat16).float()
+        dev.fetch("PX", 2 * i * H, 2 * n * H)
+        rows = dev.view("PX")[2 * i * H:2 * (i + n) * H].view(np.int16).copy()
+        return torch.from_numpy(rows).view(torch.bfloat16).float().view(n, H)
 
     # ------------------------------------------------------------------
     # Time estimates

@@ -224,17 +224,19 @@ class ChunkPrefill:
         """Whether a chunk of size T at p0 runs in pieces within PIECE_BUDGET_S (one layer each at least)."""
         return max(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers) * self.pace_factor() <= PIECE_BUDGET_S
 
-    def plan(self, p0: int, n: int) -> list[int]:
+    def plan(self, p0: int, n: int, *, steps: bool = True) -> list[int]:
         """The chunk sizes (in order) that run the first tokens of n from position p0: full chunks of the largest size
         that fits, then the tail as the sizes of the least estimated time; tokens left (the overlay's SLOTS at most:
         one decode step, which streams the weights once as a chunk does, without its ConfigureOps and the LM head's
-        dispatch; fewer than ``MIN_TOKENS``; or no size fits) are for decode steps."""
+        dispatch, unless ``steps`` is False: a readout, which needs no LM head; fewer than ``MIN_TOKENS``; or no size
+        fits) are for decode steps."""
         out: list[int] = []
-        while n >= max(self.MIN_TOKENS, self.ov.SLOTS + 1):
-            ok = [T for T in self.sizes if self.fits(T, p0)]
-            if not ok:
+        while n >= (max(self.MIN_TOKENS, self.ov.SLOTS + 1) if steps else self.MIN_TOKENS):
+            first = next((T for T in self.sizes if self.fits(T, p0)), 0)
+            if not first:
                 break
-            if n >= ok[-1]:
+            ok = [first, *(T for T in self.sizes if T > first and self.fits(T, p0))] if n > first else [first]
+            if n >= ok[-1] or n <= first:  # (or the smallest size holds them all: the cheapest cover)
                 T = ok[-1]
             else:  # (the tail in units of the sizes' gcd: the cheapest cover)
                 cost = {T: self.chunk_seconds(T, p0) for T in ok}

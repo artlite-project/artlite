@@ -35,7 +35,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, Sampling, chat_template
-from . import agents
+from ..readouts import Readouts
+from . import agents, readouts
 from .agents import Blocks
 from .engine import Engine, Job
 from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
@@ -48,8 +49,7 @@ PENALTIES = ("repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_p
 # sampler fields the NPU path does not have, with their neutral values (others are ignored with a log line)
 NEUTRAL: dict[str, object] = {
     "typical_p": 1.0, "typ_p": 1.0, "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0,
-    "dynatemp_range": 0.0, "top_n_sigma": -1.0, "n_probs": 0, "logprobs": False, "top_logprobs": 0,
-    "ignore_eos": False, "logit_bias": None, "grammar": None, "json_schema": None, "response_format": None,
+    "dynatemp_range": 0.0, "top_n_sigma": -1.0, "ignore_eos": False, "logit_bias": None, "grammar": None, "json_schema": None, "response_format": None,
     "thinking_budget_tokens": None,
 }
 # llama-server's other sampler settings, as /props reports them (the parameters of samplers that are off)
@@ -85,6 +85,9 @@ class Options:
     preserve_reasoning: bool = True  # earlier answers keep their thoughts (the templates' preserve_thinking)
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)  # under each request's
     cache_prompt: bool = True
+    embedding: bool = False  # the embedding routes (llama-server's --embedding; with pooling rank: rerank too)
+    pooling: str | None = None  # the embeddings' pooling (--pooling, else the model file's; None: none)
+    embd_normalize: int = 2  # the embeddings' normalization by default (models.readouts.normalize)
     sse_ping_interval: float = 30.0  # seconds between pings while a stream waits (<= 0: none)
     slots: bool = True  # GET /slots
     ui: Callable[[FastAPI], None] | None = None  # serves the web UI's files (``ui.mount``); None: none
@@ -106,6 +109,7 @@ class ModelInfo:
     n_params: int = 0
     size: int = 0
     ftype: str = ""
+    readouts: Readouts = field(default_factory=Readouts)  # (its pooling, classifier head, rerank prompt)
 
     @classmethod
     def from_gguf(cls, path: str) -> ModelInfo:
@@ -124,7 +128,7 @@ class ModelInfo:
                    n_ctx_train=int(meta.get(f"{arch}.context_length", 0)),
                    n_embd=int(meta.get(f"{arch}.embedding_length", 0)), n_vocab=n_vocab,
                    n_params=int(fields["model_n_params"]), size=int(fields["model_size"]),
-                   ftype=file_type_name(meta.get("general.file_type")))
+                   ftype=file_type_name(meta.get("general.file_type")), readouts=Readouts.of(path))
 
 
 class ApiError(Exception):
@@ -222,10 +226,14 @@ class Generation(BaseModel):
     timings_per_token: bool | None = False
     sse_ping_interval: float | None = None
     stream_options: dict[str, Any] | None = None
+    n_probs: int | None = None
+    post_sampling_probs: bool | None = None
 
 
 class ChatRequest(Generation):
     messages: list[Message]
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
     max_completion_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     reasoning_format: str | None = None
@@ -237,6 +245,7 @@ class ChatRequest(Generation):
 
 class CompletionRequest(Generation):
     prompt: str | list[int] | list[str]
+    logprobs: int | None = None  # (n_probs: llama-server's alias)
 
 
 class TokenizeRequest(BaseModel):
@@ -341,9 +350,8 @@ def key_check(api_keys: frozenset[str]) -> Callable[..., Awaitable[None]]:
     return authorized
 
 
-NOT_SUPPORTED = ["/v1/chat/completions/control", "/v1/embeddings", "/embeddings", "/embedding", "/rerank",
-                 "/reranking", "/v1/rerank", "/v1/reranking", "/infill", "/v1/audio/transcriptions",
-                 "/audio/transcriptions", "/lora-adapters", "/metrics"]
+NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/v1/audio/transcriptions", "/audio/transcriptions",
+                 "/lora-adapters", "/metrics"]
 
 
 def add_unsupported(router: APIRouter) -> None:
@@ -569,7 +577,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
         n = max_tokens if max_tokens is not None else req.max_tokens if req.max_tokens is not None else \
             req.n_predict if req.n_predict is not None else options.n_predict
+        if isinstance(req, ChatRequest) and not req.logprobs and req.top_logprobs is not None:
+            raise bad_request("top_logprobs requires logprobs to be set to true")
+        n_probs = (req.top_logprobs if req.top_logprobs is not None else 20) if getattr(req, "logprobs", None) is True \
+            else req.n_probs if req.n_probs is not None else int(getattr(req, "logprobs", None) or 0)
+        if n_probs < 0:
+            raise bad_request("n_probs (top_logprobs, logprobs) must be >= 0")
         j = Job(ids=ids, emit=emit, sampling=request_sampling(req, think), max_tokens=n,
+                n_probs=n_probs, post_sampling=bool(req.post_sampling_probs),
                 seed=req.seed if req.seed is not None else options.seed, stop=stops(req), reasoning=reasoning,
                 inside=reasoning and inside(ids), think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
@@ -593,9 +608,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 return
 
     async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[Blocks, dict[str, Any]]:
-        """A job's output (a response without streaming) as the blocks of its message, and its last event; the client
-        going away cancels it."""
-        blocks = Blocks()
+        """A job's output (a response without streaming) as the blocks of its message, and its last event (its
+        ``probs``: every delta's and its own); the client going away cancels it."""
+        blocks, probs = Blocks(), []
         loop = asyncio.get_running_loop()
         check = loop.time()
         try:
@@ -606,9 +621,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                         j.cancel.set()
                 if kind == "delta":
                     blocks.feed(data["parts"])
+                    probs += data.get("probs", [])
                 elif kind == "done":
                     blocks.end()
-                    return blocks, data
+                    return blocks, {**data, "probs": probs + data["probs"]}
                 elif kind == "error":
                     raise ApiError(500, "server_error", data["message"])
                 elif kind == "cancelled":
@@ -766,13 +782,19 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 message["reasoning_content"] = blocks.text("thinking")
             if calls:
                 message["tool_calls"] = calls
-            return {"choices": [{"finish_reason": done["finish_reason"], "index": 0, "message": message}], **head,
-                    "object": "chat.completion", "usage": usage(done), "timings": done["timings"]}
+            choice = {"finish_reason": done["finish_reason"], "index": 0, "message": message}
+            if done["probs"]:
+                choice["logprobs"] = {"content": done["probs"]}
+            return {"choices": [choice], **head, "object": "chat.completion", "usage": usage(done),
+                    "timings": done["timings"]}
         include_usage = bool((req.stream_options or {}).get("include_usage"))
 
-        def chunk(delta: dict[str, Any], finish: str | None = None, **extra: object) -> dict[str, Any]:
-            return {"choices": [{"finish_reason": finish, "index": 0, "delta": delta}], **head,
-                    "object": "chat.completion.chunk", **extra}
+        def chunk(delta: dict[str, Any], finish: str | None = None, probs: list | None = None, **extra: object
+                  ) -> dict[str, Any]:
+            choice = {"finish_reason": finish, "index": 0, "delta": delta}
+            if probs:
+                choice["logprobs"] = {"content": probs}
+            return {"choices": [choice], **head, "object": "chat.completion.chunk", **extra}
 
         async def stream() -> AsyncIterator[str]:
             yield sse(chunk({"role": "assistant", "content": None}))
@@ -784,11 +806,12 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 elif kind == "delta":
                     parts = data["parts"]
                     for i, (k, v) in enumerate(parts):
-                        last = req.timings_per_token and i == len(parts) - 1
+                        last = i == len(parts) - 1
                         yield sse(chunk({"tool_calls": [call_delta(v)]} if k == "tool_call" else {k: v},
-                                        **({"timings": data["timings"]} if last else {})))
+                                        probs=data.get("probs") if last else None,
+                                        **({"timings": data["timings"]} if last and req.timings_per_token else {})))
                 elif kind == "done":
-                    end = [chunk({}, data["finish_reason"])]
+                    end = [chunk({}, data["finish_reason"], probs=data["probs"])]
                     if include_usage:
                         end.append({"choices": [], **head, "object": "chat.completion.chunk", "usage": usage(data)})
                     end[-1]["timings"] = data["timings"]
@@ -971,13 +994,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         head = {"created": created, "model": name, "system_fingerprint": options.build_info,
                 "object": "text_completion", "id": cid}
 
-        def body(text: str, finish: str | None, **extra: object) -> dict[str, Any]:
-            return {"choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": finish}], **head,
-                    **extra}
+        def body(text: str, finish: str | None, probs: list | None = None, **extra: object) -> dict[str, Any]:
+            return {"choices": [{"text": text, "index": 0, "logprobs": {"content": probs} if probs else None,
+                                 "finish_reason": finish}], **head, **extra}
 
         if not req.stream:
             blocks, done = await collect(j, events, request)
-            return body(blocks.text("text"), done["finish_reason"], usage=usage(done), timings=done["timings"])
+            return body(blocks.text("text"), done["finish_reason"], done["probs"], usage=usage(done),
+                        timings=done["timings"])
 
         async def stream() -> AsyncIterator[str]:
             async for kind, data in events_of(events, ping_of(req)):
@@ -987,9 +1011,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     yield sse(body("", None, prompt_progress=data))
                 elif kind == "delta":
                     text = "".join(t for _, t in data["parts"])
-                    yield sse(body(text, None, **({"timings": data["timings"]} if req.timings_per_token else {})))
+                    yield sse(body(text, None, data.get("probs"),
+                                   **({"timings": data["timings"]} if req.timings_per_token else {})))
                 elif kind == "done":
-                    yield sse(body("", data["finish_reason"], usage=usage(data), timings=data["timings"]))
+                    yield sse(body("", data["finish_reason"], data["probs"], usage=usage(data), timings=data["timings"]))
                     yield "data: [DONE]\n\n"
                 else:
                     yield stream_error(kind, data)
@@ -1014,7 +1039,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     "tokens_predicted": t["predicted_n"], "tokens_evaluated": n_prompt,
                     "generation_settings": params(j.sampling), "prompt": req.prompt if isinstance(req.prompt, str)
                     else "", "has_new_line": "\n" in content, "truncated": False, "stop_type": stop_type,
-                    "stopping_word": done["stop_word"] or "", "tokens_cached": done["n_cached"], "timings": t}
+                    "stopping_word": done["stop_word"] or "", "tokens_cached": done["n_cached"], "timings": t,
+                    **({"completion_probabilities": done["probs"]} if done["probs"] else {})}
 
         if not req.stream:
             blocks, done = await collect(j, events, request)
@@ -1031,6 +1057,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     yield sse({"index": 0, "content": "".join(t for _, t in data["parts"]), "tokens": [],
                                "stop": False, "id_slot": 0, "tokens_predicted": data["timings"]["predicted_n"],
                                "tokens_evaluated": n_prompt,
+                               **({"completion_probabilities": data["probs"]} if data.get("probs") else {}),
                                **({"timings": data["timings"]} if req.timings_per_token else {})})
                 elif kind == "done":
                     yield sse(final("", data))
@@ -1093,6 +1120,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     async def lookup_streams() -> list[Any]:
         return []
 
+    readouts.add_routes(api, engine=engine, alias=options.alias, embedding=options.embedding, pooling=options.pooling,
+                        embd_normalize=options.embd_normalize, readouts=info.readouts,
+                        cache_prompt=options.cache_prompt,
+                        errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits, valid=valid)
     add_unsupported(listed)
     app.include_router(public)
     app.include_router(listed)

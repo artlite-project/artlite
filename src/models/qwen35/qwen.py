@@ -51,7 +51,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Sampling, max_prob
+from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
@@ -239,7 +239,7 @@ class NpuQwen(OverlayModel):
         return (self._rows(tokens),)
 
     def prompt(self, tokens: list[int] | Sequence, *, logits: bool = False,
-               progress: Callable[[int], None] | None = None) -> torch.Tensor | None:
+               progress: Callable[[int], None] | None = None, readout: Readout | None = None) -> torch.Tensor | None:
         """(a sequence's positions from ``rope_next``)"""
         p, n = self.position, len(tokens)
         if p + n > self.capacity:
@@ -248,7 +248,7 @@ class NpuQwen(OverlayModel):
         self.overlay.rope[p:p + n] = self.rope_next + seq.pos
         self._prompting = True
         try:
-            return super().prompt(tokens, logits=logits, progress=progress)
+            return super().prompt(tokens, logits=logits, progress=progress, readout=readout)
         finally:
             self._prompting = False
             done = self.position - p  # (a prompt that ``progress`` stopped: the text after its last cached token)
@@ -306,11 +306,11 @@ class NpuQwen(OverlayModel):
             S, keep, q, src = self._inj
             self._inj = (S, keep - n, q, src[:-n]) if keep > n else None
 
-    def _chunk(self, left: int, position: int | None = None) -> int:
+    def _chunk(self, left: int, position: int | None = None, *, steps: bool = True) -> int:
         """(after a generation's step: a decode step first, which replays its accepted tokens into the GDN states)"""
         if self.overlay.nrep and position in (None, self.position):
             return 0
-        return super()._chunk(left, position)
+        return super()._chunk(left, position, steps=steps)
 
     def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
         """(the LM head alone on the chunk's last output row)"""
@@ -420,12 +420,12 @@ class NpuQwen(OverlayModel):
         return out
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
-                 mask: Mask | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
         """(the drafter's table follows the prompt and each token: ``HeadTable.see``)"""
         see = self._table.see if self._drafting else None
         if see is not None:
             see(getattr(prompt, "ids", prompt))
-        for token in super().generate(logits, max_tokens, sampling, prompt, mask):
+        for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs):
             if see is not None:
                 see((token,))
             yield token

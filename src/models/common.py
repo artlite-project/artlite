@@ -86,6 +86,17 @@ class Sampling:
             return int(ids[0])
         return int(ids[_native.pick(values, self.temp, self.top_p, self.min_p, _rng.random())])
 
+    def probs(self, values: np.ndarray) -> np.ndarray:
+        """The probabilities ``pick`` draws from (of its candidates, in their order; 0: filtered out)."""
+        if self.k == 1:
+            return np.eye(1, len(values), dtype=np.float32)[0]
+        q = np.exp((values - values[0]) / np.float64(self.temp))
+        q /= q.sum()
+        keep = (np.concatenate([[0.0], np.cumsum(q)[:-1]]) < self.top_p) & (q >= self.min_p * q[0])
+        keep[0] = True
+        q = np.where(keep if self.top_p < 1.0 or self.min_p > 0.0 else True, q, 0.0)
+        return (q / q.sum()).astype(np.float32)
+
 
 def top_logits(logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray | None = None
                ) -> tuple[np.ndarray, np.ndarray]:
@@ -103,6 +114,11 @@ def argmax(logits: LogitsLike) -> int:
 def max_prob(logits: LogitsLike) -> tuple[int, float]:
     """The largest of bf16 logits (its index: the first of equal ones) and its probability (softmax)."""
     return _native.max_prob(logits)
+
+
+# a generation's observer of each choice (``NpuModel.generate``'s ``probs``): the logits the token was chosen from (a view
+# valid until the next dispatch), the token, the model's soft cap of them, the candidates the sampler drew from
+Probs = Callable[[LogitsLike, int, float, tuple[np.ndarray, np.ndarray]], None]
 
 
 class Mask(Protocol):
@@ -279,6 +295,17 @@ def _tojson(value: object, ensure_ascii: bool = False, indent: int | None = None
     return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
 
+@functools.lru_cache(maxsize=16)
+def _compiled(template: str) -> jinja2.Template:
+    """A chat template compiled (~10 ms: once per template, not per request)."""
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                                       extensions=[jinja2.ext.loopcontrols])
+    env.filters["tojson"] = _tojson
+    env.globals["raise_exception"] = _raise
+    env.globals["strftime_now"] = lambda fmt: datetime.now().astimezone().strftime(fmt)
+    return env.from_string(template)
+
+
 def chat_template(template: str, messages: list[dict[str, object]], *, tools: list[dict[str, object]] | None = None,
                   **variables: object) -> str:
     """The prompt text of a conversation rendered with a model's chat template (a GGUF file's
@@ -286,13 +313,7 @@ def chat_template(template: str, messages: list[dict[str, object]], *, tools: li
     ``tools``: the functions the model may call (OpenAI's ``{"type": "function", "function": {...}}``; a tool call's
     ``arguments`` in the messages are objects); ``variables``: the template's own (``enable_thinking``, ``bos_token``,
     ``date_string``, ...)."""
-    env = jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                                       extensions=[jinja2.ext.loopcontrols])
-    env.filters["tojson"] = _tojson
-    env.globals["raise_exception"] = _raise
-    env.globals["strftime_now"] = lambda fmt: datetime.now().astimezone().strftime(fmt)
-    return env.from_string(template).render(messages=messages, add_generation_prompt=True, tools=tools or None,
-                                            **variables)
+    return _compiled(template).render(messages=messages, add_generation_prompt=True, tools=tools or None, **variables)
 
 
 class Detokenizer(Protocol):
@@ -400,6 +421,14 @@ class NpuModel:
         out = self.forward(tokens, progress=progress)
         return out if logits else None
 
+    def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
+                progress: Callable[[int], None] | None = None) -> np.ndarray:
+        """Run tokens after the cached positions (``prompt``) and return the last layer's outputs (len(at), hidden)
+        fp32 of the tokens at indices ``at`` (negative: from the end; None: every token), output-normed (``norm``: the
+        LM head's input; else the residual stream): a readout's rows (embeddings, a classifier's or the LM head's rows
+        on the host: ``models.readouts``)."""
+        raise NotImplementedError(f"{type(self).__name__} has no readouts")
+
     def checkpoint(self) -> Checkpoint:
         """The state at the current position that continuing from it needs besides the KV caches' records of the
         positions before it (any position: inside a cache group, after a step whose drafts were rejected)."""
@@ -431,22 +460,50 @@ class NpuModel:
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
-                 mask: Mask | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
         """Sample up to ``max_tokens`` tokens (< 0: no limit) after the cached positions; ``logits``: of the last
         cached one; ``prompt``: the prompt's tokens (the penalties' first); ``mask``: the tokens each may be (told
-        each token as it is sampled). Ends after an end-of-sequence token or when the cache is full."""
+        each token as it is sampled); ``probs``: told each choice before its token is yielded (``logprobs``). Ends
+        after an end-of-sequence token or when the cache is full."""
         if max_tokens == 0:
             return
         penalties = Penalties(sampling, prompt, mask)
-        token = sampling.pick(*penalties.top(logits, sampling.k))
-        penalties.accept(token)
+
+        def choose(row: LogitsLike) -> int:
+            cand = penalties.top(row, sampling.k)
+            token = sampling.pick(*cand)
+            if probs is not None:
+                probs(row, token, 0.0, cand)
+            penalties.accept(token)
+            return token
+
+        token = choose(logits)
         n = 1
         yield token
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
-            token = sampling.pick(*self.top_k(token, sampling.k, penalties))
-            penalties.accept(token)
+            if probs is None:
+                token = sampling.pick(*self.top_k(token, sampling.k, penalties))
+                penalties.accept(token)
+            else:  # (the whole row)
+                token = choose(self.step(token))
             n += 1
             yield token
+
+
+class Readout:
+    """The output rows of a prompt's tokens at indices ``at`` (in order, repeats allowed), gathered as its chunks and
+    steps run (``OverlayModel.prompt``)."""
+
+    def __init__(self, at: np.ndarray, hidden: int):
+        self.at = at
+        self.rows = np.zeros((len(at), hidden), np.float32)
+
+    def take(self, i: int, n: int, rows: Callable[[int, int], torch.Tensor]) -> None:
+        """Tokens i .. i + n - 1 ran: ``rows(j, k)`` (k, hidden) are the outputs of k of them from their j-th on."""
+        sel = np.flatnonzero((self.at >= i) & (self.at < i + n))
+        if sel.size:
+            lo, hi = int(self.at[sel].min()) - i, int(self.at[sel].max()) - i + 1
+            self.rows[sel] = rows(lo, hi - lo).numpy()[self.at[sel] - i - lo]
 
 
 class OverlayModel(NpuModel):
@@ -468,6 +525,7 @@ class OverlayModel(NpuModel):
 
     overlay: Any
     prefill: Any
+    _w_out: torch.Tensor  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
@@ -579,11 +637,11 @@ class OverlayModel(NpuModel):
         self.prefill.run(*args, self.position, T)
         self.stale()
 
-    def _chunk(self, left: int, position: int | None = None) -> int:
+    def _chunk(self, left: int, position: int | None = None, *, steps: bool = True) -> int:
         """The size of the next prefill chunk at ``position`` (default: the next) when ``left`` tokens remain (0: the
-        next token runs as a decode step)."""
+        next token runs as a decode step; ``steps`` False: a readout, as few tokens as possible as decode steps)."""
         p = self.position if position is None else position
-        plan = self.prefill.plan(p, left) if self.prefill is not None else []
+        plan = self.prefill.plan(p, left, steps=steps) if self.prefill is not None else []
         return plan[0] if plan else 0
 
     @property
@@ -640,24 +698,28 @@ class OverlayModel(NpuModel):
         for ov, r in zip(self._overlays(), records, strict=True):
             ov.write_records(r, start, end)
 
-    def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None
-               ) -> torch.Tensor | None:
+    def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None,
+               readout: Readout | None = None) -> torch.Tensor | None:
         """Run tokens after the cached positions (prefill chunks, else decode steps); ``logits``: return the last
-        token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps."""
+        token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps; ``readout``:
+        gathers output rows (``outputs``: every token a chunk can take in chunks)."""
         self._abandon()
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
+        steps = readout is None
         out, i, nxt = None, 0, None
         while i < len(tokens):
-            T = self._chunk(len(tokens) - i)
+            T = self._chunk(len(tokens) - i, steps=steps)
             if not T:  # (decode steps up to the next position where a chunk can start)
                 n = 1
                 while n < min(self.overlay.SLOTS, len(tokens) - i) and \
-                        not self._chunk(len(tokens) - i - n, self.position + n):
+                        not self._chunk(len(tokens) - i - n, self.position + n, steps=steps):
                     n += 1
                 last = logits and i + n == len(tokens)
-                o = self.steps(tokens[i:i + n], logits=last)
+                o = self.steps(tokens[i:i + n], logits=last or not steps)  # (a readout's rows: the LM head's input)
                 out = self.cap(o[-1].float()) if last else None
+                if readout is not None:
+                    readout.take(i, n, lambda j, k: torch.stack([self.overlay.hidden(-1, s) for s in range(j, j + k)]))
                 i += n
                 if progress is not None:
                     progress(i)
@@ -666,13 +728,15 @@ class OverlayModel(NpuModel):
             t0 = time.perf_counter()
             args = nxt.result() if nxt is not None else self._chunk_inputs(tokens[i:i + n], first=True)
             t1 = time.perf_counter()
-            m = self._chunk(len(tokens) - i - n, self.position + n)  # (the next chunk: its inputs meanwhile)
+            m = self._chunk(len(tokens) - i - n, self.position + n, steps=steps)  # (the next chunk: its inputs meanwhile)
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
                                     tokens[i + n:i + n + m]) if m else None
             self._prefill_run(args, T, n)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches
+            if readout is not None:
+                readout.take(i, n, self.prefill.hidden)
             if logits and i + n == len(tokens):
                 out = self.cap(self._chunk_logits(tokens[-1], n).float())
                 self.slot = 0
@@ -685,6 +749,21 @@ class OverlayModel(NpuModel):
     def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> torch.Tensor:
         """Run the tokens after the cached positions: the logits (vocab,) of the last."""
         return self.prompt(tokens, logits=True, progress=progress)
+
+    def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
+                progress: Callable[[int], None] | None = None) -> np.ndarray:
+        """(every token a chunk can take in chunks, the last one padded: a chunk's rows need no LM head, which a decode
+        step's do; the output norm on the host: ``_w_out``)"""
+        n = len(tokens)
+        idx = np.arange(n) if at is None else np.asarray(at, np.int64).reshape(-1)
+        if n == 0 or ((idx < -n) | (idx >= n)).any():
+            raise IndexError(f"readout rows {idx.tolist()} of {n} tokens")
+        readout = Readout(idx % n, self.cfg.hidden_size)
+        self.prompt(tokens, progress=progress, readout=readout)
+        x = readout.rows
+        if norm:
+            x *= np.asarray(self._w_out, np.float32) / np.sqrt((x * x).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
+        return x
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""
@@ -772,13 +851,22 @@ class OverlayModel(NpuModel):
         self.rounds, self.carry, self._rounds_of = False, (), None
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
-                 mask: Mask | None = None) -> Iterator[int]:
-        """(in rounds of a step of drafts each: the class docstring)"""
+                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
+        """(in rounds of a step of drafts each: the class docstring; ``probs``: of a round's kept tokens, their rows of
+        its step)"""
         if max_tokens == 0:
             return
         penalties = Penalties(sampling, prompt, mask)
-        token = sampling.pick(*penalties.top(logits, sampling.k))
-        penalties.accept(token)
+
+        def choose(row: LogitsLike, cap: float = 0.0) -> int:
+            cand = penalties.top(row, sampling.k, cap)
+            token = sampling.pick(*cand)
+            if probs is not None:
+                probs(row, token, cap, cand)
+            penalties.accept(token)
+            return token
+
+        token = choose(logits)
         n = 1
         yield token
         ctx = Lookup(getattr(prompt, "ids", prompt)) if self.lookup and self.DRAFTS > 0 else None
@@ -807,16 +895,14 @@ class OverlayModel(NpuModel):
                 t2 = time.perf_counter()
                 new: list[int] = []
                 for i in range(len(d) + 1):
-                    new.append(sampling.pick(*penalties.top(raw[c + i], sampling.k, self.softcap)))
-                    penalties.accept(new[i])
+                    new.append(choose(raw[c + i], self.softcap))
                     if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
                         break
                 won = 0  # (the sibling branch's tokens kept: their own logits, the token after each)
                 if sib is not None and new == [sib[0]] and sib[0] not in self.eos_token_ids:
                     won = 1
                     while True:
-                        new.append(sampling.pick(*penalties.top(raw[c + len(d) + won], sampling.k, self.softcap)))
-                        penalties.accept(new[-1])
+                        new.append(choose(raw[c + len(d) + won], self.softcap))
                         if won == len(sib) or new[-1] != sib[won] or new[-1] in self.eos_token_ids:
                             break
                         won += 1
