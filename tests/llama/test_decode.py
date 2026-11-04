@@ -11,7 +11,8 @@ Files: 1B Q4_K_M (head_dim 64, 4 query heads per KV head; layer 0's V / down Q6_
 Q6_K (12-row tiles of 10112 B), 3B Q4_K_M (head_dim 128, 3 query heads per KV head), 8B Q4_K_S (hidden 4096, Q4_K,
 Q5_K and Q6_K tiles; down in 7 K groups), 1B BF16 (8-row BFP16 tiles of 9216 B), 1B Q4_0 (Q4_0 of 16 rows, layer 0's
 down Q4_1 of 14), 1B Q4_1 (16 rows, 10240 B); Qwen3 0.6B Q4_1 (2 query heads per KV head, q / k norms with weights
-per dim: layer 0's k_norm up to 96.5) and Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 tiles of 9216 B).
+per dim: layer 0's k_norm up to 96.5), Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 tiles of 9216 B) and Qwen3-Embedding-4B
+Q4_K_M (hidden 2560 and ffn 9728 in K chunks padded with zero super-blocks; 4 query heads per KV head at head_dim 128).
 """
 
 import os
@@ -37,7 +38,8 @@ CASES = {"1B_Q4_K_M": ("Q4_K_M", "1B", [0, 2]), "1B_Q5_K_M": ("Q5_K_M", "1B", [0
          "8B_Q4_K_S": ("Q4_K_S", "8B", [0, 4]), "1B_BF16": ("BF16", "1B", [0, 1]), "1B_Q4_0": ("Q4_0", "1B", [0, 2]),
          "1B_Q4_1": ("Q4_1", "1B", [0, 2]), "3B_Q2_K": ("Q2_K", "3B", [0, 3]), "3B_Q3_K_M": ("Q3_K_M", "3B", [0, 3]),
          "1B_Q3_K_L": ("Q3_K_L", "1B", [0, 2]), "qwen3_0.6B_Q4_1": ("Q4_1", "qwen3:0.6B", [0, 1]),
-         "qwen3_emb_Q8_0": ("Q8_0", "qwen3:embedding-0.6B", [0, 1])}
+         "qwen3_emb_Q8_0": ("Q8_0", "qwen3:embedding-0.6B", [0, 1]),
+         "qwen3_emb4b_Q4_K_M": ("Q4_K_M", "qwen3:embedding-4B", [0, 2])}
 STEPS = (1, 4, 3, 2, 4, 4, 1, 3, 3, 2, 1, 4)  # (step sizes, repeated: every alignment to the records and their pairs)
 # relative rms error: the reference leaves out the GEMV's panels (14 bits) and its 32-k sums rounded to bf16, which move
 # a projection's rows by ~1% (the NPU's o projection is bit-exact to ``mmv.ref_rows``); up to 4.2% here

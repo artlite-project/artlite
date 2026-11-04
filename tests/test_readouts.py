@@ -1,4 +1,4 @@
-"""``NpuModel.outputs`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B): a
+"""``NpuModel.outputs`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B): a
 readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
 bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
@@ -22,7 +22,7 @@ from .llama_cpp import _lib_identity, llama_embeddings
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
-CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B")]
+CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B"), qwen3_gguf("embedding-4B")]
 
 
 @pytest.fixture(scope="module", params=CASES, ids=os.path.basename)

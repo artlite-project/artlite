@@ -183,8 +183,8 @@ class TileImage:
         gu: dict[str, int] = {}
         tied = "output.weight" not in self.gguf
         for name, (dims, qtype, _, _) in self.gguf.tensor_info.items():
-            if len(dims) == 2 and dims[0] % self.kc == 0 and (tied or name != "token_embd.weight") and has_tile_format(qtype):
-                f, n_kc = tile_format(qtype), dims[0] // self.kc
+            if len(dims) == 2 and dims[0] % 256 == 0 and (tied or name != "token_embd.weight") and has_tile_format(qtype):
+                f, n_kc = tile_format(qtype), -(-dims[0] // self.kc)  # (a K of part of a chunk: padded, ``_region``)
                 if name.endswith("ffn_gate.weight"):
                     gu[f] = gu.get(f, 0) + dims[1] // 64 * n_kc
                 elif not name.endswith("ffn_up.weight"):

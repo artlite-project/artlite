@@ -106,6 +106,30 @@ def test_prefill_norm_pre_pitch(T: int, E: int) -> None:
         assert rel < 1e-2, rel
 
 
+@pytest.mark.parametrize(("T", "add", "cols"), [(64, True, 4), (256, False, 4), (512, True, 8)])
+def test_prefill_norm_padded(T: int, add: bool, cols: int) -> None:
+    """E 2560 (Qwen3-Embedding-4B's hidden size: the replay design, E not a multiple of 1024) into panel rows of 3072
+    columns (the GEMMs' K in whole chunks): the norm within the bfp16 panels' rounding, the padding panels unwritten."""
+    E, P = 2560, 3072
+    g = torch.Generator().manual_seed(T)
+    x = (torch.randn(T, E, generator=g) * 2).bfloat16()
+    d = torch.randn(T, E, generator=g).bfloat16()
+    w = (torch.rand(E, generator=g) + 0.5).bfloat16()
+    op = PrefillNormOperator(T=T, add=add, E=E, cols=cols, out_pitch=P).compile()
+    dev = op.device
+    xb, wb = artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(w.clone(), dev)
+    xnb = artlite.from_torch(torch.full((T * P * 9 // 16,), 7.0).bfloat16(), dev)  # (the padding: not zero)
+    op.dispatch(*((xb, artlite.from_torch(d.clone().flatten(), dev), wb, xb, xnb) if add else (xb, wb, xnb)))
+    xnb.sync_from_device()
+    xs = (x.float() + d.float()).bfloat16().float() if add else x.float()
+    ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.float()
+    out = xnb.to_torch()
+    xn = _from_panels(out, T, P)
+    assert ((xn[:, :E] - ref).norm() / ref.norm()).item() < 1e-2
+    pad = out.view(T // 8, P // 8, 36)[:, E // 8:]  # (the padding panels as they were)
+    assert torch.equal(pad, torch.full_like(pad, 7.0))
+
+
 # (T, E, d_pitch, cols, rows, deltas): Llama's and qwen35's projections in K parts
 DELTAS = [(64, 5120, 660, 4, 96, 2), (256, 4096, 528, 8, 256, 2), (64, 4096, 0, 2, 64, 2),
           (1024, 3072, 396, 8, 1024, 2), (2048, 4096, 528, 8, 2048, 2), (512, 2048, 264, 8, 512, 2),

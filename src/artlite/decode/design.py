@@ -246,7 +246,8 @@ def packed_slots(S: int) -> int:
 
 class DecodeOverlayOperator(ArtcOperator):
     """The shared decode overlay design (module docstring): the main and helper cores of every column. ``hidden``: the
-    model's hidden size (the norm length, the residual slices); ``rows``: {tile format: rows per tile} of the formats
+    model's hidden size (the norm length, the residual slices; one of part of a K chunk: the phases reading it take
+    whole chunks of zero-padded weights, their inputs' padding k zero, which the helper's norm squares); ``rows``: {tile format: rows per tile} of the formats
     the phases use; ``tile_bytes``: the A object size; ``nsb``: super-blocks per tile (its K chunk). The runtime
     sequence (W, ACT, OUT) is a probe that issues one task per stream (``check_endpoints``; never dispatched): the
     host runs the design with transactions.
@@ -307,7 +308,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert max_k % self.chunk.k == 0 and max_k <= MAX_K
         self.max_k = max_k
         self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
-        assert hidden % (COLS * C_LEN) == 0 and hidden % self.chunk.k == 0 and hidden <= max_k
+        assert hidden % (COLS * C_LEN) == 0 and hidden <= max_k
         assert not moe or not (post or pli or packed or tok) and act == "silu" and nsb == 4
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert all(gemv.supported(f, nsb, slots) for f in rows), (rows, slots)

@@ -20,6 +20,12 @@ objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``)
 head_dim 64, 64 at 128 for objects of ~9.3 KB; then per layer and KV head a ring of two slots of T bytes with the
 exact V values of the open records (``decode.vring``). Phase inputs are packed (``decode.design.packed_slots``).
 
+A hidden size that is not a whole number of K chunks (Qwen3-Embedding-4B's 2560) pads the K of the phases that read
+the residual stream (qkv, gate_up, the LM head) with zero super-blocks (``decode.image``); their inputs' padding k
+must be zero too, since the helper's norm squares every input element: a step of more slots writes a layout whose
+real k reach into the padding of the fewer-slot layouts, which the next step of fewer slots clears first
+(``_clear_pads``).
+
 The step's transaction is built once per S and pattern of sub-steps (and LM head or not) and patched per step: the
 token objects, each column's range of each layer's cache per sub-step (A: address, length), its tail objects (A: the
 ring slots of the sub-step's open records, or after a prefill the V panels of the first: record mode) and the record
@@ -148,6 +154,10 @@ class LlamaOverlay(ModelOverlay):
         self._trec = 0  # (M_ATREC as the F_ATT objects of slot 0 hold it)
         self.inv_freq = cfg.rope_inv_freq()
         self._plan()
+        # (the normed phases' input regions whose k run past the hidden size: offset, first padding k, K)
+        self._pads = [(rg.off, max(self.H - rg.k0, 0), rg.K) for (L, name), regs in self.inp.items()
+                      if name in ("qkv", "gate_up", "lm") for rg in regs if rg.k0 + rg.K > self.H]
+        self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
 
     # ------------------------------------------------------------------
     # Layout
@@ -432,6 +442,19 @@ class LlamaOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
+    def _clear_pads(self, sp: int) -> None:
+        """Before a step whose inputs are laid out for sp slots (``_pads``): zero their padding k if a step of more
+        slots wrote there since (the layout's padding bytes [2 sp H, 2 sp K) of a region's x); then the layouts of fewer
+        slots than sp are the dirty ones."""
+        if sp in self._dirty:
+            act = self.dev.view("ACT")
+            for off, lo, K in self._pads:
+                a, b = off + XB + 2 * sp * lo, off + XB + 2 * sp * K
+                act[a:b] = 0
+                self.dev.flush("ACT", a, b - a)
+        if self._pads:
+            self._dirty = (self._dirty - {sp}) | {s for s in (1, 2, 4) if s < sp}
+
     def step(self, x: torch.Tensor, position: int, *, logits: bool = True) -> torch.Tensor | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
         - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
@@ -442,9 +465,14 @@ class LlamaOverlay(ModelOverlay):
         if self._metas_s != (S, self.start):
             self._metas(S)
         xf = x.numpy()
+        self._clear_pads(packed_slots(S))
         self._write_loadr(xf)
         self._write_input(self.inp[(self.layers[0], "qkv")][0], interleave(xf, packed_slots(S)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
+
+    def logits_of(self, x: torch.Tensor) -> torch.Tensor:
+        self._clear_pads(self._sp(1))
+        return super().logits_of(x)
 
     def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions: K rotated, V as it is."""

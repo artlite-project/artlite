@@ -1,8 +1,8 @@
 # Qwen3 on the NPU
 
-Qwen3 0.6B, its embedding and reranker models (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B) and vllm-sr's decision model
-Decision-2.0-Kai-0.6B (GGUF architectures `qwen3` and `vllm-decision2`) run on Llama's path: the same layers, with q
-and k RMS-normed per head (a weight per dim) before RoPE. Running them: [artlite-cli](../cli.md),
+Qwen3 0.6B, its embedding and reranker models (Qwen3-Embedding-0.6B and -4B, Qwen3-Reranker-0.6B) and vllm-sr's
+decision model Decision-2.0-Kai-0.6B (GGUF architectures `qwen3` and `vllm-decision2`) run on Llama's path: the same
+layers, with q and k RMS-normed per head (a weight per dim) before RoPE. Running them: [artlite-cli](../cli.md),
 [artlite-server](../server.md) (embeddings, rerank, `/classify`, `/v1/systemone`).
 
 ## Model files
@@ -11,6 +11,7 @@ and k RMS-normed per head (a weight per dim) before RoPE. Running them: [artlite
 $ARTLITE_MODELS_DIR/
   unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_1.gguf
   Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
+  Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf
   ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf   (converted, below)
 ```
@@ -38,21 +39,23 @@ chat template has Qwen3's thinking mode (`--think`); sampling follows the model 
 - The KV cache holds K as bfp16 hi + lo by default (`--kv-k hilo`; 96 KB per position): with one block per 8 dims
   (`--kv-k single`, 64 KB) the KL against the same file on the CPU goes from 0.0037 to 0.0085 on a chat.
 - A file of Q8_0 alone (the embedding, reranker and decision files) takes 8-row tiles of 9216 bytes.
+- Qwen3-Embedding-4B's hidden size (2560) and ffn (9728) are not whole K chunks of 1024: their projections run in
+  chunks padded with zero weights.
 
 Qwen3 0.6B Q4_1: time to first token at 1K / 8K / 32K prompt tokens 0.095 / 1.41 / 16.7 s; decode 9.8 ms per token
 after 1K, 70.3 ms after 32K (101.5 / 14.2 tokens/s). Quality vs the CPU model on the same weights, teacher-forced: KL
 0.0037 on a chat (through the prefill), 0.0037 after a 4800-token essay.
 
-Through artlite-server, warm, each request's texts new (Qwen3-Embedding-0.6B Q8_0): a 30-token text's embedding in 31
-ms, a 430-token passage's in 62 ms, batches of 8 passages 7.1K tokens/s; Qwen3-Reranker-0.6B Q8_0: 16.3 pairs/s of
-~510 tokens; Decision-2.0-Kai-0.6B: 37-44 ms per question of 90-190 tokens.
+Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 31
+ms, a 430-token passage's in 62 ms, batches of 8 passages 7.1K tokens/s; Qwen3-Embedding-4B Q4_K_M 87 ms, 229 ms, 1.9K
+tokens/s; Qwen3-Reranker-0.6B Q8_0 16.3 pairs/s of ~510 tokens; Decision-2.0-Kai-0.6B 37-44 ms per question of 90-190
+tokens.
 
-Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (its CPU and Vulkan builds:
-0.9995), the same share of target passages among the 30 test queries' top 10 (72%); the rerank scores within 0.15, the
+Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (4B: 0.995-0.999; its CPU and
+Vulkan builds: 0.9995, 0.997), the same share of target passages among the 30 test queries' top 10 (72%; 4B 73%, CPU
+74%); the rerank scores within 0.15, the
 target passage first as often (93%); Kai's answers 313 of 320 the same, probabilities within 0.04, accuracy on four
 classification sets within one question of 50. The prefill's GEMMs take bfp16 weights and activations (8-bit
 mantissas per block of 8), so a row is within ~0.15% of the CPU's where llama.cpp's own builds differ by 0.05%.
-
-Not yet: Qwen3-Embedding-4B (a hidden width of 2560: the overlay's K chunks are 1024 columns).
 
 NPU code: `src/models/llama/` (the model object `Qwen3`: `qwen3.py`).

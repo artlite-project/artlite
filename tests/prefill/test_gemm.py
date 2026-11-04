@@ -17,7 +17,7 @@ import torch
 import artlite
 from artlite.gemm.gemm_q import PACE, pace_word
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import decision_gguf, gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf
+from artlite.model_config import decision_gguf, gemma_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.operators.fused import Library
@@ -65,7 +65,10 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("occamy", "", "", (0, 3), 3, "attn_out", 64),
          ("d3-lite", "", "", (0, 3), 0, "gdn_in", 256), ("d3-lite", "", "", (0, 3), 0, "gate_up", 256),
          ("d3-lite", "", "", (0, 3), 0, "gate_up", 64), ("d3-lite", "", "", (0, 3), 0, "down", 256),
-         ("d3-lite", "", "", (0, 3), 3, "attn_in", 64), ("d3-lite", "", "", (0, 3), 3, "attn_out", 256)]
+         ("d3-lite", "", "", (0, 3), 3, "attn_in", 64), ("d3-lite", "", "", (0, 3), 3, "attn_out", 256),
+         ("qwen3", "", "embedding-4B", (0, 4), 4, "down", 256), ("qwen3", "", "embedding-4B", (0, 4), 0, "down", 256),
+         ("qwen3", "", "embedding-4B", (0, 4), 4, "qkv", 256), ("qwen3", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
+         ("qwen3", "", "embedding-4B", (0, 4), 4, "o", 64), ("qwen3", "", "embedding-0.6B", (0,), 0, "down", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -73,14 +76,15 @@ _images: dict[tuple, tuple] = {}
 def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[GGUFFile, object, np.ndarray]:
     """The model's image of the layers (a truncated vocabulary), packed."""
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
-            "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf}[model]()
+            "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf,
+            "qwen3": lambda: qwen3_gguf(size)}[model]()
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     key = (path, layers)
     if key not in _images:
         _images.clear()
         g = GGUFFile(path)
-        if model == "llama":
+        if model in ("llama", "qwen3"):
             from models.llama.image import LlamaImage as Image
         elif model in ("qwen35", "occamy", "d3-lite"):
             from models.qwen35.image import QwenImage as Image
@@ -98,7 +102,7 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
     pitch = PG.d_pitch(img, T) if region.name in PG.OUT else 0
     if model == "gemma4":
         from models.gemma4.prefill import plan_gemm
-    elif model == "llama":
+    elif model in ("llama", "qwen3"):
         from models.llama.prefill import plan_gemm
     else:
         return PG.plan_phase(img, region, T, pitch=pitch)
@@ -196,7 +200,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         (b,) = region.blocks
         ffn = cfg.intermediate_size // COLS
         idx = np.concatenate([ffn * c + np.arange(ffn) for c in range(COLS)])
-        gt, up = (_rows(img, (t,), idx) for t in b.tensors)
+        gt, up = (_rows(img, (t,), idx, K) for t in b.tensors)
         y_g, y_u = Aq[:T] @ gt.T, Aq[:T] @ up.T
         act = (lambda y: torch.nn.functional.gelu(y, approximate="tanh")) if model == "gemma4" else \
             torch.nn.functional.silu
@@ -225,7 +229,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
                 agree(lambda C, Cb, o=o, n=rows.size: Cb[:T, o:o + n])
                 continue
             got = C[:, o + np.arange(rows.size)]
-            assert _rel(got, Aq[:T] @ _rows(img, b.tensors, rows).T) < _tol(K), (b.name, c)
+            assert _rel(got, Aq[:T] @ _rows(img, b.tensors, rows, K).T) < _tol(K), (b.name, c)
             agree(lambda C, Cb, o=o, n=rows.size: C[:, o:o + n])
 
 

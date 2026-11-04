@@ -1,6 +1,8 @@
-"""The weight image of a Llama 3.x model (``decode.image.TileImage``): the file's tile formats over K chunks of 1024
-columns (``KC``, every model and format: 4 super-blocks of 256 columns), objects of the size that streams the fewest
-bytes for the file's formats (``formats.choose_tile_bytes``: 9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0).
+"""The weight image of a Llama 3.x or Qwen3 model (``decode.image.TileImage``): the file's tile formats over K chunks of
+1024 columns (``KC``, every model and format: 4 super-blocks of 256 columns; a hidden or ffn size of part of a chunk,
+Qwen3-Embedding-4B's 2560 and 9728, padded with zero super-blocks: the overlay and the prefill keep those inputs'
+padding zero), objects of the size that streams the fewest bytes for the file's formats (``formats.choose_tile_bytes``:
+9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0, 9216 for Q8_0 alone).
 
 Column-major (as ``gemma4.image``): a column's regions in step order, each normed phase's norm-weight objects (data
 region "<name>_norm": the RMSNorm weights, ``decode.design.norm_objects``) before its tiles, so that a decode step
@@ -45,7 +47,7 @@ class LlamaImage(TileImage):
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab, column_major=True)
         assert cfg.num_key_value_heads == COLS, f"one KV head per column: {cfg.num_key_value_heads} KV heads"
-        assert H % KC == 0 and I % KC == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
+        assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
         for L in self.layers:
             self._layer(L)

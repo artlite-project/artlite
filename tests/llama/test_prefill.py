@@ -4,7 +4,8 @@ prefill/test_norm.py):
 - the attention (prefill/attn.py): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
-  logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-0.6B Q8_0: q / k norms, all-Q8_0 GEMMs).
+  logits (Llama; Qwen3 0.6B Q4_1, Qwen3-Embedding-0.6B Q8_0 and -4B: q / k norms, all-Q8_0 GEMMs, a hidden size of
+  2560 in padded K chunks).
 """
 
 import numpy as np
@@ -134,7 +135,7 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
 # (GGUF quantization, model size, K format, tokens, decode steps first; "qwen3:<name>": model_config.qwen3_gguf's file)
 CACHES = [("Q4_K_M", "1B", "single", 300, 0), ("Q4_K_M", "1B", "hilo", 300, 128), ("Q4_K_M", "3B", "single", 600, 64),
           ("Q4_K_S", "8B", "hilo", 300, 0), ("Q4_1", "qwen3:0.6B", "hilo", 300, 64),
-          ("Q8_0", "qwen3:embedding-0.6B", "hilo", 600, 0)]
+          ("Q8_0", "qwen3:embedding-0.6B", "hilo", 600, 0), ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64)]
 
 
 @pytest.mark.slow

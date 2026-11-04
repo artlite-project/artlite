@@ -152,10 +152,11 @@ classifier head (`cls.output`) on the last token of its rerank prompt (the file'
 the softmax of the head's outputs, a sigmoid of a single one), the likeliest `label` (the file's
 `classifier.output_labels`, else its index) and `num_classes`.
 
-The embeddings and scores come within llama.cpp's own spread of each other on retrieval and ranking (Qwen3-Embedding-0.6B:
-the same top-10 passages for 30 queries but one at most; Qwen3-Reranker-0.6B: the target passages ranked first as
-often), not to its digits: the prefill's weights and activations are 8-bit bfp16 blocks, so an embedding is within a
-cosine of 0.997-0.999 of llama.cpp's CPU result (its CPU and Vulkan builds: 0.9995) and a rerank score within 0.15.
+The embeddings and scores come within llama.cpp's own spread of each other on retrieval and ranking (Qwen3-Embedding
+0.6B and 4B: the same top-10 passages for 30 queries but one at most; Qwen3-Reranker-0.6B: the target passages ranked
+first as often), not to its digits: the prefill's weights and activations are 8-bit bfp16 blocks, so an embedding is
+within a cosine of 0.995-0.999 of llama.cpp's CPU result (its CPU and Vulkan builds: 0.997-0.9995) and a rerank score
+within 0.15. Model pages: [Qwen3](models/qwen3.md).
 
 ## Decisions
 

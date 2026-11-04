@@ -1,7 +1,8 @@
 """Qwen3 on the NPU (GGUF architecture ``qwen3``: Qwen3 0.6B, Qwen3-Embedding, Qwen3-Reranker; ``vllm-decision2``:
 Decision-2.0-Kai, Qwen3 with a decision head the server runs on the host) on Llama's path: the same layers but q and k
 RMS-normed per head with a weight per dim before RoPE, NeoX rotary pairs in the file's rows (``LlamaConfig.neox``,
-``qk_norm``), no BOS, Qwen's tokenizer and ChatML template (``models.tokenizer``).
+``qk_norm``), no BOS, Qwen's tokenizer and ChatML template (``models.tokenizer``). Qwen3-Embedding-4B's hidden size of
+2560 and ffn of 9728 run in K chunks padded with zero super-blocks (``llama.image``).
 
 The KV caches hold K as hi + lo bfp16 blocks by default: the k_norm weights (up to ~100) leave dims a thousand times
 smaller than their block's largest, which a single block per 8 dims loses (KL 0.005-0.008 on a chat and an essay window

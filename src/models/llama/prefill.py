@@ -115,6 +115,9 @@ class LlamaPrefill(ChunkPrefill):
         self.kv_layers = [0]  # (the overlay's rings: one state for every layer, key 0)
         self.shape = s
         self.group = s.pg
+        # the norms' panel rows: the hidden size padded to whole K chunks (the padding columns never written: zero)
+        self.kh = -(-ov.H // ov.image.kc) * ov.image.kc
+        self._out_pitch = self.kh if self.kh != ov.H else 0
         self.cs_rows = ov.max_positions + MAX_T
         self.pad = KV_PAD // s.pg * s.group  # (the KV arguments past a layer's caches: the overlay's padding)
         self._static_s: dict[tuple[int, float], float] = {}
@@ -156,7 +159,8 @@ class LlamaPrefill(ChunkPrefill):
                                                              cs_positions=self.cs_rows, kv_pad=self.pad,
                                                              norm=cfg.qk_norm, eps=cfg.rms_norm_eps)
         o = _Ops(plans, qt, pitch, dp, parts, f_part,
-                 PrefillNormOperator(T=t, add=False, E=H, eps=cfg.rms_norm_eps, cols=self._norm_cols(t)), {}, preps)
+                 PrefillNormOperator(T=t, add=False, E=H, eps=cfg.rms_norm_eps, cols=self._norm_cols(t),
+                                     out_pitch=self._out_pitch), {}, preps)
         for n in {t, *(m for m in NORM_SIZES if t <= m <= max(T for T in self.sizes if self._t(T) == t))}:
             o.norms[n] = self._norms(n, o)
         return o
@@ -175,6 +179,7 @@ class LlamaPrefill(ChunkPrefill):
             key = (n, dp, deltas, cols)
             if key not in self._norm_ops:
                 self._norm_ops[key] = PrefillNormOperator(T=n, E=H, eps=eps, d_pitch=dp, deltas=deltas, cols=cols,
+                                                          out_pitch=self._out_pitch,
                                                           d_stride=n * COLS * dp if deltas > 1 else 0)
             return self._norm_ops[key]
 
@@ -205,8 +210,10 @@ class LlamaPrefill(ChunkPrefill):
         parameter objects."""
         cfg, H, s = self.cfg, self.H, self.shape
         pitch, dp = max(o.pitch for o in self.ops.values()), max(o.d_pitch for o in self.ops.values())
-        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
-                   "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp, "HP": 9 * cfg.intermediate_size // 8}
+        kc = self.img.kc  # (the GEMMs' A rows: K padded to whole chunks, ``LlamaPrefill.kh``)
+        self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
+                   "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp,
+                   "HP": 9 * -(-cfg.intermediate_size // kc) * kc // 8}
         self.np_off = {"in": 0}  # (the norms' weights: H bf16 each)
         k = 1
         for L in self.layers:

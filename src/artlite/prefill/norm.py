@@ -26,7 +26,8 @@ x's), pass B computes x' (and its squares; ``plain``: also its panels), pass C x
 arithmetic) and its panels. The parameters (w_post, w1, s: ``residual_params``, [8 rows][E] bf16: row 0 w_post, row 1
 w1, row 2 the hi / lo bits of s) are d's first object.
 
-``PrefillNormOperator`` (Qwen, Llama): for a (T, E) bf16 prompt activation x (T a multiple of 64, E the hidden size)
+``PrefillNormOperator`` (Qwen, Llama): for a (T, E) bf16 prompt activation x (T a multiple of 64, E the hidden size: a
+multiple of 1024, or above 2048 of 256 columns, Qwen3-Embedding-4B's 2560)
   add:    x += delta (bf16, written back), xn = rmsnorm(x) * w
   no add: xn = rmsnorm(x) * w
 with xn as panels.
@@ -555,7 +556,7 @@ class PrefillNormOperator(ArtcOperator):
         norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
         panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them; not
         in the hold design). raw (no add): xn = x w, without the norm (a drafter's taps as panels: w of ones)."""
-        assert T % (8 * cols) == 0 and T > 0 and E % 1024 == 0 and 1 <= cols <= COLS
+        assert T % (8 * cols) == 0 and T > 0 and E % CH == 0 and 1 <= cols <= COLS
         self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
         assert self.d_pitch >= E // COLS and (add or not d_pitch)
@@ -571,6 +572,7 @@ class PrefillNormOperator(ArtcOperator):
         assert self.d_stride >= T * COLS * self.d_pitch and (self.deltas >= 2 or not d_stride)
         self.ch = min(CH, E // 8)  # (columns per chunk)
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
+        assert E % 1024 == 0 or self.replay, "the plain design: E of whole 1024 columns"
         assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
         self.pre, self.raw = pre, raw
         assert not raw or not (add or pre or lo), "raw: x's own panels"
@@ -833,7 +835,8 @@ class PrefillNormOperator(ArtcOperator):
             for c in range(self.cols):
                 # w as a group-shaped object (8 copies; pre: w1's, then w2's)
                 nw = 2 if pre else 1
-                xh[c].fill(w, TensorAccessPattern((nw * E,), 0, [nw, 8, E // 1024, 1024], [E if pre else 0, 0, 1024, 1]),
+                wr = 1024 if E % 1024 == 0 else 512  # (a shim BD's rows of at most 1023 words)
+                xh[c].fill(w, TensorAccessPattern((nw * E,), 0, [nw, 8, E // wr, wr], [E if pre else 0, 0, wr, 1]),
                            group=tg)
                 xh[c].fill(x, groups(c), group=tg)
                 if add:
