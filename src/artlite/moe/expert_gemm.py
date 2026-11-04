@@ -46,10 +46,13 @@ from aie.iron import (
     Buffer,
     Kernel,
     ObjectFifo,
+    Packet,
+    Port,
     Program,
     Runtime,
     ScratchpadParameter,
     TaskGroup,
+    Transport,
     Worker,
     sync_parameters,
 )
@@ -377,8 +380,8 @@ class ExpertGemmOperator(GemmQdOperator):
         k_chk = Kernel(f"{p}_chk", "kernel.o", [A_l1_ty, fl_ty])
 
         # B: the column's packet-switched MM2S1 -> memtile -> the dequantizing core
-        b_l3 = [ObjectFifo(B_l2_ty, name=f"egB_{c}", depth=2, from_stream_per_cons=df.b_wdims, packet=True,
-                           packet_id=ctl.XID) for c in range(COLS)]
+        b_l3 = [ObjectFifo(B_l2_ty, name=f"egB_{c}", depth=2, from_stream_per_cons=df.b_wdims,
+                           transport=Transport.dma(Packet(ctl.XID))) for c in range(COLS)]
         b_l1 = [b_l3[c].cons().forward(obj_type=B_l1_ty, name=f"egB1_{c}", depth=self.b_depth, tile=Tile(c, 1),
                                         to_stream=df.b_rdims) for c in range(COLS)]
         d_f = [ObjectFifo(D_ty, name=f"egD_{c}", depth=D_DEPTH) for c in range(COLS)]
@@ -389,7 +392,7 @@ class ExpertGemmOperator(GemmQdOperator):
         a_l3 = [ObjectFifo(A_l2_ty, name=f"egA_{c}", depth=1, from_stream_per_cons=stream_walk(strip, a_wdims))
                 for c in range(COLS)]
         rep = self.passes * self.G
-        a_l1 = [a_l3[c].cons(channel=A_CH).split([strip * r for r in range(MR)], tile=Tile(c, 1), depths=[2] * MR,
+        a_l1 = [a_l3[c].cons(port=Port.dma(A_CH)).split([strip * r for r in range(MR)], tile=Tile(c, 1), depths=[2] * MR,
                                       obj_types=[A_l1_ty] * MR, names=[f"egA1_{c}_{r}" for r in range(MR)],
                                       repeat_counts=[rep] * MR if rep > 1 else None) for c in range(COLS)]
         # C: row 0's objects straight to the shim, rows 1 and 2's joined in the memtile (whole objects: rows of n_c)
@@ -592,10 +595,10 @@ class ExpertGemmOperator(GemmQdOperator):
 
         bf = np.dtype[bfloat16]
         rt = Runtime(seq, [np.ndarray[(n_cb,), bf], np.ndarray[(n_a,), bf], np.ndarray[(n_c,), bf],
-                           [b_l3[c].prod(tile=Tile(c, 0), channel=1) for c in range(COLS)],
-                           [a_l3[c].prod(tile=Tile(c, 0), channel=0) for c in range(COLS)],
-                           [c0[c].cons(tile=Tile(c, 0), channel=0) for c in range(COLS)],
-                           [c12[c].cons(tile=Tile(c, 0), channel=1) for c in range(COLS)]])
+                           [b_l3[c].prod(tile=Tile(c, 0), port=Port.dma(1)) for c in range(COLS)],
+                           [a_l3[c].prod(tile=Tile(c, 0), port=Port.dma(0)) for c in range(COLS)],
+                           [c0[c].cons(tile=Tile(c, 0), port=Port.dma(0)) for c in range(COLS)],
+                           [c12[c].cons(tile=Tile(c, 0), port=Port.dma(1)) for c in range(COLS)]])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         layout = self._l1_layout()
         if layout is not None:

@@ -36,4 +36,6 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 
 - Wheels come from GitHub release pages listed in `[tool.uv] find-links` (`mlir-aie` `latest-wheels-4`, `llvm-aie` `nightly`). If the script finds no matches, the release tag or page layout changed — check the URLs in `SOURCES` in the script against `find-links`.
 - llvm-aie's 4th version component is `YYYYMMDDNN`; it advances nightly even when the commit hash doesn't, so a "new" version may contain no compiler changes.
+- Only wheels this machine can install count: a nightly can publish its Windows wheel without its Linux one (its
+  Linux build job failed), and the script then keeps the newest Linux build. A failed `uv sync` leaves no `.venv`.
 - A toolchain bump can change kernel schedules (II) or break compilation of RTC templates. If a test regresses, compare against the previous pin (`git diff pyproject.toml`) before debugging the operator.

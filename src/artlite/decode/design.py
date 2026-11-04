@@ -105,7 +105,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 from aie.ir import Module
-from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Packet, Port, Program, Runtime, Transport, Worker
 from aie.iron.controlflow import forever_, range_
 from aie.iron.dataflow.objectfifo import ObjectFifoLink
 from aie.iron.device import NPU2, Tile
@@ -555,21 +555,21 @@ class DecodeOverlayOperator(ArtcOperator):
             k_lstrip = Kernel(f"{p}_lstrip", "kernel.o", [ws_ty, cmd_ty])
 
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
-        akw, amt = ({"packet": True, "packet_id": AID}, {"channel": A_MT}) if self.a_bcast else ({}, {})
+        akw, amt = ({"transport": Transport.dma(Packet(AID))}, {"port": Port.dma(A_MT)}) if self.a_bcast else ({}, {})
         a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH, **akw) for c in range(COLS)]
         a_l1 = [a_l3[c].cons(depth=self.A_DEPTH, **amt).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}")
                 for c in range(COLS)]
         # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
         x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH,
-                           **({"packet": True, "packet_id": XID} if self.moe or self.bcast else {})) for c in range(COLS)]
+                           **({"transport": Transport.dma(Packet(XID))} if self.moe or self.bcast else {})) for c in range(COLS)]
         if self.bcast:  # (past the memtile too: the broadcast shares the cores' channels)
-            x_l1 = [ObjectFifo(x_ty, name=f"{P}_x{c}", depth=1, packet=True, packet_id=XC_ID) for c in range(COLS)]
+            x_l1 = [ObjectFifo(x_ty, name=f"{P}_x{c}", depth=1, transport=Transport.dma(Packet(XC_ID))) for c in range(COLS)]
             for c in range(COLS):
                 ObjectFifoLink(x_l3[c].cons(depth=self.X_DEPTH), x_l1[c].prod(), Tile(c, 1))
         else:
             x_l1 = [x_l3[c].cons(depth=self.X_DEPTH).forward(tile=Tile(c, 1), depth=1, name=f"{P}_x{c}")
                     for c in range(COLS)]
-        x_kw = {"channel": X_CH} if self.bcast else {}  # (a consumer's X channel: the broadcast's route names it)
+        x_kw = {"port": Port.dma(X_CH)} if self.bcast else {}  # (a consumer's X channel: the broadcast's route names it)
         c_fifos = [ObjectFifo(c_ty, name=f"{P}_C{c}", depth=2) for c in range(COLS)]
         cmds = [ObjectFifo(cmd_ty, name=f"{P}_cmd{c}", depth=2) for c in range(COLS)]
         m_fifos = [ObjectFifo(c_ty, name=f"{P}_M{c}", depth=2) for c in range(COLS)] if self.msg else []
@@ -783,10 +783,10 @@ class DecodeOverlayOperator(ArtcOperator):
                      ws=m_ws, xs=m_xs, xp=xps, sq=sqs, x_kw=x_kw)
         extra, d_fifos = self._extra_workers(s)
         workers += extra
-        a_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["A"][1]) for c, f in enumerate(a_l3)]
-        x_prod = [f.prod(tile=Tile(c, 0), channel=self.ENDPOINTS["X"][1]) for c, f in enumerate(x_l3)]
-        c_cons = [f.cons(tile=Tile(c, 0), channel=self.ENDPOINTS["C"][1]) for c, f in enumerate(c_fifos)]
-        d_cons = [f.cons(tile=Tile(c, 0), channel=self.ENDPOINTS["D"][1]) for c, f in d_fifos]
+        a_prod = [f.prod(tile=Tile(c, 0), port=Port.dma(self.ENDPOINTS["A"][1])) for c, f in enumerate(a_l3)]
+        x_prod = [f.prod(tile=Tile(c, 0), port=Port.dma(self.ENDPOINTS["X"][1])) for c, f in enumerate(x_l3)]
+        c_cons = [f.cons(tile=Tile(c, 0), port=Port.dma(self.ENDPOINTS["C"][1])) for c, f in enumerate(c_fifos)]
+        d_cons = [f.cons(tile=Tile(c, 0), port=Port.dma(self.ENDPOINTS["D"][1])) for c, f in d_fifos]
         d_len = [math.prod(f.shape) * np.dtype(f.dtype).itemsize // 2 for _, f in d_fifos]  # (whole objects)
         a_n, x_n, c_n = COLS * self.tile_bytes // 2, COLS * XB // 2, COLS * C_LEN + sum(d_len)
 

@@ -46,12 +46,12 @@ def pin_l1_buffers(
                 if addrs is None:
                     continue
                 assert len(addrs) == depth, (ir.StringAttr(op.attributes["fifoName"]).value, depth, addrs)
-                base = ir.StringAttr(op.attributes["sym_name"]).value.removesuffix("_pool")
+                base = ir.StringAttr(op.attributes["sym_name"]).value.removesuffix("__pool")
                 names = []
                 for i, addr in enumerate(addrs):
-                    aie.BufferOp(ir.TypeAttr(op.attributes["elemType"]).value, op.tile, sym_name=f"{base}_buff_{i}",
+                    aie.BufferOp(ir.TypeAttr(op.attributes["elemType"]).value, op.tile, sym_name=f"{base}__buf{i}",
                                  address=addr, ip=ir.InsertionPoint(op))
-                    names.append(f"{base}_buff_{i}")
+                    names.append(f"{base}__buf{i}")
                 op.attributes["buffers"] = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(n) for n in names])
                 pinned += 1
             elif buffer is not None and isinstance(op, aie.BufferOp) and "sym_name" in op.attributes:

@@ -91,11 +91,15 @@ def _parity_v(words: np.ndarray) -> np.ndarray:
 
 def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
     """A tile's writes ((tile-local address, words)) as control packets: per packet the stream header (``stream_id``:
-    the route's packet id), the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding)."""
+    the route's packet id), the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding) in one
+    16-byte line (words past its end wrap to its start)."""
     head = _parity(stream_id)
     out = []
     for addr, data in writes:
         d = np.asarray(data, np.uint32)
+        if k := min(d.size, -addr // 4 % 4):  # (the words up to the next line)
+            out.append(np.array([head, _parity(((k - 1) << 20) | (addr & 0xFFFFF)), *d[:k].tolist()], np.uint32))
+            addr, d = addr + 4 * k, d[k:]
         q, r = divmod(d.size, 4)
         if q:  # (whole packets of 4 words)
             blk = np.empty((q, 6), np.uint32)

@@ -14,6 +14,7 @@ Usage (from anywhere inside the repo):
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -51,12 +52,22 @@ def current_pin(text: str, name: str) -> str:
     return m.group(2)
 
 
+def installable(wheel: str) -> bool:
+    """Whether this machine can install ``wheel``: its platform tag names this OS and CPU (a nightly's Linux wheel
+    can be missing while its Windows one is published)."""
+    tags = wheel.removesuffix(".whl").split("-")[-1].split(".")
+    if sys.platform == "win32":
+        return "win_amd64" in tags
+    machine = platform.machine().lower()
+    return any(re.fullmatch(rf"((many|musl)linux_\d+_\d+|linux)_{machine}", t) for t in tags)
+
+
 def latest_version(url: str, regex: str) -> str:
     with urllib.request.urlopen(url, timeout=60) as resp:
         html = resp.read().decode()
-    found = set(re.findall(regex, html))
+    found = {m.group(1) for w in set(re.findall(r"[\w.+-]+\.whl", html)) if (m := re.match(regex, w)) and installable(w)}
     if not found:
-        sys.exit(f"error: no wheels matched on {url} (page layout changed?)")
+        sys.exit(f"error: no wheels for this platform matched on {url} (page layout changed?)")
     # Local segment (+hash) doesn't order meaningfully; compare the public part.
     # For llvm-aie the 4th component is YYYYMMDDNN, so the newest nightly wins.
     return max(found, key=lambda v: Version(v.split("+")[0]))

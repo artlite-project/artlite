@@ -33,10 +33,13 @@ from aie.iron import (
     Buffer,
     Kernel,
     ObjectFifo,
+    Packet,
+    Port,
     Program,
     Runtime,
     ScratchpadParameter,
     TaskGroup,
+    Transport,
     Worker,
     sync_parameters,
 )
@@ -360,7 +363,7 @@ class GatherNormOperator(_Gathered):
         k_row = Kernel(f"{p}_row", "kernel.o", [row_ty, grp_ty, st_ty, np.int32])
         k_b = Kernel(f"{p}_b", "kernel.o", [grp_ty, row_ty, st_ty, pan_ty, np.int32])
         pg = [ScratchpadParameter(f"{N_PARAM}{c}", np.int32) for c in range(COLS)]
-        xf = [ObjectFifo(row_ty, name=f"mgx{c}", depth=2, packet=True, packet_id=ctl.XID) for c in range(COLS)]
+        xf = [ObjectFifo(row_ty, name=f"mgx{c}", depth=2, transport=Transport.dma(Packet(ctl.XID))) for c in range(COLS)]
         wf = [ObjectFifo(row_ty, name=f"mgw{c}", depth=1) for c in range(COLS)]
         pf = [ObjectFifo(pan_ty, name=f"mgp{c}", depth=2) for c in range(COLS)]
 
@@ -403,8 +406,8 @@ class GatherNormOperator(_Gathered):
                 _npu_sync(_as_i32(c), _as_i32(0), _as_i32(txn.S2MM), _as_i32(0), _as_i32(1), _as_i32(1))
 
         rt = Runtime(seq, [np.ndarray[(n_cb,), bf], np.ndarray[(E,), bf], np.ndarray[(n_xp,), bf],
-                           [xf[c].prod(tile=Tile(c, 0), channel=1) for c in range(COLS)],
-                           [wf[c].prod(tile=Tile(c, 0), channel=0) for c in range(COLS)],
+                           [xf[c].prod(tile=Tile(c, 0), port=Port.dma(1)) for c in range(COLS)],
+                           [wf[c].prod(tile=Tile(c, 0), port=Port.dma(0)) for c in range(COLS)],
                            [pf[c].cons(tile=Tile(c, 0)) for c in range(COLS)]])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
@@ -461,7 +464,7 @@ class CombineOperator(_Gathered):
         # (Y's rows: shim -> memtile -> the core in output order: per pass, tile and C object its run)
         passes, vp, tiles, run, _ = self.y_layout
         order = stream_walk(self.row_n, [(passes, vp * tiles * run), (tiles, run), (vp, tiles * run), (run, 1)])
-        y3 = [ObjectFifo(row_ty, name=f"mcy{c}", depth=2, packet=True, packet_id=ctl.XID) for c in range(COLS)]
+        y3 = [ObjectFifo(row_ty, name=f"mcy{c}", depth=2, transport=Transport.dma(Packet(ctl.XID))) for c in range(COLS)]
         yf = [y3[c].cons().forward(obj_type=row_ty, name=f"mcy1{c}", depth=2, tile=Tile(c, 1), to_stream=order)
               for c in range(COLS)]
         df = [ObjectFifo(obj_ty, name=f"mcd{c}", depth=2) for c in range(COLS)]
@@ -499,7 +502,7 @@ class CombineOperator(_Gathered):
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_cb,), bf], np.ndarray[(n_ds,), bf], np.ndarray[(n_o,), bf],
-                           [y3[c].prod(tile=Tile(c, 0), channel=1) for c in range(COLS)],
-                           [df[c].prod(tile=Tile(c, 0), channel=0) for c in range(COLS)],
+                           [y3[c].prod(tile=Tile(c, 0), port=Port.dma(1)) for c in range(COLS)],
+                           [df[c].prod(tile=Tile(c, 0), port=Port.dma(0)) for c in range(COLS)],
                            [of[c].cons(tile=Tile(c, 0)) for c in range(COLS)]])
         return Program(NPU2(), rt, workers=workers).resolve_program()

@@ -86,6 +86,8 @@ class ParameterScratchpad {
   /// parameter's value, read as an int32, must lie in the range the compiler
   /// gave it, which keeps its transfers within their buffers.
   void writeBits(const std::string& name, uint32_t bits) {
+    if (unslotted.count(name))
+      throw std::runtime_error("ParameterScratchpad: no command reads parameter '" + name + "', so it has no slot");
     auto it = paramMap.find(name);
     if (it == paramMap.end()) {
       throw std::runtime_error("ParameterScratchpad: unknown parameter '" + name + "'");
@@ -147,6 +149,7 @@ class ParameterScratchpad {
   uint32_t* boMap = nullptr;
   size_t scratchpadSizeBytes = 0;
   std::unordered_map<std::string, uint8_t> paramMap;
+  std::unordered_set<std::string> unslotted;  // params no command reads
   std::unordered_set<std::string> coreParams;  // params with kind="core"
   std::unordered_set<std::string> repeatParams;  // params with kind="repeat"
   std::unordered_map<std::string, std::pair<int32_t, int32_t>> ranges;
@@ -170,31 +173,47 @@ class ParameterScratchpad {
     }
 
     // Format (mlir-aie's emitScratchpadParamsFile):
-    //   <num_parameters>
+    //   <num_parameters> <num_slots>
     //   <name> <state_table_idx> <type> <kind> <min> <max>
     //   ...
     //   <num_joint_bounds>
     //   <length> <offset> <length_step> <max>
     //   ...
-    // where kind is "core", "addr" or "repeat", and <min> <max> is "- -" for a
-    // parameter with no range. A joint bound requires
-    // offset + length_step * length <= max.
-    unsigned numParams = 0;
-    file >> numParams;
-    scratchpadSizeBytes = numParams * 4;
+    //   <num_commands>
+    //   <device>:<sequence> <num_read> <name> ...
+    //   ...
+    // where <state_table_idx> is "-" for a parameter no command reads, kind is
+    // "core", "addr" or "repeat", and <min> <max> is "- -" for a parameter with
+    // no range. A joint bound requires offset + length_step * length <= max.
+    // The commands (runtime sequences no aiex.run calls) may share slots, so a
+    // scratchpad holds one command's: an ELF with several is refused.
+    unsigned numParams = 0, numSlots = 0;
+    file >> numParams >> numSlots;
+    if (!file) throw std::runtime_error("ParameterScratchpad: missing parameter and slot counts in '" + path + "'");
+    scratchpadSizeBytes = numSlots * 4;
 
     for (unsigned i = 0; i < numParams; i++) {
-      std::string name, type, kind, min, max;
-      unsigned idx;
-      file >> name >> idx >> type >> kind >> min >> max;
+      std::string name, slot, type, kind, min, max;
+      file >> name >> slot >> type >> kind >> min >> max;
       if (!file)
         throw std::runtime_error("ParameterScratchpad: malformed entry " + std::to_string(i) + " in '" + path + "'");
-      if (idx > 255)
-        throw std::runtime_error("ParameterScratchpad: state_table_idx " + std::to_string(idx) +
-                                 " for '" + name + "' exceeds uint8_t range");
-      if (paramMap.count(name))
+      if (paramMap.count(name) || unslotted.count(name))
         throw std::runtime_error("ParameterScratchpad: duplicate parameter name '" + name + "'");
-      paramMap[name] = static_cast<uint8_t>(idx);
+      if (slot == "-") {
+        unslotted.insert(name);
+      } else {
+        unsigned long idx = 0;
+        try {
+          idx = std::stoul(slot);
+        } catch (const std::logic_error&) {
+          throw std::runtime_error("ParameterScratchpad: malformed slot '" + slot + "' for parameter '" + name +
+                                   "' in '" + path + "'");
+        }
+        if (idx >= numSlots)
+          throw std::runtime_error("ParameterScratchpad: state_table_idx " + std::to_string(idx) + " for '" + name +
+                                   "' is past the " + std::to_string(numSlots) + " slots of '" + path + "'");
+        paramMap[name] = static_cast<uint8_t>(idx);
+      }
       if (kind != "core" && kind != "addr" && kind != "repeat") {
         throw std::runtime_error("ParameterScratchpad: invalid kind '" + kind +
                                  "' for parameter '" + name + "'");
@@ -229,6 +248,13 @@ class ParameterScratchpad {
                                    "', which has no range, in '" + path + "'");
       jointBounds.push_back(bound);
     }
+
+    unsigned numCommands = 0;
+    file >> numCommands;
+    if (!file) throw std::runtime_error("ParameterScratchpad: missing command count in '" + path + "'");
+    if (numCommands > 1)
+      throw std::runtime_error("ParameterScratchpad: '" + path + "' lists " + std::to_string(numCommands) +
+                               " commands, whose parameters may share slots");
   }
 };
 

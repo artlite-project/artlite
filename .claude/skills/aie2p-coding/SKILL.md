@@ -215,8 +215,8 @@ BDs:
   repeat count. [`AIETargetModel.h`]
 - Memtile BD ids run out with deep FIFOs: an A FIFO of depth 8-12 next to an X FIFO of depth 8 failed (6 and 4 work),
   depth 16 failed elsewhere. A link's two directions on one channel number draw on one parity (the decode overlay's
-  A FIFO tops out at depth 12); pinning the channels (`cons(channel=)`: the memtile S2MM, `forward(channel=)`: its
-  MM2S) puts the directions on different parities (depth 20-22 compiled).
+  A FIFO tops out at depth 12); pinning the channels (`cons(port=Port.dma(n))`: the memtile S2MM, `forward(port=)`:
+  its MM2S) puts the directions on different parities (depth 20-22 compiled).
 - Shim BDs: 3 dims plus the outer repeat; the innermost dimension at most 1023 words (AGENTS.md): write long rows as
   `[n][512 words]`. An inner run of 1280 words fails lowering ("Do not include the highest dimension size in transfer
   length"); a longer one can make aiecc run for 25+ minutes instead. A gathered unit longer than 1023 words (32-row
@@ -261,11 +261,11 @@ Transfers the array chooses (control packets into a shim) [measured]:
   slave port (MM2S0 = South 3, MM2S1 = South 7) in packet mode, a slot of the packets' id on a free arbiter, master
   Tile_Ctrl (0x3F000) in packet mode on it, header kept. aiecc numbers a shim's packet flows from arbiter 0 up: a stream
   left on the control route's arbiter feeds TileControl its words as control packets (`moe.route.check_route` reads the
-  configuration and refuses that). A packet-switched ObjectFifo (`packet=True`) shares the channel at no measurable
-  cost; its fills' BDs carry Enable_Packet and its id (word 2 bits 30, 23:19, above the address's high bits: a host
-  patch of a BD's address keeps them, or its first data word routes as a header: a TDR). IRON's placer counts a
-  PacketFlow's DMA source as a channel beside an ObjectFifo's on the same channel ("requires ... DMA channels"): the
-  host writes that route (slot and master: two words).
+  configuration and refuses that). A packet-switched ObjectFifo (`transport=Transport.dma(Packet(id))`) shares the
+  channel at no measurable cost; its fills' BDs carry Enable_Packet and its id (word 2 bits 30, 23:19, above the
+  address's high bits: a host patch of a BD's address keeps them, or its first data word routes as a header: a TDR).
+  IRON's placer counts a PacketFlow's DMA source as a channel beside an ObjectFifo's on the same channel ("requires
+  ... DMA channels"): the host writes that route (slot and master: two words).
 - Order the DDR round trip with a shim lock (0x14000 + 16 n), not a firmware sync: the drain's S2MM BD releases it, the
   packets' MM2S BD acquires it (word 7), both pushed at once. A core's release of the packets -> the first 9 KB object
   of the BD they pushed in its L1: ~2.6 us on 8 columns (~7.6 us with a TCT sync between drain and read).
@@ -279,9 +279,10 @@ Transfers the array chooses (control packets into a shim) [measured]:
   per block + ~0.15 us per row BD; 8 columns within 2-5% of contiguous reads.
 - **Finish on TLAST** (an S2MM channel's FoT_Mode, bits 17:16 of its DMA_S2MM_<ch>_Ctrl, 1 = no counts; memtile
   0xA0600 + 8 ch; mlir-aie has no API: a maskwrite in the runtime sequence, the FIFO's channel pinned with
-  `cons(channel=)`): a BD ends at the stream's TLAST (every shim BD sends one at its end), so a sender may send less
-  than the object; a split's input BDs (one per part, with their walks) each end on their own TLAST. An expert GEMM's
-  A strips: a strip without valid rows sent as one 72-byte marker panel, which its core checks (`moe.expert_gemm`).
+  `cons(port=Port.dma(n))`): a BD ends at the stream's TLAST (every shim BD sends one at its end), so a sender may
+  send less than the object; a split's input BDs (one per part, with their walks) each end on their own TLAST. An
+  expert GEMM's A strips: a strip without valid rows sent as one 72-byte marker panel, which its core checks
+  (`moe.expert_gemm`).
   Without FoT such a short transfer hangs the dispatch. A runtime-sequence transfer that is not whole objects fails
   mlir-aie's verifier: send them from control packets (or raw `npu_writebd` in a standalone operator: a library's
   assembler maps every data BD to an argument slot).

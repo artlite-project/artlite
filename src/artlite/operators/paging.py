@@ -229,19 +229,27 @@ def header(stream_id: int = LOOP_ID) -> int:
     return _parity(stream_id)
 
 
+class _PageFlow(PacketFlow):
+    """A route of pages into a core's TileControl: they write its program memory, the pager's state words and its wake
+    lock, never its DMA, so IRON's refusal of a TileControl route into a tile with a TileDma program (a dispatch's
+    reconfiguration would rewrite that DMA) does not hold for it."""
+
+    def control_tiles(self) -> list[Tile]:
+        return []
+
+
 def loop_flow(tile: Tile, *, channel: int = 1, stream_id: int = LOOP_ID) -> PacketFlow:
     """The self-DMA route of a core: its MM2S ``channel`` into its own TileControl (the design gives that channel a
     static chain over the slots the pages arrive in)."""
-    return PacketFlow(stream_id, tile, tile, src_port=WireBundle.DMA, src_channel=channel,
-                      dst_port=WireBundle.TileControl, keep_pkt_header=True,
-                      name=f"pg_loop{tile.col}_{tile.row}")
+    return _PageFlow(stream_id, tile, tile, src_port=WireBundle.DMA, src_channel=channel,
+                     dst_port=WireBundle.TileControl, keep_pkt_header=True, name=f"pg_loop{tile.col}_{tile.row}")
 
 
 def page_flow(mem: Tile, core: Tile, *, channel: int, stream_id: int) -> PacketFlow:
     """The memtile transport's route of a core's pages: its memtile's MM2S ``channel`` into its TileControl (the stored
     streams carry ``stream_id``: one per core of the column)."""
-    return PacketFlow(stream_id, mem, core, src_channel=channel, dst_port=WireBundle.TileControl, keep_pkt_header=True,
-                      name=f"pg_page{core.col}_{core.row}")
+    return _PageFlow(stream_id, mem, core, src_channel=channel, dst_port=WireBundle.TileControl, keep_pkt_header=True,
+                     name=f"pg_page{core.col}_{core.row}")
 
 
 def request_flow(core: Tile, mem: Tile, *, stream_id: int) -> PacketFlow:
@@ -328,8 +336,8 @@ def cdo_writes(work_dir: str) -> set[int]:
 
 
 def cdo_values(work_dir: str) -> dict[int, int]:
-    """Address -> the last value a compiled design's configuration writes there (aiecc's CDO files: writes, masked
-    writes and block writes, 64-bit addresses)."""
+    """Address -> the value a compiled design's configuration leaves there (aiecc's CDO files: writes, masked writes
+    and block writes, 64-bit addresses)."""
     out: dict[int, int] = {}
     prj = os.path.join(work_dir, "design.mlir.prj")
     for name in ("main_aie_cdo_init.bin", "main_aie_cdo_enable.bin", "main_aie_cdo_elfs.bin"):
@@ -346,9 +354,12 @@ def cdo_values(work_dir: str) -> dict[int, int]:
             if n == 0xFF:
                 n, i = w[i], i + 1
             p = w[i:i + n]
-            if api in (5, 7, 8):  # (block write, masked write, write: the address in two words)
+            if api in (5, 7, 8):  # (block write, masked write: mask, value, write: the address in two words)
                 a = p[0] << 32 | p[1]
-                out.update({a + 4 * k: p[2 + k] for k in range(n - 2)} if api == 5 else {a: p[-1]})
+                if api == 7:
+                    out[a] = out.get(a, 0) & ~p[2] | p[3] & p[2]
+                else:
+                    out.update({a + 4 * k: p[2 + k] for k in range(n - 2)} if api == 5 else {a: p[-1]})
             i += n
     return out
 
