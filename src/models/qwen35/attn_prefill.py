@@ -74,7 +74,9 @@ GROUP = AT.OBJS * AT.OBJ_BYTES  # bytes of a cache group (32 positions: a K obje
 # of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
 QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
 QA_KV = "qa_kv"  # bf16 offset of the chunk's first cache group (GROUP / 2 * p0 / 32)
-QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count)
+QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count); non-causal: the
+# prompt's groups
+QA_NK = "qa_nk"  # (non-causal) the prompt's keys in its last group (1 .. 32)
 QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
 # (timing builds, ablate "ev_<kernel>": counter 0 the window's cycles, 1 lock stall, 2 all cycles, 3 the windows)
@@ -502,6 +504,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     aie::store_v(pm, mn);
 }
 
+{% if CAUSAL %}
 // Masked keys of a diag group (row panel token group t, record rec = t % 4; dd < 0: the group lies after the panel's
 // queries): -16384 (P = 0 against any real row maximum)
 __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int32_t rec)
@@ -515,7 +518,26 @@ __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int
             aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
     }
 }
+{% endif %}
 
+{% if not CAUSAL %}
+// Keys past the prompt's in its last group (non-causal: the group's first nk keys are the prompt's): -16384
+__attribute__((noinline)) void {{ p }}_keys(float *__restrict s, int32_t nk)
+{
+    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-16384.0f);
+    for (int k = 0; k < 4; k++) {
+        const int v = nk - 8 * k;  // (the record's prompt keys)
+        if (v <= 0)
+            aie::store_v(s + 64 * k, ninf);
+{% for v in range(1, 8) %}
+        else if (v == {{ v }})  // (lane 8 q + j: j >= {{ v }})
+            aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf,
+                                                 aie::mask<64>::from_uint64(0x{{ keys[v] }}ull)));
+{% endfor %}
+    }
+}
+
+{% endif %}
 // pass 1 of P = 2^(s - m) over a head's 4 panels of A = s + 192 - m, 32 lanes a step: the first step of kmath.exp2
 // (P = 2^(round(s - m) + 64) exactly, f = s - m - round(s - m); masked keys -16384: P ~ 0) -> pP, pF; whether
 // every bf16(A) <= 208 (s <= m + 16)
@@ -703,7 +725,8 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, flo
 
 // The group's softmax terms, diag groups before the pass's last: per row panel (its token group t = QG r + i % QG of
 // the pass, in the pass's group t / 4) on its diagonal group keys after the query masked (record k vs record t % 4),
-// the groups after it wholly (a panel's first groups are never masked: they lie before every pass's queries); a row's
+// the groups after it wholly (a panel's first groups are never masked: they lie before every pass's queries);
+// non-causal, r the prompt's keys in its last group (diag 0): the keys after them; a row's
 // maximum m is raised (o, l rescaled, pass 1 again) on the pass's first group (g = 0) and when the group's exceeds it
 // by 2^16; P = 2^(s - m) as bfp16 panels, l += P
 void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int32_t r, int32_t g)
@@ -717,9 +740,14 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int3
     aie::set_rounding(aie::rounding_mode::conv_even);
     for (int h = 0; h < {{ R }}; h++) {
         float *__restrict s = AW(float, {{ w.sc }}) + 256 * h;
+{% if CAUSAL %}
         const int t = {{ QG }} * r + h % {{ QG }}, dd = diag - ({{ QG - 1 }} - (t >> 2));
         if (dd <= 0)
             {{ p }}_mask(s, dd, t & 3);
+{% else %}
+        if (diag == 0 && r < 32)
+            {{ p }}_keys(s, r);
+{% endif %}
         float *__restrict pm = AW(float, {{ w.m }}) + 64 * h;
         float *__restrict pl = AW(float, {{ w.l }}) + 64 * h;
         if (!{{ p }}_pass1(s, pw) || g == 0) {
@@ -871,19 +899,23 @@ class PrefillAttnOperator(ArtcOperator):
     streams the cache groups 0 .. p0 / 32 + QG (b + 1) - 1 (the KV head's stream broadcast to the 4 NPH cores of its
     columns) and writes their outputs as the attn_out GEMM's A panels. Runtime sequence: QS (the prep's), KV (one layer's cache), A (T x heads x 256 as bfp16
     panels [T / 8][heads x 32]). Parameters ``QA_N`` = p0 / 32 + 1 (the history groups every pass streams first, and the
-    cores' trip count), ``QA_OFF`` (T's): the bf16 offset of the chunk's second group (``params``)."""
+    cores' trip count), ``QA_OFF`` (T's): the bf16 offset of the chunk's second group (``params``).
+
+    Non-causal (``causal`` False: ``QwenConfig.causal``, vllm-d3's decision models): a prompt of n tokens in one chunk
+    at position 0, every pass streams the prompt's groups (``QA_N`` of them) and each query sees all of its keys, those
+    after the prompt's in its last group masked (``QA_NK``: the prompt's keys there)."""
 
     STACK = 3072
     pfx = kernel_prefix("qaa")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = ()):
+    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_qk",
         "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
         two streams only)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0
-        self.T, self.cfg, self.head_bytes = T, cfg, head_bytes
+        self.T, self.cfg, self.head_bytes, self.causal = T, cfg, head_bytes, causal
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
@@ -905,8 +937,10 @@ class PrefillAttnOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         p = self.pfx
         tri = sum(1 << (8 * q + k) for q in range(8) for k in range(8) if k > q)
+        keys = [f"{sum(1 << (8 * q + k) for q in range(8) for k in range(v, 8)):016X}" for v in range(8)]
         return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
-                            tri=f"{tri:016X}", ablate=self.ablate, TWO=self.two, OB=self.ob)
+                            tri=f"{tri:016X}", keys=keys, ablate=self.ablate, TWO=self.two, OB=self.ob,
+                            CAUSAL=self.causal)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -914,8 +948,12 @@ class PrefillAttnOperator(ArtcOperator):
                 ArgSpec("in", (self.kvh * self.head_bytes // 2,), torch.bfloat16),
                 ArgSpec("out", (T * self.H * HD * 9 // 16,), torch.bfloat16)]
 
-    def params(self, p0: int) -> dict[str, int]:
+    def params(self, p0: int, n: int = 0) -> dict[str, int]:
+        """(n: the valid tokens of a non-causal chunk, the prompt's)"""
         assert p0 % 32 == 0
+        if not self.causal:
+            assert p0 == 0 and 0 < n <= self.T, (p0, n)
+            return {QA_N: -(-n // 32), QA_NK: n - 32 * (-(-n // 32) - 1)}
         return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": GROUP // 2 * (p0 // 32 + 1)}
 
     def get_mlir_artifact(self) -> Module:
@@ -936,6 +974,7 @@ class PrefillAttnOperator(ArtcOperator):
         k_pv = Kernel(f"{p}_pv", "kernel.o", [kv_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
+        causal, p_nk = self.causal, None if self.causal else ScratchpadParameter(QA_NK, np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
         assert nph >= 2, "a KV head's stream from two shims of its columns"
         n_q = nph * 4 * qg * qc  # (a pass's slots of a KV head's cores, one object each)
@@ -958,14 +997,16 @@ class PrefillAttnOperator(ArtcOperator):
                         qsel(a, qb, i, me)
                         kv_h.release(1)
                     init(ws)
-                    # read after this dispatch's first object: the host wrote it before the fills
-                    n = n_p.read() + b * qg + (qg - 1)
+                    # read after this dispatch's first object: the host wrote it before the fills (non-causal: the
+                    # prompt's groups; row: the prompt's keys in the last)
+                    n = n_p.read() + b * qg + (qg - 1) if causal else n_p.read()
+                    last = row if causal else row.read()
                     for g in range32(n):
                         for k in range(2):
                             kr = kv_h.acquire(1)
                             qk(qb, kr, ws, k)
                             kv_h.release(1)
-                        soft(ws, pw, n - 1 - g, row, g)
+                        soft(ws, pw, n - 1 - g, last, g)
                         for half in range(2):
                             v = kv_h.acquire(1)
                             pv(v, ws, half)
@@ -981,7 +1022,8 @@ class PrefillAttnOperator(ArtcOperator):
 
         workers = [Worker(core, [kv[c // nph].cons(), o1[c][r].prod(), k_init, k_qsel, k_qk, k_soft, k_pv, k_fin,
                                  Buffer(ws_ty, name=f"pa_ws{c}_{r}"), Buffer(pw_ty, name=f"pa_pw{c}_{r}"),
-                                 Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph * 4 * qg + qg * r) * qc],
+                                 Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r if causal else p_nk,
+                                 (c % nph * 4 * qg + qg * r) * qc],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs = COLS * T // 8 * qc * SLOT
@@ -1008,7 +1050,7 @@ class PrefillAttnOperator(ArtcOperator):
             inflight = []  # (a pass: one task of up to four BDs per part, at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
-                more = qg * b + qg - 1  # (the chunk's groups after its first through the pass's)
+                more = qg * b + qg - 1 if causal else 0  # (the chunk's groups after its first through the pass's)
                 for (h, i), f in zip(((h, i) for h in range(n_kvh) for i in range(2)), kvh, strict=True):
                     # (part i: d-blocks 16 i .. of every piece (a cache object's two pairs of records); the pass's slots of the head's
                     # columns [column NPH][token group 4 QG][head] one after the other in QS, a token group [Q |
@@ -1066,6 +1108,7 @@ class PrefillAttnOperator(ArtcOperator):
         k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
+        causal, p_nk = self.causal, None if self.causal else ScratchpadParameter(QA_NK, np.int32)
         n_pass, nph, n_kvh = T // (32 * qg), self.nph, self.kvh
         n_q = nph * 4 * qg * qc  # (a pass's slots of a KV head's cores)
 
@@ -1091,15 +1134,17 @@ class PrefillAttnOperator(ArtcOperator):
                         a_h.release(1)
                         b_h.release(1)
                     init(ws)
-                    # read after this dispatch's first object: the host wrote it before the fills
-                    n = n_p.read() + b * qg + (qg - 1)
+                    # read after this dispatch's first object: the host wrote it before the fills (non-causal: the
+                    # prompt's groups; row: the prompt's keys in the last)
+                    n = n_p.read() + b * qg + (qg - 1) if causal else n_p.read()
+                    last = row if causal else row.read()
                     for g in range32(n):
                         ka = a_h.acquire(1)
                         b_h.acquire(1)
                         qk(qb, ka, ws)
                         a_h.release(1)
                         b_h.release(1)
-                        soft(ws, pw, n - 1 - g, row, g)
+                        soft(ws, pw, n - 1 - g, last, g)
                         va = a_h.acquire(1)
                         b_h.acquire(1)
                         pv(va, ws)
@@ -1123,7 +1168,8 @@ class PrefillAttnOperator(ArtcOperator):
                 workers.append(Worker(core, [kv[h, 0].cons(), kv[h, 1].cons(), o1[c][r].prod(), k_init, k_qsel, k_qk,
                                              k_soft, k_pv, k_fin, Buffer(ws_ty, name=f"pa_ws{c}_{r}"),
                                              Buffer(pw_ty, name=f"pa_pw{c}_{r}"),
-                                             Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r, (c % nph) * 4 + r],
+                                             Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r if causal else p_nk,
+                                             (c % nph) * 4 + r],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
         n_qs = COLS * T // 8 * qc * SLOT
@@ -1149,7 +1195,7 @@ class PrefillAttnOperator(ArtcOperator):
             inflight = []  # (a pass: one task of up to four BDs per stream, at most two passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
-                more = qg * b + qg - 1  # (the chunk's groups after its first through the pass's)
+                more = qg * b + qg - 1 if causal else 0  # (the chunk's groups after its first through the pass's)
                 for ((h, s), i), f in zip(((hs, i) for hs in streams for i in range(2)), kvh, strict=True):
                     # (part i: d-blocks 16 s + 8 i .. of every piece (a cache object's two); QS pass-major: the pass's
                     # slots of the head's columns [column NPH][token group 4 QG] one after the other, a token group's [Q

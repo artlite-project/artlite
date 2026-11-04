@@ -92,6 +92,7 @@ class NpuQwen(OverlayModel):
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights, image=image,
                                    formats=draft_formats(mtp) if mtp is not None else ())
         self.cfg = self.overlay.cfg
+        self.causal = self.cfg.causal
         self.eos_token_ids = self.cfg.eos_token_ids
         own = drafter == "" and self.overlay.image.mtp_layer >= 0  # (the file's own block)
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None

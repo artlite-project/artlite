@@ -36,7 +36,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, Sampling, chat_template
 from ..readouts import Readouts
-from . import agents, readouts
+from . import agents, decisions, readouts
 from .agents import Blocks
 from .engine import Engine, Job
 from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
@@ -110,6 +110,8 @@ class ModelInfo:
     size: int = 0
     ftype: str = ""
     readouts: Readouts = field(default_factory=Readouts)  # (its pooling, classifier head, rerank prompt)
+    decision: str | None = None  # its decision type (``{arch}.decision.type``; None: not a decision model)
+    decisions: decisions.Decisions | None = None  # (its decision context made ahead: else on the first request)
 
     @classmethod
     def from_gguf(cls, path: str) -> ModelInfo:
@@ -128,7 +130,8 @@ class ModelInfo:
                    n_ctx_train=int(meta.get(f"{arch}.context_length", 0)),
                    n_embd=int(meta.get(f"{arch}.embedding_length", 0)), n_vocab=n_vocab,
                    n_params=int(fields["model_n_params"]), size=int(fields["model_size"]),
-                   ftype=file_type_name(meta.get("general.file_type")), readouts=Readouts.of(path))
+                   ftype=file_type_name(meta.get("general.file_type")), readouts=Readouts.of(path),
+                   decision=decisions.decision_type(meta, arch))
 
 
 class ApiError(Exception):
@@ -728,7 +731,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                                         "parameter_size": "", "quantization_level": ""}}],
                 "data": [{"id": name, "aliases": [], "tags": [], "object": "model",
                           "architecture": {"input_modalities": ["text"] + ["image"] * vision,
-                                           "output_modalities": ["text"]},
+                                           "output_modalities": ["decisions" if info.decision else "text"]},
                           "created": int(time.time()), "owned_by": "artlite",
                           "meta": {"n_vocab": info.n_vocab, "n_ctx": options.n_ctx, "n_ctx_train": info.n_ctx_train,
                                    "n_embd": info.n_embd, "n_params": info.n_params, "size": info.size,
@@ -1124,6 +1127,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                         embd_normalize=options.embd_normalize, readouts=info.readouts,
                         cache_prompt=options.cache_prompt,
                         errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits, valid=valid)
+    decisions.add_routes(api, engine=engine, alias=options.alias, kind=info.decision,
+                         make=lambda: info.decisions or decisions.Decisions.of(info.path, engine.model.tokenizer.encode),
+                         errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits)
     add_unsupported(listed)
     app.include_router(public)
     app.include_router(listed)

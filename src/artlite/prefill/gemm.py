@@ -35,7 +35,7 @@ is within ~1.35 2^-9 sqrt(K / 64) of the exact product (relative rms; ``tests/pr
 from dataclasses import dataclass
 
 from ..decode.image import Block, Region, TileImage
-from ..formats import gu_tiles
+from ..formats import gu_tiles, slot
 from ..gemm.gemm_q import GemmQOperator, pace_class
 from ..gemm.gemm_q import planar as is_planar
 from ..gemm.gemm_qd import GemmQdOperator, choose_planar_plan, gemm_mac_rows, planar_gemm
@@ -239,9 +239,10 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     which = WHICH[name]
     if name == "gate_up":
         (b,) = region.blocks
-        if is_planar(b.fmt, b.R, KC):  # (a pass: one group of 8 x [8 gate | 8 up] rows, 64 outputs, in two halves)
-            tp, width = gu_tiles(b.R), 64
-        else:  # (a pass: 64 rows, 4 x [8 gate | 8 up]: 4 Q4_K tiles, 8 BFP16 tiles)
+        planar = is_planar(b.fmt, b.R, KC)
+        if planar and slot(b.fmt).pass_tiles(b.fmt, b.R, gu_tiles(b.R)):  # (a pass: one group of 8 x [8 gate | 8 up]
+            tp, width = gu_tiles(b.R), 64  # rows, 64 outputs, in two halves)
+        else:  # (a pass: 64 rows, 4 x [8 gate | 8 up]: 4 Q4_K tiles, 8 BFP16 tiles; planar, half a group: 8 Q8_0 tiles)
             tp, width = _tp(b), 32
         passes = b.tiles // tp
         ffn = image.cfg.intermediate_size // COLS
@@ -255,7 +256,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
                   "blocks": ((tp * p0, p1 - p0),), "lines": LINES}
-            if is_planar(b.fmt, b.R, KC):
+            if planar:
                 kw["tiles"] = tp
             op = _gemm(kw, T, which, ops)
             gemms.append(Gemm(op, region.offset - op.hdr_skip))

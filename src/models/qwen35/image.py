@@ -67,6 +67,8 @@ from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
 
+from .attn import OBJ_BYTES
+
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
@@ -124,7 +126,8 @@ class QwenImage(TileImage):
         self.n_ids = cfg.vocab_size if vocab is None else vocab  # (the token ids of the LM rows: 0 .. ids - 1)
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
-        super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes, vocab=vocab)
+        # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
+        super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab)
         assert H % KC == 0 and H % (8 * COLS) == 0 and I % (64 * COLS) == 0
         assert not cfg.moe or (cfg.n_experts % COLS == 0 and cfg.shared_ffn % (64 * COLS) == 0
                                and KC % cfg.shared_ffn == 0 and KC % (cfg.expert_ffn // 2) == 0

@@ -61,6 +61,10 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - **The prompt's last token** needs logits: Qwen runs the LM head on the last row of x (`QwenOverlay.logits_of`);
   Gemma finishes the token with an overlay step from the prefill's last layer (`GemmaOverlay.step(start=)`, x the
   chunk's residual at that layer's input: `GemmaPrefill.residual`), so only the layers the prefill skipped stream.
+- **Readouts and non-causal prompts**: `NpuModel.outputs` gathers a prompt's rows per chunk (no decode-step tail, no
+  LM head; the heads on the host: `models.readouts`, `models.server.decisions`). A non-causal model (vllm-d3:
+  `QwenConfig.causal`) runs a prompt whole in one chunk from position 0: the flash attention's passes all stream the
+  prompt's groups, the padding keys of its last group masked (`PrefillAttnOperator(causal=False)`), no decode steps.
 - **App** (`models.common.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
   start (whole cache groups), the planner's chunks, decode steps after; each chunk's inputs (embeddings, per-layer
   inputs) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and

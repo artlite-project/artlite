@@ -20,7 +20,7 @@ import numpy as np
 from artlite import _native, portable
 
 from ..common import Detokenizer, LogitsLike, Model, NpuModel, Sampling, StreamDecoder, argmax, seed, top_logits
-from .cache import PromptCache
+from .cache import PromptCache, common_prefix
 from .tools import Calls, held
 
 log = logging.getLogger("artlite.server")
@@ -296,30 +296,56 @@ class Engine:
                  name: str = "readout") -> concurrent.futures.Future:
         """Output rows of prompts (``NpuModel.outputs``, output-normed) on the worker after the queued jobs: per input
         its tokens' rows at ``rows`` (indices), one after another, each after what the prompt cache keeps of it before
-        its first row; the result: a list of (len(rows), hidden) fp32."""
+        its first row (a non-causal model's: none; a recurrent model's inputs with a long common prefix: ``_shared``);
+        the result: a list of (len(rows), hidden) fp32."""
         return self.run(lambda: self._readouts(inputs, rows, cache_prompt, name))
 
     def _readouts(self, inputs: list[list[int]], rows: list[np.ndarray], cache_prompt: bool, name: str
                   ) -> list[np.ndarray]:
         npu, cache = self.npu, self.cache
-        t0, out, kept = time.perf_counter(), [], 0
+        cache_prompt = cache_prompt and npu.causal  # (a non-causal model reads every prompt whole)
+        t0, out, ran = time.perf_counter(), [], 0
         try:
             if self._dirty:
                 npu.reset()
                 self._dirty = False
+            if p := self._shared(inputs, rows) if cache_prompt else 0:  # (the prefix once, a checkpoint at its end)
+                k, _, _ = cache.prepare(inputs[0][:p])
+                if k < p:
+                    npu.outputs(inputs[0][k:p], [-1])  # (in chunks: as a readout runs)
+                cache.checkpoint(inputs[0][:p])
+                ran += p - k
             for ids, at in zip(inputs, rows, strict=True):
                 k, _, _ = cache.prepare(ids[:int(at.min())], enabled=cache_prompt)
                 out.append(npu.outputs(ids[k:], at - k))
                 cache.ran(ids)
-                kept += k
+                ran += len(ids) - k
         except Exception:  # (the device's state is unknown: the caches start over)
             cache.clear()
             self._dirty = True
             raise
         n = sum(map(len, inputs))
-        log.info(f"{name}: {len(inputs)} input{'s' * (len(inputs) != 1)}, {n - kept} tokens ({kept} cached) in "
+        log.info(f"{name}: {len(inputs)} input{'s' * (len(inputs) != 1)}, {ran} tokens ({n - ran} cached) in "
                  f"{time.perf_counter() - t0:.3f} s")
         return out
+
+    def _shared(self, inputs: list[list[int]], rows: list[np.ndarray]) -> int:
+        """Where a recurrent model's prompts (whose states the prompt cache keeps only at checkpoints) run their common
+        prefix once: its last cache group's start before every prompt's first row, if the prefill's estimates
+        (``NpuModel.prompt_seconds``) say the prefix and each prompt's rest after it take less than 0.9 of the
+        prompts whole (a short chunk costs about as much as a longer one: its configurations), else 0."""
+        npu = self.npu
+        if not npu.recurrent or len(inputs) < 2:
+            return 0
+        p = min(min(common_prefix(inputs[0], ids) for ids in inputs[1:]), min(int(at.min()) for at in rows))
+        p -= p % npu.group
+        if p <= 0:
+            return 0
+        whole = [npu.prompt_seconds(len(ids)) for ids in inputs]
+        rest = [npu.prompt_seconds(len(ids) - p, p) for ids in inputs]
+        if None in whole or None in rest:
+            return 0
+        return p if npu.prompt_seconds(p) + sum(rest) < 0.9 * sum(whole) else 0
 
     def waiting(self) -> int:
         """Jobs in the queue (not running)."""
@@ -408,14 +434,17 @@ class Engine:
     def _warm(self) -> None:
         """A short prompt and one step (as llama-server's warmup): the first request's dispatches find their HW
         contexts and transactions ready (the prompt's tokens through the prefill: a few, Qwen's chunks take 3 at
-        least; ``NpuModel.prepare``: the steps of drafts)."""
+        least; ``NpuModel.prepare``: the steps of drafts); a non-causal model's: a readout (it runs no steps)."""
         t0 = time.perf_counter()
         npu = self.npu
         ids = self.model.encode("The quick brown fox jumps over the lazy dog.")
         npu.reset()
-        npu.prepare(len(ids))
-        logits = npu.forward(ids)
-        npu.top_k(argmax(logits), 1)
+        if npu.causal:
+            npu.prepare(len(ids))
+            logits = npu.forward(ids)
+            npu.top_k(argmax(logits), 1)
+        else:
+            npu.outputs(ids, [-1])
         npu.reset()
         log.info("warmup: %.2f s", time.perf_counter() - t0)
 

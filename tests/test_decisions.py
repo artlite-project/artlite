@@ -1,0 +1,54 @@
+"""Decisions on the NPU (``models.server.decisions``; vllm-d3's d3-lite: qwen35, non-causal, every tensor Q8_0): each
+question's prompt through ``NpuModel.outputs`` (one chunk from position 0), its label logits on the host, against the same
+label rows times llama.cpp's last row of the same prompt (``qwen35/dump.cpp``'s ``result_norm``: the whole prompt in
+one graph, the file's non-causal attention), the answers' probabilities within 0.03 and the same choices. llama.cpp's
+CPU and Vulkan builds are 0.019 apart at most on 320 such questions, the NPU 0.087 (median 0.003): the prefill's bfp16
+GEMMs, ~3% of each layer's own output."""
+
+import os
+
+import numpy as np
+import pytest
+
+from artlite.model_config import decision_gguf
+from models import open_model
+from models.server.decisions import Decisions
+
+from .common import essay
+from .qwen35 import ref
+
+pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
+
+QUESTIONS = {
+    "topic": {"type": "choice", "instructions": "What is the passage mostly about?",
+              "criteria": {"programming": None, "cooking": None, "sports": None, "music": None}},
+    "tone": {"type": "score", "instructions": "How optimistic is the tone of the passage?",
+             "criteria": ["very pessimistic", "pessimistic", "neutral", "optimistic", "very optimistic"]},
+    "advice": {"type": "noul", "instructions": "Does the passage give advice to the reader?"},
+}
+
+
+def test_d3_lite() -> None:
+    path = decision_gguf("d3-lite")
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    model = open_model(path)
+    npu = model.load(capacity=4096)
+    assert not npu.causal
+    d = Decisions.of(path, model.tokenizer.encode)
+    text = essay("apple.txt")
+    worst = 0.0
+    for state in (text[:400], text[2000:5000]):  # (~170 and ~800 prompt tokens: chunks of 256 and 1024)
+        body = {"state": state, "questions": QUESTIONS}
+        qs = d.questions(body)
+        for p in d.prompts(state, qs, model.tokenizer.encode):
+            q = qs[p.question]
+            npu.reset()
+            got = d.answer(q, [d.scores(q, npu.outputs(p.ids, p.rows))])
+            g = ref.golden(path, p.ids, layers=("g",), names="result_norm", logits="none")
+            want = d.answer(q, [d.scores(q, np.asarray(g["result_norm"], np.float64).reshape(-1, model.cfg.hidden_size))])
+            assert got.get("choice") == want.get("choice"), (q.id, got, want)
+            pw, pg = (a.get("probabilities", {"true": a.get("noul")}) for a in (want, got))
+            worst = max(worst, *(abs(pw[k] - pg[k]) for k in pw))
+    print(f"max |dp| {worst:.4f}")
+    assert worst < 0.03

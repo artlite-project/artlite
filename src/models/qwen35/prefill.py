@@ -35,7 +35,8 @@ the chunk (the prefill's own and the overlay's) lives on the overlay's device.
 
 Chunks start at multiples of 32 positions (whole cache groups) with at least 3 valid tokens (the conv states: the
 last three); the padding tokens after the valid ones leave the GDN states alone and write cache records that later
-tokens overwrite.
+tokens overwrite. A non-causal model's prompt (``QwenConfig.causal``: vllm-d3) is one chunk at position 0, its
+attention over all of its tokens (``attn_prefill.PrefillAttnOperator``'s non-causal design).
 """
 
 import functools
@@ -124,8 +125,8 @@ class QwenPrefill(ChunkPrefill):
         # (an MTP drafter's cache records of the prompt: ``draft_prefill``)
         self.dp = DraftPrefill(draft, self) if draft is not None else None
         self.fp = DFlashPrefill(dflash, self) if dflash is not None else None
-        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes) for T in self.sizes} \
-            if self.att else {}
+        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal)
+                     for T in self.sizes} if self.att else {}
         self._starts: dict[int, list[int]] = {}
         self._rows()
         self._library()
@@ -412,7 +413,7 @@ class QwenPrefill(ChunkPrefill):
                 .conv_offset(n)
         if self.att:
             prep = self._prep(self.sz[self._t(T)].plans[(self.att[0], "attn_in")].layout, T)
-            out |= prep.params(p0, cs_row) | self.attn[T].params(p0)
+            out |= prep.params(p0, cs_row) | self.attn[T].params(p0, n)
         if self.fp is not None:
             out |= self.fp.params(T, p0)
         return out
@@ -485,8 +486,10 @@ class QwenPrefill(ChunkPrefill):
     def attention_seconds(self, p0: int, S: float) -> float:
         """Estimated time of an attention layer's flash attention over a chunk of S sub-chunks (a ``SMALL`` size: the
         fraction T / SUB of one) at p0 (the 1B / 9B / 27B: 0.144 / 0.488 / 0.636 ms per 1K cached positions and
-        sub-chunk)."""
+        sub-chunk; non-causal: every pass streams the whole chunk, as a causal chunk's half way through it)."""
         at = self.attn[round(S * SUB)]
+        if not at.causal:
+            p0 += round(S * SUB) // 2
         passes = SUB / (32 * at.qg)  # (per sub-chunk)
         dma = passes * at.kvh * (AP.AT.REC_K + AP.AT.REC_V) / 8 / ATTN_BW
         cores = passes * at.R * (ATTN_CYC_TWO if at.two else ATTN_CYC_ONE) / 32 / CORE_HZ

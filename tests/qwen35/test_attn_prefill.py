@@ -1,6 +1,6 @@
 """The attention prefill operators (models/qwen35/attn_prefill.py) on the NPU, on an attention layer's own inputs
 (llama.cpp's prompt-mode projections of an essay laid out as the attn_in GEMMs write them), two chunks: the second
-at position T, with padding tokens after its valid ones."""
+at position T, with padding tokens after its valid ones; non-causal (d3-lite's), one chunk with padding tokens."""
 
 import os
 
@@ -10,7 +10,7 @@ import torch
 
 from artlite.decode import kv as KV
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import QwenConfig, qwen_gguf
+from artlite.model_config import QwenConfig, decision_gguf, qwen_gguf
 from artlite.operators import FusedOperator, bfp16
 from artlite.operators.design import COLS
 from artlite.prefill import gemm as PG
@@ -53,10 +53,11 @@ def _qs_slots(fused: FusedOperator, T: int, qc: int, qg: int) -> np.ndarray:
 
 
 class _Setup:
-    """The model, the layer, two chunks of essay tokens and llama.cpp's tensors of them."""
+    """The model, the layer, two chunks of essay tokens (T, n2; or ``tokens`` of them) and llama.cpp's tensors of
+    them."""
 
-    def __init__(self, size: str, T: int, n2: int):
-        path = qwen_gguf("Q4_K_M", size)
+    def __init__(self, size: str, T: int, n2: int, tokens: int = 0):
+        path = decision_gguf(size) if size.startswith("d3") else qwen_gguf("Q4_K_M", size)
         if not os.path.exists(path):
             pytest.skip(f"{path} missing")
         self.g = g = GGUFFile(path)
@@ -68,7 +69,7 @@ class _Setup:
         self.T, self.n2, self.qc = T, n2, cfg.num_attention_heads // COLS
         self.kvh = cfg.num_key_value_heads
         self.per = self.kvh * AT.HD // COLS  # (K / V dims of a column)
-        self.tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T + n2]
+        self.tokens = ref.llama_tokenize(path, essay("apple.txt"))[:tokens or T + n2]
         n = len(self.tokens)
         G_ = ref.golden(path, self.tokens, layers=(L,), names="Qcur_full|Kcur|Vcur|Qcur|gate_sigmoid|attn_gated",
                         logits="none")
@@ -189,3 +190,38 @@ def test_attn_prefill(size: str, T: int) -> None:
         assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2, t0
         gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[t0:t0 + n]
         assert ref.rel_err(A, gold) < 3e-2, t0
+
+
+@pytest.mark.parametrize(("size", "T", "n"), [("d3-lite", 128, 99), ("d3-lite", 96, 70)])
+def test_attn_prefill_noncausal(size: str, T: int, n: int) -> None:
+    """A non-causal chunk (vllm-d3's prompt: every query sees every key) of n valid tokens at position 0: against the
+    exact attention of the cores' own operands and llama.cpp's attn_gated of the whole prompt. T 128: passes of 64
+    queries on two streams; T 96: of 32 on one."""
+    s = _Setup(size, T, 0, tokens=n)
+    assert not s.cfg.causal
+    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=False)
+    assert attn.two == (T % 64 == 0)
+    fused = FusedOperator(name="attn_prefill_nc", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
+                          input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
+    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
+    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
+    fused.get_buffer("KV").zero_()
+    H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
+    _run(fused, prep.params(0) | attn.params(0, n), s.G(0, n))
+    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
+    slots = _qs_slots(fused, T, qc, prep.qg)
+    q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
+    sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
+    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    want = np.zeros((n, H, hd))
+    for h in range(s.kvh):
+        K, V = (np.asarray(x, np.float64)[:n] for x in KV.kv_from_groups(kv[h, :(n + 31) // 32], AT.HD, dmajor=True))
+        for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
+            sc = q[g].astype(np.float64) @ K.T / 16
+            pr = np.exp(sc - sc.max(-1, keepdims=True))
+            want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
+    assert ref.rel_err(A, want) < 1.5e-2
+    assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2
+    gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[:n]
+    assert ref.rel_err(A, gold) < 3e-2

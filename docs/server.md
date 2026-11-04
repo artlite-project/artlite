@@ -32,6 +32,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
 | `/v1/embeddings`, `/embeddings`, `/embedding` | embeddings (with `--embedding`: [below](#embeddings-and-rerank)) |
 | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | a reranker's scores of documents (with `--rerank`) |
+| `/v1/systemone` | a decision model's answers to questions about a state ([below](#decisions)) |
 
 Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
 sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
@@ -145,6 +146,31 @@ A request's texts run one after another, each entirely as prefill chunks (no dec
 prefix the prompt cache keeps of it. `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
 `{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file: its classifier head
 (`cls.output`) on the last token of its rerank prompt; none of the architectures Artlite runs has one yet.
+
+## Decisions
+
+A decision model (a GGUF file with `{arch}.decision.*` metadata and a `systemone` template) answers `/v1/systemone`
+as llama-server does (TypeSafe's System One API): a `state` (text, a JSON value or chat messages) and `questions`, each
+`{"type": "choice" | "score" | "noul", "instructions", "criteria"}` (a choice's options as an object, a score's 2 to
+10 levels as a list, a noul's optional `true` / `false` descriptions). Each question is one forward pass over its
+prompt, no token generated: a choice's `choice`, `probabilities` and `confidence`, a score's expected level `score`,
+`legend`, `probabilities` and `confidence`, a noul's probability of true `noul`; `usage.input_tokens` counts every
+question's prompt. `/v1/models` reports such a model's `output_modalities` as `["decisions"]`.
+
+```bash
+artlite-server -m ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf
+curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '{"state": "I was charged twice for
+  my order and nobody replied.", "questions": {"route": {"type": "choice", "instructions": "Which team?",
+  "criteria": {"billing": null, "shipping": null}}, "angry": {"type": "noul", "instructions": "Is the customer angry?"}}}'
+```
+
+The decision types artlite-server reads: vllm-d3, pplx-decider, openjev, lev, nimble (the logits of the options' label
+tokens) and kev (its head's products of the last token's and each option's rows), computed on the host from the
+prompt's output rows. Of the published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0) run; Kev-4B does not
+yet (a hidden width of 2560: [Models](models/README.md)). A vllm-d3 model reads a prompt whole (its attention is
+non-causal): one prefill chunk of at most 2048 tokens (a longer prompt: 400), and it generates no text; other types'
+questions share the state's tokens through the prompt cache. Other types (laya, clef, vllm-decision2, lfm2-d1) and
+images (`files`, `images`, a message's image parts) answer 501.
 
 ## Requests
 

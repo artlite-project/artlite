@@ -306,6 +306,12 @@ def _compiled(template: str) -> jinja2.Template:
     return env.from_string(template)
 
 
+def render_template(template: str, **variables: object) -> str:
+    """A template of a model file's (``tokenizer.chat_template.<name>``) rendered as the chat templates are (Jinja2 in
+    the sandbox, compiled once)."""
+    return _compiled(template).render(**variables)
+
+
 def chat_template(template: str, messages: list[dict[str, object]], *, tools: list[dict[str, object]] | None = None,
                   **variables: object) -> str:
     """The prompt text of a conversation rendered with a model's chat template (a GGUF file's
@@ -387,6 +393,8 @@ class NpuModel:
     dispatches = 0
     recurrent = False  # positions are kept only where a checkpoint was taken (states that hold the whole sequence)
     group = 1  # ``rewind`` and a ``restore`` without a checkpoint land on its multiples
+    causal = True  # False: a prompt's every token sees all of them (vllm-d3's decision models): one chunk from position
+    # 0, no decode steps (``readouts`` only)
 
     def prepare(self, prompt_len: int) -> None:
         """Compile and open what a prompt of ``prompt_len`` tokens needs (before it is timed)."""
@@ -428,6 +436,10 @@ class NpuModel:
         LM head's input; else the residual stream): a readout's rows (embeddings, a classifier's or the LM head's rows
         on the host: ``models.readouts``)."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
+
+    def prompt_seconds(self, n: int, position: int = 0) -> float | None:
+        """Estimated seconds of a prompt of n tokens from ``position`` (None: no estimate)."""
+        return None
 
     def checkpoint(self) -> Checkpoint:
         """The state at the current position that continuing from it needs besides the KV caches' records of the
@@ -608,6 +620,8 @@ class OverlayModel(NpuModel):
         prompt tokens); ``step``: the overlay step's other keywords."""
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
+        if not self.causal:
+            raise ValueError("a non-causal model reads whole prompts (readouts), it runs no decode steps")
         t0 = time.perf_counter()
         args = self._step_inputs(tokens)
         self.t_host += time.perf_counter() - t0
@@ -637,10 +651,27 @@ class OverlayModel(NpuModel):
         self.prefill.run(*args, self.position, T)
         self.stale()
 
+    def prompt_seconds(self, n: int, position: int = 0) -> float | None:
+        """(its prefill chunks' estimates, ``ChunkPrefill.chunk_seconds``; the tokens left for decode steps not
+        counted)"""
+        if self.prefill is None:
+            return None
+        if not self.causal:
+            T = self._chunk(n, position)
+            return self.prefill.chunk_seconds(T, position) if T else None
+        p, out = position, 0.0
+        for T in self.prefill.plan(position, n, steps=False):
+            out += self.prefill.chunk_seconds(T, p)
+            p += T
+        return out
+
     def _chunk(self, left: int, position: int | None = None, *, steps: bool = True) -> int:
         """The size of the next prefill chunk at ``position`` (default: the next) when ``left`` tokens remain (0: the
         next token runs as a decode step; ``steps`` False: a readout, as few tokens as possible as decode steps)."""
         p = self.position if position is None else position
+        if not self.causal:  # (the whole prompt: the smallest size that holds it)
+            ok = self.prefill is not None and left >= self.prefill.MIN_TOKENS
+            return next((T for T in self.prefill.sizes if T >= left and self.prefill.fits(T, p)), 0) if ok else 0
         plan = self.prefill.plan(p, left, steps=steps) if self.prefill is not None else []
         return plan[0] if plan else 0
 
@@ -706,6 +737,11 @@ class OverlayModel(NpuModel):
         self._abandon()
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
+        if not self.causal and (self.position or not self._chunk(len(tokens))):
+            sizes = self.prefill.sizes if self.prefill is not None else (0,)
+            raise ValueError(f"a non-causal model reads a whole prompt in one chunk from position 0 "
+                             f"({self.prefill.MIN_TOKENS if self.prefill else 1} to {sizes[-1]} tokens): "
+                             f"{len(tokens)} tokens at position {self.position}")
         steps = readout is None
         out, i, nxt = None, 0, None
         while i < len(tokens):

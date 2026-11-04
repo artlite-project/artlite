@@ -31,6 +31,7 @@ from models.readouts import Readouts
 from models.sequence import MEDIA, Sequence
 from models.server import ui
 from models.server.api import ModelInfo, Options, create_app
+from models.server.decisions import Decisions
 from models.server.engine import Engine, Job, ReasoningSplitter, StopMatcher
 
 VOCAB = 1024
@@ -304,12 +305,15 @@ def make(*, reasoning: tuple[str, str] | None = None, load: object = None, visio
     return model, npu, engine
 
 
-def app_of(engine: Engine, *, template: str = TEMPLATE, readouts: Readouts | None = None, **options: object
-           ) -> object:
+def app_of(engine: Engine, *, template: str = TEMPLATE, readouts: Readouts | None = None,
+           decisions: Decisions | None = None, **options: object) -> object:
+    """(``decisions``: the model is a decision model of that context)"""
     opts = {"alias": "fake", "n_ctx": 512, "sse_ping_interval": 0.05} | options
     return create_app(engine, Options(**opts), ModelInfo(path="/models/org/repo/fake.gguf", chat_template=template,
                                                          n_ctx_train=4096, n_vocab=VOCAB,
-                                                         readouts=readouts or Readouts()))
+                                                         readouts=readouts or Readouts(),
+                                                         decision=decisions.type if decisions else None,
+                                                         decisions=decisions))
 
 
 @pytest.fixture

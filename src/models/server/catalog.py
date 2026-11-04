@@ -46,7 +46,7 @@ from .main import ENV, MODEL, ROUTER, env_name
 
 log = logging.getLogger("artlite.server")
 
-VERSION = 1  # of the cache file
+VERSION = 2  # of the cache file (a header's fields)
 DRAFTERS = ("mtp-", "dspark-", "dflash-", "eagle3-")
 SPLIT = re.compile(r"-(\d{5})-of-\d{5}$")
 TAG = re.compile(r"[-.]([A-Za-z0-9_]+)$")
@@ -89,7 +89,8 @@ class Entry:
 
 def header(path: str) -> dict[str, Any]:
     """What the router reads of a GGUF file: its architecture; a vision encoder's projector type and width; a model's
-    context, sizes and file type, and the types of its matrices that have no tile format (``unsupported``)."""
+    context, sizes and file type, its decision type (``{arch}.decision.type``, or None) and the types of its matrices
+    that have no tile format (``unsupported``)."""
     from ..bench import file_type_name
 
     g = GGUFFile(path)
@@ -104,6 +105,7 @@ def header(path: str) -> dict[str, Any]:
             "n_params": sum(math.prod(dims) for dims, _, _, _ in tensors), "size": sum(n or 0 for _, _, _, n in tensors),
             "ftype": file_type_name(meta.get("general.file_type")),
             "size_label": str(meta.get("general.size_label", "")),
+            "decision": None if (t := meta.get(f"{arch}.decision.type")) is None else str(t),
             "unsupported": sorted({t for dims, t, _, _ in tensors if len(dims) >= 2 and t != "F32"
                                    and not has_tile_format(t)})}
 

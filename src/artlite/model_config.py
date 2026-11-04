@@ -87,6 +87,17 @@ def minicpmv_mmproj(compression: int = 16) -> str:
                         "mmproj-model-f16.gguf" if compression == 16 else "mmproj-model-f16-4x.gguf")
 
 
+DECISION_FILES = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
+                  "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
+                  "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf"}
+
+
+def decision_gguf(name: str = "d3-lite") -> str:
+    """A decision model's GGUF file (``{arch}.decision.*`` metadata: llama-server's ``/v1/systemone``): vllm-sr's d3-lite
+    and d3-nano (``qwen35``, non-causal: ggml-org's Q8_0), Kev-4B (``qwen35``: ggml-org's Q4_K_M)."""
+    return os.path.join(MODELS_DIR, DECISION_FILES[name])
+
+
 def assistant_of(model: str) -> str:
     """Where the multi-token-prediction drafter (``gemma4-assistant``) of a Gemma 4 model file is
     expected: ``mtp-<model file>`` next to it."""
@@ -305,7 +316,8 @@ class QwenConfig:
     pairs) on the first ``rope_dims`` dims only, in ``rope_sections`` of pairs whose positions differ for image
     embeddings only (M-RoPE: ``rope_section_order`` maps an image token's position components t, y, x, z to the
     sections, llama.cpp's "tyxz" or MiniCPM-V's "zyxt"). ``nextn_layers``: multi-token-prediction blocks after the
-    trunk's layers (Qwen3.8).
+    trunk's layers (Qwen3.8). ``causal`` False (``attention.causal``: vllm-d3's decision models): the full-attention
+    layers see the whole prompt (read in one pass), the GDN layers stay recurrent.
 
     A ``qwen35moe`` file (Qwen3.6-35B-A3B; ``src/models/qwen35moe.cpp``) has the same layers with an MoE FFN instead of
     the dense one (``intermediate_size`` 0): ``n_experts`` experts of width ``expert_ffn``, the ``n_experts_used``
@@ -337,6 +349,7 @@ class QwenConfig:
     n_experts_used: int = 0
     expert_ffn: int = 0
     shared_ffn: int = 0
+    causal: bool = True
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> QwenConfig:
@@ -387,6 +400,7 @@ class QwenConfig:
             n_experts_used=int(m("expert_used_count")) if moe else 0,
             expert_ffn=int(m("expert_feed_forward_length")) if moe else 0,
             shared_ffn=int(m("expert_shared_feed_forward_length")) if moe else 0,
+            causal=bool(m("attention.causal", True)),
         )
 
     @property

@@ -4,7 +4,7 @@ model's prefill plans them, with random bfp16 activations, against the dequantiz
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
 Q4_1 (planar at 1024 columns; Gemma's at 512), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
-file), Q8_0 (super-block units, Occamy's GDN z), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums). The GEMMs
+file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums). The GEMMs
 run in a library program as the prefill's do, paced (``gemm_q``'s "Pacing") at level 0 and at ``LEVEL``, and as unpaced
 twins: their outputs bit-identical."""
 
@@ -17,7 +17,7 @@ import torch
 import artlite
 from artlite.gemm.gemm_q import PACE, pace_word
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf
+from artlite.model_config import decision_gguf, gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.operators.fused import Library
@@ -62,7 +62,10 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 1024),
          ("occamy", "", "", (0, 3), 0, "gdn_in", 256), ("occamy", "", "", (0, 3), 0, "gdn_in", 64),
          ("occamy", "", "", (0, 3), 0, "gdn_out", 256), ("occamy", "", "", (0, 3), 3, "attn_in", 256),
-         ("occamy", "", "", (0, 3), 3, "attn_out", 64)]
+         ("occamy", "", "", (0, 3), 3, "attn_out", 64),
+         ("d3-lite", "", "", (0, 3), 0, "gdn_in", 256), ("d3-lite", "", "", (0, 3), 0, "gate_up", 256),
+         ("d3-lite", "", "", (0, 3), 0, "gate_up", 64), ("d3-lite", "", "", (0, 3), 0, "down", 256),
+         ("d3-lite", "", "", (0, 3), 3, "attn_in", 64), ("d3-lite", "", "", (0, 3), 3, "attn_out", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -70,7 +73,7 @@ _images: dict[tuple, tuple] = {}
 def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[GGUFFile, object, np.ndarray]:
     """The model's image of the layers (a truncated vocabulary), packed."""
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
-            "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf}[model]()
+            "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf}[model]()
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     key = (path, layers)
@@ -79,7 +82,7 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
         g = GGUFFile(path)
         if model == "llama":
             from models.llama.image import LlamaImage as Image
-        elif model in ("qwen35", "occamy"):
+        elif model in ("qwen35", "occamy", "d3-lite"):
             from models.qwen35.image import QwenImage as Image
         else:
             from models.gemma4.image import GemmaImage as Image
