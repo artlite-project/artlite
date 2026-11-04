@@ -406,6 +406,12 @@ class QwenPrefill(ChunkPrefill):
         cvl[self._cv_dst] = dev.view("GHDR").view(np.uint16)[self._cv_src]
         dev.flush("CVL", 0, 2 * (int(self._cv_dst.max()) + 1))
 
+    def _conv_zero(self) -> None:
+        """CVL's conv-state rows zero (a chunk at position 0)."""
+        dev = self.ov.dev
+        dev.view("CVL").view(np.uint16)[self._cv_dst] = 0
+        dev.flush("CVL", 0, 2 * (int(self._cv_dst.max()) + 1))
+
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
@@ -457,8 +463,12 @@ class QwenPrefill(ChunkPrefill):
             pm = dev.view("PM").view(np.float32)
             pm[:T] = np.arange(T) < n
             dev.flush("PM", 0, 4 * T)
-            self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
-            self._conv_states()
+            if p0 == 0:  # (a sequence's first chunk: no conv history)
+                self.ov.conv_fresh()
+                self._conv_zero()
+            else:
+                self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
+                self._conv_states()
         if self.dp is not None:
             self.dp.before(dev, p0)
         if self.fp is not None:

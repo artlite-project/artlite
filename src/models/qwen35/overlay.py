@@ -1026,6 +1026,16 @@ class QwenOverlay(ModelOverlay):
         self._conv_in_ghdr = True
         self._branch = -1  # (a prompt chunk in between: the next step writes the M_BRANCH words)
 
+    def conv_fresh(self) -> None:
+        """Before a sequence's first prompt chunk (at position 0: no conv history, its zero rows the chunk's own,
+        ``QwenPrefill._conv_zero``): GHDR's conv states count as current (the chunk's GdnOut writes them) without
+        ``conv_for_prefill``'s copy (its fetch of GOBJ: ~0.8 ms on MiniCPM-V)."""
+        if self.gsh is None:
+            return
+        assert self.nrep == 0, "a prefill after a lazy step: commit its accepted tokens first"
+        self._conv_in_ghdr = True
+        self._branch = -1
+
     def _conv_for_decode(self) -> None:
         """Before a decode step after a prefill: GHDR's conv states into the conv objects' base rows."""
         if not self._conv_in_ghdr:
