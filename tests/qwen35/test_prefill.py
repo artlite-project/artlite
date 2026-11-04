@@ -17,8 +17,9 @@ from ..common import essay
 from . import ref
 
 
-@pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("occamy", 7)],
-                         ids=["9B", "27B", "1B", "35B-A3B", "occamy", "occamy-7"])
+@pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("occamy", 7),
+                                         ("kev", 0)],
+                         ids=["9B", "27B", "1B", "35B-A3B", "occamy", "occamy-7", "kev"])
 def test_prefill_slice(size: str, La: int) -> None:
     """(La: the slice's attention layer, its last; 0: the one in the middle)"""
     from models.qwen35.overlay import QwenOverlay

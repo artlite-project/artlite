@@ -108,6 +108,9 @@ class QwenPrefill(ChunkPrefill):
         self.pitch = {name: PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att))
                       if ls}
         self.d_pitch = PG.d_pitch(img, SUB)
+        # the norms' panel rows: the hidden size padded to whole K chunks (the padding columns never written: zero)
+        self.kh = -(-cfg.hidden_size // img.kc) * img.kc
+        self._out_pitch = self.kh if self.kh != cfg.hidden_size else 0
         # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the items that start its pieces: the shared
         # expert's, the gathered norm's, the expert GEMMs'))
         self.moe = MoEPrefill(img, layers=self.layers, sizes=self.sizes, sub=SUB, eps=cfg.rms_norm_eps) \
@@ -162,7 +165,7 @@ class QwenPrefill(ChunkPrefill):
             return plan
 
         plans = {(L, name): plan(L, name) for L in self.layers for name in self._phases(L)}
-        eps = cfg.rms_norm_eps
+        eps, out = cfg.rms_norm_eps, self._out_pitch
         dp = dpt if dpt != H // COLS else 0
         # (an output projection in P K parts: per sub-chunk [part 0 C | part 1 C | ..], slots of the largest part's C;
         # one norm adds them, per P)
@@ -170,10 +173,10 @@ class QwenPrefill(ChunkPrefill):
         f_part = max(arg_bytes(op, 2) for op in parted) if parted else 0
         return SimpleNamespace(
             plans=plans, d_pitch=dpt, f_part=f_part, rb_y=2 * COLS * dpt,
-            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps),
-            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp),
-            pnm=PrefillNormOperator(T=t, E=H, eps=eps) if dp else None,  # (an MoE layer's delta: rows of H)
-            pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2)
+            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out),
+            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, out_pitch=out),
+            pnm=PrefillNormOperator(T=t, E=H, eps=eps, out_pitch=out) if dp else None,  # (an MoE layer's delta: rows of H)
+            pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2, out_pitch=out)
                  for P in sorted({p.parts for p in plans.values() if p.parts > 1})})
 
     def _phases(self, L: int) -> tuple[str, ...]:
@@ -203,7 +206,7 @@ class QwenPrefill(ChunkPrefill):
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
         cfg, H = self.cfg, self.H
-        self.rb = {"PX": 2 * H, "PXN": 9 * H // 8, "Y": 2 * COLS * self.d_pitch, "F": 2 * COLS * self.d_pitch, "PM": 4}
+        self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "Y": 2 * COLS * self.d_pitch, "F": 2 * COLS * self.d_pitch, "PM": 4}
         if self.moe:
             self.rb |= self.moe.rows()
         else:  # (down's K: the ffn padded to whole K chunks)

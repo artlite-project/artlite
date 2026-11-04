@@ -174,6 +174,7 @@ class QwenOverlay(ModelOverlay):
     text after it: ``models.qwen35``), again after ``reset``."""
 
     CONFIG, IMAGE = QwenConfig, QwenImage
+    NORMED = frozenset(NORMS)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),

@@ -118,6 +118,9 @@ class ModelOverlay:
     # (the next step's position patched into a second transaction while a step runs: ``_run``; the model's
     # ``_set_position`` takes ``ahead`` and its transactions their buffer, ``_transaction``)
     AHEAD: ClassVar[bool] = False
+    # the phases whose input the helper norms (a hidden size of part of a K chunk: their inputs' padding k kept zero,
+    # ``_clear_pads``)
+    NORMED: ClassVar[frozenset[str]] = frozenset()
     rings = (0, 0)  # (byte offset, bytes) in KV of the attention layers' rings (``vring``), set by ``_plan``
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None,
@@ -145,6 +148,8 @@ class ModelOverlay:
         self._last_s = 1
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
+        self._pads: list[tuple[int, int, int]] | None = None  # (``_clear_pads``)
+        self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
 
     @property
     def SLOTS(self) -> int:
@@ -427,11 +432,30 @@ class ModelOverlay:
         x = torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
         return x[:, :min(self.vocab, self.cfg.vocab_size)]
 
+    def _clear_pads(self, sp: int) -> None:
+        """Before a step whose inputs are laid out for sp slots: zero the padding k of the normed phases' inputs
+        (``NORMED``: the input regions whose K, whole chunks of zero-padded weights, runs past the hidden size; the
+        helper's norm squares every input element) if a step of more slots wrote there since (the layout's padding
+        bytes [2 sp H, 2 sp K) of a region's x); then the layouts of fewer slots than sp are the dirty ones."""
+        if self._pads is None:
+            self._pads = [(rg.off, max(self.H - rg.k0, 0), rg.K) for (L, name), regs in self.inp.items()
+                          if name in self.NORMED for rg in regs if rg.k0 + rg.K > self.H]
+        if not self._pads:
+            return
+        if sp in self._dirty:
+            act = self.dev.view("ACT")
+            for off, lo, K in self._pads:
+                a, b = off + XB + 2 * sp * lo, off + XB + 2 * sp * K
+                act[a:b] = 0
+                self.dev.flush("ACT", a, b - a)
+        self._dirty = (self._dirty - {sp}) | {self._sp(s) for s in range(1, self.SLOTS + 1) if self._sp(s) < sp}
+
     def _run(self, S: int, position: int, logits: bool) -> torch.Tensor | None:
         """Dispatch the step of S slots at ``position`` (its inputs written): its transaction (built at its first use),
         patched (or patched ahead, while the previous step ran: ``AHEAD``); then, while it runs, the next step's (S slots
         at position + S, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or
         None."""
+        self._clear_pads(self._sp(S))
         subs = self.subs(position, S)
         key = (S, logits, self._variant(), subs)
         if self._ahead is not None and self._ahead[0] == (key, position, self._ring_state()):
@@ -470,6 +494,7 @@ class ModelOverlay:
             self._lm_phase(seq)
             seq.sync(fills=True)
             self._tr_lm = Transaction(self.dev, seq.words())
+        self._clear_pads(self._sp(1))
         self._write_input(rg, interleave(x.reshape(1, -1).float().numpy(), self._sp(1)).view(np.uint8).reshape(-1))
         self.ready()
         self.dev.dispatch(self._tr_lm)

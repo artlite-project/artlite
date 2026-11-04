@@ -178,9 +178,8 @@ curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '
 The decision types artlite-server reads: vllm-d3, pplx-decider, openjev, lev, nimble (the logits of the options' label
 tokens), kev (its head's products of the last token's and each option's rows) and vllm-decision2 (a joint head over the
 rows at the ends of the options and of the question), computed on the host from the prompt's output rows. Of the
-published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0) and Decision-2.0-Kai-0.6B (llama.cpp's converter run on
-vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run; Kev-4B does not yet (a hidden width of 2560:
-[Models](models/README.md)). A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
+published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M) and Decision-2.0-Kai-0.6B
+(llama.cpp's converter run on vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
 at most 2048 tokens (a longer prompt: 400), and it generates no text; other types' questions share the state's tokens
 through the prompt cache. Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
 answer 501.

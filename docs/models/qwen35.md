@@ -5,8 +5,8 @@ through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (lla
 DeltaNet layers with a full-attention layer every fourth), and Qwen3.6-35B-A3B (`qwen35moe`: the same layers with a
 mixture of experts as the FFN: [below](#mixture-of-experts-qwen36-35b-a3b)), also as Occamy 1.0 (Accio-Lab's fine-tune
 of it for agentic tool use, abliterated by IsValorum, in a 3-bit quantization: 15.8 GB instead of 21 GB), and the
-decision models vllm-sr d3-lite and d3-nano ([below](#decision-models-vllm-d3)). The architecture, tokenizer and chat
-template are read from the file's metadata.
+decision models vllm-sr d3-lite, d3-nano and Kev-4B ([below](#decision-models-vllm-d3-kev)). The architecture,
+tokenizer and chat template are read from the file's metadata.
 Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
 the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100,
 repetition penalty 1.03).
@@ -27,6 +27,7 @@ $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf         
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf         (the same, 4x: finer detail)
 $ARTLITE_MODELS_DIR/ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf              (decision models: artlite-server)
 $ARTLITE_MODELS_DIR/ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf
+$ARTLITE_MODELS_DIR/ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf
 ```
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
@@ -65,7 +66,7 @@ Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qw
 Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.97 GB (the
 35B-A3B, 0.66 GB of them its experts' inputs and outputs).
 
-## Decision models (vllm-d3)
+## Decision models (vllm-d3, kev)
 
 vllm-sr's d3-lite (Qwen3.5-0.8B's shapes) and d3-nano (2B) answer questions about a state with the logits of the
 options' label tokens at a prompt's last token ([artlite-server's `/v1/systemone`](../server.md#decisions); no text
@@ -77,6 +78,13 @@ are llama.cpp's (CPU) on 318-319 and their accuracy the same, the probabilities 
 prefill's bfp16 GEMMs; llama.cpp's own CPU and Vulkan builds are 0.02 apart); a question takes 47 ms at 99 tokens,
 54 ms at 256 and 136 ms at 1024 through the server (d3-lite; the iGPU with llama.cpp's Vulkan build: 24 / 39 / 170 ms,
 at about 4x the energy above idle).
+
+Kev-4B (Qwen3.5-4B's shapes, causal) answers with its classifier head (`cls.output`) on the rows at the options' end
+tokens and at the question's last token. Its hidden size, 2560, is not a whole number of K chunks: the projections that
+read the residual stream take K chunks padded with zero weights (the image is 3.6 GB for the 2.8 GB file). On the same
+320 questions its choices are llama.cpp's on 317-319 and its accuracy the same (median |dp| 0.004); a question takes 109 ms
+at 28 tokens, 147 at 184 and 477 at 952 through the server (the iGPU: 49 / 143 / 732 ms), at 2.3-3.4x less energy above
+idle.
 
 ## Mixture of experts (Qwen3.6-35B-A3B)
 

@@ -45,6 +45,7 @@ from artlite.model_config import (  # (tests import them from here)
     LLAMA_CPP_DIR,
     DFlashConfig,
     QwenConfig,
+    decision_gguf,
     occamy_gguf,
     qwen_gguf,
 )
@@ -60,9 +61,10 @@ DUMP_SRC = os.path.join(HERE, "dump.cpp")
 
 
 def size_gguf(size: str) -> str:
-    """The file a test runs for a size: lmstudio's Q4_K_M of it (``qwen_gguf``), or "occamy": Occamy 1.0 APEX
-    (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0 and F32 tensors)."""
-    return occamy_gguf() if size == "occamy" else qwen_gguf("Q4_K_M", size)
+    """The file a test runs for a size: lmstudio's Q4_K_M of it (``qwen_gguf``), "occamy": Occamy 1.0 APEX
+    (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0 and F32 tensors), or "kev": Kev-4B
+    (``decision_gguf``: a hidden size of 2560, part of a K chunk; Q8_0 and Q4_K tensors)."""
+    return occamy_gguf() if size == "occamy" else decision_gguf("kev") if size == "kev" else qwen_gguf("Q4_K_M", size)
 
 
 # ----------------------------------------------------------------------

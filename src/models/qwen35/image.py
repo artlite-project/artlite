@@ -47,7 +47,9 @@ tiles, data region "<name>_norm") when every region's decode K groups are whole 
 (``contiguous``: the 9B, MiniCPM-V), so that a decode step streams a column's weights between two attentions as one run;
 else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its down's 17 chunk-major in groups of 5).
 
-down's K is the ffn padded to whole K chunks (MiniCPM-V's 3584 -> 4096: zero super-blocks, ``decode.image``). The
+down's K is the ffn padded to whole K chunks (MiniCPM-V's 3584 -> 4096: zero super-blocks, ``decode.image``), and so
+is the hidden size of the phases that read it where it is part of a chunk (Kev-4B's 2560 -> 3072: the overlay keeps those
+inputs' padding zero, ``ModelOverlay._clear_pads``; the prefill's norms write rows of the padded K). The
 activation objects' payload (``payload``: the K groups) is the hidden state rounded up to whole 4 KB state panels of the
 GDN cores, at least 4096 elements (27B 6144, 9B and MiniCPM-V 4096): down takes its K chunks in groups (27B 1 of 17, 9B
 4 of 12, MiniCPM-V 4 of 4); an MoE model's is the hidden state's (Qwen3.6-35B-A3B 2048: gdn_out and attn_out in groups
@@ -128,7 +130,7 @@ class QwenImage(TileImage):
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab)
-        assert H % KC == 0 and H % (8 * COLS) == 0 and I % (64 * COLS) == 0
+        assert H % (64 * COLS) == 0 and I % (64 * COLS) == 0
         assert not cfg.moe or (cfg.n_experts % COLS == 0 and cfg.shared_ffn % (64 * COLS) == 0
                                and KC % cfg.shared_ffn == 0 and KC % (cfg.expert_ffn // 2) == 0
                                and cfg.expert_ffn % 128 == 0)

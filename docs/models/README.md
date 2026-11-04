@@ -27,7 +27,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter | vision |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
 | | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0 | images (their Qwen3-VL encoder) |
-| | 🤔 Kev-4B (decision model) | | ggml-org Q4_K_M (a hidden width of 2560) |
+| | ✅ Kev-4B (decision model: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q4_K_M | |
 | qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0) | vision |
 | | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M) | vision |
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
