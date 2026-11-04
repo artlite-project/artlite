@@ -51,11 +51,13 @@ ms, a 430-token passage's in 62 ms, batches of 8 passages 7.1K tokens/s; Qwen3-E
 tokens/s; Qwen3-Reranker-0.6B Q8_0 16.3 pairs/s of ~510 tokens; Decision-2.0-Kai-0.6B 37-44 ms per question of 90-190
 tokens.
 
-Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (4B: 0.995-0.999; its CPU and
-Vulkan builds: 0.9995, 0.997), the same share of target passages among the 30 test queries' top 10 (72%; 4B 73%, CPU
-74%); the rerank scores within 0.15, the
-target passage first as often (93%); Kai's answers 313 of 320 the same, probabilities within 0.04, accuracy on four
-classification sets within one question of 50. The prefill's GEMMs take bfp16 weights and activations (8-bit
-mantissas per block of 8), so a row is within ~0.15% of the CPU's where llama.cpp's own builds differ by 0.05%.
+Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (4B: 0.994-0.999; its CPU and
+Vulkan builds: 0.9995, 0.997; an exact fp32 model of the 0.6B file: 0.999 on its most sensitive texts, llama.cpp's own
+8-bit activations), the same share of target passages among the 30 test queries' top 10 (72%; 4B 73%, CPU 74%); the
+rerank scores within 0.18 (logits within 1.2), the target passage first as often (93%); Kai's answers 314 of 320 the
+same, probabilities within 0.07 (median 0.006), accuracy on four classification sets within one question of 50. The
+prefill's GEMMs take bfp16 weights and activations (8-bit mantissas per block of 8), so a row is within ~0.15% of the
+CPU's where llama.cpp's own builds differ by 0.05%; these models' attention takes its softmax weights as two blocks
+each (hi + lo: its error is then its output's own rounding).
 
 NPU code: `src/models/llama/` (the model object `Qwen3`: `qwen3.py`).
