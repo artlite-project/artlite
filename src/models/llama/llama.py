@@ -37,7 +37,7 @@ from .tokenizer import BOS, chat_prompt, load_tokenizer
 
 
 class NpuLlama(OverlayModel):
-    """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("single",
+    """The model on the NPU (Llama 3.x, or Qwen3: ``qwen3.Qwen3`` loads it). ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("single",
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``
     (default ``prefill.SIZES``); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
 

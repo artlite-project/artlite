@@ -1,13 +1,16 @@
 """llama-server's readout routes (llama.cpp 7182ef71e's shapes and messages): embeddings (``/v1/embeddings``,
 OpenAI's; ``/embeddings``, ``/embedding``, llama-server's own) and rerank (``/rerank``, ``/reranking``,
 ``/v1/rerank``, ``/v1/reranking``: Jina's and TEI's shapes), with OpenAI's ``dimensions`` and Cohere's
-``return_documents``. Each request's inputs run on the worker one after another (``Engine.readouts``: prefill chunks
-only, after what the prompt cache keeps), their rows pooled and scored on the host (``models.readouts``). Like
-llama-server's, the routes need ``--embedding`` (rerank: ``--rerank``, a model file with a classifier head) and
-answer 501 otherwise."""
+``return_documents``; vLLM's ``/classify``: a classifier head's label probabilities per input.
+Each request's inputs run on the worker one after another (``Engine.readouts``: prefill chunks only, after what the
+prompt cache keeps), their rows pooled and scored on the host (``models.readouts``). Like llama-server's, the routes
+need ``--embedding`` (rerank and classify: ``--rerank``, a model file with a classifier head) and answer 501
+otherwise."""
 
 import asyncio
 import base64
+import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -149,3 +152,29 @@ def add_routes(api: APIRouter, *, engine: Engine, alias: str, embedding: bool, p
 
     for path in ("/rerank", "/reranking", "/v1/rerank", "/v1/reranking"):
         api.add_api_route(path, rerank, methods=["POST"])
+
+    async def classify(body: dict[str, Any]) -> Any:
+        """vLLM's classification: per input (a text or token ids) its label probabilities, the most likely label."""
+        if not embedding or pooling != "rank" or readouts.head is None:
+            raise unsupported("This server does not support classification. Start it with `--reranking` on a model "
+                              "file with a classifier head (cls.output)")
+        prompt = body.get("input")
+        items = prompt if isinstance(prompt, list) and not (prompt and all(isinstance(t, int) for t in prompt)) \
+            else [prompt]
+        if prompt is None or not items:
+            raise bad("\"input\" must be a non-empty string, array of strings or of token ids")
+        inputs = await run_in_threadpool(lambda: [embedding_ids(p) for p in items])
+        if not all(inputs):
+            raise bad("Input content cannot be empty")
+        out = await rows(inputs, [rows_of("rank", len(ids)) for ids in inputs], "classify")
+        data = []
+        for i, r in enumerate(out):
+            p = readouts.head.probs(r[0])
+            data.append({"index": i, "label": readouts.head.label(int(p.argmax())), "probs": p.tolist(),
+                         "num_classes": len(p)})
+        n = sum(map(len, inputs))
+        return {"id": f"classify-{uuid.uuid4().hex}", "object": "list", "created": int(time.time()),
+                "model": body.get("model") or alias, "data": data,
+                "usage": {"prompt_tokens": n, "total_tokens": n, "completion_tokens": 0, "prompt_tokens_details": None}}
+
+    api.add_api_route("/classify", classify, methods=["POST"])

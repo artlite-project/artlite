@@ -100,7 +100,11 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - Gemma's rules: the residual in fp32; scales of a whole vector (1 / rms) as bf16 hi + lo; Q, K and P as bfp16
   hi + lo panels in the attention (a single bfp16 P doubled the cache error); V and the GEMM inputs as single bfp16.
   Llama meets its gates with less: a bf16 residual (`PrefillNormOperator`, the deltas summed in fp32 and rounded once:
-  half the norms' bytes) and single bfp16 Q, K and P panels.
+  half the norms' bytes) and single bfp16 Q, K and P panels. Per-dim q / k norm weights (Qwen3's reach ~100: a block's
+  dims ~1e5 apart) need hi + lo Q and K (`prefill.attn.Shape.qp`, `kv_k` hilo: Qwen3 0.6B's chat KL 0.0053 -> 0.0037).
+- The GEMMs' floor is their 8-bit operands: weights dequantized into bfp16 blocks (Q8_0's bf16(d) q needs ~15 bits)
+  and bfp16 activations, ~0.15% of a row after 28 layers (a CPU model with those roundings matches the NPU's error);
+  llama.cpp's CPU and Vulkan builds differ by ~0.05%. Embeddings and decision probabilities show it, the tokens rarely.
 - Judge a precision change on KL means over several sequences (Llama: three chat prompts, three essay windows): one
   or two prompts move by ~30% with small rounding changes. With a drafter, also on its gate (Gates 5): a prompt's
   tokens per round move by up to ~2% between equivalent paths, the set's mean by up to ~0.6%.

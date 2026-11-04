@@ -305,7 +305,7 @@ WALKS = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML, "<tool_call>
 
 def tokenizer_of(family: str, path: str) -> object:
     if family == "qwen":
-        from models.qwen35.tokenizer import QwenTokenizer
+        from models.tokenizer import QwenTokenizer
         return QwenTokenizer(GGUFFile(path))
     if family == "gemma":
         from models.gemma4.tokenizer import GemmaTokenizer
@@ -412,7 +412,7 @@ def test_model_templates(family: str) -> None:
         assert text.endswith("Checking.<turn|>\n<|turn>model\n")
         assert chat_prompt(g, msgs[:1], tools=fns).endswith("<|turn>user\nTime in Oslo?<turn|>\n<|turn>model\n")
     else:
-        from models.qwen35.tokenizer import chat_prompt
+        from models.tokenizer import chat_prompt
         text = chat_prompt(g, msgs, tools=fns)
         assert "<tool_call>\n<function=get_time>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>" in text
         assert '"name": "get_time"' in text

@@ -1,9 +1,9 @@
 """A prompt's output rows (``NpuModel.outputs``: the last layer's, output-normed) turned on the host into what
 llama.cpp's embedding and rerank APIs return: a pooling of them (llama.cpp's ``--pooling``: none, mean, cls, last,
 rank), the embeddings' normalizations (``embd_normalize``), a reranker's score through its classifier head
-(``cls.output``), and the prompts both take (``Readouts``: what a model file's metadata gives them). One request's
-rows are a few thousand values: numpy, no NPU dispatch (an LM-head-sized one would cost milliseconds for microseconds of
-host work)."""
+(``cls.output``) and a classifier's label probabilities (vLLM's ``/classify``: ``classifier.output_labels``), and the
+prompts they take (``Readouts``: what a model file's metadata gives them). One request's rows are a few thousand
+values: numpy, no NPU dispatch (an LM-head-sized one would cost milliseconds for microseconds of host work)."""
 
 import re
 from collections.abc import Callable, Mapping
@@ -55,18 +55,33 @@ def normalize(x: np.ndarray, p: int) -> np.ndarray:
 class RankHead:
     """A reranker's classifier head on the last row (llama.cpp's rank pooling on a causal model): ``w`` (labels,
     hidden) and ``b`` (labels,) of ``cls.output``, then a softmax over the labels (Qwen3's rerankers: [yes, no]); the
-    score is the first output."""
+    score is the first output. ``labels``: the outputs' names (``classifier.output_labels``; else their indices)."""
 
     w: np.ndarray
     b: np.ndarray | None
     softmax: bool
+    labels: tuple[str, ...] = ()
+
+    def logits(self, h: np.ndarray) -> np.ndarray:
+        return self.w.astype(np.float64) @ np.asarray(h, np.float64) + (0.0 if self.b is None else self.b)
 
     def score(self, h: np.ndarray) -> float:
-        z = self.w.astype(np.float64) @ np.asarray(h, np.float64) + (0.0 if self.b is None else self.b)
+        z = self.logits(h)
         if self.softmax:
             z = np.exp(z - z.max())
             z /= z.sum()
         return float(z[0])
+
+    def probs(self, h: np.ndarray) -> np.ndarray:
+        """The labels' probabilities (vLLM's classification: a softmax, a sigmoid of a single output)."""
+        z = self.logits(h)
+        if len(z) == 1:
+            return 1 / (1 + np.exp(-z))
+        z = np.exp(z - z.max())
+        return z / z.sum()
+
+    def label(self, i: int) -> str:
+        return self.labels[i] if i < len(self.labels) else str(i)
 
 
 def _rows(g: GGUFFile, name: str) -> np.ndarray:
@@ -97,9 +112,11 @@ class Readouts:
         if "cls.output.weight" in g:
             if "cls.weight" in g:
                 raise NotImplementedError(f"{path}: a classifier head with a dense layer before cls.output (BERT's)")
+            key = f"{arch}.classifier.output_labels"
             head = RankHead(_rows(g, "cls.output.weight"),
                             _rows(g, "cls.output.bias").reshape(-1) if "cls.output.bias" in g else None,
-                            softmax=arch in ("qwen3", "qwen3vl"))
+                            softmax=arch in ("qwen3", "qwen3vl"),
+                            labels=tuple(g.strings(key)) if g.has_strings(key) else ())
         sep = m.get("tokenizer.ggml.seperator_token_id", m.get("tokenizer.ggml.separator_token_id"))
         eos = m.get("tokenizer.ggml.eos_token_id", sep)
         return cls(pooling=pooling_of(m, arch), head=head,

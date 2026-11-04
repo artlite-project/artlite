@@ -3,7 +3,9 @@ question's prompt through ``NpuModel.outputs`` (one chunk from position 0), its 
 label rows times llama.cpp's last row of the same prompt (``qwen35/dump.cpp``'s ``result_norm``: the whole prompt in
 one graph, the file's non-causal attention), the answers' probabilities within 0.03 and the same choices. llama.cpp's
 CPU and Vulkan builds are 0.019 apart at most on 320 such questions, the NPU 0.087 (median 0.003): the prefill's bfp16
-GEMMs, ~3% of each layer's own output."""
+GEMMs, ~3% of each layer's own output. vllm-decision2's Decision-2.0-Kai-0.6B (qwen3 on the Llama path, its joint head on
+the host) against the fp32 CPU model's rows (``llama/cpu.py``) through the same head: within 0.05 (against llama-server's
+CPU answers on 320 questions: 0.040 at most, 313 of 320 choices the same)."""
 
 import os
 
@@ -52,3 +54,29 @@ def test_d3_lite() -> None:
             worst = max(worst, *(abs(pw[k] - pg[k]) for k in pw))
     print(f"max |dp| {worst:.4f}")
     assert worst < 0.03
+
+
+def test_kai() -> None:
+    from artlite.gguf_model import GGUFFile
+
+    from .llama.cpu import LlamaCpu
+
+    path = decision_gguf("kai")
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    model = open_model(path)
+    npu = model.load(capacity=4096)
+    d = Decisions.of(path, model.tokenizer.encode)
+    cpu = LlamaCpu(GGUFFile(path))
+    worst = 0.0
+    state = essay("apple.txt")[:1200]
+    qs = d.questions({"state": state, "questions": QUESTIONS})
+    for p in d.prompts(state, qs, model.tokenizer.encode):
+        q = qs[p.question]
+        npu.reset()
+        got = d.answer(q, [d.scores(q, npu.outputs(p.ids, p.rows))])
+        want = d.answer(q, [d.scores(q, cpu.outputs(p.ids, list(p.rows)).numpy())])  # (rows ascending: options, question)
+        pw, pg = (a.get("probabilities", {"true": a.get("noul")}) for a in (want, got))
+        worst = max(worst, *(abs(pw[k] - pg[k]) for k in pw))
+    print(f"max |dp| {worst:.4f}")
+    assert worst < 0.05

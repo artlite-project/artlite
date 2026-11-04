@@ -1,4 +1,4 @@
-"""artlite-server's readout routes (embeddings, rerank) and ``logprobs`` on the host, with the scripted fake model
+"""artlite-server's readout routes (embeddings, rerank, classify) and ``logprobs`` on the host, with the scripted fake model
 (``test_server``: its output rows are a function of the tokens up to each, ``fake_row``): shapes and errors as
 llama-server's, pooling and normalization against numpy, base64, OpenAI's ``dimensions``, rerank's order, ``top_n``
 and both formats, the prompt cache's prefix; the readout math of ``models.readouts``."""
@@ -15,7 +15,8 @@ from models.readouts import RankHead, Readouts, normalize, pool, pooling_of, row
 
 from .test_server import _stop_engines, app_of, chat, events, fake_row, make  # noqa: F401 (_stop_engines: autouse)
 
-HEAD = RankHead(np.stack([np.arange(8, dtype=np.float32) / 8, -np.arange(8, dtype=np.float32) / 8]), None, True)
+HEAD = RankHead(np.stack([np.arange(8, dtype=np.float32) / 8, -np.arange(8, dtype=np.float32) / 8]), None, True,
+                ("yes", "no"))
 
 
 def client_of(**options: object) -> Iterator[tuple[object, object, TestClient]]:
@@ -145,6 +146,26 @@ def test_rerank(rank: tuple) -> None:
     for body in ({"documents": docs}, {"query": "q", "documents": []}, {"query": "q", "documents": docs, "top_n": -1},
                  {"query": {"image": "x"}, "documents": docs}):
         assert client.post("/v1/reranking", json=body).status_code == 400, body
+
+
+def test_classify(rank: tuple) -> None:
+    """vLLM's /classify: per input the labels' softmax of the head's logits at its last token, the likeliest label."""
+    model, _npu, client = rank
+    texts = ["good movie", "bad plot and worse acting"]
+    r = client.post("/classify", json={"input": texts, "model": "m"})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["object"] == "list" and out["model"] == "m" and [d["index"] for d in out["data"]] == [0, 1]
+    for d, t in zip(out["data"], texts, strict=True):
+        ids = model.encode(t)
+        z = HEAD.w.astype(np.float64) @ fake_row(ids)
+        p = np.exp(z - z.max()) / np.exp(z - z.max()).sum()
+        assert np.allclose(d["probs"], p) and d["num_classes"] == 2 and d["label"] == ("yes", "no")[int(p.argmax())]
+    assert out["usage"]["prompt_tokens"] == sum(len(model.encode(t)) for t in texts)
+    assert client.post("/classify", json={"input": "one"}).json()["data"][0]["num_classes"] == 2
+    assert client.post("/classify", json={"input": []}).status_code == 400
+    for _model, _npu, plain in client_of(embedding=True, pooling="mean"):
+        assert plain.post("/classify", json={"input": "a"}).status_code == 501
 
 
 def test_no_readouts() -> None:

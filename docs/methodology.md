@@ -56,6 +56,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 
 | model | quant | file | sha256 | recorded |
 |---|---|---|---|---|
+| Qwen3 0.6B | Q4_1 | [unsloth/Qwen3-0.6B-GGUF](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q4_1.gguf) `Qwen3-0.6B-Q4_1.gguf` | `ddaf05402c66` | 2026-11-05 |
 | Llama 3.2 1B Instruct | Q4_0 | [unsloth/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct-Q4_0.gguf) `Llama-3.2-1B-Instruct-Q4_0.gguf` | `66bfbb2d48bd` | 2026-10-15 |
 | | Q4_1 | [unsloth/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct-Q4_1.gguf) `Llama-3.2-1B-Instruct-Q4_1.gguf` | `a8bfc798aceb` | 2026-10-15 |
 | | Q4_K_M | [unsloth/Llama-3.2-1B-Instruct-GGUF](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/blob/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf) `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | `3f5a22426976` | 2026-10-15 |
@@ -88,6 +89,7 @@ runs, with the toolchain pinned then:
 | 2026-10-24 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-10-25 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-10-29 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
+| 2026-11-05 | 1.4.6.dev3+g6a97402 | 22.0.0.2026102001+4f5df13d |
 
 ## FastFlowLM and OpenFlowLM
 

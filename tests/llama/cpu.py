@@ -1,6 +1,8 @@
-"""Llama on the CPU in fp32: the reference of the NPU path (tests/llama/test_npu.py), on a GGUF file's dequantized
-tensors (GGUF names; Q / K rows in rotate-half order, as ``LlamaImage`` lays them out: the same model). ``logits(seq,
-rows)`` runs the tokens from position 0 in chunks through a KV cache and returns the logits of the positions ``rows``."""
+"""Llama and Qwen3 on the CPU in fp32: the reference of the NPU path (tests/llama/test_npu.py), on a GGUF file's
+dequantized tensors (GGUF names; Q / K rows in rotate-half order, as ``LlamaImage`` lays them out: the same model;
+Qwen3's q / k RMS norms with their weights per dim). ``logits(seq, rows)`` runs the tokens from position 0 in chunks
+through a KV cache and returns the logits of the positions ``rows``; ``outputs(seq, rows)`` their output-normed last
+hidden rows (the readouts: embeddings, rerank, decisions)."""
 
 import torch
 
@@ -9,7 +11,7 @@ from artlite.model_config import LlamaConfig
 
 
 class LlamaCpu:
-    """A Llama GGUF file's model in fp32 (its weights dequantized at construction)."""
+    """A Llama / Qwen3 GGUF file's model in fp32 (its weights dequantized at construction)."""
 
     def __init__(self, gguf: GGUFFile):
         self.gguf = gguf
@@ -22,7 +24,10 @@ class LlamaCpu:
         self.emb = w("token_embd.weight")
         self.out = w("output.weight") if "output.weight" in gguf else self.emb
         self.norm = w("output_norm.weight").reshape(-1)
-        qi, ki = torch.from_numpy(unpermute_rows(nh, nh * hd)), torch.from_numpy(unpermute_rows(nkv, nkv * hd))
+        if cfg.neox:
+            qi, ki = torch.arange(nh * hd), torch.arange(nkv * hd)
+        else:
+            qi, ki = torch.from_numpy(unpermute_rows(nh, nh * hd)), torch.from_numpy(unpermute_rows(nkv, nkv * hd))
         self.layers = []
         for L in range(cfg.num_hidden_layers):
             b = f"blk.{L}."
@@ -31,6 +36,9 @@ class LlamaCpu:
                                 "o": w(b + "attn_output.weight"), "fn": w(b + "ffn_norm.weight").reshape(-1),
                                 "gu": torch.cat([w(b + "ffn_gate.weight"), w(b + "ffn_up.weight")]),
                                 "down": w(b + "ffn_down.weight")})
+            if cfg.qk_norm:
+                self.layers[-1] |= {"qn": w(b + "attn_q_norm.weight").reshape(-1),
+                                    "kn": w(b + "attn_k_norm.weight").reshape(-1)}
         self.inv = torch.from_numpy(cfg.rope_inv_freq())
 
     def _rms(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -47,6 +55,11 @@ class LlamaCpu:
     @torch.no_grad()
     def logits(self, seq: list[int], rows: slice, *, chunk: int = 1024) -> torch.Tensor:
         """The fp32 logits (n, vocab) of the positions ``rows`` of the tokens seq (from position 0)."""
+        return self.outputs(seq, rows, chunk=chunk) @ self.out.T
+
+    @torch.no_grad()
+    def outputs(self, seq: list[int], rows: slice | list[int], *, chunk: int = 1024) -> torch.Tensor:
+        """The fp32 output-normed last hidden rows (n, hidden) of the positions ``rows`` of the tokens seq."""
         cfg = self.cfg
         nh, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         P = len(seq)
@@ -64,6 +77,8 @@ class LlamaCpu:
                 y = self._rms(x, lw["an"]) @ lw["qkv"].T
                 q = y[:, :nh * hd].view(T, nh, hd).transpose(0, 1)
                 k = y[:, nh * hd:(nh + nkv) * hd].view(T, nkv, hd).transpose(0, 1)
+                if cfg.qk_norm:
+                    q, k = self._rms(q, lw["qn"]), self._rms(k, lw["kn"])
                 kc[L][:, p0:p0 + T] = self._rope(k, pos)
                 vc[L][:, p0:p0 + T] = y[:, (nh + nkv) * hd:].view(T, nkv, hd).transpose(0, 1)
                 o = torch.nn.functional.scaled_dot_product_attention(
@@ -74,5 +89,5 @@ class LlamaCpu:
                 x = x + (torch.nn.functional.silu(g) * u) @ lw["down"].T
             sel = want[p0:p0 + T]
             if sel.any():
-                out.append(self._rms(x[sel], self.norm) @ self.out.T)
+                out.append(self._rms(x[sel], self.norm))
         return torch.cat(out)

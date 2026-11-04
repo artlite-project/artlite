@@ -87,14 +87,29 @@ def minicpmv_mmproj(compression: int = 16) -> str:
                         "mmproj-model-f16.gguf" if compression == 16 else "mmproj-model-f16-4x.gguf")
 
 
+QWEN3_FILES = {"0.6B": "unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_1.gguf",
+               "embedding-0.6B": "Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
+               "embedding-4B": "Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf",
+               "reranker-0.6B": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"}
+
+
+def qwen3_gguf(name: str = "0.6B") -> str:
+    """A GGUF file of the ``qwen3`` architecture: Qwen3 0.6B (``"0.6B"``: unsloth's Q4_1), Qwen's Qwen3-Embedding 0.6B
+    (Q8_0) and 4B (Q4_K_M), ggml-org's Qwen3-Reranker-0.6B (Q8_0)."""
+    return os.path.join(MODELS_DIR, QWEN3_FILES[name])
+
+
 DECISION_FILES = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
-                  "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf"}
+                  "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",
+                  "kai": "vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf"}
 
 
 def decision_gguf(name: str = "d3-lite") -> str:
     """A decision model's GGUF file (``{arch}.decision.*`` metadata: llama-server's ``/v1/systemone``): vllm-sr's d3-lite
-    and d3-nano (``qwen35``, non-causal: ggml-org's Q8_0), Kev-4B (``qwen35``: ggml-org's Q4_K_M)."""
+    and d3-nano (``qwen35``, non-causal: ggml-org's Q8_0), Kev-4B (``qwen35``: ggml-org's Q4_K_M), Decision-2.0-Kai-0.6B
+    (``vllm-decision2``: Qwen3 0.6B and a head; llama.cpp's converter run on vllm-sr's checkpoint, whose own GGUF
+    is a fork's format, Q8_0)."""
     return os.path.join(MODELS_DIR, DECISION_FILES[name])
 
 
@@ -146,12 +161,16 @@ def sd15_dir() -> str:
 
 @dataclass(frozen=True)
 class LlamaConfig:
-    """Architecture of a Llama 3.x model, from the metadata of its GGUF file (llama.cpp's ``src/models/llama.cpp``).
+    """Architecture of a Llama 3.x or Qwen3 model, from the metadata of its GGUF file (llama.cpp's
+    ``src/models/llama.cpp``, ``qwen3.cpp``; ``vllm-decision2``: Qwen3 with a decision head).
 
     ``num_attention_heads`` query heads over ``num_key_value_heads`` KV heads of ``head_dim``; RoPE on every dim, pair
     i turning by p base^(-2 i / head_dim) / ``rope_freq_factors[i]``: llama.cpp's ``rope_freqs`` tensor, the llama3
     frequency scaling of Llama 3.1 / 3.2 (low frequencies stretched for the 128K context) that its converter computes
-    from the ``rope_scaling`` of the model's config.json."""
+    from the ``rope_scaling`` of the model's config.json. ``neox``: the pairs are dims (i, i + head_dim / 2) of the
+    file's Q / K rows (Qwen3); else llama.cpp's converter interleaved them (Llama: ``gguf_model.unpermute_rows``).
+    ``qk_norm``: q and k RMS-normed per head with a weight per dim (``attn_q_norm``, ``attn_k_norm``) before RoPE
+    (Qwen3)."""
 
     vocab_size: int
     hidden_size: int
@@ -165,13 +184,17 @@ class LlamaConfig:
     rope_freq_factors: tuple[float, ...] | None
     max_position_embeddings: int
     eos_token_ids: tuple[int, ...]
+    neox: bool = False
+    qk_norm: bool = False
 
-    EOG: ClassVar[tuple[str, ...]] = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>")  # (llama.cpp's end-of-generation)
+    ARCHS: ClassVar[tuple[str, ...]] = ("llama", "qwen3", "vllm-decision2")
+    # (llama.cpp's end-of-generation tokens: Llama 3's, Qwen3's)
+    EOG: ClassVar[tuple[str, ...]] = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>")
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> LlamaConfig:
         """From an ``artlite.gguf_model.GGUFFile``."""
-        assert gguf.arch == "llama", f"{gguf.path}: architecture {gguf.arch!r}, expected llama"
+        assert gguf.arch in cls.ARCHS, f"{gguf.path}: architecture {gguf.arch!r}, expected one of {cls.ARCHS}"
         m = gguf.arch_meta
         if m("rope.scaling.type", "none") != "none":
             raise NotImplementedError(f"{gguf.path}: RoPE scaling {m('rope.scaling.type')!r}")
@@ -179,7 +202,7 @@ class LlamaConfig:
         hd = int(m("attention.key_length", hidden // heads))
         assert int(m("rope.dimension_count", hd)) == hd and int(m("attention.value_length", hd)) == hd
         vocab = gguf.string_count("tokenizer.ggml.tokens")
-        tail = max(0, vocab - 256)  # (the special tokens)
+        tail = max(0, vocab - 512)  # (the special tokens: Qwen3's before 256 padding tokens)
         eos = [int(gguf.meta["tokenizer.ggml.eos_token_id"])]
         eos += [i for i, t in enumerate(gguf.strings("tokenizer.ggml.tokens", tail), tail) if t in cls.EOG]
         freqs = gguf.tensor("rope_freqs.weight").raw.reshape(-1) if "rope_freqs.weight" in gguf else None
@@ -196,6 +219,8 @@ class LlamaConfig:
             rope_freq_factors=None if freqs is None else tuple(float(x) for x in freqs),
             max_position_embeddings=int(m("context_length")),
             eos_token_ids=tuple(dict.fromkeys(eos)),
+            neox=gguf.arch != "llama",
+            qk_norm="blk.0.attn_q_norm.weight" in gguf,
         )
 
     @property

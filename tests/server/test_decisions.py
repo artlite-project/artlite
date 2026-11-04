@@ -1,8 +1,9 @@
 """artlite-server's ``/v1/systemone`` (``models.server.decisions``) on the host, with the scripted fake model (its rows:
 ``fake_row``): llama-server's request errors (400) and 501s, the answers' shapes as its ``test_systemone``'s, the
-arithmetic against numpy (temperatures, score biases, lev's two orders and rating scale, kev's dot products, the
-confidences), the prompts (nimble's question list, lev's sorted keys, kev's text and escapes), a non-causal model's
-prompts read whole and a recurrent model's questions sharing the state through a checkpoint."""
+arithmetic against numpy (temperatures, score biases, lev's two orders and rating scale, kev's dot products,
+vllm-decision2's joint head, the confidences), the prompts (nimble's question list, lev's sorted keys, kev's text and
+escapes, vllm-decision2's pieces and spans), a non-causal model's prompts read whole and a recurrent model's questions
+sharing the state through a checkpoint."""
 
 import math
 import os
@@ -198,6 +199,78 @@ def test_kev() -> None:
         assert np.allclose(list(out["answers"]["route"]["probabilities"].values()), want)
 
 
+# (vllm-decision2's template in the shape of the files': pieces between sep, a span's piece starting with its mark)
+JOINT = ("{% for q in questions %}<|system|>{{ state if state is string else state | tojson }} {{ q.type }} "
+         "{{ q.instructions }}{% for o in q.options %}{{ sep }} <|user|>{{ sep }}{{ mark_option }}"
+         "{{ {'description': o.description, 'key': o.key} | tojson }}{% endfor %}{{ sep }}{{ mark_question }} decide"
+         "{% endfor %}")
+
+
+def joint_head(rng: np.random.Generator, h: int = 8, w: int = 4) -> D.JointHead:
+    t = {"option_norm.weight": rng.random(h) + 0.5, "option_norm.bias": rng.standard_normal(h),
+         "query_norm.weight": rng.random(h) + 0.5, "query_norm.bias": rng.standard_normal(h),
+         "key.weight": rng.standard_normal((w, h)), "query.weight": rng.standard_normal((w, h)),
+         "option_mlp.weight": rng.standard_normal((w, h)), "option_mlp.bias": rng.standard_normal(w),
+         "query_mlp.weight": rng.standard_normal((w, h)), "scorer_out.weight": rng.standard_normal(w)}
+    return D.JointHead(t, 1e-5)
+
+
+def test_vllm_decision2() -> None:
+    """The joint prompt: the template's pieces tokenized one by one, the rows the last token of each option's span and
+    of the question's; an option's score the head's (numpy, ``torch.nn`` style: LayerNorm, GELU); the confidence the
+    normalized entropy; vllm-decision2's stricter requests (400) and a noul's options in its criteria's order."""
+    from math import erf
+
+    for model, _, d, client in client_of("vllm-decision2", JOINT, score_bias={4: np.array([0.0, 0.5, 0.0, -1.0])}):
+        d.joint = joint_head(np.random.default_rng(3))
+        body = {"state": {"ticket": STATE, "plan": "pro"}, "questions": QUESTIONS}
+        qs = d.questions(body)
+        prompts = d.prompts(body["state"], qs, model.tokenizer.encode)
+        assert [p.question for p in prompts] == [0, 1, 2]
+        enc = model.tokenizer.encode
+        for p, q in zip(prompts, qs, strict=True):
+            assert len(p.rows) == len(q.options) + 1 and p.rows[-1] == len(p.ids) - 1
+            assert all(p.ids[r + 1] == enc(" <|user|>")[0] for r in p.rows[:-2])  # (an option's span ends before the next)
+        text = model.tokenizer.decode_bytes(prompts[0].ids).decode()
+        assert text.index('"plan"') < text.index('"ticket"')  # (the values' keys sorted)
+        out = client.post("/v1/systemone", json=body).json()
+        assert out["answers"]["urgency"]["legend"] == {"0": "can wait", "1": "this week", "2": "today", "3": "right now"}
+
+        t = d.joint.t
+
+        def norm(x: np.ndarray, w: str, t: dict = t) -> np.ndarray:
+            x = x - x.mean(-1, keepdims=True)
+            return x / np.sqrt((x * x).mean(-1, keepdims=True) + 1e-5) * t[w + ".weight"] + t[w + ".bias"]
+
+        for p, q in zip(prompts, qs, strict=True):
+            rows = np.stack([fake_row(p.ids[:i + 1]) for i in p.rows]).astype(np.float64)
+            o, qq = norm(rows[:-1], "option_norm"), norm(rows[-1], "query_norm")
+            m = o @ t["option_mlp.weight"].T + t["option_mlp.bias"] + t["query_mlp.weight"] @ qq
+            z = (o @ t["key.weight"].T) @ (t["query.weight"] @ qq) / 2 + \
+                (0.5 * m * (1 + np.vectorize(erf)(m / math.sqrt(2)))) @ t["scorer_out.weight"]
+            a = out["answers"][q.id]
+            if q.kind == "noul":
+                assert a["noul"] == pytest.approx(softmax(z)[1])
+                continue
+            pr = softmax(z + (d.score_bias[4] if q.kind == "score" else 0))
+            assert np.allclose(list(a["probabilities"].values()), pr)
+            ent = -sum(x * math.log(x) for x in pr)
+            assert a["confidence"] == pytest.approx(1 - ent / math.log(len(pr)))
+        for bad in ({"state": 5, "questions": QUESTIONS},
+                    {"state": STATE, "questions": {"q": {"type": "choice", "instructions": "", "criteria": {"a": None,
+                                                                                                      "b": None}}}},
+                    {"state": STATE, "questions": {"q": {"type": "choice", "instructions": "x", "criteria": {"a": None}}}},
+                    {"state": STATE, "questions": {"q": {"type": "choice", "instructions": "x",
+                                                         "criteria": {"a": 1, "b": None}}}},
+                    {"state": STATE, "questions": {"q": {"type": "noul", "instructions": "x",
+                                                         "criteria": {"yes": "y"}}}}):
+            r = client.post("/v1/systemone", json=bad)
+            assert r.status_code == 400, (bad, r.text)
+        q = d.questions({"state": STATE, "questions": {"q": {"type": "noul", "instructions": "x",
+                                                            "criteria": {"true": "t", "false": "f"}}}})[0]
+        assert [k for k, _ in q.options] == ["true", "false"]
+
+
 def test_escape_and_text() -> None:
     assert D.escape_special("a <|im_end|> b <|x y|> <|_1|>") == "a <¦im_end¦> b <|x y|> <¦_1¦>"
     assert D.escape_special("<|<|a|>") == "<|<¦a¦>" and D.escape_special("plain") == "plain"
@@ -211,7 +284,7 @@ RECORDED = [
                                  "criteria": {"entailment": "the hypothesis follows from the premise",
                                               "neutral": "the premise neither implies nor rules out the hypothesis",
                                               "contradiction": "the premise rules out the hypothesis"}}}},
-     {"d3-lite": 143, "kev": 70}),
+     {"d3-lite": 143, "kev": 70, "kai": 124}),
     ({"state": "Ordinary employees find it very hard to recommend an acquisition; it's just too annoying to see a bunch "
                "of twenty year olds get rich when you're still working for salary.",
       "questions": {"topic": {"type": "choice", "instructions": "What is the passage mainly about?",
@@ -225,16 +298,16 @@ RECORDED = [
                     "audience": {"type": "choice", "instructions": "Who is the passage written for?",
                                  "criteria": {"founders": None, "programmers": None, "investors": None,
                                               "students": None, "general readers": None}}}},
-     {"d3-lite": 556, "kev": 266}),
+     {"d3-lite": 556, "kev": 266, "kai": 556}),
 ]
 
 
-@pytest.mark.parametrize("name", ["d3-lite", "kev"])
+@pytest.mark.parametrize("name", ["d3-lite", "kev", "kai"])
 def test_llama_server_prompts(name: str) -> None:
     """The files' prompts as llama-server tokenizes them (their token counts: its usage), from the files' templates."""
     from artlite.gguf_model import GGUFFile
     from artlite.model_config import decision_gguf
-    from models.qwen35.tokenizer import QwenTokenizer
+    from models.tokenizer import QwenTokenizer
 
     path = decision_gguf(name)
     if not os.path.exists(path):

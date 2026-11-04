@@ -2,9 +2,9 @@
 prefill/test_norm.py):
 
 - the attention (prefill/attn.py): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
-  at p0 after a cache the host filled, in both K formats and the three models' head layouts;
+  at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
-  logits.
+  logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-0.6B Q8_0: q / k norms, all-Q8_0 GEMMs).
 """
 
 import numpy as np
@@ -18,20 +18,25 @@ from artlite.prefill import attn as PA
 from artlite.prefill.gemm import Layout
 
 A_BYTES = 9280  # the cache objects (the Q4_K_M images' tile size)
-# (head_dim, query heads per KV head, K panels per record, chunk, its position)
-ATTN = [(64, 4, 1, 256, 0), (64, 4, 2, 256, 128), (64, 4, 1, 512, 384), (128, 3, 1, 256, 0), (128, 3, 2, 256, 64),
-        (128, 3, 1, 512, 192), (128, 4, 1, 256, 0), (128, 4, 2, 512, 128), (128, 3, 1, 1024, 64),
-        (64, 4, 1, 128, 128), (128, 3, 1, 64, 0), (128, 3, 2, 128, 192), (128, 4, 1, 64, 64)]  # (short chunks: 1 row)
+# (head_dim, query heads per KV head, K panels per record, chunk, its position, q / k norms with weights and Q hi + lo:
+# Qwen3)
+ATTN = [(64, 4, 1, 256, 0, False), (64, 4, 2, 256, 128, False), (64, 4, 1, 512, 384, False),
+        (128, 3, 1, 256, 0, False), (128, 3, 2, 256, 64, False), (128, 3, 1, 512, 192, False),
+        (128, 4, 1, 256, 0, False), (128, 4, 2, 512, 128, False), (128, 3, 1, 1024, 64, False),
+        (64, 4, 1, 128, 128, False), (128, 3, 1, 64, 0, False), (128, 3, 2, 128, 192, False),
+        (128, 4, 1, 64, 64, False),  # (short chunks: 1 row)
+        (128, 2, 2, 256, 0, True), (128, 2, 2, 512, 128, True), (128, 2, 1, 256, 64, True), (128, 2, 2, 64, 0, True),
+        (128, 2, 2, 1024, 64, True), (128, 4, 2, 256, 64, True)]
 
 
 def _rel(got: np.ndarray, want: np.ndarray) -> float:
     return float(np.linalg.norm(got - want) / np.linalg.norm(want))
 
 
-def _q_values(units: np.ndarray, hd: int) -> np.ndarray:
-    """Q units (..., 72 hd / 8) uint8 -> (..., 8 queries, hd) the values they hold."""
+def _q_values(units: np.ndarray, hd: int, qp: int = 1) -> np.ndarray:
+    """Q units (..., 72 hd / 8 qp) uint8 -> (..., 8 queries, hd) the values they hold (qp 2: hi + lo)."""
     lead = units.shape[:-1]
-    v = bfp16.block_values(units.reshape(*lead, hd // 8, 8, 9))  # [db][query][8]
+    v = bfp16.block_values(units.reshape(*lead, qp, hd // 8, 8, 9)).sum(-4)  # [db][query][8]
     return np.moveaxis(v, -3, -2).reshape(*lead, 8, hd)
 
 
@@ -40,25 +45,34 @@ def _layout(hd: int, qh: int) -> Layout:
     return Layout(-(-(qh + 2) * hd // 64) * 64, {"q": 0, "k": qh * hd, "v": (qh + 1) * hd})
 
 
-@pytest.mark.parametrize(("hd", "qh", "kp", "T", "p0"), ATTN, ids=[f"hd{a}-qh{b}-kp{c}-T{d}-p{e}" for a, b, c, d, e in ATTN])
-def test_attn(hd: int, qh: int, kp: int, T: int, p0: int) -> None:
+@pytest.mark.parametrize(("hd", "qh", "kp", "T", "p0", "norm"), ATTN,
+                         ids=[f"hd{a}-qh{b}-kp{c}-T{d}-p{e}{'-norm' if f else ''}" for a, b, c, d, e, f in ATTN])
+def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
     """The Q units and the K / V records against their fp64 model (K hi + lo within the panels' ~14 bits, Q and single
     K and V within bfp16), the output panels against the exact attention (causal) of the cores' own operands (their Q
-    units, the cache they read): within 1.5 x the error of the exact output rounded to bfp16 (P as single bfp16 panels)."""
-    shape = PA.Shape(hd, qh, kp, A_BYTES)
+    units, the cache they read): within 1.5 x the error of the exact output rounded to bfp16 (P as single bfp16 panels).
+    ``norm``: q and k RMS-normed per head with random weights per dim (Qwen3's: up to ~100) before RoPE, Q hi + lo
+    (within its ~14 bits)."""
+    shape = PA.Shape(hd, qh, kp, A_BYTES, 2 if norm else 1)
     max_pos = max(1024, p0 + T)
     n_groups = max_pos // shape.pg
     kvb = n_groups * shape.group
     lay = _layout(hd, qh)
-    prep = PA.PrepOperator(T=T, shape=shape, layout=lay, kv_bytes=kvb, cs_positions=max_pos)
+    prep = PA.PrepOperator(T=T, shape=shape, layout=lay, kv_bytes=kvb, cs_positions=max_pos, norm=norm)
     attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb)
-    fused = FusedOperator(name=f"pa_test{hd}_{qh}_{kp}", runlist=[(prep, "G", "CS", "QS", "KV"),
-                                                                  (attn, "QS", "KV", "A")],
-                          input_args=["G", "CS"], output_args=["A"]).compile()
+    fused = FusedOperator(name=f"pa_test{hd}_{qh}_{kp}{'_n' if norm else ''}",
+                          runlist=[(prep, "G", "CS", "QS", "KV", *(["NW"] if norm else [])), (attn, "QS", "KV", "A")],
+                          input_args=["G", "CS", *(["NW"] if norm else [])], output_args=["A"]).compile()
     gen = torch.Generator().manual_seed(p0 + hd + kp)
     inv = 500000.0 ** (-np.arange(0, hd, 2) / hd)
     cs = PA.cs_table(inv, max_pos)
     fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
+    wq = (torch.rand(hd, generator=gen) * 4 + 0.5).double()
+    wk = torch.exp(torch.randn(hd, generator=gen) * 1.5).double()  # (dims a thousand times apart)
+    if norm:
+        nw = np.zeros(PA.PrepOperator.nw_bytes(hd) // 4, np.float32)
+        nw[:2 * hd] = torch.cat([wq, wk]).numpy()
+        fused.get_buffer("NW").view(torch.uint8)[:] = torch.from_numpy(nw.view(np.uint8))
     kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(COLS, n_groups, shape.objects, A_BYTES)
     kv[:] = 0
     for c in range(COLS):  # (the cache before the chunk)
@@ -81,8 +95,10 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int) -> None:
     fused.sync_outputs()
     fused.sync_scratch_from_device()
 
-    def rope(x: torch.Tensor) -> np.ndarray:  # x (T, ..., hd) bf16 values rotated (fp64)
+    def rope(x: torch.Tensor, w: torch.Tensor | None = None) -> np.ndarray:  # x (T, ..., hd) bf16 values rotated (fp64)
         y = x.bfloat16().double().numpy().copy()
+        if norm:  # (RMS-normed, times the weights)
+            y = y / np.sqrt((y * y).mean(-1, keepdims=True) + 1e-6) * w.numpy()
         c_ = cs[p0:p0 + T, :hd // 2].astype(np.float64).reshape(T, *[1] * (y.ndim - 2), hd // 2)
         s_ = cs[p0:p0 + T, hd // 2:].astype(np.float64).reshape(c_.shape)
         a, b = y[..., :hd // 2].copy(), y[..., hd // 2:].copy()
@@ -90,15 +106,15 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int) -> None:
         return y
 
     units = fused.get_buffer("QS").view(torch.uint8).numpy()[:T // 8 * COLS * qh * shape.qunit]
-    qv = _q_values(units.reshape(COLS, T // 8, qh, shape.qunit), hd)  # [column][token group][head][query][hd]
+    qv = _q_values(units.reshape(COLS, T // 8, qh, shape.qunit), hd, shape.qp)  # [column][token group][head][query][hd]
     qv = qv.transpose(0, 2, 1, 3, 4).reshape(COLS, qh, T, hd)
-    want_q = rope(q).transpose(1, 2, 0, 3) * shape.scale
-    assert _rel(qv, want_q) < 1e-2
+    want_q = rope(q, wq).transpose(1, 2, 0, 3) * shape.scale
+    assert _rel(qv, want_q) < (2e-4 if shape.qp == 2 else 1e-2)
     n = (p0 + T) // shape.pg
     Ks, Vs = {}, {}
     for c in range(COLS):
         Ks[c], Vs[c] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[c, :n], hd))
-        assert _rel(Ks[c][p0:], rope(k)[:, c]) < (2e-4 if kp == 2 else 1e-2), c
+        assert _rel(Ks[c][p0:], rope(k, wk)[:, c]) < (2e-4 if kp == 2 else 1e-2), c
         assert _rel(Vs[c][p0:], v[:, c].bfloat16().double().numpy()) < 1e-2, c
     A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a].clone(), T, COLS * qh * hd).numpy().reshape(T, COLS, qh, hd)
     want = np.zeros((T, COLS, qh, hd))
@@ -115,9 +131,10 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int) -> None:
     assert err < 1.5 * eq
 
 
-# (GGUF quantization, model size, K format, tokens, decode steps first)
+# (GGUF quantization, model size, K format, tokens, decode steps first; "qwen3:<name>": model_config.qwen3_gguf's file)
 CACHES = [("Q4_K_M", "1B", "single", 300, 0), ("Q4_K_M", "1B", "hilo", 300, 128), ("Q4_K_M", "3B", "single", 600, 64),
-          ("Q4_K_S", "8B", "hilo", 300, 0)]
+          ("Q4_K_S", "8B", "hilo", 300, 0), ("Q4_1", "qwen3:0.6B", "hilo", 300, 64),
+          ("Q8_0", "qwen3:embedding-0.6B", "hilo", 600, 0)]
 
 
 @pytest.mark.slow
@@ -130,18 +147,21 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     import os
 
     from artlite.gguf_model import GGUFFile
+    from artlite.model_config import qwen3_gguf
     from models.llama.overlay import LlamaOverlay
     from models.llama.prefill import LlamaPrefill
     from models.llama.tokenizer import load_tokenizer
+    from models.tokenizer import QwenTokenizer
 
     from ..common import essay, llama_gguf
 
-    path = llama_gguf(quant, size)
+    qwen3 = size.startswith("qwen3:")
+    path = qwen3_gguf(size.removeprefix("qwen3:")) if qwen3 else llama_gguf(quant, size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
     layers = [0, 1, 2, 3]
-    ids = load_tokenizer(path).encode(essay("apple.txt"))[:p0 + n]
+    ids = (QwenTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
     x = g.rows("token_embd.weight", ids).float()
     ov = LlamaOverlay(g, layers=layers, vocab=2048, max_positions=1024, kv_k=kv_k)
     ov.load()

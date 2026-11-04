@@ -122,9 +122,10 @@ class ModelInfo:
         g = GGUFFile(path)
         meta, arch = g.meta, str(g.arch)
         fields, n_vocab = file_info(path, gguf=g)
-        ids = [int(meta[k]) for k in ("tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id") if k in meta]
-        names = json.loads(g.strings_json("tokenizer.ggml.tokens", ids)) if ids else []
-        special = dict(zip([k for k in ("bos", "eos") if f"tokenizer.ggml.{k}_token_id" in meta], names, strict=True))
+        ids = {k: int(meta[f"tokenizer.ggml.{k}_token_id"]) for k in ("bos", "eos") if f"tokenizer.ggml.{k}_token_id" in meta}
+        names = {i: t for t, i in json.loads(g.strings_json("tokenizer.ggml.tokens", list(ids.values()))).items()} \
+            if ids else {}  # (by id: BOS and EOS may be one token, Qwen3-Embedding's)
+        special = {k: names[i] for k, i in ids.items()}
         return cls(path=path, chat_template=str(meta.get("tokenizer.chat_template", "")),
                    bos_token=special.get("bos", ""), eos_token=special.get("eos", ""),
                    n_ctx_train=int(meta.get(f"{arch}.context_length", 0)),

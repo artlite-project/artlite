@@ -19,7 +19,7 @@ from artlite.model_config import ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 from models.qwen35 import attn as AT
 from models.qwen35.qwen import NpuQwen, Qwen
-from models.qwen35.tokenizer import QwenTokenizer, chat_prompt
+from models.tokenizer import QwenTokenizer, chat_prompt
 
 from ..common import essay
 from . import ref as V

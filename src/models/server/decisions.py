@@ -17,11 +17,14 @@ output-normed) on the host:
   rating / 8), nimble's prompt lists every question of the request, vllm-d3's model is non-causal (each prompt whole,
   from position 0);
 - kev: ``cls.output`` (and its bias) of the rows at each option's end token (``<|box_end|>``) and at the last token;
-  an option's score is the dot product of the last token's first half with its second half over sqrt(half).
+  an option's score is the dot product of the last token's first half with its second half over sqrt(half);
+- vllm-decision2 (a qwen3 trunk): a joint head (``decision.*`` tensors, fp32: ``JointHead``) over the rows at the end of
+  each option's span and of the question's; the prompt is pieces the template separates (``CLEF_SEP``), tokenized one
+  by one as the model was trained, a piece that starts with ``CLEF_QUESTION`` / ``CLEF_OPTION`` a span.
 
-Other types (laya, clef, vllm-decision2, lfm2-d1, lfm2-d1-omni: other architectures or heads) and images (``files``,
-``images``, a chat message's image parts: d3's and pplx's encoders are Qwen3-VL's) are refused (501). A causal
-model's questions share the prompt's prefix through the prompt cache (``Engine.readouts``: the state once)."""
+Other types (laya, clef, lfm2-d1, lfm2-d1-omni: other architectures or heads) and images (``files``, ``images``, a
+chat message's image parts: d3's and pplx's encoders are Qwen3-VL's) are refused (501). A causal model's questions
+share the prompt's prefix through the prompt cache (``Engine.readouts``: the state once)."""
 
 import asyncio
 import json
@@ -39,9 +42,12 @@ from artlite.gguf_model import GGUFFile
 from ..common import render_template
 from .engine import Engine
 
-TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev")  # (the types Artlite answers)
+TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2")  # (the types Artlite answers)
 LABEL_TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3")  # (their scores: label logits)
-SHARED = ("openjev", "lev", "kev", "nimble", "pplx-decider")  # (the questions' prompts share a prefix the model continues)
+# (the questions' prompts share a prefix the model continues)
+SHARED = ("openjev", "lev", "kev", "nimble", "pplx-decider", "vllm-decision2")
+CLEF_MARKER, CLEF_SEP = "<<clef:", "<<clef:sep>>"  # (a joint prompt's pieces: ``Decisions.joint_prompt``)
+CLEF_QUESTION, CLEF_OPTION = "<<clef:question>>", "<<clef:option>>"
 LEV_RATINGS = 9  # lev's noul rating scale: 0 = certainly no .. 8 = certainly yes
 MAX_IMAGES = 8
 KINDS = ("choice", "score", "noul")
@@ -107,6 +113,54 @@ def _kev_text(v: Any) -> str:
     return escape_special(_kev_render(v))
 
 
+def _replace_text(v: Any, old: str, new: str) -> Any:
+    """Every string value (not the keys) with ``old`` replaced (``decision_replace_text``)."""
+    if isinstance(v, str):
+        return v.replace(old, new)
+    if isinstance(v, list):
+        return [_replace_text(x, old, new) for x in v]
+    if isinstance(v, dict):
+        return {k: _replace_text(x, old, new) for k, x in v.items()}
+    return v
+
+
+def _payload(v: Any) -> bool:
+    """Text, an object or an array (``decision_is_payload``: what vllm-decision2 takes)."""
+    return isinstance(v, str | dict | list)
+
+
+@dataclass(frozen=True)
+class JointHead:
+    """vllm-decision2's head (llama.cpp's ``llama_model_vllm_decision2::graph::build_head``, fp32 tensors): the option
+    rows o and the question's row q, each LayerNorm'd (``eps``); an option's score is (K o) . (Q q) / sqrt(h) + s .
+    gelu(Mo o + bo + Mq q), h the head's width."""
+
+    t: dict[str, np.ndarray]
+    eps: float
+
+    @classmethod
+    def of(cls, g: GGUFFile, eps: float) -> "JointHead":
+        names = ("option_norm.weight", "option_norm.bias", "query_norm.weight", "query_norm.bias", "key.weight",
+                 "query.weight", "option_mlp.weight", "option_mlp.bias", "query_mlp.weight", "scorer_out.weight")
+        t = {n: np.asarray(g.tensor("decision." + n).dequantize(), np.float64).reshape(g.tensor("decision." + n).rows, -1)
+             for n in names}
+        return cls({n: v[0] if v.shape[0] == 1 else v for n, v in t.items()}, eps)
+
+    def _norm(self, x: np.ndarray, which: str) -> np.ndarray:
+        x = x - x.mean(-1, keepdims=True)
+        x = x / np.sqrt((x * x).mean(-1, keepdims=True) + self.eps)
+        return x * self.t[f"{which}_norm.weight"] + self.t[f"{which}_norm.bias"]
+
+    def scores(self, options: np.ndarray, query: np.ndarray) -> np.ndarray:
+        t = self.t
+        o, q = self._norm(options, "option"), self._norm(query, "query")
+        k, qq = o @ t["key.weight"].T, t["query.weight"] @ q
+        bilinear = k @ qq / math.sqrt(k.shape[1])
+        m = o @ t["option_mlp.weight"].T + t["option_mlp.bias"] + t["query_mlp.weight"] @ q
+        gelu = 0.5 * m * (1 + np.vectorize(math.erf)(m / math.sqrt(2)))
+        return bilinear + gelu @ t["scorer_out.weight"]
+
+
 @dataclass(frozen=True)
 class Question:
     id: str
@@ -137,9 +191,12 @@ class Decisions:
     label_texts: list[str] = field(default_factory=list)  # (codes given to the template as an option's label)
     head: np.ndarray | None = None  # label types: the labels' LM rows (labels, hidden); kev: cls.output (out, hidden)
     bias: np.ndarray | None = None  # kev: cls.output's bias
+    joint: JointHead | None = None  # vllm-decision2
     marker: int = -1  # kev: the token that ends an option
     n_options_max: int = 0
     noul_true_first: bool = False
+    noul_criteria_order: bool = False  # (a noul's options in its criteria's order when they name both)
+    strict_payload: bool = False  # (states, instructions and descriptions: text, objects or arrays)
     canonical_legend: bool = False
 
     @classmethod
@@ -174,6 +231,8 @@ class Decisions:
         if t in LABEL_TYPES:
             lm = "output.weight" if "output.weight" in g else "token_embd.weight"
             d.head = np.asarray(g.rows(lm, d.labels), np.float64)
+        elif t == "vllm-decision2":
+            d.joint = JointHead.of(g, float(meta.get(f"{arch}.attention.layer_norm_epsilon", 1e-5)))
         else:
             w = g.tensor("cls.output.weight")
             d.head = np.asarray(g.rows("cls.output.weight", np.arange(w.rows)), np.float64)
@@ -198,6 +257,8 @@ class Decisions:
                     self.labels.append(ids[0])
                     self.label_texts.append(code)
             self.n_options_max, self.canonical_legend = len(self.labels), self.type == "vllm-d3"
+        elif self.type == "vllm-decision2":
+            self.n_options_max, self.noul_criteria_order, self.strict_payload, self.canonical_legend = 255, True, True, True
         else:  # kev
             ids = encode("<|box_end|>")
             if len(ids) != 1:
@@ -218,6 +279,8 @@ class Decisions:
         """A request's questions (BadRequest: a bad one)."""
         if "state" not in body or body["state"] is None and self.type != "vllm-d3":
             raise BadRequest("\"state\" must be provided")
+        if self.strict_payload and not _payload(body["state"]):
+            raise BadRequest("\"state\" must be text, an object or an array")
         qs = body.get("questions")
         if not isinstance(qs, dict) or not qs:
             raise BadRequest("\"questions\" must be a non-empty object")
@@ -231,21 +294,33 @@ class Decisions:
             instructions = q.get("instructions")  # (vllm-d3's prompt has a default question)
             if instructions is None and self.type != "vllm-d3":
                 raise err("\"instructions\" must be provided")
+            if self.strict_payload and (not _payload(instructions) or instructions == ""):
+                raise err("\"instructions\" must be non-empty text, an object or an array")
             kind = q.get("type") if isinstance(q.get("type"), str) else ""
             crit = q.get("criteria")
             if kind == "choice":
                 if not isinstance(crit, dict) or not crit:
                     raise err("\"criteria\" must be a non-empty object")
                 options = list(crit.items())
+                if self.strict_payload and any(not k or not (d is None or _payload(d)) for k, d in options):
+                    raise err("option keys must be non-empty, descriptions must be null, text, an object or an array")
+                if self.strict_payload and len(options) < 2:
+                    raise err("\"criteria\" must have at least 2 options")
             elif kind == "score":
                 if not isinstance(crit, list) or not 2 <= len(crit) <= 10:
                     raise err("\"criteria\" must be an array of 2 to 10 levels")
+                if self.strict_payload and not all(_payload(c) for c in crit):
+                    raise err("level descriptions must be text, an object or an array")
                 options = [(str(i), c) for i, c in enumerate(crit)]
             elif kind == "noul":
                 if crit is not None and not isinstance(crit, dict):
                     raise err("\"criteria\" must be an object")
+                if self.strict_payload and crit and any(k not in ("false", "true") or not _payload(d)
+                                                        for k, d in crit.items()):
+                    raise err("\"criteria\" may only describe \"false\" and \"true\" with text, an object or an array")
                 options = [(k, crit.get(k) if crit else None) for k in ("false", "true")]
-                if self.noul_true_first:
+                if self.noul_true_first or self.noul_criteria_order and crit and len(crit) == 2 and \
+                        next(iter(crit)) == "true":
                     options.reverse()
             else:
                 raise err("\"type\" must be one of: choice, score, noul")
@@ -349,10 +424,41 @@ class Decisions:
         inp["images"] = []
         return render_template(self.template, **inp)
 
+    def joint_prompt(self, state: Any, q: Question, encode: Callable[[str], list[int]]) -> tuple[list[int], np.ndarray]:
+        """vllm-decision2's prompt of a question (``fill_task_joint``): the template's text (the values with sorted keys,
+        none of them a piece marker) split into its pieces, each tokenized alone; the rows: the last token of each
+        option's span, then of the question's."""
+        inp = {"state": state, "questions": [{"id": q.id, "type": q.kind, "instructions": q.instructions,
+                                              "options": [{"key": k, "description": d} for k, d in q.options]}]}
+        inp = _replace_text(_sort_keys(inp), CLEF_MARKER, "<<clef ")
+        text = render_template(self.template, **inp, images=[], sep=CLEF_SEP, mark_question=CLEF_QUESTION,
+                               mark_option=CLEF_OPTION)
+        ids: list[int] = []
+        options: list[int] = []
+        question = -1
+        for piece in text.split(CLEF_SEP):
+            mark = next((m for m in (CLEF_QUESTION, CLEF_OPTION) if piece.startswith(m)), None)
+            toks = encode(piece[len(mark):] if mark else piece)
+            if mark and not toks:
+                raise BadRequest("the instructions and the options of a question must not be empty")
+            ids += toks
+            if mark == CLEF_OPTION:
+                options.append(len(ids) - 1)
+            elif mark == CLEF_QUESTION:
+                if question >= 0:
+                    raise RuntimeError("unexpected layout of the decision prompt")
+                question = len(ids) - 1
+        if question < 0 or len(options) != len(q.options):
+            raise RuntimeError("unexpected layout of the decision prompt")
+        return ids, np.array([*options, question])
+
     def prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]]) -> list[Prompt]:
         """Every question's variants as prompts (``encode``: the model's tokenizer, special tokens parsed)."""
         out = []
         for i, q in enumerate(questions):
+            if self.joint is not None:
+                out.append(Prompt(i, 0, *self.joint_prompt(state, q, encode)))
+                continue
             for v in range(self.n_variants(q)):
                 ids = encode(self.render(state, questions, q, v))
                 if self.type == "kev":  # (an option read at its end token, the question at the last)
@@ -372,6 +478,8 @@ class Decisions:
     def scores(self, q: Question, rows: np.ndarray) -> np.ndarray:
         """A variant's raw outputs from its prompt's rows (``Prompt.rows``, output-normed)."""
         x = np.asarray(rows, np.float64)
+        if self.joint is not None:
+            return self.joint.scores(x[:-1], x[-1])
         if self.type == "kev":
             e = x @ self.head.T + self.bias  # (rows, out)
             half = e.shape[1] // 2
@@ -388,11 +496,11 @@ class Decisions:
         return self.temperatures.get(f"{q.kind}.{bucket}", self.temperatures.get(q.kind, 1.0))
 
     def confidence(self, kind: str, p: np.ndarray) -> float:
-        """TypeSafe's confidence formulas (vllm-d3: the normalized entropy)."""
+        """TypeSafe's confidence formulas (vllm-d3, vllm-decision2: the normalized entropy)."""
         n = len(p)
         if n < 2:
             return 1.0
-        if self.type == "vllm-d3":
+        if self.type in ("vllm-d3", "vllm-decision2"):
             h = -sum(float(x) * math.log(x) for x in p if x > 0)
             return max(0.0, min(1.0, 1.0 - h / math.log(n)))
         if kind == "choice":
@@ -485,4 +593,5 @@ def add_routes(api: APIRouter, *, engine: Engine, alias: str, kind: str | None, 
                 "usage": {"input_tokens": n, "output_tokens": 0}}
 
 
-__all__ = ["TYPES", "BadRequest", "Decisions", "Prompt", "Question", "add_routes", "decision_type", "escape_special"]
+__all__ = ["TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "add_routes", "decision_type",
+           "escape_special"]

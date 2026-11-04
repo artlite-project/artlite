@@ -1,11 +1,11 @@
 """Host model of the Llama decode overlay's arithmetic (models/llama: the shared decode overlay with pre-norm residual
-updates, the attention cores): fp32 math on the dequantized weights with the kernels' rounding points.
+updates, the attention cores; Llama and Qwen3): fp32 math on the dequantized weights with the kernels' rounding points.
 
 - main cores: the residual stream in fp32 (each column's slice), the output projections' rows added exactly; a normed
   phase's input is the residual's bf16 copy times the norm weight (bf16), its rows scaled by 1 / rms of that copy and
   rounded to bf16; silu(bf16(gate)) rounded to bf16, times up, rounded to bf16. (Not modelled: the MMUL panels keep 14
   bits below the largest of 8 elements; the sums of 32 products are rounded to bf16 before their scale.)
-- attention cores (``decode.attn_ref.AttentionRef`` without norms): q, k rotated in fp32 (fp32 cos / sin), k cached as one
+- attention cores (``decode.attn_ref.AttentionRef`` without norms, Qwen3's q / k norms with weights per dim): q, k rotated in fp32 (fp32 cos / sin), k cached as one
   bfp16 block (kp 1) or hi + lo blocks (kp 2) per 8 dims, v cached as bfp16 blocks per dim over the 8 positions of a
   record, encoded from the bf16 values of its positions up to the attending one, exact softmax of the scores q k /
   sqrt(head_dim), o rounded to bf16. (Not modelled: the Q panels' 14 bits, the P panels, exp2's bf16-level polynomial.)
@@ -38,7 +38,9 @@ class LlamaNpuRef:
         self._mats: dict[str, torch.Tensor] = {}
         self.caches = {L: AttentionRef(head_dim=cfg.head_dim, heads=cfg.num_attention_heads,
                                        kv_heads=cfg.num_key_value_heads, eps=cfg.rms_norm_eps, window=0,
-                                       rot=cfg.head_dim // 2, norm=False, kp=kp) for L in layers}
+                                       rot=cfg.head_dim // 2, norm=False, kp=kp,
+                                       qk_w=tuple(self.mat(f"blk.{L}.attn_{n}_norm.weight").reshape(-1)
+                                                  for n in "qk") if cfg.qk_norm else None) for L in layers}
 
     def mat(self, name: str) -> torch.Tensor:
         """A tensor dequantized (fp32; BF16 / F16 rounded to the BFP16 tiles' blocks), Q / K rows in rotate-half order
@@ -49,9 +51,9 @@ class LlamaNpuRef:
             if has_tile_format(t.qtype) and tile_format(t.qtype) == "BFP16":
                 w = torch.from_numpy(bfp16.values(w.numpy()))
             cfg = self.cfg
-            if name.endswith("attn_q.weight"):
+            if name.endswith("attn_q.weight") and not cfg.neox:
                 w = w[torch.from_numpy(unpermute_rows(cfg.num_attention_heads, w.shape[0]))]
-            elif name.endswith("attn_k.weight"):
+            elif name.endswith("attn_k.weight") and not cfg.neox:
                 w = w[torch.from_numpy(unpermute_rows(cfg.num_key_value_heads, w.shape[0]))]
             self._mats[name] = w
         return self._mats[name]

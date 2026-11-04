@@ -10,8 +10,9 @@ prefill GEMMs' weight arguments within 4 GB: ``decode.image.BLOCK_BYTES``).
 Per-column rows (layer L, column c = KV head c, qh query heads per KV head):
 
 - "qkv": block "q" = the rows of query heads qh c .. qh c + qh - 1, "k" and "v" = KV head c's. llama.cpp's converter
-  interleaves a head's Q / K rows by rotary pair: the blocks take them in rotate-half order (pair i = dims i,
-  i + head_dim / 2; ``gguf_model.unpermute_rows``), the other models' RoPE;
+  interleaves a Llama head's Q / K rows by rotary pair: the blocks take them in rotate-half order (pair i = dims i,
+  i + head_dim / 2; ``gguf_model.unpermute_rows``), the other models' RoPE (Qwen3's rows are in that order:
+  ``LlamaConfig.neox``);
 - "o" (``attn_output``), "down": rows hidden / 8 c ..; "gate_up": ``decode.image.gate_up_rows``;
 - "lm": rows vocab / 8 c .. of ``output`` (the tied ``token_embd`` in 1B and 3B), the vocabulary padded to whole C
   objects per column (128256 -> 128512; padding rows -1: zero tiles).
@@ -65,8 +66,8 @@ class LlamaImage(TileImage):
     def _layer(self, L: int) -> None:
         cfg, b = self.cfg, f"blk.{L}."
         H, I, hd, nh = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim, cfg.num_attention_heads
-        q = unpermute_rows(nh, nh * hd).reshape(COLS, cfg.q_per_kv * hd)
-        k = unpermute_rows(COLS, COLS * hd).reshape(COLS, hd)
+        q = (np.arange(nh * hd) if cfg.neox else unpermute_rows(nh, nh * hd)).reshape(COLS, cfg.q_per_kv * hd)
+        k = (np.arange(COLS * hd) if cfg.neox else unpermute_rows(COLS, COLS * hd)).reshape(COLS, hd)
         self._norm(L, "qkv")
         self._add(L, "qkv", [("q", (b + "attn_q.weight",), q), ("k", (b + "attn_k.weight",), k),
                              ("v", (b + "attn_v.weight",), column_rows(COLS * hd))], H)

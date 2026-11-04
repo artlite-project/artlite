@@ -10,6 +10,7 @@ with a web chat).
 | architecture / pipeline | package | models |
 |---|---|---|
 | ``llama`` | ``llama`` | Llama 3.2 1B / 3B, Llama 3.1 8B |
+| ``qwen3``, ``vllm-decision2`` | ``llama`` | Qwen3 0.6B, Qwen3-Embedding, Qwen3-Reranker; Decision-2.0-Kai (Qwen3 and a decision head) |
 | ``gemma4`` | ``gemma4`` | Gemma 4 E4B |
 | ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 (Gated DeltaNet and full-attention layers), MiniCPM-V 4.7 (images: its mmproj) |
 | ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN) |
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 # architecture -> (module, Model subclass), imported on use
 ARCHITECTURES = {
     "llama": ("models.llama.llama", "Llama"),
+    "qwen3": ("models.llama.qwen3", "Qwen3"),
+    "vllm-decision2": ("models.llama.qwen3", "Qwen3"),
     "gemma4": ("models.gemma4.gemma", "Gemma"),
     "qwen35": ("models.qwen35.qwen", "Qwen"),
     "qwen35moe": ("models.qwen35.qwen", "Qwen"),

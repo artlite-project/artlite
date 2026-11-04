@@ -39,24 +39,28 @@ def rope(y: torch.Tensor, cs: tuple[torch.Tensor, torch.Tensor], rot: int) -> to
 
 class AttentionRef:
     """One layer's cache and attention as the attention cores compute them (``decode.attn``): ``store`` a position's K,
-    V projections, ``attend`` a query. ``norm``: q, k, v RMS-normed (Gemma; Llama: none); ``kp``: K as hi + lo bfp16
+    V projections, ``attend`` a query. ``norm``: q, k, v RMS-normed (Gemma; Llama: none); ``qk_w``: q and k RMS-normed
+    and times these weights per dim (fp32, as the cores' 2^-16 products; Qwen3), v as it is; ``kp``: K as hi + lo bfp16
     blocks (2) or one block (1) per 8 dims."""
 
     def __init__(self, *, head_dim: int, heads: int, kv_heads: int, eps: float, window: int, rot: int, norm: bool = True,
-                 kp: int = 2):
+                 kp: int = 2, qk_w: tuple[torch.Tensor, torch.Tensor] | None = None):
         self.hd, self.heads, self.nkv, self.eps, self.window, self.rot = head_dim, heads, kv_heads, eps, window, rot
-        self.norm, self.kp = norm, kp
+        self.norm, self.kp, self.qk_w = norm, kp, qk_w
         self.K = torch.zeros(kv_heads, 0, head_dim)  # (normed,) rotated (without the k_norm weight), as cached
         self.V = torch.zeros(kv_heads, 0, head_dim)  # as cached: the records' bfp16 panels
         self.rows = torch.zeros(kv_heads, 0, head_dim)  # (normed,) bf16 (the attention cores' ring)
 
-    def _n(self, x: torch.Tensor) -> torch.Tensor:
+    def _n(self, x: torch.Tensor, w: int | None = None) -> torch.Tensor:
+        """(w: 0 q, 1 k, None v)"""
+        if self.qk_w is not None:
+            return x if w is None else x * inv_rms(x, self.eps) * self.qk_w[w]
         return x * inv_rms(x, self.eps) if self.norm else x
 
     def store(self, k: torch.Tensor, v: torch.Tensor, cs: tuple[torch.Tensor, torch.Tensor]) -> None:
         p, hd = self.K.shape[1], self.hd
         k, v = k.view(self.nkv, hd), v.view(self.nkv, hd)
-        kr = rope(self._n(k), cs, self.rot)
+        kr = rope(self._n(k, 1), cs, self.rot)
         kn = hilo_values(kr) if self.kp == 2 else torch.from_numpy(bfp16.values(np.ascontiguousarray(kr.numpy())))
         self.K = torch.cat([self.K, kn[:, None]], 1)
         self.rows = torch.cat([self.rows, bf(self._n(v))[:, None]], 1)
@@ -69,7 +73,7 @@ class AttentionRef:
     def attend(self, q: torch.Tensor, cs: tuple[torch.Tensor, torch.Tensor], c: float, p: int) -> torch.Tensor:
         """The attention of q (heads hd,) at position p (the positions up to p cached) -> (heads hd,) bf16-valued."""
         q = q.view(self.heads, self.hd)
-        qn = rope(self._n(q), cs, self.rot)
+        qn = rope(self._n(q, 0), cs, self.rot)
         lo = max(0, p - self.window + 1) if self.window else 0
         per = self.heads // self.nkv
         out = []

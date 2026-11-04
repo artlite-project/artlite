@@ -55,12 +55,12 @@ from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Re
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..sequence import Sequence
+from ..tokenizer import QwenTokenizer, chat_prompt
 from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats
 from .image import QwenImage
 from .overlay import QwenOverlay
 from .prefill import QwenPrefill
-from .tokenizer import QwenTokenizer, chat_prompt
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
 # set): the language model of openbmb's files, marked by the M-RoPE order of its vision

@@ -105,7 +105,9 @@ def gu_tiles(r_gu: int) -> int:
 def choose_tile_bytes(formats: dict[str, int], nsb: int = 8, gu: dict[str, int] | None = None) -> int:
     """Object size minimizing the streamed bytes; formats: {fmt: rows streamed} (rows counted
     per K chunk of nsb super-blocks); gu: {fmt: gate/up SiLU groups streamed (per K chunk)}, each
-    ``gu_tiles`` tiles. A format with a fixed tile size (BFP16: 8 rows) imposes it."""
+    ``gu_tiles`` tiles. A format with a fixed tile size (BFP16: 8 rows) imposes it. The candidates: per format
+    and row count it can have (``row_step``) the size that holds them, at least the floor (Q8_0's 8 rows: 9216
+    at 4 super-blocks)."""
     gu = gu or {}
     formats = {**{f: 0 for f in gu}, **formats}
     fixed = {FORMATS[f].tile_bytes(nsb) for f in formats} - {None}
@@ -115,9 +117,9 @@ def choose_tile_bytes(formats: dict[str, int], nsb: int = 8, gu: dict[str, int] 
     best = None
     lo, hi = 2304 * nsb, 2568 * nsb  # 18432 .. 20544 for 2048-column tiles
     for fmt in formats:
-        for r in range(8, FORMATS[fmt].max_rows + 1):
-            s = -(-FORMATS[fmt].used_bytes(r, nsb) // 64) * 64
-            if s < lo or s > hi:
+        for r in range(8, FORMATS[fmt].max_rows + 1, FORMATS[fmt].row_step):
+            s = max(lo, -(-FORMATS[fmt].used_bytes(r, nsb) // 64) * 64)
+            if s > hi or FORMATS[fmt].rows(s, nsb) != r:
                 continue
             if any(FORMATS[f].rows(s, nsb) < 8 for f in formats):
                 continue

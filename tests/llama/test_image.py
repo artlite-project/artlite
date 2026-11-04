@@ -1,7 +1,7 @@
-"""The Llama config and weight image (``model_config.LlamaConfig``, models/llama/image.py), on the host (no NPU):
-the config from the GGUF metadata, the layout of a file (every row of every matrix in exactly one column's block, Q / K
-heads in rotate-half order, the padded vocabulary, the regions in step order) and the packed image's tiles and
-norm-weight objects at their places."""
+"""The Llama config and weight image (``model_config.LlamaConfig``, models/llama/image.py; Qwen3's too), on the host
+(no NPU): the config from the GGUF metadata, the layout of a file (every row of every matrix in exactly one column's
+block, Q / K heads in rotate-half order, the padded vocabulary, the regions in step order) and the packed image's tiles
+and norm-weight objects at their places."""
 
 import os
 
@@ -11,7 +11,7 @@ import torch
 
 from artlite.decode.image import BLOCK_BYTES, COL_SLOT, pack_rows
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LlamaConfig, llama_gguf
+from artlite.model_config import LlamaConfig, llama_gguf, qwen3_gguf
 from artlite.operators.design import COLS
 from models.llama.image import KC, LlamaImage
 
@@ -37,6 +37,27 @@ def test_config(size: str) -> None:
     plain = 500000.0 ** (-np.arange(0, hd, 2) / hd)
     inv = cfg.rope_inv_freq()
     assert inv[0] == plain[0] and inv[-1] == plain[-1] / factor  # (llama3 scaling: high frequencies kept, low ones / factor)
+
+
+@pytest.mark.parametrize(("name", "tile_bytes", "vocab", "eos"), [("0.6B", 10240, 151936, {151645, 151643}),
+                                                                   ("embedding-0.6B", 9216, 151669, {151643, 151645})])
+def test_qwen3(name: str, tile_bytes: int, vocab: int, eos: set[int]) -> None:
+    """Qwen3 on the Llama path: q / k norms, NeoX rows (the image's Q / K blocks take the file's rows as they are),
+    Qwen's end-of-generation tokens, the tile size of Q4_1 (16 rows) and of a file of Q8_0 alone (8 rows: the floor's
+    9216 B, not 9 rows' 9792 of which 8 hold rows)."""
+    path = qwen3_gguf(name)
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    cfg = LlamaConfig.from_gguf(g)
+    assert cfg.neox and cfg.qk_norm and (cfg.num_hidden_layers, cfg.hidden_size, cfg.head_dim, cfg.q_per_kv) == \
+        (28, 1024, 128, 2)
+    assert cfg.vocab_size == vocab and set(cfg.eos_token_ids) == eos and cfg.rope_freq_factors is None
+    img = LlamaImage(g, layers=[0, 1])
+    assert img.tile_bytes == tile_bytes and img.vocab == -(-vocab // 512) * 512
+    qkv = img.region(1, "qkv")
+    assert qkv.block("q").rows[3].tolist() == list(range(3 * 256, 4 * 256)) and \
+        qkv.block("k").rows[3].tolist() == list(range(3 * 128, 4 * 128))
 
 
 @pytest.mark.parametrize("size", sorted(SIZES))

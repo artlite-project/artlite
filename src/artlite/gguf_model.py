@@ -304,6 +304,10 @@ class GGUFFile:
         """The length of a string array of the metadata."""
         return self._string_arrays[key][1]
 
+    def has_strings(self, key: str) -> bool:
+        """The metadata has the string array ``key``."""
+        return key in self._string_arrays
+
     def strings_json(self, key: str, ids: np.ndarray | None = None) -> bytes:
         """The JSON text of a string array of the metadata (C++, no Python string per element): the array, or with
         ``ids`` the object {string: id} of those elements."""

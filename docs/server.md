@@ -32,6 +32,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/tokenize`, `/detokenize`, `/apply-template` | the model's tokenizer and chat template |
 | `/v1/embeddings`, `/embeddings`, `/embedding` | embeddings (with `--embedding`: [below](#embeddings-and-rerank)) |
 | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | a reranker's scores of documents (with `--rerank`) |
+| `/classify` | a classifier's label probabilities (vLLM's shape; with `--rerank`) |
 | `/v1/systemone` | a decision model's answers to questions about a state ([below](#decisions)) |
 
 Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
@@ -134,18 +135,27 @@ list of texts or token ids; `encoding_format` `float` or `base64`; OpenAI's `dim
 normalized again) and `/embeddings` (llama-server's own: `content`). An embedding is the last layer's output after the
 model's final norm, pooled by `--pooling` (else the model file's `pooling_type`): `mean` over the tokens, `cls` the
 first token's, `last` the last token's, `none` every token's (`/embeddings` only), normalized by `embd_normalize`
-(Euclidean by default: `--embd-normalize`). A generative model (Llama 3.x, Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7) has no
-pooling of its own: give one. Gemma 4 has no embeddings (501).
+(Euclidean by default: `--embd-normalize`). An embedding model's file sets its pooling and whether a text ends with its
+end token (Qwen3-Embedding: `last`, appended); a generative model (Llama 3.x, Qwen3, Qwen3.5 / 3.6 / 3.8, MiniCPM-V
+4.7) has no pooling of its own: give one. Gemma 4 has no embeddings (501).
 
 ```bash
-artlite-server -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf --embedding --pooling mean
+artlite-server -m Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf --embedding
 curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d '{"input": ["a text", "another"]}'
 ```
 
 A request's texts run one after another, each entirely as prefill chunks (no decode steps, no LM head), after the
 prefix the prompt cache keeps of it. `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
-`{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file: its classifier head
-(`cls.output`) on the last token of its rerank prompt; none of the architectures Artlite runs has one yet.
+`{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file (Qwen3-Reranker): its
+classifier head (`cls.output`) on the last token of its rerank prompt (the file's `rerank` template). With it,
+`/classify` returns vLLM's classification of each `input` (a text or token ids): the labels' probabilities (`probs`:
+the softmax of the head's outputs, a sigmoid of a single one), the likeliest `label` (the file's
+`classifier.output_labels`, else its index) and `num_classes`.
+
+The embeddings and scores come within llama.cpp's own spread of each other on retrieval and ranking (Qwen3-Embedding-0.6B:
+the same top-10 passages for 30 queries but one at most; Qwen3-Reranker-0.6B: the target passages ranked first as
+often), not to its digits: the prefill's weights and activations are 8-bit bfp16 blocks, so an embedding is within a
+cosine of 0.997-0.999 of llama.cpp's CPU result (its CPU and Vulkan builds: 0.9995) and a rerank score within 0.15.
 
 ## Decisions
 
@@ -165,12 +175,14 @@ curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '
 ```
 
 The decision types artlite-server reads: vllm-d3, pplx-decider, openjev, lev, nimble (the logits of the options' label
-tokens) and kev (its head's products of the last token's and each option's rows), computed on the host from the
-prompt's output rows. Of the published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0) run; Kev-4B does not
-yet (a hidden width of 2560: [Models](models/README.md)). A vllm-d3 model reads a prompt whole (its attention is
-non-causal): one prefill chunk of at most 2048 tokens (a longer prompt: 400), and it generates no text; other types'
-questions share the state's tokens through the prompt cache. Other types (laya, clef, vllm-decision2, lfm2-d1) and
-images (`files`, `images`, a message's image parts) answer 501.
+tokens), kev (its head's products of the last token's and each option's rows) and vllm-decision2 (a joint head over the
+rows at the ends of the options and of the question), computed on the host from the prompt's output rows. Of the
+published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0) and Decision-2.0-Kai-0.6B (llama.cpp's converter run on
+vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run; Kev-4B does not yet (a hidden width of 2560:
+[Models](models/README.md)). A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
+at most 2048 tokens (a longer prompt: 400), and it generates no text; other types' questions share the state's tokens
+through the prompt cache. Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
+answer 501.
 
 ## Requests
 
@@ -305,7 +317,7 @@ NPU:
 | option | |
 |---|---|
 | `--no-prefill` | run prompts as decode steps |
-| `--kv-k single\|hilo` | the KV cache's K precision (Llama, Gemma 4), as [artlite-cli](cli.md)'s |
+| `--kv-k single\|hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4), as [artlite-cli](cli.md)'s |
 | `--dflash`, `--no-dflash` | Qwen3.8 27B's drafter, as [artlite-cli](cli.md)'s (default: its DFlash2 block drafter where the file is in the models directory, else its MTP layer) |
 | `--warmup`, `--no-warmup` | run one token after loading (default on) |
 
@@ -315,7 +327,7 @@ Embeddings and rerank ([above](#embeddings-and-rerank)):
 |---|---|
 | `--embedding`, `--embeddings` | the embedding routes |
 | `--pooling none\|mean\|cls\|last\|rank` | the embeddings' pooling (default: the model file's) |
-| `--rerank`, `--reranking` | the rerank routes: `--embedding` with pooling `rank` (a reranker's file) |
+| `--rerank`, `--reranking` | the rerank routes and `/classify`: `--embedding` with pooling `rank` (a file with a classifier head) |
 | `--embd-normalize N` | the embeddings' normalization: -1 none, 0 the largest magnitude to 32760, 2 Euclidean, any other p the p-norm (default 2; a request's `embd_normalize` overrides it) |
 
 Images:

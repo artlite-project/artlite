@@ -31,8 +31,8 @@ from models.qwen35.dflash import DFlashOverlay
 from models.qwen35.dflash_core import HD, PAIR, POS_PER_GROUP, QC, ROWS_B
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.qwen import NpuQwen, Qwen
-from models.qwen35.tokenizer import QwenTokenizer
 from models.server.cache import PromptCache
+from models.tokenizer import QwenTokenizer
 
 from ..common import essays
 from . import ref

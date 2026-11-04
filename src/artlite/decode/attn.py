@@ -1,9 +1,10 @@
-"""The attention cores of the decode overlays on host-built transactions (Gemma 4: ``gemma4/decode.py``, Llama:
-``llama/decode.py``): per step S <= 4 token slots at positions p .. p + S - 1, a model's head dims (one or two kinds of
-layer: Gemma's sliding-window 256 / full 512, Llama's 64 or 128), RoPE on the dim pairs (i, i + hd / 2) of i < rot
-(per kind), scores in log2 units: q k times a constant per layer (the F_ATT object's: Gemma q_norm k_norm log2(e) with q
-and k RMS-normed per head, ``Attn(qk_norm=True)``; Llama log2(e) / sqrt(hd)), v as it is or RMS-normed without a weight
-(``v_norm``).
+"""The attention cores of the decode overlays on host-built transactions (Gemma 4: ``gemma4/decode.py``, Llama and
+Qwen3: ``llama/decode.py``): per step S <= 4 token slots at positions p .. p + S - 1, a model's head dims (one or two
+kinds of layer: Gemma's sliding-window 256 / full 512, Llama's 64 or 128), RoPE on the dim pairs (i, i + hd / 2) of
+i < rot (per kind), scores in log2 units: q k times a constant per layer (the F_ATT object's: Gemma q_norm k_norm
+log2(e) with q and k RMS-normed per head, ``Attn(qk_norm=True)``; Llama log2(e) / sqrt(hd), Qwen3 too, with q and k
+RMS-normed per head and times their weights per dim before RoPE, ``qk_weights``), v as it is or RMS-normed without a
+weight (``v_norm``).
 
 The KV cache of a (layer, KV head) is groups of objects of ``a_bytes`` (``decode.kv``): ``kp`` K objects (records of 8
 positions: [K panels ND] per record, kp = 2: [hi panels ND | lo panels ND], kp = 1: one bfp16 block per 8 dims) and the
@@ -123,10 +124,10 @@ struct {{ p }}_AWin {
 };
 
 {% if QK_NORM %}
-// x (hd bf16) -> out (hd fp32) = x / rms(x), then the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot,
+// x (hd bf16) -> out (hd fp32) = x / rms(x){{ " w" if QK_W else "" }}, then the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot,
 // fp32). (One copy for every head dim: runtime trip counts, not a hot loop)
 __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict out,
-                                             int hd, int rot)
+                                             int hd, int rot{% if QK_W %}, const float *__restrict w{% endif %})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
@@ -134,6 +135,16 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
     for (int i = 0; i < hd; i += 64)
         ss = aie::mac_square(ss, aie::load_v<64>(x + i));
     const float sum = aie::reduce_add(ss.template to_vector<float>());
+{% if QK_W %}
+    const float inv = al::inv_rms<{{ HDS[0] }}>(sum, {{ eps }}f);  // (one head dim)
+    aie::vector<bfloat16, 32> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts, times w; 32 lanes:
+    al::bf16_hilo<32>(inv, ih, il);    // program memory)
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < hd; i += 32) {
+        const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x + i);
+        aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>(), aie::load_v<32>(w + i)));
+    }
+{% else %}
     const float inv = al::inv_rms(sum, {{ by_hd(INV_HD) }}, {{ eps }}f);
     aie::vector<bfloat16, 64> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts)
     al::bf16_hilo<64>(inv, ih, il);
@@ -142,6 +153,7 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
         const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
         aie::store_v(out + i, aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>());
     }
+{% endif %}
 {% else %}
 // x (hd bf16) -> out (hd fp32), the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot, fp32)
 __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict out,
@@ -870,7 +882,11 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_QS }}] = 0;
     // the F_ATT object is the sub-step's first q object: its heads into qa (free by now), ``aq0`` once the chain lets
     // the column's q rows overwrite its last partial (the east neighbour merged it)
+{% if QK_W %}
+    al::copy<{{ QCOPY + 2 * HDS[0] }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd] | q_norm hd fp32)
+{% else %}
     al::copy<{{ QCOPY }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd])
+{% endif %}
     st[{{ A_I }}] = 0;
     st[{{ A_KS }}] = 0;
 {% if WIN in (40, 41) %}
@@ -904,7 +920,7 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
 {% endif %}
     AIE_LOOP_NO_UNROLL
     for (int h = 0; h < nh; h++)
-        {{ p }}_nrope(x + {{ 2 * META }} + hd * h, cs, AW(float, {{ a.y }}) + hd * (nh * s + h), hd, rot);
+        {{ p }}_nrope(x + {{ 2 * META }} + hd * h, cs, AW(float, {{ a.y }}) + hd * (nh * s + h), hd, rot{{ ", (const float *)(x + %d)" % (2 * META + QCOPY) if QK_W else "" }});
 }
 
 // The sub-step's first q object, as abegin left it in qa
@@ -982,7 +998,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
 {% endif %}
     float *__restrict kf = AW(float, {{ a.kf }});
     const bfloat16 *__restrict kv = x + {{ 2 * META }};
-    {{ p }}_nrope(kv, cs, kf, hd, rot);
+    {{ p }}_nrope(kv, cs, kf, hd, rot{{ ", (const float *)(kv + 2 * hd)" if QK_W else "" }});
     int8_t *__restrict km = AW(int8_t, {{ a.kb }}) + {{ KB_SLOT }} * s;
     int8_t *__restrict ke = km + {{ 8 * KP }} * nd;
     AIE_LOOP_NO_UNROLL
@@ -1145,15 +1161,20 @@ class Attn:
     """The attention cores' shapes: the head dims ``hds`` (one per kind of layer, at most two) and their rotated pairs
     ``rot``, ``chain`` columns per KV head (COLS / chain KV heads), at most ``heads`` query heads per KV head (a layer's:
     the F_ATT object's M_ANH), ``kp`` K panels per record (2: hi + lo, 1: single), RMS norms of q / k (``qk_norm``: the
-    weight folded into the score constant) and of v (``v_norm``), the cache objects of ``a_bytes`` (the A stream's)."""
+    weight folded into the score constant; ``qk_weights``: a weight per dim, Qwen3's, hd fp32 after the q heads of
+    every q object and after [K | V] of every raw K / V object, one head dim) and of v (``v_norm``), the cache objects of
+    ``a_bytes`` (the A stream's)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
-                 qk_norm: bool = False, v_norm: bool = False, eps: float = 1e-6, c_len: int = 64):
+                 qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
+                 c_len: int = 64):
         assert 1 <= len(hds) <= 2 and len(rot) == len(hds) and all(hd % 64 == 0 and hd <= 512 for hd in hds), hds
         assert all(r % 32 == 0 and r <= hd // 2 for r, hd in zip(rot, hds)) and kp in (1, 2)
         assert chain in (1, 2, 4) and 1 <= heads <= 4, (chain, heads)
+        assert not qk_weights or (qk_norm and not v_norm and len(hds) == 1), "per-dim weights: q / k norms, one head dim"
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
+        self.qk_weights = qk_weights
         self.kv_heads = COLS // chain
         self.d_len = min(256, min(hds)) // 2  # (bf16 of a D object: every record, ring slot and o in whole objects)
         self.kper = {hd: Records(hd, kp).kper(a_bytes) for hd in hds}  # K records per K object
@@ -1221,7 +1242,8 @@ class Attn:
                            NO=max(self.rows(hd) for hd in hds) // 8, PPO=self.ppo,
                            ND=hds[0] // 8,
                            MINT="" if nd_min >= 32 else f"<{nd_min}>", VPUT="" if nd_min >= 32 else f"<0, {nd_min}>",
-                           QK_NORM=self.qk_norm, V_NORM=self.v_norm, CHAIN=self.chain, QCOPY=self.heads * max(hds),
+                           QK_NORM=self.qk_norm, QK_W=self.qk_weights, V_NORM=self.v_norm, CHAIN=self.chain,
+                           QCOPY=self.heads * max(hds),
                            NH_POW2=self.heads in (1, 2, 4), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
                            **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k[:2] in ("A_", "M_")}))

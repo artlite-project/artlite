@@ -1,16 +1,16 @@
-"""The qwen35 tokenizer (models.qwen35.tokenizer) against llama.cpp's llama-tokenize: essays,
-code, Unicode, special tokens, the chat template's prompts (no NPU)."""
+"""Qwen's tokenizer (models.tokenizer) against llama.cpp's llama-tokenize, on a file of each pre-tokenizer (qwen35:
+Qwen3.5-9B, qwen2: Qwen3 0.6B): essays, code, Unicode, special tokens, the chat template's prompts (no NPU)."""
 
 import os
 
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from models.qwen35.tokenizer import QwenTokenizer, chat_prompt
+from artlite.model_config import qwen3_gguf, qwen_gguf
+from models.tokenizer import QwenTokenizer, chat_prompt
 
-from ..common import ESSAYS_DIR, essay
-from ..llama_cpp import llama_tokenize
-from .ref import qwen_gguf
+from .common import ESSAYS_DIR, essay
+from .llama_cpp import llama_tokenize
 
 TEXTS = [
     "Hello world, this is a test.\nNew line  two spaces",
@@ -30,9 +30,9 @@ TEXTS = [
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Factorize x^2 + x - 6 = 0"}]
 
 
-@pytest.fixture(scope="module")
-def tok() -> tuple[str, object]:
-    path = qwen_gguf("Q4_K_M", "9B")
+@pytest.fixture(scope="module", params=["qwen35", "qwen2"])
+def tok(request: pytest.FixtureRequest) -> tuple[str, object]:
+    path = qwen_gguf("Q4_K_M", "9B") if request.param == "qwen35" else qwen3_gguf("0.6B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     return path, QwenTokenizer(GGUFFile(path))
@@ -56,7 +56,8 @@ def test_encode(tok: tuple[str, object], i: int) -> None:
 def test_chat_prompt(tok: tuple[str, object], thinking: bool) -> None:
     path, t = tok
     p = chat_prompt(GGUFFile(path), MESSAGES, enable_thinking=thinking)
-    tail = "<think>\n" if thinking else "<think>\n\n</think>\n\n"
+    opens = GGUFFile(path).meta["tokenizer.ggml.pre"] == "qwen35"  # (Qwen3's model writes its <think> itself)
+    tail = ("<think>\n" if opens else "") if thinking else "<think>\n\n</think>\n\n"
     assert p == ("<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nFactorize x^2 + x - 6 = 0<|im_end|>\n"
                  "<|im_start|>assistant\n" + tail)
     assert t.encode(p) == llama_tokenize(path, p)

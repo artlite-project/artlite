@@ -101,7 +101,7 @@ def header(path: str) -> dict[str, Any]:
     tensors = g.tensor_info.values()
     return {"arch": arch, "n_ctx_train": int(meta.get(f"{arch}.context_length", 0)),
             "n_embd": int(meta.get(f"{arch}.embedding_length", 0)),
-            "n_vocab": g.string_count("tokenizer.ggml.tokens") if "tokenizer.ggml.tokens" in g._string_arrays else 0,
+            "n_vocab": g.string_count("tokenizer.ggml.tokens") if g.has_strings("tokenizer.ggml.tokens") else 0,
             "n_params": sum(math.prod(dims) for dims, _, _, _ in tensors), "size": sum(n or 0 for _, _, _, n in tensors),
             "ftype": file_type_name(meta.get("general.file_type")),
             "size_label": str(meta.get("general.size_label", "")),

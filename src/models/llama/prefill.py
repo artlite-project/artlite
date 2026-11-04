@@ -1,6 +1,7 @@
-"""The prefill of a Llama 3.x model: a prompt chunk of up to ``MAX_T`` tokens through every layer on the decode
-overlay's buffers (``overlay.LlamaOverlay``: the weight image, the KV caches), so the decode continues from the caches
-the chunk leaves; the prompt's last token's logits from the LM head alone (``ModelOverlay.logits_of``).
+"""The prefill of a Llama 3.x or Qwen3 model (Qwen3: the q / k norms' weights per layer in NW, hi + lo Q panels:
+``prefill.attn``): a prompt chunk of up to ``MAX_T`` tokens through every layer on the decode overlay's buffers
+(``overlay.LlamaOverlay``: the weight image, the KV caches), so the decode continues from the caches the chunk leaves;
+the prompt's last token's logits from the LM head alone (``ModelOverlay.logits_of``).
 
 A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256) runs layer-major in sub-chunks of ``SUB`` tokens, of
 ``BIG`` where T is a multiple of it (qkv in its ``SUB``-token items): each operator of a layer runs over the sub-chunks
@@ -107,7 +108,7 @@ class LlamaPrefill(ChunkPrefill):
 
     def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES):
         ov = overlay
-        s = PA.Shape(ov.hd, ov.nh, ov.kp, ov.T)
+        s = PA.Shape(ov.hd, ov.nh, ov.kp, ov.T, 2 if ov.cfg.qk_norm else 1)  # (Qwen3: Q hi + lo, ``prefill.attn``)
         pq = 32 * s.blocks[0]  # (the flash attention's queries per pass: at most 64 passes a chunk, 8B's 2048 tokens)
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and t // pq <= 64))
         self.layers = ov.layers
@@ -152,7 +153,8 @@ class LlamaPrefill(ChunkPrefill):
             for pt in {self._pt(T) for T in self.sizes if self._t(T) == t}:
                 if (_key(lay), pt) not in preps:
                     preps[(_key(lay), pt)] = PA.PrepOperator(T=pt, shape=self.shape, layout=lay, kv_bytes=ov.kv_bytes,
-                                                             cs_positions=self.cs_rows, kv_pad=self.pad)
+                                                             cs_positions=self.cs_rows, kv_pad=self.pad,
+                                                             norm=cfg.qk_norm, eps=cfg.rms_norm_eps)
         o = _Ops(plans, qt, pitch, dp, parts, f_part,
                  PrefillNormOperator(T=t, add=False, E=H, eps=cfg.rms_norm_eps, cols=self._norm_cols(t)), {}, preps)
         for n in {t, *(m for m in NORM_SIZES if t <= m <= max(T for T in self.sizes if self._t(T) == t))}:
@@ -212,6 +214,7 @@ class LlamaPrefill(ChunkPrefill):
                 self.np_off[(L, n)] = k * 2 * H
                 k += 1
         self.np_bytes = k * 2 * H
+        self.nw = PA.PrepOperator.nw_bytes(s.hd) if cfg.qk_norm else 0  # (a layer's q / k norm weights: NW)
 
     def _np(self, key: object) -> str:
         o = self.np_off[key]
@@ -251,7 +254,7 @@ class LlamaPrefill(ChunkPrefill):
         rl: list[tuple] = [(o.n_in, tok("PX", j, o.n_in, i=0), self._np("in"), tok("PXN", j, o.n_in, i=2))
                            for j in range(S)]
         starts = []
-        for L in self.layers:
+        for li, L in enumerate(self.layers):
             starts.append(len(rl))
             qt = o.qt
             rl += [(g.op, sl("PXN", j * qt * rb["PXN"], g.op, i=0), self._w(g), sl("G", j * qt * rg, g.op, i=2))
@@ -260,8 +263,9 @@ class LlamaPrefill(ChunkPrefill):
             prep, attn = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)], self.attn[S * t]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
             pg = pt // s.pg * s.group
+            nw = [f"NW[{self.nw * li}:{self.nw * (li + 1)}]"] if self.nw else []
             rl += [(prep, tok("G", 0, prep, i=0, row=rg, extra=b * pt * rg), sl("CS", b * pt * 4 * s.hd, prep, i=1),
-                    tok("QS", 0, prep, i=2, extra=b * pt * rb["QS"]), f"KV[{kv0 + b * pg}:{kv0 + b * pg + kvb}]")
+                    tok("QS", 0, prep, i=2, extra=b * pt * rb["QS"]), f"KV[{kv0 + b * pg}:{kv0 + b * pg + kvb}]", *nw)
                    for b in range(S * t // pt)]
             rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2)))
             (g,) = o.plans[(L, "o")].gemms
@@ -290,7 +294,7 @@ class LlamaPrefill(ChunkPrefill):
         own["F"] = own["F"] + max(o.f_part for o in self.ops.values())
 
     def _bind(self) -> None:
-        """The norms' parameter objects (NP), the cos / sin table (CS)."""
+        """The norms' parameter objects (NP), the q / k norms' weights (NW: Qwen3), the cos / sin table (CS)."""
         dev, H = self.ov.dev, self.H
         npb = dev.view("NP").view(np.uint16)
 
@@ -305,6 +309,13 @@ class LlamaPrefill(ChunkPrefill):
             put((L, "d"), f"blk.{self.layers[i + 1]}.attn_norm.weight" if i + 1 < len(self.layers)
                 else "output_norm.weight")
         dev.flush("NP")
+        if self.nw:  # (per layer [q_norm | k_norm] fp32, the prep's NW objects)
+            nw = dev.view("NW")
+            for i, L in enumerate(self.layers):
+                w = np.concatenate([np.asarray(self.ov.gguf.tensor(f"blk.{L}.attn_{n}_norm.weight").dequantize(),
+                                               np.float32).reshape(-1) for n in "qk"]).view(np.uint8)
+                nw[i * self.nw:i * self.nw + w.size] = w
+            dev.flush("NW")
         cs = PA.cs_table(self.cfg.rope_inv_freq(), self.cs_rows).view(np.uint8).reshape(-1)
         dev.view("CS")[:cs.size] = cs
         dev.flush("CS")

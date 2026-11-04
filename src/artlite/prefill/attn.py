@@ -1,4 +1,4 @@
-"""The attention of a prefill on the decode's KV record format (``decode.kv``), one column per KV head (Llama): a
+"""The attention of a prefill on the decode's KV record format (``decode.kv``), one column per KV head (Llama, Qwen3): a
 T-token chunk at position p0 of one layer, from the qkv GEMMs' output G (``prefill.gemm``: per column c [q of its qh
 heads | k | v] of KV head c) to the O GEMM's A panels, with the chunk's K / V records in the decode's cache, so the
 decode continues from them. A KV head's cache is groups of kp + 1 objects of the image's tile size (kp K objects of
@@ -8,8 +8,11 @@ in rotate-half order), scores in log2 units: q k log2(e) / sqrt(hd).
 
 ``PrepOperator``: per column c, cores (c, 2) and (c, 3) the Q heads (the first half of the column's heads, the rest),
 (c, 4) K, (c, 5) V. Per 8 tokens a Q core turns each of its heads' rows into the attention's operands: q rotated (fp32)
-times the score constant, as single bfp16 panels of 8 queries x 8 dims (ND panels: a Q unit); QS holds per token group
-and column the qh heads' units. The K core writes K rotated (fp32) as the cache's K
+times the score constant, as single bfp16 panels of 8 queries x 8 dims (ND panels: a Q unit; ``Shape.qp`` 2: hi then
+lo panels, 2 ND); QS holds per token group and column the qh heads' units. Qwen3's q and k are RMS-normed per head and
+times their weights per dim first (``norm``: the layer's weights the cores' first object; its weights reach ~100, so a
+row's dims span ~1e5 within a block: Q hi + lo, KL 0.0005-0.0023 of Qwen3 0.6B less on the CPU model with the
+attention's roundings). The K core writes K rotated (fp32) as the cache's K
 records (kp per 8 dims: hi + lo, or single panels), the V core V (bf16) as V records (per 8 dims a panel of blocks over
 the 8 positions); each fills a group's K objects (V object) in L1 and the memtile joins them into the group's objects
 (one transfer per group: a column's shim has two output channels). cos / sin from a table of every position
@@ -21,11 +24,12 @@ the pass's and writes their outputs as the O GEMM's A panels. Two streams per co
 broadcast to the column's 4 cores (a core's two input channels): A the K records (a single-K cache: its K objects,
 each unit's two records interleaved per d-block; hi + lo: each group's [K | K] objects, the memtile skipping the first
 one's padding), B the pass's Q units ahead of the V objects, both in objects of two units read per d half (a core keeps
-its own Q units). A unit is 144 ND bytes: a hi + lo K record (two single ones), two V records, two row blocks' Q units.
-Per chunk of CR records (QB, CR: the most that L1 holds, ``Shape.blocks``):
+its own Q units). A unit is 144 ND bytes: a hi + lo K record (two single ones), two V records, two row blocks' Q units
+(hi + lo Q: one row block's). Per chunk of CR records (QB, CR: the most that L1 holds, ``Shape.blocks``):
 
 - the scores on the MMUL, the accumulators starting at the rows' bias: per pair of row blocks one loop of two panel
-  streams (Q | K0, K1: four chains, MMUL-bound; hi + lo K: a loop for K hi, then one for K lo);
+  streams (Q | K0, K1: four chains, MMUL-bound; hi + lo K: a loop for K hi, then one for K lo; hi + lo Q: each Q panel
+  pair's products into the same accumulators, Q lo against K hi only);
 - the softmax with a running maximum per row, raised (o, l rescaled) only when the chunk's maximum exceeds it by 2^16
   (qwen35's ``attn_prefill``; the chunk's maxima in bf16: m is only the reference of 2^(s - m)); masks only on a
   diagonal chunk; P = 2^(s - m) times 2^64 (o / l cancels it) by ``km.exp2``, clamped at 2^-63 of that (masked scores
@@ -88,12 +92,13 @@ L1 = 0x10000 - 512  # a core's data memory for its buffers (a margin for aiecc's
 @dataclass(frozen=True)
 class Shape:
     """The attention's shapes: head_dim, query heads per KV head (a column's), K panels per record, the cache's object
-    bytes."""
+    bytes, Q panels per row block (``qp``: 1 single bfp16, 2 hi + lo)."""
 
     hd: int
     qh: int
     kp: int
     a_bytes: int
+    qp: int = 1
 
     @cached_property
     def nd(self) -> int:
@@ -108,8 +113,8 @@ class Shape:
         return 144 * self.nd
 
     @cached_property
-    def qunit(self) -> int:  # bytes of a row block's Q panels (single bfp16: 8 queries x 8 dims per panel)
-        return 72 * self.nd
+    def qunit(self) -> int:  # bytes of a row block's Q panels (8 queries x 8 dims per panel; hi + lo: [hi ND | lo ND])
+        return 72 * self.nd * self.qp
 
     @cached_property
     def rg(self) -> int:  # records per cache group
@@ -156,16 +161,34 @@ def cs_table(inv_freq: np.ndarray, n: int) -> np.ndarray:
 
 
 _PREP = JINJA_ENV.from_string(r"""
-// The prep cores' workspace (bytes): row (HD fp32) | stage [db ND][row 8][8] fp32
+// The prep cores' workspace (bytes): row (HD fp32) | stage [db ND][row 8][8] fp32{{ " | nrm [q_norm | k_norm] fp32" if NORM else "" }}
 #define PW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
 
+{% if NORM %}
+// x (HD bf16) -> row = x / rms(x) w (fp32: x times 1 / rms's hi and lo parts, times w), the pairs (i, i + HD / 2)
+// rotated by cs [cos HD / 2 | sin HD / 2]
+__attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict w, const float *__restrict cs,
+                                            float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < {{ HD }}; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, 64> ih, il;
+    al::bf16_hilo<64>(inv, ih, il);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
+        aie::store_v(row + i, al::mulff<64>(aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>(), aie::load_v<64>(w + i)));
+    }
+{% else %}
 // x (HD bf16) -> row (fp32), the pairs (i, i + HD / 2) rotated by cs [cos HD / 2 | sin HD / 2]
 __attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict row)
 {
     for (int i = 0; i < {{ HD }}; i += 32)
         aie::store_v(row + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
+{% endif %}
     for (int i = 0; i < {{ HD // 2 }}; i += 32) {
         const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
         const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ HD // 2 }} + i);
@@ -203,7 +226,7 @@ __attribute__((noinline)) void {{ p }}_hilo(const float *__restrict st, uint8_t 
 }
 
 // 8 tokens of head h of the core's nq (rows of nq HD bf16), cs (8 x [cos | sin] fp32) -> unit h of out: the Q panels
-// (single bfp16) of q rotated, times the score constant
+// ({{ "hi then lo" if QP == 2 else "single bfp16" }}) of q rotated, times the score constant
 __attribute__((noinline)) void {{ p }}_qh(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws,
                                           bfloat16 *__restrict out, int32_t h, int32_t nq)
 {
@@ -212,22 +235,34 @@ __attribute__((noinline)) void {{ p }}_qh(const bfloat16 *__restrict q, const bf
     float *__restrict row = PW(float, {{ w.row }});
     float *__restrict st = PW(float, {{ w.stage }});
     for (int r = 0; r < 8; r++) {
-        {{ p }}_rope(q + {{ HD }} * (nq * r + h), cs + {{ HD }} * r, row);
+        {{ p }}_rope(q + {{ HD }} * (nq * r + h), {% if NORM %}PW(float, {{ w.nrm }}), {% endif %}cs + {{ HD }} * r, row);
         for (int i = 0; i < {{ HD }}; i += 64)
             aie::store_v(row + i, al::mul_hilo<64, {{ qc[0] }}f, {{ qc[1] }}f>(aie::load_v<64>(row + i)));
         {{ p }}_scatter(row, st, r);
     }
+{% if QP == 2 %}
+    {{ p }}_hilo(st, (uint8_t *)out + {{ QUNIT }} * h);
+{% else %}
     al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ QUNIT }} * h));
     for (int db = 0; db < {{ ND }}; db++) {
         o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
         st += 64;
     }
+{% endif %}
 }
 
 }  // namespace
 
 extern "C" {
 
+{% if NORM %}
+// The B stream's first object: the layer's q_norm, k_norm (HD fp32 each)
+void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
+{
+    al::copy<{{ 2 * HD }}, 16>(PW(float, {{ w.nrm }}), (const float *)n);
+}
+
+{% endif %}
 {% for i in range(2) %}
 // the Q core {{ i }}'s (its own buffer sizes)
 void {{ p }}_q{{ i }}(const bfloat16 *__restrict q, const bfloat16 *__restrict cs, float *__restrict ws, bfloat16 *__restrict out,
@@ -246,7 +281,7 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
     float *__restrict row = PW(float, {{ w.row }});
     float *__restrict st = PW(float, {{ w.stage }});
     for (int t = 0; t < 8; t++) {
-        {{ p }}_rope(k + {{ HD }} * t, cs + {{ HD }} * t, row);
+        {{ p }}_rope(k + {{ HD }} * t, {% if NORM %}PW(float, {{ w.nrm }}) + {{ HD }}, {% endif %}cs + {{ HD }} * t, row);
         {{ p }}_scatter(row, st, t);
     }
     uint8_t *__restrict rec = (uint8_t *)out + {{ KREC }} * r;
@@ -284,30 +319,37 @@ void {{ p }}_v(const bfloat16 *__restrict v, bfloat16 *__restrict out, int32_t r
 class PrepOperator(ArtcOperator):
     """The attention prep of T tokens (module docstring). Runtime sequence: G (the qkv GEMM's output, ``layout``), CS
     (``cs_table`` of every position, as bf16 pairs), QS (per token group and column the heads' Q units; a sub-chunk's
-    part of a chunk's), KV (the layer's cache: COLS KV heads of ``kv_bytes`` each, ``kv_pad`` bytes past them).
-    Parameters ``params``."""
+    part of a chunk's), KV (the layer's cache: COLS KV heads of ``kv_bytes`` each, ``kv_pad`` bytes past them); with
+    ``norm`` (Qwen3: q and k RMS-normed per head with weights per dim before RoPE, ``eps``) NW, the layer's [q_norm |
+    k_norm] fp32 (``nw_bytes``: the B stream's first object, before the cos / sin rows). Parameters ``params``."""
 
     STACK = 1024
     pfx = kernel_prefix("pap")
 
-    def __init__(self, *, T: int, shape: Shape, layout: Layout, kv_bytes: int, cs_positions: int, kv_pad: int = 0):
+    def __init__(self, *, T: int, shape: Shape, layout: Layout, kv_bytes: int, cs_positions: int, kv_pad: int = 0,
+                 norm: bool = False, eps: float = 1e-6):
         s = shape
         assert T % s.pg == 0 and T // s.pg <= 64 and {"q", "k", "v"} <= set(layout.off)
-        assert s.qh in (3, 4) and s.used % 1152 == 0
+        assert s.qh in (2, 3, 4) and s.used % 1152 == 0
         self.T, self.shape, self.layout, self.kv_bytes, self.cs_positions = T, s, layout, kv_bytes, cs_positions
-        self.kv_pad = kv_pad
+        self.kv_pad, self.norm, self.eps = kv_pad, norm, eps
         self.nq = [-(-s.qh // 2), s.qh // 2]  # (the Q cores' heads)
         super().__init__()
 
+    @staticmethod
+    def nw_bytes(hd: int) -> int:
+        """Bytes of a layer's NW object (the B stream's objects: 8 positions' cos / sin; its weights 8 hd)."""
+        return 8 * 2 * hd * 2
+
     def workspace(self) -> dict[str, int]:
         hd = self.shape.hd
-        return regions([("row", 4 * hd), ("stage", 32 * hd)])
+        return regions([("row", 4 * hd), ("stage", 32 * hd)] + ([("nrm", 8 * hd)] if self.norm else []))
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         s = self.shape
-        return _PREP.render(p=p, HD=s.hd, ND=s.nd, KP=s.kp, KREC=s.rec.k_bytes, QUNIT=s.qunit, qc=bf16_hilo(s.scale),
-                            w=Attr(self.workspace()))
+        return _PREP.render(p=p, HD=s.hd, ND=s.nd, KP=s.kp, QP=s.qp, KREC=s.rec.k_bytes, QUNIT=s.qunit,
+                            qc=bf16_hilo(s.scale), w=Attr(self.workspace()), NORM=self.norm, eps=repr(self.eps))
 
     @property
     def n_cs(self) -> int:
@@ -323,8 +365,9 @@ class PrepOperator(ArtcOperator):
         return (COLS * self.kv_bytes + self.kv_pad) // 2
 
     def get_arg_spec(self) -> list[ArgSpec]:
+        nw = [ArgSpec("in", (self.nw_bytes(self.shape.hd) // 2,), torch.bfloat16)] if self.norm else []
         return [ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16), ArgSpec("in", (self.n_cs,), torch.bfloat16),
-                ArgSpec("out", (self.n_qs,), torch.bfloat16), ArgSpec("out", (self.n_kv,), torch.bfloat16)]
+                ArgSpec("out", (self.n_qs,), torch.bfloat16), ArgSpec("out", (self.n_kv,), torch.bfloat16), *nw]
 
     def params(self, p0: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 (a group start)."""
@@ -347,6 +390,7 @@ class PrepOperator(ArtcOperator):
         k_q1 = Kernel(f"{p}_q1", "kernel.o", [q_ty[1], cs_ty, ws_ty, qo_ty[1], np.int32, np.int32])
         k_k = Kernel(f"{p}_k", "kernel.o", [row_ty, cs_ty, ws_ty, kg_ty, np.int32])
         k_v = Kernel(f"{p}_v", "kernel.o", [row_ty, vg_ty, np.int32])
+        k_prm = Kernel(f"{p}_prm", "kernel.o", [cs_ty, ws_ty]) if self.norm else None
         p_cs, p_kv = ScratchpadParameter(P_CS, np.int32), ScratchpadParameter(P_KV, np.int32)
         n_tg, rg, n_grp = T // 8, s.rg, T // s.pg
 
@@ -365,8 +409,15 @@ class PrepOperator(ArtcOperator):
         g1 = [g3[c].prod().join([0, s.kp * s.used // 2], tile=Tile(c, 1), depths=[2, 2], obj_types=[kg_ty, vg_ty],
                                 names=[f"lp_k{c}", f"lp_v{c}"]) for c in range(COLS)]
 
-        def core_q(a_h, b_h, o_h, fn, ws, n):
+        def prm(b_h, fn, ws):  # (norm: the layer's weights, the B stream's first object)
+            if fn is not None:
+                w = b_h.acquire(1)
+                fn(w, ws)
+                b_h.release(1)
+
+        def core_q(a_h, b_h, o_h, fn, ws, n, k_prm):
             for _ in forever_():
+                prm(b_h, k_prm, ws)
                 for _ in range_(n_tg):
                     x = a_h.acquire(1)
                     cs = b_h.acquire(1)
@@ -377,8 +428,9 @@ class PrepOperator(ArtcOperator):
                     b_h.release(1)
                     a_h.release(1)
 
-        def core_k(a_h, b_h, o_h, fn, ws):
+        def core_k(a_h, b_h, o_h, fn, ws, k_prm):
             for _ in forever_():
+                prm(b_h, k_prm, ws)
                 for _ in range_(n_grp):
                     out = o_h.acquire(1)
                     for r in range_(rg):
@@ -403,11 +455,11 @@ class PrepOperator(ArtcOperator):
         for c in range(COLS):
             for i, fn in enumerate((k_q, k_q1)):
                 workers.append(Worker(core_q, [a1[c][i].cons(), b[c].cons(), o1[c][i].prod(), fn,
-                                               Buffer(ws_ty, name=f"lp_ws{c}_{i}"), nq[i]],
+                                               Buffer(ws_ty, name=f"lp_ws{c}_{i}"), nq[i], k_prm],
                                       tile=Tile(c, 2 + i), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
             workers.append(Worker(core_k, [a1[c][2].cons(), b[c].cons(), g1[c][0].prod(), k_k,
-                                           Buffer(ws_ty, name=f"lp_ws{c}_k")],
+                                           Buffer(ws_ty, name=f"lp_ws{c}_k"), k_prm],
                                   tile=Tile(c, 4), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                   while_true=False))
             workers.append(Worker(core_v, [a1[c][3].cons(), g1[c][1].prod(), k_v], tile=Tile(c, 5),
@@ -416,7 +468,10 @@ class PrepOperator(ArtcOperator):
         uw, qw = s.qunit // 2, s.qh * s.qunit // 2  # (bf16: a Q unit, a column's units of a token group)
         hb, g2, o2, ow = self.kv_bytes // 2, s.group // 2, s.a_bytes // 2, s.used // 2
 
-        def seq(G, CS, QS, KV, ah, bh, oh, gh):
+        n_nw = self.nw_bytes(hd) // 2
+
+        def seq(G, CS, QS, KV, *rest):
+            *nw, ah, bh, oh, gh = rest
             sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
@@ -428,8 +483,12 @@ class PrepOperator(ArtcOperator):
                         TensorAccessPattern((T * N,), q0 + nq[0] * hd, [nt, 1, 8, nq[1] * hd], [8 * N, 0, N, 1]),
                         TensorAccessPattern((T * N,), k0, [nt, 2, 8, hd], [8 * N, lay.off["v"] - lay.off["k"], N, 1])],
                         tg)
-                bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 2 * hd], [0, 0, 0, 1]),
-                           offset_parameter=p_cs, group=tg)
+                cs = TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 2 * hd], [0, 0, 0, 1])
+                if nw:
+                    chained_fill(bh[c], CS, [ChainPart(nw[0], TensorAccessPattern((n_nw,), 0, [1, 1, 1, n_nw], [0, 0, 0, 1])),
+                                             ChainPart(CS, cs, offset_parameter=p_cs)], tg)
+                else:
+                    bh[c].fill(CS, cs, offset_parameter=p_cs, group=tg)
                 oh[c].drain(QS, TensorAccessPattern((n_qs,), c * n_tg * qw, [1, n_tg, s.qh, uw], [0, qw, uw, 1]),
                             group=tg, wait=True)
                 # per group its objects' records (rows of 576 elements: a shim BD's inner dimension <= 1023 words)
@@ -438,7 +497,7 @@ class PrepOperator(ArtcOperator):
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(T * N,), bf], np.ndarray[(n_cs,), bf], np.ndarray[(n_qs,), bf],
-                           np.ndarray[(n_kv,), bf],
+                           np.ndarray[(n_kv,), bf], *([np.ndarray[(n_nw,), bf]] if self.norm else []),
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)],
@@ -613,15 +672,33 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
     st[1] = st[0] - {{ QB - 1 }} > 0;
 }
 
+{% if QP == 2 %}
+// The pass's L1 unit i (of {{ 4 * RB }}: d half i % 2 of the slices 4 (i / 2) ..: per d-block pair 4 slices [d-block 2], a
+// pair of row blocks' [hi | lo] units): the core's own pairs (row blocks me .. me + {{ RB - 1 }}) into q (per pair [d half]
+// [d-block pair][8 panels])
+{% else %}
 // The pass's L1 unit i (of {{ 2 * RB }}: d half i % 2 of the Q units 4 (i / 2) ..: per d-block pair 4 slices [d-block 2], a
 // pair of row blocks the first two slices, the next pair the others): the core's own pairs (row blocks me .. me + {{ RB - 1 }})
 // into q (per pair [d half][d-block pair][4 panels])
+{% endif %}
 __attribute__((minsize)) void {{ p }}_qsel(const bfloat16 *__restrict u, bfloat16 *__restrict q, int32_t i, int32_t me)
 {
 {% if "ev_q" in ablate %}
     if (i == 0)
         event0();
 {% endif %}
+{% if QP == 2 %}
+    const int pr = (i >> 1) - (me >> 1);  // (the core's pair)
+    if (pr < 0 || pr >= {{ RB // 2 }})
+        return;
+    const bfloat16 *__restrict a = u;
+    bfloat16 *__restrict d = q + {{ QUNIT }} * pr + {{ QUNIT // 2 }} * (i & 1);
+    for (int j = 0; j < {{ ND // 4 }}; j++) {
+        al::copy<288, 16>(d, a);
+        a += 288;
+        d += 288;
+    }
+{% else %}
     for (int pp = 0; pp < 2; pp++) {
         const int pr = 2 * (i >> 1) + pp - (me >> 1);  // (the core's pair)
         if (pr < 0 || pr >= {{ RB // 2 }})
@@ -634,6 +711,7 @@ __attribute__((minsize)) void {{ p }}_qsel(const bfloat16 *__restrict u, bfloat1
             d += 144;
         }
     }
+{% endif %}
 }
 
 // Scores of the chunk's K unit kk for each pair of row blocks, A = s + bias (the accumulators start at the rows' bias)
@@ -674,6 +752,7 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
         for (int j = 0; j < {{ ND // 2 }}; j++) {  // (d-blocks 2 j, 2 j + 1)
             const al::BV K0 = ks.pop(), K1 = ks.pop(), K0n = ks.pop(), K1n = ks.pop();
 {% for e in (0, 1) %}
+{% for part in range(QP) %}
             {
                 const al::BV Q = qs.pop(), Qn = qs.pop();
                 c{{ e }}0.mac(Q, aie::op_transpose(K0));
@@ -681,6 +760,7 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
                 c{{ e }}0.mac(Qn, aie::op_transpose(K0n));
                 c{{ e }}1.mac(Qn, aie::op_transpose(K1n));
             }
+{% endfor %}
 {% endfor %}
         }
         aie::store_v(s, c00.template to_vector<float>());
@@ -699,11 +779,18 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
             for (int j = 0; j < {{ ND // 2 }}; j++) {
                 const al::BV K = ks.pop(), Kn = ks.pop();
 {% for e in (0, 1) %}
+{% for part in range(QP) %}
                 {
                     const al::BV Q = qs.pop(), Qn = qs.pop();
+{% if part == 0 or half == 0 %}
                     c{{ e }}.mac(Q, aie::op_transpose(K));
                     c{{ e }}.mac(Qn, aie::op_transpose(Kn));
+{% else %}
+                    (void)Q;  // (Q lo against K lo: below the products' 2^-16)
+                    (void)Qn;
+{% endif %}
                 }
+{% endfor %}
 {% endfor %}
             }
         }
@@ -848,7 +935,7 @@ class AttnOperator(ArtcOperator):
         s = self.shape
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
-                            KP=s.kp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
+                            KP=s.kp, QP=s.qp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
 
     @property
     def n_qs(self) -> int:
@@ -947,7 +1034,8 @@ class AttnOperator(ArtcOperator):
             for _ in forever_():
                 for bg in range_(n_pass // m):
                     for bb in range(m):  # (the pass's units to every core: each keeps its own)
-                        turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb, 2 * rb)
+                        turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb,
+                             2 * rb * s.qp)
 
         workers = [Worker(core, [a1[c].cons(), b1[c].cons(), o1[c][r].prod(), k_init, k_grp, k_qsel, k_qk, k_soft,
                                  k_pv, k_fin, Buffer(ws_ty, name=f"la_ws{c}_{r}"), Buffer(wo_ty, name=f"la_wo{c}_{r}"),

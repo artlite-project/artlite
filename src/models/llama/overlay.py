@@ -1,5 +1,5 @@
-"""A Llama 3.x model on its decode overlay (``llama/decode.py``): buffers, the transaction of a step of S <= 4 token
-slots, the step.
+"""A Llama 3.x or Qwen3 model on its decode overlay (``llama/decode.py``): buffers, the transaction of a step of S <= 4
+token slots, the step (Qwen3: its q / k norms' weights in the attention's q and K / V objects, ``_load_attention``).
 
 Per step (one dispatch; the weights stream once for all slots) the columns read the token objects (per sub-step its
 positions and the cache's range, the RoPE tables) and the slots' residual slices (F_LOADR: the embeddings, fp32), then
@@ -136,7 +136,7 @@ class LlamaOverlay(ModelOverlay):
         fmts = check_formats(img)
         self.hd, self.nh, self.kp = cfg.head_dim, cfg.q_per_kv, KV_K[kv_k]
         self.at = at = Attn(hds=(self.hd,), rot=(self.hd // 2,), chain=1, heads=self.nh, kp=self.kp,
-                            eps=cfg.rms_norm_eps, a_bytes=self.T)
+                            qk_norm=cfg.qk_norm, qk_weights=cfg.qk_norm, eps=cfg.rms_norm_eps, a_bytes=self.T)
         gu = {b.R for L in self.layers for b in img.region(L, "gate_up").blocks}
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                       eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16}, paged=paged_formats(gguf, fmts))
@@ -212,9 +212,13 @@ class LlamaOverlay(ModelOverlay):
     def _load_attention(self, L: int) -> None:
         """The metadata words of layer L's q and K / V objects: q object a's the F_ATT object of the sub-step from a on
         (static but M_ATREC: ``_tails``); K / V object a's M_NASKIP = -1 - a: after it the main core skips the cache
-        objects of token a (those of the sub-step that ends at slot a, else none)."""
+        objects of token a (those of the sub-step that ends at slot a, else none). With q / k norms their weights (hd
+        fp32) after the payloads the qkv drains write: q_norm after a q object's heads, k_norm after a K / V object's
+        [K | V]."""
         act = self.dev.view("ACT")
         hi, lo = score_bits(1 / math.sqrt(self.hd))
+        w = {n: np.asarray(self.gguf.tensor(f"blk.{L}.attn_{n}_norm.weight").dequantize(), np.float32).reshape(-1)
+             .view(np.uint8) for n in ("q", "k")} if self.cfg.qk_norm else {}
         for c in range(COLS):
             for a in range(SLOTS):
                 m = np.zeros(META, np.int32)
@@ -224,10 +228,14 @@ class LlamaOverlay(ModelOverlay):
                 m[M_ANH], m[M_ATOK] = self.nh, a
                 o = self.att_reg[(L, c)] + a * XB
                 act[o:o + 4 * META] = m.view(np.uint8)
+                if w:
+                    act[o + 4 * META + 2 * self.nh * self.hd:][:w["q"].size] = w["q"]
                 m = np.zeros(META, np.int32)
                 m[M_NASKIP] = -1 - a
                 o = self.att_reg[(L, c)] + (SLOTS + a) * XB
                 act[o:o + 4 * META] = m.view(np.uint8)
+                if w:
+                    act[o + 4 * META + 4 * self.hd:][:w["k"].size] = w["k"]
 
     # ------------------------------------------------------------------
     # The transaction of a step

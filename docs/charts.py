@@ -32,7 +32,7 @@ PAD = 24
 FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif'
 # color order: a runtime keeps its color whoever else is drawn
 RUNTIMES = ("Artlite", "FastFlowLM", "llama.cpp", "OpenFlowLM")
-NOTE_MARKS = "*†‡§¶"
+NOTE_MARKS = "*†‡§¶‖"
 
 
 @dataclass(frozen=True)

@@ -43,17 +43,20 @@ and generation speeds go to stderr.
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |
 | `--dflash`, `--no-dflash` | Qwen3.8 27B: draft with its DFlash2 block drafter ([qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)) or with its MTP layer (default: the block drafter where its file is in the models directory) |
-| `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Gemma 4), below |
+| `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4), below |
 | `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
 | `--max-slices N` | an image's slices at most (default: the mmproj's, 9; the model card uses 36) |
 
-The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen
-the file's `general.sampling.*`, else its model card's.
+The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen3
+its model card's (thinking: temperature 0.6, top-k 20, top-p 0.95; else 0.7, 20, 0.8); Qwen3.5 and later the file's
+`general.sampling.*`, else its model card's.
 
 `--kv-k` stores K as one bfp16 value per 8 dims (`single`) or as bfp16 hi + lo (`hilo`: 1.5x the cache and its read
 time). Llama's default is `single`: `hilo` makes decode at 32K 1.2x slower with no measured quality gain. Gemma 4's
 default is `hilo`: `single` takes 2/3 of the cache at KL 0.00028 instead of 0.00023 against the same file on the CPU.
+Qwen3's default is `hilo`: its K norm's weights (up to ~100) leave dims a thousand times below their block's largest,
+and `single` takes the KL against the same file on the CPU from 0.0037 to 0.0085 (Qwen3 0.6B, a chat).
 
 Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and draft tokens after it, which a step checks at a
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so

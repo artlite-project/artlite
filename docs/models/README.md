@@ -1,7 +1,8 @@
 # Models
 
-How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Gemma 4](gemma4.md),
-[Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [Stable Diffusion 1.5](sd15.md).
+How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
+[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md),
+[Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
 `~/.artlite/models`) as `<account>/<repository>/<file>`: [Installation](../install.md#models-directory). A GGUF file's
@@ -34,6 +35,10 @@ architecture, tokenizer and chat template come from its metadata.
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |
 | dflash | ✅ Qwen3.8 27B's DFlash2 drafter | z-lab Q4_K_M | |
 | | 🤔 MiniCPM-V 4.7 1B's DSpark drafter | | openbmb F16, Q4_K_M |
-| qwen3 | 🤔 Qwen3 0.6B | | unsloth Q4_1 |
+| qwen3 | ✅ Qwen3 0.6B | unsloth Q4_1 | |
+| | ✅ Qwen3-Embedding-0.6B ([embeddings](../server.md#embeddings-and-rerank)) | Qwen Q8_0 | |
+| | 🤔 Qwen3-Embedding-4B | | Qwen Q4_K_M (a hidden width of 2560) |
+| | ✅ Qwen3-Reranker-0.6B ([rerank](../server.md#embeddings-and-rerank)) | ggml-org Q8_0 | |
+| vllm-decision2 | ✅ vllm-sr Decision-2.0-Kai-0.6B (decision model: [`/v1/systemone`](../server.md#decisions)) | Q8_0 by llama.cpp's converter from vllm-sr's checkpoint | |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
 | speech recognition | 🤔 Whisper base.en | | whisper.cpp `ggml-base.en.bin` |
