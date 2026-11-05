@@ -483,7 +483,8 @@ _ATTN = JINJA_ENV.from_string(r"""
 // query q's running maximum, 192 - m, the partial sums), o [panel][db 32][8 x 8] fp32{{ ", ob its second copy (P V
 // reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, its own buffer): P [8][32],
 // f [8][32] bf16 (or a rescale's row maxima [64] fp32){% if PACK %}; lh [token group QG][lo 8 | hi 8 | the largest lo, the least hi |
-// the history's keys | 5] int32 (per row of the core's token groups its segment's first and last keys){% endif +%}
+// the history's keys | 5] int32 (per row of the core's token groups its segment's first and last keys), lv [token group
+// QG][lo | hi][64 lanes] int16 (lane 8 q + j: row q's), jl [64] int16 (lane 8 q + j: j){% endif +%}
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 {% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="bounded") %}
@@ -523,24 +524,19 @@ __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int
 {% endif %}
 
 {% if PACK %}
-// Keys outside a row's segment (key kc + 8 k + j of record k, lane 8 q + j, outside [lo, hi] of row q): -16384
-__attribute__((noinline, minsize)) void {{ p }}_masklh(float *__restrict s, const int32_t *__restrict lh, int32_t kc)
+// Keys outside a row's segment (key kc + 8 k + j of record k, lane 8 q + j, outside [lo, hi] of row q): -16384 (lv: per
+// lane its row's lo, then hi, ``seg``; jl: per lane j)
+__attribute__((noinline)) void {{ p }}_masklh(float *__restrict s, const int16_t *__restrict lv, const int16_t *__restrict jl,
+                                              int32_t kc)
 {
     const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-16384.0f);
-    AIE_LOOP_NO_UNROLL
+    const aie::vector<int16, 64> lo = aie::load_v<64>(lv), hi = aie::load_v<64>(lv + 64), j = aie::load_v<64>(jl);
     for (int k = 0; k < 4; k++) {
-        uint64_t bits = 0;
-        AIE_LOOP_NO_UNROLL
-        for (int q = 0; q < 8; q++) {
-            int32_t a = lh[q] - kc - 8 * k, b = lh[8 + q] - kc - 8 * k + 1;  // (the row's keys of the record: [a, b))
-            a = a < 0 ? 0 : a > 8 ? 8 : a;
-            b = b < 0 ? 0 : b > 8 ? 8 : b;
-            bits |= (uint64_t)(~(((1u << b) - 1u) & ~((1u << a) - 1u)) & 0xFFu) << (8 * q);
-        }
-        aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, aie::mask<64>::from_uint64(bits)));
+        const aie::vector<int16, 64> b = aie::broadcast<int16, 64>((int16_t)(kc + 8 * k));
+        const aie::mask<64> m = aie::lt(j, aie::sub(lo, b)) | aie::lt(aie::sub(hi, b), j);
+        aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, m));
     }
 }
-
 {% endif %}
 {% if not CAUSAL %}
 // Keys past the prompt's in its last group (non-causal: the group's first nk keys are the prompt's): -16384
@@ -786,7 +782,11 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int3
             const int32_t *__restrict lh = AW(int32_t, {{ w.lh }}) + 24 * (h % {{ QG }});  // (the panel's token group)
             const int32_t kc = 32 * g - lh[18];  // (the group's first key in the chunk; < 0: the history, every row's)
             if (kc >= 0 && (kc < lh[16] || kc + 31 > lh[17]))  // (the group reaches outside a row's segment)
-                {{ p }}_masklh(s, lh, kc);
+{% if "mask" in ablate %}
+                ;
+{% else %}
+                {{ p }}_masklh(s, AW(int16_t, {{ w.lv }}) + 128 * (h % {{ QG }}), AW(int16_t, {{ w.jl }}), kc);
+{% endif %}
         }
 {% elif CAUSAL %}
         const int t = {{ QG }} * r + h % {{ QG }}, dd = diag - ({{ QG - 1 }} - (t >> 2));
@@ -919,7 +919,18 @@ void {{ p }}_seg(const bfloat16 *__restrict a,{% if TWO %} const bfloat16 *__res
         lh[16] = mx;
         lh[17] = mn;
         lh[18] = hk;
+        aie::vector<int16, 64> lv, hv;  // (``masklh``'s per lane)
+        AIE_LOOP_UNROLL_FULL
+        for (int q = 0; q < 8; q++) {
+            lv.insert(q, aie::broadcast<int16, 8>(lo[t + q]));
+            hv.insert(q, aie::broadcast<int16, 8>(hi[t + q]));
+        }
+        aie::store_v(AW(int16_t, {{ w.lv }}) + 128 * j, lv);
+        aie::store_v(AW(int16_t, {{ w.lv }}) + 128 * j + 64, hv);
     }
+    int16_t *__restrict jl = AW(int16_t, {{ w.jl }});
+    for (int l = 0; l < 64; l += 2)
+        ((int32_t *)jl)[l / 2] = (l & 7) | ((l + 1) & 7) << 16;
 }
 
 {% endif %}
@@ -997,7 +1008,8 @@ class PrefillAttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
                  pp: int = 1, pack: bool = False):
-        """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_qk",
+        """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
+        results); "ev_qk",
         "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
         two streams only). ``pp``: P as single bfp16 panels (1) or hi + lo (2: P V's error gone; one stream: the lo pair
         in the same loop, two streams: P V once per part)."""
@@ -1021,7 +1033,7 @@ class PrefillAttnOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         R = self.R
         sizes = [("sc", R * 1024), ("m", R * 256), ("b", R * 256), ("l", R * 256)] + \
-            ([("lh", 96 * self.qg)] if self.pack else []) + [("o", R * 8192)]
+            ([("lh", 96 * self.qg), ("lv", 256 * self.qg), ("jl", 128)] if self.pack else []) + [("o", R * 8192)]
         return regions(sizes + [("ob", R * 8192)] if self.ob else sizes)
 
     def get_kernel_src(self) -> str:
