@@ -46,6 +46,7 @@ from .engine import Engine
 log = logging.getLogger("artlite.server")
 
 ENV = "ARTLITE_ARG_"
+SHARE = "ARTLITE_ROUTER_MODELS"  # (a router's model server: --models-max, its default prompt cache's part of the RAM)
 DEFAULT_CTX = 32768  # -c 0 (capped at the model's context)
 # the router's own options (in router mode each model's server gets its own: ``router``)
 ROUTER = frozenset({"host", "port", "api_key", "api_key_file", "cors_origins", "path", "no_ui", "timeout", "log_file",
@@ -100,8 +101,8 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      help="continue from the prefix a prompt shares with the cached tokens (default: on)")
     gen.add_argument("-cram", "--cache-ram", type=int,
                      help="MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints "
-                          "(default: 8192, at most half of the RAM still available once the model is loaded; -1: no "
-                          "limit, 0: the device's conversation alone)")
+                          "(default: 8192, at most half of the RAM still available once the model is loaded, and in "
+                          "router mode that over --models-max; -1: no limit, 0: the device's conversation alone)")
     gen.add_argument("-ctxcp", "--ctx-checkpoints", type=int, default=32,
                      help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8 and MiniCPM-V that "
                           "a prompt continues from; default: 32)")
@@ -392,7 +393,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
 
     engine = Engine(load, warmup=args.warmup, on_ready=ready, on_exit=failed,
                     cache_ram=None if args.cache_ram is None else args.cache_ram << 20 if args.cache_ram >= 0 else -1,
-                    checkpoints=args.ctx_checkpoints)
+                    share=int(os.environ.get(SHARE) or 1), checkpoints=args.ctx_checkpoints)
     config = uvicorn.Config(create_app(engine, options, info), host=args.host, port=args.port, log_config=None,
                             access_log=args.verbose, timeout_keep_alive=int(args.timeout), lifespan="off")
     server = Server(config, engine.stop)

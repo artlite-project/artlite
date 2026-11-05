@@ -235,7 +235,8 @@ class Engine:
     runs one token through it (``warmup``), then runs the jobs one at a time in arrival order.
 
     The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory - None: ``CACHE_RAM``, at most half of
-    what is still available once the model is loaded (its weights and caches are host memory too) -, ``checkpoints``
+    what is still available once the model is loaded (its weights and caches are host memory too), over ``share``
+    (a router's models: each server's part); a non-causal model's none -, ``checkpoints``
     per sequence): a job continues from what it keeps of its prompt (the device's sequence, a checkpoint, a sequence
     saved in RAM) and runs the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``), with a
     checkpoint at its end; ``cached``: the tokens whose K / V the caches hold (the last sampled token never ran).
@@ -244,14 +245,14 @@ class Engine:
 
     def __init__(self, load: Callable[[], tuple[Model, NpuModel]], *, warmup: bool = True,
                  on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None,
-                 cache_ram: int | None = None, checkpoints: int = 32):
+                 cache_ram: int | None = None, share: int = 1, checkpoints: int = 32):
         self.model: Model | None = None
         self.npu: NpuModel | None = None
         self.cache: PromptCache | None = None
         self.error: str | None = None  # why the load failed
         self.current: Job | None = None
         self._load, self._warmup, self._on_ready, self._on_exit = load, warmup, on_ready, on_exit
-        self._cache_ram, self._checkpoints = cache_ram, checkpoints
+        self._cache_ram, self._share, self._checkpoints = cache_ram, max(share, 1), checkpoints
         self._queue: collections.deque[Job] = collections.deque()
         self._cv = threading.Condition()
         self._stopping = False
@@ -388,10 +389,13 @@ class Engine:
                 self._warm()
             turns = [self.model.tokenizer.encode(t) if t else None for t in (self.model.turn, self.model.user_turn)]
             ram = self._cache_ram
-            if ram is None:
+            if not self.npu.causal:  # (it reads every prompt whole: nothing continues from a saved sequence)
+                ram = 0
+            elif ram is None:
                 free = portable.available_memory()
-                ram = CACHE_RAM if free is None else min(CACHE_RAM, free // 2)
-                log.info("prompt cache: up to %.1f GiB of host RAM (--cache-ram)", ram / 2**30)
+                ram = (CACHE_RAM if free is None else min(CACHE_RAM, free // 2)) // self._share
+                log.info("prompt cache: up to %.1f GiB of host RAM (--cache-ram%s)", ram / 2**30,
+                         f", over --models-max {self._share}" if self._share > 1 else "")
             self.cache = PromptCache(self.npu, ram=ram, checkpoints=self._checkpoints, turn=turns[0],
                                      user_turn=turns[1])
         except Exception as e:  # (any failure of the load: reported, the server exits)

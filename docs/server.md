@@ -221,9 +221,10 @@ button and the shutdown stop a request at its next token or prompt chunk.
 
 A chat's next turn continues from the KV cache: the server keeps the prefix a prompt shares with the cached tokens,
 rounded down to where a prefill chunk can start, and runs the rest. Other conversations stay in host RAM, as in
-llama-server (`--cache-ram`: 8 GiB by default, or half of the RAM left once the model is loaded where that is less):
-when a request continues one of them (an agent's subagent, a title request, another chat in the web UI), its cache is
-copied back to the NPU (~15 GB/s: 30-45 ms for 32K positions of the 35B-A3B) instead of running its prompt again. The
+llama-server (`--cache-ram`: 8 GiB by default, or half of the RAM left once the model is loaded where that is less;
+in router mode each model's part of that: over `--models-max`): when a request continues one of them (an agent's
+subagent, a title request, another chat in the web UI), its cache is copied back to the NPU (~15 GB/s: 30-45 ms for
+32K positions of the 35B-A3B) instead of running its prompt again. The
 Qwen models' Gated DeltaNet states cannot go back, so for them the server saves the states (checkpoints,
 `--ctx-checkpoints`; Qwen3.6-35B-A3B: 80 MB, a few milliseconds each) at the end of each prompt and where its first
 user message begins: a prompt continues from the latest one it shares (the client's own rendering of the last answer,
@@ -261,9 +262,8 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
   command line's model options (`-c`, `-rea`, `--temp`, `--kv-k`, ...); unloading ends that process, which gives all
   its memory back. One process is kept started ahead, so a load does not wait for Python to start (~1.5 s). Loaded
-  models take turns on the NPU: one process's dispatches run while no other's do, and another process's request waits
-  for the running dispatch, or for the next piece boundary of a long prompt (up to two pieces, ~1.6 s, during a
-  32K prompt of a 3B).
+  models take turns on the NPU: one process's dispatches run while no other's do (a side model beside a chat model:
+  below).
 - **API.** `GET /v1/models` lists every model with its status: `unloaded` (`failed` and the reason when its last load
   failed), `loading`, `loaded`; `?reload=1` reads the directory again, and a running model whose file changed
   unloads. `POST /models/load` and `/models/unload` take `{"model": ...}` (an unload cancels the model's running
@@ -293,6 +293,49 @@ Keys are the options' long names without dashes (`ctx-size`), their short ones (
 (`chat-template-file`) is the working directory's, as on the command line. An empty `mmproj` turns a vision encoder
 off, `alias` adds names (comma-separated), `load-on-startup` loads the model when the server starts. A model's option
 comes from the command line, else its section, else `[*]`.
+
+### A side model beside a chat model
+
+An embedding, rerank or decision model serves beside a chat model in a process of its own: a preset that loads both
+when the server starts, and `--models-max 2`.
+
+```ini
+[chat]
+model = MaziyarPanahi/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct.Q3_K_M.gguf
+ctx-size = 32768
+load-on-startup = true
+
+[embed]
+model = Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
+embedding = true
+ctx-size = 8192
+load-on-startup = true
+```
+
+```bash
+artlite-server --models-preset side.ini --models-max 2
+curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d '{"model": "embed", "input": "a text"}'
+```
+
+The two take turns on the NPU dispatch by dispatch. A side request waits for the chat model's running decode step
+(~31 ms on Llama 3.2 3B) or for the running piece of its prompt: while another model is loaded, a long prompt runs in
+pieces of ~0.05 s (whole layers) and queues none ahead. The chat model's next step waits for the side request, and
+reloads its code pages after it (2.4 ms on Llama's Q3_K_M). When both keep the NPU busy (an indexing burst during a
+chat), each gets about half of it. Through the server, HTTP included (Llama 3.2 3B Q3_K_M with d3-lite or
+Qwen3-Embedding-0.6B):
+
+| side request | alone | during the chat's decode, p50 / p95 | during its 32K prompt, p50 / p95 |
+|---|---|---|---|
+| d3-lite, a 99-token question | 32-35 ms | 52 / 67 ms | 91 / 115 ms |
+| Qwen3-Embedding-0.6B, a 30-token query | 25-27 ms | 43 / 60 ms | 62 / 115 ms |
+
+A longer side request (a 430-token passage, a batch of texts) runs in pieces too, the chat's dispatches between them.
+One side request per chat turn (a decision or a retrieval query per user message) leaves the chat's decode speed and
+its 32K TTFT (18.2 s) as they are alone; side requests back to back halve its decode speed while they last (and take
+about twice their time alone). Each process holds its own weights, caches and prompt cache (Llama 3.2 3B Q3_K_M at
+32768 positions ~7 GB with its prompt cache in use, the 0.6B ~2.5 GB, d3-lite ~2 GB, the process kept started ahead
+0.4 GB); in router mode the default prompt cache of each is its part of the RAM (`--cache-ram`: over
+`--models-max`), and a non-causal decision model's (d3) holds nothing.
 
 ## Options
 
@@ -333,7 +376,7 @@ Generation:
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
 | `-np N`, `--parallel` | sequences at a time (1 only: the NPU runs one) |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
-| `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded; -1: no limit, 0: none saved) |
+| `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V; default 32) |
 | `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |

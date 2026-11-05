@@ -166,6 +166,23 @@ def test_no_ram() -> None:
         assert r["timings"]["cache_n"] == 0 and not [c for c in npu.calls if c[0] in ("read", "write")]
 
 
+def test_default_ram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt cache's RAM by default: 8 GiB at most, half of what is available once the model is loaded at most,
+    over ``share`` (in router mode each model server's part of --models-max); a non-causal model's: none."""
+    from models.server import engine as engine_module
+
+    for free, share, want in [(64 << 30, 1, engine_module.CACHE_RAM), (6 << 30, 1, 3 << 30), (6 << 30, 2, 3 << 29),
+                              (64 << 30, 2, engine_module.CACHE_RAM // 2)]:
+        monkeypatch.setattr(engine_module.portable, "available_memory", lambda free=free: free)
+        _, _, engine = make(cache={"share": share})
+        assert engine.wait_ready(10) and engine.cache.ram == want, (free, share, engine.cache.ram)
+    model = FakeModel()
+    npu = FakeNpu(model)
+    npu.causal = False  # (it reads every prompt whole: none)
+    _, _, engine = make(load=lambda: (model, npu), cache={"cache_ram": 1 << 30})
+    assert engine.wait_ready(10) and engine.cache.ram == 0
+
+
 def test_failure_keeps_saved() -> None:
     """A failure drops the device's state; the conversations in RAM stay."""
     with served(exact=True) as (model, npu, _engine, client):

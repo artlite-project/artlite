@@ -18,13 +18,17 @@ cancelled; during a load, the requests waiting for it fail: the UI's cancel). A 
 the feed ``GET /models/sse``): unloaded (``failed`` and its ``exit_code`` when its last load failed or its server
 crashed), loading - with the share of its last load's time passed (``progress``) - and loaded.
 
-Requests: the routes of a model (``/v1/chat/completions``, ``/completion``, ``/tokenize``, ..., ``/props?model=``,
-``/slots``) go to the server of the model their ``model`` field or parameter names (an id, an alias or the file's path;
-none: the one model running), their responses stream back as they come (``Proxied``; ``/props?model=`` with the
-router's ``ui``: the web UI leaves out the models whose props say they have none); a client that goes away closes the
-model server's response, which cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the
-server of the conversation's last request (``X-Conversation-Id``), or cancels the request still waiting for its model.
-Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends."""
+Requests: the routes of a model (``/v1/chat/completions``, ``/completion``, ``/tokenize``, ..., the readouts'
+``/v1/embeddings``, ``/v1/rerank``, ``/v1/systemone``, ..., ``/props?model=``, ``/slots``) go to the server of the
+model their ``model`` field or parameter names (an id, an alias or the file's path; none: the one model running),
+their responses stream back as they come (``Proxied``; ``/props?model=`` with the router's ``ui``: the web UI leaves
+out the models whose props say they have none); a client that goes away closes the model server's response, which
+cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the server of the conversation's last
+request (``X-Conversation-Id``), or cancels the request still waiting for its model.
+Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
+and with --models-max above 1 its default prompt cache takes its part of the RAM (``main.SHARE``). Models loaded
+together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
+the NPU, and none is queued ahead of its requests: ``prefill.chunks.PEER_PIECE_S``, ``Library.run``)."""
 
 import argparse
 import asyncio
@@ -63,7 +67,8 @@ log = logging.getLogger("artlite.server")
 # the routes of a model: POST by the body's "model", GET by the "model" parameter
 POSTED = ["/v1/chat/completions", "/chat/completions", "/v1/completions", "/completion", "/completions", "/tokenize",
           "/detokenize", "/apply-template", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses",
-          "/responses", "/v1/responses/input_tokens", "/responses/input_tokens"]
+          "/responses", "/v1/responses/input_tokens", "/responses/input_tokens", "/v1/embeddings", "/embeddings",
+          "/embedding", "/v1/rerank", "/rerank", "/reranking", "/v1/reranking", "/classify", "/v1/systemone"]
 CONVERSATIONS = 1024  # conversations whose model the router remembers (the UI's Stop)
 PROGRESS_S = 0.5  # seconds between a load's progress events
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer",
@@ -184,6 +189,8 @@ class Router:
         hidden = server.ROUTER | server.MODEL  # (the children's env: none of the router's own, nor a model's)
         self.env = {k: v for k, v in os.environ.items()
                     if not (k.startswith(server.ENV) and k[len(server.ENV):].lower() in hidden)}
+        if models_max > 1:  # (each model's default prompt cache: its part of the RAM)
+            self.env[server.SHARE] = str(models_max)
         self.instances: dict[str, Instance] = {}
         self.failures: dict[str, dict[str, Any]] = {}  # id -> exit_code, error of its last failed load
         self.queue: list[str] = []  # the models requests wait to load, in the order they asked

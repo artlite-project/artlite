@@ -25,7 +25,7 @@ from gguf import GGMLQuantizationType, GGUFWriter
 from models.server import catalog as catalog_module
 from models.server import ui
 from models.server.catalog import Catalog, read_preset, render
-from models.server.main import arg_parser, listen
+from models.server.main import SHARE, arg_parser, listen
 from models.server.router import Router, RouterOptions, create_router_app
 
 CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
@@ -177,10 +177,10 @@ cache-prompt = false
 
 @contextlib.contextmanager
 def live_router(models_dir: str, tmp_path: object, *, api_keys: frozenset[str] = frozenset(), ui: bool = False,
-                **kw: object) -> Iterator[tuple[str, Router]]:
-    """The router of ``models_dir`` under uvicorn on a free port (fake model servers; ``ui``: a web UI without files):
-    its URL and the router; at the end every model server has ended."""
-    router = Router(catalog_of(models_dir, tmp_path), command=CHILD, **kw)
+                preset: str | None = None, **kw: object) -> Iterator[tuple[str, Router]]:
+    """The router of ``models_dir`` under uvicorn on a free port (fake model servers; ``ui``: a web UI without files;
+    ``preset``: a preset file): its URL and the router; at the end every model server has ended."""
+    router = Router(catalog_of(models_dir, tmp_path, preset=preset), command=CHILD, **kw)
     app = create_router_app(router, RouterOptions(api_keys=api_keys, ui=(lambda app: None) if ui else None))
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
     sock = listen(config)
@@ -402,10 +402,31 @@ def test_router_several(models_dir: str, tmp_path: object) -> None:
             return reply(r)
 
         assert ask_(A) == "a-Q4_0" and ask_(B) == "a-Q8_0" and sorted(router.instances) == [A, B]
+        assert router.env[SHARE] == "2"  # (each model server's default prompt cache: half of its own)
         port = router.instances[A].port
         assert httpx.get(f"http://127.0.0.1:{port}/props", headers=auth).status_code == 401  # (its own key)
         assert ask_(A) == "a-Q4_0"  # (B is now the least recently used)
         assert ask_(VL).startswith("vl-1B") and sorted(router.instances) == [A, VL]
+
+
+def test_router_readouts(models_dir: str, tmp_path: object) -> None:
+    """A side model beside a chat model: the readout routes go to the model they name (a preset's --embedding), and
+    another model's server answers them as it would alone (501)."""
+    A, B = "org/a-GGUF:Q4_0", "org/a-GGUF:Q8_0"
+    preset = tmp_path / "models.ini"
+    preset.write_text(f"[{B}]\nembedding = true\npooling = mean\n")
+    with live_router(models_dir, tmp_path, models_max=2, preset=str(preset)) as (url, router):
+        assert reply(ask(url, A)) == "a-Q4_0"
+        r = httpx.post(f"{url}/v1/embeddings", json={"model": B, "input": ["a b", "c"]}, timeout=60)
+        assert r.status_code == 200, r.text
+        data = r.json()["data"]
+        assert [d["index"] for d in data] == [0, 1] and np.isclose(np.linalg.norm(data[0]["embedding"]), 1)
+        assert httpx.post(f"{url}/embeddings", json={"model": B, "content": "a b"}, timeout=60).json()[0]["embedding"]
+        assert sorted(router.instances) == [A, B]
+        for path, body in [("/v1/embeddings", {"input": "a"}), ("/v1/rerank", {"query": "q", "documents": ["d"]}),
+                           ("/classify", {"input": "a"}), ("/v1/systemone", {"state": "s", "questions": {}})]:
+            r = httpx.post(url + path, json={"model": A, **body}, timeout=60)
+            assert r.status_code == 501, (path, r.status_code, r.text)  # (A's server's, not the router's 404)
 
 
 def test_router_reload(models_dir: str, tmp_path: object) -> None:
