@@ -74,7 +74,7 @@ from ml_dtypes import bfloat16
 from ..decode.kv import Records
 from ..gemm.gemm_q import ChainPart, chained_fill
 from ..operators.base import JINJA_ENV, ArgSpec, ArtcOperator
-from ..operators.design import COLS, range32, stream_walk
+from ..operators.design import COLS, plus_i32, range32, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import pin_l1_buffers
 from ..operators.util import Attr, bf16_hilo, regions
@@ -514,7 +514,9 @@ _ATTN = JINJA_ENV.from_string(r"""
 // lane 8 q + k; m the row's reference maximum), bias [row block][64] (192 - m), l [row block][64] (P's row sums, in
 // every lane of the row), pp [pair][record][row block 2]{{ "[hi, lo]" if PP == 2 else "" }} P panels, vm [64] bf16 (the chunk's maximum A per lane), st
 // [16] int32 (the chunk's first record relative to
-// the core's first block, skip, the pass's first record)
+// the core's first block, skip, the pass's first record{% if WIN %}, the masks below the rows' segments, the least and the
+// largest segment start of the core's rows, the chunk's first record, the window's, the history's chunks, the chunk's
+// first key (chunk-relative)); lo [8 QB] int32 (per row of the core its segment's first key, chunk-relative{% endif %})
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 {# 2^(A - 128) of 32 lanes (A below 256: 2^(s - m) times 2^64, which o / l cancels), 2^1 below 128.5 (masked -1e30 too) #}
@@ -564,6 +566,31 @@ __attribute__((noinline, minsize)) void {{ p }}_mask(float *__restrict sc, int32
 {% endfor %}
     }
 }
+{% if WIN %}
+
+// A chunk's keys below a row's segment (from the chunk's first key kc, chunk-relative: key kc + 8 k + i of record k,
+// lane 8 q + i, below lo of row q of the block), per row block b (its query block b / QH): -1e30
+__attribute__((noinline, minsize)) void {{ p }}_masklo(float *__restrict sc, const int32_t *__restrict lo, int32_t kc)
+{
+    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-1e30f);
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < {{ RB }}; b++) {
+        float *__restrict s = sc + {{ 128 * CR }} * (b >> 1) + 64 * (b & 1);
+        const int32_t *__restrict lb = lo + 8 * (b >= {{ QH }}{% for j in range(2, QB) %} + b >= {{ QH * j }}{% endfor %});
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < {{ CR }}; k++) {
+            uint64_t bits = 0;
+            AIE_LOOP_NO_UNROLL
+            for (int q = 0; q < 8; q++) {
+                int32_t v = lb[q] - kc - 8 * k;  // (the row's keys of the record below its segment)
+                v = v < 0 ? 0 : v > 8 ? 8 : v;
+                bits |= (uint64_t)((1u << v) - 1u) << (8 * q);
+            }
+            aie::store_v(s + 128 * k, aie::select(aie::load_v<64>(s + 128 * k), ninf, aie::mask<64>::from_uint64(bits)));
+        }
+    }
+}
+{% endif %}
 
 // Row blocks with a row whose chunk maximum exceeds its reference by 2^16 (rare, and at a pass's first chunk): each row
 // whose maximum (bf16: an integer from 128 on) exceeds its reference takes it, m' - m = d >= 0 an integer (< 64: A <
@@ -678,7 +705,7 @@ extern "C" {
 // A pass's start: o = 0, the reference m = -48 (bias 240: P = 2^(s + 48), a chunk's maximum above -32 raises it; rows
 // whose scores all stay below -111 would read 2^-63 for each), l = 0; the pass's first record p0 / 8 + {{ 4 * QB }}
 // (M bg + bb)
-__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb)
+__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq{% endif %})
 {
 {% if "ev_q" in ablate %}
     event1();
@@ -688,8 +715,51 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
         aie::store_v(AW(float, {{ w.bias }}) + 64 * b, aie::broadcast<float, 64>(240.0f));
     al::zero<{{ RB * 64 }}, 64>(AW(float, {{ w.l }}));
     AW(int32_t, {{ w.st }})[2] = p8 + {{ 4 * QB }} * ({{ M }} * bg + bb);
+{% if WIN %}
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    st[6] = p8;
+    st[7] = p8 + {{ RG }} * (bg > {{ WIN }} ? bg - {{ WIN - 1 }} : 1);  // (the window: the chunk's groups max(1, bg - {{ WIN - 1 }}) .. bg)
+    st[8] = fq;
+{% endif %}
 }
 
+{% if WIN %}
+// The pass's segments (its SEG object: per row of the pass the chunk-relative first key of its segment, int16): the
+// core's rows' into lo, their least and largest into st
+__attribute__((minsize)) void {{ p }}_seg(const bfloat16 *__restrict u, float *__restrict ws, int32_t r)
+{
+    const int16_t *__restrict s = (const int16_t *)u + {{ 8 * QB }} * r;
+    int32_t *__restrict lo = AW(int32_t, {{ w.lo }});
+    int32_t mn = s[0], mx = s[0];
+    for (int i = 0; i < {{ 8 * QB }}; i++) {
+        const int32_t v = s[i];
+        lo[i] = v;
+        mn = v < mn ? v : mn;
+        mx = v > mx ? v : mx;
+    }
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    st[4] = mn;
+    st[5] = mx;
+}
+
+// Chunk t of the pass's stream (the history's {{ CR }} t .., then the window's): its first record relative to the core's
+// first query block (rho0: block j's record is rho0 - j), skipped when past every one of the core's queries or below
+// every one of their segments (the history's chunks before the prompt chunk never); masks below a row's segment when it
+// reaches below one
+__attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32_t r)
+{
+{% if "ev_chunk" in ablate %}
+    event0();
+{% endif %}
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    const int32_t rec = t < st[8] ? {{ CR }} * t : st[7] + {{ CR }} * (t - st[8]);
+    const int32_t kc = 8 * (rec - st[6]);
+    st[0] = rec - st[2] - {{ QB }} * r;
+    st[1] = (st[0] - {{ QB - 1 }} > 0) | ((kc >= 0) & (kc + {{ 8 * CR }} <= st[4]));
+    st[3] = (kc >= 0) & (kc < st[5]);
+    st[9] = kc;
+}
+{% else %}
 // Chunk t of the pass's stream (records {{ CR }} t ..): its first record relative to the core's first query block
 // (rho0: block j's record is rho0 - j), skipped when past every one of the core's queries
 __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32_t r)
@@ -701,6 +771,7 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
     st[0] = {{ CR }} * t - st[2] - {{ QB }} * r;
     st[1] = st[0] - {{ QB - 1 }} > 0;
 }
+{% endif %}
 
 {% if QP == 2 %}
 // The pass's L1 unit i (of {{ 4 * RB }}: d half i % 2 of the slices 4 (i / 2) ..: per d-block pair 4 slices [d-block 2], a
@@ -853,6 +924,10 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict wo)
     float *__restrict sc = AW(float, {{ w.sc }});
     if (st[0] + {{ CR - 1 }} >= 0)  // (the chunk reaches the first block's queries)
         {{ p }}_mask(sc, st[0]);
+{% if WIN %}
+    if (st[3])  // (the chunk reaches below a row's segment)
+        {{ p }}_masklo(sc, AW(int32_t, {{ w.lo }}), st[9]);
+{% endif %}
     if (!aie::lt(aie::load_v<64>(AW(bfloat16, {{ w.vm }})), aie::broadcast<bfloat16, 64>(208.0f)).full())
         {{ p }}_raise(ws, wo);
     {{ p }}_ppan(sc, AW(uint8_t, {{ w.pp }}));
@@ -924,7 +999,14 @@ class AttnOperator(ArtcOperator):
     (``PrepOperator``). Column c = KV head c (query heads qh c ..), core row r; in pass b the core takes the query
     blocks 4 QB b + QB r .. of each of the column's heads. Runtime sequence: QS (the prep's of sub-chunks of ``sub``
     tokens, each [column][token group][head][unit]), KV (the layer's cache: COLS KV heads of ``kv_bytes``, ``kv_pad``
-    past them), A (T x heads hd as bfp16 panels [T / 8][heads hd / 8]). Parameters ``params``."""
+    past them), A (T x heads hd as bfp16 panels [T / 8][heads hd / 8]). Parameters ``params``.
+
+    Packed (``window`` W > 0: several inputs, segments, in the chunk): each row sees the history (the cache before p0)
+    and its segment's keys up to itself, from its segment's first key lo (the SEG argument: ``seg``, an object per pass
+    on stream B ahead of the V objects). Pass b streams the history and the chunk's groups max(1, D - W + 1) .. D (D:
+    its queries' group; a window fixed by the design: no runtime parameters), so a segment spans at most
+    ``max_segment`` positions; key chunks below every one of a core's rows' segments are skipped, those below some
+    masked (-1e30)."""
 
     STACK = 2048
     pfx = kernel_prefix("paa")
@@ -935,10 +1017,11 @@ class AttnOperator(ArtcOperator):
     COUNTER0 = 0x31520
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
-                 ablate: tuple[str, ...] = ()):
+                 ablate: tuple[str, ...] = (), window: int = 0):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
-        cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1)."""
+        cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
+        packed variant's window of cache groups (class docstring)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -947,26 +1030,34 @@ class AttnOperator(ArtcOperator):
         assert T % s.pg == 0 and T // self.pq <= 64 and s.rg % self.cr == 0 and self.m >= 1
         assert self.qb * s.qh % 2 == 0 and T % self.sub == 0 and self.sub % self.pq == 0, "row blocks in pairs"
         assert 4 * self.qb * s.qh % 4 == 0  # (a pass's Q units: whole B objects of 4)
+        assert window >= 0 and self.pq <= 72, "a pass's segment starts in its object's first 72 values (stream B's walk)"
         self.T, self.shape, self.kv_bytes, self.kv_pad, self.ablate = T, s, kv_bytes, kv_pad, tuple(ablate)
+        self.win = window
         self.n_pass = T // self.pq
         super().__init__()
 
     @staticmethod
-    def regions(rows: int, cr: int, pp: int = 1) -> list[tuple[str, int]]:
+    def regions(rows: int, cr: int, pp: int = 1, qb: int = 0) -> list[tuple[str, int]]:
         """The workspace's regions at ``rows`` row blocks, chunks of ``cr`` records and ``pp`` P panels per row block
-        and record (the kernels' comment)."""
+        and record (the kernels' comment); ``qb``: the packed variant's query blocks (their rows' segment starts)."""
         return [("sc", 256 * rows * cr), ("bias", 256 * rows), ("l", 256 * rows), ("pp", 72 * rows * cr * pp),
-                ("vm", 128), ("st", 64)]
+                ("vm", 128), ("st", 64)] + ([("lo", 32 * qb)] if qb else [])
 
     def workspace(self) -> dict[str, int]:
-        return regions(self.regions(self.qb * self.shape.qh, self.cr, self.shape.pp))
+        return regions(self.regions(self.qb * self.shape.qh, self.cr, self.shape.pp, self.qb if self.win else 0))
+
+    @property
+    def max_segment(self) -> int:
+        """The packed variant's longest segment: its window holds its keys wherever in a cache group it starts."""
+        return (self.win - 1) * self.shape.pg + 1 if self.win else self.T
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         s = self.shape
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
-                            KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate)
+                            KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
+                            WIN=self.win, RG=s.rg)
 
     @property
     def n_qs(self) -> int:
@@ -980,9 +1071,23 @@ class AttnOperator(ArtcOperator):
     def n_a(self) -> int:
         return self.T * COLS * self.shape.qh * self.shape.hd * 9 // 16
 
+    @property
+    def n_seg(self) -> int:
+        """bf16 of the SEG argument (packed): an object of two units per pass."""
+        return self.n_pass * self.shape.unit
+
     def get_arg_spec(self) -> list[ArgSpec]:
+        seg = [ArgSpec("in", (self.n_seg,), torch.bfloat16)] if self.win else []
         return [ArgSpec("in", (self.n_qs,), torch.bfloat16), ArgSpec("in", (self.n_kv,), torch.bfloat16),
-                ArgSpec("out", (self.n_a,), torch.bfloat16)]
+                ArgSpec("out", (self.n_a,), torch.bfloat16), *seg]
+
+    def seg(self, lo: np.ndarray) -> np.ndarray:
+        """The SEG argument's bytes (uint8) of a packed chunk: ``lo`` (T,) per token the chunk-relative first key of its
+        segment (a padding token's: itself) -> per pass its rows' as int16 at its object's start."""
+        assert self.win and lo.shape == (self.T,) and (lo <= np.arange(self.T)).all() and (lo >= 0).all()
+        out = np.zeros((self.n_pass, self.shape.unit), np.int16)
+        out[:, :self.pq] = lo.reshape(self.n_pass, self.pq)
+        return out.view(np.uint8).reshape(-1)
 
     def params(self, p0: int) -> dict[str, int]:
         s = self.shape
@@ -1003,8 +1108,10 @@ class AttnOperator(ArtcOperator):
         om_ty = np.ndarray[(4 * qb * nd * 36,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), f32]
         wo_ty = np.ndarray[(64 * nd * rb,), f32]
-        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32])
+        win = self.win
+        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * (win > 0))
         k_grp = Kernel(f"{p}_grp", "kernel.o", [ws_ty, np.int32, np.int32])
+        k_seg = Kernel(f"{p}_seg", "kernel.o", [u_ty, ws_ty, np.int32]) if win else None
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [u_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, u_ty, ws_ty, np.int32])
         k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, wo_ty])
@@ -1035,16 +1142,29 @@ class AttnOperator(ArtcOperator):
         o1 = [o3[c].prod().join([qb * nd * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"la_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
-        def turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb, nq):
-            """(a core's share of a pass: its Q units of the pass's nq, the history, its output)"""
+        def turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb, nq, seg=None,
+                 full=False):
+            """(a core's share of a pass: its Q units of the pass's nq, its segments (packed), the history, its output;
+            ``full``: the packed window's last groups only, ``win`` of them)"""
             for i in range_(nq):
                 u = b_h.acquire(1)
                 qsel(u, q, i, me)
                 b_h.release(1)
-            init(ws, wo, p8.read(), bg, bb)
+            if seg is not None:  # (the pass's SEG object: two units, the first read)
+                u = b_h.acquire(1)
+                seg(u, ws, row)
+                b_h.release(1)
+                b_h.acquire(1)
+                b_h.release(1)
+                init(ws, wo, p8.read(), bg, bb, fq.read())
+            else:
+                init(ws, wo, p8.read(), bg, bb)
             n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
-            for _ in range(gq):
-                n = n + bg
+            if full:
+                n = plus_i32(n, gq * win)
+            else:
+                for _ in range(gq):
+                    n = n + bg
             for t in range32(n):
                 grp(ws, t, row)
                 for kk in range(ku):
@@ -1061,16 +1181,25 @@ class AttnOperator(ArtcOperator):
                 fin(ws, wo, o, h)
                 o_h.release(1)
 
-        def core(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row):
+        npg = n_pass // m  # (the chunk's groups)
+
+        def core(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, *seg):
             for _ in forever_():
-                for bg in range_(n_pass // m):
+                # (packed: the passes whose window is every group of the chunk after its first, then the rest's last
+                # win)
+                for bg in range_(min(npg, win + 1) if win else npg):
                     for bb in range(m):  # (the pass's units to every core: each keeps its own)
                         turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb,
-                             2 * rb * s.qp)
+                             2 * rb * s.qp, *seg)
+                if win and npg > win + 1:
+                    for bg in range_(win + 1, npg):
+                        for bb in range(m):
+                            turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb,
+                                 2 * rb * s.qp, *seg, full=True)
 
         workers = [Worker(core, [a1[c].cons(), b1[c].cons(), o1[c][r].prod(), k_init, k_grp, k_qsel, k_qk, k_soft,
                                  k_pv, k_fin, Buffer(ws_ty, name=f"la_ws{c}_{r}"), Buffer(wo_ty, name=f"la_wo{c}_{r}"),
-                                 Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq, rb * r, r],
+                                 Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq, rb * r, r, *([k_seg] if win else [])],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs, n_kv, n_a, NH = self.n_qs, self.n_kv, self.n_a, COLS * qh
@@ -1082,7 +1211,11 @@ class AttnOperator(ArtcOperator):
         else:
             k_tap = [1, 1, rows, 576], [0, g2, 576, 1]
 
-        def seq(QS, KV, A, ah, bh, oh):
+        n_seg = self.n_seg
+
+        def seq(QS, KV, A, *rest):
+            *seg, ah, bh, oh = rest  # (packed: SEG)
+
             def kv_part(off: int, n: int = 0, *, sizes: list[int], strides: list[int]) -> ChainPart:
                 """A KV head's groups from ``off`` (bf16): the history's (P_FG groups, n = 0) or n of the chunk's from
                 P_FO on (sizes [1, 1, d1, d0]: a group's part)."""
@@ -1109,32 +1242,38 @@ class AttnOperator(ArtcOperator):
                 oh[c].drain(A, TensorAccessPattern((n_a,), c * qh * nd * 36, [n_pass, qh, 4 * qb, nd * 36],
                                                    [4 * qb * NH * nd * 36, nd * 36, NH * nd * 36, 1]),
                             group=tg, wait=True)
-            inflight = []  # (a pass's fills: at most three in flight, within the shim tiles' BDs)
+            # (a pass's fills: at most three in flight, within the shim tiles' BDs; packed: two, its SEG part one more)
+            inflight = []
             for b in range(n_pass):
                 tp = TaskGroup()
-                ng = b // m  # (the chunk's groups after its first that the pass streams)
+                ng = b // m  # (the chunk's groups after its first that the pass streams; packed: the last win of them)
+                j0, nw = (max(1, ng - win + 1), min(ng, win)) if win else (1, ng)
                 t0 = 4 * qb * b  # (the pass's first token group: its sub-chunk, the group in it)
                 q0 = t0 // sg * sg * COLS * qh * uw + t0 % sg * qh * uw
                 for c in range(COLS):
                     k0, v0 = c * hb, c * hb + s.kp * o2
                     parts = [kv_part(k0, sizes=k_tap[0], strides=k_tap[1])]
-                    if ng:
-                        parts.append(kv_part(k0, ng, sizes=k_tap[0], strides=k_tap[1]))
+                    if nw:
+                        parts.append(kv_part(k0 + (j0 - 1) * g2, nw, sizes=k_tap[0], strides=k_tap[1]))
                     chained_fill(ah[c], KV, parts, tp, wait=True)
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0 + c * sg * qh * uw, [1, 1, 4 * qb * qh, uw],
-                                                               [0, 0, uw, 1])),
-                             kv_part(v0, sizes=[1, 1, rows, 576], strides=[0, g2, 576, 1])]
-                    if ng:
-                        parts.append(kv_part(v0, ng, sizes=[1, 1, rows, 576], strides=[0, g2, 576, 1]))
+                                                               [0, 0, uw, 1]))]
+                    if seg:
+                        parts.append(ChainPart(seg[0], TensorAccessPattern((n_seg,), b * s.unit,
+                                                                           [1, 1, s.unit // 576, 576], [0, 0, 576, 1])))
+                    parts.append(kv_part(v0, sizes=[1, 1, rows, 576], strides=[0, g2, 576, 1]))
+                    if nw:
+                        parts.append(kv_part(v0 + (j0 - 1) * g2, nw, sizes=[1, 1, rows, 576], strides=[0, g2, 576, 1]))
                     chained_fill(bh[c], KV, parts, tp, wait=True)
                 inflight.append(tp)
-                if len(inflight) > 2:
+                if len(inflight) > (1 if win else 2):
                     inflight.pop(0).finish()
             for tp in inflight:
                 tp.finish()
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
+                           *([np.ndarray[(n_seg,), bf]] if win else []),
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b3)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
