@@ -4,11 +4,12 @@ them one by one (a blockwrite costs ~1.5 us per KB, any operation ~0.1 us: a Lla
 of program memory in 10 of its 43 ms, and ran ~850 operations per GEMM configuration).
 
 ``split`` takes out of a configuration (after its PDI load: the array reset) per core and memory tile its writes to
-program memory, DMA BDs, DMA channels (start queues included), locks and the core's control but its enable, in their
+program memory, data memory (static tables: a GDN operator's SiLU table copies, 100 KB on 32 cores, took ~150 us of
+blockwrites), DMA BDs, DMA channels (start queues included), locks and the core's control but its enable, in their
 order (masked writes as the values they leave); the transaction keeps the stream switches, the shim, the cores'
-enables and memory contents (a marker may share their word). The DMA channels then start before the stream switches
-are configured: every task waits for a lock or for data, and none comes before the cores run and the program's shim
-tasks.
+enables, masked writes to memory and the contents of the marker's word (written after the poll). The DMA channels then
+start before the stream switches are configured: every task waits for a lock or for data, and none comes before the
+cores run and the program's shim tasks.
 
 The loader routes, per column with packets, the shim's MM2S channel 0 (its mux South 3) up the column: circuit through
 the shim (North 0), at each tile on the way a split in packet mode (its own packets, its controller id as mlir-aie
@@ -43,9 +44,11 @@ BD0 = 11  # (the shim BDs of a column's chained task, one per tile: free during 
 WRITE_S, BLOCKWRITE_S, BLOCK_BYTE_S, POLL_S, STREAM_BYTE_S = 0.133e-6, 0.101e-6, 1.5e-9, 0.075e-6, 0.25e-9
 
 # (the registers a tile's packets take, per row kind: core tile - program memory, DMA BDs, DMA channels, locks, core
-# control; memtile - DMA BDs, DMA channels, locks)
-_MOVED = {2: ((0x20000, 0x24000), (0x1D000, 0x1D200), (0x1DE00, 0x1DE20), (0x1F000, 0x1F100), (0x32000, 0x32004)),
-          1: ((0xA0000, 0xA0660), (0xC0000, 0xC0400))}
+# control, data memory; memtile - DMA BDs, DMA channels, locks, data memory)
+_MOVED = {2: ((0x20000, 0x24000), (0x1D000, 0x1D200), (0x1DE00, 0x1DE20), (0x1F000, 0x1F100), (0x32000, 0x32004),
+              (0x0, 0x10000)),
+          1: ((0xA0000, 0xA0660), (0xC0000, 0xC0400), (0x0, 0x80000))}
+_DATA_END = {2: 0x10000, 1: 0x80000}  # (a tile's data memory: from 0)
 _CORE_CONTROL, _CORE_CONTROL_RESET = 0x32000, 0x2  # (its value after a reset: in reset, disabled)
 # (stream switch registers: slave South 0, its slots, masters TileControl .. North 0, the slave port number of South 0)
 _SWITCH = {2: (0x3F114, 0x3F250, 0x3F00C, 0x3F034), 1: (0xB011C, 0xB0270, 0xB0018, 0xB002C)}
@@ -115,8 +118,9 @@ def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
 
 def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
     """A configuration (after its PDI load) without the writes control packets take (per core and memory tile its
-    program memory, DMA BDs, DMA channels, locks, the core's control but its enable: writes, blockwrites, masked writes
-    as the values they leave), and those per tile in their order."""
+    program memory, data memory but the marker's word, DMA BDs, DMA channels, locks, the core's control but its enable:
+    writes, blockwrites, masked writes as the values they leave; not masked writes to data memory, whose old values are
+    unknown), and those per tile in their order."""
     rest, moved = [], defaultdict(list)
     value, big = {}, []  # (the moved writes: per word of short ones (seq, value); long ones (seq, address, words))
 
@@ -136,8 +140,9 @@ def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
         row, off = min((reg >> 20) & 0x1F, 2), reg & 0xFFFFF
         n = (e - p - 4) if op == txn.OP_BLOCKWRITE else 1
         if not row or not any(a <= off and off + 4 * n <= b for a, b in _MOVED[row]) or \
-                (op == txn.OP_MASKWRITE and row == 2 and off == _CORE_CONTROL and int(cfg[p + 4]) & int(cfg[p + 5]) & 1):
-            rest.append(cfg[p:e])  # (not a tile's, or the core's enable)
+                (op == txn.OP_MASKWRITE and row == 2 and off == _CORE_CONTROL and int(cfg[p + 4]) & int(cfg[p + 5]) & 1) or \
+                (op == txn.OP_MASKWRITE and off < _DATA_END[row]):
+            rest.append(cfg[p:e])  # (not a tile's, the core's enable, or a masked write to memory)
             continue
         if op == txn.OP_MASKWRITE:
             v, m = int(cfg[p + 4]), int(cfg[p + 5])
@@ -145,6 +150,11 @@ def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
             words = np.array([(old & ~m) | (v & m)], np.uint32)
         else:
             words = cfg[p + 4:e] if op == txn.OP_BLOCKWRITE else cfg[p + 4:p + 5]
+        if off <= MARK[row] < off + 4 * len(words):  # (the marker's word, data memory's last: after the poll)
+            rest.append(np.array([txn.OP_WRITE, 0, (reg & ~0xFFFFF) | MARK[row], 0, words[-1], 24], np.uint32))
+            words = words[:-1]
+            if not len(words):
+                continue
         if len(words) > 16:  # (program and data memory)
             big.append((seq, reg, words))
         else:

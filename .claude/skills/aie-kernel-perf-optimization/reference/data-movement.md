@@ -279,13 +279,12 @@ offsets): aie2p-coding section 8. For speed:
   `Library.run`, which assembles the program on the host and dispatches it in pieces. (One aiecc ELF of
   thousands of entries is no alternative: aiecc's time grows superlinearly, 14 min for 1216 entries.)
 - **Count a layer-major program's design switches.** Every change of design is a ConfigureOp (above): the Gemma
-  prefill switches design 12 times per layer (a 1152-token chunk: 279 configurations, 23 ms alone, 7%). Data memory
-  contents still go by blockwrites (~1.5 µs per KB): tables as `initial_value` (the GELU epilogue's GEMM: 195 vs
-  107 KB of PDI) cost on every switch; the per-design PDIs of a library ELF are in its cache dir
-  (`design.mlir.prj/op<N>_<Class>.pdi`).
-- **Static buffers are rewritten on every reconfiguration** (`.bss` zero-fill travels in the PDI):
-  8 KB x 8 cores = +80 µs. Use worker `Buffer`s, without `initial_value` (it travels too: a zeroed workspace of 760 KB
-  was most of a 1.29 MB PDI).
+  prefill switches design 12 times per layer (a 1152-token chunk: 279 configurations, 23 ms alone, 7%). The
+  per-design PDIs of a library ELF are in its cache dir (`design.mlir.prj/op<N>_<Class>.pdi`).
+- **Static buffers are rewritten on every reconfiguration** (`.bss` zero-fill and tables travel in the PDI): by
+  blockwrites (~1.5 µs per KB; an overlay, a `FusedOperator`) 8 KB x 8 cores = +80 µs; a library's go in its control
+  packets (`fused.ctrlpkt`: a GDN operator's SiLU table copies, 100 KB on 32 cores, ~150 -> ~5 µs). Use worker
+  `Buffer`s, without `initial_value` (it travels too: a zeroed workspace of 760 KB was most of a 1.29 MB PDI).
 - **Program memory is the tight resource** in overlays (16 KB for all phases): SKILL.md section 7.
 - **Library entries of one array design share one compiled device** (`fused.Library`: an overlay's
   operators differ only in their runtime sequences): one design compiled, not one per entry. Runtime-task BD ids are
@@ -295,8 +294,8 @@ offsets): aie2p-coding section 8. For speed:
   lock value (0 after the reset), the DMA channels' and the core's reset pulses and each stream switch port alone:
   ~2500 operations for a 32-core design. `program._prune` drops what the PDI load's array reset already holds and
   writes a tile's ports as one blockwrite per range (Llama 3B chunk of 1024 tokens: 512K -> 222K configuration
-  operations, 362 -> 341 ms, bit-identical). `fused.ctrlpkt` sends each core's program memory and each core's and
-  memtile's BDs, locks and DMA channels (start queues included, in their order) as control packets: per column the shim
+  operations, 362 -> 341 ms, bit-identical). `fused.ctrlpkt` sends each core's program and data memory and each core's
+  and memtile's BDs, locks and DMA channels (start queues included, in their order) as control packets: per column the shim
   DMA streams them up a route set after the reset (a packet split at each tile: its id to TileControl, the rest
   North), a marker word polled, the route's ports zeroed by the design's own (a 24-core GEMM: 854 -> 306 operations;
   Llama 1B chunk of 128 tokens 43 -> 31 ms, Gemma / Qwen chat TTFT -20%). A slave port has 4 slots: match the ids

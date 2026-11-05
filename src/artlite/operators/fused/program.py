@@ -12,8 +12,8 @@ configuration only where the previous item is of another design:
 - memory-tile BDs the registers already hold since the last configuration left out (``Run.emit``);
 - the configurations without the writes their PDI load's array reset makes redundant, a tile's stream switch ports
   as blockwrites (``_prune``: 57% fewer configuration operations in a Llama prefill chunk, -6% time at 1K tokens);
-- the cores' program memory by control packets where they cost less than blockwrites (``ctrlpkt``: a Llama 1B chunk
-  of 128 tokens 43 -> 35 ms), from a packet buffer the library allocates (``Assembler.place``).
+- the cores' program and data memory by control packets where they cost less than blockwrites (``ctrlpkt``: a Llama
+  1B chunk of 128 tokens 43 -> 35 ms), from a packet buffer the library allocates (``Assembler.place``).
 """
 
 from __future__ import annotations

@@ -232,6 +232,41 @@ def test_library_program_packets(monkeypatch):
     torch.testing.assert_close(outs[1].float(), (3 * x[64:64 + n].float()).bfloat16().float(), rtol=1e-2, atol=1e-2)
 
 
+def test_library_data_packets(monkeypatch):
+    """A design with a static table in data memory (SiLU's gather table) alternating with another: with packets the
+    table travels in them (no data-memory blockwrite left in its configuration but the marker's), and the outputs
+    are the blockwrites' bit for bit."""
+    from artlite import txn
+    from artlite.operators.fused import ctrlpkt
+    from artlite.txn import device_address
+
+    n = 1024
+    silu, add = SiluOperator(size=n), AddOperator(size=n)
+    dev = artlite.Device()
+    x = torch.randn(n).bfloat16()
+    outs = []
+    for packets in (False, True):
+        monkeypatch.setattr(ctrlpkt, "ENABLED", packets)
+        monkeypatch.setattr(ctrlpkt, "worth", lambda loader: True)
+        lib = Library("t_library_dm", [silu, add]).compile()
+        lib.load()
+        cfg = lib._asm.blocks[0].config[4:]
+        dm = [hex(int(cfg[p + 2])) for p, op in txn.op_offsets(cfg)  # (core data-memory blockwrites)
+              if op == txn.OP_BLOCKWRITE and (cfg[p + 2] >> 20) & 0x1F >= 2 and cfg[p + 2] & 0xFFFFF < 0x10000]
+        assert bool(dm) != packets, dm
+        bx = artlite.from_torch(x.clone(), dev)
+        t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+        a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
+        items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]]), (0, [a["out"], a["t"]]),
+                 (1, [a["t"], a["x"], a["out"]])]
+        lib.run(items, bufs=[b._raw for b in (bx, t, out)])
+        out.sync_from_device()
+        outs.append(out.to_torch().clone())
+    assert torch.equal(outs[0], outs[1])
+    s = torch.nn.functional.silu
+    torch.testing.assert_close(outs[1].float(), s(s(x.float()) + x.float()) + x.float(), rtol=5e-2, atol=5e-2)
+
+
 class AxpyOperator(AddOperator):
     """c = a + s b, s a compile-time constant: designs of different s differ only in program memory."""
 
