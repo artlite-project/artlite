@@ -51,8 +51,9 @@ from . import gemm as PG
 from . import pace as PACING
 
 PIECE_BUDGET_S = 0.8  # estimated seconds per dispatch (the hang detection: 2 s; DDR contention adds up to 40%)
-CONFIG_S = 0.15e-3  # a ConfigureOp (~80-90 us alone: the PDI load's reset ~40 us, the rest's operations; the cores'
-# programs by control packets: Llama's fitted 0.143 ms, Qwen's 0.075 ms in its own model; Gemma's ~40% above its chunks)
+CONFIG_S = 0.12e-3  # a ConfigureOp (~30-40 us alone: no array reset but at a piece's first, ``fused.program``; the
+# cores' programs by control packets: Llama's fitted 0.111 ms, Qwen's 0.085 ms in their own models; Gemma's model
+# 1.5-1.6x its chunks)
 GROUP = 32  # positions a chunk starts at a multiple of (whole cache groups; a model's default ``group``)
 
 

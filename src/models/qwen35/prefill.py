@@ -89,8 +89,8 @@ CS_OFF = 4 * META + 640  # the conv state's bytes in a GDN header slot of the ov
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
 # the time model's constants (``layer_seconds``; fitted to the chunk times of the 1B, 9B and 27B Q4_K_M, T = 256 ..
 # 2048 at p0 = 0 .. 30K: within ~2%): per sub-chunk a byte of a layer's weights, a GEMM item, a norm per hidden unit,
-# the GDN ops per v head, the attention prep per q head; a ConfigureOp
-WEIGHT_S, GEMM_S, NORM_S, GDN_S, PREP_S, CFG_S = 28.4e-12, 0.056e-3, 43e-9, 21.7e-6, 17e-6, 0.116e-3
+# the GDN ops per v head, the attention prep per q head; a ConfigureOp (without the array reset: ``fused.program``)
+WEIGHT_S, GEMM_S, NORM_S, GDN_S, PREP_S, CFG_S = 28.4e-12, 0.056e-3, 43e-9, 21.7e-6, 17e-6, 0.085e-3
 # a SMALL size's operators: S + SMALL_S (1 - S) of a sub-chunk's terms (the weights stream whatever the tokens; T = 64
 # / 128 within ~9%)
 SMALL_S = 0.42

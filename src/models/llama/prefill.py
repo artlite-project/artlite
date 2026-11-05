@@ -51,9 +51,9 @@ from .overlay import KV_PAD, LlamaOverlay
 
 SUB = 256  # tokens per sub-chunk (the operators' T)
 # the time model's constants (``layer_seconds``; fitted to the chunk times of 1B Q4_0 and 3B Q4_K_M, T = 64 .. 4096 at
-# p0 = 0 and 4096: within ~5%, a chunk of 64 ~20% below): a ConfigureOp, per sub-chunk a byte of a layer's weights, a
-# cache record a flash attention pass streams
-CFG_S, WEIGHT_S, RECORD_S = 0.143e-3, 3.69e-11, 0.346e-6
+# p0 = 0 and 4096: within ~5%, a chunk of 64 ~20% below): a ConfigureOp (without the array reset: ``fused.program``),
+# per sub-chunk a byte of a layer's weights, a cache record a flash attention pass streams
+CFG_S, WEIGHT_S, RECORD_S = 0.111e-3, 3.69e-11, 0.346e-6
 BIG = 1024  # the sub-chunk of the chunks made of them (the GEMMs but qkv once per 1024 tokens: fewer items and fills;
 # qkv's items stay SUB: a 1024-token GemmQd is slower, a GemmQ no faster)
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them

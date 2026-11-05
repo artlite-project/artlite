@@ -164,12 +164,12 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 
 - Per operator kind: drop its items from the program and time the rest.
 - Per design switch: a program of one item of the design alternating with another kind's, minus both repeated alone
-  (no switch between them); or the program's configurations alone (its RunOps dropped). ~50-100 µs each: the PDI
-  load's array reset 37 µs, ~0.1 µs per transaction operation left (stream switch ports, the loader's route, the shim),
-  program and data memory, BDs, locks by control packets (`fused.ctrlpkt`); a layer of a dozen operators ~1 ms
-  whatever the chunk size (Llama 1B's chunk of 128 tokens: 10 of 31 ms; d3-lite's of 64: 14 of 31 ms, Qwen3 0.6B's
-  14 of 28). At 64 / 128 tokens they are half the chunk, the reset alone a quarter (configurations without it:
-  aie-kernel-perf-optimization `reference/rejected.md`).
+  (no switch between them); or the program's configurations alone (its RunOps dropped). ~30-40 µs each: ~0.1 µs per
+  transaction operation (stream switch ports, the loader's route, the shim, the previous design's cores held in
+  reset), program and data memory, BDs, locks by control packets (`fused.ctrlpkt`, each tile quiesced first); the PDI
+  load's array reset (37 µs) only at a piece's first configuration (`fused.program.Quiet`). A layer of a dozen
+  operators ~0.4 ms whatever the chunk size (d3-lite's chunk of 64 tokens: 7.1 of 23.5 ms, Qwen3 0.6B's 6.8 of 20.9):
+  a third of a 64-token chunk.
 - Per GEMM: alone with parts compiled out (`ablate=("dq", "mm", "act")`) and its cores' windows (`ablate=("ev_kt",)`
   with the profiling counters); per attention kind and position: the attention operator alone at (T, p0).
 - Gemma E4B, 1152 tokens at p0 = 0: GEMMs ~60% (gate/up the largest, MAC-bound), norms ~17% (the fp32 residual read

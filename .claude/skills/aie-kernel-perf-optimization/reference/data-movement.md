@@ -256,8 +256,9 @@ offsets): aie2p-coding section 8. For speed:
 
 ## Overlays, libraries and fused ELFs
 
-- **A change of design inside a fused ELF is a reset and a full reconfiguration**: ~80-90 µs in a library
-  (the reset ~40 µs, the tiles' writes by control packets: `fused.ctrlpkt`). One design whose workers run every
+- **A change of design inside a fused ELF is a full reconfiguration**: ~30-40 µs in a library (the tiles' writes
+  by control packets: `fused.ctrlpkt`; the PDI load's array reset, 37 µs more, only at a piece's first:
+  `fused.program.Quiet`), ~80-90 µs with the reset. One design whose workers run every
   phase removes it (the Llama decode step: 13.4 ms on one overlay, 25 as a runlist of designs). Design for it from the
   start:
   - one weight-object size;
@@ -268,8 +269,9 @@ offsets): aie2p-coding section 8. For speed:
   scratch goes as segments (`fused.layout.SEGMENT_BYTES`); host-built transactions carry 64-bit addresses.
 - **`FusedOperator(expand_load_pdis=False)`** for a single-design ELF: the ConfigureOp is skipped
   when the PDI is unchanged (-0.28 ms per dispatch). Multi-design ELFs: keep the default.
-- **ConfigureOp cost** (a library's): the PDI load's reset ~40 µs, ~0.1-0.13 µs per transaction operation left
-  (stream switch ports, the cores' enables, the shim), a few µs of packets per column. With program memory by control
+- **ConfigureOp cost** (a library's): ~0.1-0.13 µs per transaction operation (stream switch ports, the cores'
+  enables, the shim), a few µs of packets per column; the PDI load's reset 37 µs at a piece's first configuration
+  only. With program memory by control
   packets, size each design for its work, not its configuration (Llama chunks of 64 / 128: GemmQ over 1-2-row GemmQd,
   the attention on 4 rows over 1, the norms on 4 columns over 2: -10 to -12%); by blockwrites (~1.5 µs per KB) fewer
   cores would win on short prompts.
@@ -301,6 +303,16 @@ offsets): aie2p-coding section 8. For speed:
   Llama 1B chunk of 128 tokens 43 -> 31 ms, Gemma / Qwen chat TTFT -20%). A slave port has 4 slots: match the ids
   above by a differing bit, not one slot each. Firmware PDI loads (`expand_load_pdis=False`) are slower: +1.1 ms per
   switch.
+- **A design that ends leaves its lock waits pending.** A core or DMA channel blocked on a lock when its design ends
+  keeps its acquire pending in the lock's module: neither a core reset (Core_Control) nor a DMA channel reset cancels
+  it, and the next design's first release of that lock goes to it (that object never reaches its consumer: a hang,
+  late and timing-dependent when the wait was on the core's own lock); writing the lock value 63 grants it. Only the
+  PDI load's array reset clears them, so a configuration without it (`fused.program.Quiet`) quiesces each tile by its
+  packets (core and channels held in reset while every lock is written 63, then 0) and, before any packet, resets the
+  previous design's cores that wait on a neighbour's lock and flushes those locks: a neighbour's packets can arrive
+  first (`fused.locks`: those acquires from the cores' objects). The registers, stream switch counters and data memory
+  showed nothing; per-port word counters (event port selection + `PORT_RUNNING` counted) and the lock values read
+  during the hang did.
 - **Control code is the fixed cost of a small operator**: ~0.1 us per TXN operation (measured with injected
   write32s), and an overlay operator issues 300-900 (memtile BDs and their address fields, shim BDs, address patches,
   queue pushes, task waits): 35-65 us per operator before any data moves. The library assembler leaves out memtile
