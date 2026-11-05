@@ -319,7 +319,13 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
   m.def("turn_foreign", &artlite::turn::foreign,
         "The turns this process took after another process's: a change means another process's hardware context "
         "may have run on the NPU since.");
+  m.def("turn_waited", &artlite::turn::waited,
+        "Seconds this process waited for another process's NPU turn to end (in its lifetime): a timing of its own "
+        "work subtracts it.");
   m.def("turn_contended", &artlite::turn::contended, "Whether another process waits for the NPU's turn.");
+  m.def("turn_peers", &artlite::turn::peers,
+        "Whether another process uses the NPU (any of these functions called, the process not ended): its turns may "
+        "come between this process's dispatches.");
   m.def(
       "turn_pass",
       [] {

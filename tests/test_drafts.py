@@ -108,6 +108,18 @@ def test_planner_crossing() -> None:
     p.ran(4, 0.390)
     assert p.t[3] == 0.340 and p.again == pytest.approx(0.8 * (0.384 - 0.3366) + 0.2 * 0.050)
     assert not Planner((1.0, 1.1)).t[1]  # (nothing measured: no crossing's measure in relative units)
+    # a long context's steps stand for no other span's: at 30K a step of 4 takes 2x one of 1; at 100 the planner drafts
+    r = Planner((1.0, 1.02, 1.035, 1.05))
+    r.place(30000)
+    for S, t in enumerate((0.060, 0.090, 0.105, 0.120), 1):
+        r.ran(S, t)
+    assert r.choose(1, 3, drafter=False) == 0
+    r.place(100)
+    assert r.step_time(4) == 0.120  # (a span of no steps: the nearest measured one's)
+    r.ran(1, 0.030)
+    assert r.step_time(4) == pytest.approx(0.030 * 1.05) and r.choose(1, 3, drafter=False) == 3
+    r.place(31000)
+    assert r.step_time(1) == 0.060 and r.choose(1, 3, drafter=False) == 0
     q = Planner((1.0, 1.1))
     q.crossing = (False, True)
     q.ran(2, 0.3)

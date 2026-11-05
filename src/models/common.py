@@ -1043,17 +1043,18 @@ class OverlayModel(NpuModel):
                 c = len(self.carry)
                 k = min(self.DRAFTS - c, self.capacity - self.position - 1 - c,
                         max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
+                plan.place(self.position)
                 plan.crossing = self._crossing()
-                t0 = time.perf_counter()
+                t0, w0 = time.perf_counter(), _native.turn_waited()  # (the planner's times: this process's own work)
                 m, d = ctx.draft(k) if ctx is not None else (0, [])
                 j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
                 mtp = j is None
                 d = self._mtp(token, k, penalties) if mtp else d[:j]
                 sib = self._sibling() if mtp else None
                 p = self.position
-                t1 = time.perf_counter()
+                t1, w1 = time.perf_counter(), _native.turn_waited()
                 raw = self._verify([*self.carry, token, *d], mtp)
-                t2 = time.perf_counter()
+                t2, w2 = time.perf_counter(), _native.turn_waited()
                 new: list[int] = []
                 for i in range(len(d) + 1):
                     new.append(choose(raw[c + i], self.softcap))
@@ -1069,10 +1070,10 @@ class OverlayModel(NpuModel):
                         won += 1
                 self._kept(p, [*self.carry, token, *d], c + 1 if won else c + len(new), mtp, won)
                 self.carry = tuple(new[:won])
-                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1)
+                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1))
                 self.accepted += len(new) - 1
                 if mtp:
-                    plan.drafted(m, len(new), t2 - t0)
+                    plan.drafted(m, len(new), t2 - t0 - (w2 - w0))
                     self._calibrate(len(new) - 1)
                 elif d:
                     plan.accepted(m, len(d), len(new) - 1)

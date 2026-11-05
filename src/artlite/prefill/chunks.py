@@ -42,7 +42,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from .. import parallel_compile
+from .. import _native, parallel_compile
 from ..gemm.gemm_q import PACE, PACE_IDLE, pace_levels
 from ..operators.base import ArtcOperator
 from ..operators.fused import Library
@@ -51,6 +51,9 @@ from . import gemm as PG
 from . import pace as PACING
 
 PIECE_BUDGET_S = 0.8  # estimated seconds per dispatch (the hang detection: 2 s; DDR contention adds up to 40%)
+PEER_PIECE_S = 0.05  # the same while another process uses the NPU: its requests wait for a piece (``Library.run``),
+# and two processes that both keep the NPU busy get about half of it each (Qwen3-Embedding-0.6B's batches against Llama
+# 3.2 3B's decode: 1.9x / 2.1x their time alone; at 0.1 s 1.5x / 2.8x)
 CONFIG_S = 0.12e-3  # a ConfigureOp (~30-40 us alone: no array reset but at a piece's first, ``fused.program``; the
 # cores' programs by control packets: Llama's fitted 0.111 ms, Qwen's 0.085 ms in their own models; Gemma's model
 # 1.5-1.6x its chunks)
@@ -150,15 +153,15 @@ class ChunkPrefill:
             starts.append(starts[-1] + self.layer_entries(L, n))
         return starts
 
-    def _splits(self, T: int, p0: int) -> list[int]:
-        """The program items (``_runlist``) that start a piece: whole layers, each piece under PIECE_BUDGET_S at p0, the
-        pace's slowdown included (``pace_factor``; ``Library.run`` also cuts where a piece's control code would exceed
-        its BOs)."""
+    def _splits(self, T: int, p0: int, budget: float = PIECE_BUDGET_S) -> list[int]:
+        """The program items (``_runlist``) that start a piece: whole layers, each piece under ``budget`` seconds at p0,
+        the pace's slowdown included (``pace_factor``; ``Library.run`` also cuts where a piece's control code would
+        exceed its BOs)."""
         S, starts, f = self.subs(T), self._layer_starts(T), self.pace_factor()
         splits, t = [], 0.0
         for k, L in enumerate(self.layers):
             s = self.layer_seconds(L, p0, S) * f
-            if k and t + s > PIECE_BUDGET_S:
+            if k and t + s > budget:
                 splits.append(starts[k])
                 t = 0.0
             t += s
@@ -378,9 +381,10 @@ class ChunkPrefill:
         (``kv_layers``: record mode)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
-        cut = ("splits", T, p0, self.pace)  # (a packed or tree chunk's: its size's, the same items per layer)
+        budget = PEER_PIECE_S if _native.turn_peers() else PIECE_BUDGET_S  # (another process's requests wait less)
+        cut = ("splits", T, p0, self.pace, budget)  # (a packed or tree chunk's: its size's, the same items per layer)
         if cut not in self._est:
-            self._est[cut] = self._splits(T, p0)
+            self._est[cut] = self._splits(T, p0, budget)
         self.dispatches = self.lib.run(self._program(T if key is None else key),
                                        splits=[*self._est[cut], *(hooks or {})],
                                        bufs=list(self._buffers().values()), hooks=hooks)

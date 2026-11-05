@@ -34,6 +34,7 @@ from typing import Any
 
 import numpy as np
 
+from .. import _native
 from ..gemm.gemm_q import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
 from ..operators.base import CACHE_DIR
 from ..operators.util import arg_bytes
@@ -204,9 +205,9 @@ def calibrate(pf: Any) -> tuple[int, dict]:
         t = []
         end = time.perf_counter() + RUN_S
         while len(t) < 3 or time.perf_counter() < end:
-            t0 = time.perf_counter()
+            t0, w0 = time.perf_counter(), _native.turn_waited()
             run(items)
-            t.append(time.perf_counter() - t0)
+            t.append(time.perf_counter() - t0 - (_native.turn_waited() - w0))  # (another process's turns: not its)
         return statistics.median(t)
 
     t_start = time.perf_counter()

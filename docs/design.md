@@ -135,8 +135,12 @@ auto* out_span = static_cast<int32_t*>(buf_out->map());
   process's commands never run between two of its own; `turn::foreign()` counts the turns other processes took in
   between (Python: `artlite.overlay.npu_turn`, `_native.turn_foreign`). A switch to another process's hardware
   context loses what a design keeps on the array beyond its configuration: an overlay with code pages loads its page
-  store again after one. A pipelined run of pieces (`Library.run`) lets a waiting process in between its pieces. A
-  lock file every user's processes share (`/dev/shm/artlite-npu.lock`; Windows: the temp directory).
+  store again after one. A pipelined run of pieces (`Library.run`) lets a waiting process in between its pieces;
+  while another process uses the NPU (`turn::peers()`: each process holds a slot byte of the file) it queues no piece
+  ahead and a prefill's pieces are shorter (`prefill.chunks.PEER_PIECE_S`), so a waiter waits for one piece at most.
+  `turn::waited()` counts the time a process waited for another's turn: timings of its own work subtract it (the
+  drafts' planner, the pace calibration). A lock file every user's processes share (`/dev/shm/artlite-npu.lock`;
+  Windows: the temp directory).
 
 ---
 

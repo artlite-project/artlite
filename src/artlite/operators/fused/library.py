@@ -170,9 +170,10 @@ class Library(FusedElf):
 
         Each piece is dispatched as soon as it is assembled and its hook ran, then the previous one is waited for: the
         firmware starts it at the previous one's end (a boundary waited for first: ~35 us more of idle NPU, the wait's
-        wake-up and the submit), unless another process waits for the NPU's turn (``overlay.npu_turn``): then the
-        previous one ends first and that process's dispatches run before this one (each piece configures the array
-        again). The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
+        wake-up and the submit), unless another process uses the NPU (``_native.turn_peers``): then the previous one
+        ends first, and if that process waits for the NPU's turn (``overlay.npu_turn``) its dispatches run before this
+        one (each piece configures the array again), so that it waits for one piece at most, not also for one queued
+        behind it. The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
         (``irq_cpu``): it waits there (napping, then polling from shortly before the piece's shortest seen end), and the
         host work between pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU
         the scheduler woke for it)."""
@@ -235,10 +236,11 @@ class Library(FusedElf):
             bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
                 hooks[a]()
-            if last is not None and _native.turn_contended():  # (another process's dispatches between the pieces)
+            if last is not None and _native.turn_peers():  # (none queued ahead of another process's turn)
                 end = wait(last, 0)
                 last = None
-                _native.turn_pass()
+                if _native.turn_contended():  # (its dispatches between the pieces)
+                    _native.turn_pass()
             with npu_turn():  # (the piece's submit time: once the turn is this process's)
                 submit = time.perf_counter()
                 kern.dispatch_elf_async(bo, refs, piece.nbytes)

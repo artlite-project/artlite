@@ -23,7 +23,7 @@ namespace artlite::turn {
 
 namespace {
 
-constexpr int64_t kTurn = 0, kWaiting = 1, kOwner = 8;  // (the lock file's bytes: turn.h)
+constexpr int64_t kTurn = 0, kWaiting = 1, kOwner = 8, kSlot0 = 64, kSlots = 256;  // (the lock file's bytes: turn.h)
 
 enum class Mode { kShared, kExclusive, kUnlock };
 
@@ -44,13 +44,15 @@ void close_file(Handle h) { ::CloseHandle(h); }
 
 long process_id() { return static_cast<long>(::GetCurrentProcessId()); }
 
-// false: another process's lock is in the way (wait = false) or the call failed (conflict(): which)
-bool lock(Handle h, int64_t at, Mode mode, bool wait) {
+// Bytes [at, at + n). false: another process's lock is in the way (wait = false) or the call failed (conflict():
+// which)
+bool lock(Handle h, int64_t at, Mode mode, bool wait, int64_t n = 1) {
   OVERLAPPED ov{};
   ov.Offset = static_cast<DWORD>(at);
-  if (mode == Mode::kUnlock) return ::UnlockFileEx(h, 0, 1, 0, &ov) != 0;
+  const DWORD len = static_cast<DWORD>(n);
+  if (mode == Mode::kUnlock) return ::UnlockFileEx(h, 0, len, 0, &ov) != 0;
   const DWORD flags = (mode == Mode::kExclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0) | (wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
-  return ::LockFileEx(h, flags, 0, 1, 0, &ov) != 0;
+  return ::LockFileEx(h, flags, 0, len, 0, &ov) != 0;
 }
 
 bool conflict() { return ::GetLastError() == ERROR_LOCK_VIOLATION; }
@@ -89,13 +91,14 @@ void close_file(Handle fd) { ::close(fd); }
 
 long process_id() { return static_cast<long>(::getpid()); }
 
-// Open-file-description locks: a forked child's copy of the descriptor shares them (State::own reopens).
-bool lock(Handle fd, int64_t at, Mode mode, bool wait) {
+// Open-file-description locks of bytes [at, at + n): a forked child's copy of the descriptor shares them
+// (State::own reopens).
+bool lock(Handle fd, int64_t at, Mode mode, bool wait, int64_t n = 1) {
   struct flock l{};
   l.l_type = mode == Mode::kShared ? F_RDLCK : mode == Mode::kExclusive ? F_WRLCK : F_UNLCK;
   l.l_whence = SEEK_SET;
   l.l_start = at;
-  l.l_len = 1;
+  l.l_len = n;
   while (::fcntl(fd, wait ? F_OFD_SETLKW : F_OFD_SETLK, &l) != 0)
     if (errno != EINTR) return false;
   return true;
@@ -117,12 +120,14 @@ struct State {
   std::mutex m;
   size_t held = 0;
   std::atomic<uint64_t> foreign{0};
+  std::atomic<int64_t> waited_ns{0};
   uint64_t id = 0;
   long pid = -1;
   Handle h = kNone;
+  int64_t slot = kSlots;  // (its byte kSlot0 + slot; kSlots: none free)
 
   // The lock file of this process: opened at the first call, and again in a forked child (which would share the
-  // parent's locks), with a holder id of its own.
+  // parent's locks), with a holder id and a slot of its own.
   void own() {
     const long p = process_id();
     if (p == pid) return;
@@ -133,16 +138,22 @@ struct State {
     foreign = 0;
     std::random_device rd;
     id = (static_cast<uint64_t>(rd()) << 32 | rd()) | 1;  // (0: no holder yet)
+    slot = 0;
+    while (h != kNone && slot < kSlots && !lock(h, kSlot0 + slot, Mode::kExclusive, false)) slot++;
   }
 
-  // Whether another process holds byte kWaiting (waits for the turn).
-  bool waiting() {
-    if (lock(h, kWaiting, Mode::kExclusive, false)) {
-      lock(h, kWaiting, Mode::kUnlock, false);
+  // Whether another process holds a byte of [at, at + n).
+  bool taken(int64_t at, int64_t n = 1) {
+    if (n <= 0) return false;
+    if (lock(h, at, Mode::kExclusive, false, n)) {
+      lock(h, at, Mode::kUnlock, false, n);
       return false;
     }
     return conflict();
   }
+
+  // Whether another process waits for the turn (holds byte kWaiting).
+  bool waiting() { return taken(kWaiting); }
 };
 
 State& state() {
@@ -157,9 +168,15 @@ void enter() {
   std::lock_guard g(s.m);
   s.own();
   if (s.held++ > 0 || s.h == kNone) return;
-  lock(s.h, kWaiting, Mode::kShared, true);
-  lock(s.h, kTurn, Mode::kExclusive, true);
-  lock(s.h, kWaiting, Mode::kUnlock, false);
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!lock(s.h, kTurn, Mode::kExclusive, false)) {  // (another process's turn: wait for it, as a waiter)
+    lock(s.h, kWaiting, Mode::kShared, true);
+    lock(s.h, kTurn, Mode::kExclusive, true);
+    lock(s.h, kWaiting, Mode::kUnlock, false);
+    s.waited_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                              .count(),
+                          std::memory_order_relaxed);
+  }
   if (read_owner(s.h) != s.id) {
     s.foreign.fetch_add(1, std::memory_order_relaxed);
     write_owner(s.h, s.id);
@@ -176,11 +193,20 @@ void leave(size_t n) {
 
 uint64_t foreign() { return state().foreign.load(std::memory_order_relaxed); }
 
+double waited() { return 1e-9 * static_cast<double>(state().waited_ns.load(std::memory_order_relaxed)); }
+
 bool contended() {
   State& s = state();
   std::lock_guard g(s.m);
   s.own();
   return s.h != kNone && s.waiting();
+}
+
+bool peers() {
+  State& s = state();
+  std::lock_guard g(s.m);
+  s.own();
+  return s.h != kNone && (s.taken(kSlot0, s.slot) || s.taken(kSlot0 + s.slot + 1, kSlots - s.slot - 1));
 }
 
 void pass() {

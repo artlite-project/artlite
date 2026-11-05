@@ -11,8 +11,10 @@
 // between two of its own meanwhile; foreign() counts the turns this process took after another process had one.
 //
 // A lock file every user's processes open (Linux: /dev/shm, else the temp directory; Windows: the temp directory):
-// byte 0 is the turn, a process waiting for it holds byte 1 shared (contended), bytes 8-15 hold the last holder's id.
-// Where the file cannot be opened there is no turn (every call returns at once, foreign() stays 0).
+// byte 0 is the turn, a process waiting for it holds byte 1 shared (contended), bytes 8-15 hold the last holder's id,
+// and each process holds one of bytes 64-319 from its first call on (peers: whether another holds one; a range lock
+// tests them all at once). Where the file cannot be opened there is no turn (every call returns at once, foreign()
+// stays 0, peers() false).
 namespace artlite::turn {
 
 // Until this process holds the turn (nested holds count; the commands' are among them).
@@ -21,8 +23,14 @@ void enter();
 void leave(size_t n = 1);
 // The turns this process took after another process's (in this process's lifetime).
 uint64_t foreign();
+// Seconds this process waited for another process's turn to end (in its lifetime): a timing of this process's own
+// work subtracts it.
+double waited();
 // Whether another process waits for the turn.
 bool contended();
+// Whether another process uses the NPU: one that called any of these and has not ended (its turns may come between
+// this process's dispatches at any time).
+bool peers();
 // Holding nothing: until a waiting process has taken the turn (at most kPassMs), so that the next enter() comes after
 // its turn. Holding something: returns at once.
 void pass();

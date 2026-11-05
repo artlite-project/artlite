@@ -596,9 +596,9 @@ class QwenPrefill(ChunkPrefill):
         """(a chunk's: its attention streams every pass's groups as an unpacked one's)"""
         return self.chunk_seconds(T, p0)
 
-    def _splits(self, T: int, p0: int) -> list[int]:
+    def _splits(self, T: int, p0: int, budget: float = PIECE_BUDGET_S) -> list[int]:
         """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""
-        out = super()._splits(T, p0)
+        out = super()._splits(T, p0, budget)
         return sorted({*out, *(i for _, at in self._moe_marks.get(T, ()) for i in at)})
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:

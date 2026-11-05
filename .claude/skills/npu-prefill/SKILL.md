@@ -41,7 +41,7 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - **Library ELF** (`fused.Library`): each design compiled once, whatever the depth and chunk sizes;
   `run(items, splits=, bufs=, hooks=)` assembles a chunk's program on the host and dispatches it in pieces of
   whole layers, each estimated under `PIECE_BUDGET_S` (the driver kills a dispatch after 2 s; DDR contention adds up
-  to 40%). Keep a per-layer time estimate (`layer_seconds`) for the splits and the chunk planner, fitted to measured
+  to 40%), under `PEER_PIECE_S` while another process uses the NPU (its requests wait for a piece). Keep a per-layer time estimate (`layer_seconds`) for the splits and the chunk planner, fitted to measured
   chunks (sizes x positions; Llama's within ~5%): a model 2x off put a 48-token prompt in a 256-token chunk (58 ms)
   instead of a 128-token one (44). Terms that scale with the model's dimensions fit one set of constants to all its
   sizes (Qwen: weight bytes, GEMM items, hidden size, v heads, q heads; the flash attention per cached position as
