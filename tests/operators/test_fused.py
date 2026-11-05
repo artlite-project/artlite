@@ -393,17 +393,71 @@ def test_library_without_reset(monkeypatch):
         lib._pieces.clear()
         fused_library._PIECES.held = [None, None]
         parity = asm.parity
-        asm.assemble(items)
+        asm.assemble(items)  # (on the host only)
         assert (asm.parity != parity) == reuse  # (1 PDI load with the reset in the 16 configurations, else 16)
-        asm.parity = parity  # (the PDI the firmware loaded last unchanged: the run's first configuration resets)
+        _zero(out)
         lib.run(items, bufs=[b._raw for b in (bx, t, out)])
         out.sync_from_device()
         outs.append(out.to_torch().clone())
     assert torch.equal(outs[0], outs[1])
+    torch.testing.assert_close(outs[1].float(), _chain_ref(x), rtol=5e-2, atol=5e-2 * float(_chain_ref(x).abs().max()))
+
+
+def _zero(t: artlite.Tensor) -> None:
+    """Clear a tensor on the device (``Tensor.sync_to_device`` flushes once only: stale host lines would come back)."""
+    t._raw.map()[:] = 0
+    t._raw.sync_to_device()
+
+
+def _chain_ref(x: torch.Tensor) -> torch.Tensor:
+    """The output of the chain / add program of ``test_library_without_reset`` (8 rounds of 4 y + x)."""
     y = x.float()
     for _ in range(8):
         y = 4 * y + x.float()
-    torch.testing.assert_close(outs[1].float(), y, rtol=5e-2, atol=5e-2 * float(y.abs().max()))
+    return y
+
+
+def test_library_abort(monkeypatch):
+    """A program whose hook raises before its second piece is dispatched (that piece assembled: the assembler's PDI
+    parity advanced), then the same program again; again after a piece assembled on the host only: no hang (each
+    piece's first configuration resets the array whatever the parity says, though the first piece left a core waiting
+    on its neighbour's lock), the outputs a clean run's bit for bit."""
+    from artlite.operators.fused import ctrlpkt
+    from artlite.txn import device_address
+
+    class Abort(Exception):
+        pass
+
+    def abort() -> None:
+        raise Abort
+
+    n = 1024
+    monkeypatch.setattr(ctrlpkt, "worth", lambda loader: True)
+    lib = Library("t_library_reuse", [ChainOperator(n=n), AddOperator(size=n)]).compile()
+    lib.load()
+    dev = artlite.Device()
+    x = torch.randn(n).bfloat16()
+    bx = artlite.from_torch(x.clone(), dev)
+    t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+    a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
+    items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
+    for _ in range(7):
+        items += [(0, [a["out"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
+    bufs = [b._raw for b in (bx, t, out)]
+
+    def run() -> torch.Tensor:
+        _zero(out)
+        assert lib.run(items, splits=[7], bufs=bufs) == 2  # (piece 0 ends with the chain)
+        out.sync_from_device()
+        return out.to_torch().clone()
+
+    ref = run()
+    torch.testing.assert_close(ref.float(), _chain_ref(x), rtol=5e-2, atol=5e-2 * float(_chain_ref(x).abs().max()))
+    with pytest.raises(Abort):
+        lib.run(items, splits=[7], bufs=bufs, hooks={7: abort})
+    assert torch.equal(run(), ref)
+    lib._asm.assemble(items[:7])
+    assert torch.equal(run(), ref)
 
 
 def test_control_packets_encoding(tmp_path):

@@ -6,7 +6,9 @@ device addresses of its arguments; ``Assembler.assemble`` writes the items' RunO
 configuration only where the previous item is of another design:
 
 - the configurations' PDI loads alternate between the library's two (the firmware skips the load, and with it the
-  array reset, of the PDI it loaded last);
+  array reset, of the PDI it loaded last); a piece's first loads the other one first (skipped after the previous
+  piece: 0.25 us), so that its own load resets whatever ran before (a piece assembled and never dispatched, one a
+  TDR stopped, another context's, a fresh context: neither PDI loaded yet);
 - a RunOp again right after its own design: the form with a poll for a free task-queue slot before each shim task
   push (``Run.guarded``);
 - memory-tile BDs the registers already hold since the last configuration left out (``Run.emit``);
@@ -444,7 +446,9 @@ class Assembler:
         """``census``: the library's cores' acquires of a neighbour's lock (``locks.census``; None: every
         configuration with the array reset)."""
         self.header, self.preamble, self.blocks, self.loadpdi = _cut(code, bds, slots)
-        self.parity = 1  # (the PDI load of the next configuration; the first: the second, as aiecc starts)
+        # (the PDI load of the next configuration with the reset, the other most likely the firmware's last; the first:
+        # the second, as aiecc starts)
+        self.parity = 1
         self.reuse = REUSE and census is not None  # (configurations without the array reset: ``Quiet``)
         # (per entry: its cores that acquire a neighbour's lock, and those (tile, lock))
         self._neighbours = {e: (frozenset(t for t, _, _ in v), frozenset((lt, k) for _, lt, k in v))
@@ -533,6 +537,9 @@ class Assembler:
             elif configure:
                 cfg = blk.config.copy()
                 cfg[:4] = self.loadpdi[self.parity]
+                if prev is None:  # (a piece's first: the other PDI loaded first, so that this load is never skipped)
+                    parts.append(self.loadpdi[self.parity ^ 1])
+                    n_ops += 1
                 self.parity ^= 1
                 parts.append(cfg)
                 n_ops += blk.n_config
@@ -556,9 +563,11 @@ class Assembler:
         def nbytes(i: int, prev: int | None) -> int:  # (as ``assemble`` emits it, all memory-tile BDs written)
             e = items[i][0]
             blk = self.blocks[e]
+            if prev is None:  # (two PDI loads, then the configuration)
+                return 4 * (4 + blk.config.size + blk.run.words.size)
             if self._configure(e, prev):
                 quiet = blk.quiet.config.size + self._before(prev, e)[0].size \
-                    if prev is not None and self.reuse and blk.quiet is not None and self.blocks[prev].quiet else 0
+                    if self.reuse and blk.quiet is not None and self.blocks[prev].quiet else 0
                 return 4 * (max(blk.config.size, quiet) + blk.run.words.size)
             return 4 * blk.run.guarded.words.size
 

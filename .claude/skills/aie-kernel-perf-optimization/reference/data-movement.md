@@ -313,6 +313,11 @@ offsets): aie2p-coding section 8. For speed:
   first (`fused.locks`: those acquires from the cores' objects). The registers, stream switch counters and data memory
   showed nothing; per-port word counters (event port selection + `PORT_RUNNING` counted) and the lock values read
   during the hang did.
+- **Which PDI load the firmware skips is its state, not the host's.** It skips a load of the PDI it loaded last (and
+  the reset with it); a fresh context has loaded neither of a library's two, a TDR recovery keeps the last one, and a
+  host's count of loads drifts when a piece is assembled but not dispatched or a hung piece stops anywhere. A
+  configuration pruned for a reset array then runs on a live one: a hang. A dispatch whose first configuration needs
+  the reset loads the other PDI first (`fused.program`: 0.25 µs where it is the last one, skipped).
 - **Control code is the fixed cost of a small operator**: ~0.1 us per TXN operation (measured with injected
   write32s), and an overlay operator issues 300-900 (memtile BDs and their address fields, shim BDs, address patches,
   queue pushes, task waits): 35-65 us per operator before any data moves. The library assembler leaves out memtile
