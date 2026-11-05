@@ -244,13 +244,18 @@ __attribute__((noinline)) void {{ p }}_panels(const float *__restrict xf, uint8_
 }
 
 // The 8 tokens' window, conv, SiLU and panels (b: their raw rows [8][128]; the record's slot of the token block{% if PACK %};
-// m: their mask values, a segment's first three tokens' convs again from its first token on{% endif %})
+// m: their mask values, a segment's first three tokens' convs again from its first token on{% elif TREE %};
+// m: their mask values, the window the prefix's rows where a segment starts with the block{% endif %})
 template <bool Q>
 [[clang::always_inline]] inline void {{ p }}_block(const bfloat16 *__restrict b, int32_t *__restrict ws,
-                                                   uint8_t *__restrict out{% if PACK %}, const float *__restrict m{% endif %})
+                                                   uint8_t *__restrict out{% if SEG %}, const float *__restrict m{% endif %})
 {
     bfloat16 *__restrict r = SW(bfloat16, {{ w.rows }});
     al::copy<{{ 8 * 128 }}, 64>(r + {{ 3 * 128 }}, b);
+{% if TREE %}
+    if (((const int32_t *)m)[0] == 0x3F800000)  // (1.0: a segment's first token)
+        al::copy<{{ 3 * 128 }}, 64>(r, SW(bfloat16, {{ w.cv0 }}));
+{% endif %}
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
     bfloat16 *__restrict ys = SW(bfloat16, {{ w.ys }});
     {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc);
@@ -273,9 +278,10 @@ template <bool Q>
 extern "C" {
 
 // The first objects (q core: k = 0 the q conv weights ([tap][hi, lo][128]) then the gate parameters (dt, ssm_a of the
-// k head's v heads: fp32 [16] each); k = 1 the conv state rows (12 read, 3 used); k = 2 the token mask (fp32 [T]: {% if PACK %}0
+// k head's v heads: fp32 [16] each); k = 1 the conv state rows (12 read, 3 used); k = 2 the token mask (fp32 [T]: {% if SEG %}0
 // padding, else 1 + the token's distance from its segment's first token, 4 from 3 on{% else %}1
-// a valid token, 0 padding{% endif %}))
+// a valid token, 0 padding{% endif %}{% if TREE %}; then 1 in a layer's first call: the conv state rows are the prefix's,
+// which a segment's first block takes as its window{% endif %}))
 void {{ p }}_qinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t k)
 {
     if (k == 0) {
@@ -284,18 +290,30 @@ void {{ p }}_qinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t
     } else if (k == 1) {
         al::copy<{{ 3 * 128 }}, 64>(SW(bfloat16, {{ w.rows }}), b);
     } else {
+{% if TREE %}
+        al::copy<{{ T + 16 }}, 16>(SW(float, {{ w.mask }}), (const float *)b);
+        if (SW(int32_t, {{ w.mask }})[{{ T }}])
+            al::copy<{{ 3 * 128 }}, 64>(SW(bfloat16, {{ w.cv0 }}), SW(bfloat16, {{ w.rows }}));
+{% else %}
         al::copy<{{ T }}, 16>(SW(float, {{ w.mask }}), (const float *)b);
+{% endif %}
     }
 }
 
-// (k core: the k conv weights, the conv state rows{% if PACK %}, the token mask{% else %}; the mask object is not its{% endif %})
+// (k core: the k conv weights, the conv state rows{% if SEG %}, the token mask{% else %}; the mask object is not its{% endif %})
 void {{ p }}_kinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t k)
 {
     if (k == 0)
         al::copy<{{ 8 * 128 }}, 64>(SW(bfloat16, {{ w.wc }}), b);
     else if (k == 1)
         al::copy<{{ 3 * 128 }}, 64>(SW(bfloat16, {{ w.rows }}), b);
-{% if PACK %}
+{% if TREE %}
+    else {
+        al::copy<{{ T + 16 }}, 16>(SW(float, {{ w.mask }}), (const float *)b);
+        if (SW(int32_t, {{ w.mask }})[{{ T }}])
+            al::copy<{{ 3 * 128 }}, 64>(SW(bfloat16, {{ w.cv0 }}), SW(bfloat16, {{ w.rows }}));
+    }
+{% elif PACK %}
     else
         al::copy<{{ T }}, 16>(SW(float, {{ w.mask }}), (const float *)b);
 {% endif %}
@@ -306,30 +324,36 @@ void {{ p }}_kblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
                     int32_t tb)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if PACK %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
+    {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if SEG %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
 }
 
 // Token block tb of chunk i (q core): b = [ab slot 8 x 64 ({{ "alpha HC fp32 | beta HC bf16" if F32A else "alpha HC | beta HC bf16" }}) | q rows 8 x 128] -> the Q panels
 // and the gates of the k head's v heads h = kh + 2 hh: d = expm1(ssm_a softplus(alpha + dt)), beta = sigmoid(beta),
 // times the mask, at the record's [hh][d 16 | beta 16] (fp32: the block's 8 tokens at 8 tb); two heads per call
 // (lanes [head 2][the 8 tokens]){% if PACK %}; packed: the mask's token valid, d = -2 at a segment's first token (the scan's
-// reset there){% endif +%}
+// reset there){% elif TREE %}; tree: the mask's token valid, the mask values at the record's slot VH (the scan's reload at a
+// segment's first token){% endif +%}
 void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat16 *__restrict out, int32_t kh,
                     int32_t i, int32_t tb)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_block<true>(b + 512, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if PACK %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
+    {{ p }}_block<true>(b + 512, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if SEG %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
     const float *__restrict gp = SW(float, {{ w.gp }});
     // (8 lanes, 32 B: a 64-B load at an odd block's 32-B offset would round the address down)
     const aie::vector<float, 8> m8 = aie::load_v<8>(SW(float, {{ w.mask }}) + 16 * i + 8 * tb);
-{% if PACK %}
+{% if SEG %}
     const aie::vector<float, 16> mv = aie::concat(m8, m8);
     const aie::vector<float, 16> m = aie::min(mv, aie::broadcast<float, 16>(1.0f));
-    const aie::mask<16> first = aie::eq(mv, aie::broadcast<float, 16>(1.0f));
 {% else %}
     const aie::vector<float, 16> m = aie::concat(m8, m8);
 {% endif %}
+{% if PACK %}
+    const aie::mask<16> first = aie::eq(mv, aie::broadcast<float, 16>(1.0f));
+{% endif %}
     float *__restrict gt = (float *)((uint8_t *)out + {{ KP_BYTES }}) + 8 * tb;
+{% if TREE %}
+    aie::store_v(gt + {{ 32 * VH }}, m8);
+{% endif %}
     const uint16_t *__restrict ab = (const uint16_t *)b;
 {% for hp in range((VH + 1) // 2) %}
 {% set h1 = 2 * hp + 1 if 2 * hp + 1 < VH else 2 * hp %}
@@ -382,7 +406,12 @@ class GdnPrepOperator(ArtcOperator):
     distance from its segment's first token (4 from 3 on), twice: from its start (the q core's part of the object) and
     from ``K_MASK`` (the k core's): a segment's first three tokens' convs again from its first token on (the zeros a
     sequence's first tokens see: their outputs as the segment's alone), d = -2 at its first token
-    (``GdnScanOperator``'s reset there)."""
+    (``GdnScanOperator``'s reset there).
+
+    Tree (``tree``: segments that each continue a prefix's state, the layer's conv state in CV; ``mask(.., tree=True)``):
+    M as packed, segments starting at multiples of 16 tokens; a block that starts a segment takes the prefix's 3 rows as
+    its window (saved from CV in a layer's first call, flagged after the mask values), and the record carries one more
+    gate slot (``jobj_bytes(vh + 1)``) holding the mask values: ``GdnScanOperator``'s reload of the prefix's state."""
 
     STACK = 5120
     CV_ROWS = 12  # rows of CV read (the q part's 12 rows, the k part's 8: 3 used)
@@ -390,9 +419,9 @@ class GdnPrepOperator(ArtcOperator):
     K_MASK = QB_ELEMS // 2  # (packed: the fp32 of the mask's second copy, the k core's part of the object)
     pfx = kernel_prefix("gdp")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False):
-        assert T % C == 0 and T // 8 <= 64 and 4 * T <= 2 * QB_ELEMS
-        self.T, self.cfg, self.layout, self.pack = T, cfg, layout, pack
+    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False, tree: bool = False):
+        assert T % C == 0 and T // 8 <= 64 and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
+        self.T, self.cfg, self.layout, self.pack, self.tree = T, cfg, layout, pack, tree
         self.sh = GD.GdnShape(cfg)
         self.hc = self.sh.hc
         self.vh = self.hc // 2
@@ -403,7 +432,7 @@ class GdnPrepOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         sizes = [("wc", 2 * 8 * 128), ("rows", 2 * 11 * 128), ("yc", 2 * 8 * 128), ("ys", 2 * 8 * 128),
                  ("xf", 4 * 8 * 128), ("gp", 4 * 32), ("mask", 4 * (self.T + 16))]
-        return regions(sizes)
+        return regions(sizes + ([("cv0", 2 * 3 * 128)] if self.tree else []))
 
     def get_kernel_src(self) -> str:
         helpers = JINJA_ENV.from_string(GD.HELPERS).render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D, gm=GD.MATH,
@@ -411,25 +440,32 @@ class GdnPrepOperator(ArtcOperator):
         return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, w=Attr(self.workspace()), D=D, HC=self.hc,
                             F32A=ab_f32(self.layout),
                             VH=self.vh, T=self.T, PAN=PAN, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
-                            rs=bf16_hilo(1 / math.sqrt(D)), PACK=self.pack)
+                            rs=bf16_hilo(1 / math.sqrt(D)), PACK=self.pack, TREE=self.tree,
+                            SEG=self.pack or self.tree)
 
     @staticmethod
-    def mask(n: int, T: int, lo: np.ndarray | None = None, t: int = 0) -> np.ndarray:
+    def mask(n: int, T: int, lo: np.ndarray | None = None, t: int = 0, tree: bool = False) -> np.ndarray:
         """M (fp32 [T]) of a chunk of n valid tokens: 1 each, 0 the padding; packed (``lo``: per token its segment's
-        first one), 1 + the distance from it up to 4, per call of ``t`` tokens its object ([MASK_ELEMS / 2] fp32: the
-        values at 0 and at ``K_MASK``)."""
+        first one, -1 for padding between segments), 1 + the distance from it up to 4, per call of ``t`` tokens its
+        object ([MASK_ELEMS / 2] fp32: the values at 0 and at ``K_MASK``); ``tree``: segments from multiples of C
+        tokens, the first call's flag after the values."""
         out = np.zeros(T, np.float32)
-        out[:n] = 1 if lo is None else 1 + np.minimum(np.arange(n) - lo, 3)
         if lo is None:
+            out[:n] = 1
             return out
+        seg = lo >= 0
+        out[:n] = np.where(seg, 1 + np.minimum(np.arange(n) - lo, 3), 0)
+        assert not tree or (lo[seg] % C == 0).all(), "tree: segments from multiples of C tokens"
         obj = np.zeros((T // t, GdnPrepOperator.MASK_ELEMS // 2), np.float32)
         obj[:, :t] = obj[:, GdnPrepOperator.K_MASK:GdnPrepOperator.K_MASK + t] = out.reshape(-1, t)
+        if tree:  # (as int32 bits: any nonzero word)
+            obj[0, t] = obj[0, GdnPrepOperator.K_MASK + t] = 1
         return obj.reshape(-1)
 
     @property
     def jobj(self) -> int:
         """bf16 of a chunk's record."""
-        return jobj_bytes(self.vh) // 2
+        return jobj_bytes(self.vh + self.tree) // 2
 
     @property
     def n_pr(self) -> int:
@@ -544,7 +580,7 @@ _SCAN = JINJA_ENV.from_string(r"""
 
 namespace {
 
-{% set silu = km.act(km.SILU) %}
+{% set silu = km.act(km.SILU, copies=1 if TREE else 2) %}
 {{ silu.src }}
 // y[t][0 .. 32) = bf16(sum over the taps of w (hi + lo) x) of 8 tokens t: x rows t .. t + 3 of r (pitch 32: the
 // window's 3 rows, then the tokens'), w [tap 4][hi, lo][32]{% if PACK %}; a tap before the token's segment's first token
@@ -1109,13 +1145,18 @@ __attribute__((noinline)) void {{ p }}_vblock(const bfloat16 *__restrict v, int3
 extern "C" {
 
 // A round's first split parts: k = 0: the v quarter's conv weights; k = 1: its conv state rows ([16][32]: 3 used)
-// (minsize: the round's entries are cold)
+// (minsize: the round's entries are cold{% if TREE %}; the conv state the prefix's, also kept for the segments' first
+// blocks{% endif %})
 __attribute__((minsize)) void {{ p }}_vinit(const bfloat16 *__restrict s, int32_t *__restrict ws, int32_t k)
 {
     if (k == 0)
         al::copy<256, 32>(SW(bfloat16, {{ w.wc }}), s);
     else
         al::copy<96, 32>(SW(bfloat16, {{ w.rows }}), s);
+{% if TREE %}
+    if (k == 1)
+        al::copy<96, 32>(SW(bfloat16, {{ w.cv0 }}), s);
+{% endif %}
 {% if PACK %}
     if (k == 0)
         SW(int32_t, {{ w.pk }})[16] = 3;  // (no segment start in the window)
@@ -1134,9 +1175,11 @@ __attribute__((minsize)) void {{ p }}_sout(const float *__restrict S, bfloat16 *
 }
 
 // A chunk of 16 tokens of the round's v head h (index h / 2 among its k head's): b = the chunk's record (GdnPrep), v = the v quarter's
-// raw rows [16][32], S = the state quarter ([jb 4][ib 16][j 8][i 8] fp32, in place), o = the chunk's outputs [16][32]
+// raw rows [16][32], S = the state quarter ([jb 4][ib 16][j 8][i 8] fp32, in place), o = the chunk's outputs [16][32]{% if TREE %};
+// Sp the prefix's state quarter: S0 where a segment starts with the chunk (the record's mask slot: 1.0), its v window the
+// prefix's rows; the state's decay and update after the objects' release (``post``){% endif +%}
 void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, float *__restrict S,
-                   int32_t *__restrict ws, bfloat16 *__restrict o, int32_t h)
+                   int32_t *__restrict ws, bfloat16 *__restrict o, int32_t h{% if TREE %}, const float *__restrict Sp{% endif %})
 {
 {% if "ev_chunk" in ablate %}
     event0();
@@ -1151,6 +1194,13 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
     {{ p }}_vblock(v, ws, ys, pk);
     {{ p }}_vblock(v + 256, ws, ys + 256, pk + 8);
 {% else %}
+{% if TREE %}
+    const int32_t first = ((const int32_t *)(rec + {{ 2 * KP_BYTES }}))[{{ 32 * VH }}] == 0x3F800000;
+    SW(int32_t, {{ w.tf }})[0] = first;
+    if (first)
+        al::copy<96, 32>(SW(bfloat16, {{ w.rows }}), SW(bfloat16, {{ w.cv0 }}));
+    const float *__restrict S0 = first ? Sp : S;
+{% endif %}
     {{ p }}_vblock(v, ws, ys);
     {{ p }}_vblock(v + 256, ws, ys + 256);
 {% endif %}
@@ -1172,7 +1222,7 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
     {{ p }}_tinv(SW(bfloat16, {{ w.lt }}), SW(float, {{ w.tr }}), SW(bfloat16, {{ w.rb }}), SW(uint8_t, {{ w.pn }}));
     AIE_LOOP_NO_UNROLL
     for (int jb = 0; jb < 4; jb++) {  // (S0 read by every j-block before the decay changes it)
-        {{ p }}_xy(S + 1024 * jb, rec, rec + {{ KP_BYTES }}, SW(float, {{ w.xy }}));
+        {{ p }}_xy({{ "S0" if TREE else "S" }} + 1024 * jb, rec, rec + {{ KP_BYTES }}, SW(float, {{ w.xy }}));
 {% if PACK %}
         {{ p }}_xyz(SW(float, {{ w.xy }}), pk);
 {% endif %}
@@ -1184,15 +1234,29 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
         {{ p }}_szero(S);
     else
         {{ p }}_decay(S, S, SW(bfloat16, {{ w.dc }}));
-{% else %}
+{% elif not TREE %}
     {{ p }}_decay(S, S, SW(bfloat16, {{ w.dc }}));
 {% endif %}
+{% if not TREE %}
     {{ p }}_update(S, S, SW(uint8_t, {{ w.kt }}), SW(uint8_t, {{ w.up }}));
+{% endif %}
 {% endif %}
 {% if "ev_chunk" in ablate %}
     event1();
 {% endif %}
 }
+{% if TREE %}
+
+// The chunk's state (after ``chunk``, its objects released): S = S0 + dC S0 (S0 = Sp where a segment started with the
+// chunk), then S += U'^T K^T
+void {{ p }}_post(float *__restrict S, const float *__restrict Sp, int32_t *__restrict ws)
+{
+{% if "chunk" not in ablate %}
+    {{ p }}_decay(SW(int32_t, {{ w.tf }})[0] ? Sp : S, S, SW(bfloat16, {{ w.dc }}));
+    {{ p }}_update(S, S, SW(uint8_t, {{ w.kt }}), SW(uint8_t, {{ w.up }}));
+{% endif %}
+}
+{% endif %}
 
 }  // extern "C"
 """)
@@ -1204,7 +1268,13 @@ class GdnScanOperator(ArtcOperator):
     GdnPrep calls of ``sub`` tokens. Runtime sequence: PR (GdnPrep's records, [prep call][column][k head][chunk]), G
     (gdn_in's output, ``layout``: the v rows), CV (``CV_ROWS`` rows of G's layout: the conv state in rows 0 .. 2), P
     (``scan_params``: the v conv weights), GSTATE (the layer's state, per column its panels: read and written), O (T x
-    hv x 128 bf16: o of every v head)."""
+    hv x 128 bf16: o of every v head).
+
+    Tree (``tree``: segments from multiples of C tokens, each continuing the prefix's state in GSTATE and conv state in
+    CV, ``GdnPrepOperator(tree=True)``'s records): a core holds its prefix quarter (Sp, read once per round) beside the
+    running one; a chunk that starts a segment (the record's mask slot) starts from Sp, its v window the prefix's rows;
+    GSTATE is left as it was (no drain). The L1 for Sp: the cores' B, V and O FIFOs one object deep (the memtile's two),
+    the chunk's state update after their release (``post``: the next record streams meanwhile)."""
 
     STACK = 3072
     STACK_PACK = 3072
@@ -1213,15 +1283,15 @@ class GdnScanOperator(ArtcOperator):
     pfx = kernel_prefix("gdsc")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = (),
-                 pack: bool = False):
+                 pack: bool = False, tree: bool = False):
         """``ablate`` (timing experiments, wrong results): "chunk" the chunk's math compiled out (the v conv and SiLU
         kept); "ev_chunk": an event window around a chunk call (results unchanged). ``pack``: several inputs
         (segments) in the chunk (GdnPrep's packed records: d = -2 at a segment's first token): the state reset there
         exactly (E's cut terms -1 exactly, Gamma X and Gamma Y exact zeros, the state zeroed where Gamma_C = 0), a
         segment's first three tokens' v convs from its first token on."""
         self.sub = sub or T
-        self.pack = pack
-        assert T % self.sub == 0 and self.sub % C == 0 and T // self.sub <= 64
+        self.pack, self.tree = pack, tree
+        assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0 and T // self.sub <= 64
         assert T <= 4 * self.RUN, "the v rows and o in at most four runs (a round's BDs: 13 of a shim's 16)"
         self.T, self.cfg, self.layout = T, cfg, layout
         self.ablate = tuple(ablate)
@@ -1232,19 +1302,22 @@ class GdnScanOperator(ArtcOperator):
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
-        """(the gates' scratch g .. tr is dead once the T panels are written: xy and sw share its bytes)"""
-        common = [("wc", 2 * 4 * 2 * 32), ("rows", 2 * 11 * 32), ("yc", 2 * 8 * 32), ("ys", 2 * 16 * 32),
+        """(the gates' scratch g .. tr is dead once the T panels are written: xy and sw share its bytes; tree: the v
+        conv's yc, ys too, dead once V^T is built)"""
+        vconv = [("yc", 2 * 8 * 32), ("ys", 2 * 16 * 32)]
+        common = [("wc", 2 * 4 * 2 * 32), ("rows", 2 * 11 * 32), *([] if self.tree else vconv),
                   ("vt", 2 * 4 * 2 * 64), ("kt", KP_BYTES), ("fv", 4 * 2 * 3 * 64), ("pn", 12 * PAN), ("dc", 2 * 2 * 64),
-                  ("up", 4 * 4 * PAN)] + ([("pk", 4 * 32)] if self.pack else [])
+                  ("up", 4 * 4 * PAN)] + ([("pk", 4 * 32)] if self.pack else []) + \
+            ([("cv0", 2 * 3 * 32), ("tf", 64)] if self.tree else [])
         gates = [("g", 4 * 6 * 64), ("er", 4 * 8 * 32 + 64), ("ed", 4 * 3 * 64), ("lt", 2 * 4 * 64), ("tr", 4 * 8 * 16),
                  ("rb", 2 * 2 * 8 * 16)]
         jblock = [("xy", 4 * 4 * 64), ("sw", 4 * 192 + 6 * PAN)]
         w = regions(common)
-        a, b = regions(gates), regions(jblock)
+        shared = [regions(gates), regions(jblock), *([regions(vconv)] if self.tree else [])]
         out = {k: v for k, v in w.items() if k != "size"}
-        out |= {k: w["size"] + v for k, v in a.items() if k != "size"}
-        out |= {k: w["size"] + v for k, v in b.items() if k != "size"}
-        out["size"] = w["size"] + max(a["size"], b["size"])
+        for r in shared:
+            out |= {k: w["size"] + v for k, v in r.items() if k != "size"}
+        out["size"] = w["size"] + max(r["size"] for r in shared)
         return out
 
     def get_kernel_src(self) -> str:
@@ -1252,10 +1325,10 @@ class GdnScanOperator(ArtcOperator):
         lower = sum(1 << (8 * t + s) for t in range(8) for s in range(t + 1))
         return _SCAN.render(p=self.pfx, w=Attr(self.workspace()),
                             PART=PART, PAN=PAN, KP_BYTES=KP_BYTES, strict=f"{strict:016X}", lower=f"{lower:016X}",
-                            ablate=self.ablate, PACK=self.pack)
+                            ablate=self.ablate, PACK=self.pack, TREE=self.tree, VH=self.vh)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * 2 * self.T // C * jobj_bytes(self.vh) // 2,), torch.bfloat16),
+        return [ArgSpec("in", (COLS * 2 * self.T // C * jobj_bytes(self.vh + self.tree) // 2,), torch.bfloat16),
                 ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16),
                 ArgSpec("in", (self.CV_ROWS * self.layout.N,), torch.bfloat16),
                 ArgSpec("in", (params_bytes(self.hc) // 2,), torch.bfloat16),
@@ -1266,7 +1339,7 @@ class GdnScanOperator(ArtcOperator):
         p, T, hc, lay = self.pfx, self.T, self.hc, self.layout
         bf = np.dtype[bfloat16]
         W = self.workspace()
-        jobj = jobj_bytes(self.vh) // 2
+        jobj = jobj_bytes(self.vh + self.tree) // 2
         b_ty = np.ndarray[(jobj,), bf]
         part_ty = np.ndarray[(PART,), bf]
         quad_ty = np.ndarray[(4 * PART,), bf]
@@ -1275,7 +1348,9 @@ class GdnScanOperator(ArtcOperator):
         k_vinit = Kernel(f"{p}_vinit", "kernel.o", [part_ty, ws_ty, np.int32])
         k_sin = Kernel(f"{p}_sin", "kernel.o", [part_ty, S_ty, np.int32])
         k_sout = Kernel(f"{p}_sout", "kernel.o", [S_ty, part_ty, np.int32])
-        k_chunk = Kernel(f"{p}_chunk", "kernel.o", [b_ty, part_ty, S_ty, ws_ty, part_ty, np.int32])
+        k_chunk = Kernel(f"{p}_chunk", "kernel.o", [b_ty, part_ty, S_ty, ws_ty, part_ty, np.int32,
+                                                    *([S_ty] if self.tree else [])])
+        k_post = Kernel(f"{p}_post", "kernel.o", [S_ty, S_ty, ws_ty]) if self.tree else None
 
         b3 = [ObjectFifo(b_ty, name=f"gs_b{c}", depth=2) for c in range(COLS)]
         b1 = [b3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"gs_bm{c}") for c in range(COLS)]
@@ -1311,13 +1386,38 @@ class GdnScanOperator(ArtcOperator):
                         sout(S, o, k)
                         o_f.release(1)
 
+        def core_tree(b_f, v_f, o_f, vinit, sin, chunk, post, ws, S, Sp):
+            for _ in forever_():
+                for h in range_(hc):
+                    for k in range_(2):
+                        v = v_f.acquire(1)
+                        vinit(v, ws, k)
+                        v_f.release(1)
+                    for k in range_(N_SPART):
+                        v = v_f.acquire(1)
+                        sin(v, Sp, k)
+                        v_f.release(1)
+                    for _ in range_(n_ch):
+                        b = b_f.acquire(1)
+                        v = v_f.acquire(1)
+                        o = o_f.acquire(1)
+                        chunk(b, v, S, ws, o, h, Sp)
+                        o_f.release(1)
+                        v_f.release(1)
+                        b_f.release(1)
+                        post(S, Sp, ws)
+
         workers = []
         for c in range(COLS):
             for r in range(4):
                 ws = Buffer(ws_ty, name=f"gs_ws{c}_{r}")  # (every byte written before it is read: no PDI zeroes)
                 S = Buffer(S_ty, name=f"gs_S{c}_{r}")
-                workers.append(Worker(core, [b1[c].cons(), v1[c][r].cons(), o1[c][r].prod(), k_vinit, k_sin, k_sout,
-                                             k_chunk, ws, S],
+                if self.tree:
+                    args = [b1[c].cons(depth=1), v1[c][r].cons(depth=1), o1[c][r].prod(depth=1), k_vinit, k_sin,
+                            k_chunk, k_post, ws, S, Buffer(S_ty, name=f"gs_Sp{c}_{r}")]
+                else:
+                    args = [b1[c].cons(), v1[c][r].cons(), o1[c][r].prod(), k_vinit, k_sin, k_sout, k_chunk, ws, S]
+                workers.append(Worker(core_tree if self.tree else core, args,
                                       tile=Tile(c, 2 + r), stack_size=self.STACK_PACK if self.pack else self.STACK,
                                       dynamic_objfifo_lowering=True,
                                       while_true=False))
@@ -1350,11 +1450,13 @@ class GdnScanOperator(ArtcOperator):
                     for t0, n in runs:
                         vh[c].fill(G, TensorAccessPattern((T * N,), t0 * N + qkv + 4 * D + D * h, [n // C, 4, 16, 32],
                                                           [16 * N, 32, N, 1]), group=tg)
-                    for t0, n in runs:
+                    for t0, n in runs:  # (tree: the round's last drain the one waited for; GS left as it was)
                         oh[c].drain(O, TensorAccessPattern((n_o,), t0 * self.hv * D + D * j, [n // C, 4, 16, 32],
-                                                           [16 * self.hv * D, 32, self.hv * D, 1]), group=tg)
-                    oh[c].drain(GS, TensorAccessPattern((n_st,), st, [N_SPART, 4, 1, PART], [PART, 4 * PANEL // 2, 0, 1]),
-                                group=tg, wait=True)
+                                                           [16 * self.hv * D, 32, self.hv * D, 1]), group=tg,
+                                    wait=self.tree and t0 == runs[-1][0])
+                    if not self.tree:
+                        oh[c].drain(GS, TensorAccessPattern((n_st,), st, [N_SPART, 4, 1, PART],
+                                                            [PART, 4 * PANEL // 2, 0, 1]), group=tg, wait=True)
                 tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_pr,), bf], np.ndarray[(T * N,), bf], np.ndarray[(n_cv,), bf],
@@ -1482,8 +1584,8 @@ class GdnOutOperator(ArtcOperator):
     (8 tokens x a pair of the column's v heads, pair-major) come as [o | z] objects, four per memtile object split
     between the cores, their panels joined back; the conv state goes from GC through the memtile into GHDR (no core).
     Runtime sequence: O (the scan's), G (z), GC (``gc_rows`` rows of G's layout: the prompt chunk's; the conv state rows
-    from the scratchpad parameter ``gdn_conv``: ``conv_offset``), P (ssm_norm first), GHDR (the conv states written), A
-    (the ssm_out GEMM's panels, T x hv 128)."""
+    from the scratchpad parameter ``gdn_conv``: ``conv_offset``; 3 rows: the conv state itself, no parameter), P
+    (ssm_norm first), GHDR (the conv states written), A (the ssm_out GEMM's panels, T x hv 128)."""
 
     STACK = 4096
     OBJ = 2048  # bf16 of an o (or z) unit: 8 tokens x a pair of heads
@@ -1505,7 +1607,7 @@ class GdnOutOperator(ArtcOperator):
 
     def conv_offset(self, n: int) -> int:
         """The ``gdn_conv`` parameter of a chunk of n valid tokens: GC's first element of row n - 3."""
-        assert 3 <= n <= self.gc_rows, "the conv state: three tokens of the chunk"
+        assert 3 <= n <= self.gc_rows and self.gc_rows > 3, "the conv state: three tokens of the chunk"
         return (n - 3) * self.layout.N
 
     @property
@@ -1530,7 +1632,7 @@ class GdnOutOperator(ArtcOperator):
         ws_ty = np.ndarray[(D + 8 * 256 + 4 * 256 + 512 + D // 32 * 32,), np.dtype[np.float32]]  # norm | y | silu(z) (bf16) | 1 / rms | norm hi / lo
         k_norm = Kernel(f"{p}_norm", "kernel.o", [u_ty, ws_ty])
         k_pair = Kernel(f"{p}_pair", "kernel.o", [u_ty, ws_ty, pan_ty])
-        conv = ScratchpadParameter(CONV_OFF, np.int32)
+        conv = ScratchpadParameter(CONV_OFF, np.int32) if self.gc_rows > 3 else None
         a3 = [ObjectFifo(uq_ty, name=f"go_a{c}", depth=2) for c in range(COLS)]
         a1 = [a3[c].cons().split([U * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[u_ty] * 4,
                                  names=[f"go_ap{c}_{r}" for r in range(4)]) for c in range(COLS)]
@@ -1564,7 +1666,8 @@ class GdnOutOperator(ArtcOperator):
         n_gc = self.gc_rows * N
 
         def seq(O, G, GC, P, GH, A, ah, ch_, dh, d1h):
-            sync_parameters()
+            if conv is not None:
+                sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
                 # (the norm to each core: P's first unit read four times)
@@ -1576,8 +1679,11 @@ class GdnOutOperator(ArtcOperator):
                                             ChainPart(G, TensorAccessPattern((T * N,), z0 + 2 * D * pp, [n_g, 1, 8, 2 * D],
                                                                              [8 * N, 0, N, 1]))], tg)
                 qkv = c * lay.pitch + lay.off["qkv"]
-                dh[c].fill(GC, TensorAccessPattern((n_gc,), qkv, [1, 1, 3, ch], [0, 0, N, 1]), offset_parameter=conv,
-                           group=tg)
+                if conv is not None:
+                    dh[c].fill(GC, TensorAccessPattern((n_gc,), qkv, [1, 1, 3, ch], [0, 0, N, 1]), offset_parameter=conv,
+                               group=tg)
+                else:
+                    dh[c].fill(GC, TensorAccessPattern((n_gc,), qkv, [1, 1, 3, ch], [0, 0, N, 1]), group=tg)
                 dh[c].fill(GC, TensorAccessPattern((n_gc,), 0, [1, 1, 1, 2 * self.OBJ - 3 * ch], [0, 0, 0, 1]),
                            group=tg)
                 # (the conv state and the objects' padding after it: the bytes the decode's conv-state drain writes)

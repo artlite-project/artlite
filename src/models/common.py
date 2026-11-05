@@ -830,33 +830,44 @@ class OverlayModel(NpuModel):
         return self.prefill is not None and bool(self.prefill.pack_sizes)
 
     def readout_seconds(self, lengths: list[int], position: int = 0) -> float | None:
-        """(the packing's estimate, ``ChunkPrefill.pack``; a recurrent model's inputs after a prefix: each alone)"""
-        if self.packs and not (self.recurrent and position):
+        """(the packing's estimate, ``ChunkPrefill.pack``)"""
+        if self.packs and self.prefill.packed_sizes(position):
             return self.prefill.pack(lengths, position).seconds
         return super().readout_seconds(lengths, position)
 
     def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
-        the cached prefix, so a recurrent model's only from position 0, where each segment starts its own state; the
-        others one after another from the prefix)"""
+        the cached prefix; a recurrent model's after a prefix are tree chunks, which leave its states as the prefix left
+        them; inputs alone one after another from the prefix, a checkpoint's where needed)"""
         if not self.packs:
             return super().readouts(inputs, at, norm=norm)
         self._abandon()
         p = self.position
         at = [np.asarray(r, np.int64).reshape(-1) % len(ids) for ids, r in zip(inputs, at, strict=True)]
-        plan = self.prefill.pack([len(ids) for ids in inputs], p) if not (self.recurrent and p) else None
-        cp = self.checkpoint() if p and (self.recurrent or p % self.group) else None
+        plan = self.prefill.pack([len(ids) for ids in inputs], p)
+        cp = self.checkpoint() if p and plan.alone and (self.recurrent or p % self.group) else None
         out: list[np.ndarray] = [np.zeros(0)] * len(inputs)
-        for i in (plan.alone if plan is not None else range(len(inputs))):
-            self.restore(p, cp)
+        for k, i in enumerate(plan.alone):
+            if k:
+                self.restore(p, cp)
             out[i] = self.outputs(inputs[i], at[i], norm=norm)
-        bins = plan.bins if plan is not None else []
+        if plan.alone:
+            self.restore(p, cp)  # (back at the prefix, which the packed chunks continue)
+        bins, u = plan.bins, self.prefill.seg_unit(p)
 
-        def chunk_of(idx: list[int]) -> tuple:  # (a packed chunk's: its inputs, positions, segment starts, offsets)
-            offs = np.cumsum([0] + [len(inputs[i]) for i in idx])
-            args = self._chunk_inputs([t for i in idx for t in inputs[i]], first=False)
-            pos = np.concatenate([p + np.arange(len(inputs[i])) for i in idx])
-            return args, pos, np.repeat(offs[:-1], np.diff(offs)), offs
+        def chunk_of(idx: list[int]) -> tuple:
+            """A packed chunk's inputs, positions, segment starts (-1: the padding tokens between two segments, up to
+            the next multiple of ``seg_unit``: the prefill zeroes their rows) and the segments' offsets."""
+            toks: list[int] = []
+            pos, lo, offs = [], [], []
+            for k, i in enumerate(idx):
+                ids = inputs[i]
+                gap = -len(ids) % u if k + 1 < len(idx) else 0
+                offs.append(len(toks))
+                toks += ids + ids[-1:] * gap
+                pos += [p + np.arange(len(ids)), np.full(gap, p)]
+                lo += [np.full(len(ids), offs[-1]), np.full(gap, -1)]
+            return self._chunk_inputs(toks, first=False), np.concatenate(pos), np.concatenate(lo), offs
 
         nxt = self._pool.submit(chunk_of, bins[0][1]) if bins else None
         for k, (T, idx) in enumerate(bins):
@@ -864,16 +875,16 @@ class OverlayModel(NpuModel):
             args, pos, lo, offs = nxt.result()
             t1 = time.perf_counter()
             nxt = self._pool.submit(chunk_of, bins[k + 1][1]) if k + 1 < len(bins) else None  # (meanwhile)
-            self.restore(p, cp)
             self._packed_run(args, T, pos, lo)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches
-            for i, o in zip(idx, offs, strict=False):
+            for i, o in zip(idx, offs, strict=True):
                 r0, r1 = int(at[i].min()), int(at[i].max()) + 1
                 x = self.prefill.hidden(int(o) + r0, r1 - r0).numpy()[at[i] - r0]
                 out[i] = self._normed(x) if norm else x
-        self.restore(p, cp)
+        if bins and self.recurrent and not p:
+            self.restore(0)  # (the packed chunks' states: none of a sequence)
         return out
 
     def _packed_run(self, args: tuple, T: int, pos: np.ndarray, lo: np.ndarray) -> None:

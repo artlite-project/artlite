@@ -80,16 +80,17 @@ class _Setup:
         self.qn = np.asarray(g.tensor(f"blk.{L}.attn_q_norm.weight").raw, np.float32).reshape(-1)
         self.kn = np.asarray(g.tensor(f"blk.{L}.attn_k_norm.weight").raw, np.float32).reshape(-1)
 
-    def G(self, t0: int, n: int) -> np.ndarray:
-        """attn_in's output of tokens t0 .. t0 + n - 1 (rows n .. T - 1 zero)."""
+    def G(self, t0: int, n: int, rows: np.ndarray | None = None) -> np.ndarray:
+        """attn_in's output of tokens t0 .. t0 + n - 1 in rows 0 .. n - 1 (or ``rows``; the others zero)."""
         lay, qc = self.lay, self.qc
         G = np.zeros((self.T, lay.N), np.float32)
+        r = np.arange(n) if rows is None else rows
         for c in range(COLS):
-            G[:n, c * lay.pitch + lay.off["q"] + np.arange(2 * qc * AT.HD)] = \
+            G[r[:, None], c * lay.pitch + lay.off["q"] + np.arange(2 * qc * AT.HD)] = \
                 self.qfull[t0:t0 + n, 2 * qc * AT.HD * c:2 * qc * AT.HD * (c + 1)]
             e = self.per
-            G[:n, c * lay.pitch + lay.off["k"] + np.arange(e)] = self.k[t0:t0 + n, e * c:e * (c + 1)]
-            G[:n, c * lay.pitch + lay.off["v"] + np.arange(e)] = self.v[t0:t0 + n, e * c:e * (c + 1)]
+            G[r[:, None], c * lay.pitch + lay.off["k"] + np.arange(e)] = self.k[t0:t0 + n, e * c:e * (c + 1)]
+            G[r[:, None], c * lay.pitch + lay.off["v"] + np.arange(e)] = self.v[t0:t0 + n, e * c:e * (c + 1)]
         return G
 
     def nr(self, x: np.ndarray, w: np.ndarray, pos: np.ndarray) -> np.ndarray:
@@ -298,3 +299,80 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
     A1 = bfp16.from_panels(alone.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:lengths[0]]
     bad = np.flatnonzero((A1 != A[:lengths[0]]).any((1, 2)))
     assert bad.size == 0, f"rows {bad.tolist()} differ from the segment alone"
+
+
+@pytest.mark.parametrize(("size", "T"), [("d3-lite", 96), ("d3-lite", 128)])
+def test_attn_prefill_tree(size: str, T: int) -> None:
+    """A packed chunk after a history (``PrefillAttnOperator(pack=True)`` at p0 = T: a prefix every segment continues,
+    the tree packing of a recurrent model's questions): segments of 32, 37, 3 and 20 tokens at 16-token starts (0, 32,
+    80, 96), padding between them, each token's rotary position T + its distance from its segment's start; every row
+    against the exact attention of the cores' own operands over the history and its segment's keys up to itself, and
+    every segment bit-identical to its tokens alone after the same history (the unpacked design at p0 = T: the same
+    keys, the masked ones adding exact zeros, the same V blocks). At 128 tokens two streams, at 96 one (segments of 13,
+    37, 3 and 10 tokens from 0, 16, 64, 80)."""
+    lengths = [32, 37, 3, 20] if T == 128 else [13, 37, 3, 10]
+    starts = np.cumsum([0, *(-(-m // 16) * 16 for m in lengths)])[:-1]
+    n = sum(lengths)
+    s = _Setup(size, T, 0, tokens=T + n)
+    H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
+    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
+    attn1 = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=2)
+    alone = FusedOperator(name="attn_prefill_tree_alone", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
+                                                                   (attn1, "QS", "KV", "A")],
+                          input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
+    for f in (alone,):
+        f.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
+        f.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
+        f.get_buffer("KV").zero_()
+    _run(alone, prep.params(0) | attn1.params(0), s.G(0, T))  # (the history: the essay's first T tokens)
+    hist = alone.get_buffer("KV").clone()
+    # the packed chunk at p0 = T: segment k's tokens T + sum(lengths[:k]) .. in rows starts[k] ..
+    lo, hi, pos = np.arange(T), np.arange(T), np.full(T, T, np.int64)
+    G = np.zeros((T, s.lay.N), np.float32)
+    t0 = T + np.cumsum([0, *lengths])[:-1]
+    for a, m, t in zip(starts, lengths, t0, strict=True):
+        lo[a:a + m], hi[a:a + m], pos[a:a + m] = a, np.arange(a, a + m), T + np.arange(m)
+        G += s.G(int(t), m, np.arange(a, a + m))
+    R = MAX_POS - T  # (the chunk's rows of the cos / sin table)
+    cs = AP.cs_table(s.cfg, MAX_POS)
+    cs[R:] = AP.cs_rows(s.cfg, pos)
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=2, pack=True)
+    fused = FusedOperator(name="attn_prefill_tree", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
+                                                             (attn, "QS", "KV", "A", "SEG")],
+                          input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
+    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
+    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
+    fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.seg(lo, hi, T))
+    fused.get_buffer("KV")[:] = hist
+    fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    fused.sync_inputs()
+    fused.set_params(prep.params(T, R) | attn.params(T))
+    fused()
+    fused.sync_outputs()
+    fused.sync_scratch_from_device()
+    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)
+    slots = _qs_slots(fused, T, qc, prep.qg)
+    q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd) * (16 / np.log2(np.e))
+    sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)
+    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    rows = np.concatenate([np.arange(a, a + m) for a, m in zip(starts, lengths, strict=True)])
+    keys = np.arange(2 * T)
+    seen = (keys[None] < T) | ((keys[None] >= T + lo[rows, None]) & (keys[None] <= T + hi[rows, None]))
+    want = np.zeros((len(rows), H, hd))
+    for h in range(s.kvh):
+        K, V = (np.asarray(x, np.float64)[:2 * T] for x in KV.kv_from_groups(kv[h, :2 * T // 32], AT.HD, dmajor=True))
+        for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
+            sc = q[g][rows].astype(np.float64) @ K.T / 16
+            sc[~seen] = -np.inf
+            pr = np.exp(sc - sc.max(-1, keepdims=True))
+            want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g][rows]
+    eq = ref.rel_err(bfp16.values(want.reshape(len(rows), -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T}: {ref.rel_err(A[rows], want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    assert ref.rel_err(A[rows], want) < 1.1 * eq
+    for a, m, t in zip(starts, lengths, t0, strict=True):  # (each segment alone after the history)
+        alone.get_buffer("KV")[:] = hist
+        _run(alone, prep.params(T) | attn1.params(T), s.G(int(t), m))
+        A1 = bfp16.from_panels(alone.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:m]
+        bad = np.flatnonzero((A1 != A[a:a + m]).any((1, 2)))
+        print(f"segment {a} + {m}: {m - bad.size} of {m} rows bit-identical to alone")
+        assert bad.size == 0, f"segment {a}: rows {bad.tolist()} differ from the segment alone"

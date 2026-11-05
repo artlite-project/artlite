@@ -1,10 +1,11 @@
-"""``NpuModel.outputs`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B): a
+"""``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B): a
 readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
 bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
 end token, as the file asks): cosine >= 0.999 for mean pooling, >= 0.995 for one row (last: llama.cpp's own two CPU
 paths, ``llama-embedding`` and ``qwen35/dump.cpp``, are 0.998 apart on MiniCPM-V's row of a 30-token text; the NPU
-0.996 - 0.999 on these files: the prefill's bfp16 weights and activations)."""
+0.996 - 0.999 on these files: the prefill's bfp16 weights and activations). Packed readouts (Qwen3-Embedding-0.6B,
+Kev-4B, d3-lite): against each input alone."""
 
 import os
 
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.model_config import llama_gguf, minicpmv_gguf, qwen3_gguf
+from artlite.model_config import decision_gguf, llama_gguf, minicpmv_gguf, qwen3_gguf
 from models import open_model
 from models.common import Model, NpuModel
 from models.readouts import Readouts, pool, rows_of
@@ -72,3 +73,57 @@ def test_embeddings(loaded: tuple[str, Model, NpuModel], pooling: str) -> None:
         got = torch.from_numpy(pool(npu.outputs(ids, rows_of(pooling, len(ids))), pooling))
         cos = torch.nn.functional.cosine_similarity(got.double(), want.double(), 0).item()
         assert cos >= (0.999 if pooling == "mean" else 0.995), (len(ids), cos)
+
+
+PACKED = [qwen3_gguf("embedding-0.6B"), decision_gguf("kev"), decision_gguf("d3-lite")]
+
+
+@pytest.fixture(scope="module", params=PACKED, ids=os.path.basename)
+def packed(request: pytest.FixtureRequest) -> tuple[str, Model, NpuModel]:
+    path = request.param
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    model = open_model(path)
+    return path, model, model.load(capacity=8192)
+
+
+def test_readouts_packed(packed: tuple[str, Model, NpuModel]) -> None:
+    """``NpuModel.readouts`` through packed chunks (a readout model's: the Llama path's, qwen35's from position 0 and,
+    for a causal model, its tree chunks after a prefix) against each input alone (``NpuModel.readouts``' default: one
+    after another): rows at any indices (negative: from an input's end) bit for bit in a tree chunk (alone's
+    arithmetic: each segment's padding as alone's), else close (cosine 0.997 at least, 0.999 the median: the Llama
+    path's chunk sizes differ in their GEMMs' K parts and norm splits, a non-causal chunk in its groups, and segments
+    there share V blocks; the NPU's own distance from llama.cpp); and the model left at the prefix: a prompt after it
+    runs as after the prefix alone."""
+    path, model, npu = packed
+    ids = model.encode(essay("addiction.txt") * 3)
+    lengths = [20, 77, 130, 45, 300, 3]
+    starts = np.cumsum([0, *lengths])[:-1]
+    p = 64 if npu.causal else 0
+    inputs = [ids[p + 2000 + a:p + 2000 + a + n] for a, n in zip(starts, lengths, strict=True)]
+    at = [np.array([0, -1, n // 2, -2 % n]) for n in lengths]
+    plan = npu.prefill.pack(lengths, p)
+    assert plan.bins, (path, plan)
+
+    def run(fn: object) -> tuple[list[np.ndarray], np.ndarray]:
+        npu.reset()
+        if p:
+            npu.outputs(ids[:p], [-1])
+        out = fn(inputs, at)
+        assert npu.position == p
+        after = npu.outputs(ids[p:p + 40], [-1])  # (the prefix's sequence continues)
+        return out, after
+
+    alone, after_alone = run(lambda x, r: NpuModel.readouts(npu, x, r))
+    got, after = run(npu.readouts)
+    same, cos = 0, []
+    for g, w in zip(got, alone, strict=True):
+        assert g.shape == (4, model.cfg.hidden_size)
+        cos += list((g * w).sum(-1) / np.linalg.norm(g, axis=-1) / np.linalg.norm(w, axis=-1))
+        same += int((g == w).all())
+    print(f"{os.path.basename(path)}: plan {[(T, len(b)) for T, b in plan.bins]} alone {plan.alone}; {same} of "
+          f"{len(lengths)} inputs bit-identical to alone, cosine min {min(cos):.5f} median {np.median(cos):.5f}")
+    if npu.recurrent and p:
+        assert same == len(lengths)
+    assert min(cos) > 0.997 and np.median(cos) > 0.999
+    assert np.array_equal(after, after_alone)

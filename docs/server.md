@@ -186,9 +186,11 @@ rows at the ends of the options and of the question), computed on the host from 
 published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M) and Decision-2.0-Kai-0.6B
 (llama.cpp's converter run on vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
 at most 2048 tokens (a longer prompt: 400), and it generates no text; other types' questions share the state's tokens
-through the prompt cache. A request's questions run packed as embeddings' texts do (a vllm-d3 model's whole prompts;
-on a Qwen3.5 model, whose state cannot be shared inside a chunk, either the state once and each question after it or
-the questions' whole prompts packed, whichever the estimates say is faster). Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
+through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
+on a causal Qwen3.5 model the state once, then the questions packed after it, each continuing the state's Gated
+DeltaNet and attention state, or the questions' whole prompts packed, whichever the estimates say is faster (Kev-4B, 8
+questions of 64 tokens after a 256-token state: 387 ms, 1006 one after another; S0's requests of 4-8 questions after
+a 150-650-token state: 1.6-2.1x faster, the same answers). Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
 answer 501.
 
 ## Requests

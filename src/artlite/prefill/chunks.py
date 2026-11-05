@@ -17,9 +17,11 @@ after a chunk's valid ones write cache records that later tokens overwrite (mask
 
 Packed chunks (a readout model's: several inputs, segments, in one chunk; ``pack_sizes``) run their own programs,
 keyed ``("pack", T)``: the model's runlist with the operators that keep the segments apart (``_runlist_of(T,
-packed=True)``), the same items per layer. ``pack`` plans a request's inputs: first-fit-decreasing into chunks of
-each packed size in turn (a chunk's fixed cost, its ConfigureOps and every weight's pass, shared by its inputs), the
-plan of the least estimated time (``packed_seconds``) against each input run alone (``chunk_seconds`` of its
+packed=True)``), the same items per layer; a recurrent model's segments after a cached prefix run tree chunks
+(``tree_sizes``, ``("tree", T)``, ``_runlist_of(T, tree=True)``: each segment continues the prefix's states). ``pack``
+plans a request's inputs: first-fit-decreasing into chunks of each packed size in turn (``packed_sizes``; segments
+rounded up to ``seg_unit`` tokens; a chunk's fixed cost, its ConfigureOps and every weight's pass, shared by its inputs),
+the plan of the least estimated time (``packed_seconds``) against each input run alone (``chunk_seconds`` of its
 ``plan``): an input longer than ``span``, a chunk that would not be faster than its inputs alone, run alone.
 
 A model's prefill supplies its runlist per sub-chunk count (``_runlist``, built with ``_sl`` / ``_tok``; chunk sizes below
@@ -86,8 +88,10 @@ class ChunkPrefill:
         self.group = GROUP
         self.rb: dict[str, int] = {}  # (bytes per token of the token buffers)
         self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
+        self.tree_sizes: tuple[int, ...] = ()  # (a recurrent model's packed chunks after a prefix)
         self.span = 0  # (a packed chunk's longest segment)
         self._est: dict[tuple, float] = {}  # (the planner's estimates by (kind, tokens or size, position))
+        self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
         self._items: dict[int | tuple[str, int], list] = {}
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
@@ -97,6 +101,7 @@ class ChunkPrefill:
         """The runlists of the chunk sizes, the prefill's own buffers, the library of their operators."""
         self.runlists: dict[int | tuple[str, int], list[tuple]] = {T: self._runlist_of(T) for T in self.sizes}
         self.runlists |= {("pack", T): self._runlist_of(T, packed=True) for T in self.pack_sizes}
+        self.runlists |= {("tree", T): self._runlist_of(T, tree=True) for T in self.tree_sizes}
         self._sizes()
         self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
         self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)
@@ -110,9 +115,10 @@ class ChunkPrefill:
         its arguments' buffer slices "NAME[a:b]")."""
         raise NotImplementedError
 
-    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
-        """The runlist of a chunk of size T (a ``SMALL`` size: the model's own; ``packed``: a packed chunk's)."""
-        assert not packed, f"{type(self).__name__} has no packed chunks"
+    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
+        """The runlist of a chunk of size T (a ``SMALL`` size: the model's own; ``packed``, ``tree``: a packed or tree
+        chunk's)."""
+        assert not packed and not tree, f"{type(self).__name__} has no packed chunks"
         return self._runlist(T // self.SUB)
 
     def subs(self, T: int) -> int | float:
@@ -204,8 +210,8 @@ class ChunkPrefill:
         """The model's static buffers (``bind``)."""
 
     def _program(self, key: int | tuple[str, int]) -> list[tuple[int, list[int]]]:
-        """The items of a chunk's program (``key``: its size, or ("pack", size)): (library entry, device addresses of
-        its arguments' slices)."""
+        """The items of a chunk's program (``key``: its size, or ("pack" / "tree", size)): (library entry, device
+        addresses of its arguments' slices)."""
         if key not in self._items:
             self._items[key] = self.lib.items(self.runlists[key], self._buffers())
         return self._items[key]
@@ -292,13 +298,31 @@ class ChunkPrefill:
             self._est[key] = out
         return self._est[key]
 
+    def packed_sizes(self, p0: int) -> tuple[int, ...]:
+        """The packed chunks' sizes after p0 cached positions (this default: ``pack_sizes`` at any position)."""
+        return self.pack_sizes
+
+    def seg_unit(self, p0: int) -> int:
+        """The multiple of tokens a packed chunk's segments start at after p0 cached positions."""
+        return 1
+
     def pack(self, lengths: Sequence[int], p0: int) -> Packing:
         """How inputs of ``lengths`` tokens after p0 (the caches' prefix every one of them continues) run (module
-        docstring): packed chunks of their indices in order and inputs alone."""
+        docstring): packed chunks of their indices in order and inputs alone (a plan per request: the last one kept)."""
+        key = (tuple(lengths), p0, self.pace)
+        if self._last_pack is not None and self._last_pack[0] == key:
+            return self._last_pack[1]
+        out = self._pack(lengths, p0)
+        self._last_pack = (key, out)
+        return out
+
+    def _pack(self, lengths: Sequence[int], p0: int) -> Packing:
         alone = [self.alone_seconds(n, p0) for n in lengths]
-        if p0 % self.group or not self.pack_sizes:
+        if p0 % self.group or not self.packed_sizes(p0):
             return Packing(alone=list(range(len(lengths))), seconds=sum(alone), sequential=sum(alone))
-        sizes = tuple(T for T in self.pack_sizes if self.fits(T, p0))
+        sizes = tuple(T for T in self.packed_sizes(p0) if self.fits(T, p0))
+        u = self.seg_unit(p0)
+        lengths = [-(-n // u) * u for n in lengths]  # (each segment's tokens and the padding to the next one's start)
 
         def best(idx: list[int], caps: tuple[int, ...]) -> tuple[float, list[tuple[int, list[int]]]]:
             """The least estimated time of the inputs idx (packable) in chunks of the sizes caps, and their chunks:
@@ -346,13 +370,14 @@ class ChunkPrefill:
         return T
 
     def _launch(self, T: int, p0: int, params: dict[str, int], hooks: dict[int, Callable[[], None]] | None = None, *,
-                packed: bool = False) -> None:
-        """Dispatch a chunk's program (its inputs written; ``packed``: a packed chunk's): the scratchpad ``params``, the
-        pieces of ``_splits`` (and one from each item index of ``hooks`` on, its host function called before it); the
-        cache layers' rings then hold no rows of the chunk's last record (``kv_layers``: record mode)."""
+                key: int | tuple[str, int] | None = None) -> None:
+        """Dispatch a chunk's program (its inputs written; ``key``: a packed or tree chunk's, ``_program``): the
+        scratchpad ``params``, the pieces of ``_splits`` (and one from each item index of ``hooks`` on, its host
+        function called before it); the cache layers' rings then hold no rows of the chunk's last record
+        (``kv_layers``: record mode)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
-        self.dispatches = self.lib.run(self._program(("pack", T) if packed else T),
+        self.dispatches = self.lib.run(self._program(T if key is None else key),
                                        splits=[*self._splits(T, p0), *(hooks or {})],
                                        bufs=list(self._buffers().values()), hooks=hooks)
         self.ov.vring.from_prefill.update(self.kv_layers)

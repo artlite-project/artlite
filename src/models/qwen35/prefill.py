@@ -45,6 +45,13 @@ segment's first three tokens' convs from its first token on), the packed attenti
 itself, or all of them non-causal; ``SEG``); every other operator works row by row. Each token's rotary position counts
 from its segment's start (the overlay's rope rows: the chunk's cos / sin rows past the text positions, ``_cs_row``).
 The chunk leaves no sequence in the caches and states.
+
+A causal readout model's prefill also runs tree chunks (``tree_sizes``, ``run_packed`` at p0 > 0): segments that each
+continue the cached prefix (a decision request's questions after its shared state), from multiples of ``GP.C`` tokens.
+GdnPrep / GdnScan's tree variants start a segment's first scan chunk from the prefix's state (held in the scan cores' L1
+beside the running one) and its conv windows from the prefix's rows (CVL); the packed attention sees the history; GdnOut
+writes the prefix's conv state back from CVL. The chunk leaves the prefix's states as they were (its cache records past
+p0 are the next prompt's to overwrite).
 """
 
 import functools
@@ -147,6 +154,8 @@ class QwenPrefill(ChunkPrefill):
         self.pattn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
                                                 pp=2 if precise else 1, pack=True)
                       for T in self.pack_sizes} if self.att else {}
+        # (tree chunks: a causal model's segments after a prefix; GdnOut's conv state the prefix's, from CVL)
+        self.tree_sizes = self.pack_sizes if cfg.causal and self.gdn else ()
         self._starts: dict[int, list[int]] = {}
         self._rows()
         self._library()
@@ -209,14 +218,15 @@ class QwenPrefill(ChunkPrefill):
             self._ops[key] = cls(**args)
         return self._ops[key]
 
-    def _gdn_ops(self, lay: PG.Layout, T: int, packed: bool = False
+    def _gdn_ops(self, lay: PG.Layout, T: int, packed: bool = False, tree: bool = False
                  ) -> tuple[GP.GdnPrepOperator, GP.GdnScanOperator, GP.GdnOutOperator]:
-        """(the scan over the chunk of T tokens in one call: the states read and written once; ``packed``: the packed
-        variants)"""
+        """(the scan over the chunk of T tokens in one call: the states read and written once; ``packed``, ``tree``:
+        those variants; a tree chunk's GdnOut reads the conv state from the layer's 3 rows of CVL)"""
         t = self._t(T)
-        pk = {"pack": True} if packed else {}
+        pk = {"pack": True} if packed else {"tree": True} if tree else {}
         return (self._op(GP.GdnPrepOperator, lay, T=t, **pk), self._op(GP.GdnScanOperator, lay, T=T, sub=t, **pk),
-                self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=self.max_t))
+                self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF,
+                         gc_rows=3 if tree else self.max_t))
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
         """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""
@@ -254,9 +264,10 @@ class QwenPrefill(ChunkPrefill):
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
 
-    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
+    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
         """(sub-chunks of ``_t`` tokens: a ``SMALL`` size one of its own operators; the layers' first items in
-        ``_starts``; ``packed``: the packed GDN and attention operators, the segments in SEG)"""
+        ``_starts``; ``packed``, ``tree``: the packed or tree GDN operators and the packed attention, the segments in
+        SEG)"""
         ov, cfg, sl = self.ov, self.cfg, self._sl
         t = self._t(T)
         S, o = T // t, self.sz[t]
@@ -281,7 +292,7 @@ class QwenPrefill(ChunkPrefill):
             rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("G", j, g.op, i=2, row=g_rb))
                    for g in p_in.gemms for j in range(S)]
             if cfg.attention[L]:
-                prep, attn = self._prep(p_in.layout, T), (self.pattn if packed else self.attn)[T]
+                prep, attn = self._prep(p_in.layout, T), (self.pattn if packed or tree else self.attn)[T]
                 kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
                 qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots: QS pass-major)
@@ -290,9 +301,9 @@ class QwenPrefill(ChunkPrefill):
                         sl("QS", j * t // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")
                        for j in range(S)]
                 rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2),
-                           *([sl("SEG", 0, attn, i=3)] if packed else [])))
+                           *([sl("SEG", 0, attn, i=3)] if packed or tree else [])))
             else:
-                gprep, scan, gout = self._gdn_ops(p_in.layout, T, packed)
+                gprep, scan, gout = self._gdn_ops(p_in.layout, T, packed, tree)
                 i = self.gdn.index(L)
                 pp = f"PP[{self.pp_off[L]}:{self.pp_off[L] + self.n_p}]"
                 gh = f"GHDR[{ov.ghdr[L]}:{ov.ghdr[L] + gout.ghdr_bytes}]"
@@ -300,13 +311,14 @@ class QwenPrefill(ChunkPrefill):
                 cv = [sl("CVL", 3 * i * g_rb, gprep, i=1)] + [sl("G", (j * t - 3) * g_rb, gprep, i=1)
                                                               for j in range(1, S)]
                 pr = arg_bytes(gprep, 4)  # (a sub-chunk's records)
-                pm = arg_bytes(gprep, 3) if packed else 4 * t  # (packed: an object per sub-chunk, GdnPrep.mask)
+                pm = arg_bytes(gprep, 3) if packed or tree else 4 * t  # (an object per sub-chunk, GdnPrep.mask)
                 rl += [(gprep, tok("G", j, gprep, i=0, row=g_rb), cv[j], pp, sl("PM", j * pm, gprep, i=3),
                         sl("PR", j * pr, gprep, i=4)) for j in range(S)]
                 rl.append((scan, sl("PR", 0, scan, i=0), tok("G", 0, scan, i=1, row=g_rb),
                            sl("CVL", 3 * i * g_rb, scan, i=2), pp, gs, tok("O", 0, scan, i=5, row=self.rb_o)))
-                rl += [(gout, tok("O", j, gout, i=0, row=self.rb_o), tok("G", j, gout, i=1, row=g_rb),
-                        sl("G", 0, gout, i=2), pp, gh, tok("A", j, gout, i=5, row=a_rb)) for j in range(S)]
+                gc = sl("CVL", 3 * i * g_rb, gout, i=2) if tree else sl("G", 0, gout, i=2)
+                rl += [(gout, tok("O", j, gout, i=0, row=self.rb_o), tok("G", j, gout, i=1, row=g_rb), gc, pp, gh,
+                        tok("A", j, gout, i=5, row=a_rb)) for j in range(S)]
             out, fp = o.plans[(L, self._phases(L)[1])], o.f_part
             pan = self._norm(L, "post_attention_norm")
             if self.moe:  # (the out projection, the norm with lo panels, the MoE block, the residual norm)
@@ -435,11 +447,11 @@ class QwenPrefill(ChunkPrefill):
     # Run
     # ------------------------------------------------------------------
 
-    def params(self, T: int, p0: int, n: int, cs_row: int | None = None) -> dict[str, int]:
+    def params(self, T: int, p0: int, n: int, cs_row: int | None = None, tree: bool = False) -> dict[str, int]:
         """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens (their cos / sin from
-        table row ``cs_row``, default p0)."""
+        table row ``cs_row``, default p0; ``tree``: a tree chunk's)."""
         out = self.moe.params(T) if self.moe else {}
-        if self.gdn:
+        if self.gdn and not tree:  # (a tree chunk's GdnOut: the conv state at CVL's rows, no parameter)
             out[GP.CONV_OFF] = self._gdn_ops(self.sz[self._t(T)].plans[(self.gdn[0], "gdn_in")].layout, T)[2] \
                 .conv_offset(n)
         if self.att:
@@ -503,37 +515,61 @@ class QwenPrefill(ChunkPrefill):
             self.fp.after(p0, n, T)
 
     def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
-        """A packed chunk of size T at position 0 (default: the smallest of ``pack_sizes`` that holds x): x (n, hidden)
-        the segments' first layer input rows back to back, ``pos`` (n,) their text positions, ``lo`` (n,) per token its
-        segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``); the caches and
-        states hold no sequence after it."""
-        n, dev = x.shape[0], self.ov.dev
-        T = T or next(t for t in self.pack_sizes if t >= n)
-        assert p0 == 0 and T in self.pack_sizes and (lo <= np.arange(n)).all(), "a packed chunk at position 0"
+        """A packed chunk of size T at position p0 (default: the smallest of ``packed_sizes(p0)`` that holds x): x (n,
+        hidden) the segments' first layer input rows back to back, ``pos`` (n,) their text positions, ``lo`` (n,) per
+        token its segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``). At position
+        0 the caches and states hold no sequence after it; after a prefix (p0 > 0: a tree chunk, segments from multiples
+        of ``seg_unit``, the tokens between them -1 in ``lo``: padding of the segment before them, zero rows that see its
+        keys, so that its last V records round as alone) they hold the prefix as before it."""
+        n, dev, tree = x.shape[0], self.ov.dev, p0 > 0
+        sizes = self.packed_sizes(p0)
+        T = T or next(t for t in sizes if t >= n)
+        gap = lo < 0
+        assert T in sizes and (lo <= np.arange(n)).all() and (tree or not gap.any()), (T, p0)
         self._size(n, p0, T)
         px = torch.from_numpy(dev.view("PX")[:2 * T * self.H]).view(torch.bfloat16).view(T, self.H)
         px[:n] = x.bfloat16()
         px[n:] = 0
+        px[torch.from_numpy(np.flatnonzero(gap))] = 0
         dev.flush("PX", 0, 2 * T * self.H)
         if self.gdn:
-            m = GP.GdnPrepOperator.mask(n, T, lo, self._t(T))
+            m = GP.GdnPrepOperator.mask(n, T, lo, self._t(T), tree=tree)
             dev.view("PM").view(np.float32)[:m.size] = m
             dev.flush("PM", 0, 4 * m.size)
-            self.ov.conv_fresh()
-            self._conv_zero()
-        cs_row = None
-        if self.att:
-            self.ov.rope[:n] = np.asarray(pos, np.int64)[:, None]
-            cs_row = self._cs_row(0, n)
-            ends = np.r_[lo[1:] != lo[:-1], True]  # (a segment's last token)
-            last = np.minimum.accumulate(np.where(ends, np.arange(n), n)[::-1])[::-1]
+            if tree:  # (the prefix's conv states: the prep's and scan's window at a segment's start, GdnOut's)
+                self.ov.conv_for_prefill()
+                self._conv_states()
+            else:
+                self.ov.conv_fresh()
+                self._conv_zero()
+        cs_row, rope = None, None
+        if self.att:  # (the padding after a segment, between segments or the chunk's last, as alone's: its positions
+            # continue the segment's, its rows see the segment's keys)
             i = np.arange(T)
-            lo_t, hi_t = i.copy(), i.copy()  # (padding: itself)
-            lo_t[:n], hi_t[:n] = lo, (np.arange(n) if self.cfg.causal else last)
-            seg = self.pattn[T].seg(lo_t, hi_t)
-            dev.view("SEG")[:seg.size] = seg
-            dev.flush("SEG", 0, seg.size)
-        self._launch(T, 0, self.params(T, 0, n, cs_row), packed=True)
+            seg = np.maximum.accumulate(np.r_[lo, np.full(T - n, -1)])  # (each token's segment's first)
+            real = np.r_[~gap, np.zeros(T - n, bool)]
+            last = np.zeros(T, np.int64)
+            np.maximum.at(last, seg[real], i[real])
+            pos_t = np.asarray(pos, np.int64)[seg] + i - seg
+            rope = self.ov.rope[p0:p0 + T].copy()
+            self.ov.rope[p0:p0 + T] = pos_t[:, None]
+            cs_row = self._cs_row(p0, T)
+            sg = self.pattn[T].seg(seg, i if self.cfg.causal else last[seg], p0)
+            dev.view("SEG")[:sg.size] = sg
+            dev.flush("SEG", 0, sg.size)
+        try:
+            self._launch(T, p0, self.params(T, p0, n, cs_row, tree=tree), key=("tree" if tree else "pack", T))
+        finally:
+            if rope is not None:  # (the cached sequence's text positions)
+                self.ov.rope[p0:p0 + T] = rope
+
+    def packed_sizes(self, p0: int) -> tuple[int, ...]:
+        """(after a prefix: the tree chunks')"""
+        return self.tree_sizes if p0 else self.pack_sizes
+
+    def seg_unit(self, p0: int) -> int:
+        """(a tree chunk's segments start at scan chunks)"""
+        return GP.C if p0 else 1
 
     def packed_seconds(self, T: int, p0: int) -> float:
         """(a chunk's: its attention streams every pass's groups as an unpacked one's)"""

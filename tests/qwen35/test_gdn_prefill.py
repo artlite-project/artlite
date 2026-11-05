@@ -262,3 +262,116 @@ def test_gdn_scan_packed(size: str) -> None:
         if a % GP.C == 0:
             k = m if (a + m) % GP.C == 0 else (a + m) // GP.C * GP.C - a  # (the rows before the next start's chunk)
             assert (got[:k] == alone[:k]).all(), (a, np.flatnonzero((got[:k] != alone[:k]).any((1, 2))).tolist())
+
+
+@pytest.mark.parametrize("size", ["1B", "kev", "27B"])
+def test_gdn_scan_tree(size: str) -> None:
+    """GdnPrep and GdnScan tree (``tree``): a 192-token chunk of segments that each continue a prefix's state and conv
+    state (a recurrent model's questions after a shared state: the prefix's 100 tokens run first, from zero), from
+    multiples of 16 tokens (0, 48, 64, 80, 144; one of 3 tokens, one across the two 96-token GdnPrep calls), padding
+    between them: each segment's o bit-identical to its tokens alone after the prefix (the unpacked designs: the same
+    arithmetic from the same state), within the reference's tolerance of the cores' arithmetic; the layer's state left
+    as the prefix's (the 27B: three v heads per k head, the L1's tightest)."""
+    path = ref.size_gguf(size)
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    L, T, t, pre = cfg.gdn_layers[0], 192, 96, 100
+    img = QwenImage(g, cfg, layers=[L], vocab=COLS * 64)
+    region = img.region(L, "gdn_in")
+    lay = PG.plan_phase(img, region, T, pitch=PG.phase_pitch(img, "gdn_in", T)).layout
+    blk = region.block("qkv")
+    lengths = [37, 8, 3, 50, 20]
+    starts = np.cumsum([0, *(-(-m // GP.C) * GP.C for m in lengths)])[:-1]
+    n = pre + int(sum(lengths))
+    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
+    qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
+    alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
+    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)
+    beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
+    sh = GD.GdnShape(cfg)
+    P = GP.scan_params(g, cfg, L, blk.rows)
+    cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
+    dt = np.asarray(g.tensor(f"blk.{L}.ssm_dt.bias").raw, np.float32).reshape(-1)
+    A = np.asarray(g.tensor(f"blk.{L}.ssm_a").raw, np.float32).reshape(-1)
+    N = lay.N
+
+    def g_rows(sel: np.ndarray, at: np.ndarray) -> np.ndarray:
+        """G (T rows, bf16 bits) with tokens sel in rows at."""
+        Gb = np.zeros((T, N), np.uint16)
+        for c in range(COLS):
+            rows = blk.rows[c][blk.rows[c] >= 0]
+            vh = gdn_v_heads(cfg, c)
+            Gb[at[:, None], c * lay.pitch + lay.off["qkv"] + np.arange(rows.size)] = _bits(qkv[sel][:, rows])
+            if GP.ab_f32(lay):
+                a32 = np.ascontiguousarray(alpha[sel][:, vh], np.float32).view(np.uint16)
+                Gb[at[:, None], c * lay.pitch + lay.off["alpha"] + np.arange(a32.shape[1])] = a32
+                Gb[at[:, None], c * lay.pitch + lay.off["beta"] + np.arange(len(vh))] = _bits(beta[sel][:, vh])
+            else:
+                ab = np.concatenate([alpha[sel][:, vh], beta[sel][:, vh]], 1)
+                Gb[at[:, None], c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = _bits(ab)
+        return Gb
+
+    def setup(fused: FusedOperator, Gb: np.ndarray, cv: np.ndarray, gs: np.ndarray, m: np.ndarray) -> None:
+        fused.get_buffer("P").view(torch.uint8)[:P.size] = torch.from_numpy(P)
+        fused.get_buffer("G").view(torch.int16)[:] = torch.from_numpy(Gb.reshape(-1).view(np.int16))
+        c = fused.get_buffer("CV").view(torch.int16)
+        c.zero_()
+        c[:cv.size] = torch.from_numpy(cv.reshape(-1).view(np.int16))
+        fused.get_buffer("GS").view(torch.float32)[:] = torch.from_numpy(gs)
+        fused.get_buffer("M").view(torch.float32)[:m.size] = torch.from_numpy(m)
+        fused.sync_inputs()
+        fused()
+        fused.sync_outputs()
+        fused.sync_scratch_from_device()
+
+    prep, scan = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay), GP.GdnScanOperator(T=T, cfg=cfg, layout=lay)
+    alone = FusedOperator(name="gdn_scan_tree_alone",
+                          runlist=[(prep, "G", "CV", "P", "M", "PR"), (scan, "PR", "G", "CV", "P", "GS", "O")],
+                          input_args=["G", "P", "M", "CV", "GS"], output_args=["O"]).compile()
+    zero = np.zeros(alone.get_buffer("GS").view(torch.float32).numel(), np.float32)
+    setup(alone, g_rows(np.arange(pre), np.arange(pre)), np.zeros((3, N), np.uint16), zero,
+          GP.GdnPrepOperator.mask(pre, T))
+    s_p = alone.get_buffer("GS").view(torch.float32).numpy().copy()  # (the prefix's state and conv state)
+    cv_p = g_rows(np.arange(pre - 3, pre), np.arange(3))[:3]
+    st_p = [GD.state_from_panels(s_p.reshape(COLS, -1)[c].reshape(-1, 1024), sh.hc) for c in range(COLS)]
+    # the tree chunk: two GdnPrep calls of t tokens (the second's conv rows G's before it), the scan over both
+    tp = GP.GdnPrepOperator(T=t, cfg=cfg, layout=lay, tree=True)
+    ts = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay, sub=t, tree=True)
+    pr, mb = 2 * tp.n_pr, 2 * tp.MASK_ELEMS
+    tree = FusedOperator(name="gdn_scan_tree",
+                         runlist=[(tp, f"G[0:{2 * t * N}]", "CV", "P", f"M[0:{mb}]", f"PR[0:{pr}]"),
+                                  (tp, f"G[{2 * t * N}:{4 * t * N}]", f"G[{2 * (t - 3) * N}:{2 * (t + 9) * N}]", "P",
+                                   f"M[{mb}:{2 * mb}]", f"PR[{pr}:{2 * pr}]"),
+                                  (ts, "PR", "G", "CV", "P", "GS", "O")],
+                         input_args=["G", "P", "M", "CV", "GS"], output_args=["O"],
+                         buffer_sizes={"M": 4 * tp.MASK_ELEMS}).compile()
+    sel = np.arange(pre, n)
+    at = np.concatenate([np.arange(a, a + m) for a, m in zip(starts, lengths, strict=True)])
+    lo = np.full(at[-1] + 1, -1)  # (-1: the padding between segments)
+    for a, m in zip(starts, lengths, strict=True):
+        lo[a:a + m] = a
+    setup(tree, g_rows(sel, at), cv_p, s_p, GP.GdnPrepOperator.mask(lo.size, T, lo, t, tree=True))
+    O = tree.get_buffer("O").float().numpy().reshape(T, cfg.ssm_v_heads, 128)
+    assert (tree.get_buffer("GS").view(torch.float32).numpy() == s_p).all(), "the prefix's state changed"
+    t0 = pre
+    for a, m in zip(starts, lengths, strict=True):
+        seg = np.arange(t0, t0 + m)
+        t0 += m
+        setup(alone, g_rows(seg, np.arange(m)), cv_p, s_p, GP.GdnPrepOperator.mask(m, T))
+        got, one = O[a:a + m], alone.get_buffer("O").float().numpy().reshape(T, cfg.ssm_v_heads, 128)[:m]
+        want = np.zeros((m, cfg.ssm_v_heads, 128), np.float32)
+        for c in range(COLS):
+            rows = blk.rows[c][blk.rows[c] >= 0]
+            vh = gdn_v_heads(cfg, c)
+            ab = np.concatenate([alpha[seg][:, vh], beta[seg][:, vh]], 1)
+            cs = _bf(qkv[pre - 3:pre][:, rows])
+            want[:, vh] = ref.core_gdn_scan(qkv=qkv[seg][:, rows], ab=ab, conv_state=cs, conv_w=cw[rows], dt=dt[vh],
+                                            ssm_a=A[vh], state=st_p[c], n=m, eps=cfg.rms_norm_eps)[0]
+        diff = np.flatnonzero((got != one).any((1, 2)))
+        print(f"{size} segment {a} + {m}: {m - diff.size} of {m} rows bit-identical to alone; vs the cores' arithmetic "
+              f"{ref.rel_err(got, want):.2e} (alone {ref.rel_err(one, want):.2e})")
+        assert diff.size == 0, (a, diff[:8].tolist())
+        assert ref.rel_err(got, want) < 1e-2, a

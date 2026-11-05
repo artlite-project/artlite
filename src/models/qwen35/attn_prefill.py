@@ -482,8 +482,8 @@ _ATTN = JINJA_ENV.from_string(r"""
 // units against the row's maximum; after the softmax its first 288 B the P panels{{ ", the lo panels from byte 320 on" if PP == 2 else "" }}), m, b, l [panel][64] (lane 8 q + k:
 // query q's running maximum, 192 - m, the partial sums), o [panel][db 32][8 x 8] fp32{{ ", ob its second copy (P V
 // reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, its own buffer): P [8][32],
-// f [8][32] bf16 (or a rescale's row maxima [64] fp32){% if PACK %}; lh [token group QG][lo 8 | hi 8 | the largest lo, the least hi | 6]
-// int32 (per row of the core's token groups its segment's first and last keys){% endif +%}
+// f [8][32] bf16 (or a rescale's row maxima [64] fp32){% if PACK %}; lh [token group QG][lo 8 | hi 8 | the largest lo, the least hi |
+// the history's keys | 5] int32 (per row of the core's token groups its segment's first and last keys){% endif +%}
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 {% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="bounded") %}
@@ -784,8 +784,9 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int3
 {% if PACK %}
         {
             const int32_t *__restrict lh = AW(int32_t, {{ w.lh }}) + 24 * (h % {{ QG }});  // (the panel's token group)
-            if (32 * g < lh[16] || 32 * g + 31 > lh[17])  // (the group reaches outside a row's segment)
-                {{ p }}_masklh(s, lh, 32 * g);
+            const int32_t kc = 32 * g - lh[18];  // (the group's first key in the chunk; < 0: the history, every row's)
+            if (kc >= 0 && (kc < lh[16] || kc + 31 > lh[17]))  // (the group reaches outside a row's segment)
+                {{ p }}_masklh(s, lh, kc);
         }
 {% elif CAUSAL %}
         const int t = {{ QG }} * r + h % {{ QG }}, dd = diag - ({{ QG - 1 }} - (t >> 2));
@@ -897,12 +898,14 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, int32_t half
 {% endif %}
 
 {% if PACK %}
-// The pass's segments (its SEG object{{ "s: a's the rows' first keys, b's their last" if TWO else ": the rows' first keys, then their last" }}, int16, chunk-relative): the
-// core's token groups' rows into lh, each group's largest first and least last key
+// The pass's segments (its SEG object{{ "s: a's the rows' first keys, b's their last" if TWO else ": the rows' first keys, then their last" }}, int16, chunk-relative; a's
+// value 64 the history's cache groups): the core's token groups' rows into lh, each group's largest first and least
+// last key, the history's keys
 void {{ p }}_seg(const bfloat16 *__restrict a,{% if TWO %} const bfloat16 *__restrict b,{% endif %} float *__restrict ws, int32_t r)
 {
     const int16_t *__restrict lo = (const int16_t *)a;
     const int16_t *__restrict hi = {% if TWO %}(const int16_t *)b{% else %}lo + {{ 32 * QG }}{% endif %};
+    const int32_t hk = 32 * lo[64];
     for (int j = 0; j < {{ QG }}; j++) {
         int32_t *__restrict lh = AW(int32_t, {{ w.lh }}) + 24 * j;
         const int t = 8 * ({{ QG }} * r + j);  // (the token group's first row in the pass)
@@ -915,6 +918,7 @@ void {{ p }}_seg(const bfloat16 *__restrict a,{% if TWO %} const bfloat16 *__res
         }
         lh[16] = mx;
         lh[17] = mn;
+        lh[18] = hk;
     }
 }
 
@@ -982,10 +986,11 @@ class PrefillAttnOperator(ArtcOperator):
     at position 0, every pass streams the prompt's groups (``QA_N`` of them) and each query sees all of its keys, those
     after the prompt's in its last group masked (``QA_NK``: the prompt's keys there).
 
-    Packed (``pack``: several inputs, segments, in a chunk at position 0): each row sees its segment's keys from its
-    first up to itself (causal) or to its last (non-causal), the others masked (-16384: P 0 against any of its own;
-    a row's groups before its segment, all masked, rescaled to 0 by its first own one); the SEG argument (``seg``) per
-    pass, an object after the Q slots (two streams: a pair), holds the rows' first and last keys."""
+    Packed (``pack``: several inputs, segments, in a chunk): each row sees the history (the positions before p0: a
+    prefix every segment continues; causal only) and its segment's keys from its first up to itself (causal) or to its
+    last (non-causal, at position 0), the others masked (-16384: P 0 against any of its own; a row's groups before its
+    segment, all masked, rescaled to 0 by its first own one); the SEG argument (``seg``) per pass, an object after the Q
+    slots (two streams: a pair), holds the rows' first and last keys and the history's groups."""
 
     STACK = 3072
     pfx = kernel_prefix("qaa")
@@ -1039,23 +1044,27 @@ class PrefillAttnOperator(ArtcOperator):
                 ArgSpec("in", (self.kvh * self.head_bytes // 2,), torch.bfloat16),
                 ArgSpec("out", (T * self.H * HD * 9 // 16,), torch.bfloat16), *seg]
 
-    def seg(self, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
-        """The SEG argument's bytes (uint8) of a packed chunk: per token (T,) its segment's first and last key (chunk
-        positions; a padding token's: itself) -> per pass [its rows' lo | their hi] int16 in the first stream's object
-        (two streams: lo in the first's, hi in the second's), at the start of the part its first shim fills."""
+    def seg(self, lo: np.ndarray, hi: np.ndarray, p0: int = 0) -> np.ndarray:
+        """The SEG argument's bytes (uint8) of a packed chunk at p0: per token (T,) its segment's first and last key
+        (chunk positions; a padding token's: itself) -> per pass [its rows' lo | their hi] int16 in the first stream's
+        object (two streams: lo in the first's, hi in the second's), at the start of the part its first shim fills; the
+        first's value 64 the history's groups (p0 / 32)."""
         assert self.pack and lo.shape == hi.shape == (self.T,) and (lo <= np.arange(self.T)).all()
+        assert p0 % 32 == 0 and p0 // 32 < 1 << 15 and (self.causal or not p0)
         pq = 32 * self.qg
+        assert 2 * pq <= 64 or (self.two and pq <= 64), "value 64 free"
         out = np.zeros((self.T // pq, 2, SLOT // 2), np.int16)
         out[:, 0, :pq] = lo.reshape(-1, pq)
         if self.two:
             out[:, 1, :pq] = hi.reshape(-1, pq)
         else:
             out[:, 0, pq:2 * pq] = hi.reshape(-1, pq)
+        out[:, 0, 64] = p0 // 32
         return out.view(np.uint8).reshape(-1)
 
     def params(self, p0: int, n: int = 0) -> dict[str, int]:
         """(n: the valid tokens of a non-causal chunk, the prompt's)"""
-        assert p0 % 32 == 0 and not (self.pack and p0), "a packed chunk at position 0"
+        assert p0 % 32 == 0 and not (self.pack and p0 and not self.causal), "a non-causal packed chunk at position 0"
         if not self.causal:
             assert p0 == 0 and 0 < n <= self.T, (p0, n)
             return {QA_N: -(-n // 32)} | ({} if self.pack else {QA_NK: n - 32 * (-(-n // 32) - 1)})

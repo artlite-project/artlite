@@ -51,7 +51,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - **Runtime values** (position, cache offsets, window starts) are scratchpad parameters set per chunk (`params()`):
   only for operators in the library (an unknown name raises), range-checked against the arguments' declared sizes
   (declare the cache argument with padding past its end). One parameter name has one value per program: two variants
-  of an operator that need different values cannot share a program.
+  of an operator that need different values cannot share a program. Its range is the tightest of every operator in the
+  library that reads it, in any program: a variant with a smaller argument takes a name of its own (`QA_KV` per size)
+  or, where its value is fixed, none.
 - **Caches in the decode's layout**: a prep operator writes the chunk's K / V records where the decode would, and the
   flash attention reads the chunk's history from the same cache, so the decode continues with no host work. Linear
   caches (also for sliding windows, after a guard of one window) keep the window reads one BD per pass. Recurrent
@@ -78,6 +80,14 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
     marks that token (natural decays round to -1.0); the scan's reset is exact: the cut E terms are held at -1 and the
     values they multiply are zeroed by select (`al::mulff`'s bf16 hi + lo products leave 2^-17 of x in x + (-1) x: a long
     segment's state leaked 9% into the next), and a segment's first 3 tokens' convs use their own taps only.
+  - Tree chunks (a recurrent model's inputs after a cached prefix: qwen35's `tree_sizes`, `run_packed` at p0 > 0):
+    each segment continues the prefix's states, from a 16-token scan chunk. The scan cores hold the prefix's state
+    quarter beside the running one (its L1 from one-deep core FIFOs with the chunk's state update after their release,
+    the v conv scratch in the union, one SiLU table copy: `km.act(copies=1)`); a chunk whose first token starts a
+    segment (a gate slot of the record holds the mask) starts from it, the conv windows from the prefix's rows; GdnOut
+    writes the prefix's conv state back, so the chunk leaves the states as they were (no checkpoint, no restore).
+    Kev-4B: every row bit-identical to the question run alone after the checkpoint; 8 x 64 tokens after 256: 387 vs
+    1006 ms.
   - Positions per token: cos / sin rows written past the table's text rows (rows only padding tokens read otherwise).
   - Test a packed chunk against each segment alone in a chunk of the same size: GEMM K parts and norm splits differ
     between sizes. K records come out bit-identical. V's blocks span a record's 8 positions, so a segment that starts

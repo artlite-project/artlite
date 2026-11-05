@@ -390,7 +390,7 @@ class LlamaPrefill(ChunkPrefill):
         seg = self.pattn[T].seg(np.concatenate([lo, np.arange(n, T)]))
         dev.view("SEG")[:seg.size] = seg
         dev.flush("SEG", 0, seg.size)
-        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R}, packed=True)
+        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R}, key=("pack", T))
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
