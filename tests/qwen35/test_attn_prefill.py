@@ -57,7 +57,7 @@ class _Setup:
     them."""
 
     def __init__(self, size: str, T: int, n2: int, tokens: int = 0):
-        path = decision_gguf(size) if size.startswith("d3") or size == "kev" else qwen_gguf("Q4_K_M", size)
+        path = decision_gguf(size) if size.startswith("d3") else qwen_gguf("Q4_K_M", size)
         if not os.path.exists(path):
             pytest.skip(f"{path} missing")
         self.g = g = GGUFFile(path)
