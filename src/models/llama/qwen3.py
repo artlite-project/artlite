@@ -60,4 +60,4 @@ class Qwen3(Model):
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
         return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                        precise=readout_model(self.gguf.meta, self.gguf.arch))
+                        readout=readout_model(self.gguf.meta, self.gguf.arch))

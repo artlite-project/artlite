@@ -155,11 +155,16 @@ class Shape:
         return next((qb, 4) for qb in (2, 1) if self.l1(qb, 4) <= L1)
 
 
-def cs_table(inv_freq: np.ndarray, n: int) -> np.ndarray:
+def cs_rows(inv_freq: np.ndarray, positions: np.ndarray) -> np.ndarray:
     """(n, hd) fp32: per position [cos hd / 2 | sin hd / 2] of the pairs' angles position inv_freq[i] (the decode's
     ``decode.attn.rope_tables``)."""
-    th = np.outer(np.arange(n, dtype=np.float64), np.asarray(inv_freq, np.float64))
+    th = np.outer(np.asarray(positions, np.float64), np.asarray(inv_freq, np.float64))
     return np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+
+
+def cs_table(inv_freq: np.ndarray, n: int) -> np.ndarray:
+    """``cs_rows`` of the positions 0 .. n - 1."""
+    return cs_rows(inv_freq, np.arange(n))
 
 
 _PREP = JINJA_ENV.from_string(r"""

@@ -437,6 +437,19 @@ class NpuModel:
         on the host: ``models.readouts``)."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
+    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
+        """Several inputs' output rows (each as ``outputs`` returns them): each input's tokens after the cached positions
+        (a prefix every one of them continues); the model is left at the prefix's end. This default runs them one after
+        another from a checkpoint there."""
+        p = self.position
+        cp = self.checkpoint() if p else None
+        out = []
+        for ids, rows in zip(inputs, at, strict=True):
+            self.restore(p, cp)
+            out.append(self.outputs(ids, rows, norm=norm))
+        self.restore(p, cp)
+        return out
+
     def prompt_seconds(self, n: int, position: int = 0) -> float | None:
         """Estimated seconds of a prompt of n tokens from ``position`` (None: no estimate)."""
         return None
@@ -796,10 +809,58 @@ class OverlayModel(NpuModel):
             raise IndexError(f"readout rows {idx.tolist()} of {n} tokens")
         readout = Readout(idx % n, self.cfg.hidden_size)
         self.prompt(tokens, progress=progress, readout=readout)
-        x = readout.rows
-        if norm:
-            x *= np.asarray(self._w_out, np.float32) / np.sqrt((x * x).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
+        return self._normed(readout.rows) if norm else readout.rows
+
+    def _normed(self, x: np.ndarray) -> np.ndarray:
+        """Output rows (n, hidden) through the output norm (the LM head's input), in place."""
+        x *= np.asarray(self._w_out, np.float32) / np.sqrt((x * x).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
         return x
+
+    @property
+    def packs(self) -> bool:
+        """Whether the prefill runs packed chunks (a readout model's: ``readouts``)."""
+        return self.prefill is not None and bool(self.prefill.pack_sizes)
+
+    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
+        """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
+        the cached prefix, so a recurrent model's only from position 0, where each segment starts its own state; the
+        others one after another from the prefix)"""
+        if not self.packs:
+            return super().readouts(inputs, at, norm=norm)
+        self._abandon()
+        p = self.position
+        at = [np.asarray(r, np.int64).reshape(-1) % len(ids) for ids, r in zip(inputs, at, strict=True)]
+        plan = self.prefill.pack([len(ids) for ids in inputs], p) if not (self.recurrent and p) else None
+        cp = self.checkpoint() if p and (self.recurrent or p % self.group) else None
+        out: list[np.ndarray] = [np.zeros(0)] * len(inputs)
+        for i in (plan.alone if plan is not None else range(len(inputs))):
+            self.restore(p, cp)
+            out[i] = self.outputs(inputs[i], at[i], norm=norm)
+        for T, idx in (plan.bins if plan is not None else []):
+            self.restore(p, cp)
+            offs = np.cumsum([0] + [len(inputs[i]) for i in idx])
+            toks = [t for i in idx for t in inputs[i]]
+            pos = np.concatenate([p + np.arange(len(inputs[i])) for i in idx])
+            lo = np.repeat(offs[:-1], np.diff(offs))
+            t0 = time.perf_counter()
+            args = self._chunk_inputs(toks, first=True)
+            t1 = time.perf_counter()
+            self._packed_run(args, T, pos, lo)
+            self.t_host += t1 - t0
+            self.t_npu += time.perf_counter() - t1
+            self.dispatches += self.prefill.dispatches
+            for i, o in zip(idx, offs, strict=False):
+                r0, r1 = int(at[i].min()), int(at[i].max()) + 1
+                x = self.prefill.hidden(int(o) + r0, r1 - r0).numpy()[at[i] - r0]
+                out[i] = self._normed(x) if norm else x
+        self.restore(p, cp)
+        return out
+
+    def _packed_run(self, args: tuple, T: int, pos: np.ndarray, lo: np.ndarray) -> None:
+        """A packed chunk of size T at the next position (``ChunkPrefill.run_packed``'s: its inputs ``args``, its tokens'
+        positions ``pos``, segment starts ``lo``)."""
+        self.prefill.run_packed(*args, self.position, pos, lo, T)
+        self.stale()
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""

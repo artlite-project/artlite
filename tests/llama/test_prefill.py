@@ -314,3 +314,66 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     worst["logits"] = _rel(ov.logits_of(h).float().numpy(), want_l.numpy())
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.06 for v in worst.values()), worst
+
+
+# (history: a shared prefix in the caches; segments' lengths: starts at 32-token key chunks and inside them, inside
+# sub-chunks and records)
+PACKED_SLICE = [(0, [192, 64, 45, 107, 120, 96, 200, 150]), (64, [100, 28, 300, 37, 199, 280])]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(("p0", "lengths"), PACKED_SLICE, ids=[f"p{p}" for p, _ in PACKED_SLICE])
+def test_prefill_packed(p0: int, lengths: list[int]) -> None:
+    """A packed chunk (``LlamaPrefill.run_packed``) on a 4-layer slice of Qwen3-Embedding-0.6B (Q8_0) against each of
+    its segments run alone in a chunk of the same size at p0 (after the same history: a shared prefix): the first
+    layer's K records bit-identical; V's blocks span a record's 8 positions, so a segment that starts at a record has
+    its V records bit-identical but one shared with the next segment (whose values set its exponents) and one that
+    starts inside a record all of them rounded otherwise; every row within ~2% of the rows' largest (that V, the
+    attention's key chunks); the rows of a segment that starts at a 32-token chunk of keys up to its last V record
+    bit-identical."""
+    import os
+
+    from artlite.gguf_model import GGUFFile
+    from artlite.model_config import qwen3_gguf
+    from models.llama.overlay import LlamaOverlay
+    from models.llama.prefill import LlamaPrefill
+    from models.tokenizer import QwenTokenizer
+
+    from ..common import essay
+
+    path = qwen3_gguf("embedding-0.6B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    g = GGUFFile(path)
+    T = 1024
+    ids = QwenTokenizer(g).encode(essay("apple.txt"))[:p0 + sum(lengths)]
+    x = g.rows("token_embd.weight", ids).float()
+    ov = LlamaOverlay(g, layers=[0, 1, 2, 3], vocab=2048, max_positions=2048, kv_k="hilo")
+    ov.load()
+    pf = LlamaPrefill(ov, sizes=(64, T), precise=True, pack=True).compile().bind()
+    if p0:
+        pf.run(x[:p0], 0, 64)
+    starts = np.cumsum([0, *lengths])[:-1]
+    xs = [x[p0 + a:p0 + a + n] for a, n in zip(starts, lengths, strict=True)]
+    alone = []
+    for xi in xs:
+        pf.run(xi, p0, T)
+        alone.append((pf.hidden(0, len(xi)).numpy(), ov.read_kv(0, range(p0, p0 + len(xi)))))
+    pos = np.concatenate([p0 + np.arange(n) for n in lengths])
+    pf.run_packed(torch.cat(xs), p0, pos, np.repeat(starts, lengths), T)
+    shared = {r for a in starts[1:] if a % 8 for r in range(a - a % 8, a - a % 8 + 8)}  # (records of two segments)
+    worst = 0.0
+    for a, n, (want, (kw, vw)) in zip(starts, lengths, alone, strict=True):
+        k, v = ov.read_kv(0, range(p0 + a, p0 + a + n))
+        assert (k == kw).all(), a
+        dv = {int(a + i) for i in np.flatnonzero((v != vw).reshape(COLS, n, -1).any(-1).any(0))}
+        assert a % 8 or dv <= shared, (a, sorted(dv - shared))
+        got = pf.hidden(int(a), n).numpy()
+        err = float(np.abs(got - want).max() / np.abs(want).max())
+        same = int((got == want).all(1).sum())
+        print(f"segment {a} + {n}: max |d| {err:.2e} of the rows' largest, {same} of {n} rows bit-identical")
+        worst = max(worst, err)
+        if a % 32 == 0:
+            m = n - n % 8
+            assert (got[:m] == want[:m]).all(), (a, n, np.flatnonzero((got[:m] != want[:m]).any(1)).tolist())
+    assert worst < 0.025, worst

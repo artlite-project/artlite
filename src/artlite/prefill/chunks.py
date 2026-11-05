@@ -15,6 +15,13 @@ Chunks start at multiples of ``group`` positions (whole cache groups: ``GROUP``,
 estimated time, but a prompt's last few tokens (a decode step's SLOTS at most) for one decode step. The padding tokens
 after a chunk's valid ones write cache records that later tokens overwrite (masked until then).
 
+Packed chunks (a readout model's: several inputs, segments, in one chunk; ``pack_sizes``) run their own programs,
+keyed ``("pack", T)``: the model's runlist with the operators that keep the segments apart (``_runlist_of(T,
+packed=True)``), the same items per layer. ``pack`` plans a request's inputs: first-fit-decreasing into chunks of
+each packed size in turn (a chunk's fixed cost, its ConfigureOps and every weight's pass, shared by its inputs), the
+plan of the least estimated time (``packed_seconds``) against each input run alone (``chunk_seconds`` of its
+``plan``): an input longer than ``span``, a chunk that would not be faster than its inputs alone, run alone.
+
 A model's prefill supplies its runlist per sub-chunk count (``_runlist``, built with ``_sl`` / ``_tok``; chunk sizes below
 SUB, ``SMALL``: one sub-chunk of operators of their own size, ``_runlist_of``), the bytes per token of its own buffers
 (``rb``), their static contents (``_bind``), its time model (``layer_seconds``, ``layer_configs``, ``layer_entries`` or
@@ -29,7 +36,8 @@ word (``pace.resolve``: before the first chunk, or at ``prepare``; 0 where nothi
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .. import parallel_compile
@@ -44,6 +52,17 @@ PIECE_BUDGET_S = 0.8  # estimated seconds per dispatch (the hang detection: 2 s;
 CONFIG_S = 0.15e-3  # a ConfigureOp (~80-90 us alone: the PDI load's reset ~40 us, the rest's operations; the cores'
 # programs by control packets: Llama's fitted 0.143 ms, Qwen's 0.075 ms in its own model; Gemma's ~40% above its chunks)
 GROUP = 32  # positions a chunk starts at a multiple of (whole cache groups; a model's default ``group``)
+
+
+@dataclass
+class Packing:
+    """A request's inputs as packed chunks (``bins``: per chunk its size and the inputs' indices) and inputs run alone
+    (``alone``); ``seconds`` its estimate, ``sequential`` every input's alone."""
+
+    bins: list[tuple[int, list[int]]] = field(default_factory=list)
+    alone: list[int] = field(default_factory=list)
+    seconds: float = 0.0
+    sequential: float = 0.0
 
 
 class ChunkPrefill:
@@ -66,14 +85,17 @@ class ChunkPrefill:
         self.H = self.cfg.hidden_size
         self.group = GROUP
         self.rb: dict[str, int] = {}  # (bytes per token of the token buffers)
-        self._items: dict[int, list] = {}
+        self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
+        self.span = 0  # (a packed chunk's longest segment)
+        self._items: dict[int | tuple[str, int], list] = {}
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
         self.pace: int | None = None  # (the PACE word, once resolved: ``pace_ready``)
 
     def _library(self) -> None:
         """The runlists of the chunk sizes, the prefill's own buffers, the library of their operators."""
-        self.runlists = {T: self._runlist_of(T) for T in self.sizes}
+        self.runlists: dict[int | tuple[str, int], list[tuple]] = {T: self._runlist_of(T) for T in self.sizes}
+        self.runlists |= {("pack", T): self._runlist_of(T, packed=True) for T in self.pack_sizes}
         self._sizes()
         self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
         self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)
@@ -87,8 +109,9 @@ class ChunkPrefill:
         its arguments' buffer slices "NAME[a:b]")."""
         raise NotImplementedError
 
-    def _runlist_of(self, T: int) -> list[tuple]:
-        """The runlist of a chunk of size T (a ``SMALL`` size: the model's own)."""
+    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
+        """The runlist of a chunk of size T (a ``SMALL`` size: the model's own; ``packed``: a packed chunk's)."""
+        assert not packed, f"{type(self).__name__} has no packed chunks"
         return self._runlist(T // self.SUB)
 
     def subs(self, T: int) -> int | float:
@@ -179,11 +202,12 @@ class ChunkPrefill:
     def _bind(self) -> None:
         """The model's static buffers (``bind``)."""
 
-    def _program(self, T: int) -> list[tuple[int, list[int]]]:
-        """The items of a chunk's program: (library entry, device addresses of its arguments' slices)."""
-        if T not in self._items:
-            self._items[T] = self.lib.items(self.runlists[T], self._buffers())
-        return self._items[T]
+    def _program(self, key: int | tuple[str, int]) -> list[tuple[int, list[int]]]:
+        """The items of a chunk's program (``key``: its size, or ("pack", size)): (library entry, device addresses of
+        its arguments' slices)."""
+        if key not in self._items:
+            self._items[key] = self.lib.items(self.runlists[key], self._buffers())
+        return self._items[key]
 
     # ------------------------------------------------------------------
     # Compile, run
@@ -251,6 +275,59 @@ class ChunkPrefill:
             p0, n = p0 + m, n - m
         return out
 
+    def alone_seconds(self, n: int, p0: int) -> float:
+        """Estimated time of an input of n tokens at p0 alone: its chunks (``plan`` of a readout)."""
+        out = 0.0
+        for T in self.plan(p0, n, steps=False):
+            out += self.chunk_seconds(T, p0)
+            p0 += T
+        return out
+
+    def pack(self, lengths: Sequence[int], p0: int) -> Packing:
+        """How inputs of ``lengths`` tokens after p0 (the caches' prefix every one of them continues) run (module
+        docstring): packed chunks of their indices in order and inputs alone."""
+        alone = [self.alone_seconds(n, p0) for n in lengths]
+        if p0 % self.group or not self.pack_sizes:
+            return Packing(alone=list(range(len(lengths))), seconds=sum(alone), sequential=sum(alone))
+        sizes = tuple(T for T in self.pack_sizes if self.fits(T, p0))
+        cost: dict[int, float] = {}
+
+        def best(idx: list[int], caps: tuple[int, ...]) -> tuple[float, list[tuple[int, list[int]]]]:
+            """The least estimated time of the inputs idx (packable) in chunks of the sizes caps, and their chunks:
+            first-fit-decreasing into chunks of each size, each chunk's inputs instead alone or in smaller ones."""
+            out = (sum(alone[i] for i in idx), [])
+            for cap in caps:
+                bins: list[list[int]] = []
+                fill: list[int] = []
+                for i in sorted(idx, key=lambda i: -lengths[i]):
+                    k = next((k for k, f in enumerate(fill) if f + lengths[i] <= cap), len(bins))
+                    if k == len(bins):
+                        bins.append([])
+                        fill.append(0)
+                    bins[k].append(i)
+                    fill[k] += lengths[i]
+                t, plan = 0.0, []
+                for b, f in zip(bins, fill, strict=True):
+                    T = next(T for T in sizes if T >= f)
+                    if T not in cost:
+                        cost[T] = self.packed_seconds(T, p0)
+                    options = [(sum(alone[i] for i in b), [])] + ([(cost[T], [(T, sorted(b))])] if len(b) > 1 else [])
+                    if len(b) > 1 and T > sizes[0]:
+                        options.append(best(b, tuple(c for c in sizes if c < T)))
+                    tb, pb = min(options, key=lambda o: o[0])
+                    t += tb
+                    plan += pb
+                if t < out[0]:
+                    out = (t, plan)
+            return out
+
+        packable = [i for i, n in enumerate(lengths) if 0 < n <= self.span]
+        t, bins = best(packable, sizes)
+        packed = {i for _, b in bins for i in b}
+        rest = [i for i in range(len(lengths)) if i not in packed]
+        return Packing(bins=bins, alone=rest, seconds=t + sum(alone[i] for i in rest if i not in packable),
+                       sequential=sum(alone))
+
     def _size(self, n: int, p0: int, T: int) -> int:
         """The size of a chunk of n tokens at p0 (T, or the smallest that holds them)."""
         T = T or next(t for t in self.sizes if t >= n)
@@ -258,14 +335,15 @@ class ChunkPrefill:
         assert T in self.runlists and 0 < n <= T and self.fits(T, p0), (T, p0, n)
         return T
 
-    def _launch(self, T: int, p0: int, params: dict[str, int], hooks: dict[int, Callable[[], None]] | None = None
-                ) -> None:
-        """Dispatch a chunk's program (its inputs written): the scratchpad ``params``, the pieces of ``_splits`` (and
-        one from each item index of ``hooks`` on, its host function called before it); the cache layers' rings then
-        hold no rows of the chunk's last record (``kv_layers``: record mode)."""
+    def _launch(self, T: int, p0: int, params: dict[str, int], hooks: dict[int, Callable[[], None]] | None = None, *,
+                packed: bool = False) -> None:
+        """Dispatch a chunk's program (its inputs written; ``packed``: a packed chunk's): the scratchpad ``params``, the
+        pieces of ``_splits`` (and one from each item index of ``hooks`` on, its host function called before it); the
+        cache layers' rings then hold no rows of the chunk's last record (``kv_layers``: record mode)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
-        self.dispatches = self.lib.run(self._program(T), splits=[*self._splits(T, p0), *(hooks or {})],
+        self.dispatches = self.lib.run(self._program(("pack", T) if packed else T),
+                                       splits=[*self._splits(T, p0), *(hooks or {})],
                                        bufs=list(self._buffers().values()), hooks=hooks)
         self.ov.vring.from_prefill.update(self.kv_layers)
 
@@ -288,3 +366,7 @@ class ChunkPrefill:
     def chunk_seconds(self, T: int, p0: int) -> float:
         """Estimated time of a chunk of size T at p0."""
         return sum(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers)
+
+    def packed_seconds(self, T: int, p0: int) -> float:
+        """Estimated time of a packed chunk of size T at p0."""
+        raise NotImplementedError

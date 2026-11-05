@@ -24,6 +24,14 @@ afterwards (the last's in the buffers' padding).
 
 Chunks start at a cache group (64 positions at head_dim 128, 128 at 64: the attention's cache reads and writes are whole
 groups); the padding tokens after the valid ones write cache records that later tokens overwrite.
+
+A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
+one chunk of ``PACK_SIZES``, after a history every one of them sees (a shared prefix in the caches, or none). Only the
+attention keeps them apart (``prefill.attn.AttnOperator(window=)``: each row its segment's keys up to itself; segments of
+up to ``PACK_SPAN`` tokens); every other operator works row by row. Each token's rotary position counts from its
+segment's start (after the history): the chunk's cos / sin rows, written past the table's positions (rows that only
+padding tokens read otherwise), through the prep's ``P_CS``. The chunk's K / V records are not a sequence's: a packed
+chunk leaves the caches valid up to its p0 only.
 """
 
 import itertools
@@ -51,6 +59,8 @@ BIG = 1024  # the sub-chunk of the chunks made of them (the GEMMs but qkv once p
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
 NORM_SIZES = (2048, 1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
+PACK_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)  # packed chunks' sizes (``run_packed``)
+PACK_SPAN = 512  # a packed chunk's longest segment (its attention's window: PACK_SPAN / pg + 1 cache groups)
 # chunk sizes of whole cache groups (a flash attention design each); past 2048 in whole BIG sub-chunks (long prompts:
 # half the ConfigureOps per token of 2048-token chunks)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
@@ -106,9 +116,11 @@ class LlamaPrefill(ChunkPrefill):
 
     SUB, SMALL, MAX_T, NAME = SUB, SMALL, MAX_T, "llama_prefill"
 
-    def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = False):
+    def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = False,
+                 pack: bool = False):
         """``precise``: the attention's P as hi + lo panels (``prefill.attn.Shape.pp``: P V's error gone, at +1% of the
-        attention at 512 tokens but +20% at 8K: the readout models' prompts are short)."""
+        attention at 512 tokens but +20% at 8K: the readout models' prompts are short); ``pack``: packed chunks
+        (``run_packed``) of the sizes of ``PACK_SIZES`` among ``sizes``."""
         ov = overlay
         s = PA.Shape(ov.hd, ov.nh, ov.kp, ov.T, 2 if ov.cfg.qk_norm else 1,  # (Qwen3: Q hi + lo, ``prefill.attn``)
                      2 if precise else 1)
@@ -132,6 +144,10 @@ class LlamaPrefill(ChunkPrefill):
         self.plans = self.ops[SUB].plans if SUB in self.ops else self.ops[max(self.ops)].plans
         self.attn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T))
                      for T in self.sizes}
+        self.pack_sizes = tuple(T for T in PACK_SIZES if T in self.sizes) if pack else ()
+        self.pattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
+                                         window=PACK_SPAN // s.pg + 1) for T in self.pack_sizes}
+        self.span = PACK_SPAN if pack else 0
         self._rows()
         self._library()
 
@@ -233,16 +249,17 @@ class LlamaPrefill(ChunkPrefill):
     def _runlist(self, S: int) -> list[tuple]:
         return self._runlist_of(S * SUB)
 
-    def _runlist_of(self, T: int) -> list[tuple]:
+    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
         """(the sub-chunks of ``_t``: a size below SUB one of its own operators)"""
         t = self._t(T)
-        return self._ops_runlist(T // t, self.ops[t])
+        return self._ops_runlist(T // t, self.ops[t], packed)
 
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
 
-    def _ops_runlist(self, S: int, o: _Ops) -> list[tuple]:
-        """The runlist of S sub-chunks of the operators ``o`` (their layers' first items in ``_starts``)."""
+    def _ops_runlist(self, S: int, o: _Ops, packed: bool = False) -> list[tuple]:
+        """The runlist of S sub-chunks of the operators ``o`` (their layers' first items in ``_starts``; ``packed``: the
+        packed attention, the chunk's segments in SEG)."""
         ov, s, sl = self.ov, self.shape, self._sl
         t = o.n_in.T  # (a sub-chunk's tokens)
 
@@ -270,14 +287,15 @@ class LlamaPrefill(ChunkPrefill):
             rl += [(g.op, sl("PXN", j * qt * rb["PXN"], g.op, i=0), self._w(g), sl("G", j * qt * rg, g.op, i=2))
                    for g in o.plans[(L, "qkv")].gemms for j in range(S * t // qt)]
             pt = self._pt(S * t)  # (the prep's blocks of the chunk)
-            prep, attn = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)], self.attn[S * t]
+            prep, attn = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)], (self.pattn if packed else self.attn)[S * t]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
             pg = pt // s.pg * s.group
             nw = [f"NW[{self.nw * li}:{self.nw * (li + 1)}]"] if self.nw else []
             rl += [(prep, tok("G", 0, prep, i=0, row=rg, extra=b * pt * rg), sl("CS", b * pt * 4 * s.hd, prep, i=1),
                     tok("QS", 0, prep, i=2, extra=b * pt * rb["QS"]), f"KV[{kv0 + b * pg}:{kv0 + b * pg + kvb}]", *nw)
                    for b in range(S * t // pt)]
-            rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2)))
+            rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2),
+                       *([sl("SEG", 0, attn, i=3)] if packed else [])))
             (g,) = o.plans[(L, "o")].gemms
             rl += [(g.op, tok("A", j, g.op, i=0), self._w(g), tok("Y", j, g.op, i=2, row=ry)) for j in range(S)]
             for a, nt in blocks:
@@ -351,6 +369,29 @@ class LlamaPrefill(ChunkPrefill):
         dev.flush("PX", 0, 2 * T * H)
         self._launch(T, p0, self.params(T, p0))
 
+    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
+        """A packed chunk of size T (default: the smallest of ``pack_sizes`` that holds x): x (n, hidden) the segments'
+        embeddings back to back, ``pos`` (n,) their rotary positions, ``lo`` (n,) per token its segment's first (an index
+        into x); every row sees the caches' positions before p0 (a shared prefix) and its segment's tokens up to itself
+        (segments of up to ``PACK_SPAN`` tokens). Leaves the last layer's output rows in PX (``hidden``); the caches hold
+        no sequence after p0."""
+        n, dev, H, hd = x.shape[0], self.ov.dev, self.H, self.shape.hd
+        T = T or next(t for t in self.pack_sizes if t >= n)
+        self._size(n, p0, T)
+        assert ((np.arange(n) - lo) < PACK_SPAN).all() and (lo <= np.arange(n)).all(), "segments of PACK_SPAN tokens"
+        px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
+        px[:n] = x.bfloat16().view(torch.int16).numpy().view(np.uint16)
+        px[n:] = 0
+        dev.flush("PX", 0, 2 * T * H)
+        R = self.ov.max_positions  # (the chunk's cos / sin rows past the text positions'; padding: a row of its own)
+        rows = PA.cs_rows(self.cfg.rope_inv_freq(), np.concatenate([pos, p0 + np.arange(n, T)]))
+        dev.view("CS")[4 * hd * R:4 * hd * (R + T)] = rows.view(np.uint8).reshape(-1)
+        dev.flush("CS", 4 * hd * R, 4 * hd * T)
+        seg = self.pattn[T].seg(np.concatenate([lo, np.arange(n, T)]))
+        dev.view("SEG")[:seg.size] = seg
+        dev.flush("SEG", 0, seg.size)
+        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R}, packed=True)
+
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
         before its norm)."""
@@ -363,18 +404,25 @@ class LlamaPrefill(ChunkPrefill):
     # Time estimates
     # ------------------------------------------------------------------
 
-    def attention_seconds(self, p0: int, S: float) -> float:
+    def attention_seconds(self, p0: int, S: float, packed: bool = False) -> float:
         """Estimated time of a layer's flash attention over a chunk of S sub-chunks at p0: per pass the cache records
-        it streams (from position 0 to its queries' group), RECORD_S each."""
-        s, at = self.shape, self.attn[round(S * SUB)]
-        q, r = divmod(at.n_pass, at.m)  # (sum over the passes b of b // m)
-        recs = (at.n_pass * (p0 // s.pg + 1) + at.m * q * (q - 1) // 2 + q * r) * s.rg
+        it streams (from position 0 to its queries' group; ``packed``: the history and its window), RECORD_S each."""
+        s, at = self.shape, (self.pattn if packed else self.attn)[round(S * SUB)]
+        if packed:
+            recs = sum(p0 // s.pg + 1 + min(b // at.m, at.win) for b in range(at.n_pass)) * s.rg
+        else:
+            q, r = divmod(at.n_pass, at.m)  # (sum over the passes b of b // m)
+            recs = (at.n_pass * (p0 // s.pg + 1) + at.m * q * (q - 1) // 2 + q * r) * s.rg
         return RECORD_S * recs
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
         """(per sub-chunk, or the fraction T / SUB of one, the GEMMs by the bytes of their weights, WEIGHT_S each (the
         norms and the prep included); the flash attention (``attention_seconds``); CFG_S per ConfigureOp)"""
         return self._layer_static(L, S) + self.attention_seconds(p0, S)
+
+    def packed_seconds(self, T: int, p0: int) -> float:
+        S = self.subs(T)
+        return sum(self._layer_static(L, S) + self.attention_seconds(p0, S, packed=True) for L in self.layers)
 
     def _layer_static(self, L: int, S: float) -> float:
         """(``layer_seconds`` but the attention's; cached: the planner asks for every layer and size)"""
