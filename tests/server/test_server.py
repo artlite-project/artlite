@@ -18,6 +18,7 @@ import time
 from collections.abc import Iterator
 
 import httpx
+import jinja2
 import numpy as np
 import openai
 import pytest
@@ -71,7 +72,8 @@ class FakeTokenizer:
 
 
 class FakeModel(Model):
-    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks)."""
+    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks); ``efforts``: the
+    ``reasoning_effort`` levels its template takes (Qwen3.8's raises for another; None: any)."""
 
     name = "Fake"
 
@@ -83,14 +85,21 @@ class FakeModel(Model):
         self.thought_first = reasoning == QWEN
         self.rendered: tuple[list[dict[str, object]], list[dict[str, object]] | None] = ([], None)
         self.preserved: bool | None = None  # (the last chat's preserve)
+        self.thought: bool | None = None  # (the last chat's think)
+        self.variables: dict[str, object] = {}  # (the last chat's template variables)
+        self.efforts: tuple[str, ...] | None = None
 
     def encode(self, text: str) -> list[int]:
         return [BOS] + self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int]:
         """(tools: their names in a system turn; an assistant's tool calls after its content)"""
-        self.rendered, self.preserved = (messages, tools), preserve
+        effort = (variables or {}).get("reasoning_effort")
+        if self.efforts is not None and effort is not None and effort not in self.efforts:
+            raise jinja2.TemplateError(f"Unexpected reasoning effort {effort}")
+        self.rendered, self.preserved, self.thought, self.variables = (messages, tools), preserve, think, variables or {}
         text = "<s>" + (f"<|system|>tools: {' '.join(t['function']['name'] for t in tools)}" if tools else "")
         for m in messages:
             calls = "".join(f" call {c['function']['name']} {json.dumps(c['function']['arguments'])}"
@@ -116,7 +125,8 @@ class FakeVision(FakeModel):
         self.threads: list[str] = []
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int] | Sequence:
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int] | Sequence:
         seq, text = Sequence.text([], 8), "<s>"
         for m in messages:
             text += f"<|{m['role']}|>"
@@ -475,6 +485,61 @@ def test_preserve_reasoning() -> None:
             assert model.preserved is want, (options, kwargs)
             client.post("/apply-template", json={"messages": [{"role": "user", "content": "Hi"}], **body})
             assert model.preserved is want, (options, kwargs)
+
+
+def test_template_variables() -> None:
+    """A request's chat_template_kwargs reach the template as its variables, over the server's (but enable_thinking
+    and the preserve switches, which are the model's, and the conversation's own names). reasoning_effort, the
+    server's --reasoning-effort or a request's field (as llama-server's; the Responses API's reasoning.effort):
+    none turns the thought off, another level on and is the template's variable; a level from a request's field that
+    the template refuses gives way to the server's, else the template's default; one in chat_template_kwargs fails."""
+    model, _npu, engine = make(reasoning=QWEN)
+    model.efforts = ("xhigh", "medium", "low")
+    hi = [{"role": "user", "content": "Hi"}]
+    with TestClient(app_of(engine, chat_template_kwargs={"add_vision_id": True, "x": 1})) as client:
+        assert engine.wait_ready(5)
+        kw = {"x": 2, "tools_in_user_message": False, "messages": [], "add_generation_prompt": False,
+              "enable_thinking": True, "preserve_thinking": False}
+        assert chat(client, "Hi", chat_template_kwargs=kw).status_code == 200
+        assert model.variables == {"add_vision_id": True, "x": 2, "tools_in_user_message": False}
+        assert model.thought is True and model.preserved is False and model.rendered[0] == hi
+        assert chat(client, "Hi", reasoning_effort="low").status_code == 200
+        assert model.variables == {"add_vision_id": True, "x": 1, "reasoning_effort": "low"} and model.thought is True
+        assert chat(client, "Hi", reasoning_effort="none").status_code == 200
+        assert "reasoning_effort" not in model.variables and model.thought is False
+        assert chat(client, "Hi", reasoning_effort="low", chat_template_kwargs={"enable_thinking": False}).status_code \
+            == 200 and model.thought is False  # (chat_template_kwargs over the field)
+        assert chat(client, "Hi", reasoning_effort="high").status_code == 200
+        assert "reasoning_effort" not in model.variables and model.thought is True
+        r = chat(client, "Hi", chat_template_kwargs={"reasoning_effort": "high"})
+        assert r.status_code == 400 and "Unexpected reasoning effort high" in r.json()["error"]["message"]
+        client.post("/apply-template", json={"messages": hi, "reasoning_effort": "medium"})
+        assert model.variables["reasoning_effort"] == "medium"
+        assert client.post("/v1/responses", json={"input": "Hi", "reasoning": {"effort": "low"}}).status_code == 200
+        assert model.variables["reasoning_effort"] == "low" and model.thought is True
+    with TestClient(app_of(engine, reasoning_effort="medium")) as client:
+        assert chat(client, "Hi").status_code == 200
+        assert model.variables == {"reasoning_effort": "medium"} and model.thought is False  # (-rea off)
+        assert chat(client, "Hi", reasoning_effort="high").status_code == 200
+        assert model.variables == {"reasoning_effort": "medium"} and model.thought is True
+        assert chat(client, "Hi", reasoning_effort="none").status_code == 200 and model.variables == {}
+
+
+def test_chat_template_option() -> None:
+    """The server's chat template in place of the file's (--chat-template, ModelInfo's): /props reports it and the
+    template's tool-call syntax, content parts and system messages are read from it."""
+    model, _npu, engine = make()
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        assert client.get("/props").json()["chat_template_caps"]["supports_tools"] is False
+    template = "{%- for m in messages %}{{ m.content if m.content is string else m.content|map(attribute='text')|" \
+               "join }}{% endfor %}{# <tool_call> <function= <parameter= #}"
+    with TestClient(app_of(engine, template=template)) as client:
+        p = client.get("/props").json()
+        assert p["chat_template"] == template and p["chat_template_caps"]["supports_tools"] is True
+        parts = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+        assert chat(client, [{"role": "user", "content": parts}]).status_code == 200
+        assert model.rendered[0][0]["content"] == parts  # (the template joins the parts itself)
 
 
 def test_splitter_and_stops() -> None:

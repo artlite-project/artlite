@@ -58,6 +58,24 @@ name is always one of the request's functions: while the model writes it, only t
 are not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema
 allows no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
 
+## Chat template
+
+A chat's messages go through the model file's chat template (`tokenizer.chat_template`), rendered as transformers and
+llama.cpp render it. `--chat-template-file FILE` (or `--chat-template` with the template's text) replaces it, as
+llama-server's options do: to change a tool-call syntax, a thinking switch or a broken upstream template without
+rewriting the GGUF file, and, as a preset's key (`chat-template-file = ...`), to give several models one template.
+It gets the variables the file's template gets (`enable_thinking`, `preserve_thinking`, `bos_token`, ...), and the
+server reads from it what it reads from the file's (the tool-call syntax, whether it takes a message as text parts
+and a system message after the first); `/props` and `/apply-template` show it. A template that does not render a user
+message fails at load.
+
+A request's `chat_template_kwargs` and the server's `--chat-template-kwargs` are the template's variables, as in
+llama-server (the request's over the server's). A request's `reasoning_effort` (and a Responses request's
+`reasoning.effort`) sets the template's `reasoning_effort` and turns the thought on, `none` off; a level that the
+template refuses (Qwen3.8's takes `xhigh`, `medium` and `low`; clients send `high` or `minimal`) gives way to
+`--reasoning-effort`, else the template's own default, with a log line. A level given in `chat_template_kwargs` or
+by `--reasoning-effort` is the template's to take: a refused one fails the request, or the server's start.
+
 ## Agents
 
 Coding agents and other clients that call tools use the API they speak: chat completions (opencode, Open WebUI, the
@@ -103,7 +121,8 @@ thinks can take longer):
   context answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
 - Responses API: `instructions`, the items `message`, `reasoning`, `function_call` and `function_call_output`,
   function tools (others, such as `web_search`, are left out), `tool_choice`, `reasoning.effort` (`none`: no
-  thought), `max_output_tokens`, and OpenAI's event stream. `previous_response_id` continues one of the last 1024
+  thought; another: a thought, and the template's `reasoning_effort`: [above](#chat-template)), `max_output_tokens`,
+  and OpenAI's event stream. `previous_response_id` continues one of the last 1024
   responses the server keeps (not those with `store: false`); `GET` and `DELETE /v1/responses/{id}` read and drop
   one. A prompt longer than the context fails with the code `context_length_exceeded`.
 - On every route a `developer` message is a system message, and where a template takes a system message only first
@@ -262,6 +281,7 @@ ctx-size = 8192
 mmproj = openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf
 max-slices = 36
 load-on-startup = true
+chat-template-file = templates/qwen-chatml.jinja
 
 [my-llama]                                 ; a model of its own, from anywhere
 model = /path/to/Llama-3.2-3B-Instruct-Q4_K_M.gguf
@@ -269,9 +289,10 @@ alias = llama
 ```
 
 Keys are the options' long names without dashes (`ctx-size`), their short ones (`c`) or their environment variables
-(`ARTLITE_ARG_CTX_SIZE`); switches take `true` or `false` (`no-prefill = true`, `warmup = false`). An empty `mmproj`
-turns a vision encoder off, `alias` adds names (comma-separated), `load-on-startup` loads the model when the server
-starts. A model's option comes from the command line, else its section, else `[*]`.
+(`ARTLITE_ARG_CTX_SIZE`); switches take `true` or `false` (`no-prefill = true`, `warmup = false`), and a relative path
+(`chat-template-file`) is the working directory's, as on the command line. An empty `mmproj` turns a vision encoder
+off, `alias` adds names (comma-separated), `load-on-startup` loads the model when the server starts. A model's option
+comes from the command line, else its section, else `[*]`.
 
 ## Options
 
@@ -320,7 +341,9 @@ Generation:
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
 | `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |
 | `--reasoning-preserve`, `--no-reasoning-preserve` | earlier answers keep their thoughts in the prompt where the template can (the templates' `preserve_thinking`; default on); a request's `chat_template_kwargs.preserve_reasoning` (or `preserve_thinking`) overrides it |
-| `--chat-template-kwargs JSON` | chat template variables, under each request's own (`enable_thinking`, `preserve_reasoning`) |
+| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
+| `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
+| `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
 
 NPU:
 

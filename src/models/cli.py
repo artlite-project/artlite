@@ -16,14 +16,26 @@ stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to s
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
 import time
 
+import jinja2
+
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
-from .common import MEDIA_MARKER, StreamDecoder, auto_capacity, performance_mode, seed, stale_install
+from .common import (
+    MEDIA_MARKER,
+    TEMPLATE_RESERVED,
+    StreamDecoder,
+    auto_capacity,
+    performance_mode,
+    seed,
+    stale_install,
+    template_option,
+)
 from .sd15.pipeline import BACKENDS, check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
@@ -41,6 +53,14 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-sys", "--system-prompt", help="system message")
     p.add_argument("--raw", action="store_true", help="the prompt is the raw text (no chat template)")
     p.add_argument("--think", action="store_true", help="let the model think first (default: an empty thought)")
+    p.add_argument("--reasoning-effort", metavar="LEVEL", default="default",
+                   help="the chat template's reasoning_effort, with --think (Qwen3.8's: xhigh, medium, low; default: "
+                        "default, the template's own)")
+    p.add_argument("--chat-template-kwargs", type=json.loads, default={},
+                   help="chat template variables as a JSON object (reasoning_effort, tools_in_user_message, ...)")
+    p.add_argument("--chat-template", metavar="JINJA_TEMPLATE",
+                   help="a Jinja chat template in place of the model file's (tokenizer.chat_template)")
+    p.add_argument("--chat-template-file", metavar="FILE", help="the same from a file")
     p.add_argument("-n", "--n-predict", type=int, default=-1,
                    help="tokens to generate (default: -1, until an end-of-sequence token or a full KV cache)")
     p.add_argument("-c", "--ctx-size", type=int, default=0,
@@ -135,16 +155,22 @@ def main(argv: list[str] | None = None) -> None:
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
     options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
+    variables = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
+        ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
     try:
         text = prompt_text(args)
-        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
-        ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image)
+        template = template_option(args.chat_template, args.chat_template_file)
+        model = open_model(args.model, chat_template=template, **{k: v for k, v in options.items() if v is not None})
+        ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image,
+                           variables=variables)
         sampling = model.sampling(think=args.think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
                  "repeat_last_n": args.repeat_last_n, "presence_penalty": args.presence_penalty,
                  "frequency_penalty": args.frequency_penalty}
         sampling = dataclasses.replace(sampling, **{k: v for k, v in given.items() if v is not None},
                                        greedy=sampling.greedy or args.greedy)
+    except jinja2.TemplateError as e:  # (the template refuses the prompt or a variable)
+        sys.exit(f"artlite-cli: the chat template failed: {e}")
     except (OSError, ValueError, NotImplementedError) as e:
         sys.exit(f"artlite-cli: {e}")
     if model.vision is not None and args.image:

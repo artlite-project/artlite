@@ -322,6 +322,39 @@ def chat_template(template: str, messages: list[dict[str, object]], *, tools: li
     return _compiled(template).render(messages=messages, add_generation_prompt=True, tools=tools or None, **variables)
 
 
+TEMPLATE_RESERVED = frozenset({"messages", "tools", "add_generation_prompt"})  # (no variables: the conversation's)
+
+
+def check_chat_template(template: str, **variables: object) -> None:
+    """ValueError unless a chat template renders a user message with ``variables`` (llama.cpp's check of a template
+    it is given: a broken one fails at load, not at the first request)."""
+    try:
+        chat_template(template, [{"role": "user", "content": "test"}], **variables)
+    except Exception as e:  # noqa: BLE001 (any failure of the template's)
+        given = f" with {json.dumps(variables, ensure_ascii=False)}" if variables else ""
+        raise ValueError(f"the chat template does not render a user message{given}: {type(e).__name__}: {e}") from None
+
+
+def template_option(text: str | None, file: str | None) -> str | None:
+    """The chat template of the options ``--chat-template`` (its text) or ``--chat-template-file`` (a file's text),
+    as llama.cpp's, in place of the model file's; None: neither (empty: not given). OSError: the file does not open;
+    ValueError: both given, or the template does not render (``check_chat_template``)."""
+    if text and file:
+        raise ValueError("--chat-template and --chat-template-file: give one of them")
+    if file:
+        with open(file, encoding="utf-8") as f:
+            text = f.read()
+        if not text.strip():
+            raise ValueError(f"--chat-template-file {file}: the file is empty")
+    if not text:
+        return None
+    try:
+        check_chat_template(text)
+    except ValueError as e:
+        raise ValueError(f"--chat-template{'-file ' + file if file else ''}: {e}") from None
+    return text
+
+
 class Detokenizer(Protocol):
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes: ...
 
@@ -1101,6 +1134,7 @@ class Model:
     thought_first = False  # a thought only begins an answer (its markers later in the answer are text)
     turn: str | None = None  # the text that begins every message in the chat template (a prompt cache's marks)
     user_turn: str | None = None  # the text that begins a user message
+    chat_template: str | None = None  # a Jinja chat template in place of the file's (``open_model``'s); None: the file's
     tokenizer: Tokenizer
     eos_token_ids: tuple[int, ...] | set[int]
 
@@ -1109,13 +1143,15 @@ class Model:
         raise NotImplementedError
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
-        """Token ids of a conversation through the chat template, up to the assistant's turn (``think``: let it
-        think first; otherwise an empty thought where the template has one; ``tools``: the functions it may call,
-        ``chat_template``; ``preserve``: the earlier answers keep their thoughts, the template's ``preserve_thinking``,
-        where it has one). A message's content may be a list of parts: ``{"type": "text", "text": ...}``,
-        ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model with ``vision``: its prompt then a
-        sequence of ids and embedding rows; the encoder runs on the NPU)."""
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int]:
+        """Token ids of a conversation through the chat template (``chat_template``, else the file's), up to the
+        assistant's turn (``think``: let it think first; otherwise an empty thought where the template has one;
+        ``tools``: the functions it may call, ``chat_template``; ``preserve``: the earlier answers keep their thoughts,
+        the template's ``preserve_thinking``, where it has one; ``variables``: the template's others, over the model's
+        own: ``reasoning_effort``, ``bos_token``, ...). A message's content may be a list of parts:
+        ``{"type": "text", "text": ...}``, ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model
+        with ``vision``: its prompt then a sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError
 
     def sampling(self, *, think: bool = False) -> Sampling:
@@ -1128,9 +1164,10 @@ class Model:
         raise NotImplementedError
 
     def prompt(self, text: str, *, system: str | None = None, raw: bool = False, think: bool = False,
-               images: list[object] = ()) -> list[int]:
+               images: list[object] = (), variables: dict[str, object] | None = None) -> list[int]:
         """Token ids of a user message after an optional system message, through the chat template (``raw``: the text
-        alone); ``images`` (files or their bytes) where the text has ``MEDIA_MARKER``, else before it."""
+        alone; ``variables``: the template's, as ``chat``'s); ``images`` (files or their bytes) where the text has
+        ``MEDIA_MARKER``, else before it."""
         if images and self.vision is None:
             raise ValueError(f"{self.name}: images need a vision encoder (an mmproj file)")
         if raw:
@@ -1148,4 +1185,4 @@ class Model:
             for im, t in zip(images, parts[1:], strict=True):
                 content += [{"type": "image", "image": im}] + ([{"type": "text", "text": t}] if t else [])
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
-        return self.chat(messages, think=think)
+        return self.chat(messages, think=think, variables=variables)

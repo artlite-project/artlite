@@ -67,9 +67,10 @@ def model_class(arch: str) -> type[Model]:
     return getattr(importlib.import_module(module), name)
 
 
-def open_model(path: str, **options: object) -> Model:
-    """Open a GGUF file with the ``Model`` of its architecture; ``options``: that class's keyword arguments (one given as
-    False: where the class has it, a flag that turns a feature off applies to every model)."""
+def open_model(path: str, *, chat_template: str | None = None, **options: object) -> Model:
+    """Open a GGUF file with the ``Model`` of its architecture; ``chat_template``: a Jinja chat template in place of the
+    file's (``Model.chat_template``); ``options``: that class's keyword arguments (one given as False: where the class
+    has it, a flag that turns a feature off applies to every model)."""
     arch = architecture(path)
     try:
         cls = model_class(arch)
@@ -79,7 +80,9 @@ def open_model(path: str, **options: object) -> Model:
     unknown = {k for k, v in options.items() if k not in params and v is not False}
     if unknown:
         raise ValueError(f"{cls.name} has no option {', '.join(sorted(unknown))}")
-    return cls(path, **{k: v for k, v in options.items() if k in params})
+    model = cls(path, **{k: v for k, v in options.items() if k in params})
+    model.chat_template = chat_template
+    return model
 
 
 def is_diffusers(path: str) -> bool:

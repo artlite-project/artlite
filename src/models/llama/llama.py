@@ -114,8 +114,10 @@ class Llama(Model):
         return [self.tokenizer.special[BOS]] + self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, tools=tools))
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int]:
+        return self.tokenizer.encode(chat_prompt(self.gguf, messages, tools=tools, template=self.chat_template,
+                                                 **(variables or {})))
 
     def sampling(self, *, think: bool = False) -> Sampling:
         return Sampling(temp=0.7, top_k=50)

@@ -9,6 +9,7 @@ serves that model; without, the models of a directory, each in a server of its o
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -27,7 +28,16 @@ from fastapi import FastAPI
 from artlite.model_config import MODELS_DIR, model_path
 
 from .. import open_model
-from ..common import Model, NpuModel, Sampling, performance_mode, stale_install
+from ..common import (
+    TEMPLATE_RESERVED,
+    Model,
+    NpuModel,
+    Sampling,
+    check_chat_template,
+    performance_mode,
+    stale_install,
+    template_option,
+)
 from ..readouts import POOLING
 from . import ui
 from .api import PENALTIES, ModelInfo, Options, create_app
@@ -120,8 +130,16 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      help="earlier answers keep their thoughts in the prompt where the chat template can (Qwen3.6, "
                           "Gemma 4): every turn extends the cached tokens (default: on); a request's "
                           "chat_template_kwargs.preserve_reasoning overrides it")
+    gen.add_argument("--reasoning-effort", metavar="LEVEL", default="default",
+                     help="the chat template's reasoning_effort (Qwen3.8's: xhigh, medium, low; default: default, the "
+                          "template's own); a request's reasoning_effort overrides it")
     gen.add_argument("--chat-template-kwargs", type=json.loads, default={},
-                     help="chat template variables as a JSON object, under each request's (enable_thinking)")
+                     help="chat template variables as a JSON object, under each request's (enable_thinking, "
+                          "reasoning_effort, ...)")
+    gen.add_argument("--chat-template", metavar="JINJA_TEMPLATE",
+                     help="a Jinja chat template in place of the model file's (tokenizer.chat_template)")
+    gen.add_argument("--chat-template-file", metavar="FILE",
+                     help="the same from a file (one template for several models: a preset's sections)")
     vis = p.add_argument_group("images (MiniCPM-V 4.7)")
     vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-model-f16.gguf): images "
                      "in chat messages (image_url parts of data URIs)")
@@ -314,8 +332,16 @@ def main(argv: list[str] | None = None, *, report: Report | None = None) -> None
 def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     """One model's server (``-m``)."""
     name = os.path.basename(args.model)
+    effort = None if args.reasoning_effort == "default" else args.reasoning_effort
     try:
+        template = template_option(args.chat_template, args.chat_template_file)
         info = ModelInfo.from_gguf(args.model)
+        if template is not None:
+            info = dataclasses.replace(info, chat_template=template)
+        given = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
+            ({"reasoning_effort": effort} if effort else {})
+        if info.chat_template and (template is not None or given):  # (the file's own, alone: as it is)
+            check_chat_template(info.chat_template, **given)
         keys = api_keys(args)
         penalties = {k: getattr(args, k) for k in PENALTIES if getattr(args, k) is not None}
         Sampling(**penalties)  # (ValueError: out of range)
@@ -331,7 +357,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     options = Options(alias=args.alias or name, n_ctx=n_ctx, api_keys=keys, n_predict=args.n_predict, temp=args.temp,
                       top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, **penalties, seed=args.seed,
                       reasoning=args.reasoning, reasoning_format="none" if args.reasoning_format == "none" else "auto",
-                      preserve_reasoning=args.reasoning_preserve, chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
+                      preserve_reasoning=args.reasoning_preserve, reasoning_effort=effort,
+                      chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
                       embedding=args.embedding or args.rerank, pooling=pooling, embd_normalize=args.embd_normalize,
                       sse_ping_interval=args.sse_ping_interval, slots=args.slots,
                       cors_origins=[o.strip() for o in args.cors_origins.split(",") if o.strip()],
@@ -342,7 +369,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     def load() -> tuple[Model, NpuModel]:
         t0 = time.perf_counter()
         opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
-        model = open_model(args.model, **{k: v for k, v in opts.items() if v is not None})
+        model = open_model(args.model, chat_template=template, **{k: v for k, v in opts.items() if v is not None})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
         npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)

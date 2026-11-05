@@ -139,6 +139,8 @@ kv-k = hilo
 mmproj =
 reasoning = on
 chat-template-kwargs = {{"enable_thinking": false}}
+chat-template-file = templates/vl.jinja
+reasoning-effort = low
 
 [extra]
 model = {extra}
@@ -153,6 +155,7 @@ cache-prompt = false
     vl = entries["org/vl-GGUF:Q4_K_M"]
     assert vl.mmproj is None and vl.options["reasoning"] == "on"
     assert "--chat-template-kwargs" in c.argv(vl) and '{"enable_thinking": false}' in c.argv(vl)
+    assert c.argv(vl)[-4:] == ["--chat-template-file", "templates/vl.jinja", "--reasoning-effort", "low"]
     e = entries["extra"]
     assert e.source == "preset" and e.path == extra and e.options["cache_prompt"] is False
     assert entries["org/a-GGUF:Q8_0"].options == {"ctx_size": 8192, "warmup": False, "temp": 0.25}

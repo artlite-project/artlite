@@ -51,8 +51,11 @@ class Qwen3(Model):
         return self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int]:
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools))
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int]:
+        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools,
+                                                 preserve_thinking=preserve, template=self.chat_template,
+                                                 **(variables or {})))
 
     def sampling(self, *, think: bool = False) -> Sampling:
         s = SAMPLING[think]

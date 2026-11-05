@@ -11,7 +11,8 @@ Where the conversions differ from llama-server's:
   puts a message's text first, a user turn between the calls and their results);
 - Anthropic's ``tool_choice`` ``tool`` names its function, ``none`` and ``disable_parallel_tool_use`` apply;
   ``thinking`` ``enabled`` and ``adaptive`` turn the model's thought on, ``disabled`` off (absent: the server's
-  ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off); thinking budgets are not enforced;
+  ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off; another level: the template's
+  ``reasoning_effort`` too, as a chat request's); thinking budgets are not enforced;
 - Claude Code's billing header has a stamp per request (``cch=``, which llama.cpp fixes), its version's build hash,
   which differs between sessions, and on the requests its scheduled wakeups send a ``cc_workload``: the stamp and the
   hash are fixed, the workload dropped, so the system prompt's tokens stay a cached prefix;
@@ -445,9 +446,8 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
     for k in ("temperature", "top_p", "stream", "parallel_tool_calls", "chat_template_kwargs"):
         if body.get(k) is not None:
             out[k] = body[k]
-    effort = (body.get("reasoning") or {}).get("effort")
-    if effort is not None:
-        out["chat_template_kwargs"] = {"enable_thinking": effort != "none", **(body.get("chat_template_kwargs") or {})}
+    if (body.get("reasoning") or {}).get("effort") is not None:
+        out["reasoning_effort"] = body["reasoning"]["effort"]
     if ((body.get("text") or {}).get("format") or {}).get("type", "text") != "text":
         note("text.format")
     return out

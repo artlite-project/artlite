@@ -34,7 +34,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
-from ..common import MEDIA_MARKER, Sampling, chat_template
+from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, Sampling, chat_template
 from ..readouts import Readouts
 from . import agents, decisions, readouts
 from .agents import Blocks
@@ -83,6 +83,7 @@ class Options:
     reasoning: str = "off"  # think: on, off, auto (when the model can)
     reasoning_format: str = "auto"  # auto: thoughts in reasoning_content; none: in content
     preserve_reasoning: bool = True  # earlier answers keep their thoughts (the templates' preserve_thinking)
+    reasoning_effort: str | None = None  # the templates' reasoning_effort (None: the template's own)
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)  # under each request's
     cache_prompt: bool = True
     embedding: bool = False  # the embedding routes (llama-server's --embedding; with pooling rank: rerank too)
@@ -97,7 +98,8 @@ class Options:
 
 @dataclass(frozen=True)
 class ModelInfo:
-    """What the API reports of the model file (its GGUF header)."""
+    """What the API reports of the model file (its GGUF header; ``chat_template``: the server's in place of the
+    file's, ``--chat-template``)."""
 
     path: str
     chat_template: str = ""
@@ -240,6 +242,7 @@ class ChatRequest(Generation):
     top_logprobs: int | None = None
     max_completion_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    reasoning_effort: str | None = None
     reasoning_format: str | None = None
     continue_final_message: bool | None = False
     tools: list[Any] | None = None
@@ -265,6 +268,7 @@ class DetokenizeRequest(BaseModel):
 class TemplateRequest(BaseModel):
     messages: list[Message]
     chat_template_kwargs: dict[str, Any] | None = None
+    reasoning_effort: str | None = None
     tools: list[Any] | None = None
 
 
@@ -521,37 +525,66 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     d["role"] = "user"
         return out
 
-    def template_options(kwargs: dict[str, Any] | None) -> tuple[bool, bool]:
-        """Whether the model thinks (``enable_thinking``) and the earlier answers keep their thoughts
-        (``preserve_reasoning``, llama-server's, or the templates' own ``preserve_thinking``), of a request's
-        ``chat_template_kwargs`` over the server's."""
-        kw = {**options.chat_template_kwargs, **(kwargs or {})}
-        for k in kw.keys() - {"enable_thinking", "preserve_reasoning", "preserve_thinking"}:
+    def template_options(kwargs: dict[str, Any] | None, effort: str | None = None
+                         ) -> tuple[bool, bool, dict[str, Any]]:
+        """Whether the model thinks (``enable_thinking``), whether the earlier answers keep their thoughts
+        (``preserve_reasoning``, llama-server's, or the templates' own ``preserve_thinking``) and the template's other
+        variables (``reasoning_effort``, ...), of a request's ``chat_template_kwargs`` over its ``reasoning_effort``
+        (``effort``: ``none``, no thought; another level: a thought and the template's ``reasoning_effort``) over the
+        server's (``--reasoning-effort`` over ``--chat-template-kwargs``)."""
+        server = {**options.chat_template_kwargs,
+                  **({"reasoning_effort": options.reasoning_effort} if options.reasoning_effort else {})}
+        asked = {} if effort is None else {"enable_thinking": effort != "none"} | \
+            ({"reasoning_effort": effort} if effort != "none" else {})
+        kw = {**server, **asked, **(kwargs or {})}
+        if effort == "none" and "reasoning_effort" not in (kwargs or {}):
+            kw.pop("reasoning_effort", None)
+        for k in kw.keys() & TEMPLATE_RESERVED:
             if ("chat_template_kwargs", k) not in warned:
                 warned.add(("chat_template_kwargs", k))
-                log.info("chat_template_kwargs.%s is not supported: ignored", k)
+                log.info("chat_template_kwargs.%s is the request's, not a variable: ignored", k)
         think = bool(kw["enable_thinking"]) if "enable_thinking" in kw else default_think()
         given = next((d[k] for d in (kwargs or {}, options.chat_template_kwargs)
                       for k in ("preserve_thinking", "preserve_reasoning") if k in d), None)
         preserve = options.preserve_reasoning if given is None else bool(given)
-        return think and engine.model.thinks, preserve
+        variables = {k: v for k, v in kw.items()
+                     if k not in TEMPLATE_RESERVED | {"enable_thinking", "preserve_reasoning", "preserve_thinking"}}
+        return think and engine.model.thinks, preserve, variables
 
-    async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, media: bool = False,
-                     tools: list[dict[str, Any]] | None = None) -> tuple[list[int], bool]:
+    async def render(messages: list[Message], kwargs: dict[str, Any] | None, *, effort: str | None = None,
+                     media: bool = False, tools: list[dict[str, Any]] | None = None) -> tuple[list[int], bool]:
         """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
         engine's worker between its jobs; ``media``: images as text, ``messages_of``; ``tools``: the functions the
-        model may call), and whether the model thinks."""
-        think, preserve = template_options(kwargs)
+        model may call; ``kwargs``, ``effort``: a request's ``chat_template_kwargs`` and ``reasoning_effort``,
+        ``template_options``), and whether the model thinks. A request's ``reasoning_effort`` level that the template
+        refuses (Qwen3.8's takes xhigh, medium and low; clients send high or minimal) gives way to the server's, else
+        the template's default, with a log line; one in ``chat_template_kwargs`` fails the request."""
+        think, preserve, variables = template_options(kwargs, effort)
         msgs = messages_of(messages, media=media)
         tools = tools or None
 
-        def chat() -> list[int]:
-            return engine.model.chat(msgs, think=think, tools=tools, preserve=preserve)
+        async def run(variables: dict[str, Any]) -> list[int]:
+            def chat() -> list[int]:
+                return engine.model.chat(msgs, think=think, tools=tools, preserve=preserve, variables=variables)
+
+            if any(p.get("type") == "image" for m in msgs if isinstance(m["content"], list) for p in m["content"]):
+                return await asyncio.wrap_future(engine.run(chat))
+            return await run_in_threadpool(chat)
 
         try:
-            if any(p.get("type") == "image" for m in msgs if isinstance(m["content"], list) for p in m["content"]):
-                return await asyncio.wrap_future(engine.run(chat)), think
-            return await run_in_threadpool(chat), think
+            try:
+                return await run(variables), think
+            except jinja2.TemplateError as e:
+                if not effort or variables.get("reasoning_effort") != effort or "reasoning_effort" in (kwargs or {}):
+                    raise
+                default = template_options(kwargs)[2].get("reasoning_effort")  # (the server's, else the template's)
+                ids = await run({**variables, "reasoning_effort": default} if default else
+                                {k: v for k, v in variables.items() if k != "reasoning_effort"})
+                if ("reasoning_effort", effort) not in warned:  # (the template took the level away: it refused it)
+                    warned.add(("reasoning_effort", effort))
+                    log.info("reasoning_effort %r: the chat template refuses it (%s): %s instead", effort, e,
+                             f"the server's {default!r}" if default else "the template's default")
+                return ids, think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
         except (OSError, ValueError) as e:  # (an image that does not open, or does not fit the prompt)
@@ -762,7 +795,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         fns, calls = calls_of(req)
         if calls is not None:
             calls = dataclasses.replace(calls, vocab=await vocabulary())
-        ids, think = await render(req.messages, req.chat_template_kwargs, tools=fns)
+        ids, think = await render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort, tools=fns)
         fits(ids, api)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
         # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
@@ -856,7 +889,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
     async def counted(req: ChatRequest) -> int:
         """The prompt tokens of a chat request."""
-        ids, _ = await render(req.messages, req.chat_template_kwargs, tools=calls_of(req)[0])
+        ids, _ = await render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
+                              tools=calls_of(req)[0])
         return len(ids)
 
     @api.post("/v1/messages")
@@ -1104,7 +1138,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             fns = functions(req.tools) if syntax is not None else []
         except ValueError as e:
             raise bad_request(str(e)) from None
-        ids, _ = await render(req.messages, req.chat_template_kwargs, media=True, tools=fns)
+        ids, _ = await render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort, media=True,
+                              tools=fns)
         return {"prompt": engine.model.tokenizer.decode_bytes(ids, special=True).decode("utf-8", errors="replace")}
 
     # ------------------------------------------------------------------

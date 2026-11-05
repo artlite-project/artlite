@@ -1,12 +1,16 @@
 """Qwen's tokenizer (models.tokenizer) against llama.cpp's llama-tokenize, on a file of each pre-tokenizer (qwen35:
-Qwen3.5-9B, qwen2: Qwen3 0.6B): essays, code, Unicode, special tokens, the chat template's prompts (no NPU)."""
+Qwen3.5-9B, qwen2: Qwen3 0.6B): essays, code, Unicode, special tokens, the chat template's prompts; a template in
+place of the file's and the template's variables (no NPU)."""
 
 import os
+from pathlib import Path
 
+import jinja2
 import pytest
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import qwen3_gguf, qwen_gguf
+from models.common import template_option
 from models.tokenizer import QwenTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
@@ -61,3 +65,43 @@ def test_chat_prompt(tok: tuple[str, object], thinking: bool) -> None:
     assert p == ("<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nFactorize x^2 + x - 6 = 0<|im_end|>\n"
                  "<|im_start|>assistant\n" + tail)
     assert t.encode(p) == llama_tokenize(path, p)
+
+
+def test_template_option(tmp_path: Path) -> None:
+    """--chat-template (the text) or --chat-template-file (a file's), checked by rendering a user message."""
+    template = "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}<assistant>{{ enable_thinking }}"
+    f = tmp_path / "t.jinja"
+    f.write_text(template)
+    assert template_option(None, str(f)) == template_option(template, None) == template
+    assert template_option(None, None) is None and template_option("", "") is None
+    for text, file, error in [(template, str(f), "give one"), ("{% if %}", None, "TemplateSyntaxError"),
+                              ("{{ raise_exception('no') }}", None, "no"), (None, str(tmp_path / "e"), "empty")]:
+        if file and not os.path.exists(file):
+            Path(file).write_text(" ")
+        with pytest.raises(ValueError, match=error):
+            template_option(text, file)
+    with pytest.raises(OSError):
+        template_option(None, str(tmp_path / "missing.jinja"))
+
+
+def test_chat_prompt_template() -> None:
+    """A template in place of the file's gets the model's variables (enable_thinking, ...), and the template's other
+    variables go over them: Qwen3.8's reasoning_effort (xhigh, medium, low; another level raises)."""
+    path = qwen3_gguf("0.6B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    template = "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}|{{ enable_thinking }}|{{ x }}"
+    assert chat_prompt(g, MESSAGES, template=template, enable_thinking=True) == \
+        "<system>You are terse.<user>Factorize x^2 + x - 6 = 0|True|"
+    assert chat_prompt(g, MESSAGES, template=template, x=3, enable_thinking=False).endswith("|False|3")
+    assert chat_prompt(g, MESSAGES, add_vision_id=True) == chat_prompt(g, MESSAGES)  # (a variable it does not use)
+    path = qwen_gguf("Q4_K_M", "3.8-27B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    assert "Reasoning effort is set to xhigh" in chat_prompt(g, MESSAGES, enable_thinking=True)
+    assert "Reasoning effort is set to low" in chat_prompt(g, MESSAGES, enable_thinking=True, reasoning_effort="low")
+    assert "Reasoning effort" not in chat_prompt(g, MESSAGES, reasoning_effort="low")  # (no thought)
+    with pytest.raises(jinja2.TemplateError, match="Unexpected reasoning effort high"):
+        chat_prompt(g, MESSAGES, enable_thinking=True, reasoning_effort="high")

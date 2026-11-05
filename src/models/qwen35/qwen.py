@@ -555,8 +555,10 @@ class Qwen(Model):
         return self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
-             tools: list[dict[str, object]] | None = None, preserve: bool = False) -> list[int] | Sequence:
-        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve)
+             tools: list[dict[str, object]] | None = None, preserve: bool = False,
+             variables: dict[str, object] | None = None) -> list[int] | Sequence:
+        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
+                           template=self.chat_template, **(variables or {}))
         images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
                   if isinstance(p, dict) and p.get("type") == "image"]
         if not images:
