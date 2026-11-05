@@ -74,7 +74,8 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
     (`prefill.attn.AttnOperator(window=)`) is DMA-bound (compute compiled out: 88-92% of its time), so skipping masked
     chunks' compute saves nothing; a pass streams a fixed window of cache groups ending at its own instead (no runtime
     parameters: a sequence reads at most 32), which caps a segment at `PACK_SPAN`. qwen35's
-    (`PrefillAttnOperator(pack=)`) streams as unpacked. Both take the rows' first / last keys on a stream (SEG, an
+    (`PrefillAttnOperator(pack=)`) streams as unpacked (its masks by vector compares against per-lane lo / hi: a
+    scalar loop building them had doubled a packed layer's time). Both take the rows' first / last keys on a stream (SEG, an
     object per pass in the values the memtile walk leaves in order) and mask the rest;
   - qwen35's GDN prep / scan (`pack=`): the mask PM per token, 1 + its distance from its segment's first token; d = -2
     marks that token (natural decays round to -1.0); the scan's reset is exact: the cut E terms are held at -1 and the
