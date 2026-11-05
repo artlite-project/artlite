@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from models.readouts import RankHead, Readouts, normalize, pool, pooling_of, rows_of
+from models.server.cache import common_prefix
 
 from .test_server import _stop_engines, app_of, chat, events, fake_row, make  # noqa: F401 (_stop_engines: autouse)
 
@@ -146,6 +147,32 @@ def test_rerank(rank: tuple) -> None:
     for body in ({"documents": docs}, {"query": "q", "documents": []}, {"query": "q", "documents": docs, "top_n": -1},
                  {"query": {"image": "x"}, "documents": docs}):
         assert client.post("/v1/reranking", json=body).status_code == 400, body
+
+
+def test_rerank_shared_query() -> None:
+    """A rerank request's documents after a long query (a model that rewinds): the query's prompt once (to the cache
+    group below where the prompts part), each document's rest after it, the same scores as each pair whole."""
+    import math as m
+
+    query = " ".join(f"q{i}" for i in range(40))
+    docs = ["alpha", "beta gamma", "delta", "epsilon zeta eta"]
+    for share in (False, True):
+        for model, npu, client in client_of(embedding=True, pooling="rank", readouts=Readouts(
+                pooling="rank", head=HEAD, rerank_template="{query}<|system|>{document}")):
+            if share:  # (a chunk costs 10 ms and 0.1 ms a token: the query's run once pays)
+                npu.prompt_seconds = lambda n, position=0: 0.01 * m.ceil(n / 8) + 1e-4 * n
+            npu.calls.clear()
+            res = client.post("/v1/rerank", json={"query": query, "documents": docs}).json()["results"]
+            prompts = [model.tokenizer.encode(f"{query}<|system|>{d}") for d in docs]
+            want = {i: HEAD.score(fake_row(ids)) for i, ids in enumerate(prompts)}
+            assert all(m.isclose(e["relevance_score"], want[e["index"]], rel_tol=1e-6) for e in res)
+            runs = [c[1] for c in npu.calls if c[0] == "outputs"]
+            if share:
+                p = min(common_prefix(prompts[0], ids) for ids in prompts[1:])
+                p -= p % npu.group
+                assert runs == [p] + [len(ids) - p for ids in prompts], runs
+            else:
+                assert len(runs) == len(docs), runs
 
 
 def test_classify(rank: tuple) -> None:

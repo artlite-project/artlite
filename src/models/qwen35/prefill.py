@@ -37,6 +37,14 @@ Chunks start at multiples of 32 positions (whole cache groups) with at least 3 v
 last three); the padding tokens after the valid ones leave the GDN states alone and write cache records that later
 tokens overwrite. A non-causal model's prompt (``QwenConfig.causal``: vllm-d3) is one chunk at position 0, its
 attention over all of its tokens (``attn_prefill.PrefillAttnOperator``'s non-causal design).
+
+A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
+a chunk at position 0, each from a state of its own. The operators that keep them apart: GdnPrep / GdnScan's packed
+variants (the mask PM per token: 1 + its distance from its segment's first token; the state reset there exactly, a
+segment's first three tokens' convs from its first token on), the packed attention (each row its segment's keys: up to
+itself, or all of them non-causal; ``SEG``); every other operator works row by row. Each token's rotary position counts
+from its segment's start (the overlay's rope rows: the chunk's cos / sin rows past the text positions, ``_cs_row``).
+The chunk leaves no sequence in the caches and states.
 """
 
 import functools
@@ -95,10 +103,10 @@ class QwenPrefill(ChunkPrefill):
     SUB, SMALL, MAX_T, MIN_TOKENS, NAME = SUB, SMALL, MAX_T, 3, "qwen_prefill"
 
     def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None, draft: object = None,
-                 dflash: object = None, precise: bool = False):
+                 dflash: object = None, precise: bool = False, pack: bool = False):
         """draft, dflash: an MTP drafter, a DFlash2 drafter whose records a chunk writes; precise: the attention's P as
         hi + lo panels (``attn_prefill.PrefillAttnOperator``'s ``pp``; d3-lite's attention error 9e-3 -> 4e-3, the
-        output's own rounding: the readout models)."""
+        output's own rounding: the readout models); pack: packed chunks of every size (``run_packed``)."""
         default = MOE_SIZES if overlay.cfg.moe else SIZES
         super().__init__(overlay, sizes or default)
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
@@ -133,6 +141,12 @@ class QwenPrefill(ChunkPrefill):
         self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
                                                pp=2 if precise else 1)
                      for T in self.sizes} if self.att else {}
+        pack = pack and not cfg.moe and draft is None and dflash is None  # (a dense model's prefill alone)
+        self.pack_sizes = self.sizes if pack else ()
+        self.span = self.sizes[-1] if pack else 0  # (the attention streams a packed chunk whole: any input that fits)
+        self.pattn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
+                                                pp=2 if precise else 1, pack=True)
+                      for T in self.pack_sizes} if self.att else {}
         self._starts: dict[int, list[int]] = {}
         self._rows()
         self._library()
@@ -195,10 +209,13 @@ class QwenPrefill(ChunkPrefill):
             self._ops[key] = cls(**args)
         return self._ops[key]
 
-    def _gdn_ops(self, lay: PG.Layout, T: int) -> tuple[GP.GdnPrepOperator, GP.GdnScanOperator, GP.GdnOutOperator]:
-        """(the scan over the chunk of T tokens in one call: the states read and written once)"""
+    def _gdn_ops(self, lay: PG.Layout, T: int, packed: bool = False
+                 ) -> tuple[GP.GdnPrepOperator, GP.GdnScanOperator, GP.GdnOutOperator]:
+        """(the scan over the chunk of T tokens in one call: the states read and written once; ``packed``: the packed
+        variants)"""
         t = self._t(T)
-        return (self._op(GP.GdnPrepOperator, lay, T=t), self._op(GP.GdnScanOperator, lay, T=T, sub=t),
+        pk = {"pack": True} if packed else {}
+        return (self._op(GP.GdnPrepOperator, lay, T=t, **pk), self._op(GP.GdnScanOperator, lay, T=T, sub=t, **pk),
                 self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF, gc_rows=self.max_t))
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
@@ -237,9 +254,9 @@ class QwenPrefill(ChunkPrefill):
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
 
-    def _runlist_of(self, T: int) -> list[tuple]:
+    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
         """(sub-chunks of ``_t`` tokens: a ``SMALL`` size one of its own operators; the layers' first items in
-        ``_starts``)"""
+        ``_starts``; ``packed``: the packed GDN and attention operators, the segments in SEG)"""
         ov, cfg, sl = self.ov, self.cfg, self._sl
         t = self._t(T)
         S, o = T // t, self.sz[t]
@@ -264,7 +281,7 @@ class QwenPrefill(ChunkPrefill):
             rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("G", j, g.op, i=2, row=g_rb))
                    for g in p_in.gemms for j in range(S)]
             if cfg.attention[L]:
-                prep, attn = self._prep(p_in.layout, T), self.attn[T]
+                prep, attn = self._prep(p_in.layout, T), (self.pattn if packed else self.attn)[T]
                 kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
                 qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots: QS pass-major)
@@ -272,9 +289,10 @@ class QwenPrefill(ChunkPrefill):
                 rl += [(prep, tok("G", j, prep, i=0, row=g_rb), sl("PCS", j * t * 256, prep, i=1), qn,
                         sl("QS", j * t // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")
                        for j in range(S)]
-                rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2)))
+                rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2),
+                           *([sl("SEG", 0, attn, i=3)] if packed else [])))
             else:
-                gprep, scan, gout = self._gdn_ops(p_in.layout, T)
+                gprep, scan, gout = self._gdn_ops(p_in.layout, T, packed)
                 i = self.gdn.index(L)
                 pp = f"PP[{self.pp_off[L]}:{self.pp_off[L] + self.n_p}]"
                 gh = f"GHDR[{ov.ghdr[L]}:{ov.ghdr[L] + gout.ghdr_bytes}]"
@@ -282,7 +300,8 @@ class QwenPrefill(ChunkPrefill):
                 cv = [sl("CVL", 3 * i * g_rb, gprep, i=1)] + [sl("G", (j * t - 3) * g_rb, gprep, i=1)
                                                               for j in range(1, S)]
                 pr = arg_bytes(gprep, 4)  # (a sub-chunk's records)
-                rl += [(gprep, tok("G", j, gprep, i=0, row=g_rb), cv[j], pp, sl("PM", j * t * 4, gprep, i=3),
+                pm = arg_bytes(gprep, 3) if packed else 4 * t  # (packed: an object per sub-chunk, GdnPrep.mask)
+                rl += [(gprep, tok("G", j, gprep, i=0, row=g_rb), cv[j], pp, sl("PM", j * pm, gprep, i=3),
                         sl("PR", j * pr, gprep, i=4)) for j in range(S)]
                 rl.append((scan, sl("PR", 0, scan, i=0), tok("G", 0, scan, i=1, row=g_rb),
                            sl("CVL", 3 * i * g_rb, scan, i=2), pp, gs, tok("O", 0, scan, i=5, row=self.rb_o)))
@@ -482,6 +501,43 @@ class QwenPrefill(ChunkPrefill):
             self.dp.after(dev, n)
         if self.fp is not None:
             self.fp.after(p0, n, T)
+
+    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
+        """A packed chunk of size T at position 0 (default: the smallest of ``pack_sizes`` that holds x): x (n, hidden)
+        the segments' first layer input rows back to back, ``pos`` (n,) their text positions, ``lo`` (n,) per token its
+        segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``); the caches and
+        states hold no sequence after it."""
+        n, dev = x.shape[0], self.ov.dev
+        T = T or next(t for t in self.pack_sizes if t >= n)
+        assert p0 == 0 and T in self.pack_sizes and (lo <= np.arange(n)).all(), "a packed chunk at position 0"
+        self._size(n, p0, T)
+        px = torch.from_numpy(dev.view("PX")[:2 * T * self.H]).view(torch.bfloat16).view(T, self.H)
+        px[:n] = x.bfloat16()
+        px[n:] = 0
+        dev.flush("PX", 0, 2 * T * self.H)
+        if self.gdn:
+            m = GP.GdnPrepOperator.mask(n, T, lo, self._t(T))
+            dev.view("PM").view(np.float32)[:m.size] = m
+            dev.flush("PM", 0, 4 * m.size)
+            self.ov.conv_fresh()
+            self._conv_zero()
+        cs_row = None
+        if self.att:
+            self.ov.rope[:n] = np.asarray(pos, np.int64)[:, None]
+            cs_row = self._cs_row(0, n)
+            ends = np.r_[lo[1:] != lo[:-1], True]  # (a segment's last token)
+            last = np.minimum.accumulate(np.where(ends, np.arange(n), n)[::-1])[::-1]
+            i = np.arange(T)
+            lo_t, hi_t = i.copy(), i.copy()  # (padding: itself)
+            lo_t[:n], hi_t[:n] = lo, (np.arange(n) if self.cfg.causal else last)
+            seg = self.pattn[T].seg(lo_t, hi_t)
+            dev.view("SEG")[:seg.size] = seg
+            dev.flush("SEG", 0, seg.size)
+        self._launch(T, 0, self.params(T, 0, n, cs_row), packed=True)
+
+    def packed_seconds(self, T: int, p0: int) -> float:
+        """(a chunk's: its attention streams every pass's groups as an unpacked one's)"""
+        return self.chunk_seconds(T, p0)
 
     def _splits(self, T: int, p0: int) -> list[int]:
         """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""

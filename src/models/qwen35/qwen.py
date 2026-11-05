@@ -83,9 +83,10 @@ class NpuQwen(OverlayModel):
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = "",
-                 dflash: str | None = None, precise: bool = False):
-        """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); precise: the prefill's precise
-        variants (``QwenPrefill``'s: a readout model, ``models.readouts.readout_model``)."""
+                 dflash: str | None = None, readout: bool = False):
+        """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); readout: a readout model
+        (``models.readouts.readout_model``): the prefill's precise variants and packed chunks (``QwenPrefill``'s
+        ``precise``, ``pack``)."""
         self.gguf = gguf
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
@@ -110,7 +111,7 @@ class NpuQwen(OverlayModel):
         self._inj: tuple[int, int, int, list[int] | None] | None = None
         self._sib: list[int] | None = None  # (the round's sibling branch: ``_sibling``)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
-                                   dflash=self.dflash, precise=precise) if prefill else None
+                                   dflash=self.dflash, precise=readout, pack=readout) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
             self.overlay.load(threads=threads)
@@ -575,5 +576,5 @@ class Qwen(Model):
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
         self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, dflash=self.dflash,
-                            precise=readout_model(self.gguf.meta, self.gguf.arch))
+                            readout=readout_model(self.gguf.meta, self.gguf.arch))
         return self._npu

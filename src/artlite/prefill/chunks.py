@@ -87,6 +87,7 @@ class ChunkPrefill:
         self.rb: dict[str, int] = {}  # (bytes per token of the token buffers)
         self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
         self.span = 0  # (a packed chunk's longest segment)
+        self._est: dict[tuple, float] = {}  # (the planner's estimates by (kind, tokens or size, position))
         self._items: dict[int | tuple[str, int], list] = {}
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
@@ -242,7 +243,12 @@ class ChunkPrefill:
 
     def fits(self, T: int, p0: int) -> bool:
         """Whether a chunk of size T may start at p0: inside the caches, within the budget (``_fits_budget``)."""
-        return p0 % self.group == 0 and p0 + T <= self.ov.max_positions and self._fits_budget(T, p0)
+        if p0 % self.group or p0 + T > self.ov.max_positions:
+            return False
+        key = ("fits", T, p0, self.pace)
+        if key not in self._est:
+            self._est[key] = self._fits_budget(T, p0)
+        return self._est[key]
 
     def _fits_budget(self, T: int, p0: int) -> bool:
         """Whether a chunk of size T at p0 runs in pieces within PIECE_BUDGET_S (one layer each at least)."""
@@ -277,11 +283,14 @@ class ChunkPrefill:
 
     def alone_seconds(self, n: int, p0: int) -> float:
         """Estimated time of an input of n tokens at p0 alone: its chunks (``plan`` of a readout)."""
-        out = 0.0
-        for T in self.plan(p0, n, steps=False):
-            out += self.chunk_seconds(T, p0)
-            p0 += T
-        return out
+        key = ("alone", n, p0)
+        if key not in self._est:
+            out, p = 0.0, p0
+            for T in self.plan(p0, n, steps=False):
+                out += self.chunk_seconds(T, p)
+                p += T
+            self._est[key] = out
+        return self._est[key]
 
     def pack(self, lengths: Sequence[int], p0: int) -> Packing:
         """How inputs of ``lengths`` tokens after p0 (the caches' prefix every one of them continues) run (module
@@ -290,7 +299,6 @@ class ChunkPrefill:
         if p0 % self.group or not self.pack_sizes:
             return Packing(alone=list(range(len(lengths))), seconds=sum(alone), sequential=sum(alone))
         sizes = tuple(T for T in self.pack_sizes if self.fits(T, p0))
-        cost: dict[int, float] = {}
 
         def best(idx: list[int], caps: tuple[int, ...]) -> tuple[float, list[tuple[int, list[int]]]]:
             """The least estimated time of the inputs idx (packable) in chunks of the sizes caps, and their chunks:
@@ -309,9 +317,11 @@ class ChunkPrefill:
                 t, plan = 0.0, []
                 for b, f in zip(bins, fill, strict=True):
                     T = next(T for T in sizes if T >= f)
-                    if T not in cost:
-                        cost[T] = self.packed_seconds(T, p0)
-                    options = [(sum(alone[i] for i in b), [])] + ([(cost[T], [(T, sorted(b))])] if len(b) > 1 else [])
+                    if ("packed", T, p0) not in self._est:
+                        self._est["packed", T, p0] = self.packed_seconds(T, p0)
+                    options = [(sum(alone[i] for i in b), [])]
+                    if len(b) > 1 and f >= self.MIN_TOKENS:
+                        options.append((self._est["packed", T, p0], [(T, sorted(b))]))
                     if len(b) > 1 and T > sizes[0]:
                         options.append(best(b, tuple(c for c in sizes if c < T)))
                     tb, pb = min(options, key=lambda o: o[0])
@@ -365,7 +375,10 @@ class ChunkPrefill:
 
     def chunk_seconds(self, T: int, p0: int) -> float:
         """Estimated time of a chunk of size T at p0."""
-        return sum(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers)
+        key = ("chunk", T, p0)
+        if key not in self._est:
+            self._est[key] = sum(self.layer_seconds(L, p0, self.subs(T)) for L in self.layers)
+        return self._est[key]
 
     def packed_seconds(self, T: int, p0: int) -> float:
         """Estimated time of a packed chunk of size T at p0."""

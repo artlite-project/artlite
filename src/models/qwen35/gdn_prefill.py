@@ -174,6 +174,23 @@ __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const
         }
     }
 }
+{% if PACK %}
+
+// Token t of the 8 again from tap k0 on (rows t + k0 .. t + 3 of r: the rows before its segment's first token left
+// out, the zeros a sequence's first tokens see), in conv8's order
+__attribute__((noinline)) void {{ p }}_conv1(const bfloat16 *__restrict r, const bfloat16 *__restrict w,
+                                           bfloat16 *__restrict y, int t, int k0)
+{
+    for (int c = 0; c < 128; c += 32) {
+        aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+        for (int k = k0; k < 4; k++) {
+            const aie::vector<bfloat16, 32> xk = aie::load_v<32>(r + 128 * (t + k) + c);
+            acc = aie::mac(aie::mac(acc, xk, aie::load_v<32>(w + 256 * k + c)), xk, aie::load_v<32>(w + 256 * k + 128 + c));
+        }
+        aie::store_v(y + 128 * t + c, acc.template to_vector<bfloat16>());
+    }
+}
+{% endif %}
 
 // The 8 tokens' rows ys [8][128] (bf16) l2-normalized, times sc (q: 1 / sqrt(D), the scores' scale), as fp32 in the
 // panel order xf [ib 16][t 8][i 8]: x 1 / sqrt(sum x^2 + eps) as two bf16 products (the scale's hi and lo)
@@ -226,16 +243,25 @@ __attribute__((noinline)) void {{ p }}_panels(const float *__restrict xf, uint8_
     }
 }
 
-// The 8 tokens' window, conv, SiLU and panels (b: their raw rows [8][128]; the record's slot of the token block)
+// The 8 tokens' window, conv, SiLU and panels (b: their raw rows [8][128]; the record's slot of the token block{% if PACK %};
+// m: their mask values, a segment's first three tokens' convs again from its first token on{% endif %})
 template <bool Q>
 [[clang::always_inline]] inline void {{ p }}_block(const bfloat16 *__restrict b, int32_t *__restrict ws,
-                                                   uint8_t *__restrict out)
+                                                   uint8_t *__restrict out{% if PACK %}, const float *__restrict m{% endif %})
 {
     bfloat16 *__restrict r = SW(bfloat16, {{ w.rows }});
     al::copy<{{ 8 * 128 }}, 64>(r + {{ 3 * 128 }}, b);
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
     bfloat16 *__restrict ys = SW(bfloat16, {{ w.ys }});
     {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc);
+{% if PACK %}
+    for (int t = 0; t < 8; t++) {  // (m: 1 + the token's distance from its segment's first token, 4 from 3 on; 0 padding)
+        const int32_t v = ((const int32_t *)m)[t];  // (its fp32 bits: 1, 2, 3 -> the taps from 3, 2, 1)
+        const int k0 = v == 0x3F800000 ? 3 : v == 0x40000000 ? 2 : v == 0x40400000 ? 1 : 0;
+        if (k0)
+            {{ p }}_conv1(r, SW(bfloat16, {{ w.wc }}), yc, t, k0);
+    }
+{% endif %}
     {{ silu }}<{{ 8 * 128 }}>(yc, ys);
     al::copy<{{ 3 * 128 }}, 32>(r, r + {{ 8 * 128 }});  // (the last 3 tokens: the next block's window)
     {{ p }}_l2rows<Q>(ys, SW(float, {{ w.xf }}));
@@ -247,8 +273,9 @@ template <bool Q>
 extern "C" {
 
 // The first objects (q core: k = 0 the q conv weights ([tap][hi, lo][128]) then the gate parameters (dt, ssm_a of the
-// k head's v heads: fp32 [16] each); k = 1 the conv state rows (12 read, 3 used); k = 2 the token mask (fp32 [T]: 1
-// a valid token, 0 padding))
+// k head's v heads: fp32 [16] each); k = 1 the conv state rows (12 read, 3 used); k = 2 the token mask (fp32 [T]: {% if PACK %}0
+// padding, else 1 + the token's distance from its segment's first token, 4 from 3 on{% else %}1
+// a valid token, 0 padding{% endif %}))
 void {{ p }}_qinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t k)
 {
     if (k == 0) {
@@ -261,13 +288,17 @@ void {{ p }}_qinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t
     }
 }
 
-// (k core: the k conv weights, the conv state rows; the mask object is not its)
+// (k core: the k conv weights, the conv state rows{% if PACK %}, the token mask{% else %}; the mask object is not its{% endif %})
 void {{ p }}_kinit(const bfloat16 *__restrict b, int32_t *__restrict ws, int32_t k)
 {
     if (k == 0)
         al::copy<{{ 8 * 128 }}, 64>(SW(bfloat16, {{ w.wc }}), b);
     else if (k == 1)
         al::copy<{{ 3 * 128 }}, 64>(SW(bfloat16, {{ w.rows }}), b);
+{% if PACK %}
+    else
+        al::copy<{{ T }}, 16>(SW(float, {{ w.mask }}), (const float *)b);
+{% endif %}
 }
 
 // Token block tb of chunk i (k core): b = its k rows [8][128] -> the K panels of the record (out: [ib][tb][hi, lo])
@@ -275,22 +306,29 @@ void {{ p }}_kblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
                     int32_t tb)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb);
+    {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if PACK %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
 }
 
 // Token block tb of chunk i (q core): b = [ab slot 8 x 64 ({{ "alpha HC fp32 | beta HC bf16" if F32A else "alpha HC | beta HC bf16" }}) | q rows 8 x 128] -> the Q panels
 // and the gates of the k head's v heads h = kh + 2 hh: d = expm1(ssm_a softplus(alpha + dt)), beta = sigmoid(beta),
 // times the mask, at the record's [hh][d 16 | beta 16] (fp32: the block's 8 tokens at 8 tb); two heads per call
-// (lanes [head 2][the 8 tokens])
+// (lanes [head 2][the 8 tokens]){% if PACK %}; packed: the mask's token valid, d = -2 at a segment's first token (the scan's
+// reset there){% endif +%}
 void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat16 *__restrict out, int32_t kh,
                     int32_t i, int32_t tb)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_block<true>(b + 512, ws, (uint8_t *)out + {{ 2 * PAN }} * tb);
+    {{ p }}_block<true>(b + 512, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if PACK %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
     const float *__restrict gp = SW(float, {{ w.gp }});
     // (8 lanes, 32 B: a 64-B load at an odd block's 32-B offset would round the address down)
     const aie::vector<float, 8> m8 = aie::load_v<8>(SW(float, {{ w.mask }}) + 16 * i + 8 * tb);
+{% if PACK %}
+    const aie::vector<float, 16> mv = aie::concat(m8, m8);
+    const aie::vector<float, 16> m = aie::min(mv, aie::broadcast<float, 16>(1.0f));
+    const aie::mask<16> first = aie::eq(mv, aie::broadcast<float, 16>(1.0f));
+{% else %}
     const aie::vector<float, 16> m = aie::concat(m8, m8);
+{% endif %}
     float *__restrict gt = (float *)((uint8_t *)out + {{ KP_BYTES }}) + 8 * tb;
     const uint16_t *__restrict ab = (const uint16_t *)b;
 {% for hp in range((VH + 1) // 2) %}
@@ -314,8 +352,8 @@ void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
         }
         const aie::vector<float, 16> sp = {{ gm.softplus }}(
             aie::add(ai.template cast_to<float>(), aie::concat(aie::broadcast<float, 8>(gp[{{ 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ h1 }}]))));
-        const aie::vector<float, 16> d = al::mulff<16>(
-            {{ gm.expm1 }}(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[{{ 16 + 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ 16 + h1 }}])))), m);
+        const aie::vector<float, 16> d = {% if PACK %}aie::select({% endif %}al::mulff<16>(
+            {{ gm.expm1 }}(al::mulff<16>(sp, aie::concat(aie::broadcast<float, 8>(gp[{{ 16 + 2 * hp }}]), aie::broadcast<float, 8>(gp[{{ 16 + h1 }}])))), m){% if PACK %}, aie::broadcast<float, 16>(-2.0f), first){% endif %};
         const aie::vector<float, 16> be = al::mulff<16>({{ gm.sigmoid }}(bi.template cast_to<float>()), m);
         aie::store_v(gt + {{ 64 * hp }}, d.template extract<8>(0));
         aie::store_v(gt + {{ 64 * hp + 16 }}, be.template extract<8>(0));
@@ -338,16 +376,23 @@ class GdnPrepOperator(ArtcOperator):
     mask. The memtile splits each input object between the two and joins their parts of a chunk's record (``JOBJ``).
     Runtime sequence: G (gdn_in's output, ``layout``), CV (``CV_ROWS`` rows of G's layout: the conv state in rows 0 ..
     2), P (``scan_params``), M (fp32 per token: 1 valid, 0 padding; ``MASK_ELEMS`` bf16 read), PR (the records:
-    [column][k head][chunk])."""
+    [column][k head][chunk]).
+
+    Packed (``pack``: several inputs, segments, in the chunk; ``mask``): M holds per token 0 (padding) or 1 + its
+    distance from its segment's first token (4 from 3 on), twice: from its start (the q core's part of the object) and
+    from ``K_MASK`` (the k core's): a segment's first three tokens' convs again from its first token on (the zeros a
+    sequence's first tokens see: their outputs as the segment's alone), d = -2 at its first token
+    (``GdnScanOperator``'s reset there)."""
 
     STACK = 5120
     CV_ROWS = 12  # rows of CV read (the q part's 12 rows, the k part's 8: 3 used)
     MASK_ELEMS = B_ELEMS  # bf16 of the mask argument (an object; T fp32 used)
+    K_MASK = QB_ELEMS // 2  # (packed: the fp32 of the mask's second copy, the k core's part of the object)
     pfx = kernel_prefix("gdp")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout):
+    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False):
         assert T % C == 0 and T // 8 <= 64 and 4 * T <= 2 * QB_ELEMS
-        self.T, self.cfg, self.layout = T, cfg, layout
+        self.T, self.cfg, self.layout, self.pack = T, cfg, layout, pack
         self.sh = GD.GdnShape(cfg)
         self.hc = self.sh.hc
         self.vh = self.hc // 2
@@ -366,7 +411,20 @@ class GdnPrepOperator(ArtcOperator):
         return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, w=Attr(self.workspace()), D=D, HC=self.hc,
                             F32A=ab_f32(self.layout),
                             VH=self.vh, T=self.T, PAN=PAN, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
-                            rs=bf16_hilo(1 / math.sqrt(D)))
+                            rs=bf16_hilo(1 / math.sqrt(D)), PACK=self.pack)
+
+    @staticmethod
+    def mask(n: int, T: int, lo: np.ndarray | None = None, t: int = 0) -> np.ndarray:
+        """M (fp32 [T]) of a chunk of n valid tokens: 1 each, 0 the padding; packed (``lo``: per token its segment's
+        first one), 1 + the distance from it up to 4, per call of ``t`` tokens its object ([MASK_ELEMS / 2] fp32: the
+        values at 0 and at ``K_MASK``)."""
+        out = np.zeros(T, np.float32)
+        out[:n] = 1 if lo is None else 1 + np.minimum(np.arange(n) - lo, 3)
+        if lo is None:
+            return out
+        obj = np.zeros((T // t, GdnPrepOperator.MASK_ELEMS // 2), np.float32)
+        obj[:, :t] = obj[:, GdnPrepOperator.K_MASK:GdnPrepOperator.K_MASK + t] = out.reshape(-1, t)
+        return obj.reshape(-1)
 
     @property
     def jobj(self) -> int:
@@ -489,9 +547,10 @@ namespace {
 {% set silu = km.act(km.SILU) %}
 {{ silu.src }}
 // y[t][0 .. 32) = bf16(sum over the taps of w (hi + lo) x) of 8 tokens t: x rows t .. t + 3 of r (pitch 32: the
-// window's 3 rows, then the tokens'), w [tap 4][hi, lo][32]
+// window's 3 rows, then the tokens'), w [tap 4][hi, lo][32]{% if PACK %}; a tap before the token's segment's first token
+// a zero row (dist: the tokens' distances from it, 3 from 3 on: the zeros a sequence's first tokens see){% endif +%}
 __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const bfloat16 *__restrict w,
-                                           bfloat16 *__restrict y)
+                                           bfloat16 *__restrict y{% if PACK %}, const int32_t *__restrict dist{% endif %})
 {
     aie::vector<bfloat16, 32> wh[4], wl[4];
     AIE_LOOP_UNROLL_FULL
@@ -504,9 +563,17 @@ __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int t = 0; t < 8; t++) {
         aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+{% if PACK %}
+        const int k0 = 3 - dist[t];
+{% endif %}
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 4; k++) {
+{% if PACK %}
+            const aie::vector<bfloat16, 32> xk = aie::select(aie::load_v<32>(pr + 32 * k), aie::zeros<bfloat16, 32>(),
+                                                             aie::mask<32>::from_uint32(k < k0 ? ~0u : 0u));
+{% else %}
             const aie::vector<bfloat16, 32> xk = aie::load_v<32>(pr + 32 * k);
+{% endif %}
             acc = aie::mac(aie::mac(acc, xk, wh[k]), xk, wl[k]);
         }
         aie::store_v(py, acc.template to_vector<bfloat16>());
@@ -514,6 +581,73 @@ __attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const
         py += 32;
     }
 }
+{% if PACK %}
+
+// A lane mask of two words (``cuts``)
+[[clang::always_inline]] inline aie::mask<64> {{ p }}_lanes(const int32_t *__restrict w)
+{
+    return aie::mask<64>::from_uint64((uint64_t)(uint32_t)w[1] << 32 | (uint32_t)w[0]);
+}
+
+// A chunk whose tokens of the bits sb are segments' first (E[t][s] of s < u <= t, u such a token, cut): st[0 ..] the
+// tokens' distances from their segments' first (3 from 3 on; the last's carried in st[16]), st[17] any (Gamma_C 0:
+// the state zeroed); as lane masks (two words each) of the 8 x 8 blocks [j 8][t 8], [18 ..] per token block the tokens
+// of Gamma 0 (from the first on), [22 ..] those of E15 cut (before the last); [26 ..] the pairs of the blocks 00, 10,
+// 11 (lane 8 t + s: s below t's latest first token)
+__attribute__((noinline, minsize)) void {{ p }}_cuts(unsigned sb, int32_t *__restrict st)
+{
+    for (int i = 18; i < 32; i++)
+        st[i] = 0;
+    int h = -1, n = st[16];
+    unsigned gz = 0, ez = 0;
+    for (int t = 0; t < 16; t++) {
+        n = (sb >> t) & 1u ? 0 : n < 3 ? n + 1 : 3;
+        st[t] = n;
+        if ((sb >> t) & 1u) {
+            h = t;
+            ez = (1u << t) - 1u;
+        }
+        gz |= (h >= 0 ? 1u : 0u) << t;
+        const uint32_t lo = h > 0 ? (1u << (h < 8 ? h : 8)) - 1u : 0u, hi = h > 8 ? (1u << (h - 8)) - 1u : 0u;
+        const int sh = 8 * (t & 3), k = t >> 2;  // (row t's byte of its block's words)
+        st[26 + k] |= lo << sh;
+        if (t >= 8)
+            st[28 + k] |= hi << sh;
+    }
+    st[16] = n;
+    st[17] = sb != 0;
+    for (int b = 0; b < 2; b++) {  // (a token block's 8 bits in every j row)
+        st[18 + 2 * b] = st[19 + 2 * b] = ((gz >> (8 * b)) & 0xFFu) * 0x01010101u;
+        st[22 + 2 * b] = st[23 + 2 * b] = ((ez >> (8 * b)) & 0xFFu) * 0x01010101u;
+    }
+}
+
+// X^T, Y^T of a j-block (xy: [X tb 0 | X tb 1 | Y tb 0 | Y tb 1]) zero for the tokens of Gamma 0 (S0's terms gone
+// exactly: mulff's products of bf16 hi and lo parts would leave x's low bits in x + (Gamma - 1) x)
+__attribute__((noinline, minsize)) void {{ p }}_xyz(float *__restrict xy, const int32_t *__restrict st)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < 4; b++)
+        aie::store_v(xy + 64 * b, aie::select(aie::load_v<64>(xy + 64 * b), aie::zeros<float, 64>(), {{ p }}_lanes(st + 18 + 2 * (b & 1))));
+}
+
+// U^T of a j-block's token blocks (u: [tb 2][64]) zero for the tokens of E15 cut (their terms of the state gone)
+__attribute__((noinline, minsize)) void {{ p }}_uz(float *__restrict u, const int32_t *__restrict st)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < 2; b++)
+        aie::store_v(u + 64 * b, aie::select(aie::load_v<64>(u + 64 * b), aie::zeros<float, 64>(), {{ p }}_lanes(st + 22 + 2 * b)));
+}
+
+// The state quarter zeroed (a segment's first token in the chunk: Gamma_C = 0)
+__attribute__((noinline, minsize)) void {{ p }}_szero(float *__restrict S)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ 4 * 1024 }}; i += 64)
+        aie::store_v(S + i, aie::zeros<float, 64>());
+}
+
+{% endif %}
 
 // lanes [0, N / 2) = a, [N / 2, N) = b (two broadcasts and a select: a concat of half-width broadcasts pushes lane by
 // lane)
@@ -611,7 +745,9 @@ __attribute__((noinline)) void {{ p }}_gram(const uint8_t *__restrict kp, const 
 // by 8 steps on 32 lanes: block 0 (rows 0 .. 7) its columns 0 .. 7 at lanes 0 .. 7, the chunk's start (s = -1) at lane
 // 8; block 1 (rows 8 .. 15) its columns 8 .. 15 at lanes 16 .. 23, its start (s = 7) at lane 24 (er: [row k][32]).
 // Out: ed = E00, E10, E11 ([t][s] fp32); per token block tb fv [tb][beta | Es = Gamma - 1 | E15 = Gamma_C / Gamma - 1]
-// (64 lanes: the 8 tokens' values over the j rows); dc = Gamma_C - 1 as bf16 hi [64], lo [64]
+// (64 lanes: the 8 tokens' values over the j rows); dc = Gamma_C - 1 as bf16 hi [64], lo [64]{% if PACK %}. Packed: d = -2 a
+// segment's first token u: E[t][s] of every s < u <= t is cut (its decay 0); a lane depends on its own decays only, so
+// every other one comes out as unpacked, and the cut ones' products are zeroed where they are used (``cuts``){% endif +%}
 __attribute__((noinline)) void {{ p }}_decays(const float *__restrict gt, float *__restrict er, float *__restrict ed,
                                             float *__restrict fv, bfloat16 *__restrict dc)
 {
@@ -681,7 +817,8 @@ __attribute__((noinline)) void {{ p }}_decays(const float *__restrict gt, float 
 // and ed ([E00 | E10 | E11]): L00, L11 as bf16 hi, lo (lb: [hi | lo][block 2][t][s]) and the panels (hi, lo) of -L10,
 // M00, M10, M11 at pn + 2, 6, 8, 10 panels (rolled over the blocks: program memory)
 __attribute__((noinline)) void {{ p }}_lm(const float *__restrict gt, const float *__restrict g,
-                                        const float *__restrict ed, bfloat16 *__restrict lb, uint8_t *__restrict pn)
+                                        const float *__restrict ed, bfloat16 *__restrict lb, uint8_t *__restrict pn{% if PACK %},
+                                        const int32_t *__restrict st{% endif %})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const al::BV nI = al::neg_eye();
@@ -689,7 +826,14 @@ __attribute__((noinline)) void {{ p }}_lm(const float *__restrict gt, const floa
     for (int b = 0; b < 3; b++) {  // (block b: 00, 10, 11; its rows' token block b > 0)
         const aie::vector<float, 64> kk = aie::load_v<64>(g + 64 * b), q = aie::load_v<64>(g + 192 + 64 * b);
         const aie::vector<float, 64> e = aie::load_v<64>(ed + 64 * b);
+{% if PACK %}
+        // (the pairs across a segment's first token: ``cuts``)
+        const aie::mask<64> cut = {{ p }}_lanes(st + 26 + 2 * b);
+        const aie::vector<float, 64> l = aie::select(al::mulff<64>(al::bcast8(aie::load_v<8>(gt + 16 + 8 * (b > 0))),
+                                                                   aie::add(kk, al::mulff<64>(e, kk))), aie::zeros<float, 64>(), cut);
+{% else %}
         const aie::vector<float, 64> l = al::mulff<64>(al::bcast8(aie::load_v<8>(gt + 16 + 8 * (b > 0))), aie::add(kk, al::mulff<64>(e, kk)));
+{% endif %}
         const bool diag = b != 1;
         const aie::mask<64> strict = aie::mask<64>::from_uint64(diag ? 0x{{ strict }}ull : ~0ull);
         const aie::mask<64> lower = aie::mask<64>::from_uint64(diag ? 0x{{ lower }}ull : ~0ull);
@@ -700,8 +844,13 @@ __attribute__((noinline)) void {{ p }}_lm(const float *__restrict gt, const floa
             aie::store_v(lb + 128 + 32 * b, lo);
         } else
             {{ p }}_push2(aie::accum<accfloat, 64>(aie::sub(aie::zeros<float, 64>(), l)), nI, pn + {{ 2 * PAN }});
+{% if PACK %}
+        {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower & ~cut)), nI,
+                      pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
+{% else %}
         {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower)), nI,
                       pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
+{% endif %}
     }
 }
 
@@ -829,7 +978,8 @@ __attribute__((noinline)) void {{ p }}_decay(const float *__restrict si, float *
 // through memory, a frame of 64-lane vectors would not fit the stack)
 __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const bfloat16 *__restrict vt,
                                            const float *__restrict fv, const uint8_t *__restrict pn,
-                                           bfloat16 *__restrict o, uint8_t *__restrict up, float *__restrict sw)
+                                           bfloat16 *__restrict o, uint8_t *__restrict up, float *__restrict sw{% if PACK %},
+                                           const int32_t *__restrict st{% endif %})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const al::BV nI = al::neg_eye();
@@ -898,6 +1048,9 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
             for (int t = 0; t < 8; t++)
                 aie::store_v(o + 256 + 32 * t, a.template extract<8>(t));
         }
+{% if PACK %}
+        {{ p }}_uz(uf0, st);  // (uf0, uf1 adjacent)
+{% endif %}
         {
             const aie::vector<float, 64> u = aie::load_v<64>(uf0);
             {{ p }}_push2(aie::accum<accfloat, 64>(aie::add(u, al::mulff<64>(aie::load_v<64>(fv + 128), u))), nI, up);
@@ -938,14 +1091,15 @@ __attribute__((noinline)) void {{ p }}_update(const float *__restrict si, float 
 }
 
 // a token block's v quarter: the window rows (3 before, then the block's raw rows, pitch 32), conv, SiLU -> ys
-// [8][32]; the window shifted
+// [8][32]; the window shifted{% if PACK %} (dist: the tokens' distances from their segments' first tokens, a segment's first three
+// tokens' convs again from its first token on){% endif +%}
 __attribute__((noinline)) void {{ p }}_vblock(const bfloat16 *__restrict v, int32_t *__restrict ws,
-                                            bfloat16 *__restrict ys)
+                                            bfloat16 *__restrict ys{% if PACK %}, const int32_t *__restrict dist{% endif %})
 {
     bfloat16 *__restrict r = SW(bfloat16, {{ w.rows }});
     al::copy<256, 32>(r + 96, v);
     bfloat16 *__restrict yc = SW(bfloat16, {{ w.yc }});
-    {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc);
+    {{ p }}_conv8(r, SW(bfloat16, {{ w.wc }}), yc{% if PACK %}, dist{% endif %});
     {{ silu }}<256>(yc, ys);
     al::copy<96, 32>(r, r + 256);
 }
@@ -962,6 +1116,10 @@ __attribute__((minsize)) void {{ p }}_vinit(const bfloat16 *__restrict s, int32_
         al::copy<256, 32>(SW(bfloat16, {{ w.wc }}), s);
     else
         al::copy<96, 32>(SW(bfloat16, {{ w.rows }}), s);
+{% if PACK %}
+    if (k == 0)
+        SW(int32_t, {{ w.pk }})[16] = 3;  // (no segment start in the window)
+{% endif %}
 }
 
 // Part k of the state quarter in or out
@@ -986,8 +1144,16 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
     aie::set_rounding(aie::rounding_mode::conv_even);
     const uint8_t *__restrict rec = (const uint8_t *)b;
     bfloat16 *__restrict ys = SW(bfloat16, {{ w.ys }});
+{% if PACK %}
+    int32_t *__restrict pk = SW(int32_t, {{ w.pk }});  // (``cuts``: d = -2 the segments' first tokens)
+    {{ p }}_cuts(aie::lt(aie::load_v<16>((const float *)(rec + {{ 2 * KP_BYTES }}) + 32 * (h >> 1)),
+                         aie::broadcast<float, 16>(-1.5f)).to_uint32(), pk);
+    {{ p }}_vblock(v, ws, ys, pk);
+    {{ p }}_vblock(v + 256, ws, ys + 256, pk + 8);
+{% else %}
     {{ p }}_vblock(v, ws, ys);
     {{ p }}_vblock(v + 256, ws, ys + 256);
+{% endif %}
     // V^T blocks [jb][tb][j 8][t 8]
     bfloat16 *__restrict vt = SW(bfloat16, {{ w.vt }});
     AIE_LOOP_NO_UNROLL
@@ -1002,15 +1168,25 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
     {{ p }}_gram(rec, rec + {{ KP_BYTES }}, SW(float, {{ w.g }}), SW(uint8_t, {{ w.kt }}));
     const float *__restrict gt = (const float *)(rec + {{ 2 * KP_BYTES }}) + 32 * (h >> 1);
     {{ p }}_decays(gt, SW(float, {{ w.er }}), SW(float, {{ w.ed }}), SW(float, {{ w.fv }}), SW(bfloat16, {{ w.dc }}));
-    {{ p }}_lm(gt, SW(float, {{ w.g }}), SW(float, {{ w.ed }}), SW(bfloat16, {{ w.lt }}), SW(uint8_t, {{ w.pn }}));
+    {{ p }}_lm(gt, SW(float, {{ w.g }}), SW(float, {{ w.ed }}), SW(bfloat16, {{ w.lt }}), SW(uint8_t, {{ w.pn }}){% if PACK %}, pk{% endif %});
     {{ p }}_tinv(SW(bfloat16, {{ w.lt }}), SW(float, {{ w.tr }}), SW(bfloat16, {{ w.rb }}), SW(uint8_t, {{ w.pn }}));
     AIE_LOOP_NO_UNROLL
     for (int jb = 0; jb < 4; jb++) {  // (S0 read by every j-block before the decay changes it)
         {{ p }}_xy(S + 1024 * jb, rec, rec + {{ KP_BYTES }}, SW(float, {{ w.xy }}));
+{% if PACK %}
+        {{ p }}_xyz(SW(float, {{ w.xy }}), pk);
+{% endif %}
         {{ p }}_solve(SW(float, {{ w.xy }}), vt + 128 * jb, SW(float, {{ w.fv }}), SW(uint8_t, {{ w.pn }}), o + 8 * jb,
-                      SW(uint8_t, {{ w.up }}) + {{ 4 * PAN }} * jb, SW(float, {{ w.sw }}));
+                      SW(uint8_t, {{ w.up }}) + {{ 4 * PAN }} * jb, SW(float, {{ w.sw }}){% if PACK %}, pk{% endif %});
     }
+{% if PACK %}
+    if (pk[17])  // (a segment's first token in the chunk: Gamma_C = 0, S0 gone exactly)
+        {{ p }}_szero(S);
+    else
+        {{ p }}_decay(S, S, SW(bfloat16, {{ w.dc }}));
+{% else %}
     {{ p }}_decay(S, S, SW(bfloat16, {{ w.dc }}));
+{% endif %}
     {{ p }}_update(S, S, SW(uint8_t, {{ w.kt }}), SW(uint8_t, {{ w.up }}));
 {% endif %}
 {% if "ev_chunk" in ablate %}
@@ -1031,14 +1207,20 @@ class GdnScanOperator(ArtcOperator):
     hv x 128 bf16: o of every v head)."""
 
     STACK = 3072
+    STACK_PACK = 3072
     CV_ROWS = 16  # rows of CV read (the v quarter's conv state: [16][32])
     RUN = 64 * C  # tokens per BD of the v rows and o (a BD iterates at most 64 times)
     pfx = kernel_prefix("gdsc")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = ()):
+    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = (),
+                 pack: bool = False):
         """``ablate`` (timing experiments, wrong results): "chunk" the chunk's math compiled out (the v conv and SiLU
-        kept); "ev_chunk": an event window around a chunk call (results unchanged)."""
+        kept); "ev_chunk": an event window around a chunk call (results unchanged). ``pack``: several inputs
+        (segments) in the chunk (GdnPrep's packed records: d = -2 at a segment's first token): the state reset there
+        exactly (E's cut terms -1 exactly, Gamma X and Gamma Y exact zeros, the state zeroed where Gamma_C = 0), a
+        segment's first three tokens' v convs from its first token on."""
         self.sub = sub or T
+        self.pack = pack
         assert T % self.sub == 0 and self.sub % C == 0 and T // self.sub <= 64
         assert T <= 4 * self.RUN, "the v rows and o in at most four runs (a round's BDs: 13 of a shim's 16)"
         self.T, self.cfg, self.layout = T, cfg, layout
@@ -1053,7 +1235,7 @@ class GdnScanOperator(ArtcOperator):
         """(the gates' scratch g .. tr is dead once the T panels are written: xy and sw share its bytes)"""
         common = [("wc", 2 * 4 * 2 * 32), ("rows", 2 * 11 * 32), ("yc", 2 * 8 * 32), ("ys", 2 * 16 * 32),
                   ("vt", 2 * 4 * 2 * 64), ("kt", KP_BYTES), ("fv", 4 * 2 * 3 * 64), ("pn", 12 * PAN), ("dc", 2 * 2 * 64),
-                  ("up", 4 * 4 * PAN)]
+                  ("up", 4 * 4 * PAN)] + ([("pk", 4 * 32)] if self.pack else [])
         gates = [("g", 4 * 6 * 64), ("er", 4 * 8 * 32 + 64), ("ed", 4 * 3 * 64), ("lt", 2 * 4 * 64), ("tr", 4 * 8 * 16),
                  ("rb", 2 * 2 * 8 * 16)]
         jblock = [("xy", 4 * 4 * 64), ("sw", 4 * 192 + 6 * PAN)]
@@ -1070,7 +1252,7 @@ class GdnScanOperator(ArtcOperator):
         lower = sum(1 << (8 * t + s) for t in range(8) for s in range(t + 1))
         return _SCAN.render(p=self.pfx, w=Attr(self.workspace()),
                             PART=PART, PAN=PAN, KP_BYTES=KP_BYTES, strict=f"{strict:016X}", lower=f"{lower:016X}",
-                            ablate=self.ablate)
+                            ablate=self.ablate, PACK=self.pack)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (COLS * 2 * self.T // C * jobj_bytes(self.vh) // 2,), torch.bfloat16),
@@ -1136,7 +1318,8 @@ class GdnScanOperator(ArtcOperator):
                 S = Buffer(S_ty, name=f"gs_S{c}_{r}")
                 workers.append(Worker(core, [b1[c].cons(), v1[c][r].cons(), o1[c][r].prod(), k_vinit, k_sin, k_sout,
                                              k_chunk, ws, S],
-                                      tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
+                                      tile=Tile(c, 2 + r), stack_size=self.STACK_PACK if self.pack else self.STACK,
+                                      dynamic_objfifo_lowering=True,
                                       while_true=False))
 
         N, pitch = lay.N, lay.pitch

@@ -173,3 +173,92 @@ def test_gdn_out(size: str) -> None:
         o = (c * HSLOT + CS_OFF) // 2
         rows = G[n - 3:n, c * lay.pitch + lay.off["qkv"]:][:, :op.ch].view(torch.int16).numpy().reshape(-1)
         assert np.array_equal(gh[o:o + 3 * op.ch], rows), c
+
+
+@pytest.mark.parametrize("size", ["1B", "d3-lite"])
+def test_gdn_scan_packed(size: str) -> None:
+    """GdnPrep and GdnScan packed (``pack``): a 128-token chunk of segments (from position 0) that start inside a
+    16-token scan chunk and an 8-token conv block, one of 3 tokens, padding after them, the layer's state garbage before
+    it: each segment's o against its tokens alone (the unpacked designs from a zero state and conv state) and the
+    cores' arithmetic of them alone (``ref.core_gdn_scan``): within the reference's tolerance as close as alone (no leak
+    of a segment's state into the next); one that starts at a scan chunk bit-identical up to the chunk the next one
+    starts inside (whose reset changes that chunk's arithmetic)."""
+    path = ref.size_gguf(size)
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    L, T = cfg.gdn_layers[0], 128
+    img = QwenImage(g, cfg, layers=[L], vocab=COLS * 64)
+    region = img.region(L, "gdn_in")
+    lay = PG.plan_phase(img, region, T, pitch=PG.phase_pitch(img, "gdn_in", T)).layout
+    blk = region.block("qkv")
+    lengths = [37, 8, 3, 50, 20]  # (starts 0, 37, 45, 48, 98; padding from 118)
+    starts = np.cumsum([0, *lengths])[:-1]
+    n = int(sum(lengths))
+    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
+    qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
+    alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
+    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)
+    beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
+    sh = GD.GdnShape(cfg)
+    P = GP.scan_params(g, cfg, L, blk.rows)
+    cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
+    dt = np.asarray(g.tensor(f"blk.{L}.ssm_dt.bias").raw, np.float32).reshape(-1)
+    A = np.asarray(g.tensor(f"blk.{L}.ssm_a").raw, np.float32).reshape(-1)
+
+    def run(pack: bool, sel: np.ndarray, lo: np.ndarray | None) -> np.ndarray:
+        prep = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay, pack=pack)
+        scan = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay, pack=pack)
+        fused = FusedOperator(name=f"gdn_scan{'_packed' if pack else ''}",
+                              runlist=[(prep, "G", "CV", "P", "M", "PR"), (scan, "PR", "G", "CV", "P", "GS", "O")],
+                              input_args=["G", "P", "M", "CV"], output_args=["O"]).compile()
+        for name in ("G", "P", "M", "CV"):
+            fused.get_buffer(name).zero_()
+        gs = fused.get_buffer("GS").view(torch.float32)  # (the state before: garbage packed, zero alone)
+        gs[:] = torch.randn(gs.numel(), generator=torch.Generator().manual_seed(3)) if pack else 0
+        fused.get_buffer("P").view(torch.uint8)[:P.size] = torch.from_numpy(P)
+        Gb = np.zeros((T, lay.N), np.uint16)
+        for c in range(COLS):
+            rows = blk.rows[c][blk.rows[c] >= 0]
+            vh = gdn_v_heads(cfg, c)
+            Gb[:len(sel), c * lay.pitch + lay.off["qkv"] + np.arange(rows.size)] = _bits(qkv[sel][:, rows])
+            if GP.ab_f32(lay):
+                a32 = np.ascontiguousarray(alpha[sel][:, vh], np.float32).view(np.uint16)
+                Gb[:len(sel), c * lay.pitch + lay.off["alpha"] + np.arange(a32.shape[1])] = a32
+                Gb[:len(sel), c * lay.pitch + lay.off["beta"] + np.arange(len(vh))] = _bits(beta[sel][:, vh])
+            else:
+                ab = np.concatenate([alpha[sel][:, vh], beta[sel][:, vh]], 1)
+                Gb[:len(sel), c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = _bits(ab)
+        fused.get_buffer("G").view(torch.int16)[:] = torch.from_numpy(Gb.reshape(-1).view(np.int16))
+        m = GP.GdnPrepOperator.mask(len(sel), T, lo, T)
+        fused.get_buffer("M").view(torch.float32)[:m.size] = torch.from_numpy(m)
+        fused.sync_inputs()
+        fused()
+        fused.sync_outputs()
+        return fused.get_buffer("O").float().numpy().reshape(T, cfg.ssm_v_heads, 128)
+
+    O = run(True, np.arange(n), np.repeat(starts, lengths))
+    for a, m in zip(starts, lengths, strict=True):
+        sel = np.arange(a, a + m)
+        alone = run(False, sel, None)[:m]
+        want = np.zeros((T, cfg.ssm_v_heads, 128), np.float32)
+        for c in range(COLS):
+            rows = blk.rows[c][blk.rows[c] >= 0]
+            vh = gdn_v_heads(cfg, c)
+            ab = np.concatenate([np.concatenate([alpha[sel][:, vh], beta[sel][:, vh]], 1),
+                                 np.zeros((T - m, 2 * len(vh)), np.float32)])
+            x = np.concatenate([qkv[sel][:, rows], np.zeros((T - m, rows.size), np.float32)])
+            want[:, vh] = ref.core_gdn_scan(qkv=x, ab=ab, conv_state=np.zeros((3, sh.ch), np.float32), conv_w=cw[rows],
+                                            dt=dt[vh], ssm_a=A[vh], state=np.zeros((sh.hc, 128, 128), np.float32),
+                                            n=m, eps=cfg.rms_norm_eps)[0]
+        got = O[a:a + m]
+        e_alone, e_ref = ref.rel_err(got, alone), ref.rel_err(got, want[:m])
+        diff = np.flatnonzero((got != alone).any((1, 2)))
+        print(f"segment {a} + {m}: vs alone {e_alone:.2e} ({m - diff.size} of {m} rows bit-identical; first differing "
+              f"{diff[:4].tolist()}), vs the cores' arithmetic {e_ref:.2e} (alone {ref.rel_err(alone, want[:m]):.2e})")
+        assert e_ref < 1.05 * ref.rel_err(alone, want[:m]) + 1e-4, a
+        if a % GP.C == 0:
+            k = m if (a + m) % GP.C == 0 else (a + m) // GP.C * GP.C - a  # (the rows before the next start's chunk)
+            assert (got[:k] == alone[:k]).all(), (a, np.flatnonzero((got[:k] != alone[:k]).any((1, 2))).tolist())

@@ -59,7 +59,7 @@ BIG = 1024  # the sub-chunk of the chunks made of them (the GEMMs but qkv once p
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
 NORM_SIZES = (2048, 1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
-PACK_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)  # packed chunks' sizes (``run_packed``)
+PACK_SIZES = (64, 128, 256, 512, 1024, 2048, 3072, 4096)  # packed chunks' sizes (``run_packed``)
 PACK_SPAN = 512  # a packed chunk's longest segment (its attention's window: PACK_SPAN / pg + 1 cache groups)
 # chunk sizes of whole cache groups (a flash attention design each); past 2048 in whole BIG sub-chunks (long prompts:
 # half the ConfigureOps per token of 2048-token chunks)

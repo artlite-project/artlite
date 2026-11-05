@@ -57,7 +57,7 @@ class _Setup:
     them."""
 
     def __init__(self, size: str, T: int, n2: int, tokens: int = 0):
-        path = decision_gguf(size) if size.startswith("d3") else qwen_gguf("Q4_K_M", size)
+        path = decision_gguf(size) if size.startswith("d3") or size == "kev" else qwen_gguf("Q4_K_M", size)
         if not os.path.exists(path):
             pytest.skip(f"{path} missing")
         self.g = g = GGUFFile(path)
@@ -232,3 +232,69 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
     assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2
     gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[:n]
     assert ref.rel_err(A, gold) < 3e-2
+
+
+@pytest.mark.parametrize(("size", "T", "causal"), [("d3-lite", 96, True), ("d3-lite", 128, True), ("d3-lite", 128, False),
+                                                   ("d3-lite", 96, False)])
+def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
+    """A packed chunk at position 0 (``PrefillAttnOperator(pack=True)``): segments of 32, 37, 3 and 20 tokens (from 0,
+    32, 69, 72: inside a group and a record), padding after them, each token's rotary position from its segment's start
+    (cos / sin rows written past the table's text rows); every row against the exact attention of the cores' own
+    operands over its segment's keys (up to itself, or all of them non-causal); the first segment bit-identical to its
+    tokens alone (the unpacked design: the same keys, the masked ones adding exact zeros). At 128 tokens two streams,
+    at 96 (32-query passes) one."""
+    lengths = [32, 37, 3, 20]
+    n = sum(lengths)
+    s = _Setup(size, T, 0, tokens=n)
+    starts = np.cumsum([0, *lengths])[:-1]
+    lo = np.arange(T)
+    hi = np.arange(T)
+    pos = np.zeros(T, np.int64)
+    for a, m in zip(starts, lengths, strict=True):
+        lo[a:a + m] = a
+        hi[a:a + m] = a + m - 1 if not causal else np.arange(a, a + m)
+        pos[a:a + m] = np.arange(m)
+    R = MAX_POS - T  # (the chunk's rows of the cos / sin table)
+    cs = AP.cs_table(s.cfg, MAX_POS)
+    cs[R:] = AP.cs_rows(s.cfg, pos)
+    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=causal, pp=2, pack=True)
+    fused = FusedOperator(name=f"attn_prefill_packed{int(causal)}",
+                          runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A", "SEG")],
+                          input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
+    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
+    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
+    fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.seg(lo, hi))
+    fused.get_buffer("KV").zero_()
+    H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
+    _run(fused, prep.params(0, R) | attn.params(0, n), s.G(0, n))
+    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
+    slots = _qs_slots(fused, T, qc, prep.qg)
+    q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
+    sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
+    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    want = np.zeros((n, H, hd))
+    keys = np.arange(n)
+    seen = (keys[None] >= lo[:n, None]) & (keys[None] <= hi[:n, None])
+    for h in range(s.kvh):
+        K, V = (np.asarray(x, np.float64)[:n] for x in KV.kv_from_groups(kv[h, :(n + 31) // 32], AT.HD, dmajor=True))
+        for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
+            sc = q[g].astype(np.float64) @ K.T / 16
+            sc[~seen] = -np.inf
+            pr = np.exp(sc - sc.max(-1, keepdims=True))
+            want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
+    eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T} causal {causal}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    assert ref.rel_err(A, want) < 1.1 * eq
+    # the first segment alone (the unpacked design, its 32 tokens at position 0)
+    attn1 = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=causal, pp=2)
+    alone = FusedOperator(name=f"attn_prefill_alone{int(causal)}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
+                                                                             (attn1, "QS", "KV", "A")],
+                          input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
+    alone.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
+    alone.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
+    alone.get_buffer("KV").zero_()
+    _run(alone, prep.params(0) | attn1.params(0, lengths[0]), s.G(0, lengths[0]))
+    A1 = bfp16.from_panels(alone.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:lengths[0]]
+    bad = np.flatnonzero((A1 != A[:lengths[0]]).any((1, 2)))
+    assert bad.size == 0, f"rows {bad.tolist()} differ from the segment alone"

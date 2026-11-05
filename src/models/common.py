@@ -437,6 +437,8 @@ class NpuModel:
         on the host: ``models.readouts``)."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
+    packs = False  # whether ``readouts`` packs inputs into prefill chunks (a readout model's prefill)
+
     def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
         """Several inputs' output rows (each as ``outputs`` returns them): each input's tokens after the cached positions
         (a prefix every one of them continues); the model is left at the prefix's end. This default runs them one after
@@ -449,6 +451,12 @@ class NpuModel:
             out.append(self.outputs(ids, rows, norm=norm))
         self.restore(p, cp)
         return out
+
+    def readout_seconds(self, lengths: list[int], position: int = 0) -> float | None:
+        """Estimated seconds of ``readouts`` of inputs of ``lengths`` tokens after ``position`` (None: no estimate); this
+        default: each alone (``prompt_seconds``)."""
+        t = [self.prompt_seconds(n, position) for n in lengths]
+        return None if None in t else sum(t)
 
     def prompt_seconds(self, n: int, position: int = 0) -> float | None:
         """Estimated seconds of a prompt of n tokens from ``position`` (None: no estimate)."""
@@ -818,8 +826,14 @@ class OverlayModel(NpuModel):
 
     @property
     def packs(self) -> bool:
-        """Whether the prefill runs packed chunks (a readout model's: ``readouts``)."""
+        """(the prefill runs packed chunks: a readout model's)"""
         return self.prefill is not None and bool(self.prefill.pack_sizes)
+
+    def readout_seconds(self, lengths: list[int], position: int = 0) -> float | None:
+        """(the packing's estimate, ``ChunkPrefill.pack``; a recurrent model's inputs after a prefix: each alone)"""
+        if self.packs and not (self.recurrent and position):
+            return self.prefill.pack(lengths, position).seconds
+        return super().readout_seconds(lengths, position)
 
     def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
@@ -836,15 +850,21 @@ class OverlayModel(NpuModel):
         for i in (plan.alone if plan is not None else range(len(inputs))):
             self.restore(p, cp)
             out[i] = self.outputs(inputs[i], at[i], norm=norm)
-        for T, idx in (plan.bins if plan is not None else []):
-            self.restore(p, cp)
+        bins = plan.bins if plan is not None else []
+
+        def chunk_of(idx: list[int]) -> tuple:  # (a packed chunk's: its inputs, positions, segment starts, offsets)
             offs = np.cumsum([0] + [len(inputs[i]) for i in idx])
-            toks = [t for i in idx for t in inputs[i]]
+            args = self._chunk_inputs([t for i in idx for t in inputs[i]], first=False)
             pos = np.concatenate([p + np.arange(len(inputs[i])) for i in idx])
-            lo = np.repeat(offs[:-1], np.diff(offs))
+            return args, pos, np.repeat(offs[:-1], np.diff(offs)), offs
+
+        nxt = self._pool.submit(chunk_of, bins[0][1]) if bins else None
+        for k, (T, idx) in enumerate(bins):
             t0 = time.perf_counter()
-            args = self._chunk_inputs(toks, first=True)
+            args, pos, lo, offs = nxt.result()
             t1 = time.perf_counter()
+            nxt = self._pool.submit(chunk_of, bins[k + 1][1]) if k + 1 < len(bins) else None  # (meanwhile)
+            self.restore(p, cp)
             self._packed_run(args, T, pos, lo)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1

@@ -295,31 +295,38 @@ class Engine:
     def readouts(self, inputs: list[list[int]], rows: list[np.ndarray], *, cache_prompt: bool = True,
                  name: str = "readout") -> concurrent.futures.Future:
         """Output rows of prompts (``NpuModel.outputs``, output-normed) on the worker after the queued jobs: per input
-        its tokens' rows at ``rows`` (indices), one after another, each after what the prompt cache keeps of it before
-        its first row (a non-causal model's: none; a recurrent model's inputs with a long common prefix: ``_shared``);
-        the result: a list of (len(rows), hidden) fp32."""
+        its tokens' rows at ``rows`` (indices). One input runs after what the prompt cache keeps of it before its first
+        row; several run after a prefix they share (``_start``: run once, through the prompt cache) as
+        ``NpuModel.readouts`` runs them (packed chunks where the model packs, else one after another); a non-causal
+        model's from position 0. The result: a list of (len(rows), hidden) fp32."""
         return self.run(lambda: self._readouts(inputs, rows, cache_prompt, name))
 
     def _readouts(self, inputs: list[list[int]], rows: list[np.ndarray], cache_prompt: bool, name: str
                   ) -> list[np.ndarray]:
         npu, cache = self.npu, self.cache
         cache_prompt = cache_prompt and npu.causal  # (a non-causal model reads every prompt whole)
-        t0, out, ran = time.perf_counter(), [], 0
+        t0, ran = time.perf_counter(), 0
         try:
             if self._dirty:
                 npu.reset()
                 self._dirty = False
-            if p := self._shared(inputs, rows) if cache_prompt else 0:  # (the prefix once, a checkpoint at its end)
-                k, _, _ = cache.prepare(inputs[0][:p])
-                if k < p:
-                    npu.outputs(inputs[0][k:p], [-1])  # (in chunks: as a readout runs)
-                cache.checkpoint(inputs[0][:p])
-                ran += p - k
-            for ids, at in zip(inputs, rows, strict=True):
+            if len(inputs) == 1:
+                (ids,), (at,) = inputs, rows
                 k, _, _ = cache.prepare(ids[:int(at.min())], enabled=cache_prompt)
-                out.append(npu.outputs(ids[k:], at - k))
+                out = [npu.outputs(ids[k:], at - k)]
                 cache.ran(ids)
-                ran += len(ids) - k
+                ran = len(ids) - k
+            else:
+                p = self._start(inputs, rows) if cache_prompt else 0
+                prefix = inputs[0][:p]
+                k, _, _ = cache.prepare(prefix, enabled=cache_prompt)
+                if k < p:
+                    npu.outputs(prefix[k:], [-1])  # (in chunks: as a readout runs)
+                if p:
+                    cache.checkpoint(prefix)
+                out = npu.readouts([ids[p:] for ids in inputs], [at - p for at in rows])
+                cache.ran(prefix)
+                ran = p - k + sum(len(ids) - p for ids in inputs)
         except Exception:  # (the device's state is unknown: the caches start over)
             cache.clear()
             self._dirty = True
@@ -329,23 +336,21 @@ class Engine:
                  f"{time.perf_counter() - t0:.3f} s")
         return out
 
-    def _shared(self, inputs: list[list[int]], rows: list[np.ndarray]) -> int:
-        """Where a recurrent model's prompts (whose states the prompt cache keeps only at checkpoints) run their common
-        prefix once: its last cache group's start before every prompt's first row, if the prefill's estimates
-        (``NpuModel.prompt_seconds``) say the prefix and each prompt's rest after it take less than 0.9 of the
-        prompts whole (a short chunk costs about as much as a longer one: its configurations), else 0."""
+    def _start(self, inputs: list[list[int]], rows: list[np.ndarray]) -> int:
+        """Where several prompts split into a prefix they share, run once, and their rests: the last cache group's start
+        before their first difference and every prompt's first row, if the estimates (``NpuModel.readout_seconds``,
+        ``prompt_seconds``) say the prefix and the rests after it take less than 0.9 of the prompts whole, else 0."""
         npu = self.npu
-        if not npu.recurrent or len(inputs) < 2:
-            return 0
         p = min(min(common_prefix(inputs[0], ids) for ids in inputs[1:]), min(int(at.min()) for at in rows))
         p -= p % npu.group
         if p <= 0:
             return 0
-        whole = [npu.prompt_seconds(len(ids)) for ids in inputs]
-        rest = [npu.prompt_seconds(len(ids) - p, p) for ids in inputs]
-        if None in whole or None in rest:
+        whole = npu.readout_seconds([len(ids) for ids in inputs])
+        rest = npu.readout_seconds([len(ids) - p for ids in inputs], p)
+        head = npu.prompt_seconds(p)
+        if whole is None or rest is None or head is None:
             return 0
-        return p if npu.prompt_seconds(p) + sum(rest) < 0.9 * sum(whole) else 0
+        return p if head + rest < 0.9 * whole else 0
 
     def waiting(self) -> int:
         """Jobs in the queue (not running)."""
