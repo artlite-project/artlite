@@ -410,23 +410,30 @@ class QwenOverlay(ModelOverlay):
 
     def reset(self) -> None:
         """A new sequence: the GDN layers' conv histories, replay objects and states zeroed (a layer's objects as
-        ``_load_gdn`` wrote them first: their conv weights take it ~0.5 ms a layer)."""
+        ``_load_gdn`` wrote them first: their conv weights take it ~0.5 ms a layer). A non-causal model's none of them:
+        it never decodes, and each of its prompt chunks (position 0) starts from zero states itself (``QwenPrefill.run``:
+        a scan that zeroes them, or ``zero_state`` first; d3-lite's 18.9 MB, ~0.8 ms of a short readout)."""
         super().reset()
-        dev = self.dev
-        dev.view("GSTATE")[:] = 0
-        dev.flush("GSTATE")
-        gobj, n = dev.view("GOBJ"), COLS * self.gcol if self.gobj else 0
-        for L, o in self.gobj.items():
-            if L in self._gobj0:
-                gobj[o:o + n] = self._gobj0[L]
-            else:
-                self._load_gdn(L)
-                self._gobj0[L] = gobj[o:o + n].copy()
-        dev.flush("GOBJ")
+        if self.cfg.causal:
+            self.zero_state()
+            dev = self.dev
+            gobj, n = dev.view("GOBJ"), COLS * self.gcol if self.gobj else 0
+            for L, o in self.gobj.items():
+                if L in self._gobj0:
+                    gobj[o:o + n] = self._gobj0[L]
+                else:
+                    self._load_gdn(L)
+                    self._gobj0[L] = gobj[o:o + n].copy()
+            dev.flush("GOBJ")
         self.nrep, self.cshift = 0, 0
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
+
+    def zero_state(self) -> None:
+        """The GDN layers' states (GSTATE) zero."""
+        self.dev.view("GSTATE")[:] = 0
+        self.dev.flush("GSTATE")
 
     # ------------------------------------------------------------------
     # The transaction of a step

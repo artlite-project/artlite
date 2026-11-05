@@ -90,7 +90,7 @@ class ChunkPrefill:
         self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
         self.tree_sizes: tuple[int, ...] = ()  # (a recurrent model's packed chunks after a prefix)
         self.span = 0  # (a packed chunk's longest segment)
-        self._est: dict[tuple, float] = {}  # (the planner's estimates by (kind, tokens or size, position))
+        self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
         self._items: dict[int | tuple[str, int], list] = {}
         self.dispatches = 0  # (the last chunk's)
@@ -377,8 +377,11 @@ class ChunkPrefill:
         (``kv_layers``: record mode)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
+        cut = ("splits", T, p0, self.pace)  # (a packed or tree chunk's: its size's, the same items per layer)
+        if cut not in self._est:
+            self._est[cut] = self._splits(T, p0)
         self.dispatches = self.lib.run(self._program(T if key is None else key),
-                                       splits=[*self._splits(T, p0), *(hooks or {})],
+                                       splits=[*self._est[cut], *(hooks or {})],
                                        bufs=list(self._buffers().values()), hooks=hooks)
         self.ov.vring.from_prefill.update(self.kv_layers)
 

@@ -36,7 +36,10 @@ the chunk (the prefill's own and the overlay's) lives on the overlay's device.
 Chunks start at multiples of 32 positions (whole cache groups) with at least 3 valid tokens (the conv states: the
 last three); the padding tokens after the valid ones leave the GDN states alone and write cache records that later
 tokens overwrite. A non-causal model's prompt (``QwenConfig.causal``: vllm-d3) is one chunk at position 0, its
-attention over all of its tokens (``attn_prefill.PrefillAttnOperator``'s non-causal design).
+attention over all of its tokens (``attn_prefill.PrefillAttnOperator``'s non-causal design); a chunk of up to SUB tokens
+runs the packed GDN operators with one segment from its first token (``fresh_sizes``: the scan starts from zero states
+itself, so the model's reset zeroes none, ``QwenOverlay.reset``; the states it leaves are no sequence's), a larger one
+zeroes the states first.
 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
 a chunk at position 0, each from a state of its own. The operators that keep them apart: GdnPrep / GdnScan's packed
@@ -156,9 +159,13 @@ class QwenPrefill(ChunkPrefill):
                       for T in self.pack_sizes} if self.att else {}
         # (tree chunks: a causal model's segments after a prefix; GdnOut's conv state the prefix's, from CVL)
         self.tree_sizes = self.pack_sizes if cfg.causal and self.gdn else ()
+        # (a non-causal model's chunks of up to SUB tokens: the packed GDN operators, one segment from the first token, so
+        # that no reset zeroes its states: ``run``)
+        self.fresh_sizes = tuple(T for T in self.pack_sizes if T <= SUB) if not cfg.causal and self.gdn else ()
         self._starts: dict[int, list[int]] = {}
         self._rows()
         self._library()
+        self.runlists |= {("fresh", T): self._runlist_of(T, fresh=True) for T in self.fresh_sizes}
 
     # ------------------------------------------------------------------
     # The runlists
@@ -193,16 +200,20 @@ class QwenPrefill(ChunkPrefill):
         plans = {(L, name): plan(L, name) for L in self.layers for name in self._phases(L)}
         eps, out = cfg.rms_norm_eps, self._out_pitch
         dp = dpt if dpt != H // COLS else 0
+        cols = 4 if t < SUB else COLS  # (a SMALL size's norms on half the columns: d3-lite T 64 / 128 -0.7 / -0.3 ms in
+        # one process, the 9B no slower; at 256 no faster)
         # (an output projection in P K parts: per sub-chunk [part 0 C | part 1 C | ..], slots of the largest part's C;
         # one norm adds them, per P)
         parted = [g.op for p in plans.values() if p.parts > 1 for g in p.gemms]
         f_part = max(arg_bytes(op, 2) for op in parted) if parted else 0
         return SimpleNamespace(
             plans=plans, d_pitch=dpt, f_part=f_part, rb_y=2 * COLS * dpt,
-            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out),
-            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, out_pitch=out),
-            pnm=PrefillNormOperator(T=t, E=H, eps=eps, out_pitch=out) if dp else None,  # (an MoE layer's delta: rows of H)
-            pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2, out_pitch=out)
+            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out, cols=cols),
+            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, out_pitch=out, cols=cols),
+            # (an MoE layer's delta: rows of H)
+            pnm=PrefillNormOperator(T=t, E=H, eps=eps, out_pitch=out, cols=cols) if dp else None,
+            pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2, out_pitch=out,
+                                        cols=cols)
                  for P in sorted({p.parts for p in plans.values() if p.parts > 1})})
 
     def _phases(self, L: int) -> tuple[str, ...]:
@@ -264,10 +275,10 @@ class QwenPrefill(ChunkPrefill):
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
 
-    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
+    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False, fresh: bool = False) -> list[tuple]:
         """(sub-chunks of ``_t`` tokens: a ``SMALL`` size one of its own operators; the layers' first items in
         ``_starts``; ``packed``, ``tree``: the packed or tree GDN operators and the packed attention, the segments in
-        SEG)"""
+        SEG; ``fresh``: the packed GDN operators and the unpacked attention)"""
         ov, cfg, sl = self.ov, self.cfg, self._sl
         t = self._t(T)
         S, o = T // t, self.sz[t]
@@ -303,7 +314,7 @@ class QwenPrefill(ChunkPrefill):
                 rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2),
                            *([sl("SEG", 0, attn, i=3)] if packed or tree else [])))
             else:
-                gprep, scan, gout = self._gdn_ops(p_in.layout, T, packed, tree)
+                gprep, scan, gout = self._gdn_ops(p_in.layout, T, packed or fresh, tree)
                 i = self.gdn.index(L)
                 pp = f"PP[{self.pp_off[L]}:{self.pp_off[L] + self.n_p}]"
                 gh = f"GHDR[{ov.ghdr[L]}:{ov.ghdr[L] + gout.ghdr_bytes}]"
@@ -311,7 +322,7 @@ class QwenPrefill(ChunkPrefill):
                 cv = [sl("CVL", 3 * i * g_rb, gprep, i=1)] + [sl("G", (j * t - 3) * g_rb, gprep, i=1)
                                                               for j in range(1, S)]
                 pr = arg_bytes(gprep, 4)  # (a sub-chunk's records)
-                pm = arg_bytes(gprep, 3) if packed or tree else 4 * t  # (an object per sub-chunk, GdnPrep.mask)
+                pm = arg_bytes(gprep, 3) if packed or tree or fresh else 4 * t  # (an object per sub-chunk, GdnPrep.mask)
                 rl += [(gprep, tok("G", j, gprep, i=0, row=g_rb), cv[j], pp, sl("PM", j * pm, gprep, i=3),
                         sl("PR", j * pr, gprep, i=4)) for j in range(S)]
                 rl.append((scan, sl("PR", 0, scan, i=0), tok("G", 0, scan, i=1, row=g_rb),
@@ -428,6 +439,7 @@ class QwenPrefill(ChunkPrefill):
         self._cv_src, self._cv_dst = np.concatenate(src) // 2, np.concatenate(dst) // 2  # (bf16 indices)
         lo, hi = ov.ghdr[self.gdn[0]], ov.ghdr[self.gdn[-1]] + COLS * ov.hslot
         self._cv_range = (lo, hi - lo)
+        self._cvl_zero = False  # (CVL's conv rows zero: only the host writes CVL)
 
     def _conv_states(self) -> None:
         """CVL from GHDR: the GDN layers' conv states as the decode left them (or the last chunk)."""
@@ -436,12 +448,17 @@ class QwenPrefill(ChunkPrefill):
         cvl = dev.view("CVL").view(np.uint16)
         cvl[self._cv_dst] = dev.view("GHDR").view(np.uint16)[self._cv_src]
         dev.flush("CVL", 0, 2 * (int(self._cv_dst.max()) + 1))
+        self._cvl_zero = False
 
     def _conv_zero(self) -> None:
-        """CVL's conv-state rows zero (a chunk at position 0)."""
+        """CVL's conv-state rows zero (a chunk at position 0; nothing to do when they are since the last
+        ``_conv_states``: ~0.35 ms of a short readout's host work)."""
+        if self._cvl_zero:
+            return
         dev = self.ov.dev
         dev.view("CVL").view(np.uint16)[self._cv_dst] = 0
         dev.flush("CVL", 0, 2 * (int(self._cv_dst.max()) + 1))
+        self._cvl_zero = True
 
     # ------------------------------------------------------------------
     # Run
@@ -490,13 +507,16 @@ class QwenPrefill(ChunkPrefill):
         px[:n] = x.bfloat16()
         px[n:] = 0
         dev.flush("PX", 0, 2 * T * self.H)
+        fresh = p0 == 0 and T in self.fresh_sizes  # (a non-causal model's: the packed scan zeroes the states itself)
         if self.gdn:
-            pm = dev.view("PM").view(np.float32)
-            pm[:T] = np.arange(T) < n
-            dev.flush("PM", 0, 4 * T)
+            m = GP.GdnPrepOperator.mask(n, T, np.zeros(n, np.int64), self._t(T)) if fresh else np.arange(T) < n
+            dev.view("PM").view(np.float32)[:m.size] = m
+            dev.flush("PM", 0, 4 * m.size)
             if p0 == 0:  # (a sequence's first chunk: no conv history)
                 self.ov.conv_fresh()
                 self._conv_zero()
+                if not self.cfg.causal and not fresh:  # (its reset leaves the states as they are)
+                    self.ov.zero_state()
             else:
                 self.ov.conv_for_prefill()  # (the decode's conv states into GHDR)
                 self._conv_states()
@@ -508,7 +528,8 @@ class QwenPrefill(ChunkPrefill):
         for L, (_, i_e, i_g) in self._moe_marks.get(T, ()):
             hooks[i_e] = functools.partial(self.moe.host_route, L, n=n, T=T, dev=dev, lib=self.lib)
             hooks[i_g] = functools.partial(self.moe.host_streams, L, n=n, T=T, dev=dev, lib=self.lib)
-        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks or None)
+        self._launch(T, p0, self.params(T, p0, n, self._cs_row(p0, n) if self.att else None), hooks or None,
+                     key=("fresh", T) if fresh else None)
         if self.dp is not None:
             self.dp.after(dev, n)
         if self.fp is not None:
