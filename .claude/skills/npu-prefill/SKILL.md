@@ -35,7 +35,7 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   32-token one from ~222 / ~650 to 159 / 452 ms (the weights still stream once: ~0.6 of a sub-chunk's time at 64).
   Plan their input projections at SUB's pitch where buffers outlive a chunk in that layout (Qwen's conv states).
   Choose their operators by speed, not configuration size (configurations by control packets: GemmQ, the attention on
-  4 rows, the norms on 4 columns; 3B's chat prompt 96 -> 70 ms). Long prompts the other way: chunks past 2048 in whole
+  4 rows, the norms on 4 columns, also qwen35's; 3B's chat prompt 96 -> 70 ms). Long prompts the other way: chunks past 2048 in whole
   1024-token sub-chunks (Llama 3072 / 4096, where the flash attention's 64 passes allow) halve the ConfigureOps per
   token (1B 8K TTFT 1.29 -> 1.21 s).
 - **Library ELF** (`fused.Library`): each design compiled once, whatever the depth and chunk sizes;
@@ -67,6 +67,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   LM head; the heads on the host: `models.readouts`, `models.server.decisions`). A non-causal model (vllm-d3:
   `QwenConfig.causal`) runs a prompt whole in one chunk from position 0: the flash attention's passes all stream the
   prompt's groups, the padding keys of its last group masked (`PrefillAttnOperator(causal=False)`), no decode steps.
+  Its reset zeroes no GDN states (d3-lite: 18.9 MB, ~1 ms of a short readout): a chunk of up to SUB tokens runs the
+  packed GDN operators, one segment from token 0 (the scan zeroes the state itself, exactly; its final state is no
+  sequence's, so causal models cannot), a larger one zeroes GSTATE first (the packed scan costs more there).
 - **Packed chunks** (a readout model's prefill, `pack`; `NpuModel.readouts`): several inputs (segments) back to back in
   one chunk, so they share its ConfigureOps and weight passes. Only operators that mix tokens need packed variants;
   every other operator works row by row:
@@ -161,9 +164,12 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 
 - Per operator kind: drop its items from the program and time the rest.
 - Per design switch: a program of one item of the design alternating with another kind's, minus both repeated alone
-  (no switch between them); or the program's configurations alone (its RunOps dropped). ~80-90 µs each (the reset
-  ~40 µs; program memory, BDs, locks by control packets: `fused.ctrlpkt`): a layer of a dozen operators ~1 ms whatever
-  the chunk size (Llama 1B's chunk of 128 tokens: 10 of 31 ms).
+  (no switch between them); or the program's configurations alone (its RunOps dropped). ~50-100 µs each: the PDI
+  load's array reset 37 µs, ~0.1 µs per transaction operation left (stream switch ports, the loader's route, the shim),
+  program and data memory, BDs, locks by control packets (`fused.ctrlpkt`); a layer of a dozen operators ~1 ms
+  whatever the chunk size (Llama 1B's chunk of 128 tokens: 10 of 31 ms; d3-lite's of 64: 14 of 31 ms, Qwen3 0.6B's
+  14 of 28). At 64 / 128 tokens they are half the chunk, the reset alone a quarter (configurations without it:
+  aie-kernel-perf-optimization `reference/rejected.md`).
 - Per GEMM: alone with parts compiled out (`ablate=("dq", "mm", "act")`) and its cores' windows (`ablate=("ev_kt",)`
   with the profiling counters); per attention kind and position: the attention operator alone at (T, p0).
 - Gemma E4B, 1152 tokens at p0 = 0: GEMMs ~60% (gate/up the largest, MAC-bound), norms ~17% (the fp32 residual read

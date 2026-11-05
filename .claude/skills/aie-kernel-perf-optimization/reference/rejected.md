@@ -117,6 +117,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Splitting a DMA-bound attention block's query rows over the 4th core row (Llama 3B prefill: 96 rows as 4 x 24) | not built: 12.09 vs 12.16 ms with the compute compiled out; 64-query blocks (half the KV reads) gave -25% |
 | Two shim channels per KV head joined in one memtile (Gemma prefill attention) | 7 memtile inputs: does not build (aie2p-coding section 8); two streams through two memtiles work, and each from two shims once Q rides the KV stream (qwen35: data-movement.md) |
 | A second o copy for the qwen35 27B's attention (three row panels per core) | no L1 left (61 of 64 KB): its P V stays in place, ~2.8 ms of memory stall per layer at 16K |
+| Library configurations without the array reset (the PDI loaded last loaded again: the firmware skips it, 0.25 against 37 µs; each tile's packets reset its core and DMA channels, the loader's route rewrites whole master-port ranges) | a toy pair of designs ran bit-identical, but d3-lite's first GDN prep after a GEMM never drained its fills (TDR): state the column reset clears (stream FIFOs?) beyond the registers; pulsing the tiles' Module_Reset_Control (core 0x60010, memtile 0xFFF10) by the transaction hung even the toy. Worth ~5-6 ms a short chunk if made safe |
 
 ## Numerics
 
