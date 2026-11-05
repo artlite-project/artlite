@@ -65,6 +65,9 @@ PACK_SPAN = 512  # a packed chunk's longest segment (its attention's window: PAC
 # half the ConfigureOps per token of 2048-token chunks)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
 MAX_T = SIZES[-1]
+# (a library's runtime parameter has one range, its largest chunk's: the attention's P_FO streams MAX_T / pg - 1 groups
+# from it, so a smaller chunk at the caches' end needs KV_PAD past them)
+assert MAX_T - SMALL[0] <= KV_PAD
 PHASES = ("qkv", "o", "gate_up", "down")
 NORMS = ("o", "d")  # a layer's residual adds (after o, after down)
 DOWN_CHUNKS = 4  # K chunks per down part (1B / 3B: 2 parts of 4; each part's A strip stays in the memtile, each sums 64

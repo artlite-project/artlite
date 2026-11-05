@@ -94,7 +94,8 @@ from .image import LlamaImage
 PHASES = ("qkv", "att", "o", "gate_up", "down")
 FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM}
 KV_K = {"single": 1, "hilo": 2}  # K precision of the caches (``kv_k``): K panels per record
-KV_PAD = 2048  # positions past the caches (the last layer's): the prefill's sub-chunk slices of a cache
+KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache (its largest chunk's
+# runtime offsets range over the caches and this pad, the range every chunk size's parameter takes: ``prefill.MAX_T``)
 
 
 def check_formats(image: LlamaImage) -> set[str]:

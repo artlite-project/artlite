@@ -316,6 +316,38 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     assert all(v < 0.06 for v in worst.values()), worst
 
 
+def test_chunk_params_to_the_end() -> None:
+    """Every chunk size at every start the planner may give it (``fits``: within the caches) takes its runtime
+    parameters (a 1-layer slice of Llama 1B at 4096 positions, the largest chunk among its sizes; no dispatch). A
+    library's parameter has one range, its largest chunk's: the caches' padding (``KV_PAD``) extends it to every
+    smaller chunk at the caches' end (with a pad short of the largest chunk, a 256-token chunk of a 32K prompt at
+    31808 of 32768 positions was refused: its attention's P_FO)."""
+    import os
+
+    from artlite.gguf_model import GGUFFile
+    from models.llama.overlay import LlamaOverlay
+    from models.llama.prefill import LlamaPrefill
+
+    from ..common import llama_gguf
+
+    path = llama_gguf("Q4_K_M", "1B")
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    ov = LlamaOverlay(GGUFFile(path), layers=[0], vocab=2048, max_positions=4096)
+    ov.load()
+    pf = LlamaPrefill(ov).compile().bind()
+    assert max(pf.sizes) == 4096
+    refused = []
+    for T in pf.sizes:
+        for p0 in range(0, 4096 - T + 1, pf.group):
+            assert pf.fits(T, p0)
+            try:
+                pf.lib.set_params(pf.params(T, p0))
+            except ValueError as e:
+                refused.append((T, p0, str(e)))
+    assert not refused, (len(refused), refused[:3])
+
+
 # (history: a shared prefix in the caches; segments' lengths: starts at 32-token key chunks and inside them, inside
 # sub-chunks and records)
 PACKED_SLICE = [(0, [192, 64, 45, 107, 120, 96, 200, 150]), (64, [100, 28, 300, 37, 199, 280])]

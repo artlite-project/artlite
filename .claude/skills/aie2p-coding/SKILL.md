@@ -246,7 +246,8 @@ BDs:
   with the length; the core derives the same trip count from its own data.
 - Scratchpad offset parameters are range-checked against the argument's declared size (a value that would move a
   transfer past its buffer raises at write time): declare the argument with the padding the largest offset needs
-  (the Gemma overlay's `KV_PAD`).
+  (the overlays' `KV_PAD`). In a library ELF a parameter has one range, the tightest of the designs that read it: the
+  largest chunk's transfer from the offset bounds the smallest chunk's offset too, so pad by the largest chunk.
 - With 16 shim BDs, large GEMM K / output dimensions reuse BDs in flight, synchronized by task-completion tokens of the
   command processor's per-channel task queues (at most 4 queued tasks per channel). [GEMM-gen, AM027]
 - A GEMM's DDR -> NPU transfers need a long enough contiguous `k_mt` (and matching `k_ct`) to reach effective DRAM
