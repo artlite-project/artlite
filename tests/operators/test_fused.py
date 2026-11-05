@@ -313,6 +313,99 @@ def test_library_program_memory_variants(monkeypatch):
                                    atol=1e-2)
 
 
+_DOUBLE_SRC = JINJA_ENV.from_string("""
+extern "C"
+void {{ name }}(bfloat16 *__restrict a, bfloat16 *__restrict c) {
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    auto ones = aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    for (int i = 0; i < {{ n }} / 32; i++) {
+        aie::accum<accfloat, 32> acc;
+        acc.from_vector(aie::load_v<32>(a), 0);
+        aie::store_v(c, aie::mac(acc, ones, aie::load_v<32>(a)).template to_vector<bfloat16>());
+        a += 32; c += 32;
+    }
+}
+""")
+
+
+class ChainOperator(ArtcOperator):
+    """out = 4 x by two cores on neighbouring tiles, each doubling, the first's output in shared memory (no DMA): the
+    second core acquires its neighbour's locks."""
+
+    def __init__(self, *, n: int):
+        self.n = n
+        super().__init__()
+
+    def get_kernel_src(self) -> str:
+        return _DOUBLE_SRC.render(name=f"test_double_{self.n}", n=self.n)
+
+    def get_arg_spec(self) -> list[ArgSpec]:
+        return [ArgSpec("in", (self.n,), torch.bfloat16), ArgSpec("out", (self.n,), torch.bfloat16)]
+
+    def get_mlir_artifact(self) -> Module:
+        ty = np.ndarray[(self.n,), np.dtype[bfloat16]]
+        k = Kernel(f"test_double_{self.n}", "kernel.o", [ty, ty])
+        i_f, ab, o_f = ObjectFifo(ty, name="ch_i"), ObjectFifo(ty, name="ch_ab"), ObjectFifo(ty, name="ch_o")
+
+        def core(i_h, o_h, kern):
+            a, c = i_h.acquire(1), o_h.acquire(1)
+            kern(a, c)
+            o_h.release(1)
+            i_h.release(1)
+
+        def seq(x, out, ih, oh):
+            tg = TaskGroup()
+            ih.fill(x, TensorAccessPattern((self.n,), 0, [1, 1, 1, self.n], [0, 0, 0, 1]), group=tg)
+            oh.drain(out, TensorAccessPattern((self.n,), 0, [1, 1, 1, self.n], [0, 0, 0, 1]), group=tg, wait=True)
+            tg.finish()
+
+        workers = [Worker(core, [i_f.cons(), ab.prod(), k], tile=Tile(0, 2)),
+                   Worker(core, [ab.cons(), o_f.prod(), k], tile=Tile(0, 3))]
+        rt = Runtime(seq, [ty, ty, i_f.prod(tile=Tile(0, 0)), o_f.cons(tile=Tile(0, 0))])
+        return Program(NPU2(), rt, workers=workers).resolve_program()
+
+
+def test_library_without_reset(monkeypatch):
+    """Configurations without the array reset (``program.Quiet``): a design whose second core waits on its neighbour's
+    lock when it ends (``locks.census`` finds it; the next configuration flushes it) alternating with another, in one
+    piece: every configuration but the first without the reset, the outputs the reset path's bit for bit."""
+    from artlite.operators.fused import ctrlpkt
+    from artlite.operators.fused import library as fused_library
+    from artlite.txn import device_address
+
+    n = 1024
+    monkeypatch.setattr(ctrlpkt, "worth", lambda loader: True)
+    lib = Library("t_library_reuse", [ChainOperator(n=n), AddOperator(size=n)]).compile()
+    lib.load()
+    asm = lib._asm
+    assert asm.reuse and asm._neighbours[0][1], "the chain's second core acquires its neighbour's lock"
+    dev = artlite.Device()
+    x = torch.randn(n).bfloat16()
+    bx = artlite.from_torch(x.clone(), dev)
+    t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+    a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
+    items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
+    for _ in range(7):
+        items += [(0, [a["out"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
+    outs = []
+    for reuse in (False, True):
+        asm.reuse = reuse
+        lib._pieces.clear()
+        fused_library._PIECES.held = [None, None]
+        parity = asm.parity
+        asm.assemble(items)
+        assert (asm.parity != parity) == reuse  # (1 PDI load with the reset in the 16 configurations, else 16)
+        asm.parity = parity  # (the PDI the firmware loaded last unchanged: the run's first configuration resets)
+        lib.run(items, bufs=[b._raw for b in (bx, t, out)])
+        out.sync_from_device()
+        outs.append(out.to_torch().clone())
+    assert torch.equal(outs[0], outs[1])
+    y = x.float()
+    for _ in range(8):
+        y = 4 * y + x.float()
+    torch.testing.assert_close(outs[1].float(), y, rtol=5e-2, atol=5e-2 * float(y.abs().max()))
+
+
 def test_control_packets_encoding(tmp_path):
     """``ctrlpkt.packets`` encodes a tile's writes as mlir-aie's aie-translate does (stream and control headers with
     their parity, up to 4 words a packet)."""

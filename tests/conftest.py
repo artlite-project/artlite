@@ -30,6 +30,7 @@ SMOKE = (
     "test_sampling.py", "prefill/test_pace.py", "minicpmv/test_host.py", "minicpmv/test_npu.py", "test_probe.py", "operators/test_kmath.py",
     "server/test_router.py::test_catalog", "server/test_router.py::test_preset", "server/test_router.py::test_router",
     "operators/test_fused.py::test_library_program", "operators/test_fused.py::test_library_program_memory_variants",
+    "operators/test_fused.py::test_library_without_reset",
     "operators/test_fused.py::TestFusedOperator::test_silu_add",
     "decode/test_gemv.py::test_gemv[Q4_0-9216-4]",
     "prefill/test_gemm.py::test_prefill_gemm[llama-1B-Q4_K_M-L3-gate_up-T256]",

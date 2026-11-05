@@ -8,6 +8,7 @@ are allocated: the items address the caller's buffers.
 
 import contextlib
 import itertools
+import os
 import threading
 import time
 import weakref
@@ -20,6 +21,7 @@ from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
 from ...overlay import SPIN_MARGIN_US, irq_cpu, npu_turn
 from ..base import ArtcOperator
+from . import ctrlpkt, locks, program
 from .elf import FusedElf
 from .layout import Runlist, distinct, parse_name
 from .program import PIECE_BYTES, Assembler, Item
@@ -140,7 +142,8 @@ class Library(FusedElf):
         code, bds = self._control_program(elf, lambda bd: 0)  # (the items' addresses: written per item)
         slots = [(s.offset, s.offset + s.nbytes, e, k)
                  for e, (_, *names) in enumerate(self.runlist) for k, s in enumerate(map(self.layout.span, names))]
-        self._asm = Assembler(code, bds, slots)
+        census = locks.census(os.path.dirname(self.elf_path)) if program.REUSE and ctrlpkt.ENABLED else None
+        self._asm = Assembler(code, bds, slots, census)
         assert len(self._asm.blocks) == len(self.runlist), (len(self._asm.blocks), len(self.runlist))
         self._dispatch_bufs = list(self._pdis.values())
         if self._asm.packet_bytes:  # (the configurations' control packets: ``ctrlpkt``)
