@@ -286,7 +286,7 @@ class DecodeOverlayOperator(ArtcOperator):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
-        count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold fewer
+        count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold other
         than 16 rows (their [8 gate | 8 up] groups cross tiles: a window per slot); paged: formats whose kernels are
         code pages (module docstring); moe: (experts, experts used per token) of the MoE layers' phases (module
         docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
@@ -322,7 +322,8 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
         # memory, not one chunk's 128 panels in a row: their reads at once conflict; a 512-k input strip is a half)
         self.xh = nsb == 4 and not self.rowsplit and not post
-        self.wide = any(r > 16 for r in rows.values())  # (tiles of more than 16 rows: 4-slot designs)
+        # (tiles of more than 16 rows, or an MoE design's gate / up windows: 4-slot designs)
+        self.wide = any(r > 16 for r in rows.values()) or (moe is not None and gu_win)
         assert slots == 4 or not self.wide, rows
         self.yt = (128 if self.wide else 64) * slots // 4  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
@@ -330,7 +331,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.yb = self.yt  # (floats of a tile's row block: 16 rows [g 2][slot][r], 32 rows [g 4][slot][r])
         if self.moe:  # (row groups: a tile's 4 blocks, the helper's two; tiles of more than 16 rows: blocks of 32 rows,
             # their gate / up rows through the windows, ``gu_win``)
-            self.yb = 128 if any(r > 16 for r in rows.values()) else 64
+            self.yb = 128 if self.wide else 64
             self.yt, self.yn = 4 * self.yb, 2 * self.yb
             self.gu_win = self.gu_win or self.yb == 128
             self.PACKET, self.BD_COUNT = {"X": XID}, {"A": 3}  # (shim BD 3: the experts' tasks, ``moe``)

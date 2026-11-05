@@ -194,6 +194,12 @@ class QwenImage(TileImage):
         out[rows[:, own]] = np.arange(COLS * per).reshape(COLS, per)[:, own]
         return out
 
+    def gu_rows(self) -> set[int]:
+        """The rows per tile of the gate / up phases' tiles: the dense layers' gate_up, an MoE layer's shared expert
+        (moe_in's "sgu") and experts (exp_gu)."""
+        return {b.R for r in self.regions + self.slabs for b in r.blocks
+                if r.name in ("gate_up", "exp_gu") or (r.name, b.name) == ("moe_in", "sgu")}
+
     def mtp_view(self, cfg: QwenConfig) -> "MtpView":
         """The image of the MTP block's drafter (``cfg``: its config, the block as a layer): ``MtpView``."""
         assert self.draft_cols, "a file with an MTP block of its own"
@@ -331,6 +337,8 @@ class MtpView:
 
     def region(self, layer: int, name: str) -> Region:
         return self._index[(layer, name)]
+
+    gu_rows = QwenImage.gu_rows
 
     def head_rows(self) -> np.ndarray:
         """The head's tokens (COLS, draft_cols): per column its fixed tokens, then its table's (the model's LM rows)."""

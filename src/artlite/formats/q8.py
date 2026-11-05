@@ -75,7 +75,7 @@ __attribute__((noinline)) void {{ p }}_q80_d(const uint8_t *__restrict u, bfloat
 {% endif %}
 template <int H>
 __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg and R80 == 8 else "" }})
 {
     bfloat16 *tab = (bfloat16 *)scr;
     bfloat16 *c = (bfloat16 *)(scr + 1024);
@@ -83,8 +83,8 @@ __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q80_d(a + 4352 * H, tab);  // (the rows' d of super-blocks 2 H, 2 H + 1)
     {{ p }}_q80_mm<2, 128>(xp, a + 4352 * H, c);
     AIE_LOOP_NO_UNROLL
-    for (int sb = 0; sb < 2; sb++)
-        {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y);
+    for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg else "" }}
+        {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y{{ " + sb * ys" if rg else "" }});
 {% else %}
     {{ p }}_dtab<1>((const bfloat16 *)a + {{ 64 * NSB }} * H, tab);
     {{ p }}_q80_mm<{{ NSB }}, {{ 256 * R80 - 2048 }}>(xp, a + {{ 16 * NSB * R80 }} + 2048 * H, c);

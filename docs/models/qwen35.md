@@ -33,8 +33,9 @@ $ARTLITE_MODELS_DIR/ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
 the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"; Occamy's:
 `model_config.occamy_gguf()`). The NPU path reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and IQ3_XXS tensors, Q4_0 ones (a
-drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha). Qwen3.8's drafter is its file's own MTP layer; a
-qwen35moe model's (`model_config.qwen_mtp_of`):
+drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha), in any role: a file whose FFN gate / up is in another
+format than Q4_K (the Q5_K_M, Q6_K and Q8_0 files) decodes up to 4 tokens per dispatch. Qwen3.8's drafter is its
+file's own MTP layer; a qwen35moe model's (`model_config.qwen_mtp_of`):
 an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in another account's repository of the
 same name (ggml-org publishes its drafters apart from the models); of several, Q4_0, then Q4_K_M, then Q8_0.
 
@@ -42,7 +43,7 @@ same name (ggml-org publishes its drafters apart from the models); of several, Q
 
 Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
 share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head (the 27B
-models' up to 8, for a drafter's long chains: a step of 8 costs 1.01x a step of one at 1K and at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
+models' up to 8 when their gate / up is Q4_K, for a drafter's long chains: a step of 8 costs 1.01x a step of one at 1K and at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
 cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);

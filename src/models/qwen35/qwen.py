@@ -58,7 +58,7 @@ from ..readouts import readout_model
 from ..sequence import Sequence
 from ..tokenizer import QwenTokenizer, chat_prompt
 from .dflash import DFlashOverlay
-from .draft import HeadTable, QwenDraft, draft_formats
+from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
 from .image import QwenImage
 from .overlay import QwenOverlay
 from .prefill import QwenPrefill
@@ -92,7 +92,8 @@ class NpuQwen(OverlayModel):
         mtp = GGUFFile(path) if path else None
         image = QwenImage(gguf, cfg, mtp=False) if dflash and weights is None else None
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights, image=image,
-                                   formats=draft_formats(mtp) if mtp is not None else ())
+                                   formats=draft_formats(mtp) if mtp is not None else (),
+                                   gu=draft_gate_up(mtp) if mtp is not None else frozenset())
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal
         self.eos_token_ids = self.cfg.eos_token_ids

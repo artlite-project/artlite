@@ -43,7 +43,7 @@ def _tokens(path: str, n: int, name: str = "founders.txt") -> list[int]:
     return ref.llama_tokenize(path, essay(name))[:n]
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
+@pytest.mark.parametrize("size", ["9B", "27B", "1B", "d3-lite"])
 def test_slice(size: str) -> None:
     from models.qwen35.overlay import QwenOverlay
 

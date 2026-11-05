@@ -14,11 +14,12 @@ from artlite.decode.design import norm_objects
 from artlite.decode.image import BLOCK_BYTES, pack_rows
 from artlite.formats import pack_tile, slice_fields
 from artlite.gguf_model import GGUFFile, QTensor
+from artlite.model_config import MODELS_DIR
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
-from .ref import QwenConfig, experts, qwen_gguf
+from .ref import QwenConfig, decision_gguf, experts, qwen_gguf
 
 S = 9280
 MOE = qwen_gguf("Q4_K_M", "35B-A3B")
@@ -250,6 +251,34 @@ def test_pack_moe() -> None:
             got = QTensor(name="d", qtype=dview.qtype, rows=o.size, cols=F // 2, raw=dview.raw[v[o]]).dequantize().numpy()
             want = down[_group_out(v.size, dn.R, 4)[o], h * F // 2:(h + 1) * F // 2]
             assert np.array_equal(got, want), (L, e, h)
+
+
+def test_gate_up_windows() -> None:
+    """Gate / up tiles of other than 16 rows (``QwenImage.gu_rows``: d3-lite's Q8_0, 8) take the decode design's windows
+    (``decode.design``'s ``gu_win``) and so 4 slots, and an MoE design's windows its wide frame (Qwen3.6-35B-A3B with
+    ggml-org's Q8_0 drafter: ``draft_gate_up``); MiniCPM-V's Q4_K (16 rows) none."""
+    from models.qwen35.draft import draft_formats, draft_gate_up
+    from models.qwen35.overlay import QwenOverlay
+
+    mtp8 = os.path.join(MODELS_DIR, "ggml-org", "Qwen3.6-35B-A3B-GGUF", "mtp-Qwen3.6-35B-A3B-Q8_0.gguf")
+    ran = 0
+    cases = ((decision_gguf("d3-lite"), None, {8}, True), (qwen_gguf("Q4_K_M", "1B"), None, {16}, False),
+             (MOE, mtp8, {16}, True))
+    for path, mtp, rows, win in cases:
+        if not os.path.exists(path) or (mtp is not None and not os.path.exists(mtp)):
+            continue
+        gm = GGUFFile(mtp) if mtp is not None else None
+        ov = QwenOverlay(GGUFFile(path), layers=[0, 3], vocab=4096, max_positions=64,
+                         formats=draft_formats(gm) if gm is not None else (),
+                         gu=draft_gate_up(gm) if gm is not None else frozenset())
+        assert ov.image.gu_rows() == rows and ov.op.gu_win == win, (path, ov.image.gu_rows(), ov.op.gu_win)
+        if gm is not None:
+            assert draft_gate_up(gm) == {8} and ov.op.wide
+        elif win:
+            assert ov.op.slots == 4
+        ran += 1
+    if not ran:
+        pytest.skip("no files")
 
 
 def _bfp16_rows(tile: np.ndarray) -> np.ndarray:

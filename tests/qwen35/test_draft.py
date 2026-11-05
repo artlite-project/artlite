@@ -1,4 +1,5 @@
-"""The multi-token-prediction drafter (``qwen35.draft.QwenDraft``) of Qwen3.6-35B-A3B (ggml-org's Q4_0 MTP file), of
+"""The multi-token-prediction drafter (``qwen35.draft.QwenDraft``) of Qwen3.6-35B-A3B (ggml-org's Q4_0 MTP file, and its
+Q8_0 one: gate / up tiles of 8 rows, row-group downs), of
 Occamy 1.0 (its Q4_K_M MTP file: Q4_K and Q6_K) and of Qwen3.8-27B (its file's own block, on the model's image: its
 head the first rows of the model's, the vocabulary whole) on the decode overlay of a 2-layer slice (layers 0 and 3: the
 model's design, its formats with the drafter's), against ``ref.mtp_block`` on llama.cpp's hidden states of an essay
@@ -14,7 +15,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
-from models.qwen35.draft import TABLE_ROWS, QwenDraft, draft_formats
+from models.qwen35.draft import TABLE_ROWS, QwenDraft, draft_formats, draft_gate_up
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.prefill import QwenPrefill
 
@@ -24,21 +25,28 @@ from . import ref
 N = 100
 # (per model: the router gap below which a row's 8th and 9th experts tie, h's median and largest error elsewhere;
 # Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median; the
-# 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%)
-TOL = {"35B-A3B": (0.01, 7e-3, 1.5e-2), "occamy": (0.02, 1.5e-2, 2.5e-2), "3.8-27B": (0.0, 1.5e-2, 3e-2)}
+# 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%. The K records hold K as single bfp16: the 35B-A3B's
+# h 0.72-0.74% median against the oracle, 0.68-0.70% against one with K so rounded; its 1.2% gaps flip at S 4. A step
+# of S > 1 encodes its V records once, so position 0's V shares its bfp16 blocks with the step's later positions: the
+# row that attends to it alone moves by that, the 35B-A3B's to 1.75%, Occamy's 2.2% (S 1) -> 2.8%)
+TOL = {"35B-A3B": (0.015, 7.5e-3, 2e-2), "35B-A3B-Q8_0": (0.015, 7.5e-3, 2e-2), "occamy": (0.02, 1.5e-2, 3e-2),
+       "3.8-27B": (0.0, 1.5e-2, 3e-2)}
 # (designs of 8 slots: x as single bfp16 rows, ``decode.gemv``; the 27B's h 1.4% median, 4.3% at most)
 TOL8 = {"3.8-27B": (0.0, 2e-2, 5e-2)}
-SIZES = ["35B-A3B", "occamy", "3.8-27B"]
+SIZES = ["35B-A3B", "35B-A3B-Q8_0", "occamy", "3.8-27B"]
 PREFILL_TOL = {"3.8-27B": (1.5e-2, 3e-2)}  # (test_draft_prefill's records and carry, where not 1% and 2%)
 PREFILL_TOL8 = {"3.8-27B": (2.5e-2, 3e-2)}  # (designs of 8 slots: the steps' records 1.7% from the prefill's)
 
 
 def _files(size: str) -> tuple[str, str]:
-    """The model file of a size ("35B-A3B", "occamy", "3.8-27B") and its drafter's (the model's own, with a block)."""
+    """The model file of a size ("35B-A3B", "occamy", "3.8-27B"; "35B-A3B-Q8_0": its Q8_0 drafter) and its drafter's
+    (the model's own, with a block)."""
+    size, _, quant = size.partition("-Q")
     model = ref.size_gguf(size)
     if not os.path.exists(model):
         pytest.skip(f"no {model}")
-    mtp = model if QwenConfig.from_gguf(GGUFFile(model)).nextn_layers else qwen_mtp_of(model)
+    own = QwenConfig.from_gguf(GGUFFile(model)).nextn_layers
+    mtp = model if own else qwen_mtp_of(model, "Q" + quant if quant else "")
     if mtp is None:
         pytest.skip(f"no MTP drafter of {model}")
     return model, mtp
@@ -52,7 +60,7 @@ def _slice(model: str, mtp: str, max_positions: int) -> tuple[QwenOverlay, QwenD
         return target, QwenDraft(target)
     gm = GGUFFile(mtp)
     target = QwenOverlay(GGUFFile(model), layers=[0, 3], vocab=4096, max_positions=max_positions,
-                         formats=draft_formats(gm))
+                         formats=draft_formats(gm), gu=draft_gate_up(gm))
     return target, QwenDraft(target, gm)
 
 
@@ -108,7 +116,7 @@ def test_table(setup: tuple) -> None:
     seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
-    2% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks (8 slots:
+    2.5% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks (8 slots:
     4%)."""
     draft, emb, h, r, tied, _ = setup
     d = draft if draft.w_of is not None else QwenDraft(draft.target, draft.gguf)  # (the model's own block: its buffer)
@@ -128,7 +136,8 @@ def test_table(setup: tuple) -> None:
     w = d.gguf.rows("output.weight", t.ids[t.rows]).numpy().astype(np.float64)
     want = r["h_nextn"].astype(np.float64) @ w.T
     e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
-    assert e[~tied].max() < (2e-2 if d.SLOTS == 4 else 4e-2), (np.median(e), e[~tied].max())  # (8 slots: 3.6%)
+    # (8 slots: 3.6%; Occamy's 2.3%: position 0's V in the step's blocks, ``TOL``)
+    assert e[~tied].max() < (2.5e-2 if d.SLOTS == 4 else 4e-2), (np.median(e), e[~tied].max())
 
 
 def test_interleaved(setup: tuple) -> None:

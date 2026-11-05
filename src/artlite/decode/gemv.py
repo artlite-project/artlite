@@ -65,7 +65,7 @@ def scr_bytes(slots: int = SLOTS) -> int:
     """A core's scratch (Q6_K's of 8 slots: c [i][h][g][64] bf16 after its 5 KB of codes and tables)."""
     return SCR_BYTES if slots == 4 else 9216
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
-RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS")  # (``render(rg=)``) the formats of row-group tiles
+RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS", "Q8_0")  # (``render(rg=)``) the formats of row-group tiles
 B_G4 = 8192  # (``decode.design``'s block format word bit of row groups of 4)
 
 

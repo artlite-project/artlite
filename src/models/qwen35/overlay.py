@@ -144,11 +144,13 @@ class _Step:
         self.patch: dict[str, np.ndarray] | None = None  # (``_patch_tables``)
 
 
-def slots_of(cfg: QwenConfig, fmts: set[str]) -> int:
+def slots_of(cfg: QwenConfig, fmts: set[str], gu_win: bool = False) -> int:
     """A step's token slots at most: 8 for a dense model of a KV head per 2 columns whose formats the decode GEMV runs at
-    8 slots (``decode.gemv``): no slower at S 1, S 4 3% faster. Else 4: an MoE design has no broadcast input, a KV head
-    per 4 columns makes the one-pass attention slower at S 1."""
-    return 8 if not cfg.moe and COLS // cfg.num_key_value_heads == 2 and all(gemv.supported(f, 4, 8) for f in fmts) else 4
+    8 slots (``decode.gemv``) and whose gate / up tiles hold 16 rows: no slower at S 1, S 4 3% faster. Else 4: an MoE
+    design has no broadcast input, a KV head per 4 columns makes the one-pass attention slower at S 1, gate / up tiles of
+    other rows need the windows (``gu_win``: ``decode.design``) that designs of 8 slots lack."""
+    return 8 if (not cfg.moe and not gu_win and COLS // cfg.num_key_value_heads == 2
+                 and all(gemv.supported(f, 4, 8) for f in fmts)) else 4
 
 
 def chunk_of(cfg: QwenConfig) -> bool:
@@ -167,7 +169,9 @@ class QwenOverlay(ModelOverlay):
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the KV caches' capacity, ``weights``: the
     image's buffer allocated ahead (its image's layers and vocabulary), ``formats``: tile formats the design runs
     besides the image's (a drafter's: ``draft``; past three formats, all but the model's largest as code pages),
-    ``image``: an image laid out already (``ModelOverlay``'s: a drafter's view of its model's).
+    ``gu``: the rows per tile of a drafter's gate / up tiles besides the image's (``draft.draft_gate_up``: gate / up
+    tiles of other than 16 rows take ``decode.design``'s windows), ``image``: an image laid out already
+    (``ModelOverlay``'s: a drafter's view of its model's).
 
     ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot, which the step's and the prefill's
     rotations take; the slot's index (text from position 0) until a model writes others (an image's tokens, the
@@ -178,12 +182,13 @@ class QwenOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 image: QwenImage | None = None, slots: int | None = None):
+                 image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset()):
         """slots: a step's token slots at most (default ``slots_of``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
-        slots = slots or slots_of(cfg, fmts)
+        gu_win = img.gu_rows() | gu != {16}  # (``decode.design``'s gate / up windows)
+        slots = slots or slots_of(cfg, fmts, gu_win)
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
@@ -195,8 +200,9 @@ class QwenOverlay(ModelOverlay):
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
-                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16),
-                                      slots=slots, bcast=slots == 8)
+                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16
+                                                                                        or gu_win)),
+                                      slots=slots, bcast=slots == 8, gu_win=gu_win)
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
         self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "4 slots, chunkwise")
         self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})

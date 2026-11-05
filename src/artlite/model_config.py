@@ -122,10 +122,11 @@ def assistant_of(model: str) -> str:
 MTP_QUANTS = ("Q4_0", "Q4_K_M", "Q8_0")  # (a qwen35 drafter file by preference: the fewest bytes per draft first)
 
 
-def qwen_mtp_of(model: str) -> str | None:
+def qwen_mtp_of(model: str, quant: str = "") -> str | None:
     """The multi-token-prediction drafter (``mtp-*.gguf``, or an uploader's ``<name>-mtp-*.gguf``) of a qwen35 /
     qwen35moe model file without a block of its own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
-    the drafters apart from other uploaders' models); of several, the first of ``MTP_QUANTS``. None: there is none."""
+    the drafters apart from other uploaders' models); of several, the first of ``MTP_QUANTS`` (``quant``: that
+    quantization's only). None: there is none."""
     d = os.path.dirname(os.path.abspath(model))
     root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d)
     others = sorted(os.path.join(root, org, repo) for org in os.listdir(root) if os.path.isdir(os.path.join(root, org, repo)))
@@ -134,7 +135,8 @@ def qwen_mtp_of(model: str) -> str | None:
         return next((i for i, q in enumerate(MTP_QUANTS) if f.endswith(f"-{q}.gguf")), len(MTP_QUANTS))
 
     for x in dict.fromkeys([d, *others]):
-        files = [f for f in os.listdir(x) if (f.startswith("mtp-") or "-mtp-" in f) and f.endswith(".gguf")]
+        files = [f for f in os.listdir(x) if (f.startswith("mtp-") or "-mtp-" in f)
+                 and f.endswith(f"-{quant}.gguf" if quant else ".gguf")]
         if files:
             return os.path.join(x, min(sorted(files), key=rank))
     return None

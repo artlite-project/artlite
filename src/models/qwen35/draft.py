@@ -83,10 +83,19 @@ def _formats(img: QwenImage) -> set[str]:
     return {b.fmt for r in img.regions + img.slabs for b in r.blocks}
 
 
+def _draft_image(gguf: GGUFFile) -> DraftImage:
+    cfg = mtp_config(gguf)
+    return DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1])
+
+
 def draft_formats(gguf: GGUFFile) -> tuple[str, ...]:
     """The tile formats of a drafter file's image: its model's design runs them (``QwenOverlay(formats=)``)."""
-    cfg = mtp_config(gguf)
-    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1]))))
+    return tuple(sorted(_formats(_draft_image(gguf))))
+
+
+def draft_gate_up(gguf: GGUFFile) -> frozenset[int]:
+    """The rows per tile of a drafter file's gate / up tiles: its model's design takes them (``QwenOverlay(gu=)``)."""
+    return frozenset(_draft_image(gguf).gu_rows())
 
 
 class HeadTable:
@@ -173,6 +182,9 @@ class QwenDraft(QwenOverlay):
         if not fmts <= set(target.op.rows):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
                              f"QwenOverlay(formats=draft_formats(gguf))")
+        if self.image.gu_rows() != {16} and not target.op.gu_win:
+            raise ValueError(f"the drafter's gate / up tiles of {sorted(self.image.gu_rows())} rows need the design's "
+                             f"windows: QwenOverlay(gu=draft_gate_up(gguf))")
         self.target, self.op = target, target.op  # (the model's design and hardware context: ``load``)
         self.table = HeadTable(self.image, cfg.vocab_size, lambda: self.dev)
 
@@ -225,4 +237,5 @@ class QwenDraft(QwenOverlay):
         return torch.from_numpy(x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight"))
 
 
-__all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "HeadTable", "QwenDraft", "draft_formats", "head_tokens", "mtp_config"]
+__all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "HeadTable", "QwenDraft", "draft_formats", "draft_gate_up", "head_tokens",
+           "mtp_config"]
