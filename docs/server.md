@@ -144,8 +144,13 @@ artlite-server -m Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf 
 curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d '{"input": ["a text", "another"]}'
 ```
 
-A request's texts run one after another, each entirely as prefill chunks (no decode steps, no LM head), after the
-prefix the prompt cache keeps of it. `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
+A request's texts run entirely as prefill chunks (no decode steps, no LM head). Several texts in one request run
+packed: several of them in one chunk (up to 4096 tokens; 2048 on Qwen3.5's path), each with its own positions,
+attention and Gated DeltaNet state, so they share the chunk's fixed cost. The server plans a request by the prefill's
+estimates and runs a text alone where packing would not be faster (on Qwen3's path, any text longer than 512 tokens).
+A prefix the texts share (a rerank query's prompt before its documents) runs once, through the prompt cache, and every
+text after it sees it. Qwen3-Embedding-0.6B: 10.3K tokens/s for requests of 32 texts of 64-512 tokens (7.1K one
+after another); Qwen3-Reranker-0.6B: 22 pairs/s at ~510-token pairs (16). `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
 `{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file (Qwen3-Reranker): its
 classifier head (`cls.output`) on the last token of its rerank prompt (the file's `rerank` template). With it,
 `/classify` returns vLLM's classification of each `input` (a text or token ids): the labels' probabilities (`probs`:
@@ -181,7 +186,9 @@ rows at the ends of the options and of the question), computed on the host from 
 published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M) and Decision-2.0-Kai-0.6B
 (llama.cpp's converter run on vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
 at most 2048 tokens (a longer prompt: 400), and it generates no text; other types' questions share the state's tokens
-through the prompt cache. Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
+through the prompt cache. A request's questions run packed as embeddings' texts do (a vllm-d3 model's whole prompts;
+on a Qwen3.5 model, whose state cannot be shared inside a chunk, either the state once and each question after it or
+the questions' whole prompts packed, whichever the estimates say is faster). Other types (laya, clef, lfm2-d1) and images (`files`, `images`, a message's image parts)
 answer 501.
 
 ## Requests

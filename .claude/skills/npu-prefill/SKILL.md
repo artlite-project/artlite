@@ -65,6 +65,27 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   LM head; the heads on the host: `models.readouts`, `models.server.decisions`). A non-causal model (vllm-d3:
   `QwenConfig.causal`) runs a prompt whole in one chunk from position 0: the flash attention's passes all stream the
   prompt's groups, the padding keys of its last group masked (`PrefillAttnOperator(causal=False)`), no decode steps.
+- **Packed chunks** (a readout model's prefill, `pack`; `NpuModel.readouts`): several inputs (segments) back to back in
+  one chunk, so they share its ConfigureOps and weight passes. Only operators that mix tokens need packed variants;
+  every other operator works row by row:
+  - the attention: each row sees its segment's keys (after a history every row sees: a shared prefix). The Llama path's
+    (`prefill.attn.AttnOperator(window=)`) is DMA-bound (compute compiled out: 88-92% of its time), so skipping masked
+    chunks' compute saves nothing; a pass streams a fixed window of cache groups ending at its own instead (no runtime
+    parameters: a sequence reads at most 32), which caps a segment at `PACK_SPAN`. qwen35's
+    (`PrefillAttnOperator(pack=)`) streams as unpacked. Both take the rows' first / last keys on a stream (SEG, an
+    object per pass in the values the memtile walk leaves in order) and mask the rest;
+  - qwen35's GDN prep / scan (`pack=`): the mask PM per token, 1 + its distance from its segment's first token; d = -2
+    marks that token (natural decays round to -1.0); the scan's reset is exact: the cut E terms are held at -1 and the
+    values they multiply are zeroed by select (`al::mulff`'s bf16 hi + lo products leave 2^-17 of x in x + (-1) x: a long
+    segment's state leaked 9% into the next), and a segment's first 3 tokens' convs use their own taps only.
+  - Positions per token: cos / sin rows written past the table's text rows (rows only padding tokens read otherwise).
+  - Test a packed chunk against each segment alone in a chunk of the same size: GEMM K parts and norm splits differ
+    between sizes. K records come out bit-identical. V's blocks span a record's 8 positions, so a segment that starts
+    inside one rounds every V differently. Segments at 32-token key chunks are bit-identical up to their last V record.
+  - `ChunkPrefill.pack` plans a request (first-fit-decreasing into each size, each chunk's inputs instead in smaller ones
+    or alone where not faster).
+  - Qwen3-Embedding-0.6B's 4096-token packed chunk: 354 ms against 515 unpacked: its attention 96 ms (the window) against
+    257 ms.
 - **App** (`models.common.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
   start (whole cache groups), the planner's chunks, decode steps after; each chunk's inputs (embeddings, per-layer
   inputs) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and
