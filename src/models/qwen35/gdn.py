@@ -512,7 +512,7 @@ namespace {
 
 {{ gm.expm1.src }}
 {{ gm.softplus.src }}
-{% set silu = km.act(km.SILU, f32=True, table_arg=True) %}
+{% set silu = km.act(km.SILU, f32=True, table_arg=True, small=SMAX < 8) %}
 {{ silu.src }}
 
 // 1024 SiLUs: t scratch, y fp32 (the table's addresses run-time values: llvm-aie's gathers want pointers)
@@ -1590,8 +1590,9 @@ void {{ p }}_gdlout(int32_t *__restrict ws, bfloat16 *__restrict d)
 
 // The v head's gated outputs rms(o) ssm_norm silu(z) -> d ([k block 16][slot 4][8] bf16; 1 KB of padding), its new history 2 KB
 // on; the next v head (of the next k head after the last of this one's). (o: [panel 16][j 8][t 8]; z from the message, silu(z)
-// in vt, the panels being through; the rows past S go nowhere)
-void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
+// in vt, the panels being through; the rows past S go nowhere; minsize: its kb loop pipelined, 256 B more, puts an MoE
+// design's GDN core past its program memory)
+__attribute__((minsize)) void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = GW(int32_t, {{ g.st }});

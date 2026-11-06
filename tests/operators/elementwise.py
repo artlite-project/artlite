@@ -144,7 +144,7 @@ void {{ name }}(bfloat16 __aie_dm_resource_a *__restrict input, bfloat16 __aie_d
 
 
 class SiluOperator(StreamOperator):
-    """SiLU (or another kmath table's activation: ``table``) on a 1-D bf16 vector (``kmath.act``: ~0.8 cycles per
+    """SiLU (or another kmath table's activation: ``table``) on a 1-D bf16 vector (``kmath.act``: ~0.5 cycles per
     element); ``repeat``: computed that many times per tile (the same output: a long compute-bound dispatch)."""
 
     def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, table: str = "silu",

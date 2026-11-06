@@ -131,13 +131,14 @@ pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
   from its centre (c0 fp32, c1, c2 bf16: one 64-bit entry; minimax on the segment's bf16 points, in result ULPs).
 - Range reduction in bf16: v = bf16(t + 32) rounds t to the grid ([32, 56] is a binade of ULP 1/4), r = (32 - v) + t
   exactly ((32 - v) first, or tiny t lose their bits), the table offset is vfloor(64 v).
-- Max 0.59 ULP, 99.84% correctly rounded, 3287 cycles per 4096 elements on the NPU; the vtanh / vexp2 form below:
+- Max 0.59 ULP, 99.84% correctly rounded, ~2000 cycles per 4096 elements on the NPU; the vtanh / vexp2 form below:
   6.6 ULP (at x = -2.2), 2682 cycles. Its emulation in numpy is bit-exact (`emulate` in `tests/operators/elementwise.py`).
 - What set the II (~550 variants): register pressure, not slots. In one loop the
   constant vectors (1, 24, the abs mask, 0, the lanes' table pointers) took 5 of the 12 x registers, and the
   post-pipeliner's allocation failed (II 23-30 at ResMII 12-15; constants parked in lf / bm registers and moved back
-  every iteration). Fission: t = min(|x|, 24) in a loop of its own (II 2), the table pass reads it in place (II 22,
-  bound 9: the post-pipeliner's register allocation fails below). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
+  every iteration). Fission: t = min(|x|, 24) in a loop of its own (II 2), the table pass reads it in place (II 14,
+  bound 9; post-RA only: 21, its register allocation fails below; a full table's pass: II 12 post-RA only, 27 pipelined
+  first). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
   halves (moves).
 
 ### Sigmoid through the gather LUT (`km.SIGMOID`: the qwen35 attention prep's gate)

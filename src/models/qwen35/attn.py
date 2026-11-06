@@ -211,8 +211,9 @@ _SRC = JINJA_ENV.from_string(r"""
 
 namespace {
 
-// 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each)
-__attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
+// 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each); minsize where
+// this core gates o (an MoE design: no program memory to spare; 112 B less, ~120 cycles more per head)
+__attribute__((noinline{{ "" if GATE_MAIN else ", minsize" }})) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
                                                  const float *__restrict cs, const float *__restrict sn,
                                                  float *__restrict out)
 {

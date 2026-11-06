@@ -511,19 +511,23 @@ class _Compilation:
         return self.clean_returncode or self.annotated_returncode
 
 
+COMPILE_TIMEOUT = 600  # seconds (a fused library's translation unit takes ~200 s)
+
+
 def _run_compiler(command: list[str]) -> tuple[str, str, int]:
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=COMPILE_TIMEOUT,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + "compiler timed out after 120 seconds\n"
-        return stdout, stderr, 124
+        def text(b: bytes | str | None) -> str:  # (the exception's output is bytes even with text=True)
+            return b.decode(errors="replace") if isinstance(b, bytes) else b or ""
+
+        return text(exc.stdout), text(exc.stderr) + f"compiler timed out after {COMPILE_TIMEOUT} seconds\n", 124
     return result.stdout or "", result.stderr or "", result.returncode
 
 

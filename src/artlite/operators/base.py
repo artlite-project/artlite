@@ -78,8 +78,10 @@ AIE_TARGET = "aie2p-none-unknown-elf"
 # llc flags for the cores' own code (the worker loops aiecc generates from a design; the kernels are clang++'s): a loop
 # without a known minimum trip count (an object fifo's skip loop: acquire, release) as a branch loop, not a zero-overhead
 # loop padded with full NOP bundles (~32 instead of ~180 B each: the Gemma decode overlay's attention cores' loop 1840 ->
-# 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
-CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false",)
+# 1408 B, the main cores' 2400 -> 2192); the last 3 delay slots of a branch left empty: the scheduler ends a lock
+# acquire as late as the call's last delay slot (it leaves the acquire's stages out of the region's exit latency), and
+# its request (4 stages) is still out when the kernel reads the buffer (wrong rows, NaN). aiecc passes them on (-Xllc).
+CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false", "--aie-reserved-delay-slots=3")
 
 
 def _tool_env() -> dict[str, str] | None:

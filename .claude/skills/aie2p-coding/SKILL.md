@@ -327,6 +327,9 @@ Silent wrong results:
   fetches the callee before the acquire completes, fatal when the wait is for that very code (pages written by
   control packets: the core runs stale code and its fetch then blocks the writes). `__builtin_aie2p_sched_barrier()`
   after the acquire, and the call through a resident noinline function (`paging.check_pager` checks a pager's ELF).
+  In the last delay slot its request (4 stages) is still out when the callee's first bundles read the buffer it
+  guards (a worker loop's kernel call: wrong rows, NaN); the cores' llc leaves the last 3 delay slots empty
+  (`--aie-reserved-delay-slots=3` in `operators/base.py` `CORE_LLC_FLAGS`).
 - **Jinja `trim_blocks`** eats the newline after a block tag: `{% endif %}` at the end of a line glues the next line
   onto it (e.g. `inline` onto a return type). Put block tags on their own lines and read the rendered `kernel.cc` in
   the cache dir.
