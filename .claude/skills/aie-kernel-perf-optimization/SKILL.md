@@ -275,7 +275,11 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
 - **Smaller functions**: shared helpers out of line (`noinline`); `minsize` on cold dispatchers, rolled
   (`AIE_LOOP_NO_UNROLL`) call loops and copies, per function by compiling the kernels alone, no link (on a GDN core's constants
   and transposes -130 B each, nothing or more on its gate helpers and the scan's copy kernels, an unrolled solve +32 B:
-  split such code across ops or cores); vector compares against a lane-index table instead of 64-bit mask arithmetic;
+  split such code across ops or cores). `minsize` turns loop rotation off: a `for` loop stays two blocks (its test
+  at the top, the delay slots of its `jnz` and of the jump into it empty), no ZOL, ~7 cycles more per iteration. A loop whose ZOL is too big
+  (post-pipelined, or a short body padded to the ZOL's 112 B from setup to loop end) takes
+  `AIE_LOOP_MIN_ITERATION_COUNT(1)` without `minsize` instead (`gout`, `norm_rope`, `qpan`): no hardware loop, one
+  block, its `jnz` delay slots filled from the body, smaller and faster than `minsize`; vector compares against a lane-index table instead of 64-bit mask arithmetic;
   runtime parameters instead of template instances (each instance is a copy: one dequant routine with a runtime
   sub-block shift, `shuffle_down` of a short vector by a runtime amount then `filter_even`, instead of one instance per
   sub-block); a table activation (`km.act`) instead of a polynomial chain: smaller and faster.

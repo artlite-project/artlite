@@ -211,20 +211,27 @@ _SRC = JINJA_ENV.from_string(r"""
 
 namespace {
 
-// 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each); minsize where
-// this core gates o (an MoE design: no program memory to spare; 112 B less, ~120 cycles more per head)
-__attribute__((noinline{{ "" if GATE_MAIN else ", minsize" }})) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
+// 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each); where this core
+// gates o (no program memory to spare) its loops are no hardware loops (a minimum of 1 iteration): 144 B
+// less than their ZOLs (the first one post-pipelined), 32 cycles more per head; minsize: 32 B more, ~90 cycles more
+__attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
                                                  const float *__restrict cs, const float *__restrict sn,
                                                  float *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+{% if not GATE_MAIN %}
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+{% endif %}
     for (int i = 0; i < {{ HD }}; i += 64)
         ss = aie::mac_square(ss, aie::load_v<64>(x + i));
     const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
     aie::vector<bfloat16, 32> ih, il;  // (x is bf16: x / rms = x ih + x il, mulff's products less x's lo part, 0)
     al::split2<32>(aie::broadcast<float, 32>(inv), ih, il);
     AIE_LOOP_NO_UNROLL
+{% if not GATE_MAIN %}
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+{% endif %}
     for (int i = 0; i < {{ HD }}; i += 32) {
         const aie::vector<bfloat16, 32> xb = aie::load_v<32>(x + i);
         aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>(), aie::load_v<32>(w + i)));

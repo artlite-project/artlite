@@ -1590,9 +1590,10 @@ void {{ p }}_gdlout(int32_t *__restrict ws, bfloat16 *__restrict d)
 
 // The v head's gated outputs rms(o) ssm_norm silu(z) -> d ([k block 16][slot 4][8] bf16; 1 KB of padding), its new history 2 KB
 // on; the next v head (of the next k head after the last of this one's). (o: [panel 16][j 8][t 8]; z from the message, silu(z)
-// in vt, the panels being through; the rows past S go nowhere; minsize: its kb loop pipelined, 256 B more, puts an MoE
-// design's GDN core past its program memory)
-__attribute__((minsize)) void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
+// in vt, the panels being through; the rows past S go nowhere; its kb loop no hardware loop (a minimum of 1 iteration): as
+// a ZOL it is post-pipelined, 304 B more, past an MoE design's GDN core's program memory; minsize keeps the for loop two
+// blocks, its test at the top: 48 B more, ~90 cycles more)
+void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
@@ -1609,6 +1610,7 @@ __attribute__((minsize)) void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__r
     {{ p }}_gnorm(o, GW(float, {{ g.sq }}), {{ D }});
     const aie::vector<float, 64> iv = aie::load_v<8>(GW(float, {{ g.sq }}) + 64).template grow_replicate<64>();
     AIE_LOOP_NO_UNROLL
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
     for (int kb = 0; kb < 16; kb++) {
         const aie::vector<float, 64> w = al::bcast8(aie::load_v<8>(nw + 8 * kb));
         const aie::vector<float, 64> t = al::mulff<64>(al::mulff<64>(al::mulff<64>(aie::load_v<64>(o + 64 * kb), iv), w), aie::load_v<64>(sz + 64 * kb));
