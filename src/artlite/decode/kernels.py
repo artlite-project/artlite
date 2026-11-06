@@ -1164,7 +1164,9 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
 {% else %}
         al::copy<{{ YB }}, 32>(yt + {{ YB }}, r);
 {% endif %}
-    else  // (its partial sums of our block)
+    else  // (its partial sums of our block, on every tile: unrolled, 19 cycles at YB 64; Peano's rolled loop, a
+        // pipelined ZOL, takes 40 and 160 B more of the main core, where the 35B-A3B drafter design's pages need room)
+        AIE_LOOP_UNROLL_FULL
         for (int i = 0; i < {{ YB }}; i += 32)
             aie::store_v(yt + i, aie::add(aie::load_v<32>(yt + i), aie::load_v<32>(r + i)));
 {% elif rowsplit %}

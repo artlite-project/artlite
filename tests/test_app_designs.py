@@ -1,7 +1,9 @@
 """The apps' full designs, built as the apps build them (no NPU): the decode overlays and prefill libraries of the
-models present, the Stable Diffusion UNet program. They compile (program memory, stack and BD limits of the whole
-models, which the layer-slice tests do not reach), and ``--dump-designs`` records them: the refactoring check covers
-the apps without running the slow tests."""
+models present (Qwen3.6-35B-A3B also with its MTP drafter file, the app's default: the design runs the drafter's
+formats too), the Stable Diffusion UNet program. They compile (program memory, stack and BD limits of the whole
+models, which the layer-slice tests do not reach), a paged design's code pages link (each within the slot its core's
+resident code leaves: ``paging.link``, else only at load), and ``--dump-designs`` records them: the refactoring check
+covers the apps without running the slow tests."""
 
 import os
 from collections.abc import Callable
@@ -10,7 +12,7 @@ import pytest
 
 from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf, sd15_dir
+from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf, qwen_mtp_of, sd15_dir
 
 
 def _llama(size: str, quant: str, kv_k: str) -> tuple[str, Callable[[str], None]]:
@@ -20,6 +22,7 @@ def _llama(size: str, quant: str, kv_k: str) -> tuple[str, Callable[[str], None]
 
         ov = LlamaOverlay(GGUFFile(path), kv_k=kv_k)
         parallel_compile.compile_all([ov.op, LlamaPrefill(ov).lib])
+        ov.op.page_store()
 
     return llama_gguf(quant, size), build
 
@@ -33,12 +36,21 @@ def _gemma(path: str) -> None:
     parallel_compile.compile_all([ov.op, GemmaPrefill(ov).lib])
 
 
-def _qwen(path: str) -> None:
+def _qwen(path: str, mtp: bool = False) -> None:
+    """mtp: with the model's MTP drafter file (``Qwen``'s default for an MoE model: ``model_config.qwen_mtp_of``)."""
+    from models.qwen35.draft import QwenDraft, draft_formats, draft_gate_up
     from models.qwen35.overlay import QwenOverlay
     from models.qwen35.prefill import QwenPrefill
 
-    ov = QwenOverlay(GGUFFile(path), max_positions=4096)
-    parallel_compile.compile_all([ov.op, QwenPrefill(ov).lib])
+    drafter = None
+    if mtp:
+        if (file := qwen_mtp_of(path)) is None:
+            pytest.skip(f"no MTP drafter of {path}")
+        drafter = GGUFFile(file)
+    ov = QwenOverlay(GGUFFile(path), max_positions=4096, formats=draft_formats(drafter) if drafter else (),
+                     gu=draft_gate_up(drafter) if drafter else frozenset())
+    parallel_compile.compile_all([ov.op, QwenPrefill(ov, draft=QwenDraft(ov, drafter) if drafter else None).lib])
+    ov.op.page_store()
 
 
 def _sd15(path: str) -> None:
@@ -58,6 +70,7 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
+    "qwen-35B-A3B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "35B-A3B"), lambda path: _qwen(path, mtp=True)),
     "occamy-1.0-APEX": (occamy_gguf(), _qwen),
     "sd15": (sd15_dir(), _sd15),
 }
