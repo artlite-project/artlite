@@ -51,7 +51,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, max_prob
+from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, drafter_type, max_prob
 from ..minicpmv.host import image_prompt
 from ..minicpmv.npu import PROJECTORS, NpuVision
 from ..readouts import readout_model
@@ -73,9 +73,9 @@ MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95, "penalty_repeat":
 class NpuQwen(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full-attention layers' caches hold; ``prefill``: prompts
     in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``QwenPrefill``'s);
-    ``drafter``: a qwen35moe model's multi-token-prediction drafter file ("": the model file's own MTP block, else
-    ``model_config.qwen_mtp_of``'s file, when there is one; None: none); ``dflash``: a DFlash2 drafter's file, in the place of any of
-    those (``dflash.DFlashOverlay``)."""
+    ``drafter``: the multi-token-prediction drafter's file ("": the model file's own MTP block, else a qwen35moe model's
+    ``model_config.qwen_mtp_of`` file, when there is one; None: none, and an image without the block); ``dflash``: a
+    DFlash2 drafter's file, in the place of any of those (``dflash.DFlashOverlay``)."""
 
     recurrent = True  # (the GDN layers' states hold the whole sequence)
     BRANCH = 2  # the tokens of a sibling branch that rounds of the DFlash2 drafter may run (``_sibling``; 0: none)
@@ -91,14 +91,15 @@ class NpuQwen(OverlayModel):
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
         mtp = GGUFFile(path) if path else None
-        image = QwenImage(gguf, cfg, mtp=False) if dflash and weights is None else None
+        own = drafter == "" and not dflash  # (the file's own MTP block may draft: the image lays it out)
+        image = QwenImage(gguf, cfg, mtp=False) if not own and weights is None else None
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights, image=image,
                                    formats=draft_formats(mtp) if mtp is not None else (),
                                    gu=draft_gate_up(mtp) if mtp is not None else frozenset())
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal
         self.eos_token_ids = self.cfg.eos_token_ids
-        own = drafter == "" and self.overlay.image.mtp_layer >= 0  # (the file's own block)
+        own = own and self.overlay.image.mtp_layer >= 0
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None
         self.DRAFTS = self.overlay.SLOTS - 1
         if cfg.moe:
@@ -425,12 +426,12 @@ class NpuQwen(OverlayModel):
         return out
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
-                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(the drafter's table follows the prompt and each token: ``HeadTable.see``)"""
         see = self._table.see if self._drafting else None
         if see is not None:
             see(getattr(prompt, "ids", prompt))
-        for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs):
+        for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs, drafts=drafts):
             if see is not None:
                 see((token,))
             yield token
@@ -518,8 +519,10 @@ class Qwen(Model):
     tokenizer and chat template from its metadata. Opening the file allocates the weight image's buffer and packs it in
     a thread (``WeightBuffer``) while the tokenizer and the designs load. ``mmproj``: MiniCPM-V's vision encoder file
     (``models.minicpmv.npu.NpuVision``: images in prompts; ``max_slices``: an image's slices at most, default the
-    file's); ``dflash``: draft with the model's DFlash2 drafter (``model_config.qwen_dflash_of``) instead of its MTP block: by default
-    where the drafter's file exists, True: the file must exist, False: its MTP block."""
+    file's); ``spec_type``, ``draft_model``: the drafter (``common.drafter_type``): auto, the model's DFlash2 drafter
+    (``model_config.qwen_dflash_of``; not with images) where its file exists, else its MTP block, else a qwen35moe model's
+    MTP file (``model_config.qwen_mtp_of``); none (the image leaves the MTP block out); draft-mtp, draft-dflash: that
+    one, which must exist; ``draft_model``: that file."""
 
     name = "Qwen3.5"
     thinks = True
@@ -528,15 +531,25 @@ class Qwen(Model):
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
     projectors = PROJECTORS
 
-    def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None, dflash: bool | None = None):
+    def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None, spec_type: str = "auto",
+                 draft_model: str | None = None):
         self.gguf = GGUFFile(path)
         self.cfg = QwenConfig.from_gguf(self.gguf)
-        self.dflash = qwen_dflash_of(path) if dflash is not False and mmproj is None else None
-        if dflash and mmproj is not None:
+        kind = drafter_type(spec_type, draft_model, ("draft-mtp", "draft-dflash"), self.name)
+        if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
-        if dflash and self.dflash is None:
+        self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
+                       qwen_dflash_of(path) if kind == "auto" and mmproj is None else None)
+        if kind == "draft-dflash" and self.dflash is None:
             raise ValueError(f"{path}: no DFlash2 drafter (a <repository>-DFlash2-GGUF of Q4_K_M) in the models directory")
-        self.weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=self.dflash is None))
+        # (the MTP drafter, ``NpuQwen``'s: "" the file's own block, else a qwen35moe model's MTP file; a file; None)
+        self.mtp = None if self.dflash is not None or kind == "none" else draft_model or ""
+        image = QwenImage(self.gguf, self.cfg, mtp=self.mtp == "")
+        if self.mtp == "" and image.mtp_layer < 0 and not (self.cfg.moe and qwen_mtp_of(path)):
+            if kind == "draft-mtp":
+                raise ValueError(f"{path}: no MTP drafter (no MTP block in the file, no mtp-*.gguf beside it)")
+            self.mtp = None
+        self.weights = WeightBuffer(image)
         self.tokenizer = QwenTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.minicpmv = self.cfg.rope_section_order == "zyxt"
@@ -577,6 +590,6 @@ class Qwen(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
-        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, dflash=self.dflash,
-                            readout=readout_model(self.gguf.meta, self.gguf.arch))
+        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
+                            dflash=self.dflash, readout=readout_model(self.gguf.meta, self.gguf.arch))
         return self._npu

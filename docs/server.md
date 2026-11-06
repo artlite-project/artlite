@@ -41,7 +41,9 @@ settings for them have no effect. Log-probabilities come as llama-server's: chat
 `top_logprobs` (default 20) and `/v1/completions`' `logprobs: N` give each generated token's (`logprobs.content`:
 `id`, `token`, `bytes`, `logprob` and the `top_logprobs`), `/completion`'s `n_probs` gives them as
 `completion_probabilities`, and `post_sampling_probs` the probabilities the sampler drew from instead (`prob`,
-`top_probs`).
+`top_probs`). A request's `speculative.n_max` (llama-server's field) caps the draft tokens per step of its
+generation, up to `--spec-draft-n-max` (0: steps of one token; a drafter still follows the tokens, so the next request
+drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
 `image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: infill,
 `/metrics`, LoRA, model downloads; their routes answer 501.
@@ -255,7 +257,8 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
   says why. Drafters (`mtp-`, `<name>-mtp-`, z-lab's `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
-  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file), and MiniCPM-V 4.7 gets the `mmproj` file of its
+  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
+  a preset's `spec-type` and `spec-draft-model` choose another), and MiniCPM-V 4.7 gets the `mmproj` file of its
   directory (`mmproj-model-f16.gguf` before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
@@ -291,8 +294,9 @@ alias = llama
 Keys are the options' long names without dashes (`ctx-size`), their short ones (`c`) or their environment variables
 (`ARTLITE_ARG_CTX_SIZE`); switches take `true` or `false` (`no-prefill = true`, `warmup = false`), and a relative path
 (`chat-template-file`) is the working directory's, as on the command line. An empty `mmproj` turns a vision encoder
-off, `alias` adds names (comma-separated), `load-on-startup` loads the model when the server starts. A model's option
-comes from the command line, else its section, else `[*]`.
+off, and `mmproj` and `spec-draft-model` (a drafter's file) are found as `model` is; `alias` adds names
+(comma-separated), `load-on-startup` loads the model when the server starts. A model's option comes from the command
+line, else its section, else `[*]`.
 
 ### A side model beside a chat model
 
@@ -379,6 +383,8 @@ Generation:
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V; default 32) |
 | `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
+| `--spec-type auto\|none\|draft-mtp\|draft-dflash`, `-md FILE`, `--spec-draft-model` | the model's drafter, as [artlite-cli](cli.md)'s (default `auto`: the one found by its file name) |
+| `--spec-draft-n-max N` | draft tokens per step at most, as [artlite-cli](cli.md)'s; a request's `speculative.n_max` lowers it for its generation |
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
@@ -394,7 +400,6 @@ NPU:
 |---|---|
 | `--no-prefill` | run prompts as decode steps |
 | `--kv-k single\|hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4), as [artlite-cli](cli.md)'s |
-| `--dflash`, `--no-dflash` | Qwen3.8 27B's drafter, as [artlite-cli](cli.md)'s (default: its DFlash2 block drafter where the file is in the models directory, else its MTP layer) |
 | `--warmup`, `--no-warmup` | run one token after loading (default on) |
 
 Embeddings and rerank ([above](#embeddings-and-rerank)):

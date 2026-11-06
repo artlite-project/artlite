@@ -69,15 +69,16 @@ def model_class(arch: str) -> type[Model]:
 
 def open_model(path: str, *, chat_template: str | None = None, **options: object) -> Model:
     """Open a GGUF file with the ``Model`` of its architecture; ``chat_template``: a Jinja chat template in place of the
-    file's (``Model.chat_template``); ``options``: that class's keyword arguments (one given as False: where the class
-    has it, a flag that turns a feature off applies to every model)."""
+    file's (``Model.chat_template``); ``options``: that class's keyword arguments (one given as False or "none": where
+    the class has it, a value that turns a feature off applies to every model, ``spec_type="none"`` to one without a
+    drafter)."""
     arch = architecture(path)
     try:
         cls = model_class(arch)
     except NotImplementedError as e:
         raise NotImplementedError(f"{path}: {e}") from None
     params = inspect.signature(cls).parameters
-    unknown = {k for k, v in options.items() if k not in params and v is not False}
+    unknown = {k for k, v in options.items() if k not in params and v is not False and v != "none"}
     if unknown:
         raise ValueError(f"{cls.name} has no option {', '.join(sorted(unknown))}")
     model = cls(path, **{k: v for k, v in options.items() if k in params})

@@ -35,9 +35,11 @@ the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "
 `model_config.occamy_gguf()`). The NPU path reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and IQ3_XXS tensors, Q4_0 ones (a
 drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha), in any role: a file whose FFN gate / up is in another
 format than Q4_K (the Q5_K_M, Q6_K and Q8_0 files) decodes up to 4 tokens per dispatch. Qwen3.8's drafter is its
+DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account), else its
 file's own MTP layer; a qwen35moe model's (`model_config.qwen_mtp_of`):
 an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in another account's repository of the
 same name (ggml-org publishes its drafters apart from the models); of several, Q4_0, then Q4_K_M, then Q8_0.
+`--spec-draft-model FILE` takes another file, `--spec-type none` none ([artlite-cli](../cli.md)).
 
 ## How the NPU path works
 
@@ -135,8 +137,8 @@ On the 35B-A3B models a step of several tokens sums the experts' outputs in anot
 greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the
 dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
 
-Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory (`--no-dflash`: with its MTP layer, whose
-263 MB the image otherwise leaves out; the drafter takes 1.07 GB; `qwen35/dflash.py`). Instead of a chain of drafts, one dispatch guesses a whole
+Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory (`--spec-type draft-mtp`: with its MTP layer, whose
+263 MB the image otherwise leaves out, as with `--spec-type none`; the drafter takes 1.07 GB; `qwen35/dflash.py`). Instead of a chain of drafts, one dispatch guesses a whole
 block of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a design of its own, which adds under 1 s to a load and no visible time
 to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt
 chunk; its head is the first 84480 rows of the model's LM head (the special tokens, the first ids and 512 of the sequence's own tokens: a few

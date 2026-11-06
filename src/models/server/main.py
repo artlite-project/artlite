@@ -33,8 +33,10 @@ from ..common import (
     Model,
     NpuModel,
     Sampling,
+    add_spec_options,
     check_chat_template,
     performance_mode,
+    spec_options,
     stale_install,
     template_option,
 )
@@ -52,7 +54,9 @@ DEFAULT_CTX = 32768  # -c 0 (capped at the model's context)
 ROUTER = frozenset({"host", "port", "api_key", "api_key_file", "cors_origins", "path", "no_ui", "timeout", "log_file",
                     "models_dir", "models_preset", "models_max", "models_autoload"})
 MODELS = frozenset({"models_dir", "models_preset", "models_max", "models_autoload"})  # (router mode's)
-MODEL = frozenset({"model", "alias", "mmproj"})  # one model's (in router mode: the router's, a preset's)
+# one model's (in router mode: the router's, a preset's), of them its files (``FILES``: a preset's found as ``model``)
+MODEL = frozenset({"model", "alias", "mmproj", "spec_draft_model"})
+FILES = frozenset({"mmproj", "spec_draft_model"})
 Report = Callable[[dict[str, Any]], None]  # a router's child: a message to the router
 
 
@@ -108,6 +112,7 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                           "a prompt continues from; default: 32)")
     gen.add_argument("--lookup", action=argparse.BooleanOptionalAction, default=True,
                      help="draft tokens from the context (prompt lookup) for the multi-token steps (default: on)")
+    add_spec_options(gen)
     gen.add_argument("--temp", type=float, help="sampling temperature (default: the model's; 0: greedy)")
     gen.add_argument("--top-k", type=int, help="sample among the k most likely tokens (default: the model's)")
     gen.add_argument("--top-p", type=float, help="nucleus sampling threshold (default: the model's)")
@@ -162,9 +167,6 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     npu.add_argument("--no-prefill", action="store_true", help="run prompts as decode steps")
     npu.add_argument("--kv-k", choices=("single", "hilo"),
                      help="K precision of the KV cache (Llama, Gemma), as artlite-cli's --kv-k")
-    npu.add_argument("--dflash", action=argparse.BooleanOptionalAction,
-                     help="Qwen3.8 27B: draft with its DFlash2 block drafter, a file of its own, instead of its MTP layer "
-                          "(default: where that file exists)")
     npu.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
                      help="run one token after loading (default: on)")
     out = p.add_argument_group("logging")
@@ -369,12 +371,14 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
 
     def load() -> tuple[Model, NpuModel]:
         t0 = time.perf_counter()
-        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
+        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, **spec_options(args)}
         model = open_model(args.model, chat_template=template, **{k: v for k, v in opts.items() if v is not None})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
         npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)
         npu.lookup = args.lookup
+        if args.spec_draft_n_max is not None:
+            npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
         log.info("%s (%s): loaded in %.1f s: %s", name, model.name, time.perf_counter() - t0, npu.describe())
         return model, npu
 

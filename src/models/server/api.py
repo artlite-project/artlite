@@ -29,7 +29,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
@@ -50,7 +50,7 @@ PENALTIES = ("repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_p
 NEUTRAL: dict[str, object] = {
     "typical_p": 1.0, "typ_p": 1.0, "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0,
     "dynatemp_range": 0.0, "top_n_sigma": -1.0, "ignore_eos": False, "logit_bias": None, "grammar": None, "json_schema": None, "response_format": None,
-    "thinking_budget_tokens": None,
+    "thinking_budget_tokens": None, "speculative.n_min": 0, "speculative.p_min": 0.0,
 }
 # llama-server's other sampler settings, as /props reports them (the parameters of samplers that are off)
 OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": -1.0, "xtc_probability": 0.0,
@@ -234,6 +234,7 @@ class Generation(BaseModel):
     stream_options: dict[str, Any] | None = None
     n_probs: int | None = None
     post_sampling_probs: bool | None = None
+    spec_n_max: int | None = Field(None, alias="speculative.n_max")  # (llama-server's: draft tokens per step at most)
 
 
 class ChatRequest(Generation):
@@ -429,13 +430,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                  **{k: getattr(options, k) for k in PENALTIES}}
         return dataclasses.replace(s, **{k: v for k, v in given.items() if v is not None})
 
-    def params(s: Sampling) -> dict[str, Any]:
-        """llama-server's generation settings (/props, /slots)."""
+    def params(s: Sampling, drafts: int | None = None) -> dict[str, Any]:
+        """llama-server's generation settings (/props, /slots; ``drafts``: a job's draft tokens per step at most)."""
+        most = engine.npu.DRAFTS if drafts is None else min(drafts, engine.npu.DRAFTS)
         return {"seed": options.seed, "temperature": 0.0 if s.greedy else s.temp, "top_k": s.top_k, "top_p": s.top_p,
                 "min_p": s.min_p, **{k: getattr(s, k) for k in PENALTIES}, **OTHER_PARAMS,
                 "max_tokens": options.n_predict, "n_predict": options.n_predict,
                 "stream": False, "reasoning_format": options.reasoning_format, "samplers": SAMPLERS,
-                "timings_per_token": False}
+                "speculative.n_max": most, "timings_per_token": False}
 
     def check(req: Generation) -> None:
         """What every generation request must satisfy; fields the NPU path ignores are logged."""
@@ -620,7 +622,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             else req.n_probs if req.n_probs is not None else int(getattr(req, "logprobs", None) or 0)
         if n_probs < 0:
             raise bad_request("n_probs (top_logprobs, logprobs) must be >= 0")
-        j = Job(ids=ids, emit=emit, sampling=request_sampling(req, think), max_tokens=n,
+        if req.spec_n_max is not None and req.spec_n_max < 0:
+            raise bad_request("speculative.n_max must be >= 0")
+        j = Job(ids=ids, emit=emit, sampling=request_sampling(req, think), max_tokens=n, drafts=req.spec_n_max,
                 n_probs=n_probs, post_sampling=bool(req.post_sampling_probs),
                 seed=req.seed if req.seed is not None else options.seed, stop=stops(req), reasoning=reasoning,
                 inside=reasoning and inside(ids), think=think,
@@ -778,7 +782,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         j = engine.current
         return [{"id": 0, "id_task": -1 if j is None else 0, "n_ctx": engine.npu.capacity,
                  "is_processing": j is not None, "n_cached": len(engine.cached), "n_waiting": engine.waiting(),
-                 "params": params(sampling(default_think()) if j is None else j.sampling),
+                 "params": params(sampling(default_think())) if j is None else params(j.sampling, j.drafts),
                  "next_token": [{"has_next_token": j is not None and j.state == "generating",
                                  "n_decoded": 0 if j is None else j.n_gen}]}]
 

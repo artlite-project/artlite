@@ -14,12 +14,12 @@ the NPU against ``ref.DFlash`` on the same taps, rounds of a generation.
 
 import itertools
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-import models
 from artlite.decode.design import META, XB, interleave
 from artlite.decode.kv import kv_from_groups
 from artlite.gguf_model import GGUFFile
@@ -96,25 +96,21 @@ def test_ref_window() -> None:
 
 
 def test_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A drafter asked for where it cannot run says so; "off" reaches every model: ``open_model`` drops it for one without the option."""
-    model, _ = _files()
+    """The drafter of ``Qwen``'s ``spec_type`` / ``draft_model``: the DFlash2 file by default, the MTP block (the image lays
+    it out), none (the image leaves it out), the file given; one asked for where it cannot run says so."""
+    model, path = _files()
+    monkeypatch.setattr("models.qwen35.qwen.WeightBuffer", lambda image: SimpleNamespace(image=image))  # (no packing)
+    for spec, draft, dflash, mtp in [("auto", None, path, None), ("draft-mtp", None, None, ""), ("none", None, None, None),
+                                     ("auto", path, path, None)]:
+        q = Qwen(model, spec_type=spec, draft_model=draft)
+        assert (q.dflash, q.mtp, q.weights.image.mtp_layer >= 0) == (dflash, mtp, mtp == ""), spec
     with pytest.raises(ValueError, match="images in prompts"):
-        Qwen(model, mmproj="mmproj.gguf", dflash=True)
+        Qwen(model, mmproj="mmproj.gguf", spec_type="draft-dflash")
+    with pytest.raises(ValueError, match="a draft-dflash drafter, not draft-mtp"):
+        Qwen(model, spec_type="draft-mtp", draft_model=path)
     monkeypatch.setattr("models.qwen35.qwen.qwen_dflash_of", lambda _: None)
     with pytest.raises(ValueError, match="no DFlash2 drafter"):
-        Qwen(model, dflash=True)
-
-    class Plain:
-        name = "Plain"
-
-        def __init__(self, path: str, *, kv_k: str | None = None):
-            self.kv_k = kv_k
-
-    monkeypatch.setattr(models, "architecture", lambda _: "plain")
-    monkeypatch.setattr(models, "model_class", lambda _: Plain)
-    assert models.open_model("x", kv_k="single", dflash=False).kv_k == "single"
-    with pytest.raises(ValueError, match="no option dflash"):
-        models.open_model("x", dflash=True)
+        Qwen(model, spec_type="draft-dflash")
 
 
 class _Npu:

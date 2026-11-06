@@ -45,7 +45,9 @@ and generation speeds go to stderr.
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |
-| `--dflash`, `--no-dflash` | Qwen3.8 27B: draft with its DFlash2 block drafter ([qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)) or with its MTP layer (default: the block drafter where its file is in the models directory) |
+| `--spec-type auto\|none\|draft-mtp\|draft-dflash` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)); one asked for that the model does not have is an error |
+| `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
+| `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4), below |
 | `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
@@ -64,8 +66,9 @@ and `single` takes the KL against the same file on the CPU from 0.0037 to 0.0085
 Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and draft tokens after it, which a step checks at a
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
 far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
-model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's own MTP layer, Qwen3.6 35B-A3B's and
-Occamy's); each step takes the ones that pay at the model's measured step times, none where nothing does. A draft is kept only where the model's own
+model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's DFlash2 file, else its own MTP layer,
+Qwen3.6 35B-A3B's and Occamy's `mtp` files); each step takes the ones that pay at the model's measured step times, none where
+nothing does. A draft is kept only where the model's own
 token at its position is that draft, so the text is the one without drafts (greedy: the same tokens, except at near
 ties on Qwen3.6 35B-A3B and Occamy, whose steps of several tokens sum their experts in another order). The summary on
 stderr counts each kind's draft tokens and the accepted ones.

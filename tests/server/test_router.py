@@ -134,9 +134,12 @@ ctx-size = 4096
 alias = small, tiny
 load-on-startup = true
 kv-k = hilo
+spec-type = none
+spec-draft-n-max = 2
 
 [org/vl-GGUF/vl-1B-Q4_K_M.gguf]
 mmproj =
+md = org/vl-GGUF/mtp-vl-Q4_0.gguf
 reasoning = on
 chat-template-kwargs = {{"enable_thinking": false}}
 chat-template-file = templates/vl.jinja
@@ -149,11 +152,15 @@ cache-prompt = false
     c = catalog_of(models_dir, tmp_path, preset=str(preset), options={"temp": 0.25})
     entries = c.scan()
     a = entries["org/a-GGUF:Q4_0"]
-    assert a.options == {"ctx_size": 4096, "warmup": False, "temp": 0.25, "kv_k": "hilo"}  # (the command line's temp)
+    assert a.options == {"ctx_size": 4096, "warmup": False, "temp": 0.25, "kv_k": "hilo", "spec_type": "none",
+                         "spec_draft_n_max": 2}  # (the command line's temp)
     assert a.load_on_startup and c.find("tiny") is a and c.find("small") is a
-    assert c.argv(a)[4:] == ["--ctx-size", "4096", "--no-warmup", "--temp", "0.25", "--kv-k", "hilo"]
+    assert c.argv(a)[4:] == ["--ctx-size", "4096", "--no-warmup", "--temp", "0.25", "--kv-k", "hilo", "--spec-type",
+                             "none", "--spec-draft-n-max", "2"]
     vl = entries["org/vl-GGUF:Q4_K_M"]
     assert vl.mmproj is None and vl.options["reasoning"] == "on"
+    assert vl.options["spec_draft_model"] == os.path.join(models_dir, "org/vl-GGUF/mtp-vl-Q4_0.gguf")  # (as a model's path)
+    assert c.argv(vl)[c.argv(vl).index("--spec-draft-model") + 1] == vl.options["spec_draft_model"]
     assert "--chat-template-kwargs" in c.argv(vl) and '{"enable_thinking": false}' in c.argv(vl)
     assert c.argv(vl)[-4:] == ["--chat-template-file", "templates/vl.jinja", "--reasoning-effort", "low"]
     e = entries["extra"]
@@ -162,6 +169,7 @@ cache-prompt = false
     p = arg_parser(env=False)
     for text, error in [("[*]\nport = 9000\n", "the router's option"), ("[*]\nctx = 1\n", "no such option"),
                         ("[*]\nkv-k = big\n", "one of single, hilo"), ("[*]\nc = many\n", "invalid literal"),
+                        ("[*]\nspec-type = mtp\n", "one of auto, none"), ("[*]\nspec-draft-n-max = -1\n", "0 or more"),
                         ("x = 1\n[*]\n", "keys before the first section"), ("[*]\nwarmup = maybe\n", "true or false")]:
         preset.write_text(text)
         with pytest.raises(ValueError, match=error):

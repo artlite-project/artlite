@@ -22,8 +22,9 @@ model, a section named by a model's id or alias the options of that model, and a
 named by the section, whose ``model`` key is its file (absolute, else relative to the working directory or the models
 directory). Keys are the options' long names without the dashes (``ctx-size``), their short ones (``c``) or their
 environment variables (``ARTLITE_ARG_CTX_SIZE``), with ``true`` / ``false`` for switches; ``mmproj`` chooses the vision
-encoder (empty: none), ``alias`` adds names (comma-separated), ``load-on-startup`` loads the model when the router
-starts. A model's options: the command line's, else its section's, else ``[*]``'s."""
+encoder (empty: none) and ``spec-draft-model`` the drafter (both paths as ``model``'s), ``alias`` adds names
+(comma-separated), ``load-on-startup`` loads the model when the router starts. A model's options: the command line's,
+else its section's, else ``[*]``'s."""
 
 import argparse
 import configparser
@@ -42,7 +43,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.operators.base import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
-from .main import ENV, MODEL, ROUTER, env_name
+from .main import ENV, FILES, MODEL, ROUTER, env_name
 
 log = logging.getLogger("artlite.server")
 
@@ -123,7 +124,7 @@ def preset_keys(parser: argparse.ArgumentParser) -> dict[str, tuple[argparse.Act
     """A preset's keys of model options: key -> (the option, whether the key negates it: ``no-warmup``)."""
     keys: dict[str, tuple[argparse.Action, bool]] = {}
     for a in parser._actions:
-        if a.dest == "help" or a.dest in ROUTER or a.dest in MODEL - {"mmproj"}:
+        if a.dest == "help" or a.dest in ROUTER or a.dest in MODEL - FILES:
             continue
         for s in a.option_strings:
             keys[s.lstrip("-")] = (a, isinstance(a, argparse.BooleanOptionalAction) and s.startswith("--no-"))
@@ -177,8 +178,8 @@ def read_preset(path: str, parser: argparse.ArgumentParser) -> dict[str, dict[st
             try:
                 if action.nargs == 0:  # (a switch)
                     value: Any = boolean(text) != negated
-                elif action.dest == "mmproj":
-                    value = text.strip() or None  # (a path as ``model``'s; empty: no vision encoder)
+                elif action.dest in FILES:
+                    value = text.strip() or None  # (a path as ``model``'s; empty: none, no vision encoder)
                 else:
                     value = action.type(text) if action.type is not None else text
                     if action.choices is not None and value not in action.choices:
@@ -324,8 +325,9 @@ class Catalog:
         entries = self._ids(models)
         sections = read_preset(self.preset, self.parser) if self.preset else {}
         for opts in sections.values():
-            if opts.get("mmproj"):
-                opts["mmproj"] = self.path(opts["mmproj"])
+            for f in FILES & opts.keys():
+                if opts[f]:
+                    opts[f] = self.path(opts[f])
         common = sections.pop("*", {})
         for name, opts in sections.items():
             if "model" in opts:

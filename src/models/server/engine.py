@@ -55,6 +55,7 @@ class Job:
     emit: Emit
     sampling: Sampling
     max_tokens: int = -1  # < 0: until an end-of-sequence token or a full cache
+    drafts: int | None = None  # draft tokens per step at most (None: the model's, ``NpuModel.DRAFTS``)
     seed: int = -1  # < 0: random
     stop: list[str] = field(default_factory=list)
     reasoning: bool = False  # split the thoughts off (the model's ``reasoning`` markers)
@@ -548,7 +549,7 @@ class Engine:
             finish = "length"
             while True:
                 left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-                it = npu.generate(logits, left, job.sampling, ids + gen, mask, probs)
+                it = npu.generate(logits, left, job.sampling, ids + gen, mask, probs, drafts=job.drafts)
                 for token in it:
                     gen.append(token)
                     sampled += 1

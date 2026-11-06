@@ -131,7 +131,7 @@ def test_mtp(size: str) -> None:
 
     path = _path(size)
     _drafter(path)
-    qwen = Qwen(path, dflash=False)
+    qwen = Qwen(path, spec_type="draft-mtp")
     model = qwen.load(capacity=4096)
     assert model.drafter is not None and model.DRAFTS == model.overlay.SLOTS - 1
     first = qwen.prompt(essay("apple.txt")[:4000] + "\n\nSummarize the essay above in a few paragraphs.")
@@ -146,7 +146,7 @@ def test_mtp(size: str) -> None:
     assert model.prefill.group - pos % model.prefill.group + 3 < len(ids) - pos  # (decode steps, then a chunk)
     out2 = list(model.generate(model.forward(ids[pos:]), N, greedy))
     stats2 = (model.drafted - stats1[0], model.accepted - stats1[1])
-    model.DRAFTS = 0
+    drafts, model.DRAFTS = model.DRAFTS, 0
     model.reset()
     flips = []
     for prompt, out in ((first, out1), (ids[pos:], out2)):
@@ -162,7 +162,7 @@ def test_mtp(size: str) -> None:
     flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
     assert len(flips) <= (3 if model.cfg.moe else 0) and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
     # (up to 7 drafts: the chains run deeper while their probability pays a slot, about half of them kept)
-    assert all(a >= (0.5 if model.DRAFTS == 3 else 0.4) * d for d, a in (stats1, stats2))
+    assert all(a >= (0.5 if drafts == 3 else 0.4) * d for d, a in (stats1, stats2))
 
 
 @pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
@@ -176,7 +176,7 @@ def test_mtp_prefill(size: str) -> None:
 
     path = _path(size)
     _drafter(path)
-    qwen = Qwen(path, dflash=False)
+    qwen = Qwen(path, spec_type="draft-mtp")
     got = draft_gate(qwen.load(capacity=2048), draft_prompts(qwen))
     pre, steps = got["prefill"].mean(0), got["steps"].mean(0)
     assert pre[0] > 0.985 * steps[0] and (pre[1:] > steps[1:] - 0.02).all(), (pre, steps)

@@ -3,6 +3,7 @@ generation loop of a model on the NPU (``NpuModel``; a sequence's state as host 
 records), a model on a decode overlay with a chunk prefill (``OverlayModel``: its steps, prompts and accounting),
 sampling, chat templates, incremental detokenization and the default KV cache capacity."""
 
+import argparse
 import collections
 import copy
 import functools
@@ -28,6 +29,8 @@ import numpy as np
 import torch
 
 from artlite import _native, backend, portable
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import model_path
 
 from .drafts import EWMA, Lookup, Planner
 
@@ -355,6 +358,61 @@ def template_option(text: str | None, file: str | None) -> str | None:
     return text
 
 
+# the drafter of a model's multi-token steps (``--spec-type``: llama-server's names, and auto: the model's own choice)
+SPEC_TYPES = ("auto", "none", "draft-mtp", "draft-dflash")
+
+
+def drafter_type(spec_type: str, draft_model: str | None, types: tuple[str, ...], name: str) -> str:
+    """The drafter a model loads (a ``Model``'s ``spec_type``, ``draft_model`` options): ``spec_type`` (one of
+    ``SPEC_TYPES``; ``types``: the drafters the model ``name`` has), or a drafter file's type (``draft_model``: by its
+    architecture, ``dflash`` draft-dflash, any other draft-mtp). ValueError: a drafter the model does not have, or a
+    file of another type than ``spec_type``."""
+    if spec_type not in SPEC_TYPES:
+        raise ValueError(f"spec_type: {spec_type!r} (one of {', '.join(SPEC_TYPES)})")
+    if draft_model is not None:
+        kind = "draft-dflash" if GGUFFile(draft_model).arch == "dflash" else "draft-mtp"
+        if spec_type not in ("auto", kind):
+            raise ValueError(f"{draft_model}: a {kind} drafter, not {spec_type}")
+        spec_type = kind
+    if spec_type not in ("auto", "none", *types):
+        raise ValueError(f"{name} has no {spec_type} drafter (it has: {', '.join(types) or 'none'})")
+    return spec_type
+
+
+def draft_count(text: str) -> int:
+    """``--spec-draft-n-max``'s value: 0 or more."""
+    n = int(text)
+    if n < 0:
+        raise ValueError(f"{text}: 0 or more")
+    return n
+
+
+def add_spec_options(p: argparse.ArgumentParser | argparse._ArgumentGroup, *, n_max: bool = True) -> None:
+    """The drafter's options (llama-server's names): ``--spec-type``, ``-md`` / ``--spec-draft-model`` and (``n_max``)
+    ``--spec-draft-n-max``; ``spec_options`` reads them."""
+    p.add_argument("--spec-type", choices=SPEC_TYPES, default="auto",
+                   help="the drafter of the multi-token steps: auto, the model's found by file name (Qwen3.8 27B: its "
+                        "DFlash2 file, else its MTP layer; Gemma 4, Qwen3.6 35B-A3B, Occamy: their MTP files); none "
+                        "(the draft tokens from the context stay); draft-mtp, draft-dflash: that drafter, which must "
+                        "exist (default: auto)")
+    p.add_argument("-md", "--spec-draft-model", "--model-draft", metavar="FILE", type=model_path,
+                   help="the drafter's GGUF file (an MTP or a DFlash2 drafter, by its architecture) in place of the one "
+                        "found by name; a relative path is also looked up in the models directory")
+    if n_max:
+        p.add_argument("--spec-draft-n-max", type=draft_count, metavar="N",
+                       help="draft tokens per step at most, the context's and the drafter's (default and at most: the "
+                            "step's slots - 1, 3 or 7; 0: steps of one token, no drafter loaded)")
+
+
+def spec_options(args: argparse.Namespace) -> dict[str, object]:
+    """``open_model``'s options of ``add_spec_options``' (none of a drafter where a step takes no drafts:
+    ``--spec-draft-n-max 0``)."""
+    if getattr(args, "spec_draft_n_max", None) == 0:
+        return {"spec_type": "none"}
+    return {k: v for k, v in (("spec_type", args.spec_type), ("draft_model", args.spec_draft_model))
+            if v not in ("auto", None)}
+
+
 class Detokenizer(Protocol):
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes: ...
 
@@ -428,6 +486,7 @@ class NpuModel:
     group = 1  # ``rewind`` and a ``restore`` without a checkpoint land on its multiples
     causal = True  # False: a prompt's every token sees all of them (vllm-d3's decision models): one chunk from position
     # 0, no decode steps (``readouts`` only)
+    DRAFTS = 0  # draft tokens per step at most (0: steps of one token)
 
     def prepare(self, prompt_len: int) -> None:
         """Compile and open what a prompt of ``prompt_len`` tokens needs (before it is timed)."""
@@ -526,11 +585,12 @@ class NpuModel:
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
-                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """Sample up to ``max_tokens`` tokens (< 0: no limit) after the cached positions; ``logits``: of the last
         cached one; ``prompt``: the prompt's tokens (the penalties' first); ``mask``: the tokens each may be (told
-        each token as it is sampled); ``probs``: told each choice before its token is yielded (``logprobs``). Ends
-        after an end-of-sequence token or when the cache is full."""
+        each token as it is sampled); ``probs``: told each choice before its token is yielded (``logprobs``);
+        ``drafts``: draft tokens per step at most in this generation, up to ``DRAFTS`` (None: ``DRAFTS``). Ends after
+        an end-of-sequence token or when the cache is full."""
         if max_tokens == 0:
             return
         penalties = Penalties(sampling, prompt, mask)
@@ -594,7 +654,7 @@ class OverlayModel(NpuModel):
     _w_out: torch.Tensor  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
-    DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1; 0: steps of one token)
+    DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1, or fewer: ``--spec-draft-n-max``)
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
     # (a drafter step of one row's seconds; per draft depth the rounds that kept a draft there and their chains'
@@ -1012,11 +1072,13 @@ class OverlayModel(NpuModel):
         self.rounds, self.carry, self._rounds_of = False, (), None
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
-                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
+                 mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(in rounds of a step of drafts each: the class docstring; ``probs``: of a round's kept tokens, their rows of
-        its step)"""
+        its step; ``drafts`` below ``DRAFTS``: a drafter's caches still follow the tokens, as after a round of the
+        context's drafts)"""
         if max_tokens == 0:
             return
+        most = self.DRAFTS if drafts is None else max(min(drafts, self.DRAFTS), 0)  # (this generation's)
         penalties = Penalties(sampling, prompt, mask)
 
         def choose(row: LogitsLike, cap: float = 0.0) -> int:
@@ -1030,7 +1092,7 @@ class OverlayModel(NpuModel):
         token = choose(logits)
         n = 1
         yield token
-        ctx = Lookup(getattr(prompt, "ids", prompt)) if self.lookup and self.DRAFTS > 0 else None
+        ctx = Lookup(getattr(prompt, "ids", prompt)) if self.lookup and most > 0 else None
         if ctx is not None:
             ctx.extend([token])
         self._begin()
@@ -1041,8 +1103,7 @@ class OverlayModel(NpuModel):
         try:
             while n != max_tokens and token not in self.eos_token_ids and self.position + len(self.carry) < self.capacity:
                 c = len(self.carry)
-                k = min(self.DRAFTS - c, self.capacity - self.position - 1 - c,
-                        max_tokens - n - 1 if max_tokens > 0 else self.DRAFTS)
+                k = min(most - c, self.capacity - self.position - 1 - c, max_tokens - n - 1 if max_tokens > 0 else most)
                 plan.place(self.position)
                 plan.crossing = self._crossing()
                 t0, w0 = time.perf_counter(), _native.turn_waited()  # (the planner's times: this process's own work)

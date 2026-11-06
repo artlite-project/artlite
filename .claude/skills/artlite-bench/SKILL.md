@@ -66,18 +66,18 @@ spends assembling its chunks' control code, which artlite-bench's warmup absorbs
 ## 4. MTP: the best S
 
 For a model with a drafter (Gemma 4 with its `mtp-<file>` next to the model, Qwen3.8 27B with z-lab's DFlash2 file
-(`model_config.qwen_dflash_of`; `--no-dflash`: the MTP layer of its own file), Qwen3.6 35B-A3B with ggml-org's
-`mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`), S = drafts + 1 tokens per dispatch. A block drafter's
+(`model_config.qwen_dflash_of`; `--spec-type draft-mtp`: the MTP layer of its own file), Qwen3.6 35B-A3B with ggml-org's
+`mtp-Qwen3.6-35B-A3B-Q4_0.gguf`: `model_config.qwen_mtp_of`; `-md FILE`: another), S = drafts + 1 tokens per dispatch. A block drafter's
 rounds depend on the text alone, so a run repeats exactly; an MTP chain's length follows the step times of the run
 (Qwen3.8 27B's 7.5-8.1 tok/s at 1K, 6.1-7.0 at 32K on one prompt): compare drafters on several prompts, not on one. Any
 change of the drafts or of a step's grouping also re-rolls greedy text at its near ties, and one prompt's rate with it
 (Qwen3.8 27B's DFlash2 branches: 32K prompt 6.56 -> 6.51 tok/s on a harder text, +4.7% on the same texts).
-`artlite-cli` takes up to the maximum (`OverlayModel.DRAFTS`; per step the drafts that pay, `models.drafts`);
-`drafts.py` sets it (0: steps of one token, the entry's `decode_tps`):
+`artlite-cli` takes up to the maximum (per step the drafts that pay, `models.drafts`); `--spec-draft-n-max D` caps it
+(0: steps of one token, no drafter loaded: the entry's `decode_tps`):
 
 ```bash
 for D in 0 1 2 3; do
-  python .claude/skills/artlite-bench/drafts.py $D -m MODEL.gguf -f OUT_DIR/prompt1024.txt -n 256 --greedy --no-lookup 2>&1 >/dev/null | grep prompt:
+  artlite-cli -m MODEL.gguf -f OUT_DIR/prompt1024.txt -n 256 --greedy --no-lookup --spec-draft-n-max $D 2>&1 >/dev/null | grep prompt:
 done   # and the same for prompt32768.txt
 ```
 

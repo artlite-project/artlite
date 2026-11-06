@@ -37,7 +37,7 @@ from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
-from ..common import Checkpoint, Model, OverlayModel, Penalties, Sampling
+from ..common import Checkpoint, Model, OverlayModel, Penalties, Sampling, drafter_type
 from .draft import GemmaDraft, output_norm
 from .host import GemmaHost
 from .overlay import GemmaOverlay
@@ -221,16 +221,22 @@ class NpuGemma(OverlayModel):
 
 class Gemma(Model):
     """Gemma 4 from a GGUF file: the architecture, tokenizer and chat template from its metadata. ``kv_k``: the KV
-    caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block per 8 dims)."""
+    caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block per 8 dims); ``spec_type``, ``draft_model``:
+    the drafter (``common.drafter_type``): auto, ``mtp-<model file>`` next to it when it is there; none; draft-mtp: that
+    file, which must exist; ``draft_model``: a ``gemma4-assistant`` file."""
 
     name = "Gemma 4"
     thinks = True
     reasoning = ("<|channel>thought", "<channel|>")  # (a thought is the "thought" channel)
 
-    def __init__(self, path: str, *, kv_k: str = "hilo"):
+    def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None):
         if kv_k not in ("hilo", "single"):
             raise ValueError(f"kv_k: {kv_k!r} (one of hilo, single)")
         self.kv_k = kv_k
+        kind = drafter_type(spec_type, draft_model, ("draft-mtp",), self.name)
+        if kind == "draft-mtp" and draft_model is None and not os.path.exists(assistant_of(path)):
+            raise ValueError(f"{path}: no MTP drafter ({os.path.basename(assistant_of(path))} next to it)")
+        self.drafter = None if kind == "none" else draft_model or ""  # (``NpuGemma``'s)
         self.gguf = GGUFFile(path)
         self.tokenizer = GemmaTokenizer(self.gguf)
         self.eos_token_ids = GemmaConfig.from_gguf(self.gguf).eos_token_ids
@@ -249,4 +255,4 @@ class Gemma(Model):
         return Sampling(temp=1.0, top_k=64, top_p=0.95)  # (the model card's)
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuGemma:
-        return NpuGemma(self.gguf, capacity=capacity, prefill=prefill, kv_k=self.kv_k)
+        return NpuGemma(self.gguf, capacity=capacity, prefill=prefill, drafter=self.drafter, kv_k=self.kv_k)

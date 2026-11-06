@@ -1,16 +1,20 @@
 """Context drafts (models/drafts.py: ``Lookup``, ``Planner``), the generation's rounds of drafts
-(``OverlayModel.generate``) on a fake overlay model whose text is fixed and a drafter's stop rule; on the NPU (slow)
-greedy replies with drafts against steps of one token."""
+(``OverlayModel.generate``) on a fake overlay model whose text is fixed and a drafter's stop rule, the drafter's
+options (``models.common.add_spec_options``); on the NPU (slow) greedy replies with drafts against steps of one
+token."""
 
+import argparse
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+import models
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.common import OverlayModel, Penalties, Sampling
+from models.common import OverlayModel, Penalties, Sampling, add_spec_options, drafter_type, spec_options
 from models.drafts import DRAFTER_MATCH, NMAX, PRIOR, RETRY, WARM, Lookup, Planner, bucket
 
 from .common import essay
@@ -179,11 +183,51 @@ def test_generate_drafts() -> None:
     one = Text(text)
     one.DRAFTS = 0
     assert list(one.generate(one.first(P), 20, GREEDY, text[:P])) == out[:20] and len(one.calls) == 19
+    for drafts in (0, 1, 9):  # (a generation's cap: steps of one, of up to 2 tokens; at most the model's)
+        capped = Text(text)
+        assert list(capped.generate(capped.first(P), -1, GREEDY, text[:P], drafts=drafts)) == out
+        assert max(map(len, capped.calls)) == min(drafts, capped.DRAFTS) + 1
     s = Sampling(greedy=True, repeat_penalty=1.0001, repeat_last_n=8)
     pen = Text(text)
     assert list(pen.generate(pen.first(P), -1, s, text[:P])) == out
     short = Text(text)
     assert list(short.generate(short.first(P), 7, GREEDY, text[:P])) == out[:7] and short.position <= P + 6
+
+
+def test_spec_options(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The drafter's options (``add_spec_options``) as ``open_model``'s: none where a step takes no drafts; a drafter
+    file's type by its architecture against ``--spec-type``; "none" reaches a model without a drafter, which refuses
+    another."""
+    p = argparse.ArgumentParser()
+    add_spec_options(p)
+    assert spec_options(p.parse_args([])) == {}
+    f = str(tmp_path / "d.gguf")
+    assert spec_options(p.parse_args(["--spec-type", "draft-mtp", "-md", f])) == {"spec_type": "draft-mtp",
+                                                                                   "draft_model": f}
+    assert spec_options(p.parse_args(["-md", f, "--spec-draft-n-max", "0"])) == {"spec_type": "none"}
+    with pytest.raises(SystemExit):
+        p.parse_args(["--spec-draft-n-max", "-1"])
+    monkeypatch.setattr("models.common.GGUFFile", lambda path: SimpleNamespace(arch=path))
+    assert drafter_type("auto", "dflash", ("draft-mtp", "draft-dflash"), "Q") == "draft-dflash"
+    assert drafter_type("draft-mtp", "qwen35moe", ("draft-mtp",), "Q") == "draft-mtp"
+    for args, error in [(("draft-mtp", "dflash", ("draft-mtp", "draft-dflash")), "a draft-dflash drafter, not draft-mtp"),
+                        (("none", "qwen35moe", ("draft-mtp",)), "a draft-mtp drafter, not none"),
+                        (("draft-dflash", None, ("draft-mtp",)), "G has no draft-dflash drafter"),
+                        (("mtp", None, ("draft-mtp",)), "one of auto")]:
+        with pytest.raises(ValueError, match=error):
+            drafter_type(*args, "G")
+
+    class Plain:
+        name = "Plain"
+
+        def __init__(self, path: str, *, kv_k: str | None = None):
+            self.kv_k = kv_k
+
+    monkeypatch.setattr(models, "architecture", lambda _: "plain")
+    monkeypatch.setattr(models, "model_class", lambda _: Plain)
+    assert open_model("x", kv_k="single", spec_type="none").kv_k == "single"
+    with pytest.raises(ValueError, match="no option spec_type"):
+        open_model("x", spec_type="draft-mtp")
 
 
 def test_draft_stop() -> None:

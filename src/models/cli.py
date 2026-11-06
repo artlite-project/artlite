@@ -30,9 +30,11 @@ from .common import (
     MEDIA_MARKER,
     TEMPLATE_RESERVED,
     StreamDecoder,
+    add_spec_options,
     auto_capacity,
     performance_mode,
     seed,
+    spec_options,
     stale_install,
     template_option,
 )
@@ -81,9 +83,7 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
     p.add_argument("--no-lookup", action="store_true",
                    help="no draft tokens from the context (prompt lookup) in the multi-token steps")
-    p.add_argument("--dflash", action=argparse.BooleanOptionalAction,
-                   help="Qwen3.8 27B: draft with its DFlash2 block drafter, a file of its own, instead of its MTP layer "
-                        "(default: where that file exists)")
+    add_spec_options(p)
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Qwen3, Gemma): one bfp16 block per 8 dims (Llama's "
                         "default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read time)")
@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> None:
     seed(args.seed)
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
-    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, "dflash": args.dflash}
+    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, **spec_options(args)}
     variables = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
         ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
     try:
@@ -185,6 +185,8 @@ def main(argv: list[str] | None = None) -> None:
     except NotImplementedError as e:
         sys.exit(f"artlite-cli: {name}: not supported yet: {e}")
     npu.lookup = not args.no_lookup
+    if args.spec_draft_n_max is not None:
+        npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
     npu.prepare(len(ids))
     sys.stderr.write(f"{name} ({model.name}): {len(ids)} prompt tokens; loaded in {time.perf_counter() - t0:.1f} s: "
                      f"{npu.describe()}\n")

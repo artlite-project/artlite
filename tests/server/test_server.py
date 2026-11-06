@@ -161,6 +161,8 @@ class FakeNpu(NpuModel):
         self.capacity, self.group, self.exact, self.chunk, self.delay = capacity, group, exact, chunk, delay
         self.recurrent = exact
         self.drafts = drafts  # (> 0: steps of drafts, every draft accepted: tokens run before they are yielded)
+        self.DRAFTS = drafts
+        self.generated: list[int | None] = []
         self.position = 0
         self.seq: list[int] = []
         self.replies: list[list[str]] = []
@@ -269,10 +271,12 @@ class FakeNpu(NpuModel):
         return self._logits(next(self._next, EOS))
 
     def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = (),
-                 mask: Mask | None = None, probs: Probs | None = None) -> Iterator[int]:
-        """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded)"""
+                 mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
+        """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded;
+        ``generated``: each generation's ``drafts`` argument)"""
+        self.generated.append(drafts)
         if not self.drafts:
-            yield from super().generate(logits, max_tokens, sampling, prompt, mask, probs)
+            yield from super().generate(logits, max_tokens, sampling, prompt, mask, probs, drafts=drafts)
             return
         token, n = int(logits.argmax()), 1
         yield token
@@ -1147,6 +1151,29 @@ def test_props_and_models(fake: tuple) -> None:
     assert s[0]["n_ctx"] == npu.capacity and s[0]["is_processing"] is False
     assert client.post("/v1/streams/lookup", json={"conversation_ids": ["a"]}).json() == []
     assert client.get("/v1/stream", params={"conv_id": "a", "from": 0}).status_code == 404
+
+
+def test_speculative_n_max() -> None:
+    """A request's ``speculative.n_max`` (llama-server's field) caps its generation's drafts per step (``generate``'s
+    ``drafts``); /props and a running job's /slots report the cap, at most the model's (``NpuModel.DRAFTS``); llama-server's
+    other speculative fields are ignored; below 0 is a bad request."""
+    _model, npu, engine = make(drafts=3)
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        assert client.get("/props").json()["default_generation_settings"]["params"]["speculative.n_max"] == 3
+        assert chat(client, "hi").status_code == 200
+        assert chat(client, "hi", **{"speculative.n_max": 1, "speculative.n_min": 0}).status_code == 200
+        npu.delay, npu.replies = 0.1, [[" a"] * 8]
+        out: list[httpx.Response] = []
+        t = threading.Thread(target=lambda: out.append(chat(client, "hi", **{"speculative.n_max": 9})))
+        t.start()
+        while engine.current is None:
+            time.sleep(0.002)
+        assert client.get("/slots").json()[0]["params"]["speculative.n_max"] == 3
+        t.join(10)
+        assert out[0].status_code == 200 and npu.generated == [None, 1, 9]
+        r = chat(client, "hi", **{"speculative.n_max": -1})
+        assert r.status_code == 400 and "speculative.n_max" in r.text
 
 
 def test_utilities(fake: tuple) -> None:

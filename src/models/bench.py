@@ -41,7 +41,7 @@ from artlite.model_config import MODELS_DIR, model_path
 from artlite.prefill import pace
 
 from . import open_model
-from .common import NpuModel, auto_capacity, stale_install
+from .common import NpuModel, add_spec_options, auto_capacity, spec_options, stale_install
 from .diagnose import telemetry
 
 # a result's fields (llama-bench's that apply, plus n_ctx); json and jsonl add samples_ns and samples_ts
@@ -104,7 +104,7 @@ def arg_parser() -> argparse.ArgumentParser:
                    help="output format printed to stderr (default: none)")
     p.add_argument("--progress", action="store_true", help="print test progress indicators")
     p.add_argument("--no-warmup", action="store_true", help="skip the warmup run before each test")
-    p.add_argument("--no-dflash", action="store_true", help="no DFlash2 block drafter (Qwen3.8 27B: where its file exists)")
+    add_spec_options(p, n_max=False)
     return p
 
 
@@ -333,7 +333,7 @@ def main(argv: list[str] | None = None) -> None:
         capacity = auto_capacity(max(t.n_depth + t.n_prompt + t.n_gen for t in group))
         try:
             info, n_vocab = file_info(path)
-            model = open_model(path, **({"dflash": False} if args.no_dflash else {}))
+            model = open_model(path, **spec_options(args))
             npu = model.load(capacity=capacity)
         except (OSError, ValueError, NotImplementedError) as e:
             sys.exit(f"artlite-bench: {name}: {e}")

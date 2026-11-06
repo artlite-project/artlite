@@ -45,6 +45,7 @@ largest test (`n_ctx` in the results). `backends` is `NPU` and `gpu_info` is the
 | `-oe FMT`, `--output-err` | output format on stderr: `none` (default), `md`, `csv`, `json`, `jsonl` |
 | `--progress` | print test progress indicators |
 | `--no-warmup` | skip the warmup run before each test |
+| `--spec-type TYPE`, `-md FILE` | the model's drafter, as [artlite-cli](cli.md)'s (a qwen35 model's prompt chunks also write its drafter's caches) |
 
 `-p`, `-n` and `-d` take llama-bench's value lists: comma-separated values or ranges `first-last`, `first-last+step`,
 `first-last*mult` (`-p 512-8192*2`). `-n 0` or `-p 0` leaves those tests out.

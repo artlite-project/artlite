@@ -796,8 +796,8 @@ def serve(p: argparse.ArgumentParser, args: argparse.Namespace, given: set[str])
     """Router mode (``main``): ``given``, the options of the command line (to the models' servers: the ones that are
     not the router's)."""
     if given & server.MODEL:
-        p.error(f"{', '.join(sorted('--' + d for d in given & server.MODEL))}: one model's option (router mode: a "
-                f"preset's, --models-preset)")
+        p.error(f"{', '.join(sorted('--' + d.replace('_', '-') for d in given & server.MODEL))}: one model's option "
+                f"(router mode: a preset's, --models-preset)")
     if args.models_max < 0:
         p.error("--models-max: 0 (any number) or more")
     try:
