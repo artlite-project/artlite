@@ -930,8 +930,9 @@ __attribute__((minsize)) void {{ p }}_aq0(int32_t *__restrict ws)
 }
 
 // {{ DB }} d-blocks of a set's 4 q rows (fp32, rows rs apart from q; rows past nv zero) times the score constant qc (bf16 hi |
-// lo << 16: three products in one accumulator) as hi + lo panels -> qa ({{ 72 * DB }} B)
-__attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict qa, int rs, int nv, int qc)
+// lo << 16: three products in one accumulator) as hi + lo panels -> qa ({{ 72 * DB }} B); minsize with q / k norm weights:
+// their code leaves the attention core no room (160 B less, ~590 cycles more per call)
+__attribute__((noinline{{ ", minsize" if QK_W else "" }})) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict qa, int rs, int nv, int qc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const aie::mask<32> valid = aie::mask<32>::from_uint32(nv >= 4 ? ~0u : (1u << (8 * nv)) - 1u);
