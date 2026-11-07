@@ -6,6 +6,7 @@ import hashlib
 import os
 import pickle
 import shutil
+from collections.abc import Callable
 from importlib.metadata import version
 
 import numpy as np
@@ -21,11 +22,13 @@ from .seq import Seq
 
 def role_pages(work_dir: str) -> paging.Pager:
     """The roles' pages (``core.ROLES``, entries ``sd15_ext_<role>``, called from the main loop ``sd15_run``; "ln" also
-    ``sd15_geglu`` and ``sd15_gelu``, the GEMM's) of the compiled design in ``work_dir``, the same on every core."""
+    ``sd15_geglu`` and ``sd15_gelu``, the GEMM's; "r"'s entry the GEMM's RoPE epilogue) of the compiled design in
+    ``work_dir``, the same on every core."""
     p = K.P
     pages = {r: (f"{p}_ext_{r}",) + ((f"{p}_geglu", f"{p}_gelu") if r == "ln" else ()) for r in K.ROLES}
     return paging.link(work_dir, pages=pages, pager=f"{p}_pg_self",
-                       calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES), f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu")},
+                       calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES),
+                              f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu", f"{p}_ext_r")},
                        roots=(f"{p}_main",), stack=D.STACK, cores=[(c, r + 2) for c in range(COLS) for r in range(ROWS)],
                        state=D.L1["ext"], wake=D.L_WAKE)
 
@@ -149,6 +152,29 @@ class VisionDevice:
         out[rel[:, 0]] = (a & 0xFFFFFFFF).astype(np.uint32)
         out[rel[:, 0] + 1] = (a >> 32).astype(np.uint32)
         return out
+
+    def refs(self, addrs: list[tuple[int, int]]) -> tuple[np.ndarray, list[str], np.ndarray]:
+        """Shim BD addresses of a transaction (``txn.Txn.addrs``) by image: their word indices, the images' names and per
+        address its image (an index into them) and offset in it (``resolve`` rewrites them for other images: another
+        layer's of the same layout)."""
+        names = list(self._images)
+        base = np.array([self.address(n) for n in names], np.int64)
+        size = np.array([self._images[n][2] for n in names], np.int64)
+        order = np.argsort(base)
+        a = np.array([x for _, x in addrs], np.int64)
+        k = order[np.searchsorted(base[order], a, side="right") - 1]
+        assert ((a >= base[k]) & (a < base[k] + size[k])).all(), "a shim address outside the images"
+        used, inv = np.unique(k, return_inverse=True)
+        return np.array([i for i, _ in addrs], np.int64), [names[j] for j in used], np.stack([inv, a - base[k]], 1)
+
+    def resolve(self, words: np.ndarray, refs: tuple, rename: Callable[[str], str]) -> None:
+        """Rewrite in place the shim addresses of ``refs`` (``refs``) in words for the images ``rename`` maps theirs to
+        (each of at least the bytes the old one had)."""
+        idx, names, at = refs
+        base = np.array([self.address(rename(n)) for n in names], np.int64)
+        a = base[at[:, 0]] + at[:, 1]
+        words[idx] = (a & 0xFFFFFFFF).astype(np.uint32)
+        words[idx + 1] = (a >> 32).astype(np.uint32)
 
     def warm(self) -> None:
         """An empty dispatch: the first one after new host buffers takes ~0.15 s more than later ones (a model's load

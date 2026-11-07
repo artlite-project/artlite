@@ -93,7 +93,10 @@ class Gemm:
     """The layer's shape and memtile tensors: x (panels of the column's m ntile tokens x K, ``x_np`` token panels per
     kb), y (panels if out != "bf16", else C tiles), res (C tiles of N channels, or None). out "vt": panels of the
     transposes ([kb][token panel] of [8 channels][8 tokens], the attention's V^T); "geglu": the weights' rows
-    [hid N / 2 | gate N / 2], output hid gelu(gate) (N / 2 channels); "gelu": gelu of the outputs as panels. stats "gn" (groups of ``gsize`` channels of a
+    [hid N / 2 | gate N / 2], output hid gelu(gate) (N / 2 channels); "gelu": gelu of the outputs as panels; "rope":
+    each pass a head of 40 pairs of channels (k, 40 + k) turned by its tokens' angles, as panels: res is then the tile's
+    cos | sin (one C-tile object of 80 channels, the same for every pass: ``core``'s RoPE; m 64, one tile, no
+    statistics). stats "gn" (groups of ``gsize`` channels of a
     tensor whose channel ``ch_off`` is this output's first) / "ln": records at ``rec`` ([tile][core][OCH] (LN), [core][OCH]
     (GN)); stf: ``core.ST_*`` (a GroupNorm record over several ops). The op runs passes [p0, p0 + npo) of each row's
     N / 4 channels (default all). K 0: a copy of res (C tiles) into y with statistics (no weights).
@@ -157,8 +160,10 @@ class Gemm:
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N * self.tsplit % 320 == 0 and self.K % 8 == 0 and \
-            self.out in ("bf16", "bfp16", "geglu", "vt", "ds", "gelu")
+            self.out in ("bf16", "bfp16", "geglu", "vt", "ds", "gelu", "rope")
         assert self.out != "ds" or self.rc and self.rstep == 2 and self.stats is None and self.res is None
+        assert self.out != "rope" or self.res is not None and self.m == 64 and self.ntile == 1 and self.stats is None \
+            and not self.conv
         assert self.tsplit in (1, 2, 4) and self.ntile % self.tsplit == 0 and (self.tsplit == 1 or self.out == "bf16")
         self.npass = self.N * self.tsplit // 320
         self.nt = self.ntile // self.tsplit  # (a core's tiles)
@@ -189,7 +194,8 @@ class Gemm:
         self.nres = -(-self.m * 160 // D.A_OBJ) if self.res is not None else 0
         self.aobj = self.nch if self.conv else -(-self.nkt * self.m // 128)  # (A objects of a pass's k-tiles)
         assert self.npass <= 16 and self.y_np >= self.np + self.junk
-        ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "gelu": self.N // 8, "geglu": self.N // 16}.get(self.out, 0) * \
+        ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "gelu": self.N // 8, "rope": self.N // 8,
+                  "geglu": self.N // 16}.get(self.out, 0) * \
             self.y_np * L.PANEL or \
             self.N // 80 * (1 if self.out == "ds" else self.ntile) * L.ct_bytes(self.m)
         assert self.y + ybytes <= D.HEAP and self.x + self.K // 8 * self.x_np * L.PANEL <= D.HEAP, "tensors past the heap"
@@ -197,8 +203,9 @@ class Gemm:
         # the second, the longer)
         assert self.conv or self.x + walk * 8 * self.x_np * L.PANEL <= 512 * 1024, \
             "the A objects' walk past the memtile (an over-read hangs)"
-        assert self.res is None or self.res + (self.N // 80 * self.ntile - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= \
-            512 * 1024, "the residual's last objects past the memtile"
+        nres_obj = 1 if self.out == "rope" else self.N // 80 * self.ntile  # (the residual's C-tile objects)
+        assert self.res is None or self.res + (nres_obj - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= 512 * 1024, \
+            "the residual's last objects past the memtile"
         assert self.stats != "gn" or self.gsize, "a GroupNorm's group size"
         assert self.stats != "ln" or not self.stf or self.nt == 1, "a LayerNorm record over ops of one tile"
 
@@ -394,7 +401,7 @@ class Gemm:
         """Row ``row``'s command slot (Q bytes); bias: (N,) or None (a conv's: its bias + the time bias)."""
         cmd = np.zeros(D.Q // 4, np.int32)
         om = {"bf16": K.O_BF16, "bfp16": K.O_BFP16, "geglu": K.O_GEGLU, "vt": K.O_VT, "ds": K.O_DS,
-              "gelu": K.O_GELU}[self.out]
+              "gelu": K.O_GELU, "rope": K.O_ROPE}[self.out]
         st = {None: K.S_NONE, "gn": K.S_GN, "ln": K.S_LN}[self.stats]
         cmd[[K.C_KIND, K.C_M, K.C_NTILE, K.C_NPASS, K.C_NKT, K.C_NRES, K.C_OUT, K.C_STATS, K.C_STF]] = (
             K.K_GEMM, self.m, self.nt, self.npo, self.nkt, self.nres, om, st, self.stf)
@@ -552,7 +559,10 @@ class Gemm:
                             out.append({"addr": self.x + t * TP * 4, "nwords": n,
                                         "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)],
                                         **({"iteration": (TP, self.nt)} if it else {})})
-                    if self.res is not None:  # (the object (sl npass + P0 + p, t))
+                    if self.out == "rope":  # (the tile's cos | sin: every pass's)
+                        ow = self.nres * D.A_OBJ // 4
+                        out.append({"addr": self.res + t * ct, "nwords": ow, "dims": _contig(ow)})
+                    elif self.res is not None:  # (the object (sl npass + P0 + p, t))
                         ow = self.nres * D.A_OBJ // 4
                         it_res = (ct // 4, self.nt) if NPO == 1 else (NT * ct // 4, NPO)
                         out.append({"addr": self.res + ((sl * self.npass + P0) * NT + t) * ct, "nwords": ow,
@@ -562,7 +572,7 @@ class Gemm:
                     sends.append(MemTask(chain(self.tiles(r)[0], True), repeat=self.nt * NPO))
                 else:
                     sends += [MemTask(chain(t, False), repeat=NPO) for t in self.tiles(r)]
-            if self.out in ("bfp16", "vt", "gelu"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token panel (m / 8) t + rb)
+            if self.out in ("bfp16", "vt", "gelu", "rope"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token panel (m / 8) t + rb)
                 data = _panel_recv(self.y + (r * self.npass + P0) * 10 * YN * L.PANEL, YN, m // 8, 10, NPO)
                 data["iteration"] = (TP, NT)
             elif self.out == "geglu":  # (pass p: [rb][5 cb] -> kb (r npass + p) 5 + cb)
@@ -590,8 +600,9 @@ class Gemm:
         wb = self.npo * self.nkt * D.Q
         runs = [(img, D.Q + wb)] + [(img + D.Q, wb)] * (self.nt - 1 if wb else 0) if wimg is None else \
             [(img, D.Q)] + [(wimg, wb)] * self.nt
+        role = "ln" if self.out in ("geglu", "gelu") else "r" if self.out == "rope" else None  # (the epilogues' pages)
         return RowOps(runs=runs, b_objects=1 + self.nt * self.npo * self.nkt, parity=self.m == 64 and self.nkt > 0,
-                      role="ln" if self.out in ("geglu", "gelu") else None)  # (the GEGLU / GELU epilogues: page ln's)
+                      role=role)
 
 
 @dataclass
@@ -712,12 +723,15 @@ class Attention:
     keys][K | V^T]: d 160 groups of 32 keys, d 80 of 64), written by ``kv_drains``. Self-attention (keys = the image's
     tokens, of ``nbands`` ops of np token panels: band b's column c holds keys [(8 b + c) kpi, ..) of its image): an
     image's token panels in a column are 2 apart. Cross-attention: nkeys (the context's: ``layout.kv_slots``, the last
-    group's keys from nkeys masked). d 40: a key group's K and V^T in one slot. raise_max: every key group checks the
-    softmax's reference max (raised past an attention sink; d 80 / 160), else the first group's. valid (d 80 / 160): per
+    group's keys from nkeys masked). d 40: a key group's K and V^T in one slot. raise_max: a key group whose P saturates
+    (a score 63 past the softmax's reference max, the first group's: an attention sink) runs again with the reference
+    raised (d 80 / 160), else P saturates. valid (d 80 / 160): per
     image a boolean array over its keys in the slots' order, the others masked (default: the first nkeys, or all).
     joint (d 80 / 160 self-attention): the images' keys one sequence (an entry over both images of its bands: MiniCPM-V's
     lone entries): image 1's groups after image 0's in one slot region, which both images' units stream (valid: per
-    image over that sequence)."""
+    image over that sequence). dense (joint, d 80; any number of groups): the groups up to the last with a valid key
+    computed, every one before it whole (valid: over the joint sequence, both images' the same; None: all), the rest
+    streamed and skipped (``core``'s C_DENSE: the command's masks of that last live group only)."""
 
     np: int
     q: int
@@ -732,6 +746,7 @@ class Attention:
     heads: int = 8
     valid: tuple | None = None
     joint: bool = False
+    dense: bool = False
 
     def __post_init__(self) -> None:
         assert self.d in (40, 80, 160) and len(self.rows) in (2, 4) and (self.heads == 8 or self.d == 80 and self.heads == 16)
@@ -750,6 +765,7 @@ class Attention:
         if self.joint:
             assert self.d != 40 and not self.nkeys
             self.ng *= 2
+        assert not self.dense or self.joint and self.d == 80
         self.nk = self.nkeys - 8 * self.gk * (self.ng - 1) if self.nkeys else 8 * self.gk
         assert self.kpc in (1, 4, 16) and (self.d == 160 or self.kpc >= 4), self.np
         assert self.q + (((self.heads - 1) * self.nd + (8 if self.d == 40 else 32)) * self.np + 8) * L.PANEL <= D.HEAP, \
@@ -760,7 +776,22 @@ class Attention:
         cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP]] = (K.K_ATTN, 2 * self.hpr, self.kpc, self.ng, self.nk,
                                                                              self.nd, self.gk)
         cmd[K.C_RAISE] = self.raise_max
-        if self.d != 40:
+        if self.dense:  # (masks: the last live group's, every key's, none's: two words each)
+            ok = np.ones((self.ng, 64), bool)
+            if self.valid is not None:
+                v = np.asarray(self.valid[0], bool)
+                assert np.array_equal(v, np.asarray(self.valid[1], bool)) and v.size <= ok.size, "dense: one sequence"
+                ok[:] = False
+                ok.reshape(-1)[:v.size] = v
+            live = ok.any(1)
+            nlive = int(np.flatnonzero(live)[-1]) + 1 if live.any() else 1
+            assert ok[:nlive - 1].all() and not live[nlive:].any(), "dense: whole groups, then the last live one"
+            words = [int(sum(1 << k for k in range(32) if ok[nlive - 1, 32 * j + k])) for j in range(2)]
+            m = (np.array(words + [-1, -1, 0, 0], np.int64) & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
+            cmd[[K.C_DENSE, K.C_NLIVE]] = 1, nlive
+            for img in range(2):
+                cmd[K.C_KMASK[img]:K.C_KMASK[img] + 6] = m
+        elif self.d != 40:
             assert self.ng <= 32 and K.C_KMASK[0] + 64 <= K.C_WALKS and K.C_KMASK[1] + 64 <= D.WS // 4, "key masks"
             km = self.key_masks().reshape(2, -1)
             for img in range(2):

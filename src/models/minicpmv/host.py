@@ -30,18 +30,17 @@ the text after the image at O + its tiles and separators; its PR #30510 moves bo
 breaks ties of its KV position by (H, W)).
 """
 
-import io
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 from artlite.model_config import ClipConfig
 
-from ..sequence import MEDIA, Sequence
+from ..sequence import MEDIA, Sequence, load_image  # noqa: F401 (load_image: this module's API)
 
 # token ids of the markers (the GGUF's vocabulary; the official config's image_start_id .. newline_id)
 IMAGE, IMAGE_END, SLICE, SLICE_END, IMAGE_ID, IMAGE_ID_END, NEWLINE = 248078, 248079, 248088, 248089, 248090, 248091, 198
@@ -181,13 +180,6 @@ def refine_size(h: int, w: int, grid: tuple[int, int], scale: int, align: int) -
     rows, cols = grid
     sh, sw = best_resize(_divide(h, rows) / rows, _divide(w, cols) / cols, scale, align, upscale=True)
     return sh * rows, sw * cols
-
-
-def load_image(src: str | bytes) -> Image.Image:
-    """An image file (a path or its bytes) as RGB, turned upright by its EXIF orientation (transformers'
-    ``load_image``; an alpha channel dropped; a JPEG's pixels within 3 levels of llama.cpp's stb_image)."""
-    with Image.open(io.BytesIO(src) if isinstance(src, bytes) else src) as im:
-        return ImageOps.exif_transpose(im).convert("RGB")
 
 
 def _pixels(im: Image.Image, clip: ClipConfig) -> np.ndarray:

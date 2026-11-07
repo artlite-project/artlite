@@ -27,7 +27,7 @@ use any modern SIMD (AVX-512 included).
 - Layers (Map): `models` -> `artlite`'s subsystems (`decode`, `prefill`, `moe`, `vision`, `gemm`, `formats`) -> the
   framework (`artlite.operators`, `artlite.overlay`) -> the runtime. Code that two models share lives in `artlite`, in
   the subsystem it belongs to, never in one model's package for another to import (a model package imports another
-  only to run that model: qwen35 runs MiniCPM-V's vision encoder); `artlite` never imports `models`.
+  only to run that model: qwen35 runs MiniCPM-V's and Qwen3-VL's vision encoders); `artlite` never imports `models`.
 - `src/` holds what the apps and tools run: test harnesses (standalone operators of one kernel), CPU references and
   other test-only code live in `tests/`, a directory per package of `src/`
   (`tests/<subsystem or model>/test_<module>.py`; the top-level modules' tests at the top). Layout inverses and
@@ -104,11 +104,12 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma, Llama and Qwen3 (`attn.py`), the models' shared host side (`model.py`) |
 | `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs (packed ones: several inputs in a chunk, a recurrent model's after a cached prefix too, and their planner), the GEMM planner, the GEMMs' pace calibration (`pace.py`), the residual norms, the attention of a column per KV head (Llama's, Qwen3's) |
 | `src/artlite/moe/` | MoE layers: the routing on the decode overlay's cores, the prefill's router, expert work lists and gathers |
-| `src/artlite/vision/` | the vision overlay: a whole image network per dispatch on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`) |
+| `src/artlite/vision/` | the vision overlay: image networks on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`), the vision encoders' ViT layers (`vit.py`) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
 | `src/artlite/{model_config,gguf_model,measure_ii,variant_search,profiling,probe}.py` | model files, schedule tools, profiling, `artlite-probe`'s designs |
 | `src/models/{llama,gemma4,qwen35}/` | the language models, a package per GGUF architecture (`llama` also runs `qwen3` and `vllm-decision2`: `qwen3.py`): on the NPU (the weight image `image.py`, the decode design `decode.py` and its host side `overlay.py`, the prefill `prefill.py`, the model's own operators) and on the host (tokenizer, chat template, inputs); `models.open_model` picks one by a GGUF file's architecture |
 | `src/models/minicpmv/` | MiniCPM-V 4.7's vision side (its mmproj): the encoder on the vision overlay (`encoder.py`), an image's embeddings and tokens (`npu.py`), its slices and positions (`host.py`); qwen35's language model takes them (`models/sequence.py`: token ids and embedding rows) |
+| `src/models/qwen3vl/` | Qwen3-VL's vision side (the mmproj of Qwen3.5 / 3.6 / 3.8, projector `qwen3vl_merger`): the encoder on the vision overlay (`encoder.py`: its layout, programs per image size), an image's embeddings and tokens (`npu.py`), its size, pixels and positions (`host.py`); qwen35's language models take them |
 | `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) on the vision overlay: the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`), the VAE decoder (`vae.py`) |
 | `src/models/server/` | `artlite-server`: the HTTP API (FastAPI: llama-server's routes and shapes; `agents.py`: Anthropic's Messages and OpenAI's Responses APIs as chat requests; `readouts.py`: embeddings, rerank and vLLM's `/classify`; `decisions.py`: llama-server's `/v1/systemone`, a decision model's answers), the NPU worker, its prompt cache (`cache.py`: conversations in RAM, the Qwen hybrids' state checkpoints), tool calls (`tools.py`: each template's call syntax, its streaming parser, the mask that keeps call names the functions'), llama.cpp's prebuilt web UI (pinned); router mode (`router.py`: a model server process per model, `child.py`; `catalog.py`: the models directory's models, presets) |
 | `src/models/common.py`, `drafts.py`, `readouts.py`, `tokenizer.py`, `cli.py`, `bench.py`, `probe.py` | the shared model interface (`Model`, `NpuModel`: generation loop, sampling, a prompt's output rows `outputs`, several inputs' `readouts`; `OverlayModel`: steps, prompts and a generation's steps of drafts on an overlay), draft tokens from the context and each step's choice of drafts, the output rows as embeddings, rerank scores and classifications, Qwen's tokenizer and chat template (qwen35's and qwen3's files), `artlite-cli`, `artlite-bench` and `artlite-probe` (its designs: `artlite.probe`; `--diagnose`: `diagnose/`) |
@@ -170,8 +171,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   (`artlite/prefill/gemm.py`, paced where a machine throttles them: `pace.py`), the residual norms (`norm.py`: bf16
   for Qwen and Llama, fp32 for Gemma) and Llama's and Qwen3's attention (`attn.py`), writing the caches the decode
   continues from (the `npu-prefill` skill).
-- Image networks (Stable Diffusion's UNet and VAE decoder, MiniCPM-V's vision encoder) run whole on the vision overlay
-  (`artlite/vision/`), a dispatch per network.
+- Image networks (Stable Diffusion's UNet and VAE decoder, MiniCPM-V's and Qwen3-VL's vision encoders) run on the vision
+  overlay (`artlite/vision/`), a dispatch per network (Qwen3-VL's larger images: a dispatch per few layers).
 - Each model's design is in its package's module docstrings.
 
 ## Pitfalls

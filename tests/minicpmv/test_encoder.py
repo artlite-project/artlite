@@ -11,6 +11,7 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, minicpmv_mmproj
 from artlite.vision import layout as L
+from artlite.vision import vit
 from artlite.vision.build import Builder, Level
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor
@@ -98,7 +99,7 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
     bd.op(bd.load("x_in", xt.addr, lv.ct(M.C)), {})
     rec = M.ln_records(bd, xt, name="x.rec")
     kv = bd.ddr("kv", M.kv_bytes(lv))
-    y, _ = M.layer(bd, w, f"l{il}", xt, rec, kv=kv, keys=M.Keys("attn"))
+    y, _ = M.layer(bd, w, f"l{il}", xt, rec, kv_ddr=kv, keys=M.Keys("attn"))
     bd.op(bd.spill("y_out", y.addr, lv.ct(M.C)), {})
     npu.run(bd.transaction())
     yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
@@ -133,7 +134,7 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
     rec = M.ln_records(bd, x, name="x.rec")
     kv = bd.ddr("kv", M.kv_bytes(lv))
     for il in range(7, 27):
-        x, rec = M.layer(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, rec, kv=kv, keys=M.Keys("attn"))
+        x, rec = M.layer(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, rec, kv_ddr=kv, keys=M.Keys("attn"))
     bd.op(bd.spill("y_out", x.addr, lv.ct(M.C)), {})
     tr = bd.transaction()
     npu.run(tr)
@@ -191,7 +192,7 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
     x = _bands_in(bd, xs, lv, "x")
     out = M.Bands(lv, "y")
     M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, out,
-                  kv=bd.ddr("kv", M.kv_bytes(lv)), keys=M.Keys("attn"))
+                  kv_ddr=bd.ddr("kv", M.kv_bytes(lv)), keys=M.Keys("attn"))
     bd.op({}, {})  # (the last band's drains)
     npu.run(bd.transaction())
     for g, e, xx in zip(_bands_out(npu, out), want, xs, strict=True):
@@ -245,7 +246,7 @@ def test_before_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
     pre, _ = M.level_keys(case, entries, joint=entries[0].joint)
     for il in range(7):
         y = M.Bands(M.PRE, f"x{il + 1}")
-        M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, y, kv=kv, keys=pre)
+        M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, y, kv_ddr=kv, keys=pre)
         x = y
     bd.op({}, {})
     npu.run(bd.transaction())
@@ -290,7 +291,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     vv = torch.stack([torch.cat([bq(x[2, s, sl].T).T for sl in cols]) for s in range(4)])  # (V^T: blocks over 8 windows)
     ref = torch.zeros(4, n, M.C)
     for h in range(M.HEADS):
-        ch = slice(M.HP * h, M.HP * (h + 1))
+        ch = slice(vit.HP * h, vit.HP * (h + 1))
         sc = torch.einsum("iwd,jwd->wij", qq[:, :, ch], kk[:, :, ch])
         pr = torch.exp2(sc - sc.amax(-1, keepdim=True))
         pr = pr / pr.sum(-1, keepdim=True)
@@ -300,7 +301,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     assert err < 1.2e-2
 
 
-def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: M.VitLevel, name: str) -> M.Bands:
+def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: vit.VitLevel, name: str) -> M.Bands:
     """Two entries' rows (n_i, 1152) at their slots as a banded level's residual in DDR (records by a copy op per
     band)."""
     tiles = M.pack([torch.nn.functional.pad(r.float(), (0, M.C - M.H)) for r in rows], slots, lv.nb)

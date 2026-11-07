@@ -1,10 +1,7 @@
 """MiniCPM-V 4.7's vision encoder (projector ``minicpmv4_7``: a SigLIP2 ViT of 27 layers, the ViT merger after layer 6
 (the 16x file; the 4x file has none), the final 2 x 2 merger) on the vision overlay (``artlite.vision``: one design for
-every image network, its ops built by host-built transactions).
-
-Channels: the hidden 1152 padded to ``C`` = 1280 (passes of 80 on 4 core rows): the residual's 1152 real channels,
-then 128 that zero weight rows, biases, gamma and beta keep zero (LayerNorm's 1 / n over the 1152); a head's 72 dims
-padded to 80 (Q / K / V rows, O's columns: 16 heads of d 80); the feed-forward's 4304 to ``FFN`` = 4480.
+every image network, its ops built by host-built transactions; the ViT's layers ``artlite.vision.vit``'s: channels,
+heads and the feed-forward padded there).
 
 A dispatch (``encode``) runs the whole encoder on two entries of at most 64 final groups each (the overlay's two images)
 or on one of at most 128 (joint: the entry over both images, its keys one sequence); the official slicer's slices have
@@ -14,17 +11,11 @@ in the memtile from the merger to the final merger). The entries' sizes reach th
 panels and position rows (``inputs``) and the levels' key masks (``level_keys``), so ``Encoder`` builds two transactions
 once (pair, joint) and rewrites those per dispatch.
 
-The GEMMs' operands are bfp16 panels (C fp32 over the whole K: the overlay's); the patch embedding's are the pixels'
-exact 8-bit integers (``patches``, ``patch_weights``: the normalization folded into its weights), and the GEMMs of
-``HILO`` (the patch embedding, the final merger's up and down: the most sensitive weights for their cost) take hi + lo
-weights (``ops.Gemm``). Most of the embeddings' error is the activations' panels (the weights' bfp16 about a quarter of
-it); the largest single rounding is post_ln's panels, the identity GEMM's A (``_post``).
-
-A layer (``layer``) on a level: LN1 -> K, V (their slots drained to DDR), Q (x log2 e / sqrt 72) -> attention (16
-heads, the softmax's max raised past attention sinks, key groups of padding skipped) -> O + x (LayerNorm records) ->
-LN2 (x parked in DDR meanwhile) -> up + GELU (panels) -> x back -> down + x (records). Its memtile layout alternates
-between two (x low / high), the same every other layer. On ``PRE`` (``layer_bands``) per band: its keys first, then
-its queries.
+The patch embedding's operands are the pixels' exact 8-bit integers (``patches``, ``patch_weights``: the normalization
+folded into its weights), and the GEMMs of ``HILO`` (the patch embedding, the final merger's up and down: the most
+sensitive weights for their cost) take hi + lo weights (``ops.Gemm``). Most of the embeddings' error is the
+activations' panels (the weights' bfp16 about a quarter of it); the largest single rounding is post_ln's panels, the
+identity GEMM's A (``_post``).
 """
 
 import math
@@ -41,45 +32,33 @@ from artlite.overlay import Transaction
 from artlite.vision import core as K
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level
+from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
-from artlite.vision.ops import Apply, Attention, Gemm, _dims
+from artlite.vision.ops import Apply, Gemm, _dims
 from artlite.vision.seq import ColOps, MemTask, RowOps
+from artlite.vision.vit import (
+    EPS,
+    FFN,
+    HD,
+    HEADS,
+    LOG2E,
+    Bands,
+    C,
+    H,
+    Keys,
+    kv_bytes,
+    layer,
+    layer_bands,
+    ln,
+    ln_records,
+    vit_level,
+)
+from artlite.vision.vit import pad as _pad
+from artlite.vision.vit import pad_heads as _heads
+from artlite.vision.vit import xfer as _xfer
 
-H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
-FFN_REAL, FFN = 4304, 4480
-EPS = 1e-6
-LOG2E = 1.4426950408889634
 GROUPS = 64  # final groups (4 x 4 patches) of one image of a band: a tile's 8 columns x 8 lanes
-
-
-@dataclass(frozen=True)
-class VitLevel(Level):
-    """A ViT level: ``nb`` bands of one tile per column of ``tm`` tokens (64; 16: the merges' tiles of merged tokens;
-    both images: token panel tp of image tp % 2)."""
-
-    tm: int = 64
-
-    @property
-    def T(self) -> int:
-        return self.tm
-
-    @property
-    def m(self) -> int:
-        return self.tm
-
-    @property
-    def ntile(self) -> int:
-        return 1
-
-    @property
-    def np(self) -> int:
-        return self.tm // 8
-
-
-def vit_level(nb: int, tm: int = 64) -> VitLevel:
-    return VitLevel(0, nb, False, tm)
 
 
 PRE, POST = vit_level(4), vit_level(1)  # (the levels before and after the ViT merger)
@@ -164,14 +143,14 @@ def pack(rows: list[torch.Tensor], slots: list[tuple[np.ndarray, ...]], nb: int)
     """Entries' rows (n_i, k) at their slots (``Entry.patch_slots`` / ``window_slots``) -> per band and column its
     tile's tokens (nb, COLS, 64, k), zeros elsewhere."""
     out = torch.zeros(nb, COLS, 64, rows[0].shape[1])
-    for x, (b, c, k, ln, img) in zip(rows, slots, strict=True):
-        out[b, c, (2 * k + img) * 8 + ln] = x.float()
+    for x, (b, c, k, lane, img) in zip(rows, slots, strict=True):
+        out[b, c, (2 * k + img) * 8 + lane] = x.float()
     return out
 
 
 def unpack(tiles: torch.Tensor, slots: list[tuple[np.ndarray, ...]]) -> list[torch.Tensor]:
     """``pack``'s inverse: per entry its rows."""
-    return [tiles[b, c, (2 * k + img) * 8 + ln] for b, c, k, ln, img in slots]
+    return [tiles[b, c, (2 * k + img) * 8 + lane] for b, c, k, lane, img in slots]
 
 
 def key_valid(entries: list[Entry], nb: int, slots: str) -> tuple[np.ndarray, np.ndarray]:
@@ -185,34 +164,6 @@ def key_valid(entries: list[Entry], nb: int, slots: str) -> tuple[np.ndarray, np
     if any(e.joint for e in entries):
         return ok.reshape(-1), ok.reshape(-1)
     return ok[0].reshape(-1), ok[1].reshape(-1)
-
-
-@dataclass(frozen=True)
-class Keys:
-    """A level's attention keys: per image their validity (``key_valid``; None: all), joint (one sequence of both
-    images' keys: a lone entry's); ``name``: the DDR image of the level's attention command (shared by its layers:
-    ``Encoder`` rewrites its key masks per dispatch)."""
-
-    name: str
-    valid: tuple | None = None
-    joint: bool = False
-
-    def attention(self, lv: Level, **kw: int) -> Attention:
-        return Attention(np=lv.np, d=HP, nbands=lv.nb, heads=HEADS, raise_max=True, valid=self.valid, joint=self.joint,
-                         **{"q": 0, "o": 0, "kv": 0} | kw)
-
-
-def _heads(w: torch.Tensor) -> torch.Tensor:
-    """Rows of 16 heads of 72 -> 16 heads of 80 (zero rows after each head's)."""
-    out = torch.zeros((HEADS * HP,) + w.shape[1:], dtype=w.dtype)
-    out.view(HEADS, HP, *w.shape[1:])[:, :HD] = w.reshape(HEADS, HD, *w.shape[1:])
-    return out
-
-
-def _pad(w: torch.Tensor, rows: int, cols: int = 0) -> torch.Tensor:
-    out = torch.zeros((rows, cols) if cols else (rows,), dtype=w.dtype)
-    out[tuple(slice(0, n) for n in w.shape)] = w
-    return out
 
 
 def _attn_weights(get: Callable[[str], torch.Tensor], p: str) -> dict[str, torch.Tensor]:
@@ -245,156 +196,6 @@ def layer_weights(get: Callable[[str], torch.Tensor], il: int) -> dict[str, torc
         w[n + "_g"] = _pad(get(p + n + ".weight").float().reshape(-1), C)
         w[n + "_b"] = _pad(get(p + n + ".bias").float().reshape(-1), C)
     return w
-
-
-def ln_records(bd: Builder, x: Tensor, *, name: str) -> int:
-    """The LayerNorm records of the C tiles x (a copy op with statistics: x from the host, no producer GEMM); returns
-    their memtile address."""
-    lv = x.lv
-    rec = bd.mem.alloc(ln_rec(lv))
-    y = bd.mem.alloc(lv.pn(C))
-    bd.gemm(Gemm(m=lv.m, ntile=lv.ntile, K=0, N=C, x=0, y=y, out="bfp16", res=x.addr, stats="ln", rec=rec), None, None,
-            name=name)
-    bd.mem.release(y, lv.pn(C))
-    return rec
-
-
-def ln(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
-    """LayerNorm of the C tiles x (its producer's records at rec, freed) into the panels y on every core row."""
-    a = Apply(m=x.lv.m, nblk=C // 320, mode="ln", x=x.addr, y=y.addr, ntile=x.lv.ntile, rec=rec, C=H, eps=EPS,
-              y_np=y.np)
-    bd.apply(a, gamma, beta, name=name)
-    bd.mem.release(rec, ln_rec(x.lv))
-
-
-def attend(bd: Builder, q: Tensor, kv: int, keys: Keys) -> Tensor:
-    """The attention of the scaled queries' panels q on the K / V^T slots at DDR kv (their level's ``keys``): the
-    output panels."""
-    o = alloc(bd, q.lv, C, "pn")
-    for t in range(max(q.lv.np // 8, 1)):  # (an op per tile)
-        at = keys.attention(q.lv, q=q.addr, o=o.addr, kv=kv, tile=t)
-        cmd = bd.image(keys.name, at.command())
-        bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(cmd))
-    return o
-
-
-def _kv(bd: Builder, w: dict[str, torch.Tensor], name: str, n: Tensor, kv: int, keys: Keys, band: int, *,
-        q: bool) -> Tensor | None:
-    """K and V of the LN1 panels n (their slots' drains: band ``band``'s keys), and Q (q: its panels; else None, V^T's
-    drains with the next op)."""
-    lv = n.lv
-    kt, vt = alloc(bd, lv, C, "pn"), alloc(bd, lv, C, "pn")
-    at = keys.attention(lv, kv=kv)
-    gemm(bd, n, w["k"], w["k_b"], name=name + ".k", out=kt, kind="bfp16")
-    gemm(bd, n, w["v"], w["v_b"], name=name + ".v", out=vt, kind="vt",
-         extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k", band=band) for c in range(COLS)})
-    free(bd, kt)
-    vd = {c: at.kv_drains(kt.addr, vt.addr, c, part="v", band=band) for c in range(COLS)}
-    if not q:
-        bd.defer(vd, release=[(vt.addr, vt.size)])
-        return None
-    qt = alloc(bd, lv, C, "pn")
-    gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16", extra=vd)
-    free(bd, vt)
-    return qt
-
-
-def _attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: Tensor, kv: int, keys: Keys) -> int:
-    """x += O (the attention of the queries qt, freed): x's records."""
-    o = attend(bd, qt, kv, keys)
-    free(bd, qt)
-    rec = gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=x, res=x, ln=True)
-    free(bd, o)
-    return rec
-
-
-def _ffn(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, park: str = "") -> tuple[Tensor, int]:
-    """LN2, x parked in DDR (image ``park``, default name.x), up + GELU, x back, down + x: the output's C tiles (x's
-    memory freed) and records."""
-    park = park or name + ".x"
-    lv = x.lv
-    # (the down GEMM reads the hidden panels and writes y: 506 of the memtile's 510 KB; layers alternate between x low,
-    # the LN2 panels at the top and the hidden from the bottom (y then high), and x high, the LN2 panels at the bottom
-    # and the hidden at the top (y then low))
-    low = x.addr < D.HEAP // 2
-    n = alloc(bd, lv, C, "pn", top=low)
-    bd.defer(bd.spill(park, x.addr, x.nbytes), release=[(x.addr, x.size or x.nbytes)])  # (with LN2: the hidden
-    # panels take the memtile)
-    ln(bd, x, n, w["ln2_g"], w["ln2_b"], name=name + ".ln2", rec=rec)
-    bd.table("gelu", gelu_table())
-    g = alloc(bd, lv, FFN, "pn", top=not low)
-    gemm(bd, n, w["up"], w["up_b"], name=name + ".up", out=g, kind="gelu")
-    free(bd, n)
-    y = alloc(bd, lv, C)
-    bd.op(bd.load(park, y.addr, y.nbytes), {})
-    rec = gemm(bd, g, w["down"], w["down_b"], name=name + ".down", out=y, res=y, ln=True)
-    free(bd, g)
-    return y, rec
-
-
-def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv: int,
-          keys: Keys) -> tuple[Tensor, int]:
-    """A ViT layer (module docstring) on the residual's C tiles x with its LayerNorm records at rec (its producer's):
-    the output's C tiles (x's memory freed) and their records. kv: a DDR buffer for the attention's K / V^T slots
-    (``kv_bytes``); keys: the level's (``Keys``)."""
-    n = alloc(bd, x.lv, C, "pn")
-    ln(bd, x, n, w["ln1_g"], w["ln1_b"], name=name + ".ln1", rec=rec)
-    qt = _kv(bd, w, name, n, kv, keys, 0, q=True)
-    bd.ddr_sync()
-    free(bd, n)
-    return _ffn(bd, w, name, x, _attn_out(bd, w, name, qt, x, kv, keys))
-
-
-class Bands:
-    """A banded level's residual in DDR: per band its C tiles (``DTensor`` image ``name.b``) and LayerNorm records
-    (image ``name.rec.b``)."""
-
-    def __init__(self, lv: Level, name: str):
-        self.lv, self.name = lv, name
-        self.x = DTensor(lv, C, name)
-
-    def load(self, bd: Builder, b: int) -> tuple[Tensor, int]:
-        """Band b's C tiles and records in the memtile (one op of fills)."""
-        lv = self.lv
-        t = alloc(bd, lv, C)
-        rec = bd.mem.alloc(ln_rec(lv))
-        bd.op(bd.merge(bd.load(self.x.band(b), t.addr, t.nbytes), bd.load(f"{self.name}.rec.{b}", rec, ln_rec(lv))), {})
-        return t, rec
-
-    def store(self, bd: Builder, b: int, t: Tensor, rec: int) -> None:
-        """Band b from the memtile's C tiles t and records rec (drained with the next op, their bytes released after
-        it)."""
-        bd.defer(bd.merge(bd.spill(self.x.band(b), t.addr, t.nbytes), bd.spill(f"{self.name}.rec.{b}", rec, ln_rec(self.lv))),
-                 release=[(t.addr, t.size or t.nbytes), (rec, ln_rec(self.lv))])
-
-
-def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands, *, kv: int, keys: Keys) -> None:
-    """A ViT layer on a banded level (each entry's keys in every band): per band LN1, K and V into the slots; then per
-    band LN1 again, Q, the attention, O + x and the feed-forward into ``out``'s band (x's bands read twice; Q computed
-    in the second pass instead of parked in DDR)."""
-    for b in range(x.lv.nb):
-        xb, rec = x.load(bd, b)
-        n = alloc(bd, x.lv, C, "pn")
-        ln(bd, xb, n, w["ln1_g"], w["ln1_b"], name=f"{name}.ln1", rec=rec)
-        free(bd, xb)
-        _kv(bd, w, name, n, kv, keys, b, q=False)
-        free(bd, n)
-    bd.op({}, {})  # (the last band's V^T drains)
-    bd.ddr_sync()
-    for b in range(x.lv.nb):
-        xb, rec = x.load(bd, b)
-        n = alloc(bd, x.lv, C, "pn")
-        ln(bd, xb, n, w["ln1_g"], w["ln1_b"], name=f"{name}.ln1", rec=rec)
-        qt = alloc(bd, x.lv, C, "pn")
-        gemm(bd, n, w["q"], w["q_b"], name=name + ".q", out=qt, kind="bfp16")
-        free(bd, n)
-        y, rec = _ffn(bd, w, name, xb, _attn_out(bd, w, name, qt, xb, kv, keys), park=f"{name}.x.{b}")
-        out.store(bd, b, y, rec)
-
-
-def kv_bytes(lv: Level) -> int:
-    """Bytes of a level's K / V^T slots (``layer``'s kv; joint or not)."""
-    return Keys("").attention(lv).kv_bytes()
 
 
 HILO = ("v.patch_embd.weight", "mm.up.weight", "mm.down.weight")  # (the mmproj's weights of the hi + lo GEMMs)
@@ -533,17 +334,6 @@ def merger_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor
     w["down"] = torch.cat([_pad(get(p + "ds_ffn_down.weight").float(), C, HID), mean], 1)
     w["down_b"] = _pad(get(p + "ds_ffn_down.bias").float().reshape(-1), C)
     return w
-
-
-def _xfer(bd: Builder, name: str, image_bytes: int, *, fill: bool, mem: int, nbytes: int, off: int = 0,
-          mdims: list | None = None, sdims: tuple | None = None) -> dict[int, ColOps]:
-    """Per column a fill (DDR image ``name`` -> memtile at mem) or drain of nbytes: column c's bytes of the image
-    ([col][image_bytes]) from off, the memtile walk mdims (``ops._dims`` form), the shim's sdims (``txn.shim_bd``)."""
-    base = bd.ddr(name, COLS * image_bytes)
-    (bd.reading if fill else bd.written)(name)
-    bd_ = {"addr": mem, "nwords": nbytes // 4} | ({"dims": mdims} if mdims else {})
-    t = lambda c: MemTask([bd_], ddr=(base + c * image_bytes + off, nbytes, sdims))
-    return {c: ColOps(fills=[t(c)]) if fill else ColOps(drains=[t(c)]) for c in range(COLS)}
 
 
 def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> tuple[Tensor, int]:
@@ -800,13 +590,13 @@ def encode(bd: Builder, w: dict, *, joint: bool, name: str = "v") -> str:
     kv = bd.ddr(name + ".kv", kv_bytes(PRE))
     for il in range(w["insert"] + 1 if w["insert"] >= 0 else w["layers"]):
         y = Bands(PRE, f"{name}.x{il + 1}")
-        layer_bands(bd, w[il], f"{name}.l{il}", x, y, kv=kv, keys=pre)
+        layer_bands(bd, w[il], f"{name}.l{il}", x, y, kv_ddr=kv, keys=pre)
         x = y
     if w["insert"] < 0:
         return final_bands(bd, w["final"], name + ".f", x)
     xt, rec = merger(bd, w["merger"], name + ".mg", x)
     for il in range(w["insert"] + 1, w["layers"]):
-        xt, rec = layer(bd, w[il], f"{name}.l{il}", xt, rec, kv=kv, keys=post)
+        xt, rec = layer(bd, w[il], f"{name}.l{il}", xt, rec, kv_ddr=kv, keys=post)
     return final(bd, w["final"], name + ".f", xt, rec)
 
 

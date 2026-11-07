@@ -93,7 +93,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 | [Llama 3.2 1B, 3B, Llama 3.1 8B Instruct](docs/models/llama3.md) | GGUF Q2_K to Q6_K, Q4_0, Q4_1, BF16 | prefill, decode |
 | [Qwen3 0.6B, Qwen3-Embedding 0.6B / 4B, Qwen3-Reranker 0.6B](docs/models/qwen3.md) | GGUF Q4_1, Q8_0, Q4_K_M | prefill, decode; embeddings, rerank |
 | [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0 | prefill, decode with its MTP drafter |
-| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B](docs/models/qwen35.md) | GGUF Q4_K_M; Occamy's IQ3_XXS / Q3_K mix | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; MiniCPM-V's vision encoder |
+| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B](docs/models/qwen35.md) | GGUF Q4_K_M; Occamy's IQ3_XXS / Q3_K mix | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's) |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).

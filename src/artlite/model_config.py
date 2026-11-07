@@ -524,11 +524,13 @@ class DFlashConfig:
 @dataclass(frozen=True)
 class ClipConfig:
     """A vision encoder and projector, from the metadata of its GGUF file (architecture ``clip``; llama.cpp's
-    ``tools/mtmd/clip.cpp``): ``projector`` (``clip.projector_type``: "minicpmv4_7"), the ViT (``layers`` of
-    ``hidden`` with ``heads``, ``ffn``, LayerNorm ``eps``), its input (``image_size`` pixels, ``patch_size``, the
-    normalization ``mean`` / ``std``), the language model's width ``projection_dim``, ``merge`` (``projector.scale_factor``:
-    patches per output token per side, MiniCPM-V 4 or 2), ``max_slices`` and the layer after which the ViT merger runs
-    (``merger_layer``: ``wa_layer_indexes``, -1 without one)."""
+    ``tools/mtmd/clip.cpp``): ``projector`` (``clip.projector_type``: "minicpmv4_7", "qwen3vl_merger"), the ViT
+    (``layers`` of ``hidden`` with ``heads``, ``ffn``, LayerNorm ``eps``), its input (``image_size`` pixels,
+    ``patch_size``, the normalization ``mean`` / ``std``), the language model's width ``projection_dim``, ``merge``
+    (patches per output token per side: MiniCPM-V's ``projector.scale_factor``, 4 or 2; Qwen3-VL's
+    ``spatial_merge_size``, 2), ``max_slices`` and the layer after which the ViT merger runs (``merger_layer``:
+    ``wa_layer_indexes``, -1 without one) of MiniCPM-V; Qwen3-VL's ``deepstack``: its layers whose outputs feed
+    projectors of their own (``is_deepstack_layers``)."""
 
     projector: str
     image_size: int
@@ -544,13 +546,14 @@ class ClipConfig:
     merge: int
     max_slices: int
     merger_layer: int
+    deepstack: tuple[int, ...] = ()
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> ClipConfig:
         """From an ``artlite.gguf_model.GGUFFile``."""
         assert gguf.arch == "clip", f"{gguf.path}: architecture {gguf.arch!r}, expected clip"
         m = lambda k, d=None: gguf.meta.get(f"clip.vision.{k}", d)
-        merge = int(m("projector.scale_factor", 4))
+        merge = int(m("projector.scale_factor", m("spatial_merge_size", 4)))
         wa = m("wa_layer_indexes")
         return cls(
             projector=str(gguf.meta["clip.projector_type"]),
@@ -567,6 +570,7 @@ class ClipConfig:
             merge=merge,
             max_slices=int(m("max_slice_nums", 9)),
             merger_layer=int(wa[0]) if merge == 4 and wa is not None else -1,
+            deepstack=tuple(i for i, d in enumerate(np.asarray(m("is_deepstack_layers", []), bool).tolist()) if d),
         )
 
     @property

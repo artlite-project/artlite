@@ -7,8 +7,8 @@ stream of the weights (``models.qwen35.overlay.QwenOverlay``): the projections o
 the full attention and its KV cache on the attention cores. The host reads the tokens' embedding rows from the mapped
 file and samples from the logits.
 
-A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows with M-RoPE positions: MiniCPM-V's
-images): each cache slot's position (``QwenOverlay.rope``) comes from it, the text after it from its ``next`` on.
+A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows with M-RoPE positions: images, MiniCPM-V's
+or Qwen3-VL's): each cache slot's position (``QwenOverlay.rope``) comes from it, the text after it from its ``next`` on.
 
 With a DFlash2 drafter (``dflash``, a file of its own, ``model_config.qwen_dflash_of``) a round's drafts come from one dispatch of a design of
 its own: its block of 8 positions over its cache of the model's last 2048 positions, up to 7 drafts for ~30 ms where an MTP chain takes
@@ -48,12 +48,14 @@ import torch
 
 from artlite.decode.design import XB
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import QwenConfig, qwen_dflash_of, qwen_mtp_of
+from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
 from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, drafter_type, max_prob
-from ..minicpmv.host import image_prompt
-from ..minicpmv.npu import PROJECTORS, NpuVision
+from ..minicpmv import host as minicpmv_host
+from ..minicpmv import npu as minicpmv_npu
+from ..qwen3vl import host as qwen3vl_host
+from ..qwen3vl import npu as qwen3vl_npu
 from ..readouts import readout_model
 from ..sequence import Sequence
 from ..tokenizer import QwenTokenizer, chat_prompt
@@ -517,9 +519,11 @@ class NpuQwen(OverlayModel):
 class Qwen(Model):
     """A qwen35 model from a GGUF file (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7's language model): the architecture,
     tokenizer and chat template from its metadata. Opening the file allocates the weight image's buffer and packs it in
-    a thread (``WeightBuffer``) while the tokenizer and the designs load. ``mmproj``: MiniCPM-V's vision encoder file
-    (``models.minicpmv.npu.NpuVision``: images in prompts; ``max_slices``: an image's slices at most, default the
-    file's); ``spec_type``, ``draft_model``: the drafter (``common.drafter_type``): auto, the model's DFlash2 drafter
+    a thread (``WeightBuffer``) while the tokenizer and the designs load. ``mmproj``: the vision encoder's file (images
+    in prompts), by its projector: Qwen3-VL's for Qwen3.5 / 3.6 / 3.8 (``models.qwen3vl.npu.NpuVision``;
+    ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default 8 .. 4096), MiniCPM-V's for its
+    language model (``models.minicpmv.npu.NpuVision``; ``max_slices``: an image's slices at most, default the file's);
+    ``spec_type``, ``draft_model``: the drafter (``common.drafter_type``): auto, the model's DFlash2 drafter
     (``model_config.qwen_dflash_of``; not with images) where its file exists, else its MTP block, else a qwen35moe model's
     MTP file (``model_config.qwen_mtp_of``); none (the image leaves the MTP block out); draft-mtp, draft-dflash: that
     one, which must exist; ``draft_model``: that file."""
@@ -529,9 +533,10 @@ class Qwen(Model):
     reasoning = ("<think>", "</think>")
     thought_first = True
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
-    projectors = PROJECTORS
+    projectors = minicpmv_npu.PROJECTORS + qwen3vl_npu.PROJECTORS
 
-    def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None, spec_type: str = "auto",
+    def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None,
+                 image_min_tokens: int | None = None, image_max_tokens: int | None = None, spec_type: str = "auto",
                  draft_model: str | None = None):
         self.gguf = GGUFFile(path)
         self.cfg = QwenConfig.from_gguf(self.gguf)
@@ -557,12 +562,23 @@ class Qwen(Model):
             self.name = "MiniCPM-V 4.7"
         self._npu: NpuQwen | None = None
         if mmproj is not None:
-            if not self.minicpmv:
-                raise ValueError(f"{path}: an mmproj file goes with MiniCPM-V 4.7's language model")
-            self.vision = NpuVision(mmproj, max_slices=max_slices)
-            if self.vision.clip.projection_dim != self.cfg.hidden_size:
-                raise ValueError(f"{mmproj}: embeddings of {self.vision.clip.projection_dim}, the language model's "
+            clip = ClipConfig.from_gguf(GGUFFile(mmproj))
+            if clip.projection_dim != self.cfg.hidden_size:
+                raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's "
                                  f"{self.cfg.hidden_size}")
+            if clip.projector in minicpmv_npu.PROJECTORS:
+                if not self.minicpmv:
+                    raise ValueError(f"{path}: MiniCPM-V's mmproj file goes with MiniCPM-V 4.7's language model")
+                self.vision = minicpmv_npu.NpuVision(mmproj, max_slices=max_slices)
+                self._image_prompt = minicpmv_host.image_prompt
+            elif clip.projector in qwen3vl_npu.PROJECTORS:
+                if self.minicpmv:
+                    raise ValueError(f"{path}: Qwen3-VL's mmproj file goes with Qwen3.5 / 3.6 / 3.8, not MiniCPM-V")
+                self.vision = qwen3vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
+                self._image_prompt = qwen3vl_host.image_prompt
+            else:
+                raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: "
+                                          f"{', '.join(self.projectors)})")
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -578,7 +594,7 @@ class Qwen(Model):
             return self.tokenizer.encode(text)
         if self.vision is None:
             raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
-        seq = image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
+        seq = self._image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
         if self._npu is not None:  # (the encoder's hardware context ran: ``OverlayDevice.set_prologue``)
             self._npu.stale()
         return seq

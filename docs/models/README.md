@@ -23,13 +23,13 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Gemma 4 26B-A4B it | | lmstudio-community QAT Q4_0; vision |
 | | 🤔 Gemma 4 31B it | | lmstudio-community QAT Q4_0; HauhauCS QAT Uncensored Balanced Q4_K_M (with MTP); vision |
 | qwen35 | ✅ Qwen3.5 9B | lmstudio-community Q4_K_M | |
-| | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M | vision |
-| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter | vision |
+| | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M, its mmproj BF16 (images) | |
+| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images) | |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
 | | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0 | images (their Qwen3-VL encoder) |
 | | ✅ Kev-4B (decision model: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q4_K_M | |
-| qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0) | vision |
-| | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M) | vision |
+| qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0); its mmproj BF16 (images) | |
+| | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M); its mmproj Q8_0 (images) | |
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |

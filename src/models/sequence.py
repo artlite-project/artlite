@@ -3,17 +3,19 @@
 ``Sequence``: per token its id (``MEDIA`` where only an embedding row stands: an image's patches), whether it takes a
 given embedding row instead of its id's (``given``; the rows in ``rows``, in order) and its position (T, H, W) relative
 to the sequence's start; ``next``: the position of the text after it. Text from position 0 has the positions of its
-indices; an image's take fewer positions than tokens (``models.minicpmv.host``). Sequences concatenate (``+``, a
-list of token ids as text) and slice like lists (a slice's positions relative to its first token's T, so that the
-slices of a sequence run one after another as the whole), so the model's prompt path runs them in chunks and steps as
-token lists.
+indices; an image's take fewer positions than tokens (``models.minicpmv.host``, ``models.qwen3vl.host``). Sequences
+concatenate (``+``, a list of token ids as text) and slice like lists (a slice's positions relative to its first
+token's T, so that the slices of a sequence run one after another as the whole), so the model's prompt path runs them
+in chunks and steps as token lists. ``load_image``: an image file as the vision encoders take it.
 """
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image, ImageOps
 
 MEDIA = -1  # the id of a token that only an embedding row stands for
 
@@ -60,3 +62,10 @@ class Sequence:
         alike)."""
         rows = iter(self.rows)
         return [next(rows).tobytes() if g else int(t) for t, g in zip(self.ids, self.given, strict=True)]
+
+
+def load_image(src: str | bytes) -> Image.Image:
+    """An image file (a path or its bytes) as RGB, turned upright by its EXIF orientation (transformers'
+    ``load_image``; an alpha channel dropped; a JPEG's pixels within 3 levels of llama.cpp's stb_image)."""
+    with Image.open(io.BytesIO(src) if isinstance(src, bytes) else src) as im:
+        return ImageOps.exif_transpose(im).convert("RGB")

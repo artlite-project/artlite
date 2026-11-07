@@ -132,10 +132,12 @@ class Records:
 @dataclass
 class Builder:
     """A dispatch under construction: ``ops`` in order, DDR images by name (``image``), the memtile (``mem``), the
-    activation table each core row holds."""
+    activation table each core row holds. reuse: an image the device holds already (a restored model's: its weights,
+    commands) is taken by its name as it is, neither converted nor written again."""
 
     npu: VisionDevice
     mem: Mem = field(default_factory=Mem)
+    reuse: bool = False
 
     def __post_init__(self) -> None:
         self.s = self.npu.seq()
@@ -158,7 +160,7 @@ class Builder:
     def fork(self) -> "Builder":
         """A builder of another dispatch on the same device that shares this one's DDR images (weights, commands,
         tables: written once, the same names in both)."""
-        b = Builder(self.npu)
+        b = Builder(self.npu, reuse=self.reuse)
         b.tables, b._images, b._ddr, b._gemm_images = self.tables, self._images, self._ddr, self._gemm_images
         return b
 
@@ -166,6 +168,8 @@ class Builder:
     def image(self, name: str, data: np.ndarray) -> int:
         """A persistent DDR buffer holding ``data``; returns its device address. A name may be imaged again with the
         same data only (ops of several bands share a layer's images: the dispatch reads what was written last)."""
+        if self.reuse and self.npu.has(name):
+            return self.npu.address(name)
         data = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
         h = hash(data.tobytes())
         assert self._images.setdefault(name, h) == h, f"DDR image {name!r} written again with other data"
@@ -310,6 +314,8 @@ class Builder:
         else:
             if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
                 addr, per = self._gemm_images[name][1:]
+            elif self.reuse and self.npu.has(name):  # (per row its command, then its weights' k-tiles of B slots)
+                addr, per = self.npu.address(name), D.Q + (g.npo * g.nkt * D.Q if g.nkt else 0)
             else:
                 ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
                 per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)

@@ -2,7 +2,7 @@
 loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
 d 80 / 160, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
 "ln" the LayerNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's window
-attention; together they do not fit 16 KB
+attention, "r" the RoPE epilogue of Qwen3-VL's Q and K GEMMs; together they do not fit 16 KB
 of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the pager's state
 words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third). A page arrives in the B stream
 (``device.VisionDevice``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
@@ -25,8 +25,10 @@ core copies it into its workspace and releases the slot. Kinds:
   chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B; O_DS: its groups 0 and 2, a
   stride-2 conv's x, in 2 x 2 chunks), its bfp16 panels (m x 90 B,
   [rb][cb]), their transposes (V^T: [rb][cb] of [8 channels][8 tokens], the exponent per channel), GEGLU (the
-  pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]) or GELU (gelu of the 80: bfp16 panels
-  [rb][10]) in ``OCH`` chunks (the last one padded);
+  pass's channels [hid 40 | gate 40] -> hid gelu(gate): bfp16 panels [rb][5]), GELU (gelu of the 80: bfp16 panels
+  [rb][10]) or RoPE (role r's entry: the pass is a head, its channels [first dims 40 | second dims 40] of 40 pairs
+  (k, 40 + k); the residual objects its tokens' cos | sin, a C tile [rb][cb][64] of cos (cb < 5) and sin; each pair
+  turned, then bfp16 panels [rb][cb]) in ``OCH`` chunks (the last one padded);
 - ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
   stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
   beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
@@ -39,10 +41,12 @@ core copies it into its workspace and releases the slot. Kinds:
   keys, C_NK of them valid in the last one) a K slot [key pair 2][d-block 20][2] and a V^T slot [d-block pair 10][key
   block 4][2] (8 dims x 8 keys): per query pair S = Q K^T (the GEMM MAC loop, m 16) and the softmax, then P V^T of the
   pairs (m 16 npair); K is given back before V is taken (the next K arrives during P V^T). The softmax: the reference
-  max of each query from the first group (with C_RAISE raised, O and l rescaled, where a later group's scores exceed
-  it by 2^16: attention sinks; else never, P saturating at 2^63 above it; q pre-scaled by log2 e / sqrt d), P = 2^(s - m) to 0.59 bf16 ULP, l = the row sums of the bfp16 P;
+  max of each query from the first group (with C_RAISE raised, O and l rescaled, where a later group's P saturates
+  at 2^63 above it: an attention sink, the group's S computed again and the reference raised to its maximum; else P
+  saturates; q pre-scaled by log2 e / sqrt d), P = 2^(s - m) to 0.59 bf16 ULP, l = the row sums of the bfp16 P;
   out: O / l as panels [query panel][d-block]. A group whose keys are all masked (C_KMASK) is streamed and skipped
-  (the first group computed sets the reference max).
+  (the first group computed sets the reference max). C_DENSE (any number of groups): the first C_NLIVE groups live,
+  their last one's masks C_KMASK's words 0, 1 (words 2, 3: -1, every key; 4, 5: 0, the dead groups').
 
 Statistics records (``REC`` bytes, an output chunk): GroupNorm [image 2][S1, S2][16 groups] fp32 of groups of C_GSIZE
 channels counted from C_G0 (the core's first output channel C_CH0 + its passes); LayerNorm [S1 m | S2 m] fp32.
@@ -62,6 +66,7 @@ from ..operators.kernel_source import kernel_prefix
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
  C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
 C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
+C_DENSE, C_NLIVE = 30, 31  # (attention: the dense key masks, the live groups: the module docstring)
 C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
 # groups; -1: all; around the command's walks)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
@@ -80,13 +85,13 @@ C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
 K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN = 1, 2, 3, 4, 5, 6
-O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU = 0, 1, 2, 3, 4, 5
+O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU, O_ROPE = 0, 1, 2, 3, 4, 5, 6
 S_NONE, S_GN, S_LN = 0, 1, 2
 A_GN, A_GNSILU, A_LN = 1, 2, 3
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "c", "v", "gn", "ln", "w")
+ROLES = ("a", "c", "v", "gn", "ln", "w", "r")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
@@ -469,6 +474,10 @@ __attribute__((noinline, minsize)) void {{ p }}_gemm({{ p }}_st &s, int32_t *cb,
         {{ p }}_give_a(s, a);
       }
       int left = m * 80;  // (the residual tile's bf16 values, with the conversion to bf16)
+      if (om == {{ O_ROPE }}) {  // (page r's entry: the residual objects are the tokens' cos | sin; panels out)
+        ((void (*)({{ p }}_st &, int32_t *, int32_t *, int32_t *))(intptr_t)s.ext[1])(s, cb, ws, tab);
+        continue;
+      }
       for (int i = 0; i < nres; i++) {
         int32_t *a = {{ p }}_take_a(s);
         const int n = left < {{ A_OBJ // 2 }} ? left : {{ A_OBJ // 2 }};
@@ -757,14 +766,16 @@ static __attribute__((noinline, minsize)) void {{ p }}_apply_gn({{ p }}_st &s, i
 // 32 lanes per step: A = S + mb, mb [q panel][8 q][8]); sl, ss: S as distinct restrict parameters (each read before it
 // is written: the loop pipelines, II 23; a runtime trip count or walk leaves it unpipelined)
 template <int QS>
-static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict mb) {
+static __attribute__((noinline)) int {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict mb) {
 {% if win == "aexp" %}
   event0();
 {% endif %}
   int cl = 0, cs = 0;
+  aie::vector<bfloat16, 32> mx = aie::zeros<bfloat16, 32>();  // (the largest A: P saturates from A = 255.5)
   for (int t = 0; t < 16; t++) {
     aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
     A = aie::add(A, aie::load_v<32>(mb + 64 * (t >> 3) + 32 * (t & 1)));
+    mx = aie::max(mx, A.template to_vector<bfloat16>());
     aie::store_v(ss, {{ exp2 }}(A).template to_vector<float>());
     sl = add_2d_ptr(sl, QS - 224, 7, cl, 32);
     ss = add_2d_ptr(ss, QS - 224, 7, cs, 32);
@@ -772,6 +783,7 @@ static __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, f
 {% if win == "aexp" %}
   event1();
 {% endif %}
+  return !aie::lt(mx, aie::broadcast<bfloat16, 32>(255.0f)).full();
 }
 
 // the softmax's masked keys (``{{ p }}_attn_sm``): key k of the group kept where bit k of km (two words) is set, else
@@ -789,26 +801,13 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_mm(float *__restrict
 }
 
 // a query pair's reference max per key group: the first group's maximum per query in bf16 (a reference, not the exact
-// max: mb = 192 - m, [q panel][8 q][8]); in a later group a score past it by 2^16 (an attention sink: P saturates at
-// 2^63 above the reference) raises the query's to its group maximum (rarely), its o [2 q panels][nd][64] and l [2][8
-// q][8] lanes scaled by a = 2^(m - m') (bf16: a <= 2^-16 where raised, 1 elsewhere: within 2^-16 there); the check over
-// both q panels, then 16 lanes (2 queries) at a time
+// max: mb = 192 - m, [q panel][8 q][8]); in a later group (its P saturated: ``{{ p }}_attn_sm``) a score past it by 2^16
+// raises the query's to its group maximum, its o [2 q panels][nd][64] and l [2][8 q][8] lanes scaled by a = 2^(m - m')
+// (bf16: a <= 2^-16 where raised, 1 elsewhere: within 2^-16 there); 16 lanes (2 queries) at a time
 template <int QS>
 static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *__restrict sm, float *__restrict mb,
                                                              float *__restrict o, float *__restrict l, int nkp, int nd,
                                                              int first) {
-  bool ok = !first;
-  for (int qp = 0; ok && qp < 2; qp++) {
-    const float *ps = sm + QS * qp;
-    aie::vector<bfloat16, 64> v = aie::accum<accfloat, 64>(aie::load_v<64>(ps)).template to_vector<bfloat16>();
-    for (int kp = 1; kp < nkp; kp++)
-      v = aie::max(v, aie::accum<accfloat, 64>(aie::load_v<64>(ps + 64 * kp)).template to_vector<bfloat16>());
-    const aie::vector<bfloat16, 64> lim = aie::accum<accfloat, 64>(
-        aie::sub(aie::broadcast<float, 64>(208.0f), aie::load_v<64>(mb + 64 * qp))).template to_vector<bfloat16>();  // (m + 16)
-    ok = aie::lt(v, lim).full();
-  }
-  if (ok)
-    return;
   for (int i = 0; i < 8; i++) {
     const int qp = i >> 2, c = 16 * (i & 3);
     const float *ps = sm + QS * qp + c;
@@ -839,17 +838,22 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *_
 
 // the softmax of a query pair and key group (``K_ATTN``): S [2 q panels, QS floats apart][nkp key panels][64] fp32 (keys
 // from nk on: -2^14), the reference max (mb = 192 - m per query, [2][8 q][8]: ``{{ p }}_attn_raise`` in the first group,
-// in later ones with ``raise``; o the pair's [2][nd][64]), P = 2^(S - m) (``{{ p }}_pexp`` per 4 key panels) -> pp (bfp16 panels
-// [key panel][q panel]: the P V^T MAC's A order; QPM: [q panel][key panel]), l [2][8 q][8] += the row sums of those
-// panels (a MAC with ones: the P that multiplies V)
+// with ``raise`` 2 in a later one; o the pair's [2][nd][64]), P = 2^(S - m) (``{{ p }}_pexp`` per 4 key panels) -> pp (bfp16
+// panels [key panel][q panel]: the P V^T MAC's A order; QPM: [q panel][key panel]), l [2][8 q][8] += the row sums of
+// those panels (a MAC with ones: the P that multiplies V). raise 1 (C_RAISE): a later group's P saturated (a score past
+// the reference by 63: an attention sink; ``{{ p }}_pexp``'s flag): then 0, nothing stored (the caller computes S again
+// and calls with raise 2); else 1
 template <int QS, bool QPM>
-static __attribute__((noinline)) void {{ p }}_attn_sm(float *__restrict sm, float *__restrict mb, float *__restrict l,
-                                                 bfp16ebs8 *__restrict pp, const int32_t *km, int nkp, float *o, int nd,
-                                                 int first, int raise) {
+static __attribute__((noinline)) int {{ p }}_attn_sm(float *__restrict sm, float *__restrict mb, float *__restrict l,
+                                                bfp16ebs8 *__restrict pp, const int32_t *km, int nkp, float *o, int nd,
+                                                int first, int raise) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   if ((km[0] & km[1]) != -1) {{ p }}_attn_mm<QS>(sm, km, nkp);
-  if (first || raise) {{ p }}_attn_raise<QS>(sm, mb, o, l, nkp, nd, first);
-  for (int k = 0; k < nkp; k += 4) {{ p }}_pexp<QS>(sm + 64 * k, sm + 64 * k, mb);
+  if (first || raise == 2) {{ p }}_attn_raise<QS>(sm, mb, o, l, nkp, nd, first);
+  int sat = 0;
+  for (int k = 0; k < nkp; k += 4) sat |= {{ p }}_pexp<QS>(sm + 64 * k, sm + 64 * k, mb);
+  if (sat && raise == 1 && !first)
+    return 0;
   const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
   al::MM8 a0(aie::accum<accfloat, 64>(aie::load_v<64>(l))), a1(aie::accum<accfloat, 64>(aie::load_v<64>(l + 64)));
   al::BOut<> po(pp), pq((bfp16ebs8 *)((uint8_t *)pp + 72 * nkp));
@@ -870,6 +874,7 @@ static __attribute__((noinline)) void {{ p }}_attn_sm(float *__restrict sm, floa
   }
   aie::store_v(l, a0.template to_vector<float>());
   aie::store_v(l + 64, a1.template to_vector<float>());
+  return 1;
 }
 
 // a query pair and key group: S := Q K^T (16 queries, 16 nkb keys, k 8 nd; Q [d-block nd][2 panels], K [key block nkb][d-block
@@ -938,7 +943,7 @@ static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o
 static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
   const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}];
   const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}], d160 = nd == 20;
-  const int npair = (nqp + 1) / 2;
+  const int npair = (nqp + 1) / 2, dense = ws[{{ C_DENSE }}], nlive = ws[{{ C_NLIVE }}];
   float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
   // (P V^T at d 80: the GEMM MAC of one band, its walks the command's)
   const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
@@ -951,7 +956,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
     int first = 1;  // (no group computed yet: the next one sets the reference max)
     for (int g = 0; g < ng; g++) {  // (K given back before V is taken: the next K arrives during the PVs)
       int32_t *k = {{ p }}_take_b(s);
-      const int live = km[2 * g] != 0 || (!d160 && km[2 * g + 1] != 0);  // (a group of masked keys only: streamed, skipped)
+      const int32_t *kg = dense ? km + (g < nlive - 1 ? 2 : g == nlive - 1 ? 0 : 4) : km + 2 * g;
+      const int live = kg[0] != 0 || (!d160 && kg[1] != 0);  // (a group of masked keys only: streamed, skipped)
 {% if win == "aqk" %}
       event0();
 {% endif %}
@@ -959,9 +965,11 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
         int32_t *qa = {{ p }}_aw(q, {{ A_OBJ // 8 }} * pr);
         float *sm = (float *)(q + (36 * nd + 15) / 16 * 16);  // (64-B aligned: the 2048-bit stores' unit)
         bfp16ebs8 *pp = (bfp16ebs8 *)(d160 ? s.s1 + {{ 8 * 18 }} * pr : (pr ? s.s1 : s.s0));
-        {{ p }}_attn_qk<{{ QS }}>(qa, k, sm, nkp / 2, nd);
-        {{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, km + 2 * g, nkp, o + 128 * nd * pr, nd,
-                                         first, ws[{{ C_RAISE }}]);
+        for (int ra = ws[{{ C_RAISE }}];; ra = 2) {  // (a sink: S again, the reference raised)
+          {{ p }}_attn_qk<{{ QS }}>(qa, k, sm, nkp / 2, nd);
+          if ({{ p }}_attn_sm<{{ QS }}, false>(sm, mb + 128 * pr, l + 128 * pr, pp, kg, nkp, o + 128 * nd * pr, nd, first, ra))
+            break;
+        }
       }
 {% if win == "aqk" %}
       event1();
@@ -1421,6 +1429,24 @@ static __attribute__((noinline, minsize)) void {{ p }}_wattn({{ p }}_st &s, int3
   }
 }
 
+// a head's bf16 C tile [rb][cb][64] turned in place: pair (cb, cb + 5) of channel blocks (x, y) by the table t (the same
+// layout: cos in cb < 5, sin in cb + 5): x cos - y sin, y cos + x sin
+static __attribute__((noinline)) void {{ p }}_rope(bfloat16 *__restrict c, const bfloat16 *__restrict t, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  for (int rb = 0; rb < nrb; rb++) {
+    AIE_LOOP_UNROLL_FULL
+    for (int cb = 0; cb < 5; cb++) {
+      bfloat16 *x = c + 640 * rb + 64 * cb;
+      const bfloat16 *cs = t + 640 * rb + 64 * cb;
+      const aie::vector<bfloat16, 64> vx = aie::load_v<64>(x), vy = aie::load_v<64>(x + 320);
+      const aie::vector<bfloat16, 64> vc = aie::load_v<64>(cs), vs = aie::load_v<64>(cs + 320);
+      const aie::accum<accfloat, 64> a = aie::msc(aie::mul(vx, vc), vy, vs), b = aie::mac(aie::mul(vy, vc), vx, vs);
+      aie::store_v(x, a.template to_vector<bfloat16>());
+      aie::store_v(x + 320, b.template to_vector<bfloat16>());
+    }
+  }
+}
+
 {{ pager }}
 
 // the cores' main loop (resident): commands from the B stream; GEMMs / convs and tables here, the other kinds by the
@@ -1477,6 +1503,28 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_ln({{ p }}_st &s, int32_t *c
 
 __attribute__((noinline, minsize)) void {{ p }}_ext_w({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
   {{ p }}_wattn(s, cb, ws);
+}
+
+// K_GEMM's RoPE epilogue (role r, the module docstring): the pass's fp32 C tile to bf16 in place, its C_NRES residual
+// objects (the tokens' cos | sin, m x 80 bf16) into the C buffer after it, the pairs turned, the tile -> bfp16 panels
+// out
+__attribute__((noinline, minsize)) void {{ p }}_ext_r({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  const int m = ws[{{ C_M }}], nres = ws[{{ C_NRES }}];
+  {{ p }}_res_f2b((const bfloat16 *)(ws + {{ C_ZERO }}), (const float *)cb, (bfloat16 *)cb, m * 80, 0, 0);
+  int32_t *t = cb + m * 40;  // (words: the table after the bf16 tile, in the C buffer's other region)
+  for (int i = 0, left = m * 40; i < nres; i++) {
+    int32_t *a = {{ p }}_take_a(s);
+    const int n = left < {{ A_OBJ // 4 }} ? left : {{ A_OBJ // 4 }}, n0 = n < {{ A_OBJ // 8 }} ? n : {{ A_OBJ // 8 }};
+    {{ p }}_copy8(a, t, n0);
+    if (n > n0)
+      {{ p }}_copy8({{ p }}_aw(a, {{ A_OBJ // 8 }}), t + n0, n - n0);
+    t += n;
+    left -= n;
+    {{ p }}_give_a(s, a);
+  }
+  {{ p }}_rope((bfloat16 *)cb, (const bfloat16 *)(cb + m * 40), m / 8);
+  {{ p }}_bfp(cb, cb, m / 8 * 10);
+  {{ p }}_out(s, cb, m * 90);
 }
 
 extern "C" {

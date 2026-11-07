@@ -87,12 +87,16 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kv-k", choices=("single", "hilo"),
                    help="K precision of the KV cache (Llama, Qwen3, Gemma): one bfp16 block per 8 dims (Llama's "
                         "default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read time)")
-    vis = p.add_argument_group("images in the prompt (MiniCPM-V 4.7)")
-    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-model-f16.gguf)")
+    vis = p.add_argument_group("images in the prompt (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-*.gguf)")
     vis.add_argument("--image", action="append", default=[],
                      help=f"an image file (repeatable): where the prompt has {MEDIA_MARKER}, else before it")
     vis.add_argument("--max-slices", type=int,
-                     help="an image's slices at most (default: the mmproj's, 9; the model card uses 36)")
+                     help="an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36)")
+    vis.add_argument("--image-min-tokens", type=int,
+                     help="an image's tokens at least (Qwen3-VL's mmproj; default 8, llama.cpp's)")
+    vis.add_argument("--image-max-tokens", type=int,
+                     help="an image's tokens at most (Qwen3-VL's mmproj; default 4096, llama.cpp's)")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
@@ -154,7 +158,8 @@ def main(argv: list[str] | None = None) -> None:
     seed(args.seed)
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
-    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, **spec_options(args)}
+    options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices,
+               "image_min_tokens": args.image_min_tokens, "image_max_tokens": args.image_max_tokens, **spec_options(args)}
     variables = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
         ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
     try:

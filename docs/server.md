@@ -44,7 +44,8 @@ settings for them have no effect. Log-probabilities come as llama-server's: chat
 `top_probs`). A request's `speculative.n_max` (llama-server's field) caps the draft tokens per step of its
 generation, up to `--spec-draft-n-max` (0: steps of one token; a drafter still follows the tokens, so the next request
 drafts as before); `/props` and `/slots` report the cap in `params`.
-Images (a model with `--mmproj`: [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
+Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
+[MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
 `image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: infill,
 `/metrics`, LoRA, model downloads; their routes answer 501.
 
@@ -258,8 +259,9 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
   says why. Drafters (`mtp-`, `<name>-mtp-`, z-lab's `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
   qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
-  a preset's `spec-type` and `spec-draft-model` choose another), and MiniCPM-V 4.7 gets the `mmproj` file of its
-  directory (`mmproj-model-f16.gguf` before the 4x one).
+  a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
+  that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
+  before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
@@ -415,8 +417,9 @@ Images:
 
 | option | |
 |---|---|
-| `--mmproj FILE` | the vision encoder's file (MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in chat messages |
-| `--max-slices N` | an image's slices at most (default: the mmproj's, 9; the model card uses 36) |
+| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)) |
+| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen; default 8 / 4096, llama.cpp's) |
+| `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 Logging:
 

@@ -97,6 +97,86 @@ def test_gemm(npu: VisionDevice, m: int, ntile: int, K: int, N: int, res: bool, 
     assert _rel(y, ref) < 8e-3
 
 
+def test_gemm_rope(npu: VisionDevice) -> None:
+    """Q / K of 16 heads of 80 (``Gemm(out="rope")``): each head's pairs of channels (k, 40 + k) turned by its token's
+    cos | sin (the residual tile, the same for every pass), as panels: within 8e-3 of the turned bf16 outputs of the
+    bfp16-rounded operands' GEMM."""
+    torch.manual_seed(1)
+    m, K, N = 64, 1280, 1280
+    x = torch.randn(COLS * m, K)
+    w, b = torch.randn(N, K) / K ** 0.5, torch.randn(N) * 0.1
+    ang = torch.rand(COLS * m, 40) * 20
+    cs = torch.cat([torch.cos(ang), torch.sin(ang)], 1)  # (per token [cos 40 | sin 40])
+    X, RES = 0, K // 8 * m // 8 * L.PANEL
+    Y = RES + L.ct_bytes(m)
+    g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, res=RES, out="rope")
+    ybytes = N // 8 * m // 8 * L.PANEL
+    s = npu.seq()
+    s.op(merge(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X),
+               fills(npu, "r", [L.ctiles(cs[c * m:(c + 1) * m], m) for c in range(COLS)], RES)), {})
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, b))
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    y = torch.cat([L.from_panels(yb[c], m, N) for c in range(COLS)])
+    c0 = (q(x) @ q(w).T + b.bfloat16().float()).bfloat16().float().reshape(-1, 16, 2, 40)
+    c, sn = (t.bfloat16().float()[:, None] for t in (cs[:, :40], cs[:, 40:]))
+    ref = torch.stack([c0[:, :, 0] * c - c0[:, :, 1] * sn, c0[:, :, 1] * c + c0[:, :, 0] * sn], 2).reshape(-1, N)
+    assert _rel(y, ref) < 8e-3
+
+
+@pytest.mark.parametrize("nb, frac", [(5, 0.83), (2, 1.0), (9, 0.5)])
+def test_attention_dense(npu: VisionDevice, nb: int, frac: float) -> None:
+    """Joint self-attention of 16 heads of 80 over more than 32 key groups (``Attention(dense=True)``): both images'
+    keys of nb bands one sequence, about its first ``frac`` valid (the last live group's keys in a pattern; the rest
+    streamed, skipped or masked), each column's band-0 queries over them: within 1.5e-2 of softmax attention on the
+    bfp16-rounded operands."""
+    torch.manual_seed(5)
+    np_, d, heads = 8, 80, 16
+    T, C = 8 * np_, heads * d
+    x = torch.randn(3, nb, COLS * T, C)
+    qs, k, v = x[0, 0] * (1.4426950408889634 / d ** 0.5) * 2, x[1], x[2]
+    QA = 0
+    KA = QA + C // 8 * np_ * L.PANEL + D.A_OBJ
+    VA = KA + C // 8 * np_ * L.PANEL
+    OA = VA + C // 8 * np_ * L.PANEL
+    cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
+    kw = {"np": np_, "q": QA, "o": OA, "d": d, "nbands": nb, "heads": heads, "joint": True, "dense": True}
+    nkeys = 2 * 4 * COLS * T * nb // 8  # (the sequence: image 0's keys of every band, then image 1's)
+    nvalid = int(nkeys * frac)
+    ok = np.arange(nkeys) < nvalid
+    ok[nvalid // 64 * 64:nvalid] &= np.arange(nvalid % 64) % 3 != 1  # (the last live group: a pattern)
+    npu.alloc("kv", Attention(kv=0, **kw).kv_bytes())
+    at = Attention(kv=npu.address("kv"), valid=(ok, ok), **kw)
+    s = npu.seq()
+    for b in range(nb):
+        s.op(merge(fills(npu, f"k{b}", [L.panels(k[b, sl]) for sl in cols], KA),
+                   fills(npu, f"v{b}", [L.vt_panels(v[b, sl]) for sl in cols], VA)), {})
+        for part in ("k", "v"):
+            s.op({c: at.kv_drains(KA, VA, c, band=b, part=part) for c in range(COLS)}, {})
+    s.ddr_sync()
+    npu.alloc("acmd", D.Q)
+    npu.write("acmd", at.command())
+    s.op(fills(npu, "q", [L.panels(qs[sl]) for sl in cols], QA), {})
+    s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(npu.address("acmd")))
+    nbytes = C // 8 * np_ * L.PANEL
+    s.op(drains(npu, "o", nbytes, OA), {})
+    npu.run(npu.transaction(s))
+    ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
+    o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
+    img = images(T)
+    sel = torch.from_numpy(ok)
+    kk = torch.cat([q(k[b][img == i]) for i in range(2) for b in range(nb)])[sel]
+    vq = torch.cat([torch.cat([q(v[b, sl].T).T for sl in cols])[img == i] for i in range(2) for b in range(nb)])[sel]
+    ref = torch.zeros(COLS * T, C)
+    for h in range(heads):
+        ch = slice(d * h, d * (h + 1))
+        sc = q(qs[:, ch]) @ kk[:, ch].T
+        p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
+        ref[:, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
+    assert _rel(o, ref) < 1.5e-2
+
+
 @pytest.mark.parametrize("m, K, N", [(64, 320, 2560), (64, 640, 1280), (16, 320, 1280)])
 def test_geglu(npu: VisionDevice, m: int, K: int, N: int) -> None:
     """ff1 with the GEGLU epilogue (N / 2 outputs hid gelu(gate), the weight's rows [hid | gate]): within 1.2e-2 of

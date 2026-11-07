@@ -87,6 +87,18 @@ def catalog_of(models_dir: str, tmp_path: object, **kw: object) -> Catalog:
 # ----------------------------------------------------------------------
 
 
+def test_catalog_qwen3vl(tmp_path: object) -> None:
+    """A Qwen model's directory: its vision encoder is the Qwen3-VL mmproj of its width (another model's, wider, and
+    MiniCPM-V's are not its own)."""
+    d = str(tmp_path / "models")
+    write_gguf(f"{d}/org/q-GGUF/q-35B-A3B-Q4_K_M.gguf", arch="qwen35moe", n_embd=128)
+    write_gguf(f"{d}/org/q-GGUF/mmproj-q-BF16.gguf", arch="clip", n_embd=128, projector="qwen3vl_merger")
+    write_gguf(f"{d}/org/q-GGUF/mmproj-27B-BF16.gguf", arch="clip", n_embd=256, projector="qwen3vl_merger")
+    write_gguf(f"{d}/org/q-GGUF/mmproj-f16.gguf", arch="clip", n_embd=128, projector="other_projector")
+    entries = catalog_of(d, tmp_path).scan()
+    assert os.path.basename(entries["org/q-GGUF:Q4_K_M"].mmproj) == "mmproj-q-BF16.gguf"
+
+
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,
                  caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level("INFO")

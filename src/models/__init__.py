@@ -12,8 +12,8 @@ with a web chat).
 | ``llama`` | ``llama`` | Llama 3.2 1B / 3B, Llama 3.1 8B |
 | ``qwen3``, ``vllm-decision2`` | ``llama`` | Qwen3 0.6B, Qwen3-Embedding, Qwen3-Reranker; Decision-2.0-Kai (Qwen3 and a decision head) |
 | ``gemma4`` | ``gemma4`` | Gemma 4 E4B |
-| ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 (Gated DeltaNet and full-attention layers), MiniCPM-V 4.7 (images: its mmproj) |
-| ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN) |
+| ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet and full-attention layers; images: their Qwen3-VL mmproj), MiniCPM-V 4.7 (images: its mmproj) |
+| ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN; images: its mmproj) |
 | ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 

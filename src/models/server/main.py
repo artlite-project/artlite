@@ -146,11 +146,15 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      help="a Jinja chat template in place of the model file's (tokenizer.chat_template)")
     gen.add_argument("--chat-template-file", metavar="FILE",
                      help="the same from a file (one template for several models: a preset's sections)")
-    vis = p.add_argument_group("images (MiniCPM-V 4.7)")
-    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-model-f16.gguf): images "
-                     "in chat messages (image_url parts of data URIs)")
+    vis = p.add_argument_group("images (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-*.gguf): images in chat "
+                     "messages (image_url parts of data URIs)")
     vis.add_argument("--max-slices", type=int,
-                     help="an image's slices at most (default: the mmproj's, 9; the model card uses 36)")
+                     help="an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36)")
+    vis.add_argument("--image-min-tokens", type=int,
+                     help="an image's tokens at least (Qwen3-VL's mmproj; default 8, llama.cpp's)")
+    vis.add_argument("--image-max-tokens", type=int,
+                     help="an image's tokens at most (Qwen3-VL's mmproj; default 4096, llama.cpp's)")
     emb = p.add_argument_group("embeddings and rerank")
     emb.add_argument("--embedding", "--embeddings", action="store_true",
                      help="the embedding routes (/v1/embeddings, /embeddings), as llama-server's: --pooling's, else the "
@@ -371,7 +375,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
 
     def load() -> tuple[Model, NpuModel]:
         t0 = time.perf_counter()
-        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices, **spec_options(args)}
+        opts = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices,
+                "image_min_tokens": args.image_min_tokens, "image_max_tokens": args.image_max_tokens, **spec_options(args)}
         model = open_model(args.model, chat_template=template, **{k: v for k, v in opts.items() if v is not None})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)

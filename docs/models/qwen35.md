@@ -5,8 +5,9 @@ through its vision encoder: [below](#images-minicpm-v-47)) from a GGUF file (lla
 DeltaNet layers with a full-attention layer every fourth), and Qwen3.6-35B-A3B (`qwen35moe`: the same layers with a
 mixture of experts as the FFN: [below](#mixture-of-experts-qwen36-35b-a3b)), also as Occamy 1.0 (Accio-Lab's fine-tune
 of it for agentic tool use, abliterated by IsValorum, in a 3-bit quantization: 15.8 GB instead of 21 GB), and the
-decision models vllm-sr d3-lite, d3-nano and Kev-4B ([below](#decision-models-vllm-d3-kev)). The architecture,
-tokenizer and chat template are read from the file's metadata.
+decision models vllm-sr d3-lite, d3-nano and Kev-4B ([below](#decision-models-vllm-d3-kev)); the Qwen models take images
+through their Qwen3-VL vision encoder ([below](#images-qwen35--36--38)). The architecture, tokenizer and chat template
+are read from the file's metadata.
 Running them: [artlite-cli](../cli.md); `--think` lets the model think (default: an empty thought); default sampling:
 the file's (`general.sampling.*`), else the model card's (MiniCPM-V's: temperature 0.7, top-p 0.95, top-k 100,
 repetition penalty 1.03).
@@ -19,9 +20,11 @@ $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf 
 $ARTLITE_MODELS_DIR/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   (its DFlash2 drafter, optional, the default where it is here)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
+$ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/mmproj-Qwen3.6-35B-A3B-BF16.gguf  (its vision encoder; the 27B models' likewise)
 $ARTLITE_MODELS_DIR/ggml-org/Qwen3.6-35B-A3B-GGUF/mtp-Qwen3.6-35B-A3B-Q4_0.gguf          (its MTP drafter)
 $ARTLITE_MODELS_DIR/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
 $ARTLITE_MODELS_DIR/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/occamy-1.0-mtp-Q4_K_M.gguf (its drafter)
+$ARTLITE_MODELS_DIR/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/mmproj-Q8_0.gguf (its vision encoder)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf     (MiniCPM-V's language model)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf            (its vision encoder, 16x)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf         (the same, 4x: finer detail)
@@ -158,6 +161,40 @@ wherever the context could guess, the block already does. A prompt cache's check
 Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
 (`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's
 does, and with a drafter its rows follow the step's kept tokens.
+
+## Images (Qwen3.5 / 3.6 / 3.8)
+
+```bash
+artlite-cli -m lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+    --mmproj lmstudio-community/Qwen3.6-35B-A3B-GGUF/mmproj-Qwen3.6-35B-A3B-BF16.gguf --image photo.jpg -p "Describe the image."
+```
+
+The Qwen models' vision encoder is their `mmproj-*.gguf` (projector `qwen3vl_merger`; BF16, F16 or Q8_0, tested:
+lmstudio-community's BF16 files of Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B, IsValorum's Q8_0 for Occamy 1.0: the
+one of the model's repository, whose width is the model's; [artlite-server](../server.md)'s router mode pairs it with
+the model by itself). An image is resized whole, as transformers' processor and llama.cpp resize it: its sides to multiples of 32
+pixels at its aspect, between `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (llama.cpp's
+defaults 8 and 4096; a 1024 x 768 photo is 768 tokens, a phone's 12-megapixel photo 4015). Its tokens take the
+official M-RoPE positions (rows and columns from the position after `<|vision_start|>`; llama.cpp's are the same).
+
+The encoder (`qwen3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 27 layers of
+attention over all of the image's 16 x 16 patches (a 2-D RoPE in each head), then each 2 x 2 window merged into one
+token by an MLP. Its time grows with the patches and, through the attention, with their square:
+
+| image (tokens) | 512 x 512 (256) | 1024 x 1024 (1024) | 2048 x 2048 (4096) |
+|---|---|---|---|
+| Artlite (NPU) | 0.068 s | 0.44 s | 4.7 s |
+| llama.cpp, iGPU (Vulkan) | 0.27 s | 1.33 s | 10.3 s |
+| llama.cpp, CPU (16 threads) | 0.42 s | 2.61 s | 27.1 s |
+
+(Strix Halo, Qwen3.6-35B-A3B's mmproj; llama.cpp's `mtmd batch encoding` time.)
+
+A large image runs as a dispatch per one or a few layers (each well under the driver's 2 s). Its weights are converted
+to bfp16 at the first load (the patch embedding's and the merger's MLP's as bfp16 hi + lo pairs; the pixels enter as
+their exact 8-bit values) and cached with the dispatches of each image size (~0.6 GB, the cache directory); an image's
+embeddings are kept, so a chat's next turns do not run it again. The language model's answer with the NPU encoder's
+embeddings is as close to llama.cpp's own as with llama.cpp's embeddings (teacher-forced over a description: KL 0.005,
+argmax agreement 0.98).
 
 ## Images (MiniCPM-V 4.7)
 
