@@ -59,7 +59,7 @@ from artlite.decode.design import (
     XPAY,
     input_fill,
 )
-from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
+from artlite.decode.image import PAD, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
@@ -243,8 +243,11 @@ class DFlashOverlay(ModelOverlay):
         self.shape = DFlashShape(cfg)
         self.image = DFlashImage(gguf, cfg)
         view = target.image.mtp_view(target.cfg)
-        self.table = HeadTable(view, tc.vocab_size, lambda: target.dev)
-        self.head = view.region(-1, "lm")
+        head = view.region(-1, "lm")
+        self._lm_src = (head.offset, head.col_stride)
+        head.offset, head.col_stride = self.image.nbytes, head.col_bytes
+        self.table = HeadTable(view, tc.vocab_size, lambda: self.dev)
+        self.head = head
         self.image.vocab = self.head.n_rt * self.head.blocks[0].R * COLS
         super().__init__(gguf, layers=list(range(cfg.layers)), vocab=None, weights=None, image=self.image)
         fmts = self.image.formats() | {self.head.blocks[0].fmt}
@@ -353,12 +356,19 @@ class DFlashOverlay(ModelOverlay):
     def load(self, *, threads: int = 0, release: bool = True) -> None:
         """The design in its own hardware context on the target's device, the image packed, the target's buffers adopted, the static
         objects written."""
-        img, dev0 = self.image, self.target.dev
+        img, dev0, head = self.image, self.target.dev, self.head
+        src_off, src_stride = self._lm_src
         self.dev = dev = OverlayDevice(self.op, device=dev0.device)
-        if img.pack(dev.alloc("W", img.nbytes), threads=threads, release=release):
-            dev.flush("W")
+        w = dev.alloc("W", img.nbytes + head.nbytes + PAD)
+        if img.pack(w[:img.nbytes], threads=threads, release=release):
+            dev.flush("W", 0, img.nbytes)
+        w0 = dev0.view("W")
+        for c in range(COLS):
+            s = src_off + c * src_stride
+            d = head.offset + c * head.col_stride
+            w[d:d + head.col_bytes] = w0[s:s + head.col_bytes]
+        dev.flush("W", head.offset, head.nbytes)
         self.selector.resident()
-        dev.adopt("MW", dev0.buffers["W"])
         dev.adopt("MACT", dev0.buffers["ACT"])
         for name, n in self.sizes.items():
             dev.alloc(name, n)
@@ -437,13 +447,12 @@ class DFlashOverlay(ModelOverlay):
         dev, (L, name) = self.dev, phase
         region = self.region(L, name)
         gr = mp.groups(region, FLAGS[name], 1, slots=self.SLOTS)[gi]
-        buf = "MW" if name == "lm" else "W"
         for c in range(COLS):
             if gi == 0 and norm is not None:  # (object n: T bytes from weight 4096 n on)
                 seq.fill("A", c, dev.address("NORM", self.norm_off[norm]), self.n_norm * self.T,
                          (self.T // 16, 4, self.T // 16, NX_PER_NORM * OBJ_K // 2))
             for o, n, dims, rep, it in mp.a_reads(region, c, gr):
-                seq.fill("A", c, dev.address(buf, o), n, dims, rep, it)
+                seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
 
     def _bc(self, seq: Sequence, meta: int, K: int, sp: int, x: int | None = None) -> None:
         """A phase's input on the broadcast stream: its [metadata object | x] at ACT offset ``meta``, or x elsewhere (ACT offset x)."""
