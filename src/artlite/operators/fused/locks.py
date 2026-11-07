@@ -25,17 +25,19 @@ _OBJECTS = re.compile(r"objects_op(\d+)_\w+?_core_(\d+)_(\d+)$")
 _ACQUIRE = re.compile(r"\bacq\s+#0x([0-9a-f]+)")
 _FILE = re.compile(r"^(\S+\.o):\s+file format", re.MULTILINE)
 _DIRECTION = {0: (0, -1), 1: (-1, 0), 2: (0, 1)}  # (lock id // 16: south, west, north: (col, row) offsets)
+_ARGS = 16384  # characters of object paths per llvm-objdump (Windows' command line: 32767 at most)
 FILE = "neighbour_locks.json"
 
 Census = dict[int, list[tuple[tuple[int, int], tuple[int, int], int]]]  # (entry -> [(core tile, lock's tile, lock)])
 
 
-def _scan(paths: list[str]) -> dict[str, set[int]]:
-    """Each object's acquired lock ids (immediates): one llvm-objdump for all of ``paths``."""
+def _scan(prj: str, paths: list[str]) -> dict[str, set[int]]:
+    """Each object's acquired lock ids (immediates): one llvm-objdump for all of ``paths`` (relative to ``prj``: no
+    spaces in the file heads ``_FILE`` reads)."""
     from ..base import peano_tool
 
-    text = subprocess.run([peano_tool("llvm-objdump"), "-d", "--triple=aie2p", *paths], capture_output=True, text=True,
-                          check=True).stdout
+    text = subprocess.run([peano_tool("llvm-objdump"), "-d", "--triple=aie2p", *paths], cwd=prj, capture_output=True,
+                          text=True, check=True).stdout
     heads = list(_FILE.finditer(text))
     return {m[1]: {int(x, 16) for x in _ACQUIRE.findall(text, m.end(), n.start() if n else len(text))}
             for m, n in zip(heads, heads[1:] + [None])}
@@ -56,13 +58,19 @@ def census(work_dir: str) -> Census | None:
         if (m := _OBJECTS.match(name)) is not None:
             for f in os.listdir(os.path.join(prj, name)):
                 if f.endswith(".o"):
-                    cores[os.path.join(prj, name, f)] = (int(m[1]), int(m[2]), int(m[3]))
+                    cores[os.path.join(name, f)] = (int(m[1]), int(m[2]), int(m[3]))
     if not cores:
         return None
-    paths = sorted(cores)
+    parts, size = [[]], 0
+    for p in sorted(cores):
+        if parts[-1] and size + len(p) >= _ARGS:
+            parts.append([])
+            size = 0
+        parts[-1].append(p)
+        size += len(p) + 1
     with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as ex:
         found = {}
-        for part in ex.map(_scan, [paths[i:i + 256] for i in range(0, len(paths), 256)]):
+        for part in ex.map(lambda part: _scan(prj, part), parts):
             found.update(part)
     out: Census = defaultdict(list)
     for p, (e, c, r) in cores.items():
