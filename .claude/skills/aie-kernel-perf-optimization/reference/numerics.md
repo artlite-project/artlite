@@ -268,7 +268,11 @@ weights as bfp16 panels, bf16 outputs, the C tile per k-tile, K parts, P and V b
   any change re-draws all later roundings, so one run of it measures that noise: in MiniCPM-V's encoder every early
   site moved the KL by the same ~0.01. The one-site errors add up (as squares) where the full model's do not.
 - A few fragile tokens can hold most of an output's squared error (MiniCPM-V's ViT: the worst 1% held 67-80%,
-  single tokens changed by 57-99% by any small change): rank by the median per-token error.
+  single tokens changed by 57-99% by any small change): rank by the median per-token error. The model can make them,
+  not a rounding point or an op (the vision ViTs: a late FFN half switching on a massive activation, ``artlite.vision.vit``'s
+  Precision; llama.cpp errs on the same tokens). Tell that from a kernel's error: read the NPU's residual after every
+  layer (a dispatch per layer), run each layer alone from the float64 input against the CPU at its rounding points,
+  and compare llama.cpp's own error per token.
 - llama.cpp's CPU takes Q4_K weights' activations as Q8, so any change of the input re-draws that rounding: a KL
   floor (~0.005 on MiniCPM-V 1B over 96 tokens). Its F32 requant (`llama-quantize --allow-requantize IN OUT F32`)
   has none.

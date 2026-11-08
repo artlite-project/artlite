@@ -27,6 +27,11 @@ residual stream brings each band's cos | sin tile (``inputs``). The patch embedd
 integers (q = p - 128, the normalization folded into its weights), the patch embedding and the MLP hi + lo weights
 (``ops.Gemm``); positions are the patch embedding's residual (host rows, bf16).
 
+Precision (``artlite.vision.vit``'s): per merged token ~4% from the float64 encoder (median; 512 x 512: p90 ~12%), as
+the CPU at the overlay's rounding points; a few tokens 0.3-2.8x their norm off (the last layer's massive activation:
+at 512 x 512 a total of 0.07-0.10, whichever tokens the last bits pick), where llama.cpp's own embeddings are up to
+0.22x off (total 0.014). The language model's KL against llama.cpp's run stays at llama.cpp's level (``tests/qwen3vl``).
+
 Dispatches (``Encoder``): a program per nb (built on first use, ``programs``): nb 1 runs as one dispatch; larger
 images as the patch embedding, pieces of ``layers_per_piece(nb)`` layers (one dispatch each: well under the driver's 2
 s), the final merger. A piece is built once for layers 0 .. k - 1 and run at layer i0 by rewriting its shim addresses

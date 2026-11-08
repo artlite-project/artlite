@@ -12,6 +12,18 @@ attention sinks, key groups of padding skipped) -> O + x (LayerNorm records) -> 
 + GELU (panels) -> x back -> down + x (records). Its memtile layout alternates between two (x low / high), the same
 every other layer. On a banded level (``layer_bands``) per band: its keys first, then its queries. With RoPE (Qwen3-VL)
 the K and Q GEMMs turn each head's pairs by the band's cos | sin tile (``ops.Gemm(out="rope")``).
+
+Precision: each layer alone is as close to float64 as the CPU at its rounding points (the tests' ``NpuEncoder``). Over
+27 layers the roundings add up to ~4% per token (median; llama.cpp's bf16 activations: ~0.7%), in squares: the bfp16
+weights (the down GEMM's most) and the bfp16 GEMM inputs (LN2's and GELU's most) ~35% each, the bf16 residual ~17%,
+Q / K ~10% (Qwen3-VL at 512 x 512). A few tokens are much further off: both encoders' last layer writes a massive
+activation into channel 514 (Qwen3-VL's: ~2000-12000, through ~30 FFN units that are on in most patches and off in
+the rest); where those units are partly on, a small input error becomes a large error of x514, and post_ln divides
+the patch by the sigma x514 sets. llama.cpp errs on the same tokens (Qwen3-VL: ~6x less), and which tokens depends on
+the last bits of anything (float64 itself moves one by 67% between two JPEG decoders' pixels). Taking them to
+llama.cpp's level needs bf16-level operands throughout (hi + lo inputs and weights, an fp32-level residual, Q / K: an
+estimated ~2x the encoder's time); moving the largest units or channels into bfp16 blocks of their own (the pads) does
+not help.
 """
 
 import math

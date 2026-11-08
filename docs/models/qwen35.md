@@ -192,9 +192,10 @@ token by an MLP. Its time grows with the patches and, through the attention, wit
 A large image runs as a dispatch per one or a few layers (each well under the driver's 2 s). Its weights are converted
 to bfp16 at every load (the patch embedding's and the merger's MLP's as bfp16 hi + lo pairs; the pixels enter as
 their exact 8-bit values), the dispatches of each image size cached (~15 MB, the cache directory; later loads ~0.25 s); an image's
-embeddings are kept, so a chat's next turns do not run it again. The language model's answer with the NPU encoder's
-embeddings is as close to llama.cpp's own as with llama.cpp's embeddings (teacher-forced over a description: KL 0.005,
-argmax agreement 0.98).
+embeddings are kept, so a chat's next turns do not run it again. The embeddings are ~4% per token from an exact
+(float64) encoder, llama.cpp's ~0.7%; a few tokens are much further off in both, wherever the encoder's last layer
+half switches on a huge activation, and the language model hardly notices: its answer stays close to llama.cpp's own
+(teacher-forced over a description: KL 0.006, argmax agreement 0.95).
 
 ## Images (MiniCPM-V 4.7)
 

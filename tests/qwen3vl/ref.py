@@ -154,13 +154,15 @@ def _bfp(x: torch.Tensor) -> torch.Tensor:
 
 
 class NpuEncoder(Encoder):
-    """The encoder's layers at the rounding points of the vision overlay (``models.qwen3vl.encoder``; float64 between
-    them): a GEMM's A as bfp16 panels and its weights bfp16, C over the whole K from the bf16 bias plus a bf16 residual,
-    rounded once (bf16 C tiles: the residual stream; bfp16 panels: a GEMM's or the attention's input, V^T blocked over
-    8 tokens: ``vblocks`` of the tokens' order); Q and K rounded to bf16, turned by bf16 cos / sin (the products summed
-    in fp32, rounded to bf16), then bfp16 per head's 8 dims of the epilogue's layout (dims 0 .. 35 | 36 .. 71 of 36,
-    each padded to 40); LayerNorm statistics S1, S2 of the bf16 values in fp32; GELU of bf16 values to bf16; attention
-    with P = 2^(s - max) in bf16 as bfp16 panels, l their sums, o / l as panels."""
+    """The encoder at the rounding points of the vision overlay (``models.qwen3vl.encoder``; float64 between them): a
+    GEMM's A as bfp16 panels and its weights bfp16, C over the whole K from the bf16 bias plus a bf16 residual, rounded
+    once (bf16 C tiles: the residual stream; bfp16 panels: a GEMM's or the attention's input); Q and K rounded to bf16,
+    turned by bf16 cos / sin (the products summed in fp32, rounded to bf16), then bfp16 per head's 8 dims of the
+    epilogue's layout (dims 0 .. 35 | 36 .. 71 of 36, each padded to 40); LayerNorm statistics S1, S2 of the bf16 values
+    in fp32; GELU of bf16 values to bf16; attention with P = 2^(s - max) in bf16 as bfp16 panels, l their sums, o / l as
+    panels. The keys' blocks of 8 (P's and V^T's) are the NPU's key panels: ``vblocks``, per block its 8 patches (-1:
+    a padding slot). ``forward``: the patch embedding to bf16, every layer, post_ln's panels, the merge and the merger
+    (hi + lo weights, GELU erf of bf16 values to bf16 panels, bf16 out)."""
 
     def __init__(self, mmproj: str):
         super().__init__(mmproj)
@@ -209,14 +211,14 @@ class NpuEncoder(Encoder):
         q = self._turn(self.gemm(a, w, b, rows=slice(0, H)) * (math.log2(math.e) / math.sqrt(d)), ang)
         k = self._turn(self.gemm(a, w, b, rows=slice(H, 2 * H)), ang)
         v = self.gemm(a, w, b, rows=slice(2 * H, 3 * H)).reshape(n, self.heads, d).permute(1, 2, 0)  # (h, d, n)
-        vp = torch.cat([v, torch.zeros_like(v[..., :1])], -1)[..., torch.from_numpy(vblocks.reshape(-1))]
-        vq = _bfp(vp.reshape(self.heads, d, -1, 8)).reshape(self.heads, d, -1)
-        v = torch.zeros_like(v)
-        ok = vblocks.reshape(-1) >= 0
-        v[..., torch.from_numpy(vblocks.reshape(-1)[ok])] = vq[..., torch.from_numpy(ok)]
-        s = q @ k.transpose(1, 2)  # (log2 units)
-        pr = _bfp(_bf16(torch.exp2(s - s.amax(-1, keepdim=True))))
-        o = (pr @ v.transpose(1, 2)) / pr.sum(-1, keepdim=True)
+        ko = torch.from_numpy(vblocks.reshape(-1))  # (the keys in the NPU's blocks of 8; padding: -1)
+        ok = ko >= 0
+        vq = _bfp(torch.cat([v, torch.zeros_like(v[..., :1])], -1)[..., ko])  # (h, d, slots)
+        s = q @ k[:, ko[ok]].transpose(1, 2)  # (log2 units)
+        e = torch.zeros(self.heads, n, len(ko), dtype=s.dtype)
+        e[..., ok] = torch.exp2(s - s.amax(-1, keepdim=True))
+        pr = _bfp(_bf16(e))
+        o = (pr @ vq.transpose(1, 2)) / pr.sum(-1, keepdim=True)
         return _bfp(o.transpose(0, 1).reshape(n, H))
 
     def layer(self, x: torch.Tensor, il: int, ang: torch.Tensor, vblocks: np.ndarray) -> torch.Tensor:
@@ -227,3 +229,29 @@ class NpuEncoder(Encoder):
         h = self.gemm(self.ln(x, p + "ln2"), p + "ffn_up.weight", p + "ffn_up.bias")
         h = _bfp(_bf16(_gelu_tanh(_bf16(h))))
         return _bf16(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
+
+    def _hilo(self, name: str) -> torch.Tensor:
+        w = self.w(name)
+        hi = _bfp(w)
+        return hi + _bfp(w - hi)
+
+    def forward(self, pixels: np.ndarray | torch.Tensor, vblocks: np.ndarray,  # type: ignore[override]
+                trace: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+        """Pixels (3, H, W) (normalized) -> the embeddings at the NPU's rounding points (class docstring); vblocks: the
+        NPU's key panels (patches in raster order). ``trace``: "layer_out-<il>" (each layer's weights dropped after it:
+        the float64 copies of all 27 take ~4 GB)."""
+        P = self.patch
+        ph, pw = np.asarray(pixels).shape[1] // P, np.asarray(pixels).shape[2] // P
+        tr = trace if trace is not None else {}
+        ang = torch.from_numpy(rope_angles(ph, pw, self.hd))
+        x = _bf16(self.embed(pixels))
+        for il in range(self.layers):
+            x = self.layer(x, il, ang, vblocks)
+            tr[f"layer_out-{il}"] = x
+            for cache in (self._w, self._wq):
+                for k in [k for k in cache if k.startswith(f"v.blk.{il}.")]:
+                    del cache[k]
+        m = self.ln(x, "v.post_ln")[torch.from_numpy(self.windows(ph, pw))].reshape(-1, 4 * self.hidden)
+        h = _bf16(m @ self._hilo("mm.0.weight").T + _bf16(self.w("mm.0.bias").reshape(-1)))
+        h = _bfp(_bf16(0.5 * h * (1 + torch.erf(h / math.sqrt(2)))))
+        return _bf16(h @ self._hilo("mm.2.weight").T + _bf16(self.w("mm.2.bias").reshape(-1)))

@@ -123,6 +123,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | idea | result |
 |---|---|
 | 3-bit weights (MSE-searched); 2-bit LM-head screening + exact refinement | KL x2-3; screening error 0.8 logits -> 14-76% candidate blocks |
+| Outlier channels / FFN units in bfp16 blocks of their own (pad slots; the largest units' down weights hi + lo there) | Qwen3-VL's ViT: median per token 4.1 -> 3.2-3.9%, the fragile tokens unchanged (``artlite.vision.vit``) |
 
 ## Upstream mlir-aie kernels
 

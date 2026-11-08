@@ -1,7 +1,7 @@
 """Qwen3-VL's vision encoder on the vision overlay (models.qwen3vl.encoder) against the float64 encoder (ref.Encoder)
 and the CPU at the NPU's rounding points (ref.NpuEncoder): the level's layout (no NPU), one layer as far from the
 float64 layer as the CPU at the NPU's rounding points, a program in pieces bit for bit the same as in one dispatch,
-whole images of 1 .. 9 bands."""
+whole images of 1 .. 9 bands (per-token statistics; slow: as close as the CPU at the NPU's rounding points)."""
 
 import os
 from collections import OrderedDict
@@ -153,17 +153,44 @@ def test_pieces(npu: VisionDevice, mm: tuple, encoder: E.Encoder, monkeypatch: p
     assert np.array_equal(one(px), got)
 
 
+def _token_errors(got: np.ndarray, want: np.ndarray) -> np.ndarray:
+    """Per merged token its error relative to its norm."""
+    return np.linalg.norm(np.asarray(got, np.float64) - want, axis=1) / np.linalg.norm(want, axis=1)
+
+
 @pytest.mark.parametrize("size", [(352, 352), (512, 512), (1536, 768)], ids=["nb1", "nb2", "nb9"])
 def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
-    """An image of 1, 2 and 9 bands (4608 patches: 72 key groups): the embeddings within 10% of the float64 encoder's
-    (the 27 layers' roundings: 0.062, 0.091, 0.075; a few tokens of low norm, near the image's last rows, take 50% to
-    270% of their norm at the last bits of any weight (a hi + lo plane's) and dominate the sum: per token the median is
-    0.039, p90 0.107 at 512 x 512; the language model's KL against llama.cpp's own run at llama.cpp's level:
-    test_npu.py), the same at a second run."""
+    """An image of 1, 2 and 9 bands (4608 patches: 72 key groups) against the float64 encoder per merged token: the
+    median within 5.5%, p90 within 17% (with the patch weights' last bits perturbed: 0.037-0.044 / 0.095-0.137,
+    0.038-0.040 / 0.107-0.135, 0.046-0.048 / 0.140-0.146), the same at a second run. Not the sum: a few tokens, where
+    the last layer's massive activation is partly on (``artlite.vision.vit``), take 0.3-2.8x their norm, which ones
+    the last bits pick (the sum at 512 x 512: 0.07-0.10)."""
     _, clip = mm
     px = _pixels(*size)
     got = encoder(px)
     want = V.Encoder(MMPROJ).forward(Q.normalized(px, clip.mean, clip.std)).numpy()
-    print(f"{size}: {got.shape[0]} tokens, rel {_rel(got, want):.3f}")
-    assert got.shape == want.shape and _rel(got, want) < 0.1
+    e = _token_errors(got, want)
+    print(f"{size}: {got.shape[0]} tokens, per token median {np.median(e):.4f}, p90 {np.percentile(e, 90):.4f}, max "
+          f"{e.max():.3f}; sum {_rel(got, want):.3f}")
+    assert got.shape == want.shape and np.median(e) < 0.055 and np.percentile(e, 90) < 0.17
     assert np.array_equal(encoder(px), got)
+
+
+@pytest.mark.slow  # (the whole encoder on the CPU twice, in float64 and at the NPU's rounding points)
+def test_encoder_model(mm: tuple, encoder: E.Encoder) -> None:
+    """512 x 512 per merged token as close to the float64 encoder as the CPU at the overlay's rounding points over all
+    of it (``ref.NpuEncoder.forward``, the NPU's key blocks): the median within 1.15x and p90 within 1.3x of the CPU's
+    (with the patch weights' last bits perturbed: the NPU 0.038-0.040 / 0.107-0.135, the CPU 0.038-0.041 /
+    0.122-0.135)."""
+    _, clip = mm
+    px = _pixels(512, 512)
+    lay = E.Layout(16, 16)
+    _, _, real = lay.slot_windows()
+    pix = Q.normalized(px, clip.mean, clip.std)
+    want = V.Encoder(MMPROJ).forward(pix).numpy()
+    sim = V.NpuEncoder(MMPROJ).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
+    e, es = _token_errors(encoder(px), want), _token_errors(sim, want)
+    med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
+    print(f"per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f}), max {e.max():.3f} "
+          f"({es.max():.3f})")
+    assert med[0] < 1.15 * med[1] and p90[0] < 1.3 * p90[1]
