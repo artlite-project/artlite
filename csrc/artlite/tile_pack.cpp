@@ -1,4 +1,5 @@
-// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, bf16.py:
+// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, iq3s.py, iq4.py,
+// bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
@@ -24,8 +25,8 @@ namespace artlite {
 namespace {
 
 constexpr int kMaxNsb = 16;
-// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, BF16, F16, F32
-constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 98, 512, 512, 1024};
+// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, BF16, F16, F32
+constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 98, 110, 144, 136, 512, 512, 1024};
 constexpr int64_t kItemRows = 2048;  // rows of a work item
 
 alignas(64) const uint8_t kZeroRow[kMaxNsb * 1024] = {};  // a padding row's blocks (-1)
@@ -428,6 +429,74 @@ void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// IQ3_S (iq3s.py): per super-block a unit of 2304 bytes (17 .. 20 rows): A, the index records [32-k group i][panel pair
+/// h][panel l' 2] of 48 B (rows 0 .. 15 at 2 r, rows 16 .. at 32 + 2 (r - 16), row r's two indices j of panel l = 2 h + l':
+/// qs[8 i + 2 l + j]; at 42 the 16-bit masks of the 9th bits per row group, bit 2 (r % 8) + j), then B, the sign records
+/// [i][l 4] of 24 B (row r's byte signs[4 i + l] at r; at 20 slot 4 i + l of C: row r's 4 scale bytes in slot r, rows 2 s,
+/// 2 s + 1's bf16 d in slot R + s).
+constexpr size_t kIq3sUnit = 2304;
+
+void tile_iq3s(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* a = t + kIq3sUnit * sb;
+    uint8_t* bs = a + 1536;
+    uint16_t mask[8][4][3] = {};  // ([i][l][g])
+    for (int r = 0; r < R; r++) {
+      const uint8_t* b = src[r] + 110 * sb;
+      const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
+      const int g = r / 8, rr = r % 8, o = g < 2 ? 16 * g + 2 * rr : 32 + 2 * rr;
+      for (int i = 0; i < 8; i++)
+        for (int l = 0; l < 4; l++) {
+          uint8_t* rec = a + 48 * (4 * i + l);
+          for (int j = 0; j < 2; j++) {
+            rec[o + j] = qs[8 * i + 2 * l + j];
+            mask[i][l][g] |= uint16_t(((qh[i] >> (2 * l + j)) & 1) << (2 * rr + j));
+          }
+          bs[24 * (4 * i + l) + r] = sg[4 * i + l];
+        }
+      std::memcpy(bs + 24 * r + 20, sc, 4);
+      put16(bs + 24 * (R + r / 2) + 20 + 2 * (r % 2), bf16_of(b));
+    }
+    for (int n = 0; n < 32; n++)
+      for (int g = 0; g < 3; g++) put16(a + 48 * n + 42 + 2 * g, mask[n / 4][n % 4][g]);
+  }
+}
+
+/// IQ4_NL / IQ4_XS (iq4.py): per super-block a unit: the codes [32-k group i][step s 4][row group][row 8][4 B] (byte b of
+/// word (i, s) = codes 8 s + 2 b and 8 s + 2 b + 1 of group i, the lower k in the low nibble), then IQ4_NL: d [i][row]
+/// bf16; IQ4_XS: the scales' low nibbles [i][row], their high crumbs [i' 4][row] (nibble = crumb i' | crumb i' + 4 << 2),
+/// d [row] bf16 (nibbles in pairs per byte, the first low).
+template <bool XS>
+void tile_iq4(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  const int ng = R / 8;
+  const size_t U = (XS ? 136 : 144) * size_t(R);
+  auto nib = [](uint8_t* p, int n, int v) { p[n / 2] = uint8_t(n % 2 ? (p[n / 2] & 15) | v << 4 : (p[n / 2] & 0xF0) | v); };
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* u = t + U * sb;
+    uint8_t* hd = u + 128 * size_t(R);
+    for (int r = 0; r < R; r++) {
+      const uint8_t* b = src[r] + (XS ? 136 : 144) * sb;
+      for (int i = 0; i < 8; i++) {
+        const uint8_t* qs = XS ? b + 8 + 16 * i : b + 18 * i + 2;
+        for (int s2 = 0; s2 < 4; s2++) {
+          uint8_t* w = u + ((((size_t(i) * 4 + s2) * ng + r / 8) * 8 + r % 8) * 4);
+          for (int bb = 0; bb < 4; bb++) {
+            const int k = 8 * s2 + 2 * bb;
+            w[bb] = k < 16 ? uint8_t((qs[k] & 15) | (qs[k + 1] & 15) << 4) : uint8_t((qs[k - 16] >> 4) | (qs[k - 15] & 0xF0));
+          }
+        }
+        if constexpr (!XS) put16(hd + 2 * (size_t(i) * R + r), bf16_of(b + 18 * i));
+      }
+      if constexpr (XS) {
+        const int sh = b[2] | b[3] << 8;
+        for (int i = 0; i < 8; i++) nib(hd, i * R + r, (b[4 + i / 2] >> (4 * (i % 2))) & 15);
+        for (int i = 0; i < 4; i++) nib(hd + 4 * R, i * R + r, ((sh >> (2 * i)) & 3) | ((sh >> (2 * i + 8)) & 3) << 2);
+        put16(hd + 6 * R + 2 * r, bf16_of(b));
+      }
+    }
+  }
+}
+
 /// BFP16 (bf16.py) of BF16 or F16 rows: 8 rows of [k8][row][exp, 8 int8] blocks.
 template <bool F16>
 void tile_bfp16(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -473,6 +542,12 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
       return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
     case TileFormat::IQ3_XXS:
       return iq3xxs_unit(R) * size_t(nsb);
+    case TileFormat::IQ3_S:
+      return R > 16 && R <= 20 ? kIq3sUnit * nsb : ~size_t(0);
+    case TileFormat::IQ4_NL:
+      return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R;
+    case TileFormat::IQ4_XS:
+      return R % 8 ? ~size_t(0) : 136 * size_t(nsb) * R;
     case TileFormat::BFP16_BF16:
     case TileFormat::BFP16_F16:
     case TileFormat::BFP16_F32:
@@ -498,6 +573,9 @@ TileFormat tile_format(std::string_view name) {
   if (name == "Q2_K") return TileFormat::Q2_K;
   if (name == "Q3_K") return TileFormat::Q3_K;
   if (name == "IQ3_XXS") return TileFormat::IQ3_XXS;
+  if (name == "IQ3_S") return TileFormat::IQ3_S;
+  if (name == "IQ4_NL") return TileFormat::IQ4_NL;
+  if (name == "IQ4_XS") return TileFormat::IQ4_XS;
   if (name == "BFP16/BF16") return TileFormat::BFP16_BF16;
   if (name == "BFP16/F16") return TileFormat::BFP16_F16;
   if (name == "BFP16/F32") return TileFormat::BFP16_F32;
@@ -635,6 +713,15 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
               break;
             case TileFormat::IQ3_XXS:
               tile_iq3xxs(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::IQ3_S:
+              tile_iq3s(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::IQ4_NL:
+              tile_iq4<false>(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::IQ4_XS:
+              tile_iq4<true>(tile.get(), src, b.R, b.nsb);
               break;
             case TileFormat::BFP16_BF16:
               tile_bfp16<false>(tile.get(), src, b.R, b.nsb);

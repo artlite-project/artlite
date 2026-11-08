@@ -115,6 +115,28 @@ void q3_k(const uint8_t* b, float* o) {
   }
 }
 
+// IQ4_NL / IQ4_XS's 16 values (ggml's kvalues_iq4nl)
+constexpr int8_t IQ4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// IQ4_NL (18 B per 32): w = d IQ4[q]; q as Q4_0's
+void iq4_nl(const uint8_t* b, float* o) {
+  const float d = f16(b);
+  for (int j = 0; j < 32; j++) o[j] = d * float(IQ4[j < 16 ? b[2 + j] & 15 : b[2 + j - 16] >> 4]);
+}
+
+// IQ4_XS (136 B per 256): w = (d (ls_g - 32)) IQ4[q], ls_g = nibble g % 2 of byte 4 + g / 2 | (crumb g of the u16 at
+// byte 2) << 4; a 32-group's codes as Q4_0's in its 16 bytes from 8 + 16 g
+void iq4_xs(const uint8_t* b, float* o) {
+  const float d = f16(b);
+  const int sh = b[2] | b[3] << 8;
+  for (int g = 0; g < 8; g++) {
+    const int ls = ((b[4 + g / 2] >> (4 * (g & 1))) & 15) | ((sh >> (2 * g)) & 3) << 4;
+    const float dl = d * float(ls - 32);
+    const uint8_t* q = b + 8 + 16 * g;
+    for (int j = 0; j < 32; j++) o[32 * g + j] = dl * float(IQ4[j < 16 ? q[j] & 15 : q[j - 16] >> 4]);
+  }
+}
+
 // The plain types, a value per "block": F32, F16, BF16 (its bits, the high half of the fp32 value)
 void f32(const uint8_t* b, float* o) { std::memcpy(o, b, 4); }
 void f16_1(const uint8_t* b, float* o) { *o = f16(b); }
@@ -132,7 +154,7 @@ struct Type {
 constexpr Type TYPES[] = {{"F32", 1, 4, f32},       {"F16", 1, 2, f16_1},          {"BF16", 1, 2, bf16},
                           {"Q4_0", 32, 18, q4_0},   {"Q4_1", 32, 20, q4_1},        {"Q8_0", 32, 34, q8_0},
                           {"Q3_K", 256, 110, q3_k}, {"Q4_K", 256, 144, q45_k<false>}, {"Q5_K", 256, 176, q45_k<true>},
-                          {"Q6_K", 256, 210, q6_k}};
+                          {"Q6_K", 256, 210, q6_k},   {"IQ4_NL", 32, 18, iq4_nl},    {"IQ4_XS", 256, 136, iq4_xs}};
 
 const Type* type_of(std::string_view qtype) {
   for (const Type& t : TYPES)

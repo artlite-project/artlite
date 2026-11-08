@@ -25,7 +25,8 @@ class TileFormat:
     fixed_rows: rows of a fixed-size tile (BFP16: 8-row MMUL panels; the object size follows); pad8_row: code bytes per row
     and super-block stored for the rows rounded up to a multiple of 8 (IQ3_XXS: its indices in 8-row panels); unit_align:
     each super-block's slice padded to a multiple of these bytes (``unit_bytes``; IQ3_XXS: a super-block unit holds the
-    slice's indices, sign / scale words and d); ws_planes: GemmQ's expanded
+    slice's indices, sign / scale words and d); unit_fixed: the bytes of every super-block's slice whatever the rows
+    (IQ3_S: 17 .. 20 rows in 3 row groups, the last group's spare bytes holding other fields); ws_planes: GemmQ's expanded
     scale planes (tile-major formats); dq_row_cycles: GemmQd's planar dequant, cycles per row (MMUL
     column) and k-tile on the dequantizing core (measured; ``gemm_qd.k_tile_cycles``). Methods take
     ``nsb``, the super-blocks of a tile (8: 2048 columns); word_major: the tile is stored [word][row][4 B] (header words, then each
@@ -45,6 +46,7 @@ class TileFormat:
     fixed_rows: int | None = None
     pad8_row: int = 0
     unit_align: int = 0
+    unit_fixed: int = 0
     header_pad32: bool = False
     ws_planes: int = 0
     dq_row_cycles: float | None = None
@@ -74,6 +76,8 @@ class TileFormat:
 
     def unit_bytes(self, rows: int) -> int:
         """Bytes of one super-block's slice as stored (its padding rows and ``unit_align`` included)."""
+        if self.unit_fixed:
+            return self.unit_fixed
         n = self.slice_bytes(rows) + self.pad8_row * (-rows % 8)
         return -(-n // self.unit_align) * self.unit_align if self.unit_align else n
 
