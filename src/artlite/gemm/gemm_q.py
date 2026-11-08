@@ -75,7 +75,6 @@ import numpy as np
 import torch
 from aie.dialects import arith
 from aie.dialects.aie import T as IrT
-from aie.dialects.aiex import npu_maskwrite32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter, TaskGroup, Worker
@@ -85,7 +84,7 @@ from ml_dtypes import bfloat16
 
 from ..formats import FORMATS, KC, KT, kernel_template, slot
 from ..operators.base import ArgSpec, ArtcOperator
-from ..operators.design import COLS, CORE_PROCESSOR_BUS, ROWS, range32, stream_walk, times_i32
+from ..operators.design import COLS, ROWS, range32, stream_walk, times_i32
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import pin_l1_buffers
 from .mac import MAC, render_mac
@@ -601,30 +600,23 @@ void {{ p }}_mm2(const bfloat16 *__restrict pA_in, const void *__restrict stage,
 
 {% endif %}
 {% if pace is not none %}
-// pacing (a paced core: ``pace_cores``): st[0] = the tile's Timer_Low when its last acquire returned
-static inline unsigned {{ p }}_now()
-{
-    const unsigned t = read_tm(0x340F8);  // (the runtime sequence enables the core's processor bus)
-    __builtin_aie2p_sched_barrier();
-    return t;
-}
-
-// an acquire returned: the core works from now
+// pacing (a paced core: ``pace_cores``): st[0] = the tile's timer (get_cycles: mov cntr) when its last acquire returned.
+// An acquire returned: the core works from now
 void {{ p }}_pace0(int32_t *__restrict st)
 {
-    st[0] = (int32_t){{ p }}_now();
+    st[0] = (int32_t)get_cycles();
 }
 
 // before an acquire: idle PACE_IDLE[level] / 16 of the cycles worked since the last one returned (not after a pause;
 // the levels' sixteenths a byte each of one immediate: no table in data memory)
 void {{ p }}_pace1(int32_t *__restrict st, int32_t level)
 {
-    const unsigned t = {{ p }}_now();
+    const unsigned t = (unsigned)get_cycles();
     const unsigned busy = t - (unsigned)st[0];
     if (busy >= {{ pace_cap }}u)
         return;
     const unsigned idle = busy * (unsigned)(({{ pace_idle }}ull >> 8 * level) & 0xFF) >> 4;
-    while ({{ p }}_now() - t < idle) {
+    while ((unsigned)get_cycles() - t < idle) {
     }
 }
 
@@ -1315,8 +1307,6 @@ class GemmQOperator(ArtcOperator):
             # per-pass ones: 1B down), A strips and C drains (one drain BD per run of evenly spaced
             # pass outputs covers many C objects); at most 2 chunks in flight. A chunk's last drain
             # completing proves its fills completed, so its BDs are recycled then.
-            for c, r in self.pace_cores():  # (the paced cores read their timer)
-                npu_maskwrite32(CORE_PROCESSOR_BUS, 1, 1, column=c, row=r)
             taps = [self.b_taps(c) for c in range(COLS)]
             chains = [self.b_chain(c) for c in range(COLS)]
             assert all(ch_ is not None for ch_ in chains) or max(len(t) for t in taps) <= 4, \

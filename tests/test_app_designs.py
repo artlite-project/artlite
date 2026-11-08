@@ -1,9 +1,9 @@
 """The apps' full designs, built as the apps build them (no NPU): the decode overlays and prefill libraries of the
-models present (Qwen3.6-35B-A3B also with its MTP drafter file, the app's default: the design runs the drafter's
-formats too), the Stable Diffusion UNet program. They compile (program memory, stack and BD limits of the whole
-models, which the layer-slice tests do not reach), a paged design's code pages link (each within the slot its core's
-resident code leaves: ``paging.link``, else only at load), and ``--dump-designs`` records them: the refactoring check
-covers the apps without running the slow tests."""
+models present (Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the
+app's default: the design runs the drafter's formats too), the Stable Diffusion UNet program. They compile (program
+memory, stack and BD limits of the whole models, which the layer-slice tests do not reach), a paged design's code pages
+link (each within the slot its core's resident code leaves: ``paging.link``, else only at load), and
+``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
 
 import os
 from collections.abc import Callable
@@ -12,10 +12,10 @@ import pytest
 
 from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen_gguf, qwen_mtp_of, sd15_dir
+from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf, qwen_mtp_of, sd15_dir
 
 
-def _llama(size: str, quant: str, kv_k: str) -> tuple[str, Callable[[str], None]]:
+def _llama(path: str, kv_k: str) -> tuple[str, Callable[[str], None]]:
     def build(path: str) -> None:
         from models.llama.overlay import LlamaOverlay
         from models.llama.prefill import LlamaPrefill
@@ -24,7 +24,7 @@ def _llama(size: str, quant: str, kv_k: str) -> tuple[str, Callable[[str], None]
         parallel_compile.compile_all([ov.op, LlamaPrefill(ov).lib])
         ov.op.page_store()
 
-    return llama_gguf(quant, size), build
+    return path, build
 
 
 def _gemma(path: str) -> None:
@@ -60,11 +60,13 @@ def _sd15(path: str) -> None:
 
 
 APPS: dict[str, tuple[str, Callable[[str], None]]] = {
-    "llama-1B-Q4_K_M": _llama("1B", "Q4_K_M", "single"),
-    "llama-1B-Q4_K_M-hilo": _llama("1B", "Q4_K_M", "hilo"),
-    "llama-1B-Q5_K_M": _llama("1B", "Q5_K_M", "single"),
-    "llama-3B-Q4_K_M": _llama("3B", "Q4_K_M", "single"),
-    "llama-8B-Q4_K_S": _llama("8B", "Q4_K_S", "single"),
+    "llama-1B-Q4_K_M": _llama(llama_gguf("Q4_K_M", "1B"), "single"),
+    "llama-1B-Q4_K_M-hilo": _llama(llama_gguf("Q4_K_M", "1B"), "hilo"),
+    "llama-1B-Q5_K_M": _llama(llama_gguf("Q5_K_M", "1B"), "single"),
+    "llama-3B-Q4_K_M": _llama(llama_gguf("Q4_K_M", "3B"), "single"),
+    "llama-8B-Q4_K_S": _llama(llama_gguf("Q4_K_S", "8B"), "single"),
+    "qwen3-0.6B-Q4_1": _llama(qwen3_gguf("0.6B"), "hilo"),
+    "qwen3-embedding-4B-Q4_K_M": _llama(qwen3_gguf("embedding-4B"), "hilo"),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),

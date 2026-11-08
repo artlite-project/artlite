@@ -12,6 +12,7 @@ Where a design's time goes, measured on the hardware rather than inferred from s
   - which counters to program
   - reading the numbers
 - Reading core L1 from the host
+- The core's timer in a kernel
 - What does not work
 
 ## Timing hygiene
@@ -168,10 +169,15 @@ minus 0x70000: a workspace at core address 0x71000 (see the linker script in the
 tile address 0x1000. Use it to read state words or debug values the kernel stored after a
 dispatch. One word per call: keep it to a few words.
 
+## The core's timer in a kernel
+
+`get_cycles()` (aie_api `aie::tile::current().cycles()`) reads the tile's 64-bit timer (Timer_Low / Timer_High) in
+one `mov r1:r0, cntr`, with no setup in the runtime sequence (`probe.py`'s clock probe, GemmQ's pacing). A
+`read_tm` of Timer_Low (0x340F8) stalls the core unless the runtime sequence enabled its processor bus (bit 0 of
+0x32038).
+
 ## What does not work
 
-- Reading the core's timer from the kernel (`read_tm` of Timer_Low, 0x340F8) hangs the core.
-- `aie::tile::cycles()` needs a `get_cycles` that Peano does not provide (link error).
 - Memtile counters: the profiling skill's KMD limits (reading registers ≥ 0x91030 hangs the context).
 - There are 4 core counters and 2 memory-module counters per core tile: measure more events over
   several dispatches.

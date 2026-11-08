@@ -18,13 +18,12 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from aie.dialects.aiex import npu_maskwrite32
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU2, Tile
 
 from . import txn
 from .operators.base import JINJA_ENV, ArgSpec, ArtcOperator
-from .operators.design import COLS, CORE_PROCESSOR_BUS
+from .operators.design import COLS
 from .operators.kernel_source import kernel_prefix
 
 P = kernel_prefix("probe")
@@ -32,27 +31,14 @@ P = kernel_prefix("probe")
 _SPIN = JINJA_ENV.from_string(r"""
 #include <aie2pintrin.h>
 
-// the core's timer (Timer_Low / Timer_High, AM029) through the processor bus
-static inline unsigned long long {{ p }}_cycles()
-{
-    unsigned hi = read_tm(0x340FC);
-    __builtin_aie2p_sched_barrier();
-    unsigned lo = read_tm(0x340F8);
-    __builtin_aie2p_sched_barrier();
-    unsigned hi2 = read_tm(0x340FC);
-    __builtin_aie2p_sched_barrier();
-    if (hi2 != hi)
-        lo = read_tm(0x340F8);
-    return ((unsigned long long)hi2 << 32) | lo;
-}
-
+// get_cycles(): the tile's timer (mov cntr)
 extern "C" void {{ p }}_spin(const int32_t *__restrict n, int32_t *__restrict out)
 {
-    const unsigned long long t0 = {{ p }}_cycles();
+    const unsigned long long t0 = get_cycles();
     const unsigned long long want = (unsigned)n[0];
     unsigned long long t = t0;
     while (t - t0 < want)
-        t = {{ p }}_cycles();
+        t = get_cycles();
     out[0] = (int32_t)(t - t0);
 }
 
@@ -87,13 +73,13 @@ __attribute__((noinline)) void {{ p }}_mmuls(const int8_t *__restrict data, v64a
 // the spin with MMULs: blocks of 64 until the core's counter has advanced n[0] cycles (the sums after data's panels)
 extern "C" void {{ p }}_load(const int32_t *__restrict n, int8_t *__restrict data, int32_t *__restrict out)
 {
-    const unsigned long long t0 = {{ p }}_cycles();
+    const unsigned long long t0 = get_cycles();
     const unsigned long long want = (unsigned)n[0];
     v64accfloat *acc = (v64accfloat *)(data + {{ LOAD_BYTES }});
     unsigned long long t = t0;
     while (t - t0 < want) {
         {{ p }}_mmuls(data, acc);
-        t = {{ p }}_cycles();
+        t = get_cycles();
     }
     out[0] = (int32_t)(t - t0);
 }
@@ -154,9 +140,6 @@ class ClockProbeOperator(ArtcOperator):
         fills, drain = [f.prod() for f in n_in], n_out.cons()
 
         def seq(a: object, b: object, handles: object) -> None:
-            for c in cols:
-                for r in rows:
-                    npu_maskwrite32(CORE_PROCESSOR_BUS, 1, 1, column=c, row=r)
             tg = TaskGroup()
             for f in fills:
                 f.fill(a, group=tg)

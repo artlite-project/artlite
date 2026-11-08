@@ -930,9 +930,7 @@ __attribute__((minsize)) void {{ p }}_aq0(int32_t *__restrict ws)
 }
 
 // {{ DB }} d-blocks of a set's 4 q rows (fp32, rows rs apart from q; rows past nv zero) times the score constant qc (bf16 hi |
-// lo << 16: three products in one accumulator) as hi + lo panels -> qa ({{ 72 * DB }} B); with q / k norm weights (their
-// code leaves the attention core no room) the loop is no hardware loop (a minimum of 1 iteration): 208 B less than the
-// post-pipelined ZOL, 770 cycles per call against 329 (minsize: 48 B more, 917 cycles)
+// lo << 16: three products in one accumulator) as hi + lo panels -> qa ({{ 72 * DB }} B)
 __attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict qa, int rs, int nv, int qc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -946,9 +944,6 @@ __attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *
     const float __aie_dm_resource_b *__restrict p2 = (const float __aie_dm_resource_b *)(q + 2 * rs);
     const float __aie_dm_resource_b *__restrict p3 = p2 + rs;
     AIE_PREPARE_FOR_POSTPIPELINING
-{% if QK_W %}
-    AIE_LOOP_MIN_ITERATION_COUNT(1)
-{% endif %}
     for (int db = 0; db < {{ DB }}; db++) {
         aie::vector<float, 32> v = aie::concat(aie::load_v<8>(p0), aie::load_v<8>(p1), aie::load_v<8>(p2), aie::load_v<8>(p3));
         p0 += 8;

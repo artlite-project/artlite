@@ -299,8 +299,6 @@ Crashes:
   wrong subprogram: "Broken module found" (`!dbg attachment points at wrong subprogram`) only with line tables, so
   measure_ii's compile fails while the plain build works. Write the unrolled body out by hand.
 - Peano cannot lower inline `asm`.
-- `get_cycles()` (aie_api `tile::cycles()`) has no Peano definition (undefined symbol at link), and a core reading its
-  own Timer_Low (0x340F8) by `__builtin_aie2p_read_tm` stalled it (TDR): time with event0 / event1 counters.
 
 Silent wrong results:
 - **A load followed by a store to the same address can be reordered** (`yv = load(y); store(y, zeros); ... use(yv)`:
@@ -327,9 +325,6 @@ Silent wrong results:
   fetches the callee before the acquire completes, fatal when the wait is for that very code (pages written by
   control packets: the core runs stale code and its fetch then blocks the writes). `__builtin_aie2p_sched_barrier()`
   after the acquire, and the call through a resident noinline function (`paging.check_pager` checks a pager's ELF).
-  In the last delay slot its request (4 stages) is still out when the callee's first bundles read the buffer it
-  guards (a worker loop's kernel call: wrong rows, NaN); the cores' llc leaves the last 3 delay slots empty
-  (`--aie-reserved-delay-slots=3` in `operators/base.py` `CORE_LLC_FLAGS`).
 - **Jinja `trim_blocks`** eats the newline after a block tag: `{% endif %}` at the end of a line glues the next line
   onto it (e.g. `inline` onto a return type). Put block tags on their own lines and read the rendered `kernel.cc` in
   the cache dir.
