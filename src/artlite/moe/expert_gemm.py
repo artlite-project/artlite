@@ -63,7 +63,7 @@ from ml_dtypes import bfloat16
 from .. import txn
 from ..formats import KT, gu_tiles, slot
 from ..gemm.gemm_q import planar
-from ..gemm.gemm_qd import D_DEPTH, GemmQdOperator
+from ..gemm.gemm_qd import D_DEPTH, DQ_ONLY, GemmQdOperator
 from ..operators.base import JINJA_ENV, ArgSpec
 from ..operators.design import COLS, range32, stream_walk
 from ..operators.l1_layout import pin_l1_buffers
@@ -610,6 +610,9 @@ class ExpertGemmOperator(GemmQdOperator):
                 role = role[:-1] if i else role
                 return layout[role][i] if role in layout and i < len(layout[role]) else None
 
-            pin_l1_buffers(module, fifo=lambda name, depth: layout.get(roles.get(name.split("_")[0], "")),
-                           buffer=worker_buffer)
+            def fifo(name: str, depth: int) -> list[int] | None:  # (dq-only: not the MAC cores' D pools)
+                return None if DQ_ONLY in layout and "__cons" in name and name.startswith("egD_") else \
+                    layout.get(roles.get(name.split("_")[0], ""))
+
+            pin_l1_buffers(module, fifo=fifo, buffer=worker_buffer)
         return module

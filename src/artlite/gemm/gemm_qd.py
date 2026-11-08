@@ -60,6 +60,7 @@ from .mac import MAC, render_mac
 
 D_DEPTH = 2  # dequantized k-tile objects (producer and each consumer)
 REGION = 0x4000  # a core's data memory: four 16 KB regions of two interleaved banks
+DQ_ONLY = "dq_only"  # (a key of a layout that pins the dequantizing core alone: ``GemmQdOperator._dq_layout``)
 MAC_STACK = 0x400  # a MAC core's stack (its deepest call: the gate/up epilogue, ~320 B with the control code)
 # Planar MAC cores' buffers by region (``GemmQdOperator._planar_layout``): A0 / A1 / D0 / D1 the A and D objects, T0 / T1
 # the C tiles the MAC accumulates in (acc and the second half's or the pingpong's accb; the C objects when there is no
@@ -188,7 +189,7 @@ class GemmQdOperator(GemmQOperator):
         scale workspace (3), the header slots next to the stack (0); planar tiles: ``_planar_layout``. None: aiecc's
         placement."""
         if self.planar:
-            return self._planar_layout(self.m)
+            return self._planar_layout(self.m) or self._dq_layout()
         if self.c_depth == 1:
             return None
         mac, dq = self._buffers(self.m), self._dq_buffers()
@@ -233,7 +234,7 @@ class GemmQdOperator(GemmQOperator):
         return None
 
     def _place_plan(self, m: int, plan: str, two: bool) -> dict[str, list[int]] | None:
-        mac, dq = self._buffers(m), self._dq_buffers()
+        mac = self._buffers(m)
         tiles = [("acc", 0), ("accb", 0)] if two else [("acc", 0)] if mac["acc"][0] else [("C", 0)]
         sizes = {k: (v[1] + 63) // 64 * 64 for k, v in {**mac, "accb": mac["acc"]}.items()}
         if self.csplit:  # (the tiles' first halves acc, accb; their second halves acch, accbh)
@@ -269,12 +270,45 @@ class GemmQdOperator(GemmQOperator):
             return None  # (the table's second copy in another region than the first)
         if self.csplit and any(lay[h][0] - lay[t][0] != self.csplit for t, h in (("acc", "acch"), ("accb", "accbh"))):
             return None
-        # the dequantizing core: first-fit in the gaps around its D objects; a gather table's two copies each within one
-        # region, "tabb" in another region than "tab", both out of the D objects' regions where they fit (the DMA
-        # reading a D object meets the gathers: an IQ3_XXS expert gate / up 360 -> 347 us per chunk), the core's other
-        # buffers then within one region where they fit
-        d_size = (dq["D"][1] + 63) // 64 * 64
-        edges = [0x0800] + [e for a in sorted(lay["D"]) for e in (a, a + d_size)] + [0x10000]
+        return self._place_dq(lay, {"D": lay["D"]})
+
+    def _dq_layout(self) -> dict[str, list[int]] | None:
+        """A planar GEMM of a gather table's format whose MAC cores fit no plan: the dequantizing core alone pinned (the
+        MAC cores aiecc's): its weight objects in regions 2 and 3 (the DMA writes them), the D objects in region 1, the
+        rest first-fit as ``_place_dq``; weight objects wider than a region: the table's copies at the two ends of its
+        memory, the rest in between (in one region every gather waits a cycle: aiecc put IQ4_XS's two in region 3, its
+        dequant 37% in memory stalls). None if it does not fit; ``DQ_ONLY`` marks it."""
+        dq = self._dq_buffers()
+        if "tab" not in dq:
+            return None
+        b_size, d_size = ((dq[k][1] + 63) // 64 * 64 for k in ("B", "D"))
+        if self.b_depth == 2 and b_size <= REGION and 2 * d_size <= REGION:
+            lay = self._place_dq({}, {"D": [REGION, REGION + d_size], "B": [2 * REGION, 3 * REGION]})
+            return None if lay is None else {**lay, DQ_ONLY: []}
+        # (weight objects wider than a region: the table's copies at the two ends, region 0 after the stack and the top
+        # of region 3, everything else in between)
+        size_of = {k: (v[1] + 63) // 64 * 64 for k, v in dq.items()}
+        tabb = 0x10000 - size_of["tabb"]
+        lay, at = {"tab": [0x0800], "tabb": [tabb]}, 0x0800 + size_of["tab"]
+        for key in (k for k in dq if k not in ("tab", "tabb")):
+            for _ in range(dq[key][0]):
+                lay.setdefault(key, []).append(at)
+                at += size_of[key]
+        if at > tabb or size_of["tab"] > REGION - 0x0800:
+            return None
+        return {**lay, DQ_ONLY: []}
+
+    def _place_dq(self, lay: dict[str, list[int]], fixed: dict[str, list[int]]) -> dict[str, list[int]] | None:
+        """The dequantizing core's buffers into ``lay``: ``fixed`` (D: the MAC cores' addresses, or B and D) where
+        given, the others first-fit in the gaps around them; a gather table's two copies each within one region,
+        "tabb" in another region than "tab", both out of the D objects' regions where they fit (the DMA reading a D
+        object meets the gathers: an IQ3_XXS expert gate / up 360 -> 347 us per chunk), the core's other buffers then
+        within one region where they fit. None if something does not fit."""
+        dq = self._dq_buffers()
+        size_of = {k: (v[1] + 63) // 64 * 64 for k, v in dq.items()}
+        lay = {**lay, **fixed}
+        edges = [0x0800] + [e for k, addrs in fixed.items() for a in sorted(addrs) for e in (a, a + size_of[k])]
+        edges = [0x0800] + sorted(edges[1:]) + [0x10000]
         free = [[lo, hi] for lo, hi in zip(edges[::2], edges[1::2]) if hi > lo]
         tables = "tab" in dq
 
@@ -291,9 +325,9 @@ class GemmQdOperator(GemmQOperator):
                     lo = (lo // REGION + 1) * REGION
             return None
 
-        d_regions = {r for a in lay["D"] for r in regions(a, d_size)}
-        for key in (k for k in dq if k != "D"):
-            n, size = dq[key][0], (dq[key][1] + 63) // 64 * 64
+        d_regions = {r for a in lay["D"] for r in regions(a, size_of["D"])}
+        for key in (k for k in dq if k not in fixed):
+            n, size = dq[key][0], size_of[key]
             for _ in range(n):
                 if key in ("tab", "tabb"):
                     other = regions(lay["tab"][0], size) if key == "tabb" else set()
@@ -596,8 +630,11 @@ class GemmQdOperator(GemmQOperator):
                 role = name.split("_")[1] if name.startswith("gq_") else None
                 return layout[role][0] if role in layout else None
 
-            pin_l1_buffers(module, fifo=lambda name, depth: layout.get(roles.get(name.split("_")[0], "")),
-                           buffer=worker_buffer)
+            def fifo(name: str, depth: int) -> list[int] | None:  # (dq-only: not the MAC cores' D pools)
+                return None if DQ_ONLY in layout and "__cons" in name and name.startswith("gqD_") else \
+                    layout.get(roles.get(name.split("_")[0], ""))
+
+            pin_l1_buffers(module, fifo=fifo, buffer=worker_buffer)
         return module
 
 
