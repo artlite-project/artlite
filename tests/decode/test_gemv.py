@@ -12,8 +12,8 @@ import torch
 from artlite.decode import gemv
 from artlite.decode.image import pack_rows
 from artlite.formats import FORMATS, pack_tile, slice_fields, tile_format
-from artlite.gguf_model import GGUFFile, QTensor
-from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf
+from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
+from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
 from . import mmv
@@ -143,6 +143,12 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         return per(f["d"], 32) * q
     if fmt == "IQ3_XXS":
         return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 4, 32, 1) * q
+    if fmt == "IQ3_S":
+        return per(f["d"], 256) * np.repeat(1 + 2 * f["sc"].astype(np.float64), 32, 1) * q
+    if fmt in ("IQ4_NL", "IQ4_XS"):
+        v = IQ4_VALUES[f["q"]].astype(np.float64)
+        return per(f["d"], 32) * v if fmt == "IQ4_NL" else \
+            per(f["d"], 256) * np.repeat(f["ls"].astype(np.float64) - 32, 32, 1) * v
     sub = 32 if fmt in ("Q4_K", "Q5_K") else 16
     sc = np.repeat(f["sc"].astype(np.float64).reshape(q.shape[0], -1), sub, 1)
     if fmt in ("Q4_K", "Q5_K", "Q2_K"):
@@ -169,12 +175,16 @@ GEMV = [
     ("Q8_0", 9280, 4, ("occamy",), "blk.0.attn_gate.weight"),  # (8 rows: the super-block split)
     ("IQ3_XXS", 9280, 4, ("occamy",), "blk.10.ffn_gate_exps.weight"),  # (23 rows)
     ("Q3_K", 9280, 4, ("occamy",), "blk.0.attn_qkv.weight"),  # (21 rows)
+    ("IQ4_XS", 9280, 4, ("swift",), "blk.0.ffn_down.weight"),  # (16 rows)
+    ("IQ4_NL", 9280, 4, ("random",), "IQ4_NL"),  # (16 rows; no file of ours has IQ4_NL tensors)
+    ("IQ3_S", 9280, 4, ("swift",), "blk.0.ffn_gate.weight"),  # (20 rows)
+    ("IQ3_XXS", 9280, 4, ("swift",), "blk.16.ffn_up.weight"),  # (23 rows: a dense model's)
 ]
 
 
 def _path(key: tuple[str, ...]) -> str:
-    if key[0] == "occamy":
-        return occamy_gguf()
+    if key[0] in ("occamy", "swift"):
+        return occamy_gguf() if key[0] == "occamy" else swift_gguf()
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])
 
 
@@ -196,10 +206,13 @@ def test_gemv8(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str
 
 
 def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int, slots: int = 4) -> None:
-    path = _path(key)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
-    t = GGUFFile(path).tensor(name)
+    if key[0] == "random":
+        t = _random_tensor(name, 256, 2048, 4)
+    else:
+        path = _path(key)
+        if not os.path.exists(path):
+            pytest.skip(f"{path}: not present")
+        t = GGUFFile(path).tensor(name)
     assert tile_format(t.qtype) == fmt
     KC = 256 * NSB
     n_tiles = 3

@@ -73,6 +73,14 @@ def occamy_gguf() -> str:
                         "Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf")
 
 
+def swift_gguf() -> str:
+    """IsValorum's Swift 1.5 (a fine-tune of Qwen3.8-27B, uncensored) in its APEX-I-MiniPlus V3 quantization (GGUF
+    architecture ``qwen35`` with an MTP block: IQ4_XS downs, IQ3_S and IQ3_XXS gate / up, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0,
+    Q4_1 and F32 tensors)."""
+    return os.path.join(MODELS_DIR, "IsValorum", "Swift-1.5-Qwen3.8-27B-Uncensored-MTP-VAL-APEX-I-MiniPlus-V3-GGUF",
+                        "Swift-1.5-Qwen3.8-27B-Uncensored-VAL-APEX-I-MiniPlus-V3.gguf")
+
+
 def minicpmv_gguf(quant: str = "Q4_K_M") -> str:
     """A file of openbmb's MiniCPM-V 4.7 1B GGUF repository: the language model of a quantization (GGUF architecture
     ``qwen35``)."""

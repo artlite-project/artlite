@@ -27,12 +27,7 @@ from typing import ClassVar
 import numpy as np
 
 from . import k23
-from .common import DqKernels, Slot, TileFormat, dq_kernel, i32
-
-# the grid table's two copies per core half (main core, helper: addresses in their own data memory, two 16 KB regions
-# each, in gaps the decode overlay's buffers leave)
-TAB: tuple[tuple[int, int], tuple[int, int]] = ((0x7B800, 0x7F780), (0x77400, 0x7F780))
-TAB_BYTES = 2048
+from .common import TAB, TAB_BYTES, DqKernels, Slot, TileFormat, dq_kernel, i32
 
 
 def grid_words() -> np.ndarray:
@@ -150,7 +145,37 @@ __attribute__((noinline)) void {{ p }}_iq3_w(const uint8_t *__restrict ix, const
     }
 }
 
-// The 3 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
+// super-blocks 2 H, 2 H + 1 of an IQ3_XXS tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; ys:
+// the second super-block's rows at y + ys (row groups)" if rg else "" }}
+template <int H>
+__attribute__((noinline)) void {{ p }}_iq3(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
+{
+    uint8_t *mk = scr + 6144;
+    bfloat16 *sct = (bfloat16 *)(scr + 7168), *dg = (bfloat16 *)(scr + 7936);
+    // (the table copies' addresses through a volatile word: constants at the call would specialize _iq3_w, and the
+    // gathers' memory operands need pointers, AIEPostSelectOptimize asserts on immediates)
+    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
+    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
+    ta[1] = H ? {{ TAB[1][1] }} : {{ TAB[0][1] }};
+    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        uint8_t *un = a + {{ U3 }} * (2 * H + u);  // (the super-block's unit: [ix | ss | d], odd ones [d | ss | ix])
+        {{ p }}_iq3_ss(un + (u ? {{ U3 - I3 - S3 }} : {{ I3 }}), (v16int32 *)mk, sct);
+        const aie::vector<bfloat16, 32> dv = aie::vector<int32, 16>({{ p }}_k23w1((uintptr_t)(un + (u ? 0 : {{ I3 + S3 }})), {{ 2 * RI3 }})).template cast_to<bfloat16>();
+        AIE_LOOP_UNROLL_FULL
+        for (int g = 0; g < 3; g++)
+            aie::store_v(dg + 8 * g, dv.template extract<8>(g));
+        {{ p }}_iq3_w(un + (u ? {{ U3 - I3 }} : 0), mk, tab_ab, tab_cd, scr);
+        {{ p }}_iq3_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
+        {{ p }}_iq3_sc((const bfloat16 *)scr, sct, dg, y{{ " + u * ys" if rg else "" }});
+    }
+}
+"""
+
+# the MMUL and the scaling of IQ3_XXS and IQ3_S (their weight panels [i][l 4][g 3][64 B], scales [i][g 4][r 8])
+_XSC = r"""// The 3 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
 // rows] + C[lo rows]) of the group's 4 panels, in place of its panel (l 0, g) (w: [i][l][g][64 B], c: 64 B per (i, g)
 // at 64 (12 i + g))
 __attribute__((noinline)) void {{ p }}_iq3_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
@@ -203,33 +228,6 @@ __attribute__((noinline)) void {{ p }}_iq3_sc(const bfloat16 *__restrict c, cons
     {{ p }}_k23d(y + 64, Y2, dg + 16);
 }
 
-// super-blocks 2 H, 2 H + 1 of an IQ3_XXS tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; ys:
-// the second super-block's rows at y + ys (row groups)" if rg else "" }}
-template <int H>
-__attribute__((noinline)) void {{ p }}_iq3(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
-{
-    uint8_t *mk = scr + 6144;
-    bfloat16 *sct = (bfloat16 *)(scr + 7168), *dg = (bfloat16 *)(scr + 7936);
-    // (the table copies' addresses through a volatile word: constants at the call would specialize _iq3_w, and the
-    // gathers' memory operands need pointers, AIEPostSelectOptimize asserts on immediates)
-    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
-    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
-    ta[1] = H ? {{ TAB[1][1] }} : {{ TAB[0][1] }};
-    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
-    AIE_LOOP_NO_UNROLL
-    for (int u = 0; u < 2; u++) {
-        uint8_t *un = a + {{ U3 }} * (2 * H + u);  // (the super-block's unit: [ix | ss | d], odd ones [d | ss | ix])
-        {{ p }}_iq3_ss(un + (u ? {{ U3 - I3 - S3 }} : {{ I3 }}), (v16int32 *)mk, sct);
-        const aie::vector<bfloat16, 32> dv = aie::vector<int32, 16>({{ p }}_k23w1((uintptr_t)(un + (u ? 0 : {{ I3 + S3 }})), {{ 2 * RI3 }})).template cast_to<bfloat16>();
-        AIE_LOOP_UNROLL_FULL
-        for (int g = 0; g < 3; g++)
-            aie::store_v(dg + 8 * g, dv.template extract<8>(g));
-        {{ p }}_iq3_w(un + (u ? {{ U3 - I3 }} : 0), mk, tab_ab, tab_cd, scr);
-        {{ p }}_iq3_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
-        {{ p }}_iq3_sc((const bfloat16 *)scr, sct, dg, y{{ " + u * ys" if rg else "" }});
-    }
-}
 """
 
 # one weight panel from its 16 grid entries' addresses and the signs (before ``mmv/IQ3_XXS``, which calls it)
@@ -472,7 +470,8 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
 class Iq3Slot(Slot):
     formats = (TileFormat("IQ3_XXS", 10, 98, 24, 1, 98, 0, planes=3, pad8_row=64, unit_align=16, dq_row_cycles=11.0,
                           mmv="iq3"),)
-    sources: ClassVar[dict[str, str]] = {"mmv/IQ3_XXS": _MMV, "mmv/iq3panel": _PANEL, "gemm/IQ3_XXS": _GEMM}
+    sources: ClassVar[dict[str, str]] = {"mmv/IQ3_XXS": _MMV, "mmv/iq3panel": _PANEL, "mmv/iq3c": _XSC,
+                                         "gemm/IQ3_XXS": _GEMM}
 
     @staticmethod
     def unit(R: int) -> tuple[int, int, int, int]:
@@ -555,7 +554,10 @@ class Iq3Slot(Slot):
         return nsb == 4  # (two super-blocks per core)
 
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
-        return ("mmv/k23", "mmv/iq3panel", f"mmv/{fmt}")
+        return ("mmv/k23", "mmv/iq3panel", "mmv/iq3c", f"mmv/{fmt}")
+
+    def mmv_table(self, fmt: str) -> np.ndarray:
+        return grid_words()
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, object]:
         R = self.format(fmt).rows(tile_bytes, nsb)

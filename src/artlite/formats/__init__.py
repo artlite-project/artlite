@@ -27,9 +27,9 @@ import numpy as np
 from jinja2 import FunctionLoader, Template
 
 from . import bf16, common, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6k, q8
-from .common import KC, KT, SB, DqKernels, Slot, TileFormat
+from .common import KC, KT, SB, TAB, TAB_BYTES, DqKernels, Slot, TileFormat
 
-__all__ = ["FORMATS", "KC", "KT", "SB", "SLOTS", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
+__all__ = ["FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
            "has_tile_format", "kernel_template", "pack_tile", "slice_fields", "slot", "tile_format"]
 
 # the slots

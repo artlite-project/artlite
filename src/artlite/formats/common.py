@@ -223,6 +223,11 @@ class Slot:
         """Variables of the ``mmv/<fmt>`` source for tiles of tile_bytes over nsb super-blocks."""
         return {}
 
+    def mmv_table(self, fmt: str) -> np.ndarray | None:
+        """The decode GEMV's gather table of a format (uint32 words, at most ``TAB_BYTES``: each core half holds two
+        copies at ``TAB``), or None."""
+        return None
+
 
 def dq_kernel(op: object, kernel: KernelFn, B_l1_ty: object, ws_ty: object, D_ty: object,
               extra: list | None = None) -> object:
@@ -239,6 +244,10 @@ def collected_header(kernel: KernelFn, B_l1_ty: object, ws_ty: object, hb_ty: ob
 
 
 MMV_SLOTS = 4  # token slots of the decode GEMV's x panels (``decode.gemv``)
+# the decode GEMV's gather table: two copies per core half (main core, helper: addresses in their own data memory, in
+# two 16 KB regions each, in gaps the decode overlay's buffers leave), each at most TAB_BYTES (``Slot.mmv_table``)
+TAB: tuple[tuple[int, int], tuple[int, int]] = ((0x7B800, 0x7F780), (0x77400, 0x7F780))
+TAB_BYTES = 2048
 
 
 # ----------------------------------------------------------------------
@@ -273,6 +282,19 @@ def sb_major(b: np.ndarray, R: int, n: int) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 SOURCES = {
+# 16 table entries by 4x16 gathers (IQ4, IQ3_S)
+"mmv/g16": r"""// ---- 16 entries of a 4x16 gather table (a: their addresses, lanes 0, 1 of each 4 from one table copy, 2, 3 from the
+// other) -> lanes 0 .. 15: a lane's entry lands in halfword 0 of its 64-bit output lane, T16_16x4_lo gathers those of two
+// vectors in order
+[[clang::always_inline]] inline v16int16 {{ p }}_g16(v16int32 a)
+{
+    const v8int32 a0 = extract_v8int32(a, 0), a1 = extract_v8int32(a, 1);
+    const v16int32 c0 = concat(load_4x16_lo(a0), load_4x16_hi(a0));
+    const v16int32 c1 = concat(load_4x16_lo(a1), load_4x16_hi(a1));
+    return extract_v16int16((v32int16)::shuffle(c0, c1, T16_16x4_lo), 0);
+}
+
+""",
 # the decode GEMV's scale tables and per-super-block scaling of the formats with a bf16 scale per 32-k group (Q4_0, Q4_1,
 # Q8_0)
 "mmv/trq": r"""// ---- Q5_K, Q6_K: Pass 1: a super-block's code planes of ps B -> scr [i][h][g][ql0 | ql1 | c0 | c1], per half h of its

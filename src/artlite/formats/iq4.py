@@ -11,12 +11,19 @@ the GGUF blocks' sizes): per super-block a unit of ``unit_bytes`` (R 16: IQ4_NL 
 nibbles in pairs per byte (the first one low), in the order of the list.
 
 w = d v[q] (IQ4_NL: d per 32-k group), w = d (ls - 32) v[q] (IQ4_XS), v = ``gguf_model.IQ4_VALUES`` (16 int8 values).
-"""
+
+Decode (``mmv/iq4``): a weight panel (8 rows x 8 k) is its 32 code bytes looked up by the gather unit in a table of the
+256 byte values' value pairs [v[lo], v[hi]] (``pair_words``: 16-bit entries, 4x16 gathers, ``common.TAB``): 8 gathers
+per panel, two panels per iteration (II 20, bound by the gathers' DM_ADA port); then the MMUL against the x panels, per
+32-k group the rows' sums c, and y += hilo(sum_i c_i (ls_i - 32)) d (IQ4_XS: the integer scales exact in bf16) or
+y += sum_i c_i d_i (IQ4_NL: bf16 d)."""
+
+from typing import ClassVar
 
 import numpy as np
 
 from . import k23
-from .common import Slot, TileFormat
+from .common import TAB, Slot, TileFormat
 
 
 def _pairs(nib: np.ndarray) -> np.ndarray:
@@ -29,6 +36,168 @@ def codes(q: np.ndarray, R: int, nsb: int) -> np.ndarray:
     G = R // 8
     b = _pairs(q.reshape(R, nsb, 8, 4, 8))  # [row][sb][i][s][4 B]
     return np.ascontiguousarray(b.reshape(G, 8, nsb, 8, 4, 4).transpose(2, 3, 4, 0, 1, 5)).reshape(nsb, -1)
+
+
+def pair_words() -> np.ndarray:
+    """The decode's table (256 uint32 = 1 KB): entry b = [v[b & 15], v[b >> 4]] (int8 pair) at byte 4 b, i.e. per group of
+    16 entries their 32 bytes twice."""
+    from ..gguf_model import IQ4_VALUES
+
+    v = IQ4_VALUES.view(np.uint8).astype(np.uint16)
+    e = v[np.arange(256) & 15] | v[np.arange(256) >> 4] << 8
+    return np.concatenate([e.reshape(16, 16)] * 2, 1).reshape(-1).view(np.uint32)
+
+
+# the decode GEMV (``decode.gemv``; the 4x16 gathers: ``mmv/g16``, the scaling by d: ``mmv/k23``)
+_MMV = r"""// ---- IQ4_NL / IQ4_XS (formats/iq4.py: {{ R4 }} rows, 2 row groups): per super-block a unit, [codes [i][s][g][r][4 B] |
+// IQ4_NL: d [i][row] bf16 | IQ4_XS: ls low nibbles [i][row], high crumbs [i' 4][row], d [row] bf16]. Core H: super-blocks
+// 2 H, 2 H + 1; per super-block u: the weight panels (_iq4_w), each x panel against them (_iq4_x: the groups' sums c in
+// place of panels (i, 0, g)), y += sum_i c_i S_i (IQ4_XS: S = ls - 32 then hilo times d, _iq4xs_ss / _iq4_sc).
+// Scratch: w / c [i 8][s 4][g 2][64 B] (0 .. 4096) | sct [i][row 16] bf16 (4096) | the table's addresses (8000 .. 8008)
+
+// The 64 weight panels of a super-block (codes [i][s][g][32 B], two panels per 64-byte load) -> wp [i][s][g][64 B]: per
+// panel its 32 bytes' entries (4 b + the copies' bases), 8 gathers
+__attribute__((noinline)) void {{ p }}_iq4_w(const uint8_t *__restrict codes, const uint32_t *__restrict tab_ab,
+                                             const uint32_t *__restrict tab_cd, uint8_t *__restrict wp)
+{
+    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v64int8 four = broadcast_to_v64int8(4);
+    const v64uint8 __aie_dm_resource_a *__restrict pi = (const v64uint8 __aie_dm_resource_a *)codes;
+    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < 32; t++) {  // (II 20: the gathers' DM_ADA 17)
+        const v64acc32 q = mul_elem_64_2(*pi++, four);
+        pw[0] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 0), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 1), b16)));
+        pw[1] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 2), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 3), b16)));
+        pw += 2;
+    }
+}
+
+// The 2 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
+// rows] + C[lo rows]) of the group's 4 panels, in place of its panel (i, 0, g) (w: [i][s][g][64 B], c: 64 B per (i, g)
+// at 512 i + 64 g)
+__attribute__((noinline)) void {{ p }}_iq4_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
+                                             bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    v64bfp16ebs8 W;
+    W.exponent = al::e8(0x85);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 8; i++) {
+        v64accfloat C0, C1;
+        AIE_LOOP_UNROLL_FULL
+        for (int s = 0; s < 4; s++) {
+            const v64bfp16ebs8 X = xs.pop();
+            W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 128 * s);
+            C0 = s ? mac_8x8_8x8T(X, 1, W, 1, C0) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 128 * s + 64);
+            C1 = s ? mac_8x8_8x8T(X, 1, W, 1, C1) : mul_8x8_8x8T(X, 1, W, 1);
+        }
+        aie::store_v(pc, {{ p }}_sum2(C0));
+        aie::store_v(pc + 32, {{ p }}_sum2(C1));
+        pw += 512;
+        pc += 256;
+    }
+}
+
+// y[g] += sum over the 8 groups i of c (i, g) sct[i][g][r] for the 2 row groups (c (i, g): 32 bf16 at c + 256 i + 32 g),
+// then (dg: IQ4_XS) y[g] += hilo(that sum) dg[g] (fp32 sums)
+template <bool D>
+__attribute__((noinline)) void {{ p }}_iq4_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
+                                              const bfloat16 *__restrict dg, float *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 32> Y0, Y1;
+    if constexpr (D) {
+        Y0 = aie::zeros<accfloat, 32>();
+        Y1 = aie::zeros<accfloat, 32>();
+    } else {
+        Y0 = aie::accum<accfloat, 32>(aie::load_v<32>(y));
+        Y1 = aie::accum<accfloat, 32>(aie::load_v<32>(y + 32));
+    }
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < 8; i++) {
+        Y0 = aie::mac(Y0, aie::load_v<32>(pc + 256 * i), aie::load_v<8>(ps + 16 * i).template grow_replicate<32>());
+        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 256 * i + 32), aie::load_v<8>(ps + 16 * i + 8).template grow_replicate<32>());
+    }
+    if constexpr (D) {
+        {{ p }}_k23d(y, Y0, dg);
+        {{ p }}_k23d(y + 32, Y1, dg + 8);
+    } else {
+        aie::store_v(y, Y0.template to_vector<float>());
+        aie::store_v(y + 32, Y1.template to_vector<float>());
+    }
+}
+
+// IQ4_XS: sct [i][row 16] = ls - 32 (bf16, exact) from the low plane (lo: nibbles [i 8][row 16]) and the high one (hi:
+// nibbles [i' 4][row 16] = crumb i' | crumb i' + 4 << 2): bf16(128 + ls) by its bits 0x4300 | ls, minus 160
+__attribute__((noinline)) void {{ p }}_iq4xs_ss(const uint8_t *__restrict lo, const uint8_t *__restrict hi,
+                                                bfloat16 *__restrict sct)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<uint8, 64> h = aie::unpack(aie::load_v<64>((const uint4 *)hi));  // ([i' 4][row 16])
+    const aie::vector<uint8, 64> m3 = aie::broadcast<uint8, 64>(3);
+    const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4300);
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const aie::accum<accfloat, 32> k160(aie::broadcast<float, 32>(-160.0f));
+    AIE_LOOP_UNROLL_FULL
+    for (int u = 0; u < 2; u++) {  // (groups 4 u ..)
+        const aie::vector<uint8, 64> l = aie::unpack(aie::load_v<64>((const uint4 *)(lo + 32 * u)));
+        const aie::vector<uint8, 64> c = u ? aie::downshift(h, 2) : aie::bit_and(h, m3);
+        const aie::vector<uint8, 64> ls = aie::bit_or(l, aie::upshift(aie::bit_and(c, m3), 4));
+        AIE_LOOP_UNROLL_FULL
+        for (int j = 0; j < 2; j++) {
+            const aie::vector<bfloat16, 32> v = aie::add(aie::unpack(ls.template extract<32>(j)), k43).template cast_to<bfloat16>();
+            aie::store_v(sct + 64 * u + 32 * j, aie::mac(k160, v, one).template to_vector<bfloat16>());
+        }
+    }
+}
+
+// super-blocks 2 H, 2 H + 1 of an IQ4 tile (X: IQ4_XS): y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels)
+template <int H, bool X>
+[[clang::always_inline]] inline void {{ p }}_iq4(uint8_t *__restrict a, const uint8_t *__restrict xp, float *__restrict y,
+                                                 uint8_t *__restrict scr)
+{
+    constexpr int U = X ? {{ 136 * R4 }} : {{ 144 * R4 }};
+    bfloat16 *sct = (bfloat16 *)(scr + 4096);
+    // (the table copies' addresses through a volatile word: constants at the call would specialize _iq4_w, and the
+    // gathers' memory operands need pointers)
+    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
+    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
+    ta[1] = H ? {{ TAB[1][1] }} : {{ TAB[0][1] }};
+    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        uint8_t *un = a + U * (2 * H + u), *hd = un + {{ 128 * R4 }};
+        if constexpr (X)
+            {{ p }}_iq4xs_ss(hd, hd + {{ 4 * R4 }}, sct);
+        {{ p }}_iq4_w(un, tab_ab, tab_cd, scr);
+        {{ p }}_iq4_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
+        {{ p }}_iq4_sc<X>((const bfloat16 *)scr, X ? sct : (const bfloat16 *)hd, (const bfloat16 *)(hd + {{ 6 * R4 }}), y);
+    }
+}
+"""
+
+_NL = r"""template <int H>
+__attribute__((noinline)) void {{ p }}_iq4nl(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                             float *__restrict y, uint8_t *__restrict scr)
+{
+    {{ p }}_iq4<H, false>(a, xp, y, scr);
+}
+"""
+
+_XS = r"""template <int H>
+__attribute__((noinline)) void {{ p }}_iq4xs(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                             float *__restrict y, uint8_t *__restrict scr)
+{
+    {{ p }}_iq4<H, true>(a, xp, y, scr);
+}
+"""
 
 
 class Iq4Slot(Slot):
@@ -52,6 +221,22 @@ class Iq4Slot(Slot):
 
     def unit_bytes(self, fmt: str, rows: int, nsb: int) -> int:
         return self.format(fmt).unit_bytes(rows)
+
+    sources: ClassVar[dict[str, str]] = {"mmv/iq4": _MMV, "mmv/IQ4_NL": _NL, "mmv/IQ4_XS": _XS}
+
+    def mmv_supports(self, fmt: str, nsb: int) -> bool:
+        return nsb == 4  # (two super-blocks per core)
+
+    def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
+        return ("mmv/k23", "mmv/g16", "mmv/iq4", f"mmv/{fmt}")
+
+    def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, object]:
+        R = self.format(fmt).rows(tile_bytes, nsb)
+        assert R == 16, R  # (2 row groups: the kernels' layout)
+        return {"R4": R, "TAB": TAB}
+
+    def mmv_table(self, fmt: str) -> np.ndarray:
+        return pair_words()
 
 
 SLOT = Iq4Slot()

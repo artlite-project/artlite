@@ -431,7 +431,7 @@ void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
 
 /// IQ3_S (iq3s.py): per super-block a unit of 2304 bytes (17 .. 20 rows): A, the index records [32-k group i][panel pair
 /// h][panel l' 2] of 48 B (rows 0 .. 15 at 2 r, rows 16 .. at 32 + 2 (r - 16), row r's two indices j of panel l = 2 h + l':
-/// qs[8 i + 2 l + j]; at 42 the 16-bit masks of the 9th bits per row group, bit 2 (r % 8) + j), then B, the sign records
+/// qs[8 i + 2 l + j]; at 40 the 16-bit masks of the 9th bits per row group, bit 2 (r % 8) + j), then B, the sign records
 /// [i][l 4] of 24 B (row r's byte signs[4 i + l] at r; at 20 slot 4 i + l of C: row r's 4 scale bytes in slot r, rows 2 s,
 /// 2 s + 1's bf16 d in slot R + s).
 constexpr size_t kIq3sUnit = 2304;
@@ -458,7 +458,7 @@ void tile_iq3s(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
       put16(bs + 24 * (R + r / 2) + 20 + 2 * (r % 2), bf16_of(b));
     }
     for (int n = 0; n < 32; n++)
-      for (int g = 0; g < 3; g++) put16(a + 48 * n + 42 + 2 * g, mask[n / 4][n % 4][g]);
+      for (int g = 0; g < 3; g++) put16(a + 48 * n + 40 + 2 * g, mask[n / 4][n % 4][g]);
   }
 }
 
