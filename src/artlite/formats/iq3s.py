@@ -94,7 +94,7 @@ __attribute__((noinline)) void {{ p }}_iq3s_w(const uint8_t *__restrict ix, cons
     const v64uint8 __aie_dm_resource_d *__restrict ph = (const v64uint8 __aie_dm_resource_d *)hb;
     const v8int32 __aie_dm_resource_b *__restrict ps = (const v8int32 __aie_dm_resource_b *)sg;
     v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
-    AIE_PREPARE_FOR_POSTPIPELINING
+    AIE_TRY_INITIATION_INTERVAL(24)  // (post-RA II 29, the heuristic search's 40: qrs 24 = the gathers, unpacks, stores)
     for (int t = 0; t < 24; t++) {
         const v64acc32 q = mac_elem_64_2(*ph++, eight, mul_elem_64_2(*pi++, four));  // (4 (qs + 256 qh) of 4 panels)
         const v16int32 sv = set_v16int32(0, *ps++);
