@@ -81,6 +81,23 @@ __attribute__((noinline)) void {{ p }}_inv(float *__restrict st)
     aie::store_v((bfloat16 *)(st + 256), al::expand8(hi.template extract<8>(0)));
     aie::store_v((bfloat16 *)(st + 256) + 64, al::expand8(lo.template extract<8>(0)));
 }
+
+// ao[j] = ai[j] + y[j] (h + l) in fp32 ({{ E }} values; ai, ao one buffer: each value read before it is written,
+// distinct parameters so that a store and the next iteration's load are independent: II 4 instead of 16)
+[[clang::always_inline]] inline void {{ p }}_acc(const bfloat16 *__restrict py, const float *__restrict ai,
+                                           float *__restrict ao, aie::vector<bfloat16, 32> h,
+                                           aie::vector<bfloat16, 32> l)
+{
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < {{ E // 32 }}; j++) {
+        const aie::vector<bfloat16, 32> v = aie::load_v<32>(py);
+        py += 32;
+        aie::accum<accfloat, 32> a(aie::load_v<32>(ai));
+        ai += 32;
+        aie::store_v(ao, aie::mac(aie::mac(a, v, h), v, l).template to_vector<float>());
+        ao += 32;
+    }
+}
 }  // namespace
 
 extern "C" {
@@ -124,11 +141,7 @@ void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
-        aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(pg), aie::load_v<8>(pg + {{ E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 2 * E }}), aie::load_v<8>(pg + {{ 3 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 4 * E }}), aie::load_v<8>(pg + {{ 5 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 6 * E }}), aie::load_v<8>(pg + {{ 7 * E }})));
+        aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
                                            .template to_vector<bfloat16>();
         o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
@@ -165,25 +178,20 @@ void {{ p }}_cy(const bfloat16 *__restrict y, const bfloat16 *__restrict obj, fl
     const float w = ((const float *)(obj + {{ COLS * DP }}))[i];
     const bfloat16 wh = (bfloat16)w;
     const bfloat16 wl = (bfloat16)(w - (float)wh);
-    const aie::vector<bfloat16, 32> h = aie::broadcast<bfloat16, 32>(wh), l = aie::broadcast<bfloat16, 32>(wl);
-    const bfloat16 *__restrict py = y;
-    float *__restrict pa = acc;
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int j = 0; j < {{ E // 32 }}; j++) {
-        const aie::vector<bfloat16, 32> v = aie::load_v<32>(py);
-        py += 32;
-        aie::accum<accfloat, 32> a(aie::load_v<32>(pa));
-        aie::store_v(pa, aie::mac(aie::mac(a, v, h), v, l).template to_vector<float>());
-        pa += 32;
-    }
+    {{ p }}_acc(y, acc, acc, aie::broadcast<bfloat16, 32>(wh), aie::broadcast<bfloat16, 32>(wl));
 }
 
 // acc -> bf16 (one rounding)
 void {{ p }}_co(const float *__restrict acc, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    for (int j = 0; j < {{ E // 32 }}; j++)
-        aie::store_v(out + 32 * j, aie::accum<accfloat, 32>(aie::load_v<32>(acc + 32 * j)).template to_vector<bfloat16>());
+    const float *__restrict pa = acc;
+    bfloat16 *__restrict po = out;
+    for (int j = 0; j < {{ E // 32 }}; j++) {  // (walked pointers: indexed acc + 32 j, out + 32 j ran at II 6)
+        aie::store_v(po, aie::accum<accfloat, 32>(aie::load_v<32>(pa)).template to_vector<bfloat16>());
+        pa += 32;
+        po += 32;
+    }
 }
 
 }  // extern "C"

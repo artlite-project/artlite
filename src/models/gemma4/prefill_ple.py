@@ -45,11 +45,8 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pli, b
         al::BOut<> o((bfp16ebs8 *)out);
         for (int s = 0; s < 8; s++) {
             for (int q = 0; q < 4; q++) {
-                aie::vector<bfloat16, 64> g, l;
-{% for r in range(8) %}
-                g.insert({{ r }}, aie::load_v<8>(pg + {{ 8 * PER * r }} + {{ PER }} * s + 8 * q));
-                l.insert({{ r }}, aie::load_v<8>(pli + {{ 8 * PER * r }} + {{ PER }} * s + 8 * q));
-{% endfor %}
+                const aie::vector<bfloat16, 64> g = al::gather<8, 8>(pg + {{ PER }} * s + 8 * q, {{ 8 * PER }});
+                const aie::vector<bfloat16, 64> l = al::gather<8, 8>(pli + {{ PER }} * s + 8 * q, {{ 8 * PER }});
                 o.push(aie::mul(g, l).template to_vector<bfp16ebs8>());
             }
             for (int q = 0; q < 4; q++)

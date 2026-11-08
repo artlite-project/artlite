@@ -279,10 +279,7 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
     al::BOut<> o((bfp16ebs8 *)out);
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int db = 0; db < {{ ND }}; db++) {
-        aie::vector<bfloat16, 64> pd;  // [position][dim]
-        AIE_LOOP_UNROLL_FULL
-        for (int r = 0; r < 8; r++)
-            pd.insert(r, aie::load_v<8>(vn + {{ HD }} * r + 8 * db));
+        const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(vn + 8 * db, {{ HD }});  // [position][dim]
         o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
     }
 }
@@ -488,8 +485,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
     const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
     const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
-    for (int db = 0; db < {{ ND }}; db++)
-        aie::store_v(o + 64 * db, al::mulff<64>(aie::load_v<64>(o + 64 * db), a));
+    al::scale<{{ ND }}>(o, o, a);
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
     aie::store_v(pm, mn);
 }

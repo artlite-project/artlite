@@ -138,6 +138,13 @@ per panel): a dequant writing 8 panels per iteration with 30 shuffles ran at II 
 - **Repeat a 128-bit vector with `grow_replicate<N>()`** (one `vextbcst.128`), not `aie::concat(v, v, ...)`: aie_api
   concatenates 128-bit pieces with one `vshift` each, in sequence. K2 / K3 scales repeated to 64 lanes (`formats/k23.py`
   `_d64`): the GemmQd super-block header's loop II 22 -> 18 (the prefill level: not its bound).
+- **Build a vector from distinct 128-bit pieces with `al::concat` / `al::gather`** (8 bf16 rows of a panel: 6
+  `vshuffle`s), not `aie::concat` (a `vshift` per piece, plus `vmov`s joining 256-bit halves) or `insert` (a `vshift` +
+  `vsel` per piece). Per call: the residual norm's sums pass 1114 -> 851 cycles, the prefill norm's pass B 1031 -> 848,
+  the prefill attention's V panels 1109 -> 821, the decode helper's x strip 1490 -> 974. Not on a memory recurrence:
+  GemmQd's pack loads its carry from the C row the previous iteration stored to (may alias), and the shuffle tree
+  lengthened that circuit (RecMII 30 -> 34, II 35 -> 39); aie_api's shift chain there and `al::concat` for the
+  other rows: II 32.
 - **Transpose bytes before the arithmetic, not bf16 results after it**: Q4_K's scale header (`formats/q4k.py`
   `_hdr_q4k`) as [row][group] nibbles -> bf16 products -> transposes took 12 shuffles per 128 values; one `T8_8x8`
   shuffle per 8x8 bytes and an even / odd row zip before the math, the crumb words shared by their two super-blocks,

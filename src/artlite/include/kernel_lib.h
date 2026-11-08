@@ -110,6 +110,20 @@ template <unsigned N>
     return aie::mac(aie::mac(aie::mul(a_hi, b_hi), a_hi, b_lo), a_lo, b_hi).template to_vector<float>();
 }
 
+// out = in a for N vectors of L fp32 (mulff), walked. in and out may be one buffer (each vector is read before it is
+// written): as distinct parameters a store and the next iteration's load are independent (the attention rescale's
+// o in place through one pointer: II 31, here 14)
+template <int N, unsigned L>
+[[clang::always_inline]] inline void scale(const float *__restrict in, float *__restrict out, aie::vector<float, L> a)
+{
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < N; i++) {
+        aie::store_v(out, mulff<L>(aie::load_v<L>(in), a));
+        in += L;
+        out += L;
+    }
+}
+
 // The bf16 hi / lo parts of fp32 x
 template <unsigned N>
 [[clang::always_inline]] inline void split2(aie::vector<float, N> x, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
@@ -214,6 +228,71 @@ template <unsigned N>
     } else {
         return aie::concat(exp2_acc<N / 2>(a.template extract<N / 2>(0)), exp2_acc<N / 2>(a.template extract<N / 2>(1)));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Vectors from 128-bit pieces
+// ---------------------------------------------------------------------------------------------
+
+// aie::concat with 128-bit pieces (8 bf16 / int16, 16 int8, 4 fp32 / int32) built by vshuffles: T128_2x4_lo of two
+// pieces (padded to 512 bits) holds [a b] in its low 256 bits and T256_2x2_lo of two such pairs [a b c d], so 2 pieces
+// take 1 vshuffle, 4 take 3 and 8 take 6. aie::concat takes a vshift per piece (aie_api's shift_bytes chain), a
+// vector's inserts of 128-bit pieces vshifts and vsels (Peano's insert), and joining 256-bit results adds moves: 8 rows
+// into 64 lanes cost 8 vshifts + 2 vmovs or 4 vshifts + 4 vsels + 2 vmovs, all move-slot ops (shifts, selects and
+// shuffles also take the rm port). Other pieces go to aie::concat (256-bit pieces are register halves).
+namespace detail {
+template <typename T, unsigned N>
+[[clang::always_inline]] inline v16int32 pad128(aie::vector<T, N> v)
+{
+    return set_v16int32(0, (v4int32)v.to_native());
+}
+
+template <typename T, unsigned N>
+[[clang::always_inline]] inline v16int32 cat2(aie::vector<T, N> a, aie::vector<T, N> b)
+{
+    return ::shuffle(pad128(a), pad128(b), T128_2x4_lo);
+}
+
+template <typename T, unsigned N>
+[[clang::always_inline]] inline aie::vector<T, 4 * N> cat4(aie::vector<T, N> a, aie::vector<T, N> b,
+                                                           aie::vector<T, N> c, aie::vector<T, N> d)
+{
+    return aie::vector<int32, 16>(::shuffle(cat2(a, b), cat2(c, d), T256_2x2_lo)).template cast_to<T>();
+}
+}  // namespace detail
+
+template <typename T, unsigned N, typename... V>
+[[clang::always_inline]] inline auto concat(aie::vector<T, N> a, V... v)
+{
+    constexpr unsigned K = 1 + sizeof...(V);
+    if constexpr (sizeof(T) * N != 16) {
+        return aie::concat(a, v...);
+    } else {
+        static_assert(K == 2 || K == 4 || K == 8, "2, 4 or 8 pieces");
+        const aie::vector<T, N> p[K] = {a, v...};
+        if constexpr (K == 2)
+            return aie::vector<int32, 16>(detail::cat2(p[0], p[1])).template cast_to<T>().template extract<2 * N>(0);
+        else if constexpr (K == 4)
+            return detail::cat4(p[0], p[1], p[2], p[3]);
+        else
+            return aie::concat(detail::cat4(p[0], p[1], p[2], p[3]), detail::cat4(p[4], p[5], p[6], p[7]));
+    }
+}
+
+namespace detail {
+template <int E, typename T, int... I>
+[[clang::always_inline]] inline auto gather(const T *p, int pitch, std::integer_sequence<int, I...>)
+{
+    return al::concat(aie::load_v<E>(p + I * pitch)...);
+}
+}  // namespace detail
+
+// K pieces of E elements at p, p + pitch, ..., p + (K - 1) pitch (pitch in elements; K rows of a panel) -> lanes
+// [piece K][E]: al::concat of the loads
+template <int K, int E, typename T>
+[[clang::always_inline]] inline auto gather(const T *p, int pitch)
+{
+    return detail::gather<E>(p, pitch, std::make_integer_sequence<int, K>());
 }
 
 // ---------------------------------------------------------------------------------------------

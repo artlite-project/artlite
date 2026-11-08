@@ -318,9 +318,7 @@ __attribute__((noinline)) void {{ p }}_dtab(const bfloat16 *__restrict d, bfloat
     AIE_LOOP_NO_UNROLL AIE_LOOP_REG_REWRITE_BASIC  // (II 11; the default rewrite: 13)
     for (int t = 0; t < NS * G; t++) {
         const bfloat16 *q = d + {{ 64 * NSB }} * (t % G) + 8 * (t / G);  // (row group t % G, super-block t / G)
-        const aie::vector<bfloat16, 64> v = aie::concat(
-            aie::load_v<8>(q), aie::load_v<8>(q + {{ 8 * NSB }}), aie::load_v<8>(q + {{ 16 * NSB }}), aie::load_v<8>(q + {{ 24 * NSB }}),
-            aie::load_v<8>(q + {{ 32 * NSB }}), aie::load_v<8>(q + {{ 40 * NSB }}), aie::load_v<8>(q + {{ 48 * NSB }}), aie::load_v<8>(q + {{ 56 * NSB }}));
+        const aie::vector<bfloat16, 64> v = al::gather<8, 8>(q, {{ 8 * NSB }});
         aie::store_v(pt, aie::transpose(v, 8, 8));  // [r][i] -> [i][r]
         pt += 64;
     }

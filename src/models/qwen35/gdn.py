@@ -490,8 +490,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
         bfloat16 *__restrict dh = d + {{ 16 * 32 }} * hl;
         AIE_LOOP_NO_UNROLL
         for (int kb = 0; kb < 16; kb++)
-            aie::store_v(dh + 32 * kb, aie::concat(aie::load_v<8>(g + 8 * kb), aie::load_v<8>(g + {{ D }} + 8 * kb),
-                                                   aie::load_v<8>(g + {{ 2 * D }} + 8 * kb), aie::load_v<8>(g + {{ 3 * D }} + 8 * kb)));
+            aie::store_v(dh + 32 * kb, al::gather<4, 8>(g + 8 * kb, {{ D }}));
     }
 }
 
@@ -585,10 +584,7 @@ __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__
 template <int N, typename T>
 [[clang::always_inline]] inline aie::vector<T, 64> {{ p }}_blk(const T *__restrict p)
 {
-    return aie::concat(aie::concat(aie::concat(aie::load_v<8>(p), aie::load_v<8>(p + N)),
-                                   aie::concat(aie::load_v<8>(p + 2 * N), aie::load_v<8>(p + 3 * N))),
-                       aie::concat(aie::concat(aie::load_v<8>(p + 4 * N), aie::load_v<8>(p + 5 * N)),
-                                   aie::concat(aie::load_v<8>(p + 6 * N), aie::load_v<8>(p + 7 * N))));
+    return al::gather<8, 8>(p, N);
 }
 
 {% if SMAX == 8 %}
@@ -599,14 +595,7 @@ __attribute__(({{ cold }})) void {{ p }}_tr8(const bfloat16 *__restrict x, bfloa
     bfloat16 *__restrict py = y;
     AIE_LOOP_NO_UNROLL
     for (int i = 0; i < n; i++) {
-        aie::vector<bfloat16, 64> v;
-        const bfloat16 *pr = px;
-        AIE_LOOP_UNROLL_FULL
-        for (int t = 0; t < 8; t++) {
-            v.insert(t, aie::load_v<8>(pr));
-            pr += N;
-        }
-        aie::store_v(py, aie::transpose(v, 8, 8));
+        aie::store_v(py, aie::transpose(al::gather<8, 8>(px, N), 8, 8));
         px += 8;
         py += 64;
     }

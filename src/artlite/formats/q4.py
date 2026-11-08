@@ -422,12 +422,7 @@ __attribute__((noinline)) void {{ p }}_q41_off(const uint8_t *__restrict a, cons
         AIE_LOOP_UNROLL_FULL
         for (int u = 0; u < 2; u++) {  // (super-block 2 H + u: [row 8 g ..][i 8])
             const bfloat16 *d = (const bfloat16 *)a + 256 * g + 16 * H + 8 * u, *m = d + {{ 32 * R41 }};
-            const aie::vector<bfloat16, 64> D = aie::concat(
-                aie::load_v<8>(d), aie::load_v<8>(d + 32), aie::load_v<8>(d + 64), aie::load_v<8>(d + 96),
-                aie::load_v<8>(d + 128), aie::load_v<8>(d + 160), aie::load_v<8>(d + 192), aie::load_v<8>(d + 224));
-            const aie::vector<bfloat16, 64> M = aie::concat(
-                aie::load_v<8>(m), aie::load_v<8>(m + 32), aie::load_v<8>(m + 64), aie::load_v<8>(m + 96),
-                aie::load_v<8>(m + 128), aie::load_v<8>(m + 160), aie::load_v<8>(m + 192), aie::load_v<8>(m + 224));
+            const aie::vector<bfloat16, 64> D = al::gather<8, 8>(d, 32), M = al::gather<8, 8>(m, 32);
             al::BV hi, lo;
             al::split_hilo(aie::mac(aie::accum<accfloat, 64>(M), D, aie::broadcast<bfloat16, 64>(8.0f)), nI, hi, lo);
             const v64bfp16ebs8 X = u ? X1 : X0;

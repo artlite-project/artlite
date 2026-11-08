@@ -274,17 +274,9 @@ void {{ p }}_rb{{ sfx }}(const bfloat16 *__restrict x, {{ "const bfloat16 *__res
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
-        aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(px), aie::load_v<8>(px + {{ C }})),
-            aie::concat(aie::load_v<8>(px + {{ 2 * C }}), aie::load_v<8>(px + {{ 3 * C }})),
-            aie::concat(aie::load_v<8>(px + {{ 4 * C }}), aie::load_v<8>(px + {{ 5 * C }})),
-            aie::concat(aie::load_v<8>(px + {{ 6 * C }}), aie::load_v<8>(px + {{ 7 * C }})));
+        aie::vector<bfloat16, 64> xp = al::gather<8, 8>(px, {{ C }});
 {% if nd == 1 %}
-        xp = aie::add(xp, aie::concat(
-            aie::concat(aie::load_v<8>(pd), aie::load_v<8>(pd + {{ C }})),
-            aie::concat(aie::load_v<8>(pd + {{ 2 * C }}), aie::load_v<8>(pd + {{ 3 * C }})),
-            aie::concat(aie::load_v<8>(pd + {{ 4 * C }}), aie::load_v<8>(pd + {{ 5 * C }})),
-            aie::concat(aie::load_v<8>(pd + {{ 6 * C }}), aie::load_v<8>(pd + {{ 7 * C }}))));
+        xp = aie::add(xp, al::gather<8, 8>(pd, {{ C }}));
         pd += 8;
 {% endif %}
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
@@ -347,11 +339,7 @@ void {{ p }}_rb0p(const bfloat16 *__restrict x, const bfloat16 *__restrict w1, c
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
-        const aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(px), aie::load_v<8>(px + {{ C }})),
-            aie::concat(aie::load_v<8>(px + {{ 2 * C }}), aie::load_v<8>(px + {{ 3 * C }})),
-            aie::concat(aie::load_v<8>(px + {{ 4 * C }}), aie::load_v<8>(px + {{ 5 * C }})),
-            aie::concat(aie::load_v<8>(px + {{ 6 * C }}), aie::load_v<8>(px + {{ 7 * C }})));
+        const aie::vector<bfloat16, 64> xp = al::gather<8, 8>(px, {{ C }});
         const aie::vector<bfloat16, 64> g = aie::mul(xp, aie::load_v<8>(pw1).template grow_replicate<64>())
                                                 .template to_vector<bfloat16>();
         const aie::vector<bfloat16, 64> xw = aie::mul(g, aie::load_v<8>(pw).template grow_replicate<64>())
@@ -381,11 +369,7 @@ void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
-        aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(pg), aie::load_v<8>(pg + {{ E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 2 * E }}), aie::load_v<8>(pg + {{ 3 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 4 * E }}), aie::load_v<8>(pg + {{ 5 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 6 * E }}), aie::load_v<8>(pg + {{ 7 * E }})));
+        aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
                                            .template to_vector<bfloat16>();
         o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
@@ -416,11 +400,7 @@ void {{ p }}_bl(const bfloat16 *__restrict g, const bfloat16 *__restrict w, floa
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
-        aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(pg), aie::load_v<8>(pg + {{ E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 2 * E }}), aie::load_v<8>(pg + {{ 3 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 4 * E }}), aie::load_v<8>(pg + {{ 5 * E }})),
-            aie::concat(aie::load_v<8>(pg + {{ 6 * E }}), aie::load_v<8>(pg + {{ 7 * E }})));
+        aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
         const aie::accum<accfloat, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>());
         const aie::vector<bfloat16, 64> wh = xw.template to_vector<bfloat16>();
         const aie::vector<bfloat16, 64> wl = aie::msc(xw, wh, one).template to_vector<bfloat16>();
@@ -520,11 +500,7 @@ void {{ p }}_b(const bfloat16 *__restrict v, const bfloat16 *__restrict w, float
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 16 }}; kb++) {
-        aie::vector<bfloat16, 64> xp = aie::concat(
-            aie::concat(aie::load_v<8>(pv), aie::load_v<8>(pv + {{ E }})),
-            aie::concat(aie::load_v<8>(pv + {{ 2 * E }}), aie::load_v<8>(pv + {{ 3 * E }})),
-            aie::concat(aie::load_v<8>(pv + 8), aie::load_v<8>(pv + {{ E + 8 }})),
-            aie::concat(aie::load_v<8>(pv + {{ 2 * E + 8 }}), aie::load_v<8>(pv + {{ 3 * E + 8 }})));
+        aie::vector<bfloat16, 64> xp = aie::concat(al::gather<4, 8>(pv, {{ E }}), al::gather<4, 8>(pv + 8, {{ E }}));
         const aie::vector<bfloat16, 64> wr = aie::concat(aie::load_v<8>(pw).template grow_replicate<32>(),
                                                          aie::load_v<8>(pw + 8).template grow_replicate<32>());
         aie::vector<bfloat16, 64> xw = aie::mul(xp, wr).template to_vector<bfloat16>();
@@ -964,16 +940,6 @@ _RSRC = JINJA_ENV.from_string(r"""
 
 namespace {
 
-// 8 rows (pitch P elements) x 8 consecutive elements -> 64 lanes (lane 8 t + e)
-template <typename T, int P>
-[[clang::always_inline]] inline aie::vector<T, 64> {{ p }}_gather8(const T *__restrict p)
-{
-    return aie::concat(aie::concat(aie::load_v<8>(p), aie::load_v<8>(p + P)),
-                       aie::concat(aie::load_v<8>(p + 2 * P), aie::load_v<8>(p + 3 * P)),
-                       aie::concat(aie::load_v<8>(p + 4 * P), aie::load_v<8>(p + 5 * P)),
-                       aie::concat(aie::load_v<8>(p + 6 * P), aie::load_v<8>(p + 7 * P)));
-}
-
 // 64 lanes -> 8 rows (pitch P) x 8 elements
 template <int P>
 [[clang::always_inline]] inline void {{ p }}_scatter8(float *__restrict p, aie::vector<float, 64> v)
@@ -1057,7 +1023,7 @@ void {{ p }}_ss(const bfloat16 *__restrict v, bfloat16 *__restrict ws, int32_t k
     const float *__restrict px = (const float *)v;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
-        acc = aie::mac_square(acc, aie::accum<accfloat, 64>({{ p }}_gather8<float, {{ CH }}>(px)).template to_vector<bfloat16>());
+        acc = aie::mac_square(acc, aie::accum<accfloat, 64>(al::gather<8, 8>(px, {{ CH }})).template to_vector<bfloat16>());
         px += 8;
     }
 {% else %}
@@ -1065,13 +1031,13 @@ void {{ p }}_ss(const bfloat16 *__restrict v, bfloat16 *__restrict ws, int32_t k
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
 {% if deltas > 1 %}
-        aie::accum<accfloat, 64> s({{ p }}_gather8<bfloat16, {{ CH }}>(pd));
+        aie::accum<accfloat, 64> s(al::gather<8, 8>(pd, {{ CH }}));
 {% for i in range(1, deltas) %}
-        s = aie::add(s, {{ p }}_gather8<bfloat16, {{ CH }}>(pd + {{ 8 * CH * i }}));
+        s = aie::add(s, al::gather<8, 8>(pd + {{ 8 * CH * i }}, {{ CH }}));
 {% endfor %}
         acc = aie::mac_square(acc, s.template to_vector<bfloat16>());
 {% else %}
-        acc = aie::mac_square(acc, {{ p }}_gather8<bfloat16, {{ CH }}>(pd));
+        acc = aie::mac_square(acc, al::gather<8, 8>(pd, {{ CH }}));
 {% endif %}
         pd += 8;
     }
@@ -1102,9 +1068,9 @@ void {{ p }}_upd(const bfloat16 *__restrict x_, const bfloat16 *__restrict d, bf
     const bfloat16 *__restrict pw = NW(bfloat16, {{ w.wp }}) + {{ CH }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
-        const aie::vector<float, 64> xp = {{ p }}_xp({{ p }}_gather8<float, {{ CH }}>(px), {{ p }}_gather8<bfloat16, {{ CH }}>(d + 8 * kb),
+        const aie::vector<float, 64> xp = {{ p }}_xp(al::gather<8, 8>(px, {{ CH }}), al::gather<8, 8>(d + 8 * kb, {{ CH }}),
 {% for i in range(1, deltas) %}
-                                                    {{ p }}_gather8<bfloat16, {{ CH }}>(d + {{ 8 * CH * i }} + 8 * kb),
+                                                    al::gather<8, 8>(d + {{ 8 * CH * i }} + 8 * kb, {{ CH }}),
 {% endfor %}
                                                     aie::load_v<8>(pw).template grow_replicate<64>(), ah, al_, sh, sl);
         {{ p }}_scatter8<{{ CH }}>(xo, xp);
@@ -1145,14 +1111,14 @@ void {{ p }}_pan(const bfloat16 *__restrict x_, {{ "const bfloat16 *__restrict d
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
 {% if mode == "post" %}
-        const aie::vector<float, 64> xp = {{ p }}_xp({{ p }}_gather8<float, {{ CH }}>(px), {{ p }}_gather8<bfloat16, {{ CH }}>(d + 8 * kb),
+        const aie::vector<float, 64> xp = {{ p }}_xp(al::gather<8, 8>(px, {{ CH }}), al::gather<8, 8>(d + 8 * kb, {{ CH }}),
 {% for i in range(1, deltas) %}
-                                                    {{ p }}_gather8<bfloat16, {{ CH }}>(d + {{ 8 * CH * i }} + 8 * kb),
+                                                    al::gather<8, 8>(d + {{ 8 * CH * i }} + 8 * kb, {{ CH }}),
 {% endfor %}
                                                     aie::load_v<8>(pw).template grow_replicate<64>(), ah, al_, sh, sl);
         pw += 8;
 {% else %}
-        const aie::vector<float, 64> xp = {{ p }}_gather8<float, {{ CH }}>(px);
+        const aie::vector<float, 64> xp = al::gather<8, 8>(px, {{ CH }});
 {% endif %}
         const aie::vector<bfloat16, 64> xw = aie::mul(aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>(),
                                                       aie::load_v<8>(p1).template grow_replicate<64>()).template to_vector<bfloat16>();

@@ -140,7 +140,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **R6 Per-lane scales of small sub-blocks**: `broadcast_elem_128` + two 8x8 transposes instead of zips (II 44 -> 29),
   scales kept in the MMUL's lane order, fission of a spilling dequant (750 -> 590 cycles per 64 rows).
 - **R7 Port-bound loops** (shuffles and panel pushes share `L_RM_PORT`): broadcast + transpose expansions, 128-bit
-  repeats by `grow_replicate` (not `concat` chains: a `vshift` each), transposes of bytes before the arithmetic (II
+  repeats by `grow_replicate` (not `concat` chains: a `vshift` each), vectors from 128-bit pieces by `al::concat` /
+  `al::gather` (not `aie::concat` / `insert`), transposes of bytes before the arithmetic (II
   46 -> 40; a Q4_K header 2246 -> 920 cycles).
 - **R8 Pointer walks instead of index math** (`add_3d_ptr` walks: II 46 -> 30, alu 0) and small scalar gathers
   unrolled to constant offsets (4660 -> 281 cycles).

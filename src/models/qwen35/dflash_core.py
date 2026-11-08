@@ -92,19 +92,13 @@ namespace {
 // The 8 slots' coefficients of group g of a tap (dyn [slot 8][192]: row r) -> 64 lanes, [slot][8]
 [[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_slots(const bfloat16 *__restrict dyn, int r)
 {
-    aie::vector<bfloat16, 64> v;
-{% for s in range(8) %}
-    v.insert({{ s }}, aie::broadcast<bfloat16, 8>(dyn[{{ DYN_ROWS * s }} + r]));
-{% endfor %}
-    return v;
+    return al::concat({% for s in range(8) %}aie::broadcast<bfloat16, 8>(dyn[{{ DYN_ROWS * s }} + r]){{ ", " if not loop.last }}{% endfor %});
 }
 
 // 8 values -> 64 lanes, [slot][8]
 [[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_rep(aie::vector<bfloat16, 8> b)
 {
-    const aie::vector<bfloat16, 16> a = aie::concat(b, b);
-    const aie::vector<bfloat16, 32> c = aie::concat(a, a);
-    return aie::concat(c, c);
+    return b.grow_replicate<64>();
 }
 
 // [slot][8] -> each slot's row its predecessor's, slot 0 zeros

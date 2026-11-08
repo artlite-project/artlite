@@ -332,9 +332,10 @@ void {{ p }}_pack(const bfloat16 *__restrict acc, bfloat16 *c, int32_t pass)
         bfloat16 *row = c + t * {{ n_c }};
         // (own columns 32 j.. : 8-column items of the token's sub-block row; zeros past the MAC tile)
 {% for j in range(nv) %}
-        const aie::vector<bfloat16, 32> o{{ j }} = aie::concat({% for i in range(4) %}{{ "aie::load_v<8>(s + %d)" % (64 * (4 * j + i)) if 4 * j + i < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+        const aie::vector<bfloat16, 32> o{{ j }} = al::concat({% for i in range(4) %}{{ "aie::load_v<8>(s + %d)" % (64 * (4 * j + i)) if 4 * j + i < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
 {% endfor %}
-        // (the carry, loaded before the stores overwrite where it was)
+        // (the carry, loaded before the stores overwrite where it was; aie::concat's shift chain, not al::gather: the
+        // carry's loads follow the previous token's stores into c, and the shuffle tree lengthens that recurrence)
         const aie::vector<bfloat16, 32> k = aie::vector<bfloat16, 32>(::shift_bytes(aie::concat({% for i in range(4) %}aie::load_v<8>(row + ks + {{ 8 * i }}){{ ", " if not loop.last }}{% endfor %}), z, kb));
 {% for j in range(nv) %}
 {% if j == 0 %}
@@ -388,8 +389,8 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
             const bfloat16 *__restrict s1 = a1 + rb * {{ 8 * n }} + rr * 8;
 {% if pack_plan.halves %}
 {% for sl in (0, 1) %}
-            const aie::vector<bfloat16, 32> h{{ sl }}0 = aie::concat({% for j in range(4) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
-            const aie::vector<bfloat16, 32> h{{ sl }}1 = aie::concat({% for j in range(4, 8) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+            const aie::vector<bfloat16, 32> h{{ sl }}0 = al::concat({% for j in range(4) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+            const aie::vector<bfloat16, 32> h{{ sl }}1 = al::concat({% for j in range(4, 8) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
 {% endfor %}
 {% endif %}
 {% for item in pack_plan.items %}

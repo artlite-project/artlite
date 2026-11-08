@@ -808,7 +808,7 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
     for (int i = 0; i < 8; i += 2) {  // (two chunks of 8 values: chunk c = (head, k block) S + slot)
         aie::vector<float, 16> yv, il;
 {% if not GATE_MAIN %}
-        aie::vector<bfloat16, 16> g;
+        aie::vector<bfloat16, 8> gk[2];
 {% endif %}
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
@@ -817,14 +817,14 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
             yv.insert(k, aie::load_v<8>(AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + 32 * db + 8 * q));
             il.insert(k, aie::broadcast<float, 8>(AW(float, {{ a.ml }})[64 * set + 32 + 8 * q]));
 {% if not GATE_MAIN %}
-            g.insert(k, aie::load_v<8>(AP(bfloat16, {{ A_GS }}) + {{ HD }} * row + 8 * db));
+            gk[k] = aie::load_v<8>(AP(bfloat16, {{ A_GS }}) + {{ HD }} * row + 8 * db);
 {% endif %}
         }
 {% if GATE_MAIN %}
         aie::store_v((float *)r + 8 * i, al::mulff<16>(yv, il));  // (fp32: the main core multiplies by the gates)
 {% else %}
         // (g bf16: mulff's products less g's lo part, 0)
-        aie::store_v(r + 8 * i, al::mulc<16>(al::mulff<16>(yv, il), g).template to_vector<bfloat16>());
+        aie::store_v(r + 8 * i, al::mulc<16>(al::mulff<16>(yv, il), al::concat(gk[0], gk[1])).template to_vector<bfloat16>());
 {% endif %}
     }
 }
@@ -1474,12 +1474,13 @@ __attribute__((minsize)) void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloa
     const int S = st[{{ MG_S }}], QR = st[{{ MG_QR }}];
     AIE_LOOP_NO_UNROLL
     for (int i = 0; i < 8; i += 2) {
-        aie::vector<bfloat16, 16> g;
+        aie::vector<bfloat16, 8> gk[2];
         AIE_LOOP_UNROLL_FULL
         for (int k = 0; k < 2; k++) {
             const int c = 8 * e + i + k, hk = {{ p }}_divs(c, S), s = c - S * hk;
-            g.insert(k, aie::load_v<8>(gt + {{ HD }} * (QR * s + (hk >> 5)) + 8 * (hk & 31)));
+            gk[k] = aie::load_v<8>(gt + {{ HD }} * (QR * s + (hk >> 5)) + 8 * (hk & 31));
         }
+        const aie::vector<bfloat16, 16> g = al::concat(gk[0], gk[1]);
         // (g bf16: mulff's products less g's lo part, 0)
         aie::store_v(o + 8 * i, al::mulc<16>(aie::load_v<16>((const float *)r + 8 * i), g).template to_vector<bfloat16>());
     }
@@ -1556,10 +1557,7 @@ void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloat16 *__restrict o, int32_
     }
     aie::set_rounding(aie::rounding_mode::conv_even);
     const bfloat16 *__restrict g = gt + {{ 8 * HD }} * (e >> 5) + 8 * (e & 31);
-    aie::vector<bfloat16, 64> gv;
-{% for s in range(8) %}
-    gv.insert({{ s }}, aie::load_v<8>(g + {{ HD * s }}));
-{% endfor %}
+    const aie::vector<bfloat16, 64> gv = al::gather<8, 8>(g, {{ HD }});
     // (g bf16: mulff's products less g's lo part, 0)
     aie::store_v(o, al::mulc<64>(aie::load_v<64>((const float *)r), gv).template to_vector<bfloat16>());
 }

@@ -164,13 +164,7 @@ inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_rep(cons
 
 // 8 per-token values -> 64 lanes [token][8 ch]
 inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(const bfloat16 *v) {
-  aie::vector<bfloat16, 8> x = aie::load_v<8>(v);
-  const auto z1 = aie::interleave_zip(x, x, 1);
-  const aie::vector<bfloat16, 16> x16 = aie::concat(z1.first, z1.second);
-  const auto z2 = aie::interleave_zip(x16, x16, 1);
-  const aie::vector<bfloat16, 32> x32 = aie::concat(z2.first, z2.second);
-  const auto z3 = aie::interleave_zip(x32, x32, 1);
-  return aie::concat(z3.first, z3.second);
+  return al::expand8(aie::load_v<8>(v));
 }
 }  // namespace
 
@@ -540,8 +534,8 @@ static inline __attribute__((always_inline)) void {{ p }}_split_st(aie::vector<f
   aie::vector<bfloat16, 16> sh, sl, th, tl;
   al::split2<16>(sv, sh, sl);
   al::split2<16>(tv, th, tl);
-  aie::store_v(cf, aie::concat(sh.extract<8>(0), sl.extract<8>(0)));
-  aie::store_v(cf + 16, aie::concat(th.extract<8>(0), tl.extract<8>(0)));
+  aie::store_v(cf, al::concat(sh.extract<8>(0), sl.extract<8>(0)));
+  aie::store_v(cf + 16, al::concat(th.extract<8>(0), tl.extract<8>(0)));
 }
 
 // GroupNorm coefficients of n16 x 16 channels (s = gamma rstd, t = beta - mean s): mr = mean [16] | rstd [16] of the
@@ -568,10 +562,10 @@ static __attribute__((noinline)) void {{ p }}_gnc16(const float *__restrict gb, 
     aie::vector<bfloat16, 16> sh, sl, th, tl;
     al::split2<16>(sv, sh, sl);
     al::split2<16>(tv, th, tl);
-    aie::store_v(coef, aie::concat(sh.extract<8>(0), sl.extract<8>(0)));
-    aie::store_v(coef + 16, aie::concat(th.extract<8>(0), tl.extract<8>(0)));
-    aie::store_v(coef + 32, aie::concat(sh.extract<8>(1), sl.extract<8>(1)));
-    aie::store_v(coef + 48, aie::concat(th.extract<8>(1), tl.extract<8>(1)));
+    aie::store_v(coef, al::concat(sh.extract<8>(0), sl.extract<8>(0)));
+    aie::store_v(coef + 16, al::concat(th.extract<8>(0), tl.extract<8>(0)));
+    aie::store_v(coef + 32, al::concat(sh.extract<8>(1), sl.extract<8>(1)));
+    aie::store_v(coef + 48, al::concat(th.extract<8>(1), tl.extract<8>(1)));
     gb += 32;
     coef += 64;
   }
@@ -623,8 +617,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__res
     al::split2<16>(bb, bh, bl);
     for (int h = 0; h < 2; h++) {
       bfloat16 *o = tokc + 32 * (k / 8 + h);
-      aie::store_v(o, aie::concat(ah.extract<8>(h), al_.extract<8>(h)));
-      aie::store_v(o + 16, aie::concat(bh.extract<8>(h), bl.extract<8>(h)));
+      aie::store_v(o, al::concat(ah.extract<8>(h), al_.extract<8>(h)));
+      aie::store_v(o + 16, al::concat(bh.extract<8>(h), bl.extract<8>(h)));
     }
   }
 }
@@ -815,8 +809,8 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *_
     aie::vector<bfloat16, 16> v = aie::accum<accfloat, 16>(aie::load_v<16>(ps)).template to_vector<bfloat16>();
     for (int kp = 1; kp < nkp; kp++)
       v = aie::max(v, aie::accum<accfloat, 16>(aie::load_v<16>(ps + 64 * kp)).template to_vector<bfloat16>());
-    const aie::vector<bfloat16, 16> rmb = aie::concat(aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(0))),
-                                                      aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(1))));
+    const aie::vector<bfloat16, 16> rmb = al::concat(aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(0))),
+                                                     aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(1))));
     const aie::vector<float, 16> rm = aie::accum<accfloat, 16>(rmb).template to_vector<float>();
     const aie::vector<float, 16> mn0 = aie::sub(aie::broadcast<float, 16>(192.0f), rm);
     if (first) {

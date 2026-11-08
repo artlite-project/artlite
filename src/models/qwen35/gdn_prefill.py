@@ -1209,9 +1209,7 @@ void {{ p }}_chunk(const bfloat16 *__restrict b, const bfloat16 *__restrict v, f
     AIE_LOOP_NO_UNROLL
     for (int b = 0; b < 8; b++) {
         const bfloat16 *__restrict py = ys + 256 * (b & 1) + 8 * (b >> 1);
-        const aie::vector<bfloat16, 64> x = aie::concat(
-            aie::concat(aie::concat(aie::load_v<8>(py), aie::load_v<8>(py + 32)), aie::concat(aie::load_v<8>(py + 64), aie::load_v<8>(py + 96))),
-            aie::concat(aie::concat(aie::load_v<8>(py + 128), aie::load_v<8>(py + 160)), aie::concat(aie::load_v<8>(py + 192), aie::load_v<8>(py + 224))));
+        const aie::vector<bfloat16, 64> x = al::gather<8, 8>(py, 32);
         aie::store_v(vt + 64 * b, aie::transpose(x, 8, 8));
     }
 {% if "chunk" not in ablate %}

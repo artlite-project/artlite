@@ -257,14 +257,10 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
     }
 }
 
-// The V panel of d-block db of 8 tokens' rows (bf16): per dim of the 8 a block over the positions (the rows' inserts
-// unrolled: a rolled r makes insert(r, ..) a switch, ~26K cycles per record; unrolled II 14, 478)
+// The V panel of d-block db of 8 tokens' rows (bf16): per dim of the 8 a block over the positions
 [[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
 {
-    aie::vector<bfloat16, 64> pd;  // [position][dim]
-    AIE_LOOP_UNROLL_FULL
-    for (int r = 0; r < 8; r++)
-        pd.insert(r, aie::load_v<8>(v + {{ HD }} * r + 8 * db));
+    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
     return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
 }
 
@@ -501,8 +497,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
     const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
     const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
-    for (int db = 0; db < {{ ND }}; db++)
-        aie::store_v(o + 64 * db, al::mulff<64>(aie::load_v<64>(o + 64 * db), a));
+    al::scale<{{ ND }}>(o, o, a);
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
     aie::store_v(pm, mn);
 }
@@ -971,10 +966,7 @@ void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h,
     const float *__restrict o = AW(float, {{ w.o }}) + 2048 * h;
     al::BOut<> po((bfp16ebs8 *)out);
     for (int db = 0; db < {{ ND }}; db++) {
-        aie::vector<bfloat16, 64> gv;
-        AIE_LOOP_UNROLL_FULL
-        for (int q = 0; q < 8; q++)
-            gv.insert(q, aie::load_v<8>(g + {{ 144 if TWO else 72 }} * db + 8 * q));
+        const aie::vector<bfloat16, 64> gv = al::gather<8, 8>(g + {{ 144 if TWO else 72 }} * db, 8);
         const aie::vector<float, 64> y = al::mulff<64>(aie::load_v<64>(o + 64 * db), iv);
         po.push(al::mulc<64>(y, gv).template to_vector<bfp16ebs8>());
     }

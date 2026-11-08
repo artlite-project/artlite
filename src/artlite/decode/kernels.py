@@ -130,7 +130,7 @@ template <int SP, typename T>
 template <typename T>
 [[clang::always_inline]] inline aie::vector<bfloat16, 32> {{ p }}_kbr(const T *x)
 {
-    return aie::concat(aie::load_v<8>(x), aie::load_v<8>(x + 8), aie::load_v<8>(x + 16), aie::load_v<8>(x + 24));
+    return al::gather<4, 8>(x, 8);
 }
 
 {% if SLOTS == 8 %}
@@ -957,7 +957,7 @@ __attribute__((minsize)) void {{ p }}_nbegin(const uint8_t *__restrict a, int32_
         AIE_LOOP_NO_UNROLL
         for (int g = 0; g < 4; g++) {
             const aie::vector<bfloat16, 8> h8 = aie::load_v<8>(w + 8 * g), l8 = aie::load_v<8>(w + 32 + 8 * g);
-            const aie::vector<bfloat16, 32> wh = aie::concat(h8, h8, h8, h8), wl = aie::concat(l8, l8, l8, l8);
+            const aie::vector<bfloat16, 32> wh = h8.template grow_replicate<32>(), wl = l8.template grow_replicate<32>();
             const aie::accum<accfloat, 32> c = aie::mac(aie::mac(aie::mul(ih, wh), ih, wl), il, wh);  // (1 / rms w)
             const aie::vector<bfloat16, 32> ch = c.template to_vector<bfloat16>();
             const aie::vector<bfloat16, 32> cl = aie::msc(c, ch, one).template to_vector<bfloat16>();

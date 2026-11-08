@@ -118,10 +118,7 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
 // The V panel of d-block db of 8 tokens' rows: per dim of the 8 a block over the positions
 [[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
 {
-    aie::vector<bfloat16, 64> pd;  // [position][dim]
-    AIE_LOOP_UNROLL_FULL
-    for (int r = 0; r < 8; r++)
-        pd.insert(r, aie::load_v<8>(v + {{ HD }} * r + 8 * db));
+    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
     return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
 }
 

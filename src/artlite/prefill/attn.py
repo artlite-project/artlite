@@ -311,10 +311,7 @@ void {{ p }}_v(const bfloat16 *__restrict v, bfloat16 *__restrict out, int32_t r
     al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }} * r));
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int db = 0; db < {{ ND }}; db++) {
-        aie::vector<bfloat16, 64> pd;  // [position][dim]
-        AIE_LOOP_UNROLL_FULL
-        for (int t = 0; t < 8; t++)
-            pd.insert(t, aie::load_v<8>(v + {{ HD }} * t + 8 * db));
+        const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
         o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
     }
 }
