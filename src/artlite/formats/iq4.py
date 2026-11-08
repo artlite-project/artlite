@@ -138,28 +138,31 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
     const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
     const v64int8 eight = broadcast_to_v64int8(8);
-    AIE_LOOP_NO_UNROLL
-    for (int t = t0; t < t0 + {{ n_mac // 16 }}; t++) {
-        const v64uint8 __aie_dm_resource_a *__restrict pc = (const v64uint8 __aie_dm_resource_a *)(b + {{ UP }} * t + 512 * kt);
+    // one loop over (tile t, k-step ks): the codes by 64 B, the next tile a unit on; the scales of group 2 kt + ks / 4
+    const v64uint8 __aie_dm_resource_a *__restrict pc = (const v64uint8 __aie_dm_resource_a *)(b + {{ UP }} * t0 + 512 * kt);
+    dims_2d_t wc = dims_2d_from_steps(8, 1, {{ UP // 64 }});
 {% if fmt == "IQ4_NL" %}
-        const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)(b + {{ UP }} * t + 2048 + 64 * kt);
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)(b + {{ UP }} * t0 + 2048 + 64 * kt);
+    dims_3d_t wsc = dims_3d_from_steps(4, 0, 2, 16, {{ UP // 2 }});
 {% else %}
-        const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)ws + {{ 2 * n }} * kt + 16 * t;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)ws + {{ 2 * n }} * kt + 16 * t0;
+    dims_3d_t wsc = dims_3d_from_steps(4, 0, 2, {{ n }}, 16);
 {% endif %}
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int ks = 0; ks < 8; ks++) {  // (group 2 kt + ks / 4: its scales)
-            aie::vector<bfloat16, 64> S0, S1;
-            al::expand16_bc(aie::load_v<16>(ps + (ks >> 2) * {{ 16 if fmt == "IQ4_NL" else n }}), S0, S1);
-            const v64acc32 q = mul_elem_64_2(*pc++, eight);  // (8 b: [r 16][4 B])
-            const v16int32 e0 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 0), b16));
-            const v16int32 e1 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 1), b16));
-            const v16int32 e2 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 2), b16));
-            const v16int32 e3 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 3), b16));
-            out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e0), aie::vector<bfloat16, 32>((v32bfloat16)e1)), S0)
-                         .template to_vector<bfp16ebs8>());
-            out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e2), aie::vector<bfloat16, 32>((v32bfloat16)e3)), S1)
-                         .template to_vector<bfp16ebs8>());
-        }
+    AIE_TRY_INITIATION_INTERVAL(18)  // (post-RA II 21, bound 18: the gathers' DM_ADA; nested per tile: II 28 + a ramp per tile)
+    for (int it = 0; it < {{ n_mac // 2 }}; it++) {
+        aie::vector<bfloat16, 64> S0, S1;
+        al::expand16_bc(aie::load_v<16>(ps), S0, S1);
+        const v64acc32 q = mul_elem_64_2(*pc, eight);  // (8 b: [r 16][4 B])
+        const v16int32 e0 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 0), b16));
+        const v16int32 e1 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 1), b16));
+        const v16int32 e2 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 2), b16));
+        const v16int32 e3 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 3), b16));
+        out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e0), aie::vector<bfloat16, 32>((v32bfloat16)e1)), S0)
+                     .template to_vector<bfp16ebs8>());
+        out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e2), aie::vector<bfloat16, 32>((v32bfloat16)e3)), S1)
+                     .template to_vector<bfp16ebs8>());
+        pc = add_2d_ptr(pc, wc);
+        ps = add_3d_ptr(ps, wsc);
     }
 {% if "ev_dq" in ablate %}
     event1();
