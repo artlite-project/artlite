@@ -161,49 +161,17 @@ __attribute__((noinline)) void {{ p }}_iq3s(uint8_t *__restrict a, const uint8_t
 _GEMM = r"""// IQ3_S (GemmQd, super-block units: formats/iq3s.py): the weight object is a unit of the pass's {{ tiles }} tiles
 // ({{ UP }} B each: [A: index records [i][h][l' 2] of 48 B (rows' low bytes [r][2], at 40 the 9th bits' masks) | B: sign
 // records [i][l 4] of 24 B (rows' bytes, at 20 a slot of C: the rows' scale bytes, then d)]). Its rows compacted: MMUL row
-// q is tile q / {{ R }}'s row q % {{ R }} ({{ n }} rows; past the tiles d = 0, so w = 0). Per unit _sb: C's slots, d, the
-// scales S = bf16((1 + 2 sc) d) [i][q] and the signs [i][16-row block][l][16]; per k-tile _dq (its first call of a
-// k-tile: _prep, the k-tile's 8 index lists compacted: low bytes, 9th bits as bytes) the panels' codes (_iq3sg: per panel
-// the gather offsets on the MMUL, 4 gathers of the nibble grid, unpacked, the signs as 64 +- g by vaddsub), then the panels
-// (_iq3s).
-// Scratch (ws, bytes): S [i 8][{{ n }}] bf16 | signs [i 8][{{ n // 16 }}][64] | at {{ WL }} the index lists' low bytes [ks
-// 8][{{ LS }} B], then their 9th bits [ks 8][{{ LS }} B] (_sb's, before a unit's k-tiles: C's slots [tile][32 words], then the
-// scale words [{{ n }}]); hb: d [{{ n }}] bf16; wc: a dq call's codes [{{ n_mac // 16 }} blocks][ks 8][rh 2][64]
+// q is tile q / {{ R }}'s row q % {{ R }} ({{ n }} rows; past the tiles d = 0, so w = 0). Per unit _sb: C's slots straight to the
+// compacted rows' scale words and d, the scales S = bf16((1 + 2 sc) d) [i][q]; per k-tile _dq (its first call of a k-tile:
+// _prep, the k-tile's 8 index lists compacted, low bytes and 9th bits as bytes; _sbg, its records' signs compacted) the
+// panels' codes (_iq3sg: per 4 panels the gather offsets on the MMUL, 4 gathers per panel of the nibble grid, unpacked, the
+// signs as 64 +- g by vaddsub), then the panels (_iq3s). The compactions' windows have constant blocks and shifts: the
+// weight object and the scratch are 64-byte aligned (pinned).
+// Scratch (ws, bytes): S [i 8][{{ n }}] bf16 | the k-tile's signs [ks 8][{{ n }}] | at {{ WL }} the index lists' low bytes [ks
+// 8][{{ LS }} B], then their 9th bits [ks 8][{{ LS }} B] (_sb's, before a unit's k-tiles: the scale words [{{ n }}]); hb: d [{{ n }}]
+// bf16; wc: a dq call's codes [{{ n_mac // 16 }} blocks][ks 8][rh 2][64]
 
 {% include "mmv/g16" %}
-{# Compaction (MMUL row q: tile q / R's row q % R): tile t's rows of e bytes each from src + t pitch (IQ3_XXS's) #}
-{% macro windows(src, e, pitch, x="") -%}
-{% for t in range(tiles) %}
-        const uintptr_t {{ x }}o{{ t }} = (uintptr_t)({{ src }} + {{ t * pitch - e * R * t }});
-        const v16int32 *{{ x }}a{{ t }} = (const v16int32 *)({{ x }}o{{ t }} & ~(uintptr_t)63);
-        const unsigned {{ x }}s{{ t }} = (unsigned)({{ x }}o{{ t }} & 63);
-{% endfor %}
-{%- endmacro %}
-
-{# v = rows q0 .. q0 + nq - 1 (64 bytes from e q0 on; zero: rows past the tiles 0, else junk) #}
-{% macro build(e, q0, nq, zero=False, x="", v="v") -%}
-{% set c = e * q0 // 64 %}
-{% if zero %}
-            aie::vector<int8, 64> {{ v }} = aie::zeros<int8, 64>();
-{% endif %}
-{% for t, lo, hi in seg(q0, q0 + nq) %}
-{% set w = "(v64int8)shift_bytes(%sa%d[%d], %sa%d[%d], %ss%d)" % (x, t, c, x, t, c + 1, x, t) %}
-{% if loop.first and not zero %}
-            aie::vector<int8, 64> {{ v }}({{ w }});
-{% else %}
-            {{ v }} = aie::select({{ v }}, aie::vector<int8, 64>({{ w }}),
-                            aie::mask<64>::from_uint64({{ "0x%016Xull" % mask(e * (lo - q0), e * (hi - q0) if zero else 64) }}));
-{% endif %}
-{% endfor %}
-{%- endmacro %}
-
-{% macro rows(dst, e, q0, nq, zero=False) -%}
-        {   // (rows {{ q0 }} .. {{ q0 + nq - 1 }})
-{{ build(e, q0, nq, zero) }}
-            aie::store_v((int8_t *)({{ dst }}), v{{ ".template extract<32>(0)" if e * nq == 32 else "" }});
-        }
-{%- endmacro %}
-
 // S [i][q] = bf16((1 + 2 sc) d) of the compacted rows from their scale words (scw [q]: nibble i = sc of group i) and d (dc
 // [q]): per 16 rows the nibbles [r][i] as bf16(128 + 1 + 2 sc) by their bits, minus 128, times d, per 8 rows a transpose
 __attribute__((noinline)) void {{ p }}_sbs(const uint8_t *__restrict scw, const bfloat16 *__restrict dc, bfloat16 *__restrict S)
@@ -231,54 +199,56 @@ __attribute__((noinline)) void {{ p }}_sbs(const uint8_t *__restrict scw, const 
     }
 }
 
-// The signs of the compacted rows: per record (i, l) of B its rows' bytes (e = 1) -> pm [i][16-row block][l][16]
-__attribute__((noinline)) void {{ p }}_sbg(const uint8_t *__restrict b, uint8_t *__restrict pm)
+// The signs of k-tile kt's compacted rows: per record (i, l) of B (8 kt ..) its rows' bytes -> pm [ks 8][{{ n }}] (ks = 4 i'
+// + l); every window (tile t's rows of record 8 kt + r at 24 r + UP t - R t from the k-tile's 64-byte aligned 192 B of
+// records) has a constant block and shift
+__attribute__((noinline)) void {{ p }}_sbg(const uint8_t *__restrict b, uint8_t *__restrict pm, int kt)
 {
-    AIE_LOOP_NO_UNROLL
-    for (int il = 0; il < 32; il++) {
-        const uint8_t *bs = b + 1536 + 24 * il;
-        uint8_t *po = pm + {{ 4 * n }} * (il >> 2) + 16 * (il & 3);
-{{ windows("bs", 1, UP) }}
+    const v16int32 *__restrict pb = (const v16int32 *)(b + 1536 + 192 * kt);
+    uint8_t *__restrict po = pm;
+    {
+{% for r8 in range(8) %}
 {% for q0 in range(0, n, 64) %}
-        {
-{{ build(1, q0, [64, n - q0] | min) }}
-{% for j in range(([64, n - q0] | min) // 16) %}
-            aie::store_v((int8_t *)(po + {{ 4 * q0 + 64 * j }}), v.template extract<16>({{ j }}));
+{% set nq = [64, n - q0] | min %}
+        {   // (record 8 j + {{ r8 }}, rows {{ q0 }} .. {{ q0 + nq - 1 }})
+{% for t, lo, hi in seg(q0, q0 + nq) %}
+{% set K = 24 * r8 + (UP - R) * t + q0 %}
+{% set w = "(v64int8)shift_bytes(pb[%d], pb[%d], %d)" % (K // 64, K // 64 + 1, K % 64) if K % 64 else "(v64int8)pb[%d]" % (K // 64) %}
+{% if loop.first %}
+            aie::vector<int8, 64> v({{ w }});
+{% else %}
+            v = aie::select(v, aie::vector<int8, 64>({{ w }}), aie::mask<64>::from_uint64({{ "0x%016Xull" % mask(lo - q0, 64) }}));
+{% endif %}
 {% endfor %}
+            aie::store_v((int8_t *)(po + {{ n * r8 + q0 }}), v{{ ".template extract<32>(0)" if nq == 32 else "" }});
         }
+{% endfor %}
 {% endfor %}
     }
 }
 
-// One unit's C slots (B + 24 n + 20 of every tile) -> st [tile][32 words]; d of the compacted rows (slots R ..) -> dc;
-// their scale words (slots 0 .. R - 1) -> scw; then S and the signs
+// One unit's C slots (B + 24 k + 20 of tile t: slot k < R row k's scale bytes, slot R + s rows 2 s, 2 s + 1's d) straight
+// to the compacted rows' scale words (scw [q], q = R t + k) and d (dc [q] bf16), rows past the tiles d = 0; then S
 __attribute__((noinline)) void {{ p }}_sbp(const uint8_t *__restrict b, uint8_t *__restrict ws, bfloat16 *__restrict dc)
 {
-    int32_t *__restrict st = (int32_t *)(ws + {{ WU }});
-    AIE_LOOP_NO_UNROLL
-    for (int t = 0; t < {{ tiles }}; t++) {
-        const int32_t *__restrict pc = (const int32_t *)(b + {{ UP }} * t + 1556);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int k = 0; k < 32; k++)
-            st[32 * t + k] = pc[6 * k];
-    }
-    uint8_t *scw = ws + {{ WU + 128 * tiles }};
-    {
-        const uint8_t *sd = ws + {{ WU + 4 * R }};
-{{ windows("sd", 2, 128) }}
-{% for c in range(0, n, 32) %}
-{{ rows("dc + %d" % c, 2, c, [32, n - c] | min, zero=True) }}
+    int32_t *__restrict scw = (int32_t *)(ws + {{ WU }});
+    int32_t *__restrict dw = (int32_t *)dc;
+{% if R * tiles < n %}
+    for (int c = {{ (R * tiles) // 32 * 32 }}; c < {{ n }}; c += 32)
+        aie::store_v(dc + c, aie::zeros<bfloat16, 32>());
+{% endif %}
+{% for t in range(tiles) %}
+{% for k in range(R + R // 2) %}
+{% if R * t + k < n or k >= R %}
+{% if k < R %}
+    scw[{{ R * t + k }}] = *(const int32_t *)(b + {{ UP * t + 1556 + 24 * k }});
+{% elif R * t + 2 * (k - R) < n %}
+    dw[{{ (R * t) // 2 + k - R }}] = *(const int32_t *)(b + {{ UP * t + 1556 + 24 * k }});
+{% endif %}
+{% endif %}
 {% endfor %}
-    }
-    {
-        const uint8_t *sw = ws + {{ WU }};
-{{ windows("sw", 4, 128) }}
-{% for B in range(n // 16) %}
-{{ rows("scw + %d" % (64 * B), 4, 16 * B, 16) }}
 {% endfor %}
-    }
-    {{ p }}_sbs(scw, dc, (bfloat16 *)ws);
-    {{ p }}_sbg(b, ws + {{ 16 * n }});
+    {{ p }}_sbs((const uint8_t *)scw, dc, (bfloat16 *)ws);
 }
 
 void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
@@ -290,46 +260,69 @@ void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *
 }
 
 // k-tile kt's 8 index lists (ks = 4 i' + 2 h + l': record 8 kt + ks, tile t's 40 bytes [r][2] at its start) of the compacted
-// rows: their low bytes (lo, [ks][LS]) and their 9th bits as bytes 0 / 128 (hb, [ks][LS]: per tile its record's masks as
-// bytes, then compacted in registers); 4 lists per iteration, so that every window (tile t's rows of list ks at 48 ks +
-// UP t - 40 t from the k-tile's 64-byte aligned records) has a constant block and shift
-__attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t *__restrict ws, int kt)
+// rows: their low bytes (lo, [ks][LS]; _prepl) and their 9th bits as bytes 0 / 128 (hb, [ks][LS]; _preph: per tile its
+// record's masks as bytes, compacted in registers); 4 lists per iteration, so that every window (tile t's rows of list ks
+// at 48 ks + UP t - 40 t from the k-tile's 64-byte aligned records) has a constant block and shift
+__attribute__((noinline)) void {{ p }}_prepl(const uint8_t *__restrict b, uint8_t *__restrict pl)
 {
-    const v64uint8 k128 = broadcast_to_v64uint8((unsigned char)128), z = broadcast_zero_to_v64uint8();
-    const v16int32 *__restrict pb = (const v16int32 *)(b + 384 * kt);
-    uint8_t *__restrict pl = ws + {{ WL }};
+    const v16int32 *__restrict pb = (const v16int32 *)b;
     AIE_LOOP_NO_UNROLL
     for (int j = 0; j < 2; j++) {
 {% for k4 in range(4) %}
-        {   // (list 4 j + {{ k4 }})
-{% for t in range(tiles) %}
-            const v64uint8 h{{ t }} = ::sel(z, k128, *(const uint64_t *)((const uint8_t *)pb + {{ 48 * k4 + UP * t + 40 }}));
-{% endfor %}
 {% for c in range(0, n, 32) %}
 {% set nq = [32, n - c] | min %}
-            {   // (rows {{ c }} .. {{ c + nq - 1 }})
+        {   // (list 4 j + {{ k4 }}, rows {{ c }} .. {{ c + nq - 1 }})
 {% for t, lo, hi in seg(c, c + nq) %}
 {% set K = 48 * k4 + UP * t - 40 * t + 2 * c %}
 {% set lw = "(v64int8)shift_bytes(pb[%d], pb[%d], %d)" % (K // 64, K // 64 + 1, K % 64) if K % 64 else "(v64int8)pb[%d]" % (K // 64) %}
-{% set d = 2 * c - 40 * t %}
-{% set hw = ("(v64int8)shift_bytes(h%d, z, %d)" % (t, d) if d > 0 else "(v64int8)h%d" % t) if d >= 0 else "(v64int8)shift_bytes(z, h%d, %d)" % (t, 64 + d) %}
 {% if loop.first %}
-                aie::vector<int8, 64> v({{ lw }}), w({{ hw }});
+            aie::vector<int8, 64> v({{ lw }});
 {% else %}
-{% set mk = "aie::mask<64>::from_uint64(0x%016Xull)" % mask(2 * (lo - c), 64) %}
-                v = aie::select(v, aie::vector<int8, 64>({{ lw }}), {{ mk }});
-                w = aie::select(w, aie::vector<int8, 64>({{ hw }}), {{ mk }});
+            v = aie::select(v, aie::vector<int8, 64>({{ lw }}), aie::mask<64>::from_uint64({{ "0x%016Xull" % mask(2 * (lo - c), 64) }}));
 {% endif %}
 {% endfor %}
-                aie::store_v((int8_t *)(pl + {{ k4 * LS + 2 * c }}), v);
-                aie::store_v((int8_t *)(pl + {{ (8 + k4) * LS + 2 * c }}), w);
-            }
-{% endfor %}
+            aie::store_v((int8_t *)(pl + {{ k4 * LS + 2 * c }}), v);
         }
+{% endfor %}
 {% endfor %}
         pb += 3;
         pl += {{ 4 * LS }};
     }
+}
+
+__attribute__((noinline)) void {{ p }}_preph(const uint8_t *__restrict b, uint8_t *__restrict ph)
+{
+    const v64uint8 k128 = broadcast_to_v64uint8((unsigned char)128), z = broadcast_zero_to_v64uint8();
+    const uint8_t *__restrict pb = b;
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < 2; j++) {
+{% for k4 in range(4) %}
+{% for c in range(0, n, 32) %}
+{% set nq = [32, n - c] | min %}
+        {   // (list 4 j + {{ k4 }}, rows {{ c }} .. {{ c + nq - 1 }})
+{% for t, lo, hi in seg(c, c + nq) %}
+{% set d = 2 * c - 40 * t %}
+            const v64uint8 h{{ t }} = ::sel(z, k128, *(const uint64_t *)(pb + {{ 48 * k4 + UP * t + 40 }}));
+{% set hw = ("(v64int8)shift_bytes(h%d, z, %d)" % (t, d) if d > 0 else "(v64int8)h%d" % t) if d >= 0 else "(v64int8)shift_bytes(z, h%d, %d)" % (t, 64 + d) %}
+{% if loop.first %}
+            aie::vector<int8, 64> w({{ hw }});
+{% else %}
+            w = aie::select(w, aie::vector<int8, 64>({{ hw }}), aie::mask<64>::from_uint64({{ "0x%016Xull" % mask(2 * (lo - c), 64) }}));
+{% endif %}
+{% endfor %}
+            aie::store_v((int8_t *)(ph + {{ k4 * LS + 2 * c }}), w);
+        }
+{% endfor %}
+{% endfor %}
+        pb += 192;
+        ph += {{ 4 * LS }};
+    }
+}
+
+__attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t *__restrict ws, int kt)
+{
+    {{ p }}_prepl(b + 384 * kt, ws + {{ WL }});
+    {{ p }}_preph(b + 384 * kt, ws + {{ WL + 8 * LS }});
 }
 
 // a panel's codes 64 +- g (a: its 16 entries' addresses, m: its signs): 4 gathers of the nibble grid, unpacked, 64 - g
@@ -340,34 +333,35 @@ __attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t
     return __builtin_aie2p_vaddsub8(broadcast_to_v64int8(64), (v64int8)u, m);
 }
 
-// The codes of a dq call's panels (u [16-row block][ks 8][rh 2][64]): per (block, list pair ks, ks + 1) the lists' 16 rows
-// (lo: low bytes, hb: 9th bits as 0 / 128) as the gather offsets 4 lo + 8 hb on the MMUL + the copies' bases, the signs
-// ([l 2][rh 2][8]: one 32-byte load), 4 panels
+// The codes of a dq call's panels (u [16-row block][ks 8][rh 2][64]): per (32 rows, list ks) the list's rows (lo: low bytes,
+// hb: 9th bits as 0 / 128) as the gather offsets 4 lo + 8 hb on the MMUL + the copies' bases, their signs (mk [ks][q]: one
+// 32-byte load), 4 panels (blocks 2 bp, 2 bp + 1, both halves)
 __attribute__((noinline)) void {{ p }}_iq3sg(const uint8_t *__restrict lo, const uint8_t *__restrict hb,
                                              const uint8_t *__restrict mk, const uint32_t *__restrict tab_ab,
                                              const uint32_t *__restrict tab_cd, uint8_t *__restrict u)
 {
     const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
     const v64int8 four = broadcast_to_v64int8(4), eight = broadcast_to_v64int8(8);
-    const v32uint8 __aie_dm_resource_a *__restrict pl = (const v32uint8 __aie_dm_resource_a *)lo;
-    const v32uint8 __aie_dm_resource_d *__restrict ph = (const v32uint8 __aie_dm_resource_d *)hb;
+    const v64uint8 __aie_dm_resource_a *__restrict pl = (const v64uint8 __aie_dm_resource_a *)lo;
+    const v64uint8 __aie_dm_resource_d *__restrict ph = (const v64uint8 __aie_dm_resource_d *)hb;
     const v8int32 __aie_dm_resource_b *__restrict pm = (const v8int32 __aie_dm_resource_b *)mk;
     v64int8 __aie_dm_resource_c *__restrict pu = (v64int8 __aie_dm_resource_c *)u;
-    // (lists: the pair by 2 lists, then the next block's 16 rows; signs: h by 32 B, i' by a group's, the next block 64 B)
-    dims_2d_t wl = dims_2d_from_steps(4, {{ 2 * LS // 32 }}, 1);
-    dims_2d_t wh = dims_2d_from_steps(4, {{ 2 * LS // 32 }}, 1);
-    dims_3d_t wm = dims_3d_from_steps(2, 1, 2, {{ 4 * n // 32 }}, 2);
-    AIE_TRY_INITIATION_INTERVAL(24)  // (post-RA II 31: qrs 24 = the gathers, unpacks and stores; pre-RA 37)
-    for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (16-row block, pair kp) = (it / 4, it % 4): lists 2 kp, 2 kp + 1
-        const v64acc32 q = mac_elem_64_2(concat(ph[0], ph[{{ LS // 32 }}]), eight, mul_elem_64_2(concat(pl[0], pl[{{ LS // 32 }}]), four));
+    // (lists: by a list, then the next 32 rows; signs: by a record, then the next 32 rows; panels: by a list's 2, then the
+    // next two blocks' 32)
+    dims_2d_t wl = dims_2d_from_steps(8, {{ LS // 64 }}, 1);
+    dims_2d_t wh = dims_2d_from_steps(8, {{ LS // 64 }}, 1);
+    dims_2d_t wm = dims_2d_from_steps(8, {{ n // 32 }}, 1);
+    dims_2d_t wu = dims_2d_from_steps(8, 2, 32);
+    for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (pre-RA II 31: qrs 24 = the gathers, unpacks and stores)  // (32 rows bp, list ks) = (it / 8, it % 8)
+        const v64acc32 q = mac_elem_64_2(*ph, eight, mul_elem_64_2(*pl, four));
         const v16int32 sv = set_v16int32(0, *pm);
 {% for j in range(4) %}
-        pu[{{ j }}] = {{ p }}_iq3su(add((v16int32)extract_v16acc32(q, {{ j }}), b16), ext_v2int32(sv, {{ j }}));
+        pu[{{ (j // 2) * 16 + j % 2 }}] = {{ p }}_iq3su(add((v16int32)extract_v16acc32(q, {{ j }}), b16), ext_v2int32(sv, {{ j }}));
 {% endfor %}
         pl = add_2d_ptr(pl, wl);
         ph = add_2d_ptr(ph, wh);
-        pm = add_3d_ptr(pm, wm);
-        pu += 4;
+        pm = add_2d_ptr(pm, wm);
+        pu = add_2d_ptr(pu, wu);
     }
 }
 
@@ -412,16 +406,18 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
     return;
 {% endif %}
 {% if halves > 1 %}
-    if (half == 0)
+    if (half == 0) {
         {{ p }}_prep(b, (uint8_t *)ws, kt);
+        {{ p }}_sbg(b, (uint8_t *)ws + {{ 16 * n }}, kt);
+    }
     const int r0 = {{ n_mac }} * half;  // (the half's first row)
 {% else %}
     {{ p }}_prep(b, (uint8_t *)ws, kt);
+    {{ p }}_sbg(b, (uint8_t *)ws + {{ 16 * n }}, kt);
     const int r0 = 0;
 {% endif %}
     uint8_t *wsb = (uint8_t *)ws;
-    {{ p }}_iq3sg(wsb + {{ WL }} + 2 * r0, wsb + {{ WL + 8 * LS }} + 2 * r0, wsb + {{ 16 * n }} + {{ 8 * n }} * kt + 4 * r0, tab_ab,
-                  tab_cd, wc);
+    {{ p }}_iq3sg(wsb + {{ WL }} + 2 * r0, wsb + {{ WL + 8 * LS }} + 2 * r0, wsb + {{ 16 * n }} + r0, tab_ab, tab_cd, wc);
     {{ p }}_iq3s(wc, ws + {{ 2 * n }} * kt + r0, stage);
 {% if "ev_dq" in ablate %}
     event1();
@@ -472,27 +468,29 @@ class Iq3sSlot(Slot):
 
     def pass_tiles(self, fmt: str, rows: int, tiles: int) -> bool:
         # (two weight objects of up to 7 units in the dequantizing core's L1: 32 KB, a gate / up pass of a whole SiLU
-        # group; MMUL columns <= 128)
-        return tiles <= 7
+        # group of 128 rows; MMUL columns <= 128, in whole 32-row blocks: the dequant's 4-panel iterations)
+        return tiles == 7 or tiles < 7 and -(-rows * tiles // 16) * 16 % 32 == 0
 
     def _ws(self, op: object) -> dict[str, int]:
         """Byte offsets in the prefill dequant's scratch (``gemm/IQ3_S``'s): WL the index lists' low bytes, then their 9th
-        bits (LS bytes each: whole 64-byte blocks of 32 rows), at WU = WL between k-tiles C's slots and the scale words
-        (``_sb``); its size."""
+        bits (LS bytes each: whole 64-byte blocks of 32 rows), at WU = WL between k-tiles the scale words (``_sb``); its
+        size."""
         LS = Iq3Slot.list_bytes(-(-op.n // 32) * 32)
-        WU = WL = 48 * op.n  # (_sb's scratch while no k-tile's lists are live)
-        return {"WU": WU, "WL": WL, "LS": LS, "size": WL + max(16 * LS, 128 * op.tiles + 4 * op.n)}
+        WU = WL = 24 * op.n  # (_sb's scratch while no k-tile's lists are live)
+        return {"WU": WU, "WL": WL, "LS": LS, "size": WL + max(16 * LS, 4 * op.n)}
 
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
-        # ws: S, the signs, the lists (``_ws``); hb: d; ex: a dq call's codes; the grid's two copies (in two 16 KB
+        # ws: S, a k-tile's signs, the lists (``_ws``); hb: d; ex: a dq call's codes; the grid's two copies (in two 16 KB
         # regions: ``gemm_qd``)
         return {"ws": (1, self._ws(op)["size"]), "hb": (1, max(2 * op.n, 64)), "ex": (1, 64 * op.nm),
                 "tab": (1, TAB_BYTES), "tabb": (1, TAB_BYTES)}
 
     def qd_kernels(self, op: object, kernel: object, *, B_l1_ty: object, ws_ty: object, hb_ty: object,
                    D_ty: object) -> DqKernels:
-        assert 16 < op.R <= 20 and op.n % 16 == 0 and op.nm % 16 == 0, (op.R, op.n)
-        # (_prep's constant windows: the weight objects 64-byte aligned, as the pinned planar layout places them)
+        # (_sbp: d pairs; _iq3sg: 32 rows per iteration)
+        assert 16 < op.R <= 20 and op.R % 2 == 0 and op.n % 32 == 0 and op.nm % 32 == 0, (op.R, op.n, op.nm)
+        # (the constant windows of _prep and _sbg: the weight objects and the scratch 64-byte aligned, as the dequantizing
+        # core's layouts place every buffer)
         assert op.unit_pitch % 64 == 0, op.unit_pitch
         tab_ty = np.ndarray[(TAB_BYTES // 4,), np.dtype[np.uint32]]
         ex_ty = np.ndarray[(64 * op.nm,), np.dtype[np.uint8]]
