@@ -202,7 +202,8 @@ class QwenOverlay(ModelOverlay):
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
                                       paged=paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16
                                                                                         or gu_win)),
-                                      slots=slots, bcast=slots == 8, gu_win=gu_win)
+                                      slots=slots, bcast=slots == 8, gu_win=gu_win,
+                                      pairs=not cfg.moe and any(b.pairs for r in img.regions for b in r.blocks))
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
         self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "4 slots, chunkwise")
         self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})

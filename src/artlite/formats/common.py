@@ -246,7 +246,7 @@ def collected_header(kernel: KernelFn, B_l1_ty: object, ws_ty: object, hb_ty: ob
 MMV_SLOTS = 4  # token slots of the decode GEMV's x panels (``decode.gemv``)
 # the decode GEMV's gather table: two copies per core half (main core, helper: addresses in their own data memory, in
 # two 16 KB regions each, in gaps the decode overlay's buffers leave), each at most TAB_BYTES (``Slot.mmv_table``)
-TAB: tuple[tuple[int, int], tuple[int, int]] = ((0x7B800, 0x7F780), (0x77400, 0x7F780))
+TAB: tuple[tuple[int, int], tuple[int, int]] = ((0x7B400, 0x7F780), (0x70800, 0x7F780))
 TAB_BYTES = 2048
 
 

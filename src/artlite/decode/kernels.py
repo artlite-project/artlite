@@ -622,6 +622,13 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
     }
 {% endif %}
 {% endif %}
+{% if pairs and not moe %}
+    if (fw & {{ B_PAIR }}) {  // (rows [hi, lo] of nv / 2 values, an F32 matrix's planes: their sums, fp32 as two bf16 slots each)
+        const aie::vector<float, 8> pv = aie::add(aie::filter_even(y, 1), aie::filter_odd(y, 1));
+        {{ p }}_put_bf16(WS(bfloat16, {{ w_.stg }}) + {{ 2 * C_LEN }} * s + n, pv.template cast_to<bfloat16>(), nv);
+        return nv;
+    }
+{% endif %}
 {% if post %}
     if (flags & {{ F_RESID + F_VOUT }}) {  // (a window of 32 floats at the 16-aligned base; F_VOUT: into pend)
         float *__restrict pr = WS(float, {{ w_.res }}) + ((flags & {{ F_VOUT }}) ? {{ w_.pend - w_.res }} / 4 : 0) + {{ RES_PITCH }} * s + (q & ~15);

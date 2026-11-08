@@ -54,11 +54,12 @@ class QwenDecodeOperator(DecodeOverlayOperator):
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
                  max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = OD.SLOTS,
-                 bcast: bool = False, gu_win: bool = False):
+                 bcast: bool = False, gu_win: bool = False, pairs: bool = False):
         """moe: (experts, experts per token) of an MoE model (``decode.design``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``decode.model.paged_formats``:
         a drafter's Q4_0 beside the model's three); slots: a step's token slots at most (4, 8); bcast: phase inputs on
-        one broadcast stream (``decode.design``); gu_win: gate / up tiles of other than 16 rows (``decode.design``)."""
+        one broadcast stream (``decode.design``); gu_win: gate / up tiles of other than 16 rows (``decode.design``);
+        pairs: a dense model's F32 alpha planes (``decode.design``)."""
         assert all(gemv.supported(f, 4, slots) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
         assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META and gdn.slots == slots)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
@@ -72,7 +73,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         self.R_LEN = attn.r_bytes // 2 if attn is not None else C_LEN
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
                          paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast, gu_win=gu_win,
-                         a_bcast=attn.a_bcast if attn is not None else ())
+                         a_bcast=attn.a_bcast if attn is not None else (), pairs=pairs)
 
     def _consts(self) -> dict[str, int]:
         return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}

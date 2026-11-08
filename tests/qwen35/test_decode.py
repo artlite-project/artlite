@@ -797,7 +797,7 @@ def interleave_bits(v: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B", "swift"])
 @pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "split4", "s7", "lazy8"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
@@ -844,7 +844,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode.startswith("split") and not ov.ash.one)
     top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
-                 "3.8-27B": (5.6e-2, 2.1e-2)}[size]
+                 "3.8-27B": (5.6e-2, 2.1e-2), "swift": (5.6e-2, 2.1e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
@@ -897,7 +897,32 @@ def test_moe_slice(first: int) -> None:
     assert checked >= n * len(layers) // 3
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy"])
+@pytest.mark.parametrize("first", [16, 48])
+def test_dense_slice(first: int) -> None:
+    """Swift 1.5's layers first .. first + 3 (16-19: IQ3_XXS gate / up; 48-51: IQ3_S; IQ4_XS downs in both, 19 and 51
+    attention layers) over 16 positions, fed llama.cpp's residual stream before them token by token: the residual after
+    every layer within the 27B's bounds of ``test_overlay_slice``."""
+    from models.qwen35.overlay import QwenOverlay
+
+    path = ref.size_gguf("swift")
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    layers, n = list(range(first, first + 4)), 16
+    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = ref.golden(path, tokens, ubatch=1, layers=(first - 1, *layers), names="l_out", logits="none")
+    ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
+    ov.load(release=False)
+    errs = np.zeros((n, len(layers)))
+    for t in range(n):
+        ov.step(torch.from_numpy(np.asarray(G_["l_out", first - 1][t], np.float32).copy()), t, logits=False)
+        for i, L in enumerate(layers):
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1).numpy()
+            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+    print(f"layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.4f}")
+    assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
+
+
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "swift"])
 def test_lm_head(size: str) -> None:
     """The LM head alone (``logits_of``: the output norm, every vocabulary row) on llama.cpp's last residual of T
     tokens: the logits within llama.cpp's own error (its Q8_K activations) of its logits, the same argmax."""

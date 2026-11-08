@@ -23,7 +23,8 @@ calls page code only through the entry words, from resident code. Hazards and th
   pager (``link``: the call graph), so no page is on the stack while another one is written. Program memory ends at
   16 KB: a page past it writes the tile's other registers and breaks the core;
 - page data: the core's data memory is the resident ELF's: ``link`` refuses a page whose functions need data the
-  resident code does not have (constant or jump tables);
+  resident code does not have (constant or jump tables); a page may write words of its own into data memory (``Pager.data``:
+  a table in a buffer the design placed for it, which the page's code reads);
 - the stack: the deepest call of the core, page entries called from their resident callers, fits its stack_size;
 - a stale page: a configuration (a PDI load) rewrites the slot's start with the startup code and leaves the state
   words: after one, the state is cleared (the memtile transport's reload) or a dispatch's first page is always sent
@@ -158,13 +159,15 @@ class Page:
 class Pager:
     """The pages of the cores that share them: where they go (``slot``), the pager's state words (data-memory byte
     ``state``), the wake lock, the packets' stream id (their route to the core's TileControl). Page ids count from 1
-    in ``pages``' order (0 in the state: no page)."""
+    in ``pages``' order (0 in the state: no page). ``data``: words a page writes into data memory besides (per page
+    (byte address, words) runs: a table its code reads), before its state words."""
 
     slot: int
     state: int
     wake: int
     stream_id: int
     pages: dict[str, Page]
+    data: dict[str, tuple[tuple[int, np.ndarray], ...]] = field(default_factory=dict)
 
     def page_id(self, name: str) -> int:
         return list(self.pages).index(name) + 1
@@ -174,8 +177,9 @@ class Pager:
         return np.array([self.page_id(name), *e, *[0] * (STATE_WORDS - 1 - len(e))], np.uint32)
 
     def stream(self, name: str) -> np.ndarray:
-        """Page ``name`` as control packets: its code at the slot, the state words, the wake lock (last)."""
-        return packets(self.stream_id, [(PM + self.slot, self.pages[name].code), (self.state, self._state(name)),
+        """Page ``name`` as control packets: its code at the slot, its data, the state words, the wake lock (last)."""
+        return packets(self.stream_id, [(PM + self.slot, self.pages[name].code), *self.data.get(name, ()),
+                                        (self.state, self._state(name)),
                                         (CORE_LOCK0 + 16 * self.wake, np.array([1], np.uint32))])
 
     def slots(self, name: str, *, words: int, n: int) -> np.ndarray:

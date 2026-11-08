@@ -262,8 +262,8 @@ class QwenImage(TileImage):
             ab = np.stack(ab)
             if self.fmt(alpha) == self.fmt(beta):
                 abp = [("ab", (alpha, beta), ab)]
-            else:  # (an F32 alpha: its planes [hi, lo] per head, module docstring; their sums: an MoE design's B_PAIR)
-                assert cfg.moe and self.gguf.tensor_info[alpha][1] == "F32", (alpha, self.fmt(alpha), self.fmt(beta))
+            else:  # (an F32 alpha: its planes [hi, lo] per head, module docstring; their sums: the design's B_PAIR)
+                assert self.gguf.tensor_info[alpha][1] == "F32", (alpha, self.fmt(alpha), self.fmt(beta))
                 a = ab[:, :ab.shape[1] // 2]
                 abp = [("alpha", (alpha,), np.stack([2 * a, 2 * a + 1], -1).reshape(COLS, -1)),
                        ("beta", (beta,), ab[:, ab.shape[1] // 2:] - cfg.ssm_v_heads)]

@@ -97,6 +97,7 @@ whenever it is stale (``artlite.overlay.OverlayDevice.set_prologue``: first, the
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from dataclasses import dataclass
@@ -112,7 +113,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from .. import txn
-from ..formats import FORMATS, iq3
+from ..formats import FORMATS, TAB, TAB_BYTES, slot
 from ..moe import route as moe_k
 from ..operators import kmath, paging
 from ..operators.base import ArgSpec, ArtcOperator
@@ -282,7 +283,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
-                 a_bcast: tuple[tuple[int, int], ...] = ()):
+                 a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False):
         """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -294,7 +295,8 @@ class DecodeOverlayOperator(ArtcOperator):
         the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
         slots"); bcast: phase inputs on one broadcast stream (module docstring "Broadcast inputs"); a_bcast: pairs of columns
         (c, d): a fill of column c's A stream with the packet id AB_ID + i (i: the pair's index) reaches both columns'
-        memtiles, the same objects in both columns (module docstring "Shared A objects")."""
+        memtiles, the same objects in both columns (module docstring "Shared A objects"); pairs: a dense design's blocks
+        of plane pairs (B_PAIR: an F32 matrix's [hi, lo] rows, their sums out as fp32; an MoE design has them anyway)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or gu_win or paged or moe)), slots
         self.slots, self.bcast = slots, bcast
         assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
@@ -304,6 +306,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.nx_per_norm = NORM_K // self.obj_k  # (input objects per norm-weight object)
         self.chunk = gemv.Chunk(nsb, slots)
         self.moe = moe is not None
+        self.pairs = pairs
         self.experts, self.top = moe or (0, 0)
         assert max_k % self.chunk.k == 0 and max_k <= MAX_K
         self.max_k = max_k
@@ -317,6 +320,11 @@ class DecodeOverlayOperator(ArtcOperator):
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
         self.paged = tuple(sorted(paged))
         assert set(self.paged) <= set(rows), (paged, rows)
+        # (the formats with a gather table: one table slot per core, TAB; a resident format's table resident, else every
+        # one in its format's page)
+        self.tables = [f for f in self.rows if slot(f).mmv_table(f) is not None]
+        assert len([f for f in self.tables if f not in self.paged]) <= 1 and \
+            (set(self.tables) <= set(self.paged) or len(self.tables) == 1), (self.tables, self.paged)
         assert not gu_win or act == "silu"
         self.rowsplit = sorted(f for f in rows if gemv.row_split(f, nsb))
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
@@ -431,7 +439,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate, SILU8=[0x40000 + a for a in SILU8_AT],
-                                 moe=self.moe, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
+                                 moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
@@ -446,16 +454,26 @@ class DecodeOverlayOperator(ArtcOperator):
                 "ITEM_WORDS": ITEM_WORDS}
 
     @property
+    def pg_channel(self) -> int:
+        """The memtile MM2S channel of the page store: PG_CH (odd: BDs 24-47) for up to 4 paged formats or an MoE design,
+        else 4 (even: BDs 0-23; a dense design's memtile channels take BDs 0-3 and 24-39 of them)."""
+        return PG_CH if len(self.paged) <= 4 or self.moe else 4
+
+    @property
     def pg_store(self) -> tuple[int, int, int]:
         """(first BD, store address, bytes) of the page store: PG_BD, PG_STORE, PG_STORE_BYTES for up to 4 paged
-        formats; of more, the BDs from 48 - 2 n (the odd channels' last) and 48 KB (6 formats' pages of ~3-4 KB per
-        core half)."""
+        formats; of more, a BD per format and core half up to the channel's last (``pg_channel``'s parity: 47 or 23), and
+        4 KB per page (pages of ~3-4 KB), 12 KB more per paged format with a gather table (its two copies in the page of
+        each core half: ~6 KB of control packets each), the store ending at the memtile's end."""
         n = len(self.paged)
-        return (PG_BD, PG_STORE, PG_STORE_BYTES) if n <= 4 else (48 - 2 * n, 0x74000, 0xC000)
+        if n <= 4 and not self.tables:
+            return PG_BD, PG_STORE, PG_STORE_BYTES
+        size = max(0xC000, 0x2000 * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
+        return 24 * (self.pg_channel % 2) + 24 - 2 * n, 0x80000 - size, size
 
     def _page_spec(self) -> gemv.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
-        (h0, ctl), (h1, _) = (paging.request(stream_id=i, channel=PG_CH) for i in PG_REQ_ID)
+        (h0, ctl), (h1, _) = (paging.request(stream_id=i, channel=self.pg_channel) for i in PG_REQ_ID)
         bd0 = self.pg_store[0]
         return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1),
                              bd0=(bd0, bd0 + len(self.paged)), ctl=ctl)
@@ -476,8 +494,12 @@ class DecodeOverlayOperator(ArtcOperator):
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
                                stream_id=PG_PAGE_ID[h])
         bd0, base, size = self.pg_store
-        store = paging.Store(base=base, size=size, channel=PG_CH, bd0=bd0,
-                             pagers=(pager(0, self.MAIN_ROW, self.STACK), pager(1, self.HELPER_ROW, self.HELPER_STACK)))
+        pagers = []
+        for h, (row, stack) in enumerate(((self.MAIN_ROW, self.STACK), (self.HELPER_ROW, self.HELPER_STACK))):
+            pg = pager(h, row, stack)
+            data = {f: tuple((a - 0x70000, slot(f).mmv_table(f)) for a in TAB[h]) for f in self.paged if f in self.tables}
+            pagers.append(dataclasses.replace(pg, data=data) if data else pg)
+        store = paging.Store(base=base, size=size, channel=self.pg_channel, bd0=bd0, pagers=tuple(pagers))
         store.check(wd, range(COLS))
         return store
 
@@ -582,7 +604,7 @@ class DecodeOverlayOperator(ArtcOperator):
             rest = list(rest)
             if s8:
                 rest = rest[:-2]
-            if "IQ3_XXS" in self.rows:  # (the grid tables: placed, read through their addresses)
+            if self.tables:  # (the gather tables: placed, read through their addresses)
                 rest = rest[:-2]
             if self.paged:  # (the pager's state words and the column's page store: placed, used by no code here)
                 rest = rest[:-2]
@@ -732,15 +754,20 @@ class DecodeOverlayOperator(ArtcOperator):
             pg_locks += [Lock(main, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{mr}"),
                          Lock(helper, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{hr}")]
             for h, t in enumerate((main, helper)):
-                pg_flows += [paging.page_flow(mem, t, channel=PG_CH, stream_id=PG_PAGE_ID[h]),
+                pg_flows += [paging.page_flow(mem, t, channel=self.pg_channel, stream_id=PG_PAGE_ID[h]),
                              paging.request_flow(t, mem, stream_id=PG_REQ_ID[h])]
-        grids = {}  # (IQ3_XXS: per core the grid table's two copies at iq3.TAB, used through their addresses only)
-        if "IQ3_XXS" in self.rows:
-            t_ty = np.ndarray[(iq3.TAB_BYTES // 4,), np.dtype[np.uint32]]
+        grids = {}  # (the gather tables: per core two copies at TAB, used through their addresses only; ``tables``)
+        if self.tables:
+            t_ty = np.ndarray[(TAB_BYTES // 4,), np.dtype[np.uint32]]
+            res = [f for f in self.tables if f not in self.paged]
+            init = np.zeros(TAB_BYTES // 4, np.uint32)
+            if res:  # (a resident table; else every table comes with its format's page)
+                tab = slot(res[0]).mmv_table(res[0])
+                init[:tab.size] = tab
             for c in range(COLS):
                 for h, r in enumerate((mr, hr)):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
-                                          address=iq3.TAB[h][i] - 0x70000, initial_value=iq3.grid_words())
+                                          address=TAB[h][i] - 0x70000, initial_value=init)
                                    for i in range(2)]
         def silu_tab(c: int) -> list[Buffer]:  # (placed, read through their addresses)
             words = kmath.SILU.table_words()
