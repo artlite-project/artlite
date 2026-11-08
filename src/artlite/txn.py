@@ -292,7 +292,7 @@ def bd_offsets(nbytes: int, dims: tuple[int, int, int, int] | None = None) -> np
 
 def device_address(buffer: object, offset: int = 0, context: object = None) -> int:
     """The address the shim DMA uses for byte ``offset`` of a host buffer (an ``artlite``
-    Buffer or Tensor) in the hardware context ``context`` (XRT on Windows maps a buffer at its own
+    Buffer or Tensor) in the hardware context ``context`` (on XRT an instruction buffer has its own
     address in each: ``backend``; None: any context of the process)."""
     raw = getattr(buffer, "_raw", buffer)
     return (raw.paddr if context is None else raw.paddr_in(context)) + offset + DDR_AIE_ADDR_OFFSET

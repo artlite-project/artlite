@@ -110,8 +110,9 @@ Remove-Item Env:XILINX_XRT
 - The NPU reaches only the data buffers a command lists, at most 5. A program of more buffers lists the regions they
   lie in: buffers under 256 MB share 1 GB regions of the process, a larger one has its own. Instruction buffers
   (control code, PDIs, the scratchpad) need not be listed.
-- Each hardware context maps a buffer at its own device address (`Buffer.paddr_in`), and only once a context exists
-  in the process (XRT's rule): a program opens its context before it resolves addresses.
+- A data buffer's region is one XRT buffer of the device, at one device address in every context, made once a
+  context exists in the process (XRT's rule): a program opens its context before it resolves addresses. Instruction
+  buffers are made in the memory group of the context that runs them (`Buffer.paddr_in`).
 - Not available: the profiler's register reads (counters; traces work) and `Device.clocks()`, `busy_ns()`,
   `last_async_error()` (they return 0 or nothing).
 - The planning step of the tests and `python -m artlite.parallel_compile` work as on Linux.

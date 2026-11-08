@@ -21,6 +21,7 @@
 
 #include "shim_xrt/device.h"
 #include "shim_xrt/hwctx.h"
+#include "xrt/experimental/xrt_ext.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
@@ -112,19 +113,19 @@ bool has_ddr_patch(std::span<const uint32_t> w) {
 region::region(size_t n) : host(host_alloc(n)), size(round_up(n)) {}
 
 region::~region() {
-  by_group.clear();
+  xrt.reset();
+  hold.reset();
   host_free(host, size);
 }
 
-xrt::bo& region::xrt_for(const hw_ctx& ctx, uint32_t g) {
+xrt::bo& region::xrt_for(const hw_ctx& ctx) {
   std::lock_guard guard(lock);
-  pinned& p = by_group[g];
-  if (!p.xrt) {
-    p.hold = std::make_unique<xrt::hw_context>(*ctx.m_ctx);
+  if (!xrt) {
+    hold = std::make_unique<xrt::hw_context>(*ctx.m_ctx);
     // (XRT makes a buffer only on a device object with a context: the context's)
-    p.xrt = std::make_unique<xrt::bo>(ctx.m_device.xrt_device(), host, size, XRT_BO_FLAGS_HOST_ONLY, g);
+    xrt = std::make_unique<xrt::ext::bo>(ctx.m_device.xrt_device(), host, size);
   }
-  return *p.xrt;
+  return *xrt;
 }
 
 bo::bo(device& dev, size_t size, kind k) : m_device(dev), m_size(size), m_kind(k) {
@@ -140,7 +141,7 @@ bo::bo(device& dev, size_t size, kind k) : m_device(dev), m_size(size), m_kind(k
 bo::bo(device& dev, size_t size, user_memory) : bo(dev, size, kind::data) {}
 
 bo::~bo() {
-  m_subs.clear();
+  m_sub.reset();
   m_xrt.reset();
   m_hold.reset();
   if (m_kind == kind::instructions) host_free(m_host, m_size);
@@ -180,9 +181,9 @@ void bo::sync(direction dir, size_t size, size_t offset) {
   }
 #ifdef _WIN32
   std::lock_guard guard(m_region->lock);
-  if (!m_region->by_group.empty())
-    m_region->by_group.begin()->second.xrt->sync(
-        dir == direction::host2device ? XCL_BO_SYNC_BO_TO_DEVICE : XCL_BO_SYNC_BO_FROM_DEVICE, size, m_offset + offset);
+  if (m_region->xrt)
+    m_region->xrt->sync(dir == direction::host2device ? XCL_BO_SYNC_BO_TO_DEVICE : XCL_BO_SYNC_BO_FROM_DEVICE, size,
+                        m_offset + offset);
 #else
   flush_lines(static_cast<char*>(m_host) + offset, size);
 #endif
@@ -196,24 +197,21 @@ uint64_t bo::get_paddr() {
 }
 
 uint64_t bo::paddr_in(const hw_ctx& ctx) {
-  if (m_kind == kind::data) return region_for(ctx, 3).address() + m_offset;
+  if (m_kind == kind::data) return region_for(ctx).address() + m_offset;
   return xrt_for(ctx, 1).address();
 }
 
-xrt::bo& bo::region_for(const hw_ctx& ctx, unsigned arg) {
-  return m_region->xrt_for(ctx, ctx.m_kernel->group_id(arg));
-}
+xrt::bo& bo::region_for(const hw_ctx& ctx) { return m_region->xrt_for(ctx); }
 
 xrt::bo& bo::xrt_for(const hw_ctx& ctx, unsigned arg) {
-  const uint32_t group = ctx.m_kernel->group_id(arg);
   if (m_kind == kind::data) {
-    xrt::bo& whole = m_region->xrt_for(ctx, group);
+    xrt::bo& whole = m_region->xrt_for(ctx);
     if (m_offset == 0 && m_region->size == round_up(m_size)) return whole;
     std::lock_guard guard(m_lock);
-    auto& sub = m_subs[group];
-    if (!sub) sub = std::make_unique<xrt::bo>(whole, round_up(m_size), m_offset);
-    return *sub;
+    if (!m_sub) m_sub = std::make_unique<xrt::bo>(whole, round_up(m_size), m_offset);
+    return *m_sub;
   }
+  const uint32_t group = ctx.m_kernel->group_id(arg);
   std::lock_guard guard(m_lock);
   if (!m_xrt || m_group != group) {
     m_xrt.reset();

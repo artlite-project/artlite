@@ -32,6 +32,7 @@ SMOKE = (
     "operators/test_fused.py::test_library_program", "operators/test_fused.py::test_library_program_memory_variants",
     "operators/test_fused.py::test_library_without_reset", "operators/test_fused.py::test_library_abort",
     "operators/test_fused.py::TestFusedOperator::test_silu_add",
+    "operators/test_fused.py::TestFusedLifecycle::test_buffer_pinned_once",
     "decode/test_gemv.py::test_gemv[Q4_0-9216-4]",
     "prefill/test_gemm.py::test_prefill_gemm[llama-1B-Q4_K_M-L3-gate_up-T256]",
     "prefill/test_gemm.py::test_prefill_gemm[llama-3B-Q3_K_M-L0-qkv-T64]",

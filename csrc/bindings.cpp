@@ -411,7 +411,9 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       .def_prop_ro("paddr", [](shim_xdna::bo& self) -> uint64_t { return self.get_paddr(); })
       .def(
           "paddr_in", [](shim_xdna::bo& self, const shim_xdna::hw_ctx& ctx) -> uint64_t { return self.paddr_in(ctx); },
-          "ctx"_a, "The device address in a hardware context (XRT on Windows maps a buffer at its own in each).");
+          "ctx"_a,
+          "The device address in a hardware context (on XRT an instruction buffer is made in each context's memory group: "
+          "its own address in each).");
 
   // --- HwContext (wraps shim_xdna::hw_ctx directly) ---
   nb::class_<shim_xdna::hw_ctx>(m, "HwContext")

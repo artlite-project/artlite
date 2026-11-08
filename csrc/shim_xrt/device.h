@@ -63,8 +63,8 @@ struct device {
 
   xrt::device& xrt_device() const { return *m_dev; }
 
-  // The process's live hardware contexts, of any device object (hw_ctx adds and removes itself): a buffer takes its
-  // memory groups from one, of `preferred` if it has one.
+  // The process's live hardware contexts, of any device object (hw_ctx adds and removes itself): a buffer is made in
+  // one, of `preferred` if it has one.
   static void add_context(const hw_ctx* ctx);
   static void remove_context(const hw_ctx* ctx);
   static const hw_ctx* any_context(const device* preferred = nullptr);

@@ -76,7 +76,7 @@ struct Kernel::Impl {
         if (!regions) {
           args.push_back(&b.xrt_for(ctx, arg));
         } else if (b.is_data()) {
-          xrt::bo* x = &b.region_for(ctx, arg);
+          xrt::bo* x = &b.region_for(ctx);
           if (std::find(args.begin(), args.end(), x) == args.end()) args.push_back(x);
         }
       }

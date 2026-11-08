@@ -1,5 +1,7 @@
 """Tests for FusedOperator: compile and dispatch multiple ops as one ELF."""
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -485,6 +487,12 @@ def test_control_packets_encoding(tmp_path):
     assert np.array_equal(ctrlpkt.packets(ctrlpkt.ROW_ID[4], writes), want)
 
 
+def _vm_pin() -> int:
+    """The process's pinned bytes: the amdxdna driver charges the user memory it pins to RLIMIT_MEMLOCK."""
+    with open("/proc/self/status") as f:
+        return next(int(line.split()[1]) << 10 for line in f if line.startswith("VmPin:"))
+
+
 def _add_chain(name: str, **kw: object) -> FusedOperator:
     """y = (x + w) + w with w a scratch weight buffer (external if given)."""
     add = AddOperator(size=1024)
@@ -599,6 +607,23 @@ class TestFusedLifecycle:
         verify_close(t, (x.float() + w.float()).bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="user t")
         ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
         verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="user y")
+
+    @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="VmPin is Linux's")
+    def test_buffer_pinned_once(self):
+        """A buffer that two hardware contexts address (a model's weights: its decode overlay's, its prefill library's)
+        is pinned once, at one address. On XRT an XRT buffer of a context's memory group would pin it again in every
+        context: on Windows another allocation of its size in the NPU's share of memory, here the pages charged to
+        RLIMIT_MEMLOCK again (/proc's VmPin)."""
+        fs = [_add_chain(name) for name in ("t_pin_a", "t_pin_b")]
+        ctxs = []
+        for f in fs:
+            f.compile().load()._kernel()
+            ctxs.append(f.load()._ctx)
+        assert ctxs[0] is not ctxs[1]
+        buf = artlite.Device().alloc_user_buffer(256 << 20)  # (on XRT: a region of its own)
+        pinned = _vm_pin()
+        assert buf.paddr_in(ctxs[0]) == buf.paddr_in(ctxs[1])
+        assert _vm_pin() - pinned <= buf.size  # (amdxdna: 0, pinned at its allocation; XRT: once)
 
     def test_scratch_segments(self, monkeypatch):
         """Scratch larger than one sequence argument's 32-bit relocation addends is passed as

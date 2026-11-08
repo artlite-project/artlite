@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,27 +34,25 @@ struct properties {
 // Tag of the user-memory constructor.
 struct user_memory {};
 
-// Host memory pinned as an XRT buffer per memory group (on Windows each context has its own groups), made against a
-// context at its first use there (XRT creates a buffer only then). A data buffer is a range of a region: small ones
-// share one, a large one has its own.
+// Host memory pinned as one XRT buffer of the device (xrt::ext::bo, of no memory group), made at its first use in a
+// context (XRT creates a buffer only on a device object with a context): the commands of every context list it, at one
+// address. (A buffer of the group kernel.group_id gives belongs to that context's xclbin slot: every context would pin
+// the memory again, on Windows another allocation of its size in the NPU's share of memory.) A data buffer is a range
+// of a region: small ones share one, a large one has its own.
 struct region {
-  struct pinned {
-    std::unique_ptr<xrt::hw_context> hold;  // (the context the XRT buffer was made against: it must outlive it)
-    std::unique_ptr<xrt::bo> xrt;
-  };
-
   explicit region(size_t size);
   ~region();
   region(const region&) = delete;
   region& operator=(const region&) = delete;
 
-  xrt::bo& xrt_for(const hw_ctx& ctx, uint32_t group);
+  xrt::bo& xrt_for(const hw_ctx& ctx);
 
   void* host;
   size_t size;
   size_t used = 0;  // (shared regions: the bytes handed out)
-  std::mutex lock;  // (by_group: dispatches of several threads)
-  std::map<uint32_t, pinned> by_group;
+  std::mutex lock;  // (xrt: dispatches of several threads)
+  std::unique_ptr<xrt::hw_context> hold;  // (the context the XRT buffer was made in: it must outlive it)
+  std::unique_ptr<xrt::bo> xrt;
 };
 
 // A buffer the NPU reads and writes. A data buffer is a range of a region (above); an instruction buffer is a
@@ -79,7 +76,8 @@ struct bo {
   // The address the NPU's DMA uses for the first byte (XRT's, not the host's). It exists once the buffer has an XRT
   // handle, which needs a hardware context in the process: throws without one.
   uint64_t get_paddr();
-  // The address in `ctx`: on Windows each context maps the buffer at its own address.
+  // The address in `ctx` (a data buffer's is the same in every context; an instruction buffer is made again in the
+  // memory group of each context it runs in).
   uint64_t paddr_in(const hw_ctx& ctx);
   std::string_view type_to_name() const;
 
@@ -87,7 +85,7 @@ struct bo {
   // a sub-buffer of it), created on first use.
   xrt::bo& xrt_for(const hw_ctx& ctx, unsigned arg);
   // The XRT buffer of a data buffer's whole region (what a command lists so that the NPU reaches the buffer).
-  xrt::bo& region_for(const hw_ctx& ctx, unsigned arg);
+  xrt::bo& region_for(const hw_ctx& ctx);
   bool is_data() const { return m_kind == kind::data; }
   // Whether the transaction in this instruction buffer (its header's length) has a DDR patch: an address the firmware
   // takes from the command's k-th buffer. Walked once per upload.
@@ -106,7 +104,7 @@ struct bo {
   uint32_t m_group = ~0u;
   std::unique_ptr<xrt::hw_context> m_hold;  // (instruction buffers: as region::hold)
   std::unique_ptr<xrt::bo> m_xrt;  // (instruction buffers: theirs)
-  std::map<uint32_t, std::unique_ptr<xrt::bo>> m_subs;  // (data buffers in a shared region: their sub-buffer per group)
+  std::unique_ptr<xrt::bo> m_sub;  // (data buffers in a shared region: their sub-buffer)
   size_t m_dirty_lo = ~size_t(0), m_dirty_hi = 0;  // (instruction buffers: the bytes where the host copy is newer)
   std::optional<bool> m_patched;  // (instruction buffers: ddr_patched since the last upload)
 };
