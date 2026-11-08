@@ -33,6 +33,7 @@ from artlite.vision.layers import (
 )
 from artlite.vision.ops import Attention, Gemm
 from artlite.vision.seq import ColOps, MemTask
+from artlite.vision.weights import cat
 
 
 def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: torch.Tensor, eps: float,
@@ -129,7 +130,7 @@ def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, 
     h4 = None
     for k in range(2):  # (the hidden channels in halves: the GEGLU output of all of them does not fit the memtile)
         g = alloc(bd, lv, half, "pn", pnp=lv.np + junk)
-        rows = torch.cat([w1[k * half:(k + 1) * half], w1[hid + k * half:hid + (k + 1) * half]])
+        rows = cat([w1[k * half:(k + 1) * half], w1[hid + k * half:hid + (k + 1) * half]])
         bias = torch.cat([b1[k * half:(k + 1) * half], b1[hid + k * half:hid + (k + 1) * half]])
         gemm(bd, n, rows, bias, name=q + f"ff1.{k}", out=g, kind="geglu", split=2)
         if k == 1:

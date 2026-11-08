@@ -57,6 +57,7 @@ from artlite.vision.vit import (
 from artlite.vision.vit import pad as _pad
 from artlite.vision.vit import pad_heads as _heads
 from artlite.vision.vit import xfer as _xfer
+from artlite.vision.weights import Wt, cat, computed, eye, take, values
 
 GROUPS = 64  # final groups (4 x 4 patches) of one image of a band: a tile's 8 columns x 8 lanes
 
@@ -176,8 +177,7 @@ def _attn_weights(get: Callable[[str], torch.Tensor], p: str) -> dict[str, torch
             wt, b = wt * s, b * s
         w[r] = _pad(_heads(wt), C, C)
         w[r + "_b"] = _heads(b)
-    o = get(p + "attn_out.weight").float()
-    w["o"] = _pad(_heads(o.T).T, C, C)
+    w["o"] = _pad(_heads(get(p + "attn_out.weight").float(), 1), C, C)
     w["o_b"] = _pad(get(p + "attn_out.bias").float().reshape(-1), C)
     return w
 
@@ -214,11 +214,12 @@ def patch_weights(get: Callable[[str], torch.Tensor], mean: tuple[float, ...], s
     """The patch embedding as a GEMM of the integer panels of ``patches`` (640 inputs -> C) with the pixels'
     normalization (``pixel_map``) folded in: input k < 588 the weights' column k times a_k, input 592 (the constant 1)
     their offset sum_k w_k o_k; the bias; "norm": the mean and std."""
-    w = get("v.patch_embd.weight").double().reshape(H, -1)
-    a, o = pixel_map(mean, std)
-    wt = torch.zeros(C, 640)
-    wt[:H, :PIX], wt[:H, ONE] = (w * a).float(), (w @ o).float()
-    return {"w": wt, "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C), "norm": (tuple(mean), tuple(std))}
+    w = values(get("v.patch_embd.weight")).astype(np.float64).reshape(H, -1)
+    a, o = (x.numpy() for x in pixel_map(mean, std))
+    wt = np.zeros((C, 640), np.float32)
+    wt[:H, :PIX], wt[:H, ONE] = w * a, w @ o
+    return {"w": computed("minicpmv.patch", wt), "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C),
+            "norm": (tuple(mean), tuple(std))}
 
 
 def patches(pixels: np.ndarray | torch.Tensor, norm: tuple[tuple[float, ...], tuple[float, ...]],
@@ -310,12 +311,13 @@ class WindowAttention:
 MERGED, HID = 4 * C, 17280  # (a merged token's channels: 4 x 1280; the ViT merger's hidden, 17216 padded)
 
 
-def _blocks4(v: torch.Tensor, axis: int = -1) -> torch.Tensor:
-    """A merged token's 4 x 1152 channels (along axis) -> 4 x 1280 (each source's padded)."""
-    v = v.float().movedim(axis, -1)
-    out = torch.zeros(*v.shape[:-1], 4, C)
-    out[..., :H] = v.reshape(*v.shape[:-1], 4, H)
-    return out.reshape(*v.shape[:-1], MERGED).movedim(-1, axis)
+BLOCKS4 = np.array([k * H + i if i < H else -1 for k in range(4) for i in range(C)])  # (``_blocks4``)
+
+
+def _blocks4(v: Wt | torch.Tensor, axis: int = 0) -> Wt | torch.Tensor:
+    """A merged token's 4 x 1152 channels (along axis: 0, a vector's or a matrix's rows; 1, a matrix's columns) -> 4 x
+    1280 (each source's padded)."""
+    return take(v.float(), BLOCKS4, axis)
 
 
 def merger_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -328,10 +330,8 @@ def merger_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor
     w["ds_g"], w["ds_b"] = (_blocks4(get(p + f"ds_ln.{n}").reshape(-1)) for n in ("weight", "bias"))
     w["up"] = _pad(_blocks4(get(p + "ds_ffn_up.weight"), 1), HID, MERGED)
     w["up_b"] = _pad(get(p + "ds_ffn_up.bias").float().reshape(-1), HID)
-    mean = torch.zeros(C, MERGED)
-    for k in range(4):
-        mean[torch.arange(H), C * k + torch.arange(H)] = 0.25
-    w["down"] = torch.cat([_pad(get(p + "ds_ffn_down.weight").float(), C, HID), mean], 1)
+    mean = _pad(eye(C), C, H) * 0.25  # (a source's 1152 channels, 1 / 4 each)
+    w["down"] = cat([_pad(get(p + "ds_ffn_down.weight").float(), C, HID)] + [_pad(mean, C, C)] * 4, 1)
     w["down_b"] = _pad(get(p + "ds_ffn_down.bias").float().reshape(-1), C)
     return w
 
@@ -450,7 +450,7 @@ def final_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]
     """The final merger's padded weights: post_ln, the identity (post_ln's panels back to C tiles), input_norm (4608 ->
     5120, per source), up (5120 -> 4800), down (4800 -> 1280: 1024 real)."""
     w = {"post_g": _pad(get("v.post_ln.weight").float().reshape(-1), C), "post_b": _pad(get("v.post_ln.bias").float().reshape(-1), C)}
-    w["eye"] = torch.eye(C)
+    w["eye"] = eye(C)
     w["in_g"], w["in_b"] = (_blocks4(get(f"mm.input_norm.{n}").reshape(-1)) for n in ("weight", "bias"))
     w["up"] = _pad(_blocks4(get("mm.up.weight"), 1), FUP, MERGED)
     w["up_b"] = _pad(get("mm.up.bias").float().reshape(-1), FUP)
@@ -616,7 +616,7 @@ class Encoder:
         for joint, b in ((False, bd), (True, bd.fork())):
             self.out = encode(b, w, joint=joint, name=name)
             self.words[joint], self.addrs[joint] = b.finish(), b.s.t.addrs
-        self.images = list(bd.images)  # (both builders': ``fork``)
+        self.built = bd.built()  # (both builders': ``fork``)
         self.tr: dict[bool, Transaction] = {}
 
     def state(self) -> dict:

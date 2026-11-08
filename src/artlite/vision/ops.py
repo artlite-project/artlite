@@ -447,19 +447,6 @@ class Gemm:
         h, g = self.N // 2, n0 // 2
         return torch.tensor([g + 40 * p + i if i < 40 else h + g + 40 * p + i - 40 for p in ps for i in range(80)])
 
-    def weights(self, w: torch.Tensor, row: int) -> np.ndarray:
-        """Row ``row``'s weight image (a conv's k-tiles: per chunk of 64 input channels its taps, ``tap_order``)."""
-        ws = w[self._rows(row)]
-        if self.hilo:  # ([hi | lo], each K padded to whole k-tiles)
-            wp = torch.nn.functional.pad(ws.float(), (0, self.nkt // 2 * D.KT - ws.shape[1]))
-            hi = torch.from_numpy(L.unblocks(L.blocks(wp.reshape(wp.shape[0], -1, 8)))).reshape(wp.shape)
-            ws = torch.cat([hi, wp - hi], 1)
-        if self.conv:
-            t = ws.reshape(-1, self.nch, 64, 3, 3).permute(0, 1, 3, 4, 2)  # (n, chunk, dy, dx, k)
-            ws = torch.stack([torch.stack([t[:, c, dy, dx] for dy, dx in self.tap_order(c)], 1) for c in range(self.nch)],
-                             1).reshape(ws.shape[0], -1)
-        return L.gemm_weights(ws, 0, self.npo)
-
     @property
     def col_free(self) -> bool:
         """The op's tasks are the same in every column (none reads a neighbour's memtile or the image's edge)."""

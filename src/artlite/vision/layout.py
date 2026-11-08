@@ -6,8 +6,8 @@ m = 128):
   GEMM's A operand; V^T panels: the same with [8 channels][9 B] (a row: one channel's 8 tokens);
 - C tiles: bf16 objects [channel block of 80][tile][``ct_bytes``]: the C tile [rb][10 cb][8 tokens][8 channels], padded
   to whole output chunks (the cores' C-tile outputs, residual inputs).
-Weights of row r (``gemm_weights``): per pass of 80 output channels its k-tiles, each [16-column block 5][k-step 8][half
-2][8 outputs][9 B] (the MAC's B pop order).
+Weights of core row r (packed by ``weights.Slots``): per pass of 80 output channels its k-tiles, each [16-column block
+5][k-step 8][half 2][8 outputs][9 B] (the MAC's B pop order).
 """
 
 import numpy as np
@@ -81,17 +81,6 @@ def from_ctiles(b: np.ndarray, tokens: int, c: int, m: int) -> torch.Tensor:
     raw = np.asarray(b, np.uint8)[:c // 80 * nt * ct_bytes(m)].reshape(c // 80, nt, ct_bytes(m))[..., :m * 160]
     v = torch.from_numpy(np.ascontiguousarray(raw)).view(torch.bfloat16).float()
     return v.reshape(c // 80, nt, m // 8, 10, 8, 8).permute(1, 2, 4, 0, 3, 5).reshape(tokens, c)
-
-
-def gemm_weights(w: torch.Tensor, row: int, npass: int) -> np.ndarray:
-    """(N, K) -> row ``row``'s weight image: its channel slice [row npass 80, ..) as per pass, per k-tile [5 j][8 s][2
-    h][8 n][9 B] (K padded to whole k-tiles)."""
-    k = w.shape[1]
-    nkt = -(-k // D.KT)
-    ws = torch.zeros(npass * 80, nkt * D.KT)
-    ws[:, :k] = w[row * npass * 80:(row + 1) * npass * 80].float()
-    t = ws.reshape(npass, 5, 2, 8, nkt, 8, 8).permute(0, 4, 1, 5, 2, 3, 6)  # p kt j s h n k
-    return blocks(t).reshape(-1)
 
 
 def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:

@@ -3,10 +3,11 @@ the overview and the slices), their embeddings (``models.minicpmv.encoder.Encode
 dispatch of a pair of entries or a lone one, on the vision overlay in a hardware context of its own) and its tokens
 (``host.Grid.sequence``: the embeddings and the mmproj's separator rows at the official positions).
 
-The encoder's built state (its weight images and transactions) is cached as Stable Diffusion's
-(``artlite.vision.device.state_dir``), keyed by the mmproj file and the code: a load restores it, else converts the
-weights (BF16 -> BFP16) and builds the transactions (~3 s). An image's embeddings are kept by its pixels' digest, so a
-conversation's image runs the encoder once.
+Every load packs the weights from the mmproj file (F16 / BF16 -> BFP16: ``artlite.vision.weights``, the native
+packer). The encoder's built state (its transactions, layout and commands) is cached as Stable Diffusion's
+(``artlite.vision.device.state_dir``), keyed by the mmproj file and the code: a load restores it, else builds the
+transactions (~3 s). An image's embeddings are kept by its pixels' digest, so a conversation's image runs the encoder
+once.
 """
 
 import collections
@@ -20,6 +21,7 @@ from PIL import Image
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
+from artlite.vision.weights import gguf_getter, gguf_sources
 
 from ..sequence import Sequence
 from . import encoder as V
@@ -49,21 +51,18 @@ class NpuVision:
         self.t_encode, self.entries = 0.0, 0  # (the encoder's time and entries so far)
         self.encoder = self._load()
 
-    def _get(self, name: str) -> torch.Tensor:
-        t = self.gguf.tensor(name)
-        return t.dequantize().reshape(t.rows, t.cols).float()
-
     def _load(self) -> V.Encoder:
-        pos = self._get("v.position_embd.weight").bfloat16()
+        get, c = gguf_getter(self.gguf), self.clip
+        pos = torch.from_numpy(get("v.position_embd.weight").numpy()).bfloat16()
         cache = state_dir("minicpmv", self.path, _SOURCES, [self.path])
-        if (got := load_state(cache)) is not None:
+        srcs = gguf_sources(self.gguf, {"minicpmv.patch": lambda: V.patch_weights(get, c.mean, c.std)["w"]})
+        if (got := load_state(cache, srcs)) is not None:
             npu, st = got
-            enc = V.Encoder.restored(npu, st, pos, patch=self.clip.patch_size)
+            enc = V.Encoder.restored(npu, st, pos, patch=c.patch_size)
         else:
             npu = VisionDevice()
-            enc = V.Encoder(npu, V.weights(self._get, self.clip.layers, self.clip.merger_layer, self.clip.mean,
-                                           self.clip.std), pos, patch=self.clip.patch_size)
-            save_state(cache, npu, enc.images, enc.state())
+            enc = V.Encoder(npu, V.weights(get, c.layers, c.merger_layer, c.mean, c.std), pos, patch=c.patch_size)
+            save_state(cache, npu, [enc.built], enc.state())
         npu.warm()
         return enc
 

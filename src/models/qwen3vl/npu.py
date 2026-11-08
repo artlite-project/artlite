@@ -3,12 +3,12 @@ size (``host.image_pixels``: between ``min_tokens`` and ``max_tokens`` merged to
 (``models.qwen3vl.encoder.Encoder``: on the vision overlay in a hardware context of its own) and its tokens
 (``host.Grid.sequence``).
 
-The encoder's built state (its weight images and the program of the smallest images) is cached as MiniCPM-V's
-(``artlite.vision.device.state_dir``), keyed by the mmproj file and the code: a load restores it, else converts the
-weights (BF16 / F16 / Q8_0 -> BFP16) and builds the programs of the smallest and the largest images (~3 s; the
-largest's allocates every band's DDR images). Another size's program is built on its first image (0.3-0.8 s, over the
-images as they are) and kept in the cache directory too. An image's embeddings are kept by its pixels' digest, so a
-conversation's image runs the encoder once.
+Every load packs the weights from the mmproj file (BF16 / F16 / Q8_0 -> BFP16: ``artlite.vision.weights``, the
+native packer). The encoder's built state (the program of the smallest images, the layout and commands) is cached as
+MiniCPM-V's (``artlite.vision.device.state_dir``), keyed by the mmproj file and the code: a load restores it, else
+builds the programs of the smallest and the largest images (~1.5 s; the largest's allocates every band's DDR images).
+Another size's program is built on its first image (0.3-0.8 s, over the images as they are) and kept in the cache
+directory too. An image's embeddings are kept by its pixels' digest, so a conversation's image runs the encoder once.
 """
 
 import collections
@@ -19,13 +19,13 @@ import pickle
 import time
 
 import numpy as np
-import torch
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
 from artlite.vision.vit import FFN_REAL, HEADS, H
+from artlite.vision.weights import gguf_getter, sources
 
 from ..sequence import Sequence, load_image
 from . import encoder as V
@@ -77,16 +77,13 @@ class NpuVision:
         self.t_encode, self.entries = 0.0, 0  # (the encoder's time and images so far)
         self.encoder = self._load()
 
-    def _get(self, name: str) -> torch.Tensor:
-        t = self.gguf.tensor(name)
-        return t.dequantize().reshape(t.rows, t.cols).float()
-
     def _load(self) -> V.Encoder:
-        w = V.weights(self._get, self.clip.layers, self.clip.projection_dim)
-        pos = self._get("v.position_embd.weight").numpy()
+        get = gguf_getter(self.gguf)
+        w = V.weights(get, self.clip.layers, self.clip.projection_dim)
+        pos = get("v.position_embd.weight").numpy()
         bands = -(-self.max_tokens // V.WIN)
         cache = state_dir("qwen3vl", self.path, _SOURCES, [self.path])
-        if (got := load_state(cache)) is not None and got[1]["max_bands"] >= bands:
+        if (got := load_state(cache, sources(w), accept=lambda st: st["max_bands"] >= bands)) is not None:
             npu, st = got
             for f in glob.glob(os.path.join(cache, "program_*.pkl")):  # (the programs built after the state)
                 with open(f, "rb") as fh:
@@ -96,7 +93,7 @@ class NpuVision:
         else:
             npu = VisionDevice()
             enc = V.Encoder(npu, w, pos, max_bands=max(bands, -(-MAX_TOKENS // V.WIN)))
-            save_state(cache, npu, enc.images, enc.state() | {"max_bands": enc.max_bands})
+            save_state(cache, npu, [enc.bd.built()], enc.state() | {"max_bands": enc.max_bands})
         enc.built = lambda nb, pieces, same: _save_program(cache, nb, pieces, same)
         npu.warm()
         return enc

@@ -62,8 +62,10 @@ class UNet:
     PREFIXES = [f"down_blocks.{i}.attentions.{j}." for i in range(3) for j in range(2)] + ["mid_block.attentions.0."] + \
         [f"up_blocks.{i}.attentions.{j}." for i in (1, 2, 3) for j in range(3)]
 
-    def __init__(self, npu: VisionDevice, w: dict, *, eps: float):
-        self.npu, self.w = npu, w
+    def __init__(self, npu: VisionDevice, w: dict, *, eps: float, runtime: dict | None = None):
+        """w: the weights by diffusers name (``weights.safetensors``' or tensors); runtime: the host's (``RUNTIME``,
+        tensors; default w)."""
+        self.npu, self.w = npu, w if runtime is None else runtime
         bd = self.bd = Builder(npu)
         lat = self.lat = PImage(64, "lat")
         bd.ddr(lat.name, COLS * lat.colbytes)  # (zeros: per step only its first kb written)
@@ -78,7 +80,7 @@ class UNet:
         self.words = bd.finish()
         self.tr = None
         self.tb_used, self.tb_hooks = bd.tb_used, bd.tb_hooks
-        self.addrs, self.images = bd.s.t.addrs, list(bd.images)
+        self.addrs, self.built = bd.s.t.addrs, bd.built()
 
     # (the host's weights at run time: the time embedding, the resnets' time projections and conv1 biases, the cross
     # attentions' K / V projections: ``host.resnet_time_biases``, ``set_time``, ``set_context``)

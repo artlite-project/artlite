@@ -8,6 +8,10 @@ in DDR as the columns' images of that memtile region (``spill`` / ``load``: one 
 GroupNorm records (``Records``): a producer op's per-core records ([core][OCH] in the memtile) drained to DDR [col][core]
 [256 B]; an apply's core sums those of the producer rows whose 16-group window is its own (``ops.gn_window``), read from
 DDR by its B stream (a shim gather of every column's).
+
+A GEMM's weights go into its DDR image as jobs (``weights.Slots``), packed by the native packer when the dispatch is
+finished; what the host wrote besides them (commands, norm parameters, tables) is ``Built.writes``: a model's cached
+build keeps both (``device.save_state``), never the weights.
 """
 
 import dataclasses
@@ -24,6 +28,7 @@ from . import layout as L
 from .device import VisionDevice
 from .ops import Apply, Gemm, gn_window
 from .seq import B_BDS, ColOps, MemTask, RowOps
+from .weights import Slots, Wt, as_wt
 
 TBIAS, TBIAS_BYTES = "_tbias", 64 * 1024  # (the time-biased convs' command biases: [op][row][passes 80 bf16])
 
@@ -130,6 +135,15 @@ class Records:
 
 
 @dataclass
+class Built:
+    """What a model's builds wrote into the device's DDR images (``Builder.built``): the host's byte ranges (commands,
+    norm parameters, tables; image -> {offset: bytes}) and the weight jobs."""
+
+    writes: dict[str, dict[int, int]]
+    slots: Slots
+
+
+@dataclass
 class Builder:
     """A dispatch under construction: ``ops`` in order, DDR images by name (``image``), the memtile (``mem``), the
     activation table each core row holds. reuse: an image the device holds already (a restored model's: its weights,
@@ -154,6 +168,8 @@ class Builder:
         self._ddr: dict[str, int] = {}  # (DDR image name -> its bytes)
         self._gemm_images: dict[str, tuple] = {}  # (a GEMM's image name -> (its commands' hash, its weights), address, row bytes)
         self._dirty: set[str] = set()  # (DDR images drained into since the last DDR sync)
+        self.slots = Slots()  # (the GEMMs' weight jobs: packed by ``finish``)
+        self._writes: dict[str, dict[int, int]] = {}  # (the host's writes of DDR images: ``Built.writes``)
         # (drains for the next op: records, deferred spills; the memtile bytes released after it; records?)
         self._drains: list[tuple[dict[int, ColOps], list[tuple[int, int]], bool]] = []
 
@@ -162,7 +178,12 @@ class Builder:
         tables: written once, the same names in both)."""
         b = Builder(self.npu, reuse=self.reuse)
         b.tables, b._images, b._ddr, b._gemm_images = self.tables, self._images, self._ddr, self._gemm_images
+        b.slots, b._writes = self.slots, self._writes
         return b
+
+    def built(self) -> Built:
+        """What this builder and its forks wrote (``Built``)."""
+        return Built(self._writes, self.slots)
 
     # -- DDR images
     def image(self, name: str, data: np.ndarray) -> int:
@@ -174,8 +195,14 @@ class Builder:
         h = hash(data.tobytes())
         assert self._images.setdefault(name, h) == h, f"DDR image {name!r} written again with other data"
         self.ddr(name, data.size)
-        self.npu.write(name, data)
+        self.put(name, data)
         return self.npu.address(name)
+
+    def put(self, name: str, data: np.ndarray, offset: int = 0) -> None:
+        """Host bytes into DDR image ``name`` at offset (a build's: ``Built.writes``)."""
+        self.npu.write(name, data, offset)
+        w = self._writes.setdefault(name, {})
+        w[offset] = max(w.get(offset, 0), data.size)
 
     def ddr(self, name: str, nbytes: int) -> int:
         """The device address of DDR image ``name`` of nbytes (a name this dispatch took with fewer bytes is an error:
@@ -291,35 +318,42 @@ class Builder:
             self._tab_runs[r] = (self.tables[name], 2 * D.Q)
             self.tab[r] = name
 
-    def gemm(self, g: Gemm, w: torch.Tensor | None, b: torch.Tensor | None, *, name: str, barrier: bool = False,
+    def gemm(self, g: Gemm, w: Wt | torch.Tensor | None, b: torch.Tensor | None, *, name: str, barrier: bool = False,
              extra: dict[int, ColOps] | None = None, inputs_ready: bool = False, tbias: str | None = None,
              wname: str = "") -> None:
         """A GEMM / conv / copy op (``extra``: fills / drains merged into it; ``name``'s image: per row its command,
-        then its weights; wname: the weights in an image of that name, shared by a layer's command variants). A conv is
-        a barrier (its halo rows: the neighbours'), unless inputs_ready (complete before an earlier op: its later
-        passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes: the commands' biases
-        on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
+        then its weights: jobs, packed by ``finish``; wname: the weights in an image of that name, shared by a layer's
+        command variants). A conv is a barrier (its halo rows: the neighbours'), unless inputs_ready (complete before an
+        earlier op: its later passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes:
+        the commands' biases on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
         cmds = [g.command(b, r) for r in range(ROWS)]
-        key = (hash(b"".join(c.tobytes() for c in cmds)),
-               None if w is None else (w.data_ptr(), tuple(w.shape), w.stride(), w.dtype))
+        assert w is not None or not g.nkt, f"{name}: a GEMM of {g.nkt} k-tiles without weights"
+        w = None if w is None or not g.nkt else as_wt(w)
+        key = (hash(b"".join(c.tobytes() for c in cmds)), None if w is None else w.key)
+        wb = g.npo * g.nkt * D.Q  # (a row's weight bytes: its passes' k-tiles of B slots)
         if wname:
             assert not tbias
             addr = self.image(name, np.concatenate(cmds))
             if wname not in self._gemm_images:
-                ws = [g.weights(w, r) for r in range(ROWS)]
-                self._gemm_images[wname] = (key[1], self.image(wname, np.concatenate(ws)), ws[0].size)
+                wa = self.ddr(wname, ROWS * wb)
+                self.slots.add(g, w, {r: (wname, r * wb) for r in range(ROWS)})
+                self._gemm_images[wname] = (key[1], wa, wb)
             assert self._gemm_images[wname][0] == key[1], f"weights image {wname!r} of other weights"
             wa, wb = self._gemm_images[wname][1:]
             rows = {r: g.row_ops(addr + r * D.Q, wa + r * wb) for r in range(ROWS)}
         else:
+            per = D.Q + wb  # (per row its command, then its weights: one B run)
             if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
-                addr, per = self._gemm_images[name][1:]
-            elif self.reuse and self.npu.has(name):  # (per row its command, then its weights' k-tiles of B slots)
-                addr, per = self.npu.address(name), D.Q + (g.npo * g.nkt * D.Q if g.nkt else 0)
+                addr = self._gemm_images[name][1]
+            elif self.reuse and self.npu.has(name):
+                addr = self.npu.address(name)
             else:
-                ws = [g.weights(w, r) for r in range(ROWS)] if g.nkt else [np.zeros(0, np.uint8)] * ROWS
-                per = D.Q + ws[0].size  # (per row its command, then its weights: one B run)
-                addr = self.image(name, np.concatenate([x for r in range(ROWS) for x in (cmds[r], ws[r])]))
+                assert name not in self._gemm_images, f"DDR image {name!r} written again with other data"
+                addr = self.ddr(name, ROWS * per)
+                for r in range(ROWS):
+                    self.put(name, cmds[r], r * per)
+                if w is not None:
+                    self.slots.add(g, w, {r: (name, r * per + D.Q) for r in range(ROWS)})
                 self._gemm_images[name] = (key, addr, per)
             rows = {r: g.row_ops(addr + r * per) for r in range(ROWS)}
         if tbias:  # (the first run in three: the header, the biases from TBIAS, the rest)
@@ -432,15 +466,12 @@ class Builder:
         return self.npu.address("_zq")
 
     def finish(self) -> np.ndarray:
-        """The dispatch's transaction words (``seq.Seq.finish``), the drains still pending pushed first."""
+        """The dispatch's transaction words (``seq.Seq.finish``), the drains still pending pushed first; the weight jobs
+        still pending packed."""
         if self._drains:
             self.op({}, {})
+        self.slots.pack(self.npu)
         return self.s.finish()
 
     def transaction(self):
         return Transaction(self.npu.dev, self.finish())
-
-    @property
-    def images(self) -> list[str]:
-        """The DDR images this dispatch wrote at build time (weights, commands, tables: what a model's cache keeps)."""
-        return list(self._images)

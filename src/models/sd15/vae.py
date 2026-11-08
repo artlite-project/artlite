@@ -27,6 +27,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
 from artlite.vision.ops import Apply, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
+from artlite.vision.weights import Wt, computed, take, values
 
 from .level64 import IL
 
@@ -91,11 +92,15 @@ class Chans:
         c = torch.arange(self.C)
         return c // self.per * self.pslice + c % self.per
 
-    def pad(self, v: torch.Tensor) -> torch.Tensor:
-        """(C, ...) -> (P, ...): zeros at the pads."""
-        out = torch.zeros(self.P, *v.shape[1:], dtype=v.dtype)
-        out[self.phys()] = v
-        return out
+    def index(self) -> np.ndarray:
+        """Each stored channel's real one (-1: a pad)."""
+        idx = np.full(self.P, -1, np.int64)
+        idx[self.phys().numpy()] = np.arange(self.C)
+        return idx
+
+    def pad(self, v: Wt | torch.Tensor, dim: int = 0) -> Wt | torch.Tensor:
+        """C along dim (0: (C, ...); 1: a matrix's columns) -> P: zeros at the pads."""
+        return take(v, self.index(), dim)
 
     def unpad(self, v: torch.Tensor) -> torch.Tensor:
         return v[..., self.phys()]
@@ -446,7 +451,7 @@ def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
 def shortcut(bd: Builder, x: DTensor, w: torch.Tensor, b: torch.Tensor, *, cin: Chans, cout: Chans, name: str) -> DTensor:
     """The resnet's 1x1 conv_shortcut of x (stored ``cin``) per band -> a DTensor (stored ``cout``)."""
     lv = x.lv
-    wp = cout.pad(cin.pad(w.flatten(1).T).T)  # ((P out, P in): zeros at both pads)
+    wp = cout.pad(cin.pad(w.flatten(1), 1))  # ((P out, P in): zeros at both pads)
     bp = cout.pad(b)
     out = DTensor(lv, cout.P, name)
     for band in range(lv.nb):
@@ -492,13 +497,22 @@ def upsample(bd: Builder, w: dict, p: str, x: DTensor, *, ch: Chans, name: str) 
 def conv_in(bd: Builder, w: dict, lat: VImage, *, scale: float, name: str) -> DTensor:
     """The latents' 1 / scaling_factor, post_quant_conv and conv_in as one 3x3 conv of the latents' image (``latents``:
     64 channels, the 4 latent ones, a ones channel (post_quant_conv's bias through conv_in's taps: zero past the image's
-    edges, as the padding of post_quant_conv's output), zeros) -> 512 channels with records."""
+    edges, as the padding of post_quant_conv's output), zeros) -> 512 channels with records (the weights:
+    ``latent_conv_in``)."""
     wi, bi = w["decoder.conv_in.weight"], w["decoder.conv_in.bias"]
-    wq, bq = w["post_quant_conv.weight"][:, :, 0, 0], w["post_quant_conv.bias"]
-    w64 = torch.zeros(wi.shape[0], 64, 3, 3)
-    w64[:, :wq.shape[1]] = torch.einsum("omyx,mi->oiyx", wi, wq) / scale
-    w64[:, wq.shape[1]] = torch.einsum("omyx,m->oyx", wi, bq)
-    return conv_layer(bd, lat, w64, bi, ch=chans(wi.shape[0]), name=name)
+    return conv_layer(bd, lat, latent_conv_in(w, scale), bi, ch=chans(wi.shape[0]), name=name)
+
+
+def latent_conv_in(w: dict, scale: float) -> Wt:
+    """``conv_in``'s weights (512, 64, 3, 3): conv_in's of the latents' 4 channels through post_quant_conv / scale,
+    of the ones channel post_quant_conv's bias through conv_in, zeros (computed from the file's at every load:
+    ``weights.computed``)."""
+    wi, wq, bq = values(w["decoder.conv_in.weight"]), values(w["post_quant_conv.weight"])[:, :, 0, 0], \
+        values(w["post_quant_conv.bias"])
+    w64 = np.zeros((wi.shape[0], 64, 3, 3), np.float32)
+    w64[:, :wq.shape[1]] = np.einsum("omyx,mi->oiyx", wi, wq) / np.float32(scale)
+    w64[:, wq.shape[1]] = np.einsum("omyx,m->oyx", wi, bq)
+    return computed("vae.conv_in", w64)
 
 
 def latents(lat: torch.Tensor) -> torch.Tensor:
@@ -579,7 +593,7 @@ class Decoder:
         decoder(bd, w, self.lat, scale=scale, eps=eps, name="vae.out")
         self.words = bd.finish()
         self.tr = None
-        self.addrs, self.images = bd.s.t.addrs, bd.images
+        self.addrs, self.built = bd.s.t.addrs, bd.built()
 
     def state(self) -> dict:
         """What ``restored`` needs besides the device's images (the transaction's shim addresses as relocations)."""

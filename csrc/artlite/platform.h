@@ -79,6 +79,18 @@ inline void drop_pages(void* addr, size_t n) {
 #endif
 }
 
+// Map the pages of [addr, addr + n) of a file mapping that are in the page cache into the process ahead of its reads
+// (MADV_POPULATE_READ, Linux 5.14: one call instead of a page fault per 64 KB; elsewhere, or on older kernels,
+// nothing).
+inline void populate([[maybe_unused]] void* addr, [[maybe_unused]] size_t n) {
+#ifndef _WIN32
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+  ::madvise(addr, n, MADV_POPULATE_READ);
+#endif
+}
+
 // Whether a read should bring [addr, addr + n) of a file mapping into memory: some page is not there (Linux: mincore;
 // a failed query says no). Windows has no such query and always says yes.
 inline bool needs_reading([[maybe_unused]] void* addr, [[maybe_unused]] size_t n, [[maybe_unused]] unsigned char* vec) {

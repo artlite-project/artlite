@@ -10,21 +10,13 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <chrono>
-#include <cerrno>
-#include <cstdlib>
 #include <cstring>
-#include <deque>
-#include <exception>
 #include <format>
 #include <memory>
-#include <mutex>
-#include <system_error>
-#include <thread>
 #include <unordered_map>
 
 #include "artlite/error.h"
+#include "artlite/pack_run.h"
 #include "artlite/platform.h"
 
 namespace artlite {
@@ -34,14 +26,13 @@ namespace {
 constexpr int kMaxNsb = 16;
 // per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, BF16, F16, F32
 constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 98, 512, 512, 1024};
-constexpr int64_t kItemRows = 2048;                // rows of a work item
-constexpr size_t kPrefetchWindow = size_t(2) << 30;
-constexpr size_t kPrefetchPiece = size_t(8) << 20;
-constexpr unsigned kPrefetchThreads = 16;
+constexpr int64_t kItemRows = 2048;  // rows of a work item
 
 alignas(64) const uint8_t kZeroRow[kMaxNsb * 1024] = {};  // a padding row's blocks (-1)
 
 using Idx = std::array<uint8_t, 64>;
+using pack::bfp16_blocks;
+using pack::bfp16_values;
 
 /// vpermi2b indices of a super-block's low-nibble planes (bytes 64 half .. 64 half + 63) from the nibble pairs of
 /// its 128 code bytes (``nibble_pairs``: byte 2 m + h = nibble h of code bytes 2 m and 2 m + 1). Q4_K / Q5_K: code
@@ -437,47 +428,6 @@ void tile_iq3xxs(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// 16 values (two blocks of 8) -> their bfp16ebs8 blocks as ``operators.bfp16.blocks`` rounds them: the exponent of
-/// the block's maximum (at least 2^-120), mantissas rint(x 2^(6 - e)), a positive maximum rounded up to 128 raises
-/// the exponent (a negative one stays at -128), an all-zero block has exponent byte 0.
-inline void bfp16_blocks(__m512 x, uint8_t* blk0, uint8_t* blk1) {
-  const __m512i bits = _mm512_and_si512(_mm512_castps_si512(x), _mm512_set1_epi32(0x7FFFFFFF));
-  __m512i mx = _mm512_max_epu32(bits, _mm512_shuffle_epi32(bits, _MM_PERM_CDAB));
-  mx = _mm512_max_epu32(mx, _mm512_shuffle_epi32(mx, _MM_PERM_BADC));
-  mx = _mm512_max_epu32(mx, _mm512_shuffle_i32x4(mx, mx, _MM_SHUFFLE(2, 3, 0, 1)));  // (per 8 lanes)
-  __m512i e = _mm512_max_epi32(_mm512_sub_epi32(_mm512_srli_epi32(mx, 23), _mm512_set1_epi32(127)),
-                               _mm512_set1_epi32(-120));
-  auto mant = [&](__m512i ee) {
-    const __m512 scale = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_sub_epi32(_mm512_set1_epi32(133), ee), 23));
-    return _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(x, scale), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-  };
-  __m512i m = mant(e);
-  const __mmask16 over = _mm512_cmpgt_epi32_mask(m, _mm512_set1_epi32(127));
-  if (over) {
-    const __mmask16 raise = static_cast<__mmask16>(((over & 0xFF) ? 0xFF : 0) | ((over & 0xFF00) ? 0xFF00 : 0));
-    e = _mm512_mask_add_epi32(e, raise, e, _mm512_set1_epi32(1));
-    m = _mm512_mask_mov_epi32(m, raise, mant(e));
-  }
-  const __m128i mb = _mm512_cvtepi32_epi8(m);
-  const int e0 = _mm512_cvtsi512_si32(e), e1 = _mm_extract_epi32(_mm512_extracti32x4_epi32(e, 2), 0);
-  const uint32_t a0 = static_cast<uint32_t>(_mm512_cvtsi512_si32(mx));
-  const uint32_t a1 = static_cast<uint32_t>(_mm_extract_epi32(_mm512_extracti32x4_epi32(mx, 2), 0));
-  blk0[0] = a0 ? static_cast<uint8_t>(e0 + 127) : 0;
-  blk1[0] = a1 ? static_cast<uint8_t>(e1 + 127) : 0;
-  std::memcpy(blk0 + 1, &mb, 8);
-  std::memcpy(blk1 + 1, reinterpret_cast<const uint8_t*>(&mb) + 8, 8);
-}
-
-/// The values of two bfp16ebs8 blocks (``operators.bfp16.block_values``): m 2^(E - 133).
-inline __m512 bfp16_values(const uint8_t* blk0, const uint8_t* blk1) {
-  int64_t m0, m1;
-  std::memcpy(&m0, blk0 + 1, 8);
-  std::memcpy(&m1, blk1 + 1, 8);
-  const __m512 m = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_set_epi64x(m1, m0)));
-  const __m256 e0 = _mm256_set1_ps(float(blk0[0]) - 133.0f), e1 = _mm256_set1_ps(float(blk1[0]) - 133.0f);
-  return _mm512_scalef_ps(m, _mm512_insertf32x8(_mm512_castps256_ps512(e0), e1, 1));
-}
-
 /// BFP16 (bf16.py) of BF16 or F16 rows: 8 rows of [k8][row][exp, 8 int8] blocks.
 template <bool F16>
 void tile_bfp16(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -531,29 +481,10 @@ size_t used_bytes(TileFormat f, int R, int nsb) {
   return 0;
 }
 
-/// Copy a tile to its place in the image (64-byte aligned both: non-temporal stores).
-void put_tile(uint8_t* dst, const uint8_t* tile, size_t S) {
-  if (reinterpret_cast<uintptr_t>(dst) % 64 || S % 64) {
-    std::memcpy(dst, tile, S);
-    return;
-  }
-  for (size_t i = 0; i < S; i += 64)
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i), _mm512_load_si512(tile + i));
-}
-
 struct Item {
   int block, col;
   int64_t t0, nt;  // row tiles
 };
-
-/// The whole pages inside [p, p + n) (MADV_DONTNEED must not touch a neighbour's) or around it (MADV_WILLNEED).
-std::pair<uintptr_t, size_t> pages(const uint8_t* p, size_t n, bool inside) {
-  const uintptr_t ps = static_cast<uintptr_t>(platform::page_size());
-  uintptr_t a = reinterpret_cast<uintptr_t>(p), b = a + n;
-  a = inside ? (a + ps - 1) / ps * ps : a / ps * ps;
-  b = inside ? b / ps * ps : (b + ps - 1) / ps * ps;
-  return {a, b > a ? b - a : 0};
-}
 
 }  // namespace
 
@@ -576,18 +507,13 @@ TileFormat tile_format(std::string_view name) {
 size_t block_bytes(TileFormat f) { return kBlockBytes[static_cast<int>(f)]; }
 
 void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blocks, const PackOptions& opt) {
-  // checks, the work items, the tensors' item counts (release) in order of first use (prefetch)
-  struct Tensor {
-    const uint8_t* data;
-    size_t bytes;
-    int64_t left;                  // items (release)
-    std::atomic<int64_t> pending;  // pieces not read yet (prefetch)
-  };
-  std::deque<Tensor> tensors;
-  std::unordered_map<const uint8_t*, size_t> tensor_of;
-  std::vector<std::vector<size_t>> block_tensors(blocks.size());
+  // checks, the work items, the tensors in order of first use
+  pack::Items run;
+  std::unordered_map<const uint8_t*, uint32_t> tensor_of;
+  std::vector<std::vector<uint32_t>> block_tensors(blocks.size());
   std::vector<Item> items;
   size_t max_S = 64;
+  const int file = opt.file.empty() ? -1 : 0;
   for (size_t bi = 0; bi < blocks.size(); bi++) {
     const PackBlock& b = blocks[bi];
     const size_t row_bytes = size_t(b.row_sb) * kBlockBytes[static_cast<int>(b.fmt)];
@@ -609,8 +535,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     int64_t total = 0;
     for (auto [data, rows] : b.tensors) {
       total += rows;
-      auto [it, added] = tensor_of.try_emplace(data, tensors.size());
-      if (added) tensors.emplace_back(data, size_t(rows) * row_bytes, 0, 0);
+      auto [it, added] = tensor_of.try_emplace(data, static_cast<uint32_t>(run.tensors.size()));
+      if (added) run.tensors.push_back({data, size_t(rows) * row_bytes, file});
       block_tensors[bi].push_back(it->second);
     }
     const int64_t indices = f32 ? 2 * total : total;  // (F32: two planes per row)
@@ -622,199 +548,110 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     for (int c = 0; c < b.cols; c++)
       for (int64_t t0 = 0; t0 < tiles; t0 += step) {
         items.push_back({static_cast<int>(bi), c, t0, std::min(step, tiles - t0)});
-        for (size_t t : block_tensors[bi]) tensors[t].left++;
+        run.add(block_tensors[bi], size_t(items.back().nt) * tile_rows * row_bytes);
       }
   }
 
-  std::atomic<size_t> next{0}, done_bytes{0};
-  std::atomic<size_t> needed{0};  // (tensors 0 .. needed - 1: a claimed item reads them; the prefetchers never hold
-                                  // them back)
-  std::atomic<bool> failed{false}, finished{false};
-  std::mutex mutex;  // (the tensors' counts, the first error)
-  std::exception_ptr error;
-
-  auto worker = [&] {
-    auto tile = platform::aligned_buffer<uint8_t>(64, (max_S + 63) / 64 * 64);
-    std::vector<uint8_t> part;  // (the rows of a chunk past a row's end: its super-blocks, then zero ones)
-    try {
-      if (!tile) throw std::bad_alloc();
+  std::vector<pack::MappedFile> files;
+  if (file == 0) files.push_back({opt.file, opt.map});
+  pack::run_items(run, files, opt.threads, opt.release, [&] {
+    auto tile = std::shared_ptr<uint8_t>(platform::aligned_buffer<uint8_t>(64, (max_S + 63) / 64 * 64).release(),
+                                         platform::AlignedFree{});
+    if (!tile) throw std::bad_alloc();
+    auto part = std::make_shared<std::vector<uint8_t>>();  // (the rows of a chunk past a row's end: its super-blocks,
+                                                           // then zero ones)
+    return std::function<void(size_t)>([&, tile, part](size_t k) {
       const uint8_t* src[256];
       const uint8_t* base[256];
       uint8_t lo[256];
-      for (size_t k; !failed && (k = next++) < items.size();) {
-        const Item& it = items[k];
-        const PackBlock& b = blocks[it.block];
-        const bool f32 = b.fmt == TileFormat::BFP16_F32;
-        const int tile_rows = b.R * b.G;
-        const size_t bb = kBlockBytes[static_cast<int>(b.fmt)], row_bytes = size_t(b.row_sb) * bb;
-        for (size_t t : block_tensors[it.block]) {
-          size_t n = needed;
-          while (n < t + 1 && !needed.compare_exchange_weak(n, t + 1)) {
+      const Item& it = items[k];
+      const PackBlock& b = blocks[it.block];
+      const bool f32 = b.fmt == TileFormat::BFP16_F32;
+      const int tile_rows = b.R * b.G;
+      const size_t bb = kBlockBytes[static_cast<int>(b.fmt)], row_bytes = size_t(b.row_sb) * bb;
+      std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
+      uint8_t* col = out + b.offset + it.col * b.col_stride;
+      for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
+        const int64_t* rows = b.rows + it.col * b.n + rt * tile_rows;
+        for (int r = 0; r < tile_rows; r++) {
+          base[r] = nullptr;
+          int64_t i = rows[r];
+          lo[r] = f32 && i >= 0 ? i & 1 : 0;
+          if (f32 && i >= 0) i >>= 1;
+          for (auto [data, n] : b.tensors) {
+            if (i < 0) break;
+            if (i < n) {
+              base[r] = data + i * row_bytes;
+              break;
+            }
+            i -= n;
           }
         }
-        for (size_t t : block_tensors[it.block])  // (read by the prefetchers: no page fault reads it in 128 KB)
-          while (tensors[t].pending > 0 && !failed) std::this_thread::sleep_for(std::chrono::microseconds(100));
-        std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
-        uint8_t* col = out + b.offset + it.col * b.col_stride;
-        for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
-          const int64_t* rows = b.rows + it.col * b.n + rt * tile_rows;
-          for (int r = 0; r < tile_rows; r++) {
-            base[r] = nullptr;
-            int64_t i = rows[r];
-            lo[r] = f32 && i >= 0 ? i & 1 : 0;
-            if (f32 && i >= 0) i >>= 1;
-            for (auto [data, n] : b.tensors) {
-              if (i < 0) break;
-              if (i < n) {
-                base[r] = data + i * row_bytes;
-                break;
-              }
-              i -= n;
+        for (int kc = 0; kc < b.n_kc; kc++) {
+          const int have = std::clamp(b.row_sb - kc * b.nsb, 0, b.nsb);  // (the chunk's super-blocks in a row)
+          if ((have < b.nsb || b.G > 1) && part->size() < size_t(b.R) * b.nsb * bb)
+            part->assign(size_t(b.R) * b.nsb * bb, 0);
+          for (int r = 0; r < b.R; r++) {
+            if (b.G > 1) {  // (a tile row of G rows of row_sb super-blocks)
+              uint8_t* p = part->data() + size_t(r) * b.nsb * bb;
+              for (int j = 0; j < b.G; j++)
+                std::memcpy(p + j * row_bytes, base[b.G * r + j] ? base[b.G * r + j] : kZeroRow, row_bytes);
+              src[r] = p;
+            } else if (!base[r] || have == 0) {
+              src[r] = kZeroRow;
+            } else if (have == b.nsb) {
+              src[r] = base[r] + kc * b.nsb * bb;
+            } else {
+              uint8_t* p = part->data() + size_t(r) * b.nsb * bb;
+              std::memcpy(p, base[r] + kc * b.nsb * bb, have * bb);
+              std::memset(p + have * bb, 0, (b.nsb - have) * bb);
+              src[r] = p;
             }
           }
-          for (int kc = 0; kc < b.n_kc; kc++) {
-            const int have = std::clamp(b.row_sb - kc * b.nsb, 0, b.nsb);  // (the chunk's super-blocks in a row)
-            if ((have < b.nsb || b.G > 1) && part.size() < size_t(b.R) * b.nsb * bb)
-              part.assign(size_t(b.R) * b.nsb * bb, 0);
-            for (int r = 0; r < b.R; r++) {
-              if (b.G > 1) {  // (a tile row of G rows of row_sb super-blocks)
-                uint8_t* p = part.data() + size_t(r) * b.nsb * bb;
-                for (int j = 0; j < b.G; j++)
-                  std::memcpy(p + j * row_bytes, base[b.G * r + j] ? base[b.G * r + j] : kZeroRow, row_bytes);
-                src[r] = p;
-              } else if (!base[r] || have == 0) {
-                src[r] = kZeroRow;
-              } else if (have == b.nsb) {
-                src[r] = base[r] + kc * b.nsb * bb;
-              } else {
-                uint8_t* p = part.data() + size_t(r) * b.nsb * bb;
-                std::memcpy(p, base[r] + kc * b.nsb * bb, have * bb);
-                std::memset(p + have * bb, 0, (b.nsb - have) * bb);
-                src[r] = p;
-              }
-            }
-            switch (b.fmt) {
-              case TileFormat::Q4_K:
-                tile_q4k(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q5_K:
-                tile_q5k(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q6_K:
-                tile_q6k(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q4_0:
-                tile_q4_0(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q8_0:
-                tile_q8_0(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q4_1:
-                tile_q4_1(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q2_K:
-                tile_q2k(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::Q3_K:
-                tile_q3k(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::IQ3_XXS:
-                tile_iq3xxs(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::BFP16_BF16:
-                tile_bfp16<false>(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::BFP16_F16:
-                tile_bfp16<true>(tile.get(), src, b.R, b.nsb);
-                break;
-              case TileFormat::BFP16_F32:
-                tile_bfp16_f32(tile.get(), src, lo, b.R, b.nsb);
-                break;
-            }
-            const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
-            put_tile(col + idx * b.S, tile.get(), b.S);
+          switch (b.fmt) {
+            case TileFormat::Q4_K:
+              tile_q4k(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q5_K:
+              tile_q5k(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q6_K:
+              tile_q6k(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q4_0:
+              tile_q4_0(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q8_0:
+              tile_q8_0(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q4_1:
+              tile_q4_1(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q2_K:
+              tile_q2k(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::Q3_K:
+              tile_q3k(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::IQ3_XXS:
+              tile_iq3xxs(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::BFP16_BF16:
+              tile_bfp16<false>(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::BFP16_F16:
+              tile_bfp16<true>(tile.get(), src, b.R, b.nsb);
+              break;
+            case TileFormat::BFP16_F32:
+              tile_bfp16_f32(tile.get(), src, lo, b.R, b.nsb);
+              break;
           }
-        }
-        done_bytes += size_t(it.nt) * tile_rows * row_bytes;
-        if (opt.release) {
-          std::vector<size_t> drop;
-          {
-            std::lock_guard lock(mutex);
-            for (size_t t : block_tensors[it.block])
-              if (--tensors[t].left == 0) drop.push_back(t);
-          }
-          for (size_t t : drop) {  // (the pages stay in the page cache)
-            auto [a, n] = pages(tensors[t].data, tensors[t].bytes, true);
-            if (n) platform::drop_pages(reinterpret_cast<void*>(a), n);
-          }
+          const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
+          pack::stream_copy(col + idx * b.S, tile.get(), b.S);
         }
       }
-      _mm_sfence();
-    } catch (...) {
-      std::lock_guard lock(mutex);
-      if (!error) error = std::current_exception();
-      failed = true;
-    }
-  };
-
-  // prefetch: the tensors in pieces, in order of first use, each read into the page cache by one of kPrefetchThreads
-  // threads unless mincore finds it resident (pread: the device's 128 KB readahead makes page faults and
-  // MADV_WILLNEED / POPULATE_READ stream at 1.2 - 1.8 GB/s, 16 threads of 8 MB reads at 3.5 GB/s: a cold 27B packs
-  // in 5.3 s), at most a window ahead of the workers but for the tensors of claimed items (the window counts the
-  // items' rows, which can fall behind the tensors' bytes: workers waiting on a held-back tensor would never finish
-  // one); a worker starts an item once its tensors are read
-  std::unique_ptr<platform::File> file;
-  if (!opt.file.empty()) file = std::make_unique<platform::File>(opt.file);
-  const bool prefetching = file != nullptr;
-  struct Piece {
-    const uint8_t* data;
-    size_t bytes, tensor;
-  };
-  std::vector<Piece> pieces;
-  size_t window = kPrefetchWindow;  // (>= a tensor: the workers of its first item wait for all of it)
-  for (size_t t = 0; t < tensors.size(); t++) {
-    window = std::max(window, tensors[t].bytes);
-    for (size_t o = 0; o < tensors[t].bytes; o += kPrefetchPiece)
-      pieces.push_back({tensors[t].data + o, std::min(kPrefetchPiece, tensors[t].bytes - o), t});
-    tensors[t].pending = prefetching ? -(-int64_t(tensors[t].bytes) / int64_t(kPrefetchPiece)) : 0;
-  }
-  std::atomic<size_t> next_piece{0}, issued{0};
-  auto prefetcher = [&] {
-    const size_t ps = platform::page_size();
-    auto buf = platform::aligned_buffer(ps, kPrefetchPiece + ps);
-    std::vector<unsigned char> resident(kPrefetchPiece / ps + 2);
-    for (size_t k; !finished && !failed && (k = next_piece++) < pieces.size();) {
-      const Piece& pc = pieces[k];
-      while (!finished && !failed && issued > done_bytes + window && pc.tensor >= needed)
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
-      issued += pc.bytes;
-      auto [a, len] = pages(pc.data, pc.bytes, false);
-      if (buf && platform::needs_reading(reinterpret_cast<void*>(a), len, resident.data()))
-        for (size_t got = 0; got < len;) {  // (errors, no buffer: the workers' page faults read it)
-          size_t r = 0;
-          try {
-            r = file->read_at(buf.get(), len - got, a - reinterpret_cast<uintptr_t>(opt.map) + got);
-          } catch (const std::system_error&) {
-          }
-          if (r == 0) break;
-          got += r;
-        }
-      tensors[pc.tensor].pending--;
-    }
-  };
-
-  unsigned threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency() / 2);
-  threads = static_cast<unsigned>(std::min<size_t>(threads, std::max<size_t>(1, items.size())));
-  std::vector<std::thread> pool;
-  std::vector<std::thread> prefetch;
-  if (prefetching)
-    for (unsigned i = 0; i < kPrefetchThreads; i++) prefetch.emplace_back(prefetcher);
-  for (unsigned i = 1; i < threads; i++) pool.emplace_back(worker);
-  worker();
-  for (auto& th : pool) th.join();
-  finished = true;
-  for (auto& th : prefetch) th.join();
-  if (error) std::rethrow_exception(error);
+    });
+  });
 }
 
 }  // namespace artlite

@@ -22,7 +22,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 # The smoke set (``pytest tests -m smoke``, about a minute with the designs cached): the host-side tests, the
 # apps' full designs build, and one or two NPU cases per component (each model's decode slice, attention, prefill
-# GEMM / attention / norm, the shared GEMV, fused ELFs, the activation table, kmath's variants, kernel_lib's gathers).
+# GEMM / attention / norm, the shared GEMV, fused ELFs, the activation table, kmath's variants, kernel_lib's gathers,
+# the vision overlay's ops and weight packer).
 # Entries: test files or test ids.
 SMOKE = (
     "test_app_designs.py", "decode/test_kv.py", "test_overlay.py", "gemma4/test_attn.py", "llama/test_image.py",
@@ -64,7 +65,7 @@ SMOKE = (
     "prefill/test_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
     "vision/test_ops.py::test_gemm[16-2-640-640-True-bf16]", "vision/test_ops.py::test_conv[16-1-640-640-True]",
     "vision/test_ops.py::test_norm[gnsilu-64-640-2-4]", "vision/test_ops.py::test_attention[16-80-2-2-False-8-False]",
-    "vision/test_ops.py::test_gemm_rope", "vision/test_ops.py::test_attention_dense[5-0.83]",
+    "vision/test_ops.py::test_gemm_rope", "vision/test_ops.py::test_attention_dense[5-0.83]", "vision/test_weights.py",
     "qwen3vl/test_ref.py::test_sizes", "qwen3vl/test_encoder.py::test_layout[64-64]", "qwen3vl/test_encoder.py::test_pieces",
     "sd15/test_vae.py::test_conv[512-128-128]",
 )

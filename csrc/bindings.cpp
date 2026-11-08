@@ -30,6 +30,7 @@
 #include "artlite/gguf_json.h"
 #include "artlite/kernel.h"
 #include "artlite/moe_host.h"
+#include "artlite/slot_pack.h"
 #include "artlite/profiler.h"
 #include "artlite/sampling.h"
 #include "artlite/shim.h"
@@ -869,6 +870,100 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       "consecutive in rows, along K). threads: 0 = one per physical core; release: "
       "MADV_DONTNEED each tensor's pages when done (file mappings only); file: (path, its whole mapping) of the "
       "tensors: read into the page cache ahead of the workers.");
+
+  m.def(
+      "pack_slots",
+      [](nb::list dsts, nb::list tensors, nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> jobs,
+         nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> parts,
+         nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> scales,
+         nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> rows,
+         nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> runs, nb::list files, unsigned threads,
+         bool release) {
+        using Out = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+        using Raw = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+        using Map = nb::ndarray<const uint8_t, nb::ndim<1>, nb::device::cpu>;
+        std::vector<std::pair<uint8_t*, size_t>> out;
+        for (nb::handle h : dsts) {
+          auto a = nb::cast<Out>(h, false);
+          out.emplace_back(a.data(), a.shape(0));
+        }
+        std::vector<artlite::pack::MappedFile> fs;
+        for (nb::handle h : files) {
+          auto t = nb::cast<nb::tuple>(h);
+          fs.push_back({nb::cast<std::string>(t[0]), nb::cast<Map>(t[1], false).data()});
+        }
+        std::vector<artlite::SlotTensor> ts;
+        for (nb::handle h : tensors) {
+          auto t = nb::cast<nb::tuple>(h);
+          if (t.size() != 5) throw artlite::Error("pack_slots: a tensor is (type, raw, rows, cols, file)");
+          const std::string type = nb::cast<std::string>(t[0]);
+          artlite::SlotTensor x{};
+          x.type = type == "F32"    ? artlite::SlotSource::F32
+                   : type == "F16"  ? artlite::SlotSource::F16
+                   : type == "BF16" ? artlite::SlotSource::BF16
+                   : type == "Q8_0" ? artlite::SlotSource::Q8_0
+                   : type == "EYE"  ? artlite::SlotSource::EYE
+                                    : throw artlite::Error(std::format("pack_slots: no source type {}", type));
+          x.rows = nb::cast<int64_t>(t[2]);
+          x.cols = nb::cast<int64_t>(t[3]);
+          x.file = nb::cast<int>(t[4]);
+          const size_t rb = type == "F32" ? 4 * size_t(x.cols) : type == "Q8_0" ? 34 * size_t(x.cols / 32)
+                            : type == "EYE" ? 0 : 2 * size_t(x.cols);
+          if (x.rows <= 0 || x.cols <= 0 || x.cols >= (int64_t(1) << 31) || (type == "Q8_0" && x.cols % 32) ||
+              x.file < -1 || x.file >= int(fs.size()))
+            throw artlite::Error(std::format("pack_slots: tensor {}: {} x {} {}, file {}", ts.size(), x.rows, x.cols,
+                                             type, x.file));
+          if (type != "EYE") {
+            auto raw = nb::cast<Raw>(t[1], false);
+            if (raw.shape(0) != size_t(x.rows) || raw.shape(1) != rb)
+              throw artlite::Error(std::format("pack_slots: tensor {}: raw ({}, {}) for {} x {} {}", ts.size(),
+                                               raw.shape(0), raw.shape(1), x.rows, x.cols, type));
+            x.data = raw.data();
+          }
+          x.row_bytes = rb;
+          ts.push_back(x);
+        }
+        if (parts.shape(1) != 4 || scales.shape(0) != parts.shape(0) || runs.shape(1) != 4 || jobs.shape(1) != 7)
+          throw artlite::Error("pack_slots: jobs (J, 7), parts (P, 4), scales (P,), runs (R, 4)");
+        std::vector<artlite::SlotPart> ps;
+        for (size_t i = 0; i < parts.shape(0); i++) {
+          const int64_t* p = parts.data() + 4 * i;
+          if (p[1] < 0 || p[2] < 0 || p[3] < 0 || size_t(p[2] + p[3]) > runs.shape(0))
+            throw artlite::Error(std::format("pack_slots: part {}: rows from {}, runs {} + {} of {}", i, p[1], p[2], p[3],
+                                             runs.shape(0)));
+          ps.push_back({static_cast<int>(p[0]), scales.data()[i], rows.data() + p[1], runs.data() + 4 * p[2],
+                        static_cast<int>(p[3])});
+        }
+        std::vector<artlite::SlotJob> js;
+        for (size_t i = 0; i < jobs.shape(0); i++) {
+          const int64_t* j = jobs.data() + 7 * i;
+          const size_t bytes = size_t(j[2]) * size_t(j[3]) * 5760;
+          if (j[0] < 0 || size_t(j[0]) >= out.size() || j[1] < 0 || size_t(j[1]) + bytes > out[j[0]].second ||
+              j[5] < 0 || j[6] < 0 || size_t(j[5] + j[6]) > ps.size())
+            throw artlite::Error(std::format("pack_slots: job {}: {} B at {} of buffer {} ({} buffers), parts {} + {}",
+                                             i, bytes, j[1], j[0], out.size(), j[5], j[6]));
+          for (int64_t k = j[5]; k < j[5] + j[6]; k++)
+            if (parts.data()[4 * k + 1] + j[2] * 80 > int64_t(rows.shape(0)))
+              throw artlite::Error(std::format("pack_slots: job {}: part {}: rows past the {} given", i, k, rows.shape(0)));
+          js.push_back({out[j[0]].first + j[1], static_cast<int>(j[2]), static_cast<int>(j[3]), j[4] != 0,
+                        static_cast<int>(j[5]), static_cast<int>(j[6])});
+        }
+        nb::gil_scoped_release release_gil;
+        artlite::pack_slots(ts, ps, js, fs, threads, release);
+      },
+      "dsts"_a, "tensors"_a, "jobs"_a, "parts"_a, "scales"_a, "rows"_a, "runs"_a, "files"_a = nb::list(),
+      "threads"_a = 0, "release"_a = false,
+      nb::sig("def pack_slots(dsts: list[numpy.ndarray[numpy.uint8]], tensors: list[tuple], "
+              "jobs: numpy.ndarray[numpy.int64], parts: numpy.ndarray[numpy.int64], "
+              "scales: numpy.ndarray[numpy.float32], rows: numpy.ndarray[numpy.int32], "
+              "runs: numpy.ndarray[numpy.int32], files: list[tuple[str, numpy.ndarray[numpy.uint8]]] = [], "
+              "threads: int = 0, release: bool = False) -> None"),
+      "Pack the vision overlay's weight images (artlite::pack_slots, artlite.vision.weights): tensors (type \"F32\", "
+      "\"F16\", \"BF16\", \"Q8_0\" or \"EYE\", raw (rows, row bytes) uint8 or None for EYE, rows, cols, file: an index "
+      "into files or -1), jobs (J, 7) int64 [dst buffer, byte offset, passes, k-tiles, hilo, first part, parts], parts "
+      "(P, 4) int64 [tensor, first of its passes x 80 rows in rows (-1: a zero row), first run, runs], scales (P,), "
+      "runs (R, 4) int32 [first column, columns, source column, stride]; files: (path, its whole mapping), read "
+      "ahead; threads: 0 = one per physical core; release: MADV_DONTNEED each file tensor's pages when done.");
 
   // --- The MoE prefill's host step (artlite/moe: plan, ctl) ---
   m.def(

@@ -1,13 +1,17 @@
 """The vision overlay on the NPU (``VisionDevice``): its hardware context, DDR buffers, the roles' pages (``paging``: one
 image of two B slots per role, the same for every core), and dispatches of ``seq.Seq`` programs."""
 
+from __future__ import annotations
+
 import glob
 import hashlib
 import os
 import pickle
 import shutil
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Mapping
 from importlib.metadata import version
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -18,6 +22,10 @@ from ..overlay import OverlayDevice, Transaction
 from . import core as K
 from . import design as D
 from .seq import Seq
+from .weights import Slots, Source
+
+if TYPE_CHECKING:
+    from .build import Built
 
 
 def role_pages(work_dir: str) -> paging.Pager:
@@ -43,6 +51,7 @@ class VisionDevice:
     def __init__(self, design: D.VisionDesign | None = None):
         self.design = design or D.VisionDesign()
         self.dev = OverlayDevice(self.design)
+        self._packing: tuple[threading.Thread, list] | None = None  # (``pack_behind``)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
         self.pager = role_pages(os.path.dirname(self.dev._prog.insts_path))
@@ -99,6 +108,7 @@ class VisionDevice:
         self.dev.flush(chunk, off + offset, data.size)
 
     def read(self, name: str, nbytes: int | None = None, offset: int = 0) -> np.ndarray:
+        self.packed()
         chunk, off, n = self._images[name]
         nbytes = n - offset if nbytes is None else nbytes
         self.dev.fetch(chunk, off + offset, nbytes)
@@ -115,7 +125,31 @@ class VisionDevice:
         return Transaction(self.dev, seq.finish())
 
     def run(self, tr: Transaction) -> None:
+        self.packed()
         self.dev.dispatch(tr)
+
+    def pack_behind(self, pack: Callable[[], None]) -> None:
+        """Run ``pack`` (weight images: ``weights.Slots``, the native packer without the GIL) on a thread while the
+        caller goes on; the next dispatch waits for it (``packed``)."""
+        self.packed()
+        err: list = []
+
+        def run() -> None:
+            try:
+                pack()
+            except BaseException as e:  # noqa: BLE001 (raised by ``packed``)
+                err.append(e)
+        t = threading.Thread(target=run, name="vision-pack")
+        t.start()
+        self._packing = (t, err)
+
+    def packed(self) -> None:
+        """Until ``pack_behind``'s packing is done (its error raised here)."""
+        if self._packing is not None:
+            (t, err), self._packing = self._packing, None
+            t.join()
+            if err:
+                raise err[0]
 
     def layout(self) -> dict:
         """The DDR layout: the host buffers in creation order (name, bytes), per image its buffer, offset and bytes
@@ -182,9 +216,10 @@ class VisionDevice:
         self.run(self.transaction(self.seq()))
 
 
-# A model's built state on the design (the device's layout, the DDR images its builds wrote: weights, commands,
-# tables; its transactions with their shim addresses as relocations) cached in a directory per model file: restored,
-# a load skips the weights' conversion and the builds.
+# A model's built state on the design (the device's layout, what its builds wrote besides the weights: commands, norm
+# parameters, tables; the weight jobs; its transactions with their shim addresses as relocations) cached in a directory
+# per model file: restored, a load skips the builds and packs the weights from the model's files (``weights.Slots``),
+# as a build does; the cache never holds a copy of the weights.
 
 def state_dir(kind: str, path: str, sources: tuple[str, ...], files: list[str]) -> str:
     """The cache directory of a model's built state: ``CACHE_DIR/kind/<path's digest>/<key>``, the key covering the
@@ -203,37 +238,48 @@ def state_dir(kind: str, path: str, sources: tuple[str, ...], files: list[str]) 
     return os.path.join(CACHE_DIR, kind, hashlib.sha256(os.path.abspath(path).encode()).hexdigest()[:12], h.hexdigest()[:16])
 
 
-def load_state(cache: str) -> tuple[VisionDevice, dict] | None:
-    """A device restored from ``save_state``'s directory (its images written back) and the saved state; None: no
-    entry."""
-    if not os.path.exists(os.path.join(cache, "state.pkl")):
+def load_state(cache: str, sources: Mapping[str, Source], *,
+               accept: Callable[[dict], bool] | None = None) -> tuple[VisionDevice, dict] | None:
+    """A device restored from ``save_state``'s directory (the host's writes again, the weights packed from
+    ``sources``: the model's, ``weights.sources`` or ``weights.Sources``, on a thread until the first dispatch:
+    ``VisionDevice.pack_behind``) and the saved state; None: no entry, one whose state ``accept`` refuses, or one whose
+    weights' sources the model lacks."""
+    try:
+        with open(os.path.join(cache, "state.pkl"), "rb") as f:
+            st = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError):
         return None
-    with open(os.path.join(cache, "state.pkl"), "rb") as f:
-        st = pickle.load(f)
+    if not isinstance(st, dict) or "slots" not in st or (accept is not None and not accept(st["state"])):
+        return None
+    res = [Slots.resolve(t, sources) for t in st["slots"]]
+    if any(r is None for r in res):
+        return None
     npu = VisionDevice()
     npu.restore(st["layout"])
-    with open(os.path.join(cache, "images.bin"), "rb") as f:
-        for name, at, n in st["images"]:
-            f.seek(at)
-            f.readinto(npu.view(name)[:n])
-            npu.flush(name)
+    for name, off, data in st["writes"]:
+        npu.write(name, np.frombuffer(data, np.uint8), off)
+    npu.pack_behind(lambda: [Slots.restore(npu, t, r) for t, r in zip(st["slots"], res, strict=True)])
     return npu, st["state"]
 
 
-def save_state(cache: str, npu: VisionDevice, images: list[str], state: dict) -> None:
-    """The built state of a device (the DDR images ``images``) and the models' ``state`` into the cache directory
-    (written to a sibling, then renamed); the model file's older entries removed."""
+def save_state(cache: str, npu: VisionDevice, built: list[Built], state: dict) -> None:
+    """The built state of a device (what ``built`` wrote: the host's byte ranges, without their trailing zeros, and the
+    weight jobs) and the models' ``state`` into the cache directory (written to a sibling, then renamed); the model
+    file's older entries removed."""
     root, tmp = os.path.dirname(cache), f"{cache}.{os.getpid()}"
-    os.makedirs(tmp)
-    index, at = [], 0
-    with open(os.path.join(tmp, "images.bin"), "wb") as f:
-        for name in dict.fromkeys(images):
+    npu.packed()
+    writes = []
+    for b in built:
+        for name, ranges in b.writes.items():
             v = npu.view(name)
-            f.write(v.tobytes())
-            index.append((name, at, v.size))
-            at += v.size
+            for off, n in sorted(ranges.items()):
+                nz = np.flatnonzero(v[off:off + n])
+                if len(nz):
+                    writes.append((name, off, v[off:off + nz[-1] + 1].tobytes()))
+    st = {"layout": npu.layout(), "writes": writes, "slots": [b.slots.table(npu) for b in built], "state": state}
+    os.makedirs(tmp)
     with open(os.path.join(tmp, "state.pkl"), "wb") as f:
-        pickle.dump({"layout": npu.layout(), "images": index, "state": state}, f)
+        pickle.dump(st, f, protocol=pickle.HIGHEST_PROTOCOL)
     for e in os.listdir(root):
         if e != os.path.basename(tmp):
             shutil.rmtree(os.path.join(root, e), ignore_errors=True)

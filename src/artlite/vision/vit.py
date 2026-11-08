@@ -18,6 +18,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from ..operators.design import COLS
@@ -26,6 +27,7 @@ from .build import Builder, Level
 from .layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 from .ops import Apply, Attention, Gemm
 from .seq import ColOps, MemTask
+from .weights import Wt, pad_index, take
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
 FFN_REAL, FFN = 4304, 4480
@@ -79,17 +81,18 @@ class Keys:
                          dense=self.dense, **{"q": 0, "o": 0, "kv": 0} | kw)
 
 
-def pad_heads(w: torch.Tensor) -> torch.Tensor:
-    """Rows of 16 heads of 72 -> 16 heads of 80 (zero rows after each head's)."""
-    out = torch.zeros((HEADS * HP,) + w.shape[1:], dtype=w.dtype)
-    out.view(HEADS, HP, *w.shape[1:])[:, :HD] = w.reshape(HEADS, HD, *w.shape[1:])
-    return out
+HEAD_ROWS = np.array([h * HD + d if d < HD else -1 for h in range(HEADS) for d in range(HP)])  # (``pad_heads``)
 
 
-def pad(w: torch.Tensor, rows: int, cols: int = 0) -> torch.Tensor:
-    out = torch.zeros((rows, cols) if cols else (rows,), dtype=w.dtype)
-    out[tuple(slice(0, n) for n in w.shape)] = w
-    return out
+def pad_heads(w: Wt | torch.Tensor, dim: int = 0) -> Wt | torch.Tensor:
+    """Rows (dim 0) or columns (1) of 16 heads of 72 -> 16 heads of 80 (zeros after each head's)."""
+    return take(w, HEAD_ROWS, dim)
+
+
+def pad(w: Wt | torch.Tensor, rows: int, cols: int = 0) -> Wt | torch.Tensor:
+    """w's rows (and columns) zero-padded to rows (cols)."""
+    out = take(w, pad_index(rows, w.shape[0]))
+    return take(out, pad_index(cols, w.shape[1]), 1) if cols else out
 
 
 def ln_records(bd: Builder, x: Tensor, *, name: str) -> int:

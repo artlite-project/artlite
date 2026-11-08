@@ -112,7 +112,7 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
         assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)
 
 
-@pytest.mark.slow  # (20 layers' weights converted on the host)
+@pytest.mark.slow  # (20 layers on the CPU: in float64 and at the NPU's rounding points)
 def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
     """The 20 layers after the ViT merger (7 .. 26) in one dispatch on two entries: as far from the float64 layers as
     the CPU at the NPU's rounding points (the two apart by ~1e-2 after 20 layers: each layer's 1.5e-3); the dispatch's
@@ -222,7 +222,7 @@ def _pos(sim: V.NpuEncoder, e: M.Entry) -> torch.Tensor:
     return torch.nn.functional.pad(rows.float(), (0, M.C - M.H))
 
 
-@pytest.mark.slow  # (7 layers' weights converted on the host)
+@pytest.mark.slow  # (7 layers on the CPU: in float64 and at the NPU's rounding points)
 @pytest.mark.parametrize("case", ["pair", "joint"])
 def test_before_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
     """The patch embedding and layers 0 .. 6 on a dispatch's entries (``_pixels``): each as far from the float64

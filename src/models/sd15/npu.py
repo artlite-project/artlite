@@ -4,8 +4,9 @@ and ``NpuVae``, its image decoder (``vae.Decoder`` on the same design: one dispa
 
 Per step the host writes the latents and the 22 resnets' time biases (``host``: the steps' computed ahead on a worker
 thread, ``NpuUNet.prepare``), runs the dispatch and reads the 4 output channels; per prompt (a new context) it writes
-the cross attentions' K / V^T (computed on the host). The first build writes the weight images and builds the
-dispatches' transactions (the design's compile is cached).
+the cross attentions' K / V^T (computed on the host). Every load packs the weight images from the safetensors files
+(``artlite.vision.weights``: the native packer, the files read in place); the first one also builds the dispatches'
+transactions, which later loads restore from the cache (``load``; the design's compile is cached too).
 """
 
 import json
@@ -15,12 +16,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import torch
 
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
+from artlite.vision.weights import Source, safetensors, sources
 
 from . import reference
 from .host import resnet_time_biases
 from .model import UNet
-from .vae import Decoder
+from .vae import Decoder, latent_conv_in
 from .weights import load_safetensors
+
+FILE = "diffusion_pytorch_model.safetensors"
+VAE_PREFIXES = ("decoder.", "post_quant_conv.")  # (the VAE decoder's tensors)
 
 
 class NpuUNet:
@@ -32,13 +37,12 @@ class NpuUNet:
             cfg = json.load(f)
         assert cfg["block_out_channels"] == [320, 640, 1280, 1280] and cfg["attention_head_dim"] == 8, \
             f"{directory}: not SD 1.x's UNet"
-        path = os.path.join(directory, "diffusion_pytorch_model.safetensors")
+        path = os.path.join(directory, FILE)
+        self.w = load_safetensors(path, contains=UNet.RUNTIME)  # (the host's)
         if state is None:
-            self.w = load_safetensors(path)
-            self.net = UNet(npu or VisionDevice(), self.w, eps=cfg["norm_eps"])
+            self.net = UNet(npu or VisionDevice(), safetensors(path, tag="unet"), eps=cfg["norm_eps"], runtime=self.w)
             self.net.npu.warm()
         else:  # (a restored device's: ``load``)
-            self.w = load_safetensors(path, contains=UNet.RUNTIME)
             self.net = UNet.restored(npu, self.w, state)
         self.context: torch.Tensor | None = None
         self.pool = ThreadPoolExecutor(8)  # (the time biases' projections)
@@ -65,13 +69,9 @@ class NpuVae:
     dispatch): the sampler's latents (B, 4, 64, 64) -> the images (B, 3, 512, 512), one at a time."""
 
     def __init__(self, directory: str, npu: VisionDevice, *, state: dict | None = None):
-        with open(os.path.join(directory, "config.json")) as f:
-            cfg = json.load(f)
-        assert cfg["block_out_channels"] == [128, 256, 512, 512] and cfg["layers_per_block"] == 2 and \
-            cfg.get("latent_channels", 4) == 4, f"{directory}: not SD 1.x's VAE"
         if state is None:
-            w = load_safetensors(os.path.join(directory, "diffusion_pytorch_model.safetensors"), ("decoder.", "post_quant_conv."))
-            self.dec = Decoder(npu, w, scale=cfg.get("scaling_factor", 0.18215), eps=reference.VaeDecoder.EPS)
+            w, scale = vae_weights(directory)
+            self.dec = Decoder(npu, w, scale=scale, eps=reference.VaeDecoder.EPS)
             npu.warm()
         else:  # (a restored device's: ``load``)
             self.dec = Decoder.restored(npu, state)
@@ -87,14 +87,31 @@ _SOURCES = ("artlite/vision", "models/sd15/unet.py", "models/sd15/level64.py", "
             "models/sd15/npu.py", "models/sd15/reference.py", "models/sd15/weights.py")
 
 
+def vae_weights(directory: str) -> tuple[dict, float]:
+    """A diffusers ``vae`` directory's decoder weights (``weights.safetensors``) and its scaling factor."""
+    with open(os.path.join(directory, "config.json")) as f:
+        cfg = json.load(f)
+    assert cfg["block_out_channels"] == [128, 256, 512, 512] and cfg["layers_per_block"] == 2 and \
+        cfg.get("latent_channels", 4) == 4, f"{directory}: not SD 1.x's VAE"
+    return safetensors(os.path.join(directory, FILE), VAE_PREFIXES, tag="vae"), cfg.get("scaling_factor", 0.18215)
+
+
+def weight_sources(path: str) -> dict[str, Source]:
+    """The weights' sources of a diffusers directory's UNet and VAE decoder: the files' tensors, the VAE's computed
+    conv_in (``vae.latent_conv_in``)."""
+    w, scale = vae_weights(os.path.join(path, "vae"))
+    return sources(safetensors(os.path.join(path, "unet", FILE), tag="unet")) | sources(w) | \
+        sources(latent_conv_in(w, scale))
+
+
 def load(path: str) -> tuple[NpuUNet, NpuVae]:
     """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache
-    (``artlite.vision.device.state_dir``: the device's layout, the images the builds wrote (weights, commands, tables),
-    the transactions with their shim addresses relocated; keyed by the model's files and the code), else built and
-    cached (one entry per model)."""
-    files = [os.path.join(path, sub, f) for sub in ("unet", "vae") for f in ("config.json", "diffusion_pytorch_model.safetensors")]
+    (``artlite.vision.device.state_dir``: the device's layout, the commands and tables the builds wrote, the
+    transactions with their shim addresses relocated; keyed by the model's files and the code; the weights packed from
+    the files), else built and cached (one entry per model)."""
+    files = [os.path.join(path, sub, f) for sub in ("unet", "vae") for f in ("config.json", FILE)]
     cache = state_dir("sd15", path, _SOURCES, files)
-    if (got := load_state(cache)) is not None:
+    if (got := load_state(cache, weight_sources(path))) is not None:
         npu, st = got
         unet = NpuUNet(os.path.join(path, "unet"), npu=npu, state=st["unet"])
         vae = NpuVae(os.path.join(path, "vae"), npu, state=st["vae"])
@@ -103,5 +120,5 @@ def load(path: str) -> tuple[NpuUNet, NpuVae]:
     unet = NpuUNet(os.path.join(path, "unet"))
     npu = unet.net.npu
     vae = NpuVae(os.path.join(path, "vae"), npu)
-    save_state(cache, npu, unet.net.images + vae.dec.images, {"unet": unet.net.state(), "vae": vae.dec.state()})
+    save_state(cache, npu, [unet.net.built, vae.dec.built], {"unet": unet.net.state(), "vae": vae.dec.state()})
     return unet, vae

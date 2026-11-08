@@ -15,6 +15,7 @@ from artlite.vision.build import Builder, Level
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm, gn_apply, plain
 from artlite.vision.ops import Gemm
 from artlite.vision.seq import ColOps, MemTask
+from artlite.vision.weights import pad_index, take
 
 LV64 = Level(64, 4)
 ROW = 16 * L.PANEL  # (a row's token panels per kb, bytes)
@@ -287,8 +288,7 @@ def conv_in64(bd: Builder, w: dict, lat: PImage, *, stats: tuple[int, int], name
     """conv_in on the latents' PImage (lat: 64 channels, the 4 latent ones then zeros) -> the 64x64 level's 320 channels
     per band (records for ``stats``)."""
     wi = w["conv_in.weight"]
-    w64 = torch.zeros(wi.shape[0], lat.C, 3, 3)
-    w64[:, :wi.shape[1]] = wi
+    w64 = take(wi, pad_index(lat.C, wi.shape[1]), 1)
     out = DTensor(LV64, wi.shape[0], name, rec=[])
     for b in range(LV64.nb):
         out.store(bd, b, conv64(bd, lat, w64, w["conv_in.bias"], name="conv_in", band=b, stats=stats))
@@ -301,8 +301,7 @@ def conv_out64(bd: Builder, w: dict, x: DTensor, *, eps: float, name: str) -> No
     ``noise``)."""
     img = norm64(bd, x, "conv_norm_out.", w, name=name + ".pn", eps=eps)
     wo = w["conv_out.weight"]
-    w320, b320 = torch.zeros(320, x.C, 3, 3), torch.zeros(320)
-    w320[:wo.shape[0]], b320[:wo.shape[0]] = wo, w["conv_out.bias"]
+    w320, b320 = take(wo, pad_index(320, wo.shape[0])), take(w["conv_out.bias"], pad_index(320, wo.shape[0]))
     base = bd.ddr(name, LV64.nb * COLS * OUT)
     for b in range(LV64.nb):
         cb = conv64(bd, img, w320, b320, name="conv_out", band=b)

@@ -23,6 +23,11 @@ use any modern SIMD (AVX-512 included).
   definition once; a name written out in full collides as soon as two configurations meet in one fused program.
 - **Weights stay at their quantization's size.** Never expand them on the host; prefill and decode read one weight
   image in place. Lossless, same-size re-layouts are fine (images are packed at every load: nothing on disk).
+- **No file holds a copy of the weights.** Every load converts them from the model's files on the fly, with the native
+  AVX-512 packers (`csrc/artlite/tile_pack.cpp`: the GGUF tile formats; `slot_pack.cpp`: the vision overlay's B slots;
+  both on `pack_run.h`'s threads, read-ahead and non-temporal stores); preprocessing them (padding, permutations,
+  scales, folded normalizations) happens at load, never into a file. Caches keep only what the code builds (designs,
+  transactions, and a vision network's commands, which carry its biases and norm parameters).
 - Operators are self-contained: never import IRON operators.
 - Layers (Map): `models` -> `artlite`'s subsystems (`decode`, `prefill`, `moe`, `vision`, `gemm`, `formats`) -> the
   framework (`artlite.operators`, `artlite.overlay`) -> the runtime. Code that two models share lives in `artlite`, in
@@ -91,7 +96,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 | path | what |
 |---|---|
-| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, the NPU's turn between processes, profiler); API and errors: `docs/design.md`; the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
+| `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, the NPU's turn between processes, profiler) and the host's hot code (weight packers, dequantization, sampling, the MoE prefill's host step); API and errors: `docs/design.md`; the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
 | `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
 | `src/artlite/{txn,elf_parser}.py`, `overlay.py` | control programs: transactions built on the host (the `insts.bin` format), full ELFs and the patching of their control code; the host runtime of the overlays, designs run by host-built transactions (`Sequence`, `OverlayDevice`, `Transaction`, `WeightBuffer`) |
 | `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, cache, dispatch), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py`, `render_cache.py`, and the pieces operators share (How an operator works) |
@@ -104,7 +109,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma, Llama and Qwen3 (`attn.py`), the models' shared host side (`model.py`) |
 | `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs (packed ones: several inputs in a chunk, a recurrent model's after a cached prefix too, and their planner), the GEMM planner, the GEMMs' pace calibration (`pace.py`), the residual norms, the attention of a column per KV head (Llama's, Qwen3's) |
 | `src/artlite/moe/` | MoE layers: the routing on the decode overlay's cores, the prefill's router, expert work lists and gathers |
-| `src/artlite/vision/` | the vision overlay: image networks on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`), the vision encoders' ViT layers (`vit.py`) |
+| `src/artlite/vision/` | the vision overlay: image networks on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`), the vision encoders' ViT layers (`vit.py`), its weights (`weights.py`: views of the model files' tensors, packed at every load by `_native.pack_slots`), a model's cached build (`device.py`: transactions and commands, no weights) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
 | `src/artlite/{model_config,gguf_model,measure_ii,variant_search,profiling,probe}.py` | model files, schedule tools, profiling, `artlite-probe`'s designs |
 | `src/models/{llama,gemma4,qwen35}/` | the language models, a package per GGUF architecture (`llama` also runs `qwen3` and `vllm-decision2`: `qwen3.py`): on the NPU (the weight image `image.py`, the decode design `decode.py` and its host side `overlay.py`, the prefill `prefill.py`, the model's own operators) and on the host (tokenizer, chat template, inputs); `models.open_model` picks one by a GGUF file's architecture |

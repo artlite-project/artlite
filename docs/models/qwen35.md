@@ -190,8 +190,8 @@ token by an MLP. Its time grows with the patches and, through the attention, wit
 (Strix Halo, Qwen3.6-35B-A3B's mmproj; llama.cpp's `mtmd batch encoding` time.)
 
 A large image runs as a dispatch per one or a few layers (each well under the driver's 2 s). Its weights are converted
-to bfp16 at the first load (the patch embedding's and the merger's MLP's as bfp16 hi + lo pairs; the pixels enter as
-their exact 8-bit values) and cached with the dispatches of each image size (~0.6 GB, the cache directory); an image's
+to bfp16 at every load (the patch embedding's and the merger's MLP's as bfp16 hi + lo pairs; the pixels enter as
+their exact 8-bit values), the dispatches of each image size cached (~15 MB, the cache directory; later loads ~0.25 s); an image's
 embeddings are kept, so a chat's next turns do not run it again. The language model's answer with the NPU encoder's
 embeddings is as close to llama.cpp's own as with llama.cpp's embeddings (teacher-forced over a description: KL 0.005,
 argmax agreement 0.98).
@@ -213,8 +213,8 @@ The encoder (`minicpmv/encoder.py`) runs on the vision overlay, Stable Diffusion
 hardware context of its own): one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final
 merger) on two entries, or on one larger than 64 tokens alone, in about 60 ms: about 30 ms per entry (llama.cpp on the
 CPU: ~0.2 s per entry). The 4x file has no ViT merger, so its 27 layers all run on 1024 tokens per entry: about 65 ms
-per entry. Its weights are converted to bfp16 at the first load (the most sensitive ones, the patch embedding's and the
-final merger's, as bfp16 hi + lo pairs; the pixels enter as their exact 8-bit values) and cached with the dispatches, as
-Stable Diffusion's (~0.7 GB, the cache directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next
+per entry. Its weights are converted to bfp16 at every load (the most sensitive ones, the patch embedding's and the
+final merger's, as bfp16 hi + lo pairs; the pixels enter as their exact 8-bit values), the dispatches cached as Stable
+Diffusion's (~16 MB, the cache directory; later loads ~0.3 s); an image's embeddings are kept, so a chat's next
 turns do not run it again.
 

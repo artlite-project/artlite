@@ -13,6 +13,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import gelu_table
 from artlite.vision.ops import Apply, Attention, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
+from artlite.vision.weights import Slots, as_wt
 
 COLS, ROWS = 8, 4
 
@@ -58,11 +59,17 @@ def merge(*ops: dict[int, ColOps]) -> dict[int, ColOps]:
 
 
 def gemm_rows(npu: VisionDevice, name: str, g: Gemm, w: torch.Tensor, b: torch.Tensor | None) -> dict:
-    """Row images of a Gemm (per row its command, then its weights) in buffer ``name``; returns its RowOps by row."""
-    imgs = [np.concatenate([g.command(b, r), g.weights(w, r)]) for r in range(ROWS)]
-    per = imgs[0].size
+    """Row images of a Gemm (per row its command, then its weights: ``weights.Slots``) in buffer ``name``; returns its
+    RowOps by row."""
+    per = D.Q + g.npo * g.nkt * D.Q
+    img = np.zeros(ROWS * per, np.uint8)
+    for r in range(ROWS):
+        img[r * per:r * per + D.Q] = g.command(b, r)
+    s = Slots()
+    s.add(g, as_wt(w), {r: ("w", r * per + D.Q) for r in range(ROWS)})
+    s.pack_to({"w": img})
     npu.alloc(name, ROWS * per)
-    npu.write(name, np.concatenate(imgs))
+    npu.write(name, img)
     return {r: g.row_ops(npu.address(name, r * per)) for r in range(ROWS)}
 
 
