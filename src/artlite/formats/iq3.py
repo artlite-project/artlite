@@ -507,8 +507,9 @@ class Iq3Slot(Slot):
         return self.unit(rows)[0]
 
     def pass_tiles(self, fmt: str, rows: int, tiles: int) -> bool:
-        # (two weight objects of up to 5 units in the dequantizing core's L1: 23 KB; MMUL columns <= 128)
-        return tiles <= 5
+        # (two weight objects of up to 6 units in the dequantizing core's L1: 28 KB, a gate / up pass of a whole SiLU
+        # group; MMUL columns <= 128)
+        return tiles <= 6
 
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
         # ws: S, the signs, a call's codes, the index lists (module docstring of gemm/IQ3_XXS); hb: d; the grid

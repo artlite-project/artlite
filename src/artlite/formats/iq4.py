@@ -16,14 +16,19 @@ Decode (``mmv/iq4``): a weight panel (8 rows x 8 k) is its 32 code bytes looked 
 256 byte values' value pairs [v[lo], v[hi]] (``pair_words``: 16-bit entries, 4x16 gathers, ``common.TAB``): 8 gathers
 per panel, two panels per iteration (II 20, bound by the gathers' DM_ADA port); then the MMUL against the x panels, per
 32-k group the rows' sums c, and y += hilo(sum_i c_i (ls_i - 32)) d (IQ4_XS: the integer scales exact in bf16) or
-y += sum_i c_i d_i (IQ4_NL: bf16 d)."""
+y += sum_i c_i d_i (IQ4_NL: bf16 d).
+
+Prefill (``gemm/IQ4_NL``, ``gemm/IQ4_XS``: GemmQd on super-block units, a pass of whole 16-row tiles, MMUL row block t =
+tile t): per k-tile and tile the 8 k-steps' 64 code bytes each by 16 gathers of a table of the byte values' bf16 pairs
+(``bf16_pair_words``: 32-bit entries, 4x32), w = S v rounded once into bfp16, S = d (IQ4_NL) or bf16(d (ls - 32))
+(IQ4_XS: per unit, ``_sb``)."""
 
 from typing import ClassVar
 
 import numpy as np
 
 from . import k23
-from .common import TAB, Slot, TileFormat
+from .common import TAB, DqKernels, Slot, TileFormat, dq_kernel, i32
 
 
 def _pairs(nib: np.ndarray) -> np.ndarray:
@@ -47,6 +52,121 @@ def pair_words() -> np.ndarray:
     e = v[np.arange(256) & 15] | v[np.arange(256) >> 4] << 8
     return np.concatenate([e.reshape(16, 16)] * 2, 1).reshape(-1).view(np.uint32)
 
+
+TAB_PREFILL = 2048  # (the prefill's table copies)
+
+
+def bf16_pair_words() -> np.ndarray:
+    """The prefill's table (512 uint32 = 2 KB): entry b = [bf16(v[b & 15]), bf16(v[b >> 4])] at byte 8 b, i.e. per group
+    of 8 entries their 32 bytes twice (4x32 gathers)."""
+    from ..gguf_model import IQ4_VALUES
+
+    v = (IQ4_VALUES.astype(np.float32).view(np.uint32) >> 16).astype(np.uint32)
+    e = v[np.arange(256) & 15] | v[np.arange(256) >> 4] << 16
+    return np.concatenate([e.reshape(32, 8)] * 2, 1).reshape(-1)
+
+
+# GemmQd (prefill) on super-block units of whole 16-row tiles
+_GEMM = r"""// {{ fmt }} (GemmQd, super-block units: formats/iq4.py): the weight object is a unit of the pass's {{ tiles }} tiles
+// ({{ UP }} B each: [codes [i][s][g 2][r 8][4 B] | {{ "d [i][row 16] bf16" if fmt == "IQ4_NL" else "ls planes, d [row 16]" }}]); MMUL
+// row block t is tile t's 16 rows. {{ "Per unit _sb: S = bf16(d (ls - 32)) [i][16 t + r] in ws; " if fmt == "IQ4_XS" else "" }}per k-tile and 16-row
+// block the k-steps' panels: 64 code bytes, 16 gathers of the bf16 pairs [v[lo], v[hi]] (entry at 8 b), w = S v
+// rounded once (bf16 times bf16: exact in fp32)
+
+// 16 entries of the 4x32 table (a: their addresses) -> 32 bf16 (entries in order)
+[[clang::always_inline]] inline v16int32 {{ p }}_g32(v16int32 a)
+{
+    const v8int32 a0 = extract_v8int32(a, 0), a1 = extract_v8int32(a, 1);
+    const v16int32 c01 = concat(load_4x32_lo(a0), load_4x32_hi(a0));  // (entries 0 .. 7 in the even 32-bit lanes)
+    const v16int32 c23 = concat(load_4x32_lo(a1), load_4x32_hi(a1));
+    return ::shuffle(c01, c23, T32_16x2_lo);
+}
+
+{% if fmt == "IQ4_XS" %}
+// A unit's scales of the pass's rows: per tile S [i][16 t + r] = bf16(d (ls - 32)) (ls from the low plane, nibbles [i][row
+// 16], and the high one, nibbles [i' 4][row 16] = crumb i' | crumb i' + 4 << 2; bf16(128 + ls) by its bits, minus 160)
+void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<uint8, 64> m3 = aie::broadcast<uint8, 64>(3);
+    const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4300);
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const aie::accum<accfloat, 32> k160(aie::broadcast<float, 32>(-160.0f));
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tiles }}; t++) {
+        const uint8_t *u = b + {{ UP }} * t + 2048;
+        const aie::vector<uint8, 64> h = aie::unpack(aie::load_v<64>((const uint4 *)(u + 64)));  // ([i' 4][row 16])
+        const aie::vector<bfloat16, 32> d = aie::concat(aie::load_v<16>((const bfloat16 *)(u + 96)), aie::load_v<16>((const bfloat16 *)(u + 96)));
+        AIE_LOOP_UNROLL_FULL
+        for (int g = 0; g < 2; g++) {  // (groups 4 g ..)
+            const aie::vector<uint8, 64> l = aie::unpack(aie::load_v<64>((const uint4 *)(u + 32 * g)));
+            const aie::vector<uint8, 64> c = g ? aie::downshift(h, 2) : aie::bit_and(h, m3);
+            const aie::vector<uint8, 64> ls = aie::bit_or(l, aie::upshift(aie::bit_and(c, m3), 4));
+            AIE_LOOP_UNROLL_FULL
+            for (int j = 0; j < 2; j++) {  // (groups 4 g + 2 j, + 1)
+                const aie::vector<bfloat16, 32> v = aie::add(aie::unpack(ls.template extract<32>(j)), k43).template cast_to<bfloat16>();
+                const aie::vector<bfloat16, 32> sv = aie::mac(k160, v, one).template to_vector<bfloat16>();
+                const aie::vector<bfloat16, 32> S = aie::mul(sv, d).template to_vector<bfloat16>();
+                aie::store_v(ws + {{ n }} * (4 * g + 2 * j) + 16 * t, S.template extract<16>(0));
+                aie::store_v(ws + {{ n }} * (4 * g + 2 * j + 1) + 16 * t, S.template extract<16>(1));
+            }
+        }
+    }
+}
+{% else %}
+void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
+{
+}
+{% endif %}
+
+// k-tile kt -> {{ n_mac }} x 64 bfp16 panels (rows {{ n_mac }} half ..) in the MAC pop order [16-row block][k-step ks][8-row
+// half]
+void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt{{ half_arg }}, const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int t0 = {{ "half * %d" % (n_mac // 16) if halves > 1 else "0" }};
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
+    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v64int8 eight = broadcast_to_v64int8(8);
+    AIE_LOOP_NO_UNROLL
+    for (int t = t0; t < t0 + {{ n_mac // 16 }}; t++) {
+        const v64uint8 __aie_dm_resource_a *__restrict pc = (const v64uint8 __aie_dm_resource_a *)(b + {{ UP }} * t + 512 * kt);
+{% if fmt == "IQ4_NL" %}
+        const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)(b + {{ UP }} * t + 2048 + 64 * kt);
+{% else %}
+        const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)ws + {{ 2 * n }} * kt + 16 * t;
+{% endif %}
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int ks = 0; ks < 8; ks++) {  // (group 2 kt + ks / 4: its scales)
+            aie::vector<bfloat16, 64> S0, S1;
+            al::expand16_bc(aie::load_v<16>(ps + (ks >> 2) * {{ 16 if fmt == "IQ4_NL" else n }}), S0, S1);
+            const v64acc32 q = mul_elem_64_2(*pc++, eight);  // (8 b: [r 16][4 B])
+            const v16int32 e0 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 0), b16));
+            const v16int32 e1 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 1), b16));
+            const v16int32 e2 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 2), b16));
+            const v16int32 e3 = {{ p }}_g32(add((v16int32)extract_v16acc32(q, 3), b16));
+            out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e0), aie::vector<bfloat16, 32>((v32bfloat16)e1)), S0)
+                         .template to_vector<bfp16ebs8>());
+            out.push(aie::mul(aie::concat(aie::vector<bfloat16, 32>((v32bfloat16)e2), aie::vector<bfloat16, 32>((v32bfloat16)e3)), S1)
+                         .template to_vector<bfp16ebs8>());
+        }
+    }
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}
+
+"""
 
 # the decode GEMV (``decode.gemv``; the 4x16 gathers: ``mmv/g16``, the scaling by d: ``mmv/k23``)
 _MMV = r"""// ---- IQ4_NL / IQ4_XS (formats/iq4.py: {{ R4 }} rows, 2 row groups): per super-block a unit, [codes [i][s][g][r][4 B] |
@@ -201,8 +321,9 @@ __attribute__((noinline)) void {{ p }}_iq4xs(uint8_t *__restrict a, const uint8_
 
 
 class Iq4Slot(Slot):
-    formats = (TileFormat("IQ4_NL", 11, 144, 16, 8, 144, 0, planes=4, unit_align=64, mmv="iq4nl"),
-               TileFormat("IQ4_XS", 12, 136, 16, 8, 136, 0, planes=4, unit_align=64, mmv="iq4xs"))
+    formats = (TileFormat("IQ4_NL", 11, 144, 16, 8, 144, 0, planes=4, unit_align=64, dq_row_cycles=9.0, mmv="iq4nl"),
+               TileFormat("IQ4_XS", 12, 136, 16, 8, 136, 0, planes=4, unit_align=64, dq_row_cycles=9.0,
+                          mmv="iq4xs"))
 
     def pack(self, fmt: str, f: dict[str, np.ndarray], R: int, nsb: int) -> list[np.ndarray]:
         assert R % 8 == 0, R
@@ -222,7 +343,33 @@ class Iq4Slot(Slot):
     def unit_bytes(self, fmt: str, rows: int, nsb: int) -> int:
         return self.format(fmt).unit_bytes(rows)
 
-    sources: ClassVar[dict[str, str]] = {"mmv/iq4": _MMV, "mmv/IQ4_NL": _NL, "mmv/IQ4_XS": _XS}
+    sources: ClassVar[dict[str, str]] = {"mmv/iq4": _MMV, "mmv/IQ4_NL": _NL, "mmv/IQ4_XS": _XS, "gemm/IQ4_NL": _GEMM,
+                                         "gemm/IQ4_XS": _GEMM}
+
+    # GemmQd (prefill): super-block units of whole 16-row tiles
+
+    def planar(self, fmt: str, rows: int, kc: int) -> bool:
+        return True
+
+    def pass_tiles(self, fmt: str, rows: int, tiles: int) -> bool:
+        # (two weight objects of up to 8 units in the dequantizing core's L1: 36 KB; MMUL columns <= 128)
+        return tiles <= 8
+
+    def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
+        # ws: IQ4_XS's scales S [i][n] bf16; the bf16 pair table's two copies (``gemm_qd``: two regions)
+        return {"ws": (1, 16 * op.n if op.fmt == "IQ4_XS" else 64), "hb": (1, 64), "tab": (1, TAB_PREFILL),
+                "tabb": (1, TAB_PREFILL)}
+
+    def qd_kernels(self, op: object, kernel: object, *, B_l1_ty: object, ws_ty: object, hb_ty: object,
+                   D_ty: object) -> DqKernels:
+        assert op.R == 16 and op.unit_pitch % 64 == 0, (op.R, op.unit_pitch)
+        tab_ty = np.ndarray[(TAB_PREFILL // 4,), np.dtype[np.uint32]]
+        return DqKernels(hdr=None, sb=kernel("sb", [B_l1_ty, ws_ty, hb_ty, i32]),
+                         dq=dq_kernel(op, kernel, B_l1_ty, ws_ty, D_ty, [tab_ty, tab_ty]), units=True,
+                         tables=(tab_ty, bf16_pair_words()))
+
+    def qd_template_vars(self, op: object) -> dict[str, object]:
+        return {"UP": op.unit_pitch}
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)

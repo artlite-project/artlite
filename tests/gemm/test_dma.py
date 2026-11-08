@@ -353,6 +353,12 @@ CASES_PLANAR = [
     # super-block units (Q8_0 of 1024 columns: 8-row tiles, 2176-byte units; IQ3_XXS: 2320 bytes, padded to 2336)
     ("Q8_0", 8, 9280, 1024, {"M": 192, "K": 2048, "tiles": 8, "blocks": ((0, 2), (16, 1)), "region_rt": 24}),
     ("Q8_0", 8, 9280, 1024, {"M": 64, "K": 3072, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12, "mac_rows": 1}),
+    # (IQ4_XS: 16-row tiles of 2176-byte units; IQ3_S: 20 rows, 2304-byte units, a SiLU group of 7 tiles)
+    ("IQ4_XS", 16, 9280, 1024, {"M": 192, "K": 2048, "tiles": 4, "blocks": ((0, 2), (8, 1)), "region_rt": 12}),
+    ("IQ4_XS", 16, 9280, 1024, {"M": 192, "K": 2048, "tiles": 8, "blocks": ((0, 2),), "region_rt": 16, "silu": True}),
+    ("IQ4_NL", 16, 9280, 1024, {"M": 64, "K": 3072, "tiles": 8, "blocks": ((0, 2),), "region_rt": 16, "mac_rows": 1}),
+    ("IQ3_S", 20, 9280, 1024, {"M": 192, "K": 2048, "tiles": 6, "blocks": ((0, 2),), "region_rt": 12}),
+    ("IQ3_S", 20, 9280, 1024, {"M": 192, "K": 2048, "tiles": 7, "blocks": ((0, 2),), "region_rt": 14, "silu": True}),
 ]
 
 
