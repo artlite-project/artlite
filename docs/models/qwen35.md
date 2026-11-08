@@ -35,8 +35,9 @@ $ARTLITE_MODELS_DIR/ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf
 
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
 the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"; Occamy's:
-`model_config.occamy_gguf()`). The NPU path reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and IQ3_XXS tensors, Q4_0 ones (a
-drafter's) and F32 ones (an MoE router's, Occamy's GDN alpha), in any role: a file whose FFN gate / up is in another
+`model_config.occamy_gguf()`; Swift 1.5's: `model_config.swift_gguf()`). The NPU path reads Q3_K, Q4_K, Q5_K, Q6_K,
+Q8_0, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL tensors, Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), in any
+role: a file whose FFN gate / up is in another
 format than Q4_K (the Q5_K_M, Q6_K and Q8_0 files) decodes up to 4 tokens per dispatch. Qwen3.8's drafter is its
 DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account), else its
 file's own MTP layer; a qwen35moe model's (`model_config.qwen_mtp_of`):
@@ -113,6 +114,13 @@ rows or 23 IQ3_XXS rows (the 35B-A3B's at most 16), and its design loads each fo
 needs it. IQ3_XXS stores indices into a 256-entry grid of 4 values each: the cores look them up by gathers from copies
 of the grid in their own memory (`formats/iq3.py`): in a decode step per 8 x 8 weight panel, in a prompt's GEMMs per
 super-block of the rows a pass dequantizes. Alpha runs as two BFP16 planes (hi + lo) summed in fp32.
+
+Swift 1.5's file (APEX-I-MiniPlus V3, a Qwen3.8-27B fine-tune) keeps the FFN downs in IQ4_XS and the gate / up of the
+first and last sixteen layers in IQ3_S, of the middle thirty-two in IQ3_XXS, the GDN alpha in F32 and its MTP layer in
+Q4_0 / Q4_1. Its 9280-byte tiles hold 16 IQ4_XS rows, 20 IQ3_S rows or 23 IQ3_XXS rows. IQ4_XS and IQ4_NL map 4-bit codes
+through a table of 16 values: the cores look up two codes per byte by gathers; IQ3_S indexes a 512-entry grid of 4
+values each (`formats/iq4.py`, `formats/iq3s.py`). With ten tile formats its decode design loads every format's kernel
+as a code page, each IQ format's page bringing its lookup table, and a step decodes up to 4 tokens.
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 

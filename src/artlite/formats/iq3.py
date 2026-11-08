@@ -18,9 +18,9 @@ lanes per instruction, entry i at byte 8 i of a table whose 32-byte groups of 8 
 of an instruction from one copy, 2, 3 from the other, the copies in two 16 KB regions: in one region a gather waits a
 cycle), its signs applied by a masked subtract (``vaddsub8``: the 8 signs of a row one byte of the 64-bit mask): ~6.5
 cycles per panel, the move slot's 5 operations and the gathers' memory ports; then the MMUL against the x panels.
-A core's half tile (two super-blocks) takes ~2300 cycles. The table (``grid_words``) is a resident buffer of each core
-at ``TAB`` (a page brings no data); the panel loop takes its two copies as pointer parameters (llvm-aie gives the
-gathers a memory operand only then)."""
+A core's half tile (two super-blocks) takes ~2300 cycles. The table (``grid_words``) is each core's buffer at ``TAB``,
+resident or written by the format's page (``decode.design``'s tables); the panel loop takes its two copies as pointer
+parameters (llvm-aie gives the gathers a memory operand only then)."""
 
 from typing import ClassVar
 

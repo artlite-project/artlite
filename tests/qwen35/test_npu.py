@@ -72,7 +72,7 @@ def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
     return (lw.exp() * (lw - lg)).sum(-1)
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy", "swift"])
 def test_teacher_forced(size: str) -> None:
     path = _path(size)
     tokens = _tokens(path, 128)
@@ -94,7 +94,7 @@ def test_teacher_forced(size: str) -> None:
     assert kl < 1.5 * kl_llama and agree > agree_llama - tol
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy", "swift"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches

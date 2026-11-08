@@ -106,7 +106,9 @@ The locks order every step:
 
 The core never calls page code by name. The page's packets also write the pager's **state words** in data memory:
 the page's id and the addresses of its entry functions. The main loop calls the role's code through those
-addresses. The entries are ordinary C++ functions that only these addresses reach.
+addresses. The entries are ordinary C++ functions that only these addresses reach. A page may also write a table its
+code reads into a buffer the design placed for it: the decode overlay's IQ formats each bring their lookup table into
+one table slot per core.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/paging-packets-dark.svg">
@@ -145,7 +147,7 @@ The link runs once per design and is cached next to it.
 | An acquire in a jump's delay slots | The core fetches the jump's target before the acquire completes, so it runs stale code | The wake lock is acquired only in the pager, which has no jumps (`check_pager`); page code is entered after the pager returns |
 | Code overwritten while it runs | A page replaces a function still on the stack | Pages lie above the resident code, and no page reaches the pager (`link`'s call graph) |
 | Writes past 16 KB | They land in the tile's other registers and break the core | `link` refuses a page that does not fit |
-| Page data | Data memory holds only the resident ELF's data | `link` refuses a page that needs data of its own |
+| Page data | Data memory holds only the resident ELF's data | `link` refuses a page that needs data of its own; a page's own words go into a buffer the design placed (`Pager.data`) |
 | A stale page after a configuration | A PDI load rewrites the slot's start but keeps the state words | The state words are cleared after one (memory tile transport), or a dispatch always sends its first page (self-DMA) |
 | A packet across slots | A slot's BD ends with TLAST and cuts the packet | `Pager.slots` packs whole packets per slot |
 | A dispatch ending with tasks queued | The next dispatch rewrites the BDs, and the queued task streams its data: a page twice or out of place | the vision overlay waits for the last push of every B stream at the end |
@@ -163,8 +165,9 @@ The vision overlay carries its pages in the B streams: its memory tiles have nei
 host knows each row's role. The decode overlays are the other way round: the cores decide what they need (a weight
 tile's format is in the metadata they read), and their memory tiles have free channels and room. Here, the core asks
 for its page. Before a tile of a paged format whose page is not loaded, it sends three words through its stream port:
-a control packet that writes the page's BD id into the start queue of its memory tile's MM2S channel 5. It then
-sleeps on its wake lock. MM2S 5 streams the page, which waits in the memory tile's page store, into the core's
+a control packet that writes the page's BD id into the start queue of its memory tile's MM2S channel 5 (channel 4 in
+a dense model's design of more than four paged formats, whose odd BDs its memory tiles' channels take). It then
+sleeps on its wake lock. That channel streams the page, which waits in the memory tile's page store, into the core's
 TileControl.
 
 A request costs 86 cycles plus about 0.39 µs per KB of code. The store and its BDs are not part of the design's

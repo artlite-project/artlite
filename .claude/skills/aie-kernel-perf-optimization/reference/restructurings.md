@@ -364,4 +364,18 @@ of 23 rows) 4596 -> ~2300 cycles:
   into 5 ops.
 - Peano: a 128-bit vector load fed to `ext_v2int32` (through `set_v16int32`) fails to legalize (`G_UNMERGE_VALUES`
   <4 x s32> -> <2 x s32>).
+- **16-bit entries** (`load_4x16`: 2 B per entry, 4 B per entry and copy; IQ4's value pairs, IQ3_S's grid as nibbles,
+  `formats/iq4.py`, `iq3s.py`): an instruction's entries land in halfword 0 of its 64-bit lanes, and
+  `shuffle(c0, c1, T16_16x4_lo)` puts those of two concatenated pairs in order (16 entries per shuffle,
+  `mmv/g16`). Two shuffles instead (`T32_16x2_lo`, then `T16_32x2_lo`) left a 4-panel loop unallocatable at every II.
+  An index byte covers at most 2 values of a 4-bit code: IQ4 needs 8 gathers per panel (II 20-21 per 2 panels, bound
+  17 by DM_ADA).
+- **A 9th index bit** (IQ3_S's 512-entry grid): on the MMUL with the offsets, `mac_elem_64_2(bits, 8,
+  mul_elem_64_2(idx, 4))` from bits stored as bytes 0 / 128 by a loop of their own; a `sel` from a scalar 64-bit mask
+  inside the gather loop left it unpipelined (RecMII 48 in the physical mode). The prefill's lists: the index bytes
+  zipped with their bits (bytes 0 / 1) into 16-bit indices, one `ups_to_v32acc32(v32int16, 2)` per list (v32acc32 has
+  no add).
+- **Signs after an unpack** (IQ3_S): the mask's `vextract.64` of the next panel waits for the previous panel's
+  `vaddsub8` through gather -> shuffle -> unpack (II 40 per 4 panels, bound 21): the longer chain makes the masks'
+  registers the recurrence.
 

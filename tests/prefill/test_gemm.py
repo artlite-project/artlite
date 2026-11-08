@@ -15,7 +15,10 @@ import pytest
 import torch
 
 import artlite
+from artlite.decode.image import pack_rows
+from artlite.formats import FORMATS
 from artlite.gemm.gemm_q import PACE, pace_word
+from artlite.gemm.gemm_qd import GemmQdOperator
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import decision_gguf, gemma_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf, swift_gguf
 from artlite.operators import bfp16
@@ -242,3 +245,39 @@ def _ratio(img: object, region: object) -> torch.Tensor:
     w = img.gguf.tensor(f"blk.{region.layer}.attn_norm.weight").dequantize().float().reshape(-1)
     bw = w.bfloat16().float()
     return torch.where(bw != 0, w / torch.where(bw != 0, bw, 1), 1)
+
+
+# (format, tiles per pass): super-block unit formats in passes no test file holds (IQ3_S and IQ4 outside gate / up)
+UNIT = [("IQ3_S", 6), ("IQ3_S", 3), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ4_XS", 1)]
+
+
+@pytest.mark.parametrize(("fmt", "tiles"), UNIT, ids=[f"{f}-t{t}" for f, t in UNIT])
+def test_unit_gemm(fmt: str, tiles: int) -> None:
+    """GemmQd on super-block unit tiles of random GGUF blocks (packed C of two passes per column, K of two chunks; 3 and 2
+    MAC rows) against the product of the dequantized weights."""
+    from ..decode.test_gemv import _random_tensor
+
+    S, kc, K, T, passes = 9280, 1024, 2048, 192, 2
+    R = FORMATS[fmt].rows(S, kc // 256)
+    n_rt, w = passes * tiles, tiles * R + tiles * R % 2
+    t = _random_tensor(fmt, COLS * n_rt * R, K, 7)
+    W = np.concatenate([pack_rows([t], np.arange(c * n_rt * R, (c + 1) * n_rt * R), fmt, R, S, K // kc, kc=kc).reshape(-1)
+                        for c in range(COLS)])
+    pitch = passes * w
+
+    def gemm(mac_rows: int) -> GemmQdOperator:
+        return GemmQdOperator(fmt=fmt, rows=R, M=T, K=K, N=COLS * pitch, tile_bytes=S, col_bytes=n_rt * (K // kc) * S,
+                              passes=passes, out_cols=[[c * pitch + w * p for p in range(passes)] for c in range(COLS)],
+                              kc=kc, kc_group=K // kc, tiles=tiles, c_pack=True, region_rt=n_rt,
+                              blocks=((0, passes),), mac_rows=mac_rows)
+
+    ops = [gemm(3), gemm(2)]  # (a library holds two designs at least)
+    lib = Library("t_unit_gemm", ops).compile().load()
+    A = (torch.randn(ops[0].M, K, generator=torch.Generator().manual_seed(1)) * 0.5).bfloat16()
+    Aq = bfp16.from_panels(bfp16.to_panels(A), ops[0].M, K)
+    want = Aq[:T] @ t.dequantize().float().T
+    for op in ops:
+        C = _run(lib, op, A, W, -op.hdr_skip)[:T].float()
+        cols = np.concatenate([c * pitch + w * p + np.arange(tiles * R) for c in range(COLS) for p in range(op.passes)])
+        rows = np.concatenate([c * n_rt * R + np.arange(op.passes * tiles * R) for c in range(COLS)])
+        assert _rel(C[:, cols], want[:, rows]) < _tol(K), (op.passes, _rel(C[:, cols], want[:, rows]))

@@ -301,7 +301,8 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 }  // namespace
 {% if keep %}
 
-// (every format paged: the resident code keeps the inline tables of kernel_lib their pages read; a page brings no data)
+// (every format paged: the resident code keeps the inline tables of kernel_lib their pages read; a page writes no data but
+// a gather table, ``paging.Pager.data``)
 __attribute__((noinline, used, retain)) void {{ p }}_keep(v64int8 *o)
 {
     const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();
@@ -365,7 +366,7 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
                 parts += [x for x in s.mmv_parts(f.name, nsb) if x not in parts]
                 var.update(s.mmv_vars(f.name, tile_bytes, nsb))
     pager = paging.source(p, wake=pg.wake, request=True) if paged else ""
-    # (retain: the frame's table in every link where formats are paged, used or not by resident code: a page brings no
+    # (retain: the frame's table in every link where formats are paged, used or not by resident code: a page writes no
     # data of its own)
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
                             keep=bool(paged) and set(paged) == set(fmts),
