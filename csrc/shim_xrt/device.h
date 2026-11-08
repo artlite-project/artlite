@@ -78,7 +78,7 @@ struct device {
   static constexpr size_t kSharedMax = 256ull << 20;
   static constexpr size_t kSharedBytes = 1ull << 30;
 
-  std::unique_ptr<xrt::device> m_dev;
+  std::shared_ptr<xrt::device> m_dev;  // (the device objects of one index share it)
 };
 
 }  // namespace shim_xdna

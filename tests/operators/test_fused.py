@@ -608,11 +608,10 @@ class TestFusedLifecycle:
         ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
         verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="user y")
 
-    @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="VmPin is Linux's")
     def test_buffer_pinned_once(self):
         """A buffer that two hardware contexts address (a model's weights: its decode overlay's, its prefill library's)
         is pinned once, at one address. On XRT an XRT buffer of a context's memory group would pin it again in every
-        context: on Windows another allocation of its size in the NPU's share of memory, here the pages charged to
+        context: on Windows another allocation of its size in the NPU's share of memory, on Linux the pages charged to
         RLIMIT_MEMLOCK again (/proc's VmPin)."""
         fs = [_add_chain(name) for name in ("t_pin_a", "t_pin_b")]
         ctxs = []
@@ -621,9 +620,11 @@ class TestFusedLifecycle:
             ctxs.append(f.load()._ctx)
         assert ctxs[0] is not ctxs[1]
         buf = artlite.Device().alloc_user_buffer(256 << 20)  # (on XRT: a region of its own)
-        pinned = _vm_pin()
+        linux = os.path.exists("/proc/self/status")
+        pinned = _vm_pin() if linux else 0
         assert buf.paddr_in(ctxs[0]) == buf.paddr_in(ctxs[1])
-        assert _vm_pin() - pinned <= buf.size  # (amdxdna: 0, pinned at its allocation; XRT: once)
+        if linux:
+            assert _vm_pin() - pinned <= buf.size  # (amdxdna: 0, pinned at its allocation; XRT: once)
 
     def test_scratch_segments(self, monkeypatch):
         """Scratch larger than one sequence argument's 32-bit relocation addends is passed as

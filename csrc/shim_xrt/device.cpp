@@ -1,6 +1,7 @@
 #include "shim_xrt/device.h"
 
 #include <algorithm>
+#include <map>
 #include <mutex>
 
 #include "xrt/xrt_device.h"
@@ -30,7 +31,16 @@ const hw_ctx* device::any_context(const device* preferred) {
   return g_contexts.empty() ? nullptr : g_contexts.back();
 }
 
-device::device(uint32_t device_index) : m_dev(std::make_unique<xrt::device>(device_index)) {}
+// One XRT device per index, as the amdxdna shim's pdev: a region's XRT buffer belongs to the device object it was made
+// on, and every context's commands list it (on Windows a buffer of another xrt::device times the command out).
+device::device(uint32_t device_index) {
+  static std::mutex lock;
+  static std::map<uint32_t, std::weak_ptr<xrt::device>> devices;
+  std::lock_guard guard(lock);
+  std::weak_ptr<xrt::device>& w = devices[device_index];
+  m_dev = w.lock();
+  if (!m_dev) w = m_dev = std::make_shared<xrt::device>(device_index);
+}
 
 device::~device() = default;
 
