@@ -39,7 +39,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import torch
 
-from . import profiling
+from . import profiling, txn
 from .backend import _native  # (first: the backend ARTLITE_BACKEND selects is artlite._native)
 from .operators.base import ArgDirection, ArgSpec
 
@@ -231,6 +231,9 @@ class Program:
 
         self._exe = _native.Executable.from_files(self.pdi_path, self.insts_path)
         insts = self._exe.entry().asm_instr_runlist[0]
+        if insts.view(np.uint32)[4] & 0xFF == txn.OP_CREATE_SCRATCHPAD:  # (the firmware fails it: ERROR (state 5))
+            raise RuntimeError(f"{self.insts_path}: the design reads scratchpad parameters, which only a library or "
+                               "fused program has (prefill GEMMs: their unpaced twin, pace None)")
         self._insts_buf = dev.alloc_insts_buffer(insts.nbytes)
         self._insts_buf.map()[:] = insts.view(np.uint8)
         self._insts_buf.sync_to_device()

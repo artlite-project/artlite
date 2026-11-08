@@ -54,6 +54,14 @@ def _f32(g: GGUFFile, name: str) -> np.ndarray:
     return np.asarray(t.dequantize().numpy(), np.float64).reshape(t.rows, t.cols)
 
 
+def _unpaced(op: object) -> object:
+    """A paced prefill GEMM's unpaced twin (its constructor's arguments, pace None): the paced design reads its level
+    from a library's scratchpad, which a standalone program has none of (its outputs are the twin's at every level:
+    tests/prefill/test_gemm.py)."""
+    args, kwargs = op._ctor
+    return type(op)(*args, **{**kwargs, "pace": None})
+
+
 @pytest.mark.parametrize(("model", "L"), LAYERS)
 def test_router(model: str, L: int) -> None:
     """The post-attention norm with lo panels (``PrefillNormOperator(lo=True)``), then the router GEMM
@@ -66,8 +74,9 @@ def test_router(model: str, L: int) -> None:
     T, H, E = 256, cfg.hidden_size, cfg.n_experts
     region = img.region(L, "moe_in")
     gm = MG.router(img, region, T)
+    op = _unpaced(gm.op)
     norm = PrefillNormOperator(T=T, E=H, eps=cfg.rms_norm_eps, lo=True)
-    norm.compile(), gm.op.compile()
+    norm.compile(), op.compile()
     dev = norm.device
     rng = np.random.default_rng(L)
     x = torch.from_numpy((rng.standard_normal((T, H)) * 2).astype(np.float32)).bfloat16()
@@ -77,8 +86,8 @@ def test_router(model: str, L: int) -> None:
     xn = artlite.empty((2 * T * H * 9 // 16,), dtype=torch.bfloat16, device=dev)
     norm.dispatch(xb, artlite.from_torch(d.flatten(), dev), artlite.from_torch(torch.from_numpy(wn).float().bfloat16(), dev),
                   xb, xn)
-    C = artlite.empty((T, gm.op.N), dtype=torch.bfloat16, device=dev)
-    gm.op.dispatch(xn, _w_arg(gm.op, W, gm.w_off, dev), C)
+    C = artlite.empty((T, op.N), dtype=torch.bfloat16, device=dev)
+    op.dispatch(xn, _w_arg(op, W, gm.w_off, dev), C)
     C.sync_from_device()
     c = C.to_torch().view(torch.float32).numpy().reshape(T, COLS, MG.router_pitch(region))
     got = c[:, :, :E // COLS].reshape(T, E)
@@ -135,10 +144,10 @@ def test_shared_gate_up(model: str, L: int, T: int) -> None:
     cfg = img.cfg
     H, F = cfg.hidden_size, cfg.shared_ffn
     gm = MG.shared_gate_up(img, img.region(L, "moe_in"), T, width=F)
-    gm.op.compile()
+    op = _unpaced(gm.op).compile()
     dev, xn, _, _ = _normed(model, L, T)
     out = artlite.empty((T * F * 9 // 16,), dtype=torch.bfloat16, device=dev)
-    gm.op.dispatch(xn, _w_arg(gm.op, W, gm.w_off, dev), out)
+    op.dispatch(xn, _w_arg(op, W, gm.w_off, dev), out)
     out.sync_from_device()
     got = bfp16.from_panels(out.to_torch(), T, F).double().numpy()
     xn.sync_from_device()
