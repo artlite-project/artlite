@@ -322,11 +322,15 @@ class Engine:
                 p = self._start(inputs, rows) if cache_prompt else 0
                 prefix = inputs[0][:p]
                 k, _, _ = cache.prepare(prefix, enabled=cache_prompt)
-                if k < p:
+                # (the prefix's rest not cached: a lead the first packed chunk may run, else a readout's chunks first)
+                lead = prefix[k:] if 0 < p - k == npu.lead_tokens and not npu.recurrent else []
+                if k < p and not lead:
                     npu.outputs(prefix[k:], [-1])  # (in chunks: as a readout runs)
-                if p:
+                if p and not lead:
                     cache.checkpoint(prefix)
-                out = npu.readouts([ids[p:] for ids in inputs], [at - p for at in rows])
+                out = npu.readouts([ids[p:] for ids in inputs], [at - p for at in rows], lead=lead or None)
+                if lead:
+                    cache.checkpoint(prefix)
                 cache.ran(prefix)
                 ran = p - k + sum(len(ids) - p for ids in inputs)
         except Exception:  # (the device's state is unknown: the caches start over)

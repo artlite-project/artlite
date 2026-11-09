@@ -134,7 +134,8 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
 
 # (head_dim, query heads per KV head, K panels per record, q / k norms (Qwen3: Q, P hi + lo), chunk, history, window,
 # segments (first token, tokens): starts inside a record, a group, at 32-token chunks of keys; the longest the window's)
-# (the ring variant, ``ring``: the history's groups held in the memory tiles, the chunk's first among them)
+# (the ring variant, ``ring``: the history's groups held in the memory tiles; ``lead``: the first segment a prompt every
+# later row sees)
 PACKED = [(128, 2, 2, True, 512, 0, 3, 0, [(0, 100), (128, 64), (192, 37), (230, 122), (352, 129)]),
           (128, 2, 2, True, 1024, 128, 4, 0, [(0, 193), (193, 7), (200, 120), (320, 190), (512, 193), (705, 300)]),
           (64, 4, 1, False, 1024, 0, 2, 0, [(0, 129), (129, 100), (256, 64), (320, 3), (323, 129), (452, 500)]),
@@ -143,21 +144,26 @@ PACKED = [(128, 2, 2, True, 512, 0, 3, 0, [(0, 100), (128, 64), (192, 37), (230,
           (128, 2, 2, True, 2048, 128, 9, 0, [(0, 512), (512, 100), (612, 300), (912, 497), (1409, 3), (1412, 512),
                                               (1924, 124)]),
           (128, 2, 2, True, 2048, 128, 9, 4, [(0, 512), (512, 100), (612, 300), (912, 497), (1409, 3), (1412, 512),
-                                              (1924, 124)])]
+                                              (1924, 124)]),
+          (128, 2, 2, True, 1024, 0, 4, 0, [(0, 64), (64, 129), (193, 7), (200, 120), (320, 190), (512, 193)]),
+          (128, 2, 2, True, 1024, 0, 4, 1, [(0, 64), (64, 129), (193, 7), (200, 120), (320, 190), (512, 193)])]
+LEAD = {len(PACKED) - 2, len(PACKED) - 1}  # (the cases whose first segment is a lead)
 
 
-@pytest.mark.parametrize(("hd", "qh", "kp", "norm", "T", "p0", "win", "ring", "segs"), PACKED,
+@pytest.mark.parametrize(("hd", "qh", "kp", "norm", "T", "p0", "win", "ring", "segs", "lead"),
+                         [(*c, 64 if i in LEAD else 0) for i, c in enumerate(PACKED)],
                          ids=[f"hd{a}-qh{b}-kp{c}{'-norm' if d else ''}-T{e}-p{f}-w{g}{f'-ring{h}' if h else ''}"
-                              for a, b, c, d, e, f, g, h, _ in PACKED])
+                              f"{'-lead' if i in LEAD else ''}" for i, (a, b, c, d, e, f, g, h, _) in enumerate(PACKED)])
 def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win: int, ring: int,
-                     segs: list[tuple[int, int]]) -> None:
+                     segs: list[tuple[int, int]], lead: int) -> None:
     """A packed chunk (``AttnOperator(window=)``: segments of the chunk, each its own rows' attention over the history
     and its keys up to the row; rotary positions from p0 per segment, the prep's cos / sin rows written past the
     table's) against the exact attention of the cores' own operands, as ``test_attn``; a segment that starts at a
     32-token chunk of keys bit-identical to the same tokens run alone (the unpacked design at p0: the history, the
     segment's keys in the same chunks, the skipped ones adding nothing) up to its last whole V record. A segment too
     long for the window: padding (its rows see only themselves). The ring variant (``ring``) takes the window's key
-    chunks in its slots' order, so it is held to the reference row by row instead of to the segments alone."""
+    chunks in its slots' order, so it is held to the reference row by row instead of to the segments alone, as is a
+    chunk with a lead (``lead``: its first segment, which every later row sees too)."""
     shape = PA.Shape(hd, qh, kp, A_BYTES, 2 if norm else 1, 2 if norm else 1)
     max_pos = max(1024, p0 + T)
     n_groups = max_pos // shape.pg
@@ -209,7 +215,7 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
 
     fused.get_buffer("G")[:] = torch.from_numpy(g_rows(np.arange(T), T)).bfloat16()
     fused.sync_inputs()
-    fused.set_params(prep.params(p0) | {PA.P_CS: 2 * hd * max_pos} | attn.params(p0))
+    fused.set_params(prep.params(p0) | {PA.P_CS: 2 * hd * max_pos} | attn.params(p0, lead))
     fused()
     fused.sync_outputs()
     fused.sync_scratch_from_device()
@@ -221,6 +227,7 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
     want = np.zeros((T, COLS, qh, hd))
     keys = np.arange(p0 + T)
     seen = (keys[None] < p0) | ((keys[None] >= p0 + lo[:, None]) & (keys[None] <= p0 + np.arange(T)[:, None]))
+    seen |= (keys[None] < p0 + lead) & (keys[None] <= p0 + np.arange(T)[:, None])
     for c in range(COLS):
         Kc, Vc = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[c, :n], hd))
         for h in range(qh):
@@ -234,7 +241,7 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
               want[valid])
     print(f"packed attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
     assert err < 1.5 * eq
-    if ring:  # (row by row: a key of another segment or out of the window in one row shows there)
+    if ring or lead:  # (row by row: a key of another segment or out of the window in one row shows there)
         w = want[valid].reshape(len(valid), -1)
         row_err = np.linalg.norm(A[valid].reshape(len(valid), -1) - w, axis=1) / np.linalg.norm(w, axis=1)
         row_eq = np.linalg.norm(bfp16.values(w.astype(np.float32)) - w, axis=1) / np.linalg.norm(w, axis=1)

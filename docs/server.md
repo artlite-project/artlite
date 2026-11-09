@@ -171,8 +171,8 @@ packed: several of them in one chunk (up to 4096 tokens; 2048 on Qwen3.5's path)
 attention and Gated DeltaNet state, so they share the chunk's fixed cost. The server plans a request by the prefill's
 estimates and runs a text alone where packing would not be faster (on Qwen3's path, any text longer than 512 tokens).
 A prefix the texts share (a rerank query's prompt before its documents) runs once, through the prompt cache, and every
-text after it sees it. Qwen3-Embedding-0.6B: a 30-token query in 26 ms, a 430-token passage in 55 ms (HTTP included),
-11.6K tokens/s for requests of 32 texts of 64-512 tokens (7.1K one after another); Qwen3-Reranker-0.6B: 25 pairs/s at
+text after it sees it (on Qwen3's path a new prefix of one cache group, 64 tokens, runs inside the first packed chunk). Qwen3-Embedding-0.6B: a 30-token query in 26 ms, a 430-token passage in 55 ms (HTTP included),
+11.6K tokens/s for requests of 32 texts of 64-512 tokens (7.1K one after another); Qwen3-Reranker-0.6B: 25.6 pairs/s at
 ~510-token pairs (16). `--rerank` serves `/v1/rerank` (Jina's shape: `query`, `documents` as strings or
 `{"text": ...}`, `top_n`, Cohere's `return_documents`; TEI's with `texts`) for a reranker's file (Qwen3-Reranker): its
 classifier head (`cls.output`) on the last token of its rerank prompt (the file's `rerank` template). With it,

@@ -78,7 +78,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
     chunks' compute saves nothing; a pass streams a fixed window of cache groups ending at its own instead (no runtime
     parameters: a sequence reads at most 32), which caps a segment at `PACK_SPAN`. After a history of up to `RING_HOLD`
     groups, chunks from 1024 tokens take its ring variant (`ring=`, `("ring", T)` programs): each column's memory tile
-    holds the history and the last W + 1 groups, each read from DDR once, and the cores are the bound. qwen35's
+    holds the history and the last W + 1 groups, each read from DDR once, and the cores are the bound. A prompt of one
+    cache group the inputs continue, not cached yet, rides in the first packed chunk as its first segment, the keys
+    before `P_HK` seen by every row (`run_packed(lead=)`, `NpuModel.readouts(lead=)`: a rerank query's). qwen35's
     (`PrefillAttnOperator(pack=)`) streams as unpacked (its masks by vector compares against per-lane lo / hi: a
     scalar loop building them had doubled a packed layer's time). Both take the rows' first / last keys on a stream (SEG, an
     object per pass in the values the memtile walk leaves in order) and mask the rest;

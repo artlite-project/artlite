@@ -6,6 +6,7 @@ sampling, chat templates, incremental detokenization and the default KV cache ca
 import argparse
 import collections
 import copy
+import dataclasses
 import functools
 import importlib.metadata
 import json
@@ -530,11 +531,15 @@ class NpuModel:
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
     packs = False  # whether ``readouts`` packs inputs into prefill chunks (a readout model's prefill)
+    lead_tokens = 0  # the length of a ``readouts`` lead that may run inside its first packed chunk (0: none)
 
-    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
+    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
+                 lead: list[int] | None = None) -> list[np.ndarray]:
         """Several inputs' output rows (each as ``outputs`` returns them): each input's tokens after the cached positions
-        (a prefix every one of them continues); the model is left at the prefix's end. This default runs them one after
-        another from a checkpoint there."""
+        (a prefix every one of them continues; ``lead``: tokens of it not cached yet, run first); the model is left at
+        the prefix's end. This default runs them one after another from a checkpoint there."""
+        if lead:
+            self.outputs(lead, [-1])
         p = self.position
         cp = self.checkpoint() if p else None
         out = []
@@ -922,37 +927,67 @@ class OverlayModel(NpuModel):
         """(the prefill runs packed chunks: a readout model's)"""
         return self.prefill is not None and bool(self.prefill.pack_sizes)
 
+    @property
+    def lead_tokens(self) -> int:  # type: ignore[override]
+        """(the prefill's packed chunks' lead: ``ChunkPrefill.lead``)"""
+        return self.prefill.lead if self.packs else 0
+
     def readout_seconds(self, lengths: list[int], position: int = 0) -> float | None:
         """(the packing's estimate, ``ChunkPrefill.pack``)"""
         if self.packs and self.prefill.packed_sizes(position):
             return self.prefill.pack(lengths, position).seconds
         return super().readout_seconds(lengths, position)
 
-    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True) -> list[np.ndarray]:
+    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
+                 lead: list[int] | None = None) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
         the cached prefix; a recurrent model's after a prefix are tree chunks, which leave its states as the prefix left
-        them; inputs alone one after another from the prefix, a checkpoint's where needed)"""
+        them; inputs alone one after another from the prefix, a checkpoint's where needed; a lead of ``lead_tokens``
+        inside the first packed chunk where it has room and no input runs alone, else alone first)"""
         if not self.packs:
-            return super().readouts(inputs, at, norm=norm)
+            return super().readouts(inputs, at, norm=norm, lead=lead)
         self._abandon()
-        p = self.position
         at = [np.asarray(r, np.int64).reshape(-1) % len(ids) for ids, r in zip(inputs, at, strict=True)]
-        plan = self.prefill.pack([len(ids) for ids in inputs], p)
-        cp = self.checkpoint() if p and plan.alone and (self.recurrent or p % self.group) else None
+        lead = list(lead or [])
+        p = self.position + len(lead)  # (the prefix's end: the inputs' history)
+        lengths = [len(ids) for ids in inputs]
+        # (a lead planned as one more input: its chunk first, the lead its first segment, the inputs alone after the
+        # packed chunks; a lead alone runs first)
+        n, inside = len(inputs), False
+        if lead and len(lead) == self.lead_tokens:
+            plan = self.prefill.pack([*lengths, len(lead)], p)
+            j = next((k for k, (_, b) in enumerate(plan.bins) if n in b), None)
+            if j is not None:
+                (T0, b0), rest = plan.bins[j], plan.bins[:j] + plan.bins[j + 1:]
+                plan = dataclasses.replace(plan, bins=[(T0, [i for i in b0 if i != n]), *rest])
+                inside = True
+            else:
+                plan = dataclasses.replace(plan, alone=[i for i in plan.alone if i != n])
+        else:
+            plan = self.prefill.pack(lengths, p)
+        if lead and not inside:
+            self.outputs(lead, [-1])
         out: list[np.ndarray] = [np.zeros(0)] * len(inputs)
-        for k, i in enumerate(plan.alone):
-            if k:
-                self.restore(p, cp)
-            out[i] = self.outputs(inputs[i], at[i], norm=norm)
-        if plan.alone:
+
+        def run_alone() -> None:
+            """The inputs alone, one after another from the prefix (a checkpoint's where needed), back at it after."""
+            cp = self.checkpoint() if p and (self.recurrent or p % self.group) else None
+            for k, i in enumerate(plan.alone):
+                if k:
+                    self.restore(p, cp)
+                out[i] = self.outputs(inputs[i], at[i], norm=norm)
             self.restore(p, cp)  # (back at the prefix, which the packed chunks continue)
+
+        if plan.alone and not inside:
+            run_alone()
         bins, u = plan.bins, self.prefill.seg_unit(p)
 
-        def chunk_of(idx: list[int]) -> tuple:
+        def chunk_of(idx: list[int], lead: list[int]) -> tuple:
             """A packed chunk's inputs, positions, segment starts (-1: the padding tokens between two segments, up to
-            the next multiple of ``seg_unit``: the prefill zeroes their rows) and the segments' offsets."""
-            toks: list[int] = []
-            pos, lo, offs = [], [], []
+            the next multiple of ``seg_unit``: the prefill zeroes their rows) and the segments' offsets (``lead``: its
+            first tokens, a segment from p - len(lead))."""
+            toks: list[int] = list(lead)
+            pos, lo, offs = [p - len(lead) + np.arange(len(lead))], [np.zeros(len(lead), np.int64)], []
             for k, i in enumerate(idx):
                 ids = inputs[i]
                 gap = -len(ids) % u if k + 1 < len(idx) else 0
@@ -962,13 +997,18 @@ class OverlayModel(NpuModel):
                 lo += [np.full(len(ids), offs[-1]), np.full(gap, -1)]
             return self._chunk_inputs(toks, first=False), np.concatenate(pos), np.concatenate(lo), offs
 
-        nxt = self._pool.submit(chunk_of, bins[0][1]) if bins else None
+        nxt = self._pool.submit(chunk_of, bins[0][1], lead if inside else []) if bins else None
         for k, (T, idx) in enumerate(bins):
             t0 = time.perf_counter()
             args, pos, lo, offs = nxt.result()
             t1 = time.perf_counter()
-            nxt = self._pool.submit(chunk_of, bins[k + 1][1]) if k + 1 < len(bins) else None  # (meanwhile)
-            self._packed_run(args, T, pos, lo)
+            nxt = self._pool.submit(chunk_of, bins[k + 1][1], []) if k + 1 < len(bins) else None  # (meanwhile)
+            if k == 0 and inside:  # (the lead's records a sequence: the prefix then ends at p)
+                self.prefill.run_packed(*args, p - len(lead), pos, lo, T, lead=len(lead))
+                self.stale()
+                self.restore(p)
+            else:
+                self._packed_run(args, T, pos, lo)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches
@@ -978,6 +1018,8 @@ class OverlayModel(NpuModel):
                 out[i] = self._normed(x) if norm else x
         if bins and self.recurrent and not p:
             self.restore(0)  # (the packed chunks' states: none of a sequence)
+        if plan.alone and inside:
+            run_alone()
         return out
 
     def _packed_run(self, args: tuple, T: int, pos: np.ndarray, lo: np.ndarray) -> None:

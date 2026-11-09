@@ -95,6 +95,7 @@ class ChunkPrefill:
         self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
         self.tree_sizes: tuple[int, ...] = ()  # (a recurrent model's packed chunks after a prefix)
         self.ring_sizes: tuple[int, ...] = ()  # (packed chunks of a second attention design: the model's ``("ring", T)``)
+        self.lead = 0  # (the tokens of a prompt a packed chunk may lead with, which every segment sees: ``run_packed``)
         self.span = 0  # (a packed chunk's longest segment)
         self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)

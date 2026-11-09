@@ -166,6 +166,7 @@ class LlamaPrefill(ChunkPrefill):
                                          window=win, ring=hold) for T in self.pack_sizes if T >= RING_MIN} if hold else {}
         self.ring_sizes = tuple(self.rattn)
         self.span = PACK_SPAN if pack else 0
+        self.lead = s.pg if pack else 0  # (a cache group: ``run_packed``'s lead)
         self._rows()
         self._library()
 
@@ -388,16 +389,18 @@ class LlamaPrefill(ChunkPrefill):
         dev.flush("PX", 0, 2 * T * H)
         self._launch(T, p0, self.params(T, p0))
 
-    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
+    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0, lead: int = 0) -> None:
         """A packed chunk of size T (default: the smallest of ``pack_sizes`` that holds x): x (n, hidden) the segments'
         embeddings back to back, ``pos`` (n,) their rotary positions, ``lo`` (n,) per token its segment's first (an index
         into x); every row sees the caches' positions before p0 (a shared prefix) and its segment's tokens up to itself
-        (segments of up to ``PACK_SPAN`` tokens). Leaves the last layer's output rows in PX (``hidden``); the caches hold
-        no sequence after p0."""
+        (segments of up to ``PACK_SPAN`` tokens). ``lead`` (0 or ``self.lead``): x's first rows a prompt at p0 that every
+        segment after it sees too (their own segment; the caches then hold it as a sequence). Leaves the last layer's
+        output rows in PX (``hidden``); the caches hold no sequence after p0 + lead."""
         n, dev, H, hd = x.shape[0], self.ov.dev, self.H, self.shape.hd
         T = T or next(t for t in self.pack_sizes if t >= n)
         self._size(n, p0, T)
         assert ((np.arange(n) - lo) < PACK_SPAN).all() and (lo <= np.arange(n)).all(), "segments of PACK_SPAN tokens"
+        assert lead in (0, self.lead) and (lo[:lead] == 0).all() and (lo[lead:] >= lead).all(), "a lead of a group"
         px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
         px[:n] = x.bfloat16().view(torch.int16).numpy().view(np.uint16)
         px[n:] = 0
@@ -409,13 +412,15 @@ class LlamaPrefill(ChunkPrefill):
         seg = self.pattn[T].seg(np.concatenate([lo, np.arange(n, T)]))
         dev.view("SEG")[:seg.size] = seg
         dev.flush("SEG", 0, seg.size)
-        ring = self._ring(T, p0)
-        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R} | (self.rattn[T].params(p0) if ring else {}),
+        ring = self._ring(T, p0, lead)
+        attn = (self.rattn if ring else self.pattn)[T]
+        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R} | attn.params(p0, lead),
                      key=("ring" if ring else "pack", T))
 
-    def _ring(self, T: int, p0: int) -> bool:
-        """Whether a packed chunk of size T at p0 runs the ring attention (its memory tiles hold the history)."""
-        return T in self.rattn and p0 // self.shape.pg <= self.rattn[T].ring
+    def _ring(self, T: int, p0: int, lead: int = 0) -> bool:
+        """Whether a packed chunk of size T at p0 runs the ring attention (its memory tiles hold the history and the
+        lead)."""
+        return T in self.rattn and (p0 + lead) // self.shape.pg <= self.rattn[T].ring
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input

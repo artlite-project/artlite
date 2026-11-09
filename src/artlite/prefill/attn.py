@@ -89,6 +89,7 @@ P_FQ = "pa_fq"  # their chunks of CR records (the cores' count)
 P_FO = "pa_fo"  # bf16 offset of the chunk's second group
 P_G0 = "pa_g0"  # bf16 offset of the chunk's first group (``AttnOperator(ring=)``)
 P_FH = "pa_fh"  # the history's chunks of CR records (``AttnOperator(ring=)``: the cores')
+P_HK = "pa_hk"  # the chunk's first keys every row sees (packed: a lead, ``AttnOperator.params``)
 L1 = 0x10000 - 512  # a core's data memory for its buffers (a margin for aiecc's)
 MT_BYTES = 0x80000 - 8192  # a memory tile's for the ring variant's buffers (``AttnOperator(ring=)``)
 
@@ -711,7 +712,7 @@ extern "C" {
 // A pass's start: o = 0, the reference m = -48 (bias 240: P = 2^(s + 48), a chunk's maximum above -32 raises it; rows
 // whose scores all stay below -111 would read 2^-63 for each), l = 0; the pass's first record p0 / 8 + {{ 4 * QB }}
 // (M bg + bb)
-__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq{% endif %})
+__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq, int32_t hk{% endif %})
 {
 {% if "ev_q" in ablate %}
     event1();
@@ -732,6 +733,10 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
     st[7] = p8 + {{ RG }} * (bg > {{ WIN }} ? bg - {{ WIN - 1 }} : 1);  // (the window: the chunk's groups max(1, bg - {{ WIN - 1 }}) .. bg)
 {% endif %}
     st[8] = fq;
+    st[14] = hk;  // (the chunk's first keys every row sees: a lead{% if RING %}, its groups out of the ring's window{% endif %})
+{% if RING %}
+    st[13] = hk / {{ 8 * RG }};
+{% endif %}
 {% endif %}
 }
 
@@ -779,7 +784,7 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
         int32_t d = st[11] - j;
         d = d < 0 ? d + {{ R }} : d;
         const int32_t g = st[10] - d;
-        out = (d > {{ WIN - 1 }}) | (g < 0);
+        out = (d > {{ WIN - 1 }}) | (g < st[13]);
         rec = st[6] + {{ RG }} * g + {{ CR }} * (u - {{ GQ }} * j);
     }
 {% else %}
@@ -787,8 +792,8 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
 {% endif %}
     const int32_t kc = 8 * (rec - st[6]);
     st[0] = rec - st[2] - {{ QB }} * r;
-    st[1] = (st[0] - {{ QB - 1 }} > 0) | ((kc >= 0) & (kc + {{ 8 * CR }} <= st[4]));
-    st[3] = (kc >= 0) & (kc < st[5]);
+    st[1] = (st[0] - {{ QB - 1 }} > 0) | ((kc >= st[14]) & (kc + {{ 8 * CR }} <= st[4]));
+    st[3] = (kc >= st[14]) & (kc < st[5]);
 {% if RING %}
     st[1] |= out;
     st[3] &= !out;
@@ -1163,14 +1168,17 @@ class AttnOperator(ArtcOperator):
         out[:, :self.pq] = lo.reshape(self.n_pass, self.pq)
         return out.view(np.uint8).reshape(-1)
 
-    def params(self, p0: int) -> dict[str, int]:
+    def params(self, p0: int, lead: int = 0) -> dict[str, int]:
+        """The scratchpad parameters of a chunk at p0 (packed: ``lead``, its first keys every row sees: 0 or a cache
+        group, a prompt every segment continues; its rows a segment of their own)."""
         s = self.shape
-        assert p0 % s.pg == 0
+        assert p0 % s.pg == 0 and lead in (0, s.pg) and (self.win or not lead)
         fg = p0 // s.pg + 1
         if self.ring:
-            assert fg - 1 <= self.ring, (p0, self.ring, "a history the memory tiles hold")
-            return {P_P8: p0 // 8, P_FH: (fg - 1) * s.rg // self.cr, P_G0: s.group // 2 * (fg - 1)}
-        out = {P_P8: p0 // 8, P_FG: fg, P_FQ: fg * s.rg // self.cr}
+            assert fg - 1 + lead // s.pg <= self.ring, (p0, lead, self.ring, "a history the memory tiles hold")
+            return {P_P8: p0 // 8, P_FH: (fg - 1 + lead // s.pg) * s.rg // self.cr, P_G0: s.group // 2 * (fg - 1),
+                    P_HK: lead}
+        out = {P_P8: p0 // 8, P_FG: fg, P_FQ: fg * s.rg // self.cr} | ({P_HK: lead} if self.win else {})
         if self.n_pass > self.m:  # (a pass streams the chunk's groups after its first)
             out[P_FO] = s.group // 2 * fg
         return out
@@ -1186,7 +1194,7 @@ class AttnOperator(ArtcOperator):
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), f32]
         wo_ty = np.ndarray[(64 * nd * rb,), f32]
         win = self.win
-        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * (win > 0))
+        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * 2 * (win > 0))
         k_grp = Kernel(f"{p}_grp", "kernel.o", [ws_ty, np.int32, np.int32])
         k_seg = Kernel(f"{p}_seg", "kernel.o", [u_ty, ws_ty, np.int32]) if win else None
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [u_ty, q_ty, np.int32, np.int32])
@@ -1223,8 +1231,8 @@ class AttnOperator(ArtcOperator):
                                 obj_types=[o_ty] * 4, names=[f"la_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
         def turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb, nq, seg=None,
-                 full=False):
-            """(a core's share of a pass: its Q units of the pass's nq, its segments (packed), the history, its output;
+                 hk=None, full=False):
+            """(a core's share of a pass: its Q units of the pass's nq, its segments and lead (packed), the history, its output;
             ``full``: the packed window's last groups only, ``win`` of them; the ring: the held history's and the ring's
             chunks, every pass)"""
             for i in range_(nq):
@@ -1237,7 +1245,7 @@ class AttnOperator(ArtcOperator):
                 b_h.release(1)
                 b_h.acquire(1)
                 b_h.release(1)
-                init(ws, wo, p8.read(), bg, bb, fq.read())
+                init(ws, wo, p8.read(), bg, bb, fq.read(), hk.read())
             else:
                 init(ws, wo, p8.read(), bg, bb)
             n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
@@ -1288,7 +1296,8 @@ class AttnOperator(ArtcOperator):
 
         workers = [Worker(core, [a1[c].cons(), b1[c].cons(), o1[c][r].prod(), k_init, k_grp, k_qsel, k_qk, k_soft,
                                  k_pv, k_fin, Buffer(ws_ty, name=f"la_ws{c}_{r}"), Buffer(wo_ty, name=f"la_wo{c}_{r}"),
-                                 Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq, rb * r, r, *([k_seg] if win else [])],
+                                 Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq, rb * r, r,
+                                 *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win else [])],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs, n_kv, n_a, NH = self.n_qs, self.n_kv, self.n_a, COLS * qh

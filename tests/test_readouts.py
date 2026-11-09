@@ -127,3 +127,34 @@ def test_readouts_packed(packed: tuple[str, Model, NpuModel]) -> None:
         assert same == len(lengths)
     assert min(cos) > 0.997 and np.median(cos) > 0.999
     assert np.array_equal(after, after_alone)
+
+
+def test_readouts_lead(packed: tuple[str, Model, NpuModel]) -> None:
+    """``NpuModel.readouts(lead=)`` (a prompt every input continues, not cached yet: the Llama path's packed chunk runs it
+    as its first segment, others run it first) against the prompt run first: rows close (cosine 0.999 at least: the
+    chunk's sizes differ; bit for bit where the lead runs first), the model left at the prompt's end."""
+    path, model, npu = packed
+    if not npu.causal:
+        pytest.skip("a non-causal model reads every prompt whole")
+    ids = model.encode(essay("addiction.txt") * 3)
+    g = npu.group
+    lengths = [20, 77, 130, 45, 300, 3]
+    starts = np.cumsum([0, *lengths])[:-1]
+    inputs = [ids[g + 2000 + a:g + 2000 + a + n] for a, n in zip(starts, lengths, strict=True)]
+    at = [np.array([0, -1]) for _ in lengths]
+    npu.reset()
+    npu.outputs(ids[:g], [-1])
+    want = npu.readouts(inputs, at)
+    after_want = npu.outputs(ids[g:g + 40], [-1])
+    npu.reset()
+    got = npu.readouts(inputs, at, lead=ids[:g])
+    assert npu.position == g
+    after = npu.outputs(ids[g:g + 40], [-1])
+    cos = [float((a * b).sum() / np.linalg.norm(a) / np.linalg.norm(b)) for x, y in zip(got, want, strict=True)
+           for a, b in zip(x, y, strict=True)]
+    print(f"{os.path.basename(path)}: lead inside {npu.lead_tokens == g}; cosine min {min(cos):.5f}")
+    if npu.lead_tokens != g:
+        assert all(np.array_equal(x, y) for x, y in zip(got, want, strict=True))
+    assert min(cos) > 0.999
+    assert np.array_equal(after, after_want)
+
