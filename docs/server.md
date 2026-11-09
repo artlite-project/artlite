@@ -52,7 +52,7 @@ Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-q
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
 arguments) with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8,
-MiniCPM-V 4.7 and Occamy (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 have them; a template without tools (Llama
+MiniCPM-V 4.7, Occamy and LFM3 (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 have them; a template without tools (Llama
 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt, nothing is
 parsed), `required` and a named function (the answer begins with the call, after the model's thought; a named
 function's call is the only one), and `parallel_tool_calls: false` ends the answer after its first call. A call's
@@ -228,12 +228,13 @@ llama-server (`--cache-ram`: 8 GiB by default, or half of the RAM left once the 
 in router mode each model's part of that: over `--models-max`): when a request continues one of them (an agent's
 subagent, a title request, another chat in the web UI), its cache is copied back to the NPU (~15 GB/s: 30-45 ms for
 32K positions of the 35B-A3B) instead of running its prompt again. The
-Qwen models' Gated DeltaNet states cannot go back, so for them the server saves the states (checkpoints,
-`--ctx-checkpoints`; Qwen3.6-35B-A3B: 80 MB, a few milliseconds each) at the end of each prompt and where its first
+Qwen models' Gated DeltaNet states and LFM3's conv histories cannot go back, so for them the server saves the states
+(checkpoints, `--ctx-checkpoints`; Qwen3.6-35B-A3B: 80 MB, a few milliseconds each; LFM3: 2.8 MB) at the end of each
+prompt and where its first
 user message begins: a prompt continues from the latest one it shares (the client's own rendering of the last answer,
 another answer to the same prompt), and a new conversation with the same system prompt and tools from the second. The
 earlier answers keep their thoughts in the prompt, as llama-server does (`--reasoning-preserve`, on by default, where
-the template can: Qwen3.6 / 3.8, Occamy, Gemma 4), so a turn extends the last one when the client sends the thoughts
+the template can: Qwen3.6 / 3.8, Occamy, Gemma 4, LFM3), so a turn extends the last one when the client sends the thoughts
 back (`reasoning_content`, as the web UI does). Where they are dropped (Qwen3.5's and MiniCPM-V's templates,
 `--no-reasoning-preserve`), the next user message renders the last answer from its start otherwise: the server also
 saves the state where each prompt's last message begins, and a turn continues from there. A request's
@@ -383,7 +384,7 @@ Generation:
 | `-np N`, `--parallel` | sequences at a time (1 only: the NPU runs one) |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
-| `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V; default 32) |
+| `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3; default 32) |
 | `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
 | `--spec-type auto\|none\|draft-mtp\|draft-dflash`, `-md FILE`, `--spec-draft-model` | the model's drafter, as [artlite-cli](cli.md)'s (default `auto`: the one found by its file name) |
 | `--spec-draft-n-max N` | draft tokens per step at most, as [artlite-cli](cli.md)'s; a request's `speculative.n_max` lowers it for its generation |

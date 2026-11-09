@@ -29,7 +29,7 @@ and generation speeds go to stderr.
 | `-p TEXT`, `--prompt`; `-f FILE`, `--file` | the user message, or a file holding it (one of them is required) |
 | `-sys TEXT`, `--system-prompt` | system message |
 | `--raw` | the prompt as it is, without the chat template |
-| `--think` | let the model think first (Gemma 4, Qwen; default: an empty thought) |
+| `--think` | let the model think first (Gemma 4, Qwen, LFM3; default: an empty thought) |
 | `--reasoning-effort LEVEL` | the chat template's `reasoning_effort`, with `--think` (Qwen3.8: `xhigh`, `medium`, `low`; default `default`: the template's own) |
 | `--chat-template-kwargs JSON` | chat template variables as a JSON object (`{"tools_in_user_message": false}`, `{"date_string": "26 Jul 2024"}`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`); it gets the variables the file's gets (`enable_thinking`, `bos_token`, ...) |
@@ -48,21 +48,23 @@ and generation speeds go to stderr.
 | `--spec-type auto\|none\|draft-mtp\|draft-dflash` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)); one asked for that the model does not have is an error |
 | `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
 | `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
-| `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4), below |
+| `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4, LFM3), below |
 | `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([Qwen](models/qwen35.md#images-qwen35--36--38), [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
 | `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen; default 8 / 4096, llama.cpp's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen3
-its model card's (thinking: temperature 0.6, top-k 20, top-p 0.95; else 0.7, 20, 0.8); Qwen3.5 and later the file's
-`general.sampling.*`, else its model card's.
+its model card's (thinking: temperature 0.6, top-k 20, top-p 0.95; else 0.7, 20, 0.8); Qwen3.5 and later and LFM3
+the file's `general.sampling.*`, else the model card's (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1).
 
 `--kv-k` stores K as one bfp16 value per 8 dims (`single`) or as bfp16 hi + lo (`hilo`: 1.5x the cache and its read
 time). Llama's default is `single`: `hilo` makes decode at 32K 1.2x slower with no measured quality gain. Gemma 4's
 default is `hilo`: `single` takes 2/3 of the cache at KL 0.00028 instead of 0.00023 against the same file on the CPU.
 Qwen3's default is `hilo`: its K norm's weights (up to ~100) leave dims a thousand times below their block's largest,
-and `single` takes the KL against the same file on the CPU from 0.0037 to 0.0085 (Qwen3 0.6B, a chat).
+and `single` takes the KL against the same file on the CPU from 0.0037 to 0.0085 (Qwen3 0.6B, a chat). LFM3's default
+is `single`: its q / k norm weights stay below 2.5, and at 32K `single` costs a KL of 1.4e-4 against `hilo`'s 1e-5 for
+a third less of the cache.
 
 Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and draft tokens after it, which a step checks at a
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so

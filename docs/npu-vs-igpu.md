@@ -61,6 +61,24 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
   Q4_K_M: 113.5 vs 78.7 tokens/s), 1.25x (Gemma 4 E4B Q4_0: 29.3 vs 23.4) and 1.36x (Qwen3.8 27B Q4_K_M: 5.77 vs
   4.24), plugged in and on battery alike: that laptop's iGPU holds its clocks on battery.
 
+## A small hybrid model's prompts: LFM3-1.7B
+
+LFM3-1.7B (QAD-Q4_0: 13 short-convolution layers, 11 attention layers, 1.07 GB of weights) is the case where the NPU is
+the faster device for every prompt length: its prefill is compute-bound GEMMs with a small KV cache (6 full-attention
+layers). A chat request of an essay prompt and one generated token through each server (`artlite-server` on the NPU,
+`llama-server -ngl 99 -fa on` on the iGPU), the same file, each request's text new and uncached, energy above a 10 W
+idle (socket power from the SMU):
+
+| prompt tokens | NPU | iGPU | energy a request above idle, NPU / iGPU |
+|---|---|---|---|
+| 1027 | 216 ms | 250 ms | 3.9 / 13.2 J |
+| 8192 | 1.26 s | 2.13 s | 27 / 93 J |
+| 32771 | 6.35 s | 12.07 s | 142 / 462 J |
+
+The NPU draws 18-22 W over idle against the iGPU's 39-53 W, and uses ~3.3x less energy per prompt. Generation goes the
+other way: 50.0 / 41.5 tokens/s on the NPU after 1K / 32K tokens against the iGPU's 168.8 / 122.5 (`llama-bench`).
+Prompt-heavy work on this model (agents' long system prompts and re-read files, long documents) is where the NPU fits.
+
 ## Prefill-only work: decisions, embeddings, rerank
 
 A decision, an embedding or a rerank score is one forward pass over a prompt and no generated text, so the work is

@@ -21,7 +21,7 @@ Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF'
 | machine | ASUS ROG Flow Z13 (2025, GZ302EA), BIOS 314 |
 | processor | AMD Ryzen AI Max+ 395: 16 Zen 5 cores, Radeon 8060S iGPU, XDNA 2 NPU |
 | memory | 128 GB LPDDR5X-8000, 256-bit (256 GB/s) |
-| OS | Gentoo Linux, kernel 7.2.9 |
+| OS | Gentoo Linux, kernel 7.2.9 (7.2.14 from 2026-11-10) |
 | NPU driver and firmware | `amdxdna` from AMD's xdna-driver (2.21.70-790-g49fe4e13), NPU firmware 1.1.2.65 (xdna-driver's build, `npu.dev.sbin`; linux-firmware's `npu_7.sbin` 1.1.2.65 measures the same) |
 | power | ACPI platform profile `performance` in both of its handlers (amd-pmf and asus-wmi: `/sys/class/platform-profile/*/profile`; `/sys/firmware/acpi/platform_profile` reads `custom` when they differ); NPU power mode: the driver's default for Artlite (it sets none), `turbo` for FastFlowLM and OpenFlowLM |
 
@@ -77,6 +77,8 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf`, its drafter [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/blob/main/mtp-Qwen3.6-35B-A3B-Q4_0.gguf) `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | `4ac6a06bce55`, `606fca331adc` | 2026-10-24; MTP at 1K 2026-10-29 |
 | Occamy 1.0 (35B-A3B) | APEX-I-MiniPlus | [IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf) `Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf` (as re-uploaded on 2026-10-23), its drafter [`occamy-1.0-mtp-Q4_K_M.gguf`](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/occamy-1.0-mtp-Q4_K_M.gguf) | `ba40cdc039c6`, `f8b0e6174daa` | 2026-10-25 |
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
+| LFM3 1.7B | QAD-Q4_0 | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-QAD-Q4_0.gguf) `LFM3-1.7B-QAD-Q4_0.gguf` | `43a7d09a0e9c` | 2026-11-10 |
+| | Q4_K_M | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-Q4_K_M.gguf) `LFM3-1.7B-Q4_K_M.gguf` | `3793e1e6e226` | 2026-11-10 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
 runs, with the toolchain pinned then:
@@ -90,10 +92,12 @@ runs, with the toolchain pinned then:
 | 2026-10-25 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-10-29 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-11-05 | 1.4.6.dev3+g6a97402 | 22.0.0.2026102001+4f5df13d |
+| 2026-11-10 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026110801+22c4674a |
 
 ## FastFlowLM and OpenFlowLM
 
-FastFlowLM 1.0.7 (v1.0.7-56-g6c9ed874; 1.0.9, v1.0.9-41-gd8767c0a, for Qwen3.8 27B and MiniCPM-V 4.7 1B) and OpenFlowLM 0.1.0-99fe7e4
+FastFlowLM 1.0.7 (v1.0.7-56-g6c9ed874; 1.0.9, v1.0.9-41-gd8767c0a, for Qwen3.8 27B and MiniCPM-V 4.7 1B; 1.0.12, its
+portable build, for LFM3 1.7B) and OpenFlowLM 0.1.0-99fe7e4
 (Atomic-Germ/OpenFlowLM-Next at 99fe7e4, every model on its open kernels), each as `serve` with its default prefill
 chunks of 4096 tokens and each model at its native context:
 
@@ -113,6 +117,7 @@ chunks of 4096 tokens and each model at its native context:
 | | Qwen3.8 27B | `qwen3.8-mtp:27b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw); lm_head and embedding Q8_0; its MTP layer (7 drafts per step); at most 8192 positions | Q4_K_M |
 | | Qwen3.6 35B-A3B | `qwen3.6-moe:35b-a3b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw) | Q4_K_M |
 | | MiniCPM-V 4.7 1B | `minicpm-v-4.7:1b` | FastFlowLM's own Q4_K quantization (560 MB per token, the lm_head Q8_0), not openbmb's GGUF files; text prompts | Q4_K_M |
+| | LFM3 1.7B | `lfm3:1.7b` | its own file (1.61 GB) of LiquidAI's quantization-aware-distilled Q4_0 weights; at most 32768 positions in its catalog | QAD-Q4_0 |
 | OpenFlowLM | Llama 3.2 1B Instruct | `llama3.2:1b` | FastFlowLM's container of the same Q4_1 | Q4_1 |
 | | Llama 3.2 3B Instruct | `llama3.2:3b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |
 | | Llama 3.1 8B Instruct | `llama3.1:8b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |

@@ -134,6 +134,20 @@
       "engine_decode_tps": {"1024": 41.74, "2048": 41.04, "4096": 38.28, "8192": 34.35, "16384": 29.07, "32768": 22.06, "65536": 14.67, "131072": 9.01},
       "image_ttft_s": {"16x": {"sd15-astronaut.jpg": 1.20, "airplane.jpeg": 2.31, "test-1.jpeg": 1.12, "hk_OCR.jpg": 1.80}},
       "notes": {"image_ttft_s": {"4x": "FastFlowLM's MiniCPM-V comes with the 16x vision encoder only"}}
+    },
+    {
+      "model": "LFM3 1.7B",
+      "tag": "lfm3:1.7b",
+      "version": "1.0.12 (v1.0.12, a portable build: no libedit), ctx-len 262144",
+      "date": "2026-11-10",
+      "quant": "q4nx",
+      "weights": "FLM's own file (model.q4nx, 1.61 GB) of the vendor's quantization-aware-distilled Q4_0 weights; its catalog's context 32768",
+      "comparable_quants": ["QAD-Q4_0"],
+      "ttft_s": {"1024": 1.28, "2048": 1.71, "4096": 3.18, "8192": 6.25, "16384": 12.91, "32768": 28.17},
+      "prefill_tps": {"1024": 802, "2048": 1197, "4096": 1287, "8192": 1310, "16384": 1269, "32768": 1163},
+      "decode_tps": {"1024": 41.11, "2048": 39.84, "4096": 38.28, "8192": 34.93, "16384": 30.07, "32768": 23.58},
+      "engine_prefill_tps": {"1024": 975, "2048": 1384, "4096": 1395, "8192": 1371, "16384": 1302, "32768": 1183},
+      "engine_decode_tps": {"1024": 41.71, "2048": 40.41, "4096": 38.82, "8192": 35.4, "16384": 30.45, "32768": 23.87}
     }
   ]
 }
