@@ -72,7 +72,7 @@ def _disassembly(obj_path: str) -> dict[str, list[str]]:
 
 def stack_usage(obj_path: str, su_path: str, *, calls: dict[str, set[str]] | None = None) -> dict[str, int]:
     """Deepest stack (bytes) of every function of kernel.o: its frame plus the deepest callee (``calls``: more calls,
-    by function name: indirect ones)."""
+    by function name: indirect ones; a decode GEMV dispatcher's pages are its callees)."""
     own: dict[str, int] = {}
     with open(su_path) as f:
         for line in f:
@@ -83,6 +83,9 @@ def stack_usage(obj_path: str, su_path: str, *, calls: dict[str, set[str]] | Non
     for fn, lines in _disassembly(obj_path).items():
         graph[fn] = {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([A-Za-z_]\w*)$", ln))
                      and not m.group(1).startswith(".") and m.group(1) != fn}
+    for fn in list(graph):  # (a decode GEMV dispatcher of core half H calls its pages through pointers: ``decode.gemv``)
+        if m := re.search(r"_mmv_[0-9a-f]{8}ILi([01])E", fn):
+            graph[fn] |= {g for g in graph if f"_pgf{m.group(1)}_" in g}
     for fn, more in (calls or {}).items():
         graph[fn] = graph.get(fn, set()) | more
     memo: dict[str, int] = {}

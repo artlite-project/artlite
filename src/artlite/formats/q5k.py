@@ -169,10 +169,18 @@ __attribute__((noinline)) void {{ p }}_q5k_tab(const uint8_t *__restrict a, cons
     const int sbl = sb & 1;
     const v64bfp16ebs8 I = al::eye();
     const v64uint8 m3 = broadcast_to_v64uint8((unsigned char)3), m12 = broadcast_to_v64uint8((unsigned char)12);
-    al::BIn<> xsp((const bfp16ebs8 *)xs);  // (the pair's slot: the panel of sb is the (sbl + 1)-th)
+    al::BIn<> xsp((const bfp16ebs8 *)xs);  // (the pair's slot: the panel of sb is the (sbl + 1)-th; 8 slots: its hi, lo)
+{% if slots == 8 %}
+    v64bfp16ebs8 X = xsp.pop(), XL = xsp.pop();
+    if (sbl) {
+        X = xsp.pop();
+        XL = xsp.pop();
+    }
+{% else %}
     v64bfp16ebs8 X = xsp.pop();
     if (sbl)
         X = xsp.pop();
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int g = 0; g < 2; g++) {
         v16int32 o0, o1, o2, o3;  // word panels of the pair's scale planes, rows 8 g ..: [w0 | w1], [w2 | w3], ..
@@ -193,34 +201,56 @@ __attribute__((noinline)) void {{ p }}_q5k_tab(const uint8_t *__restrict a, cons
         const aie::vector<bfloat16, 16> dq = dp.template extract<16>(0), mq = dp.template extract<16>(1);
         const aie::vector<bfloat16, 64> D = {{ p }}_pick(dq, sbl).template grow_replicate<64>();
         {{ p }}_td(mac_8x8_8x8T(I, 1, Sc, 0, mul_8x8_8x8T(I, 1, Sl, 0)), D, tab + 128 * g);
+{% if slots == 8 %}
+        aie::accum<accfloat, 64> Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Sc, 0, mac_8x8_8x8T(XL, 1, Sl, 0, mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)))),
+                                                aie::mul(D, aie::broadcast<bfloat16, 64>(16.0f)).template to_vector<bfloat16>(),
+                                                aie::zeros<accfloat, 64>());
+        Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Mc, 0, mac_8x8_8x8T(XL, 1, Ml, 0, mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)))),
+                       {{ p }}_pick(mq, sbl).template grow_replicate<64>(), Y);
+        {{ p }}_yadd8(y + 64 * g, Y);
+{% else %}
         aie::accum<accfloat, 64> Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)),
                                                 aie::mul(D, aie::broadcast<bfloat16, 64>(16.0f)).template to_vector<bfloat16>(),
                                                 aie::zeros<accfloat, 64>());
         Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), {{ p }}_pick(mq, sbl).template grow_replicate<64>(), Y);
         {{ p }}_yadd(y + 32 * g, Y);
+{% endif %}
     }
 }
 
-// Pass 3: c_g,i = bf16(C[hi rows] + C[lo rows]) -> c [i][g][32]; C = -16 XS_i + sum_s X_s (ql_s + 16 h_s) (xsum:
-// the pair's slot, the panel of the super-block the (sbl + 1)-th)
+// Pass 3: c_g,i = bf16(C[hi rows] + C[lo rows]) (8 slots: bf16(C)) -> c [i][g][{{ L }}]; C = -16 XS_i + sum_s X_s (ql_s +
+// 16 h_s) (xsum: the pair's slot, the panel of the super-block the (sbl + 1)-th; 8 slots: its hi and lo panels)
 __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, const uint8_t *__restrict xsum,
                                               const uint8_t *__restrict w, bfloat16 *__restrict c, int sbl)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
     al::BIn<aie_dm_resource::d> xz((const bfp16ebs8 *)xsum);
+{% if slots == 8 %}
+    v64bfp16ebs8 Z = xz.pop(), ZL = xz.pop();
+    if (sbl) {
+        Z = xz.pop();
+        ZL = xz.pop();
+    }
+{% else %}
     v64bfp16ebs8 Z = xz.pop();
     if (sbl)
         Z = xz.pop();
+{% endif %}
     const uint8_t __aie_dm_resource_b *__restrict pw = (const uint8_t __aie_dm_resource_b *)w;
-    const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[1][0];
+    const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
     bfloat16 *__restrict pc = c;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < 8; i++) {
-        const v64bfp16ebs8 N = {{ p }}_np(pn);
+        const v64bfp16ebs8 N = {{ p }}_np(pn, 0x86);  // (-16 e_i)
         pn += 64;
+{% if slots == 8 %}
+        v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+        v64accfloat C1 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+{% else %}
         v64accfloat C0 = mul_8x8_8x8T(Z, 1, N, 1);
         v64accfloat C1 = mul_8x8_8x8T(Z, 1, N, 1);
+{% endif %}
 {% for st in range(4) %}
         {
             const v64bfp16ebs8 x = xs.pop();
@@ -231,10 +261,15 @@ __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o + 192 }}, {{ 0x89 - st }}), 0, C1);
         }
 {% endfor %}
+{% if slots == 8 %}
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
         aie::store_v(pc, {{ p }}_sum2(C0));
         aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
         pw += 512;
-        pc += 64;
+        pc += {{ 2 * L }};
     }
 }
 
@@ -250,7 +285,7 @@ __attribute__((noinline)) void {{ p }}_q5k(uint8_t *__restrict a, const uint8_t 
         {{ p }}_q5k_tr(a + {{ q5_codes }} + {{ 5 * 32 * R5 }} * sb, scr);
         {{ p }}_q5k_tab(a, xs + {{ XS_SLOT }} * HI, tab, y, sb);
         {{ p }}_q5k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * HI, scr, c, u);
-        {{ p }}_sc(c, tab, y, 128, 8, 64);
+        {{ p }}_sc(c, tab, y, 128, 8, {{ 2 * L }});
     }
 }
 """
@@ -293,6 +328,9 @@ class Q5KSlot(Slot):
         ex_ty = np.ndarray[(self.qd_scratch(op)["ex"][1] // 2,), np.dtype[bfloat16]]
         return DqKernels(hdr=hdr, sb=sb, dq=dq_kernel(op, kernel, B_l1_ty, ws_ty, D_ty, [ex_ty]), collect=True,
                          unit=False, ex_ty=ex_ty)
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)

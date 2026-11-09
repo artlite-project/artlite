@@ -125,13 +125,14 @@ __attribute__((noinline)) void {{ p }}_k23al(const uint8_t *src, uint8_t *__rest
     return shift_bytes(*(const v16int32 __aie_dm_resource_b *)b, *(const v16int32 __aie_dm_resource_b *)(sh + n > 64 ? b + 64 : b), sh);
 }
 
-// y += hilo(Y) d (32 lanes [slot][r]; d: the 8 rows' bf16)
-[[clang::always_inline]] inline void {{ p }}_k23d(float *__restrict y, aie::accum<accfloat, 32> Y, const bfloat16 *d)
+// y += hilo(Y) d (N lanes [slot][r]: 32 or 64; d: the 8 rows' bf16)
+template <unsigned N>
+[[clang::always_inline]] inline void {{ p }}_k23d(float *__restrict y, aie::accum<accfloat, N> Y, const bfloat16 *d)
 {
-    const aie::vector<bfloat16, 32> h = Y.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> l = aie::msc(Y, h, aie::broadcast<bfloat16, 32>(1.0f)).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> D = aie::load_v<8>(d).template grow_replicate<32>();
-    aie::store_v(y, aie::mac(aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(y)), h, D), l, D).template to_vector<float>());
+    const aie::vector<bfloat16, N> h = Y.template to_vector<bfloat16>();
+    const aie::vector<bfloat16, N> l = aie::msc(Y, h, aie::broadcast<bfloat16, N>(1.0f)).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, N> D = aie::load_v<8>(d).template grow_replicate<N>();
+    aie::store_v(y, aie::mac(aie::mac(aie::accum<accfloat, N>(aie::load_v<N>(y)), h, D), l, D).template to_vector<float>());
 }
 
 // y[g] += hilo(yu[g] + sum over the 16 sub-blocks j of c[j][g] sct[g][j][r]) dg[g] for 4 row groups g (Q3_K's three:

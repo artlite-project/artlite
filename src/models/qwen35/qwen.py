@@ -97,7 +97,8 @@ class NpuQwen(OverlayModel):
         image = QwenImage(gguf, cfg, mtp=False) if not own and weights is None else None
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights, image=image,
                                    formats=draft_formats(mtp) if mtp is not None else (),
-                                   gu=draft_gate_up(mtp) if mtp is not None else frozenset())
+                                   gu=draft_gate_up(mtp) if mtp is not None else frozenset(),
+                                   drafts=mtp is not None or bool(dflash) or (own and bool(cfg.nextn_layers)))
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal
         self.eos_token_ids = self.cfg.eos_token_ids

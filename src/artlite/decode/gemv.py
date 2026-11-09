@@ -19,11 +19,13 @@ x panels: per k-block (8 consecutive k) one 8x8 bfp16 panel, rows a = [hi of slo
 two panels (``XS_SLOT``): slot j < nsb / 2: the 32-k panels of super-blocks 2 j, 2 j + 1; slot nsb / 2 + sb: the two
 16-k panels of super-block sb.
 
-Designs of 8 slots (``render(slots=8)``: Q4_K, Q6_K) take x as single bfp16, rows a = slot 0 .. 7 (the prefill
-GEMMs' activations; [hi | lo] of 8 slots would be two panels per k block: twice the MMULs and 92 KB of x panels for
-a K group of 5120): the same panels and MMULs. Their sums stay exact as two panels each, [hi rows of the slots] then
-[lo rows] (the codes' centering subtracts z XS from the codes' sums: XS must be the sum of the quantized x), in slots
-of four panels (``xs_slot(8)``) in the same order; c is bf16(C) (64 lanes [slot][r]), y [g][slot 8][r 8].
+Designs of 8 slots (``render(slots=8)``: every format of the super-block split) take x as single bfp16, rows a = slot
+0 .. 7 (the prefill GEMMs' activations; [hi | lo] of 8 slots would be two panels per k block: twice the MMULs and 92 KB
+of x panels for a K group of 5120): the same panels and MMULs. Their sums stay exact as two panels each, [hi rows of
+the slots] then [lo rows] (the codes' centering subtracts z XS from the codes' sums: XS must be the sum of the
+quantized x), in slots of four panels (``xs_slot(8)``) in the same order; c is bf16(C) (64 lanes [slot][r]), y
+[g][slot 8][r 8]. A pass that holds 64-lane values across a loop's iterations spills them (Q4_K's offsets: a 1.6 KB
+frame, which every core's stack must hold): pop the sums per super-block instead.
 
 A weight panel is 8 rows x 8 k of the tile's integer codes as bfp16 mantissas at exponent 133 (value = code), so the
 MMUL sums exact products: C[a][r] = sum_k X[a][k] W[r][k] in fp32. The codes of a row are words of 8 consecutive k
@@ -66,6 +68,7 @@ def scr_bytes(slots: int = SLOTS) -> int:
     return SCR_BYTES if slots == 4 else 9216
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
 RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS", "Q8_0")  # (``render(rg=)``) the formats of row-group tiles
+NZ_FORMATS = ("Q4_0", "Q4_1", "Q4_K", "Q5_K", "Q6_K")  # the formats whose kernels read the -z e_i panels (``_nz``)
 B_G4 = 8192  # (``decode.design``'s block format word bit of row groups of 4)
 
 
@@ -203,14 +206,10 @@ template <typename T>
     return aie::filter_even(aie::shuffle_down(v, sbl), 1);
 }
 
-// -z e_i panels (mantissas): [z 8, 16, 32][i][64]
-alignas(64) {{ retain }}static const int8_t {{ p }}_nz[3][8][64] = {
-{% for z in (8, 16, 32) %}
-    {
+// -8 e_i panels (mantissas): [i][64] (-16 e_i, -32 e_i: the same mantissas at exponents 0x86, 0x87)
+alignas(64) static const int8_t {{ p }}_nz[8][64] = {
 {% for i in range(8) %}
-        { {% for l in range(64) %}{{ -z if l % 8 == i else 0 }}, {% endfor %}},
-{% endfor %}
-    },
+    { {% for l in range(64) %}{{ -8 if l % 8 == i else 0 }}, {% endfor %}},
 {% endfor %}
 };
 
@@ -258,13 +257,35 @@ __attribute__((noinline)) void {{ p }}_sc(const bfloat16 *__restrict c, const bf
 {% if paged %}
 {{ pager }}
 
+{% if keep or keep_nz %}
+// (resident) The data the pages read and no resident kernel does, read into the scratch o (192 B), so that the links of
+// the cores that page keep it (and no other core's: a retained section would take room in every core of the design); a
+// page writes no data but a gather table (``paging.Pager.data``)
+__attribute__((noinline)) void {{ p }}_keep(v64int8 *o)
+{
+{% if keep %}
+    const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();  // (every format paged: the inline tables of kernel_lib)
+    o[0] = a.mantissa;
+    o[1] = b.mantissa;
+{% endif %}
+{% if keep_nz %}
+    o[2] = *(const volatile v64int8 *){{ p }}_nz[0];
+{% endif %}
+}
+{% endif %}
+
 // (resident) page ``page`` of core half H into program memory unless its state words name it (``render(paged=)``)
 template <int H>
-__attribute__((noinline)) void {{ p }}_pg_need(int page)
+__attribute__((noinline)) void {{ p }}_pg_need(int page, uint8_t *__restrict scr)
 {
-    if (((const volatile int32_t *){{ pg.state }})[0] != page)
-        {{ p }}_pg_request(H ? (int32_t){{ pg.hdr[1] }}u : (int32_t){{ pg.hdr[0] }}u, (int32_t){{ pg.ctl }}u,
+    if (((const volatile int32_t *){{ pg.state }})[0] != page) {
+{% if keep or keep_nz %}
+        {{ p }}_keep((v64int8 *)scr);
+{% endif %}
+        {{ p }}_pg_request(H ? (int32_t){{ pg.hdr[1] }}u : (int32_t){{ pg.hdr[0] }}u,
+                           H ? (int32_t){{ pg.ctl[1] }}u : (int32_t){{ pg.ctl[0] }}u,
                            (H ? {{ pg.bd0[1] }} : {{ pg.bd0[0] }}) + page - 1);
+    }
 }
 {% endif %}
 
@@ -286,7 +307,7 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 {% for f in fmts %}
 {% if f in paged %}
     if (fmt == {{ fid[f] }}) {
-        {{ p }}_pg_need<H>({{ paged.index(f) + 1 }});
+        {{ p }}_pg_need<H>({{ paged.index(f) + 1 }}, scr);
         ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if f in rg_fmts else "" }}))(intptr_t)
              ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
         return;
@@ -299,17 +320,6 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 }
 
 }  // namespace
-{% if keep %}
-
-// (every format paged: the resident code keeps the inline tables of kernel_lib their pages read; a page writes no data but
-// a gather table, ``paging.Pager.data``)
-__attribute__((noinline, used, retain)) void {{ p }}_keep(v64int8 *o)
-{
-    const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();
-    o[0] = a.mantissa;
-    o[1] = b.mantissa;
-}
-{% endif %}
 {% for f in paged %}
 {% for h in (0, 1) %}
 
@@ -332,14 +342,14 @@ _TEMPLATE = kernel_template(_SRC)
 class PageSpec:
     """Where the paged formats' pages go and come from (``render(paged=)``): the pager's state words (a core address,
     the same on both cores), its wake lock (a core lock id), per core half the stream header of its request route and
-    the BD of its first page (``paging.request``, ``paging.Store.bd``: page i at bd0 + i - 1), the control header
-    writing the page channel's start queue."""
+    the BD of its first page (``paging.request``, ``paging.Store.bd``: page i at bd0 + i - 1) and the control header
+    writing its page channel's start queue."""
 
     state: int
     wake: int
     hdr: tuple[int, int]
     bd0: tuple[int, int]
-    ctl: int
+    ctl: tuple[int, int]
 
 
 def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str, ...]]:
@@ -349,15 +359,18 @@ def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str,
 
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
-           pg: PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS) -> str:
+           pg: PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS,
+           tab: tuple[tuple[int, int], tuple[int, int]] | None = None) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
     are code pages (``pg``: their pager), in page-id order (from 1). ``rg``: the format word's B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``decode.image.Block.G``) put super-block 2 H + 1's rows
-    ``yb`` floats after 2 H's instead of adding them. ``slots``: the design's token slots (module docstring)."""
+    ``yb`` floats after 2 H's instead of adding them. ``slots``: the design's token slots (module docstring). ``tab``: the
+    gather tables' two copies per core half (default ``formats.TAB``)."""
     assert all(supported(f, nsb, slots) for f in fmts), (fmts, nsb, slots)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
     assert not rg or (nsb == 4 and slots == 4), (rg, nsb, slots)
+    assert slots == 4 or not any(row_split(f, nsb) for f in fmts), (fmts, nsb, slots)  # (row-split tiles: 4 slots)
     parts: list[str] = []
     var: dict[str, int] = {}
     for s in FORMAT_SLOTS:
@@ -365,12 +378,16 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
             if f.name in fmts:
                 parts += [x for x in s.mmv_parts(f.name, nsb) if x not in parts]
                 var.update(s.mmv_vars(f.name, tile_bytes, nsb))
+    if tab is not None:
+        var["TAB"] = tab
     pager = paging.source(p, wake=pg.wake, request=True) if paged else ""
-    # (retain: the frame's table in every link where formats are paged, used or not by resident code: a page writes no
-    # data of its own)
+    # (keep: every format paged, the inline tables of kernel_lib its pages read kept by resident code; keep_nz: a paged
+    # format reads the -z e_i panels and no resident one does: a page writes no data of its own)
+    nz = [f for f in fmts if f in NZ_FORMATS]
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
                             keep=bool(paged) and set(paged) == set(fmts),
-                            retain="__attribute__((used, retain)) " if paged else "", rg=rg,
+                            keep_nz=bool(nz) and set(nz) <= set(paged),
+                            rg=rg,
                             rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4, yb=yb,
                             rowsplit=any(row_split(f, nsb) for f in fmts),
                             fid={f: FORMATS[f].fid for f in FORMATS}, fn={f: FORMATS[f].mmv for f in FORMATS}, NSB=nsb,

@@ -63,13 +63,17 @@ stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side c
 Designs of 8 slots (``slots=8``: a dense model whose formats run at 8 slots, ``gemv``): x per k block one panel of the
 8 slots' single bfp16 rows (``gemv``'s "Designs of 8 slots"; the sum panels a hi and a lo panel each), an input object
 of ``obj_k`` 256 k ([k block][slot 8][8] bf16; a strip of the helper's is a super-block), a norm-weight object over 16 of
-them, a row tile's outputs [g 2][slot 8][r 8]. The residual goes out as the next input's x lies ([k block][slot SP][8]: a column's
+them, a row tile's outputs [g][slot 8][r 8]. The residual goes out as the next input's x lies ([k block][slot SP][8]: a column's
 whole rows in DDR, where a slot's objects scattered 16-byte rows, ~22 us a phase at S 8). L1 (the main core's own regions are its 4-slot design's at twice the
 slots, but the residual): the main core's workspace holds the residual of slots 0 .. 3, the helper's memory that of 4
 .. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums)
 and the sum of squares lie in the core south of it (``HS8_ROW``: the model's core there leaves it room), the main core's SiLU
 table in the helper's memory (``SILU8_AT``): the main core holds a second X object, so that the next object comes in while
-the helper converts this one's strips (at 8 rows per k block the objects double). No moe, post, packed, paged designs.
+the helper converts this one's strips (at 8 rows per k block the objects double). With gather tables (paged formats, tiles
+of more than 16 rows, gate / up windows) every byte counts: the cores' buffers pinned (``l1_8``), one X object, one SiLU
+copy, smaller stacks (``STACK8``: the pages' frames counted, ``operators.checks``), the residual's pitch 16 past a row.
+Their memtiles' channels leave a side 14 BDs: each core half's pages have a channel of their own (``pg_split``). No moe,
+post, packed designs.
 
 Shared A objects (``a_bcast``): a fill on column c's A stream with a pair's packet id reaches the memtile of column c and of
 the pair's other column, whose cores take the objects as their own, one read of DDR for both. A stream's shim -> memtile
@@ -90,8 +94,9 @@ phase comes after local objects with no drains in between: its inputs stay per c
 
 Paged formats (``paged``: a model whose formats' kernels do not fit the cores together): their kernels are code pages
 (``paging``, the memtile transport): per column the main and helper cores request a format's page for their half
-before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes; the
-pager's state words and wake lock on both cores), which ``page_store`` links and the device loads before a dispatch
+before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes, or a store
+per core half: ``pg_split``; the pager's state words and wake lock on both cores), which ``page_store`` links and the device
+loads before a dispatch
 whenever it is stale (``artlite.overlay.OverlayDevice.set_prologue``: first, then after another hardware context ran).
 """
 
@@ -217,6 +222,10 @@ PG_STATE, PG_WAKE = 0xFFE0, 15  # (32-byte aligned: aiecc)
 WS8_AT = 0x4000  # (8 slots) the main core's workspace (region 1 on; then the sum panels)
 # (8 slots) the main core's SiLU table, its two copies in regions 0, 3 of the helper's memory: the room of a second X object
 SILU8_AT = (0x0800, 0xF9C0)
+# (8 slots with gather tables: ``l1_8``) the main core's table copies in regions 1 (its workspace after it) and 3, the
+# helper's in regions 0 and 3 (its scratch is in the core south of it)
+TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
+STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores' stacks (their deepest calls, pages included)
 PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 # the event windows of a stats build (DecodeOverlayOperator(win=)): main's half tile, the helper's, main's row
 # epilogue (collect), the helper's input objects
@@ -297,7 +306,7 @@ class DecodeOverlayOperator(ArtcOperator):
         (c, d): a fill of column c's A stream with the packet id AB_ID + i (i: the pair's index) reaches both columns'
         memtiles, the same objects in both columns (module docstring "Shared A objects"); pairs: a dense design's blocks
         of plane pairs (B_PAIR: an F32 matrix's [hi, lo] rows, their sums out as fp32; an MoE design has them anyway)."""
-        assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or gu_win or paged or moe)), slots
+        assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
         self.slots, self.bcast = slots, bcast
         assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
         if bcast:
@@ -323,6 +332,8 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the formats with a gather table: one table slot per core, TAB; a resident format's table resident, else every
         # one in its format's page)
         self.tables = [f for f in self.rows if slot(f).mmv_table(f) is not None]
+        self.tab = TAB8 if slots == 8 and self.tables else TAB  # (the tables' copies per core half)
+        self.stacks = STACK8 if slots == 8 and self.tables else (self.STACK, self.HELPER_STACK)  # (main, helper)
         assert len([f for f in self.tables if f not in self.paged]) <= 1 and \
             (set(self.tables) <= set(self.paged) or len(self.tables) == 1), (self.tables, self.paged)
         assert not gu_win or act == "silu"
@@ -330,12 +341,13 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
         # memory, not one chunk's 128 panels in a row: their reads at once conflict; a 512-k input strip is a half)
         self.xh = nsb == 4 and not self.rowsplit and not post
-        # (tiles of more than 16 rows, or an MoE design's gate / up windows: 4-slot designs)
+        # (tiles of more than 16 rows, or an MoE design's gate / up windows)
         self.wide = any(r > 16 for r in rows.values()) or (moe is not None and gu_win)
-        assert slots == 4 or not self.wide, rows
         self.yt = (128 if self.wide else 64) * slots // 4  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
-        self.yn = 128 if any(r > 16 and f not in self.rowsplit for f, r in rows.items()) else gemv.y_floats(slots)
+        # (floats of the helper's partial rows: [g][slot][r] of its row groups of a tile: 4 at 4 slots, the formats' at 8)
+        wide_r = max([r for f, r in rows.items() if r > 16 and f not in self.rowsplit], default=0)
+        self.yn = (8 * slots * (4 if slots == 4 else -(-wide_r // 8))) if wide_r else gemv.y_floats(slots)
         self.yb = self.yt  # (floats of a tile's row block: 16 rows [g 2][slot][r], 32 rows [g 4][slot][r])
         if self.moe:  # (row groups: a tile's 4 blocks, the helper's two; tiles of more than 16 rows: blocks of 32 rows,
             # their gate / up rows through the windows, ``gu_win``)
@@ -349,9 +361,52 @@ class DecodeOverlayOperator(ArtcOperator):
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
         self.h8 = hidden // COLS
-        self.res_pitch = -(-(self.h8 + 32) // 16) * 16  # (fp32 per slot: the window adds reach 32 past a row)
+        # (fp32 per slot: the window adds reach 32 past a row's 16-aligned base, 16 past the row's end; 8 slots with gather
+        # tables: just that, ``l1_8``)
+        self.res_pitch = -(-(self.h8 + (16 if slots == 8 and self.tables else 32)) // 16) * 16
         self.res_slots = min(slots, 4)  # (the slots of the residual in the main core's workspace; the others' in hres)
         super().__init__()
+
+    @property
+    def x_l1_depth(self) -> int:
+        """The main core's X objects: two in a design of 8 slots (the next object comes in while the helper converts this
+        one's strips), one with gather tables (``l1_8``: their room)."""
+        return 2 if self.slots == 8 and not self.tables else 1
+
+    def l1_8(self) -> dict[str, int]:
+        """(8 slots with gather tables) The pinned buffers (local addresses) of the main core (``m_*``): A object 0 and the
+        X object in region 0 after its stack, table copy 0 at region 1's start, the workspace (its scratch in region 2) and
+        the sum panels after it, A object 1 and table copy 1 in region 3; of the helper (``h_*``): table copy 0 after its
+        stack, the x panels, slots 4 .. 7's residual (``hres``), its partial rows (one object), the SiLU table (one copy,
+        the main core gathers it twice) and ``hst``, table copy 1 (its scratch is in the core south of it: ``HS8_ROW``).
+        The rest (statics, C and command objects) goes into the gaps: no room is left for a second X object or SiLU copy
+        (``x_l1_depth``, ``silu8_addresses``)."""
+        W, (mt, ht) = self.workspace(), self.tab
+
+        def up(n: int) -> int:
+            return -(-n // 64) * 64
+
+        out = {"m_a0": self.stacks[0], "m_ws": mt[0] - 0x70000 + TAB_BYTES}
+        out["m_x0"] = out["m_a0"] + up(self.tile_bytes)
+        out["m_xs"] = out["m_ws"] + W["size"]
+        out["m_a1"] = out["m_xs"] + up(self.xs_bytes)
+        assert out["m_x0"] + XB + 4 * 2 * C_LEN <= mt[0] - 0x70000, out  # (and the C and command objects)
+        assert out["m_a1"] + self.tile_bytes <= mt[1] - 0x70000, out
+        assert ht[0] - 0x70000 >= self.stacks[1], (ht, self.stacks)
+        out["h_xp"] = ht[0] - 0x70000 + TAB_BYTES
+        out["h_hres"] = out["h_xp"] + up(self.xp_bytes)
+        out["h_res"] = out["h_hres"] + up(self.hres_bytes)
+        out["h_silu"] = out["h_res"] + up(4 * self.yn)
+        out["h_hst"] = out["h_silu"] + up(4 * kmath.SILU.table_words().size)
+        assert out["h_hst"] + 16 <= ht[1] - 0x70000, out
+        return out
+
+    def silu8_addresses(self) -> list[int]:
+        """(8 slots) The SiLU table's two copies as the main core reads them in the helper's memory (at 0x40000), with
+        gather tables its one copy twice (``l1_8``)."""
+        if self.slots != 8:
+            return [0, 0]
+        return [0x40000 + self.l1_8()["h_silu"]] * 2 if self.tables else [0x40000 + a for a in SILU8_AT]
 
     @property
     def xp_bytes(self) -> int:
@@ -383,8 +438,8 @@ class DecodeOverlayOperator(ArtcOperator):
         if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; [slot][8] fp32 sums, then the slots' 1 / rms(p) [slot][r 8]
             # bf16 hi | lo)
             sizes += [("pli", 2 * 2 * 4 * SLOTS * 8 + 4 * 32)]
-        if self.gu_win:
-            sizes += [("gw", 4 * SLOTS * (64 if self.yb == 128 else 32))]
+        if self.gu_win:  # (a window of 64 rows per slot for tiles of more than 16 rows, else 32)
+            sizes += [("gw", 4 * S * (64 if self.wide else 32))]
         if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
             # routing's C objects (control packets, the expert object's metadata), the expert object's plan)
             sizes += [("wsc", 4 * 32), ("hold", 2 * SLOTS * OBJ_K), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
@@ -418,7 +473,8 @@ class DecodeOverlayOperator(ArtcOperator):
         fmts = list(self.rows)
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
-                          pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb, slots=self.slots)
+                          pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb, slots=self.slots,
+                          tab=self.tab)
         src += self._extra_src(p, consts)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
               "XS_SLOT": gemv.xs_slot(self.slots),
@@ -438,7 +494,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
-                                 packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate, SILU8=[0x40000 + a for a in SILU8_AT],
+                                 packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate, SILU8=self.silu8_addresses(),
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  **self._moe_vars(p, consts), **consts)
 
@@ -454,33 +510,53 @@ class DecodeOverlayOperator(ArtcOperator):
                 "ITEM_WORDS": ITEM_WORDS}
 
     @property
-    def pg_channel(self) -> int:
-        """The memtile MM2S channel of the page store: PG_CH (odd: BDs 24-47) for up to 4 paged formats or an MoE design,
-        else 4 (even: BDs 0-23; a dense design's memtile channels take BDs 0-3 and 24-39 of them)."""
-        return PG_CH if len(self.paged) <= 4 or self.moe else 4
+    def pg_split(self) -> bool:
+        """Whether each core half's pages have a memtile channel of their own (``pg_channels``): a design of 8 slots, whose
+        memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves."""
+        return self.slots == 8
+
+    @property
+    def pg_channels(self) -> tuple[int, int]:
+        """The memtile MM2S channel of each core half's pages: PG_CH (odd: BDs 24-47) for up to 4 paged formats or an MoE
+        design, else 4 (even: BDs 0-23; a dense design's memtile channels take BDs 0-3 and 24-39 of them); ``pg_split``: 4
+        and 5."""
+        if self.pg_split:
+            return 4, 5
+        ch = PG_CH if len(self.paged) <= 4 or self.moe else 4
+        return ch, ch
 
     @property
     def pg_store(self) -> tuple[int, int, int]:
         """(first BD, store address, bytes) of the page store: PG_BD, PG_STORE, PG_STORE_BYTES for up to 4 paged
-        formats; of more, a BD per format and core half up to the channel's last (``pg_channel``'s parity: 47 or 23), and
+        formats; of more, a BD per format and core half up to the channel's last (``pg_channels``' parity: 47 or 23), and
         4 KB per page (pages of ~3-4 KB), 12 KB more per paged format with a gather table (its two copies in the page of
-        each core half: ~6 KB of control packets each), the store ending at the memtile's end."""
+        each core half: ~6 KB of control packets each), the store ending at the memtile's end (``pg_split``: the first BD
+        of the main cores' pages; the helpers' end at BD 47, their bytes the second half)."""
         n = len(self.paged)
-        if n <= 4 and not self.tables:
+        if n <= 4 and not self.tables and not self.pg_split:
             return PG_BD, PG_STORE, PG_STORE_BYTES
         size = max(0xC000, 0x2000 * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
-        return 24 * (self.pg_channel % 2) + 24 - 2 * n, 0x80000 - size, size
+        ch = self.pg_channels[0]
+        return 24 * (ch % 2) + 24 - (1 if self.pg_split else 2) * n, 0x80000 - size, size
+
+    def pg_halves(self) -> tuple[tuple[int, int, int, int], ...]:
+        """Per page store (``pg_split``: per core half) (channel, first BD, store address, bytes)."""
+        bd0, base, size = self.pg_store
+        if not self.pg_split:
+            return ((self.pg_channels[0], bd0, base, size),)
+        n = len(self.paged)
+        return ((4, bd0, base, size // 2), (5, 48 - n, base + size // 2, size - size // 2))
 
     def _page_spec(self) -> gemv.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
-        (h0, ctl), (h1, _) = (paging.request(stream_id=i, channel=self.pg_channel) for i in PG_REQ_ID)
+        (h0, c0), (h1, c1) = (paging.request(stream_id=i, channel=ch) for i, ch in zip(PG_REQ_ID, self.pg_channels))
         bd0 = self.pg_store[0]
-        return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1),
-                             bd0=(bd0, bd0 + len(self.paged)), ctl=ctl)
+        bd1 = self.pg_halves()[1][1] if self.pg_split else bd0 + len(self.paged)
+        return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1), bd0=(bd0, bd1), ctl=(c0, c1))
 
-    def page_store(self) -> paging.Store | None:
-        """The compiled design's page store (the paged formats' pages of the main cores, then of the helpers), checked
-        against the design's configuration; None without paged formats."""
+    def page_store(self) -> tuple[paging.Store, ...] | None:
+        """The compiled design's page stores (the paged formats' pages of the main cores, then of the helpers; ``pg_split``:
+        a store per core half), checked against the design's configuration; None without paged formats."""
         if not self.paged:
             return None
         wd = os.path.dirname(self._program.insts_path)
@@ -493,21 +569,25 @@ class DecodeOverlayOperator(ArtcOperator):
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
                                stream_id=PG_PAGE_ID[h])
-        bd0, base, size = self.pg_store
         pagers = []
-        for h, (row, stack) in enumerate(((self.MAIN_ROW, self.STACK), (self.HELPER_ROW, self.HELPER_STACK))):
+        for h, (row, stack) in enumerate(zip((self.MAIN_ROW, self.HELPER_ROW), self.stacks)):
             pg = pager(h, row, stack)
-            data = {f: tuple((a - 0x70000, slot(f).mmv_table(f)) for a in TAB[h]) for f in self.paged if f in self.tables}
+            data = {f: tuple((a - 0x70000, slot(f).mmv_table(f)) for a in self.tab[h]) for f in self.paged if f in self.tables}
             pagers.append(dataclasses.replace(pg, data=data) if data else pg)
-        store = paging.Store(base=base, size=size, channel=self.pg_channel, bd0=bd0, pagers=tuple(pagers))
-        store.check(wd, range(COLS))
-        return store
+        halves = self.pg_halves()
+        groups = [tuple(pagers)] if len(halves) == 1 else [(pg,) for pg in pagers]
+        stores = tuple(paging.Store(base=base, size=size, channel=ch, bd0=bd0, pagers=g)
+                       for (ch, bd0, base, size), g in zip(halves, groups))
+        for store in stores:
+            store.check(wd, range(COLS))
+        return stores
 
-    def page_prologue(self, store: paging.Store) -> np.ndarray:
-        """The transaction that makes the pages loadable: the store and its BDs in every memtile, every paging core's
+    def page_prologue(self, stores: tuple[paging.Store, ...]) -> np.ndarray:
+        """The transaction that makes the pages loadable: the stores and their BDs in every memtile, every paging core's
         state words cleared (a configuration rewrites the slot's start with the startup code)."""
         t = txn.Txn()
-        store.load(t, range(COLS))
+        for store in stores:
+            store.load(t, range(COLS))
         for c in range(COLS):
             for row in (self.MAIN_ROW, self.HELPER_ROW):
                 t.write32(txn.tile_address(c, row, PG_STATE), 0)
@@ -598,12 +678,12 @@ class DecodeOverlayOperator(ArtcOperator):
         cmds = [ObjectFifo(cmd_ty, name=f"{P}_cmd{c}", depth=2) for c in range(COLS)]
         m_fifos = [ObjectFifo(c_ty, name=f"{P}_M{c}", depth=2) for c in range(COLS)] if self.msg else []
         r_fifos = [ObjectFifo(rr_ty, name=f"{P}_R{c}", depth=2) for c in range(COLS)] if self.relay else []
-        ress = [ObjectFifo(r_ty, name=f"{P}_res{c}", depth=2) for c in range(COLS)]
+        ress = [ObjectFifo(r_ty, name=f"{P}_res{c}", depth=1 if s8 and self.tables else 2) for c in range(COLS)]
 
         def main_fn(a_f, x_f, c_f, cmd_f, res_f, *rest):
             rest = list(rest)
-            if s8:
-                rest = rest[:-2]
+            if s8:  # (the SiLU table's copies: placed, read through their addresses)
+                rest = rest[:-(1 if self.tables else 2)]
             if self.tables:  # (the gather tables: placed, read through their addresses)
                 rest = rest[:-2]
             if self.paged:  # (the pager's state words and the column's page store: placed, used by no code here)
@@ -754,7 +834,7 @@ class DecodeOverlayOperator(ArtcOperator):
             pg_locks += [Lock(main, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{mr}"),
                          Lock(helper, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}_{hr}")]
             for h, t in enumerate((main, helper)):
-                pg_flows += [paging.page_flow(mem, t, channel=self.pg_channel, stream_id=PG_PAGE_ID[h]),
+                pg_flows += [paging.page_flow(mem, t, channel=self.pg_channels[h], stream_id=PG_PAGE_ID[h]),
                              paging.request_flow(t, mem, stream_id=PG_REQ_ID[h])]
         grids = {}  # (the gather tables: per core two copies at TAB, used through their addresses only; ``tables``)
         if self.tables:
@@ -767,12 +847,15 @@ class DecodeOverlayOperator(ArtcOperator):
             for c in range(COLS):
                 for h, r in enumerate((mr, hr)):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
-                                          address=TAB[h][i] - 0x70000, initial_value=init)
+                                          address=self.tab[h][i] - 0x70000, initial_value=init)
                                    for i in range(2)]
         def silu_tab(c: int) -> list[Buffer]:  # (placed, read through their addresses)
+            if not s8:
+                return []
             words = kmath.SILU.table_words()
+            at = [self.l1_8()["h_silu"]] if self.tables else list(SILU8_AT)
             return [Buffer(np.ndarray[(words.size,), np.dtype[np.uint32]], name=f"{P}_msilu{c}_{i}", tile=Tile(c, hr), address=a,
-                           initial_value=words) for i, a in enumerate(SILU8_AT)] if s8 else []
+                           initial_value=words) for i, a in enumerate(at)]
 
         # (paged: the main cores take COLS + their column, not a constant 0 in column 0, which can give its control code
         # another size: every core's resident kernels must lie where the pages were linked, ``paging.link``)
@@ -788,7 +871,7 @@ class DecodeOverlayOperator(ArtcOperator):
             hs = Buffer(hs_ty, name=f"{P}_hs{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
             sq = Buffer(sq_ty, name=f"{P}_sq{c}", tile=Tile(c, self.HS8_ROW if s8 else hr))
             sqs.append(sq)
-            workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=2 if s8 else 1, **x_kw), c_fifos[c].prod(), cmds[c].prod(),
+            workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=self.x_l1_depth, **x_kw), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, *hres,
                                             *([k_xgate] if self.gate else []), k_begin, k_nbegin,
@@ -797,7 +880,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                             *([k_psums] if self.post else []), ws, xp, xs,
                                             (COLS if self.paged else 0) + c, *pg_main.get(c, []),
                                             *grids.get((c, 0), []), *silu_tab(c)],
-                                  tile=Tile(c, mr), stack_size=self.STACK, dynamic_objfifo_lowering=True,
+                                  tile=Tile(c, mr), stack_size=self.stacks[0], dynamic_objfifo_lowering=True,
                                   while_true=False))
             help_args = []
             if self.help_flag:
@@ -807,7 +890,7 @@ class DecodeOverlayOperator(ArtcOperator):
             workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres, *help_args,
                                               *pg_help.get(c, []), *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
-                                  stack_size=self.HELPER_STACK, dynamic_objfifo_lowering=True, while_true=False))
+                                  stack_size=self.stacks[1], dynamic_objfifo_lowering=True, while_true=False))
         s = _Streams(p=p, a_ty=a_ty, x_ty=x_ty, c_ty=c_ty, r_ty=rr_ty, a_l1=a_l1, x_l1=x_l1, m_fifos=m_fifos, r_fifos=r_fifos,
                      ws=m_ws, xs=m_xs, xp=xps, sq=sqs, x_kw=x_kw)
         extra, d_fifos = self._extra_workers(s)
@@ -837,11 +920,18 @@ class DecodeOverlayOperator(ArtcOperator):
             rt.add_lock(lk)
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         at = self._pins()
-        if s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
+        pools: dict[str, list[int]] = {}
+        if s8 and self.tables:  # (``l1_8``)
+            L = self.l1_8()
+            for c in range(COLS):
+                at |= {f"{P}_ws{c}": L["m_ws"], f"{P}_xs{c}": L["m_xs"], f"{P}_xp{c}": L["h_xp"], f"{P}_hres{c}": L["h_hres"],
+                       f"{P}_hst{c}": L["h_hst"]}
+                pools |= {f"{P}_a{c}__cons0": [L["m_a0"], L["m_a1"]], f"{P}_x{c}__cons0": [L["m_x0"]], f"{P}_res{c}": [L["h_res"]]}
+        elif s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
             at |= {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)}
             assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000
-        if at:
-            pin_l1_buffers(module, fifo=lambda name, depth: None, buffer=at.get)
+        if at or pools:
+            pin_l1_buffers(module, fifo=lambda name, depth: pools.get(name), buffer=at.get)
         if self.bcast:  # (on the placed design: the placer takes a flow from a shim channel an ObjectFifo uses for a channel more)
             packet_flow(module, BC_ID, (BC_COL, 0), self.ENDPOINTS["X"][1],
                         [(c, r, X_CH) for c in range(COLS) for r in (mr, *self._x_rows())])

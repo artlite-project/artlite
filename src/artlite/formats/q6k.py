@@ -210,10 +210,10 @@ __attribute__((noinline)) void {{ p }}_q6k_mm(const uint8_t *__restrict xp, cons
 {% if slots == 8 %}
         const v64bfp16ebs8 ZL = xz.pop();
 {% endif %}
-        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[2][0];
+        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int t = 0; t < 8; t++) {  // (i, h): sub-block 2 i + h = 8 k + t
-            const v64bfp16ebs8 N = {{ p }}_np(pn);
+            const v64bfp16ebs8 N = {{ p }}_np(pn, 0x87);  // (-32 e_i)
             pn += 64;
             const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop();
 {% if slots == 8 %}

@@ -223,6 +223,49 @@ __attribute__((noinline)) void {{ p }}_q4k_tr(const uint8_t *__restrict src, uin
 // Pass 2: per (g, sb) the table TD = d sc ([i][r], sc = lo + 16 crumb through I) -> tab; y[g] += the offsets
 // hilo(XS sc) 8 d + hilo(XS mn) (-dmin) (w = d sc (q - 8) + 8 d sc - dmin mn). HI: the second core's super-blocks 2, 3
 // (crumbs in bits 2-3){{ "; ys: the second super-block's rows at y + ys (row groups)" if rg else "" }}
+{% if slots == 8 %}
+template <int HI>
+__attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, const uint8_t *__restrict xs,
+                                               bfloat16 *__restrict tab, float *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const v64bfp16ebs8 I = al::eye();
+    const v64uint8 msk = broadcast_to_v64uint8((unsigned char)(HI ? 12 : 3));
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 4; t++) {  // (g, u) = (t / 2, t % 2), sb = 2 HI + u: its sums' hi and lo panels (no 64-lane values
+        // across iterations: the unrolled form spills, a 1.6 KB frame)
+        const int g = t >> 1, u = t & 1;
+        const uint8_t *hw = hw0 + 512 * g;
+        al::BIn<> xsp((const bfp16ebs8 *)(xs + {{ XS_SLOT }} * HI));
+        if (u) {
+            xsp.pop();
+            xsp.pop();
+        }
+        const v64bfp16ebs8 X = xsp.pop(), XL = xsp.pop();
+        // d, -dmin of the pair: word panels 12 + HI, 14 + HI ([row][sb % 2] bf16)
+        const aie::vector<bfloat16, 16> dp = aie::load_v<16>((const bfloat16 *)(hw + 384 + 32 * HI));
+        const aie::vector<bfloat16, 16> mp = aie::load_v<16>((const bfloat16 *)(hw + 448 + 32 * HI));
+        v64bfp16ebs8 Sl, Sc, Ml, Mc;
+        Sl.exponent = Ml.exponent = al::e8(0x85);
+        Sc.exponent = Mc.exponent = al::e8(HI ? 0x87 : 0x89);
+        Sl.mantissa = (v64int8)unpack(*(const v64uint4 *)(hw + 32 * (2 * HI + u)));
+        Ml.mantissa = (v64int8)unpack(*(const v64uint4 *)(hw + 128 + 32 * (2 * HI + u)));
+        Sc.mantissa = (v64int8)band(unpack(*(const v64uint4 *)(hw + 256 + 32 * u)), msk);
+        Mc.mantissa = (v64int8)band(unpack(*(const v64uint4 *)(hw + 320 + 32 * u)), msk);
+        const aie::vector<bfloat16, 8> d8 = u ? aie::filter_odd(dp, 1) : aie::filter_even(dp, 1);
+        const aie::vector<bfloat16, 8> m8 = u ? aie::filter_odd(mp, 1) : aie::filter_even(mp, 1);
+        const aie::vector<bfloat16, 64> D = d8.template grow_replicate<64>();
+        {{ p }}_td(mac_8x8_8x8T(I, 1, Sc, 0, mul_8x8_8x8T(I, 1, Sl, 0)), D, tab + 256 * u + 128 * g);
+        aie::accum<accfloat, 64> Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Sc, 0, mac_8x8_8x8T(XL, 1, Sl, 0, mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)))),
+                                                aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(),
+                                                aie::zeros<accfloat, 64>());
+        Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Mc, 0, mac_8x8_8x8T(XL, 1, Ml, 0, mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)))),
+                       m8.template grow_replicate<64>(), Y);
+        {{ p }}_yadd8(y + 64 * g, Y);
+    }
+}
+
+{% else %}
 template <int HI>
 __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, const uint8_t *__restrict xs,
                                                bfloat16 *__restrict tab, float *__restrict y{{ ", int ys" if rg else "" }})
@@ -231,11 +274,7 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, co
     const v64bfp16ebs8 I = al::eye();
     const v64uint8 msk = broadcast_to_v64uint8((unsigned char)(HI ? 12 : 3));
     al::BIn<> xsp((const bfp16ebs8 *)(xs + {{ XS_SLOT }} * HI));
-{% if slots == 8 %}
-    const v64bfp16ebs8 X0 = xsp.pop(), L0 = xsp.pop(), X1 = xsp.pop(), L1 = xsp.pop();  // (the sums' hi, lo panels)
-{% else %}
     const v64bfp16ebs8 X0 = xsp.pop(), X1 = xsp.pop();
-{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int g = 0; g < 2; g++) {
         const uint8_t *hw = hw0 + 512 * g;
@@ -246,9 +285,6 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, co
         AIE_LOOP_UNROLL_FULL
         for (int u = 0; u < 2; u++) {  // sb = 2 HI + u
             const v64bfp16ebs8 X = u ? X1 : X0;
-{% if slots == 8 %}
-            const v64bfp16ebs8 XL = u ? L1 : L0;
-{% endif %}
             v64bfp16ebs8 Sl, Sc, Ml, Mc;
             Sl.exponent = Ml.exponent = al::e8(0x85);
             Sc.exponent = Mc.exponent = al::e8(HI ? 0x87 : 0x89);
@@ -260,29 +296,21 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict hw0, co
             const aie::vector<bfloat16, 8> m8 = u ? aie::filter_odd(mp, 1) : aie::filter_even(mp, 1);
             const aie::vector<bfloat16, 64> D = d8.template grow_replicate<64>();
             {{ p }}_td(mac_8x8_8x8T(I, 1, Sc, 0, mul_8x8_8x8T(I, 1, Sl, 0)), D, tab + 256 * u + 128 * g);
-{% if slots == 8 %}
-            Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Sc, 0, mac_8x8_8x8T(XL, 1, Sl, 0, mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)))),
-                           aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(), Y);
-            Y = {{ p }}_mo(mac_8x8_8x8T(XL, 1, Mc, 0, mac_8x8_8x8T(XL, 1, Ml, 0, mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)))),
-                           m8.template grow_replicate<64>(), Y);
-{% else %}
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Sc, 0, mul_8x8_8x8T(X, 1, Sl, 0)),
                            aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(), Y);
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), m8.template grow_replicate<64>(), Y);
-{% endif %}
 {% if rg %}
             {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (per super-block: its rows of their own with ys)
             Y = aie::zeros<accfloat, 64>();
 {% endif %}
         }
-{% if slots == 8 %}
-        {{ p }}_yadd8(y + 64 * g, Y);
-{% elif not rg %}
+{% if not rg %}
         {{ p }}_yadd(y + 32 * g, Y);
 {% endif %}
     }
 }
 
+{% endif %}
 {% if slots == 8 %}
 // Pass 3: c_g,sb,i = bf16(C) -> c [sb][i][g][64]; C = -8 XS_i + sum_s X(sb, i, s) W_g(sb, s, i) (the unsigned codes,
 // centered; XS: the sums' hi and lo panels)
@@ -304,7 +332,7 @@ __attribute__((noinline)) void {{ p }}_q4k_mm(const uint8_t *__restrict xp, cons
 {% if slots == 8 %}
         const v64bfp16ebs8 ZL = xz.pop();
 {% endif %}
-        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0][0];
+        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int i = 0; i < 8; i++) {
             const v64bfp16ebs8 N = {{ p }}_np(pn);

@@ -509,6 +509,9 @@ class Iq3sSlot(Slot):
 
         return {"UP": op.unit_pitch, "seg": seg, "mask": mask, **self._ws(op)}
 
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
+
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)
 

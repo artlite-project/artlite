@@ -120,13 +120,14 @@ first and last sixteen layers in IQ3_S, of the middle thirty-two in IQ3_XXS, the
 Q4_0 / Q4_1. Its 9280-byte tiles hold 16 IQ4_XS rows, 20 IQ3_S rows or 23 IQ3_XXS rows. IQ4_XS and IQ4_NL map 4-bit codes
 through a table of 16 values: the cores look up two codes per byte by gathers; IQ3_S indexes a 512-entry grid of 4
 values each (`formats/iq4.py`, `formats/iq3s.py`). With ten tile formats its decode design loads every format's kernel
-as a code page, each IQ format's page bringing its lookup table, and a step decodes up to 4 tokens.
+as a code page, each IQ format's page bringing its lookup table. With its MTP drafter a step decodes up to 8 tokens
+(`--spec-type none`: up to 4, a design 2% faster per step).
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
 With its drafter (the model's MTP layer: an attention layer and an FFN of its own - Qwen3.8-27B's dense, in its model
 file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three draft
-tokens along (Qwen3.8-27B up to seven; `qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
+tokens along (Qwen3.8-27B and Swift 1.5 up to seven; `qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
 follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
 ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 14 ms at 32K), as long as their
 chain's probability pays for what they cost: a draft's slot in the step and the drafter's step for the next one, against

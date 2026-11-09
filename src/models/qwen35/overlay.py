@@ -144,13 +144,15 @@ class _Step:
         self.patch: dict[str, np.ndarray] | None = None  # (``_patch_tables``)
 
 
-def slots_of(cfg: QwenConfig, fmts: set[str], gu_win: bool = False) -> int:
+def slots_of(cfg: QwenConfig, fmts: set[str], drafts: bool) -> int:
     """A step's token slots at most: 8 for a dense model of a KV head per 2 columns whose formats the decode GEMV runs at
-    8 slots (``decode.gemv``) and whose gate / up tiles hold 16 rows: no slower at S 1, S 4 3% faster. Else 4: an MoE
-    design has no broadcast input, a KV head per 4 columns makes the one-pass attention slower at S 1, gate / up tiles of
-    other rows need the windows (``gu_win``: ``decode.design``) that designs of 8 slots lack."""
-    return 8 if (not cfg.moe and not gu_win and COLS // cfg.num_key_value_heads == 2
-                 and all(gemv.supported(f, 4, 8) for f in fmts)) else 4
+    8 slots (``decode.gemv``), either Q4_K and Q6_K only (no slower at S 1, S 4 3% faster) or with ``drafts`` (a drafter's
+    steps of several tokens): other formats' designs of 8 slots are slower at S 1 (the 9B's Q5_K +1.4%; Swift 1.5's IQ
+    formats, their tables' layout with one X object, +2%), which only the drafts pay for (Swift 1.5's MTP layer at 1K:
+    +10% on prose). Else 4: an MoE design has no broadcast input, a KV head per 4 columns makes the one-pass attention
+    slower at S 1."""
+    return 8 if (not cfg.moe and COLS // cfg.num_key_value_heads == 2 and all(gemv.supported(f, 4, 8) for f in fmts)
+                 and (fmts <= {"Q4_K", "Q6_K"} or drafts)) else 4
 
 
 def chunk_of(cfg: QwenConfig) -> bool:
@@ -182,13 +184,15 @@ class QwenOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset()):
-        """slots: a step's token slots at most (default ``slots_of``)."""
+                 image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset(),
+                 drafts: bool | None = None):
+        """slots: a step's token slots at most (default ``slots_of``, ``drafts``: whether a drafter's steps of several
+        tokens run, default: the file has an MTP layer of its own)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
         gu_win = img.gu_rows() | gu != {16}  # (``decode.design``'s gate / up windows)
-        slots = slots or slots_of(cfg, fmts, gu_win)
+        slots = slots or slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts)
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None

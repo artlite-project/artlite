@@ -32,7 +32,7 @@ template <typename T>
 // ---- Q8_0 ({{ R80 }} rows): {{ "per super-block a unit [codes [i][s][row 8][8 B] (MMUL panels) | d [row][i] bf16] (2176 B)" if R80 == 8 else "d [row][sb][i] bf16 | codes [sb][g][i][s][row 8][8 B] (MMUL panels)" }}. {{ "Core H: super-blocks 2 H, 2 H + 1 of the row group (y[0 ..])" if R80 == 8 else "Core H: row group H (y[32 H ..])" }}.
 // Scratch: tab [sb][i][r] (128 B per sb) | c [sb][i][32] (512 B per sb)
 
-// c_sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][32] for NS super-blocks (their slices of the row group SK bytes
+// c_sb,i = bf16(C[hi rows] + C[lo rows]) (8 slots: bf16(C)) -> c [sb][i][{{ L }}] for NS super-blocks (their slices of the row group SK bytes
 // apart); C = sum_s X(sb, i, s) W(sb, i, s); groups i, i + 1 in two chains
 template <int NS, int SK>
 __attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, const uint8_t *__restrict w, bfloat16 *__restrict c)
@@ -55,10 +55,15 @@ __attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x6, 1, {{ p }}_w8(pw + 384), 1, C1);
             C0 = mac_8x8_8x8T(x3, 1, {{ p }}_w8(pw + 192), 1, C0);
             C1 = mac_8x8_8x8T(x7, 1, {{ p }}_w8(pw + 448), 1, C1);
+{% if slots == 8 %}
+            aie::store_v(pc, {{ p }}_c8(C0));
+            aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
             aie::store_v(pc, {{ p }}_sum2(C0));
             aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
             pw += 512;
-            pc += 64;
+            pc += {{ 2 * L }};
         }
         pw += SK;  // (the next super-block's slice, the same row group)
     }
@@ -84,13 +89,13 @@ __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q80_mm<2, 128>(xp, a + 4352 * H, c);
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg else "" }}
-        {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y{{ " + sb * ys" if rg else "" }});
+        {{ p }}_sc1<1>(c + {{ 8 * L }} * sb, tab + 64 * sb, y{{ " + sb * ys" if rg else "" }});
 {% else %}
     {{ p }}_dtab<1>((const bfloat16 *)a + {{ 64 * NSB }} * H, tab);
     {{ p }}_q80_mm<{{ NSB }}, {{ 256 * R80 - 2048 }}>(xp, a + {{ 16 * NSB * R80 }} + 2048 * H, c);
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < {{ NSB }}; sb++)
-        {{ p }}_sc1<1>(c + 256 * sb, tab + 64 * sb, y + 32 * H);
+        {{ p }}_sc1<1>(c + {{ 8 * L }} * sb, tab + 64 * sb, y + {{ L }} * H);
 {% endif %}
 }
 """
@@ -193,6 +198,9 @@ class Q8Slot(Slot):
 
     def qd_template_vars(self, op: object) -> dict[str, int]:
         return {"UP": op.unit_pitch}
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return True

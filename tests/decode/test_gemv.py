@@ -194,7 +194,7 @@ def test_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str,
     _check_gemv(fmt, S_BYTES, NSB, key, name, S)
 
 
-GEMV8 = [c for c in GEMV if c[0] in ("Q4_K", "Q6_K")]
+GEMV8 = [c for c in GEMV if c[0] in mmv.GEMV8_FORMATS and not gemv.row_split(c[0], c[2])]
 
 
 @pytest.mark.parametrize("S", [1, 5, 8])

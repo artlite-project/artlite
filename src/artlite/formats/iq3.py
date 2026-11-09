@@ -177,7 +177,7 @@ __attribute__((noinline)) void {{ p }}_iq3(uint8_t *__restrict a, const uint8_t 
 # the MMUL and the scaling of IQ3_XXS and IQ3_S (their weight panels [i][l 4][g 3][64 B], scales [i][g 4][r 8])
 _XSC = r"""// The 3 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
 // rows] + C[lo rows]) of the group's 4 panels, in place of its panel (l 0, g) (w: [i][l][g][64 B], c: 64 B per (i, g)
-// at 64 (12 i + g))
+// at 64 (12 i + g); 8 slots: c = bf16(C), 128 B per (i, g) at 768 i + 128 g, in place of the group's panels l 0, 1)
 __attribute__((noinline)) void {{ p }}_iq3_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
                                              bfloat16 *__restrict c)
 {
@@ -200,32 +200,39 @@ __attribute__((noinline)) void {{ p }}_iq3_x(const uint8_t *__restrict xp, const
             W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 192 * l + 128);
             C2 = l ? mac_8x8_8x8T(X, 1, W, 1, C2) : mul_8x8_8x8T(X, 1, W, 1);
         }
+{% if slots == 8 %}
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + 64, {{ p }}_c8(C1));
+        aie::store_v(pc + 128, {{ p }}_c8(C2));
+{% else %}
         aie::store_v(pc, {{ p }}_sum2(C0));
         aie::store_v(pc + 32, {{ p }}_sum2(C1));
         aie::store_v(pc + 64, {{ p }}_sum2(C2));
+{% endif %}
         pw += 768;
         pc += 384;
     }
 }
 
-// y[g] += hilo(sum over the 8 groups i of c (i, g) sct[i][g][r]) dg[g] for the 3 row groups (c (i, g): 32 bf16 at
-// c + 384 i + 32 g)
+// y[g] += hilo(sum over the 8 groups i of c (i, g) sct[i][g][r]) dg[g] for the 3 row groups (c (i, g): {{ L }} bf16 at
+// c + 384 i + {{ L }} g; y [g][slot][r])
 __attribute__((noinline)) void {{ p }}_iq3_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
                                               const bfloat16 *__restrict dg, float *__restrict y)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 32> Y0 = aie::zeros<accfloat, 32>(), Y1 = aie::zeros<accfloat, 32>(), Y2 = aie::zeros<accfloat, 32>();
+    aie::accum<accfloat, {{ L }}> Y0 = aie::zeros<accfloat, {{ L }}>(), Y1 = aie::zeros<accfloat, {{ L }}>(),
+        Y2 = aie::zeros<accfloat, {{ L }}>();
     const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
     const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
     AIE_LOOP_UNROLL_FULL  // (pipelined: a ramp longer than the 8 iterations)
     for (int i = 0; i < 8; i++) {
-        Y0 = aie::mac(Y0, aie::load_v<32>(pc + 384 * i), aie::load_v<8>(ps + 32 * i).template grow_replicate<32>());
-        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 384 * i + 32), aie::load_v<8>(ps + 32 * i + 8).template grow_replicate<32>());
-        Y2 = aie::mac(Y2, aie::load_v<32>(pc + 384 * i + 64), aie::load_v<8>(ps + 32 * i + 16).template grow_replicate<32>());
+        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(pc + 384 * i), aie::load_v<8>(ps + 32 * i).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(pc + 384 * i + {{ L }}), aie::load_v<8>(ps + 32 * i + 8).template grow_replicate<{{ L }}>());
+        Y2 = aie::mac(Y2, aie::load_v<{{ L }}>(pc + 384 * i + {{ 2 * L }}), aie::load_v<8>(ps + 32 * i + 16).template grow_replicate<{{ L }}>());
     }
     {{ p }}_k23d(y, Y0, dg);
-    {{ p }}_k23d(y + 32, Y1, dg + 8);
-    {{ p }}_k23d(y + 64, Y2, dg + 16);
+    {{ p }}_k23d(y + {{ L }}, Y1, dg + 8);
+    {{ p }}_k23d(y + {{ 2 * L }}, Y2, dg + 16);
 }
 
 """
@@ -550,6 +557,9 @@ class Iq3Slot(Slot):
         ws = self._ws(op)
         return {"UP": op.unit_pitch, "U3": U, "I3": I, "S3": S, "LS": self.list_bytes(op.n), "WU": ws["WU"],
                 "WL": ws["WL"], "seg": seg, "mask": mask}
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)

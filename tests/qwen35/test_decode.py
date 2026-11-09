@@ -817,7 +817,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     path = ref.size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    if mode in ("s7", "lazy8") and size != "3.8-27B":
+    if mode in ("s7", "lazy8") and size not in ("3.8-27B", "swift"):
         pytest.skip("steps of more than 4 tokens: designs of 8 slots")
     La = ref.QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
     n, layers = 104 if mode.startswith("split") else 34, list(range(La + 1))

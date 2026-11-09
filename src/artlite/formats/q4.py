@@ -299,17 +299,30 @@ __attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, cons
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < NS; sb++) {
         al::BIn<aie_dm_resource::d> xz((const bfp16ebs8 *)(xsum + {{ XS_SLOT }} * (sb >> 1)));  // (the pair's slot)
+{% if slots == 8 %}
+        v64bfp16ebs8 Z = xz.pop(), ZL = xz.pop();  // (the sums' hi and lo panels)
+        if (sb & 1) {
+            Z = xz.pop();
+            ZL = xz.pop();
+        }
+{% else %}
         v64bfp16ebs8 Z = xz.pop();
         if (sb & 1)
             Z = xz.pop();
-        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0][0];
+{% endif %}
+        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int i = 0; i < 8; i++) {
             const v64bfp16ebs8 N = {{ p }}_np(pn);
             pn += 64;
             const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
+{% if slots == 8 %}
+            v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+            v64accfloat C1 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+{% else %}
             v64accfloat C0 = mul_8x8_8x8T(Z, 1, N, 1);
             v64accfloat C1 = mul_8x8_8x8T(Z, 1, N, 1);
+{% endif %}
             C0 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw), 0, C0);
             C1 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw + 1024), 0, C1);
             C0 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 32), 0, C0);
@@ -318,10 +331,15 @@ __attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x2, 1, {{ p }}_wu(pw + 1088), 0, C1);
             C0 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 96), 0, C0);
             C1 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 1120), 0, C1);
+{% if slots == 8 %}
+            aie::store_v(pc, {{ p }}_c8(C0));
+            aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
             aie::store_v(pc, {{ p }}_sum2(C0));
             aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
             pw += 128;
-            pc += 64;
+            pc += {{ 2 * L }};
         }
         pw += ADV;  // (the next super-block's codes)
     }
@@ -330,7 +348,8 @@ __attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, cons
 
 _Q4S = r"""// ---- Q4_0 / Q4_1 tiles of 1024 columns (R rows, row group 1 = rows 8 .. and junk): d [row][sb 4][i 8] bf16 (Q4_1: then
 // m [row][sb][i]) | codes [sb][row R][128 B]. Core H: super-blocks 2 H, 2 H + 1 of every row (the K-quants' split).
-// Scratch: the codes transposed [u 2][g 2][i 8][s 4][32 B] (4 KB) | tab [u][g][i][r] (512 B) | c [u][i][g][32] (2 KB)
+// Scratch: the codes transposed [u 2][g 2][i 8][s 4][32 B] (4 KB) | tab [u][g][i][r] (512 B) | c [u][i][g][32] (2 KB; 8
+// slots: [64], 4 KB)
 
 // The codes of super-blocks 2 H, 2 H + 1 (src: the first's [row][128 B], the second rb B after it) -> dst
 // [u][g][i][s][32 B]: panel (s, i) of row group g = word i of chunk s of its rows
@@ -384,7 +403,7 @@ __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q40_mm<{{ NSB }}, {{ 128 * R40 - 1024 }}>(xp, xs, codes, c);
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < {{ NSB }}; sb++)
-        {{ p }}_sc1<2>(c + 512 * sb, tab + 128 * sb, y);
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * sb, tab + 128 * sb, y);
 }
 {% else %}
 // ---- Q4_0 ({{ R40 }} rows): d [row][sb][i] bf16 | codes (mmv/q4s). y[g][32] (rows 8 g ..) += the rows of super-blocks 2 H,
@@ -400,7 +419,7 @@ __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++)  // (rg: super-block 2 H + 1's rows into y + ys, rows of their own)
-        {{ p }}_sc1<2>(c + 512 * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
 }
 {% endif %}
 """
@@ -409,6 +428,32 @@ _MMV41 = r"""// ---- Q4_1 ({{ R41 }} rows): d | m [row][sb][i] bf16 | codes (mmv
 
 // The offsets: y[g] += sum_i XS_i (m_i + 8 d_i) of super-blocks 2 H, 2 H + 1: the core's 32-k sum panels against M =
 // m + 8 d [r][i] (fp32, exact) as bfp16 hi + lo B panels (~14 bits); y += their hi and lo rows' sums
+{% if slots == 8 %}
+__attribute__((noinline)) void {{ p }}_q41_off(const uint8_t *__restrict a, const uint8_t *__restrict xsum,
+                                               float *__restrict y, int H)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 4; t++) {  // (g, u) = (t / 2, t % 2): super-block 2 H + u's sums, hi and lo panels (no 64-lane
+        // values across iterations)
+        const int g = t >> 1, u = t & 1;
+        al::BIn<> xz((const bfp16ebs8 *)xsum);
+        if (u) {
+            xz.pop();
+            xz.pop();
+        }
+        const v64bfp16ebs8 X = xz.pop(), XL = xz.pop();
+        const bfloat16 *d = (const bfloat16 *)a + 256 * g + 16 * H + 8 * u, *m = d + {{ 32 * R41 }};
+        const aie::vector<bfloat16, 64> D = al::gather<8, 8>(d, 32), M = al::gather<8, 8>(m, 32);
+        al::BV hi, lo;
+        al::split_hilo(aie::mac(aie::accum<accfloat, 64>(M), D, aie::broadcast<bfloat16, 64>(8.0f)), nI, hi, lo);
+        const aie::accum<accfloat, 64> Y(mac_8x8_8x8T(XL, 1, lo, 1, mac_8x8_8x8T(XL, 1, hi, 1, mac_8x8_8x8T(X, 1, lo, 1, mul_8x8_8x8T(X, 1, hi, 1)))));
+        {{ p }}_yadd8(y + 64 * g, Y);
+    }
+}
+
+{% else %}
 __attribute__((noinline)) void {{ p }}_q41_off(const uint8_t *__restrict a, const uint8_t *__restrict xsum,
                                                float *__restrict y, int H)
 {
@@ -432,6 +477,7 @@ __attribute__((noinline)) void {{ p }}_q41_off(const uint8_t *__restrict a, cons
     }
 }
 
+{% endif %}
 // super-blocks 2 H, 2 H + 1 of a Q4_1 tile (d (q - 8) as Q4_0's, then the offsets)
 template <int H>
 __attribute__((noinline)) void {{ p }}_q41(uint8_t *__restrict a, const uint8_t *__restrict xp,
@@ -444,7 +490,7 @@ __attribute__((noinline)) void {{ p }}_q41(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++)
-        {{ p }}_sc1<2>(c + 512 * u, tab + 128 * u, y);
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * u, tab + 128 * u, y);
     {{ p }}_q41_off(a, xs + {{ XS_SLOT }} * H, y, H);
 }
 """
@@ -494,6 +540,9 @@ class Q4Slot(Slot):
 
     sources: ClassVar[dict[str, str]] = {"gemm/Q4_0": _GEMM, "gemm/Q4_1": _GEMM, "mmv/q4mm": _MM, "mmv/q4s": _Q4S,
                                          "mmv/Q4_0": _MMV, "mmv/Q4_1": _MMV41}
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4 or (fmt == "Q4_0" and nsb == 2)

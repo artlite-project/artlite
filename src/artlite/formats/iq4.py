@@ -198,7 +198,7 @@ __attribute__((noinline)) void {{ p }}_iq4_w(const uint8_t *__restrict codes, co
 
 // The 2 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
 // rows] + C[lo rows]) of the group's 4 panels, in place of its panel (i, 0, g) (w: [i][s][g][64 B], c: 64 B per (i, g)
-// at 512 i + 64 g)
+// at 512 i + 64 g; 8 slots: c = bf16(C), 128 B at 512 i + 128 g)
 __attribute__((noinline)) void {{ p }}_iq4_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
                                              bfloat16 *__restrict c)
 {
@@ -219,41 +219,46 @@ __attribute__((noinline)) void {{ p }}_iq4_x(const uint8_t *__restrict xp, const
             W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 128 * s + 64);
             C1 = s ? mac_8x8_8x8T(X, 1, W, 1, C1) : mul_8x8_8x8T(X, 1, W, 1);
         }
+{% if slots == 8 %}
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
         aie::store_v(pc, {{ p }}_sum2(C0));
         aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
         pw += 512;
         pc += 256;
     }
 }
 
-// y[g] += sum over the 8 groups i of c (i, g) sct[i][g][r] for the 2 row groups (c (i, g): 32 bf16 at c + 256 i + 32 g),
-// then (dg: IQ4_XS) y[g] += hilo(that sum) dg[g] (fp32 sums)
+// y[g] += sum over the 8 groups i of c (i, g) sct[i][g][r] for the 2 row groups (c (i, g): {{ L }} bf16 at c + 256 i +
+// {{ L }} g; y [g][slot][r]), then (dg: IQ4_XS) y[g] += hilo(that sum) dg[g] (fp32 sums)
 template <bool D>
 __attribute__((noinline)) void {{ p }}_iq4_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
                                               const bfloat16 *__restrict dg, float *__restrict y)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 32> Y0, Y1;
+    aie::accum<accfloat, {{ L }}> Y0, Y1;
     if constexpr (D) {
-        Y0 = aie::zeros<accfloat, 32>();
-        Y1 = aie::zeros<accfloat, 32>();
+        Y0 = aie::zeros<accfloat, {{ L }}>();
+        Y1 = aie::zeros<accfloat, {{ L }}>();
     } else {
-        Y0 = aie::accum<accfloat, 32>(aie::load_v<32>(y));
-        Y1 = aie::accum<accfloat, 32>(aie::load_v<32>(y + 32));
+        Y0 = aie::accum<accfloat, {{ L }}>(aie::load_v<{{ L }}>(y));
+        Y1 = aie::accum<accfloat, {{ L }}>(aie::load_v<{{ L }}>(y + {{ L }}));
     }
     const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
     const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < 8; i++) {
-        Y0 = aie::mac(Y0, aie::load_v<32>(pc + 256 * i), aie::load_v<8>(ps + 16 * i).template grow_replicate<32>());
-        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 256 * i + 32), aie::load_v<8>(ps + 16 * i + 8).template grow_replicate<32>());
+        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(pc + 256 * i), aie::load_v<8>(ps + 16 * i).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(pc + 256 * i + {{ L }}), aie::load_v<8>(ps + 16 * i + 8).template grow_replicate<{{ L }}>());
     }
     if constexpr (D) {
         {{ p }}_k23d(y, Y0, dg);
-        {{ p }}_k23d(y + 32, Y1, dg + 8);
+        {{ p }}_k23d(y + {{ L }}, Y1, dg + 8);
     } else {
         aie::store_v(y, Y0.template to_vector<float>());
-        aie::store_v(y + 32, Y1.template to_vector<float>());
+        aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
     }
 }
 
@@ -373,6 +378,9 @@ class Iq4Slot(Slot):
 
     def qd_template_vars(self, op: object) -> dict[str, object]:
         return {"UP": op.unit_pitch}
+
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
 
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)

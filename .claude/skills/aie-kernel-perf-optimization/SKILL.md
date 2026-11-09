@@ -305,7 +305,9 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   (`OverlayDevice.set_prologue`: 0.3 ms). Decode overlays page the tile formats beyond the one of the most bytes when
   four or more do not fit (`DecodeOverlayOperator(paged=)`: Llama 3B Q3_K_M, a few loads per step, the main core 2.4 KB
   freer). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
-  1.7 KB off the resident code). A page's constant tables must be resident (`retain`: `gemv`'s `_nz`).
+  1.7 KB off the resident code). A page's constant tables must be resident, kept by a read in resident code that only
+  the paging cores run (`gemv`'s `_keep`): `retain` keeps a section in the link of every core of the design, and an
+  8-slot qwen35 design's attention core had no 1.6 KB to spare.
 - After a toolchain update, compare each core's `core_<col>_<row>` size with the previous build's.
 
 Rejected size levers: rejected.md "Program memory".

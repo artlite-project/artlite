@@ -350,24 +350,25 @@ __attribute__((noinline)) void {{ p }}_dtab(const bfloat16 *__restrict d, bfloat
     }
 }
 
-// One super-block: y[g] += sum over the 8 groups i of c_g,i (c [i][g][32]) times tab [g][i][r] (G row groups)
+// One super-block: y[g] += sum over the 8 groups i of c_g,i (c [i][g][{{ L }}]) times tab [g][i][r] (G row groups; y
+// [g][slot][r])
 template <int G>
 __attribute__((noinline)) void {{ p }}_sc1(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y)
 {
-    aie::accum<accfloat, 32> Y0(aie::load_v<32>(y)), Y1(aie::load_v<32>(y + 32));
+    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
     const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
     const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < 8; i++) {
-        Y0 = aie::mac(Y0, aie::load_v<32>(pc), aie::load_v<8>(ph).template grow_replicate<32>());
+        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(pc), aie::load_v<8>(ph).template grow_replicate<{{ L }}>());
         if constexpr (G == 2)
-            Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), aie::load_v<8>(ph + 64).template grow_replicate<32>());
-        pc += 32 * G;
+            Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(pc + {{ L }}), aie::load_v<8>(ph + 64).template grow_replicate<{{ L }}>());
+        pc += {{ L }} * G;
         ph += 8;
     }
     aie::store_v(y, Y0.template to_vector<float>());
     if constexpr (G == 2)
-        aie::store_v(y + 32, Y1.template to_vector<float>());
+        aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
 }
 """,
 # the 6-bit scale expansion of Q4_K and Q5_K (``outs``: Q4_K's scattered group stores)

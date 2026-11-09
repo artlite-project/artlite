@@ -199,7 +199,7 @@ def _q4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     R, K = q.shape
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32)) - 8 * x.xs32[..., None]
     d = _bf64(f["d"]).reshape(R, K // 32)
-    y = (_csum(C) * d.T[None]).sum(1)
+    y = (x.csum(C) * d.T[None]).sum(1)
     if fmt == "Q4_0":
         return y
     # Q4_1's offsets: XS against M = m + 8 d as bfp16 hi + lo blocks of 8 groups, the sums in fp32
@@ -207,14 +207,14 @@ def _q4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     Mh = bfp16.values(M)
     Mhl = Mh.astype(np.float64) + bfp16.values((M - Mh).astype(np.float32))
     o = x.xs32 @ Mhl.T  # (8, R)
-    return y + o[:SLOTS] + o[SLOTS:]
+    return y + x.fold(o)
 
 
 def _q8(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     q = f["q"].astype(np.float64)
     R, K = q.shape
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32))
-    return (_csum(C) * _bf64(f["d"]).reshape(R, K // 32).T[None]).sum(1)
+    return (x.csum(C) * _bf64(f["d"]).reshape(R, K // 32).T[None]).sum(1)
 
 
 def _scale_min(f: dict[str, np.ndarray], x: MmvX, z: int) -> np.ndarray:
@@ -289,7 +289,7 @@ def _iq3(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32))
     nsb = K // 256
     S = (2 * f["ls"].astype(np.float64) + 1) / 4
-    Y = np.einsum("sbir,rbi->sbr", _csum(C).reshape(4, nsb, 8, R), S.reshape(R, nsb, 8))
+    Y = np.einsum("sbir,rbi->sbr", x.csum(C).reshape(x.slots, nsb, 8, R), S.reshape(R, nsb, 8))
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
@@ -299,7 +299,8 @@ def _iq3s(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     R, K = q.shape
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32))
     nsb = K // 256
-    Y = np.einsum("sbir,rbi->sbr", _csum(C).reshape(4, nsb, 8, R), 1 + 2 * f["sc"].astype(np.float64).reshape(R, nsb, 8))
+    Y = np.einsum("sbir,rbi->sbr", x.csum(C).reshape(x.slots, nsb, 8, R),
+                  1 + 2 * f["sc"].astype(np.float64).reshape(R, nsb, 8))
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
@@ -308,11 +309,11 @@ def _iq4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     # super-block hilo(sum c (ls - 32)) d; sums in fp32)
     v = IQ4_VALUES[f["q"]].astype(np.float64)
     R, K = v.shape
-    c = _csum(np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), v.reshape(R, K // 32, 32)))  # (4, K / 32, R)
+    c = x.csum(np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), v.reshape(R, K // 32, 32)))  # (slots, K / 32, R)
     if fmt == "IQ4_NL":
         return (c * _bf64(f["d"]).reshape(R, K // 32).T[None]).sum(1)
     nsb = K // 256
-    Y = np.einsum("sbir,rbi->sbr", c.reshape(4, nsb, 8, R), f["ls"].astype(np.float64).reshape(R, nsb, 8) - 32)
+    Y = np.einsum("sbir,rbi->sbr", c.reshape(x.slots, nsb, 8, R), f["ls"].astype(np.float64).reshape(R, nsb, 8) - 32)
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
@@ -321,7 +322,7 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     w = w.astype(np.float32) if w.dtype == np.float16 else \
         torch.from_numpy(np.ascontiguousarray(w).view(np.int16)).view(torch.bfloat16).float().numpy()
     C = x.X @ bfp16.values(w).astype(np.float64).T  # (8, R): fp32 sums of exact products
-    return C[:SLOTS] + C[SLOTS:]
+    return x.fold(C)
 
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
@@ -329,10 +330,14 @@ _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_
          "BFP16": _bfp16}
 
 
+# (the formats with kernels of 8 slots)
+GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16")
+
+
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:
     """The kernels' arithmetic on one tile and K chunk (the fields ``f`` of its R rows): (slots, R) float64 against
     x (S, 256 nsb), for designs of ``slots`` slots."""
-    assert slots == 4 or fmt in ("Q4_K", "Q6_K"), (fmt, slots)
+    assert slots == 4 or fmt in GEMV8_FORMATS, (fmt, slots)
     return _REFS[fmt](fmt, f, MmvX(x_rows(x, slots), xs_rows(x, 32, slots), xs_rows(x, 16, slots), slots))
 
 
@@ -429,8 +434,8 @@ class MmvOperator(ArtcOperator):
         self.chunk = Chunk(nsb, slots)
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
         self.hy = helper_y(fmt, nsb)  # (where the second core's rows go)
-        self.yn = 128 if self.rows > 16 and not row_split(fmt, nsb) else y_floats(slots)  # (a core's output)
-        assert slots == 4 or self.rows <= 16, (fmt, slots)
+        # (a core's output: [g][slot][r], 4 row groups for tiles of more than 16 rows)
+        self.yn = (4 * 8 * slots) if self.rows > 16 and not row_split(fmt, nsb) else y_floats(slots)
         self.y_floats = self.yn + self.hy
         super().__init__()
 

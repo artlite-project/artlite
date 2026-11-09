@@ -116,10 +116,10 @@ def test_prefill(size: str) -> None:
     assert float(kl.mean()) < 1.5 * float(kl_llama.mean()) + 2e-3 and agree > agree_llama - 0.05
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
+@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B", "swift"])
 def test_mtp(size: str) -> None:
-    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B with its file's own block
-    (``NpuQwen.generate``, up to SLOTS - 1 drafts per step: 3, the 27B's design 7): greedy replies to two user turns of
+    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B and Swift 1.5 with their files' own blocks
+    (``NpuQwen.generate``, up to SLOTS - 1 drafts per step: 3, the 27Bs' designs 7): greedy replies to two user turns of
     a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
     model's one-token steps over the same text (the dense 27B's steps of S slots give the numbers of S steps of one),
     but where an MoE's multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps

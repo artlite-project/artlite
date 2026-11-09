@@ -349,7 +349,11 @@ Address spaces and layout:
   (`stack N B` per function), `-fstack-size-section` + `llvm-readelf <o> --stack-sizes`, or the `paddxm [sp],
   #<offset>` prolog in the assembly. The static maximum is a lower bound; every compile's `checks.py` compares the
   deepest call chain plus the core's own frame (64-128 B) with `stack_size` (a kernel needing exactly `stack_size`
-  zeroed parts of a workspace).
+  zeroed parts of a workspace); a decode GEMV dispatcher's code pages count as its callees.
+- A frame is mostly spills: a loop that holds 64-lane values (bfp16 panels, 64-lane accumulators) across iterations
+  spills them (Q4_K's 8-slot offsets with four sum panels held over a loop of row groups: 1.6 KB; one loop over (row
+  group, super-block) popping each one's panels: 256 B). Where L1 is tight, size the stack to the deepest chain
+  (``decode.design.STACK8``).
 - **Stack overflow is silent and has a parity signature.** A spill area past the reservation clobbers the adjacent
   ObjectFifo buffer: the corruption hits alternating k-tiles / buffer parity ("even k-tile, first panels wrong +
   NaN"), looking like a DMA / layout bug. Unrolling or straight-lining pipelined code can triple stack usage:
