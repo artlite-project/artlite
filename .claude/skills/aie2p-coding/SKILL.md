@@ -240,6 +240,13 @@ BDs:
   objects (`txn.shim_bd(..., iteration=(step_words, count))`).
 - A memtile BD's word 6 changes under the DMA: `Iteration_Current` (bits 28:23) advances each time the BD loads
   (AM029 DMA_BD0_6); writing the BD resets it.
+- A memory tile's DMA driven from the runtime sequence (`prefill.attn.AttnOperator._ring_memtiles`: in the split module
+  a forward's memtile pool and endpoints replaced by `aie.route_endpoint`s the routes name, buffers, locks and
+  `dma_configure_task_for` tasks started once per dispatch, freed after the drains): a runtime BD has three data
+  dimensions and its iteration (`#aie.bd_iteration`, the outermost slot; the memtile's fourth dimension is out of
+  reach), and a BD with locks takes exactly one acquire and one release (a lock between two BDs passes the turn). A
+  walk that needs four dimensions moves to the other side: the S2MM writes each object with the inverse walk (a BD
+  per object), the MM2S reads linearly. IRON checks that a FIFO's runtime transfers are whole objects.
 - Runtime-variable lengths (a KV fill up to the position): in compiled designs a scratchpad `length_parameter`
   (`fill(tap, length_parameter=)`: n passes of `tap`; `ChainPart(length_parameter=)`), applied by the firmware at
   dispatch at no measurable cost, in whole steps of the walk's third dimension; in host transactions the BD built

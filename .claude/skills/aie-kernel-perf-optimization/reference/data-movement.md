@@ -81,6 +81,14 @@ bandwidth.
   query block. Llama 3B prefill: 32-query blocks were DMA-bound on the re-reads (12.09 of 12.16 ms
   with the compute compiled out); 64-query blocks, each of the 4 core rows taking 16 queries of the
   column's 3 heads, halved them: -25%, then compute-bound.
+- **A sliding window from the memory tile** (`prefill.attn.AttnOperator(ring=)`): the Llama path's packed attention
+  read its window of 9 cache groups from DDR again every pass, at the port's rate. Each column's memory tile holding the
+  history and a ring of the last W + 1 groups, sent whole every pass (runtime memtile tasks: aie2p-coding section 8),
+  reads each group once, the cores skipping the slots outside their window. It is then bound by the cores, not by its
+  bytes (Qwen3-Reranker-0.6B, 4096 tokens: 3.25 -> 2.45 ms a layer on random data, ~1.9 by the bytes): a key chunk the
+  cores skip still crosses their input channel at 8 B a cycle and, through two-deep FIFOs, does not overlap their
+  compute. Send as few skipped objects as the static program allows (the chunk's first group in the ring, not in the
+  always-sent history: -0.1 ms a layer).
 - **Every column reads every input** (the decode overlays): a phase's input goes to all 8 columns, each from its own
   shim: 8 copies through the one port and 8 fill tasks at every phase boundary. A phase's input is on the critical path
   (its tiles wait for it): read the step's slots only (``decode.design.packed_slots``; the 27B's 8-slot design read 8

@@ -28,7 +28,9 @@ groups); the padding tokens after the valid ones write cache records that later 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
 one chunk of ``PACK_SIZES``, after a history every one of them sees (a shared prefix in the caches, or none). Only the
 attention keeps them apart (``prefill.attn.AttnOperator(window=)``: each row its segment's keys up to itself; segments of
-up to ``PACK_SPAN`` tokens); every other operator works row by row. Each token's rotary position counts from its
+up to ``PACK_SPAN`` tokens; after a history of up to ``RING_HOLD`` cache groups, chunks from ``RING_MIN`` tokens run its
+ring design, the window held in the memory tiles: ``("ring", T)`` programs, ``AttnOperator(ring=)``); every other
+operator works row by row. Each token's rotary position counts from its
 segment's start (after the history): the chunk's cos / sin rows, written past the table's positions (rows that only
 padding tokens read otherwise), through the prep's ``P_CS``. The chunk's K / V records are not a sequence's: a packed
 chunk leaves the caches valid up to its p0 only.
@@ -54,6 +56,9 @@ SUB = 256  # tokens per sub-chunk (the operators' T)
 # p0 = 0 and 4096: within ~5%, a chunk of 64 ~20% below): a ConfigureOp (without the array reset: ``fused.program``),
 # per sub-chunk a byte of a layer's weights, a cache record a flash attention pass streams
 CFG_S, WEIGHT_S, RECORD_S = 0.111e-3, 3.69e-11, 0.346e-6
+# the ring attention's (``AttnOperator(ring=)``: bound by its cores; Qwen3-Reranker-0.6B's on a rerank request's
+# operands, 2.6 ms a layer at 4096 tokens): per pass, per layer
+RING_PASS_S, RING_FIXED_S = 39e-6, 0.12e-3
 BIG = 1024  # the sub-chunk of the chunks made of them (the GEMMs but qkv once per 1024 tokens: fewer items and fills;
 # qkv's items stay SUB: a 1024-token GemmQd is slower, a GemmQ no faster)
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
@@ -61,6 +66,8 @@ NORM_SIZES = (2048, 1024, 512)  # tokens per norm item where a chunk holds them 
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 PACK_SIZES = (64, 128, 256, 512, 1024, 2048, 3072, 4096)  # packed chunks' sizes (``run_packed``)
 PACK_SPAN = 512  # a packed chunk's longest segment (its attention's window: PACK_SPAN / pg + 1 cache groups)
+RING_HOLD = 1  # the history's cache groups the ring attention's memory tiles hold (a rerank query's prompt)
+RING_MIN = 1024  # the smallest packed chunk with a ring attention design (at 512 tokens the window is faster)
 # chunk sizes of whole cache groups (a flash attention design each); past 2048 in whole BIG sub-chunks (long prompts:
 # half the ConfigureOps per token of 2048-token chunks)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
@@ -148,8 +155,16 @@ class LlamaPrefill(ChunkPrefill):
         self.attn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T))
                      for T in self.sizes}
         self.pack_sizes = tuple(T for T in PACK_SIZES if T in self.sizes) if pack else ()
+        win = PACK_SPAN // s.pg + 1
         self.pattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
-                                         window=PACK_SPAN // s.pg + 1) for T in self.pack_sizes}
+                                         window=win) for T in self.pack_sizes}
+        # (after a history of up to RING_HOLD groups: the window and the history in the memory tiles, each group read
+        # once; hi + lo K and a pass a cache group)
+        hold = (min(RING_HOLD, PA.AttnOperator.ring_groups(s, win, s.blocks[0]))
+                if s.kp == 2 and s.pg == 32 * s.blocks[0] else 0)
+        self.rattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
+                                         window=win, ring=hold) for T in self.pack_sizes if T >= RING_MIN} if hold else {}
+        self.ring_sizes = tuple(self.rattn)
         self.span = PACK_SPAN if pack else 0
         self._rows()
         self._library()
@@ -252,17 +267,17 @@ class LlamaPrefill(ChunkPrefill):
     def _runlist(self, S: int) -> list[tuple]:
         return self._runlist_of(S * SUB)
 
-    def _runlist_of(self, T: int, *, packed: bool = False) -> list[tuple]:
+    def _runlist_of(self, T: int, *, packed: bool = False, ring: bool = False) -> list[tuple]:
         """(the sub-chunks of ``_t``: a size below SUB one of its own operators)"""
         t = self._t(T)
-        return self._ops_runlist(T // t, self.ops[t], packed)
+        return self._ops_runlist(T // t, self.ops[t], packed, ring)
 
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
 
-    def _ops_runlist(self, S: int, o: _Ops, packed: bool = False) -> list[tuple]:
+    def _ops_runlist(self, S: int, o: _Ops, packed: bool = False, ring: bool = False) -> list[tuple]:
         """The runlist of S sub-chunks of the operators ``o`` (their layers' first items in ``_starts``; ``packed``: the
-        packed attention, the chunk's segments in SEG)."""
+        packed attention, the chunk's segments in SEG; ``ring``: its ring design)."""
         ov, s, sl = self.ov, self.shape, self._sl
         t = o.n_in.T  # (a sub-chunk's tokens)
 
@@ -290,7 +305,8 @@ class LlamaPrefill(ChunkPrefill):
             rl += [(g.op, sl("PXN", j * qt * rb["PXN"], g.op, i=0), self._w(g), sl("G", j * qt * rg, g.op, i=2))
                    for g in o.plans[(L, "qkv")].gemms for j in range(S * t // qt)]
             pt = self._pt(S * t)  # (the prep's blocks of the chunk)
-            prep, attn = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)], (self.pattn if packed else self.attn)[S * t]
+            prep = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)]
+            attn = (self.rattn if ring else self.pattn if packed else self.attn)[S * t]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
             pg = pt // s.pg * s.group
             nw = [f"NW[{self.nw * li}:{self.nw * (li + 1)}]"] if self.nw else []
@@ -393,7 +409,13 @@ class LlamaPrefill(ChunkPrefill):
         seg = self.pattn[T].seg(np.concatenate([lo, np.arange(n, T)]))
         dev.view("SEG")[:seg.size] = seg
         dev.flush("SEG", 0, seg.size)
-        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R}, key=("pack", T))
+        ring = self._ring(T, p0)
+        self._launch(T, p0, self.params(T, p0) | {PA.P_CS: 2 * hd * R} | (self.rattn[T].params(p0) if ring else {}),
+                     key=("ring" if ring else "pack", T))
+
+    def _ring(self, T: int, p0: int) -> bool:
+        """Whether a packed chunk of size T at p0 runs the ring attention (its memory tiles hold the history)."""
+        return T in self.rattn and p0 // self.shape.pg <= self.rattn[T].ring
 
     def hidden(self, i: int, n: int = 1) -> torch.Tensor:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
@@ -409,8 +431,12 @@ class LlamaPrefill(ChunkPrefill):
 
     def attention_seconds(self, p0: int, S: float, packed: bool = False) -> float:
         """Estimated time of a layer's flash attention over a chunk of S sub-chunks at p0: per pass the cache records
-        it streams (from position 0 to its queries' group; ``packed``: the history and its window), RECORD_S each."""
-        s, at = self.shape, (self.pattn if packed else self.attn)[round(S * SUB)]
+        it streams (from position 0 to its queries' group; ``packed``: the history and its window), RECORD_S each; the
+        ring attention's by its passes."""
+        T = round(S * SUB)
+        if packed and self._ring(T, p0):
+            return RING_FIXED_S + RING_PASS_S * self.rattn[T].n_pass
+        s, at = self.shape, (self.pattn if packed else self.attn)[T]
         if packed:
             recs = sum(p0 // s.pg + 1 + min(b // at.m, at.win) for b in range(at.n_pass)) * s.rg
         else:

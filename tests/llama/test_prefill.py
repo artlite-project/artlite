@@ -134,31 +134,39 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
 
 # (head_dim, query heads per KV head, K panels per record, q / k norms (Qwen3: Q, P hi + lo), chunk, history, window,
 # segments (first token, tokens): starts inside a record, a group, at 32-token chunks of keys; the longest the window's)
-PACKED = [(128, 2, 2, True, 512, 0, 3, [(0, 100), (128, 64), (192, 37), (230, 122), (352, 129)]),
-          (128, 2, 2, True, 1024, 128, 4, [(0, 193), (193, 7), (200, 120), (320, 190), (512, 193), (705, 300)]),
-          (64, 4, 1, False, 1024, 0, 2, [(0, 129), (129, 100), (256, 64), (320, 3), (323, 129), (452, 500)]),
-          (128, 4, 2, False, 512, 64, 2, [(0, 65), (96, 96), (192, 31), (223, 65), (320, 65)])]
+# (the ring variant, ``ring``: the history's groups held in the memory tiles, the chunk's first among them)
+PACKED = [(128, 2, 2, True, 512, 0, 3, 0, [(0, 100), (128, 64), (192, 37), (230, 122), (352, 129)]),
+          (128, 2, 2, True, 1024, 128, 4, 0, [(0, 193), (193, 7), (200, 120), (320, 190), (512, 193), (705, 300)]),
+          (64, 4, 1, False, 1024, 0, 2, 0, [(0, 129), (129, 100), (256, 64), (320, 3), (323, 129), (452, 500)]),
+          (128, 4, 2, False, 512, 64, 2, 0, [(0, 65), (96, 96), (192, 31), (223, 65), (320, 65)]),
+          (128, 2, 2, True, 1024, 128, 4, 4, [(0, 193), (193, 7), (200, 120), (320, 190), (512, 193), (705, 300)]),
+          (128, 2, 2, True, 2048, 128, 9, 0, [(0, 512), (512, 100), (612, 300), (912, 497), (1409, 3), (1412, 512),
+                                              (1924, 124)]),
+          (128, 2, 2, True, 2048, 128, 9, 4, [(0, 512), (512, 100), (612, 300), (912, 497), (1409, 3), (1412, 512),
+                                              (1924, 124)])]
 
 
-@pytest.mark.parametrize(("hd", "qh", "kp", "norm", "T", "p0", "win", "segs"), PACKED,
-                         ids=[f"hd{a}-qh{b}-kp{c}{'-norm' if d else ''}-T{e}-p{f}-w{g}" for a, b, c, d, e, f, g, _ in PACKED])
-def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win: int,
+@pytest.mark.parametrize(("hd", "qh", "kp", "norm", "T", "p0", "win", "ring", "segs"), PACKED,
+                         ids=[f"hd{a}-qh{b}-kp{c}{'-norm' if d else ''}-T{e}-p{f}-w{g}{f'-ring{h}' if h else ''}"
+                              for a, b, c, d, e, f, g, h, _ in PACKED])
+def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win: int, ring: int,
                      segs: list[tuple[int, int]]) -> None:
     """A packed chunk (``AttnOperator(window=)``: segments of the chunk, each its own rows' attention over the history
     and its keys up to the row; rotary positions from p0 per segment, the prep's cos / sin rows written past the
     table's) against the exact attention of the cores' own operands, as ``test_attn``; a segment that starts at a
     32-token chunk of keys bit-identical to the same tokens run alone (the unpacked design at p0: the history, the
     segment's keys in the same chunks, the skipped ones adding nothing) up to its last whole V record. A segment too
-    long for the window: padding (its rows see only themselves)."""
+    long for the window: padding (its rows see only themselves). The ring variant (``ring``) takes the window's key
+    chunks in its slots' order, so it is held to the reference row by row instead of to the segments alone."""
     shape = PA.Shape(hd, qh, kp, A_BYTES, 2 if norm else 1, 2 if norm else 1)
     max_pos = max(1024, p0 + T)
     n_groups = max_pos // shape.pg
     kvb = n_groups * shape.group
     lay = _layout(hd, qh)
     prep = PA.PrepOperator(T=T, shape=shape, layout=lay, kv_bytes=kvb, cs_positions=max_pos + T, norm=norm)
-    attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb, window=win)
+    attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb, window=win, ring=ring)
     nw_arg = ["NW"] if norm else []
-    fused = FusedOperator(name=f"pa_packed{hd}_{qh}_{kp}_{T}_{win}{'_n' if norm else ''}",
+    fused = FusedOperator(name=f"pa_packed{hd}_{qh}_{kp}_{T}_{win}{'_n' if norm else ''}{f'_r{ring}' if ring else ''}",
                           runlist=[(prep, "G", "CS", "QS", "KV", *nw_arg), (attn, "QS", "KV", "A", "SEG")],
                           input_args=["G", "CS", "SEG", *nw_arg], output_args=["A"]).compile()
     segs = [(a, n) for a, n in segs if n <= attn.max_segment]  # (the rest padding)
@@ -226,6 +234,14 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
               want[valid])
     print(f"packed attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
     assert err < 1.5 * eq
+    if ring:  # (row by row: a key of another segment or out of the window in one row shows there)
+        w = want[valid].reshape(len(valid), -1)
+        row_err = np.linalg.norm(A[valid].reshape(len(valid), -1) - w, axis=1) / np.linalg.norm(w, axis=1)
+        row_eq = np.linalg.norm(bfp16.values(w.astype(np.float32)) - w, axis=1) / np.linalg.norm(w, axis=1)
+        print(f"rows: worst {row_err.max():.2e} (its bfp16 rounding {row_eq[row_err.argmax()]:.2e}, the worst's "
+              f"{row_eq.max():.2e})")
+        assert (row_err < 2 * row_eq.max()).all()
+        return
     for a, n in segs:  # (each segment alone: the unpacked design, the same tokens at p0)
         if a % 32:
             continue
@@ -348,9 +364,10 @@ def test_chunk_params_to_the_end() -> None:
     assert not refused, (len(refused), refused[:3])
 
 
-# (history: a shared prefix in the caches; segments' lengths: starts at 32-token key chunks and inside them, inside
-# sub-chunks and records)
-PACKED_SLICE = [(0, [192, 64, 45, 107, 120, 96, 200, 150]), (64, [100, 28, 300, 37, 199, 280])]
+# (history: a shared prefix in the caches, of up to RING_HOLD groups the ring attention's, longer the window's;
+# segments' lengths: starts at 32-token key chunks and inside them, inside sub-chunks and records)
+PACKED_SLICE = [(0, [192, 64, 45, 107, 120, 96, 200, 150]), (64, [100, 28, 300, 37, 199, 280]),
+                (128, [100, 28, 300, 37, 199, 280])]
 
 
 @pytest.mark.slow
@@ -361,8 +378,8 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     layer's K records bit-identical; V's blocks span a record's 8 positions, so a segment that starts at a record has
     its V records bit-identical but one shared with the next segment (whose values set its exponents) and one that
     starts inside a record all of them rounded otherwise; every row within ~2% of the rows' largest (that V, the
-    attention's key chunks); the rows of a segment that starts at a 32-token chunk of keys up to its last V record
-    bit-identical."""
+    attention's key chunks); with the window attention the rows of a segment that starts at a 32-token chunk of keys
+    up to its last V record bit-identical (the ring attention takes the key chunks in another order)."""
     import os
 
     from artlite.gguf_model import GGUFFile
@@ -384,7 +401,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     ov.load()
     pf = LlamaPrefill(ov, sizes=(64, T), precise=True, pack=True).compile().bind()
     if p0:
-        pf.run(x[:p0], 0, 64)
+        pf.run(x[:p0], 0, 64 if p0 <= 64 else T)
     starts = np.cumsum([0, *lengths])[:-1]
     xs = [x[p0 + a:p0 + a + n] for a, n in zip(starts, lengths, strict=True)]
     alone = []
@@ -405,7 +422,8 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
         same = int((got == want).all(1).sum())
         print(f"segment {a} + {n}: max |d| {err:.2e} of the rows' largest, {same} of {n} rows bit-identical")
         worst = max(worst, err)
-        if a % 32 == 0:
+        if a % 32 == 0 and not pf._ring(T, p0):
             m = n - n % 8
             assert (got[:m] == want[:m]).all(), (a, n, np.flatnonzero((got[:m] != want[:m]).any(1)).tolist())
+    print("ring attention" if pf._ring(T, p0) else "window attention")
     assert worst < 0.025, worst

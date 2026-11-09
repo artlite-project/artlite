@@ -87,7 +87,10 @@ P_P8 = "pa_p8"  # p0 / 8 (the attention cores' masks)
 P_FG = "pa_fg"  # the cache groups every pass streams first (p0 / pg + 1: the history and the chunk's first)
 P_FQ = "pa_fq"  # their chunks of CR records (the cores' count)
 P_FO = "pa_fo"  # bf16 offset of the chunk's second group
+P_G0 = "pa_g0"  # bf16 offset of the chunk's first group (``AttnOperator(ring=)``)
+P_FH = "pa_fh"  # the history's chunks of CR records (``AttnOperator(ring=)``: the cores')
 L1 = 0x10000 - 512  # a core's data memory for its buffers (a margin for aiecc's)
+MT_BYTES = 0x80000 - 8192  # a memory tile's for the ring variant's buffers (``AttnOperator(ring=)``)
 
 
 @dataclass(frozen=True)
@@ -518,7 +521,9 @@ _ATTN = JINJA_ENV.from_string(r"""
 // [16] int32 (the chunk's first record relative to
 // the core's first block, skip, the pass's first record{% if WIN %}, the masks below the rows' segments, the least and the
 // largest segment start of the core's rows, the chunk's first record, the window's, the history's chunks, the chunk's
-// first key (chunk-relative)); lo [8 QB] int32 (per row of the core its segment's first key, chunk-relative{% endif %})
+// first key (chunk-relative){% if RING %}, the pass's cache group{% endif %}, the pass's first computed chunk to come); lo
+// [QB][64] int16 (per query block its rows' segment starts, chunk-relative, per lane 8 q + i) and [64] int16 (lane 8 q + i:
+// i{% else %}, the pass's first computed chunk to come{% endif %})
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 {# 2^(A - 128) of 32 lanes (A below 256: 2^(s - m) times 2^64, which o / l cancels), 2^1 below 128.5 (masked -1e30 too) #}
@@ -571,24 +576,19 @@ __attribute__((noinline, minsize)) void {{ p }}_mask(float *__restrict sc, int32
 {% if WIN %}
 
 // A chunk's keys below a row's segment (from the chunk's first key kc, chunk-relative: key kc + 8 k + i of record k,
-// lane 8 q + i, below lo of row q of the block), per row block b (its query block b / QH): -1e30
-__attribute__((noinline, minsize)) void {{ p }}_masklo(float *__restrict sc, const int32_t *__restrict lo, int32_t kc)
+// lane 8 q + i, below lo of row q of the block), per row block b (its query block b / QH): -1e30 (lv: per query block
+// its rows' lo per lane, then per lane i; ``seg``)
+__attribute__((noinline)) void {{ p }}_masklo(float *__restrict sc, const int16_t *__restrict lv, int32_t kc)
 {
     const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-1e30f);
+    const aie::vector<int16, 64> i = aie::load_v<64>(lv + {{ 64 * QB }});
     AIE_LOOP_NO_UNROLL
     for (int b = 0; b < {{ RB }}; b++) {
         float *__restrict s = sc + {{ 128 * CR }} * (b >> 1) + 64 * (b & 1);
-        const int32_t *__restrict lb = lo + 8 * (b >= {{ QH }}{% for j in range(2, QB) %} + b >= {{ QH * j }}{% endfor %});
-        AIE_LOOP_NO_UNROLL
+        const aie::vector<int16, 64> lo = aie::load_v<64>(lv + 64 * (b >= {{ QH }}{% for j in range(2, QB) %} + b >= {{ QH * j }}{% endfor %}));
         for (int k = 0; k < {{ CR }}; k++) {
-            uint64_t bits = 0;
-            AIE_LOOP_NO_UNROLL
-            for (int q = 0; q < 8; q++) {
-                int32_t v = lb[q] - kc - 8 * k;  // (the row's keys of the record below its segment)
-                v = v < 0 ? 0 : v > 8 ? 8 : v;
-                bits |= (uint64_t)((1u << v) - 1u) << (8 * q);
-            }
-            aie::store_v(s + 128 * k, aie::select(aie::load_v<64>(s + 128 * k), ninf, aie::mask<64>::from_uint64(bits)));
+            const aie::mask<64> m = aie::lt(i, aie::sub(lo, aie::broadcast<int16, 64>((int16_t)(kc + 8 * k))));
+            aie::store_v(s + 128 * k, aie::select(aie::load_v<64>(s + 128 * k), ninf, m));
         }
     }
 }
@@ -596,9 +596,10 @@ __attribute__((noinline, minsize)) void {{ p }}_masklo(float *__restrict sc, con
 
 // Row blocks with a row whose chunk maximum exceeds its reference by 2^16 (rare, and at a pass's first chunk): each row
 // whose maximum (bf16: an integer from 128 on) exceeds its reference takes it, m' - m = d >= 0 an integer (< 64: A <
-// 256): o, l scaled by 2^-d = vexp2(64 - d) 2^-64 (vexp2 is exact at non-negative integers only), the bias and the
-// chunk's A lowered by d (per half row block: 4 rows in 32 lanes)
-__attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, float *__restrict wo)
+// 256): o, l scaled by 2^-d = vexp2(64 - d) 2^-64 (vexp2 is exact at non-negative integers only; ``first``, the pass's
+// first computed chunk: o and l are still zero), the bias and the chunk's A lowered by d (per half row block: 4 rows in
+// 32 lanes)
+__attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, float *__restrict wo, int32_t first)
 {
     for (int b = 0; b < {{ RB }}; b++) {
         for (int hf = 0; hf < 2; hf++) {
@@ -612,11 +613,14 @@ __attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, floa
             const aie::vector<float, 32> d = aie::max(aie::sub(am, aie::broadcast<float, 32>(192.0f)), aie::zeros<float, 32>());
             const aie::vector<bfloat16, 32> a = aie::mul(al::exp2_acc<32>(aie::accum<accfloat, 32>(
                 aie::sub(aie::broadcast<float, 32>(64.0f), d))), aie::broadcast<bfloat16, 32>(0x1p-64f)).template to_vector<bfloat16>();
-            float *__restrict o = wo + {{ 64 * ND }} * b + 32 * hf;
-            for (int db = 0; db < {{ ND }}; db++)
-                aie::store_v(o + 64 * db, al::mulc<32>(aie::load_v<32>(o + 64 * db), a).template to_vector<float>());
-            float *__restrict pl = AW(float, {{ w.l }}) + 64 * b + 32 * hf, *__restrict pb = AW(float, {{ w.bias }}) + 64 * b + 32 * hf;
-            aie::store_v(pl, al::mulc<32>(aie::load_v<32>(pl), a).template to_vector<float>());
+            if (!first) {
+                float *__restrict o = wo + {{ 64 * ND }} * b + 32 * hf;
+                for (int db = 0; db < {{ ND }}; db++)
+                    aie::store_v(o + 64 * db, al::mulc<32>(aie::load_v<32>(o + 64 * db), a).template to_vector<float>());
+                float *__restrict pl = AW(float, {{ w.l }}) + 64 * b + 32 * hf;
+                aie::store_v(pl, al::mulc<32>(aie::load_v<32>(pl), a).template to_vector<float>());
+            }
+            float *__restrict pb = AW(float, {{ w.bias }}) + 64 * b + 32 * hf;
             aie::store_v(pb, aie::sub(aie::load_v<32>(pb), d));
             for (int k = 0; k < {{ CR }}; k++)
                 aie::store_v(s + 128 * k, aie::sub(aie::load_v<32>(s + 128 * k), d));
@@ -717,10 +721,16 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
         aie::store_v(AW(float, {{ w.bias }}) + 64 * b, aie::broadcast<float, 64>(240.0f));
     al::zero<{{ RB * 64 }}, 64>(AW(float, {{ w.l }}));
     AW(int32_t, {{ w.st }})[2] = p8 + {{ 4 * QB }} * ({{ M }} * bg + bb);
+    AW(int32_t, {{ w.st }})[12] = 1;  // (the pass's first computed chunk to come: ``raise``)
 {% if WIN %}
     int32_t *__restrict st = AW(int32_t, {{ w.st }});
     st[6] = p8;
+{% if RING %}
+    st[10] = bg;  // (the pass's group: the ring's slots hold the chunk's groups bg - {{ R - 1 }} .. bg)
+    st[11] = bg % {{ R }};  // (its slot)
+{% else %}
     st[7] = p8 + {{ RG }} * (bg > {{ WIN }} ? bg - {{ WIN - 1 }} : 1);  // (the window: the chunk's groups max(1, bg - {{ WIN - 1 }}) .. bg)
+{% endif %}
     st[8] = fq;
 {% endif %}
 }
@@ -731,14 +741,17 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
 __attribute__((minsize)) void {{ p }}_seg(const bfloat16 *__restrict u, float *__restrict ws, int32_t r)
 {
     const int16_t *__restrict s = (const int16_t *)u + {{ 8 * QB }} * r;
-    int32_t *__restrict lo = AW(int32_t, {{ w.lo }});
+    int16_t *__restrict lv = AW(int16_t, {{ w.lo }});
     int32_t mn = s[0], mx = s[0];
     for (int i = 0; i < {{ 8 * QB }}; i++) {
         const int32_t v = s[i];
-        lo[i] = v;
+        for (int k = 0; k < 8; k++)
+            lv[8 * i + k] = v;
         mn = v < mn ? v : mn;
         mx = v > mx ? v : mx;
     }
+    for (int k = 0; k < 64; k++)
+        lv[{{ 64 * QB }} + k] = k & 7;
     int32_t *__restrict st = AW(int32_t, {{ w.st }});
     st[4] = mn;
     st[5] = mx;
@@ -754,11 +767,32 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
     event0();
 {% endif %}
     int32_t *__restrict st = AW(int32_t, {{ w.st }});
+{% if RING %}
+    // (the held history's {{ HBC }} chunks from position 0, the history's below st[8]; then the ring's {{ R }} slots of {{ GQ }}
+    // chunks: slot j holds the chunk's group g = bg - (bg - j) mod {{ R }}, in the window when g >= max(0, bg - {{ WIN - 1 }}))
+    int32_t rec, out;
+    if (t < {{ HBC }}) {
+        rec = {{ CR }} * t;
+        out = t >= st[8];
+    } else {
+        const int32_t u = t - {{ HBC }}, j = u / {{ GQ }};
+        int32_t d = st[11] - j;
+        d = d < 0 ? d + {{ R }} : d;
+        const int32_t g = st[10] - d;
+        out = (d > {{ WIN - 1 }}) | (g < 0);
+        rec = st[6] + {{ RG }} * g + {{ CR }} * (u - {{ GQ }} * j);
+    }
+{% else %}
     const int32_t rec = t < st[8] ? {{ CR }} * t : st[7] + {{ CR }} * (t - st[8]);
+{% endif %}
     const int32_t kc = 8 * (rec - st[6]);
     st[0] = rec - st[2] - {{ QB }} * r;
     st[1] = (st[0] - {{ QB - 1 }} > 0) | ((kc >= 0) & (kc + {{ 8 * CR }} <= st[4]));
     st[3] = (kc >= 0) & (kc < st[5]);
+{% if RING %}
+    st[1] |= out;
+    st[3] &= !out;
+{% endif %}
     st[9] = kc;
 }
 {% else %}
@@ -916,9 +950,11 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict wo)
 {% if "soft" in ablate %}
     return;
 {% endif %}
-    const int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
     if (st[1])
         return;
+    const int32_t first = st[12];
+    st[12] = 0;
 {% if "ev_soft" in ablate %}
     event0();
 {% endif %}
@@ -928,10 +964,18 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict wo)
         {{ p }}_mask(sc, st[0]);
 {% if WIN %}
     if (st[3])  // (the chunk reaches below a row's segment)
-        {{ p }}_masklo(sc, AW(int32_t, {{ w.lo }}), st[9]);
+        {{ p }}_masklo(sc, AW(int16_t, {{ w.lo }}), st[9]);
 {% endif %}
+{% if "ev_raise" in ablate %}
+    if (!aie::lt(aie::load_v<64>(AW(bfloat16, {{ w.vm }})), aie::broadcast<bfloat16, 64>(208.0f)).full()) {
+        event0();
+        {{ p }}_raise(ws, wo, first);
+        event1();
+    }
+{% else %}
     if (!aie::lt(aie::load_v<64>(AW(bfloat16, {{ w.vm }})), aie::broadcast<bfloat16, 64>(208.0f)).full())
-        {{ p }}_raise(ws, wo);
+        {{ p }}_raise(ws, wo, first);
+{% endif %}
     {{ p }}_ppan(sc, AW(uint8_t, {{ w.pp }}));
 {% if "ev_soft" in ablate %}
     event1();
@@ -1008,7 +1052,14 @@ class AttnOperator(ArtcOperator):
     on stream B ahead of the V objects). Pass b streams the history and the chunk's groups max(1, D - W + 1) .. D (D:
     its queries' group; a window fixed by the design: no runtime parameters), so a segment spans at most
     ``max_segment`` positions; key chunks below every one of a core's rows' segments are skipped, those below some
-    masked (-1e30)."""
+    masked (-1e30). It reads at the DDR port's rate (each pass the history and its window again).
+
+    The ring variant (``ring`` H > 0: hi + lo K, a pass per cache group, a history of at most H groups) reads each group
+    once: per column the memory tile holds H groups from position 0 (the history's, the rest skipped) and a ring of W + 1
+    of the chunk's groups (slot b % (W + 1) group b), and sends every pass the history and the whole ring
+    (``_ring_memtiles``); the cores skip the slots outside their window (the chunk's groups max(0, D - W + 1) .. D), so
+    a pass takes its window's key chunks in the slots' order (o, l the same sums in another order: not bit-identical to
+    the window variant). A key chunk the cores skip still crosses their input streams: the ring wins from 2048 tokens."""
 
     STACK = 2048
     pfx = kernel_prefix("paa")
@@ -1019,11 +1070,12 @@ class AttnOperator(ArtcOperator):
     COUNTER0 = 0x31520
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
-                 ablate: tuple[str, ...] = (), window: int = 0):
+                 ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
-        (qk, soft, pv, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
+        (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
-        packed variant's window of cache groups (class docstring)."""
+        packed variant's window of cache groups; ``ring``: its history's groups held in the memory tiles (class
+        docstring)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -1036,6 +1088,10 @@ class AttnOperator(ArtcOperator):
         self.T, self.shape, self.kv_bytes, self.kv_pad, self.ablate = T, s, kv_bytes, kv_pad, tuple(ablate)
         self.win = window
         self.n_pass = T // self.pq
+        self.ring = ring
+        if ring:
+            assert window and self.m == 1 and s.kp == 2 and s.used % (2 * s.unit) == 0, "the ring: hi + lo K, a pass a group"
+            assert self.mt_bytes <= MT_BYTES, (self.mt_bytes, "a column's memory tile")
         super().__init__()
 
     @staticmethod
@@ -1043,10 +1099,25 @@ class AttnOperator(ArtcOperator):
         """The workspace's regions at ``rows`` row blocks, chunks of ``cr`` records and ``pp`` P panels per row block
         and record (the kernels' comment); ``qb``: the packed variant's query blocks (their rows' segment starts)."""
         return [("sc", 256 * rows * cr), ("bias", 256 * rows), ("l", 256 * rows), ("pp", 72 * rows * cr * pp),
-                ("vm", 128), ("st", 64)] + ([("lo", 32 * qb)] if qb else [])
+                ("vm", 128), ("st", 64)] + ([("lo", 128 * qb + 128)] if qb else [])
 
     def workspace(self) -> dict[str, int]:
         return regions(self.regions(self.qb * self.shape.qh, self.cr, self.shape.pp, self.qb if self.win else 0))
+
+    @property
+    def mt_bytes(self) -> int:
+        """Bytes of a column's memory tile the ring variant takes: the held history and the ring (K and V), the pass's
+        Q units and SEG, the output join's objects."""
+        s = self.shape
+        return ((self.ring + self.win + 1) * 3 * s.used + (2 * self.qb * s.qh * s.qp + 2) * s.unit
+                + 2 * 4 * self.qb * s.nd * 72)
+
+    @staticmethod
+    def ring_groups(shape: Shape, window: int, qb: int) -> int:
+        """The most history groups (the chunk's first included) a ring variant's memory tiles hold beside its ring."""
+        s = shape
+        rest = (window + 1) * 3 * s.used + (2 * qb * s.qh * s.qp + 2) * s.unit + 2 * 4 * qb * s.nd * 72
+        return (MT_BYTES - rest) // (3 * s.used)
 
     @property
     def max_segment(self) -> int:
@@ -1059,7 +1130,8 @@ class AttnOperator(ArtcOperator):
         tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
                             KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
-                            WIN=self.win, RG=s.rg)
+                            WIN=self.win, RG=s.rg, RING=self.ring, R=self.win + 1, GQ=s.rg // self.cr,
+                            HBC=self.ring * s.rg // self.cr)
 
     @property
     def n_qs(self) -> int:
@@ -1095,6 +1167,9 @@ class AttnOperator(ArtcOperator):
         s = self.shape
         assert p0 % s.pg == 0
         fg = p0 // s.pg + 1
+        if self.ring:
+            assert fg - 1 <= self.ring, (p0, self.ring, "a history the memory tiles hold")
+            return {P_P8: p0 // 8, P_FH: (fg - 1) * s.rg // self.cr, P_G0: s.group // 2 * (fg - 1)}
         out = {P_P8: p0 // 8, P_FG: fg, P_FQ: fg * s.rg // self.cr}
         if self.n_pass > self.m:  # (a pass streams the chunk's groups after its first)
             out[P_FO] = s.group // 2 * fg
@@ -1119,13 +1194,16 @@ class AttnOperator(ArtcOperator):
         k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, wo_ty])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [u_ty, ws_ty, wo_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, wo_ty, o_ty, np.int32])
-        p_p8, p_fq = ScratchpadParameter(P_P8, np.int32), ScratchpadParameter(P_FQ, np.int32)
+        p_p8, p_fq = ScratchpadParameter(P_P8, np.int32), ScratchpadParameter(P_FH if self.ring else P_FQ, np.int32)
         p_fg, p_fo = ScratchpadParameter(P_FG, np.int32), ScratchpadParameter(P_FO, np.int32)
         n_pass, ku, gq = self.n_pass, cr * s.kp // 2, s.rg // cr
 
         # stream A: the K records (hi + lo: a group's [K obj | padding | K obj], the memtile reads the objects' records)
         ilv = stream_walk(s.unit // 2, [(nd, 36), (2, nd * 36), (36, 1)])  # (per d-block the unit's two halves)
-        if s.kp == 2:
+        if self.ring:  # (a group's K records without the padding; the memory tiles' own buffers: ``_ring_memtiles``)
+            ka_ty = np.ndarray[(s.used,), bf]
+            walk = stream_walk(s.used, [(s.used // 576, 576), (576, 1)])
+        elif s.kp == 2:
             ka_ty = np.ndarray[((s.a_bytes + s.used) // 2,), bf]
             walk = stream_walk((s.a_bytes + s.used) // 2, [(2, s.a_bytes // 2), (s.used // 1152, 576), (576, 1)],
                                pad=[(0, 0)] * 3)
@@ -1147,7 +1225,8 @@ class AttnOperator(ArtcOperator):
         def turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb, nq, seg=None,
                  full=False):
             """(a core's share of a pass: its Q units of the pass's nq, its segments (packed), the history, its output;
-            ``full``: the packed window's last groups only, ``win`` of them)"""
+            ``full``: the packed window's last groups only, ``win`` of them; the ring: the held history's and the ring's
+            chunks, every pass)"""
             for i in range_(nq):
                 u = b_h.acquire(1)
                 qsel(u, q, i, me)
@@ -1162,7 +1241,9 @@ class AttnOperator(ArtcOperator):
             else:
                 init(ws, wo, p8.read(), bg, bb)
             n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
-            if full:
+            if self.ring:
+                n = gq * (self.ring + win + 1)
+            elif full:
                 n = plus_i32(n, gq * win)
             else:
                 for _ in range(gq):
@@ -1186,6 +1267,12 @@ class AttnOperator(ArtcOperator):
         npg = n_pass // m  # (the chunk's groups)
 
         def core(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, *seg):
+            if self.ring:  # (every pass the held history and the whole ring)
+                for _ in forever_():
+                    for bg in range_(npg):
+                        turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, 0,
+                             2 * rb * s.qp, *seg)
+                return
             for _ in forever_():
                 # (packed: the passes whose window is every group of the chunk after its first, then the rest's last
                 # win)
@@ -1244,6 +1331,9 @@ class AttnOperator(ArtcOperator):
                 oh[c].drain(A, TensorAccessPattern((n_a,), c * qh * nd * 36, [n_pass, qh, 4 * qb, nd * 36],
                                                    [4 * qb * NH * nd * 36, nd * 36, NH * nd * 36, 1]),
                             group=tg, wait=True)
+            if self.ring:
+                ring_fills(QS, KV, seg[0], ah, bh, tg)
+                return
             # (a pass's fills: at most three in flight, within the shim tiles' BDs; packed: two, its SEG part one more)
             inflight = []
             for b in range(n_pass):
@@ -1274,6 +1364,41 @@ class AttnOperator(ArtcOperator):
                 tp.finish()
             tg.finish()
 
+        def ring_fills(QS: object, KV: object, SEG: object, ah: list, bh: list, tg: TaskGroup) -> None:
+            """The ring variant's fills: per column the held history (groups from position 0, the chunk's first among
+            them) once, then pass b's group b (stream A: its K; B: the pass's Q units, SEG, its V), each read once."""
+            p_g0, hold = ScratchpadParameter(P_G0, np.int32), self.ring
+            hist = TaskGroup()
+            for c in range(COLS):  # (a group's K: its two objects' records, without the first one's padding)
+                k0, v0 = c * hb, c * hb + s.kp * o2
+                chained_fill(ah[c], KV, [TensorAccessPattern((n_kv,), k0, [hold, 2, rows, 576], [g2, o2, 576, 1])],
+                             hist, wait=True)
+                chained_fill(bh[c], KV, [TensorAccessPattern((n_kv,), v0, [hold, 1, rows, 576], [g2, 0, 576, 1])], hist,
+                             wait=True)
+            inflight = [hist]
+            for b in range(n_pass):
+                tp = TaskGroup()
+                t0 = 4 * qb * b
+                q0 = t0 // sg * sg * COLS * qh * uw + t0 % sg * qh * uw
+                for c in range(COLS):
+                    k0, v0 = c * hb + b * g2, c * hb + s.kp * o2 + b * g2
+                    chained_fill(ah[c], KV, [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 2, rows, 576],
+                                                                               [0, o2, 576, 1]), offset_parameter=p_g0)],
+                                 tp, wait=True)
+                    chained_fill(bh[c], KV, [
+                        ChainPart(QS, TensorAccessPattern((n_qs,), q0 + c * sg * qh * uw, [1, 1, 4 * qb * qh, uw],
+                                                          [0, 0, uw, 1])),
+                        ChainPart(SEG, TensorAccessPattern((n_seg,), b * s.unit, [1, 1, s.unit // 576, 576],
+                                                           [0, 0, 576, 1])),
+                        ChainPart(KV, TensorAccessPattern((n_kv,), v0, [1, 1, rows, 576], [0, g2, 576, 1]),
+                                  offset_parameter=p_g0)], tp, wait=True)
+                inflight.append(tp)
+                if len(inflight) > 2:
+                    inflight.pop(0).finish()
+            for tp in inflight:
+                tp.finish()
+            tg.finish()
+
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if win else []),
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
@@ -1283,7 +1408,114 @@ class AttnOperator(ArtcOperator):
         lay = self.l1_layout()
         pin_l1_buffers(module, fifo=lambda name, depth: next((v for k, v in lay.items() if name.startswith(k)), None),
                        buffer=lambda name: next((v[0] for k, v in lay.items() if name.startswith(k)), None))
+        if self.ring:
+            self._ring_memtiles(module)
         return module
+
+    def _ring_memtiles(self, module: Module) -> None:
+        """The ring variant's memory tiles (``pin_l1_buffers``' split module): per column the forwards of streams A and B
+        replaced by buffers of their own (the held history and a ring of win + 1 groups after it, the pass's Q units
+        and SEG) and tasks the runtime sequence starts once per dispatch (a runtime BD: three dimensions and its
+        iteration). A writes the history, then each pass's group into slot b % R (a group's K records only: the fills
+        leave out the padding); it sends the history and the whole ring every pass (the cores skip the slots outside
+        their window). B writes its history, then per pass the Q units and SEG, then the group's V, each object of two
+        units re-laid as stream B's walk sends it (la_v's to_stream, inverted: a BD per object); it sends them in order.
+        A slot is written again once the pass before the last that reads it ended (credits: 2). The tasks end with the
+        dispatch's last pass (freed after the drains)."""
+        from aie import ir
+        from aie.dialects import aie
+        from aie.dialects.aiex import dma_configure_task_for, dma_free_task, dma_start_task
+
+        s, R, hold, npg = self.shape, self.win + 1, self.ring, self.n_pass
+        ob = s.unit  # (bf16 of an object of two units)
+        ks, vs = s.used, s.used // 2  # (bf16 of a group's K, V)
+        opg = vs // ob  # (V objects per group)
+        nqs = (2 * self.qb * s.qh * s.qp + 2) * ob // 2  # (bf16 of a pass's Q units and SEG)
+        walk = [(4, 72), (s.nd // 2, 288), (72, 1)]  # (an object's cache order [slice][d-block] into la_v's stream order)
+        with module.context, ir.Location.unknown():
+            dev = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
+            blk = dev.regions[0].blocks[0]
+            ops = {ir.StringAttr(o.attributes["sym_name"]).value: o for o in blk.operations
+                   if "sym_name" in o.attributes}
+            tiles = {(o.col.value, o.row.value): o.result for o in blk.operations if isinstance(o, aie.TileOp)}
+            routes = [o for o in blk.operations if isinstance(o, aie.RouteOp)]
+            seq = next(o for o in blk.operations if isinstance(o, aie.RuntimeSequenceOp))
+            bf = ir.BF16Type.get()
+            ends: dict[tuple[int, str], str] = {}
+            locks: dict[tuple[int, str], object] = {}
+            bufs: dict[tuple[int, str], object] = {}
+            ip = ir.InsertionPoint(seq.operation)
+            for c in range(COLS):
+                mt = tiles[(c, 1)]
+                for src, fwd, st in ((f"la_ka{c}", f"la_k{c}", "a"), (f"la_vb{c}", f"la_v{c}", "b")):
+                    for name in (f"{src}__cons__pool", f"{src}__cons__dma", f"{fwd}__prod__dma"):
+                        ops[name].erase()
+                    for d in ("in", "out"):
+                        ends[(c, st + d)] = f"rg_{st}{d}{c}"
+                        aie.route_endpoint(ends[(c, st + d)], mt, aie.WireBundle.DMA, ip=ip)
+                    for r in routes:
+                        dst = [ir.FlatSymbolRefAttr(a).value for a in ir.ArrayAttr(r.attributes["destinations"])]
+                        srcs = [ir.FlatSymbolRefAttr(a).value for a in ir.ArrayAttr(r.attributes["sources"])]
+                        if dst == [f"{src}__cons__dma"]:
+                            r.attributes["destinations"] = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(ends[(c, st + "in")])])
+                        if srcs == [f"{fwd}__prod__dma"]:
+                            r.attributes["sources"] = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(ends[(c, st + "out")])])
+                for name, n in (("k", (hold + R) * ks), ("q", nqs), ("v", (hold + R) * vs)):
+                    bufs[(c, name)] = aie.BufferOp(ir.MemRefType.get([n], bf), mt, sym_name=f"rg_{name}{c}", ip=ip).result
+                for name, init in (("k_ready", 0), ("k_free", 2), ("q_ready", 0), ("q_free", 1), ("q_mid", 0),
+                                   ("v_ready", 0), ("v_free", 2), ("v_mid", 0)):
+                    locks[(c, name)] = aie.lock(mt, init=init, sym_name=f"rg_{name}{c}", ip=ip)
+            acq, rel = aie.LockAction.AcquireGreaterEqual, aie.LockAction.Release
+            tasks = []
+
+            def task(end: str, parts: list[tuple], reps: int) -> None:
+                """A memory tile task of ``reps`` runs of the BD chain ``parts``: (buffer, offset, length, dims or None,
+                the lock acquired and the lock released or None, iteration (steps, stride) or None)."""
+                t = dma_configure_task_for(end, repeat_count=reps - 1)
+                with aie.bds(t) as bd:
+                    for i, (buf, off, n, dims, lk, it) in enumerate(parts):
+                        with bd[i]:
+                            if lk is not None:
+                                aie.use_lock(lk[0], acq, 1)
+                            kw = {"sizes": [d for d, _ in dims], "strides": [st for _, st in dims]} if dims else {}
+                            op = aie.dma_bd(buf, offset=off, transfer_len=n, **kw)
+                            if it:
+                                op = op if isinstance(op, ir.OpView) else op.owner
+                                op.attributes["iteration"] = ir.Attribute.parse(
+                                    f"#aie.bd_iteration<size = {it[0]}, stride = {it[1]}, current = 0>")
+                            if lk is not None:
+                                aie.use_lock(lk[1], rel, 1)
+                            if i + 1 < len(parts):
+                                aie.next_bd(bd[i + 1])
+                            else:
+                                aie.EndOp()
+                dma_start_task(t)
+                tasks.append(t)
+
+            first = seq.regions[0].blocks[0]
+            with ir.InsertionPoint.at_block_begin(first):
+                for c in range(COLS):
+                    B = lambda n, c=c: bufs[(c, n)]
+                    L = lambda n, c=c: locks[(c, n)]
+                    task(ends[(c, "ain")], [(B("k"), 0, hold * ks, None, None, None)], 1)
+                    task(ends[(c, "ain")], [(B("k"), hold * ks, ks, None, (L("k_free"), L("k_ready")), (R, ks))], npg)
+                    task(ends[(c, "aout")], [(B("k"), 0, (hold + R) * ks, None, (L("k_ready"), L("k_free")), None)], npg)
+                    task(ends[(c, "bin")], [(B("v"), 0, ob, walk, None, (hold * opg, ob))], hold * opg)
+                    qs = [(B("q"), k * ob, ob, walk, None, None) for k in range(nqs // ob)]
+                    qs[0] = (*qs[0][:4], (L("q_free"), L("q_mid")), None)
+                    qs[-1] = (*qs[-1][:4], (L("q_mid"), L("q_ready")), None)
+                    vv = [(B("v"), hold * vs + k * ob, ob, walk, None, (R, vs)) for k in range(opg)]
+                    if opg == 1:
+                        vv[0] = (*vv[0][:4], (L("v_free"), L("v_ready")), (R, vs))
+                    else:
+                        vv[0] = (*vv[0][:4], (L("v_free"), L("v_mid")), (R, vs))
+                        vv[-1] = (*vv[-1][:4], (L("v_mid"), L("v_ready")), (R, vs))
+                    task(ends[(c, "bin")], qs + vv, npg)
+                    task(ends[(c, "bout")], [(B("q"), 0, nqs, None, (L("q_ready"), L("q_free")), None),
+                                             (B("v"), 0, (hold + R) * vs, None, (L("v_ready"), L("v_free")), None)], npg)
+            with ir.InsertionPoint(first):  # (after the drains' awaits: the tasks are done by then)
+                for t in tasks:
+                    dma_free_task(t)
 
     def l1_layout(self) -> dict[str, list[int]]:
         """Core byte addresses by 16 KB region (the stack at 0): the stack, Q and the output buffers (touched by ``fin``

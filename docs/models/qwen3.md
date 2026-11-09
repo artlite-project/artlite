@@ -46,9 +46,9 @@ Qwen3 0.6B Q4_1: time to first token at 1K / 8K / 32K prompt tokens 0.095 / 1.41
 after 1K, 70.3 ms after 32K (101.5 / 14.2 tokens/s). Quality vs the CPU model on the same weights, teacher-forced: KL
 0.0037 on a chat (through the prefill), 0.0037 after a 4800-token essay.
 
-Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 31
-ms, a 430-token passage's in 62 ms, batches of 8 passages 7.1K tokens/s; Qwen3-Embedding-4B Q4_K_M 87 ms, 229 ms, 1.9K
-tokens/s; Qwen3-Reranker-0.6B Q8_0 16.3 pairs/s of ~510 tokens; Decision-2.0-Kai-0.6B 37-44 ms per question of 90-190
+Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 26
+ms, a 430-token passage's in 55 ms, batches of 8 passages 10.7K tokens/s; Qwen3-Embedding-4B Q4_K_M 87 ms, 229 ms, 1.9K
+tokens/s; Qwen3-Reranker-0.6B Q8_0 25 pairs/s of ~510 tokens; Decision-2.0-Kai-0.6B 37-44 ms per question of 90-190
 tokens.
 
 Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (4B: 0.994-0.999; its CPU and

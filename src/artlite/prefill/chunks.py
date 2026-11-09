@@ -18,7 +18,8 @@ after a chunk's valid ones write cache records that later tokens overwrite (mask
 Packed chunks (a readout model's: several inputs, segments, in one chunk; ``pack_sizes``) run their own programs,
 keyed ``("pack", T)``: the model's runlist with the operators that keep the segments apart (``_runlist_of(T,
 packed=True)``), the same items per layer; a recurrent model's segments after a cached prefix run tree chunks
-(``tree_sizes``, ``("tree", T)``, ``_runlist_of(T, tree=True)``: each segment continues the prefix's states). ``pack``
+(``tree_sizes``, ``("tree", T)``, ``_runlist_of(T, tree=True)``: each segment continues the prefix's states); a model with
+a second packed attention design runs it as ``("ring", T)`` (``ring_sizes``, ``_runlist_of(T, packed=True, ring=True)``). ``pack``
 plans a request's inputs: first-fit-decreasing into chunks of each packed size in turn (``packed_sizes``; segments
 rounded up to ``seg_unit`` tokens; a chunk's fixed cost, its ConfigureOps and every weight's pass, shared by its inputs),
 the plan of the least estimated time (``packed_seconds``) against each input run alone (``chunk_seconds`` of its
@@ -93,6 +94,7 @@ class ChunkPrefill:
         self.rb: dict[str, int] = {}  # (bytes per token of the token buffers)
         self.pack_sizes: tuple[int, ...] = ()  # (the packed chunks' sizes: the model's, a readout model's)
         self.tree_sizes: tuple[int, ...] = ()  # (a recurrent model's packed chunks after a prefix)
+        self.ring_sizes: tuple[int, ...] = ()  # (packed chunks of a second attention design: the model's ``("ring", T)``)
         self.span = 0  # (a packed chunk's longest segment)
         self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
@@ -106,6 +108,7 @@ class ChunkPrefill:
         self.runlists: dict[int | tuple[str, int], list[tuple]] = {T: self._runlist_of(T) for T in self.sizes}
         self.runlists |= {("pack", T): self._runlist_of(T, packed=True) for T in self.pack_sizes}
         self.runlists |= {("tree", T): self._runlist_of(T, tree=True) for T in self.tree_sizes}
+        self.runlists |= {("ring", T): self._runlist_of(T, packed=True, ring=True) for T in self.ring_sizes}
         self._sizes()
         self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
         self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)

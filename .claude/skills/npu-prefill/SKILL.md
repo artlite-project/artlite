@@ -76,7 +76,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   - the attention: each row sees its segment's keys (after a history every row sees: a shared prefix). The Llama path's
     (`prefill.attn.AttnOperator(window=)`) is DMA-bound (compute compiled out: 88-92% of its time), so skipping masked
     chunks' compute saves nothing; a pass streams a fixed window of cache groups ending at its own instead (no runtime
-    parameters: a sequence reads at most 32), which caps a segment at `PACK_SPAN`. qwen35's
+    parameters: a sequence reads at most 32), which caps a segment at `PACK_SPAN`. After a history of up to `RING_HOLD`
+    groups, chunks from 1024 tokens take its ring variant (`ring=`, `("ring", T)` programs): each column's memory tile
+    holds the history and the last W + 1 groups, each read from DDR once, and the cores are the bound. qwen35's
     (`PrefillAttnOperator(pack=)`) streams as unpacked (its masks by vector compares against per-lane lo / hi: a
     scalar loop building them had doubled a packed layer's time). Both take the rows' first / last keys on a stream (SEG, an
     object per pass in the values the memtile walk leaves in order) and mask the rest;
@@ -95,11 +97,12 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   - Positions per token: cos / sin rows written past the table's text rows (rows only padding tokens read otherwise).
   - Test a packed chunk against each segment alone in a chunk of the same size: GEMM K parts and norm splits differ
     between sizes. K records come out bit-identical. V's blocks span a record's 8 positions, so a segment that starts
-    inside one rounds every V differently. Segments at 32-token key chunks are bit-identical up to their last V record.
+    inside one rounds every V differently. Segments at 32-token key chunks are bit-identical up to their last V record
+    (with the window attention; the ring takes the key chunks in its slots' order).
   - `ChunkPrefill.pack` plans a request (first-fit-decreasing into each size, each chunk's inputs instead in smaller ones
     or alone where not faster).
-  - Qwen3-Embedding-0.6B's 4096-token packed chunk: 354 ms against 515 unpacked: its attention 96 ms (the window) against
-    257 ms.
+  - Qwen3-Reranker-0.6B's 4096-token packed chunk after a 64-token prompt: 332 ms with the ring attention, 346 with
+    the window.
 - **App** (`models.common.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
   start (whole cache groups), the planner's chunks, decode steps after; each chunk's inputs (embeddings, per-layer
   inputs) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and

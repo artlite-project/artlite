@@ -288,6 +288,12 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   exp loop are bound by loads and the exp2's vec ops, not MMULs; it stays, with single Q: smaller buffers, KL within
   the prefill's gate); `minsize` on the cold kernels (-0.5 KB of 7.8; with configuration by control packets program
   memory costs a few µs per design switch).
+- **Rare paths that are not rare** (the packed variant, real rerank data): the raise (a row's reference maximum rising:
+  o, l rescaled) runs at every pass's first computed chunk, 7,280 cycles compiled `minsize`; o and l are still zero
+  there, so it only moves the bias: 2,540. The masks below the rows' segments built bit by bit (a scalar loop per row
+  block, record and row) gave way to qwen35's form: per query block a 64-lane int16 vector of its rows' segment starts
+  (built once per pass) compared against the lanes' key offsets. The softmax 1,804 -> 885 cycles a chunk, the layer
+  3.73 -> 3.13 ms (Qwen3-Reranker-0.6B, 4096 tokens).
 
 qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core when a column holds one q head), per
 32-key group and core, the 1B (MiniCPM-V's LM) at p0 = 16K:
