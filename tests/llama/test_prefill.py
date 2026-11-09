@@ -299,7 +299,7 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     from models.llama.overlay import LlamaOverlay
     from models.llama.prefill import LlamaPrefill
     from models.llama.tokenizer import load_tokenizer
-    from models.tokenizer import QwenTokenizer
+    from models.tokenizer import BpeTokenizer
 
     from ..common import essay, llama_gguf
 
@@ -309,7 +309,7 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
     layers = [0, 1, 2, 3]
-    ids = (QwenTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
+    ids = (BpeTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
     x = g.rows("token_embd.weight", ids).float()
     ov = LlamaOverlay(g, layers=layers, vocab=2048, max_positions=1024, kv_k=kv_k)
     ov.load()
@@ -393,7 +393,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     from artlite.model_config import qwen3_gguf
     from models.llama.overlay import LlamaOverlay
     from models.llama.prefill import LlamaPrefill
-    from models.tokenizer import QwenTokenizer
+    from models.tokenizer import BpeTokenizer
 
     from ..common import essay
 
@@ -402,7 +402,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
     T = 1024
-    ids = QwenTokenizer(g).encode(essay("apple.txt"))[:p0 + sum(lengths)]
+    ids = BpeTokenizer(g).encode(essay("apple.txt"))[:p0 + sum(lengths)]
     x = g.rows("token_embd.weight", ids).float()
     ov = LlamaOverlay(g, layers=[0, 1, 2, 3], vocab=2048, max_positions=2048, kv_k="hilo")
     ov.load()

@@ -58,7 +58,7 @@ from ..qwen3vl import host as qwen3vl_host
 from ..qwen3vl import npu as qwen3vl_npu
 from ..readouts import readout_model
 from ..sequence import Sequence
-from ..tokenizer import QwenTokenizer, chat_prompt
+from ..tokenizer import BpeTokenizer, chat_prompt
 from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
 from .image import QwenImage
@@ -556,7 +556,7 @@ class Qwen(Model):
                 raise ValueError(f"{path}: no MTP drafter (no MTP block in the file, no mtp-*.gguf beside it)")
             self.mtp = None
         self.weights = WeightBuffer(image)
-        self.tokenizer = QwenTokenizer(self.gguf)
+        self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.minicpmv = self.cfg.rope_section_order == "zyxt"
         if self.minicpmv:

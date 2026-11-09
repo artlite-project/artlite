@@ -305,8 +305,8 @@ WALKS = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML, "<tool_call>
 
 def tokenizer_of(family: str, path: str) -> object:
     if family == "qwen":
-        from models.tokenizer import QwenTokenizer
-        return QwenTokenizer(GGUFFile(path))
+        from models.tokenizer import BpeTokenizer
+        return BpeTokenizer(GGUFFile(path))
     if family == "gemma":
         from models.gemma4.tokenizer import GemmaTokenizer
         return GemmaTokenizer(GGUFFile(path))

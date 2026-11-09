@@ -14,7 +14,7 @@ from artlite.gguf_model import GGUFFile
 from models.qwen3vl import host as Q
 from models.qwen35.qwen import NpuQwen, Qwen
 from models.sequence import MEDIA
-from models.tokenizer import QwenTokenizer, chat_prompt
+from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
 from . import ref as V
@@ -51,7 +51,7 @@ def case() -> tuple:
         if not os.path.exists(p):
             pytest.skip(f"{p} missing")
     g = GGUFFile(MODEL)
-    tok = QwenTokenizer(g)
+    tok = BpeTokenizer(g)
     text = chat_prompt(g, _messages(None), enable_thinking=False)
     answer = tok.encode(ANSWER)
     gold = V.golden(MODEL, MMPROJ, IMAGE, text.replace(PAD, "<__media__>"), answer=answer)

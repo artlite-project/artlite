@@ -1,6 +1,7 @@
-"""Qwen's tokenizer (models.tokenizer) against llama.cpp's llama-tokenize, on a file of each pre-tokenizer (qwen35:
-Qwen3.5-9B, qwen2: Qwen3 0.6B): essays, code, Unicode, special tokens, the chat template's prompts; a template in
-place of the file's and the template's variables (no NPU)."""
+"""The GGUF files' BPE tokenizer (models.tokenizer) against llama.cpp's llama-tokenize, on a file of each pre-tokenizer
+(qwen35: Qwen3.5-9B, qwen2: Qwen3 0.6B, lfm2: LFM3-1.7B): essays, code, Unicode, special tokens, the chat template's
+prompts; a template in place of the file's and the template's variables; LFM3's template (its ``generation`` block,
+thinking, tool calls) as llama-server renders it (no NPU)."""
 
 import os
 from pathlib import Path
@@ -9,9 +10,9 @@ import jinja2
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import qwen3_gguf, qwen_gguf
+from artlite.model_config import lfm3_gguf, qwen3_gguf, qwen_gguf
 from models.common import template_option
-from models.tokenizer import QwenTokenizer, chat_prompt
+from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
 from .llama_cpp import llama_tokenize
@@ -34,12 +35,12 @@ TEXTS = [
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Factorize x^2 + x - 6 = 0"}]
 
 
-@pytest.fixture(scope="module", params=["qwen35", "qwen2"])
+@pytest.fixture(scope="module", params=["qwen35", "qwen2", "lfm2"])
 def tok(request: pytest.FixtureRequest) -> tuple[str, object]:
-    path = qwen_gguf("Q4_K_M", "9B") if request.param == "qwen35" else qwen3_gguf("0.6B")
+    path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf()}[request.param]
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    return path, QwenTokenizer(GGUFFile(path))
+    return path, BpeTokenizer(GGUFFile(path))
 
 
 def _texts() -> list[str]:
@@ -59,6 +60,8 @@ def test_encode(tok: tuple[str, object], i: int) -> None:
 @pytest.mark.parametrize("thinking", [False, True])
 def test_chat_prompt(tok: tuple[str, object], thinking: bool) -> None:
     path, t = tok
+    if GGUFFile(path).meta["tokenizer.ggml.pre"] == "lfm2":
+        pytest.skip("LFM3's template: test_lfm3_template")
     p = chat_prompt(GGUFFile(path), MESSAGES, enable_thinking=thinking)
     opens = GGUFFile(path).meta["tokenizer.ggml.pre"] == "qwen35"  # (Qwen3's model writes its <think> itself)
     tail = ("<think>\n" if opens else "") if thinking else "<think>\n\n</think>\n\n"
@@ -105,3 +108,44 @@ def test_chat_prompt_template() -> None:
     assert "Reasoning effort" not in chat_prompt(g, MESSAGES, reasoning_effort="low")  # (no thought)
     with pytest.raises(jinja2.TemplateError, match="Unexpected reasoning effort high"):
         chat_prompt(g, MESSAGES, enable_thinking=True, reasoning_effort="high")
+
+
+LFM3_TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}}}},
+              {"type": "function", "function": {"name": "search", "description": "Search", "defer_loading": True,
+                                                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+
+
+def test_lfm3_template() -> None:
+    """LFM3's chat template (a ``{% generation %}`` block, the BOS, ``<think>`` opened or empty, an earlier thought kept
+    with ``preserve_thinking``, tool calls in Qwen3-Coder's XML, deferred tools left out of the system prompt): the
+    prompts llama-server's ``/apply-template`` renders (llama.cpp 80d2c0c2c; its ``preserve_reasoning`` default on)."""
+    path = lfm3_gguf()
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    from models.lfm.lfm import Lfm
+    m = Lfm(path)
+    head = "<|startoftext|><|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+    turn = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning_content": "think a"},
+            {"role": "user", "content": "What is 2+2?"}]
+    tail = "Hello!<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+    for think in (True, False):
+        end = "<think>" if think else "<think></think>"
+        ids = m.chat(turn, think=think, preserve=True)
+        assert m.tokenizer.decode(ids, special=True) == head + "<think>think a</think>" + tail + end
+        assert ids == llama_tokenize(path, head + "<think>think a</think>" + tail + end)
+        assert m.tokenizer.decode(m.chat(turn, think=think), special=True) == head + "<think></think>" + tail + end
+    calls = [{"role": "user", "content": "Weather in Paris?"},
+             {"role": "assistant", "content": "", "tool_calls": [
+                 {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
+             {"role": "tool", "content": "sunny"}]
+    want = ('<|startoftext|><|im_start|>system\n<tools>\n{"name": "get_weather", "description": "Weather", "parameters": '
+            '{"type": "object", "properties": {"city": {"type": "string"}}}}\n</tools><|im_end|>\n<|im_start|>user\n'
+            'Weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n'
+            '<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n'
+            '<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n')
+    for think in (True, False):
+        ids = m.chat(calls, think=think, tools=LFM3_TOOLS, preserve=True)
+        assert m.tokenizer.decode(ids, special=True) == want + ("<think>" if think else "<think></think>")
+    assert m.encode("Hello") == llama_tokenize(path, "Hello")  # (no BOS: the file's add_bos_token)

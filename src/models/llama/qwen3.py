@@ -15,7 +15,7 @@ from artlite.overlay import WeightBuffer
 
 from ..common import Model, Sampling
 from ..readouts import readout_model
-from ..tokenizer import QwenTokenizer, chat_prompt
+from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LlamaImage
 from .llama import NpuLlama
 from .overlay import KV_K, check_formats
@@ -43,7 +43,7 @@ class Qwen3(Model):
         image = LlamaImage(self.gguf, self.cfg)
         check_formats(image)
         self.weights = WeightBuffer(image)
-        self.tokenizer = QwenTokenizer(self.gguf)
+        self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.kv_k = kv_k
 

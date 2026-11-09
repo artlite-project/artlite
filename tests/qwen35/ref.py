@@ -185,7 +185,7 @@ def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split
         if dflash:
             cmd += ["--dflash", dflash, "--dflash-at", str(dflash_at), "--dflash-names", dflash_names or "$^"]
             cmd += ["--dflash-random"] if dflash_random else []
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
         if r.returncode:
             raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
         shutil.rmtree(path, ignore_errors=True)

@@ -32,7 +32,7 @@ from models.qwen35.dflash_core import HD, PAIR, POS_PER_GROUP, QC, ROWS_B
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.qwen import NpuQwen, Qwen
 from models.server.cache import PromptCache
-from models.tokenizer import QwenTokenizer
+from models.tokenizer import BpeTokenizer
 
 from ..common import essays
 from . import ref
@@ -53,7 +53,7 @@ def _files() -> tuple[str, str]:
 
 
 def _tokens(model: str, n: int) -> list[int]:
-    return QwenTokenizer(GGUFFile(model)).encode(essays()[:8 * n])[:n]
+    return BpeTokenizer(GGUFFile(model)).encode(essays()[:8 * n])[:n]
 
 
 def _emb(d: ref.DFlash, token: int) -> np.ndarray:
@@ -286,7 +286,7 @@ def test_rounds() -> None:
     keeping most of a block."""
     model, path = _files()
     g = GGUFFile(model)
-    tk = QwenTokenizer(g)
+    tk = BpeTokenizer(g)
     m = NpuQwen(g, capacity=1024, prefill=False, dflash=path)
     m.lookup = False
     ids = tk.encode("<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number using memoization, with a docstring "
@@ -363,16 +363,16 @@ def test_prefill(n: int) -> None:
 
 
 @pytest.fixture(scope="module")
-def app() -> tuple[NpuQwen, QwenTokenizer]:
+def app() -> tuple[NpuQwen, BpeTokenizer]:
     """The whole path, prompts through the prefill; a test's first ``reset``."""
     model, path = _files()
     g = GGUFFile(model)
     m = NpuQwen(g, capacity=8192, prefill=True, dflash=path)
     m.prepare(1)
-    return m, QwenTokenizer(g)
+    return m, BpeTokenizer(g)
 
 
-def _chat(tk: QwenTokenizer, text: str) -> list[int]:
+def _chat(tk: BpeTokenizer, text: str) -> list[int]:
     return tk.encode(f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
@@ -404,7 +404,7 @@ def _close(a: list, b: list, n: int) -> None:
             assert np.median(e) < 0.08, e
 
 
-def test_sampled(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_sampled(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """Rounds of a sampled generation (temperature 0.7, top 20): a kept draft is a sample of the model's logits like any other token, so
     every token lies among the top 20 of one-token steps over the same text (a step's rounding moves ranks by a few)."""
     m, tk = app
@@ -431,7 +431,7 @@ def test_sampled(app: tuple[NpuQwen, QwenTokenizer]) -> None:
     assert max(ranks) < 24, ranks
 
 
-def test_branch(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_branch(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """A step whose last L slots branch off slot c (``QwenOverlay.step``'s branch): from one state, its branch slots against a chain
     of the tokens to slot c and the branch, its other slots against the chain without the branch, a step after a prefill (record
     mode, the first metadata of 8 slots) and later; then greedy rounds with sibling branches on prose: every token the argmax of
@@ -485,7 +485,7 @@ def test_branch(app: tuple[NpuQwen, QwenTokenizer]) -> None:
     assert not [f for f in flips if f > 0.26], flips
 
 
-def test_context_rounds(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_context_rounds(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """Context rounds between the drafter's on a copy of the prompt (forced, two of three: the Planner keeps the drafter while it beats them,
     which on a copy it does): their kept rows reach the drafter's cache, the records are those of steps of one over the same tokens."""
     m, tk = app
@@ -515,7 +515,7 @@ def test_context_rounds(app: tuple[NpuQwen, QwenTokenizer]) -> None:
     _close(a, _by_steps(m, (ids + out)[:n]), n)
 
 
-def test_second_turn(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_second_turn(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """A second turn after a generation: decode steps up to a cache group, then a chunk, the drafter's rows of all of them; the rounds
     after it draft."""
     m, tk = app
@@ -553,7 +553,7 @@ def _llama_records(n: int) -> tuple[list[int], ref.DFlash]:
     return ids, rf
 
 
-def test_ring_wraps(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_ring_wraps(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """A prompt of several chunks over wraps of the ring, its last one padded: every closed record of the window against the injection of
     llama.cpp's taps of the same tokens (K, V: as ``test_prefill``'s paths differ, and the rare token with them), the padding rows' records
     past the window."""
@@ -585,7 +585,7 @@ def test_ring_wraps(app: tuple[NpuQwen, QwenTokenizer]) -> None:
 
 
 @pytest.mark.parametrize("n", [256, 264, 320, 325])
-def test_record_edges(app: tuple[NpuQwen, QwenTokenizer], n: int) -> None:
+def test_record_edges(app: tuple[NpuQwen, BpeTokenizer], n: int) -> None:
     """A prompt ending on a chunk's end, a record's, a cache group's, and past it: the block after it has the drafts of the same taps
     run through ``ref.DFlash``."""
     m, _ = app
@@ -610,7 +610,7 @@ def test_record_edges(app: tuple[NpuQwen, QwenTokenizer], n: int) -> None:
     assert min(top) >= 12, top
 
 
-def test_prompt_cache(app: tuple[NpuQwen, QwenTokenizer]) -> None:
+def test_prompt_cache(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     """The server's prompt cache: a prompt past the ring's window, an answer far longer than the ring's slack, then a request that goes
     back to the prompt's end, in place; another sequence and the first one's records back. The block after a continuation has the logits
     and gates, bit for bit, of the same continuation run with nothing in between (but for the head's table, the rows of the tokens seen)."""

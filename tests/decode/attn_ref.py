@@ -2,7 +2,8 @@
 the models' host models share: q, k (RMS-normed: Gemma) rotated in fp32 (fp32 cos / sin), k cached as bfp16 hi + lo
 blocks (or one), v (normed to bf16: Gemma) cached as bfp16 blocks per dim over the 8 positions of a record, encoded
 from the bf16 values of its positions up to the attending one (all 8 once it is past the record), exact softmax of
-the scores, o rounded to bf16. (Not modelled: the Q panels' 14 bits, the P panels, exp2's bf16-level polynomial.)
+the scores, o (times the head's sigmoid output gate: LFM3) rounded to bf16. (Not modelled: the Q panels' 14 bits, the P
+panels, exp2's bf16-level polynomial.)
 """
 
 import numpy as np
@@ -70,8 +71,10 @@ class AttentionRef:
         rec = bfp16.values(np.ascontiguousarray(rec.transpose(0, 2, 1))).transpose(0, 2, 1)
         self.V = torch.cat([self.V[:, :r0], torch.from_numpy(np.ascontiguousarray(rec[:, :p + 1 - r0]))], 1)
 
-    def attend(self, q: torch.Tensor, cs: tuple[torch.Tensor, torch.Tensor], c: float, p: int) -> torch.Tensor:
-        """The attention of q (heads hd,) at position p (the positions up to p cached) -> (heads hd,) bf16-valued."""
+    def attend(self, q: torch.Tensor, cs: tuple[torch.Tensor, torch.Tensor], c: float, p: int,
+               g: torch.Tensor | None = None) -> torch.Tensor:
+        """The attention of q (heads hd,) at position p (the positions up to p cached) -> (heads hd,) bf16-valued;
+        g: the heads' gate logits (o_h times sigmoid(bf16(g_h)))."""
         q = q.view(self.heads, self.hd)
         qn = rope(self._n(q, 0), cs, self.rot)
         lo = max(0, p - self.window + 1) if self.window else 0
@@ -80,4 +83,7 @@ class AttentionRef:
         for h in range(self.heads):
             K, V = self.K[h // per, lo:p + 1].double(), self.V[h // per, lo:p + 1].double()
             out.append(torch.softmax((qn[h].double() * c) @ K.T, -1) @ V)
-        return bf(torch.stack(out).float().reshape(-1))
+        o = torch.stack(out)
+        if g is not None:
+            o = o * torch.sigmoid(bf(g).double())[:, None]
+        return bf(o.float().reshape(-1))

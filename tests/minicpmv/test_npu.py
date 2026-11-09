@@ -19,7 +19,7 @@ from artlite.model_config import ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 from models.qwen35 import attn as AT
 from models.qwen35.qwen import NpuQwen, Qwen
-from models.tokenizer import QwenTokenizer, chat_prompt
+from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
 from . import ref as V
@@ -44,7 +44,7 @@ def case() -> tuple:
         if not os.path.exists(p):
             pytest.skip(f"{p} missing")
     g = GGUFFile(path)
-    tok = QwenTokenizer(g)
+    tok = BpeTokenizer(g)
     gold = V.golden(path, MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)
     _, grid = M.slice_image(M.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
     chunk = gold.embd(0)  # (llama.cpp's image chunk: the tokens after <image>, through the last marker)

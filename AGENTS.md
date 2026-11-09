@@ -106,13 +106,13 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/include/` | the kernels' headers: `operators.h` (loop-pragma macros; the precompiled header of every kernel), `kernel_lib.h` (shared kernel helpers, namespace `al`) |
 | `src/artlite/formats/` | the GGUF tile formats: one slot per format family (`formats.common.Slot`) |
 | `src/artlite/gemm/` | the GEMMs on the weight tiles: GemmQ, GemmQd (a dequantizing core per column), their MAC loop |
-| `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma, Llama and Qwen3 (`attn.py`), the models' shared host side (`model.py`) |
+| `src/artlite/decode/` | the decode overlay of the language models: its design (`design.py`) and the main / helper cores' GEMV phases, the weight image (`image.py`), the KV record format (`kv.py`), the attention core of Gemma, Llama, Qwen3 and LFM3 (`attn.py`), the models' shared host side (`model.py`) |
 | `src/artlite/prefill/` | the chunk prefill on the decode overlay's buffers: chunk programs (packed ones: several inputs in a chunk, a recurrent model's after a cached prefix too, and their planner), the GEMM planner, the GEMMs' pace calibration (`pace.py`), the residual norms, the attention of a column per KV head (Llama's, Qwen3's) |
 | `src/artlite/moe/` | MoE layers: the routing on the decode overlay's cores, the prefill's router, expert work lists and gathers |
 | `src/artlite/vision/` | the vision overlay: image networks on one static design (host-built transactions, core roles as code pages the cores load); a network's tensors and layers (`layers.py`), the vision encoders' ViT layers (`vit.py`), its weights (`weights.py`: views of the model files' tensors, packed at every load by `_native.pack_slots`), a model's cached build (`device.py`: transactions and commands, no weights) |
 | `src/artlite/parallel_compile.py` | all parallel compilation |
 | `src/artlite/{model_config,gguf_model,measure_ii,variant_search,profiling,probe}.py` | model files, schedule tools, profiling, `artlite-probe`'s designs |
-| `src/models/{llama,gemma4,qwen35}/` | the language models, a package per GGUF architecture (`llama` also runs `qwen3` and `vllm-decision2`: `qwen3.py`): on the NPU (the weight image `image.py`, the decode design `decode.py` and its host side `overlay.py`, the prefill `prefill.py`, the model's own operators) and on the host (tokenizer, chat template, inputs); `models.open_model` picks one by a GGUF file's architecture |
+| `src/models/{llama,gemma4,qwen35,lfm}/` | the language models, a package per GGUF architecture (`llama` also runs `qwen3` and `vllm-decision2`: `qwen3.py`; `lfm`: `lfm3`, its conv layers' operators `conv.py`, `conv_prefill.py`): on the NPU (the weight image `image.py`, the decode design `decode.py` and its host side `overlay.py`, the prefill `prefill.py`, the model's own operators) and on the host (tokenizer, chat template, inputs); `models.open_model` picks one by a GGUF file's architecture |
 | `src/models/minicpmv/` | MiniCPM-V 4.7's vision side (its mmproj): the encoder on the vision overlay (`encoder.py`), an image's embeddings and tokens (`npu.py`), its slices and positions (`host.py`); qwen35's language model takes them (`models/sequence.py`: token ids and embedding rows) |
 | `src/models/qwen3vl/` | Qwen3-VL's vision side (the mmproj of Qwen3.5 / 3.6 / 3.8, projector `qwen3vl_merger`): the encoder on the vision overlay (`encoder.py`: its layout, programs per image size), an image's embeddings and tokens (`npu.py`), its size, pixels and positions (`host.py`); qwen35's language models take them |
 | `src/models/sd15/` | Stable Diffusion 1.5 text to image from a diffusers directory (`models.open_pipeline`): CLIP tokenizer, samplers, the pipeline over a `Backend` of three parts (text encoder, UNet, VAE decoder), the fp32 torch CPU backend, the NPU UNet and VAE decoder (`npu.py`) on the vision overlay: the 64x64 level (`level64.py`), the 32x32 .. 8x8 levels (`unet.py`; 32x32 in bands), the step (`model.py`), the VAE decoder (`vae.py`) |
@@ -165,13 +165,13 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 ## Models
 
-- `artlite.model_config` reads the GGUF metadata (`LlamaConfig`: Llama and Qwen3, `GemmaConfig`, `QwenConfig`). Model
+- `artlite.model_config` reads the GGUF metadata (`LlamaConfig`: Llama and Qwen3, `GemmaConfig`, `QwenConfig`, `LfmConfig`). Model
   files live in `<models dir>/<HF org>/<HF repo>/`; the models dir (`ARTLITE_MODELS_DIR`, default `~/.artlite/models`) is
   spelled only in `model_config.MODELS_DIR`: get paths from its helpers (`llama_gguf`, `qwen3_gguf`, `gemma_gguf`,
   `qwen_gguf`, ...), in tests and research scripts too.
 - Decode: each language model runs one overlay design whose cores interpret metadata in their inputs, driven by
   host-built transactions (`artlite/decode/`: the models' shared host side `model.py`, the KV record format `kv.py`,
-  the attention core of Gemma, Llama and Qwen3 `attn.py`).
+  the attention core of Gemma, Llama, Qwen3 and LFM3 `attn.py`).
 - Prefill: layer-major chunk programs (`artlite/prefill/chunks.py`) of GEMMs on the decode's weight image
   (`artlite/prefill/gemm.py`, paced where a machine throttles them: `pace.py`), the residual norms (`norm.py`: bf16
   for Qwen and Llama, fp32 for Gemma) and Llama's and Qwen3's attention (`attn.py`), writing the caches the decode

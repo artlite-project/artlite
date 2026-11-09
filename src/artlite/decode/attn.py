@@ -1,7 +1,8 @@
 """The attention cores of the decode overlays on host-built transactions (Gemma 4: ``gemma4/decode.py``, Llama and
-Qwen3: ``llama/decode.py``): per step S <= 4 token slots at positions p .. p + S - 1, a model's head dims (one or two
-kinds of layer: Gemma's sliding-window 256 / full 512, Llama's 64 or 128), RoPE on the dim pairs (i, i + hd / 2) of
-i < rot (per kind), scores in log2 units: q k times a constant per layer (the F_ATT object's: Gemma q_norm k_norm
+Qwen3: ``llama/decode.py``, LFM3: ``lfm/decode.py``): per step S <= 4 token slots at positions p .. p + S - 1, one or two
+kinds of layer (Gemma's sliding-window head_dim 256 / full 512, Llama's one of 64 or 128, LFM3's sliding-window and full
+of one head_dim 128, told apart by their rotated pairs: the F_ATT object's kind), RoPE on the dim pairs (i, i + hd / 2)
+of i < rot (per kind), scores in log2 units: q k times a constant per layer (the F_ATT object's: Gemma q_norm k_norm
 log2(e) with q and k RMS-normed per head, ``Attn(qk_norm=True)``; Llama log2(e) / sqrt(hd), Qwen3 too, with q and k
 RMS-normed per head and times their weights per dim before RoPE, ``qk_weights``), v as it is or RMS-normed without a
 weight (``v_norm``).
@@ -40,6 +41,11 @@ positions as the K objects come, then per open record its V panels and its ring 
 before o; the next sub-step reads them from DDR. D objects: ``d_len`` bf16 (min(256, head_dim) bytes: every record,
 ring slot and o is a whole number of them).
 
+LFM3's gate (``Attn(gate=)``): per head a sigmoid of the q object's gate logit times o, folded into l (l (1 + 2^(-g
+log2 e)), the softmax's exp2). Its operator cores also run the conv layers' step between attention layers (``Attn(conv=)``,
+``models.lfm.conv``), and their program is code pages (``Attn(pages=)``, ``page_entries``: the worker's kernels resident
+stubs of three pages, the memtile transport of ``operators.paging``).
+
 With one head dim (Llama) the softmax and P V run per octet (two sets' 8 rows): P of a group's records by kmath's
 bias-192 exp2 (masked scores -16384; P 0 below m - 63.5 and past the sub-step's rows) as [P hi | P lo] panels of the
 8 rows, and P V of a record pair as P hi and P lo two MMULs per record into one 8-row accumulator, each V panel popped
@@ -58,6 +64,7 @@ its tail objects).
 """
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 from aie.iron import Buffer, Kernel, ObjectFifo, Worker
@@ -65,6 +72,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
+from ..operators import paging
 from ..operators.base import JINJA_ENV
 from ..operators.design import COLS
 from ..operators.util import Attr, bf16_bits, bf16_hilo, regions, rup
@@ -811,6 +819,9 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     const int flags = m[{{ M_FLAGS }}];
     for (int i = 0; i < {{ A_P }}; i++)
         st[i] = 0;
+{% if CONV %}
+    st[{{ A_WORDS }}] = 0;  // (the conv's loop count)
+{% endif %}
     if (flags & {{ F_MAIN }}) {
         if (!(flags & {{ F_LOADR }})) {  // its input objects (under its norm-weight objects), its tiles
             const int nx = m[{{ M_NX }}], S = m[{{ M_NS }}], lper = S == 1 ? 2 : (S == 2 ? 1 : 0);
@@ -837,6 +848,11 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         tk[1] = m[{{ M_TOK_NA }} + col] >> 16;
         tk[2] = m[{{ M_TOK_NA }} + col] & 0xFFFF;
         tk[3] = (m[{{ M_POS }}] << 8) | (m[{{ M_TOK_A }}] << 4) | m[{{ M_NS }}];
+{% if CONV %}
+        if (t == 0) {  // (the step's words of the conv)
+            {{ CONV_TOK }}
+        }
+{% endif %}
         const float *__restrict src = (const float *)(x + {{ 2 * META }});
 {% if ROT|length == 2 %}
         float *__restrict cs = AW(float, {{ a.cs }}) + (kind ? {{ 2 * SMAX * ROT[0] }} : 0);
@@ -851,6 +867,12 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         return;
     }
     if (!(flags & {{ F_ATT }})) {
+{% if CONV %}
+        if (flags & {{ CONV_FLAG }}) {  // (a conv region's first object: its job)
+            {{ CONV_BEGIN }}
+            return;
+        }
+{% endif %}
         st[{{ A_NXSKIP }}] = m[{{ M_SKIP }}];
         return;
     }
@@ -863,6 +885,9 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_HD }}] = hd;
     st[{{ A_OWN }}] = m[{{ M_AOWN }}];
     st[{{ A_WIN }}] = m[{{ M_AWIN }}];
+{% if ROT|length == 2 and ONE_HD %}
+    st[{{ A_KIND }}] = m[{{ M_AKIND }}];
+{% endif %}
     st[{{ A_TREC }}] = m[{{ M_ATREC }}];
     st[{{ A_QC }}] = m[{{ M_QC_HI }}] | (m[{{ M_QC_LO }}] << 16);
     st[{{ A_NH }}] = nq;
@@ -882,7 +907,9 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_QS }}] = 0;
     // the F_ATT object is the sub-step's first q object: its heads into qa (free by now), ``aq0`` once the chain lets
     // the column's q rows overwrite its last partial (the east neighbour merged it)
-{% if QK_W %}
+{% if GATE %}
+    al::copy<{{ GOFF + 64 * CHAIN }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd] | q_norm hd fp32 | gates)
+{% elif QK_W %}
     al::copy<{{ QCOPY + 2 * HDS[0] }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd] | q_norm hd fp32)
 {% else %}
     al::copy<{{ QCOPY }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd])
@@ -903,17 +930,33 @@ __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
     st[{{ A_XL }}] = left - n;
 }
 
+{% if GATE %}
+// A q object's gate logits (bf16: the heads of chain column c at g + 64 c, {{ GPER }} each) -> 1 + 2^(-g log2 e) per head at gt
+// (the softmax's exp2, bf16-level): l times it, o = y sigmoid(g) / l
+__attribute__((noinline, minsize)) void {{ p }}_gates(const bfloat16 *__restrict g, float *__restrict gt)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::vector<bfloat16, 64> v = aie::zeros<bfloat16, 64>();
+{% for h in range(GPER * CHAIN) %}
+    v[{{ h }}] = g[{{ 64 * (h // GPER) + h % GPER }}];
+{% endfor %}
+    const aie::vector<float, 64> a = aie::mac(aie::mul(v, aie::broadcast<bfloat16, 64>(-1.4453125f)), v,
+                                              aie::broadcast<bfloat16, 64>(0.00262451171875f)).template to_vector<float>();
+    aie::store_v(gt, aie::add({{ exp2 }}(a).template extract<4>(0), aie::broadcast<float, 4>(1.0f)));  // (16 B apart)
+}
+
+{% endif %}
 // The next q object (slot s of the sub-step, the step's a + s: [head nh][hd]): its heads {{ "normed and " if QK_NORM else "" }}rotated into the
 // query rows (row s nh + h)
-__attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws)
+__attribute__((minsize)) void {{ p }}_aq{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     {{ p }}_AWin<{{ WINS['aq'] }}> win_;
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int s = st[{{ A_QS }}], nh = st[{{ A_NH }}], hd = st[{{ A_HD }}];
     st[{{ A_QS }}] = s + 1;
 {% if ROT|length == 2 %}
-    const int rot = hd == {{ HDS[0] }} ? {{ ROT[0] }} : {{ ROT[1] }};
-    const float *__restrict cs = AW(float, {{ a.cs }}) + (hd == {{ HDS[0] }} ? 0 : {{ 2 * SMAX * ROT[0] }}) + 2 * rot * (st[{{ A_SA }}] + s);
+    const int rot = {{ K0 }} ? {{ ROT[0] }} : {{ ROT[1] }};
+    const float *__restrict cs = AW(float, {{ a.cs }}) + ({{ K0 }} ? 0 : {{ 2 * SMAX * ROT[0] }}) + 2 * rot * (st[{{ A_SA }}] + s);
 {% else %}
     const int rot = {{ ROT[0] }};
     const float *__restrict cs = AW(float, {{ a.cs }}) + 2 * rot * (st[{{ A_SA }}] + s);
@@ -921,12 +964,15 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
     AIE_LOOP_NO_UNROLL
     for (int h = 0; h < nh; h++)
         {{ p }}_nrope(x + {{ 2 * META }} + hd * h, cs, AW(float, {{ a.y }}) + hd * (nh * s + h), hd, rot{{ ", (const float *)(x + %d)" % (2 * META + QCOPY) if QK_W else "" }});
+{% if GATE %}
+    {{ p }}_gates(x + {{ 2 * META + GOFF }}, AW(float, {{ a.gt }}) + nh * s);
+{% endif %}
 }
 
 // The sub-step's first q object, as abegin left it in qa
-__attribute__((minsize)) void {{ p }}_aq0(int32_t *__restrict ws)
+__attribute__((minsize)) void {{ p }}_aq0{{ X }}(int32_t *__restrict ws)
 {
-    {{ p }}_aq(AW(bfloat16, {{ a.qa }}) - {{ 2 * META }}, ws);
+    {{ p }}_aq{{ X }}(AW(bfloat16, {{ a.qa }}) - {{ 2 * META }}, ws);
 }
 
 // {{ DB }} d-blocks of a set's 4 q rows (fp32, rows rs apart from q; rows past nv zero) times the score constant qc (bf16 hi |
@@ -960,7 +1006,7 @@ __attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *
 
 // The q rows are in: the Q panels of every set, scaled by the score constant (rows past S nh zero), y = 0, the running
 // maxima (a floor below any score: a row without positions here keeps l = 0) and sums
-__attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
+__attribute__((minsize)) void {{ p }}_aqpan{{ X }}(int32_t *__restrict ws)
 {
     {{ p }}_AWin<{{ WINS['aqpan'] }}> win_;
     const int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -982,7 +1028,7 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
 
 // The raw K, V object of the next slot ([K hd | V hd]): its K ({{ "normed, " if QK_NORM else "" }}rotated) as {{ "hi + lo blocks" if KP == 2 else "bfp16 blocks" }} (mantissas: 64 B per 8
 // blocks, then the exponents), its V ({{ "normed" if V_NORM else "as it is" }}) bf16
-__attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t kvh)
+__attribute__((minsize)) void {{ p }}_akv{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t kvh)
 {
     {{ p }}_AWin<{{ WINS['akv'] }}> win_;
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -990,8 +1036,8 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
     const int s = st[{{ A_KS }}], hd = st[{{ A_HD }}], nd = hd >> 3;
     st[{{ A_KS }}] = s + 1;
 {% if ROT|length == 2 %}
-    const int rot = hd == {{ HDS[0] }} ? {{ ROT[0] }} : {{ ROT[1] }};
-    const float *__restrict cs = AW(float, {{ a.cs }}) + (hd == {{ HDS[0] }} ? 0 : {{ 2 * SMAX * ROT[0] }}) + 2 * rot * (st[{{ A_SA }}] + s);
+    const int rot = {{ K0 }} ? {{ ROT[0] }} : {{ ROT[1] }};
+    const float *__restrict cs = AW(float, {{ a.cs }}) + ({{ K0 }} ? 0 : {{ 2 * SMAX * ROT[0] }}) + 2 * rot * (st[{{ A_SA }}] + s);
 {% else %}
     const int rot = {{ ROT[0] }};
     const float *__restrict cs = AW(float, {{ a.cs }}) + 2 * rot * (st[{{ A_SA }}] + s);
@@ -1033,7 +1079,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
 
 // A cache object (i = {{ KP + 1 }} k + ph of the column's group k: K objects ph < {{ KP }}, the V object ph {{ KP }}), or at the chain's end
 // one of its last tails (``tobj``); st[A_NE]: the D objects of the records to emit from it
-__attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
+__attribute__((minsize)) void {{ p }}_aobj{{ X }}(uint8_t *__restrict a, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -1070,7 +1116,7 @@ __attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__res
 
 // The next D object of a record to emit (A_EOFF0, A_EOFF1: the records' L1 addresses, in the cache object a or the
 // workspace)
-__attribute__((minsize)) void {{ p }}_arec(const uint8_t *__restrict a, int32_t *__restrict ws, bfloat16 *__restrict d)
+__attribute__((minsize)) void {{ p }}_arec{{ X }}(const uint8_t *__restrict a, int32_t *__restrict ws, bfloat16 *__restrict d)
 {
     {{ p }}_AWin<{{ WINS['arec'] }}> win_;
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -1085,7 +1131,7 @@ __attribute__((minsize)) void {{ p }}_arec(const uint8_t *__restrict a, int32_t 
 // chain continues from it; at the chain's end o = y / l into the Q panels' region (free by now): [k block (head, 8
 // dims)][slot S][8] bf16, the sub-step's slots of the O projection's packed input (the drain puts them at slot a);
 // st[A_NE]: its D objects
-__attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw)
+__attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const int32_t *__restrict pw)
 {
     {{ p }}_AWin<{{ WINS['aend'] }}> win_;
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -1120,7 +1166,13 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < (st[{{ A_CEND }}] ? nsets : 0); set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + 32 * (nd + 1) * set + 32 * nd;
+{% if GATE %}
+        aie::vector<float, 16> gs = aie::broadcast<float, 16>(1.0f);  // (rows 4 set ..: 1 + e^-g)
+        gs.insert(0, aie::load_v<4>(AW(float, {{ a.gt }}) + 4 * set));
+        const aie::vector<float, 32> il = al::rows4(aie::inv(al::mulff<16>(al::sum8(aie::load_v<32>(l)), gs)));
+{% else %}
         const aie::vector<float, 32> il = al::rows4(aie::inv(al::sum8(aie::load_v<32>(l))));
+{% endif %}
         bfloat16 *po[4];
         for (int q = 0; q < 4; q++) {  // row 4 set + q: slot r / nh, head r % nh (a row past the slots: kf, scratch)
             const int r = 4 * set + q;
@@ -1140,7 +1192,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
 }
 
 // The next D object of o (``aend``)
-__attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict d)
+__attribute__((minsize)) void {{ p }}_aemit{{ X }}(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
     {{ p }}_AWin<{{ WINS['aemit'] }}> win_;
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -1154,33 +1206,140 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
 }
 
 }  // extern "C"
+{% if PAGED %}
+
+// Paging (``artlite.operators.paging``, the memtile transport): the worker's kernels above are resident stubs of the
+// pages' code - page 1 the query's preparation (aq0, aq, aqpan, akv), page 2 the attention over the cache (aobj, arec,
+// aend, aemit){{ ", page 3 the conv (cobj, cemit)" if CONV else "" }} - each entered through its dispatcher (the state words' entry)
+{{ PAGER }}
+
+namespace {
+
+// The constant data the pages' code reads, read in the pager's slow path (``paging.link``: page code may read only data
+// the resident code has)
+__attribute__((noinline)) void {{ p }}_keep(v64int8 *o)
+{
+    const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();
+    o[0] = a.mantissa;
+    o[1] = b.mantissa;
+    *(v8int8 *)(o + 2) = a.exponent;
+    *((v8int8 *)(o + 2) + 1) = b.exponent;
+}
+
+// page ``page`` into program memory unless the state words name it
+__attribute__((noinline)) void {{ p }}_need(int page, int32_t *__restrict ws)
+{
+    if (((const volatile int32_t *){{ PG.state }})[0] != page) {
+        {{ p }}_keep(AW(v64int8, {{ a.keep }}));
+        {{ p }}_pg_request((int32_t){{ PG.hdr }}u, (int32_t){{ PG.ctl }}u, {{ PG.bd0 }} + page - 1);
+    }
+}
+
+[[clang::always_inline]] inline void {{ p }}_enter(int page, int op, void *a, int32_t *ws, void *d)
+{
+    {{ p }}_need(page, ws);
+    ((void (*)(int, void *, int32_t *, void *))(intptr_t)((const volatile int32_t *){{ PG.state }})[1])(op, a, ws, d);
+}
+
+}  // namespace
+
+extern "C" {
+
+// (the pages' entries: external, so that they stay in the object for ``paging.link``)
+void {{ p }}_pgprep(int op, void *a, int32_t *ws, void *d)
+{
+    if (op == 0)
+        {{ p }}_aq0_x(ws);
+    else if (op == 1)
+        {{ p }}_aq_x((const bfloat16 *)a, ws);
+    else if (op == 2)
+        {{ p }}_aqpan_x(ws);
+    else
+        {{ p }}_akv_x((const bfloat16 *)a, ws, (int32_t)(intptr_t)d);
+}
+
+void {{ p }}_pgmain(int op, void *a, int32_t *ws, void *d)
+{
+    if (op == 0)
+        {{ p }}_aobj_x((uint8_t *)a, ws);
+    else if (op == 1)
+        {{ p }}_arec_x((const uint8_t *)a, ws, (bfloat16 *)d);
+    else if (op == 2)
+        {{ p }}_aend_x(ws, (const int32_t *)d);
+    else
+        {{ p }}_aemit_x(ws, (bfloat16 *)d);
+}
+{% if CONV %}
+
+void {{ p }}_pgconv(int op, void *a, int32_t *ws, void *d)
+{
+    if (op == 0)
+        {{ p }}_cobj_x((const bfloat16 *)a, ws);
+    else
+        {{ p }}_cemit_x(ws, (bfloat16 *)d);
+}
+{% endif %}
+
+__attribute__((minsize)) void {{ p }}_aq0(int32_t *__restrict ws) { {{ p }}_enter(1, 0, nullptr, ws, nullptr); }
+__attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws) { {{ p }}_enter(1, 1, (void *)x, ws, nullptr); }
+__attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws) { {{ p }}_enter(1, 2, nullptr, ws, nullptr); }
+__attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t kvh)
+{
+    {{ p }}_enter(1, 3, (void *)x, ws, (void *)(intptr_t)kvh);
+}
+__attribute__((minsize)) void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws) { {{ p }}_enter(2, 0, a, ws, nullptr); }
+__attribute__((minsize)) void {{ p }}_arec(const uint8_t *__restrict a, int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_enter(2, 1, (void *)a, ws, d);
+}
+__attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw) { {{ p }}_enter(2, 2, nullptr, ws, (void *)pw); }
+__attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(2, 3, nullptr, ws, d); }
+{% if CONV %}
+__attribute__((minsize)) void {{ p }}_cobj(const bfloat16 *__restrict x, int32_t *__restrict ws) { {{ p }}_enter(3, 0, (void *)x, ws, nullptr); }
+__attribute__((minsize)) void {{ p }}_cemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(3, 1, nullptr, ws, d); }
+{% endif %}
+
+}  // extern "C"
+{% endif %}
 """)
 
 
 class Attn:
-    """The attention cores' shapes: the head dims ``hds`` (one per kind of layer, at most two) and their rotated pairs
-    ``rot``, ``chain`` columns per KV head (COLS / chain KV heads), at most ``heads`` query heads per KV head (a layer's:
-    the F_ATT object's M_ANH), ``kp`` K panels per record (2: hi + lo, 1: single), RMS norms of q / k (``qk_norm``: the
-    weight folded into the score constant; ``qk_weights``: a weight per dim, Qwen3's, hd fp32 after the q heads of
-    every q object and after [K | V] of every raw K / V object, one head dim) and of v (``v_norm``), the cache objects of
-    ``a_bytes`` (the A stream's)."""
+    """The attention cores' shapes: the kinds of layer (at most two) by their rotated pairs ``rot`` and head dims ``hds``
+    (one per kind, or one for both: the F_ATT object's M_AKIND tells a layer's kind), ``chain`` columns per KV head
+    (COLS / chain KV heads), at most ``heads`` query heads per KV head (a layer's: the F_ATT object's M_ANH), ``kp`` K
+    panels per record (2: hi + lo, 1: single), RMS norms of q / k (``qk_norm``: the weight folded into the score
+    constant; ``qk_weights``: a weight per dim, Qwen3's, hd fp32 after the q heads of every q object and after [K | V] of
+    every raw K / V object, one head dim) and of v (``v_norm``), a sigmoid output gate per head (``gate``: its logits in
+    the q objects, ``goff``; the chain's end emits o = y sigmoid(g) / l), the cache objects of ``a_bytes`` (the A
+    stream's). ``conv``: a second job of the cores between attention layers (LFM3's short convolution,
+    ``models.lfm.conv.ConvJob``: its kernels, its state words after A_WORDS, its workspace over the attention's scratch,
+    its X objects from one with its ``flag``, its outputs on D). ``pages``: the cores' code as pages (a program beyond 16
+    KB: ``PAGES``), the memtile transport's words (``AttnPages``)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
-                 c_len: int = 64):
-        assert 1 <= len(hds) <= 2 and len(rot) == len(hds) and all(hd % 64 == 0 and hd <= 512 for hd in hds), hds
-        assert all(r % 32 == 0 and r <= hd // 2 for r, hd in zip(rot, hds)) and kp in (1, 2)
+                 c_len: int = 64, gate: bool = False, conv: object = None, pages: object = None):
+        assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
+        assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and 1 <= heads <= 4, (chain, heads)
         assert not qk_weights or (qk_norm and not v_norm and len(hds) == 1), "per-dim weights: q / k norms, one head dim"
+        assert not gate or (len(hds) == 1 and heads % chain == 0), "gates: one head dim, a chain column's heads alike"
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
-        self.qk_weights = qk_weights
+        self.qk_weights, self.gate, self.conv, self.pages = qk_weights, gate, conv, pages
         self.kv_heads = COLS // chain
         self.d_len = min(256, min(hds)) // 2  # (bf16 of a D object: every record, ring slot and o in whole objects)
         self.kper = {hd: Records(hd, kp).kper(a_bytes) for hd in hds}  # K records per K object
         self.rg = {hd: Records(hd, kp).rg(a_bytes) for hd in hds}  # records per group
         self.pg = {hd: Records(hd, kp).pg(a_bytes) for hd in hds}  # positions per group
         assert all(k > 0 and self.rg[hd] % 2 == 0 for hd, k in self.kper.items()), self.kper
+
+    @property
+    def goff(self) -> int:
+        """(``gate``) Where a q object's gate logits start (bf16 elements of its payload): after its heads (and the q
+        norm's weights); chain column c's heads' at goff + 64 c (a C object each: the qkv phase's last of the column)."""
+        return self.heads * self.hds[0] + (2 * self.hds[0] if self.qk_weights else 0)
 
     @staticmethod
     def rows(hd: int) -> int:
@@ -1208,11 +1367,18 @@ class Attn:
         rg = max(self.rg.values())
         sets = max(self.rows(hd) // 4 for hd in self.hds)
         kb = max(self.kb_slot * SMAX, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
-        sizes = [("st", 4 * A_WORDS), ("cs", 4 * 2 * SMAX * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
+        words = A_WORDS + (self.conv.words if self.conv is not None else 0)
+        sizes = [("st", 4 * words), ("cs", 4 * 2 * SMAX * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
                  ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SMAX), ("sc", 4 * 32 * rg * sets),
                  ("pp", self.ppo * sets // 2 if len(self.hds) == 1 else 72 * rg), ("m", 4 * 32 * sets)]
+        if self.gate:
+            sizes.append(("gt", 4 * 4 * sets))  # (1 + e^-g per query row)
+        if self.pages is not None:
+            sizes.append(("keep", 192))  # (the pager's slow path: the pages' constant data read into it)
         out = regions(sizes)
         assert 16 * hm <= qa and 2 * self.heads * hm <= qa  # (a record's rows; the first q object's heads)
+        assert not self.gate or 2 * (self.goff + 64 * self.chain) <= qa  # (and its gates)
+        assert self.conv is None or out["size"] - out["y"] >= self.conv.need, (out, self.conv.need)  # (the conv's)
         return out
 
     @property
@@ -1229,13 +1395,19 @@ class Attn:
     def render(self, p: str, consts: dict[str, int], win: str = "") -> str:
         nd_min = min(32, min(self.hds) // 8)
         hds = self.hds
+        ws = self.workspace()
+        conv = self.conv
+        pg = self.pages
+        X = "_x" if pg is not None else ""
+        src = "" if conv is None else conv.render(p, base=ws["y"], st=ws["st"], X=X, consts={
+            k: v for k, v in globals().items() if k[:2] in ("A_", "M_")})
 
         def by(var: str, vals: dict[int, object], key: object = lambda hd: hd) -> str:  # (a value per head dim)
             if len(hds) == 1:
                 return str(vals[hds[0]])
             return f"{var} == {key(hds[0])} ? {vals[hds[0]]} : {vals[hds[1]]}"
 
-        return _SRC.render(p=p, a=Attr(self.workspace()), eps=repr(self.eps), SMAX=SMAX, ROT=self.rot, HDS=hds,
+        return src + _SRC.render(p=p, a=Attr(ws), eps=repr(self.eps), SMAX=SMAX, ROT=self.rot, HDS=hds,
                            WINS=WINS, KPER=self.kper, RG=self.rg, RG_MAX=max(self.rg.values()), D_LEN=self.d_len,
                            D_SHIFT=int(math.log2(2 * self.d_len)), WIN=WINS.get(win, 0), Y_FLOATS=self.y_floats(),
                            KB_SLOT=self.kb_slot, KP=self.kp, DB=nd_min, ND_MIN=nd_min, ONE_HD=len(hds) == 1,
@@ -1243,16 +1415,22 @@ class Attn:
                            ND=hds[0] // 8,
                            MINT="" if nd_min >= 32 else f"<{nd_min}>", VPUT="" if nd_min >= 32 else f"<0, {nd_min}>",
                            QK_NORM=self.qk_norm, QK_W=self.qk_weights, V_NORM=self.v_norm, CHAIN=self.chain,
-                           QCOPY=self.heads * max(hds),
+                           QCOPY=self.heads * max(hds), GATE=self.gate, GOFF=self.goff if self.gate else 0,
+                           GPER=self.heads // self.chain,
+                           K0=f"hd == {hds[0]}" if len(hds) == 2 else f"st[{A_KIND}] == 0",
+                           CONV=conv is not None, CONV_FLAG=conv.flag if conv else 0, X=X, PAGED=pg is not None, PG=pg,
+                           PAGER=paging.source(p, wake=pg.wake, request=True) if pg is not None else "",
+                           CONV_BEGIN=conv.begin_src(p) if conv else "", CONV_TOK=conv.token_src(A_WORDS) if conv else "",
                            NH_POW2=self.heads in (1, 2, 4), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
                            **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k[:2] in ("A_", "M_")}))
 
-    def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1
-                ) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
+    def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1,
+                extra: dict[int, list] | None = None) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
         """The attention cores' workers on row ``row`` and their D streams (column, ObjectFifo) on the decode design's
         shared streams ``s`` (``decode.design._Streams``; kernel prefix s.p, object names from ``prefix``); ``a_depth``:
-        their A objects in L1 (2: the next cache object arrives while the core works on one)."""
+        their A objects in L1 (2: the next cache object arrives while the core works on one); ``extra``: per column
+        buffers of the core that its kernels reach through their addresses (the pager's state words)."""
         p, P, chain = s.p, prefix, self.chain
         bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
         x_ty, a_ty = s.x_ty, s.a_ty
@@ -1271,6 +1449,11 @@ class Attn:
         k_arec = Kernel(f"{p}_arec", "kernel.o", [a_ty, aws_ty, d_ty])
         k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
         k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, d_ty])
+        conv = self.conv
+        k_conv = [Kernel(f"{p}_cobj", "kernel.o", [x_ty, aws_ty]), Kernel(f"{p}_cemit", "kernel.o", [aws_ty, d_ty])] \
+            if conv is not None else []
+        if conv is not None:
+            assert conv.d_bytes == 2 * self.d_len, (conv.d_bytes, self.d_len)
 
         def attn_fn(a_f, x_f, d_f, *rest):
             # tl / tr: the chain's tokens from the west neighbour / to the east one (columns chain h .. chain h + chain
@@ -1278,9 +1461,11 @@ class Attn:
             # one merged it), consumes tl around its end (the merge of the west partial, pw)
             rest = list(rest)
             col = rest.pop()
+            del rest[len(rest) - len((extra or {}).get(col, [])):]
             j = col % chain
             tl = rest.pop(0) if j > 0 else None
             tr = rest.pop(0) if j < chain - 1 else None
+            cobj, cemit = (rest.pop(10), rest.pop(10)) if conv is not None else (None, None)
             abegin, anb, aq, aq0, aqpan, akv, aobj, arec, aend, aemit, ws, pw = rest
             for _ in forever_():
                 x = x_f.acquire(1)
@@ -1334,6 +1519,16 @@ class Attn:
                         d = d_f.acquire(1)
                         aemit(ws, d)
                         d_f.release(1)
+                if conv is not None:
+                    for _ in range_(ws[i_a + A_WORDS]):  # (a conv step: the region's other objects, then its D objects)
+                        for _ in range_(ws[i_a + A_WORDS + 1]):
+                            x = x_f.acquire(1)
+                            cobj(x, ws)
+                            x_f.release(1)
+                        for _ in range_(ws[i_a + A_NE]):
+                            d = d_f.acquire(1)
+                            cemit(ws, d)
+                            d_f.release(1)
 
         aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AW["size"] // 4, np.int32),
                       tile=Tile(c, row)) for c in range(COLS)]
@@ -1346,9 +1541,36 @@ class Attn:
             links = ([toks[c - 1].cons()] if j > 0 else []) + ([toks[c].prod()] if j < chain - 1 else [])
             workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=a_depth), s.x_l1[c].cons(depth=1), d.prod(), *links,
                                             k_abegin, k_anb, k_aq, k_aq0, k_aqpan, k_akv, k_aobj, k_arec, k_aend, k_aemit,
-                                            aws[c], aws[c - 1] if j > 0 else aws[c], c],
+                                            *k_conv, aws[c], aws[c - 1] if j > 0 else aws[c],
+                                            *(extra or {}).get(c, []), c],
                                   tile=Tile(c, row), stack_size=stack, dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
+
+
+@dataclass(frozen=True)
+class AttnPages:
+    """Where the attention cores' pages come from (``Attn(pages=)``, the memtile transport: ``paging``): the pager's
+    state words (a core address), its wake lock (a core lock id), the stream header of the core's request route and the
+    control header of its memtile channel's start queue (``paging.request``), the BD of its first page."""
+
+    state: int
+    wake: int
+    hdr: int
+    ctl: int
+    bd0: int
+
+
+def page_entries(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
+    """The attention cores' pages (``paging.link``'s ``pages``, page ids from 1 in this order): the query's preparation,
+    the attention over the cache, the conv job's."""
+    return {"prep": (f"{p}_pgprep",), "main": (f"{p}_pgmain",), **({"conv": (f"{p}_pgconv",)} if conv else {})}
+
+
+def page_calls(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
+    """The resident stubs' calls of the pages' entries (``paging.link``'s ``calls``)."""
+    out = {f"{p}_{k}": (f"{p}_pgprep",) for k in ("aq0", "aq", "aqpan", "akv")}
+    out |= {f"{p}_{k}": (f"{p}_pgmain",) for k in ("aobj", "arec", "aend", "aemit")}
+    return out | ({f"{p}_{k}": (f"{p}_pgconv",) for k in ("cobj", "cemit")} if conv else {})
 
 
 # ----------------------------------------------------------------------

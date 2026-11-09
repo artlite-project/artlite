@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 
 import jinja2.ext
 import jinja2.sandbox
@@ -299,11 +299,22 @@ def _tojson(value: object, ensure_ascii: bool = False, indent: int | None = None
     return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
 
+class _Generation(jinja2.ext.Extension):
+    """``{% generation %} .. {% endgeneration %}``: transformers' marker of the assistant's tokens (its training masks;
+    LFM3's template), rendered as its body."""
+
+    tags: ClassVar[set[str]] = {"generation"}
+
+    def parse(self, parser: jinja2.parser.Parser) -> list[jinja2.nodes.Node]:
+        next(parser.stream)
+        return parser.parse_statements(("name:endgeneration",), drop_needle=True)
+
+
 @functools.lru_cache(maxsize=16)
 def _compiled(template: str) -> jinja2.Template:
     """A chat template compiled (~10 ms: once per template, not per request)."""
     env = jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                                       extensions=[jinja2.ext.loopcontrols])
+                                                       extensions=[jinja2.ext.loopcontrols, _Generation])
     env.filters["tojson"] = _tojson
     env.globals["raise_exception"] = _raise
     env.globals["strftime_now"] = lambda fmt: datetime.now().astimezone().strftime(fmt)

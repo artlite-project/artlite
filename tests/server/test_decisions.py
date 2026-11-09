@@ -307,12 +307,12 @@ def test_llama_server_prompts(name: str) -> None:
     """The files' prompts as llama-server tokenizes them (their token counts: its usage), from the files' templates."""
     from artlite.gguf_model import GGUFFile
     from artlite.model_config import decision_gguf
-    from models.tokenizer import QwenTokenizer
+    from models.tokenizer import BpeTokenizer
 
     path = decision_gguf(name)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
-    encode = QwenTokenizer(GGUFFile(path)).encode
+    encode = BpeTokenizer(GGUFFile(path)).encode
     d = Decisions.of(path, encode)
     for body, tokens in RECORDED:
         prompts = d.prompts(d.state(body)[0], d.questions(body), encode)

@@ -1,5 +1,5 @@
 """Model architectures from the metadata of a GGUF file (:class:`LlamaConfig`, :class:`GemmaConfig`,
-:class:`QwenConfig`), and where model files live.
+:class:`QwenConfig`, :class:`LfmConfig`), and where model files live.
 
 Model directories live under :data:`MODELS_DIR` (``ARTLITE_MODELS_DIR``) as ``<org>/<repository>/`` (the Hugging Face
 repository a file comes from):
@@ -105,6 +105,15 @@ def qwen3_gguf(name: str = "0.6B") -> str:
     """A GGUF file of the ``qwen3`` architecture: Qwen3 0.6B (``"0.6B"``: unsloth's Q4_1), Qwen's Qwen3-Embedding 0.6B
     (Q8_0) and 4B (Q4_K_M), ggml-org's Qwen3-Reranker-0.6B (Q8_0)."""
     return os.path.join(MODELS_DIR, QWEN3_FILES[name])
+
+
+LFM3_QUANTS = ("QAD-Q4_0", "Q4_K_M", "Q8_0", "BF16")
+
+
+def lfm3_gguf(quant: str = "QAD-Q4_0") -> str:
+    """A file of LiquidAI's LFM3-1.7B GGUF repository: ``QAD-Q4_0`` (Liquid's quantization-aware-distilled Q4_0 layers,
+    a Q6_K embedding), ``Q4_K_M``, ``Q8_0``, ``BF16``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-1.7B-GGUF", f"LFM3-1.7B-{quant}.gguf")
 
 
 DECISION_FILES = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
@@ -336,6 +345,112 @@ class GemmaConfig:
         if not swa and self.rope_freq_factors is not None:
             inv = inv / np.asarray(self.rope_freq_factors[:d // 2], np.float64)
         return inv
+
+
+@dataclass(frozen=True)
+class LfmConfig:
+    """Architecture of a LiquidAI LFM3 model, from the metadata of its GGUF file (llama.cpp's ``src/models/lfm3.cpp``,
+    ``lfm-base.cpp``).
+
+    Every layer is [operator | SwiGLU FFN] with sandwich norms (``h = x + post(op(norm(x)))``, the same for the FFN,
+    scale 1). The operator by ``kinds[l]``: "conv" (a short convolution: ``in_proj`` -> [B; C; x], y = C *
+    conv(B * x) over the last ``conv_width`` positions per channel, ``out_proj``), "swa" (attention over the last
+    ``sliding_window`` positions, RoPE base ``rope_base_swa`` on every pair) or "full" (attention over all positions,
+    RoPE base ``rope_base`` on the pairs whose ``rope_freq_factors`` is not 1e30: ``rot_full`` pairs). Attention:
+    ``num_attention_heads`` query heads over ``num_key_value_heads`` KV heads of ``head_dim``, q / k RMS-normed per
+    head with a weight per dim before RoPE (NeoX pairs: dims i, i + head_dim / 2), a sigmoid output gate per head
+    (``attn_gate``: hidden -> heads, o_h *= sigmoid(x w_h) of the operator's normed input). The LM head is
+    ``token_embd``. ``causal`` False (d1 decision models): the full-attention layers see the whole prompt, the SWA and
+    conv layers stay causal."""
+
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    kinds: tuple[str, ...]
+    sliding_window: int
+    conv_width: int
+    rms_norm_eps: float
+    rope_base: float
+    rope_base_swa: float
+    rope_freq_factors: tuple[float, ...] | None
+    max_position_embeddings: int
+    eos_token_ids: tuple[int, ...]
+    sampling: dict[str, float]
+    causal: bool = True
+
+    ARCHS: ClassVar[tuple[str, ...]] = ("lfm3",)
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> LfmConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch in cls.ARCHS, f"{gguf.path}: architecture {gguf.arch!r}, expected one of {cls.ARCHS}"
+        m = gguf.arch_meta
+        n = int(m("block_count"))
+        kv = [int(x) for x in m("attention.head_count_kv")]
+        swa = [bool(x) for x in m("attention.sliding_window_pattern")]
+        kinds = tuple("conv" if kv[i] == 0 else "swa" if swa[i] else "full" for i in range(n))
+        hd = int(m("attention.key_length"))
+        assert int(m("attention.value_length")) == hd and int(m("rope.dimension_count", hd)) == hd
+        assert "blk.0.post_attention_norm.weight" in gguf, "LFM3 without sandwich norms"
+        heads_kv = {x for x in kv if x}
+        assert len(heads_kv) == 1, kv
+        vocab = gguf.string_count("tokenizer.ggml.tokens")
+        tail = max(0, vocab - 4096)
+        eos = [int(gguf.meta["tokenizer.ggml.eos_token_id"])]
+        eos += [i for i, t in enumerate(gguf.strings("tokenizer.ggml.tokens", tail), tail)
+                if t in ("<|im_end|>", "<|endoftext|>")]
+        freqs = gguf.tensor("rope_freqs.weight").raw.reshape(-1) if "rope_freqs.weight" in gguf else None
+        return cls(
+            vocab_size=vocab,
+            hidden_size=int(m("embedding_length")),
+            intermediate_size=int(m("feed_forward_length")),
+            num_hidden_layers=n,
+            num_attention_heads=int(m("attention.head_count")),
+            num_key_value_heads=heads_kv.pop(),
+            head_dim=hd,
+            kinds=kinds,
+            sliding_window=int(m("attention.sliding_window")),
+            conv_width=int(m("shortconv.l_cache")),
+            rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")),
+            rope_base=float(m("rope.freq_base")),
+            rope_base_swa=float(m("rope.freq_base_swa", 10000.0)),
+            rope_freq_factors=None if freqs is None else tuple(float(x) for x in freqs),
+            max_position_embeddings=int(m("context_length")),
+            eos_token_ids=tuple(dict.fromkeys(eos)),
+            sampling={k: float(gguf.meta[f"general.sampling.{k}"])
+                      for k in ("top_k", "top_p", "temp", "penalty_repeat", "penalty_last_n")
+                      if f"general.sampling.{k}" in gguf.meta},
+            causal=bool(m("attention.causal", True)),
+        )
+
+    def layers(self, kind: str) -> list[int]:
+        """The layers of a kind ("conv", "swa", "full"; "attn": both attention kinds)."""
+        return [i for i, k in enumerate(self.kinds) if k == kind or (kind == "attn" and k != "conv")]
+
+    @property
+    def q_per_kv(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
+
+    @property
+    def rot_full(self) -> int:
+        """The rotated pairs of the full-attention layers (the first ones: their frequency factor is not 1e30)."""
+        f = self.rope_freq_factors
+        return self.head_dim // 2 if f is None else next((i for i, x in enumerate(f) if x > 1e20), len(f))
+
+    def rot(self, kind: str) -> int:
+        """The rotated pairs of a layer kind."""
+        return self.rot_full if kind == "full" else self.head_dim // 2
+
+    def rope_inv_freq(self, kind: str) -> np.ndarray:
+        """RoPE frequencies (rot pairs,) float64 of a layer kind: base^(-2 i / head_dim) (the full head dim's
+        progression; the unrotated pairs left out)."""
+        d = self.head_dim
+        base = self.rope_base if kind == "full" else self.rope_base_swa
+        return base ** (-np.arange(0, 2 * self.rot(kind), 2, dtype=np.float64) / d)
 
 
 @dataclass(frozen=True)

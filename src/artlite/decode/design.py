@@ -820,6 +820,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
         workers, pg_flows, pg_locks, pg_main, pg_help = [], [], [], {}, {}
         self._locks: list[Lock] = []  # (the model's: ``_extra_workers``)
+        self._flows: list = []  # (the model's packet flows: ``_extra_workers``)
         xps = []
         m_ws, m_xs, sqs = [], [], []
         st_ty = np.ndarray[(paging.STATE_WORDS,), i32]
@@ -914,7 +915,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(a_n,), bf], np.ndarray[(x_n,), bf], np.ndarray[(c_n,), bf],
                            a_prod, x_prod, c_cons, d_cons])
-        for f in pg_flows:
+        for f in pg_flows + self._flows:
             rt.add_flow(f)
         for lk in pg_locks + self._locks:
             rt.add_lock(lk)
