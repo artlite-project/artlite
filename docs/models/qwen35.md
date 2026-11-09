@@ -83,15 +83,16 @@ Gated DeltaNet layers stay recurrent. Every tensor of ggml-org's files is Q8_0 (
 half a group). On 320 questions (SST-2, AG News, BoolQ and MNLI rows, questions about essay passages) their choices
 are llama.cpp's (CPU) on 318 and their accuracy the same within one question of 50, the probabilities within 0.08 of its
 (median 0.002-0.003: the prefill's bfp16 GEMMs; llama.cpp's own CPU and Vulkan builds are 0.02 apart); a question takes
-45 ms at 99 tokens, 52 ms at 256 and 135 ms at 1024 through the server (d3-lite; the iGPU with llama.cpp's Vulkan build:
-24 / 39 / 170 ms, at about 4x the energy above idle).
+32 ms at 103 tokens, 39 ms at 256 and 113 ms at 1024 through the server (d3-lite; d3-nano 50 / 57 / 186 ms; the iGPU
+with llama.cpp's Vulkan build: 24 / 37 / 168 ms and 42 / 74 / 315 ms, at ~4x the energy above idle:
+[NPU vs iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
 
 Kev-4B (Qwen3.5-4B's shapes, causal) answers with its classifier head (`cls.output`) on the rows at the options' end
 tokens and at the question's last token. Its hidden size, 2560, is not a whole number of K chunks: the projections that
 read the residual stream take K chunks padded with zero weights (the image is 3.6 GB for the 2.8 GB file). On the same
 320 questions its choices are llama.cpp's on 317 and its accuracy the same within one question of 50 (median |dp|
-0.0035); a question takes 109 ms at 28 tokens, 147 at 184 and 477 at 952 through the server (the iGPU: 49 / 143 /
-732 ms), at 2.3-3.4x less energy above idle.
+0.0035); a question takes 90 ms at 32 tokens, 125 at 184 and 453 at 952 through the server, 8 questions about one
+state 278 ms (the iGPU: 46 / 145 / 744 ms, 1379 ms), at 4-12x less energy above idle.
 
 ## Mixture of experts (Qwen3.6-35B-A3B)
 

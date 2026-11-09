@@ -61,6 +61,36 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
   Q4_K_M: 113.5 vs 78.7 tokens/s), 1.25x (Gemma 4 E4B Q4_0: 29.3 vs 23.4) and 1.36x (Qwen3.8 27B Q4_K_M: 5.77 vs
   4.24), plugged in and on battery alike: that laptop's iGPU holds its clocks on battery.
 
+## Prefill-only work: decisions, embeddings, rerank
+
+A decision, an embedding or a rerank score is one forward pass over a prompt and no generated text, so the work is
+prefill. Through each server ([artlite-server's](server.md#embeddings-and-rerank) on the NPU, llama-server's Vulkan
+build with `-ngl 99` on the iGPU), on the same files, one device at a time, warm, HTTP included, each request's text
+new; energy per request above an 18 W idle (socket power from the SMU, idle varying by a few W with the desktop's
+other programs):
+
+| file | request | prompt tokens | NPU | iGPU | energy a request, NPU / iGPU (the shortest, the longest prompt) |
+|---|---|---|---|---|---|
+| vllm-sr d3-lite (0.8B, Q8_0) | a question | 103 / 256 / 1024 | 32 / 39 / 113 ms | 24 / 37 / 168 ms | 0.26 / 1.0 J, 1.4 / 6.2 J |
+| | 8 questions about one state | 2315 | 282 ms | 338 ms | 0.56 / 1.4 J a question |
+| vllm-sr d3-nano (2B, Q8_0) | a question | 103 / 256 / 1024 | 50 / 57 / 186 ms | 42 / 74 / 315 ms | 0.8 / 1.7 J, 3.2 / 11 J |
+| Kev-4B (Q4_K_M) | a question | 32 / 184 / 952 | 90 / 125 / 453 ms | 46 / 145 / 744 ms | 0.4 / 2.0 J, 6.0 / 25 J |
+| | 8 questions about one state | 1732 | 278 ms | 1379 ms | 0.48 / 5.8 J a question |
+| Decision-2.0-Kai (0.6B, Q8_0) | a question | 79 / 268 / 1036 | 31 / 56 / 159 ms | 17 / 34 / 129 ms | 0.22 / 0.66 J, 2.0 / 4.6 J |
+| Qwen3-Embedding-0.6B (Q8_0) | a query / a passage | 30 / 433 | 27 / 55 ms | 12 / 51 ms | 0.16 / 0.50 J, 0.72 / 1.9 J |
+| | 8 passages a request | 3434 | 11.1K tokens/s | 8.0K tokens/s | 0.72 / 1.9 J a passage |
+| Qwen3-Embedding-4B (Q4_K_M) | a query / a passage | 30 / 433 | 79 / 216 ms | 50 / 326 ms | 0.9 / 2.0 J, 4.4 / 11 J |
+| | 8 passages a request | 3434 | 2.1K tokens/s | 1.1K tokens/s | 4.0 / 13 J a passage |
+| Qwen3-Reranker-0.6B (Q8_0) | 20 pairs of ~510 tokens | 10194 | 26.1 pairs/s | 17.1 pairs/s | 0.60 / 2.5 J a pair |
+
+- **Energy**: the NPU answers with 2-5x less energy above idle (12x for several questions about one state), drawing
+  5-18 W over idle against the iGPU's 32-45 W, and leaves the GPU free.
+- **Latency**: the iGPU answers a single short request sooner (up to ~100 tokens: its fixed cost per request is
+  lower); from ~256 tokens on the two are even, and longer prompts, batches and several questions about one state
+  (packed into shared prefill chunks on the NPU) go faster on the NPU, up to 5x.
+- A decision model with full attention over the whole prompt (vllm-d3) runs a prompt in one chunk of the next size:
+  one just past a size pays the next one (d3-lite, 260 tokens: 62 ms, 39 at 256).
+
 ## Candidates to explore
 
 So the NPU can win where compute rather than DRAM bandwidth bounds the work, or where watts or a free GPU matter more
@@ -68,12 +98,11 @@ than speed. Not tried yet, ranked by expected value per effort:
 
 | | candidate | why the NPU could win |
 |---|---|---|
-| 1 | Prefill-only work: an LLM as a classifier, decision models (JEV-27B-VL), rerankers, guard models; RAG | compute-bound; prefill at a fraction of the power |
-| 2 | Prefill on the NPU, decode on the iGPU | each device on its strength, overlapped in a server |
-| 3 | Multimodal encoders (vision and audio projectors, Whisper) | ViT and conformer encoders are compute-bound |
-| 4 | Image generation (UNet, DiT) | many compute-bound steps |
-| 5 | Diffusion LLMs (parallel block decoding) | a block of tokens per weight pass turns decode into prefill |
-| 6 | Batched decode, parallel sampling | the NPU's spare compute in decode |
-| 7 | Extremely compressed models (1-bit, ternary) | few bytes per token; the iGPU may become bound by unpacking them |
-| 8 | Power-capped and smaller platforms | a 128-bit bus narrows the iGPU's decode lead to 1.25-1.44x (Krackan Point) |
-| 9 | An always-on second model beside the iGPU's | the GPU stays free; the two share only DRAM |
+| 1 | Prefill on the NPU, decode on the iGPU | each device on its strength, overlapped in a server |
+| 2 | Multimodal encoders (vision and audio projectors, Whisper) | ViT and conformer encoders are compute-bound |
+| 3 | Image generation (UNet, DiT) | many compute-bound steps |
+| 4 | Diffusion LLMs (parallel block decoding) | a block of tokens per weight pass turns decode into prefill |
+| 5 | Batched decode, parallel sampling | the NPU's spare compute in decode |
+| 6 | Extremely compressed models (1-bit, ternary) | few bytes per token; the iGPU may become bound by unpacking them |
+| 7 | Power-capped and smaller platforms | a 128-bit bus narrows the iGPU's decode lead to 1.25-1.44x (Krackan Point) |
+| 8 | An always-on second model beside the iGPU's | the GPU stays free; the two share only DRAM |

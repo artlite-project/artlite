@@ -208,8 +208,8 @@ tokens), kev (its head's products of the last token's and each option's rows) an
 rows at the ends of the options and of the question), computed on the host from the prompt's output rows. Of the
 published files, vllm-sr's d3-lite and d3-nano (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M) and Decision-2.0-Kai-0.6B
 (llama.cpp's converter run on vllm-sr's checkpoint: vllm-sr's own GGUF is a fork's format) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
-at most 2048 tokens (a longer prompt: 400), and it generates no text (d3-lite: a question of 99 / 256 / 1024 prompt
-tokens in 31 / 39 / 122 ms, HTTP included); other types' questions share the state's tokens through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
+at most 2048 tokens (a longer prompt: 400), and it generates no text (d3-lite: a question of 103 / 256 / 1024 prompt
+tokens in 32 / 39 / 113 ms, HTTP included); other types' questions share the state's tokens through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
 on a causal Qwen3.5 model the state once, then the questions packed after it, each continuing the state's Gated
 DeltaNet and attention state, or the questions' whole prompts packed, whichever the estimates say is faster (Kev-4B, 8
 questions of 64 tokens after a 256-token state: 387 ms, 1006 one after another; S0's requests of 4-8 questions after
