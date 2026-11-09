@@ -54,7 +54,8 @@ BIG = 1024  # the sub-chunk of the chunks made of them (out / o, gate_up, down o
 # half of it where a block's down parts would lie too far apart for the norm (``D_STRIDE``: Q4_K_M's planar Q6_K downs
 # at a pitch of 288)
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
-NORM_SIZES = (2048, 1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item)
+NORM_SIZES = (1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item; those whose
+# down parts lie within D_STRIDE)
 D_STRIDE = 1 << 21  # bf16 between a norm block's down parts at most (a shim BD dimension's step: 2^20 words)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)

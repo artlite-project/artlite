@@ -6,7 +6,7 @@ model writes a call, parsed as the text streams (``Parser``: text in, content an
 
 | syntax | templates | a call in the generated text |
 |---|---|---|
-| ``QwenXml`` | Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7 | ``<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>\\n</function>\\n</tool_call>`` |
+| ``QwenXml`` | Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3 | ``<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>\\n</function>\\n</tool_call>`` |
 | ``Gemma4`` | Gemma 4 | ``<|tool_call>call:NAME{k:V,...}<tool_call|>``, strings between ``<|"|>`` |
 | ``Llama3`` | Llama 3.1 / 3.2 | the whole message ``{"name": NAME, "parameters": {...}}`` |
 

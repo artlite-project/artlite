@@ -23,13 +23,14 @@ each dispatch releases the GIL, so the loop keeps serving while a step or a prom
 runs in a thread of the event loop's pool.
 
 The prompt cache (``cache``): the KV caches keep the tokens of the last request (its prompt and the generated tokens
-that ran), host RAM the conversations before it (``--cache-ram``: their KV records and states) and, for the Qwen
-hybrids, checkpoints of the Gated DeltaNet states (``--ctx-checkpoints``), which cannot go back. A request continues
-from what keeps the most of its prompt - the device's conversation (to the prefill's cache group where a chunk can
-start, ``NpuModel.rewind``; Qwen: its end or a checkpoint), a conversation copied back from RAM - and runs the rest: a
+that ran), host RAM the conversations before it (``--cache-ram``: their KV records and states) and, for the recurrent
+models, checkpoints of their states (``--ctx-checkpoints``: the Qwen hybrids' Gated DeltaNet states, LFM3's conv
+histories), which cannot go back. A request continues from what keeps the most of its prompt - the device's
+conversation (to the prefill's cache group where a chunk can start, ``NpuModel.rewind``; a recurrent model: its end or
+a checkpoint), a conversation copied back from RAM - and runs the rest: a
 chat's next turn runs only its new messages, an agent's subagents and side requests do not cost its main conversation
 its cache. The earlier answers keep their thoughts (``--reasoning-preserve``: the templates' ``preserve_thinking``,
-Qwen3.6's and Gemma 4's), so a turn extends the last one. ``cache_prompt: false`` starts from an empty cache.
+Qwen3.6's, Gemma 4's and LFM3's), so a turn extends the last one. ``cache_prompt: false`` starts from an empty cache.
 
 Cancelling: a client that goes away, the UI's Stop (``DELETE /v1/stream?conv_id=``, matched by the chat request's
 ``X-Conversation-Id``) and the shutdown stop the request at its next token or prompt chunk; a dispatch is never

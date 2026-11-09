@@ -365,6 +365,16 @@ def test_sibling() -> None:
     assert left.drops == 1
 
 
+def test_rewind_recurrent() -> None:
+    """A recurrent model rewinds to all its cached positions or none (its states cannot go back: a generation's forced
+    call opener continues where it stopped); another to a cache group."""
+    for recurrent, want in ((True, (45, 0)), (False, (40, 40))):  # (without a prefill: groups of 8)
+        m = Text(list(range(1, 60)))
+        m.recurrent, m.prefill, m.position = recurrent, None, 45
+        m.reset = lambda m=m: setattr(m, "position", 0)
+        assert (m.rewind(45), m.rewind(40)) == want
+
+
 # the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model; Qwen3.5-9B: its
 # steps of several tokens past 6 cache groups)
 CASES = [llama_gguf("Q4_0", "1B"), gemma_gguf("Q4_0"), minicpmv_gguf(), qwen_gguf("Q4_K_M", "9B")]

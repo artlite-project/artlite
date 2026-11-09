@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
+from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models.server.tools import (
     GEMMA4,
     LLAMA3,
@@ -300,11 +300,12 @@ def test_name_mask() -> None:
 
 WALKS = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML, "<tool_call>"),
          "gemma": (gemma_gguf, GEMMA4, "<|tool_call>"),
-         "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3, '{"name": "')}  # (the text after which a name's head comes)
+         "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3, '{"name": "'),
+         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML, "<tool_call>")}  # (the text after which a name's head comes)
 
 
 def tokenizer_of(family: str, path: str) -> object:
-    if family == "qwen":
+    if family in ("qwen", "lfm3"):
         from models.tokenizer import BpeTokenizer
         return BpeTokenizer(GGUFFile(path))
     if family == "gemma":
@@ -379,14 +380,15 @@ def test_functions_and_arguments() -> None:
 
 
 FILES = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML), "minicpmv": (minicpmv_gguf, QWEN_XML),
-         "gemma": (gemma_gguf, GEMMA4), "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3)}
+         "gemma": (gemma_gguf, GEMMA4), "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3),
+         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML)}
 
 
 @pytest.mark.parametrize("family", FILES)
 def test_model_templates(family: str) -> None:
     """The model files' templates: their syntax, a call with its result rendered as the model writes it, and the
-    call's thought before a later user message kept with preserve_thinking (Qwen3.6's and Gemma's templates; MiniCPM-V's
-    drops it)."""
+    call's thought before a later user message kept with preserve_thinking (Qwen3.6's, Gemma's and LFM3's templates;
+    MiniCPM-V's drops it)."""
     path, syntax = FILES[family][0](), FILES[family][1]
     if not os.path.exists(path):
         pytest.skip(f"{path}: not here")

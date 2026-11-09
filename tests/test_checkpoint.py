@@ -12,7 +12,7 @@ import time
 import pytest
 import torch
 
-from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
+from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
 from models.common import Model, NpuModel, Sampling
 
@@ -20,8 +20,10 @@ from .common import essay
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
-# the files: a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model) and qwen35moe with its drafter
-CASES = [llama_gguf("Q4_0", "1B"), gemma_gguf("Q4_0"), minicpmv_gguf(), qwen_gguf("Q4_K_M", "35B-A3B")]
+# the files: a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model), qwen35moe with its drafter and LFM3
+# (its conv histories)
+CASES = [llama_gguf("Q4_0", "1B"), gemma_gguf("Q4_0"), minicpmv_gguf(), qwen_gguf("Q4_K_M", "35B-A3B"),
+         lfm3_gguf("QAD-Q4_0")]
 GREEDY = Sampling(greedy=True)
 
 

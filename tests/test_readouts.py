@@ -1,4 +1,4 @@
-"""``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B): a
+"""``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B; LFM3): a
 readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
 bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.model_config import decision_gguf, llama_gguf, minicpmv_gguf, qwen3_gguf
+from artlite.model_config import decision_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen3_gguf
 from models import open_model
 from models.common import Model, NpuModel
 from models.readouts import Readouts, pool, rows_of
@@ -23,7 +23,8 @@ from .llama_cpp import _lib_identity, llama_embeddings
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
-CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B"), qwen3_gguf("embedding-4B")]
+CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B"), qwen3_gguf("embedding-4B"),
+         lfm3_gguf("QAD-Q4_0")]
 
 
 @pytest.fixture(scope="module", params=CASES, ids=os.path.basename)
@@ -50,13 +51,21 @@ def test_rows(loaded: tuple[str, Model, NpuModel]) -> None:
         npu.reset()
         want = npu.forward(toks)  # (its last logits: the LM head on the chunk's last row, or a decode step's)
         got = npu.overlay.logits_of(torch.from_numpy(rows[-1])).float()
-        if npu.prefill.plan(0, n) == npu.prefill.plan(0, n, steps=False):
+        plan = npu.prefill.plan(0, n)
+        # (a post-norm model's step row is its LM header's updated residual in bf16, not the header's sum: LFM3's)
+        if plan == npu.prefill.plan(0, n, steps=False) and (sum(plan) >= n or not getattr(npu.overlay.op, "post", 0)):
             assert torch.equal(got, want), n  # (the same row through the same LM head)
         else:  # (the prompt path's tail is a decode step, the readout's a chunk: two paths, test_rewind's KL bound;
             # Q8_0's weights: exact codes in the decode's GEMV, bfp16 panels in the prefill's GEMMs, KL 0.0095)
             lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
             bound = 0.012 if path == qwen3_gguf("embedding-0.6B") else 0.002
             assert got.argmax() == want.argmax() and (lw.exp() * (lw - lg)).sum() < bound, n
+
+
+# (mean pooling's bound where it is not 0.999: LFM3's rows 0.9990 - 0.9998 from the fp32 CPU model's, llama.cpp's 0.9997 -
+# 0.99997, 0.9986 - 0.9997 from each other; one row 0.9967 - 0.9991 from the fp32 model's: the prefill's 8-bit GEMM
+# operands)
+MEAN = {lfm3_gguf("QAD-Q4_0"): 0.998}
 
 
 @pytest.mark.parametrize("pooling", ["mean", "last"])
@@ -72,7 +81,7 @@ def test_embeddings(loaded: tuple[str, Model, NpuModel], pooling: str) -> None:
         npu.reset()
         got = torch.from_numpy(pool(npu.outputs(ids, rows_of(pooling, len(ids))), pooling))
         cos = torch.nn.functional.cosine_similarity(got.double(), want.double(), 0).item()
-        assert cos >= (0.999 if pooling == "mean" else 0.995), (len(ids), cos)
+        assert cos >= (MEAN.get(path, 0.999) if pooling == "mean" else 0.995), (len(ids), cos)
 
 
 PACKED = [qwen3_gguf("embedding-0.6B"), decision_gguf("kev"), decision_gguf("d3-lite")]

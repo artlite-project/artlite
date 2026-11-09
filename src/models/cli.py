@@ -85,8 +85,9 @@ def arg_parser() -> argparse.ArgumentParser:
                    help="no draft tokens from the context (prompt lookup) in the multi-token steps")
     add_spec_options(p)
     p.add_argument("--kv-k", choices=("single", "hilo"),
-                   help="K precision of the KV cache (Llama, Qwen3, Gemma): one bfp16 block per 8 dims (Llama's "
-                        "default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read time)")
+                   help="K precision of the KV cache (Llama, Qwen3, Gemma, LFM3): one bfp16 block per 8 dims (Llama's "
+                        "and LFM3's default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read "
+                        "time)")
     vis = p.add_argument_group("images in the prompt (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7)")
     vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-*.gguf)")
     vis.add_argument("--image", action="append", default=[],

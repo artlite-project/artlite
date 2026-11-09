@@ -40,7 +40,7 @@ class NpuLfm(OverlayModel):
     ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
 
     recurrent = True  # (the conv histories hold the whole sequence)
-    STEP_COST = (1.0, 1.025, 1.05, 1.076)  # (decode steps at 1K: 19.8 / 21.3 ms for 1 / 4 slots)
+    STEP_COST = (1.0, 1.02, 1.05, 1.06)  # (decode steps at 1K: QAD-Q4_0 20.2 ms for one slot, Q4_K_M 21.3)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):

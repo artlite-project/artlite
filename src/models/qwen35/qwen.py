@@ -195,15 +195,6 @@ class NpuQwen(OverlayModel):
         if self.drafter is not None:
             self.drafter.dev.stale = True
 
-    def rewind(self, n: int) -> int:
-        """(all cached positions or none: the GDN layers' states hold the whole sequence and cannot go back; a
-        ``checkpoint`` keeps a position)"""
-        self._abandon()
-        if n >= self.position:
-            return self.position
-        self.reset()
-        return 0
-
     def _overlays(self) -> list[QwenOverlay | DFlashOverlay]:
         d = self.dflash if self.dflash is not None else self.drafter
         return [self.overlay] + ([d] if d is not None else [])

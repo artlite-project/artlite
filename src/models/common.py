@@ -813,8 +813,13 @@ class OverlayModel(NpuModel):
         return self.prefill.group if self.prefill is not None else 8
 
     def rewind(self, n: int) -> int:
-        """(down to a multiple of ``group``)"""
+        """(down to a multiple of ``group``; a recurrent model's: all cached positions or none, its states hold the whole
+        sequence and cannot go back: a ``checkpoint`` keeps a position)"""
         self._abandon()
+        if self.recurrent:
+            if n < self.position:
+                self.reset()
+            return self.position
         keep = min(n, self.position)
         self.position = keep - keep % self.group
         return self.position
