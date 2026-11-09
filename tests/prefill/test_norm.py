@@ -163,7 +163,6 @@ def test_prefill_norm_deltas(T: int, E: int, d_pitch: int, cols: int, rows: int,
     assert ((xn - ref).norm() / ref.norm()).item() < 1e-2
 
 
-# (mode, E, deltas, d_pitch, scale): Gemma E4B's modes
 def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.Tensor | None, w1: torch.Tensor | None,
                         scale: float, eps: float, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
     """(x', xn values before the bfp16 rounding) in fp64 of fp32 x (T, E), d (T, E) the (summed) delta."""
@@ -179,8 +178,10 @@ def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.T
     return x, xb * w1.bfloat16().double() * iv
 
 
+# (mode, E, deltas, d_pitch, scale): Gemma E4B's modes, LFM3's (E 2048)
 RESIDUAL = [("in", 2560, 1, 320, False), ("post", 2560, 1, 320, False), ("post", 2560, 1, 384, True),
-            ("plain", 2560, 2, 320, False), ("plain", 2560, 2, 384, False), ("plain", 2560, 4, 320, False)]
+            ("plain", 2560, 2, 320, False), ("plain", 2560, 2, 384, False), ("plain", 2560, 4, 320, False),
+            ("in", 2048, 1, 256, False), ("post", 2048, 1, 256, False), ("post", 2048, 2, 256, False)]
 
 
 @pytest.mark.parametrize(("mode", "E", "deltas", "d_pitch", "scale"), RESIDUAL,

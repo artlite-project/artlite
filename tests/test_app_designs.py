@@ -1,6 +1,7 @@
 """The apps' full designs, built as the apps build them (no NPU): the decode overlays and prefill libraries of the
 models present (Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the
-app's default: the design runs the drafter's formats too), the Stable Diffusion UNet program. They compile (program
+app's default: the design runs the drafter's formats too; LFM3's QAD-Q4_0 and Q4_K_M images), the Stable Diffusion UNet
+program. They compile (program
 memory, stack and BD limits of the whole models, which the layer-slice tests do not reach), a paged design's code pages
 link (each within the slot its core's resident code leaves: ``paging.link``, else only at load), and
 ``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
@@ -14,6 +15,7 @@ from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
     gemma_gguf,
+    lfm3_gguf,
     llama_gguf,
     occamy_gguf,
     qwen3_gguf,
@@ -62,6 +64,15 @@ def _qwen(path: str, mtp: bool = False) -> None:
     ov.op.page_store()
 
 
+def _lfm(path: str) -> None:
+    from models.lfm.overlay import LfmOverlay
+    from models.lfm.prefill import LfmPrefill
+
+    ov = LfmOverlay(GGUFFile(path))
+    parallel_compile.compile_all([ov.op, LfmPrefill(ov).lib])
+    ov.op.page_store()
+
+
 def _sd15(path: str) -> None:
     from artlite.vision.design import VisionDesign
 
@@ -84,6 +95,8 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "qwen-35B-A3B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "35B-A3B"), lambda path: _qwen(path, mtp=True)),
     "occamy-1.0-APEX": (occamy_gguf(), _qwen),
     "swift-1.5-APEX": (swift_gguf(), _qwen),
+    "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
+    "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
     "sd15": (sd15_dir(), _sd15),
 }
 

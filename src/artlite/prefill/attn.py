@@ -1053,7 +1053,7 @@ __attribute__((minsize)) void {{ p }}_gsel(const bfloat16 *__restrict u, float *
     for (int h = 0; h < {{ QH }}; h++)
         for (int i = 0; i < {{ 8 * QB }}; i++) {
             const int e = {{ 8 * QH * QB }} * r + {{ QH }} * i + h;  // (its value in the object)
-            gt[{{ 8 * QB }} * h + i] = (float)u[e + 216 * (e / 72)];
+            gt[{{ 8 * QB }} * h + i] = (float)u[e + 216 * ((e * 7282) >> 19)];  // (e / 72 for e < 32768: no division)
         }
 }
 

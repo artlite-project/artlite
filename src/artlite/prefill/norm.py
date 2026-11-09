@@ -932,7 +932,7 @@ class PrefillNormOperator(ArtcOperator):
 
 
 MODES = ("in", "post", "plain")
-RCH = 160  # columns per chunk (ResidualNormOperator: E / 16 for E = 2560)
+RCH = 16  # chunks per row (ResidualNormOperator: E / 16 columns each, 160 for E = 2560, 128 for 2048)
 
 _RSRC = JINJA_ENV.from_string(r"""
 // workspace (bytes): wp [E] bf16 | w1 [E] bf16 | ss [64] fp32 | a hi, lo [64] bf16 | iv hi, lo [64] bf16 | s hi, lo [64] bf16
@@ -1160,10 +1160,11 @@ class ResidualNormOperator(ArtcOperator):
     def __init__(self, *, T: int, E: int, mode: str, eps: float, d_pitch: int = 0, deltas: int = 1, d_stride: int = 0,
                  scale: bool = False, cols: int = COLS):
         """``scale``: x' = (...) s with s from the parameters (the layer's output scale), else s = 1 (cheaper)."""
-        assert mode in MODES and E % RCH == 0 and E % 128 == 0, (mode, E)
+        assert mode in MODES and E % 128 == 0, (mode, E)
         assert T % 8 == 0 and T >= 8 * cols and 1 <= cols <= COLS and deltas in (1, 2, 4)
         assert mode == "post" or not scale
         self.T, self.E, self.mode, self.eps, self.cols, self.scale = T, E, mode, eps, cols, scale
+        self.ch = E // RCH  # (columns per chunk)
         self.d_pitch = d_pitch or E // COLS
         assert self.d_pitch >= E // COLS
         self.deltas = deltas if mode != "in" else 0
@@ -1177,7 +1178,7 @@ class ResidualNormOperator(ArtcOperator):
         return regions(sizes)
 
     def get_kernel_src(self) -> str:
-        return _RSRC.render(p=self.p, E=self.E, CH=RCH, eps=repr(self.eps), mode=self.mode, deltas=self.deltas,
+        return _RSRC.render(p=self.p, E=self.E, CH=self.ch, eps=repr(self.eps), mode=self.mode, deltas=self.deltas,
                            scale=self.scale, w=Attr(self.workspace()))
 
     @property
@@ -1194,12 +1195,12 @@ class ResidualNormOperator(ArtcOperator):
 
     def get_mlir_artifact(self) -> Module:
         T, E, p, mode, nd = self.T, self.E, self.p, self.mode, max(self.deltas, 1)
-        n_kc = E // RCH
+        ch, n_kc = self.ch, RCH
         n_gs = [len(range(c, T // 8, self.cols)) for c in range(self.cols)]  # (core c: token groups c, c + cols, ..)
         bf = np.dtype[bfloat16]
-        xc_ty = np.ndarray[(2 * 8 * RCH,), bf]  # a chunk of x (8 tokens x RCH fp32)
-        dc_ty = np.ndarray[(nd * 8 * RCH,), bf]  # a chunk of d ([delta][8 tokens][RCH] bf16) or of the parameters
-        pan_ty = np.ndarray[(RCH // 8 * 36,), bf]
+        xc_ty = np.ndarray[(2 * 8 * ch,), bf]  # a chunk of x (8 tokens x ch fp32)
+        dc_ty = np.ndarray[(nd * 8 * ch,), bf]  # a chunk of d ([delta][8 tokens][ch] bf16) or of the parameters
+        pan_ty = np.ndarray[(ch // 8 * 36,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 2,), bf]
         k_prm = Kernel(f"{p}_prm", "kernel.o", [dc_ty, ws_ty, np.int32])
         k_ss = Kernel(f"{p}_ss", "kernel.o", [xc_ty if mode == "in" else dc_ty, ws_ty, np.int32])
@@ -1305,8 +1306,8 @@ class ResidualNormOperator(ArtcOperator):
                     # d: [group][delta][8 tokens x 8 column blocks][E / 8] (row stride 8 d_pitch = 8 blocks)
                     dh[c].fill(D, TensorAccessPattern((self.n_delta,), 8 * ed * c, [n_g, nd, 8 * COLS, E // COLS],
                                                       [8 * cols * ed, self.d_stride, dp, 1]), group=tg)
-                    oh[c].drain(XO, TensorAccessPattern((n,), 16 * E * c, [n_g, n_kc, 8, 2 * RCH],
-                                                        [16 * cols * E, 2 * RCH, 2 * E, 1]), group=tg, wait=True)
+                    oh[c].drain(XO, TensorAccessPattern((n,), 16 * E * c, [n_g, n_kc, 8, 2 * ch],
+                                                        [16 * cols * E, 2 * ch, 2 * E, 1]), group=tg, wait=True)
                 ph[c].drain(XN, TensorAccessPattern((T * E * 9 // 16,), c * (E // 8) * 36,
                                                     [1, n_g, 8, E // 64 * 36], [0, cols * (E // 8) * 36, E // 64 * 36, 1]),
                             group=tg, wait=True)

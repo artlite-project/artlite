@@ -443,7 +443,30 @@ class LfmOverlay(ModelOverlay):
         return st
 
     def _lm_phase(self, seq: Sequence) -> None:
-        raise NotImplementedError("the LM head reads a header's residual parts (logits_of: a plain input)")
+        self._weight_run(seq, [(-1, "lm")])
+        self._gemv(seq, _Step(1, ()), (-1, "lm"))
+
+    def logits_of(self, x: torch.Tensor) -> torch.Tensor:
+        """(its header's input: r = x, v and its partial sums zero, so the header's update adds nothing and its norm is
+        the output norm of x, as a step's)"""
+        rg = self.inp[(-1, "lm")][0]
+        if self._metas_s != (1, self.start):
+            self._metas(1)
+        if self._tr_lm is None:
+            seq = Sequence(self.op, rolling=True, inputs=("X",))
+            self._lm_phase(seq)
+            seq.sync(fills=True)
+            self._tr_lm = Transaction(self.dev, seq.words())
+        sp = packed_slots(1)
+        act, o = self.dev.view("ACT"), rg.off + XB
+        act[o:o + XPAY] = 0
+        hx = act[o + XPAY:o + XPAY + 4 * sp * self.H].reshape(self.H // 8, 2, 16 * sp)
+        hx[:, 0] = 0
+        hx[:, 1] = interleave(x.reshape(1, -1).float().numpy(), sp).view(np.uint8).reshape(self.H // 8, 16 * sp)
+        self.dev.flush("ACT", o, XPAY + 4 * sp * self.H)
+        self.ready()
+        self.dev.dispatch(self._tr_lm)
+        return self._logits(1)[0]
 
     # ------------------------------------------------------------------
     # The per-step words
@@ -517,6 +540,21 @@ class LfmOverlay(ModelOverlay):
         """The conv histories' base is the 6 rows before position p (a prefill wrote them, a restore put them back): the
         next step continues at p with shift 0."""
         self.conv_p, self.conv_s = p, 0
+
+    def conv_base(self, p: int) -> None:
+        """Before a prefill chunk at p: each conv region's rows of the 6 positions before p moved to its base (rows 0 ..
+        5, where the chunk's conv reads its history), as a step at p shifts them on its cores."""
+        sh = self._cshift(p)
+        if sh:
+            act, dev = self.dev.view("ACT"), self.dev
+            for o in self.conv_reg.values():
+                h, t = o + CV.payload(2), o + CV.payload(1) + 3 * CV.TAP  # (rows 0 .. 7, rows 8, 9)
+                dev.fetch("ACT", h, 8 * CV.ROW)
+                dev.fetch("ACT", t, 2 * CV.ROW)
+                rows = np.concatenate([act[h:h + 8 * CV.ROW], act[t:t + 2 * CV.ROW]]).reshape(CV.HIST, CV.ROW)
+                act[h:h + 6 * CV.ROW] = rows[sh:sh + 6].reshape(-1)
+                dev.flush("ACT", h, 6 * CV.ROW)
+        self.conv_at(p)
 
     def _cshift(self, p: int) -> int:
         """The conv shift of a step at p: the last step's tokens before p (a step continues from the last one's
@@ -626,6 +664,38 @@ class LfmOverlay(ModelOverlay):
             ks.append(k[pos])
             vs.append(v[pos])
         return torch.from_numpy(np.stack(ks)), torch.from_numpy(np.stack(vs))
+
+    def snapshot(self, position: int) -> dict[str, object]:
+        """(and the conv histories: each region's rows, the last step's position and slots, ``conv_at``)"""
+        out = super().snapshot(position)
+        rows = np.zeros((len(self.conv_reg), CV.HIST * CV.ROW), np.uint8)
+        act = self.dev.view("ACT")
+        for i, o in enumerate(self.conv_reg.values()):
+            for a, b, n in self._hist_parts(o):
+                self.dev.fetch("ACT", a, n)
+                rows[i, b:b + n] = act[a:a + n]
+        out["conv"] = (rows, self.conv_p, self.conv_s)
+        return out
+
+    def restore(self, snapshot: dict[str, object]) -> None:
+        super().restore(snapshot)
+        rows, self.conv_p, self.conv_s = snapshot["conv"]
+        act = self.dev.view("ACT")
+        for i, o in enumerate(self.conv_reg.values()):
+            for a, b, n in self._hist_parts(o):
+                act[a:a + n] = rows[i, b:b + n]
+                self.dev.flush("ACT", a, n)
+
+    @staticmethod
+    def _hist_parts(o: int) -> tuple[tuple[int, int, int], ...]:
+        """A conv region's history rows at ACT offset o: (offset in ACT, offset in the rows, bytes) of rows 0 .. 7 and 8, 9."""
+        return (o + CV.payload(2), 0, 8 * CV.ROW), (o + CV.payload(1) + 3 * CV.TAP, 8 * CV.ROW, 2 * CV.ROW)
+
+    def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
+        """The residual stream the LM head read in the last step (L = -1), of a slot (bf16 values, fp32): its updated
+        residual (``residual``), the output norm's input."""
+        assert L == -1, "the LM head's input only"
+        return self.residual(slot)
 
     def read_conv(self, layer: int) -> torch.Tensor:
         """A conv layer's history (HIST rows, hidden) as the regions hold it (bf16 values as fp32): rows 0 .. 5 the base
