@@ -68,9 +68,12 @@ struct bo {
 
   void* map() const { return m_host; }
   size_t size() const { return m_size; }
-  // Both directions on Linux write back and invalidate the range's cache lines (the NPU's DMA does not snoop them).
+  // A data buffer: both directions write back and invalidate the range's cache lines (the NPU's DMA does not snoop
+  // them; the process's own CLFLUSH, no driver call). An instruction buffer: host2device copies the range to its XRT
+  // buffer, device2host back.
   void sync(direction dir, size_t size, size_t offset);
   void sync(direction dir);
+  // host2device of 64-byte lines (their byte offsets): a data buffer's line by line, an instruction buffer's span.
   void sync_lines(const int64_t* offsets, size_t count);
   properties get_properties() const;
   // The address the NPU's DMA uses for the first byte (XRT's, not the host's). It exists once the buffer has an XRT

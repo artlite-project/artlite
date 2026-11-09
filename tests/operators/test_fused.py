@@ -1,6 +1,7 @@
 """Tests for FusedOperator: compile and dispatch multiple ops as one ELF."""
 
 import os
+import time
 
 import numpy as np
 import pytest
@@ -607,6 +608,39 @@ class TestFusedLifecycle:
         verify_close(t, (x.float() + w.float()).bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="user t")
         ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
         verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="user y")
+
+    def test_sync_lines(self):
+        """Scattered host writes flushed by their lines (Buffer.sync_lines: a step's patches): the NPU reads them, and
+        lines 48 MB apart cost their lines, not their span (on XRT a span of a step's patches in ACT took 0.4 ms of
+        CLFLUSH a call on Linux, 15.5 ms of driver sync on Windows, where it ran beside a dispatch: NPU timeouts)."""
+        dev = artlite.Device()
+        ub = dev.alloc_user_buffer(64 << 20)
+        at = 48 << 20
+        f = _add_chain("t_lines", buffer_sizes={"w": 2048}, external_buffers={"w": (ub, at)}).compile().load()
+        torch.manual_seed(8)
+        x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
+        ub.map()[at:at + 2048] = w.view(torch.uint8).numpy()
+        ub.map()[64] = 1
+        lines = np.array([64, *range(at, at + 2048, 64)], np.int64)
+        ub.sync_lines(lines)
+        f.get_buffer("x").copy_(x)
+        f.sync_input_only()
+        f()
+        f.sync_outputs()
+        ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
+        verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="lines y")
+
+        def cost(flush: object) -> float:
+            best = float("inf")
+            for _ in range(5):
+                ub.map()[lines] += 1
+                t = time.perf_counter()
+                flush()
+                best = min(best, time.perf_counter() - t)
+            return best
+
+        span = cost(lambda: ub.sync_to_device(at + 2048 - 64, 64))
+        assert cost(lambda: ub.sync_lines(lines)) * 10 < span
 
     def test_buffer_pinned_once(self):
         """A buffer that two hardware contexts address (a model's weights: its decode overlay's, its prefill library's)

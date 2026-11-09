@@ -1,23 +1,24 @@
 #include "shim_xrt/bo.h"
 
+#include <emmintrin.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <emmintrin.h>
 #include <sys/mman.h>
 
-#include <atomic>
 #include <cerrno>
 #include <system_error>
-#include <thread>
-#include <vector>
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include "shim_xrt/device.h"
 #include "shim_xrt/hwctx.h"
@@ -32,15 +33,6 @@ namespace {
 constexpr size_t kPage = 4096;
 size_t round_up(size_t n) { return (std::max<size_t>(n, 1) + kPage - 1) / kPage * kPage; }
 
-#ifdef _WIN32
-void* host_alloc(size_t size) {
-  void* p = ::VirtualAlloc(nullptr, round_up(size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-  if (!p) throw std::bad_alloc();
-  return p;
-}
-
-void host_free(void* p, size_t) { ::VirtualFree(p, 0, MEM_RELEASE); }
-#else
 // Write back and invalidate the cache lines of a range. CLFLUSH is not ordered against younger loads: without the
 // fences a read right after a device->host sync can still hit the stale line.
 void flush_lines(const void* p, size_t len) {
@@ -53,12 +45,50 @@ void flush_lines(const void* p, size_t len) {
   _mm_mfence();
 }
 
-// Zeroed anonymous memory at a 2 MB boundary (2 MB pages where the kernel has them: fewer page walks for the IOMMU and
-// the CPU), kept out of forked children (pinned pages must not turn copy-on-write), faulted in and written back by
-// several threads: no dirty line of the zeroing may later land over what the NPU wrote, and the driver's pin would
-// fault the pages in one thread (16 GB: ~1.7 s; this: ~0.3 s).
+#ifdef _WIN32
+void fault_in(char* p, size_t n) {
+  for (size_t o = 0; o < n; o += kPage) p[o] = 0;
+}
+#else
+void fault_in(char* p, size_t n) {
+  if (::madvise(p, n, MADV_POPULATE_WRITE))
+    for (size_t o = 0; o < n; o += kPage) p[o] = 0;  // (before Linux 5.14)
+}
+#endif
+
+// Fresh memory faulted in and written back by several threads: no dirty line of the zeroing may later land over what
+// the NPU wrote, and the driver's pin would fault the pages in one thread (Linux, 16 GB: ~1.7 s; this: ~0.3 s).
+void populate(char* mem, size_t n) {
+  constexpr size_t piece = size_t(32) << 20;
+  std::atomic<size_t> next{0};
+  auto work = [&] {
+    for (size_t a; (a = next.fetch_add(piece)) < n;) {
+      const size_t k = std::min(piece, n - a);
+      fault_in(mem + a, k);
+      flush_lines(mem + a, k);
+    }
+  };
+  std::vector<std::thread> pool;
+  for (size_t t = 1; t < std::clamp<size_t>(n / (size_t(256) << 20), 1, 8); t++) pool.emplace_back(work);
+  work();
+  for (auto& th : pool) th.join();
+}
+
+#ifdef _WIN32
 void* host_alloc(size_t size) {
-  constexpr size_t huge = size_t(2) << 20, piece = size_t(32) << 20;
+  const size_t n = round_up(size);
+  void* p = ::VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (!p) throw std::bad_alloc();
+  populate(static_cast<char*>(p), n);
+  return p;
+}
+
+void host_free(void* p, size_t) { ::VirtualFree(p, 0, MEM_RELEASE); }
+#else
+// Zeroed anonymous memory at a 2 MB boundary (2 MB pages where the kernel has them: fewer page walks for the IOMMU and
+// the CPU), kept out of forked children (pinned pages must not turn copy-on-write), populated.
+void* host_alloc(size_t size) {
+  constexpr size_t huge = size_t(2) << 20;
   const size_t n = round_up(size), span = n + huge;
   void* base = ::mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (base == MAP_FAILED) throw std::bad_alloc();
@@ -72,19 +102,7 @@ void* host_alloc(size_t size) {
     ::munmap(mem, n);
     throw std::system_error(err, std::generic_category(), "madvise(MADV_DONTFORK)");
   }
-  std::atomic<size_t> next{0};
-  auto populate = [&] {
-    for (size_t a; (a = next.fetch_add(piece)) < n;) {
-      const size_t k = std::min(piece, n - a);
-      if (::madvise(mem + a, k, MADV_POPULATE_WRITE))
-        for (size_t o = a; o < a + k; o += kPage) mem[o] = 0;  // (before Linux 5.14)
-      flush_lines(mem + a, k);
-    }
-  };
-  std::vector<std::thread> pool;
-  for (size_t t = 1; t < std::clamp<size_t>(n / (size_t(256) << 20), 1, 8); t++) pool.emplace_back(populate);
-  populate();
-  for (auto& th : pool) th.join();
+  populate(mem, n);
   return mem;
 }
 
@@ -160,8 +178,17 @@ void bo::sync(direction dir) { sync(dir, m_size, 0); }
 
 void bo::sync_lines(const int64_t* offsets, size_t count) {
   if (!count) return;
-  const auto [lo, hi] = std::minmax_element(offsets, offsets + count);  // (one copy of the range: an instruction BO's)
-  sync(direction::host2device, static_cast<size_t>(*hi - *lo) + 64, static_cast<size_t>(*lo));
+  const auto [lo, hi] = std::minmax_element(offsets, offsets + count);
+  if (*lo < 0 || static_cast<uint64_t>(*hi) >= m_size)
+    throw std::out_of_range("bo::sync_lines: a line outside the buffer");
+  if (m_kind == kind::instructions) {  // (one copy of the lines' span)
+    sync(direction::host2device, std::min<size_t>(*hi - *lo + 64, m_size - *lo), static_cast<size_t>(*lo));
+    return;
+  }
+  const char* const host = static_cast<const char*>(m_host);
+  _mm_mfence();
+  for (size_t i = 0; i < count; i++) _mm_clflush(host + offsets[i]);
+  _mm_mfence();
 }
 
 void bo::sync(direction dir, size_t size, size_t offset) {
@@ -179,14 +206,7 @@ void bo::sync(direction dir, size_t size, size_t offset) {
     }
     return;
   }
-#ifdef _WIN32
-  std::lock_guard guard(m_region->lock);
-  if (m_region->xrt)
-    m_region->xrt->sync(dir == direction::host2device ? XCL_BO_SYNC_BO_TO_DEVICE : XCL_BO_SYNC_BO_FROM_DEVICE, size,
-                        m_offset + offset);
-#else
   flush_lines(static_cast<char*>(m_host) + offset, size);
-#endif
 }
 
 uint64_t bo::get_paddr() {
