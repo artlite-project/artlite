@@ -159,6 +159,16 @@ def test_count_ports() -> None:
     assert slots.describe("rm") == "vshuffle 3, vst.push.576.conv.bfp16ebs8.fp32 1, vst.flush.512.conv 1"
 
 
+def test_ports_by_register_kind() -> None:
+    """A store of a vector register reads QEY_RS (as the gathers and vunpack do), one of an accumulator not: a gather
+    loop's 16 gathers, 4 unpacks and 4 stores per 4 panels bind it at 24, above its slot B's 21."""
+    body = [["vldb.4x16.lo\t wl5, wh7", "vst\t wh9, [p5, #32]"], ["vunpack\tx8, wl8, unpacksign0", "vst\t bmll0, [p1, #0]"],
+            ["vlda\t x3, [p1], #64"]]
+    slots = count_slots(body)
+    assert slots.describe("qrs") == "vldb.4x16.lo 1, vst 1, vunpack 1"
+    assert slots.count("qwa") == 1 and slots.count("ada") == 2  # (vlda of x: QEY_WA, of an accumulator: DM_WM)
+
+
 def test_lock_port() -> None:
     """A lock op holds the core's lock-request unit 4 cycles: an acquire + release loop (an ObjectFifo drain) is
     bound at 8 by it, not by its scalar ops."""

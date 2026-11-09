@@ -375,7 +375,13 @@ of 23 rows) 4596 -> ~2300 cycles:
   inside the gather loop left it unpipelined (RecMII 48 in the physical mode). The prefill's lists: the index bytes
   zipped with their bits (bytes 0 / 1) into 16-bit indices, one `ups_to_v32acc32(v32int16, 2)` per list (v32acc32 has
   no add).
-- **Signs after an unpack** (IQ3_S): the mask's `vextract.64` of the next panel waits for the previous panel's
-  `vaddsub8` through gather -> shuffle -> unpack (II 40 per 4 panels, bound 21): the longer chain makes the masks'
-  registers the recurrence.
+- **Signs after an unpack** (IQ3_S): with `AIE_TRY_INITIATION_INTERVAL(24)` II 29 per 4 panels (the heuristic search
+  stopped at 40), its bound QEY_RS 24 (machine-model.md "Shared ports"); per super-block 976 -> 736 cycles, the decode
+  step -3%.
+- **Compacted rows from constant windows** (the prefill's IQ3_S passes: tiles of 20 rows packed into MMUL rows): with
+  the weight object, its records and the units 64-byte aligned, a window's block and shift depend only on the record's
+  phase (48 B records: 4 per 192 B; 24 B records: 8), so 4 lists (8 records) per iteration make every `shift_bytes`
+  and select mask a constant: the index lists 968 -> 587 cycles per k-tile (in two loops: low bytes, 9th bits from
+  registers), the signs 1271 cycles per unit -> 174 per k-tile; a unit's scalar slots copied straight to their
+  compacted places (constant offsets) instead of a strided gather and a compaction: 2223 -> 659 per unit.
 

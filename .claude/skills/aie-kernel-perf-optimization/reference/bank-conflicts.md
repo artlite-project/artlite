@@ -30,6 +30,11 @@ SKILL.md section 5 has the workflow; machine-model.md the load-slot binding the 
   a cycle: the SiLU table activation of 4096 values stalls 1099 cycles on memory per call instead of 159, a
   GemmQ gate/up epilogue through the SiLU table 2290 cycles per call against 1753 scheduled (512 gathers).
 - mlir-aie's own LUT kernels place their pairs the same way (`AIE_BANK_A` / `AIE_BANK_B`, `aie_bank_placement.h`).
+- aiecc's placement puts two copies wherever they fit, often in one region: a GemmQd of a gather table's format whose
+  MAC cores fit no planar plan (m 96) had both in one region, the IQ4_XS down's dequant 1177 of 3170 cycles per call in
+  memory stalls, IQ3_S's 360 of 1461. `GemmQdOperator._dq_layout` pins the dequantizing core alone then (weight objects in
+  regions 2 / 3 or, wider than a region, the copies at the two ends of the core's memory): 127 and 47; the GEMMs -28%
+  and -24%.
 - `kmath.table_pass` takes the copies as two pointers (static: the bank sections below; `table_arg`: two buffers of the
   core, `ActTable.table_words` each).
 

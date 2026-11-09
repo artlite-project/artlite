@@ -312,7 +312,9 @@ mmvh_q5k_mm loop 1/1: for.body @kernel.cc:261, depth 1 (in base); ranked by cycl
   not met". The search stops at II 60 (`-aie-postpipeliner-maxii`) or after 20 IIs (`-maxtry-ii`).
   The report warns when that build's llvm-aie commit is not the wheel's (and lists the commits between them
   that touch the AIE backend or CodeGen): its traces may then differ from the shipped schedule.
-- Slot and port tables: `artlite/aie2p_isa.py`, generated from llvm-aie's TableGen at the wheel's commit by
+- Slot and port tables: `artlite/aie2p_isa.py` (ports per mnemonic, and per first-operand register kind where a
+  mnemonic's variants differ: `PORT_KINDS`, e.g. a `vst` of a vector register reads QEY_RS), generated from llvm-aie's
+  TableGen at the wheel's commit by
   `python -m artlite.gen_isa_tables` (after a toolchain upgrade; `test_variant_search.py` checks them when the
   `../llvm-aie` checkout and its `llvm-tblgen` are there).
 - `--npu`: the builds compile in parallel, then each runs alone in its own process: the time of one

@@ -99,6 +99,17 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | The dequant pair's last spilled constant (-128) as a load from a bank-1 table walked by two copies | reloads 2 -> 0, II 40 -> 42: the saved conflicts and the 2 cycles cancel |
 | SD 1.5's activation table copies in two regions | its fixed L1 layout has no 1.6 KB in another region; the tables' stalls are ~0.1-0.2% of a UNet step |
 
+## Gather loops (IQ formats: IQ3_S, IQ3_XXS, IQ4)
+
+| idea | result |
+|---|---|
+| IQ3_S prefill: gather per tile in its row groups, compact by 4-row halves on the store (no index or sign compaction) | 168 tile-panels per k-tile instead of 128, 32-byte half stores on QEY_RS: II 35-37 per 4 panels (12 panels per iteration for constant offsets: not pipelined) |
+| IQ3_S prefill: 32-bit grid entries (no unpack, 4 KB copies) | `_iq3sg` 532 vs 535 (II 31 either way) and no pinned layout fits the dequantizing core |
+| IQ3_S prefill: gathers, signs and the bfp16 conversion in one loop | II 59 per 4 panels with spills (mv 47: 17 vmov), 981 vs 538 + 233 for two loops |
+| IQ3_S decode: a word of 9th bits per 4 panels in the records (a re-layout), the loop's own `vsel` instead of `_iq3s_hb` | II 33 instead of 29: 841 vs 736 + 122 per super-block |
+| Gather loops unrolled to 8 panels per iteration (any target II) | not pipelined, spills |
+| IQ3_XXS / IQ4 decode panel loops at target IIs | II 39 / 21 unchanged (their QEY_RS 30 / 18) |
+
 ## Data movement
 
 | idea | result |

@@ -2376,6 +2376,23 @@ for _port, _text in aie2p_isa.PORT_MNEMONICS.items():
     for _word in _text.split():
         _mnemonic, _, _cycles = _word.partition("*")
         _PORTS_OF.setdefault(_mnemonic, []).append((_port, int(_cycles or 1)))
+# (mnemonics whose ports follow their first operand's register kind: vst of a vector register reads QEY_RS, of an
+# accumulator not)
+_PORT_KINDS = {mnemonic: {kind: list(busy.items()) for kind, busy in by.items()}
+               for mnemonic, by in aie2p_isa.PORT_KINDS.items()}
+_REGISTER_KIND = re.compile(r"(bm|cm|dm|ex|ey|wl|wh|x|y)[lh]{0,2}\d")
+_KIND = {"bm": "BM", "cm": "CM", "dm": "DM", "ex": "EX", "ey": "EY", "wl": "W", "wh": "W", "x": "X", "y": "Y"}
+
+
+def ports_of(instruction: str) -> list[tuple[str, int]]:
+    """The shared ports (and cycles) of an assembly instruction."""
+    mnemonic, *rest = instruction.split(None, 1)
+    by = _PORT_KINDS.get(mnemonic)
+    if by is not None and rest:
+        found = _REGISTER_KIND.match(rest[0].strip())
+        if found and _KIND[found.group(1)] in by:
+            return by[_KIND[found.group(1)]]
+    return _PORTS_OF.get(mnemonic, [])
 
 
 def slot_of(instruction: str) -> str | None:
@@ -2453,7 +2470,7 @@ def count_slots(bundles: Sequence[Sequence[str]]) -> SlotCounts:
             if slot is not None:
                 mnemonic = instruction.split(None, 1)[0]
                 counts.ops.setdefault(slot, Counter())[mnemonic] += 1
-                for port, cycles in _PORTS_OF.get(mnemonic, ()):
+                for port, cycles in ports_of(instruction):
                     counts.port_ops.setdefault(port, Counter())[mnemonic] += cycles
     return counts
 

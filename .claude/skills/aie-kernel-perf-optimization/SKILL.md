@@ -166,7 +166,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **R14 Weight panels from gathers** (IQ3_XXS's grid, IQ3_S's, IQ4's value pairs): indices upshifted into an
   accumulator on the load, one vector load of masks per several panels, no FIFO in the gather loop, a lossless
   re-encoding that removes decode steps, the MMUL in a loop of its own (4596 -> ~2300 cycles per half tile); 16-bit
-  entries in order by one `T16_16x4_lo` shuffle, a 9th index bit on the MMUL from precomputed bytes.
+  entries in order by one `T16_16x4_lo` shuffle, a 9th index bit on the MMUL from precomputed bytes; the stores count on
+  the gathers' QEY_RS; compacted rows from constant windows (records per iteration so that every shift is a constant).
 
 ## 4. Pipelining playbook
 
@@ -208,7 +209,7 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **`AIE_LOOP_IGNORE_MEM_DEPS` also drops spill / reload ordering**: a spilling loop computed garbage with it. Use
   distinct `__restrict` parameters instead.
 - **`AIE_TRY_INITIATION_INTERVAL(N)`**: an exact search at N. It finds schedules the heuristics miss (gemm_q header
-  copies II 9 -> 6) and is useless below the bound.
+  copies II 9 -> 6, gather loops 40 -> 29 and 28 -> 21: loop-hints.md) and is useless below the bound.
 - **Short trips**: a pipelined loop peels NS - 1 iterations into its prologue and epilogue; for a few iterations the
   ramp can cost as much as the steady state.
 - **Global flags** (`-aie-postpipeliner-maxii` etc.) apply to every loop of the kernel file and have miscompiled a

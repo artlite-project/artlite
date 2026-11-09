@@ -136,3 +136,14 @@ PORT_MNEMONICS = {
         "acq*4 acq.cond*4 rel*4 rel.cond*4"
     ),
 }
+# Mnemonics whose ports depend on their first operand's register kind (x, w(l/h), y, bm, cm, dm, ex, ey): the
+# ports of each kind that differ from PORT_MNEMONICS' (port: cycles).
+PORT_KINDS = {
+    "vlda": {"BM": {"ada": 1, "dwm": 1}, "W": {"ada": 1, "qwa": 1}, "X": {"ada": 1, "qwa": 1}},
+    "vlda.2d": {"BM": {"ada": 1, "dwm": 1}, "W": {"ada": 1, "qwa": 1}, "X": {"ada": 1, "qwa": 1}},
+    "vlda.3d": {"BM": {"ada": 1, "dwm": 1}, "W": {"ada": 1, "qwa": 1}, "X": {"ada": 1, "qwa": 1}},
+    "vmov": {"BM": {"dwm": 1}, "CM": {"dwm": 1}, "X": {"qwa": 1}},
+    "vst": {"W": {"qrs": 1}, "X": {"qrs": 1}},
+    "vst.2d": {"W": {"qrs": 1}, "X": {"qrs": 1}},
+    "vst.3d": {"W": {"qrs": 1}, "X": {"qrs": 1}},
+}

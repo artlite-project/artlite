@@ -11,7 +11,8 @@ HEAD and working tree do not matter. ``--check`` changes nothing and exits 1 whe
 
 Per mnemonic (the first word of an AsmString, non-pseudo instructions with a slot): its slots, and per port the
 cycles it occupies the port's unit (InstrItinData stages of its Itinerary, Reserved stages skipped), common to every
-instruction of that mnemonic.
+instruction of that mnemonic; where those differ by the register kind of the first assembly operand (a ``vst`` of a
+vector register or of an accumulator), the ports per kind (``PORT_KINDS``).
 """
 
 import argparse
@@ -87,8 +88,28 @@ def _list(value: str) -> list[str]:
     return re.findall(r"\w+", value)
 
 
-def tables(records: dict[str, dict[str, str]]) -> tuple[dict[str, list[str]], dict[str, Counter[str]]]:
-    """Per mnemonic its slots (sorted) and the cycles it occupies each port (short names of PORTS)."""
+# The register kind of an instruction's first assembly operand, from its operand class's name (OP_mXs, OP_mWs,
+# OP_mBMs, ...): the mnemonics whose variants differ in their ports by it (vst of a vector register reads QEY_RS, of an
+# accumulator not) get ports per kind (``PORT_KINDS``; measure_ii matches the operand's register name: x, wl / wh, bm ..).
+KINDS = ("BM", "CM", "DM", "EX", "EY", "X", "W", "Y")
+
+
+def operand_kind(fields: dict[str, str]) -> str | None:
+    """The register kind (KINDS) of the instruction's first assembly operand, or None."""
+    asm = fields.get("AsmString", '""').strip('"').split(None, 1)
+    first = re.match(r"\s*\$(\w+)", asm[1]) if len(asm) > 1 else None
+    if first is None:
+        return None
+    operands = fields.get("OutOperandList", "") + " " + fields.get("InOperandList", "")
+    cls = re.search(r"(\w+):\$" + first.group(1) + r"\b", operands)
+    found = re.match(r"(?:OP_)?m?(" + "|".join(KINDS) + r")[a-z]", cls.group(1)) if cls else None
+    return found.group(1) if found else None
+
+
+def tables(records: dict[str, dict[str, str]]) -> tuple[dict[str, list[str]], dict[str, Counter[str]],
+                                                        dict[str, dict[str, Counter[str]]]]:
+    """Per mnemonic its slots (sorted) and the cycles it occupies each port (short names of PORTS), common to its
+    variants; per mnemonic whose variants differ by their first operand's register kind, the ports per kind."""
     stages = {}
     for name, fields in records.items():
         if "Units" in fields and "Cycles" in fields and "Kind" in fields:
@@ -100,6 +121,7 @@ def tables(records: dict[str, dict[str, str]]) -> tuple[dict[str, list[str]], di
     units_of = {unit: port for port, unit in PORTS.items()}
     slots: dict[str, set[str]] = {}
     ports: dict[str, Counter[str]] = {}
+    by_kind: dict[str, dict[str, Counter[str]]] = {}
     for fields in records.values():
         asm = fields.get("AsmString", '""').strip('"').split()
         slot = fields.get("Slot", "").removesuffix("_slot")
@@ -117,10 +139,17 @@ def tables(records: dict[str, dict[str, str]]) -> tuple[dict[str, list[str]], di
                         busy[units_of[unit]] += max(cycles, 1)
         slots.setdefault(mnemonic, set()).add(slot)
         ports[mnemonic] = busy if mnemonic not in ports else ports[mnemonic] & busy
+        kind = operand_kind(fields)
+        if kind is not None:
+            by = by_kind.setdefault(mnemonic, {})
+            by[kind] = busy if kind not in by else by[kind] & busy
     unknown = {slot for found in slots.values() for slot in found} - set(SLOTS)
     if unknown:
         raise RuntimeError(f"unknown issue slots {sorted(unknown)}: update SLOTS")
-    return {mnemonic: sorted(found, key=SLOTS.index) for mnemonic, found in slots.items()}, ports
+    kinds = {mnemonic: {kind: busy for kind, busy in sorted(by.items()) if busy != ports[mnemonic]}
+             for mnemonic, by in sorted(by_kind.items())}
+    return ({mnemonic: sorted(found, key=SLOTS.index) for mnemonic, found in slots.items()}, ports,
+            {mnemonic: by for mnemonic, by in kinds.items() if by})
 
 
 def _wrapped(words: list[str], indent: str) -> list[str]:
@@ -135,7 +164,8 @@ def _wrapped(words: list[str], indent: str) -> list[str]:
     return [f'{indent}"{text}"' for text in lines]
 
 
-def render(commit: str, slots: dict[str, list[str]], ports: dict[str, Counter[str]]) -> str:
+def render(commit: str, slots: dict[str, list[str]], ports: dict[str, Counter[str]],
+           kinds: dict[str, dict[str, Counter[str]]]) -> str:
     out = [
         f'"""AIE2P issue slots and shared ports per assembly mnemonic, from llvm-aie {commit[:12]}.',
         "",
@@ -172,6 +202,16 @@ def render(commit: str, slots: dict[str, list[str]], ports: dict[str, Counter[st
             if busy[port]
         )
         out += [f'    "{port}": (', *_wrapped(words, "        "), "    ),"]
+    out += [
+        "}",
+        "# Mnemonics whose ports depend on their first operand's register kind (x, w(l/h), y, bm, cm, dm, ex, ey): the",
+        "# ports of each kind that differ from PORT_MNEMONICS' (port: cycles).",
+        "PORT_KINDS = {",
+    ]
+    for mnemonic, by in kinds.items():
+        items = ", ".join(f'"{kind}": {{{", ".join(f"{chr(34)}{port}{chr(34)}: {n}" for port, n in sorted(busy.items()))}}}'
+                          for kind, busy in by.items())
+        out.append(f'    "{mnemonic}": {{{items}}},')
     out += ["}", ""]
     return "\n".join(out)
 
