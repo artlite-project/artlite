@@ -1044,16 +1044,16 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
 {% endif %}
 
 {% if GATE %}
-// The pass's gates (its GATE object's first values: per token group of the pass [token 8][head QH] bf16, the stream B
-// walk's 72 values of a slice, then the next slice's at 288): the core's blocks' as gt [head QH][query block QB][token
-// 8] fp32
+// The pass's gates (its GATE object's first values: per column of the stream and token group of the pass [token
+// 8][head QH] bf16, the stream B walk's 72 values of a slice, the next slice's 288 on): the core's blocks' (row r of the
+// stream's: r + 4 j in column j) as gt [head QH][query block QB][token 8] fp32
 __attribute__((minsize)) void {{ p }}_gsel(const bfloat16 *__restrict u, float *__restrict ws, int32_t r)
 {
     float *__restrict gt = AW(float, {{ w.gt }});
     for (int h = 0; h < {{ QH }}; h++)
         for (int i = 0; i < {{ 8 * QB }}; i++) {
             const int e = {{ 8 * QH * QB }} * r + {{ QH }} * i + h;  // (its value in the object)
-            gt[{{ 8 * QB }} * h + i] = (float)u[e < 72 ? e : e + 216];
+            gt[{{ 8 * QB }} * h + i] = (float)u[e + 216 * (e / 72)];
         }
 }
 
@@ -1328,13 +1328,17 @@ class AttnOperator(ArtcOperator):
     COUNTER0 = 0x31520
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
-                 ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0):
+                 ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
+                 bcast: bool = True):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
         packed variant's window of cache groups; ``ring``: its history's groups held in the memory tiles (class
         docstring); ``swa``: a sliding window of that many positions (whole cache groups: each pass streams the window's
-        groups before its own and its own, from ``kv0`` bytes of a KV head's cache, its guard, before group 0)."""
+        groups before its own and its own, from ``kv0`` bytes of a KV head's cache, its guard, before group 0); ``bcast``
+        (two columns per KV head, ``Shape.per``): the KV head's streams read once, by column 2 h's shim, and broadcast by
+        its memtile to the cores of both columns (each taking its column's Q units and gates of both), else each column
+        reads them (twice the cache's bytes: a reference)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -1349,6 +1353,8 @@ class AttnOperator(ArtcOperator):
         self.n_pass = T // self.pq
         self.ring = ring
         self.swa, self.kv0 = swa, kv0
+        self.bc = shape.per == 2 and bcast  # (one stream per KV head, broadcast to its columns' cores)
+        assert not self.bc or (shape.gate and not window and not ring), "the broadcast: LFM3's shapes"
         assert not swa or (swa % s.pg == 0 and not window and not ring and kv0 >= swa // s.pg * s.group), swa
         if ring:
             assert window and self.m == 1 and s.kp == 2 and s.used % (2 * s.unit) == 0, "the ring: hi + lo K, a pass a group"
@@ -1480,15 +1486,16 @@ class AttnOperator(ArtcOperator):
                                pad=[(0, 0)] * 3)
         else:  # (a unit's two records interleaved per d-block)
             ka_ty, walk = u_ty, ilv
-        a3 = [ObjectFifo(ka_ty, name=f"la_ka{c}", depth=2) for c in range(COLS)]
-        a1 = [a3[c].cons().forward(tile=Tile(c, 1), obj_type=u_ty, depth=2, name=f"la_k{c}", to_stream=walk)
-              for c in range(COLS)]
+        scols = list(range(0, COLS, s.per)) if self.bc else list(range(COLS))  # (the columns whose shims stream)
+        a3 = {c: ObjectFifo(ka_ty, name=f"la_ka{c}", depth=2) for c in scols}
+        a1 = {c: a3[c].cons().forward(tile=Tile(c, 1), obj_type=u_ty, depth=2, name=f"la_k{c}", to_stream=walk)
+              for c in scols}
         # stream B: objects of two units, four slices of nd panels (4 V records; 4 Q units: two pairs of row blocks)
         # -> per d half [d-block pair][slice][d-block 2]
         vwalk = stream_walk(s.unit, [(2, nd // 2 * 36), (nd // 4, 72), (4, nd * 36), (72, 1)])
-        b3 = [ObjectFifo(np.ndarray[(s.unit,), bf], name=f"la_vb{c}", depth=2) for c in range(COLS)]
-        b1 = [b3[c].cons().forward(tile=Tile(c, 1), obj_type=u_ty, depth=2, name=f"la_v{c}", to_stream=vwalk)
-              for c in range(COLS)]
+        b3 = {c: ObjectFifo(np.ndarray[(s.unit,), bf], name=f"la_vb{c}", depth=2) for c in scols}
+        b1 = {c: b3[c].cons().forward(tile=Tile(c, 1), obj_type=u_ty, depth=2, name=f"la_v{c}", to_stream=vwalk)
+              for c in scols}
         o3 = [ObjectFifo(om_ty, name=f"la_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([qb * nd * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"la_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
@@ -1512,7 +1519,7 @@ class AttnOperator(ArtcOperator):
             else:
                 if gsel is not None:  # (the pass's GATE object: two units, the first read)
                     u = b_h.acquire(1)
-                    gsel(u, ws, row)
+                    gsel[0](u, ws, gsel[1])
                     b_h.release(1)
                     b_h.acquire(1)
                     b_h.release(1)
@@ -1549,7 +1556,7 @@ class AttnOperator(ArtcOperator):
         npg = n_pass // m  # (the chunk's groups)
 
         def core(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, *extra):
-            seg, gs = (extra[:-1], extra[-1]) if s.gate else (extra, None)
+            seg, gs = (extra[:-2], extra[-2:]) if s.gate else (extra, None)
             if self.ring:  # (every pass the held history and the whole ring)
                 for _ in forever_():
                     for bg in range_(npg):
@@ -1562,18 +1569,25 @@ class AttnOperator(ArtcOperator):
                 for bg in range_(min(npg, win + 1) if win else npg):
                     for bb in range(m):  # (the pass's units to every core: each keeps its own)
                         turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb,
-                             2 * rb * s.qp, *seg, gsel=gs)
+                             2 * rb * s.qp * (s.per if self.bc else 1), *seg, gsel=gs)
                 if win and npg > win + 1:
                     for bg in range_(win + 1, npg):
                         for bb in range(m):
                             turn(a_h, b_h, o_h, init, grp, qsel, qk, soft, pv, fin, ws, wo, q, p8, fq, me, row, bg, bb,
                                  2 * rb * s.qp, *seg, full=True)
 
-        workers = [Worker(core, [a1[c].cons(), b1[c].cons(), o1[c][r].prod(), k_init, k_grp, k_qsel, k_qk, k_soft,
-                                 k_pv, k_fin, Buffer(ws_ty, name=f"la_ws{c}_{r}"), Buffer(wo_ty, name=f"la_wo{c}_{r}"),
-                                 Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq, rb * r, r,
+        def src(c: int) -> int:  # (the column whose streams column c's cores take)
+            return c - c % s.per if self.bc else c
+
+        def jb(c: int) -> int:  # (column c's place among a broadcast's columns)
+            return c % s.per if self.bc else 0
+
+        workers = [Worker(core, [a1[src(c)].cons(), b1[src(c)].cons(), o1[c][r].prod(), k_init, k_grp, k_qsel, k_qk,
+                                 k_soft, k_pv, k_fin, Buffer(ws_ty, name=f"la_ws{c}_{r}"),
+                                 Buffer(wo_ty, name=f"la_wo{c}_{r}"), Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq,
+                                 rb * (r + 4 * jb(c)), r,
                                  *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win else []),
-                                 *([k_gsel] if s.gate else [])],
+                                 *([k_gsel, r + 4 * jb(c)] if s.gate else [])],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs, n_kv, n_a, NH = self.n_qs, self.n_kv, self.n_a, COLS * qh
@@ -1629,7 +1643,7 @@ class AttnOperator(ArtcOperator):
                 j0, nw = (max(1, ng - win + 1), min(ng, win)) if win else (1, ng)
                 t0 = 4 * qb * b  # (the pass's first token group: its sub-chunk, the group in it)
                 q0 = t0 // sg * sg * COLS * tw + t0 % sg * tw
-                for c in range(COLS):
+                for i, c in enumerate(scols):
                     h = c // s.per  # (the column's KV head)
                     k0, v0 = h * hb + self.kv0 // 2, h * hb + self.kv0 // 2 + s.kp * o2
                     if self.swa:  # (the window's groups before the pass's and its own, from the guard on)
@@ -1640,13 +1654,14 @@ class AttnOperator(ArtcOperator):
                         parts = [kv_part(k0, sizes=k_tap[0], strides=k_tap[1])]
                         if nw:
                             parts.append(kv_part(k0 + (j0 - 1) * g2, nw, sizes=k_tap[0], strides=k_tap[1]))
-                    chained_fill(ah[c], KV, parts, tp, wait=True)
-                    qc = q0 + c * sg * tw
+                    chained_fill(ah[i], KV, parts, tp, wait=True)
+                    qc, nc = q0 + c * sg * tw, s.per if self.bc else 1  # (the stream's columns: their Q units, gates)
                     if s.gate:  # (the pass's Q units, then its GATE object: its token groups' gates, padding to 2 units)
-                        parts = [ChainPart(QS, TensorAccessPattern((n_qs,), qc, [1, 4 * qb, qh, uw], [0, tw, uw, 1])),
-                                 ChainPart(QS, TensorAccessPattern((n_qs,), qc + qh * uw, [1, 1, 4 * qb, gw2],
-                                                                   [0, 0, tw, 1])),
-                                 ChainPart(QS, TensorAccessPattern((n_qs,), 0, [1, 1, 1, s.unit - 4 * qb * gw2],
+                        parts = [ChainPart(QS, TensorAccessPattern((n_qs,), qc, [1, nc, 4 * qb, qh * uw],
+                                                                   [0, sg * tw, tw, 1])),
+                                 ChainPart(QS, TensorAccessPattern((n_qs,), qc + qh * uw, [1, nc, 4 * qb, gw2],
+                                                                   [0, sg * tw, tw, 1])),
+                                 ChainPart(QS, TensorAccessPattern((n_qs,), 0, [1, 1, 1, s.unit - nc * 4 * qb * gw2],
                                                                    [0, 0, 0, 1]))]
                     else:
                         parts = [ChainPart(QS, TensorAccessPattern((n_qs,), qc, [1, 1, 4 * qb * qh, uw], [0, 0, uw, 1]))]
@@ -1661,7 +1676,7 @@ class AttnOperator(ArtcOperator):
                         if nw:
                             parts.append(kv_part(v0 + (j0 - 1) * g2, nw, sizes=[1, 1, rows, 576],
                                                  strides=[0, g2, 576, 1]))
-                    chained_fill(bh[c], KV, parts, tp, wait=True)
+                    chained_fill(bh[i], KV, parts, tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) > (1 if win or s.gate else 2):  # (a GATE object: two parts more)
                     inflight.pop(0).finish()
@@ -1706,8 +1721,8 @@ class AttnOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if win else []),
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b3)],
+                           [a3[c].prod(tile=Tile(c, 0)) for c in scols],
+                           [b3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()
