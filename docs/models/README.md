@@ -27,7 +27,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images) | |
 | | ✅ Swift 1.5 (Qwen3.8 27B fine-tune, uncensored) | IsValorum APEX-I-MiniPlus V3 (IQ4_XS / IQ3_S / IQ3_XXS FFN), with its MTP layer as the drafter | its mmproj Q8_0 |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
-| | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0 | images (their Qwen3-VL encoder) |
+| | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0, their mmproj Q8_0 (images) | |
 | | ✅ Kev-4B (decision model: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q4_K_M | |
 | qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0); its mmproj BF16 (images) | |
 | | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M); its mmproj Q8_0 (images) | |
@@ -42,7 +42,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3-Reranker-0.6B ([rerank](../server.md#embeddings-and-rerank)) | ggml-org Q8_0 | |
 | vllm-decision2 | ✅ vllm-sr Decision-2.0-Kai-0.6B (decision model: [`/v1/systemone`](../server.md#decisions)) | Q8_0 by llama.cpp's converter from vllm-sr's checkpoint | |
 | lfm3 | ✅ LFM3-1.7B | LiquidAI QAD-Q4_0, Q4_K_M, Q8_0 | the sliding-window layers' caches as rings; LiquidAI BF16 |
-| | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0 | images, video (its mmproj: LFM3-VL's encoder) |
+| | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0, its mmproj Q8_0 (images) | video |
 | | ✅ LFM3-VL-2B | LiquidAI QAD-Q4_0, its mmproj BF16, Q8_0 (images) | video; LiquidAI Q4_K_M, Q8_0 |
 | | 🤔 LFM3-Audio-2B | | LiquidAI LFM3-Audio-2B: speech in and out |
 | | 🤔 LFM3-Omni-2B | | LiquidAI LFM3-Omni-2B, d1-Omni-2B |

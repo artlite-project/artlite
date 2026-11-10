@@ -114,15 +114,27 @@ class FakeModel(Model):
         return Sampling(temp=0.6 if think else 0.7, top_k=8, top_p=0.9)
 
 
-class FakeVision(FakeModel):
-    """A model with a vision encoder: an image part's bytes as two embedding rows (their first 16 bytes), the encoder's
-    threads recorded."""
+class FakeEncoder:
+    """A vision encoder: an image's bytes as two embedding rows (their first 16 bytes), its threads recorded."""
 
-    vision = "fake"
+    markup = ("<|system|>", "<|assistant|>")  # (two special tokens of the fake tokenizer)
+
+    def __init__(self) -> None:
+        self.threads: list[str] = []
+
+    def sequence(self, image: bytes) -> Sequence:
+        self.threads.append(threading.current_thread().name)
+        rows = np.frombuffer(bytes(image)[:16].ljust(16, b"\0"), np.uint8).astype(np.float32)
+        return Sequence(np.full(2, MEDIA), np.ones(2, bool), rows.reshape(2, 8), np.zeros((2, 3), np.int64), 1)
+
+
+class FakeVision(FakeModel):
+    """A model with a vision encoder (``FakeEncoder``), its threads recorded."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.threads: list[str] = []
+        self.vision = FakeEncoder()
+        self.threads = self.vision.threads
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
@@ -132,10 +144,7 @@ class FakeVision(FakeModel):
             text += f"<|{m['role']}|>"
             for part in m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]:
                 if part["type"] == "image":
-                    self.threads.append(threading.current_thread().name)
-                    rows = np.frombuffer(bytes(part["image"])[:16].ljust(16, b"\0"), np.uint8).astype(np.float32)
-                    img = Sequence(np.full(2, MEDIA), np.ones(2, bool), rows.reshape(2, 8), np.zeros((2, 3), np.int64), 1)
-                    seq, text = seq + self.tokenizer.encode(text) + img, ""
+                    seq, text = seq + self.tokenizer.encode(text) + self.vision.sequence(part["image"]), ""
                 else:
                     text += str(part["text"])
         return seq + self.tokenizer.encode(text + "<|assistant|>")

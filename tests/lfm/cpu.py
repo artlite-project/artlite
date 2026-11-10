@@ -14,10 +14,12 @@ override them (N0's simulations, the NPU's host models)."""
 import itertools
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LfmConfig
+from models.sequence import Sequence
 
 
 @dataclass
@@ -180,11 +182,15 @@ class LfmCpu:
         return self.residual(x + self.rms(self.ffn(L, self.rms(x, lw["fn"])), lw["pfn"]))
 
     @torch.no_grad()
-    def run(self, tokens: list[int], state: LfmState) -> torch.Tensor:
-        """The output-normed last hidden rows (T, hidden) of tokens after the state's positions (the state gains
-        them)."""
+    def run(self, tokens: list[int] | Sequence, state: LfmState) -> torch.Tensor:
+        """The output-normed last hidden rows (T, hidden) of tokens (ids, or a sequence: its given rows) after the
+        state's positions (the state gains them)."""
         p0 = state.n
-        x = self.emb[torch.tensor(tokens)]
+        if isinstance(tokens, Sequence):
+            x = self.emb[torch.from_numpy(np.where(tokens.given, 0, tokens.ids))]
+            x[torch.from_numpy(tokens.given)] = torch.from_numpy(tokens.rows).to(x.dtype)
+        else:
+            x = self.emb[torch.tensor(tokens)]
         for L in self.run_layers:
             x = self.layer(L, x, state, p0)
         state.n = p0 + len(tokens)

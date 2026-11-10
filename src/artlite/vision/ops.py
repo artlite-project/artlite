@@ -720,7 +720,7 @@ class Apply:
 
 @dataclass
 class Attention:
-    """Attention of ``heads`` (8, or 16 of d 80) heads of d 160 (16x16, 8x8) or 80 (32x32; 16x16: a key group over two
+    """Attention of ``heads`` (8, or 12 / 16 of d 80) heads of d 160 (16x16, 8x8) or 80 (32x32; 16x16: a key group over two
     columns' keys) over each image's keys, for the queries of tile ``tile`` (4 query panels of each image, 8 token
     panels; 8x8: one panel of each), or of d 40 (64x64, role c) for all of the op's (16 query panels of each image, one
     op): row i of ``rows`` (in role a / c) runs the units (image, head) of heads [h i, h i + h), h = heads / len(rows),
@@ -758,7 +758,7 @@ class Attention:
     kv_heads: int = 0
 
     def __post_init__(self) -> None:
-        assert self.d in (40, 80, 160) and len(self.rows) in (2, 4) and (self.heads == 8 or self.d == 80 and self.heads == 16)
+        assert self.d in (40, 80, 160) and len(self.rows) in (2, 4) and (self.heads == 8 or self.d == 80 and self.heads in (12, 16))
         self.kvh = self.kv_heads or self.heads
         assert self.heads % self.kvh == 0 and (self.kvh == self.heads or self.d == 80)
         self.hpr = self.heads // len(self.rows)  # (heads per row)

@@ -158,7 +158,7 @@ class NpuEncoder(Encoder):
     GEMM's A as bfp16 panels and its weights bfp16, C over the whole K from the bf16 bias plus a bf16 residual, rounded
     once (bf16 C tiles: the residual stream; bfp16 panels: a GEMM's or the attention's input); Q and K rounded to bf16,
     turned by bf16 cos / sin (the products summed in fp32, rounded to bf16), then bfp16 per head's 8 dims of the
-    epilogue's layout (dims 0 .. 35 | 36 .. 71 of 36, each padded to 40); LayerNorm statistics S1, S2 of the bf16 values
+    epilogue's layout (dims 0 .. d / 2 - 1 | d / 2 .. d - 1, each padded to 40); LayerNorm statistics S1, S2 of the bf16 values
     in fp32; GELU of bf16 values to bf16; attention with P = 2^(s - max) in bf16 as bfp16 panels, l their sums, o / l as
     panels. The keys' blocks of 8 (P's and V^T's) are the NPU's key panels: ``vblocks``, per block its 8 patches (-1:
     a padding slot). ``forward``: the patch embedding to bf16, every layer, post_ln's panels, the merge and the merger
@@ -198,8 +198,8 @@ class NpuEncoder(Encoder):
         x = _bf16(c).reshape(n, self.heads, 2, h).transpose(0, 1)
         cs, sn = (_bf16(f(ang)).to(c.dtype) for f in (torch.cos, torch.sin))
         a, b = x[:, :, 0], x[:, :, 1]
-        out = torch.stack([_bf16(a * cs - b * sn), _bf16(b * cs + a * sn)], 2)  # (heads, n, 2, 36)
-        out = torch.nn.functional.pad(out, (0, 4))  # (the epilogue's blocks: 36 + 4 per half)
+        out = torch.stack([_bf16(a * cs - b * sn), _bf16(b * cs + a * sn)], 2)  # (heads, n, 2, d / 2)
+        out = torch.nn.functional.pad(out, (0, 40 - h))  # (the epilogue's blocks: d / 2 + zeros to 40 per half)
         return _bfp(out).reshape(self.heads, n, 2, 40)[..., :h].reshape(self.heads, n, self.hd)
 
     def attention(self, a: torch.Tensor, p: str, ang: torch.Tensor, vblocks: np.ndarray) -> torch.Tensor:

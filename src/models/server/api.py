@@ -13,13 +13,11 @@ ones joined and the later ones as user messages - Claude Code sends system messa
 from __future__ import annotations
 
 import asyncio
-import base64
 import dataclasses
 import json
 import logging
 import secrets
 import time
-import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +34,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, Sampling, chat_template
 from ..readouts import Readouts
+from ..sequence import data_bytes
 from . import agents, decisions, readouts
 from .agents import Blocks
 from .engine import Engine, Job
@@ -154,9 +153,8 @@ def image_bytes(url: object) -> bytes:
     u = url.get("url") if isinstance(url, dict) else url
     if not isinstance(u, str) or not u.startswith("data:") or "," not in u:
         raise bad_request("an image_url must be a data URI (data:image/...;base64,...)")
-    head, data = u.split(",", 1)
     try:
-        return base64.b64decode(data, validate=True) if head.endswith(";base64") else urllib.parse.unquote_to_bytes(data)
+        return data_bytes(u)
     except ValueError:
         raise bad_request("an image_url's base64 data does not decode") from None
 

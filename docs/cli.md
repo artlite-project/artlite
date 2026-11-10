@@ -49,9 +49,9 @@ and generation speeds go to stderr.
 | `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
 | `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4, LFM3), below |
-| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in the prompt |
-| `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([Qwen](models/qwen35.md#images-qwen35--36--38), [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) |
-| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default 8 / 4096 and 64 / 4096, llama.cpp's) |
+| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`): images in the prompt |
+| `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([Qwen](models/qwen35.md#images-qwen35--36--38), [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images)) |
+| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, else 8 / 4096 and 64 / 4096, llama.cpp's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen3

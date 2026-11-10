@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from ..sequence import MEDIA, Sequence
+from ..sequence import MEDIA, Sequence, splice
 
 MIN_TOKENS, MAX_TOKENS = 64, 4096  # (an image's merged tokens: the mmproj's min pixels / 1024, llama.cpp's cap)
 IMAGE = "<|image|>"  # (the chat template's place of an image, between <|vision_start|> and <|vision_end|>)
@@ -81,10 +81,6 @@ def image_prompt(text: str, images: list[object], encode: Callable[[str], list[i
     """A chat prompt's text with the template's ``IMAGE`` per image -> its tokens: each placeholder becomes the image's
     tokens (``sequence(image)``: ``Grid.sequence``'s); the template's ``<|vision_start|>`` and ``<|vision_end|>``
     around it stay text."""
-    parts = text.split(IMAGE)
-    if len(parts) != len(images) + 1:
-        raise ValueError(f"{len(images)} image(s) for {len(parts) - 1} place(s) in the prompt")
-    seq = Sequence.text(encode(parts[0]))
-    for im, tail in zip(images, parts[1:], strict=True):
-        seq = seq + sequence(im) + encode(tail)
-    return seq
+    if text.count(IMAGE) != len(images):
+        raise ValueError(f"{len(images)} image(s) for {text.count(IMAGE)} place(s) in the prompt")
+    return splice(text, IMAGE, [sequence(im) for im in images], encode)

@@ -142,23 +142,30 @@ which then scales up their small errors. The language model hardly notices: teac
 
 LiquidAI's d1-2B is a decision model on LFM3's trunk: typed answers to questions about a state (a choice, a score, a
 yes / no probability) from one forward pass, no generated text, through
-[artlite-server's `/v1/systemone`](../server.md#decisions). Its files' text model only: pictures and video (its
-mmproj, LFM3-VL's encoder) do not run yet.
+[artlite-server's `/v1/systemone`](../server.md#decisions), about text and pictures (its mmproj: LFM3-VL's encoder).
+Video does not run yet.
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/d1-2B-GGUF/         LiquidAI/d1-2B-GGUF
     d1-2B-Q4_0.gguf
     d1-2B-Q4_K_M.gguf
     d1-2B-Q8_0.gguf                              (the nearest to the BF16 model)
+    mmproj-d1-2B-Q8_0.gguf                       (its vision encoder: pictures in requests; or its BF16, F16)
 ```
 
 ```bash
-artlite-server -m LiquidAI/d1-2B-GGUF/d1-2B-Q4_0.gguf
+artlite-server -m LiquidAI/d1-2B-GGUF/d1-2B-Q4_0.gguf --mmproj LiquidAI/d1-2B-GGUF/mmproj-d1-2B-Q8_0.gguf
 curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '{"state": "I was charged twice
   this month, please refund one of them.", "questions": {"refund": {"type": "noul", "instructions": "Is the customer
   asking for a refund?"}, "team": {"type": "choice", "instructions": "Which team should handle this?", "criteria":
   {"billing": "Charges, refunds", "technical": "App faults"}}}}'
 ```
+
+A request's pictures (`images`, or a chat state's `image_url` parts: [Decisions](../server.md#decisions)) head its
+state, each its tokens between `<|vision_start|>` and `<|vision_end|>`, as d1's runner and llama-server place them.
+A picture takes 64 to 1600 tokens of 32 x 32 pixels (d1's runner's budget, which it was trained at; llama-server reads
+up to 4096: `--image-max-tokens 1600` there gives the same sizes); a state with its pictures fits one chunk of 4096
+tokens.
 
 How it runs: its full-attention layers are non-causal, so a request is read as d1's own runner reads it, the state
 once and up to 16 questions after it in one sequence (a request's `set_size`: [Decisions](../server.md#decisions)),
@@ -166,7 +173,9 @@ in one prefill chunk from position 0 (at most 4096 tokens). The chunk's full lay
 non-causal design (`prefill/attn.py`): every pass streams the sequence's cache groups, the state's tokens see every
 token, a question's tokens the state and their own question (per row its own keys, in an object per pass; the chunks
 no row of a core sees skipped). The sliding-window and conv layers stay causal, the conv from zero histories. The
-answers come from each question's last row and its options' label tokens' rows of the LM head, on the host.
+answers come from each question's last row and its options' label tokens' rows of the LM head, on the host. A
+request's pictures run through the vision encoder first (LFM3-VL-2B's: [above](#lfm3-vl-2b-images)), once each; their
+tokens are the state's.
 
 Speed (Strix Halo, through the servers, HTTP included, warm; energy per question above a ~20 W idle):
 
@@ -189,5 +198,18 @@ about essays), each question alone as llama-server reads them:
 Questions in one sequence answer as d1's runner does (its Hugging Face model in fp32: the fp32 evaluation of the Q8_0
 file is within 0.012 of it on 27 requests of 4-8 questions, with the same prompts token for token), which differ from
 each question alone by up to 0.27 in a probability (median 0.09 a request).
+
+With pictures (57 questions on 16 requests: photos of 128 to 1600 tokens, drawn shapes, an invoice; one or two
+pictures with a state, pictures alone, a chat state), each question alone against llama-server on the CPU (its
+mmproj on the CPU too): Q4_0 57 / 57 the same answer, the largest difference in a probability 0.021 (median 0.003);
+Q8_0 56 / 57 (a score's near tie), 0.029 (0.003); the prompts' tokens the same as llama-server's. Speed, one question
+about a picture and 8 about one (energy a question above a 12.5 W idle):
+
+| request (Q4_0 + mmproj Q8_0) | NPU | iGPU (llama-server Vulkan) | CPU (llama-server) |
+|---|---|---|---|
+| a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture (292 / 802 / 1633 tokens) | 87 / 281 / 613 ms | 118 / 370 / 974 ms | 500 / 1369 / 3288 ms |
+| energy | 1.8 / 4.4 / 8.9 J | 4.8 / 13 / 32 J | 19 / 56 / 130 J |
+| 8 questions about a 512 x 512 picture | 127 ms (one sequence of 516 tokens; each alone: 646 ms) | 1241 ms | 3749 ms |
+| energy a question | 0.31 J | 5.6 J | 18.5 J |
 
 Design: the module docstrings of `decode/design.py`, `decode/attn.py` and `lfm/`.

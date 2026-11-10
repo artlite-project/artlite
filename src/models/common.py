@@ -34,6 +34,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import model_path
 
 from .drafts import EWMA, Lookup, Planner
+from .sequence import Sequence as Tokens
 
 if TYPE_CHECKING:
     from artlite.decode.model import Records
@@ -533,21 +534,21 @@ class NpuModel:
         out = self.forward(tokens, progress=progress)
         return out if logits else None
 
-    def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
+    def outputs(self, tokens: list[int] | Tokens, at: Sequence[int] | None = None, *, norm: bool = True,
                 progress: Callable[[int], None] | None = None, sets: Sequence[int] | None = None) -> np.ndarray:
-        """Run tokens after the cached positions (``prompt``) and return the last layer's outputs (len(at), hidden)
-        fp32 of the tokens at indices ``at`` (negative: from the end; None: every token), output-normed (``norm``: the
-        LM head's input; else the residual stream): a readout's rows (embeddings, a classifier's or the LM head's rows
-        on the host: ``models.readouts``). ``sets`` (a non-causal model whose prefill reads sets: LFM3's d1): the
-        prompt as a state and questions after it, bounds (S, e1, .., en): the state's tokens 0 .. S - 1 see every
-        token on the non-causal layers, question k's (e(k-1) .. ek - 1, e0 = S) the state's and their own; None: every
-        token sees every token."""
+        """Run tokens (ids, or a ``sequence.Sequence``: images' rows among them) after the cached positions
+        (``prompt``) and return the last layer's outputs (len(at), hidden) fp32 of the tokens at indices ``at``
+        (negative: from the end; None: every token), output-normed (``norm``: the LM head's input; else the residual
+        stream): a readout's rows (embeddings, a classifier's or the LM head's rows on the host: ``models.readouts``).
+        ``sets`` (a non-causal model whose prefill reads sets: LFM3's d1): the prompt as a state and questions after it,
+        bounds (S, e1, .., en): the state's tokens 0 .. S - 1 see every token on the non-causal layers, question k's
+        (e(k-1) .. ek - 1, e0 = S) the state's and their own; None: every token sees every token."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
     packs = False  # whether ``readouts`` packs inputs into prefill chunks (a readout model's prefill)
     lead_tokens = 0  # the length of a ``readouts`` lead that may run inside its first packed chunk (0: none)
 
-    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
+    def readouts(self, inputs: list[list[int] | Tokens], at: list[np.ndarray], *, norm: bool = True,
                  lead: list[int] | None = None, sets: list[Sequence[int] | None] | None = None) -> list[np.ndarray]:
         """Several inputs' output rows (each as ``outputs`` returns them): each input's tokens after the cached positions
         (a prefix every one of them continues; ``lead``: tokens of it not cached yet, run first; ``sets``: each one's
@@ -930,7 +931,7 @@ class OverlayModel(NpuModel):
         """Run the tokens after the cached positions: the logits (vocab,) of the last."""
         return self.prompt(tokens, logits=True, progress=progress)
 
-    def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
+    def outputs(self, tokens: list[int] | Tokens, at: Sequence[int] | None = None, *, norm: bool = True,
                 progress: Callable[[int], None] | None = None, sets: Sequence[int] | None = None) -> np.ndarray:
         """(every token a chunk can take in chunks, the last one padded: a chunk's rows need no LM head, which a decode
         step's do; the output norm on the host: ``_w_out``)"""
@@ -963,7 +964,7 @@ class OverlayModel(NpuModel):
             return self.prefill.pack(lengths, position).seconds
         return super().readout_seconds(lengths, position)
 
-    def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
+    def readouts(self, inputs: list[list[int] | Tokens], at: list[np.ndarray], *, norm: bool = True,
                  lead: list[int] | None = None, sets: list[Sequence[int] | None] | None = None) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
         the cached prefix; a recurrent model's after a prefix are tree chunks, which leave its states as the prefix left
@@ -1008,17 +1009,24 @@ class OverlayModel(NpuModel):
         bins, u = plan.bins, self.prefill.seg_unit(p)
 
         def chunk_of(idx: list[int], lead: list[int]) -> tuple:
-            """A packed chunk's inputs, positions, segment starts (-1: the padding tokens between two segments, up to
-            the next multiple of ``seg_unit``: the prefill zeroes their rows) and the segments' offsets (``lead``: its
-            first tokens, a segment from p - len(lead))."""
-            toks: list[int] = list(lead)
-            pos, lo, offs = [p - len(lead) + np.arange(len(lead))], [np.zeros(len(lead), np.int64)], []
+            """A packed chunk's inputs, positions (per token; (T, H, W) where an input is a ``sequence.Sequence``),
+            segment starts (-1: the padding tokens between two segments, up to the next multiple of ``seg_unit``: the
+            prefill zeroes their rows) and the segments' offsets (``lead``: its first tokens, a segment from p -
+            len(lead))."""
+            toks: list[int] | Tokens = list(lead)
+            rope = any(isinstance(inputs[i], Tokens) for i in idx)
+            text = (lambda n, p0: p0 + np.repeat(np.arange(n)[:, None], 3, 1)) if rope else \
+                (lambda n, p0: p0 + np.arange(n))
+            pos, lo, offs = [text(len(lead), p - len(lead))], [np.zeros(len(lead), np.int64)], []
             for k, i in enumerate(idx):
                 ids = inputs[i]
                 gap = -len(ids) % u if k + 1 < len(idx) else 0
                 offs.append(len(toks))
-                toks += ids + ids[-1:] * gap
-                pos += [p + np.arange(len(ids)), np.full(gap, p)]
+                toks = toks + ids
+                for _ in range(gap):
+                    toks = toks + ids[-1:]
+                pos += [p + ids.pos if isinstance(ids, Tokens) else text(len(ids), p),
+                        np.full((gap, 3) if rope else gap, p)]
                 lo += [np.full(len(ids), offs[-1]), np.full(gap, -1)]
             return self._chunk_inputs(toks, first=False), np.concatenate(pos), np.concatenate(lo), offs
 
@@ -1266,6 +1274,7 @@ class Model:
     chat_template: str | None = None  # a Jinja chat template in place of the file's (``open_model``'s); None: the file's
     tokenizer: Tokenizer
     eos_token_ids: tuple[int, ...] | set[int]
+    _npu: NpuModel | None = None  # (the model on the NPU, once ``load``ed)
 
     def encode(self, text: str) -> list[int]:
         """Token ids of a raw text (no chat template), after the model's BOS if it has one."""
@@ -1282,6 +1291,24 @@ class Model:
         ``{"type": "text", "text": ...}``, ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model
         with ``vision``: its prompt then a sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError
+
+    def image_tokens(self, image: object) -> Tokens:
+        """An image (a file, its bytes or a PIL image) as the model reads it where a prompt's text has ``MEDIA_MARKER``
+        (llama.cpp's mtmd: the encoder's markup ``vision.markup`` around the image's tokens); the encoder runs on the
+        NPU."""
+        markup = getattr(self.vision, "markup", None)
+        if markup is None:
+            raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
+        try:
+            return self.tokenizer.encode(markup[0]) + self.vision.sequence(image) + self.tokenizer.encode(markup[1])
+        finally:
+            self._vision_ran()
+
+    def _vision_ran(self) -> None:
+        """The image encoder's hardware context ran: the language model's overlay comes back before its next dispatch
+        (``OverlayDevice.set_prologue``)."""
+        if self._npu is not None:
+            self._npu.stale()
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The model's default sampling (in the thinking mode)."""

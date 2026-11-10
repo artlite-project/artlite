@@ -30,9 +30,14 @@ output-normed) on the host:
   (``Decisions.prompts``); on the full-attention layers the state's tokens see every token, a question's the state
   and its own (``Prompt.sets``, ``NpuModel.outputs``' ``sets``).
 
-Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni: other architectures or heads) and images (``files``,
-``images``, a chat message's image parts: d3's and pplx's encoders are Qwen3-VL's) are refused (501). A causal model's
-questions share the prompt's prefix through the prompt cache (``Engine.readouts``: the state once)."""
+Images (``files``, ``images``: data URLs; a chat state's ``image_url`` parts; at most ``MAX_IMAGES``) for lfm3-d1 and
+vllm-d3 (``IMAGE_TYPES``) on a server with the model's vision encoder: each runs the encoder once
+(``Model.image_tokens``: its tokens between the encoder's markup), the template gets a ``MEDIA_MARKER`` per image (at
+the head of the user turn in both: the state's first tokens) and the prompts are sequences of ids and embedding rows
+(``sequence.splice``, as llama.cpp's mtmd); a file's ``decision.temperature.image`` is the temperature of a request with
+images. Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni: other architectures or heads), images for the
+others, audio and video are refused (501). A causal model's questions share the prompt's prefix through the prompt
+cache (``Engine.readouts``: the state once)."""
 
 import asyncio
 import json
@@ -48,12 +53,14 @@ from starlette.concurrency import run_in_threadpool
 
 from artlite.gguf_model import GGUFFile
 
-from ..common import render_template
+from ..common import MEDIA_MARKER, render_template
+from ..sequence import Sequence, data_bytes, splice
 from .engine import Engine
 
 TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2", "lfm3-d1")  # (Artlite's)
 LABEL_TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3")  # (their scores: label logits)
 NULL_STATE = ("vllm-d3", "lfm3-d1")  # (a null state: the question alone)
+IMAGE_TYPES = ("vllm-d3", "lfm3-d1")  # (images in the state; llama-server's openjev and pplx-decider too: no files here)
 # (the questions' prompts share a prefix the model continues)
 SHARED = ("openjev", "lev", "kev", "nimble", "pplx-decider", "vllm-decision2")
 CLEF_MARKER, CLEF_SEP = "<<clef:", "<<clef:sep>>"  # (a joint prompt's pieces: ``Decisions.joint_prompt``)
@@ -72,6 +79,10 @@ ApiErrors = tuple[Callable[[str], Exception], Callable[[str], Exception]]  # (40
 
 class BadRequest(ValueError):
     """A request llama-server answers with 400 (its ``std::invalid_argument``)."""
+
+
+class Unsupported(ValueError):
+    """A request Artlite does not answer (501): media other than images."""
 
 
 def decision_type(meta: dict[str, Any], arch: str) -> str | None:
@@ -208,13 +219,14 @@ class Question:
 
 @dataclass
 class Prompt:
-    """One variant of a question: its tokens and the rows its scores read (indices into them). lfm3-d1: a sequence of
-    the questions ``questions`` after their state (each read at one row, in their order), ``sets`` its non-causal
-    attention's bounds (the state's end, then each question's: ``NpuModel.outputs``)."""
+    """One variant of a question: its tokens (with images: a sequence of ids and embedding rows) and the rows its
+    scores read (indices into them). lfm3-d1: a sequence of the questions ``questions`` after their state (each read at
+    one row, in their order), ``sets`` its non-causal attention's bounds (the state's end, then each question's:
+    ``NpuModel.outputs``)."""
 
     question: int
     variant: int
-    ids: list[int]
+    ids: list[int] | Sequence
     rows: np.ndarray
     questions: list[int] = field(default_factory=list)  # (lfm3-d1; else [question])
     sets: tuple[int, ...] | None = None
@@ -389,27 +401,30 @@ class Decisions:
             out.append(Question(qid, kind, instructions, options))
         return out
 
-    @staticmethod
-    def state(body: dict[str, Any]) -> tuple[Any, int]:
-        """A request's state without its images, and how many it has (``files`` / ``images``, a chat message's
-        ``image_url`` and ``input_audio`` parts; BadRequest: a bad one)."""
-        n = 0
+    def state(self, body: dict[str, Any]) -> tuple[Any, list[bytes]]:
+        """A request's state without its media, and its images' bytes, in order (``files`` / ``images``, then a chat
+        message's ``image_url`` parts; BadRequest: a bad one; Unsupported: audio (``input_audio`` parts, audio data
+        URLs) and video (lfm3-d1's ``video_url`` parts, video data URLs))."""
+        media: list[bytes] = []
 
         def image(url: object) -> None:
-            nonlocal n
             if not isinstance(url, str) or not url.startswith("data:"):
-                raise BadRequest("images must be data URLs (data:image/...;base64,... or data:audio/...;base64,...)")
-            if n >= MAX_IMAGES:
+                raise BadRequest("media must be data URLs (data:image/..., data:audio/... or data:video/...;base64,...)")
+            if len(media) >= MAX_IMAGES:
                 raise BadRequest(f"too many images, the maximum is {MAX_IMAGES}")
-            n += 1
+            if url.startswith(("data:audio/", "data:video/")):
+                raise Unsupported("artlite-server reads images in decision requests, not audio or video")
+            try:
+                media.append(data_bytes(url))
+            except ValueError as e:
+                raise BadRequest(str(e)) from None
 
         def audio(data: object) -> None:
-            nonlocal n
             if not isinstance(data, str) or data.startswith(("http", "file://")):
                 raise BadRequest("audio must be base64 data")
-            if n >= MAX_IMAGES:
+            if len(media) >= MAX_IMAGES:
                 raise BadRequest(f"too many media files, the maximum is {MAX_IMAGES}")
-            n += 1
+            raise Unsupported("artlite-server reads images in decision requests, not audio")
 
         if body.get("videos"):
             raise BadRequest("\"videos\" is not supported")
@@ -424,7 +439,7 @@ class Decisions:
         wrapped = isinstance(state, dict) and "messages" in state
         messages = state["messages"] if wrapped else state
         if not isinstance(messages, list):
-            return state, n
+            return state, media
         kept = []
         for msg in messages:
             if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
@@ -439,10 +454,12 @@ class Decisions:
                 elif kind == "input_audio" and "input_audio" in part:
                     a = part["input_audio"] if isinstance(part["input_audio"], dict) else {}
                     audio(a["data"] if "data" in a else a.get("url"))
+                elif kind == "video_url" and "video_url" in part and self.type == "lfm3-d1":  # (llama-server's media)
+                    raise Unsupported("artlite-server reads images in decision requests, not video")
                 else:
                     content.append(part)
             kept.append({**msg, "content": content})
-        return ({**state, "messages": kept} if wrapped else kept), n
+        return ({**state, "messages": kept} if wrapped else kept), media
 
     # ------------------------------------------------------------------
     # Prompts
@@ -522,9 +539,10 @@ class Decisions:
         self._d1[key] = (texts, groups)
         return texts, groups
 
-    def render(self, state: Any, questions: list[Question], q: Question, variant: int) -> str:
+    def render(self, state: Any, questions: list[Question], q: Question, variant: int, n_images: int = 0) -> str:
         """The prompt text of a question's variant (the template takes the raw JSON values: it serializes those that
-        are not strings)."""
+        are not strings), with ``n_images`` images: a ``MEDIA_MARKER`` each where the template puts them (none in the
+        input's values: llama-server's)."""
         inp: dict[str, Any] = {"id": q.id, "type": q.kind, "instructions": q.instructions, "state": state,
                                "options": self._options(q, variant)}
         if self.type == "nimble":  # (its prompt lists all the questions)
@@ -536,7 +554,9 @@ class Decisions:
             inp["state"], inp["instructions"] = _kev_text(state), _kev_text(q.instructions)
         if self.type == "lfm3-d1":
             inp = d1_break(inp, self.spellings)
-        inp["images"] = []
+        if n_images:
+            inp = _replace_text(inp, MEDIA_MARKER, " ")
+        inp["images"] = [MEDIA_MARKER] * n_images
         return render_template(self.template, **inp)
 
     def joint_prompt(self, state: Any, q: Question, encode: Callable[[str], list[int]]) -> tuple[list[int], np.ndarray]:
@@ -568,19 +588,21 @@ class Decisions:
         return ids, np.array([*options, question])
 
     def prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]], *,
-                set_size: int = D1_SET_SIZE, max_tokens: int = 0) -> list[Prompt]:
-        """Every question's variants as prompts (``encode``: the model's tokenizer, special tokens parsed); lfm3-d1:
+                media: list[Sequence] = (), set_size: int = D1_SET_SIZE, max_tokens: int = 0) -> list[Prompt]:
+        """Every question's variants as prompts (``encode``: the model's tokenizer, special tokens parsed; ``media``:
+        the request's images as the model reads them, ``Model.image_tokens``: the prompts are then sequences); lfm3-d1:
         sequences of up to ``set_size`` questions after their state (``_d1_prompts``), of at most ``max_tokens`` (0:
         any) where a question alone fits."""
         if self.type == "lfm3-d1":
-            return self._d1_prompts(state, questions, encode, set_size=set_size, max_tokens=max_tokens)
+            return self._d1_prompts(state, questions, encode, media=list(media), set_size=set_size,
+                                    max_tokens=max_tokens)
         out = []
         for i, q in enumerate(questions):
             if self.joint is not None:
                 out.append(Prompt(i, 0, *self.joint_prompt(state, q, encode)))
                 continue
             for v in range(self.n_variants(q)):
-                ids = encode(self.render(state, questions, q, v))
+                ids = splice(self.render(state, questions, q, v, len(media)), MEDIA_MARKER, list(media), encode)
                 if self.type == "kev":  # (an option read at its end token, the question at the last)
                     marks = [j for j, t in enumerate(ids) if t == self.marker]
                     if len(marks) != len(q.options):
@@ -592,24 +614,27 @@ class Decisions:
         return out
 
     def _d1_prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]], *,
-                    set_size: int, max_tokens: int) -> list[Prompt]:
+                    media: list[Sequence], set_size: int, max_tokens: int) -> list[Prompt]:
         """lfm3-d1's sequences (the runner's ``pack_set``): the prompt of a sequence's first question as the template
-        writes it (the state, "QUESTION:\\n", the question up to its answer slot), then each further question's part
-        after ``D1_HEADER``, tokenized alone; the state is the tokens before the first question's own (its part's
-        tokens alone). A question's part is its prompt after the template's head (its text with no state); a sequence
-        closes at ``set_size`` questions, or before one that would take it past ``max_tokens``."""
+        writes it (the images, the state, "QUESTION:\\n", the question up to its answer slot), then each further
+        question's part after ``D1_HEADER``, tokenized alone; the state is the tokens before the first question's own
+        (its part's tokens alone: the images are the state's, as the runner's media). A question's part is its prompt
+        after the template's head (its text with no state); a sequence closes at ``set_size`` questions, or before one
+        that would take it past ``max_tokens``."""
         sentinel = "\x00d1\x00"
         for q in questions:
             self.d1_labels(q, encode)
         probe = Question("", "noul", sentinel, [("true", None), ("false", None)])
         self.d1_labels(probe, encode)
-        head = self.render(None, [], probe, 0)
+        n = len(media)
+        head = self.render(None, [], probe, 0, n)
         head = head[:head.find(sentinel)]
         parts, prefix = [], None
         for q in questions:
-            whole, alone = self.render(state, questions, q, 0), self.render(None, questions, q, 0)
+            whole, alone = self.render(state, questions, q, 0, n), self.render(None, questions, q, 0, n)
             part = alone[len(head):]
-            if not alone.startswith(head) or not whole.endswith(part) or prefix not in (None, whole[:-len(part)]):
+            if not alone.startswith(head) or not whole.endswith(part) or prefix not in (None, whole[:-len(part)]) \
+                    or MEDIA_MARKER in part:
                 raise RuntimeError("unexpected layout of the decision prompt")
             prefix = whole[:-len(part)]
             parts.append(part)
@@ -620,12 +645,12 @@ class Decisions:
         out: list[Prompt] = []
         i = 0
         while i < len(questions):
-            ids = encode(prefix + parts[i])
+            ids = splice(prefix + parts[i], MEDIA_MARKER, media, encode)
             S = len(ids) - len(encode(parts[i]))
             ends, qs = [len(ids)], [i]
             i += 1
             while i < len(questions) and len(qs) < set_size and (not max_tokens or len(ids) + len(more[i]) <= max_tokens):
-                ids += more[i]
+                ids = ids + more[i]
                 ends.append(len(ids))
                 qs.append(i)
                 i += 1
@@ -689,13 +714,13 @@ class Decisions:
         uniform = sum(abs(i - (n - 1) / 2) / n for i in range(n))
         return max(0.0, 1.0 - dist / uniform)
 
-    def answer(self, q: Question, scores: list[np.ndarray]) -> dict[str, Any]:
-        """A question's answer from its variants' scores (each softmaxed at the question's temperature, the second
-        variant's in reverse order, then averaged)."""
+    def answer(self, q: Question, scores: list[np.ndarray], *, media: bool = False) -> dict[str, Any]:
+        """A question's answer from its variants' scores (each softmaxed at the question's temperature, or with
+        ``media`` the file's ``image`` one where it has it, the second variant's in reverse order, then averaged)."""
         n = self.n_outputs(q)
         if len(scores) != self.n_variants(q) or any(len(s) != n for s in scores):
             raise RuntimeError("decision result does not match the number of options")
-        T = self.temperature(q)
+        T = self.temperatures["image"] if media and "image" in self.temperatures else self.temperature(q)
         probs = np.zeros(n)
         for v, s in enumerate(scores):
             z = np.asarray(s, np.float64)
@@ -752,15 +777,28 @@ def add_routes(api: APIRouter, *, engine: Engine, alias: str, kind: str | None, 
         try:
             questions = d.questions(body)
             state, images = d.state(body)
+            set_size = d.set_size(body) if d.type == "lfm3-d1" else 1
         except BadRequest as e:
             raise bad(str(e)) from None
-        if images:
-            raise unsupported("This server does not support image input for decisions")
+        except Unsupported as e:
+            raise unsupported(str(e)) from None
+        model = engine.model
+        if images and getattr(model.vision, "markup", None) is None:
+            raise unsupported("This server does not support image input for decisions. For a model that supports it, "
+                              "start it with `--mmproj`")
+        if images and d.type not in IMAGE_TYPES:
+            raise unsupported(f"artlite-server reads images in decision requests of {', '.join(IMAGE_TYPES)}, not "
+                              f"{d.type}")
+        media: list[Sequence] = []
+        if images:  # (the encoder on the worker, between its jobs)
+            try:
+                media = await asyncio.wrap_future(engine.run(lambda: [model.image_tokens(b) for b in images]))
+            except (OSError, ValueError) as e:  # (an image that does not open or is too large)
+                raise bad(f"an image: {e}") from None
         npu = engine.npu
         whole = npu.prefill.sizes[-1] if not npu.causal else 0  # (a non-causal model reads a prompt in one chunk)
         try:
-            set_size = d.set_size(body) if d.type == "lfm3-d1" else 1
-            prompts = await run_in_threadpool(d.prompts, state, questions, engine.model.tokenizer.encode,
+            prompts = await run_in_threadpool(d.prompts, state, questions, model.tokenizer.encode, media=media,
                                               set_size=set_size, max_tokens=whole)
         except BadRequest as e:
             raise bad(str(e)) from None
@@ -780,9 +818,9 @@ def add_routes(api: APIRouter, *, engine: Engine, alias: str, kind: str | None, 
                 scores[i].append(d.scores(questions[i], rows[j:j + 1]))
         n = sum(len(p.ids) for p in prompts)
         return {"model": body.get("model") or alias,
-                "answers": {q.id: d.answer(q, s) for q, s in zip(questions, scores, strict=True)},
+                "answers": {q.id: d.answer(q, s, media=bool(media)) for q, s in zip(questions, scores, strict=True)},
                 "usage": {"input_tokens": n, "output_tokens": 0}}
 
 
-__all__ = ["TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "add_routes", "d1_break",
-           "decision_type", "escape_special"]
+__all__ = ["IMAGE_TYPES", "TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "Unsupported",
+           "add_routes", "d1_break", "decision_type", "escape_special"]

@@ -7,18 +7,26 @@ GEMMs, ~3% of each layer's own output. vllm-decision2's Decision-2.0-Kai-0.6B (q
 the host) against the fp32 CPU model's rows (``llama/cpu.py``) through the same head: within 0.05 (against llama-server's
 CPU answers on 320 questions: 0.040 at most, 313 of 320 choices the same). LiquidAI's d1-2B (lfm3, its full layers
 non-causal): each question alone against llama.cpp's last row, a state's questions in one sequence (its ``set``
-attention) against the fp32 CPU model's rows (``lfm/cpu.py``) of the same sequence, within 0.03 and the same choices."""
+attention) against the fp32 CPU model's rows (``lfm/cpu.py``) of the same sequence, within 0.03 and the same choices.
+Requests with images (d1-2B, d3-lite, d3-nano with their mmproj: ``test_images``): each question alone against
+llama-server's CPU answers (cached), the same usage; d1's sequences against the fp32 CPU model on the same image rows,
+d3's packed chunks of image prompts against each prompt alone."""
 
+import base64
+import io
+import json
 import os
 
 import numpy as np
 import pytest
+from PIL import Image, ImageDraw, ImageFont
 
-from artlite.model_config import decision_gguf
+from artlite.model_config import decision_gguf, decision_mmproj
 from models import open_model
 from models.server.decisions import Decisions
 
-from .common import essay
+from .common import cached_ref, essay, model_key
+from .llama_cpp import _lib_identity, llama_server_decisions
 from .qwen35 import ref
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
@@ -119,3 +127,117 @@ def test_d1() -> None:
                     worst[size] = max(worst[size], *(abs(pa[k] - pb[k]) for k in pa))
     print(f"max |dp|: alone vs llama.cpp {worst[1]:.4f}, a sequence vs the CPU model {worst[16]:.4f}")
     assert max(worst.values()) < 0.03
+
+
+ASTRONAUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "images", "sd15-astronaut.jpg")
+IMAGE_QUESTIONS = {
+    "scene": {"type": "choice", "instructions": "What does the image mainly show?",
+              "criteria": {"animal": None, "vehicle": None, "person": None, "text document": None,
+                           "abstract shapes": None}},
+    "person": {"type": "noul", "instructions": "Is there a person in the image?"},
+    "count": {"type": "score", "instructions": "How many separate objects are in the image?",
+              "criteria": ["none", "one", "two", "three", "four or more"]},
+    "color": {"type": "choice", "instructions": "What is the dominant color of the main object?",
+              "criteria": {"red": None, "green": None, "blue": None, "white": None}},
+    "text": {"type": "noul", "instructions": "Does the image contain readable text?"},
+}
+# (the largest |dp| from llama-server's CPU answers, each question alone: the NPU's prefill GEMMs, and for d3 the vision
+# overlay's bfp16 encoder (its 24 layers of 1024: ~7% per merged token, as the CPU at its rounding points); on 57 such
+# questions d1 Q4_0 0.021, d3-lite 0.117, d3-nano 0.097)
+IMAGE_DP = {"d1-2b": 0.05, "d3-lite": 0.12, "d3-nano": 0.12}
+
+
+def _url(im: Image.Image, fmt: str) -> str:
+    buf = io.BytesIO()
+    im.save(buf, fmt)
+    return f"data:image/{fmt.lower()};base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def image_bodies() -> list[dict]:
+    """The astronaut (512 x 512: 256 tokens) with a state; a drawn card (a red circle, three blue squares, a line of
+    text) and the astronaut at 384 x 384 with a null state; a chat state with the card in an image_url part."""
+    card = Image.new("RGB", (640, 480), "white")
+    d = ImageDraw.Draw(card)
+    d.ellipse((60, 60, 260, 260), fill=(220, 30, 30))
+    for x in (320, 420, 520):
+        d.rectangle((x, 120, x + 70, 190), fill=(30, 60, 210))
+    d.text((60, 340), "TOTAL DUE: $1,250.00", fill=(0, 0, 0), font=ImageFont.load_default(size=40))
+    with Image.open(ASTRONAUT) as im:
+        astro = im.convert("RGB")
+    a, c = _url(astro, "JPEG"), _url(card, "PNG")
+    small = _url(astro.resize((384, 384), Image.Resampling.BICUBIC), "JPEG")
+    return [{"state": "A listing photo a seller submitted.", "images": [a], "questions": IMAGE_QUESTIONS},
+            {"state": None, "images": [c, small], "questions": IMAGE_QUESTIONS},
+            {"state": [{"role": "user", "content": [{"type": "text", "text": "What do I owe?"},
+                                                    {"type": "image_url", "image_url": {"url": c}}]}],
+             "questions": {k: IMAGE_QUESTIONS[k] for k in ("text", "count", "color")}}]
+
+
+def _probs(a: dict) -> dict[str, float]:
+    return a.get("probabilities", {"true": a.get("noul")})
+
+
+def _top(a: dict) -> str:
+    p = _probs(a)
+    return str(p["true"] >= 0.5) if a["type"] == "noul" else max(p, key=p.get)
+
+
+@pytest.mark.parametrize("name", ["d1-2b", "d3-lite", "d3-nano"])
+def test_images(name: str) -> None:
+    path, mmproj = decision_gguf(name), decision_mmproj(name)
+    if not (os.path.exists(path) and os.path.exists(mmproj)):
+        pytest.skip(f"{path} or {mmproj} missing")
+    bodies = image_bodies()
+    args = ("--image-max-tokens", "1600") if name == "d1-2b" else ()  # (Artlite's d1 budget: its runner's)
+    want = cached_ref(path, "systemone_images", (model_key(path), model_key(mmproj), json.dumps(bodies), args,
+                                                 _lib_identity()),
+                      lambda: llama_server_decisions(path, mmproj, bodies, args))
+    model = open_model(path, mmproj=mmproj)
+    npu = model.load(capacity=4096)
+    d = Decisions.of(path, model.tokenizer.encode)
+    enc = model.tokenizer.encode
+    whole = npu.prefill.sizes[-1]
+    cpu = None
+    if name == "d1-2b":
+        from artlite.gguf_model import GGUFFile
+
+        from .lfm.cpu import LfmCpu
+        cpu = LfmCpu(GGUFFile(path), vocab=0)
+    worst, same, n, worst_set = 0.0, 0, 0, 0.0
+    for body, ref_out in zip(bodies, want, strict=True):
+        qs = d.questions(body)
+        state, images = d.state(body)
+        media = [model.image_tokens(b) for b in images]
+        lone = d.prompts(state, qs, enc, media=media, set_size=1, max_tokens=whole)
+        assert sum(len(p.ids) for p in lone) == ref_out["usage"]["input_tokens"]
+        rows = []
+        for p in lone:
+            npu.reset()
+            rows.append(npu.outputs(p.ids, p.rows, **({"sets": p.sets} if p.sets else {})))
+        for p, r in zip(lone, rows, strict=True):
+            q = qs[p.question]
+            got, ref_a = d.answer(q, [d.scores(q, r)], media=True), ref_out["answers"][q.id]
+            same += _top(got) == _top(ref_a)
+            n += 1
+            worst = max(worst, *(abs(_probs(got)[k] - _probs(ref_a)[k]) for k in _probs(ref_a)))
+        if cpu is not None:  # (one sequence of the state's questions: the runner's set attention, against the CPU model)
+            (p,) = d.prompts(state, qs, enc, media=media, max_tokens=whole)
+            npu.reset()
+            got = npu.outputs(p.ids, p.rows, sets=p.sets)
+            exact = cpu.outputs(p.ids, list(p.rows), sets=p.sets).double().numpy()
+            for j, i in enumerate(p.questions):
+                q = qs[i]
+                a, b = (d.answer(q, [d.scores(q, x[j:j + 1])], media=True) for x in (got, exact))
+                assert _top(a) == _top(b), (q.id, a, b)
+                worst_set = max(worst_set, *(abs(_probs(a)[k] - _probs(b)[k]) for k in _probs(a)))
+        else:  # (several image prompts in packed chunks, against each alone)
+            npu.reset()
+            packed = npu.readouts([p.ids for p in lone], [p.rows for p in lone])
+            for p, r, g in zip(lone, rows, packed, strict=True):
+                q = qs[p.question]
+                a, b = (d.answer(q, [d.scores(q, x)], media=True) for x in (g, r))
+                worst_set = max(worst_set, *(abs(_probs(a)[k] - _probs(b)[k]) for k in _probs(a)))
+    print(f"{name}: {same} / {n} same top choice as llama-server CPU, max |dp| {worst:.4f}; "
+          f"{'a sequence vs the CPU model' if cpu else 'packed vs alone'} {worst_set:.4f}")
+    assert same >= n - 1 and worst < IMAGE_DP[name]
+    assert worst_set < 0.03

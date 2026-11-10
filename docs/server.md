@@ -45,8 +45,9 @@ settings for them have no effect. Log-probabilities come as llama-server's: chat
 generation, up to `--spec-draft-n-max` (0: steps of one token; a drafter still follows the tokens, so the next request
 drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
-[MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47)) come as a chat message's
-`image_url` parts of data URIs, as llama-server takes them; the web UI attaches them. Not provided: infill,
+[MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images); the decision
+models d3 and d1: [below](#decisions)) come as a chat message's `image_url` parts of data URIs, as llama-server takes
+them; the web UI attaches them. Not provided: infill,
 `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
@@ -214,8 +215,19 @@ tokens in 32 / 39 / 113 ms, HTTP included); other types' questions share the sta
 on a causal Qwen3.5 model the state once, then the questions packed after it, each continuing the state's Gated
 DeltaNet and attention state, or the questions' whole prompts packed, whichever the estimates say is faster (Kev-4B, 8
 questions of 64 tokens after a 256-token state: 387 ms, 1006 one after another; S0's requests of 4-8 questions after
-a 150-650-token state: 1.6-2.1x faster, the same answers). Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni) and images (`files`, `images`, a message's image parts)
+a 150-650-token state: 1.6-2.1x faster, the same answers). Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni)
 answer 501.
+
+Pictures (a d3 or d1 model started with its `--mmproj`; the router pairs the mmproj of the model's directory by
+itself): a request's `images` (or `files`) as data URIs, or a chat state's messages with `image_url` parts, at most 8;
+they head the state, each through the vision encoder once ([d3](models/qwen35.md#decision-models-vllm-d3-kev),
+[d1](models/lfm3.md#d1-2b-decision-model)), as llama-server places them (`usage.input_tokens` counts their tokens).
+The answers are llama-server's within the model's usual difference (d1-2B Q4_0 57 / 57, d3-lite 56 / 57, d3-nano
+57 / 57 on 57 questions about pictures); a question about a 512 x 512 picture takes 67-104 ms through the server
+(1280 x 1280: 0.5-1.2 s), 8 questions about it 127 ms (d1, one sequence) to 563 ms (d3-nano). A file's
+`decision.temperature.image` (llama-server's), where it has one, calibrates a request with pictures. Without the
+encoder, pictures answer 501, as do audio (`input_audio` parts, audio data URIs), video (d1's `video_url` parts) and
+pictures for the other types.
 
 A d1 model reads a request's questions as its own runner does (its `set` attention): the state once, then up to 16
 questions after it in one sequence, each answered at its last token; the state's tokens see every token, a question's
@@ -427,8 +439,8 @@ Images:
 
 | option | |
 |---|---|
-| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)) |
-| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default 8 / 4096 and 64 / 4096, llama.cpp's) |
+| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; d3: `mmproj-vllm-d3-lite-Q8_0.gguf`; d1-2B: `mmproj-d1-2B-Q8_0.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)), pictures in decision requests ([Decisions](#decisions)) |
+| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, d3's 64 / 1600, else 8 / 4096 for Qwen3-VL, 64 / 4096 for LFM3-VL, llama.cpp's; d1-2B 64 / 1600: its runner's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 Logging:

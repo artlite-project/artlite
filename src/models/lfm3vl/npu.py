@@ -56,6 +56,8 @@ class NpuVision:
     between ``min_tokens`` and ``max_tokens`` (llama.cpp's ``--image-min-tokens`` / ``--image-max-tokens``; default the
     mmproj's minimum, 64, and llama.cpp's 4096)."""
 
+    markup = ("<|vision_start|>", "<|vision_end|>")  # (around an image's tokens: llama.cpp's mtmd, the chat template's)
+
     def __init__(self, path: str, *, min_tokens: int | None = None, max_tokens: int | None = None):
         self.path = path
         self.gguf = GGUFFile(path)

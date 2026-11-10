@@ -1,7 +1,8 @@
 """Qwen3-VL's vision encoder on the vision overlay (models.qwen3vl.encoder) against the float64 encoder (ref.Encoder)
 and the CPU at the NPU's rounding points (ref.NpuEncoder): the level's layout (no NPU), one layer as far from the
 float64 layer as the CPU at the NPU's rounding points, a program in pieces bit for bit the same as in one dispatch,
-whole images of 1 .. 9 bands (per-token statistics; slow: as close as the CPU at the NPU's rounding points)."""
+whole images of 1 .. 9 bands (per-token statistics; slow: as close as the CPU at the NPU's rounding points); the
+smaller towers (d3-lite's 768 wide, 12 heads; d3-nano's 1024) as close as the CPU at the NPU's rounding points."""
 
 import os
 from collections import OrderedDict
@@ -11,13 +12,13 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import ClipConfig
+from artlite.model_config import ClipConfig, decision_mmproj
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
 from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import alloc
-from artlite.vision.vit import Bands, C, H, Keys, kv_bytes, ln_records, vit_level
+from artlite.vision.vit import VIT, Bands, C, H, Keys, kv_bytes, ln_records, vit_level
 from models.qwen3vl import encoder as E
 from models.qwen3vl import host as Q
 from models.sequence import load_image
@@ -112,7 +113,7 @@ def test_layer(npu: VisionDevice, mm: tuple, size: tuple[int, int], il: int) -> 
     E.layers(bd, {il: E.layer_weights(get, il)}, nm, nb, range(il, il + 1), kv)
     bd.op({}, {})
     host = E.Encoder.__new__(E.Encoder)  # (the image's RoPE tables and key masks: ``Encoder.inputs``)
-    host.nm, host.pos, host._inputs = nm, get("v.position_embd.weight").numpy(), OrderedDict()
+    host.nm, host.pos, host._inputs, host.vt = nm, get("v.position_embd.weight").numpy(), OrderedDict(), VIT
     for n, d in E.Encoder.inputs(host, lay, px).items():
         if n.startswith((f"{nm.p}.rope", f"{nm.p}.attn")):
             npu.alloc(n, d.size)
@@ -194,3 +195,37 @@ def test_encoder_model(mm: tuple, encoder: E.Encoder) -> None:
     print(f"per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f}), max {e.max():.3f} "
           f"({es.max():.3f})")
     assert med[0] < 1.15 * med[1] and p90[0] < 1.3 * p90[1]
+
+
+@pytest.mark.parametrize("name", ["d3-lite", "d3-nano"])
+def test_tower(npu: VisionDevice, name: str) -> None:
+    """A smaller tower (``E.tower``: d3-lite's 12 layers of 768, 12 heads of 64 in C 960; d3-nano's 24 of 1024, 16 heads
+    of 64) at 1 and 2 bands per merged token as close to the float64 encoder as the CPU at the overlay's rounding points
+    (measured: lite median 4.7%, p90 14% at 352 x 352, the CPU's 4.1%, 14%; nano 6.9%, 42%, the CPU's 7.0%, 40%: its
+    residual's drift through 24 layers, post_ln's amplification), the same at a second run."""
+    mmproj = decision_mmproj(name)
+    if not os.path.exists(mmproj):
+        pytest.skip(f"{mmproj} missing")
+    g = GGUFFile(mmproj)
+    clip = ClipConfig.from_gguf(g)
+
+    def get(n: str) -> torch.Tensor:
+        t = g.tensor(n)
+        return t.dequantize().reshape(t.rows, t.cols).float()
+    vt = E.tower(clip.hidden, clip.heads, clip.ffn, clip.eps)
+    assert (vt.C, vt.HD, vt.FFN) == ((960, 64, 3200) if name == "d3-lite" else (1280, 64, 4160))
+    enc = E.Encoder(npu, E.weights(get, clip.layers, clip.projection_dim, vt), get("v.position_embd.weight").numpy(),
+                    max_bands=2, name=f"t{clip.hidden}")
+    for size in ((352, 352), (512, 512)):
+        px = _pixels(*size)
+        lay = E.Layout(px.shape[0] // 32, px.shape[1] // 32)
+        _, _, real = lay.slot_windows()
+        pix = Q.normalized(px, clip.mean, clip.std)
+        got = enc(px)
+        assert np.array_equal(enc(px), got)
+        want = V.Encoder(mmproj).forward(pix).numpy()
+        sim = V.NpuEncoder(mmproj).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
+        e, es = _token_errors(got, want), _token_errors(sim, want)
+        med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
+        print(f"{name} {size}: per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f})")
+        assert med[0] < 1.25 * med[1] and p90[0] < 1.3 * p90[1]

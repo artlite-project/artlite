@@ -537,8 +537,8 @@ class QwenPrefill(ChunkPrefill):
 
     def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
         """A packed chunk of size T at position p0 (default: the smallest of ``packed_sizes(p0)`` that holds x): x (n,
-        hidden) the segments' first layer input rows back to back, ``pos`` (n,) their text positions, ``lo`` (n,) per
-        token its segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``). At position
+        hidden) the segments' first layer input rows back to back, ``pos`` (n,) their text positions or (n, 3) their
+        M-RoPE ones (images), ``lo`` (n,) per token its segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``). At position
         0 the caches and states hold no sequence after it; after a prefix (p0 > 0: a tree chunk, segments from multiples
         of ``seg_unit``, the tokens between them -1 in ``lo``: padding of the segment before them, zero rows that see its
         keys, so that its last V records round as alone) they hold the prefix as before it."""
@@ -571,9 +571,12 @@ class QwenPrefill(ChunkPrefill):
             real = np.r_[~gap, np.zeros(T - n, bool)]
             last = np.zeros(T, np.int64)
             np.maximum.at(last, seg[real], i[real])
-            pos_t = np.asarray(pos, np.int64)[seg] + i - seg
+            pos = np.asarray(pos, np.int64)
+            ext = np.r_[pos.reshape(n, -1), np.zeros((T - n, pos.size // n), np.int64)]  # ((T, 1) or (T, 3))
+            lr = last[seg]
+            pos_t = np.where(real[:, None], ext, ext[lr] + (i - lr)[:, None])  # (padding: on from its segment's last)
             rope = self.ov.rope[p0:p0 + T].copy()
-            self.ov.rope[p0:p0 + T] = pos_t[:, None]
+            self.ov.rope[p0:p0 + T] = pos_t
             cs_row = self._cs_row(p0, T)
             sg = self.pattn[T].seg(seg, i if self.cfg.causal else last[seg], p0)
             dev.view("SEG")[:sg.size] = sg

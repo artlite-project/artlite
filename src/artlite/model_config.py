@@ -143,6 +143,17 @@ def decision_gguf(name: str = "d3-lite") -> str:
     return os.path.join(MODELS_DIR, DECISION_FILES[name])
 
 
+DECISION_MMPROJ = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/mmproj-vllm-d3-lite-Q8_0.gguf",
+                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/mmproj-vllm-d3-nano-Q8_0.gguf",
+                   "d1-2b": "LiquidAI/d1-2B-GGUF/mmproj-d1-2B-Q8_0.gguf"}
+
+
+def decision_mmproj(name: str = "d3-lite") -> str:
+    """A decision model's vision encoder (images in its requests): d3-lite's and d3-nano's Qwen3-VL towers (768 / 1024
+    wide: ggml-org's Q8_0), d1-2B's LFM3-VL encoder (LiquidAI's Q8_0)."""
+    return os.path.join(MODELS_DIR, DECISION_MMPROJ[name])
+
+
 def d1_gguf(quant: str = "Q4_0") -> str:
     """A file of LiquidAI's d1-2B GGUF repository (an LFM3 decision model): ``Q4_0`` (a Q6_K embedding), ``Q4_K_M``,
     ``Q8_0``."""

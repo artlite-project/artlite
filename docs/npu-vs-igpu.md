@@ -112,6 +112,21 @@ other programs):
   one just past a size pays the next one (d3-lite, 260 tokens: 62 ms, 39 at 256). d1 reads a state's questions in one
   sequence (its runner's way), the state once: 4.4x faster than each question alone on the NPU.
 
+Decisions about pictures (each side with the model's mmproj, its vision encoder on the same device; every request's
+picture new; energy a question above a 12.5 W idle):
+
+| file | request | NPU | iGPU | energy a question, NPU / iGPU (the smallest, the largest picture) |
+|---|---|---|---|---|
+| LiquidAI d1-2B (Q4_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 87 / 281 / 613 ms | 118 / 370 / 974 ms | 1.8 / 4.8 J, 8.9 / 32 J |
+| | 8 questions about a 512 x 512 picture | 127 ms (one sequence) | 1241 ms | 0.31 / 5.6 J |
+| vllm-sr d3-lite (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 67 / 222 / 520 ms | 98 / 359 / 983 ms | 1.2 / 3.1 J, 6.1 / 30 J |
+| | 8 questions about a 512 x 512 picture | 342 ms | 892 ms | 0.65 / 3.2 J |
+| vllm-sr d3-nano (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 104 / 449 / 1162 ms | 229 / 796 / 2099 ms | 2.1 / 7.0 J, 16 / 59 J |
+| | 8 questions about a 512 x 512 picture | 563 ms | 2104 ms | 1.3 / 7.5 J |
+
+With a picture the NPU answers 1.3-2.2x sooner than the iGPU at 2.6-4.9x less energy above idle; several questions
+about one picture 2.6-10x sooner at 5-18x less.
+
 ## Candidates to explore
 
 So the NPU can win where compute rather than DRAM bandwidth bounds the work, or where watts or a free GPU matter more

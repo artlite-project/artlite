@@ -180,7 +180,7 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
     from .vit import Bands  # (the ViT's banded residual)
     C, MERGED, FUP = md.C, md.merged, md.FUP
     lv, l1 = vit_level(nb), vit_level(1)
-    x = Bands(lv, nm.x(nl))
+    x = Bands(lv, nm.x(nl), C)
     pn, mgb, hid = lv.pn(C), l1.pn(MERGED), l1.pn(FUP)
     outw = w["down"].shape[0]
     walk = _dims((18, 1), (2, 18), (C // 8, 144), (4, 36))  # (stream order: s, kb, p, a panel's 18 words)

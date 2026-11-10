@@ -5,6 +5,7 @@ vllm-decision2's joint head, the confidences), the prompts (nimble's question li
 escapes, vllm-decision2's pieces and spans), a non-causal model's prompts read whole and a recurrent model's questions
 sharing the state through a checkpoint; lfm3-d1's label groups, escapes and sequences of a state's questions."""
 
+import base64
 import math
 import os
 import re
@@ -15,6 +16,8 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from models.common import MEDIA_MARKER
+from models.sequence import Sequence
 from models.server import decisions as D
 from models.server.cache import common_prefix
 from models.server.decisions import Decisions
@@ -359,8 +362,10 @@ def test_shared_state() -> None:
     assert answers[0] == answers[1]
 
 
-# (lfm3-d1's template in the shape of d1-2B's: the state, "QUESTION:", the question and its options up to the answer)
-D1 = ("<s><|user|>{% if state is not none %}{{ state if state is string else state | tojson(indent=2) }}"
+# (lfm3-d1's template in the shape of d1-2B's: the images, the state, "QUESTION:", the question and its options up to
+# the answer)
+D1 = ("<s><|user|>{% for image in images %}{{ image }}{% endfor %}{% if state is not none %}"
+      "{{ state if state is string else state | tojson(indent=2) }}"
       "{{ '\\n\\n\\nQUESTION:\\n' }}{% endif %}{{ instructions }}{% for o in options %} {{ o.label }} {{ o.key }}"
       "{% endfor %}<|assistant|><think></think>")
 
@@ -431,3 +436,82 @@ def test_d1() -> None:
                     {"state": STATE, "questions": {"q": {"type": "noul", "instructions": {"type": "input_audio"}}}}):
             r = client.post("/v1/systemone", json=bad)
             assert r.status_code == 400, (bad, r.text)
+
+
+IMAGES = [b"first image's bytes", b"second image's bytes"]
+URLS = ["data:image/png;base64," + base64.b64encode(b).decode() for b in IMAGES]
+
+
+def test_images() -> None:
+    """Images (``files`` / ``images``, a chat state's ``image_url`` parts) in lfm3-d1's and vllm-d3's requests: each
+    image through the encoder once, on the worker; the prompts sequences with the image's tokens between the encoder's
+    markup where the template has its markers (the input's markers text: " "); lfm3-d1's sequences hold them in the
+    state; usage counts their tokens; a file's image temperature; a null state with images; audio, video, images for
+    another type or without an encoder refused (501)."""
+    model, npu, engine = make(vision=True)
+    d = d1_context(model)
+    d.temperatures["image"] = 0.5
+    enc = model.tokenizer.encode
+    with TestClient(app_of(engine, decisions=d)) as client:
+        assert engine.wait_ready(5)
+        npu.causal, npu.prefill = False, types.SimpleNamespace(sizes=(64, 128, 256))
+        state = f"a note {MEDIA_MARKER} with the marker"
+        body = {"state": state, "questions": QUESTIONS, "images": URLS[:1], "set_size": 2}
+        npu.calls.clear()
+        r = client.post("/v1/systemone", json=body)
+        assert r.status_code == 200, r.text
+        assert model.threads == ["artlite-npu"]
+        qs = d.questions(body)
+        media = [model.image_tokens(IMAGES[0])]
+        assert len(media[0]) == 4 and list(media[0].ids[[0, 3]]) == enc("<|system|><|assistant|>")
+        got = d.prompts(state, qs, enc, media=media, set_size=2)
+        text = d.prompts(state.replace(MEDIA_MARKER, " "), qs, enc, set_size=2)
+        assert [p.questions for p in got] == [[0, 1], [2]]
+        for a, b in zip(got, text, strict=True):  # (the image after "<s><|user|>": the state's)
+            assert isinstance(a.ids, Sequence) and len(a.ids) == len(b.ids) + 4 and list(a.ids.given) == \
+                [False] * 3 + [True] * 2 + [False] * (len(b.ids) - 1)
+            assert [*a.ids.ids[:2], *a.ids.ids[6:]] == b.ids and a.sets == tuple(x + 4 for x in b.sets)
+            assert list(a.rows) == list(b.rows + 4)
+        assert [c for c in npu.calls if c[0] == "outputs"] == [("outputs", len(p.ids), p.sets) for p in got]
+        out = r.json()
+        assert out["usage"]["input_tokens"] == sum(len(p.ids) for p in got)
+        p = got[0]
+        x = fake_row([int(t) for t in p.ids.ids[:p.rows[0] + 1]]).astype(np.float64)
+        z = np.array([max(d._rows[t] @ x for t in g) for g in d.d1_labels(qs[0], enc)[1]])
+        assert np.allclose(list(out["answers"]["route"]["probabilities"].values()), softmax(z, 0.5))  # (the image's)
+        chat = {"state": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": URLS[1]}},
+                                                       {"type": "text", "text": "what is it?"}]}],
+                "questions": QUESTIONS, "files": URLS[:1]}
+        model.threads.clear()
+        r = client.post("/v1/systemone", json=chat)
+        assert r.status_code == 200 and len(model.threads) == 2  # (files first, then the chat's)
+        r = client.post("/v1/systemone", json={"state": None, "images": URLS, "questions": {"q": QUESTIONS["angry"]}})
+        assert r.status_code == 200, r.text
+        (lone,) = d.prompts(None, d.questions({"state": None, "questions": {"q": QUESTIONS["angry"]}}), enc,
+                            media=[model.image_tokens(b) for b in IMAGES])
+        assert lone.sets[0] == 2 + 8 and r.json()["usage"]["input_tokens"] == len(lone.ids)
+        for bad in ({**body, "images": ["data:audio/wav;base64,AAAA"]},
+                    {"state": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "AAAA"}}]}],
+                     "questions": QUESTIONS},
+                    {"state": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": URLS[0]}}]}],
+                     "questions": QUESTIONS}):
+            r = client.post("/v1/systemone", json=bad)
+            assert r.status_code == 501, (bad, r.text)
+        assert client.post("/v1/systemone", json={**body, "images": ["data:image/png;base64,A"]}).status_code == 400
+    model, npu, engine = make(vision=True)
+    d = context("vllm-d3", model, "{% for image in images %}{{ image }}{% endfor %}" + TEMPLATE)
+    with TestClient(app_of(engine, decisions=d)) as client:
+        assert engine.wait_ready(5)
+        npu.causal, npu.prefill = False, types.SimpleNamespace(sizes=(64, 128))
+        npu.calls.clear()
+        r = client.post("/v1/systemone", json={"state": STATE, "questions": QUESTIONS, "images": URLS})
+        assert r.status_code == 200 and len(model.threads) == 2
+        qs = d.questions({"state": STATE, "questions": QUESTIONS})
+        got = d.prompts(STATE, qs, model.tokenizer.encode, media=[model.image_tokens(b) for b in IMAGES])
+        text = d.prompts(STATE, qs, model.tokenizer.encode)
+        assert [len(p.ids) for p in got] == [len(p.ids) + 8 for p in text]
+        assert [c for c in npu.calls if c[0] == "outputs"] == [("outputs", len(p.ids)) for p in got]
+    for model, _, _, client in client_of("pplx-decider"):
+        model.vision = types.SimpleNamespace(markup=("<|system|>", "<|assistant|>"))
+        r = client.post("/v1/systemone", json={"state": STATE, "questions": QUESTIONS, "images": URLS})
+        assert r.status_code == 501 and "pplx-decider" in r.json()["error"]["message"]

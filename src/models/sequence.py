@@ -6,12 +6,16 @@ to the sequence's start; ``next``: the position of the text after it. Text from 
 indices; an image's take fewer positions than tokens (``models.minicpmv.host``, ``models.qwen3vl.host``). Sequences
 concatenate (``+``, a list of token ids as text) and slice like lists (a slice's positions relative to its first
 token's T, so that the slices of a sequence run one after another as the whole), so the model's prompt path runs them
-in chunks and steps as token lists. ``load_image``: an image file as the vision encoders take it.
+in chunks and steps as token lists. ``splice``: a text's tokens with sequences where it has a marker; ``load_image``: an
+image file as the vision encoders take it (``data_bytes``: a data URL's).
 """
 
 from __future__ import annotations
 
+import base64
 import io
+import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -64,8 +68,34 @@ class Sequence:
         return [next(rows).tobytes() if g else int(t) for t, g in zip(self.ids, self.given, strict=True)]
 
 
+def splice(text: str, marker: str, items: list[Sequence], encode: Callable[[str], list[int]]) -> list[int] | Sequence:
+    """A text's tokens with ``items`` where it has ``marker`` (one each, in order): the pieces between the markers
+    tokenized one by one (llama.cpp's mtmd); without items the text's ids (its markers stay text)."""
+    if not items:
+        return encode(text)
+    parts = text.split(marker)
+    if len(parts) != len(items) + 1:
+        raise ValueError(f"{len(items)} item(s) for {len(parts) - 1} place(s) in the text")
+    seq = Sequence.text(encode(parts[0]))
+    for item, tail in zip(items, parts[1:], strict=True):
+        seq = seq + item + encode(tail)
+    return seq
+
+
 def load_image(src: str | bytes) -> Image.Image:
     """An image file (a path or its bytes) as RGB, turned upright by its EXIF orientation (transformers'
     ``load_image``; an alpha channel dropped; a JPEG's pixels within 3 levels of llama.cpp's stb_image)."""
     with Image.open(io.BytesIO(src) if isinstance(src, bytes) else src) as im:
         return ImageOps.exif_transpose(im).convert("RGB")
+
+
+def data_bytes(url: str) -> bytes:
+    """The bytes of a data URL (``data:<type>[;base64],<data>``: base64 or percent-encoded); ValueError: no data, or
+    data that does not decode."""
+    head, sep, data = url.partition(",")
+    if not sep or not head.startswith("data:"):
+        raise ValueError("not a data URL")
+    try:
+        return base64.b64decode(data, validate=True) if head.endswith(";base64") else urllib.parse.unquote_to_bytes(data)
+    except ValueError:
+        raise ValueError("a data URL's base64 data does not decode") from None

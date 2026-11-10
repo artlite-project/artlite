@@ -24,7 +24,6 @@ from PIL import Image
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
-from artlite.vision.vit import FFN_REAL, HEADS, H
 from artlite.vision.weights import gguf_getter, sources
 from artlite.vision.windows import WIN, Piece
 
@@ -56,7 +55,9 @@ def _save_program(cache: str, nb: int, pieces: list[Piece], same_layout: bool) -
 class NpuVision:
     """The vision encoder and projector of an mmproj file (projector ``qwen3vl_merger``) on the NPU; an image's merged
     tokens between ``min_tokens`` and ``max_tokens`` (llama.cpp's ``--image-min-tokens`` / ``--image-max-tokens``;
-    default 8 and 4096, llama.cpp's)."""
+    default the mmproj's image_min / max_pixels / 1024 where it has them, else 8 and 4096: llama.cpp's)."""
+
+    markup = ("<|vision_start|>", "<|vision_end|>")  # (around an image's tokens: llama.cpp's mtmd, the chat template's)
 
     def __init__(self, path: str, *, min_tokens: int | None = None, max_tokens: int | None = None):
         self.path = path
@@ -64,14 +65,14 @@ class NpuVision:
         self.clip = c = ClipConfig.from_gguf(self.gguf)
         if c.projector not in PROJECTORS:
             raise NotImplementedError(f"{path}: projector {c.projector!r} (Qwen3-VL's qwen3vl_merger only)")
-        if (c.hidden, c.heads, c.ffn, c.patch_size, c.merge) != (H, HEADS, FFN_REAL, V.PATCH, 2) or c.deepstack:
-            raise NotImplementedError(f"{path}: a ViT of {c.hidden} x {c.heads} heads, FFN {c.ffn}, patch {c.patch_size}, "
-                                      f"merge {c.merge}, deepstack layers {list(c.deepstack)} (the encoder runs 1152 x 16, "
-                                      f"4304, 16, 2 without deepstack: Qwen3.5 / 3.6 / 3.8's)")
+        if (c.patch_size, c.merge) != (V.PATCH, 2) or c.deepstack:
+            raise NotImplementedError(f"{path}: patch {c.patch_size}, merge {c.merge}, deepstack layers "
+                                      f"{list(c.deepstack)} (the encoder runs patches of 16, merge 2, no deepstack)")
+        self.vit = V.tower(c.hidden, c.heads, c.ffn, c.eps)  # (NotImplementedError: widths the overlay does not run)
         if tuple(c.mean) != (0.5,) * 3 or tuple(c.std) != (0.5,) * 3:
             raise NotImplementedError(f"{path}: pixels normalized by {c.mean} / {c.std} (the encoder folds in 0.5 / 0.5)")
-        self.min_tokens = min_tokens or MIN_TOKENS
-        self.max_tokens = max_tokens or MAX_TOKENS
+        self.min_tokens = min_tokens or c.min_pixels // 1024 or MIN_TOKENS
+        self.max_tokens = max_tokens or c.max_pixels // 1024 or MAX_TOKENS
         if not 1 <= self.min_tokens <= self.max_tokens <= TOKENS_LIMIT:
             raise ValueError(f"image tokens {self.min_tokens} .. {self.max_tokens}: 1 <= min <= max <= {TOKENS_LIMIT}")
         self._kept: collections.OrderedDict[bytes, np.ndarray] = collections.OrderedDict()
@@ -80,7 +81,7 @@ class NpuVision:
 
     def _load(self) -> V.Encoder:
         get = gguf_getter(self.gguf)
-        w = V.weights(get, self.clip.layers, self.clip.projection_dim)
+        w = V.weights(get, self.clip.layers, self.clip.projection_dim, self.vit)
         pos = get("v.position_embd.weight").numpy()
         bands = -(-self.max_tokens // WIN)
         cache = state_dir("qwen3vl", self.path, _SOURCES, [self.path])

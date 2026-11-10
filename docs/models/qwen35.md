@@ -29,7 +29,9 @@ $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf  
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf            (its vision encoder, 16x)
 $ARTLITE_MODELS_DIR/openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16-4x.gguf         (the same, 4x: finer detail)
 $ARTLITE_MODELS_DIR/ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf              (decision models: artlite-server)
+$ARTLITE_MODELS_DIR/ggml-org/vllm-d3-lite-GGUF/mmproj-vllm-d3-lite-Q8_0.gguf       (its vision encoder: pictures in requests)
 $ARTLITE_MODELS_DIR/ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf
+$ARTLITE_MODELS_DIR/ggml-org/vllm-d3-nano-GGUF/mmproj-vllm-d3-nano-Q8_0.gguf
 $ARTLITE_MODELS_DIR/ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf
 ```
 
@@ -86,6 +88,17 @@ are llama.cpp's (CPU) on 318 and their accuracy the same within one question of 
 32 ms at 103 tokens, 39 ms at 256 and 113 ms at 1024 through the server (d3-lite; d3-nano 50 / 57 / 186 ms; the iGPU
 with llama.cpp's Vulkan build: 24 / 37 / 168 ms and 42 / 74 / 315 ms, at ~4x the energy above idle:
 [NPU vs iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
+
+With their mmproj (`--mmproj`; the router pairs it by itself) the d3 models read pictures in a request's state
+([Decisions](../server.md#decisions)): their Qwen3-VL towers are Qwen3.5-0.8B's (12 layers of 768, 12 heads) and
+Qwen3.5-2B's (24 layers of 1024), on the same encoder as the larger models' ([below](#images-qwen35--36--38)); a
+picture takes 64 to 1600 tokens (the files' limits). On 57 questions about pictures (16 requests: photos of 128 to 1600
+tokens, drawn shapes, an invoice; one or two pictures, pictures alone, a chat state) the answers are llama-server's
+(CPU) on 56 (d3-lite) and 57 (d3-nano), the probabilities within 0.12 and 0.10 (median 0.003, 0.001): as close as
+with text (the language model alone, fed llama.cpp's own image rows, differs as much on a few questions), the
+encoder's bfp16 rounding adding as much on others. A question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture
+takes 67 / 222 / 520 ms through the server (d3-nano 104 / 449 / 1162 ms; the iGPU 98 / 359 / 983 and 229 / 796 / 2099
+ms at 3-5x the energy above idle), 8 questions about a 512 x 512 picture 342 ms (d3-nano 563; the iGPU 892, 2104).
 
 Kev-4B (Qwen3.5-4B's shapes, causal) answers with its classifier head (`cls.output`) on the rows at the options' end
 tokens and at the question's last token. Its hidden size, 2560, is not a whole number of K chunks: the projections that
@@ -180,16 +193,18 @@ artlite-cli -m lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gg
 ```
 
 The Qwen models' vision encoder is their `mmproj-*.gguf` (projector `qwen3vl_merger`; BF16, F16 or Q8_0, tested:
-lmstudio-community's BF16 files of Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B, IsValorum's Q8_0 for Occamy 1.0: the
-one of the model's repository, whose width is the model's; [artlite-server](../server.md)'s router mode pairs it with
-the model by itself). An image is resized whole, as transformers' processor and llama.cpp resize it: its sides to multiples of 32
-pixels at its aspect, between `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (llama.cpp's
-defaults 8 and 4096; a 1024 x 768 photo is 768 tokens, a phone's 12-megapixel photo 4015). Its tokens take the
+lmstudio-community's BF16 files of Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B, IsValorum's Q8_0 for Occamy 1.0,
+ggml-org's Q8_0 for d3-lite and d3-nano: the one of the model's repository, whose width is the model's;
+[artlite-server](../server.md)'s router mode pairs it with the model by itself). An image is resized whole, as
+transformers' processor and llama.cpp resize it: its sides to multiples of 32 pixels at its aspect, between
+`--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (default the mmproj's limits where it has them,
+d3's 64 and 1600, else llama.cpp's 8 and 4096; a 1024 x 768 photo is 768 tokens, a phone's 12-megapixel photo 4015). Its tokens take the
 official M-RoPE positions (rows and columns from the position after `<|vision_start|>`; llama.cpp's are the same).
 
 The encoder (`qwen3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 27 layers of
-attention over all of the image's 16 x 16 patches (a 2-D RoPE in each head), then each 2 x 2 window merged into one
-token by an MLP. Its time grows with the patches and, through the attention, with their square:
+attention over all of the image's 16 x 16 patches (a 2-D RoPE in each head; Qwen3.5-0.8B's and 2B's smaller towers, d3's:
+12 layers of 768 and 24 of 1024), then each 2 x 2 window merged into one token by an MLP. Its time grows with the
+patches and, through the attention, with their square (d3-lite's tower 0.024 s at 512 x 512, d3-nano's 0.062 s):
 
 | image (tokens) | 512 x 512 (256) | 1024 x 1024 (1024) | 2048 x 2048 (4096) |
 |---|---|---|---|

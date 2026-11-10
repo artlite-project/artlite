@@ -37,6 +37,9 @@ from .prefill import SIZES, LfmPrefill
 
 # the model card's sampling (the file's general.sampling.* over it)
 SAMPLING = {"temp": 0.1, "top_k": 50, "penalty_repeat": 1.1}
+# a d1 decision model's images at most (its runner's ``d1_vision_max_pixels``, 1638400: the budget it was trained and is
+# served at; its mmproj's maximum is LFM3-VL's)
+D1_IMAGE_TOKENS = 1600
 
 
 class NpuLfm(OverlayModel):
@@ -112,7 +115,7 @@ class Lfm(Model):
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
     (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the vision encoder's file (images in prompts: LFM3-VL's,
     ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default the
-    mmproj's 64 .. 4096)."""
+    mmproj's 64 .. 4096, a d1 decision model's 64 .. ``D1_IMAGE_TOKENS``)."""
 
     name = "LFM3"
     thinks = True
@@ -139,6 +142,8 @@ class Lfm(Model):
                 raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: {', '.join(self.projectors)})")
             if clip.projection_dim != self.cfg.hidden_size:
                 raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's {self.cfg.hidden_size}")
+            if image_max_tokens is None and not self.cfg.causal:
+                image_max_tokens = D1_IMAGE_TOKENS
             self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
 
     def encode(self, text: str) -> list[int]:
@@ -157,8 +162,7 @@ class Lfm(Model):
         if self.vision is None:
             raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
         seq = vl_host.image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
-        if self._npu is not None:  # (the encoder's hardware context ran: ``OverlayDevice.set_prologue``)
-            self._npu.stale()
+        self._vision_ran()
         return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:

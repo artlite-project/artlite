@@ -1,11 +1,15 @@
 """llama.cpp's CPU build (``model_config.LLAMA_CPP_DIR``, ``ARTLITE_LLAMA_CPP_DIR``) for the references: its files
 (a test without the build skips), the identity of its library (a rebuild invalidates what it computed), its
-tokenizer (``llama-tokenize``) and its embeddings (``llama-embedding``)."""
+tokenizer (``llama-tokenize``), its embeddings (``llama-embedding``) and a decision model's answers (``llama-server``'s
+``/v1/systemone``)."""
 
 import json
 import os
+import socket
 import subprocess
 import tempfile
+import time
+import urllib.request
 
 import pytest
 
@@ -54,3 +58,36 @@ def llama_embeddings(model: str, texts: list[str], pooling: str) -> list[list[fl
                           "--embd-separator", sep, "-p", sep.join(texts)],
                          capture_output=True, text=True, check=True).stdout
     return [d["embedding"] for d in json.loads(out[out.index("{"):])["data"]]
+
+
+def llama_server_decisions(model: str, mmproj: str, bodies: list[dict], args: tuple[str, ...] = ()) -> list[dict]:
+    """llama-server's ``/v1/systemone`` responses to request bodies on the CPU (``-ngl 0``, the vision encoder ``mmproj``
+    on the CPU too; one slot: each question alone, as it reads them); ``args``: more options."""
+    exe = llama_cpp_bin("llama-server")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    p = subprocess.Popen([exe, "-m", model, "--mmproj", mmproj, "--port", str(port), "-np", "1", "-c", "8192", "-b", "8192",
+                          "-ub", "8192", "-ngl", "0", "--no-mmproj-offload", "--no-webui", *args],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(600):
+            try:
+                with urllib.request.urlopen(url + "/health") as r:
+                    if json.load(r).get("status") == "ok":
+                        break
+            except OSError:
+                pass
+            if p.poll() is not None:
+                raise RuntimeError(f"llama-server exited ({p.returncode})")
+            time.sleep(0.5)
+        out = []
+        for body in bodies:
+            req = urllib.request.Request(url + "/v1/systemone", json.dumps(body).encode(), {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as r:
+                out.append(json.load(r))
+        return out
+    finally:
+        p.terminate()
+        p.wait(60)

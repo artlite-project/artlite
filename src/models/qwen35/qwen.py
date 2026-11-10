@@ -588,8 +588,7 @@ class Qwen(Model):
         if self.vision is None:
             raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
         seq = self._image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
-        if self._npu is not None:  # (the encoder's hardware context ran: ``OverlayDevice.set_prologue``)
-            self._npu.stale()
+        self._vision_ran()
         return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:
