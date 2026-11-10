@@ -60,8 +60,8 @@ Speed and accuracy (Strix Halo):
 
 | | QAD-Q4_0 | Q4_K_M |
 |---|---|---|
-| time to first token, 1K / 8K / 32K / 64K tokens | 0.153 / 1.21 / 6.26 / 16.3 s | 0.174 / 1.37 / 6.89 / 17.5 s |
-| prefill, 1K / 32K tokens | 6698 / 5236 tokens/s | 5869 / 4754 tokens/s |
+| time to first token, 1K / 8K / 32K / 64K tokens | 0.153 / 1.19 / 5.93 / 15.0 s | 0.174 / 1.35 / 6.58 / 16.3 s |
+| prefill, 1K / 32K tokens | 6674 / 5525 tokens/s | 5896 / 4981 tokens/s |
 | generation after 1K / 32K tokens | 50.0 / 41.5 tokens/s | 47.6 / 39.8 tokens/s |
 | a step of 2 / 3 / 4 tokens against one | +2% / +5% / +6% (20.2 ms for one at 1K) | |
 | teacher-forced KL against the fp32 evaluation (a chat / an essay; llama.cpp's own on the same file) | 5.7e-4 / 5.5e-4 (7.0e-4 / 6.3e-4) | 1.1e-3 / 8.7e-4 (5.1e-3 / 2.5e-3) |
@@ -73,7 +73,7 @@ Q8_0: KL 6.2e-4 / 5.7e-4 (llama.cpp 1.0e-3 / 5.2e-4). Steps of 1-4 tokens give t
 text with the context's drafts is the text without them.
 
 Against FastFlowLM 1.0.12 on the same NPU (its file of the same QAD Q4_0 weights, at most 32K positions): the first token
-8.4x sooner at 1K tokens (1.28 s there), 4.5x at 32K (28.2 s); generation 1.2x / 1.8x as fast after 1K / 32K (41.1 / 23.6
+8.4x sooner at 1K tokens (1.28 s there), 4.8x at 32K (28.2 s); generation 1.2x / 1.8x as fast after 1K / 32K (41.1 / 23.6
 tokens/s). Its documentation reports 81.3% on the first 150 GSM8K questions (its own requests) against its CPU engine's
 87.3%, the difference its NPU attention's.
 

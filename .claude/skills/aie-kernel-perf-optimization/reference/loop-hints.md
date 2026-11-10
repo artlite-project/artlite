@@ -40,6 +40,13 @@ Enum options take integers (use the macros).
 | `AIE_LOOP_OUTER_PIPELINING` / `_NO_OUTER_PIPELINING` | `aie-enable-outer-loop-pipelining` | IR outer-loop pipeliner (put on the OUTER loop) |
 | `AIE_LOOP_OUTER_MIN_TRIP_COUNT(N)`, `_NO_SPLIT_PROLOGUE`, `_LEAN_STAGE0`, `_SPECULATIVE`, `_HW_LOOP` | `aie-outer-loop-pipelining-*`, `aie-outer-loop-hw-loop` | outer-loop pipeliner tuning |
 
+The outer-loop pipeliner takes a counted outer loop of three or more trips around one pipelined inner loop (a
+2-trip loop is lowered to a flag loop: "Cannot adjust loop bound" under `-mllvm -debug-only=aie-outer-loop-pipeliner`
+of the debug llvm-aie); index math by selects, not division. With `_SPECULATIVE` (the last iteration's stage 0 loads
+anyway, no last-iteration copy) the prefill attention's scores over (pair of row blocks, K unit), four 8-iteration
+MMUL loops whose ramps and stores dominate, took 494 instead of 2 x 266 cycles a chunk; without `_SPECULATIVE` it was
+slower than no hint (static 647 against 584).
+
 These are cheap to sweep. On the 4-accumulator MMUL loop none of them moved
 II on its own (the fix was structural, machine-model.md "Worked example"); on loops bound
 by false dependences or rename-able WAW chains they can.

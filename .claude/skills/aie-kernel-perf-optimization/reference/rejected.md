@@ -169,3 +169,8 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Attention `_pexp` in two loops (P, then l += P) | 312 vs 380 cycles only fully unrolled, with a 2.3 KB frame |
 | sd15's exp pass (cubic, every clamp: pre-RA II 23, register allocation fails with 9 constant vectors): a quadratic 2^f (numerics.md) with the reference vectors walked by `add_3d_ptr` II 19; also without the f clamps II 15 (overflow above y = 320); the cubic with that walk II 55; fission (v, f, then P) 397-590 vs 424 cycles per call (two ramps; f live for II 22 until loaded twice) | ~30 us per UNet section: not taken |
 | A reciprocal in Newton steps from the bits' seed against `aie::inv`'s 32 scalar inversions, 32 lanes (the 27B's one-pass gates) | fp32 products are emulated: 180 against 133 bundles, 1024 B of spills |
+| `AIE_LOOP_AGGRESSIVE_REALLOC` on the prefill attention's exp loop (`prefill.attn` `ppan`) | II 22 -> 20 with 4 reloads, and wrong results (inf) on the NPU |
+| The prefill attention's 2^(v - 128) from v's bits (`vsub.16`, `vups`, `vsrs`: no `vexp2`, one vector op less) | II 23-29 against 22: the store slot |
+| The prefill attention's exp loop keeping the chunk's maximum (a loop-carried vector `max`) | II 32-39 against 22; the maximum in the score loop's epilogue instead |
+| P V over both V halves of a chunk in one loop (`add_3d_ptr` walks, 3-D stream seeks) | 4 spills, II 38: 640 against 2 x 298 cycles |
+| Chunks of 8 records in the prefill attention (CR 8) | P V's body of 64 MMULs exceeds the post-pipeliner's II window (60): not pipelined, 810-906 against 2 x 298 cycles; L1 holds it only without o's second copy |

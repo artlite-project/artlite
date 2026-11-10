@@ -161,8 +161,9 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   cycles, the 9B prefill chunk -7%).
 - **R13 Flash attention with several query heads per core**: at most two panel streams per loop (the memtile
   interleaves the rest), every pop for as many MMULs as the accumulators allow (two row panels x two records: the
-  MMUL bound), P V over pairs of row blocks, the softmax in pipelined passes with no per-lane constants, o in two
-  copies, rare paths out of line (88 -> 15.1 ms per layer; qwen35 1B 9.95 -> 4.95).
+  MMUL bound), P V over pairs of row blocks with its two streams on one load slot (the other takes o's loads), the
+  softmax in pipelined passes with no per-lane constants and its range reduction in the score loop's epilogue, o in two
+  copies a region apart, rare paths out of line (88 -> 15.1 ms per layer; qwen35 1B 9.95 -> 4.95; LFM3 11.4 -> 9.6).
 - **R14 Weight panels from gathers** (IQ3_XXS's grid, IQ3_S's, IQ4's value pairs): indices upshifted into an
   accumulator on the load, one vector load of masks per several panels, no FIFO in the gather loop, a lossless
   re-encoding that removes decode steps, the MMUL in a loop of its own (4596 -> ~2300 cycles per half tile); 16-bit

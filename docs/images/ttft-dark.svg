@@ -541,7 +541,7 @@
 <line x1="383.6" y1="1049.6" x2="383.6" y2="1053.6" class="axis"/>
 <text x="383.6" y="1065.6" text-anchor="middle">64k</text>
 <line x1="402.4" y1="1049.6" x2="402.4" y2="1053.6" class="axis"/>
-<polygon points="270.6,1025.7 327.1,969.7 364.7,925.8 383.6,900.5 383.6,902.4 364.7,928.4 327.1,973.0 270.6,1029.2" class="b0"/>
+<polygon points="270.6,1025.7 327.1,970.1 364.7,927.0 383.6,902.4 383.6,904.7 364.7,929.9 327.1,973.5 270.6,1029.2" class="b0"/>
 <polyline points="270.6,971.5 289.4,963.6 308.3,946.8 327.1,928.4 345.9,908.7 364.7,887.6" class="l1"/>
 <circle cx="270.6" cy="971.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 1k tokens: 1.28 s</title></circle>
 <circle cx="289.4" cy="963.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 2k tokens: 1.71 s</title></circle>
@@ -549,21 +549,21 @@
 <circle cx="327.1" cy="928.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 6.25 s</title></circle>
 <circle cx="345.9" cy="908.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 12.9 s</title></circle>
 <circle cx="364.7" cy="887.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 28.2 s</title></circle>
-<polyline points="270.6,1029.2 327.1,973.0 364.7,928.4 383.6,902.4" class="l0"/>
+<polyline points="270.6,1029.2 327.1,973.5 364.7,929.9 383.6,904.7" class="l0"/>
 <circle cx="270.6" cy="1029.2" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 1k tokens: 0.153 s</title></circle>
-<circle cx="327.1" cy="973.0" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 8k tokens: 1.21 s</title></circle>
-<circle cx="364.7" cy="928.4" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 32k tokens: 6.26 s</title></circle>
-<circle cx="383.6" cy="902.4" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 64k tokens: 16.3 s</title></circle>
+<circle cx="327.1" cy="973.5" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 8k tokens: 1.19 s</title></circle>
+<circle cx="364.7" cy="929.9" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 32k tokens: 5.93 s</title></circle>
+<circle cx="383.6" cy="904.7" r="3.5" class="d0"><title>Artlite QAD-Q4_0, 64k tokens: 15.0 s</title></circle>
 <text x="371.7" y="891.6" class="halo">28.2 s</text>
-<text x="390.6" y="906.4" class="halo">16.3 s</text>
+<text x="390.6" y="908.7" class="halo">15.0 s</text>
 <path d="M267.6,1023.2h6M270.6,1023.2V977.5M267.6,977.5h6" class="bracket"/>
 <text x="277.6" y="1004.3" class="lbl halo">8.4×</text>
-<path d="M361.7,922.4h6M364.7,922.4V893.6M361.7,893.6h6" class="bracket"/>
-<text x="357.7" y="912.0" text-anchor="end" class="lbl halo">4.5×</text>
-<text x="293.8" y="843.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 293.8 843.5)">10 tok/s</text>
+<path d="M361.7,923.9h6M364.7,923.9V893.6M361.7,893.6h6" class="bracket"/>
+<text x="357.7" y="912.7" text-anchor="end" class="lbl halo">4.8×</text>
+<text x="292.8" y="844.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 292.8 844.5)">10 tok/s</text>
 <text x="341.3" y="841.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 341.3 841.6)">100 tok/s</text>
 <text x="388.7" y="856.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 388.7 856.6)">1k tok/s</text>
-<text x="382.9" y="942.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 382.9 942.0)">10k tok/s</text>
+<text x="379.3" y="945.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 379.3 945.5)">10k tok/s</text>
 <text x="391.9" y="995.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 391.9 995.5)">100k tok/s</text>
 <text x="236.0" y="1085.6" text-anchor="middle" class="muted">prompt length, tokens</text>
 <text x="24.0" y="1113.6">* DeepSeek R1 Distill Llama 8B: the shapes of Llama 3.1 8B Instruct, other weights</text>

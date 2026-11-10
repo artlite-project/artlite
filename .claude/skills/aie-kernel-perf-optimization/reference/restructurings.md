@@ -295,6 +295,19 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   (built once per pass) compared against the lanes' key offsets. The softmax 1,804 -> 885 cycles a chunk, the layer
   3.73 -> 3.13 ms (Qwen3-Reranker-0.6B, 4096 tokens).
 
+- **LFM3's broadcast design** (two columns per KV head, one cache stream: core-bound where Llama's and Qwen3's per-column
+  streams are cache-bound), 2048 tokens at p0 = 8K, hi + lo P, per chunk of 4 records and core 2150 -> 1790 cycles,
+  the layer 11.4 -> 9.6 ms (single P 10.6 -> 8.2; at p0 = 32K 41.3 -> 34.5 ms):
+  - **o in two copies a region apart** (P V reads one, writes the other): in place, its loads and stores met in one
+    region's banks, 1.16 M conflict cycles per core and layer, ~60 cycles a P V call; P panels moved out of the
+    workspace's region (the exp loop's loads and pushes met there); every hot loop's streams in distinct regions;
+  - **both P V panel streams on load slot B** (one bank annotation): slot A takes o's accumulator loads; II 38 -> 32,
+    the MMUL bound (single P: 25 -> 20). Read the `lda` / `ldb` columns before blaming register pressure;
+  - **the exp's range reduction in the score loop's epilogue** (v = max(bf16(A), 129), f = bf16(A - v) stored as bf16
+    in place of the fp32 scores; the vector slot idles there): the exp loop vec 21 -> 15, II 26 -> 22, and the
+    softmax's raise test a flag from that epilogue (569 -> 440 cycles a chunk with the rest);
+  - **both K units of a chunk in one call**, the (pair, unit) loop outer-loop-pipelined (loop-hints.md): 532 -> 494.
+
 qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core when a column holds one q head), per
 32-key group and core, the 1B (MiniCPM-V's LM) at p0 = 16K:
 - **Every pop for as many MMULs as one-chain accumulators allow**: with K objects of two records (the memtile
