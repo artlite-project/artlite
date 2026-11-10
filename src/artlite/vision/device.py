@@ -30,13 +30,14 @@ if TYPE_CHECKING:
 
 def role_pages(work_dir: str) -> paging.Pager:
     """The roles' pages (``core.ROLES``, entries ``sd15_ext_<role>``, called from the main loop ``sd15_run``; "ln" also
-    ``sd15_geglu`` and ``sd15_gelu``, the GEMM's; "r"'s entry the GEMM's RoPE epilogue) of the compiled design in
-    ``work_dir``, the same on every core."""
+    ``sd15_geglu`` and ``sd15_gelu``, "d" ``sd15_swiglu`` and ``sd15_prod``, the GEMM's; "r"'s entry the GEMM's RoPE
+    epilogue) of the compiled design in ``work_dir``, the same on every core."""
     p = K.P
-    pages = {r: (f"{p}_ext_{r}",) + ((f"{p}_geglu", f"{p}_gelu") if r == "ln" else ()) for r in K.ROLES}
+    more = {"ln": (f"{p}_geglu", f"{p}_gelu"), "d": (f"{p}_swiglu", f"{p}_prod")}
+    pages = {r: (f"{p}_ext_{r}",) + more.get(r, ()) for r in K.ROLES}
     return paging.link(work_dir, pages=pages, pager=f"{p}_pg_self",
                        calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES),
-                              f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu", f"{p}_ext_r")},
+                              f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu", f"{p}_ext_r", f"{p}_swiglu", f"{p}_prod")},
                        roots=(f"{p}_main",), stack=D.STACK, cores=[(c, r + 2) for c in range(COLS) for r in range(ROWS)],
                        state=D.L1["ext"], wake=D.L_WAKE)
 

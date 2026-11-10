@@ -1,6 +1,7 @@
 # LFM3 on the NPU
 
-LiquidAI's LFM3-1.7B from a GGUF file (architecture `lfm3`): 24 layers of three kinds, 13 short-convolution layers, 6
+LiquidAI's LFM3-1.7B (and LFM3-VL-2B with images: [below](#lfm3-vl-2b-images)) from a GGUF file (architecture `lfm3`):
+24 layers of three kinds, 13 short-convolution layers, 6
 full-attention layers and 5 sliding-window attention layers (a window of 256 positions), each an operator and a SwiGLU
 FFN with norms before and after both. The architecture is read from the file's metadata, the tokenizer and the chat
 template from the file itself. Running it: [artlite-cli](../cli.md); default sampling: the file's (temperature 0.1,
@@ -80,6 +81,51 @@ tokens/s). Its documentation reports 81.3% on the first 150 GSM8K questions (its
 Against llama.cpp's Vulkan backend on the iGPU (the same QAD-Q4_0 file): a prompt runs 1.16x as fast at 1K tokens and
 1.9x at 32K, with ~3.3x less energy; generation runs at ~30% of its speed (168.8 / 122.5 tokens/s after 1K / 32K):
 [Where the NPU fits](../npu-vs-igpu.md#a-small-hybrid-models-prompts-lfm3-17b).
+
+## LFM3-VL-2B (images)
+
+```bash
+artlite-cli -m LiquidAI/LFM3-VL-2B-GGUF/LFM3-VL-2B-QAD-Q4_0.gguf \
+    --mmproj LiquidAI/LFM3-VL-2B-GGUF/mmproj-LFM3-VL-2B-BF16.gguf --image photo.jpg -p "Describe the image."
+```
+
+```
+$ARTLITE_MODELS_DIR/LiquidAI/LFM3-VL-2B-GGUF/    LiquidAI/LFM3-VL-2B-GGUF
+    LFM3-VL-2B-QAD-Q4_0.gguf                     (its language model: LFM3-1.7B's shapes, its own weights)
+    mmproj-LFM3-VL-2B-BF16.gguf                  (its vision encoder; Q8_0 too)
+```
+
+LiquidAI's LFM3-VL-2B is LFM3's trunk with a vision encoder: the language model runs as LFM3-1.7B does (above), its
+image tokens take the encoder's rows in place of token embeddings (one position each). `--mmproj`
+(artlite-cli and [artlite-server](../server.md), whose chat messages then take `image_url` parts) loads the
+encoder. An image is resized whole, as transformers' processor and llama.cpp resize it: its sides to multiples of 32
+pixels at its aspect, between `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (defaults 64 and
+4096, llama.cpp's; a 1024 x 768 photo is 768 tokens).
+
+The encoder (`lfm3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 14 layers over the
+image's 16 x 16 patches, 8 of them a gated depthwise 3 x 3 convolution over the patch grid (its own op on the cores:
+each patch's 8 neighbours read in strips of their 2 x 2 windows, `vision/windows.py`) and 6 attention over all of
+the image's patches (16 query heads sharing 8 key / value heads, a 2-D RoPE), each with a SwiGLU feed-forward; then
+each 2 x 2 window merged into one token by an MLP.
+
+Its time grows with the patches and, through the attention, with their square:
+
+| image (tokens) | 512 x 512 (256) | 1024 x 1024 (1024) | 2048 x 2048 (4096) |
+|---|---|---|---|
+| Artlite (NPU) | 0.037 s | 0.17 s | 1.34 s |
+| llama.cpp, iGPU (Vulkan) | 0.14 s | 0.47 s | 3.0 s |
+| llama.cpp, CPU (16 threads) | 0.27 s | 1.1 s | 7.8 s |
+
+(Strix Halo, the BF16 mmproj; llama.cpp's `mtmd batch encoding` time, the median of fresh runs.) A large image runs as a
+dispatch per one or a few layers (each well under the driver's 2 s). Its weights are converted to bfp16 at every load
+(the patch embedding's and the merger's MLP's as bfp16 hi + lo pairs; the pixels enter as their exact 8-bit values), the
+dispatches of each image size cached in the cache directory; an image's embeddings are kept, so a chat's next turns do
+not run it again.
+
+The embeddings are ~3.5% per token from an exact (float64) encoder (the bfp16 operands of its GEMMs), llama.cpp's ~1%;
+a few tokens are further off (up to ~0.8 of their norm): patches whose values nearly cancel before the final LayerNorm,
+which then scales up their small errors. The language model hardly notices: teacher-forced over a description of an image, its answer stays as close to llama.cpp's own
+(KL 0.0007, argmax agreement 1.0) as with llama.cpp's own image embeddings (KL 0.0005).
 
 ## d1-2B (decision model)
 

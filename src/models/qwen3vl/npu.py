@@ -26,6 +26,7 @@ from artlite.model_config import ClipConfig
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
 from artlite.vision.vit import FFN_REAL, HEADS, H
 from artlite.vision.weights import gguf_getter, sources
+from artlite.vision.windows import WIN, Piece
 
 from ..sequence import Sequence, load_image
 from . import encoder as V
@@ -40,7 +41,7 @@ PROJECTORS = ("qwen3vl_merger",)  # the mmproj projector types (``clip.projector
 TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default bound)
 
 
-def _save_program(cache: str, nb: int, pieces: list[V.Piece], same_layout: bool) -> None:
+def _save_program(cache: str, nb: int, pieces: list[Piece], same_layout: bool) -> None:
     """A program built over a restored state's images (same_layout: none new, their layout the state's) into its cache
     directory."""
     if not same_layout or not os.path.isdir(cache):
@@ -81,7 +82,7 @@ class NpuVision:
         get = gguf_getter(self.gguf)
         w = V.weights(get, self.clip.layers, self.clip.projection_dim)
         pos = get("v.position_embd.weight").numpy()
-        bands = -(-self.max_tokens // V.WIN)
+        bands = -(-self.max_tokens // WIN)
         cache = state_dir("qwen3vl", self.path, _SOURCES, [self.path])
         if (got := load_state(cache, sources(w), accept=lambda st: st["max_bands"] >= bands)) is not None:
             npu, st = got
@@ -92,7 +93,7 @@ class NpuVision:
             enc = V.Encoder(npu, w, pos, max_bands=st["max_bands"], state=st)
         else:
             npu = VisionDevice()
-            enc = V.Encoder(npu, w, pos, max_bands=max(bands, -(-MAX_TOKENS // V.WIN)))
+            enc = V.Encoder(npu, w, pos, max_bands=max(bands, -(-MAX_TOKENS // WIN)))
             save_state(cache, npu, [enc.bd.built()], enc.state() | {"max_bands": enc.max_bands})
         enc.built = lambda nb, pieces, same: _save_program(cache, nb, pieces, same)
         npu.warm()

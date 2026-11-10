@@ -1,7 +1,7 @@
 # Models
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
-[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and d1-2B)](lfm3.md),
+[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, d1-2B)](lfm3.md),
 [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
@@ -43,7 +43,7 @@ architecture, tokenizer and chat template come from its metadata.
 | vllm-decision2 | ✅ vllm-sr Decision-2.0-Kai-0.6B (decision model: [`/v1/systemone`](../server.md#decisions)) | Q8_0 by llama.cpp's converter from vllm-sr's checkpoint | |
 | lfm3 | ✅ LFM3-1.7B | LiquidAI QAD-Q4_0, Q4_K_M, Q8_0 | the sliding-window layers' caches as rings; LiquidAI BF16 |
 | | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0 | images, video (its mmproj: LFM3-VL's encoder) |
-| | 🤔 LFM3-VL-2B | | LiquidAI LFM3-VL-2B: images |
+| | ✅ LFM3-VL-2B | LiquidAI QAD-Q4_0, its mmproj BF16, Q8_0 (images) | video; LiquidAI Q4_K_M, Q8_0 |
 | | 🤔 LFM3-Audio-2B | | LiquidAI LFM3-Audio-2B: speech in and out |
 | | 🤔 LFM3-Omni-2B | | LiquidAI LFM3-Omni-2B, d1-Omni-2B |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |

@@ -270,7 +270,7 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   says why. Drafters (`mtp-`, `<name>-mtp-`, z-lab's `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
   qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
   a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
-  that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
+  that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
   before the 4x one).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
@@ -428,7 +428,7 @@ Images:
 | option | |
 |---|---|
 | `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)) |
-| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen; default 8 / 4096, llama.cpp's) |
+| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default 8 / 4096 and 64 / 4096, llama.cpp's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 Logging:

@@ -136,7 +136,7 @@ def golden(model: str, mmproj: str, image: str, prompt: str, *, answer: list[int
         if emb is not None:
             emb.tofile(os.path.join(tmp, "embd.f32"))
             cmd += ["-e", os.path.join(tmp, "embd.f32")]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
         if r.returncode:
             raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
         shutil.rmtree(path, ignore_errors=True)
@@ -170,7 +170,7 @@ def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *,
         pos.tofile(os.path.join(tmp, "pos.i32"))
         cmd = [dump_tool(), "-m", model, "--seq", os.path.join(tmp, "seq.f32"), "--pos", os.path.join(tmp, "pos.i32"),
                "--from", str(first), "-o", tmp, "--threads", str(threads)]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
         if r.returncode:
             raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
         for f in ("seq.f32", "pos.i32"):

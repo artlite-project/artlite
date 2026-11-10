@@ -1,10 +1,12 @@
 """The cores' program of the vision overlay (``design``): a C++ main reading commands from the row's B stream. The main
 loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
 d 80 / 160, "c" attention of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
-"ln" the LayerNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's window
-attention, "r" the RoPE epilogue of Qwen3-VL's Q and K GEMMs; together they do not fit 16 KB
-of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the pager's state
-words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third). A page arrives in the B stream
+"ln" the LayerNorm / RMSNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's
+window attention, "r" the RoPE epilogue of the vision encoders' Q and K GEMMs (with LFM3-VL's per-head RMSNorm), "d"
+LFM3-VL's depthwise 3 x 3 conv and the SwiGLU / gated-product epilogues at GEGLU's and GELU's places; together they do
+not fit 16 KB of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the
+pager's state words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third; "d": SwiGLU second,
+the product third: a GEMM's command picks the code by the page its op loads). A page arrives in the B stream
 (``device.VisionDevice``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
 core holds both slots, its MM2S 1 streams them into its own program memory while it sleeps in ``sd15_pg_self``, then it
 gives them back.
@@ -29,7 +31,8 @@ core copies it into its workspace and releases the slot. Kinds:
   [rb][10]) or RoPE (role r's entry: the pass is a head, its channels [first dims 40 | second dims 40] of 40 pairs
   (k, 40 + k); the residual objects its tokens' cos | sin, a C tile [rb][cb][64] of cos (cb < 5) and sin; each pair
   turned, then bfp16 panels [rb][cb]) in ``OCH`` chunks (the last one padded);
-- ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
+- ``K_DW`` (role d): a depthwise 3 x 3 conv of one 80-channel block of the column's tile (``sd15_ext_d``);
+- ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm / RMSNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
   stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
   beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
   image's halves, their sums added): the B slots after it C_NREC
@@ -66,12 +69,14 @@ from ..operators.kernel_source import kernel_prefix
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
  C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
 C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
+C_QKN = 32  # (a RoPE GEMM: each head RMS-normed first, C_INVN, C_EPS its 1 / n and eps, its weights at C_QKW)
 C_DENSE, C_NLIVE = 30, 31  # (attention: the dense key masks, the live groups: the module docstring)
 C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
 # groups; -1: all; around the command's walks)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
 C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
 C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
+C_QKW = C_CALLS  # (a RoPE GEMM with C_QKN, not a conv: its heads' norm weights, 80 bf16)
 CALL, NCALL = 10, 11  # (words of a call, the most calls)
 CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk crosses between cbuf and the object)
 C_PATS = C_CALLS + CALL * NCALL  # (the MAC's walks of B and C, a dims_3d_t each: a conv's, a GEMM's, attention's P V^T)
@@ -84,14 +89,15 @@ ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a statistics record continued from / kept for
 C_BIAS = 64  # (word of the biases: bf16 [pass][80])
 C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
 C_ZERO = 48  # (16 zero words: a residual of zeros)
-K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN = 1, 2, 3, 4, 5, 6
+K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN, K_DW = 1, 2, 3, 4, 5, 6, 8  # (not paging.header(), 7: a page's first word)
+DW_STRIP, DW_C, DW_MASK = 1600, 3200, 4480  # (a depthwise conv slot: its strips, C, mask words: ``ops.DwConv``)
 O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU, O_ROPE = 0, 1, 2, 3, 4, 5, 6
 S_NONE, S_GN, S_LN = 0, 1, 2
-A_GN, A_GNSILU, A_LN = 1, 2, 3
+A_GN, A_GNSILU, A_LN, A_RMS = 1, 2, 3, 4
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "c", "v", "gn", "ln", "w", "r")
+ROLES = ("a", "c", "v", "gn", "ln", "w", "r", "d")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
@@ -174,9 +180,12 @@ inline __attribute__((always_inline)) aie::vector<bfloat16, 64> {{ p }}_tok64(co
    of two row blocks' gate blocks in a GEGLU tile (groups of 320 values, 640 apart) #}
 {% set gelu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax) %}
 {% set geglu_act = km.act(km.SILU, table_arg=True, n=640, scale=2, clamp=2 * gelu_tmax, walk=(10, 640)) %}
+{# SiLU of two row blocks' gate blocks in a SwiGLU tile (role d: SiLU's own table, exact) #}
+{% set swiglu_act = km.act(km.SILU, table_arg=True, n=640, walk=(10, 640)) %}
 {{ stab.src }}
 {{ gelu_act.src }}
 {{ geglu_act.src }}
+{{ swiglu_act.src }}
 
 
 // (an fp32 C tile of nbr 16-row bands: a k-tile from A at a with the walks pa (A, bytes), pb (B, bytes), pl (C))
@@ -597,9 +606,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_ch_coef(const float *__re
 }
 
 // LayerNorm per token: a tile's records of the column's 4 cores ([core][S1 m | S2 m], 144 floats apart) -> tokc [rb][a_hi 8 |
-// a_lo 8 | b_hi 8 | b_lo 8] (a = rstd, b = -mean rstd); st: scratch (mean 16 | rstd 16)
+// a_lo 8 | b_hi 8 | b_lo 8] (a = rstd, b = -mean rstd; RMSNorm: the mean 0); st: scratch (mean 16 | rstd 16)
 static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__restrict ra, const int32_t *ws, float *__restrict st,
                                                 bfloat16 *__restrict tokc, int m) {
+  const bool rms = ws[{{ C_MODE }}] == {{ A_RMS }};
   for (int k = 0; k < m; k += 16) {
     aie::vector<float, 16> s1 = aie::zeros<float, 16>(), s2 = aie::zeros<float, 16>();
     for (int q = 0; q < 4; q++) {
@@ -607,7 +617,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__res
       s1 = aie::add(s1, aie::load_v<16>(r + k));
       s2 = aie::add(s2, aie::load_v<16>(r + m + k));
     }
-    aie::store_v(st + 32, s1);
+    aie::store_v(st + 32, rms ? aie::zeros<float, 16>() : s1);
     aie::store_v(st + 48, s2);
     {{ p }}_mrstd(st + 32, st + 48, ws, st, st + 16);
     const aie::vector<float, 16> rs = aie::load_v<16>(st + 16);
@@ -624,7 +634,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_ln_tok(const float *__res
 }
 
 // one row block x (10 sub-blocks [8 tokens][8 ch], bf16) -> its 10 panels pushed at pan: z = x s + t (GroupNorm,
-// mode 1 / 2: then SiLU (the table)) or z = (x a + b) s + t (LayerNorm, mode 3: a, b the row block's token coefficients
+// mode 1 / 2: then SiLU (the table)) or z = (x a + b) s + t (LayerNorm / RMSNorm, mode 3 / 4: a, b the row block's token coefficients
 // tk [a_hi | a_lo | b_hi | b_lo], expanded once); s, t: the channels' cf [cb][s_hi | s_lo | t_hi | t_lo]; zz: z (x
 // itself: each read before it is written), tt: scratch (640). GroupNorm 32 lanes a step (64-lane vectors take two x
 // registers each: the coefficients' replicas and x spilled, II 26 per 64)
@@ -633,7 +643,7 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
                                                   const uint32_t *__restrict tab, bfp16ebs8 *__restrict pan, int mode) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   bfloat16 *z0 = zz, *t0 = tt;
-  if (mode != {{ A_LN }}) {
+  if (mode < {{ A_LN }}) {
     const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), hi = aie::broadcast<bfloat16, 32>(24.0f);
     int cc = 0;
     for (int i = 0; i < 20; i++) {  // (post-RA pipelined, II 8)
@@ -675,7 +685,7 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
 // [tile][rb][a_hi a_lo b_hi b_lo] (from 8192 B), t (640 at 16640 B), the output chunk's panels (at 17920 B)
 static __attribute__((noinline, minsize)) void {{ p }}_apply_run({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
   const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], nblk = ws[{{ C_NBLK }}], mode = ws[{{ C_MODE }}];
-  const int nrb = m / 8, nch = 80 * nblk, ln = mode == {{ A_LN }};
+  const int nrb = m / 8, nch = 80 * nblk, ln = mode >= {{ A_LN }};
   bfloat16 *coef = (bfloat16 *)cb, *tokc = (bfloat16 *)((uint8_t *)cb + 8192);
   bfloat16 *tt = (bfloat16 *)((uint8_t *)cb + 16640);
   int32_t *pan = (int32_t *)((uint8_t *)cb + 17920);
@@ -1499,12 +1509,42 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_w({{ p }}_st &s, int32_t *cb
   {{ p }}_wattn(s, cb, ws);
 }
 
-// K_GEMM's RoPE epilogue (role r, the module docstring): the pass's fp32 C tile to bf16 in place, its C_NRES residual
-// objects (the tokens' cos | sin, m x 80 bf16) into the C buffer after it, the pairs turned, the tile -> bfp16 panels
-// out
+// a head's bf16 C tile [rb][cb][64] RMS-normed per token in place (C_QKN: LFM3-VL's q / k norm): the sum of squares
+// of its 80 channels (pads zero) times C_INVN plus C_EPS, c := bf16(c w) rsqrt(..) (the inverse as hi + lo bf16), w the
+// command's 80 bf16 at C_QKW
+static __attribute__((noinline)) void {{ p }}_qkn(bfloat16 *__restrict c, const int32_t *ws, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *w = (const bfloat16 *)(ws + {{ C_QKW }});
+  const aie::vector<float, 16> inv_n = aie::broadcast<int32, 16>(ws[{{ C_INVN }}]).template cast_to<float>();
+  const aie::vector<float, 16> eps = aie::broadcast<int32, 16>(ws[{{ C_EPS }}]).template cast_to<float>();
+  for (int rb = 0; rb < nrb; rb++) {
+    bfloat16 *x = c + 640 * rb;
+    aie::accum<accfloat, 64> a2 = aie::zeros<accfloat, 64>();
+    for (int cb = 0; cb < 10; cb++) {
+      const aie::vector<bfloat16, 64> v = aie::load_v<64>(x + 64 * cb);
+      a2 = aie::mac(a2, v, v);
+    }
+    const aie::vector<float, 16> ve = aie::add(al::mulff<16>(al::group8<false>(a2.template to_vector<float>()).template grow<16>(), inv_n), eps);
+    aie::vector<float, 16> r = aie::zeros<float, 16>();
+    AIE_LOOP_UNROLL_FULL
+    for (int k = 0; k < 8; k++) r.set(aie::invsqrt(ve[k]), k);
+    aie::vector<bfloat16, 16> rh, rl;
+    al::split2<16>(r, rh, rl);
+    const aie::vector<bfloat16, 64> h = al::expand8(rh.extract<8>(0)), l = al::expand8(rl.extract<8>(0));
+    for (int cb = 0; cb < 10; cb++) {
+      const aie::vector<bfloat16, 64> cw = aie::mul(aie::load_v<64>(x + 64 * cb), {{ p }}_rep(w + 8 * cb)).template to_vector<bfloat16>();
+      aie::store_v(x + 64 * cb, aie::mac(aie::mul(cw, h), cw, l).template to_vector<bfloat16>());
+    }
+  }
+}
+
+// K_GEMM's RoPE epilogue (role r, the module docstring): the pass's fp32 C tile to bf16 in place (with C_QKN each
+// head RMS-normed: ``{{ p }}_qkn``), its C_NRES residual objects (the tokens' cos | sin, m x 80 bf16) into the C buffer
+// after it, the pairs turned, the tile -> bfp16 panels out
 __attribute__((noinline, minsize)) void {{ p }}_ext_r({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
   const int m = ws[{{ C_M }}], nres = ws[{{ C_NRES }}];
   {{ p }}_res_f2b((const bfloat16 *)(ws + {{ C_ZERO }}), (const float *)cb, (bfloat16 *)cb, m * 80, 0, 0);
+  if (ws[{{ C_QKN }}]) {{ p }}_qkn((bfloat16 *)cb, ws, m / 8);
   int32_t *t = cb + m * 40;  // (words: the table after the bf16 tile, in the C buffer's other region)
   for (int i = 0, left = m * 40; i < nres; i++) {
     int32_t *a = {{ p }}_take_a(s);
@@ -1519,6 +1559,86 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_r({{ p }}_st &s, int32_t *cb
   {{ p }}_rope((bfloat16 *)cb, (const bfloat16 *)(cb + m * 40), m / 8);
   {{ p }}_bfp(cb, cb, m / 8 * 10);
   {{ p }}_out(s, cb, m * 90);
+}
+
+// SwiGLU of a C tile (role d's second entry: a GEMM's GEGLU path): rb's channels [hid 5 cb | gate 5 cb] -> hid silu(gate)
+// as bfp16 panels [rb][5] at out (``{{ p }}_geglu``'s form; tab: SiLU's table)
+__attribute__((noinline)) void {{ p }}_swiglu(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict t,
+                                         const uint32_t *__restrict tab, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *h = (const bfloat16 *)in;
+  int ch = 0;
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> o((bfp16ebs8 *)out);
+  for (int rb = 0; rb < nrb; rb += 2) {
+    {{ swiglu_act }}((const bfloat16 *)in + 320 + 640 * rb, t, tab, tab + {{ tw }});
+    const bfloat16 *tv = t;
+    for (int i = 0; i < 10; i++) {
+      o.push(aie::mul(aie::load_v<64>(tv), aie::load_v<64>(h)).template to_vector<bfp16ebs8>());
+      h = add_2d_ptr(h, 384, 4, ch, 64);
+      tv += 64;
+    }
+  }
+}
+
+// a gated product of a C tile (role d's third entry: a GEMM's GELU path): rb's channels [hid 5 cb | gate 5 cb] -> bf16
+// hid gate [rb][5 cb][64] at out (the tile's buffer: rb's products at 320 rb, written after its reads)
+__attribute__((noinline)) void {{ p }}_prod(const int32_t *__restrict in, int32_t *__restrict out, bfloat16 *__restrict,
+                                       const uint32_t *__restrict, int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *x = (const bfloat16 *)in;
+  bfloat16 *y = (bfloat16 *)out;
+  for (int rb = 0; rb < nrb; rb++)
+    for (int cb = 0; cb < 5; cb++) {
+      const aie::vector<bfloat16, 64> v = aie::mul(aie::load_v<64>(x + 640 * rb + 64 * cb),
+                                                   aie::load_v<64>(x + 640 * rb + 64 * cb + 320)).template to_vector<bfloat16>();
+      aie::store_v(y + 320 * rb + 64 * cb, v);
+    }
+}
+
+// a class's outputs of the depthwise 3 x 3 conv (``{{ p }}_ext_d``): hb the half's 4 class slots, taps [tap 9][80] bf16,
+// y the class's row block [cb][64] of the C tile; per tap its source (class q' = ((py + dy) & 1, (px + dx) & 1): the
+// strip cy != 0 where cy = (py + dy) >> 1, windows from 1 + cx, cx = (px + dx) >> 1) and the class's mask words (the
+// slot's 18 at DW_MASK: per tap the lanes of its valid windows); fp32 sums of 9 taps per channel, rounded to bf16, times
+// C, rounded
+static __attribute__((noinline)) void {{ p }}_dwq(const uint8_t *const *hb, const bfloat16 *__restrict taps, bfloat16 *__restrict y,
+                                             int q) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const int py = q >> 1, px = q & 1;
+  const bfloat16 *src[9];
+  const uint32_t *mw = (const uint32_t *)(hb[q] + {{ DW_MASK }});
+  for (int t = 0; t < 9; t++) {
+    const int dy = t / 3 - 1, dx = t % 3 - 1, sy = py + dy, sx = px + dx;
+    src[t] = (const bfloat16 *)(hb[(sy & 1) * 2 + (sx & 1)] + ((sy >> 1) ? {{ DW_STRIP }} : 0) + ((sx >> 1) + 1) * 16);
+  }
+  const bfloat16 *c = (const bfloat16 *)(hb[q] + {{ DW_C }});
+  for (int cb = 0; cb < 10; cb++) {
+    aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
+    for (int t = 0; t < 9; t++) {
+      const aie::mask<64> mk = aie::mask<64>::from_uint32(mw[2 * t], mw[2 * t + 1]);
+      const aie::vector<bfloat16, 64> v = aie::select(aie::zeros<bfloat16, 64>(), al::gather<8, 8>(src[t] + 80 * cb, 8), mk);
+      acc = aie::mac(acc, v, {{ p }}_rep(taps + 80 * t + 8 * cb));
+    }
+    aie::store_v(y + 64 * cb, aie::mul(acc.template to_vector<bfloat16>(), aie::load_v<64>(c + 64 * cb)).template to_vector<bfloat16>());
+  }
+}
+
+// the depthwise 3 x 3 conv op (K_DW, role d, ``ops.DwConv``): one 80-channel block of the column's tile; per half p two A
+// objects of its classes' slots (q' 0, 1 | 2, 3 in the halves: [strip cy 0 | strip cy != 0: cb 10 x window 10 x 8 bf16]
+// [C: cb 10 x 8 x 8][mask words]), the taps (B slot [tap 9][80] bf16); y = C conv(g) into the C tile (row block
+// 2 q + p), then bfp16 panels [rb][cb] out
+__attribute__((noinline, minsize)) void {{ p }}_ext_d({{ p }}_st &s, int32_t *cb, int32_t *, int32_t *) {
+  int32_t *tw = {{ p }}_take_b(s);
+  for (int h = 0; h < 2; h++) {
+    const uint8_t *a0 = (const uint8_t *){{ p }}_take_a(s), *a1 = (const uint8_t *){{ p }}_take_a(s);
+    const uint8_t *hb[4] = {a0, {{ p }}_ab(a0, {{ A_OBJ // 2 }}), a1, {{ p }}_ab(a1, {{ A_OBJ // 2 }})};
+    for (int q = 0; q < 4; q++)
+      {{ p }}_dwq(hb, (const bfloat16 *)tw, (bfloat16 *)cb + 640 * (2 * q + h), q);
+    {{ p }}_give_a(s, (int32_t *)a0);
+    {{ p }}_give_a(s, (int32_t *)a1);
+  }
+  {{ p }}_give_b(s, tw);
+  {{ p }}_bfp(cb, cb, 80);
+  {{ p }}_out(s, cb, 5760);
 }
 
 extern "C" {
@@ -1577,9 +1697,10 @@ def shift_masks(joined: bool = False) -> bytes:
 def source(*, win: str = "") -> str:
     from . import design as d
     assert win in ("",) + WINS, win
+    assert paging.header() not in (K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN, K_DW), "a command kind reads as a page"
     return JINJA_ENV.from_string(_SRC).render(
         p=P, pager=paging.source(P, wake=d.L_WAKE, send=d.L_SEND), header=paging.header(), lock_base=paging.LOCK_BASE,
         L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
         gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
-        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_") or k[:3] in ("REC", "ST_")})
+        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_") or k[:3] in ("REC", "ST_", "DW_")})

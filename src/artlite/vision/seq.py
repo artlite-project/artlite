@@ -40,7 +40,8 @@ B_BDS = (4, 5, 6, 7, 12, 13, 14, 15)  # (MM2S 1: a pool for the B runs' chains, 
 class MemTask:
     """A memtile task: its chain of BDs (``txn.mem_bd_words`` keywords without locks and links: the first BD takes
     the task's acquire, the last its release), runs; a fill's / drain's DDR side (device address, bytes per run, shim
-    dims[, shim iteration (step words, count)]: the shim task runs as often)."""
+    dims[, shim iteration (step words, count)[, tag]]: the shim task runs as often; a tag: its address is set per
+    dispatch (``Seq.tags``))."""
 
     chain: list[dict]
     repeat: int = 1
@@ -93,6 +94,7 @@ class Seq:
         self._prod = [0] * COLS  # producers pushed since the column's last gate
         self._par = [0] * ROWS  # per row: B objects, mod 2
         self._drains: dict[int, int] = {}  # col -> its last shim drain's push (waited for at the end)
+        self.tags: list[tuple[int, object]] = []  # (the word index of a tagged shim BD's address low word, the tag)
         for c in range(COLS):
             for d in (txn.S2MM, txn.MM2S):
                 for ch in range(6):
@@ -220,11 +222,13 @@ class Seq:
             self._pushed(key, n)
 
     def _shim(self, col: int, d: int, ch: int, op: int, address: int, nbytes: int, dims: tuple | None,
-              iteration: tuple[int, int] | None = None, *, repeat: int = 1) -> int:
+              iteration: tuple[int, int] | None = None, tag: object = None, *, repeat: int = 1) -> int:
         key = (0, col, d, ch)
         k = self._slot(key, op) % txn.QUEUE_DEPTH
         bd = SHIM_BD_BASE[(d, ch)] + k
-        self.t.shim_bd(col, bd, address=address, nbytes=nbytes, dims=dims, iteration=iteration)
+        at = self.t.shim_bd(col, bd, address=address, nbytes=nbytes, dims=dims, iteration=iteration)
+        if tag is not None:
+            self.tags.append((at + 1, tag))
         n = self.t.n_ops
         self.t.shim_push(col, d, ch, bd, repeat=repeat)
         self._pushed(key, n)

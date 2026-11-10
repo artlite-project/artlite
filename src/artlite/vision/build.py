@@ -256,6 +256,11 @@ class Builder:
         """Drains (``spill``) with the next op (not synced: ``op``); release: memtile (addr, bytes) freed after it."""
         self._drains.append((cols, list(release), False))
 
+    def flush(self) -> None:
+        """The drains pending (``defer``) pushed with an op of their own, their memtile bytes released."""
+        if self._drains:
+            self.op({}, {})
+
     def ddr_sync(self) -> None:
         """Every drain pushed so far written to DDR (``seq.Seq.ddr_sync``)."""
         self.s.ddr_sync()

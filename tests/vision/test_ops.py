@@ -569,3 +569,167 @@ def test_conv_il(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
         ref = ref + r_img.bfloat16().float()
     err = _rel(y, ref)
     assert err < 8e-3, err
+
+
+def test_norm_rms(npu: VisionDevice) -> None:
+    """RMSNorm (``Apply(mode="rms")``: LayerNorm's records, the mean taken as 0, gamma only) of a GEMM's output over its
+    first 1024 of 1280 channels (the rest zero: LFM3-VL's padded residual): within 9e-3 of torch."""
+    torch.manual_seed(21)
+    m, C, H = 64, 1280, 1024
+    x = torch.randn(COLS * m, 320)
+    w = torch.randn(C, 320) / 320 ** 0.5
+    w[H:] = 0
+    gamma = 1 + 0.3 * torch.randn(C)
+    X, Y = 0, 320 // 8 * m // 8 * L.PANEL
+    REC = Y + C // 80 * L.ct_bytes(m)
+    Z = REC + 16 * D.OCH
+    g = Gemm(m=m, ntile=1, K=320, N=C, x=X, y=Y, out="bf16", stats="ln", rec=REC)
+    a = Apply(m=m, nblk=C // 320, mode="rms", x=Y, y=Z, rec=REC, C=H)
+    s = npu.seq()
+    s.op(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X), {})
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, None))
+    npu.alloc("ap", ROWS * 2 * D.Q)
+    npu.write("ap", np.concatenate([x for r in range(ROWS) for x in (a.command(r), a.gamma_beta(gamma, None, r))]))
+    s.op({c: a.col_ops() for c in range(COLS)}, {r: a.row_ops(npu.address("ap", 2 * r * D.Q)) for r in range(ROWS)})
+    nz, ny = C // 8 * m // 8 * L.PANEL, C // 80 * L.ct_bytes(m)
+    s.op(merge(drains(npu, "y", ny, Y), drains(npu, "z", nz, Z)), {})
+    npu.run(npu.transaction(s))
+    y = torch.cat([L.from_ctiles(b, m, C, m) for b in npu.read("y", COLS * ny).reshape(COLS, -1)])
+    z = torch.cat([L.from_panels(b, m, C) for b in npu.read("z", COLS * nz).reshape(COLS, -1)])
+    ref = y / torch.sqrt((y[:, :H] ** 2).mean(-1, keepdim=True) + 1e-5) * gamma
+    assert _rel(z[:, :H], ref[:, :H]) < 9e-3 and float(z[:, H:].abs().max()) == 0
+
+
+@pytest.mark.parametrize("out", ["swiglu", "prod"])
+def test_gated(npu: VisionDevice, out: str) -> None:
+    """The gated pair epilogues of role d (the weight's rows [hid | gate], per pass [hid 40 | gate 40]): SwiGLU (``Gemm(
+    out="geglu", act="silu")``: hid silu(gate) as panels, SiLU's own table) and the product (``out="prod"``: hid gate as
+    bf16, 5760 B a pass): within 1.2e-2 (panels) / 8e-3 (bf16) of torch on the bfp16-rounded operands."""
+    torch.manual_seed(22)
+    m, K, N = 64, 1024, 2560
+    x = torch.randn(COLS * m, K)
+    w = torch.randn(N, K) / K ** 0.5
+    X, Y = 0, K // 8 * m // 8 * L.PANEL
+    g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, out="geglu" if out == "swiglu" else "prod", act="silu" if out == "swiglu"
+             else "gelu")
+    s = npu.seq()
+    s.op(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X), {})
+    if out == "swiglu":
+        s.op({}, table_rows(npu, "tab", np.tile(kmath.SILU.table_words(), 2).view(np.uint8)))
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, None))
+    ybytes = N // 16 * g.y_np * L.PANEL if out == "swiglu" else N // 80 * 5760
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    ob = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    u = (q(x) @ q(w).T).bfloat16().float()
+    hid, gate = u.chunk(2, -1)
+    if out == "swiglu":
+        y = torch.cat([L.from_panels(ob[c], m, N // 2) for c in range(COLS)])
+        assert _rel(y, hid * F.silu(gate)) < 1.2e-2
+    else:  # ([pass 32][rb 8][cb 5][8 tokens][8 ch] bf16 per column, 640 B of padding a pass)
+        v = torch.from_numpy(ob.reshape(COLS, N // 80, 5760)[:, :, :5120].copy()).view(torch.bfloat16).float()
+        y = v.reshape(COLS, N // 80, 8, 5, 8, 8).permute(0, 2, 4, 1, 3, 5).reshape(COLS * m, N // 2)
+        assert _rel(y, (hid * gate).bfloat16().float()) < 8e-3
+
+
+def test_gemm_rope_qkn(npu: VisionDevice) -> None:
+    """The RoPE epilogue with LFM3-VL's q / k norm (``Gemm(qkn=)``): each head of 80 RMS-normed over 64 channels (its
+    pads zero), times the 80 weights, then turned: within 8e-3 of torch on the bfp16-rounded operands' bf16 outputs."""
+    torch.manual_seed(23)
+    m, K, N = 64, 1024, 1280
+    x = torch.randn(COLS * m, K)
+    w = torch.randn(N, K) / K ** 0.5
+    pads = torch.tensor([j % 40 >= 32 for j in range(80)])
+    w.reshape(16, 80, K)[:, pads] = 0
+    nw = (1 + 0.3 * torch.randn(80)) * ~pads
+    ang = torch.rand(COLS * m, 40) * 20
+    cs = torch.cat([torch.cos(ang), torch.sin(ang)], 1)
+    X, RES = 0, K // 8 * m // 8 * L.PANEL
+    Y = RES + L.ct_bytes(m)
+    g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, res=RES, out="rope", qkn=nw.numpy(), qkn_n=64, qkn_eps=1e-5)
+    ybytes = N // 8 * m // 8 * L.PANEL
+    s = npu.seq()
+    s.op(merge(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X),
+               fills(npu, "r", [L.ctiles(cs[c * m:(c + 1) * m], m) for c in range(COLS)], RES)), {})
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, None))
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    y = torch.cat([L.from_panels(yb[c], m, N) for c in range(COLS)])
+    c0 = (q(x) @ q(w).T).bfloat16().float().reshape(-1, 16, 80)
+    c0 = c0 / torch.sqrt((c0 * c0).sum(-1, keepdim=True) / 64 + 1e-5) * nw.bfloat16().float()
+    c0 = c0.reshape(-1, 16, 2, 40)
+    c, sn = (t.bfloat16().float()[:, None] for t in (cs[:, :40], cs[:, 40:]))
+    ref = torch.stack([c0[:, :, 0] * c - c0[:, :, 1] * sn, c0[:, :, 1] * c + c0[:, :, 0] * sn], 2).reshape(-1, N)
+    assert _rel(y, ref) < 8e-3
+
+
+@pytest.mark.parametrize("gh, gw, nb, b", [(6, 20, 1, 0), (13, 17, 2, 1), (5, 3, 1, 0), (2, 70, 2, 0)])
+def test_dwconv(npu: VisionDevice, gh: int, gw: int, nb: int, b: int) -> None:
+    """LFM3-VL's depthwise 3 x 3 conv (``ops.DwConv``, 4 steps of an 80-channel block per row) of band b of a gh x gw
+    window grid: the gated input from DDR ([window][class][1280] bf16: strips of 10 windows per class, the rows above /
+    below gw windows away), the gate C from a band's C tiles, the image's edge masks: y = C conv(g) within 8e-3 of torch
+    on the bf16 inputs (the bfp16 output's rounding), the tokens of real windows."""
+    from ml_dtypes import bfloat16
+
+    from artlite.vision import windows as Wn
+    from artlite.vision.ops import DwConv
+    torch.manual_seed(24)
+    C, W = 1280, nb * 128
+    g = torch.randn(W, 4, C).bfloat16().float()
+    cg = torch.randn(nb, COLS, 64, C).bfloat16().float()  # (the band's tiles' C: token 8 (2 q + p) + j)
+    taps = torch.randn(C, 3, 3) / 3
+    gd = np.zeros((W + 2 * Wn.MARGIN, 4, C), bfloat16)
+    gd[Wn.MARGIN:Wn.MARGIN + W] = g.numpy().astype(bfloat16)
+    npu.alloc("g", Wn.conv_ddr_bytes(nb))
+    npu.write("g", gd.view(np.uint8))
+    ct = L.ct_bytes(64)
+    npu.alloc("c", COLS * 16 * ct)
+    npu.write("c", np.concatenate([L.ctiles(cg[b, c], 64) for c in range(COLS)]))
+    masks = Wn.dw_masks(gh, gw, nb, b)
+    npu.alloc("m", COLS * DwConv.MASK_BYTES)
+    npu.write("m", masks.view(np.uint8))
+    STAGE, Y = 0, DwConv.STAGE_BYTES
+    s = npu.seq()
+    for k in range(4):
+        op = DwConv(stage=STAGE, y=Y, k=k)
+        cols = {}
+        for c in range(COLS):
+            fl = []
+            for p in range(2):
+                for part in ("mid", "up", "down"):
+                    off = Wn.conv_strip(nb, b, c, p, part, k) + Wn.conv_shift(part, gw)
+                    fl.append(op.strip_fill(p, part, npu.address("g", off)))
+            fl.append(MemTask([op.c_fill()], ddr=op.c_ddr(npu.address("c", c * 16 * ct), k)))
+            fl.append(MemTask([op.mask_fill()], ddr=(npu.address("m", c * DwConv.MASK_BYTES), DwConv.MASK_BYTES, None)))
+            cols[c] = ColOps(fills=fl)
+        s.op(cols, {})
+        img = np.concatenate([np.concatenate([op.command(), DwConv.taps(taps, 4 * r + k)]) for r in range(ROWS)])
+        npu.alloc(f"t{k}", ROWS * 2 * D.Q)
+        npu.write(f"t{k}", img)
+        s.op({c: op.col_ops() for c in range(COLS)}, op.row_ops(npu.address(f"t{k}")))
+    nbytes = C // 8 * 8 * L.PANEL
+    s.op(drains(npu, "y", nbytes, Y), {})
+    npu.run(npu.transaction(s))
+    yb = npu.read("y", COLS * nbytes).reshape(COLS, nbytes)
+    got = torch.stack([L.from_panels(yb[c], 64, C) for c in range(COLS)])  # (column, token 8 (2 q + p) + j, C)
+    wq = taps.bfloat16().float()
+    ref, sel = torch.zeros_like(got), torch.zeros(COLS, 64, dtype=torch.bool)
+    for c in range(COLS):
+        for p in range(2):
+            for j, w in enumerate(Wn.windows_of(nb, b, c, p)):
+                if w >= gh * gw:
+                    continue
+                wy, wx = divmod(int(w), gw)
+                for qq in range(4):
+                    py, px = divmod(qq, 2)
+                    acc = torch.zeros(C)
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            y, x = 2 * wy + py + dy, 2 * wx + px + dx
+                            if 0 <= y < 2 * gh and 0 <= x < 2 * gw:
+                                acc += wq[:, dy + 1, dx + 1] * g[(y // 2) * gw + x // 2, (y % 2) * 2 + x % 2]
+                    t = 8 * (2 * qq + p) + j
+                    ref[c, t] = (acc.bfloat16().float() * cg[b, c, t]).bfloat16().float()
+                    sel[c, t] = True
+    assert _rel(got[sel], ref[sel]) < 8e-3

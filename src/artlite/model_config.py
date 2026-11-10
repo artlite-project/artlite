@@ -116,7 +116,19 @@ def lfm3_gguf(quant: str = "QAD-Q4_0") -> str:
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-1.7B-GGUF", f"LFM3-1.7B-{quant}.gguf")
 
 
-DECISION_FILES = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
+def lfm3vl_gguf(quant: str = "QAD-Q4_0") -> str:
+    """A language model file of LiquidAI's LFM3-VL-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes):
+    ``QAD-Q4_0``, ``Q4_K_M``, ``Q8_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-VL-2B-GGUF", f"LFM3-VL-2B-{quant}.gguf")
+
+
+def lfm3vl_mmproj(quant: str = "BF16") -> str:
+    """LFM3-VL-2B's vision encoder and projector (GGUF architecture ``clip``, projector ``lfm3vl``): ``BF16``, ``F16``,
+    ``Q8_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-VL-2B-GGUF", f"mmproj-LFM3-VL-2B-{quant}.gguf")
+
+
+DECISION_FILES = {"d3-lite":"ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
                   "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",
                   "kai": "vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf",
@@ -660,7 +672,9 @@ class ClipConfig:
     (patches per output token per side: MiniCPM-V's ``projector.scale_factor``, 4 or 2; Qwen3-VL's
     ``spatial_merge_size``, 2), ``max_slices`` and the layer after which the ViT merger runs (``merger_layer``:
     ``wa_layer_indexes``, -1 without one) of MiniCPM-V; Qwen3-VL's ``deepstack``: its layers whose outputs feed
-    projectors of their own (``is_deepstack_layers``)."""
+    projectors of their own (``is_deepstack_layers``); ``kv_heads`` (grouped-query attention: LFM3-VL's), an image's
+    pixels between ``min_pixels`` and ``max_pixels`` and the resampling filter ``resize`` (0, "": the projector's
+    defaults). The projector type is ``clip.projector_type`` or (LFM3-VL's files) ``clip.vision.projector_type``."""
 
     projector: str
     image_size: int
@@ -677,6 +691,10 @@ class ClipConfig:
     max_slices: int
     merger_layer: int
     deepstack: tuple[int, ...] = ()
+    kv_heads: int = 0
+    min_pixels: int = 0
+    max_pixels: int = 0
+    resize: str = ""
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> ClipConfig:
@@ -686,7 +704,7 @@ class ClipConfig:
         merge = int(m("projector.scale_factor", m("spatial_merge_size", 4)))
         wa = m("wa_layer_indexes")
         return cls(
-            projector=str(gguf.meta["clip.projector_type"]),
+            projector=str(gguf.meta.get("clip.projector_type", m("projector_type"))),
             image_size=int(m("image_size")),
             patch_size=int(m("patch_size")),
             hidden=int(m("embedding_length")),
@@ -701,6 +719,10 @@ class ClipConfig:
             max_slices=int(m("max_slice_nums", 9)),
             merger_layer=int(wa[0]) if merge == 4 and wa is not None else -1,
             deepstack=tuple(i for i, d in enumerate(np.asarray(m("is_deepstack_layers", []), bool).tolist()) if d),
+            kv_heads=int(m("attention.head_count_kv", m("attention.head_count"))),
+            min_pixels=int(m("image_min_pixels", 0)),
+            max_pixels=int(m("image_max_pixels", 0)),
+            resize=str(m("image_resize_algo", "")),
         )
 
     @property

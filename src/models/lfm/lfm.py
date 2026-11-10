@@ -2,7 +2,9 @@
 of three kinds (short convolutions, sliding-window and full attention), each [operator | SwiGLU FFN] with sandwich
 norms (``artlite.model_config.LfmConfig``).
 
-A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the weights
+A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows: an LFM3-VL image's, ``models.lfm3vl``;
+the positions 1-D). A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the
+weights
 (``models.lfm.overlay.LfmOverlay``): the projections on the main cores and their helpers, the attention, its KV caches
 and the conv layers' short convolutions on the operator cores. A prompt runs in chunks of up to 4096 tokens through the
 prefill (``models.lfm.prefill.LfmPrefill``: layer-major from one library ELF on the same weight image; the chunk's K / V
@@ -21,10 +23,13 @@ import torch
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LfmConfig
+from artlite.model_config import ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
 
 from ..common import Model, OverlayModel, Sampling
+from ..lfm3vl import host as vl_host
+from ..lfm3vl import npu as vl_npu
+from ..sequence import Sequence
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LfmImage
 from .overlay import KV_K, LfmOverlay
@@ -78,11 +83,23 @@ class NpuLfm(OverlayModel):
         self.overlay.reset()
         self.position = 0
 
-    def _step_inputs(self, tokens: list[int]) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _rows(self, tokens: list[int] | Sequence) -> torch.Tensor:
+        """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
+        if not isinstance(tokens, Sequence):
+            return self.gguf.rows("token_embd.weight", tokens)
+        x = torch.empty(len(tokens), self.cfg.hidden_size)
+        t = ~tokens.given
+        if t.any():
+            x[torch.from_numpy(t)] = self.gguf.rows("token_embd.weight", tokens.ids[t])
+        if tokens.given.any():
+            x[torch.from_numpy(tokens.given)] = torch.from_numpy(tokens.rows)
+        return x
 
-    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
+        return (self._rows(tokens),)
+
+    def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
+        return (self._rows(tokens),)
 
     def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
         """(the LM head alone on the chunk's last output row)"""
@@ -93,15 +110,19 @@ class NpuLfm(OverlayModel):
 class Lfm(Model):
     """An lfm3 GGUF file: the architecture, tokenizer and chat template from its metadata. Thinking: the template opens
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
-    (the file's ``add_bos_token``, as llama.cpp)."""
+    (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the vision encoder's file (images in prompts: LFM3-VL's,
+    ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default the
+    mmproj's 64 .. 4096)."""
 
     name = "LFM3"
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
+    projectors = vl_npu.PROJECTORS
 
-    def __init__(self, path: str, *, kv_k: str = "single"):
+    def __init__(self, path: str, *, kv_k: str = "single", mmproj: str | None = None, image_min_tokens: int | None = None,
+                 image_max_tokens: int | None = None):
         if kv_k not in KV_K:
             raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
         self.gguf = GGUFFile(path)
@@ -111,17 +132,34 @@ class Lfm(Model):
         self.eos_token_ids = self.cfg.eos_token_ids
         self.bos = int(self.gguf.meta["tokenizer.ggml.bos_token_id"])
         self.kv_k = kv_k
+        self._npu: NpuLfm | None = None
+        if mmproj is not None:
+            clip = ClipConfig.from_gguf(GGUFFile(mmproj))
+            if clip.projector not in self.projectors:
+                raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: {', '.join(self.projectors)})")
+            if clip.projection_dim != self.cfg.hidden_size:
+                raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's {self.cfg.hidden_size}")
+            self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
-             variables: dict[str, object] | None = None) -> list[int]:
+             variables: dict[str, object] | None = None) -> list[int] | Sequence:
         bos = self.gguf.strings("tokenizer.ggml.tokens", self.bos)[0]
-        return self.tokenizer.encode(chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools,
-                                                 preserve_thinking=preserve, template=self.chat_template,
-                                                 **{"bos_token": bos, **(variables or {})}))
+        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
+                           template=self.chat_template, **{"bos_token": bos, **(variables or {})})
+        images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
+                  if isinstance(p, dict) and p.get("type") == "image"]
+        if not images:
+            return self.tokenizer.encode(text)
+        if self.vision is None:
+            raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
+        seq = vl_host.image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
+        if self._npu is not None:  # (the encoder's hardware context ran: ``OverlayDevice.set_prologue``)
+            self._npu.stale()
+        return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""
@@ -130,4 +168,5 @@ class Lfm(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLfm:
-        return NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
+        self._npu = NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
+        return self._npu

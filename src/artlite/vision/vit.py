@@ -79,7 +79,8 @@ def vit_level(nb: int, tm: int = 64) -> VitLevel:
 @dataclass(frozen=True)
 class Keys:
     """A level's attention keys: per image their validity (``valid``: None, all), joint (one sequence of both images'
-    keys), dense (joint: any number of key groups, whole ones before the last valid one: ``ops.Attention``); ``name``:
+    keys), dense (joint: any number of key groups, whole ones before the last valid one: ``ops.Attention``), kv_heads
+    (grouped-query attention: ``ops.Attention``); ``name``:
     the DDR image of the level's attention command (shared by its layers: an encoder rewrites its key masks per
     dispatch)."""
 
@@ -87,10 +88,11 @@ class Keys:
     valid: tuple | None = None
     joint: bool = False
     dense: bool = False
+    kv_heads: int = 0
 
     def attention(self, lv: Level, **kw: int) -> Attention:
         return Attention(np=lv.np, d=HP, nbands=lv.nb, heads=HEADS, raise_max=True, valid=self.valid, joint=self.joint,
-                         dense=self.dense, **{"q": 0, "o": 0, "kv": 0} | kw)
+                         dense=self.dense, kv_heads=self.kv_heads, **{"q": 0, "o": 0, "kv": 0} | kw)
 
 
 HEAD_ROWS = np.array([h * HD + d if d < HD else -1 for h in range(HEADS) for d in range(HP)])  # (``pad_heads``)
@@ -119,9 +121,11 @@ def ln_records(bd: Builder, x: Tensor, *, name: str) -> int:
     return rec
 
 
-def ln(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
-    """LayerNorm of the C tiles x (its producer's records at rec, freed) into the panels y on every core row."""
-    a = Apply(m=x.lv.m, nblk=C // 320, mode="ln", x=x.addr, y=y.addr, ntile=x.lv.ntile, rec=rec, C=H, eps=EPS,
+def ln(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor | None, *, name: str, rec: int,
+       C: int = C, H: int = H, eps: float = EPS, mode: str = "ln") -> None:
+    """LayerNorm (mode "rms": RMSNorm, beta None) of the C tiles x (its producer's records at rec, freed) over their
+    first H of C channels into the panels y on every core row."""
+    a = Apply(m=x.lv.m, nblk=C // 320, mode=mode, x=x.addr, y=y.addr, ntile=x.lv.ntile, rec=rec, C=H, eps=eps,
               y_np=y.np)
     bd.apply(a, gamma, beta, name=name)
     bd.mem.release(rec, ln_rec(x.lv))
