@@ -122,6 +122,17 @@ dispatch per one or a few layers (each well under the driver's 2 s). Its weights
 dispatches of each image size cached in the cache directory; an image's embeddings are kept, so a chat's next turns do
 not run it again.
 
+The time to the first token of an image prompt (the encoder, then the prefill), through each runtime's server
+(`image_ttft.py` of the README's image chart: the image and "Describe this image in detail.", QAD-Q4_0 and the BF16
+mmproj; the iGPU's best of 3 sessions):
+
+| image (its size: prompt tokens) | Artlite (NPU) | llama-server, iGPU (Vulkan) |
+|---|---|---|
+| sd15-astronaut.jpg (512 x 512: 282) | 0.146 s | 0.189 s |
+| test-1.jpeg (640 x 488: 324) | 0.173 s | 0.251 s |
+| hk_OCR.jpg (1300 x 858: 1132) | 0.447 s | 0.914 s |
+| airplane.jpeg (1920 x 1440: 2724) | 1.19 s | 2.40 s |
+
 The embeddings are ~3.5% per token from an exact (float64) encoder (the bfp16 operands of its GEMMs), llama.cpp's ~1%;
 a few tokens are further off (up to ~0.8 of their norm): patches whose values nearly cancel before the final LayerNorm,
 which then scales up their small errors. The language model hardly notices: teacher-forced over a description of an image, its answer stays as close to llama.cpp's own
