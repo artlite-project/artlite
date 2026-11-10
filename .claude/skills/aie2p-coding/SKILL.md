@@ -311,6 +311,11 @@ Silent wrong results:
 - **A load followed by a store to the same address can be reordered** (`yv = load(y); store(y, zeros); ... use(yv)`:
   the store issued one cycle after the load, which saw it). Store after the last use.
 - **A rolled `extract<8>(h)` loop stored wrong lanes** (besides compiling to a switch): unroll lane loops.
+- **`aie::concat` of two 32-lane fp32 accumulators fresh from bf16 MACs** lost the upper 32 lanes in a pipelined loop:
+  a 32-lane `vmul.f` / `vmac.f` writes its whole 2048-bit `dm` six cycles after issue, and Peano scheduled the move of
+  the other result into that `dm`'s upper half before it (`vmov cmh1, cml1`, or two `vmov bmh*` through float vectors:
+  the same). Schedule-dependent (qwen35's prefill softmax concatenates its exp2 halves and is right). Store the halves to
+  L1 as fp32 and load 64 lanes (the vision attention's `pexp2`).
 - **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
   (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
 - **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B

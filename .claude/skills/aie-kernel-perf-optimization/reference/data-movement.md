@@ -76,7 +76,9 @@ bandwidth.
   pixel across the seam, for free; only the masks change (sd15's VAE decoder: `core.shift_masks(joined)`), and
   the per-image statistics are summed (the GroupNorm apply's C_JOIN).
 - **Tokens per weight pass**: a weight-streaming GEMM re-reads all weights once per token chunk (GemmQ, 32 -> 64
-  tokens per core row: GEMMs -15..26%); L1 bounds the tokens per pass.
+  tokens per core row: GEMMs -15..26%); L1 bounds the tokens per pass. Only where the stream binds: the vision overlay's
+  m-64 GEMMs are bound by their cores (an fp32-C MAC call of 1006 cycles per k-tile against ~930 of B stream; with the
+  MAC compiled out an op still takes 76% of its time), and a second fp32 C tile does not fit their L1 (rejected.md).
 - **Queries per pass over a KV cache**: a flash attention re-reads its KV head's history once per
   query block. Llama 3B prefill: 32-query blocks were DMA-bound on the re-reads (12.09 of 12.16 ms
   with the compute compiled out); 64-query blocks, each of the 4 core rows taking 16 queries of the

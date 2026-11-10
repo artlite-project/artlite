@@ -116,6 +116,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 |---|---|
 | Weights over 2 shim channels per column | 50.0 vs 49.9 GB/s; 56 GB/s for 8 and for 16 streams: one channel per column already reaches the ceiling |
 | Deeper L1 / L2 FIFOs, pinned layouts, AxCACHE hints on a DMA-bound operator | no e2e change |
+| The vision encoders' GEMMs on two 64-token tiles per weight pass (each B k-tile for 128 tokens a core) | not built: the ops are core-bound (Qwen3-VL's up, K 1152 -> 4480 + GELU, one band: 203 us = MAC 252 x 1006 cycles + ~55 us of epilogues; MAC compiled out 155 us), and 128 x 80 fp32 C needs 40 KB of a full 64 KB L1; bf16 C between k-tiles was rejected for precision (sd15_v2: K 1280 +16% error, K 5120 +52%) |
 | Gemma decode overlay: A memtile depth 20 / 22 (channels pinned to both parities), X depth 2 in the main core's L1 or 4 in the memtile | 55.6-56.4 ms vs 55.6-56.2 at depth 12, alternated processes: its boundaries are not prefetch-bound |
 | qwen35 decode overlay (35B-A3B): A memtile depth 12 / 16 / 20 instead of 8 | S = 1 41.4-41.7 ms, S = 3 66.1-66.6 at every depth |
 | An MoE layer's router as a phase before the shared expert's gate / up (the logits' sync and the route object beside its tiles; 35B-A3B decode) | +0.2-0.6 ms per step at S 1-4: the extra phase and the shared down's input round trip after the routing cost more than the overlap |

@@ -62,8 +62,7 @@ def _panel_recv(addr: int, np_: int, nrb: int, ncb: int, nblk: int, junk_rb: int
 
 def mac_walks(m: int) -> np.ndarray:
     """The MAC's walks of A, B and C (``core.C_WALKS``, ``C_PATS``: three dims_3d_t) of a GEMM's m-token C tile (m 64:
-    the band pairs (0, 2), (1, 3) alternate per block, C's halves in two L1 regions; m 16: one band; a d-80 attention's
-    P V^T: one band of a query pair)."""
+    the band pairs (0, 2), (1, 3) alternate per block, C's halves in two L1 regions; m 16: one band)."""
     if m == 64:
         w = [(1, 1152, 4, -3456, -2304), (1, -1152, 4, 0, -5760), (1, 2560, 4, -2432, -1792)]
     else:
@@ -723,7 +722,7 @@ class Attention:
     """Attention of ``heads`` (8, or 12 / 16 of d 80) heads of d 160 (16x16, 8x8) or 80 (32x32; 16x16: a key group over two
     columns' keys) over each image's keys, for the queries of tile ``tile`` (4 query panels of each image, 8 token
     panels; 8x8: one panel of each), or of d 40 (64x64, role c) for all of the op's (16 query panels of each image, one
-    op): row i of ``rows`` (in role a / c) runs the units (image, head) of heads [h i, h i + h), h = heads / len(rows),
+    op): row i of ``rows`` (in role a, s or c) runs the units (image, head) of heads [h i, h i + h), h = heads / len(rows),
     image-major. q: the op's query panels ([kb 8 d][np], scaled by log2 e / sqrt d),
     o: the output panels (the same layout); kv: the device address of the K / V^T slots ([image][head][group of
     keys][K | V^T]: d 160 groups of 32 keys, d 80 of 64), written by ``kv_drains``. Self-attention (keys = the image's
@@ -767,7 +766,7 @@ class Attention:
         self.kpi = self.np // 2  # (an image's token panels in the op)
         self.kpc = 16 if self.d == 40 else min(self.kpi, 4)  # (query panels of a unit: an op per tile keeps a core's sends
         # and receives to two BDs each)
-        self.role = "c" if self.d == 40 else "a"
+        self.role = {40: "c", 80: "a", 160: "s"}[self.d]
         self.slots = 1 if self.d == 40 else 2  # (B slots of a key group)
         assert 8 * self.tile < self.np and (self.d != 40 or (self.kpi, self.tile) == (16, 0))
         keys = 8 * COLS * self.kpi * self.nbands
@@ -808,7 +807,11 @@ class Attention:
             for img in range(2):
                 cmd[K.C_KMASK[img]:K.C_KMASK[img] + 2 * self.ng] = km[img]
         if self.d == 80:
-            cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(16)  # (P V^T of d 80: one band)
+            # (P V^T of d 80: a band per query pair, block by block in turn (its O in the C buffer's two halves: a
+            # block's C stores and the next one's loads in two L1 regions), its P from the scratch buffers s0, s1)
+            sp = D.R23["s1"] - D.R23["s0"]
+            w = [(1, sp - 1152, 0, 0, -sp - 1152), (1, -1152, 0, 0, 0), (1, 2560, 0, 0, 128 - 2560)]
+            cmd[K.C_WALKS:K.C_PATS + 14] = np.array([x for d in w for x in (*d, 0, 0)], np.int64).astype(np.int32)
         return cmd.view(np.uint8)
 
     def key_masks(self) -> np.ndarray:
