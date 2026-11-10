@@ -132,23 +132,26 @@ def test_gemm_rope(npu: VisionDevice) -> None:
     assert _rel(y, ref) < 8e-3
 
 
-@pytest.mark.parametrize("nb, frac", [(5, 0.83), (2, 1.0), (9, 0.5)])
-def test_attention_dense(npu: VisionDevice, nb: int, frac: float) -> None:
-    """Joint self-attention of 16 heads of 80 over more than 32 key groups (``Attention(dense=True)``): both images'
-    keys of nb bands one sequence, about its first ``frac`` valid (the last live group's keys in a pattern; the rest
-    streamed, skipped or masked), each column's band-0 queries over them: within 1.5e-2 of softmax attention on the
-    bfp16-rounded operands."""
+@pytest.mark.parametrize("nb, frac, heads, kvh", [(5, 0.83, 16, 0), (2, 1.0, 16, 0), (9, 0.5, 16, 0), (2, 1.0, 16, 8),
+                                                 (3, 0.7, 12, 0)])
+def test_attention_dense(npu: VisionDevice, nb: int, frac: float, heads: int, kvh: int) -> None:
+    """Joint self-attention of 16 (or 12) heads of 80 over more than 32 key groups (``Attention(dense=True)``): both
+    images' keys of nb bands one sequence, about its first ``frac`` valid (the last live group's keys in a pattern; the
+    rest streamed, skipped or masked), each column's band-0 queries over them; kvh: grouped-query attention (query head h
+    on key / value head h mod kvh: LFM3-VL's): within 1.5e-2 of softmax attention on the bfp16-rounded operands."""
     torch.manual_seed(5)
-    np_, d, heads = 8, 80, 16
-    T, C = 8 * np_, heads * d
-    x = torch.randn(3, nb, COLS * T, C)
-    qs, k, v = x[0, 0] * (1.4426950408889634 / d ** 0.5) * 2, x[1], x[2]
+    np_, d = 8, 80
+    kvh = kvh or heads
+    T, C, Ck = 8 * np_, heads * d, kvh * d
+    qs = torch.randn(COLS * T, C) * (1.4426950408889634 / d ** 0.5) * 2
+    k, v = torch.randn(2, nb, COLS * T, Ck)
     QA = 0
     KA = QA + C // 8 * np_ * L.PANEL + D.A_OBJ
-    VA = KA + C // 8 * np_ * L.PANEL
-    OA = VA + C // 8 * np_ * L.PANEL
+    VA = KA + Ck // 8 * np_ * L.PANEL
+    OA = VA + Ck // 8 * np_ * L.PANEL
     cols = [slice(c * T, (c + 1) * T) for c in range(COLS)]
-    kw = {"np": np_, "q": QA, "o": OA, "d": d, "nbands": nb, "heads": heads, "joint": True, "dense": True}
+    kw = {"np": np_, "q": QA, "o": OA, "d": d, "nbands": nb, "heads": heads, "joint": True, "dense": True,
+          "kv_heads": kvh if kvh < heads else 0}
     nkeys = 2 * 4 * COLS * T * nb // 8  # (the sequence: image 0's keys of every band, then image 1's)
     nvalid = int(nkeys * frac)
     ok = np.arange(nkeys) < nvalid
@@ -177,10 +180,10 @@ def test_attention_dense(npu: VisionDevice, nb: int, frac: float) -> None:
     vq = torch.cat([torch.cat([q(v[b, sl].T).T for sl in cols])[img == i] for i in range(2) for b in range(nb)])[sel]
     ref = torch.zeros(COLS * T, C)
     for h in range(heads):
-        ch = slice(d * h, d * (h + 1))
-        sc = q(qs[:, ch]) @ kk[:, ch].T
+        ch, ck = slice(d * h, d * (h + 1)), slice(d * (h % kvh), d * (h % kvh + 1))
+        sc = q(qs[:, ch]) @ kk[:, ck].T
         p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
-        ref[:, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
+        ref[:, ch] = (p @ vq[:, ck]) / p.sum(-1, keepdim=True)
     assert _rel(o, ref) < 1.5e-2
 
 
