@@ -223,8 +223,8 @@ itself): a request's `images` (or `files`) as data URIs, or a chat state's messa
 they head the state, each through the vision encoder once ([d3](models/qwen35.md#decision-models-vllm-d3-kev),
 [d1](models/lfm3.md#d1-2b-decision-model)), as llama-server places them (`usage.input_tokens` counts their tokens).
 The answers are llama-server's within the model's usual difference (d1-2B Q4_0 57 / 57, d3-lite 56 / 57, d3-nano
-57 / 57 on 57 questions about pictures); a question about a 512 x 512 picture takes 67-104 ms through the server
-(1280 x 1280: 0.5-1.2 s), 8 questions about it 127 ms (d1, one sequence) to 563 ms (d3-nano). A file's
+57 / 57 on 57 questions about pictures); a question about a 512 x 512 picture takes 68-104 ms through the server
+(1280 x 1280: 0.5-1.1 s), 8 questions about it 126 ms (d1, one sequence) to 561 ms (d3-nano). A file's
 `decision.temperature.image` (llama-server's), where it has one, calibrates a request with pictures. Without the
 encoder, pictures answer 501, as do audio (`input_audio` parts, audio data URIs), video (d1's `video_url` parts) and
 pictures for the other types.

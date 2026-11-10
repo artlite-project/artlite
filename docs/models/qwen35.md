@@ -97,8 +97,8 @@ tokens, drawn shapes, an invoice; one or two pictures, pictures alone, a chat st
 (CPU) on 56 (d3-lite) and 57 (d3-nano), the probabilities within 0.12 and 0.10 (median 0.003, 0.001): as close as
 with text (the language model alone, fed llama.cpp's own image rows, differs as much on a few questions), the
 encoder's bfp16 rounding adding as much on others. A question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture
-takes 67 / 222 / 520 ms through the server (d3-nano 104 / 449 / 1162 ms; the iGPU 98 / 359 / 983 and 229 / 796 / 2099
-ms at 3-5x the energy above idle), 8 questions about a 512 x 512 picture 342 ms (d3-nano 563; the iGPU 892, 2104).
+takes 68 / 216 / 487 ms through the server (d3-nano 104 / 428 / 1071 ms; the iGPU 101 / 367 / 990 and 241 / 820 / 2242
+ms at 3-4x the energy above idle), 8 questions about a 512 x 512 picture 342 ms (d3-nano 561; the iGPU 854, 2273).
 
 Kev-4B (Qwen3.5-4B's shapes, causal) answers with its classifier head (`cls.output`) on the rows at the options' end
 tokens and at the question's last token. Its hidden size, 2560, is not a whole number of K chunks: the projections that
@@ -204,11 +204,11 @@ official M-RoPE positions (rows and columns from the position after `<|vision_st
 The encoder (`qwen3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 27 layers of
 attention over all of the image's 16 x 16 patches (a 2-D RoPE in each head; Qwen3.5-0.8B's and 2B's smaller towers, d3's:
 12 layers of 768 and 24 of 1024), then each 2 x 2 window merged into one token by an MLP. Its time grows with the
-patches and, through the attention, with their square (d3-lite's tower 0.024 s at 512 x 512, d3-nano's 0.062 s):
+patches and, through the attention, with their square (d3-lite's tower 0.023 s at 512 x 512, d3-nano's 0.057 s):
 
 | image (tokens) | 512 x 512 (256) | 1024 x 1024 (1024) | 2048 x 2048 (4096) |
 |---|---|---|---|
-| Artlite (NPU) | 0.068 s | 0.44 s | 4.7 s |
+| Artlite (NPU) | 0.066 s | 0.39 s | 4.0 s |
 | llama.cpp, iGPU (Vulkan) | 0.27 s | 1.33 s | 10.3 s |
 | llama.cpp, CPU (16 threads) | 0.42 s | 2.61 s | 27.1 s |
 

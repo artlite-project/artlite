@@ -113,19 +113,19 @@ other programs):
   sequence (its runner's way), the state once: 4.4x faster than each question alone on the NPU.
 
 Decisions about pictures (each side with the model's mmproj, its vision encoder on the same device; every request's
-picture new; energy a question above a 12.5 W idle):
+picture new; energy a question above a 16.5 W idle, both in one session):
 
 | file | request | NPU | iGPU | energy a question, NPU / iGPU (the smallest, the largest picture) |
 |---|---|---|---|---|
-| LiquidAI d1-2B (Q4_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 87 / 281 / 613 ms | 118 / 370 / 974 ms | 1.8 / 4.8 J, 8.9 / 32 J |
-| | 8 questions about a 512 x 512 picture | 127 ms (one sequence) | 1241 ms | 0.31 / 5.6 J |
-| vllm-sr d3-lite (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 67 / 222 / 520 ms | 98 / 359 / 983 ms | 1.2 / 3.1 J, 6.1 / 30 J |
-| | 8 questions about a 512 x 512 picture | 342 ms | 892 ms | 0.65 / 3.2 J |
-| vllm-sr d3-nano (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 104 / 449 / 1162 ms | 229 / 796 / 2099 ms | 2.1 / 7.0 J, 16 / 59 J |
-| | 8 questions about a 512 x 512 picture | 563 ms | 2104 ms | 1.3 / 7.5 J |
+| LiquidAI d1-2B (Q4_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 86 / 274 / 591 ms | 118 / 385 / 964 ms | 1.5 / 4.2 J, 8.0 / 26 J |
+| | 8 questions about a 512 x 512 picture | 126 ms (one sequence) | 1184 ms | 0.29 / 3.8 J |
+| vllm-sr d3-lite (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 68 / 216 / 487 ms | 101 / 367 / 990 ms | 0.92 / 2.7 J, 6.1 / 23 J |
+| | 8 questions about a 512 x 512 picture | 342 ms | 854 ms | 0.64 / 2.7 J |
+| vllm-sr d3-nano (Q8_0) | a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture | 104 / 428 / 1071 ms | 241 / 820 / 2242 ms | 2.0 / 6.2 J, 15 / 51 J |
+| | 8 questions about a 512 x 512 picture | 561 ms | 2273 ms | 1.3 / 7.1 J |
 
-With a picture the NPU answers 1.3-2.2x sooner than the iGPU at 2.6-4.9x less energy above idle; several questions
-about one picture 2.6-10x sooner at 5-18x less.
+With a picture the NPU answers 1.4-2.3x sooner than the iGPU at 2.8-3.8x less energy above idle; several questions
+about one picture 2.5-9x sooner at 4-13x less.
 
 ## Candidates to explore
 

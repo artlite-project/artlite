@@ -112,7 +112,7 @@ Its time grows with the patches and, through the attention, with their square:
 
 | image (tokens) | 512 x 512 (256) | 1024 x 1024 (1024) | 2048 x 2048 (4096) |
 |---|---|---|---|
-| Artlite (NPU) | 0.037 s | 0.17 s | 1.34 s |
+| Artlite (NPU) | 0.036 s | 0.16 s | 1.19 s |
 | llama.cpp, iGPU (Vulkan) | 0.14 s | 0.47 s | 3.0 s |
 | llama.cpp, CPU (16 threads) | 0.27 s | 1.1 s | 7.8 s |
 
@@ -128,10 +128,10 @@ mmproj; the iGPU's best of 3 sessions):
 
 | image (its size: prompt tokens) | Artlite (NPU) | llama-server, iGPU (Vulkan) |
 |---|---|---|
-| sd15-astronaut.jpg (512 x 512: 282) | 0.146 s | 0.189 s |
-| test-1.jpeg (640 x 488: 324) | 0.173 s | 0.251 s |
-| hk_OCR.jpg (1300 x 858: 1132) | 0.447 s | 0.914 s |
-| airplane.jpeg (1920 x 1440: 2724) | 1.19 s | 2.40 s |
+| sd15-astronaut.jpg (512 x 512: 282) | 0.145 s | 0.189 s |
+| test-1.jpeg (640 x 488: 324) | 0.169 s | 0.251 s |
+| hk_OCR.jpg (1300 x 858: 1132) | 0.444 s | 0.914 s |
+| airplane.jpeg (1920 x 1440: 2724) | 1.14 s | 2.40 s |
 
 The embeddings are ~3.5% per token from an exact (float64) encoder (the bfp16 operands of its GEMMs), llama.cpp's ~1%;
 a few tokens are further off (up to ~0.8 of their norm): patches whose values nearly cancel before the final LayerNorm,
@@ -203,13 +203,13 @@ With pictures (57 questions on 16 requests: photos of 128 to 1600 tokens, drawn 
 pictures with a state, pictures alone, a chat state), each question alone against llama-server on the CPU (its
 mmproj on the CPU too): Q4_0 57 / 57 the same answer, the largest difference in a probability 0.021 (median 0.003);
 Q8_0 56 / 57 (a score's near tie), 0.029 (0.003); the prompts' tokens the same as llama-server's. Speed, one question
-about a picture and 8 about one (energy a question above a 12.5 W idle):
+about a picture and 8 about one (energy a question above a 16.5 W idle, the three in one session):
 
 | request (Q4_0 + mmproj Q8_0) | NPU | iGPU (llama-server Vulkan) | CPU (llama-server) |
 |---|---|---|---|
-| a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture (292 / 802 / 1633 tokens) | 87 / 281 / 613 ms | 118 / 370 / 974 ms | 500 / 1369 / 3288 ms |
-| energy | 1.8 / 4.4 / 8.9 J | 4.8 / 13 / 32 J | 19 / 56 / 130 J |
-| 8 questions about a 512 x 512 picture | 127 ms (one sequence of 516 tokens; each alone: 646 ms) | 1241 ms | 3749 ms |
-| energy a question | 0.31 J | 5.6 J | 18.5 J |
+| a question about a 512 x 512 / 1024 x 768 / 1280 x 1280 picture (292 / 802 / 1633 tokens) | 86 / 274 / 591 ms | 118 / 385 / 964 ms | 488 / 1747 / 3215 ms |
+| energy | 1.5 / 3.9 / 8.0 J | 4.2 / 12 / 26 J | 16 / 60 / 115 J |
+| 8 questions about a 512 x 512 picture | 126 ms (one sequence of 516 tokens; each alone: 646 ms) | 1184 ms | 3667 ms |
+| energy a question | 0.29 J | 3.8 J | 16 J |
 
 Design: the module docstrings of `decode/design.py`, `decode/attn.py` and `lfm/`.
