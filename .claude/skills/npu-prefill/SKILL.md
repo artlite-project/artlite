@@ -70,6 +70,10 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   Its reset zeroes no GDN states (d3-lite: 18.9 MB, ~1 ms of a short readout): a chunk of up to SUB tokens runs the
   packed GDN operators, one segment from token 0 (the scan zeroes the state itself, exactly; its final state is no
   sequence's, so causal models cannot), a larger one zeroes GSTATE first (the packed scan costs more there).
+  LFM3's d1 (`LfmConfig.causal`): the full layers' passes stream the prompt's groups (`AttnOperator(causal=False)`,
+  the causal design's history part from group 0), each row its own keys (lo, hi per row in a SEG object per pass; S,
+  the keys every row sees, a parameter): a state and its questions in one sequence (`outputs(sets=)`); the SWA and
+  conv layers stay causal.
 - **Packed chunks** (a readout model's prefill, `pack`; `NpuModel.readouts`): several inputs (segments) back to back in
   one chunk, so they share its ConfigureOps and weight passes. Only operators that mix tokens need packed variants;
   every other operator works row by row:

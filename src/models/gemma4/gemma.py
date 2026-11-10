@@ -162,7 +162,7 @@ class NpuGemma(OverlayModel):
                                                         emb=emb)[0])
 
     def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
-                progress: Callable[[int], None] | None = None) -> np.ndarray:
+                progress: Callable[[int], None] | None = None, sets: Sequence[int] | None = None) -> np.ndarray:
         """(none: a chunk runs the layers that share a KV cache for its last token alone, ``_chunk_logits``)"""
         raise NotImplementedError("Gemma 4 has no readouts")
 

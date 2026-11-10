@@ -20,15 +20,24 @@ output-normed) on the host:
   an option's score is the dot product of the last token's first half with its second half over sqrt(half);
 - vllm-decision2 (a qwen3 trunk): a joint head (``decision.*`` tensors, fp32: ``JointHead``) over the rows at the end of
   each option's span and of the question's; the prompt is pieces the template separates (``CLEF_SEP``), tokenized one
-  by one as the model was trained, a piece that starts with ``CLEF_QUESTION`` / ``CLEF_OPTION`` a span.
+  by one as the model was trained, a piece that starts with ``CLEF_QUESTION`` / ``CLEF_OPTION`` a span;
+- lfm3-d1 (LiquidAI's d1 on an LFM3 trunk, non-causal on its full-attention layers): per option a group of single
+  tokens (its code, the code after a space; yes / Yes / YES, no / ...; a level's digit: ``d1_labels``), its score the
+  group's largest logit at the question's last token; a choice's confidence is its probability, a score the median
+  level; the texts of the control tokens are broken in the input (``d1_break``). Questions about a state share one
+  sequence as the model's runner reads them (its ``set`` attention, up to ``D1_SET_SIZE`` a sequence; the request's
+  ``set_size``, 1: each question alone as llama-server reads them): the state, then each question after "QUESTION:\n"
+  (``Decisions.prompts``); on the full-attention layers the state's tokens see every token, a question's the state
+  and its own (``Prompt.sets``, ``NpuModel.outputs``' ``sets``).
 
-Other types (laya, clef, lfm2-d1, lfm2-d1-omni: other architectures or heads) and images (``files``, ``images``, a
-chat message's image parts: d3's and pplx's encoders are Qwen3-VL's) are refused (501). A causal model's questions
-share the prompt's prefix through the prompt cache (``Engine.readouts``: the state once)."""
+Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni: other architectures or heads) and images (``files``,
+``images``, a chat message's image parts: d3's and pplx's encoders are Qwen3-VL's) are refused (501). A causal model's
+questions share the prompt's prefix through the prompt cache (``Engine.readouts``: the state once)."""
 
 import asyncio
 import json
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,14 +51,20 @@ from artlite.gguf_model import GGUFFile
 from ..common import render_template
 from .engine import Engine
 
-TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2")  # (the types Artlite answers)
+TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2", "lfm3-d1")  # (Artlite's)
 LABEL_TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3")  # (their scores: label logits)
+NULL_STATE = ("vllm-d3", "lfm3-d1")  # (a null state: the question alone)
 # (the questions' prompts share a prefix the model continues)
 SHARED = ("openjev", "lev", "kev", "nimble", "pplx-decider", "vllm-decision2")
 CLEF_MARKER, CLEF_SEP = "<<clef:", "<<clef:sep>>"  # (a joint prompt's pieces: ``Decisions.joint_prompt``)
 CLEF_QUESTION, CLEF_OPTION = "<<clef:question>>", "<<clef:option>>"
 LEV_RATINGS = 9  # lev's noul rating scale: 0 = certainly no .. 8 = certainly yes
 MAX_IMAGES = 8
+D1_SET_SIZE = 16  # lfm3-d1: the questions a sequence holds after their state (d1-2B's ``d1_set_size``, its runner's default)
+D1_HEADER = "QUESTION:\n"  # lfm3-d1: what opens each question after the first in a sequence (the runner's ``question_header``)
+D1_POOL = ([chr(c) for c in range(65, 91)] + [f"{i:02d}" for i in range(100)] + [chr(c) for c in range(97, 123)]
+           + [f"#{i}" for i in range(200)] + [a + b for a in map(chr, range(65, 91)) for b in map(chr, range(65, 91))])
+ZWSP = "\u200b"
 KINDS = ("choice", "score", "noul")
 
 ApiErrors = tuple[Callable[[str], Exception], Callable[[str], Exception]]  # (400, 501)
@@ -78,6 +93,24 @@ def escape_special(text: str) -> str:
             done = j + 2
         i = text.find("<|", max(i + 1, done))
     return text if not done else "".join(out) + text[done:]
+
+
+def d1_break(v: Any, spellings: re.Pattern | None) -> Any:
+    """lfm3-d1: every string of a JSON value, keys too, with a zero-width space after the first character of each
+    control token's text in it (``server_decision_context::d1_break``, the runner's ``plain``: it reads the same and is
+    no longer the token), again where a break made a new one; ``spellings``: the texts, longest first."""
+    if spellings is None:
+        return v
+    if isinstance(v, str):
+        n = 1
+        while n:
+            v, n = spellings.subn(lambda m: m[0][0] + ZWSP + m[0][1:], v)
+        return v
+    if isinstance(v, list):
+        return [d1_break(x, spellings) for x in v]
+    if isinstance(v, dict):
+        return {d1_break(k, spellings): d1_break(x, spellings) for k, x in v.items()}
+    return v
 
 
 def _sort_keys(v: Any) -> Any:
@@ -122,6 +155,10 @@ def _replace_text(v: Any, old: str, new: str) -> Any:
     if isinstance(v, dict):
         return {k: _replace_text(x, old, new) for k, x in v.items()}
     return v
+
+
+def _d1_key(q: "Question") -> tuple:
+    return q.kind, tuple(k for k, _ in q.options)
 
 
 def _payload(v: Any) -> bool:
@@ -171,12 +208,20 @@ class Question:
 
 @dataclass
 class Prompt:
-    """One variant of a question: its tokens and the rows its scores read (indices into them)."""
+    """One variant of a question: its tokens and the rows its scores read (indices into them). lfm3-d1: a sequence of
+    the questions ``questions`` after their state (each read at one row, in their order), ``sets`` its non-causal
+    attention's bounds (the state's end, then each question's: ``NpuModel.outputs``)."""
 
     question: int
     variant: int
     ids: list[int]
     rows: np.ndarray
+    questions: list[int] = field(default_factory=list)  # (lfm3-d1; else [question])
+    sets: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.questions:
+            self.questions = [self.question]
 
 
 @dataclass
@@ -198,6 +243,10 @@ class Decisions:
     noul_criteria_order: bool = False  # (a noul's options in its criteria's order when they name both)
     strict_payload: bool = False  # (states, instructions and descriptions: text, objects or arrays)
     canonical_legend: bool = False
+    spellings: re.Pattern | None = None  # lfm3-d1: the control tokens' texts the input's are broken at (``d1_break``)
+    lm_rows: Callable[[list[int]], np.ndarray] | None = None  # lfm3-d1: LM rows of tokens (fp64, (n, hidden))
+    _rows: dict[int, np.ndarray] = field(default_factory=dict)  # (lfm3-d1: the LM rows read so far)
+    _d1: dict[tuple, tuple[list[str], list[list[int]]]] = field(default_factory=dict)  # (lfm3-d1: ``d1_labels``)
 
     @classmethod
     def of(cls, path: str, encode: Callable[[str], list[int]]) -> "Decisions | None":
@@ -228,9 +277,16 @@ class Decisions:
                     raise ValueError(f"invalid decision score bias: {k}")
                 d.score_bias.setdefault(n, np.zeros(n))[level] = float(v)
         d.with_labels(encode)
+        lm = "output.weight" if "output.weight" in g else "token_embd.weight"
         if t in LABEL_TYPES:
-            lm = "output.weight" if "output.weight" in g else "token_embd.weight"
             d.head = np.asarray(g.rows(lm, d.labels), np.float64)
+        elif t == "lfm3-d1":
+            types = np.asarray(meta["tokenizer.ggml.token_type"])
+            texts = g.strings("tokenizer.ggml.tokens")
+            ctrl = sorted((texts[i] for i in np.flatnonzero(types == 3) if len(texts[i].encode()) >= 2), key=len,
+                          reverse=True)  # (stable: llama.cpp's order among equal lengths)
+            d.spellings = re.compile("|".join(map(re.escape, ctrl))) if ctrl else None
+            d.lm_rows = lambda ids: np.asarray(g.rows(lm, ids), np.float64)
         elif t == "vllm-decision2":
             d.joint = JointHead.of(g, float(meta.get(f"{arch}.attention.layer_norm_epsilon", 1e-5)))
         else:
@@ -259,6 +315,8 @@ class Decisions:
             self.n_options_max, self.canonical_legend = len(self.labels), self.type == "vllm-d3"
         elif self.type == "vllm-decision2":
             self.n_options_max, self.noul_criteria_order, self.strict_payload, self.canonical_legend = 255, True, True, True
+        elif self.type == "lfm3-d1":  # (labels per question: ``d1_labels``)
+            self.n_options_max, self.noul_true_first = 255, True
         else:  # kev
             ids = encode("<|box_end|>")
             if len(ids) != 1:
@@ -277,7 +335,7 @@ class Decisions:
 
     def questions(self, body: dict[str, Any]) -> list[Question]:
         """A request's questions (BadRequest: a bad one)."""
-        if "state" not in body or body["state"] is None and self.type != "vllm-d3":
+        if "state" not in body or body["state"] is None and self.type not in NULL_STATE:
             raise BadRequest("\"state\" must be provided")
         if self.strict_payload and not _payload(body["state"]):
             raise BadRequest("\"state\" must be text, an object or an array")
@@ -296,6 +354,8 @@ class Decisions:
                 raise err("\"instructions\" must be provided")
             if self.strict_payload and (not _payload(instructions) or instructions == ""):
                 raise err("\"instructions\" must be non-empty text, an object or an array")
+            if self.type == "lfm3-d1" and isinstance(instructions, dict) and instructions.get("type") == "input_audio":
+                raise err("spoken instructions need a model with audio input")
             kind = q.get("type") if isinstance(q.get("type"), str) else ""
             crit = q.get("criteria")
             if kind == "choice":
@@ -406,8 +466,61 @@ class Decisions:
                 o = {"key": _kev_text(key), "description": None if desc is None else _kev_text(desc)}
             if self.label_texts:
                 o["label"] = self.label_texts[i]
+            if self.type == "lfm3-d1":
+                o["label"] = self._d1[_d1_key(q)][0][i]
             out.append(o)
         return out
+
+    def d1_labels(self, q: Question, encode: Callable[[str], list[int]]) -> tuple[list[str], list[list[int]]]:
+        """lfm3-d1: each option's code (the template's label) and its group of single tokens, whose largest logit is
+        the option's score (llama-server's ``d1_labels``, the runner's ``readout_ids``): a level's digit, a noul's yes /
+        Yes / YES (no / ...), a choice's code and the code after a space; the codes are the options' keys when each is
+        a letter, else A .. Z, then AA, AB ..; a code of several tokens or one taken: the first free of ``D1_POOL``.
+        Kept for the question's answer (``scores``)."""
+        key = _d1_key(q)
+        if key in self._d1:
+            return self._d1[key]
+
+        def singles(forms: list[str]) -> list[int]:
+            out: list[int] = []
+            for f in forms:
+                ids = encode(f)
+                if len(ids) == 1 and ids[0] not in out:
+                    out.append(ids[0])
+            return out
+
+        texts: list[str] = []
+        groups: list[list[int]] = []
+        if q.kind != "choice":
+            for k, _ in q.options:
+                g = singles([k] if q.kind == "score" else ["yes", "Yes", "YES"] if k == "true" else ["no", "No", "NO"])
+                if not g:
+                    raise RuntimeError(f"decision label is not a single token: {k}")
+                texts.append(k)
+                groups.append(g)
+        else:
+            keys = [k for k, _ in q.options]
+            n = len(keys)
+            if all(len(k.encode()) == 1 and k.isalpha() for k in keys):
+                codes = keys
+            else:
+                codes = [chr(65 + i) if i < 26 else chr(65 + (i - 26) // 26) + chr(65 + (i - 26) % 26) for i in range(n)]
+            used: set[int] = set()
+
+            def take(code: str) -> bool:
+                ids = encode(code)
+                if len(ids) != 1 or ids[0] in used:
+                    return False
+                used.add(ids[0])
+                texts.append(code)
+                groups.append([ids[0]] + [t for t in singles([" " + code]) if t != ids[0]])
+                return True
+
+            for code in codes:
+                if not take(code) and not any(take(c) for c in D1_POOL):
+                    raise BadRequest(f"no single-token label left for {n} options")
+        self._d1[key] = (texts, groups)
+        return texts, groups
 
     def render(self, state: Any, questions: list[Question], q: Question, variant: int) -> str:
         """The prompt text of a question's variant (the template takes the raw JSON values: it serializes those that
@@ -421,6 +534,8 @@ class Decisions:
             inp = _sort_keys(inp)
         if self.type == "kev":  # (text only)
             inp["state"], inp["instructions"] = _kev_text(state), _kev_text(q.instructions)
+        if self.type == "lfm3-d1":
+            inp = d1_break(inp, self.spellings)
         inp["images"] = []
         return render_template(self.template, **inp)
 
@@ -452,8 +567,13 @@ class Decisions:
             raise RuntimeError("unexpected layout of the decision prompt")
         return ids, np.array([*options, question])
 
-    def prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]]) -> list[Prompt]:
-        """Every question's variants as prompts (``encode``: the model's tokenizer, special tokens parsed)."""
+    def prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]], *,
+                set_size: int = D1_SET_SIZE, max_tokens: int = 0) -> list[Prompt]:
+        """Every question's variants as prompts (``encode``: the model's tokenizer, special tokens parsed); lfm3-d1:
+        sequences of up to ``set_size`` questions after their state (``_d1_prompts``), of at most ``max_tokens`` (0:
+        any) where a question alone fits."""
+        if self.type == "lfm3-d1":
+            return self._d1_prompts(state, questions, encode, set_size=set_size, max_tokens=max_tokens)
         out = []
         for i, q in enumerate(questions):
             if self.joint is not None:
@@ -471,13 +591,70 @@ class Decisions:
                 out.append(Prompt(i, v, ids, rows))
         return out
 
+    def _d1_prompts(self, state: Any, questions: list[Question], encode: Callable[[str], list[int]], *,
+                    set_size: int, max_tokens: int) -> list[Prompt]:
+        """lfm3-d1's sequences (the runner's ``pack_set``): the prompt of a sequence's first question as the template
+        writes it (the state, "QUESTION:\\n", the question up to its answer slot), then each further question's part
+        after ``D1_HEADER``, tokenized alone; the state is the tokens before the first question's own (its part's
+        tokens alone). A question's part is its prompt after the template's head (its text with no state); a sequence
+        closes at ``set_size`` questions, or before one that would take it past ``max_tokens``."""
+        sentinel = "\x00d1\x00"
+        for q in questions:
+            self.d1_labels(q, encode)
+        probe = Question("", "noul", sentinel, [("true", None), ("false", None)])
+        self.d1_labels(probe, encode)
+        head = self.render(None, [], probe, 0)
+        head = head[:head.find(sentinel)]
+        parts, prefix = [], None
+        for q in questions:
+            whole, alone = self.render(state, questions, q, 0), self.render(None, questions, q, 0)
+            part = alone[len(head):]
+            if not alone.startswith(head) or not whole.endswith(part) or prefix not in (None, whole[:-len(part)]):
+                raise RuntimeError("unexpected layout of the decision prompt")
+            prefix = whole[:-len(part)]
+            parts.append(part)
+        header = "" if state is None else D1_HEADER
+        if not prefix.endswith(header):
+            raise RuntimeError("unexpected layout of the decision prompt")
+        more = [encode(header + p) for p in parts]
+        out: list[Prompt] = []
+        i = 0
+        while i < len(questions):
+            ids = encode(prefix + parts[i])
+            S = len(ids) - len(encode(parts[i]))
+            ends, qs = [len(ids)], [i]
+            i += 1
+            while i < len(questions) and len(qs) < set_size and (not max_tokens or len(ids) + len(more[i]) <= max_tokens):
+                ids += more[i]
+                ends.append(len(ids))
+                qs.append(i)
+                i += 1
+            out.append(Prompt(qs[0], 0, ids, np.array(ends) - 1, questions=qs, sets=(S, *ends)))
+        return out
+
+    @staticmethod
+    def set_size(body: dict[str, Any]) -> int:
+        """lfm3-d1: the request's ``set_size`` (questions a sequence holds after their state; 1: each alone, as
+        llama-server reads them), default ``D1_SET_SIZE``."""
+        n = body.get("set_size", D1_SET_SIZE)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise BadRequest("\"set_size\" must be a whole number from 1")
+        return n
+
     # ------------------------------------------------------------------
     # Answers
     # ------------------------------------------------------------------
 
     def scores(self, q: Question, rows: np.ndarray) -> np.ndarray:
-        """A variant's raw outputs from its prompt's rows (``Prompt.rows``, output-normed)."""
+        """A variant's raw outputs from its prompt's rows (``Prompt.rows``, output-normed; lfm3-d1: the question's
+        row)."""
         x = np.asarray(rows, np.float64)
+        if self.type == "lfm3-d1":
+            groups = self._d1[_d1_key(q)][1]
+            missing = sorted({t for g in groups for t in g} - self._rows.keys())
+            if missing:
+                self._rows.update(zip(missing, self.lm_rows(missing), strict=True))
+            return np.array([max(float(self._rows[t] @ x[-1]) for t in g) for g in groups])
         if self.joint is not None:
             return self.joint.scores(x[:-1], x[-1])
         if self.type == "kev":
@@ -503,6 +680,8 @@ class Decisions:
         if self.type in ("vllm-d3", "vllm-decision2"):
             h = -sum(float(x) * math.log(x) for x in p if x > 0)
             return max(0.0, min(1.0, 1.0 - h / math.log(n)))
+        if self.type == "lfm3-d1":  # (the answer's probability: d1's api.py)
+            return float(p.max())
         if kind == "choice":
             return max(0.0, (float(p.max()) - 1 / n) / (1 - 1 / n))
         mode = int(np.argmax(p))
@@ -539,8 +718,10 @@ class Decisions:
         else:
             legend = {k: json.dumps(_sort_keys(d), ensure_ascii=False, separators=(",", ":"))
                       if self.canonical_legend and not isinstance(d, str) else d for k, d in q.options}
-            out |= {"score": float(sum(i * p for i, p in enumerate(probs))), "legend": legend, "probabilities": pr,
-                    "confidence": self.confidence(q.kind, probs)}
+            score = float(sum(i * p for i, p in enumerate(probs)))
+            if self.type == "lfm3-d1":  # (the median level: the first whose cumulative probability reaches one half)
+                score = float(min(int(np.searchsorted(np.cumsum(probs), 0.5)), n - 1))
+            out |= {"score": score, "legend": legend, "probabilities": pr, "confidence": self.confidence(q.kind, probs)}
         return out
 
 
@@ -575,23 +756,33 @@ def add_routes(api: APIRouter, *, engine: Engine, alias: str, kind: str | None, 
             raise bad(str(e)) from None
         if images:
             raise unsupported("This server does not support image input for decisions")
-        prompts = await run_in_threadpool(d.prompts, state, questions, engine.model.tokenizer.encode)
         npu = engine.npu
         whole = npu.prefill.sizes[-1] if not npu.causal else 0  # (a non-causal model reads a prompt in one chunk)
+        try:
+            set_size = d.set_size(body) if d.type == "lfm3-d1" else 1
+            prompts = await run_in_threadpool(d.prompts, state, questions, engine.model.tokenizer.encode,
+                                              set_size=set_size, max_tokens=whole)
+        except BadRequest as e:
+            raise bad(str(e)) from None
         for p in prompts:
             fits(p.ids)
             if whole and len(p.ids) > whole:
                 raise bad(f"the prompt has {len(p.ids)} tokens, this model reads at most {whole} in one pass")
+        sets = [p.sets for p in prompts] if any(p.sets for p in prompts) else None
         out = await asyncio.wrap_future(engine.readouts([p.ids for p in prompts], [p.rows for p in prompts],
-                                                        cache_prompt=d.shares_prompt, name="decisions"))
+                                                        cache_prompt=d.shares_prompt, name="decisions", sets=sets))
         scores: list[list[np.ndarray]] = [[] for _ in questions]
         for p, rows in zip(prompts, out, strict=True):
-            scores[p.question].append(d.scores(questions[p.question], rows))
+            if len(p.questions) == 1:
+                scores[p.question].append(d.scores(questions[p.question], rows))
+                continue
+            for j, i in enumerate(p.questions):  # (a sequence's questions: a row each)
+                scores[i].append(d.scores(questions[i], rows[j:j + 1]))
         n = sum(len(p.ids) for p in prompts)
         return {"model": body.get("model") or alias,
                 "answers": {q.id: d.answer(q, s) for q, s in zip(questions, scores, strict=True)},
                 "usage": {"input_tokens": n, "output_tokens": 0}}
 
 
-__all__ = ["TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "add_routes", "decision_type",
-           "escape_special"]
+__all__ = ["TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "add_routes", "d1_break",
+           "decision_type", "escape_special"]

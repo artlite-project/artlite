@@ -224,10 +224,10 @@ class FakeNpu(NpuModel):
                 progress(min(i + self.chunk, len(tokens)))
         return None
 
-    def outputs(self, tokens: list[int], at: object = None, *, norm: bool = True, progress: object = None
-                ) -> np.ndarray:
-        """(a causal model's rows: each a function of the tokens up to it, ``fake_row``)"""
-        self.calls.append(("outputs", len(tokens)))
+    def outputs(self, tokens: list[int], at: object = None, *, norm: bool = True, progress: object = None,
+                sets: object = None) -> np.ndarray:
+        """(a causal model's rows: each a function of the tokens up to it, ``fake_row``; ``sets`` recorded)"""
+        self.calls.append(("outputs", len(tokens)) if sets is None else ("outputs", len(tokens), tuple(sets)))
         if self.fail is not None:
             raise self.fail
         p0 = self.position

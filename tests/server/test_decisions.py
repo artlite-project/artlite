@@ -3,10 +3,11 @@
 arithmetic against numpy (temperatures, score biases, lev's two orders and rating scale, kev's dot products,
 vllm-decision2's joint head, the confidences), the prompts (nimble's question list, lev's sorted keys, kev's text and
 escapes, vllm-decision2's pieces and spans), a non-causal model's prompts read whole and a recurrent model's questions
-sharing the state through a checkpoint."""
+sharing the state through a checkpoint; lfm3-d1's label groups, escapes and sequences of a state's questions."""
 
 import math
 import os
+import re
 import types
 from collections.abc import Iterator
 
@@ -284,7 +285,7 @@ RECORDED = [
                                  "criteria": {"entailment": "the hypothesis follows from the premise",
                                               "neutral": "the premise neither implies nor rules out the hypothesis",
                                               "contradiction": "the premise rules out the hypothesis"}}}},
-     {"d3-lite": 143, "kev": 70, "kai": 124}),
+     {"d3-lite": 143, "kev": 70, "kai": 124, "d1-2b": 89}),
     ({"state": "Ordinary employees find it very hard to recommend an acquisition; it's just too annoying to see a bunch "
                "of twenty year olds get rich when you're still working for salary.",
       "questions": {"topic": {"type": "choice", "instructions": "What is the passage mainly about?",
@@ -298,13 +299,14 @@ RECORDED = [
                     "audience": {"type": "choice", "instructions": "Who is the passage written for?",
                                  "criteria": {"founders": None, "programmers": None, "investors": None,
                                               "students": None, "general readers": None}}}},
-     {"d3-lite": 556, "kev": 266, "kai": 556}),
+     {"d3-lite": 556, "kev": 266, "kai": 556, "d1-2b": 323}),
 ]
 
 
-@pytest.mark.parametrize("name", ["d3-lite", "kev", "kai"])
+@pytest.mark.parametrize("name", ["d3-lite", "kev", "kai", "d1-2b"])
 def test_llama_server_prompts(name: str) -> None:
-    """The files' prompts as llama-server tokenizes them (their token counts: its usage), from the files' templates."""
+    """The files' prompts as llama-server tokenizes them (their token counts: its usage), from the files' templates
+    (lfm3-d1: each question alone, as llama-server reads them)."""
     from artlite.gguf_model import GGUFFile
     from artlite.model_config import decision_gguf
     from models.tokenizer import BpeTokenizer
@@ -315,7 +317,7 @@ def test_llama_server_prompts(name: str) -> None:
     encode = BpeTokenizer(GGUFFile(path)).encode
     d = Decisions.of(path, encode)
     for body, tokens in RECORDED:
-        prompts = d.prompts(d.state(body)[0], d.questions(body), encode)
+        prompts = d.prompts(d.state(body)[0], d.questions(body), encode, set_size=1)
         assert sum(len(p.ids) for p in prompts) == tokens[name]
 
 
@@ -355,3 +357,77 @@ def test_shared_state() -> None:
             else:
                 assert runs == [len(x.ids) for x in prompts]
     assert answers[0] == answers[1]
+
+
+# (lfm3-d1's template in the shape of d1-2B's: the state, "QUESTION:", the question and its options up to the answer)
+D1 = ("<s><|user|>{% if state is not none %}{{ state if state is string else state | tojson(indent=2) }}"
+      "{{ '\\n\\n\\nQUESTION:\\n' }}{% endif %}{{ instructions }}{% for o in options %} {{ o.label }} {{ o.key }}"
+      "{% endfor %}<|assistant|><think></think>")
+
+
+def d1_context(model: object) -> Decisions:
+    """lfm3-d1 on the fake tokenizer: LM rows of random values per token, "<|user|>" a control token."""
+    rng = np.random.default_rng(5)
+    head = rng.standard_normal((2048, 8)) * 3
+    d = Decisions(type="lfm3-d1", template=D1, temperatures={"choice": 1.3, "score": 1.3, "noul": 1.3},
+                  spellings=re.compile(re.escape("<|user|>")), lm_rows=lambda ids: head[ids])
+    return d.with_labels(model.tokenizer.encode)
+
+
+def test_d1() -> None:
+    """lfm3-d1: each option's score the largest logit of its label group (a choice's code and the code after a space;
+    yes / Yes / YES; a level's digit), at the temperature, a choice's confidence its probability, a score the median
+    level; the control tokens' texts broken in the input, keys too; a state's questions in sequences of ``set_size``
+    (the state, then each question after "QUESTION:"; bounds per sequence, a row per question), the same answers'
+    shapes; a null state; ``set_size`` and spoken questions refused (400)."""
+    model, npu, engine = make()
+    d = d1_context(model)
+    enc = model.tokenizer.encode
+    with TestClient(app_of(engine, decisions=d)) as client:
+        assert engine.wait_ready(5)
+        npu.causal, npu.prefill = False, types.SimpleNamespace(sizes=(64, 128, 256))
+        body = {"state": {"note <|user|> x": "a <|user|> b"}, "questions": QUESTIONS}
+        qs = d.questions(body)
+        assert [k for k, _ in qs[2].options] == ["true", "false"]
+        texts, groups = d.d1_labels(qs[0], enc)
+        assert texts == ["A", "B", "C"] and groups == [[enc("A")[0], enc(" A")[0]], [enc("B")[0], enc(" B")[0]],
+                                                       [enc("C")[0], enc(" C")[0]]]
+        assert d.d1_labels(qs[1], enc)[0] == ["0", "1", "2", "3"]
+        assert d.d1_labels(qs[2], enc)[1] == [[enc(f)[0] for f in forms] for forms in (("yes", "Yes", "YES"),
+                                                                                       ("no", "No", "NO"))]
+        lone = d.prompts(body["state"], qs, enc, set_size=1)
+        text = model.tokenizer.decode_bytes(lone[0].ids).decode()
+        assert text.count("<\u200b|user|>") == 2 and text.count("<|user|>") == 1  # (the template's own: a token)
+        assert [p.questions for p in lone] == [[0], [1], [2]] and all(p.sets == (p.sets[0], len(p.ids)) for p in lone)
+        both = d.prompts(body["state"], qs, enc, set_size=2)
+        assert [p.questions for p in both] == [[0, 1], [2]]
+        p0 = both[0]
+        assert p0.ids[:p0.sets[1]] == lone[0].ids and p0.sets[0] == lone[0].sets[0]
+        assert p0.ids[p0.sets[1]:] == enc("QUESTION:\n" + d.render(None, qs, qs[1], 0)[len("<s><|user|>"):])
+        assert list(p0.rows) == [p0.sets[1] - 1, p0.sets[2] - 1]
+        npu.calls.clear()
+        out = client.post("/v1/systemone", json={**body, "set_size": 2}).json()
+        assert [c for c in npu.calls if c[0] == "outputs"] == [("outputs", len(p.ids), p.sets) for p in both]
+        assert out["usage"]["input_tokens"] == sum(len(p.ids) for p in both)
+        for p in both:
+            for j, i in enumerate(p.questions):
+                q = qs[i]
+                x = fake_row(p.ids[:p.rows[j] + 1]).astype(np.float64)
+                z = np.array([max(d._rows[t] @ x for t in g) for g in d.d1_labels(q, enc)[1]])
+                pr = softmax(z, 1.3)
+                a = out["answers"][q.id]
+                if q.kind == "noul":
+                    assert a["noul"] == pytest.approx(pr[0])
+                    continue
+                assert np.allclose(list(a["probabilities"].values()), pr)
+                assert a["confidence"] == pytest.approx(pr.max())
+                if q.kind == "score":
+                    assert a["score"] == float(np.searchsorted(np.cumsum(pr), 0.5))
+        default = client.post("/v1/systemone", json=body).json()  # (one sequence: D1_SET_SIZE)
+        assert default["usage"]["input_tokens"] == len(d.prompts(body["state"], qs, enc)[0].ids)
+        r = client.post("/v1/systemone", json={"state": None, "questions": {"q": QUESTIONS["angry"]}})
+        assert r.status_code == 200
+        for bad in ({**body, "set_size": 0}, {**body, "set_size": "2"},
+                    {"state": STATE, "questions": {"q": {"type": "noul", "instructions": {"type": "input_audio"}}}}):
+            r = client.post("/v1/systemone", json=bad)
+            assert r.status_code == 400, (bad, r.text)

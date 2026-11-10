@@ -3,7 +3,10 @@
 dim, a sigmoid output gate per head, full layers (32 rotated pairs: the other pairs' cos 1, sin 0) and sliding-window
 layers (a window of 256 positions, the cache after a guard of its groups), on random projections of a chunk at p0 after a
 cache the host filled: the K / V records against their fp64 model, the output panels against the exact attention of the
-cores' own operands (their Q units, the cache they read) times the gates."""
+cores' own operands (their Q units, the cache they read) times the gates; the non-causal design (d1's full layers: a
+prompt from position 0 as a state and questions after it) against the exact attention under its masks."""
+
+import itertools
 
 import numpy as np
 import pytest
@@ -23,6 +26,9 @@ LAYOUT = Layout(448, {"q": 0, "k": 256, "v": 320, "g": 384})  # (the qkv GEMMs' 
 # (K panels per record, chunk, its position, sliding window (0: a full layer), rotated pairs)
 CASES = [(1, 256, 0, 0, 32), (1, 512, 128, 0, 32), (2, 256, 64, 0, 32), (1, 256, 0, 256, 64), (1, 512, 192, 256, 64),
          (1, 1024, 512, 256, 64), (2, 512, 64, 256, 64), (1, 64, 0, 0, 32), (1, 64, 320, 256, 64)]
+# non-causal: (K panels per record, chunk, the state's end and each question's: the last the prompt's length)
+SETS = [(1, 64, (48,)), (1, 256, (120, 151, 200)), (1, 512, (70, 100, 133, 166, 199, 260, 261, 300, 333, 400, 449)),
+        (2, 256, (30, 64, 128, 192, 256)), (1, 1024, (577, 650, 700, 770, 1000))]
 
 
 def _rel(got: np.ndarray, want: np.ndarray) -> float:
@@ -39,6 +45,15 @@ def _q_values(units: np.ndarray, hd: int) -> np.ndarray:
 @pytest.mark.parametrize(("kp", "T", "p0", "win", "rot"), CASES,
                          ids=[f"kp{a}-T{b}-p{c}-{'swa' if d else 'full'}" for a, b, c, d, _ in CASES])
 def test_lfm_attn(kp: int, T: int, p0: int, win: int, rot: int) -> None:
+    _run(kp, T, p0, win, rot)
+
+
+@pytest.mark.parametrize(("kp", "T", "sets"), SETS, ids=[f"kp{a}-T{b}-n{c[-1]}-q{len(c) - 1}" for a, b, c in SETS])
+def test_lfm_attn_set(kp: int, T: int, sets: tuple[int, ...]) -> None:
+    _run(kp, T, 0, 0, 32, sets)
+
+
+def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | None = None) -> None:
     shape = PA.Shape(HD, QH, kp, A_BYTES, 1, PP, per=2, gate=True)
     max_pos = max(1024, p0 + T)
     guard = win // shape.pg  # (groups before a sliding-window cache's group 0)
@@ -46,9 +61,11 @@ def test_lfm_attn(kp: int, T: int, p0: int, win: int, rot: int) -> None:
     kvb, kv0 = n_groups * shape.group, guard * shape.group
     prep = PA.PrepOperator(T=T, shape=shape, layout=LAYOUT, kv_bytes=kvb, cs_positions=max_pos, norm=True, eps=1e-5,
                            kv0=kv0)
-    attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb, swa=win, kv0=kv0)
-    fused = FusedOperator(name=f"lfa_test{kp}_{'s' if win else 'f'}", input_args=["G", "CS", "NW"], output_args=["A"],
-                          runlist=[(prep, "G", "CS", "QS", "KV", "NW"), (attn, "QS", "KV", "A")]).compile()
+    attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb, swa=win, kv0=kv0, causal=sets is None)
+    seg = ["SEG"] if sets is not None else []
+    fused = FusedOperator(name=f"lfa_test{kp}_{'s' if win else 'n' if seg else 'f'}", input_args=["G", "CS", "NW", *seg],
+                          output_args=["A"], runlist=[(prep, "G", "CS", "QS", "KV", "NW"),
+                                                      (attn, "QS", "KV", "A", *seg)]).compile()
     gen = torch.Generator().manual_seed(p0 + T + kp + win)
     base = 1e4 if win else 1e6
     inv = base ** (-np.arange(0, HD, 2) / HD)
@@ -80,8 +97,10 @@ def test_lfm_attn(kp: int, T: int, p0: int, win: int, rot: int) -> None:
         G[:, o + LAYOUT.off["v"] + np.arange(64)] = v[:, h, 64 * j:64 * j + 64]
         G[:, o + LAYOUT.off["g"] + np.arange(QH)] = g[:, QH * c:QH * c + QH]
     fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    if sets is not None:
+        fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.set_seg(sets))
     fused.sync_inputs()
-    fused.set_params(prep.params(p0) | attn.params(p0))
+    fused.set_params(prep.params(p0) | (attn.params(p0) if sets is None else attn.set_params(sets)))
     fused()
     fused.sync_outputs()
     fused.sync_scratch_from_device()
@@ -114,6 +133,12 @@ def test_lfm_attn(kp: int, T: int, p0: int, win: int, rot: int) -> None:
     want = np.zeros((T, COLS * QH, HD))
     kpos, qpos = np.arange(p0 + T)[None], np.arange(p0, p0 + T)[:, None]
     masked = (kpos > qpos) | ((qpos - kpos >= win) if win else False)
+    if sets is not None:  # (a row sees the keys below the state's end and its own: the state's and the padding's 0 .. n)
+        n = sets[-1]
+        lo, hi = np.zeros(T, int), np.full(T, n)
+        for a, b in itertools.pairwise(sets):
+            lo[a:b], hi[a:b] = a, b
+        masked = (kpos >= hi[:, None]) | ((kpos >= sets[0]) & (kpos < lo[:, None]))
     for hq in range(COLS * QH):
         h = hq // 4  # (its KV head: 4 query heads each)
         sc = qv[hq].astype(np.float64) @ Ks[h].T

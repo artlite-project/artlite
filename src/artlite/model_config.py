@@ -119,15 +119,22 @@ def lfm3_gguf(quant: str = "QAD-Q4_0") -> str:
 DECISION_FILES = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
                   "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",
-                  "kai": "vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf"}
+                  "kai": "vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf",
+                  "d1-2b": "LiquidAI/d1-2B-GGUF/d1-2B-Q4_0.gguf"}
 
 
 def decision_gguf(name: str = "d3-lite") -> str:
     """A decision model's GGUF file (``{arch}.decision.*`` metadata: llama-server's ``/v1/systemone``): vllm-sr's d3-lite
     and d3-nano (``qwen35``, non-causal: ggml-org's Q8_0), Kev-4B (``qwen35``: ggml-org's Q4_K_M), Decision-2.0-Kai-0.6B
     (``vllm-decision2``: Qwen3 0.6B and a head; llama.cpp's converter run on vllm-sr's checkpoint, whose own GGUF
-    is a fork's format, Q8_0)."""
+    is a fork's format, Q8_0), LiquidAI's d1-2B (``lfm3``, non-causal full layers: ``d1_gguf``'s Q4_0)."""
     return os.path.join(MODELS_DIR, DECISION_FILES[name])
+
+
+def d1_gguf(quant: str = "Q4_0") -> str:
+    """A file of LiquidAI's d1-2B GGUF repository (an LFM3 decision model): ``Q4_0`` (a Q6_K embedding), ``Q4_K_M``,
+    ``Q8_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "d1-2B-GGUF", f"d1-2B-{quant}.gguf")
 
 
 def assistant_of(model: str) -> str:

@@ -25,6 +25,11 @@ on chats). Per layer L (the decode's order):
 The first layer's input norm (``in``) starts the chunk. The control code is assembled on the host from one library ELF
 and runs in pieces of whole layers (``prefill.chunks.ChunkPrefill``).
 
+A non-causal model (``LfmConfig.causal`` False: d1's decision models) reads a prompt in one chunk from position 0: its
+full layers' attention sees the prompt both ways as a state and questions after it (``run``'s ``sets``: the state's
+tokens every token, a question's the state's and its own; ``prefill.attn.AttnOperator(causal=False)``, the bounds in
+SEG), its sliding-window and conv layers stay causal, the conv from zero histories.
+
 Chunks start at a cache group (64 positions) and hold at least ``MIN_TOKENS`` valid tokens (the conv history's 6 rows).
 Before a chunk the host moves each conv region's history to its base (the 6 rows before the chunk: ``LfmOverlay.conv_base``);
 the chunk's conv leaves its last 6 valid rows there (``LfmOverlay.conv_at``). The operator cores' code pages are reloaded
@@ -128,8 +133,10 @@ class LfmPrefill(ChunkPrefill):
         gemms: dict[str, object] = {}  # (one object per distinct GEMM)
         self.ops = {t: self._ops(t, gemms) for t in sorted({self._t(T) for T in self.sizes})}
         self.plans = self.ops[SUB].plans if SUB in self.ops else self.ops[max(self.ops)].plans
+        self.nc = not self.cfg.causal  # (the full layers' attention non-causal: d1)
         self.attn = {(k, T): PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes[k], kv_pad=self.pad, sub=self._pt(T),
-                                             swa=self.win[k], kv0=self.kv0[k]) for k in kinds for T in self.sizes}
+                                             swa=self.win[k], kv0=self.kv0[k], causal=k != "full" or not self.nc)
+                     for k in kinds for T in self.sizes}
         self.conv = {T: ConvPrefillOperator(T=T, pitch=self.ops[self._t(T)].pitch["in"]) for T in self.sizes}
         self._static_s: dict[tuple[int, float], float] = {}
         self._rows()
@@ -276,7 +283,9 @@ class LfmPrefill(ChunkPrefill):
                 rl += [(prep, tok("G", b * pt, prep, i=0, row=rg), sl(cs, b * pt * 4 * s.hd, prep, i=1),
                         tok("QS", b * pt, prep, i=2), f"KV[{kv0 + b * gb}:{kv0 + b * gb + kvb}]", nw)
                        for b in range(T // pt)]
-                rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2)))
+                seg = [sl("SEG", 0, attn, i=3)] if attn.nc else []  # (non-causal: its rows' keys, ``run``)
+                rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2),
+                           *seg))
             (g,) = o.plans[(L, "out" if kind == "conv" else "o")].gemms
             rl += [(g.op, tok("A", j * t, g.op, i=0), self._w(g), tok("Y", j * t, g.op, i=2, row=ry)) for j in range(S)]
             for a, nt in blocks:
@@ -343,27 +352,38 @@ class LfmPrefill(ChunkPrefill):
     # Run
     # ------------------------------------------------------------------
 
-    def params(self, T: int, p0: int, n: int) -> dict[str, int]:
-        """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens."""
+    def params(self, T: int, p0: int, n: int, sets: tuple[int, ...] = ()) -> dict[str, int]:
+        """The scratchpad parameters of a chunk of size T at position p0 with n valid tokens (non-causal: ``sets``, its
+        attention's bounds)."""
         out = ConvPrefillOperator.params(n)
         for (k, _, pt), prep in self.ops[self._t(T)].preps.items():
             if pt == self._pt(T):
-                out |= prep.params(p0) | self.attn[(k, T)].params(p0)
+                at = self.attn[(k, T)]
+                out |= prep.params(p0) | (at.set_params(sets) if at.nc else at.params(p0))
         return out
 
-    def run(self, x: torch.Tensor, p0: int, T: int = 0) -> None:
+    def run(self, x: torch.Tensor, p0: int, T: int = 0, *, sets: tuple[int, ...] | None = None) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches and conv histories hold the positions before). Leaves the attention layers' K / V of the
-        positions in the caches and the conv histories at p0 + n."""
+        positions in the caches and the conv histories at p0 + n. A non-causal model's prompt: at p0 0 (zero
+        histories), ``sets`` its bounds (``NpuModel.outputs``; default (n,): every token sees every token)."""
         n, dev, H = x.shape[0], self.ov.dev, self.H
         T = self._size(n, p0, T)
         assert n >= self.MIN_TOKENS, n
+        if self.nc:
+            sets = tuple(sets or (n,))
+            assert p0 == 0 and sets[-1] == n, (p0, sets, n)
+            seg = self.attn[("full", T)].set_seg(sets)
+            dev.view("SEG")[:seg.size] = seg
+            dev.flush("SEG", 0, seg.size)
+        else:
+            assert sets is None, "a causal model's prompt sees what is before it"
         px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
         px[:n] = x.float().numpy()
         px[n:] = 0
         dev.flush("PX", 0, 4 * T * H)
         self.ov.conv_base(p0)
-        self._launch(T, p0, self.params(T, p0, n))
+        self._launch(T, p0, self.params(T, p0, n, sets or ()))
         self.ov.conv_at(p0 + n)
         dev.stale = True  # (the chunk's configurations replaced the operator cores' code pages)
 
@@ -384,6 +404,8 @@ class LfmPrefill(ChunkPrefill):
         if self.ov.kind(L) != "full":
             return 0.0
         at, s = self.attn[("full", round(S * SUB))], self.shape
+        if at.nc:  # (every pass the chunk's groups: a prompt that fills it)
+            return RECORD_S * at.n_pass * at.T // s.pg * s.rg
         q, r = divmod(at.n_pass, at.m)
         recs = (at.n_pass * (p0 // s.pg + 1) + at.m * q * (q - 1) // 2 + q * r) * s.rg
         return RECORD_S * recs

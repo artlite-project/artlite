@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import lfm3_gguf
+from artlite.model_config import d1_gguf, lfm3_gguf
 
 from .. import common
 from ..llama_cpp import llama_tokenize
@@ -34,9 +34,17 @@ def gguf(quant: str = "QAD-Q4_0") -> GGUFFile:
     return GGUFFile(path(quant))
 
 
-def essay_ids(n: int, quant: str = "QAD-Q4_0", name: str = "addiction.txt") -> list[int]:
-    """The BOS and the first n - 1 tokens of an essay of the corpus."""
-    return [124894] + llama_tokenize(path(quant), common.essay(name))[:n - 1]
+def d1_path(quant: str = "Q4_0") -> str:
+    """A d1-2B file (non-causal full layers: a decision model's prompts)."""
+    p = d1_gguf(quant)
+    if not os.path.exists(p):
+        pytest.skip(f"{p} missing")
+    return p
+
+
+def essay_ids(n: int, quant: str = "QAD-Q4_0", name: str = "addiction.txt", *, path: str | None = None) -> list[int]:
+    """The BOS and the first n - 1 tokens of an essay of the corpus (``path``: another LFM3 file's tokenizer)."""
+    return [124894] + llama_tokenize(path or globals()["path"](quant), common.essay(name))[:n - 1]
 
 
 def chat_ids(quant: str = "QAD-Q4_0") -> list[int]:

@@ -239,7 +239,8 @@ class NpuQwen(OverlayModel):
         return (self._rows(tokens),)
 
     def prompt(self, tokens: list[int] | Sequence, *, logits: bool = False,
-               progress: Callable[[int], None] | None = None, readout: Readout | None = None) -> torch.Tensor | None:
+               progress: Callable[[int], None] | None = None, readout: Readout | None = None,
+               sets: abc.Sequence[int] | None = None) -> torch.Tensor | None:
         """(a sequence's positions from ``rope_next``)"""
         p, n = self.position, len(tokens)
         if p + n > self.capacity:
@@ -248,7 +249,7 @@ class NpuQwen(OverlayModel):
         self.overlay.rope[p:p + n] = self.rope_next + seq.pos
         self._prompting = True
         try:
-            return super().prompt(tokens, logits=logits, progress=progress, readout=readout)
+            return super().prompt(tokens, logits=logits, progress=progress, readout=readout, sets=sets)
         finally:
             self._prompting = False
             done = self.position - p  # (a prompt that ``progress`` stopped: the text after its last cached token)
@@ -373,7 +374,7 @@ class NpuQwen(OverlayModel):
         rows, self._pend = self._pend[:n], self._pend[n:]
         self._draft_step(rows, logits=False)
 
-    def _prefill_run(self, args: tuple, T: int, n: int) -> None:
+    def _prefill_run(self, args: tuple, T: int, n: int, sets: abc.Sequence[int] | None = None) -> None:
         """(the drafter's records of the rows before the chunk first; the chunk's carry after decode steps)"""
         self._inject()
         mtp = self._drafting and self.dflash is None
@@ -382,7 +383,7 @@ class NpuQwen(OverlayModel):
                 self._run_pending(self.overlay.SLOTS)
             if self.position and self._carry_at != self.position:
                 self.prefill.dp.carry_of(self._h)
-        super()._prefill_run(args, T, n)
+        super()._prefill_run(args, T, n, sets)
         if mtp:
             x = self.prefill.hidden(n - 1)
             self._h = (x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.cfg.rms_norm_eps) * self._w_out)[0]

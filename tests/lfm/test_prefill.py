@@ -6,12 +6,18 @@ test_conv_prefill.py, its attention: test_attn_prefill.py) on the NPU:
   K single and hi + lo: the caches, the conv histories and the last token's logits (the LM head alone on the chunk's last
   output row: ``LfmOverlay.logits_of``, or a decode step after the chunks);
 - the whole model (slow): prompts through the prefill, then the text after them as decode steps, against the fp32 CPU
-  model: KL of the next-token distributions and argmax agreement (the prompt's last token's included).
+  model: KL of the next-token distributions and argmax agreement (the prompt's last token's included);
+- a non-causal file's (d1-2B's) slice: a prompt from position 0, its full layer's attention both ways as a state and
+  questions after it (``sets``), against the fp32 CPU model's output rows of the same slice.
 """
 
+import itertools
+
+import numpy as np
 import pytest
 import torch
 
+from artlite.gguf_model import GGUFFile
 from models.lfm.overlay import LfmOverlay
 from models.lfm.prefill import LfmPrefill
 
@@ -118,3 +124,34 @@ def test_lfm_prefill_teacher_forced(quant: str) -> None:
         print(f"{quant} prompt {P}, {len(ids) - P} after: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) "
               f"max {float(k.max()):.4f}, first {float(k[0]):.5f}, argmax {agree:.4f}")
         assert float(k.mean()) < max(1.5e-3, 1.5 * lk) and agree > 0.95
+
+
+# (a non-causal prompt's tokens, its bounds: the state's end, each question's)
+SET_CASES = [(50, (50,)), (300, (230, 252, 270, 300)), (480, (100, 140, 141, 200, 260, 330, 400, 480)),
+             (1500, (1300, 1400, 1500))]
+
+
+@pytest.mark.parametrize(("n", "sets"), SET_CASES, ids=[f"n{n}-q{len(s) - 1}" for n, s in SET_CASES])
+def test_lfm_prefill_set(n: int, sets: tuple[int, ...]) -> None:
+    """d1-2B's first six layers (conv, conv, full, conv, sliding-window, conv) on a prompt read whole from position 0:
+    the full layer non-causal as a state and questions after it, the others causal from zero histories; every output
+    row against the fp32 CPU model's (output-normed) within 5% (the prefill's bfp16 GEMM operands)."""
+    g = GGUFFile(ref.d1_path())
+    layers = [0, 1, 2, 3, 4, 5]
+    ids = ref.essay_ids(n, path=g.path)
+    cpu_m = ref.cpu.LfmCpu(g, layers=layers, vocab=0)
+    want = cpu_m.outputs(ids, slice(None), sets=sets)
+    ov = LfmOverlay(g, layers=layers, vocab=VOCAB, max_positions=2048)
+    ov.load()
+    sizes = BIG if n > 512 else SIZES
+    pf = LfmPrefill(ov, sizes=sizes).compile().bind()
+    assert pf.nc and not pf.attn[("swa", sizes[0])].nc
+    ov.reset()
+    pf.run(cpu_m.emb[torch.tensor(ids)], 0, sets=sets)
+    got = cpu_m.rms(pf.hidden(0, n), cpu_m.norm)
+    worst = {"all": ref.relative(got, want)}
+    for k, (a, b) in enumerate(itertools.pairwise((0, *sets))):  # (the state, each question)
+        worst[f"part{k}"] = ref.relative(got[a:b], want[a:b])
+    print({k: round(v, 4) for k, v in worst.items()})
+    assert all(v < 0.05 for v in worst.values()), worst
+    assert np.isfinite(got.numpy()).all()

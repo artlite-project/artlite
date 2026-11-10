@@ -4,10 +4,14 @@ rows as stored: NeoX pairs), the graph of llama.cpp's ``src/models/lfm3.cpp`` (c
 
 ``LfmCpu.run(tokens, state)`` runs tokens after a state's cached positions (``LfmState``: the attention layers' K / V,
 the conv layers' histories) and returns their output-normed last hidden rows; ``logits(seq, rows)`` runs a sequence
-from position 0 in chunks and returns the logits of the positions ``rows``. The arithmetic's steps are methods
+from position 0 in chunks and returns the logits of the positions ``rows``. A non-causal file (d1's decision models)
+reads a prompt whole from position 0: its full layers see it both ways, as a state and questions after it (``sets``:
+the bounds S, e1, .., en; the state's tokens see every token, a question's the state's and their own: d1's ``set``
+attention), the sliding-window and conv layers stay causal. The arithmetic's steps are methods
 (``mm``, ``conv``, ``attend``, ``store_kv``, ``q_rows``, ``residual``) so that models of other rounding can
 override them (N0's simulations, the NPU's host models)."""
 
+import itertools
 from dataclasses import dataclass, field
 
 import torch
@@ -25,6 +29,7 @@ class LfmState:
     values: dict[int, torch.Tensor] = field(default_factory=dict)
     conv: dict[int, torch.Tensor] = field(default_factory=dict)
     n: int = 0
+    sets: tuple[int, ...] | None = None  # (non-causal: the prompt's bounds, ``LfmCpu`` docstring; None: all both ways)
 
 
 class LfmCpu:
@@ -152,6 +157,12 @@ class LfmCpu:
         mask = kpos <= pos[:, None] if cfg.causal or kind == "swa" else torch.ones(T, p0 + T, dtype=torch.bool)
         if kind == "swa":
             mask = mask & (pos[:, None] - kpos < cfg.sliding_window)
+        elif not cfg.causal and state.sets is not None:  # (a question's rows: the state's keys and their own)
+            assert p0 == 0 and state.sets[-1] == T, (p0, state.sets, T)
+            lo, hi = torch.zeros(T, dtype=torch.long), torch.full((T,), T)
+            for a, b in itertools.pairwise(state.sets):
+                lo[a:b], hi[a:b] = a, b
+            mask = (kpos < hi[:, None]) & ((kpos < state.sets[0]) | (kpos >= lo[:, None]))
         per = nh // nkv
         o = torch.cat([self.attend(q[h * per:(h + 1) * per], K[h], V[h], mask) for h in range(nkv)])  # (nh, T, hd)
         o = o * self.gate(self.mm(xn, lw["g"])).T[:, :, None]
@@ -185,10 +196,13 @@ class LfmCpu:
 
     @torch.no_grad()
     def outputs(self, seq: list[int], rows: slice | list[int], *, chunk: int = 1024,
-                state: LfmState | None = None) -> torch.Tensor:
+                state: LfmState | None = None, sets: tuple[int, ...] | None = None) -> torch.Tensor:
         """The output-normed last hidden rows (n, hidden) of the positions ``rows`` of seq (from position 0, or after
-        a given state's positions: rows of seq)."""
-        state = LfmState() if state is None else state
+        a given state's positions: rows of seq); a non-causal file's prompt whole (``sets``: its bounds)."""
+        state = LfmState(sets=sets) if state is None else state
+        if not self.cfg.causal:
+            assert state.n == 0, "a non-causal prompt runs whole from position 0"
+            chunk = max(chunk, len(seq))
         want = torch.zeros(len(seq), dtype=torch.bool)
         want[rows] = True
         out = []
@@ -201,9 +215,9 @@ class LfmCpu:
 
     @torch.no_grad()
     def logits(self, seq: list[int], rows: slice | list[int], *, chunk: int = 1024,
-               state: LfmState | None = None) -> torch.Tensor:
+               state: LfmState | None = None, sets: tuple[int, ...] | None = None) -> torch.Tensor:
         """The fp32 logits (n, vocab) of the positions ``rows`` of seq."""
-        return self.head(self.outputs(seq, rows, chunk=chunk, state=state))
+        return self.head(self.outputs(seq, rows, chunk=chunk, state=state, sets=sets))
 
 
 def kl(ref: torch.Tensor, got: torch.Tensor) -> torch.Tensor:

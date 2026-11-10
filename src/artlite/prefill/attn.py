@@ -54,6 +54,7 @@ record and core: scores 124, softmax 110, P V 180, the rest calls and locks), 8.
 compiled out.
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 from functools import cached_property
@@ -733,7 +734,9 @@ _ATTN = JINJA_ENV.from_string(r"""
 // largest segment start of the core's rows, the chunk's first record, the window's, the history's chunks, the chunk's
 // first key (chunk-relative){% if RING %}, the pass's cache group{% endif %}, the pass's first computed chunk to come); lo
 // [QB][64] int16 (per query block its rows' segment starts, chunk-relative, per lane 8 q + i) and [64] int16 (lane 8 q + i:
-// i{% else %}, the pass's first computed chunk to come{% endif %})
+// i{% elif NC %}, the chunk's masks, the least and the largest lo of the core's rows, the chunk's first key, the least and
+// the largest hi, the pass's first computed chunk to come, the state's end S); lh [lo 8 QB][hi 8 QB] int16 (the core's
+// rows' own keys lo .. hi - 1: ``seg``{% else %}, the pass's first computed chunk to come{% endif %})
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 namespace {
@@ -851,6 +854,34 @@ __attribute__((noinline)) void {{ p }}_masklo(float *__restrict sc, const int16_
         const aie::vector<int16, 64> lo = aie::load_v<64>(lv + 64 * (b >= {{ QH }}{% for j in range(2, QB) %} + b >= {{ QH * j }}{% endfor %}));
         for (int k = 0; k < {{ CR }}; k++) {
             {{ p }}_vfm(s + 128 * k, aie::lt(i, aie::sub(lo, aie::broadcast<int16, 64>((int16_t)(kc + 8 * k)))));
+        }
+    }
+}
+{% endif %}
+{% if NC %}
+
+alignas(16) static const int16_t {{ p }}_lane8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+// A chunk's masks (non-causal: key kc + 8 k + i of record k, lane 8 q + i): row q sees the keys below the state's end S
+// and its own, lo .. hi - 1 (``seg``: lh); the others -1e30 (``vfm``)
+__attribute__((noinline)) void {{ p }}_maskset(float *__restrict sc, const float *__restrict ws, int32_t kc)
+{
+    const int16_t *__restrict lh = AW(const int16_t, {{ w.lh }});
+    const aie::vector<int16, 8> i8 = aie::load_v<8>({{ p }}_lane8);
+    const aie::vector<int16, 64> i = al::concat(i8, i8, i8, i8, i8, i8, i8, i8);
+    const int16_t s0 = (int16_t)(AW(const int32_t, {{ w.st }})[14] - kc);
+    for (int j = 0; j < {{ QB }}; j++) {
+        const int16_t *__restrict l = lh + 8 * j;
+        const aie::vector<int16, 64> lo = al::concat({% for q in range(8) %}aie::broadcast<int16, 8>((int16_t)(l[{{ q }}] - kc)){{ ", " if not loop.last }}{% endfor %});
+        const aie::vector<int16, 64> hi = al::concat({% for q in range(8) %}aie::broadcast<int16, 8>((int16_t)(l[{{ 8 * QB + q }}] - kc)){{ ", " if not loop.last }}{% endfor %});
+        for (int h = 0; h < {{ QH }}; h++) {
+            const int b = {{ QH }} * j + h;
+            float *__restrict s = sc + {{ 128 * CR }} * (b >> 1) + 64 * (b & 1);
+{% for k in range(CR) %}
+            {{ p }}_vfm(s + {{ 128 * k }}, aie::ge(i, aie::sub(hi, aie::broadcast<int16, 64>({{ 8 * k }}))) |
+                                     (aie::ge(i, aie::broadcast<int16, 64>((int16_t)(s0 - {{ 8 * k }}))) &
+                                      aie::lt(i, aie::sub(lo, aie::broadcast<int16, 64>({{ 8 * k }})))));
+{% endfor %}
         }
     }
 }
@@ -985,7 +1016,7 @@ extern "C" {
 // A pass's start: o = 0, the reference m = -48 (bias 240: P = 2^(s + 48), a chunk's maximum above -32 raises it; rows
 // whose scores all stay below -111 would read 2^-63 for each), l = 0; the pass's first record p0 / 8 + {{ 4 * QB }}
 // (M bg + bb)
-__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq, int32_t hk{% endif %})
+__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq, int32_t hk{% elif NC %}, int32_t hk{% endif %})
 {
 {% if "ev_q" in ablate %}
     event1();
@@ -1001,6 +1032,9 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
 {% endif %}
 {% if SWA %}
     AW(int32_t, {{ w.st }})[7] = p8 + {{ RG }} * (bg - {{ WG }});  // (the window's first record: {{ WG }} groups before the pass's)
+{% endif %}
+{% if NC %}
+    AW(int32_t, {{ w.st }})[14] = hk;  // (the state's end: the keys below it every row sees)
 {% endif %}
 {% if WIN %}
     int32_t *__restrict st = AW(int32_t, {{ w.st }});
@@ -1077,6 +1111,44 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
     st[1] |= out;
     st[3] &= !out;
 {% endif %}
+    st[9] = kc;
+}
+{% elif NC %}
+// The pass's rows' own keys (its SEG object: per row of the pass lo, int16, then from value 72 on hi; a row sees the
+// keys below the state's end and lo .. hi - 1): the core's rows' into lh, their least and largest into st
+__attribute__((minsize)) void {{ p }}_seg(const bfloat16 *__restrict u, float *__restrict ws, int32_t r)
+{
+    const int16_t *__restrict s = (const int16_t *)u + {{ 8 * QB }} * r;
+    int16_t *__restrict lh = AW(int16_t, {{ w.lh }});
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    int32_t l0 = s[0], l1 = s[0], h0 = s[288], h1 = s[288];  // (value 72 of the object: 288 of the unit, stream B's walk)
+    for (int i = 0; i < {{ 8 * QB }}; i++) {
+        const int32_t lo = s[i], hi = s[288 + i];
+        lh[i] = lo;
+        lh[{{ 8 * QB }} + i] = hi;
+        l0 = lo < l0 ? lo : l0;
+        l1 = lo > l1 ? lo : l1;
+        h0 = hi < h0 ? hi : h0;
+        h1 = hi > h1 ? hi : h1;
+    }
+    st[4] = l0;
+    st[5] = l1;
+    st[10] = h0;
+    st[11] = h1;
+}
+
+// Chunk t of the pass's stream (non-causal: keys kc = {{ 8 * CR }} t .. kc + {{ 8 * CR - 1 }} from position 0): skipped where every one of
+// the core's rows sees none of them (past every row's own keys, or between the state's end and every row's own), masked
+// where a row does not see all of them (``maskset``)
+__attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32_t r)
+{
+{% if "ev_chunk" in ablate %}
+    event0();
+{% endif %}
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    const int32_t kc = {{ 8 * CR }} * t, ke = kc + {{ 8 * CR }};
+    st[1] = (kc >= st[11]) | ((kc >= st[14]) & (ke <= st[4]));
+    st[3] = !((ke <= st[14]) | ((kc >= st[5]) & (ke <= st[10])));
     st[9] = kc;
 }
 {% else %}
@@ -1266,7 +1338,12 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
 {% endif %}
 }
 
+{% if NC %}
+// The chunk's softmax terms: masks where a row does not see all of its keys; rows whose maximum exceeds their reference
+// by 2^16 raise it
+{% else %}
 // The chunk's softmax terms: masks on a diagonal chunk; rows whose maximum exceeds their reference by 2^16 raise it
+{% endif %}
 // (``raise``: when ``qk`` saw a v of the chunk reach 208); P = 2^(A - 128) as bfp16 panels (``ppan``)
 void {{ p }}_soft(float *__restrict ws, float *__restrict wo, uint8_t *__restrict pp)
 {
@@ -1283,8 +1360,13 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict wo, uint8_t *__restric
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
     float *__restrict sc = AW(float, {{ w.sc }});
+{% if NC %}
+    if (st[3])  // (a row does not see all of the chunk's keys)
+        {{ p }}_maskset(sc, ws, st[9]);
+{% else %}
     if (st[0] + {{ CR - 1 }} >= 0)  // (the chunk reaches the first block's queries)
         {{ p }}_mask(sc, st[0]);
+{% endif %}
 {% if SWA %}
     if (st[0] - {{ QB - 1 }} <= -{{ WR }})  // (the chunk reaches below the last block's window)
         {{ p }}_maskw(sc, st[0]);
@@ -1401,7 +1483,14 @@ class AttnOperator(ArtcOperator):
     of the chunk's groups (slot b % (W + 1) group b), and sends every pass the history and the whole ring
     (``_ring_memtiles``); the cores skip the slots outside their window (the chunk's groups max(0, D - W + 1) .. D), so
     a pass takes its window's key chunks in the slots' order (o, l the same sums in another order: not bit-identical to
-    the window variant). A key chunk the cores skip still crosses their input streams: the ring wins from 2048 tokens."""
+    the window variant). A key chunk the cores skip still crosses their input streams: the ring wins from 2048 tokens.
+
+    Non-causal (``causal`` False: LFM3's d1 decision models' full-attention layers, a prompt in one chunk at position 0):
+    every pass streams the prompt's cache groups (the causal design's history part, from group 0: ``set_params``);
+    row q sees the keys below the state's end S (``P_HK``) and its own, lo .. hi - 1 (the SEG argument, ``set_seg``: an
+    object per pass after the GATE object, per row lo then hi, int16): the state's rows and the padding's every key of
+    the prompt, a question's rows the state's and their question's. Key chunks no row of a core sees are skipped, those
+    some row sees in part masked (-1e30)."""
 
     STACK = 2048
     pfx = kernel_prefix("paa")
@@ -1413,7 +1502,7 @@ class AttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
                  ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
-                 bcast: bool = True):
+                 bcast: bool = True, causal: bool = True):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
@@ -1422,7 +1511,7 @@ class AttnOperator(ArtcOperator):
         groups before its own and its own, from ``kv0`` bytes of a KV head's cache, its guard, before group 0); ``bcast``
         (two columns per KV head, ``Shape.per``): the KV head's streams read once, by column 2 h's shim, and broadcast by
         its memtile to the cores of both columns (each taking its column's Q units and gates of both), else each column
-        reads them (twice the cache's bytes: a reference)."""
+        reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -1438,6 +1527,8 @@ class AttnOperator(ArtcOperator):
         self.ring = ring
         self.swa, self.kv0 = swa, kv0
         self.bc = shape.per == 2 and bcast  # (one stream per KV head, broadcast to its columns' cores)
+        self.nc = not causal
+        assert not self.nc or (not window and not ring and not swa and T < 32768), "non-causal: full layers, int16 keys"
         assert not self.bc or (shape.gate and not window and not ring), "the broadcast: LFM3's shapes"
         assert not swa or (swa % s.pg == 0 and not window and not ring and kv0 >= swa // s.pg * s.group), swa
         if ring:
@@ -1447,11 +1538,11 @@ class AttnOperator(ArtcOperator):
         super().__init__()
 
     @staticmethod
-    def regions(rows: int, cr: int, qb: int = 0) -> list[tuple[str, int]]:
+    def regions(rows: int, cr: int, qb: int = 0, nc: int = 0) -> list[tuple[str, int]]:
         """The workspace's regions at ``rows`` row blocks and chunks of ``cr`` records (the kernels' comment); ``qb``: the
-        packed variant's query blocks (their rows' segment starts)."""
+        packed variant's query blocks (their rows' segment starts); ``nc``: the non-causal variant's (their rows' keys)."""
         return [("sc", 256 * rows * cr), ("bias", 256 * rows), ("l", 256 * rows), ("vm", 192), ("st", 64)] + (
-            [("lo", 128 * qb + 128)] if qb else [])
+            [("lo", 128 * qb + 128)] if qb else []) + ([("lh", 32 * nc)] if nc else [])
 
     OS = 0x4000 // 4  # (floats from o's first copy to its second: a region apart)
 
@@ -1467,7 +1558,8 @@ class AttnOperator(ArtcOperator):
 
     def workspace(self) -> dict[str, int]:
         gt = [("gt", 32 * self.qb * self.shape.qh)] if self.shape.gate else []
-        return regions(self.regions(self.qb * self.shape.qh, self.cr, self.qb if self.win else 0) + gt)
+        return regions(self.regions(self.qb * self.shape.qh, self.cr, self.qb if self.win else 0,
+                                    self.qb if self.nc else 0) + gt)
 
     @property
     def mt_bytes(self) -> int:
@@ -1501,7 +1593,7 @@ class AttnOperator(ArtcOperator):
                             KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
                             WIN=self.win, RG=s.rg, RING=self.ring, R=self.win + 1, GQ=s.rg // self.cr,
                             HBC=self.ring * s.rg // self.cr, SWA=self.swa > 0, WR=self.swa // 8,
-                            WG=self.swa // s.pg, tril=f"{tril:016X}", GATE=s.gate)
+                            WG=self.swa // s.pg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc)
 
     @property
     def n_qs(self) -> int:
@@ -1521,7 +1613,7 @@ class AttnOperator(ArtcOperator):
         return self.n_pass * self.shape.unit
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        seg = [ArgSpec("in", (self.n_seg,), torch.bfloat16)] if self.win else []
+        seg = [ArgSpec("in", (self.n_seg,), torch.bfloat16)] if self.win or self.nc else []
         return [ArgSpec("in", (self.n_qs,), torch.bfloat16), ArgSpec("in", (self.n_kv,), torch.bfloat16),
                 ArgSpec("out", (self.n_a,), torch.bfloat16), *seg]
 
@@ -1533,10 +1625,33 @@ class AttnOperator(ArtcOperator):
         out[:, :self.pq] = lo.reshape(self.n_pass, self.pq)
         return out.view(np.uint8).reshape(-1)
 
+    def set_seg(self, sets: tuple[int, ...]) -> np.ndarray:
+        """The SEG argument's bytes (uint8) of a non-causal prompt of n = sets[-1] tokens, a state and questions after it
+        (``sets``: bounds S, e1, .., en, as ``NpuModel.outputs`` takes them) -> per pass its rows' lo (values 0 ..) and
+        hi (values 72 ..: stream B's walk puts them 288 bf16 into the unit) as int16: the state's rows and the padding's
+        0, n; question k's e(k-1), ek."""
+        assert self.nc and len(sets) >= 1 and sets[0] >= 1 and list(sets) == sorted(sets) and sets[-1] <= self.T, sets
+        n = sets[-1]
+        lo, hi = np.zeros(self.T, np.int16), np.full(self.T, n, np.int16)
+        for a, b in itertools.pairwise(sets):
+            lo[a:b], hi[a:b] = a, b
+        out = np.zeros((self.n_pass, self.shape.unit), np.int16)
+        out[:, :self.pq] = lo.reshape(self.n_pass, self.pq)
+        out[:, 72:72 + self.pq] = hi.reshape(self.n_pass, self.pq)
+        return out.view(np.uint8).reshape(-1)
+
+    def set_params(self, sets: tuple[int, ...]) -> dict[str, int]:
+        """The scratchpad parameters of a non-causal prompt (``set_seg``'s ``sets``): its cache groups every pass streams
+        from position 0, the state's end."""
+        s = self.shape
+        g = -(-sets[-1] // s.pg)
+        return {P_P8: 0, P_FG: g, P_FQ: g * s.rg // self.cr, P_HK: sets[0]}
+
     def params(self, p0: int, lead: int = 0) -> dict[str, int]:
         """The scratchpad parameters of a chunk at p0 (packed: ``lead``, its first keys every row sees: 0 or a cache
         group, a prompt every segment continues; its rows a segment of their own)."""
         s = self.shape
+        assert not self.nc, "non-causal: set_params"
         assert p0 % s.pg == 0 and lead in (0, s.pg) and (self.win or not lead)
         if self.swa:
             return {P_P8: p0 // 8, P_SW: s.group // 2 * (p0 // s.pg)}
@@ -1562,8 +1677,9 @@ class AttnOperator(ArtcOperator):
         wo_ty = np.ndarray[((self.OS if self.oc == 2 else 0) + 64 * nd * rb,), f32]
         pp_ty = np.ndarray[(self.pp_bytes,), np.dtype[np.uint8]]
         win = self.win
-        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * 2 * (win > 0))
-        k_seg = Kernel(f"{p}_seg", "kernel.o", [u_ty, ws_ty, np.int32]) if win else None
+        k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * (
+            2 if win else 1 if self.nc else 0))
+        k_seg = Kernel(f"{p}_seg", "kernel.o", [u_ty, ws_ty, np.int32]) if win or self.nc else None
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [u_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, u_ty, u_ty, ws_ty, np.int32, np.int32] if s.kp == 1 else
                       [q_ty, u_ty, ws_ty, np.int32, np.int32, np.int32])
@@ -1611,26 +1727,29 @@ class AttnOperator(ArtcOperator):
                 u = b_h.acquire(1)
                 qsel(u, q, i, me)
                 b_h.release(1)
+            if gsel is not None:  # (the pass's GATE object: two units, the first read)
+                u = b_h.acquire(1)
+                gsel[0](u, ws, gsel[1])
+                b_h.release(1)
+                b_h.acquire(1)
+                b_h.release(1)
             if seg is not None:  # (the pass's SEG object: two units, the first read)
                 u = b_h.acquire(1)
                 seg(u, ws, row)
                 b_h.release(1)
                 b_h.acquire(1)
                 b_h.release(1)
+            if win:
                 init(ws, wo, p8.read(), bg, bb, fq.read(), hk.read())
+            elif self.nc:
+                init(ws, wo, p8.read(), bg, bb, hk.read())
             else:
-                if gsel is not None:  # (the pass's GATE object: two units, the first read)
-                    u = b_h.acquire(1)
-                    gsel[0](u, ws, gsel[1])
-                    b_h.release(1)
-                    b_h.acquire(1)
-                    b_h.release(1)
                 init(ws, wo, p8.read(), bg, bb)
             if self.swa:  # (the window's groups and the pass's)
                 n = gq * (self.swa // s.pg + 1)
             else:
                 n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
-            if self.swa:
+            if self.swa or self.nc:  # (non-causal: the prompt's groups, every pass)
                 pass
             elif self.ring:
                 n = gq * (self.ring + win + 1)
@@ -1692,7 +1811,7 @@ class AttnOperator(ArtcOperator):
                                  Buffer(wo_ty, name=f"la_wo{c}_{r}"), Buffer(pp_ty, name=f"la_pp{c}_{r}"),
                                  Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq,
                                  rb * (r + 4 * jb(c)), r,
-                                 *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win else []),
+                                 *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win or self.nc else []),
                                  *([k_gsel, r + 4 * jb(c)] if s.gate else [])],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
@@ -1746,7 +1865,7 @@ class AttnOperator(ArtcOperator):
             for b in range(n_pass):
                 tp = TaskGroup()
                 ng = b // m  # (the chunk's groups after its first that the pass streams; packed: the last win of them)
-                j0, nw = (max(1, ng - win + 1), min(ng, win)) if win else (1, ng)
+                j0, nw = (max(1, ng - win + 1), min(ng, win)) if win else (1, 0 if self.nc else ng)
                 t0 = 4 * qb * b  # (the pass's first token group: its sub-chunk, the group in it)
                 q0 = t0 // sg * sg * COLS * tw + t0 % sg * tw
                 for i, c in enumerate(scols):
@@ -1826,7 +1945,7 @@ class AttnOperator(ArtcOperator):
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
-                           *([np.ndarray[(n_seg,), bf]] if win else []),
+                           *([np.ndarray[(n_seg,), bf]] if win or self.nc else []),
                            [a3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [b3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])

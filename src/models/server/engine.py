@@ -295,16 +295,17 @@ class Engine:
         return call.future
 
     def readouts(self, inputs: list[list[int]], rows: list[np.ndarray], *, cache_prompt: bool = True,
-                 name: str = "readout") -> concurrent.futures.Future:
+                 name: str = "readout", sets: list[tuple[int, ...] | None] | None = None) -> concurrent.futures.Future:
         """Output rows of prompts (``NpuModel.outputs``, output-normed) on the worker after the queued jobs: per input
         its tokens' rows at ``rows`` (indices). One input runs after what the prompt cache keeps of it before its first
         row; several run after a prefix they share (``_start``: run once, through the prompt cache) as
         ``NpuModel.readouts`` runs them (packed chunks where the model packs, else one after another); a non-causal
-        model's from position 0. The result: a list of (len(rows), hidden) fp32."""
-        return self.run(lambda: self._readouts(inputs, rows, cache_prompt, name))
+        model's from position 0, ``sets`` its inputs' attention (``NpuModel.outputs``). The result: a list of
+        (len(rows), hidden) fp32."""
+        return self.run(lambda: self._readouts(inputs, rows, cache_prompt, name, sets))
 
-    def _readouts(self, inputs: list[list[int]], rows: list[np.ndarray], cache_prompt: bool, name: str
-                  ) -> list[np.ndarray]:
+    def _readouts(self, inputs: list[list[int]], rows: list[np.ndarray], cache_prompt: bool, name: str,
+                  sets: list[tuple[int, ...] | None] | None = None) -> list[np.ndarray]:
         npu, cache = self.npu, self.cache
         cache_prompt = cache_prompt and npu.causal  # (a non-causal model reads every prompt whole)
         t0, ran = time.perf_counter(), 0
@@ -312,7 +313,13 @@ class Engine:
             if self._dirty:
                 npu.reset()
                 self._dirty = False
-            if len(inputs) == 1:
+            if sets is not None:  # (a non-causal model's sequences of their own attention: each whole, from position 0)
+                assert not npu.causal
+                cache.prepare([], enabled=False)
+                out = npu.readouts(inputs, rows, sets=sets)
+                cache.ran([])
+                ran = sum(map(len, inputs))
+            elif len(inputs) == 1:
                 (ids,), (at,) = inputs, rows
                 k, _, _ = cache.prepare(ids[:int(at.min())], enabled=cache_prompt)
                 out = [npu.outputs(ids[k:], at - k)]

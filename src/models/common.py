@@ -534,29 +534,33 @@ class NpuModel:
         return out if logits else None
 
     def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
-                progress: Callable[[int], None] | None = None) -> np.ndarray:
+                progress: Callable[[int], None] | None = None, sets: Sequence[int] | None = None) -> np.ndarray:
         """Run tokens after the cached positions (``prompt``) and return the last layer's outputs (len(at), hidden)
         fp32 of the tokens at indices ``at`` (negative: from the end; None: every token), output-normed (``norm``: the
         LM head's input; else the residual stream): a readout's rows (embeddings, a classifier's or the LM head's rows
-        on the host: ``models.readouts``)."""
+        on the host: ``models.readouts``). ``sets`` (a non-causal model whose prefill reads sets: LFM3's d1): the
+        prompt as a state and questions after it, bounds (S, e1, .., en): the state's tokens 0 .. S - 1 see every
+        token on the non-causal layers, question k's (e(k-1) .. ek - 1, e0 = S) the state's and their own; None: every
+        token sees every token."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
     packs = False  # whether ``readouts`` packs inputs into prefill chunks (a readout model's prefill)
     lead_tokens = 0  # the length of a ``readouts`` lead that may run inside its first packed chunk (0: none)
 
     def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
-                 lead: list[int] | None = None) -> list[np.ndarray]:
+                 lead: list[int] | None = None, sets: list[Sequence[int] | None] | None = None) -> list[np.ndarray]:
         """Several inputs' output rows (each as ``outputs`` returns them): each input's tokens after the cached positions
-        (a prefix every one of them continues; ``lead``: tokens of it not cached yet, run first); the model is left at
-        the prefix's end. This default runs them one after another from a checkpoint there."""
+        (a prefix every one of them continues; ``lead``: tokens of it not cached yet, run first; ``sets``: each one's
+        as ``outputs`` takes them); the model is left at the prefix's end. This default runs them one after another
+        from a checkpoint there."""
         if lead:
             self.outputs(lead, [-1])
         p = self.position
         cp = self.checkpoint() if p else None
         out = []
-        for ids, rows in zip(inputs, at, strict=True):
+        for k, (ids, rows) in enumerate(zip(inputs, at, strict=True)):
             self.restore(p, cp)
-            out.append(self.outputs(ids, rows, norm=norm))
+            out.append(self.outputs(ids, rows, norm=norm, **({"sets": sets[k]} if sets is not None else {})))
         self.restore(p, cp)
         return out
 
@@ -776,9 +780,10 @@ class OverlayModel(NpuModel):
         array comes back before its next dispatch (``OverlayDevice.set_prologue``)."""
         self.overlay.dev.stale = True
 
-    def _prefill_run(self, args: tuple, T: int, n: int) -> None:
-        """A prompt chunk of n tokens at the next position through the prefill's chunk of T (its inputs ``args``)."""
-        self.prefill.run(*args, self.position, T)
+    def _prefill_run(self, args: tuple, T: int, n: int, sets: Sequence[int] | None = None) -> None:
+        """A prompt chunk of n tokens at the next position through the prefill's chunk of T (its inputs ``args``;
+        ``sets``: a non-causal prompt's, ``outputs``)."""
+        self.prefill.run(*args, self.position, T, **({"sets": sets} if sets is not None else {}))
         self.stale()
 
     def prompt_seconds(self, n: int, position: int = 0) -> float | None:
@@ -865,13 +870,17 @@ class OverlayModel(NpuModel):
             ov.write_records(r, start, end)
 
     def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None,
-               readout: Readout | None = None) -> torch.Tensor | None:
+               readout: Readout | None = None, sets: Sequence[int] | None = None) -> torch.Tensor | None:
         """Run tokens after the cached positions (prefill chunks, else decode steps); ``logits``: return the last
         token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps; ``readout``:
-        gathers output rows (``outputs``: every token a chunk can take in chunks)."""
+        gathers output rows (``outputs``: every token a chunk can take in chunks); ``sets``: a non-causal prompt's
+        (``outputs``)."""
         self._abandon()
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
+        if sets is not None and (self.causal or len(sets) < 1 or sets[-1] != len(tokens) or list(sets) != sorted(sets)
+                                 or sets[0] < 1):
+            raise ValueError(f"sets {list(sets)}: a non-causal prompt's increasing bounds, the last its length")
         if not self.causal and (self.position or not self._chunk(len(tokens))):
             sizes = self.prefill.sizes if self.prefill is not None else (0,)
             raise ValueError(f"a non-causal model reads a whole prompt in one chunk from position 0 "
@@ -902,7 +911,7 @@ class OverlayModel(NpuModel):
             m = self._chunk(len(tokens) - i - n, self.position + n, steps=steps)  # (the next chunk: its inputs meanwhile)
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
                                     tokens[i + n:i + n + m]) if m else None
-            self._prefill_run(args, T, n)
+            self._prefill_run(args, T, n, sets)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
             self.dispatches += self.prefill.dispatches
@@ -922,7 +931,7 @@ class OverlayModel(NpuModel):
         return self.prompt(tokens, logits=True, progress=progress)
 
     def outputs(self, tokens: list[int], at: Sequence[int] | None = None, *, norm: bool = True,
-                progress: Callable[[int], None] | None = None) -> np.ndarray:
+                progress: Callable[[int], None] | None = None, sets: Sequence[int] | None = None) -> np.ndarray:
         """(every token a chunk can take in chunks, the last one padded: a chunk's rows need no LM head, which a decode
         step's do; the output norm on the host: ``_w_out``)"""
         n = len(tokens)
@@ -930,7 +939,7 @@ class OverlayModel(NpuModel):
         if n == 0 or ((idx < -n) | (idx >= n)).any():
             raise IndexError(f"readout rows {idx.tolist()} of {n} tokens")
         readout = Readout(idx % n, self.cfg.hidden_size)
-        self.prompt(tokens, progress=progress, readout=readout)
+        self.prompt(tokens, progress=progress, readout=readout, sets=sets)
         return self._normed(readout.rows) if norm else readout.rows
 
     def _normed(self, x: np.ndarray) -> np.ndarray:
@@ -955,13 +964,13 @@ class OverlayModel(NpuModel):
         return super().readout_seconds(lengths, position)
 
     def readouts(self, inputs: list[list[int]], at: list[np.ndarray], *, norm: bool = True,
-                 lead: list[int] | None = None) -> list[np.ndarray]:
+                 lead: list[int] | None = None, sets: list[Sequence[int] | None] | None = None) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues
         the cached prefix; a recurrent model's after a prefix are tree chunks, which leave its states as the prefix left
         them; inputs alone one after another from the prefix, a checkpoint's where needed; a lead of ``lead_tokens``
         inside the first packed chunk where it has room and no input runs alone, else alone first)"""
-        if not self.packs:
-            return super().readouts(inputs, at, norm=norm, lead=lead)
+        if not self.packs or sets is not None:
+            return super().readouts(inputs, at, norm=norm, lead=lead, sets=sets)
         self._abandon()
         at = [np.asarray(r, np.int64).reshape(-1) % len(ids) for ids, r in zip(inputs, at, strict=True)]
         lead = list(lead or [])

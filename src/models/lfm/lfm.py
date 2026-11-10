@@ -47,13 +47,14 @@ class NpuLfm(OverlayModel):
         self.gguf = gguf
         self.overlay = LfmOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
         self.cfg = self.overlay.cfg
+        self.causal = self.cfg.causal  # (d1's decision models: readouts of whole prompts, no decode steps)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.prefill = LfmPrefill(self.overlay, sizes=sizes) if prefill else None
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
             self.overlay.load(threads=threads)
-            for S in range(1, SLOTS + 1):  # (the steps' transactions: prompt tokens, a prompt's last, generated ones)
-                self.overlay.prepare(S, logits=False)
+            for S in range(1, SLOTS + 1) if self.causal else ():  # (the steps' transactions: prompt tokens, a prompt's
+                self.overlay.prepare(S, logits=False)  # last, generated ones)
                 self.overlay.prepare(S, logits=True)
             if build is not None:
                 build.result()  # (its error, if any)
