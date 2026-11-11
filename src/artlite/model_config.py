@@ -128,6 +128,18 @@ def lfm3vl_mmproj(quant: str = "BF16") -> str:
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-VL-2B-GGUF", f"mmproj-LFM3-VL-2B-{quant}.gguf")
 
 
+def lfm3a_gguf(quant: str = "Q4_K_M") -> str:
+    """A language model file of LiquidAI's LFM3-Audio-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes,
+    weights of its own): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Audio-2B-GGUF", f"LFM3-Audio-2B-{quant}.gguf")
+
+
+def lfm3a_mmproj(quant: str = "Q8_0") -> str:
+    """LFM3-Audio-2B's speech encoder and projector (GGUF architecture ``clip``, projector ``lfm3a``; the file also holds
+    the speech decoder, ``lfm3a_gen``): ``Q8_0``, ``BF16``, ``F16``, ``Q4_K_M``, ``Q4_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Audio-2B-GGUF", f"mmproj-LFM3-Audio-2B-{quant}.gguf")
+
+
 DECISION_FILES = {"d3-lite":"ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
                   "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",
@@ -734,6 +746,51 @@ class ClipConfig:
             min_pixels=int(m("image_min_pixels", 0)),
             max_pixels=int(m("image_max_pixels", 0)),
             resize=str(m("image_resize_algo", "")),
+        )
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden // self.heads
+
+
+@dataclass(frozen=True)
+class AudioConfig:
+    """A speech encoder and projector, from the ``clip.audio.*`` metadata of a GGUF file (architecture ``clip``; llama.cpp's
+    ``tools/mtmd/clip.cpp``): ``projector`` (``clip.audio.projector_type``: "lfm3a"), the encoder (``layers`` of
+    ``hidden`` with ``heads`` and ``kv_heads``, ``ffn``, RMSNorm ``eps``, attention over the last ``window`` positions),
+    its input (``mel_bins`` log-mel bins) and the language model's width ``projection_dim``."""
+
+    projector: str
+    hidden: int
+    ffn: int
+    layers: int
+    heads: int
+    kv_heads: int
+    eps: float
+    mel_bins: int
+    window: int
+    projection_dim: int
+
+    @classmethod
+    def has_audio(cls, gguf: Any) -> bool:
+        return gguf.arch == "clip" and bool(gguf.meta.get("clip.has_audio_encoder", False))
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> AudioConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert cls.has_audio(gguf), f"{gguf.path}: no speech encoder (clip.has_audio_encoder)"
+        m = lambda k, d=None: gguf.meta.get(f"clip.audio.{k}", d)
+        return cls(
+            projector=str(m("projector_type")),
+            hidden=int(m("embedding_length")),
+            ffn=int(m("feed_forward_length")),
+            layers=int(m("block_count")),
+            heads=int(m("attention.head_count")),
+            kv_heads=int(m("attention.head_count_kv", m("attention.head_count"))),
+            eps=float(m("attention.layer_norm_epsilon")),
+            mel_bins=int(m("num_mel_bins")),
+            window=int(m("window_size", 0)),
+            projection_dim=int(m("projection_dim")),
         )
 
     @property

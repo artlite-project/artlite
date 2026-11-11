@@ -1,5 +1,6 @@
-// Golden tensors of llama.cpp's MiniCPM-V 4.7 vision path (libmtmd): an image prompt through the projector and the
-// language model on the CPU backend, with the vision encoder's intermediate tensors dumped as .npy files.
+// Golden tensors of llama.cpp's MiniCPM-V 4.7 vision path (libmtmd): an image prompt (or any mmproj's media: an audio
+// file through a speech encoder) through the projector and the language model on the CPU backend, with the encoder's
+// intermediate tensors dumped as .npy files.
 //
 // Built against a prebuilt llama.cpp tree (include/, ggml/include/, tools/mtmd/, build/bin/libmtmd.so) by
 // ref.py.
@@ -20,11 +21,12 @@
 // tokens K .. n - 1), chunks.json ({"chunks": [], "logit_tokens", "entries": 0}), meta.json.
 //
 // Output in OUTDIR:
-// - chunks.json: the prompt's chunks in order, text ({"text": [token ids]}) or image ({"image": n_tokens, "n_pos",
-//   "pos": [[t, x, y, z] per token]: mtmd_image_tokens_get_decoder_pos at the chunk's first position}),
+// - chunks.json: the prompt's chunks in order, text ({"text": [token ids]}), image ({"image": n_tokens, "n_pos",
+//   "pos": [[t, x, y, z] per token]: mtmd_image_tokens_get_decoder_pos at the chunk's first position}) or audio
+//   ({"audio": n_tokens, "n_pos"}),
 //   then the answer's tokens as a text chunk; "logit_tokens": the index in the whole sequence of each row of logits;
 //   "entries": the encoder's graphs (the image's entries);
-// - embd-<i>.npy: image chunk i's embeddings (n_tokens, n_embd), as mtmd_encode_chunk gives them;
+// - embd-<i>.npy: media chunk i's embeddings (n_tokens, n_embd), as mtmd_encode_chunk gives them;
 // - <name>-<il>.e<k>.npy: the encoder's tensors per entry k of an image (the overview, then the slices row by row);
 //   the inputs (inp_raw: the entry's pixels; positions, the merges' gather indices) as the first nodes that read them
 //   see them; float tensors as float32, integer ones as int32, shape = ne reversed;
@@ -442,14 +444,18 @@ int main(int argc, char ** argv) {
             decode_text(toks, n);
             continue;
         }
-        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(chunk);
-        const size_t n_tok = mtmd_image_tokens_get_n_tokens(it);
-        fprintf(js, "{\"image\": %zu, \"n_pos\": %d, \"pos\": [", n_tok, (int) mtmd_image_tokens_get_n_pos(it));
-        for (size_t i = 0; i < n_tok; i++) {
-            const mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(it, n_past, i);
-            fprintf(js, "%s[%u, %u, %u, %u]", i ? ", " : "", p.t, p.x, p.y, p.z);
+        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(chunk);  // (null: an audio chunk)
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
+        if (it) {
+            fprintf(js, "{\"image\": %zu, \"n_pos\": %d, \"pos\": [", n_tok, (int) mtmd_image_tokens_get_n_pos(it));
+            for (size_t i = 0; i < n_tok; i++) {
+                const mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(it, n_past, i);
+                fprintf(js, "%s[%u, %u, %u, %u]", i ? ", " : "", p.t, p.x, p.y, p.z);
+            }
+            fprintf(js, "]}");
+        } else {
+            fprintf(js, "{\"audio\": %zu, \"n_pos\": %d}", n_tok, (int) mtmd_input_chunk_get_n_pos(chunk));
         }
-        fprintf(js, "]}");
         const int n_embd = llama_model_n_embd_inp(model);
         std::vector<float> given;
         float * embd = nullptr;
