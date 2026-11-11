@@ -1,5 +1,6 @@
-"""The vision overlay: image networks (Stable Diffusion's UNet and VAE decoder: ``models.sd15``; MiniCPM-V's and
-Qwen3-VL's vision encoders: ``models.minicpmv``, ``models.qwen3vl``) on one static design run by host-built
+"""The vision overlay: image networks (Stable Diffusion's UNet and VAE decoder: ``models.sd15``; MiniCPM-V's,
+Qwen3-VL's and LFM3-VL's vision encoders: ``models.minicpmv``, ``models.qwen3vl``, ``models.lfm3vl``) and LFM3-Audio's
+speech encoder (``models.lfm3a``) on one static design run by host-built
 transactions (``design``: the array; ``core``: the cores' program and its roles; ``seq``: the transactions; ``ops``:
 GEMMs and convs, the norms' applies, attention; ``layout``: the memtile tensors; ``build``: a dispatch's program and
 its DDR images; ``layers``: a network's tensors and layers; ``vit``: the vision encoders' ViT layers; ``device``: the

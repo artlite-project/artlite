@@ -31,6 +31,8 @@ from . import design as D
 from . import layout as L
 from .seq import ColOps, MemTask, RowOps
 
+ROPE2_TAB = 5120  # (a rope2 tile's tables [A | B], m 16: 2 x 16 tokens x 80 bf16)
+
 
 @functools.cache
 def _contig(words: int) -> list[tuple[int, int]]:
@@ -98,7 +100,10 @@ class Gemm:
     each pass a head of 40 pairs of channels (k, 40 + k) turned by its tokens' angles, as panels: res is then the tile's
     cos | sin (one C-tile object of 80 channels, the same for every pass: ``core``'s RoPE; m 64, one tile, no
     statistics), with ``qkn`` (80 weights, the pairs' layout) each head RMS-normed first (over ``qkn_n`` channels,
-    eps ``qkn_eps``: LFM3-VL's q / k norms). stats "gn" (groups of ``gsize`` channels of a
+    eps ``qkn_eps``: LFM3-VL's q / k norms); "rope2" (m 16): a head in two passes (A, B: the pairs (k, 40 + k) of each),
+    normed over both (``qkn``: 160 weights, A's then B's) and turned, res the tiles' tables [A | B] (``ROPE2_TAB`` bytes
+    a tile: two C-tile layouts [rb][cb][64] of cos | sin; LFM3-Audio's heads of 96); act "silu" with out "gelu": silu of
+    the outputs as panels (role r). stats "gn" (groups of ``gsize`` channels of a
     tensor whose channel ``ch_off`` is this output's first) / "ln": records at ``rec`` ([tile][core][OCH] (LN), [core][OCH]
     (GN)); stf: ``core.ST_*`` (a GroupNorm record over several ops). The op runs passes [p0, p0 + npo) of each row's
     N / 4 channels (default all). K 0: a copy of res (C tiles) into y with statistics (no weights).
@@ -123,7 +128,9 @@ class Gemm:
     channels) for the (r % tsplit)-th of tsplit parts of the tiles (``tiles``).
 
     hilo: the weights as two bfp16 parts, hi = bfp16(w) and lo = bfp16(w - hi) (about bf16's precision): K doubled, per
-    pass the hi k-tiles, then the lo ones on the A panels walked again (twice the MACs and weight bytes)."""
+    pass the hi k-tiles, then the lo ones on the A panels walked again (twice the MACs and weight bytes). packed (bf16,
+    N 320): row r's block of tile t at y + r ``packed_block`` + t m 160 (the C tiles without their chunks' padding: a
+    block's tokens linear over the tiles, a drain's walk)."""
 
     m: int
     ntile: int
@@ -163,16 +170,20 @@ class Gemm:
     qkn: object = None
     qkn_n: int = 64
     qkn_eps: float = 1e-5
+    packed: bool = False
 
     def __post_init__(self) -> None:
         assert self.m in (64, 16) and self.N * self.tsplit % 320 == 0 and self.K % 8 == 0 and \
-            self.out in ("bf16", "bfp16", "geglu", "vt", "ds", "gelu", "rope", "prod")
-        assert self.act == "gelu" or self.act == "silu" and self.out == "geglu"
+            self.out in ("bf16", "bfp16", "geglu", "vt", "ds", "gelu", "rope", "rope2", "prod")
+        assert self.act == "gelu" or self.act == "silu" and self.out in ("geglu", "gelu")
         assert self.out != "prod" or self.m == 64 and self.ntile == 1 and self.stats is None and not self.conv
-        assert self.qkn is None or self.out == "rope"
+        assert self.qkn is None or self.out in ("rope", "rope2")
         assert self.out != "ds" or self.rc and self.rstep == 2 and self.stats is None and self.res is None
         assert self.out != "rope" or self.res is not None and self.m == 64 and self.ntile == 1 and self.stats is None \
             and not self.conv
+        assert not self.packed or self.out == "bf16" and self.N == 320 and self.tsplit == 1 and self.res is None
+        assert self.out != "rope2" or self.res is not None and self.m == 16 and self.stats is None and not self.conv \
+            and self.qkn is not None and (self.npo or self.N // 320) % 2 == 0 and self.p0 % 2 == 0
         assert self.tsplit in (1, 2, 4) and self.ntile % self.tsplit == 0 and (self.tsplit == 1 or self.out == "bf16")
         self.npass = self.N * self.tsplit // 320
         self.nt = self.ntile // self.tsplit  # (a core's tiles)
@@ -203,7 +214,7 @@ class Gemm:
         self.nres = -(-self.m * 160 // D.A_OBJ) if self.res is not None else 0
         self.aobj = self.nch if self.conv else -(-self.nkt * self.m // 128)  # (A objects of a pass's k-tiles)
         assert self.npass <= 16 and self.y_np >= self.np + self.junk
-        ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "gelu": self.N // 8, "rope": self.N // 8,
+        ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "gelu": self.N // 8, "rope": self.N // 8, "rope2": self.N // 8,
                   "geglu": self.N // 16}.get(self.out, 0) * \
             self.y_np * L.PANEL or (self.N // 80 * 5760 if self.out == "prod" else 0) or \
             self.N // 80 * (1 if self.out == "ds" else self.ntile) * L.ct_bytes(self.m)
@@ -212,11 +223,18 @@ class Gemm:
         # the second, the longer)
         assert self.conv or self.x + walk * 8 * self.x_np * L.PANEL <= 512 * 1024, \
             "the A objects' walk past the memtile (an over-read hangs)"
-        nres_obj = 1 if self.out == "rope" else self.N // 80 * self.ntile  # (the residual's C-tile objects)
+        nres_obj = 1 if self.out == "rope" else self.ntile if self.out == "rope2" else self.N // 80 * self.ntile  # (the
+        # residual's C-tile objects)
         assert self.res is None or self.res + (nres_obj - 1) * L.ct_bytes(self.m) + self.nres * D.A_OBJ <= 512 * 1024, \
             "the residual's last objects past the memtile"
         assert self.stats != "gn" or self.gsize, "a GroupNorm's group size"
         assert self.stats != "ln" or not self.stf or self.nt == 1, "a LayerNorm record over ops of one tile"
+
+    @property
+    def packed_block(self) -> int:
+        """Bytes between the packed output's blocks (``packed``: a block's tiles m x 160 bytes apart, then a chunk's
+        padding)."""
+        return self.ntile * self.m * 160 + L.ct_bytes(self.m) - self.m * 160
 
     def ch0(self, row: int) -> int:
         """Row ``row``'s first output channel in the statistics' channel space."""
@@ -410,7 +428,8 @@ class Gemm:
         """Row ``row``'s command slot (Q bytes); bias: (N,) or None (a conv's: its bias + the time bias)."""
         cmd = np.zeros(D.Q // 4, np.int32)
         om = {"bf16": K.O_BF16, "bfp16": K.O_BFP16, "geglu": K.O_GEGLU, "vt": K.O_VT, "ds": K.O_DS,
-              "gelu": K.O_GELU, "rope": K.O_ROPE, "prod": K.O_GELU}[self.out]  # (prod: role d's code at GELU's place)
+              "gelu": K.O_GELU, "rope": K.O_ROPE, "rope2": K.O_ROPE, "prod": K.O_GELU}[self.out]  # (prod: role d's code at
+        # GELU's place; SiLU (act "silu"): role r's)
         st = {None: K.S_NONE, "gn": K.S_GN, "ln": K.S_LN}[self.stats]
         cmd[[K.C_KIND, K.C_M, K.C_NTILE, K.C_NPASS, K.C_NKT, K.C_NRES, K.C_OUT, K.C_STATS, K.C_STF]] = (
             K.K_GEMM, self.m, self.nt, self.npo, self.nkt, self.nres, om, st, self.stf)
@@ -423,9 +442,10 @@ class Gemm:
             assert K.C_BIAS * 4 + self.npo * 160 <= K.C_WALKS * 4
             cmd[K.C_WALKS:K.C_PATS + 14] = mac_walks(self.m)
         if self.qkn is not None:
-            cmd[[K.C_QKN, K.C_INVN, K.C_EPS]] = 1, _f32(1.0 / self.qkn_n), _f32(self.qkn_eps)
-            w = np.asarray(self.qkn, np.float32).reshape(80).astype(bfloat16)
-            cmd[K.C_QKW:K.C_QKW + 40] = w.view(np.int32)
+            two = self.out == "rope2"
+            cmd[[K.C_QKN, K.C_INVN, K.C_EPS, K.C_ROPE2]] = not two, _f32(1.0 / self.qkn_n), _f32(self.qkn_eps), two
+            w = np.asarray(self.qkn, np.float32).reshape(160 if two else 80).astype(bfloat16)
+            cmd[K.C_QKW:K.C_QKW + w.size // 2] = w.view(np.int32)
         if self.conv:
             cmd[[K.C_CONV, K.C_NCH, K.C_R, K.C_ROT, K.C_TPAR]] = self.conv, self.nch, self.R, self.R == 2, self._tpar(row)
             cmd[K.C_CALLS:K.C_PHASE + 24] = self.conv_words()
@@ -559,9 +579,10 @@ class Gemm:
                             out.append({"addr": self.x + t * TP * 4, "nwords": n,
                                         "dims": [(36, 1), (8, XN * 18), (m // 16, 36), (0, 8 * XN * 18)],
                                         **({"iteration": (TP, self.nt)} if it else {})})
-                    if self.out == "rope":  # (the tile's cos | sin: every pass's)
+                    if self.out in ("rope", "rope2"):  # (the tile's cos | sin: every pass's; rope2: [A | B] tables)
                         ow = self.nres * D.A_OBJ // 4
-                        out.append({"addr": self.res + t * ct, "nwords": ow, "dims": _contig(ow)})
+                        out.append({"addr": self.res + t * (ROPE2_TAB if self.out == "rope2" else ct), "nwords": ow,
+                                    "dims": _contig(ow)})
                     elif self.res is not None:  # (the object (sl npass + P0 + p, t))
                         ow = self.nres * D.A_OBJ // 4
                         it_res = (ct // 4, self.nt) if NPO == 1 else (NT * ct // 4, NPO)
@@ -572,7 +593,8 @@ class Gemm:
                     sends.append(MemTask(chain(self.tiles(r)[0], True), repeat=self.nt * NPO))
                 else:
                     sends += [MemTask(chain(t, False), repeat=NPO) for t in self.tiles(r)]
-            if self.out in ("bfp16", "vt", "gelu", "rope"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token panel (m / 8) t + rb)
+            if self.out in ("bfp16", "vt", "gelu", "rope", "rope2"):  # (pass p: [rb][cb] -> kb (r npass + p) 10 + cb, token
+                # panel (m / 8) t + rb)
                 data = _panel_recv(self.y + (r * self.npass + P0) * 10 * YN * L.PANEL, YN, m // 8, 10, NPO)
                 data["iteration"] = (TP, NT)
             elif self.out == "prod":  # (pass p: 5760 B [rb][5 cb][64] bf16 (and a chunk's padding) at (r npass + p))
@@ -584,6 +606,9 @@ class Gemm:
                 # C-tile object (r npass + p), its row t: the second call's data over the first's chunk padding)
                 data = {"addr": self.y + (r * self.npass + P0) * ct, "nwords": NT * NPO * 1440,
                         "dims": [(720, 1), (2, 640), (NPO, ct // 4), (0, 1280)]}
+            elif self.packed:  # (row r's block r of tile t at r packed_block + t m 160: its chunks' padding over the
+                # next tile's start, before that tile's data lands)
+                data = {"addr": self.y + r * self.packed_block, "nwords": ct // 4, "iteration": (m * 40, NT)}
             else:  # (pass p: the C-tile object (sl npass + p, t))
                 data = {"addr": self.y + ((sl * self.npass + P0) * NT + self.tiles(r)[0]) * ct, "nwords": NPO * ct // 4,
                         "dims": _contig(ct // 4) + [(NPO, NT * ct // 4)], "iteration": (ct // 4, self.nt)}
@@ -602,8 +627,9 @@ class Gemm:
         wb = self.npo * self.nkt * D.Q
         runs = [(img, D.Q + wb)] + [(img + D.Q, wb)] * (self.nt - 1 if wb else 0) if wimg is None else \
             [(img, D.Q)] + [(wimg, wb)] * self.nt
-        role = ("d" if self.out == "prod" or self.act == "silu" else "ln" if self.out in ("geglu", "gelu") else
-                "r" if self.out == "rope" else None)  # (the epilogues' pages)
+        role = ("d" if self.out == "prod" or self.act == "silu" and self.out == "geglu" else
+                "r" if self.out in ("rope", "rope2") or self.act == "silu" else
+                "ln" if self.out in ("geglu", "gelu") else None)  # (the epilogues' pages)
         return RowOps(runs=runs, b_objects=1 + self.nt * self.npo * self.nkt, parity=self.m == 64 and self.nkt > 0,
                       role=role)
 
@@ -1003,3 +1029,211 @@ class DwConv:
                 "dims": [(18, 1), (4, S), (2, 4 * S), (0, 8 * S)]}
 
     MASK_BYTES = 4 * 2 * 4 * 72  # (a column's masks in DDR: the 4 rows' copies)
+
+
+@dataclass
+class StripConv:
+    """A depthwise conv of strips (``core``'s K_DW1, role d: LFM3-Audio's causal 1-D conv and its downsampler's stride-2
+    3 x 3 convs): per core row r one 80-channel block (``blocks[r]``) of ``nobj`` A objects, the row's tap words
+    (B slot: [tap][80] bf16, then the bias [80]), its output panels (8 token panels from ``tp0`` of the panel tensor ``y``,
+    ``y_np`` token panels a kb; the block's kb 10 block). mode 1: half h of object o = row block 2 o + h, its strip
+    [10 rows][80] bf16 (row j + s for token j and tap s: ``off`` 0, 80, 160) and its C row block at ``core.DW1_C``; y =
+    C conv. mode 2: object o = row block o, half h its channels 40 h .., a strip of ``core.DW1_STRIP`` bf16 (the
+    taps' element offsets ``off``, tokens 80 elements apart), SiLU'd first where ``silu``; y = conv + b."""
+
+    mode: int
+    y: int
+    off: tuple[int, ...]
+    blocks: tuple[int, ...] = (0, 1, 2, 3)
+    nobj: int = 4
+    tp0: int = 0
+    y_np: int = 8
+    silu: bool = False
+
+    def __post_init__(self) -> None:
+        assert self.mode in (1, 2) and len(self.off) <= 9 and len(self.blocks) == ROWS
+        assert self.nobj == (4 if self.mode == 1 else 8)  # (8 row blocks: the output tile)
+
+    def command(self) -> np.ndarray:
+        cmd = np.zeros(D.Q // 4, np.int32)
+        cmd[[K.C_KIND, K.C_NOBJ, K.C_DWM, K.C_NTAP, K.C_DWS]] = K.K_DW1, self.nobj, self.mode, len(self.off), self.silu
+        cmd[K.C_TOFF:K.C_TOFF + len(self.off)] = self.off
+        return cmd.view(np.uint8)
+
+    def taps(self, w: np.ndarray, bias: np.ndarray | None, block: int) -> np.ndarray:
+        """The B slot of channels [80 block, +80) (zero past w's) of taps w (C, ntap) and the bias (C,) (or none)."""
+        out = np.zeros(D.Q // 2, bfloat16)
+        nt = len(self.off)
+        t = np.zeros((nt + 1, 80), np.float32)
+        sel = np.asarray(w, np.float32)[80 * block:80 * block + 80]
+        t[:nt, :sel.shape[0]] = sel.T
+        if bias is not None:
+            b = np.asarray(bias, np.float32)[80 * block:80 * block + 80]
+            t[nt, :b.shape[0]] = b
+        out[:t.size] = t.reshape(-1).astype(bfloat16)
+        return out.view(np.uint8)
+
+    def image(self, w: np.ndarray, bias: np.ndarray | None) -> np.ndarray:
+        """The rows' [command | taps] pairs (``row_ops``' image)."""
+        return np.concatenate([np.concatenate([self.command(), self.taps(w, bias, self.blocks[r])]) for r in range(ROWS)])
+
+    def recvs(self) -> dict[int, list[MemTask]]:
+        return {r: [MemTask([_panel_recv(self.y + (10 * self.blocks[r] * self.y_np + self.tp0) * L.PANEL, self.y_np, 8,
+                                         10, 1)])] for r in range(ROWS)}
+
+    def row_ops(self, img: int) -> dict[int, RowOps]:
+        """img: the device address of the rows' [command | taps] pairs (2 Q bytes each)."""
+        return {r: RowOps(runs=[(img + 2 * r * D.Q, 2 * D.Q)], b_objects=2, parity=False, role="d") for r in range(ROWS)}
+
+    STRIP1 = 1600  # (mode 1: a token panel's strip [10 rows][80] bf16)
+    STAGE1 = ROWS * 8 * STRIP1  # (mode 1: the staging of an op's strips, [row][panel 8][strip])
+
+    def sends1(self, stage: int, c: int) -> dict[int, list[MemTask]]:
+        """mode 1: per core row its 8 halves [strip (the staging at ``stage``) | C row block (the C tiles at ``c``:
+        [block][``layout.ct_bytes(64)``], the row's block's row block j) | what follows] (A_OBJ / 2 bytes each)."""
+        ct, n1 = L.ct_bytes(64), self.STRIP1 // 4
+        return {r: [MemTask([{"addr": stage + r * 8 * self.STRIP1, "nwords": n1, "iteration": (n1, 8)},
+                             {"addr": c + self.blocks[r] * ct, "nwords": D.A_OBJ // 8 - n1, "iteration": (320, 8)}],
+                            repeat=8)] for r in range(ROWS)}
+
+    def fill1(self, stage: int, g: int, channels: int, pstride: int) -> MemTask:
+        """mode 1: the staging's strips from a DDR image of rows [position][channels] bf16: ``g`` the device address of
+        token panel 0's first strip row (2 before its first token) at block 0, the panels' first rows ``pstride`` rows
+        apart (the interleaved layout: 64); per core row (an execution) its block's 10 rows of each panel."""
+        rw, bs = channels // 2, self.blocks[1] - self.blocks[0]
+        assert all(self.blocks[r + 1] - self.blocks[r] == bs for r in range(ROWS - 1))
+        n = 8 * self.STRIP1 // 4
+        return MemTask([{"addr": stage, "nwords": n, "iteration": (n, ROWS)}], repeat=ROWS,
+                       ddr=(g + 160 * self.blocks[0], 8 * self.STRIP1, (40, 10, rw, pstride * rw), (40 * bs, ROWS)))
+
+
+    STAGE2 = ROWS * 8 * D.A_OBJ  # (mode 2: the staging of an op's objects, [row][object 8][A_OBJ])
+
+    @staticmethod
+    def taps2(lines: int) -> tuple[int, ...]:
+        """mode 2's tap offsets of a 3 x 3 stride-2 conv (tap 3 a + b: weights [C][3][3] flattened), the strip [3][17][40]
+        of 3 lines of the input across the 8 outputs' axis (a line: 17 positions from 2 o - 1 of the outputs o .. o + 7):
+        the lines are the taps' first index a (``lines`` 0) or their second b (1), the positions the other."""
+        return tuple((a * 680 + b * 40) if lines == 0 else (b * 680 + a * 40) for a in range(3) for b in range(3))
+
+    def fill2(self, stage: int, src: int, r: int, *, pos: int, line: int, step: int) -> MemTask:
+        """mode 2: core row r's 8 objects of the staging from a DDR image of positions of 256 (or more) bf16 channels:
+        ``src`` the device address of object 0's first strip element (line 0, position 0, channel 0), its positions
+        ``pos`` words apart, its 3 lines ``line`` words apart, the objects ``step`` words apart; per position the row's
+        block's 80 channels, 40 into each half (block 3 of 256: 64 channels of the next position, garbage the next GEMM
+        does not read)."""
+        o = stage + r * 8 * D.A_OBJ
+        return MemTask([{"addr": o, "nwords": 3 * 17 * 40, "dims": _dims((20, 1), (2, D.A_OBJ // 8), (17, 20), (3, 340)),
+                         "iteration": (D.A_OBJ // 4, 8)}],
+                       repeat=8, ddr=(src + 160 * self.blocks[r], 3 * 17 * 160, (40, 17, pos, line), (step, 8)))
+
+    def sends2(self, stage: int) -> dict[int, list[MemTask]]:
+        """mode 2: per core row its 8 objects (one task)."""
+        return {r: [MemTask([{"addr": stage + r * 8 * D.A_OBJ, "nwords": 8 * D.A_OBJ // 4}])] for r in range(ROWS)}
+
+
+@dataclass
+class WinAttention:
+    """Sliding-window attention of window pairs on the d-160 core (role s, ``core``'s C_QMASK): LFM3-Audio's encoder (8
+    query heads, 4 KV heads, heads of 96 in 160). A band's rows in the interleaved layout (column c's token panel j: rows
+    64 j + 8 c ..): window pair j (64 rows: window 2 j in columns 0-3, 2 j + 1 in 4-7, one query panel per column) is a
+    unit. Core row r runs KV head r: per unit its query pair (query heads 2 r, 2 r + 1 of the column's panel j: the
+    query object's first half, ``q``'s panels [kb][np]) against the unit's 4 key groups on the B stream ([own, previous]
+    of window 2 j, then of 2 j + 1: the K / V^T image ``kv_image``'s unit), each column's per-query masks (the object's
+    second half: ``masks``, at memtile ``mask``) keeping its window's two groups (own first: the diagonal key sets the
+    reference max), outputs into the panels ``o`` (the same layout as q)."""
+
+    q: int
+    o: int
+    mask: int
+    kv: int
+    units: int = 8
+    np: int = 8
+
+    ND, GROUPS = 20, 4
+
+    def command(self) -> np.ndarray:
+        cmd = np.zeros(D.Q // 4, np.int32)
+        cmd[[K.C_KIND, K.C_NUNIT, K.C_NQP, K.C_NG, K.C_NK, K.C_ND, K.C_NKP, K.C_RAISE, K.C_QMASK]] = (
+            K.K_ATTN, self.units, 2, self.GROUPS, 32, self.ND, 4, 1, 1)
+        return cmd.view(np.uint8)
+
+    @staticmethod
+    def unit_bytes() -> int:
+        """Bytes of a unit's K / V^T groups of one KV head."""
+        return WinAttention.GROUPS * 2 * D.Q
+
+    @staticmethod
+    def kv_image(units: int) -> int:
+        """Bytes of a layer's K / V^T image: [KV head 4][unit units + 1][group 4][K | V^T] (the last unit: where the
+        dispatch's last group goes as the next one's previous group, ``kv_drains``)."""
+        return ROWS * (units + 1) * WinAttention.unit_bytes()
+
+    def col_ops(self) -> ColOps:
+        """Per core row its units' query objects (the pair's 32 d-blocks: head 2 r's 20 and what follows; then the
+        column's masks of the unit and what follows) and outputs ([qp 2][d-block 20] -> kb 20 (2 r + qp) + db)."""
+        co = ColOps()
+        kb = self.np * 18  # (words of a kb)
+        for r in range(ROWS):
+            h0 = 2 * r * self.ND * kb
+            co.sends[r] = [MemTask([{"addr": self.q + 4 * h0, "nwords": D.A_OBJ // 8, "dims": _dims((18, 1), (2, self.ND * kb), (32, kb)),
+                                     "iteration": (18, self.units)},
+                                    {"addr": self.mask, "nwords": D.A_OBJ // 8, "iteration": (32, self.units)}],
+                                   repeat=self.units)]
+            co.recvs[r] = [MemTask([{"addr": self.o + 4 * h0, "nwords": 2 * self.ND * 18,
+                                     "dims": _dims((18, 1), (self.ND, kb), (2, self.ND * kb)), "iteration": (18, self.units)}],
+                                   repeat=self.units)]
+        return co
+
+    def row_ops(self, cmd: int, unit0: int) -> dict[int, RowOps]:
+        """The rows' B streams: the command, then KV head r's groups of units unit0 .. + units (``kv``: the image)."""
+        ub, hb = self.unit_bytes(), self.kv_head_bytes
+        return {r: RowOps(runs=[(cmd, D.Q), (self.kv + r * hb + unit0 * ub, self.units * ub)],
+                          b_objects=1 + self.units * self.GROUPS * 2, parity=True, role="s") for r in range(ROWS)}
+
+    kv_head_bytes: int = 0  # (a KV head's units in the image: ``kv_image`` / 4)
+
+    @staticmethod
+    def masks(col: int, units: int, start: bool = False) -> np.ndarray:
+        """Column ``col``'s per-query masks of ``units`` units ([unit][group 4][key panel 4][2] uint32: bit 8 q + k of word
+        h: query 4 h + q of the column's panel, key 8 kp + k of the group): its window's own group (keys up to the query's
+        row) and previous one (keys after it: the window of 32); start: unit 0's previous group masked (the stream's
+        first rows)."""
+        out = np.zeros((units, 4, 4, 2), np.uint32)
+        w, i0 = col // 4, 8 * (col % 4)
+        for kp in range(4):
+            for h in range(2):
+                own = prev = 0
+                for q in range(4):
+                    for k in range(8):
+                        i, key = i0 + 4 * h + q, 8 * kp + k
+                        own |= (key <= i) << (8 * q + k)
+                        prev |= (key > i) << (8 * q + k)
+                out[:, 2 * w, kp, h], out[:, 2 * w + 1, kp, h] = own, prev
+        if start:
+            out[0, 2 * w + 1] = 0 if w == 0 else out[0, 2 * w + 1]
+        return out
+
+    def kv_drains(self, k: int, vt: int, col: int, band: int, image: int) -> ColOps:
+        """Column ``col``'s drains of band ``band``'s keys (its panels j: group g = 2 j + col // 4, key panel col % 4):
+        K from the panels at ``k``, V^T from those at ``vt`` ([kb][np], 20 kb a KV head) into both slots of each group
+        (even g = 2 j: unit j's groups 0 and 3; odd: unit j's group 2 and unit j + 1's group 1) of each KV head; image:
+        the layer's K / V^T image (device address)."""
+        kb, ub, hb = self.np * 18, self.unit_bytes(), self.kv_head_bytes
+        kp, odd = col % 4, col // 4
+        dests = [(2, 0), (1, 1)] if odd else [(0, 0), (3, 0)]  # ((group, unit offset) of the two slots)
+        co = ColOps()
+        for g, du in dests:
+            slot = image + (band * self.units + du) * ub + g * 2 * D.Q
+            # (K: the slot's key block kp // 2, panel kp % 2 of each d-block pair; V^T: its key panel kp of each
+            # d-block pair row: ``layout.kv_slots``)
+            co.drains.append(MemTask([{"addr": k, "nwords": self.units * self.ND * 18,
+                                       "dims": _dims((18, 1), (self.ND, kb), (self.units, 18)), "iteration": (self.ND * kb, ROWS)}],
+                                     repeat=ROWS, ddr=(slot + (kp // 2 * 40 + kp % 2) * L.PANEL, self.units * self.ND * L.PANEL,
+                                                      (18, self.ND, 36, ub // 4), (hb // 4, ROWS))))
+            co.drains.append(MemTask([{"addr": vt, "nwords": self.units * self.ND * 18,
+                                       "dims": _dims((18, 1), (2, kb), (self.ND // 2, 2 * kb), (self.units, 18)),
+                                       "iteration": (self.ND * kb, ROWS)}],
+                                     repeat=ROWS, ddr=(slot + D.Q + 2 * kp * L.PANEL, self.units * self.ND * L.PANEL,
+                                                      (36, self.ND // 2, 144, ub // 4), (hb // 4, ROWS))))
+        return co
