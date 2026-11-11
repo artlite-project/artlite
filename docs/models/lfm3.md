@@ -177,6 +177,39 @@ band. Live, the band in progress runs again as each 0.96 s arrives. Its rows are
 encoder (llama.cpp's ~2.4%), and the language model teacher-forced over a transcript stays as close to llama.cpp's
 (KL 0.0002) as with llama.cpp's own rows.
 
+Word error rates on LibriSpeech (200 utterances each of test-clean and test-other, Whisper's English normalizer),
+through each runtime's server:
+
+| | test-clean | test-other |
+|---|---|---|
+| Artlite (NPU), Q4_K_M | 2.09% | 4.51% |
+| Artlite (NPU), Q4_0 | 2.11% | 4.87% |
+| llama.cpp, CPU / iGPU (Vulkan), Q4_K_M | 2.14% / 2.17% | 4.51% / 4.46% |
+| live: Artlite (NPU) | 3.00% | 7.50% |
+| live: llama.cpp (Vulkan) | 3.02% | 7.45% |
+| whisper.cpp, Whisper base.en | 4.00% | 8.97% |
+| FastFlowLM 1.0.9 (NPU), Whisper large-v3-turbo | 4.98% | 7.53% |
+
+A transcription's time, and its energy (the SoC's power above a ~18 W idle), through each runtime's server (Strix
+Halo, HTTP included, warm):
+
+| a transcription of | 30 s of speech | 179 s (one prompt) |
+|---|---|---|
+| Artlite (NPU) | 2.2 s, 21 J | 13.0 s, 120 J |
+| llama.cpp, CPU (16 threads) | 1.9 s, 73 J | 10.6 s, 362 J |
+| llama.cpp, iGPU (Vulkan) | 1.0 s, 32 J | 6.2 s, 189 J |
+| whisper.cpp base.en, CPU / iGPU (Vulkan) | 0.63 s, 18 J / 0.33 s, 7 J | 2.9 s, 90 J / 1.5 s, 40 J |
+| FastFlowLM 1.0.9 (NPU), Whisper large-v3-turbo | 6.1 s, 54 J | 26 s, 200 J |
+
+Most of a transcription is the language model writing the text, a decode step per token (~21 ms on the NPU, the
+reading of its weights; the encoder takes ~18 ms per 41 s of audio, the prompt ~0.1 s): the iGPU writes faster, the NPU
+with two thirds of its energy (a third of the CPU's) and leaves the CPU and the iGPU free.
+
+Live (the 179-s chapter paced as a microphone's, through artlite-server's websocket; `artlite-cli --live realtime`
+alike): each 0.96 s of audio takes the NPU ~170 ms (the encoder's band ~27 ms, then its 12 rows and its text as decode
+steps), busy 17% of the audio's time, with 4% of a CPU core; a chunk's text comes ~0.18 s after its audio (llama.cpp's
+live mode on the iGPU: ~0.05 s). As fast as it goes, the 179 s take 32 s.
+
 ## d1-2B (decision model)
 
 LiquidAI's d1-2B is a decision model on LFM3's trunk: typed answers to questions about a state (a choice, a score, a

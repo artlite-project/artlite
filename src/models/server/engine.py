@@ -307,19 +307,18 @@ class Engine:
                 raise
         return self.run(run)
 
-    def hold(self, seq: Sequence) -> None:
-        """(on the worker) The device holds ``seq`` (a live stream's text sequence): what the prompt cache keeps of it,
-        the rest run (requests ran between the stream's chunks)."""
+    def hold(self, ids: Sequence) -> int:
+        """(on the worker) A live stream's text sequence and its next chunk's tokens: the device where they continue
+        from (``PromptCache.prepare``: as the last chunk left it, else, when requests ran between the stream's chunks,
+        what the prompt cache keeps), the tokens it holds."""
         if self._dirty:
             self.npu.reset()
             self._dirty = False
-        k, _, _ = self.cache.prepare(seq)
-        if k < len(seq):
-            self.npu.prompt(seq[k:])
+        return self.cache.prepare(ids)[0]
 
     def ran(self, seq: Sequence) -> None:
-        """(on the worker) After a live stream's chunk: the device holds ``seq`` (a checkpoint at its end)."""
-        self.cache.checkpoint(seq)
+        """(on the worker) After a live stream's chunk: the device holds ``seq`` (saved by the prompt cache when a
+        request displaces it, as a conversation)."""
         self.cache.ran(seq)
 
     def readouts(self, inputs: list[list[int]], rows: list[np.ndarray], *, cache_prompt: bool = True,

@@ -127,6 +127,13 @@ picture new; energy a question above a 16.5 W idle, both in one session):
 With a picture the NPU answers 1.4-2.3x sooner than the iGPU at 2.8-3.8x less energy above idle; several questions
 about one picture 2.5-9x sooner at 4-13x less.
 
+## Speech: LFM3-Audio
+
+A transcription is mostly decode (the language model writing the text), so the iGPU is ~2x faster (30 s of speech:
+1.0 s against 2.2 s) while the NPU takes two thirds of its energy (21 J against 32 J above idle) and a third of the
+CPU's. Live transcription is the NPU's case: each 0.96 s of audio keeps it busy ~170 ms (17% of the time) with 4% of
+a CPU core, the iGPU and the CPU left free ([LFM3-Audio](models/lfm3.md#lfm3-audio-2b-speech)).
+
 ## Candidates to explore
 
 So the NPU can win where compute rather than DRAM bandwidth bounds the work, or where watts or a free GPU matter more
@@ -135,7 +142,7 @@ than speed. Not tried yet, ranked by expected value per effort:
 | | candidate | why the NPU could win |
 |---|---|---|
 | 1 | Prefill on the NPU, decode on the iGPU | each device on its strength, overlapped in a server |
-| 2 | Multimodal encoders (vision and audio projectors, Whisper) | ViT and conformer encoders are compute-bound |
+| 2 | Multimodal encoders beyond the vision and speech encoders that run (Whisper, video) | ViT and conformer encoders are compute-bound |
 | 3 | Image generation (UNet, DiT) | many compute-bound steps |
 | 4 | Diffusion LLMs (parallel block decoding) | a block of tokens per weight pass turns decode into prefill |
 | 5 | Batched decode, parallel sampling | the NPU's spare compute in decode |

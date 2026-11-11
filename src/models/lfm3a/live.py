@@ -152,11 +152,12 @@ class LiveAsr:
     """Live ASR on an LFM3-Audio model (module docstring): ``start`` a stream, ``push`` samples, ``commit``, ``end``;
     each returns the text that came out meanwhile (a new line where the text restarted).
 
-    ``sync``: makes the device hold a sequence (the server's prompt cache: other requests run between chunks) and is
-    told what the device holds after a chunk; without it the stream owns the language model's caches."""
+    ``sync``: (``hold``, ``ran``) - hold(the stream's text sequence with the next chunk's tokens) puts the device where
+    they continue from (the server's prompt cache: other requests run between chunks) and returns the tokens it holds,
+    ran(sequence) tells what the device holds after a chunk; without it the stream owns the language model's caches."""
 
     def __init__(self, model: object, npu: NpuModel, encoder: Encoder, *,
-                 sync: tuple[Callable[[Sequence], None], Callable[[Sequence], None]] | None = None):
+                 sync: tuple[Callable[[Sequence], int], Callable[[Sequence], None]] | None = None):
         self.model, self.npu = model, npu
         meta = model.gguf.meta
         if "tokenizer.chat_template.asr" not in meta:
@@ -222,13 +223,15 @@ class LiveAsr:
             self.seq_rows = 0
             if self.sent:
                 out += "\n"
+        full = self.seq + self.closing + host.clip_sequence(rows) + ([self.mixed_end] if final else [])
         if self._sync is not None:
-            self._sync[0](self.seq)
-        elif not len(self.seq):
-            npu.reset()
-        feed = self.closing + host.clip_sequence(rows) + ([self.mixed_end] if final else [])
-        logits = npu.forward(feed)
-        self.seq = self.seq + feed
+            kept = self._sync[0](full)
+        else:
+            kept = len(self.seq)
+            if not kept:
+                npu.reset()
+        logits = npu.forward(full[kept:])
+        self.seq = full
         self.closing = []
         self.started, self.seq_rows, self.chunks = True, self.seq_rows + n, self.chunks + 1
         penalties = Penalties(self.sampling)

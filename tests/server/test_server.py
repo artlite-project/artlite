@@ -1034,6 +1034,30 @@ def test_realtime(monkeypatch: pytest.MonkeyPatch, fake: tuple) -> None:
         assert ev["type"] == "error" and "does not support" in ev["error"]["message"]
 
 
+def test_live_hold() -> None:
+    """``Engine.hold`` / ``ran`` around a live stream's chunks: the device's own sequence runs nothing again; after a
+    request displaced it, the prompt cache's copy (a sequence of more than MIN_SAVE positions) comes back."""
+    model, npu, engine = make(audio=True, capacity=4096, exact=True)
+    assert engine.wait_ready(5)
+    words = model.tokenizer.encode(" ".join(f"w{i % 50}" for i in range(700)))
+
+    def chunk(prev: list[int], seq: list[int]) -> None:  # (seq: prev and the chunk's tokens)
+        npu.forward(seq[engine.hold(seq):])
+        engine.ran(seq)
+
+    run = lambda f: engine.live(f).result(10)
+    run(lambda: chunk([], words[:600]))
+    n = len(npu.calls)
+    run(lambda: chunk(words[:600], words[:650]))
+    assert npu.calls[n:] == [("forward", 50)] and npu.seq == words[:650]
+    with TestClient(app_of(engine)) as client:
+        assert chat(client, "something else").status_code == 200
+    n = len(npu.calls)
+    run(lambda: chunk(words[:650], words[:700]))
+    assert npu.calls[n:][-1] == ("forward", 50) and not any(c[0] == "prompt" for c in npu.calls[n:])
+    assert npu.seq == words[:700]
+
+
 def test_audio_refused(fake: tuple) -> None:
     """A model without a speech encoder refuses audio parts and transcriptions."""
     client = fake[3]

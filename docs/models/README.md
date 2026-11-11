@@ -1,7 +1,7 @@
 # Models
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
-[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, d1-2B)](lfm3.md),
+[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, LFM3-Audio-2B, d1-2B)](lfm3.md),
 [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
