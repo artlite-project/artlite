@@ -66,7 +66,8 @@ SMOKE = (
     "prefill/test_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
     "vision/test_ops.py::test_gemm[16-2-640-640-True-bf16]", "vision/test_ops.py::test_conv[16-1-640-640-True]",
     "vision/test_ops.py::test_norm[gnsilu-64-640-2-4]", "vision/test_ops.py::test_attention[16-80-2-2-False-8-False]",
-    "vision/test_ops.py::test_gemm_rope", "vision/test_ops.py::test_attention_dense[5-0.83]", "vision/test_weights.py",
+    "vision/test_ops.py::test_gemm_rope", "vision/test_ops.py::test_attention_dense[5-0.83-16-0]",
+    "vision/test_weights.py",
     "qwen3vl/test_ref.py::test_sizes", "qwen3vl/test_encoder.py::test_layout[64-64]", "qwen3vl/test_encoder.py::test_pieces",
     "sd15/test_vae.py::test_conv[512-128-128]",
 )
