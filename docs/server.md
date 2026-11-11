@@ -34,6 +34,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | a reranker's scores of documents (with `--rerank`) |
 | `/classify` | a classifier's label probabilities (vLLM's shape; with `--rerank`) |
 | `/v1/systemone` | a decision model's answers to questions about a state ([below](#decisions)) |
+| `/v1/audio/transcriptions`, `/audio/transcriptions` | a transcription of an audio file (LFM3-Audio: [below](#speech)) |
+| `/v1/realtime?intent=transcription` | live transcription over a websocket (OpenAI's realtime API, as llama-server: [below](#speech)) |
 
 Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
 sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
@@ -47,8 +49,9 @@ drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
 [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images); the decision
 models d3 and d1: [below](#decisions)) come as a chat message's `image_url` parts of data URIs, as llama-server takes
-them; the web UI attaches them. Not provided: infill,
-`/metrics`, LoRA, model downloads; their routes answer 501.
+them; the web UI attaches them; audio (LFM3-Audio: [below](#speech)) as `input_audio` parts or `audio_url` data URIs.
+Not provided: infill, speech output (`/v1/audio/speech`, a chat's `modalities: ["audio"]`), `/metrics`, LoRA, model
+downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
@@ -237,6 +240,31 @@ questions in a sequence they match the runner's, which differ from each question
 probability). A sequence is one prefill chunk of at most 4096 tokens (a question that would take it further starts
 the next one). A choice's `confidence` is its probability and a score is the median level (d1's API).
 
+## Speech
+
+LFM3-Audio-2B started with its mmproj (`--mmproj LiquidAI/LFM3-Audio-2B-GGUF/mmproj-LFM3-Audio-2B-Q8_0.gguf`; the
+router pairs it with the model of its directory) takes audio as llama-server does
+([the model](models/lfm3.md#lfm3-audio-2b-speech)):
+
+- `/v1/audio/transcriptions` (and `/audio/transcriptions`): OpenAI's multipart form, `file` (WAV, MP3, FLAC, Ogg
+  Vorbis), `language` (a code or a name; without it the model tells), `prompt` (text before the audio in the user
+  message), `response_format` (`json`, `text`), `temperature`, `max_tokens` (default 64 + 8 per second of audio: a clip
+  of minutes can loop), `stream` (`transcript.text.delta` events, then `transcript.text.done`). The request is a chat
+  of the model card's ASR prompt ("Perform ASR in English."). The `openai` package's `audio.transcriptions.create`
+  works unchanged.
+- Chat messages take `input_audio` parts (`{"data": base64, "format": "wav"}`) and `audio_url` parts of data URIs, as
+  images: the encoder runs on the NPU worker between requests, a clip's rows kept for a conversation's next turns.
+- `/v1/realtime?intent=transcription`: live transcription (English) over a websocket, llama-server's events. The
+  client appends PCM16 audio at 16 kHz (`input_audio_buffer.append`); every 0.96 s of it gives the text it holds
+  (`conversation.item.input_audio_transcription.delta`); `input_audio_buffer.commit` pads the audio with silence to
+  the next 0.96 s, then completes the item (`...completed` with its transcript), `"final": true` ends the stream.
+  The stream's chunks run between other requests (its text sequence comes back through the prompt cache). The text
+  restarts on a new line after at most 30 s (as the model was trained).
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+```
+
 ## Requests
 
 With `-m`, the model loads after the server starts; until then the API answers 503 `Loading model`, which the UI
@@ -283,7 +311,7 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
   a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
   that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
-  before the 4x one).
+  before the 4x one; LFM3-Audio-2B: its speech encoder, `/v1/models` lists the model's `audio` input).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
@@ -439,7 +467,7 @@ Images:
 
 | option | |
 |---|---|
-| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; d3: `mmproj-vllm-d3-lite-Q8_0.gguf`; d1-2B: `mmproj-d1-2B-Q8_0.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)), pictures in decision requests ([Decisions](#decisions)) |
+| `--mmproj FILE` | the vision or speech encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; d3: `mmproj-vllm-d3-lite-Q8_0.gguf`; d1-2B: `mmproj-d1-2B-Q8_0.gguf`; LFM3-Audio-2B: `mmproj-LFM3-Audio-2B-Q8_0.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)), pictures in decision requests ([Decisions](#decisions)), audio ([Speech](#speech)) |
 | `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, d3's 64 / 1600, else 8 / 4096 for Qwen3-VL, 64 / 4096 for LFM3-VL, llama.cpp's; d1-2B 64 / 1600: its runner's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 

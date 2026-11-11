@@ -82,6 +82,35 @@ def splice(text: str, marker: str, items: list[Sequence], encode: Callable[[str]
     return seq
 
 
+def splice_media(text: str, items: dict[str, list[Sequence]], encode: Callable[[str], list[int]]) -> list[int] | Sequence:
+    """``splice`` of several markers: each occurrence of a marker of ``items`` (marker -> its sequences, in order) becomes
+    its next sequence, in the text's order (a message's images and audio clips)."""
+    items = {m: list(v) for m, v in items.items() if v}
+    if len(items) <= 1:
+        (m, v), = items.items() if items else (("", []),)
+        return splice(text, m, v, encode) if v else encode(text)
+    found = sorted((i, m) for m in items for i in _finds(text, m))
+    for m, v in items.items():
+        if len(v) != sum(1 for _, m2 in found if m2 == m):
+            raise ValueError(f"{len(v)} item(s) for {sum(1 for _, m2 in found if m2 == m)} place(s) of {m} in the text")
+    seq, at, nxt = None, 0, dict.fromkeys(items, 0)
+    for i, m in found:
+        piece = Sequence.text(encode(text[at:i]))
+        seq = piece if seq is None else seq + piece
+        seq = seq + items[m][nxt[m]]
+        nxt[m] += 1
+        at = i + len(m)
+    return seq + encode(text[at:])
+
+
+def _finds(text: str, marker: str) -> list[int]:
+    out, i = [], text.find(marker)
+    while i >= 0:
+        out.append(i)
+        i = text.find(marker, i + len(marker))
+    return out
+
+
 def load_image(src: str | bytes) -> Image.Image:
     """An image file (a path or its bytes) as RGB, turned upright by its EXIF orientation (transformers'
     ``load_image``; an alpha channel dropped; a JPEG's pixels within 3 levels of llama.cpp's stb_image)."""

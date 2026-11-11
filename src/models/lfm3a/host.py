@@ -188,6 +188,29 @@ def log_mel(samples: np.ndarray, *, dtype: type = np.float32, block: int = 4096)
 
 # -- prompts
 
+AUDIO_PARTS = ("audio", "input_audio", "audio_url")  # (a chat message's audio parts: the template's <|audio|>)
+
+
+def part_audio(part: dict) -> str | bytes | np.ndarray:
+    """The clip of a chat message's audio part: ``{"type": "audio", "audio": a file, its bytes or 16 kHz samples}``,
+    OpenAI's ``{"type": "input_audio", "input_audio": {"data": base64, "format": ...}}`` or ``{"type": "audio_url",
+    "audio_url": {"url": a data URL}}``; ValueError: none of them."""
+    import base64
+
+    from ..sequence import data_bytes
+    t = part.get("type")
+    try:
+        if t == "audio":
+            return part["audio"]
+        if t == "input_audio":
+            return base64.b64decode(part["input_audio"]["data"], validate=True)
+        if t == "audio_url":
+            v = part["audio_url"]
+            return data_bytes(v["url"] if isinstance(v, dict) else v)
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"an audio part without its clip: {e}") from None
+    raise ValueError(f"not an audio part: {t!r}")
+
 def audio_prompt(text: str, clips: list[object], encode: Callable[[str], list[int]],
                  sequence: Callable[[object], Sequence]) -> Sequence:
     """A chat prompt's text with the template's ``AUDIO`` per clip -> its tokens: each placeholder becomes the clip's

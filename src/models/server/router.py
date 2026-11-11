@@ -311,17 +311,17 @@ class Router:
         """GET /v1/models: every model with its status, and (aligned) details as llama-server's ``models``."""
         data, details = [], []
         for e in self.catalog.entries.values():
-            h, vision = e.header, e.mmproj is not None
+            h, media = e.header, e.media
             data.append({"id": e.id, "aliases": e.aliases, "tags": [], "object": "model", "owned_by": "artlite",
                          "created": int(time.time()), "path": e.path, "status": self.status(e),
-                         "architecture": {"input_modalities": ["text"] + ["image"] * vision,
+                         "architecture": {"input_modalities": ["text"] + media,
                                           "output_modalities": ["decisions" if h["decision"] else "text"]},
                          "source": e.source, "can_remove": False, "context_length": h["n_ctx_train"],
                          "meta": {"architecture": h["arch"], "n_vocab": h["n_vocab"], "n_ctx": self.n_ctx(e),
                                   "n_ctx_train": h["n_ctx_train"], "n_embd": h["n_embd"], "n_params": h["n_params"],
                                   "size": h["size"], "ftype": h["ftype"]}})
             details.append({"name": e.id, "model": e.id, "modified_at": "", "size": "", "digest": "", "type": "model",
-                            "description": "", "tags": [""], "capabilities": ["completion"] + ["multimodal"] * vision,
+                            "description": "", "tags": [""], "capabilities": ["completion"] + ["multimodal"] * bool(media),
                             "parameters": "",
                             "details": {"parent_model": "", "format": "gguf", "family": h["arch"],
                                         "families": [h["arch"]], "parameter_size": h["size_label"],

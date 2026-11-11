@@ -32,12 +32,19 @@ CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
 
 
 def write_gguf(path: str, *, arch: str = "llama", n_embd: int = 64,
-               qtype: GGMLQuantizationType = GGMLQuantizationType.Q4_0, projector: str = "minicpmv4_7") -> str:
-    """A small GGUF file: a model of ``arch`` with one matrix of ``qtype``, or a vision encoder (``arch="clip"``);
-    written next to the path and moved there (a server may have the old one mapped)."""
+               qtype: GGMLQuantizationType = GGMLQuantizationType.Q4_0, projector: str = "minicpmv4_7",
+               audio: str | None = None) -> str:
+    """A small GGUF file: a model of ``arch`` with one matrix of ``qtype``, or a vision encoder (``arch="clip"``; with
+    ``audio``: a speech encoder of that projector instead); written next to the path and moved there (a server may have
+    the old one mapped)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     w = GGUFWriter(path + ".tmp", arch)
-    if arch == "clip":
+    if arch == "clip" and audio is not None:
+        w.add_bool("clip.has_audio_encoder", True)
+        w.add_string("clip.audio.projector_type", audio)
+        w.add_uint32("clip.audio.projection_dim", n_embd)
+        w.add_tensor("a.position_embd.weight", np.zeros((4, 4), np.float32))
+    elif arch == "clip":
         w.add_string("clip.projector_type", projector)
         w.add_uint32("clip.vision.projection_dim", n_embd)
         w.add_tensor("v.patch_embd.weight", np.zeros((4, 4), np.float32))
@@ -97,6 +104,21 @@ def test_catalog_qwen3vl(tmp_path: object) -> None:
     write_gguf(f"{d}/org/q-GGUF/mmproj-f16.gguf", arch="clip", n_embd=128, projector="other_projector")
     entries = catalog_of(d, tmp_path).scan()
     assert os.path.basename(entries["org/q-GGUF:Q4_K_M"].mmproj) == "mmproj-q-BF16.gguf"
+    assert entries["org/q-GGUF:Q4_K_M"].media == ["image"]
+
+
+def test_catalog_audio(tmp_path: object) -> None:
+    """An LFM3 model's directory with LFM3-Audio's mmproj: its speech encoder (a model of another class does not take
+    it)."""
+    d = str(tmp_path / "models")
+    write_gguf(f"{d}/org/a-GGUF/a-Q4_K_M.gguf", arch="lfm3", n_embd=128)
+    write_gguf(f"{d}/org/a-GGUF/mmproj-a-Q8_0.gguf", arch="clip", n_embd=128, audio="lfm3a")
+    write_gguf(f"{d}/org/q-GGUF/q-Q4_K_M.gguf", arch="qwen35", n_embd=128)
+    write_gguf(f"{d}/org/q-GGUF/mmproj-a-Q8_0.gguf", arch="clip", n_embd=128, audio="lfm3a")
+    entries = catalog_of(d, tmp_path).scan()
+    a, q = entries["org/a-GGUF:Q4_K_M"], entries["org/q-GGUF:Q4_K_M"]
+    assert os.path.basename(a.mmproj) == "mmproj-a-Q8_0.gguf" and a.media == ["audio"]
+    assert q.mmproj is None and q.media == []
 
 
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,

@@ -13,6 +13,7 @@ ones joined and the later ones as user messages - Claude Code sends system messa
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -26,7 +27,7 @@ import jinja2
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -35,7 +36,7 @@ from starlette.types import Receive, Scope, Send
 from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, Sampling, chat_template
 from ..readouts import Readouts
 from ..sequence import data_bytes
-from . import agents, decisions, readouts
+from . import agents, decisions, readouts, realtime
 from .agents import Blocks
 from .engine import Engine, Job
 from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
@@ -161,6 +162,15 @@ def image_bytes(url: object) -> bytes:
 
 def bad_request(message: str) -> ApiError:
     return ApiError(400, "invalid_request_error", message)
+
+
+def audio_clip(part: dict[str, Any]) -> bytes:
+    """An ``input_audio`` part's clip (base64 data) or an ``audio_url`` part's (a data URI)."""
+    from ..lfm3a.host import part_audio  # (numpy only: the model's host side)
+    try:
+        return part_audio(part)
+    except ValueError as e:
+        raise bad_request(str(e)) from None
 
 
 def takes_parts(template: str) -> bool:
@@ -342,23 +352,28 @@ def new_app(*, build_info: str, cors_origins: list[str], lifespan: Callable | No
     return app
 
 
+def key_valid(api_keys: frozenset[str], authorization: str | None, x_api_key: str | None) -> bool:
+    """Whether a request's ``Authorization: Bearer`` or ``X-Api-Key`` is one of the server's keys (any, without keys)."""
+    if not api_keys:
+        return True
+    key = x_api_key or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+    return any(secrets.compare_digest(key.encode(), k.encode()) for k in api_keys)
+
+
 def key_check(api_keys: frozenset[str]) -> Callable[..., Awaitable[None]]:
-    """The dependency of the routes that need an API key (``Authorization: Bearer`` or ``X-Api-Key``), when the
-    server has keys."""
+    """The dependency of the routes that need an API key (``key_valid``), when the server has keys."""
 
     async def authorized(authorization: str | None = Header(None), x_api_key: str | None = Header(None)) -> None:
-        if not api_keys:
-            return
-        key = x_api_key or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ")
-                            else "")
-        if not any(secrets.compare_digest(key.encode(), k.encode()) for k in api_keys):
+        if not key_valid(api_keys, authorization, x_api_key):
             raise ApiError(401, "authentication_error", "Invalid API Key")
 
     return authorized
 
 
-NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/v1/audio/transcriptions", "/audio/transcriptions",
-                 "/lora-adapters", "/metrics"]
+TRANSCRIPT_TOKENS = (64, 8)  # a transcription's tokens at most by default: 64 + 8 per second of audio
+
+NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/v1/audio/speech", "/audio/speech", "/lora-adapters",
+                 "/metrics"]
 
 
 def add_unsupported(router: APIRouter) -> None:
@@ -483,10 +498,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     def messages_of(messages: list[Message], *, media: bool = False) -> list[dict[str, object]]:
         """The messages for the chat template: content as text parts if the template takes them (else joined by
         newlines), with images (``image_url`` parts of data URIs, a model with a vision encoder) as parts
-        ``{"type": "image", "image": bytes}`` among the text parts; ``media``: images as the text ``MEDIA_MARKER``
-        (the template's text alone)."""
+        ``{"type": "image", "image": bytes}`` and audio clips (``input_audio`` parts, ``audio_url`` ones of data URIs,
+        a model with a speech encoder) as parts ``{"type": "audio", "audio": bytes}`` among the text parts; ``media``:
+        images and clips as the text ``MEDIA_MARKER`` (the template's text alone)."""
         out = []
-        vision = engine.model.vision is not None
+        vision, audio = engine.model.vision is not None, engine.model.audio is not None
         for m in messages:
             if m.role not in ROLES:
                 raise bad_request(f"message role {m.role!r} (one of {', '.join(ROLES)})")
@@ -501,10 +517,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     elif kind == "image_url" and vision:
                         parts.append({"type": "text", "text": MEDIA_MARKER} if media else
                                      {"type": "image", "image": image_bytes(part.get("image_url"))})
+                    elif kind in ("input_audio", "audio_url") and audio:
+                        parts.append({"type": "text", "text": MEDIA_MARKER} if media else
+                                     {"type": "audio", "audio": audio_clip(part)})
                     else:
+                        takes = [n for n, ok in (("images (image_url)", vision), ("audio (input_audio)", audio)) if ok]
                         raise bad_request(f"content of type {kind!r} is not supported: this server's model takes "
-                                          f"text{' and images (image_url)' if vision else ' only'}")
-                content = parts if typed or any(p["type"] == "image" for p in parts) else \
+                                          f"text{' and ' + ' and '.join(takes) if takes else ' only'}")
+                content = parts if typed or any(p["type"] in ("image", "audio") for p in parts) else \
                     "\n".join(p["text"] for p in parts)
             d: dict[str, object] = {**(m.model_extra or {}), "role": role, "content": content or ""}
             if m.reasoning_content:
@@ -567,7 +587,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             def chat() -> list[int]:
                 return engine.model.chat(msgs, think=think, tools=tools, preserve=preserve, variables=variables)
 
-            if any(p.get("type") == "image" for m in msgs if isinstance(m["content"], list) for p in m["content"]):
+            if any(p.get("type") in ("image", "audio") for m in msgs if isinstance(m["content"], list)
+                   for p in m["content"]):  # (an encoder on the NPU: between the worker's jobs)
                 return await asyncio.wrap_future(engine.run(chat))
             return await run_in_threadpool(chat)
 
@@ -746,7 +767,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         return {"default_generation_settings": {"n_ctx": engine.npu.capacity, "params": params(sampling(
                     default_think()))},
                 "total_slots": 1, "model_alias": options.alias, "model_path": info.path,
-                "modalities": {"vision": engine.model.vision is not None, "audio": False, "video": False},
+                "modalities": {"vision": engine.model.vision is not None, "audio": engine.model.audio is not None,
+                               "video": False},
                 "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
                 "ui": options.ui is not None, "ui_settings": {},
                 "chat_template": info.chat_template, "bos_token": info.bos_token, "eos_token": info.eos_token,
@@ -759,14 +781,16 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     @listed.get("/models")
     async def models() -> dict[str, Any]:
         name, vision = options.alias, engine.model is not None and engine.model.vision is not None
+        audio = engine.model is not None and engine.model.audio is not None
         return {"object": "list",
                 "models": [{"name": name, "model": name, "modified_at": "", "size": "", "digest": "", "type": "model",
-                            "description": "", "tags": [""], "capabilities": ["completion"] + ["multimodal"] * vision,
+                            "description": "", "tags": [""],
+                            "capabilities": ["completion"] + ["multimodal"] * (vision or audio),
                             "parameters": "",
                             "details": {"parent_model": "", "format": "gguf", "family": "", "families": [""],
                                         "parameter_size": "", "quantization_level": ""}}],
                 "data": [{"id": name, "aliases": [], "tags": [], "object": "model",
-                          "architecture": {"input_modalities": ["text"] + ["image"] * vision,
+                          "architecture": {"input_modalities": ["text"] + ["image"] * vision + ["audio"] * audio,
                                            "output_modalities": ["decisions" if info.decision else "text"]},
                           "created": int(time.time()), "owned_by": "artlite",
                           "meta": {"n_vocab": info.n_vocab, "n_ctx": options.n_ctx, "n_ctx_train": info.n_ctx_train,
@@ -794,6 +818,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
         check(req)
         if req.continue_final_message:
             raise bad_request("continue_final_message is not supported")
+        if "audio" in ((req.model_extra or {}).get("modalities") or []):
+            raise ApiError(501, "not_supported_error", "audio output is not supported by artlite-server")
         fns, calls = calls_of(req)
         if calls is not None:
             calls = dataclasses.replace(calls, vocab=await vocabulary())
@@ -858,6 +884,77 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                         yield sse(c)
                     yield "data: [DONE]\n\n"
                 else:
+                    yield stream_error(kind, data)
+
+        return EventStream(stream(), j)
+
+    @api.post("/v1/audio/transcriptions")
+    @api.post("/audio/transcriptions")
+    async def transcriptions(request: Request) -> Any:
+        """OpenAI's transcriptions (llama-server's): a multipart form's ``file`` (an audio file), ``language``,
+        ``prompt`` (text before the clip in the user message), ``response_format`` (json, text), ``temperature``,
+        ``max_tokens`` (default ``TRANSCRIPT_TOKENS``: a clip of minutes can loop), ``stream``; the model's ASR prompt
+        (the system message of LFM3-Audio's card) as a chat request.
+        The answer: ``{"type": "transcript.text.done", "text", "usage"}`` (stream: ``transcript.text.delta`` events
+        first), or the text."""
+        if engine.model.audio is None:
+            raise ApiError(501, "not_supported_error", "The current model does not support audio input.")
+        try:
+            form = await request.form()
+        except (AssertionError, ValueError) as e:  # (no python-multipart, or not a multipart body)
+            raise bad_request(f"a transcription takes a multipart form: {e}") from None
+        f = form.get("file")
+        if f is None or not hasattr(f, "read"):
+            raise bad_request("No input file found for transcription")
+        data = await f.read()
+        get = lambda k, d="": str(form.get(k) or d)
+        fmt = get("response_format", "json")
+        if fmt not in ("json", "text"):
+            raise bad_request(f"response_format {fmt!r}: json or text")
+        from ..lfm3a.host import SR, asr_system, load_audio  # (numpy only)
+        user = ([{"type": "text", "text": get("prompt")}] if get("prompt") else []) + \
+            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(data).decode(), "format": "wav"}}]
+        body: dict[str, Any] = {"messages": [{"role": "system", "content": asr_system(get("language"))},
+                                             {"role": "user", "content": user}],
+                                "stream": get("stream", "false").lower() == "true",
+                                "chat_template_kwargs": {"enable_thinking": False}}
+        try:
+            for k, cast in (("temperature", float), ("max_tokens", int), ("seed", int)):
+                if form.get(k) not in (None, ""):
+                    body[k] = cast(form.get(k))
+            if "max_tokens" not in body:  # (a transcript that loops ends: 8 tokens a second of audio, ~2x speech's)
+                body["max_tokens"] = TRANSCRIPT_TOKENS[0] + TRANSCRIPT_TOKENS[1] * len(
+                    await run_in_threadpool(load_audio, data)) // SR
+        except ValueError as e:
+            raise bad_request(str(e)) from None
+        req = chat_request(body)
+        j, events = await start(req)
+
+        def asr_usage(done: dict[str, Any]) -> dict[str, Any]:
+            u = usage(done)
+            return {"type": "tokens", "input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"],
+                    "total_tokens": u["total_tokens"], "input_tokens_details": u["prompt_tokens_details"]}
+        if not req.stream:
+            blocks, done = await collect(j, events, request)
+            text = blocks.text("text") or ""
+            if fmt == "text":
+                return PlainTextResponse(text)
+            return {"type": "transcript.text.done", "text": text, "usage": asr_usage(done)}
+
+        async def stream() -> AsyncIterator[str]:
+            parts: list[str] = []
+            async for kind, data in events_of(events, ping_of(req)):
+                if kind == "ping":
+                    yield ":\n\n"
+                elif kind == "delta":
+                    for k, v in data["parts"]:
+                        if k == "content":
+                            parts.append(v)
+                            yield sse({"type": "transcript.text.delta", "delta": v})
+                elif kind == "done":
+                    yield sse({"type": "transcript.text.done", "text": "".join(parts), "usage": asr_usage(data)})
+                    yield "data: [DONE]\n\n"
+                elif kind != "progress":
                     yield stream_error(kind, data)
 
         return EventStream(stream(), j)
@@ -1168,6 +1265,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     decisions.add_routes(api, engine=engine, alias=options.alias, kind=info.decision,
                          make=lambda: info.decisions or decisions.Decisions.of(info.path, engine.model.tokenizer.encode),
                          errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits)
+    realtime.add_route(app, engine=engine, alias=options.alias,
+                       authorized=lambda a, x: key_valid(options.api_keys, a, x))
     add_unsupported(listed)
     app.include_router(public)
     app.include_router(listed)

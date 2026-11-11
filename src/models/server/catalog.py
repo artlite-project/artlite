@@ -1,5 +1,5 @@
-"""The router's models (``router``): the GGUF files of a models directory that Artlite runs, each with the vision
-encoder of its directory that it takes, and the options and models of a preset file.
+"""The router's models (``router``): the GGUF files of a models directory that Artlite runs, each with the vision or
+speech encoder of its directory that it takes, and the options and models of a preset file.
 
 A model's id is ``<directory>:<quantization>`` - ``lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0``, as
 llama-server names the files of its Hugging Face cache, which the web UI groups by repository - with the file name's
@@ -10,8 +10,8 @@ and its file name (when no other file has it) resolve to it too.
 
 A file is served when Artlite has its architecture (``models.ARCHITECTURES``) and a tile format for the type of each
 of its matrices (``formats.has_tile_format``); a file Artlite cannot run is skipped with a log line that says why.
-Drafters (``mtp-``, ``dspark-``, ``dflash-``, ``eagle3-``: their models find them themselves) and vision encoders
-(architecture ``clip``) are not models of their own; split files are not read. A vision encoder goes with a model of
+Drafters (``mtp-``, ``dspark-``, ``dflash-``, ``eagle3-``: their models find them themselves) and vision or speech
+encoders (architecture ``clip``) are not models of their own; split files are not read. An encoder goes with a model of
 its directory whose class takes its projector type (``Model.projectors``) and its width; of several, the one of the
 shortest name (``mmproj-model-f16.gguf``, not ``mmproj-model-f16-4x.gguf``). Reading a header takes ~0.1 s (its
 vocabulary's strings are skipped one by one): the headers are cached in ``<cache>/server/models.json`` by path, size
@@ -22,7 +22,7 @@ model, a section named by a model's id or alias the options of that model, and a
 named by the section, whose ``model`` key is its file (absolute, else relative to the working directory or the models
 directory). Keys are the options' long names without the dashes (``ctx-size``), their short ones (``c``) or their
 environment variables (``ARTLITE_ARG_CTX_SIZE``), with ``true`` / ``false`` for switches; ``mmproj`` chooses the vision
-encoder (empty: none) and ``spec-draft-model`` the drafter (both paths as ``model``'s), ``alias`` adds names
+or speech encoder (empty: none) and ``spec-draft-model`` the drafter (both paths as ``model``'s), ``alias`` adds names
 (comma-separated), ``load-on-startup`` loads the model when the router starts. A model's options: the command line's,
 else its section's, else ``[*]``'s."""
 
@@ -47,7 +47,7 @@ from .main import ENV, FILES, MODEL, ROUTER, env_name
 
 log = logging.getLogger("artlite.server")
 
-VERSION = 2  # of the cache file (a header's fields)
+VERSION = 3  # of the cache file (a header's fields)
 DRAFTERS = ("mtp-", "dspark-", "dflash-", "eagle3-")
 SPLIT = re.compile(r"-(\d{5})-of-\d{5}$")
 TAG = re.compile(r"[-.]([A-Za-z0-9_]+)$")
@@ -59,13 +59,14 @@ TRUE, FALSE = ("1", "true", "on", "yes", "enabled"), ("0", "false", "off", "no",
 @dataclass
 class Entry:
     """A model the router serves: its ``id`` in the API, its file and what the router reads of it (``header``), its
-    vision encoder's file (None: text only), the other names that resolve to it (``names``, ``aliases``), its server's
+    vision or speech encoder's file (None: text only) and what it takes (``media``: ``image``, ``audio``), the other names that resolve to it (``names``, ``aliases``), its server's
     options (dest -> value) and where it comes from (``models_dir``, ``preset``)."""
 
     id: str
     path: str
     header: dict[str, Any]
     mmproj: str | None = None
+    media: list[str] = field(default_factory=list)
     names: list[str] = field(default_factory=list)  # its path in the models directory, its file name
     aliases: list[str] = field(default_factory=list)  # a preset's (the API lists them)
     options: dict[str, Any] = field(default_factory=dict)
@@ -89,7 +90,8 @@ class Entry:
 
 
 def header(path: str) -> dict[str, Any]:
-    """What the router reads of a GGUF file: its architecture; a vision encoder's projector type and width; a model's
+    """What the router reads of a GGUF file: its architecture; an encoder's projector types (vision's, speech's) and
+    width; a model's
     context, sizes and file type, its decision type (``{arch}.decision.type``, or None) and the types of its matrices
     that have no tile format (``unsupported``)."""
     from ..bench import file_type_name
@@ -97,8 +99,12 @@ def header(path: str) -> dict[str, Any]:
     g = GGUFFile(path)
     meta, arch = g.meta, g.arch
     if arch == "clip":
-        return {"arch": arch, "projector": str(meta.get("clip.projector_type", "")),
-                "projection_dim": int(meta.get("clip.vision.projection_dim", 0))}
+        vision = str(meta.get("clip.vision.projector_type", meta.get("clip.projector_type", "")))
+        if not meta.get("clip.has_vision_encoder", bool(vision)):
+            vision = ""
+        audio = str(meta.get("clip.audio.projector_type", "")) if meta.get("clip.has_audio_encoder") else ""
+        return {"arch": arch, "projector": vision, "audio": audio,
+                "projection_dim": int(meta.get("clip.vision.projection_dim", meta.get("clip.audio.projection_dim", 0)))}
     tensors = g.tensor_info.values()
     return {"arch": arch, "n_ctx_train": int(meta.get(f"{arch}.context_length", 0)),
             "n_embd": int(meta.get(f"{arch}.embedding_length", 0)),
@@ -358,6 +364,7 @@ class Catalog:
                 entry.mmproj = opts.pop("mmproj")
             else:
                 entry.mmproj = self._encoder(entry, encoders.get(os.path.dirname(entry.path), []))
+            entry.media = self._media(entry.mmproj) if entry.mmproj else []
             entry.options = opts
             entry.load_s = float(self._cache.get(os.path.realpath(entry.path), {}).get("load_s", 0.0))
         if self._dirty:
@@ -403,13 +410,21 @@ class Catalog:
 
     @staticmethod
     def _encoder(entry: Entry, encoders: list[tuple[str, dict[str, Any]]]) -> str | None:
-        """The vision encoder of the model's directory that its class takes (module docstring), or None."""
+        """The encoder of the model's directory that its class takes (module docstring), or None."""
         if not encoders:
             return None
         projectors = model_class(entry.header["arch"]).projectors
-        fit = [p for p, h in encoders if h["projector"] in projectors
+        fit = [p for p, h in encoders if ({h["projector"], h["audio"]} & set(projectors))
                and h["projection_dim"] in (0, entry.header["n_embd"])]
         return min(fit, key=lambda p: (len(os.path.basename(p)), p)) if fit else None
+
+    def _media(self, mmproj: str) -> list[str]:
+        """What an encoder file takes: ``image``, ``audio`` (both: ``image`` when its header cannot be read)."""
+        try:
+            h = self._header(mmproj)
+        except (OSError, ValueError, AssertionError, KeyError):
+            return ["image"]
+        return ["image"] * bool(h.get("projector")) + ["audio"] * bool(h.get("audio"))
 
     # ------------------------------------------------------------------
     # Names

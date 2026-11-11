@@ -66,6 +66,7 @@ class Sampling:
     repeat_last_n: int = 64  # the recent tokens (0: no penalties)
     presence_penalty: float = 0.0  # subtracted from a recent token's logit
     frequency_penalty: float = 0.0  # subtracted from a recent token's logit per occurrence
+    banned: tuple[int, ...] = ()  # tokens never chosen (their logits -inf: LFM3-Audio's text-only output)
 
     def __post_init__(self) -> None:
         if not 0 < self.repeat_penalty < math.inf:
@@ -191,7 +192,16 @@ class Penalties:
         or the overlay's bf16 (``top_logits``; ``cap``: the model's soft cap); ``rows``, ``where``: the token of each
         logit and the logit of each token (logits in another order: a drafter's). The candidates: the recent tokens
         and the ``k`` largest logits of the others; with the mask, the tokens it allows (logits in the vocabulary's
-        order)."""
+        order); never the sampling's ``banned`` ones."""
+        ban = self.sampling.banned
+        if not ban:
+            return self._top(logits, k, cap, rows=rows, where=where)
+        v, i = self._top(logits, k + len(ban), cap, rows=rows, where=where)
+        keep = ~np.isin(i, ban)
+        return v[keep][:k], i[keep][:k]
+
+    def _top(self, logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray | None = None,
+             where: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         allowed = self.mask.allowed() if self.mask is not None else None
         if allowed is not None:
             return self._top_of(logits, k, cap, allowed)
@@ -1265,6 +1275,7 @@ class Model:
 
     name: str  # for messages: "Llama 3", ...
     vision: Any = None  # the image encoder (an option of the model's: its mmproj file), or None: text only
+    audio: Any = None  # the speech encoder (an mmproj file's), or None
     projectors: tuple[str, ...] = ()  # the projector types (``clip.projector_type``) of the mmproj files it takes
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
@@ -1320,25 +1331,30 @@ class Model:
         raise NotImplementedError
 
     def prompt(self, text: str, *, system: str | None = None, raw: bool = False, think: bool = False,
-               images: list[object] = (), variables: dict[str, object] | None = None) -> list[int]:
+               images: list[object] = (), audio: list[object] = (), variables: dict[str, object] | None = None
+               ) -> list[int]:
         """Token ids of a user message after an optional system message, through the chat template (``raw``: the text
-        alone; ``variables``: the template's, as ``chat``'s); ``images`` (files or their bytes) where the text has
-        ``MEDIA_MARKER``, else before it."""
+        alone; ``variables``: the template's, as ``chat``'s); ``images`` (files or their bytes), then ``audio`` clips
+        (files or their bytes), where the text has ``MEDIA_MARKER``, else before it."""
         if images and self.vision is None:
             raise ValueError(f"{self.name}: images need a vision encoder (an mmproj file)")
+        if audio and self.audio is None:
+            raise ValueError(f"{self.name}: audio needs a speech encoder (an mmproj file)")
+        media = [{"type": "image", "image": im} for im in images] + [{"type": "audio", "audio": a} for a in audio]
         if raw:
-            if images:
-                raise ValueError("images go through the chat template (not a raw prompt)")
+            if media:
+                raise ValueError("images and audio go through the chat template (not a raw prompt)")
             return self.encode(text)
         if think and not self.thinks:
             raise ValueError(f"{self.name} has no thinking mode")
         content: str | list[dict[str, object]] = text
-        if images:
+        if media:
             parts = text.split(MEDIA_MARKER) if MEDIA_MARKER in text else ["", text]
-            if len(parts) != len(images) + 1:
-                raise ValueError(f"{len(images)} image(s) for {len(parts) - 1} {MEDIA_MARKER} marker(s) in the prompt")
+            if len(parts) != len(media) + 1:
+                raise ValueError(f"{len(media)} media file(s) for {len(parts) - 1} {MEDIA_MARKER} marker(s) in the "
+                                 "prompt")
             content = [{"type": "text", "text": parts[0]}] if parts[0] else []
-            for im, t in zip(images, parts[1:], strict=True):
-                content += [{"type": "image", "image": im}] + ([{"type": "text", "text": t}] if t else [])
+            for part, t in zip(media, parts[1:], strict=True):
+                content += [part] + ([{"type": "text", "text": t}] if t else [])
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
         return self.chat(messages, think=think, variables=variables)

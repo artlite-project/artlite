@@ -1,6 +1,7 @@
 # LFM3 on the NPU
 
-LiquidAI's LFM3-1.7B (and LFM3-VL-2B with images: [below](#lfm3-vl-2b-images)) from a GGUF file (architecture `lfm3`):
+LiquidAI's LFM3-1.7B (and LFM3-VL-2B with images, LFM3-Audio-2B with speech: [below](#lfm3-vl-2b-images)) from a GGUF
+file (architecture `lfm3`):
 24 layers of three kinds, 13 short-convolution layers, 6
 full-attention layers and 5 sliding-window attention layers (a window of 256 positions), each an operator and a SwiGLU
 FFN with norms before and after both. The architecture is read from the file's metadata, the tokenizer and the chat
@@ -137,6 +138,44 @@ The embeddings are ~3.5% per token from an exact (float64) encoder (the bfp16 op
 a few tokens are further off (up to ~0.8 of their norm): patches whose values nearly cancel before the final LayerNorm,
 which then scales up their small errors. The language model hardly notices: teacher-forced over a description of an image, its answer stays as close to llama.cpp's own
 (KL 0.0007, argmax agreement 1.0) as with llama.cpp's own image embeddings (KL 0.0005).
+
+## LFM3-Audio-2B (speech)
+
+```bash
+M=LiquidAI/LFM3-Audio-2B-GGUF
+artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --audio speech.wav
+artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --audio speech.wav --live realtime
+artlite-server -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf
+```
+
+```
+$ARTLITE_MODELS_DIR/LiquidAI/LFM3-Audio-2B-GGUF/   LiquidAI/LFM3-Audio-2B-GGUF
+    LFM3-Audio-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, its own weights; Q4_0 too)
+    mmproj-LFM3-Audio-2B-Q8_0.gguf                 (its speech encoder, and the speech decoder Artlite does not run yet)
+```
+
+LiquidAI's LFM3-Audio-2B is LFM3's trunk with a speech encoder: the language model runs as LFM3-1.7B does (above), a
+clip's rows (one per 80 ms of audio) take token positions in place of token embeddings. `--mmproj` (artlite-cli and
+[artlite-server](../server.md#speech)) loads the encoder. Audio files: WAV, read natively; MP3, FLAC and Ogg Vorbis
+through the `miniaudio` package (in the `examples` extra; llama.cpp decodes with the same library), as 16 kHz mono.
+
+- **Transcription**: `--audio` without a prompt (artlite-server: `/v1/audio/transcriptions`) is the model card's ASR
+  prompt, the system message "Perform ASR in English." (`--language`; without it "Perform ASR.", the model tells the
+  language), greedy, text only (the tokens that would start speech output are never sampled). A clip of any length is
+  one prompt, as in llama.cpp, but the model was trained on clips of up to 30 s: past ~3 minutes it starts to repeat
+  itself (llama.cpp's does too); the server bounds a transcription's tokens by the audio's length.
+- **Live transcription** (English; `--live`, artlite-server's `/v1/realtime?intent=transcription`): the model card's
+  live layout, the text of every 0.96 s of audio right after it (12 rows, then the model's text up to its end-of-chunk
+  token), restarting on a new line after at most 30 s, so any length works.
+- With a prompt, the audio goes into the user message as images do: questions about a clip.
+
+The encoder (`lfm3a/encoder.py`) runs on the vision overlay, in a hardware context of its own: the clip's log-mel
+spectrogram (128 bins, 100 frames a second, numpy on the host) through a downsampler of three stride-2 convolutions
+(a row per 8 frames), 17 layers (10 short convolutions, 7 attention layers over a causal window of 32 rows) and the
+projector, in bands of 512 rows (41 s of audio), one dispatch a band (~18 ms), the layers' state carried from band to
+band. Live, the band in progress runs again as each 0.96 s arrives. Its rows are ~2.3% from an exact (float64)
+encoder (llama.cpp's ~2.4%), and the language model teacher-forced over a transcript stays as close to llama.cpp's
+(KL 0.0002) as with llama.cpp's own rows.
 
 ## d1-2B (decision model)
 

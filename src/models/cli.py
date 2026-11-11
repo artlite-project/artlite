@@ -8,8 +8,9 @@ options follow llama.cpp's ``llama-cli`` where it has an equivalent, the image o
         --mmproj openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf --image photo.jpg -p "Describe the image."
     artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "..." -o image.png
 
-Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image`` files (a model with a
-vision encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them; tokens are then sampled until an
+Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image`` and ``--audio`` files (a
+model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them (``--audio`` alone:
+a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then sampled until an
 end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed report to
 stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr.
 """
@@ -38,6 +39,7 @@ from .common import (
     stale_install,
     template_option,
 )
+from .lfm3a.host import asr_system
 from .sd15.pipeline import BACKENDS, check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
@@ -49,7 +51,7 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", "--model", required=True, type=model_path,
                    help=f"GGUF file or diffusers directory; a relative path is also looked up in the models directory "
                         f"({MODELS_DIR}, ARTLITE_MODELS_DIR)")
-    prompt = p.add_mutually_exclusive_group(required=True)
+    prompt = p.add_mutually_exclusive_group()
     prompt.add_argument("-p", "--prompt", help="the user message (an image's description)")
     prompt.add_argument("-f", "--file", help="read the user message from this file")
     p.add_argument("-sys", "--system-prompt", help="system message")
@@ -88,8 +90,8 @@ def arg_parser() -> argparse.ArgumentParser:
                    help="K precision of the KV cache (Llama, Qwen3, Gemma, LFM3): one bfp16 block per 8 dims (Llama's "
                         "and LFM3's default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read "
                         "time)")
-    vis = p.add_argument_group("images in the prompt (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7)")
-    vis.add_argument("--mmproj", type=model_path, help="the vision encoder's GGUF file (mmproj-*.gguf)")
+    vis = p.add_argument_group("images in the prompt (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3-VL)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf)")
     vis.add_argument("--image", action="append", default=[],
                      help=f"an image file (repeatable): where the prompt has {MEDIA_MARKER}, else before it")
     vis.add_argument("--max-slices", type=int,
@@ -98,6 +100,15 @@ def arg_parser() -> argparse.ArgumentParser:
                      help="an image's tokens at least (Qwen3-VL's, LFM3-VL's mmproj; default 8 and 64, llama.cpp's)")
     vis.add_argument("--image-max-tokens", type=int,
                      help="an image's tokens at most (Qwen3-VL's, LFM3-VL's mmproj; default 4096, llama.cpp's)")
+    aud = p.add_argument_group("audio in the prompt (LFM3-Audio)")
+    aud.add_argument("--audio", action="append", default=[],
+                     help=f"an audio file (repeatable; WAV, MP3, FLAC, Ogg Vorbis): where the prompt has {MEDIA_MARKER}, "
+                          "else before it, after the images; without -p / -f a transcription (ASR)")
+    aud.add_argument("--language", default="",
+                     help="the transcription's language (a code: en, de, ...; or a name; default: the model detects it)")
+    aud.add_argument("--live", nargs="?", const="fast", choices=("fast", "realtime"),
+                     help="live transcription (English) of the --audio files, the text while the audio streams in: as "
+                          "fast as it goes, or paced as a microphone's (realtime: each chunk's latency)")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
@@ -111,10 +122,14 @@ def arg_parser() -> argparse.ArgumentParser:
 
 
 def prompt_text(args: argparse.Namespace) -> str:
-    """The prompt of ``-p``, or the contents of ``-f``."""
+    """The prompt of ``-p``, or the contents of ``-f``; "" for a transcription (``--audio`` alone)."""
     if args.file:
         with open(args.file) as f:
             return f.read()
+    if args.prompt is None:
+        if not getattr(args, "audio", None):
+            raise ValueError("a prompt: -p or -f (or --audio files to transcribe)")
+        return ""
     return args.prompt
 
 
@@ -148,6 +163,54 @@ def generate_image(args: argparse.Namespace) -> None:
                      f"{args.output}: {args.width}x{args.height}, seed {args.seed}\n")
 
 
+def live(args: argparse.Namespace, options: dict[str, object]) -> None:
+    """``--live``: each --audio file as a stream (``models.lfm3a.live``), pushed 0.1 s at a time; the text to stdout,
+    the chunks' times to stderr."""
+    from .lfm3a.host import HOP, N_FFT, SR, STRIDE, load_audio
+    from .lfm3a.live import CHUNK_ROWS, LiveAsr
+
+    row = STRIDE * HOP  # (samples of a row)
+
+    if not args.audio or args.prompt is not None or args.file:
+        sys.exit("artlite-cli: --live transcribes --audio files (no -p / -f)")
+    t0 = time.perf_counter()
+    try:
+        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        if model.audio is None:
+            raise ValueError("--live needs the model's speech encoder (--mmproj: LFM3-Audio's)")
+        clips = [load_audio(a) for a in args.audio]
+        npu = model.load(capacity=args.ctx_size or 2048, prefill=not args.no_prefill)
+        asr = LiveAsr(model, npu, model.audio.encoder)
+    except (OSError, ValueError, NotImplementedError) as e:
+        sys.exit(f"artlite-cli: {e}")
+    npu.prepare(64)
+    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): live ASR; loaded in {time.perf_counter() - t0:.1f} "
+                     f"s: {npu.describe()}\n")
+    step = SR // 10
+    for x in clips:
+        asr.start()
+        lat: list[float] = []  # (realtime: from the end of the audio a chunk's rows need to its text)
+        t_npu, cpu0 = npu.t_npu, time.process_time()
+        t0 = time.perf_counter()
+        for i in range(0, len(x), step):
+            if args.live == "realtime":
+                time.sleep(max(0.0, t0 + (i + step) / SR - time.perf_counter()))
+            n = asr.chunks
+            print(asr.push(x[i:i + step]), end="", flush=True)
+            if args.live == "realtime" and asr.chunks > n:
+                lat.append(time.perf_counter() - t0 - min(len(x), row * asr.stream.taken + N_FFT - HOP) / SR)
+        print(asr.end(), flush=True)
+        dt, audio, cpu = time.perf_counter() - t0, len(x) / SR, time.process_time() - cpu0
+        st = asr.stream
+        busy = st.t_encode + npu.t_npu - t_npu
+        sys.stderr.write(f"\n{audio:.1f} s of audio in {dt:.2f} s: {asr.chunks} chunks of {CHUNK_ROWS} rows (0.96 s); "
+                         f"the encoder: {st.dispatches} dispatches in {st.t_encode:.2f} s; the text: {asr.t_text:.2f} s; "
+                         f"the NPU busy {busy:.2f} s ({100 * busy / audio:.1f}% of the audio's time), the host's CPU "
+                         f"{cpu:.2f} s ({100 * cpu / audio:.1f}%)"
+                         + (f"; latency: median {1e3 * sorted(lat)[len(lat) // 2]:.0f} ms, max {1e3 * max(lat):.0f} ms"
+                            if lat else "") + "\n")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = arg_parser().parse_args(argv)
     if stale := stale_install():
@@ -163,11 +226,16 @@ def main(argv: list[str] | None = None) -> None:
                "image_min_tokens": args.image_min_tokens, "image_max_tokens": args.image_max_tokens, **spec_options(args)}
     variables = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
         ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
+    if args.live:
+        live(args, options)
+        return
     try:
         text = prompt_text(args)
         template = template_option(args.chat_template, args.chat_template_file)
         model = open_model(args.model, chat_template=template, **{k: v for k, v in options.items() if v is not None})
-        ids = model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image,
+        asr = bool(args.audio) and args.prompt is None and not args.file
+        system = args.system_prompt or (asr_system(args.language) if asr else None)
+        ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
                            variables=variables)
         sampling = model.sampling(think=args.think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
@@ -183,6 +251,9 @@ def main(argv: list[str] | None = None) -> None:
         v = model.vision
         sys.stderr.write(f"{len(args.image)} image(s): {v.entries} entries through the encoder in {v.t_encode:.2f} s "
                          f"({1e3 * v.t_encode / max(v.entries, 1):.0f} ms each)\n")
+    if model.audio is not None and args.audio:
+        a = model.audio
+        sys.stderr.write(f"{len(args.audio)} audio clip(s) through the encoder in {a.t_encode:.2f} s\n")
     capacity = args.ctx_size or auto_capacity(len(ids) + max(args.n_predict, 0))
     if len(ids) >= capacity:
         sys.exit(f"artlite-cli: a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")

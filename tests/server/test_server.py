@@ -15,7 +15,9 @@ import re
 import socket
 import threading
 import time
+import types
 from collections.abc import Iterator
+from typing import ClassVar
 
 import httpx
 import jinja2
@@ -118,6 +120,7 @@ class FakeEncoder:
     """A vision encoder: an image's bytes as two embedding rows (their first 16 bytes), its threads recorded."""
 
     markup = ("<|system|>", "<|assistant|>")  # (two special tokens of the fake tokenizer)
+    encoder = None  # (a speech encoder's: ``FakeLive``'s)
 
     def __init__(self) -> None:
         self.threads: list[str] = []
@@ -139,15 +142,52 @@ class FakeVision(FakeModel):
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
              variables: dict[str, object] | None = None) -> list[int] | Sequence:
+        self.rendered, self.thought = (messages, tools), think
         seq, text = Sequence.text([], 8), "<s>"
         for m in messages:
             text += f"<|{m['role']}|>"
             for part in m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]:
-                if part["type"] == "image":
-                    seq, text = seq + self.tokenizer.encode(text) + self.vision.sequence(part["image"]), ""
+                if part["type"] in ("image", "audio"):
+                    enc = self.vision if part["type"] == "image" else self.audio
+                    seq, text = seq + self.tokenizer.encode(text) + enc.sequence(part[part["type"]]), ""
                 else:
                     text += str(part["text"])
         return seq + self.tokenizer.encode(text + "<|assistant|>")
+
+
+class FakeAudio(FakeVision):
+    """A model with a speech encoder (``FakeEncoder``: a clip's bytes as two rows) and no vision encoder, and live ASR's
+    template (``FakeLive``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.audio, self.vision = self.vision, None
+        self.gguf = types.SimpleNamespace(meta={"tokenizer.chat_template.asr": ""})
+
+
+class FakeLive:
+    """``LiveAsr``'s interface: a push's text its samples' count and first value; commit "|", end "."; on the worker
+    (its thread recorded), its sync (the engine's hold / ran) called on each step."""
+
+    threads: ClassVar[list[str]] = []
+
+    def __init__(self, model: object, npu: object, encoder: object, *, sync: tuple) -> None:
+        self.sync, self.chunks, self.t_text = sync, 0, 0.0
+        self.stream = types.SimpleNamespace(t_encode=0.0)
+
+    def _step(self, out: str) -> str:
+        FakeLive.threads.append(threading.current_thread().name)
+        self.chunks += 1
+        return out
+
+    def push(self, x: np.ndarray) -> str:
+        return self._step(f"[{len(x)} {x[0]:.2f}]")
+
+    def commit(self) -> str:
+        return self._step("|")
+
+    def end(self) -> str:
+        return self._step(".")
 
 
 def fake_row(seq: list[int]) -> np.ndarray:
@@ -314,12 +354,12 @@ def _stop_engines() -> Iterator[None]:
         e.join(5)
 
 
-def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False,
+def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, audio: bool = False,
          turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, **kw: object
          ) -> tuple[FakeModel, FakeNpu, Engine]:
     """A fake model's engine, started: ``turns``: the model's ``turn`` and ``user_turn`` (its prompt cache's marks),
     ``cache``: the prompt cache's options; ``kw``: the ``FakeNpu``'s."""
-    model = FakeVision() if vision else FakeModel(reasoning=reasoning)
+    model = FakeAudio() if audio else FakeVision() if vision else FakeModel(reasoning=reasoning)
     model.turn, model.user_turn = turns or (None, None)
     npu = FakeNpu(model, **kw)
     engine = Engine(load or (lambda: (model, npu)), warmup=False, **(cache or {}))
@@ -906,6 +946,101 @@ def test_images_refused(fake: tuple) -> None:
     client = fake[3]
     r = chat(client, [{"role": "user", "content": [_image(b"x"), {"type": "text", "text": "hi"}]}])
     assert r.status_code == 400 and "text only" in r.json()["error"]["message"]
+
+
+def test_audio() -> None:
+    """A model with a speech encoder: input_audio parts and audio_url data URIs in chat (the encoder on the NPU
+    worker), /v1/audio/transcriptions (json, text, a stream: llama-server's shapes; the ASR system message, no
+    thought), the openai client's transcriptions; audio in /props and /v1/models; audio output refused."""
+    from models.lfm3a.host import wav_bytes
+
+    model, npu, engine = make(audio=True)
+    clip = wav_bytes(np.linspace(-0.5, 0.5, 1600))
+    data = base64.b64encode(clip).decode()
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        b = chat(client, [{"role": "user", "content": [
+            {"type": "text", "text": "hear"}, {"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]}])
+        assert b.status_code == 200 and model.threads == ["artlite-npu"]
+        b = chat(client, [{"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64," + data}}]}])
+        assert b.status_code == 200 and len(model.threads) == 2
+        r = chat(client, [{"role": "user", "content": [_image(b"x")]}])
+        assert r.status_code == 400 and "audio (input_audio)" in r.json()["error"]["message"]
+        assert chat(client, "hi", modalities=["text", "audio"]).status_code == 501
+        npu.replies = [["hello", " world"]]
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", clip, "audio/wav")},
+                        data={"language": "de", "model": "fake"})
+        j = r.json()
+        assert r.status_code == 200 and j["type"] == "transcript.text.done" and j["text"] == "hello world"
+        assert j["usage"]["output_tokens"] == 3 and j["usage"]["type"] == "tokens" and model.thought is False
+        system = model.rendered[0][0]
+        assert system["role"] == "system" and "German" in str(system["content"])
+        npu.replies = [["hi"]]
+        r = client.post("/audio/transcriptions", files={"file": ("a.wav", clip)}, data={"response_format": "text"})
+        assert r.status_code == 200 and r.text == "hi"
+        npu.replies = [["a", " b"]]
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", clip)}, data={"stream": "true"})
+        evs = [e for e in events(r) if isinstance(e, dict)]
+        assert [e["delta"] for e in evs if e["type"] == "transcript.text.delta"] == ["a", " b"]
+        assert evs[-1]["type"] == "transcript.text.done" and evs[-1]["text"] == "a b"
+        assert client.post("/v1/audio/transcriptions", data={"language": "en"}).status_code == 400
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"not audio")})
+        assert r.status_code == 400 and "decode" in r.json()["error"]["message"]
+        p = client.get("/props").json()
+        assert p["modalities"]["audio"] is True and p["modalities"]["vision"] is False
+        m = client.get("/v1/models").json()
+        assert m["data"][0]["architecture"]["input_modalities"] == ["text", "audio"]
+    with live(engine) as url:
+        npu.replies = [["via", " openai"]]
+        c = openai.OpenAI(base_url=f"{url}/v1", api_key="none")
+        t = c.audio.transcriptions.create(model="fake", file=("a.wav", clip), language="en")
+        assert t.text == "via openai"
+
+
+def test_realtime(monkeypatch: pytest.MonkeyPatch, fake: tuple) -> None:
+    """/v1/realtime?intent=transcription (llama-server's live transcription events) over ``LiveAsr``'s steps on the
+    worker; a model without live ASR, a session without the intent: an error event, closed."""
+    monkeypatch.setattr("models.lfm3a.live.LiveAsr", FakeLive)
+    _model, _npu, engine = make(audio=True)
+    pcm = base64.b64encode((np.full(1600, 0.25) * 32768).astype("<i2").tobytes()).decode()
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+            ev = ws.receive_json()
+            assert ev["type"] == "session.created" and ev["session"]["audio"]["input"]["format"]["rate"] == 16000
+            ws.send_json({"type": "session.update", "session": {"type": "transcription"}})
+            assert ws.receive_json()["type"] == "session.updated"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm})
+            ev = ws.receive_json()
+            assert ev["type"] == "conversation.item.input_audio_transcription.delta" and ev["delta"] == "[1600 0.25]"
+            item = ev["item_id"]
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            evs = [ws.receive_json() for _ in range(3)]
+            assert [e["type"] for e in evs] == ["input_audio_buffer.committed",
+                                                "conversation.item.input_audio_transcription.delta",
+                                                "conversation.item.input_audio_transcription.completed"]
+            assert evs[0]["item_id"] == item and evs[2]["transcript"] == "[1600 0.25]|"
+            ws.send_json({"type": "nonsense"})
+            assert ws.receive_json()["type"] == "error"
+            ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+            evs = [ws.receive_json() for _ in range(2)]
+            assert evs[1]["type"] == "conversation.item.input_audio_transcription.completed"
+            assert evs[1]["transcript"] == "." and evs[1]["item_id"] != item
+        assert FakeLive.threads and set(FakeLive.threads) == {"artlite-npu"}
+    client = fake[3]  # (a model without live ASR)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ev = ws.receive_json()
+        assert ev["type"] == "error" and "does not support" in ev["error"]["message"]
+
+
+def test_audio_refused(fake: tuple) -> None:
+    """A model without a speech encoder refuses audio parts and transcriptions."""
+    client = fake[3]
+    r = chat(client, [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "AA=="}}]}])
+    assert r.status_code == 400 and "text only" in r.json()["error"]["message"]
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"RIFF")})
+    assert r.status_code == 501
 
 
 def test_prompt_images() -> None:

@@ -20,6 +20,7 @@ import numpy as np
 from artlite import _native, portable
 
 from ..common import Detokenizer, LogitsLike, Model, NpuModel, Sampling, StreamDecoder, argmax, seed, top_logits
+from ..sequence import Sequence
 from .cache import PromptCache, common_prefix
 from .tools import Calls, held
 
@@ -293,6 +294,33 @@ class Engine:
         call = Call(fn)
         self.submit(call)
         return call.future
+
+    def live(self, fn: Callable[[], Any]) -> concurrent.futures.Future:
+        """Run fn on the worker after the queued jobs: a live stream's step (``models.lfm3a.live.LiveAsr``, its
+        ``sync`` this engine's ``hold`` and ``ran``); a failure: the caches start over."""
+        def run() -> Any:
+            try:
+                return fn()
+            except Exception:  # (the device's state is unknown)
+                self.cache.clear()
+                self._dirty = True
+                raise
+        return self.run(run)
+
+    def hold(self, seq: Sequence) -> None:
+        """(on the worker) The device holds ``seq`` (a live stream's text sequence): what the prompt cache keeps of it,
+        the rest run (requests ran between the stream's chunks)."""
+        if self._dirty:
+            self.npu.reset()
+            self._dirty = False
+        k, _, _ = self.cache.prepare(seq)
+        if k < len(seq):
+            self.npu.prompt(seq[k:])
+
+    def ran(self, seq: Sequence) -> None:
+        """(on the worker) After a live stream's chunk: the device holds ``seq`` (a checkpoint at its end)."""
+        self.cache.checkpoint(seq)
+        self.cache.ran(seq)
 
     def readouts(self, inputs: list[list[int]], rows: list[np.ndarray], *, cache_prompt: bool = True,
                  name: str = "readout", sets: list[tuple[int, ...] | None] | None = None) -> concurrent.futures.Future:

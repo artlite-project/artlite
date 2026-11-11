@@ -503,9 +503,10 @@ class Net:
 
     # -- the state into the next band's place
 
-    def carry(self, bd: Builder) -> None:
-        """Copies, through column 0's memtile: S1's / S2's last time into time -1, each conv layer's last 2 rows of B x into
-        rows -2, -1, each attention layer's unit 8 slot 1 (the band's last group) into unit 0's (every KV head)."""
+    def carried(self) -> list[tuple[str, int, int, int, int]]:
+        """What ``carry`` copies: (image, its bytes, from, to, bytes) - S1's / S2's last time into time -1, each conv
+        layer's last 2 rows of B x into rows -2, -1, each attention layer's unit 8 slot 1 (the band's last group) into
+        unit 0's (every KV head)."""
         jobs = [("s1", S1_BYTES, T1 * S1_ROW, 0, S1_ROW), ("s2", S2_BYTES, T2 * S2_ROW, 0, S2_ROW)]
         ub, kvb = WinAttention.unit_bytes(), WinAttention.kv_image(8)
         for il, kd in enumerate(self.w["kinds"]):
@@ -514,6 +515,11 @@ class Net:
             else:
                 jobs += [(f"kv{il}", kvb, h * kvb // ROWS + 8 * ub + 2 * D.Q, h * kvb // ROWS + 2 * D.Q, 2 * D.Q)
                          for h in range(ROWS)]
+        return jobs
+
+    def carry(self, bd: Builder) -> None:
+        """The state into the next band's place (``carried``), through column 0's memtile."""
+        jobs = self.carried()
         at = 0
         fills, drains = [], []
         for name, size, src, dst, nb in jobs:
@@ -539,16 +545,21 @@ def _mdims(block: int) -> list[tuple[int, int]]:
 # -- the host side of a band
 
 
-def im2col(melp: np.ndarray, band: int, valid_t1: int) -> np.ndarray:
-    """Stage 1's panels of a band (DDR image <p>.mel: [column][op][kb 8][panel 32][8][9] bytes, kb 2 .. 7 zero): column
-    c of op k the pixels of frequency 8 (k % 8) + c, times 256 (k // 8) + i of the band; a pixel's taps 3 dy + dx (mel
-    bin 2 f + dy - 1, frame 2 t + dx - 1) and the constant 1 at input 9, all zero for times from valid_t1 on (the clip's
-    end: only the ops that hold earlier times are converted). melp: the band's frames from 4096 band - 1 (130 bins: the
-    first and last zero, the bins from 1; frames past the clip zero)."""
-    out = np.zeros((COLS, MEL_OPS, 8, MEL_PX // 8, 8, 9), np.uint8)
-    nk = 8 * max(0, min(-(-(valid_t1 - T1 * band) // MEL_PX), T1 // MEL_PX))  # (the ops with a time inside the clip)
-    if nk:
-        k, c, px = np.arange(nk), np.arange(COLS), np.arange(MEL_PX)
+GROUPS = T1 // MEL_PX  # (stage 1's time groups of a band: ops 8 g .. 8 g + 7 hold group g's times)
+
+
+def im2col(melp: np.ndarray, band: int, valid_t1: int, groups: tuple[int, int] = (0, GROUPS)) -> np.ndarray:
+    """Stage 1's panels of a band's time groups [g0, g1) (DDR image <p>.mel: [column][op][kb 8][panel 32][8][9] bytes,
+    kb 2 .. 7 zero; here [column][the groups' ops]): column c of op k the pixels of frequency 8 (k % 8) + c, times
+    256 (k // 8) + i of the band; a pixel's taps 3 dy + dx (mel bin 2 f + dy - 1, frame 2 t + dx - 1) and the constant 1
+    at input 9, all zero for times from valid_t1 on (the clip's end: only the ops that hold earlier times are
+    converted). melp: the band's frames from 4096 band - 1 (130 bins: the first and last zero, the bins from 1; frames
+    past the clip zero)."""
+    g0, g1 = groups
+    out = np.zeros((COLS, 8 * (g1 - g0), 8, MEL_PX // 8, 8, 9), np.uint8)
+    nk = 8 * max(0, min(-(-(valid_t1 - T1 * band) // MEL_PX), g1) - g0)  # (the ops with a time inside the clip)
+    if nk > 0:
+        k, c, px = 8 * g0 + np.arange(nk), np.arange(COLS), np.arange(MEL_PX)
         f1 = (8 * (k % 8))[:, None, None] + c[None, :, None]
         t1 = (MEL_PX * (k // 8))[:, None, None] + px[None, None, :]
         x = np.zeros((nk, COLS, MEL_PX, 16), np.float32)
@@ -559,16 +570,16 @@ def im2col(melp: np.ndarray, band: int, valid_t1: int) -> np.ndarray:
         x[(T1 * band + t1 >= valid_t1).repeat(COLS, 1)] = 0
         b = L.blocks(x.reshape(nk, COLS, MEL_PX // 8, 8, 2, 8))  # (op, col, panel, lane, kb, 9)
         out[:, :nk, :2] = b.transpose(1, 0, 4, 2, 3, 5)
-    return out.reshape(-1)
+    return out
 
 
-def band_mel(mel: np.ndarray, band: int) -> np.ndarray:
-    """``im2col``'s melp of a clip's mel (128, frames) for a band."""
+def band_mel(mel: np.ndarray, band: int, start: int = 0) -> np.ndarray:
+    """``im2col``'s melp of a clip's mel (128, frames: from frame ``start`` on) for a band."""
     f0 = FRAMES_BAND * band - 1
     out = np.zeros((130, FRAMES_BAND + 3), np.float32)
-    a, b = max(f0, 0), min(f0 + FRAMES_BAND + 3, mel.shape[1])
+    a, b = max(f0, start), min(f0 + FRAMES_BAND + 3, start + mel.shape[1])
     if b > a:
-        out[1:129, a - f0:b - f0] = mel[:, a:b]
+        out[1:129, a - f0:b - f0] = mel[:, a - start:b - start]
     return out
 
 
@@ -586,7 +597,14 @@ class Encoder:
     """The encoder (module docstring) as dispatches on a VisionDevice: ``band`` and ``carry`` programs (built at
     construction, over the same weight images: ``Builder.fork``). A clip (``__call__``) or a stream's bands (``reset``,
     ``run_band``): per band the host writes its inputs (stage 1's panels, the RoPE tables, the masks, where S2's time past
-    the clip goes), runs the band program and reads its rows; the carry program between bands."""
+    the clip goes), runs the band program and reads its rows; the carry program between bands.
+
+    A stream's band in progress (``run_band(partial=True)``: live audio) runs again as its frames arrive: every layer is
+    causal, so its rows before the frames' end are the band's, but for the rounding of V^T's bfp16 blocks (8 keys, the
+    later ones of a partial run past the frames: the rows of such a block as far from float64 as the band's, ~2%
+    from them), and the state carried on comes from its complete run.
+    Stage 1's panels are converted for the time groups the new frames reach. Such a stream keeps its state on the host
+    between bands (``saved``), as a clip encoded meanwhile (``owner``: who ran the encoder last) overwrites it."""
 
     def __init__(self, npu: VisionDevice, w: dict, *, name: str = "a", state: dict | None = None):
         """state: a ``state()`` on a device whose images were restored (``VisionDevice.restore``: the programs taken,
@@ -601,6 +619,9 @@ class Encoder:
         self.band_tags = self.pieces["band"]["tags"]
         self.proj = w["proj"]
         self.band = 0
+        self._carry = False  # (the last band ran complete: the carry program before the next)
+        self._t1 = None  # (stage 1's times of the band in progress in the mel image; None: none of its own yet)
+        self.owner: object | None = None  # (the stream that ran the encoder last; None: a clip)
 
     def _piece(self, build: Callable[[Builder], None]) -> dict:
         """A program: its words, their shim addresses by image (``VisionDevice.refs``), its tags ([word, tag])."""
@@ -627,17 +648,48 @@ class Encoder:
         for il, kd in enumerate(self.w["kinds"]):
             if kd == "conv":
                 self.npu.write(f"{p}.g{il}", z(2 * G_ROW))
-        self.band = 0
+        self.band, self._carry, self._t1 = 0, False, None
 
-    def run_band(self, mel: np.ndarray, frames: int) -> np.ndarray:
-        """The stream's next band (its rows 512 band ..: (512, proj) float32) of the clip's log-mel spectrogram mel (128,
-        >= the band's frames; ``frames``: the clip's frames, the end's zero padding), the state carried on."""
-        p, b = self.p, self.band
-        if b:
+    def carry(self) -> None:
+        """The state of the band that ran complete into the next band's place now (else before the next band)."""
+        if self._carry:
             self.npu.run(self.carry_tr)
-        self.npu.write(f"{p}.mel", im2col(band_mel(mel, b), b, -(-frames // 2)))
-        self.npu.write(f"{p}.rope", rope_image(ROWS_BAND * b))
-        self.npu.write(f"{p}.mask", mask_image(b == 0))
+            self._carry = False
+
+    def saved(self) -> list[np.ndarray]:
+        """The stream's state at the next band's start (after ``carry``): the bytes ``Net.carried`` copies."""
+        assert not self._carry
+        return [self.npu.read(f"{self.p}.{name}", nb, dst) for name, _, _, dst, nb in self.net.carried()]
+
+    def restore(self, band: int, saved: list[np.ndarray] | None) -> None:
+        """A stream's state at band ``band``'s start (``saved``; None: band 0's, zero)."""
+        if saved is None:
+            self.reset()
+        else:
+            for (name, _, _, dst, _), data in zip(self.net.carried(), saved, strict=True):
+                self.npu.write(f"{self.p}.{name}", data, dst)
+            self._carry, self._t1 = False, None
+        self.band = band
+
+    def run_band(self, mel: np.ndarray, frames: int, *, start: int = 0, partial: bool = False) -> np.ndarray:
+        """The stream's band (its rows 512 band ..: (512, proj) float32) of the clip's log-mel spectrogram mel (128,
+        frames ``start`` .. >= the band's; ``frames``: the clip's frames so far, the end's zero padding); ``partial``:
+        the band runs again with more frames (its rows past the frames' end are not the stream's), else the next call
+        runs the next band, the state carried on."""
+        p, b = self.p, self.band
+        self.carry()
+        t1 = -(-frames // 2)
+        if self._t1 is None:  # (the band's first run: its tables and every group)
+            g0, g1 = 0, GROUPS
+            self.npu.write(f"{p}.rope", rope_image(ROWS_BAND * b))
+            self.npu.write(f"{p}.mask", mask_image(b == 0))
+        else:  # (the groups the new frames reach; the later ones stay zero)
+            g0, g1 = self._t1 // MEL_PX, min(-(-(t1 - T1 * b) // MEL_PX), GROUPS)
+        if g1 > g0:
+            img = im2col(band_mel(mel, b, start), b, t1, (g0, g1))
+            for c in range(COLS):
+                self.npu.write(f"{p}.mel", img[c], (c * MEL_OPS + 8 * g0) * MEL_BYTES)
+        self._t1 = min(t1 - T1 * b, T1) if partial else None
         t2 = -(-frames // 4) - T2 * b  # (S2's first time past the clip's end, if in this band)
         zrow = self.npu.address(f"{p}.s2", (1 + t2) * S2_ROW) if 0 <= t2 < T2 else self.npu.address(f"{p}.junk")
         tr = self.band_tr
@@ -646,7 +698,9 @@ class Encoder:
             tr.words[idx], tr.words[idx + 1] = zrow & 0xFFFFFFFF, zrow >> 32
         tr.flush()
         self.npu.run(tr)
-        self.band += 1
+        if not partial:
+            self.band += 1
+            self._carry = True
         lv = self.net.lv
         raw = self.npu.read(f"{p}.emb", COLS * lv.ct(OUT_W)).reshape(COLS, -1)
         out = np.empty((ROWS_BAND, self.proj), np.float32)
@@ -659,5 +713,6 @@ class Encoder:
         frames = mel.shape[1]
         rows = -(-frames // 8)
         self.reset()
+        self.owner = None
         out = [self.run_band(mel, frames) for _ in range(-(-rows // ROWS_BAND))]
         return np.concatenate(out)[:rows]

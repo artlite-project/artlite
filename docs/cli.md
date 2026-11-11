@@ -26,7 +26,7 @@ and generation speeds go to stderr.
 
 | option | |
 |---|---|
-| `-p TEXT`, `--prompt`; `-f FILE`, `--file` | the user message, or a file holding it (one of them is required) |
+| `-p TEXT`, `--prompt`; `-f FILE`, `--file` | the user message, or a file holding it (one of them is required, but for a transcription: `--audio` alone) |
 | `-sys TEXT`, `--system-prompt` | system message |
 | `--raw` | the prompt as it is, without the chat template |
 | `--think` | let the model think first (Gemma 4, Qwen, LFM3; default: an empty thought) |
@@ -49,10 +49,13 @@ and generation speeds go to stderr.
 | `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
 | `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4, LFM3), below |
-| `--mmproj FILE` | the vision encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`): images in the prompt |
+| `--mmproj FILE` | the vision or speech encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; LFM3-Audio-2B: `mmproj-LFM3-Audio-2B-Q8_0.gguf`): images or audio in the prompt |
 | `--image FILE` | an image (repeatable), where the prompt has `<__media__>` (llama.cpp's marker), else before it ([Qwen](models/qwen35.md#images-qwen35--36--38), [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images)) |
 | `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, else 8 / 4096 and 64 / 4096, llama.cpp's) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
+| `--audio FILE` | an audio file (repeatable; WAV, MP3, FLAC, Ogg Vorbis: [LFM3-Audio](models/lfm3.md#lfm3-audio-2b-speech)), where the prompt has `<__media__>`, else before it, after the images; without `-p` / `-f` a transcription (the model card's ASR system message) |
+| `--language LANG` | a transcription's language (a code, `en`, `de`, ..., or a name; default: the model tells) |
+| `--live [fast\|realtime]` | live transcription (English) of the `--audio` files: the text while the audio streams in, 0.1 s at a time, as fast as it goes or (`realtime`) as a microphone's; stderr reports the NPU's share of the audio's time and (`realtime`) each chunk's latency |
 
 The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen3
 its model card's (thinking: temperature 0.6, top-k 20, top-p 0.95; else 0.7, 20, 0.8); Qwen3.5 and later and LFM3

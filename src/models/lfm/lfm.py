@@ -23,13 +23,15 @@ import torch
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import ClipConfig, LfmConfig
+from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
 
 from ..common import Model, OverlayModel, Sampling
+from ..lfm3a import host as a_host
+from ..lfm3a import npu as a_npu
 from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
-from ..sequence import Sequence
+from ..sequence import Sequence, splice_media
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LfmImage
 from .overlay import KV_K, LfmOverlay
@@ -113,16 +115,19 @@ class NpuLfm(OverlayModel):
 class Lfm(Model):
     """An lfm3 GGUF file: the architecture, tokenizer and chat template from its metadata. Thinking: the template opens
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
-    (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the vision encoder's file (images in prompts: LFM3-VL's,
-    ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default the
-    mmproj's 64 .. 4096, a d1 decision model's 64 .. ``D1_IMAGE_TOKENS``)."""
+    (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the media encoders' file: a vision encoder (images in
+    prompts: LFM3-VL's, ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged
+    tokens, default the mmproj's 64 .. 4096, a d1 decision model's 64 .. ``D1_IMAGE_TOKENS``) and / or a speech encoder
+    (audio clips in prompts: LFM3-Audio's, ``models.lfm3a.npu.NpuAudio``; a message's parts ``{"type": "audio", "audio":
+    a file, its bytes or 16 kHz samples}``, OpenAI's ``input_audio`` and ``audio_url`` ones). LFM3-Audio's language model
+    (its file has the ``asr`` chat template) answers in text: its speech tokens are banned (``host.TEXT_ONLY_BANNED``)."""
 
     name = "LFM3"
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
-    projectors = vl_npu.PROJECTORS
+    projectors = vl_npu.PROJECTORS + a_npu.PROJECTORS
 
     def __init__(self, path: str, *, kv_k: str = "single", mmproj: str | None = None, image_min_tokens: int | None = None,
                  image_max_tokens: int | None = None):
@@ -136,15 +141,34 @@ class Lfm(Model):
         self.bos = int(self.gguf.meta["tokenizer.ggml.bos_token_id"])
         self.kv_k = kv_k
         self._npu: NpuLfm | None = None
+        toks = self.gguf.strings("tokenizer.ggml.tokens")
+        self.banned = tuple(toks.index(t) for t in a_host.TEXT_ONLY_BANNED) \
+            if "tokenizer.chat_template.asr" in self.gguf.meta else ()
         if mmproj is not None:
-            clip = ClipConfig.from_gguf(GGUFFile(mmproj))
-            if clip.projector not in self.projectors:
-                raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: {', '.join(self.projectors)})")
-            if clip.projection_dim != self.cfg.hidden_size:
-                raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's {self.cfg.hidden_size}")
-            if image_max_tokens is None and not self.cfg.causal:
-                image_max_tokens = D1_IMAGE_TOKENS
-            self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
+            mg = GGUFFile(mmproj)
+            has_vision = bool(mg.meta.get("clip.has_vision_encoder", "clip.vision.projector_type" in mg.meta))
+            if AudioConfig.has_audio(mg):
+                ac = AudioConfig.from_gguf(mg)
+                if ac.projector not in a_npu.PROJECTORS:
+                    raise NotImplementedError(f"{mmproj}: audio projector {ac.projector!r} (supported: "
+                                              f"{', '.join(a_npu.PROJECTORS)})")
+                if ac.projection_dim != self.cfg.hidden_size:
+                    raise ValueError(f"{mmproj}: embeddings of {ac.projection_dim}, the language model's "
+                                     f"{self.cfg.hidden_size}")
+                self.audio = a_npu.NpuAudio(mmproj)
+            elif not has_vision:
+                raise ValueError(f"{mmproj}: neither a vision nor a speech encoder")
+            if has_vision:
+                clip = ClipConfig.from_gguf(mg)
+                if clip.projector not in vl_npu.PROJECTORS:
+                    raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: "
+                                              f"{', '.join(vl_npu.PROJECTORS)})")
+                if clip.projection_dim != self.cfg.hidden_size:
+                    raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's "
+                                     f"{self.cfg.hidden_size}")
+                if image_max_tokens is None and not self.cfg.causal:
+                    image_max_tokens = D1_IMAGE_TOKENS
+                self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -155,21 +179,27 @@ class Lfm(Model):
         bos = self.gguf.strings("tokenizer.ggml.tokens", self.bos)[0]
         text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
                            template=self.chat_template, **{"bos_token": bos, **(variables or {})})
-        images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
-                  if isinstance(p, dict) and p.get("type") == "image"]
-        if not images:
+        parts = [p for m in messages if isinstance(m.get("content"), list) for p in m["content"] if isinstance(p, dict)]
+        images = [p["image"] for p in parts if p.get("type") == "image"]
+        clips = [a_host.part_audio(p) for p in parts if p.get("type") in a_host.AUDIO_PARTS]
+        if not images and not clips:
             return self.tokenizer.encode(text)
-        if self.vision is None:
+        if images and self.vision is None:
             raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
-        seq = vl_host.image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
-        self._vision_ran()
-        return seq
+        if clips and self.audio is None:
+            raise ValueError(f"{self.name}: audio needs its speech encoder (an mmproj file)")
+        try:
+            return splice_media(text, {vl_host.IMAGE: [self.vision.sequence(im) for im in images],
+                                       a_host.AUDIO: [self.audio.sequence(c) for c in clips]}, self.tokenizer.encode)
+        finally:
+            self._vision_ran()
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""
         s = SAMPLING | self.cfg.sampling
         return Sampling(temp=s["temp"], top_k=int(s["top_k"]), top_p=s.get("top_p", 1.0),
-                        repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
+                        repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)),
+                        banned=self.banned)
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLfm:
         self._npu = NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
