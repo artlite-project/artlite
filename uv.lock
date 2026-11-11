@@ -103,7 +103,7 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'examples'", specifier = ">=0.10.0" },
     { name = "httpx", marker = "extra == 'examples'", specifier = ">=0.28" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "llvm-aie", specifier = "==22.0.0.2026110801+22c4674a" },
+    { name = "llvm-aie", specifier = "==22.0.0.2026111101+81af12b7" },
     { name = "ml-dtypes" },
     { name = "mlir-aie", specifier = "==1.4.6.dev15+ge5a3fa1" },
     { name = "numpy" },
@@ -552,11 +552,11 @@ wheels = [
 
 [[package]]
 name = "llvm-aie"
-version = "22.0.0.2026110801+22c4674a"
+version = "22.0.0.2026111101+81af12b7"
 source = { registry = "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly" }
 wheels = [
-    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026110801+22c4674a-py3-none-win_amd64.whl" },
-    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026110801+22c4674a-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
+    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111101+81af12b7-py3-none-win_amd64.whl" },
+    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111101+81af12b7-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]

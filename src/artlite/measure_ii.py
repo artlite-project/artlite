@@ -511,7 +511,7 @@ class _Compilation:
         return self.clean_returncode or self.annotated_returncode
 
 
-COMPILE_TIMEOUT = 600  # seconds (a fused library's translation unit takes ~200 s)
+COMPILE_TIMEOUT = 120  # seconds (a fused library's translation unit takes ~30 s, ~45 s with 16 compiles at once)
 
 
 def _run_compiler(command: list[str]) -> tuple[str, str, int]:
