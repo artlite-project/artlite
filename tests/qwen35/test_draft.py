@@ -23,11 +23,14 @@ from ..common import essay
 from . import ref
 
 N = 100
-# (per model: the router gap below which a row's 8th and 9th experts tie, h's median and largest error elsewhere;
-# Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median; the
-# 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%. The K records hold K as single bfp16: the 35B-A3B's
-# h 0.72-0.74% median against the oracle, 0.68-0.70% against one with K so rounded; its 1.2% gaps flip at S 4)
-TOL = {"35B-A3B": (0.015, 7.5e-3, 2e-2), "35B-A3B-Q8_0": (0.015, 7.5e-3, 2e-2), "occamy": (0.02, 1.5e-2, 3e-2),
+# (per model: the router gap below which a row's 8th and 9th experts may trade places, h's median and largest error;
+# a row within that gap is checked against the oracle that routes it as the NPU did: either expert (the router's input
+# is ~0.7% from the oracle's: the 35B-A3B Q8_0 drafter's row 64 of the essay, a 2.1% gap, takes the 9th, its h 1.0%
+# from that oracle and 11% from the other). Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as
+# bf16: that alone moves h by 0.9% median; the 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%. The
+# K records hold K as single bfp16: the 35B-A3B's h 0.72-0.74% median against the oracle, 0.68-0.70% against one with
+# K so rounded)
+TOL = {"35B-A3B": (0.03, 7.5e-3, 2e-2), "35B-A3B-Q8_0": (0.03, 7.5e-3, 2e-2), "occamy": (0.03, 1.5e-2, 3e-2),
        "3.8-27B": (0.0, 1.5e-2, 3e-2)}
 # (designs of 8 slots: x as single bfp16 rows, ``decode.gemv``; the 27B's h 1.4% median, 4.3% at most)
 TOL8 = {"3.8-27B": (0.0, 2e-2, 5e-2)}
@@ -78,20 +81,27 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     draft.load()
     r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids)
     tie, *tol = (TOL8 if draft.SLOTS == 8 else TOL)[request.param]
-    tied = np.zeros(N, bool)
-    if cfg.moe:
+    refs = [r]
+    if cfg.moe:  # (rows whose 8th and 9th experts nearly tie: either may win, the other oracle routes them with the 9th)
         t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
         p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ t.dequantize().reshape(t.rows, -1).T), -1)[:, ::-1]
-        tied = (p[:, 7] - p[:, 8]) / p[:, 7] < tie  # (rows whose 8th and 9th experts nearly tie: either may win)
-    return draft, emb, h, r, tied, tol
+        swap = (p[:, 7] - p[:, 8]) / p[:, 7] < tie
+        refs.append(ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids, swap=swap))
+    return draft, emb, h, refs, tol
+
+
+def _nearest(got: np.ndarray, wants: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Per row the rms error of got relative to the nearer of the oracles' wants (the routing the NPU took), and which."""
+    e = np.stack([np.sqrt(((got - w) ** 2).mean(-1) / (w ** 2).mean(-1)) for w in wants])
+    return e.min(0), e.argmin(0)
 
 
 @pytest.mark.parametrize("S", [1, 3, 4, 8])
 def test_draft_steps(setup: tuple, S: int) -> None:
-    """Rows within 1.5% rms of the oracle's h (median 0.5%) but where the router's 8th and 9th experts tie within 1%
-    (Occamy's: ``TOL``); the head's argmax the oracle's on those rows where its top two logits are 0.1 apart. S 8: the
-    designs of 8 slots (the 27B's)."""
-    draft, emb, h, r, tied, (med, top) = setup
+    """Rows within ``TOL`` of the oracle's h (rows whose router's 8th and 9th experts nearly tie: of the oracle that
+    routes them as the NPU did); the head's argmax that oracle's on those rows where its top two logits are 0.1 apart.
+    S 8: the designs of 8 slots (the 27B's)."""
+    draft, emb, h, refs, (med, top) = setup
     if S > draft.SLOTS:
         pytest.skip(f"a design of {draft.SLOTS} slots")
     draft.reset()
@@ -101,12 +111,12 @@ def test_draft_steps(setup: tuple, S: int) -> None:
         lg.append(draft.step(emb[p:p + k], h[p:p + k], p).astype(np.float32))
         hs += [draft.hidden_state(s) for s in range(k)]
     lg, hs = np.concatenate(lg), np.stack(hs)
-    want = r["h_nextn"].astype(np.float64)
-    e = np.sqrt(((hs - want) ** 2).mean(-1) / (want ** 2).mean(-1))
-    assert np.median(e) < med and e[~tied].max() < top, (np.median(e), e[~tied].max())
-    top2 = np.sort(r["logits"], -1)[:, -2:]
-    clear = (top2[:, 1] - top2[:, 0] > 0.1) & ~tied
-    assert (lg.argmax(-1) == r["logits"].argmax(-1))[clear].all()
+    e, which = _nearest(hs, [r["h_nextn"].astype(np.float64) for r in refs])
+    assert np.median(e) < med and e.max() < top, (np.median(e), e.max(), int(e.argmax()))
+    want = np.choose(which[:, None], [r["logits"] for r in refs])
+    top2 = np.sort(want, -1)[:, -2:]
+    clear = top2[:, 1] - top2[:, 0] > 0.1
+    assert (lg.argmax(-1) == want.argmax(-1))[clear].all()
 
 
 def test_table(setup: tuple) -> None:
@@ -114,9 +124,9 @@ def test_table(setup: tuple) -> None:
     seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
-    2.5% rms of the oracle's (its h, the file's rows of those tokens) on the rows ``test_draft_steps`` checks (8 slots:
-    4%)."""
-    draft, emb, h, r, tied, _ = setup
+    2.5% rms of the oracle's (its h, the file's rows of those tokens; a near tie's row: of the oracle that routes it as
+    the NPU did, as ``test_draft_steps``) (8 slots: 4%; Occamy: its h bound, 3%)."""
+    draft, emb, h, refs, (_, top) = setup
     d = draft if draft.w_of is not None else QwenDraft(draft.target, draft.gguf)  # (the model's own block: its buffer)
     if d is not draft:
         d.load()
@@ -132,10 +142,10 @@ def test_table(setup: tuple) -> None:
     assert np.array_equal(t.ids, ids)
     lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).astype(np.float32)[:, t.rows] for p in range(0, N, 4)])
     w = d.gguf.rows("output.weight", t.ids[t.rows]).astype(np.float64)
-    want = r["h_nextn"].astype(np.float64) @ w.T
-    e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
-    # (8 slots: 3.6%; Occamy's 2.3%: position 0's V in the step's blocks, ``TOL``)
-    assert e[~tied].max() < (2.5e-2 if d.SLOTS == 4 else 4e-2), (np.median(e), e[~tied].max())
+    e, _ = _nearest(lg, [r["h_nextn"].astype(np.float64) @ w.T for r in refs])
+    # (8 slots: 3.6%; the h bound of ``TOL`` where larger: Occamy's row 4, a near tie routed as the oracle, h 2.1% off, its
+    # logits 2.7%)
+    assert e.max() < (max(2.5e-2, top) if d.SLOTS == 4 else 4e-2), (np.median(e), e.max())
 
 
 def test_interleaved(setup: tuple) -> None:

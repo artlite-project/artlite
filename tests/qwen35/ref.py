@@ -392,14 +392,15 @@ def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndar
 
 
 def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos: np.ndarray, *,
-              head: np.ndarray | None = None) -> dict[str, np.ndarray]:
+              head: np.ndarray | None = None, swap: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """An MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP file, or of a
     model file with a block of its own) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the
     rows after it: emb (T, H) the rows' token embeddings, h (T, H) the model's output-normed hidden state of the
     position before each (zeros at 0). Its FFN: a ``qwen35moe`` file's MoE, a ``qwen35`` file's dense SwiGLU.
     Returns its tensors by llama.cpp's names (``mtp_eh_proj``: the layer's input x0, ``mtp_attn_residual``,
     ``mtp_attn_post_norm``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``: the next draft's h), an MoE's experts' ids
-    and weights (``ids``, ``weights``) and the logits of the tokens ``head`` (None: none)."""
+    and weights (``ids``, ``weights``) and the logits of the tokens ``head`` (None: none). ``swap`` (T,) bool: rows whose
+    router takes its 9th expert instead of its 8th (a near tie's other side)."""
     L, eps = cfg.num_hidden_layers, cfg.rms_norm_eps
     b = f"blk.{L}."
 
@@ -426,7 +427,12 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
     x1 = out["mtp_attn_residual"] = (o * sigmoid(gate)).reshape(T, -1) @ mat("attn_output.weight").T + x0
     xm = out["mtp_attn_post_norm"] = rms_norm(x1, vec("post_attention_norm.weight"), eps)
     if cfg.moe:
-        ids, w = moe_route(xm @ mat("ffn_gate_inp.weight").T, cfg.n_experts_used)
+        k, lg = cfg.n_experts_used, xm @ mat("ffn_gate_inp.weight").T
+        ids, w = moe_route(lg, k)
+        if swap is not None:
+            ids = np.where(swap[:, None] & (np.arange(k) == k - 1), moe_route(lg, k + 1)[0][:, k:], ids)
+            w = np.take_along_axis(softmax(lg), ids, -1)
+            w = (w / w.sum(-1, keepdims=True)).astype(np.float32)
         out["ids"], out["weights"] = ids, w
         y = moe_ffn(xm, ids, w, experts(gguf, L)) + shared_expert(
             xm, mat("ffn_gate_shexp.weight"), mat("ffn_up_shexp.weight"), mat("ffn_down_shexp.weight"),

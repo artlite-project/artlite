@@ -64,8 +64,9 @@ def test_prefill_slice(size: str, La: int) -> None:
             dec.append(ref.rel_err(ov.hidden(-1), want[t]))
     err = np.asarray(err)
     # (the prefill GEMMs multiply bfp16 activations by the weights dequantized to bfp16: ~1.4% rms per projection vs
-    # the decode GEMV's bf16 x; 9B: mean 0.8%, max 6.4%, an outlier dimension cancelling in layer 19; 1B: llama.cpp's
-    # own noise is ~3x the 9B's, the decode path's error 1.5%, the prefill's 1.7%; 35B-A3B: mean 1.8%, the experts' two
+    # the decode GEMV's bf16 x, which adds 0.2-0.6% to the decode path's mean error (9B 0.34 -> 0.79%, 27B 0.45 -> 0.62%,
+    # 1B 1.26 -> 1.69%: llama.cpp's own noise is ~3x the 9B's, Kev 0.62 -> 1.25%); 9B: max 6.4%, an outlier dimension
+    # cancelling in layer 19; 35B-A3B: mean 1.8%, the experts' two
     # GEMMs and routing flips: x ~1% off changes a few % of the top-8 sets per layer, and a token whose 8th and 9th
     # logits nearly tie in a layer of the slice may take another expert in either run (up to 14% at one such token;
     # the NPU's own prefill and decode paths up to 10% apart at one), so the largest error is over the tokens llama.cpp
@@ -83,5 +84,5 @@ def test_prefill_slice(size: str, La: int) -> None:
     if moe:
         assert np.max(err[clear]) < 0.12 and np.mean(err) < 2.4 * np.mean(dec)
     else:
-        assert np.max(err) < 8e-2 and np.mean(err) < max(1.5e-2, 1.3 * np.mean(dec))
+        assert np.max(err) < 8e-2 and np.mean(err) < np.mean(dec) + 8e-3
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3
