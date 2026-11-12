@@ -156,7 +156,7 @@ class DraftPrefill:
 
     def after(self, dev: object, n: int) -> None:
         """The next chunk's carry: this one's projection of its last valid row's h; the drafter's cache records of the
-        chunk's last record are its (record mode)."""
+        chunk's last record are its (the next step's ring from its V panels: ``QwenOverlay._rings_from_prefill``)."""
         o = 2 * self.H * (self.R0 + n)
         dev.fetch("DY", o, self.carry.size)
         self.carry[:] = dev.view("DY")[o:o + self.carry.size]

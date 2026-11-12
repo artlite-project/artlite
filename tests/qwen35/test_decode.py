@@ -603,15 +603,15 @@ def test_attention_later_keys(size: str, p: int, S: int, split: int) -> None:
 def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.0, tol: float = 3e-2) -> None:
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
-    holds them, the open ones encoded from their exact rows up to the step's last position: the ring slot's rows before p,
-    or with ``rec`` the V panels as a prefill left them, and the new ones); the relayed records (a chain's first column: the K
-    records of the new positions; its last: their records' V panels up to the last one and rows). split: the chain of a
+    holds them, the open ones encoded from their exact rows up to the slot's position: the ring slot's rows before p,
+    with ``rec`` the V panels' values a prefill left, as ``QwenOverlay._rings_from_prefill`` puts them in the ring, and
+    the new ones); the relayed records (a chain's first column: the K records of the new positions; its last: their
+    records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
     emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots; split 2:
     of 3 or 4 on the chain's halves, each half's two cores with its heads, on the streams of the chain's first two). The
     3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
-    column's stream, a step across a cache group too; what a position sees of an open record is its panels up to the
-    step's last position, o an octet's 8 rows."""
+    column's stream, a step across a cache group too; o an octet's 8 rows."""
     from models.qwen35 import attn as A1
 
     path = ref.size_gguf(size)
@@ -638,6 +638,8 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     kc[:, p:] = vc[:, p:] = 0
     kc[:, 32:] *= far
     groups = [KV.kv_groups(kc[h], vc[h], T, 1, dmajor=True) for h in range(kvh)]
+    kc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[0] for gr in groups]  # (as stored)
+    vc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[1] for gr in groups]
     hb = groups[0].nbytes
     rb = 2 * T  # (a head's ring)
     kv_bytes = kvh * (hb + rb) + T
@@ -645,12 +647,10 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     kvv = dev.view("KV")
     for h in range(kvh):
         kvv[h * hb:(h + 1) * hb] = groups[h].reshape(-1)
-        rows = vc[h, 8 * rp:8 * rp + 8].reshape(8, A1.ND, 8).transpose(1, 0, 2)  # ([d-block][position][8])
+        rows = (vc_s[h] if rec else vc[h])[8 * rp:8 * rp + 8].reshape(8, A1.ND, 8).transpose(1, 0, 2)  # ([d-block][position][8])
         o = kvh * hb + h * rb + (rp & 1) * T
         kvv[o:o + A1.ROWS_B] = interleave_bits(rows.reshape(-1))
     dev.flush("KV")
-    kc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[0] for gr in groups]  # (as stored)
-    vc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[1] for gr in groups]
     qg = mmv.bf(rng.standard_normal((COLS, S, qc, 2 * HD)).astype(np.float32))  # [q | gate] per head
     kv = mmv.bf(rng.standard_normal((S, kvh, 2 * HD)).astype(np.float32))  # [K | V] per KV head
     qn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
@@ -670,7 +670,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
         m = np.zeros(OD.META, np.int32)
         m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (3 if half else nph + 1 if split else 2) * S
         m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, split, S), p, int(split)
-        m[MD.M_NTAIL], m[MD.M_ATREC] = tl, int(rec)
+        m[MD.M_NTAIL] = tl
         if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
         elif kr == 0:  # (then group g's K and V objects)
@@ -712,9 +712,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
                 seq.fill("A", c, base + o_k * g * T, 2 * T, **pk)
         if not split or (k if half else role == A1.ROLE_V):  # (the tail objects)
             for t in range(nt):
-                r = rl if t else rp
-                v0 = base + o_k * (rp // 4) * T + T + rp % 4 // 2 * 2 * A1.REC_V  # (its pair of records)
-                seq.fill("A", c, v0 if rec and t == 0 else ring + (r & 1) * T, T, **pk)
+                seq.fill("A", c, ring + ((rl if t else rp) & 1) * T, T, **pk)
         if not split and k == 0 and not one:
             seq.fill("A", c, base + o_k * g * T, 2 * T)
     for c in range(COLS):
@@ -747,7 +745,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
         else:
             o_c = outs[c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
                 outs[c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
-        # the open records' rows: the ring's (or the panels' in record mode) before p, then the new ones
+        # the open records' rows: the ring's before p (rec: the panels' values), then the new ones
         rows = {r: (vc_s[h] if rec else vc[h])[8 * r:8 * r + 8].copy() for r in {rp, rl}}
         for s in range(S):
             rows[(p + s) // 8][(p + s) % 8] = kv[s, h, HD:]
@@ -755,9 +753,9 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
         for s in range(S):
             q = p + s
             v_seen = vc_s[h][:q].copy()
-            for r in sorted(rows):  # (an open record up to q, or one pass: up to the step's last position: encoded from its rows)
+            for r in sorted(rows):  # (an open record up to q: encoded from its rows)
                 if 8 * r <= q:
-                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min(p + S - 8 * r, 8))])[:q + 1]
+                    v_seen = np.concatenate([v_seen[:8 * r], _enc(rows[r], min(q + 1 - 8 * r, 8))])[:q + 1]
             k_prev = np.concatenate([kc_s[h][:p], *[x[None] for x in kn_all]]) if kn_all else kc_s[h][:p]
             want, knew = ref.core_attention(qg[c, s], kv[s, h, :HD], v_seen[q], k_prev, v_seen[:q], q_norm=qn,
                                             k_norm=kn, cs=cs[s], eps=cfg.rms_norm_eps)
@@ -846,6 +844,47 @@ def test_overlay_slice(size: str, mode: str) -> None:
     top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
                  "3.8-27B": (5.6e-2, 2.1e-2), "swift": (5.6e-2, 2.1e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
+
+
+@pytest.mark.parametrize("size", ["1B", "9B"])
+def test_drafts_exact(size: str) -> None:
+    """A step of S slots gives each kept slot the numbers of a step of one, bit for bit, so that drafts never change a
+    greedy text: the first layers up to the first full-attention layer over 120 random tokens (the attention's chains
+    divide the caches from 96 positions on), by steps of one and by a generation's rounds: a token and up to SLOTS - 1
+    drafts, junk (rejected: the round keeps the token) or the next tokens (the round keeps some of them); every kept
+    slot's logits (bf16 bits) those of the step of one."""
+    from models.qwen35.overlay import QwenOverlay
+
+    path = ref.size_gguf(size)
+    if not os.path.exists(path):
+        pytest.skip(f"{path}: not present")
+    g = GGUFFile(path)
+    layers = list(range(ref.QwenConfig.from_gguf(g).attention_layers[0] + 1))
+    P = 120
+    rng = np.random.default_rng(5)
+    tokens = [int(t) for t in rng.integers(0, 50000, P)]
+
+    def run(drafts: bool) -> dict[int, np.ndarray]:
+        ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=P + 64)
+        ov.load(release=False)
+        out, t = {}, 0
+        while t < P:
+            S = int(rng.integers(1, ov.SLOTS + 1)) if drafts else 1
+            junk = bool(rng.random() < 0.5)
+            ids = [tokens[t], *([int(x) for x in rng.integers(0, 50000, S - 1)] if junk else tokens[t + 1:t + S])]
+            lg = ov.step(g.rows("token_embd.weight", ids), t, commit=len(ids) == 1)
+            m = 1 if junk or len(ids) == 1 else int(rng.integers(1, len(ids) + 1))
+            for s in range(m):
+                out[t + s] = np.asarray(lg[s]).view(np.uint16).copy()
+            if len(ids) > 1:
+                ov.accept(m)
+            t += m
+        ov.dev = None
+        return out
+
+    one, rounds = run(False), run(True)
+    bad = [q for q in sorted(one) if not np.array_equal(one[q], rounds[q])]
+    assert not bad, f"{len(bad)} of {P} positions differ: {bad[:8]}"
 
 
 @pytest.mark.parametrize("first", [0, 10])

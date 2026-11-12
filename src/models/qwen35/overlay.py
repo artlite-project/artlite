@@ -90,13 +90,13 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
 from artlite.operators import paging
+from artlite.operators.bfp16 import block_values
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
 
 from . import attn, gdn
 from .decode import (
     M_ANA,
-    M_ATREC,
     M_BRANCH,
     M_COMMIT,
     M_CSHIFT,
@@ -858,10 +858,9 @@ class QwenOverlay(ModelOverlay):
         act = dev.view("ACT")
         c0, s0 = attn.rope_cs(self.cfg, self.rope[p:p + S])
         cs = np.concatenate([c0, s0], 1)
-        rec = np.array([L in self.vring.from_prefill for L in self.fatt])
-        for L, r in zip(self.fatt, rec):
-            if not r:
-                self.vring.check(L, p, p)
+        self._rings_from_prefill(p)
+        for L in self.fatt:
+            self.vring.check(L, p, p)
         w = np.zeros((U, nph, len(F_WORDS)), np.int32)  # (per sub-step and column of its chain)
         gr = np.zeros((U, len(FILLS), nph, 2), np.int64)  # (a fill's groups)
         su = np.zeros((U, 2), np.int64)  # (a sub-step's first position, slots)
@@ -888,8 +887,6 @@ class QwenOverlay(ModelOverlay):
         fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
         a32 = act.view(np.int32)
         a32[fo[..., None] + F_WORDS] = w[np.arange(U), np.arange(COLS)[:, None] % nph]
-        a32[fo + M_ATREC] = 0
-        a32[fo[rec, :, 0] + M_ATREC] = 1
         q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)
         af = act.view(np.float32)
         for u, (a, n, _) in enumerate(st.subs):
@@ -903,11 +900,9 @@ class QwenOverlay(ModelOverlay):
         g = gr[f[:, 1], f[:, 6], f[:, 3]]
         o = attn.OBJS
         self._bd_words(words, f[:, 0], kv0 + f[:, 4] + o * g[:, 0] * T, np.where(f[:, 6] == 1, 2, o * (g[:, 1] - g[:, 0])) * T)
-        f = t["t"]  # (the ring slots of the sub-step's first and last records, or the first's V panels in record mode)
+        f = t["t"]  # (the ring slots of the sub-step's first and last records)
         r = (su[f[:, 1], 0] + np.where(f[:, 6], su[f[:, 1], 1] - 1, 0)) >> 3
-        trec = rec[f[:, 2]] & (f[:, 1] == 0) & (f[:, 6] == 0)  # (its pair of records)
-        off = np.where(trec, f[:, 4] + o * (r // 4) * T + T + (r % 4 // 2) * 2 * attn.REC_V, f[:, 5] + (r & 1) * T)
-        self._bd_words(words, f[:, 0], kv0 + off, np.full(len(off), T, np.int64))
+        self._bd_words(words, f[:, 0], kv0 + f[:, 5] + (r & 1) * T, np.full(len(r), T, np.int64))
         f = t["r"]  # (the first column's K records; the last's V panels (into their pairs) and rows, of record 0, 1)
         v = f[:, 3] == nph - 1
         r = (su[f[:, 1], 0] + np.where(np.where(v, f[:, 6] >= 2, f[:, 6] > 0), su[f[:, 1], 1] - 1, 0)) >> 3
@@ -918,6 +913,28 @@ class QwenOverlay(ModelOverlay):
         nk = attn.REC_K if ash.one else 2 * attn.REC_K
         self._bd_words(words, f[:, 0], kv0 + off, np.array([nk, attn.REC_V, attn.ROWS_B])[kind])
         st.tr.flush_lines(t["lines"])
+
+    def _rings_from_prefill(self, p: int) -> None:
+        """Before a step at p, of each attention layer whose caches a prefill wrote last (it writes no ring): its open
+        record (p >> 3) as rows into its ring slot, from the record's V panels in the cache (their values are bf16 values:
+        exact), so that a step reads every open record from the ring."""
+        layers = [L for L in self.fatt if L in self.vring.from_prefill]
+        if not layers:
+            return
+        r, dev, ash, T = p >> 3, self.dev, self.ash, self.T
+        if p % 8:
+            kv = dev.view("KV")
+            for L in layers:
+                for h in range(ash.kvh):  # (the record in its pair [d-block][record 2] of the group's V object)
+                    a = self.kv_off[L] + h * ash.head_bytes + attn.OBJS * (r // 4) * T + T + (r % 4 // 2) * 2 * attn.REC_V
+                    dev.fetch("KV", a, 2 * attn.REC_V)
+                    v = block_values(kv[a:a + 2 * attn.REC_V].reshape(attn.ND, 2, 8, 9)[:, r % 2])  # ([d-block][dim][position])
+                    o = self.ring(L, h) + (r & 1) * T
+                    kv[o:o + attn.ROWS_B] = np.ascontiguousarray(v.transpose(0, 2, 1), bfloat16).view(np.uint8).reshape(-1)
+                    dev.flush("KV", o, attn.ROWS_B)
+        for L in layers:
+            self.vring.slots.setdefault(L, {})[r & 1] = (r, p)
+            self.vring.from_prefill.discard(L)
 
     @property
     def can_branch(self) -> bool:

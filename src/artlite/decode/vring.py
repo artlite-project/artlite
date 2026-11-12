@@ -40,7 +40,8 @@ def ring_rows(slot: np.ndarray, hd: int) -> np.ndarray:
 class VRing:
     """Which open records the rings of an overlay's layers hold: per layer the (record, rows up to (exclusive)) of each
     slot as the last steps left them; and the layers whose cache a prefill wrote last (it writes no ring: their open
-    record's values are its V panels, exact as bf16 rows - a step reads them instead: record mode)."""
+    record's values are its V panels, exact as bf16 rows - a step reads them instead: record mode; qwen35's host decodes
+    them into the ring before the step)."""
 
     def __init__(self) -> None:
         self.slots: dict[int, dict[int, tuple[int, int]]] = {}

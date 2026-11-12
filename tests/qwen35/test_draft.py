@@ -26,9 +26,7 @@ N = 100
 # (per model: the router gap below which a row's 8th and 9th experts tie, h's median and largest error elsewhere;
 # Occamy's drafter is Q4_K / Q6_K, whose decode tiles hold d and dmin as bf16: that alone moves h by 0.9% median; the
 # 27B's block too: 0.84% median, two rows of the essay at 2.5-2.7%. The K records hold K as single bfp16: the 35B-A3B's
-# h 0.72-0.74% median against the oracle, 0.68-0.70% against one with K so rounded; its 1.2% gaps flip at S 4. A step
-# of S > 1 encodes its V records once, so position 0's V shares its bfp16 blocks with the step's later positions: the
-# row that attends to it alone moves by that, the 35B-A3B's to 1.75%, Occamy's 2.2% (S 1) -> 2.8%)
+# h 0.72-0.74% median against the oracle, 0.68-0.70% against one with K so rounded; its 1.2% gaps flip at S 4)
 TOL = {"35B-A3B": (0.015, 7.5e-3, 2e-2), "35B-A3B-Q8_0": (0.015, 7.5e-3, 2e-2), "occamy": (0.02, 1.5e-2, 3e-2),
        "3.8-27B": (0.0, 1.5e-2, 3e-2)}
 # (designs of 8 slots: x as single bfp16 rows, ``decode.gemv``; the 27B's h 1.4% median, 4.3% at most)

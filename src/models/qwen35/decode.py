@@ -12,7 +12,7 @@ Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the G
 ``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
 KV head's chain divides the cache's groups (1); the core's first group, the end of its attention groups, the first
 group past them (a chain's first core's: the sub-step's group, for its records only); its first slot's row of angles;
-record mode (the first tail object is the open record's V panels); the tail objects.
+the tail objects.
 """
 
 import numpy as np
@@ -32,7 +32,7 @@ from . import attn as AT
 from . import gdn as GD
 
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
-M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 11)  # (an F_ATT object's)
+M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 10)  # (an F_ATT object's)
 M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
 M_BRANCH = 37  # (a step whose last slots branch off an earlier one: an F_ATT object's two words, the gdn_in object's one: their
 # kernels' ``M_BRANCH``)
