@@ -9,7 +9,7 @@ cores of every column, their GEMV phases) with the qwen35 cores:
   pass, a design of 8 slots: each core emits its own rows, no tokens).
 
 Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
-``M_COMMIT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
+``M_COMMIT``, ``M_KSHIFT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
 KV head's chain divides the cache's groups (1); the core's first group, the end of its attention groups, the first
 group past them (a chain's first core's: the sub-step's group, for its records only); its first slot's row of angles;
 the tail objects.
@@ -32,6 +32,7 @@ from . import attn as AT
 from . import gdn as GD
 
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
+M_KSHIFT = OD.M_MODEL + 3  # (the gdn_in phase's, chunkwise core of 4: the k / v histories' and the gates' first row)
 M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 10)  # (an F_ATT object's)
 M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
 M_BRANCH = 37  # (a step whose last slots branch off an earlier one: an F_ATT object's two words, the gdn_in object's one: their
@@ -382,8 +383,8 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     def _gdn4_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
         """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "4 slots, chunkwise"): the step's message on M, then per k
-        head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, U] objects, 16 state
-        panels, its outputs, history and deltas out."""
+        head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, H] objects, 16 state
+        panels, its outputs and history out."""
         p, P, gdn = s.p, self.PREFIX, self.gdn
         bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
         x_ty = s.x_ty
@@ -394,11 +395,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         i_g = GW["st"] // 4
         kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
         kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
-        ks = [kx("gbegin"), Kernel(f"{p}_gmsg", "kernel.o", [s.c_ty, gws_ty]), kx("gq"), kx("gqw"), kx("gk"), kx("gv"), kx("gdl"),
-              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kd("ghq"), kd("ghk"), kd("gdlout"), kd("gout")]
+        ks = [kx("gbegin"), Kernel(f"{p}_gmsg", "kernel.o", [s.c_ty, gws_ty]), kx("gq"), kx("gqw"), kx("gk"), kx("gv"), kx("gvh"),
+              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kd("ghq"), kd("ghk"), kd("gvhout"), kd("gout")]
         nv = gdn.hc // 2
 
-        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gdl, gpanel, ghq, ghk, gdlout, gout, ws, *_tabs):
+        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gvh, gpanel, ghq, ghk, gvhout, gout, ws, *_tabs):
             def take(k: Kernel) -> None:  # an X object into the workspace
                 x = x_f.acquire(1)
                 k(x, ws)
@@ -427,15 +428,15 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                         emit(ghk)
                         for _ in range32(nv, unroll=False):  # its v heads
                             take(gv)
-                            take(gdl)
+                            take(gvh)
                             for _ in range32(16, unroll=False):
                                 x = x_f.acquire(1)
                                 d = d_f.acquire(1)
                                 gpanel(x, ws, d)
                                 d_f.release(1)
                                 x_f.release(1)
-                            emit(gout)  # (its outputs and history, then its deltas: one drain for the two)
-                            emit(gdlout)
+                            emit(gout)  # (its outputs and its history's first rows, then the rest: one drain for the two)
+                            emit(gvhout)
 
         for c in range(COLS):
             d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))

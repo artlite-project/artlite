@@ -335,7 +335,8 @@ class _Gdn:
         self.gcol = 256 + 4096 * (sh.n_slots if sh.chunk else 5 + 3 * self.npair)  # a column's GDN objects [header | payloads]
         gobj = dev.alloc("GOBJ", COLS * self.gcol)
         self.ps = sh.hc * 16 * GD.PANEL  # a column's state panels
-        dev.alloc("GSTATE", 256 + COLS * self.ps)
+        self.half = COLS * self.ps if sh.chunk else 0  # (a chunkwise core's: two halves, ``overlay._half``)
+        dev.alloc("GSTATE", 256 + COLS * self.ps + self.half)
         dev.alloc("GO", COLS * sh.hc * GD.D_BYTES // 2)  # (per v head 2 KB; a chunkwise core's: its 1 KB, 1 KB of padding)
         blk = r.block("qkv")
         cw = np.asarray(g.tensor(f"blk.{layer}.ssm_conv1d.weight").raw, np.float32)
@@ -362,14 +363,23 @@ class _Gdn:
             self.vh.append(vh)
             self.params.append({"conv_w": cw[rows], "dt": dt[vh], "ssm_a": A[vh], "norm": norm})
         dev.flush("GOBJ")
+        self.gobj0 = gobj.copy()
+
+    def reset(self) -> None:
+        """A new sequence: the objects as loaded (no conv history), zero states."""
+        self.dev.view("GOBJ")[:] = self.gobj0
+        self.dev.view("GSTATE")[:] = 0
+        self.dev.flush("GOBJ")
+        self.dev.flush("GSTATE")
 
     def pay(self, c: int, k: int) -> int:
         """Byte offset of column c's GDN object k's payload in GOBJ (k: q / k blocks 0 .. 3, K 4, pair p 5 + 3 p ..; a
         chunkwise core's: its payload slot)."""
         return c * self.gcol + 256 + 4096 * k
 
-    def _chunk_units(self, seq: Sequence) -> None:
-        """A chunkwise core's objects and drains (``overlay._gdn4``), its outputs into GO."""
+    def _chunk_units(self, seq: Sequence, h: int) -> None:
+        """A chunkwise core's objects and drains (``overlay._gdn4``; its state from half h, into the other), its outputs
+        into GO."""
         dev, MG, sh = self.dev, self.MG, self.sh
         dims4 = (OD.XB // 8, 2, OD.XB // 8, OD.XPAY // 4)
         units = [u for kh in range(2) for u in [("k", kh)] + [("v", h) for h in range(kh, sh.hc, 2)]]
@@ -379,13 +389,13 @@ class _Gdn:
                 seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i)) - 256), MG.KH_SPAN4 * OD.XB, dims4)
                 return
             seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) - 256), MG.V_SPAN4 * OD.XB, dims4)
-            seq.fill("X", c, dev.address("GSTATE", c * self.ps + 16 * i * MG.PANEL), 16 * OD.XB, dims4)
+            seq.fill("X", c, dev.address("GSTATE", h * self.half + c * self.ps + 16 * i * MG.PANEL), 16 * OD.XB, dims4)
 
         def drains(kind: str, i: int, c: int) -> None:
             if kind == "k":
                 seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i))), 2 * MG.D_BYTES, (512, 2, 512, 2048))
                 return
-            seq.drain("D", c, dev.address("GSTATE", 256 + c * self.ps + 16 * i * MG.PANEL), 16 * MG.PANEL)
+            seq.drain("D", c, dev.address("GSTATE", 256 + (1 - h) * self.half + c * self.ps + 16 * i * MG.PANEL), 16 * MG.PANEL)
             seq.drain("D", c, dev.address("GO", (c * sh.hc + i) * MG.D_BYTES // 2), MG.D_BYTES // 2)
             seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) + 2048), 3 * MG.D_BYTES // 2)
 
@@ -397,7 +407,7 @@ class _Gdn:
                 for c in range(COLS):
                     drains(*units[n - 1], c)
 
-    def _transaction(self, S: int, msg: bool) -> Transaction:
+    def _transaction(self, S: int, msg: bool, h: int = 0) -> Transaction:
         dev, op, r = self.dev, self.op, self.r
         MG = self.MG
         groups = mp.groups(r, OD.F_NORM | (OD.F_MSG if msg else 0), S, f32_ab=True)
@@ -416,7 +426,7 @@ class _Gdn:
             if msg and not self.sh.chunk:
                 seq.fill("X", c, dev.address("GOBJ", c * self.gcol), 5 * OD.XB, dims4)
         if msg and self.sh.chunk:
-            self._chunk_units(seq)
+            self._chunk_units(seq, h)
             seq.sync(fills=True)
             return Transaction(dev, seq.words())
         for c in range(COLS):
@@ -438,21 +448,23 @@ class _Gdn:
         seq.sync(fills=True)
         return Transaction(dev, seq.words())
 
-    def step(self, x: np.ndarray, *, nrep: int = 0, cshift: int = 0, commit: bool = False
+    def step(self, x: np.ndarray, *, nrep: int = 0, cshift: int = 0, commit: bool = False, kshift: int = 0, half: int = 0
              ) -> tuple[list[list[dict]], np.ndarray]:
-        """x (S, hidden): the slots' gdn_in inputs. Returns (per column per slot the message as the GDN core got it,
-        the gated outputs (S, v heads of the columns in column order, 128))."""
+        """x (S, hidden): the slots' gdn_in inputs (the words: ``QwenOverlay._set_gdn``'s; a chunkwise core's state from
+        ``half``). Returns (per column per slot the message as the GDN core got it, the gated outputs (S, v heads of the
+        columns in column order, 128))."""
         dev, hc, ch, S = self.dev, self.sh.hc, self.sh.ch, x.shape[0]
         out = []
         for msg in (False, True):
             gr = mp.groups(self.r, OD.F_NORM | (OD.F_MSG if msg else 0), S, f32_ab=True)[0]
             gr.meta[MD.M_NREP], gr.meta[MD.M_CSHIFT], gr.meta[MD.M_COMMIT] = nrep, cshift, int(commit)
+            gr.meta[MD.M_KSHIFT] = kshift
             act = dev.view("ACT")
             act[:] = 0
             act[:4 * OD.META] = gr.meta.view(np.uint8)
             act[OD.XB:] = OD.interleave(x).view(np.uint8).reshape(-1)
             dev.flush("ACT")
-            dev.dispatch(self._transaction(S, msg))
+            dev.dispatch(self._transaction(S, msg, half))
             if not msg:
                 dev.fetch("OUT")
                 raw = dev.view("OUT").view(np.uint16).reshape(COLS, -1)[:, :S * self.n_c * OD.C_LEN].reshape(COLS, S, -1)
@@ -479,11 +491,11 @@ class _Gdn:
                 out.append(o)
         return msgs, np.stack(out, 1).reshape(S, -1, 128)
 
-    def states(self) -> list[np.ndarray]:
+    def states(self, half: int = 0) -> list[np.ndarray]:
         from models.qwen35 import gdn as G1
 
         self.dev.fetch("GSTATE")
-        v = self.dev.view("GSTATE")[256:].reshape(COLS, -1)
+        v = self.dev.view("GSTATE")[256 + half * self.half:256 + half * self.half + COLS * self.ps].reshape(COLS, -1)
         return [G1.state_from_panels(v[c].view(np.float32), self.sh.hc) for c in range(COLS)]
 
 
@@ -534,15 +546,68 @@ def test_gdn_steps(setup: tuple) -> None:
     _gdn_steps(P.path, Lg, _t(G_["model.input_embed"][:5]), G_["final_output", Lg])
 
 
+class _Blocks:
+    """The host's words of a chunkwise core of 4 (``QwenOverlay``'s ``_advance``, ``_half``): blocks of 8 positions from 0."""
+
+    def __init__(self):
+        self.pos = self.cshift = self.kshift = 0
+
+    def words(self) -> dict[str, int]:
+        return {"nrep": self.pos % 8, "cshift": self.cshift, "kshift": self.kshift, "half": self.pos // 8 & 1}
+
+    def accept(self, m: int) -> None:
+        self.kshift = 8 if self.pos % 8 + m >= 8 else 0
+        self.cshift = m
+        self.pos += m
+
+
+def _gdn_blocks(path: str, Lg: int, x: np.ndarray, junk: np.ndarray) -> None:
+    """A chunkwise core of 4 (blocks of 8 positions, ``gdn``'s "4 slots, chunkwise") over the rows x in steps of one: each
+    output within bf16 rounding of the cores' arithmetic in sequence (ref.core_gdn_step), the state at each block's end in
+    the other half within 2e-3; then in steps of up to 4 slots whose drafts past the accepted ones are junk rows (steps
+    inside a block, past its end with all or part of its lanes accepted, ending at its end): every accepted slot's
+    outputs those of the steps of one, bit for bit."""
+    h = _Gdn(path, Lg)
+    hc, eps, N = h.sh.hc, h.cfg.rms_norm_eps, x.shape[0]
+    st = [np.zeros((hc, 128, 128), np.float32) for _ in range(COLS)]
+    cs = [np.zeros((3, h.sh.ch), np.float32) for _ in range(COLS)]
+    w, ones = _Blocks(), []
+    for p in range(N):
+        msgs, out = h.step(x[p:p + 1], **w.words())
+        want = np.zeros((1, COLS * hc, 128), np.float32)
+        for c in range(COLS):
+            o, cs[c], st[c] = ref.core_gdn_step(**msgs[c][0], conv_state=cs[c], state=st[c], eps=eps, **h.params[c])
+            want[0, hc * c:hc * (c + 1)] = o
+        assert ref.rel_err(out, want) < 1e-2, (p, ref.rel_err(out, want))
+        ones.append(out[0].copy())
+        if p % 8 == 7:  # (the block's end: its state in the other half)
+            got = h.states(1 - w.words()["half"])
+            assert max(ref.rel_err(got[c], st[c]) for c in range(COLS)) < 2e-3, p
+        w.accept(1)
+    h.reset()
+    w, j = _Blocks(), 0
+    for S, m in ((4, 2), (4, 3), (4, 2), (4, 4), (3, 1), (4, 4), (1, 1), (4, 3)):
+        p = w.pos
+        rows = np.concatenate([x[p:p + m], junk[j:j + S - m]])
+        j += S - m
+        _, out = h.step(rows, **w.words())
+        for s in range(m):
+            assert np.array_equal(out[s].view(np.uint32), ones[p + s].view(np.uint32)), (p, S, m, s)
+        w.accept(m)
+    assert w.pos == N
+
+
 def test_gdn_steps_a3b() -> None:
-    """The same steps on the 35B-A3B's first GDN layer (the chunkwise core of 4 slots, 4 v heads per column) on random
+    """``_gdn_blocks`` on the 35B-A3B's first GDN layer (the chunkwise core of 4 slots, 4 v heads per column), random
     inputs."""
     path = ref.size_gguf("35B-A3B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
-    x = mmv.bf(np.random.default_rng(3).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
-    _gdn_steps(path, cfg.gdn_layers[0], x, None)
+    rng = np.random.default_rng(3)
+    x = mmv.bf(rng.standard_normal((20, cfg.hidden_size)).astype(np.float32) * 0.02)
+    junk = mmv.bf(rng.standard_normal((12, cfg.hidden_size)).astype(np.float32) * 0.02)
+    _gdn_blocks(path, cfg.gdn_layers[0], x, junk)
 
 
 def test_gdn_steps_27b() -> None:

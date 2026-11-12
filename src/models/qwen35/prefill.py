@@ -66,6 +66,7 @@ from ml_dtypes import bfloat16
 
 from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS
+from artlite.operators.fused.layout import parse_name
 from artlite.operators.util import arg_bytes
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
@@ -418,6 +419,22 @@ class QwenPrefill(ChunkPrefill):
 
     def _external(self) -> set[str]:
         return (self.dp.external() if self.dp is not None else set()) | (self.fp.external() if self.fp is not None else set())
+
+    def _program(self, key: int | tuple[str, int]) -> list[tuple[int, list[int]]]:
+        """(a chunkwise GDN core of 4: the GDN states in the half that the overlay's next position's block starts from,
+        ``QwenOverlay._half``)"""
+        ov = self.ov
+        if not (ov.g4 and ov._gcur):
+            return super()._program(key)
+        k1 = ("half", key)
+        if k1 not in self._items:
+            def other(name: str) -> str:
+                base, a, b = parse_name(name)
+                return f"GSTATE[{a + ov.ghalf}:{b + ov.ghalf}]" if base == "GSTATE" else name
+
+            rl = [(op, *map(other, names)) for op, *names in self.runlists[key]]
+            self._items[k1] = self.lib.items(rl, self._buffers())
+        return self._items[k1]
 
     def _buffers(self) -> dict[str, object]:
         return self.ov.dev.buffers | (self.dp.buffers() if self.dp is not None else {}) | \
