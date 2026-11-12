@@ -35,7 +35,7 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
 from artlite.decode.design import (
@@ -169,7 +169,7 @@ class Selector:
         for name in self.TABLES:
             self.gguf.willneed(name)
 
-    def walk(self, logits: torch.Tensor, gates: np.ndarray, anchor: int, ids: np.ndarray, n: int, stop: set[int], *,
+    def walk(self, logits: np.ndarray, gates: np.ndarray, anchor: int, ids: np.ndarray, n: int, stop: set[int], *,
              sibling: int = 0) -> list[int]:
         """Up to n drafts after the anchor token (logits (block, vocab): rows of the tokens ``ids``), ending with a token of ``stop``.
         ``sibling`` > 0: also ``self.sibling``, a branch of that many tokens from the first position's second candidate on (its
@@ -183,8 +183,8 @@ class Selector:
         k = self.top_k
         top = [top_logits(logits[i], k, rows=ids) for i in range(1, n + 1)]
         c = np.stack([c for _, c in top])
-        succ = self.gguf.rows(self.TABLES[0], c.reshape(-1), prefetch=False).numpy().reshape(n, k, -1)
-        pred = self.gguf.rows(self.TABLES[1], np.concatenate([[anchor], c[:-1].reshape(-1)]), prefetch=False).numpy()
+        succ = self.gguf.rows(self.TABLES[0], c.reshape(-1), prefetch=False).reshape(n, k, -1)
+        pred = self.gguf.rows(self.TABLES[1], np.concatenate([[anchor], c[:-1].reshape(-1)]), prefetch=False)
         out: list[int] = []
         j = 0  # (the predecessor's row)
         chain, p2, b = 1.0, 0.0, 0
@@ -371,7 +371,7 @@ class DFlashOverlay(ModelOverlay):
 
     def _base(self, name: str) -> np.ndarray:
         """A conv's base (2 side, 2 tap, hidden) bf16 bits."""
-        x = torch.from_numpy(self._f32(name)).bfloat16().view(torch.uint16).numpy()
+        x = self._f32(name).astype(bfloat16).view(np.uint16)
         return x.reshape(2, 2, self.cfg.hidden)
 
     def _load(self) -> None:
@@ -379,7 +379,7 @@ class DFlashOverlay(ModelOverlay):
         norm, act = self.dev.view("NORM"), self.dev.view("ACT")
 
         def bf(x: np.ndarray) -> np.ndarray:
-            return torch.from_numpy(x).bfloat16().view(torch.uint8).numpy()
+            return x.astype(bfloat16).view(np.uint8)
 
         for key, name in (("enc", "enc.output_norm.weight"), ("output", "output_norm.weight")):
             norm[self.norm_off[key]:][:2 * self.H] = bf(self._f32(name))
@@ -390,7 +390,7 @@ class DFlashOverlay(ModelOverlay):
             q = self._f32(b + "attn_q_norm.weight") * np.float32(np.log2(np.e) / np.sqrt(HD))
             act[self.norms + L * XB + 4 * META:][:4 * 2 * HD] = np.concatenate([q, self._f32(b + "attn_k_norm.weight")]).view(np.uint8)
             for k, (w, base) in enumerate((("attn_norm", "attn_conv_base"), ("ffn_norm", "ffn_conv_base"))):
-                wb = torch.from_numpy(self._f32(b + w + ".weight")).bfloat16().view(torch.uint16).numpy().reshape(COLS, H8)
+                wb = self._f32(b + w + ".weight").astype(bfloat16).view(np.uint16).reshape(COLS, H8)
                 bs = self._base(b + base)
                 for c in range(COLS):
                     o = self._cvin(L, k, c)
@@ -751,17 +751,17 @@ class DFlashOverlay(ModelOverlay):
         dev.flush("KV", self.open_off, opened.size)
         self.next = snapshot["next"]
 
-    def logits(self) -> torch.Tensor:
+    def logits(self) -> np.ndarray:
         """The block's head logits (8, vocab) bf16 (a view of the NPU's buffer; [slot][the head's rows])."""
         self.dev.fetch("LOGITS")
-        return torch.from_numpy(self.dev.view("LOGITS")).view(torch.bfloat16).reshape(8, self.vocab)
+        return self.dev.view("LOGITS").view(bfloat16).reshape(8, self.vocab)
 
     def gates(self) -> np.ndarray:
         """The block's selector gates (8, rank) fp32."""
         self.dev.fetch("GATE")
         g = self.dev.view("GATE").view(np.uint16).reshape(COLS, 8, C_LEN)
         per = self.cfg.rank // COLS
-        return torch.from_numpy(g[:, :, :per].copy().astype(np.uint16).view(np.int16)).view(torch.bfloat16).float().numpy().transpose(1, 0, 2).reshape(8, -1)
+        return g[:, :, :per].astype(np.uint16).view(bfloat16).astype(np.float32).transpose(1, 0, 2).reshape(8, -1)
 
 
 __all__ = ["DFlashImage", "DFlashOverlay", "Selector", "conv_rows"]

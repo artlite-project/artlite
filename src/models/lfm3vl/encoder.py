@@ -39,7 +39,6 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS, ROWS
@@ -52,7 +51,7 @@ from artlite.vision.layers import Tensor, alloc, free, gemm
 from artlite.vision.ops import DwConv, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.vit import Bands, Keys, VitLevel, attend, kv_bytes, ln, pad, vit_level
-from artlite.vision.weights import Wt, cat, computed, eye, take, values
+from artlite.vision.weights import Wt, cat, computed, eye, f32, take, values
 
 H, C, HD, HP, HEADS, KVH, FFN = 1024, 1280, 64, 80, 16, 8, 2560
 EPS = 1e-5
@@ -87,12 +86,12 @@ def plain_index(heads: np.ndarray) -> np.ndarray:
     return np.concatenate([np.where(j < HD, h * HD + j, -1) for h in heads])
 
 
-def vec(get: Callable[[str], Wt | torch.Tensor], name: str, n: int = C) -> torch.Tensor:
+def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
     """A norm's weights (or any vector) of the file, zero-padded to n."""
-    return pad(get(name).float().reshape(-1), n)
+    return pad(f32(get(name)).reshape(-1), n)
 
 
-def layer_weights(get: Callable[[str], Wt | torch.Tensor], il: int, kind: str) -> dict:
+def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> dict:
     """Layer il's padded weights by role: "ln1", "ln2" (RMSNorm weights), "gu" (the feed-forward's rows [up | gate],
     K 1024), "down" (K 2560); a conv layer's "bx" ([B | x] rows, each padded to 1280), "c" (C's rows), "taps" (1280, 3,
     3), "out" (K 1024); an attention layer's "q" (the NPU's head order, RoPE rows), "k" (RoPE rows), "v", "o" (columns by
@@ -106,7 +105,7 @@ def layer_weights(get: Callable[[str], Wt | torch.Tensor], il: int, kind: str) -
         w["bx"] = cat([pad(rows(0), C), pad(rows(2), C)])
         w["c"] = pad(rows(1), C)
         taps = values(get(p + "conv2d_spatial.weight")).astype(np.float32).reshape(H, 3, 3)
-        w["taps"] = torch.from_numpy(np.concatenate([taps, np.zeros((C - H, 3, 3), np.float32)]))
+        w["taps"] = np.concatenate([taps, np.zeros((C - H, 3, 3), np.float32)])
         w["out"] = pad(get(p + "conv2d_out_proj.weight"), C)
         return w
     qo = q_order()
@@ -116,7 +115,7 @@ def layer_weights(get: Callable[[str], Wt | torch.Tensor], il: int, kind: str) -
     w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(qo), 1), C)
     idx = rope_index(np.zeros(1, np.int64))
     for n, s in (("qn", QSCALE), ("kn", 1.0)):
-        nw = get(p + f"attn_{n[0]}_norm.weight").float().reshape(-1).numpy()
+        nw = f32(get(p + f"attn_{n[0]}_norm.weight")).reshape(-1)
         w[n] = np.where(idx >= 0, nw[np.maximum(idx, 0)], 0).astype(np.float32) * np.float32(s)
     return w
 
@@ -126,7 +125,7 @@ def kinds_of(names: object, layers: int) -> tuple[str, ...]:
     return tuple("conv" if f"v.blk.{il}.conv2d_in_proj.weight" in names else "attn" for il in range(layers))
 
 
-def patch_weights(get: Callable[[str], Wt | torch.Tensor]) -> dict[str, Wt | torch.Tensor]:
+def patch_weights(get: Callable[[str], Wt | np.ndarray]) -> dict[str, Wt | np.ndarray]:
     """The patch embedding as a GEMM of the integer panels (KP inputs -> C): the two temporal kernels summed, the
     normalization x = (p / 255 - 0.5) / 0.5 = a q + o of q = p - 128 (a = 1 / 127.5, o = 1 / 255) folded in: input
     k < 768 the weights' column k times a, input 768 (the constant 1) their offset sum_k w_k o (computed at every
@@ -140,7 +139,7 @@ def patch_weights(get: Callable[[str], Wt | torch.Tensor]) -> dict[str, Wt | tor
     return {"w": computed("lfm3vl.patch", wt), "eg": vec(get, "v.embedding_norm.weight"), "eye": pad(eye(H), C)}
 
 
-def weights(get: Callable[[str], Wt | torch.Tensor], kinds: tuple[str, ...], proj: int) -> dict:
+def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...], proj: int) -> dict:
     """Every padded weight of the encoder: "patch" (``patch_weights``), per layer il its ``layer_weights``, "kinds",
     "post_g" / "post_b" (the projector's LayerNorm), "up" / "down" (mm.0 on the merged 4 x 1280 channels -> 4160, mm.2
     -> the language model's width in passes) and their biases; "layers", "proj". Matrices as ``get`` gives them (views
@@ -150,9 +149,9 @@ def weights(get: Callable[[str], Wt | torch.Tensor], kinds: tuple[str, ...], pro
     w["post_g"], w["post_b"] = vec(get, "mm.input_norm.weight"), vec(get, "mm.input_norm.bias")
     blocks = np.array([k * H + i if i < H else -1 for k in range(4) for i in range(C)])
     w["up"] = pad(take(get("mm.0.weight"), blocks, 1), MERGER.FUP)
-    w["up_b"] = pad(get("mm.0.bias").float().reshape(-1), MERGER.FUP)
+    w["up_b"] = pad(f32(get("mm.0.bias")).reshape(-1), MERGER.FUP)
     w["down"] = pad(get("mm.2.weight"), W.out_width(proj), MERGER.FUP)
-    w["down_b"] = pad(get("mm.2.bias").float().reshape(-1), W.out_width(proj))
+    w["down_b"] = pad(f32(get("mm.2.bias")).reshape(-1), W.out_width(proj))
     return w
 
 
@@ -165,7 +164,7 @@ def view(t: Tensor, n: int) -> Tensor:
     return Tensor(t.lv, n, t.addr, "pn", pnp=t.np)
 
 
-def rms(bd: Builder, x: Tensor, y: Tensor, g: torch.Tensor, *, name: str, rec: int) -> None:
+def rms(bd: Builder, x: Tensor, y: Tensor, g: np.ndarray, *, name: str, rec: int) -> None:
     """RMSNorm of the C tiles x (records at rec, freed) over their 1024 channels into the panels y."""
     ln(bd, x, y, g, None, name=name, rec=rec, C=C, H=H, eps=EPS, mode="rms")
 

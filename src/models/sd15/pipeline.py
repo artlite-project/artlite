@@ -11,8 +11,8 @@ replace the CPU's one at a time:
   what depends only on it (each cross-attention's K and V) can be computed once per image; one with a
   ``prepare(timesteps)`` gets the steps' timesteps before the text encoder runs (per-timestep work started early);
 - ``ImageDecoder``: the sampler's final latents (1, 4, 64, 64) -> the image (1, 3, 512, 512) in about [-1, 1].
-``load_backend("cpu", ...)``: the three in fp32 torch (``reference``); ``"npu"``: the UNet and the VAE decoder on
-the NPU (``npu``).
+``load_backend``: the UNet and the VAE decoder on the NPU (``npu``), the text encoder on the host (``text``); tests run
+the pipeline on their fp32 references' backend. The noise of a seed: numpy's PCG64 (``np.random.default_rng``).
 """
 
 import json
@@ -23,28 +23,26 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
-import torch  # noqa: TID251
 
-from . import reference
 from .sampling import Schedule, cfg_denoiser, sample
+from .text import ClipText
 from .tokenizer import ClipTokenizer
 
-BACKENDS = ("cpu", "npu")
 SIZES = (512,)  # image widths and heights the pipeline runs (the NPU's designs are for 512 x 512)
 LATENT_CHANNELS = 4
 LATENT_SCALE = 8  # image pixels per latent pixel
 
 
 class TextEncoder(Protocol):
-    def __call__(self, ids: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, ids: np.ndarray) -> np.ndarray: ...
 
 
 class NoisePredictor(Protocol):
-    def __call__(self, x: torch.Tensor, t: float, context: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, x: np.ndarray, t: float, context: np.ndarray) -> np.ndarray: ...
 
 
 class ImageDecoder(Protocol):
-    def __call__(self, latents: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, latents: np.ndarray) -> np.ndarray: ...
 
 
 @dataclass
@@ -56,17 +54,15 @@ class Backend:
     vae: ImageDecoder
 
 
-def load_backend(name: str, path: str) -> Backend:
-    """The networks of a diffusers directory on a backend: ``cpu`` (fp32 torch) or ``npu``."""
-    if name == "cpu":
-        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")),
-                       unet=reference.UNet(os.path.join(path, "unet")),
-                       vae=reference.VaeDecoder(os.path.join(path, "vae")))
-    if name == "npu":  # (the UNet and the VAE decoder on the NPU, one design; the text encoder on the CPU)
-        from . import npu
-        unet, vae = npu.load(path)
-        return Backend(text_encoder=reference.ClipText(os.path.join(path, "text_encoder")), unet=unet, vae=vae)
-    raise ValueError(f"unknown backend {name!r} (backends: {', '.join(BACKENDS)})")
+def load_backend(path: str, *, prompts: list[list[int]] = ()) -> Backend:
+    """The networks of a diffusers directory: the UNet and the VAE decoder on the NPU (one design), the text encoder on
+    the host (``prompts``: token ids it encodes meanwhile, kept)."""
+    from . import npu
+    text = ClipText(os.path.join(path, "text_encoder"))
+    if prompts:
+        text.prepare(np.array(prompts, np.int64))
+    unet, vae = npu.load(path)
+    return Backend(text_encoder=text, unet=unet, vae=vae)
 
 
 def check_request(*, width: int, height: int, steps: int) -> None:
@@ -88,9 +84,9 @@ def check_pipeline(path: str) -> None:
                                   f"{unet.get('cross_attention_dim')}); only SD 1.x is supported")
 
 
-def pixels(image: torch.Tensor) -> np.ndarray:
+def pixels(image: np.ndarray) -> np.ndarray:
     """An image (3, H, W) in [-1, 1] as (H, W, 3) uint8."""
-    return ((image.clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).numpy()
+    return np.round((np.clip(image, -1, 1) + 1) * 127.5).astype(np.uint8).transpose(1, 2, 0)
 
 
 @dataclass
@@ -98,22 +94,22 @@ class Txt2Img:
     """An image generated from a prompt, and where the time went."""
 
     pixels: np.ndarray  # (H, W, 3) uint8
-    latents: torch.Tensor  # (1, 4, H / 8, W / 8): the sampler's result
+    latents: np.ndarray  # (1, 4, H / 8, W / 8): the sampler's result
     t_text: float  # seconds: text encoder
     t_steps: float  # the sampler's steps
     t_vae: float  # VAE decoder
 
 
 class StableDiffusion:
-    """A diffusers directory of Stable Diffusion 1.5 on a backend (``BACKENDS``)."""
+    """A diffusers directory of Stable Diffusion 1.5 (``backend``: what runs the networks, default ``load_backend``'s)."""
 
     name = "Stable Diffusion 1.5"
 
-    def __init__(self, path: str, *, backend: str = "npu"):
+    def __init__(self, path: str, *, backend: Backend | None = None):
         check_pipeline(path)
         self.tokenizer = ClipTokenizer(os.path.join(path, "tokenizer"))
         self.schedule = Schedule.from_config(os.path.join(path, "scheduler", "scheduler_config.json"))
-        self.backend = load_backend(backend, path)
+        self.backend = backend or load_backend(path, prompts=[self.tokenizer.encode("")])  # (the usual negative prompt)
 
     def txt2img(self, prompt: str, *, negative_prompt: str = "", steps: int = 20, cfg_scale: float = 7.0,
                 sampler: str = "euler_a", seed: int = 42, width: int = 512, height: int = 512,
@@ -123,19 +119,18 @@ class StableDiffusion:
         check_request(width=width, height=height, steps=steps)
         b = self.backend
         t0 = time.perf_counter()
-        with torch.no_grad():
-            sigmas = self.schedule.sigmas(steps, sampler)
-            if hasattr(b.unet, "prepare"):
-                b.unet.prepare([self.schedule.timestep(s) for s in sigmas[:-1]])
-            ids = torch.tensor([self.tokenizer.encode(negative_prompt), self.tokenizer.encode(prompt)])
-            context = b.text_encoder(ids)
-            t1 = time.perf_counter()
-            generator = torch.Generator().manual_seed(seed)
-            shape = (1, LATENT_CHANNELS, height // LATENT_SCALE, width // LATENT_SCALE)
-            x = torch.randn(shape, generator=generator) * sigmas[0]
-            x = sample(cfg_denoiser(b.unet, self.schedule, context, cfg_scale), x, sigmas, sampler=sampler,
-                       generator=generator, callback=None if progress is None else lambda i: progress(i + 1, steps))
-            t2 = time.perf_counter()
-            image = b.vae(x)[0]
+        sigmas = self.schedule.sigmas(steps, sampler)
+        if hasattr(b.unet, "prepare"):
+            b.unet.prepare([self.schedule.timestep(s) for s in sigmas[:-1]])
+        ids = np.array([self.tokenizer.encode(negative_prompt), self.tokenizer.encode(prompt)], np.int64)
+        context = b.text_encoder(ids)
+        t1 = time.perf_counter()
+        rng = np.random.default_rng(seed)
+        shape = (1, LATENT_CHANNELS, height // LATENT_SCALE, width // LATENT_SCALE)
+        x = rng.standard_normal(shape, np.float32) * sigmas[0]
+        x = sample(cfg_denoiser(b.unet, self.schedule, context, cfg_scale), x, sigmas, sampler=sampler, rng=rng,
+                   callback=None if progress is None else lambda i: progress(i + 1, steps))
+        t2 = time.perf_counter()
+        image = b.vae(x)[0]
         t3 = time.perf_counter()
         return Txt2Img(pixels=pixels(image), latents=x, t_text=t1 - t0, t_steps=t2 - t1, t_vae=t3 - t2)

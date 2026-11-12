@@ -1,6 +1,7 @@
 """Stable Diffusion 1.5's networks in fp32 torch, from a diffusers directory's safetensors: the CLIP text encoder
 (transformers' ``CLIPTextModel``), the UNet (diffusers' ``UNet2DConditionModel``) and the VAE decoder (the decoding
-half of ``AutoencoderKL``), with SD 1.x's configuration. The CPU backend, and the reference of the NPU's parts.
+half of ``AutoencoderKL``), with SD 1.x's configuration: the reference of the NPU's parts and of the host's text
+encoder (``backend``: the pipeline on them, ~30 s for 20 steps).
 
 - Text encoder: 12 pre-norm transformer layers (768 wide, 12 heads, causal, quick-GELU MLP of 3072) over token and
   position embeddings, then the final layer norm.
@@ -20,13 +21,25 @@ half of ``AutoencoderKL``), with SD 1.x's configuration. The CPU backend, and th
 import json
 import os
 
-import torch  # noqa: TID251
-import torch.nn.functional as F  # noqa: TID251
+import torch
+import torch.nn.functional as F
 
-from .host import resnet_time_biases
-from .weights import load_safetensors
+from models.sd15 import host
+from models.sd15.pipeline import Backend
+from models.sd15.weights import load_safetensors as load_arrays
 
 Weights = dict[str, torch.Tensor]
+
+
+def load_safetensors(path: str, *args: object, **kwargs: object) -> Weights:
+    """``weights.load_safetensors``' arrays as tensors."""
+    return {k: torch.from_numpy(v) for k, v in load_arrays(path, *args, **kwargs).items()}
+
+
+def resnet_time_biases(w: Weights, t: float) -> Weights:
+    """``host.resnet_time_biases`` of the weights' tensors."""
+    biases = host.resnet_time_biases({k: v.numpy() for k, v in w.items() if "time_emb" in k}, t)
+    return {k: torch.from_numpy(v) for k, v in biases.items()}
 
 
 def _config(path: str) -> dict:
@@ -193,3 +206,12 @@ class VaeDecoder:
                 h = conv(w, f"decoder.up_blocks.{i}.upsamplers.0.conv.",
                          F.interpolate(h, scale_factor=2.0, mode="nearest"))
         return conv(w, "decoder.conv_out.", group_norm(w, "decoder.conv_norm_out.", h, eps, silu=True))
+
+
+def backend(path: str) -> Backend:
+    """The three networks of a diffusers directory in fp32 torch, as the pipeline's backend (numpy in and out)."""
+    text, unet, vae = (ClipText(os.path.join(path, "text_encoder")), UNet(os.path.join(path, "unet")),
+                       VaeDecoder(os.path.join(path, "vae")))
+    return Backend(text_encoder=lambda ids: text(torch.from_numpy(ids)).numpy(),
+                   unet=lambda x, t, ctx: unet(torch.from_numpy(x), t, torch.from_numpy(ctx)).numpy(),
+                   vae=lambda lat: vae(torch.from_numpy(lat)).numpy())

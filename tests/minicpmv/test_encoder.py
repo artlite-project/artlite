@@ -19,6 +19,7 @@ from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
 
+from ..common import as_torch
 from ..vision.test_ops import from_level_tokens, level_tokens
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
@@ -39,6 +40,7 @@ def enc() -> V.Encoder:
 
 
 def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = as_torch(a), as_torch(b)
     return float((a.double() - b.double()).norm() / b.double().norm())
 
 
@@ -103,7 +105,7 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
     bd.op(bd.spill("y_out", y.addr, lv.ct(M.C)), {})
     npu.run(bd.transaction())
     yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
-    got = _level_out(torch.stack([L.from_ctiles(yb[c], lv.m, M.C, lv.m) for c in range(COLS)]))
+    got = _level_out(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, M.C, lv.m)) for c in range(COLS)]))
     for g, e, x in zip(got, want, xs, strict=True):
         exact = enc._layer(x.double(), il)
         print(f"NPU vs CPU at its rounding points {_rel(g[:, :M.H], e):.2e}; vs float64 {_rel(g[:, :M.H], exact):.2e} "
@@ -144,7 +146,7 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
         npu.run(tr)
         ts.append(time.perf_counter() - t0)
     yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
-    got = _level_out(torch.stack([L.from_ctiles(yb[c], lv.m, M.C, lv.m) for c in range(COLS)]))
+    got = _level_out(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, M.C, lv.m)) for c in range(COLS)]))
     for g, e, x in zip(got, want, exact, strict=True):
         npu_err, cpu_err = _rel(g[:, :M.H], x), _rel(e, x)
         print(f"20 layers on 2 x 256 tokens: {1e3 * min(ts):.2f} ms ({1e3 * min(ts) / 20:.3f} ms per layer); from "
@@ -170,7 +172,7 @@ def _bands_in(bd: Builder, x: list[torch.Tensor], lv: Level, name: str) -> M.Ban
 def _bands_out(npu: VisionDevice, y: M.Bands) -> list[torch.Tensor]:
     lv = y.lv
     yb = [npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1) for b in range(lv.nb)]
-    yc = torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, M.C, lv.m) for b in range(lv.nb)]) for c in range(COLS)])
+    yc = torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, M.C, lv.m)) for b in range(lv.nb)]) for c in range(COLS)])
     img = from_level_tokens(yc, lv.R, lv.Lg)
     return [img[i].reshape(M.C, 1024).T for i in range(2)]
 
@@ -206,8 +208,8 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
 def _bands_read(npu: VisionDevice, y: M.Bands) -> torch.Tensor:
     """A banded level's residual -> (nb, COLS, 64, C)."""
     lv = y.lv
-    return torch.stack([torch.stack([L.from_ctiles(npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1)[c], 64, M.C,
-                                                   64) for c in range(COLS)]) for b in range(lv.nb)])
+    return torch.stack([torch.stack([torch.from_numpy(L.from_ctiles(npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1)[c], 64, M.C,
+                                                   64)) for c in range(COLS)]) for b in range(lv.nb)])
 
 
 def _pixels(case: str) -> list[np.ndarray]:
@@ -286,7 +288,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     bd.op(bd.spill("o", OA, 4 * stride), {})
     npu.run(bd.transaction())
     ob = npu.read("o", COLS * 4 * stride).reshape(COLS, 4, stride)
-    o = torch.stack([torch.cat([L.from_panels(ob[c, s], 16, M.C) for c in range(COLS)]) for s in range(4)])  # (s, n, C)
+    o = torch.stack([torch.cat([torch.from_numpy(L.from_panels(ob[c, s], 16, M.C)) for c in range(COLS)]) for s in range(4)])  # (s, n, C)
     qq, kk = bq(x[0]), bq(x[1])
     vv = torch.stack([torch.cat([bq(x[2, s, sl].T).T for sl in cols]) for s in range(4)])  # (V^T: blocks over 8 windows)
     ref = torch.zeros(4, n, M.C)
@@ -347,7 +349,7 @@ def test_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
     bd.mem.release(rec, M.ln_rec(M.POST))
     bd.op(bd.spill("y_out", y.addr, y.nbytes), {})
     npu.run(bd.transaction())
-    tiles = torch.stack([L.from_ctiles(npu.read("y_out", COLS * y.nbytes).reshape(COLS, -1)[c], 64, M.C, 64)
+    tiles = torch.stack([torch.from_numpy(L.from_ctiles(npu.read("y_out", COLS * y.nbytes).reshape(COLS, -1)[c], 64, M.C, 64))
                          for c in range(COLS)])[None]
     got = M.unpack(tiles, [e.window_slots() for e in entries])
     for g, e, ex in zip(got, want, exact, strict=True):

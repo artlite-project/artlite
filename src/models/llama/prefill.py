@@ -40,7 +40,7 @@ import itertools
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
@@ -348,8 +348,8 @@ class LlamaPrefill(ChunkPrefill):
 
         def put(key: object, w1: str) -> None:
             o = self.np_off[key] // 2
-            w = torch.from_numpy(np.asarray(self.ov.gguf.tensor(w1).dequantize(), np.float32).reshape(-1))
-            npb[o:o + H] = w.bfloat16().view(torch.int16).numpy().view(np.uint16)
+            w = np.asarray(self.ov.gguf.tensor(w1).dequantize(), np.float32).reshape(-1)
+            npb[o:o + H] = w.astype(bfloat16).view(np.uint16)
 
         put("in", f"blk.{self.layers[0]}.attn_norm.weight")
         for i, L in enumerate(self.layers):
@@ -377,19 +377,19 @@ class LlamaPrefill(ChunkPrefill):
         prep = next(p for (_, pt), p in self.ops[self._t(T)].preps.items() if pt == self._pt(T))
         return prep.params(p0) | self.attn[T].params(p0)
 
-    def run(self, x: torch.Tensor, p0: int, T: int = 0) -> None:
+    def run(self, x: np.ndarray, p0: int, T: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches hold the positions before). Leaves the layers' K / V of the positions in the caches and the
         last layer's output in PX (``hidden``)."""
         n, dev, H = x.shape[0], self.ov.dev, self.H
         T = self._size(n, p0, T)
         px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
-        px[:n] = x.bfloat16().view(torch.int16).numpy().view(np.uint16)
+        px[:n] = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
         px[n:] = 0
         dev.flush("PX", 0, 2 * T * H)
         self._launch(T, p0, self.params(T, p0))
 
-    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0, lead: int = 0) -> None:
+    def run_packed(self, x: np.ndarray, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0, lead: int = 0) -> None:
         """A packed chunk of size T (default: the smallest of ``pack_sizes`` that holds x): x (n, hidden) the segments'
         embeddings back to back, ``pos`` (n,) their rotary positions, ``lo`` (n,) per token its segment's first (an index
         into x); every row sees the caches' positions before p0 (a shared prefix) and its segment's tokens up to itself
@@ -402,7 +402,7 @@ class LlamaPrefill(ChunkPrefill):
         assert ((np.arange(n) - lo) < PACK_SPAN).all() and (lo <= np.arange(n)).all(), "segments of PACK_SPAN tokens"
         assert lead in (0, self.lead) and (lo[:lead] == 0).all() and (lo[lead:] >= lead).all(), "a lead of a group"
         px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
-        px[:n] = x.bfloat16().view(torch.int16).numpy().view(np.uint16)
+        px[:n] = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
         px[n:] = 0
         dev.flush("PX", 0, 2 * T * H)
         R = self.ov.max_positions  # (the chunk's cos / sin rows past the text positions'; padding: a row of its own)
@@ -422,13 +422,13 @@ class LlamaPrefill(ChunkPrefill):
         lead)."""
         return T in self.rattn and (p0 + lead) // self.shape.pg <= self.rattn[T].ring
 
-    def hidden(self, i: int, n: int = 1) -> torch.Tensor:
+    def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
         before its norm)."""
         H, dev = self.H, self.ov.dev
         dev.fetch("PX", 2 * i * H, 2 * n * H)
         rows = dev.view("PX")[2 * i * H:2 * (i + n) * H].view(np.int16).copy()
-        return torch.from_numpy(rows).view(torch.bfloat16).float().view(n, H)
+        return np.ascontiguousarray(rows).view(bfloat16).astype(np.float32).reshape(n, H)
 
     # ------------------------------------------------------------------
     # Time estimates

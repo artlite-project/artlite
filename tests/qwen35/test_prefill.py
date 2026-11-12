@@ -9,7 +9,6 @@ import os
 
 import numpy as np
 import pytest
-import torch
 
 from artlite.gguf_model import GGUFFile
 
@@ -45,24 +44,24 @@ def test_prefill_slice(size: str, La: int) -> None:
     ov.load(release=False)
     pf.bind()
 
-    def x(t0: int, n: int) -> torch.Tensor:
-        return torch.from_numpy(x_in[t0:t0 + n].copy())
+    def x(t0: int, n: int) -> np.ndarray:
+        return x_in[t0:t0 + n]
 
     err = []
     for t0, n, T in [(0, n1, 512), (n1, n2, 64), (n1 + n2, n3, 128)]:
         pf.run(x(t0, n), t0, T)
-        got = pf.hidden(0, n).numpy()
+        got = pf.hidden(0, n)
         err += [ref.rel_err(got[i], want[t0 + i]) for i in range(n)]
     cont = []
     for t in range(P, P + K):
         ov.step(x(t, 1)[0], t, logits=False)
-        cont.append(ref.rel_err(ov.hidden(-1).numpy(), want[t]))
+        cont.append(ref.rel_err(ov.hidden(-1), want[t]))
     ov.reset()
     dec = []
     for t in range(P + K):
         ov.step(x(t, 1)[0], t, logits=False)
         if t >= P:
-            dec.append(ref.rel_err(ov.hidden(-1).numpy(), want[t]))
+            dec.append(ref.rel_err(ov.hidden(-1), want[t]))
     err = np.asarray(err)
     # (the prefill GEMMs multiply bfp16 activations by the weights dequantized to bfp16: ~1.4% rms per projection vs
     # the decode GEMV's bf16 x; 9B: mean 0.8%, max 6.4%, an outlier dimension cancelling in layer 19; 1B: llama.cpp's

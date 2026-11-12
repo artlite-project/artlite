@@ -19,7 +19,7 @@ class LlamaCpu:
         nh, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
 
         def w(name: str) -> torch.Tensor:
-            return gguf.tensor(name).dequantize().float()
+            return torch.from_numpy(gguf.tensor(name).dequantize())
 
         self.emb = w("token_embd.weight")
         self.out = w("output.weight") if "output.weight" in gguf else self.emb

@@ -13,7 +13,6 @@ import functools
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 
 from ..operators import kmath
 from ..operators.design import COLS, ROWS
@@ -22,6 +21,7 @@ from . import layout as L
 from .build import Builder, Level, Records
 from .ops import Apply, Attention, Gemm
 from .seq import ColOps, MemTask
+from .weights import flat
 
 
 @dataclass
@@ -99,7 +99,7 @@ def gn_ops(lo: int, hi: int, win: int) -> list[tuple[int, int, tuple[int, ...]]]
     return out
 
 
-def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, eps: float,
+def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: np.ndarray, beta: np.ndarray, *, name: str, eps: float,
              silu: bool, y_kb0: int = 0, ch0: int = 0, ccat: int = 0, extra: dict | None = None) -> None:
     """GroupNorm (32 groups, + SiLU) of x into the panels y (from kb y_kb0). x may be the part [ch0, ch0 + x.C) of a
     concatenation of ccat channels (its records in that space; gamma, beta: the part's). Ops of every core row, each
@@ -115,7 +115,7 @@ def gn_apply(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch
         bd.apply(ap, gamma, beta, name=f"{name}.{k}", records=x.rec, extra=extra if k == 0 else None)
 
 
-def conv(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor, *, name: str, out: Tensor, stride: int = 1,
+def conv(bd: Builder, x: Tensor, w: np.ndarray, b: np.ndarray, *, name: str, out: Tensor, stride: int = 1,
          res: Tensor | None = None, stats: tuple[int, int] | None = None, tbias: str | None = None,
          band: int | None = None) -> None:
     """A 3x3 conv of the panels x into the C tiles out (+ res), out's records for ``stats``; tbias: the resnet whose
@@ -136,7 +136,7 @@ def conv(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor, *, name: str,
                               nbands=lv.nb)]
 
 
-def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, name: str, out: Tensor,
+def gemm(bd: Builder, x: Tensor, w: np.ndarray, b: np.ndarray | None, *, name: str, out: Tensor,
          res: Tensor | None = None, stats: tuple[int, int] | None = None, kind: str = "bf16", ln: bool = False,
          split: int = 1, extra: dict | None = None, band: int = 0, hilo: bool = False) -> int:
     """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu"), + res;
@@ -155,7 +155,7 @@ def gemm(bd: Builder, x: Tensor, w: torch.Tensor, b: torch.Tensor | None, *, nam
     npass = w.shape[0] // 320
     for k in range(split):
         part = {} if split == 1 else {"p0": k * npass // split, "npo": npass // split}
-        bd.gemm(Gemm(**kw, **part), w.flatten(1), b, name=name if split == 1 else f"{name}.{k}", extra=extra if k == 0 else None)
+        bd.gemm(Gemm(**kw, **part), flat(w), b, name=name if split == 1 else f"{name}.{k}", extra=extra if k == 0 else None)
     if stats:
         out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=w.shape[0] // 4, gsize=stats[0], band=band,
                               nbands=lv.nb)]
@@ -192,7 +192,7 @@ def plain(bd: Builder, x: Tensor, y: Tensor, *, name: str) -> None:
 LOG2E = 1.4426950408889634
 
 
-def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor, *, name: str, rec: int) -> None:
+def ln_apply(bd: Builder, h: Tensor, y: Tensor, gamma: np.ndarray, beta: np.ndarray, *, name: str, rec: int) -> None:
     """LayerNorm of the C tiles h (records at rec: its producer's) into the panels y on every core row; frees rec."""
     a = Apply(m=h.lv.m, nblk=h.C // (80 * ROWS), mode="ln", x=h.addr, y=y.addr, ntile=h.lv.ntile, rec=rec, C=h.C,
               y_np=y.np)

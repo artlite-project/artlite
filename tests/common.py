@@ -32,6 +32,11 @@ def to_torch(a: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(a.view(np.int16)).view(torch.bfloat16) if a.dtype == bfloat16 else torch.from_numpy(a)
 
 
+def as_torch(x: torch.Tensor | np.ndarray) -> torch.Tensor:
+    """A tensor of a torch reference's or a runtime result's values (``to_torch``; a tensor as it is)."""
+    return to_torch(x) if isinstance(x, np.ndarray) else x
+
+
 def essay(name: str) -> str:
     """The text of one essay of the long-prompt corpus, or skip the test if the corpus was not fetched."""
     path = os.path.join(ESSAYS_DIR, name)
@@ -88,7 +93,7 @@ def draft_gate(model: Any, prompts: dict[str, tuple[list[int], tuple[int, ...]]]
                 after = seq[len(ids) + q + 1:]
                 a = next((i for i, (x, y) in enumerate(zip(d, after)) if x != y), min(len(d), len(after)))
                 r.append((1 + a, bool(d) and d[0] == int(logits.argmax()),
-                          float(torch.softmax(logits, -1)[d[0]]) if d else 0.0))
+                          float(torch.softmax(as_torch(logits), -1)[d[0]]) if d else 0.0))
             rows.append(np.array(r, np.float64))
             line += f"  {path} " + " / ".join(f"{x:.3f}" for x in rows[-1].mean(0))
         print(line)

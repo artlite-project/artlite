@@ -16,7 +16,7 @@ def test_iq3xxs_dequantize() -> None:
     """IQ3_XXS weights bit-identical to gguf-py's on random blocks (every index, sign field and scale), its fields
     consistent: the codes on the grid with the signs' even parity per 8 values."""
     t = _random_tensor("IQ3_XXS", 64, 2048, 0)
-    w = t.dequantize().numpy()
+    w = t.dequantize()
     ref = IQ3_XXS.dequantize_rows(np.ascontiguousarray(t.raw)).reshape(t.rows, t.cols).astype(np.float32)
     assert np.array_equal(w.view(np.uint32), ref.view(np.uint32))
     f = t.fields()
@@ -30,7 +30,7 @@ def test_iq_dequantize(qtype: str) -> None:
     """IQ3_S, IQ4_NL and IQ4_XS weights bit-identical to gguf-py's on random blocks (every index, sign, scale and
     code), their fields consistent: the codes on the grid or the 16 values times the scales."""
     t = _random_tensor(qtype, 64, 2048, 0)
-    w = t.dequantize().numpy()
+    w = t.dequantize()
     q = {"IQ3_S": IQ3_S, "IQ4_NL": IQ4_NL, "IQ4_XS": IQ4_XS}[qtype]
     ref = q.dequantize_rows(np.ascontiguousarray(t.raw)).reshape(t.rows, t.cols).astype(np.float32)
     assert np.array_equal(w.view(np.uint32), ref.view(np.uint32))
@@ -54,7 +54,7 @@ def test_dequant_rows(qtype: str) -> None:
     t = _random_tensor(qtype, 33, 1024, 1)
     out = np.empty((t.rows, t.cols), np.float32)
     _native.dequant_rows(qtype, np.ascontiguousarray(t.raw).view(np.uint8), out)
-    assert np.array_equal(out.view(np.uint32), t.dequantize().numpy().view(np.uint32))
+    assert np.array_equal(out.view(np.uint32), t.dequantize().view(np.uint32))
 
 
 def test_qwen_mtp_of(tmp_path: object) -> None:

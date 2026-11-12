@@ -43,7 +43,7 @@ import math
 import os
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite import txn
 from artlite.decode import gemv
@@ -363,8 +363,8 @@ class QwenOverlay(ModelOverlay):
             MR.check_route(paging.cdo_values(os.path.dirname(self.op._program.insts_path)), range(COLS))
         norm = self.dev.view("NORM")
         for (L, name), off in self.norm_off.items():
-            w = torch.from_numpy(self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight")).bfloat16()
-            norm[off:off + 2 * self.H] = w.view(torch.uint8).numpy()
+            w = self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight").astype(bfloat16)
+            norm[off:off + 2 * self.H] = w.view(np.uint8)
         self.dev.flush("NORM")
         for L in self.fatt:
             self._load_attention(L)
@@ -966,8 +966,8 @@ class QwenOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: torch.Tensor, position: int, *, logits: bool = True, commit: bool = True,
-             branch: tuple[int, int] | None = None) -> torch.Tensor | None:
+    def step(self, x: np.ndarray, position: int, *, logits: bool = True, commit: bool = True,
+             branch: tuple[int, int] | None = None) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the first layer's inputs (embeddings) at positions
         position .. position + S - 1 (the positions before are in the caches, the GDN states hold the committed ones and
         the previous step's accepted tokens: ``accept``). ``commit``: the GDN states after the step's tokens are written
@@ -975,7 +975,7 @@ class QwenOverlay(ModelOverlay):
         as accepted. ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
         at position + parent + 1 .. (a tree of two branches: ``_set_branch``); None: a chain. Returns the slots' logits
         (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits`` None."""
-        x = x.reshape(-1, self.H).float()
+        x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
         assert self._committed or self._accepted, "accept() the previous lazy step's tokens first"
@@ -993,7 +993,7 @@ class QwenOverlay(ModelOverlay):
             self._set_branch(branch, position)
         self._set_gdn(nrep=self.nrep, cshift=self.cshift, commit=commit)
         self._committed = commit
-        xf = x.numpy()
+        xf = x
         self._write_loadr(xf)
         first = self._input(self.layers[0])
         self._write_input(self.inp[first][0], interleave(xf, self._sp(S, first)).view(np.uint8).reshape(-1))
@@ -1074,7 +1074,7 @@ class QwenOverlay(ModelOverlay):
         cuts = [0, *(np.flatnonzero(np.diff(order) != 1) + 1).tolist(), len(order)]
         return np.empty((8, len(order)), np.uint16), [(a, b, int(order[a])) for a, b in itertools.pairwise(cuts)]
 
-    def _logits(self, S: int) -> torch.Tensor:
+    def _logits(self, S: int) -> np.ndarray:
         """(an image whose LM rows are not in id order, ``QwenImage.order``: in id order, the ids' rows, in a buffer valid
         until the next dispatch as the NPU's; an MTP drafter's table rows left out)"""
         if self._order is None:
@@ -1084,7 +1084,7 @@ class QwenOverlay(ModelOverlay):
         out, runs = self._order
         for a, b, r in runs:
             out[:S, a:b] = x[:, r:r + b - a]
-        return torch.from_numpy(out[:S]).view(torch.bfloat16)
+        return out[:S].view(bfloat16)
 
     def _lm_phase(self, seq: Sequence) -> None:
         if self.image.column_major:
@@ -1130,12 +1130,12 @@ class QwenOverlay(ModelOverlay):
         self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted = snapshot["fields"]
         self.rope[:] = snapshot["rope"]
 
-    def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
+    def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""
         off, sp = self.inp[self._input(L)][0].off + XB, self._sp(self._last_s, self._input(L))
         self.dev.fetch("ACT", off, 2 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, slot].reshape(-1)
-        return torch.from_numpy(v.copy()).view(torch.bfloat16).float()
+        return v.view(bfloat16).astype(np.float32)
 
 
 __all__ = ["FLAGS", "F_EMITR", "F_GU", "F_MSG", "F_RESID", "QwenOverlay"]

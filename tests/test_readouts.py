@@ -18,7 +18,7 @@ from models import open_model
 from models.common import Model, NpuModel
 from models.readouts import Readouts, pool, rows_of
 
-from .common import cached_ref, essay, model_key
+from .common import cached_ref, essay, model_key, to_torch
 from .llama_cpp import _lib_identity, llama_embeddings
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
@@ -49,8 +49,8 @@ def test_rows(loaded: tuple[str, Model, NpuModel]) -> None:
         assert np.array_equal(rows, every[[0, n // 2, n - 1]]), n
         assert np.isfinite(every).all()
         npu.reset()
-        want = npu.forward(toks)  # (its last logits: the LM head on the chunk's last row, or a decode step's)
-        got = npu.overlay.logits_of(torch.from_numpy(rows[-1])).float()
+        want = torch.from_numpy(npu.forward(toks))  # (its last logits: the LM head on the chunk's last row, or a decode step's)
+        got = to_torch(npu.overlay.logits_of(rows[-1])).float()
         plan = npu.prefill.plan(0, n)
         # (a post-norm model's step row is its LM header's updated residual in bf16, not the header's sum: LFM3's)
         if plan == npu.prefill.plan(0, n, steps=False) and (sum(plan) >= n or not getattr(npu.overlay.op, "post", 0)):

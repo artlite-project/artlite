@@ -22,7 +22,7 @@ while the tokenizer and the designs load), at their quantization's size; nothing
 
 from concurrent.futures import ThreadPoolExecutor
 
-import torch  # noqa: TID251
+import numpy as np
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
@@ -61,7 +61,7 @@ class NpuLlama(OverlayModel):
                 build.result()  # (its error, if any)
                 self.prefill.bind()
         self.overlay.ready()  # (the weights' thread packs meanwhile)
-        self._w_out = gguf.tensor("output_norm.weight").dequantize().float()
+        self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
 
@@ -85,7 +85,7 @@ class NpuLlama(OverlayModel):
     def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
         return (self.gguf.rows("token_embd.weight", tokens),)
 
-    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(the LM head alone on the chunk's last output row)"""
         x = self.prefill.hidden(n - 1)
         return self._dispatch(lambda: self.overlay.logits_of(x))

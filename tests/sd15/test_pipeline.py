@@ -1,6 +1,6 @@
-"""Stable Diffusion 1.5 on the CPU backend (models.sd15): the UNet's host time inputs, text to image in a couple of
-steps, artlite-cli's image path and its refusals, diffusers directories in ``models`` (no NPU). The fp32 networks
-(models.sd15.reference) match diffusers' and transformers' to fp32 rounding."""
+"""Stable Diffusion 1.5's host side (models.sd15): the UNet's time inputs, the text encoder against the fp32 reference,
+text to image in a couple of steps on the reference's networks, artlite-cli's image path and its refusals, diffusers
+directories in ``models``. The fp32 networks (ref.py) match diffusers' and transformers' to fp32 rounding."""
 
 import json
 import math
@@ -8,6 +8,7 @@ import os
 import struct
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,11 @@ from models import architecture, is_diffusers, open_pipeline
 from models.cli import main
 from models.sd15.host import resnet_time_biases, time_embedding, timestep_embedding
 from models.sd15.pipeline import StableDiffusion
+from models.sd15.text import ClipText
+from models.sd15.tokenizer import ClipTokenizer
+from models.sd15.weights import load_safetensors
+
+from . import ref
 
 # host only: nothing for the background compilation's planning run to see (it would run the CPU pipeline again)
 pytestmark = pytest.mark.skipif(parallel_compile.planning_active(), reason="host only")
@@ -31,7 +37,7 @@ def _model_dir() -> str:
 
 
 def test_timestep_embedding() -> None:
-    torch.testing.assert_close(timestep_embedding(0), torch.cat([torch.ones(160), torch.zeros(160)]))
+    np.testing.assert_array_equal(timestep_embedding(0), np.concatenate([np.ones(160), np.zeros(160)]))
     e = timestep_embedding(517.37)
     for i in (0, 1, 80, 159):
         f = 517.37 * 10000 ** (-i / 160)
@@ -63,28 +69,43 @@ def test_cli_refuses(args: list[str], message: str) -> None:
 
 @pytest.fixture(scope="module")
 def sd() -> StableDiffusion:
-    return StableDiffusion(_model_dir(), backend="cpu")
+    return StableDiffusion(_model_dir(), backend=ref.backend(_model_dir()))
 
 
-@pytest.mark.slow
-def test_time_biases(sd: StableDiffusion) -> None:
-    w = sd.backend.unet.w
+def test_time_biases() -> None:
+    w = load_safetensors(f"{_model_dir()}/unet/diffusion_pytorch_model.safetensors", contains=("time_emb", "conv1.weight"))
     biases = resnet_time_biases(w, 517.37)
     assert len(biases) == 22  # 2 per down block, 2 in the middle, 3 per up block
     assert list(biases)[:2] == ["down_blocks.0.resnets.0.", "down_blocks.0.resnets.1."]
     for p, b in biases.items():
-        assert b.shape == (w[p + "conv1.weight"].shape[0],) and b.dtype == torch.float32
+        assert b.shape == (w[p + "conv1.weight"].shape[0],) and b.dtype == np.float32
     p = "mid_block.resnets.1."
-    expect = F.linear(F.silu(time_embedding(w, 517.37)), w[p + "time_emb_proj.weight"], w[p + "time_emb_proj.bias"])
-    torch.testing.assert_close(biases[p], expect)
-    assert not torch.allclose(resnet_time_biases(w, 20.0)[p], biases[p])
+    t = {k: torch.from_numpy(w[p + k]) for k in ("time_emb_proj.weight", "time_emb_proj.bias")}
+    expect = F.linear(F.silu(torch.from_numpy(time_embedding(w, 517.37))), t["time_emb_proj.weight"], t["time_emb_proj.bias"])
+    torch.testing.assert_close(torch.from_numpy(biases[p]), expect)
+    assert not np.allclose(resnet_time_biases(w, 20.0)[p], biases[p])
+
+
+def test_text_encoder() -> None:
+    """The host's numpy text encoder against the fp32 torch reference, to fp32 rounding; a kept prompt's encoding
+    returned again."""
+    path = _model_dir()
+    tok = ClipTokenizer(f"{path}/tokenizer")
+    ids = np.array([tok.encode(""), tok.encode("a photograph of an astronaut riding a horse")], np.int64)
+    got = ClipText(f"{path}/text_encoder")
+    want = ref.ClipText(f"{path}/text_encoder")(torch.from_numpy(ids)).numpy()
+    a = got(ids)
+    err = float(np.abs(a - want).max() / np.abs(want).max())
+    print(f"text encoder: max |d| {err:.2e} of the largest")
+    assert a.shape == (2, 77, 768) and a.dtype == np.float32 and err < 1e-5
+    assert np.array_equal(got(ids[1:]), a[1:])
 
 
 @pytest.mark.slow
 def test_txt2img(sd: StableDiffusion) -> None:
     out = sd.txt2img("a photograph of an astronaut riding a horse", steps=2, seed=42)
     assert out.pixels.shape == (512, 512, 3) and out.pixels.dtype.name == "uint8"
-    assert out.latents.shape == (1, 4, 64, 64) and torch.isfinite(out.latents).all()
+    assert out.latents.shape == (1, 4, 64, 64) and np.isfinite(out.latents).all()
     assert out.pixels.std() > 20  # (not a flat image)
     assert min(out.t_text, out.t_steps, out.t_vae) > 0
 

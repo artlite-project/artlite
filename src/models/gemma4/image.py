@@ -28,7 +28,6 @@ import dataclasses
 import math
 
 import numpy as np
-import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from artlite import _native
@@ -131,7 +130,7 @@ class GemmaImage(TileImage):
             parts = np.zeros((2, n * NX_PER_NORM * POST_K), np.float32)
             parts[0, :H], parts[1, :H] = self._vec(w1n), self._vec(wpn)
         objs = parts.reshape(len(parts), n, -1).transpose(1, 0, 2).reshape(n, -1)  # [object][w1 | w_post]
-        b = torch.from_numpy(np.ascontiguousarray(objs)).bfloat16().view(torch.int16).numpy().view(np.uint8)
+        b = np.ascontiguousarray(objs).astype(bfloat16).view(np.uint8)
         out = np.zeros((n, T), np.uint8)
         out[:, :b.shape[1]] = b
         if name != "gate":

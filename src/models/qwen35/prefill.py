@@ -62,7 +62,7 @@ import math
 from types import SimpleNamespace
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS
@@ -496,15 +496,15 @@ class QwenPrefill(ChunkPrefill):
         """(an attention layer's flash attention within the budget)"""
         return not self.att or self.attention_seconds(p0, self.subs(T)) <= PIECE_BUDGET_S
 
-    def run(self, x: torch.Tensor, p0: int, T: int = 0) -> None:
+    def run(self, x: np.ndarray, p0: int, T: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the first layer's input rows of
         positions p0 .. p0 + n - 1 (the embeddings; the caches and states hold the positions before). Leaves the last
         layer's output in PX (``hidden``)."""
         n, dev = x.shape[0], self.ov.dev
         T = self._size(n, p0, T)
         assert 3 <= n or not self.gdn, n
-        px = torch.from_numpy(dev.view("PX")[:2 * T * self.H]).view(torch.bfloat16).view(T, self.H)
-        px[:n] = x.bfloat16()
+        px = dev.view("PX")[:2 * T * self.H].view(bfloat16).reshape(T, self.H)
+        px[:n] = np.asarray(x, np.float32)
         px[n:] = 0
         dev.flush("PX", 0, 2 * T * self.H)
         fresh = p0 == 0 and T in self.fresh_sizes  # (a non-causal model's: the packed scan zeroes the states itself)
@@ -535,7 +535,7 @@ class QwenPrefill(ChunkPrefill):
         if self.fp is not None:
             self.fp.after(p0, n, T)
 
-    def run_packed(self, x: torch.Tensor, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
+    def run_packed(self, x: np.ndarray, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0) -> None:
         """A packed chunk of size T at position p0 (default: the smallest of ``packed_sizes(p0)`` that holds x): x (n,
         hidden) the segments' first layer input rows back to back, ``pos`` (n,) their text positions or (n, 3) their
         M-RoPE ones (images), ``lo`` (n,) per token its segment's first (an index into x). Leaves the last layer's output rows in PX (``hidden``). At position
@@ -548,10 +548,10 @@ class QwenPrefill(ChunkPrefill):
         gap = lo < 0
         assert T in sizes and (lo <= np.arange(n)).all() and (tree or not gap.any()), (T, p0)
         self._size(n, p0, T)
-        px = torch.from_numpy(dev.view("PX")[:2 * T * self.H]).view(torch.bfloat16).view(T, self.H)
-        px[:n] = x.bfloat16()
+        px = dev.view("PX")[:2 * T * self.H].view(bfloat16).reshape(T, self.H)
+        px[:n] = np.asarray(x, np.float32)
         px[n:] = 0
-        px[torch.from_numpy(np.flatnonzero(gap))] = 0
+        px[np.flatnonzero(gap)] = 0
         dev.flush("PX", 0, 2 * T * self.H)
         if self.gdn:
             m = GP.GdnPrepOperator.mask(n, T, lo, self._t(T), tree=tree)
@@ -604,12 +604,12 @@ class QwenPrefill(ChunkPrefill):
         out = super()._splits(T, p0, budget)
         return sorted({*out, *(i for _, at in self._moe_marks.get(T, ()) for i in at)})
 
-    def hidden(self, i: int, n: int = 1) -> torch.Tensor:
+    def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32)."""
         dev, H = self.ov.dev, self.H
         dev.fetch("PX", 2 * H * i, 2 * H * n)
         rows = dev.view("PX")[2 * H * i:2 * H * (i + n)].copy()
-        return torch.from_numpy(rows).view(torch.bfloat16).float().view(n, H)
+        return rows.view(bfloat16).astype(np.float32).reshape(n, H)
 
     # ------------------------------------------------------------------
     # Time estimates

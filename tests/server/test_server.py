@@ -24,7 +24,6 @@ import jinja2
 import numpy as np
 import openai
 import pytest
-import torch
 import uvicorn
 from fastapi.testclient import TestClient
 
@@ -264,7 +263,7 @@ class FakeNpu(NpuModel):
         self.seq[start:end] = [int(t) for t in tokens]
         self.position = min(self.position, start)  # (positions past the records written: another sequence's)
 
-    def prompt(self, tokens: list[int], *, logits: bool = False, progress: object = None) -> torch.Tensor | None:
+    def prompt(self, tokens: list[int], *, logits: bool = False, progress: object = None) -> np.ndarray | None:
         assert not logits
         self.calls.append(("prompt", len(tokens)))
         for i in range(0, len(tokens), self.chunk):
@@ -285,8 +284,8 @@ class FakeNpu(NpuModel):
         idx = np.arange(len(tokens)) if at is None else np.asarray(at) % len(tokens)
         return np.stack([fake_row(self.seq[:p0 + i + 1]) for i in idx])
 
-    def _logits(self, token: int) -> torch.Tensor:
-        out = torch.full((VOCAB,), -100.0)
+    def _logits(self, token: int) -> np.ndarray:
+        out = np.full(VOCAB, -100.0, np.float32)
         out[token] = 0.0
         return out
 
@@ -298,7 +297,7 @@ class FakeNpu(NpuModel):
         self.position += len(tokens)
         self.dispatches += 1
 
-    def forward(self, tokens: list[int], *, progress: object = None) -> torch.Tensor:
+    def forward(self, tokens: list[int], *, progress: object = None) -> np.ndarray:
         self.calls.append(("forward", len(tokens)))
         if self.fail is not None:
             raise self.fail
@@ -315,11 +314,11 @@ class FakeNpu(NpuModel):
         logits = self._logits(next(self._next, EOS))
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
-    def step(self, token: int) -> torch.Tensor:
+    def step(self, token: int) -> np.ndarray:
         self._run([token])
         return self._logits(next(self._next, EOS))
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: object = (),
+    def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: object = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(with ``drafts``: as a model's multi-token steps, the token and its drafts run, then they are yielded;
         ``generated``: each generation's ``drafts`` argument)"""

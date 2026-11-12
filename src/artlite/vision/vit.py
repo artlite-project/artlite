@@ -32,7 +32,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 
 from ..operators.design import COLS
 from . import design as D
@@ -138,12 +137,12 @@ class Keys:
                          joint=self.joint, dense=self.dense, kv_heads=self.kv_heads, **{"q": 0, "o": 0, "kv": 0} | kw)
 
 
-def pad_heads(w: Wt | torch.Tensor, dim: int = 0, vt: Vit = VIT) -> Wt | torch.Tensor:
+def pad_heads(w: Wt | np.ndarray, dim: int = 0, vt: Vit = VIT) -> Wt | np.ndarray:
     """Rows (dim 0) or columns (1) of the heads of HD -> heads of HP (zeros after each head's)."""
     return take(w, vt.head_rows(), dim)
 
 
-def pad(w: Wt | torch.Tensor, rows: int, cols: int = 0) -> Wt | torch.Tensor:
+def pad(w: Wt | np.ndarray, rows: int, cols: int = 0) -> Wt | np.ndarray:
     """w's rows (and columns) zero-padded to rows (cols)."""
     out = take(w, pad_index(rows, w.shape[0]))
     return take(out, pad_index(cols, w.shape[1]), 1) if cols else out
@@ -161,7 +160,7 @@ def ln_records(bd: Builder, x: Tensor, *, name: str, C: int = C) -> int:
     return rec
 
 
-def ln(bd: Builder, x: Tensor, y: Tensor, gamma: torch.Tensor, beta: torch.Tensor | None, *, name: str, rec: int,
+def ln(bd: Builder, x: Tensor, y: Tensor, gamma: np.ndarray, beta: np.ndarray | None, *, name: str, rec: int,
        C: int = C, H: int = H, eps: float = EPS, mode: str = "ln") -> None:
     """LayerNorm (mode "rms": RMSNorm, beta None) of the C tiles x (its producer's records at rec, freed) over their
     first H of C channels into the panels y on every core row."""
@@ -182,20 +181,20 @@ def attend(bd: Builder, q: Tensor, kv: int, keys: Keys) -> Tensor:
     return o
 
 
-def k_view(n: Tensor, w: Wt | torch.Tensor) -> Tensor:
+def k_view(n: Tensor, w: Wt | np.ndarray) -> Tensor:
     """The panels n as the A of a GEMM of the weights w: their K, the first of n's channels (the pads skipped)."""
     k = w.shape[1]
     return n if k == n.C else Tensor(n.lv, k, n.addr, "pn", pnp=n.np)
 
 
-def _qk(bd: Builder, n: Tensor, w: dict[str, torch.Tensor], role: str, name: str, out: Tensor, rope: Tensor | None,
+def _qk(bd: Builder, n: Tensor, w: dict[str, np.ndarray], role: str, name: str, out: Tensor, rope: Tensor | None,
         extra: dict | None = None) -> None:
     """Q or K of the LN1 panels n into the panels out (rope: the band's cos | sin tile, each head's pairs turned)."""
     gemm(bd, k_view(n, w[role]), w[role], w[role + "_b"], name=f"{name}.{role}", out=out, kind="rope" if rope else "bfp16",
          res=rope, extra=extra)
 
 
-def kv(bd: Builder, w: dict[str, torch.Tensor], name: str, n: Tensor, kvd: int, keys: Keys, band: int, *, q: bool,
+def kv(bd: Builder, w: dict[str, np.ndarray], name: str, n: Tensor, kvd: int, keys: Keys, band: int, *, q: bool,
        rope: Tensor | None = None) -> Tensor | None:
     """K and V of the LN1 panels n (their slots' drains at DDR kvd: band ``band``'s keys), and Q (q: its panels; else
     None, V^T's drains with the next op); rope: the band's cos | sin tile for K and Q."""
@@ -216,7 +215,7 @@ def kv(bd: Builder, w: dict[str, torch.Tensor], name: str, n: Tensor, kvd: int, 
     return qt
 
 
-def attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: Tensor, kvd: int, keys: Keys) -> int:
+def attn_out(bd: Builder, w: dict[str, np.ndarray], name: str, qt: Tensor, x: Tensor, kvd: int, keys: Keys) -> int:
     """x += O (the attention of the queries qt, freed): x's records."""
     o = attend(bd, qt, kvd, keys)
     free(bd, qt)
@@ -225,7 +224,7 @@ def attn_out(bd: Builder, w: dict[str, torch.Tensor], name: str, qt: Tensor, x: 
     return rec
 
 
-def ffn(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, park: str = "", vt: Vit = VIT
+def ffn(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int, park: str = "", vt: Vit = VIT
         ) -> tuple[Tensor, int]:
     """LN2, x parked in DDR (image ``park``, default name.x), up + GELU, x back, down + x: the output's C tiles (x's
     memory freed) and records."""
@@ -250,7 +249,7 @@ def ffn(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int,
     return y, rec
 
 
-def layer(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int, *, kv_ddr: int,
+def layer(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int, *, kv_ddr: int,
           keys: Keys, vt: Vit = VIT) -> tuple[Tensor, int]:
     """A ViT layer (module docstring) on the residual's C tiles x with its LayerNorm records at rec (its producer's):
     the output's C tiles (x's memory freed) and their records. kv_ddr: a DDR buffer for the attention's K / V^T slots
@@ -286,7 +285,7 @@ class Bands:
                  release=[(t.addr, t.size or t.nbytes), (rec, ln_rec(self.lv))])
 
 
-def layer_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands, out: Bands, *, kv_ddr: int, keys: Keys,
+def layer_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands, out: Bands, *, kv_ddr: int, keys: Keys,
                 park: Callable[[int], str] | None = None, rope: Callable[[Builder, int], Tensor] | None = None,
                 vt: Vit = VIT) -> None:
     """A ViT layer on a banded level (each entry's keys in every band): per band LN1, K and V into the slots; then per

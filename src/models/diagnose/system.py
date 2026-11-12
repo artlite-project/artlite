@@ -279,7 +279,7 @@ def code_state() -> dict[str, object]:
     local = _git("log", "--oneline", f"{upstream}..HEAD")
     status = _git("status", "--porcelain", "--untracked-files=no")
     versions = {}
-    for pkg in ("mlir_aie", "llvm_aie", "numpy", "torch", "nanobind"):
+    for pkg in ("mlir_aie", "llvm_aie", "numpy", "ml_dtypes", "nanobind"):
         try:
             versions[pkg] = metadata.version(pkg)
         except metadata.PackageNotFoundError:

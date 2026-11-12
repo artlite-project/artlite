@@ -40,7 +40,6 @@ import itertools
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
@@ -362,7 +361,7 @@ class LfmPrefill(ChunkPrefill):
                 out |= prep.params(p0) | (at.set_params(sets) if at.nc else at.params(p0))
         return out
 
-    def run(self, x: torch.Tensor, p0: int, T: int = 0, *, sets: tuple[int, ...] | None = None) -> None:
+    def run(self, x: np.ndarray, p0: int, T: int = 0, *, sets: tuple[int, ...] | None = None) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches and conv histories hold the positions before). Leaves the attention layers' K / V of the
         positions in the caches and the conv histories at p0 + n. A non-causal model's prompt: at p0 0 (zero
@@ -379,7 +378,7 @@ class LfmPrefill(ChunkPrefill):
         else:
             assert sets is None, "a causal model's prompt sees what is before it"
         px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
-        px[:n] = x.float().numpy()
+        px[:n] = x
         px[n:] = 0
         dev.flush("PX", 0, 4 * T * H)
         self.ov.conv_base(p0)
@@ -387,12 +386,12 @@ class LfmPrefill(ChunkPrefill):
         self.ov.conv_at(p0 + n)
         dev.stale = True  # (the chunk's configurations replaced the operator cores' code pages)
 
-    def hidden(self, i: int, n: int = 1) -> torch.Tensor:
+    def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of the last chunk's output residual (the LM head's input before its
         norm: ``LfmOverlay.logits_of``)."""
         H, dev = self.H, self.ov.dev
         dev.fetch("PX", 4 * i * H, 4 * n * H)
-        return torch.from_numpy(dev.view("PX")[4 * i * H:4 * (i + n) * H].view(np.float32).copy()).view(n, H)
+        return dev.view("PX")[4 * i * H:4 * (i + n) * H].view(np.float32).reshape(n, H).copy()
 
     # ------------------------------------------------------------------
     # Time estimates

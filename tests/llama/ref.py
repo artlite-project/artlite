@@ -23,6 +23,7 @@ from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators import bfp16
 
+from ..common import as_torch
 from ..decode.attn_ref import AttentionRef, bf, inv_rms
 
 
@@ -47,7 +48,7 @@ class LlamaNpuRef:
         (as the image's)."""
         if name not in self._mats:
             t = self.gguf.tensor(name)
-            w = t.dequantize().float()
+            w = torch.from_numpy(t.dequantize())
             if has_tile_format(t.qtype) and tile_format(t.qtype) == "BFP16":
                 w = torch.from_numpy(bfp16.values(w.numpy()))
             cfg = self.cfg
@@ -60,7 +61,7 @@ class LlamaNpuRef:
 
     def embed(self, tokens: list[int]) -> torch.Tensor:
         """The tokens' embedding rows (T, hidden) fp32."""
-        return self.gguf.rows("token_embd.weight", tokens)
+        return torch.from_numpy(self.gguf.rows("token_embd.weight", tokens))
 
     def _normed(self, r: torch.Tensor, w: str) -> tuple[torch.Tensor, torch.Tensor]:
         """A normed phase's input from the residual r: (x w, 1 / rms(x)) of its bf16 copy x."""
@@ -96,11 +97,12 @@ class LlamaNpuRef:
         trace["r"] = bf(r)
         xin, sc = self._normed(r, "output_norm.weight")
         lm = "output.weight" if "output.weight" in self.gguf else "token_embd.weight"
-        return bf((xin @ self.gguf.rows(lm, list(range(self.vocab))).T) * sc)
+        return bf((xin @ torch.from_numpy(self.gguf.rows(lm, list(range(self.vocab)))).T) * sc)
 
 
 def relative(a: torch.Tensor, b: torch.Tensor) -> float:
     """Relative rms error (inf when a is not finite: a NaN would compare as no error)."""
+    a, b = as_torch(a), as_torch(b)
     if not torch.isfinite(a.float()).all():
         return float("inf")
     return float((a.float() - b.float()).pow(2).sum().sqrt() / b.float().pow(2).sum().sqrt())

@@ -63,7 +63,7 @@ class LlamaImage(TileImage):
     def norm_objects(self, L: int, name: str) -> np.ndarray:
         """(n_norm, tile_bytes) uint8: the phase's RMSNorm weights (bf16)."""
         w = self.gguf.tensor("output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight").dequantize()
-        return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
+        return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
 
     def _layer(self, L: int) -> None:
         cfg, b = self.cfg, f"blk.{L}."

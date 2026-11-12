@@ -8,10 +8,11 @@ file. Checked against llama.cpp's CPU backend (BF16 file: KL 2e-7 on the next-to
 distribution; llama.cpp itself rounds activations to bf16 there).
 
 The operations are methods (``mm``, ``norm``, ``gelu``, ``rope``, ``attend``) so that models of
-other arithmetic can override them (ref.py: ``mm`` with the NPU's rounding). The embedding and the
-per-layer inputs are the NPU app's (``models.gemma4.host.GemmaHost``).
+other arithmetic can override them (ref.py: ``mm`` with the NPU's rounding). The weights and the
+embedding rows are the NPU app's (``models.gemma4.host.GemmaHost``), as torch tensors.
 """
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -20,7 +21,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from models.gemma4 import host
-from models.gemma4.host import GemmaHost, rms_norm
+from models.gemma4.host import GemmaHost
 
 SOURCES = [__file__, host.__file__]  # the reference's code (tests' cached_ref)
 
@@ -46,6 +47,12 @@ def rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
+
+
+def rms_norm(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
+    """x / sqrt(mean(x^2) + eps) (* w) over the last dimension."""
+    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return y if w is None else y * w
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
@@ -84,9 +91,37 @@ class GemmaCpu(GemmaHost):
         with ThreadPoolExecutor(self._threads) as ex:  # numpy releases the GIL
             list(ex.map(self.mat, names))
 
+    def mat(self, name: str) -> torch.Tensor:
+        """The dequantized matrix (rows, cols) fp32, or vector (n,) (``GemmaHost.mat``'s, shared)."""
+        return torch.from_numpy(super().mat(name))
+
+    def embed(self, tokens: list[int]) -> torch.Tensor:
+        """(T, hidden): the token embeddings * sqrt(hidden)."""
+        return torch.from_numpy(super().embed(tokens))
+
+    def per_layer_inputs(self, tokens: list[int], x: torch.Tensor) -> torch.Tensor | None:
+        """(T, layers, per_layer_dim): (RMSNorm(per_layer_model_proj @ x / sqrt(hidden)) +
+        sqrt(per_layer_dim) * per_layer_token_embd[token]) / sqrt(2)."""
+        cfg = self.cfg
+        if not cfg.per_layer_dim:
+            return None
+        T, n, d = len(tokens), cfg.num_hidden_layers, cfg.per_layer_dim
+        proj = (self.mm("per_layer_model_proj.weight", x) / math.sqrt(cfg.hidden_size)).view(T, n, d)
+        proj = self.norm(proj, "per_layer_proj_norm.weight")
+        tok = torch.from_numpy(self.gguf.rows("per_layer_token_embd.weight", tokens)).view(T, n, d) * math.sqrt(d)
+        return (proj + tok) / math.sqrt(2.0)
+
     # ------------------------------------------------------------------
-    # Operations (overridden by models of the NPU arithmetic; mm, norm: GemmaHost)
+    # Operations (overridden by models of the NPU arithmetic)
     # ------------------------------------------------------------------
+
+    def mm(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        """x (T, K) @ W^T."""
+        return x @ self.mat(name).T
+
+    def norm(self, x: torch.Tensor, name: str | None) -> torch.Tensor:
+        """RMSNorm over the last dimension with the weight vector ``name`` (None: no weight)."""
+        return rms_norm(x, None if name is None else self.mat(name), self.cfg.rms_norm_eps)
 
     def gelu(self, x: torch.Tensor) -> torch.Tensor:
         return gelu(x)
@@ -216,7 +251,7 @@ class GemmaAssistant:
         self.eps = float(m("attention.layer_norm_rms_epsilon"))
         self.w: dict[str, torch.Tensor] = {}
         for n in gguf.tensor_info:
-            t = gguf.tensor(n).dequantize()
+            t = torch.from_numpy(gguf.tensor(n).dequantize())
             self.w[n] = t.reshape(-1) if t.shape[0] == 1 else t
 
     def step(self, token: int, h: torch.Tensor, state: GemmaState, pos: int,

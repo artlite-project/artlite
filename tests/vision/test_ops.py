@@ -15,6 +15,8 @@ from artlite.vision.ops import Apply, Attention, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Slots, as_wt
 
+from ..common import as_torch
+
 COLS, ROWS = 8, 4
 
 
@@ -30,6 +32,7 @@ def q(x: torch.Tensor) -> torch.Tensor:
 
 
 def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
+    y, ref = as_torch(y), as_torch(ref)
     return float((y - ref).norm() / ref.norm())
 
 
@@ -97,8 +100,8 @@ def test_gemm(npu: VisionDevice, m: int, ntile: int, K: int, N: int, res: bool, 
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    unpack = {"bfp16": lambda b: L.from_panels(b, T, N), "vt": lambda b: L.from_vt_panels(b, T, N),
-              "bf16": lambda b: L.from_ctiles(b, T, N, m)}[out]
+    unpack = {"bfp16": lambda b: torch.from_numpy(L.from_panels(b, T, N)), "vt": lambda b: torch.from_numpy(L.from_vt_panels(b, T, N)),
+              "bf16": lambda b: torch.from_numpy(L.from_ctiles(b, T, N, m))}[out]
     y = torch.cat([unpack(yb[c]) for c in range(COLS)])
     ref = q(x) @ q(w).T + b.bfloat16().float() + (r.bfloat16().float() if res else 0)
     assert _rel(y, ref) < 8e-3
@@ -125,7 +128,7 @@ def test_gemm_rope(npu: VisionDevice) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(yb[c], m, N) for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(yb[c], m, N)) for c in range(COLS)])
     c0 = (q(x) @ q(w).T + b.bfloat16().float()).bfloat16().float().reshape(-1, 16, 2, 40)
     c, sn = (t.bfloat16().float()[:, None] for t in (cs[:, :40], cs[:, 40:]))
     ref = torch.stack([c0[:, :, 0] * c - c0[:, :, 1] * sn, c0[:, :, 1] * c + c0[:, :, 0] * sn], 2).reshape(-1, N)
@@ -173,7 +176,7 @@ def test_attention_dense(npu: VisionDevice, nb: int, frac: float, heads: int, kv
     s.op(drains(npu, "o", nbytes, OA), {})
     npu.run(npu.transaction(s))
     ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
-    o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
+    o = torch.cat([torch.from_numpy(L.from_panels(ob[c], T, C)) for c in range(COLS)])
     img = images(T)
     sel = torch.from_numpy(ok)
     kk = torch.cat([q(k[b][img == i]) for i in range(2) for b in range(nb)])[sel]
@@ -205,7 +208,7 @@ def test_geglu(npu: VisionDevice, m: int, K: int, N: int) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     out = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(out[c], g.y_np * 8, N // 2)[:T] for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(out[c], g.y_np * 8, N // 2))[:T] for c in range(COLS)])
     u = q(x) @ q(w).T + b.bfloat16().float()
     hid, gate = u.chunk(2, -1)
     ref = hid.bfloat16().float() * F.gelu(gate.bfloat16().float(), approximate="tanh")
@@ -230,7 +233,7 @@ def test_gelu(npu: VisionDevice, m: int, ntile: int, K: int, N: int) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     out = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(out[c], g.y_np * 8, N)[:T] for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(out[c], g.y_np * 8, N))[:T] for c in range(COLS)])
     u = q(x) @ q(w).T + b.bfloat16().float()
     ref = F.gelu(u.bfloat16().float(), approximate="tanh")
     assert _rel(y, ref) < 1.2e-2
@@ -304,9 +307,9 @@ def test_norm(npu: VisionDevice, mode: str, m: int, C: int, ntile: int, nrows: i
     s.op(merge(drains(npu, "y", ny, Y), drains(npu, "z", nz, Z)), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ny).reshape(COLS, -1)
-    y = torch.cat([L.from_ctiles(yb[c], T, C, m) for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_ctiles(yb[c], T, C, m)) for c in range(COLS)])
     zb = npu.read("z", COLS * nz).reshape(COLS, nz)
-    z = torch.cat([L.from_panels(zb[c], T, C) for c in range(COLS)])
+    z = torch.cat([torch.from_numpy(L.from_panels(zb[c], T, C)) for c in range(COLS)])
     if gn:
         img = images(T)
         ref = torch.zeros_like(y)
@@ -373,7 +376,7 @@ def test_attention(npu: VisionDevice, np_: int, d: int, nb: int, rows: int, sink
     s.op(drains(npu, "o", nbytes, OA), {})
     npu.run(npu.transaction(s))
     ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
-    o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
+    o = torch.cat([torch.from_numpy(L.from_panels(ob[c], T, C)) for c in range(COLS)])
     img = images(T)
     ref = torch.zeros(COLS * T, C)
     for i in range(2):
@@ -442,7 +445,7 @@ def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: boo
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = from_level_tokens(torch.stack([L.from_ctiles(yb[c], m, N, m) for c in range(COLS)]), R, Lg)
+    y = from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], m, N, m)) for c in range(COLS)]), R, Lg)
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), stride=stride, padding=1)
     if res:
         ref = ref + r_img.bfloat16().float()
@@ -475,7 +478,7 @@ def test_conv_rows(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     s.op(merge(*(drains(npu, f"y{k}", yb, Y[k]) for k in range(2))), {})
     npu.run(npu.transaction(s))
     ys = [npu.read(f"y{k}", COLS * yb).reshape(COLS, yb) for k in range(2)]
-    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(ys[k][c], 128, N, 64) for k in range(2)]) for c in range(COLS)]),
+    y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(ys[k][c], 128, N, 64)) for k in range(2)]) for c in range(COLS)]),
                           rc, 4)
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
     if res:
@@ -509,7 +512,7 @@ def test_cross_attention(npu: VisionDevice, np_: int, d: int, nb: int) -> None:
     s.op(drains(npu, "o", nbytes, OA), {})
     npu.run(npu.transaction(s))
     ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
-    o = torch.cat([L.from_panels(ob[c], T, C) for c in range(COLS)])
+    o = torch.cat([torch.from_numpy(L.from_panels(ob[c], T, C)) for c in range(COLS)])
     img = images(T)
     ref = torch.zeros(COLS * T, C)
     for i in range(2):
@@ -565,7 +568,7 @@ def test_conv_il(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
         s.op(drains(npu, f"y{k}", yb, Y), {})
     npu.run(npu.transaction(s))
     ys = [npu.read(f"y{k}", COLS * yb).reshape(COLS, yb) for k in range(4)]
-    y = from_il_tokens(torch.stack([torch.cat([L.from_ctiles(ys[k][c], 256, N, 64) for k in range(4)]) for c in range(COLS)]),
+    y = from_il_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(ys[k][c], 256, N, 64)) for k in range(4)]) for c in range(COLS)]),
                        8)
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
     if res:
@@ -597,8 +600,8 @@ def test_norm_rms(npu: VisionDevice) -> None:
     nz, ny = C // 8 * m // 8 * L.PANEL, C // 80 * L.ct_bytes(m)
     s.op(merge(drains(npu, "y", ny, Y), drains(npu, "z", nz, Z)), {})
     npu.run(npu.transaction(s))
-    y = torch.cat([L.from_ctiles(b, m, C, m) for b in npu.read("y", COLS * ny).reshape(COLS, -1)])
-    z = torch.cat([L.from_panels(b, m, C) for b in npu.read("z", COLS * nz).reshape(COLS, -1)])
+    y = torch.cat([torch.from_numpy(L.from_ctiles(b, m, C, m)) for b in npu.read("y", COLS * ny).reshape(COLS, -1)])
+    z = torch.cat([torch.from_numpy(L.from_panels(b, m, C)) for b in npu.read("z", COLS * nz).reshape(COLS, -1)])
     ref = y / torch.sqrt((y[:, :H] ** 2).mean(-1, keepdim=True) + 1e-5) * gamma
     assert _rel(z[:, :H], ref[:, :H]) < 9e-3 and float(z[:, H:].abs().max()) == 0
 
@@ -627,7 +630,7 @@ def test_gated(npu: VisionDevice, out: str) -> None:
     u = (q(x) @ q(w).T).bfloat16().float()
     hid, gate = u.chunk(2, -1)
     if out == "swiglu":
-        y = torch.cat([L.from_panels(ob[c], m, N // 2) for c in range(COLS)])
+        y = torch.cat([torch.from_numpy(L.from_panels(ob[c], m, N // 2)) for c in range(COLS)])
         assert _rel(y, hid * F.silu(gate)) < 1.2e-2
     else:  # ([pass 32][rb 8][cb 5][8 tokens][8 ch] bf16 per column, 640 B of padding a pass)
         v = torch.from_numpy(ob.reshape(COLS, N // 80, 5760)[:, :, :5120].copy()).view(torch.bfloat16).float()
@@ -658,7 +661,7 @@ def test_gemm_rope_qkn(npu: VisionDevice) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(yb[c], m, N) for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(yb[c], m, N)) for c in range(COLS)])
     c0 = (q(x) @ q(w).T).bfloat16().float().reshape(-1, 16, 80)
     c0 = c0 / torch.sqrt((c0 * c0).sum(-1, keepdim=True) / 64 + 1e-5) * nw.bfloat16().float()
     c0 = c0.reshape(-1, 16, 2, 40)
@@ -715,7 +718,7 @@ def test_dwconv(npu: VisionDevice, gh: int, gw: int, nb: int, b: int) -> None:
     s.op(drains(npu, "y", nbytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * nbytes).reshape(COLS, nbytes)
-    got = torch.stack([L.from_panels(yb[c], 64, C) for c in range(COLS)])  # (column, token 8 (2 q + p) + j, C)
+    got = torch.stack([torch.from_numpy(L.from_panels(yb[c], 64, C)) for c in range(COLS)])  # (column, token 8 (2 q + p) + j, C)
     wq = taps.bfloat16().float()
     ref, sel = torch.zeros_like(got), torch.zeros(COLS, 64, dtype=torch.bool)
     for c in range(COLS):
@@ -790,7 +793,7 @@ def test_gemm_rope2(npu: VisionDevice, N: int) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(yb[c], T, N) for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(yb[c], T, N)) for c in range(COLS)])
     c0 = (q(x) @ q(w).T).bfloat16().float().reshape(-1, N // 160, 160)
     c0 = c0 / torch.sqrt((c0 * c0).sum(-1, keepdim=True) / 96 + 1e-5) * nw.bfloat16().float()
     ref = torch.empty_like(c0)
@@ -820,7 +823,7 @@ def test_gemm_silu(npu: VisionDevice) -> None:
     s.op(drains(npu, "y", ybytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
-    y = torch.cat([L.from_panels(yb[c], m, N) for c in range(COLS)])
+    y = torch.cat([torch.from_numpy(L.from_panels(yb[c], m, N)) for c in range(COLS)])
     u = (q(x) @ q(w).T + b.bfloat16().float()).bfloat16().float()
     assert _rel(y, F.silu(u)) < 1.2e-2
 
@@ -859,7 +862,7 @@ def test_strip_conv1(npu: VisionDevice, k: int) -> None:
     s.op(drains(npu, "y", nbytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * nbytes).reshape(COLS, nbytes)
-    got = torch.stack([L.from_panels(yb[c], 64, C) for c in range(COLS)])
+    got = torch.stack([torch.from_numpy(L.from_panels(yb[c], 64, C)) for c in range(COLS)])
     wq = taps.bfloat16().float()
     conv = (wq[:, 0] * g[:-2] + wq[:, 1] * g[1:-1] + wq[:, 2] * g[2:]).bfloat16().float()
     ref = (conv * cg).bfloat16().float()[order]
@@ -914,7 +917,7 @@ def test_win_attention(npu: VisionDevice, start: bool) -> None:
     ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
     o = torch.zeros(T, H * d)
     for c in range(COLS):
-        o[order[c]] = L.from_panels(ob[c], 64, H * d)
+        o[order[c]] = torch.from_numpy(L.from_panels(ob[c], 64, H * d))
     kq = q(k.reshape(32 + T, -1)).reshape(32 + T, KVH, d)
     vq = torch.cat([q(v.reshape(32 + T, -1)[i:i + 8].T).T for i in range(0, 32 + T, 8)]).reshape(32 + T, KVH, d)
     ref = torch.zeros(T, H, d)
@@ -979,7 +982,7 @@ def test_strip_conv2(npu: VisionDevice, lead: str) -> None:
     s.op(drains(npu, "y", nbytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * nbytes).reshape(COLS, nbytes)
-    got = torch.stack([L.from_panels(yb[c], 64, 320)[:, :C] for c in range(COLS)])
+    got = torch.stack([torch.from_numpy(L.from_panels(yb[c], 64, 320))[:, :C] for c in range(COLS)])
     xs = F.silu(x).bfloat16().float()
     wq, bq = taps.bfloat16().float(), bias.bfloat16().float()
     ref = torch.zeros_like(got)

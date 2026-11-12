@@ -11,7 +11,7 @@ Weights of core row r (packed by ``weights.Slots``): per pass of 80 output chann
 """
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from ..operators import bfp16 as _bfp16
 from . import design as D
@@ -33,74 +33,74 @@ def ct_bytes(m: int) -> int:
     return -(-m * 160 // D.OCH) * D.OCH
 
 
-def panels(x: torch.Tensor) -> np.ndarray:
+def panels(x: np.ndarray) -> np.ndarray:
     """(tokens, C) -> the panel layout [C / 8][tokens / 8][8][9] (bytes)."""
     t, c = x.shape
-    return blocks(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3)).reshape(-1)
+    return blocks(np.asarray(x, np.float32).reshape(t // 8, 8, c // 8, 8).transpose(2, 0, 1, 3)).reshape(-1)
 
 
-def int_panels(x: torch.Tensor) -> np.ndarray:
+def int_panels(x: np.ndarray) -> np.ndarray:
     """(tokens, C) of integers in [-128, 127] -> the panel layout, exactly (every block's mantissas the integers, its
     exponent byte 133: a scale of 1)."""
     t, c = x.shape
-    m = x.to(torch.int8).reshape(t // 8, 8, c // 8, 8).permute(2, 0, 1, 3)
-    out = torch.full((*m.shape[:-1], 9), 133, dtype=torch.uint8)
-    out[..., 1:] = m.view(torch.uint8)
-    return out.numpy().reshape(-1)
-
-
-def from_panels(b: np.ndarray, tokens: int, c: int) -> torch.Tensor:
-    v = unblocks(np.asarray(b, np.uint8)[:c // 8 * tokens * 9].reshape(c // 8, tokens // 8, 8, 9))
-    return torch.from_numpy(np.ascontiguousarray(v)).permute(1, 2, 0, 3).reshape(tokens, c)
-
-
-def vt_panels(x: torch.Tensor) -> np.ndarray:
-    """(tokens, C) -> panels of the transposes [C / 8][tokens / 8][8 channels][8 tokens] (bytes; the exponent per
-    channel)."""
-    t, c = x.shape
-    return blocks(x.float().reshape(t // 8, 8, c // 8, 8).permute(2, 0, 3, 1)).reshape(-1)
-
-
-def from_vt_panels(b: np.ndarray, tokens: int, c: int) -> torch.Tensor:
-    v = unblocks(np.asarray(b, np.uint8)[:c // 8 * tokens * 9].reshape(c // 8, tokens // 8, 8, 9))
-    return torch.from_numpy(np.ascontiguousarray(v)).permute(1, 3, 0, 2).reshape(tokens, c)
-
-
-def ctiles(x: torch.Tensor, m: int) -> np.ndarray:
-    """(tokens, C) -> bf16 C-tile objects [C / 80][tokens / m][ct_bytes(m)] (bytes)."""
-    t, c = x.shape
-    nt = t // m
-    v = x.float().reshape(nt, m // 8, 8, c // 80, 10, 8).permute(3, 0, 1, 4, 2, 5).bfloat16()  # cb80 t rb cb tok ch
-    out = np.zeros((c // 80, nt, ct_bytes(m)), np.uint8)
-    out[..., :m * 160] = v.reshape(c // 80, nt, -1).view(torch.uint8).numpy().reshape(c // 80, nt, m * 160)
+    m = np.asarray(x).astype(np.int8).reshape(t // 8, 8, c // 8, 8).transpose(2, 0, 1, 3)
+    out = np.full((*m.shape[:-1], 9), 133, np.uint8)
+    out[..., 1:] = m.view(np.uint8)
     return out.reshape(-1)
 
 
-def from_ctiles(b: np.ndarray, tokens: int, c: int, m: int) -> torch.Tensor:
+def from_panels(b: np.ndarray, tokens: int, c: int) -> np.ndarray:
+    v = unblocks(np.asarray(b, np.uint8)[:c // 8 * tokens * 9].reshape(c // 8, tokens // 8, 8, 9))
+    return np.ascontiguousarray(v.transpose(1, 2, 0, 3)).reshape(tokens, c)
+
+
+def vt_panels(x: np.ndarray) -> np.ndarray:
+    """(tokens, C) -> panels of the transposes [C / 8][tokens / 8][8 channels][8 tokens] (bytes; the exponent per
+    channel)."""
+    t, c = x.shape
+    return blocks(np.asarray(x, np.float32).reshape(t // 8, 8, c // 8, 8).transpose(2, 0, 3, 1)).reshape(-1)
+
+
+def from_vt_panels(b: np.ndarray, tokens: int, c: int) -> np.ndarray:
+    v = unblocks(np.asarray(b, np.uint8)[:c // 8 * tokens * 9].reshape(c // 8, tokens // 8, 8, 9))
+    return np.ascontiguousarray(v.transpose(1, 3, 0, 2)).reshape(tokens, c)
+
+
+def ctiles(x: np.ndarray, m: int) -> np.ndarray:
+    """(tokens, C) -> bf16 C-tile objects [C / 80][tokens / m][ct_bytes(m)] (bytes)."""
+    t, c = x.shape
+    nt = t // m
+    v = np.asarray(x, np.float32).reshape(nt, m // 8, 8, c // 80, 10, 8).transpose(3, 0, 1, 4, 2, 5).astype(bfloat16)
+    out = np.zeros((c // 80, nt, ct_bytes(m)), np.uint8)  # (v: cb80 t rb cb tok ch)
+    out[..., :m * 160] = v.reshape(c // 80, nt, -1).view(np.uint8)
+    return out.reshape(-1)
+
+
+def from_ctiles(b: np.ndarray, tokens: int, c: int, m: int) -> np.ndarray:
     nt = tokens // m
     raw = np.asarray(b, np.uint8)[:c // 80 * nt * ct_bytes(m)].reshape(c // 80, nt, ct_bytes(m))[..., :m * 160]
-    v = torch.from_numpy(np.ascontiguousarray(raw)).view(torch.bfloat16).float()
-    return v.reshape(c // 80, nt, m // 8, 10, 8, 8).permute(1, 2, 4, 0, 3, 5).reshape(tokens, c)
+    v = np.ascontiguousarray(raw).view(bfloat16).astype(np.float32)
+    return np.ascontiguousarray(v.reshape(c // 80, nt, m // 8, 10, 8, 8).transpose(1, 2, 4, 0, 3, 5)).reshape(tokens, c)
 
 
-def kv_slots(k: torch.Tensor, v: torch.Tensor, d: int = 160) -> np.ndarray:
+def kv_slots(k: np.ndarray, v: np.ndarray, d: int = 160) -> np.ndarray:
     """An attention's K / V^T slots of 8 heads of d 160 (groups of 32 keys), 80 or 40 (groups of 64): k, v (2 images,
     keys, 8 d) -> [image][head][group][K [key block][d-block][2] | V^T [d-block pair][key panel][2]] (d 40: V^T's
     d-block 4 as [key panel] after the pairs', K and V^T one slot; keys padded to whole groups with zeros:
     ``ops.Attention`` masks them)."""
     n, nd, gk = k.shape[1], d // 8, 4 if d == 160 else 8
     ng = -(-n // (8 * gk))
-    kp = torch.zeros(2, 8 * gk * ng, 8 * d)
-    vp = torch.zeros(2, 8 * gk * ng, 8 * d)
-    kp[:, :n], vp[:, :n] = k.float(), v.float()
-    kk = kp.reshape(2, ng, gk // 2, 2, 8, 8, nd, 8).permute(0, 5, 1, 2, 6, 3, 4, 7)  # i g kb kh j h db d -> i h g kb db kh j d
+    kp = np.zeros((2, 8 * gk * ng, 8 * d), np.float32)
+    vp = np.zeros((2, 8 * gk * ng, 8 * d), np.float32)
+    kp[:, :n], vp[:, :n] = k, v
+    kk = kp.reshape(2, ng, gk // 2, 2, 8, 8, nd, 8).transpose(0, 5, 1, 2, 6, 3, 4, 7)  # i g kb kh j h db d -> i h g kb db kh j d
     if d == 40:  # ([d-block pair 2][key panel][2] of d-blocks 0..3, then [key panel] of d-block 4)
         v4 = vp.reshape(2, ng, gk, 8, 8, nd, 8)  # i g kp j h db d
-        va = v4[..., :4, :].reshape(2, ng, gk, 8, 8, 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # -> i h g dp kp dh d j
-        vb = v4[..., 4, :].permute(0, 4, 1, 2, 5, 3)  # i g kp j h d -> i h g kp d j
-        vv = torch.cat([va.reshape(2, 8, ng, -1, 8), vb.reshape(2, 8, ng, -1, 8)], 3)
+        va = v4[..., :4, :].reshape(2, ng, gk, 8, 8, 2, 2, 8).transpose(0, 4, 1, 5, 2, 6, 7, 3)  # -> i h g dp kp dh d j
+        vb = v4[..., 4, :].transpose(0, 4, 1, 2, 5, 3)  # i g kp j h d -> i h g kp d j
+        vv = np.concatenate([va.reshape(2, 8, ng, -1, 8), vb.reshape(2, 8, ng, -1, 8)], 3)
     else:
-        vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).permute(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
+        vv = vp.reshape(2, ng, gk, 8, 8, nd // 2, 2, 8).transpose(0, 4, 1, 5, 2, 6, 7, 3)  # i g kp j h dp dh d -> i h g dp kp dh d j
     kb_ = blocks(kk).reshape(2, 8, ng, -1)
     vb_ = blocks(vv).reshape(2, 8, ng, -1)
     return np.concatenate([kb_, vb_], axis=-1).reshape(-1)

@@ -21,7 +21,6 @@ import struct
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from .. import txn
@@ -424,7 +423,7 @@ class Gemm:
                                                                  A[0], 1152, A[5], A[6] | K.SH_OBJ, 0, 0, 0, 0]
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
 
-    def command(self, bias: torch.Tensor | None, row: int) -> np.ndarray:
+    def command(self, bias: np.ndarray | None, row: int) -> np.ndarray:
         """Row ``row``'s command slot (Q bytes); bias: (N,) or None (a conv's: its bias + the time bias)."""
         cmd = np.zeros(D.Q // 4, np.int32)
         om = {"bf16": K.O_BF16, "bfp16": K.O_BFP16, "geglu": K.O_GEGLU, "vt": K.O_VT, "ds": K.O_DS,
@@ -467,18 +466,18 @@ class Gemm:
         v = (self.tpar & 0xFFFFFFFF) >> self.tiles(row)[0]
         return v - (1 << 32) if v >> 31 else v
 
-    def bias_bytes(self, bias: torch.Tensor, row: int) -> np.ndarray:
+    def bias_bytes(self, bias: np.ndarray, row: int) -> np.ndarray:
         """The command's biases (at word C_BIAS): row ``row``'s of its passes, bf16."""
-        return bias[self._rows(row)].float().numpy().astype(bfloat16).view(np.uint8)
+        return np.asarray(bias, np.float32)[self._rows(row)].astype(bfloat16).view(np.uint8)
 
-    def _rows(self, row: int) -> torch.Tensor:
+    def _rows(self, row: int) -> np.ndarray:
         """Row ``row``'s weight rows of the op's passes in order (GEGLU: per pass [hid 40 | gate 40])."""
         n0 = row // self.tsplit * self.npass * 80
         ps = range(self.p0, self.p0 + self.npo)
         if self.out not in ("geglu", "prod"):
-            return torch.tensor([n0 + 80 * p + i for p in ps for i in range(80)])
+            return np.array([n0 + 80 * p + i for p in ps for i in range(80)])
         h, g = self.N // 2, n0 // 2
-        return torch.tensor([g + 40 * p + i if i < 40 else h + g + 40 * p + i - 40 for p in ps for i in range(80)])
+        return np.array([g + 40 * p + i if i < 40 else h + g + 40 * p + i - 40 for p in ps for i in range(80)])
 
     @property
     def col_free(self) -> bool:
@@ -701,15 +700,15 @@ class Apply:
             cmd[K.C_INVN] = _f32(1.0 / self.C)
         return cmd.view(np.uint8)
 
-    def gamma_beta(self, gamma: torch.Tensor | None, beta: torch.Tensor | None, row: int) -> np.ndarray:
+    def gamma_beta(self, gamma: np.ndarray | None, beta: np.ndarray | None, row: int) -> np.ndarray:
         """Row ``row``'s B slot: gamma, beta (fp32) of its channels (gamma, beta: of x's channels from block 0):
         GroupNorm [c16][gamma 16 | beta 16], else [gamma | beta]."""
         out = np.zeros(D.Q // 4, np.float32)
         n = self.nblk * 80
         if gamma is not None:
             c0 = (self.blk0 + self.rows.index(row) * self.nblk) * 80
-            g = gamma[c0:c0 + n].float().numpy()
-            b = np.zeros_like(g) if beta is None else beta[c0:c0 + n].float().numpy()
+            g = np.asarray(gamma, np.float32)[c0:c0 + n]
+            b = np.zeros_like(g) if beta is None else np.asarray(beta, np.float32)[c0:c0 + n]
             if self.gn:
                 out[:2 * n] = np.stack([g.reshape(-1, 16), b.reshape(-1, 16)], 1).reshape(-1)
             else:
@@ -975,10 +974,10 @@ class DwConv:
         return cmd.view(np.uint8)
 
     @staticmethod
-    def taps(w: torch.Tensor, block: int) -> np.ndarray:
+    def taps(w: np.ndarray, block: int) -> np.ndarray:
         """The B slot of channels [80 block, +80) (zero past w's) of taps w (C, 3, 3): [tap 9][80] bf16 in Q bytes."""
         out = np.zeros(D.Q // 2, bfloat16)
-        sel = w.reshape(w.shape[0], 9)[80 * block:80 * block + 80].float().numpy()
+        sel = np.asarray(w, np.float32).reshape(w.shape[0], 9)[80 * block:80 * block + 80]
         t = np.zeros((9, 80), np.float32)
         t[:, :sel.shape[0]] = sel.T
         out[:720] = t.reshape(-1).astype(bfloat16)

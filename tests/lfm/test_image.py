@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 import pytest
-import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode.design import POST_K
 from artlite.decode.image import COL_SLOT, pack_rows
@@ -98,7 +98,7 @@ def test_pack_image(quant: str) -> None:
     rng = np.random.default_rng(0)
 
     def bf(name: str) -> np.ndarray:
-        return g.tensor(name).dequantize().bfloat16().view(torch.uint16).numpy().reshape(-1)
+        return g.tensor(name).dequantize().astype(bfloat16).view(np.uint16).reshape(-1)
 
     for r in img.regions:
         cols = [out[r.offset + c * r.col_stride:][:r.col_bytes] for c in range(COLS)]

@@ -37,7 +37,6 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
 
 from ..common import Checkpoint, NpuModel
 from ..sequence import Sequence
@@ -74,7 +73,7 @@ class Entry:
 
     tokens: list[int] | Sequence = field(default_factory=list)
     checkpoints: dict[int, Checkpoint] = field(default_factory=dict)
-    logits: dict[int, torch.Tensor] = field(default_factory=dict)
+    logits: dict[int, np.ndarray] = field(default_factory=dict)
     segments: list[list] = field(default_factory=list)
     valid: int = 0
 
@@ -116,7 +115,7 @@ class PromptCache:
             for seg in e.segments:
                 seen.update((id(r), r.nbytes) for r in seg)
             seen.update((id(c), c.nbytes) for c in e.checkpoints.values())
-            seen.update((id(x), x.numel() * x.element_size()) for x in e.logits.values())
+            seen.update((id(x), x.nbytes) for x in e.logits.values())
         return sum(seen.values())
 
     # ------------------------------------------------------------------
@@ -134,7 +133,7 @@ class PromptCache:
             k = max(k, m - m % self.npu.group)
         return k
 
-    def prepare(self, ids: list[int] | Sequence, *, enabled: bool = True) -> tuple[int, torch.Tensor | None, str]:
+    def prepare(self, ids: list[int] | Sequence, *, enabled: bool = True) -> tuple[int, np.ndarray | None, str]:
         """Put the device where ``ids`` continue from: the positions kept (the device holds ``ids[:kept]``), the logits
         of the last one when all of them are (the checkpoint of a prompt that ended there), and how (for the log)."""
         npu, act = self.npu, self.active
@@ -238,7 +237,7 @@ class PromptCache:
             out.add(m)
         return sorted(m for m in out if kept < m < len(ids))
 
-    def checkpoint(self, tokens: list[int] | Sequence, logits: torch.Tensor | None = None) -> None:
+    def checkpoint(self, tokens: list[int] | Sequence, logits: np.ndarray | None = None) -> None:
         """The device holds ``tokens`` (a prompt, or its first part): a recurrent model's checkpoint there (``logits``:
         the prompt's last token's, at its end)."""
         self.active.tokens = tokens

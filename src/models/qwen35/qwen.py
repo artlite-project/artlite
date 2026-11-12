@@ -44,7 +44,6 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.decode.design import XB
 from artlite.gguf_model import GGUFFile
@@ -131,7 +130,7 @@ class NpuQwen(OverlayModel):
                 self.prefill.bind()
         self.overlay.ready()  # (the weights' thread packs meanwhile)
         gguf.release()
-        self._w_out = torch.from_numpy(self.overlay._f32("output_norm.weight"))
+        self._w_out = self.overlay._f32("output_norm.weight")
         self.position = 0
         self.rope_next = 0  # (the M-RoPE position of the next text token)
         self._prompting = False
@@ -223,16 +222,16 @@ class NpuQwen(OverlayModel):
             if self.prefill is not None and self.prefill.dp is not None:
                 self.prefill.dp.carry[:] = state["carry"]
 
-    def _rows(self, tokens: list[int] | Sequence) -> torch.Tensor:
+    def _rows(self, tokens: list[int] | Sequence) -> np.ndarray:
         """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
         if not isinstance(tokens, Sequence):
             return self.gguf.rows("token_embd.weight", tokens)
-        x = torch.empty(len(tokens), self.cfg.hidden_size)
+        x = np.empty((len(tokens), self.cfg.hidden_size), np.float32)
         t = ~tokens.given
         if t.any():
-            x[torch.from_numpy(t)] = self.gguf.rows("token_embd.weight", tokens.ids[t])
+            x[t] = self.gguf.rows("token_embd.weight", tokens.ids[t])
         if tokens.given.any():
-            x[torch.from_numpy(tokens.given)] = torch.from_numpy(tokens.rows)
+            x[tokens.given] = tokens.rows
         return x
 
     def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
@@ -240,7 +239,7 @@ class NpuQwen(OverlayModel):
 
     def prompt(self, tokens: list[int] | Sequence, *, logits: bool = False,
                progress: Callable[[int], None] | None = None, readout: Readout | None = None,
-               sets: abc.Sequence[int] | None = None) -> torch.Tensor | None:
+               sets: abc.Sequence[int] | None = None) -> np.ndarray | None:
         """(a sequence's positions from ``rope_next``)"""
         p, n = self.position, len(tokens)
         if p + n > self.capacity:
@@ -257,7 +256,7 @@ class NpuQwen(OverlayModel):
                               int(self.overlay.rope[self.position - 1].max()) + 1 if done else self.rope_next)
 
     def steps(self, tokens: list[int], *, logits: bool = True, commit: bool = True,
-              branch: tuple[int, int] | None = None) -> torch.Tensor | None:
+              branch: tuple[int, int] | None = None) -> np.ndarray | None:
         """(tokens after a prompt: text from ``rope_next``; ``commit``, ``branch``: ``QwenOverlay.step``'s, else the caller
         ``accept``s)"""
         p, n = self.position, len(tokens)
@@ -313,7 +312,7 @@ class NpuQwen(OverlayModel):
             return 0
         return super()._chunk(left, position, steps=steps)
 
-    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(the LM head alone on the chunk's last output row)"""
         x = self.prefill.hidden(n - 1)
         return self._dispatch(lambda: self.overlay.logits_of(x))
@@ -333,15 +332,14 @@ class NpuQwen(OverlayModel):
 
     def _records(self) -> None:
         """No drafter rows pending, nothing cached."""
-        self._pend: list[tuple[torch.Tensor, torch.Tensor]] = []  # (embedding, h) per row
+        self._pend: list[tuple[np.ndarray, np.ndarray]] = []  # (embedding, h) per row
         self._dpos = 0
-        self._h = torch.zeros(self.cfg.hidden_size)  # (zeros before position 0)
+        self._h = np.zeros(self.cfg.hidden_size, np.float32)  # (zeros before position 0)
         self._carry_at = 0  # (the position after the last chunk: the prefill's carry is its)
 
-    def _hidden(self, n: int) -> torch.Tensor:
+    def _hidden(self, n: int) -> np.ndarray:
         """The model's output-normed hidden states (n, hidden) fp32 of the last step's first n slots."""
-        x = torch.stack([self.overlay.hidden(-1, s) for s in range(n)])
-        return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.cfg.rms_norm_eps) * self._w_out
+        return self._normed(np.stack([self.overlay.hidden(-1, s) for s in range(n)]))
 
     def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
         self._x = self._rows(tokens)
@@ -350,13 +348,13 @@ class NpuQwen(OverlayModel):
     def _follow(self, n: int) -> None:
         """After the model's step: the drafter rows of its first n tokens (cached) pending."""
         hs = self._hidden(n)
-        h = torch.cat([self._h[None], hs[:-1]])
+        h = np.concatenate([self._h[None], hs[:-1]])
         self._pend += list(zip(self._x[:n], h, strict=True))
         self._h = hs[-1]
         while len(self._pend) >= self.overlay.SLOTS:
             self._run_pending(self.overlay.SLOTS)
 
-    def _draft_step(self, rows: list[tuple[torch.Tensor, torch.Tensor]], logits: bool) -> torch.Tensor | None:
+    def _draft_step(self, rows: list[tuple[np.ndarray, np.ndarray]], logits: bool) -> np.ndarray | None:
         """A drafter step of rows at ``_dpos`` on (their records; the drafter's logits (n, vocab) bf16, or None)."""
         p, n = self._dpos, len(rows)
         q = np.arange(p, p + n)
@@ -364,7 +362,7 @@ class NpuQwen(OverlayModel):
         rope = self.drafter.rope
         rope[q[old]] = self.overlay.rope[q[old]]
         rope[q[~old]] = self.rope_next + (q[~old] - self.position)[:, None]
-        emb, h = (torch.stack(v) for v in zip(*rows, strict=True))
+        emb, h = (np.stack(v) for v in zip(*rows, strict=True))
         out = self.drafter.step(emb, h, p, logits=logits)
         self._dpos += n
         return out
@@ -386,7 +384,7 @@ class NpuQwen(OverlayModel):
         super()._prefill_run(args, T, n, sets)
         if mtp:
             x = self.prefill.hidden(n - 1)
-            self._h = (x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.cfg.rms_norm_eps) * self._w_out)[0]
+            self._h = self._normed(x)[0]
             self._dpos = self._carry_at = self.position + n
 
     def draft(self, token: int, n: int) -> list[int]:
@@ -420,7 +418,7 @@ class NpuQwen(OverlayModel):
         self._chains = tuple(chains)
         return out
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
+    def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(the drafter's table follows the prompt and each token: ``HeadTable.see``)"""
         see = self._table.see if self._drafting else None
@@ -432,7 +430,7 @@ class NpuQwen(OverlayModel):
             yield token
 
     def forced_drafts(self, tokens: list[int], first: int, *, turns: abc.Sequence[int] = (), prefill: bool = True
-                      ) -> Iterator[tuple[list[int], torch.Tensor]]:
+                      ) -> Iterator[tuple[list[int], np.ndarray]]:
         """(the drafter's table sees all the tokens first: runs over the same tokens draft from the same rows)"""
         if self._drafting:
             self._table.see(tokens)
@@ -449,7 +447,7 @@ class NpuQwen(OverlayModel):
         t0 = time.perf_counter()
         d = self.dflash
         c = len(self.carry)
-        x = torch.stack([self._rows([token])[0], *[self._mask] * (d.cfg.block - 1)]).numpy()
+        x = np.stack([self._rows([token])[0], *[self._mask] * (d.cfg.block - 1)])
         if self._inj is not None:
             self._move_taps()
         S, keep, q, _ = self._inj if self._inj is not None else (0, 0, 0, None)
@@ -477,7 +475,7 @@ class NpuQwen(OverlayModel):
     def _sibling(self) -> list[int] | None:
         return self._sib
 
-    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
+    def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
         """(a step of drafts, or a drafter's round, commits no GDN state: ``_kept`` accepts its kept tokens, which the
         next step replays, ``QwenOverlay.accept``; a sibling in the last slot, after the round's token: ``QwenOverlay.step``'s
         branch)"""

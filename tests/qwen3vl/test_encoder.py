@@ -72,7 +72,7 @@ def mm() -> tuple:
 
     def get(n: str) -> torch.Tensor:
         t = g.tensor(n)
-        return t.dequantize().reshape(t.rows, t.cols).float()
+        return torch.from_numpy(t.dequantize().reshape(t.rows, t.cols))
     return get, ClipConfig.from_gguf(g)
 
 
@@ -123,7 +123,7 @@ def test_layer(npu: VisionDevice, mm: tuple, size: tuple[int, int], il: int) -> 
     for b in range(nb):
         raw = npu.read(f"{nm.x(il + 1)}.{b}", COLS * lv.ct(C)).reshape(COLS, -1)
         for c in range(COLS):
-            v = L.from_ctiles(raw[c], 64, C, 64).numpy()
+            v = L.from_ctiles(raw[c], 64, C, 64)
             rows[sp[b, c][real[b, c]]] = v[real[b, c]]
     sim = V.NpuEncoder(MMPROJ).layer(xin, il, ang, np.where(real, sp, -1).reshape(-1, 8)).numpy()
     got = rows[:, :H]
@@ -211,7 +211,7 @@ def test_tower(npu: VisionDevice, name: str) -> None:
 
     def get(n: str) -> torch.Tensor:
         t = g.tensor(n)
-        return t.dequantize().reshape(t.rows, t.cols).float()
+        return torch.from_numpy(t.dequantize().reshape(t.rows, t.cols))
     vt = E.tower(clip.hidden, clip.heads, clip.ffn, clip.eps)
     assert (vt.C, vt.HD, vt.FFN) == ((960, 64, 3200) if name == "d3-lite" else (1280, 64, 4160))
     enc = E.Encoder(npu, E.weights(get, clip.layers, clip.projection_dim, vt), get("v.position_embd.weight").numpy(),

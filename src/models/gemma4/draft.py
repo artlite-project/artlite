@@ -30,7 +30,7 @@ On the overlay (the model's phases: ``gemma4/overlay.py``):
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.decode import gemv, kv
 from artlite.decode import phases as mp
@@ -192,7 +192,7 @@ class DraftImage(TileImage):
         parts = np.zeros((2, NX_PER_NORM * POST_K), np.float32)
         for i, w in enumerate((w1, wp)):
             parts[i, :2 * self.d] = np.tile(self._vec(w), 2)
-        b = torch.from_numpy(parts.reshape(-1)).bfloat16().view(torch.int16).numpy().view(np.uint8)
+        b = parts.reshape(-1).astype(bfloat16).view(np.uint8)
         out = np.zeros(self.tile_bytes, np.uint8)
         out[:b.size] = b
         return out
@@ -463,7 +463,7 @@ class GemmaDraft:
         self._tkey = key
         return True
 
-    def step(self, x: torch.Tensor, h: torch.Tensor | None, pos: int) -> torch.Tensor:
+    def step(self, x: np.ndarray, h: np.ndarray | None, pos: int) -> np.ndarray:
         """A draft step for the token at position ``pos`` (not cached; the positions before are): x (hidden,) its
         scaled embedding, h (hidden,) the model's output-normed hidden state of position pos - 1, or None: the hidden
         state the previous step left (the steps of a draft run at the position of its first token). Returns the raw
@@ -472,9 +472,9 @@ class GemmaDraft:
         dev = self.ov.dev
         act = dev.view("DACT")
         pre = self.inp[(-1, "pre")].off + XB
-        xh = torch.cat([x.reshape(-1), h.reshape(-1)]) if h is not None else x.reshape(-1)
-        act[pre:pre + 2 * xh.numel()] = xh.bfloat16().view(torch.int16).numpy().view(np.uint8)
-        dev.flush("DACT", pre, 2 * xh.numel())
+        xh = np.concatenate([x.reshape(-1), h.reshape(-1)]) if h is not None else x.reshape(-1)
+        act[pre:pre + 2 * xh.size] = xh.astype(bfloat16).view(np.uint8)
+        dev.flush("DACT", pre, 2 * xh.size)
         moved = pos != self._pos
         if moved:
             self._position(pos)
@@ -483,9 +483,9 @@ class GemmaDraft:
         self.ov.ready()
         dev.dispatch(self._tr)
         dev.fetch("DLOGITS")
-        return torch.from_numpy(dev.view("DLOGITS")).view(torch.bfloat16)
+        return dev.view("DLOGITS").view(bfloat16)
 
-    def token(self, logits: torch.Tensor) -> int:
+    def token(self, logits: np.ndarray) -> int:
         """The most likely token of a step's logits."""
         return int(self.rows[argmax(logits)])
 
@@ -495,10 +495,10 @@ class GemmaDraft:
         self._tkey = None
 
 
-def output_norm(r: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def output_norm(r: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:
     """The model's output-normed hidden state of a residual r (hidden,): what a draft starts from (bf16)."""
-    r = r.float()
-    return (r * torch.rsqrt(r.pow(2).mean() + eps) * w).bfloat16()
+    r = np.asarray(r, np.float32)
+    return (r * (1 / np.sqrt((r * r).mean() + np.float32(eps))) * w).astype(bfloat16)
 
 
 __all__ = ["DraftImage", "GemmaDraft", "output_norm", "pair_rows"]

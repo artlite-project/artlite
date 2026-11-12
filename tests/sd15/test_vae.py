@@ -13,6 +13,8 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
 from models.sd15 import vae
 
+from ..common import as_torch
+
 
 @pytest.fixture(scope="module")
 def npu() -> VisionDevice:
@@ -32,6 +34,7 @@ def qconv(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> torch.Ten
 
 
 def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
+    y, ref = as_torch(y), as_torch(ref)
     return float((y - ref).norm() / ref.norm())
 
 
@@ -83,7 +86,7 @@ def _input(bd: Builder, x: torch.Tensor, lv: Level, name: str) -> DTensor:
 def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     """The decoder's ResnetBlock2D on a level (GN1 + SiLU, conv1, GN2 + SiLU, conv2 + x or the 1x1 shortcut; the
     halves' statistics joined): within 1.5e-2 of the fp32 reference."""
-    from models.sd15 import reference
+    from . import ref as reference
     torch.manual_seed(2)
     p, lv = f"r{H}.{cin}.{cout}.", vae.LEVELS[H]
     w = _rand_resnet(p, cin, cout)
@@ -123,7 +126,8 @@ def test_upsample(npu: VisionDevice, H: int, C: int) -> None:
 def test_decoder(npu: VisionDevice) -> None:
     """SD 1.5's VAE decoder (one dispatch) on random latents: within 2e-2 of the fp32 decoder (pixels)."""
     from artlite.model_config import sd15_dir
-    from models.sd15 import reference
+
+    from . import ref as reference
     path = os.path.join(sd15_dir(), "vae")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
@@ -161,7 +165,7 @@ def test_attention512(npu: VisionDevice) -> None:
           {})
     npu.run(bd.transaction())
     raw = npu.read("a512.o", COLS * ob).reshape(COLS, 80 * 16 * 72)
-    o = torch.cat([L.from_panels(raw[c][:64 * 16 * 72], 128, d) for c in range(COLS)])
+    o = torch.cat([torch.from_numpy(L.from_panels(raw[c][:64 * 16 * 72], 128, d)) for c in range(COLS)])
     qq, kq, vq = q(qs), q(k), q(v)
     p = torch.exp2(qq @ kq.T - (qq @ kq.T).max(-1, keepdim=True).values)
     ref = (p @ vq) / p.sum(-1, keepdim=True)
@@ -173,7 +177,7 @@ def test_attention512(npu: VisionDevice) -> None:
 def test_mid_attention(npu: VisionDevice) -> None:
     """The decoder's mid-block attention on the 64 level (GroupNorm, q / k / v, the d-512 attention over all 4096
     pixels, proj_attn + x): within 1.5e-2 of the fp32 reference."""
-    from models.sd15 import reference
+    from . import ref as reference
     torch.manual_seed(6)
     p, C, lv = "m.", 512, vae.LEVELS[64]
     g = torch.Generator().manual_seed(8)

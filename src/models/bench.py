@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import TextIO
 
 import gguf
-import torch  # noqa: TID251
+import numpy as np
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, model_path
@@ -179,11 +179,11 @@ def file_info(path: str, *, gguf: GGUFFile | None = None) -> tuple[dict[str, obj
     return info, f.string_count("tokenizer.ggml.tokens")
 
 
-def token_source(n_vocab: int, bos: list[int], rng: torch.Generator) -> Callable[[int, int], list[int]]:
+def token_source(n_vocab: int, bos: list[int], rng: np.random.Generator) -> Callable[[int, int], list[int]]:
     """Random input tokens: ``(n, position)`` -> n tokens from a position, the first ``bos`` at position 0."""
 
     def tokens(n: int, position: int) -> list[int]:
-        ids = torch.randint(n_vocab, (n,), generator=rng).tolist()
+        ids = rng.integers(n_vocab, size=n).tolist()
         return bos + ids[len(bos):] if ids and position == 0 else ids
 
     return tokens
@@ -324,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
                 if fmt != "none"]
     for p in printers:
         p.header()
-    rng = torch.Generator().manual_seed(0)
+    rng = np.random.default_rng(0)
     i = 0
     for path, group in itertools.groupby(tests, key=lambda t: t.model):  # (a model stays loaded for its tests)
         group = list(group)

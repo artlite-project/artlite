@@ -60,7 +60,7 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 import math
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.decode.design import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
@@ -216,8 +216,8 @@ class QwenImage(TileImage):
             if not self.cfg.attention[L] and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
                 planes.append((b + "attn_norm", (b + "ssm_alpha.weight",)))
             for norm, tensors in planes:
-                w = self.gguf.tensor(norm + ".weight").dequantize().numpy().reshape(-1)
-                bw = torch.from_numpy(w).bfloat16().float().numpy()
+                w = self.gguf.tensor(norm + ".weight").dequantize().reshape(-1)
+                bw = w.astype(bfloat16).astype(np.float32)
                 ratio = np.where(bw != 0, w / np.where(bw != 0, bw, 1), 1).astype(np.float32)
                 for name in tensors:
                     t = self.gguf.tensor(name)
@@ -233,7 +233,7 @@ class QwenImage(TileImage):
     def norm_objects(self, layer: int, name: str) -> np.ndarray:
         """(n_norm, tile_bytes) uint8: the phase's RMSNorm weights (bf16)."""
         w = self.gguf.tensor("output_norm.weight" if layer < 0 else f"blk.{layer}.{NORMS[name]}.weight").dequantize()
-        return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
+        return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
 
     def _layer(self, layer: int, attention: bool | None = None) -> None:
         """(``attention``: whether it is a full-attention layer, default ``cfg.attention``'s: an MTP block's is)"""

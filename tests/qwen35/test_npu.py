@@ -61,7 +61,7 @@ def test_slice(size: str) -> None:
     for t in range(n):
         ov.step(torch.from_numpy(np.asarray(G["l_out", layers[0] - 1][t], np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
-            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1).numpy()
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
             errs[t, i] = ref.rel_err(got, np.asarray(G["l_out", L][t], np.float32))
     print(f"{size} layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.3f}")
     assert errs.max() < 4e-2 and errs.mean(0).max() < 1.5e-2
@@ -79,7 +79,7 @@ def test_teacher_forced(size: str) -> None:
     dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
     pro = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
     model = NpuQwen(GGUFFile(path), capacity=256)
-    got = model.forced_logits(tokens)
+    got = torch.from_numpy(model.forced_logits(tokens))
     kl, kl_llama = float(_kl(dec, got).mean()), float(_kl(dec, pro).mean())
     # (an MoE model's routing flips near-tied experts, and then the next token where its top two are near ties: either
     # side's rounding moves a few of the 128 (Occamy's NPU 12, all where llama.cpp's own top two lie within 0.85); its
@@ -106,7 +106,7 @@ def test_prefill(size: str) -> None:
     split = torch.from_numpy(np.asarray(ref.golden(path, tokens, split=P, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
     dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
     model = NpuQwen(GGUFFile(path), capacity=4096)
-    got = torch.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]])
+    got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = _kl(split, got), _kl(split, dec)
     agree = float((split.argmax(-1) == got.argmax(-1)).float().mean())
     agree_llama = float((split.argmax(-1) == dec.argmax(-1)).float().mean())
@@ -152,7 +152,7 @@ def test_mtp(size: str) -> None:
     for prompt, out in ((first, out1), (ids[pos:], out2)):
         lg = model.forward(prompt)
         for i, t in enumerate(out):
-            top = torch.topk(lg.float(), 2)
+            top = torch.topk(torch.from_numpy(lg), 2)
             if int(top.indices[0]) != t:
                 flips.append(float(top.values[0] - top.values[1]))
             if i + 1 < len(out):

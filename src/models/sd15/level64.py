@@ -6,7 +6,7 @@ rows (the neighbour bands' and columns', zeros past the image)."""
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
 from artlite.vision import design as D
@@ -15,7 +15,7 @@ from artlite.vision.build import Builder, Level
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm, gn_apply, plain
 from artlite.vision.ops import Gemm
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.weights import pad_index, take
+from artlite.vision.weights import flat, pad_index, take
 
 LV64 = Level(64, 4)
 ROW = 16 * L.PANEL  # (a row's token panels per kb, bytes)
@@ -23,32 +23,33 @@ IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (a row's groups in their order: even, then odd)
 OUT = 4 * 8 * 128  # (conv_out's bytes per band and column: [tile][row block][64] of output channels 0..7)
 
 
-def tokens(x: torch.Tensor) -> torch.Tensor:
+def tokens(x: np.ndarray) -> np.ndarray:
     """(2 images, C, 64, 64) -> per column its tokens (COLS, 1024, C): column c's image rows 8 c .., token panel (row,
     group IL[k], image), lane j = pixel x = g + 8 j."""
+    x = np.asarray(x, np.float32)
     C = x.shape[1]
     v = x.reshape(2, C, COLS, 8, 8, 8)[..., list(IL)]  # i C c row j g
-    return v.permute(2, 3, 5, 0, 4, 1).reshape(COLS, 1024, C)
+    return v.transpose(2, 3, 5, 0, 4, 1).reshape(COLS, 1024, C)
 
 
-def from_tokens(y: torch.Tensor) -> torch.Tensor:
+def from_tokens(y: np.ndarray) -> np.ndarray:
     C = y.shape[-1]
-    v = y.reshape(COLS, 8, 8, 2, 8, C).permute(3, 5, 0, 1, 4, 2)  # i C c row j k
+    v = y.reshape(COLS, 8, 8, 2, 8, C).transpose(3, 5, 0, 1, 4, 2)  # i C c row j k
     return v[..., [IL.index(g) for g in range(8)]].reshape(2, C, 64, 64)
 
 
-def latent_panels(lat: torch.Tensor) -> list[np.ndarray]:
+def latent_panels(lat: np.ndarray) -> list[np.ndarray]:
     """The latents (2, 4, 64, 64) as conv_in's PImage's first kb per column (its 8 channels: the 4 latent ones, zeros;
     the image's other kbs zeros)."""
-    x = torch.zeros(2, 8, 64, 64)
+    x = np.zeros((2, 8, 64, 64), np.float32)
     x[:, :lat.shape[1]] = lat
     return np.split(L.panels(tokens(x).reshape(-1, 8)), COLS)  # (one kb: the columns' panels in a row)
 
 
-def noise(raw: np.ndarray) -> torch.Tensor:
+def noise(raw: np.ndarray) -> np.ndarray:
     """conv_out's output image ([band][col][OUT]: [tile][row block][8 tokens][8 channels] bf16) -> (2, 4, 64, 64)."""
-    v = torch.from_numpy(np.ascontiguousarray(raw).reshape(LV64.nb, COLS, 4, 8, 8, 16)).view(torch.bfloat16)[..., :4]
-    return from_tokens(v.float().permute(1, 0, 2, 3, 4, 5).reshape(COLS, 1024, 4))
+    v = np.ascontiguousarray(raw).reshape(LV64.nb, COLS, 4, 8, 8, 16).view(bfloat16)[..., :4]
+    return from_tokens(v.astype(np.float32).transpose(1, 0, 2, 3, 4, 5).reshape(COLS, 1024, 4))
 
 
 @dataclass
@@ -128,7 +129,7 @@ class PImage:
         return x
 
 
-def conv64(bd: Builder, img: PImage, w: torch.Tensor, b: torch.Tensor | None, *, name: str, band: int,
+def conv64(bd: Builder, img: PImage, w: np.ndarray, b: np.ndarray | None, *, name: str, band: int,
            out: Tensor | None = None, c0: int = 0, res: Tensor | None = None, stats: tuple[int, int] | None = None,
            tbias: str | None = None) -> Tensor:
     """A 3x3 conv (padding 1) of img's channels [c0, c0 + K) (w: (N, K, 3, 3), N <= 320) for band ``band`` into out's C
@@ -168,7 +169,7 @@ def norm64(bd: Builder, x: DTensor, wp: str, w: dict, *, name: str, eps: float, 
     return img
 
 
-def resnet64(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: torch.Tensor, eps: float,
+def resnet64(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: np.ndarray, eps: float,
              stats: tuple[int, int] | None, name: str) -> DTensor:
     """``unet.resnet`` on the 64x64 level (x and the output in DDR, 320 channels): GN1 + SiLU into a PImage, conv1 (+
     the time bias) per band with GN2's records, GN2 + SiLU into a PImage, conv2 + x per band -> the output's band
@@ -189,7 +190,7 @@ def resnet64(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: 
     return out
 
 
-def resnet_cat64(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cout: int, time_bias: torch.Tensor,
+def resnet_cat64(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cout: int, time_bias: np.ndarray,
                  eps: float, stats: tuple[int, int] | None, name: str) -> DTensor:
     """``unet.resnet_cat`` on the 64x64 level (h, the skip and the output in DDR; their records in the concatenation's
     group space): GN1 + SiLU per part of 320 channels into PImages, conv1 over the parts per band (the partial sums in
@@ -218,7 +219,7 @@ def resnet_cat64(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cou
             px = alloc(bd, lv, 320, "pn", top=True)
             plain(bd, xb, px, name=f"{p}xpn.{k}")
             free(bd, xb)
-            gemm(bd, px, wsc[:, cc:cc + 320].flatten(1), w[p + "conv_shortcut.bias"] if k == 0 else None,
+            gemm(bd, px, flat(wsc[:, cc:cc + 320]), w[p + "conv_shortcut.bias"] if k == 0 else None,
                  name=f"{p}conv_shortcut.{k}", out=sb, res=sb if k else None)
             free(bd, px)
         sc.store(bd, b, sb, defer=False)  # (the next band's sum and parts need its bytes)

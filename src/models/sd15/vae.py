@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
 from artlite.overlay import Transaction
@@ -27,13 +27,14 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
 from artlite.vision.ops import Apply, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
-from artlite.vision.weights import Wt, computed, take, values
+from artlite.vision.weights import Wt, computed, flat, take, values
 
 from .level64 import IL
 
 L64, L128, L256, L512 = Level(64, 4, True), Level(128, 16, True), Level(256, 64, True), Level(512, 128, True)
 LEVELS = {lv.H: lv for lv in (L64, L128, L256, L512)}
 APPLY_ROWS = (0, 1, 2, 3)
+EPS = 1e-6  # (the decoder's GroupNorm epsilon: diffusers' AutoencoderKL)
 
 
 def kind(lv: Level) -> str:
@@ -45,17 +46,18 @@ def order(lv: Level) -> list[int]:
     return list(IL) if lv.Lg == 8 else list(range(lv.Lg))
 
 
-def tokens(x: torch.Tensor, lv: Level) -> torch.Tensor:
+def tokens(x: np.ndarray, lv: Level) -> np.ndarray:
     """(1, C, H, H) -> per column its tokens (COLS, R 16 Lg, C): column c's rows c R .., token panel (row, group in the
     storage order, half), lane j = pixel half H / 2 + g + Lg j."""
+    x = np.asarray(x, np.float32)
     C = x.shape[1]
     v = x.reshape(C, COLS, lv.R, 2, 8, lv.Lg)[..., order(lv)]  # C c row half j g
-    return v.permute(1, 2, 5, 3, 4, 0).reshape(COLS, lv.R * lv.Lg * 16, C)
+    return v.transpose(1, 2, 5, 3, 4, 0).reshape(COLS, lv.R * lv.Lg * 16, C)
 
 
-def from_tokens(y: torch.Tensor, lv: Level) -> torch.Tensor:
+def from_tokens(y: np.ndarray, lv: Level) -> np.ndarray:
     C = y.shape[-1]
-    v = y.reshape(COLS, lv.R, lv.Lg, 2, 8, C).permute(5, 0, 1, 3, 4, 2)  # C c row half j g
+    v = y.reshape(COLS, lv.R, lv.Lg, 2, 8, C).transpose(5, 0, 1, 3, 4, 2)  # C c row half j g
     return v[..., [order(lv).index(g) for g in range(lv.Lg)]].reshape(1, C, lv.H, lv.H)
 
 
@@ -87,22 +89,22 @@ class Chans:
     def stride(self) -> int:
         return 16 * self.gsize
 
-    def phys(self) -> torch.Tensor:
+    def phys(self) -> np.ndarray:
         """Each real channel's stored index."""
-        c = torch.arange(self.C)
+        c = np.arange(self.C)
         return c // self.per * self.pslice + c % self.per
 
     def index(self) -> np.ndarray:
         """Each stored channel's real one (-1: a pad)."""
         idx = np.full(self.P, -1, np.int64)
-        idx[self.phys().numpy()] = np.arange(self.C)
+        idx[self.phys()] = np.arange(self.C)
         return idx
 
-    def pad(self, v: Wt | torch.Tensor, dim: int = 0) -> Wt | torch.Tensor:
+    def pad(self, v: Wt | np.ndarray, dim: int = 0) -> Wt | np.ndarray:
         """C along dim (0: (C, ...); 1: a matrix's columns) -> P: zeros at the pads."""
         return take(v, self.index(), dim)
 
-    def unpad(self, v: torch.Tensor) -> torch.Tensor:
+    def unpad(self, v: np.ndarray) -> np.ndarray:
         return v[..., self.phys()]
 
     def kb_runs(self) -> list[tuple[int, int, int]]:
@@ -264,17 +266,17 @@ class VImage:
         return x, {"Lg": 4, "rc": rb + 2, "r0": 1}, cols
 
 
-def image_bytes(img: VImage, x: torch.Tensor) -> np.ndarray:
+def image_bytes(img: VImage, x: np.ndarray) -> np.ndarray:
     """The host's x (1, C, H, H) as img's DDR image (a model's input; tests)."""
     lv = img.lv
     t = tokens(x, lv)
     if kind(lv) == "wide":  # (the rows' positions: [the last group, groups 0 .. G - 1, group 0])
         t = t.reshape(COLS, lv.R, lv.Lg, 16, -1)
-        t = torch.cat([t[:, :, -1:], t, t[:, :, :1]], 2).reshape(COLS, -1, x.shape[1])
+        t = np.concatenate([t[:, :, -1:], t, t[:, :, :1]], 2).reshape(COLS, -1, x.shape[1])
     return np.concatenate([L.panels(t[c]) for c in range(COLS)])
 
 
-def write(bd: Builder, img: VImage, x: torch.Tensor) -> None:
+def write(bd: Builder, img: VImage, x: np.ndarray) -> None:
     img.base(bd)
     bd.npu.write(img.name, image_bytes(img, x))
 
@@ -312,7 +314,7 @@ def prefetch(bd: Builder, get: Callable[[], tuple]) -> tuple | None:
         return None
 
 
-def conv(bd: Builder, x: Tensor, kw: dict, w: torch.Tensor, b: torch.Tensor | None, *, ch: Chans, name: str,
+def conv(bd: Builder, x: Tensor, kw: dict, w: np.ndarray, b: np.ndarray | None, *, ch: Chans, name: str,
          band: int, nb: int, out: Tensor, acc: bool = False, rec: int = 0, extra: dict | None = None) -> None:
     """A 3x3 conv (padding 1) of the input rows x (``VImage.rows``: their Gemm keywords kw; w: (P, K, 3, 3), its output
     rows stored as ``ch``: the same tensor for a layer's bands) for band ``band`` of nb into out's C tiles (acc: + out,
@@ -326,7 +328,7 @@ def conv(bd: Builder, x: Tensor, kw: dict, w: torch.Tensor, b: torch.Tensor | No
     bd.gemm(Gemm(**g), w, b, name=f"{name}.{kw.get('wide', '')}{g.get('stf', '')}", wname=f"{name}.w", extra=extra)
 
 
-def norm(bd: Builder, x: DTensor, gamma: torch.Tensor, beta: torch.Tensor, *, ch: Chans, name: str, eps: float,
+def norm(bd: Builder, x: DTensor, gamma: np.ndarray, beta: np.ndarray, *, ch: Chans, name: str, eps: float,
          silu: bool = True) -> VImage:
     """GroupNorm (+ SiLU) of x (its stored channels ``ch``, its records) into a VImage of the real channels, band by
     band: an apply on every core row (one slice each: a record window), the halves' statistics joined (gamma, beta:
@@ -360,7 +362,7 @@ def records(bd: Builder, rec: int, *, ch: Chans, name: str) -> list:
     return [r]
 
 
-def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None, *, ch: Chans, name: str,
+def conv_layer(bd: Builder, img: VImage, w: np.ndarray, b: np.ndarray | None, *, ch: Chans, name: str,
                res: DTensor | None = None, stats: bool = True) -> DTensor:
     """A 3x3 conv of every band of img (w, b: the real channels' (N, K, 3, 3), (N,); + res: its band in place) -> a
     DTensor of the stored channels ``ch`` with records for its norm. K in parts where a band's input and output do not
@@ -408,29 +410,29 @@ def conv_layer(bd: Builder, img: VImage, w: torch.Tensor, b: torch.Tensor | None
     return out
 
 
-def dtensor_bytes(t: DTensor, x: torch.Tensor, ch: Chans) -> np.ndarray:
+def dtensor_bytes(t: DTensor, x: np.ndarray, ch: Chans) -> np.ndarray:
     """The host's x (1, C, H, H) as t's bands' DDR images ([band][col][80-channel block][tile][``layout.ct_bytes``]: C
     tiles of the stored channels ``ch``)."""
     lv, P, ct = t.lv, ch.P, L.ct_bytes(64)
-    xt = ch.pad(tokens(x, lv).permute(2, 0, 1)).permute(1, 2, 0)  # (COLS, tokens, P)
-    v = xt.reshape(COLS, lv.nb, lv.ntile, 8, 8, P // 80, 10, 8).permute(1, 0, 5, 2, 3, 6, 4, 7)  # band col cb80 t rb cb tok ch
+    xt = ch.pad(np.asarray(tokens(x, lv), np.float32).transpose(2, 0, 1)).transpose(1, 2, 0)  # (COLS, tokens, P)
+    v = xt.reshape(COLS, lv.nb, lv.ntile, 8, 8, P // 80, 10, 8).transpose(1, 0, 5, 2, 3, 6, 4, 7)  # band col cb80 t rb cb tok ch
     out = np.zeros((lv.nb, COLS, P // 80, lv.ntile, ct), np.uint8)
-    out[..., :64 * 160] = v.bfloat16().reshape(lv.nb, COLS, P // 80, lv.ntile, -1).view(torch.uint8).numpy()
+    out[..., :64 * 160] = v.astype(bfloat16).reshape(lv.nb, COLS, P // 80, lv.ntile, -1).view(np.uint8)
     return out.reshape(lv.nb, -1)
 
 
-def write_dtensor(bd: Builder, t: DTensor, x: torch.Tensor, ch: Chans) -> None:
+def write_dtensor(bd: Builder, t: DTensor, x: np.ndarray, ch: Chans) -> None:
     for b, v in enumerate(dtensor_bytes(t, x, ch)):
         bd.image(t.band(b), v)
 
 
-def read_dtensor(npu: VisionDevice, t: DTensor, ch: Chans) -> torch.Tensor:
+def read_dtensor(npu: VisionDevice, t: DTensor, ch: Chans) -> np.ndarray:
     """t's real channels as (1, C, H, H)."""
     lv, P, ct = t.lv, ch.P, L.ct_bytes(64)
     raw = np.stack([npu.read(t.band(b), COLS * t.nbytes) for b in range(lv.nb)]).reshape(lv.nb, COLS, P // 80, lv.ntile, ct)
-    v = torch.from_numpy(np.ascontiguousarray(raw[..., :64 * 160])).view(torch.bfloat16)
-    y = v.reshape(lv.nb, COLS, P // 80, lv.ntile, 8, 10, 8, 8).permute(1, 0, 3, 4, 6, 2, 5, 7)  # col band t rb tok cb80 cb ch
-    return from_tokens(ch.unpad(y.float().reshape(COLS, -1, P)), lv)
+    v = np.ascontiguousarray(raw[..., :64 * 160]).view(bfloat16)
+    y = v.reshape(lv.nb, COLS, P // 80, lv.ntile, 8, 10, 8, 8).transpose(1, 0, 3, 4, 6, 2, 5, 7)  # col band t rb tok cb80 cb ch
+    return from_tokens(ch.unpad(y.astype(np.float32).reshape(COLS, -1, P)), lv)
 
 
 def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
@@ -448,10 +450,10 @@ def with_stats(bd: Builder, x: DTensor, ch: Chans, *, name: str) -> None:
     x.rec = records(bd, rec, ch=ch, name=name + ".rec")
 
 
-def shortcut(bd: Builder, x: DTensor, w: torch.Tensor, b: torch.Tensor, *, cin: Chans, cout: Chans, name: str) -> DTensor:
+def shortcut(bd: Builder, x: DTensor, w: np.ndarray, b: np.ndarray, *, cin: Chans, cout: Chans, name: str) -> DTensor:
     """The resnet's 1x1 conv_shortcut of x (stored ``cin``) per band -> a DTensor (stored ``cout``)."""
     lv = x.lv
-    wp = cout.pad(cin.pad(w.flatten(1), 1))  # ((P out, P in): zeros at both pads)
+    wp = cout.pad(cin.pad(flat(w), 1))  # ((P out, P in): zeros at both pads)
     bp = cout.pad(b)
     out = DTensor(lv, cout.P, name)
     for band in range(lv.nb):
@@ -515,9 +517,9 @@ def latent_conv_in(w: dict, scale: float) -> Wt:
     return computed("vae.conv_in", w64)
 
 
-def latents(lat: torch.Tensor) -> torch.Tensor:
+def latents(lat: np.ndarray) -> np.ndarray:
     """The sampler's latents (1, 4, 64, 64) as ``conv_in``'s input channels (1, 64, 64, 64)."""
-    x = torch.zeros(1, 64, *lat.shape[2:])
+    x = np.zeros((1, 64, *lat.shape[2:]), np.float32)
     x[:, :lat.shape[1]] = lat
     x[:, lat.shape[1]] = 1
     return x
@@ -554,11 +556,11 @@ def conv_out(bd: Builder, w: dict, x: DTensor, *, C: int, eps: float, name: str)
     bd.ddr_sync()
 
 
-def image(raw: np.ndarray, n: int = 3) -> torch.Tensor:
+def image(raw: np.ndarray, n: int = 3) -> np.ndarray:
     """conv_out's output image ([band][col][OUTB]) -> (1, n, 512, 512)."""
     lv = L512
-    v = torch.from_numpy(np.ascontiguousarray(raw).reshape(lv.nb, COLS, lv.ntile, 8, 8, 16)).view(torch.bfloat16)[..., :n]
-    t = v.float().permute(1, 0, 2, 3, 4, 5).reshape(COLS, lv.nb * lv.T, n)  # (col, band tile rb token, ch)
+    v = np.ascontiguousarray(raw).reshape(lv.nb, COLS, lv.ntile, 8, 8, 16).view(bfloat16)[..., :n]
+    t = v.astype(np.float32).transpose(1, 0, 2, 3, 4, 5).reshape(COLS, lv.nb * lv.T, n)  # (col, band tile rb token, ch)
     return from_tokens(t, lv)
 
 
@@ -607,7 +609,7 @@ class Decoder:
         d.words = npu.relocate(state["words"], state["rel"])
         return d
 
-    def __call__(self, lat: torch.Tensor) -> torch.Tensor:
+    def __call__(self, lat: np.ndarray) -> np.ndarray:
         if self.tr is None:
             self.tr = Transaction(self.npu.dev, self.words)
         self.npu.write(self.lat.name, image_bytes(self.lat, latents(lat)))
@@ -663,7 +665,7 @@ class Attention512:
                           b_objects=1 + self.units * 4 * self.ng, parity=False, role="v") for r in range(4)}
 
 
-def kv512_image(k: torch.Tensor, v: torch.Tensor) -> np.ndarray:
+def kv512_image(k: np.ndarray, v: np.ndarray) -> np.ndarray:
     """K and V (keys, 512) as Attention512's image ([group][slot 4][Q]: K panels [d-block 32][key panel 2] of d-blocks
     0..31, of 32..63, then V^T panels likewise; a slot's last 1152 bytes unused) (tests)."""
     nkp = k.shape[0] // 8
@@ -693,7 +695,7 @@ def mid_attention(bd: Builder, w: dict, p: str, x: DTensor, *, eps: float, name:
     its norm."""
     lv, ch = x.lv, chans(512)
     ns = ("query.", "key.", "value.", "proj_attn.") if p + "query.weight" in w else ("to_q.", "to_k.", "to_v.", "to_out.0.")
-    (wq, bq), (wk, bk), (wv, bv), (wo, bo) = ((w[p + n + "weight"].flatten(1), w[p + n + "bias"]) for n in ns)
+    (wq, bq), (wk, bk), (wv, bv), (wo, bo) = ((flat(w[p + n + "weight"]), w[p + n + "bias"]) for n in ns)
     c = LOG2E / ch.C ** 0.5
     gn = norm(bd, x, w[p + "group_norm.weight"], w[p + "group_norm.bias"], ch=ch, name=name + ".n", eps=eps, silu=False)
     at0 = Attention512(np=lv.np, q=0, o=0, kv=0, nkeys=lv.H ** 2, padded=True)

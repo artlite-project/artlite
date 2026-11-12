@@ -365,7 +365,7 @@ def experts(gguf: object, layer: int) -> Callable[[int], tuple[np.ndarray, np.nd
 
     def get(e: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         def rows(name: str, n: int) -> np.ndarray:
-            return gguf.rows(b + name, np.arange(e * n, (e + 1) * n)).numpy()
+            return gguf.rows(b + name, np.arange(e * n, (e + 1) * n))
 
         return rows("ffn_gate_exps.weight", F), rows("ffn_up_exps.weight", F), rows("ffn_down_exps.weight", H)
 
@@ -405,10 +405,10 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
 
     def mat(name: str) -> np.ndarray:
         t = gguf.tensor(b + name)
-        return f32(t.dequantize().numpy()).reshape(t.rows, t.cols)
+        return f32(t.dequantize()).reshape(t.rows, t.cols)
 
     def vec(name: str) -> np.ndarray:
-        return f32(gguf.tensor(b + name).dequantize().numpy()).reshape(-1)
+        return f32(gguf.tensor(b + name).dequantize()).reshape(-1)
 
     T, d = emb.shape[0], cfg.head_dim
     nh, nkv = cfg.num_attention_heads, cfg.num_key_value_heads
@@ -437,7 +437,7 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
     x2 = out["mtp_post_ffn"] = x1 + y
     hn = out["h_nextn"] = rms_norm(x2, vec("nextn.shared_head_norm.weight"), eps)
     if head is not None:
-        out["logits"] = hn @ f32(gguf.rows("output.weight", head).numpy()).T
+        out["logits"] = hn @ f32(gguf.rows("output.weight", head)).T
     return out
 
 
@@ -470,12 +470,12 @@ class DFlash:
     def mat(self, name: str) -> np.ndarray:
         if name not in self._w:
             t = self.gguf.tensor(name)
-            self._w[name] = f32(t.dequantize().numpy()).reshape(t.rows, t.cols)
+            self._w[name] = f32(t.dequantize()).reshape(t.rows, t.cols)
         return self._w[name]
 
     def vec(self, name: str) -> np.ndarray:
         if name not in self._w:
-            self._w[name] = f32(self.gguf.tensor(name).dequantize().numpy()).reshape(-1)
+            self._w[name] = f32(self.gguf.tensor(name).dequantize()).reshape(-1)
         return self._w[name]
 
     def base(self, name: str) -> np.ndarray:
@@ -557,7 +557,7 @@ class DFlash:
         if "lm" not in self._w:
             t = self.model.tensor("output.weight")
             ids = np.arange(t.rows) if self.head is None else self.head
-            self._w["lm"] = f32(self.model.rows("output.weight", ids).numpy())
+            self._w["lm"] = f32(self.model.rows("output.weight", ids))
         return self._w["lm"]
 
     def lattice(self, logits: np.ndarray, gate: np.ndarray, anchor: int) -> tuple[np.ndarray, np.ndarray]:
@@ -578,7 +578,7 @@ class DFlash:
         return cand, score
 
     def _rows(self, name: str, ids: np.ndarray) -> np.ndarray:
-        return f32(self.gguf.rows(name, ids).numpy())
+        return f32(self.gguf.rows(name, ids))
 
     @staticmethod
     def walk(cand: np.ndarray, score: np.ndarray) -> list[int]:

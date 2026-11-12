@@ -311,12 +311,12 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     g = GGUFFile(path)
     layers = [0, 1, 2, 3]
     ids = (BpeTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
-    x = g.rows("token_embd.weight", ids).float()
+    x = g.rows("token_embd.weight", ids)
     ov = LlamaOverlay(g, layers=layers, vocab=2048, max_positions=1024, kv_k=kv_k)
     ov.load()
     for t in range(0, p0 + n - 1, 4):  # the decode path
         ov.step(x[t:min(t + 4, p0 + n - 1)], t, logits=False)
-    want_l = ov.step(x[p0 + n - 1:], p0 + n - 1).float()[0]
+    want_l = ov.step(x[p0 + n - 1:], p0 + n - 1)[0].astype(np.float32)
     want_h = ov.hidden(-1, 0)
     want = {L: ov.read_kv(L, range(p0 + n)) for L in layers}
     ov.reset()
@@ -332,10 +332,10 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     worst = {}
     for L in layers:
         k, v = ov.read_kv(L, range(p0 + n))
-        worst[f"K.{L}"], worst[f"V.{L}"] = _rel(k.numpy(), want[L][0].numpy()), _rel(v.numpy(), want[L][1].numpy())
+        worst[f"K.{L}"], worst[f"V.{L}"] = _rel(k, want[L][0]), _rel(v, want[L][1])
     h = pf.hidden(m - 1)
-    worst["hidden"] = _rel(h.numpy(), want_h.numpy())
-    worst["logits"] = _rel(ov.logits_of(h).float().numpy(), want_l.numpy())
+    worst["hidden"] = _rel(h, want_h)
+    worst["logits"] = _rel(ov.logits_of(h).astype(np.float32), want_l)
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.06 for v in worst.values()), worst
 
@@ -404,7 +404,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     g = GGUFFile(path)
     T = 1024
     ids = BpeTokenizer(g).encode(essay("apple.txt"))[:p0 + sum(lengths)]
-    x = g.rows("token_embd.weight", ids).float()
+    x = g.rows("token_embd.weight", ids)
     ov = LlamaOverlay(g, layers=[0, 1, 2, 3], vocab=2048, max_positions=2048, kv_k="hilo")
     ov.load()
     pf = LlamaPrefill(ov, sizes=(64, T), precise=True, pack=True).compile().bind()
@@ -415,9 +415,9 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     alone = []
     for xi in xs:
         pf.run(xi, p0, T)
-        alone.append((pf.hidden(0, len(xi)).numpy(), ov.read_kv(0, range(p0, p0 + len(xi)))))
+        alone.append((pf.hidden(0, len(xi)), ov.read_kv(0, range(p0, p0 + len(xi)))))
     pos = np.concatenate([p0 + np.arange(n) for n in lengths])
-    pf.run_packed(torch.cat(xs), p0, pos, np.repeat(starts, lengths), T)
+    pf.run_packed(np.concatenate(xs), p0, pos, np.repeat(starts, lengths), T)
     shared = {r for a in starts[1:] if a % 8 for r in range(a - a % 8, a - a % 8 + 8)}  # (records of two segments)
     worst = 0.0
     for a, n, (want, (kw, vw)) in zip(starts, lengths, alone, strict=True):
@@ -425,7 +425,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
         assert (k == kw).all(), a
         dv = {int(a + i) for i in np.flatnonzero((v != vw).reshape(COLS, n, -1).any(-1).any(0))}
         assert a % 8 or dv <= shared, (a, sorted(dv - shared))
-        got = pf.hidden(int(a), n).numpy()
+        got = pf.hidden(int(a), n)
         err = float(np.abs(got - want).max() / np.abs(want).max())
         same = int((got == want).all(1).sum())
         print(f"segment {a} + {n}: max |d| {err:.2e} of the rows' largest, {same} of {n} rows bit-identical")

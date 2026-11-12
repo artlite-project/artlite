@@ -30,7 +30,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite import parallel_compile
 from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
@@ -89,7 +89,7 @@ class NpuGemma(OverlayModel):
             self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
         if self.cfg.per_layer_dim and self.prefill is not None:  # (the prefill's per-layer projection, a bf16 copy:
             # before timing)
-            self.host.per_layer_inputs([0], self.host.embed([0]), bf16=True)
+            self.host.per_layer_inputs([0], self.host.embed([0]))
         gguf.release()
         self.position = 0
 
@@ -108,16 +108,16 @@ class NpuGemma(OverlayModel):
         if self.drafter is not None:
             self.drafter.reset()
 
-    def inputs(self, tokens: list[int]) -> tuple[torch.Tensor, np.ndarray | None]:
+    def inputs(self, tokens: list[int]) -> tuple[np.ndarray, np.ndarray | None]:
         """What a decode step needs of its tokens: their scaled embeddings (n, hidden) as bf16 values, and their
         per-layer token rows (n, layers, per_layer_dim; ``GemmaHost.layer_rows``) or None."""
         e = self.host.layer_rows(tokens) if self.cfg.per_layer_dim else None
-        return self.host.embed(tokens).bfloat16().float(), e
+        return self.host.embed(tokens).astype(bfloat16).astype(np.float32), e
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
         return self.inputs(tokens)
 
-    def steps(self, tokens: list[int], *, logits: bool = True, **step: object) -> torch.Tensor | None:
+    def steps(self, tokens: list[int], *, logits: bool = True, **step: object) -> np.ndarray | None:
         """(a step of tokens whose per-layer projections are kept writes them instead of projecting the embeddings,
         ``GemmaOverlay.step(p=)``: 0.6 ms less; one that projects keeps its tokens')"""
         if not self.cfg.per_layer_dim:
@@ -136,22 +136,22 @@ class NpuGemma(OverlayModel):
         self.t_host += time.perf_counter() - t0
         return out
 
-    def chunk_inputs(self, tokens: list[int], x: torch.Tensor | None = None
-                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def chunk_inputs(self, tokens: list[int], x: np.ndarray | None = None
+                     ) -> tuple[np.ndarray, np.ndarray | None]:
         """A prefill chunk's inputs: the scaled embeddings (n, hidden) and the per-layer inputs (n, the prefill's layers,
         dim), bf16 values (x: the embeddings, computed already)."""
         x = self.host.embed(tokens) if x is None else x
-        pli = self.host.per_layer_inputs(tokens, x, bf16=True, layers=len(self.prefill.layers))
-        return x.bfloat16(), None if pli is None else pli.bfloat16()
+        pli = self.host.per_layer_inputs(tokens, x, layers=len(self.prefill.layers))
+        return x.astype(bfloat16), None if pli is None else pli.astype(bfloat16)
 
     def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
         """(the first chunk: its per-layer inputs on the worker thread while its first operators run)"""
         if not first:
             return self.chunk_inputs(tokens)
         x = self.host.embed(tokens)
-        return x.bfloat16(), self._pool.submit(lambda: self.chunk_inputs(tokens, x)[1])
+        return x.astype(bfloat16), self._pool.submit(lambda: self.chunk_inputs(tokens, x)[1])
 
-    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(a step from the prefill's last layer on - the layers that share a KV cache, the LM head: 19 of E4B's 42
         layers, ~25 ms less than a decode step -, its input the chunk's residual stream)"""
         t0 = time.perf_counter()
@@ -170,7 +170,7 @@ class NpuGemma(OverlayModel):
     # Multi-token prediction
     # ------------------------------------------------------------------
 
-    def hidden_state(self, slot: int | None = None) -> torch.Tensor:
+    def hidden_state(self, slot: int | None = None) -> np.ndarray:
         """The output-normed hidden state (hidden,) bf16 of slot ``slot`` of the last step (it computed logits; default:
         its last token's, ``slot``): what a draft continues from."""
         slot = self.slot if slot is None else slot
@@ -184,7 +184,7 @@ class NpuGemma(OverlayModel):
         out[rows] = np.arange(len(rows), dtype=rows.dtype)
         return out
 
-    def draft(self, token: int, h: torch.Tensor, n: int, penalties: Penalties | None = None) -> list[int]:
+    def draft(self, token: int, h: np.ndarray, n: int, penalties: Penalties | None = None) -> list[int]:
         """The drafter's guesses of the (up to n) tokens after ``token`` - the token of the next position, not run yet;
         h: the hidden state of the position before it -: its most likely one, the most likely one after that, ...
         (ends with an end-of-sequence token); ``penalties``: the generation's (up to ``token``), which the guesses

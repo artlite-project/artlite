@@ -8,7 +8,7 @@ import collections
 import ml_dtypes
 import numpy as np
 import pytest
-import torch
+from ml_dtypes import bfloat16
 
 from artlite import _native
 from models.common import NpuModel, OverlayModel, Penalties, Sampling, max_prob, seed, top_logits
@@ -151,10 +151,10 @@ class Steps(NpuModel):
     def __init__(self) -> None:
         self.position = 0
 
-    def step(self, token: int) -> torch.Tensor:
+    def step(self, token: int) -> np.ndarray:
         self.position += 1
-        out = torch.full((16,), -5.0)
-        out[5:8] = torch.tensor([2.0, 1.9, 1.8])
+        out = np.full(16, -5.0, np.float32)
+        out[5:8] = [2.0, 1.9, 1.8]
         return out
 
 
@@ -168,9 +168,9 @@ class OverlaySteps(OverlayModel):
     def __init__(self) -> None:
         self.position = 0
 
-    def steps(self, tokens: list[int], *, logits: bool = True) -> torch.Tensor:
+    def steps(self, tokens: list[int], *, logits: bool = True) -> np.ndarray:
         self.position += len(tokens)
-        return Steps().step(0).bfloat16()[None].repeat(len(tokens), 1)
+        return np.tile(Steps().step(0).astype(bfloat16), (len(tokens), 1))
 
     def _crossing(self) -> tuple[bool, ...]:
         return (False,) * (self.DRAFTS + 1)
@@ -208,10 +208,10 @@ class Allowed:
         self.seen.append(token)
 
 
-@pytest.mark.parametrize("dtype", ["bf16-cap", "fp32", "torch"])
+@pytest.mark.parametrize("dtype", ["bf16-cap", "fp32", "bf16"])
 def test_mask(dtype: str) -> None:
     """With a mask, the candidates are the k largest penalized logits of the tokens it allows (recent tokens among
-    them and not; fewer than k), of numpy and torch logits; the mask is told the accepted tokens (not the prompt's), a
+    them and not; fewer than k), of fp32 and bf16 logits (bits, ml_dtypes); the mask is told the accepted tokens (not the prompt's), a
     draft's copy has none; a generation's tokens are the allowed ones."""
     rng = np.random.default_rng(2)
     logits = (rng.standard_normal(VOCAB) * 4).astype(np.float32)
@@ -220,8 +220,8 @@ def test_mask(dtype: str) -> None:
     allowed = sorted({*order[:3], *rng.choice(VOCAB, 20, replace=False).tolist()})
     prompt = [order[0], order[5], allowed[4], allowed[4]]
     cap = CAP if dtype == "bf16-cap" else 0.0
-    raw = bf16(logits) if cap else torch.from_numpy(logits) if dtype == "torch" else logits
-    full = reference(softcap(values(bf16(logits))) if cap else logits, prompt, s)
+    raw = bf16(logits) if cap else logits.astype(ml_dtypes.bfloat16) if dtype == "bf16" else logits
+    full = reference(softcap(values(bf16(logits))) if cap else values(bf16(logits)) if dtype == "bf16" else logits, prompt, s)
     mask = Allowed(allowed)
     p = Penalties(s, prompt, mask)
     v, i = p.top(raw, s.top_k, cap)

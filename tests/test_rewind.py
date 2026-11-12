@@ -6,6 +6,7 @@ prefill's positions) or continues A's generated tokens (in the decode steps' pos
 
 import os
 
+import numpy as np
 import pytest
 import torch
 
@@ -34,7 +35,7 @@ def _logits(npu: NpuModel, prompt: list[int], continuation: list[int]) -> torch.
     """The logits of the prompt's last token and of the continuation's tokens, run after the cached positions."""
     out = [npu.forward(prompt)]
     out += [npu.step(t) for t in continuation]
-    return torch.stack(out)
+    return torch.from_numpy(np.stack(out))
 
 
 @pytest.fixture(scope="module", params=CASES, ids=[f"{os.path.basename(p)}-{'prefill' if f else 'steps'}"

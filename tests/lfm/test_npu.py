@@ -48,11 +48,11 @@ def test_lfm_forward(loaded: tuple) -> None:
     for n in (40, 700):  # (one SMALL chunk; a chunk of 512 and one of 256 with 188 valid)
         ids = [model.bos] + model.encode(essay("apple.txt"))[:n - 1]
         npu.reset()
-        got = npu.forward(ids)
+        got = torch.from_numpy(npu.forward(ids))
         prefill, npu.prefill = npu.prefill, None
         try:
             npu.reset()
-            want = npu.forward(ids)
+            want = torch.from_numpy(npu.forward(ids))
         finally:
             npu.prefill = prefill
         lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)

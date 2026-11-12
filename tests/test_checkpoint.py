@@ -9,6 +9,7 @@ copies' times are printed."""
 import os
 import time
 
+import numpy as np
 import pytest
 import torch
 
@@ -38,7 +39,7 @@ def loaded(request: pytest.FixtureRequest) -> tuple[Model, NpuModel]:
 
 def _logits(npu: NpuModel, tokens: list[int]) -> torch.Tensor:
     """The logits of each of the tokens, run one after another from the cached positions."""
-    return torch.stack([npu.forward(tokens[:1])] + [npu.step(t) for t in tokens[1:]])
+    return torch.from_numpy(np.stack([npu.forward(tokens[:1])] + [npu.step(t) for t in tokens[1:]]))
 
 
 def _timed(fn: object, *args: object) -> tuple[object, float]:

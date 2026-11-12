@@ -19,7 +19,18 @@ import numpy as np
 
 from artlite import _native, portable
 
-from ..common import Detokenizer, LogitsLike, Model, NpuModel, Sampling, StreamDecoder, argmax, seed, top_logits
+from ..common import (
+    Detokenizer,
+    LogitsLike,
+    Model,
+    NpuModel,
+    Sampling,
+    StreamDecoder,
+    argmax,
+    logit_bits,
+    seed,
+    top_logits,
+)
 from ..sequence import Sequence
 from .cache import PromptCache, common_prefix
 from .tools import Calls, held
@@ -112,7 +123,7 @@ def prob_entry(tokenizer: Detokenizer, row: LogitsLike, token: int, cap: float, 
         q, ids = sampling.probs(cand[0]), cand[1]
         top = [tok(int(i), "prob", float(p)) for i, p in zip(ids[:n], q[:n], strict=True) if p > 0]
         return {**tok(token, "prob", float(q[ids == token].sum())), "top_probs": top}
-    lse = _native.logsumexp(row, cap)
+    lse = _native.logsumexp(logit_bits(row), cap)
     v = float(row[token])
     own = (math.tanh(v / cap) * cap if cap else v) - lse
     values, ids = top_logits(row, n, cap)

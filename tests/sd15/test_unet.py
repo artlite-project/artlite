@@ -40,8 +40,9 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     """diffusers' ResnetBlock2D on the level (GN1 + SiLU, conv1 + time bias, GN2 + SiLU, conv2 + x or the 1x1
     shortcut; the input's GroupNorm records by a copy op): within 1.5e-2 of the fp32 reference."""
     from artlite.vision.layers import copy_stats
-    from models.sd15 import reference
     from models.sd15.unet import resnet
+
+    from . import ref as reference
     torch.manual_seed(6)
     p = "r."
     w = _rand_resnet(p, cin, cout)
@@ -59,7 +60,7 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     bd.op(bd.spill("y_out", out.addr, lv.ct(cout)), {})
     npu.run(bd.transaction())
     yb = npu.read("y_out", COLS * lv.ct(cout)).reshape(COLS, -1)
-    y = from_level_tokens(torch.stack([L.from_ctiles(yb[c], lv.m, cout, lv.m) for c in range(COLS)]), lv.R, lv.Lg)
+    y = from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, cout, lv.m)) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
     assert _rel(y, ref) < 1.5e-2
 
@@ -70,8 +71,9 @@ def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
     """ResnetBlock2D on the banded 32x32 level (x and the output in DDR per band, h parked; the shortcut where cin !=
     cout): within 1.5e-2 of the fp32 reference."""
     from artlite.vision.layers import DTensor, copy_stats
-    from models.sd15 import reference
     from models.sd15.unet import resnet_bands
+
+    from . import ref as reference
     torch.manual_seed(13)
     p, H = "r.", 32
     w = _rand_resnet(p, cin, cout)
@@ -91,7 +93,7 @@ def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     yb = [npu.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
-    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, cout, lv.m) for b in range(2)])
+    y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, cout, lv.m)) for b in range(2)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
     err = _rel(y, ref)
@@ -119,7 +121,7 @@ def _il_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> D
 def _il_output(npu: VisionDevice, y: DTensor) -> torch.Tensor:
     lv = y.lv
     yb = [npu.read(y.band(b), COLS * y.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
-    return from_il_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, y.C, lv.m) for b in range(lv.nb)])
+    return from_il_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, y.C, lv.m)) for b in range(lv.nb)])
                                        for c in range(COLS)]), lv.R)
 
 
@@ -127,8 +129,9 @@ def _il_output(npu: VisionDevice, y: DTensor) -> torch.Tensor:
 def test_resnet64(npu: VisionDevice) -> None:
     """ResnetBlock2D 320 -> 320 on the 64x64 level (``level64``: x and the output in DDR per band, the convs' input rows
     from DDR panel images): within 1.5e-2 of the fp32 reference."""
-    from models.sd15 import reference
     from models.sd15.level64 import resnet64
+
+    from . import ref as reference
     torch.manual_seed(15)
     p, C = "r.", 320
     w = _rand_resnet(p, C, C)
@@ -150,8 +153,9 @@ def test_resnet_cat_bands(npu: VisionDevice, ch: int, cs: int) -> None:
     """The up path's resnet on [h | skip] on the banded 32x32 level (K parts of at most 640 channels, partial sums
     parked in DDR): within 1.5e-2 of the fp32 reference."""
     from artlite.vision.layers import DTensor
-    from models.sd15 import reference
     from models.sd15.unet import resnet_cat_bands, skip_bands
+
+    from . import ref as reference
     torch.manual_seed(14)
     p, H, cout = "r.", 32, 640
     w = _rand_resnet(p, ch + cs, cout)
@@ -173,7 +177,7 @@ def test_resnet_cat_bands(npu: VisionDevice, ch: int, cs: int) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     yb = [npu.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
-    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, cout, lv.m) for b in range(2)])
+    y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, cout, lv.m)) for b in range(2)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, torch.cat([hx, sk], 1), eps=1e-5, time_bias=tb)
     err = _rel(y, ref)
@@ -219,7 +223,7 @@ def test_upsample_bands(npu: VisionDevice) -> None:
     npu.run(bd.transaction())
     lv = out.lv
     yb = [npu.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
-    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(2)])
+    y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, C, lv.m)) for b in range(2)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     xq = F.interpolate(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), scale_factor=2.0, mode="nearest")
     ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), padding=1)
@@ -258,8 +262,9 @@ def test_transformer(npu: VisionDevice, H: int) -> None:
     import types
 
     from artlite.vision.layers import copy_stats
-    from models.sd15 import reference
     from models.sd15.unet import transformer
+
+    from . import ref as reference
     torch.manual_seed(8)
     p, C = "t.", 1280
     w = _rand_transformer(p)
@@ -280,7 +285,7 @@ def test_transformer(npu: VisionDevice, H: int) -> None:
     bd.op(bd.spill("y_out", out.addr, lv.ct(C)), {})
     npu.run(bd.transaction())
     yb = npu.read("y_out", COLS * lv.ct(C)).reshape(COLS, -1)
-    y = from_level_tokens(torch.stack([L.from_ctiles(yb[c], lv.m, C, lv.m) for c in range(COLS)]), lv.R, lv.Lg)
+    y = from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, C, lv.m)) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
     assert _rel(y, ref) < 2e-2
 
@@ -292,8 +297,9 @@ def test_transformer_bands(npu: VisionDevice) -> None:
     import types
 
     from artlite.vision.layers import DTensor, copy_stats
-    from models.sd15 import reference
     from models.sd15.unet import transformer_bands
+
+    from . import ref as reference
     torch.manual_seed(11)
     p, C, H = "t.", 640, 32
     w = _rand_transformer(p, C)
@@ -318,7 +324,7 @@ def test_transformer_bands(npu: VisionDevice) -> None:
     bd.op({}, {})  # (the last band's deferred drain)
     npu.run(bd.transaction())
     yb = [npu.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(2)]
-    yc = torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(2)]) for c in range(COLS)])
+    yc = torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, C, lv.m)) for b in range(2)]) for c in range(COLS)])
     y = from_level_tokens(yc, lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
     err = _rel(y, ref)
@@ -357,7 +363,7 @@ def test_down64(npu: VisionDevice) -> None:
     npu.run(bd.transaction())
     lv = out.lv
     yb = [npu.read(out.band(b), COLS * out.nbytes).reshape(COLS, -1) for b in range(lv.nb)]
-    y = from_level_tokens(torch.stack([torch.cat([L.from_ctiles(yb[b][c], lv.T, C, lv.m) for b in range(lv.nb)])
+    y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, C, lv.m)) for b in range(lv.nb)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w["s.conv.weight"]),
                    w["s.conv.bias"].bfloat16().float(), padding=1, stride=2)
@@ -390,8 +396,9 @@ def test_up64(npu: VisionDevice) -> None:
 def test_resnet_cat64(npu: VisionDevice, ch: int) -> None:
     """The up path's resnet on [h | skip] (skip 320) -> 320 on the 64x64 level (K parts of 320): within 1.5e-2 of the
     fp32 reference."""
-    from models.sd15 import reference
     from models.sd15.level64 import resnet_cat64
+
+    from . import ref as reference
     torch.manual_seed(19)
     p, cs, cout = "r.", 320, 320
     w = _rand_resnet(p, ch + cs, cout)
@@ -417,9 +424,10 @@ def test_transformer64(npu: VisionDevice) -> None:
     import types
 
     from artlite.vision.ops import Attention
-    from models.sd15 import reference
     from models.sd15.level64 import LV64
     from models.sd15.unet import transformer_bands
+
+    from . import ref as reference
     torch.manual_seed(16)
     p, C = "t.", 320
     w = _rand_transformer(p, C)
@@ -454,7 +462,7 @@ def _level_output(npu: VisionDevice, bd: Builder, t: Tensor, name: str) -> torch
     npu.run(bd.transaction())
     lv = t.lv
     yb = npu.read(name, COLS * t.nbytes).reshape(COLS, -1)
-    return from_level_tokens(torch.stack([L.from_ctiles(yb[c], lv.m, t.C, lv.m) for c in range(COLS)]), lv.R, lv.Lg)
+    return from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, t.C, lv.m)) for c in range(COLS)]), lv.R, lv.Lg)
 
 
 @pytest.mark.parametrize("H, ch, cs", [(8, 1280, 1280), (16, 1280, 1280), (16, 1280, 640)])
@@ -462,8 +470,9 @@ def test_resnet_cat(npu: VisionDevice, H: int, ch: int, cs: int) -> None:
     """The up path's resnet on the concatenation [h | skip] (the skip from DDR; GN over both, conv1 and the shortcut in
     two K-chunks): within 1.5e-2 of the fp32 reference."""
     from artlite.vision.layers import copy_stats, free
-    from models.sd15 import reference
     from models.sd15.unet import make_skip, resnet_cat
+
+    from . import ref as reference
     torch.manual_seed(9)
     p, cout = "r.", 1280
     w = _rand_resnet(p, ch + cs, cout)
@@ -512,9 +521,10 @@ def test_unet(npu: VisionDevice) -> None:
 
     from artlite.model_config import sd15_dir
     from models import is_diffusers
-    from models.sd15 import reference
     from models.sd15.host import resnet_time_biases
     from models.sd15.model import UNet
+
+    from . import ref as reference
     path = sd15_dir()
     if not is_diffusers(path):
         pytest.skip(f"{path}: not present")

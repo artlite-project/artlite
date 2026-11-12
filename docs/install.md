@@ -142,7 +142,7 @@ Which files run: [Models](models/README.md).
 ## Build cache
 
 The first run of a model compiles its NPU designs into `~/.cache/artlite` (`ARTLITE_CACHE_DIR`), keyed by their
-content: later runs load them. Stable Diffusion's npu backend and the vision encoders (MiniCPM-V's, Qwen3-VL's) also
+content: later runs load them. Stable Diffusion's UNet and VAE decoder and the vision encoders (MiniCPM-V's, Qwen3-VL's) also
 keep their built dispatches there (15-60 MB per model, the latest build only). No weights are cached: every load converts
 them from the model's files. The cache only grows; deleting it is safe (the next runs rebuild what they need).
 

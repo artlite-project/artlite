@@ -29,7 +29,6 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.decode.design import interleave, norm_objects
 from artlite.decode.image import column_rows
@@ -76,7 +75,7 @@ class DraftImage(QwenImage):
         if layer >= 0:
             return super().norm_objects(layer, name)
         w = self.gguf.tensor(f"blk.{self.layers[0]}.nextn.shared_head_norm.weight").dequantize()
-        return norm_objects(w.numpy().reshape(-1), self.tile_bytes).view(np.uint8)
+        return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
 
 
 def _formats(img: QwenImage) -> set[str]:
@@ -200,20 +199,20 @@ class QwenDraft(QwenOverlay):
     def _f32(self, name: str) -> np.ndarray:
         return super()._f32(f"blk.{self.L}.nextn.shared_head_norm.weight" if name == "output_norm.weight" else name)
 
-    def inputs(self, emb: torch.Tensor, h: torch.Tensor) -> np.ndarray:
+    def inputs(self, emb: np.ndarray, h: np.ndarray) -> np.ndarray:
         """The eh phase's input (S, 2 hidden) fp32: [enorm(emb) | hnorm(h)] of the slots' token embeddings and the
         hidden states before them (S, hidden each)."""
         eps, b = self.cfg.rms_norm_eps, f"blk.{self.L}.nextn."
 
-        def norm(x: torch.Tensor, w: str) -> np.ndarray:
-            x = x.float().numpy().astype(np.float32)
+        def norm(x: np.ndarray, w: str) -> np.ndarray:
+            x = np.asarray(x, np.float32)
             r = 1 / np.sqrt((x * x).mean(-1, keepdims=True, dtype=np.float32) + np.float32(eps))
             return x * r * self._f32(b + w)
 
         return np.concatenate([norm(emb, "enorm.weight"), norm(h, "hnorm.weight")], -1)
 
-    def step(self, emb: torch.Tensor, h: torch.Tensor, position: int, *, logits: bool = True
-             ) -> torch.Tensor | None:
+    def step(self, emb: np.ndarray, h: np.ndarray, position: int, *, logits: bool = True
+             ) -> np.ndarray | None:
         """A step of S = len(emb) <= SLOTS rows at positions position .. position + S - 1 (their cache records): emb (S,
         hidden) their tokens' embeddings, h (S, hidden) the hidden states of the positions before them. Returns the
         head's logits (S, vocab) bf16 (the tokens ``ids``; a view of the NPU's buffer, valid until the next step), or
@@ -228,13 +227,13 @@ class QwenDraft(QwenOverlay):
             self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K], self._sp(S, (self.L, "eh"))).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
-    def hidden_state(self, slot: int = 0) -> torch.Tensor:
+    def hidden_state(self, slot: int = 0) -> np.ndarray:
         """The next draft's h of a slot of the last step: its residual before the head, normed by shared_head_norm
         (hidden,) fp32."""
-        x = self.hidden(-1, slot).numpy()
+        x = self.hidden(-1, slot)
         eps = np.float32(self.cfg.rms_norm_eps)
         r = 1 / np.sqrt((x * x).mean(dtype=np.float32) + eps)
-        return torch.from_numpy(x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight"))
+        return x * r * self._f32(f"blk.{self.L}.nextn.shared_head_norm.weight")
 
 
 __all__ = ["HEAD_ROWS", "TABLE_ROWS", "DraftImage", "HeadTable", "QwenDraft", "draft_formats", "draft_gate_up", "head_tokens",

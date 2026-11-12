@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 import jinja2.ext
 import jinja2.sandbox
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite import _native, backend, portable
 from artlite.gguf_model import GGUFFile
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 R = TypeVar("R")
 MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
-LogitsLike = torch.Tensor | np.ndarray  # a vocabulary's logits: bf16 (an overlay's) or fp32
+LogitsLike = np.ndarray  # a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32
 _rng = random.Random()  # (sampling's draws: ``seed``)
 
 
@@ -109,17 +109,22 @@ def top_logits(logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray
     """The k largest of a vocabulary's logits after a soft cap (``cap`` > 0: cap tanh(l / cap)), fp32, descending
     (equal ones: the lower index first), and their token ids (int32; ``rows``: the token of each logit, else its index):
     one pass over the logits (``_native.top_logits``)."""
-    return _native.top_logits(logits, k, cap, rows=rows)
+    return _native.top_logits(logit_bits(logits), k, cap, rows=rows)
 
 
 def argmax(logits: LogitsLike) -> int:
     """The index of the largest logit (the first of equal ones)."""
-    return int(_native.top_logits(logits, 1)[1][0])
+    return int(_native.top_logits(logit_bits(logits), 1)[1][0])
+
+
+def logit_bits(logits: LogitsLike) -> np.ndarray:
+    """bf16 logits as their bits (uint16: what the native code takes), fp32 as they are."""
+    return logits.view(np.uint16) if logits.dtype == bfloat16 else logits
 
 
 def max_prob(logits: LogitsLike) -> tuple[int, float]:
     """The largest of bf16 logits (its index: the first of equal ones) and its probability (softmax)."""
-    return _native.max_prob(logits)
+    return _native.max_prob(logit_bits(logits))
 
 
 # a generation's observer of each choice (``NpuModel.generate``'s ``probs``): the logits the token was chosen from (a view
@@ -209,13 +214,12 @@ class Penalties:
             return top_logits(logits, k, cap, rows=rows)
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
         s, count = self.sampling, np.fromiter(self.counts.values(), np.float32, len(ids))
-        return _native.top_logits(logits, k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
+        return _native.top_logits(logit_bits(logits), k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, rows)
 
     def _top_of(self, logits: LogitsLike, k: int, cap: float, allowed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """The ``k`` largest penalized logits of the ``allowed`` tokens (sorted ids) and their ids."""
-        sub = logits[torch.from_numpy(allowed.astype(np.int64))] if isinstance(logits, torch.Tensor) else \
-            logits[allowed]
+        sub = logits[allowed]
         k = min(k, len(allowed))
         if not self.counts:
             return top_logits(sub, k, cap, rows=allowed)
@@ -224,7 +228,7 @@ class Penalties:
         at = np.minimum(np.searchsorted(allowed, ids), len(allowed) - 1)
         hit = allowed[at] == ids
         s = self.sampling
-        return _native.top_logits(sub, k, cap, at[hit].astype(np.int32), count[hit], s.repeat_penalty,
+        return _native.top_logits(logit_bits(sub), k, cap, at[hit].astype(np.int32), count[hit], s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, allowed)
 
 
@@ -470,10 +474,7 @@ class StreamDecoder:
 
 
 def nbytes(x: object) -> int:
-    """Bytes of the tensors and of the objects with ``nbytes`` (arrays, ``Records``) in nested lists, tuples and
-    dicts."""
-    if isinstance(x, torch.Tensor):
-        return x.numel() * x.element_size()
+    """Bytes of the objects with ``nbytes`` (arrays, ``Records``) in nested lists, tuples and dicts."""
     if isinstance(x, dict):
         return sum(nbytes(v) for v in x.values())
     if isinstance(x, (list, tuple)):
@@ -532,14 +533,14 @@ class NpuModel:
         self.reset()
         return 0
 
-    def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> torch.Tensor:
+    def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> np.ndarray:
         """Run tokens after the cached positions: the logits (vocab,) fp32 of the last. ``progress``: called with the
         number of tokens done as they run (an exception it raises stops the prompt between dispatches, the positions
         run so far cached)."""
         raise NotImplementedError
 
     def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None
-               ) -> torch.Tensor | None:
+               ) -> np.ndarray | None:
         """Run tokens after the cached positions (``forward``); ``logits``: return the last one's."""
         out = self.forward(tokens, progress=progress)
         return out if logits else None
@@ -605,7 +606,7 @@ class NpuModel:
         """The caches' records of positions start .. end - 1 from ``read_records``' copies (which hold them)."""
         raise NotImplementedError
 
-    def step(self, token: int) -> torch.Tensor:
+    def step(self, token: int) -> np.ndarray:
         """Run ``token`` at the next position: the logits (vocab,) of the next token."""
         raise NotImplementedError
 
@@ -615,7 +616,7 @@ class NpuModel:
         logits = self.step(token)
         return top_logits(logits, k) if penalties is None else penalties.top(logits, k)
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
+    def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """Sample up to ``max_tokens`` tokens (< 0: no limit) after the cached positions; ``logits``: of the last
         cached one; ``prompt``: the prompt's tokens (the penalties' first); ``mask``: the tokens each may be (told
@@ -655,12 +656,12 @@ class Readout:
         self.at = at
         self.rows = np.zeros((len(at), hidden), np.float32)
 
-    def take(self, i: int, n: int, rows: Callable[[int, int], torch.Tensor]) -> None:
+    def take(self, i: int, n: int, rows: Callable[[int, int], np.ndarray]) -> None:
         """Tokens i .. i + n - 1 ran: ``rows(j, k)`` (k, hidden) are the outputs of k of them from their j-th on."""
         sel = np.flatnonzero((self.at >= i) & (self.at < i + n))
         if sel.size:
             lo, hi = int(self.at[sel].min()) - i, int(self.at[sel].max()) - i + 1
-            self.rows[sel] = rows(lo, hi - lo).numpy()[self.at[sel] - i - lo]
+            self.rows[sel] = rows(lo, hi - lo)[self.at[sel] - i - lo]
 
 
 class OverlayModel(NpuModel):
@@ -682,7 +683,7 @@ class OverlayModel(NpuModel):
 
     overlay: Any
     prefill: Any
-    _w_out: torch.Tensor  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
+    _w_out: np.ndarray  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1, or fewer: ``--spec-draft-n-max``)
@@ -722,9 +723,10 @@ class OverlayModel(NpuModel):
             out.append(f"{self.drafted_ctx} context draft tokens, {self.accepted_ctx} accepted")
         return "; ".join(out)
 
-    def cap(self, logits: torch.Tensor) -> torch.Tensor:
-        """The model's logits of the overlay's (fp32): the soft cap, if any."""
-        return torch.tanh(logits / self.softcap) * self.softcap if self.softcap else logits
+    def cap(self, logits: np.ndarray) -> np.ndarray:
+        """The model's logits (fp32) of the overlay's (bf16 or fp32): the soft cap, if any."""
+        logits = np.asarray(logits, np.float32)
+        return np.tanh(logits / self.softcap) * np.float32(self.softcap) if self.softcap else logits
 
     @functools.cached_property
     def _pool(self) -> ThreadPoolExecutor:
@@ -746,7 +748,7 @@ class OverlayModel(NpuModel):
         whose inputs nothing prepared ahead)."""
         raise NotImplementedError
 
-    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """The overlay's logits (vocab,) of the last chunk's last token (``token``, the chunk's n-th; positions up to
         it cached), in the dispatches of ``_dispatch``."""
         raise NotImplementedError
@@ -759,7 +761,7 @@ class OverlayModel(NpuModel):
         self.dispatches += 1
         return out
 
-    def steps(self, tokens: list[int], *, logits: bool = True, **step: Any) -> torch.Tensor | None:
+    def steps(self, tokens: list[int], *, logits: bool = True, **step: Any) -> np.ndarray | None:
         """Run up to ``overlay.SLOTS`` tokens at the next positions in one dispatch: the overlay's logits (n, vocab)
         bf16 after each of them (a view of the NPU's buffer, valid until the next dispatch), or None (``logits=False``:
         prompt tokens); ``step``: the overlay step's other keywords."""
@@ -776,10 +778,10 @@ class OverlayModel(NpuModel):
             self.slot = len(tokens) - 1
         return out
 
-    def step(self, token: int, *, logits: bool = True) -> torch.Tensor | None:
+    def step(self, token: int, *, logits: bool = True) -> np.ndarray | None:
         """Run ``token`` at the next position: the logits (vocab,) fp32 of the next token, or None (``logits=False``)."""
         out = self.steps([token], logits=logits)
-        return None if out is None else self.cap(out[0].float())
+        return None if out is None else self.cap(out[0])
 
     def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[np.ndarray, np.ndarray]:
         """(from the overlay's bf16 logits: the soft cap on the candidates alone)"""
@@ -881,7 +883,7 @@ class OverlayModel(NpuModel):
             ov.write_records(r, start, end)
 
     def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None,
-               readout: Readout | None = None, sets: Sequence[int] | None = None) -> torch.Tensor | None:
+               readout: Readout | None = None, sets: Sequence[int] | None = None) -> np.ndarray | None:
         """Run tokens after the cached positions (prefill chunks, else decode steps); ``logits``: return the last
         token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps; ``readout``:
         gathers output rows (``outputs``: every token a chunk can take in chunks); ``sets``: a non-causal prompt's
@@ -908,9 +910,9 @@ class OverlayModel(NpuModel):
                     n += 1
                 last = logits and i + n == len(tokens)
                 o = self.steps(tokens[i:i + n], logits=last or not steps)  # (a readout's rows: the LM head's input)
-                out = self.cap(o[-1].float()) if last else None
+                out = self.cap(o[-1]) if last else None
                 if readout is not None:
-                    readout.take(i, n, lambda j, k: torch.stack([self.overlay.hidden(-1, s) for s in range(j, j + k)]))
+                    readout.take(i, n, lambda j, k: np.stack([self.overlay.hidden(-1, s) for s in range(j, j + k)]))
                 i += n
                 if progress is not None:
                     progress(i)
@@ -929,7 +931,7 @@ class OverlayModel(NpuModel):
             if readout is not None:
                 readout.take(i, n, self.prefill.hidden)
             if logits and i + n == len(tokens):
-                out = self.cap(self._chunk_logits(tokens[-1], n).float())
+                out = self.cap(self._chunk_logits(tokens[-1], n))
                 self.slot = 0
             self.position += n
             i += n
@@ -937,7 +939,7 @@ class OverlayModel(NpuModel):
                 progress(i)
         return out
 
-    def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> torch.Tensor:
+    def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> np.ndarray:
         """Run the tokens after the cached positions: the logits (vocab,) of the last."""
         return self.prompt(tokens, logits=True, progress=progress)
 
@@ -1057,7 +1059,7 @@ class OverlayModel(NpuModel):
             self.dispatches += self.prefill.dispatches
             for i, o in zip(idx, offs, strict=True):
                 r0, r1 = int(at[i].min()), int(at[i].max()) + 1
-                x = self.prefill.hidden(int(o) + r0, r1 - r0).numpy()[at[i] - r0]
+                x = self.prefill.hidden(int(o) + r0, r1 - r0)[at[i] - r0]
                 out[i] = self._normed(x) if norm else x
         if bins and self.recurrent and not p:
             self.restore(0)  # (the packed chunks' states: none of a sequence)
@@ -1130,7 +1132,7 @@ class OverlayModel(NpuModel):
     def _begin(self) -> None:
         """A generation's rounds begin (after its prompt's last step)."""
 
-    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
+    def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
         """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab)."""
         return self.steps(tokens)
 
@@ -1156,7 +1158,7 @@ class OverlayModel(NpuModel):
             self._drop_carry()
         self.rounds, self.carry, self._rounds_of = False, (), None
 
-    def generate(self, logits: torch.Tensor, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
+    def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(in rounds of a step of drafts each: the class docstring; ``probs``: of a round's kept tokens, their rows of
         its step; ``drafts`` below ``DRAFTS``: a drafter's caches still follow the tokens, as after a round of the
@@ -1235,15 +1237,15 @@ class OverlayModel(NpuModel):
             if self._rounds_of is tag:
                 self._abandon()
 
-    def forced_logits(self, tokens: list[int], first: int = 0, *, batch: int = 1) -> torch.Tensor:
+    def forced_logits(self, tokens: list[int], first: int = 0, *, batch: int = 1) -> np.ndarray:
         """Teacher-forced logits (len(tokens) - first, vocab) fp32 of tokens[first:], from position 0, ``batch`` tokens
         per dispatch (quality tooling)."""
         self.reset()
         self.prompt(tokens[:first])
-        return torch.cat([self.cap(self.steps(tokens[i:i + batch]).float()) for i in range(first, len(tokens), batch)])
+        return np.concatenate([self.cap(self.steps(tokens[i:i + batch])) for i in range(first, len(tokens), batch)])
 
     def forced_drafts(self, tokens: list[int], first: int, *, turns: Sequence[int] = (), prefill: bool = True
-                      ) -> Iterator[tuple[list[int], torch.Tensor]]:
+                      ) -> Iterator[tuple[list[int], np.ndarray]]:
         """Teacher-forced drafts of the drafter (quality tooling): tokens[:first] from position 0 as prompts that start
         at 0 and at ``turns`` (a later one after the cached positions, as a chat's next turn; with ``prefill`` False all
         as decode steps), then per position of tokens[first:-1] the drafter's guesses after its token (``_mtp``, as a
@@ -1264,7 +1266,7 @@ class OverlayModel(NpuModel):
         for token in tokens[first:-1]:
             p = self.position
             d = self._mtp(token, self.DRAFTS, penalties)
-            logits = self.cap(self._verify([token], True)[0].float())
+            logits = self.cap(self._verify([token], True)[0])
             self._kept(p, [token], 1, True)
             yield d, logits
 

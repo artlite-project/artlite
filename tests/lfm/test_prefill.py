@@ -21,6 +21,7 @@ from artlite.gguf_model import GGUFFile
 from models.lfm.overlay import LfmOverlay
 from models.lfm.prefill import LfmPrefill
 
+from ..common import to_torch
 from . import ref
 
 VOCAB = 2048
@@ -48,10 +49,10 @@ def _prompt(ov: LfmOverlay, pf: LfmPrefill, x: torch.Tensor, p: int) -> torch.Te
         pf.run(x[p:p + m], p, T)
         p += m
     if p == n:
-        return ov.logits_of(pf.hidden(m - 1)).float()
+        return to_torch(ov.logits_of(pf.hidden(m - 1))).float()
     while p < n:
         S = min(4, n - p)
-        out = ov.step(x[p:p + S], p).float()
+        out = to_torch(ov.step(x[p:p + S], p)).float()
         p += S
     return out[-1]
 
@@ -73,7 +74,7 @@ def test_lfm_prefill_layers(first: int, steps: tuple[int, ...], n: int, kv_k: st
     p = 0
     while p < len(ids):
         S = min(4, len(ids) - p)
-        want_l = ov.step(x[p:p + S], p).float()[-1]
+        want_l = to_torch(ov.step(x[p:p + S], p)).float()[-1]
         p += S
     att = [L for L in layers if ov.kind(L) != "conv"]
     want = {L: ov.read_kv(L, range(len(ids))) for L in att}
@@ -115,7 +116,7 @@ def test_lfm_prefill_teacher_forced(quant: str) -> None:
         p = P
         while p < len(ids):
             n = min(S, len(ids) - p)
-            rows += list(ov.step(x[p:p + n], p).float())
+            rows += list(to_torch(ov.step(x[p:p + n], p)).float())
             p += n
         got = torch.stack(rows)
         k = ref.cpu.kl(want, got)
@@ -148,7 +149,7 @@ def test_lfm_prefill_set(n: int, sets: tuple[int, ...]) -> None:
     assert pf.nc and not pf.attn[("swa", sizes[0])].nc
     ov.reset()
     pf.run(cpu_m.emb[torch.tensor(ids)], 0, sets=sets)
-    got = cpu_m.rms(pf.hidden(0, n), cpu_m.norm)
+    got = cpu_m.rms(torch.from_numpy(pf.hidden(0, n)), cpu_m.norm)
     worst = {"all": ref.relative(got, want)}
     for k, (a, b) in enumerate(itertools.pairwise((0, *sets))):  # (the state, each question)
         worst[f"part{k}"] = ref.relative(got[a:b], want[a:b])

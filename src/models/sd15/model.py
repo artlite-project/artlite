@@ -8,7 +8,6 @@ V^T slots of the text context (``set_context``)."""
 from concurrent.futures import Executor
 
 import numpy as np
-import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
@@ -24,7 +23,7 @@ from .level64 import LV64, PImage, conv_in64, conv_out64, down64, latent_panels,
 from .unet import CTX_KEYS, outer, skip_bands, transformer_bands
 
 
-def unet(bd: Builder, w: dict, lat: PImage, *, biases: dict[str, torch.Tensor], ctx_kv: dict[str, int], kv: dict[int, int],
+def unet(bd: Builder, w: dict, lat: PImage, *, biases: dict[str, np.ndarray], ctx_kv: dict[str, int], kv: dict[int, int],
          eps: float) -> None:
     """The UNet from the latents' PImage to conv_out's image "out": conv_in, down_blocks.0 (64x64), down_blocks.1 ..
     up_blocks.2 (``outer``), up_blocks.2's upsampler, up_blocks.3 (64x64), conv_out. kv: per level size its
@@ -73,9 +72,9 @@ class UNet:
         kv = {16: bd.ddr("kv_self", 16 * Level(16).np * 2 * D.Q),
               32: bd.ddr("kv_self32", Attention(np=lv32.np, q=0, o=0, kv=0, d=80, nbands=lv32.nb).kv_bytes()),
               64: bd.ddr("kv_self64", Attention(np=LV64.np, q=0, o=0, kv=0, d=40, nbands=LV64.nb).kv_bytes())}
-        ctx_kv = {p: bd.image(p + "ctx", np.zeros(len(self._ctx(p, torch.zeros(2, CTX_KEYS, 768))), np.uint8))
+        ctx_kv = {p: bd.image(p + "ctx", np.zeros(len(self._ctx(p, np.zeros((2, CTX_KEYS, 768), np.float32))), np.uint8))
                   for p in self.PREFIXES}
-        zero = {p[:-len("time_emb_proj.weight")]: torch.zeros(w[p].shape[0]) for p in w if p.endswith("time_emb_proj.weight")}
+        zero = {p[:-len("time_emb_proj.weight")]: np.zeros(w[p].shape[0], np.float32) for p in w if p.endswith("time_emb_proj.weight")}
         unet(bd, w, lat, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
         self.words = bd.finish()
         self.tr = None
@@ -102,25 +101,25 @@ class UNet:
         net.lat, net.tb_used, net.tb_hooks = state["lat"], state["tb_used"], state["tb_hooks"]
         return net
 
-    def _ctx(self, p: str, ctx: torch.Tensor) -> np.ndarray:
+    def _ctx(self, p: str, ctx: np.ndarray) -> np.ndarray:
         a = p + "transformer_blocks.0.attn2."
         wk, wv = self.w[a + "to_k.weight"], self.w[a + "to_v.weight"]
         return L.kv_slots(ctx @ wk.T, ctx @ wv.T, d=wk.shape[0] // 8)
 
-    def set_time(self, biases: dict[str, torch.Tensor]) -> None:
+    def set_time(self, biases: dict[str, np.ndarray]) -> None:
         """The resnets' time biases (by prefix): their conv1 commands' biases (the conv bias + the time bias, bf16) in
         TBIAS, one write."""
         buf = np.empty(self.tb_used // 2, bfloat16)
         for p, off, rows in self.tb_hooks:
-            buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p]).numpy()[rows]
+            buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p])[rows]
         self.npu.write(TBIAS, buf)
 
-    def set_context(self, ctx: torch.Tensor, pool: Executor | None = None) -> None:
+    def set_context(self, ctx: np.ndarray, pool: Executor | None = None) -> None:
         """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768) (pool: computed on its threads)."""
         for p, v in zip(self.PREFIXES, (pool.map if pool else map)(lambda p: self._ctx(p, ctx), self.PREFIXES), strict=True):
             self.npu.write(p + "ctx", v)
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: np.ndarray) -> np.ndarray:
         for c, p in enumerate(latent_panels(x)):
             self.npu.write(self.lat.name, p, c * self.lat.colbytes)
         if self.tr is None:

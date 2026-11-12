@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-import torch  # noqa: TID251
 
 from .. import _native
 from . import design as D
@@ -77,10 +76,10 @@ class Part(NamedTuple):
 
 
 def _index(key: object, n: int) -> np.ndarray:
-    """A row or channel selection (a slice, or indices: a sequence, array or tensor) as int64 indices into n."""
+    """A row or channel selection (a slice, or indices: a sequence or array) as int64 indices into n."""
     if isinstance(key, slice):
         return np.arange(n, dtype=np.int64)[key]
-    idx = np.asarray(key.numpy() if isinstance(key, torch.Tensor) else key, np.int64).reshape(-1)
+    idx = np.asarray(key, np.int64).reshape(-1)
     assert ((idx >= 0) & (idx < n)).all(), "indices in range (no negative ones)"
     return idx
 
@@ -222,10 +221,10 @@ def _merge(parts: list[Part]) -> tuple[Part, ...]:
     return tuple(out)
 
 
-def memory(x: np.ndarray | torch.Tensor, name: str | None = None) -> Wt:
+def memory(x: np.ndarray, name: str | None = None) -> Wt:
     """A matrix of memory of its own (float32 values; name: a computed weight's, unique among the model's sources;
     None: by the values' digest, for tests: not resolvable in a cached build)."""
-    a = np.ascontiguousarray(x.float().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, np.float32))
+    a = np.ascontiguousarray(x, np.float32)
     shape = a.shape if a.ndim > 1 else (1, a.size)
     rows, cols = shape[0], math.prod(shape[1:])
     name = name or "mem:" + hashlib.blake2b(a.tobytes(), digest_size=12).hexdigest()
@@ -242,35 +241,46 @@ def eye(n: int) -> Wt:
     return Wt.of(Source(f"eye:{n}", "EYE", n, n))
 
 
-def as_wt(x: Wt | np.ndarray | torch.Tensor) -> Wt:
+def as_wt(x: Wt | np.ndarray) -> Wt:
     return x if isinstance(x, Wt) else memory(x)
 
 
-def values(x: Wt | np.ndarray | torch.Tensor) -> np.ndarray:
+def values(x: Wt | np.ndarray) -> np.ndarray:
     """A matrix's values as float32 numpy (for the host's computed weights)."""
     if isinstance(x, Wt):
         return x.numpy()
-    return x.float().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, np.float32)
+    return np.asarray(x, np.float32)
 
 
-def take(x: Wt | torch.Tensor, idx: np.ndarray, dim: int = 0) -> Wt | torch.Tensor:
-    """Entries idx of x along dim 0 (rows) or 1 (channels), -1: zeros (a Wt's maps; a tensor's copy)."""
+def flat(x: Wt | np.ndarray) -> Wt | np.ndarray:
+    """A matrix as (rows, the rest): a conv's (N, C, kh, kw) as (N, C kh kw)."""
+    return x.flatten(1) if isinstance(x, Wt) else np.asarray(x).reshape(x.shape[0], -1)
+
+
+def f32(x: Wt | np.ndarray) -> Wt | np.ndarray:
+    """A matrix as it is (a Wt), an array's values as float32."""
+    return x if isinstance(x, Wt) else np.asarray(x, np.float32)
+
+
+def take(x: Wt | np.ndarray, idx: np.ndarray, dim: int = 0) -> Wt | np.ndarray:
+    """Entries idx of x along dim 0 (rows) or 1 (channels), -1: zeros (a Wt's maps; an array's copy)."""
     idx = np.asarray(idx, np.int64)
     if isinstance(x, Wt):
         return x.take_rows(idx) if dim == 0 else x.take_cols(idx)
+    x = np.asarray(x)
     shape = list(x.shape)
     shape[dim] = len(idx)
-    out = torch.zeros(shape, dtype=x.dtype)
-    ok = torch.from_numpy(np.flatnonzero(idx >= 0))
-    src = torch.from_numpy(idx[idx >= 0])
-    out.index_copy_(dim, ok, x.index_select(dim, src))
+    out = np.zeros(shape, x.dtype)
+    at = [slice(None)] * x.ndim
+    at[dim] = np.flatnonzero(idx >= 0)
+    out[tuple(at)] = np.take(x, idx[idx >= 0], axis=dim)
     return out
 
 
-def cat(xs: list[Wt | torch.Tensor], dim: int = 0) -> Wt | torch.Tensor:
-    """``torch.cat`` of tensors; matrices of which any is a Wt as one Wt (tensors as memory of their own)."""
-    if all(isinstance(x, torch.Tensor) for x in xs):
-        return torch.cat(xs, dim)
+def cat(xs: list[Wt | np.ndarray], dim: int = 0) -> Wt | np.ndarray:
+    """The concatenation of arrays; matrices of which any is a Wt as one Wt (arrays as memory of their own)."""
+    if not any(isinstance(x, Wt) for x in xs):
+        return np.concatenate([np.asarray(x) for x in xs], dim)
     return Wt.cat([as_wt(x) for x in xs], dim)
 
 
@@ -346,24 +356,24 @@ def gguf_matrix(g: GGUFFile, name: str) -> Wt:
     return Wt.of(Source(sname, t.qtype, t.rows, t.cols, raw.reshape(t.rows, -1), (g.path, g.data)))
 
 
-def gguf_getter(g: GGUFFile) -> Callable[[str], Wt | torch.Tensor]:
+def gguf_getter(g: GGUFFile) -> Callable[[str], Wt | np.ndarray]:
     """A GGUF file's tensors by name: matrices (2 dims and more: ``gguf_matrix``) and vectors as float32 (1, cols)
-    tensors."""
-    def get(name: str) -> Wt | torch.Tensor:
+    arrays."""
+    def get(name: str) -> Wt | np.ndarray:
         if len(g.tensor_info[name][0]) > 1:
             return gguf_matrix(g, name)
         t = g.tensor(name)
-        return t.dequantize().reshape(1, t.cols).float()
+        return t.dequantize().reshape(1, t.cols)
     return get
 
 
 _ST_KINDS = {"F32": ("F32", np.float32), "F16": ("F16", np.float16), "BF16": ("BF16", np.uint16)}
 
 
-def safetensors(path: str, prefixes: tuple[str, ...] = (), *, tag: str = "") -> dict[str, Wt | torch.Tensor]:
+def safetensors(path: str, prefixes: tuple[str, ...] = (), *, tag: str = "") -> dict[str, Wt | np.ndarray]:
     """A safetensors file's tensors (``prefixes``: only those whose names start with one of them) read from its memory
     map: matrices (2 dims and more) as Wt (sources named ``tag:<name>``, tag default the file's name), vectors as
-    float32 tensors."""
+    float32 arrays."""
     data = np.memmap(path, dtype=np.uint8, mode="r")
     (n,) = struct.unpack_from("<Q", data, 0)
     header = json.loads(bytes(data[8:8 + n]))
@@ -380,8 +390,7 @@ def safetensors(path: str, prefixes: tuple[str, ...] = (), *, tag: str = "") -> 
             raise ValueError(f"{path}: {name}: a byte range that does not fit the shape")
         if len(shape) < 2:
             v = raw.view(dt)
-            out[name] = torch.from_numpy((v.astype(np.uint32) << 16).view(np.float32) if kind == "BF16" else
-                                         v.astype(np.float32))
+            out[name] = (v.astype(np.uint32) << 16).view(np.float32) if kind == "BF16" else v.astype(np.float32)
             continue
         out[name] = Wt.of(Source(f"{tag}:{name}", kind, shape[0], math.prod(shape[1:]), raw.reshape(shape[0], -1),
                                  (path, data)), shape)
@@ -441,7 +450,7 @@ class Slots:
         parts = [(p, _runs(np.where(cols >= 0, p.cols[np.maximum(cols, 0)], -1))) for p in w.parts]
         parts = [(p, r) for p, r in parts if len(r)]
         for row, (image, offset) in at.items():
-            idx = g._rows(row).numpy()
+            idx = g._rows(row)
             assert idx.max() < w.shape[0], (idx.max(), w.shape)
             self.pending.append((image, offset, g.npo, g.nkt, g.hilo,
                                  [(p.source, p.scale, np.where(p.rows[idx] >= 0, p.rows[idx], -1).astype(np.int32), r)

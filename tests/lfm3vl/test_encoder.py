@@ -116,7 +116,7 @@ def test_layer(npu: VisionDevice, encoder: E.Encoder, il: int, size: tuple[int, 
     for b in range(nb):
         raw = npu.read(f"{encoder.nm.x(il + 1)}.{b}", COLS * lv.ct(E.C)).reshape(COLS, -1)
         for c in range(COLS):
-            v = L.from_ctiles(raw[c], 64, E.C, 64).numpy()
+            v = L.from_ctiles(raw[c], 64, E.C, 64)
             rows[sp[b, c][real[b, c]]] = v[real[b, c]]
     got, d = rows[:, :E.H], want - xin.numpy()
     tok = np.linalg.norm(got - want, axis=1) / np.linalg.norm(d, axis=1)

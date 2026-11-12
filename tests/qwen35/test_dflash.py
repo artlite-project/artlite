@@ -34,7 +34,7 @@ from models.qwen35.qwen import NpuQwen, Qwen
 from models.server.cache import PromptCache
 from models.tokenizer import BpeTokenizer
 
-from ..common import essays
+from ..common import essays, to_torch
 from . import ref
 
 pytestmark = pytest.mark.slow  # the whole 27B: its taps from llama.cpp's CPU run, its head in place
@@ -57,7 +57,7 @@ def _tokens(model: str, n: int) -> list[int]:
 
 
 def _emb(d: ref.DFlash, token: int) -> np.ndarray:
-    return ref.f32(d.model.rows("token_embd.weight", [token] + [d.cfg.mask_token] * (d.cfg.block - 1)).numpy())
+    return ref.f32(d.model.rows("token_embd.weight", [token] + [d.cfg.mask_token] * (d.cfg.block - 1)))
 
 
 def test_ref() -> None:
@@ -272,7 +272,7 @@ def test_block(npu: _Npu, P: int) -> None:
     d.step(0, 0, P, emb, P)
     out = rf.block(emb, P)
     raw, gates = d.logits(), d.gates()
-    logits = raw.float().numpy().copy()
+    logits = raw.astype(np.float32)
     assert ref.rel_err(logits, out["logits"]) < 0.035 and ref.rel_err(gates, out["gate"]) < 0.05
     top = [len(set(np.argsort(-logits[s])[:16].tolist()) & set(np.argsort(-out["logits"][s])[:16].tolist())) for s in range(1, 8)]
     assert min(top) >= 14, top
@@ -302,7 +302,7 @@ def test_rounds() -> None:
     lg = m.forward(ids)
     flips = []
     for i, t in enumerate(out):
-        top = torch.topk(lg.float(), 2)
+        top = torch.topk(torch.from_numpy(lg), 2)
         if int(top.indices[0]) != t:
             flips.append(float(top.values[0] - top.values[1]))
         if i + 1 < len(out):
@@ -423,7 +423,7 @@ def test_sampled(app: tuple[NpuQwen, BpeTokenizer]) -> None:
         lg = m.forward(ids)
         ranks = []
         for i, t in enumerate(out):
-            ranks.append(int((lg.float() > lg.float()[t]).sum()))
+            ranks.append(int((lg > lg[t]).sum()))
             if i + 1 < len(out):
                 lg = m.step(t)
     finally:
@@ -443,7 +443,7 @@ def test_branch(app: tuple[NpuQwen, BpeTokenizer]) -> None:
 
     def step(ids: list[int], p: int, branch: tuple[int, int] | None = None) -> torch.Tensor:
         ov.rope[p:p + len(ids)] = np.arange(p, p + len(ids))[:, None]
-        out = ov.step(m._rows(ids), p, commit=False, branch=branch).float().clone()
+        out = to_torch(ov.step(m._rows(ids), p, commit=False, branch=branch)).float()
         ov.accept(0)
         return out
 
@@ -475,7 +475,7 @@ def test_branch(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     try:
         lg, flips = m.forward(ids), []
         for i, t in enumerate(out):
-            top = torch.topk(lg.float(), 2)
+            top = torch.topk(torch.from_numpy(lg), 2)
             if int(top.indices[0]) != t:
                 flips.append(float(top.values[0] - top.values[1]))
             if i + 1 < len(out):
@@ -603,7 +603,7 @@ def test_record_edges(app: tuple[NpuQwen, BpeTokenizer], n: int) -> None:
     m._inject()
     assert d.next == n
     d.step(0, 0, n, emb, n)
-    logits, gates = d.logits().float().numpy().copy(), d.gates()
+    logits, gates = d.logits().astype(np.float32), d.gates()
     out = rf.block(emb, n)
     assert ref.rel_err(logits, out["logits"]) < 0.06 and ref.rel_err(gates, out["gate"]) < 0.08
     top = [len(set(np.argsort(-logits[s])[:16].tolist()) & set(np.argsort(-out["logits"][s])[:16].tolist())) for s in range(1, 8)]
@@ -623,11 +623,11 @@ def test_prompt_cache(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     greedy = Sampling(greedy=True)
 
     def block() -> tuple[torch.Tensor, np.ndarray]:
-        x = torch.stack([m._rows([cont[-1]])[0], *[m._mask] * 7]).numpy()
+        x = np.stack([m._rows([cont[-1]])[0], *[m._mask] * 7])
         m._inject()
         d.step(0, 0, m.position, x, m.position)
-        fixed = torch.from_numpy(np.setdiff1d(np.arange(d.vocab), d.table.rows))
-        return d.logits()[:, fixed].clone(), d.gates().copy()
+        fixed = np.setdiff1d(np.arange(d.vocab), d.table.rows)
+        return to_torch(d.logits()[:, fixed]), d.gates().copy()
 
     m.reset()
     m.forward(A)

@@ -16,6 +16,7 @@
 
 import os
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,7 +30,7 @@ from models.gemma4.gemma import Gemma, NpuGemma
 from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 
-from ..common import cached_ref, draft_gate, draft_prompts, model_key
+from ..common import as_torch, cached_ref, draft_gate, draft_prompts, model_key, to_torch
 from . import cpu as gemma_cpu
 from . import ref
 
@@ -60,6 +61,7 @@ def _gguf() -> GGUFFile:
 
 def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
     """Relative rms error (inf when got is not finite: a NaN would compare as no error)."""
+    got, want = as_torch(got), as_torch(want)
     if not torch.isfinite(got.float()).all():
         return float("inf")
     return float((got.float() - want.float()).pow(2).sum().sqrt() / want.float().pow(2).sum().sqrt())
@@ -67,11 +69,13 @@ def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
 
 def _rel_positions(got: torch.Tensor, want: torch.Tensor) -> torch.Tensor:
     """Per position of a cache (heads, positions, head_dim): the relative rms error."""
+    got, want = as_torch(got), as_torch(want)
     d, w = (got.float() - want.float()).transpose(0, 1).flatten(1), want.float().transpose(0, 1).flatten(1)
     return d.norm(dim=1) / w.norm(dim=1)
 
 
 def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
+    want, got = as_torch(want), as_torch(got)
     lr, lp = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
     return (lr.exp() * (lr - lp)).sum(-1)
 
@@ -135,7 +139,7 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: s
 
     for t0 in range(0, len(ids), batch):
         n = min(batch, len(ids) - t0)
-        logits = ov.step(x[t0:t0 + n], e[t0:t0 + n], t0).float()
+        logits = to_torch(ov.step(x[t0:t0 + n], e[t0:t0 + n], t0)).float()
         ov.dev.fetch("ACT")
         act = ov.dev.view("ACT")
         for s in range(n):
@@ -169,7 +173,7 @@ def test_gemma_npu_teacher_forced(cpu: _Cpu, npu: object) -> None:
     first = len(prompt) - 1  # the prompt's tokens before its last run without logits
     want = cpu.logits(seq, slice(first, None))
     for batch in (1, NB):
-        got = npu.forced_logits(seq, first, batch=batch)
+        got = torch.from_numpy(npu.forced_logits(seq, first, batch=batch))
         kl = float(_kl(want, got).mean())
         agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
         print(f"{batch} per dispatch: KL(same) {kl:.5f}, argmax agreement {agree:.3f} over {len(seq) - first} tokens")
@@ -204,7 +208,7 @@ def test_gemma_prefill(cpu: _Cpu, npu: object) -> None:
     for li in layers:
         for name, got, want in zip("KV", npu.overlay.read_kv(li, range(first)), want_kv[li]):
             worst[f"{name}.{li}"] = round(float(_rel_positions(got, want).max()), 4)
-    got = torch.cat([gemma_cpu.softcap(npu.steps(seq[i:i + NB]).float(), npu.cfg.final_logit_softcapping)
+    got = torch.cat([gemma_cpu.softcap(to_torch(npu.steps(seq[i:i + NB])).float(), npu.cfg.final_logit_softcapping)
                      for i in range(first, len(seq), NB)])
     want = cpu.logits(seq, slice(first, None))
     kl = float(_kl(want, got).mean())
@@ -236,7 +240,7 @@ def test_gemma_forward(cpu: _Cpu, npu: object) -> None:
         else:
             npu.prompt(prompt[:-1])
             a = npu.step(prompt[-1])
-        out[name] = torch.stack([a, npu.step(nxt)])
+        out[name] = torch.from_numpy(np.stack([a, npu.step(nxt)]))
     kl = {k: [round(float(x), 5) for x in _kl(want, v)] for k, v in out.items()}
     between = [round(float(x), 5) for x in _kl(out["steps"], out["forward"])]
     print(f"KL(same) {kl}, forward vs steps {between}")
@@ -253,7 +257,7 @@ def test_gemma_kept_projections(npu: object) -> None:
     runs = []
     for _ in range(2):
         npu.reset()
-        runs.append([npu.steps(ids[i:i + NB]).clone() for i in range(0, len(ids), NB)])
+        runs.append([to_torch(npu.steps(ids[i:i + NB]).copy()) for i in range(0, len(ids), NB)])
     assert not npu.overlay.ple
     for a, b in zip(*runs, strict=True):
         assert torch.equal(a, b)
@@ -294,7 +298,7 @@ def test_gemma_draft(cpu: _Cpu, npu: object) -> None:
         for _ in range(3):
             want = next(wants)
             got = torch.empty(npu.drafter.vocab)  # (the drafter's logits in vocabulary order)
-            got[torch.from_numpy(npu.drafter.rows)] = npu.drafter.step(npu.inputs([t])[0][0], x_h, p).float()
+            got[torch.from_numpy(npu.drafter.rows)] = to_torch(npu.drafter.step(npu.inputs([t])[0][0], x_h, p)).float()
             kls.append(float(_kl(want, got)))
             agree.append(int(want.argmax()) == int(got.argmax()))
             t, x_h = int(want.argmax()), None  # both sides continue with the reference's draft
@@ -320,14 +324,14 @@ def test_gemma_mtp_generation(npu: object) -> None:
         p0 = npu.position
         raw = steps(tokens, logits=logits)
         if raw is not None:
-            log.append((p0, list(tokens), gemma_cpu.softcap(raw.float(), npu.cfg.final_logit_softcapping)))
+            log.append((p0, list(tokens), gemma_cpu.softcap(to_torch(raw).float(), npu.cfg.final_logit_softcapping)))
         return raw
 
     npu.reset()
     npu.steps = recording
     try:
         first = npu.forward(ids)
-        log.append((len(ids) - 1, ids[-1:], first[None]))  # (the prompt's last token: through the prefill's step)
+        log.append((len(ids) - 1, ids[-1:], torch.from_numpy(first)[None]))  # (the prompt's last token: through the prefill's step)
         d0 = npu.dispatches
         out = list(npu.generate(first, 48, Sampling(greedy=True)))
         dispatches = npu.dispatches - d0
@@ -344,7 +348,7 @@ def test_gemma_mtp_generation(npu: object) -> None:
     mine = torch.stack([got[p] for p in pos])
     assert [int(t) for t in mine.argmax(-1)] == out, "a token is not the argmax of its position's logits"
     assert npu.position == len(seq) - 1, "the rejected drafts' positions were not forgotten"
-    want = npu.forced_logits(seq[:-1], len(ids) - 1)
+    want = torch.from_numpy(npu.forced_logits(seq[:-1], len(ids) - 1))
     kl = float(_kl(want, mine).mean())
     agree = float((want.argmax(-1) == mine.argmax(-1)).float().mean())
     print(f"{len(out)} tokens in {dispatches} dispatches; KL(same) {kl:.5f}, argmax agreement {agree:.3f}")

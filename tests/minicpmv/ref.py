@@ -221,7 +221,7 @@ class Encoder:
         """A tensor as (rows, cols) of self.dtype (cached)."""
         if name not in self._w:
             t = self.g.tensor(name)
-            self._w[name] = t.dequantize().reshape(t.rows, t.cols).to(self.dtype)
+            self._w[name] = torch.from_numpy(t.dequantize().reshape(t.rows, t.cols)).to(self.dtype)
         return self._w[name]
 
     def has(self, name: str) -> bool:

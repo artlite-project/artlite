@@ -39,7 +39,6 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.vision import windows as W
@@ -49,7 +48,7 @@ from artlite.vision.layers import Tensor, alloc, free, gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.vit import VIT, Bands, Keys, Vit, kv_bytes, layer_bands, pad, pad_heads
 from artlite.vision.vit import vit_level as level
-from artlite.vision.weights import Wt, computed, take, values
+from artlite.vision.weights import Wt, computed, f32, take, values
 from artlite.vision.windows import Layout, Names, out_width
 
 PATCH = 16
@@ -82,43 +81,43 @@ def rope_rows(vt: Vit) -> np.ndarray:
     return np.concatenate([np.where(ok, h * HD + d, -1) for h in range(vt.HEADS)])
 
 
-def rope_heads(w: Wt | torch.Tensor, vt: Vit = VIT) -> Wt | torch.Tensor:
+def rope_heads(w: Wt | np.ndarray, vt: Vit = VIT) -> Wt | np.ndarray:
     """Rows of the heads of HD -> heads of 80 for the RoPE epilogue (``rope_rows``; zeros elsewhere)."""
     return take(w, rope_rows(vt))
 
 
-def layer_weights(get: Callable[[str], Wt | torch.Tensor], il: int, vt: Vit = VIT) -> dict[str, Wt | torch.Tensor]:
+def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, vt: Vit = VIT) -> dict[str, Wt | np.ndarray]:
     """Layer il's padded weights by role: q (x log2 e / sqrt HD), k (rows by head for the RoPE epilogue:
     ``rope_heads``), v (rows by head), o (columns by head), up, down and their biases (``*_b``), ln1 / ln2 gamma and
     beta (``*_g``, ``*_b``); q, k, v and up of K = the hidden; ``get(name)``: a tensor of the mmproj, a matrix (rows,
     cols: ``weights.Wt`` or a tensor) or a vector (1, cols) float32."""
     p = f"v.blk.{il}."
     H, C, A, F = vt.H, vt.C, vt.HEADS * vt.HP, vt.FFN
-    qkv, qkv_b = get(p + "attn_qkv.weight").float(), get(p + "attn_qkv.bias").float().reshape(-1)
+    qkv, qkv_b = f32(get(p + "attn_qkv.weight")), f32(get(p + "attn_qkv.bias")).reshape(-1)
     part = lambda t, i: t[i * H:(i + 1) * H]
     rope, qs = lambda t: rope_heads(t, vt), vt.qscale
     w = {"q": pad(rope(part(qkv, 0) * qs), A), "q_b": rope(part(qkv_b, 0) * qs),
          "k": pad(rope(part(qkv, 1)), A), "k_b": rope(part(qkv_b, 1)),
          "v": pad(pad_heads(part(qkv, 2), vt=vt), A), "v_b": pad_heads(part(qkv_b, 2), vt=vt)}
-    w["o"] = pad(pad_heads(get(p + "attn_out.weight").float(), 1, vt), C, A)
-    w["o_b"] = pad(get(p + "attn_out.bias").float().reshape(-1), C)
-    w["up"] = pad(get(p + "ffn_up.weight").float(), F)
-    w["up_b"] = pad(get(p + "ffn_up.bias").float().reshape(-1), F)
-    w["down"] = pad(get(p + "ffn_down.weight").float(), C, F)
-    w["down_b"] = pad(get(p + "ffn_down.bias").float().reshape(-1), C)
+    w["o"] = pad(pad_heads(f32(get(p + "attn_out.weight")), 1, vt), C, A)
+    w["o_b"] = pad(f32(get(p + "attn_out.bias")).reshape(-1), C)
+    w["up"] = pad(f32(get(p + "ffn_up.weight")), F)
+    w["up_b"] = pad(f32(get(p + "ffn_up.bias")).reshape(-1), F)
+    w["down"] = pad(f32(get(p + "ffn_down.weight")), C, F)
+    w["down_b"] = pad(f32(get(p + "ffn_down.bias")).reshape(-1), C)
     for n in ("ln1", "ln2"):
-        w[n + "_g"] = pad(get(p + n + ".weight").float().reshape(-1), C)
-        w[n + "_b"] = pad(get(p + n + ".bias").float().reshape(-1), C)
+        w[n + "_g"] = pad(f32(get(p + n + ".weight")).reshape(-1), C)
+        w[n + "_b"] = pad(f32(get(p + n + ".bias")).reshape(-1), C)
     return w
 
 
-def _blocks4(v: Wt | torch.Tensor, axis: int = 0, vt: Vit = VIT) -> Wt | torch.Tensor:
+def _blocks4(v: Wt | np.ndarray, axis: int = 0, vt: Vit = VIT) -> Wt | np.ndarray:
     """A merged token's 4 x H channels (along axis: 0, a vector's or a matrix's rows; 1, a matrix's columns) -> 4 x C
     (each patch's padded)."""
     return take(v, np.array([k * vt.H + i if i < vt.H else -1 for k in range(4) for i in range(vt.C)]), axis)
 
 
-def weights(get: Callable[[str], Wt | torch.Tensor], layers: int, proj: int, vt: Vit = VIT) -> dict:
+def weights(get: Callable[[str], Wt | np.ndarray], layers: int, proj: int, vt: Vit = VIT) -> dict:
     """Every padded weight of the encoder: "patch" (``patch_weights``), per layer il its ``layer_weights``, "post"
     (post_ln's gamma, beta), "up" / "down" (mm.0 on the merged 4 x C channels -> FUP, mm.2 FUP -> ``out_width``) and
     their biases; "layers", "proj", "vit" (the widths). Matrices as ``get`` gives them (``weights.Wt``: views of the
@@ -126,15 +125,15 @@ def weights(get: Callable[[str], Wt | torch.Tensor], layers: int, proj: int, vt:
     md = merger(vt)
     w: dict = {"patch": patch_weights(get, vt), "layers": layers, "proj": proj, "vit": vt,
                **{il: layer_weights(get, il, vt) for il in range(layers)}}
-    w["post_g"], w["post_b"] = (pad(get(f"v.post_ln.{n}").float().reshape(-1), vt.C) for n in ("weight", "bias"))
+    w["post_g"], w["post_b"] = (pad(f32(get(f"v.post_ln.{n}")).reshape(-1), vt.C) for n in ("weight", "bias"))
     w["up"] = pad(_blocks4(get("mm.0.weight"), 1, vt), md.FUP, md.merged)
-    w["up_b"] = pad(get("mm.0.bias").float().reshape(-1), md.FUP)
-    w["down"] = pad(get("mm.2.weight").float(), out_width(proj), md.FUP)
-    w["down_b"] = pad(get("mm.2.bias").float().reshape(-1), out_width(proj))
+    w["up_b"] = pad(f32(get("mm.0.bias")).reshape(-1), md.FUP)
+    w["down"] = pad(f32(get("mm.2.weight")), out_width(proj), md.FUP)
+    w["down_b"] = pad(f32(get("mm.2.bias")).reshape(-1), out_width(proj))
     return w
 
 
-def patch_weights(get: Callable[[str], Wt | torch.Tensor], vt: Vit = VIT) -> dict[str, Wt | torch.Tensor]:
+def patch_weights(get: Callable[[str], Wt | np.ndarray], vt: Vit = VIT) -> dict[str, Wt | np.ndarray]:
     """The patch embedding as a GEMM of the integer panels of ``Layout.patches`` (KP inputs -> C): the two temporal
     kernels summed, the normalization x = (p / 255 - 0.5) / 0.5 = a q + o of q = p - 128 (a = 1 / 127.5, o = 1 / 255)
     folded in: input k < 768 the weights' column k times a, input 768 (the constant 1) their offset sum_k w_k o
@@ -146,7 +145,7 @@ def patch_weights(get: Callable[[str], Wt | torch.Tensor], vt: Vit = VIT) -> dic
     o = 128 * a - 1
     wt = np.zeros((C, KP), np.float32)
     wt[:H, :PIX], wt[:H, ONE] = w * a, w.sum(1) * o
-    return {"w": computed("qwen3vl.patch", wt), "b": pad(get("v.patch_embd.bias").float().reshape(-1), C)}
+    return {"w": computed("qwen3vl.patch", wt), "b": pad(f32(get("v.patch_embd.bias")).reshape(-1), C)}
 
 
 def pos_rows(table: np.ndarray, ph: int, pw: int) -> np.ndarray:
@@ -180,7 +179,7 @@ def layers_per_piece(nb: int, layers: int = 27) -> int:
     return max(1, min(layers, PIECE_BAND_LAYERS // nb, int(PIECE_MS / (1.6 * nb + 0.15 * nb * nb))))
 
 
-def patch_embed(bd: Builder, w: dict[str, torch.Tensor], nm: Names, nb: int, vt: Vit = VIT) -> None:
+def patch_embed(bd: Builder, w: dict[str, np.ndarray], nm: Names, nb: int, vt: Vit = VIT) -> None:
     """The patch embedding of nb bands: per band a GEMM of the host's patch panels (DDR image <p>.pix.b) with the
     position rows (<p>.pos.b) as its residual -> the residual's bands before layer 0 and their records."""
     lv = level(nb)

@@ -16,6 +16,7 @@ from artlite.model_config import GemmaConfig, gemma_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.gemma4.attn_prefill import Kind
+from models.gemma4.host import GemmaHost
 from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
@@ -206,9 +207,9 @@ def test_prefill_caches(n: int, p0: int) -> None:
     ids = GemmaTokenizer(g).encode(essay("apple.txt"), add_bos=True)[:p0 + n]
     host = GemmaCpu(g)
     x = host.embed(ids)
-    pli = host.per_layer_inputs(ids, x, bf16=True)
+    pli = GemmaHost.per_layer_inputs(host, ids, x.numpy())  # (the app's)
     x = x.bfloat16().float()  # (the app's inputs: bf16)
-    pli, e = pli.bfloat16(), host.layer_rows(ids)
+    pli, e = pli.astype(bfloat16), host.layer_rows(ids)
     ov = GemmaOverlay(g, layers=layers, vocab=COLS * 64, max_positions=1024)
     ov.load()
     for t in range(0, p0 + n, 4):  # the decode path

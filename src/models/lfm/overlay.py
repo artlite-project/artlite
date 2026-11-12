@@ -45,7 +45,7 @@ import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.decode import kv
 from artlite.decode.attn import (
@@ -446,7 +446,7 @@ class LfmOverlay(ModelOverlay):
         self._weight_run(seq, [(-1, "lm")])
         self._gemv(seq, _Step(1, ()), (-1, "lm"))
 
-    def logits_of(self, x: torch.Tensor) -> torch.Tensor:
+    def logits_of(self, x: np.ndarray) -> np.ndarray:
         """(its header's input: r = x, v and its partial sums zero, so the header's update adds nothing and its norm is
         the output norm of x, as a step's)"""
         rg = self.inp[(-1, "lm")][0]
@@ -462,7 +462,7 @@ class LfmOverlay(ModelOverlay):
         act[o:o + XPAY] = 0
         hx = act[o + XPAY:o + XPAY + 4 * sp * self.H].reshape(self.H // 8, 2, 16 * sp)
         hx[:, 0] = 0
-        hx[:, 1] = interleave(x.reshape(1, -1).float().numpy(), sp).view(np.uint8).reshape(self.H // 8, 16 * sp)
+        hx[:, 1] = interleave(np.asarray(x, np.float32).reshape(1, -1), sp).view(np.uint8).reshape(self.H // 8, 16 * sp)
         self.dev.flush("ACT", o, XPAY + 4 * sp * self.H)
         self.ready()
         self.dev.dispatch(self._tr_lm)
@@ -629,17 +629,17 @@ class LfmOverlay(ModelOverlay):
                 lo, hi = min(self.conv_reg.values()), max(self.conv_reg.values()) + CV.region_bytes()
                 self.dev.flush("ACT", lo, hi - lo)
 
-    def step(self, x: torch.Tensor, position: int, *, logits: bool = True) -> torch.Tensor | None:
+    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
         - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
         until the next step), or without ``logits`` None (only the caches are updated)."""
-        x = x.reshape(-1, self.H).float()
+        x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS
         if self._metas_s != (S, self.start):
             self._metas(S)
         act = self.dev.view("ACT")
-        xf = x.numpy()
+        xf = x
         self._write_loadr(xf)
         sp = packed_slots(S)
         xi = interleave(xf, sp).view(np.uint8).reshape(-1)
@@ -651,7 +651,7 @@ class LfmOverlay(ModelOverlay):
         self.dev.flush("ACT", h0, 4 * sp * self.H)
         return self._run(S, position, logits)
 
-    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
+    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[np.ndarray, np.ndarray]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions of an attention layer: K normed (with its
         weights) and rotated, V as it is."""
         pos = np.asarray(positions)
@@ -663,7 +663,7 @@ class LfmOverlay(ModelOverlay):
             k, v = kv.kv_from_groups(self.dev.view("KV")[b:b + n * self.G * self.T].reshape(n, self.G, self.T), self.hd)
             ks.append(k[pos])
             vs.append(v[pos])
-        return torch.from_numpy(np.stack(ks)), torch.from_numpy(np.stack(vs))
+        return np.stack(ks), np.stack(vs)
 
     def snapshot(self, position: int) -> dict[str, object]:
         """(and the conv histories: each region's rows, the last step's position and slots, ``conv_at``)"""
@@ -691,13 +691,13 @@ class LfmOverlay(ModelOverlay):
         """A conv region's history rows at ACT offset o: (offset in ACT, offset in the rows, bytes) of rows 0 .. 7 and 8, 9."""
         return (o + CV.payload(2), 0, 8 * CV.ROW), (o + CV.payload(1) + 3 * CV.TAP, 8 * CV.ROW, 2 * CV.ROW)
 
-    def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
+    def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream the LM head read in the last step (L = -1), of a slot (bf16 values, fp32): its updated
         residual (``residual``), the output norm's input."""
         assert L == -1, "the LM head's input only"
         return self.residual(slot)
 
-    def read_conv(self, layer: int) -> torch.Tensor:
+    def read_conv(self, layer: int) -> np.ndarray:
         """A conv layer's history (HIST rows, hidden) as the regions hold it (bf16 values as fp32): rows 0 .. 5 the base
         of the last step, then its rows."""
         out = []
@@ -708,22 +708,22 @@ class LfmOverlay(ModelOverlay):
             rows = np.concatenate([reg[CV.payload(2):CV.payload(2) + 8 * CV.ROW],
                                    reg[CV.payload(1) + 3 * CV.TAP:CV.payload(1) + 3 * CV.TAP + 2 * CV.ROW]])
             out.append(rows.view(np.uint16).reshape(CV.HIST, CH))
-        return torch.from_numpy(np.concatenate(out, 1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(np.concatenate(out, 1)).view(bfloat16).astype(np.float32)
 
-    def op_out(self, L: int, slot: int = 0) -> torch.Tensor:
+    def op_out(self, L: int, slot: int = 0) -> np.ndarray:
         """The operator's output of layer L in the last step, of a slot (bf16 values, fp32): the attention's o (heads
         hd, gated) or the conv's y (hidden), the output projection's input."""
         rg, sp = self.inp[(L, "out" if self.kind(L) == "conv" else "o")][0], packed_slots(self._last_s)
         self.dev.fetch("ACT", rg.off + XB, 2 * sp * rg.K)
         v = self.dev.view("ACT")[rg.off + XB:rg.off + XB + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, slot]
-        return torch.from_numpy(v.reshape(-1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
-    def residual(self, slot: int = 0) -> torch.Tensor:
+    def residual(self, slot: int = 0) -> np.ndarray:
         """The last step's residual stream after the last layer (the LM header's update), bf16 values as fp32."""
         off, sp = self.final + XB + XPAY, packed_slots(self._last_s)
         self.dev.fetch("ACT", off, 4 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 4 * sp * self.H].view(np.uint16).reshape(-1, 2, sp, 8)[:, 1, slot]
-        return torch.from_numpy(v.reshape(-1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
 
 __all__ = ["KV_K", "KV_PAD", "LfmOverlay"]

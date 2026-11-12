@@ -20,7 +20,6 @@ import time
 from collections.abc import Callable, Iterator
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite import _native as native
 from artlite.gemm.gemm_q import PACE, PACE_IDLE, pace_word
@@ -116,7 +115,7 @@ def timed_lookups(into: list[float]) -> Iterator[None]:
     """Each GGUFFile.rows call's seconds into ``into`` meanwhile (the host's embedding lookups of a prompt)."""
     rows = GGUFFile.rows
 
-    def wrapped(self: GGUFFile, *args: object, **kw: object) -> torch.Tensor:
+    def wrapped(self: GGUFFile, *args: object, **kw: object) -> np.ndarray:
         t0 = time.perf_counter()
         try:
             return rows(self, *args, **kw)
@@ -256,7 +255,7 @@ def run(path: str, *, step: Callable[[str], None], end: Callable[[str], None], i
     at each pace level (``pace_sweep``) and the calibration (``prefill.pace.calibrate``), whose levels V5 runs at.
     ``step`` / ``end``: the telemetry sampler's (``Sampler.step``, ``Sampler.end``)."""
     out: dict[str, object] = {"file": path, "resident_before": resident(path), "runs": []}
-    rng = torch.Generator().manual_seed(0)
+    rng = np.random.default_rng(0)
     spec = os.environ.get("ARTLITE_PACE")
     os.environ["ARTLITE_PACE"] = "off"  # (the paces the variants run at are set here: none, or V5's calibrated ones)
     try:

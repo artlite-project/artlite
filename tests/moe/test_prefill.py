@@ -53,7 +53,7 @@ def _w_arg(op: object, W: np.ndarray, w_off: int, dev: object) -> object:
 
 def _f32(g: GGUFFile, name: str) -> np.ndarray:
     t = g.tensor(name)
-    return np.asarray(t.dequantize().numpy(), np.float64).reshape(t.rows, t.cols)
+    return np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols)
 
 
 def _unpaced(op: object) -> object:
@@ -82,7 +82,7 @@ def test_router(model: str, L: int) -> None:
     dev = norm.device
     rng = np.random.default_rng(L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
+    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
     xb = artlite.from_numpy(x.reshape(-1), dev)
     xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
     norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
@@ -122,7 +122,7 @@ def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.
     dev = norm.device
     rng = np.random.default_rng(100 + L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
+    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
     xb = artlite.from_numpy(x.reshape(-1), dev)
     xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
     norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
@@ -298,7 +298,7 @@ def test_moe_block(model: str, L: int) -> None:
     dev = lib.device
     rng = np.random.default_rng(10 + L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
+    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
     bufs = {}
 
     def buf(name: str, n: int, init: np.ndarray | None = None) -> object:
@@ -378,7 +378,7 @@ def test_moe_block(model: str, L: int) -> None:
     clear = srt[:, K - 1] - srt[:, K] > 1e-3
     assert (np.sort(ids, 1) == np.sort(rids, 1)).all(1)[clear].all()
     b = f"blk.{L}."
-    shared = ref.shared_expert(xr, *(g.tensor(b + t).dequantize().numpy() for t in
+    shared = ref.shared_expert(xr, *(g.tensor(b + t).dequantize() for t in
                                      ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
                                _f32(g, b + "ffn_gate_inp_shexp.weight")[0])
     want = ref.moe_ffn(xr, ids, w, ref.experts(g, L)) + shared

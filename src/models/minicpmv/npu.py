@@ -15,7 +15,7 @@ import hashlib
 import time
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile
@@ -46,14 +46,14 @@ class NpuVision:
         if self.clip.projector not in PROJECTORS:
             raise NotImplementedError(f"{path}: projector {self.clip.projector!r} (MiniCPM-V 4.7's minicpmv4_7 only)")
         self.max_slices = max_slices or self.clip.max_slices
-        self.sep = self.gguf.rows("v.tok_embd_sep", [0, 1, 2, 3]).numpy()
-        self._kept: collections.OrderedDict[bytes, torch.Tensor] = collections.OrderedDict()
+        self.sep = self.gguf.rows("v.tok_embd_sep", [0, 1, 2, 3])
+        self._kept: collections.OrderedDict[bytes, np.ndarray] = collections.OrderedDict()
         self.t_encode, self.entries = 0.0, 0  # (the encoder's time and entries so far)
         self.encoder = self._load()
 
     def _load(self) -> V.Encoder:
         get, c = gguf_getter(self.gguf), self.clip
-        pos = torch.from_numpy(get("v.position_embd.weight").numpy()).bfloat16()
+        pos = get("v.position_embd.weight").numpy().astype(bfloat16)
         cache = state_dir("minicpmv", self.path, _SOURCES, [self.path])
         srcs = gguf_sources(self.gguf, {"minicpmv.patch": lambda: V.patch_weights(get, c.mean, c.std)["w"]})
         if (got := load_state(cache, srcs)) is not None:
@@ -78,12 +78,12 @@ class NpuVision:
             self._kept.move_to_end(key)
         else:
             t0 = time.perf_counter()
-            self._kept[key] = torch.cat(self.encoder(pixels))
+            self._kept[key] = np.concatenate(self.encoder(pixels))
             self.t_encode += time.perf_counter() - t0
             self.entries += len(pixels)
             if len(self._kept) > KEEP:
                 self._kept.popitem(last=False)
-        return self._kept[key].numpy(), grid
+        return self._kept[key], grid
 
     def sequence(self, image: str | bytes | Image.Image, *, newline_after: bool = True) -> Sequence:
         """An image (a file, its bytes or a PIL image) as the language model's tokens from position 0 (``<image>``

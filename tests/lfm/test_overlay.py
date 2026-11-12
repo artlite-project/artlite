@@ -16,6 +16,7 @@ import torch
 
 from models.lfm.overlay import LfmOverlay
 
+from ..common import to_torch
 from . import ref
 
 VOCAB = 2048
@@ -30,7 +31,7 @@ def _run(ov: LfmOverlay, x: torch.Tensor, steps: tuple[int, ...]) -> torch.Tenso
     while p < x.shape[0]:
         n = min(steps[i % len(steps)], x.shape[0] - p)
         i += 1
-        out[p:p + n] = ov.step(x[p:p + n], p).float()
+        out[p:p + n] = to_torch(ov.step(x[p:p + n], p)).float()
         p += n
     return out
 
@@ -100,7 +101,7 @@ def test_lfm_overlay_steps() -> None:
         acc = int(rng.integers(1, n + 1))
         xs = x[p:p + n].clone()
         xs[acc:] = cpu.emb[torch.from_numpy(rng.integers(0, 120000, n - acc))]
-        got = ov.step(xs, p).float()
+        got = to_torch(ov.step(xs, p)).float()
         assert torch.equal(got[:acc], one[p:p + acc]), p
         p += acc
 

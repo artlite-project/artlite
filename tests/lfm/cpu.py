@@ -45,7 +45,7 @@ class LfmCpu:
         self.run_layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
 
         def w(name: str) -> torch.Tensor:
-            return gguf.tensor(name).dequantize().float()
+            return torch.from_numpy(gguf.tensor(name).dequantize())
 
         def v(name: str) -> torch.Tensor:
             return w(name).reshape(-1)

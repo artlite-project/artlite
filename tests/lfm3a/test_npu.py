@@ -62,7 +62,7 @@ def test_audio_prompt(case: tuple) -> None:
     seq, answer, want = case
     for prefill in (True, False):
         model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(128,))
-        got = torch.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]])
+        got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
         kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
         assert kl < 0.003 and agree > 0.95
         del model
@@ -77,7 +77,7 @@ def test_app_audio_prompt(case: tuple) -> None:
     prompt = app.chat(_messages(clip(NAME)))
     assert np.array_equal(prompt.ids, seq.ids) and np.array_equal(prompt.given, seq.given)
     model = app.load(capacity=1024)
-    got = torch.stack([model.forward(prompt)] + [model.step(t) for t in answer[:-1]])
+    got = torch.from_numpy(np.stack([model.forward(prompt)] + [model.step(t) for t in answer[:-1]]))
     kl, agree = _kl_report("the NPU encoder, prefill", want, got)
     assert kl < 0.004 and agree > 0.95
     model.reset()

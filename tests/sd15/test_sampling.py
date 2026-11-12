@@ -7,7 +7,6 @@ import os
 
 import numpy as np
 import pytest
-import torch
 
 from artlite.model_config import sd15_dir
 from models.sd15.sampling import SAMPLERS, Schedule, cfg_denoiser, sample
@@ -30,7 +29,7 @@ def test_schedule_config() -> None:
     path = os.path.join(sd15_dir(), "scheduler", "scheduler_config.json")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    assert torch.equal(Schedule.from_config(path).log_sigmas, Schedule().log_sigmas)
+    assert np.array_equal(Schedule.from_config(path).log_sigmas, Schedule().log_sigmas)
 
 
 def test_sigmas() -> None:
@@ -46,19 +45,19 @@ def test_sigmas() -> None:
         assert s.sigmas(1, sampler) == [s.sigma(999), 0.0]
 
 
-def _recorded(sampler: str, *, seed: int = 0) -> tuple[torch.Tensor, list[float], list[torch.Tensor], torch.Tensor]:
+def _recorded(sampler: str, *, seed: int = 0) -> tuple[np.ndarray, list[float], list[np.ndarray], np.ndarray]:
     """A sampler run with a denoiser that always answers x0: (x0, sigmas, the x of each step, the result)."""
-    x0 = torch.randn(1, 4, 64, 64, generator=torch.Generator().manual_seed(100))
+    x0 = np.random.default_rng(100).standard_normal((1, 4, 64, 64), np.float32)
     sigmas = Schedule().sigmas(10, sampler)
-    seen: list[torch.Tensor] = []
+    seen: list[np.ndarray] = []
 
-    def denoise(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    def denoise(x: np.ndarray, sigma: float) -> np.ndarray:
         seen.append(x)
         return x0
 
-    gen = torch.Generator().manual_seed(seed)
-    x = x0 + torch.randn(x0.shape, generator=gen) * sigmas[0]
-    return x0, sigmas, seen, sample(denoise, x, sigmas, sampler=sampler, generator=gen)
+    rng = np.random.default_rng(seed)
+    x = x0 + rng.standard_normal(x0.shape, np.float32) * sigmas[0]
+    return x0, sigmas, seen, sample(denoise, x, sigmas, sampler=sampler, rng=rng)
 
 
 @pytest.mark.parametrize("sampler", ["euler", "ddim"])
@@ -67,8 +66,9 @@ def test_deterministic_samplers(sampler: str) -> None:
     x0, sigmas, seen, out = _recorded(sampler)
     assert len(seen) == len(sigmas) - 1
     for s, x in zip(sigmas, seen):
-        torch.testing.assert_close(x - x0, (seen[0] - x0) * (s / sigmas[0]), rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(out, x0)
+        np.testing.assert_allclose(x - x0, (seen[0] - x0) * (s / sigmas[0]), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(out, x0, rtol=1.3e-6, atol=1e-5)
+    assert all(x.dtype == np.float32 for x in seen) and out.dtype == np.float32
 
 
 def test_euler_ancestral() -> None:
@@ -76,29 +76,31 @@ def test_euler_ancestral() -> None:
     x0, sigmas, seen, out = _recorded("euler_a")
     for s, x in zip(sigmas, seen):
         assert float((x - x0).std()) == pytest.approx(s, rel=0.03)
-    torch.testing.assert_close(out, x0)
+    np.testing.assert_allclose(out, x0, rtol=1.3e-6, atol=1e-5)
     again = _recorded("euler_a")[2]
-    assert all(torch.equal(a, b) for a, b in zip(seen, again))
-    assert not torch.equal(_recorded("euler_a", seed=1)[2][2], seen[2])
+    assert all(np.array_equal(a, b) for a, b in zip(seen, again))
+    assert not np.array_equal(_recorded("euler_a", seed=1)[2][2], seen[2])
 
 
 def test_unknown_sampler() -> None:
     with pytest.raises(ValueError, match="sampler"):
-        sample(lambda x, s: x, torch.zeros(1), [1.0, 0.0], sampler="heun")
+        sample(lambda x, s: x, np.zeros(1, np.float32), [1.0, 0.0], sampler="heun")
 
 
 def test_cfg_denoiser() -> None:
     s = Schedule()
-    context = torch.randn(2, 77, 768)
+    rng = np.random.default_rng(0)
+    context = rng.standard_normal((2, 77, 768), np.float32)
     calls = []
 
-    def unet(x: torch.Tensor, t: float, ctx: torch.Tensor) -> torch.Tensor:
+    def unet(x: np.ndarray, t: float, ctx: np.ndarray) -> np.ndarray:
         calls.append((x, t, ctx))
-        return torch.cat([torch.full_like(x[:1], 1.0), torch.full_like(x[:1], 3.0)])  # [uncond, cond]
+        return np.concatenate([np.full_like(x[:1], 1.0), np.full_like(x[:1], 3.0)])  # [uncond, cond]
 
-    x, sigma, scale = torch.randn(1, 4, 64, 64), 5.0, 7.5
+    x, sigma, scale = rng.standard_normal((1, 4, 64, 64), np.float32), 5.0, 7.5
     out = cfg_denoiser(unet, s, context, scale)(x, sigma)
     xin, t, ctx = calls[0]
-    torch.testing.assert_close(xin, torch.cat([x, x]) / math.sqrt(sigma ** 2 + 1))
+    np.testing.assert_allclose(xin, np.concatenate([x, x]) / math.sqrt(sigma ** 2 + 1), rtol=1.3e-6)
     assert t == s.timestep(sigma) and ctx is context
-    torch.testing.assert_close(out, x - sigma * (1.0 + scale * 2.0))
+    np.testing.assert_allclose(out, x - sigma * (1.0 + scale * 2.0), rtol=1.3e-6, atol=1e-5)
+    assert out.dtype == np.float32

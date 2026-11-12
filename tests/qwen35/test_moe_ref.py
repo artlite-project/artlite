@@ -35,14 +35,14 @@ def test_moe_block(gold: tuple[GGUFFile, ref.Golden], L: int) -> None:
     g, G = gold
     b = f"blk.{L}."
     x = np.asarray(G["attn_post_norm", L], np.float32)
-    wr = g.tensor(b + "ffn_gate_inp.weight").dequantize().numpy()
+    wr = g.tensor(b + "ffn_gate_inp.weight").dequantize()
     assert ref.rel_err(x @ wr.T, G["ffn_moe_logits", L]) < 2e-5
     ids, w = ref.moe_route(G["ffn_moe_logits", L], int(g.arch_meta("expert_used_count")))
     assert np.array_equal(ids, G["ffn_moe_topk", L])
     assert ref.rel_err(w, G["ffn_moe_weights_norm", L]) < 2e-5
     moe = ref.moe_ffn(x, ids, w, ref.experts(g, L))
-    shared = ref.shared_expert(x, *(g.tensor(b + f"ffn_{n}_shexp.weight").dequantize().numpy() for n in ("gate", "up", "down")),
-                               g.tensor(b + "ffn_gate_inp_shexp.weight").dequantize().numpy()[0])
+    shared = ref.shared_expert(x, *(g.tensor(b + f"ffn_{n}_shexp.weight").dequantize() for n in ("gate", "up", "down")),
+                               g.tensor(b + "ffn_gate_inp_shexp.weight").dequantize()[0])
     assert ref.rel_err(moe, G["ffn_moe_out", L]) < 3e-2
     assert ref.rel_err(shared, G["ffn_shexp_gated", L]) < 3e-2
     out = np.asarray(G["attn_residual", L]) + G["ffn_moe_out", L] + G["ffn_shexp_gated", L]

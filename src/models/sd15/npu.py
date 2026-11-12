@@ -13,15 +13,14 @@ import json
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 
-import torch  # noqa: TID251
+import numpy as np
 
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
 from artlite.vision.weights import Source, safetensors, sources
 
-from . import reference
 from .host import resnet_time_biases
 from .model import UNet
-from .vae import Decoder, latent_conv_in
+from .vae import EPS, Decoder, latent_conv_in
 from .weights import load_safetensors
 
 FILE = "diffusion_pytorch_model.safetensors"
@@ -44,7 +43,7 @@ class NpuUNet:
             self.net.npu.warm()
         else:  # (a restored device's: ``load``)
             self.net = UNet.restored(npu, self.w, state)
-        self.context: torch.Tensor | None = None
+        self.context: np.ndarray | None = None
         self.pool = ThreadPoolExecutor(8)  # (the time biases' projections)
         self.worker = ThreadPoolExecutor(1)  # (the steps' time biases ahead of them: ``prepare``)
         self.biases: dict[float, Future] = {}
@@ -55,12 +54,12 @@ class NpuUNet:
             if t not in self.biases:
                 self.biases[t] = self.worker.submit(resnet_time_biases, self.w, t, pool=self.pool)
 
-    def __call__(self, x: torch.Tensor, t: float, context: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: np.ndarray, t: float, context: np.ndarray) -> np.ndarray:
         f = self.biases.pop(t, None)
         self.net.set_time(f.result() if f else resnet_time_biases(self.w, t, pool=self.pool))
-        if self.context is None or not torch.equal(self.context, context):
+        if self.context is None or not np.array_equal(self.context, context):
             self.net.set_context(context, pool=self.pool)
-            self.context = context.clone()
+            self.context = np.array(context, np.float32)
         return self.net(x)
 
 
@@ -71,20 +70,20 @@ class NpuVae:
     def __init__(self, directory: str, npu: VisionDevice, *, state: dict | None = None):
         if state is None:
             w, scale = vae_weights(directory)
-            self.dec = Decoder(npu, w, scale=scale, eps=reference.VaeDecoder.EPS)
+            self.dec = Decoder(npu, w, scale=scale, eps=EPS)
             npu.warm()
         else:  # (a restored device's: ``load``)
             self.dec = Decoder.restored(npu, state)
 
-    def __call__(self, latents: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.dec(latents[i:i + 1]) for i in range(latents.shape[0])])
+    def __call__(self, latents: np.ndarray) -> np.ndarray:
+        return np.concatenate([self.dec(latents[i:i + 1]) for i in range(latents.shape[0])])
 
 
 # (what the cache's key covers besides the model's files: the code that builds the images and the transactions)
 _SOURCES = ("artlite/vision", "models/sd15/unet.py", "models/sd15/level64.py", "models/sd15/model.py",
             "models/sd15/vae.py", "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
             "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/overlay.py",
-            "models/sd15/npu.py", "models/sd15/reference.py", "models/sd15/weights.py")
+            "models/sd15/npu.py", "models/sd15/weights.py")
 
 
 def vae_weights(directory: str) -> tuple[dict, float]:

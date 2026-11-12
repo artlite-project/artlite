@@ -245,10 +245,10 @@ def test_pack_moe() -> None:
             for name, ref, base in ((b + "ffn_gate_exps.weight", gate, 0), (b + "ffn_up_exps.weight", up, E * F)):
                 idx = rows[(rows >= base) & (rows < base + E * F)] - base
                 assert np.array_equal(np.sort(idx), e * F + h * F // 2 + np.arange(F // 2))
-                assert np.array_equal(g.rows(name, idx).numpy(), ref[idx - e * F])
+                assert np.array_equal(g.rows(name, idx), ref[idx - e * F])
             v = dn.rows[2 * e + h]
             o = np.flatnonzero(v >= 0)
-            got = QTensor(name="d", qtype=dview.qtype, rows=o.size, cols=F // 2, raw=dview.raw[v[o]]).dequantize().numpy()
+            got = QTensor(name="d", qtype=dview.qtype, rows=o.size, cols=F // 2, raw=dview.raw[v[o]]).dequantize()
             want = down[_group_out(v.size, dn.R, 4)[o], h * F // 2:(h + 1) * F // 2]
             assert np.array_equal(got, want), (L, e, h)
 

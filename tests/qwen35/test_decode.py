@@ -834,11 +834,11 @@ def test_overlay_slice(size: str, mode: str) -> None:
                           "s7": (min(7, n - t), True, min(7, n - t)), "lazy8": (min(8, n - t), False, min(3, n - t))}[mode]
         x = ov.gguf.rows("token_embd.weight", tokens[t:t + S])
         if t == 0:
-            assert np.array_equal(x[0].numpy(), np.asarray(G_["model.input_embed"][0], np.float32))
+            assert np.array_equal(x[0], np.asarray(G_["model.input_embed"][0], np.float32))
         ov.step(x, t, logits=False, commit=commit)
         for s in range(acc):
             for i, L in enumerate(layers):
-                got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1, slot=s).numpy()
+                got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1, slot=s)
                 errs[t + s, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t + s], np.float32))
         ov.accept(acc)
         t += acc
@@ -875,7 +875,7 @@ def test_moe_slice(first: int) -> None:
         x = G_["model.input_embed"][t] if first == 0 else G_["l_out", first - 1][t]
         ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
-            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1).numpy()
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
             errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
             o = ov.xch[L] + 4 * OD.META  # (the route object's payload: [slot][expert] fp32)
             ov.dev.fetch("ACT", o, 4 * E)
@@ -916,7 +916,7 @@ def test_dense_slice(first: int) -> None:
     for t in range(n):
         ov.step(torch.from_numpy(np.asarray(G_["l_out", first - 1][t], np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
-            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1).numpy()
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
             errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
     print(f"layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.4f}")
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
@@ -938,7 +938,7 @@ def test_lm_head(size: str) -> None:
     ov = QwenOverlay(g, layers=[L], max_positions=64)
     ov.load(release=False)
     for t in range(T):
-        got = ov.logits_of(torch.from_numpy(np.asarray(G_["l_out", L][t], np.float32).copy())).float().numpy()
+        got = ov.logits_of(np.asarray(G_["l_out", L][t], np.float32)).astype(np.float32)
         want = np.asarray(G_.logits[t], np.float32)
         assert got.shape == want.shape and int(got.argmax()) == int(want.argmax()), t
         assert ref.rel_err(got, want) < 2e-2, (t, ref.rel_err(got, want))
@@ -1002,12 +1002,12 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
             assert it[0] == e | h0 << 8 | h1 << 9
             assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (c, i)
     ex = ref.experts(g, L)
-    shared = ref.shared_expert(xn, *(g.tensor(b + t).dequantize().numpy() for t in
+    shared = ref.shared_expert(xn, *(g.tensor(b + t).dequantize() for t in
                                      ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
                                np.asarray(g.tensor(b + "ffn_gate_inp_shexp.weight").raw, np.float32).reshape(-1))
     want = xin + ref.moe_ffn(xn, rids, rw, ex) + shared
     for s in range(S):
-        got = ov.hidden(-1, slot=s).numpy()
+        got = ov.hidden(-1, slot=s)
         assert ref.rel_err(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, ref.rel_err(got, want[s]))
 
 

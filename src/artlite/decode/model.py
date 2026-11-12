@@ -15,11 +15,13 @@ step's transaction (``_build``), its sub-steps (``subs``, repeating every ``peri
 (``cache_rows``) and rings (``rings``).
 """
 
+import math
+import mmap
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from ..formats import has_tile_format, tile_format
 from ..gguf_model import GGUFFile
@@ -79,8 +81,10 @@ class InputRegion:
 def host_bytes(shape: tuple[int, ...]) -> np.ndarray:
     """An uninitialized uint8 host array in 4 KB pages: numpy asks for huge pages for large arrays, and when RAM runs
     short of free pages (a model's file in the page cache) the kernel compacts memory for them first - a copy of
-    600 MB then takes ~1 s instead of ~0.15 s."""
-    return torch.empty(shape, dtype=torch.uint8).numpy()
+    600 MB then takes ~1 s instead of ~0.15 s. (An anonymous mapping: no madvise, so no huge pages unless the system
+    makes every mapping huge.)"""
+    n = math.prod(shape)
+    return np.frombuffer(mmap.mmap(-1, max(n, 1)), np.uint8)[:n].reshape(shape)
 
 
 @dataclass(eq=False)
@@ -425,11 +429,11 @@ class ModelOverlay:
         self.dev.view("ACT")[rg.off + XB:rg.off + XB + xi.size] = xi
         self.dev.flush("ACT", rg.off + XB, xi.size)
 
-    def _logits(self, S: int) -> torch.Tensor:
+    def _logits(self, S: int) -> np.ndarray:
         """The last step's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next dispatch): the
         LM rows of the vocabulary (an image's rows padded to whole C objects per column are cut off)."""
         self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
-        x = torch.from_numpy(self.dev.view("LOGITS")[:2 * S * self.vocab]).view(torch.bfloat16).reshape(S, self.vocab)
+        x = self.dev.view("LOGITS")[:2 * S * self.vocab].view(bfloat16).reshape(S, self.vocab)
         return x[:, :min(self.vocab, self.cfg.vocab_size)]
 
     def _clear_pads(self, sp: int) -> None:
@@ -450,7 +454,7 @@ class ModelOverlay:
                 self.dev.flush("ACT", a, b - a)
         self._dirty = (self._dirty - {sp}) | {self._sp(s) for s in range(1, self.SLOTS + 1) if self._sp(s) < sp}
 
-    def _run(self, S: int, position: int, logits: bool) -> torch.Tensor | None:
+    def _run(self, S: int, position: int, logits: bool) -> np.ndarray | None:
         """Dispatch the step of S slots at ``position`` (its inputs written): its transaction (built at its first use),
         patched (or patched ahead, while the previous step ran: ``AHEAD``); then, while it runs, the next step's (S slots
         at position + S, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or
@@ -482,7 +486,7 @@ class ModelOverlay:
         """The LM head's phase alone for one slot (``logits_of``): its weights, input fills, logits drains."""
         raise NotImplementedError
 
-    def logits_of(self, x: torch.Tensor) -> torch.Tensor:
+    def logits_of(self, x: np.ndarray) -> np.ndarray:
         """The LM head alone (one dispatch): the logits (vocab) bf16 of a last layer's output x (hidden), e.g. a
         prompt's last token from the prefill (a view of the NPU's buffer, valid until the next dispatch)."""
         rg = self.inp[(-1, "lm")][0]
@@ -495,7 +499,7 @@ class ModelOverlay:
             seq.sync(fills=True)
             self._tr_lm = Transaction(self.dev, seq.words())
         self._clear_pads(self._sp(1))
-        self._write_input(rg, interleave(x.reshape(1, -1).float().numpy(), self._sp(1)).view(np.uint8).reshape(-1))
+        self._write_input(rg, interleave(np.asarray(x, np.float32).reshape(1, -1), self._sp(1)).view(np.uint8).reshape(-1))
         self.ready()
         self.dev.dispatch(self._tr_lm)
         return self._logits(1)[0]

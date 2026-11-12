@@ -24,12 +24,12 @@ import json
 import math
 from collections.abc import Callable
 
-import torch  # noqa: TID251
+import numpy as np
 
 SAMPLERS = ("euler_a", "euler", "ddim")
 
 # denoise(x, sigma): the denoised estimate of latents x at noise level sigma
-Denoise = Callable[[torch.Tensor, float], torch.Tensor]
+Denoise = Callable[[np.ndarray, float], np.ndarray]
 
 
 class Schedule:
@@ -37,9 +37,9 @@ class Schedule:
     sigmas of a sampler's steps."""
 
     def __init__(self, *, beta_start: float = 0.00085, beta_end: float = 0.012, timesteps: int = 1000):
-        betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, timesteps, dtype=torch.float64) ** 2
-        alpha_bar = torch.cumprod(1 - betas, 0)
-        self.log_sigmas = ((1 - alpha_bar) / alpha_bar).sqrt().log()
+        betas = np.linspace(beta_start ** 0.5, beta_end ** 0.5, timesteps) ** 2
+        alpha_bar = np.cumprod(1 - betas)
+        self.log_sigmas = np.log(np.sqrt((1 - alpha_bar) / alpha_bar))
 
     @classmethod
     def from_config(cls, path: str) -> Schedule:
@@ -59,7 +59,7 @@ class Schedule:
         lo = math.floor(t)
         hi = min(lo + 1, self.timesteps - 1)
         w = t - lo
-        return float(((1 - w) * self.log_sigmas[lo] + w * self.log_sigmas[hi]).exp())
+        return float(np.exp((1 - w) * self.log_sigmas[lo] + w * self.log_sigmas[hi]))
 
     def timestep(self, sigma: float) -> float:
         """The fractional timestep of a sigma (log sigma interpolated between the two timesteps around it)."""
@@ -79,9 +79,9 @@ class Schedule:
         return [self.sigma(t) for t in ts] + [0.0]
 
 
-def sample(denoise: Denoise, x: torch.Tensor, sigmas: list[float], *, sampler: str,
-           generator: torch.Generator | None = None, callback: Callable[[int], None] | None = None) -> torch.Tensor:
-    """Run a sampler from latents ``x`` at ``sigmas[0]`` down the sigmas; ``generator``: euler_a's noise;
+def sample(denoise: Denoise, x: np.ndarray, sigmas: list[float], *, sampler: str,
+           rng: np.random.Generator | None = None, callback: Callable[[int], None] | None = None) -> np.ndarray:
+    """Run a sampler from latents ``x`` (fp32) at ``sigmas[0]`` down the sigmas; ``rng``: euler_a's noise;
     ``callback(i)`` after step i."""
     if sampler not in SAMPLERS:
         raise ValueError(f"unknown sampler {sampler!r} (samplers: {', '.join(SAMPLERS)})")
@@ -90,7 +90,7 @@ def sample(denoise: Denoise, x: torch.Tensor, sigmas: list[float], *, sampler: s
         if sampler == "euler_a" and sn > 0:
             up = min(sn, math.sqrt(sn ** 2 * (s ** 2 - sn ** 2) / s ** 2))
             down = math.sqrt(sn ** 2 - up ** 2)
-            x = x + d * (down - s) + torch.randn(x.shape, generator=generator) * up
+            x = x + d * (down - s) + rng.standard_normal(x.shape, np.float32) * up
         else:
             x = x + d * (sn - s)
         if callback is not None:
@@ -98,14 +98,14 @@ def sample(denoise: Denoise, x: torch.Tensor, sigmas: list[float], *, sampler: s
     return x
 
 
-def cfg_denoiser(unet: Callable[[torch.Tensor, float, torch.Tensor], torch.Tensor], schedule: Schedule,
-                 context: torch.Tensor, scale: float) -> Denoise:
+def cfg_denoiser(unet: Callable[[np.ndarray, float, np.ndarray], np.ndarray], schedule: Schedule,
+                 context: np.ndarray, scale: float) -> Denoise:
     """``denoise`` of an eps-predicting UNet with classifier-free guidance: ``unet(x, t, context)`` runs the batch
     [uncond, cond] (``context`` (2, 77, 768) in that order)."""
 
-    def denoise(x: torch.Tensor, sigma: float) -> torch.Tensor:
-        eps = unet(torch.cat([x, x]) * (1.0 / math.sqrt(sigma ** 2 + 1)), schedule.timestep(sigma), context)
-        uncond, cond = eps.chunk(2)
+    def denoise(x: np.ndarray, sigma: float) -> np.ndarray:
+        eps = unet(np.concatenate([x, x]) * (1.0 / math.sqrt(sigma ** 2 + 1)), schedule.timestep(sigma), context)
+        uncond, cond = np.split(eps, 2)
         return x - sigma * (uncond + scale * (cond - uncond))
 
     return denoise

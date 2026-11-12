@@ -22,7 +22,7 @@ model's W), its KV cache DKV.
 from types import SimpleNamespace
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
 from artlite.prefill import gemm as PG
@@ -126,7 +126,7 @@ class DraftPrefill:
         d, b = self.d, f"blk.{self.L}."
         w = [d._f32(b + "nextn.enorm.weight"), ov._f32("output_norm.weight"), d._f32(b + "nextn.hnorm.weight"),
              d._f32(b + "attn_norm.weight")]
-        pdn = torch.from_numpy(np.concatenate(w)).bfloat16().view(torch.uint8).numpy()
+        pdn = np.concatenate(w).astype(bfloat16).view(np.uint8)
         dev.view("PDN")[:pdn.size] = pdn
         dev.flush("PDN")
         o = self.pf.qn_off[self.L]
@@ -142,18 +142,17 @@ class DraftPrefill:
         dev.view("DY")[o:o + self.carry.size] = self.carry
         dev.flush("DY", o, self.carry.size)
 
-    def carry_of(self, h: torch.Tensor) -> None:
+    def carry_of(self, h: np.ndarray) -> None:
         """The carry of a chunk after decode steps (not after a chunk): eh_proj's hnorm half of hnorm(h), h (hidden,) the
         model's output-normed hidden state of the position before the chunk."""
         if self._w_h is None:
             g = self.d.gguf
-            w = g.tensor(f"blk.{self.L}.nextn.eh_proj.weight").dequantize().numpy().reshape(self.H, 2 * self.H)
+            w = g.tensor(f"blk.{self.L}.nextn.eh_proj.weight").dequantize().reshape(self.H, 2 * self.H)
             self._w_h = np.ascontiguousarray(w[:, self.H:])
-        x = h.float().numpy().astype(np.float32)
+        x = np.asarray(h, np.float32)
         x = x / np.sqrt((x * x).mean(dtype=np.float32) + np.float32(self.eps)) * self.d._f32(
             f"blk.{self.L}.nextn.hnorm.weight")
-        y = torch.from_numpy(self._w_h @ x).bfloat16()
-        self.carry[:] = y.view(torch.uint8).numpy()
+        self.carry[:] = (self._w_h @ x).astype(bfloat16).view(np.uint8)
 
     def after(self, dev: object, n: int) -> None:
         """The next chunk's carry: this one's projection of its last valid row's h; the drafter's cache records of the

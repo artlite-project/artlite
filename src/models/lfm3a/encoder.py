@@ -37,7 +37,6 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS, ROWS
@@ -100,19 +99,19 @@ def rope2_tables(pos: np.ndarray) -> np.ndarray:
     b[:, 40:] = 0
     b[:, :8], b[:, 40:48] = np.cos(ang[:, 40:]), np.sin(ang[:, 40:])
     out = np.zeros(ROPE2_TAB, np.uint8)
-    out[:2560], out[2560:] = L.ctiles(torch.from_numpy(a), 16)[:2560], L.ctiles(torch.from_numpy(b), 16)[:2560]
+    out[:2560], out[2560:] = L.ctiles(a, 16)[:2560], L.ctiles(b, 16)[:2560]
     return out
 
 
 # -- weights
 
 
-def vec(get: Callable[[str], Wt | torch.Tensor], name: str, n: int = C) -> torch.Tensor:
+def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
     """A vector of the file (a norm's weights, a bias), zero-padded to n."""
-    return pad(torch.as_tensor(values(get(name))).float().reshape(-1), n)
+    return pad(values(get(name)).reshape(-1), n)
 
 
-def residual_order(get: Callable[[str], Wt | torch.Tensor], kinds: tuple[str, ...]) -> np.ndarray:
+def residual_order(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...]) -> np.ndarray:
     """The residual's channel order (C entries: HF's channel, -1 a pad): the ``ISOLATED`` largest channels each in a bfp16
     block of its own after the others (the RMSNorms' panels: a block's 8 channels share an exponent, and the residual
     has a few channels 10 - 30x the rest, ~20 after the final norm: in a shared block they leave the others ~5 bits).
@@ -135,12 +134,12 @@ def residual_order(get: Callable[[str], Wt | torch.Tensor], kinds: tuple[str, ..
     return np.array(order + [-1] * (C - KR), np.int64)
 
 
-def rvec(get: Callable[[str], Wt | torch.Tensor], name: str, order: np.ndarray) -> torch.Tensor:
+def rvec(get: Callable[[str], Wt | np.ndarray], name: str, order: np.ndarray) -> np.ndarray:
     """A residual-ordered vector of the file (``residual_order``)."""
-    return take(torch.as_tensor(values(get(name))).float().reshape(-1), order)
+    return take(values(get(name)).reshape(-1), order)
 
 
-def layer_weights(get: Callable[[str], Wt | torch.Tensor], il: int, kind: str, order: np.ndarray) -> dict:
+def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str, order: np.ndarray) -> dict:
     """Layer il's padded weights by role, the residual's channels in ``order`` (``residual_order``: the norms' weights,
     the residual writers' rows, the norm panels' readers' columns, K 832): "ln1", "ln2" (RMSNorm weights), "gu" ([up |
     gate] rows), "down" (K 1792); a conv layer's "bx" ([B | x] rows, each padded to 960), "c", "taps" (960, 3), "out" (K
@@ -177,7 +176,7 @@ def kinds_of(names: object, layers: int) -> tuple[str, ...]:
     return tuple("conv" if f"a.blk.{il}.conv_dw.weight" in names else "attn" for il in range(layers))
 
 
-def down_weights(get: Callable[[str], Wt | torch.Tensor], order: np.ndarray) -> dict:
+def down_weights(get: Callable[[str], Wt | np.ndarray], order: np.ndarray) -> dict:
     """The downsampler's weights: "in" (stage 1: 320 rows of K 16: taps 3 dy + dx (dy the frequency's), then the bias at
     input 9), "mid_taps" / "end_taps" (256, 9) and their biases, "mid" / "end" (the 1 x 1 convs, 320 x 256) and their
     biases, "out" (lin_out: K 4096 in order f 256 + c, rows 960) and its bias."""
@@ -197,7 +196,7 @@ def down_weights(get: Callable[[str], Wt | torch.Tensor], order: np.ndarray) -> 
     return out
 
 
-def weights(get: Callable[[str], Wt | torch.Tensor], kinds: tuple[str, ...], proj: int) -> dict:
+def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...], proj: int) -> dict:
     """Every padded weight of the encoder (``layer_weights`` per layer, ``down_weights`` as "down", the final norm
     "post", the projector's LayerNorm "pg" / "pb", its GEMMs "up" / "dn" and biases), as ``get`` gives them (views of the
     file), never materialized."""
@@ -258,7 +257,7 @@ class Net:
         return {c: ColOps(fills=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * per_col + off, nbytes, None))])
                 for c in range(COLS)}
 
-    def rms(self, bd: Builder, x: Tensor, n: Tensor, g: torch.Tensor, name: str, rec: int) -> None:
+    def rms(self, bd: Builder, x: Tensor, n: Tensor, g: np.ndarray, name: str, rec: int) -> None:
         ln(bd, x, n, g, None, name=name, rec=rec, C=C, H=H, eps=EPS, mode="rms")
 
     # -- the downsampler
@@ -705,7 +704,7 @@ class Encoder:
         raw = self.npu.read(f"{p}.emb", COLS * lv.ct(OUT_W)).reshape(COLS, -1)
         out = np.empty((ROWS_BAND, self.proj), np.float32)
         for c in range(COLS):
-            out[tokens(c)] = L.from_ctiles(raw[c], 64, OUT_W, 64).numpy()[:, :self.proj]
+            out[tokens(c)] = L.from_ctiles(raw[c], 64, OUT_W, 64)[:, :self.proj]
         return out
 
     def __call__(self, mel: np.ndarray) -> np.ndarray:

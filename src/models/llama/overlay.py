@@ -37,7 +37,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.decode import gemv, kv
 from artlite.decode.attn import (
@@ -440,21 +440,21 @@ class LlamaOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: torch.Tensor, position: int, *, logits: bool = True) -> torch.Tensor | None:
+    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
         - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
         until the next step), or without ``logits`` None (only the caches are updated)."""
-        x = x.reshape(-1, self.H).float()
+        x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS
         if self._metas_s != (S, self.start):
             self._metas(S)
-        xf = x.numpy()
+        xf = x
         self._write_loadr(xf)
         self._write_input(self.inp[(self.layers[0], "qkv")][0], interleave(xf, packed_slots(S)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
-    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
+    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[np.ndarray, np.ndarray]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions: K rotated, V as it is."""
         pos = np.asarray(positions)
         n, G, T = int(pos.max()) // self.pg + 1, self.rec.objects, self.T  # (the groups that hold the positions)
@@ -465,22 +465,22 @@ class LlamaOverlay(ModelOverlay):
             k, v = kv.kv_from_groups(self.dev.view("KV")[b:b + n * G * T].reshape(n, G, T), self.hd)
             ks.append(k[pos])
             vs.append(v[pos])
-        return torch.from_numpy(np.stack(ks)), torch.from_numpy(np.stack(vs))
+        return np.stack(ks), np.stack(vs)
 
-    def hidden(self, L: int = -1, slot: int = 0) -> torch.Tensor:
+    def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream that layer L's qkv phase (-1: the LM head) read in the last step, of a slot (its bf16
         copy, as fp32)."""
         rg, sp = self.inp[(L, "lm" if L < 0 else "qkv")][0], packed_slots(self._last_s)
         self.dev.fetch("ACT", rg.off + XB, 2 * sp * self.H)
         v = self.dev.view("ACT")[rg.off + XB:rg.off + XB + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, slot]
-        return torch.from_numpy(v.reshape(-1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
-    def attn_out(self, L: int, slot: int = 0) -> torch.Tensor:
+    def attn_out(self, L: int, slot: int = 0) -> np.ndarray:
         """The attention's output o (heads hd) of layer L in the last step, of a slot (bf16 values, fp32)."""
         rg, sp = self.inp[(L, "o")][0], packed_slots(self._last_s)
         self.dev.fetch("ACT", rg.off + XB, 2 * sp * rg.K)
         v = self.dev.view("ACT")[rg.off + XB:rg.off + XB + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, slot]
-        return torch.from_numpy(v.reshape(-1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
 
 __all__ = ["KV_K", "KV_PAD", "LlamaOverlay", "check_formats"]

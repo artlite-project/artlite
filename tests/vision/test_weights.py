@@ -9,6 +9,7 @@ import struct
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.operators import bfp16
 from artlite.vision import design as D
@@ -23,7 +24,7 @@ def slot_ref(g: Gemm, w: np.ndarray, row: int) -> np.ndarray:
     (``Gemm._rows``), a conv's k-tiles per chunk of 64 input channels its taps (``tap_order``), K padded to whole
     k-tiles; per pass its k-tiles [16-row block 5][k-step 8][half 2][row 8][9 B] (hilo: the hi planes' k-tiles, then
     the lo ones: lo = bfp16(w - hi))."""
-    ws = np.asarray(w, np.float32)[g._rows(row).numpy()]
+    ws = np.asarray(w, np.float32)[g._rows(row)]
     if g.conv:
         t = ws.reshape(-1, g.nch, 64, 3, 3).transpose(0, 1, 3, 4, 2)  # (n, chunk, dy, dx, k)
         ws = np.stack([np.stack([t[:, c, dy, dx] for dy, dx in g.tap_order(c)], 1) for c in range(g.nch)],
@@ -40,7 +41,7 @@ def slot_ref(g: Gemm, w: np.ndarray, row: int) -> np.ndarray:
     return np.concatenate(out, 1).reshape(-1)
 
 
-def packed(g: Gemm, w: W.Wt | torch.Tensor) -> list[np.ndarray]:
+def packed(g: Gemm, w: W.Wt | np.ndarray) -> list[np.ndarray]:
     """Every core row's image of g by the native packer."""
     per = g.npo * g.nkt * D.Q
     s = W.Slots()
@@ -50,7 +51,7 @@ def packed(g: Gemm, w: W.Wt | torch.Tensor) -> list[np.ndarray]:
     return [out[r * per:(r + 1) * per] for r in range(ROWS)]
 
 
-def check(g: Gemm, w: W.Wt | torch.Tensor) -> None:
+def check(g: Gemm, w: W.Wt | np.ndarray) -> None:
     vals = W.values(w)
     for r, img in enumerate(packed(g, w)):
         ref = slot_ref(g, vals, r)
@@ -66,7 +67,7 @@ def source(kind: str, x: np.ndarray, name: str = "t") -> W.Wt:
     elif kind == "F16":
         raw = x.reshape(r, c).astype(np.float16).view(np.uint8)
     elif kind == "BF16":
-        raw = (torch.from_numpy(x.reshape(r, c)).bfloat16().view(torch.int16).numpy()).view(np.uint8)
+        raw = x.reshape(r, c).astype(bfloat16).view(np.uint8)
     else:
         b = x.reshape(r, c // 32, 32)
         d = (np.abs(b).max(-1) / 127).astype(np.float16)
@@ -144,8 +145,8 @@ def test_wt_ops() -> None:
     torch.testing.assert_close(torch.from_numpy(two.numpy()), torch.cat([t[:2], t[5:]]), rtol=0, atol=0)
     assert len(two.parts) == 1  # (one source's rows: one part)
     idx = np.array([1, -1, 0])
-    torch.testing.assert_close(torch.from_numpy(W.take(w, idx, 1).numpy()), W.take(t, idx, 1), rtol=0, atol=0)
-    torch.testing.assert_close(torch.from_numpy(W.take(w, idx, 0).numpy()), W.take(t, idx, 0), rtol=0, atol=0)
+    torch.testing.assert_close(torch.from_numpy(W.take(w, idx, 1).numpy()), torch.from_numpy(W.take(t, idx, 1)), rtol=0, atol=0)
+    torch.testing.assert_close(torch.from_numpy(W.take(w, idx, 0).numpy()), torch.from_numpy(W.take(t, idx, 0)), rtol=0, atol=0)
     assert w[1:3].key == w[1:3].key and w[1:3].key != w[1:4].key
 
 
@@ -166,7 +167,7 @@ def test_files(tmp_path: object) -> None:
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", len(h)) + h + blob)
     st = W.safetensors(path)
-    assert isinstance(st["c"], torch.Tensor) and np.array_equal(st["c"].numpy(), arrays["c"])
+    assert isinstance(st["c"], np.ndarray) and np.array_equal(st["c"], arrays["c"])
     assert np.array_equal(st["a"].numpy(), arrays["a"]) and np.array_equal(st["b"].numpy(), arrays["b"].astype(np.float32))
     assert st["a"].parts[0].source.file[0] == path
     check(Gemm(m=64, ntile=1, K=64, N=320, x=0, y=0, conv=1, R=1, Lg=4), st["a"])

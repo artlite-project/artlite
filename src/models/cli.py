@@ -40,7 +40,7 @@ from .common import (
     template_option,
 )
 from .lfm3a.host import asr_system
-from .sd15.pipeline import BACKENDS, check_request
+from .sd15.pipeline import check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
 
@@ -117,7 +117,6 @@ def arg_parser() -> argparse.ArgumentParser:
     img.add_argument("-o", "--output", default="output.png", help="the PNG file to write (default: output.png)")
     img.add_argument("-W", "--width", type=int, default=512, help="image width (512 only for now)")
     img.add_argument("-H", "--height", type=int, default=512, help="image height (512 only for now)")
-    img.add_argument("--backend", choices=BACKENDS, default="npu", help="what runs the networks (default: npu)")
     return p
 
 
@@ -140,10 +139,10 @@ def generate_image(args: argparse.Namespace) -> None:
     try:
         check_request(width=args.width, height=args.height, steps=args.steps)
         text = prompt_text(args)
-        sd = open_pipeline(args.model, backend=args.backend)
+        sd = open_pipeline(args.model)
     except (OSError, ValueError, NotImplementedError) as e:
         sys.exit(f"artlite-cli: {e}")
-    sys.stderr.write(f"{name} ({sd.name}, {args.backend} backend): loaded in {time.perf_counter() - t0:.1f} s\n")
+    sys.stderr.write(f"{name} ({sd.name}): loaded in {time.perf_counter() - t0:.1f} s\n")
     tty = sys.stderr.isatty()
 
     def progress(step: int, steps: int) -> None:

@@ -9,35 +9,37 @@ CFG batch share t, so a step needs one vector per resnet (out channels,), whatev
 import math
 from concurrent.futures import Executor
 
-import torch  # noqa: TID251
-import torch.nn.functional as F  # noqa: TID251
+import numpy as np
 
 TIME_CHANNELS = 320  # the sinusoidal embedding's width (block_out_channels[0])
 
 
-def timestep_embedding(t: float, dim: int = TIME_CHANNELS) -> torch.Tensor:
+def silu(x: np.ndarray) -> np.ndarray:
+    return x / (1 + np.exp(-x))
+
+
+def timestep_embedding(t: float, dim: int = TIME_CHANNELS) -> np.ndarray:
     """The sinusoidal embedding (dim,) fp32 of a (fractional) timestep: cos(t f_i), then sin(t f_i), f_i =
     10000^(-i / (dim / 2)) (diffusers' flip_sin_to_cos, freq_shift 0)."""
     half = dim // 2
-    e = float(t) * torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
-    return torch.cat([torch.cos(e), torch.sin(e)])
+    e = float(t) * np.exp(-math.log(10000) * np.arange(half, dtype=np.float32) / half)
+    return np.concatenate([np.cos(e), np.sin(e)])
 
 
-def time_embedding(weights: dict[str, torch.Tensor], t: float) -> torch.Tensor:
+def time_embedding(weights: dict[str, np.ndarray], t: float) -> np.ndarray:
     """temb (1280,) of a timestep: the UNet's ``time_embedding`` MLP on its sinusoidal embedding."""
-    e = F.linear(timestep_embedding(t)[None], weights["time_embedding.linear_1.weight"],
-                 weights["time_embedding.linear_1.bias"])
-    return F.linear(F.silu(e), weights["time_embedding.linear_2.weight"], weights["time_embedding.linear_2.bias"])[0]
+    e = weights["time_embedding.linear_1.weight"] @ timestep_embedding(t) + weights["time_embedding.linear_1.bias"]
+    return weights["time_embedding.linear_2.weight"] @ silu(e) + weights["time_embedding.linear_2.bias"]
 
 
-def resnet_time_biases(weights: dict[str, torch.Tensor], t: float, *, pool: Executor | None = None) -> dict[str, torch.Tensor]:
+def resnet_time_biases(weights: dict[str, np.ndarray], t: float, *, pool: Executor | None = None) -> dict[str, np.ndarray]:
     """Each UNet resnet's time bias (out channels,) fp32 at a timestep, by the resnet's weight prefix
     (``"down_blocks.0.resnets.0."``, ..., ``"mid_block.resnets.1."``, ..., ``"up_blocks.3.resnets.2."``). pool: the
-    projections on its threads (memory-bound GEMVs over 103 MB of weights: ~5 ms on one thread, ~1 ms on 8)."""
-    s = F.silu(time_embedding(weights, t))[None]
+    projections on its threads (memory-bound GEMVs over 103 MB of weights, the GIL released: ~5 ms on one thread)."""
+    s = silu(time_embedding(weights, t))
     suffix = "time_emb_proj.weight"
     names = [name for name in weights if name.endswith(suffix)]
 
-    def proj(name: str) -> torch.Tensor:
-        return F.linear(s, weights[name], weights[name.removesuffix("weight") + "bias"])[0]
+    def proj(name: str) -> np.ndarray:
+        return weights[name] @ s + weights[name.removesuffix("weight") + "bias"]
     return dict(zip((n.removesuffix(suffix) for n in names), (pool.map if pool else map)(proj, names), strict=True))

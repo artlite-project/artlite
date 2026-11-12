@@ -24,7 +24,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS
@@ -57,7 +56,7 @@ from artlite.vision.vit import (
 from artlite.vision.vit import pad as _pad
 from artlite.vision.vit import pad_heads as _heads
 from artlite.vision.vit import xfer as _xfer
-from artlite.vision.weights import Wt, cat, computed, eye, take, values
+from artlite.vision.weights import Wt, cat, computed, eye, f32, take, values
 
 GROUPS = 64  # final groups (4 x 4 patches) of one image of a band: a tile's 8 columns x 8 lanes
 
@@ -140,16 +139,16 @@ def plan(entries: list[Entry]) -> list[list[int]]:
     return out + [[i] for i, e in enumerate(entries) if e.groups > GROUPS]
 
 
-def pack(rows: list[torch.Tensor], slots: list[tuple[np.ndarray, ...]], nb: int) -> torch.Tensor:
+def pack(rows: list[np.ndarray], slots: list[tuple[np.ndarray, ...]], nb: int) -> np.ndarray:
     """Entries' rows (n_i, k) at their slots (``Entry.patch_slots`` / ``window_slots``) -> per band and column its
     tile's tokens (nb, COLS, 64, k), zeros elsewhere."""
-    out = torch.zeros(nb, COLS, 64, rows[0].shape[1])
+    out = np.zeros((nb, COLS, 64, rows[0].shape[1]), np.float32)
     for x, (b, c, k, lane, img) in zip(rows, slots, strict=True):
-        out[b, c, (2 * k + img) * 8 + lane] = x.float()
+        out[b, c, (2 * k + img) * 8 + lane] = x
     return out
 
 
-def unpack(tiles: torch.Tensor, slots: list[tuple[np.ndarray, ...]]) -> list[torch.Tensor]:
+def unpack(tiles: np.ndarray, slots: list[tuple[np.ndarray, ...]]) -> list[np.ndarray]:
     """``pack``'s inverse: per entry its rows."""
     return [tiles[b, c, (2 * k + img) * 8 + lane] for b, c, k, lane, img in slots]
 
@@ -167,34 +166,34 @@ def key_valid(entries: list[Entry], nb: int, slots: str) -> tuple[np.ndarray, np
     return ok[0].reshape(-1), ok[1].reshape(-1)
 
 
-def _attn_weights(get: Callable[[str], torch.Tensor], p: str) -> dict[str, torch.Tensor]:
+def _attn_weights(get: Callable[[str], np.ndarray], p: str) -> dict[str, np.ndarray]:
     """The padded q, k, v (rows by head; q x log2 e / sqrt 72), o (columns by head) of prefix p, their biases."""
     s = LOG2E / math.sqrt(HD)
     w = {}
     for r in ("q", "k", "v"):
-        wt, b = get(p + f"attn_{r}.weight").float(), get(p + f"attn_{r}.bias").float().reshape(-1)
+        wt, b = f32(get(p + f"attn_{r}.weight")), f32(get(p + f"attn_{r}.bias")).reshape(-1)
         if r == "q":
             wt, b = wt * s, b * s
         w[r] = _pad(_heads(wt), C, C)
         w[r + "_b"] = _heads(b)
-    w["o"] = _pad(_heads(get(p + "attn_out.weight").float(), 1), C, C)
-    w["o_b"] = _pad(get(p + "attn_out.bias").float().reshape(-1), C)
+    w["o"] = _pad(_heads(f32(get(p + "attn_out.weight")), 1), C, C)
+    w["o_b"] = _pad(f32(get(p + "attn_out.bias")).reshape(-1), C)
     return w
 
 
-def layer_weights(get: Callable[[str], torch.Tensor], il: int) -> dict[str, torch.Tensor]:
+def layer_weights(get: Callable[[str], np.ndarray], il: int) -> dict[str, np.ndarray]:
     """Layer il's padded weights (float32) by role: q, k, v (rows by head), o (columns by head), up, down and their
     biases (``*_b``), ln1 / ln2 gamma and beta (``*_g``, ``*_b``); ``get(name)``: a tensor of the mmproj as
     (rows, cols) or (cols,)."""
     p = f"v.blk.{il}."
     w = _attn_weights(get, p)
-    w["up"] = _pad(get(p + "ffn_up.weight").float(), FFN, C)
-    w["up_b"] = _pad(get(p + "ffn_up.bias").float().reshape(-1), FFN)
-    w["down"] = _pad(get(p + "ffn_down.weight").float(), C, FFN)
-    w["down_b"] = _pad(get(p + "ffn_down.bias").float().reshape(-1), C)
+    w["up"] = _pad(f32(get(p + "ffn_up.weight")), FFN, C)
+    w["up_b"] = _pad(f32(get(p + "ffn_up.bias")).reshape(-1), FFN)
+    w["down"] = _pad(f32(get(p + "ffn_down.weight")), C, FFN)
+    w["down_b"] = _pad(f32(get(p + "ffn_down.bias")).reshape(-1), C)
     for n in ("ln1", "ln2"):
-        w[n + "_g"] = _pad(get(p + n + ".weight").float().reshape(-1), C)
-        w[n + "_b"] = _pad(get(p + n + ".bias").float().reshape(-1), C)
+        w[n + "_g"] = _pad(f32(get(p + n + ".weight")).reshape(-1), C)
+        w[n + "_b"] = _pad(f32(get(p + n + ".bias")).reshape(-1), C)
     return w
 
 
@@ -202,42 +201,42 @@ HILO = ("v.patch_embd.weight", "mm.up.weight", "mm.down.weight")  # (the mmproj'
 PIX, ONE = 588, 592  # (a patch's inputs (c, ky, kx) of 3 x 14 x 14; the constant input 1, a bfp16 block of its own)
 
 
-def pixel_map(mean: tuple[float, ...], std: tuple[float, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+def pixel_map(mean: tuple[float, ...], std: tuple[float, ...]) -> tuple[np.ndarray, np.ndarray]:
     """The normalization x = (p / 255 - mean) / std of a patch's inputs (c, ky, kx) as x = a q + o of q = p - 128 (float64
     a, o of the 588 inputs)."""
-    m, s = (torch.tensor(v, dtype=torch.float64).repeat_interleave(PIX // 3) for v in (mean, std))
+    m, s = (np.repeat(np.asarray(v, np.float64), PIX // 3) for v in (mean, std))
     a = 1 / (255 * s)
     return a, 128 * a - m / s
 
 
-def patch_weights(get: Callable[[str], torch.Tensor], mean: tuple[float, ...], std: tuple[float, ...]) -> dict:
+def patch_weights(get: Callable[[str], np.ndarray], mean: tuple[float, ...], std: tuple[float, ...]) -> dict:
     """The patch embedding as a GEMM of the integer panels of ``patches`` (640 inputs -> C) with the pixels'
     normalization (``pixel_map``) folded in: input k < 588 the weights' column k times a_k, input 592 (the constant 1)
     their offset sum_k w_k o_k; the bias; "norm": the mean and std."""
     w = values(get("v.patch_embd.weight")).astype(np.float64).reshape(H, -1)
-    a, o = (x.numpy() for x in pixel_map(mean, std))
+    a, o = pixel_map(mean, std)
     wt = np.zeros((C, 640), np.float32)
     wt[:H, :PIX], wt[:H, ONE] = w * a, w @ o
-    return {"w": computed("minicpmv.patch", wt), "b": _pad(get("v.patch_embd.bias").float().reshape(-1), C),
+    return {"w": computed("minicpmv.patch", wt), "b": _pad(f32(get("v.patch_embd.bias")).reshape(-1), C),
             "norm": (tuple(mean), tuple(std))}
 
 
-def patches(pixels: np.ndarray | torch.Tensor, norm: tuple[tuple[float, ...], tuple[float, ...]],
-            patch: int = 14) -> torch.Tensor:
+def patches(pixels: np.ndarray, norm: tuple[tuple[float, ...], tuple[float, ...]],
+            patch: int = 14) -> np.ndarray:
     """An entry's pixels (3, H, W), normalized by norm (mean, std) from 8-bit values p -> its patches' integer inputs
     (ph pw, 640): q = p - 128 of (c, ky, kx) of each (raster order), input 592 the constant 1, zeros elsewhere
     (``patch_weights``; pixels of other values: the nearest p)."""
-    x = torch.as_tensor(np.asarray(pixels), dtype=torch.float64)
-    mean, std = (torch.tensor(v, dtype=torch.float64)[:, None, None] for v in norm)
-    q = torch.round((x * std + mean) * 255).clamp(0, 255) - 128
+    x = np.asarray(pixels, np.float64)
+    mean, std = (np.asarray(v, np.float64)[:, None, None] for v in norm)
+    q = np.clip(np.round((x * std + mean) * 255), 0, 255) - 128
     ph, pw = x.shape[1] // patch, x.shape[2] // patch
-    out = torch.zeros(ph * pw, 640)
-    out[:, :PIX] = q.reshape(3, ph, patch, pw, patch).permute(1, 3, 0, 2, 4).reshape(ph * pw, -1)
+    out = np.zeros((ph * pw, 640), np.float32)
+    out[:, :PIX] = q.reshape(3, ph, patch, pw, patch).transpose(1, 3, 0, 2, 4).reshape(ph * pw, -1)
     out[:, ONE] = 1
     return out
 
 
-def patch_embed(bd: Builder, w: dict[str, torch.Tensor], name: str) -> Bands:
+def patch_embed(bd: Builder, w: dict[str, np.ndarray], name: str) -> Bands:
     """The patch embedding of a dispatch's entries into the level before the merger: per band a GEMM of the host's
     patch panels (DDR image name.pix.b) with the position rows (name.pos.b) as its residual -> the residual's bands and
     records (``inputs`` writes those images)."""
@@ -257,7 +256,7 @@ def patch_embed(bd: Builder, w: dict[str, torch.Tensor], name: str) -> Bands:
     return out
 
 
-def inputs(entries: list[Entry], pix: list[torch.Tensor], pos: list[torch.Tensor], name: str) -> dict[str, np.ndarray]:
+def inputs(entries: list[Entry], pix: list[np.ndarray], pos: list[np.ndarray], name: str) -> dict[str, np.ndarray]:
     """``patch_embed``'s DDR images for a dispatch's placed entries (``place``): their patches (``patches``: pix, as
     integer panels) and position rows (pos: (n, C)) at every group of their images (``Entry.fill_slots``)."""
     fills = [e.fill_slots() for e in entries]
@@ -314,29 +313,29 @@ MERGED, HID = 4 * C, 17280  # (a merged token's channels: 4 x 1280; the ViT merg
 BLOCKS4 = np.array([k * H + i if i < H else -1 for k in range(4) for i in range(C)])  # (``_blocks4``)
 
 
-def _blocks4(v: Wt | torch.Tensor, axis: int = 0) -> Wt | torch.Tensor:
+def _blocks4(v: Wt | np.ndarray, axis: int = 0) -> Wt | np.ndarray:
     """A merged token's 4 x 1152 channels (along axis: 0, a vector's or a matrix's rows; 1, a matrix's columns) -> 4 x
     1280 (each source's padded)."""
-    return take(v.float(), BLOCKS4, axis)
+    return take(f32(v), BLOCKS4, axis)
 
 
-def merger_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
+def merger_weights(get: Callable[[str], np.ndarray]) -> dict[str, np.ndarray]:
     """The ViT merger's padded weights: its attention's (``_attn_weights``) and ln1; ds_ln (4608 -> 5120, per source),
     up (5120 -> 17280) and down (17280 + 5120 -> 1280: the mean of the merged token's 4 sources as its last K, 1 / 4
     per source channel)."""
     p = "v.vit_merger."
     w = _attn_weights(get, p)
-    w["ln1_g"], w["ln1_b"] = (_pad(get(p + f"ln1.{n}").float().reshape(-1), C) for n in ("weight", "bias"))
+    w["ln1_g"], w["ln1_b"] = (_pad(f32(get(p + f"ln1.{n}")).reshape(-1), C) for n in ("weight", "bias"))
     w["ds_g"], w["ds_b"] = (_blocks4(get(p + f"ds_ln.{n}").reshape(-1)) for n in ("weight", "bias"))
     w["up"] = _pad(_blocks4(get(p + "ds_ffn_up.weight"), 1), HID, MERGED)
-    w["up_b"] = _pad(get(p + "ds_ffn_up.bias").float().reshape(-1), HID)
+    w["up_b"] = _pad(f32(get(p + "ds_ffn_up.bias")).reshape(-1), HID)
     mean = _pad(eye(C), C, H) * 0.25  # (a source's 1152 channels, 1 / 4 each)
-    w["down"] = cat([_pad(get(p + "ds_ffn_down.weight").float(), C, HID)] + [_pad(mean, C, C)] * 4, 1)
-    w["down_b"] = _pad(get(p + "ds_ffn_down.bias").float().reshape(-1), C)
+    w["down"] = cat([_pad(f32(get(p + "ds_ffn_down.weight")), C, HID)] + [_pad(mean, C, C)] * 4, 1)
+    w["down_b"] = _pad(f32(get(p + "ds_ffn_down.bias")).reshape(-1), C)
     return w
 
 
-def merger(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> tuple[Tensor, int]:
+def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[Tensor, int]:
     """The ViT merger (module docstring) from the level before it (x: ``PRE``) into ``POST``'s band, left in the
     memtile: per source band LN1 -> Q, K, V^T panels (to DDR); per merged tile (two token panels: 8 windows of each
     image per column) the window attention of the 4 sources' rows -> o's rows (to DDR); per source band O + x (to DDR);
@@ -446,20 +445,20 @@ FUP = 4800  # (the final merger's hidden: 4608 padded to 15 passes a row)
 OUT = 1024  # (the language model's width)
 
 
-def final_weights(get: Callable[[str], torch.Tensor]) -> dict[str, torch.Tensor]:
+def final_weights(get: Callable[[str], np.ndarray]) -> dict[str, np.ndarray]:
     """The final merger's padded weights: post_ln, the identity (post_ln's panels back to C tiles), input_norm (4608 ->
     5120, per source), up (5120 -> 4800), down (4800 -> 1280: 1024 real)."""
-    w = {"post_g": _pad(get("v.post_ln.weight").float().reshape(-1), C), "post_b": _pad(get("v.post_ln.bias").float().reshape(-1), C)}
+    w = {"post_g": _pad(f32(get("v.post_ln.weight")).reshape(-1), C), "post_b": _pad(f32(get("v.post_ln.bias")).reshape(-1), C)}
     w["eye"] = eye(C)
     w["in_g"], w["in_b"] = (_blocks4(get(f"mm.input_norm.{n}").reshape(-1)) for n in ("weight", "bias"))
     w["up"] = _pad(_blocks4(get("mm.up.weight"), 1), FUP, MERGED)
-    w["up_b"] = _pad(get("mm.up.bias").float().reshape(-1), FUP)
-    w["down"] = _pad(get("mm.down.weight").float(), C, FUP)
-    w["down_b"] = _pad(get("mm.down.bias").float().reshape(-1), C)
+    w["up_b"] = _pad(f32(get("mm.up.bias")).reshape(-1), FUP)
+    w["down"] = _pad(f32(get("mm.down.weight")), C, FUP)
+    w["down_b"] = _pad(f32(get("mm.down.bias")).reshape(-1), C)
     return w
 
 
-def _post(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int) -> Tensor:
+def _post(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int) -> Tensor:
     """post_ln of a band's C tiles x (its records at rec; x freed), its panels back to C tiles by an identity GEMM."""
     n = alloc(bd, x.lv, C, "pn")
     ln(bd, x, n, w["post_g"], w["post_b"], name=name + ".post", rec=rec)
@@ -482,7 +481,7 @@ def _merged(bd: Builder, src: list[tuple[str, int]], name: str) -> Tensor:
     return mc
 
 
-def _final_mlp(bd: Builder, w: dict[str, torch.Tensor], name: str, mc: Tensor) -> Tensor:
+def _final_mlp(bd: Builder, w: dict[str, np.ndarray], name: str, mc: Tensor) -> Tensor:
     """The final merger's MLP on a tile of 16 merged tokens (mc, freed): their records, LayerNorm(4608), up + GELU
     (erf), down -> the embeddings' C tiles (m 16, 1280 channels: 1024 real)."""
     l16 = mc.lv
@@ -510,7 +509,7 @@ def _final_mlp(bd: Builder, w: dict[str, torch.Tensor], name: str, mc: Tensor) -
     return e
 
 
-def final(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: int) -> str:
+def final(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int) -> str:
     """The final merger of ``POST``'s band (x, its records at rec; freed): post_ln (``_post``, to DDR), the band's 4
     windows of each group as one tile of 16 merged tokens (``_merged``: a DDR round trip of block copies), the MLP
     (``_final_mlp``) -> the embeddings: DDR image ``name.out`` ([col][16 x 1280 channels as C tiles of 16];
@@ -525,7 +524,7 @@ def final(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Tensor, rec: in
     return name + ".out"
 
 
-def final_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) -> str:
+def final_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> str:
     """The final merger of ``PRE``'s bands (the 4x file, without the ViT merger: an output token per window, its 4
     tokens in bands 0 .. 3): per band post_ln (``_post``, to DDR); per merged tile k (window k of both images' groups:
     token panels 2 k, 2 k + 1 of the bands) the 4 bands' rows as one tile of 16 merged tokens, the MLP -> the
@@ -542,14 +541,14 @@ def final_bands(bd: Builder, w: dict[str, torch.Tensor], name: str, x: Bands) ->
     return name + ".out"
 
 
-def embeddings(npu: VisionDevice, image: str, entries: list[Entry], merge: int = 4) -> list[torch.Tensor]:
+def embeddings(npu: VisionDevice, image: str, entries: list[Entry], merge: int = 4) -> list[np.ndarray]:
     """The final merger's output (``final``'s image; merge 2: ``final_bands``') -> per placed entry its embeddings
     (tokens, 1024) in raster order of its final grid (merge 4: its groups; 2: its windows)."""
     l16 = vit_level(1, 16)
     nt = 1 if merge == 4 else 4
     raw = npu.read(image, COLS * nt * l16.ct(C)).reshape(COLS, nt, -1)
-    tiles = torch.stack([torch.stack([L.from_ctiles(raw[c, t], 16, C, 16)[:, :OUT] for t in range(nt)])
-                         for c in range(COLS)])  # ([col][tile] (16 tokens: image 0's 8 lanes, then image 1's), 1024)
+    tiles = np.stack([np.stack([L.from_ctiles(raw[c, t], 16, C, 16)[:, :OUT] for t in range(nt)])
+                      for c in range(COLS)])  # ([col][tile] (16 tokens: image 0's 8 lanes, then image 1's), 1024)
     out = []
     for e in entries:
         if merge == 4:
@@ -561,7 +560,7 @@ def embeddings(npu: VisionDevice, image: str, entries: list[Entry], merge: int =
     return out
 
 
-def weights(get: Callable[[str], torch.Tensor], layers: int, insert: int, mean: tuple[float, ...],
+def weights(get: Callable[[str], np.ndarray], layers: int, insert: int, mean: tuple[float, ...],
             std: tuple[float, ...]) -> dict:
     """Every padded weight of the encoder: "patch" (the pixels' normalization mean, std folded in), per layer il its
     ``layer_weights``, "merger" (after layer ``insert``; -1: none, the 4x file), "final"."""
@@ -606,11 +605,11 @@ class Encoder:
     (``plan``: an image's entries) the host writes the entries' patch panels and position rows (``inputs``) and the
     levels' key masks into their attention commands (``level_keys``), runs it and reads the embeddings."""
 
-    def __init__(self, npu: VisionDevice, w: dict, pos: torch.Tensor, *, patch: int, name: str = "v"):
+    def __init__(self, npu: VisionDevice, w: dict, pos: np.ndarray, *, patch: int, name: str = "v"):
         """w: ``weights``; pos: the learned position embedding (70 x 70 rows, 1152) in bf16 values; patch: pixels."""
         self.npu, self.name, self.patch, self.norm = npu, name, patch, w["patch"]["norm"]
         self.merge = 4 if w["insert"] >= 0 else 2  # (patches per output token per side)
-        self.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
+        self.pos = np.pad(np.asarray(pos, np.float32), ((0, 0), (0, C - H)))
         bd = Builder(npu)
         self.words, self.addrs = {}, {}
         for joint, b in ((False, bd), (True, bd.fork())):
@@ -626,18 +625,18 @@ class Encoder:
                 "merge": self.merge, "norm": self.norm}
 
     @classmethod
-    def restored(cls, npu: VisionDevice, state: dict, pos: torch.Tensor, *, patch: int, name: str = "v") -> "Encoder":
+    def restored(cls, npu: VisionDevice, state: dict, pos: np.ndarray, *, patch: int, name: str = "v") -> "Encoder":
         """An Encoder of ``state()`` on a device whose images were restored (``VisionDevice.restore``)."""
         enc = cls.__new__(cls)
         enc.npu, enc.name, enc.patch, enc.out, enc.merge, enc.tr = npu, name, patch, state["out"], state["merge"], {}
         enc.norm = state["norm"]
-        enc.pos = torch.nn.functional.pad(pos.float(), (0, C - H))
+        enc.pos = np.pad(np.asarray(pos, np.float32), ((0, 0), (0, C - H)))
         enc.words = {j: npu.relocate(wd, state["rel"][j]) for j, wd in state["words"].items()}
         return enc
 
     def _host(self, ents: list[Entry], pixels: list[np.ndarray]) -> dict[str, np.ndarray]:
         """A dispatch's DDR images: its placed entries' patch panels and position rows, its levels' commands."""
-        pos = [self.pos[torch.from_numpy(positions(e.ph, e.pw))] for e in ents]
+        pos = [self.pos[positions(e.ph, e.pw)] for e in ents]
         out = inputs(ents, [patches(p, self.norm, self.patch) for p in pixels], pos, self.name + ".x0")
         joint = ents[0].joint
         keys = level_keys(f"{self.name}.{'joint' if joint else 'pair'}", ents, joint=joint)
@@ -645,11 +644,11 @@ class Encoder:
             out[k.name] = k.attention(lv).command()
         return out
 
-    def __call__(self, pixels: list[np.ndarray]) -> list[torch.Tensor]:
+    def __call__(self, pixels: list[np.ndarray]) -> list[np.ndarray]:
         """An image's entries (their pixels (3, H, W), normalized) -> their embeddings (tokens, 1024), in order (a
         dispatch's DDR images prepared on a thread while the one before runs)."""
         entries = [Entry(p.shape[1] // self.patch, p.shape[2] // self.patch) for p in pixels]
-        out: list[torch.Tensor | None] = [None] * len(entries)
+        out: list[np.ndarray | None] = [None] * len(entries)
         work = [(idx, place([entries[i] for i in idx])) for idx in plan(entries)]
         with ThreadPoolExecutor(1) as pool:
             host = [pool.submit(self._host, ents, [pixels[i] for i in idx]) for idx, ents in work]

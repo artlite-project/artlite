@@ -53,7 +53,7 @@ class Encoder:
         if name not in self._w:
             t = self.g.tensor(name)
             dims = tuple(reversed(self.g.tensor_info[name][0]))
-            self._w[name] = t.dequantize().reshape(dims).to(torch.float64)
+            self._w[name] = torch.from_numpy(t.dequantize().reshape(dims)).to(torch.float64)
         return self._w[name]
 
     def vec(self, name: str) -> torch.Tensor:

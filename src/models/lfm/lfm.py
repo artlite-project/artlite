@@ -19,7 +19,7 @@ lazy shift, the caches' records overwritten).
 
 from concurrent.futures import ThreadPoolExecutor
 
-import torch  # noqa: TID251
+import numpy as np
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
@@ -70,7 +70,7 @@ class NpuLfm(OverlayModel):
                 build.result()  # (its error, if any)
                 self.prefill.bind()
         self.overlay.ready()
-        self._w_out = gguf.tensor("output_norm.weight").dequantize().float()
+        self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
 
@@ -88,16 +88,16 @@ class NpuLfm(OverlayModel):
         self.overlay.reset()
         self.position = 0
 
-    def _rows(self, tokens: list[int] | Sequence) -> torch.Tensor:
+    def _rows(self, tokens: list[int] | Sequence) -> np.ndarray:
         """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
         if not isinstance(tokens, Sequence):
             return self.gguf.rows("token_embd.weight", tokens)
-        x = torch.empty(len(tokens), self.cfg.hidden_size)
+        x = np.empty((len(tokens), self.cfg.hidden_size), np.float32)
         t = ~tokens.given
         if t.any():
-            x[torch.from_numpy(t)] = self.gguf.rows("token_embd.weight", tokens.ids[t])
+            x[t] = self.gguf.rows("token_embd.weight", tokens.ids[t])
         if tokens.given.any():
-            x[torch.from_numpy(tokens.given)] = torch.from_numpy(tokens.rows)
+            x[tokens.given] = tokens.rows
         return x
 
     def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
@@ -106,7 +106,7 @@ class NpuLfm(OverlayModel):
     def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
         return (self._rows(tokens),)
 
-    def _chunk_logits(self, token: int, n: int) -> torch.Tensor:
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(the LM head alone on the chunk's last output row)"""
         x = self.prefill.hidden(n - 1)
         return self._dispatch(lambda: self.overlay.logits_of(x))

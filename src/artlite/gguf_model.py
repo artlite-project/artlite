@@ -20,11 +20,10 @@ import json
 import math
 import mmap
 import struct
-import warnings
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from . import _native
 
@@ -82,7 +81,7 @@ class QTensor:
         if t == "F32":
             return {"w": self.raw}
         if t == "BF16":
-            return {"w": self._bf16().view(torch.int16).numpy().view(np.uint16)}
+            return {"w": np.ascontiguousarray(self.raw).view(np.uint16)}
         if t == "F16":
             return {"w": self.raw.view(np.float16)}
         if t == "Q4_0":
@@ -195,13 +194,13 @@ class QTensor:
                     "q": q.reshape(self.rows, self.cols)}
         raise ValueError(f"{self.name}: no quantization fields for {t}")
 
-    def dequantize(self) -> torch.Tensor:
+    def dequantize(self) -> np.ndarray:
         """fp32 (rows, cols) weights, computed from :meth:`fields`."""
         t = self.qtype
         if t == "F32":
-            return torch.from_numpy(self.raw.astype(np.float32))
+            return self.raw.astype(np.float32)
         if t in ("F16", "BF16"):
-            return torch.from_numpy(self.raw.copy()).float() if t == "F16" else self._bf16().float()
+            return self.raw.astype(np.float32) if t == "F16" else np.ascontiguousarray(self.raw).view(bfloat16).astype(np.float32)
         f = self.fields()
         r = self.rows
         if t == "Q4_0":
@@ -234,13 +233,7 @@ class QTensor:
             w = dl[..., None] * IQ4_VALUES[f["q"]].reshape(r, -1, 32).astype(np.float32)
         else:
             raise ValueError(t)
-        return torch.from_numpy(np.ascontiguousarray(w, dtype=np.float32).reshape(r, self.cols))
-
-    def _bf16(self) -> torch.Tensor:
-        """A view of the file's bf16 data (read-only memory: callers convert or copy it)."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)  # torch warns about non-writable arrays
-            return torch.from_numpy(np.ascontiguousarray(self.raw).view(np.int16)).view(torch.bfloat16)
+        return np.ascontiguousarray(w, dtype=np.float32).reshape(r, self.cols)
 
 
 _PARITY7 = np.array([i.bit_count() & 1 for i in range(128)], np.uint8)  # (IQ3_XXS: a sign field's 8th sign)
@@ -398,7 +391,7 @@ class GGUFFile:
             raw = raw.reshape(rows, -1)
         return QTensor(name=name, qtype=qtype, rows=rows, cols=cols, raw=raw)
 
-    def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0, *, prefetch: bool = True) -> torch.Tensor:
+    def rows(self, name: str, idx: list[int] | np.ndarray, cols: int = 0, *, prefetch: bool = True) -> np.ndarray:
         """Rows ``idx`` of a tensor dequantized (len(idx), cols) fp32, of its first ``cols`` columns (default all; a
         multiple of the format's block): an embedding lookup in the mapped file. In C++ (``_native.dequant_rows``: a
         decode step's lookup in a few us) the types of ``_native.dequant_supported`` (the plain ones, Q4_0, Q4_1, Q8_0,
@@ -414,7 +407,7 @@ class GGUFFile:
         if _native.dequant_supported(t.qtype):
             out = np.empty((len(idx), cols), np.float32)
             _native.dequant_rows(t.qtype, raw.view(np.uint8), out)
-            return torch.from_numpy(out)
+            return out
         return QTensor(name=name, qtype=t.qtype, rows=len(idx), cols=cols, raw=raw).dequantize()
 
     def _prefetch(self, off: int, stride: int, idx: np.ndarray, nbytes: int) -> None:

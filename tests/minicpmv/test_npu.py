@@ -49,7 +49,7 @@ def case() -> tuple:
     _, grid = M.slice_image(M.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
     chunk = gold.embd(0)  # (llama.cpp's image chunk: the tokens after <image>, through the last marker)
     embd = chunk[np.asarray(grid.layout(newline_after=False)[1:]) == M.MEDIA]
-    img = grid.sequence(embd, GGUFFile(MMPROJ).rows("v.tok_embd_sep", [0, 1, 2, 3]).numpy())
+    img = grid.sequence(embd, GGUFFile(MMPROJ).rows("v.tok_embd_sep", [0, 1, 2, 3]))
     text = chat_prompt(g, _messages(None), enable_thinking=False)
     head, tail = text.split("<|image_pad|>")
     seq = tok.encode(head + "<image_id>0</image_id>") + img + tok.encode(tail.removeprefix("\n"))
@@ -57,7 +57,7 @@ def case() -> tuple:
     K = len(seq)
     seq = seq + answer
     rows = np.empty((len(seq), g.tensor("token_embd.weight").cols), np.float32)
-    rows[~seq.given] = g.rows("token_embd.weight", seq.ids[~seq.given]).numpy()
+    rows[~seq.given] = g.rows("token_embd.weight", seq.ids[~seq.given])
     rows[seq.given] = seq.rows
     want = torch.from_numpy(np.asarray(V.seq_golden(path, rows, seq.pos, K - 1).logits, np.float32)[:-1].copy())
     return path, seq, K, want
@@ -102,7 +102,7 @@ def test_image_prompt(case: tuple) -> None:
         model = NpuQwen(GGUFFile(path), capacity=1024, prefill=prefill, sizes=(256,))
         got = [model.forward(seq[:K])]
         caches[prefill] = _k_cache(model, K - K % 32)
-        got = torch.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]])
+        got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
         kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
         assert model.rope_next == seq.next - 1  # (the text positions continued through the answer's steps)
         assert kl < 0.008 and agree > 0.92
@@ -129,7 +129,7 @@ def test_app_image_prompt(case: tuple) -> None:
     assert np.array_equal(prompt.given, seq.given[:K])
     model = app.load(capacity=1024)
     got = [model.forward(prompt)]
-    got = torch.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]])
+    got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
     kl, agree = _kl_report("the NPU encoder, prefill", want, got)
     assert kl < 0.016 and agree > 0.9
     app.vision._kept.clear()

@@ -44,7 +44,7 @@ class GemmaNpuRef(GemmaCpu):
         t = self.gguf.tensor("per_layer_model_proj.weight")
         raw = np.empty((t.rows, t.cols // 32 * 34), np.uint8)
         _native.quantize_q8_0(np.ascontiguousarray(t.raw), raw)
-        w = QTensor(name="ple", qtype="Q8_0", rows=t.rows, cols=t.cols, raw=raw).dequantize()
+        w = torch.from_numpy(QTensor(name="ple", qtype="Q8_0", rows=t.rows, cols=t.cols, raw=raw).dequantize())
         p = bf(bf(x) @ w.T).view(len(tokens), -1, d)
         inv = torch.rsqrt(p.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps * cfg.hidden_size)
         wn = self.mat("per_layer_proj_norm.weight") / math.sqrt(2.0)
@@ -119,5 +119,5 @@ class GemmaNpuRef(GemmaCpu):
                 prev = (self.mat(b + "post_ffw_norm.weight"), scal(b + "layer_output_scale.weight"))
         r, xin, sc = self.header(r, v, prev[0], prev[1], self.mat("output_norm.weight"), True)
         trace["r"] = r
-        lm = self.gguf.rows("token_embd.weight", list(range(self.vocab)))
+        lm = torch.from_numpy(self.gguf.rows("token_embd.weight", list(range(self.vocab))))
         return bf((xin @ lm.T) * sc)

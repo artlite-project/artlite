@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 import pytest
-import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode.image import BLOCK_BYTES, COL_SLOT, pack_rows
 from artlite.gguf_model import GGUFFile
@@ -119,7 +119,7 @@ def test_pack_image() -> None:
         cols = [out[r.offset + c * r.col_stride:][:r.col_bytes] for c in range(COLS)]
         if r.data:
             name = "output_norm" if r.layer < 0 else f"blk.{r.layer}.{'attn' if r.name == 'qkv_norm' else 'ffn'}_norm"
-            w = g.tensor(name + ".weight").dequantize().bfloat16().view(torch.uint16).numpy().reshape(-1)
+            w = g.tensor(name + ".weight").dequantize().astype(bfloat16).view(np.uint16).reshape(-1)
             for col in cols:
                 assert np.array_equal(col[:w.nbytes].view(np.uint16), w) and not col[w.nbytes:].any()
             continue

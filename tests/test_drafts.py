@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
+from ml_dtypes import bfloat16
 
 import models
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
@@ -140,22 +140,22 @@ class Text(OverlayModel):
     def __init__(self, text: list[int]):
         self.text, self.position, self.calls = text, 0, []
 
-    def steps(self, tokens: list[int], *, logits: bool = True) -> torch.Tensor:
+    def steps(self, tokens: list[int], *, logits: bool = True) -> np.ndarray:
         p = self.position
         self.calls.append(list(tokens))
         self.position += len(tokens)
-        out = torch.full((len(tokens), VOCAB), -8.0)
+        out = np.full((len(tokens), VOCAB), -8.0, np.float32)
         for i in range(len(tokens)):  # (past the text: its end)
             out[i, self.text[min(p + i + 1, len(self.text) - 1)]] = 8.0
-        return out.bfloat16()
+        return out.astype(bfloat16)
 
     def _crossing(self) -> tuple[bool, ...]:
         return tuple((self.position % 32) + S > 32 for S in range(1, self.DRAFTS + 2))
 
-    def first(self, n: int) -> torch.Tensor:
+    def first(self, n: int) -> np.ndarray:
         """The prompt's last logits after positions 0 .. n - 1 ran."""
         self.position = n
-        out = torch.full((VOCAB,), -8.0)
+        out = np.full(VOCAB, -8.0, np.float32)
         out[self.text[n]] = 8.0
         return out
 
@@ -303,21 +303,21 @@ class Branchy(Text):
     def _sibling(self) -> list[int] | None:
         return self.sib
 
-    def _verify(self, tokens: list[int], mtp: bool) -> torch.Tensor:
-        if self.sib is None:
+    def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
+        if not mtp or self.sib is None:  # (a round of the context's drafts: no sibling, whatever the last drafter round's)
             return self.steps(tokens)
         self.branches.append((self.position, len(self.carry), list(tokens), list(self.sib)))
         return self.steps([*tokens, *self.sib], branch=(len(self.carry), len(self.sib)))
 
-    def steps(self, tokens: list[int], *, logits: bool = True, branch: tuple[int, int] | None = None) -> torch.Tensor:
+    def steps(self, tokens: list[int], *, logits: bool = True, branch: tuple[int, int] | None = None) -> np.ndarray:
         out = super().steps(tokens, logits=logits)
         if branch is not None:  # (branch slot j at position p + c + 1 + j: the text's token after it)
             p, (c, L) = self.position - len(tokens), branch
-            out = out.float()
+            out = out.astype(np.float32)
             for j in range(L):
                 out[len(tokens) - L + j] = -8.0
                 out[len(tokens) - L + j, self.text[min(p + c + 2 + j, len(self.text) - 1)]] = 8.0
-            out = out.bfloat16()
+            out = out.astype(bfloat16)
         return out
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
@@ -343,7 +343,7 @@ def test_sibling() -> None:
     p = 10
     for c in m.calls:  # (each step at the text's next position, its carry first; a branch's slots after its chain)
         assert c[0] == text[p], (c, p)
-        p += next((i for i in range(1, len(c)) if c[i] != text[p + i]), len(c))
+        p += next((i for i in range(1, len(c)) if p + i >= len(text) or c[i] != text[p + i]), len(c))
         if p > len(text) - 2:
             break
     for pos, c, tokens, sib in m.branches:

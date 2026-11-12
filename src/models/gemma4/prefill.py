@@ -35,7 +35,7 @@ would double the error (hence hi + lo).
 from concurrent.futures import Future
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
@@ -241,25 +241,25 @@ class GemmaPrefill(ChunkPrefill):
                 out |= self.attn[(hd, T)].params(p0)
         return out
 
-    def residual(self, i: int) -> torch.Tensor:
+    def residual(self, i: int) -> np.ndarray:
         """Row i of the last chunk's residual stream (hidden,) fp32 where the chunk leaves it: the input of the last
         layer (which only writes its cache here). A decode step from that layer on (``GemmaOverlay.step(start=)``)
         finishes the token: a prompt's last token without the layers before."""
         H, dev = self.H, self.ov.dev
         dev.fetch("PX", 4 * i * H, 4 * H)
-        return torch.from_numpy(dev.view("PX")[4 * i * H:4 * (i + 1) * H].view(np.float32).copy())
+        return dev.view("PX")[4 * i * H:4 * (i + 1) * H].view(np.float32).copy()
 
-    def _write_pli(self, pli: torch.Tensor, n: int, T: int) -> None:
+    def _write_pli(self, pli: np.ndarray, n: int, T: int) -> None:
         dev, d = self.ov.dev, self.cfg.per_layer_dim
         stride = (MAX_T + PAD_ROWS) * d  # (a layer's rows, bf16)
         pl = dev.view("PLI").view(np.uint16)
-        b = pli.reshape(n, -1, d)[:, :len(self.layers)].bfloat16().view(torch.int16).numpy().view(np.uint16)
+        b = np.asarray(pli).reshape(n, -1, d)[:, :len(self.layers)].astype(bfloat16).view(np.uint16)
         for i in range(len(self.layers) - 1):
             pl[i * stride:i * stride + n * d] = b[:, i].reshape(-1)
             pl[i * stride + n * d:i * stride + T * d] = 0
         dev.flush("PLI")
 
-    def run(self, x: torch.Tensor, pli: torch.Tensor | Future, p0: int, T: int = 0) -> None:
+    def run(self, x: np.ndarray, pli: np.ndarray | Future, p0: int, T: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the scaled embeddings and pli (n,
         layers, per_layer_dim) the per-layer inputs (of the first layers at least: those of the prefill) of positions
         p0 .. p0 + n - 1 (the caches hold the positions before). Leaves the own-cache layers' K / V of the positions in
@@ -268,7 +268,7 @@ class GemmaPrefill(ChunkPrefill):
         n, dev, H = x.shape[0], self.ov.dev, self.H
         T = self._size(n, p0, T)
         px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
-        px[:n] = x.float().numpy()
+        px[:n] = x
         px[n:] = 0
         dev.flush("PX", 0, 4 * T * H)
         hooks = None

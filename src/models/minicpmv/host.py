@@ -35,7 +35,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 from PIL import Image
 
 from artlite.model_config import ClipConfig
@@ -46,6 +45,18 @@ from ..sequence import MEDIA, Sequence, load_image  # noqa: F401 (load_image: th
 IMAGE, IMAGE_END, SLICE, SLICE_END, IMAGE_ID, IMAGE_ID_END, NEWLINE = 248078, 248079, 248088, 248089, 248090, 248091, 198
 # the markers' rows in the mmproj's v.tok_embd_sep (the language model's embeddings of them, unquantized)
 SEP_ROWS = {IMAGE_END: 0, SLICE: 1, SLICE_END: 2, NEWLINE: 3}
+
+
+def linspace(start: float, end: float, n: int) -> np.ndarray:
+    """``torch.linspace(start, end, n)`` in float32 as torch's CPU kernel computes it (transformers' positions): step =
+    (end - start) / (n - 1) in float32, then start + i step for i < n / 2 and end - (n - 1 - i) step after, each a fused
+    multiply-add (exact here in float64, rounded once)."""
+    if n == 1:
+        return np.array([start], np.float32)
+    s, e = np.float32(start), np.float32(end)
+    step = np.float64((e - s) / np.float32(n - 1))
+    i = np.arange(n)
+    return np.where(i < n // 2, s + step * i, e - step * (n - 1 - i)).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -83,8 +94,8 @@ class Grid:
         O, (ch, cw), (oh, ow) = origin, self.canvas, self.ov
         pos = []
         pos.append((O, O - 1, O - 1))  # <image>
-        hs = torch.linspace(0, ch - 1, oh).round().long().numpy()
-        ws = torch.linspace(0, cw - 1, ow).round().long().numpy()
+        hs = np.round(linspace(0, ch - 1, oh)).astype(np.int64)
+        ws = np.round(linspace(0, cw - 1, ow)).astype(np.int64)
         pos += [(O, O + h, O + w) for h in hs for w in ws]
         pos.append((O, O + ch, O + cw))  # </image>
         rows, cols = self.grid

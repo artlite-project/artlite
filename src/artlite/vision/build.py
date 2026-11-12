@@ -18,7 +18,6 @@ import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
 
 from ..operators.design import COLS, ROWS
 from ..overlay import Transaction
@@ -323,7 +322,7 @@ class Builder:
             self._tab_runs[r] = (self.tables[name], 2 * D.Q)
             self.tab[r] = name
 
-    def gemm(self, g: Gemm, w: Wt | torch.Tensor | None, b: torch.Tensor | None, *, name: str, barrier: bool = False,
+    def gemm(self, g: Gemm, w: Wt | np.ndarray | None, b: np.ndarray | None, *, name: str, barrier: bool = False,
              extra: dict[int, ColOps] | None = None, inputs_ready: bool = False, tbias: str | None = None,
              wname: str = "") -> None:
         """A GEMM / conv / copy op (``extra``: fills / drains merged into it; ``name``'s image: per row its command,
@@ -373,7 +372,7 @@ class Builder:
                 (a, n), *more = ro.runs  # (more: the weights again per further tile)
                 self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
                 ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
-            self.tb_hooks.append((tbias, off, torch.cat([g._rows(r) for r in range(ROWS)]).numpy()))
+            self.tb_hooks.append((tbias, off, np.concatenate([g._rows(r) for r in range(ROWS)])))
         co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
         cols = {c: co or g.col_ops(c) for c in range(COLS)}
         if extra:
@@ -400,7 +399,7 @@ class Builder:
         self._drains.append((cols, [(rec, 4 * D.OCH)], True))
         return Records(base, ch_off, nr, gsize)
 
-    def apply(self, a: Apply, gamma: torch.Tensor | None, beta: torch.Tensor | None, *, name: str,
+    def apply(self, a: Apply, gamma: np.ndarray | None, beta: np.ndarray | None, *, name: str,
               records: list[Records] = (), extra: dict[int, ColOps] | None = None) -> None:
         """An apply op (GroupNorm: its cores' records gathered from ``records``, after a DDR sync)."""
         runs, cmds, gbs, slots = {}, [], [], {}

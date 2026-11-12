@@ -15,7 +15,7 @@ from models.common import auto_capacity
 from models.llama.llama import NpuLlama
 from models.llama.tokenizer import chat_prompt
 
-from ..common import cached_ref, essays, llama_gguf, model_key
+from ..common import as_torch, cached_ref, essays, llama_gguf, model_key
 from . import cpu as llama_cpu
 
 pytestmark = pytest.mark.slow  # GGUF models + CPU references: run with --run-slow
@@ -46,6 +46,7 @@ def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
 
 
 def _kl_agree(ref: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
+    ref, got = as_torch(ref), as_torch(got)
     lr, lp = torch.log_softmax(ref.double(), -1), torch.log_softmax(got.double(), -1)
     return float((lr.exp() * (lr - lp)).sum(-1).mean()), float((ref.argmax(-1) == got.argmax(-1)).float().mean())
 

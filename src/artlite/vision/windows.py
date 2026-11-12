@@ -35,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
 
 from ..operators import kmath
 from ..operators.design import COLS
@@ -400,7 +399,7 @@ class WindowEncoder:
         for qd in range(nq):
             raw = self.npu.read(f"{self.nm.p}.out.{qd}", COLS * l1.ct(self.outw)).reshape(COLS, -1)
             for c in range(COLS):
-                tiles[qd, c] = L.from_ctiles(raw[c], 64, self.outw, 64).numpy()
+                tiles[qd, c] = L.from_ctiles(raw[c], 64, self.outw, 64)
         return lay.merged(tiles)[:, :self.proj]
 
     def __call__(self, px: np.ndarray) -> np.ndarray:
@@ -430,7 +429,7 @@ def patch_panels(lay: Layout, px: np.ndarray, name: str, *, kp: int, one: int, p
     pix[..., one] = 1
     for b in range(nb):
         pix[..., :3 * patch * patch] = q[sp[b]]
-        out[f"{name}.pix.{b}"] = np.concatenate([L.int_panels(torch.from_numpy(pix[c])) for c in range(COLS)])
+        out[f"{name}.pix.{b}"] = np.concatenate([L.int_panels(pix[c]) for c in range(COLS)])
     return out
 
 
@@ -438,7 +437,7 @@ def band_rows(lay: Layout, rows: np.ndarray, name: str) -> dict[str, np.ndarray]
     """Per band the C tiles of per-patch rows (raster order, any channels in passes of 80) at its slots: DDR images
     <name>.b ([column][C tiles of 64])."""
     sp = lay.slot_patches().reshape(lay.nb, COLS, 64)
-    return {f"{name}.{b}": np.concatenate([L.ctiles(torch.from_numpy(rows[sp[b, c]]), 64) for c in range(COLS)])
+    return {f"{name}.{b}": np.concatenate([L.ctiles(rows[sp[b, c]], 64) for c in range(COLS)])
             for b in range(lay.nb)}
 
 

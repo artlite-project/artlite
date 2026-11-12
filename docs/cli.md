@@ -94,4 +94,3 @@ A diffusers directory as `-m` generates a 512x512 PNG ([Stable Diffusion 1.5](mo
 | `-s SEED`, `--seed` | the noise's seed (default 1608560892) |
 | `-o FILE`, `--output` | the PNG file (default `output.png`) |
 | `-W N`, `--width`; `-H N`, `--height` | image size (512 only for now) |
-| `--backend NAME` | `npu` (default: the UNet and the VAE decoder on the NPU) or `cpu` (every network in fp32 torch) |

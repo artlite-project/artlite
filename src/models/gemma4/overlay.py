@@ -47,7 +47,6 @@ import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from artlite.decode import kv
@@ -558,9 +557,9 @@ class GemmaOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: torch.Tensor, e: np.ndarray | None, position: int, *, logits: bool = True,
-             start: int | None = None, emb: torch.Tensor | None = None, p: np.ndarray | None = None
-             ) -> torch.Tensor | None:
+    def step(self, x: np.ndarray, e: np.ndarray | None, position: int, *, logits: bool = True,
+             start: int | None = None, emb: np.ndarray | None = None, p: np.ndarray | None = None
+             ) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the scaled embeddings, e (S, layers, per_layer_dim)
         the model's per-layer token rows times sqrt(per_layer_dim / 2) (``GemmaHost.layer_rows``; E2B / E4B), at positions
         position .. position + S - 1 (the positions before are cached). Returns the raw logits (S, vocab) bf16 (before
@@ -571,8 +570,8 @@ class GemmaOverlay(ModelOverlay):
         stays finite) to res = x / (the previous layer's output scale), so the header's residual is x. ``p``: the
         tokens' per-layer projections (S, the overlay's layers, per_layer_dim) bf16 bits as an earlier step left them
         (``read_p``): written instead of the projection's phase."""
-        emb = (x if emb is None else emb).reshape(-1, self.H).float()
-        x = x.reshape(-1, self.H).float()
+        emb = np.asarray(x if emb is None else emb, np.float32).reshape(-1, self.H)
+        x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS
         dev, H = self.dev, self.H
@@ -582,7 +581,7 @@ class GemmaOverlay(ModelOverlay):
         act = dev.view("ACT")
         if start != self.layers[0]:  # (res: what the header scales back to x, with the scale's bf16 bits as M_SCALE)
             x = x / bf16_value(self._scale(start, "qkv"))
-        xf = x.numpy()
+        xf = x
         self._write_loadr(xf)
         sp = packed_slots(S)
         xi = interleave(xf, sp).view(np.uint8).reshape(-1)
@@ -599,7 +598,7 @@ class GemmaOverlay(ModelOverlay):
         self.ple = p is None or not self.cfg.per_layer_dim or start != self.layers[0]
         if self.cfg.per_layer_dim:
             if self.ple:
-                self._write_input(self.inp[PLE_PHASE][0], interleave(emb.numpy(), sp).view(np.uint8).reshape(-1))
+                self._write_input(self.inp[PLE_PHASE][0], interleave(emb, sp).view(np.uint8).reshape(-1))
             self._write_pe(np.asarray(e, np.float32).reshape(S, -1, self.cfg.per_layer_dim), None if self.ple else p)
         return self._run(S, position, logits)
 
@@ -631,7 +630,7 @@ class GemmaOverlay(ModelOverlay):
             self.dev.fetch("ACT", self.inp[(L, "gate")][0].off + 4 * META, 2 * S * d)
         return self.dev.view("ACT").view(np.uint16)[self._pe_index()[:, :S]].transpose(1, 0, 2)
 
-    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[torch.Tensor, torch.Tensor]:
+    def read_kv(self, layer: int, positions: list[int] | range) -> tuple[np.ndarray, np.ndarray]:
         """K, V (kv heads, n, head_dim) fp32 as cached for the positions of an own-cache layer: K normed and rotated
         (without the k_norm weight), V normed."""
         cfg = self.cfg
@@ -645,14 +644,14 @@ class GemmaOverlay(ModelOverlay):
             k, v = kv.kv_from_groups(self.dev.view("KV")[b:b + n * self.G * self.T].reshape(n, self.G, self.T), hd)
             ks.append(k[pos])
             vs.append(v[pos])
-        return torch.from_numpy(np.stack(ks)), torch.from_numpy(np.stack(vs))
+        return np.stack(ks), np.stack(vs)
 
-    def residual(self, slot: int = 0) -> torch.Tensor:
+    def residual(self, slot: int = 0) -> np.ndarray:
         """The last step's residual stream after the last layer (the LM header's update), bf16 values as fp32."""
         off, sp = self.final + XB + XPAY, packed_slots(self._last_s)
         self.dev.fetch("ACT", off, 4 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 4 * sp * self.H].view(np.uint16).reshape(-1, 2, sp, 8)[:, 1, slot]
-        return torch.from_numpy(v.reshape(-1).copy()).view(torch.bfloat16).float()
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
 
 __all__ = ["GemmaOverlay"]

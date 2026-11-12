@@ -143,7 +143,7 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
 def _rows(img: object, tensors: tuple[str, ...], rows: np.ndarray, K: int = 0) -> torch.Tensor:
     """Dequantized rows of the stacked tensors as the image holds them (Llama's Q / K rows in rotate-half order, Gemma's
     proj in its slotted copy; K: zero columns past the tensors' up to K, a K padded to whole chunks)."""
-    w = torch.cat([img.tensor(t).dequantize().float().reshape(img.tensor(t).rows, -1) for t in tensors])
+    w = torch.cat([torch.from_numpy(img.tensor(t).dequantize()).reshape(img.tensor(t).rows, -1) for t in tensors])
     w = w[torch.from_numpy(rows)]
     return torch.nn.functional.pad(w, (0, max(K - w.shape[1], 0)))
 
@@ -265,7 +265,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
 
 def _ratio(img: object, region: object) -> torch.Tensor:
     """The norm weight's w / bf16(w) of a region's input (the factor F32 rows are packed with: ``QwenImage.pack``)."""
-    w = img.gguf.tensor(f"blk.{region.layer}.attn_norm.weight").dequantize().float().reshape(-1)
+    w = torch.from_numpy(img.gguf.tensor(f"blk.{region.layer}.attn_norm.weight").dequantize()).reshape(-1)
     bw = w.bfloat16().float()
     return torch.where(bw != 0, w / torch.where(bw != 0, bw, 1), 1)
 
@@ -298,7 +298,7 @@ def test_unit_gemm(fmt: str, tiles: int) -> None:
     lib = Library("t_unit_gemm", ops).compile().load()
     A = (torch.randn(ops[0].M, K, generator=torch.Generator().manual_seed(1)) * 0.5).bfloat16()
     Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), ops[0].M, K))
-    want = Aq[:T] @ t.dequantize().float().T
+    want = Aq[:T] @ torch.from_numpy(t.dequantize()).T
     for op in ops:
         C = _run(lib, op, A, W, -op.hdr_skip)[:T].float()
         cols = np.concatenate([c * pitch + w * p + np.arange(tiles * R) for c in range(COLS) for p in range(op.passes)])

@@ -11,7 +11,7 @@ import os
 
 import numpy as np
 import pytest
-import torch
+from ml_dtypes import bfloat16
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_mtp_of
@@ -83,9 +83,9 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     tied = np.zeros(N, bool)
     if cfg.moe:
         t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
-        p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ t.dequantize().numpy().reshape(t.rows, -1).T), -1)[:, ::-1]
+        p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ t.dequantize().reshape(t.rows, -1).T), -1)[:, ::-1]
         tied = (p[:, 7] - p[:, 8]) / p[:, 7] < tie  # (rows whose 8th and 9th experts nearly tie: either may win)
-    return draft, torch.from_numpy(emb), torch.from_numpy(h), r, tied, tol
+    return draft, emb, h, r, tied, tol
 
 
 @pytest.mark.parametrize("S", [1, 3, 4, 8])
@@ -100,8 +100,8 @@ def test_draft_steps(setup: tuple, S: int) -> None:
     lg, hs = [], []
     for p in range(0, N, S):
         k = min(S, N - p)
-        lg.append(draft.step(emb[p:p + k], h[p:p + k], p).float().numpy().copy())
-        hs += [draft.hidden_state(s).numpy() for s in range(k)]
+        lg.append(draft.step(emb[p:p + k], h[p:p + k], p).astype(np.float32))
+        hs += [draft.hidden_state(s) for s in range(k)]
     lg, hs = np.concatenate(lg), np.stack(hs)
     want = r["h_nextn"].astype(np.float64)
     e = np.sqrt(((hs - want) ** 2).mean(-1) / (want ** 2).mean(-1))
@@ -132,8 +132,8 @@ def test_table(setup: tuple) -> None:
     ids = t.ids.copy()
     t.see(seq)
     assert np.array_equal(t.ids, ids)
-    lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).float().numpy()[:, t.rows] for p in range(0, N, 4)])
-    w = d.gguf.rows("output.weight", t.ids[t.rows]).numpy().astype(np.float64)
+    lg = np.concatenate([d.step(emb[p:p + 4], h[p:p + 4], p).astype(np.float32)[:, t.rows] for p in range(0, N, 4)])
+    w = d.gguf.rows("output.weight", t.ids[t.rows]).astype(np.float64)
     want = r["h_nextn"].astype(np.float64) @ w.T
     e = np.sqrt(((lg - want) ** 2).mean(-1) / (want ** 2).mean(-1))
     # (8 slots: 3.6%; Occamy's 2.3%: position 0's V in the step's blocks, ``TOL``)
@@ -146,13 +146,13 @@ def test_interleaved(setup: tuple) -> None:
     draft, emb, h, *_ = setup
     target, n = draft.target, 12
     draft.reset()
-    alone = [draft.step(emb[p:p + 1], h[p:p + 1], p).clone() for p in range(n)]
+    alone = [draft.step(emb[p:p + 1], h[p:p + 1], p).copy() for p in range(n)]
     draft.reset()
     target.reset()
     for p in range(n):
         target.step(emb[p:p + 2], p, logits=False, commit=False)
         target.accept(1)
-        assert torch.equal(draft.step(emb[p:p + 1], h[p:p + 1], p), alone[p]), p
+        assert np.array_equal(draft.step(emb[p:p + 1], h[p:p + 1], p).view(np.uint16), alone[p].view(np.uint16)), p
 
 
 @pytest.mark.parametrize("size", SIZES)
@@ -175,27 +175,26 @@ def test_draft_prefill(size: str) -> None:
     draft.load()
     pf.bind()
     n = T * nch
-    emb = g.rows("token_embd.weight", ref.llama_tokenize(model, essay("apple.txt"))[:n + 1]).float()
+    emb = g.rows("token_embd.weight", ref.llama_tokenize(model, essay("apple.txt"))[:n + 1])
     target.rope[:n + 4] = np.arange(n + 4)[:, None]
     xs = []
     for c in range(nch):
         pf.run(emb[c * T:(c + 1) * T], c * T, T)
         xs.append(pf.hidden(0, T))
-    x = torch.cat(xs)
-    h = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + target.cfg.rms_norm_eps) * torch.from_numpy(
-        target._f32("output_norm.weight"))
-    hp = torch.cat([torch.zeros(1, draft.H), h])  # (row q: the model's h of q - 1)
-    dev_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
+    x = np.concatenate(xs)
+    h = x / np.sqrt((x * x).mean(-1, keepdims=True) + target.cfg.rms_norm_eps) * target._f32("output_norm.weight")
+    hp = np.concatenate([np.zeros((1, draft.H), np.float32), h])  # (row q: the model's h of q - 1)
+    dev_carry = pf.dp.carry.view(bfloat16).astype(np.float32)
     pf.dp.carry_of(h[n - 1])  # (the host's, after decode steps)
-    host_carry = torch.from_numpy(pf.dp.carry.copy()).view(torch.bfloat16).float()
-    assert float((dev_carry - host_carry).norm() / host_carry.norm()) < carry
-    a = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
-    ha = draft.hidden_state(0).numpy()
+    host_carry = pf.dp.carry.view(bfloat16).astype(np.float32)
+    assert float(np.linalg.norm(dev_carry - host_carry) / np.linalg.norm(host_carry)) < carry
+    a = draft.step(emb[n:n + 1], hp[n:n + 1], n).astype(np.float32)
+    ha = draft.hidden_state(0)
     draft.reset()
     for p in range(0, n, draft.SLOTS):
         draft.step(emb[p:p + draft.SLOTS], hp[p:p + draft.SLOTS], p)
-    b = draft.step(emb[n:n + 1], hp[n:n + 1], n).float().numpy().copy()
-    hb = draft.hidden_state(0).numpy()
+    b = draft.step(emb[n:n + 1], hp[n:n + 1], n).astype(np.float32)
+    hb = draft.hidden_state(0)
     for u, v in ((ha, hb), (a, b)):
         assert np.sqrt(((u - v) ** 2).mean() / (v ** 2).mean()) < rec
     assert a.argmax() == b.argmax()

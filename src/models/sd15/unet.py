@@ -10,7 +10,7 @@ by diffusers name (``w[p + ...]``).
 
 from dataclasses import dataclass
 
-import torch  # noqa: TID251
+import numpy as np
 
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
@@ -33,10 +33,10 @@ from artlite.vision.layers import (
 )
 from artlite.vision.ops import Attention, Gemm
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.weights import cat
+from artlite.vision.weights import cat, flat
 
 
-def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: torch.Tensor, eps: float,
+def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: np.ndarray, eps: float,
            stats: tuple[int, int] | None) -> Tensor:
     """diffusers' ResnetBlock2D: GN1 + SiLU, conv1 (+ the time bias), GN2 + SiLU, conv2 + x (or its 1x1 shortcut).
     x: C tiles with records for GN1 (freed); returns the output C tiles with records for ``stats``."""
@@ -131,7 +131,7 @@ def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, 
     for k in range(2):  # (the hidden channels in halves: the GEGLU output of all of them does not fit the memtile)
         g = alloc(bd, lv, half, "pn", pnp=lv.np + junk)
         rows = cat([w1[k * half:(k + 1) * half], w1[hid + k * half:hid + (k + 1) * half]])
-        bias = torch.cat([b1[k * half:(k + 1) * half], b1[hid + k * half:hid + (k + 1) * half]])
+        bias = np.concatenate([b1[k * half:(k + 1) * half], b1[hid + k * half:hid + (k + 1) * half]])
         gemm(bd, n, rows, bias, name=q + f"ff1.{k}", out=g, kind="geglu", split=2)
         if k == 1:
             free(bd, n)
@@ -186,7 +186,7 @@ def transformer_bands(bd: Builder, w: dict, p: str, x: DTensor, *, kv: int, ctx_
     return out
 
 
-def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: torch.Tensor, eps: float,
+def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bias: np.ndarray, eps: float,
                  stats: tuple[int, int] | None, name: str) -> DTensor:
     """``resnet`` on a banded level (x and the output in DDR): GN1 + SiLU of each band into the whole column's panels
     (the convs' halo rows), conv1 (+ the time bias) per band with GN2's records (parked in DDR, the last band's kept),
@@ -302,7 +302,7 @@ def skip_bands(bd: Builder, x: DTensor, *, name: str, st: tuple[int, int]) -> DT
     return out
 
 
-def resnet_cat_bands(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cout: int, time_bias: torch.Tensor,
+def resnet_cat_bands(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *, cout: int, time_bias: np.ndarray,
                      eps: float, stats: tuple[int, int] | None, name: str) -> DTensor:
     """``resnet_cat`` on a banded level (h, the skip and the output in DDR; their records in the concatenation's group
     space): conv1 and the 1x1 shortcut over K parts of at most 640 channels (h's, the skip's: a part's whole-column
@@ -339,7 +339,7 @@ def resnet_cat_bands(bd: Builder, w: dict, p: str, h: DTensor, skip: DTensor, *,
             px = alloc(bd, lv, n, "pn", top=True)
             plain(bd, xb, px, name=f"{p}xpn.{k}")
             free(bd, xb)
-            gemm(bd, px, wsc[:, cc:cc + n].flatten(1), w[p + "conv_shortcut.bias"] if k == 0 else None,
+            gemm(bd, px, flat(wsc[:, cc:cc + n]), w[p + "conv_shortcut.bias"] if k == 0 else None,
                  name=f"{p}conv_shortcut.{k}", out=sb, res=sb if k else None)
             free(bd, px)
         sc.store(bd, b, sb, defer=False)
@@ -397,7 +397,7 @@ def make_skip(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], norm: t
     return Skip(x.lv, x.C, name + ".ct", name + ".pn", rec)
 
 
-def resnet_cat(bd: Builder, w: dict, p: str, h: Tensor, skip: Skip, *, cout: int, time_bias: torch.Tensor,
+def resnet_cat(bd: Builder, w: dict, p: str, h: Tensor, skip: Skip, *, cout: int, time_bias: np.ndarray,
                eps: float, stats: tuple[int, int] | None) -> Tensor:
     """A resnet of the up path on the concatenation [h | skip] (h: C tiles with records in the concatenation's group
     space): conv1 and the 1x1 shortcut in two K-chunks (h's, the skip's), the partials in the residual stream; ordered
@@ -486,7 +486,7 @@ def upsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] 
 CTX_KEYS = 77  # (the text context's tokens)
 
 
-def section(bd: Builder, w: dict, x6: Tensor, *, biases: dict[str, torch.Tensor], ctx_kv: dict[str, int], kv: int,
+def section(bd: Builder, w: dict, x6: Tensor, *, biases: dict[str, np.ndarray], ctx_kv: dict[str, int], kv: int,
             eps: float) -> Tensor:
     """The UNet's 16x16 / 8x8 levels: down_blocks.2 (2 resnets + transformers, the downsampler), down_blocks.3 (2
     resnets), the mid block, up_blocks.0 (3 resnets on concatenations, the upsampler), up_blocks.1 (3 resnets on
@@ -540,7 +540,7 @@ def section(bd: Builder, w: dict, x6: Tensor, *, biases: dict[str, torch.Tensor]
     return tr(u1 + "attentions.2.", x, None)
 
 
-def outer(bd: Builder, w: dict, x5: DTensor, s3: DTensor, *, biases: dict[str, torch.Tensor], ctx_kv: dict[str, int],
+def outer(bd: Builder, w: dict, x5: DTensor, s3: DTensor, *, biases: dict[str, np.ndarray], ctx_kv: dict[str, int],
           kv: int, kv32: int, eps: float) -> DTensor:
     """The UNet from down_blocks.1 to up_blocks.2 (the 32x32 level banded, the 16x16 / 8x8 levels by ``section``): x5
     (32x32, 320 channels: down_blocks.0's downsampler output, records for down_blocks.1's first GroupNorm) and s3 (the
