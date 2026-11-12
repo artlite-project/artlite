@@ -310,19 +310,19 @@ class GemmaPrepOperator(ArtcOperator):
     """The attention prep of T tokens of one layer kind (module docstring). Runtime sequence: G (the qkv GEMM's
     output, ``layout``), CS (the kind's ``cs_table`` of every position, as bf16 pairs), PRM (``prm_object``), QS (per
     token group and column the Q panels, head_dim 512 pass-major: ``n_qs``; a sub-chunk's part of a chunk's), KV (the
-    layer's cache: 2 KV heads of ``kv_bytes`` each, from the first head's guard). Parameters ``params``."""
+    layer's cache: 2 KV heads of ``kv_bytes`` each, from the first head's guard; a sub-chunk's from its first group:
+    the cache's groups it writes lie inside, the bytes past the caches are never touched). Parameters ``params``."""
 
     STACK = 2048
     pfx = kernel_prefix("g4ap")
 
     def __init__(self, *, T: int, cfg: GemmaConfig, hd: int, layout: Layout, kv_bytes: int, cs_positions: int,
-                 kv_pad: int = 0, kp: int = 2):
+                 kp: int = 2):
         """``kp``: the cache's K panels per record (2: hi + lo, 1: single)."""
         assert cfg.num_attention_heads == COLS and all(k == COLS // QH for k in cfg.kv_heads)
         self.kind = kind_of(cfg, hd, kp)
         assert T % 32 == 0 and T // 8 <= 64 and {"q", "kv"} <= set(layout.off)
         self.T, self.cfg, self.layout, self.kv_bytes, self.cs_positions = T, cfg, layout, kv_bytes, cs_positions
-        self.kv_pad = kv_pad
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
@@ -354,7 +354,7 @@ class GemmaPrepOperator(ArtcOperator):
                 ArgSpec("in", (self.n_cs,), bfloat16),
                 ArgSpec("in", (8 * 4 * k.rot,), bfloat16),
                 ArgSpec("out", (self.n_qs,), bfloat16),
-                ArgSpec("out", ((COLS // QH * self.kv_bytes + self.kv_pad) // 2,), bfloat16)]
+                ArgSpec("out", (COLS // QH * self.kv_bytes // 2,), bfloat16)]
 
     def params(self, p0: int, guard: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 (``guard``: the cache's groups before group 0)."""
@@ -420,7 +420,7 @@ class GemmaPrepOperator(ArtcOperator):
                                              k_k if roles[c] == "k" else k_v, Buffer(ws_ty, name=f"gp_wk{c}")],
                                       tile=Tile(c, 3), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
-        n_cs, n_kv, n_qs = self.n_cs, (COLS // QH * self.kv_bytes + self.kv_pad) // 2, self.n_qs
+        n_cs, n_kv, n_qs = self.n_cs, COLS // QH * self.kv_bytes // 2, self.n_qs
         qh = k.qp // 2  # (a token group's Q panels of a column, bf16: rows of 1152 for a shim BD)
         hb, g2 = self.kv_bytes // 2, k.group // 2
         n_grp = T // k.pg

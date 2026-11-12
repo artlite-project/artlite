@@ -53,6 +53,7 @@ from .prefill_ple import PleOperator
 SUB = 288  # tokens per sub-chunk (the operators' T: the GEMMs' whole passes of 3 MAC rows x 96 tokens)
 SIZES = tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each per layer kind)
 MAX_T = SIZES[-1]
+assert MAX_T - SUB <= KV_PAD  # (a chunk's last sub-chunk slices a cache from MAX_T - SUB positions on)
 PAD_ROWS = 64  # rows past a chunk's buffers (a GEMM's padding rows past its tokens, if any)
 PHASES = ("qkv", "o", "gate_up", "down", "gate", "proj")
 DOWN_CHUNKS = 5  # K chunks per down part (4 of E4B's 20: each part's A strip stays in the memtile, each sums 40
@@ -113,7 +114,7 @@ class GemmaPrefill(ChunkPrefill):
         pad = KV_PAD // 16 * ov.G * AP.OBJ  # (the KV arguments past a layer's caches: the overlay's padding at the end)
         self.prep = {hd: AP.GemmaPrepOperator(T=SUB, cfg=cfg, hd=hd, layout=self.plans[(next(
             L for L in own if cfg.head_dim(L) == hd), "qkv")].layout, kv_bytes=self.kv_bytes[hd],
-            cs_positions=self.cs_rows, kv_pad=pad, kp=ov.at.kp) for hd in self.hds}
+            cs_positions=self.cs_rows, kp=ov.at.kp) for hd in self.hds}
         self.attn = {(hd, T): AP.GemmaAttnOperator(T=T, cfg=cfg, hd=hd, kv_bytes=self.kv_bytes[hd], kv_pad=pad,
                                                    kp=ov.at.kp) for hd in self.hds for T in self.sizes}
         self._rows()
@@ -173,7 +174,7 @@ class GemmaPrefill(ChunkPrefill):
                     tok("QS", j, prep, i=3, row=rq), f"KV[{kv0 + j * grp}:{kv0 + j * grp + kvb}]") for j in range(S)]
             if i == len(self.layers) - 1:  # (the last layer: its cache only)
                 break
-            rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + kvb}]", sl("A", 0, attn, i=2)))
+            rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2)))
             (g,) = self.plans[(L, "o")].gemms
             rl += [(g.op, tok("A", j, g.op, i=0, row=ra), self._w(g), tok("Y", j, g.op, i=2)) for j in range(S)]
             n = self.n_o
