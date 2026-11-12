@@ -7,30 +7,25 @@ from collections.abc import Sequence
 from typing import ClassVar
 
 import numpy as np
-import torch
 from aie.ir import Module
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2
 from ml_dtypes import bfloat16
+from numpy.typing import DTypeLike
 
 from artlite.operators import kmath
 from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
 from artlite.operators.design import COLS, ROWS, linear_tap
 
-_NP_DTYPE: dict[torch.dtype, type] = {
-    torch.bfloat16: bfloat16, torch.float32: np.float32, torch.int32: np.int32, torch.int16: np.int16,
-    torch.int8: np.int8, torch.uint8: np.uint8,
-}
+
+def vec(n: int, dtype: DTypeLike) -> type[np.ndarray]:
+    """The IRON type of a buffer of n elements."""
+    return np.ndarray[(n,), np.dtype[np.dtype(dtype).type]]
 
 
-def vec(n: int, dtype: type | torch.dtype) -> type[np.ndarray]:
-    """The IRON type of a buffer of n elements (numpy or torch element type)."""
-    return np.ndarray[(n,), np.dtype[_NP_DTYPE[dtype] if isinstance(dtype, torch.dtype) else dtype]]
-
-
-def stream_design(*, kernel: str, size: int, tile: int, ins: Sequence[type | torch.dtype],
-                  outs: Sequence[type | torch.dtype], cores: int, depth: int = 2, stack_size: int | None = None) -> Module:
+def stream_design(*, kernel: str, size: int, tile: int, ins: Sequence[DTypeLike], outs: Sequence[DTypeLike], cores: int,
+                  depth: int = 2, stack_size: int | None = None) -> Module:
     """The design of a 1-D streaming operator: the arguments (inputs of the element types ``ins``,
     then outputs ``outs``; ``size`` elements each) are split into ``cores`` contiguous chunks, one per
     core, and every core calls ``kernel`` on consecutive tiles of ``tile`` elements of all of them.
@@ -88,13 +83,13 @@ class StreamOperator(ArtcOperator):
     MAX_TILE_BYTES: ClassVar[int] = 8192
     MAX_CHANNELS: ClassVar[int] = 1
 
-    def __init__(self, *, size: int, num_columns: int, tile_size: int | None, dtypes_in: Sequence[torch.dtype],
-                 dtypes_out: Sequence[torch.dtype], num_channels: int = 1):
+    def __init__(self, *, size: int, num_columns: int, tile_size: int | None, dtypes_in: Sequence[DTypeLike],
+                 dtypes_out: Sequence[DTypeLike], num_channels: int = 1):
         self.size = size
         self.num_columns = num_columns
         self.num_channels = num_channels
-        self.dtypes_in = tuple(dtypes_in)
-        self.dtypes_out = tuple(dtypes_out)
+        self.dtypes_in = tuple(np.dtype(d) for d in dtypes_in)
+        self.dtypes_out = tuple(np.dtype(d) for d in dtypes_out)
         cores = num_columns * num_channels
         self.tile_size = ts = tile_size or size // cores
         max_ch = min(self.MAX_CHANNELS, ROWS)
@@ -150,8 +145,8 @@ class SiluOperator(StreamOperator):
     def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, table: str = "silu",
                  repeat: int = 1):
         self.table, self.repeat = table, repeat
-        super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, dtypes_in=(torch.bfloat16,),
-                         dtypes_out=(torch.bfloat16,))
+        super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, dtypes_in=(bfloat16,),
+                         dtypes_out=(bfloat16,))
 
     @property
     def kernel_name(self) -> str:
@@ -175,8 +170,8 @@ class VtanhOperator(StreamOperator):
     """vtanh (``al::tanh_acc``) of a bf16 vector: the hardware's table, read for ``kmath_sim.load_vtanh``."""
 
     def __init__(self, *, size: int):
-        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(torch.bfloat16,),
-                         dtypes_out=(torch.bfloat16,))
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(bfloat16,),
+                         dtypes_out=(bfloat16,))
 
     @property
     def kernel_name(self) -> str:
@@ -194,7 +189,7 @@ class GeluOperator(StreamOperator):
 
     def __init__(self, *, size: int, num_columns: int = 1, tile_size: int | None = None, num_channels: int = 1):
         super().__init__(size=size, num_columns=num_columns, tile_size=tile_size, num_channels=num_channels,
-                         dtypes_in=(torch.bfloat16,), dtypes_out=(torch.bfloat16,))
+                         dtypes_in=(bfloat16,), dtypes_out=(bfloat16,))
 
     @property
     def kernel_name(self) -> str:
@@ -249,7 +244,7 @@ class KmOperator(StreamOperator):
         self.func, self.kwargs = func, kwargs
         args = {k: kmath.TABLES[v] if k == "table" else v for k, v in kwargs.items()}
         self.fn = getattr(kmath, func)(**args)
-        dt = torch.bfloat16 if self.fn.arg == "ptr" and not self.fn.params.get("f32") else torch.float32
+        dt = bfloat16 if self.fn.arg == "ptr" and not self.fn.params.get("f32") else np.float32
         super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(dt,), dtypes_out=(dt,))
 
     @property

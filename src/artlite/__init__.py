@@ -14,13 +14,13 @@ Pipeline usage (batch dispatch, explicit sync)::
     op_a = OpA(...).compile(device=dev)
     op_b = OpB(...).compile(device=dev)
 
-    x = artlite.from_torch(x_torch, dev)
+    x = artlite.from_numpy(x_np, dev)
     tmp = artlite.empty(x.shape, dtype=x.dtype, device=dev)
     y = artlite.empty(x.shape, dtype=x.dtype, device=dev)
 
     op_a.dispatch(x, tmp)  # no host sync
     op_b.dispatch(tmp, y)  # tmp stays on device
-    result = y.to_torch()  # one sync at the end
+    result = y.numpy()  # one sync at the end
 """
 
 import math
@@ -36,8 +36,9 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 # spinning while the NPU worked, 62 W instead of ~25)
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
+import ml_dtypes
 import numpy as np
-import torch  # noqa: TID251
+from numpy.typing import DTypeLike
 
 from . import profiling, txn
 from .backend import _native  # (first: the backend ARTLITE_BACKEND selects is artlite._native)
@@ -51,58 +52,21 @@ DispatchError = _native.DispatchError
 HeapFullError = _native.HeapFullError
 Device = _native.Device
 
-
-def _get_buffer_nbytes(size: tuple, dtype: torch.dtype) -> int:
-    return math.prod(size) * torch.tensor([], dtype=dtype).element_size()
-
-
-# numpy dtype usable to reinterpret the raw byte buffer for each torch dtype.
-# All shape/dtype juggling MUST happen at the numpy level, followed by a
-# single torch.from_numpy() hop: torch tensors whose provenance contains a
-# torch-level shape-changing op (reshape/shape-view) are torn down only after
-# nanobind's Py_AtExit leak check, which then falsely reports the underlying
-# Buffer/Device instances as leaked.  (Dtype-only torch .view() hops are
-# teardown-safe, so bfloat16 is handled via uint16 at the numpy level plus
-# one torch dtype view.)
-_TORCH_TO_NUMPY: dict[torch.dtype, np.dtype] = {
-    torch.float32: np.dtype(np.float32),
-    torch.float64: np.dtype(np.float64),
-    torch.float16: np.dtype(np.float16),
-    torch.int8: np.dtype(np.int8),
-    torch.uint8: np.dtype(np.uint8),
-    torch.int16: np.dtype(np.int16),
-    torch.uint16: np.dtype(np.uint16),
-    torch.int32: np.dtype(np.int32),
-    torch.uint32: np.dtype(np.uint32),
-    torch.int64: np.dtype(np.int64),
-    torch.bool: np.dtype(np.bool_),
-}
-
-
-def _map_torch(raw: _native.Buffer, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-    """Zero-copy torch view of a raw device buffer with the given shape/dtype."""
-    view_as_uint16 = dtype == torch.bfloat16
-    np_dtype = np.dtype(np.uint16) if view_as_uint16 else _TORCH_TO_NUMPY[dtype]
-    arr = raw.map().view(np_dtype).reshape(shape)
-    t = torch.from_numpy(arr)
-    if view_as_uint16:
-        t = t.view(torch.bfloat16)
-    return t
+bfloat16 = np.dtype(ml_dtypes.bfloat16)
 
 
 class Tensor:
     """Device-resident tensor with explicit sync control.
 
-    Created via ``from_torch()`` or ``empty()``.  Data stays on device until
-    ``.to_torch()`` is called.
+    Created via ``from_numpy()`` or ``empty()``.  Data stays on device until
+    ``.numpy()`` is called.
     """
 
-    def __init__(self, size: tuple, *, dtype: torch.dtype, device: Device):
-        nbytes = _get_buffer_nbytes(size, dtype)
+    def __init__(self, shape: tuple[int, ...], *, dtype: DTypeLike, device: Device):
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
         # alloc_host_buffer returns zeroed memory, so we don't need to zero it
-        self._raw = device.alloc_host_buffer(nbytes)
-        self.shape = size
-        self.dtype = dtype
+        self._raw = device.alloc_host_buffer(self.nbytes)
         self.device = device
         self._synced_to_device = True
 
@@ -111,7 +75,7 @@ class Tensor:
 
     @property
     def nbytes(self) -> int:
-        return _get_buffer_nbytes(self.shape, self.dtype)
+        return self.numel() * self.dtype.itemsize
 
     def sync_to_device(self) -> None:
         """Ensure host data is visible to the NPU."""
@@ -123,26 +87,24 @@ class Tensor:
         """Ensure NPU results are visible to the host."""
         self._raw.sync_from_device()
 
-    def to_torch(self) -> torch.Tensor:
-        """Read data back from device and return a torch tensor."""
+    def numpy(self) -> np.ndarray:
+        """The NPU's data: synced from the device, a zero-copy view of the buffer (writes to it reach the device
+        only through ``from_numpy``'s copy or an explicit ``_raw.sync_to_device()``)."""
         self.sync_from_device()
-        return _map_torch(self._raw, self.shape, self.dtype)
+        return self._raw.map().view(self.dtype)[:self.numel()].reshape(self.shape)
 
 
-def empty(
-    size: tuple, *, dtype: torch.dtype = torch.bfloat16, device: Device
-) -> "Tensor":
-    return Tensor(size=size, dtype=dtype, device=device)
+def empty(shape: tuple[int, ...], *, dtype: DTypeLike = bfloat16, device: Device) -> Tensor:
+    return Tensor(shape, dtype=dtype, device=device)
 
 
-def from_torch(t: torch.Tensor, dev: Device) -> Tensor:
-    """A new device Tensor holding a copy of ``t`` (synced to the device)."""
-    src = t.contiguous().view(torch.uint8).reshape(-1)
-    tensor = Tensor(t.shape, dtype=t.dtype, device=dev)
-    torch.from_numpy(tensor._raw.map()).copy_(src)
+def from_numpy(a: np.ndarray, dev: Device) -> Tensor:
+    """A new device Tensor holding a copy of ``a`` (synced to the device)."""
+    a = np.asarray(a)
+    tensor = Tensor(a.shape, dtype=a.dtype, device=dev)
+    tensor._raw.map()[:tensor.nbytes] = np.ascontiguousarray(a).reshape(-1).view(np.uint8)
     tensor._synced_to_device = False
     tensor.sync_to_device()
-
     return tensor
 
 
@@ -161,12 +123,12 @@ class Program:
         dev = artlite.Device()
         prog_a = OpA(...).compile(device=dev)
         prog_b = OpB(...).compile(device=dev)
-        buf = from_torch(x, dev)
+        buf = from_numpy(x, dev)
         tmp = artlite.empty(buf.shape, dtype=buf.dtype, device=dev)
         out = artlite.empty(..., device=dev)
         prog_a.dispatch(buf, tmp)     # no host sync
         prog_b.dispatch(tmp, out)     # tmp stays on device
-        result = out.to_torch()       # one sync at the end
+        result = out.numpy()          # one sync at the end
     """
 
     def __init__(
@@ -180,7 +142,7 @@ class Program:
         self.pdi_path = pdi_path
         self.insts_path = insts_path
         self.arg_specs = arg_specs
-        self._arg_bytes = [_get_buffer_nbytes(shape, dtype) for _, shape, dtype in arg_specs]
+        self._arg_bytes = [math.prod(shape) * np.dtype(dtype).itemsize for _, shape, dtype in arg_specs]
         self._device = device
         self._exe = None
         self._kern = None
@@ -318,24 +280,24 @@ class Program:
                 profiling.register_trace_dump(path, self._prof_work_dir)
             self._trace_seq += 1
 
-    def run(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def run(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         """Convenience: allocate outputs, sync, dispatch, read back.
 
-        Each input tensor is validated against the corresponding ``ArgSpec``:
+        Each input array is validated against the corresponding ``ArgSpec``:
         the **dtype** must match exactly, and the **total element count**
-        (``numel()``) must equal ``math.prod(spec.shape)``.  The actual
-        tensor shape may differ (e.g. flattened or transposed views are fine).
+        (``size``) must equal ``math.prod(spec.shape)``.  The actual
+        array shape may differ (e.g. flattened or transposed views are fine).
 
         Output buffers are allocated using the shapes from ``arg_specs``
         and returned after device-to-host sync.
 
         Args:
-            *inputs: One ``torch.Tensor`` per ``ArgDirection.IN`` entry
+            *inputs: One array per ``ArgDirection.IN`` entry
                 in ``self.arg_specs``.
 
         Returns:
-            A single output tensor when there is one ``ArgDirection.OUT``
-            spec, otherwise a tuple of tensors.
+            A single output array (a view of its device buffer) when there is
+            one ``ArgDirection.OUT`` spec, otherwise a tuple of arrays.
         """
 
         input_specs = [
@@ -351,18 +313,18 @@ class Program:
 
         if len(inputs) != len(input_specs):
             raise ValueError(
-                f"Expected {len(input_specs)} input tensors, got {len(inputs)}"
+                f"Expected {len(input_specs)} input arrays, got {len(inputs)}"
             )
 
         for i, (buf, (expected_shape, expected_dtype)) in enumerate(
             zip(inputs, input_specs)
         ):
-            if buf.dtype != expected_dtype:
+            if np.dtype(buf.dtype) != np.dtype(expected_dtype):
                 raise ValueError(
                     f"Input {i}: dtype mismatch — expected {expected_dtype}, got {buf.dtype}"
                 )
             expected_numel = math.prod(expected_shape)
-            actual_numel = buf.numel()
+            actual_numel = buf.size
             if actual_numel != expected_numel:
                 raise ValueError(
                     f"Input {i}: element count mismatch — "
@@ -372,12 +334,12 @@ class Program:
         self._ensure_loaded()
         dev = self._device
 
-        in_bufs = [from_torch(t, dev) for t in inputs]
+        in_bufs = [from_numpy(t, dev) for t in inputs]
         out_bufs = [
             empty(shape, dtype=dtype, device=dev) for shape, dtype in output_specs
         ]
 
         self.dispatch(*in_bufs, *out_bufs)
 
-        results = [b.to_torch() for b in out_bufs]
+        results = [b.numpy() for b in out_bufs]
         return results[0] if len(results) == 1 else tuple(results)

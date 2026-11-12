@@ -127,8 +127,8 @@ ARTLITE_PROFILE=1 ARTLITE_PROFILE_COUNTERS=33:34,34:33 \
 # Full waveform trace of a single-column GELU kernel (then open the .json in
 # Perfetto — synthesized X slices = named kernel windows):
 ARTLITE_PROFILE=trace ARTLITE_PROFILE_TRACE_SIZE=262144 \
-  python -c "import torch; from tests.operators.elementwise import GeluOperator; \
-             GeluOperator(size=65536, tile_size=1024).compile().run(torch.zeros(65536, dtype=torch.bfloat16))"
+  python -c "import numpy as np; from ml_dtypes import bfloat16; from tests.operators.elementwise import GeluOperator; \
+             GeluOperator(size=65536, tile_size=1024).compile().run(np.zeros(65536, bfloat16))"
 ```
 
 Kernel side: `event0();` / `event1();` around the code of interest (the GELU / SiLU harnesses of

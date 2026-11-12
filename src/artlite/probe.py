@@ -17,7 +17,6 @@ all fall on one DRAM channel (the interleave below 4 KB), larger rows on several
 from typing import NamedTuple
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU2, Tile
 
@@ -104,7 +103,7 @@ class ClockProbeOperator(ArtcOperator):
         return _SPIN.render(p=P, LOAD_BYTES=LOAD_BYTES)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.WORDS,), torch.int32), ArgSpec("out", (self.WORDS,), torch.int32)]
+        return [ArgSpec("in", (self.WORDS,), np.int32), ArgSpec("out", (self.WORDS,), np.int32)]
 
     def get_mlir_artifact(self) -> object:
         t = np.ndarray[(self.WORDS,), np.dtype[np.int32]]
@@ -158,7 +157,7 @@ class DmaProbeOperator(ArtcOperator):
     host-built transactions (``OverlayDevice``)."""
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (1024,), torch.int32), ArgSpec("out", (1024,), torch.int32)]
+        return [ArgSpec("in", (1024,), np.int32), ArgSpec("out", (1024,), np.int32)]
 
     def get_mlir_artifact(self) -> str:
         mt = f"memref<{SINK_WORDS}xi32>"

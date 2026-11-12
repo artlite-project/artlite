@@ -20,7 +20,6 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
-import torch  # noqa: TID251
 
 import artlite
 from artlite import backend, portable
@@ -186,13 +185,12 @@ def timed(fn: Callable[[], None], *, seconds: float, warmup: int = 2) -> float:
 def array_clock(op: ClockProbeOperator, *, seconds: float) -> tuple[float, float]:
     """(MHz, dispatch round trip in us): one core spinning for n cycles of its counter (``op.load``: all cores, with
     MMULs), timed at two n."""
-    out = artlite.empty((ClockProbeOperator.WORDS,), dtype=torch.int32, device=op.device)
+    out = artlite.empty((ClockProbeOperator.WORDS,), dtype=np.int32, device=op.device)
     durations = {}
     for n in (1 << 10, 1 << 24, 1 << 27):
-        n_in = artlite.from_torch(torch.tensor([n] + [0] * (ClockProbeOperator.WORDS - 1), dtype=torch.int32),
-                                  op.device)
+        n_in = artlite.from_numpy(np.array([n] + [0] * (ClockProbeOperator.WORDS - 1), np.int32), op.device)
         durations[n] = timed(lambda n_in=n_in: op.dispatch(n_in, out), seconds=seconds / 3)
-        counted = int(out.to_torch()[0])
+        counted = int(out.numpy()[0])
         assert counted >= n, f"the core counted {counted} of {n} cycles"
     mhz = ((1 << 27) - (1 << 24)) / (durations[1 << 27] - durations[1 << 24]) / 1e6
     return mhz, durations[1 << 10] * 1e6

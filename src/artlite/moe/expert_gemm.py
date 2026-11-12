@@ -35,7 +35,6 @@ formats: Q4_K and BFP16 (tile-major), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS
 import functools
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects import arith
 from aie.dialects._aiex_ops_gen import npu_sync as _npu_sync
 from aie.dialects.aie import T
@@ -190,9 +189,9 @@ class ExpertGemmOperator(GemmQdOperator):
         return M * self.KA * 9 // 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * self.cb_words * 2,), torch.bfloat16),
-                ArgSpec("in", (COLS * self.cap * self.a_slot,), torch.bfloat16),
-                ArgSpec("out", (COLS * self.cap * self.c_slot,), torch.bfloat16)]
+        return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16),
+                ArgSpec("in", (COLS * self.cap * self.a_slot,), bfloat16),
+                ArgSpec("out", (COLS * self.cap * self.c_slot,), bfloat16)]
 
     # ------------------------------------------------------------------
     # Host side: a chunk's tasks

@@ -61,7 +61,6 @@ from functools import cached_property
 from typing import ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects.aiex import npu_write32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
@@ -418,9 +417,9 @@ class PrepOperator(ArtcOperator):
         return (self.shape.kvh * self.kv_bytes + self.kv_pad) // 2
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        nw = [ArgSpec("in", (self.nw_bytes(self.shape.hd) // 2,), torch.bfloat16)] if self.norm else []
-        return [ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16), ArgSpec("in", (self.n_cs,), torch.bfloat16),
-                ArgSpec("out", (self.n_qs,), torch.bfloat16), ArgSpec("out", (self.n_kv,), torch.bfloat16), *nw]
+        nw = [ArgSpec("in", (self.nw_bytes(self.shape.hd) // 2,), bfloat16)] if self.norm else []
+        return [ArgSpec("in", (self.T * self.layout.N,), bfloat16), ArgSpec("in", (self.n_cs,), bfloat16),
+                ArgSpec("out", (self.n_qs,), bfloat16), ArgSpec("out", (self.n_kv,), bfloat16), *nw]
 
     def params(self, p0: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 (a group start)."""
@@ -1613,9 +1612,9 @@ class AttnOperator(ArtcOperator):
         return self.n_pass * self.shape.unit
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        seg = [ArgSpec("in", (self.n_seg,), torch.bfloat16)] if self.win or self.nc else []
-        return [ArgSpec("in", (self.n_qs,), torch.bfloat16), ArgSpec("in", (self.n_kv,), torch.bfloat16),
-                ArgSpec("out", (self.n_a,), torch.bfloat16), *seg]
+        seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.win or self.nc else []
+        return [ArgSpec("in", (self.n_qs,), bfloat16), ArgSpec("in", (self.n_kv,), bfloat16),
+                ArgSpec("out", (self.n_a,), bfloat16), *seg]
 
     def seg(self, lo: np.ndarray) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk: ``lo`` (T,) per token the chunk-relative first key of its

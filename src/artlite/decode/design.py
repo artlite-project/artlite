@@ -109,7 +109,6 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Packet, Port, Program, Runtime, Transport, Worker
 from aie.iron.controlflow import forever_, range_
@@ -450,9 +449,9 @@ class DecodeOverlayOperator(ArtcOperator):
         return out
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * self.tile_bytes // 2,), torch.bfloat16),
-                ArgSpec("in", (COLS * XB // 2,), torch.bfloat16),
-                ArgSpec("out", (2 * COLS * C_LEN,), torch.bfloat16)]
+        return [ArgSpec("in", (COLS * self.tile_bytes // 2,), bfloat16),
+                ArgSpec("in", (COLS * XB // 2,), bfloat16),
+                ArgSpec("out", (2 * COLS * C_LEN,), bfloat16)]
 
     def _consts(self) -> dict[str, int]:
         """The metadata, flag and state words the kernel sources take."""
@@ -1015,7 +1014,7 @@ def interleave(x: np.ndarray, sp: int = SLOTS) -> np.ndarray:
     """S <= sp slots' x (S, K) -> the input layout [k block][slot sp][8] (K / 8, sp, 8) bf16 bits (uint16)."""
     S, K = x.shape
     out = np.zeros((K // 8, sp, 8), np.uint16)
-    xb = torch.from_numpy(np.asarray(x, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)
+    xb = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
     out[:, :S] = xb.reshape(S, K // 8, 8).transpose(1, 0, 2)
     return out
 
@@ -1026,7 +1025,7 @@ def norm_objects(w: np.ndarray, tile_bytes: int) -> np.ndarray:
     per = NORM_K
     n = -(-len(w) // per)
     out = np.zeros((n, tile_bytes // 2), np.uint16)
-    wb = torch.from_numpy(np.array(w, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)
+    wb = np.asarray(w, np.float32).astype(bfloat16).view(np.uint16)
     for i in range(n):
         part = wb[i * per:(i + 1) * per]
         out[i, :len(part)] = part

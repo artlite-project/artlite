@@ -230,7 +230,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
         ref.append(mmv.ref_tile(fmt, fc, x, slots)[:S])
         exact.append(x.astype(np.float64) @ _weights(fmt, fc).T)
     X = np.concatenate([mmv.x_panels(x, slots).reshape(-1), mmv.xs_panels(x, NSB, slots).reshape(-1)])
-    got = op.compile().run(torch.from_numpy(np.concatenate(tiles)), torch.from_numpy(X)).numpy()
+    got = op.compile().run(np.concatenate(tiles), X)
     gs = mmv.tile_rows(got.reshape(n_tiles, op.y_floats), R, slots)[:, :S]
     rs, ex = np.stack(ref), np.stack(exact)
     assert np.abs(gs - rs).max() <= 1e-5 * np.abs(rs).max(), np.argwhere(np.abs(gs - rs) > 1e-5 * np.abs(rs).max())[:8]

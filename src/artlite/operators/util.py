@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 if TYPE_CHECKING:
     from .base import ArtcOperator
@@ -37,12 +37,12 @@ def regions(sizes: Iterable[tuple[str, int]], align: int = 64) -> dict[str, int]
 
 def bf16_value(x: float) -> float:
     """x rounded to bf16 (round to nearest even)."""
-    return float(torch.tensor(x).bfloat16())
+    return float(np.float32(x).astype(bfloat16))
 
 
 def bf16_bits(x: float) -> int:
     """The bit pattern of x rounded to bf16 (round to nearest even)."""
-    return int(torch.tensor([x]).bfloat16().view(torch.int16)[0]) & 0xFFFF
+    return int(np.float32(x).astype(bfloat16).view(np.uint16))
 
 
 def bf16_hilo(x: float) -> tuple[float, float]:
@@ -54,4 +54,4 @@ def bf16_hilo(x: float) -> tuple[float, float]:
 def arg_bytes(op: ArtcOperator, i: int) -> int:
     """Bytes of an operator's argument i (``get_arg_spec``)."""
     spec = op.get_arg_spec()[i]
-    return int(np.prod(spec.shape)) * torch.tensor([], dtype=spec.dtype).element_size()
+    return int(np.prod(spec.shape)) * spec.dtype.itemsize

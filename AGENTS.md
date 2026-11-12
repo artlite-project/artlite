@@ -158,7 +158,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   runtime is not in that key, so a monkeypatched test needs its own operator names.
 - First use (`op.device` or the first dispatch) opens a HW context and uploads the program. `dispatch(*buffers)`
   submits in sequence order and waits, without host <-> device syncs; `run(*tensors)` is the one-shot wrapper;
-  `artlite.from_torch` / `artlite.empty(..., device=)` give zero-copy buffers; `compile(device=)` chains operators
+  `artlite.from_numpy` / `artlite.empty(..., device=)` give device buffers (`Tensor.numpy()`: a zero-copy view); `compile(device=)` chains operators
   on one device.
 - NPU2: 8 columns of compute rows 2-5, a memtile (row 1, 512 KB) and a shim (row 0). A core has 64 KB of data
   memory in four 16 KB regions (budget ~63 KB with the stack) and 16 KB of program memory.

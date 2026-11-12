@@ -11,7 +11,6 @@ buffer of the core: no static tables), bf16 like the decode's F_PLI epilogue: bf
 """
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
@@ -76,8 +75,8 @@ class PleOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
-        return [ArgSpec("in", (T * COLS * SLOT,), torch.bfloat16), ArgSpec("in", (T * COLS * PER,), torch.bfloat16),
-                ArgSpec("out", (T * COLS * SLOT * 9 // 16,), torch.bfloat16)]
+        return [ArgSpec("in", (T * COLS * SLOT,), bfloat16), ArgSpec("in", (T * COLS * PER,), bfloat16),
+                ArgSpec("out", (T * COLS * SLOT * 9 // 16,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         T, p, cols = self.T, self.p, self.cols

@@ -5,11 +5,11 @@ Usage::
 
     fused = FusedOperator(name="silu_gelu", runlist=[(silu, "in", "t"), (gelu, "t", "out")], input_args=["in"],
                           output_args=["out"]).compile()
-    fused.get_buffer("in").copy_(x)
+    fused.get_buffer("in")[:] = x
     fused.sync_inputs()
     fused()
     fused.sync_outputs()
-    y = fused.get_buffer("out").clone()
+    y = fused.get_buffer("out").copy()
 
 Lifecycle: ``compile()`` (no device) -> ``load()`` (the BOs and the patched control program; implicit at the first
 buffer access or dispatch) -> host writes, syncs, dispatches. Every buffer the runlist reads before an operator writes
@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from ... import txn
 from ...elf_parser import ParsedElf
@@ -50,7 +50,7 @@ class FusedOperator(FusedElf):
         assert not unknown, f"uninitialized buffers not in the runlist: {sorted(unknown)}"
         self._host_written: set[str] = set()
         self._checked = False  # (the host writes, at the first dispatch)
-        self._views: dict[str, torch.Tensor] = {}
+        self._views: dict[str, np.ndarray] = {}
 
     def render_args(self) -> tuple:
         return (*super().render_args(), self.input_args, self.output_args, self.buffer_sizes,
@@ -127,8 +127,8 @@ class FusedOperator(FusedElf):
         self.load()
         return self._bo_at(*self.span(name)[:2])
 
-    def get_buffer(self, name: str) -> torch.Tensor:
-        """A bf16 view of a buffer in its host BO (writes reach the device at the next sync). Counts as a host write
+    def get_buffer(self, name: str) -> np.ndarray:
+        """A bf16 view (``ml_dtypes.bfloat16``) of a buffer in its host BO (writes reach the device at the next sync). Counts as a host write
         of the buffer."""
         self.load()
         self._host_written.add(parse_name(name)[0])
@@ -136,19 +136,31 @@ class FusedOperator(FusedElf):
             s = self.span(name)
             bo, offset = self._bo_at(s.space, s.offset)
             view = np.frombuffer(bo.map(), np.uint8, s.nbytes, offset)
-            self._views[name] = torch.from_numpy(view).view(torch.bfloat16)
+            self._views[name] = view.view(bfloat16)
         return self._views[name]
 
     def sync_inputs(self) -> None:
-        """Flush the input and scratch BOs to the device."""
+        """Flush the input and scratch BOs to the device (and the host's buffers in the output BO:
+        ``_sync_outputs_written``)."""
         self.load()
         self._in_bo.sync_to_device()
         self._scratch_bo.sync_to_device()
+        self._sync_outputs_written()
 
     def sync_input_only(self) -> None:
-        """Flush the input BO to the device."""
+        """Flush the input BO to the device (and what the host wrote of the output BO)."""
         self.load()
         self._in_bo.sync_to_device()
+        self._sync_outputs_written()
+
+    def _sync_outputs_written(self) -> None:
+        """Flush the output-BO buffers the host accessed (``get_buffer``: an input that is also an output, which lives
+        in the output BO): else its host writes may stay in the CPU's caches."""
+        for name in self._views:
+            s = self.span(name)
+            if s.space == "output":
+                bo, offset = self._bo_at(s.space, s.offset)
+                bo.sync_to_device(s.nbytes, offset)
 
     def sync_scratch_from_device(self, length: int | None = None, offset: int = 0) -> None:
         """Pull the scratch BO (or ``length`` bytes from ``offset``) from the device."""
@@ -196,15 +208,15 @@ class FusedOperator(FusedElf):
             pass
         kern.dispatch_wait()  # (retires the command; raises DispatchError on a failure)
 
-    def run(self, *, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def run(self, *, inputs: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
         """One shot: write ``inputs`` (by buffer name), sync every data BO (overlapping input and output names
-        work), dispatch, return the outputs by name."""
+        work; an input's bytes taken as bf16), dispatch, return copies of the outputs by name."""
         self.load()
         for name, tensor in inputs.items():
-            self.get_buffer(name).copy_(tensor.view(torch.bfloat16).flatten())
+            self.get_buffer(name)[:] = np.ascontiguousarray(tensor).reshape(-1).view(bfloat16)
         for bo in (self._in_bo, self._out_bo, self._scratch_bo):
             bo.sync_to_device()
         self()
         self._in_bo.sync_from_device()
         self._out_bo.sync_from_device()
-        return {name: self.get_buffer(name).clone() for name in self.output_args}
+        return {name: self.get_buffer(name).copy() for name in self.output_args}

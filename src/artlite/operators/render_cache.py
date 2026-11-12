@@ -37,7 +37,6 @@ from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch  # noqa: TID251
 
 from .. import profiling
 from .base import AIECC, CACHE_DIR, CLANGPP, ArtcOperator
@@ -131,8 +130,6 @@ def _describe(x: Any, files: set[str], active: set[int]) -> str:
         return f"np:{x.dtype}:{x.dtype.str}:{x.item()!r}"
     if isinstance(x, np.dtype):
         return f"dtype:{x}:{x.str}"
-    if isinstance(x, torch.dtype):
-        return str(x)
     if isinstance(x, type):
         return f"type:{x.__module__}.{x.__qualname__}"
     if isinstance(x, types.GenericAlias):
@@ -141,11 +138,8 @@ def _describe(x: Any, files: set[str], active: set[int]) -> str:
         if isinstance(x, np.memmap) or x.nbytes > _MAX_ARRAY or x.dtype.hasobject:
             raise _NoKey("array")
         return f"nd:{x.dtype}:{x.dtype.str}:{x.shape}:{hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()}"
-    if isinstance(x, torch.Tensor):
-        if x.device.type != "cpu" or x.numel() * x.element_size() > _MAX_ARRAY:
-            raise _NoKey("tensor")
-        data = x.detach().contiguous().view(torch.uint8).numpy().tobytes() if x.numel() else b""
-        return f"t:{x.dtype}:{tuple(x.shape)}:{hashlib.sha256(data).hexdigest()}"
+    if hasattr(x, "__array__") or hasattr(x, "__dlpack__"):  # (another library's array: no key covers its data)
+        raise _NoKey("array-like")
     if id(x) in active:
         raise _NoKey("a cycle")
     active.add(id(x))

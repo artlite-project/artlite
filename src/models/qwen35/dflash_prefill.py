@@ -20,7 +20,6 @@ Buffers of the drafter's device by "F" + their name (``buffers``): its weight im
 from types import SimpleNamespace
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (
@@ -165,8 +164,8 @@ class DFlashPrepOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
-        return [ArgSpec("in", (T * self.layout.N,), torch.bfloat16), ArgSpec("in", (T * HD * 2,), torch.bfloat16),
-                ArgSpec("in", (8 * HD * 2,), torch.bfloat16), ArgSpec("out", (COLS * self.hb // 2,), torch.bfloat16)]
+        return [ArgSpec("in", (T * self.layout.N,), bfloat16), ArgSpec("in", (T * HD * 2,), bfloat16),
+                ArgSpec("in", (8 * HD * 2,), bfloat16), ArgSpec("out", (COLS * self.hb // 2,), bfloat16)]
 
     def params(self, slot: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk whose first object lies at ``slot`` of the rings."""
@@ -338,11 +337,11 @@ class DFlashPrefill:
         """FNR's weights."""
         d, n = self.d, 2 * self.H
         fnr = dev.view("FNR")
-        fnr[:n] = torch.ones(self.H).bfloat16().view(torch.uint8).numpy()
+        fnr[:n] = np.ones(self.H, bfloat16).view(np.uint8)
         for L in range(d.cfg.layers):
             w = d._f32(f"blk.{L}.attn_k_norm.weight")
             fnr[n + L * 8 * 4 * HD:][:w.nbytes] = w.view(np.uint8)
-        w = torch.from_numpy(d._f32("enc.output_norm.weight")).bfloat16().view(torch.uint8).numpy()
+        w = d._f32("enc.output_norm.weight").astype(bfloat16).view(np.uint8)
         fnr[n + d.cfg.layers * 8 * 4 * HD:][:w.size] = w
         dev.flush("FNR")
 
@@ -387,7 +386,7 @@ class DFlashPrefill:
                 pan = np.stack([kv[a + at + part * 2 * PAIR + 144 * db:][:72] for db in range(ND)]).reshape(ND, 8, 9)
                 v = block_values(pan)
                 rows[part] = v if part == 0 else v.transpose(0, 2, 1)
-            bits = torch.from_numpy(rows).bfloat16().view(torch.uint8).numpy()
+            bits = rows.astype(bfloat16).view(np.uint8)
             kv[o + (r & 1) * ROWS_B:][:ROWS_B] = bits[0].reshape(-1)
             kv[o + (2 + (r & 1)) * ROWS_B:][:ROWS_B] = bits[1].reshape(-1)
             dev.flush("KV", o, 4 * ROWS_B)

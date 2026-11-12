@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.model_config import llama_gguf  # noqa: F401 (the tests import it from here)
 from models.common import Sampling
@@ -15,6 +16,20 @@ REFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs")
 REFRESH_REFS = False  # --refresh-refs (conftest): recompute and overwrite the cached references
 # the long-prompt corpus (gitignored): tests/datasets/fetch_datasets.py fetches it
 ESSAYS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "paul_graham_essays")
+
+
+def to_numpy(t: torch.Tensor) -> np.ndarray:
+    """A CPU tensor as a numpy array (bf16 as ``ml_dtypes.bfloat16``, through an int16 view; no copy when contiguous):
+    what the runtime API (``artlite.from_numpy``, ``op.run``, ``FusedOperator.get_buffer``) takes."""
+    t = t.detach().contiguous()
+    return t.view(torch.int16).numpy().view(bfloat16) if t.dtype == torch.bfloat16 else t.numpy()
+
+
+def to_torch(a: np.ndarray) -> torch.Tensor:
+    """A numpy array as a CPU tensor sharing its memory (``ml_dtypes.bfloat16`` as torch.bfloat16, through an int16
+    view): the runtime API's results (``Tensor.numpy()``, ``op.run``) in the torch references."""
+    a = np.asarray(a)
+    return torch.from_numpy(a.view(np.int16)).view(torch.bfloat16) if a.dtype == bfloat16 else torch.from_numpy(a)
 
 
 def essay(name: str) -> str:
@@ -130,6 +145,7 @@ def verify_close(output, reference, *, rel_tol, abs_tol, label="output"):
 
     Handles reference in float64 (high-precision) by converting to float32.
     """
+    output, reference = (to_torch(x) if isinstance(x, np.ndarray) else x for x in (output, reference))
     assert output.shape == reference.shape, f"{label}: shape mismatch {output.shape} vs {reference.shape}"
     out_f = output.float().reshape(-1)
     ref_f = reference.float().reshape(-1)  # Converts float64 -> float32 if needed

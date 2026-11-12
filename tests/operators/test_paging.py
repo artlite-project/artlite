@@ -13,7 +13,6 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
-import torch
 from aie.dialects._aie_enum_gen import DMAChannelDir
 from aie.helpers.taplib import TensorAccessPattern as TAP
 from aie.iron import Acquire, Bd, Buffer, DmaChannel, Flow, Kernel, Lock, Program, Release, Runtime, TileDma, Worker
@@ -166,7 +165,7 @@ class PagingProbe(ArtcOperator):
                                                   npages=len(PAGES))
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec(ArgDirection.IN, (1024,), torch.int32), ArgSpec(ArgDirection.OUT, (1024,), torch.int32)]
+        return [ArgSpec(ArgDirection.IN, (1024,), np.int32), ArgSpec(ArgDirection.OUT, (1024,), np.int32)]
 
     def check_endpoints(self, insts: np.ndarray) -> None:
         pass

@@ -7,6 +7,7 @@ import itertools
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.operators import kmath
 from artlite.operators.kernel_source import KernelSource
@@ -122,8 +123,8 @@ def test_kmath_shared_dependency() -> None:
 @pytest.fixture(scope="module")
 def vtanh_table() -> np.ndarray:
     """vtanh of every bf16 (by its bits) as the NPU computes it: the model's (``kmath_sim.load_vtanh``)."""
-    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
-    return VtanhOperator(size=65536).compile().run(bits).float().numpy()
+    bits = np.arange(65536, dtype=np.int32).astype(np.uint16).view(bfloat16)
+    return VtanhOperator(size=65536).compile().run(bits).astype(np.float32)
 
 
 @pytest.mark.parametrize("case", list(CASES))
@@ -136,10 +137,10 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     x = np.concatenate([dom, edges])
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
     if fn.arg == "ptr" and not fn.params.get("f32"):
-        xt = torch.from_numpy(xp).bfloat16()
-        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(xt).float().numpy()[:len(x)]
+        xt = xp.astype(np.float32).astype(bfloat16)
+        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(xt).astype(np.float32)[:len(x)]
     else:
-        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(torch.from_numpy(xp)).numpy()[:len(x)]
+        out = KmOperator(size=len(xp), func=func, **kwargs).compile().run(xp)[:len(x)]
     em = kmath_sim.emulate(fn, x)
     same = (out == em) | (np.isnan(out) & np.isnan(em))  # (zeros of either sign alike)
     if fn.params.get("f32"):  # (unrounded: the accumulator's sum, which the model takes in fp32 steps)

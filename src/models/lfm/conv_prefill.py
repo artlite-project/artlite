@@ -15,7 +15,6 @@ parameter) the window's last 6 rows of valid tokens are kept, and go out at the 
 """
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (
@@ -141,8 +140,8 @@ class ConvPrefillOperator(ArtcOperator):
         return self.T * self.hidden * 9 // 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.n_g,), torch.bfloat16), ArgSpec("inout", (self.n_h,), torch.bfloat16),
-                ArgSpec("out", (self.n_a,), torch.bfloat16)]
+        return [ArgSpec("in", (self.n_g,), bfloat16), ArgSpec("inout", (self.n_h,), bfloat16),
+                ArgSpec("out", (self.n_a,), bfloat16)]
 
     @staticmethod
     def params(n: int) -> dict[str, int]:

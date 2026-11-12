@@ -3,7 +3,6 @@ from 256-bit ones (aie::concat), bit for bit against numpy (data movement only).
 
 import numpy as np
 import pytest
-import torch
 
 from artlite.operators.base import JINJA_ENV
 
@@ -37,7 +36,7 @@ class GatherOperator(StreamOperator):
 
     def __init__(self, case: str):
         self.case = case
-        super().__init__(size=N, num_columns=1, tile_size=None, dtypes_in=(torch.int32,), dtypes_out=(torch.int32,))
+        super().__init__(size=N, num_columns=1, tile_size=None, dtypes_in=(np.int32,), dtypes_out=(np.int32,))
 
     @property
     def kernel_name(self) -> str:
@@ -52,5 +51,5 @@ class GatherOperator(StreamOperator):
 def test_gather(case: str):
     _, view, k, e, p = CASES[case]
     x = np.random.default_rng(1).integers(-2**31, 2**31, N, dtype=np.int64).astype(np.int32)
-    got = GatherOperator(case).run(torch.from_numpy(x)).numpy().view(view)
+    got = GatherOperator(case).run(x).view(view)
     np.testing.assert_array_equal(got, x.view(view).reshape(-1, k, p // e, e).transpose(0, 2, 1, 3).reshape(-1))

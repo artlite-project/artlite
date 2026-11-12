@@ -36,7 +36,6 @@ QK binds), the 35B-A3B (two streams) 1.12 / 3.44 / 10.6 (8.8).
 import math
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects.aiex import npu_write32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
@@ -334,11 +333,11 @@ class AttnPrepOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
-        return [ArgSpec("in", (T * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (self.cs_positions * 128,), torch.bfloat16),
-                ArgSpec("in", (2 * HD * 2,), torch.bfloat16),
-                ArgSpec("out", (self.n_qs,), torch.bfloat16),
-                ArgSpec("out", (self.kvh * self.head_bytes // 2,), torch.bfloat16)]
+        return [ArgSpec("in", (T * self.layout.N,), bfloat16),
+                ArgSpec("in", (self.cs_positions * 128,), bfloat16),
+                ArgSpec("in", (2 * HD * 2,), bfloat16),
+                ArgSpec("out", (self.n_qs,), bfloat16),
+                ArgSpec("out", (self.kvh * self.head_bytes // 2,), bfloat16)]
 
     @property
     def n_qs(self) -> int:
@@ -1043,10 +1042,10 @@ class PrefillAttnOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
-        seg = [ArgSpec("in", (self.n_seg,), torch.bfloat16)] if self.pack else []
-        return [ArgSpec("in", (COLS * T // 8 * 2 * self.qc * SLOT // 2,), torch.bfloat16),
-                ArgSpec("in", (self.kvh * self.head_bytes // 2,), torch.bfloat16),
-                ArgSpec("out", (T * self.H * HD * 9 // 16,), torch.bfloat16), *seg]
+        seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.pack else []
+        return [ArgSpec("in", (COLS * T // 8 * 2 * self.qc * SLOT // 2,), bfloat16),
+                ArgSpec("in", (self.kvh * self.head_bytes // 2,), bfloat16),
+                ArgSpec("out", (T * self.H * HD * 9 // 16,), bfloat16), *seg]
 
     def seg(self, lo: np.ndarray, hi: np.ndarray, p0: int = 0) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk at p0: per token (T,) its segment's first and last key

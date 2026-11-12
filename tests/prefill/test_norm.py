@@ -4,11 +4,14 @@ Qwen's, Llama's) vs torch, ResidualNormOperator (an fp32 residual: Gemma's modes
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 import artlite
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator, ResidualNormOperator, residual_params
+
+from ..common import to_numpy, to_torch
 
 _from_panels = bfp16.from_panels
 
@@ -31,21 +34,21 @@ def test_prefill_norm(T: int, add: bool, E: int, d_pitch: int, cols: int):
     w = (torch.rand(E, generator=g) + 0.5).bfloat16()
     op = PrefillNormOperator(T=T, add=add, E=E, d_pitch=d_pitch, cols=cols).compile()
     dev = op.device
-    xb, wb = artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(w.clone(), dev)
-    xnb = artlite.empty((T * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
+    xb, wb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev), artlite.from_numpy(to_numpy(w), dev)
+    xnb = artlite.empty((T * E * 9 // 16,), dtype=bfloat16, device=dev)
     dp = d_pitch or E // 8
     dpad = torch.full((T, 8, dp), 1e30).bfloat16()  # (padding: garbage)
     dpad[:, :, :E // 8] = d.view(T, 8, E // 8)
-    op.dispatch(*((xb, artlite.from_torch(dpad.flatten(), dev), wb, xb, xnb) if add else (xb, wb, xnb)))
+    op.dispatch(*((xb, artlite.from_numpy(to_numpy(dpad.flatten()), dev), wb, xb, xnb) if add else (xb, wb, xnb)))
     xnb.sync_from_device()
     xs = (x.float() + d.float()).bfloat16().float() if add else x.float()
     ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.float()
-    xn = _from_panels(xnb.to_torch(), T, E)
+    xn = to_torch(_from_panels(xnb.numpy(), T, E))
     rel = ((xn - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"xn rel-rms {rel}"  # bfp16ebs8 rounding: ~7e-3
     if add:
         xb.sync_from_device()
-        assert torch.equal(xb.to_torch().view(T, E), (x.float() + d.float()).bfloat16())
+        assert torch.equal(to_torch(xb.numpy()).view(T, E), (x.float() + d.float()).bfloat16())
 
 
 @pytest.mark.parametrize(("T", "d_pitch"), [(64, 0), (256, 264)], ids=["T64", "T256-dp264"])
@@ -60,16 +63,16 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     w = (torch.rand(E, generator=g) + 0.5).bfloat16()
     op = PrefillNormOperator(T=T, E=E, d_pitch=d_pitch, lo=True).compile()
     dev = op.device
-    xb, wb = artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(w.clone(), dev)
-    xnb = artlite.empty((2 * T * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
+    xb, wb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev), artlite.from_numpy(to_numpy(w), dev)
+    xnb = artlite.empty((2 * T * E * 9 // 16,), dtype=bfloat16, device=dev)
     dp = d_pitch or E // 8
     dpad = torch.full((T, 8, dp), 1e30).bfloat16()
     dpad[:, :, :E // 8] = d.view(T, 8, E // 8)
-    op.dispatch(xb, artlite.from_torch(dpad.flatten(), dev), wb, xb, xnb)
+    op.dispatch(xb, artlite.from_numpy(to_numpy(dpad.flatten()), dev), wb, xb, xnb)
     xnb.sync_from_device()
     xs = (x.float() + d.float()).bfloat16().double()
     ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.double()
-    both = _from_panels(xnb.to_torch(), T, 2 * E).double()  # (per token [hi | lo])
+    both = to_torch(_from_panels(xnb.numpy(), T, 2 * E)).double()  # (per token [hi | lo])
     hi, lo = both[:, :E], both[:, E:]
     assert ((hi - ref).norm() / ref.norm()).item() < 1e-2
     rel = ((hi + lo - ref).norm() / ref.norm()).item()
@@ -77,7 +80,7 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     print(f"hi + lo rel-rms {rel:.2e}; per-token scale rms {scale.pow(2).mean().sqrt():.2e}")
     assert rel < 4e-5, rel
     xb.sync_from_device()
-    assert torch.equal(xb.to_torch().view(T, E), xs.float().bfloat16())
+    assert torch.equal(to_torch(xb.numpy()).view(T, E), xs.float().bfloat16())
 
 
 @pytest.mark.parametrize(("T", "E"), [(64, 2048), (256, 2048), (64, 5120), (256, 5120)])
@@ -92,11 +95,11 @@ def test_prefill_norm_pre_pitch(T: int, E: int) -> None:
     a = PrefillNormOperator(T=T, add=False, E=E, out_pitch=2 * E, out_col=0).compile()
     b = PrefillNormOperator(T=T, add=False, E=E, pre=True, out_pitch=2 * E, out_col=E).compile(device=a.device)
     dev = a.device
-    xn = artlite.empty((T * 2 * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
-    a.dispatch(artlite.from_torch(e.clone().flatten(), dev), artlite.from_torch(we.clone(), dev), xn)
-    b.dispatch(artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(torch.cat([w1, w2]), dev), xn)
+    xn = artlite.empty((T * 2 * E * 9 // 16,), dtype=bfloat16, device=dev)
+    a.dispatch(artlite.from_numpy(to_numpy(e.clone().flatten()), dev), artlite.from_numpy(to_numpy(we), dev), xn)
+    b.dispatch(artlite.from_numpy(to_numpy(x.clone().flatten()), dev), artlite.from_numpy(to_numpy(torch.cat([w1, w2])), dev), xn)
     xn.sync_from_device()
-    both = _from_panels(xn.to_torch(), T, 2 * E).double()
+    both = to_torch(_from_panels(xn.numpy(), T, 2 * E)).double()
     ef = e.double()
     ref_e = ef * torch.rsqrt((ef ** 2).mean(-1, keepdim=True) + 1e-5) * we.double()
     xw = (x.float() * w1.float()).bfloat16().double()
@@ -117,16 +120,16 @@ def test_prefill_norm_padded(T: int, add: bool, cols: int) -> None:
     w = (torch.rand(E, generator=g) + 0.5).bfloat16()
     op = PrefillNormOperator(T=T, add=add, E=E, cols=cols, out_pitch=P).compile()
     dev = op.device
-    xb, wb = artlite.from_torch(x.clone().flatten(), dev), artlite.from_torch(w.clone(), dev)
-    xnb = artlite.from_torch(torch.full((T * P * 9 // 16,), 7.0).bfloat16(), dev)  # (the padding: not zero)
-    op.dispatch(*((xb, artlite.from_torch(d.clone().flatten(), dev), wb, xb, xnb) if add else (xb, wb, xnb)))
+    xb, wb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev), artlite.from_numpy(to_numpy(w), dev)
+    xnb = artlite.from_numpy(to_numpy(torch.full((T * P * 9 // 16,), 7.0).bfloat16()), dev)  # (the padding: not zero)
+    op.dispatch(*((xb, artlite.from_numpy(to_numpy(d.clone().flatten()), dev), wb, xb, xnb) if add else (xb, wb, xnb)))
     xnb.sync_from_device()
     xs = (x.float() + d.float()).bfloat16().float() if add else x.float()
     ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.float()
-    out = xnb.to_torch()
-    xn = _from_panels(out, T, P)
+    out = xnb.numpy()
+    xn = to_torch(_from_panels(out, T, P))
     assert ((xn[:, :E] - ref).norm() / ref.norm()).item() < 1e-2
-    pad = out.view(T // 8, P // 8, 36)[:, E // 8:]  # (the padding panels as they were)
+    pad = to_torch(out).view(T // 8, P // 8, 36)[:, E // 8:]  # (the padding panels as they were)
     assert torch.equal(pad, torch.full_like(pad, 7.0))
 
 
@@ -151,15 +154,15 @@ def test_prefill_norm_deltas(T: int, E: int, d_pitch: int, cols: int, rows: int,
     dev = op.device
     dpad = torch.full((n, rows, 8, dp), 1e30).bfloat16()  # ([d1 | d2 | ..]; padding: garbage)
     dpad[:, :T, :, :E // 8] = d.view(n, T, 8, E // 8)
-    xb = artlite.from_torch(x.clone().flatten(), dev)
-    xnb = artlite.empty((T * E * 9 // 16,), dtype=torch.bfloat16, device=dev)
-    op.dispatch(xb, artlite.from_torch(dpad.flatten(), dev), artlite.from_torch(w.clone(), dev), xb, xnb)
+    xb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev)
+    xnb = artlite.empty((T * E * 9 // 16,), dtype=bfloat16, device=dev)
+    op.dispatch(xb, artlite.from_numpy(to_numpy(dpad.flatten()), dev), artlite.from_numpy(to_numpy(w), dev), xb, xnb)
     xb.sync_from_device()
     xnb.sync_from_device()
     xs = (x.float() + d.float().sum(0)).bfloat16()
-    assert torch.equal(xb.to_torch().view(T, E), xs)
+    assert torch.equal(to_torch(xb.numpy()).view(T, E), xs)
     ref = xs.float() * torch.rsqrt((xs.float() ** 2).mean(-1, keepdim=True) + 1e-5) * w.float()
-    xn = _from_panels(xnb.to_torch(), T, E)
+    xn = to_torch(_from_panels(xnb.numpy(), T, E))
     assert ((xn - ref).norm() / ref.norm()).item() < 1e-2
 
 
@@ -201,22 +204,22 @@ def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool
     wp, w1 = torch.rand(E, generator=g) + 0.5, torch.rand(E, generator=g) + 0.5
     s = 0.7128 if scale else 1.0
     prm = residual_params(wp.numpy(), w1.numpy(), s, E).view(np.int16)
-    P = artlite.from_torch(torch.from_numpy(prm).view(torch.bfloat16), dev)
-    X = artlite.from_torch(x.contiguous().view(torch.bfloat16).reshape(-1).clone(), dev)
-    XN = artlite.from_torch(torch.zeros(T * E * 9 // 16, dtype=torch.bfloat16), dev)
+    P = artlite.from_numpy(prm.view(bfloat16), dev)
+    X = artlite.from_numpy(to_numpy(x.contiguous().view(torch.bfloat16).reshape(-1)), dev)
+    XN = artlite.from_numpy(np.zeros(T * E * 9 // 16, bfloat16), dev)
     dd = d[..., :E // COLS].float().reshape(deltas, T, E).sum(0)
     if mode == "in":
         op.dispatch(P, X, XN)
     else:
         dp = torch.zeros(deltas, stride, dtype=torch.bfloat16)
         dp[:, :T * COLS * d_pitch] = d.reshape(deltas, -1)
-        D = artlite.from_torch(dp.reshape(-1)[:(deltas - 1) * stride + T * COLS * d_pitch].contiguous(), dev)
+        D = artlite.from_numpy(to_numpy(dp.reshape(-1)[:(deltas - 1) * stride + T * COLS * d_pitch].contiguous()), dev)
         op.dispatch(P, X, D, X, XN)
     X.sync_from_device()
     XN.sync_from_device()
     want_x, want_n = _residual_reference(x, dd, wp, w1, s, eps, mode)
-    got_x = X.to_torch().view(torch.float32).reshape(T, E).double()
-    got_n = bfp16.from_panels(XN.to_torch(), T, E).double()
+    got_x = to_torch(X.numpy()).view(torch.float32).reshape(T, E).double()
+    got_n = to_torch(bfp16.from_panels(XN.numpy(), T, E)).double()
     want_q = torch.from_numpy(bfp16.values(want_n.float().numpy())).double()
 
     def rel(a: torch.Tensor, b: torch.Tensor) -> float:

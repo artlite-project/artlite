@@ -24,7 +24,6 @@ scratchpad parameter ``expert_gemm.N_PARAM`` c), the combine the weights.
 import functools
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects._aiex_ops_gen import npu_sync as _npu_sync
 from aie.dialects.aiex import _as_i32, npu_maskwrite32, npu_write32
 from aie.helpers.taplib import TensorAccessPattern
@@ -357,8 +356,8 @@ class GatherNormOperator(_Gathered):
         return res
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * self.cb_words * 2,), torch.bfloat16), ArgSpec("in", (self.E,), torch.bfloat16),
-                ArgSpec("out", (COLS * self.cap * self.slot,), torch.bfloat16)]
+        return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16), ArgSpec("in", (self.E,), bfloat16),
+                ArgSpec("out", (COLS * self.cap * self.slot,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         E, p, cap = self.E, self.p, self.cap
@@ -454,9 +453,9 @@ class CombineOperator(_Gathered):
         return -(-(self.b0_words + self.stream_words(self.T // COLS * 8)) // 16) * 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * self.cb_words * 2,), torch.bfloat16),
-                ArgSpec("in", (self.T * ds_row(self.E, self.ds_pitch),), torch.bfloat16),
-                ArgSpec("out", (self.T * self.E,), torch.bfloat16)]
+        return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16),
+                ArgSpec("in", (self.T * ds_row(self.E, self.ds_pitch),), bfloat16),
+                ArgSpec("out", (self.T * self.E,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         E, p, T, dp = self.E, self.p, self.T, self.ds_pitch

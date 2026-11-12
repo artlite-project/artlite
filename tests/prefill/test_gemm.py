@@ -14,6 +14,7 @@ import os
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 import artlite
 from artlite.decode.image import pack_rows
@@ -35,6 +36,8 @@ from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
+
+from ..common import to_numpy, to_torch
 
 LEVEL = 3  # (a paced level: the paced copy of each worker body)
 
@@ -160,16 +163,15 @@ def _run(lib: Library, op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a
     w = np.zeros(op.w_bytes, np.uint8)
     a, b = max(w_off, 0), min(w_off + op.w_bytes, W.size)
     w[a - w_off:b - w_off] = W[a:b]
-    init = C if C is not None else torch.zeros((op.M * op.N * 9 // 16,) if op.silu else (op.M, op.N),
-                                               dtype=torch.bfloat16)
-    out = artlite.from_torch(init.clone(), dev)
-    pan = bfp16.to_panels(A)
-    bufs = [artlite.from_torch(torch.cat([pan[a_off:], torch.zeros(a_off, dtype=pan.dtype)]), dev),
-            artlite.from_torch(torch.from_numpy(w).view(torch.bfloat16), dev), out]
+    init = to_numpy(C) if C is not None else np.zeros((op.M * op.N * 9 // 16,) if op.silu else (op.M, op.N), bfloat16)
+    out = artlite.from_numpy(init, dev)
+    pan = bfp16.to_panels(to_numpy(A))
+    bufs = [artlite.from_numpy(np.concatenate([pan[a_off:], np.zeros(a_off, bfloat16)]), dev),
+            artlite.from_numpy(w.view(bfloat16), dev), out]
     lib.run(lib.items([(op, "A", "W", "C")], dict(zip("AWC", (x._raw for x in bufs)))), bufs=[x._raw for x in bufs])
     out.sync_from_device()
-    c = out.to_torch()
-    return bfp16.from_panels(c, op.M, op.N) if op.silu else c
+    c = out.numpy()
+    return to_torch(bfp16.from_panels(c, op.M, op.N) if op.silu else c.copy())
 
 
 def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -195,7 +197,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
     lib = Library("t_prefill_gemm", [*ops, *twins.values()]).compile().load()
     M, K = max(gm.op.M for gm in pp.gemms), region.K  # (GemmQd pads the tokens to whole passes)
     A = (torch.randn(M, K, generator=torch.Generator().manual_seed(T + K)) * 0.5).bfloat16()
-    Aq = bfp16.from_panels(bfp16.to_panels(A), M, K)  # (the GEMM's operand values)
+    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), M, K))  # (the GEMM's operand values)
 
     def outputs(level: int | None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """C (T rows, fp32) and an input projection's whole bf16 output Cb: paced at ``level`` (None: the twins)."""
@@ -295,7 +297,7 @@ def test_unit_gemm(fmt: str, tiles: int) -> None:
     ops = [gemm(3), gemm(2)]  # (a library holds two designs at least)
     lib = Library("t_unit_gemm", ops).compile().load()
     A = (torch.randn(ops[0].M, K, generator=torch.Generator().manual_seed(1)) * 0.5).bfloat16()
-    Aq = bfp16.from_panels(bfp16.to_panels(A), ops[0].M, K)
+    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), ops[0].M, K))
     want = Aq[:T] @ t.dequantize().float().T
     for op in ops:
         C = _run(lib, op, A, W, -op.hdr_skip)[:T].float()

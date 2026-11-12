@@ -9,7 +9,7 @@ panels as they are (``_MMV``)."""
 from typing import ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 from ..operators import bfp16
 from .common import Slot, TileFormat
@@ -48,7 +48,7 @@ def _values(w: np.ndarray) -> np.ndarray:
     """A BF16 tensor's bf16 bit patterns (uint16) or an F16 / F32 tensor's values -> float32."""
     if w.dtype in (np.float16, np.float32):
         return w.astype(np.float32)
-    return torch.from_numpy(np.ascontiguousarray(w).view(np.int16)).view(torch.bfloat16).float().numpy()
+    return np.ascontiguousarray(w).view(bfloat16).astype(np.float32)
 
 
 class Bf16Slot(Slot):

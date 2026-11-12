@@ -18,7 +18,7 @@ from artlite.operators import FusedOperator
 from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
 from artlite.operators.fused import Library
 
-from ..common import verify_close
+from ..common import to_numpy, to_torch, verify_close
 from .elementwise import SiluOperator, StreamOperator
 
 _ADD_SRC = JINJA_ENV.from_string("""
@@ -42,8 +42,8 @@ class AddOperator(StreamOperator):
     """c = a + b on 1-D bf16 vectors (a two-input op for the runlist tests)."""
 
     def __init__(self, *, size: int):
-        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(torch.bfloat16, torch.bfloat16),
-                         dtypes_out=(torch.bfloat16,))
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(bfloat16, bfloat16),
+                         dtypes_out=(bfloat16,))
 
     @property
     def kernel_name(self) -> str:
@@ -79,7 +79,7 @@ class TestFusedOperator:
         ref_silu = torch.nn.functional.silu(inp)
         ref = inp + ref_silu
 
-        result = fused.run(inputs={"in": inp})
+        result = fused.run(inputs={"in": to_numpy(inp)})
         verify_close(result["out"], ref, rel_tol=0.04, abs_tol=1e-6, label="silu_add")
 
     def test_double_silu(self):
@@ -103,7 +103,7 @@ class TestFusedOperator:
 
         ref = torch.nn.functional.silu(torch.nn.functional.silu(inp))
 
-        result = fused.run(inputs={"in": inp})
+        result = fused.run(inputs={"in": to_numpy(inp)})
         verify_close(result["out"], ref, rel_tol=0.04, abs_tol=1e-6, label="double_silu")
 
     def test_get_buffer_write(self):
@@ -125,11 +125,11 @@ class TestFusedOperator:
         inp = torch.randn(SIZE, dtype=torch.bfloat16)
         ref = torch.nn.functional.silu(inp)
 
-        fused.get_buffer("in").copy_(inp)
+        fused.get_buffer("in")[:] = to_numpy(inp)
         fused.sync_inputs()
         fused()
         fused.sync_outputs()
-        output = fused.get_buffer("out").clone()
+        output = to_torch(fused.get_buffer("out").copy())
 
         verify_close(output, ref, rel_tol=0.04, abs_tol=1e-6, label="get_buffer")
 
@@ -156,7 +156,7 @@ class ShiftOperator(ArtcOperator):
         return _SHIFT_SRC.render(name=f"test_shift_{self.n}", n=self.n)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (2 * self.n,), torch.bfloat16), ArgSpec("out", (self.n,), torch.bfloat16)]
+        return [ArgSpec("in", (2 * self.n,), bfloat16), ArgSpec("out", (self.n,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         n = self.n
@@ -194,15 +194,15 @@ def test_library_program():
     lib = Library("t_library", [shift, add]).compile().load()  # (on XRT, buffer addresses need a context first)
     dev = artlite.Device()
     x = torch.randn(2 * n).bfloat16()
-    bx = artlite.from_torch(x.clone(), dev)
-    t, u, v, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(4))
+    bx = artlite.from_numpy(to_numpy(x), dev)
+    t, u, v, out = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(4))
     a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
     items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["t"], a["u"]]), (0, [a["x"], a["v"]]), (1, [a["u"], a["v"], a["out"]])]
     lib.set_params({ShiftOperator.PARAM: 128})
     assert lib.run(items, splits=[1, 3], bufs=[b._raw for b in (bx, t, u, v, out)]) == 3
     out.sync_from_device()
     want = (3 * x[128:128 + n].float()).bfloat16()  # (2 x[s : s + n] + x[s : s + n])
-    torch.testing.assert_close(out.to_torch().float(), want.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(to_torch(out.numpy()).float(), want.float(), rtol=1e-2, atol=1e-2)
 
 
 def test_library_program_packets(monkeypatch):
@@ -222,15 +222,15 @@ def test_library_program_packets(monkeypatch):
         lib = Library("t_library", [shift, add]).compile()
         lib.load()
         assert all(bool(blk.packets) == packets for blk in lib._asm.blocks)
-        bx = artlite.from_torch(x.clone(), dev)
-        t, u, v, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(4))
+        bx = artlite.from_numpy(to_numpy(x), dev)
+        t, u, v, out = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(4))
         a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "u": u, "v": v, "out": out}.items()}
         items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["t"], a["u"]]), (0, [a["x"], a["v"]]),
                  (1, [a["u"], a["v"], a["out"]])]
         lib.set_params({ShiftOperator.PARAM: 64})
         lib.run(items, bufs=[b._raw for b in (bx, t, u, v, out)])
         out.sync_from_device()
-        outs.append(out.to_torch().clone())
+        outs.append(to_torch(out.numpy()).clone())
     assert torch.equal(outs[0], outs[1])
     torch.testing.assert_close(outs[1].float(), (3 * x[64:64 + n].float()).bfloat16().float(), rtol=1e-2, atol=1e-2)
 
@@ -257,14 +257,14 @@ def test_library_data_packets(monkeypatch):
         dm = [hex(int(cfg[p + 2])) for p, op in txn.op_offsets(cfg)  # (core data-memory blockwrites)
               if op == txn.OP_BLOCKWRITE and (cfg[p + 2] >> 20) & 0x1F >= 2 and cfg[p + 2] & 0xFFFFF < 0x10000]
         assert bool(dm) != packets, dm
-        bx = artlite.from_torch(x.clone(), dev)
-        t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+        bx = artlite.from_numpy(to_numpy(x), dev)
+        t, out = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(2))
         a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
         items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]]), (0, [a["out"], a["t"]]),
                  (1, [a["t"], a["x"], a["out"]])]
         lib.run(items, bufs=[b._raw for b in (bx, t, out)])
         out.sync_from_device()
-        outs.append(out.to_torch().clone())
+        outs.append(to_torch(out.numpy()).clone())
     assert torch.equal(outs[0], outs[1])
     s = torch.nn.functional.silu
     torch.testing.assert_close(outs[1].float(), s(s(x.float()) + x.float()) + x.float(), rtol=5e-2, atol=5e-2)
@@ -306,13 +306,13 @@ def test_library_program_memory_variants(monkeypatch):
     assert b0.packets and np.array_equal(bare(b0), bare(b1)) and b0.design != b1.design
     dev = artlite.Device()
     x, y = torch.randn(n).bfloat16(), torch.randn(n).bfloat16()
-    bx, by = artlite.from_torch(x.clone(), dev), artlite.from_torch(y.clone(), dev)
-    t, u = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+    bx, by = artlite.from_numpy(to_numpy(x), dev), artlite.from_numpy(to_numpy(y), dev)
+    t, u = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(2))
     a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "y": by, "t": t, "u": u}.items()}
     lib.run([(0, [a["x"], a["y"], a["t"]]), (1, [a["x"], a["y"], a["u"]])], bufs=[b._raw for b in (bx, by, t, u)])
     for s, out in ((2, t), (3, u)):
         out.sync_from_device()
-        torch.testing.assert_close(out.to_torch().float(), (x.float() + s * y.float()).bfloat16().float(), rtol=1e-2,
+        torch.testing.assert_close(to_torch(out.numpy()).float(), (x.float() + s * y.float()).bfloat16().float(), rtol=1e-2,
                                    atol=1e-2)
 
 
@@ -343,7 +343,7 @@ class ChainOperator(ArtcOperator):
         return _DOUBLE_SRC.render(name=f"test_double_{self.n}", n=self.n)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.n,), torch.bfloat16), ArgSpec("out", (self.n,), torch.bfloat16)]
+        return [ArgSpec("in", (self.n,), bfloat16), ArgSpec("out", (self.n,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         ty = np.ndarray[(self.n,), np.dtype[bfloat16]]
@@ -384,8 +384,8 @@ def test_library_without_reset(monkeypatch):
     assert asm.reuse and asm._neighbours[0][1], "the chain's second core acquires its neighbour's lock"
     dev = artlite.Device()
     x = torch.randn(n).bfloat16()
-    bx = artlite.from_torch(x.clone(), dev)
-    t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+    bx = artlite.from_numpy(to_numpy(x), dev)
+    t, out = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(2))
     a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
     items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
     for _ in range(7):
@@ -401,7 +401,7 @@ def test_library_without_reset(monkeypatch):
         _zero(out)
         lib.run(items, bufs=[b._raw for b in (bx, t, out)])
         out.sync_from_device()
-        outs.append(out.to_torch().clone())
+        outs.append(to_torch(out.numpy()).clone())
     assert torch.equal(outs[0], outs[1])
     torch.testing.assert_close(outs[1].float(), _chain_ref(x), rtol=5e-2, atol=5e-2 * float(_chain_ref(x).abs().max()))
 
@@ -440,8 +440,8 @@ def test_library_abort(monkeypatch):
     lib.load()
     dev = artlite.Device()
     x = torch.randn(n).bfloat16()
-    bx = artlite.from_torch(x.clone(), dev)
-    t, out = (artlite.empty((n,), dtype=torch.bfloat16, device=dev) for _ in range(2))
+    bx = artlite.from_numpy(to_numpy(x), dev)
+    t, out = (artlite.empty((n,), dtype=bfloat16, device=dev) for _ in range(2))
     a = {k: device_address(b, 0, lib._ctx) for k, b in {"x": bx, "t": t, "out": out}.items()}
     items = [(0, [a["x"], a["t"]]), (1, [a["t"], a["x"], a["out"]])]
     for _ in range(7):
@@ -452,7 +452,7 @@ def test_library_abort(monkeypatch):
         _zero(out)
         assert lib.run(items, splits=[7], bufs=bufs) == 2  # (piece 0 ends with the chain)
         out.sync_from_device()
-        return out.to_torch().clone()
+        return to_torch(out.numpy()).clone()
 
     ref = run()
     torch.testing.assert_close(ref.float(), _chain_ref(x), rtol=5e-2, atol=5e-2 * float(_chain_ref(x).abs().max()))
@@ -540,7 +540,7 @@ class TestFusedLifecycle:
                               input_args=["in"], output_args=["out"]).compile()
         torch.manual_seed(0)
         inp = torch.randn(SIZE, dtype=torch.bfloat16)
-        fused.get_buffer("in").copy_(inp)
+        fused.get_buffer("in")[:] = to_numpy(inp)
         fused.sync_inputs()
         kern = fused._kernel()
         for _ in range(3):
@@ -557,7 +557,7 @@ class TestFusedLifecycle:
 
     def test_missing_host_write(self):
         f = _add_chain("t_missing").compile()
-        f.get_buffer("x").zero_()
+        f.get_buffer("x")[:] = 0
         try:
             f()
         except RuntimeError as e:
@@ -577,15 +577,15 @@ class TestFusedLifecycle:
         b.compile()
         torch.manual_seed(3)
         x, x2 = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
-        a.get_buffer("x").copy_(x)
+        a.get_buffer("x")[:] = to_numpy(x)
         a.sync_input_only()
         a()
-        b.get_buffer("x2").copy_(x2)
+        b.get_buffer("x2")[:] = to_numpy(x2)
         b.sync_input_only()
         b()
         b.sync_outputs()
         ref = (x.float() + x.float()).bfloat16().float() + x2.float()
-        verify_close(b.get_buffer("y").clone(), ref.bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="shared")
+        verify_close(to_torch(b.get_buffer("y").copy()), ref.bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="shared")
 
     def test_user_buffer(self):
         """External buffers in a user-memory BO (Device.alloc_user_buffer): the NPU reads w from it and writes t
@@ -599,7 +599,7 @@ class TestFusedLifecycle:
         x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
         ub.map()[1 << 20:(1 << 20) + 2048] = w.view(torch.uint8).numpy()
         ub.sync_to_device(2048, 1 << 20)
-        f.get_buffer("x").copy_(x)
+        f.get_buffer("x")[:] = to_numpy(x)
         f.sync_input_only()
         f()
         f.sync_outputs()
@@ -607,7 +607,7 @@ class TestFusedLifecycle:
         t = torch.from_numpy(ub.map()[3 << 20:(3 << 20) + 2048].copy()).view(torch.bfloat16)
         verify_close(t, (x.float() + w.float()).bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="user t")
         ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
-        verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="user y")
+        verify_close(to_torch(f.get_buffer("y").copy()), ref, rel_tol=0.01, abs_tol=1e-2, label="user y")
 
     def test_sync_lines(self):
         """Scattered host writes flushed by their lines (Buffer.sync_lines: a step's patches): the NPU reads them, and
@@ -623,12 +623,12 @@ class TestFusedLifecycle:
         ub.map()[64] = 1
         lines = np.array([64, *range(at, at + 2048, 64)], np.int64)
         ub.sync_lines(lines)
-        f.get_buffer("x").copy_(x)
+        f.get_buffer("x")[:] = to_numpy(x)
         f.sync_input_only()
         f()
         f.sync_outputs()
         ref = ((x.float() + w.float()).bfloat16().float() + w.float()).bfloat16()
-        verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="lines y")
+        verify_close(to_torch(f.get_buffer("y").copy()), ref, rel_tol=0.01, abs_tol=1e-2, label="lines y")
 
         def cost(flush: object) -> float:
             best = float("inf")
@@ -674,16 +674,16 @@ class TestFusedLifecycle:
         assert len(f.segments) == 2, f.segments  # t | w (each 2 KB)
         torch.manual_seed(5)
         x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
-        a.get_buffer("x").copy_(w * 0.5)
+        a.get_buffer("x")[:] = to_numpy(w * 0.5)
         a.sync_input_only()
         a()  # s = w
-        f.get_buffer("x").copy_(x)
+        f.get_buffer("x")[:] = to_numpy(x)
         f.sync_input_only()
         f()
         f.sync_outputs()
         wv = (w * 0.5).float() + (w * 0.5).float()
         ref = ((x.float() + wv).bfloat16().float() + wv).bfloat16()
-        verify_close(f.get_buffer("y").clone(), ref, rel_tol=0.01, abs_tol=1e-2, label="segments")
+        verify_close(to_torch(f.get_buffer("y").copy()), ref, rel_tol=0.01, abs_tol=1e-2, label="segments")
         assert {bd.space for bd in f.shim_bds()} == {"input", "output", "scratch"}
 
 

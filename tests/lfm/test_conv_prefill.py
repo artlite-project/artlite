@@ -14,6 +14,7 @@ from artlite.operators.fused import FusedOperator
 from models.lfm import conv as CV
 from models.lfm.conv_prefill import ROW, ConvPrefillOperator
 
+from ..common import to_numpy
 from . import ref
 
 PITCH = 768
@@ -58,15 +59,15 @@ def test_conv_prefill(T: int, n: int) -> None:
         H[c, CV.payload(0):CV.payload(0) + XPAY] = taps[c, :XPAY]
         H[c, CV.payload(1):CV.payload(1) + 3 * CV.TAP] = taps[c, XPAY:]
         H[c, CV.payload(2):CV.payload(2) + 6 * CV.ROW] = hist[c].view(torch.uint8).numpy().reshape(-1)
-    fused.get_buffer("G")[:] = G.reshape(-1)
-    fused.get_buffer("H").view(torch.uint8)[:] = torch.from_numpy(H.reshape(-1))
+    fused.get_buffer("G")[:] = to_numpy(G.reshape(-1))
+    fused.get_buffer("H").view(np.uint8)[:] = H.reshape(-1)
     fused.sync_inputs()
     fused.set_params(op.params(n))
     fused()
     fused.sync_outputs()
-    a = fused.get_buffer("A").view(torch.uint8).numpy()
+    a = fused.get_buffer("A").view(np.uint8)
     y = bfp16.block_values(a.reshape(T // 8, COLS * CV.CH // 8, 8, 9)).transpose(0, 2, 1, 3).reshape(T, -1)
-    h_out = fused.get_buffer("H").view(torch.uint8).numpy().reshape(COLS, -1)
+    h_out = fused.get_buffer("H").view(np.uint8).reshape(COLS, -1)
     Gf = G.float().numpy()
     for c in range(COLS):
         rows = Gf[:, c * PITCH:c * PITCH + ROW]

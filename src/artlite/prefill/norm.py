@@ -58,7 +58,6 @@ projection's padding rows after each column's values).
 """
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
@@ -561,14 +560,14 @@ class PrefillNormOperator(ArtcOperator):
     def get_arg_spec(self) -> list[ArgSpec]:
         EMB = self.E
         n = self.T * EMB
-        specs = [ArgSpec("in", (n,), torch.bfloat16)]
+        specs = [ArgSpec("in", (n,), bfloat16)]
         if self.add:  # (two deltas: one argument, [delta | delta2])
             specs.append(ArgSpec("in", ((self.deltas - 1) * self.d_stride + self.T * COLS * self.d_pitch,),
-                                 torch.bfloat16))
-        specs.append(ArgSpec("in", ((2 if self.pre else 1) * EMB,), torch.bfloat16))
+                                 bfloat16))
+        specs.append(ArgSpec("in", ((2 if self.pre else 1) * EMB,), bfloat16))
         if self.add:
-            specs.append(ArgSpec("out", (n,), torch.bfloat16))
-        specs.append(ArgSpec("out", ((2 if self.lo else 1) * self.T * self.out_pitch * 9 // 16,), torch.bfloat16))
+            specs.append(ArgSpec("out", (n,), bfloat16))
+        specs.append(ArgSpec("out", ((2 if self.lo else 1) * self.T * self.out_pitch * 9 // 16,), bfloat16))
         return specs
 
     def get_kernel_src(self) -> str:
@@ -1138,7 +1137,7 @@ def residual_params(w_post: np.ndarray | None, w1: np.ndarray | None, scale: flo
     out = np.zeros((8, E), np.uint16)
 
     def b16(v: np.ndarray) -> np.ndarray:
-        return torch.from_numpy(np.asarray(v, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)
+        return np.asarray(v, np.float32).astype(bfloat16).view(np.uint16)
 
     if w_post is not None:
         out[0] = b16(w_post)
@@ -1187,10 +1186,10 @@ class ResidualNormOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T, E = self.T, self.E
-        specs = [ArgSpec("in", (8 * E,), torch.bfloat16), ArgSpec("in", (2 * T * E,), torch.bfloat16)]
+        specs = [ArgSpec("in", (8 * E,), bfloat16), ArgSpec("in", (2 * T * E,), bfloat16)]
         if self.mode != "in":
-            specs += [ArgSpec("in", (self.n_delta,), torch.bfloat16), ArgSpec("out", (2 * T * E,), torch.bfloat16)]
-        specs.append(ArgSpec("out", (T * E * 9 // 16,), torch.bfloat16))
+            specs += [ArgSpec("in", (self.n_delta,), bfloat16), ArgSpec("out", (2 * T * E,), bfloat16)]
+        specs.append(ArgSpec("out", (T * E * 9 // 16,), bfloat16))
         return specs
 
     def get_mlir_artifact(self) -> Module:

@@ -72,7 +72,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects import arith
 from aie.dialects.aie import T as IrT
 from aie.helpers.taplib import TensorAccessPattern
@@ -1052,9 +1051,9 @@ class GemmQOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [
-            ArgSpec("in", (self.M * self.a_K * 9 // 16,), torch.bfloat16),
-            ArgSpec("in", (self.w_bytes // 2,), torch.bfloat16),
-            ArgSpec("out", (self.M * self.N * 9 // 16,) if self.c_bfp16 else (self.M, self.N), torch.bfloat16),
+            ArgSpec("in", (self.M * self.a_K * 9 // 16,), bfloat16),
+            ArgSpec("in", (self.w_bytes // 2,), bfloat16),
+            ArgSpec("out", (self.M * self.N * 9 // 16,) if self.c_bfp16 else (self.M, self.N), bfloat16),
         ]
 
     def get_kernel_src(self) -> str:

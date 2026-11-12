@@ -15,7 +15,7 @@ from importlib.metadata import version
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, NamedTuple, Self
 
-import torch  # noqa: TID251
+import numpy as np
 from jinja2 import Environment, StrictUndefined
 
 from .. import backend, portable, profiling
@@ -24,6 +24,7 @@ from .kernel_source import KernelSource, translation_unit
 
 if TYPE_CHECKING:
     from aie.ir import Module
+    from numpy.typing import DTypeLike
 
     from .. import Device, Program
     from .._native import Buffer
@@ -237,18 +238,25 @@ class ArgDirection(StrEnum):
     OUT = "out"
 
 
-class ArgSpec(NamedTuple):
+class _ArgSpec(NamedTuple):
+    direction: ArgDirection
+    shape: tuple[int, ...]
+    dtype: np.dtype
+
+
+class ArgSpec(_ArgSpec):
     """Describes one buffer argument for an RTC operator.
 
     The ``shape`` is the *logical* shape used for allocation sizing.
     At dispatch time only the total element count (``math.prod(shape)``)
-    and ``dtype`` are validated — callers may pass tensors with any
-    shape as long as numel and dtype match.
+    and ``dtype`` (any numpy dtype-like, kept as ``np.dtype``) are validated —
+    callers may pass arrays with any shape as long as size and dtype match.
     """
 
-    direction: ArgDirection
-    shape: tuple[int, ...]
-    dtype: torch.dtype
+    __slots__ = ()
+
+    def __new__(cls, direction: ArgDirection | str, shape: tuple[int, ...], dtype: DTypeLike) -> Self:
+        return super().__new__(cls, direction, shape, np.dtype(dtype))
 
 
 @dataclass(frozen=True)
@@ -386,12 +394,12 @@ class ArtcOperator:
         # Pipeline (explicit device sharing, zero-copy between ops):
         op_a = OpA(...).compile()
         op_b = OpB(...).compile(device=op_a.device)
-        buf = artlite.from_torch(x, op_a.device)
+        buf = artlite.from_numpy(x, op_a.device)
         tmp = artlite.empty(..., device=op_a.device)
         out = artlite.empty(..., device=op_a.device)
         op_a.dispatch(buf, tmp)
         op_b.dispatch(tmp, out)
-        result = out.to_torch()
+        result = out.numpy()
     """
 
     AIECC_FLAGS: tuple[str, ...] = ()  # (aiecc options of the design)
@@ -547,18 +555,18 @@ class ArtcOperator:
             self.compile()
         self._program.dispatch(*buffers)
 
-    def run(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Compile (if needed), dispatch, and return output tensors.
+    def run(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Compile (if needed), dispatch, and return output arrays.
 
-        Input tensors are synced to device, output buffers are auto-allocated
+        Input arrays are copied to device buffers, output buffers are auto-allocated
         from ``get_arg_spec()``, and results are read back to host.
-        See ``Program.run`` for validation semantics (numel + dtype).
+        See ``Program.run`` for validation semantics (size + dtype).
 
         Args:
-            *inputs: torch tensors for each "in" arg in the arg spec.
+            *inputs: numpy arrays for each "in" arg in the arg spec.
 
         Returns:
-            Single output tensor, or tuple of tensors if multiple outputs.
+            Single output array, or tuple of arrays if multiple outputs.
         """
         if self._program is None:
             self.compile()

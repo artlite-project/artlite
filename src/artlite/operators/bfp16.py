@@ -12,36 +12,31 @@ each panel = 8 rows x 8 columns, one block per row.
 """
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 
-def _blocks(w: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = w.float().contiguous() if isinstance(w, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(w, np.float32))
-    amax = x.abs().amax(-1)
-    e = torch.frexp(amax.clamp_min(2.0 ** -120))[1] - 1  # floor(log2(amax))
-    s = ((133 - e) << 23).view(torch.float32)[..., None]  # 2^(6 - e)
-    m = torch.round(x * s)
-    over = m.amax(-1) > 127  # a positive maximum rounded up to 128
-    m = torch.where(over[..., None], torch.round(x * (s * 0.5)), m)
-    e = torch.where(amax == 0, -127, e + over)  # an all-zero block has exponent byte 0
-    return (e + 127).clamp(0, 255).to(torch.uint8), m.to(torch.int8)
-
-
-def blocks(w: np.ndarray | torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+def blocks(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """float (..., 8) -> (exponent bytes (...,), int8 mantissas (..., 8)), round to nearest even.
     As the hardware: a positive maximum that rounds up to 128 raises the exponent, a negative
     one stays at -128; an all-zero block has exponent byte 0."""
-    e, m = _blocks(w)
-    return e.numpy(), m.numpy()
+    x = np.ascontiguousarray(w, np.float32)
+    amax = np.abs(x).max(-1)
+    e = np.frexp(np.maximum(amax, np.float32(2.0 ** -120)))[1] - 1  # floor(log2(amax))
+    s = np.ascontiguousarray((133 - e) << 23, np.int32).view(np.float32)[..., None]  # 2^(6 - e)
+    m = np.round(x * s)
+    over = m.max(-1) > 127  # a positive maximum rounded up to 128
+    m = np.where(over[..., None], np.round(x * (s * np.float32(0.5))), m)
+    e = np.where(amax == 0, -127, e + over)  # an all-zero block has exponent byte 0
+    return np.clip(e + 127, 0, 255).astype(np.uint8), m.astype(np.int8)
 
 
-def block_bytes(x: np.ndarray | torch.Tensor) -> np.ndarray:
+def block_bytes(x: np.ndarray) -> np.ndarray:
     """float (..., 8) -> bfp16ebs8 blocks (..., 9) uint8 [E, m0 .. m7] (``blocks``)."""
-    e, m = _blocks(x)
-    out = torch.empty((*e.shape, 9), dtype=torch.uint8)
+    e, m = blocks(x)
+    out = np.empty((*e.shape, 9), np.uint8)
     out[..., 0] = e
-    out[..., 1:] = m.view(torch.uint8)
-    return out.numpy()
+    out[..., 1:] = m.view(np.uint8)
+    return out
 
 
 def block_values(b: np.ndarray) -> np.ndarray:
@@ -55,15 +50,15 @@ def values(w: np.ndarray) -> np.ndarray:
     return (m * np.ldexp(np.float32(1.0), e.astype(np.int32) - 133)[..., None]).reshape(w.shape)
 
 
-def to_panels(x: torch.Tensor) -> torch.Tensor:
+def to_panels(x: np.ndarray) -> np.ndarray:
     """(rows, cols) -> activation panels [rows / 8][cols / 8][8 x 9 B] (round to nearest even)
     as a bf16-typed byte buffer."""
     r, c = x.shape
-    b = block_bytes(x.float().numpy().reshape(r // 8, 8, c // 8, 8).transpose(0, 2, 1, 3))
-    return torch.from_numpy(np.ascontiguousarray(b).reshape(-1)).view(torch.bfloat16)
+    b = block_bytes(np.asarray(x, np.float32).reshape(r // 8, 8, c // 8, 8).transpose(0, 2, 1, 3))
+    return np.ascontiguousarray(b).reshape(-1).view(bfloat16)
 
 
-def from_panels(b: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+def from_panels(b: np.ndarray, rows: int, cols: int) -> np.ndarray:
     """Activation panels -> (rows, cols) float32."""
-    val = block_values(b.view(torch.uint8).numpy().reshape(rows // 8, cols // 8, 8, 9))
-    return torch.from_numpy(np.ascontiguousarray(val.transpose(0, 2, 1, 3)).reshape(rows, cols))
+    val = block_values(np.ascontiguousarray(b).view(np.uint8).reshape(rows // 8, cols // 8, 8, 9))
+    return np.ascontiguousarray(val.transpose(0, 2, 1, 3)).reshape(rows, cols)

@@ -440,9 +440,9 @@ class MmvOperator(ArtcOperator):
         super().__init__()
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.n_tiles * self.tile_bytes,), torch.uint8),
-                ArgSpec("in", (self.chunk.xp + self.chunk.xs,), torch.uint8),
-                ArgSpec("out", (self.n_tiles * self.y_floats,), torch.float32)]
+        return [ArgSpec("in", (self.n_tiles * self.tile_bytes,), np.uint8),
+                ArgSpec("in", (self.chunk.xp + self.chunk.xs,), np.uint8),
+                ArgSpec("out", (self.n_tiles * self.y_floats,), np.float32)]
 
     def get_kernel_src(self) -> str:
         fid, ch = FORMATS[self.fmt].fid, self.chunk

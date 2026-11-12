@@ -31,7 +31,6 @@ needs it there (``seq``), so every row runs every role.
 from typing import ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.dialects._aie_enum_gen import DMAChannelDir
 from aie.helpers.taplib import TensorAccessPattern as TAP
 from aie.iron import (
@@ -118,7 +117,7 @@ class VisionDesign(ArtcOperator):
         return core.source(win=self.win)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec(ArgDirection.IN, (4096,), torch.bfloat16), ArgSpec(ArgDirection.OUT, (4096,), torch.bfloat16)]
+        return [ArgSpec(ArgDirection.IN, (4096,), bfloat16), ArgSpec(ArgDirection.OUT, (4096,), bfloat16)]
 
     def get_mlir_artifact(self):
         i32 = np.dtype[np.int32]

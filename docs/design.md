@@ -186,20 +186,20 @@ import artlite
 
 # Simple usage (auto-sync)
 prog = SomeOperator(...).compile()
-output = prog.run(input_tensor)
+output = prog.run(input_array)  # numpy arrays in and out (bf16: ml_dtypes.bfloat16)
 
 # Pipeline usage (explicit sync, tensor reuse)
 dev = artlite.Device()
 op_a = OpA(...).compile(device=dev)
 op_b = OpB(...).compile(device=dev)
 
-x = artlite.from_torch(x_torch, dev)
+x = artlite.from_numpy(x_np, dev)
 tmp = artlite.empty(x.shape, dtype=x.dtype, device=dev)
 y = artlite.empty(x.shape, dtype=x.dtype, device=dev)
 
 op_a.dispatch(x, tmp)  # no host sync
 op_b.dispatch(tmp, y)  # tmp stays on device
-result = y.to_torch()  # one sync at the end
+result = y.numpy()  # one sync at the end
 ```
 
 **Key classes**:

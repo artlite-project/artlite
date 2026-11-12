@@ -30,7 +30,6 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (
@@ -351,11 +350,11 @@ class GemmaPrepOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         k = self.kind
-        return [ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (self.n_cs,), torch.bfloat16),
-                ArgSpec("in", (8 * 4 * k.rot,), torch.bfloat16),
-                ArgSpec("out", (self.n_qs,), torch.bfloat16),
-                ArgSpec("out", ((COLS // QH * self.kv_bytes + self.kv_pad) // 2,), torch.bfloat16)]
+        return [ArgSpec("in", (self.T * self.layout.N,), bfloat16),
+                ArgSpec("in", (self.n_cs,), bfloat16),
+                ArgSpec("in", (8 * 4 * k.rot,), bfloat16),
+                ArgSpec("out", (self.n_qs,), bfloat16),
+                ArgSpec("out", ((COLS // QH * self.kv_bytes + self.kv_pad) // 2,), bfloat16)]
 
     def params(self, p0: int, guard: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 (``guard``: the cache's groups before group 0)."""
@@ -840,9 +839,9 @@ class GemmaAttnOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         hd = self.kind.hd
-        return [ArgSpec("in", (self.n_qs,), torch.bfloat16),
-                ArgSpec("in", ((COLS // QH * self.kv_bytes + self.kv_pad) // 2,), torch.bfloat16),
-                ArgSpec("out", (self.n_pass * self.pq * COLS * hd * 9 // 16,), torch.bfloat16)]
+        return [ArgSpec("in", (self.n_qs,), bfloat16),
+                ArgSpec("in", ((COLS // QH * self.kv_bytes + self.kv_pad) // 2,), bfloat16),
+                ArgSpec("out", (self.n_pass * self.pq * COLS * hd * 9 // 16,), bfloat16)]
 
     def params(self, p0: int) -> dict[str, int]:
         assert p0 % 32 == 0

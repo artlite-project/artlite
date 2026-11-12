@@ -8,6 +8,7 @@ import os
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 import artlite
 from artlite.gguf_model import GGUFFile
@@ -18,7 +19,7 @@ from models.gemma4.attn_prefill import Kind
 from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
-from ..common import essay
+from ..common import essay, to_numpy, to_torch
 
 LAYERS = (0, 5)  # a sliding-window and a full-attention layer
 _image: dict[str, tuple] = {}
@@ -85,9 +86,9 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
                           input_args=["G", "CS", "PRM"], output_args=["A"]).compile()
     gen = torch.Generator().manual_seed(t0 + hd)
     c_score = 1.7 / np.log(2)
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(cfg, kind, max_pos).view(np.uint8).reshape(-1))
-    fused.get_buffer("PRM").view(torch.uint8)[:] = torch.from_numpy(AP.prm_object(kind, c_score).view(np.uint8))
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(COLS // 4, n_groups, kp + 1, AP.OBJ)
+    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(cfg, kind, max_pos).view(np.uint8).reshape(-1)
+    fused.get_buffer("PRM").view(np.uint8)[:] = AP.prm_object(kind, c_score).view(np.uint8)
+    kv = fused.get_buffer("KV").view(np.uint8).reshape(COLS // 4, n_groups, kp + 1, AP.OBJ)
     kv[:] = 0
     hist = t0 // kind.pg  # (the cache before the chunk: random normed K, V)
     for h in range(COLS // 4):
@@ -104,7 +105,7 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
         G[:, c * lay.pitch + lay.off["q"] + np.arange(hd)] = q[:, c]
         src = (k if j < 2 else v)[:, h, (j % 2) * hd // 2:(j % 2 + 1) * hd // 2]
         G[:, c * lay.pitch + lay.off["kv"] + np.arange(hd // 2)] = src
-    fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    fused.get_buffer("G")[:] = G.reshape(-1).astype(bfloat16)
     fused.sync_inputs()
     fused.set_params(prep.params(t0, guard) | attn.params(t0))
     fused()
@@ -121,7 +122,7 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
             y[..., :kind.rot], y[..., hd // 2:hd // 2 + kind.rot] = a * c_ - b * s_, a * s_ + b * c_
         return y
 
-    slots = fused.get_buffer("QS").view(torch.uint8).numpy()[:T // 8 * COLS * kind.qp]
+    slots = fused.get_buffer("QS").view(np.uint8)[:T // 8 * COLS * kind.qp]
     if not kind.swa:  # (pass-major: [pass][KV head][token group][column of the head])
         slots = slots.reshape(T // 32, COLS // 4, 4, 4, kind.qp).transpose(0, 2, 1, 3, 4)
     slots = slots.reshape(T // 8, COLS, kind.qp).transpose(1, 0, 2)  # (the attention's QS: whole passes, padded)
@@ -133,7 +134,7 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
         K[h], V[h] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[h, guard:guard + n], hd))
         assert _rel(torch.from_numpy(K[h][t0:]), torch.from_numpy(nr(k, True)[:, h])) < (2e-4 if kp == 2 else 1e-2), h
         assert _rel(torch.from_numpy(V[h][t0:]), torch.from_numpy(nr(v, False)[:, h])) < 1e-2, h
-    A = bfp16.from_panels(fused.get_buffer("A")[:T * COLS * hd * 9 // 16].clone(), T, COLS * hd).numpy()
+    A = bfp16.from_panels(fused.get_buffer("A")[:T * COLS * hd * 9 // 16], T, COLS * hd)
     A = A.reshape(T, COLS, hd)
     want = np.zeros((T, COLS, hd))
     pos = np.arange(t0, t0 + T)[:, None]
@@ -172,10 +173,10 @@ def test_ple() -> None:
     g = torch.Generator().manual_seed(5)
     y = (torch.randn(T, COLS * 64, generator=g) * 2).bfloat16()
     pli = (torch.randn(T, COLS * 32, generator=g)).bfloat16()
-    A = artlite.from_torch(torch.zeros(T * COLS * 64 * 9 // 16, dtype=torch.bfloat16), dev)
-    op.dispatch(artlite.from_torch(y.clone(), dev), artlite.from_torch(pli.clone(), dev), A)
+    A = artlite.from_numpy(np.zeros(T * COLS * 64 * 9 // 16, bfloat16), dev)
+    op.dispatch(artlite.from_numpy(to_numpy(y), dev), artlite.from_numpy(to_numpy(pli), dev), A)
     A.sync_from_device()
-    got = bfp16.from_panels(A.to_torch(), T, COLS * 64).double()
+    got = to_torch(bfp16.from_panels(A.numpy(), T, COLS * 64)).double()
     want = _ple_reference(y, pli).double()
     eq = _rel(torch.from_numpy(bfp16.values(want.float().numpy())).double(), want)
     err = _rel(got, want)

@@ -8,6 +8,7 @@ import os
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 import artlite
 from artlite.gguf_model import GGUFFile
@@ -17,6 +18,7 @@ from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator
 
+from ..common import to_numpy
 from ..qwen35 import ref
 
 # (model, layer): the layers each image holds
@@ -46,7 +48,7 @@ def _w_arg(op: object, W: np.ndarray, w_off: int, dev: object) -> object:
     w = np.zeros(op.w_bytes, np.uint8)
     a, b = max(w_off, 0), min(w_off + op.w_bytes, W.size)
     w[a - w_off:b - w_off] = W[a:b]
-    return artlite.from_torch(torch.from_numpy(w).view(torch.bfloat16), dev)
+    return artlite.from_numpy(w.view(bfloat16), dev)
 
 
 def _f32(g: GGUFFile, name: str) -> np.ndarray:
@@ -79,20 +81,19 @@ def test_router(model: str, L: int) -> None:
     norm.compile(), op.compile()
     dev = norm.device
     rng = np.random.default_rng(L)
-    x = torch.from_numpy((rng.standard_normal((T, H)) * 2).astype(np.float32)).bfloat16()
-    d = torch.zeros(T, H).bfloat16()
+    x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
     wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
-    xb = artlite.from_torch(x.clone().flatten(), dev)
-    xn = artlite.empty((2 * T * H * 9 // 16,), dtype=torch.bfloat16, device=dev)
-    norm.dispatch(xb, artlite.from_torch(d.flatten(), dev), artlite.from_torch(torch.from_numpy(wn).float().bfloat16(), dev),
-                  xb, xn)
-    C = artlite.empty((T, op.N), dtype=torch.bfloat16, device=dev)
+    xb = artlite.from_numpy(x.reshape(-1), dev)
+    xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
+    norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
+                  artlite.from_numpy(wn.astype(np.float32).astype(bfloat16), dev), xb, xn)
+    C = artlite.empty((T, op.N), dtype=bfloat16, device=dev)
     op.dispatch(xn, _w_arg(op, W, gm.w_off, dev), C)
     C.sync_from_device()
-    c = C.to_torch().view(torch.float32).numpy().reshape(T, COLS, MG.router_pitch(region))
+    c = C.numpy().view(np.float32).reshape(T, COLS, MG.router_pitch(region))
     got = c[:, :, :E // COLS].reshape(T, E)
     got_sg = c[:, :, router_gate(region)]
-    xd = x.double().numpy()
+    xd = x.astype(np.float64)
     xr = xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
     want = xr @ _f32(g, f"blk.{L}.ffn_gate_inp.weight").T
     want_sg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp_shexp.weight")[0]
@@ -120,13 +121,13 @@ def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.
     norm = PrefillNormOperator(T=T, E=H, eps=cfg.rms_norm_eps, lo=True).compile()
     dev = norm.device
     rng = np.random.default_rng(100 + L)
-    x = torch.from_numpy((rng.standard_normal((T, H)) * 2).astype(np.float32)).bfloat16()
+    x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
     wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
-    xb = artlite.from_torch(x.clone().flatten(), dev)
-    xn = artlite.empty((2 * T * H * 9 // 16,), dtype=torch.bfloat16, device=dev)
-    norm.dispatch(xb, artlite.from_torch(torch.zeros(T * H).bfloat16(), dev),
-                  artlite.from_torch(torch.from_numpy(wn).float().bfloat16(), dev), xb, xn)
-    xd = x.double().numpy()
+    xb = artlite.from_numpy(x.reshape(-1), dev)
+    xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
+    norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
+                  artlite.from_numpy(wn.astype(np.float32).astype(bfloat16), dev), xb, xn)
+    xd = x.astype(np.float64)
     return dev, xn, xd, xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
 
 
@@ -146,12 +147,12 @@ def test_shared_gate_up(model: str, L: int, T: int) -> None:
     gm = MG.shared_gate_up(img, img.region(L, "moe_in"), T, width=F)
     op = _unpaced(gm.op).compile()
     dev, xn, _, _ = _normed(model, L, T)
-    out = artlite.empty((T * F * 9 // 16,), dtype=torch.bfloat16, device=dev)
+    out = artlite.empty((T * F * 9 // 16,), dtype=bfloat16, device=dev)
     op.dispatch(xn, _w_arg(op, W, gm.w_off, dev), out)
     out.sync_from_device()
-    got = bfp16.from_panels(out.to_torch(), T, F).double().numpy()
+    got = bfp16.from_panels(out.numpy(), T, F).astype(np.float64)
     xn.sync_from_device()
-    xh = bfp16.from_panels(xn.to_torch(), T, 2 * H).double().numpy()[:, :H]
+    xh = bfp16.from_panels(xn.numpy(), T, 2 * H).astype(np.float64)[:, :H]
     b = f"blk.{L}."
     gate, up = xh @ _f32(g, b + "ffn_gate_shexp.weight").T, xh @ _f32(g, b + "ffn_up_shexp.weight").T
     want = gate / (1 + np.exp(-gate)) * up
@@ -175,14 +176,13 @@ def test_shared_down(model: str, L: int, T: int) -> None:
     gm.op.compile()
     dev = gm.op.device
     A = (torch.randn(T, F, generator=torch.Generator().manual_seed(L)) * 0.5).bfloat16()
-    pan = bfp16.to_panels(A)
-    Aq = bfp16.from_panels(pan, T, F).double().numpy()
-    C = artlite.from_torch(torch.zeros(gm.op.M, gm.op.N, dtype=torch.bfloat16), dev)
-    gm.op.dispatch(artlite.from_torch(torch.cat([pan, torch.zeros(gm.op.M * F * 9 // 16 - pan.numel(),
-                                                                   dtype=pan.dtype)]), dev),
+    pan = bfp16.to_panels(to_numpy(A))
+    Aq = bfp16.from_panels(pan, T, F).astype(np.float64)
+    C = artlite.from_numpy(np.zeros((gm.op.M, gm.op.N), bfloat16), dev)
+    gm.op.dispatch(artlite.from_numpy(np.concatenate([pan, np.zeros(gm.op.M * F * 9 // 16 - pan.size, bfloat16)]), dev),
                    _w_arg(gm.op, W, gm.w_off, dev), C)
     C.sync_from_device()
-    c = C.to_torch().float().numpy()[:T].reshape(T, COLS, pitch)[:, :, :H // COLS].reshape(T, H)
+    c = C.numpy().astype(np.float32)[:T].reshape(T, COLS, pitch)[:, :, :H // COLS].reshape(T, H)
     want = Aq @ _f32(g, f"blk.{L}.ffn_down_shexp.weight").T
     err = ref.rel_err(c, want)
     print(f"layer {L} ({region.blocks[0].fmt}) T {T}: shared down err {err:.2e}")
@@ -215,18 +215,18 @@ def test_expert_gemms(model: str, L: int) -> None:
     ex = [list(rng.integers(0, cfg.n_experts, size=int(n))) for n in ns]
     act = [rng.random(int(n)) < 0.5 for n in ns]
     act[1][:] = False  # (a column whose only rows 64 .. are its last chunk's)
-    Wd = artlite.empty((img.nbytes // 2,), dtype=torch.bfloat16, device=dev)
+    Wd = artlite.empty((img.nbytes // 2,), dtype=bfloat16, device=dev)
     Wd._raw.map()[:] = W
     Wd._raw.sync_to_device()
     A = (torch.randn(COLS, cap, CHUNK, H, generator=torch.Generator().manual_seed(L)) * 0.5).bfloat16()
-    pan = torch.stack([torch.stack([bfp16.to_panels(A[c, k]) for k in range(cap)]) for c in range(COLS)])
-    XP = artlite.from_torch(pan.reshape(-1).contiguous(), dev)
+    pan = np.stack([np.stack([bfp16.to_panels(to_numpy(A[c, k])) for k in range(cap)]) for c in range(COLS)])
+    XP = artlite.from_numpy(pan.reshape(-1), dev)
     UNSET = 0x7FC1  # (what no drain writes)
-    Hb = artlite.from_torch(torch.full((COLS * cap * gu.c_slot,), UNSET, dtype=torch.int16).view(torch.bfloat16), dev)
-    Yb = artlite.from_torch(torch.full((COLS * cap * dn.c_slot,), UNSET, dtype=torch.int16).view(torch.bfloat16), dev)
+    Hb = artlite.from_numpy(np.full(COLS * cap * gu.c_slot, UNSET, np.int16).view(bfloat16), dev)
+    Yb = artlite.from_numpy(np.full(COLS * cap * dn.c_slot, UNSET, np.int16).view(bfloat16), dev)
     cbs = {}
     for op, name, region, a_in, out in ((gu, "gu", gu_r, XP, Hb), (dn, "dn", dn_r, Hb, Yb)):
-        cb = artlite.from_torch(torch.zeros(COLS * op.cb_words * 2, dtype=torch.bfloat16), dev)
+        cb = artlite.from_numpy(np.zeros(COLS * op.cb_words * 2, bfloat16), dev)
         cbv = cb._raw.map().view(np.uint32)
         for c in range(COLS):
             op.stream(ex[c], act[c], cb=device_address(cb, 4 * c * op.cb_words, lib._ctx),
@@ -243,24 +243,24 @@ def test_expert_gemms(model: str, L: int) -> None:
             bufs=[b._raw for b in (Wd, cbs["gu"], cbs["dn"], XP, Hb, Yb)])
     Hb.sync_from_device()
     Yb.sync_from_device()
-    hv = Hb.to_torch().view(COLS, cap, -1)
-    hr = hv.view(torch.int16).numpy()
-    yr = dn.y_rows(Yb.to_torch().view(torch.int16).numpy().reshape(COLS, cap, -1))[..., :H]
-    yv = torch.from_numpy(yr.copy()).view(torch.bfloat16)
+    hv = Hb.numpy().reshape(COLS, cap, -1)
+    hr = hv.view(np.int16)
+    yr = dn.y_rows(Yb.numpy().view(np.int16).reshape(COLS, cap, -1))[..., :H]
+    yv = yr.view(bfloat16)
     ex_w = ref.experts(g, L)
     errs_h, errs_y = [], []
     for c in range(COLS):
         for k in range(int(ns[c])):
             rows = CHUNK if act[c][k] or k == ns[c] - 1 else M
             gate, up, down = (np.asarray(m, np.float64) for m in ex_w(int(ex[c][k])))
-            aq = bfp16.from_panels(pan[c, k], CHUNK, H).double().numpy()[:rows]
+            aq = bfp16.from_panels(pan[c, k], CHUNK, H).astype(np.float64)[:rows]
             hg, hu = aq @ gate.T, aq @ up.T
             g = rows // 8 * F // 8 * 36  # (H: the rows' token groups' panels first)
             assert (hr[c, k, :g] != UNSET).any() and (hr[c, k, g:] == UNSET).all(), (c, k, rows)
             assert (yr[c, k, rows:] == UNSET).all() and not (yr[c, k, :rows] == UNSET).all(axis=1).any(), (c, k)
-            got_h = bfp16.from_panels(hv[c, k], CHUNK, F).double().numpy()[:rows]
+            got_h = bfp16.from_panels(hv[c, k], CHUNK, F).astype(np.float64)[:rows]
             errs_h.append(ref.rel_err(got_h, hg / (1 + np.exp(-hg)) * hu))
-            errs_y.append(ref.rel_err(yv[c, k, :rows].double().numpy(), got_h @ down.T))
+            errs_y.append(ref.rel_err(yv[c, k, :rows].astype(np.float64), got_h @ down.T))
     print(f"layer {L}: chunks {ns.tolist()}; H err max {max(errs_h):.2e}, down err max {max(errs_y):.2e}")
     assert max(errs_h) < 3.5e-2 and max(errs_y) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
 
@@ -297,17 +297,17 @@ def test_moe_block(model: str, L: int) -> None:
     lib = Library(f"t_moe_block_{model}{L}", ops).compile().load()
     dev = lib.device
     rng = np.random.default_rng(10 + L)
-    x = torch.from_numpy((rng.standard_normal((T, H)) * 2).astype(np.float32)).bfloat16()
+    x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
     wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize().numpy(), np.float64).reshape(-1)
     bufs = {}
 
-    def buf(name: str, n: int, init: torch.Tensor | None = None) -> object:
-        bufs[name] = artlite.from_torch(init if init is not None else torch.zeros(n, dtype=torch.bfloat16), dev)
+    def buf(name: str, n: int, init: np.ndarray | None = None) -> object:
+        bufs[name] = artlite.from_numpy(init if init is not None else np.zeros(n, bfloat16), dev)
         return bufs[name]
 
-    buf("PX", 0, x.clone().flatten())
+    buf("PX", 0, x.reshape(-1))
     buf("D", T * H)
-    buf("WN", 0, torch.from_numpy(wn).float().bfloat16())
+    buf("WN", 0, wn.astype(np.float32).astype(bfloat16))
     buf("XN2", 2 * T * H * 9 // 16)
     buf("LG", T * router.op.N)
     buf("HS", T * Fs * 9 // 16)
@@ -331,7 +331,7 @@ def test_moe_block(model: str, L: int) -> None:
              (3, [a["HS"], a["W"] + sdown.w_off, a["DS"]])], bufs=raw)
     for k in ("LG", "PX"):
         bufs[k].sync_from_device()
-    lg = bufs["LG"].to_torch().view(torch.float32).numpy().reshape(T, COLS, MG.router_pitch(mi))
+    lg = bufs["LG"].numpy().view(np.float32).reshape(T, COLS, MG.router_pitch(mi))
     logits, sg = lg[:, :, :E // COLS].reshape(T, E), lg[:, 0, MG.PASS // 2]
     ids, w = MP.route(logits, K)
     plan = MP.Plan.of(ids, cap=cap, E=E)
@@ -368,9 +368,9 @@ def test_moe_block(model: str, L: int) -> None:
              (7, [a["CBC"], a["DS"], a["DL"]]), (8, [a["PX"], a["DL"], a["WN"], a["PX"], a["XN"]])], bufs=raw)
     for k in ("DL", "PX"):
         bufs[k].sync_from_device()
-    got = bufs["DL"].to_torch().double().numpy().reshape(T, H)
+    got = bufs["DL"].numpy().astype(np.float64).reshape(T, H)
     # the oracle on the NPU's routing
-    xd = x.double().numpy()
+    xd = x.astype(np.float64)
     xr = xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + eps) * wn
     want_lg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp.weight").T
     rids, _ = ref.moe_route(want_lg.astype(np.float32), K)
@@ -385,4 +385,5 @@ def test_moe_block(model: str, L: int) -> None:
     err, rms = ref.rel_err(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
     print(f"layer {L}: chunks per column {counts}; delta err max {err:.2e}, rms {rms:.2e}")
     assert err < 4e-2 and rms < 3e-2
-    assert torch.equal(bufs["PX"].to_torch().view(T, H), (x.float() + torch.from_numpy(got).float()).bfloat16())
+    assert np.array_equal(bufs["PX"].numpy().reshape(T, H).view(np.uint16),
+                          (x.astype(np.float32) + got.astype(np.float32)).astype(bfloat16).view(np.uint16))

@@ -11,7 +11,7 @@ side: ``kernel_lib.h``'s V records and ``al::merge``):
 """
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 
 def substeps(p: int, S: int, pg: int, r: int) -> list[tuple[int, int]]:
@@ -33,7 +33,7 @@ def tails(S: int) -> int:
 
 def ring_rows(slot: np.ndarray, hd: int) -> np.ndarray:
     """A ring slot (bytes: [d-block][position 8][8] bf16) -> its record's rows (8, hd) float32."""
-    v = torch.from_numpy(np.ascontiguousarray(slot[:16 * hd])).view(torch.bfloat16).float().numpy()
+    v = np.ascontiguousarray(slot[:16 * hd]).view(bfloat16).astype(np.float32)
     return np.ascontiguousarray(v.reshape(hd // 8, 8, 8).transpose(1, 0, 2)).reshape(8, hd)
 
 

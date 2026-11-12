@@ -21,8 +21,8 @@ artlite runtime.
 ## 1. The operator class
 
 ```python
-import torch
 from aie.ir import Module
+from ml_dtypes import bfloat16
 
 from ..base import ArgSpec, ArtcOperator
 from ..design import COLS
@@ -37,7 +37,7 @@ class MyOperator(ArtcOperator):
         super().__init__()
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.size,), torch.bfloat16), ArgSpec("out", (self.size,), torch.bfloat16)]
+        return [ArgSpec("in", (self.size,), bfloat16), ArgSpec("out", (self.size,), bfloat16)]
 
     def get_kernel_src(self) -> str:
         return _KERNEL.render(name=self.kernel_name, ts=self.tile_size)
@@ -110,16 +110,18 @@ import pytest
 import torch
 
 from artlite.operators import MyOperator
-from .common import verify_close
+from ..common import to_numpy, verify_close
 
 
 @pytest.mark.parametrize("size,tile_size", [(1024, 256), (2048, 512)])
 def test_my_op(size: int, tile_size: int):
     op = MyOperator(size=size, tile_size=tile_size).compile()
     x = torch.randn(size, dtype=torch.bfloat16)
-    verify_close(op.run(x), reference(x), rel_tol=0.04, abs_tol=1e-6)
+    verify_close(op.run(to_numpy(x)), reference(x), rel_tol=0.04, abs_tol=1e-6)
 ```
 
+- The runtime takes and returns numpy arrays (bf16: `ml_dtypes.bfloat16`); a torch reference crosses over with
+  `tests/common.py`'s `to_numpy` / `to_torch`.
 - Parametrize over the sizes and tile sizes IRON tests (edge cases included); `torch.equal` for bit-identical
   results, `verify_close` for floating point. Keep the body before `compile()` cheap: the planning pass runs it up to
   the first use of the NPU.

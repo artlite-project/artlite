@@ -11,6 +11,7 @@ import itertools
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode import kv as KV
 from artlite.operators import FusedOperator, bfp16
@@ -71,13 +72,13 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
     inv = base ** (-np.arange(0, HD, 2) / HD)
     inv[rot:] = 0  # (pairs past rot: cos 1, sin 0)
     cs = PA.cs_table(inv, max_pos)
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
+    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
     wq = (torch.rand(HD, generator=gen) * 2 + 0.2).double()
     wk = (torch.rand(HD, generator=gen) * 2 + 0.2).double()
     nw = np.zeros(PA.PrepOperator.nw_bytes(HD) // 4, np.float32)
     nw[:2 * HD] = torch.cat([wq, wk]).numpy()
-    fused.get_buffer("NW").view(torch.uint8)[:] = torch.from_numpy(nw.view(np.uint8))
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy()[:KVH * kvb].reshape(KVH, n_groups, shape.objects, A_BYTES)
+    fused.get_buffer("NW").view(np.uint8)[:] = nw.view(np.uint8)
+    kv = fused.get_buffer("KV").view(np.uint8)[:KVH * kvb].reshape(KVH, n_groups, shape.objects, A_BYTES)
     kv[:] = 0
     for h in range(KVH):  # (the cache before the chunk)
         if p0:
@@ -96,9 +97,9 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
         G[:, o + LAYOUT.off["k"] + np.arange(64)] = k[:, h, 64 * j:64 * j + 64]
         G[:, o + LAYOUT.off["v"] + np.arange(64)] = v[:, h, 64 * j:64 * j + 64]
         G[:, o + LAYOUT.off["g"] + np.arange(QH)] = g[:, QH * c:QH * c + QH]
-    fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    fused.get_buffer("G")[:] = G.reshape(-1).astype(bfloat16)
     if sets is not None:
-        fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.set_seg(sets))
+        fused.get_buffer("SEG").view(np.uint8)[:] = attn.set_seg(sets)
     fused.sync_inputs()
     fused.set_params(prep.params(p0) | (attn.params(p0) if sets is None else attn.set_params(sets)))
     fused()
@@ -114,7 +115,7 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
         y[..., :HD // 2], y[..., HD // 2:] = a * c_ - b * s_, a * s_ + b * c_
         return y
 
-    qs = fused.get_buffer("QS").view(torch.uint8).numpy()[:prep.n_qs * 2].reshape(COLS, T // 8, shape.tgu)
+    qs = fused.get_buffer("QS").view(np.uint8)[:prep.n_qs * 2].reshape(COLS, T // 8, shape.tgu)
     qv = _q_values(qs[:, :, :QH * shape.qunit].reshape(COLS, T // 8, QH, shape.qunit), HD)
     qv = qv.transpose(0, 2, 1, 3, 4).reshape(COLS * QH, T, HD)  # [head][query][hd]
     gv = torch.from_numpy(qs[:, :, QH * shape.qunit:].copy()).view(torch.bfloat16).float().numpy()  # [col][tg][8][QH]
@@ -129,7 +130,7 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
         Ks[h], Vs[h] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[h, guard:guard + n], HD))
         assert _rel(Ks[h][p0:], rope(k, wk)[:, h]) < (2e-4 if kp == 2 else 1e-2), h
         assert _rel(Vs[h][p0:], v[:, h].bfloat16().double().numpy()) < 1e-2, h
-    A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a].clone(), T, COLS * QH * HD).numpy().reshape(T, COLS * QH, HD)
+    A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a], T, COLS * QH * HD).reshape(T, COLS * QH, HD)
     want = np.zeros((T, COLS * QH, HD))
     kpos, qpos = np.arange(p0 + T)[None], np.arange(p0, p0 + T)[:, None]
     masked = (kpos > qpos) | ((qpos - kpos >= win) if win else False)

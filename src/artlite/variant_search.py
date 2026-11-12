@@ -1245,21 +1245,21 @@ def _worker(spec_path: str, *, compile_only: bool) -> None:
     operator.compile()
     if compile_only:
         return
-    import torch  # noqa: TID251
+    import numpy as np
 
     import artlite
 
     device = operator.device  # opens the HW context
-    generator = torch.Generator().manual_seed(0)
+    rng = np.random.default_rng(0)
     buffers = []
     for arg in operator.get_arg_spec():
         if arg.direction == "in":
             n = math.prod(arg.shape)
-            if arg.dtype.is_floating_point:
-                data = (torch.randn(n, generator=generator) * 0.5).to(arg.dtype)
+            if arg.dtype.kind == "f" or arg.dtype == artlite.bfloat16:
+                data = (rng.standard_normal(n, np.float32) * 0.5).astype(arg.dtype)
             else:
-                data = torch.randint(0, 100, (n,), generator=generator).to(arg.dtype)
-            buffers.append(artlite.from_torch(data.reshape(arg.shape), device))
+                data = rng.integers(0, 100, n).astype(arg.dtype)
+            buffers.append(artlite.from_numpy(data.reshape(arg.shape), device))
         else:
             buffers.append(artlite.empty(arg.shape, dtype=arg.dtype, device=device))
     for _ in range(2):

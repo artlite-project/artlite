@@ -7,6 +7,7 @@ import os
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode import kv as KV
 from artlite.gguf_model import GGUFFile
@@ -48,7 +49,7 @@ def _gate_sigmoid(slots: np.ndarray) -> np.ndarray:
 def _qs_slots(fused: FusedOperator, T: int, qc: int, qg: int) -> np.ndarray:
     """QS (pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head][SLOT]) as [column][token group][Q |
     gate][head][SLOT] uint8."""
-    qs = fused.get_buffer("QS").view(torch.uint8).numpy().reshape(T // (32 * qg), COLS, 4 * qg, 2, qc, AP.SLOT)
+    qs = fused.get_buffer("QS").view(np.uint8).reshape(T // (32 * qg), COLS, 4 * qg, 2, qc, AP.SLOT)
     return np.ascontiguousarray(qs.swapaxes(0, 1)).reshape(COLS, T // 8, 2, qc, AP.SLOT)
 
 
@@ -105,15 +106,15 @@ def _prep_fused(s: _Setup) -> tuple[AP.AttnPrepOperator, FusedOperator]:
     op = AP.AttnPrepOperator(T=s.T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     fused = FusedOperator(name="attn_prep", runlist=[(op, "G", "CS", "NRM", "QS", "KV")], input_args=["G", "CS", "NRM"],
                           output_args=["QS"]).compile()  # (KV: scratch, zeroed by the host: flushed with the inputs)
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
+    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
     nrm = np.concatenate([s.qn, s.kn]).astype(np.float32)
-    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(nrm.view(np.uint8))
-    fused.get_buffer("KV").zero_()
+    fused.get_buffer("NRM").view(np.uint8)[:] = nrm.view(np.uint8)
+    fused.get_buffer("KV")[:] = 0
     return op, fused
 
 
 def _run(fused: FusedOperator, params: dict[str, int], G: np.ndarray) -> None:
-    fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    fused.get_buffer("G")[:] = G.reshape(-1).astype(bfloat16)
     fused.sync_inputs()
     fused.set_params(params)
     fused()
@@ -141,7 +142,7 @@ def test_attn_prep(size: str) -> None:
         sg_want = 1 / (1 + np.exp(-np.asarray(qg[:, :, 1], np.float64))).transpose(1, 0, 2)
         assert np.abs(sg - sg_want).max() < 2 ** -8, t0
     # the cache: both chunks' positions of every KV head (K normed, rotated; V as stored)
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
     pos = np.arange(T + n2)
     kr = s.k[:T + n2].reshape(T + n2, s.kvh, hd)
     k_want = s.nr(kr, s.kn, pos)
@@ -168,17 +169,17 @@ def test_attn_prefill(size: str, T: int, pp: int) -> None:
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=pp)
     fused = FusedOperator(name=f"attn_prefill{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
-    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-    fused.get_buffer("KV").zero_()
+    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    fused.get_buffer("KV")[:] = 0
     H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
     for t0, n in [(0, T), (T, n2)]:
         _run(fused, prep.params(t0) | attn.params(t0), s.G(t0, n))
-        A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
+        A = bfp16.from_panels(fused.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:n]
         slots = _qs_slots(fused, T, qc, prep.qg)
         q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
-        kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+        kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
         want = np.zeros((n, H, hd))
         for h in range(s.kvh):
             K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD, dmajor=True))
@@ -210,16 +211,16 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
     assert attn.two == (T % 64 == 0)
     fused = FusedOperator(name=f"attn_prefill_nc{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
-    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-    fused.get_buffer("KV").zero_()
+    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    fused.get_buffer("KV")[:] = 0
     H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
     _run(fused, prep.params(0) | attn.params(0, n), s.G(0, n))
-    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
+    A = bfp16.from_panels(fused.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:n]
     slots = _qs_slots(fused, T, qc, prep.qg)
     q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
     sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
     want = np.zeros((n, H, hd))
     for h in range(s.kvh):
         K, V = (np.asarray(x, np.float64)[:n] for x in KV.kv_from_groups(kv[h, :(n + 31) // 32], AT.HD, dmajor=True))
@@ -263,17 +264,17 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
     fused = FusedOperator(name=f"attn_prefill_packed{int(causal)}",
                           runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A", "SEG")],
                           input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
-    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-    fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.seg(lo, hi))
-    fused.get_buffer("KV").zero_()
+    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
+    fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    fused.get_buffer("SEG").view(np.uint8)[:] = attn.seg(lo, hi)
+    fused.get_buffer("KV")[:] = 0
     H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
     _run(fused, prep.params(0, R) | attn.params(0, n), s.G(0, n))
-    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:n]
+    A = bfp16.from_panels(fused.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:n]
     slots = _qs_slots(fused, T, qc, prep.qg)
     q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
     sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
     want = np.zeros((n, H, hd))
     keys = np.arange(n)
     seen = (keys[None] >= lo[:n, None]) & (keys[None] <= hi[:n, None])
@@ -292,11 +293,11 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
     alone = FusedOperator(name=f"attn_prefill_alone{int(causal)}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
                                                                              (attn1, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    alone.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
-    alone.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-    alone.get_buffer("KV").zero_()
+    alone.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    alone.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    alone.get_buffer("KV")[:] = 0
     _run(alone, prep.params(0) | attn1.params(0, lengths[0]), s.G(0, lengths[0]))
-    A1 = bfp16.from_panels(alone.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:lengths[0]]
+    A1 = bfp16.from_panels(alone.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:lengths[0]]
     bad = np.flatnonzero((A1 != A[:lengths[0]]).any((1, 2)))
     assert bad.size == 0, f"rows {bad.tolist()} differ from the segment alone"
 
@@ -321,11 +322,11 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
                                                                    (attn1, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
     for f in (alone,):
-        f.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1))
-        f.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-        f.get_buffer("KV").zero_()
+        f.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+        f.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+        f.get_buffer("KV")[:] = 0
     _run(alone, prep.params(0) | attn1.params(0), s.G(0, T))  # (the history: the essay's first T tokens)
-    hist = alone.get_buffer("KV").clone()
+    hist = alone.get_buffer("KV").copy()
     # the packed chunk at p0 = T: segment k's tokens T + sum(lengths[:k]) .. in rows starts[k] ..
     lo, hi, pos = np.arange(T), np.arange(T), np.full(T, T, np.int64)
     G = np.zeros((T, s.lay.N), np.float32)
@@ -340,21 +341,21 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
     fused = FusedOperator(name="attn_prefill_tree", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
                                                              (attn, "QS", "KV", "A", "SEG")],
                           input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(torch.uint8)[:] = torch.from_numpy(cs.view(np.uint8).reshape(-1))
-    fused.get_buffer("NRM").view(torch.uint8)[:] = torch.from_numpy(np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8))
-    fused.get_buffer("SEG").view(torch.uint8)[:] = torch.from_numpy(attn.seg(lo, hi, T))
+    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
+    fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    fused.get_buffer("SEG").view(np.uint8)[:] = attn.seg(lo, hi, T)
     fused.get_buffer("KV")[:] = hist
-    fused.get_buffer("G")[:] = torch.from_numpy(G.reshape(-1)).bfloat16()
+    fused.get_buffer("G")[:] = G.reshape(-1).astype(bfloat16)
     fused.sync_inputs()
     fused.set_params(prep.params(T, R) | attn.params(T))
     fused()
     fused.sync_outputs()
     fused.sync_scratch_from_device()
-    A = bfp16.from_panels(fused.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)
+    A = bfp16.from_panels(fused.get_buffer("A"), T, H * hd).reshape(T, H, hd)
     slots = _qs_slots(fused, T, qc, prep.qg)
     q = _q_panels(slots[:, :, 0]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd) * (16 / np.log2(np.e))
     sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)
-    kv = fused.get_buffer("KV").view(torch.uint8).numpy().reshape(s.kvh, -1, AT.OBJS, 9280)
+    kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
     rows = np.concatenate([np.arange(a, a + m) for a, m in zip(starts, lengths, strict=True)])
     keys = np.arange(2 * T)
     seen = (keys[None] < T) | ((keys[None] >= T + lo[rows, None]) & (keys[None] <= T + hi[rows, None]))
@@ -372,7 +373,7 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
     for a, m, t in zip(starts, lengths, t0, strict=True):  # (each segment alone after the history)
         alone.get_buffer("KV")[:] = hist
         _run(alone, prep.params(T) | attn1.params(T), s.G(int(t), m))
-        A1 = bfp16.from_panels(alone.get_buffer("A").clone(), T, H * hd).numpy().reshape(T, H, hd)[:m]
+        A1 = bfp16.from_panels(alone.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:m]
         bad = np.flatnonzero((A1 != A[a:a + m]).any((1, 2)))
         print(f"segment {a} + {m}: {m - bad.size} of {m} rows bit-identical to alone")
         assert bad.size == 0, f"segment {a}: rows {bad.tolist()} differ from the segment alone"

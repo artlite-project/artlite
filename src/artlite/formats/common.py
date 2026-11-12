@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
-import torch  # noqa: TID251
+from ml_dtypes import bfloat16
 
 KC = 2048  # a K chunk of 8 super-blocks (the GEMM operators' default; the images' tiles: 1024 or 512)
 SB = 256  # super-block (8 groups of 32)
@@ -268,8 +268,7 @@ def _nibbles(u: np.ndarray) -> np.ndarray:
 
 def _bf16_bytes(x: np.ndarray) -> np.ndarray:
     """float array (..., n) -> (..., 2n) uint8 of the bf16 values (round to nearest even)."""
-    t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).bfloat16()
-    return t.view(torch.int16).numpy().view(np.uint8).reshape(*x.shape[:-1], -1)
+    return np.ascontiguousarray(x, dtype=np.float32).astype(bfloat16).view(np.uint8).reshape(*x.shape[:-1], -1)
 
 
 def sb_major(b: np.ndarray, R: int, n: int) -> np.ndarray:

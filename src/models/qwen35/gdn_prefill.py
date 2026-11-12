@@ -38,7 +38,6 @@ the whole prompt chunk, a runtime offset: ``conv_offset``) into GHDR.
 import math
 
 import numpy as np
-import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (
@@ -473,11 +472,11 @@ class GdnPrepOperator(ArtcOperator):
         return COLS * 2 * self.T // C * self.jobj
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (self.CV_ROWS * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (params_bytes(self.hc) // 2,), torch.bfloat16),
-                ArgSpec("in", (self.MASK_ELEMS,), torch.bfloat16),
-                ArgSpec("out", (self.n_pr,), torch.bfloat16)]
+        return [ArgSpec("in", (self.T * self.layout.N,), bfloat16),
+                ArgSpec("in", (self.CV_ROWS * self.layout.N,), bfloat16),
+                ArgSpec("in", (params_bytes(self.hc) // 2,), bfloat16),
+                ArgSpec("in", (self.MASK_ELEMS,), bfloat16),
+                ArgSpec("out", (self.n_pr,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         p, T, lay = self.pfx, self.T, self.layout
@@ -1326,12 +1325,12 @@ class GdnScanOperator(ArtcOperator):
                             ablate=self.ablate, PACK=self.pack, TREE=self.tree, VH=self.vh)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * 2 * self.T // C * jobj_bytes(self.vh + self.tree) // 2,), torch.bfloat16),
-                ArgSpec("in", (self.T * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (self.CV_ROWS * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (params_bytes(self.hc) // 2,), torch.bfloat16),
-                ArgSpec("in", (COLS * self.sh.n_panels * PANEL // 2,), torch.bfloat16),
-                ArgSpec("out", (self.T * self.hv * D,), torch.bfloat16)]
+        return [ArgSpec("in", (COLS * 2 * self.T // C * jobj_bytes(self.vh + self.tree) // 2,), bfloat16),
+                ArgSpec("in", (self.T * self.layout.N,), bfloat16),
+                ArgSpec("in", (self.CV_ROWS * self.layout.N,), bfloat16),
+                ArgSpec("in", (params_bytes(self.hc) // 2,), bfloat16),
+                ArgSpec("in", (COLS * self.sh.n_panels * PANEL // 2,), bfloat16),
+                ArgSpec("out", (self.T * self.hv * D,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         p, T, hc, lay = self.pfx, self.T, self.hc, self.layout
@@ -1614,12 +1613,12 @@ class GdnOutOperator(ArtcOperator):
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T, hv = self.T, self.hv
-        return [ArgSpec("in", (T * hv * D,), torch.bfloat16),
-                ArgSpec("in", (T * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (self.gc_rows * self.layout.N,), torch.bfloat16),
-                ArgSpec("in", (params_bytes(self.hc) // 2,), torch.bfloat16),
-                ArgSpec("out", (self.ghdr_bytes // 2,), torch.bfloat16),
-                ArgSpec("out", (T * hv * D * 9 // 16,), torch.bfloat16)]
+        return [ArgSpec("in", (T * hv * D,), bfloat16),
+                ArgSpec("in", (T * self.layout.N,), bfloat16),
+                ArgSpec("in", (self.gc_rows * self.layout.N,), bfloat16),
+                ArgSpec("in", (params_bytes(self.hc) // 2,), bfloat16),
+                ArgSpec("out", (self.ghdr_bytes // 2,), bfloat16),
+                ArgSpec("out", (T * hv * D * 9 // 16,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         p, T, hc, lay, hv, ch = self.pfx, self.T, self.hc, self.layout, self.hv, self.ch

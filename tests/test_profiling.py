@@ -19,12 +19,13 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 ONE_CORE_SCRIPT = """
-import torch
+import numpy as np
+from ml_dtypes import bfloat16
 from tests.operators.elementwise import GeluOperator
 
 # 64 kernel calls (512-element tiles) per dispatch on one core
 op = GeluOperator(size=64 * 512, num_columns=1, tile_size=512).compile()
-x = torch.randn(64 * 512).bfloat16()
+x = np.random.default_rng(0).standard_normal(64 * 512, np.float32).astype(bfloat16)
 op.run(x)
 op.run(x)
 """
@@ -113,11 +114,12 @@ def test_profiling_trace(tmp_path):
 
 
 ARRAY_SCRIPT = """
-import torch
+import numpy as np
+from ml_dtypes import bfloat16
 from tests.operators.elementwise import GeluOperator
 
 op = GeluOperator(size=16 * 1024, num_columns=8, num_channels=2, tile_size=512).compile()
-op.run(torch.randn(16 * 1024).bfloat16())
+op.run(np.random.default_rng(0).standard_normal(16 * 1024, np.float32).astype(bfloat16))
 """
 
 
