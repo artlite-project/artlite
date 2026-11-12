@@ -259,7 +259,7 @@ def stale_toolchain() -> str | None:
     if not stale:
         return None
     return (f"the installed AIE toolchain is not this checkout's: {', '.join(stale)}; update the venv: "
-            "uv sync --extra examples, then uv pip install --no-build-isolation --no-deps -ve . (docs/install.md)")
+            "uv sync --no-dev (a development venv: uv sync; docs/install.md)")
 
 
 def stale_install() -> str | None:

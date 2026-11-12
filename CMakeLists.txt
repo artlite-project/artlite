@@ -9,7 +9,7 @@ if(NOT SKBUILD)
   else()
     message(WARNING "\
       This CMake file is meant to be executed using 'scikit-build-core': \
-      uv pip install --no-build-isolation -ve .  \
+      uv sync  \
       Standalone configures are for the C++ tests only (separate tree, venv active): \
       cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON")
   endif()

@@ -239,7 +239,7 @@ def test_messages_errors(agent: tuple) -> None:
 
 def test_anthropic_sdk() -> None:
     """The anthropic package's stream parser on a live server: the final message it assembles."""
-    anthropic = pytest.importorskip("anthropic")
+    import anthropic
     _model, npu, engine = make(reasoning=QWEN)
     with live(engine, template=FIRST) as url:
         client = anthropic.Anthropic(base_url=url, api_key="none")

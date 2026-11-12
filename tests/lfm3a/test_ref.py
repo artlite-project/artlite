@@ -86,7 +86,6 @@ def test_wav_formats(tmp_path: object) -> None:
     for name, (data, tol) in cases.items():
         y = A.load_audio(data)
         assert y.shape == x.shape and np.abs(y - x).max() <= tol + 1e-7, name
-    pytest.importorskip("miniaudio")
     assert np.array_equal(A._miniaudio(cases["pcm16"][0]), x)  # (miniaudio's samples of a 16 kHz WAV: the same)
     y = A.load_audio(wav(1, 1, 16, pcm16[::2].astype("<i2").tobytes(), rate=8000))  # (resampled to 16 kHz)
     assert abs(len(y) - len(x)) <= 2

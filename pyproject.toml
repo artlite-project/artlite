@@ -10,16 +10,34 @@ readme = "README.md"
 license = "LGPL-2.1-or-later AND Apache-2.0 AND GPL-2.0-only WITH Linux-syscall-note"  # csrc/shim_xdna: its LICENSE
 license-files = ["LICENSE", "csrc/shim_xdna/LICENSE"]
 requires-python = ">=3.12,<3.15"  # the pinned mlir_aie's wheels: 3.12-3.14
+# Everything artlite-cli, artlite-server (its web chat included), artlite-bench and artlite-probe run on; tools for
+# working on Artlite are the dev group.
 dependencies = [
     "mlir_aie==1.4.6.dev15+ge5a3fa1",
     "llvm_aie==22.0.0.2026111101+81af12b7",
-    "numpy",
+    "numpy>=2",  # NEP 50 promotion: the host's float32 arithmetic stays float32
+    "ml-dtypes>=0.4",  # (the first built for numpy 2)
     "torch>=2.11.0",
     "pyyaml>=6.0.3",
-    "ml-dtypes",
     "gguf>=0.19.0",
     "jinja2>=3.1.6",
+    "gigatoken>=0.10.0",  # the tokenizers
+    "pillow>=11.0",  # image input: decoding, and the bicubic resampling of the models' training
+    "miniaudio>=1.71",  # audio input: containers besides WAV, resampling (llama.cpp's mtmd decodes with it)
+    "fastapi>=0.115",
+    "starlette",
+    "pydantic>=2",
+    "anyio",
+    "uvicorn>=0.32",
+    "httpx>=0.28",  # artlite-server's router mode: the proxy to the models' servers
+    "python-multipart>=0.0.20",  # artlite-server's /v1/audio/transcriptions (multipart forms)
+    "websockets>=15.0",  # artlite-server's /v1/realtime (uvicorn's websocket protocol)
 ]
+
+[project.urls]
+Repository = "https://github.com/artlite-project/artlite"
+Documentation = "https://github.com/artlite-project/artlite/tree/main/docs"
+Issues = "https://github.com/artlite-project/artlite/issues"
 
 [project.scripts]
 artlite-cli = "models.cli:main"
@@ -27,31 +45,18 @@ artlite-bench = "models.bench:main"
 artlite-server = "models.server.main:main"
 artlite-probe = "models.probe:main"
 
-[project.optional-dependencies]
-examples = [
-    "gigatoken>=0.10.0",
-    "fastapi>=0.115",
-    "uvicorn>=0.32",
-    "httpx>=0.28",  # artlite-server's router mode: the proxy to the models' servers
-    "pillow>=11.0",  # image input (MiniCPM-V): decoding, and the bicubic resampling of the models' training
-    "miniaudio>=1.71",  # audio input (LFM3-Audio): containers besides WAV, resampling (llama.cpp's mtmd decodes with it)
-    "python-multipart>=0.0.20",  # artlite-server's /v1/audio/transcriptions (multipart forms)
-    "websockets>=15.0",  # artlite-server's /v1/realtime (uvicorn's websocket protocol)
-]
-
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "nanobind>=2.12.0",
-    "scikit-build-core>=0.10",
+    "pytest>=9.0",
     "ruff>=0.16.2",
-    "httpx>=0.28",
-    "openai>=1.60",
+    "openai>=1.60",  # tests/server: the API through the official clients
     "anthropic>=0.60",
+    "scikit-build-core>=0.11",  # the rebuild without build isolation (docs/install.md)
+    "nanobind>=2.12.0",
 ]
 
 [tool.scikit-build]
-minimum-version = "0.10"
+minimum-version = "build-system.requires"
 build-dir = "build"
 wheel.packages = ["src/artlite", "src/models"]
 
@@ -60,23 +65,23 @@ find-links = [
     "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4",
     "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly",
 ]
+# uv sync rebuilds the native module when its sources change (the editable install keeps the Python files in place)
+cache-keys = [{ file = "pyproject.toml" }, { file = "CMakeLists.txt" }, { file = "csrc/**/*" }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[tool.pytest.ini_options]
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.pytest]
 testpaths = ["tests"]
 markers = [
     "slow: whole-model tests (minutes each); skipped unless --run-slow or -m slow",
     "smoke: the quick check after a change (conftest.SMOKE): host tests and one NPU case per component",
 ]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
 
 [tool.ruff]
 line-length = 120  # the style's width (import sorting wraps at it); long lines are not reported

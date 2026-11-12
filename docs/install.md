@@ -37,24 +37,27 @@ A shell or tmux server started before keeps the old limit. A systemd service (`a
 ```bash
 git clone https://github.com/artlite-project/artlite && cd artlite
 uv venv && source .venv/bin/activate        # activate it in every shell
-uv sync --extra examples                    # dependencies and toolchain wheels; examples: what the tools need
-uv pip install --no-build-isolation -ve .   # Artlite, editable: scikit-build-core builds csrc/ in build/
+uv sync --no-dev                            # Artlite (scikit-build-core builds csrc/ in build/) and what it runs on
 ```
 
-Rebuild after changing `csrc/`, or after adding or moving Python modules:
+After a `git pull`, run `uv sync --no-dev` again: a commit may pin other toolchain wheels, and uv rebuilds the native
+module when `csrc/` changed. `artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe` and the tests warn when
+the venv's `mlir_aie` or `llvm_aie` is not the version `pyproject.toml` pins; the tools warn, and the tests do not
+start, when the native module is not built from the checkout's `csrc/` (a build records the hash of its sources).
+
+### Development
+
+`uv sync` without `--no-dev` also installs the `dev` group: pytest, ruff, the API clients the server's tests use, and
+the build's own tools, for the rebuild after changing `csrc/` or after adding or moving Python modules:
 
 ```bash
-uv pip install --no-build-isolation --no-deps -ve .
+uv sync
+uv pip install --no-build-isolation --no-deps -ve .   # the rebuild
 ```
 
 - `--no-deps`: without it uv reinstalls `llvm_aie`, and the new `clang++` timestamp invalidates every cached design.
 - `--no-build-isolation`: builds against the venv's nanobind, so its headers stay for IDEs (an isolated build
   removes them afterwards).
-
-After a `git pull`, run `uv sync --extra examples` and then the rebuild: a commit may pin other toolchain wheels or
-change `csrc/`. `artlite-cli`, `artlite-server`, `artlite-bench`, `artlite-probe` and the tests warn when the venv's
-`mlir_aie` or `llvm_aie` is not the version `pyproject.toml` pins; the tools warn, and the tests do not start, when the
-native module is not built from the checkout's `csrc/` (a build records the hash of its sources).
 
 ### NixOS
 
@@ -63,8 +66,7 @@ The checkout's `flake.nix` is a shell with CMake, pkg-config, libdrm and uv; in 
 ```bash
 nix develop                                 # in the checkout, in every shell
 uv venv && source .venv/bin/activate
-uv sync --extra examples
-uv pip install --no-build-isolation -ve .
+uv sync --no-dev
 ```
 
 The Python that uv installs and the toolchain wheels' programs (Peano's `clang`, `aie-opt`) are built for other
@@ -92,8 +94,7 @@ XRT looks for its driver library there, and every run fails with `No such librar
 git clone https://github.com/artlite-project/artlite; cd artlite
 uv venv; .venv\Scripts\activate
 $env:XILINX_XRT = "C:\Xilinx\XRT"   # XRT's directory, usually this one
-uv sync --extra examples
-uv pip install --no-build-isolation -ve .
+uv sync --no-dev
 Remove-Item Env:XILINX_XRT
 ```
 

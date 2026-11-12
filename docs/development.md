@@ -1,7 +1,8 @@
 # Development
 
 The rules every change follows, the commands and the map of the code are in [AGENTS.md](../AGENTS.md); contributions
-are accepted under the agreement in [CONTRIBUTING.md](../CONTRIBUTING.md). Building: [Installation](install.md).
+are accepted under the agreement in [CONTRIBUTING.md](../CONTRIBUTING.md). Building: [Installation](install.md), the
+development venv: [Installation: Development](install.md#development).
 
 ## Tests
 

@@ -67,8 +67,7 @@ XRT](docs/install.md#windows); NixOS: [a development shell](docs/install.md#nixo
 ```bash
 git clone https://github.com/artlite-project/artlite && cd artlite
 uv venv && source .venv/bin/activate
-uv sync --extra examples
-uv pip install --no-build-isolation -ve .
+uv sync --no-dev
 ```
 
 Models are found by path, or relative to `ARTLITE_MODELS_DIR` (default `~/.artlite/models`) as

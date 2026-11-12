@@ -67,7 +67,7 @@ def stale_native() -> str | None:
     if built == _source_hash(root):
         return None
     return (f"the native module ({_native.__file__}) is not built from this checkout's csrc/; rebuild it: "
-            "uv pip install --no-build-isolation --no-deps -ve . (docs/install.md)")
+            "uv sync --no-dev (a development venv: uv pip install --no-build-isolation --no-deps -ve .; docs/install.md)")
 
 
 def xrt_tool(name: str) -> str | None:

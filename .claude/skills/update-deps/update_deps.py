@@ -2,7 +2,7 @@
 """Bump the mlir-aie / llvm-aie pins in pyproject.toml to the newest published wheels.
 
 Steps: fetch the find-links release pages, pick the highest version of each wheel,
-rewrite the pins, `uv lock`, `uv sync --extra examples`, then verify the installed
+rewrite the pins, `uv lock`, `uv sync`, then verify the installed
 versions and that `artlite._native` imports.
 
 Usage (from anywhere inside the repo):
@@ -125,7 +125,7 @@ def main() -> None:
     run(["uv", "lock"])
     if args.no_sync:
         return
-    run(["uv", "sync", "--extra", "examples"])
+    run(["uv", "sync"])
     verify(latest)
 
 

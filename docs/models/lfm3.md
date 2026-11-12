@@ -157,7 +157,7 @@ $ARTLITE_MODELS_DIR/LiquidAI/LFM3-Audio-2B-GGUF/   LiquidAI/LFM3-Audio-2B-GGUF
 LiquidAI's LFM3-Audio-2B is LFM3's trunk with a speech encoder: the language model runs as LFM3-1.7B does (above), a
 clip's rows (one per 80 ms of audio) take token positions in place of token embeddings. `--mmproj` (artlite-cli and
 [artlite-server](../server.md#speech)) loads the encoder. Audio files: WAV, read natively; MP3, FLAC and Ogg Vorbis
-through the `miniaudio` package (in the `examples` extra; llama.cpp decodes with the same library), as 16 kHz mono.
+through the `miniaudio` package (llama.cpp decodes with the same library), as 16 kHz mono.
 
 - **Transcription**: `--audio` without a prompt (artlite-server: `/v1/audio/transcriptions`) is the model card's ASR
   prompt, the system message "Perform ASR in English." (`--language`; without it "Perform ASR.", the model tells the

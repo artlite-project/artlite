@@ -3,7 +3,7 @@ spectrogram and rows, the ASR prompts.
 
 Samples (``load_audio``): 16 kHz mono float32. A WAV file (PCM of 8, 16, 24 or 32 bits, IEEE float of 32 or 64,
 WAVE_FORMAT_EXTENSIBLE) at 16 kHz is parsed here, its channels averaged; other containers (MP3, FLAC, Ogg Vorbis) and
-rates go through the optional ``miniaudio`` package, the library llama.cpp's mtmd decodes and resamples with (the same
+rates go through the ``miniaudio`` package, the library llama.cpp's mtmd decodes and resamples with (the same
 configuration: float32, one channel, 16 kHz), so they give llama.cpp's samples.
 
 Mel (``log_mel``, transformers' ``Lfm3AudioFeatureExtractor`` and llama.cpp's ``mtmd_audio_preprocessor_lfm3a``): the
@@ -22,6 +22,7 @@ import functools
 import struct
 from collections.abc import Callable
 
+import miniaudio
 import numpy as np
 
 from ..sequence import MEDIA, Sequence, splice
@@ -90,10 +91,6 @@ def _wav(data: bytes) -> tuple[np.ndarray, int] | None:
 
 
 def _miniaudio(data: bytes) -> np.ndarray:
-    try:
-        import miniaudio
-    except ImportError:
-        raise ValueError("audio other than 16 kHz WAV needs the miniaudio package (the examples extra)") from None
     try:
         d = miniaudio.decode(data, output_format=miniaudio.SampleFormat.FLOAT32, nchannels=1, sample_rate=SR)
     except miniaudio.DecodeError as e:

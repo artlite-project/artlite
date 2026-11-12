@@ -5,7 +5,7 @@ description: Upgrade Artlite's pinned mlir-aie and llvm-aie (Peano) toolchain wh
 
 # Update toolchain dependencies
 
-One command does the whole upgrade (fetch latest wheels → rewrite pins in `pyproject.toml` → `uv lock` → `uv sync --extra examples` → verify installed versions and `import artlite._native`):
+One command does the whole upgrade (fetch latest wheels → rewrite pins in `pyproject.toml` → `uv lock` → `uv sync` → verify installed versions and `import artlite._native`):
 
 ```bash
 python .claude/skills/update-deps/update_deps.py
@@ -20,7 +20,6 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 ## After a successful update
 
 - No cache clearing needed: RTC cache keys include the `mlir_aie`/`llvm_aie` versions, so kernels recompile automatically. Old `rtc_*` dirs in `~/.cache/artlite/` just become orphaned; delete them to reclaim disk if desired.
-- If `uv sync` dropped the editable C++ build, rebuild with `uv pip install --no-build-isolation -ve .`.
 - `requires-python` in `pyproject.toml` ends below the first Python without an `mlir_aie` wheel (uv picks the newest
   allowed Python): raise it when the new wheels add a Python version, then `uv lock`.
 - Run `pytest tests -m smoke` (one NPU case per component and the apps' full designs: a bump can push a core past

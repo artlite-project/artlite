@@ -64,7 +64,7 @@ use any modern SIMD (AVX-512 included).
 
 ```bash
 source .venv/bin/activate                                           # in every shell
-uv venv && uv sync --extra examples && uv pip install --no-build-isolation -ve .  # first setup
+uv venv && uv sync && uv pip install --no-build-isolation --no-deps -ve .  # first setup (uv sync: with the dev group)
 uv pip install --no-build-isolation --no-deps -ve .                 # rebuild after csrc/ changes or added / moved modules
 artlite-cli -m <org>/<repo>/<file>.gguf -p "..." -n 100             # run a model (NPU)
 artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds, as llama-bench (NPU)
