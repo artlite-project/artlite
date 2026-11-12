@@ -37,7 +37,7 @@ from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from .. import profiling
 from .base import AIECC, CACHE_DIR, CLANGPP, ArtcOperator

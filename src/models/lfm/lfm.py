@@ -19,7 +19,7 @@ lazy shift, the caches' records overwritten).
 
 from concurrent.futures import ThreadPoolExecutor
 
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile

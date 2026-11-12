@@ -11,7 +11,7 @@ Weights of core row r (packed by ``weights.Slots``): per pass of 80 output chann
 """
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..operators import bfp16 as _bfp16
 from . import design as D

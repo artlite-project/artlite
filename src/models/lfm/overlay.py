@@ -45,7 +45,7 @@ import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode import kv
 from artlite.decode.attn import (

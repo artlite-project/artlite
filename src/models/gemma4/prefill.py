@@ -35,7 +35,7 @@ would double the error (hence hi + lo).
 from concurrent.futures import Future
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes

@@ -21,7 +21,7 @@ import struct
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from .. import txn

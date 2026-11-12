@@ -10,7 +10,7 @@ reference of the whole model, tests/gemma4/cpu.py, derives from it).
 import math
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig

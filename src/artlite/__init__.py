@@ -37,7 +37,7 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from . import profiling, txn
 from .backend import _native  # (first: the backend ARTLITE_BACKEND selects is artlite._native)

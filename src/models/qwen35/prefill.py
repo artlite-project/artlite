@@ -62,7 +62,7 @@ import math
 from types import SimpleNamespace
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS

@@ -35,7 +35,7 @@ formats: Q4_K and BFP16 (tile-major), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS
 import functools
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.dialects import arith
 from aie.dialects._aiex_ops_gen import npu_sync as _npu_sync
 from aie.dialects.aie import T

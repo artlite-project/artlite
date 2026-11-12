@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ... import txn
 from ...elf_parser import ParsedElf

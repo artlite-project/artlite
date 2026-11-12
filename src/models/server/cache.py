@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..common import Checkpoint, NpuModel
 from ..sequence import Sequence

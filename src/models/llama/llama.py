@@ -22,7 +22,7 @@ while the tokenizer and the designs load), at their quantization's size; nothing
 
 from concurrent.futures import ThreadPoolExecutor
 
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile

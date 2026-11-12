@@ -38,7 +38,7 @@ the whole prompt chunk, a runtime offset: ``conv_offset``) into GHDR.
 import math
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import (

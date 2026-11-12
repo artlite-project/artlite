@@ -35,7 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from PIL import Image
 
 from artlite.model_config import ClipConfig

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import TextIO
 
 import gguf
-import torch
+import torch  # noqa: TID251
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, model_path

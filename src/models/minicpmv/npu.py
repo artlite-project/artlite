@@ -15,7 +15,7 @@ import hashlib
 import time
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile

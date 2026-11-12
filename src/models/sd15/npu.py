@@ -13,7 +13,7 @@ import json
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 
-import torch
+import torch  # noqa: TID251
 
 from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
 from artlite.vision.weights import Source, safetensors, sources

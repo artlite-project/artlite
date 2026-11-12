@@ -30,7 +30,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite import parallel_compile
 from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch

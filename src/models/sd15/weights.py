@@ -4,7 +4,7 @@ shape, byte range after the header), then the tensors' bytes, each read straight
 import json
 import struct
 
-import torch
+import torch  # noqa: TID251
 
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32}
 

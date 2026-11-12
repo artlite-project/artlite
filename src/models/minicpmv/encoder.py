@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS

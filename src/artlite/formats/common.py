@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 KC = 2048  # a K chunk of 8 super-blocks (the GEMM operators' default; the images' tiles: 1024 or 512)
 SB = 256  # super-block (8 groups of 32)

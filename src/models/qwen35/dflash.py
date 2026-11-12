@@ -35,7 +35,7 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode import phases as mp
 from artlite.decode.design import (

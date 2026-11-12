@@ -47,7 +47,7 @@ import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from artlite.decode import kv

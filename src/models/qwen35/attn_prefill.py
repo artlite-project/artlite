@@ -36,7 +36,7 @@ QK binds), the 35B-A3B (two streams) 1.12 / 3.44 / 10.6 (8.8).
 import math
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.dialects.aiex import npu_write32
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module

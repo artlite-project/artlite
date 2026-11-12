@@ -20,7 +20,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 import artlite
 from artlite import backend, portable

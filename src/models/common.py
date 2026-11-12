@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 import jinja2.ext
 import jinja2.sandbox
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite import _native, backend, portable
 from artlite.gguf_model import GGUFFile

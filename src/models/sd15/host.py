@@ -9,8 +9,8 @@ CFG batch share t, so a step needs one vector per resnet (out channels,), whatev
 import math
 from concurrent.futures import Executor
 
-import torch
-import torch.nn.functional as F
+import torch  # noqa: TID251
+import torch.nn.functional as F  # noqa: TID251
 
 TIME_CHANNELS = 320  # the sinusoidal embedding's width (block_out_channels[0])
 

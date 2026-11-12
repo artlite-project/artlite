@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.overlay import Transaction

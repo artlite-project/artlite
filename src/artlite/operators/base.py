@@ -15,7 +15,7 @@ from importlib.metadata import version
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, NamedTuple, Self
 
-import torch
+import torch  # noqa: TID251
 from jinja2 import Environment, StrictUndefined
 
 from .. import backend, portable, profiling

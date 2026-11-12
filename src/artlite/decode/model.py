@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..formats import has_tile_format, tile_format
 from ..gguf_model import GGUFFile

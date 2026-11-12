@@ -1245,7 +1245,7 @@ def _worker(spec_path: str, *, compile_only: bool) -> None:
     operator.compile()
     if compile_only:
         return
-    import torch
+    import torch  # noqa: TID251
 
     import artlite
 

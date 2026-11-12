@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..operators import kmath
 from ..operators.design import COLS

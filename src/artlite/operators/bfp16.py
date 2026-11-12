@@ -12,7 +12,7 @@ each panel = 8 rows x 8 columns, one block per row.
 """
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 
 def _blocks(w: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

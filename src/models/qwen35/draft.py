@@ -29,7 +29,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode.design import interleave, norm_objects
 from artlite.decode.image import column_rows

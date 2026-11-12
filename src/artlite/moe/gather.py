@@ -24,7 +24,7 @@ scratchpad parameter ``expert_gemm.N_PARAM`` c), the combine the weights.
 import functools
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.dialects._aiex_ops_gen import npu_sync as _npu_sync
 from aie.dialects.aiex import _as_i32, npu_maskwrite32, npu_write32
 from aie.helpers.taplib import TensorAccessPattern

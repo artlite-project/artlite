@@ -10,7 +10,7 @@ by diffusers name (``w[p + ...]``).
 
 from dataclasses import dataclass
 
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.vision import layout as L

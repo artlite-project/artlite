@@ -109,7 +109,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Packet, Port, Program, Runtime, Transport, Worker
 from aie.iron.controlflow import forever_, range_

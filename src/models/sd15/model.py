@@ -8,7 +8,7 @@ V^T slots of the text context (``set_context``)."""
 from concurrent.futures import Executor
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS

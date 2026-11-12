@@ -24,7 +24,7 @@ import warnings
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from . import _native
 

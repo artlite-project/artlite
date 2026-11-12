@@ -32,7 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..operators.design import COLS
 from . import design as D

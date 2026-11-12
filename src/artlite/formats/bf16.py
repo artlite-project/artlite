@@ -9,7 +9,7 @@ panels as they are (``_MMV``)."""
 from typing import ClassVar
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from ..operators import bfp16
 from .common import Slot, TileFormat

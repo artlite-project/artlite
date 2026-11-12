@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 if TYPE_CHECKING:
     from .base import ArtcOperator

@@ -37,7 +37,7 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS, ROWS

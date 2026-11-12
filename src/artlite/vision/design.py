@@ -31,7 +31,7 @@ needs it there (``seq``), so every row runs every role.
 from typing import ClassVar
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.dialects._aie_enum_gen import DMAChannelDir
 from aie.helpers.taplib import TensorAccessPattern as TAP
 from aie.iron import (

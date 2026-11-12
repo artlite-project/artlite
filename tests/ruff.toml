@@ -1,0 +1,6 @@
+# The tests: the root config, with torch allowed (CPU references and models).
+extend = "../pyproject.toml"
+src = ["..", "../src"]  # (relative to this file: the root's first-party packages)
+
+[lint.flake8-tidy-imports.banned-api]
+"iron".msg = "never import IRON operators: Artlite operators are self-contained (aie.iron is fine)"

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from . import reference
 from .sampling import Schedule, cfg_denoiser, sample

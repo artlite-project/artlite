@@ -22,7 +22,7 @@ model's W), its KV cache DKV.
 from types import SimpleNamespace
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.prefill import gemm as PG

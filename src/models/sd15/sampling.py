@@ -24,7 +24,7 @@ import json
 import math
 from collections.abc import Callable
 
-import torch
+import torch  # noqa: TID251
 
 SAMPLERS = ("euler_a", "euler", "ddim")
 

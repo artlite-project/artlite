@@ -20,8 +20,8 @@ half of ``AutoencoderKL``), with SD 1.x's configuration. The CPU backend, and th
 import json
 import os
 
-import torch
-import torch.nn.functional as F
+import torch  # noqa: TID251
+import torch.nn.functional as F  # noqa: TID251
 
 from .host import resnet_time_biases
 from .weights import load_safetensors

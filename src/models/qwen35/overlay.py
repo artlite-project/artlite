@@ -43,7 +43,7 @@ import math
 import os
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite import txn
 from artlite.decode import gemv

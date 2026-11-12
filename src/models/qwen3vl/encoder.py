@@ -39,7 +39,7 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.vision import windows as W

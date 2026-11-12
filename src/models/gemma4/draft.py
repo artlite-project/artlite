@@ -30,7 +30,7 @@ On the overlay (the model's phases: ``gemma4/overlay.py``):
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode import gemv, kv
 from artlite.decode import phases as mp

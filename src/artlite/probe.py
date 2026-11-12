@@ -17,7 +17,7 @@ all fall on one DRAM channel (the interleave below 4 KB), larger rows on several
 from typing import NamedTuple
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU2, Tile
 

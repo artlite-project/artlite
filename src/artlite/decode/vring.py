@@ -11,7 +11,7 @@ side: ``kernel_lib.h``'s V records and ``al::merge``):
 """
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 
 def substeps(p: int, S: int, pg: int, r: int) -> list[tuple[int, int]]:

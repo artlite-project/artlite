@@ -44,7 +44,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode.design import XB
 from artlite.gguf_model import GGUFFile

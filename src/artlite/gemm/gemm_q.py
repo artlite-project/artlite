@@ -72,7 +72,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.dialects import arith
 from aie.dialects.aie import T as IrT
 from aie.helpers.taplib import TensorAccessPattern

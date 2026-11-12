@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite import _native as native
 from artlite.gemm.gemm_q import PACE, PACE_IDLE, pace_word

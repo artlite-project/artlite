@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from .. import _native
 from . import design as D

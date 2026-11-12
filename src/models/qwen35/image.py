@@ -60,7 +60,7 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 import math
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.decode.design import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows

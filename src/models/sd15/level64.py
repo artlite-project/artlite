@@ -6,7 +6,7 @@ rows (the neighbour bands' and columns', zeros past the image)."""
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 
 from artlite.operators.design import COLS
 from artlite.vision import design as D

@@ -11,7 +11,7 @@ buffer of the core: no static tables), bf16 like the decode's F_PLI epilogue: bf
 """
 
 import numpy as np
-import torch
+import torch  # noqa: TID251
 from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
