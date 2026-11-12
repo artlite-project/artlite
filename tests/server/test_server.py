@@ -1231,7 +1231,10 @@ def test_model_failure(fake: tuple) -> None:
     r = chat(client, "a b c d e f")
     assert r.status_code == 500 and r.json()["error"] == {"code": 500, "type": "server_error",
                                                           "message": "RuntimeError: DispatchError: TIMEOUT"}
-    evs = events(chat(client, "a b c d e f", stream=True))
+    r = chat(client, "a b c d e f", stream=True, sse_ping_interval=5)  # (before the stream's first event: the same)
+    assert r.status_code == 500 and r.json()["error"]["message"] == "RuntimeError: DispatchError: TIMEOUT"
+    evs = events(chat(client, "a b c d e f", stream=True, return_progress=True))  # (after it: the stream's error)
+    assert evs[0]["choices"][0]["delta"] == {"role": "assistant", "content": None}
     assert evs[-1]["error"]["type"] == "server_error"
     npu.fail = None
     n = len(npu.calls)

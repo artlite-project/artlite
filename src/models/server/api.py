@@ -454,6 +454,9 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
 
     def check(req: Generation) -> None:
         """What every generation request must satisfy; fields the NPU path ignores are logged."""
+        if info.decision is not None:  # (as llama-server: its output modalities are only "decisions")
+            raise ApiError(501, "not_supported_error",
+                           "This model is a decision model without text generation, use /v1/systemone")
         if req.n not in (None, 1):
             raise bad_request("n > 1 is not supported: one sequence at a time")
         if req.model and req.model != options.alias and ("model", req.model) not in warned:  # (as llama-server: any)
@@ -667,6 +670,28 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             if kind in ("done", "error", "cancelled"):
                 return
 
+    async def opened(j: Job, events: asyncio.Queue, ping: float) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """A stream's events (``events_of``) once its job's first one or first ping has come: a job that fails
+        before either answers with the HTTP error a request without streaming gets (llama-server's first error,
+        which clients show; a stream's error event they may not)."""
+        it = events_of(events, ping)
+        try:
+            first = await anext(it)
+        except BaseException:  # (the handler cancelled: shutdown)
+            j.cancel.set()
+            raise
+        if first[0] == "error":
+            raise ApiError(500, "server_error", first[1]["message"])
+        if first[0] == "cancelled":
+            raise ApiError(503, "unavailable_error", "the request was cancelled")
+
+        async def rest() -> AsyncIterator[tuple[str, dict[str, Any]]]:
+            yield first
+            async for e in it:
+                yield e
+
+        return rest()
+
     async def collect(j: Job, events: asyncio.Queue, request: Request) -> tuple[Blocks, dict[str, Any]]:
         """A job's output (a response without streaming) as the blocks of its message, and its last event (its
         ``probs``: every delta's and its own); the client going away cancels it."""
@@ -861,9 +886,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 choice["logprobs"] = {"content": probs}
             return {"choices": [choice], **head, "object": "chat.completion.chunk", **extra}
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
             yield sse(chunk({"role": "assistant", "content": None}))
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield ":\n\n"
                 elif kind == "progress":
@@ -941,9 +968,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 return PlainTextResponse(text)
             return {"type": "transcript.text.done", "text": text, "usage": asr_usage(done)}
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
             parts: list[str] = []
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield ":\n\n"
                 elif kind == "delta":
@@ -1003,8 +1032,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             out.blocks, done = await collect(j, events, request)
             return out.message(done)
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield agents.event("ping", {"type": "ping"})
                 elif kind == "progress":
@@ -1065,9 +1096,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 store.put(r, inputs)
             return r
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
             yield "".join(out.start())
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield ":\n\n"
                 elif kind == "delta":
@@ -1140,8 +1173,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             return body(blocks.text("text"), done["finish_reason"], done["probs"], usage=usage(done),
                         timings=done["timings"])
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield ":\n\n"
                 elif kind == "progress":
@@ -1183,8 +1218,10 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             blocks, done = await collect(j, events, request)
             return final(blocks.text("text"), done)
 
+        evs = await opened(j, events, ping_of(req))
+
         async def stream() -> AsyncIterator[str]:
-            async for kind, data in events_of(events, ping_of(req)):
+            async for kind, data in evs:
                 if kind == "ping":
                     yield ":\n\n"
                 elif kind == "progress":

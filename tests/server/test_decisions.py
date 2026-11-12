@@ -141,6 +141,11 @@ def test_not_supported(pplx: tuple) -> None:
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, {"type": "text", "text": STATE}]}],
         "questions": QUESTIONS})
     assert r.status_code == 501
+    for route, body in (("/v1/chat/completions", {"messages": [{"role": "user", "content": STATE}], "stream": True}),
+                        ("/completion", {"prompt": STATE}), ("/v1/messages", {"max_tokens": 8, "messages": [
+                            {"role": "user", "content": STATE}]})):  # (as llama-server: no text generation)
+        r = client.post(route, json=body)
+        assert r.status_code == 501 and "/v1/systemone" in r.text, (route, r.text)
     _, _, engine = make()
     with TestClient(app_of(engine)) as plain:  # (not a decision model)
         assert engine.wait_ready(5)

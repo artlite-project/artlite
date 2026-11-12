@@ -198,7 +198,8 @@ as llama-server does (TypeSafe's System One API): a `state` (text, a JSON value 
 10 levels as a list, a noul's optional `true` / `false` descriptions). Each question is one forward pass over its
 prompt, no token generated: a choice's `choice`, `probabilities` and `confidence`, a score's expected level `score`,
 `legend`, `probabilities` and `confidence`, a noul's probability of true `noul`; `usage.input_tokens` counts every
-question's prompt. `/v1/models` reports such a model's `output_modalities` as `["decisions"]`.
+question's prompt. `/v1/models` reports such a model's `output_modalities` as `["decisions"]`, and its text routes (chat,
+completions, Messages, Responses, transcriptions) answer 501, as llama-server's.
 
 ```bash
 artlite-server -m ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf
