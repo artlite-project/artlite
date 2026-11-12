@@ -23,7 +23,7 @@ shares with Llama in Gemma's configuration (`decode/attn.py`, `gemma4/attn.py`).
 transaction (`gemma4/overlay.py`, `GemmaOverlay`); the cores read what to do from the metadata of their input objects.
 The host reads the tokens' embedding rows and per-layer embedding rows (`src/models/gemma4/host.py`); a dispatch's
 first phase projects the embeddings to the per-layer inputs (the host keeps a token's projection: a dispatch of kept
-tokens writes them instead; the prefill's chunks: on the host).
+tokens writes them instead; a prefill chunk's projection is a GEMM at its start).
 - A dispatch runs up to 4 token slots through all 42 layers and the LM head, streaming the weights
   once for all of them.
 - Cores per column: the main core and its helper run the projections (Q4_0 / Q8_0 tiles on the

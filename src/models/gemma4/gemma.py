@@ -87,9 +87,6 @@ class NpuGemma(OverlayModel):
             self.overlay.prepare(S, logits=False)
         if self.prefill is not None:  # (a prompt's last token after its chunk)
             self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
-        if self.cfg.per_layer_dim and self.prefill is not None:  # (the prefill's per-layer projection, a bf16 copy:
-            # before timing)
-            self.host.per_layer_inputs([0], self.host.embed([0]))
         gguf.release()
         self.position = 0
 
@@ -136,20 +133,21 @@ class NpuGemma(OverlayModel):
         self.t_host += time.perf_counter() - t0
         return out
 
-    def chunk_inputs(self, tokens: list[int], x: np.ndarray | None = None
-                     ) -> tuple[np.ndarray, np.ndarray | None]:
-        """A prefill chunk's inputs: the scaled embeddings (n, hidden) and the per-layer inputs (n, the prefill's layers,
-        dim), bf16 values (x: the embeddings, computed already)."""
-        x = self.host.embed(tokens) if x is None else x
-        pli = self.host.per_layer_inputs(tokens, x, layers=len(self.prefill.layers))
-        return x.astype(bfloat16), None if pli is None else pli.astype(bfloat16)
+    def chunk_inputs(self, tokens: list[int]) -> tuple[np.ndarray, np.ndarray | None]:
+        """A prefill chunk's inputs: the scaled embeddings (n, hidden) and the per-layer token rows (n, the prefill's
+        layers, dim; ``GemmaHost.layer_rows``), bf16 values."""
+        return self.host.embed(tokens).astype(bfloat16), self._layer_rows(tokens)
+
+    def _layer_rows(self, tokens: list[int]) -> np.ndarray | None:
+        if not self.cfg.per_layer_dim:
+            return None
+        return self.host.layer_rows(tokens, len(self.prefill.layers)).astype(bfloat16)
 
     def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
-        """(the first chunk: its per-layer inputs on the worker thread while its first operators run)"""
+        """(the first chunk: its per-layer token rows on the worker thread while its first operators run)"""
         if not first:
             return self.chunk_inputs(tokens)
-        x = self.host.embed(tokens)
-        return x.astype(bfloat16), self._pool.submit(lambda: self.chunk_inputs(tokens, x)[1])
+        return self.host.embed(tokens).astype(bfloat16), self._pool.submit(self._layer_rows, tokens)
 
     def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(a step from the prefill's last layer on - the layers that share a KV cache, the LM head: 19 of E4B's 42

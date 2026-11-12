@@ -375,8 +375,8 @@ offsets): aie2p-coding section 8. For speed:
   and 1-2.5% shorter steps.
 - **The first chunk's late inputs**: start the program with what its first operators read and write the rest
   before the piece that first reads it (`Library.run(hooks={item: fn})`: a hook runs before that piece is
-  dispatched, while the previous one runs; the item starts a piece). The Gemma prefill's per-layer inputs (a 15 ms
-  host projection) overlap layer 0's first operators (`GemmaPrefill.run` with a `Future`).
+  dispatched, while the previous one runs; the item starts a piece). The Gemma prefill's per-layer token rows (a
+  lookup) overlap the first chunk's first operators (`GemmaPrefill.run` with a `Future`).
 - **A prompt's last token**: a prefill that computes only the layers that own a cache still needs the last token's
   logits. Finish that token from the prefill's last layer with a decode step that starts there
   (`GemmaOverlay.step(start=)`; x from the chunk's residual) instead of a whole decode step: 19 of 42 layers' weights

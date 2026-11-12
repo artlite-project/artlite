@@ -353,6 +353,10 @@ CASES_PLANAR = [
     # super-block units (Q8_0 of 1024 columns: 8-row tiles, 2176-byte units; IQ3_XXS: 2320 bytes, padded to 2336)
     ("Q8_0", 8, 9280, 1024, {"M": 192, "K": 2048, "tiles": 8, "blocks": ((0, 2), (16, 1)), "region_rt": 24}),
     ("Q8_0", 8, 9280, 1024, {"M": 64, "K": 3072, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12, "mac_rows": 1}),
+    # (Gemma's Q8_0 of 16 rows x 512 columns: 4352-byte units, read in halves; chunk groups of 5 and 1)
+    ("Q8_0", 16, 9216, 512, {"M": 192, "K": 2560, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12}),
+    ("Q8_0", 16, 9216, 512, {"M": 192, "K": 2560, "tiles": 3, "blocks": ((0, 2), (6, 1)), "region_rt": 9,
+                             "kc_group": 1}),
     # (IQ4_XS: 16-row tiles of 2176-byte units; IQ3_S: 20 rows, 2304-byte units, a SiLU group of 7 tiles)
     ("IQ4_XS", 16, 9280, 1024, {"M": 192, "K": 2048, "tiles": 4, "blocks": ((0, 2), (8, 1)), "region_rt": 12}),
     ("IQ4_XS", 16, 9280, 1024, {"M": 192, "K": 2048, "tiles": 8, "blocks": ((0, 2),), "region_rt": 16, "silu": True}),

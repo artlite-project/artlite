@@ -7,7 +7,9 @@ decode step from the last own-cache layer on (its input: ``residual``) finishes 
 A chunk of T tokens (``SIZES``: multiples of 288) runs layer-major in S = T / ``SUB`` sub-chunks: each operator of a
 layer runs over the sub-chunks back to back on buffer slices ``SUB`` tokens apart (consecutive runs of one operator
 share its configuration: a ConfigureOp per layer and operator), the flash attention once over the whole chunk.
-The residual stream x is fp32 (PX, ``prefill.norm.ResidualNormOperator``). Per layer L (the decode's order):
+The residual stream x is fp32 (PX, ``prefill.norm.ResidualNormOperator``). The chunk starts with the per-layer
+projection of the embeddings (E2B / E4B: ``ple``, the decode image's Q8_0 copy, the own-cache layers' rows) on x's
+panels (PXR: a ``plain`` norm of a zero delta, x unchanged) -> PP. Per layer L (the decode's order):
 
 - qkv GEMM (``prefill.gemm``) of xn (the norm's bfp16 panels) -> G; the attention prep of the layer kind
   (``attn_prefill``: Q panels into QS, the chunk's K / V records into the layer's cache), the flash attention over the
@@ -15,9 +17,9 @@ The residual stream x is fp32 (PX, ``prefill.norm.ResidualNormOperator``). Per l
 - O GEMM -> Y; norm ``post``: x += norm(Y) post_attention_norm, xn = norm(x) ffn_norm;
 - gate_up GEMM with the GELU epilogue -> HP; down GEMM in four K parts -> F; norm ``plain``: x += norm(F)
   post_ffw_norm, xn = x (the per-layer input gate's input);
-- gate GEMM -> GY; ``prefill_ple``: gelu(GY) pli -> HPL (the host's per-layer inputs of the layer: PLI); proj GEMM ->
-  P; norm ``post`` with the output scale: x = (x + norm(P) post_norm) layer_output_scale, xn = norm(x) of the next
-  layer's attn_norm.
+- gate GEMM -> GY; ``prefill_ple``: gelu(GY) pli -> HPL, pli from the layer's rows of PP and the host's per-layer
+  token rows (E: the token lookup alone, ``GemmaHost.layer_rows``); proj GEMM -> P; norm ``post`` with the output
+  scale: x = (x + norm(P) post_norm) layer_output_scale, xn = norm(x) of the next layer's attn_norm.
 
 The last layer stops after its attention prep (its cache is all the prefill leaves). The first layer's input norm
 (``in``) starts the chunk.
@@ -32,6 +34,7 @@ the rounding points); the down GEMM's K parts halve its C tile's share; the atte
 would double the error (hence hi + lo).
 """
 
+import math
 from concurrent.futures import Future
 
 import numpy as np
@@ -94,13 +97,15 @@ class GemmaPrefill(ChunkPrefill):
         self.f_part = max(arg_bytes(g.op, 2) for d in down for g in d.gemms)  # (a down part's C)
         gl = self.plans[(own[0], "gate")].layout
         assert gl.pitch == 64 and gl.off["gate"] == 0, gl
+        self.ple_plan = plan_gemm(img, img.region(-1, "ple"), SUB, ops=gemms)  # (the own-cache layers' rows)
         eps = cfg.rms_norm_eps
+        self.n_raw = ResidualNormOperator(T=SUB, E=H, mode="plain", eps=eps, d_pitch=dp)  # (x's panels: a zero delta)
         self.n_in = ResidualNormOperator(T=SUB, E=H, mode="in", eps=eps)
         self.n_o = ResidualNormOperator(T=SUB, E=H, mode="post", eps=eps, d_pitch=dp)
         self.n_d = ResidualNormOperator(T=SUB, E=H, mode="plain", eps=eps, d_pitch=dp, deltas=self.parts,
                                      d_stride=self.f_part // 2 if self.parts > 1 else 0)
         self.n_p = ResidualNormOperator(T=SUB, E=H, mode="post", eps=eps, d_pitch=dp, scale=True)
-        self.ple = PleOperator(T=SUB)
+        self.ple = PleOperator(T=SUB, pitch=self.ple_plan.layout.pitch, eps=eps * H)
         self.hds = sorted({cfg.head_dim(L) for L in own})
         self.kind = {hd: AP.kind_of(cfg, hd, ov.at.kp) for hd in self.hds}
         self.cs_rows = ov.max_positions + MAX_T
@@ -124,11 +129,12 @@ class GemmaPrefill(ChunkPrefill):
         hd = max(self.hds)
         self.rb = {"PX": 4 * H, "PXN": 9 * H // 8, "G": 2 * COLS * max(self.pitch.values()), "A": 9 * COLS * hd // 8,
                    "Y": 2 * COLS * self.d_pitch, "HP": 9 * cfg.intermediate_size // 8, "GY": 2 * COLS * 64,
-                   "HPL": 9 * COLS * 64 // 8, "P": 2 * COLS * self.d_pitch, "PLI": 2 * cfg.per_layer_dim,
-                   "QS": COLS * max(k.qp for k in self.kind.values()) // 8}
+                   "HPL": 9 * COLS * 64 // 8, "P": 2 * COLS * self.d_pitch, "E": 2 * cfg.per_layer_dim,
+                   "QS": COLS * max(k.qp for k in self.kind.values()) // 8, "PXR": 9 * H // 8,
+                   "PP": 2 * self.ple_plan.layout.N}
         self.np_off = {}  # (the norms' parameter objects: [8][H] bf16 each)
-        self.np_off["in"] = 0
-        k = 1
+        self.np_off["in"], self.np_off["raw"] = 0, 16 * H
+        k = 2
         for L in self.layers[:-1]:
             for n in NORMS:
                 self.np_off[(L, n)] = k * 16 * H
@@ -144,8 +150,14 @@ class GemmaPrefill(ChunkPrefill):
         ov, cfg, rb = self.ov, self.cfg, self.rb
         sl, tok = self._sl, self._tok
         T, fp = S * SUB, self.f_part
-        rl: list[tuple] = [(self.n_in, self._np("in", self.n_in), tok("PX", j, self.n_in, i=1),
-                            tok("PXN", j, self.n_in, i=2)) for j in range(S)]
+        n = self.n_raw
+        rl: list[tuple] = [(n, self._np("raw", n), tok("PX", j, n, i=1), sl("Z", 0, n, i=2), tok("PX", j, n, i=3),
+                            tok("PXR", j, n, i=4)) for j in range(S)]
+        rl += [(g.op, tok("PXR", j, g.op, i=0), self._w(g), tok("PP", j, g.op, i=2)) for g in self.ple_plan.gemms
+               for j in range(S)]
+        rl += [(self.n_in, self._np("in", self.n_in), tok("PX", j, self.n_in, i=1), tok("PXN", j, self.n_in, i=2))
+               for j in range(S)]
+        ple_off = self.ple_plan.layout.off["ple"]
         for i, L in enumerate(self.layers):
             hd = cfg.head_dim(L)
             kd = self.kind[hd]
@@ -177,9 +189,11 @@ class GemmaPrefill(ChunkPrefill):
                     tok("PXN", j, n, i=4)) for j in range(S)]
             (g,) = self.plans[(L, "gate")].gemms
             rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("GY", j, g.op, i=2)) for j in range(S)]
-            pli = self.layers.index(L) * (MAX_T + PAD_ROWS) * rb["PLI"]
-            rl += [(self.ple, tok("GY", j, self.ple, i=0), tok("PLI", j, self.ple, i=1, extra=pli),
-                    tok("HPL", j, self.ple, i=2)) for j in range(S)]
+            li = self.layers.index(L)
+            e = li * (MAX_T + PAD_ROWS) * rb["E"]  # (the layer's rows of E; of PP: its 32 at 32 li in each column's)
+            rl += [(self.ple, tok("GY", j, self.ple, i=0), tok("PP", j, self.ple, i=1, extra=2 * (ple_off + 32 * li)),
+                    tok("E", j, self.ple, i=2, extra=e), sl("PLW", 0, self.ple, i=3), tok("HPL", j, self.ple, i=4))
+                   for j in range(S)]
             (g,) = self.plans[(L, "proj")].gemms
             rl += [(g.op, tok("HPL", j, g.op, i=0), self._w(g), tok("P", j, g.op, i=2)) for j in range(S)]
             n = self.n_p
@@ -194,11 +208,14 @@ class GemmaPrefill(ChunkPrefill):
     def _own_sizes(self, own: dict[str, int]) -> None:
         for name, r in self.rb.items():  # (the GEMMs' padding rows past the last sub-chunk)
             own[name] = max(own.get(name, 0), (MAX_T + PAD_ROWS) * r) + (
-                (len(self.layers) - 1) * (MAX_T + PAD_ROWS) * r if name == "PLI" else 0)
+                (len(self.layers) - 1) * (MAX_T + PAD_ROWS) * r if name == "E" else 0)
         own["F"] = own["F"] + self.f_part
+        own["Z"] = arg_bytes(self.n_raw, 2)
+        own["PLW"] = arg_bytes(self.ple, 3)
 
     def _bind(self) -> None:
-        """The norms' parameter objects (NP), the preps' (PRM), the cos / sin tables (CSS, CSF)."""
+        """The norms' parameter objects (NP), the preps' (PRM), the cos / sin tables (CSS, CSF), the per-layer inputs'
+        norm weights (PLW: per_layer_proj_norm / sqrt 2, bf16 hi | lo), the zero delta (Z)."""
         ov, dev, cfg, img, H = self.ov, self.ov.dev, self.cfg, self.img, self.H
         npb = dev.view("NP").view(np.uint16)
 
@@ -208,6 +225,14 @@ class GemmaPrefill(ChunkPrefill):
             npb[o:o + v.size] = v.reshape(-1)
 
         put("in", None, f"blk.{self.layers[0]}.attn_norm.weight", 1.0)
+        put("raw", None, None, 1.0)
+        w = (img._vec("per_layer_proj_norm.weight") / np.float32(math.sqrt(2.0))).astype(np.float32)
+        hi = w.astype(bfloat16)
+        plw = np.concatenate([hi, (w - hi.astype(np.float32)).astype(bfloat16)])
+        dev.view("PLW")[:plw.nbytes] = plw.view(np.uint8)
+        dev.flush("PLW")
+        dev.view("Z")[:] = 0
+        dev.flush("Z")
         for i, L in enumerate(self.layers[:-1]):
             b = f"blk.{L}."
             put((L, "o"), b + "post_attention_norm.weight", b + "ffn_norm.weight", 1.0)
@@ -249,22 +274,22 @@ class GemmaPrefill(ChunkPrefill):
         dev.fetch("PX", 4 * i * H, 4 * H)
         return dev.view("PX")[4 * i * H:4 * (i + 1) * H].view(np.float32).copy()
 
-    def _write_pli(self, pli: np.ndarray, n: int, T: int) -> None:
+    def _write_e(self, e: np.ndarray, n: int, T: int) -> None:
         dev, d = self.ov.dev, self.cfg.per_layer_dim
         stride = (MAX_T + PAD_ROWS) * d  # (a layer's rows, bf16)
-        pl = dev.view("PLI").view(np.uint16)
-        b = np.asarray(pli).reshape(n, -1, d)[:, :len(self.layers)].astype(bfloat16).view(np.uint16)
+        pl = dev.view("E").view(np.uint16)
+        b = np.asarray(e).reshape(n, -1, d)[:, :len(self.layers)].astype(bfloat16).view(np.uint16)
         for i in range(len(self.layers) - 1):
             pl[i * stride:i * stride + n * d] = b[:, i].reshape(-1)
             pl[i * stride + n * d:i * stride + T * d] = 0
-        dev.flush("PLI")
+        dev.flush("E")
 
-    def run(self, x: np.ndarray, pli: np.ndarray | Future, p0: int, T: int = 0) -> None:
-        """A chunk of size T (default: the smallest that holds x): x (n, hidden) the scaled embeddings and pli (n,
-        layers, per_layer_dim) the per-layer inputs (of the first layers at least: those of the prefill) of positions
-        p0 .. p0 + n - 1 (the caches hold the positions before). Leaves the own-cache layers' K / V of the positions in
-        the caches. pli may be a Future: the chunk starts without it, and its first PLE item waits for it (a new
-        piece: the host computes the per-layer inputs while layer 0's first operators run)."""
+    def run(self, x: np.ndarray, e: np.ndarray | Future, p0: int, T: int = 0) -> None:
+        """A chunk of size T (default: the smallest that holds x): x (n, hidden) the scaled embeddings and e (n, layers,
+        per_layer_dim) the per-layer token rows (``GemmaHost.layer_rows``; of the first layers at least: those of the
+        prefill) of positions p0 .. p0 + n - 1 (the caches hold the positions before). Leaves the own-cache layers' K /
+        V of the positions in the caches. e may be a Future: the chunk starts without it, and its first PLE item waits
+        for it (a new piece: the host looks the rows up while the chunk's first operators run)."""
         n, dev, H = x.shape[0], self.ov.dev, self.H
         T = self._size(n, p0, T)
         px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
@@ -272,11 +297,11 @@ class GemmaPrefill(ChunkPrefill):
         px[n:] = 0
         dev.flush("PX", 0, 4 * T * H)
         hooks = None
-        if isinstance(pli, Future):  # (a piece from the first PLE item on)
+        if isinstance(e, Future):  # (a piece from the first PLE item on)
             i = next(i for i, (op, *_) in enumerate(self.runlists[T]) if op is self.ple)
-            hooks = {i: lambda: self._write_pli(pli.result(), n, T)}
+            hooks = {i: lambda: self._write_e(e.result(), n, T)}
         else:
-            self._write_pli(pli, n, T)
+            self._write_e(e, n, T)
         self._launch(T, p0, self.params(T, p0), hooks)
 
     # ------------------------------------------------------------------
@@ -308,6 +333,14 @@ class GemmaPrefill(ChunkPrefill):
             return len({id(g.op) for g in self.plans[(L, "qkv")].gemms}) + 1
         gemms = {id(g.op) for name in PHASES for g in self.plans[(L, name)].gemms}
         return len(gemms) + 2 + 3 + 1
+
+    def _layer_starts(self, T: int) -> list[int]:
+        """(after the chunk's first items: x's panels, the per-layer projection, the first norm)"""
+        S = max(1, T // SUB)
+        starts = [S * (len(self.ple_plan.gemms) + 2)]
+        for L in self.layers:
+            starts.append(starts[-1] + self.layer_entries(L, S))
+        return starts
 
     def layer_entries(self, L: int, S: int) -> int:
         if L == self.layers[-1]:

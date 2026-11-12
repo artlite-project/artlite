@@ -16,7 +16,6 @@ from artlite.model_config import GemmaConfig, gemma_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.gemma4.attn_prefill import Kind
-from models.gemma4.host import GemmaHost
 from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
@@ -39,8 +38,9 @@ def _img() -> tuple[GGUFFile, GemmaImage, np.ndarray]:
     return _image["x"]
 
 
-def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
-    return float((got - want).norm() / want.norm())
+def _rel(got: torch.Tensor | np.ndarray, want: torch.Tensor | np.ndarray) -> float:
+    got, want = (np.asarray(x, np.float64) for x in (got, want))
+    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
 
 
 # (head_dim, chunk position, tokens, K panels per record)
@@ -153,37 +153,48 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
     assert err < 1.1 * eq
 
 
-def _ple_reference(y: torch.Tensor, pli: torch.Tensor) -> torch.Tensor:
-    """h (T, 8 SLOT) fp32 before the panels: y (T, 8 SLOT), pli (T, 8 PER)."""
+def _ple_reference(y: torch.Tensor, p: torch.Tensor, e: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """h (T, 8 SLOT) fp32 before the panels: y (T, 8 SLOT), the per-layer inputs pli = bf16(p / rms(p) w + e) of p, e
+    (T, 8 PER) bf16 values, w (8 PER) fp32 (rms with eps)."""
     from models.gemma4 import prefill_ple as PL
 
     T = y.shape[0]
+    pd = p.double()
+    pli = (pd * torch.rsqrt((pd * pd).mean(-1, keepdim=True) + eps) * w.double() + e.double()).float().bfloat16()
     g = torch.nn.functional.gelu(y.bfloat16().float(), approximate="tanh").bfloat16().float()
     h = torch.zeros(T, COLS, PL.SLOT)
-    h[:, :, :PL.PER] = g.view(T, COLS, PL.SLOT)[:, :, :PL.PER] * pli.bfloat16().float().view(T, COLS, PL.PER)
+    h[:, :, :PL.PER] = g.view(T, COLS, PL.SLOT)[:, :, :PL.PER] * pli.float().view(T, COLS, PL.PER)
     return h.reshape(T, -1)
 
 
 def test_ple() -> None:
-    """PleOperator against its model (gelu through the table: within 1 bf16 ULP; the panels' bfp16 rounding)."""
-    from models.gemma4.prefill_ple import PleOperator
+    """PleOperator against its model: the per-layer inputs from p (a layer's 32 values per column in rows of a wider
+    pitch, the argument from the layer's), e and w as the decode's F_PLI forms them, gelu through the table (within 1
+    bf16 ULP), the panels' bfp16 rounding."""
+    from models.gemma4.prefill_ple import PER, PleOperator
 
-    T = 256
-    op = PleOperator(T=T).compile()
+    T, pitch, o, eps = 256, 96, 32, 2.56e-3
+    op = PleOperator(T=T, pitch=pitch, eps=eps).compile()
     dev = op.device
     g = torch.Generator().manual_seed(5)
     y = (torch.randn(T, COLS * 64, generator=g) * 2).bfloat16()
-    pli = (torch.randn(T, COLS * 32, generator=g)).bfloat16()
+    full = (torch.randn(T + 1, COLS, pitch, generator=g) * 0.05).bfloat16()  # (rows of the projection's output)
+    p = full[:T, :, o:o + PER].reshape(T, COLS * PER)
+    e = (torch.randn(T, COLS * PER, generator=g)).bfloat16()
+    w = 0.5 + torch.rand(COLS * PER, generator=g)
+    wh = w.bfloat16()
+    plw = torch.cat([wh, (w - wh.float()).bfloat16()])
     A = artlite.from_numpy(np.zeros(T * COLS * 64 * 9 // 16, bfloat16), dev)
-    op.dispatch(artlite.from_numpy(to_numpy(y), dev), artlite.from_numpy(to_numpy(pli), dev), A)
+    P = to_numpy(full.reshape(-1)[o:o + T * COLS * pitch])
+    op.dispatch(artlite.from_numpy(to_numpy(y), dev), artlite.from_numpy(P, dev), artlite.from_numpy(to_numpy(e), dev),
+                artlite.from_numpy(to_numpy(plw), dev), A)
     A.sync_from_device()
     got = to_torch(bfp16.from_panels(A.numpy(), T, COLS * 64)).double()
-    want = _ple_reference(y, pli).double()
+    want = _ple_reference(y, p, e, wh.float() + plw[COLS * PER:].float(), eps).double()
     eq = _rel(torch.from_numpy(bfp16.values(want.float().numpy())).double(), want)
     err = _rel(got, want)
     print(f"ple {err:.2e} (bfp16 {eq:.2e})")
     assert err < 1.2 * eq
-
 
 
 @pytest.mark.slow
@@ -206,10 +217,8 @@ def test_prefill_caches(n: int, p0: int) -> None:
     layers = list(range(6))
     ids = GemmaTokenizer(g).encode(essay("apple.txt"), add_bos=True)[:p0 + n]
     host = GemmaCpu(g)
-    x = host.embed(ids)
-    pli = GemmaHost.per_layer_inputs(host, ids, x.numpy())  # (the app's)
-    x = x.bfloat16().float()  # (the app's inputs: bf16)
-    pli, e = pli.astype(bfloat16), host.layer_rows(ids)
+    x = host.embed(ids).bfloat16().float()  # (the app's inputs: bf16)
+    e = host.layer_rows(ids)
     ov = GemmaOverlay(g, layers=layers, vocab=COLS * 64, max_positions=1024)
     ov.load()
     for t in range(0, p0 + n, 4):  # the decode path
@@ -223,7 +232,7 @@ def test_prefill_caches(n: int, p0: int) -> None:
     t = p0
     for T in pf.plan(p0, n):
         m = min(T, p0 + n - t)
-        pf.run(x[t:t + m], pli[t:t + m], t, T)
+        pf.run(x[t:t + m].numpy(), e[t:t + m].astype(bfloat16), t, T)
         t += m
     worst = {}
     for L in layers:

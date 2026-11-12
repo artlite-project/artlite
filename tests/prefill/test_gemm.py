@@ -4,7 +4,8 @@ model's prefill plans them, with random bfp16 activations, against the dequantiz
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
 Q4_1 (planar at 1024 columns; Gemma's at 512), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
-file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
+file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups; Gemma's
+16-row copy of the per-layer projection), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
 in / out and its qkv with a gate block of one tile (two rows a column). The GEMMs
 run in a library program as the prefill's do, paced (``gemm_q``'s "Pacing") at level 0 and at ``LEVEL``, and as unpaced
 twins: their outputs bit-identical."""
@@ -75,7 +76,8 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "down", 288),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "proj", 256),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 1024), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "down", 1024),
-         ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 1024),
+         ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 1024), ("gemma4", "Q4_0", "E4B", (0, 5), -1, "ple", 256),
+         ("gemma4", "Q4_0", "E4B", (0, 5), -1, "ple", 1024),
          ("occamy", "", "", (0, 3), 0, "gdn_in", 256), ("occamy", "", "", (0, 3), 0, "gdn_in", 64),
          ("occamy", "", "", (0, 3), 0, "gdn_out", 256), ("occamy", "", "", (0, 3), 3, "attn_in", 256),
          ("occamy", "", "", (0, 3), 3, "attn_out", 64),
@@ -140,10 +142,19 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
     return plan_gemm(img, region, T, pitch=pitch)
 
 
+def _tensor(img: object, name: str) -> object:
+    """The image's tensor (Gemma's Q8_0 copy of the per-layer projection: made again, a packed image has dropped it)."""
+    t = img.tensor(name)
+    if not t.raw.size:
+        img._ple()
+        t = img.tensor(name)
+    return t
+
+
 def _rows(img: object, tensors: tuple[str, ...], rows: np.ndarray, K: int = 0) -> torch.Tensor:
     """Dequantized rows of the stacked tensors as the image holds them (Llama's Q / K rows in rotate-half order, Gemma's
     proj in its slotted copy; K: zero columns past the tensors' up to K, a K padded to whole chunks)."""
-    w = torch.cat([torch.from_numpy(img.tensor(t).dequantize()).reshape(img.tensor(t).rows, -1) for t in tensors])
+    w = torch.cat([torch.from_numpy(_tensor(img, t).dequantize()).reshape(img.tensor(t).rows, -1) for t in tensors])
     w = w[torch.from_numpy(rows)]
     return torch.nn.functional.pad(w, (0, max(K - w.shape[1], 0)))
 

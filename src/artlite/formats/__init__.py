@@ -2,7 +2,7 @@
 slots.
 
 A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
-(of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0; its 512-column tiles decode only), ``iq3`` (IQ3_XXS), ``iq3s``
+(of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0), ``iq3`` (IQ3_XXS), ``iq3s``
 (IQ3_S), ``iq4`` (IQ4_NL, IQ4_XS); ``k23``: their shared parts, a slot without formats)
 holds for its formats the ``TileFormat`` records (tile geometry), the host-side packing (a lossless re-layout of the
 GGUF fields; only fp16 -> bf16 scales change, BFP16 rounds bf16 weights once), the kernel-source fragments of the

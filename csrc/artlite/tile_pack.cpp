@@ -269,20 +269,18 @@ void tile_q4_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// Q8_0 (q8.py): the codes as the decode's MMUL panels [row group R / 8][group i][step s][row 8][8 bytes] per super-block
-/// (codes 8 s .. 8 s + 7 of group i) and the bf16 d: 1024-column tiles (nsb 4) as super-block units [codes | d [row][i]],
-/// others d [row][sb][i] first, then the super-blocks' codes.
+/// Q8_0 (q8.py): per super-block and row group of 8 a sub-unit [codes | d [row 8][i] bf16] (2176 bytes), the codes as
+/// the decode's MMUL panels [group i][step s][row 8][8 bytes] (codes 8 s .. 8 s + 7 of group i); a super-block's unit
+/// holds its sub-units of the tile's row groups.
 void tile_q8_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
-  const bool units = nsb == 4;
-  const size_t unit = 272 * size_t(R);
   for (int r = 0; r < R; r++)
     for (int sb = 0; sb < nsb; sb++) {
-      uint8_t* codes = units ? t + unit * sb : t + 16 * size_t(nsb) * R + size_t(sb) * R * 256;
-      uint8_t* h = units ? t + unit * sb + 256 * size_t(R) + 16 * r : t + 16 * (size_t(nsb) * r + sb);
+      uint8_t* su = t + 272 * (size_t(sb) * R + 8 * (r / 8));
+      uint8_t* h = su + 2048 + 16 * (r % 8);
       for (int i = 0; i < 8; i++) {
         const uint8_t* b = src[r] + 272 * sb + 34 * i;
         put16(h + 2 * i, bf16_of(b));
-        uint8_t* c = codes + (r / 8) * 2048 + 256 * i + 8 * (r % 8);
+        uint8_t* c = su + 256 * i + 8 * (r % 8);
         for (int s = 0; s < 4; s++) std::memcpy(c + 64 * s, b + 2 + 8 * s, 8);
       }
     }

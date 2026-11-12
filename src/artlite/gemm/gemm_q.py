@@ -857,12 +857,17 @@ class GemmQOperator(ArtcOperator):
             self.hdr_skip = 0
         # a unit longer than a shim BD's inner dimension (1023 words: Gemma's 32-row Q4_0 slices, 1024) is read as
         # ``us`` sub-units of 16 rows (their rows contiguous): the memtile gathers a pass's unit as [sub-unit][tile]
-        # [row 16], the dequant reads its rows in that order and writes the MMUL columns in the tiles' order
+        # [row 16], the dequant reads its rows in that order and writes the MMUL columns in the tiles' order. A
+        # super-block unit (Gemma's 16-row Q8_0, 1088 words) is read in equal parts that the memtile writes back in
+        # the unit's order.
         self.us = 1
         if self.planar and self.slice // 4 > 1023:
             f = FORMATS[fmt]
-            assert not (f.plane_major or f.word_major) and rows % 16 == 0, (fmt, rows)
-            self.us = rows // 16
+            if self.units:
+                self.us = next(u for u in range(2, 9) if self.slice % (4 * u) == 0 and self.slice // u // 4 <= 1023)
+            else:
+                assert not (f.plane_major or f.word_major) and rows % 16 == 0, (fmt, rows)
+                self.us = rows // 16
         self.dequant = FORMATS[fmt].dequant  # (BFP16 tiles already hold MMUL operands)
         # GemmQ's dequant: each pair of core rows splits every k-tile (GemmQd: one dequantizing core)
         self.pair = self.dequant and not self.DQ_CORE
@@ -1083,9 +1088,12 @@ class GemmQOperator(ArtcOperator):
             # k-tile objects [plane][word ii 2][g] (words 2 kt + ii: groups 2 kt + ii) of the first n_read rows,
             # zero-padded to n (64-byte aligned runs of 16 rows for the dequant's loads)
             R, T, TR, P = self.R, self.tiles, self.TR, FORMATS[self.fmt].planes
-            if self.units:  # (the unit of the pass's tiles as it arrives, each tile's padded to whole lines)
-                uw, pw = self.units // 4, self.unit_pitch // 4
-                wdims, rdims = None, [(T, uw), (uw, 1)]
+            if self.units:  # (the unit of the pass's tiles as it arrives, each tile's padded to whole lines; in
+                # parts: the stream [part][tile] written as [tile][part])
+                uw, pw, us = self.units // 4, self.unit_pitch // 4, self.us
+                assert us == 1 or pw == uw, (us, pw, uw)
+                wdims = [(us, uw // us), (T, uw), (uw // us, 1)] if us > 1 else None
+                rdims = [(T * us, uw // us), (uw // us, 1)]
                 rpad = [(0, 0), (0, pw - uw)] if pw > uw else None
             elif FORMATS[self.fmt].word_major:
                 # word-major slices ([word][row R], Q2_K / Q3_K: 2 P words per k-tile): S2MM writes [word][g];

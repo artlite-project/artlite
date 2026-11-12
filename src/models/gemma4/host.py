@@ -1,6 +1,6 @@
-"""What the host computes for Gemma 4 on the NPU: the scaled token embeddings, the per-layer token rows (E2B / E4B: the
-decode's per-layer inputs then come from the NPU's projection, ``gemma4.overlay``) and a prefill chunk's per-layer
-inputs, from the GGUF file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
+"""What the host computes for Gemma 4 on the NPU: the scaled token embeddings and the per-layer token rows (E2B / E4B:
+the per-layer inputs then come from the NPU's projection, ``gemma4.overlay``, ``gemma4.prefill``), from the GGUF
+file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
 
 ``GemmaHost`` reads matrices dequantized to fp32 on first use, embedding rows by a lookup in the mapped file
 (``GGUFFile.rows``). The fp32 reference of the whole model (tests/gemma4/cpu.py) derives from it.
@@ -9,7 +9,6 @@ inputs, from the GGUF file's tensors (llama.cpp's ``src/models/gemma4.cpp``).
 import math
 
 import numpy as np
-import torch  # noqa: TID251
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
@@ -22,7 +21,6 @@ class GemmaHost:
         self.gguf = gguf
         self.cfg = GemmaConfig.from_gguf(gguf)
         self._mats: dict[str, np.ndarray] = {}
-        self._bf16: dict[str, torch.Tensor] = {}  # (bf16 copies of BF16 matrices: per_layer_inputs)
         self._threads = threads
 
     def mat(self, name: str) -> np.ndarray:
@@ -37,35 +35,10 @@ class GemmaHost:
         """(T, hidden) fp32: the token embeddings * sqrt(hidden)."""
         return self.gguf.rows("token_embd.weight", tokens) * np.float32(math.sqrt(self.cfg.hidden_size))
 
-    def layer_rows(self, tokens: list[int]) -> np.ndarray:
+    def layer_rows(self, tokens: list[int], layers: int = 0) -> np.ndarray:
         """(T, layers, per_layer_dim) fp32: the per-layer token embedding rows times sqrt(per_layer_dim / 2), the
-        per-layer inputs' token part (``per_layer_inputs``)."""
+        per-layer inputs' token part (the decode's F_PLI and the prefill's ``prefill_ple`` add it to the projection's
+        normed part); ``layers``: of the first that many layers only (default all)."""
         d = self.cfg.per_layer_dim
-        rows = self.gguf.rows("per_layer_token_embd.weight", tokens)
+        rows = self.gguf.rows("per_layer_token_embd.weight", tokens, layers * d)
         return (rows * np.float32(math.sqrt(d / 2))).reshape(len(tokens), -1, d)
-
-    def per_layer_inputs(self, tokens: list[int], x: np.ndarray, *, layers: int = 0) -> np.ndarray | None:
-        """(T, layers, per_layer_dim) fp32: (RMSNorm(per_layer_model_proj @ x / sqrt(hidden)) +
-        sqrt(per_layer_dim) * per_layer_token_embd[token]) / sqrt(2), the projection as a bf16 matmul (its weight is
-        BF16 in the file, x rounded to bf16: ~0.2% of the projection; 0.5 instead of 4.4 ms per token on Zen 5): the
-        NPU app's inputs, which go to the NPU as bf16; ``layers``: of the first that many layers only (a prompt chunk's:
-        the layers that own a cache)."""
-        cfg = self.cfg
-        if not cfg.per_layer_dim:
-            return None
-        T, n, d = len(tokens), layers or cfg.num_hidden_layers, cfg.per_layer_dim
-        name = "per_layer_model_proj.weight"
-        # (fused: rms(p / sqrt(hidden)) = rms(p) with eps * hidden, by vector_norm; the rows' dequant in torch ops: 20
-        # instead of 73 ms unfused for the 24 own-cache layers of 1031 tokens on Zen 5)
-        if name not in self._bf16:
-            self._bf16[name] = torch.from_numpy(self.gguf.tensor(name).dequantize()).bfloat16()
-        # (one row as two: torch's 1-row product rounds otherwise than a row of any larger one, and the app keeps a
-        # token's inputs from the first batch it was in)
-        xt = torch.from_numpy(np.asarray(x, np.float32))
-        xb = xt.bfloat16() if T > 1 else xt.bfloat16().repeat(2, 1)
-        proj = (xb @ self._bf16[name][:n * d].T)[:T].float().view(T, n, d)
-        inv = torch.linalg.vector_norm(proj, dim=-1, keepdim=True).mul_(1 / math.sqrt(d)).pow_(2)
-        inv = inv.add_(cfg.rms_norm_eps * cfg.hidden_size).rsqrt_()
-        y = proj.mul_(inv).mul_(torch.from_numpy(self.mat("per_layer_proj_norm.weight")))
-        tok = torch.from_numpy(self.gguf.rows("per_layer_token_embd.weight", tokens, n * d)).view(T, n, d)
-        return torch.add(y, tok, alpha=math.sqrt(d)).mul_(1 / math.sqrt(2.0)).numpy()

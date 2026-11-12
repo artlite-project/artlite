@@ -111,8 +111,8 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
     the window.
 - **App** (`models.common.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
   start (whole cache groups), the planner's chunks, decode steps after; each chunk's inputs (embeddings, per-layer
-  inputs) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and
-  receives inputs that later operators read through a `Library.run` hook (`GemmaPrefill.run(pli=Future)`).
+  token rows) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and
+  receives inputs that later operators read through a `Library.run` hook (`GemmaPrefill.run(e=Future)`).
 
 ## Gates (test each before building on it)
 
