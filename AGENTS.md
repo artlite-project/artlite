@@ -47,6 +47,9 @@ use any modern SIMD (AVX-512 included).
   compatibility code for older ones; `from __future__ import annotations` only where 3.12 needs it (an annotation
   naming a class defined later in the module or imported only under `TYPE_CHECKING`, or an attribute of a package
   still loading, such as `artlite.Device` in a module that `import artlite` loads).
+- Production code (`src/`) runs on numpy and ml_dtypes, never torch: torch is a dev dependency, the tests' CPU
+  references (ruff refuses the import outside `tests/`; `tests/test_no_torch.py` imports every module without it).
+  Host work numpy does badly goes to `csrc/` (AVX-512), the rest to the NPU.
 - Use `uv`, never `pip`.
 - Tests: run the test file of what you changed, not the whole suite (slow), and no long LLM measuring sessions unless
   asked. Whole-model tests are marked `slow` and run only with `--run-slow`.

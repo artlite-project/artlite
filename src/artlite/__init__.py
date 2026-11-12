@@ -27,10 +27,6 @@ import math
 import os
 import time
 
-# Idle OpenMP threads sleep instead of spinning (libgomp reads this as torch loads it; a value already set stays):
-# spinning, torch's pool keeps ~1.2 CPUs busy while the NPU works (Llama 1B prefill: 1.16 vs 0.11 CPUs; prefill and
-# decode no slower asleep)
-os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 # numpy's OpenBLAS on one thread (read as numpy loads it): the host's products are a few rows (a decision head, a pooling),
 # which a pool of threads turns into busy-waiting cores (Kev-4B's head, 512 x 2560 against a question's rows: 11.5 CPUs
 # spinning while the NPU worked, 62 W instead of ~25)

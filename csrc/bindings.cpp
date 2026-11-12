@@ -336,7 +336,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
       "Holding nothing: until a process waiting for the NPU's turn has taken it (at most 50 ms), so that this "
       "process's next dispatch comes after its turn.");
 
-  // Zero-copy numpy/torch views of Buffer mappings (map()) keep their
+  // Zero-copy numpy views of Buffer mappings (map()) keep their
   // Buffer/Device wrappers alive until after nanobind's exit-time leak audit,
   // producing false "leaked N instances" reports even though gc finds zero
   // live instances at teardown and the actual munmap/GEM-close runs in ~bo().

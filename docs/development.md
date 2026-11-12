@@ -80,7 +80,7 @@ Chromium JSON for Perfetto) is switched on by `ARTLITE_PROFILE` (below).
 | `ARTLITE_LLAMA_CPP_DIR` | the llama.cpp build the Qwen reference tests load |
 | `ARTLITE_NB_LEAK_WARNINGS=1` | nanobind's leak warnings at exit (off by default) |
 | `ARTLITE_ARG_<OPTION>` | `artlite-server`'s options ([artlite-server](server.md#options)) |
-| `OMP_WAIT_POLICY` | `import artlite` sets `PASSIVE` unless set (torch's idle OpenMP threads sleep instead of spinning ~1.2 CPUs while the NPU works); it has to be set before torch is first imported |
+| `OMP_WAIT_POLICY` | the tests set `PASSIVE` unless set (the idle OpenMP threads of torch, which only the tests' CPU references load, sleep instead of spinning ~1.2 CPUs while the NPU works) |
 
 ## Skills
 

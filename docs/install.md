@@ -47,8 +47,9 @@ start, when the native module is not built from the checkout's `csrc/` (a build 
 
 ### Development
 
-`uv sync` without `--no-dev` also installs the `dev` group: pytest, ruff, the API clients the server's tests use, and
-the build's own tools, for the rebuild after changing `csrc/` or after adding or moving Python modules:
+`uv sync` without `--no-dev` also installs the `dev` group: pytest, ruff, the API clients the server's tests use, torch
+(CPU: the tests' references) and the build's own tools, for the rebuild after changing `csrc/` or after adding or moving
+Python modules:
 
 ```bash
 uv sync

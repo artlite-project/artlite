@@ -81,8 +81,6 @@ dependencies = [
     { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "starlette" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "uvicorn" },
     { name = "websockets" },
 ]
@@ -95,6 +93,8 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "scikit-build-core" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
 
 [package.metadata]
@@ -115,7 +115,6 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "starlette" },
-    { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "uvicorn", specifier = ">=0.32" },
     { name = "websockets", specifier = ">=15.0" },
 ]
@@ -128,6 +127,7 @@ dev = [
     { name = "pytest", specifier = ">=9.0" },
     { name = "ruff", specifier = ">=0.16.2" },
     { name = "scikit-build-core", specifier = ">=0.11" },
+    { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cpu" },
 ]
 
 [[package]]
