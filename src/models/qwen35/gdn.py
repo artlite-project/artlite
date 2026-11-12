@@ -73,7 +73,8 @@ block up to its own (the lanes before it from the k / v histories and the gates 
 substitution in lane order (``solve``), O from it and Y; the products along the lanes are per lane in fp32 (bfp16 blocks run
 along i, a lane's own), so no lane's rounding depends on another's. The states are double-buffered (``QwenOverlay._half``:
 the half a position's block starts from): a step reads its block's half and writes the other, the block's update
-(S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else a copy; a step past the block's end then runs
+(S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else nothing that is read (the other half is
+read only after a block's end wrote it); a step past the block's end then runs
 the next block's lanes from that update in L1 (their V in o's rows the outputs do not take, their K panels in k2). A
 prefill ends anywhere: the decode's first block after it has no lanes before the prefill's end, whose zero gates leave the
 state as it is, so that blocks start at multiples of 8 and a prefill (at a multiple of 32) at a block's start, the state
@@ -1751,8 +1752,8 @@ void {{ p }}_gvh(const bfloat16 *__restrict x, int32_t *__restrict ws)
 
 """
 _GPANEL4 = r"""// State panel x of the v head (its next one, in place): the block's lanes' X, Y (``xy``), U, O (``solve``; the step's lanes'
-// O kept); out: the panel (unchanged), or when the block ends in the step its update over the 8 lanes (S + dc S + U'^T K^T),
-// then past the block's end the next block's lanes from it
+// O kept); out (the other half's panel): when the block ends in the step its update over the 8 lanes (S + dc S + U'^T K^T),
+// then past the block's end the next block's lanes from it; else nothing (the half is read only after a block's end)
 __attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
 {
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
@@ -1765,10 +1766,8 @@ __attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__
     const uint8_t *__restrict qp = GW(uint8_t, {{ g.qp }});
     {{ p }}_xy(sp, GW(uint8_t, {{ g.kq }}), qp, xy);
     {{ p }}_solve(xy, GW(float, {{ g.vt }}) + 64 * pj, GW(float, {{ g.cc }}), u, o, ~0ull << (8 * t0), e < 8 ? e : 8);  // (lanes past the step's go nowhere)
-    if (e < 8) {
-        {{ p }}_cp4k((int32_t *)out, (const int32_t *)sp);
+    if (e < 8)  // (out: the other half's, which only a block's end writes before it is read)
         return;
-    }
     uint8_t *__restrict up = GW(uint8_t, {{ g.xy }});
     {{ p }}_uprep(u, GW(float, {{ g.uf }}), up);
     {{ p }}_dupdate(sp, out, GW(bfloat16, {{ g.dc }}), GW(uint8_t, {{ g.kt }}), up, st[{{ G_ON }}]);
