@@ -93,6 +93,8 @@ class FusedOperator(FusedElf):
         for name, (bo, offset) in self.external_buffers.items():
             s = self.layout.spans[name]
             assert s.space == "scratch", f"external buffer {name} must be a scratch buffer"
+            if offset + s.nbytes > bo.size:  # (the NPU would read and write past the BO)
+                raise ValueError(f"{self.name}: external buffer {name} of {s.nbytes} bytes at {offset} in a BO of {bo.size}")
             self._ext.append((s.offset, s.offset + s.nbytes, bo, offset))
         self._scratch_bo = dev.alloc_host_buffer(max(min((e[0] for e in self._ext), default=sizes["scratch"]), 2))
         code, self._bds = self._control_program(

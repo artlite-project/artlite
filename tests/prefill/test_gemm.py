@@ -307,8 +307,8 @@ def test_unit_gemm(fmt: str, tiles: int) -> None:
 
     ops = [gemm(3), gemm(2)]  # (a library holds two designs at least)
     lib = Library("t_unit_gemm", ops).compile().load()
-    A = (torch.randn(ops[0].M, K, generator=torch.Generator().manual_seed(1)) * 0.5).bfloat16()
-    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), ops[0].M, K))
+    A = (torch.randn(max(op.M for op in ops), K, generator=torch.Generator().manual_seed(1)) * 0.5).bfloat16()  # (padded M)
+    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), A.shape[0], K))
     want = Aq[:T] @ torch.from_numpy(t.dequantize()).T
     for op in ops:
         C = _run(lib, op, A, W, -op.hdr_skip)[:T].float()

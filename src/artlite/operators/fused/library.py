@@ -23,7 +23,7 @@ from ...overlay import SPIN_MARGIN_US, irq_cpu, npu_turn
 from ..base import ArtcOperator
 from . import ctrlpkt, locks, program
 from .elf import FusedElf
-from .layout import Runlist, distinct, parse_name
+from .layout import Runlist, distinct, parse_name, spec_bytes
 from .program import PIECE_BYTES, Assembler, Item
 
 
@@ -128,14 +128,21 @@ class Library(FusedElf):
 
     def items(self, runlist: Runlist, buffers: Mapping[str, Any]) -> list[Item]:
         """A program's items: per run of ``runlist`` ((operator, *buffer names)) its entry and the device addresses of
-        its arguments in ``buffers`` (host buffers by name; ``"NAME[a:b]"`` from byte a)."""
+        its arguments in ``buffers`` (host buffers by name; ``"NAME[a:b]"`` its bytes a .. b), each at least its
+        argument's bytes (``get_arg_spec``: the NPU reads and writes that many from the address, past a smaller buffer
+        into whatever the process maps after it)."""
         ctx = self.load()._ctx  # (on XRT: open, its addresses)
 
-        def address(name: str) -> int:
-            base, start, _ = parse_name(name)
+        def address(op: ArtcOperator, i: int, name: str) -> int:
+            base, start, end = parse_name(name)
+            size = getattr(buffers[base], "_raw", buffers[base]).size
+            end = size if end is None else end
+            if end > size or end - start < spec_bytes(op.get_arg_spec()[i]):
+                raise ValueError(f"{self.name}: {type(op).__name__}'s argument {i} needs "
+                                 f"{spec_bytes(op.get_arg_spec()[i])} bytes, {name} has {min(end, size) - start}")
             return txn.device_address(buffers[base], start, ctx)
 
-        return [(self._entry[id(op)], [address(n) for n in names]) for op, *names in runlist]
+        return [(self._entry[id(op)], [address(op, i, n) for i, n in enumerate(names)]) for op, *names in runlist]
 
     def _load(self, elf: ParsedElf) -> None:
         super()._load(elf)

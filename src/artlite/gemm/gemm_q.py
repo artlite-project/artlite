@@ -875,11 +875,14 @@ class GemmQOperator(ArtcOperator):
         # tiles of a core's k-tile objects (its dequant; GemmQd: the pass's)
         self.tq = TILES // 2 if self.pair else self.tiles if self.DQ_CORE and not self.planar else TILES
         # the W argument: hdr_skip bytes before the matrix, then its columns' regions (and the tiles the
-        # last column's extra row tiles read after its region: those of the next region in the image)
+        # last column's extra row tiles read after its region: those of the next region in the image), through the
+        # last column's: a column stride longer than the region (a column-major image's) is not read past it there,
+        # where the image may end
         nk, g, rt, rs = self.n_kc, self.kc_group, self.region_rt, self.rt_stride
         last = ((nk - 1) // g) * rt * rs + (rt_end - 1) * rs + (nk - 1) % g + 1 if nk > 1 or rs > 1 else rt_end
-        self.overrun = max(0, last - (rt * rs * (nk // g) if nk > 1 or rs > 1 else rt)) * tile_bytes
-        self.w_bytes = COLS * col_bytes + self.hdr_skip + self.overrun
+        region = (rt * rs * (nk // g) if nk > 1 or rs > 1 else rt) * tile_bytes
+        self.overrun = max(0, last * tile_bytes - region)
+        self.w_bytes = COLS * col_bytes + self.hdr_skip + self.overrun - max(0, col_bytes - region)
         self.ws_planes = FORMATS[fmt].ws_planes  # expanded scale planes
         assert self.slice in (2048, 2304) or self.planar, "super-block slices: 16 x 128 B (Q4), 8 x 288 B (BFP16)"
         # tokens per core row and chunk (the weights stream once per chunk): the largest that
