@@ -911,7 +911,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize("size", ["1B", "9B"])
+@pytest.mark.parametrize("size", ["1B", "9B", "35B-A3B", "occamy"])
 def test_drafts_exact(size: str) -> None:
     """A step of S slots gives each kept slot the numbers of a step of one, bit for bit, so that drafts never change a
     greedy text: the first layers up to the first full-attention layer over 120 random tokens (the attention's chains

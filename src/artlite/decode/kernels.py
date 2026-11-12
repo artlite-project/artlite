@@ -591,9 +591,30 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
 }
 
 {% else %}
+{% if moe %}
+// 32 rows v of slot s onto its grid g = 2^-14 of its rms' binade (the slots' 1 / rms of the phase, w_.inv: the same on
+// every column) - (v + M) - M, M = 1.5 2^23 g: a multiple of g for any v - into pa's lanes lo .. hi - 1 (fp32; st0: stored,
+// else added; the other lanes written back as they were). Sums of the grid's values are exact below 2^24 g (~2^10 of the
+// rms): a slot's partials of its experts' rows and the combine's sum of the columns' do not depend on how a step's experts
+// are dealt to the columns (``moe.route``)
+{{ "__attribute__((noinline))" if wide else "[[clang::always_inline]] inline" }} void {{ p }}_gacc(int32_t *__restrict ws, int s, float *__restrict pa, aie::vector<float, 32> v,
+                                          bool st0, int lo, int hi)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t eb = (__builtin_bit_cast(uint32_t, WS(float, {{ w_.inv }})[8 * s]) >> 23) & 0xFFu;
+    const aie::vector<float, 32> m = aie::broadcast<float, 32>(__builtin_bit_cast(float, ((263u - eb) << 23) | 0x400000u));
+    const aie::vector<float, 32> vg = aie::sub(aie::add(v, m), m);
+    const aie::vector<float, 32> old = aie::concat(aie::load_v<16>(pa), aie::load_v<16>(pa + 16));
+    const aie::vector<int16, 32> li = aie::load_v<32>({{ p }}_iota);
+    const aie::vector<float, 32> nw = aie::select(old, st0 ? vg : aie::add(old, vg), aie::ge(li, (int16)lo) & aie::lt(li, (int16)hi));
+    aie::store_v(pa, nw.template extract<16>(0));
+    aie::store_v(pa + 16, nw.template extract<16>(1));
+}
+
+{% endif %}
 // Slot s's rows 0 .. nv - 1 of a complete row tile (after _rows): into the residual at row q, or the staging buffer at
 // n; returns the values staged{{ " (h: the tile's rows 16 h ..)" if wide and not moe else "" }}{{ " (h: the tile's block of 16 rows h; moe: a B_PAIR block's pairs' sums, B_KEEP its first one kept; F_HOUT into the hold buffer, F_ACCUM into acc)" if moe else "" }}
-__attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int flags, int fw, int nv, int q, int n{{ ", int h" if wide or moe else "" }}{{ ", bfloat16 *__restrict acc" if moe else "" }})
+__attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int flags, int fw, int nv, int q, int n{{ ", int h" if wide or moe else "" }}{{ ", float *__restrict acc" if moe else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const float *__restrict yt = WS(float, {{ w_.yt }}){{ " + 64 * h" if wide or moe else "" }};
@@ -616,21 +637,12 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
         return nv;
     }
 {% if not wide %}
-    if (flags & {{ F_ACCUM }}) {  // (into acc [slot][H] bf16 at row q: a window of 32 at its 16-aligned base, in two
-        // 32-byte halves (a 64-byte access is 64-byte aligned); F_ACC0 stores)
-        bfloat16 *__restrict pa = acc + {{ H }} * s + (q & ~15);
+    if (flags & {{ F_ACCUM }}) {  // (into the slot's row of acc at row q, on its grid: a window of 32 at its 16-aligned
+        // base; F_ACC0 stores)
         const int sh = q & 15;
         aie::vector<float, 32> v = aie::zeros<float, 32>();
         v.insert(0, y);
-        v = aie::shuffle_up_fill(v, aie::zeros<float, 32>(), sh);
-        const aie::vector<bfloat16, 32> old = aie::concat(aie::load_v<16>(pa), aie::load_v<16>(pa + 16));
-        const aie::accum<accfloat, 32> sum = (flags & {{ F_ACC0 }}) ? aie::accum<accfloat, 32>(v)
-                                                                   : aie::add(aie::accum<accfloat, 32>(old), v);
-        const aie::vector<int16, 32> li = aie::load_v<32>({{ p }}_iota);
-        const aie::vector<bfloat16, 32> nw = aie::select(old, sum.template to_vector<bfloat16>(),
-                                                         aie::ge(li, (int16)sh) & aie::lt(li, (int16)(sh + nv)));
-        aie::store_v(pa, nw.template extract<16>(0));
-        aie::store_v(pa + 16, nw.template extract<16>(1));
+        {{ p }}_gacc(ws, s, acc + (q & ~15), aie::shuffle_up_fill(v, aie::zeros<float, 32>(), sh), flags & {{ F_ACC0 }}, sh, sh + nv);
         return 0;
     }
 {% endif %}
@@ -742,17 +754,18 @@ __attribute__((noinline)) int {{ p }}_slots(int32_t *__restrict ws, int S, int f
 {% if moe and wide %}
 
 // (an expert's down, F_ACCUM) rows 0 .. nv - 1 of a tile of G row groups of R <= 32 rows (group j's in yt's block j) of
-// every slot into acc at row q ([slot][H] bf16; F_ACC0 stores): _slot's sums, a group at a time (its 32 rows shifted
-// onto a window of 48 at its 16-aligned base: lanes 0 .. 31, then 32 .. 47 where its rows reach them)
+// every slot into acc at row q (fp32 [slot][H], on the slot's grid: _gacc; F_ACC0 stores):
+// _slot's sums, a group at a time (its 32 rows shifted onto a window of 48 at its 16-aligned base: lanes 0 .. 31, then
+// 32 .. 47 where its rows reach them)
 __attribute__((noinline)) void {{ p }}_accum(int32_t *__restrict ws, int S, int flags, int nv, int q, int R, int G,
-                                            bfloat16 *__restrict acc)
+                                            float *__restrict acc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const float *__restrict yt = WS(float, {{ w_.yt }});
-    const aie::vector<int16, 32> li = aie::load_v<32>({{ p }}_iota);
     const bool st0 = flags & {{ F_ACC0 }};
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {
+        float *__restrict as = acc + {{ H }} * s;
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < G; j++) {
             const int k = nv - R * j > R ? R : nv - R * j, qj = q + R * j, sh = qj & 15;
@@ -761,21 +774,10 @@ __attribute__((noinline)) void {{ p }}_accum(int32_t *__restrict ws, int S, int 
             const float *__restrict yb = yt + {{ YB }} * j + 8 * s;
             const aie::vector<float, 32> y = aie::concat(aie::load_v<8>(yb), aie::load_v<8>(yb + 32), aie::load_v<8>(yb + 64),
                                                          aie::load_v<8>(yb + 96));  // rows 0 .. 31
-            bfloat16 *__restrict pa = acc + {{ H }} * s + (qj & ~15);
-            const aie::vector<float, 32> v0 = aie::shuffle_up_fill(y, aie::zeros<float, 32>(), sh);
-            const aie::vector<bfloat16, 32> o0 = aie::concat(aie::load_v<16>(pa), aie::load_v<16>(pa + 16));
-            const aie::accum<accfloat, 32> s0 = st0 ? aie::accum<accfloat, 32>(v0) : aie::add(aie::accum<accfloat, 32>(o0), v0);
-            const aie::vector<bfloat16, 32> n0 = aie::select(o0, s0.template to_vector<bfloat16>(),
-                                                             aie::ge(li, (int16)sh) & aie::lt(li, (int16)(sh + k)));
-            aie::store_v(pa, n0.template extract<16>(0));
-            aie::store_v(pa + 16, n0.template extract<16>(1));
-            if (sh + k > 32) {  // (rows 32 - sh .. k - 1)
-                const aie::vector<float, 16> v1 = aie::shuffle_down_fill(y, aie::zeros<float, 32>(), 32 - sh).template extract<16>(0);
-                const aie::vector<bfloat16, 16> o1 = aie::load_v<16>(pa + 32);
-                const aie::accum<accfloat, 16> s1 = st0 ? aie::accum<accfloat, 16>(v1) : aie::add(aie::accum<accfloat, 16>(o1), v1);
-                aie::store_v(pa + 32, aie::select(o1, s1.template to_vector<bfloat16>(),
-                                                  aie::lt(li.template extract<16>(0), (int16)(sh + k - 32))));
-            }
+            float *__restrict pa = as + (qj & ~15);
+            {{ p }}_gacc(ws, s, pa, aie::shuffle_up_fill(y, aie::zeros<float, 32>(), sh), st0, sh, sh + k);
+            if (sh + k > 32)  // (rows 32 - sh .. k - 1: a window past the last row's end stays in acc's buffer)
+                {{ p }}_gacc(ws, s, pa + 32, aie::shuffle_down_fill(y, aie::zeros<float, 32>(), 32 - sh), st0, 0, sh + k - 32);
         }
     }
 }
@@ -1168,10 +1170,11 @@ __attribute__((noinline, minsize)) void {{ p }}_fin(int32_t *__restrict st)
         return;
     }
 {% if moe %}
-    if (flags & {{ F_EMITA }}) {  // (the last down: acc out, [64-row object][slot])
+    if (flags & {{ F_EMITA }}) {  // (the last down: acc out, objects of 32 rows: ``emit``)
         st[{{ S_ESRC }}] = 4;
         st[{{ S_EJ }}] = 0;
-        st[{{ S_NE }}] = S * {{ H // C_LEN }};
+        st[{{ S_ESLOT }}] = 0;
+        st[{{ S_NE }}] = S * {{ H // 32 }};
         return;
     }
     if (flags & {{ F_HOUT + F_ACCUM }})
@@ -1183,7 +1186,7 @@ __attribute__((noinline, minsize)) void {{ p }}_fin(int32_t *__restrict st)
 
 // The helper's partial rows: a complete row tile's rows per slot -> the residual or the staging buffers (st[S_NE]
 // C objects / st[S_NM] M objects to emit); after the phase's last tile its last outputs (fin)
-void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bfloat16 *__restrict acc" if moe else "" }}{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
+void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int32_t *__restrict aw" if moe else "" }}{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
 {
     {{ p }}_Win<3> w_;
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -1256,7 +1259,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
     const int nw = gu ? {{ p }}_guwin(ws, S, R) : 0;  // (gate / up: the windows completed, [8 gate | 8 up] each)
     int add = 0;
     if (flags & {{ F_ACCUM }})  // (an expert's down: its rows into acc)
-        {{ p }}_accum(ws, S, flags, nv, row0 + r0, R, G, acc);
+        {{ p }}_accum(ws, S, flags, nv, row0 + r0, R, G, (float *)((uint8_t *)aw + {{ ACC_AT }}));
     else {
         AIE_LOOP_NO_UNROLL
         for (int s = 0; s < S; s++) {  // (per 16 rows: a row group's rows 0 .. 15, 16 .. (block j: halves 2 j, 2 j + 1),
@@ -1265,15 +1268,15 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
             if (gu) {
                 AIE_LOOP_NO_UNROLL
                 for (int w = 0; w < nw; w++)
-                    a += {{ p }}_slot(ws, s, flags, fw, 8, 0, n + a, w, acc);
+                    a += {{ p }}_slot(ws, s, flags, fw, 8, 0, n + a, w, nullptr);  // (F_ACCUM: _accum)
             } else {
                 AIE_LOOP_NO_UNROLL
                 for (int j = 0; j < G; j++) {
                     const int k = nv - R * j > R ? R : nv - R * j;
                     if (k > 0)
-                        a += {{ p }}_slot(ws, s, flags, fw, k > 16 ? 16 : k, row0 + r0 + R * j, n + a, 2 * j, acc);
+                        a += {{ p }}_slot(ws, s, flags, fw, k > 16 ? 16 : k, row0 + r0 + R * j, n + a, 2 * j, nullptr);
                     if (k > 16)
-                        a += {{ p }}_slot(ws, s, flags, fw, k - 16, row0 + r0 + R * j + 16, n + a, 2 * j + 1, acc);
+                        a += {{ p }}_slot(ws, s, flags, fw, k - 16, row0 + r0 + R * j + 16, n + a, 2 * j + 1, nullptr);
                 }
             }
             add = a;
@@ -1285,11 +1288,12 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {  // (per block of 16 rows: R rows of a row group, or a tile's rows; F_GU: 8 outputs)
         int a = 0;
+        float *__restrict as = (float *)((uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * s;
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < G; j++) {
             const int k = gu ? 8 : (nv - R * j > R ? R : nv - R * j);
             if (k > 0)
-                a += {{ p }}_slot(ws, s, flags, fw, k, row0 + r0 + R * j, n + a, j, acc);
+                a += {{ p }}_slot(ws, s, flags, fw, k, row0 + r0 + R * j, n + a, j, as);
         }
         add = a;
     }
@@ -1367,11 +1371,17 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", bflo
 
 // The next C (or M) object: slot e's first C_LEN staged values (after the last slot: the staging moves down), or
 // the residual's next object of a slot
-__attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__restrict c{{ ", const bfloat16 *__restrict acc" if moe else "" }}{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
+__attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__restrict c{{ ", const int32_t *__restrict aw" if moe else "" }}{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+{% if moe %}
+    // (acc: its counter over slot 4 + object, the 4 objects of 32 rows of a slot's 128 rows j in a row: a combine's object,
+    // half j & 1 of column j / 2's slice)
+    const int s = st[{{ S_ESLOT }}], S = st[{{ S_NS }}] << (st[{{ S_ESRC }}] == 4 ? 2 : 0);
+{% else %}
     const int s = st[{{ S_ESLOT }}], S = st[{{ S_NS }}];
+{% endif %}
     const int last = s + 1 == S;
     st[{{ S_ESLOT }}] = last ? 0 : s + 1;
 {% if post %}
@@ -1404,9 +1414,12 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
         const int j = st[{{ S_EJ }}];
         st[{{ S_EJ }}] = last ? j + 1 : j;
 {% if moe %}
-        if (st[{{ S_ESRC }}] >= 4) {  // 4: acc ([slot][H] bf16), 5: the routing's objects (S_NS 1)
-            aie::store_v(c, aie::load_v<64>(st[{{ S_ESRC }}] == 4 ? acc + {{ H }} * s + {{ C_LEN }} * j
-                                                                   : WS(bfloat16, {{ w_.rbuf }}) + {{ C_LEN }} * j));
+        if (st[{{ S_ESRC }}] == 4) {  // 4: acc (fp32 [slot][H])
+            aie::store_v((float *)c, aie::load_v<32>((const float *)((const uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * (s >> 2) + 128 * j + 32 * (s & 3)));
+            return;
+        }
+        if (st[{{ S_ESRC }}] == 5) {  // 5: the routing's objects (S_NS 1)
+            aie::store_v(c, aie::load_v<64>(WS(bfloat16, {{ w_.rbuf }}) + {{ C_LEN }} * j));
             return;
         }
 {% endif %}
@@ -1536,19 +1549,19 @@ __attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws)
     }
 }
 
-// The helper, a combine's object: slot d's partials of the columns ([column][H8] bf16 at x) into the main core's
-// residual slice of the slot (fp32)
-__attribute__((noinline)) void {{ p }}_hacc(const bfloat16 *__restrict x, int32_t *__restrict ws, int d)
+// The helper, a combine's object d: half d & 1 of slot d / 2's partials of the columns ([column][H8 / 2] fp32 at x, on
+// the slot's grid: ``_gacc``) summed (exact), then into the main core's residual slice of the slot (fp32)
+__attribute__((noinline)) void {{ p }}_hacc(const float *__restrict x, int32_t *__restrict ws, int d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    float *__restrict r = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * d;
+    float *__restrict r = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * (d >> 1) + {{ H8 // 2 }} * (d & 1);
     AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < {{ H8 }}; i += 32) {
-        aie::accum<accfloat, 32> a(aie::load_v<32>(r + i));
+    for (int i = 0; i < {{ H8 // 2 }}; i += 32) {
+        aie::accum<accfloat, 32> a(aie::load_v<32>(x + i));
         AIE_LOOP_NO_UNROLL
-        for (int c = 0; c < {{ COLS }}; c++)
-            a = aie::add(a, aie::accum<accfloat, 32>(aie::load_v<32>(x + {{ H8 }} * c + i)).template to_vector<float>());
-        aie::store_v(r + i, a.template to_vector<float>());
+        for (int c = 1; c < {{ COLS }}; c++)
+            a = aie::add(a, aie::load_v<32>(x + {{ H8 // 2 }} * c + i));
+        aie::store_v(r + i, aie::add(aie::load_v<32>(r + i), a.template to_vector<float>()));
     }
 }
 {% endif %}
@@ -1714,7 +1727,7 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         return;
     }
     if (kind == {{ K_ACC }}) {
-        {{ p }}_hacc((const bfloat16 *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]);
+        {{ p }}_hacc((const float *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]);
         return;
     }
 {% endif %}

@@ -271,7 +271,7 @@ class QwenOverlay(ModelOverlay):
             for c in range(COLS):  # (the expert object's payload: the gate / up and down templates)
                 out.append((self.cp[L] + c * (CP_BYTES + XB) + CP_BYTES, tpl))
         m = np.zeros(META, np.int32)
-        m[M_FLAGS], m[M_NS], m[M_NX] = F_MAIN | F_COMB, S, S
+        m[M_FLAGS], m[M_NS], m[M_NX] = F_MAIN | F_COMB, S, 2 * S
         out += [(self.part + c * self.part_col, m.view(np.uint8)) for c in range(COLS)]
         return out
 
@@ -341,10 +341,11 @@ class QwenOverlay(ModelOverlay):
 
     @property
     def part_col(self) -> int:
-        """PART's bytes per column: the combine's metadata object, then per slot the 8 columns' partials of the
-        column's slice ([slot][column][hidden / 8] bf16: one object's payload per slot)."""
-        assert self.H * 2 == XPAY, "a slot's partials of a slice in one X object's payload"
-        return XB + self.SLOTS * XPAY
+        """PART's bytes per column: the combine's metadata object, then per slot and half of the column's slice the 8
+        columns' partials of it ([slot][half][column][hidden / 16] fp32 on the slot's grid: one object's payload each,
+        ``decode.design``'s "MoE")."""
+        assert self.H * 2 == XPAY, "a half of a slot's slice of the 8 columns in one X object's payload"
+        return XB + 2 * self.SLOTS * XPAY
 
     def ring(self, L: int, h: int) -> int:
         """Byte offset in KV of KV head h's ring of attention layer L: 2 slots of T bytes, slot r & 1 the V values of
@@ -781,13 +782,13 @@ class QwenOverlay(ModelOverlay):
         if run:
             self._weight_run(seq, run)
         pc = self.part_col
-        for c in range(COLS):  # (acc's objects [64 rows j][slot] -> PART[j / 4][slot][c][j % 4 ..])
-            seq.drain("C", c, dev.address("ACT", self.part + XB + 2 * h8 * c), 4 * S * 128, (32, S, XPAY // 4, 32),
+        for c in range(COLS):  # (acc's objects, per 128 rows k, slot, 4 of 32 rows -> PART[k / 2][slot][k % 2][c] ..)
+            seq.drain("C", c, dev.address("ACT", self.part + XB + 2 * h8 * c), 4 * S * h8, (h8 // 2, S, XPAY // 2, XPAY // 4),
                       COLS, (pc // 4, COLS))
         seq.sync()
         for c in range(COLS):  # (the partials are in DDR: the experts' tasks are complete)
             seq.device_done("A", c)
-            seq.fill("X", c, dev.address("ACT", self.part + c * pc), (1 + S) * XB, DIMS_OBJ)
+            seq.fill("X", c, dev.address("ACT", self.part + c * pc), (1 + 2 * S) * XB, DIMS_OBJ)
         for c in range(COLS):
             self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S)
 

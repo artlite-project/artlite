@@ -261,8 +261,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             r_f.release(1)
                         a_f.release(AT.HOLD)
 
-            aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AWs["size"] // 4, np.int32),
-                          tile=Tile(c, self.ATTN_ROW)) for c in range(COLS)]
+            aws = [self._aws_of(c) for c in range(COLS)]
             tabs = {c: [Buffer(gt_ty, name=f"{P}_agt{c}", tile=Tile(c, self.ATTN_ROW), initial_value=gt)] * 2 if attn.gate_tab else []
                     for c in range(COLS)}
             n = attn.nph
@@ -280,8 +279,36 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return workers, d_fifos
 
     def get_mlir_artifact(self) -> Module:
-        self._gws, self._tabs = {}, []  # (made per program: ``_gws_of``, ``_gdn8_workers``)
+        self._gws, self._aws, self._tabs = {}, {}, []  # (made per program: ``_gws_of``, ``_aws_of``, ``_gdn8_workers``)
         return super().get_mlir_artifact()
+
+    def _aws_of(self, c: int) -> Buffer:
+        """Column c's attention workspace (an MoE design's main core holds its acc there: ``_acc``)."""
+        if c not in self._aws:
+            n = self.attn.workspace()["size"] // 4
+            self._aws[c] = Buffer(np.ndarray[(n,), np.dtype[np.int32]], name=f"{self.PREFIX}_aws{c}",
+                                  initial_value=np.zeros(n, np.int32), tile=Tile(c, self.ATTN_ROW))
+        return self._aws[c]
+
+    @property
+    def ACC_AT(self) -> int:
+        """(moe) acc in the attention workspace past its state words: its regions are scratch that the attention core
+        writes before it reads them in each sub-step, idle in the MoE phases (the attention core only skips their objects,
+        on its state words); without an attention core, a buffer of its own on its tile."""
+        if not self.moe or self.attn is None:
+            return 0
+        aw = self.attn.workspace()
+        assert aw["y"] == aw["st"] + 192 and aw["y"] + (OD.SLOTS * self.hidden + 32) * 4 <= aw["size"], aw
+        return aw["y"]
+
+    def _acc_type(self) -> type:
+        n = self.attn.workspace()["size"] // 4 if self.attn is not None else OD.SLOTS * self.hidden + 32
+        return np.ndarray[(n,), np.dtype[np.int32]]
+
+    def _acc(self, c: int) -> Buffer:
+        if self.attn is not None:
+            return self._aws_of(c)
+        return Buffer(self._acc_type(), name=f"{self.PREFIX}_acc{c}", tile=Tile(c, self.ATTN_ROW))
 
     def _pins(self) -> dict[str, int]:
         return {f"{self.PREFIX}_gws{c}": self.GWS8_AT for c in self._gws}

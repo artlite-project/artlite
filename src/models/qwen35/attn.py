@@ -77,8 +77,9 @@ a core's 16) runs on the chain's halves (``SPLIT_HALF``): both cores of a half t
 the first half of the groups, the second the rest (and the tails), and merge as a chain of 2. Both halves read the same
 objects, once: a chain's first two columns read the cache on fills whose packet id also reaches the memtiles of the
 two columns east of them (``decode.design``'s "Shared A objects"), which take them as if their own shims had read them. Two
-streams per KV head read ~46 GB/s, one for a whole chain ~28 (a chain of 4 in the one-pass form: S 1 +30% at 32K on the 1B):
-sub-steps of fewer slots stay on the whole chain, a stream per column, ~56.
+streams per KV head read ~46 GB/s, one for a whole chain ~28 (a chain of 4 in the one-pass form: S 1 +30% at 32K on the 1B),
+a stream per column ~56; a design with halves runs every sub-step from 4 groups on on them, whatever its slots: a slot's
+partials then merge in the same order in a step of any slots.
 
 L1: a sub-step's rows need per set ~5.3 KB (y and l fp32, scores, references, P panels) plus its Q panels (2.3 KB) and the
 rows' gates (0.5 KB a row); the sigmoid's table takes 2.1 KB (``gate_tab``). Regions the core reads rarely (the gates, the
@@ -1696,8 +1697,9 @@ class AttnShape:
         return 2 if self.one or n > 1 else 1
 
     def split_of(self, g: int, n: int) -> int:
-        """A sub-step's M_SPLIT: n slots in group g."""
-        return 0 if not self.splits(g) else SPLIT_HALF if n > self.sub1 else SPLIT_CHAIN
+        """A sub-step's M_SPLIT: n slots in group g (``halves``: every sub-step on the chain's halves, whatever its slots,
+        so that a slot's partials merge in the same order in a step of any slots)."""
+        return 0 if not self.splits(g) else SPLIT_HALF if self.halves or n > self.sub1 else SPLIT_CHAIN
 
     def bounds(self, g: int, split: int = SPLIT_CHAIN) -> list[int]:
         """A split sub-step in group g: the groups of the cores, core k's from bounds[k] to bounds[k + 1] (SPLIT_HALF: of

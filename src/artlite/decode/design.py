@@ -56,9 +56,15 @@ stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side c
   main core's sub-phases (S_NSUB; set up by the helper from the plan's templates, ``hsub``): per item and half, gate /
   up on the input phase's panels and 1 / rms (F_HOUT: its h as [h | h] strips in the hold buffer), down on two strips
   of the hold buffer in the side chunk (G 4 row groups: a tile's 4 blocks of R rows are rows of their own; F_WS: the
-  item's weights; F_ACCUM: into acc, bf16 [slot][hidden] in the helper's memory; F_ACC0 stores; F_EMITA: acc out);
-- the combine (F_COMB): its input objects are the 8 columns' partials of a slot's residual slice, which the helper adds
-  into the residual (K_ACC); the residual then goes out.
+  item's weights; F_ACCUM: into acc, fp32 [slot][hidden] in a model core's scratch, ``_acc``; F_ACC0 stores; F_EMITA:
+  acc out, per 128 rows and slot);
+- the combine (F_COMB): its input objects are, per slot and half of the column's residual slice, the 8 columns'
+  partials of it, which the helper sums and adds into the residual (K_ACC); the residual then goes out.
+
+  A slot's partials are exact sums: every expert half's rows go onto the slot's grid (2^-14 of its rms' binade, from the
+  input phase's 1 / rms, the same on every column) before they add into acc, and the combine sums the columns' (fp32)
+  before it adds them into the residual, so that a slot's FFN output does not depend on how the union of the step's
+  experts is dealt to the columns (``moe.route``), nor on the other slots of the step.
 
 Designs of 8 slots (``slots=8``: a dense model whose formats run at 8 slots, ``gemv``): x per k block one panel of the
 8 slots' single bfp16 rows (``gemv``'s "Designs of 8 slots"; the sum panels a hi and a lo panel each), an input object
@@ -286,6 +292,7 @@ class DecodeOverlayOperator(ArtcOperator):
     # help_flag: an object of another core whose work the helper shares: the main core's begin commands it (K_HELP:
     # the count at metadata word help_word), then the helper runs ``_help``'s kernel that many times
     help_flag, help_word = 0, 0
+    ACC_AT = 0  # (moe) acc's byte offset in ``_acc``'s buffer
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -481,6 +488,7 @@ class DecodeOverlayOperator(ArtcOperator):
               "PANEL": gemv.PANEL,
               "Y_FLOATS": gemv.Y_FLOATS}
         return src + _SRC.render(p=p, mp=f"{p}m", w_=Attr(self.workspace()), H=self.hidden, H8=self.h8, SHM=self.SHM,
+                                 ACC_AT=self.ACC_AT,
                                  WIN=WINS.get(self.win, 0),
                                  RES_PITCH=self.res_pitch, eps=repr(self.eps), ple_eps=repr(self.eps * self.hidden),
                                  META=META, C_LEN=C_LEN, NBLK=NBLK,
@@ -602,6 +610,15 @@ class DecodeOverlayOperator(ArtcOperator):
         streams ``s`` (their locks: ``_locks``)."""
         return [], []
 
+    def _acc_type(self) -> type:
+        """(moe) The type of ``_acc``'s buffers."""
+        raise NotImplementedError
+
+    def _acc(self, c: int) -> Buffer:
+        """(moe) Column c's memory of acc (fp32 [slot][hidden] at ``ACC_AT``, a window of 32 past its end): scratch of a
+        model core that the main core reaches (north of it) and that the MoE phases leave idle."""
+        raise NotImplementedError
+
     def _pins(self) -> dict[str, int]:
         """L1 addresses of the model cores' buffers (their symbol names)."""
         return {}
@@ -650,10 +667,10 @@ class DecodeOverlayOperator(ArtcOperator):
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8,
                                                     *[hst_ty] * bool(self.help_flag)])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
-        if self.moe:  # (acc: the experts' partials of the column, in the helper's memory)
-            acc_ty = np.ndarray[(SLOTS * self.hidden,), bf]
-            k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty, acc_ty])
-            k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, acc_ty])
+        if self.moe:  # (acc: the experts' partials of the column, fp32 on the slots' grids, in ``_acc``'s buffer)
+            aw_ty = self._acc_type()
+            k_collect = Kernel(f"{p}_collect", "kernel.o", [r_ty, ws_ty, aw_ty])
+            k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, aw_ty])
             k_sub = Kernel(f"{p}_sub", "kernel.o", [ws_ty, cmd_ty])
             k_lstrip = Kernel(f"{p}_lstrip", "kernel.o", [ws_ty, cmd_ty])
 
@@ -695,7 +712,7 @@ class DecodeOverlayOperator(ArtcOperator):
                 acc, *rest = rest  # (8 slots: hres)
             xgate = rest.pop(0) if self.gate else None
             begin, nbegin, strip_n, strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
-            ea = (acc,) if self.moe or s8 else ()  # (collect's and emit's last argument: moe's acc, 8 slots' hres)
+            ea = (acc,) if self.moe or s8 else ()  # (collect's and emit's last argument: moe's acc buffer, 8 slots' hres)
 
             def command(call: object) -> None:  # a strip of the input object: the helper's command
                 c = cmd_f.acquire(1)
@@ -862,7 +879,7 @@ class DecodeOverlayOperator(ArtcOperator):
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}", **({"tile": Tile(c, mr)} if self.LENDS_WS else {}))
             m_ws.append(ws)
-            moe_args = [k_sub, k_lstrip, Buffer(acc_ty, name=f"{P}_acc{c}", tile=Tile(c, hr))] if self.moe else []
+            moe_args = [k_sub, k_lstrip, self._acc(c)] if self.moe else []
             hres = [Buffer(hres_ty, name=f"{P}_hres{c}", tile=Tile(c, hr))] if s8 else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
             xps.append(xp)
