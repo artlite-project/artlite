@@ -16,6 +16,14 @@ Prompts (``tts_prompt``): the language model file's ``tts`` chat template, ``Per
 voice.`` with the text in the user turn and the assistant turn opened by ``<|audio_start|>``; the languages by code
 (``TTS_LANGUAGES``; any other name is used as it is), the voices female (the default) and male.
 
+Voice replies (``interleave``, llama.cpp's ``lfm3a_gen_audio_pipeline`` and transformers' ``generate``): the system
+prompt ``INTERLEAVED`` and the assistant turn opened by ``<|mixed_start|>``; blocks of ``TEXT_BLOCK`` greedy text tokens
+and ``AUDIO_BLOCK`` frames in turn; ``<|text_end|>`` in a text slot ends the text (frames follow until the end of audio,
+then text, as after a reply that switched to speech by itself), ``<|im_end|>`` in any text slot the turn. A text slot's
+token comes from the logits of the step before it, so the audio step before a text slot runs the LM head; the others do
+not. A reply's sequence (its tokens, one ``<|audio_out|>`` a frame, the frames' feedback rows: ``Reply``) is how the
+conversation's next turn sees it.
+
 The frames' loop (``speak``): a frame's passes on the vision overlay (``depth.Depth``), its feedback row through a step
 of the language model without the LM head (``models.lfm.lfm.NpuLfm.audio_step``: the next hidden state), the frames
 through the codec every ``CHUNK`` frames (``codec.Codec``: whole 8-key blocks of its window attention) and the ISTFT on
@@ -35,7 +43,6 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import GenConfig
 
 from ..common import render_template
-from .codec import Istft
 
 N_CB, N_CODES = 12, 2017  # (codebooks a frame, codes a codebook: 2016 FSQ codes and the end of audio)
 EOA = N_CODES - 1
@@ -43,12 +50,15 @@ SCHEDULE = (4, 4, 4)  # (codebooks revealed per depthformer pass)
 TEXT_BLOCK, AUDIO_BLOCK = 6, 12  # (an interleaved reply's blocks: text tokens, then frames)
 SR = 24000  # (the codec's sample rate)
 CHUNK = 4  # (frames a codec call: 24 positions, whole 8-key blocks; 320 ms of speech)
+N_FFT, HOP, NBINS = 1280, 320, 641  # (the ISTFT: a frame's 6 positions are hops)
+TRIM = (N_FFT - HOP) // 2
 FRAME_SAMPLES = 1920  # (a frame's samples: 80 ms)
 VOICES = ("female", "male")
 TTS_LANGUAGES = ("ar", "da", "de", "el", "en", "en-us", "en-gb", "es", "fi", "fr", "he", "it", "ja", "ko", "nl", "pl",
                  "pt", "sv", "tr", "zh")
-AUDIO_START, MIXED_START, TEXT_END, IM_END, AUDIO_OUT = (
-    "<|audio_start|>", "<|mixed_start|>", "<|text_end|>", "<|im_end|>", "<|audio_out|>")
+AUDIO_START, MIXED_START, TEXT_END, IM_END, AUDIO_OUT, AUDIO_IN = (
+    "<|audio_start|>", "<|mixed_start|>", "<|text_end|>", "<|im_end|>", "<|audio_out|>", "<|audio|>")
+INTERLEAVED = "Respond with interleaved text and audio."  # (a voice reply's system prompt)
 
 
 def tts_prompt(gguf: GGUFFile, text: str, *, language: str = "en", voice: str = "female") -> str:
@@ -108,6 +118,48 @@ class CodeSampler:
 def feedback(gguf: GGUFFile, codes: np.ndarray) -> np.ndarray:
     """A frame's feedback row (hidden,) float32: the sum of its codes' ``a.gen.code.out_embd`` rows."""
     return gguf.rows("a.gen.code.out_embd.weight", np.arange(N_CB) * N_CODES + np.asarray(codes)).sum(0)
+
+
+class Istft:
+    """The streaming ISTFT (llama.cpp's ``mtmd_audio_streaming_istft``, transformers' ``LiquidCodecISTFT`` with its
+    streaming cache): ``push(frames)`` (STFT frames (n, 1282) [log magnitude | phase]) -> the samples they complete
+    (24 kHz float32): exp(m) e^(i phi) -> irfft (1280) times a periodic Hann window, overlap-add at hop 320 divided by
+    the window-square envelope, the stream's first 480 dropped; ``flush()`` the rest but its last 480."""
+
+    def __init__(self):
+        self.win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
+        self.w2 = self.win ** 2
+        self.reset()
+
+    def reset(self) -> None:
+        self.buf = np.zeros(N_FFT)
+        self.env = np.zeros(N_FFT)
+        self.drop = TRIM
+
+    def push(self, frames: np.ndarray) -> np.ndarray:
+        f = np.asarray(frames, np.float64)
+        if not len(f):
+            return np.zeros(0, np.float32)
+        seg = np.fft.irfft(np.exp(f[:, :NBINS] + 1j * f[:, NBINS:]), N_FFT, axis=1) * self.win
+        n = len(f)
+        acc = np.zeros(N_FFT + HOP * n)
+        env = np.zeros(N_FFT + HOP * n)
+        acc[:N_FFT], env[:N_FFT] = self.buf, self.env
+        for k in range(n):
+            acc[HOP * k:HOP * k + N_FFT] += seg[k]
+            env[HOP * k:HOP * k + N_FFT] += self.w2
+        y = acc[:HOP * n] / np.where(env[:HOP * n] > 1e-8, env[:HOP * n], 1)
+        self.buf, self.env = acc[HOP * n:], env[HOP * n:]
+        k = min(self.drop, y.size)
+        self.drop -= k
+        return y[k:].astype(np.float32)
+
+    def flush(self) -> np.ndarray:
+        n = N_FFT - HOP
+        e = self.env[:n]
+        y = self.buf[:n] / np.where(e > 1e-8, e, 1)
+        self.reset()
+        return y[:n - TRIM].astype(np.float32)
 
 
 def sample_frame(depth: Any, h: np.ndarray, sampler: CodeSampler) -> np.ndarray:
@@ -173,7 +225,7 @@ def speak(model: Any, audio: Any, h: np.ndarray, sampler: CodeSampler, *, max_fr
             break
         t0 = time.perf_counter()
         model.stale()  # (the vision overlay ran)
-        h = model.audio_step(feedback(audio.gguf, codes))
+        h = model.audio_step(feedback(audio.gguf, codes))[0]
         st.t_steps += time.perf_counter() - t0
     if pend:
         yield out()
@@ -195,3 +247,109 @@ def wav_header(n: int | None, sr: int = SR) -> bytes:
 def wav(samples: np.ndarray, sr: int = SR) -> bytes:
     """A 16-bit mono WAV file of the samples."""
     return wav_header(len(samples), sr) + pcm16(samples)
+
+
+@dataclass
+class Reply:
+    """A voice reply's sequence as it grows (``interleave``): per position its token id (``ids``; a frame's
+    ``<|audio_out|>``) and, for frames, the feedback row the model ran there (``rows``, by position); ``text`` the
+    text's token ids, ``codes`` the frames' codes."""
+
+    ids: list[int] = field(default_factory=list)
+    rows: dict[int, np.ndarray] = field(default_factory=dict)
+    text: list[int] = field(default_factory=list)
+    codes: list[np.ndarray] = field(default_factory=list)
+
+
+def interleave(model: Any, audio: Any, tokens: dict[str, int], logits: np.ndarray | None, sampler: CodeSampler, *,
+               max_tokens: int, max_frames: int, mode: str = "mixed", h: np.ndarray | None = None,
+               speech: bool = True, reply: Reply | None = None, stats: SpeechStats | None = None
+               ) -> Iterator[tuple[str, Any]]:
+    """A voice reply after a prompt (module docstring): ("text", token id) and ("audio", samples) as they come, until
+    ``<|im_end|>``, ``max_tokens`` text tokens or ``max_frames`` frames. ``mode``: how the prompt opened the reply -
+    "mixed" (``<|mixed_start|>``), "audio" (``<|audio_start|>``: speech, then text), "text" (a text reply, which may
+    switch to speech by itself unless ``speech`` is false); ``logits``: the prompt's last token's (a text slot first),
+    ``h``: its hidden state ("audio": a frame first); ``tokens``: the special tokens' ids by name (``speech_tokens``);
+    ``reply``: filled with the reply's sequence. A speech segment's samples stream every ``CHUNK`` frames across the
+    text blocks, its tail at its end of audio."""
+    st = stats if stats is not None else SpeechStats()
+    rp = reply if reply is not None else Reply()
+    t_end, im_end, a_out = tokens[TEXT_END], tokens[IM_END], tokens[AUDIO_OUT]
+    speaking, text_done, left = False, False, TEXT_BLOCK
+    banned = [a_out, tokens[AUDIO_IN]] + ([] if speech else [tokens[AUDIO_START], tokens[MIXED_START]])
+    ist, pend, seg = Istft(), [], False  # (seg: a speech segment open)
+    audio.codec.reset()
+
+    def out() -> np.ndarray:
+        t0 = time.perf_counter()
+        y = ist.push(audio.codec.frames(np.stack(pend)))
+        pend.clear()
+        st.t_codec += time.perf_counter() - t0
+        return y
+
+    def tail() -> np.ndarray:  # (a segment's end: its last frames, the ISTFT's held samples; the codec anew)
+        y = np.concatenate([out() if pend else np.zeros(0, np.float32), ist.flush()])
+        audio.codec.reset()
+        return y
+
+    ntext = 0
+    while ntext < max_tokens and st.frames < max_frames and model.position < model.capacity:
+        inter = mode == "mixed"
+        if mode == "text" or (inter and not speaking):  # (a text slot)
+            row = np.array(logits, np.float32)
+            row[banned] = -np.inf
+            tok = int(np.argmax(row))
+            if tok == im_end or (not inter and tok == t_end):
+                break
+            if not inter and tok == tokens[AUDIO_START]:
+                mode = "audio"
+            elif not inter and tok == tokens[MIXED_START]:
+                mode, left, speaking, text_done = "mixed", TEXT_BLOCK, False, False
+            elif inter and tok == t_end:
+                text_done, speaking = True, True
+            else:
+                yield "text", tok
+                rp.text.append(tok)
+                ntext += 1
+            rp.ids.append(tok)
+            t0 = time.perf_counter()
+            logits = model.cap(model.steps([tok])[0])
+            h = model.hidden_after()
+            st.t_steps += time.perf_counter() - t0
+        else:  # (a frame)
+            t0 = time.perf_counter()
+            codes = sample_frame(audio.depth, h, sampler)
+            st.t_depth += time.perf_counter() - t0
+            if codes[0] == EOA:
+                if seg:
+                    yield "audio", tail()
+                seg, mode = False, "text"
+            else:
+                sampler.accept(codes)
+                st.codes.append(codes)
+                rp.codes.append(codes)
+                st.frames += 1
+                pend.append(codes)
+                seg = True
+                if len(pend) == CHUNK:
+                    yield "audio", out()
+            fb = feedback(audio.gguf, codes)
+            t0 = time.perf_counter()
+            model.stale()  # (the vision overlay ran)
+            rp.rows[len(rp.ids)] = fb
+            rp.ids.append(a_out)
+            h, lg = model.audio_step(fb, logits=mode == "text" or (inter and not text_done and left == 1))
+            logits = logits if lg is None else lg
+            st.t_steps += time.perf_counter() - t0
+        if inter and not text_done:  # (the slot counts down its block; a switching token does not)
+            left -= 1
+            if left == 0:
+                speaking = not speaking
+                left = AUDIO_BLOCK if speaking else TEXT_BLOCK
+    if seg:
+        yield "audio", tail()
+
+
+def speech_tokens(vocab: list[str]) -> dict[str, int]:
+    """The special tokens of speech output by name (a vocabulary's ids)."""
+    return {t: vocab.index(t) for t in (AUDIO_START, MIXED_START, TEXT_END, IM_END, AUDIO_OUT, AUDIO_IN)}

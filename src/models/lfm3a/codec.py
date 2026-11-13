@@ -1,5 +1,5 @@
 """LFM3-Audio's codec decoder (the mmproj's ``a.gen.wav.*``, projector ``lfm3a_gen``) on the vision overlay
-(``artlite.vision``; F3's speech encoder's hardware context), and the ISTFT on the host.
+(``artlite.vision``; F3's speech encoder's hardware context); the ISTFT of its outputs on the host: ``speech.Istft``.
 
 The network (llama.cpp's ``clip_graph_lfm3a_gen::build_gen_wav``, transformers' ``LiquidCodecModel.decode``): per frame
 the FSQ latents of its 12 codes (4 a code: ((idx // basis) % level - level // 2) / (level // 2), levels 8, 7, 6, 6) ->
@@ -8,7 +8,7 @@ samples at 24 kHz each); 8 LFM3 layers of 512 with sandwich norms [RMSNorm -> op
 SwiGLU 512 -> 2304 -> 512 -> RMSNorm, + x], the operators short convs (``conv_pw1`` -> [B; C; x], y = C conv7(B x), causal
 over 7 positions, ``conv_pw2``) or attention (8 query heads, 2 KV heads of 64, q / k norms, NEOX RoPE of theta 1e6 at
 the stream's position, causal over the last 30 positions, each head's output times sigmoid(``attn_gate`` n)); the output
-norm and ``tfm.out_proj`` 512 -> 1282 + b: per position [log magnitude 641 | phase 641] (``Istft``).
+norm and ``tfm.out_proj`` 512 -> 1282 + b: per position [log magnitude 641 | phase 641] (``speech.Istft``).
 
 Widths: the residual's 512 channels in C = 640, the feed-forward's 2304 in 2560 (two GEGLU GEMMs of 1280), a head's 64
 dims in 160 (rope2's first pass: pairs (i, 32 + i) at (i, 40 + i), its second pass zero; V's 64 then 96 zeros; O's
@@ -57,8 +57,7 @@ EPS, THETA = 1e-5, 1e6
 WINDOW, NTAP = 30, 7
 QSCALE = 1.4426950408889634 / 8.0  # (log2 e / sqrt(64): the softmax in log2 units)
 LEVELS = (8, 7, 6, 6)
-FRAME_STACK, N_FFT, HOP = 6, 1280, 320
-TRIM = (N_FFT - HOP) // 2
+FRAME_STACK = 6
 TM, ROWS_BAND = 16, 128
 NLAT, KLAT = 96, 128  # (the latents' panels: hi + lo of 48, padded to two k-tiles)
 G_ROW = C * 2
@@ -461,45 +460,3 @@ class Codec:
                 self.lat[:] = 0
                 self._carry, self._fresh = True, True
         return np.concatenate(out) if out else np.zeros((0, NOUT), np.float32)
-
-
-class Istft:
-    """The streaming ISTFT (llama.cpp's ``mtmd_audio_streaming_istft``, transformers' ``LiquidCodecISTFT`` with its
-    streaming cache): ``push(frames)`` (STFT frames (n, 1282) [log magnitude | phase]) -> the samples they complete
-    (24 kHz float32): exp(m) e^(i phi) -> irfft (1280) times a periodic Hann window, overlap-add at hop 320 divided by
-    the window-square envelope, the stream's first 480 dropped; ``flush()`` the rest but its last 480."""
-
-    def __init__(self):
-        self.win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
-        self.w2 = self.win ** 2
-        self.reset()
-
-    def reset(self) -> None:
-        self.buf = np.zeros(N_FFT)
-        self.env = np.zeros(N_FFT)
-        self.drop = TRIM
-
-    def push(self, frames: np.ndarray) -> np.ndarray:
-        f = np.asarray(frames, np.float64)
-        if not len(f):
-            return np.zeros(0, np.float32)
-        seg = np.fft.irfft(np.exp(f[:, :NBINS] + 1j * f[:, NBINS:]), N_FFT, axis=1) * self.win
-        n = len(f)
-        acc = np.zeros(N_FFT + HOP * n)
-        env = np.zeros(N_FFT + HOP * n)
-        acc[:N_FFT], env[:N_FFT] = self.buf, self.env
-        for k in range(n):
-            acc[HOP * k:HOP * k + N_FFT] += seg[k]
-            env[HOP * k:HOP * k + N_FFT] += self.w2
-        y = acc[:HOP * n] / np.where(env[:HOP * n] > 1e-8, env[:HOP * n], 1)
-        self.buf, self.env = acc[HOP * n:], env[HOP * n:]
-        k = min(self.drop, y.size)
-        self.drop -= k
-        return y[k:].astype(np.float32)
-
-    def flush(self) -> np.ndarray:
-        n = N_FFT - HOP
-        e = self.env[:n]
-        y = self.buf[:n] / np.where(e > 1e-8, e, 1)
-        self.reset()
-        return y[:n - TRIM].astype(np.float32)

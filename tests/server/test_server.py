@@ -1543,3 +1543,52 @@ def test_chat_audio() -> None:
         for audio, word in (({"voice": "alloy"}, "female, male"), ({"format": "mp3"}, "wav or pcm16")):
             r = client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"], "audio": audio})
             assert r.status_code == 400 and word in r.json()["error"]["message"]
+
+
+def test_realtime_conversation() -> None:
+    """/v1/realtime without the transcription intent on a model that speaks: a conversation (llama-server's events) -
+    a text turn and an audio turn, each response's text and audio deltas between its start and done events, the
+    output_modalities as the reply's mode, the instructions as the system prompt, the earlier reply in the next turn as
+    its text."""
+    model = FakeSpeaker()
+    npu = FakeNpu(model)
+    engine = Engine(lambda: (model, npu), warmup=False)
+    ENGINES.append(engine)
+    engine.start()
+    want = (np.concatenate([np.full(480, i / 10, np.float32) for i in range(2)]) * 32767).round().astype("<i2")
+    pcm = base64.b64encode((np.full(1600, 0.25) * 32768).astype("<i2").tobytes()).decode()
+
+    def response(ws: object) -> list[dict]:
+        evs = []
+        while not evs or evs[-1]["type"] != "response.done":
+            evs.append(ws.receive_json())
+        return evs
+
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        with client.websocket_connect("/v1/realtime") as ws:
+            ev = ws.receive_json()
+            assert ev["type"] == "session.created" and ev["session"]["audio"]["output"]["format"]["rate"] == 24000
+            ws.send_json({"type": "session.update", "session": {"instructions": "Be brief.",
+                                                                 "output_modalities": ["text", "audio"]}})
+            assert ws.receive_json()["type"] == "session.updated"
+            ws.send_json({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+                                                                        "content": [{"type": "input_text", "text": "hi"}]}})
+            assert [ws.receive_json()["type"] for _ in range(2)] == ["conversation.item.added", "conversation.item.done"]
+            ws.send_json({"type": "response.create"})
+            evs = response(ws)
+            assert evs[0]["type"] == "response.created" and evs[-1]["response"]["status"] == "completed"
+            assert "".join(e["delta"] for e in evs if e["type"] == "response.output_text.delta") == " hello there"
+            got = np.concatenate([np.frombuffer(base64.b64decode(e["delta"]), "<i2") for e in evs
+                                  if e["type"] == "response.output_audio.delta"])
+            assert np.array_equal(got, want) and model.spoken[-1]["mode"] == "mixed"
+            assert model.spoken[-1]["messages"] == [{"role": "system", "content": "Be brief."},
+                                                    {"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm})
+            ws.send_json({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+            evs = response(ws)
+            assert evs[0]["type"] == "input_audio_buffer.committed" and model.spoken[-1]["mode"] == "audio"
+            seen = model.spoken[-1]["messages"]
+            assert seen[2] == {"role": "assistant", "content": " hello there"}
+            clip = seen[3]["content"][0]["audio"]
+            assert seen[3]["role"] == "user" and len(clip) == 1600 and abs(clip[0] - 0.25) < 1e-4

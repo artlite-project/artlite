@@ -115,6 +115,8 @@ def arg_parser() -> argparse.ArgumentParser:
     spk = p.add_argument_group("speech out (LFM3-Audio)")
     spk.add_argument("--tts", metavar="TEXT", help="speak the text (the model's tts template) into the WAV file -o")
     spk.add_argument("--voice", default="female", choices=("female", "male"), help="the voice (default: female)")
+    spk.add_argument("--speak", metavar="WAV", help="answer -p / -f / --audio in interleaved text and speech: the text "
+                     "to stdout as it comes, the speech into this WAV file")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
@@ -205,6 +207,46 @@ def speak(args: argparse.Namespace, options: dict[str, object]) -> None:
                      f"ms, the codec {1e3 * st.t_codec / max(st.frames, 1):.1f} ms\n")
 
 
+def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
+    """``--speak``: a spoken reply (``Lfm.voice_reply``) to -p / -f and the --audio files: its text to stdout as it comes,
+    its speech into the WAV file; the frames and times to stderr."""
+    from .lfm3a.speech import SR, SpeechStats, wav
+
+    t0 = time.perf_counter()
+    try:
+        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        if not hasattr(model, "voice_reply"):
+            raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
+        text = prompt_text(args) if args.prompt is not None or args.file else ""
+        content: list[dict[str, object]] = [{"type": "audio", "audio": a} for a in args.audio]
+        if text:
+            content.append({"type": "text", "text": text})
+        if not content:
+            raise ValueError("--speak answers -p / -f or --audio files")
+        msgs = ([{"role": "system", "content": args.system_prompt}] if args.system_prompt else []) + \
+            [{"role": "user", "content": content}]
+        npu = model.load(capacity=args.ctx_size or 8192, prefill=not args.no_prefill)
+    except (OSError, ValueError, NotImplementedError) as e:
+        sys.exit(f"artlite-cli: {e}")
+    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): a spoken reply; loaded in "
+                     f"{time.perf_counter() - t0:.1f} s: {npu.describe()}\n")
+    st, chunks, dec = SpeechStats(), [], StreamDecoder(model.tokenizer)
+    t0, first = time.perf_counter(), None
+    for kind, x in model.voice_reply(msgs, seed=args.seed, stats=st):
+        if kind == "text":
+            print(dec.feed(x), end="", flush=True)
+        elif len(x):
+            first = first if first is not None else time.perf_counter() - t0
+            chunks.append(x)
+    print(flush=True)
+    dt = time.perf_counter() - t0
+    y = np.concatenate(chunks) if chunks else np.zeros(0, np.float32)
+    with open(args.speak, "wb") as f:
+        f.write(wav(y, SR))
+    sys.stderr.write(f"{args.speak}: {st.frames} frames, {len(y) / SR:.2f} s of speech in {dt:.2f} s, first audio after "
+                     f"{first or 0:.2f} s\n")
+
+
 def live(args: argparse.Namespace, options: dict[str, object]) -> None:
     """``--live``: each --audio file as a stream (``models.lfm3a.live``), pushed 0.1 s at a time; the text to stdout,
     the chunks' times to stderr."""
@@ -273,6 +315,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.tts is not None:
         speak(args, options)
+        return
+    if args.speak:
+        voice_reply(args, options)
         return
     try:
         text = prompt_text(args)

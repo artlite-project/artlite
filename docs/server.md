@@ -35,7 +35,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/classify` | a classifier's label probabilities (vLLM's shape; with `--rerank`) |
 | `/v1/systemone` | a decision model's answers to questions about a state ([below](#decisions)) |
 | `/v1/audio/transcriptions`, `/audio/transcriptions` | a transcription of an audio file (LFM3-Audio: [below](#speech)) |
-| `/v1/realtime?intent=transcription` | live transcription over a websocket (OpenAI's realtime API, as llama-server: [below](#speech)) |
+| `/v1/realtime` | live transcription (`?intent=transcription`) and voice conversations over a websocket (OpenAI's realtime API, as llama-server: [below](#speech)) |
+| `/tts`, `/v1/audio/speech`, `/audio/speech` | text to speech (llama-server's and OpenAI's; LFM3-Audio: [below](#speech)) |
 
 Sampling has the repetition, presence and frequency penalties, the temperature, top-k, top-p and min-p. The other
 sampler fields (DRY, XTC, typical-p, mirostat, ...) are accepted and ignored, and logged when not neutral: the web UI's
@@ -49,8 +50,8 @@ drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
 [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images); the decision
 models d3 and d1: [below](#decisions)) come as a chat message's `image_url` parts of data URIs, as llama-server takes
-them; the web UI attaches them; audio (LFM3-Audio: [below](#speech)) as `input_audio` parts or `audio_url` data URIs.
-Not provided: infill, speech output (`/v1/audio/speech`, a chat's `modalities: ["audio"]`), `/metrics`, LoRA, model
+them; the web UI attaches them; audio (LFM3-Audio: [below](#speech)) as `input_audio` parts or `audio_url` data URIs,
+and a chat's `modalities: ["text", "audio"]` gets a spoken reply. Not provided: infill, `/metrics`, LoRA, model
 downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
@@ -262,8 +263,35 @@ router pairs it with the model of its directory) takes audio as llama-server doe
   The stream's chunks run between other requests (its text sequence comes back through the prompt cache). The text
   restarts on a new line after at most 30 s (as the model was trained).
 
+It speaks as llama-server does (its mmproj's speech generator: [the model](models/lfm3.md#speech-output)), each
+generation run on the NPU worker between requests, its samples (24 kHz) streamed every 320 ms of speech:
+
+- `/tts` (llama-server's): `input` (or `prompt`), `lang` (a code: `en`, `de`, `fr`, ...; or a name), `voice` (`female`,
+  the default, or `male`), `seed` (-1: random), `n_predict` (frames of 80 ms at most, default 512), `response_format`
+  (`wav`, 16-bit; `pcm`: float32 samples), `stream` (a WAV whose sizes are 0xFFFFFFFF, or the samples as they come). A
+  JSON body or a form. `speaker_ref` answers 400 (the model has no voice cloning); `top_k` and `top_p` are not used
+  (llama.cpp ignores them for LFM3-Audio too). `/props` lists the voices.
+- `/v1/audio/speech` (OpenAI's text to speech; Open WebUI's TTS uses it): `input`, `voice` (`female`, `male`),
+  `response_format` (`wav`, the default here: a whole file; `pcm`: 16-bit samples, streamed; mp3, opus, aac and flac
+  answer 400: no encoders), `speed` 1, `stream_format` (`sse`: `speech.audio.delta` events of base64 chunks, then
+  `speech.audio.done`). The `openai` package's `audio.speech.create` works with `response_format="wav"`.
+- `/v1/realtime` (without `intent=transcription`): a realtime conversation, as llama-server's. `session.update` sets
+  `instructions` (the system prompt), `output_modalities` (left out: the model answers in text or switches to speech by
+  itself; `["text"]`; `["audio"]`: speech, then text; `["text", "audio"]`: interleaved), `max_output_tokens` and the
+  voice (`audio.output.voice`); a user turn is audio (`input_audio_buffer.append`: PCM16 at 16 kHz, `.commit`) and / or
+  text (`conversation.item.create` with `input_text`); `response.create` (its `response.output_modalities` override
+  the session's) streams `response.output_text.delta` and `response.output_audio.delta` (base64 PCM16 at 24 kHz)
+  between the `response.*` start and done events; `response.cancel` stops it. Each reply stays in the conversation as
+  its text; a response runs the conversation so far as one prompt (a turn's audio encoded once).
+- Chat completions with `modalities: ["text", "audio"]` and `audio: {"voice": "female", "format": "wav"}` (OpenAI's
+  chat audio output): a spoken reply (the model's interleaved text and speech) as `message.audio` (`id`, `data`: base64
+  WAV, or 16-bit PCM for `format: "pcm16"`; `transcript`, `expires_at`), streamed as `delta.audio` (the transcript's
+  pieces, base64 16-bit chunks; `format: "pcm16"`). An assistant message with an earlier reply's `audio: {"id": ...}`
+  goes back to the model as that reply's transcript.
+
 ```bash
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+curl http://127.0.0.1:8080/tts -H "Content-Type: application/json" -d '{"input": "Hello there."}' -o hello.wav
 ```
 
 ## Requests

@@ -56,6 +56,9 @@ and generation speeds go to stderr.
 | `--audio FILE` | an audio file (repeatable; WAV, MP3, FLAC, Ogg Vorbis: [LFM3-Audio](models/lfm3.md#lfm3-audio-2b-speech)), where the prompt has `<__media__>`, else before it, after the images; without `-p` / `-f` a transcription (the model card's ASR system message) |
 | `--language LANG` | a transcription's language (a code, `en`, `de`, ..., or a name; default: the model tells) |
 | `--live [fast\|realtime]` | live transcription (English) of the `--audio` files: the text while the audio streams in, 0.1 s at a time, as fast as it goes or (`realtime`) as a microphone's; stderr reports the NPU's share of the audio's time and (`realtime`) each chunk's latency |
+| `--tts TEXT` | speak the text ([LFM3-Audio](models/lfm3.md#speech-output) with its mmproj; llama.cpp's `llama-tts`) into the WAV file `-o` (default `output.wav`; 24 kHz, 16-bit): the model's tts template in `--language` (a code, `en`, `de`, `fr`, ..., or a name; default `en`), `-s` its seed, `-n` its frames of 80 ms at most (default 512); stderr reports the frames and the time per frame |
+| `--voice female\|male` | the voice of `--tts` and `--speak` (default `female`) |
+| `--speak WAV` | answer `-p` / `-f` and the `--audio` files with interleaved text and speech (LFM3-Audio): the text to stdout as it comes, the speech into the WAV file |
 
 The model's sampling settings: Llama temperature 0.7, top-k 50; Gemma 4 temperature 1.0, top-k 64, top-p 0.95; Qwen3
 its model card's (thinking: temperature 0.6, top-k 20, top-p 0.95; else 0.7, 20, 0.8); Qwen3.5 and later and LFM3

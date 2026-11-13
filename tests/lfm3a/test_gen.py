@@ -76,7 +76,7 @@ def test_codec(gen: tuple[DP.Depth, CD.Codec]) -> None:
         codes = golden(i, 120).codes
         rf = ref.frames(codes)
         cd.reset()
-        ist = CD.Istft()
+        ist = S.Istft()
         fs, ys = [], []
         for k in range(0, len(codes), 4):
             f = cd.frames(codes[k:k + 4])
@@ -84,7 +84,7 @@ def test_codec(gen: tuple[DP.Depth, CD.Codec]) -> None:
             ys.append(ist.push(f))
         f, y = np.concatenate(fs), np.concatenate(ys + [ist.flush()])
         yr, yb = R.pcm(ref, codes), R.pcm(refb, codes)
-        assert np.sqrt(((rf[:, :CD.NBINS] - f[:, :CD.NBINS]) ** 2).mean()) < 0.035
+        assert np.sqrt(((rf[:, :S.NBINS] - f[:, :S.NBINS]) ** 2).mean()) < 0.035
         tot += [(yr ** 2).sum(), ((yr - y) ** 2).sum(), ((yr - yb) ** 2).sum()]
     s_npu, s_bf16 = 10 * np.log10(tot[0] / tot[1]), 10 * np.log10(tot[0] / tot[2])
     print(f"PCM SNR from float64: NPU {s_npu:.1f} dB, bfloat16 codec {s_bf16:.1f} dB")
@@ -101,7 +101,7 @@ def test_codec_stream(gen: tuple[DP.Depth, CD.Codec]) -> None:
     cd.reset()
     parts = np.concatenate([cd.frames(codes[k:k + 4]) for k in range(0, len(codes), 4)])
     assert whole.shape == (300, CD.NOUT) and np.array_equal(whole, parts)
-    ist, rist = CD.Istft(), R.Istft()
+    ist, rist = S.Istft(), R.Istft()
     y = np.concatenate([ist.push(whole[:100]), ist.push(whole[100:]), ist.flush()])
     yr = np.concatenate([rist.push(whole[:100]), rist.push(whole[100:]), rist.flush()])
     assert y.size == yr.size == 300 * R.HOP and np.abs(y - yr).max() < 1e-5 * np.abs(yr).max()

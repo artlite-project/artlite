@@ -103,15 +103,19 @@ class NpuLfm(OverlayModel):
             x[tokens.given] = tokens.rows
         return x
 
-    def audio_step(self, row: np.ndarray) -> np.ndarray:
-        """An embedding row (hidden,) at the next position (a speech frame's feedback: ``models.lfm3a.speech``) in a
-        step without the LM head: the hidden state after it (the LM head's input, from its header's: ``LfmOverlay.
-        lm_input``: r + v / rms(v) w_post, output-normed; fp32)."""
+    def audio_step(self, row: np.ndarray, *, logits: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
+        """An embedding row (hidden,) at the next position (a speech frame's feedback: ``models.lfm3a.speech``), in a
+        step without the LM head unless ``logits`` (a text token follows): the hidden state after it (the LM head's
+        input, from its header's: ``LfmOverlay.lm_input``: r + v / rms(v) w_post, output-normed; fp32) and the logits
+        (vocab,) fp32 or None."""
         if self.position + 1 > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
-        self._dispatch(lambda: self.overlay.step(np.asarray(row, np.float32).reshape(1, -1), self.position, logits=False))
+        out = self._dispatch(lambda: self.overlay.step(np.asarray(row, np.float32).reshape(1, -1), self.position,
+                                                       logits=logits))
         self.position += 1
-        return self.hidden_after()
+        if logits:
+            self.slot = 0
+        return self.hidden_after(), None if out is None else self.cap(out[0])
 
     def hidden_after(self, slot: int = 0) -> np.ndarray:
         """The hidden state (hidden,) fp32 after a slot of the last step, with or without the LM head (module
@@ -210,6 +214,38 @@ class Lfm(Model):
         h = npu.outputs(ids, at=[-1])[0]
         sampler = a_speech.CodeSampler(self.audio.gen, seed)
         yield from a_speech.speak(npu, self.audio, h, sampler, max_frames=max_frames, stats=stats)
+
+    def voice_reply(self, messages: list[dict[str, object]], *, mode: str = "mixed", seed: int | None = None,
+                    max_tokens: int = 1024, max_frames: int = 2048, reply: a_speech.Reply | None = None,
+                    stats: a_speech.SpeechStats | None = None) -> Iterator[tuple[str, object]]:
+        """A reply to a conversation that may speak (LFM3-Audio: ``speech.interleave``): ``mode`` "mixed" (interleaved
+        text and speech: the system prompt ``speech.INTERLEAVED`` unless the conversation has one, the assistant turn
+        opened by ``<|mixed_start|>``), "audio" (``<|audio_start|>``: speech, then text), "auto" (the model switches to
+        speech by itself or not), "text" (text only); ("text", token id) and ("audio", 24 kHz samples) as they come;
+        ``reply``: filled with the reply's sequence. The loaded model's positions are the conversation's and the
+        reply's."""
+        if self.audio is None or self.audio.gen is None:
+            raise ValueError(f"{self.name}: speech output needs LFM3-Audio's mmproj (its speech generator)")
+        if self._npu is None:
+            raise ValueError(f"{self.name}: load the model first")
+        if mode not in ("mixed", "audio", "auto", "text"):
+            raise ValueError(f"mode {mode!r}: mixed, audio, auto or text")
+        npu = self._npu
+        if mode == "mixed" and (not messages or messages[0].get("role") != "system"):
+            messages = [{"role": "system", "content": a_speech.INTERLEAVED}, *messages]
+        toks = a_speech.speech_tokens(self.gguf.strings("tokenizer.ggml.tokens"))
+        opener = {"mixed": [toks[a_speech.MIXED_START]], "audio": [toks[a_speech.AUDIO_START]]}.get(mode, [])
+        prompt = self.chat(messages) + opener
+        npu.reset()
+        logits, h = None, None
+        if mode == "audio":
+            h = npu.outputs(prompt, at=[-1])[0]
+        else:
+            logits = npu.forward(prompt)
+        sampler = a_speech.CodeSampler(self.audio.gen, seed)
+        yield from a_speech.interleave(npu, self.audio, toks, logits, sampler, max_tokens=max_tokens,
+                                       max_frames=max_frames, mode={"auto": "text"}.get(mode, mode), h=h,
+                                       speech=mode != "text", reply=reply, stats=stats)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
