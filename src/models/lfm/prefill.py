@@ -101,6 +101,7 @@ class LfmPrefill(ChunkPrefill):
     runs one."""
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "lfm_prefill", KV_PAD
+    SHARED_KV_RANGE = True  # (the attention's P_FO: one range for every size)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
     MIN_TOKENS = CV.WIDTH - 1
 

@@ -71,6 +71,16 @@ def test_kv_pad_covers_the_largest_chunk() -> None:
     _prefill(sizes=(16, 64), kv_pad=0)  # (the padding is for the largest chunk of this library)
 
 
+def test_kv_pad_of_shared_offset_ranges() -> None:
+    """Sizes sharing one offset parameter: a smaller chunk at the caches' end ranges over the largest chunk's."""
+    shared = type("S", (_Prefill,), {"SHARED_KV_RANGE": True, "KV_PAD": 512 - 16})
+    ov = SimpleNamespace(max_positions=4096, cfg=SimpleNamespace(hidden_size=H), image=None, dev=_Dev(0))
+    shared(ov, (16, 64, 512))
+    with pytest.raises(AssertionError):  # (the sizes' own offsets: 512 - 64 would do)
+        type("S", (shared,), {"KV_PAD": 512 - 17})(ov, (16, 64, 512))
+    type("S", (shared,), {"KV_PAD": 512 - 64})(ov, (64, 512))
+
+
 def test_norm_blocks() -> None:
     assert norm_blocks(2560, 256, [2048, 1024, 512]) == [(0, 2048), (2048, 512)]
     assert norm_blocks(1280, 256, [1024, 512]) == [(0, 1024), (1024, 256)]

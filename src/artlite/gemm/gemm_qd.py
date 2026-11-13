@@ -33,16 +33,17 @@ from dataclasses import replace
 
 import numpy as np
 from aie.ir import Module
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Worker
 from aie.iron.controlflow import range_
-from aie.iron.device import NPU2, Tile
+from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
 from ..formats import FORMATS, KC, KT, slot
 from ..operators import kmath
 from ..operators.design import COLS
 from ..operators.kernel_source import kernel_prefix
-from ..operators.l1_layout import REGION, align64, pin_l1_buffers
+from ..operators.l1_layout import REGION, align64
+from . import design_parts as DP
 from .gemm_q import KERNEL_TEMPLATE, GemmQOperator
 from .geometry import B_DEPTH, L1_BUDGET, Geometry, L1Plan, expose, pack_plan, planar
 from .mac import MAC, render_mac
@@ -376,31 +377,12 @@ class GemmQdOperator(GemmQOperator):
             if self.c_pack else None
 
         # B: shim -> memtile -> the column's dequantizing core (k-tile objects in dequant order)
-        b_l3 = [ObjectFifo(B_l2_ty, name=f"gqB_{c}", depth=2, from_stream_per_cons=df.b_wdims)
-                for c in range(COLS)]
-        b_l1 = [b_l3[c].cons().forward(obj_type=B_l1_ty, name=f"gqB1_{c}", depth=self.b_depth, tile=Tile(c, 1),
-                                        to_stream=df.b_rdims)
-                for c in range(COLS)]
+        b_l3, b_l1 = DP.b_chain(df, B_l2_ty, B_l1_ty, self.b_depth)
         # D: the dequantizing core -> the column's MAC cores (broadcast)
         d_f = [ObjectFifo(D_ty, name=f"gqD_{c}", depth=D_DEPTH) for c in range(COLS)]
-        # A: one strip per MAC row in memtile (2 row, 1), broadcast to the 8 columns
-        a_l3 = [ObjectFifo(A_l2_ty, name=f"gqA_{row}", depth=1 if df.a_res else 2,
-                           from_stream_per_cons=df.a_wdims)
-                for row in range(MR)]
-        a_l1 = [a_l3[row].cons().forward(obj_type=A_l1_ty, name=f"gqA1_{row}", depth=2, tile=Tile(2 * row, 1),
-                                          repeat_count=df.a_repeat if df.a_repeat > 1 else None)
-                for row in range(MR)]
+        a_l3, a_l1 = DP.a_chain(df, A_l2_ty, A_l1_ty, MR)
         # C: the column's MAC cores join in its memtile
-        c_l3 = []
-        c_l1: list[list[ObjectFifo]] = [[] for _ in range(MR)]
-        for c in range(COLS):
-            f = ObjectFifo(C_l2_ty, name=f"gqC_{c}", depth=2, to_stream=df.c_dims)
-            c_l3.append(f)
-            parts = f.prod().join([c_elems * i for i in range(MR)], obj_types=[C_l1_ty] * MR,
-                                  names=[f"gqC1_{c}_{row}" for row in range(MR)], depths=[self.c_depth] * MR,
-                                  tile=Tile(c, 1))
-            for row in range(MR):
-                c_l1[row].append(parts[row])
+        c_l3, c_l1 = DP.c_join(df, C_l2_ty, C_l1_ty, MR, self.c_depth)
 
         n_kc, planes, nsb = self.n_kc, self.hdr_units, self.nsb
         silu = self.silu
@@ -590,28 +572,19 @@ class GemmQdOperator(GemmQOperator):
                                                k_mm, *extra],
                                       tile=Tile(c, 3 + row), stack_size=self.mac_stack, dynamic_objfifo_lowering=True))
 
-        A_ty = np.ndarray[(self.M * self.a_K * 9 // 16,), np.dtype[bfloat16]]
-        W_ty = np.ndarray[(self.w_bytes // 2,), np.dtype[bfloat16]]
-        C_ty = np.ndarray[(self.M * self.N * 9 // 16 if cb else self.M * self.N,), np.dtype[bfloat16]]
-        a_prods = [a_l3[row].prod(tile=Tile(2 * row, 0)) for row in range(MR)]
-        b_prods = [b_l3[c].prod(tile=Tile(c, 0)) for c in range(COLS)]
-        c_conses = [c_l3[c].cons(tile=Tile(c, 0)) for c in range(COLS)]
-        sequence = self._sequence(a_prods, b_prods, c_conses, MR)
-        rt = Runtime(sequence, [A_ty, W_ty, C_ty, [a_prods, b_prods, c_conses]])
-        module = Program(NPU2(), rt, workers=workers).resolve_program()
-        layout = lay
-        if layout is not None:
-            roles = {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqD": "D"}
+        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), MR, c_bfp16=cb)
+        # the L1 budget / pinned layout describe these buffers (csplit: ``acc`` is a tile's first half)
+        mac = self._buffers(self.geo, self.plan)
+        actual = {"A": DP.nbytes(A_l1_ty), "B": DP.nbytes(B_l1_ty), "D": DP.nbytes(D_ty), "C": DP.nbytes(C_l1_ty),
+                  "sx": DP.nbytes(sx_ty), "ws": DP.nbytes(ws_ty), "hb": DP.nbytes(hb_ty),
+                  "acc": DP.nbytes(acc_ty) * (2 if self.csplit else 1)}
+        planned = {k: v[1] for k, v in {**mac, **dqb}.items() if k in actual}
+        assert actual == planned, (actual, planned)
+        if lay is not None:
+            def fifo(name: str, regions: list[int] | None) -> list[int] | None:  # (dq-only: not the MAC cores' D pools)
+                return None if DQ_ONLY in lay and "__cons" in name and name.startswith("gqD_") else regions
 
-            def worker_buffer(name: str) -> int | None:  # gq_<role>_<col>[_<row>]
-                role = name.split("_")[1] if name.startswith("gq_") else None
-                return layout[role][0] if role in layout else None
-
-            def fifo(name: str, depth: int) -> list[int] | None:  # (dq-only: not the MAC cores' D pools)
-                return None if DQ_ONLY in layout and "__cons" in name and name.startswith("gqD_") else \
-                    layout.get(roles.get(name.split("_")[0], ""))
-
-            pin_l1_buffers(module, fifo=fifo, buffer=worker_buffer)
+            DP.pin(module, lay, {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqD": "D"}, fifo)
         return module
 
 

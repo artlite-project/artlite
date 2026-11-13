@@ -96,6 +96,7 @@ class ChunkPrefill:
     MAX_T: ClassVar[int]  # the largest chunk
     MIN_TOKENS: ClassVar[int] = 1  # valid tokens of a chunk at least
     NAME: ClassVar[str]  # the library ELF's
+    SHARED_KV_RANGE: ClassVar[bool] = False  # the chunk sizes' attention offsets are one runtime parameter
     KV_PAD: ClassVar[int]  # positions the overlay's KV arguments extend past the caches (its ``KV_PAD``)
     CFG_S: ClassVar[float]  # the time model's constants (``_layer_static``): a ConfigureOp,
     WEIGHT_S: ClassVar[float]  # a byte of a layer's weights per sub-chunk
@@ -104,10 +105,12 @@ class ChunkPrefill:
         assert all((t % self.SUB == 0 or t in self.SMALL) and t <= self.MAX_T for t in sizes)
         self.ov, self.sizes = overlay, tuple(sorted(t for t in sizes if t <= overlay.max_positions))
         assert self.sizes, f"no chunk size within {overlay.max_positions} positions"
-        # (a library's runtime parameter has one range, its largest chunk's: the attention's P_FO streams T / pg - 1
-        # groups from it, so a chunk of sub-chunks at the caches' end slices a cache up to T - SUB positions past them:
-        # the NPU writes outside the KV buffer without the overlay's padding)
-        assert self.sizes[-1] - self.SUB <= self.KV_PAD, (self.sizes[-1], self.SUB, self.KV_PAD)
+        # (a chunk at the caches' end slices a cache up to its size - SUB positions past them: the NPU writes outside the
+        # KV buffer without the overlay's padding. Where the sizes share one offset parameter (the attention's P_FO:
+        # one range, the largest chunk's) a smaller chunk's offsets take that range: the bound is the largest size less
+        # the smallest; qwen35's attention names its offset parameter per size)
+        low = self.sizes[0] if self.SHARED_KV_RANGE else self.SUB
+        assert self.sizes[-1] - low <= self.KV_PAD, (self.sizes[-1], low, self.KV_PAD)
         self.cfg, self.img = overlay.cfg, overlay.image
         self.H = self.cfg.hidden_size
         self.group = GROUP

@@ -15,7 +15,7 @@ from aie.iron.runtime._context import active_sequence
 from aie.iron.runtime.dmatask import DMATask
 from aie.iron.runtime.endpoint import RuntimeEndpoint
 
-from .design import MAX_BD_ITER
+from .design import MAX_BD_ITER, TILE_BDS
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,7 @@ def chained_fill(prod: object, src: object, taps: list[TensorAccessPattern | Cha
                        rt.register_parameter(p.length_parameter), p.length_unit) for p in parts]
     reps = parts[0].tap.sizes[0]
     assert all(len(p.tap.sizes) == 4 and p.tap.sizes[0] == reps for p in parts) and reps <= MAX_BD_ITER
+    assert len(parts) <= TILE_BDS, f"a chain of {len(parts)} BDs: a shim tile's DMA has {TILE_BDS}"
 
     class _Chain(DMATask):
         def resolve(self, loc: object = None, ip: object = None) -> None:

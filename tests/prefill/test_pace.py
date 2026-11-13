@@ -7,8 +7,9 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from artlite.gemm.pacing import PACE_BITS, PACE_CLASSES, PACE_IDLE, pace_class, pace_levels, pace_word
+from artlite.gemm.pacing import PACE_BITS, PACE_CLASSES, PACE_IDLE, PACE_ROLES, pace_class, pace_levels, pace_word
 from artlite.operators import bfp16
+from artlite.prefill import gemm as PG
 from artlite.prefill import pace as P
 
 
@@ -19,6 +20,10 @@ def test_word() -> None:
     assert len(PACE_CLASSES) * PACE_BITS <= 30 and len(PACE_IDLE) == 1 << PACE_BITS
     assert P.describe(w) == "qkv.planar 7, gu 3, down 1"
     assert pace_levels(0) == {} and P.describe(0) == ""
+
+
+def test_every_gemm_role_is_a_pace_role() -> None:
+    assert set(PG.WHICH.values()) == set(PACE_ROLES)
 
 
 def test_parse() -> None:

@@ -4,7 +4,8 @@ A: (M, K) bf16 activations (M = prompt tokens). W: tiles of the decode
 overlay (``formats.pack_tile``: per-row scale planes, then the codes
 of the super-blocks), read in place, so prefill and decode share one weight
 file. C: (M, N) bf16. What a GEMM's shape makes of its passes, tiles and C objects is ``geometry``, its shim taps and
-memtile walks ``dataflow``, its pacing ``pacing``; this module holds the kernel source, the L1 buffers and the design.
+memtile walks ``dataflow``, its pacing ``pacing``, the streams both designs share ``design_parts``; this module holds
+the kernel source, the L1 buffers and the design.
 
 Work split: core row r takes tokens [m r, m r + m), column c
 the tiles of its row range, in passes of 4 tiles (64 rows for R = 16). Per
@@ -62,9 +63,9 @@ from collections.abc import Iterator
 
 import numpy as np
 from aie.ir import Module
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter, TaskGroup, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, ScratchpadParameter, TaskGroup, Worker
 from aie.iron.controlflow import range_
-from aie.iron.device import NPU2, Tile
+from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
 from ..formats import KC, KT, kernel_template, slot
@@ -73,7 +74,8 @@ from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.chain import chained_fill
 from ..operators.design import COLS, ROWS, SHIM_QUEUE, TILE_BDS, range32, times_i32
 from ..operators.kernel_source import kernel_prefix
-from ..operators.l1_layout import REGION, align64, pin_l1_buffers
+from ..operators.l1_layout import REGION, align64
+from . import design_parts as DP
 from .dataflow import Dataflow, drain_runs
 from .geometry import B_DEPTH, L1_BUDGET, M_MAX, TILES, GemmSpec, Geometry, L1Error, L1Plan, expose
 from .mac import MAC, render_mac
@@ -440,38 +442,21 @@ class GemmQOperator(ArtcOperator):
 
         # B: shim -> memtile -> the column's cores (broadcast), k-tile objects in dequant / MAC order (pair: segment
         # h of each memtile object to the cores of half h, rows h, h + 2)
-        b_l3 = [ObjectFifo(B_l2_ty, name=f"gqB_{c}", depth=2, from_stream_per_cons=df.b_wdims)
-                for c in range(COLS)]
         if pair:
+            b_l3 = [ObjectFifo(B_l2_ty, name=f"gqB_{c}", depth=2, from_stream_per_cons=df.b_wdims)
+                    for c in range(COLS)]
             b_l1 = [b_l3[c].cons().split([df.b_obj // 2 * h for h in range(2)], tile=Tile(c, 1), depths=[B_DEPTH] * 2,
                                           obj_types=[B_l1_ty] * 2, names=[f"gqB1_{c}_{h}" for h in range(2)],
                                           to_stream=[df.b_rdims] * 2)
                     for c in range(COLS)]
         else:
-            b_l1 = [b_l3[c].cons().forward(obj_type=B_l1_ty, name=f"gqB1_{c}", depth=B_DEPTH, tile=Tile(c, 1),
-                                            to_stream=df.b_rdims)
-                    for c in range(COLS)]
+            b_l3, b_l1 = DP.b_chain(df, B_l2_ty, B_l1_ty, B_DEPTH)
         # each core's dequantized half, consumed by its partner (adjacent cores: shared memory, no DMA)
         x_f = {(c, row): ObjectFifo(X_ty, name=f"gqX_{c}_{row}", depth=2) for c in range(COLS) for row in range(ROWS)
                } if pair else {}
-        # A: one strip per core row in memtile (2 row, 1), broadcast to the 8 columns
-        a_l3 = [ObjectFifo(A_l2_ty, name=f"gqA_{row}", depth=1 if df.a_res else 2,
-                           from_stream_per_cons=df.a_wdims)
-                for row in range(ROWS)]
-        a_l1 = [a_l3[row].cons().forward(obj_type=A_l1_ty, name=f"gqA1_{row}", depth=2, tile=Tile(2 * row, 1),
-                                          repeat_count=df.a_repeat if df.a_repeat > 1 else None)
-                for row in range(ROWS)]
+        a_l3, a_l1 = DP.a_chain(df, A_l2_ty, A_l1_ty, ROWS)
         # C: the column's cores join in its memtile
-        c_l3 = []
-        c_l1: list[list[ObjectFifo]] = [[] for _ in range(ROWS)]
-        for c in range(COLS):
-            f = ObjectFifo(C_l2_ty, name=f"gqC_{c}", depth=2, to_stream=df.c_dims)
-            c_l3.append(f)
-            parts = f.prod().join([c_elems * i for i in range(ROWS)], obj_types=[C_l1_ty] * ROWS,
-                                  names=[f"gqC1_{c}_{row}" for row in range(ROWS)], depths=[2] * ROWS,
-                                  tile=Tile(c, 1))
-            for row in range(ROWS):
-                c_l1[row].append(parts[row])
+        c_l3, c_l1 = DP.c_join(df, C_l2_ty, C_l1_ty, ROWS, 2)
 
         n_kc, planes = self.n_kc, self.hdr_units
         q4k = k_hdr2 is not None  # (Q4_K: the header slots collected in st, expanded per K chunk)
@@ -564,34 +549,14 @@ class GemmQOperator(ArtcOperator):
                                                  st, *extra],
                                       tile=Tile(c, row + 2), stack_size=2048, dynamic_objfifo_lowering=True))
 
-        A_ty = np.ndarray[(self.M * self.a_K * 9 // 16,), np.dtype[bfloat16]]
-        W_ty = np.ndarray[(self.w_bytes // 2,), np.dtype[bfloat16]]  # bf16: fused ELFs pass bf16 buffers
-        C_ty = np.ndarray[(self.M * self.N * 9 // 16 if cb else self.M * self.N,), np.dtype[bfloat16]]
-        a_prods = [a_l3[row].prod(tile=Tile(2 * row, 0)) for row in range(ROWS)]
-        b_prods = [b_l3[c].prod(tile=Tile(c, 0)) for c in range(COLS)]
-        c_conses = [c_l3[c].cons(tile=Tile(c, 0)) for c in range(COLS)]
-
-        sequence = self._sequence(a_prods, b_prods, c_conses, ROWS)
-        rt = Runtime(sequence, [A_ty, W_ty, C_ty, [a_prods, b_prods, c_conses]])
-        module = Program(NPU2(), rt, workers=workers).resolve_program()
+        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), ROWS, c_bfp16=cb)
         # the L1 budget / pinned layout describe these buffers
-        def nbytes(ty: object) -> int:
-            shape, dt = ty.__args__
-            return int(np.prod(shape)) * np.dtype(dt.__args__[0]).itemsize
-
-        actual = {"A": nbytes(A_l1_ty), "B": nbytes(B_l1_ty), "C": nbytes(C_l1_ty), "acc": nbytes(acc_ty),
-                  "st": nbytes(st_ty), **({"ws": nbytes(ws_ty), "X": nbytes(X_ty)} if pair else {})}
+        actual = {"A": DP.nbytes(A_l1_ty), "B": DP.nbytes(B_l1_ty), "C": DP.nbytes(C_l1_ty), "acc": DP.nbytes(acc_ty),
+                  "st": DP.nbytes(st_ty), **({"ws": DP.nbytes(ws_ty), "X": DP.nbytes(X_ty)} if pair else {})}
         assert actual == {k: b for k, (_, b) in bufs.items()}, (actual, bufs)
         layout = self._l1_layout()
         if layout is not None:
-            roles = {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqX": "X"}
-
-            def worker_buffer(name: str) -> int | None:  # gq_<role>_<col>_<row>
-                role = name.split("_")[1] if name.startswith("gq_") else None
-                return layout[role][0] if role in layout else None
-
-            pin_l1_buffers(module, fifo=lambda name, depth: layout.get(roles.get(name.split("_")[0], "")),
-                           buffer=worker_buffer)
+            DP.pin(module, layout, {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqX": "X"})
         return module
 
 

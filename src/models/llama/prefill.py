@@ -118,6 +118,7 @@ class LlamaPrefill(ChunkPrefill):
     of whole cache groups); ``run`` runs one."""
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "llama_prefill", KV_PAD
+    SHARED_KV_RANGE = True  # (the attention's P_FO: one range for every size)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
     def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = False,

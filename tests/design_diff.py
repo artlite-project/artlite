@@ -7,8 +7,11 @@ Per test, the designs that changed are paired (same MLIR and kernel entry points
 tests only in one dump, pairs whose MLIR differs (with the first differing lines) and pairs whose
 kernel source alone differs. Kernel names are compared without their hashes (``kernel_source``: a change of a
 kernel's text, comments included, renames it and what reaches it). ``--alpha`` compares MLIR modulo symbol names
-(renamed FIFOs); ``--rename`` rewrites AFTER's sources and MLIR (e.g. a renamed kernel prefix); ``--asm`` compiles
-both sources of every source-only pair and compares the sets of distinct function bodies (labels and symbol operands
+(renamed FIFOs); ``--rename`` rewrites AFTER's sources and MLIR (a renamed kernel prefix; an operator class moved
+to another module: ``--rename '(// ==== \\w+ \\()old/module.py=\\1new/module.py'``: the section label of its
+``kernel.cc`` is the module's path, so its hashes change with the label; pairs whose sources are equal after the
+rename are counted apart); ``--asm`` compiles both sources of every source-only pair and compares the sets of
+distinct function bodies (labels and symbol operands
 normalized, names ignored: a function moved to another name, or two copies merged, compares equal).
 
 A change of shared kernel code needs no full dump after it. Before the change, ``--affected REGEX --compile`` prints
@@ -199,15 +202,18 @@ def main() -> None:
             print(f"{len(designs)} designs compiled ({len(failed)} failed: {failed[:4]})", file=sys.stderr)
         print("\n".join(tests))
         return
-    b = Dump(args.after, [tuple(r.split("=", 1)) for r in args.rename], args.alpha)
+    b = Dump(args.after, [tuple(r.rsplit("=", 1)) for r in args.rename], args.alpha)
     if args.partial:
         a.tests = collections.defaultdict(list, {t: a.tests[t] for t in b.tests if t in a.tests})
     missing, extra = sorted(set(a.tests) - set(b.tests)), sorted(set(b.tests) - set(a.tests))
     changed = sorted(pairs(a, b))
     mlir = [(x, y) for x, y in changed if a.mlir(x) != b.mlir(y)]
-    src = [(x, y) for x, y in changed if a.mlir(x) == b.mlir(y)]
+    same = [(x, y) for x, y in changed if a.mlir(x) == b.mlir(y)]
+    src = [(x, y) for x, y in same if a.text(x, ".cc") != b.text(y, ".cc")]
+    renamed = len(same) - len(src)  # (kernel names' hashes or what ``--rename`` rewrites: the sources are equal)
     print(f"tests {len(a.tests)} vs {len(b.tests)} (only before: {len(missing)}, only after: {len(extra)}); "
-          f"changed designs: {len(changed)}, MLIR differs: {len(mlir)}, kernel source only: {len(src)}")
+          f"changed designs: {len(changed) - renamed}, MLIR differs: {len(mlir)}, kernel source only: {len(src)}"
+          + (f" (equal modulo hashes and renames: {renamed})" if renamed else ""))
     for t in missing[:args.show]:
         print("  only before:", t)
     for t in extra[:args.show]:
