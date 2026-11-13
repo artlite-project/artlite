@@ -140,6 +140,18 @@ def lfm3a_mmproj(quant: str = "Q8_0") -> str:
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Audio-2B-GGUF", f"mmproj-LFM3-Audio-2B-{quant}.gguf")
 
 
+def lfm3omni_gguf(quant: str = "Q4_K_M") -> str:
+    """A language model file of LiquidAI's LFM3-Omni-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes,
+    weights of its own): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Omni-2B-GGUF", f"LFM3-Omni-2B-{quant}.gguf")
+
+
+def lfm3omni_mmproj(quant: str = "Q8_0") -> str:
+    """LFM3-Omni-2B's media file (GGUF architecture ``clip``): its vision tower (projector ``lfm3vl``), speech encoder
+    (``lfm3a``) and speech generator (``lfm3a_gen``): ``Q8_0``, ``BF16``, ``F16``."""
+    return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Omni-2B-GGUF", f"mmproj-LFM3-Omni-2B-{quant}.gguf")
+
+
 DECISION_FILES = {"d3-lite":"ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
                   "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",

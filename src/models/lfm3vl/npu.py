@@ -28,7 +28,7 @@ from artlite.vision.windows import GW_MAX, WIN, Piece
 
 from ..sequence import Sequence, load_image
 from . import encoder as V
-from .host import MAX_TOKENS, Grid, image_pixels
+from .host import MAX_TOKENS, Grid, image_pixels, token_bounds
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the programs)
 _SOURCES = ("artlite/vision", "models/lfm3vl/encoder.py", "artlite/txn.py", "artlite/operators/bfp16.py",
@@ -54,7 +54,8 @@ def _save_program(cache: str, nb: int, pieces: list[Piece], same_layout: bool) -
 class NpuVision:
     """The vision encoder and projector of an mmproj file (projector ``lfm3vl``) on the NPU; an image's merged tokens
     between ``min_tokens`` and ``max_tokens`` (llama.cpp's ``--image-min-tokens`` / ``--image-max-tokens``; default the
-    mmproj's minimum, 64, and llama.cpp's 4096)."""
+    mmproj's bounds, its ``image_min_pixels`` / ``image_max_pixels`` over 1024, the maximum at most llama.cpp's 4096:
+    LFM3-VL-2B 64 .. 4096, LFM3-Omni-2B 64 .. 2048)."""
 
     markup = ("<|vision_start|>", "<|vision_end|>")  # (around an image's tokens: llama.cpp's mtmd, the chat template's)
 
@@ -70,8 +71,7 @@ class NpuVision:
                                       f"16 (8), 2560, 16, 2)")
         if tuple(c.mean) != (0.5,) * 3 or tuple(c.std) != (0.5,) * 3:
             raise NotImplementedError(f"{path}: pixels normalized by {c.mean} / {c.std} (the encoder folds in 0.5 / 0.5)")
-        self.min_tokens = min_tokens or max(1, c.min_pixels // 1024)
-        self.max_tokens = max_tokens or MAX_TOKENS
+        self.min_tokens, self.max_tokens = token_bounds(c.min_pixels, c.max_pixels, min_tokens, max_tokens)
         if not 1 <= self.min_tokens <= self.max_tokens <= TOKENS_LIMIT:
             raise ValueError(f"image tokens {self.min_tokens} .. {self.max_tokens}: 1 <= min <= max <= {TOKENS_LIMIT}")
         self._kept: collections.OrderedDict[bytes, np.ndarray] = collections.OrderedDict()

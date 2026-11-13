@@ -27,6 +27,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
 
+from .. import video
 from ..common import Model, OverlayModel, Sampling
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
@@ -142,10 +143,11 @@ class Lfm(Model):
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
     (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the media encoders' file: a vision encoder (images in
     prompts: LFM3-VL's, ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged
-    tokens, default the mmproj's 64 .. 4096, a d1 decision model's 64 .. ``D1_IMAGE_TOKENS``) and / or a speech encoder
+    tokens, default the mmproj's bounds, a d1 decision model's at most ``D1_IMAGE_TOKENS``) and / or a speech encoder
     (audio clips in prompts: LFM3-Audio's, ``models.lfm3a.npu.NpuAudio``; a message's parts ``{"type": "audio", "audio":
-    a file, its bytes or 16 kHz samples}``, OpenAI's ``input_audio`` and ``audio_url`` ones). LFM3-Audio's language model
-    (its file has the ``asr`` chat template) answers in text: its speech tokens are banned (``host.TEXT_ONLY_BANNED``)."""
+    a file, its bytes or 16 kHz samples}``, OpenAI's ``input_audio`` and ``audio_url`` ones). Text replies (``sampling``)
+    never open speech: the openers ``<|audio_start|>`` / ``<|mixed_start|>`` are banned (``host.TEXT_ONLY_BANNED``:
+    transformers' generation mode "text", llama.cpp's logit bias); ``voice_reply`` lets a model that speaks speak."""
 
     name = "LFM3"
     thinks = True
@@ -167,8 +169,7 @@ class Lfm(Model):
         self.kv_k = kv_k
         self._npu: NpuLfm | None = None
         toks = self.gguf.strings("tokenizer.ggml.tokens")
-        self.banned = tuple(toks.index(t) for t in a_host.TEXT_ONLY_BANNED) \
-            if "tokenizer.chat_template.asr" in self.gguf.meta else ()
+        self.banned = tuple(toks.index(t) for t in a_host.TEXT_ONLY_BANNED if t in toks)
         if mmproj is not None:
             mg = GGUFFile(mmproj)
             has_vision = bool(mg.meta.get("clip.has_vision_encoder", "clip.vision.projector_type" in mg.meta))
@@ -256,17 +257,38 @@ class Lfm(Model):
         parts = [p for m in messages if isinstance(m.get("content"), list) for p in m["content"] if isinstance(p, dict)]
         images = [p["image"] for p in parts if p.get("type") == "image"]
         clips = [a_host.part_audio(p) for p in parts if p.get("type") in a_host.AUDIO_PARTS]
-        if not images and not clips:
+        videos = [p["video"] for p in parts if p.get("type") == "video"]
+        if not images and not clips and not videos:
             return self.tokenizer.encode(text)
-        if images and self.vision is None:
-            raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
+        if (images or videos) and self.vision is None:
+            raise ValueError(f"{self.name}: images and videos need its vision encoder (an mmproj file)")
         if clips and self.audio is None:
             raise ValueError(f"{self.name}: audio needs its speech encoder (an mmproj file)")
         try:
             return splice_media(text, {vl_host.IMAGE: [self.vision.sequence(im) for im in images],
-                                       a_host.AUDIO: [self.audio.sequence(c) for c in clips]}, self.tokenizer.encode)
+                                       a_host.AUDIO: [self.audio.sequence(c) for c in clips],
+                                       vl_host.VIDEO: [self.video_sequence(v) for v in videos]}, self.tokenizer.encode)
         finally:
             self._vision_ran()
+
+    def video_sequence(self, src: str | bytes, *, soundtrack: bool = True) -> Sequence:
+        """A video (a file or its bytes) as the language model's tokens (``models.lfm3vl.host``: its frames' pairs
+        through the vision encoder, ``NpuVision.pairs``; with LFM3-Omni's mmproj, which has the speech encoder too, its
+        soundtrack's rows after each pair, unless ``soundtrack`` is false)."""
+        data = video.read(src)
+        info = video.probe(data)
+        heard = self.audio is not None  # (the mmproj hears a video: LFM3-Omni's prompt layout)
+        plan = vl_host.VideoPlan.of(info.n_frames, info.fps, info.width, info.height, heard=heard)
+        frames = video.frames(data, info, plan.indices, (plan.width, plan.height))
+        groups = len(plan.pairs(len(frames)))
+        rows = None
+        if heard and soundtrack and (track := video.soundtrack(data, info)) is not None:
+            slices = plan.slices(len(track))[:groups]
+            embd = self.audio.embeddings(track[:slices[-1][1]])
+            rows = [a_host.clip_sequence(embd[b:e]) for b, e in plan.rows(slices, len(embd))]
+        grid = plan.grid
+        pairs = [grid.sequence(e) for e in self.vision.pairs(frames)]
+        return vl_host.video_sequence(pairs, plan.stamps(len(frames)), self.tokenizer.encode, rows)
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""

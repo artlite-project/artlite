@@ -102,17 +102,24 @@ class VisionGolden:
         return np.load(os.path.join(self.path, "logits.npy"), mmap_mode="r")
 
 
-def golden(model: str, mmproj: str, image: str, prompt: str, *, answer: list[int] | tuple[int, ...] = (),
-           names: str = "", embd: np.ndarray | None = None, threads: int = 16) -> VisionGolden:
-    """llama.cpp's vision path for an image and a prompt (the text with ``<__media__>`` where the image goes) and
-    teacher-forced answer tokens; ``names``: a regex of the encoder tensors to dump (without the "-<il>" suffix);
-    ``embd``: the image's embeddings (tokens, n_embd) the language model takes instead of the encoder's."""
+def golden(model: str, mmproj: str, image: str | list[str], prompt: str, *, answer: list[int] | tuple[int, ...] = (),
+           names: str = "", embd: np.ndarray | None = None, no_soundtrack: bool = False,
+           threads: int = 16) -> VisionGolden:
+    """llama.cpp's media path for media files (``image``: an image, an audio file or a video, or a list of them) and a
+    prompt (the text with ``<__media__>`` where each goes, in order) and teacher-forced answer tokens; ``names``: a
+    regex of the encoder tensors to dump (without the "-<il>" suffix); ``embd``: the media chunks' embeddings (their
+    tokens in order, n_embd) the language model takes instead of the encoders'; ``no_soundtrack``: a video's frames
+    only."""
     ans = np.ascontiguousarray(answer, np.int32)
     emb = None if embd is None else np.ascontiguousarray(embd, np.float32)
-    with open(image, "rb") as f:
-        img_hash = hashlib.sha256(f.read()).hexdigest()
-    key = (common.model_key(model), common.model_key(mmproj), img_hash, prompt, hashlib.sha256(ans.tobytes()).hexdigest(),
-           names, None if emb is None else hashlib.sha256(emb.tobytes()).hexdigest(), _lib_identity(), _mtmd_identity())
+    media = [image] if isinstance(image, str) else list(image)
+    hashes = []
+    for m in media:
+        with open(m, "rb") as f:
+            hashes.append(hashlib.sha256(f.read()).hexdigest())
+    key = (common.model_key(model), common.model_key(mmproj), hashes[0] if len(hashes) == 1 else tuple(hashes), prompt,
+           hashlib.sha256(ans.tobytes()).hexdigest(), names, None if emb is None else hashlib.sha256(emb.tobytes()).hexdigest(),
+           _lib_identity(), _mtmd_identity()) + (("no_soundtrack",) if no_soundtrack else ())
     h = hashlib.sha256(repr(key).encode())
     with open(DUMP_SRC, "rb") as f:
         h.update(f.read())
@@ -126,8 +133,9 @@ def golden(model: str, mmproj: str, image: str, prompt: str, *, answer: list[int
     try:
         with open(os.path.join(tmp, "prompt.txt"), "w") as f:
             f.write(prompt)
-        cmd = [tool, "-m", model, "--mmproj", mmproj, "--image", image, "-p", os.path.join(tmp, "prompt.txt"), "-o",
-               tmp, "--threads", str(threads)]
+        cmd = [tool, "-m", model, "--mmproj", mmproj, *(a for m in media for a in ("--image", m)), "-p",
+               os.path.join(tmp, "prompt.txt"), "-o", tmp, "--threads", str(threads)] + \
+            (["--no-soundtrack"] if no_soundtrack else [])
         if ans.size:
             ans.tofile(os.path.join(tmp, "answer.i32"))
             cmd += ["-a", os.path.join(tmp, "answer.i32")]
@@ -145,6 +153,42 @@ def golden(model: str, mmproj: str, image: str, prompt: str, *, answer: list[int
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return VisionGolden(path)
+
+
+def video_items(model: str, mmproj: str, video: str, *, no_soundtrack: bool = False) -> list[dict]:
+    """The items llama.cpp's video helper reads from a video (``minicpmv_dump --video-items``: as llama-server reads a
+    video's bytes): {"text": s}, {"frame": RGB uint8 (h, w, 3)}, {"audio": float32 samples} in order. Cached as the
+    goldens are."""
+    with open(video, "rb") as f:
+        vh = hashlib.sha256(f.read()).hexdigest()
+    key = (common.model_key(model), common.model_key(mmproj), vh, no_soundtrack, _lib_identity(), _mtmd_identity())
+    h = hashlib.sha256(repr(key).encode())
+    with open(DUMP_SRC, "rb") as f:
+        h.update(f.read())
+    folder = common.model_refs(model)
+    path = os.path.join(folder, f"vitems_{h.hexdigest()[:16]}")
+    if not os.path.exists(os.path.join(path, "items.json")) or common.REFRESH_REFS:
+        os.makedirs(folder, exist_ok=True)
+        tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
+        try:
+            cmd = [dump_tool(), "-m", model, "--mmproj", mmproj, "--video-items", video, "-o", tmp] + \
+                (["--no-soundtrack"] if no_soundtrack else [])
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
+            if r.returncode:
+                raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
+            shutil.rmtree(path, ignore_errors=True)
+            os.replace(tmp, path)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+    with open(os.path.join(path, "items.json")) as f:
+        out = json.load(f)
+    for it in out:
+        if "frame" in it:
+            it["frame"] = np.load(os.path.join(path, f"frame-{it['frame']}.npy"))
+        elif "audio" in it:
+            it["audio"] = np.load(os.path.join(path, f"audio-{it['audio']}.npy"))
+    return out
 
 
 def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *, threads: int = 16) -> VisionGolden:

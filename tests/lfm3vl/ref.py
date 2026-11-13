@@ -4,7 +4,8 @@ embeddings ``embd(0)`` are the image chunk's rows, the merged tokens in raster o
 
 The encoder (``Encoder``): llama.cpp's ``clip_graph_lfm3vl`` (``tools/mtmd/models/lfm3vl.cpp``) and transformers'
 ``Lfm3VlVisionModel`` + ``Lfm3VlMultiModalProjector`` on the mmproj's tensors for an image's pixels (3, H, W): the
-patchifier (a linear map of a patch's pixels: two temporal kernels on a still image, summed; no bias), RMSNorm
+patchifier (a linear map of a patch's pixels: two temporal kernels, on a still image summed, on a video's pair of frames
+one each; no bias), RMSNorm
 (``v.embedding_norm``), 14 layers [RMSNorm -> operator | RMSNorm -> SwiGLU 1024 -> 2560 -> 1024] with residuals, the
 operator a gated depthwise 3 x 3 convolution over the patch grid (``conv2d_in_proj`` 1024 -> [B; C; x], y = C conv(B x)
 with zero padding, ``conv2d_out_proj``) or bidirectional attention (16 query heads, 8 KV heads of 64; q / k RMSNorm per
@@ -126,20 +127,21 @@ class Encoder:
         return x + h
 
     def embed(self, pixels: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """The patchifier of pixels (3, H, W) (normalized, llama.cpp's inp_raw), RMS-normed: (ph pw, hidden) in raster
-        order."""
+        """The patchifier of pixels (normalized, llama.cpp's inp_raw), RMS-normed: (ph pw, hidden) in raster order. An
+        image (3, H, W) takes both temporal kernels, a video's pair of frames (2, 3, H, W) kernel t on frame t."""
         P, H = self.patch, self.hidden
         x = torch.as_tensor(np.asarray(pixels), dtype=self.dtype)
-        kern = (self.w("v.patch_embd.weight") + self.w("v.patch_embd.weight.1")).reshape(H, 3, P, P)
-        e = torch.nn.functional.conv2d(x[None], kern, stride=P)[0]
+        k0, k1 = (self.w(n).reshape(H, 3, P, P) for n in ("v.patch_embd.weight", "v.patch_embd.weight.1"))
+        conv = lambda img, k: torch.nn.functional.conv2d(img[None], k, stride=P)[0]
+        e = conv(x, k0 + k1) if x.ndim == 3 else conv(x[0], k0) + conv(x[1], k1)
         return self._rms(e.reshape(H, -1).T, "v.embedding_norm.weight")
 
     def forward(self, pixels: np.ndarray | torch.Tensor, trace: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
-        """Pixels (3, H, W) (normalized) -> the image's embeddings (ph pw / 4, projection_dim), the merged grid in
-        raster order. ``trace``: the intermediates ("embedding_norm", "layer_out-<il>", "proj_input_norm" in raster
-        order of the patches, "merged" (windows, 4 hidden))."""
+        """Pixels (3, H, W) of an image or (2, 3, H, W) of a video's pair (normalized) -> the embeddings (ph pw / 4,
+        projection_dim), the merged grid in raster order. ``trace``: the intermediates ("embedding_norm",
+        "layer_out-<il>", "proj_input_norm" in raster order of the patches, "merged" (windows, 4 hidden))."""
         P = self.patch
-        ph, pw = np.asarray(pixels).shape[1] // P, np.asarray(pixels).shape[2] // P
+        ph, pw = np.asarray(pixels).shape[-2] // P, np.asarray(pixels).shape[-1] // P
         tr = trace if trace is not None else {}
         x = self.embed(pixels)
         tr["embedding_norm"] = x

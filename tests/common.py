@@ -54,6 +54,51 @@ def essays() -> str:
     return "".join(essay(n) for n in names)
 
 
+# synthetic videos (``video_file``): name -> (size, rate, seconds, audio, the video stream's start); "astronaut": the
+# README's astronaut picture panned and zoomed, a LibriSpeech clip (6930-75918-0001, 14.2 s) as its soundtrack
+VIDEOS = {
+    "odd-25fps": ("320x240", "25", 2.6, True, 0.0),  # (5 frames: an odd last pair)
+    "ntsc-start": ("640x360", "30000/1001", 6.5, True, 0.5),  # (a fractional rate; the video starting at 0.5 s)
+    "short": ("200x120", "10", 1.0, True, 0.0),  # (4 frames at least)
+    "big-1080p": ("1920x1080", "30", 7.0, True, 0.0),  # (14 frames over the pixel bound: scaled down)
+    "silent": ("480x272", "24", 4.0, False, 0.0),  # (no audio stream)
+    "astronaut": ("960x540", "25", 14.2, True, 0.0),
+}
+ASTRONAUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "images", "sd15-astronaut.jpg")
+SPEECH_CLIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "librispeech", "6930-75918-0001.wav")
+
+
+def video_file(folder: str, name: str) -> str:
+    """A synthetic MP4 of ``VIDEOS`` (H.264, AAC) in folder, made by ffmpeg once (skip without ffmpeg)."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("no ffmpeg / ffprobe")
+    size, rate, sec, audio, start = VIDEOS[name]
+    path = os.path.join(folder, f"{name}.mp4")
+    if os.path.exists(path):
+        return path
+    cmd = ["ffmpeg", "-v", "error", "-y"]
+    if name == "astronaut":
+        if not os.path.exists(SPEECH_CLIP):
+            pytest.skip(f"{SPEECH_CLIP} missing: run tests/datasets/fetch_datasets.py")
+        w, h = size.split("x")
+        pan = (f"scale=1920:-2,zoompan=z='1+0.002*on':x='iw/2-(iw/zoom/2)+2*on':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}"
+               f":fps={rate}")
+        cmd += ["-loop", "1", "-framerate", rate, "-i", ASTRONAUT, "-i", SPEECH_CLIP, "-t", str(sec), "-vf", pan]
+    else:
+        if start:
+            cmd += ["-itsoffset", str(start)]
+        cmd += ["-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}:duration={sec}"]
+        if audio:
+            cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:beep_factor=4:duration={sec + start}"]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"] + (["-c:a", "aac"] if audio else [])
+    tmp = path + ".tmp.mp4"
+    subprocess.run([*cmd, tmp], check=True)
+    os.replace(tmp, path)
+    return path
+
+
 def draft_prompts(host: Any) -> dict[str, tuple[list[int], tuple[int, ...]]]:
     """The drafter gate's prompts (``draft_gate``) as a model's host side (``models.common.Model``) tokenizes them: the
     ids and where later prompts start (``OverlayModel.forced_drafts(turns=)``). Replies that copy their context (a

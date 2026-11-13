@@ -346,12 +346,13 @@ _GGUF_KINDS = KINDS[:4]
 
 
 def gguf_matrix(g: GGUFFile, name: str) -> Wt:
-    """A GGUF tensor as a matrix (rows, cols) of its file (F32, F16, BF16, Q8_0; other types dequantized into memory
-    of their own)."""
+    """A GGUF tensor as a matrix (rows, cols) of its file: F32, F16, BF16 or Q8_0 (the overlay's GEMMs read bfp16, so a
+    4-bit matrix would grow on every load: refused)."""
     t = g.tensor(name)
     sname = f"{os.path.basename(g.path)}:{name}"
     if t.qtype not in _GGUF_KINDS:
-        return memory(t.dequantize(), sname)
+        raise NotImplementedError(f"{g.path}: {name} is {t.qtype}: the NPU's media encoders take mmproj files of Q8_0, "
+                                  f"BF16, F16 or F32 weights (use the model's Q8_0 mmproj)")
     raw = t.raw if t.raw.dtype == np.uint8 else t.raw.view(np.uint8)
     return Wt.of(Source(sname, t.qtype, t.rows, t.cols, raw.reshape(t.rows, -1), (g.path, g.data)))
 

@@ -5,14 +5,20 @@
 // Built against a prebuilt llama.cpp tree (include/, ggml/include/, tools/mtmd/, build/bin/libmtmd.so) by
 // ref.py.
 //
-//   minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE -p PROMPT -o OUTDIR [-a ANSWER] [-e EMBD] [-n REGEX]
-//                 [--threads N]
+//   minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE [--image FILE ...] -p PROMPT -o OUTDIR [-a ANSWER] [-e EMBD]
+//                 [-n REGEX] [--no-soundtrack] [--threads N]
+//   minicpmv_dump -m MODEL --mmproj MMPROJ --video-items FILE -o OUTDIR [--no-soundtrack]
 //   minicpmv_dump -m MODEL --seq SEQ --pos POS -o OUTDIR [--from K] [--threads N]
 //
-// PROMPT: a text file with the media marker (mtmd_default_marker()) where the image goes; ANSWER: raw little-endian
-// int32 token ids appended after the prompt (teacher forcing); EMBD: raw float32 embeddings (n_tokens, n_embd) that the
-// language model takes for the image instead of the encoder's (the encoder is not run). REGEX: the encoder tensors
-// (names without the "-<il>" suffix) to dump.
+// FILE: an image, an audio file or a video (mtmd_helper_bitmap_init_from_file: a video through ffmpeg, its frames,
+// timestamps and soundtrack pieces as llama-server reads them; --no-soundtrack: frames only), one per media marker in
+// order. PROMPT: a text file with the media marker (mtmd_default_marker()) where each file goes; ANSWER: raw
+// little-endian int32 token ids appended after the prompt (teacher forcing); EMBD: raw float32 embeddings (the media
+// chunks' tokens in order, n_embd) that the language model takes instead of the encoders' (they are not run). REGEX:
+// the encoder tensors (names without the "-<il>" suffix) to dump.
+//
+// --video-items: the items mtmd's video helper gives for a video (no encoding): items.json ([{"text": s}, {"frame": k,
+// "w", "h"}, {"audio": k, "n"}] in order), frame-<k>.npy (h, w, 3) uint8, audio-<k>.npy (n,) float32.
 //
 // --seq: the language model alone on a whole sequence of embedding rows with given M-RoPE positions (the official
 // ones, which mtmd's are not): SEQ raw float32 (n, n_embd), the text tokens' rows too; POS raw int32 (n, 3), per token
@@ -193,8 +199,9 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 }
 
 static void usage() {
-    fprintf(stderr, "usage: minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE -p PROMPT -o OUTDIR [-a ANSWER.i32]\n"
-                    "                     [-e EMBD.f32] [-n REGEX] [--threads N]\n"
+    fprintf(stderr, "usage: minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE [--image FILE ...] -p PROMPT -o OUTDIR\n"
+                    "                     [-a ANSWER.i32] [-e EMBD.f32] [-n REGEX] [--no-soundtrack] [--threads N]\n"
+                    "       minicpmv_dump -m MODEL --mmproj MMPROJ --video-items FILE -o OUTDIR [--no-soundtrack]\n"
                     "       minicpmv_dump -m MODEL --seq SEQ.f32 --pos POS.i32 -o OUTDIR [--from K] [--threads N]\n");
     exit(1);
 }
@@ -286,8 +293,58 @@ static int run_sequence(llama_model * model, const std::string & seq_path, const
     return 0;
 }
 
+// --video-items: the helper's items of a video (as llama-server reads it from a buffer), no encoding
+static int dump_video_items(mtmd_context * vctx, const std::string & path, const mtmd_helper_init_opt & opt,
+                            const std::string & outdir) {
+    const std::string buf = read_file(path);
+    mtmd_helper_video * v = mtmd_helper_video_init_from_buf(vctx, (const unsigned char *) buf.data(), buf.size(),
+                                                            opt.video_params);
+    if (!v) {
+        fprintf(stderr, "cannot open %s as a video\n", path.c_str());
+        return 1;
+    }
+    FILE * js = fopen((outdir + "/items.json").c_str(), "w");
+    fprintf(js, "[");
+    int k = 0, n_frames = 0, n_audio = 0;
+    for (;; k++) {
+        mtmd_bitmap * bm = nullptr;
+        char * text = nullptr;
+        const int rc = mtmd_helper_video_read_next(v, &bm, &text);
+        if (rc == -1) {
+            break;
+        }
+        if (rc != 0) {
+            fprintf(stderr, "read_next failed\n");
+            return 1;
+        }
+        fprintf(js, "%s\n ", k ? "," : "");
+        if (text) {
+            fprintf(js, "{\"text\": \"%s\"}", text);
+            free(text);
+            continue;
+        }
+        const uint32_t nx = mtmd_bitmap_get_nx(bm), ny = mtmd_bitmap_get_ny(bm);
+        const unsigned char * data = mtmd_bitmap_get_data(bm);
+        if (mtmd_bitmap_is_audio(bm)) {
+            fprintf(js, "{\"audio\": %d, \"n\": %u}", n_audio, nx);
+            write_npy(outdir + "/audio-" + std::to_string(n_audio++) + ".npy", data, (size_t) nx * 4, {(int64_t) nx}, "<f4");
+        } else {
+            fprintf(js, "{\"frame\": %d, \"w\": %u, \"h\": %u}", n_frames, nx, ny);
+            write_npy(outdir + "/frame-" + std::to_string(n_frames++) + ".npy", data, (size_t) nx * ny * 3,
+                      {(int64_t) ny, (int64_t) nx, 3}, "|u1");
+        }
+        mtmd_bitmap_free(bm);
+    }
+    fprintf(js, "]\n");
+    fclose(js);
+    mtmd_helper_video_free(v);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
-    std::string model_path, mmproj_path, image_path, prompt_path, answer_path, embd_path, regex_arg, seq_path, pos_path;
+    std::string model_path, mmproj_path, prompt_path, answer_path, embd_path, regex_arg, seq_path, pos_path, items_path;
+    std::vector<std::string> media;
+    bool no_soundtrack = false;
     int from = 0;
     State st;
     int threads = 16;
@@ -304,7 +361,11 @@ int main(int argc, char ** argv) {
         } else if (a == "--mmproj") {
             mmproj_path = next();
         } else if (a == "--image") {
-            image_path = next();
+            media.push_back(next());
+        } else if (a == "--video-items") {
+            items_path = next();
+        } else if (a == "--no-soundtrack") {
+            no_soundtrack = true;
         } else if (a == "-p") {
             prompt_path = next();
         } else if (a == "-a") {
@@ -328,8 +389,9 @@ int main(int argc, char ** argv) {
         }
     }
     const bool sequence = !seq_path.empty();
+    const bool items = !items_path.empty();
     if (model_path.empty() || st.outdir.empty() || (sequence ? pos_path.empty()
-                                                              : mmproj_path.empty() || image_path.empty() || prompt_path.empty())) {
+                                                     : mmproj_path.empty() || (!items && (media.empty() || prompt_path.empty())))) {
         usage();
     }
     st.names = std::regex(regex_arg.empty() ? "$^" : regex_arg);
@@ -371,17 +433,29 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "cannot load %s\n", mmproj_path.c_str());
         return 1;
     }
-    mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(vctx, image_path.c_str(), false,
-                                                                       mtmd_helper_init_opt_default());
-    if (!bw.bitmap) {
-        fprintf(stderr, "cannot read %s\n", image_path.c_str());
-        return 1;
+    mtmd_helper_init_opt opt = mtmd_helper_init_opt_default();
+    opt.video_params.no_soundtrack = no_soundtrack;
+    if (items) {
+        const int rc = dump_video_items(vctx, items_path, opt, st.outdir);
+        mtmd_free(vctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return rc;
+    }
+    std::vector<mtmd_helper_bitmap_wrapper> wrappers;
+    std::vector<const mtmd_bitmap *> bitmaps;
+    for (const auto & path : media) {
+        wrappers.push_back(mtmd_helper_bitmap_init_from_file(vctx, path.c_str(), false, opt));
+        if (!wrappers.back().bitmap) {
+            fprintf(stderr, "cannot read %s\n", path.c_str());
+            return 1;
+        }
+        bitmaps.push_back(wrappers.back().bitmap);
     }
     const std::string prompt = read_file(prompt_path);
     mtmd_input_text text = {prompt.c_str(), prompt.size(), true, true};
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-    const mtmd_bitmap * bitmaps[] = {bw.bitmap};
-    if (mtmd_tokenize(vctx, chunks, &text, bitmaps, 1) != 0) {
+    if (mtmd_tokenize(vctx, chunks, &text, bitmaps.data(), bitmaps.size()) != 0) {
         fprintf(stderr, "mtmd_tokenize failed\n");
         return 1;
     }
@@ -407,6 +481,11 @@ int main(int argc, char ** argv) {
     llama_pos n_past = 0;
     int seq_index = 0;  // (the token index in the whole sequence)
     int n_images = 0;
+    size_t embd_at = 0;  // (the given embeddings' rows used so far)
+    std::string given_raw;
+    if (!embd_path.empty()) {
+        given_raw = read_file(embd_path);
+    }
     auto decode_text = [&](const llama_token * toks, size_t n) {
         llama_batch batch = llama_batch_init((int) n, 0, 1);
         batch.n_tokens = (int) n;
@@ -459,15 +538,15 @@ int main(int argc, char ** argv) {
         const int n_embd = llama_model_n_embd_inp(model);
         std::vector<float> given;
         float * embd = nullptr;
-        if (!embd_path.empty()) {  // (the image's embeddings given)
-            const std::string raw = read_file(embd_path);
-            if (raw.size() != n_tok * n_embd * 4) {
-                fprintf(stderr, "%s: %zu bytes, the image takes %zu x %d float32\n", embd_path.c_str(), raw.size(), n_tok,
-                        n_embd);
+        if (!embd_path.empty()) {  // (the media chunks' embeddings given, in order)
+            if (given_raw.size() < (embd_at + n_tok) * n_embd * 4) {
+                fprintf(stderr, "%s: %zu bytes, the media chunks take more than %zu x %d float32\n", embd_path.c_str(),
+                        given_raw.size(), embd_at + n_tok, n_embd);
                 return 1;
             }
             given.resize(n_tok * n_embd);
-            memcpy(given.data(), raw.data(), raw.size());
+            memcpy(given.data(), given_raw.data() + embd_at * n_embd * 4, n_tok * n_embd * 4);
+            embd_at += n_tok;
             embd = given.data();
         } else {
             if (mtmd_encode_chunk(vctx, chunk) != 0) {
@@ -506,12 +585,17 @@ int main(int argc, char ** argv) {
               {(int64_t) logit_tokens.size(), n_vocab}, "<f4");
     {
         FILE * f = fopen((st.outdir + "/meta.json").c_str(), "w");
-        fprintf(f, "{\"model\": \"%s\", \"mmproj\": \"%s\", \"image\": \"%s\", \"tokens\": %d, \"images\": %d}\n",
-                model_path.c_str(), mmproj_path.c_str(), image_path.c_str(), seq_index, n_images);
+        fprintf(f, "{\"model\": \"%s\", \"mmproj\": \"%s\", \"media\": %zu, \"tokens\": %d, \"images\": %d}\n",
+                model_path.c_str(), mmproj_path.c_str(), media.size(), seq_index, n_images);
         fclose(f);
     }
     mtmd_input_chunks_free(chunks);
-    mtmd_bitmap_free(bw.bitmap);
+    for (auto & w : wrappers) {
+        mtmd_bitmap_free(w.bitmap);
+        if (w.video_ctx) {
+            mtmd_helper_video_free(w.video_ctx);
+        }
+    }
     mtmd_free(vctx);
     llama_free(ctx);
     llama_model_free(model);
