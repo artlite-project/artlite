@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
@@ -45,7 +46,7 @@ from ..sequence import Sequence, splice_media
 from ..templating import TEMPLATE_KEY, file_template, render_template
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LfmImage
-from .overlay import KV_K, LfmOverlay
+from .overlay import LfmOverlay
 from .prefill import SIZES, LfmPrefill
 
 # the model card's sampling (the file's general.sampling.* over it)
@@ -162,6 +163,16 @@ class NpuLfm(OverlayModel):
         return self._dispatch(lambda: self.overlay.logits_of(x))
 
 
+def check_tower(mmproj: str, config: AudioConfig | ClipConfig, supported: tuple[str, ...], *, what: str, hidden: int
+                ) -> None:
+    """NotImplementedError unless the mmproj's tower has a ``supported`` projector (``what`` names it in the message);
+    ValueError unless it embeds into the language model's ``hidden`` size."""
+    if config.projector not in supported:
+        raise NotImplementedError(f"{mmproj}: {what} {config.projector!r} (supported: {', '.join(supported)})")
+    if config.projection_dim != hidden:
+        raise ValueError(f"{mmproj}: embeddings of {config.projection_dim}, the language model's {hidden}")
+
+
 class Lfm(Model):
     """An lfm3 GGUF file: the architecture, tokenizer and chat template from its metadata. Thinking: the template opens
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
@@ -184,8 +195,7 @@ class Lfm(Model):
 
     def __init__(self, path: str, *, kv_k: str = "single", mmproj: str | None = None, image_min_tokens: int | None = None,
                  image_max_tokens: int | None = None):
-        if kv_k not in KV_K:
-            raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+        kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = LfmConfig.from_gguf(self.gguf)
         self.weights = WeightBuffer(LfmImage(self.gguf, self.cfg))
@@ -201,24 +211,14 @@ class Lfm(Model):
             mg = GGUFFile(mmproj)
             has_vision = bool(mg.meta.get("clip.has_vision_encoder", "clip.vision.projector_type" in mg.meta))
             if AudioConfig.has_audio(mg):
-                ac = AudioConfig.from_gguf(mg)
-                if ac.projector not in a_npu.PROJECTORS:
-                    raise NotImplementedError(f"{mmproj}: audio projector {ac.projector!r} (supported: "
-                                              f"{', '.join(a_npu.PROJECTORS)})")
-                if ac.projection_dim != self.cfg.hidden_size:
-                    raise ValueError(f"{mmproj}: embeddings of {ac.projection_dim}, the language model's "
-                                     f"{self.cfg.hidden_size}")
+                check_tower(mmproj, AudioConfig.from_gguf(mg), a_npu.PROJECTORS, what="audio projector",
+                            hidden=self.cfg.hidden_size)
                 self.audio = a_npu.NpuAudio(mmproj, load=not has_vision)
             elif not has_vision:
                 raise ValueError(f"{mmproj}: neither a vision nor a speech encoder")
             if has_vision:
-                clip = ClipConfig.from_gguf(mg)
-                if clip.projector not in vl_npu.PROJECTORS:
-                    raise NotImplementedError(f"{mmproj}: projector {clip.projector!r} (supported: "
-                                              f"{', '.join(vl_npu.PROJECTORS)})")
-                if clip.projection_dim != self.cfg.hidden_size:
-                    raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's "
-                                     f"{self.cfg.hidden_size}")
+                check_tower(mmproj, ClipConfig.from_gguf(mg), vl_npu.PROJECTORS, what="projector",
+                            hidden=self.cfg.hidden_size)
                 if image_max_tokens is None and not self.cfg.causal:
                     image_max_tokens = D1_IMAGE_TOKENS
                 self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens,

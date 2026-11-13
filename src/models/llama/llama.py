@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
@@ -33,7 +34,7 @@ from ..model import Model
 from ..overlay_model import OverlayModel
 from ..sampling import Sampling
 from .image import LlamaImage
-from .overlay import KV_K, LlamaOverlay, check_formats
+from .overlay import LlamaOverlay, check_formats
 from .prefill import SIZES, LlamaPrefill
 from .tokenizer import BOS, chat_prompt, load_tokenizer
 
@@ -101,8 +102,7 @@ class Llama(Model):
     name = "Llama 3"
 
     def __init__(self, path: str, *, kv_k: str = "single"):
-        if kv_k not in KV_K:
-            raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+        kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = LlamaConfig.from_gguf(self.gguf)
         image = LlamaImage(self.gguf, self.cfg)

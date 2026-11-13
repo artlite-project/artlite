@@ -21,11 +21,12 @@ import pytest
 import torch
 
 from artlite.decode import kv
+from artlite.decode.kv import KV_K
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import llama_gguf
 from artlite.operators.design import COLS
-from models.llama.overlay import KV_K, LlamaOverlay
+from models.llama.overlay import LlamaOverlay
 
 from ..common import as_torch, essay, to_torch
 from ..models import llama_path

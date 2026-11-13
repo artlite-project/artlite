@@ -79,6 +79,11 @@ class Sequence:
         return [next(rows).tobytes() if g else int(t) for t, g in zip(self.ids, self.given, strict=True)]
 
 
+def token_ids(tokens: list[int] | np.ndarray | Sequence) -> list[int] | np.ndarray:
+    """A prompt's token ids: a ``Sequence``'s (``MEDIA`` where an embedding row stands for the token), or the ids given."""
+    return tokens.ids if isinstance(tokens, Sequence) else tokens
+
+
 def splice(text: str, marker: str, items: list[Sequence], encode: Callable[[str], list[int]]) -> list[int] | Sequence:
     """A text's tokens with ``items`` where it has ``marker`` (one each, in order): the pieces between the markers
     tokenized one by one (llama.cpp's mtmd); without items the text's ids (its markers stay text)."""

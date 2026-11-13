@@ -18,6 +18,15 @@ import numpy as np
 from ..operators.bfp16 import block_bytes, block_values
 from .vring import tails
 
+KV_K = {"single": 1, "hilo": 2}  # K precision of the caches (``kv_k``): K panels per record
+
+
+def kv_precision(kv_k: str) -> int:
+    """The K panels per record (``Records.kp``) of a K precision (``kv_k``: "single" or "hilo"); ValueError: another."""
+    if kv_k not in KV_K:
+        raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+    return KV_K[kv_k]
+
 
 @dataclass(frozen=True)
 class Records:

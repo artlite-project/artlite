@@ -1,6 +1,7 @@
 """The host side of a model file (``Model``: tokenizer, chat template, default sampling, what it takes and gives:
 ``Capabilities``); ``load`` puts it on the NPU (``npu_model.NpuModel``)."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,14 @@ from .sampling import Sampling
 from .sequence import Sequence as Tokens
 
 MEDIA_MARKER = "<__media__>"  # where an image goes in a prompt's text (llama.cpp's mtmd marker)
+
+
+def media_parts(*, images: Sequence[object] = (), videos: Sequence[object] = (), audio: Sequence[object] = ()
+                ) -> list[dict[str, object]]:
+    """A message's media parts (``Model.chat``): the ``images``, then the ``videos``, then the ``audio`` clips (files or
+    their bytes)."""
+    return [{"type": "image", "image": im} for im in images] + [{"type": "video", "video": v} for v in videos] + \
+        [{"type": "audio", "audio": a} for a in audio]
 
 
 @dataclass(frozen=True)
@@ -106,8 +115,7 @@ class Model:
             raise ValueError(f"{self.name}: no video input (LFM3-VL's and LFM3-Omni's mmproj)")
         if audio and self.audio is None:
             raise ValueError(f"{self.name}: audio needs a speech encoder (an mmproj file)")
-        media = [{"type": "image", "image": im} for im in images] + [{"type": "video", "video": v} for v in videos] + \
-            [{"type": "audio", "audio": a} for a in audio]
+        media = media_parts(images=images, videos=videos, audio=audio)
         if raw:
             if media:
                 raise ValueError("images, videos and audio go through the chat template (not a raw prompt)")

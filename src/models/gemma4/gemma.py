@@ -33,6 +33,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import parallel_compile
+from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
@@ -232,8 +233,7 @@ class Gemma(Model):
     reasoning = ("<|channel>thought", "<channel|>")  # (a thought is the "thought" channel)
 
     def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None):
-        if kv_k not in ("hilo", "single"):
-            raise ValueError(f"kv_k: {kv_k!r} (one of hilo, single)")
+        kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.kv_k = kv_k
         kind = drafter_type(spec_type, draft_model, ("draft-mtp",), self.name)
         if kind == "draft-mtp" and draft_model is None and not os.path.exists(assistant_of(path)):

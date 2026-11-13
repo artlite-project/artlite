@@ -31,6 +31,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from .sequence import token_ids
+
 NMAX = 32  # a match's tokens at most
 # P(the i-th context draft is accepted | the ones before it were) after a match of m tokens, per bucket of m (1, 2, 3,
 # 4, 5, 6-8, 9-16, 17 on): agent sessions' (Claude Code, Codex and opencode on Qwen3.6-35B-A3B, temperature 1)
@@ -65,7 +67,7 @@ class Lookup:
     """A generation's sequence so far (token ids; an image's rows, negative, match nothing) and its context drafts."""
 
     def __init__(self, tokens: Sequence[int] | np.ndarray):
-        ids = np.asarray(getattr(tokens, "ids", tokens), np.int32).reshape(-1)
+        ids = np.asarray(token_ids(tokens), np.int32).reshape(-1)
         self._buf = np.empty(max(2 * len(ids), 1024), np.int32)
         self._buf[:len(ids)] = ids
         self.n = len(ids)

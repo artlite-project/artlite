@@ -15,6 +15,8 @@ from ml_dtypes import bfloat16
 
 from artlite import _native
 
+from .sequence import MEDIA, token_ids
+
 LogitsLike = np.ndarray  # a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32
 _rng = random.Random()  # (sampling's draws: ``seed``)
 
@@ -132,10 +134,10 @@ class Penalties:
         self.counts: collections.Counter[int] = collections.Counter()
         self.mask: Mask | None = None
         tail: list[int] = []
-        for t in reversed(getattr(prompt, "ids", prompt)):
+        for t in reversed(token_ids(prompt)):
             if len(tail) == self.n:
                 break
-            if t >= 0:
+            if t != MEDIA:
                 tail.append(int(t))
         for t in reversed(tail):
             self.accept(t)

@@ -102,6 +102,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             raise ValueError(f"the KV cache holds {self.capacity} positions")
         if not self.causal:
             raise ValueError("a non-causal model reads whole prompts (readouts), it runs no decode steps")
+        if len(tokens) > self.overlay.SLOTS:
+            raise ValueError(f"a step of {len(tokens)} tokens: the overlay runs {self.overlay.SLOTS} at most")
         t0 = time.perf_counter()
         args = self._step_inputs(tokens)
         self.t_host += time.perf_counter() - t0

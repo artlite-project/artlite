@@ -14,6 +14,7 @@ from artlite import _native
 
 from .drafts import EWMA, Lookup, Planner
 from .sampling import LogitsLike, Mask, Penalties, Probs, Sampling
+from .sequence import token_ids
 
 
 class SpeculativeMixin:
@@ -179,7 +180,7 @@ class SpeculativeMixin:
         token = choose(logits)
         n = 1
         yield token
-        ctx = Lookup(getattr(prompt, "ids", prompt)) if self.lookup and most > 0 else None
+        ctx = Lookup(token_ids(prompt)) if self.lookup and most > 0 else None
         if ctx is not None:
             ctx.extend([token])
         self._begin()

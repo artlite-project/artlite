@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+from typing import NoReturn
 
 import jinja2
 import numpy as np
@@ -33,8 +34,8 @@ from . import is_diffusers, open_model, open_pipeline
 from .detokenizer import StreamDecoder
 from .hostenv import performance_mode, stale_install
 from .lfm3a.host import asr_system
-from .model import MEDIA_MARKER
-from .npu_model import auto_capacity
+from .model import MEDIA_MARKER, Model, media_parts
+from .npu_model import NpuModel, auto_capacity
 from .sampling import seed
 from .sd15.pipeline import check_request
 from .sd15.png import write_png
@@ -140,6 +141,17 @@ def prompt_text(args: argparse.Namespace) -> str:
     return args.prompt
 
 
+def fail(error: object) -> NoReturn:
+    """Exit with ``error`` as the tool's message."""
+    sys.exit(f"artlite-cli: {error}")
+
+
+def loaded(args: argparse.Namespace, model: Model, npu: NpuModel, t0: float, what: str) -> None:
+    """The line to stderr that a model is loaded (``t0``: the start of its opening), ``what`` it is loaded for."""
+    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): {what}; loaded in {time.perf_counter() - t0:.1f} s: "
+                     f"{npu.describe()}\n")
+
+
 def generate_image(args: argparse.Namespace) -> None:
     """Text to image with a diffusers pipeline: the PNG to ``-o``, the load time and each phase's time to stderr."""
     name = os.path.basename(os.path.normpath(args.model))
@@ -149,7 +161,7 @@ def generate_image(args: argparse.Namespace) -> None:
         text = prompt_text(args)
         sd = open_pipeline(args.model)
     except (OSError, ValueError, NotImplementedError) as e:
-        sys.exit(f"artlite-cli: {e}")
+        fail(e)
     sys.stderr.write(f"{name} ({sd.name}): loaded in {time.perf_counter() - t0:.1f} s\n")
     tty = sys.stderr.isatty()
 
@@ -163,7 +175,7 @@ def generate_image(args: argparse.Namespace) -> None:
     try:
         write_png(args.output or "output.png", out.pixels)
     except OSError as e:
-        sys.exit(f"artlite-cli: {e}")
+        fail(e)
     steps = f"{args.steps} step{'s' * (args.steps > 1)}"
     sys.stderr.write(f"text encoder: {out.t_text:.2f} s; {steps} ({args.sampler}, cfg scale {args.cfg_scale:g}): "
                      f"{out.t_steps:.2f} s ({out.t_steps / args.steps:.2f} s per step); VAE decoder: {out.t_vae:.2f} s\n"
@@ -177,14 +189,13 @@ def speak(args: argparse.Namespace, options: dict[str, object]) -> None:
     out = args.output or "output.wav"
     t0 = time.perf_counter()
     try:
-        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        model = open_model(args.model, **options)
         if not model.capabilities.speech:
             raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
         npu = model.load(capacity=args.ctx_size or 4096, prefill=not args.no_prefill)
     except (OSError, ValueError, NotImplementedError) as e:
-        sys.exit(f"artlite-cli: {e}")
-    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): speech; loaded in {time.perf_counter() - t0:.1f} s: "
-                     f"{npu.describe()}\n")
+        fail(e)
+    loaded(args, model, npu, t0, "speech")
     st, chunks, first = SpeechStats(), [], None
     t0 = time.perf_counter()
     try:
@@ -194,7 +205,7 @@ def speak(args: argparse.Namespace, options: dict[str, object]) -> None:
                 first = time.perf_counter() - t0
             chunks.append(y)
     except ValueError as e:
-        sys.exit(f"artlite-cli: {e}")
+        fail(e)
     dt = time.perf_counter() - t0
     y = np.concatenate(chunks)
     with open(out, "wb") as f:
@@ -213,12 +224,11 @@ def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
 
     t0 = time.perf_counter()
     try:
-        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        model = open_model(args.model, **options)
         if not model.capabilities.speech:
             raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
         text = prompt_text(args) if args.prompt is not None or args.file else ""
-        content: list[dict[str, object]] = [{"type": "image", "image": im} for im in args.image] + \
-            [{"type": "video", "video": v} for v in args.video] + [{"type": "audio", "audio": a} for a in args.audio]
+        content = media_parts(images=args.image, videos=args.video, audio=args.audio)
         if text:
             content.append({"type": "text", "text": text})
         if not content:
@@ -227,9 +237,8 @@ def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
             [{"role": "user", "content": content}]
         npu = model.load(capacity=args.ctx_size or 8192, prefill=not args.no_prefill)
     except (OSError, ValueError, NotImplementedError) as e:
-        sys.exit(f"artlite-cli: {e}")
-    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): a spoken reply; loaded in "
-                     f"{time.perf_counter() - t0:.1f} s: {npu.describe()}\n")
+        fail(e)
+    loaded(args, model, npu, t0, "a spoken reply")
     st, chunks, dec = SpeechStats(), [], StreamDecoder(model.tokenizer)
     t0, first = time.perf_counter(), None
     for kind, x in model.voice_reply(msgs, seed=args.seed, stats=st):
@@ -256,20 +265,19 @@ def live(args: argparse.Namespace, options: dict[str, object]) -> None:
     row = STRIDE * HOP  # (samples of a row)
 
     if not args.audio or args.prompt is not None or args.file:
-        sys.exit("artlite-cli: --live transcribes --audio files (no -p / -f)")
+        fail("--live transcribes --audio files (no -p / -f)")
     t0 = time.perf_counter()
     try:
-        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        model = open_model(args.model, **options)
         if model.audio is None:
             raise ValueError("--live needs the model's speech encoder (--mmproj: LFM3-Audio's)")
         clips = [load_audio(a) for a in args.audio]
         npu = model.load(capacity=args.ctx_size or 2048, prefill=not args.no_prefill)
         asr = LiveAsr(model, npu, model.audio.encoder)
     except (OSError, ValueError, NotImplementedError) as e:
-        sys.exit(f"artlite-cli: {e}")
+        fail(e)
     npu.prepare(64)
-    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): live ASR; loaded in {time.perf_counter() - t0:.1f} "
-                     f"s: {npu.describe()}\n")
+    loaded(args, model, npu, t0, "live ASR")
     step = SR // 10
     for x in clips:
         asr.start()
@@ -307,7 +315,9 @@ def main(argv: list[str] | None = None) -> None:
     name = os.path.basename(args.model)
     t0 = time.perf_counter()
     options = {"kv_k": args.kv_k, "mmproj": args.mmproj, "max_slices": args.max_slices,
-               "image_min_tokens": args.image_min_tokens, "image_max_tokens": args.image_max_tokens, **spec_options(args)}
+               "image_min_tokens": args.image_min_tokens, "image_max_tokens": args.image_max_tokens,
+               **spec_options(args)}
+    options = {k: v for k, v in options.items() if v is not None}  # (``open_model``'s)
     variables = {k: v for k, v in args.chat_template_kwargs.items() if k not in TEMPLATE_RESERVED} | \
         ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
     if args.live:
@@ -322,7 +332,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         text = prompt_text(args)
         template = template_option(args.chat_template, args.chat_template_file)
-        model = open_model(args.model, chat_template=template, **{k: v for k, v in options.items() if v is not None})
+        model = open_model(args.model, chat_template=template, **options)
         asr = bool(args.audio) and not args.video and args.prompt is None and not args.file
         system = args.system_prompt or (asr_system(args.language) if asr else None)
         ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
@@ -334,9 +344,9 @@ def main(argv: list[str] | None = None) -> None:
         sampling = dataclasses.replace(sampling, **{k: v for k, v in given.items() if v is not None},
                                        greedy=sampling.greedy or args.greedy)
     except jinja2.TemplateError as e:  # (the template refuses the prompt or a variable)
-        sys.exit(f"artlite-cli: the chat template failed: {e}")
+        fail(f"the chat template failed: {e}")
     except (OSError, ValueError, NotImplementedError) as e:
-        sys.exit(f"artlite-cli: {e}")
+        fail(e)
     if model.vision is not None and (args.image or args.video):
         v = model.vision
         what = ", ".join(f"{n} {k}" for n, k in ((len(args.image), "image(s)"), (len(args.video), "video(s)")) if n)
@@ -347,17 +357,16 @@ def main(argv: list[str] | None = None) -> None:
         sys.stderr.write(f"{len(args.audio)} audio clip(s) through the encoder in {a.t_encode:.2f} s\n")
     capacity = args.ctx_size or auto_capacity(len(ids) + max(args.n_predict, 0))
     if len(ids) >= capacity:
-        sys.exit(f"artlite-cli: a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")
+        fail(f"a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")
     try:
         npu = model.load(capacity=capacity, prefill=not args.no_prefill)
     except NotImplementedError as e:
-        sys.exit(f"artlite-cli: {name}: not supported yet: {e}")
+        fail(f"{name}: not supported yet: {e}")
     npu.lookup = not args.no_lookup
     if args.spec_draft_n_max is not None:
         npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
     npu.prepare(len(ids))
-    sys.stderr.write(f"{name} ({model.name}): {len(ids)} prompt tokens; loaded in {time.perf_counter() - t0:.1f} s: "
-                     f"{npu.describe()}\n")
+    loaded(args, model, npu, t0, f"{len(ids)} prompt tokens")
     out = StreamDecoder(model.tokenizer)
     t0 = time.perf_counter()
     logits = npu.forward(ids)

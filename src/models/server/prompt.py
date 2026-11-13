@@ -19,7 +19,7 @@ import jinja2
 from starlette.concurrency import run_in_threadpool
 
 from ..model import MEDIA_MARKER
-from ..sequence import data_bytes
+from ..sequence import data_bytes, token_ids
 from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
@@ -236,7 +236,7 @@ class PromptBuilder:
         markers = model.reasoning
         if markers is None:
             return False
-        last = [int(t) for t in getattr(ids, "ids", ids)[-8:] if t >= 0]  # (a sequence's ids; an image's rows: none)
+        last = [int(t) for t in token_ids(ids)[-8:] if t >= 0]  # (a sequence's ids; an image's rows: none)
         tail = model.tokenizer.decode_bytes(last, special=True).decode("utf-8", errors="replace")
         return tail.rstrip().endswith(markers[0])
 

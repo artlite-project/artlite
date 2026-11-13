@@ -9,6 +9,7 @@ smaller than their block's largest, which a single block per 8 dims loses (KL 0.
 of Qwen3 0.6B against ~0 with hi + lo, the CPU model with the cache's roundings).
 """
 
+from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
@@ -19,10 +20,11 @@ from ..sampling import Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LlamaImage
 from .llama import NpuLlama
-from .overlay import KV_K, check_formats
+from .overlay import check_formats
 
 # the model card's sampling (thinking, not)
-SAMPLING = {True: {"temp": 0.6, "top_k": 20, "top_p": 0.95}, False: {"temp": 0.7, "top_k": 20, "top_p": 0.8}}
+THINK_SAMPLING = Sampling(temp=0.6, top_k=20, top_p=0.95)
+PLAIN_SAMPLING = Sampling(temp=0.7, top_k=20, top_p=0.8)
 
 
 class Qwen3(Model):
@@ -37,8 +39,7 @@ class Qwen3(Model):
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
 
     def __init__(self, path: str, *, kv_k: str = "hilo"):
-        if kv_k not in KV_K:
-            raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+        kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = LlamaConfig.from_gguf(self.gguf)
         image = LlamaImage(self.gguf, self.cfg)
@@ -59,8 +60,7 @@ class Qwen3(Model):
                                                  **(variables or {})))
 
     def sampling(self, *, think: bool = False) -> Sampling:
-        s = SAMPLING[think]
-        return Sampling(temp=s["temp"], top_k=s["top_k"], top_p=s["top_p"])
+        return THINK_SAMPLING if think else PLAIN_SAMPLING
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
         return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,

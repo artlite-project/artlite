@@ -107,7 +107,6 @@ from .image import CH, LfmImage
 
 PHASES = {"conv": ("in", "conv", "out", "gate_up", "down"), "attn": ("qkv", "att", "o", "gate_up", "down")}
 OPS = ("att", "conv")  # (the operator cores' phases)
-KV_K = {"single": 1, "hilo": 2}  # K precision of the caches (``kv_k``): K panels per record
 CHAIN = 2  # columns per KV head
 TOKENS = 2 * SLOTS  # token objects: t = SLOTS kind + a, of the sub-step from slot a on (kind 0 SWA, 1 full)
 KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache
@@ -141,12 +140,11 @@ class LfmOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None):
-        if kv_k not in KV_K:
-            raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+        kp = kv.kv_precision(kv_k)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
         cfg, img = self.cfg, self.image
         assert cfg.num_key_value_heads * CHAIN == COLS and cfg.conv_width == CV.WIDTH
-        self.hd, self.nh, self.kp = cfg.head_dim, cfg.q_per_kv, KV_K[kv_k]
+        self.hd, self.nh, self.kp = cfg.head_dim, cfg.q_per_kv, kp
         self.at = at = Attn(hds=(self.hd,), rot=(cfg.rot("swa"), cfg.rot("full")), chain=CHAIN, heads=self.nh,
                             kp=self.kp, qk_norm=True, qk_weights=True, eps=cfg.rms_norm_eps, a_bytes=self.T, gate=True,
                             conv=CV.ConvJob())
@@ -738,4 +736,4 @@ class LfmOverlay(ModelOverlay):
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
 
-__all__ = ["KV_K", "KV_PAD", "LfmOverlay"]
+__all__ = ["KV_PAD", "LfmOverlay"]

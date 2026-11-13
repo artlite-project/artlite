@@ -91,7 +91,6 @@ from .image import LlamaImage
 
 PHASES = ("qkv", "att", "o", "gate_up", "down")
 FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM}
-KV_K = {"single": 1, "hilo": 2}  # K precision of the caches (``kv_k``): K panels per record
 KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache (its largest chunk's
 # runtime offsets range over the caches and this pad, the range every chunk size's parameter takes: ``prefill.MAX_T``)
 
@@ -135,12 +134,11 @@ class LlamaOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None):
-        if kv_k not in KV_K:
-            raise ValueError(f"kv_k: {kv_k!r} (one of {', '.join(KV_K)})")
+        kp = kv.kv_precision(kv_k)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
         cfg, img = self.cfg, self.image
         fmts = check_formats(img)
-        self.hd, self.nh, self.kp = cfg.head_dim, cfg.q_per_kv, KV_K[kv_k]
+        self.hd, self.nh, self.kp = cfg.head_dim, cfg.q_per_kv, kp
         self.at = at = Attn(hds=(self.hd,), rot=(self.hd // 2,), chain=1, heads=self.nh, kp=self.kp,
                             qk_norm=cfg.qk_norm, qk_weights=cfg.qk_norm, eps=cfg.rms_norm_eps, a_bytes=self.T)
         gu = {b.R for L in self.layers for b in img.region(L, "gate_up").blocks}
@@ -481,4 +479,4 @@ class LlamaOverlay(ModelOverlay):
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
 
-__all__ = ["KV_K", "KV_PAD", "LlamaOverlay", "check_formats"]
+__all__ = ["KV_PAD", "LlamaOverlay", "check_formats"]

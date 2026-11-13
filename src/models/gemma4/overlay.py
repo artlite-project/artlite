@@ -142,9 +142,7 @@ class GemmaOverlay(ModelOverlay):
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
         cfg, img = self.cfg, self.image
         assert self.T == TILE_BYTES
-        if kv_k not in ("hilo", "single"):
-            raise ValueError(f"kv_k: {kv_k!r} (hilo, single)")
-        self.at = at = AT.GemmaAttn(cfg, kp=2 if kv_k == "hilo" else 1)
+        self.at = at = AT.GemmaAttn(cfg, kp=kv.kv_precision(kv_k))
         self.G = at.kp + 1  # (cache objects per group)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
         self.op = GemmaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, eps=cfg.rms_norm_eps,
