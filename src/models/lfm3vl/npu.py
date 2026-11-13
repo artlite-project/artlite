@@ -1,6 +1,7 @@
 """LFM3-VL's images on the NPU for the lfm3 language models (``NpuVision``): an image at its encoder size
 (``host.image_pixels``: between ``min_tokens`` and ``max_tokens`` merged tokens), its embeddings
-(``models.lfm3vl.encoder.Encoder``: on the vision overlay in a hardware context of its own) and its tokens
+(``models.lfm3vl.encoder.Encoder``: on the vision overlay in a hardware context of its own; with LFM3-Omni's mmproj on
+the one its speech networks share, ``models.lfm.lfm.media_device``) and its tokens
 (``host.Grid.sequence``).
 
 Every load packs the weights from the mmproj file (BF16 / F16 / Q8_0 -> BFP16: ``artlite.vision.weights``, the native
@@ -31,7 +32,7 @@ from . import encoder as V
 from .host import MAX_TOKENS, Grid, image_pixels, token_bounds
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the programs)
-_SOURCES = ("artlite/vision", "models/lfm3vl/encoder.py", "artlite/txn.py", "artlite/operators/bfp16.py",
+SOURCES = ("artlite/vision", "models/lfm3vl/encoder.py", "artlite/txn.py", "artlite/operators/bfp16.py",
             "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
             "artlite/overlay.py", "models/lfm3vl/npu.py")
 KEEP = 8  # images whose embeddings are kept
@@ -59,7 +60,7 @@ class NpuVision:
 
     markup = ("<|vision_start|>", "<|vision_end|>")  # (around an image's tokens: llama.cpp's mtmd, the chat template's)
 
-    def __init__(self, path: str, *, min_tokens: int | None = None, max_tokens: int | None = None):
+    def __init__(self, path: str, *, min_tokens: int | None = None, max_tokens: int | None = None, load: bool = True):
         self.path = path
         self.gguf = GGUFFile(path)
         self.clip = c = ClipConfig.from_gguf(self.gguf)
@@ -76,25 +77,44 @@ class NpuVision:
             raise ValueError(f"image tokens {self.min_tokens} .. {self.max_tokens}: 1 <= min <= max <= {TOKENS_LIMIT}")
         self._kept: collections.OrderedDict[bytes, np.ndarray] = collections.OrderedDict()
         self.t_encode, self.entries = 0.0, 0  # (the encoder's time and images so far)
-        self.encoder = self._load()
+        self.encoder: V.Encoder | None = self._load() if load else None  # (else ``build`` on a device of the caller's)
 
-    def _load(self) -> V.Encoder:
-        get = gguf_getter(self.gguf)
-        w = V.weights(get, V.kinds_of(self.gguf.tensor_info, self.clip.layers), self.clip.projection_dim)
-        bands = -(-self.max_tokens // WIN)
-        cache = state_dir("lfm3vl", self.path, _SOURCES, [self.path])
-        if (got := load_state(cache, sources(w), accept=lambda st: st["max_bands"] >= bands)) is not None:
-            npu, st = got
+    def weights(self) -> dict:
+        """The encoder's weights (views of the mmproj's tensors)."""
+        return V.weights(gguf_getter(self.gguf), V.kinds_of(self.gguf.tensor_info, self.clip.layers),
+                         self.clip.projection_dim)
+
+    def accept(self, state: dict) -> bool:
+        """Whether a cached state's encoder takes this one's largest images."""
+        return state["max_bands"] >= -(-self.max_tokens // WIN)
+
+    def build(self, npu: VisionDevice, w: dict, state: dict | None, cache: str) -> V.Encoder:
+        """The encoder on a device (restored from ``state`` and the programs built after it in ``cache``, or built);
+        the programs of other sizes kept in ``cache`` as they are built."""
+        if state is not None:
+            state = dict(state, programs=dict(state["programs"]))
             for f in glob.glob(os.path.join(cache, "program_*.pkl")):  # (the programs built after the state)
                 with open(f, "rb") as fh:
                     nb, pieces = pickle.load(fh)
-                st["programs"][nb] = pieces
-            enc = V.Encoder(npu, w, max_bands=st["max_bands"], state=st)
+                state["programs"][nb] = pieces
+            enc = V.Encoder(npu, w, max_bands=state["max_bands"], state=state)
         else:
-            npu = VisionDevice()
-            enc = V.Encoder(npu, w, max_bands=max(bands, -(-MAX_TOKENS // WIN)))
-            save_state(cache, npu, [enc.bd.built()], enc.state() | {"max_bands": enc.max_bands})
+            enc = V.Encoder(npu, w, max_bands=max(-(-self.max_tokens // WIN), -(-MAX_TOKENS // WIN)))
         enc.built = lambda nb, pieces, same: _save_program(cache, nb, pieces, same)
+        self.encoder = enc
+        return enc
+
+    def state(self) -> dict:
+        """The built state to cache (``accept``'s and ``build``'s)."""
+        return self.encoder.state() | {"max_bands": self.encoder.max_bands}
+
+    def _load(self) -> V.Encoder:
+        w = self.weights()
+        cache = state_dir("lfm3vl", self.path, SOURCES, [self.path])
+        npu, st = load_state(cache, sources(w), accept=self.accept) or (VisionDevice(), None)
+        enc = self.build(npu, w, st, cache)
+        if st is None:
+            save_state(cache, npu, [enc.bd.built()], self.state())
         npu.warm()
         return enc
 

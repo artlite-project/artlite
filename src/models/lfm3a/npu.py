@@ -1,7 +1,8 @@
 """LFM3-Audio's speech on the NPU for the lfm3 language models (``NpuAudio``): a clip's samples (``host.load_audio``), its
 log-mel spectrogram (``host.log_mel``), its rows' embeddings (``models.lfm3a.encoder.Encoder``: on the vision overlay in
-a hardware context of its own, band by band) and its tokens (``host.clip_sequence``); and, where the mmproj holds the
-speech generator (projector ``lfm3a_gen``), its depthformer (``models.lfm3a.depth.Depth``) and codec decoder
+a hardware context of its own, band by band; with LFM3-Omni's mmproj on the one its vision tower shares,
+``models.lfm.lfm.media_device``) and its tokens (``host.clip_sequence``); and, where the mmproj holds the speech
+generator (projector ``lfm3a_gen``), its depthformer (``models.lfm3a.depth.Depth``) and codec decoder
 (``models.lfm3a.codec.Codec``) on the same device (``models.lfm3a.speech``: the frames' loop).
 
 Every load packs the weights from the mmproj file (Q8_0 / BF16 / F16 -> BFP16: ``artlite.vision.weights``, the native
@@ -28,7 +29,7 @@ from . import encoder as V
 from . import host
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the programs)
-_SOURCES = ("artlite/vision", "models/lfm3a/encoder.py", "models/lfm3a/depth.py", "models/lfm3a/codec.py",
+SOURCES = ("artlite/vision", "models/lfm3a/encoder.py", "models/lfm3a/depth.py", "models/lfm3a/codec.py",
             "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
             "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/overlay.py",
             "models/lfm3a/npu.py")
@@ -46,7 +47,7 @@ def has_audio(path: str) -> bool:
 class NpuAudio:
     """The speech encoder and projector of an mmproj file (audio projector ``lfm3a``) on the NPU."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, load: bool = True):
         self.path = path
         self.gguf = GGUFFile(path)
         self.cfg = c = AudioConfig.from_gguf(self.gguf)
@@ -66,33 +67,48 @@ class NpuAudio:
         self.t_encode, self.clips = 0.0, 0  # (the encoder's time and clips so far)
         self.depth: DP.Depth | None = None
         self.codec: CD.Codec | None = None
-        self.encoder = self._load()
+        self.encoder: V.Encoder | None = self._load() if load else None  # (else ``build`` on a device of the caller's)
 
-    def _load(self) -> V.Encoder:
-        g = self.gguf
-        get = gguf_getter(g)
-        w: dict = {"enc": V.weights(get, V.kinds_of(g.tensor_info, self.cfg.layers), self.cfg.projection_dim)}
+    def weights(self) -> dict:
+        """The networks' weights (views of the mmproj's tensors): "enc", and with the generator "depth", "codec"."""
+        get = gguf_getter(self.gguf)
+        w: dict = {"enc": V.weights(get, V.kinds_of(self.gguf.tensor_info, self.cfg.layers), self.cfg.projection_dim)}
         if self.gen is not None:
             w["depth"] = DP.weights(get, self.gen.layers)
-            w["codec"] = CD.weights(get, CD.kinds_of(g.tensor_info, 8))
+            w["codec"] = CD.weights(get, CD.kinds_of(self.gguf.tensor_info, 8))
+        return w
+
+    def accept(self, state: dict) -> bool:
+        """Whether a cached state has this file's networks."""
+        return ("depth" in state) == (self.gen is not None)
+
+    def build(self, npu: VisionDevice, w: dict, state: dict | None) -> list:
+        """The networks on a device (restored from ``state``, or built): the encoder, the depthformer, the codec."""
+        g = self.gguf
+        self.encoder = V.Encoder(npu, w["enc"], state=state and state["enc"])
+        nets: list = [self.encoder]
+        if self.gen is not None:
             mask = g.tensor("a.gen.code.mask_embd").dequantize().reshape(-1)
             emb = lambda rows: g.rows("a.gen.code.embd.weight", rows)
-        cache = state_dir("lfm3a", self.path, _SOURCES, [self.path])
-        st = None
-        if (got := load_state(cache, sources(w), accept=lambda s: ("depth" in s) == ("depth" in w))) is not None:
-            npu, st = got
-        else:
-            npu = VisionDevice()
-        enc = V.Encoder(npu, w["enc"], state=st and st["enc"])
-        nets: list = [enc]
-        if self.gen is not None:
-            self.depth = DP.Depth(npu, w["depth"], emb, mask, state=st and st["depth"])
-            self.codec = CD.Codec(npu, w["codec"], state=st and st["codec"])
+            self.depth = DP.Depth(npu, w["depth"], emb, mask, state=state and state["depth"])
+            self.codec = CD.Codec(npu, w["codec"], state=state and state["codec"])
             nets += [self.depth, self.codec]
+        self._nets = dict(zip(w, nets, strict=True))
+        return nets
+
+    def state(self) -> dict:
+        """The built state to cache (``accept``'s and ``build``'s)."""
+        return {k: n.state() for k, n in self._nets.items()}
+
+    def _load(self) -> V.Encoder:
+        w = self.weights()
+        cache = state_dir("lfm3a", self.path, SOURCES, [self.path])
+        npu, st = load_state(cache, sources(w), accept=self.accept) or (VisionDevice(), None)
+        nets = self.build(npu, w, st)
         if st is None:
-            save_state(cache, npu, [n.bd.built() for n in nets], {k: n.state() for k, n in zip(w, nets, strict=True)})
+            save_state(cache, npu, [n.bd.built() for n in nets], self.state())
         npu.warm()
-        return enc
+        return self.encoder
 
     def embeddings(self, samples: np.ndarray) -> np.ndarray:
         """A clip's samples (16 kHz mono float32) -> its rows' embeddings (rows, projection_dim)."""

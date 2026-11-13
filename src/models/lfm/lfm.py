@@ -2,8 +2,8 @@
 of three kinds (short convolutions, sliding-window and full attention), each [operator | SwiGLU FFN] with sandwich
 norms (``artlite.model_config.LfmConfig``).
 
-A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows: an LFM3-VL image's, ``models.lfm3vl``;
-the positions 1-D). A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the
+A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows: an LFM3-VL image's or video's,
+``models.lfm3vl``; an LFM3-Audio clip's, ``models.lfm3a``; the positions 1-D). A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the
 weights
 (``models.lfm.overlay.LfmOverlay``): the projections on the main cores and their helpers, the attention, its KV caches
 and the conv layers' short convolutions on the operator cores. A prompt runs in chunks of up to 4096 tokens through the
@@ -26,6 +26,8 @@ from artlite.decode.design import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
+from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
+from artlite.vision.weights import sources
 
 from .. import video
 from ..common import Model, OverlayModel, Sampling
@@ -45,6 +47,21 @@ SAMPLING = {"temp": 0.1, "top_k": 50, "penalty_repeat": 1.1}
 # a d1 decision model's images at most (its runner's ``d1_vision_max_pixels``, 1638400: the budget it was trained and is
 # served at; its mmproj's maximum is LFM3-VL's)
 D1_IMAGE_TOKENS = 1600
+
+
+def media_device(mmproj: str, vision: vl_npu.NpuVision, audio: a_npu.NpuAudio) -> VisionDevice:
+    """An mmproj's vision tower and speech networks (LFM3-Omni's: the encoders and the speech generator) built on one
+    vision overlay: one hardware context, and an image and a clip run back to back without a switch. Their built state
+    is cached together, keyed by the mmproj (``artlite.vision.device.state_dir``)."""
+    w = {"vision": vision.weights(), "audio": audio.weights()}
+    cache = state_dir("lfm3omni", mmproj, vl_npu.SOURCES + a_npu.SOURCES, [mmproj])
+    npu, st = load_state(cache, sources(w), accept=lambda s: vision.accept(s["vision"]) and audio.accept(s["audio"])) \
+        or (VisionDevice(), None)
+    nets = [vision.build(npu, w["vision"], st and st["vision"], cache), *audio.build(npu, w["audio"], st and st["audio"])]
+    if st is None:
+        save_state(cache, npu, [n.bd.built() for n in nets], {"vision": vision.state(), "audio": audio.state()})
+    npu.warm()
+    return npu
 
 
 class NpuLfm(OverlayModel):
@@ -143,9 +160,11 @@ class Lfm(Model):
     a thought unless ``enable_thinking`` is false (an empty one, ``<think></think>``); a raw text gets no BOS
     (the file's ``add_bos_token``, as llama.cpp). ``mmproj``: the media encoders' file: a vision encoder (images in
     prompts: LFM3-VL's, ``models.lfm3vl.npu.NpuVision``; ``image_min_tokens`` / ``image_max_tokens``: an image's merged
-    tokens, default the mmproj's bounds, a d1 decision model's at most ``D1_IMAGE_TOKENS``) and / or a speech encoder
-    (audio clips in prompts: LFM3-Audio's, ``models.lfm3a.npu.NpuAudio``; a message's parts ``{"type": "audio", "audio":
-    a file, its bytes or 16 kHz samples}``, OpenAI's ``input_audio`` and ``audio_url`` ones). Text replies (``sampling``)
+    tokens, default the mmproj's bounds, a d1 decision model's at most ``D1_IMAGE_TOKENS``; videos: ``{"type": "video",
+    "video": a file or its bytes}``, ``video_sequence``) and / or a speech encoder (audio clips in prompts: LFM3-Audio's,
+    ``models.lfm3a.npu.NpuAudio``; a message's parts ``{"type": "audio", "audio": a file, its bytes or 16 kHz samples}``,
+    OpenAI's ``input_audio`` and ``audio_url`` ones); both (LFM3-Omni's mmproj, which also holds the speech generator)
+    on one device (``media_device``), a video heard with its soundtrack. Text replies (``sampling``)
     never open speech: the openers ``<|audio_start|>`` / ``<|mixed_start|>`` are banned (``host.TEXT_ONLY_BANNED``:
     transformers' generation mode "text", llama.cpp's logit bias); ``voice_reply`` lets a model that speaks speak."""
 
@@ -181,7 +200,7 @@ class Lfm(Model):
                 if ac.projection_dim != self.cfg.hidden_size:
                     raise ValueError(f"{mmproj}: embeddings of {ac.projection_dim}, the language model's "
                                      f"{self.cfg.hidden_size}")
-                self.audio = a_npu.NpuAudio(mmproj)
+                self.audio = a_npu.NpuAudio(mmproj, load=not has_vision)
             elif not has_vision:
                 raise ValueError(f"{mmproj}: neither a vision nor a speech encoder")
             if has_vision:
@@ -194,7 +213,10 @@ class Lfm(Model):
                                      f"{self.cfg.hidden_size}")
                 if image_max_tokens is None and not self.cfg.causal:
                     image_max_tokens = D1_IMAGE_TOKENS
-                self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens)
+                self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens,
+                                               load=self.audio is None)
+            if self.vision is not None and self.audio is not None:
+                media_device(mmproj, self.vision, self.audio)
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
