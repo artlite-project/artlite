@@ -10,7 +10,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .context import ApiContext
 from .errors import ApiError, bad_request
-from .requests import DetokenizeRequest, TemplateRequest, TokenizeRequest
+from .schemas import DetokenizeRequest, TemplateRequest, TokenizeRequest
 from .tools import functions
 
 

@@ -14,7 +14,7 @@ from . import agents
 from .app_base import ANTHROPIC, NO_CACHE
 from .context import ApiContext
 from .errors import ApiError, bad_request, cancelled, server_error
-from .requests import ChatRequest, chat_request
+from .schemas import ChatRequest, chat_request
 from .streaming import Format, collect, stream_response
 
 

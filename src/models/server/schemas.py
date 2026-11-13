@@ -22,7 +22,7 @@ class Message(BaseModel):
     reasoning_content: str | None = None
 
 
-class Generation(BaseModel):
+class GenerationRequest(BaseModel):
     """The fields that every generation request shares (the others are accepted: clients send many)."""
 
     model_config = ConfigDict(extra="allow")
@@ -51,7 +51,7 @@ class Generation(BaseModel):
     spec_n_max: int | None = Field(None, alias="speculative.n_max")  # (llama-server's: draft tokens per step at most)
 
 
-class ChatRequest(Generation):
+class ChatRequest(GenerationRequest):
     messages: list[Message]
     logprobs: bool | None = None
     top_logprobs: int | None = None
@@ -65,7 +65,7 @@ class ChatRequest(Generation):
     parallel_tool_calls: bool | None = None
 
 
-class CompletionRequest(Generation):
+class CompletionRequest(GenerationRequest):
     prompt: str | list[int] | list[str]
     logprobs: int | None = None  # (n_probs: llama-server's alias)
 

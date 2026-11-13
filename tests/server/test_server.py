@@ -1283,3 +1283,17 @@ def test_realtime_transcription_offline() -> None:
                 ["conversation.item.input_audio_transcription.completed"]
             assert evs[-1]["transcript"] == "hello world"
             assert "ASR" in str(model.rendered[0][0]["content"])
+
+
+def test_realtime_unknown_event_types() -> None:
+    """A client event whose type is no string (or no known one) gets an error event and the session carries on."""
+    model, _, engine = make(audio=True)
+    model.gguf = types.SimpleNamespace(meta={})  # (no asr template)
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+            ws.receive_json()
+            for kind in ([1], {}, "nope"):
+                ws.send_json({"type": kind})
+                ev = ws.receive_json()
+                assert ev["type"] == "error" and "unknown event type" in ev["error"]["message"]

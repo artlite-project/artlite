@@ -13,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from .app_base import sse
 from .context import ApiContext
 from .ids import hex_id
-from .requests import ChatRequest, Message
+from .schemas import ChatRequest, Message
 from .speech import chat_audio
 from .streaming import Format, collect, stream_response, usage
 from .tools import ToolCall

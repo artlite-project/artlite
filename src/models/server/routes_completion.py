@@ -13,7 +13,7 @@ from .app_base import sse
 from .context import ApiContext
 from .errors import bad_request
 from .ids import hex_id
-from .requests import CompletionRequest
+from .schemas import CompletionRequest
 from .streaming import Format, collect, stream_response, usage
 
 

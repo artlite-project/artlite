@@ -90,7 +90,7 @@ class Session:
                 await self.error("invalid JSON")
                 continue
             await self.before()
-            handler = self.handlers.get(kind)
+            handler = self.handlers.get(kind) if isinstance(kind, str) else None
             if handler is None:
                 await self.error(f"unknown event type: {kind}")
             elif await handler(ev):

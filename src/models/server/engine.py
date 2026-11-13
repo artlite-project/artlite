@@ -20,7 +20,7 @@ from ..common import Model, NpuModel, argmax
 from ..sequence import Sequence
 from .cache import PromptCache, common_prefix
 from .generation import Generation
-from .jobs import Call, Cancelled, Job
+from .jobs import Call, Cancelled, Failed, Job
 
 log = logging.getLogger("artlite.server")
 CACHE_RAM = 8192 << 20  # the prompt cache's host memory by default at most (llama-server's --cache-ram)
@@ -112,11 +112,6 @@ class Engine:
         resets the device (``begin``)."""
         self.cache.clear()
         self._dirty = True
-
-    def device_taken(self) -> None:
-        """(on the worker) Before work that leaves the device's sequence unknown to the prompt cache (speech output:
-        ``models.lfm3a.speech``)."""
-        self.recover()
 
     def hold(self, ids: Sequence) -> int:
         """(on the worker) A live stream's text sequence and its next chunk's tokens: the device where they continue
@@ -278,7 +273,7 @@ class Engine:
             except Exception as e:  # (a failure in the model: the job's error; the caches start over)
                 log.exception("%s failed", job.name)
                 self.recover()
-                job.emit("error", {"message": f"{type(e).__name__}: {e}"})
+                job.emit("error", Failed(message=f"{type(e).__name__}: {e}"))
             finally:
                 job.state = "done"
                 with self._cv:

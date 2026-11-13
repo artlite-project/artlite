@@ -22,7 +22,7 @@ from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, chat_template
 from ..sequence import data_bytes
 from .errors import bad_request
 from .listing import Modalities
-from .requests import ROLES, ChatRequest, Message
+from .schemas import ROLES, ChatRequest, Message
 from .tools import Calls, Vocabulary, call_arguments, functions
 
 if TYPE_CHECKING:

@@ -1,6 +1,6 @@
 """The server's speech output (a model with LFM3-Audio's speech generator: ``Lfm.tts``, ``models.lfm3a.speech``):
 llama-server's ``/tts`` and OpenAI's ``/v1/audio/speech``. A generation runs on the engine's worker (``Engine.run``:
-between the jobs, the prompt cache told the device's sequence is lost: ``Engine.device_taken``), its samples streamed as
+between the jobs, the prompt cache told the device's sequence is lost: ``Engine.recover``), its samples streamed as
 the codec makes them (every 4 frames, 320 ms of speech).
 
 - ``/tts`` (llama-server's): ``input`` (alias ``prompt``), ``lang``, ``voice`` (female, male), ``seed`` (-1 random),
@@ -224,7 +224,7 @@ def worker(engine: Engine, produce: Callable[[Callable[[tuple[str, Any]], None],
     def run() -> None:
         try:
             if taken:
-                engine.device_taken()
+                engine.recover()
             produce(push, cancel)
         except Exception as e:  # (the request's error)
             log.exception("speech failed")

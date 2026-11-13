@@ -14,7 +14,7 @@ from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable
 from .jobs import Job
 from .prompt import PromptBuilder, system_first, takes_parts
-from .requests import ChatRequest, Generation
+from .schemas import ChatRequest, GenerationRequest
 from .settings import PENALTIES, ModelInfo, Options
 from .speech import Replies
 from .tools import Calls, Vocabulary, syntax_of
@@ -96,7 +96,7 @@ class ApiContext:
                 "stream": False, "reasoning_format": options.reasoning_format, "samplers": SAMPLERS,
                 "speculative.n_max": most, "timings_per_token": False}
 
-    def check(self, req: Generation) -> None:
+    def check(self, req: GenerationRequest) -> None:
         """What every generation request must satisfy; fields the NPU path ignores are logged."""
         if self.info.decision is not None:  # (as llama-server: its output modalities are only "decisions")
             raise not_supported("This model is a decision model without text generation, use /v1/systemone")
@@ -109,7 +109,7 @@ class ApiContext:
             if name in NEUTRAL and value not in (neutral, None, [], {}, ""):
                 self.warn_once((name, repr(value)), "%s = %r is not supported: ignored", name, value)
 
-    def request_sampling(self, req: Generation, think: bool) -> Sampling:
+    def request_sampling(self, req: GenerationRequest, think: bool) -> Sampling:
         s = self.sampling(think)
         given = {"temp": req.temperature, "top_k": req.top_k, "top_p": req.top_p, "min_p": req.min_p,
                  **{k: getattr(req, k) for k in PENALTIES}}
@@ -122,10 +122,10 @@ class ApiContext:
         return dataclasses.replace(s, top_k=min(s.top_k, TOP_K_ALL) if s.top_k > 0 else TOP_K_ALL)
 
     @staticmethod
-    def stops(req: Generation) -> list[str]:
+    def stops(req: GenerationRequest) -> list[str]:
         return [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
 
-    def ping_of(self, req: Generation) -> float:
+    def ping_of(self, req: GenerationRequest) -> float:
         return self.options.sse_ping_interval if req.sse_ping_interval is None else req.sse_ping_interval
 
     def fits(self, ids: list[int], api: str = "chat") -> None:
@@ -154,7 +154,7 @@ class ApiContext:
     # Jobs
     # ------------------------------------------------------------------
 
-    def job(self, req: Generation, ids: list[int], *, think: bool, reasoning: bool = False,
+    def job(self, req: GenerationRequest, ids: list[int], *, think: bool, reasoning: bool = False,
             max_tokens: int | None = None, conv_id: str | None = None, tools: Calls | None = None,
             answer_mark: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:

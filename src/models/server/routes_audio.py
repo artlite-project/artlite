@@ -16,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from .app_base import sse
 from .context import ApiContext
 from .errors import bad_request, not_supported
-from .requests import chat_request
+from .schemas import chat_request
 from .streaming import Format, collect, events_of, stream_response, usage
 
 TRANSCRIPT_TOKENS = (64, 8)  # a transcription's tokens at most by default: 64 + 8 per second of audio
