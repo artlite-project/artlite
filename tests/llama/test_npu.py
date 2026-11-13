@@ -15,7 +15,8 @@ from models.common import auto_capacity
 from models.llama.llama import NpuLlama
 from models.llama.tokenizer import chat_prompt
 
-from ..common import as_torch, cached_ref, essays, llama_gguf, model_key
+from ..common import cached_ref, essays, llama_gguf, model_key
+from ..numerics import kl_agree
 from . import cpu as llama_cpu
 
 pytestmark = pytest.mark.slow  # GGUF models + CPU references: run with --run-slow
@@ -45,12 +46,6 @@ def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
                       sources=[llama_cpu.__file__])
 
 
-def _kl_agree(ref: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
-    ref, got = as_torch(ref), as_torch(got)
-    lr, lp = torch.log_softmax(ref.double(), -1), torch.log_softmax(got.double(), -1)
-    return float((lr.exp() * (lr - lp)).sum(-1).mean()), float((ref.argmax(-1) == got.argmax(-1)).float().mean())
-
-
 @pytest.mark.parametrize(("quant", "size", "kv_k"), CASES, ids=[f"{q}-{s}-{k}" for q, s, k in CASES])
 def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
     path = _path(quant, size)
@@ -64,7 +59,7 @@ def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
     npu = model.load(capacity=256)
     for batch in (1, 4):
         got = npu.forced_logits(seq, first, batch=batch)
-        kl, agree = _kl_agree(want, got)
+        kl, agree = kl_agree(want, got)
         print(f"{size} {quant} {kv_k}, {batch} per dispatch: KL(same) {kl:.5f}, argmax agreement {agree:.3f}")
         assert kl < 0.006 and agree > 0.9, f"KL(same) {kl:.5f}, argmax agreement {agree:.3f}"
 
@@ -79,6 +74,6 @@ def test_llama_npu_long_prompt(quant: str, size: str) -> None:
     want = _cpu_logits(path, ids, P - 1)
     npu: NpuLlama = model.load(capacity=auto_capacity(P + N))
     got = npu.forced_logits(ids, P - 1, batch=1)
-    kl, agree = _kl_agree(want, got)
+    kl, agree = kl_agree(want, got)
     print(f"{size} {quant} at {P}: KL(same) {kl:.5f}, argmax agreement {agree:.3f}")
     assert kl < 0.006 and agree > 0.85, f"KL(same) {kl:.5f}, argmax agreement {agree:.3f}"

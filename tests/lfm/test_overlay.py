@@ -17,6 +17,7 @@ import torch
 from models.lfm.overlay import LfmOverlay
 
 from ..common import to_torch
+from ..numerics import kl_rows, rel_finite
 from . import ref
 
 VOCAB = 2048
@@ -49,15 +50,15 @@ def test_lfm_overlay_layers(layers: list[int], n: int, kv_k: str) -> None:
     ov = LfmOverlay(g, layers=layers, vocab=VOCAB, max_positions=512, kv_k=kv_k)
     ov.load()
     got = _run(ov, x, STEPS if len(layers) > 1 else (1,))
-    worst = {"logits": max(ref.relative(got[p], want[p]) for p in range(n))}
+    worst = {"logits": max(rel_finite(got[p], want[p]) for p in range(n))}
     for L in layers:
         if ov.kind(L) == "conv":  # (the history: the last step's base and its rows of B x)
             rows = torch.cat([torch.zeros(6, ov.H), cpu_rows(cpu, ids, L)])  # (zeros before position 0)
-            worst[f"conv.{L}"] = ref.relative(ov.read_conv(L)[:6 + ov.conv_s], rows[n - ov.conv_s:n + 6])
+            worst[f"conv.{L}"] = rel_finite(ov.read_conv(L)[:6 + ov.conv_s], rows[n - ov.conv_s:n + 6])
         else:
             k, v = ov.read_kv(L, range(n))
-            worst[f"K.{L}"] = ref.relative(k, state.keys[L])
-            worst[f"V.{L}"] = ref.relative(v, state.values[L])
+            worst[f"K.{L}"] = rel_finite(k, state.keys[L])
+            worst[f"V.{L}"] = rel_finite(v, state.values[L])
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < TOL for v in worst.values()), worst
 
@@ -119,9 +120,9 @@ def test_lfm_npu_teacher_forced(quant: str) -> None:
         want = ref.cpu_logits(quant, ids, model=cpu)
         ov.reset()
         got = _run(ov, cpu.emb[torch.tensor(ids)], steps)
-        k = ref.cpu.kl(want, got)
+        k = kl_rows(want, got)
         agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(ref.cpu.kl(want, ref.llama_logits(quant, ids)).mean())
+        lk = float(kl_rows(want, ref.llama_logits(quant, ids)).mean())
         print(f"{quant} {len(ids)} tokens: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) max {float(k.max()):.4f}, "
               f"argmax {agree:.4f}")
         assert float(k.mean()) < max(1e-3, 1.5 * lk) and agree > 0.95

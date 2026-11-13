@@ -16,6 +16,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 
+from ..numerics import rel
 from . import ref as V
 
 IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
@@ -60,28 +61,23 @@ def test_slices(case: str, tmp_path: str) -> None:
     assert text["text"][-1] == M.IMAGE and image["image"] == len(grid.layout(newline_after=False)) - 1
 
 
-def _rel(a: torch.Tensor | np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, np.float64)
-    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
-
-
 @pytest.mark.slow  # (the whole encoder on the CPU, in float32)
 def test_ops(gold: V.VisionGolden) -> None:
     enc = V.Encoder(MMPROJ, llama=True)
     t = lambda name, il=None: torch.from_numpy(gold.tensor(name, 0, il).copy())
     tr: dict[str, torch.Tensor] = {}
     enc.forward(gold.tensor("inp_raw", 0), None, tr)
-    assert _rel(tr["pos_embed"], gold.tensor("pos_embed", 0)) < 1e-6
+    assert rel(tr["pos_embed"], gold.tensor("pos_embed", 0)) < 1e-6
     p = "v.blk.0."
-    assert _rel(enc._ln(t("pos_embed"), p + "ln1"), gold.tensor("layer_inp_normed", 0, 0)) < 1e-6
+    assert rel(enc._ln(t("pos_embed"), p + "ln1"), gold.tensor("layer_inp_normed", 0, 0)) < 1e-6
     x = t("layer_inp_normed", 0)
     q = enc._mm(x, p + "attn_q.weight", p + "attn_q.bias")
-    assert _rel(q, gold.tensor("Qcur", 0, 0).reshape(q.shape)) < 1e-6
-    assert _rel(enc._attn(x, p), gold.tensor("attn_out", 0, 0)) < 1e-5
-    assert _rel(enc._mm(t("ffn_inp_normed", 0), p + "ffn_up.weight", p + "ffn_up.bias"),
+    assert rel(q, gold.tensor("Qcur", 0, 0).reshape(q.shape)) < 1e-6
+    assert rel(enc._attn(x, p), gold.tensor("attn_out", 0, 0)) < 1e-5
+    assert rel(enc._mm(t("ffn_inp_normed", 0), p + "ffn_up.weight", p + "ffn_up.bias"),
                 gold.tensor("ffn_up_b", 0, 0)) < 1e-6
-    assert _rel(enc._gelu(t("ffn_up_b", 0)), gold.tensor("ffn_gelu", 0, 0)) < 1e-5
-    assert _rel(enc._mm(t("ffn_gelu", 0), p + "ffn_down.weight", p + "ffn_down.bias"), gold.tensor("ffn_out", 0, 0)) < 1e-6
+    assert rel(enc._gelu(t("ffn_up_b", 0)), gold.tensor("ffn_gelu", 0, 0)) < 1e-5
+    assert rel(enc._mm(t("ffn_gelu", 0), p + "ffn_down.weight", p + "ffn_down.bias"), gold.tensor("ffn_out", 0, 0)) < 1e-6
 
 
 @pytest.mark.slow
@@ -98,8 +94,8 @@ def test_entries(gold: V.VisionGolden, llama: bool) -> None:
         tr: dict[str, torch.Tensor] = {}
         out = enc.forward(gold.tensor("inp_raw", k), None, tr).numpy()
         assert out.shape[0] == gold.tensor("merger_out", k).shape[0]
-        assert _rel(out, emb[off:off + out.shape[0]]) < 1.5e-2, k
-        assert _rel(tr["post_ln"], gold.tensor("post_ln", k)) < 1e-2, k
+        assert rel(out, emb[off:off + out.shape[0]]) < 1.5e-2, k
+        assert rel(tr["post_ln"], gold.tensor("post_ln", k)) < 1e-2, k
         off += out.shape[0]
         # the separators after the entry: </image> (and <slice>) after the overview, </slice> (\n) <slice> between
         # the slices, </slice> after the last

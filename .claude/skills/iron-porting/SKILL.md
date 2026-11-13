@@ -113,7 +113,8 @@ import pytest
 import torch
 
 from artlite.operators import MyOperator
-from ..common import to_numpy, verify_close
+from ..common import to_numpy
+from ..numerics import verify_close
 
 
 @pytest.mark.parametrize("size,tile_size", [(1024, 256), (2048, 512)])

@@ -38,7 +38,6 @@ import tempfile
 from collections.abc import Callable
 
 import numpy as np
-import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (  # (tests import them from here)
@@ -56,6 +55,7 @@ from models.qwen35.gdn import D
 
 from .. import common
 from ..llama_cpp import _lib_identity, _llama_lib, llama_tokenize  # noqa: F401 (the tests' ref.llama_tokenize)
+from ..numerics import bf16_round
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DUMP_SRC = os.path.join(HERE, "dump.cpp")
@@ -79,9 +79,6 @@ def size_gguf(size: str) -> str:
 # ----------------------------------------------------------------------
 
 
-
-
-
 def dump_tool() -> str:
     """The path of the built ``qwen35_dump`` (compiled on first use into the artlite cache)."""
     with open(DUMP_SRC, "rb") as f:
@@ -96,7 +93,6 @@ def dump_tool() -> str:
                         f"-Wl,-rpath,{bindir}"], check=True)
         os.replace(tmp, path)
     return path
-
 
 
 class Golden:
@@ -596,19 +592,9 @@ class DFlash:
         return out
 
 
-def rel_err(a: np.ndarray, b: np.ndarray) -> float:
-    """max |a - b| / max |b|."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-30))
-
-
 # ----------------------------------------------------------------------
 # The cores' arithmetic (float64 where the kernels are accurate to ~2^-16)
 # ----------------------------------------------------------------------
-
-
-def _bf(x: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
 def _silu64(x: np.ndarray) -> np.ndarray:
@@ -626,7 +612,7 @@ def core_gdn_step(*, x: np.ndarray, z: np.ndarray, alpha: np.ndarray, beta: np.n
     hc = len(alpha)
     xs = np.concatenate([np.asarray(conv_state, np.float32), np.asarray(x, np.float32)[None]])  # (4, CH)
     y = (np.asarray(conv_w, np.float64).T * xs).sum(0)
-    act = _silu64(_bf(y))
+    act = _silu64(bf16_round(y))
     q = act[:2 * D].reshape(2, D)
     k = act[2 * D:4 * D].reshape(2, D)
     v = act[4 * D:].reshape(hc, D)
@@ -645,7 +631,7 @@ def core_gdn_step(*, x: np.ndarray, z: np.ndarray, alpha: np.ndarray, beta: np.n
     o = (wt + d[:, None] * wt + (k[kh] * q[kh]).sum(-1)[:, None] * dl) / np.sqrt(D)
     S = S + d[:, None, None] * S + k[kh][:, :, None] * dl[:, None, :]
     rms = 1 / np.sqrt((o ** 2).mean(-1, keepdims=True) + eps)
-    out = _bf(o * rms * np.asarray(norm, np.float64) * _silu64(np.asarray(z, np.float32)))
+    out = bf16_round(o * rms * np.asarray(norm, np.float64) * _silu64(np.asarray(z, np.float32)))
     new_cs = np.concatenate([xs[1:]])
     return out, new_cs, S.transpose(0, 2, 1).astype(np.float32)
 
@@ -655,7 +641,7 @@ def core_gdn_out(o: np.ndarray, z: np.ndarray, norm: np.ndarray, eps: float) -> 
     o, z (..., 128) bf16 values."""
     o = np.asarray(o, np.float64)
     inv = 1 / np.sqrt((o ** 2).mean(-1, keepdims=True) + eps)
-    return (o * inv * np.asarray(norm, np.float64) * _bf(_silu64(z))).astype(np.float32)
+    return (o * inv * np.asarray(norm, np.float64) * bf16_round(_silu64(z))).astype(np.float32)
 
 
 def core_gdn_scan(*, qkv: np.ndarray, ab: np.ndarray, conv_state: np.ndarray, conv_w: np.ndarray, dt: np.ndarray,
@@ -672,7 +658,7 @@ def core_gdn_scan(*, qkv: np.ndarray, ab: np.ndarray, conv_state: np.ndarray, co
         xs = np.concatenate([win, np.asarray(qkv[t], np.float64)[None]])
         y = (np.asarray(conv_w, np.float64).T * xs).sum(0)
         win = xs[1:]
-        act = _bf(_silu64(_bf(y)))  # (the cores' table SiLU: bf16 results within 0.59 ULP)
+        act = bf16_round(_silu64(bf16_round(y)))  # (the cores' table SiLU: bf16 results within 0.59 ULP)
         q, k, v = act[:2 * D].reshape(2, D), act[2 * D:4 * D].reshape(2, D), act[4 * D:].reshape(hc, D)
         q = q / np.sqrt((q ** 2).sum(-1, keepdims=True) + eps)
         k = k / np.sqrt((k ** 2).sum(-1, keepdims=True) + eps)

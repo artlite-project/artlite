@@ -19,6 +19,8 @@ from artlite.operators.design import COLS
 from artlite.prefill import attn as PA
 from artlite.prefill.gemm import Layout
 
+from ..numerics import rel
+
 A_BYTES = 9280
 HD, QH = 128, 2  # (per column)
 KVH = COLS // 2
@@ -30,10 +32,6 @@ CASES = [(1, 256, 0, 0, 32), (1, 512, 128, 0, 32), (2, 256, 64, 0, 32), (1, 256,
 # non-causal: (K panels per record, chunk, the state's end and each question's: the last the prompt's length)
 SETS = [(1, 64, (48,)), (1, 256, (120, 151, 200)), (1, 512, (70, 100, 133, 166, 199, 260, 261, 300, 333, 400, 449)),
         (2, 256, (30, 64, 128, 192, 256)), (1, 1024, (577, 650, 700, 770, 1000))]
-
-
-def _rel(got: np.ndarray, want: np.ndarray) -> float:
-    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
 
 
 def _q_values(units: np.ndarray, hd: int) -> np.ndarray:
@@ -123,13 +121,13 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
     want_g = torch.sigmoid(g.bfloat16().double()).numpy().T
     assert np.abs(gv - want_g).max() < 1e-2
     want_q = rope(q, wq).transpose(1, 0, 2) * shape.scale
-    assert _rel(qv, want_q) < 1e-2
+    assert rel(qv, want_q) < 1e-2
     n = (p0 + T) // shape.pg
     Ks, Vs = {}, {}
     for h in range(KVH):
         Ks[h], Vs[h] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[h, guard:guard + n], HD))
-        assert _rel(Ks[h][p0:], rope(k, wk)[:, h]) < (2e-4 if kp == 2 else 1e-2), h
-        assert _rel(Vs[h][p0:], v[:, h].bfloat16().double().numpy()) < 1e-2, h
+        assert rel(Ks[h][p0:], rope(k, wk)[:, h]) < (2e-4 if kp == 2 else 1e-2), h
+        assert rel(Vs[h][p0:], v[:, h].bfloat16().double().numpy()) < 1e-2, h
     A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a], T, COLS * QH * HD).reshape(T, COLS * QH, HD)
     want = np.zeros((T, COLS * QH, HD))
     kpos, qpos = np.arange(p0 + T)[None], np.arange(p0, p0 + T)[:, None]
@@ -146,7 +144,7 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
         sc[masked] = -np.inf
         pr = np.exp2(sc - sc.max(-1, keepdims=True))
         want[:, hq] = (pr @ Vs[h]) / pr.sum(-1, keepdims=True) * gv[hq][:, None]
-    err = _rel(A, want)
-    eq = _rel(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape), want)
+    err = rel(A, want)
+    eq = rel(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape), want)
     print(f"attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
     assert err < 1.5 * eq

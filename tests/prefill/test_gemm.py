@@ -39,6 +39,7 @@ from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
 
 from ..common import to_numpy, to_torch
+from ..numerics import rel_native
 
 LEVEL = 3  # (a paced level: the paced copy of each worker body)
 
@@ -185,10 +186,6 @@ def _run(lib: Library, op: object, A: torch.Tensor, W: np.ndarray, w_off: int, a
     return to_torch(bfp16.from_panels(c, op.M, op.N) if op.silu else c.copy())
 
 
-def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
-    return float((got - want).norm() / want.norm())
-
-
 def _tol(K: int) -> float:
     """C rounded to bf16 after each 64-k tile: ~2^-9 sqrt(K / 64); the weights dequantized to bfp16 panels: a floor
     whatever K (Q4_K: ~1.1% at K = 1024, MiniCPM-V's input projections), the bound's at K = 2048."""
@@ -246,7 +243,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         act = (lambda y: torch.nn.functional.gelu(y, approximate="tanh")) if model == "gemma4" else \
             torch.nn.functional.silu
         want = act(y_g.bfloat16().float()) * y_u
-        assert _rel(C[:, idx], want) < 3.5e-2  # (and the bfp16 C panels)
+        assert rel_native(C[:, idx], want) < 3.5e-2  # (and the bfp16 C panels)
         agree(lambda C, Cb: C[:, idx])
         return
     if phase in PG.OUT:
@@ -255,7 +252,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         cols = np.concatenate([pitch_c + np.arange(h8) for pitch_c in PG.d_pitch(img, T) * np.arange(COLS)])
         rows = np.concatenate([b.rows[c][b.rows[c] >= 0] for c in range(COLS)])
         want = Aq[:T] @ _rows(img, b.tensors, rows, K).T
-        assert _rel(C[:, cols], want) < _tol(K)
+        assert rel_native(C[:, cols], want) < _tol(K)
         agree(lambda C, Cb: C[:, cols])
         return
     lay = pp.layout
@@ -266,11 +263,11 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
             if b.pairs:  # (fp32 sums of the planes: the F32 rows times the norm's w / bf16(w), as the image packs them)
                 got = Cb[:T, o:o + rows.size].contiguous().view(torch.float32).float()
                 want = Aq[:T] @ (_rows(img, b.tensors, rows[0::2] // 2) * _ratio(img, region)[None]).T
-                assert _rel(got, want) < 5e-5, (b.name, c, _rel(got, want))  # (hi + lo: ~2^-16 of a row)
+                assert rel_native(got, want) < 5e-5, (b.name, c, rel_native(got, want))  # (hi + lo: ~2^-16 of a row)
                 agree(lambda C, Cb, o=o, n=rows.size: Cb[:T, o:o + n])
                 continue
             got = C[:, o + np.arange(rows.size)]
-            assert _rel(got, Aq[:T] @ _rows(img, b.tensors, rows, K).T) < _tol(K), (b.name, c)
+            assert rel_native(got, Aq[:T] @ _rows(img, b.tensors, rows, K).T) < _tol(K), (b.name, c)
             agree(lambda C, Cb, o=o, n=rows.size: C[:, o:o + n])
 
 
@@ -314,4 +311,4 @@ def test_unit_gemm(fmt: str, tiles: int) -> None:
         C = _run(lib, op, A, W, -op.hdr_skip)[:T].float()
         cols = np.concatenate([c * pitch + w * p + np.arange(tiles * R) for c in range(COLS) for p in range(op.passes)])
         rows = np.concatenate([c * n_rt * R + np.arange(op.passes * tiles * R) for c in range(COLS)])
-        assert _rel(C[:, cols], want[:, rows]) < _tol(K), (op.passes, _rel(C[:, cols], want[:, rows]))
+        assert rel_native(C[:, cols], want[:, rows]) < _tol(K), (op.passes, rel_native(C[:, cols], want[:, rows]))

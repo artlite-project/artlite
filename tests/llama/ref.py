@@ -23,8 +23,8 @@ from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators import bfp16
 
-from ..common import as_torch
-from ..decode.attn_ref import AttentionRef, bf, inv_rms
+from ..decode.attn_ref import AttentionRef, inv_rms
+from ..numerics import bf16_round as bf
 
 
 class LlamaNpuRef:
@@ -100,9 +100,3 @@ class LlamaNpuRef:
         return bf((xin @ torch.from_numpy(self.gguf.rows(lm, list(range(self.vocab)))).T) * sc)
 
 
-def relative(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Relative rms error (inf when a is not finite: a NaN would compare as no error)."""
-    a, b = as_torch(a), as_torch(b)
-    if not torch.isfinite(a.float()).all():
-        return float("inf")
-    return float((a.float() - b.float()).pow(2).sum().sqrt() / b.float().pow(2).sum().sqrt())

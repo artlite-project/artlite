@@ -15,6 +15,7 @@ from models.lfm3a import host as A
 from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer
 
+from ..numerics import kl_report
 from . import ref as R
 from .test_ref import MARKER, MMPROJ, MODEL, asr_text, clip
 
@@ -24,15 +25,6 @@ NAME = "6930-75918-0001"
 ANSWER = ("The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to "
           "greet the arrival of the young princess. The French, in return, invited the English to a supper, which was "
           "to be given the next day.")  # (llama.cpp's greedy transcript of the clip, CPU)
-
-
-def _kl_report(name: str, want: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
-    lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
-    kl = (lw.exp() * (lw - lg)).sum(-1)
-    agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
-    print(f"{name}: KL vs llama.cpp {float(kl.mean()):.4f} (max {float(kl.max()):.4f}), argmax agreement {agree:.3f} "
-          f"over {len(kl)} tokens")
-    return float(kl.mean()), agree
 
 
 def _messages(path: str) -> list[dict[str, object]]:
@@ -63,7 +55,7 @@ def test_audio_prompt(case: tuple) -> None:
     for prefill in (True, False):
         model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(128,))
         got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
-        kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
+        kl, agree = kl_report("prefill" if prefill else "steps", want, got)
         assert kl < 0.003 and agree > 0.95
         del model
 
@@ -78,7 +70,7 @@ def test_app_audio_prompt(case: tuple) -> None:
     assert np.array_equal(prompt.ids, seq.ids) and np.array_equal(prompt.given, seq.given)
     model = app.load(capacity=1024)
     got = torch.from_numpy(np.stack([model.forward(prompt)] + [model.step(t) for t in answer[:-1]]))
-    kl, agree = _kl_report("the NPU encoder, prefill", want, got)
+    kl, agree = kl_report("the NPU encoder, prefill", want, got)
     assert kl < 0.004 and agree > 0.95
     model.reset()
     sampling = app.sampling()

@@ -23,6 +23,7 @@ from models.qwen35.image import QwenImage
 
 from ..common import essay
 from ..decode import mmv
+from ..numerics import bf16_round, from_bf16_bits, rel_max
 from ..operators import kmath_sim
 from . import ref
 
@@ -137,11 +138,6 @@ def _t(a: np.ndarray) -> np.ndarray:
     return np.asarray(a, np.float32)
 
 
-def _bf16(u: np.ndarray) -> np.ndarray:
-    """Raw bf16 bits -> fp32 values."""
-    return (np.asarray(u, np.uint16).astype(np.uint32) << 16).view(np.float32)
-
-
 def _cols(region: object, values: np.ndarray, c: int, block: int = 0) -> np.ndarray:
     rows = region.blocks[block].rows[c]
     return _t(np.asarray(values, np.float32)[..., rows[rows >= 0]])
@@ -161,12 +157,12 @@ class _Check:
         top = float(np.abs(kern).max())
         ulp = 2.0 ** (np.floor(np.log2(top)) - 7)  # (a rounding flip of the largest value: one bf16 ULP)
         err = float(np.abs(np.asarray(got, np.float64) - kern).max())
-        assert err <= max(self.tol * top, ulp), ref.rel_err(got, kern)
+        assert err <= max(self.tol * top, ulp), rel_max(got, kern)
         self.got.append(got.reshape(-1))
         self.gold.append(np.asarray(gold).reshape(-1))
 
     def done(self, tol: float = 5e-2) -> None:
-        assert ref.rel_err(np.concatenate(self.got), np.concatenate(self.gold)) < tol
+        assert rel_max(np.concatenate(self.got), np.concatenate(self.gold)) < tol
 
 
 @pytest.mark.parametrize("S", [1, 4])
@@ -206,8 +202,8 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
                     kern.append(y.astype(np.float32))
                     k0 += 2 * n
                 else:
-                    got.append(_bf16(out[c, :, k0:k0 + n]))
-                    kern.append(mmv.bf(y))
+                    got.append(from_bf16_bits(out[c, :, k0:k0 + n]))
+                    kern.append(bf16_round(y))
                     k0 += n
             gold = np.concatenate([_cols(r, np.asarray(v).reshape(S, -1), c, i) for i, v in enumerate(golds)], -1)
             check(np.concatenate(got, -1), np.concatenate(kern, -1), gold)
@@ -221,10 +217,10 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         x, resid, gold = _t(x).reshape(S, -1), _t(resid).reshape(S, -1), _t(gold).reshape(S, -1)
         x = np.pad(x, ((0, 0), (0, r.K - x.shape[1])))  # (a K padded to whole chunks: zero inputs)
         out = P.run(r, x, OD.F_RESID | OD.F_EMITR, resid=resid)
-        xb = mmv.bf(x)
+        xb = bf16_round(x)
         for c in range(COLS):
-            kern = mmv.bf(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(img, r, c, xb)[0])
-            check(_bf16(out[c, :, :h8]), kern, gold[:, h8 * c:h8 * (c + 1)])
+            kern = bf16_round(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(img, r, c, xb)[0])
+            check(from_bf16_bits(out[c, :, :h8]), kern, gold[:, h8 * c:h8 * (c + 1)])
     else:  # gate_up
         r = img.region(Lg, phase)
         x = _t(G["attn_residual", Lg][t]).reshape(S, -1)
@@ -235,9 +231,9 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         sw = _t(G["ffn_swiglu", Lg][t]).reshape(S, -1)
         for c in range(COLS):
             y = mmv.ref_rows(img, r, c, xn)[0].reshape(S, -1, 2, 8) * inv[:, None, None, None]
-            kern = mmv.bf(kmath_sim.emulate(kmath.act(kmath.SILU), mmv.bf(y[:, :, 0])).astype(np.float64)
+            kern = bf16_round(kmath_sim.emulate(kmath.act(kmath.SILU), bf16_round(y[:, :, 0])).astype(np.float64)
                           * y[:, :, 1]).reshape(S, -1)
-            check(_bf16(out[c, :, :ffn]), kern, sw[:, ffn * c:ffn * (c + 1)])
+            check(from_bf16_bits(out[c, :, :ffn]), kern, sw[:, ffn * c:ffn * (c + 1)])
     check.done()
 
 
@@ -265,15 +261,15 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
     rng = np.random.default_rng(1)
     L = La if phase.startswith("attn") else Lg
     r = P.img.region(L, phase)
-    x = mmv.bf(rng.standard_normal((S, r.n_kc * 1024)).astype(np.float32))
+    x = bf16_round(rng.standard_normal((S, r.n_kc * 1024)).astype(np.float32))
     if phase in ("gdn_in", "attn_in"):
         norm = f"blk.{L}.attn_norm.weight"
         xn, inv = mmv.norm_input(x, P.norm_w(norm), P.cfg.rms_norm_eps)
         out = P.run(r, x, OD.F_NORM, norm=norm)
         for c in range(COLS):
-            kern = np.concatenate([mmv.bf(y * inv[:, None]) for y in mmv.ref_rows(P.img, r, c, xn, slots)], -1)
-            got = _bf16(out[c, :, :kern.shape[1]])
-            assert ref.rel_err(got, kern) < 4e-3, (c, ref.rel_err(got, kern))
+            kern = np.concatenate([bf16_round(y * inv[:, None]) for y in mmv.ref_rows(P.img, r, c, xn, slots)], -1)
+            got = from_bf16_bits(out[c, :, :kern.shape[1]])
+            assert rel_max(got, kern) < 4e-3, (c, rel_max(got, kern))
         return
     if phase == "gate_up":
         norm = f"blk.{L}.post_attention_norm.weight"
@@ -282,16 +278,16 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
         ffn = P.cfg.intermediate_size // COLS
         for c in range(COLS):
             y = mmv.ref_rows(P.img, r, c, xn, slots)[0].reshape(S, -1, 2, 8) * inv[:, None, None, None]
-            kern = mmv.bf(kmath_sim.emulate(kmath.act(kmath.SILU), mmv.bf(y[:, :, 0])).astype(np.float64)
+            kern = bf16_round(kmath_sim.emulate(kmath.act(kmath.SILU), bf16_round(y[:, :, 0])).astype(np.float64)
                           * y[:, :, 1]).reshape(S, -1)
-            got = _bf16(out[c, :, :ffn])
-            assert ref.rel_err(got, kern) < 1e-2, (c, ref.rel_err(got, kern))
+            got = from_bf16_bits(out[c, :, :ffn])
+            assert rel_max(got, kern) < 1e-2, (c, rel_max(got, kern))
         return
     resid = rng.standard_normal((S, H)).astype(np.float32)
     out = P.run(r, x, OD.F_RESID | OD.F_EMITR, resid=resid)
     for c in range(COLS):
-        kern = mmv.bf(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(P.img, r, c, x, slots)[0])
-        assert ref.rel_err(_bf16(out[c, :, :h8]), kern) < 4e-3, (c, ref.rel_err(_bf16(out[c, :, :h8]), kern))
+        kern = bf16_round(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(P.img, r, c, x, slots)[0])
+        assert rel_max(from_bf16_bits(out[c, :, :h8]), kern) < 4e-3, (c, rel_max(from_bf16_bits(out[c, :, :h8]), kern))
 
 
 # ----------------------------------------------------------------------
@@ -472,7 +468,7 @@ class _Gdn:
                 for c in range(COLS):
                     m = []
                     for s in range(S):
-                        v = _bf16(raw[c, s])
+                        v = from_bf16_bits(raw[c, s])
                         ab = np.ascontiguousarray(raw[c, s, ch + 128 * hc:ch + 128 * hc + 4 * hc]).view(np.float32)
                         m.append({"x": v[:ch], "z": v[ch:ch + 128 * hc].reshape(hc, 128), "alpha": ab[:hc],
                                   "beta": ab[hc:]})
@@ -482,12 +478,12 @@ class _Gdn:
             go = dev.view("GO").view(np.uint16).reshape(COLS, hc, -1)[:, :, :16 * OD.SLOTS * 8]
             for c in range(COLS):
                 for h in range(hc):
-                    out.append(_bf16(go[c, h]).reshape(16, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
+                    out.append(from_bf16_bits(go[c, h]).reshape(16, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
             return msgs, np.stack(out, 1)
         go = dev.view("GO").view(np.uint16).reshape(COLS, self.npair, -1)[:, :, :2 * 16 * OD.SLOTS * 8]
         for c in range(COLS):
             for p in range(self.npair):
-                o = _bf16(go[c, p]).reshape(2, 16, OD.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
+                o = from_bf16_bits(go[c, p]).reshape(2, 16, OD.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
                 out.append(o)
         return msgs, np.stack(out, 1).reshape(S, -1, 128)
 
@@ -520,17 +516,17 @@ def _gdn_steps(path: str, Lg: int, x: np.ndarray, gold: np.ndarray | None) -> No
     for toks, nrep, cshift, commit, acc in steps:
         msgs, out = h.step(x[toks], nrep=nrep, cshift=cshift, commit=commit)
         want, st_after, _ = ref_tokens(msgs, len(toks), st, cs)
-        assert ref.rel_err(out, want) < 1e-2, (toks, ref.rel_err(out, want))
+        assert rel_max(out, want) < 1e-2, (toks, rel_max(out, want))
         if gold is not None:
             g = np.asarray(gold[toks]).reshape(len(toks), -1, 128)[:, vh]
-            assert ref.rel_err(out, g) < 2e-2, (toks, ref.rel_err(out, g))
+            assert rel_max(out, g) < 2e-2, (toks, rel_max(out, g))
         written = h.states()
         if commit:  # the state after the step's tokens
             exp = st_after
         else:  # the base: the previous step's accepted tokens replayed (= the state before this step's tokens)
             exp = st
         if np.any(exp[0]):
-            assert max(ref.rel_err(written[c], exp[c]) for c in range(COLS)) < 2e-3, toks
+            assert max(rel_max(written[c], exp[c]) for c in range(COLS)) < 2e-3, toks
         else:
             assert not any(np.any(w) for w in written), toks
         # the next step starts after this step's first acc tokens
@@ -578,11 +574,11 @@ def _gdn_blocks(path: str, Lg: int, x: np.ndarray, junk: np.ndarray) -> None:
         for c in range(COLS):
             o, cs[c], st[c] = ref.core_gdn_step(**msgs[c][0], conv_state=cs[c], state=st[c], eps=eps, **h.params[c])
             want[0, hc * c:hc * (c + 1)] = o
-        assert ref.rel_err(out, want) < 1e-2, (p, ref.rel_err(out, want))
+        assert rel_max(out, want) < 1e-2, (p, rel_max(out, want))
         ones.append(out[0].copy())
         if p % 8 == 7:  # (the block's end: its state in the other half)
             got = h.states(1 - w.words()["half"])
-            assert max(ref.rel_err(got[c], st[c]) for c in range(COLS)) < 2e-3, p
+            assert max(rel_max(got[c], st[c]) for c in range(COLS)) < 2e-3, p
         w.accept(1)
     h.reset()
     w, j = _Blocks(), 0
@@ -605,8 +601,8 @@ def test_gdn_steps_a3b() -> None:
         pytest.skip(f"{path}: not present")
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
     rng = np.random.default_rng(3)
-    x = mmv.bf(rng.standard_normal((20, cfg.hidden_size)).astype(np.float32) * 0.02)
-    junk = mmv.bf(rng.standard_normal((12, cfg.hidden_size)).astype(np.float32) * 0.02)
+    x = bf16_round(rng.standard_normal((20, cfg.hidden_size)).astype(np.float32) * 0.02)
+    junk = bf16_round(rng.standard_normal((12, cfg.hidden_size)).astype(np.float32) * 0.02)
     _gdn_blocks(path, cfg.gdn_layers[0], x, junk)
 
 
@@ -616,7 +612,7 @@ def test_gdn_steps_27b() -> None:
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
-    x = mmv.bf(np.random.default_rng(2).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
+    x = bf16_round(np.random.default_rng(2).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
     _gdn_steps(path, cfg.gdn_layers[0], x, None)
 
 
@@ -700,7 +696,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     # the cache: positions 0 .. p - 1 of every KV head (K as stored: normed, rotated; V bf16), the rest of its groups
     # zero; per head its ring (record rp's rows in slot rp & 1)
     kc = rng.standard_normal((kvh, P, HD)).astype(np.float32)
-    vc = mmv.bf(rng.standard_normal((kvh, P, HD)).astype(np.float32))
+    vc = bf16_round(rng.standard_normal((kvh, P, HD)).astype(np.float32))
     kc[:, p:] = vc[:, p:] = 0
     kc[:, 32:] *= far
     groups = [KV.kv_groups(kc[h], vc[h], T, 1, dmajor=True) for h in range(kvh)]
@@ -717,8 +713,8 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
         o = kvh * hb + h * rb + (rp & 1) * T
         kvv[o:o + A1.ROWS_B] = interleave_bits(rows.reshape(-1))
     dev.flush("KV")
-    qg = mmv.bf(rng.standard_normal((COLS, S, qc, 2 * HD)).astype(np.float32))  # [q | gate] per head
-    kv = mmv.bf(rng.standard_normal((S, kvh, 2 * HD)).astype(np.float32))  # [K | V] per KV head
+    qg = bf16_round(rng.standard_normal((COLS, S, qc, 2 * HD)).astype(np.float32))  # [q | gate] per head
+    kv = bf16_round(rng.standard_normal((S, kvh, 2 * HD)).astype(np.float32))  # [K | V] per KV head
     qn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     kn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     cs = [tuple(v[0] for v in A1.rope_cs(cfg, [p + s])) for s in range(S)]
@@ -852,8 +848,8 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
             want, knew = ref.core_attention(qg[c, s], kv[s, h, :HD], v_seen[q], k_prev, v_seen[:q], q_norm=qn,
                                             k_norm=kn, cs=cs[s], eps=cfg.rms_norm_eps)
             kn_all.append(knew)
-            got = _bf16(o_c[:, :, s].reshape(qc, HD))
-            assert ref.rel_err(got, want) < tol, (c, s, ref.rel_err(got, want))
+            got = from_bf16_bits(o_c[:, :, s].reshape(qc, HD))
+            assert rel_max(got, want) < tol, (c, s, rel_max(got, want))
         recs_c = [rp, rl][:nt]
         if ash.role(c) == A1.ROLE_K:  # the K records of positions p .. p + S - 1 (as the cache holds them now)
             k_all = np.concatenate([kc_s[h][:p], np.stack(kn_all)])
@@ -865,7 +861,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
                 else:  # (its pair)
                     kg[r // 4, 0, (r % 4) // 2 * 2 * A1.REC_K:][:2 * A1.REC_K] = recs[c, 2 * i * A1.REC_K:2 * (i + 1) * A1.REC_K]
                 got_k = KV.kv_from_groups(kg, HD, dmajor=True)[0][8 * r:min(8 * r + 8, p + S)]
-                assert ref.rel_err(got_k, k_all[8 * r:min(8 * r + 8, p + S)]) < 1e-2, (c, r)
+                assert rel_max(got_k, k_all[8 * r:min(8 * r + 8, p + S)]) < 1e-2, (c, r)
         elif ash.role(c) == A1.ROLE_V:  # per record its V panels up to the last new position and its rows
             for i, r in enumerate(recs_c):
                 b_ = recs[c, i * (A1.REC_V + A1.ROWS_B):(i + 1) * (A1.REC_V + A1.ROWS_B)]
@@ -929,7 +925,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
         for s in range(acc):
             for i, L in enumerate(layers):
                 got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1, slot=s)
-                errs[t + s, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t + s], np.float32))
+                errs[t + s, i] = rel_max(got, np.asarray(G_["l_out", L][t + s], np.float32))
         ov.accept(acc)
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode.startswith("split") and not ov.ash.one)
@@ -1007,7 +1003,7 @@ def test_moe_slice(first: int) -> None:
         ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
             got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+            errs[t, i] = rel_max(got, np.asarray(G_["l_out", L][t], np.float32))
             o = ov.xch[L] + 4 * OD.META  # (the route object's payload: [slot][expert] fp32)
             ov.dev.fetch("ACT", o, 4 * E)
             lg = ov.dev.view("ACT")[o:o + 4 * E].view(np.float32)
@@ -1048,7 +1044,7 @@ def test_dense_slice(first: int) -> None:
         ov.step(torch.from_numpy(np.asarray(G_["l_out", first - 1][t], np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
             got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+            errs[t, i] = rel_max(got, np.asarray(G_["l_out", L][t], np.float32))
     print(f"layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.4f}")
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
 
@@ -1072,7 +1068,7 @@ def test_lm_head(size: str) -> None:
         got = ov.logits_of(np.asarray(G_["l_out", L][t], np.float32)).astype(np.float32)
         want = np.asarray(G_.logits[t], np.float32)
         assert got.shape == want.shape and int(got.argmax()) == int(want.argmax()), t
-        assert ref.rel_err(got, want) < 2e-2, (t, ref.rel_err(got, want))
+        assert rel_max(got, want) < 2e-2, (t, rel_max(got, want))
 
 
 # ----------------------------------------------------------------------
@@ -1107,7 +1103,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     dev.fetch("ACT")
     act = dev.view("ACT")
     off = ov.inp[(L, "moe_in")][0].off + OD.XB
-    xin = _bf16(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
+    xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
     b = f"blk.{L}."
     xn = ref.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
                       cfg.rms_norm_eps)
@@ -1115,7 +1111,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
     o = ov.xch[L] + 4 * OD.META
     lg = act[o:o + 4096].view(np.float32).reshape(OD.SLOTS, -1)[:S]
-    assert ref.rel_err(lg, lg_ref) < 3e-5, ref.rel_err(lg, lg_ref)
+    assert rel_max(lg, lg_ref) < 3e-5, rel_max(lg, lg_ref)
     ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
     rids, rw = ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
     assert np.array_equal(ids, rids)
@@ -1139,7 +1135,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     want = xin + ref.moe_ffn(xn, rids, rw, ex) + shared
     for s in range(S):
         got = ov.hidden(-1, slot=s)
-        assert ref.rel_err(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, ref.rel_err(got, want[s]))
+        assert rel_max(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, rel_max(got, want[s]))
 
 
 # ----------------------------------------------------------------------

@@ -17,8 +17,9 @@ from models.lfm3a import codec as CD
 from models.lfm3a import depth as DP
 from models.lfm3a import speech as S
 
+from ..numerics import kl_rows
 from . import gen_ref as R
-from .test_gen_ref import MMPROJ, MODEL, TEXT, kl
+from .test_gen_ref import MMPROJ, MODEL, TEXT
 
 TEXTS = [TEXT, "The quick brown fox jumps over the lazy dog, and then it runs back into the forest.",
          "Speech synthesis on a neural processing unit is a good test of small matrix programs."]
@@ -59,8 +60,8 @@ def test_depth(gen: tuple[DP.Depth, CD.Codec]) -> None:
             c[order[:4 * p]] = g.codes[f, order[:4 * p]]
             cbs = list(order[4 * p:4 * p + 4])
             r = ref.logits(h, c)[cbs]
-            ks.append(kl(r, dp.logits(c, cbs)))
-            lks.append(kl(r, R.golden(MODEL, MMPROJ, h=h, passes=c[None]).logits(0)[cbs]))
+            ks.append(kl_rows(r, dp.logits(c, cbs)))
+            lks.append(kl_rows(r, R.golden(MODEL, MMPROJ, h=h, passes=c[None]).logits(0)[cbs]))
     ks, lks = np.concatenate(ks), np.concatenate(lks)
     print(f"KL from float64: NPU median {np.median(ks):.2e} (p90 {np.percentile(ks, 90):.2e}), llama.cpp {np.median(lks):.2e}")
     assert np.median(ks) < 2.5 * np.median(lks) and np.percentile(ks, 90) < 2.5 * np.percentile(lks, 90)

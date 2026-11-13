@@ -22,6 +22,7 @@ from models.qwen35.qwen import NpuQwen, Qwen
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
+from ..numerics import kl_report
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ, NAMES
 
@@ -30,11 +31,6 @@ pytestmark = pytest.mark.slow  # (the whole model)
 ANSWER = ("The image shows an astronaut in a white spacesuit riding a brown horse across a grassy field. The horse is "
           "galloping, and the astronaut holds the reins with one hand. In the background there are rolling hills, a "
           "few trees and a clear blue sky with some clouds.")
-
-
-def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
-    lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
-    return (lw.exp() * (lw - lg)).sum(-1)
 
 
 @pytest.fixture(scope="module")
@@ -71,14 +67,6 @@ def _messages(image: str | None) -> list[dict[str, object]]:
     return [{"role": "user", "content": [{"type": "text", "text": before}, img, {"type": "text", "text": after}]}]
 
 
-def _kl_report(name: str, want: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
-    kl = _kl(want, got)
-    agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
-    print(f"{name}: KL vs llama.cpp at the official positions {float(kl.mean()):.4f} (max {float(kl.max()):.4f}), "
-          f"argmax agreement {agree:.3f} over {len(kl)} tokens")
-    return float(kl.mean()), agree
-
-
 def _k_cache(model: NpuQwen, n: int) -> np.ndarray:
     """K (attention layers x KV heads, n, head_dim) of the first n slots, as the cache holds them."""
     ov = model.overlay
@@ -103,7 +91,7 @@ def test_image_prompt(case: tuple) -> None:
         got = [model.forward(seq[:K])]
         caches[prefill] = _k_cache(model, K - K % 32)
         got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
-        kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
+        kl, agree = kl_report("prefill" if prefill else "steps", want, got, where=" at the official positions")
         assert model.rope_next == seq.next - 1  # (the text positions continued through the answer's steps)
         assert kl < 0.008 and agree > 0.92
         del model
@@ -130,7 +118,7 @@ def test_app_image_prompt(case: tuple) -> None:
     model = app.load(capacity=1024)
     got = [model.forward(prompt)]
     got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
-    kl, agree = _kl_report("the NPU encoder, prefill", want, got)
+    kl, agree = kl_report("the NPU encoder, prefill", want, got, where=" at the official positions")
     assert kl < 0.016 and agree > 0.9
     app.vision._kept.clear()
     again, _ = app.vision.embeddings(im)

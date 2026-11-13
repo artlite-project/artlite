@@ -15,6 +15,7 @@ from models import open_model
 from models.common import Model, NpuModel, Sampling
 
 from .common import essay
+from .numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -24,11 +25,6 @@ QUESTION_B = "What is the main claim of this essay?"
 TEXT = " The essay argues that technology makes the things we like more addictive."
 # (file, prefill)
 CASES = [(llama_gguf("Q4_0", "1B"), True), (llama_gguf("Q4_0", "1B"), False), (gemma_gguf("Q4_0"), True)]
-
-
-def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
-    lr, lp = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
-    return (lr.exp() * (lr - lp)).sum(-1)
 
 
 def _logits(npu: NpuModel, prompt: list[int], continuation: list[int]) -> torch.Tensor:
@@ -69,7 +65,7 @@ def test_rewind(loaded: tuple[Model, NpuModel], where: str) -> None:
     got = _logits(npu, b[kept:], cont)
     npu.reset()
     want = _logits(npu, b, cont)
-    kl = [round(float(x), 5) for x in _kl(want, got)]
+    kl = [round(float(x), 5) for x in kl_rows(want, got)]
     print(f"{model.name}: common prefix {common}, kept {kept} of {len(cached)}, B {len(b)}: KL {kl}")
     assert int(got[0].argmax()) == int(want[0].argmax())
     assert all(x < 0.002 for x in kl), kl

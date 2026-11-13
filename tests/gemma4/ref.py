@@ -24,7 +24,8 @@ import torch
 from artlite import _native
 from artlite.gguf_model import QTensor
 
-from ..decode.attn_ref import AttentionRef, bf, inv_rms
+from ..decode.attn_ref import AttentionRef, inv_rms
+from ..numerics import bf16_round as bf
 from .cpu import GemmaCpu, gelu
 
 

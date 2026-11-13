@@ -20,13 +20,10 @@ from models.qwen35 import gdn_prefill as GP
 from models.qwen35.image import QwenImage, gdn_v_heads
 
 from ..common import essay, to_numpy
+from ..numerics import bf16_round, rel_max
 from . import ref
 
 HSLOT, CS_OFF = 16384, 896  # (header slots as the overlay's: the conv state 4 META + 640 bytes in)
-
-
-def _bf(x: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
 def _bits(x: np.ndarray) -> np.ndarray:
@@ -52,10 +49,10 @@ def test_gdn_scan(T: int, size: str) -> None:
     tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T + n2]
     G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta|attn_output|new_state",
                     logits="none")
-    qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(len(tokens), -1))
+    qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(len(tokens), -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(len(tokens), -1)
-    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)  # (the ab slot's values: fp32 or bf16)
-    beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(len(tokens), -1))
+    alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)  # (the ab slot's values: fp32 or bf16)
+    beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(len(tokens), -1))
     op = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay)
     prep = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay)
     fused = FusedOperator(name="gdn_scan", runlist=[(prep, "G", "CV", "P", "M", "PR"),
@@ -110,16 +107,16 @@ def test_gdn_scan(T: int, size: str) -> None:
             cs[c] = np.concatenate([cs[c], x[:n]])[-3:]
             o_want[:, vh] = o_c
             got_s = GD.state_from_panels(S[c].reshape(-1, 1024), sh.hc)
-            s_err.append(ref.rel_err(got_s, st[c]))
+            s_err.append(rel_max(got_s, st[c]))
             assert s_err[-1] < 8e-3, (chunk, c)
             final.append(got_s)
-        assert ref.rel_err(O[:n], o_want[:n]) < 1e-2, chunk
+        assert rel_max(O[:n], o_want[:n]) < 1e-2, chunk
         gold = np.asarray(G_["attn_output", L], np.float32).reshape(len(tokens), cfg.ssm_v_heads, 128)[t0:t0 + n]
-        assert ref.rel_err(O[:n], gold) < 2e-2, chunk
+        assert rel_max(O[:n], gold) < 2e-2, chunk
     # the final state: as close to llama.cpp's as the exact arithmetic's (bf16 inputs on both; e_npu, e_ref: largest)
     gold = np.asarray(G_["new_state", L], np.float32).reshape(-1, 128, 128)
     g8 = np.concatenate([gold[gdn_v_heads(cfg, c)] for c in range(COLS)])
-    e_npu, e_ref = ref.rel_err(np.concatenate(final), g8), ref.rel_err(np.concatenate(st), g8)
+    e_npu, e_ref = rel_max(np.concatenate(final), g8), rel_max(np.concatenate(st), g8)
     r_npu = np.linalg.norm(np.concatenate(final) - g8) / np.linalg.norm(g8)
     r_ref = np.linalg.norm(np.concatenate(st) - g8) / np.linalg.norm(g8)
     print(f"{size}: states vs the cores' exact arithmetic max {max(s_err):.5f}; final state vs llama.cpp {e_npu:.5f}, the "
@@ -167,7 +164,7 @@ def test_gdn_out(size: str) -> None:
         z = G[:, c * lay.pitch + lay.off["z"]:][:, :len(vh) * 128].float().numpy().reshape(T, -1, 128)
         want = ref.core_gdn_out(O.float().numpy().reshape(T, hv, 128)[:, vh], z, norm, cfg.rms_norm_eps).reshape(T, -1)
         want = bfp16.from_panels(bfp16.to_panels(want), T, want.shape[1])  # (its blocks)
-        assert ref.rel_err(A[:, vh].reshape(T, -1), want) < 1.2e-2, c  # (rel_err: max-based; a flip of the
+        assert rel_max(A[:, vh].reshape(T, -1), want) < 1.2e-2, c  # (rel_err: max-based; a flip of the
         # 7-bit mantissa in the block of the largest values is ~1 / 100)
         gh = fused.get_buffer("GH").view(np.int16)
         o = (c * HSLOT + CS_OFF) // 2
@@ -198,10 +195,10 @@ def test_gdn_scan_packed(size: str) -> None:
     n = int(sum(lengths))
     tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
-    qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
+    qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
-    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)
-    beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
+    alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)
+    beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
     sh = GD.GdnShape(cfg)
     P = GP.scan_params(g, cfg, L, blk.rows)
     cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
@@ -254,11 +251,11 @@ def test_gdn_scan_packed(size: str) -> None:
                                             dt=dt[vh], ssm_a=A[vh], state=np.zeros((sh.hc, 128, 128), np.float32),
                                             n=m, eps=cfg.rms_norm_eps)[0]
         got = O[a:a + m]
-        e_alone, e_ref = ref.rel_err(got, alone), ref.rel_err(got, want[:m])
+        e_alone, e_ref = rel_max(got, alone), rel_max(got, want[:m])
         diff = np.flatnonzero((got != alone).any((1, 2)))
         print(f"segment {a} + {m}: vs alone {e_alone:.2e} ({m - diff.size} of {m} rows bit-identical; first differing "
-              f"{diff[:4].tolist()}), vs the cores' arithmetic {e_ref:.2e} (alone {ref.rel_err(alone, want[:m]):.2e})")
-        assert e_ref < 1.05 * ref.rel_err(alone, want[:m]) + 1e-4, a
+              f"{diff[:4].tolist()}), vs the cores' arithmetic {e_ref:.2e} (alone {rel_max(alone, want[:m]):.2e})")
+        assert e_ref < 1.05 * rel_max(alone, want[:m]) + 1e-4, a
         if a % GP.C == 0:
             k = m if (a + m) % GP.C == 0 else (a + m) // GP.C * GP.C - a  # (the rows before the next start's chunk)
             assert (got[:k] == alone[:k]).all(), (a, np.flatnonzero((got[:k] != alone[:k]).any((1, 2))).tolist())
@@ -287,10 +284,10 @@ def test_gdn_scan_tree(size: str) -> None:
     n = pre + int(sum(lengths))
     tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
-    qkv = _bf(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
+    qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
-    alpha = alpha if GP.ab_f32(lay) else _bf(alpha)
-    beta = _bf(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
+    alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)
+    beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
     sh = GD.GdnShape(cfg)
     P = GP.scan_params(g, cfg, L, blk.rows)
     cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
@@ -367,11 +364,11 @@ def test_gdn_scan_tree(size: str) -> None:
             rows = blk.rows[c][blk.rows[c] >= 0]
             vh = gdn_v_heads(cfg, c)
             ab = np.concatenate([alpha[seg][:, vh], beta[seg][:, vh]], 1)
-            cs = _bf(qkv[pre - 3:pre][:, rows])
+            cs = bf16_round(qkv[pre - 3:pre][:, rows])
             want[:, vh] = ref.core_gdn_scan(qkv=qkv[seg][:, rows], ab=ab, conv_state=cs, conv_w=cw[rows], dt=dt[vh],
                                             ssm_a=A[vh], state=st_p[c], n=m, eps=cfg.rms_norm_eps)[0]
         diff = np.flatnonzero((got != one).any((1, 2)))
         print(f"{size} segment {a} + {m}: {m - diff.size} of {m} rows bit-identical to alone; vs the cores' arithmetic "
-              f"{ref.rel_err(got, want):.2e} (alone {ref.rel_err(one, want):.2e})")
+              f"{rel_max(got, want):.2e} (alone {rel_max(one, want):.2e})")
         assert diff.size == 0, (a, diff[:8].tolist())
-        assert ref.rel_err(got, want) < 1e-2, a
+        assert rel_max(got, want) < 1e-2, a

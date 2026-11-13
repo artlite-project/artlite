@@ -19,6 +19,7 @@ from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator
 
 from ..common import to_numpy
+from ..numerics import rel_max
 from ..qwen35 import ref
 
 # (model, layer): the layers each image holds
@@ -97,7 +98,7 @@ def test_router(model: str, L: int) -> None:
     xr = xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
     want = xr @ _f32(g, f"blk.{L}.ffn_gate_inp.weight").T
     want_sg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp_shexp.weight")[0]
-    err, err_sg = ref.rel_err(got, want), ref.rel_err(got_sg, np.repeat(want_sg[:, None], COLS, 1))
+    err, err_sg = rel_max(got, want), rel_max(got_sg, np.repeat(want_sg[:, None], COLS, 1))
     print(f"layer {L}: logits rel-rms {err:.2e}, shared gate {err_sg:.2e}")
     assert err < 5e-5 and err_sg < 8e-5
     ids, _ = ref.moe_route(got.astype(np.float32), cfg.n_experts_used)
@@ -156,7 +157,7 @@ def test_shared_gate_up(model: str, L: int, T: int) -> None:
     b = f"blk.{L}."
     gate, up = xh @ _f32(g, b + "ffn_gate_shexp.weight").T, xh @ _f32(g, b + "ffn_up_shexp.weight").T
     want = gate / (1 + np.exp(-gate)) * up
-    err, rms = ref.rel_err(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
+    err, rms = rel_max(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
     print(f"layer {L} T {T}: shared silu(gate) up err {err:.2e}, rms {rms:.2e}")
     assert err < 4.5e-2 and rms < 2.5e-2
 
@@ -184,7 +185,7 @@ def test_shared_down(model: str, L: int, T: int) -> None:
     C.sync_from_device()
     c = C.numpy().astype(np.float32)[:T].reshape(T, COLS, pitch)[:, :, :H // COLS].reshape(T, H)
     want = Aq @ _f32(g, f"blk.{L}.ffn_down_shexp.weight").T
-    err = ref.rel_err(c, want)
+    err = rel_max(c, want)
     print(f"layer {L} ({region.blocks[0].fmt}) T {T}: shared down err {err:.2e}")
     assert err < 1.7e-2
 
@@ -259,8 +260,8 @@ def test_expert_gemms(model: str, L: int) -> None:
             assert (hr[c, k, :g] != UNSET).any() and (hr[c, k, g:] == UNSET).all(), (c, k, rows)
             assert (yr[c, k, rows:] == UNSET).all() and not (yr[c, k, :rows] == UNSET).all(axis=1).any(), (c, k)
             got_h = bfp16.from_panels(hv[c, k], CHUNK, F).astype(np.float64)[:rows]
-            errs_h.append(ref.rel_err(got_h, hg / (1 + np.exp(-hg)) * hu))
-            errs_y.append(ref.rel_err(yv[c, k, :rows].astype(np.float64), got_h @ down.T))
+            errs_h.append(rel_max(got_h, hg / (1 + np.exp(-hg)) * hu))
+            errs_y.append(rel_max(yv[c, k, :rows].astype(np.float64), got_h @ down.T))
     print(f"layer {L}: chunks {ns.tolist()}; H err max {max(errs_h):.2e}, down err max {max(errs_y):.2e}")
     assert max(errs_h) < 3.5e-2 and max(errs_y) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
 
@@ -382,7 +383,7 @@ def test_moe_block(model: str, L: int) -> None:
                                      ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
                                _f32(g, b + "ffn_gate_inp_shexp.weight")[0])
     want = ref.moe_ffn(xr, ids, w, ref.experts(g, L)) + shared
-    err, rms = ref.rel_err(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
+    err, rms = rel_max(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
     print(f"layer {L}: chunks per column {counts}; delta err max {err:.2e}, rms {rms:.2e}")
     assert err < 4e-2 and rms < 3e-2
     assert np.array_equal(bufs["PX"].numpy().reshape(T, H).view(np.uint16),

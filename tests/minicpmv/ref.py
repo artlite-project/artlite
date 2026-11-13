@@ -38,6 +38,7 @@ from models.minicpmv import encoder as vision
 
 from .. import common
 from ..llama_cpp import _lib_identity, _llama_lib, llama_cpp_bin
+from ..numerics import bf16_like, gelu_table, gelu_tanh
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DUMP_SRC = os.path.join(HERE, "dump.cpp")
@@ -232,21 +233,6 @@ def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *,
 # ----------------------------------------------------------------------
 
 
-def _bf16(x: torch.Tensor) -> torch.Tensor:
-    return x.to(torch.bfloat16).to(x.dtype)
-
-
-def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
-    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)))
-
-
-def _gelu_table(x: torch.Tensor) -> torch.Tensor:
-    """ggml's CPU GELU (tanh): an fp16 table of the fp16-rounded input (|x| < 10), the identity / 0 outside."""
-    xh = x.to(torch.float16).to(torch.float32)
-    y = _gelu_tanh(xh).to(torch.float16).to(x.dtype)
-    return torch.where(x <= -10, torch.zeros_like(x), torch.where(x >= 10, x, y))
-
-
 class Encoder:
     """MiniCPM-V 4.7's vision encoder from its mmproj file (module docstring); ``llama``: llama.cpp's CPU rounding."""
 
@@ -274,7 +260,7 @@ class Encoder:
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
         if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = _bf16(x)
+            x = bf16_like(x)
         y = x @ w.T
         return y + self.w(bias).reshape(-1) if bias else y
 
@@ -285,7 +271,7 @@ class Encoder:
             + self.w(prefix + ".bias").reshape(-1)
 
     def _gelu(self, x: torch.Tensor) -> torch.Tensor:
-        return _gelu_table(x) if self.llama else _gelu_tanh(x)
+        return gelu_table(x) if self.llama else gelu_tanh(x)
 
     def _attn(self, x: torch.Tensor, p: str, mask: torch.Tensor | None = None) -> torch.Tensor:
         n = x.shape[0]
@@ -418,7 +404,7 @@ class NpuEncoder(Encoder):
         """a: the A panels' values -> C + bias + residual, unrounded."""
         c = a @ self.wq(name).T
         if bias:
-            c = c + _bf16(self.w(bias).reshape(-1))
+            c = c + bf16_like(self.w(bias).reshape(-1))
         return c if res is None else c + res
 
     def ln(self, x: torch.Tensor, prefix: str) -> torch.Tensor:
@@ -433,7 +419,7 @@ class NpuEncoder(Encoder):
         return _bfp(y)
 
     def gelu_panels(self, c: torch.Tensor) -> torch.Tensor:
-        return _bfp(_bf16(_gelu_tanh(_bf16(c))))
+        return _bfp(bf16_like(gelu_tanh(bf16_like(c))))
 
     def attention(self, a: torch.Tensor, p: str) -> torch.Tensor:
         """a: the LayerNorm's panels (n, hidden) -> o / l panels (n, hidden)."""
@@ -445,7 +431,7 @@ class NpuEncoder(Encoder):
         k = _bfp(k.reshape(n, H, d).transpose(0, 1))
         v = _bfp(v.reshape(n, H, d).permute(1, 2, 0)).transpose(1, 2)  # (V^T panels: blocks over 8 tokens)
         s = q @ k.transpose(1, 2)  # (log2 units)
-        pr = _bfp(_bf16(torch.exp2(s - s.amax(-1, keepdim=True))))
+        pr = _bfp(bf16_like(torch.exp2(s - s.amax(-1, keepdim=True))))
         o = (pr @ v) / pr.sum(-1, keepdim=True)
         return _bfp(o.transpose(0, 1).reshape(n, self.hidden))
 
@@ -453,9 +439,9 @@ class NpuEncoder(Encoder):
         """Layer il on the residual x (bf16 values)."""
         p = f"v.blk.{il}."
         o = self.attention(self.ln(x, p + "ln1"), p)
-        x = _bf16(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
+        x = bf16_like(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
         h = self.gelu_panels(self.gemm(self.ln(x, p + "ln2"), p + "ffn_up.weight", p + "ffn_up.bias"))
-        return _bf16(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
+        return bf16_like(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
 
     def window_attention(self, a: torch.Tensor, p: str) -> torch.Tensor:
         """The ViT merger's attention inside windows of 4 consecutive tokens: a the LayerNorm's panels -> o panels (Q
@@ -471,7 +457,7 @@ class NpuEncoder(Encoder):
         v = _bfp(vp)[..., :nw].permute(3, 0, 1, 2)
         s = torch.einsum("wihd,wjhd->whij", q, k)
         pr = torch.exp2(s - s.amax(-1, keepdim=True))
-        pr = _bf16(pr / pr.sum(-1, keepdim=True))
+        pr = bf16_like(pr / pr.sum(-1, keepdim=True))
         o = torch.einsum("whij,wjhd->wihd", pr, v)
         return _bfp(o.reshape(n, self.hidden))
 
@@ -484,12 +470,12 @@ class NpuEncoder(Encoder):
         win = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)  # (window order)
         xw = x[torch.from_numpy(win)]
         o = self.window_attention(self.ln(xw, "v.vit_merger.ln1"), "v.vit_merger.")
-        xw = _bf16(self.gemm(o, "v.vit_merger.attn_out.weight", "v.vit_merger.attn_out.bias", xw))
+        xw = bf16_like(self.gemm(o, "v.vit_merger.attn_out.weight", "v.vit_merger.attn_out.bias", xw))
         cat = xw.reshape(-1, 4 * H)
         g = self.gelu_panels(self.gemm(self.ln(cat, "v.vit_merger.ds_ln"), "v.vit_merger.ds_ffn_up.weight",
                                        "v.vit_merger.ds_ffn_up.bias"))
-        mean4 = _bfp(xw).reshape(-1, 4, H).sum(1) / 4 if mean_panels else _bf16(xw.reshape(-1, 4, H).mean(1))
-        x = _bf16(self.gemm(g, "v.vit_merger.ds_ffn_down.weight", "v.vit_merger.ds_ffn_down.bias", mean4))
+        mean4 = _bfp(xw).reshape(-1, 4, H).sum(1) / 4 if mean_panels else bf16_like(xw.reshape(-1, 4, H).mean(1))
+        x = bf16_like(self.gemm(g, "v.vit_merger.ds_ffn_down.weight", "v.vit_merger.ds_ffn_down.bias", mean4))
         tr["vit_merger_ds_out"] = x
         return x
 
@@ -510,8 +496,8 @@ class NpuEncoder(Encoder):
         o = 128 * a - (mean / std).repeat_interleave(P * P)
         w, name = self.w("v.patch_embd.weight").reshape(H, -1), "v.patch_embd.weight"
         c = cols @ self._round(w * a, name).T + self._round((w @ o)[:, None], name)[:, 0] \
-            + _bf16(self.w("v.patch_embd.bias").reshape(-1))
-        x = _bf16(c + _bf16(self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]))
+            + bf16_like(self.w("v.patch_embd.bias").reshape(-1))
+        x = bf16_like(c + bf16_like(self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]))
         tr = trace if trace is not None else {}
         tr["pos_embed"] = x
         h, w = ph, pw
@@ -522,14 +508,14 @@ class NpuEncoder(Encoder):
                 continue
             x = self.vit_merger(x, h, w, tr, mean_panels=mean_panels)
             h, w = h // 2, w // 2
-        y = _bf16(self.ln(x, "v.post_ln"))  # (panels, then their values as C tiles)
+        y = bf16_like(self.ln(x, "v.post_ln"))  # (panels, then their values as C tiles)
         tr["post_ln"] = y
         idx = np.concatenate([ix[:, None] for ix in self.ds_index(h, w)], 1).reshape(-1)
         cat = y[torch.from_numpy(idx)].reshape(-1, 4 * H)
         up = self.gemm(self.ln(cat, "mm.input_norm"), "mm.up.weight", "mm.up.bias")
-        z = _bf16(up)
-        g = _bfp(_bf16(0.5 * z * (1 + torch.erf(z / math.sqrt(2)))))
-        out = _bf16(self.gemm(g, "mm.down.weight", "mm.down.bias"))
+        z = bf16_like(up)
+        g = _bfp(bf16_like(0.5 * z * (1 + torch.erf(z / math.sqrt(2)))))
+        out = bf16_like(self.gemm(g, "mm.down.weight", "mm.down.bias"))
         tr["merger_out"] = out
         if suffix is not None:
             out = torch.cat([out, self.w("v.tok_embd_sep")[SUFFIX_ROWS[suffix]]])

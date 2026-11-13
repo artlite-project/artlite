@@ -16,6 +16,7 @@ from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
 from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
+from ..numerics import bf16_round
 from . import mmv
 
 # per GGUF block: (columns, bytes, the offsets of its fp16 fields)
@@ -120,16 +121,12 @@ def test_pack_native_planes() -> None:
     assert err.max() < 3e-5, err
 
 
-def _bf(x: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.asarray(x, np.float32)).bfloat16().double().numpy()
-
-
 def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
     """(R, K) the tile's weights as the kernels take them: GGUF's formulas with the scales in bf16 (the tiles')."""
     q = f["q"].astype(np.float64) if "q" in f else None
 
     def per(v: np.ndarray, n: int) -> np.ndarray:  # a value per n columns
-        return np.repeat(_bf(v).reshape(v.shape[0], -1), n, 1)
+        return np.repeat(bf16_round(v).astype(np.float64).reshape(v.shape[0], -1), n, 1)
 
     if fmt == "BFP16":
         w = f["w"]

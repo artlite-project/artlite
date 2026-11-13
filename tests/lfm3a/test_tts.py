@@ -15,6 +15,7 @@ from models.lfm.lfm import Lfm
 from models.lfm3a import host as A
 from models.lfm3a import speech as S
 
+from ..numerics import rel
 from . import gen_ref as R
 from .test_gen_ref import MMPROJ, MODEL, TEXT
 
@@ -28,10 +29,6 @@ def app() -> tuple[Lfm, object]:
             pytest.skip(f"{p} missing")
     m = Lfm(MODEL, mmproj=MMPROJ)
     return m, m.load(capacity=2048)
-
-
-def rel(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
 def test_audio_steps(app: tuple[Lfm, object]) -> None:

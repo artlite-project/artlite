@@ -226,8 +226,3 @@ class LfmCpu:
         return self.head(self.outputs(seq, rows, chunk=chunk, state=state, sets=sets))
 
 
-def kl(ref: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
-    """KL(softmax(ref) || softmax(got)) per row (float64)."""
-    la, lb = torch.log_softmax(ref.double(), -1), torch.log_softmax(got.double(), -1)
-    return (la.exp() * (la - lb)).sum(-1)
-

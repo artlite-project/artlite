@@ -23,12 +23,9 @@ from models.qwen3vl import encoder as E
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
+from ..numerics import rel
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
-
-
-def _rel(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(np.asarray(a, np.float64) - b) / np.linalg.norm(b))
 
 
 @pytest.mark.parametrize("gh, gw", [(11, 11), (16, 16), (18, 20), (64, 64), (1, 8), (3, 5), (24, 48)])
@@ -127,10 +124,10 @@ def test_layer(npu: VisionDevice, mm: tuple, size: tuple[int, int], il: int) -> 
             rows[sp[b, c][real[b, c]]] = v[real[b, c]]
     sim = V.NpuEncoder(MMPROJ).layer(xin, il, ang, np.where(real, sp, -1).reshape(-1, 8)).numpy()
     got = rows[:, :H]
-    print(f"NPU vs float64 {_rel(got, exact):.2e} (the CPU at its rounding points {_rel(sim, exact):.2e}); NPU vs CPU "
-          f"{_rel(got, sim):.2e}")
+    print(f"NPU vs float64 {rel(got, exact):.2e} (the CPU at its rounding points {rel(sim, exact):.2e}); NPU vs CPU "
+          f"{rel(got, sim):.2e}")
     assert float(np.abs(rows[:, H:]).max()) == 0
-    assert _rel(got, exact) < 1.1 * _rel(sim, exact)
+    assert rel(got, exact) < 1.1 * rel(sim, exact)
 
 
 @pytest.fixture(scope="module")
@@ -172,7 +169,7 @@ def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
     want = V.Encoder(MMPROJ).forward(Q.normalized(px, clip.mean, clip.std)).numpy()
     e = _token_errors(got, want)
     print(f"{size}: {got.shape[0]} tokens, per token median {np.median(e):.4f}, p90 {np.percentile(e, 90):.4f}, max "
-          f"{e.max():.3f}; sum {_rel(got, want):.3f}")
+          f"{e.max():.3f}; sum {rel(got, want):.3f}")
     assert got.shape == want.shape and np.median(e) < 0.055 and np.percentile(e, 90) < 0.17
     assert np.array_equal(encoder(px), got)
 

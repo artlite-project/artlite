@@ -12,6 +12,7 @@ from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator, ResidualNormOperator, residual_params
 
 from ..common import to_numpy, to_torch
+from ..numerics import rel
 
 _from_panels = bfp16.from_panels
 
@@ -221,9 +222,6 @@ def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool
     got_x = to_torch(X.numpy()).view(torch.float32).reshape(T, E).double()
     got_n = to_torch(bfp16.from_panels(XN.numpy(), T, E)).double()
     want_q = torch.from_numpy(bfp16.values(want_n.float().numpy())).double()
-
-    def rel(a: torch.Tensor, b: torch.Tensor) -> float:
-        return float((a - b).norm() / b.norm())
 
     ex, en, eq = rel(got_x, want_x), rel(got_n, want_n), rel(want_q, want_n)
     print(f"x' {ex:.2e}, xn {en:.2e} (the model's values rounded to bfp16: {eq:.2e})")

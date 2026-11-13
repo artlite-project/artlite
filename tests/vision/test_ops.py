@@ -15,7 +15,7 @@ from artlite.vision.ops import Apply, Attention, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Slots, as_wt
 
-from ..common import as_torch
+from ..numerics import rel_native
 
 COLS, ROWS = 8, 4
 
@@ -29,11 +29,6 @@ def q(x: torch.Tensor) -> torch.Tensor:
     """x rounded to bfp16ebs8 blocks of 8 along the last dimension."""
     return torch.from_numpy(L.unblocks(L.blocks(np.ascontiguousarray(x.float().reshape(*x.shape[:-1], -1, 8).numpy()))
                                        )).reshape(x.shape)
-
-
-def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
-    y, ref = as_torch(y), as_torch(ref)
-    return float((y - ref).norm() / ref.norm())
 
 
 def fills(npu: VisionDevice, name: str, images: list[np.ndarray], addr: int) -> dict[int, ColOps]:
@@ -104,7 +99,7 @@ def test_gemm(npu: VisionDevice, m: int, ntile: int, K: int, N: int, res: bool, 
               "bf16": lambda b: torch.from_numpy(L.from_ctiles(b, T, N, m))}[out]
     y = torch.cat([unpack(yb[c]) for c in range(COLS)])
     ref = q(x) @ q(w).T + b.bfloat16().float() + (r.bfloat16().float() if res else 0)
-    assert _rel(y, ref) < 8e-3
+    assert rel_native(y, ref) < 8e-3
 
 
 def test_gemm_rope(npu: VisionDevice) -> None:
@@ -132,7 +127,7 @@ def test_gemm_rope(npu: VisionDevice) -> None:
     c0 = (q(x) @ q(w).T + b.bfloat16().float()).bfloat16().float().reshape(-1, 16, 2, 40)
     c, sn = (t.bfloat16().float()[:, None] for t in (cs[:, :40], cs[:, 40:]))
     ref = torch.stack([c0[:, :, 0] * c - c0[:, :, 1] * sn, c0[:, :, 1] * c + c0[:, :, 0] * sn], 2).reshape(-1, N)
-    assert _rel(y, ref) < 8e-3
+    assert rel_native(y, ref) < 8e-3
 
 
 @pytest.mark.parametrize("nb, frac, heads, kvh", [(5, 0.83, 16, 0), (2, 1.0, 16, 0), (9, 0.5, 16, 0), (2, 1.0, 16, 8),
@@ -187,7 +182,7 @@ def test_attention_dense(npu: VisionDevice, nb: int, frac: float, heads: int, kv
         sc = q(qs[:, ch]) @ kk[:, ck].T
         p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
         ref[:, ch] = (p @ vq[:, ck]) / p.sum(-1, keepdim=True)
-    assert _rel(o, ref) < 1.5e-2
+    assert rel_native(o, ref) < 1.5e-2
 
 
 @pytest.mark.parametrize("m, K, N", [(64, 320, 2560), (64, 640, 1280), (16, 320, 1280)])
@@ -212,7 +207,7 @@ def test_geglu(npu: VisionDevice, m: int, K: int, N: int) -> None:
     u = q(x) @ q(w).T + b.bfloat16().float()
     hid, gate = u.chunk(2, -1)
     ref = hid.bfloat16().float() * F.gelu(gate.bfloat16().float(), approximate="tanh")
-    assert _rel(y, ref) < 1.2e-2
+    assert rel_native(y, ref) < 1.2e-2
 
 
 @pytest.mark.parametrize("m, ntile, K, N", [(64, 1, 1280, 4480), (16, 2, 1280, 1280)])
@@ -236,7 +231,7 @@ def test_gelu(npu: VisionDevice, m: int, ntile: int, K: int, N: int) -> None:
     y = torch.cat([torch.from_numpy(L.from_panels(out[c], g.y_np * 8, N))[:T] for c in range(COLS)])
     u = q(x) @ q(w).T + b.bfloat16().float()
     ref = F.gelu(u.bfloat16().float(), approximate="tanh")
-    assert _rel(y, ref) < 1.2e-2
+    assert rel_native(y, ref) < 1.2e-2
 
 
 def table_rows(npu: VisionDevice, name: str, tab: np.ndarray) -> dict:
@@ -320,7 +315,7 @@ def test_norm(npu: VisionDevice, mode: str, m: int, C: int, ntile: int, nrows: i
             ref = F.silu(ref.bfloat16().float())
     else:
         ref = F.layer_norm(y, (C,), gamma, beta, 1e-5)
-    assert _rel(z, ref) < 9e-3
+    assert rel_native(z, ref) < 9e-3
 
 
 @pytest.mark.parametrize("np_, d, nb, rows, sink, heads, masked", [
@@ -390,7 +385,7 @@ def test_attention(npu: VisionDevice, np_: int, d: int, nb: int, rows: int, sink
                 sc[:, ~torch.from_numpy(valid[i])] = -torch.inf
             p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
             ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
-    assert _rel(o, ref) < 1.5e-2
+    assert rel_native(o, ref) < 1.5e-2
 
 
 def level_tokens(x: torch.Tensor, rows: int, L_: int) -> torch.Tensor:
@@ -449,7 +444,7 @@ def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: boo
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), stride=stride, padding=1)
     if res:
         ref = ref + r_img.bfloat16().float()
-    assert _rel(y, ref) < 8e-3
+    assert rel_native(y, ref) < 8e-3
 
 
 @pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (640, 320, True)])
@@ -483,7 +478,7 @@ def test_conv_rows(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
     if res:
         ref = ref + r_img.bfloat16().float()
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     assert err < 8e-3, err
 
 
@@ -523,7 +518,7 @@ def test_cross_attention(npu: VisionDevice, np_: int, d: int, nb: int) -> None:
             sc = q(qs[sel][:, ch]) @ kk[:, ch].T
             p = torch.exp2(sc - sc.max(-1, keepdim=True).values)
             ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
-    err = _rel(o, ref)
+    err = rel_native(o, ref)
     assert err < 1.5e-2, err
 
 
@@ -573,7 +568,7 @@ def test_conv_il(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w), b.bfloat16().float(), padding=1)
     if res:
         ref = ref + r_img.bfloat16().float()
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     assert err < 8e-3, err
 
 
@@ -603,7 +598,7 @@ def test_norm_rms(npu: VisionDevice) -> None:
     y = torch.cat([torch.from_numpy(L.from_ctiles(b, m, C, m)) for b in npu.read("y", COLS * ny).reshape(COLS, -1)])
     z = torch.cat([torch.from_numpy(L.from_panels(b, m, C)) for b in npu.read("z", COLS * nz).reshape(COLS, -1)])
     ref = y / torch.sqrt((y[:, :H] ** 2).mean(-1, keepdim=True) + 1e-5) * gamma
-    assert _rel(z[:, :H], ref[:, :H]) < 9e-3 and float(z[:, H:].abs().max()) == 0
+    assert rel_native(z[:, :H], ref[:, :H]) < 9e-3 and float(z[:, H:].abs().max()) == 0
 
 
 @pytest.mark.parametrize("out", ["swiglu", "prod"])
@@ -631,11 +626,11 @@ def test_gated(npu: VisionDevice, out: str) -> None:
     hid, gate = u.chunk(2, -1)
     if out == "swiglu":
         y = torch.cat([torch.from_numpy(L.from_panels(ob[c], m, N // 2)) for c in range(COLS)])
-        assert _rel(y, hid * F.silu(gate)) < 1.2e-2
+        assert rel_native(y, hid * F.silu(gate)) < 1.2e-2
     else:  # ([pass 32][rb 8][cb 5][8 tokens][8 ch] bf16 per column, 640 B of padding a pass)
         v = torch.from_numpy(ob.reshape(COLS, N // 80, 5760)[:, :, :5120].copy()).view(torch.bfloat16).float()
         y = v.reshape(COLS, N // 80, 8, 5, 8, 8).permute(0, 2, 4, 1, 3, 5).reshape(COLS * m, N // 2)
-        assert _rel(y, (hid * gate).bfloat16().float()) < 8e-3
+        assert rel_native(y, (hid * gate).bfloat16().float()) < 8e-3
 
 
 def test_gemm_rope_qkn(npu: VisionDevice) -> None:
@@ -667,7 +662,7 @@ def test_gemm_rope_qkn(npu: VisionDevice) -> None:
     c0 = c0.reshape(-1, 16, 2, 40)
     c, sn = (t.bfloat16().float()[:, None] for t in (cs[:, :40], cs[:, 40:]))
     ref = torch.stack([c0[:, :, 0] * c - c0[:, :, 1] * sn, c0[:, :, 1] * c + c0[:, :, 0] * sn], 2).reshape(-1, N)
-    assert _rel(y, ref) < 8e-3
+    assert rel_native(y, ref) < 8e-3
 
 
 @pytest.mark.parametrize("gh, gw, nb, b", [(6, 20, 1, 0), (13, 17, 2, 1), (5, 3, 1, 0), (2, 70, 2, 0)])
@@ -738,7 +733,7 @@ def test_dwconv(npu: VisionDevice, gh: int, gw: int, nb: int, b: int) -> None:
                     t = 8 * (2 * qq + p) + j
                     ref[c, t] = (acc.bfloat16().float() * cg[b, c, t]).bfloat16().float()
                     sel[c, t] = True
-    assert _rel(got[sel], ref[sel]) < 8e-3
+    assert rel_native(got[sel], ref[sel]) < 8e-3
 
 
 def rope2_layout() -> np.ndarray:
@@ -802,7 +797,7 @@ def test_gemm_rope2(npu: VisionDevice, N: int) -> None:
         c, sn = (t.bfloat16().float()[:, None] for t in (tab[:, :40], tab[:, 40:]))
         ref[..., 80 * p:80 * p + 80] = torch.stack([h[:, :, 0] * c - h[:, :, 1] * sn, h[:, :, 1] * c + h[:, :, 0] * sn],
                                                    2).reshape(-1, N // 160, 80)
-    assert _rel(y, ref.reshape(-1, N)) < 8e-3 and float(y.reshape(-1, N // 160, 160)[..., pads].abs().max()) == 0
+    assert rel_native(y, ref.reshape(-1, N)) < 8e-3 and float(y.reshape(-1, N // 160, 160)[..., pads].abs().max()) == 0
 
 
 def test_gemm_silu(npu: VisionDevice) -> None:
@@ -825,7 +820,7 @@ def test_gemm_silu(npu: VisionDevice) -> None:
     yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
     y = torch.cat([torch.from_numpy(L.from_panels(yb[c], m, N)) for c in range(COLS)])
     u = (q(x) @ q(w).T + b.bfloat16().float()).bfloat16().float()
-    assert _rel(y, F.silu(u)) < 1.2e-2
+    assert rel_native(y, F.silu(u)) < 1.2e-2
 
 
 @pytest.mark.parametrize("k, ntap, m", [(0, 3, 64), (2, 3, 64), (0, 7, 16), (1, 7, 16)])
@@ -872,7 +867,7 @@ def test_strip_conv1(npu: VisionDevice, k: int, ntap: int, m: int) -> None:
     blk = torch.zeros(C, dtype=torch.bool)
     for r in range(ROWS):
         blk[80 * (nstep * r + k):80 * (nstep * r + k) + 80] = True
-    assert _rel(got[..., blk], q(ref)[..., blk]) < 1e-3
+    assert rel_native(got[..., blk], q(ref)[..., blk]) < 1e-3
 
 
 @pytest.mark.parametrize("start", [True, False])
@@ -931,7 +926,7 @@ def test_win_attention(npu: VisionDevice, start: bool) -> None:
             sc = kq[lo:t + 33, h // 2] @ qq[t, h]
             p = torch.exp2(sc - sc.max())
             ref[t, h] = (p @ vq[lo:t + 33, h // 2]) / p.sum()
-    assert _rel(o, ref.reshape(T, -1)) < 1.5e-2
+    assert rel_native(o, ref.reshape(T, -1)) < 1.5e-2
 
 
 @pytest.mark.parametrize("lead", ["t", "f"])
@@ -993,7 +988,7 @@ def test_strip_conv2(npu: VisionDevice, lead: str) -> None:
         for i, (to, fo) in enumerate(outs[c]):
             ref[c, i] = (sum(wq[:, dy, dx] * xs[2 * to + dy, 2 * fo + dx] for dy in range(3) for dx in range(3)) + bq)
     ref = ref.bfloat16().float()
-    assert _rel(got, q(ref)) < 4e-3
+    assert rel_native(got, q(ref)) < 4e-3
 
 
 def test_gemm_rope40(npu: VisionDevice) -> None:
@@ -1029,7 +1024,7 @@ def test_gemm_rope40(npu: VisionDevice) -> None:
     c, sn = (t.bfloat16().float()[:, None] for t in (tab[:, :16], tab[:, 16:32]))
     a, b = c0[..., :16], c0[..., 16:32]
     ref = torch.cat([a * c - b * sn, b * c + a * sn, c0[..., 32:]], -1)
-    assert _rel(y, ref.reshape(-1, N)) < 8e-3 and float(y.reshape(-1, N // 40, 40)[..., pads].abs().max()) == 0
+    assert rel_native(y, ref.reshape(-1, N)) < 8e-3 and float(y.reshape(-1, N // 40, 40)[..., pads].abs().max()) == 0
 
 
 @pytest.mark.parametrize("out", ["f32", "isig"])
@@ -1060,7 +1055,7 @@ def test_gemm_epilogue_e(npu: VisionDevice, out: str) -> None:
         y = torch.cat([torch.from_numpy(L.from_ctiles(yb[c], m, N, m)) for c in range(COLS)])
         ref = 1 + torch.exp2(u.clamp(max=63.5))
         ok = u.abs() < 60
-        assert float(u.abs().max()) > 64 and _rel(y[ok], ref[ok]) < 1e-2 and bool(torch.isfinite(y).all())
+        assert float(u.abs().max()) > 64 and rel_native(y[ok], ref[ok]) < 1e-2 and bool(torch.isfinite(y).all())
 
 
 def test_depth_attention(npu: VisionDevice) -> None:
@@ -1111,7 +1106,7 @@ def test_depth_attention(npu: VisionDevice) -> None:
     p = torch.exp2(sc - sc.amax(-1, keepdim=True))
     ref = torch.einsum("thk,khd->thd", p, vq[:, torch.arange(H) % KVH]) / p.sum(-1, keepdim=True) / \
         fac[:, :H].bfloat16().float()[..., None]
-    assert _rel(o, ref) < 1.5e-2 and float(o[..., pads].abs().max()) == 0
+    assert rel_native(o, ref) < 1.5e-2 and float(o[..., pads].abs().max()) == 0
 
 
 @pytest.mark.parametrize("start", [True, False])
@@ -1176,4 +1171,4 @@ def test_win_attention_gated(npu: VisionDevice, start: bool) -> None:
             sc = kq[lo:t + 33, h // 2] @ qq[t, h]
             p = torch.exp2(sc - sc.max())
             ref[t, h] = (p @ vq[lo:t + 33, h // 2]) / p.sum() / fac[t, h].bfloat16().float()
-    assert _rel(o, ref.reshape(T, -1)) < 1.5e-2
+    assert rel_native(o, ref.reshape(T, -1)) < 1.5e-2

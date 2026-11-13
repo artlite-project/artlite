@@ -13,7 +13,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
 from models.sd15 import vae
 
-from ..common import as_torch
+from ..numerics import rel_native
 
 
 @pytest.fixture(scope="module")
@@ -33,11 +33,6 @@ def qconv(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> torch.Ten
     return F.conv2d(xq, wq, None if b is None else b.bfloat16().float(), padding=1)
 
 
-def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
-    y, ref = as_torch(y), as_torch(ref)
-    return float((y - ref).norm() / ref.norm())
-
-
 @pytest.mark.parametrize("H, Cin, N", [(64, 512, 512), (128, 512, 512), (256, 256, 256), (512, 128, 256),
                                       (512, 128, 128)])
 def test_conv(npu: VisionDevice, H: int, Cin: int, N: int) -> None:
@@ -54,7 +49,7 @@ def test_conv(npu: VisionDevice, H: int, Cin: int, N: int) -> None:
     y = vae.conv_layer(bd, img, w, b, ch=ch, name=f"c{H}", stats=False)
     bd.op({}, {})
     npu.run(bd.transaction())
-    err = _rel(vae.read_dtensor(npu, y, ch), qconv(x, w, b))
+    err = rel_native(vae.read_dtensor(npu, y, ch), qconv(x, w, b))
     print(f"H {H}: rel err {err:.3e}")
     assert err < 8e-3
 
@@ -96,7 +91,7 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
                      name=p + "y")
     bd.op({}, {})
     npu.run(bd.transaction())
-    err = _rel(vae.read_dtensor(npu, out, vae.chans(cout)), reference.resnet(w, p, x, eps=1e-6))
+    err = rel_native(vae.read_dtensor(npu, out, vae.chans(cout)), reference.resnet(w, p, x, eps=1e-6))
     print(f"H {H} {cin} -> {cout}: rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -117,7 +112,7 @@ def test_upsample(npu: VisionDevice, H: int, C: int) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     up = F.interpolate(x.bfloat16().float(), scale_factor=2.0, mode="nearest")
-    err = _rel(vae.read_dtensor(npu, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
+    err = rel_native(vae.read_dtensor(npu, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
     print(f"H {H} -> {2 * H}: rel err {err:.3e}")
     assert err < 8e-3
 
@@ -135,7 +130,7 @@ def test_decoder(npu: VisionDevice) -> None:
     dec = vae.Decoder(npu, ref.w, scale=ref.scale, eps=ref.EPS)
     torch.manual_seed(7)
     lat = torch.randn(1, 4, 64, 64)  # (the sampler's latents: about unit variance)
-    err = _rel(dec(lat), ref(lat))
+    err = rel_native(dec(lat), ref(lat))
     print(f"rel err {err:.3e}")
     assert err < 2e-2
 
@@ -169,7 +164,7 @@ def test_attention512(npu: VisionDevice) -> None:
     qq, kq, vq = q(qs), q(k), q(v)
     p = torch.exp2(qq @ kq.T - (qq @ kq.T).max(-1, keepdim=True).values)
     ref = (p @ vq) / p.sum(-1, keepdim=True)
-    err = _rel(o, ref)
+    err = rel_native(o, ref)
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -191,6 +186,6 @@ def test_mid_attention(npu: VisionDevice) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     ref = reference.VaeDecoder.attention(type("R", (), {"w": w, "EPS": 1e-6})(), p, x)
-    err = _rel(vae.read_dtensor(npu, out, vae.chans(C)), ref)
+    err = rel_native(vae.read_dtensor(npu, out, vae.chans(C)), ref)
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2

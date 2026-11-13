@@ -19,7 +19,7 @@ from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
 
-from ..common import as_torch
+from ..numerics import bf16_like, rel
 from ..vision.test_ops import from_level_tokens, level_tokens
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
@@ -37,11 +37,6 @@ def enc() -> V.Encoder:
     if not os.path.exists(MMPROJ):
         pytest.skip(f"{MMPROJ} missing")
     return V.Encoder(MMPROJ)
-
-
-def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
-    a, b = as_torch(a), as_torch(b)
-    return float((a.double() - b.double()).norm() / b.double().norm())
 
 
 def _entries(enc: V.Encoder, il: int) -> list[torch.Tensor]:
@@ -89,7 +84,7 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
     """One layer (10) on two entries: as far from the float64 layer as the CPU at the NPU's rounding points (both 1.7e-3;
     1.5e-3 apart: their orders of summation, exp2, GELU's table), the pad channels zero."""
     il = 10
-    xs = [V._bf16(x) for x in _entries(enc, il)]
+    xs = [bf16_like(x) for x in _entries(enc, il)]
     sim = V.NpuEncoder(MMPROJ)
     want = [sim.layer(x, il) for x in xs]
     w = M.layer_weights(lambda n: sim.w(n).float(), il)
@@ -108,10 +103,10 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
     got = _level_out(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, M.C, lv.m)) for c in range(COLS)]))
     for g, e, x in zip(got, want, xs, strict=True):
         exact = enc._layer(x.double(), il)
-        print(f"NPU vs CPU at its rounding points {_rel(g[:, :M.H], e):.2e}; vs float64 {_rel(g[:, :M.H], exact):.2e} "
-              f"(the CPU's {_rel(e, exact):.2e})")
+        print(f"NPU vs CPU at its rounding points {rel(g[:, :M.H], e):.2e}; vs float64 {rel(g[:, :M.H], exact):.2e} "
+              f"(the CPU's {rel(e, exact):.2e})")
         assert float(g[:, M.H:].abs().max()) == 0
-        assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)
+        assert rel(g[:, :M.H], exact) < 1.1 * rel(e, exact)
 
 
 @pytest.mark.slow  # (20 layers on the CPU: in float64 and at the NPU's rounding points)
@@ -121,7 +116,7 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
     time."""
     import time
 
-    xs = [V._bf16(x) for x in _entries(enc, 7)]
+    xs = [bf16_like(x) for x in _entries(enc, 7)]
     sim = V.NpuEncoder(MMPROJ)
     want, exact = list(xs), [x.double() for x in xs]
     for il in range(7, 27):
@@ -148,9 +143,9 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
     yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
     got = _level_out(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, M.C, lv.m)) for c in range(COLS)]))
     for g, e, x in zip(got, want, exact, strict=True):
-        npu_err, cpu_err = _rel(g[:, :M.H], x), _rel(e, x)
+        npu_err, cpu_err = rel(g[:, :M.H], x), rel(e, x)
         print(f"20 layers on 2 x 256 tokens: {1e3 * min(ts):.2f} ms ({1e3 * min(ts) / 20:.3f} ms per layer); from "
-              f"float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
+              f"float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], e):.2e}")
         assert npu_err < 1.1 * cpu_err
 
 
@@ -186,7 +181,7 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
     for px in (ov, np.ascontiguousarray(ov[:, :, ::-1])):
         tr: dict[str, torch.Tensor] = {}
         enc.forward(px, None, tr)
-        xs.append(V._bf16(tr[f"layer_out-{il - 1}"]))
+        xs.append(bf16_like(tr[f"layer_out-{il - 1}"]))
     sim = V.NpuEncoder(MMPROJ)
     want = [sim.layer(x, il) for x in xs]
     lv = Level(32, 4)
@@ -199,10 +194,10 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
     npu.run(bd.transaction())
     for g, e, xx in zip(_bands_out(npu, out), want, xs, strict=True):
         exact = enc._layer(xx.double(), il)
-        print(f"NPU vs CPU at its rounding points {_rel(g[:, :M.H], e):.2e}; vs float64 {_rel(g[:, :M.H], exact):.2e} "
-              f"(the CPU's {_rel(e, exact):.2e})")
+        print(f"NPU vs CPU at its rounding points {rel(g[:, :M.H], e):.2e}; vs float64 {rel(g[:, :M.H], exact):.2e} "
+              f"(the CPU's {rel(e, exact):.2e})")
         assert float(g[:, M.H:].abs().max()) == 0
-        assert _rel(g[:, :M.H], exact) < 1.1 * _rel(e, exact)
+        assert rel(g[:, :M.H], exact) < 1.1 * rel(e, exact)
 
 
 def _bands_read(npu: VisionDevice, y: M.Bands) -> torch.Tensor:
@@ -220,7 +215,7 @@ def _pixels(case: str) -> list[np.ndarray]:
 
 
 def _pos(sim: V.NpuEncoder, e: M.Entry) -> torch.Tensor:
-    rows = V._bf16(sim.w("v.position_embd.weight")[torch.from_numpy(M.positions(e.ph, e.pw))])
+    rows = bf16_like(sim.w("v.position_embd.weight")[torch.from_numpy(M.positions(e.ph, e.pw))])
     return torch.nn.functional.pad(rows.float(), (0, M.C - M.H))
 
 
@@ -256,8 +251,8 @@ def test_before_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
     for key, name in (("x0", "pos_embed"), ("x7", "layer_out-6")):
         got = M.unpack(_bands_read(npu, M.Bands(M.PRE, key)), slots)
         for g, tr, tf in zip(got, trs, ref, strict=True):
-            npu_err, cpu_err = _rel(g[:, :M.H], tf[name]), _rel(tr[name], tf[name])
-            print(f"{name}: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], tr[name]):.2e}")
+            npu_err, cpu_err = rel(g[:, :M.H], tf[name]), rel(tr[name], tf[name])
+            print(f"{name}: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], tr[name]):.2e}")
             assert float(g[:, M.H:].abs().max()) == 0
             assert npu_err < 1.1 * cpu_err + 1e-4
 
@@ -298,7 +293,7 @@ def test_window_attention(npu: VisionDevice) -> None:
         pr = torch.exp2(sc - sc.amax(-1, keepdim=True))
         pr = pr / pr.sum(-1, keepdim=True)
         ref[:, :, ch] = torch.einsum("wij,jwd->iwd", pr, vv[:, :, ch])
-    err = _rel(o, ref)
+    err = rel(o, ref)
     print(f"window attention: rel err {err:.2e}")
     assert err < 1.2e-2
 
@@ -324,8 +319,8 @@ def _before_merger(sim: V.NpuEncoder, px: np.ndarray) -> torch.Tensor:
     x = torch.as_tensor(np.asarray(px), dtype=sim.dtype)
     ph, pw = x.shape[1] // P, x.shape[2] // P
     cols = x.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)
-    c = V._bfp(cols) @ V._bfp(sim.w("v.patch_embd.weight").reshape(H, -1)).T + V._bf16(sim.w("v.patch_embd.bias").reshape(-1))
-    x = V._bf16(c + V._bf16(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(ph, pw))]))
+    c = V._bfp(cols) @ V._bfp(sim.w("v.patch_embd.weight").reshape(H, -1)).T + bf16_like(sim.w("v.patch_embd.bias").reshape(-1))
+    x = bf16_like(c + bf16_like(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(ph, pw))]))
     for il in range(sim.insert + 1):
         x = sim.layer(x, il)
     del tr
@@ -353,8 +348,8 @@ def test_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
                          for c in range(COLS)])[None]
     got = M.unpack(tiles, [e.window_slots() for e in entries])
     for g, e, ex in zip(got, want, exact, strict=True):
-        npu_err, cpu_err = _rel(g[:, :M.H], ex), _rel(e, ex)
-        print(f"merger: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {_rel(g[:, :M.H], e):.2e}")
+        npu_err, cpu_err = rel(g[:, :M.H], ex), rel(e, ex)
+        print(f"merger: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], e):.2e}")
         assert float(g[:, M.H:].abs().max()) == 0
         assert npu_err < 1.1 * cpu_err
 
@@ -373,7 +368,7 @@ def test_encoder(npu: VisionDevice, compression: int) -> None:
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     sim, enc = V.NpuEncoder(path), V.Encoder(path)
-    pos = V._bf16(sim.w("v.position_embd.weight"))
+    pos = bf16_like(sim.w("v.position_embd.weight"))
     npe = M.Encoder(npu, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert, sim.cfg.mean, sim.cfg.std), pos,
                     patch=sim.patch)
     errs = []
@@ -390,8 +385,8 @@ def test_encoder(npu: VisionDevice, compression: int) -> None:
         for g, e in zip(got, ents, strict=True):
             ex, want = enc.forward(e), sim.forward(e)
             med = [float(((a.double() - ex).norm(dim=1) / ex.norm(dim=1)).median()) for a in (g, want)]
-            print(f"embeddings: from float64 median {med[0]:.2e} (the CPU's {med[1]:.2e}), rms {_rel(g, ex):.2e} (the "
-                  f"CPU's {_rel(want, ex):.2e}), NPU vs CPU {_rel(g, want):.2e}")
+            print(f"embeddings: from float64 median {med[0]:.2e} (the CPU's {med[1]:.2e}), rms {rel(g, ex):.2e} (the "
+                  f"CPU's {rel(want, ex):.2e}), NPU vs CPU {rel(g, want):.2e}")
             errs.append(med)
     npu_err, cpu_err = np.mean(errs, 0)
     assert npu_err < 1.1 * cpu_err and all(a < 1.2 * b for a, b in errs), errs

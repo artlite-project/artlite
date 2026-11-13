@@ -20,6 +20,7 @@ from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
 from ..common import essay, to_numpy, to_torch
+from ..numerics import rel
 
 LAYERS = (0, 5)  # a sliding-window and a full-attention layer
 _image: dict[str, tuple] = {}
@@ -36,11 +37,6 @@ def _img() -> tuple[GGUFFile, GemmaImage, np.ndarray]:
         img.pack(W, release=False)
         _image["x"] = (g, img, W)
     return _image["x"]
-
-
-def _rel(got: torch.Tensor | np.ndarray, want: torch.Tensor | np.ndarray) -> float:
-    got, want = (np.asarray(x, np.float64) for x in (got, want))
-    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
 
 
 # (head_dim, chunk position, tokens, K panels per record)
@@ -128,13 +124,13 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
         slots = slots.reshape(T // 32, COLS // 4, 4, 4, kind.qp).transpose(0, 2, 1, 3, 4)
     slots = slots.reshape(T // 8, COLS, kind.qp).transpose(1, 0, 2)  # (the attention's QS: whole passes, padded)
     qv = _q_values(slots, kind).reshape(COLS, T, hd)  # [head][token]
-    assert _rel(torch.from_numpy(qv), torch.from_numpy(nr(q, True).transpose(1, 0, 2) * c_score)) < 2e-4
+    assert rel(torch.from_numpy(qv), torch.from_numpy(nr(q, True).transpose(1, 0, 2) * c_score)) < 2e-4
     K, V = {}, {}
     n = (t0 + T) // kind.pg
     for h in range(COLS // 4):
         K[h], V[h] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[h, guard:guard + n], hd))
-        assert _rel(torch.from_numpy(K[h][t0:]), torch.from_numpy(nr(k, True)[:, h])) < (2e-4 if kp == 2 else 1e-2), h
-        assert _rel(torch.from_numpy(V[h][t0:]), torch.from_numpy(nr(v, False)[:, h])) < 1e-2, h
+        assert rel(torch.from_numpy(K[h][t0:]), torch.from_numpy(nr(k, True)[:, h])) < (2e-4 if kp == 2 else 1e-2), h
+        assert rel(torch.from_numpy(V[h][t0:]), torch.from_numpy(nr(v, False)[:, h])) < 1e-2, h
     A = bfp16.from_panels(fused.get_buffer("A")[:T * COLS * hd * 9 // 16], T, COLS * hd)
     A = A.reshape(T, COLS, hd)
     want = np.zeros((T, COLS, hd))
@@ -146,8 +142,8 @@ def test_attn_prefill(hd: int, t0: int, T: int, kp: int) -> None:
         sc[masked] = -np.inf
         pr = np.exp2(sc - sc.max(-1, keepdims=True))
         want[:, c] = (pr @ V[c // 4]) / pr.sum(-1, keepdims=True)
-    err = _rel(torch.from_numpy(A), torch.from_numpy(want))
-    eq = _rel(torch.from_numpy(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape)),
+    err = rel(torch.from_numpy(A), torch.from_numpy(want))
+    eq = rel(torch.from_numpy(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape)),
               torch.from_numpy(want))
     print(f"attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e})")
     assert err < 1.1 * eq
@@ -191,8 +187,8 @@ def test_ple() -> None:
     A.sync_from_device()
     got = to_torch(bfp16.from_panels(A.numpy(), T, COLS * 64)).double()
     want = _ple_reference(y, p, e, wh.float() + plw[COLS * PER:].float(), eps).double()
-    eq = _rel(torch.from_numpy(bfp16.values(want.float().numpy())).double(), want)
-    err = _rel(got, want)
+    eq = rel(torch.from_numpy(bfp16.values(want.float().numpy())).double(), want)
+    err = rel(got, want)
     print(f"ple {err:.2e} (bfp16 {eq:.2e})")
     assert err < 1.2 * eq
 
@@ -237,6 +233,6 @@ def test_prefill_caches(n: int, p0: int) -> None:
     worst = {}
     for L in layers:
         k, v = ov.read_kv(L, range(p0 + n))
-        worst[f"K.{L}"], worst[f"V.{L}"] = _rel(k, want[L][0]), _rel(v, want[L][1])
+        worst[f"K.{L}"], worst[f"V.{L}"] = rel(k, want[L][0]), rel(v, want[L][1])
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.05 for v in worst.values()), worst

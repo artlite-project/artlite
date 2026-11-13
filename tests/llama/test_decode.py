@@ -29,6 +29,7 @@ from artlite.operators.design import COLS
 from models.llama.overlay import KV_K, LlamaOverlay
 
 from ..common import as_torch, essay, llama_gguf, to_torch
+from ..numerics import rel_finite
 from . import ref
 
 VOCAB = 2048
@@ -78,7 +79,7 @@ def test_llama_decode_steps(case: str, kv_k: str) -> None:
     worst: dict[str, float] = {}
 
     def keep(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
-        worst[name] = max(worst.get(name, 0.0), ref.relative(as_torch(got), as_torch(want)))
+        worst[name] = max(worst.get(name, 0.0), rel_finite(as_torch(got), as_torch(want)))
 
     p, i = 0, 0
     while p < len(ids):
@@ -137,11 +138,11 @@ def test_llama_decode_deep(case: str, kv_k: str) -> None:
         n = 4 if p >= 1008 else 1
         logits = to_torch(ov.step(x[p - P0:p - P0 + n], p)).float()
         for s in range(n):
-            worst = max(worst, ref.relative(logits[s], want[p - P0 + s]))
+            worst = max(worst, rel_finite(logits[s], want[p - P0 + s]))
         p += n
     for L in layers:
         k, v = ov.read_kv(L, range(P0, P0 + N))
         cache = model.caches[L]
-        worst = max(worst, ref.relative(torch.from_numpy(k), cache.K[:, P0:]), ref.relative(torch.from_numpy(v), cache.V[:, P0:]))
+        worst = max(worst, rel_finite(torch.from_numpy(k), cache.K[:, P0:]), rel_finite(torch.from_numpy(v), cache.V[:, P0:]))
     print(f"worst relative error {worst:.4f}")
     assert worst < TOL, worst

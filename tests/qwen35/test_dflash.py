@@ -35,6 +35,7 @@ from models.server.cache import PromptCache
 from models.tokenizer import BpeTokenizer
 
 from ..common import essays, to_torch
+from ..numerics import from_bf16_bits, rel_max
 from . import ref
 
 pytestmark = pytest.mark.slow  # the whole 27B: its taps from llama.cpp's CPU run, its head in place
@@ -68,16 +69,16 @@ def test_ref() -> None:
     g = ref.golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=P, dflash_names=names)
     taps = np.ascontiguousarray(g.dflash("taps"))
     d = ref.DFlash(path, model, 256)
-    assert ref.rel_err(d.inject(taps, np.arange(P)), g.dflash("inp_g_embeddings")) < 0.02
+    assert rel_max(d.inject(taps, np.arange(P)), g.dflash("inp_g_embeddings")) < 0.02
     for L in range(d.cfg.layers):
-        assert ref.rel_err(d.K[L, :P], np.asarray(g.dflash("Kcur_injected", L))) < 0.04
-        assert ref.rel_err(d.V[L, :P], np.asarray(g.dflash("Vcur_injected", L))) < 0.04
+        assert rel_max(d.K[L, :P], np.asarray(g.dflash("Kcur_injected", L))) < 0.04
+        assert rel_max(d.V[L, :P], np.asarray(g.dflash("Vcur_injected", L))) < 0.04
     out = d.block(_emb(d, ids[P]), P)
     for L in range(d.cfg.layers):
         for n in NAMES:
-            assert ref.rel_err(out[f"{n}-{L}"], np.asarray(g.dflash(n, L))) < 0.08, (n, L)
+            assert rel_max(out[f"{n}-{L}"], np.asarray(g.dflash(n, L))) < 0.08, (n, L)
     logits = np.asarray(g.dflash("result_output"))
-    assert ref.rel_err(out["logits"], logits) < 0.03
+    assert rel_max(out["logits"], logits) < 0.03
     k, T = d.cfg.top_k, d.cfg.block
     lat = np.asarray(g["dflash.lattice"])
     drafts = d.walk(lat[:, :k].astype(np.int64), lat[:, k:k + k * k].reshape(T, k, k))
@@ -97,7 +98,7 @@ def test_ref_window() -> None:
     g = ref.golden(model, ids, ubatch=64, logits="none", dflash=path, dflash_at=P, dflash_names="result_norm", dflash_random=True)
     d = ref.DFlash(path, model, 2400, head=np.arange(64))
     d.inject(np.ascontiguousarray(g.dflash("taps")), np.arange(P))
-    assert ref.rel_err(d.block(_emb(d, ids[P]), P)["result_norm"], np.asarray(g.dflash("result_norm"))) < 0.04
+    assert rel_max(d.block(_emb(d, ids[P]), P)["result_norm"], np.asarray(g.dflash("result_norm"))) < 0.04
 
 
 def test_options(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,7 +152,7 @@ def _pan(x: np.ndarray) -> np.ndarray:
 
 
 def _bf16(b: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.ascontiguousarray(b).view(np.int16).copy()).view(torch.bfloat16).float().numpy().astype(np.float64)
+    return from_bf16_bits(np.ascontiguousarray(b).view(np.uint16)).astype(np.float64)
 
 
 def _attention_errors(d: DFlashOverlay, rf: ref.DFlash, L: int, p: int) -> np.ndarray:
@@ -228,14 +229,14 @@ def test_injection(npu: _Npu) -> None:
             a = d._ring(L, c) + (r >> 2) % G * T
             k, v = kv_from_groups(kv[a:a + 2 * 2 * PAIR].reshape(1, 2, 2 * PAIR).copy(), HD, dmajor=True)
             at = (r & 3) * 8
-            assert ref.rel_err(k[at:at + 8], rf.K[L, 8 * r:8 * r + 8, c]) < 0.03, (L, c, r)
-            assert ref.rel_err(v[at:at + 8], rf.V[L, 8 * r:8 * r + 8, c]) < 0.03, (L, c, r)
+            assert rel_max(k[at:at + 8], rf.K[L, 8 * r:8 * r + 8, c]) < 0.03, (L, c, r)
+            assert rel_max(v[at:at + 8], rf.V[L, 8 * r:8 * r + 8, c]) < 0.03, (L, c, r)
         o = kv[d._open(L, c):d._open(L, c) + 4 * ROWS_B].view(np.uint16).astype(np.uint16).view(np.int16).copy()
         rows = torch.from_numpy(o).view(torch.bfloat16).float().numpy().reshape(4, 16, 8, 8)
         pos = np.arange(8 * ro, P)
         for part, x in enumerate((rf.K, rf.V)):
             got = rows[2 * part + (ro & 1)][:, pos - 8 * ro].transpose(1, 0, 2).reshape(len(pos), -1)
-            assert ref.rel_err(got, x[L, pos, c]) < 0.03
+            assert rel_max(got, x[L, pos, c]) < 0.03
 
 
 @pytest.mark.parametrize("P", [2292, 2295, 2600])
@@ -274,7 +275,7 @@ def test_block(npu: _Npu, P: int) -> None:
     out = rf.block(emb, P)
     raw, gates = d.logits(), d.gates()
     logits = raw.astype(np.float32)
-    assert ref.rel_err(logits, out["logits"]) < 0.035 and ref.rel_err(gates, out["gate"]) < 0.05
+    assert rel_max(logits, out["logits"]) < 0.035 and rel_max(gates, out["gate"]) < 0.05
     top = [len(set(np.argsort(-logits[s])[:16].tolist()) & set(np.argsort(-out["logits"][s])[:16].tolist())) for s in range(1, 8)]
     assert min(top) >= 14, top
     drafts = rf.walk(*rf.lattice(logits, gates, ids[P]))
@@ -359,12 +360,12 @@ def test_prefill(n: int) -> None:
     m.prefill = pf
     r = n >> 3
     for (ka, va, oa), (kb, vb, ob) in zip(a, b, strict=True):
-        ek = [ref.rel_err(x, y) for x, y in zip(ka, kb, strict=True)]
-        ev = [ref.rel_err(x, y) for x, y in zip(va, vb, strict=True)]
+        ek = [rel_max(x, y) for x, y in zip(ka, kb, strict=True)]
+        ev = [rel_max(x, y) for x, y in zip(va, vb, strict=True)]
         assert np.quantile(ek, 0.98) < 0.08 and np.quantile(ev, 0.98) < 0.15, (np.quantile(ek, 0.98), np.quantile(ev, 0.98))
         if n & 7:
             for part in (0, 2):
-                assert ref.rel_err(oa[part + (r & 1)][:, :n & 7], ob[part + (r & 1)][:, :n & 7]) < 0.08
+                assert rel_max(oa[part + (r & 1)][:, :n & 7], ob[part + (r & 1)][:, :n & 7]) < 0.08
 
 
 @pytest.fixture(scope="module")
@@ -399,12 +400,12 @@ def _close(a: list, b: list, n: int) -> None:
     tokens by far more, up to 3% of a text's: ``test_prefill``), and the open rows."""
     r = n >> 3
     for (ka, va, oa), (kb, vb, ob) in zip(a, b, strict=True):
-        ek = [ref.rel_err(x, y) for x, y in zip(ka, kb, strict=True)]
-        ev = [ref.rel_err(x, y) for x, y in zip(va, vb, strict=True)]
+        ek = [rel_max(x, y) for x, y in zip(ka, kb, strict=True)]
+        ev = [rel_max(x, y) for x, y in zip(va, vb, strict=True)]
         assert np.quantile(ek, 0.9) < 0.08 and np.quantile(ev, 0.9) < 0.15, (np.quantile(ek, 0.9), np.quantile(ev, 0.9))
         for part in (0, 2) if n & 7 else ():
             x, y = oa[part + (r & 1)], ob[part + (r & 1)]
-            e = [ref.rel_err(x[:, j], y[:, j]) for j in range(n & 7)]
+            e = [rel_max(x[:, j], y[:, j]) for j in range(n & 7)]
             print(f"open rows {part}: {np.round(e, 3)}")
             assert np.median(e) < 0.08, e
 
@@ -585,8 +586,8 @@ def test_ring_wraps(app: tuple[NpuQwen, BpeTokenizer]) -> None:
             k, v = kv_from_groups(kv[a:a + 2 * 2 * PAIR].reshape(1, 2, 2 * PAIR).copy(), HD, dmajor=True)
             at = (r & 3) * 8
             for j in range(8):
-                ek.append(ref.rel_err(k[at + j], rf.K[L, 8 * r + j, c]))
-                ev.append(ref.rel_err(v[at + j], rf.V[L, 8 * r + j, c]))
+                ek.append(rel_max(k[at + j], rf.K[L, 8 * r + j, c]))
+                ev.append(rel_max(v[at + j], rf.V[L, 8 * r + j, c]))
             energy.append(float(np.linalg.norm(v[at:at + 8]) / np.linalg.norm(rf.V[L, 8 * r:8 * r + 8, c])))
         assert np.quantile(ek, 0.9) < 0.1 and np.quantile(ev, 0.9) < 0.2, (np.quantile(ek, 0.9), np.quantile(ev, 0.9))
         assert min(energy) > 0.5, (int(np.argmin(energy)), min(energy))  # (a padding row's record: zeros)
@@ -615,7 +616,7 @@ def test_record_edges(app: tuple[NpuQwen, BpeTokenizer], n: int) -> None:
     out = rf.block(emb, n)
     # (gates, max-based: the block at 256 is 7.7% off the oracle through decode steps, 8.3% through the prefill (its bfp16
     # activations' taps), at 264, 320, 325 3-5%: a gate of that position's block is sensitive)
-    assert ref.rel_err(logits, out["logits"]) < 0.06 and ref.rel_err(gates, out["gate"]) < 0.09
+    assert rel_max(logits, out["logits"]) < 0.06 and rel_max(gates, out["gate"]) < 0.09
     top = [len(set(np.argsort(-logits[s])[:16].tolist()) & set(np.argsort(-out["logits"][s])[:16].tolist())) for s in range(1, 8)]
     assert min(top) >= 12, top
 

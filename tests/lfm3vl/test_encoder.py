@@ -24,6 +24,7 @@ from models.lfm3vl import encoder as E
 from models.lfm3vl import host as Q
 from models.sequence import load_image
 
+from ..numerics import rel
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
 
@@ -68,10 +69,6 @@ def test_masks() -> None:
 def encoder(npu: VisionDevice, mm: tuple) -> E.Encoder:
     get, clip, kinds = mm
     return E.Encoder(npu, E.weights(get, kinds, clip.projection_dim), max_bands=9)
-
-
-def _rel(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(np.asarray(a, np.float64) - b) / np.linalg.norm(b))
 
 
 @pytest.mark.parametrize("il, size", [(0, (512, 512)), (2, (512, 512)), (3, (640, 576)), (12, (352, 352)), (4, (480, 480))])
@@ -120,10 +117,10 @@ def test_layer(npu: VisionDevice, encoder: E.Encoder, il: int, size: tuple[int, 
             rows[sp[b, c][real[b, c]]] = v[real[b, c]]
     got, d = rows[:, :E.H], want - xin.numpy()
     tok = np.linalg.norm(got - want, axis=1) / np.linalg.norm(d, axis=1)
-    print(f"layer {il} ({encoder.kinds[il]}, {nb} bands): {_rel(got - xin.numpy(), d):.2e} of its contribution, "
+    print(f"layer {il} ({encoder.kinds[il]}, {nb} bands): {rel(got - xin.numpy(), d):.2e} of its contribution, "
           f"tokens median {np.median(tok):.3f} max {tok.max():.3f}")
     assert float(np.abs(rows[:, E.H:]).max()) == 0
-    assert _rel(got - xin.numpy(), d) < 0.025 and tok.max() < 0.06
+    assert rel(got - xin.numpy(), d) < 0.025 and tok.max() < 0.06
 
 
 def test_pieces(npu: VisionDevice, mm: tuple, encoder: E.Encoder, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -156,6 +153,6 @@ def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
     want = V.Encoder(MMPROJ).forward(Q.normalized(px)).numpy()
     e = _token_errors(got, want)
     print(f"{size}: per merged token median {np.median(e):.4f}, p90 {np.quantile(e, 0.9):.4f}, max {e.max():.3f}; "
-          f"total {_rel(got, want):.4f}")
+          f"total {rel(got, want):.4f}")
     assert np.median(e) < 0.05 and np.quantile(e, 0.9) < 0.12
     assert np.array_equal(encoder(px), got)

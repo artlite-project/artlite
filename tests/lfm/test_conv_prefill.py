@@ -15,28 +15,25 @@ from models.lfm import conv as CV
 from models.lfm.conv_prefill import ROW, ConvPrefillOperator
 
 from ..common import to_numpy
+from ..numerics import bf16_round
 from . import ref
 
 PITCH = 768
-
-
-def bf(x: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
 def conv_ref(b: np.ndarray, c: np.ndarray, x: np.ndarray, hist: np.ndarray, taps: np.ndarray, n: int
              ) -> tuple[np.ndarray, np.ndarray]:
     """The kernel's arithmetic (fp32 steps): b, c, x (T, ch) bf16 values, hist (6, ch), taps (7, 2, ch) bf16 hi / lo ->
     y (T, ch) fp32 (before the panels' rounding), the last 6 rows of B x of the first n tokens."""
-    bx = bf(b * x)
+    bx = bf16_round(b * x)
     win = np.concatenate([hist, bx]).astype(np.float32)
     T = b.shape[0]
     acc = np.zeros_like(b, np.float32)
     for k in range(7):
         for h in range(2):
             acc = (acc + taps[k, h] * win[k:k + T]).astype(np.float32)
-    ah = bf(acc)
-    al = bf(acc - ah)
+    ah = bf16_round(acc)
+    al = bf16_round(acc - ah)
     y = (ah * c).astype(np.float32)
     y = (y + al * c).astype(np.float32)
     return y, win[n:n + 6]

@@ -24,7 +24,8 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
-from ..minicpmv.ref import VisionGolden, _bf16, golden
+from ..minicpmv.ref import VisionGolden, golden
+from ..numerics import bf16_like
 
 __all__ = ["Encoder", "VisionGolden", "golden", "rope_angles"]
 
@@ -76,7 +77,7 @@ class Encoder:
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
         if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = _bf16(x)
+            x = bf16_like(x)
         y = x @ w.T
         return y + self.vec(bias) if bias else y
 

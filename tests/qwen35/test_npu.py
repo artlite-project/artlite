@@ -20,6 +20,7 @@ from artlite.model_config import QwenConfig
 from models.qwen35.qwen import NpuQwen
 
 from ..common import draft_gate, draft_prompts, essay
+from ..numerics import kl_rows, rel_max
 from . import ref
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
@@ -64,14 +65,9 @@ def test_slice(size: str) -> None:
         ov.step(torch.from_numpy(np.asarray(G["l_out", layers[0] - 1][t], np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
             got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = ref.rel_err(got, np.asarray(G["l_out", L][t], np.float32))
+            errs[t, i] = rel_max(got, np.asarray(G["l_out", L][t], np.float32))
     print(f"{size} layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.3f}")
     assert errs.max() < 4e-2 and errs.mean(0).max() < 1.5e-2
-
-
-def _kl(want: torch.Tensor, got: torch.Tensor) -> torch.Tensor:
-    lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
-    return (lw.exp() * (lw - lg)).sum(-1)
 
 
 @pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy", "swift"])
@@ -82,7 +78,7 @@ def test_teacher_forced(size: str) -> None:
     pro = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
     model = NpuQwen(GGUFFile(path), capacity=256)
     got = torch.from_numpy(model.forced_logits(tokens))
-    kl, kl_llama = float(_kl(dec, got).mean()), float(_kl(dec, pro).mean())
+    kl, kl_llama = float(kl_rows(dec, got).mean()), float(kl_rows(dec, pro).mean())
     # (the agreement counts the tokens whose top two llama.cpp's decode has clearly apart: a near tie flips on either side's
     # rounding. A dense model's at least 0.25 (Qwen3.8 27B's NPU flips 9 of 128 within 0.134, llama.cpp's prompt run 4 of them);
     # an MoE model's routing flips near-tied experts, and then the next token where its top two are near ties: at least 1
@@ -110,7 +106,7 @@ def test_prefill(size: str) -> None:
     dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
     model = NpuQwen(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
-    kl, kl_llama = _kl(split, got), _kl(split, dec)
+    kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)
     agree = float((split.argmax(-1) == got.argmax(-1)).float().mean())
     agree_llama = float((split.argmax(-1) == dec.argmax(-1)).float().mean())
     print(f"{size}: KL vs llama.cpp's split run: prompt's last token {float(kl[0]):.4f} (llama.cpp decode-only "

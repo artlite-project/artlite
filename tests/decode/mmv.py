@@ -38,6 +38,8 @@ from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import blocks
 from artlite.operators.design import COLS
 
+from ..numerics import bf16_round
+
 # ----------------------------------------------------------------------
 # The x and sum panels
 # ----------------------------------------------------------------------
@@ -353,15 +355,11 @@ def tile_rows(y: np.ndarray, R: int, slots: int = SLOTS) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-def bf(x: np.ndarray | torch.Tensor) -> np.ndarray:
-    return torch.as_tensor(np.asarray(x, np.float32)).bfloat16().float().numpy()
-
-
 def norm_input(x: np.ndarray, w: np.ndarray, eps: float) -> tuple[np.ndarray, np.ndarray]:
     """F_NORM of S slots' bf16 x (S, H): (x w in fp32 (S, H), 1 / rms(x) (S,))."""
-    x = bf(x).astype(np.float64)
+    x = bf16_round(x).astype(np.float64)
     inv = 1 / np.sqrt((x ** 2).mean(-1) + eps)
-    return (x * bf(w)).astype(np.float32), inv
+    return (x * bf16_round(w)).astype(np.float32), inv
 
 
 def ref_rows(image: TileImage, region: Region, c: int, x: np.ndarray, slots: int = SLOTS) -> list[np.ndarray]:

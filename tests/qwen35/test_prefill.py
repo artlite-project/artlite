@@ -13,6 +13,7 @@ import pytest
 from artlite.gguf_model import GGUFFile
 
 from ..common import essay
+from ..numerics import rel_max
 from . import ref
 
 
@@ -51,17 +52,17 @@ def test_prefill_slice(size: str, La: int) -> None:
     for t0, n, T in [(0, n1, 512), (n1, n2, 64), (n1 + n2, n3, 128)]:
         pf.run(x(t0, n), t0, T)
         got = pf.hidden(0, n)
-        err += [ref.rel_err(got[i], want[t0 + i]) for i in range(n)]
+        err += [rel_max(got[i], want[t0 + i]) for i in range(n)]
     cont = []
     for t in range(P, P + K):
         ov.step(x(t, 1)[0], t, logits=False)
-        cont.append(ref.rel_err(ov.hidden(-1), want[t]))
+        cont.append(rel_max(ov.hidden(-1), want[t]))
     ov.reset()
     dec = []
     for t in range(P + K):
         ov.step(x(t, 1)[0], t, logits=False)
         if t >= P:
-            dec.append(ref.rel_err(ov.hidden(-1), want[t]))
+            dec.append(rel_max(ov.hidden(-1), want[t]))
     err = np.asarray(err)
     # (the prefill GEMMs multiply bfp16 activations by the weights dequantized to bfp16: ~1.4% rms per projection vs
     # the decode GEMV's bf16 x, which adds 0.2-0.6% to the decode path's mean error (9B 0.34 -> 0.79%, 27B 0.45 -> 0.62%,

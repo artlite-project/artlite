@@ -13,7 +13,8 @@ from artlite.vision.build import Builder, Level
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor
 
-from ..vision.test_ops import _rel, from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
+from ..numerics import rel_native
+from ..vision.test_ops import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +63,7 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     yb = npu.read("y_out", COLS * lv.ct(cout)).reshape(COLS, -1)
     y = from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, cout, lv.m)) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
-    assert _rel(y, ref) < 1.5e-2
+    assert rel_native(y, ref) < 1.5e-2
 
 
 @pytest.mark.slow
@@ -96,7 +97,7 @@ def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
     y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, cout, lv.m)) for b in range(2)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, x, eps=1e-5, time_bias=tb)
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -142,7 +143,7 @@ def test_resnet64(npu: VisionDevice) -> None:
     out = resnet64(bd, w, p, xd, cout=C, time_bias=tb, eps=1e-5, stats=None, name="y")
     bd.op({}, {})
     npu.run(bd.transaction())
-    err = _rel(_il_output(npu, out), reference.resnet(w, p, x, eps=1e-5, time_bias=tb))
+    err = rel_native(_il_output(npu, out), reference.resnet(w, p, x, eps=1e-5, time_bias=tb))
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -180,7 +181,7 @@ def test_resnet_cat_bands(npu: VisionDevice, ch: int, cs: int) -> None:
     y = from_level_tokens(torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, cout, lv.m)) for b in range(2)])
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.resnet(w, p, torch.cat([hx, sk], 1), eps=1e-5, time_bias=tb)
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -204,7 +205,7 @@ def test_downsample_bands(npu: VisionDevice) -> None:
     y = _level_output(npu, bd, out, "y_out")
     xq = q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
     ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), stride=2, padding=1)
-    assert _rel(y, ref) < 8e-3, _rel(y, ref)
+    assert rel_native(y, ref) < 8e-3, rel_native(y, ref)
 
 
 @pytest.mark.slow
@@ -227,7 +228,7 @@ def test_upsample_bands(npu: VisionDevice) -> None:
                                        for c in range(COLS)]), lv.R, lv.Lg)
     xq = F.interpolate(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), scale_factor=2.0, mode="nearest")
     ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), padding=1)
-    assert _rel(y, ref) < 8e-3, _rel(y, ref)
+    assert rel_native(y, ref) < 8e-3, rel_native(y, ref)
 
 
 def _rand_transformer(p: str, C: int = 1280, cd: int = 768) -> dict:
@@ -287,7 +288,7 @@ def test_transformer(npu: VisionDevice, H: int) -> None:
     yb = npu.read("y_out", COLS * lv.ct(C)).reshape(COLS, -1)
     y = from_level_tokens(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, C, lv.m)) for c in range(COLS)]), lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
-    assert _rel(y, ref) < 2e-2
+    assert rel_native(y, ref) < 2e-2
 
 
 @pytest.mark.slow
@@ -327,7 +328,7 @@ def test_transformer_bands(npu: VisionDevice) -> None:
     yc = torch.stack([torch.cat([torch.from_numpy(L.from_ctiles(yb[b][c], lv.T, C, lv.m)) for b in range(2)]) for c in range(COLS)])
     y = from_level_tokens(yc, lv.R, lv.Lg)
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     print(f"rel err {err:.3e}")
     assert err < 2e-2
 
@@ -367,7 +368,7 @@ def test_down64(npu: VisionDevice) -> None:
                                        for c in range(COLS)]), lv.R, lv.Lg)
     ref = F.conv2d(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), qconv_w(w["s.conv.weight"]),
                    w["s.conv.bias"].bfloat16().float(), padding=1, stride=2)
-    err = _rel(y, ref)
+    err = rel_native(y, ref)
     assert err < 8e-3, err
 
 
@@ -387,7 +388,7 @@ def test_up64(npu: VisionDevice) -> None:
     npu.run(bd.transaction())
     xu = F.interpolate(q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), scale_factor=2.0, mode="nearest")
     ref = F.conv2d(xu, qconv_w(w["s.conv.weight"]), w["s.conv.bias"].bfloat16().float(), padding=1)
-    err = _rel(_il_output(npu, out), ref)
+    err = rel_native(_il_output(npu, out), ref)
     assert err < 8e-3, err
 
 
@@ -412,7 +413,7 @@ def test_resnet_cat64(npu: VisionDevice, ch: int) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     ref = reference.resnet(w, p, torch.cat([h, sk], 1), eps=1e-5, time_bias=tb)
-    err = _rel(_il_output(npu, out), ref)
+    err = rel_native(_il_output(npu, out), ref)
     print(f"rel err {err:.3e}")
     assert err < 1.5e-2
 
@@ -442,7 +443,7 @@ def test_transformer64(npu: VisionDevice) -> None:
     bd.op({}, {})
     npu.run(bd.transaction())
     ref = reference.UNet.transformer(types.SimpleNamespace(w=w, cfg={"attention_head_dim": 8}), p, x, ctx)
-    err = _rel(_il_output(npu, out), ref)
+    err = rel_native(_il_output(npu, out), ref)
     print(f"rel err {err:.3e}")
     assert err < 2e-2
 
@@ -488,7 +489,7 @@ def test_resnet_cat(npu: VisionDevice, H: int, ch: int, cs: int) -> None:
     out = resnet_cat(bd, w, p, ht, skip, cout=cout, time_bias=tb, eps=1e-5, stats=None)
     y = _level_output(npu, bd, out, "y_out")
     ref = reference.resnet(w, p, torch.cat([h, sk], 1), eps=1e-5, time_bias=tb)
-    assert _rel(y, ref) < 1.5e-2
+    assert rel_native(y, ref) < 1.5e-2
 
 
 @pytest.mark.parametrize("kind", ["down", "up"])
@@ -510,7 +511,7 @@ def test_resample(npu: VisionDevice, kind: str) -> None:
         xq = F.interpolate(xq, scale_factor=2.0, mode="nearest")
     ref = F.conv2d(xq, qconv_w(w[p + "conv.weight"]), w[p + "conv.bias"].bfloat16().float(), stride=2 if kind == "down" else 1,
                    padding=1)
-    assert _rel(y, ref) < 8e-3
+    assert rel_native(y, ref) < 8e-3
 
 
 @pytest.mark.slow
@@ -542,7 +543,7 @@ def test_unet(npu: VisionDevice) -> None:
         t1 = time.perf_counter()
         y2 = net(x)
         ts.append(time.perf_counter() - t1)
-    err = _rel(y, u(x, 500.0, ctx))
+    err = rel_native(y, u(x, 500.0, ctx))
     print(f"UNet: rel err {err:.3e}; {np.median(ts) * 1e3:.1f} ms per step")
     assert torch.equal(y, y2)
     assert err < 1.5e-2

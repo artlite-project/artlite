@@ -19,7 +19,8 @@ from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.fused import Library
 from artlite.operators.templating import JINJA_ENV
 
-from ..common import to_numpy, to_torch, verify_close
+from ..common import to_numpy, to_torch
+from ..numerics import verify_close
 from .elementwise import SiluOperator, StreamOperator
 
 _ADD_SRC = JINJA_ENV.from_string("""

@@ -12,7 +12,6 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import d1_gguf, lfm3_gguf
 
 from .. import common
-from ..common import as_torch
 from ..llama_cpp import llama_tokenize
 from ..qwen35 import ref as qref
 from . import cpu
@@ -72,9 +71,3 @@ def llama_logits(quant: str, ids: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.asarray(g.logits, np.float32).copy())
 
 
-def relative(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Relative rms error (inf when a is not finite)."""
-    a, b = as_torch(a), as_torch(b)
-    if not torch.isfinite(a.float()).all():
-        return float("inf")
-    return float((a.float() - b.float()).pow(2).sum().sqrt() / b.float().pow(2).sum().sqrt())

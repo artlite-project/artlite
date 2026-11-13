@@ -11,9 +11,7 @@ import torch
 
 from artlite.operators import bfp16
 
-
-def bf(x: torch.Tensor) -> torch.Tensor:
-    return x.bfloat16().float()
+from ..numerics import bf16_round as bf
 
 
 def inv_rms(x: torch.Tensor, eps: float) -> torch.Tensor:

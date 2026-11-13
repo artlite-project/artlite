@@ -17,6 +17,7 @@ from models.lfm3a import speech as S
 from models.tokenizer import BpeTokenizer
 
 from ..llama_cpp import llama_tokenize
+from ..numerics import kl_rows
 from . import gen_ref as R
 
 MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()
@@ -27,15 +28,6 @@ def _files() -> None:
     for path in (MODEL, MMPROJ):
         if not os.path.exists(path):
             pytest.skip(f"{path} missing")
-
-
-def kl(ref: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """KL(softmax(ref) || softmax(x)) per row."""
-    lr = ref - ref.max(-1, keepdims=True)
-    lr = lr - np.log(np.exp(lr).sum(-1, keepdims=True))
-    lx = x - x.max(-1, keepdims=True)
-    lx = lx - np.log(np.exp(lx).sum(-1, keepdims=True))
-    return (np.exp(lr) * (lr - lx)).sum(-1)
 
 
 def snr(ref: np.ndarray, x: np.ndarray) -> float:
@@ -105,7 +97,7 @@ def test_depth(weights: R.Weights, tts: R.GenGolden) -> None:
     kls = []
     for c, h in zip(passes, hs, strict=True):
         g = R.golden(MODEL, MMPROJ, h=h, passes=c[None])
-        kls.append(kl(d.logits(h, c), g.logits(0)))
+        kls.append(kl_rows(d.logits(h, c), g.logits(0)))
     kls = np.array(kls)
     print(f"KL(fp64 || llama.cpp) per codebook: median {np.median(kls):.2e}, max {kls.max():.2e}")
     assert np.median(kls) < 1e-3 and kls.max() < 5e-3

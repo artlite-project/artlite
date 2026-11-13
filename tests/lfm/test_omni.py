@@ -35,6 +35,7 @@ from ..lfm3a import ref as AR
 from ..lfm3vl import ref as VR
 from ..llama_cpp import llama_tokenize
 from ..minicpmv.ref import golden
+from ..numerics import kl_agree
 
 MODEL, MMPROJ = lfm3omni_gguf(), lfm3omni_mmproj()
 MARKER = "<__media__>"
@@ -203,13 +204,6 @@ def question(app: tuple[Lfm, object], tmp_path_factory: pytest.TempPathFactory) 
     return path
 
 
-def _kl(want: np.ndarray, got: np.ndarray) -> tuple[float, float]:
-    lw = want - np.logaddexp.reduce(want.astype(np.float64), -1, keepdims=True)
-    lg = got - np.logaddexp.reduce(got.astype(np.float64), -1, keepdims=True)
-    kl = (np.exp(lw) * (lw - lg)).sum(-1)
-    return float(kl.mean()), float((want.argmax(-1) == got.argmax(-1)).mean())
-
-
 def _float64_rows(gold: object, media: list[dict], files: list[str]) -> np.ndarray:
     """The media chunks' float64 embeddings (``tests.lfm3vl.ref``, ``tests.lfm3a.ref``) of llama.cpp's inputs: an image's
     pixels as llama.cpp read them (its inp_raw), a clip's samples."""
@@ -255,8 +249,8 @@ def test_answer_kl(app: tuple[Lfm, object], question: str, case: str) -> None:
     kls = []
     for s in (Sequence(seq.ids, seq.given, e64, seq.pos, seq.next), seq):
         npu.reset()
-        kls.append(_kl(want, np.stack([npu.forward(s)] + [npu.step(t) for t in answer[:-1]])))
-    llama = _kl(want, np.asarray(gold.logits, np.float32)[-len(answer) - 1:-1])
+        kls.append(kl_agree(want, np.stack([npu.forward(s)] + [npu.step(t) for t in answer[:-1]])))
+    llama = kl_agree(want, np.asarray(gold.logits, np.float32)[-len(answer) - 1:-1])
     print(f"{case}: KL vs llama.cpp on float64 embeddings: the NPU's language model on them {kls[0][0]:.5f}, with the "
           f"NPU's encoders {kls[1][0]:.5f} (agree {kls[1][1]:.3f}); llama.cpp's own run {llama[0]:.5f}")
     assert kls[1][0] < max(2 * kls[0][0], 1.5 * llama[0]) + 1e-4 and kls[1][1] > 0.9
@@ -316,8 +310,8 @@ def test_video_kl(app: tuple[Lfm, object], videos: str, name: str) -> None:
     kls = []
     for s in (Sequence(seq.ids, seq.given, e64, seq.pos, seq.next), seq):
         npu.reset()
-        kls.append(_kl(want, np.stack([npu.forward(s)] + [npu.step(t) for t in answer[:-1]])))
-    llama = _kl(want, np.asarray(gold.logits, np.float32)[-len(answer) - 1:-1])
+        kls.append(kl_agree(want, np.stack([npu.forward(s)] + [npu.step(t) for t in answer[:-1]])))
+    llama = kl_agree(want, np.asarray(gold.logits, np.float32)[-len(answer) - 1:-1])
     print(f"{name} ({len(seq)} tokens): KL vs llama.cpp on float64 embeddings: the NPU's language model on them "
           f"{kls[0][0]:.5f}, with the NPU's encoders {kls[1][0]:.5f} (agree {kls[1][1]:.3f}); llama.cpp's own run "
           f"{llama[0]:.5f}")
@@ -436,10 +430,10 @@ def test_realtime_conversation(app: tuple[Lfm, object], question: str) -> None:
     assert "horse" in said[0].lower() and first < 1.0 and any(w in said[1].lower() for w in ("brown", "chestnut"))
     assert "two" in said[2].lower() or "2" in said[2]
     again, logits, said2, _ = session(True)
-    kl, agree = _kl(cached[None], logits[None])
+    kl, agree = kl_agree(cached[None], logits[None])
     print(f"displaced between the turns: KL {kl:.2e}")
     assert again.cache_keys() == whole.cache_keys() and said2 == said and kl < 0.05 and agree == 1.0
     npu.reset()
-    kl, agree = _kl(np.array(npu.forward(whole), np.float32)[None], cached[None])
+    kl, agree = kl_agree(np.array(npu.forward(whole), np.float32)[None], cached[None])
     print(f"{len(whole)} positions ({int(whole.given.sum())} rows): KL cached vs from scratch {kl:.2e}")
     assert kl < 0.05 and agree == 1.0  # (the prefill's 8-bit GEMM operands against steps)

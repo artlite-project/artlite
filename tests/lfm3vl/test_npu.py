@@ -17,6 +17,7 @@ from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
+from ..numerics import kl_report
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ, MODEL
 
@@ -34,15 +35,6 @@ def _messages(image: str | None) -> list[dict[str, object]]:
     before, after = " ".join(words[:90]), " ".join(words[90:300]) + "\n\nDescribe the image."
     img = {"type": "image"} | ({"image": image} if image else {})
     return [{"role": "user", "content": [{"type": "text", "text": before}, img, {"type": "text", "text": after}]}]
-
-
-def _kl_report(name: str, want: torch.Tensor, got: torch.Tensor) -> tuple[float, float]:
-    lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
-    kl = (lw.exp() * (lw - lg)).sum(-1)
-    agree = float((want.argmax(-1) == got.argmax(-1)).float().mean())
-    print(f"{name}: KL vs llama.cpp {float(kl.mean()):.4f} (max {float(kl.max()):.4f}), argmax agreement {agree:.3f} "
-          f"over {len(kl)} tokens")
-    return float(kl.mean()), agree
 
 
 @pytest.fixture(scope="module")
@@ -73,7 +65,7 @@ def test_image_prompt(case: tuple) -> None:
     for prefill in (True, False):
         model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(256,))
         got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
-        kl, agree = _kl_report("prefill" if prefill else "steps", want, got)
+        kl, agree = kl_report("prefill" if prefill else "steps", want, got)
         assert kl < 0.003 and agree > 0.95  # (measured 0.0005 / 0.0004)
         del model
 
@@ -88,5 +80,5 @@ def test_app_image_prompt(case: tuple) -> None:
     assert np.array_equal(prompt.ids, seq.ids) and np.array_equal(prompt.given, seq.given)
     model = app.load(capacity=1024)
     got = torch.from_numpy(np.stack([model.forward(prompt)] + [model.step(t) for t in answer[:-1]]))
-    kl, agree = _kl_report("the NPU encoder, prefill", want, got)
+    kl, agree = kl_report("the NPU encoder, prefill", want, got)
     assert kl < 0.004 and agree > 0.95  # (measured 0.0007)

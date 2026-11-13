@@ -19,6 +19,8 @@ from artlite.operators.design import COLS
 from artlite.prefill import attn as PA
 from artlite.prefill.gemm import Layout
 
+from ..numerics import rel
+
 A_BYTES = 9280  # the cache objects (the Q4_K_M images' tile size)
 # (head_dim, query heads per KV head, K panels per record, chunk, its position, q / k norms with weights and Q hi + lo:
 # Qwen3)
@@ -29,10 +31,6 @@ ATTN = [(64, 4, 1, 256, 0, False), (64, 4, 2, 256, 128, False), (64, 4, 1, 512, 
         (128, 4, 1, 64, 64, False),  # (short chunks: 1 row)
         (128, 2, 2, 256, 0, True), (128, 2, 2, 512, 128, True), (128, 2, 1, 256, 64, True), (128, 2, 2, 64, 0, True),
         (128, 2, 2, 1024, 64, True), (128, 4, 2, 256, 64, True)]
-
-
-def _rel(got: np.ndarray, want: np.ndarray) -> float:
-    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
 
 
 def _q_values(units: np.ndarray, hd: int, qp: int = 1) -> np.ndarray:
@@ -111,13 +109,13 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
     qv = _q_values(units.reshape(COLS, T // 8, qh, shape.qunit), hd, shape.qp)  # [column][token group][head][query][hd]
     qv = qv.transpose(0, 2, 1, 3, 4).reshape(COLS, qh, T, hd)
     want_q = rope(q, wq).transpose(1, 2, 0, 3) * shape.scale
-    assert _rel(qv, want_q) < (2e-4 if shape.qp == 2 else 1e-2)
+    assert rel(qv, want_q) < (2e-4 if shape.qp == 2 else 1e-2)
     n = (p0 + T) // shape.pg
     Ks, Vs = {}, {}
     for c in range(COLS):
         Ks[c], Vs[c] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[c, :n], hd))
-        assert _rel(Ks[c][p0:], rope(k, wk)[:, c]) < (2e-4 if kp == 2 else 1e-2), c
-        assert _rel(Vs[c][p0:], v[:, c].bfloat16().double().numpy()) < 1e-2, c
+        assert rel(Ks[c][p0:], rope(k, wk)[:, c]) < (2e-4 if kp == 2 else 1e-2), c
+        assert rel(Vs[c][p0:], v[:, c].bfloat16().double().numpy()) < 1e-2, c
     A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a], T, COLS * qh * hd).reshape(T, COLS, qh, hd)
     want = np.zeros((T, COLS, qh, hd))
     masked = np.arange(p0 + T)[None] > np.arange(p0, p0 + T)[:, None]
@@ -127,8 +125,8 @@ def test_attn(hd: int, qh: int, kp: int, T: int, p0: int, norm: bool) -> None:
             sc[masked] = -np.inf
             pr = np.exp2(sc - sc.max(-1, keepdims=True))
             want[:, c, h] = (pr @ Vs[c]) / pr.sum(-1, keepdims=True)
-    err = _rel(A, want)
-    eq = _rel(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape), want)
+    err = rel(A, want)
+    eq = rel(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape), want)
     print(f"attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
     assert err < 1.5 * eq
 
@@ -237,8 +235,8 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
             pr = np.exp2(sc - sc.max(-1, keepdims=True))
             want[:, c, h] = (pr @ Vc) / pr.sum(-1, keepdims=True)
     valid = np.concatenate([np.arange(a, a + n) for a, n in segs])
-    err = _rel(A[valid], want[valid])
-    eq = _rel(bfp16.values(want[valid].reshape(len(valid), -1).astype(np.float32)).reshape(want[valid].shape),
+    err = rel(A[valid], want[valid])
+    eq = rel(bfp16.values(want[valid].reshape(len(valid), -1).astype(np.float32)).reshape(want[valid].shape),
               want[valid])
     print(f"packed attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
     assert err < 1.5 * eq
@@ -332,10 +330,10 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     worst = {}
     for L in layers:
         k, v = ov.read_kv(L, range(p0 + n))
-        worst[f"K.{L}"], worst[f"V.{L}"] = _rel(k, want[L][0]), _rel(v, want[L][1])
+        worst[f"K.{L}"], worst[f"V.{L}"] = rel(k, want[L][0]), rel(v, want[L][1])
     h = pf.hidden(m - 1)
-    worst["hidden"] = _rel(h, want_h)
-    worst["logits"] = _rel(ov.logits_of(h).astype(np.float32), want_l)
+    worst["hidden"] = rel(h, want_h)
+    worst["logits"] = rel(ov.logits_of(h).astype(np.float32), want_l)
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.06 for v in worst.values()), worst
 

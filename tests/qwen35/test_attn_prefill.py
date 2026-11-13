@@ -6,7 +6,6 @@ import os
 
 import numpy as np
 import pytest
-import torch
 from ml_dtypes import bfloat16
 
 from artlite.decode import kv as KV
@@ -20,13 +19,10 @@ from models.qwen35 import attn_prefill as AP
 from models.qwen35.image import QwenImage
 
 from ..common import essay
+from ..numerics import bf16_round, rel_max
 from . import ref
 
 MAX_POS = 1024
-
-
-def _bf(x: np.ndarray) -> np.ndarray:
-    return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().float().numpy()
 
 
 def _q_panels(slots: np.ndarray) -> np.ndarray:
@@ -74,9 +70,9 @@ class _Setup:
         n = len(self.tokens)
         G_ = ref.golden(path, self.tokens, layers=(L,), names="Qcur_full|Kcur|Vcur|Qcur|gate_sigmoid|attn_gated",
                         logits="none")
-        self.qfull = _bf(np.asarray(G_["Qcur_full", L], np.float32).reshape(n, -1))
-        self.k = _bf(np.asarray(G_["Kcur", L], np.float32).reshape(n, -1))
-        self.v = _bf(np.asarray(G_["Vcur", L], np.float32).reshape(n, -1))
+        self.qfull = bf16_round(np.asarray(G_["Qcur_full", L], np.float32).reshape(n, -1))
+        self.k = bf16_round(np.asarray(G_["Kcur", L], np.float32).reshape(n, -1))
+        self.v = bf16_round(np.asarray(G_["Vcur", L], np.float32).reshape(n, -1))
         self.gold = G_
         self.qn = np.asarray(g.tensor(f"blk.{L}.attn_q_norm.weight").raw, np.float32).reshape(-1)
         self.kn = np.asarray(g.tensor(f"blk.{L}.attn_k_norm.weight").raw, np.float32).reshape(-1)
@@ -136,9 +132,9 @@ def test_attn_prep(size: str) -> None:
         sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(COLS * qc, T, hd)[:, :n]
         qg = s.qfull[t0:t0 + n].reshape(n, -1, 2, hd)
         q_want = s.nr(qg[:, :, 0], s.qn, pos).transpose(1, 0, 2) * np.log2(np.e) / 16
-        assert ref.rel_err(q, q_want) < 2e-4, t0  # (hi + lo panels: ~14 bits below a block's maximum)
+        assert rel_max(q, q_want) < 2e-4, t0  # (hi + lo panels: ~14 bits below a block's maximum)
         q_gold = np.asarray(s.gold["Qcur", s.L], np.float32).reshape(-1, COLS * qc, hd)[t0:t0 + n].transpose(1, 0, 2)
-        assert ref.rel_err(q / (np.log2(np.e) / 16), q_gold) < 1e-2, t0
+        assert rel_max(q / (np.log2(np.e) / 16), q_gold) < 1e-2, t0
         sg_want = 1 / (1 + np.exp(-np.asarray(qg[:, :, 1], np.float64))).transpose(1, 0, 2)
         assert np.abs(sg - sg_want).max() < 2 ** -8, t0
     # the cache: both chunks' positions of every KV head (K normed, rotated; V as stored)
@@ -148,10 +144,10 @@ def test_attn_prep(size: str) -> None:
     k_want = s.nr(kr, s.kn, pos)
     for h in range(s.kvh):
         K, V = KV.kv_from_groups(kv[h, :(T + n2 + 31) // 32], AT.HD, dmajor=True)
-        assert ref.rel_err(K[:T + n2], k_want[:, h]) < 1e-2, h  # (single bfp16: 8 bits below a block's maximum)
-        assert ref.rel_err(V[:T + n2], s.v[:T + n2, 256 * h:256 * (h + 1)]) < 1e-2, h
+        assert rel_max(K[:T + n2], k_want[:, h]) < 1e-2, h  # (single bfp16: 8 bits below a block's maximum)
+        assert rel_max(V[:T + n2], s.v[:T + n2, 256 * h:256 * (h + 1)]) < 1e-2, h
         k_gold = np.asarray(s.gold["Kcur.1", s.L], np.float32).reshape(-1, s.kvh, hd)[:T + n2, h]
-        assert ref.rel_err(K[:T + n2], k_gold) < 1e-2, h
+        assert rel_max(K[:T + n2], k_gold) < 1e-2, h
 
 
 @pytest.mark.parametrize(("size", "T", "pp"), [("9B", 64, 1), ("27B", 64, 1), ("1B", 64, 1), ("1B", 192, 1),
@@ -190,12 +186,12 @@ def test_attn_prefill(size: str, T: int, pp: int) -> None:
                 want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
         # (1B: a peakier softmax, its largest P 0.45 on average (9B 0.28): single V rows carry more of an output, the
         # largest error ~2 ULPs of a bfp16 block; the rms error as the 9B's)
-        eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
-        print(f"{size} T {T} pp {pp} chunk at {t0}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
-        assert ref.rel_err(A, want) < (1.5e-2 if size == "1B" else 1e-2), t0
+        eq = rel_max(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+        print(f"{size} T {T} pp {pp} chunk at {t0}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+        assert rel_max(A, want) < (1.5e-2 if size == "1B" else 1e-2), t0
         assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2, t0
         gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[t0:t0 + n]
-        assert ref.rel_err(A, gold) < 3e-2, t0
+        assert rel_max(A, gold) < 3e-2, t0
 
 
 @pytest.mark.parametrize(("size", "T", "n", "pp"), [("d3-lite", 128, 99, 1), ("d3-lite", 96, 70, 1), ("d3-lite", 128, 99, 2),
@@ -228,12 +224,12 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
             sc = q[g].astype(np.float64) @ K.T / 16
             pr = np.exp(sc - sc.max(-1, keepdims=True))
             want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
-    eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
-    print(f"{size} T {T} n {n} pp {pp}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
-    assert ref.rel_err(A, want) < 1.5e-2
+    eq = rel_max(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T} n {n} pp {pp}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    assert rel_max(A, want) < 1.5e-2
     assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2
     gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[:n]
-    assert ref.rel_err(A, gold) < 3e-2
+    assert rel_max(A, gold) < 3e-2
 
 
 @pytest.mark.parametrize(("size", "T", "causal"), [("d3-lite", 96, True), ("d3-lite", 128, True), ("d3-lite", 128, False),
@@ -285,9 +281,9 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
             sc[~seen] = -np.inf
             pr = np.exp(sc - sc.max(-1, keepdims=True))
             want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
-    eq = ref.rel_err(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
-    print(f"{size} T {T} causal {causal}: {ref.rel_err(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
-    assert ref.rel_err(A, want) < 1.1 * eq
+    eq = rel_max(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T} causal {causal}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    assert rel_max(A, want) < 1.1 * eq
     # the first segment alone (the unpacked design, its 32 tokens at position 0)
     attn1 = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=causal, pp=2)
     alone = FusedOperator(name=f"attn_prefill_alone{int(causal)}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
@@ -367,9 +363,9 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
             sc[~seen] = -np.inf
             pr = np.exp(sc - sc.max(-1, keepdims=True))
             want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g][rows]
-    eq = ref.rel_err(bfp16.values(want.reshape(len(rows), -1).astype(np.float32)).reshape(want.shape), want)
-    print(f"{size} T {T}: {ref.rel_err(A[rows], want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
-    assert ref.rel_err(A[rows], want) < 1.1 * eq
+    eq = rel_max(bfp16.values(want.reshape(len(rows), -1).astype(np.float32)).reshape(want.shape), want)
+    print(f"{size} T {T}: {rel_max(A[rows], want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    assert rel_max(A[rows], want) < 1.1 * eq
     for a, m, t in zip(starts, lengths, t0, strict=True):  # (each segment alone after the history)
         alone.get_buffer("KV")[:] = hist
         _run(alone, prep.params(T) | attn1.params(T), s.G(int(t), m))

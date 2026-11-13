@@ -22,7 +22,8 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
-from ..minicpmv.ref import VisionGolden, _bf16, _gelu_table, _gelu_tanh, golden
+from ..minicpmv.ref import VisionGolden, golden
+from ..numerics import bf16_like, gelu_table, gelu_tanh
 
 __all__ = ["Encoder", "NpuEncoder", "VisionGolden", "golden", "pos_rows", "rope_angles"]
 
@@ -68,7 +69,7 @@ class Encoder:
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
         if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = _bf16(x)
+            x = bf16_like(x)
         y = x @ w.T
         return y + self.w(bias).reshape(-1) if bias else y
 
@@ -79,7 +80,7 @@ class Encoder:
             + self.w(prefix + ".bias").reshape(-1)
 
     def _gelu(self, x: torch.Tensor) -> torch.Tensor:
-        return _gelu_table(x) if self.llama else _gelu_tanh(x)
+        return gelu_table(x) if self.llama else gelu_tanh(x)
 
     def _rope(self, x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
         """x (heads, n, d) turned by ang (n, d / 2): dims i, i + d / 2 a pair (rotate_half)."""
@@ -178,7 +179,7 @@ class NpuEncoder(Encoder):
         """a: the A panels' values -> C + bias + residual of the weight rows ``rows``, unrounded."""
         c = a @ self.wq(name)[rows].T
         if bias:
-            c = c + _bf16(self.w(bias).reshape(-1)[rows])
+            c = c + bf16_like(self.w(bias).reshape(-1)[rows])
         return c if res is None else c + res
 
     def ln(self, x: torch.Tensor, prefix: str) -> torch.Tensor:
@@ -195,10 +196,10 @@ class NpuEncoder(Encoder):
     def _turn(self, c: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
         """C (n, heads d) of Q or K -> the RoPE epilogue's panels' values (heads, n, d)."""
         n, h = c.shape[0], self.hd // 2
-        x = _bf16(c).reshape(n, self.heads, 2, h).transpose(0, 1)
-        cs, sn = (_bf16(f(ang)).to(c.dtype) for f in (torch.cos, torch.sin))
+        x = bf16_like(c).reshape(n, self.heads, 2, h).transpose(0, 1)
+        cs, sn = (bf16_like(f(ang)).to(c.dtype) for f in (torch.cos, torch.sin))
         a, b = x[:, :, 0], x[:, :, 1]
-        out = torch.stack([_bf16(a * cs - b * sn), _bf16(b * cs + a * sn)], 2)  # (heads, n, 2, d / 2)
+        out = torch.stack([bf16_like(a * cs - b * sn), bf16_like(b * cs + a * sn)], 2)  # (heads, n, 2, d / 2)
         out = torch.nn.functional.pad(out, (0, 40 - h))  # (the epilogue's blocks: d / 2 + zeros to 40 per half)
         return _bfp(out).reshape(self.heads, n, 2, 40)[..., :h].reshape(self.heads, n, self.hd)
 
@@ -217,7 +218,7 @@ class NpuEncoder(Encoder):
         s = q @ k[:, ko[ok]].transpose(1, 2)  # (log2 units)
         e = torch.zeros(self.heads, n, len(ko), dtype=s.dtype)
         e[..., ok] = torch.exp2(s - s.amax(-1, keepdim=True))
-        pr = _bfp(_bf16(e))
+        pr = _bfp(bf16_like(e))
         o = (pr @ vq.transpose(1, 2)) / pr.sum(-1, keepdim=True)
         return _bfp(o.transpose(0, 1).reshape(n, H))
 
@@ -225,10 +226,10 @@ class NpuEncoder(Encoder):
         """Layer il on the residual x (bf16 values)."""
         p = f"v.blk.{il}."
         o = self.attention(self.ln(x, p + "ln1"), p, ang, vblocks)
-        x = _bf16(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
+        x = bf16_like(self.gemm(o, p + "attn_out.weight", p + "attn_out.bias", x))
         h = self.gemm(self.ln(x, p + "ln2"), p + "ffn_up.weight", p + "ffn_up.bias")
-        h = _bfp(_bf16(_gelu_tanh(_bf16(h))))
-        return _bf16(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
+        h = _bfp(bf16_like(gelu_tanh(bf16_like(h))))
+        return bf16_like(self.gemm(h, p + "ffn_down.weight", p + "ffn_down.bias", x))
 
     def _hilo(self, name: str) -> torch.Tensor:
         w = self.w(name)
@@ -244,7 +245,7 @@ class NpuEncoder(Encoder):
         ph, pw = np.asarray(pixels).shape[1] // P, np.asarray(pixels).shape[2] // P
         tr = trace if trace is not None else {}
         ang = torch.from_numpy(rope_angles(ph, pw, self.hd))
-        x = _bf16(self.embed(pixels))
+        x = bf16_like(self.embed(pixels))
         for il in range(self.layers):
             x = self.layer(x, il, ang, vblocks)
             tr[f"layer_out-{il}"] = x
@@ -252,6 +253,6 @@ class NpuEncoder(Encoder):
                 for k in [k for k in cache if k.startswith(f"v.blk.{il}.")]:
                     del cache[k]
         m = self.ln(x, "v.post_ln")[torch.from_numpy(self.windows(ph, pw))].reshape(-1, 4 * self.hidden)
-        h = _bf16(m @ self._hilo("mm.0.weight").T + _bf16(self.w("mm.0.bias").reshape(-1)))
-        h = _bfp(_bf16(0.5 * h * (1 + torch.erf(h / math.sqrt(2)))))
-        return _bf16(h @ self._hilo("mm.2.weight").T + _bf16(self.w("mm.2.bias").reshape(-1)))
+        h = bf16_like(m @ self._hilo("mm.0.weight").T + bf16_like(self.w("mm.0.bias").reshape(-1)))
+        h = _bfp(bf16_like(0.5 * h * (1 + torch.erf(h / math.sqrt(2)))))
+        return bf16_like(h @ self._hilo("mm.2.weight").T + bf16_like(self.w("mm.2.bias").reshape(-1)))

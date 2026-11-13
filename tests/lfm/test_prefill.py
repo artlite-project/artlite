@@ -22,6 +22,7 @@ from models.lfm.overlay import LfmOverlay
 from models.lfm.prefill import LfmPrefill
 
 from ..common import to_torch
+from ..numerics import kl_rows, rel_finite
 from . import ref
 
 VOCAB = 2048
@@ -84,12 +85,12 @@ def test_lfm_prefill_layers(first: int, steps: tuple[int, ...], n: int, kv_k: st
     if first:
         _prompt(ov, pf, x[:first], 0)
     got_l = _prompt(ov, pf, x, _steps(ov, x, first, steps))
-    worst = {"logits": ref.relative(got_l, want_l)}
+    worst = {"logits": rel_finite(got_l, want_l)}
     for L in att:
         k, v = ov.read_kv(L, range(len(ids)))
-        worst[f"K.{L}"], worst[f"V.{L}"] = ref.relative(k, want[L][0]), ref.relative(v, want[L][1])
+        worst[f"K.{L}"], worst[f"V.{L}"] = rel_finite(k, want[L][0]), rel_finite(v, want[L][1])
     for L, rows in want_c.items():
-        worst[f"conv.{L}"] = ref.relative(ov.read_conv(L)[ov.conv_s:ov.conv_s + 6], rows)
+        worst[f"conv.{L}"] = rel_finite(ov.read_conv(L)[ov.conv_s:ov.conv_s + 6], rows)
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.05 for v in worst.values()), worst
 
@@ -119,9 +120,9 @@ def test_lfm_prefill_teacher_forced(quant: str) -> None:
             rows += list(to_torch(ov.step(x[p:p + n], p)).float())
             p += n
         got = torch.stack(rows)
-        k = ref.cpu.kl(want, got)
+        k = kl_rows(want, got)
         agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(ref.cpu.kl(want, ref.llama_logits(quant, ids)[P - 1:]).mean())
+        lk = float(kl_rows(want, ref.llama_logits(quant, ids)[P - 1:]).mean())
         print(f"{quant} prompt {P}, {len(ids) - P} after: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) "
               f"max {float(k.max()):.4f}, first {float(k[0]):.5f}, argmax {agree:.4f}")
         assert float(k.mean()) < max(1.5e-3, 1.5 * lk) and agree > 0.95
@@ -150,9 +151,9 @@ def test_lfm_prefill_set(n: int, sets: tuple[int, ...]) -> None:
     ov.reset()
     pf.run(cpu_m.emb[torch.tensor(ids)], 0, sets=sets)
     got = cpu_m.rms(torch.from_numpy(pf.hidden(0, n)), cpu_m.norm)
-    worst = {"all": ref.relative(got, want)}
+    worst = {"all": rel_finite(got, want)}
     for k, (a, b) in enumerate(itertools.pairwise((0, *sets))):  # (the state, each question)
-        worst[f"part{k}"] = ref.relative(got[a:b], want[a:b])
+        worst[f"part{k}"] = rel_finite(got[a:b], want[a:b])
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < 0.05 for v in worst.values()), worst
     assert np.isfinite(got.numpy()).all()
