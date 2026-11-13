@@ -32,7 +32,7 @@ from artlite.vision.device import VisionDevice, load_state, save_state, state_di
 from artlite.vision.weights import sources
 
 from .. import video
-from ..common import Model, OverlayModel, Sampling
+from ..common import Model, OverlayModel, Sampling, render_template
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
 from ..lfm3a import speech as a_speech
@@ -253,42 +253,77 @@ class Lfm(Model):
         speech by itself or not), "text" (text only); ("text", token id) and ("audio", 24 kHz samples) as they come;
         ``reply``: filled with the reply's sequence. The loaded model's positions are the conversation's and the
         reply's."""
+        if mode not in ("mixed", "audio", "auto", "text"):
+            raise ValueError(f"mode {mode!r}: mixed, audio, auto or text")
+        if mode == "mixed" and (not messages or messages[0].get("role") != "system"):
+            messages = [{"role": "system", "content": a_speech.INTERLEAVED}, *messages]
+        prompt = self.chat(messages) + self.opener(mode)
+        if stats is not None:
+            stats.prompt = len(prompt)
+        self.npu_model().reset()
+        yield from self.reply(prompt, mode=mode, seed=seed, max_tokens=max_tokens, max_frames=max_frames, reply=reply,
+                              stats=stats)
+
+    def opener(self, mode: str) -> list[int]:
+        """The token that opens a reply of ``mode`` (``voice_reply``'s): ``<|mixed_start|>``, ``<|audio_start|>``, or
+        none ("auto", "text")."""
+        name = {"mixed": a_speech.MIXED_START, "audio": a_speech.AUDIO_START}.get(mode)
+        return [] if name is None else [self.gguf.strings("tokenizer.ggml.tokens").index(name)]
+
+    def npu_model(self) -> NpuLfm:
+        """The model on the NPU (``load``ed), with the speech generator its replies may speak with."""
         if self.audio is None or self.audio.gen is None:
             raise ValueError(f"{self.name}: speech output needs LFM3-Audio's mmproj (its speech generator)")
         if self._npu is None:
             raise ValueError(f"{self.name}: load the model first")
-        if mode not in ("mixed", "audio", "auto", "text"):
-            raise ValueError(f"mode {mode!r}: mixed, audio, auto or text")
-        npu = self._npu
-        if mode == "mixed" and (not messages or messages[0].get("role") != "system"):
-            messages = [{"role": "system", "content": a_speech.INTERLEAVED}, *messages]
+        return self._npu
+
+    def reply(self, tokens: list[int] | Sequence, *, mode: str = "mixed", seed: int | None = None,
+              max_tokens: int = 1024, max_frames: int = 2048, reply: a_speech.Reply | None = None,
+              stats: a_speech.SpeechStats | None = None) -> Iterator[tuple[str, object]]:
+        """``voice_reply``'s generation after the model's positions so far: ``tokens`` the prompt's rest (ending with
+        ``opener(mode)``) run first; the positions after it are the reply's (``reply``: its sequence)."""
+        npu = self.npu_model()
         toks = a_speech.speech_tokens(self.gguf.strings("tokenizer.ggml.tokens"))
-        opener = {"mixed": [toks[a_speech.MIXED_START]], "audio": [toks[a_speech.AUDIO_START]]}.get(mode, [])
-        prompt = self.chat(messages) + opener
-        if stats is not None:
-            stats.prompt = len(prompt)
-        npu.reset()
         logits, h = None, None
         if mode == "audio":
-            h = npu.outputs(prompt, at=[-1])[0]
+            h = npu.outputs(tokens, at=[-1])[0]
         else:
-            logits = npu.forward(prompt)
+            logits = npu.forward(tokens)
         sampler = a_speech.CodeSampler(self.audio.gen, seed)
         yield from a_speech.interleave(npu, self.audio, toks, logits, sampler, max_tokens=max_tokens,
                                        max_frames=max_frames, mode={"auto": "text"}.get(mode, mode), h=h,
                                        speech=mode != "text", reply=reply, stats=stats)
 
+    def chat_text(self, messages: list[dict[str, object]], *, think: bool = False,
+                  tools: list[dict[str, object]] | None = None, preserve: bool = False,
+                  variables: dict[str, object] | None = None, generation: bool = True) -> str:
+        """The chat template's text of a conversation (``generation``: up to the assistant's turn; its media parts as
+        the template writes them), the file's BOS as its ``bos_token``."""
+        bos = self.gguf.strings("tokenizer.ggml.tokens", self.bos)[0]
+        if generation:
+            return chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
+                               template=self.chat_template, **{"bos_token": bos, **(variables or {})})
+        return render_template(self.chat_template or str(self.gguf.meta["tokenizer.chat_template"]), messages=messages,
+                               add_generation_prompt=False, tools=tools or None, **{
+                                   "enable_thinking": think, "preserve_thinking": preserve, "bos_token": bos,
+                                   **(variables or {})})
+
+    def audio_stream(self) -> object:
+        """A stream's rows on the speech encoder as its samples arrive (``models.lfm3a.live.Stream``)."""
+        from ..lfm3a import live
+        return live.Stream(self.audio.encoder, ran=self._vision_ran)
+
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
              variables: dict[str, object] | None = None) -> list[int] | Sequence:
-        bos = self.gguf.strings("tokenizer.ggml.tokens", self.bos)[0]
-        text = chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
-                           template=self.chat_template, **{"bos_token": bos, **(variables or {})})
+        text = self.chat_text(messages, think=think, tools=tools, preserve=preserve, variables=variables)
         parts = [p for m in messages if isinstance(m.get("content"), list) for p in m["content"] if isinstance(p, dict)]
         images = [p["image"] for p in parts if p.get("type") == "image"]
         clips = [a_host.part_audio(p) for p in parts if p.get("type") in a_host.AUDIO_PARTS]
         videos = [p["video"] for p in parts if p.get("type") == "video"]
-        if not images and not clips and not videos:
+        frames = [p["row"] for p in parts if p.get("type") == "audio_out" and "row" in p]  # (a spoken reply as said)
+        if not images and not clips and not videos and not frames:
             return self.tokenizer.encode(text)
         if (images or videos) and self.vision is None:
             raise ValueError(f"{self.name}: images and videos need its vision encoder (an mmproj file)")
@@ -297,7 +332,9 @@ class Lfm(Model):
         try:
             return splice_media(text, {vl_host.IMAGE: [self.vision.sequence(im) for im in images],
                                        a_host.AUDIO: [self.audio.sequence(c) for c in clips],
-                                       vl_host.VIDEO: [self.video_sequence(v) for v in videos]}, self.tokenizer.encode)
+                                       vl_host.VIDEO: [self.video_sequence(v) for v in videos],
+                                       a_speech.AUDIO_OUT: [a_host.clip_sequence(np.reshape(r, (1, -1))) for r in frames]},
+                                self.tokenizer.encode)
         finally:
             self._vision_ran()
 

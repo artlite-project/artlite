@@ -13,6 +13,7 @@ that give the real token counts (``models.lfm3vl.host``, ``models.lfm3a.host``) 
 
 import os
 import re
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -368,3 +369,75 @@ def test_voice_reply_picture(app: tuple[Lfm, object]) -> None:
     print("ASR:", heard)
     norm = lambda t: set(re.sub(r"[^a-z ]", "", t.lower()).split())
     assert len(norm(heard) & norm(said)) >= 0.7 * len(norm(said))
+
+
+@pytest.mark.slow
+def test_realtime_conversation(app: tuple[Lfm, object], question: str) -> None:
+    """A realtime conversation on the prompt cache (``models.server.realtime.Conversation`` on an engine over the loaded
+    model): two camera frames and a spoken question streamed in 0.1 s pieces (its rows run on the model as they come)
+    answered in interleaved speech, then two text questions answered in text; each answer right and the first audio
+    soon after the commit. Run again with another request between the turns (the conversation displaced: brought back
+    from what the prompt cache kept of it, RAM and a checkpoint, the rest run again): the same sequence and answers.
+    The logits there and from scratch as close as one sequence's runs in other splits are (the prefill's 8-bit GEMM
+    operands against decode steps: KL ~1e-3; the same split gives the same bits)."""
+    from models.lfm3a.speech import SpeechStats
+    from models.server.engine import Engine
+    from models.server.realtime import Conversation
+    m, npu = app
+    x = A.load_audio(question)
+    example = os.path.join(os.path.dirname(ASTRONAUT), "sd15-example.jpg")  # (another astronaut on another horse)
+    other = m.chat([{"role": "user", "content": " ".join(["Tell me about the sea."] * 120)}])
+
+    def session(displace: bool) -> tuple[object, np.ndarray, list[str], float]:
+        npu.reset()
+        engine = Engine(lambda: (m, npu), warmup=False)
+        engine.start()
+        assert engine.wait_ready(60)
+        run = lambda fn: engine.run(fn).result()
+        conv = Conversation(engine, m)
+
+        def respond(mode: str) -> tuple[str, float | None]:
+            text, first = [], None
+            for kind, y in conv.respond(mode, 200, SpeechStats(), seed=7):
+                if kind == "text":
+                    text.append(y)
+                elif first is None and len(y):
+                    first = time.perf_counter()
+            return m.tokenizer.decode(text), first
+
+        def elsewhere() -> None:  # (another request: the device runs another sequence)
+            if displace:
+                run(lambda: (npu.forward(other[engine.hold(other):]), engine.ran(other)))
+        try:
+            run(lambda: conv.start("Answer in one short sentence.", None))
+            run(lambda: conv.image(example))
+            run(lambda: conv.image(ASTRONAUT))
+            for i in range(0, len(x), 1600):
+                run(lambda i=i: conv.audio(x[i:i + 1600]))
+            t0 = time.perf_counter()
+            run(conv.commit)
+            said = [run(lambda: respond("mixed"))]
+            elsewhere()
+            run(lambda: conv.text("Answer in one word: what colour is the horse?"))
+            said.append(run(lambda: respond("text")))
+            elsewhere()
+            run(lambda: conv.text("How many pictures did I show you?"))
+            said.append(run(lambda: respond("text")))
+            whole = conv.seq + m.encode("<|im_end|>\n<|im_start|>user\nThanks!")
+            logits = np.array(run(lambda: npu.forward(whole[engine.hold(whole):])), np.float32)
+            return whole, logits, [t for t, _ in said], said[0][1] - t0
+        finally:
+            engine.stop()
+            engine.join(30)
+    whole, cached, said, first = session(False)
+    print(f"answers {said}; first audio {first:.2f} s after the commit")
+    assert "horse" in said[0].lower() and first < 1.0 and any(w in said[1].lower() for w in ("brown", "chestnut"))
+    assert "two" in said[2].lower() or "2" in said[2]
+    again, logits, said2, _ = session(True)
+    kl, agree = _kl(cached[None], logits[None])
+    print(f"displaced between the turns: KL {kl:.2e}")
+    assert again.cache_keys() == whole.cache_keys() and said2 == said and kl < 0.05 and agree == 1.0
+    npu.reset()
+    kl, agree = _kl(np.array(npu.forward(whole), np.float32)[None], cached[None])
+    print(f"{len(whole)} positions ({int(whole.given.sum())} rows): KL cached vs from scratch {kl:.2e}")
+    assert kl < 0.05 and agree == 1.0  # (the prefill's 8-bit GEMM operands against steps)

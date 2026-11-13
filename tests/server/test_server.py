@@ -1463,19 +1463,46 @@ if __name__ == "__main__":
     eng.stop()
 
 
+class FakeStream:
+    """A speech encoder's stream: a row per 400 samples (the last partial one at the end), row k's values k + 0.5."""
+
+    def __init__(self) -> None:
+        self.n, self.taken, self.ended = 0, 0, False
+
+    def push(self, samples: np.ndarray) -> None:
+        self.n += len(samples)
+
+    def end(self) -> None:
+        self.ended = True
+
+    def available(self) -> int:
+        return (-(-self.n // 400) if self.ended else self.n // 400) - self.taken
+
+    def take(self, k: int) -> np.ndarray:
+        rows = np.arange(self.taken, self.taken + k, dtype=np.float32)[:, None] + np.full((k, 8), 0.5, np.float32)
+        self.taken += k
+        return rows
+
+
 class FakeSpeaker(FakeAudio):
-    """A model that speaks (``Lfm.tts``'s interface): per request 3 chunks of 480 samples (their values the chunk's index
-    / 10), its arguments recorded; its generator's mmproj config a namespace."""
+    """A model that speaks (``Lfm``'s interface): per request 3 chunks of 480 samples (their values the chunk's index
+    / 10), its arguments recorded; its generator's mmproj config a namespace. A reply (``reply``, ``voice_reply``): the
+    pieces of ``say`` (default " hello" " there") with 2 frames of 480 samples after the first, run on the fake NPU
+    (``npu``) as an ``Lfm`` reply runs: each frame an ``<|audio_out|>`` with its feedback row."""
 
     def __init__(self) -> None:
         super().__init__()
         self.audio.gen = types.SimpleNamespace()
         self.spoken: list[dict[str, object]] = []
+        self.cfg = types.SimpleNamespace(hidden_size=8)
+        self.say = [" hello", " there"]
+        self.npu: FakeNpu | None = None
+        self.streams: list[FakeStream] = []
 
     def voice_reply(self, messages: list[dict[str, object]], **kw: object) -> Iterator[tuple[str, object]]:
         """Interleaved: the words " hello" " there", 2 chunks of 480 samples between them; the messages recorded."""
         self.spoken.append({"messages": messages, **kw})
-        st = kw.get("stats")
+        st, rp = kw.get("stats"), kw.get("reply")
         if st is not None:
             st.prompt = 7
         yield "text", self.tokenizer.id(" hello")
@@ -1484,6 +1511,46 @@ class FakeSpeaker(FakeAudio):
                 st.frames += 1
             yield "audio", np.full(480, i / 10, np.float32)
         yield "text", self.tokenizer.id(" there")
+        if rp is not None:  # (the reply as said: a frame between the words)
+            rp.ids += [self.tokenizer.id(" hello"), self.tokenizer.id("<|audio_out|>"), self.tokenizer.id(" there")]
+            rp.rows[1] = np.full(8, 0.5, np.float32)
+
+    def chat_text(self, messages: list[dict[str, object]], *, tools: list[dict[str, object]] | None = None,
+                  generation: bool = True, **kw: object) -> str:
+        """(FakeModel's format: media parts as <|kind|>)"""
+        text = "<s>" + (f"<|system|>tools: {' '.join(t['function']['name'] for t in tools)}" if tools else "")
+        for m in messages:
+            c = m["content"]
+            if isinstance(c, list):
+                c = "".join(str(p.get("text", "")) if p.get("type") == "text" else f"<|{p['type']}|>" for p in c)
+            calls = "".join(f" call {c_['function']['name']}" for c_ in m.get("tool_calls") or [])
+            text += f"<|{m['role']}|>{c}{calls}"
+        return text + ("<|assistant|>" if generation else "")
+
+    def opener(self, mode: str) -> list[int]:
+        return []
+
+    def audio_stream(self) -> FakeStream:
+        self.streams.append(FakeStream())
+        return self.streams[-1]
+
+    def reply(self, tokens: list[int] | Sequence, *, mode: str = "mixed", reply: object = None, stats: object = None,
+              **kw: object) -> Iterator[tuple[str, object]]:
+        self.spoken.append({"tokens": tokens, "mode": mode, **kw})
+        self.npu.prompt(tokens)
+        out = self.npu.position
+        for i, piece in enumerate(self.say):
+            t = self.tokenizer.id(piece)
+            yield "text", t
+            reply.ids.append(t)
+            self.npu._run([t])
+            for f in range(2 if i == 0 else 0):
+                if stats is not None:
+                    stats.frames += 1
+                yield "audio", np.full(480, f / 10, np.float32)
+                reply.rows[len(reply.ids)] = np.full(8, out + len(reply.ids), np.float32)
+                reply.ids.append(self.tokenizer.id("<|audio_out|>"))
+                self.npu._run([MEDIA])
 
     def tts(self, text: str, **kw: object) -> Iterator[np.ndarray]:
         self.spoken.append({"text": text, **kw})
@@ -1555,7 +1622,7 @@ def test_chat_audio() -> None:
     """Chat completions with audio output (modalities text and audio: interleaved; audio alone: speech first): the
     spoken reply's transcript and its WAV (or
     pcm16) in message.audio, streamed as delta.audio pieces; a later turn's assistant message with that audio id goes to
-    the model as its transcript; an unknown voice or format: 400."""
+    the model as it was said (its text and its frames' feedback rows); an unknown voice or format: 400."""
     model = FakeSpeaker()
     npu = FakeNpu(model)
     engine = Engine(lambda: (model, npu), warmup=False)
@@ -1583,7 +1650,10 @@ def test_chat_audio() -> None:
         turn = msgs + [{"role": "assistant", "audio": {"id": m["audio"]["id"]}}, {"role": "user", "content": "more"}]
         client.post("/v1/chat/completions", json={"messages": turn, "modalities": ["text", "audio"]})
         seen = model.spoken[-1]["messages"]
-        assert [x["content"] for x in seen] == ["hi", " hello there", "more"] and model.spoken[-1]["mode"] == "mixed"
+        assert [x["content"] for x in (seen[0], seen[2])] == ["hi", "more"] and model.spoken[-1]["mode"] == "mixed"
+        said = seen[1]["content"]  # (the earlier reply as said: its text and its frame's feedback row)
+        assert [p["type"] for p in said] == ["text", "audio_out", "text"] and said[0]["text"] == " hello"
+        assert np.array_equal(said[1]["row"], np.full(8, 0.5, np.float32))
         client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["audio"]})
         assert model.spoken[-1]["mode"] == "audio"  # (speech, then text: <|audio_start|>)
         for audio, word in (({"voice": "alloy"}, "female, male"), ({"format": "mp3"}, "wav or pcm16")):
@@ -1591,25 +1661,32 @@ def test_chat_audio() -> None:
             assert r.status_code == 400 and word in r.json()["error"]["message"]
 
 
-def test_realtime_conversation() -> None:
-    """/v1/realtime without the transcription intent on a model that speaks: a conversation (llama-server's events) -
-    a text turn and an audio turn, each response's text and audio deltas between its start and done events, the
-    output_modalities as the reply's mode, the instructions as the system prompt, the earlier reply in the next turn as
-    its text."""
+def _speaker() -> tuple[FakeSpeaker, FakeNpu, Engine]:
     model = FakeSpeaker()
-    npu = FakeNpu(model)
+    npu = model.npu = FakeNpu(model, capacity=1024)
     engine = Engine(lambda: (model, npu), warmup=False)
     ENGINES.append(engine)
     engine.start()
+    return model, npu, engine
+
+
+def _response(ws: object) -> list[dict]:
+    evs = []
+    while not evs or evs[-1]["type"] != "response.done":
+        evs.append(ws.receive_json())
+    return evs
+
+
+def test_realtime_conversation() -> None:
+    """/v1/realtime without the transcription intent on a model that speaks: a conversation (llama-server's events) on
+    the prompt cache - a text turn and an audio turn, each response's text and audio deltas between its start and done
+    events, the output_modalities as the reply's mode, the instructions as the system prompt; a response runs only its
+    turn's new tokens (its audio's rows ran as they came; the earlier reply stays as it was said: its tokens and its
+    frames' feedback rows), and a request between turns does not lose the conversation."""
+    model, npu, engine = _speaker()
     want = (np.concatenate([np.full(480, i / 10, np.float32) for i in range(2)]) * 32767).round().astype("<i2")
-    pcm = base64.b64encode((np.full(1600, 0.25) * 32768).astype("<i2").tobytes()).decode()
-
-    def response(ws: object) -> list[dict]:
-        evs = []
-        while not evs or evs[-1]["type"] != "response.done":
-            evs.append(ws.receive_json())
-        return evs
-
+    pcm = lambda n: base64.b64encode((np.full(n, 0.25) * 32768).astype("<i2").tobytes()).decode()
+    enc = model.tokenizer.encode
     with TestClient(app_of(engine)) as client:
         assert engine.wait_ready(5)
         with client.websocket_connect("/v1/realtime") as ws:
@@ -1622,19 +1699,97 @@ def test_realtime_conversation() -> None:
                                                                         "content": [{"type": "input_text", "text": "hi"}]}})
             assert [ws.receive_json()["type"] for _ in range(2)] == ["conversation.item.added", "conversation.item.done"]
             ws.send_json({"type": "response.create"})
-            evs = response(ws)
+            evs = _response(ws)
             assert evs[0]["type"] == "response.created" and evs[-1]["response"]["status"] == "completed"
             assert "".join(e["delta"] for e in evs if e["type"] == "response.output_text.delta") == " hello there"
             got = np.concatenate([np.frombuffer(base64.b64decode(e["delta"]), "<i2") for e in evs
                                   if e["type"] == "response.output_audio.delta"])
             assert np.array_equal(got, want) and model.spoken[-1]["mode"] == "mixed"
-            assert model.spoken[-1]["messages"] == [{"role": "system", "content": "Be brief."},
-                                                    {"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm})
+            first = enc("<s><|system|>Be brief.<|user|>") + enc("hi") + enc("<|assistant|>")
+            assert list(model.spoken[-1]["tokens"].ids) == first
+            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm(3200)})  # (8 rows: they run at once)
+            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm(1000)})
             ws.send_json({"type": "response.create", "response": {"output_modalities": ["audio"]}})
-            evs = response(ws)
+            evs = _response(ws)
             assert evs[0]["type"] == "input_audio_buffer.committed" and model.spoken[-1]["mode"] == "audio"
-            seen = model.spoken[-1]["messages"]
-            assert seen[2] == {"role": "assistant", "content": " hello there"}
-            clip = seen[3]["content"][0]["audio"]
-            assert seen[3]["role"] == "user" and len(clip) == 1600 and abs(clip[0] - 0.25) < 1e-4
+            assert list(model.spoken[-1]["tokens"].ids) == enc("<|assistant|>")  # (the commit ran the clip's last rows)
+            seq = engine.cached
+            assert len(seq) == npu.position and list(seq.ids[len(first):len(first) + 4]) == \
+                [enc(" hello")[0], enc("<|audio_out|>")[0], enc("<|audio_out|>")[0], enc(" there")[0]]
+            assert np.array_equal(seq.rows[:2, 0], [len(first) + 1, len(first) + 2])  # (the frames' feedback rows)
+            clip = len(first) + 4 + len(enc("<|user|>"))
+            assert list(seq.ids[clip - 1:clip + 12]) == enc("<|user|>") + [MEDIA] * 11 + enc("<|assistant|>")
+            assert np.array_equal(seq.rows[2:13, 0], np.arange(11) + 0.5)  # (the clip's 11 rows: 8 ran as they came)
+            n = len(seq)
+            assert chat(client, "something else").status_code == 200  # (another request displaces the conversation)
+            ws.send_json({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+                                                                        "content": [{"type": "input_text", "text": "and?"}]}})
+            [ws.receive_json() for _ in range(2)]
+            ws.send_json({"type": "response.create", "response": {"output_modalities": ["text"]}})
+            _response(ws)
+            assert model.spoken[-1]["mode"] == "text" and engine.cached.cache_keys()[:n] == seq.cache_keys()
+
+
+def test_realtime_tools_images() -> None:
+    """A realtime conversation's tools (the Responses API's functions in the session): the model's call as a
+    function_call item with its arguments' deltas, its output back as a function_call_output item and the next
+    response answering it; an input_image part (a camera frame) in a user turn: the image's tokens."""
+    model, _, engine = _speaker()
+    model.vision = FakeEncoder()
+    model.chat_template = "<tool_call> <function= <parameter="  # (Qwen's XML calls: tools.syntax_of)
+    model.say = ["<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"]
+    tools = [{"type": "function", "name": "weather", "description": "the weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}}}]
+    image = "data:image/png;base64," + base64.b64encode(b"cam" * 8).decode()
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        with client.websocket_connect("/v1/realtime") as ws:
+            ws.receive_json()
+            ws.send_json({"type": "session.update", "session": {"tools": tools, "output_modalities": ["text"]}})
+            assert ws.receive_json()["session"]["tools"] == tools
+            ws.send_json({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": image}, {"type": "input_text", "text": "weather here?"}]}})
+            assert ws.receive_json()["item"]["content"][0] == {"type": "input_image"}
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            evs = _response(ws)
+            tokens = model.spoken[-1]["tokens"]
+            assert list(tokens.ids[:5]) == model.tokenizer.encode("<s><|system|>tools: weather<|user|>") and \
+                int(tokens.given.sum()) == 2  # (the camera frame's rows)
+            call = next(e["item"] for e in evs if e["type"] == "response.output_item.done" and
+                        e["item"]["type"] == "function_call")
+            assert call["name"] == "weather" and json.loads(call["arguments"]) == {"city": "Paris"}
+            assert any(e["type"] == "response.function_call_arguments.done" for e in evs)
+            ws.send_json({"type": "session.update", "session": {"instructions": "x"}})
+            assert ws.receive_json()["type"] == "error"  # (fixed once the conversation began)
+            ws.send_json({"type": "conversation.item.create", "item": {"type": "function_call_output",
+                                                                        "call_id": call["call_id"], "output": "sunny"}})
+            assert ws.receive_json()["item"]["type"] == "function_call_output"
+            ws.receive_json()
+            model.say = [" It is sunny."]
+            ws.send_json({"type": "response.create"})
+            evs = _response(ws)
+            assert list(model.spoken[-1]["tokens"].ids) == model.tokenizer.encode("<|tool|>sunny") + \
+                model.tokenizer.encode("<|assistant|>")
+            assert "".join(e["delta"] for e in evs if e["type"] == "response.output_text.delta") == " It is sunny."
+
+
+def test_realtime_transcription_offline() -> None:
+    """A transcription session of a model with a speech encoder and no live ASR (LFM3-Omni): each committed buffer
+    transcribed alone with the offline ASR prompt (a chat job), its text as deltas, then the item's transcript."""
+    model, npu, engine = make(audio=True)
+    model.gguf = types.SimpleNamespace(meta={})  # (no asr template)
+    pcm = base64.b64encode((np.full(1600, 0.25) * 32768).astype("<i2").tobytes()).decode()
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+            assert ws.receive_json()["session"]["type"] == "transcription"
+            npu.replies = [["hello", " world"]]
+            ws.send_json({"type": "input_audio_buffer.append", "audio": pcm})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            evs = [ws.receive_json() for _ in range(4)]
+            assert [e["type"] for e in evs] == ["input_audio_buffer.committed"] + \
+                ["conversation.item.input_audio_transcription.delta"] * 2 + \
+                ["conversation.item.input_audio_transcription.completed"]
+            assert evs[-1]["transcript"] == "hello world"
+            assert "ASR" in str(model.rendered[0][0]["content"])

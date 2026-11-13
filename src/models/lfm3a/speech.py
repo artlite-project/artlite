@@ -43,6 +43,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import GenConfig
 
 from ..common import render_template
+from ..sequence import Sequence
 
 N_CB, N_CODES = 12, 2017  # (codebooks a frame, codes a codebook: 2016 FSQ codes and the end of audio)
 EOA = N_CODES - 1
@@ -260,6 +261,17 @@ class Reply:
     rows: dict[int, np.ndarray] = field(default_factory=dict)
     text: list[int] = field(default_factory=list)
     codes: list[np.ndarray] = field(default_factory=list)
+
+    def sequence(self, hidden: int) -> Sequence:
+        """The positions the reply ran as a prompt's tokens: its token ids, a frame's feedback row at its
+        ``<|audio_out|>`` (a conversation's next turn continues from them exactly)."""
+        n = len(self.ids)
+        given = np.zeros(n, bool)
+        given[list(self.rows)] = True
+        rows = np.stack([self.rows[i] for i in sorted(self.rows)]).astype(np.float32) if self.rows else \
+            np.zeros((0, hidden), np.float32)
+        return Sequence(np.asarray(self.ids, np.int64), given, rows,
+                        np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1), n)
 
 
 def interleave(model: Any, audio: Any, tokens: dict[str, int], logits: np.ndarray | None, sampler: CodeSampler, *,

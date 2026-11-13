@@ -258,8 +258,9 @@ with the model of its directory) take audio as llama-server does ([the models](m
   works unchanged.
 - Chat messages take `input_audio` parts (`{"data": base64, "format": "wav"}`) and `audio_url` parts of data URIs, as
   images: the encoder runs on the NPU worker between requests, a clip's rows kept for a conversation's next turns.
-- `/v1/realtime?intent=transcription` (LFM3-Audio: a model trained for live ASR, its `asr` template): live
-  transcription (English) over a websocket, llama-server's events. The
+- `/v1/realtime?intent=transcription`: transcription over a websocket, llama-server's events. LFM3-Omni (no live ASR
+  in its training) transcribes each committed buffer alone (the ASR prompt above: `...delta` events, then
+  `...completed`); LFM3-Audio (its `asr` template) transcribes live (English). The
   client appends PCM16 audio at 16 kHz (`input_audio_buffer.append`); every 0.96 s of it gives the text it holds
   (`conversation.item.input_audio_transcription.delta`); `input_audio_buffer.commit` pads the audio with silence to
   the next 0.96 s, then completes the item (`...completed` with its transcript), `"final": true` ends the stream.
@@ -279,19 +280,26 @@ generation run on the NPU worker between requests, its samples (24 kHz) streamed
   answer 400: no encoders), `speed` 1, `stream_format` (`sse`: `speech.audio.delta` events of base64 chunks, then
   `speech.audio.done`). The `openai` package's `audio.speech.create` works with `response_format="wav"`.
 - `/v1/realtime` (without `intent=transcription`): a realtime conversation, as llama-server's. `session.update` sets
-  `instructions` (the system prompt), `output_modalities` (left out: the model answers in text or switches to speech by
-  itself; `["text"]`; `["audio"]`: speech, then text; `["text", "audio"]`: interleaved), `max_output_tokens` and the
-  voice (`audio.output.voice`); a user turn is audio (`input_audio_buffer.append`: PCM16 at 16 kHz, `.commit`) and / or
-  text (`conversation.item.create` with `input_text`); `response.create` (its `response.output_modalities` override
-  the session's) streams `response.output_text.delta` and `response.output_audio.delta` (base64 PCM16 at 24 kHz)
-  between the `response.*` start and done events; `response.cancel` stops it. Each reply stays in the conversation as
-  its text; a response runs the conversation so far as one prompt (a turn's audio encoded once).
+  `instructions` (the system prompt), `tools` (the Responses API's functions), `output_modalities` (left out: the model
+  answers in text or switches to speech by itself; `["text"]`; `["audio"]`: speech, then text; `["text", "audio"]`:
+  interleaved), `max_output_tokens` and the voice (`audio.output.voice`); the instructions and tools are fixed at the
+  first audio or message. A user turn is audio (`input_audio_buffer.append`: PCM16 at 16 kHz, `.commit`), text and
+  images (`conversation.item.create` with `input_text` and `input_image` parts of data URLs: a camera frame);
+  `response.create` (its `response.output_modalities` override the session's) streams `response.output_text.delta`
+  and `response.output_audio.delta` (base64 PCM16 at 24 kHz) between the `response.*` start and done events;
+  `response.cancel` stops it. A call of a function is a `function_call` item (its arguments as
+  `response.function_call_arguments.delta` / `.done`); its result goes back as a `function_call_output` item, and the
+  next `response.create` answers it. The conversation stays on the model between turns (the prompt cache: another
+  request in between moves it to RAM and back): a turn's audio runs on the model while it arrives, so a response
+  starts with the turn's last rows (Omni's first audio ~0.5 s after the commit), and each reply stays as the model
+  said it (its text and frames).
 - Chat completions with `modalities: ["text", "audio"]` and `audio: {"voice": "female", "format": "wav"}` (OpenAI's
   chat audio output): a spoken reply (the model's interleaved text and speech; `modalities: ["audio"]`: speech, then
   text) as `message.audio` (`id`, `data`: base64
   WAV, or 16-bit PCM for `format: "pcm16"`; `transcript`, `expires_at`), streamed as `delta.audio` (the transcript's
   pieces, base64 16-bit chunks; `format: "pcm16"`). An assistant message with an earlier reply's `audio: {"id": ...}`
-  goes back to the model as that reply's transcript.
+  goes back to the model as the reply was said (its text and frames), as its transcript once the server forgot it (it
+  keeps the last 256).
 
 ```bash
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en

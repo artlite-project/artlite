@@ -436,7 +436,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     typed = takes_parts(info.chat_template)
     first = system_first(info.chat_template)
     store = agents.Store()  # (the Responses API's, for previous_response_id)
-    replies = Replies()  # (the spoken replies' transcripts: their audio ids in later turns)
+    replies = Replies()  # (the spoken replies: their audio ids in later turns)
     vocab: list[Vocabulary] = []  # (the model's tokens for the calls' names: built on the first request with tools)
     vocab_lock = asyncio.Lock()
 
@@ -555,7 +555,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                                           f"text{' and ' + ' and '.join(takes) if takes else ' only'}")
                 content = parts if typed or any(p["type"] in ("image", "audio", "video") for p in parts) else \
                     "\n".join(p["text"] for p in parts)
-            d: dict[str, object] = {**(m.model_extra or {}), "role": role, "content": content or ""}
+            d: dict[str, object] = replies.said_as({**(m.model_extra or {}), "role": role, "content": content or ""})
             if m.reasoning_content:
                 d["reasoning_content"] = m.reasoning_content
             try:
@@ -1337,8 +1337,26 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     decisions.add_routes(api, engine=engine, alias=options.alias, kind=info.decision,
                          make=lambda: info.decisions or decisions.Decisions.of(info.path, engine.model.tokenizer.encode),
                          errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits)
+
+    async def transcribe(x: Any, language: str) -> AsyncIterator[str]:
+        """A clip's transcript (16 kHz samples; the transcriptions' chat request: the ASR prompt) as its pieces
+        come."""
+        from ..lfm3a.host import SR, asr_system, wav_bytes  # (numpy only)
+        clip = {"type": "input_audio", "input_audio": {"data": base64.b64encode(wav_bytes(x)).decode(), "format": "wav"}}
+        _, events = await start(chat_request({
+            "messages": [{"role": "system", "content": asr_system(language)}, {"role": "user", "content": [clip]}],
+            "stream": True, "chat_template_kwargs": {"enable_thinking": False},
+            "max_tokens": TRANSCRIPT_TOKENS[0] + TRANSCRIPT_TOKENS[1] * len(x) // SR}))
+        async for kind, data in events_of(events, 0):
+            if kind == "delta":
+                for k, v in data["parts"]:
+                    if k == "content":
+                        yield v
+            elif kind in ("error", "cancelled"):
+                raise RuntimeError(f"the transcription failed: {data}")
+
     realtime.add_route(app, engine=engine, alias=options.alias,
-                       authorized=lambda a, x: key_valid(options.api_keys, a, x))
+                       authorized=lambda a, x: key_valid(options.api_keys, a, x), transcribe=transcribe)
     add_speech(api, engine, ApiError)
     add_unsupported(listed)
     app.include_router(public)
