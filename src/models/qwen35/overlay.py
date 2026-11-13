@@ -134,7 +134,7 @@ class _Step:
     chains divide their caches' groups) and its words that follow the position: the KV cache and ring reads (A: their
     address and length) and the record drains (C: their address)."""
 
-    def __init__(self, S: int, subs: tuple[tuple[int, int, bool], ...]):
+    def __init__(self, S: int, subs: tuple[tuple[int, int, int], ...]):
         self.S, self.subs = S, subs
         self.tr: Transaction | None = None
         # (BD word index, layer, column, sub-step, which groups: "all", the column's "run" of a split, "new": the
@@ -692,45 +692,47 @@ class QwenOverlay(ModelOverlay):
             for part in (0, 1):
                 seq.drain("C", c, dev.address("ACT", raw + 2 * (2 * attn.HD * h + attn.HD * part + e0)), S * 2 * per,
                           (C_LEN // 2, S, XB // 4, C_LEN // 2))
-        for u, (a, n, split) in enumerate(st.subs):
-            half = split == attn.SPLIT_HALF
-            if u or half:
-                seq.sync()  # (sub-step u - 1's records in DDR; a shared stream: every column's objects before it through)
-            for c in range(0, COLS, nph if ash.one else 1):  # the cache of the column's KV head (address, length:
-                # _set_position), its ring (one pass: the chain's first column's stream, to both cores)
-                if half and c % nph >= 2:  # (its objects: the column two to the west's)
+        def cache(u: int) -> None:  # the cache of the column's KV head (address, length: _set_position), its ring (one
+            # pass: the chain's first column's stream, to both cores; a round: the first chain's streams, the round's KV
+            # head, cc its column in that head's chain)
+            _, n, split = st.subs[u]
+            rnd, kh = split & 3 == attn.SPLIT_ROUND, (split & attn.SPLIT_KV) >> 2
+            for c in range(0, COLS, nph if ash.one else 1):
+                if rnd and c >= nph:  # (its objects: the column 4 away's)
                     continue
-                head = dev.address("KV", self.kv_off[L] + c // nph * ash.head_bytes)
-                pk = {"packet": AB_ID + ash.a_bcast.index((c, c + 2))} if half else {}
+                cc = kh * nph + c if rnd else c
+                head = dev.address("KV", self.kv_off[L] + cc // nph * ash.head_bytes)
+                pk = {"packet": AB_ID + ash.a_bcast.index((c, c + nph))} if rnd else {}
                 kinds = ("all",) if not split else ("run", "new") if c % nph == 0 else ("run",)
                 for kind in kinds:  # (split: the chain's first column its run, then the new positions' group's K and V objects)
-                    st.fills.append((seq.fill("A", c, head, attn.OBJS * T, **pk), L, c, u, kind))
-                if not split or (c & 1 if half else ash.role(c) == attn.ROLE_V):  # (a column that attends to the newest group: the tails)
-                    st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, c // nph)), T, **pk), L, c, u, t)
+                    st.fills.append((seq.fill("A", c, head, attn.OBJS * T, **pk), L, cc, u, kind))
+                if not split or ash.role(c) == attn.ROLE_V:  # (a column that attends to the newest group: the tails)
+                    st.tails += [(seq.fill("A", c, dev.address("KV", self.ring(L, cc // nph)), T, **pk), L, cc, u, t)
                                  for t in range(ash.records(n))]
                 if not ash.one and not split and c % nph == 0:  # (then the new positions' group again, for their records)
                     st.fills.append((seq.fill("A", c, head, attn.OBJS * T), L, c, u, "new"))
-            last = u == len(st.subs) - 1 and run
-            if last and not half and self._a_bds > 1 + attn.TAILS:  # (a later block's after the X objects: ``_weight_run``)
-                self._weight_run(seq, run, blocks=slice(1))
-            if u == 0 and not half:
-                seq.sync()  # (attn_in's q, K, V in DDR)
+
+        def inputs(u: int) -> None:  # the F_ATT object, the q objects, the slots' raw K, V objects
+            a, n, split = st.subs[u]
+            rnd, kh = split & 3 == attn.SPLIT_ROUND, (split & attn.SPLIT_KV) >> 2
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", self._fatt(L, c, u)), XB)
-                if split:  # (the q objects of the chain's columns or its half's, in order)
-                    nc = 2 if half else nph
-                    seq.fill("X", c, dev.address("ACT", self._q(L, c - c % nc, a)), nc * n * XB,
+                if split:  # (the q objects of the chain's columns in order; a round: of its half of the KV head's)
+                    q0, nc = (kh * nph + 2 * (c // nph), 2) if rnd else (c - c % nph, nph)
+                    seq.fill("X", c, dev.address("ACT", self._q(L, q0, a)), nc * n * XB,
                              (XB // 8, 2 * n, XB // 8, self.SLOTS * XB // 4))
                 else:
                     seq.fill("X", c, dev.address("ACT", self._q(L, c, a)), n * XB)
                 seq.fill("X", c, dev.address("ACT", self.rawkv[L] + a * XB), n * XB)
-            if last and not half:
-                self._weight_run(seq, run, blocks=slice(1 if self._a_bds > 1 + attn.TAILS else 0, None))
-            for c in range(COLS):  # o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's
-                # last column's of the chain's), then the records (addresses: _set_position)
-                role = ash.role(c)
-                if not split or (c & 1 if half else role == attn.ROLE_V):
-                    h0, nh = (qc * (c - 1), 2 * qc) if half else (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc)
+
+        def outputs(u: int) -> None:  # o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's
+            # last column's of the chain's, a round's of its half), then the records (addresses: _set_position)
+            a, n, split = st.subs[u]
+            rnd, kh = split & 3 == attn.SPLIT_ROUND, (split & attn.SPLIT_KV) >> 2
+            for c in range(COLS):
+                role = attn.ROLE_O if ash.round_word(split, c) & attn.SPLIT_NOREC else ash.role(c)
+                if not split or c % nph == nph - 1:
+                    h0, nh = ((kh * nph + 2 * (c // nph)) * qc, 2 * qc) if rnd else (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc)
                     sp = self._sp(S, (L, "attn_out"))
                     at, left = self._x_at((L, "attn_out"), attn.HD * h0, S)
                     assert left >= 4 * sp * 128 * nh
@@ -744,8 +746,30 @@ class QwenOverlay(ModelOverlay):
                     dims = attn.V_SCATTER if nb == attn.REC_V else None  # (REC_K == REC_V)
                     hd = seq.drain("C", c, dev.address("KV", self.kv_off[L]), nb, dims)
                     st.drains.append((hd, L, c, u, k))
-            if half and u == len(st.subs) - 1:  # (then the columns' own objects: they keep no order with a shared stream's)
-                seq.wait_fills("A", tuple(c for c in range(COLS) if c % nph < 2))
+
+        for u, (a, n, split) in enumerate(st.subs):
+            rnd = split & 3 == attn.SPLIT_ROUND  # (a round: both chains on its KV head, the cache shared 4 columns apart)
+            last = u == len(st.subs) - 1 and run
+            if not split & attn.SPLIT_KV:  # (a sub-step's second round: issued with its first)
+                if u or rnd:
+                    seq.sync()  # (sub-step u - 1's records in DDR; a shared stream: every column's objects before it through)
+                cache(u)
+                if last and not rnd and self._a_bds > 1 + attn.TAILS:  # (a later block's after the X objects: ``_weight_run``)
+                    self._weight_run(seq, run, blocks=slice(1))
+                if u == 0 and not rnd:
+                    seq.sync()  # (attn_in's q, K, V in DDR)
+                inputs(u)
+                if rnd:  # (the second round, on the same streams after the first's objects: its inputs, then the tasks
+                    # that wait for the first round's to finish (a channel queues 4): the second's tails, the drains)
+                    inputs(u + 1)
+                    cache(u + 1)
+                if last and not rnd:
+                    self._weight_run(seq, run, blocks=slice(1 if self._a_bds > 1 + attn.TAILS else 0, None))
+                outputs(u)
+                if rnd:
+                    outputs(u + 1)
+            if rnd and u == len(st.subs) - 1:  # (then the columns' own objects: they keep no order with a shared stream's)
+                seq.wait_fills("A", tuple(range(nph)))
                 if run:
                     self._weight_run(seq, run)
 
@@ -793,7 +817,7 @@ class QwenOverlay(ModelOverlay):
         for c in range(COLS):
             self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S)
 
-    def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, bool], ...]) -> _Step:
+    def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, int], ...]) -> _Step:
         """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps)."""
         dev, cfg = self.dev, self.cfg
         seq = Sequence(self.op, rolling=True, inputs=("X",))
@@ -851,17 +875,19 @@ class QwenOverlay(ModelOverlay):
             self._ends = p % 8 + S >= 8
         super().patch_ahead(S, p)
 
-    def subs(self, p: int, S: int) -> tuple[tuple[int, int, bool], ...]:
-        """The attention's sub-steps of a step at p .. p + S - 1 (``decode.vring.substeps``): (first slot, slots,
-        whether the chains divide the cache: by its group alone)."""
+    def passes(self, p: int, S: int) -> int:
+        """The passes over the KV caches of a step at p .. p + S - 1 (a sub-step's two rounds: one, a KV head each)."""
+        return len({(a, n) for a, n, _ in self.subs(p, S)})
+
+    def subs(self, p: int, S: int) -> tuple[tuple[int, int, int], ...]:
+        """The attention's sub-steps of a step at p .. p + S - 1 (``decode.vring.substeps``), a round each: (first slot,
+        slots, how the chains divide the cache: by its group and slots alone, ``attn.AttnShape.split_of``)."""
         if self.ash is None:
             return ()
         if self.ash.one:
             return ((0, S, False),)
-        out = []
-        for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub):
-            out.append((a, n, self.ash.split_of((p + a) // attn.POS_PER_GROUP, n)))
-        return tuple(out)
+        return tuple((a, n, split) for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub)
+                     for split in self.ash.split_of((p + a) // attn.POS_PER_GROUP, n))
 
     def _patch_tables(self, st: _Step) -> dict[str, np.ndarray]:
         """A step's cache fills, tail fills and record drains as arrays: BD word index, sub-step, the layer's index among
@@ -916,32 +942,33 @@ class QwenOverlay(ModelOverlay):
         self._rings_from_prefill(p)
         for L in self.fatt:
             self.vring.check(L, p, p)
-        w = np.zeros((U, nph, len(F_WORDS)), np.int32)  # (per sub-step and column of its chain)
-        gr = np.zeros((U, len(FILLS), nph, 2), np.int64)  # (a fill's groups)
+        w = np.zeros((U, COLS, len(F_WORDS)), np.int32)  # (per sub-step and column)
+        gr = np.zeros((U, len(FILLS), nph, 2), np.int64)  # (a fill's groups, per place in a chain)
         su = np.zeros((U, 2), np.int64)  # (a sub-step's first position, slots)
         for u, (a, n, split) in enumerate(st.subs):
             q, g = p + a, (p + a) // attn.POS_PER_GROUP
             G = (q + n - 1) // attn.POS_PER_GROUP + 1  # (groups through the last slot's; split: chain core k's attention groups b[k] .. b[k + 1] - 1)
-            b = ash.bounds(g, split) if split else [0] * (nph + 1)
-            half = split == attn.SPLIT_HALF
+            b = ash.bounds(g) if split else [0] * (nph + 1)
             su[u] = q, n
-            for k in range(nph):
-                kr = k & 1 if half else k  # (its run of the groups)
-                nt = ash.records(n) if not split or (kr if half else ash.role(k) == attn.ROLE_V) else 0
+            for c in range(COLS):
+                k = c % nph
+                nt = ash.records(n) if not split or k == nph - 1 else 0
                 o = attn.OBJS
                 if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
                     na, g0, ga, gj = o * G + nt + (2 if k == 0 and not ash.one else 0), 0, 1 << 20, 0
-                elif kr == 0:  # (then group g's K and V objects for its K records)
+                elif k == 0:  # (then group g's K and V objects for its K records)
                     na, g0, ga, gj = o * b[1] + 2, 0, b[1], g
                 else:
-                    na, g0, ga, gj = o * (b[kr + 1] - b[kr]) + nt, b[kr], 1 << 20, 0
+                    na, g0, ga, gj = o * (b[k + 1] - b[k]) + nt, b[k], 1 << 20, 0
                 ana, na = na, 0 if ash.one and k else na  # (one pass: the chain's cores on the first column's stream)
-                nq = 3 if half else nph + 1 if split else 2  # (per slot the X objects after F_ATT)
-                w[u, k] = q, n, 0, nq * n, split, ash.n_rel(k, split, n), nt, na, g0, ga, gj, ana
-                gr[u, :, k] = (0, G), (g, g + 1), (b[kr], b[kr + 1])
+                nq = 3 if split & 3 == attn.SPLIT_ROUND else nph + 1 if split else 2  # (per slot the X objects after F_ATT)
+                sw = ash.round_word(split, c)
+                w[u, c] = q, n, 0, nq * n, sw, ash.n_rel(c, sw, n), nt, na, g0, ga, gj, ana
+            for k in range(nph):
+                gr[u, :, k] = (0, G), (g, g + 1), (b[k], b[k + 1])
         fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
         a32 = act.view(np.int32)
-        a32[fo[..., None] + F_WORDS] = w[np.arange(U), np.arange(COLS)[:, None] % nph]
+        a32[fo[..., None] + F_WORDS] = w[np.arange(U), np.arange(COLS)[:, None]]
         q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)
         af = act.view(np.float32)
         for u, (a, n, _) in enumerate(st.subs):

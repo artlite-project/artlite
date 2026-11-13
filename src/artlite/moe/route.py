@@ -41,27 +41,30 @@ BD_W4, BD_W5, BD_VALID, BD_USE_NEXT = 3 << 30, 2 << 24, 1 << 25, 1 << 26
 
 
 # the control packets' route on a shim's MM2S1 (stream-switch slave South 7; aiecc: slot 0, the X objects' id -> a low
-# arbiter -> North, each packet flow of the shim its own from 0 up; its control-packet overlay: arbiter 5): slot 1 (CID) ->
-# arbiter 4 -> master Tile_Ctrl, packet mode, the header kept (AM029 PL_MODULE Stream_Switch_*)
-SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL, CTL_ARB = 0x3F294, 0x3F000, 4
+# arbiter -> North, the packet flows through the shim's switch on arbiters from 0 up, msels from 0 up; its control-packet
+# overlay: arbiter 5): slot 1 (CID) -> arbiter 4, msel 3 -> master Tile_Ctrl, packet mode, the header kept (AM029 PL_MODULE
+# Stream_Switch_*). A flow may share the arbiter (the shared A streams of a decode design's rounds take up to 5 arbiters in a
+# switch they pass), not its msel: the arbiter sends a packet of msel m to every master that enables m.
+SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL, CTL_ARB, CTL_MSEL = 0x3F294, 0x3F000, 4, 3
 SW_SLOTS = range(0x3F200, 0x3F400, 4)  # (the slave ports' slots)
 
 
 def control_route(t: txn.Txn, col: int) -> None:
     """Route column col's control packets on its shim's MM2S1 to its TileControl (two writes; ``check_route``)."""
-    t.write32(txn.tile_address(col, 0, SW_SOUTH7_SLOT1), _slot(CID, CTL_ARB))
-    t.write32(txn.tile_address(col, 0, SW_MASTER_TILE_CTRL), 1 << 31 | 1 << 30 | 1 << 3 | CTL_ARB)
+    t.write32(txn.tile_address(col, 0, SW_SOUTH7_SLOT1), _slot(CID, CTL_ARB) | CTL_MSEL << 4)
+    t.write32(txn.tile_address(col, 0, SW_MASTER_TILE_CTRL), 1 << 31 | 1 << 30 | 1 << (3 + CTL_MSEL) | CTL_ARB)
 
 
 def check_route(values: dict[int, int], cols: range) -> None:
     """The configuration (``paging.cdo_values``) leaves the control route's registers to ``control_route`` and no stream
-    on its arbiter: the words of such a stream would reach TileControl."""
+    on its arbiter and msel: the words of such a stream would reach TileControl."""
     for c in cols:
         for reg in (SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL):
             assert txn.tile_address(c, 0, reg) not in values, f"column {c}: the configuration writes {reg:#x}"
         for reg in SW_SLOTS:
             v = values.get(txn.tile_address(c, 0, reg), 0)
-            assert not (v >> 8 & 1 and v & 7 == CTL_ARB and not v >> 4 & 3), f"column {c}: {reg:#x} = {v:#x} on the control route's arbiter"
+            assert not (v >> 8 & 1 and v & 7 == CTL_ARB and v >> 4 & 3 == CTL_MSEL), \
+                f"column {c}: {reg:#x} = {v:#x} on the control route's arbiter and msel"
 
 
 def top_k(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:

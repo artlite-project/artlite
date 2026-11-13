@@ -42,13 +42,14 @@ def test_deal(u: int) -> None:
 
 
 def test_check_route() -> None:
-    """The configuration may leave the control route's arbiter unused only: a stream on it would feed TileControl, a written
-    route register would be overwritten."""
+    """The configuration may leave the control route's arbiter and msel unused only: a stream on them would feed
+    TileControl (one on the arbiter with another msel does not), a written route register would be overwritten."""
     MR.check_route({}, range(COLS))
     other = txn.tile_address(1, 0, MR.SW_SLOTS[20])
-    MR.check_route({other: _slot(3, MR.CTL_ARB + 1)}, range(COLS))
+    MR.check_route({other: _slot(3, MR.CTL_ARB + 1) | MR.CTL_MSEL << 4}, range(COLS))
+    MR.check_route({other: _slot(3, MR.CTL_ARB)}, range(COLS))
     with pytest.raises(AssertionError, match="control route"):
-        MR.check_route({other: _slot(3, MR.CTL_ARB)}, range(COLS))
+        MR.check_route({other: _slot(3, MR.CTL_ARB) | MR.CTL_MSEL << 4}, range(COLS))
     with pytest.raises(AssertionError, match="writes"):
         MR.check_route({txn.tile_address(2, 0, MR.SW_MASTER_TILE_CTRL): 0}, range(COLS))
 

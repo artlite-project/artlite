@@ -87,9 +87,9 @@ segment is packet-switched for it (so that a memtile input takes two sources), t
 the memtiles nothing changes, and every other fill stays on its column (the stream's own id). Two sources keep no order
 between them: a shared fill follows a sync that drained what the columns' objects before it fed, the columns' next
 fills wait for it (``Sequence.wait_fills``): the flows never meet, which the router cannot see (it refuses flows that share
-receivers: ``--allow-deadlock-prone-routing``). On a shim each packet flow takes an arbiter from 0 up, so the MoE control
-route's arbiter stays above them (``moe.route.check_route`` refuses a configuration where a stream uses it: that stream's words
-would reach the shim's TileControl).
+receivers: ``--allow-deadlock-prone-routing``). On a shim's switch the packet flows through it take arbiters and msels from 0
+up (5 arbiters where several pass), so the MoE control route's msel stays above them (``moe.route.check_route`` refuses a
+configuration where a stream uses its arbiter and msel: that stream's words would reach the shim's TileControl).
 
 Broadcast inputs (``bcast``): a phase's [metadata object | x] are the same bytes for every column, and the cores of a column
 take the same objects, so one shim (``BC_COL``) reads them once for all (a fill with the packet id ``BC_ID``): a packet flow to

@@ -674,7 +674,8 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
     emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots; split 2:
-    of 3 or 4 on the chain's halves, each half's two cores with its heads, on the streams of the chain's first two). The
+    of 3 or 4 in two rounds, one per KV head, both chains on its cache, each with half its heads, on the first chain's
+    streams shared with the columns 4 away; its own chain's records). The
     3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
     column's stream, a step across a cache group too; o an octet's 8 rows."""
     from models.qwen35 import attn as A1
@@ -686,7 +687,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     g = p // 32
     one = size == "3.8-27B"
     assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == bool(split))
-    half = split == A1.SPLIT_HALF
+    rounds = split == A1.SPLIT_ROUND
     P = 32 * ((p + S - 1) // 32 + 1)  # (cache positions: whole groups)
     slots = 8 if one else A1.SMAX
     ash = A1.AttnShape(cfg, P, slots=slots)
@@ -722,39 +723,45 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     kn = (1 + 0.1 * rng.standard_normal(HD)).astype(np.float32)
     cs = [tuple(v[0] for v in A1.rope_cs(cfg, [p + s])) for s in range(S)]
     G = (p + S - 1) // 32 + 1
-    b = ash.bounds(g, split) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
+    b = ash.bounds(g) if split else None  # (split: chain core k's attention groups b[k] .. b[k + 1] - 1)
     o_k = A1.OBJS  # (a group's cache objects)
     nt = ash.records(S)
-    # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared)
+    rnds = (A1.SPLIT_ROUND, A1.SPLIT_ROUND | A1.SPLIT_KV) if rounds else (int(split),)  # (the sub-step's rounds)
+    # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared), then per column a second round's F_ATT
     per = (1 + slots) * OD.XB
-    act = dev.alloc("ACT", COLS * per + S * OD.XB)
+    act = dev.alloc("ACT", COLS * per + S * OD.XB + COLS * OD.XB)
+
+    def fatt(c: int, u: int) -> int:
+        return c * per if u == 0 else COLS * per + S * OD.XB + c * OD.XB
+
     for c in range(COLS):
-        k, role = c % nph, ash.role(c)
-        kr = k & 1 if half else k  # (its run of the groups)
-        tl = nt if not split or (kr if half else role == A1.ROLE_V) else 0
-        m = np.zeros(OD.META, np.int32)
-        m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (3 if half else nph + 1 if split else 2) * S
-        m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, split, S), p, int(split)
-        m[MD.M_NTAIL] = tl
-        if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
-        elif kr == 0:  # (then group g's K and V objects)
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
-        else:
-            m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[kr + 1] - b[kr]) + tl, b[kr], 1 << 20
-        if one:  # (on the first column's stream; the rows' masks and K lanes)
-            m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
-            m[MD.M_BRANCH], w, m[MD.M_ALANE] = A1.step_words(p, S)
-            m[MD.M_AMASK:MD.M_AMASK + 4] = w.view(np.int32)
-        o = c * per
-        act[o:o + 4 * OD.META] = m.view(np.uint8)
-        nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
-        nrm[:HD], nrm[HD:2 * HD] = qn * np.float32(np.log2(np.e) / 16), kn
+        k = c % nph
+        tl = nt if not split or k == nph - 1 else 0
+        for u, sp in enumerate(rnds):
+            m = np.zeros(OD.META, np.int32)
+            sw = ash.round_word(sp, c)
+            m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (3 if rounds else nph + 1 if split else 2) * S
+            m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, sw, S), p, sw
+            m[MD.M_NTAIL] = tl
+            if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
+                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
+            elif k == 0:  # (then group g's K and V objects)
+                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
+            else:
+                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
+            if one:  # (on the first column's stream; the rows' masks and K lanes)
+                m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
+                m[MD.M_BRANCH], w, m[MD.M_ALANE] = A1.step_words(p, S)
+                m[MD.M_AMASK:MD.M_AMASK + 4] = w.view(np.int32)
+            o = fatt(c, u)
+            act[o:o + 4 * OD.META] = m.view(np.uint8)
+            nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
+            nrm[:HD], nrm[HD:2 * HD] = qn * np.float32(np.log2(np.e) / 16), kn
+            for s in range(S):
+                nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
+            act[o + 4 * OD.META:o + 4 * OD.META + nrm.nbytes] = nrm.view(np.uint8)
         for s in range(S):
-            nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
-        act[o + 4 * OD.META:o + 4 * OD.META + nrm.nbytes] = nrm.view(np.uint8)
-        for s in range(S):
-            q0 = o + (1 + s) * OD.XB + 4 * OD.META
+            q0 = c * per + (1 + s) * OD.XB + 4 * OD.META
             act[q0:q0 + 2 * qc * 2 * HD] = interleave_bits(qg[c, s].reshape(-1))
     for s in range(S):
         k0 = COLS * per + s * OD.XB + 4 * OD.META
@@ -762,56 +769,74 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     dev.flush("ACT")
     ob = nph * qc * 32 * (8 if one else S) * 16  # (o of a chain's heads)
     nr = 2 * (A1.REC_V + A1.ROWS_B)  # (the relayed records' bytes at most)
-    dev.alloc("OUT", COLS * ob)
+    dev.alloc("OUT", len(rnds) * COLS * ob)
     dev.alloc("REC", COLS * nr)
     seq = Sequence(op, rolling=True)
-    for c in range(0, COLS, nph if one else 1):
-        k, role = c % nph, ash.role(c)
-        if half and k >= 2:  # (the column two to the west's stream)
-            continue
-        pk = {"packet": OD.AB_ID + ash.a_bcast.index((c, c + 2))} if half else {}
-        base, ring = dev.address("KV", c // nph * hb), dev.address("KV", kvh * hb + c // nph * rb)
-        if not split:
-            seq.fill("A", c, base, o_k * G * T)
-        else:
-            seq.fill("A", c, base + o_k * b[k] * T, o_k * (b[k + 1] - b[k]) * T, **pk)
-            if k == 0:
-                seq.fill("A", c, base + o_k * g * T, 2 * T, **pk)
-        if not split or (k if half else role == A1.ROLE_V):  # (the tail objects)
-            for t in range(nt):
-                seq.fill("A", c, ring + ((rl if t else rp) & 1) * T, T, **pk)
-        if not split and k == 0 and not one:
-            seq.fill("A", c, base + o_k * g * T, 2 * T)
-    for c in range(COLS):
-        seq.fill("X", c, dev.address("ACT", c * per), OD.XB)
-        if split:  # (the q objects of the chain's columns in order)
-            nc = 2 if half else nph
-            for c1 in range(c - c % nc, c - c % nc + nc):
-                seq.fill("X", c, dev.address("ACT", c1 * per + OD.XB), S * OD.XB)
-        else:
-            seq.fill("X", c, dev.address("ACT", c * per + OD.XB), S * OD.XB)
-        seq.fill("X", c, dev.address("ACT", COLS * per), S * OD.XB)
-    for c in range(COLS):
-        role = ash.role(c)
-        no = (ob // 2 if c & 1 else 0) if half else (ob if role == A1.ROLE_V else 0) if split else ob // nph
-        if no:
-            seq.drain("C", c, dev.address("OUT", c * ob), no)
-        rb_c = nt * {A1.ROLE_K: (1 if one else 2) * A1.REC_K, A1.ROLE_V: A1.REC_V + A1.ROWS_B, A1.ROLE_O: 0}[role]
-        if rb_c:
-            seq.drain("C", c, dev.address("REC", c * nr), rb_c)
+    def cache(u: int) -> None:
+        kh = (rnds[u] & A1.SPLIT_KV) >> 2
+        for c in range(0, COLS, nph if one else 1):
+            k, role = c % nph, ash.role(c)
+            if rounds and c >= nph:  # (the first chain's streams, for the column 4 away too)
+                continue
+            pk = {"packet": OD.AB_ID + ash.a_bcast.index((c, c + nph))} if rounds else {}
+            h = kh if rounds else c // nph
+            base, ring = dev.address("KV", h * hb), dev.address("KV", kvh * hb + h * rb)
+            if not split:
+                seq.fill("A", c, base, o_k * G * T)
+            else:
+                seq.fill("A", c, base + o_k * b[k] * T, o_k * (b[k + 1] - b[k]) * T, **pk)
+                if k == 0:
+                    seq.fill("A", c, base + o_k * g * T, 2 * T, **pk)
+            if not split or role == A1.ROLE_V:  # (the tail objects)
+                for t in range(nt):
+                    seq.fill("A", c, ring + ((rl if t else rp) & 1) * T, T, **pk)
+            if not split and k == 0 and not one:
+                seq.fill("A", c, base + o_k * g * T, 2 * T)
+
+    def inputs(u: int) -> None:
+        kh = (rnds[u] & A1.SPLIT_KV) >> 2
+        for c in range(COLS):
+            seq.fill("X", c, dev.address("ACT", fatt(c, u)), OD.XB)
+            if split:  # (the q objects of the chain's columns in order; a round: its half of the KV head's)
+                q0, nc = (kh * nph + 2 * (c // nph), 2) if rounds else (c - c % nph, nph)
+                for c1 in range(q0, q0 + nc):
+                    seq.fill("X", c, dev.address("ACT", c1 * per + OD.XB), S * OD.XB)
+            else:
+                seq.fill("X", c, dev.address("ACT", c * per + OD.XB), S * OD.XB)
+            seq.fill("X", c, dev.address("ACT", COLS * per), S * OD.XB)
+
+    def outputs(u: int) -> None:
+        for c in range(COLS):
+            role = A1.ROLE_O if ash.round_word(rnds[u], c) & A1.SPLIT_NOREC else ash.role(c)
+            no = (ob // 2 if rounds else ob) if split and c % nph == nph - 1 else 0 if split else ob // nph
+            if no:
+                seq.drain("C", c, dev.address("OUT", (u * COLS + c) * ob), no)
+            rb_c = nt * {A1.ROLE_K: (1 if one else 2) * A1.REC_K, A1.ROLE_V: A1.REC_V + A1.ROWS_B, A1.ROLE_O: 0}[role]
+            if rb_c:
+                seq.drain("C", c, dev.address("REC", c * nr), rb_c)
+
+    # (as the overlay: a second round on the same streams, its inputs and cache objects after the first's, then the
+    # outputs)
+    cache(0)
+    inputs(0)
+    if rounds:
+        inputs(1)
+        cache(1)
+    for u in range(len(rnds)):
+        outputs(u)
     seq.sync(fills=True)
     dev.dispatch(Transaction(dev, seq.words()))
     dev.fetch("OUT")
     dev.fetch("REC")
-    outs = dev.view("OUT").view(np.uint16).reshape(COLS, -1)
+    outs = dev.view("OUT").view(np.uint16).reshape(len(rnds), COLS, -1)
     recs = dev.view("REC").reshape(COLS, -1)
     for c in range(COLS):
         h, k = c // nph, c % nph
-        if half:
-            o_c = outs[c | 1, :ob // 4].reshape(2 * qc, 32, S, 8)[qc * (k & 1):qc * ((k & 1) + 1)]
+        if rounds:  # (round h: the chain of its half of the heads, its last column)
+            o_c = outs[h, nph * (k // 2) + nph - 1, :ob // 4].reshape(2 * qc, 32, S, 8)[qc * (k & 1):qc * ((k & 1) + 1)]
         else:
-            o_c = outs[c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
-                outs[c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
+            o_c = outs[0, c - k + nph - 1].reshape(nph * qc, 32, S, 8)[qc * k:qc * (k + 1)] if split else \
+                outs[0, c, :ob // (2 * nph)].reshape(qc, 32, 8 if one else S, 8)
         # the open records' rows: the ring's before p (rec: the panels' values), then the new ones
         rows = {r: (vc_s[h] if rec else vc[h])[8 * r:8 * r + 8].copy() for r in {rp, rl}}
         for s in range(S):
@@ -868,7 +893,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
     token (s1), three committed tokens (s3), or four tokens of which two are accepted (lazy: the next step replays
     them); over 104 positions by steps of two (split: from 96 positions on, the attention's chains divide their
-    caches: 9B pairs, 1B chains of 4) or of four (split4: the 35B-A3B's halves of a chain): the residual stream after every
+    caches: 9B pairs, 1B chains of 4) or of four (split4: the 35B-A3B's rounds, a KV head each): the residual stream after every
     layer and accepted token within llama.cpp's noise
     (its Q8_K activations) of its decode. The 1B's noise is ~3x the 9B's: its layer 0 against float64 math on the same
     weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's

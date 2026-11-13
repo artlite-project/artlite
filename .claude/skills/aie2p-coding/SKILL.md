@@ -266,10 +266,11 @@ Transfers the array chooses (control packets into a shim) [measured]:
 - Packets that a shim's own MM2S channel streams reach its TileControl and write its BDs, locks and task queues;
   packets from the array do not reach a shim's TileControl. So a core writes the packets (constant words from the host,
   addresses it computes) into its output stream, and they come back from DDR on the shim's MM2S. Route: the channel's
-  slave port (MM2S0 = South 3, MM2S1 = South 7) in packet mode, a slot of the packets' id on a free arbiter, master
-  Tile_Ctrl (0x3F000) in packet mode on it, header kept. aiecc numbers a shim's packet flows from arbiter 0 up: a stream
-  left on the control route's arbiter feeds TileControl its words as control packets (`moe.route.check_route` reads the
-  configuration and refuses that). A packet-switched ObjectFifo (`transport=Transport.dma(Packet(id))`) shares the
+  slave port (MM2S0 = South 3, MM2S1 = South 7) in packet mode, a slot of the packets' id on an arbiter and msel no
+  flow uses, master Tile_Ctrl (0x3F000) in packet mode enabling that msel, header kept. aiecc numbers the packet flows
+  through a shim's switch from arbiter 0 and msel 0 up (5 arbiters where several flows pass): a stream on the control
+  route's arbiter and msel feeds TileControl its words as control packets, one on the arbiter with another msel does not
+  (`moe.route.check_route` reads the configuration and refuses the first). A packet-switched ObjectFifo (`transport=Transport.dma(Packet(id))`) shares the
   channel at no measurable cost; its fills' BDs carry Enable_Packet and its id (word 2 bits 30, 23:19, above the
   address's high bits: a host patch of a BD's address keeps them, or its first data word routes as a header: a TDR).
   IRON's placer counts a PacketFlow's DMA source as a channel beside an ObjectFifo's on the same channel ("requires

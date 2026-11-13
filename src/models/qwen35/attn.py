@@ -74,14 +74,18 @@ sub-step's. The partials (m, l, y) merge west to east: a core's partial stays in
 neighbour (shared memory) has merged it into its own, and the last core emits o for the chain's heads (a token
 ObjectFifo orders each neighbour pair).
 
-A sub-step of more slots than a chain of 4 holds (``AttnShape.halves``: the 35B-A3B's 3 and 4 slots, 32 rows at most against
-a core's 16) runs on the chain's halves (``SPLIT_HALF``): both cores of a half take its two columns' heads, the first
-the first half of the groups, the second the rest (and the tails), and merge as a chain of 2. Both halves read the same
-objects, once: a chain's first two columns read the cache on fills whose packet id also reaches the memtiles of the
-two columns east of them (``decode.design``'s "Shared A objects"), which take them as if their own shims had read them. Two
-streams per KV head read ~46 GB/s, one for a whole chain ~28 (a chain of 4 in the one-pass form: S 1 +30% at 32K on the 1B),
-a stream per column ~56; a design with halves runs every sub-step from 4 groups on on them, whatever its slots: a slot's
-partials then merge in the same order in a step of any slots.
+A sub-step of more slots than a chain of 4 holds (``AttnShape.rounds``: the 35B-A3B's 3 and 4 slots, 32 rows at most against
+a core's 16) runs in two rounds, one per KV head (``SPLIT_ROUND``): in round r both chains take KV head r, the first the
+heads of the head's first two columns, the second those of the other two, each core the run of the groups its place in a
+chain has (the first chain's shims read the runs of either head on fills whose packet id also reaches the memtile of the
+column 4 away, ``decode.design``'s "Shared A objects", which takes them as if its own shim had read them), and only KV
+head r's own chain emits its records (``M_SPLIT``'s bits). A slot's row thus sees the groups in the same runs, merged in the
+same order, in a sub-step of any slots. A round's second half follows its first on the same streams (no sync between them;
+the token that orders a neighbour pair's merge also guards the y a core zeroes for its next sub-step: ``aq``). A stream per
+column reads ~56 GB/s (8 at a time), two per KV head ~46, one for a whole chain ~28 (a chain of 4 in the one-pass form: S 1
++30% at 32K on the 1B). The chain's halves for every sub-step (two runs, two streams per KV head) cost the 35B-A3B's S 1 and
+2 +1.6 ms at 32K (46.8 -> 48.3 ms at S 1); two passes of the chains over the cache (sub-steps of 2 slots) cost its S 3 and
+4 ~7-9 ms.
 
 L1: a sub-step's rows need per set ~5.3 KB (y and l fp32, scores, references, P panels) plus its Q panels (2.3 KB) and the
 rows' gates (0.5 KB a row); the sigmoid's table takes 2.1 KB (``gate_tab``). Regions the core reads rarely (the gates, the
@@ -124,7 +128,9 @@ PO = 288  # bytes of an octet's P panels of a group (4 panels)
 # state words of the main core for the gates (main_gates: its workspace's words past decode.design's of a dense design):
 # the q objects to gate, those seen, the slots, the query rows per slot, the R objects of o, those relayed
 MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = range(56, 63)
-SPLIT_CHAIN, SPLIT_HALF = 1, 2  # M_SPLIT: the chain divides the cache (0: each column over all of it); its halves do
+# M_SPLIT, bits 1:0: the chain divides the cache (0: each column over all of it), a round's chains do; bit 2 (a round):
+# its KV head; bit 3: no records (a round's other chain)
+SPLIT_CHAIN, SPLIT_ROUND, SPLIT_KV, SPLIT_NOREC = 1, 2, 4, 8
 
 
 # metadata words of an F_ATT object: decode.py's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A
@@ -137,7 +143,7 @@ SPLIT_CHAIN, SPLIT_HALF = 1, 2  # M_SPLIT: the chain divides the cache (0: each 
 # order), A_RW: the open records' rows (per tail object)
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
  A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = range(31)
-A_QA, A_HP, A_RW = 32, 36, 38  # (A_QA: up to 4 octets)
+A_KH, A_QA, A_HP, A_RW = 31, 32, 36, 38  # (A_KH: the KV head of the slots' K, V; A_QA: up to 4 octets)
 A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
 A_WORDS = 40
 A_KR, A_KN, A_KM, A_KB, A_BR, A_MK, A_LN = 40, 41, 42, 43, 44, 45, 49  # (one pass) the new K's rows, panels; the merged
@@ -431,7 +437,7 @@ __attribute__((noinline, minsize)) uint32_t {{ p }}_mask(int set, int r, int p, 
     uint32_t m = 0;
     AIE_LOOP_NO_UNROLL
     for (int q = 0; q < 4; q++) {
-{% if HALF %}
+{% if ROUNDS %}
         const int row = 4 * set + q, s = QR == {{ QC }} ? al::div_small<{{ QC }}>(row) : QR == {{ 2 * QC }} ? al::div_small<{{ 2 * QC }}>(row) : al::div_small<{{ NPH * QC }}>(row);
 {% else %}
         const int row = 4 * set + q, s = QR == {{ QC }} ? al::div_small<{{ QC }}>(row) : al::div_small<{{ NPH * QC }}>(row);
@@ -530,18 +536,20 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         st[{{ A_NXSKIP }}] = m[{{ M_SKIP }}];
         return;
     }
-    // (the column's place in its KV head's chain: its first core emits the K records, the last the V panels and rows;
-    // nc: the cores that divide the cache for the same rows, kc the core's place among them, lc: it is their last)
-    const int S = m[{{ M_NS }}], split = m[{{ M_SPLIT }}], k = col - {{ NPH }} * al::div_small<{{ NPH }}>(col);
+    // (the column's place in its chain: its first core emits the K records, the last the V panels and rows; qn: the
+    // columns whose heads a split's core takes)
+    const int S = m[{{ M_NS }}], sw = m[{{ M_SPLIT }}], split = sw & 3, k = col - {{ NPH }} * al::div_small<{{ NPH }}>(col);
     const int last = k == {{ NPH - 1 }};
-{% if HALF %}
-    const int nc = split == {{ SPLIT_HALF }} ? 2 : {{ NPH }}, kc = k & (nc - 1), lc = kc == nc - 1;
+{% if ROUNDS %}
+    const int qn = split == {{ SPLIT_ROUND }} ? 2 : {{ NPH }};
+    st[{{ A_KH }}] = split == {{ SPLIT_ROUND }} ? (sw >> 2) & 1 : al::div_small<{{ NPH }}>(col);
 {% else %}
-    const int nc = {{ NPH }}, kc = k, lc = last;
+    const int qn = {{ NPH }};
+    st[{{ A_KH }}] = al::div_small<{{ NPH }}>(col);
 {% endif %}
     st[{{ A_S }}] = S;
-    st[{{ A_QR }}] = split ? nc * {{ QC }} : {{ QC }};  // (query rows per slot: the column's heads, or the cores')
-    st[{{ A_NQ }}] = split ? nc * S : S;
+    st[{{ A_QR }}] = split ? qn * {{ QC }} : {{ QC }};  // (query rows per slot: the column's heads, or the cores')
+    st[{{ A_NQ }}] = split ? qn * S : S;
     st[{{ A_NQP }}] = 1;
     st[{{ A_NKV }}] = S;
     st[{{ A_NOBJ }}] = m[{{ M_NASKIP }}] - {{ HOLD }};
@@ -549,21 +557,20 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_SA }}] = m[{{ M_SA }}];
     st[{{ A_NTAIL }}] = m[{{ M_NTAIL }}];
     st[{{ A_I }}] = 0;
-    st[{{ A_ROLE }}] = k == 0 ? {{ ROLE_K }} : last ? {{ ROLE_V }} : {{ ROLE_O }};
+    st[{{ A_ROLE }}] = sw & {{ SPLIT_NOREC }} ? {{ ROLE_O }} : k == 0 ? {{ ROLE_K }} : last ? {{ ROLE_V }} : {{ ROLE_O }};
     st[{{ A_NKH }}] = !split && k == 0 ? {{ HOLD }} : 0;
     st[{{ A_QS }}] = 0;
     st[{{ A_KS }}] = 0;
     st[{{ A_G0 }}] = m[{{ M_G0 }}];
     st[{{ A_GATT }}] = m[{{ M_GATT }}];
     st[{{ A_GJ }}] = m[{{ M_GJ }}];
-    st[{{ A_TP }}] = split && !lc;  // (a split step: its partial to the east neighbour, which merges it; the last emits o)
-    st[{{ A_TC }}] = split && kc;
-    st[{{ A_NO }}] = 4 * S * (split ? (lc ? nc * {{ QC }} : 0) : {{ QC }});
+    st[{{ A_TP }}] = split && !last;  // (a split step: its partial to the east neighbour, which merges it; the last emits o)
+    st[{{ A_TC }}] = split && k;
+    st[{{ A_NO }}] = 4 * S * (split ? (last ? qn * {{ QC }} : 0) : {{ QC }});
 {% for w, (r, off) in at %}
     st[{{ w }}] = (int32_t)((uintptr_t){{ r }} + {{ off }});
 {% endfor %}
     al::copy<{{ 2 * HD + 64 * SMAX }}, 16>(AP(float, {{ A_NRM }}), (const float *)(x + {{ 2 * META }}));
-    al::zero<{{ 32 * (ND + 1) * SETS }}, 32>(AW(float, {{ a.y }}));  // (the q rows' staging: rows past the sub-step's 0)
 }
 
 // A main core's norm-weight object: the input objects under it
@@ -589,6 +596,9 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int i = st[{{ A_QS }}], S = st[{{ A_S }}], QR = st[{{ A_QR }}];
     st[{{ A_QS }}] = i + 1;
+    if (!i)  // (the q rows' staging, rows past the sub-step's 0: in y, which holds the core's last partial until its east
+        // neighbour has merged it, as the step's token says; abegin comes before the token)
+        al::zero<{{ 32 * (ND + 1) * SETS }}, 32>(AW(float, {{ a.y }}));
     const int kc = QR == {{ QC }} ? 0 : {{ p }}_divs(i, S), s = i - S * kc, h0 = {{ QC }} * kc;
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     const float *__restrict nrm = AP(float, {{ A_NRM }});
@@ -625,7 +635,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int s = st[{{ A_KS }}];
     st[{{ A_KS }}] = s + 1;
-    const bfloat16 *__restrict kv = x + {{ 2 * META }} + {{ 2 * HD }} * al::div_small<{{ NPH }}>(col);
+    const bfloat16 *__restrict kv = x + {{ 2 * META }} + {{ 2 * HD }} * st[{{ A_KH }}];
     const float *__restrict nrm = AP(float, {{ A_NRM }});
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * (st[{{ A_SA }}] + s);
     float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
@@ -1610,14 +1620,16 @@ class AttnShape:
         # the gates: then the core takes more rows)
         self.sub1 = slots if self.one else min(SMAX, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
         assert self.sub1 >= 1
-        # (more slots than a chain of 4 holds: its halves, each with half the rows, on two streams)
-        self.halves = not self.one and self.nph == 4 and self.sub1 < SMAX
-        self.a_bcast = tuple((c, c + 2) for c in range(COLS) if c % 4 < 2) if self.halves else ()
-        self.sub = SMAX if self.halves else self.sub1
-        self.u = 1 if self.one else -(-(slots - 1) // self.sub) + 1  # (a step's sub-steps at most)
+        # (more slots than a chain of 4 holds: two rounds, one per KV head, of both chains, each with half its heads; the
+        # first chain's shims read the round's cache for the column 4 away too)
+        self.rounds = not self.one and self.nph == 4 and self.kvh == 2 and self.sub1 < SMAX
+        self.a_bcast = tuple((c, c + 4) for c in range(COLS // 2)) if self.rounds else ()
+        self.sub = SMAX if self.rounds else self.sub1
+        # (a step's sub-steps at most, a round each: one more where a sub-step of more slots than sub1 runs in two)
+        self.u = 1 if self.one else -(-(slots - 1) // self.sub) + 1 + self.rounds
         self.rows = 8 * self.qc if self.one else self.sub1 * self.nph * self.qc  # (a sub-step's query rows at most)
         self.main_gates = self.one or self.rows > MAX_ROWS
-        assert not (self.halves and self.main_gates)  # (``_MAIN_SRC``: a chain's last column gates o)
+        assert not (self.rounds and self.main_gates)  # (``_MAIN_SRC``: a chain's last column gates o)
         self.octets = -(-self.rows // 8)
         self.sets = 2 * self.octets
         self.po = PO
@@ -1702,14 +1714,16 @@ class AttnShape:
         k = c % self.nph
         return ROLE_K if k == 0 else ROLE_V if k == self.nph - 1 else ROLE_O
 
-    def n_rel(self, c: int, split: bool, n: int) -> int:
-        """R objects of a sub-step of n slots of column c: o (split: the chain's last column's of the chain's heads),
-        then two records (the chain's first column K records, its last one V panels and rows)."""
-        role = self.role(c)
-        if split == SPLIT_HALF:
-            no = 4 * n * 2 * self.qc * (c & 1)
+    def n_rel(self, c: int, split: int, n: int) -> int:
+        """R objects of a sub-step of n slots of column c: o (split: the chain's last column's of the chain's heads, a
+        round's: of its half of them), then two records (the chain's first column K records, its last one V panels and
+        rows; a round: the KV head's own chain)."""
+        role = ROLE_O if split & SPLIT_NOREC else self.role(c)
+        last = c % self.nph == self.nph - 1
+        if split & 3 == SPLIT_ROUND:
+            no = 4 * n * 2 * self.qc * last
         else:
-            no = 32 * self.qc if self.one else 4 * n * ((self.nph * self.qc if role == ROLE_V else 0) if split else self.qc)
+            no = 32 * self.qc if self.one else 4 * n * ((self.nph * self.qc if last else 0) if split else self.qc)
         nr = self.records(n)
         k = REC_K if self.one else 2 * REC_K  # (one pass: a K record; sub-steps: its pair)
         return no + {ROLE_K: nr * k, ROLE_V: nr * (REC_V + ROWS_B), ROLE_O: 0}[role] // (2 * self.c_len)
@@ -1725,15 +1739,20 @@ class AttnShape:
         record twice when one holds both; sub-steps of one slot: one)."""
         return 2 if self.one or n > 1 else 1
 
-    def split_of(self, g: int, n: int) -> int:
-        """A sub-step's M_SPLIT: n slots in group g (``halves``: every sub-step on the chain's halves, whatever its slots,
-        so that a slot's partials merge in the same order in a step of any slots)."""
-        return 0 if not self.splits(g) else SPLIT_HALF if self.halves or n > self.sub1 else SPLIT_CHAIN
+    def split_of(self, g: int, n: int) -> tuple[int, ...]:
+        """The splits of a sub-step of n slots in group g, a round each: 0, SPLIT_CHAIN, or more slots than a chain
+        holds: ``SPLIT_ROUND`` of KV head 0, then 1 (M_SPLIT's bits less the no-records one: ``round_word``)."""
+        if not self.splits(g):
+            return (0,)
+        return (SPLIT_ROUND, SPLIT_ROUND | SPLIT_KV) if n > self.sub1 else (SPLIT_CHAIN,)
 
-    def bounds(self, g: int, split: int = SPLIT_CHAIN) -> list[int]:
-        """A split sub-step in group g: the groups of the cores, core k's from bounds[k] to bounds[k + 1] (SPLIT_HALF: of
-        each half of the chain)."""
-        G, n = g + 1, 2 if split == SPLIT_HALF else self.nph
+    def round_word(self, split: int, c: int) -> int:
+        """Column c's M_SPLIT of a sub-step's split: a round's no-records bit where c's chain is not the KV head's."""
+        return split | (SPLIT_NOREC if split & 3 == SPLIT_ROUND and c // self.nph != (split & SPLIT_KV) >> 2 else 0)
+
+    def bounds(self, g: int) -> list[int]:
+        """A split sub-step in group g: the groups of a chain's cores, core k's from bounds[k] to bounds[k + 1]."""
+        G, n = g + 1, self.nph
         assert G >= n
         return [G * k // n for k in range(n + 1)]
 
@@ -1751,8 +1770,8 @@ class AttnShape:
         v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
                  HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, PO=self.po, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps),
                  C_LEN=self.c_len, OBJ=self.a_bytes, PAIR_K=2 * REC_K, NO_OBJ=32 * self.qc,
-                 GATE_MAIN=self.main_gates, PACKED8=packed8, HALF=self.halves,
-                 SPLIT_HALF=SPLIT_HALF,
+                 GATE_MAIN=self.main_gates, PACKED8=packed8, ROUNDS=self.rounds,
+                 SPLIT_ROUND=SPLIT_ROUND, SPLIT_NOREC=SPLIT_NOREC,
                  **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k.startswith(("A_", "ROLE_", "MG_"))}))
         if self.one:
             return _ONE.render(**v) + _MAIN_ONE.render(**v)
