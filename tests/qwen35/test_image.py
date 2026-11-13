@@ -19,6 +19,7 @@ from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
+from ..models import require
 from ..moe.ref import experts
 
 S = 9280
@@ -28,8 +29,7 @@ MOE = qwen_gguf("Q4_K_M", "35B-A3B")
 @pytest.mark.parametrize("size", ["9B", "27B", "1B"])
 def test_layout(size: str) -> None:
     path = qwen_gguf("Q4_K_M", size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     img = QwenImage(g, cfg)
@@ -90,8 +90,7 @@ def test_pack_image(size: str) -> None:
     1B: down's padded K in one group): sampled tiles of every block at their places (``Region.tile``) as pack_rows
     packs their rows."""
     path = qwen_gguf("Q4_K_M", size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     img = QwenImage(g, cfg, layers=[cfg.gdn_layers[0], cfg.attention.index(True)], vocab=COLS * 64)
@@ -116,8 +115,7 @@ def test_pack_image(size: str) -> None:
 
 
 def _moe_image(layers: list[int] | None = None) -> tuple[GGUFFile, QwenConfig, QwenImage]:
-    if not os.path.exists(MOE):
-        pytest.skip(f"{MOE}: not present")
+    require(MOE)
     g = GGUFFile(MOE)
     cfg = QwenConfig.from_gguf(g)
     return g, cfg, QwenImage(g, cfg, layers=layers, vocab=None if layers is None else COLS * 64)

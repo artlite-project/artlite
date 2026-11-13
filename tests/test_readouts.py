@@ -21,6 +21,7 @@ from models.readouts import Readouts, pool, rows_of
 from .common import cached_ref, essay, model_key, to_torch
 from .llama_cpp import lib_identity, llama_embeddings
 from .models import require
+from .numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -57,9 +58,8 @@ def test_rows(loaded: tuple[str, Model, NpuModel]) -> None:
             assert torch.equal(got, want), n  # (the same row through the same LM head)
         else:  # (the prompt path's tail is a decode step, the readout's a chunk: two paths, test_rewind's KL bound;
             # Q8_0's weights: exact codes in the decode's GEMV, bfp16 panels in the prefill's GEMMs, KL 0.0095)
-            lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
             bound = 0.012 if path == qwen3_gguf("embedding-0.6B") else 0.002
-            assert got.argmax() == want.argmax() and (lw.exp() * (lw - lg)).sum() < bound, n
+            assert got.argmax() == want.argmax() and kl_rows(want, got) < bound, n
 
 
 # (mean pooling's bound where it is not 0.999: LFM3's rows 0.9990 - 0.9998 from the fp32 CPU model's, llama.cpp's 0.9997 -

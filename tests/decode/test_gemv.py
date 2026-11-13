@@ -3,7 +3,6 @@ format it reads: the C++ tile packer against the slots' ``pack_tile``, and the t
 (``mmv.MmvOperator``) against the kernels' arithmetic (``mmv.ref_tile``) and the exact product (the tiles' bf16
 scales)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -16,6 +15,7 @@ from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
 from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
+from ..models import require
 from ..numerics import bf16_round
 from ..tensors import random_tensor
 from . import mmv
@@ -188,8 +188,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
         t = random_tensor(name, 256, 2048, 4)
     else:
         path = _path(key)
-        if not os.path.exists(path):
-            pytest.skip(f"{path}: not present")
+        require(path)
         t = GGUFFile(path).tensor(name)
     assert tile_format(t.qtype) == fmt
     KC = 256 * NSB

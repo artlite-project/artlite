@@ -13,6 +13,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
 from models.sd15 import vae
 
+from ..models import require
 from ..numerics import rel_native
 
 
@@ -119,8 +120,7 @@ def test_decoder(npu: VisionDevice) -> None:
 
     from . import ref as reference
     path = os.path.join(sd15_dir(), "vae")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     ref = reference.VaeDecoder(path)
     dec = vae.Decoder(npu, ref.w, scale=ref.scale, eps=ref.EPS)
     torch.manual_seed(7)

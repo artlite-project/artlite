@@ -13,7 +13,6 @@ the NPU against ``dflash_ref.DFlash`` on the same taps, rounds of a generation.
 """
 
 import itertools
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,7 +36,7 @@ from models.tokenizer import BpeTokenizer
 from .. import np_ops
 from ..common import essays, to_torch
 from ..goldens.text import golden
-from ..models import size_gguf
+from ..models import require, size_gguf
 from ..numerics import from_bf16_bits, rel_max
 from . import dflash_ref, ref
 
@@ -48,8 +47,7 @@ NAMES = ("noise_norm", "attn_conv_in", "Qcur", "Kcur", "Vcur", "attn_conv_out", 
 
 def _files() -> tuple[str, str]:
     model = size_gguf("3.8-27B")
-    if not os.path.exists(model):
-        pytest.skip(f"no {model}")
+    require(model)
     path = qwen_dflash_of(model)
     if path is None:
         pytest.skip(f"no DFlash2 drafter of {model}")

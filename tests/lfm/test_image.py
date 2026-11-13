@@ -3,7 +3,6 @@ from the GGUF metadata, the layout of each file (every row of every matrix in ex
 channels and the KV heads' halves per column, down's K padded to whole chunks, the regions in step order, the tile
 size per file) and the packed image's tiles and norm-weight objects at their places."""
 
-import os
 import time
 
 import numpy as np
@@ -17,13 +16,14 @@ from artlite.model_config import LFM3_QUANTS, LfmConfig, lfm3_gguf
 from artlite.operators.design import COLS
 from models.lfm.image import CH, KC, LfmImage
 
+from ..models import require
+
 TILES = {"QAD-Q4_0": 9280, "Q4_K_M": 9280, "Q8_0": 9216, "BF16": 9216}
 
 
 def _gguf(quant: str) -> GGUFFile:
     path = lfm3_gguf(quant)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     return GGUFFile(path)
 
 

@@ -3,7 +3,6 @@ token slots per dispatch: the GEMV phases (normed input projections, output proj
 K groups, gate / up with silu(gate) up, down, the LM head) against the cores' numerics (``mmv.ref_rows``) and
 llama.cpp's projections of the same inputs (golden tensors of a decode run: the slots take the last S tokens)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -27,7 +26,7 @@ from ..common import essay
 from ..decode import mmv
 from ..goldens.text import Golden, golden
 from ..llama_cpp import llama_tokenize
-from ..models import size_gguf
+from ..models import require, size_gguf
 from ..moe import ref as moe_ref
 from ..numerics import bf16_round, from_bf16_bits, rel_max
 from ..operators import kmath_sim
@@ -130,8 +129,7 @@ class _Phases:
 @pytest.fixture(scope="module", params=["9B", "1B"])
 def setup(request: pytest.FixtureRequest) -> tuple[_Phases, Golden, int, int]:
     path = qwen_gguf("Q4_K_M", request.param)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     Lg, La = cfg.gdn_layers[0], cfg.attention_layers[0]
     tokens = llama_tokenize(path, essay("apple.txt"))[:T]
@@ -246,8 +244,7 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
 @pytest.fixture(scope="module", params=[4, 8])
 def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
     path = qwen_gguf("Q4_K_M", "27B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     Lg, La = cfg.gdn_layers[0], cfg.attention_layers[0]
     return _Phases(path, [Lg, La], request.param), Lg, La
@@ -603,8 +600,7 @@ def test_gdn_steps_a3b() -> None:
     """``_gdn_blocks`` on the 35B-A3B's first GDN layer (the chunkwise core of 4 slots, 4 v heads per column), random
     inputs."""
     path = size_gguf("35B-A3B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     rng = np.random.default_rng(3)
     x = bf16_round(rng.standard_normal((20, cfg.hidden_size)).astype(np.float32) * 0.02)
@@ -615,8 +611,7 @@ def test_gdn_steps_a3b() -> None:
 def test_gdn_steps_27b() -> None:
     """The same steps on the 27B's first GDN layer (6 v heads per column: 3 pairs) on random inputs."""
     path = qwen_gguf("Q4_K_M", "27B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     x = bf16_round(np.random.default_rng(2).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
     _gdn_steps(path, cfg.gdn_layers[0], x, None)
@@ -683,8 +678,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     from models.qwen35 import attn as A1
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     g = p // 32
     one = size == "3.8-27B"
@@ -907,8 +901,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     if mode in ("s7", "lazy8") and size not in ("3.8-27B", "swift"):
         pytest.skip("steps of more than 4 tokens: designs of 8 slots")
     La = QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
@@ -950,8 +943,7 @@ def test_drafts_exact(size: str) -> None:
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     layers = list(range(QwenConfig.from_gguf(g).attention_layers[0] + 1))
     P = 120
@@ -992,8 +984,7 @@ def test_moe_slice(first: int) -> None:
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf("occamy")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     layers, n = list(range(first, first + 4)), 16
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
@@ -1038,8 +1029,7 @@ def test_dense_slice(first: int) -> None:
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf("swift")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     layers, n = list(range(first, first + 4)), 16
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = golden(path, tokens, ubatch=1, layers=(first - 1, *layers), names="l_out", logits="none")
@@ -1062,8 +1052,7 @@ def test_lm_head(size: str) -> None:
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     L = QwenConfig.from_gguf(g).num_hidden_layers - 1
     tokens = llama_tokenize(path, essay("apple.txt"))[:T]
@@ -1097,8 +1086,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     from models.qwen35.overlay import CP_BYTES, QwenOverlay
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     ov = QwenOverlay(g, layers=[L], vocab=COLS * 64, max_positions=128)
     ov.load(release=False)

@@ -3,12 +3,12 @@ TTS text."""
 
 import os
 
-import pytest
-
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import lfm3a_gguf, lfm3a_mmproj
 from models.lfm3a import host as A
 from models.tokenizer import chat_prompt
+
+from ..models import require
 
 CLIPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "datasets", "librispeech")
 MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()
@@ -18,8 +18,7 @@ TEXT = "Hello there, this is a test of the speech output."
 
 def clip(name: str = "6930-75918-0001") -> str:
     path = os.path.join(CLIPS, f"{name}.wav")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing (tests/datasets/fetch_datasets.py)")
+    require(path)
     return path
 
 

@@ -12,6 +12,8 @@ from artlite.model_config import gemma_gguf
 from models.bench import FIELDS, PRINTERS, arg_parser, file_info, file_type_name, int_list, plan, result
 from models.bench import Test as BenchTest  # (not a pytest class)
 
+from .models import require
+
 
 def test_int_list() -> None:
     assert int_list("1024,2048") == [1024, 2048]
@@ -64,8 +66,7 @@ def test_file_info() -> None:
     """model_type, model_size and model_n_params as llama.cpp's (size: the GGUF's size label)."""
     assert file_type_name(2) == "Q4_0" and file_type_name(15) == "Q4_K - Medium" and file_type_name(None) == "unknown"
     path = gemma_gguf("Q4_0")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not downloaded")
+    require(path)
     info, n_vocab = file_info(path)
     assert info["model_type"] == "gemma4 7.5B Q4_0" and n_vocab == 262144
     assert (info["model_size"], info["model_n_params"]) == (4574983336, 7463013674)  # (llama-bench's)

@@ -10,6 +10,7 @@ from models.llama.tokenizer import load_tokenizer
 
 from ..common import ESSAYS_DIR, essay
 from ..llama_cpp import llama_tokenize
+from ..models import require
 
 TEXTS = [
     "Hello world, this is a test.\nNew line  two spaces",
@@ -32,8 +33,7 @@ def _texts() -> list[str]:
 @pytest.fixture(scope="module")
 def tok() -> tuple[str, object, object | None]:
     path = llama_gguf("Q4_K_M", "1B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     hf = os.path.join(os.path.dirname(llama_safetensors("1B")), "tokenizer.json")
     return path, load_tokenizer(path), load_tokenizer(path, hf) if os.path.exists(hf) else None
 

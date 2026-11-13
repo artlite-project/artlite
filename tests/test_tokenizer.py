@@ -16,6 +16,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
 from .llama_cpp import llama_tokenize
+from .models import require
 
 TEXTS = [
     "Hello world, this is a test.\nNew line  two spaces",
@@ -38,8 +39,7 @@ MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "c
 @pytest.fixture(scope="module", params=["qwen35", "qwen2", "lfm2"])
 def tok(request: pytest.FixtureRequest) -> tuple[str, object]:
     path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf()}[request.param]
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     return path, BpeTokenizer(GGUFFile(path))
 
 
@@ -91,8 +91,7 @@ def test_chat_prompt_template() -> None:
     """A template in place of the file's gets the model's variables (enable_thinking, ...), and the template's other
     variables go over them: Qwen3.8's reasoning_effort (xhigh, medium, low; another level raises)."""
     path = qwen3_gguf("0.6B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     template = "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}|{{ enable_thinking }}|{{ x }}"
     assert chat_prompt(g, MESSAGES, template=template, enable_thinking=True) == \
@@ -100,8 +99,7 @@ def test_chat_prompt_template() -> None:
     assert chat_prompt(g, MESSAGES, template=template, x=3, enable_thinking=False).endswith("|False|3")
     assert chat_prompt(g, MESSAGES, add_vision_id=True) == chat_prompt(g, MESSAGES)  # (a variable it does not use)
     path = qwen_gguf("Q4_K_M", "3.8-27B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     assert "Reasoning effort is set to xhigh" in chat_prompt(g, MESSAGES, enable_thinking=True)
     assert "Reasoning effort is set to low" in chat_prompt(g, MESSAGES, enable_thinking=True, reasoning_effort="low")
@@ -121,8 +119,7 @@ def test_lfm3_template() -> None:
     with ``preserve_thinking``, tool calls in Qwen3-Coder's XML, deferred tools left out of the system prompt): the
     prompts llama-server's ``/apply-template`` renders (llama.cpp 80d2c0c2c; its ``preserve_reasoning`` default on)."""
     path = lfm3_gguf()
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     from models.lfm.lfm import Lfm
     m = Lfm(path)
     head = "<|startoftext|><|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"

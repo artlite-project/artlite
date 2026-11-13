@@ -11,6 +11,8 @@ import pytest
 from artlite.model_config import sd15_dir
 from models.sd15.sampling import SAMPLERS, Schedule, cfg_denoiser, sample
 
+from ..models import require
+
 SIGMA_MIN, SIGMA_MAX = 0.02916716, 14.614641  # SD 1.x's sigmas at timesteps 0 and 999
 
 
@@ -27,8 +29,7 @@ def test_schedule() -> None:
 
 def test_schedule_config() -> None:
     path = os.path.join(sd15_dir(), "scheduler", "scheduler_config.json")
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     assert np.array_equal(Schedule.from_config(path).log_sigmas, Schedule().log_sigmas)
 
 

@@ -7,7 +7,6 @@ model's design, its formats with the drafter's), against ``ref.mtp_block`` on ll
 steps of S rows from position 0. The prompt's records (``QwenPrefill(draft=)``, ``draft_prefill``) against those of
 drafter steps from the same inputs."""
 
-import os
 
 import numpy as np
 import pytest
@@ -23,7 +22,7 @@ from .. import np_ops
 from ..common import essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import size_gguf
+from ..models import require, size_gguf
 from . import ref
 
 N = 100
@@ -48,8 +47,7 @@ def _files(size: str) -> tuple[str, str]:
     (the model's own, with a block)."""
     size, _, quant = size.partition("-Q")
     model = size_gguf(size)
-    if not os.path.exists(model):
-        pytest.skip(f"no {model}")
+    require(model)
     own = QwenConfig.from_gguf(GGUFFile(model)).nextn_layers
     mtp = model if own else qwen_mtp_of(model, "Q" + quant if quant else "")
     if mtp is None:

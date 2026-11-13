@@ -3,7 +3,6 @@
 block, Q / K heads in rotate-half order, the padded vocabulary, the regions in step order) and the packed image's tiles
 and norm-weight objects at their places."""
 
-import os
 
 import numpy as np
 import pytest
@@ -15,14 +14,15 @@ from artlite.model_config import LlamaConfig, llama_gguf, qwen3_gguf
 from artlite.operators.design import COLS
 from models.llama.image import KC, LlamaImage
 
+from ..models import require
+
 SIZES = {"1B": (16, 2048, 8192, 32, 64, 32.0), "3B": (28, 3072, 8192, 24, 128, 32.0),
          "8B": (32, 4096, 14336, 32, 128, 8.0)}  # layers, hidden, ffn, heads, head_dim, RoPE factor
 
 
 def _gguf(size: str, quant: str = "Q4_K_M") -> GGUFFile:
     path = llama_gguf(quant, size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     return GGUFFile(path)
 
 
@@ -46,8 +46,7 @@ def test_qwen3(name: str, tile_bytes: int, vocab: int, eos: set[int]) -> None:
     Qwen's end-of-generation tokens, the tile size of Q4_1 (16 rows) and of a file of Q8_0 alone (8 rows: the floor's
     9216 B, not 9 rows' 9792 of which 8 hold rows)."""
     path = qwen3_gguf(name)
-    if not os.path.exists(path):
-        pytest.skip(f"{path}: not present")
+    require(path)
     g = GGUFFile(path)
     cfg = LlamaConfig.from_gguf(g)
     assert cfg.neox and cfg.qk_norm and (cfg.num_hidden_layers, cfg.hidden_size, cfg.head_dim, cfg.q_per_kv) == \

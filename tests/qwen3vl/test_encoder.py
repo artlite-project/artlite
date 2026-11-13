@@ -24,7 +24,7 @@ from models.sequence import load_image
 
 from ..common import ASTRONAUT
 from ..models import require
-from ..numerics import rel
+from ..numerics import rel, rel_rows
 from . import ref as V
 from .files import MMPROJ
 
@@ -146,11 +146,6 @@ def test_pieces(npu: VisionDevice, mm: tuple, encoder: E.Encoder, monkeypatch: p
     assert np.array_equal(one(px), got)
 
 
-def _token_errors(got: np.ndarray, want: np.ndarray) -> np.ndarray:
-    """Per merged token its error relative to its norm."""
-    return np.linalg.norm(np.asarray(got, np.float64) - want, axis=1) / np.linalg.norm(want, axis=1)
-
-
 @pytest.mark.parametrize("size", [(352, 352), (512, 512), (1536, 768)], ids=["nb1", "nb2", "nb9"])
 def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
     """An image of 1, 2 and 9 bands (4608 patches: 72 key groups) against the float64 encoder per merged token: the
@@ -162,7 +157,7 @@ def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
     px = _pixels(*size)
     got = encoder(px)
     want = V.Encoder(MMPROJ).forward(Q.normalized(px, clip.mean, clip.std)).numpy()
-    e = _token_errors(got, want)
+    e = rel_rows(np.asarray(got, np.float64), want)
     print(f"{size}: {got.shape[0]} tokens, per token median {np.median(e):.4f}, p90 {np.percentile(e, 90):.4f}, max "
           f"{e.max():.3f}; sum {rel(got, want):.3f}")
     assert got.shape == want.shape and np.median(e) < 0.055 and np.percentile(e, 90) < 0.17
@@ -182,7 +177,7 @@ def test_encoder_model(mm: tuple, encoder: E.Encoder) -> None:
     pix = Q.normalized(px, clip.mean, clip.std)
     want = V.Encoder(MMPROJ).forward(pix).numpy()
     sim = V.NpuEncoder(MMPROJ).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
-    e, es = _token_errors(encoder(px), want), _token_errors(sim, want)
+    e, es = rel_rows(np.asarray(encoder(px), np.float64), want), rel_rows(np.asarray(sim, np.float64), want)
     med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
     print(f"per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f}), max {e.max():.3f} "
           f"({es.max():.3f})")
@@ -216,7 +211,7 @@ def test_tower(npu: VisionDevice, name: str) -> None:
         assert np.array_equal(enc(px), got)
         want = V.Encoder(mmproj).forward(pix).numpy()
         sim = V.NpuEncoder(mmproj).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
-        e, es = _token_errors(got, want), _token_errors(sim, want)
+        e, es = rel_rows(np.asarray(got, np.float64), want), rel_rows(np.asarray(sim, np.float64), want)
         med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
         print(f"{name} {size}: per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f})")
         assert med[0] < 1.25 * med[1] and p90[0] < 1.3 * p90[1]

@@ -183,8 +183,7 @@ def _top(a: dict) -> str:
 @pytest.mark.parametrize("name", ["d1-2b", "d3-lite", "d3-nano"])
 def test_images(name: str) -> None:
     path, mmproj = decision_gguf(name), decision_mmproj(name)
-    if not (os.path.exists(path) and os.path.exists(mmproj)):
-        pytest.skip(f"{path} or {mmproj} missing")
+    require(path, mmproj)
     bodies = image_bodies()
     args = ("--image-max-tokens", "1600") if name == "d1-2b" else ()  # (Artlite's d1 budget: its runner's)
     want = cached_ref(path, "systemone_images", (model_key(path), model_key(mmproj), json.dumps(bodies), args,
@@ -275,8 +274,7 @@ def test_omni_media(tmp_path: object) -> None:
     usage."""
     from .common import SPEECH_CLIP, video_file
     path, mmproj = decision_gguf("d1-omni"), decision_mmproj("d1-omni")
-    if not (os.path.exists(path) and os.path.exists(mmproj) and os.path.exists(SPEECH_CLIP)):
-        pytest.skip(f"{path}, {mmproj} or {SPEECH_CLIP} missing")
+    require(path, mmproj, SPEECH_CLIP)
     with open(SPEECH_CLIP, "rb") as f:
         clip = f.read()
     with open(SPEECH_CLIP.replace("0001", "0000"), "rb") as f:
