@@ -43,6 +43,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+import numpy as np
+
 from .. import _native, parallel_compile
 from ..gemm.pacing import PACE, PACE_IDLE, pace_levels
 from ..operators.base import ArtcOperator
@@ -59,6 +61,17 @@ CONFIG_S = 0.12e-3  # a ConfigureOp (~30-40 us alone: no array reset but at a pi
 # cores' programs by control packets: Llama's fitted 0.111 ms, Qwen's 0.085 ms in their own models; Gemma's model
 # 1.5-1.6x its chunks)
 GROUP = 32  # positions a chunk starts at a multiple of (whole cache groups; a model's default ``group``)
+
+
+def norm_blocks(T: int, t: int, sizes: Sequence[int]) -> list[tuple[int, int]]:
+    """A chunk of T tokens' norm blocks (first token, tokens): the largest of ``sizes`` (descending) that fit, then
+    sub-chunks of t tokens."""
+    out, a = [], 0
+    while a < T:
+        n = next((m for m in sizes if T - a >= m), t)
+        out.append((a, n))
+        a += n
+    return out
 
 
 @dataclass
@@ -83,11 +96,18 @@ class ChunkPrefill:
     MAX_T: ClassVar[int]  # the largest chunk
     MIN_TOKENS: ClassVar[int] = 1  # valid tokens of a chunk at least
     NAME: ClassVar[str]  # the library ELF's
+    KV_PAD: ClassVar[int]  # positions the overlay's KV arguments extend past the caches (its ``KV_PAD``)
+    CFG_S: ClassVar[float]  # the time model's constants (``_layer_static``): a ConfigureOp,
+    WEIGHT_S: ClassVar[float]  # a byte of a layer's weights per sub-chunk
 
     def __init__(self, overlay: Any, sizes: tuple[int, ...]):
         assert all((t % self.SUB == 0 or t in self.SMALL) and t <= self.MAX_T for t in sizes)
         self.ov, self.sizes = overlay, tuple(sorted(t for t in sizes if t <= overlay.max_positions))
         assert self.sizes, f"no chunk size within {overlay.max_positions} positions"
+        # (a library's runtime parameter has one range, its largest chunk's: the attention's P_FO streams T / pg - 1
+        # groups from it, so a chunk of sub-chunks at the caches' end slices a cache up to T - SUB positions past them:
+        # the NPU writes outside the KV buffer without the overlay's padding)
+        assert self.sizes[-1] - self.SUB <= self.KV_PAD, (self.sizes[-1], self.SUB, self.KV_PAD)
         self.cfg, self.img = overlay.cfg, overlay.image
         self.H = self.cfg.hidden_size
         self.group = GROUP
@@ -100,6 +120,7 @@ class ChunkPrefill:
         self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
         self._items: dict[int | tuple[str, int], list] = {}
+        self._static_s: dict[tuple[int, float], float] = {}  # (``_layer_static`` by layer and sub-chunks)
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
         self.pace: int | None = None  # (the PACE word, once resolved: ``pace_ready``)
@@ -202,6 +223,27 @@ class ChunkPrefill:
     def _buffers(self) -> dict[str, Any]:
         """The device buffers the items address by name: the overlay's (the prefill's own among them)."""
         return self.ov.dev.buffers
+
+    def _stage_px(self, x: np.ndarray, T: int, dtype: type, *, zero: np.ndarray | None = None) -> None:
+        """The chunk's input: x (n, hidden) as the first rows of the residual stream PX in ``dtype`` (``bfloat16`` or
+        ``np.float32``), the rows to T zero (and those at the indices ``zero``), flushed to the device."""
+        dev, H, n = self.ov.dev, self.H, x.shape[0]
+        size = np.dtype(dtype).itemsize
+        px = dev.view("PX")[:size * T * H].view(dtype).reshape(T, H)
+        px[:n] = np.asarray(x, np.float32)
+        px[n:] = 0
+        if zero is not None:
+            px[zero] = 0
+        dev.flush("PX", 0, size * T * H)
+
+    def _px_rows(self, i: int, n: int, dtype: type) -> np.ndarray:
+        """Rows i .. i + n - 1 (n, hidden) fp32 of the residual stream PX the last chunk left (``dtype``: ``bfloat16`` or
+        ``np.float32``, as ``_stage_px``)."""
+        dev, H = self.ov.dev, self.H
+        size = np.dtype(dtype).itemsize
+        dev.fetch("PX", size * i * H, size * n * H)
+        rows = dev.view("PX")[size * i * H:size * (i + n) * H].copy()
+        return rows.view(dtype).astype(np.float32).reshape(n, H)
 
     def bind(self) -> ChunkPrefill:
         """Allocate the prefill's buffers on the (loaded) overlay's device, write the static ones."""
@@ -401,6 +443,19 @@ class ChunkPrefill:
     def layer_seconds(self, L: int, p0: int, S: int = 1) -> float:
         """Estimated time of layer L of a chunk of S sub-chunks at position p0."""
         raise NotImplementedError
+
+    def _phases(self, L: int) -> tuple[str, ...]:
+        """The GEMM phases (image regions) of layer L."""
+        raise NotImplementedError
+
+    def _layer_static(self, L: int, S: float) -> float:
+        """``layer_seconds`` without the attention's: the GEMMs by the bytes of their weights (the norms and the prep
+        included), ``CFG_S`` per ConfigureOp (cached: the planner asks for every layer and size)."""
+        key = (L, S)
+        if key not in self._static_s:
+            wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
+            self._static_s[key] = S * self.WEIGHT_S * wbytes + self.CFG_S * self.layer_configs(L)
+        return self._static_s[key]
 
     def layer_configs(self, L: int) -> int:
         """ConfigureOps of layer L (its distinct operators)."""

@@ -41,11 +41,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from artlite.operators.design import COLS
+from artlite.operators.design import COLS, MAX_BD_STEP_WORDS
 from artlite.operators.util import arg_bytes
 from artlite.prefill import attn as PA
 from artlite.prefill import gemm as PG
-from artlite.prefill.chunks import ChunkPrefill
+from artlite.prefill.chunks import ChunkPrefill, norm_blocks
 from artlite.prefill.norm import ResidualNormOperator, residual_params
 
 from . import conv as CV
@@ -60,7 +60,8 @@ BIG = 1024  # the sub-chunk of the chunks made of them (out / o, gate_up, down o
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
 NORM_SIZES = (1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item; those whose
 # down parts lie within D_STRIDE)
-D_STRIDE = 1 << 21  # bf16 between a norm block's down parts at most (a shim BD dimension's step: 2^20 words)
+D_STRIDE = 2 * MAX_BD_STEP_WORDS  # bf16 between a norm block's down parts at most (a shim BD dimension's step;
+# ``ResidualNormOperator`` refuses more)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
 MAX_T = SIZES[-1]
@@ -77,12 +78,7 @@ def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[
               ) -> PG.PhasePlan:
     """A GEMM phase of the prefill (``prefill.gemm.plan_phase``): gate / up with the SiLU epilogue, down in K parts of
     ``DOWN_CHUNKS`` chunks."""
-    return PG.plan_phase(img, region, T, pitch=pitch, ops=ops, act="silu",
-                         k_part=DOWN_CHUNKS if region.name == "down" else 0)
-
-
-def _key(lay: PG.Layout) -> tuple:
-    return lay.pitch, tuple(sorted(lay.off.items()))
+    return PG.plan_down_parts(img, region, T, pitch=pitch, ops=ops, act="silu", down_chunks=DOWN_CHUNKS)
 
 
 @dataclass
@@ -104,7 +100,8 @@ class LfmPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches); ``run``
     runs one."""
 
-    SUB, SMALL, MAX_T, NAME = SUB, SMALL, MAX_T, "lfm_prefill"
+    SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "lfm_prefill", KV_PAD
+    CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
     MIN_TOKENS = CV.WIDTH - 1
 
     def __init__(self, overlay: LfmOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = True):
@@ -137,7 +134,6 @@ class LfmPrefill(ChunkPrefill):
                                              swa=self.win[k], kv0=self.kv0[k], causal=k != "full" or not self.nc)
                      for k in kinds for T in self.sizes}
         self.conv = {T: ConvPrefillOperator(T=T, pitch=self.ops[self._t(T)].pitch["in"]) for T in self.sizes}
-        self._static_s: dict[tuple[int, float], float] = {}
         self._rows()
         self._library()
 
@@ -179,8 +175,8 @@ class LfmPrefill(ChunkPrefill):
         for L in self.kv_layers:
             k, lay = ov.kind(L), plans[(L, "qkv")].layout
             for pt in {self._pt(T) for T in self.sizes if self._t(T) == t}:
-                if (k, _key(lay), pt) not in preps:
-                    preps[(k, _key(lay), pt)] = PA.PrepOperator(
+                if (k, lay.key, pt) not in preps:
+                    preps[(k, lay.key, pt)] = PA.PrepOperator(
                         T=pt, shape=self.shape, layout=lay, kv_bytes=self.kv_bytes[k], cs_positions=self.cs_rows,
                         kv_pad=self.prep_pad, norm=True, eps=eps, kv0=self.kv0[k])
         return _Ops(plans, qt, pitch, dp, f_part, n_in, norms, preps)
@@ -197,16 +193,6 @@ class LfmPrefill(ChunkPrefill):
             return self._norm_ops[key]
 
         return norm(1), norm(2)
-
-    @staticmethod
-    def _blocks(T: int, t: int, o: _Ops) -> list[tuple[int, int]]:
-        """A chunk's norm blocks (first token, tokens): the largest of NORM_SIZES that fit, then sub-chunks of t tokens."""
-        out, a = [], 0
-        while a < T:
-            n = next((m for m in NORM_SIZES if m in o.norms and T - a >= m), t)
-            out.append((a, n))
-            a += n
-        return out
 
     # ------------------------------------------------------------------
     # The runlists
@@ -240,7 +226,7 @@ class LfmPrefill(ChunkPrefill):
 
     def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
         """(the sub-chunks of ``_t``: a size below SUB one of its own operators; the input projections in items of
-        ``qt`` tokens, the preps in blocks of ``_pt``, the norms in blocks of ``_blocks``)"""
+        ``qt`` tokens, the preps in blocks of ``_pt``, the norms in blocks of ``norm_blocks``)"""
         assert not packed and not tree, "LFM3: no packed chunks yet"
         t = self._t(T)
         o, S, qt, pt = self.ops[t], T // t, self.ops[t].qt, self._pt(T)
@@ -251,7 +237,7 @@ class LfmPrefill(ChunkPrefill):
 
         ry = 2 * COLS * o.d_pitch  # (bytes per token of Y and F at these operators' pitch: a norm block's rows)
         # norm blocks; F per block [part][its tokens], then the down GEMMs' spill (their C rows past t tokens)
-        blocks = self._blocks(T, t, o)
+        blocks = norm_blocks(T, t, [m for m in NORM_SIZES if m in o.norms])
         spill = o.f_part - t * ry
         f_base = list(itertools.accumulate((2 * nt * ry + spill for _, nt in blocks), initial=0))
 
@@ -274,7 +260,7 @@ class LfmPrefill(ChunkPrefill):
                 h0 = ov.conv_reg[(L, 0)]
                 rl.append((cv, sl("G", 0, cv, i=0), f"ACT[{h0}:{h0 + arg_bytes(cv, 1)}]", sl("A", 0, cv, i=2)))
             else:
-                prep, attn = o.preps[(kind, _key(plan.layout), pt)], self.attn[(kind, T)]
+                prep, attn = o.preps[(kind, plan.layout.key, pt)], self.attn[(kind, T)]
                 kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
                 gb = pt // s.pg * s.group  # (a block's cache groups)
                 cs = "CSS" if kind == "swa" else "CSF"
@@ -366,7 +352,7 @@ class LfmPrefill(ChunkPrefill):
         n - 1 (the caches and conv histories hold the positions before). Leaves the attention layers' K / V of the
         positions in the caches and the conv histories at p0 + n. A non-causal model's prompt: at p0 0 (zero
         histories), ``sets`` its bounds (``NpuModel.outputs``; default (n,): every token sees every token)."""
-        n, dev, H = x.shape[0], self.ov.dev, self.H
+        n, dev = x.shape[0], self.ov.dev
         T = self._size(n, p0, T)
         assert n >= self.MIN_TOKENS, n
         if self.nc:
@@ -377,10 +363,7 @@ class LfmPrefill(ChunkPrefill):
             dev.flush("SEG", 0, seg.size)
         else:
             assert sets is None, "a causal model's prompt sees what is before it"
-        px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
-        px[:n] = x
-        px[n:] = 0
-        dev.flush("PX", 0, 4 * T * H)
+        self._stage_px(x, T, np.float32)
         self.ov.conv_base(p0)
         self._launch(T, p0, self.params(T, p0, n, sets or ()))
         self.ov.conv_at(p0 + n)
@@ -389,9 +372,7 @@ class LfmPrefill(ChunkPrefill):
     def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of the last chunk's output residual (the LM head's input before its
         norm: ``LfmOverlay.logits_of``)."""
-        H, dev = self.H, self.ov.dev
-        dev.fetch("PX", 4 * i * H, 4 * n * H)
-        return dev.view("PX")[4 * i * H:4 * (i + n) * H].view(np.float32).reshape(n, H).copy()
+        return self._px_rows(i, n, np.float32)
 
     # ------------------------------------------------------------------
     # Time estimates
@@ -411,13 +392,6 @@ class LfmPrefill(ChunkPrefill):
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
         return self._layer_static(L, S) + self.attention_seconds(L, p0, S)
-
-    def _layer_static(self, L: int, S: float) -> float:
-        key = (L, S)
-        if key not in self._static_s:
-            wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
-            self._static_s[key] = S * WEIGHT_S * wbytes + CFG_S * self.layer_configs(L)
-        return self._static_s[key]
 
     def layer_configs(self, L: int) -> int:
         """(its GEMM objects, the operator (conv, or prep and attention), the norms)"""

@@ -46,7 +46,7 @@ from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
 from artlite.prefill import attn as PA
 from artlite.prefill import gemm as PG
-from artlite.prefill.chunks import ChunkPrefill
+from artlite.prefill.chunks import ChunkPrefill, norm_blocks
 from artlite.prefill.norm import PrefillNormOperator
 
 from .overlay import KV_PAD, LlamaOverlay
@@ -72,17 +72,10 @@ RING_MIN = 1024  # the smallest packed chunk with a ring attention design (at 51
 # half the ConfigureOps per token of 2048-token chunks)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
 MAX_T = SIZES[-1]
-# (a library's runtime parameter has one range, its largest chunk's: the attention's P_FO streams MAX_T / pg - 1 groups
-# from it, so a smaller chunk at the caches' end needs KV_PAD past them)
-assert MAX_T - SMALL[0] <= KV_PAD
 PHASES = ("qkv", "o", "gate_up", "down")
 NORMS = ("o", "d")  # a layer's residual adds (after o, after down)
 DOWN_CHUNKS = 4  # K chunks per down part (1B / 3B: 2 parts of 4; each part's A strip stays in the memtile, each sums 64
 # k-tiles in its bf16 C tile; the norm adds the parts in fp32)
-
-
-def _key(lay: PG.Layout) -> tuple:
-    return lay.pitch, tuple(sorted(lay.off.items()))
 
 
 def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[str, object] | None = None,
@@ -124,7 +117,8 @@ class LlamaPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches and
     of whole cache groups); ``run`` runs one."""
 
-    SUB, SMALL, MAX_T, NAME = SUB, SMALL, MAX_T, "llama_prefill"
+    SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "llama_prefill", KV_PAD
+    CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
     def __init__(self, overlay: LlamaOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = False,
                  pack: bool = False):
@@ -145,7 +139,6 @@ class LlamaPrefill(ChunkPrefill):
         self._out_pitch = self.kh if self.kh != ov.H else 0
         self.cs_rows = ov.max_positions + MAX_T
         self.pad = KV_PAD // s.pg * s.group  # (the KV arguments past a layer's caches: the overlay's padding)
-        self._static_s: dict[tuple[int, float], float] = {}
         self._norm_ops: dict[tuple, PrefillNormOperator] = {}  # (one object per distinct norm)
         self._k_parts: dict[tuple, int] = {}  # (the output projections' K parts per region shape: plan_gemm)
         self._starts: dict[int, list[int]] = {}  # (per chunk size: its layers' first items, ``_layer_starts``)
@@ -192,8 +185,8 @@ class LlamaPrefill(ChunkPrefill):
         for L in self.layers:
             lay = plans[(L, "qkv")].layout
             for pt in {self._pt(T) for T in self.sizes if self._t(T) == t}:
-                if (_key(lay), pt) not in preps:
-                    preps[(_key(lay), pt)] = PA.PrepOperator(T=pt, shape=self.shape, layout=lay, kv_bytes=ov.kv_bytes,
+                if (lay.key, pt) not in preps:
+                    preps[(lay.key, pt)] = PA.PrepOperator(T=pt, shape=self.shape, layout=lay, kv_bytes=ov.kv_bytes,
                                                              cs_positions=self.cs_rows, kv_pad=self.pad,
                                                              norm=cfg.qk_norm, eps=cfg.rms_norm_eps)
         o = _Ops(plans, qt, pitch, dp, parts, f_part,
@@ -228,16 +221,6 @@ class LlamaPrefill(ChunkPrefill):
         """A norm block's cores: half the columns for short blocks (in-process A/B at T = 64 / 128: 4 faster than 2 and
         than 8)."""
         return 4 if n <= 256 else COLS
-
-    @staticmethod
-    def _blocks(T: int, t: int, o: _Ops) -> list[tuple[int, int]]:
-        """A chunk's norm blocks (first token, tokens): the largest of NORM_SIZES that fit, then sub-chunks of t tokens."""
-        out, a = [], 0
-        while a < T:
-            n = next((m for m in NORM_SIZES if m in o.norms and T - a >= m), t)
-            out.append((a, n))
-            a += n
-        return out
 
     # ------------------------------------------------------------------
     # The runlists
@@ -289,7 +272,7 @@ class LlamaPrefill(ChunkPrefill):
         ry = 2 * COLS * o.d_pitch  # (bytes per token of Y and F at these operators' pitch: a norm block's rows)
         rg = 2 * COLS * o.pitch  # (of G: a prep block's)
         # norm blocks; F per block [part][its tokens], then the down GEMMs' spill (their C rows past t tokens)
-        blocks = self._blocks(S * t, t, o)
+        blocks = norm_blocks(S * t, t, [m for m in NORM_SIZES if m in o.norms])
         spill = o.f_part - t * ry
         f_base = list(itertools.accumulate((P * nt * ry + spill for _, nt in blocks), initial=0))
 
@@ -306,7 +289,7 @@ class LlamaPrefill(ChunkPrefill):
             rl += [(g.op, sl("PXN", j * qt * rb["PXN"], g.op, i=0), self._w(g), sl("G", j * qt * rg, g.op, i=2))
                    for g in o.plans[(L, "qkv")].gemms for j in range(S * t // qt)]
             pt = self._pt(S * t)  # (the prep's blocks of the chunk)
-            prep = o.preps[(_key(o.plans[(L, "qkv")].layout), pt)]
+            prep = o.preps[(o.plans[(L, "qkv")].layout.key, pt)]
             attn = (self.rattn if ring else self.pattn if packed else self.attn)[S * t]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
             pg = pt // s.pg * s.group
@@ -381,12 +364,8 @@ class LlamaPrefill(ChunkPrefill):
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches hold the positions before). Leaves the layers' K / V of the positions in the caches and the
         last layer's output in PX (``hidden``)."""
-        n, dev, H = x.shape[0], self.ov.dev, self.H
-        T = self._size(n, p0, T)
-        px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
-        px[:n] = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
-        px[n:] = 0
-        dev.flush("PX", 0, 2 * T * H)
+        T = self._size(x.shape[0], p0, T)
+        self._stage_px(x, T, bfloat16)
         self._launch(T, p0, self.params(T, p0))
 
     def run_packed(self, x: np.ndarray, p0: int, pos: np.ndarray, lo: np.ndarray, T: int = 0, lead: int = 0) -> None:
@@ -396,15 +375,12 @@ class LlamaPrefill(ChunkPrefill):
         (segments of up to ``PACK_SPAN`` tokens). ``lead`` (0 or ``self.lead``): x's first rows a prompt at p0 that every
         segment after it sees too (their own segment; the caches then hold it as a sequence). Leaves the last layer's
         output rows in PX (``hidden``); the caches hold no sequence after p0 + lead."""
-        n, dev, H, hd = x.shape[0], self.ov.dev, self.H, self.shape.hd
+        n, dev, hd = x.shape[0], self.ov.dev, self.shape.hd
         T = T or next(t for t in self.pack_sizes if t >= n)
         self._size(n, p0, T)
         assert ((np.arange(n) - lo) < PACK_SPAN).all() and (lo <= np.arange(n)).all(), "segments of PACK_SPAN tokens"
         assert lead in (0, self.lead) and (lo[:lead] == 0).all() and (lo[lead:] >= lead).all(), "a lead of a group"
-        px = dev.view("PX")[:2 * T * H].view(np.uint16).reshape(T, H)
-        px[:n] = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
-        px[n:] = 0
-        dev.flush("PX", 0, 2 * T * H)
+        self._stage_px(x, T, bfloat16)
         R = self.ov.max_positions  # (the chunk's cos / sin rows past the text positions'; padding: a row of its own)
         rows = PA.cs_rows(self.cfg.rope_inv_freq(), np.concatenate([pos, p0 + np.arange(n, T)]))
         dev.view("CS")[4 * hd * R:4 * hd * (R + T)] = rows.view(np.uint8).reshape(-1)
@@ -425,10 +401,7 @@ class LlamaPrefill(ChunkPrefill):
     def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32; the LM head's input
         before its norm)."""
-        H, dev = self.H, self.ov.dev
-        dev.fetch("PX", 2 * i * H, 2 * n * H)
-        rows = dev.view("PX")[2 * i * H:2 * (i + n) * H].view(np.int16).copy()
-        return np.ascontiguousarray(rows).view(bfloat16).astype(np.float32).reshape(n, H)
+        return self._px_rows(i, n, bfloat16)
 
     # ------------------------------------------------------------------
     # Time estimates
@@ -458,13 +431,8 @@ class LlamaPrefill(ChunkPrefill):
         S = self.subs(T)
         return sum(self._layer_static(L, S) + self.attention_seconds(p0, S, packed=True) for L in self.layers)
 
-    def _layer_static(self, L: int, S: float) -> float:
-        """(``layer_seconds`` but the attention's; cached: the planner asks for every layer and size)"""
-        key = (L, S)
-        if key not in self._static_s:
-            wbytes = sum(self.img.region(L, name).nbytes for name in PHASES)
-            self._static_s[key] = S * WEIGHT_S * wbytes + CFG_S * self.layer_configs(L)
-        return self._static_s[key]
+    def _phases(self, L: int) -> tuple[str, ...]:
+        return PHASES
 
     def layer_configs(self, L: int) -> int:
         """(its GEMM objects, the prep and attention, the norms)"""

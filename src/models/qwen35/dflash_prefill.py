@@ -41,7 +41,7 @@ from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import block_values
 from artlite.operators.chain import chained_fill
-from artlite.operators.design import COLS
+from artlite.operators.design import COLS, MAX_BD_ITER
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.util import Attr, arg_bytes
 from artlite.prefill import gemm as PG
@@ -64,7 +64,7 @@ class DFlashPrepOperator(ArtcOperator):
     pfx = kernel_prefix("dfp")
 
     def __init__(self, *, T: int, layout: PG.Layout, hb: int, obj: int, eps: float):
-        assert T % 32 == 0 and T // 8 <= 64 and {"k", "v"} <= set(layout.off)
+        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER and {"k", "v"} <= set(layout.off)
         self.T, self.layout, self.hb, self.obj, self.eps = T, layout, hb, obj, eps
         super().__init__()
 
@@ -183,7 +183,7 @@ class DFlashPrefill:
         assert fc.parts == self.n, "fc in a K part per tap"
         kv = {L: PG.plan_phase(img, img.ikv[L], t, pitch=self.pitch, ops=pf._gemms) for L in range(d.cfg.layers)}
         fp = max(arg_bytes(g.op, 2) for g in fc.gemms)
-        prep = {_key(p.layout): DFlashPrepOperator(T=t, layout=p.layout, hb=d.ring_bytes, obj=d.T, eps=eps) for p in kv.values()}
+        prep = {p.layout.key: DFlashPrepOperator(T=t, layout=p.layout, hb=d.ring_bytes, obj=d.T, eps=eps) for p in kv.values()}
         return SimpleNamespace(fc=fc, kv=kv, f_part=fp, prep=prep,
                                tap=[PrefillNormOperator(T=t, add=False, E=H, eps=eps, raw=True, out_pitch=self.n * H, out_col=i * H)
                                     for i in range(self.n)],
@@ -230,7 +230,7 @@ class DFlashPrefill:
         for L in range(d.cfg.layers):
             plan = o.kv[L]
             rl += [(g.op, tok("FPN", j, g.op, i=0), self._w(g), tok("FG", j, g.op, i=2, row=g_rb)) for g in plan.gemms for j in range(S)]
-            prep = o.prep[_key(plan.layout)]
+            prep = o.prep[plan.layout.key]
             rg, kv0 = t // POS_PER_GROUP * d.T, d.ring_off + L * kb
             rl += [(prep, tok("FG", j, prep, i=0, row=g_rb), sl("FCS", j * t * 2 * 2 * HD, prep, i=1), self._nrm(L),
                     f"FKV[{kv0 + j * rg}:{kv0 + j * rg + kb}]") for j in range(S)]
@@ -308,10 +308,6 @@ class DFlashPrefill:
         d = self.d
         wbytes = d.image.region(-2, "fc").nbytes + sum(d.image.ikv[L].nbytes for L in range(d.cfg.layers))
         return Ss * (weight_s * wbytes + (self.n + 2 * d.cfg.layers) * gemm_s + 2 * (self.n + 1) * norm_s * self.H + prep_s * COLS) + 12 * cfg_s
-
-
-def _key(lay: PG.Layout) -> tuple:
-    return (lay.pitch, tuple(sorted(lay.off.items())))
 
 
 __all__ = ["DFlashPrefill", "DFlashPrepOperator"]

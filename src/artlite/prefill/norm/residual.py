@@ -11,9 +11,10 @@ from ml_dtypes import bfloat16
 
 from ...operators import templating
 from ...operators.base import ArgSpec, ArtcOperator
-from ...operators.design import COLS, stream_walk
+from ...operators.design import COLS, MAX_BD_STEP_WORDS, stream_walk
 from ...operators.kernel_source import kernel_prefix
 from ...operators.util import Attr, bf16_value, regions
+from ...txn import HardwareLimitError
 
 MODES = ("in", "post", "plain")
 RCH = 16  # chunks per row (ResidualNormOperator: E / 16 columns each, 160 for E = 2560, 128 for 2048)
@@ -58,6 +59,9 @@ class ResidualNormOperator(ArtcOperator):
         assert self.d_pitch >= E // COLS
         self.deltas = deltas if mode != "in" else 0
         self.d_stride = d_stride or T * COLS * self.d_pitch
+        if self.deltas > 1 and self.d_stride > 2 * MAX_BD_STEP_WORDS:  # (the deltas' dimension: bf16 elements, 2 per word)
+            raise HardwareLimitError(f"ResidualNormOperator: deltas {self.d_stride} bf16 apart: a shim BD dimension steps "
+                                     f"at most {MAX_BD_STEP_WORDS} words (smaller blocks of tokens)")
         super().__init__()
 
     def workspace(self) -> dict[str, int]:

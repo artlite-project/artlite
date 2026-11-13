@@ -42,6 +42,9 @@ from . import conv as CV
 
 P_CN = "lc_n"  # the chunk's valid tokens (its last 6 rows of bx: the history the decode continues from)
 ROW = 3 * CV.CH  # a column's G row: [B | C | x]
+GROUP = 8  # tokens of a group
+KEEP = CV.WIDTH - 1  # rows of bx the window keeps before a group (the history the decode continues from)
+WIN = KEEP + GROUP  # rows of the window
 
 _SRC = templating.load("models/lfm/conv_prefill.cc.jinja")
 
@@ -59,7 +62,7 @@ class ConvPrefillOperator(ArtcOperator):
         super().__init__()
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, CH=CV.CH, ROW=ROW, XPAY=XPAY // 2)
+        return _SRC.render(p=self.p, CH=CV.CH, ROW=ROW, XPAY=XPAY // 2, KEEP=KEEP, WIDTH=CV.WIDTH)
 
     @property
     def n_g(self) -> int:
@@ -88,10 +91,10 @@ class ConvPrefillOperator(ArtcOperator):
         r_ty = np.ndarray[(3 * XPAY // 2,), bf]
         g_ty = np.ndarray[(8 * ROW,), bf]
         o_ty = np.ndarray[(CH * 8 * 9 // 16,), bf]
-        h_ty = np.ndarray[(6 * CH,), bf]
+        h_ty = np.ndarray[(KEEP * CH,), bf]
         st_ty = np.ndarray[(16,), np.dtype[np.int32]]
-        k_init = Kernel(f"{p}_cinit", "kernel.o", [r_ty, np.ndarray[(14 * CH,), bf], st_ty, np.int32])
-        k_grp = Kernel(f"{p}_cgrp", "kernel.o", [g_ty, r_ty, np.ndarray[(14 * CH,), bf],
+        k_init = Kernel(f"{p}_cinit", "kernel.o", [r_ty, np.ndarray[(WIN * CH,), bf], st_ty, np.int32])
+        k_grp = Kernel(f"{p}_cgrp", "kernel.o", [g_ty, r_ty, np.ndarray[(WIN * CH,), bf],
                                                 np.ndarray[(8 * CH,), np.dtype[np.float32]], h_ty, o_ty, st_ty])
         p_n = ScratchpadParameter(P_CN, np.int32)
         rf = [ObjectFifo(r_ty, name=f"lc_r{c}", depth=1) for c in range(COLS)]
@@ -114,7 +117,7 @@ class ConvPrefillOperator(ArtcOperator):
                 r_f.release(1)
 
         workers = [Worker(core, [rf[c].cons(), gf[c].cons(), of[c].prod(), hf[c].prod(), k_init, k_grp,
-                                 Buffer(np.ndarray[(14 * CH,), bf], name=f"lc_win{c}"),
+                                 Buffer(np.ndarray[(WIN * CH,), bf], name=f"lc_win{c}"),
                                  Buffer(np.ndarray[(8 * CH,), np.dtype[np.float32]], name=f"lc_yt{c}"),
                                  Buffer(st_ty, name=f"lc_st{c}", initial_value=np.zeros(16, np.int32)), p_n],
                           tile=Tile(c, 2), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
@@ -134,7 +137,7 @@ class ConvPrefillOperator(ArtcOperator):
                            group=tg)
                 oh[c].drain(A, TensorAccessPattern((n_a,), CH * 8 * 9 // 16 * c, [1, 1, ng, CH * 8 * 9 // 16],
                                                    [0, 0, pa, 1]), group=tg, wait=True)
-                hh[c].drain(H, TensorAccessPattern((n_h,), rb * c + CV.payload(2) // 2, [1, 1, 1, 6 * CH], [0, 0, 0, 1]),
+                hh[c].drain(H, TensorAccessPattern((n_h,), rb * c + CV.payload(2) // 2, [1, 1, 1, KEEP * CH], [0, 0, 0, 1]),
                             group=tg, wait=True)
             tg.finish()
 

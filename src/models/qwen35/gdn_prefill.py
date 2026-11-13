@@ -60,7 +60,7 @@ from artlite.model_config import QwenConfig
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.chain import ChainPart, chained_fill
-from artlite.operators.design import COLS
+from artlite.operators.design import COLS, MAX_BD_ITER
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.util import Attr, bf16_hilo, regions
 from artlite.prefill.gemm import Layout
@@ -167,7 +167,7 @@ class GdnPrepOperator(ArtcOperator):
     pfx = kernel_prefix("gdp")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False, tree: bool = False):
-        assert T % C == 0 and T // 8 <= 64 and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
+        assert T % C == 0 and T // 8 <= MAX_BD_ITER and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
         self.T, self.cfg, self.layout, self.pack, self.tree = T, cfg, layout, pack, tree
         self.sh = GD.GdnShape(cfg)
         self.hc = self.sh.hc
@@ -340,7 +340,7 @@ class GdnScanOperator(ArtcOperator):
     STACK = 3072
     STACK_PACK = 3072
     CV_ROWS = 16  # rows of CV read (the v quarter's conv state: [16][32])
-    RUN = 64 * C  # tokens per BD of the v rows and o (a BD iterates at most 64 times)
+    RUN = MAX_BD_ITER * C  # tokens per BD of the v rows and o (a BD iterates at most MAX_BD_ITER times)
     pfx = kernel_prefix("gdsc")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = (),
@@ -352,7 +352,7 @@ class GdnScanOperator(ArtcOperator):
         segment's first three tokens' v convs from its first token on."""
         self.sub = sub or T
         self.pack, self.tree = pack, tree
-        assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0 and T // self.sub <= 64
+        assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0 and T // self.sub <= MAX_BD_ITER
         assert T <= 4 * self.RUN, "the v rows and o in at most four runs (a round's BDs: 13 of a shim's 16)"
         self.T, self.cfg, self.layout = T, cfg, layout
         self.ablate = tuple(ablate)
@@ -546,7 +546,7 @@ class GdnOutOperator(ArtcOperator):
     pfx = kernel_prefix("gdo")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, hslot: int, cs_off: int, gc_rows: int = 0):
-        assert T % 32 == 0 and T // 8 <= 64
+        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER
         self.T, self.cfg, self.layout, self.hslot, self.cs_off = T, cfg, layout, hslot, cs_off
         self.gc_rows = gc_rows or T
         self.sh = GD.GdnShape(cfg)

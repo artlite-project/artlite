@@ -51,7 +51,7 @@ from artlite.model_config import GemmaConfig
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.chain import ChainPart, chained_fill
-from artlite.operators.design import COLS, range32, stream_walk
+from artlite.operators.design import COLS, MAX_BD_ITER, range32, stream_walk
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.l1_layout import pin_l1_buffers
 from artlite.operators.util import Attr, regions
@@ -160,7 +160,7 @@ class GemmaPrepOperator(ArtcOperator):
         """``kp``: the cache's K panels per record (2: hi + lo, 1: single)."""
         assert cfg.num_attention_heads == COLS and all(k == COLS // QH for k in cfg.kv_heads)
         self.kind = kind_of(cfg, hd, kp)
-        assert T % 32 == 0 and T // 8 <= 64 and {"q", "kv"} <= set(layout.off)
+        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER and {"q", "kv"} <= set(layout.off)
         self.T, self.cfg, self.layout, self.kv_bytes, self.cs_positions = T, cfg, layout, kv_bytes, cs_positions
         super().__init__()
 
@@ -329,7 +329,7 @@ class GemmaAttnOperator(ArtcOperator):
         self.qb = 2 if self.kind.swa else 1
         self.pq = 32 * self.qb  # queries per pass
         self.n_pass = -(-T // self.pq)  # (a last pass past T: its queries' panels and outputs in the buffers' padding)
-        assert T % 32 == 0 and self.n_pass <= 64
+        assert T % 32 == 0 and self.n_pass <= MAX_BD_ITER
         self.wg = WINDOW_GROUPS + self.qb - 1  # (the groups a sliding-window pass streams)
         self.T, self.cfg, self.kv_bytes, self.kv_pad, self.ablate = T, cfg, kv_bytes, kv_pad, tuple(ablate)
         super().__init__()

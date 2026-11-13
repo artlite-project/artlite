@@ -84,7 +84,6 @@ SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer
 SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each)
 MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
 MAX_T = MOE_SIZES[-1]
-assert MAX_T - SUB <= KV_PAD
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
 # the time model's constants (``layer_seconds``; fitted to the chunk times of the 1B, 9B and 27B Q4_K_M, T = 256 ..
 # 2048 at p0 = 0 .. 30K: within ~2%): per sub-chunk a byte of a layer's weights, a GEMM item, a norm per hidden unit,
@@ -100,16 +99,12 @@ MOE_WEIGHT_S, MOE_ROW_S = 1 / 38e9, 1 / 38e9
 ATTN_BW, ATTN_CYC_TWO, ATTN_CYC_ONE, CORE_HZ = 58e9, 1020, 1500, 1.81e9
 
 
-def _key(lay: PG.Layout) -> tuple:
-    return lay.pitch, tuple(sorted(lay.off.items()))
-
-
 class QwenPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (default ``SIZES``, an MoE model's
     ``MOE_SIZES``; those within the overlay's caches: a larger chunk's transfers leave them, and aiecc rejects the
     design); ``run`` runs one."""
 
-    SUB, SMALL, MAX_T, MIN_TOKENS, NAME = SUB, SMALL, MAX_T, 3, "qwen_prefill"
+    SUB, SMALL, MAX_T, MIN_TOKENS, NAME, KV_PAD = SUB, SMALL, MAX_T, 3, "qwen_prefill", KV_PAD
 
     def __init__(self, overlay: QwenOverlay, *, sizes: tuple[int, ...] | None = None, draft: object = None,
                  dflash: object = None, precise: bool = False, pack: bool = False):
@@ -222,7 +217,7 @@ class QwenPrefill(ChunkPrefill):
 
     def _op(self, cls: type, lay: PG.Layout | None = None, **kw: object) -> object:
         """One operator object per class, layout and arguments (the layers share them: one design each in an ELF)."""
-        key = (cls, None if lay is None else _key(lay), tuple(sorted(kw.items())))
+        key = (cls, None if lay is None else lay.key, tuple(sorted(kw.items())))
         if key not in self._ops:
             args = {"T": SUB, "cfg": self.cfg} | ({"layout": lay} if lay is not None else {}) | kw
             self._ops[key] = cls(**args)
@@ -518,10 +513,7 @@ class QwenPrefill(ChunkPrefill):
         n, dev = x.shape[0], self.ov.dev
         T = self._size(n, p0, T)
         assert 3 <= n or not self.gdn, n
-        px = dev.view("PX")[:2 * T * self.H].view(bfloat16).reshape(T, self.H)
-        px[:n] = np.asarray(x, np.float32)
-        px[n:] = 0
-        dev.flush("PX", 0, 2 * T * self.H)
+        self._stage_px(x, T, bfloat16)
         fresh = p0 == 0 and T in self.fresh_sizes  # (a non-causal model's: the packed scan zeroes the states itself)
         if self.gdn:
             m = GP.GdnPrepOperator.mask(n, T, np.zeros(n, np.int64), self._t(T)) if fresh else np.arange(T) < n
@@ -563,11 +555,7 @@ class QwenPrefill(ChunkPrefill):
         gap = lo < 0
         assert T in sizes and (lo <= np.arange(n)).all() and (tree or not gap.any()), (T, p0)
         self._size(n, p0, T)
-        px = dev.view("PX")[:2 * T * self.H].view(bfloat16).reshape(T, self.H)
-        px[:n] = np.asarray(x, np.float32)
-        px[n:] = 0
-        px[np.flatnonzero(gap)] = 0
-        dev.flush("PX", 0, 2 * T * self.H)
+        self._stage_px(x, T, bfloat16, zero=np.flatnonzero(gap))
         if self.gdn:
             m = GP.GdnPrepOperator.mask(n, T, lo, self._t(T), tree=tree)
             dev.view("PM").view(np.float32)[:m.size] = m
@@ -621,10 +609,7 @@ class QwenPrefill(ChunkPrefill):
 
     def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) of the last chunk's output residual (bf16 values, fp32)."""
-        dev, H = self.ov.dev, self.H
-        dev.fetch("PX", 2 * H * i, 2 * H * n)
-        rows = dev.view("PX")[2 * H * i:2 * H * (i + n)].copy()
-        return rows.view(bfloat16).astype(np.float32).reshape(n, H)
+        return self._px_rows(i, n, bfloat16)
 
     # ------------------------------------------------------------------
     # Time estimates

@@ -58,7 +58,7 @@ from artlite.model_config import QwenConfig
 from artlite.operators import kmath, templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.chain import ChainPart, chained_fill
-from artlite.operators.design import COLS, range32, stream_walk
+from artlite.operators.design import COLS, MAX_BD_ITER, range32, stream_walk
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.l1_layout import pin_l1_buffers
 from artlite.operators.util import Attr, bf16_hilo, regions
@@ -70,6 +70,8 @@ HD = AT.HD
 ND = AT.ND
 SLOT = 2 * AT.REC_K  # bytes per head of a token group's Q panels (and of its sigmoid(gate): 4096 B used); of a pair of records
 GROUP = AT.OBJS * AT.OBJ_BYTES  # bytes of a cache group (32 positions: a K object, a V object)
+OBJ_ELEMS = AT.OBJ_BYTES // 2  # bf16 of a cache object
+A_SET = ND * 36  # bf16 of a set of 32 A panels (ND panels of 36 bf16: 72 B each)
 # Scratchpad parameters. QA_KV and QA_OFF are one per operator size ("qa_kv<T>"): a parameter's range is the tightest
 # of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
 QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
@@ -134,7 +136,7 @@ class AttnPrepOperator(ArtcOperator):
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
-        assert T % 32 == 0 and T // 8 <= 64, "whole cache groups; a BD repeats at most 64 times"
+        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER, "whole cache groups; a BD repeats at most MAX_BD_ITER times"
         assert {"q", "k", "v"} <= set(layout.off)
         self.T, self.cfg, self.layout = T, cfg, layout
         self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
@@ -410,8 +412,8 @@ class PrefillAttnOperator(ArtcOperator):
         bf = np.dtype[bfloat16]
         q_ty = np.ndarray[(R * SLOT // 2,), bf]
         kv_ty = np.ndarray[(SLOT // 2,), bf]  # a pair of K or V records, or a slot
-        o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
-        om_ty = np.ndarray[(4 * ND * 36,), bf]
+        o_ty = np.ndarray[(A_SET,), bf]  # 32 A panels
+        om_ty = np.ndarray[(4 * A_SET,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
         pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
@@ -435,7 +437,7 @@ class PrefillAttnOperator(ArtcOperator):
                                  obj_types=[np.ndarray[(SLOT // 4,), bf]] * 2, names=[f"pa_ks{h}_{i}" for i in range(2)])
                for h in range(n_kvh)]
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
-        o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
+        o1 = [o3[c].prod().join([A_SET * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
         def core(kv_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me, *seg):
@@ -496,12 +498,12 @@ class PrefillAttnOperator(ArtcOperator):
             tg = TaskGroup()
             for c in range(COLS):
                 # (a joined object: the 4 rows' panel i; QG > 1 (one head): token groups i, QG + i, .. of the pass)
-                # (passes in runs of at most 64: a BD repeats at most 64 times)
-                g_st = ND * 36 if qg == 1 else H * ND * 36
-                for b0 in range(0, n_pass, 64):
-                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36 + b0 * 4 * qg * H * ND * 36,
-                                                       [min(64, n_pass - b0), R, 4, ND * 36],
-                                                       [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]), group=tg,
+                # (passes in runs of at most MAX_BD_ITER: a BD repeats at most that many times)
+                g_st = A_SET if qg == 1 else H * A_SET
+                for b0 in range(0, n_pass, MAX_BD_ITER):
+                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * A_SET + b0 * 4 * qg * H * A_SET,
+                                                       [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
+                                                       [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]), group=tg,
                                 wait=True)
             inflight = []  # (a pass: one task of up to four BDs per part, at most two passes in flight)
             for b in range(n_pass):
@@ -518,10 +520,10 @@ class PrefillAttnOperator(ArtcOperator):
                         parts.append(ChainPart(seg[0], TensorAccessPattern((n_seg,), b * SLOT + i * SLOT // 4,
                                                                            [1, 1, 2, SLOT // 8], [0, 0, SLOT // 8, 1])))
                     parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, SLOT // 4],
-                                                                [0, 4640, SLOT // 2, 1]), length_parameter=p_n)]
+                                                                [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
                     if more:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS * more, 2, SLOT // 4],
-                                                                       [0, 4640, SLOT // 2, 1]),
+                                                                       [0, OBJ_ELEMS, SLOT // 2, 1]),
                                                offset_parameter=p_off))
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
@@ -557,8 +559,8 @@ class PrefillAttnOperator(ArtcOperator):
         bf = np.dtype[bfloat16]
         q_ty = np.ndarray[(R * SLOT // 2,), bf]
         h_ty = np.ndarray[(SLOT // 2,), bf]  # (half a K or V object, the halves of two slots)
-        o_ty = np.ndarray[(ND * 36,), bf]  # 32 A panels
-        om_ty = np.ndarray[(4 * ND * 36,), bf]
+        o_ty = np.ndarray[(A_SET,), bf]  # 32 A panels
+        om_ty = np.ndarray[(4 * A_SET,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
         pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
@@ -583,7 +585,7 @@ class PrefillAttnOperator(ArtcOperator):
                                       names=[f"pa_ks{hs[0]}_{hs[1]}_{i}" for i in range(2)])
                for hs, c in streams.items()}
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
-        o1 = [o3[c].prod().join([ND * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
+        o1 = [o3[c].prod().join([A_SET * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
         def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me, *seg):
@@ -656,11 +658,11 @@ class PrefillAttnOperator(ArtcOperator):
                             npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):
-                g_st = ND * 36 if qg == 1 else H * ND * 36  # (the row panels: heads, or token groups)
-                for b0 in range(0, n_pass, 64):  # (runs of at most 64 passes)
-                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * ND * 36 + b0 * 4 * qg * H * ND * 36,
-                                                       [min(64, n_pass - b0), R, 4, ND * 36],
-                                                       [4 * qg * H * ND * 36, g_st, qg * H * ND * 36, 1]),
+                g_st = A_SET if qg == 1 else H * A_SET  # (the row panels: heads, or token groups)
+                for b0 in range(0, n_pass, MAX_BD_ITER):  # (runs of at most MAX_BD_ITER passes)
+                    oh[c].drain(A, TensorAccessPattern((n_a,), c * qc * A_SET + b0 * 4 * qg * H * A_SET,
+                                                       [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
+                                                       [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]),
                                 group=tg, wait=True)
             inflight = []  # (a pass: one task of up to four BDs per stream, at most two passes in flight)
             for b in range(n_pass):
@@ -679,10 +681,10 @@ class PrefillAttnOperator(ArtcOperator):
                                                                            + i * SLOT // 4, [1, 1, 2, SLOT // 8],
                                                                            [0, 0, SLOT // 8, 1])))
                     parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, run],
-                                                                [0, 4640, SLOT // 2, 1]), length_parameter=p_n)]
+                                                                [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
                     if more:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS * more, 2, run],
-                                                                       [0, 4640, SLOT // 2, 1]),
+                                                                       [0, OBJ_ELEMS, SLOT // 2, 1]),
                                                offset_parameter=p_off))
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)

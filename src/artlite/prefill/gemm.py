@@ -65,6 +65,11 @@ class Layout:
     def N(self) -> int:
         return COLS * self.pitch
 
+    @property
+    def key(self) -> tuple:
+        """The layout as a dictionary key (the operators built over it are shared by equal layouts)."""
+        return self.pitch, tuple(sorted(self.off.items()))
+
 
 @dataclass
 class Gemm:
@@ -232,6 +237,13 @@ def resident_k_part(image: TileImage, region: Region, T: int, *, pitch: int, k_p
                 best, cost = n, c
             break
     return best
+
+
+def plan_down_parts(image: TileImage, region: Region, T: int, *, down_chunks: int, act: str, pitch: int = 0,
+                    ops: dict[tuple, GemmQOperator] | None = None) -> PhasePlan:
+    """``plan_phase`` of a prefill whose down projection runs in K parts of ``down_chunks`` chunks (each part's A strip
+    in the memtile, its C tile summing fewer k-tiles) and whose gate / up has the ``act`` epilogue."""
+    return plan_phase(image, region, T, pitch=pitch, ops=ops, act=act, k_part=down_chunks if region.name == "down" else 0)
 
 
 def _part_seconds(plan: PhasePlan) -> float:

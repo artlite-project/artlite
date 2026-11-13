@@ -53,7 +53,9 @@ from .prefill_ple import PleOperator
 SUB = 288  # tokens per sub-chunk (the operators' T: the GEMMs' whole passes of 3 MAC rows x 96 tokens)
 SIZES = tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each per layer kind)
 MAX_T = SIZES[-1]
-assert MAX_T - SUB <= KV_PAD  # (a chunk's last sub-chunk slices a cache from MAX_T - SUB positions on)
+# the time model's (``layer_seconds``: the GEMMs by the bytes of their weights, ~45 ms per GB: Gemma's tiles stream a third
+# more than they hold; per GEMM and per norm and op)
+WEIGHT_S, GEMM_S, OP_S = 0.045e-9, 0.1e-3, 0.15e-3
 PAD_ROWS = 64  # rows past a chunk's buffers (a GEMM's padding rows past its tokens, if any)
 PHASES = ("qkv", "o", "gate_up", "down", "gate", "proj")
 DOWN_CHUNKS = 5  # K chunks per down part (4 of E4B's 20: each part's A strip stays in the memtile, each sums 40
@@ -65,15 +67,14 @@ def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[
               ) -> PG.PhasePlan:
     """A GEMM phase of the prefill (``prefill.gemm.plan_phase``): gate / up with the GELU epilogue, down in K parts of
     ``DOWN_CHUNKS`` chunks."""
-    return PG.plan_phase(img, region, T, pitch=pitch, ops=ops, act="gelu",
-                         k_part=DOWN_CHUNKS if region.name == "down" else 0)
+    return PG.plan_down_parts(img, region, T, pitch=pitch, ops=ops, act="gelu", down_chunks=DOWN_CHUNKS)
 
 
 class GemmaPrefill(ChunkPrefill):
     """The prefill of an overlay's own-cache layers in chunks of the sizes ``sizes`` (those within the overlay's
     caches); ``run`` runs one."""
 
-    SUB, MAX_T, NAME = SUB, MAX_T, "gemma_prefill"
+    SUB, MAX_T, NAME, KV_PAD = SUB, MAX_T, "gemma_prefill", KV_PAD
 
     def __init__(self, overlay: GemmaOverlay, *, sizes: tuple[int, ...] = SIZES):
         super().__init__(overlay, sizes)
@@ -271,9 +272,7 @@ class GemmaPrefill(ChunkPrefill):
         """Row i of the last chunk's residual stream (hidden,) fp32 where the chunk leaves it: the input of the last
         layer (which only writes its cache here). A decode step from that layer on (``GemmaOverlay.step(start=)``)
         finishes the token: a prompt's last token without the layers before."""
-        H, dev = self.H, self.ov.dev
-        dev.fetch("PX", 4 * i * H, 4 * H)
-        return dev.view("PX")[4 * i * H:4 * (i + 1) * H].view(np.float32).copy()
+        return self._px_rows(i, 1, np.float32)[0]
 
     def _write_e(self, e: np.ndarray, n: int, T: int) -> None:
         dev, d = self.ov.dev, self.cfg.per_layer_dim
@@ -291,12 +290,9 @@ class GemmaPrefill(ChunkPrefill):
         prefill) of positions p0 .. p0 + n - 1 (the caches hold the positions before). Leaves the own-cache layers' K /
         V of the positions in the caches. e may be a Future: the chunk starts without it, and its first PLE item waits
         for it (a new piece: the host looks the rows up while the chunk's first operators run)."""
-        n, dev, H = x.shape[0], self.ov.dev, self.H
+        n = x.shape[0]
         T = self._size(n, p0, T)
-        px = dev.view("PX")[:4 * T * H].view(np.float32).reshape(T, H)
-        px[:n] = x
-        px[n:] = 0
-        dev.flush("PX", 0, 4 * T * H)
+        self._stage_px(x, T, np.float32)
         hooks = None
         if isinstance(e, Future):  # (a piece from the first PLE item on)
             i = next(i for i, (op, *_) in enumerate(self.runlists[T]) if op is self.ple)
@@ -326,7 +322,7 @@ class GemmaPrefill(ChunkPrefill):
         than they hold) plus ~0.1 ms each, ~0.15 ms per norm and op; the flash attention (``attention_seconds``);
         CONFIG_S per ConfigureOp)"""
         wbytes = sum(self.img.region(L, name).nbytes for name in PHASES)
-        s = S * (0.045e-9 * wbytes + 0.1e-3 * len(PHASES) + 0.15e-3 * 5)
+        s = S * (WEIGHT_S * wbytes + GEMM_S * len(PHASES) + OP_S * 5)
         return s + self.attention_seconds(L, p0, S) + CONFIG_S * self.layer_configs(L)
 
     def layer_configs(self, L: int) -> int:
