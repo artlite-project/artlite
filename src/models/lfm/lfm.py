@@ -17,6 +17,7 @@ histories, ~0.5 MB). Drafts: the context's (``drafts.Lookup``), whose rejected t
 lazy shift, the caches' records overwritten).
 """
 
+import dataclasses
 import hashlib
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -32,13 +33,16 @@ from artlite.vision.device import VisionDevice, load_state, save_state, state_di
 from artlite.vision.weights import sources
 
 from .. import video
-from ..common import Model, OverlayModel, Sampling, render_template
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
 from ..lfm3a import speech as a_speech
 from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
+from ..model import Capabilities, Model
+from ..overlay_model import OverlayModel
+from ..sampling import Sampling
 from ..sequence import Sequence, splice_media
+from ..templating import TEMPLATE_KEY, file_template, render_template
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LfmImage
 from .overlay import KV_K, LfmOverlay
@@ -222,6 +226,15 @@ class Lfm(Model):
             if self.vision is not None and self.audio is not None:
                 media_device(mmproj, self.vision, self.audio)
 
+    @property
+    def capabilities(self) -> Capabilities:
+        """(LFM3-VL's towers take videos, LFM3-Audio's mmproj holds the speech generator, the file may have the live
+        ASR template)"""
+        return dataclasses.replace(
+            super().capabilities, video=self.vision is not None,
+            speech=self.audio is not None and self.audio.gen is not None,
+            live_asr=f"{TEMPLATE_KEY}.asr" in self.gguf.meta)
+
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
@@ -304,7 +317,7 @@ class Lfm(Model):
         if generation:
             return chat_prompt(self.gguf, messages, enable_thinking=think, tools=tools, preserve_thinking=preserve,
                                template=self.chat_template, **{"bos_token": bos, **(variables or {})})
-        return render_template(self.chat_template or str(self.gguf.meta["tokenizer.chat_template"]), messages=messages,
+        return render_template(file_template(self.gguf, self.chat_template), messages=messages,
                                add_generation_prompt=False, tools=tools or None, **{
                                    "enable_thinking": think, "preserve_thinking": preserve, "bos_token": bos,
                                    **(variables or {})})
@@ -319,13 +332,13 @@ class Lfm(Model):
             raise ValueError(f"{self.name}: {kind} needs an mmproj with its encoder")
         start, end = self.vision.markup if self.vision is not None else ("", "")
         seq = self.video_sequence(data, soundtrack=False) if kind == "video" else self.audio.sequence(data)
-        self._vision_ran()
+        self.vision_ran()
         return self.tokenizer.encode(start) + seq + self.tokenizer.encode(end)
 
     def audio_stream(self) -> object:
         """A stream's rows on the speech encoder as its samples arrive (``models.lfm3a.live.Stream``)."""
         from ..lfm3a import live
-        return live.Stream(self.audio.encoder, ran=self._vision_ran)
+        return live.Stream(self.audio.encoder, ran=self.vision_ran)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
@@ -349,7 +362,7 @@ class Lfm(Model):
                                        a_speech.AUDIO_OUT: [a_host.clip_sequence(np.reshape(r, (1, -1))) for r in frames]},
                                 self.tokenizer.encode)
         finally:
-            self._vision_ran()
+            self.vision_ran()
 
     def video_sequence(self, src: str | bytes, *, soundtrack: bool = True) -> Sequence:
         """A video (a file or its bytes) as the language model's tokens (``models.lfm3vl.host``: its frames' pairs

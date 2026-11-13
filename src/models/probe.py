@@ -28,8 +28,8 @@ from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
 
 from .bench import _git, _read
-from .common import stale_install, windows_power_mode, xrt_smi
 from .diagnose import telemetry
+from .hostenv import stale_install, windows_power_mode, xrt_smi
 
 MB = 1 << 20
 CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)

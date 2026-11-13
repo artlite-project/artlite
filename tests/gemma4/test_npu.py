@@ -24,11 +24,11 @@ from artlite.decode.protocol import XB, packed_slots
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import assistant_of, gemma_gguf
-from models.common import Sampling
 from models.gemma4 import attn as AT
 from models.gemma4.gemma import Gemma, NpuGemma
 from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
+from models.sampling import Sampling
 
 from ..common import as_torch, cached_ref, draft_gate, draft_prompts, model_key, to_torch
 from ..models import require

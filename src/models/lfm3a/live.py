@@ -27,7 +27,9 @@ from collections.abc import Callable
 import jinja2
 import numpy as np
 
-from ..common import NpuModel, Penalties, Sampling, StreamDecoder
+from ..detokenizer import StreamDecoder
+from ..npu_model import NpuModel
+from ..sampling import Penalties, Sampling
 from ..sequence import Sequence
 from . import host
 from .encoder import FRAMES_BAND, ROWS_BAND, Encoder
@@ -168,7 +170,7 @@ class LiveAsr:
         self.prompt = model.tokenizer.encode(text)
         self.text_end, self.mixed_end = pieces.index(TEXT_END), pieces.index(MIXED_END)
         self.sampling = Sampling(greedy=True, banned=tuple(pieces.index(p) for p in BANNED))
-        self.stream = Stream(encoder, ran=model._vision_ran)
+        self.stream = Stream(encoder, ran=model.vision_ran)
         self._sync = sync
         self.start()
 

@@ -54,8 +54,9 @@ import numpy as np
 
 from artlite.gguf_model import GGUFFile
 
-from ..common import MEDIA_MARKER, render_template
+from ..model import MEDIA_MARKER
 from ..sequence import Sequence, data_bytes, splice
+from ..templating import render_template
 
 TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2", "lfm3-d1",
          "lfm3-d1-omni")  # (Artlite's)

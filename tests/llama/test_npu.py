@@ -9,9 +9,9 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from models import open_model
-from models.common import auto_capacity
 from models.llama.llama import NpuLlama
 from models.llama.tokenizer import chat_prompt
+from models.npu_model import auto_capacity
 
 from ..common import cached_ref, essays, model_key
 from ..models import llama_path

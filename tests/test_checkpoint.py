@@ -15,7 +15,9 @@ import torch
 
 from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.common import Model, NpuModel, Sampling
+from models.model import Model
+from models.npu_model import NpuModel
+from models.sampling import Sampling
 
 from .common import essay
 from .models import require

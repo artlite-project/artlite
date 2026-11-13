@@ -6,6 +6,7 @@ over it, ``live``: it under uvicorn, ``client_of``: it under a test client, the 
 ``make`` starts are stopped after each test (``conftest``)."""
 
 import contextlib
+import dataclasses
 import json
 import re
 import socket
@@ -22,8 +23,10 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from artlite.decode.model import Records
-from models.common import Checkpoint, Mask, Model, NpuModel, Penalties, Probs, Sampling, top_logits
+from models.model import Capabilities, Model
+from models.npu_model import Checkpoint, NpuModel
 from models.readouts import Readouts
+from models.sampling import Mask, Penalties, Probs, Sampling, top_logits
 from models.sequence import MEDIA, Sequence
 from models.server.api import create_app
 from models.server.decisions import Decisions
@@ -151,6 +154,10 @@ class FakeVision(FakeModel):
 class FakeVideo(FakeVision):
     """A model that takes videos too (``models.lfm.lfm.Lfm.video_sequence``'s presence; a video's bytes as two rows)."""
 
+    @property
+    def capabilities(self) -> Capabilities:
+        return dataclasses.replace(super().capabilities, video=True)
+
     def video_sequence(self, video: bytes) -> Sequence:
         return self.vision.sequence(video)
 
@@ -163,6 +170,10 @@ class FakeAudio(FakeVision):
         super().__init__()
         self.audio, self.vision = self.vision, None
         self.gguf = types.SimpleNamespace(meta={"tokenizer.chat_template.asr": ""})
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return dataclasses.replace(super().capabilities, live_asr="tokenizer.chat_template.asr" in self.gguf.meta)
 
 
 class FakeLive:
@@ -464,6 +475,10 @@ class FakeSpeaker(FakeAudio):
         self.say = [" hello", " there"]
         self.npu: FakeNpu | None = None
         self.streams: list[FakeStream] = []
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return dataclasses.replace(super().capabilities, speech=True)
 
     def voice_reply(self, messages: list[dict[str, object]], **kw: object) -> Iterator[tuple[str, object]]:
         """Interleaved: the words " hello" " there", 2 chunks of 480 samples between them; the messages recorded."""

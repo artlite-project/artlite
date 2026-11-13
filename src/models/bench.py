@@ -41,8 +41,10 @@ from artlite.model_config import MODELS_DIR, model_path
 from artlite.prefill import pace
 
 from . import open_model
-from .common import NpuModel, add_spec_options, auto_capacity, spec_options, stale_install
 from .diagnose import telemetry
+from .hostenv import stale_install
+from .npu_model import NpuModel, auto_capacity
+from .spec_options import add_spec_options, spec_options
 
 # a result's fields (llama-bench's that apply, plus n_ctx); json and jsonl add samples_ns and samples_ts
 FIELDS = ("build_commit", "build_number", "cpu_info", "gpu_info", "backends", "model_filename", "model_type",
@@ -360,7 +362,7 @@ def main(argv: list[str] | None = None) -> None:
             for p in printers:
                 p.test(r)
                 p.out.flush()
-        if (pf := getattr(npu, "prefill", None)) is not None and pf.pace:
+        if (pf := npu.prefill) is not None and pf.pace:
             why = ("ARTLITE_PACE" if pace.parse(os.environ.get("ARTLITE_PACE", "")) is not None else
                    "calibrated: this machine throttles them at full rate")
             sys.stderr.write(f"artlite-bench: {name}: the prefill's dense GEMMs ran paced ({pace.describe(pf.pace)}; "

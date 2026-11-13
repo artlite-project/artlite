@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..common import Checkpoint, NpuModel
+from ..npu_model import Checkpoint, NpuModel
 from ..sequence import Sequence
 
 log = logging.getLogger("artlite.server")

@@ -15,7 +15,8 @@ import torch
 
 from artlite.model_config import decision_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen3_gguf
 from models import open_model
-from models.common import Model, NpuModel
+from models.model import Model
+from models.npu_model import NpuModel
 from models.readouts import Readouts, pool, rows_of
 
 from .common import cached_ref, essay, model_key, to_torch

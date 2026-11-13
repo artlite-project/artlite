@@ -13,8 +13,9 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
-from ..common import Model, Sampling
+from ..model import Model
 from ..readouts import readout_model
+from ..sampling import Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LlamaImage
 from .llama import NpuLlama

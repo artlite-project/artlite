@@ -21,17 +21,12 @@ from typing import Any
 import uvicorn
 
 from .. import open_model
-from ..common import (
-    TEMPLATE_RESERVED,
-    Model,
-    NpuModel,
-    Sampling,
-    check_chat_template,
-    performance_mode,
-    spec_options,
-    stale_install,
-    template_option,
-)
+from ..hostenv import performance_mode, stale_install
+from ..model import Model
+from ..npu_model import NpuModel
+from ..sampling import Sampling
+from ..spec_options import spec_options
+from ..templating import TEMPLATE_RESERVED, check_chat_template, template_option
 from .api import create_app
 from .cli_options import MODELS, SHARE, api_keys, arg_parser, capacity, given, web_ui
 from .engine import Engine

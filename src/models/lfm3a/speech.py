@@ -42,8 +42,8 @@ import numpy as np
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GenConfig
 
-from ..common import render_template
 from ..sequence import Sequence
+from ..templating import render_template
 
 N_CB, N_CODES = 12, 2017  # (codebooks a frame, codes a codebook: 2016 FSQ codes and the end of audio)
 EOA = N_CODES - 1

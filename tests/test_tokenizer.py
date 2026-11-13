@@ -11,7 +11,7 @@ import pytest
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import lfm3_gguf, qwen3_gguf, qwen_gguf
-from models.common import template_option
+from models.templating import template_option
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay

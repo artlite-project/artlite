@@ -1,7 +1,7 @@
 """Artlite's models: a package per GGUF architecture (the model on the NPU and its host side: tokenizer, chat
-template, the inputs the host computes) or diffusers pipeline, what they share (``common``) and the command lines
-(``cli``: ``artlite-cli``; ``bench``: ``artlite-bench``; ``server``: ``artlite-server``, an OpenAI-compatible server
-with a web chat).
+template, the inputs the host computes) or diffusers pipeline, what they share (``model``, ``npu_model``,
+``overlay_model``, ``speculative``, ``sampling``, ``templating``, ...) and the command lines (``cli``: ``artlite-cli``;
+``bench``: ``artlite-bench``; ``server``: ``artlite-server``, an OpenAI-compatible server with a web chat).
 
 ``open_model`` reads a GGUF file's architecture from its metadata (``general.architecture``) and opens it with the
 ``Model`` of its package; ``open_pipeline`` opens a diffusers directory by the pipeline class of its
@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from artlite.gguf_model import GGUFFile
 
-from .common import Model
+from .model import Model
 
 if TYPE_CHECKING:
     from .sd15.pipeline import StableDiffusion

@@ -28,8 +28,9 @@ from typing import Any
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from ..common import StreamDecoder
+from ..detokenizer import StreamDecoder
 from ..sequence import data_bytes
+from ..templating import file_template
 from .conversation import Conversation
 from .engine import Engine
 from .ids import hex_id
@@ -41,7 +42,6 @@ log = logging.getLogger("artlite.server")
 MODES = {None: "auto", ("text",): "text", ("audio",): "audio", ("audio", "text"): "mixed"}  # (output_modalities)
 Handler = Callable[[dict[str, Any]], Awaitable[bool | None]]
 TRANSCRIPTION_EVENT = "conversation.item.input_audio_transcription"
-TEMPLATE_KEY = "tokenizer.chat_template"
 
 
 def _responses_tools(tools: object) -> list[dict[str, Any]]:
@@ -284,7 +284,7 @@ class ConversationSession(Session):
 
     @property
     def template(self) -> str:
-        return self.model.chat_template or str(self.model.gguf.meta[TEMPLATE_KEY])
+        return file_template(self.model.gguf, self.model.chat_template)
 
     async def on_worker(self, fn: Callable[[], Any]) -> Any:
         return await asyncio.wrap_future(self.engine.run(fn))
@@ -598,7 +598,7 @@ def add_route(app: FastAPI, *, engine: Engine, alias: str, authorized: Callable[
         if not transcribing and model is not None and speaks(engine):
             await ConversationSession(ws, engine, alias).run()
             return
-        live_asr = TEMPLATE_KEY + ".asr" in getattr(getattr(model, "gguf", None), "meta", {})
+        live_asr = model is not None and model.capabilities.live_asr
         if transcribing and model is not None and model.audio is not None and not live_asr and transcribe is not None:
             await TranscriptionSession(ws, alias, transcribe).run()
             return

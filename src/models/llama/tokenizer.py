@@ -12,7 +12,7 @@ import numpy as np
 
 from artlite.gguf_model import GGUFFile, bpe_tokenizer_json
 
-from ..common import chat_template
+from ..templating import render_chat
 
 LLAMA3_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
                   r"|[^\r\n\p{L}\p{N}]?\p{L}+"
@@ -78,5 +78,5 @@ def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, date: str 
     messages = [one for m in messages
                 for one in ([{**m, "tool_calls": [c]} for c in m["tool_calls"]] if len(m.get("tool_calls") or []) > 1
                             else [m])]
-    return chat_template(template or str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
-                         **{"bos_token": BOS, **({"date_string": date} if date else {}), **variables})
+    return render_chat(gguf, messages, tools=tools, template=template,
+                       **{"bos_token": BOS, **({"date_string": date} if date else {}), **variables})

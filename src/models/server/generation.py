@@ -13,7 +13,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from ..common import StreamDecoder, seed
+from ..detokenizer import StreamDecoder
+from ..sampling import seed
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
 from .textflow import ReasoningSplitter, StopMatcher
 
@@ -67,7 +68,7 @@ class Generation:
         self.kept, last, how = self.cache.prepare(self.ids, enabled=job.cache_prompt)
         job.kept = self.kept
         npu = self.npu
-        self.drafted0, self.accepted0 = getattr(npu, "drafted", 0), getattr(npu, "accepted", 0)
+        self.drafted0, self.accepted0 = npu.drafted, npu.accepted
         self.d0 = npu.dispatches
         self._forced_call()
         job.state = "prompt"
@@ -129,8 +130,7 @@ class Generation:
         npu = self.npu
         return timings(cache_n=self.kept, prompt_n=len(self.ids) - self.kept, prompt_s=self.t1 - self.t0,
                        predicted_n=len(self.gen), predicted_s=t - self.t1,
-                       drafts=(getattr(npu, "drafted", 0) - self.drafted0,
-                               getattr(npu, "accepted", 0) - self.accepted0))
+                       drafts=(npu.drafted - self.drafted0, npu.accepted - self.accepted0))
 
     def _filters(self) -> None:
         """The generated text's filters: the stop strings, the thought split, the tool call parser, and the

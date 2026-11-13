@@ -14,8 +14,8 @@ from fastapi import FastAPI
 
 from artlite.model_config import MODELS_DIR, model_path
 
-from ..common import add_spec_options
 from ..readouts import POOLING
+from ..spec_options import add_spec_options
 from . import ui
 
 log = logging.getLogger("artlite.server")

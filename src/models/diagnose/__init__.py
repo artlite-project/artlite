@@ -52,7 +52,7 @@ def become_user(argv: list[str]) -> None:
 
 def _xrt_validate() -> dict[str, object] | None:
     """``xrt-smi validate``'s latency, throughput and gemm lines (when installed; Windows: the driver's copy)."""
-    from ..common import xrt_smi
+    from ..hostenv import xrt_smi
 
     if platform.system() == "Windows":
         text = xrt_smi("validate")

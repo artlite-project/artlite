@@ -139,7 +139,7 @@ class Conversation:
         try:
             self.seq = self.seq + self.model.vision.sequence(data)
         finally:
-            self.model._vision_ran()
+            self.model.vision_ran()
         self._text(self.turns.image[1])
 
     def output(self, text: str) -> None:

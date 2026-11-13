@@ -109,7 +109,7 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
     or alone where not faster).
   - Qwen3-Reranker-0.6B's 4096-token packed chunk after a 64-token prompt: 332 ms with the ring attention, 346 with
     the window.
-- **App** (`models.common.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
+- **App** (`models.overlay_model.OverlayModel.prompt` / `forward`): decode steps up to the next position where a chunk can
   start (whole cache groups), the planner's chunks, decode steps after; each chunk's inputs (embeddings, per-layer
   token rows) on a worker thread while the previous chunk runs; Gemma's first chunk starts with its embeddings and
   receives inputs that later operators read through a `Library.run` hook (`GemmaPrefill.run(e=Future)`).
@@ -129,7 +129,7 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
    <= ~0.0005), argmax agreement; `forward`'s last-token logits vs a whole decode step's. Once the numbers are known,
    tighten the asserts to just above them.
 5. **The drafter** of a model with one: its teacher-forced drafts after a fixed prompt set through the prefill vs as
-   decode steps (`tests/common.py` `draft_gate` over `OverlayModel.forced_drafts`: per position of the model's greedy
+   decode steps (`tests/common.py` `draft_gate` over `SpeculativeMixin.forced_drafts`: per position of the model's greedy
    replies the tokens a round would give, the first guess = the model's argmax, its probability). The drafter reads
    what the prefill wrote (Qwen: its own records of the prompt's rows, from the prefill's hidden states and the
    host's carry after decode steps; Gemma: the caches of the last own-cache layers), which the model's KL does not

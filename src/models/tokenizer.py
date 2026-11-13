@@ -15,7 +15,7 @@ import numpy as np
 
 from artlite.gguf_model import GGUFFile, bpe_tokenizer_json
 
-from .common import chat_template
+from .templating import render_chat
 
 # the split regexes of the tokenizer.json files by ``tokenizer.ggml.pre`` (llama.cpp spells the case-insensitive
 # contractions out)
@@ -78,5 +78,5 @@ def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thi
     thought ``<think>\\n\\n</think>\\n\\n``; ``tools``: the functions the model may call; ``preserve_thinking``:
     the answers before the last user message keep their thoughts (Qwen3.6's template and later; Qwen3.5's and Qwen3's
     drop them); ``variables``: the template's others (``reasoning_effort``: Qwen3.8's), over these."""
-    return chat_template(template or str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
-                         **{"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking, **variables})
+    return render_chat(gguf, messages, tools=tools, template=template,
+                       **{"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking, **variables})

@@ -180,7 +180,7 @@ def _dump(out: str, op: object) -> None:
 
 
 def pytest_report_header(config: pytest.Config) -> str | None:
-    from models.common import stale_toolchain
+    from models.hostenv import stale_toolchain
 
     return f"WARNING: {stale}" if (stale := stale_toolchain()) else None
 

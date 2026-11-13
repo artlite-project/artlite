@@ -66,7 +66,7 @@ from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
 
-from ..common import top_logits
+from ..sampling import top_logits
 from .attn import OBJ_BYTES
 from .dflash_core import (
     CV_IN,

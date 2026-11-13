@@ -29,7 +29,9 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
-from ..common import Model, OverlayModel, Sampling
+from ..model import Model
+from ..overlay_model import OverlayModel
+from ..sampling import Sampling
 from .image import LlamaImage
 from .overlay import KV_K, LlamaOverlay, check_formats
 from .prefill import SIZES, LlamaPrefill

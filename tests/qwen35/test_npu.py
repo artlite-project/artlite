@@ -128,8 +128,8 @@ def test_mtp(size: str) -> None:
     bf16 logits takes either); most drafts are accepted (the drafter's cache follows the model's positions; up to 7
     drafts: 40%), over both replies (a reply drafts as its measured step times say: 6 drafts in one, where one more or
     less kept moves its share by 17%), and each reply that drafts keeps some."""
-    from models.common import Sampling
     from models.qwen35.qwen import Qwen
+    from models.sampling import Sampling
 
     path = _path(size)
     _drafter(path)

@@ -13,7 +13,8 @@ import numpy as np
 
 from artlite import _native
 
-from ..common import Detokenizer, LogitsLike, Sampling, logit_bits, top_logits
+from ..detokenizer import Detokenizer
+from ..sampling import LogitsLike, Sampling, logit_bits, top_logits
 from .tools import Calls
 
 Emit = Callable[[str, dict[str, Any]], None]  # (event, data) -> None: a job's events to its request

@@ -25,11 +25,11 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import qwen_dflash_of
 from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
-from models.common import Sampling, seed
 from models.qwen35.dflash import DFlashOverlay
 from models.qwen35.dflash_core import HD, PAIR, POS_PER_GROUP, QC, ROWS_B
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.qwen import NpuQwen, Qwen
+from models.sampling import Sampling, seed
 from models.server.cache import PromptCache
 from models.tokenizer import BpeTokenizer
 

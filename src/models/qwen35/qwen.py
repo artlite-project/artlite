@@ -50,13 +50,17 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
-from ..common import Checkpoint, Mask, Model, OverlayModel, Penalties, Probs, Readout, Sampling, drafter_type, max_prob
 from ..minicpmv import host as minicpmv_host
 from ..minicpmv import npu as minicpmv_npu
+from ..model import Model
+from ..npu_model import Checkpoint
+from ..overlay_model import OverlayModel, Readout
 from ..qwen3vl import host as qwen3vl_host
 from ..qwen3vl import npu as qwen3vl_npu
 from ..readouts import readout_model
+from ..sampling import Mask, Penalties, Probs, Sampling, max_prob
 from ..sequence import Sequence
+from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
@@ -515,7 +519,7 @@ class Qwen(Model):
     in prompts), by its projector: Qwen3-VL's for Qwen3.5 / 3.6 / 3.8 (``models.qwen3vl.npu.NpuVision``;
     ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default 8 .. 4096), MiniCPM-V's for its
     language model (``models.minicpmv.npu.NpuVision``; ``max_slices``: an image's slices at most, default the file's);
-    ``spec_type``, ``draft_model``: the drafter (``common.drafter_type``): auto, the model's DFlash2 drafter
+    ``spec_type``, ``draft_model``: the drafter (``spec_options.drafter_type``): auto, the model's DFlash2 drafter
     (``model_config.qwen_dflash_of``; not with images) where its file exists, else its MTP block, else a qwen35moe model's
     MTP file (``model_config.qwen_mtp_of``); none (the image leaves the MTP block out); draft-mtp, draft-dflash: that
     one, which must exist; ``draft_model``: that file."""
@@ -587,7 +591,7 @@ class Qwen(Model):
         if self.vision is None:
             raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
         seq = self._image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
-        self._vision_ran()
+        self.vision_ran()
         return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:

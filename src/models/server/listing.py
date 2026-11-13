@@ -7,14 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .engine import Engine
-from .speech import speaks
 
 MEDIA = ("image", "audio", "video", "speech")  # (what a model takes and gives, in the order the API lists them)
-
-
-def takes_video(model: object) -> bool:
-    """Whether a model takes videos (LFM3-VL's towers: ``models.lfm.lfm.Lfm.video_sequence``)."""
-    return getattr(model, "vision", None) is not None and hasattr(model, "video_sequence")
 
 
 @dataclass(frozen=True)
@@ -32,7 +26,8 @@ class Modalities:
         m = engine.model
         if m is None:
             return cls()
-        return cls(vision=m.vision is not None, audio=m.audio is not None, video=takes_video(m), speech=speaks(engine))
+        caps = m.capabilities
+        return cls(vision=caps.vision, audio=caps.audio, video=caps.video, speech=caps.speech)
 
     @property
     def media(self) -> list[str]:

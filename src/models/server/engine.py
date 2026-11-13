@@ -16,7 +16,9 @@ import numpy as np
 
 from artlite import portable
 
-from ..common import Model, NpuModel, argmax
+from ..model import Model
+from ..npu_model import NpuModel
+from ..sampling import argmax
 from ..sequence import Sequence
 from .cache import PromptCache, common_prefix
 from .generation import Generation

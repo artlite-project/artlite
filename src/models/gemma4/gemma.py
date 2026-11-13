@@ -37,7 +37,11 @@ from artlite.decode.protocol import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 
-from ..common import Checkpoint, Model, OverlayModel, Penalties, Sampling, drafter_type
+from ..model import Model
+from ..npu_model import Checkpoint
+from ..overlay_model import OverlayModel
+from ..sampling import Penalties, Sampling
+from ..spec_options import drafter_type
 from .draft import GemmaDraft, output_norm
 from .host import GemmaHost
 from .overlay import GemmaOverlay
@@ -220,7 +224,7 @@ class NpuGemma(OverlayModel):
 class Gemma(Model):
     """Gemma 4 from a GGUF file: the architecture, tokenizer and chat template from its metadata. ``kv_k``: the KV
     caches' K precision ("hilo": bfp16 hi + lo blocks, "single": one block per 8 dims); ``spec_type``, ``draft_model``:
-    the drafter (``common.drafter_type``): auto, ``mtp-<model file>`` next to it when it is there; none; draft-mtp: that
+    the drafter (``spec_options.drafter_type``): auto, ``mtp-<model file>`` next to it when it is there; none; draft-mtp: that
     file, which must exist; ``draft_model``: a ``gemma4-assistant`` file."""
 
     name = "Gemma 4"

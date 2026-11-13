@@ -1,6 +1,6 @@
 """Context drafts (models/drafts.py: ``Lookup``, ``Planner``), the generation's rounds of drafts
 (``OverlayModel.generate``) on a fake overlay model whose text is fixed and a drafter's stop rule, the drafter's
-options (``models.common.add_spec_options``); on the NPU (slow) greedy replies with drafts against steps of one
+options (``models.spec_options.add_spec_options``); on the NPU (slow) greedy replies with drafts against steps of one
 token."""
 
 import argparse
@@ -14,8 +14,10 @@ from ml_dtypes import bfloat16
 import models
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.common import OverlayModel, Penalties, Sampling, add_spec_options, drafter_type, spec_options
 from models.drafts import DRAFTER_MATCH, NMAX, PRIOR, RETRY, WARM, Lookup, Planner, bucket
+from models.overlay_model import OverlayModel
+from models.sampling import Penalties, Sampling
+from models.spec_options import add_spec_options, drafter_type, spec_options
 
 from .common import essay
 from .models import require
@@ -137,6 +139,7 @@ class Text(OverlayModel):
 
     eos_token_ids = (0,)
     capacity = 256
+    overlay = SimpleNamespace(once_s=0.0)  # (a step's one-time host work)
 
     def __init__(self, text: list[int]):
         self.text, self.position, self.calls = text, 0, []
@@ -208,7 +211,7 @@ def test_spec_options(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None
     assert spec_options(p.parse_args(["-md", f, "--spec-draft-n-max", "0"])) == {"spec_type": "none"}
     with pytest.raises(SystemExit):
         p.parse_args(["--spec-draft-n-max", "-1"])
-    monkeypatch.setattr("models.common.GGUFFile", lambda path: SimpleNamespace(arch=path))
+    monkeypatch.setattr("models.spec_options.GGUFFile", lambda path: SimpleNamespace(arch=path))
     assert drafter_type("auto", "dflash", ("draft-mtp", "draft-dflash"), "Q") == "draft-dflash"
     assert drafter_type("draft-mtp", "qwen35moe", ("draft-mtp",), "Q") == "draft-mtp"
     for args, error in [(("draft-mtp", "dflash", ("draft-mtp", "draft-dflash")), "a draft-dflash drafter, not draft-mtp"),

@@ -8,7 +8,7 @@ import pytest
 import torch
 from ml_dtypes import bfloat16
 
-from models.common import Sampling
+from models.sampling import Sampling
 
 # CPU reference results of the slow tests (whole-model logits), cached across runs in a folder per model: gitignored
 REFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs")
@@ -103,7 +103,7 @@ def video_file(folder: str, name: str) -> str:
 
 
 def draft_prompts(host: Any) -> dict[str, tuple[list[int], tuple[int, ...]]]:
-    """The drafter gate's prompts (``draft_gate``) as a model's host side (``models.common.Model``) tokenizes them: the
+    """The drafter gate's prompts (``draft_gate``) as a model's host side (``models.model.Model``) tokenizes them: the
     ids and where later prompts start (``OverlayModel.forced_drafts(turns=)``). Replies that copy their context (a
     summary, a quote: the drafter attends to the prompt's positions), the quote's second half as a later prompt (decode
     steps up to a cache group, then a chunk after them), a question without context (the prefill's smallest chunks) and

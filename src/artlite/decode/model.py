@@ -154,7 +154,7 @@ class ModelOverlay:
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
         # the host seconds of the last step's one-time work: its transaction's first build and patch tables, a prompt's states
-        # turned into the decode's (``_once``): not a step's time (``models.common``'s planner)
+        # turned into the decode's (``_once``): not a step's time (``models.drafts``' planner)
         self.once_s = 0.0
         self._once_t = 0.0  # (the one-time work before the step's ``_run``)
         self._ran_keys: set = set()

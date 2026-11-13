@@ -88,7 +88,7 @@ from artlite.operators.design import COLS
 from artlite.operators.util import bf16_bits, rup
 from artlite.overlay import Sequence, Transaction
 
-from ..common import argmax
+from ..sampling import argmax
 from . import attn as AT
 from .image import FORMATS, KC, TILE_BYTES
 from .overlay import GemmaOverlay

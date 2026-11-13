@@ -8,7 +8,7 @@ import dataclasses
 import logging
 from typing import Any
 
-from ..common import Sampling
+from ..sampling import Sampling
 from . import agents
 from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable

@@ -273,7 +273,7 @@ def _git(*args: str) -> str:
 def code_state() -> dict[str, object]:
     """The checkout: its commit, the commits not upstream, uncommitted changes, the native build's state, the
     toolchain and the Python packages that matter."""
-    from ..common import stale_install
+    from ..hostenv import stale_install
 
     upstream = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}") or "origin/main"
     local = _git("log", "--oneline", f"{upstream}..HEAD")

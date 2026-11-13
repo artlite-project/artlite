@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING, Any
 import jinja2
 from starlette.concurrency import run_in_threadpool
 
-from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, chat_template
+from ..model import MEDIA_MARKER
 from ..sequence import data_bytes
+from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
 from .schemas import ROLES, ChatRequest, Message
@@ -105,7 +106,7 @@ class PromptBuilder:
         newlines), with images (``image_url`` parts of data URIs, a model with a vision encoder) as parts
         ``{"type": "image", "image": bytes}``, audio clips (``input_audio`` parts, ``audio_url`` ones of data URIs,
         a model with a speech encoder) as parts ``{"type": "audio", "audio": bytes}`` and videos (``input_video`` /
-        ``video_url`` parts, a model that takes them: ``listing.takes_video``) as ``{"type": "video", "video":
+        ``video_url`` parts, a model that takes them: ``Capabilities.video``) as ``{"type": "video", "video":
         bytes}`` among the text parts; ``media``: images, clips and videos as the text ``MEDIA_MARKER`` (the
         template's text alone)."""
         ctx = self.ctx

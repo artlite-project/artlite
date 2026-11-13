@@ -20,7 +20,8 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER, Sampling
+from models.model import MEDIA_MARKER
+from models.sampling import Sampling
 from models.sequence import MEDIA
 from models.server import ui
 from models.server.engine import Engine

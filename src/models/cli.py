@@ -30,22 +30,17 @@ import numpy as np
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
-from .common import (
-    MEDIA_MARKER,
-    TEMPLATE_RESERVED,
-    StreamDecoder,
-    add_spec_options,
-    auto_capacity,
-    performance_mode,
-    seed,
-    spec_options,
-    stale_install,
-    template_option,
-)
+from .detokenizer import StreamDecoder
+from .hostenv import performance_mode, stale_install
 from .lfm3a.host import asr_system
+from .model import MEDIA_MARKER
+from .npu_model import auto_capacity
+from .sampling import seed
 from .sd15.pipeline import check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
+from .spec_options import add_spec_options, spec_options
+from .templating import TEMPLATE_RESERVED, template_option
 
 
 def arg_parser() -> argparse.ArgumentParser:
@@ -183,7 +178,7 @@ def speak(args: argparse.Namespace, options: dict[str, object]) -> None:
     t0 = time.perf_counter()
     try:
         model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
-        if not hasattr(model, "tts"):
+        if not model.capabilities.speech:
             raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
         npu = model.load(capacity=args.ctx_size or 4096, prefill=not args.no_prefill)
     except (OSError, ValueError, NotImplementedError) as e:
@@ -219,7 +214,7 @@ def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
     t0 = time.perf_counter()
     try:
         model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
-        if not hasattr(model, "voice_reply"):
+        if not model.capabilities.speech:
             raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
         text = prompt_text(args) if args.prompt is not None or args.file else ""
         content: list[dict[str, object]] = [{"type": "image", "image": im} for im in args.image] + \

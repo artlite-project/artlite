@@ -35,7 +35,7 @@ import numpy as np
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
-from ..common import StreamDecoder
+from ..detokenizer import StreamDecoder
 from ..lfm3a.speech import SR, VOICES, Reply, SpeechStats, pcm16, wav_header
 from .app_base import NO_CACHE, CancellingResponse, sse
 from .engine import Engine
@@ -51,7 +51,7 @@ EXPIRES = 3600  # (a reply's audio.expires_at: seconds after it)
 def speaks(engine: Engine) -> bool:
     """Whether the engine's model speaks (LFM3-Audio's language model with its mmproj's generator)."""
     m = engine.model
-    return m is not None and hasattr(m, "tts") and getattr(m, "audio", None) is not None and m.audio.gen is not None
+    return m is not None and m.capabilities.speech
 
 
 def audio_stream(body: AsyncIterator[bytes | str], cancel: threading.Event, media_type: str) -> CancellingResponse:

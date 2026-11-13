@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from models.common import MEDIA_MARKER
+from models.model import MEDIA_MARKER
 from models.sequence import Sequence
 from models.server import decisions as D
 from models.server.cache import common_prefix

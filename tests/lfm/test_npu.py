@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from models import open_model
-from models.common import Sampling
+from models.sampling import Sampling
 
 from ..common import essay
 from . import ref

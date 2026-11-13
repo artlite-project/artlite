@@ -13,7 +13,7 @@ import re
 
 from artlite.gguf_model import GGUFFile
 
-from ..common import chat_template
+from ..templating import render_chat
 
 SPACE = "▁"
 T_UNKNOWN, T_CONTROL, T_USER, T_BYTE = 2, 3, 4, 6  # tokenizer.ggml.token_type (1: normal, 5: unused)
@@ -133,9 +133,9 @@ def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, enable_thi
     the model thinks first; ``tools``: the functions it may call; ``preserve_thinking``: the answers with tool calls
     before the last user message keep their thoughts; ``variables``: the template's others, over these)."""
     bos = gguf.strings("tokenizer.ggml.tokens")[int(gguf.meta["tokenizer.ggml.bos_token_id"])]
-    text = chat_template(template or str(gguf.meta["tokenizer.chat_template"]), messages, tools=tools,
-                         **{"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking,
-                            "bos_token": bos, **variables})
+    text = render_chat(gguf, messages, tools=tools, template=template,
+                       **{"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking,
+                          "bos_token": bos, **variables})
     # (an answer with content after its tool calls' results closes the model's turn, and the template opens no new
     # one: the model's turn goes before the generation prompt, as llama.cpp does)
     head, end, tail = text.rpartition("<turn|>\n")

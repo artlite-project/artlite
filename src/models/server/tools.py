@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from ..common import Detokenizer, StreamDecoder
+from ..detokenizer import Detokenizer, StreamDecoder
 from .ids import alnum_id
 from .textflow import held
 
@@ -666,7 +666,7 @@ class Vocabulary:
 
 
 class NameMask:
-    """The tokens that keep a call's name one of the functions' (``common.Mask``): ``parser``, a parser of the answer's
+    """The tokens that keep a call's name one of the functions' (``sampling.Mask``): ``parser``, a parser of the answer's
     syntax, follows the generated text (``accept``, each token as it is sampled: the thoughts' text too, where a call
     does not begin); while it is in a call's name (``Parser.naming``), the tokens ``allowed`` are those that continue
     the text towards a function's head (a part of the rest, or the rest and more), else any."""

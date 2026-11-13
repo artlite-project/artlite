@@ -1,9 +1,10 @@
-"""Sampling on the host: the native top-k of a vocabulary's logits (``models.common.top_logits``, ``max_prob``), llama.cpp's
-penalties (``models.common.Penalties``) on a few candidates against their definition on the whole vocabulary, with a
+"""Sampling on the host: the native top-k of a vocabulary's logits (``models.sampling.top_logits``, ``max_prob``), llama.cpp's
+penalties (``models.sampling.Penalties``) on a few candidates against their definition on the whole vocabulary, with a
 mask of the tokens allowed, the choice among the candidates (``Sampling.pick``), and the generation loops' window of
 recent tokens (``NpuModel.generate``, the overlay models' bf16 logits with a soft cap)."""
 
 import collections
+import types
 
 import ml_dtypes
 import numpy as np
@@ -11,7 +12,9 @@ import pytest
 from ml_dtypes import bfloat16
 
 from artlite import _native
-from models.common import NpuModel, OverlayModel, Penalties, Sampling, max_prob, seed, top_logits
+from models.npu_model import NpuModel
+from models.overlay_model import OverlayModel
+from models.sampling import Penalties, Sampling, max_prob, seed, top_logits
 
 VOCAB = 4096
 CAP = 30.0
@@ -164,6 +167,7 @@ class OverlaySteps(OverlayModel):
     eos_token_ids = (0,)
     capacity = 64
     softcap = CAP
+    overlay = types.SimpleNamespace(once_s=0.0)  # (a step's one-time host work)
 
     def __init__(self) -> None:
         self.position = 0
