@@ -233,6 +233,7 @@ class DecodeOverlayOperator(ArtcOperator):
         memtiles, the same objects in both columns (module docstring "Shared A objects"); pairs: a dense design's blocks
         of plane pairs (B_PAIR: an F32 matrix's [hi, lo] rows, their sums out as fp32; an MoE design has them anyway)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
+        # (a ``post`` design has TOK_STATE's words too: S_NAS is always declared)
         STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
                        *([MOE_STATE] if moe else []), *(self.GATE_STATE if self.gate else ()))
         XMETA.consts(PHASE, TOKEN, MOE, *self.META_KINDS)  # (the design's words and flags: each name and bit once)

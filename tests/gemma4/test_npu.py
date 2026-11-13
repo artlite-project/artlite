@@ -21,6 +21,7 @@ import torch
 
 from artlite.decode.protocol import SLOTS as NB
 from artlite.decode.protocol import XB, packed_slots
+from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import assistant_of, gemma_gguf
 from models.common import Sampling
@@ -142,7 +143,7 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: s
         k, v = ov.read_kv(layer, range(len(ids)))
         worst[f"K.{layer}"], worst[f"V.{layer}"] = rel_finite(k, cache.K), rel_finite(v, cache.V)
         ov.dev.fetch("KV")
-        rows = [AT.ring_rows(ov.dev.view("KV")[ov.ring(layer, h) + (r0 // 8 & 1) * ov.T:][:ov.T], ov.cfg.head_dim(layer))
+        rows = [ring_rows(ov.dev.view("KV")[ov.ring(layer, h) + (r0 // 8 & 1) * ov.T:][:ov.T], ov.cfg.head_dim(layer))
                 for h in range(AT.KV_HEADS)]
         worst[f"ring.{layer}"] = rel_finite(torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
     print({k: round(v, 4) for k, v in worst.items()})

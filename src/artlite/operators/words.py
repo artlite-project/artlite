@@ -52,8 +52,11 @@ class Kind:
     def words(self, names: str, *, at: int | None = None) -> tuple[int, ...]:
         """Declare the words of the blank-separated ``names`` one after the other (from word ``at``, else from the next
         free one): their indices."""
-        first = self.block(names.split()[0], 1, at=at)
-        return (first, *(self.word(n) for n in names.split()[1:]))
+        names = names.split()
+        first = self.next_free(len(names)) if at is None else at
+        for i, name in enumerate(names):
+            self.block(name, 1, at=first + i)
+        return tuple(range(first, first + len(names)))
 
     def block(self, name: str, n: int, *, at: int | None = None) -> int:
         """Declare ``n`` consecutive words under ``name`` (exported: the first one): its index."""

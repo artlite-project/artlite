@@ -34,6 +34,21 @@ from ml_dtypes import bfloat16
 
 from artlite.decode import gemv, kv
 from artlite.decode import phases as mp
+from artlite.decode.attn import (
+    F_ATT,
+    M_AHD,
+    M_AKIND,
+    M_ANH,
+    M_AOWN,
+    M_ATOK,
+    M_ATREC,
+    M_AWIN,
+    M_POS,
+    M_QC_HI,
+    M_QC_LO,
+    M_TOK_G0,
+    M_TOK_NA,
+)
 from artlite.decode.image import TileImage, column_rows
 from artlite.decode.protocol import (
     C_LEN,
@@ -66,6 +81,7 @@ from artlite.decode.protocol import (
     post_region_bytes,
     region_bytes,
 )
+from artlite.decode.vring import tails
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -311,10 +327,10 @@ class GemmaDraft:
             hi, lo = AT.score_constant(self._scalar(f"blk.{L}.attn_q_norm.weight", self.gguf),
                                        self.ov._scalar(f"blk.{self.src[L]}.attn_k_norm.weight"))
             m = np.zeros(META, np.int32)
-            m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = AT.F_ATT, -1 - SLOTS * int(not swa), 0
-            m[AT.M_AHD], m[AT.M_AKIND], m[AT.M_AOWN] = self.image.hd[L], int(not swa), 0
-            m[AT.M_QC_HI], m[AT.M_QC_LO], m[AT.M_ATOK] = hi, lo, SLOTS * int(not swa)
-            m[AT.M_AWIN], m[AT.M_ANH] = self.cfg.sliding_window - 1 if swa else 0, self.nq
+            m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = F_ATT, -1 - SLOTS * int(not swa), 0
+            m[M_AHD], m[M_AKIND], m[M_AOWN] = self.image.hd[L], int(not swa), 0
+            m[M_QC_HI], m[M_QC_LO], m[M_ATOK] = hi, lo, SLOTS * int(not swa)
+            m[M_AWIN], m[M_ANH] = self.cfg.sliding_window - 1 if swa else 0, self.nq
             act[off:off + 4 * META] = m.view(np.uint8)
         dev.flush("DACT")
         self._tr = self._build()
@@ -375,7 +391,7 @@ class GemmaDraft:
             self._fills.append((at, L, c))
             if c % AT.QH == AT.QH - 1:  # (the chain's end: the tail objects, one fill each)
                 self._tails += [(seq.fill("A", c, dev.address("KV", self.ov.ring_off[self.src[L]]), self.T), L, c)
-                                for _ in range(AT.tails(1))]
+                                for _ in range(tails(1))]
         if weights:
             self.ov._weight_run(seq, weights, image=self.image, buf="DW")
         seq.sync()  # (the q objects in DDR)
@@ -426,11 +442,11 @@ class GemmaDraft:
             pg = ov.at.pg[256 if swa else 512]
             r = ov._ranges(swa, pos - 1)
             m = act[self.tok + kind * XB:][:4 * META].view(np.int32)
-            m[AT.M_POS] = pos - 1
+            m[M_POS] = pos - 1
             for c in range(COLS):
                 g0, n = r[c % AT.QH]
-                no = kv.fill(g0, n, ov.at.kp)[1] + (AT.tails(1) if c % AT.QH == AT.QH - 1 else 0)
-                m[AT.M_TOK_G0 + c], m[AT.M_TOK_NA + c], m[M_TOK_NG + c] = g0 * pg, (ov.at.kp + 1) * n | no << 16, no
+                no = kv.fill(g0, n, ov.at.kp)[1] + (tails(1) if c % AT.QH == AT.QH - 1 else 0)
+                m[M_TOK_G0 + c], m[M_TOK_NA + c], m[M_TOK_NG + c] = g0 * pg, (ov.at.kp + 1) * n | no << 16, no
                 fills[(kind, c)] = kv.fill(g0, n, ov.at.kp)
             cs = AT.rope_tables(cfg, [pos], ov.at.rot, swa=swa)
             act[self.tok + kind * XB + 4 * META:][:cs.nbytes] = cs.view(np.uint8).reshape(-1)
@@ -459,7 +475,7 @@ class GemmaDraft:
                 ov.ring(src, h) + ((pos - 1) >> 3 & 1) * T
             ov._bd_words(self._tr.words, np.array([at]), np.array([kv0 + a]), np.array([T]))
         for (L, h), off in self.att.items():
-            act[off:off + 4 * META].view(np.int32)[AT.M_ATREC] = int(rec[self.src[L]])
+            act[off:off + 4 * META].view(np.int32)[M_ATREC] = int(rec[self.src[L]])
             dev.flush("DACT", off, 4 * META)
         self._tkey = key
         return True

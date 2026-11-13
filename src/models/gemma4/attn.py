@@ -9,32 +9,10 @@ sub-steps of at most 4 slots at head_dim 256, 2 at 512. The token objects: t = S
 
 import numpy as np
 
-from artlite.decode.attn import (
-    F_ATT,
-    M_AHD,
-    M_AKIND,
-    M_ANH,
-    M_AOWN,
-    M_ATOK,
-    M_ATREC,
-    M_AWIN,
-    M_POS,
-    M_QC_HI,
-    M_QC_LO,
-    M_TOK_A,
-    M_TOK_G0,
-    M_TOK_NA,
-    Attn,
-    U,
-    score_bits,
-)
+from artlite.decode.attn import Attn, score_bits
 from artlite.decode.attn import rope_tables as _rope_tables
 from artlite.decode.protocol import SLOTS
-from artlite.decode.vring import ring_rows, substeps, tails
 from artlite.operators.design import COLS
-
-__all__ = ["F_ATT", "M_AHD", "M_AKIND", "M_ANH", "M_AOWN", "M_ATOK", "M_ATREC", "M_AWIN", "M_POS", "M_QC_HI", "M_QC_LO",
-           "M_TOK_A", "M_TOK_G0", "M_TOK_NA", "U", "ring_rows", "substeps", "tails"]
 
 QH = 4  # query heads per KV head (one chain's columns)
 KV_HEADS = COLS // QH

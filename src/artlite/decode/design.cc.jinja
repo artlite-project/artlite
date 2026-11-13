@@ -1133,7 +1133,7 @@ void {{ p }}_tile(uint8_t *__restrict a, int32_t *__restrict ws, uint8_t *__rest
 {% if WIN in (5, 6, 7) %}
     if (st[{{ S_TEND }}]) {
         event1();
-        ((int32_t *)st)[63] = 0;
+        ((int32_t *)st)[{{ S_TEND }}] = 0;
     }
 {% endif %}
     {{ p }}_Win<1> w_;

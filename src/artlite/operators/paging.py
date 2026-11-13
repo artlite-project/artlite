@@ -275,7 +275,9 @@ class PageSpec:
     takes ``hdr`` and ``ctl``): the pager's state words (a core address), its wake lock (a core lock id) and, per core
     half that pages (a core of the column, or two sharing the kernels: a decode design's main and helper cores), the
     stream header of the half's request route (``request``), the BD of its first page (``Store.bd``: page i at
-    bd0 + i - 1) and the control header writing its page channel's start queue (``request``)."""
+    bd0 + i - 1) and the control header writing its page channel's start queue (``request``). The cores' resident stubs (the code
+    that asks for a page: the decode GEMV's, the attention's) stay in their own sources: they differ in the scratch
+    pointer and in what they keep across the call."""
 
     state: int
     wake: int

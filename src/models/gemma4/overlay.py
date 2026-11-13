@@ -50,6 +50,23 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode import kv
+from artlite.decode.attn import (
+    F_ATT,
+    M_AHD,
+    M_AKIND,
+    M_ANH,
+    M_AOWN,
+    M_ATOK,
+    M_ATREC,
+    M_AWIN,
+    M_POS,
+    M_QC_HI,
+    M_QC_LO,
+    M_TOK_A,
+    M_TOK_G0,
+    M_TOK_NA,
+    U,
+)
 from artlite.decode.model import InputRegion, ModelOverlay
 from artlite.decode.protocol import (
     C_LEN,
@@ -77,6 +94,7 @@ from artlite.decode.protocol import (
     packed_slots,
     post_region_bytes,
 )
+from artlite.decode.vring import substeps, tails
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -279,10 +297,10 @@ class GemmaOverlay(ModelOverlay):
             for a in range(SLOTS):
                 t = SLOTS * kind + a
                 m = np.zeros(META, np.int32)
-                m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = AT.F_ATT, -1 - t, 0
-                m[AT.M_AHD], m[AT.M_AKIND], m[AT.M_AOWN] = cfg.head_dim(L), kind, int(src == L)
-                m[AT.M_QC_HI], m[AT.M_QC_LO], m[AT.M_AWIN] = hi, lo, cfg.sliding_window if cfg.swa[L] else 0
-                m[AT.M_ANH], m[AT.M_ATOK] = AT.QH, t
+                m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = F_ATT, -1 - t, 0
+                m[M_AHD], m[M_AKIND], m[M_AOWN] = cfg.head_dim(L), kind, int(src == L)
+                m[M_QC_HI], m[M_QC_LO], m[M_AWIN] = hi, lo, cfg.sliding_window if cfg.swa[L] else 0
+                m[M_ANH], m[M_ATOK] = AT.QH, t
                 if src == L:  # (its K / V object last)
                     m[M_NASKIP] = 0
                     kv = np.zeros(META, np.int32)
@@ -370,7 +388,7 @@ class GemmaOverlay(ModelOverlay):
                 st.fills.append((seq.fill("A", c, dev.address("KV", self.kv_off[src]), T), L, c, u))
                 if c % AT.QH == AT.QH - 1:  # (one object each: the slots of its records, ``_tails``)
                     st.tails += [(seq.fill("A", c, dev.address("KV", self.ring_off[src]), T), L, c, u, t)
-                                 for t in range(AT.tails(n))]
+                                 for t in range(tails(n))]
             last = u == len(subs) - 1 and weights
             if last:
                 self._weight_run(seq, weights, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
@@ -428,8 +446,8 @@ class GemmaOverlay(ModelOverlay):
     def subs(self, p: int, S: int) -> tuple[tuple[tuple[int, int], ...], ...]:
         """The attentions' sub-steps (first slot, slots) of a step at p .. p + S - 1 per layer kind (0 SWA, 1 full):
         within a pair of records (``attn``: P V adds two records together; a group holds whole pairs)."""
-        out = tuple(tuple(AT.substeps(p, S, 16, self.at.slots(hd))) for hd in (256, 512))
-        assert max(len(x) for x in out) <= AT.U, (p, S)
+        out = tuple(tuple(substeps(p, S, 16, self.at.slots(hd))) for hd in (256, 512))
+        assert max(len(x) for x in out) <= U, (p, S)
         return out
 
     def passes(self, p: int, S: int) -> int:
@@ -497,7 +515,7 @@ class GemmaOverlay(ModelOverlay):
                 if self._trec.get((L, a)) != ma:
                     for h in range(AT.KV_HEADS):
                         off = self.att_reg[(L, h)] + a * XB
-                        act[off:off + 4 * META].view(np.int32)[AT.M_ATREC] = ma
+                        act[off:off + 4 * META].view(np.int32)[M_ATREC] = ma
                         self.dev.flush("ACT", off, 4 * META)
                     self._trec[(L, a)] = ma
 
@@ -514,9 +532,9 @@ class GemmaOverlay(ModelOverlay):
         assert 0 <= p and p + S <= self.max_positions, (p, S)
         assert st.subs == self.subs(p, S), (p, S, st.subs)
         act = dev.view("ACT")
-        pu = np.zeros((2, AT.U, 2), np.int64)  # (per kind and sub-step: first position, slots)
-        fo = np.zeros((2, AT.U, AT.QH, 2), np.int64)  # (per kind, sub-step and column of the chain: its A fill)
-        ro = np.zeros((2, AT.U, 6, 3), np.int64)  # (per kind, sub-step and i-th record: base, offset, bytes)
+        pu = np.zeros((2, U, 2), np.int64)  # (per kind and sub-step: first position, slots)
+        fo = np.zeros((2, U, AT.QH, 2), np.int64)  # (per kind, sub-step and column of the chain: its A fill)
+        ro = np.zeros((2, U, 6, 3), np.int64)  # (per kind, sub-step and i-th record: base, offset, bytes)
         for kind, swa in ((0, True), (1, False)):
             hd = 256 if swa else 512
             pg = self.at.pg[hd]
@@ -525,17 +543,17 @@ class GemmaOverlay(ModelOverlay):
                 o = self.tok + (SLOTS * kind + a) * XB
                 act[o + 4 * META:o + 4 * META + cs.size] = cs
                 m = act[o:o + 4 * META].view(np.int32)
-                m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[AT.M_TOK_NA:AT.M_TOK_NA + COLS] = 0, 0, 0
+                m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[M_TOK_NA:M_TOK_NA + COLS] = 0, 0, 0
             for u, (a, n) in enumerate(st.subs[kind]):
                 r = self._ranges(swa, p + a)
                 o = self.tok + (SLOTS * kind + a) * XB
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)
-                m[M_NS], m[AT.M_POS], m[AT.M_TOK_A] = n, p + a, a
+                m[M_NS], m[M_POS], m[M_TOK_A] = n, p + a, a
                 for c in range(COLS):  # (every KV head's columns: the same ranges)
                     g0, ng = r[c % AT.QH]
-                    no = kv.fill(g0, ng, self.at.kp)[1] + (AT.tails(n) if c % AT.QH == AT.QH - 1 else 0)
-                    m[AT.M_TOK_G0 + c], m[AT.M_TOK_NA + c], me[M_TOK_NG + c] = g0 * pg, self.G * ng | no << 16, no
+                    no = kv.fill(g0, ng, self.at.kp)[1] + (tails(n) if c % AT.QH == AT.QH - 1 else 0)
+                    m[M_TOK_G0 + c], m[M_TOK_NA + c], me[M_TOK_NG + c] = g0 * pg, self.G * ng | no << 16, no
                 pu[kind, u] = p + a, n
                 fo[kind, u] = [kv.fill(*rj, self.at.kp) for rj in r]
                 rec = kv.records(p=p + a, S=n, hd=256 if swa else 512, a_bytes=T, kp=self.at.kp)
