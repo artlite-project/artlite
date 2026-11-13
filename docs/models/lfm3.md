@@ -145,13 +145,15 @@ which then scales up their small errors. The language model hardly notices: teac
 M=LiquidAI/LFM3-Audio-2B-GGUF
 artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --audio speech.wav
 artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --audio speech.wav --live realtime
+artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --tts "Hello there." -o hello.wav
+artlite-cli -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf --audio question.wav --speak reply.wav
 artlite-server -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-Q8_0.gguf
 ```
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/LFM3-Audio-2B-GGUF/   LiquidAI/LFM3-Audio-2B-GGUF
     LFM3-Audio-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, its own weights; Q4_0 too)
-    mmproj-LFM3-Audio-2B-Q8_0.gguf                 (its speech encoder, and the speech decoder Artlite does not run yet)
+    mmproj-LFM3-Audio-2B-Q8_0.gguf                 (its speech encoder and its speech generator)
 ```
 
 LiquidAI's LFM3-Audio-2B is LFM3's trunk with a speech encoder: the language model runs as LFM3-1.7B does (above), a
@@ -209,6 +211,50 @@ Live (the 179-s chapter paced as a microphone's, through artlite-server's websoc
 alike): each 0.96 s of audio takes the NPU ~170 ms (the encoder's band ~27 ms, then its 12 rows and its text as decode
 steps), busy 17% of the audio's time, with 4% of a CPU core; a chunk's text comes ~0.18 s after its audio (llama.cpp's
 live mode on the iGPU: ~0.05 s). As fast as it goes, the 179 s take 32 s.
+
+### Speech output
+
+The mmproj's speech generator turns the language model's hidden states into speech, as llama.cpp's `llama-tts` and
+llama-server do:
+
+- **Text to speech** (`--tts`, artlite-server's `/tts` and `/v1/audio/speech`): the file's tts template, "Perform TTS
+  in American English using a female voice." (`--language`: ar, da, de, el, en, en-gb, es, fi, fr, he, it, ja, ko, nl,
+  pl, pt, sv, tr, zh, or a language's name; `--voice female` or `male`; the model has no voice cloning), until the
+  model's end of audio (or `-n` frames of 80 ms, 512 by default), 24 kHz, streamed every 0.32 s of speech. One
+  prompt whatever the text's length, as llama.cpp's.
+- **Spoken replies** (`--speak`, a chat's `modalities: ["text", "audio"]`, artlite-server's realtime conversations):
+  the model's interleaved text and speech (blocks of 6 text tokens and 12 frames; after `<|text_end|>` speech until its
+  end, then text), the text printed as it comes; a question can be audio (`--audio`).
+
+A frame (80 ms of speech) is a decode step of the language model without its LM head (the hidden state read from the
+LM head's input), then the mmproj's depthformer on the vision overlay: 12 codebooks in 3 passes of 4 (a frame's own
+random order; 3 layers over the 12 codebooks' slots, each pass's logits in fp32), the codes sampled on the host with the
+model card's settings (temperature 1, top-k 128, a repetition penalty of 1.1), their 12 embedding rows summed into the
+next step's input. Every 4 frames the codec decoder (8 layers over 6 positions a frame: short convolutions, attention
+over a window of 30) on the vision overlay turns them into a log-magnitude and phase spectrum, the host its samples
+(inverse FFT, overlap-add). Each frame switches the NPU between the language model's hardware context and the vision
+overlay's twice (~2.5 ms each).
+
+The depthformer's logits are within KL ~8e-4 per codebook of an exact (float64) depthformer (llama.cpp's: ~4e-4; the
+bfp16 weights and inputs), the codec's samples 26.7 dB from an exact codec's (a bfloat16 codec, the reference's dtype:
+28.9 dB), and none of it shows in the speech: 200 LibriSpeech sentences spoken twice each and transcribed back by
+Whisper base.en have a word error rate of 3.32%, llama.cpp's TTS (CPU) 3.47% (paired: -0.15 points, 95% interval
+-0.49 .. +0.16); neither ran past 512 frames.
+
+Text to speech through each runtime's server (`/tts`, streamed; Strix Halo, warm; energy: the SoC's power above a
+~18 W idle):
+
+| | 9 s of speech | 41 s of speech | first audio | energy per minute of speech |
+|---|---|---|---|---|
+| Artlite (NPU), Q4_K_M | 3.5 s | 16.4 s | 0.17 s | 390 J |
+| Artlite (NPU), Q4_0 | 3.6 s | 15.8 s | 0.17 s | 420 J |
+| llama.cpp, CPU (16 threads), Q4_K_M | 2.3 s | 10.4 s | 0.2 s | 790 J |
+| llama.cpp, iGPU (Vulkan), Q4_K_M | 1.6 s | 7.6 s | 0.11 s | 470 J |
+
+A frame takes the NPU ~31 ms (the language model's step ~17 ms, the depthformer's 4 dispatches ~7 ms, the two
+switches between the hardware contexts ~5 ms, the codec ~0.7 ms), 2.5x real time; the iGPU is faster, the NPU takes
+half of the CPU's energy and somewhat less than the iGPU's, and leaves both free (its host side still keeps the CPU
+cores at ~10 W).
 
 ## d1-2B (decision model)
 

@@ -33,9 +33,11 @@ device rather than for portability.
   they apply.
 - **A local model for coding agents.** Claude Code, Codex and opencode work against `artlite-server`, with tool calls
   and a prompt cache, so each turn reads only what is new ([Agents](docs/server.md#agents)).
-- **Speech to text.** LFM3-Audio transcribes audio files and live audio (`/v1/audio/transcriptions`, OpenAI's
+- **Speech in and out.** LFM3-Audio transcribes audio files and live audio (`/v1/audio/transcriptions`, OpenAI's
   realtime transcription) with llama.cpp's accuracy, at two thirds of the iGPU's energy and a third of the CPU's,
-  live with the NPU busy a sixth of the time ([LFM3-Audio](docs/models/lfm3.md#lfm3-audio-2b-speech)).
+  live with the NPU busy a sixth of the time; it speaks text (`/tts`, `/v1/audio/speech`) and answers in voice
+  (a chat's audio output, realtime conversations) at ~2.5x real time, as intelligibly as llama.cpp's
+  ([LFM3-Audio](docs/models/lfm3.md#lfm3-audio-2b-speech)).
 - **Embeddings, rerank and decisions.** `artlite-server` answers llama-server's `/v1/embeddings`, `/v1/rerank` and
   `/v1/systemone` for embedding, reranker and decision models, also beside a chat model, with 2-5x less energy than the
   iGPU and the GPU left free ([Embeddings and rerank](docs/server.md#embeddings-and-rerank),
@@ -100,7 +102,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 | [Qwen3 0.6B, Qwen3-Embedding 0.6B / 4B, Qwen3-Reranker 0.6B, Decision-2.0-Kai 0.6B](docs/models/qwen3.md) | GGUF Q4_1, Q8_0, Q4_K_M | prefill, decode; embeddings, rerank, decisions |
 | [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0 | prefill, decode with its MTP drafter |
 | [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B; the decision models d3-lite, d3-nano, Kev-4B](docs/models/qwen35.md) | GGUF Q4_K_M, Q8_0; Occamy's IQ3_XXS / Q3_K mix | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's); decisions, also about images |
-| [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B; the decision model d1-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio Q4_K_M, Q4_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription); decisions, also about images |
+| [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B; the decision model d1-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio Q4_K_M, Q4_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription) and its generator (text to speech, spoken replies); decisions, also about images |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).

@@ -44,6 +44,6 @@ architecture, tokenizer and chat template come from its metadata.
 | lfm3 | ✅ LFM3-1.7B | LiquidAI QAD-Q4_0, Q4_K_M, Q8_0 | the sliding-window layers' caches as rings; LiquidAI BF16 |
 | | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0, its mmproj Q8_0 (images) | video |
 | | ✅ LFM3-VL-2B | LiquidAI QAD-Q4_0, its mmproj BF16, Q8_0 (images) | video; LiquidAI Q4_K_M, Q8_0 |
-| | ✅ LFM3-Audio-2B (speech in: [transcription, live transcription](lfm3.md#lfm3-audio-2b-speech)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | speech out; LiquidAI Q8_0 |
+| | ✅ LFM3-Audio-2B (speech in: [transcription, live transcription](lfm3.md#lfm3-audio-2b-speech); speech out: [text to speech, spoken replies](lfm3.md#speech-output)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | LiquidAI Q8_0 |
 | | 🤔 LFM3-Omni-2B | | LiquidAI LFM3-Omni-2B, d1-Omni-2B |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
