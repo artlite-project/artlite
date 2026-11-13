@@ -160,7 +160,7 @@ class LlamaPrefill(ChunkPrefill):
                                          window=win) for T in self.pack_sizes}
         # (after a history of up to RING_HOLD groups: the window and the history in the memory tiles, each group read
         # once; hi + lo K and a pass a cache group)
-        hold = (min(RING_HOLD, PA.AttnOperator.ring_groups(s, win, s.blocks[0]))
+        hold = (min(RING_HOLD, PA.ring_groups(s, win, s.blocks[0]))
                 if s.kp == 2 and s.pg == 32 * s.blocks[0] else 0)
         self.rattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
                                          window=win, ring=hold) for T in self.pack_sizes if T >= RING_MIN} if hold else {}

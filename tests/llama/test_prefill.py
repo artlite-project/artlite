@@ -1,7 +1,7 @@
 """The Llama prefill on the NPU (models/llama/prefill.py; its GEMMs: prefill/test_gemm.py, its norms:
 prefill/test_norm.py):
 
-- the attention (prefill/attn.py): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
+- the attention (prefill/attn/): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
   logits (Llama; Qwen3 0.6B Q4_1, Qwen3-Embedding-0.6B Q8_0 and -4B: q / k norms, all-Q8_0 GEMMs, a hidden size of

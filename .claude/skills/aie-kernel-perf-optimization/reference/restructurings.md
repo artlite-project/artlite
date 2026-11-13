@@ -80,7 +80,7 @@ loop 2 patches a range in place, each loop walking its own `__restrict` pointers
 - **Row sums**: A B_j^T, with B_j a panel of ones in row j, sums each row of A into lane j. The panels of a group
   against B_0 .. B_7 give the group sums of every row (a quantized GEMV's offset terms) inside the loop that builds
   the panels, with no vector reductions. l += P J (J a panel of ones) next to P V gives a softmax's row sums
-  (`prefill/attn.py`).
+  (`prefill/attn/`).
 - **Exact hi / lo split of fp32 x**: accumulator = x; `mac(bfp16(x), op_transpose(-I))` leaves x - hi exactly; both
   halves converted: about 14 bits per block (`al::split_hilo`, `al::hilo4`).
 - **Affine dequant `w = a q + b`**: diag(a) Q^T - diag(|b|) 1^T with unsigned mantissas, exact when the products are.
@@ -262,7 +262,7 @@ tokens: `_dq` 36%, the header 6% of each core's time) can each derive a part and
   846 cycles. gate/up then sits near its weight stream (1.24 ms with the kernels compiled out): further kernel gains
   show only in the GEMMs of fewer passes.
 
-## R13 Flash attention with several query heads per core (`prefill/attn.py`)
+## R13 Flash attention with several query heads per core (`prefill/attn/`)
 
 A core holds QB x qh row blocks (8 queries of one head each) and streams the KV head's records; Llama 3B, 2048 tokens
 at p0 = 8K, per layer 88 -> 15.1 ms (cache-bound: 13.1 ms with the compute compiled out). Each step was a measured

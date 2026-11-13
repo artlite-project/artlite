@@ -7,9 +7,9 @@ description: Build, extend or speed up a model's prompt prefill on the NPU on to
 
 Reference implementations: `models/qwen35/prefill.py` (`QwenPrefill`), `models/gemma4/prefill.py`
 (`GemmaPrefill`) and `models/llama/prefill.py` (`LlamaPrefill`: pre-norm residual adds, one column per KV head, the
-shared attention on the decode's KV record format `prefill/attn.py`); their module docstrings describe each
+shared attention on the decode's KV record format `prefill/attn/`); their module docstrings describe each
 layer's operators. Read the one closer to the new model first, then `prefill/gemm.py` (the GEMM planner they
-use), `prefill/norm.py` (the residual norms: bf16 `PrefillNormOperator`, fp32 `ResidualNormOperator`)
+use), `prefill/norm/` (the residual norms: bf16 `PrefillNormOperator`, fp32 `ResidualNormOperator`)
 and `prefill/chunks.py` (`ChunkPrefill`, their base: chunk plan, pieces, buffer slices, library program; a
 model supplies its runlist, static buffers and time model). Kernel and data-movement work inside it: the
 **aie-kernel-perf-optimization** skill.

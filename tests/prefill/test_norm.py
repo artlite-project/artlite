@@ -1,4 +1,4 @@
-"""The prefills' norms (prefill/norm.py): PrefillNormOperator ((x += delta,) RMSNorm on a bf16 residual:
+"""The prefills' norms (prefill/norm/): PrefillNormOperator ((x += delta,) RMSNorm on a bf16 residual:
 Qwen's, Llama's) vs torch, ResidualNormOperator (an fp32 residual: Gemma's modes) vs its fp64 model."""
 
 import numpy as np

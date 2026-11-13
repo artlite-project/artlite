@@ -45,8 +45,8 @@ objects.
   step's position, its cache records are overwritten.
 - The prompt runs on a prefill (`lfm/prefill.py`, `LfmPrefill`): chunks of up to 4096 tokens through all 24 layers, as
   GEMMs on the same weights (`prefill/gemm.py`), the conv (`lfm/conv_prefill.py`, one core per column), the attention
-  shared with Llama and Qwen3 (`prefill/attn.py`: one cache stream per KV head for its two columns, the gates, the
-  sliding windows) and fp32 norms (`prefill/norm.py`). It writes the KV caches and the conv histories the decode
+  shared with Llama and Qwen3 (`prefill/attn/`: one cache stream per KV head for its two columns, the gates, the
+  sliding windows) and fp32 norms (`prefill/norm/`). It writes the KV caches and the conv histories the decode
   continues from; the prompt's last token's logits come from the LM head alone.
 - The conv histories hold the whole sequence: a position is kept only where a checkpoint was taken (`artlite-server`'s
   prompt cache: a checkpoint is 2.8 MB, copied in under a millisecond).
@@ -393,7 +393,7 @@ its questions in one sequence); llama-server on the iGPU 362 / 317 / 701 ms, 3.3
 How it runs: its full-attention layers are non-causal, so a request is read as d1's own runner reads it, the state
 once and up to 16 questions after it in one sequence (a request's `set_size`: [Decisions](../server.md#decisions)),
 in one prefill chunk from position 0 (at most 4096 tokens). The chunk's full layers use the prefill attention's
-non-causal design (`prefill/attn.py`): every pass streams the sequence's cache groups, the state's tokens see every
+non-causal design (`prefill/attn/`): every pass streams the sequence's cache groups, the state's tokens see every
 token, a question's tokens the state and their own question (per row its own keys, in an object per pass; the chunks
 no row of a core sees skipped). The sliding-window and conv layers stay causal, the conv from zero histories. The
 answers come from each question's last row and its options' label tokens' rows of the LM head, on the host. A

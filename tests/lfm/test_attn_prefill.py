@@ -1,4 +1,4 @@
-"""The prefill attention on LFM3's shapes (prefill/attn.py with ``Shape(per=2, gate=True)``): two columns per KV head
+"""The prefill attention on LFM3's shapes (prefill/attn/ with ``Shape(per=2, gate=True)``): two columns per KV head
 (each column its two query heads, the KV head's K and V from both columns' halves), q / k RMS-normed with weights per
 dim, a sigmoid output gate per head, full layers (32 rotated pairs: the other pairs' cos 1, sin 0) and sliding-window
 layers (a window of 256 positions, the cache after a guard of its groups), on random projections of a chunk at p0 after a

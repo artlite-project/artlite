@@ -240,7 +240,7 @@ BDs:
   objects (`txn.shim_bd(..., iteration=(step_words, count))`).
 - A memtile BD's word 6 changes under the DMA: `Iteration_Current` (bits 28:23) advances each time the BD loads
   (AM029 DMA_BD0_6); writing the BD resets it.
-- A memory tile's DMA driven from the runtime sequence (`prefill.attn.AttnOperator._ring_memtiles`: in the split module
+- A memory tile's DMA driven from the runtime sequence (`prefill.attn.ring.ring_memtiles`: in the split module
   a forward's memtile pool and endpoints replaced by `aie.route_endpoint`s the routes name, buffers, locks and
   `dma_configure_task_for` tasks started once per dispatch, freed after the drains): a runtime BD has three data
   dimensions and its iteration (`#aie.bd_iteration`, the outermost slot; the memtile's fourth dimension is out of
