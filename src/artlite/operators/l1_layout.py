@@ -90,7 +90,8 @@ def _nbytes(memref: ir.Type) -> int:
 
 def check_placement(placed: dict[tuple[int, int], list[tuple[str, int, int]]]) -> None:
     """Per core tile, the pinned buffers (name, address, bytes) are ``L1_ALIGN``-aligned, inside L1 and pairwise
-    disjoint; HardwareLimitError naming the buffers."""
+    disjoint; HardwareLimitError naming the buffers. A buffer whose element type has no width counts as 0 bytes (only
+    its address is checked)."""
     for tile, buffers in placed.items():
         end, last = 0, None
         for name, addr, nbytes in sorted(buffers, key=lambda b: b[1]):

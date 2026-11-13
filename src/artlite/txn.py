@@ -458,14 +458,9 @@ def hang_note(words: np.ndarray, health: Mapping[str, int] | None, *, what: str)
 # ----------------------------------------------------------------------
 
 
-def verify_enabled() -> bool:
-    """Whether ``ARTLITE_VERIFY_TXN=1``: the transactions' producers run ``verify`` on what they build or load."""
-    return os.environ.get("ARTLITE_VERIFY_TXN") == "1"
-
-
 def verify_if_enabled(words: np.ndarray, *, queues: bool = True) -> None:
     """``verify`` when ``ARTLITE_VERIFY_TXN=1`` (never per dispatch: where a transaction is created or loaded)."""
-    if verify_enabled():
+    if os.environ.get("ARTLITE_VERIFY_TXN") == "1":
         verify(words, queues=queues)
 
 
@@ -490,7 +485,7 @@ def verify(words: np.ndarray, *, queues: bool = True) -> None:
       written (else the token is lost, and the ``sync`` hangs);
     - ``queues``: the shim channels' task queues, modelled as the host sequencers drive them (``overlay.Sequence``): a
       push queues a task (with the BDs of its chain), a ``sync`` retires a channel's tasks up to its first token task
-      (none: it would wait forever), a poll of a channel's queue status register retires the oldest tasks until the
+      (none: it would wait forever; several token tasks take several syncs), a poll of a channel's queue status register retires the oldest tasks until the
       polled size holds; a channel never holds more than ``QUEUE_DEPTH`` tasks (a push on a full queue blocks the
       firmware), no BD is rewritten while a task that uses it is queued (the task would run with the new words),
       and no task is queued at the end (the next dispatch rewrites the BDs from its start). A sequencer whose waits

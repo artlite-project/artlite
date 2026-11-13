@@ -80,6 +80,20 @@ def test_verify_sequence() -> None:
     txn.verify(words, queues=False)
 
 
+def test_verify_array_tasks() -> None:
+    """Tasks the array pushes itself retire without a trace in the words: the queue model is skipped, the static
+    checks still run."""
+    seq = Sequence(OP, inputs=("X",))
+    for i in range(4):
+        seq.fill("A", 0, 0x8000_0000 + 4096 * i, 4096)
+    seq.device_task("A", 0)
+    seq.drain("C", 0, 0xA000_0000, 512)
+    seq.device_done("A", 0)
+    seq.fill("A", 0, 0x8000_0000, 4096)
+    seq.sync(fills=True)
+    txn.verify(seq.words(), queues=False)
+
+
 def test_verify_qos() -> None:
     """A BD blockwrite with a nonzero AxQoS, a clear valid bit or a zero length is refused, naming the operation."""
     t = _controlled()

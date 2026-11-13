@@ -101,6 +101,7 @@ class Sequence:
         self._controlled: set[tuple[int, int, int]] = set()
         # per channel the push ops not waited for (None: a task the array pushed)
         self._queued: dict[tuple[int, str], list[int | None]] = {}
+        self._array_tasks = False  # (``device_task`` was used: the words do not show those tasks' retirement)
 
     def _controller(self, col: int, direction: int, channel: int) -> None:
         if (col, direction, channel) not in self._controlled:
@@ -162,7 +163,8 @@ class Sequence:
         """A task of the stream that the array pushes (into the column's queue, without a token) after the transfers
         issued so far; the queue keeps a slot for it."""
         self._room(stream, col, lambda q: len(q) < txn.QUEUE_DEPTH)
-        self._queued[(col, stream)].append(None)
+        self._queued.setdefault((col, stream), []).append(None)
+        self._array_tasks = True
 
     def device_done(self, stream: str, col: int) -> None:
         """The array's tasks of the column's stream are complete (a sync waited for outputs that consumed them), and so
@@ -204,7 +206,8 @@ class Sequence:
     def words(self) -> np.ndarray:
         assert not any(self._queued.values()), "tasks whose tokens are not waited for (sync(fills=True))"
         words = self.txn.words()
-        txn.verify_if_enabled(words)
+        # the queue model sees only the host's tasks: the array's own (``device_task``) retire without a trace
+        txn.verify_if_enabled(words, queues=not self._array_tasks)
         return words
 
 
