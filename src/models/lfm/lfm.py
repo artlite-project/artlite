@@ -309,6 +309,19 @@ class Lfm(Model):
                                    "enable_thinking": think, "preserve_thinking": preserve, "bos_token": bos,
                                    **(variables or {})})
 
+    def media_tokens(self, data: bytes, kind: str) -> list[int] | Sequence:
+        """A media file as a decision prompt reads it where its text has ``MEDIA_MARKER`` (llama.cpp's mtmd): an image
+        (``image_tokens``) or a video's frames, without its soundtrack (d1's runner's), between the vision markers; a
+        clip between them where the mmproj has a vision tower (LFM3-Omni's), bare otherwise."""
+        if kind == "image":
+            return self.image_tokens(data)
+        if kind == "video" and self.vision is None or kind == "audio" and self.audio is None:
+            raise ValueError(f"{self.name}: {kind} needs an mmproj with its encoder")
+        start, end = self.vision.markup if self.vision is not None else ("", "")
+        seq = self.video_sequence(data, soundtrack=False) if kind == "video" else self.audio.sequence(data)
+        self._vision_ran()
+        return self.tokenizer.encode(start) + seq + self.tokenizer.encode(end)
+
     def audio_stream(self) -> object:
         """A stream's rows on the speech encoder as its samples arrive (``models.lfm3a.live.Stream``)."""
         from ..lfm3a import live

@@ -212,17 +212,17 @@ curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '
 ```
 
 The decision types artlite-server reads: vllm-d3, pplx-decider, openjev, lev, nimble (the logits of the options' label
-tokens), lfm3-d1 (LiquidAI's d1: the largest logit of each option's label tokens), kev (its head's products of the last
+tokens), lfm3-d1 and lfm3-d1-omni (LiquidAI's d1: the largest logit of each option's label tokens), kev (its head's products of the last
 token's and each option's rows) and vllm-decision2 (a joint head over the rows at the ends of the options and of the
 question), computed on the host from the prompt's output rows. Of the published files, vllm-sr's d3-lite and d3-nano
 (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M), Decision-2.0-Kai-0.6B (llama.cpp's converter run on vllm-sr's
-checkpoint: vllm-sr's own GGUF is a fork's format) and LiquidAI's d1-2B (Q4_0, Q4_K_M, Q8_0) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
+checkpoint: vllm-sr's own GGUF is a fork's format), LiquidAI's d1-2B (Q4_0, Q4_K_M, Q8_0) and d1-Omni-2B (Q8_0) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
 at most 2048 tokens (a longer prompt: 400), and it generates no text (d3-lite: a question of 103 / 256 / 1024 prompt
 tokens in 32 / 39 / 113 ms, HTTP included); other types' questions share the state's tokens through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
 on a causal Qwen3.5 model the state once, then the questions packed after it, each continuing the state's Gated
 DeltaNet and attention state, or the questions' whole prompts packed, whichever the estimates say is faster (Kev-4B, 8
 questions of 64 tokens after a 256-token state: 387 ms, 1006 one after another; S0's requests of 4-8 questions after
-a 150-650-token state: 1.6-2.1x faster, the same answers). Other types (laya, clef, lfm2-d1, lfm2-d1-omni, lfm3-d1-omni)
+a 150-650-token state: 1.6-2.1x faster, the same answers). Other types (laya, clef, lfm2-d1, lfm2-d1-omni)
 answer 501.
 
 Pictures (a d3 or d1 model started with its `--mmproj`; the router pairs the mmproj of the model's directory by
@@ -232,9 +232,13 @@ they head the state, each through the vision encoder once ([d3](models/qwen35.md
 The answers are llama-server's within the model's usual difference (d1-2B Q4_0 57 / 57, d3-lite 56 / 57, d3-nano
 57 / 57 on 57 questions about pictures); a question about a 512 x 512 picture takes 68-104 ms through the server
 (1280 x 1280: 0.5-1.1 s), 8 questions about it 126 ms (d1, one sequence) to 561 ms (d3-nano). A file's
-`decision.temperature.image` (llama-server's), where it has one, calibrates a request with pictures. Without the
-encoder, pictures answer 501, as do audio (`input_audio` parts, audio data URIs), video (d1's `video_url` parts) and
-pictures for the other types.
+`decision.temperature.image` (llama-server's), where it has one, calibrates a request with pictures. A d1 model's
+requests also take videos (data URIs, a chat state's `video_url` parts: their frames, as d1's runner reads them; FFmpeg
+on PATH), and d1-Omni's audio clips (data URIs, `input_audio` parts) and spoken questions (a question's
+`instructions` an `input_audio` part: heard where its text would be, after the state's media), as llama-server
+reads them (d1-Omni-2B Q8_0: 8 of 9 answers about a clip, a picture with a spoken question and a video llama-server's,
+the other a near tie; the probabilities within 0.042). Without the encoder they take, pictures, video and audio
+answer 501, as do audio and video for the other types.
 
 A d1 model reads a request's questions as its own runner does (its `set` attention): the state once, then up to 16
 questions after it in one sequence, each answered at its last token; the state's tokens see every token, a question's

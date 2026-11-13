@@ -156,25 +156,28 @@ DECISION_FILES = {"d3-lite":"ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf",
                   "d3-nano": "ggml-org/vllm-d3-nano-GGUF/vllm-d3-nano-Q8_0.gguf",
                   "kev": "ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf",
                   "kai": "vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf",
-                  "d1-2b": "LiquidAI/d1-2B-GGUF/d1-2B-Q4_0.gguf"}
+                  "d1-2b": "LiquidAI/d1-2B-GGUF/d1-2B-Q4_0.gguf",
+                  "d1-omni": "LiquidAI/d1-Omni-2B-GGUF/d1-Omni-2B-Q8_0.gguf"}
 
 
 def decision_gguf(name: str = "d3-lite") -> str:
     """A decision model's GGUF file (``{arch}.decision.*`` metadata: llama-server's ``/v1/systemone``): vllm-sr's d3-lite
     and d3-nano (``qwen35``, non-causal: ggml-org's Q8_0), Kev-4B (``qwen35``: ggml-org's Q4_K_M), Decision-2.0-Kai-0.6B
     (``vllm-decision2``: Qwen3 0.6B and a head; llama.cpp's converter run on vllm-sr's checkpoint, whose own GGUF
-    is a fork's format, Q8_0), LiquidAI's d1-2B (``lfm3``, non-causal full layers: ``d1_gguf``'s Q4_0)."""
+    is a fork's format, Q8_0), LiquidAI's d1-2B (``lfm3``, non-causal full layers: ``d1_gguf``'s Q4_0) and d1-Omni-2B
+    (its Q8_0: audio, video frames and spoken questions too)."""
     return os.path.join(MODELS_DIR, DECISION_FILES[name])
 
 
 DECISION_MMPROJ = {"d3-lite": "ggml-org/vllm-d3-lite-GGUF/mmproj-vllm-d3-lite-Q8_0.gguf",
                    "d3-nano": "ggml-org/vllm-d3-nano-GGUF/mmproj-vllm-d3-nano-Q8_0.gguf",
-                   "d1-2b": "LiquidAI/d1-2B-GGUF/mmproj-d1-2B-Q8_0.gguf"}
+                   "d1-2b": "LiquidAI/d1-2B-GGUF/mmproj-d1-2B-Q8_0.gguf",
+                   "d1-omni": "LiquidAI/d1-Omni-2B-GGUF/mmproj-d1-Omni-2B-Q8_0.gguf"}
 
 
 def decision_mmproj(name: str = "d3-lite") -> str:
     """A decision model's vision encoder (images in its requests): d3-lite's and d3-nano's Qwen3-VL towers (768 / 1024
-    wide: ggml-org's Q8_0), d1-2B's LFM3-VL encoder (LiquidAI's Q8_0)."""
+    wide: ggml-org's Q8_0), d1-2B's LFM3-VL encoder (LiquidAI's Q8_0), d1-Omni-2B's (its tower and speech encoder)."""
     return os.path.join(MODELS_DIR, DECISION_MMPROJ[name])
 
 

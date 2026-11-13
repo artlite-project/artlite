@@ -241,3 +241,77 @@ def test_images(name: str) -> None:
           f"{'a sequence vs the CPU model' if cpu else 'packed vs alone'} {worst_set:.4f}")
     assert same >= n - 1 and worst < IMAGE_DP[name]
     assert worst_set < 0.03
+
+
+AUDIO_QUESTIONS = {
+    "voice": {"type": "choice", "instructions": "Who is speaking?",
+              "criteria": {"a man": None, "a woman": None, "a child": None}},
+    "topic": {"type": "choice", "instructions": "What is the speaker talking about?",
+              "criteria": {"a meal": None, "a sports game": None, "a computer program": None, "a celebration": None}},
+    "calm": {"type": "noul", "instructions": "Does the speaker sound calm?"},
+    "urgency": {"type": "score", "instructions": "How urgent is the message?",
+                "criteria": ["not urgent", "somewhat urgent", "urgent", "very urgent"]},
+}
+
+
+def omni_bodies(clip: bytes, question: bytes, video: bytes) -> list[dict]:
+    """A clip in ``files`` with a state; the astronaut with a spoken question (a LibriSpeech clip as its instructions)
+    and a written one, a null state; a chat state with a video's frames (``video_url``) and text."""
+    b64 = lambda b: base64.b64encode(b).decode()
+    with Image.open(ASTRONAUT) as im:
+        astro = _url(im.convert("RGB"), "JPEG")
+    spoken = {"type": "choice", "instructions": {"type": "input_audio", "input_audio": {"data": b64(question)}},
+              "criteria": {"an animal": None, "a vehicle": None, "a building": None}}
+    return [{"state": "A voicemail a customer left.", "files": ["data:audio/wav;base64," + b64(clip)],
+             "questions": AUDIO_QUESTIONS},
+            {"state": None, "images": [astro], "questions": {"spoken": spoken, "person": IMAGE_QUESTIONS["person"]}},
+            {"state": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,"
+                                                                                       + b64(video)}},
+                                                    {"type": "text", "text": "Does this look right?"}]}],
+             "questions": {k: IMAGE_QUESTIONS[k] for k in ("scene", "person", "count")}}]
+
+
+def test_omni_media(tmp_path: object) -> None:
+    """d1-Omni-2B's media (``lfm3-d1-omni``): an audio clip, a spoken question (heard where its text would be, after
+    the state's media), a video's frames; each question alone against llama-server's CPU answers (cached), the same
+    usage."""
+    from .common import SPEECH_CLIP, video_file
+    path, mmproj = decision_gguf("d1-omni"), decision_mmproj("d1-omni")
+    if not (os.path.exists(path) and os.path.exists(mmproj) and os.path.exists(SPEECH_CLIP)):
+        pytest.skip(f"{path}, {mmproj} or {SPEECH_CLIP} missing")
+    with open(SPEECH_CLIP, "rb") as f:
+        clip = f.read()
+    with open(SPEECH_CLIP.replace("0001", "0000"), "rb") as f:
+        question = f.read()
+    with open(video_file(str(tmp_path), "astronaut-small"), "rb") as f:
+        video = f.read()
+    bodies = omni_bodies(clip, question, video)
+    args = ("--image-max-tokens", "1600")  # (Artlite's d1 budget: its runner's)
+    want = cached_ref(path, "systemone_omni", (model_key(path), model_key(mmproj), json.dumps(bodies), args,
+                                               _lib_identity()),
+                      lambda: llama_server_decisions(path, mmproj, bodies, args))
+    model = open_model(path, mmproj=mmproj)
+    npu = model.load(capacity=4096)
+    d = Decisions.of(path, model.tokenizer.encode)
+    enc = model.tokenizer.encode
+    from models.server.decisions import spoken
+    worst, same, n = 0.0, 0, 0
+    for body, ref_out in zip(bodies, want, strict=True):
+        qs = d.questions(body)
+        state, files = d.state(body)
+        media = [model.image_tokens(b) if b.kind == "image" else model.media_tokens(b, b.kind) for b in files]
+        heard = {i: model.media_tokens(base64.b64decode(q.instructions["input_audio"]["data"]), "audio")
+                 for i, q in enumerate(qs) if spoken(q.instructions)}
+        lone = d.prompts(state, qs, enc, media=media, set_size=1, max_tokens=npu.prefill.sizes[-1], spoken_media=heard)
+        assert sum(len(p.ids) for p in lone) == ref_out["usage"]["input_tokens"]
+        for p in lone:
+            q = qs[p.question]
+            npu.reset()
+            got, ref_a = d.answer(q, [d.scores(q, npu.outputs(p.ids, p.rows, sets=p.sets))], media=True), \
+                ref_out["answers"][q.id]
+            same += _top(got) == _top(ref_a)
+            n += 1
+            worst = max(worst, *(abs(_probs(got)[k] - _probs(ref_a)[k]) for k in _probs(ref_a)))
+            print(q.id, _top(got), _top(ref_a), {k: round(v, 3) for k, v in _probs(got).items()})
+    print(f"d1-omni: {same} / {n} same top choice as llama-server CPU, max |dp| {worst:.4f}")
+    assert same >= n - 1 and worst < 0.06

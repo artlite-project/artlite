@@ -65,6 +65,7 @@ VIDEOS = {
     "silent": ("480x272", "24", 4.0, False, 0.0),  # (no audio stream)
     "astronaut": ("960x540", "25", 14.2, True, 0.0),
     "astronaut-silent": ("960x540", "25", 14.2, False, 0.0),
+    "astronaut-small": ("320x180", "25", 4.0, False, 0.0),  # (8 frames of 60 tokens: a decision's prompt)
 }
 ASTRONAUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "images", "sd15-astronaut.jpg")
 SPEECH_CLIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "librispeech", "6930-75918-0001.wav")

@@ -451,8 +451,8 @@ def test_images() -> None:
     """Images (``files`` / ``images``, a chat state's ``image_url`` parts) in lfm3-d1's and vllm-d3's requests: each
     image through the encoder once, on the worker; the prompts sequences with the image's tokens between the encoder's
     markup where the template has its markers (the input's markers text: " "); lfm3-d1's sequences hold them in the
-    state; usage counts their tokens; a file's image temperature; a null state with images; audio, video, images for
-    another type or without an encoder refused (501)."""
+    state; usage counts their tokens; a file's image temperature; a null state with images; a video's frames; audio
+    without a speech encoder, images for another type or without an encoder refused (501)."""
     model, npu, engine = make(vision=True)
     d = d1_context(model)
     d.temperatures["image"] = 0.5
@@ -495,13 +495,19 @@ def test_images() -> None:
         (lone,) = d.prompts(None, d.questions({"state": None, "questions": {"q": QUESTIONS["angry"]}}), enc,
                             media=[model.image_tokens(b) for b in IMAGES])
         assert lone.sets[0] == 2 + 8 and r.json()["usage"]["input_tokens"] == len(lone.ids)
-        for bad in ({**body, "images": ["data:audio/wav;base64,AAAA"]},
+        for bad in ({**body, "images": ["data:audio/wav;base64,AAAA"]},  # (no speech encoder)
                     {"state": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "AAAA"}}]}],
                      "questions": QUESTIONS},
-                    {"state": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": URLS[0]}}]}],
-                     "questions": QUESTIONS}):
+                    {"state": STATE, "questions": {"q": {"type": "noul", "instructions": {
+                        "type": "input_audio", "input_audio": {"data": "AAAA"}}}}}):  # (lfm3-d1: spoken, 400)
             r = client.post("/v1/systemone", json=bad)
-            assert r.status_code == 501, (bad, r.text)
+            assert r.status_code in (400, 501), (bad, r.text)
+        seen = []
+        model.media_tokens = lambda b, k: seen.append((b, k)) or model.image_tokens(b)
+        r = client.post("/v1/systemone", json={"state": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(b"clip").decode()}}]}],
+            "questions": QUESTIONS})
+        assert r.status_code == 200 and seen == [(b"clip", "video")]  # (a video's frames: lfm3-d1's media)
         assert client.post("/v1/systemone", json={**body, "images": ["data:image/png;base64,A"]}).status_code == 400
     model, npu, engine = make(vision=True)
     d = context("vllm-d3", model, "{% for image in images %}{{ image }}{% endfor %}" + TEMPLATE)
