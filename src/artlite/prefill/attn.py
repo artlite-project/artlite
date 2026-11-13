@@ -79,10 +79,10 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from ..decode.kv import Records
-from ..gemm.gemm_q import ChainPart, chained_fill
 from ..npu_regs import EVENT_LOCK_STALL, EVENT_MEMORY_STALL, window_counter_writes
 from ..operators import templating
 from ..operators.base import ArgSpec, ArtcOperator
+from ..operators.chain import ChainPart, chained_fill
 from ..operators.design import COLS, plus_i32, range32, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from ..operators.kmath import ACC_C

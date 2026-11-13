@@ -59,7 +59,7 @@ class Q5KSlot(Slot):
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
         # ws: the super-block's scales [group 8][A | B][g] bf16; hb: the 4 header slots; ex: the k-tile's scales
         # expanded per MAC lane [16-row block][word 2][A 2 x 64 bf16 | C 2 x 64 fp32]
-        return {"ws": (1, 32 * op.n), "hb": (1, 4 * 4 * op._hdr_slot_words), "ex": (1, 96 * op.n)}
+        return {"ws": (1, 32 * op.n), "hb": (1, 4 * 4 * op.hdr_slot_words), "ex": (1, 96 * op.n)}
 
     def qd_kernels(self, op: object, kernel: object, *, B_l1_ty: object, ws_ty: object, hb_ty: object,
                    D_ty: object) -> DqKernels:

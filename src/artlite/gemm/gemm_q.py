@@ -3,7 +3,8 @@
 A: (M, K) bf16 activations (M = prompt tokens). W: tiles of the decode
 overlay (``formats.pack_tile``: per-row scale planes, then the codes
 of the super-blocks), read in place, so prefill and decode share one weight
-file. C: (M, N) bf16.
+file. C: (M, N) bf16. What a GEMM's shape makes of its passes, tiles and C objects is ``geometry``, its shim taps and
+memtile walks ``dataflow``, its pacing ``pacing``; this module holds the kernel source, the L1 buffers and the design.
 
 Work split: core row r takes tokens [m r, m r + m), column c
 the tiles of its row range, in passes of 4 tiles (64 rows for R = 16). Per
@@ -32,7 +33,7 @@ workspace. (Every core converting whole k-tiles cost ~980 instead of ~800 cycles
 1.71 ms.) BFP16 tiles hold MMUL operands: the MAC reads the k-tile objects.
 
 Tokens come in chunks of 4 m (m <= 64 per core row, the largest that fits L1
-(``_l1_bytes``); the weights stream once per chunk; the weights reach the cores
+(``_size``); the weights stream once per chunk; the weights reach the cores
 in 2 KB k-tile objects so that m = 64 fits); ``nrows = 2`` halves the program
 images for short prompts (each op of a fused ELF is a reconfiguration). The core
 buffers are pinned (``_l1_layout``): each stream of the MAC loop (A, the
@@ -40,7 +41,7 @@ dequantized half, the two C tiles) has its own 16 KB bank region (memory stalls 
 one C tile: 82 cycles instead of 222 unpinned). At m = 64 the A stream (4.6 KB per k-tile, ~580 cycles of a
 64-bit DMA channel) is not the limit: the dequant + MAC take ~850 cycles per k-tile. A comes as bfp16ebs8
 panels [M / 8][K / 8][72 B] (half the bytes of bf16, which would bound 32 tokens per core row: 128 KB
-per pass; resident in the memtile up to ``A_RESIDENT_MAX``, else refetched per pass), ``c_bfp16``
+per pass; resident in the memtile up to ``dataflow.A_RESIDENT_MAX``, else refetched per pass), ``c_bfp16``
 writes the gate/up SiLU output in the same layout for the down GEMM.
 
 Tiles of 1024 columns (``kc=1024``: the Llama and Qwen images): a row tile's K chunks are consecutive tiles
@@ -48,232 +49,40 @@ Tiles of 1024 columns (``kc=1024``: the Llama and Qwen images): a row tile's K c
 is half a slice; it is read as a slice-sized unit starting 1 KB before the tile (``hdr_skip``: every
 unit the memtile permutes is then one slice of the pass's tiles; ~10% more weight bytes). The
 per-pass pattern [chunk][unit][tile][words] has more dimensions than a shim BD (3 + repeat), so the
-weights of all passes come as one chained task per column and token chunk (``b_chain``: one BD per
-K chunk, each iterating over the passes): per-pass fills would need a task each (per-pass groups
-blew the prefill's control code past a 64 MB heap BO), and more than 4 queued fills on a
-channel stall the controller before the A fills are issued (a hang).
+weights of all passes come as one chained task per column and token chunk (``dataflow.Dataflow.b_chain``).
 ``gemm_qd.GemmQdOperator`` runs the dequant on one core per column instead of on every core; it
 also reads every other dequantized tile through the planar gather (``planar``: Q5_K, Q6_K, Q2_K, Q3_K, and
 Q4_0 / Q4_1 tiles of other than 16 rows or of 512 columns; ``tiles`` per pass, ``blocks``, ``c_pack``,
 ``region_rt``: see GemmQd).
 
-Pacing (``pace``: the GEMM's class, ``PACE_CLASSES``): some laptops' power delivery asserts PROCHOT while the array
-runs MMULs and streams weights at a prefill GEMM's rate (a Krackan Point laptop: every Q4_K GEMM item, on any power
-source, within about a millisecond; the whole SoC then runs at its lowest clocks, the GEMMs 2.3x slower). A paced design
-reads the scratchpad parameter ``PACE`` (a level per class, ``PACE_BITS`` each) on the cores that set its rate
-(``pace_cores``): before each acquire of its input the core idles ``PACE_IDLE[level]`` sixteenths of the cycles it
-worked since the previous acquire returned (the tile's timer), and the array follows it through its FIFOs: duty 1 ..
-0.38, with every core's current and the weight stream's. Level 0 runs the unpaced code (``prefill.pace``: the levels a
-machine needs, by timing).
+Pacing (``pace``: the GEMM's class, ``pacing.PACE_CLASSES``): ``pacing``.
 """
 
-import itertools
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator
 
 import numpy as np
-from aie.dialects import arith
-from aie.dialects.aie import T as IrT
-from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter, TaskGroup, Worker
-from aie.iron.controlflow import else_, if_, range_
+from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from ..formats import FORMATS, KC, KT, kernel_template, slot
+from ..formats import KC, KT, kernel_template, slot
 from ..operators import templating
 from ..operators.base import ArgSpec, ArtcOperator
-from ..operators.design import COLS, ROWS, range32, stream_walk, times_i32
+from ..operators.chain import chained_fill
+from ..operators.design import COLS, ROWS, SHIM_QUEUE, TILE_BDS, range32, times_i32
 from ..operators.kernel_source import kernel_prefix
-from ..operators.l1_layout import pin_l1_buffers
+from ..operators.l1_layout import REGION, align64, pin_l1_buffers
+from .dataflow import Dataflow, drain_runs
+from .geometry import B_DEPTH, L1_BUDGET, M_MAX, TILES, GemmSpec, Geometry, L1Error, L1Plan, expose
 from .mac import MAC, render_mac
+from .pacing import PACE, PACE_CAP, PACE_IDLE, run_paced
 
 MACF = kernel_prefix("macf")  # (the fp32-C MAC helper: ``c_pairs``)
 
-TILES = 4  # tiles per pass
-A_RESIDENT_MAX = 448 * 1024  # bytes of a core row's A strip kept in its memtile (one buffer: the
-# memtile resends it per pass with a BD repeat; depth x repeat BDs must stay within 24 per channel; one
-# memtile BD moves < 512 KB (17-bit length; 442 KB strips run) and a split chain cannot carry the repeat)
-MEMTILE_BYTES = 512 * 1024
-M_MAX = 64  # GemmQ's tokens per core row and chunk (L1: A and C scale with it; see _l1_bytes)
-L1_BUDGET = 62 * 1024  # bytes of core data memory the buffers may use (incl. the 2 KB stack)
-B_DEPTH = 2  # L1 weight objects (one k-tile each)
-PACE = "gq_pace"  # the scratchpad parameter of paced designs: PACE_BITS per class, class c at bit PACE_BITS c
-PACE_BITS = 3
-PACE_ROLES = ("qkv", "o", "gu", "down")  # (``prefill.gemm.WHICH``'s); a class per role and tile kind
-PACE_CLASSES = tuple(f"{r}{k}" for r in PACE_ROLES for k in ("", ".planar"))  # class 2 i + planar
-PACE_IDLE = (0, 2, 4, 6, 9, 13, 18, 26)  # sixteenths of its work a paced core idles per level: duty 1 .. 0.38
-PACE_CAP = 1 << 16  # cycles: a longer interval between two acquires holds a pause (between dispatches), not work
-
-
-def pace_class(which: str, planar_tiles: bool) -> int:
-    """The pace class of a prefill GEMM of role ``which`` (``PACE_ROLES``) on planar tiles or not."""
-    return 2 * PACE_ROLES.index(which) + int(planar_tiles)
-
-
-def pace_word(levels: dict[int, int]) -> int:
-    """The ``PACE`` parameter of the levels per class (0 .. len(PACE_IDLE) - 1)."""
-    assert all(0 <= c < len(PACE_CLASSES) and 0 <= v < len(PACE_IDLE) for c, v in levels.items()), levels
-    return sum(v << PACE_BITS * c for c, v in levels.items())
-
-
-def pace_levels(word: int) -> dict[int, int]:
-    """The nonzero levels per class of a ``PACE`` word."""
-    m = (1 << PACE_BITS) - 1
-    return {c: word >> PACE_BITS * c & m for c in range(len(PACE_CLASSES)) if word >> PACE_BITS * c & m}
-
-
-class _Paced:
-    """A paced core's input FIFO (``pc``: the PACE parameter's handle, the core's timestamp buffer, the kernels
-    ``_pace0`` / ``_pace1``; ``cls``): each acquire idles first (its level's share of the work since the previous one
-    returned) and notes when it returned."""
-
-    def __init__(self, h: object, pc: tuple, cls: int):
-        self.h = h
-        prm, self.st, self.k0, self.k1 = pc
-        self.level = arith.andi(arith.shrui(prm.read(), arith.constant(IrT.i32(), PACE_BITS * cls)),
-                                arith.constant(IrT.i32(), (1 << PACE_BITS) - 1))
-
-    def acquire(self, n: int) -> object:
-        self.k1(self.st, self.level)
-        x = self.h.acquire(n)
-        self.k0(self.st)
-        return x
-
-    def release(self, n: int) -> None:
-        self.h.release(n)
-
-
-def run_paced(pc: tuple | None, cls: int | None, body: Callable[[object], None], h: object) -> None:
-    """A worker's item: ``body`` of its input FIFO handle h; on the core ``pc`` is given to (``_pace_args``) in two
-    copies, the one of the paced handle at a nonzero level (level 0 runs the unpaced code: a branch per item)."""
-    if pc is None:
-        body(h)
-        return
-    w = _Paced(h, pc, cls)
-    with if_(arith.cmpi(arith.CmpIPredicate.ne, w.level, arith.constant(IrT.i32(), 0))) as branch:
-        body(w)
-    with else_(branch):
-        body(h)
-
-
-class L1Error(ValueError):
-    """The design's buffers do not fit a core's data memory (e.g. a GemmQd ``m`` too large for the pass)."""
-
-
-@dataclass(frozen=True)
-class PackPlan:
-    """A C row's 8-value items (``pack2``) from two slots' MAC rows: per item its segments (slot, window, lanes: a bit
-    mask): lane l of the segment's lanes is the slot row's value window + l; ``halves``: some item needs the rows as
-    32-lane halves (a window not a whole sub-block row)."""
-
-    items: tuple[tuple[tuple[int, int, int], ...], ...]
-    halves: bool
-
-
-def pack_plan(n: int, n_out: int, n_c: int, tiles: int, R: int) -> PackPlan:
-    """The items of a C row of ``n_c`` columns: per tile t [slot 0's R rows | slot 1's], value t R + r of a slot's
-    MAC row (n columns); the columns past n_out repeat the last item's segment."""
-    assert n_out == 2 * tiles * R and n_c % 8 == 0 and n <= 64
-    items = []
-    for k in range(n_c // 8):
-        segs: list[list[int]] = []
-        for lane in range(8):
-            o = min(8 * k + lane, n_out - 1)
-            t, q = divmod(o, 2 * R)
-            s_, r = divmod(q, R)
-            w = t * R + r - lane
-            if segs and segs[-1][0] == s_ and segs[-1][1] == w:
-                segs[-1][3] = lane + 1
-            else:
-                segs.append([s_, w, lane, lane + 1])
-        items.append(tuple((s_, w, (1 << hi) - (1 << lo)) for s_, w, lo, hi in segs))
-    halves = any(len(it) > 1 or it[0][1] % 8 or not 0 <= it[0][1] <= n - 8 for it in items)
-    return PackPlan(tuple(items), halves)
-
-
-LINE = 32  # C columns of a 64-byte memory line
-
-
-def line_carry(out_cols: list[list[int]], n_out: int) -> tuple[tuple[int, int], ...] | None:
-    """Whole-line C drains of packed passes (``lines``): per pass (cr, sh), its first column's offset in its line (the
-    previous pass's last cr columns, which its drain repeats) and where they start in the previous pass's row (0: a
-    pass that starts a run of contiguous passes, at a line boundary). None when a run starts inside a line or the
-    columns' passes differ (their windows would not be one design's)."""
-    out = None
-    for cols in out_cols:
-        carry = []
-        for p, o in enumerate(cols):
-            cr = o % LINE if p and o == cols[p - 1] + n_out else 0
-            if (o - cr) % LINE:
-                return None
-            carry.append((cr, (o - cr) - (cols[p - 1] - carry[-1][0]) if cr else 0))
-        if out is not None and tuple(carry) != out:
-            return None
-        out = tuple(carry)
-    return out
-
-
-def two_parts(out_cols: list[list[int]], halves: int) -> bool:
-    """Whether every C object of 32-output bfp16 parts can hold two from a 64-output boundary (576-byte panel rows,
-    whole lines: ``lines``): a pass's halves, or the passes in pairs (an even count, each pair's outputs contiguous)."""
-    for cols in out_cols:
-        if halves == 2:
-            if any(o % 64 for o in cols):
-                return False
-        elif len(cols) % 2 or any(cols[p] % 64 or cols[p + 1] != cols[p] + 32 for p in range(0, len(cols), 2)):
-            return False
-    return True
-
-
-def line_window(carry: tuple[tuple[int, int], ...], n_out: int) -> int:
-    """Columns of every pass's whole-line drain: the most a pass carries and its own columns, in whole lines."""
-    return -(-(max(cr for cr, _ in carry) + n_out) // LINE) * LINE
-
-
-def planar(fmt: str, rows: int, kc: int) -> bool:
-    """GemmQdOperator reads these tiles through the planar gather (any row count: the memtile collects a
-    k-tile's 32-byte planes, or words of word-major tiles, of the pass's rows, ``TileFormat.planes``): Q5_K, Q6_K,
-    Q2_K, Q3_K, and Q4_0 / Q4_1 tiles of other than 16 rows or of 512 columns."""
-    return slot(fmt).planar(fmt, rows, kc)
-
-
-def tile_major(fmt: str, rows: int, kc: int) -> bool:
-    """GemmQ and GemmQd read these tiles through the tile-major permutation (16-row blocks of words, MMUL
-    panels): 16-row Q4_0 / Q4_1 tiles of 2048 or 1024 columns, 16-row Q4_K, BFP16."""
-    return slot(fmt).tile_major(fmt, rows, kc)
-
 # the dequant kernels of the format (``gemm/<fmt>``) are its slot's fragment (``formats``)
-_KERNEL_TPL = kernel_template(templating.source("artlite/gemm/gemm_q.cc.jinja"))
-
-
-@dataclass(frozen=True)
-class GemmQDataflow:
-    """GemmQ's data movement, shared by the design and ``tests/gemm/test_dma.py``
-    (sizes in elements of the FIFO object types: weights i32 words, A and C bf16 units).
-
-    B (weights): shim -> memtile objects of ``b_obj`` words (one super-block slice of the
-    pass's tiles, written with ``b_wdims``) -> L1 objects of ``b_l1`` words (one 64-k tile,
-    sent with ``b_rdims``, which may zero-pad it) to the column's cores (``b_parts`` = 2: the memtile object in two
-    segments, each written with ``b_wdims``, segment h read with ``b_rdims`` to the cores of half h). A: shim ->
-    memtile objects of ``a_obj``
-    (bfp16 panels: the row's strip if ``a_res``, sent ``a_repeat`` times, else K chunks; written with
-    ``a_wdims`` in MAC pop order) -> L1 objects of ``a_l1`` (one k-tile). C: each core's objects of ``c_l1`` joined in the
-    memtile, sent to the shim with ``c_dims``."""
-
-    b_obj: int
-    b_l1: int
-    b_wdims: TensorAccessPattern | None
-    b_rdims: TensorAccessPattern | None
-    b_parts: int  # (pair: the memtile object in 2 segments, each written with b_wdims and read with b_rdims)
-    a_res: bool
-    a_obj: int
-    a_l1: int
-    a_wdims: TensorAccessPattern | None
-    a_repeat: int
-    c_l1: int
-    c_dims: TensorAccessPattern | None
+KERNEL_TEMPLATE = kernel_template(templating.source("artlite/gemm/gemm_q.cc.jinja"))
 
 
 class GemmQOperator(ArtcOperator):
@@ -359,206 +168,71 @@ class GemmQOperator(ArtcOperator):
         (default: one, two for tiles of an odd row count; GemmQd only). ``mc_param``: the cores run as many token
         chunks as this scratchpad parameter says, in units of ``mc_unit`` tokens (a multiple of nrows m; default
         nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks). ``pace``: the design's pace
-        class (``PACE_CLASSES``; None: unpaced), its level from the ``PACE`` parameter (the module's "Pacing").
+        class (``pacing.PACE_CLASSES``; None: unpaced), its level from the ``PACE`` parameter (``pacing``).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
         "ev_kt" / "ev_act" put event0/1 markers around dq, mm, dq..mm of a k-tile or the gate/up epilogue, "noperm"
         drops the memtile transposes, "nosplit" keeps GemmQd's C tiles whole (``csplit``)."""
-        self.planar = planar(fmt, rows, kc)
-        assert self.planar or tile_major(fmt, rows, kc), f"no GEMM path reads {fmt} tiles of {rows} rows x {kc}"
-        assert not self.planar or self.DQ_CORE, f"{fmt} tiles of {rows} rows x {kc}: GemmQdOperator"
-        self.ablate = tuple(ablate)
-        assert pace is None or 0 <= pace < len(PACE_CLASSES), pace
-        self.pace = pace
-        self.mc_param = mc_param
-        self.mc_unit = mc_unit
-        self.nrows = nrows  # core rows used (fewer rows: a smaller program image, cheaper reconfiguration)
-        assert M % (nrows * 16) == 0 and K % kc == 0 and kc % 256 == 0 and tile_bytes % 4 == 0
-        assert kc in (KC, 1024, 512)
-        self.kc = kc
-        self.nsb = kc // 256  # super-block slices per K chunk
-        self.fmt, self.R = fmt, rows
-        # planar tiles of super-block units (``Slot.unit_bytes``): the weight objects are units of the pass's tiles
-        self.units = slot(fmt).unit_bytes(fmt, rows, self.nsb) if self.planar else 0
-        self.M, self.K, self.N = M, K, N
-        self.k_rep, self.c_pairs, self.G = k_rep, c_pairs, groups
-        assert groups == 1 or (self.DQ_CORE and k_rep == 1 and not silu and kc // 256 % groups == 0), groups
-        self.KA = k_rep * K // groups  # (A's columns)
-        self.a_k0, self.a_K = a_cols[0], a_cols[1] or self.KA
-        assert self.a_k0 % kc == 0 and self.a_k0 + self.KA <= self.a_K
-        self.tiles = tiles or 64 // rows  # decode tiles per pass (64 rows)
-        self.TR = self.tiles * rows  # weight rows per pass
-        self.silu = silu  # tiles of 8 gate + 8 up rows -> C = act(gate) * up (N counts outputs)
-        assert act in ("silu", "gelu") and (silu or act == "silu"), act
-        self.act = act  # the gate/up epilogue's activation: silu, or gelu (tanh form, kmath.GELU: Gemma)
-        assert act == "silu" or self.DQ_CORE, "the GELU epilogue: GemmQd"
-        # rows the memtile reads per pass: a planar SiLU pass of a whole group (128 rows and the padding rows
-        # of the group's last tile) drops the padding rows when every part of the tile, header included, maps
-        # tile row r to gathered row r (``hdr_direct``); else the dequant skips them
-        # whole groups run in two halves of 64 rows (4 [8 gate | 8 up] blocks each): the dequant writes a
-        # k-tile's rows as two D objects, a MAC core pops one A for both into two C tiles of 64 columns
-        # (L1 for 96 tokens per MAC row; a whole group's C tile does not fit) and drains them as two passes
-        self.halves = 1
-        if silu and self.planar:
-            gt = -(-128 // rows)  # tiles of a SiLU group (formats.gu_tiles)
-            if self.tiles == gt:
-                self.halves = 2
-            else:  # (half groups of whole tiles)
-                assert 64 % rows == 0 and self.TR % 64 == 0, f"planar SiLU passes: a group of {gt} tiles"
-        self.n_read = 128 if self.halves == 2 and self.hdr_direct else self.TR
-        self.n = -(-self.n_read // 16) * 16  # MMUL columns (planar: the rows padded to a multiple of 16)
-        assert self.n == self.TR or self.planar, (fmt, self.tiles)
-        self.nm = 64 if self.halves == 2 else self.n  # MMUL columns of a D object and a MAC core's C tile
-        self.tile_bytes, self.col_bytes = tile_bytes, col_bytes
-        self.passes, self.out_cols = passes, out_cols
-        self.blocks = tuple(blocks) or ((0, passes),)
-        assert sum(n for _, n in self.blocks) == passes
-        self.pass_rt = [rt0 + self.tiles * i for rt0, n in self.blocks for i in range(n)]  # first row tile of each pass
-        rt_end = max(rt0 + self.tiles * n for rt0, n in self.blocks)  # row tiles read
-        self.region_rt = region_rt or rt_end  # row tiles of a column's region (the chunk group stride)
-        assert self.region_rt <= rt_end or (kc_group or K // kc) == 1  # (one chunk per group: any chunk stride)
-        self.n_kc = K // kc
-        # a row tile's K chunks come in groups of kc_group consecutive tiles (row tiles of a group
-        # consecutive): the image's groups of a long-K projection (``decode.image.kc_group``: the decode overlay's
-        # activation objects)
-        self.kc_group = kc_group or self.n_kc
-        assert self.n_kc % self.kc_group == 0
-        # tiles from a row tile's chunk group to the next row tile's (default kc_group; more: the GEMM reads the first
-        # kc_group chunks of the image's groups of rt_stride, a K part)
-        self.rt_stride = rt_stride or self.kc_group
-        assert self.rt_stride >= self.kc_group
-        assert len(out_cols) == COLS and all(len(o) == passes for o in out_cols)
-
-        # bfp16ebs8 activations: A / C as panels of 8 rows (tokens) x 8 k, [M / 8][K / 8][72 B]
-        # (half the bytes of bf16 through the core's A input port, the limit at m = 32)
-        self.c_bfp16 = c_bfp16
-        assert c_bfp16 == silu, "the gate/up epilogue: bfp16 C panels"
-        assert not (c_pairs or k_rep > 1) or (fmt == "BFP16" and not silu and not c_pack), "router pairs: BFP16 tiles"
-        # (whole 16-row blocks: the memtile un-panelizes the MAC tile; two slots per C object: packed)
-        self.c_pack = c_pack and (self.TR != self.n or slots == 2)
-        assert not (c_pack and silu), "packed C: not with the gate/up epilogue"
-        # C object columns (whole 32-bit words: an odd row count packs one zero column more)
-        # row groups: a C object holds ``slots`` slots of the pass's rows (an even count of outputs per tile: Q6_K's 11
-        # rows in pairs), as [tile][slot][row] (c_pack) or the MMUL tile (one slot of 16-row tiles)
-        self.slots = slots or (1 if groups == 1 or rows % 2 == 0 else 2)
-        self.vp = groups // self.slots  # (C objects per pass)
-        assert groups % self.slots == 0 and (groups == 1 or self.slots == 1 or self.c_pack), (groups, rows)
-        self.n_out = self.slots * self.TR if self.c_pack and groups > 1 else \
-            self.TR + self.TR % 2 if self.c_pack else self.nm // 2 if silu else self.n
-        assert self.n_out % 2 == 0, "C rows of whole 32-bit words"
-        # packed C object rows: whole 16-byte items, the memtile drops the columns past n_out
-        self.n_c = -(-self.n_out // 8) * 8 if self.c_pack else self.n_out
-        # whole-line drains (where they fit: below): C object rows of a pass's carry and its own columns, drained in
-        # windows of ``win`` columns
-        self.carry = line_carry(out_cols, self.n_out) \
-            if lines and self.c_pack and groups == 1 and self.slots == 1 and N % LINE == 0 else None
-        n_c, self.win = self.n_c, self.n_out
-        if self.carry is not None:
-            self.n_c = -(-(max(cr for cr, _ in self.carry) + self.n_out) // 8) * 8
-            self.win = line_window(self.carry, self.n_out)
-        # gate/up (bfp16 C, 32 outputs a pass or half: 288-byte panel rows, half of them ending inside a line): C objects
-        # of two such parts, [part][group][4 panels], which the memtile drains as 576-byte rows (``lines``)
-        self.c_parts = 2 if lines and self.c_bfp16 and self.n_out == 32 and N % 64 == 0 and two_parts(out_cols,
-                                                                                                    self.halves) else 1
-        self.slice = self.units or FORMATS[fmt].slice_bytes(rows)
-        # header units of a slice each (d; d, m for Q4_1; Q4_K records). A header shorter than whole
-        # slices (Q4_K of 1024 columns: 1 KB) is read as a slice-sized unit that starts hdr_skip bytes
-        # before the tile (its first part belongs to the previous tile): every unit the memtile permutes
-        # is one slice of the pass's tiles, at the cost of hdr_skip extra bytes per tile
-        hb = 0 if self.units else FORMATS[fmt].header_bytes(rows, self.nsb)
-        self.hdr_units = -(-hb // self.slice)
-        self.hdr_skip = self.hdr_units * self.slice - hb
-        assert self.hdr_skip == 0 or (fmt in ("Q4_K", "Q4_0") and self.nsb == 4) or self.planar, (fmt, self.nsb)
-        # Gemma's 512-column Q4_0 tiles of 32 rows (a 1 KB header, a quarter of a slice): a header unit holds the
-        # headers of up to ``hg`` = 4 consecutive K chunks of a row tile ([chunk][1 KB], ``hdr_groups``), so the fills
-        # read the tiles' bytes once (a slice-sized unit per chunk from hdr_skip before the tile: 1.33x; gate / up at
-        # T = 288 has a 0.81 ms DMA floor)
-        self.hg = 4 if self.planar and fmt == "Q4_0" and self.nsb == 2 and rows == 32 else 1
-        if self.hg > 1:
-            assert hb * self.hg == self.slice and self.hdr_units == 1
-            self.hdr_skip = 0
-        # a unit longer than a shim BD's inner dimension (1023 words: Gemma's 32-row Q4_0 slices, 1024) is read as
-        # ``us`` sub-units of 16 rows (their rows contiguous): the memtile gathers a pass's unit as [sub-unit][tile]
-        # [row 16], the dequant reads its rows in that order and writes the MMUL columns in the tiles' order. A
-        # super-block unit (Gemma's 16-row Q8_0, 1088 words) is read in equal parts that the memtile writes back in
-        # the unit's order.
-        self.us = 1
-        if self.planar and self.slice // 4 > 1023:
-            f = FORMATS[fmt]
-            if self.units:
-                self.us = next(u for u in range(2, 9) if self.slice % (4 * u) == 0 and self.slice // u // 4 <= 1023)
-            else:
-                assert not (f.plane_major or f.word_major) and rows % 16 == 0, (fmt, rows)
-                self.us = rows // 16
-        self.dequant = FORMATS[fmt].dequant  # (BFP16 tiles already hold MMUL operands)
-        # GemmQ's dequant: each pair of core rows splits every k-tile (GemmQd: one dequantizing core)
-        self.pair = self.dequant and not self.DQ_CORE
-        assert not self.pair or (self.tiles == TILES and nrows % 2 == 0), "GemmQ dequant: 4 tiles per pass, row pairs"
-        # tiles of a core's k-tile objects (its dequant; GemmQd: the pass's)
-        self.tq = TILES // 2 if self.pair else self.tiles if self.DQ_CORE and not self.planar else TILES
-        # the W argument: hdr_skip bytes before the matrix, then its columns' regions (and the tiles the
-        # last column's extra row tiles read after its region: those of the next region in the image), through the
-        # last column's: a column stride longer than the region (a column-major image's) is not read past it there,
-        # where the image may end
-        nk, g, rt, rs = self.n_kc, self.kc_group, self.region_rt, self.rt_stride
-        last = ((nk - 1) // g) * rt * rs + (rt_end - 1) * rs + (nk - 1) % g + 1 if nk > 1 or rs > 1 else rt_end
-        region = (rt * rs * (nk // g) if nk > 1 or rs > 1 else rt) * tile_bytes
-        self.overrun = max(0, last * tile_bytes - region)
-        self.w_bytes = COLS * col_bytes + self.hdr_skip + self.overrun - max(0, col_bytes - region)
-        self.ws_planes = FORMATS[fmt].ws_planes  # expanded scale planes
-        assert self.slice in (2048, 2304) or self.planar, "super-block slices: 16 x 128 B (Q4), 8 x 288 B (BFP16)"
-        # tokens per core row and chunk (the weights stream once per chunk): the largest that
-        # divides the prompt and fits L1
-        # (m: GemmQd's tokens per MAC row, chosen by the caller)
-        def fit() -> list[int]:
-            return [m_ for m_ in ((m,) if m else (64, 48, 32, 16))
-                    if (m or m_ <= M_MAX) and M % (nrows * m_) == 0 and self._l1_bytes(m_) <= L1_BUDGET]
-
-        ms = fit()
-        if self.carry is not None or self.c_parts == 2:  # (whole-line drains where they keep the tokens per core row,
-            # the pinned L1 layout, the A strip resident in the memtile and the drains' queue)
-            lines_on = self.carry, self.n_c, self.win, self.c_parts
-            lines_off = None, n_c, self.n_out, 1
-            self.carry, self.n_c, self.win, self.c_parts = lines_off
-            plain = fit()
-            if ms and ms[:1] == plain[:1] and (lines_on[0] is None or self._drains_fit(lines_on[0])):
-                self.m = plain[0]
-                pinned, a_res = self._l1_layout() is not None, self.dataflow().a_res
-                self.carry, self.n_c, self.win, self.c_parts = lines_on
-                self._l1_bytes(self.m)
-                if (pinned and self._l1_layout() is None) or (a_res and not self.dataflow().a_res):
-                    self.carry, self.n_c, self.win, self.c_parts = lines_off
-                    ms = plain
-            else:
-                ms = plain
-        if not ms:
-            raise L1Error(f"no token count per core row fits L1 ({m or 'any'})")
-        self.m = ms[0]
-        self._l1_bytes(self.m)  # (the chosen variant's buffers)
-        self.mc = M // (nrows * self.m)
+        spec = GemmSpec(
+            fmt=fmt, rows=rows, M=M, K=K, N=N, tile_bytes=tile_bytes, col_bytes=col_bytes, passes=passes,
+            out_cols=out_cols, silu=silu, act=act, nrows=nrows, c_bfp16=c_bfp16, ablate=ablate, kc=kc,
+            kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
+            blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
+            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace)
+        self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
+        self.flow = Dataflow.make(self.geo)
         super().__init__()
 
-    @property
-    def c_tail(self) -> int:
-        """Elements after a packed C object's rows (whole-line windows: the memtile reads the last row's window into
-        them, ``lines``)."""
-        return self.win - self.n_c if self.carry is not None else 0
+    def _size(self, plain: Geometry, lines: Geometry | None, *, m: int) -> tuple[Geometry, L1Plan]:
+        """The geometry with the tokens per core row (m, or the largest that divides the prompt and fits L1, the weights
+        stream once per chunk) and its L1 plan. ``lines``: the variant with whole-line drains, kept where it keeps the
+        tokens per core row, the pinned L1 layout, the A strip resident in the memtile and the drains' queue."""
 
-    def _drains_fit(self, carry: tuple[tuple[int, int], ...]) -> bool:
-        """Whether whole-line windows (``carry``) keep a column's C drains within its shim channel's task queue (4: two
-        token chunks in flight, up to 2 drains each, or no more drains than without windows) and its tile's 16 BDs (the
-        weight fills', an A strip's, the drains' per chunk in flight; ``_sequence``)."""
-        cols = self.c_out_cols(0)
-        runs = len(_runs([o - cr for o, (cr, _) in zip(cols, carry, strict=True)]))
-        if runs <= len(_runs(cols)):
+        def fit(g: Geometry) -> list[int]:
+            return [m_ for m_ in ((m,) if m else (64, 48, 32, 16))
+                    if (m or m_ <= M_MAX) and g.M % (g.nrows * m_) == 0
+                    and self._l1_bytes(gm := g.with_m(m_), self._plan_l1(gm)) <= L1_BUDGET]
+
+        geo, ms = (lines or plain), fit(lines or plain)
+        if lines is not None:
+            plain_ms = fit(plain)
+            if not (ms and ms[:1] == plain_ms[:1] and self._lines_ok(plain.with_m(plain_ms[0]), lines.with_m(plain_ms[0]))):
+                geo, ms = plain, plain_ms
+        if not ms:
+            raise L1Error(f"no token count per core row fits L1 ({m or 'any'})")
+        geo = geo.with_m(ms[0])
+        return geo, self._plan_l1(geo)
+
+    def _plan_l1(self, g: Geometry) -> L1Plan:
+        """The L1 choices of the geometry (m chosen): GemmQ has none."""
+        return L1Plan()
+
+    def _lines_ok(self, plain: Geometry, lines: Geometry) -> bool:
+        """Whether the whole-line variant keeps what the plain one has: the drains' queue (``_drains_fit``), a pinned L1
+        layout and a resident A strip (the geometries with the tokens per core row chosen)."""
+        flow = Dataflow.make(plain)
+        if lines.carry is not None and not self._drains_fit(flow, lines.carry):
+            return False
+        pinned = self._layout(plain, self._plan_l1(plain)) is not None
+        return not ((pinned and self._layout(lines, self._plan_l1(lines)) is None)
+                    or (flow.a_res and not Dataflow.make(lines).a_res))
+
+    @staticmethod
+    def _drains_fit(flow: Dataflow, carry: tuple[tuple[int, int], ...]) -> bool:
+        """Whether whole-line windows (``carry``) keep a column's C drains within its shim channel's task queue
+        (``SHIM_QUEUE``: two token chunks in flight, up to 2 drains each, or no more drains than without windows) and
+        its tile's ``TILE_BDS`` BDs (the weight fills', an A strip's, the drains' per chunk in flight; ``_sequence``)."""
+        cols = flow.c_out_cols(0)
+        runs = len(drain_runs([o - cr for o, (cr, _) in zip(cols, carry, strict=True)]))
+        if runs <= len(drain_runs(cols)):
             return True
         if runs > 2:
             return False
-        chains = [self.b_chain(c) for c in range(COLS)]
-        depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > 4 else 2
-        fills = max(sum(map(len, ch)) if ch is not None else len(self.b_taps(c)) for c, ch in enumerate(chains))
-        return depth * (fills + 1 + runs) <= 16
+        chains = [flow.b_chain(c) for c in range(COLS)]
+        depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > SHIM_QUEUE else 2
+        fills = max(sum(map(len, ch)) if ch is not None else len(flow.b_taps(c)) for c, ch in enumerate(chains))
+        return depth * (fills + 1 + runs) <= TILE_BDS
 
     def _chunk_passes(self, prm: object, index: bool = False, step: int = 1) -> Iterator[object]:
         """The cores' loop over token chunks and passes: mc chunks, or ``mc_param``'s (prm: its handle); ``index``:
@@ -604,80 +278,64 @@ class GemmQOperator(ArtcOperator):
         k1 = Kernel(f"{self.p}_pace1", "kernel.o", [st_ty, np.int32])
         return {(c, r): (prm, Buffer(st_ty, name=f"gq_pace_{c}_{r}"), k0, k1) for c, r in self.pace_cores()}
 
-    @property
-    def hdr_direct(self) -> bool:
-        """Planar tiles whose gathered rows hold tile row r's header at row r too (Q5_K's scale planes,
-        Q4_0 / Q4_1 headers of 2048 columns; not Q6_K's d chunks or a half-slice Q4 header row pair); tiles of units
-        (the dequant takes the rows it converts from the unit)."""
-        return bool(self.units) or slot(self.fmt).hdr_direct(self.fmt, self.nsb)
-
-    @property
-    def unit_pitch(self) -> int:
-        """Bytes of a tile's unit in the dequantizing core's weight object (whole 32-byte lines: aligned loads)."""
-        return -(-self.units // 32) * 32
-
-    @property
-    def b_l1_words(self) -> int:
-        """Words of an L1 weight object (one k-tile; planar: [plane][word 2][rows padded to n]; units: a unit of the
-        pass's tiles, [tile][``unit_pitch``])."""
-        if self.units:
-            return self.tiles * self.unit_pitch // 4
-        return 2 * FORMATS[self.fmt].planes * self.n if self.planar else \
-            (self.tq if self.pair else self.tiles) * self.slice // 16
-
-    def _buffers(self, m: int) -> dict[str, tuple[int, int]]:
-        """(count, bytes) of each core buffer with m tokens per core row: the FIFO objects A
+    def _buffers(self, g: Geometry, plan: L1Plan) -> dict[str, tuple[int, int]]:
+        """(count, bytes) of each core buffer with g.m tokens per core row: the FIFO objects A
         (one k-tile), B (one k-tile of the pass's tiles) and C, the MAC target ``acc`` (silu
         only), the scale workspace ``ws``, the core's half of a dequantized k-tile ``X`` (its FIFO to the partner) and
         ``st``, the second C tile (also the collected header, ``Slot.gemm_q_collects``, and the SiLU scratch); BFP16:
         A, B, C, ``acc`` and ``st``, the SiLU scratch. get_mlir_artifact asserts its buffer types against
         this."""
-        if self.pair:
-            return {"A": (2, m * 72), "B": (B_DEPTH, 4 * self.b_l1_words),
-                    "C": (2, m * self.n_out * 9 // 8 * self.c_parts if self.c_bfp16 else m * self.n_c * 2),
-                    "acc": (1 if self.silu else 0, m * self.n * 2),
-                    "ws": (1, 1024 * self.nsb * self.ws_planes * self.tq // TILES),
-                    "st": (1, max(m * self.n * 2, 16 * self.b_l1_words if slot(self.fmt).gemm_q_collects else 0)),
-                    "X": (2, self.n // 2 * KT * 9 // 8)}
-        return {"A": (2, m * 72), "B": (B_DEPTH, 4 * self.b_l1_words),
-                "C": (2, m * self.n_out * 9 // 8 * self.c_parts if self.c_bfp16 else m * self.n_c * 2),
-                "acc": (1 if self.silu or self.c_pairs else 0, m * self.n * (4 if self.c_pairs else 2)),
-                "st": (1, max(64, m * self.n if self.silu else 0))}
+        m = g.m
+        if g.pair:
+            return {"A": (2, m * 72), "B": (B_DEPTH, 4 * g.b_l1_words),
+                    "C": (2, m * g.n_out * 9 // 8 * g.c_parts if g.c_bfp16 else m * g.n_c * 2),
+                    "acc": (1 if g.silu else 0, m * g.n * 2),
+                    "ws": (1, 1024 * g.nsb * g.ws_planes * g.tq // TILES),
+                    "st": (1, max(m * g.n * 2, 16 * g.b_l1_words if slot(g.fmt).gemm_q_collects else 0)),
+                    "X": (2, g.n // 2 * KT * 9 // 8)}
+        return {"A": (2, m * 72), "B": (B_DEPTH, 4 * g.b_l1_words),
+                "C": (2, m * g.n_out * 9 // 8 * g.c_parts if g.c_bfp16 else m * g.n_c * 2),
+                "acc": (1 if g.silu or g.c_pairs else 0, m * g.n * (4 if g.c_pairs else 2)),
+                "st": (1, max(64, m * g.n if g.silu else 0))}
 
-    def _l1_bytes(self, m: int) -> int:
-        """Core data memory of the design with m tokens per core row (buffers and the 2 KB stack)."""
-        return sum(n * b for n, b in self._buffers(m).values()) + 2048
+    def _l1_bytes(self, g: Geometry, plan: L1Plan) -> int:
+        """Core data memory of the design with g.m tokens per core row (buffers and the 2 KB stack)."""
+        return sum(n * b for n, b in self._buffers(g, plan).values()) + 2048
 
     def _l1_layout(self) -> dict[str, list[int]] | None:
+        """The pinned layout of the chosen geometry (``_layout``)."""
+        return self._layout(self.geo, self.plan)
+
+    def _layout(self, g: Geometry, plan: L1Plan) -> dict[str, list[int]] | None:
         """Byte addresses of a core's buffers, or None (automatic placement) if they do not fit.
 
         Core data memory behaves like four 16 KB regions of two interleaved banks. The MAC
         loop streams A (the A objects), its B operands (the dequantized halves ``X``, or the B objects of BFP16
         tiles) and the C tile(s) every cycle: each gets its own region. The stack is at 0.
         """
-        sizes = self._buffers(self.m)
-        target = "acc" if self.silu or self.c_pairs else "C"  # the MAC's C tile
+        sizes = self._buffers(g, plan)
+        target = "acc" if g.silu or g.c_pairs else "C"  # the MAC's C tile
         # (buffer, allowed regions in order of preference)
-        if self.pair:  # the MAC streams X (or the partner's), A and the two C tiles: one region each; the dequant
+        if g.pair:  # the MAC streams X (or the partner's), A and the two C tiles: one region each; the dequant
             # reads B and ws and writes X: three regions; the C objects of the epilogue (cold) next to X
             order = [("X", [0]), ("A", [1]), (target, [2]), ("st", [3]), ("ws", [2, 3, 0])]
-            order += [("C", [0, 3, 1])] if self.silu else []
+            order += [("C", [0, 3, 1])] if g.silu else []
             order += [("B", [3, 1, 0, 2])]
         else:
-            order = [("st", [0]), ("A", [1]), (target, [2])] + ([("C", [0, 3, 1])] if self.silu or self.c_pairs else [])
+            order = [("st", [0]), ("A", [1]), (target, [2])] + ([("C", [0, 3, 1])] if g.silu or g.c_pairs else [])
             order += [("B", [3])]
-        free = [16384 - 2048] + [16384] * 3
-        nxt = [2048, 16384, 32768, 49152]
+        free = [REGION - 2048] + [REGION] * 3
+        nxt = [2048, REGION, 2 * REGION, 3 * REGION]
         layout: dict[str, list[int]] = {}
         for name, regions in order:
             n, sz = sizes[name]
-            need = n * ((sz + 63) // 64 * 64)
-            g = next((g for g in regions if free[g] >= need), None)
-            if g is None:
+            need = n * align64(sz)
+            r = next((r for r in regions if free[r] >= need), None)
+            if r is None:
                 return None
-            layout[name] = [nxt[g] + i * ((sz + 63) // 64 * 64) for i in range(n)]
-            free[g] -= need
-            nxt[g] += need
+            layout[name] = [nxt[r] + i * align64(sz) for i in range(n)]
+            free[r] -= need
+            nxt[r] += need
         return layout
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -692,7 +350,7 @@ class GemmQOperator(ArtcOperator):
         mac = render_mac(k=KT, split=self.pair)
         if self.c_pairs:
             mac += render_mac(name=MACF, k=KT, f32=True)
-        return _KERNEL_TPL.render(p=self.p, mac=f"{MAC}<{self.m}, {self.n}>", m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act,
+        return KERNEL_TEMPLATE.render(p=self.p, mac=f"{MAC}<{self.m}, {self.n}>", m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act,
                                   fmt=self.fmt,
                                   nsb=self.nsb, dqb=False,
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
@@ -700,237 +358,6 @@ class GemmQOperator(ArtcOperator):
                                   sxp=1, csplit=0, tq=self.tq, pair=self.pair,
                                   c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1,
                                   **self._pace_vars())
-
-    def dataflow(self) -> GemmQDataflow:
-        m, K, no = self.m, self.KA, self.n_out
-        r = t = 8
-        cb = self.c_bfp16
-        noperm = "noperm" in self.ablate
-        obj_w = self.tiles * self.slice // 4  # words per memtile object (the pass's tiles x one slice)
-        rpad = None
-        if self.planar:
-            # tile slices of 32-byte planes per row (plane major: [plane][row R][8 words], Q5_K / Q6_K; row major:
-            # the Q4 nibbles [row R][step s][8 words]): S2MM writes [plane][g = t R + r][8 words]; MM2S reads
-            # k-tile objects [plane][word ii 2][g] (words 2 kt + ii: groups 2 kt + ii) of the first n_read rows,
-            # zero-padded to n (64-byte aligned runs of 16 rows for the dequant's loads)
-            R, T, TR, P = self.R, self.tiles, self.TR, FORMATS[self.fmt].planes
-            if self.units:  # (the unit of the pass's tiles as it arrives, each tile's padded to whole lines; in
-                # parts: the stream [part][tile] written as [tile][part])
-                uw, pw, us = self.units // 4, self.unit_pitch // 4, self.us
-                assert us == 1 or pw == uw, (us, pw, uw)
-                wdims = [(us, uw // us), (T, uw), (uw // us, 1)] if us > 1 else None
-                rdims = [(T * us, uw // us), (uw // us, 1)]
-                rpad = [(0, 0), (0, pw - uw)] if pw > uw else None
-            elif FORMATS[self.fmt].word_major:
-                # word-major slices ([word][row R], Q2_K / Q3_K: 2 P words per k-tile): S2MM writes [word][g];
-                # MM2S reads k-tile objects [word 2 P][g] (words 2 P kt ..)
-                wdims = [(T, R), (8 * P, TR), (R, 1)]
-                rdims = [(4, 2 * P * TR), (2 * P, TR), (self.n_read, 1)]
-            else:
-                if FORMATS[self.fmt].plane_major:
-                    wdims = [(T, 8 * R), (P, 8 * TR), (8 * R, 1)]
-                elif self.us > 1:  # (sub-units: the stream [sub-unit][tile][row 16][step][8 words], g = its row)
-                    wdims = [(TR, 8), (P, 8 * TR), (8, 1)]
-                else:
-                    wdims = [(T, 8 * R), (R, 8), (P, 8 * TR), (8, 1)]
-                rdims = [(4, 2), (P, 8 * TR), (2, 1), (self.n_read, 8)]
-            # (a padded MM2S BD moves its padded walk, not the object: reading fewer rows than the memtile
-            # holds needs a padding, if only of zeros)
-            if not self.units and (self.n > self.n_read or self.n_read < TR):
-                rpad = [(0, 0)] * (len(rdims) - 1) + [(0, self.n - self.n_read)]
-        elif (dims := slot(self.fmt).tile_major_dims(self)) is not None:  # (BFP16)
-            wdims, rdims = dims
-        else:
-            # Q4: tile rows store words of 8 consecutive k ((s, i) = k in [32 i + 8 s, +8)), a MMUL panel
-            # is 8 rows x 8 k: S2MM writes each slice [tile][i][s][row], MM2S reads k-tile objects
-            # [kt][tile][i % 2][s][row] (i = 2 kt + i % 2) = packed panels in the dequant's order
-            # (pair: the memtile object in two segments of tq tiles, each written and read the same way: a
-            # distribute link writes its input per segment; segment h to the cores of half h)
-            wdims = [(self.tq, 512), (16, 1), (4, 16), (8, 64)]
-            rdims = [(4, 128), (self.tq, 512), (2, 64), (64, 1)]
-        # A strip of a core row: resident in the memtile and resent per pass when it fits next to the
-        # column's B and C FIFOs, else refetched per pass in K chunks
-        c_obj = m * no * 9 // 8 * self.c_parts if cb else (m * self.n_c + self.c_tail) * 2
-        others = 2 * obj_w * 4 + 2 * self.nrows * c_obj  # (B, C: depth 2)
-        a_res = m * K * 9 // 8 <= min(A_RESIDENT_MAX, MEMTILE_BYTES - others - 4096)
-        ak = K if a_res else self.kc
-        # bfp16 panels (36 bf16 units) arrive [kt][token group g = 2 band + half][k-step][panel] (shim
-        # pattern); the memtile stores them [kt][band][k-step][half][panel] = the MAC pop order
-        a_wdims = [(ak // KT * (m // 16), 8 * 72), (2, 36), (8, 72), (36, 1)]
-        a_obj = m * ak * 9 // 16
-        c_l1 = m * no * 9 // 16 * self.c_parts if cb else m * self.n_c + self.c_tail
-        parts = 2 if self.pair else 1
-        return GemmQDataflow(
-            b_obj=obj_w, b_l1=self.b_l1_words,
-            b_wdims=None if noperm or wdims is None else stream_walk(obj_w // parts, wdims),
-            b_rdims=None if noperm else stream_walk(obj_w // parts, rdims, rpad), b_parts=parts,
-            a_res=a_res, a_obj=a_obj, a_l1=m * 36, a_wdims=stream_walk(a_obj, a_wdims),
-            a_repeat=self.passes * self.G if a_res and self.passes * self.G > 1 else 1,
-            c_l1=c_l1,
-            # the join of the 4 cores' 8x8 sub-blocks is un-panelized to row-major on the way to the shim
-            # (packed C objects: row-major already, the columns past n_out dropped: a partial read of each
-            # core's segment of the join)
-            # (whole-line windows: win columns of each row, the rest from the next row's or the object's tail, ``lines``)
-            # (two bfp16 parts: [part][group][panels] to the groups' rows of both parts' panels)
-            c_dims=(stream_walk(c_l1, [(m // 8, no // 8 * 36), (2, m // 8 * no // 8 * 36), (no // 8 * 36, 1)])
-                    if self.c_parts == 2 else
-                    stream_walk(c_l1, [(m, self.n_c), (self.win, 1)], [(0, 0), (0, 0)])
-                    if self.n_c != self.win else
-                    None if cb or self.c_pack or self.c_pairs else
-                    stream_walk(c_l1, [(m // r, r * no), (r, t), (no // t, r * t), (t, 1)])))
-
-    @property
-    def hdr_groups(self) -> list[tuple[int, int]]:
-        """(first K chunk, chunks) of each header unit: ``hg`` consecutive chunks of one chunk group (``kc_group``) at
-        most; with hg = 1 one unit per chunk."""
-        g = self.kc_group
-        return [(k0, min(self.hg, G + g - k0)) for G in range(0, self.n_kc, g) for k0 in range(G, G + g, self.hg)]
-
-    @property
-    def pass_fill_words(self) -> int:
-        """bf16 units of a column's weight fills per pass (every K chunk)."""
-        nsl, sw = self._units
-        hdr = len(self.hdr_groups) * self.slice // 2 if self.hg > 1 else 0
-        return self.k_rep * self.tiles * (self.n_kc * nsl * sw + hdr)
-
-    def _hg_bds(self, c: int, j0: int, np_: int) -> list[TensorAccessPattern]:
-        """``hg`` > 1: the weight fill of passes j0 .. (row tiles j0 + tiles p) as BDs [np_ (passes), 3 dims]: per
-        header group its unit's two 16-row sub-units ([tile][chunks 2 su, 2 su + 1][1 KB]; a group of fewer than 4
-        chunks reads its last tile's header and first codes into the unused slots), then per chunk its codes
-        ([sub-unit 4][tile][2 KB] after the header)."""
-        tw, (nsl, sw) = self.tile_bytes // 2, self._units
-        nt, g, rs, n_rt = self.tiles, self.kc_group, self.rt_stride, self.region_rt
-        base = c * self.col_bytes // 2
-        w_dims = (1, self.w_bytes // 2)
-        hw = self.slice // 2 // self.hg  # (a tile's header, bf16 units)
-
-        def at(k: int) -> int:  # tile (j0, k)
-            return base + ((k // g) * n_rt * rs + j0 * rs + k % g) * tw
-
-        out = []
-        for k0, r in self.hdr_groups:
-            for su in range(2):
-                qa, qb = min(2 * su, r - 1), min(2 * su + 1, r - 1)
-                step = at(k0 + qb) - at(k0 + qa) if qb > qa else hw  # (no zero strides in a shim BD)
-                out.append(TensorAccessPattern(w_dims, at(k0 + qa), [np_, nt, 2, hw], [nt * rs * tw, rs * tw, step, 1]))
-            out += [TensorAccessPattern(w_dims, at(k) + hw, [np_, nsl, nt, sw], [nt * rs * tw, sw, rs * tw, 1])
-                    for k in range(k0, k0 + r)]
-        return out
-
-    @property
-    def _units(self) -> tuple[int, int]:
-        """(units per tile and K chunk, bf16 per unit) of the weight fills: header planes + super-block
-        slices (each as ``us`` sub-units)."""
-        hu = 0 if self.hg > 1 else self.hdr_units  # (hg > 1: the header units apart, ``_hg_bds``)
-        return (hu + self.nsb) * self.us, self.slice // 2 // self.us
-
-    def b_taps(self, c: int) -> list[tuple[int, TensorAccessPattern]]:
-        """(first pass, tap) of the weight fills of column c in bf16 units (one fill for all passes of a
-        block where one pattern covers them): per pass and K chunk the header units and the super-block
-        slices of the pass's tiles."""
-        tw, (nsl, sw) = self.tile_bytes // 2, self._units
-        nt, nk, g, rs = self.tiles, self.n_kc, self.kc_group, self.rt_stride
-        # units start hdr_skip bytes before each tile (a header shorter than a slice: see __init__); the
-        # W argument starts hdr_skip bytes before the matrix
-        base = c * self.col_bytes // 2
-        w_dims = (1, self.w_bytes // 2)
-        n_rt = self.region_rt  # row tiles of the column
-        out: list[tuple[int, TensorAccessPattern]] = []
-        p0 = 0
-        for rt0, np_ in self.blocks:
-            if self.hg > 1:  # (per pass: the header groups' units and the chunks' codes, ``_hg_bds``)
-                for p_ in range(p0, p0 + np_):
-                    out += [(p_, t) for t in self._hg_bds(c, self.pass_rt[p_], 1)]
-            elif nk == 1:
-                out.append((p0, TensorAccessPattern(w_dims, base + rt0 * rs * tw, [np_, nsl, nt, sw],
-                                                    [nt * rs * tw, sw, rs * tw, 1])))
-            elif g == nk and tw == nsl * sw:  # (chunk, unit) as one dimension: tiles of whole slices, no padding
-                out.append((p0, TensorAccessPattern(w_dims, base + rt0 * rs * tw, [np_, nk * nsl, nt, sw],
-                                                    [nt * rs * tw, sw, rs * tw, 1])))
-            else:  # per pass (more than the 3 dimensions + repeat of a shim BD): tile (j, k) of row tile j and
-                # chunk k is at (k // g) n_rt rs + j rs + k % g
-                for p_ in range(p0, p0 + np_):
-                    j0 = self.pass_rt[p_]
-                    if g in (1, nk):  # the chunks at one stride: one fill per pass
-                        sk = tw if g == nk else n_rt * rs * tw
-                        out.append((p_, TensorAccessPattern(w_dims, base + j0 * rs * tw, [nk, nsl, nt, sw],
-                                                            [sk, sw, rs * tw, 1])))
-                    else:
-                        out += [(p_, TensorAccessPattern(w_dims, base + (G * n_rt + j0) * rs * tw, [g, nsl, nt, sw],
-                                                         [tw, sw, rs * tw, 1])) for G in range(nk // g)]
-            p0 += np_
-        return out
-
-    def b_chain(self, c: int) -> list[list[TensorAccessPattern]] | None:
-        """The weight fill of column c as one chained task per block, when b_taps needs fills per pass:
-        one BD per K chunk, each 4-dimensional [pass (BD iteration), unit, tile, words] (the task repeats
-        once per pass of the block and every BD of the chain advances its iteration then), or None."""
-        if self.hg > 1:
-            assert max(n for _, n in self.blocks) <= 64, "a BD iterates at most 64 times"
-            chains = [self._hg_bds(c, rt0, np_) for rt0, np_ in self.blocks]
-            assert sum(map(len, chains)) <= 14, "chained weight fills of more than 14 shim BDs"
-            return chains
-        taps = self.b_taps(c)
-        if (len(taps) == len(self.blocks) and self.k_rep == 1) or max(n for _, n in self.blocks) > 64:
-            return None  # (one fill per block already; a BD iterates at most 64 times)
-        tw, (nsl, sw) = self.tile_bytes // 2, self._units
-        nt, nk, g, rs = self.tiles, self.n_kc, self.kc_group, self.rt_stride
-        base = c * self.col_bytes // 2
-        n_rt = self.region_rt
-        w_dims = (1, self.w_bytes // 2)
-        # chunk k: tile (j, k) at (k // g) n_rt rs + j rs + k % g; pass p's tiles j = rt0 + nt p ..
-        return [[TensorAccessPattern(w_dims, base + ((k // g) * n_rt * rs + rt0 * rs + k % g) * tw, [np_, nsl, nt, sw],
-                                     [nt * rs * tw, sw, rs * tw, 1]) for k in list(range(nk)) * self.k_rep]
-                for rt0, np_ in self.blocks]
-
-    def a_tap(self, ch: int, row: int) -> TensorAccessPattern:
-        """Core row ``row``'s A strip of token chunk ``ch`` (bf16 units): once (resident, resent by
-        the memtile) or once per pass."""
-        m, K, aK, df = self.m, self.KA, self.a_K, self.dataflow()
-        n = 1 if df.a_res else self.passes
-        # panels [group][k8][36]: read [kt][group][8 k-steps x panel]
-        return TensorAccessPattern((self.M * aK * 9 // 16,),
-                                   (ch * self.nrows + row) * (m // 8) * (aK // 8) * 36 + self.a_k0 // 8 * 36,
-                                   [n, K // KT, m // 8, 8 * 36], [0, 8 * 36, aK // 8 * 36, 1])
-
-    def c_chain(self, ch: int, c: int) -> list[TensorAccessPattern]:
-        """Row groups: the C drain of column c for token chunk ``ch`` as one chained task, a BD per C object of a pass
-        (its slots' rows of the pass's tiles: [token][tile G R apart][slots R]), each iterating over the passes (bf16
-        units; the passes' outputs evenly spaced)."""
-        m, rows, G, R = self.m, self.nrows, self.G, self.R
-        cols = self.out_cols[c]
-        step = cols[1] - cols[0] if len(cols) > 1 else G * self.TR
-        assert all(b - a == step for a, b in itertools.pairwise(cols)) and self.passes <= 64, cols
-        assert (self.slots * R) % 2 == 0 and (G * R) % 2 == 0, "C runs of whole 32-bit words"
-        return [TensorAccessPattern((self.M, self.N), ch * rows * m * self.N + cols[0] + self.slots * R * v,
-                                    [self.passes, rows * m, self.tiles, self.slots * R], [step, self.N, G * R, 1])
-                for v in range(self.vp)]
-
-    def c_out_cols(self, c: int) -> list[int]:
-        """The first output column of each C object of column c (``out_cols``; two per pass in halves; of two parts:
-        one per pass, or per pair of passes)."""
-        if self.c_parts == 2:
-            return list(self.out_cols[c]) if self.halves == 2 else list(self.out_cols[c][0::2])
-        return [o + self.n_out * h for o in self.out_cols[c] for h in range(self.halves)]
-
-    def c_taps(self, ch: int, c: int) -> list[TensorAccessPattern]:
-        """The C drains of column c for token chunk ``ch`` (bf16 units): one per run of evenly
-        spaced C objects' outputs."""
-        m, no, rows = self.m, self.n_out * self.c_parts, self.nrows
-        cols = self.c_out_cols(c)
-        if self.carry is not None:  # (whole-line windows from each pass's line boundary)
-            cols, no = [o - cr for o, (cr, _) in zip(cols, self.carry, strict=True)], self.win
-        taps = []
-        for p0, cnt, step in _runs(cols):
-            if self.c_bfp16:  # panels [group][N / 8][36]: [pass][the chunk's groups][no / 8 blocks][panel]
-                taps.append(TensorAccessPattern((self.M * self.N * 9 // 16,),
-                                                (ch * rows * m // 8 * self.N + cols[p0]) // 8 * 36,
-                                                [cnt, rows * m // 8, no // 8, 36],
-                                                [step // 8 * 36, self.N // 8 * 36, 36, 1]))
-            else:
-                taps.append(TensorAccessPattern((self.M, self.N), ch * rows * m * self.N + cols[p0],
-                                                [1, cnt, rows * m, no], [0, step, self.N, 1]))
-        return taps
 
     def _sequence(self, a_prods: list, b_prods: list, c_conses: list, ROWS: int) -> object:
         """The runtime sequence (A, W, C): weight fills (``b_taps``), A strips (``a_tap``) of the
@@ -941,13 +368,14 @@ class GemmQOperator(ArtcOperator):
             # per-pass ones: 1B down), A strips and C drains (one drain BD per run of evenly spaced
             # pass outputs covers many C objects); at most 2 chunks in flight. A chunk's last drain
             # completing proves its fills completed, so its BDs are recycled then.
-            taps = [self.b_taps(c) for c in range(COLS)]
-            chains = [self.b_chain(c) for c in range(COLS)]
-            assert all(ch_ is not None for ch_ in chains) or max(len(t) for t in taps) <= 4, \
-                "per-pass weight fills beyond a shim queue (4 tasks) and no chained fill (passes > 64)"
-            assert chains[0] is None or len(chains[0]) <= 4, "chained fills beyond a shim queue (4 tasks)"
+            flow = self.flow
+            taps = [flow.b_taps(c) for c in range(COLS)]
+            chains = [flow.b_chain(c) for c in range(COLS)]
+            assert all(ch_ is not None for ch_ in chains) or max(len(t) for t in taps) <= SHIM_QUEUE, \
+                "per-pass weight fills beyond a shim queue and no chained fill (passes > MAX_BD_ITER)"
+            assert chains[0] is None or len(chains[0]) <= SHIM_QUEUE, "chained fills beyond a shim queue"
             # a chained weight fill holds one BD per K chunk until its chunk's drains complete
-            depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > 4 else 2
+            depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > SHIM_QUEUE else 2
             inflight: list[TaskGroup] = []
             for ch in range(self.mc):
                 tg = TaskGroup()
@@ -959,12 +387,12 @@ class GemmQOperator(ArtcOperator):
                     for _, tap in taps[c]:
                         b_prods[c].fill(W, tap, group=tg, wait=False)
                 for row in range(ROWS):
-                    a_prods[row].fill(A, self.a_tap(ch, row), group=tg, wait=False)
+                    a_prods[row].fill(A, flow.a_tap(ch, row), group=tg, wait=False)
                 for c in range(COLS):
                     if self.G > 1:
-                        chained_fill(c_conses[c], C, self.c_chain(ch, c), tg, wait=True)
+                        chained_fill(c_conses[c], C, flow.c_chain(ch, c), tg, wait=True)
                         continue
-                    for tap in self.c_taps(ch, c):
+                    for tap in flow.c_taps(ch, c):
                         c_conses[c].drain(C, tap, group=tg, wait=True)
                 inflight.append(tg)
                 if len(inflight) >= depth:
@@ -978,7 +406,7 @@ class GemmQOperator(ArtcOperator):
         ROWS = self.nrows  # shadows the module default
         m, n = self.m, self.n
         i32 = np.int32
-        df = self.dataflow()
+        df = self.flow
         B_l2_ty = np.ndarray[(df.b_obj,), np.dtype[i32]]
         B_l1_ty = np.ndarray[(df.b_l1,), np.dtype[i32]]
         cb = self.c_bfp16
@@ -989,7 +417,7 @@ class GemmQOperator(ArtcOperator):
         C_l1_ty = np.ndarray[(c_elems,) if cb else (m, no), np.dtype[bfloat16]]
         C_l2_ty = np.ndarray[(ROWS * c_elems,) if cb else (ROWS * m, no), np.dtype[bfloat16]]
         acc_ty = np.ndarray[(m, n), np.dtype[np.float32 if self.c_pairs else bfloat16]]  # MAC target (silu, c_pairs)
-        bufs = self._buffers(m)
+        bufs = self._buffers(self.geo, self.plan)
         # the second C tile (dequant: also the collected header) and the SiLU epilogue's scratch (m x n / 2 bf16)
         st_ty = np.ndarray[(bufs["st"][1] // 2,), np.dtype[bfloat16]]
 
@@ -1153,7 +581,7 @@ class GemmQOperator(ArtcOperator):
 
         actual = {"A": nbytes(A_l1_ty), "B": nbytes(B_l1_ty), "C": nbytes(C_l1_ty), "acc": nbytes(acc_ty),
                   "st": nbytes(st_ty), **({"ws": nbytes(ws_ty), "X": nbytes(X_ty)} if pair else {})}
-        assert actual == {k: b for k, (_, b) in self._buffers(m).items()}, (actual, self._buffers(m))
+        assert actual == {k: b for k, (_, b) in bufs.items()}, (actual, bufs)
         layout = self._l1_layout()
         if layout is not None:
             roles = {"gqA1": "A", "gqB1": "B", "gqC1": "C", "gqX": "X"}
@@ -1167,74 +595,4 @@ class GemmQOperator(ArtcOperator):
         return module
 
 
-@dataclass(frozen=True)
-class ChainPart:
-    """A BD of ``chained_fill`` reading another runtime buffer than the fill's, or with a scratchpad parameter: the
-    element offset added to the tap's, or the transfer's length in passes of the tap (as ``ObjectFifoHandle.fill``),
-    or in ``length_unit`` elements (a tap of one pass per unit: [1, 2, d1, d0] with length_unit d1 d0 keeps d2's stride,
-    which a d2 of size 1 loses)."""
-
-    src: object
-    tap: TensorAccessPattern
-    offset_parameter: object = None
-    length_parameter: object = None
-    length_unit: int | None = None
-
-
-def chained_fill(prod: object, src: object, taps: list[TensorAccessPattern | ChainPart], group: TaskGroup, *,
-                 wait: bool = False, repeat_parameter: object = None) -> None:
-    """A runtime-sequence fill (or drain: a consumer handle) of ``prod`` (a shim ObjectFifoHandle) from ``src`` as ONE
-    task whose BD chain reads ``taps`` in order, the task repeated taps[0].sizes[0] times: every tap is
-    [repeat, d2, d1, d0] with the repeat as its BD's iteration (all taps the same repeat count), so
-    the stream is [repeat][tap][d2][d1][d0]. A ``ChainPart`` reads its own buffer and parameters. Enrolled in
-    ``group`` (freed when it finishes; ``wait``: awaited). ``repeat_parameter``: a ScratchpadParameter n, the task
-    runs n + 1 times (at most taps[0].sizes[0])."""
-    from aie.dialects.aie import EndOp, bds, next_bd
-    from aie.dialects.aiex import dma_configure_task_for, dma_start_task, shim_dma_bd
-    from aie.iron.runtime._context import active_sequence
-    from aie.iron.runtime.dmatask import DMATask
-    from aie.iron.runtime.endpoint import RuntimeEndpoint
-
-    rt = active_sequence()._runtime
-    rp = rt.register_parameter(repeat_parameter)
-    parts = [t if isinstance(t, ChainPart) else ChainPart(src, t) for t in taps]
-    parts = [ChainPart(p.src, p.tap, rt.register_parameter(p.offset_parameter),
-                       rt.register_parameter(p.length_parameter), p.length_unit) for p in parts]
-    reps = parts[0].tap.sizes[0]
-    assert all(len(p.tap.sizes) == 4 and p.tap.sizes[0] == reps for p in parts) and reps <= 64
-
-    class _Chain(DMATask):
-        def resolve(self, loc: object = None, ip: object = None) -> None:
-            task = dma_configure_task_for(self._alloc, repeat_count=reps - 1, issue_token=wait)
-            with bds(task) as bd:
-                for i, p in enumerate(parts):
-                    with bd[i]:
-                        shim_dma_bd(p.src.op, tap=p.tap, offset_parameter=p.offset_parameter,
-                                    length_parameter=p.length_parameter, length_unit=p.length_unit,
-                                    transfer_len=0 if p.length_parameter is not None else None)
-                        if i + 1 < len(parts):
-                            next_bd(bd[i + 1])
-                        else:
-                            EndOp()
-            self._task = task
-            dma_start_task(task, repeat_parameter=rp)
-
-    if prod._endpoint is None:
-        prod.endpoint = RuntimeEndpoint(prod._shim_tile)
-    active_sequence().note_fifo(prod)
-    active_sequence().emit_transfer(_Chain(prod.name, src, tap=parts[0].tap, task_group=group, wait=wait), group)
-
-
-def _runs(cols: list[int]) -> list[tuple[int, int, int]]:
-    """Split pass output columns into runs (first pass, count, column step) of at most 64 (a drain BD's iteration
-    count)."""
-    out: list[tuple[int, int, int]] = []
-    i = 0
-    while i < len(cols):
-        step = cols[i + 1] - cols[i] if i + 1 < len(cols) else 1
-        j = i + 1
-        while j < len(cols) and cols[j] - cols[j - 1] == step and step > 0 and j - i < 64:
-            j += 1
-        out.append((i, j - i, max(step, 1)))
-        i = j
-    return out
+expose(GemmQOperator, Geometry, "geo")

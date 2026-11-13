@@ -32,7 +32,7 @@ its own ``_layer_starts``;
 ``_fits_budget``; the sub-chunks S a fraction for a small size) and the layers whose caches a chunk writes
 (``kv_layers``).
 
-The dense GEMMs are paced designs (``gemm.gemm_q``'s "Pacing"): every chunk's parameters carry the machine's ``PACE``
+The dense GEMMs are paced designs (``gemm.pacing``): every chunk's parameters carry the machine's ``PACE``
 word (``pace.resolve``: before the first chunk, or at ``prepare``; 0 where nothing throttles them).
 """
 
@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .. import _native, parallel_compile
-from ..gemm.gemm_q import PACE, PACE_IDLE, pace_levels
+from ..gemm.pacing import PACE, PACE_IDLE, pace_levels
 from ..operators.base import ArtcOperator
 from ..operators.fused import Library
 from ..operators.util import arg_bytes, rup

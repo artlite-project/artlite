@@ -1,4 +1,4 @@
-"""Pacing's host side (``gemm.gemm_q``'s PACE word, ``prefill.pace``): the word's encoding, ``ARTLITE_PACE``, and the
+"""Pacing's host side (``gemm.pacing``'s PACE word, ``prefill.pace``): the word's encoding, ``ARTLITE_PACE``, and the
 calibration's search on simulated machines (a paced run's time 1 / duty; a throttle that multiplies a class's time
 while its duty is above a trip point)."""
 
@@ -7,7 +7,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from artlite.gemm.gemm_q import PACE_BITS, PACE_CLASSES, PACE_IDLE, pace_class, pace_levels, pace_word
+from artlite.gemm.pacing import PACE_BITS, PACE_CLASSES, PACE_IDLE, pace_class, pace_levels, pace_word
 from artlite.operators import bfp16
 from artlite.prefill import pace as P
 

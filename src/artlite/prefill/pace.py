@@ -1,4 +1,4 @@
-"""The pace levels a machine needs for the prefill's dense GEMMs (``gemm.gemm_q``'s "Pacing"): the platform of some
+"""The pace levels a machine needs for the prefill's dense GEMMs (``gemm.pacing``): the platform of some
 laptops asserts PROCHOT while those GEMMs run at full rate, and the whole SoC then runs at its lowest clocks (a Krackan
 Point laptop's Q4_K GEMMs 2.3x slower, on any power source), while at a lower duty they run unthrottled.
 
@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 
 from .. import _native
-from ..gemm.gemm_q import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
+from ..gemm.pacing import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
 from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
 

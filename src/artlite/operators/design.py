@@ -17,6 +17,14 @@ from .mlir_util import device_op
 COLS = 8  # array columns
 ROWS = 4  # compute rows per column (rows 2-5; memtile row 1, shim row 0)
 
+# Shim DMA limits the designs' runtime sequences are written around (``txn`` checks the host-built transactions')
+MAX_BD_ITER = 64  # a BD's iteration count (a task repeats its chain at most this often: longer runs are split)
+SHIM_QUEUE = 4  # tasks queued on a shim channel (more stall the controller before later fills are issued: a hang)
+TILE_BDS = 16  # BDs of a shim tile's DMA: a GEMM's weight fills, an A strip and the C drains of the chunks in flight
+MAX_CHAIN_BDS = 14  # BDs of a chained weight fill (Llama-3.1-8B's down, 14 chunks, the largest built): with the A and C
+# transfers' the tile's TILE_BDS
+MAX_INNER_WORDS = 1023  # a shim BD's innermost dimension, in words (a longer one can make aiecc run for very long)
+
 
 def range32(stop: object, *, unroll: bool = True) -> Iterator[object]:
     """``scf.for`` from 0 to stop (an int or an i32 value) with i32 bounds; yields the i32 induction variable, for a

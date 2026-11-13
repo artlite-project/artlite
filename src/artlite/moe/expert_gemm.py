@@ -61,8 +61,8 @@ from ml_dtypes import bfloat16
 
 from .. import txn
 from ..formats import KT, gu_tiles, slot
-from ..gemm.gemm_q import planar
 from ..gemm.gemm_qd import D_DEPTH, DQ_ONLY, GemmQdOperator
+from ..gemm.geometry import Geometry, planar
 from ..npu_regs import EVENT_LOCK_STALL, EVENT_MEMORY_STALL, window_counter_writes
 from ..operators import templating
 from ..operators.base import ArgSpec
@@ -129,7 +129,7 @@ class ExpertGemmOperator(GemmQdOperator):
         if ablate:  # (GemmQOperator's experiment switches)
             kw["ablate"] = ablate
         super().__init__(mac_rows=MAC_ROWS, m=M, M=CHUNK, tile_bytes=tile_bytes, col_bytes=0, kc=kc, **kw)
-        assert self.mc == 1 and self.dataflow().b_obj > 0
+        assert self.mc == 1 and self.flow.b_obj > 0
         if kind == "down":
             assert self.slots == 2 and self.N == max(out, self.passes * self.vp * self.n_c), "C runs of whole words"
 
@@ -143,9 +143,9 @@ class ExpertGemmOperator(GemmQdOperator):
     def get_kernel_src(self) -> str:
         return super().get_kernel_src() + _CHK.render(p=self.p)
 
-    def _dq_buffers(self) -> dict[str, tuple[int, int]]:
+    def _dq_buffers(self, g: Geometry, b_depth: int) -> dict[str, tuple[int, int]]:
         """(the down: a header slot set and scale workspace per half)"""
-        out = super()._dq_buffers()
+        out = super()._dq_buffers(g, b_depth)
         if self.kind == "down":
             out["ws"], out["hb"] = (2, out["ws"][1]), (2, out["hb"][1])
         return out
@@ -167,7 +167,7 @@ class ExpertGemmOperator(GemmQdOperator):
     @functools.cached_property
     def b0_words(self) -> int:
         """Words of block 0: one object of the weight channel's ObjectFifo."""
-        return self.dataflow().b_obj
+        return self.flow.b_obj
 
     @functools.cached_property
     def cb_words(self) -> int:
@@ -193,7 +193,7 @@ class ExpertGemmOperator(GemmQdOperator):
         """A chunk's weight tasks as chains of taps (bf16 units from its expert's slab, the second half half_bytes
         after the first): "gu" per half one chain (a BD per K chunk, [pass, unit, tile, words]); "down" one chain: the
         header units of both halves, then per slot its super-blocks of both halves ([pass, half, tile, words])."""
-        tw, (nsl, sw) = self.tile_bytes // 2, self._units
+        tw, (nsl, sw) = self.tile_bytes // 2, self.fill_units
         nt, rs = self.tiles, self.rt_stride
         if self.kind == "gu":
             g = self.kc_group
@@ -340,7 +340,7 @@ class ExpertGemmOperator(GemmQdOperator):
     def get_mlir_artifact(self) -> Module:
         MR, m, n, cap = self.nrows, self.m, self.nm, self.cap
         i32, u8 = np.int32, np.uint8
-        df = self.dataflow()
+        df = self.flow
         cb, down = self.c_bfp16, self.kind == "down"
         B_l2_ty = np.ndarray[(df.b_obj,), np.dtype[i32]]
         B_l1_ty = np.ndarray[(df.b_l1,), np.dtype[i32]]
@@ -353,7 +353,7 @@ class ExpertGemmOperator(GemmQdOperator):
         C12_ty = np.ndarray[((MR - 1) * c_elems,) if cb else ((MR - 1) * m, self.n_c), np.dtype[bfloat16]]
         acc_ty = np.ndarray[(m // 2 if self.csplit else m, n), np.dtype[bfloat16]]  # (csplit: a tile's first half)
         sx_ty = np.ndarray[(m * n // 2 // self.sxp,), np.dtype[bfloat16]]
-        dqb = self._dq_buffers()
+        dqb = self._dq_buffers(self.geo, self.plan.b_depth)
         ws_ty = np.ndarray[(dqb["ws"][1] // 2,), np.dtype[bfloat16]]
         hb_ty = np.ndarray[(dqb["hb"][1] // 2,), np.dtype[bfloat16]]
 

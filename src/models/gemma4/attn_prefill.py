@@ -47,10 +47,10 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from artlite.gemm.gemm_q import ChainPart, chained_fill
 from artlite.model_config import GemmaConfig
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
+from artlite.operators.chain import ChainPart, chained_fill
 from artlite.operators.design import COLS, range32, stream_walk
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.l1_layout import pin_l1_buffers

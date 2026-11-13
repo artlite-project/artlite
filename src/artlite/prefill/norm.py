@@ -65,9 +65,9 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from ..gemm.gemm_q import chained_fill
 from ..operators import templating
 from ..operators.base import ArgSpec, ArtcOperator
+from ..operators.chain import chained_fill
 from ..operators.design import COLS, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from ..operators.util import Attr, bf16_value, regions

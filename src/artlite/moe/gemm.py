@@ -15,8 +15,7 @@ GemmQd, ``prefill.gemm``), model-independent.
 """
 
 from ..formats import gu_tiles
-from ..gemm.gemm_q import planar
-from ..gemm.gemm_qd import GemmQdOperator
+from ..gemm.geometry import planar
 from ..operators.design import COLS
 from ..prefill import gemm as PG
 
@@ -53,7 +52,7 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None, wh
           "region_rt": min(region.n_rt, region.rt0["router"] + passes * PASS // b.R), "k_rep": 2, "c_pairs": True}
     if whole:
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
-    op = PG._gemm(kw, T, "qkv", ops)
+    op = PG.gemm_op(kw, T, "qkv", ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)
 
 
@@ -80,14 +79,9 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
     if whole:
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     if pl and whole:  # (token chunks of CHUNK_UNIT: 2 MAC rows of 64, as ``row_group_gemm``)
-        key = repr((sorted(kw.items()), 2, 64))
-        op = ops.get(key) if ops is not None else None
-        if op is None:
-            op = GemmQdOperator(mac_rows=2, m=64, **kw)
-            if ops is not None:
-                ops[key] = op
+        op = PG.gemm_qd_op(kw, mac_rows=2, m=64, ops=ops)
     else:
-        op = PG._gemm(kw, T, "gu", ops)
+        op = PG.gemm_op(kw, T, "gu", ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)
 
 
@@ -123,11 +117,5 @@ def row_group_gemm(region: object, T: int, *, pitch: int, row: int = 0, ops: dic
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     if planar(b.fmt, R, region.kc):
         kw.update(tiles=tiles, c_pack=True)
-    key = repr((sorted(kw.items()), mac_rows, m))
-    if ops is not None and key in ops:
-        op = ops[key]
-    else:
-        op = GemmQdOperator(mac_rows=mac_rows, m=m, **kw)
-        if ops is not None:
-            ops[key] = op
+    op = PG.gemm_qd_op(kw, mac_rows=mac_rows, m=m, ops=ops)
     return PG.Gemm(op, region.offset - op.hdr_skip)

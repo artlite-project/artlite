@@ -1,6 +1,6 @@
 """The prefill GEMMs of a model on its decode overlay's weight image (``decode.image.TileImage``: qwen35's
 ``QwenImage``, gemma4's ``GemmaImage``): every projection of a T-token chunk, read in place by GemmQ / GemmQd
-(``gemm_q``, ``gemm_qd``; the image's tile convention is theirs: K chunks in groups of ``kc_group``, group G of row
+(``gemm.gemm_q``, ``gemm.gemm_qd``; the image's tile convention is theirs: K chunks in groups of ``kc_group``, group G of row
 tile j at (G n_rt + j) kc_group).
 
 ``plan_phase`` turns an image region into its GEMMs (``Gemm``: the operator and the byte offset of its W argument in
@@ -19,7 +19,7 @@ the image) and the layout of their output (``Layout``):
   3584 in rows of 4096, the padding columns never written: zero).
 
 A run of consecutive blocks of one tile format is one GEMM: Q4_K and BFP16 tile-major (64-row passes, GemmQ or GemmQd),
-planar tiles (Q5_K / Q6_K, Gemma's Q4_0 of 32 rows x 512 columns, ...: ``gemm_qd.choose_planar_plan``). Limits of a
+planar tiles (Q5_K / Q6_K, Gemma's Q4_0 of 32 rows x 512 columns, ...: ``planar.choose_planar_plan``). Limits of a
 GEMM's weight fill: a chained fill holds one shim BD per K chunk and block (16 per shim tile, with the A and C
 transfers': ``MAX_CHAIN_BDS``), so runs take at most MAX_CHAIN_BDS / n_kc blocks and a projection of more K chunks (the
 27B's down: 17; Gemma's down: 20 in two groups of 10) runs as GEMMs of K parts (whole chunk groups, or ``k_part``
@@ -36,20 +36,22 @@ from dataclasses import dataclass
 
 from ..decode.image import Block, Region, TileImage
 from ..formats import gu_tiles, slot
-from ..gemm.gemm_q import GemmQOperator, pace_class
-from ..gemm.gemm_q import planar as is_planar
-from ..gemm.gemm_qd import GemmQdOperator, choose_planar_plan, gemm_mac_rows, planar_gemm
-from ..operators.design import COLS
+from ..gemm.gemm_q import GemmQOperator
+from ..gemm.gemm_qd import GemmQdOperator
+from ..gemm.geometry import GemmSpec, planar
+from ..gemm.pacing import PACE_ROLES, pace_class
+from ..operators.design import COLS, MAX_BD_ITER, MAX_CHAIN_BDS
 from ..operators.util import arg_bytes
+from .planar import choose_planar_plan, gemm_mac_rows, planar_gemm
 
 LINES = True  # packed C drains in whole 64-byte lines (GemmQOperator lines=; artlite-probe --diagnose measures both)
-MAX_CHAIN_BDS = 14  # shim BDs of a GEMM's chained weight fill (Llama-3.1-8B's down, 14 chunks, the largest built)
 ROWS = 64  # rows of a tile-major pass (gemm_q: 4 tiles of 16 rows, 8 BFP16 tiles of 8)
 OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # projections into the residual stream (eh: an MTP
 # drafter's, fc: a DFlash2 drafter's, out: LFM3's conv layers')
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
          "ple": "qkv"}
+assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
 @dataclass(frozen=True)
@@ -79,22 +81,36 @@ class PhasePlan:
     parts: int = 1
 
 
-def _gemm(kw: dict[str, object], T: int, which: str, ops: dict[str, GemmQOperator] | None = None) -> GemmQOperator:
-    """GemmQ or GemmQd by the tokens and format (``gemm_qd.gemm_mac_rows``), paced as its role and tile kind
-    (``gemm_q.pace_class``); with ``ops``, one object per distinct GEMM (the layers of a fused prefill share them: one
-    design each in the ELF)."""
-    key = repr((sorted(kw.items()), T, which))
+def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOperator] | None = None
+            ) -> GemmQOperator:
+    """GemmQ or GemmQd of the operator keywords ``kw`` by the tokens and format (``planar.gemm_mac_rows``), paced as its
+    role and tile kind (``pacing.pace_class``); with ``ops``, one object per distinct GEMM (``GemmSpec``: the layers of a
+    fused prefill share them: one design each in the ELF)."""
+    key = (GemmSpec(**kw), T, which)
     if ops is not None and key in ops:
         return ops[key]
-    planar = is_planar(kw["fmt"], kw["rows"], kw["kc"])
-    kw = {**kw, "pace": pace_class(which, planar)}
-    assert kw["passes"] <= 64, kw["passes"]
-    mac_rows = gemm_mac_rows(T, which, kw["fmt"], planar)
-    if planar and mac_rows == 3 and T >= 256:
+    is_planar = planar(kw["fmt"], kw["rows"], kw["kc"])
+    kw = {**kw, "pace": pace_class(which, is_planar)}
+    assert kw["passes"] <= MAX_BD_ITER, kw["passes"]
+    mac_rows = gemm_mac_rows(T, which, kw["fmt"], is_planar)
+    if is_planar and mac_rows == 3 and T >= 256:
         op = planar_gemm(kw, T)
     else:
         op = GemmQdOperator(mac_rows=mac_rows, **kw) if mac_rows else \
             GemmQOperator(nrows=2 if T <= 64 else 4, **kw)
+    if ops is not None:
+        ops[key] = op
+    return op
+
+
+def gemm_qd_op(kw: dict[str, object], *, mac_rows: int, m: int, ops: dict[tuple, GemmQOperator] | None = None
+               ) -> GemmQdOperator:
+    """The GemmQd of the operator keywords ``kw`` on ``mac_rows`` MAC rows of ``m`` tokens (one object per distinct GEMM,
+    as ``gemm_op``)."""
+    key = (GemmSpec(**kw), mac_rows, m)
+    if ops is not None and key in ops:
+        return ops[key]
+    op = GemmQdOperator(mac_rows=mac_rows, m=m, **kw)
     if ops is not None:
         ops[key] = op
     return op
@@ -132,7 +148,7 @@ def _extents(region: Region, run: list[int], T: int, K: int, few: bool) -> list[
     """Output columns per column of each block of a run (whole passes; planar: to the end of the last whole-line
     window, ``PlanarPlan.line_pitches``)."""
     b = region.blocks[run[0]]
-    if is_planar(b.fmt, b.R, region.kc):
+    if planar(b.fmt, b.R, region.kc):
         return list(_plan(region, run, T, K, few).line_pitches)
     return [ROWS * -(-region.blocks[i].tiles // _tp(region.blocks[i])) for i in run]
 
@@ -179,7 +195,7 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
     kw: dict[str, object] = {"fmt": b0.fmt, "rows": b0.R, "M": T, "K": K, "N": N, "tile_bytes": region.tile_bytes,
                              "col_bytes": region.col_stride, "passes": len(out_cols[0]), "out_cols": out_cols,
                              "kc": region.kc, "kc_group": region.kc_group}
-    if is_planar(b0.fmt, b0.R, region.kc):
+    if planar(b0.fmt, b0.R, region.kc):
         plan = _plan(region, run, plan_T or T, region.K, few)
         blocks = tuple((rt0 + r, n) for r, n in plan.blocks)
         kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks, lines=LINES)
@@ -203,7 +219,7 @@ def resident_k_part(image: TileImage, region: Region, T: int, *, pitch: int, k_p
     if region.name not in OUT:
         return k_part
     base = plan_phase(image, region, T, pitch=pitch, k_part=k_part)
-    if all(g.op.dataflow().a_res for g in base.gemms):
+    if all(g.op.flow.a_res for g in base.gemms):
         return k_part
     g, nk = region.kc_group, region.n_kc
     sizes = [n for n in range(min(nk - 1, MAX_CHAIN_BDS), 0, -1) if n % g == 0] + \
@@ -211,7 +227,7 @@ def resident_k_part(image: TileImage, region: Region, T: int, *, pitch: int, k_p
     best, cost = k_part, _part_seconds(base)
     for n in sorted(sizes, key=lambda n: (-(-nk // n), -n)):  # (the fewest parts first)
         plan = plan_phase(image, region, T, pitch=pitch, k_part=n)
-        if all(p.op.dataflow().a_res for p in plan.gemms):
+        if all(p.op.flow.a_res for p in plan.gemms):
             if (c := _part_seconds(plan)) < cost:
                 best, cost = n, c
             break
@@ -222,12 +238,12 @@ def _part_seconds(plan: PhasePlan) -> float:
     """What an output projection's K split costs per call (the rest is the same): its A reads (a strip refetched per
     pass when not resident), each part's C written and read by the residual add, at the DDR read rate (~56 GB/s), and
     ~50 us per part (fitted: the 27B's down in 2 -> 6 Q6_K parts at T = 256)."""
-    a = sum(g.op.M * g.op.K * 9 / 8 * (1 if g.op.dataflow().a_res else g.op.passes) for g in plan.gemms)
+    a = sum(g.op.M * g.op.K * 9 / 8 * (1 if g.op.flow.a_res else g.op.passes) for g in plan.gemms)
     c = 2 * plan.parts * max(arg_bytes(g.op, 2) for g in plan.gemms)
     return (a + c) / 56e9 + 50e-6 * plan.parts
 
 
-def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[str, GemmQOperator] | None = None,
+def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
                act: str = "silu", k_part: int = 0, layout_T: int = 0) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
     projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
@@ -240,8 +256,8 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     which = WHICH[name]
     if name == "gate_up":
         (b,) = region.blocks
-        planar = is_planar(b.fmt, b.R, KC)
-        if planar and slot(b.fmt).pass_tiles(b.fmt, b.R, gu_tiles(b.R)):  # (a pass: one group of 8 x [8 gate | 8 up]
+        pl = planar(b.fmt, b.R, KC)
+        if pl and slot(b.fmt).pass_tiles(b.fmt, b.R, gu_tiles(b.R)):  # (a pass: one group of 8 x [8 gate | 8 up]
             tp, width = gu_tiles(b.R), 64  # rows, 64 outputs, in two halves)
         else:  # (a pass: 64 rows, 4 x [8 gate | 8 up]: 4 Q4_K tiles, 8 BFP16 tiles; planar, half a group: 8 Q8_0 tiles)
             tp, width = _tp(b), 32
@@ -257,9 +273,9 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
                   "blocks": ((tp * p0, p1 - p0),), "lines": LINES}
-            if planar:
+            if pl:
                 kw["tiles"] = tp
-            op = _gemm(kw, T, which, ops)
+            op = gemm_op(kw, T, which, ops)
             gemms.append(Gemm(op, region.offset - op.hdr_skip))
         return PhasePlan(gemms, None)
     if name in OUT:
@@ -267,7 +283,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         ext = _extents(region, [0], T, K, name == "down")[0]
         assert ext <= pitch
         b = region.blocks[0]
-        if is_planar(b.fmt, b.R, KC):
+        if planar(b.fmt, b.R, KC):
             oc = _plan(region, [0], T, K, name == "down").out_cols([0], [pitch])
         else:
             oc = [[pitch * c + 64 * p for p in range(ext // 64)] for c in range(COLS)]
@@ -280,12 +296,12 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
                 k0 = i * k_part
                 kw = _kw(region, [0], T, k_part * KC, COLS * pitch, oc, few=name == "down", k_part=(0, k_part))
                 kw.update(kc_group=k_part, rt_stride=g)
-                op = _gemm(kw, T, which, ops)
+                op = gemm_op(kw, T, which, ops)
                 gemms.append(Gemm(op, region.offset + ((k0 // g) * region.n_rt * g + k0 % g) * S - op.hdr_skip,
                                   part=i, a_off=k0 * KC // 8 * 36))
             return PhasePlan(gemms, None, parts)
         if nk <= (k_part or MAX_CHAIN_BDS):
-            op = _gemm(_kw(region, [0], T, K, COLS * pitch, oc, few=name == "down"), T, which, ops)
+            op = gemm_op(_kw(region, [0], T, K, COLS * pitch, oc, few=name == "down"), T, which, ops)
             return PhasePlan([Gemm(op, region.offset - op.hdr_skip)], None)
         # K parts of whole chunk groups (chunks outer: any split), at most k_part chunks each (else what a chained fill
         # holds); parts of one width are one design, their A arguments shifted by the part's columns (one ConfigureOp
@@ -299,7 +315,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         for i in range(parts):
             k0, k1 = bounds[i], bounds[i + 1]
             kw = _kw(region, [0], T, (k1 - k0) * KC, COLS * pitch, oc, few=name == "down", k_part=(0, k1 - k0))
-            op = _gemm(kw, T, which, ops)
+            op = gemm_op(kw, T, which, ops)
             gemms.append(Gemm(op, region.offset + k0 * region.n_rt * S - op.hdr_skip, part=i, a_off=k0 * KC // 8 * 36))
         return PhasePlan(gemms, None, parts)
     TL = layout_T or T
@@ -309,7 +325,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     for run in _runs(region):
         b0 = region.blocks[run[0]]
         col0s = [off[region.blocks[i].name] for i in run]
-        if is_planar(b0.fmt, b0.R, KC):
+        if planar(b0.fmt, b0.R, KC):
             oc = _plan(region, run, TL, K, False).out_cols(col0s, [lay.pitch] * len(run))
         else:
             oc = [[lay.pitch * c + o + 64 * p for i, o in zip(run, col0s)
@@ -318,6 +334,6 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         if b0.pairs:
             assert len(run) == 1 and b0.fmt == "BFP16", "plane pairs: one BFP16 block"
             kw["c_pairs"] = True
-        op = _gemm(kw, T, which, ops)
+        op = gemm_op(kw, T, which, ops)
         gemms.append(Gemm(op, region.offset - op.hdr_skip))
     return PhasePlan(gemms, lay)

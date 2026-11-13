@@ -26,6 +26,12 @@ from .mlir_util import device_op
 
 L1_BYTES = 0x10000  # a core's data memory
 L1_ALIGN = 64  # a 128-byte vector load needs 64-byte alignment: an unaligned address is silently rounded down
+REGION = 0x4000  # four regions of two interleaved banks: the stack in region 0, streams of one loop in different ones
+
+
+def align64(nbytes: int) -> int:
+    """``nbytes`` rounded up to a whole ``L1_ALIGN`` (a buffer's place in a layout)."""
+    return -(-nbytes // L1_ALIGN) * L1_ALIGN
 
 
 def pin_l1_buffers(

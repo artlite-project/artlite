@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 import numpy as np
 
 from artlite import _native as native
-from artlite.gemm.gemm_q import PACE, PACE_IDLE, pace_word
+from artlite.gemm.pacing import PACE, PACE_IDLE, pace_word
 from artlite.gguf_model import GGUFFile
 from artlite.prefill import gemm as prefill_gemm
 from artlite.prefill import pace as pacing
@@ -206,7 +206,7 @@ def kinds(npu: object, *, step: Callable[[str], None], end: Callable[[str], None
 def pace_sweep(npu: object, kind: str, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
                T: int = 1024) -> dict[str, object]:
     """The items of one operator kind of the chunk (a paced GEMM's) as a program of their own at each pace level
-    (``gemm_q.PACE_IDLE``), each for KIND_SECONDS after IDLE_SECONDS idle (telemetry steps ``{tag}: pace {level}``): the
+    (``pacing.PACE_IDLE``), each for KIND_SECONDS after IDLE_SECONDS idle (telemetry steps ``{tag}: pace {level}``): the
     level from which the platform lets the kind run unthrottled, and its time there."""
     pf = npu.prefill
     T = min(s for s in pf.sizes if s >= T)

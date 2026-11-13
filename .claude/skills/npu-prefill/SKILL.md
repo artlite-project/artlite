@@ -201,7 +201,7 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 - Platform throttles: a Krackan Point laptop asserts PROCHOT (the whole SoC at its lowest clocks) within about a
   millisecond of each GEMM that runs its MMULs at 35-51% of their peak while it streams weights (the Q4_K GEMMs: 2.3x
   slower), on any power source; MMULs alone at that duty, DMA alone at 97 GB/s, the Q6_K GEMMs (29-33%), attention and
-  norms do not trip it. So every GEMM of a prefill is a paced design (`gemm_q`'s "Pacing": a new one gets its class from
+  norms do not trip it. So every GEMM of a prefill is a paced design (`gemm.pacing`: a new one gets its class from
   `prefill.gemm._gemm`), its levels calibrated per machine (`prefill.pace`) on random activations: the array's current
   follows its operands' bits (Strix Halo: 26-29 W socket power on zeros, 35-36 W on activations), and a GEMM on the
   zeroed buffers of a prefill that has not run a chunk yet does not trip it. A design-wide runtime switch costs nothing

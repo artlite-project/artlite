@@ -114,7 +114,7 @@ def _data(control_scale: float = 1.0, v1_ms: float | None = None, prochot: float
     v0 = next(r for r in runs if r["variant"].startswith("V0"))
     for k in v0["kinds"]["kinds"]:
         tel[f"{v0['variant']}, round 1: kinds: {k}"] = step(prochot if "Q4_K" in k else 0.0)
-    from artlite.gemm.gemm_q import PACE_IDLE, pace_word
+    from artlite.gemm.pacing import PACE_IDLE, pace_word
 
     v0["pace_sweep"] = {"kind": "GemmQOperator Q4_K 2048x8192", "items": 16, "class": 4, "levels": {}}
     for level, idle in enumerate(PACE_IDLE):

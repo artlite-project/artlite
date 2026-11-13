@@ -1,17 +1,22 @@
 """GemmQOperator's data movement on the host (``dma_model``; no NPU, no compile).
 
 Uniquely numbered weights, activations and outputs go through the operator's own
-shim taps and memtile patterns (``GemmQOperator.dataflow`` / ``b_taps`` / ``a_tap``
+shim taps and memtile patterns (``GemmQOperator.flow``: ``b_taps`` / ``a_tap``
 / ``c_taps``); every object a core receives, and every output element, is compared
 with the layout the kernels expect (module docstring of gemm/gemm_q.py).
 """
 
+import itertools
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
-from artlite.formats import FORMATS
-from artlite.gemm.gemm_q import COLS, KT, LINE, GemmQOperator, line_window
+from artlite.formats import FORMATS, KT
+from artlite.gemm.gemm_q import GemmQOperator
 from artlite.gemm.gemm_qd import GemmQdOperator
+from artlite.gemm.geometry import LINE, line_window
+from artlite.operators.design import COLS
 
 from .. import dma_model as dm
 
@@ -49,7 +54,7 @@ def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False,
 def _op_planar(fmt: str, *, R: int, S: int, kc: int, M: int, K: int, tiles: int, blocks: tuple[tuple[int, int], ...],
                region_rt: int, kc_group: int = 0, silu: bool = False, mac_rows: int = 3, m: int = 64,
                lines: bool = False) -> GemmQdOperator:
-    """GemmQd on planar tiles (``gemm_q.planar``): ``blocks`` of passes of ``tiles`` row tiles each, packed C (or the
+    """GemmQd on planar tiles (``geometry.planar``): ``blocks`` of passes of ``tiles`` row tiles each, packed C (or the
     SiLU groups' outputs), a column's region of ``region_rt`` row tiles (a row tile's K chunks consecutive, or in
     groups of ``kc_group``); ``lines``: whole-line drains, a column's passes from a line boundary."""
     n_kc = K // kc
@@ -193,7 +198,7 @@ ALL = CASES + [("Q4_K-3B", kw) for kw in CASES_3B] + [("Q4_0-1K", kw) for kw in 
 def test_gemm_q_dataflow(fmt: str, kw: dict) -> None:
     op = _op3b(**kw) if fmt == "Q4_K-3B" else _op3b(**kw, fmt="Q4_0") if fmt == "Q4_0-1K" else _op(fmt, **kw)
     assert (op.c_parts == 2) == kw.get("lines", False)
-    df = op.dataflow()
+    df = op.flow
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
 
@@ -206,10 +211,10 @@ def _check_weights(op: GemmQOperator, df: object) -> None:
     """Weights: column 0 and the last one (the column base offset matters)."""
     w_units = np.arange(op.w_bytes // 2, dtype=np.int64)
     for c in (0, COLS - 1):
-        stream = np.concatenate([dm.read(w_units, tap) for _, tap in op.b_taps(c)])
-        for _, tap in op.b_taps(c):
+        stream = np.concatenate([dm.read(w_units, tap) for _, tap in op.flow.b_taps(c)])
+        for _, tap in op.flow.b_taps(c):
             dm.check_shim_tap(tap, 2)
-        chains = op.b_chain(c)
+        chains = op.flow.b_chain(c)
         if chains is not None:  # one task per block: [repeat (each BD's iteration)][BD of the chain][3 dims]
             parts = []
             for chain in chains:
@@ -234,7 +239,7 @@ def _check_activations(op: GemmQOperator, df: object) -> None:
     a_units = np.arange(op.M * op.K * 9 // 16, dtype=np.int64)
     for ch in range(op.mc):
         for row in range(op.nrows):
-            tap = op.a_tap(ch, row)
+            tap = op.flow.a_tap(ch, row)
             dm.check_shim_tap(tap, 2)
             l2 = dm.receive(dm.read(a_units, tap), df.a_obj, df.a_wdims)
             l1 = dm.receive(dm.send(l2, None, repeat=df.a_repeat), df.a_l1)
@@ -256,7 +261,7 @@ def _check_outputs(op: GemmQOperator, df: object) -> None:
             objs = []  # per core row, per C object (halves: two per pass)
             for row in range(op.nrows):
                 objs.append([])
-                for p, col0 in enumerate(op.c_out_cols(c)):
+                for p, col0 in enumerate(op.flow.c_out_cols(c)):
                     ids = uid + np.arange(df.c_l1)
                     uid += df.c_l1
                     objs[row].append(ids)
@@ -287,7 +292,7 @@ def _check_outputs(op: GemmQOperator, df: object) -> None:
             # (the memtile walks each core's segment of the join)
             stream = dm.send([seg for obj in dm.join(objs) for seg in np.split(obj, op.nrows)], df.c_dims)
             pos = 0
-            for tap in op.c_taps(ch, c):
+            for tap in op.flow.c_taps(ch, c):
                 dm.check_shim_tap(tap, 2)
                 n = int(np.prod(tap.sizes))
                 dm.write(C, tap, stream[pos:pos + n])
@@ -375,9 +380,56 @@ def test_gemm_qd_planar_dataflow(fmt: str, R: int, S: int, kc: int, kw: dict) ->
     whole groups."""
     op = _op_planar(fmt, R=R, S=S, kc=kc, **kw)
     assert op.planar and (op.carry is not None or op.c_parts == 2) == kw.get("lines", False)
-    df = op.dataflow()
+    df = op.flow
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)
+
+
+def _check_l1(op: GemmQOperator) -> None:
+    """The pinned layout of each role's buffers (a GemmQ core: ``_buffers``; GemmQd: the MAC cores' and the
+    dequantizing core's, which share the D objects' addresses): 64-byte aligned, inside the core's memory, disjoint."""
+    layout = op._l1_layout()
+    if layout is None:
+        return
+    mac = op._buffers(op.geo, op.plan)
+    if op.plan.csplit:  # (the C tiles in halves: ``acc`` and ``accb`` hold the first, ``acch`` and ``accbh`` the second)
+        mac |= {k: (1, op.m * op.nm) for k in ("acc", "accb", "acch", "accbh")}
+    else:
+        mac["accb"] = mac["acc"]
+    roles = [mac] + ([op._dq_buffers(op.geo, op.plan.b_depth)] if op.DQ_CORE else [])
+    for sizes in roles:
+        spans = []
+        for name, addrs in layout.items():
+            if name in sizes:
+                spans += [(a, a + sizes[name][1], name) for a in addrs]
+        spans.sort()
+        for a, end, name in spans:
+            assert a % 64 == 0 and 0 <= a and end <= 0x10000, (name, a, end)
+        for (a0, e0, n0), (a1, _, n1) in itertools.pairwise(spans):
+            assert e0 <= a1, (n0, a0, e0, n1, a1)
+
+
+@pytest.mark.parametrize("fmt,kw", ALL, ids=[f"{f}-" + "-".join(f"{k}{v}" for k, v in kw.items()) for f, kw in ALL])
+def test_gemm_q_l1_layout(fmt: str, kw: dict) -> None:
+    op = _op3b(**kw) if fmt == "Q4_K-3B" else _op3b(**kw, fmt="Q4_0") if fmt == "Q4_0-1K" else _op(fmt, **kw)
+    assert op._l1_layout() is not None
+    _check_l1(op)
+    assert op._l1_bytes(op.geo, op.plan) <= 62 * 1024
+
+
+@pytest.mark.parametrize("fmt,R,S,kc,kw", CASES_PLANAR,
+                         ids=[f"{f}-r{r}-kc{k}-" + "-".join(f"{a}{v}" for a, v in kw.items() if a != "blocks")
+                              for f, r, _, k, kw in CASES_PLANAR])
+def test_gemm_qd_l1_layout(fmt: str, R: int, S: int, kc: int, kw: dict) -> None:
+    """The L1 choices are a pure function of the geometry: asking for another token count changes nothing of the
+    operator."""
+    op = _op_planar(fmt, R=R, S=S, kc=kc, **kw)
+    _check_l1(op)
+    geo, plan = op.geo, op.plan
+    assert op._plan_l1(geo) == replace(plan, csplit=0)
+    for m in (16, 32, 48):
+        op._l1_bytes(geo.with_m(m), op._plan_l1(geo.with_m(m)))
+        assert (op.geo, op.plan) == (geo, plan)

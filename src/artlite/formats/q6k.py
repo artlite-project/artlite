@@ -50,7 +50,7 @@ class Q6KSlot(Slot):
 
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
         # ws: the super-block's scales [kt][h][ii][g] bf16, then d [sb][g] fp32
-        return {"ws": (1, 32 * op.n + 4 * op.nsb * op.n), "hb": (1, 4 * 4 * op._hdr_slot_words)}
+        return {"ws": (1, 32 * op.n + 4 * op.nsb * op.n), "hb": (1, 4 * 4 * op.hdr_slot_words)}
 
     def qd_kernels(self, op: object, kernel: object, *, B_l1_ty: object, ws_ty: object, hb_ty: object,
                    D_ty: object) -> DqKernels:

@@ -7,7 +7,7 @@ Q4_1 (planar at 1024 columns; Gemma's at 512), Q2_K / Q3_K (word-major planar), 
 file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups; Gemma's
 16-row copy of the per-layer projection), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
 in / out and its qkv with a gate block of one tile (two rows a column). The GEMMs
-run in a library program as the prefill's do, paced (``gemm_q``'s "Pacing") at level 0 and at ``LEVEL``, and as unpaced
+run in a library program as the prefill's do, paced (``gemm.pacing``) at level 0 and at ``LEVEL``, and as unpaced
 twins: their outputs bit-identical."""
 
 
@@ -19,8 +19,8 @@ from ml_dtypes import bfloat16
 import artlite
 from artlite.decode.image import pack_rows
 from artlite.formats import FORMATS
-from artlite.gemm.gemm_q import PACE, pace_word
 from artlite.gemm.gemm_qd import GemmQdOperator
+from artlite.gemm.pacing import PACE, pace_word
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
     decision_gguf,
