@@ -83,10 +83,9 @@ def bd_words(address: int, tap: TensorAccessPattern, *, packet: int | None = Non
         assert s_it > 0 and s_it % 2 == 0 and s_it // 2 <= 1 << 20 and it <= 64, tap
         iteration = ((it - 1) << 20) | (s_it // 2 - 1)
     if packet is not None:
-        assert 0 <= packet < 32
-        w[2] |= 1 << 30 | packet << 19
-    w7 = 1 << 25 | (0 if next_bd is None else next_bd << 27 | 1 << 26) | txn.shim_lock_bits(acquire, release)
-    return [*w, dims[0], 3 << 30 | dims[1], 2 << 24 | dims[2], iteration, w7]
+        w[2] |= txn.bd_packet_bits(packet)
+    w7 = txn.BD_VALID | (0 if next_bd is None else next_bd << 27 | txn.BD_USE_NEXT) | txn.shim_lock_bits(acquire, release)
+    return [*w, dims[0], txn.BD_BURST_512B | dims[1], txn.BD_AXCACHE | dims[2], iteration, w7]
 
 
 # ----------------------------------------------------------------------
@@ -110,7 +109,7 @@ def _tails(bds: tuple[int, int], channel: int) -> np.ndarray:
         out[i, 0] = out[i, 6] = out[i, 12] = _HDR
         out[i, 1] = _parity((3 << 20) | reg)
         out[i, 7] = _parity((3 << 20) | (reg + 16))
-        out[i, 8], out[i, 9], out[i, 11] = 3 << 30, 2 << 24, 1 << 25
+        out[i, 8], out[i, 9], out[i, 11] = txn.BD_BURST_512B, txn.BD_AXCACHE, txn.BD_VALID
         out[i, 13] = _ctl_header(txn.QUEUE[txn.MM2S][channel], 1)
         out[i, 14] = bd
     return out.reshape(-1)

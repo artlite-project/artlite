@@ -77,104 +77,62 @@ class OverlayOperator(Protocol):
 class Sequence:
     """The transaction of one dispatch, built from stream transfers.
 
-    ``fill`` / ``drain`` return the word index of the transfer's BD in ``words()``: its length and
-    address may be rewritten there before another dispatch (``txn.bd_words``)."""
+    ``fill`` / ``drain`` return the word index of the transfer's BD in ``words()`` (``drain``: in a one-element list):
+    its length and address may be rewritten there before another dispatch (``txn.bd_words``)."""
 
-    def __init__(self, op: OverlayOperator, *, rolling: bool = False, inputs: tuple[str, ...] = ()):
-        """rolling: every transfer is issued at once; a channel with 4 queued tasks first waits for its oldest
-        (instead of a sync every 4 transfers and fills that wait for the fourth): the transaction runs ahead of the
-        array, ``sync`` waits for the drains only. A task carries a task-complete token only when a wait needs it
-        (its push is patched when the wait is issued): a channel completes its tasks in order, so one wait per
-        channel covers its earlier tasks too, and every waited token costs the firmware ~0.3 us (a sync that waits
-        for each of a phase's 2-3 drains per column costs a phase boundary ~5 us). ``inputs`` (rolling): fill streams
-        the drains of every sync depend on (a phase's inputs, not weight runs that span phases): a sync waits for
-        them first, one wait per run of columns, while the phase still runs, so the next phase's fills after the
-        sync find empty queues instead of each waiting for its column's oldest (Gemma's step: 1366 waits instead of
-        3751, 0.2 ms less).
+    def __init__(self, op: OverlayOperator, *, inputs: tuple[str, ...] = ()):
+        """Every transfer is issued at once; a channel with 4 queued tasks first waits for its oldest: the transaction
+        runs ahead of the array, ``sync`` waits for the drains only. A task carries a task-complete token only when a
+        wait needs it (its push is patched when the wait is issued): a channel completes its tasks in order, so one wait
+        per channel covers its earlier tasks too, and every waited token costs the firmware ~0.3 us (a sync that waits
+        for each of a phase's 2-3 drains per column costs a phase boundary ~5 us). ``inputs``: fill streams the drains
+        of every sync depend on (a phase's inputs, not weight runs that span phases): a sync waits for them first, one
+        wait per run of columns, while the phase still runs, so the next phase's fills after the sync find empty queues
+        instead of each waiting for its column's oldest (Gemma's step: 1366 waits instead of 3751, 0.2 ms less).
 
         A task the array pushes itself (``device_task``: control packets that write and push BDs the host does not
         use) takes a queue slot without a token: the channel's later host task's token covers it."""
         self.op = op
         self.txn = txn.Txn()
-        self.rolling = rolling
         self.inputs = inputs
         self._bd_count: dict[str, int] = getattr(op, "BD_COUNT", {})
         self._packet: dict[str, int] = getattr(op, "PACKET", {})
         self._next_bd: dict[tuple[int, str], int] = {}
         self._controlled: set[tuple[int, int, int]] = set()
-        self._drains: list[tuple[str, int, int, int, tuple | None, list[int]]] = []
-        self._pending: dict[tuple[int, str], int] = {}  # transfers issued since the channel's last sync
-        self._fill_tokens: set[tuple[int, str]] = set()  # fills whose task-complete token is not waited for yet
-        # rolling: per channel the push ops not waited for (None: a task the array pushed)
+        # per channel the push ops not waited for (None: a task the array pushed)
         self._queued: dict[tuple[int, str], list[int | None]] = {}
-
-    def _bd(self, stream: str, col: int) -> int:
-        k = self._next_bd.get((col, stream), 0)
-        self._next_bd[(col, stream)] = k + 1
-        n = self._pending.get((col, stream), 0) + 1
-        assert n <= txn.QUEUE_DEPTH, (f"more than {txn.QUEUE_DEPTH} transfers of stream {stream}, column {col} "
-                                      f"without a sync")
-        self._pending[(col, stream)] = n
-        return self.op.BD_BASE[stream] + k % txn.QUEUE_DEPTH
 
     def _controller(self, col: int, direction: int, channel: int) -> None:
         if (col, direction, channel) not in self._controlled:
             self.txn.token_controller(col, direction, channel)
             self._controlled.add((col, direction, channel))
 
-    def _wait_fill(self, stream: str, col: int) -> None:
-        """Wait for the fill of a stream that carries a token (the fourth since the last sync): the
-        channel's queue is then empty."""
-        assert not self._drains, "a full fill queue while drains wait for a sync"
-        self.txn.sync(col=col, direction=txn.MM2S, channel=self.op.ENDPOINTS[stream][1])
-        self._fill_tokens.discard((col, stream))
-        self._pending[(col, stream)] = 0
-
     def fill(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None = None, repeat: int = 1,
              iteration: tuple[int, int] | None = None, *, packet: bool | int = True,
              acquire: tuple[int, int] | None = None) -> int:
         """Read ``nbytes`` at the device address into a column's A or X stream (``dims``: gathered,
-        see ``txn.Txn.shim_bd``), ``repeat`` times in a row (``iteration``: each from a further address). A
-        channel queues 4 tasks: the fourth fill since the last sync carries a token, a fifth one first waits
-        for it. On a packet-switched stream (``PACKET``) the fill gets the stream's packet header unless ``packet``
+        see ``txn.Txn.shim_bd``), ``repeat`` times in a row (``iteration``: each from a further address). On a
+        packet-switched stream (``PACKET``) the fill gets the stream's packet header unless ``packet``
         is False (words that carry their own headers: control packets) or another packet id (a route of its own);
-        acquire (shim lock, value): the task waits for the lock (rolling)."""
-        direction, channel = self.op.ENDPOINTS[stream]
-        assert direction == txn.MM2S, stream
-        if self.rolling:
-            pid = self._packet.get(stream) if packet is True else None if packet is False else packet
-            return self._task(stream, col, address, nbytes, dims, repeat, iteration, packet=pid, acquire=acquire)
-        assert stream not in self._packet and acquire is None, "packet-switched streams, locks: rolling sequences"
-        if self._pending.get((col, stream), 0) == txn.QUEUE_DEPTH:
-            self._wait_fill(stream, col)
-        token = self._pending.get((col, stream), 0) == txn.QUEUE_DEPTH - 1
-        if token:
-            self._controller(col, direction, channel)
-            self._fill_tokens.add((col, stream))
-        return self.txn.shim_task(col, direction, channel, self._bd(stream, col), address=address, nbytes=nbytes,
-                                  dims=dims, repeat=repeat, token=token, iteration=iteration)
+        acquire (shim lock, value): the task waits for the lock."""
+        assert self.op.ENDPOINTS[stream][0] == txn.MM2S, stream
+        pid = self._packet.get(stream) if packet is True else None if packet is False else packet
+        return self._task(stream, col, address, nbytes, dims, repeat, iteration, packet=pid, acquire=acquire)
 
     def drain(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None = None,
               repeat: int = 1, iteration: tuple[int, int] | None = None, *,
               release: tuple[int, int] | None = None) -> list[int]:
         """Write the next ``nbytes`` of a column's output stream to the device address (``dims``:
-        scattered). The transfer is issued by the next ``sync`` (rolling: at once); the returned
-        one-element list then holds its BD's word index. release (shim lock, value): added to the lock when the
-        transfer is done (rolling)."""
+        scattered), issued at once; the returned one-element list holds its BD's word index. release (shim lock,
+        value): added to the lock when the transfer is done."""
         assert self.op.ENDPOINTS[stream][0] == txn.S2MM, stream
-        handle: list[int] = []
-        if self.rolling:
-            handle.append(self._task(stream, col, address, nbytes, dims, repeat, iteration, release=release))
-            return handle
-        assert repeat == 1 and iteration is None and release is None, "repeated drains, locks: rolling sequences"
-        self._drains.append((stream, col, address, nbytes, dims, handle))
-        return handle
+        return [self._task(stream, col, address, nbytes, dims, repeat, iteration, release=release)]
 
     def _task(self, stream: str, col: int, address: int, nbytes: int, dims: tuple | None, repeat: int,
               iteration: tuple[int, int] | None = None, *, packet: int | None = None,
               acquire: tuple[int, int] | None = None, release: tuple[int, int] | None = None) -> int:
-        """Rolling: a transfer, after waiting for the channel's oldest when 4 are queued (or as many host tasks as
-        the stream has BDs)."""
+        """A transfer, after waiting for the channel's oldest when 4 are queued (or as many host tasks as the stream
+        has BDs)."""
         direction, channel = self.op.ENDPOINTS[stream]
         key = (col, stream)
         self._controller(col, direction, channel)
@@ -190,8 +148,8 @@ class Sequence:
         return at
 
     def _room(self, stream: str, col: int, ok: object) -> None:
-        """Rolling: wait for a column's oldest host tasks of a stream (and the array's tasks before them) until its
-        queue is ``ok``."""
+        """Wait for a column's oldest host tasks of a stream (and the array's tasks before them) until its queue is
+        ``ok``."""
         direction, channel = self.op.ENDPOINTS[stream]
         queued = self._queued.setdefault((col, stream), [])
         while not ok(queued):
@@ -201,21 +159,20 @@ class Sequence:
             self.txn.sync(col=col, direction=direction, channel=channel)
 
     def device_task(self, stream: str, col: int) -> None:
-        """Rolling: a task of the stream that the array pushes (into the column's queue, without a token) after the
-        transfers issued so far; the queue keeps a slot for it."""
-        assert self.rolling
+        """A task of the stream that the array pushes (into the column's queue, without a token) after the transfers
+        issued so far; the queue keeps a slot for it."""
         self._room(stream, col, lambda q: len(q) < txn.QUEUE_DEPTH)
         self._queued[(col, stream)].append(None)
 
     def device_done(self, stream: str, col: int) -> None:
-        """Rolling: the array's tasks of the column's stream are complete (a sync waited for outputs that consumed
-        them), and so are the tasks queued before them: no wait for those."""
+        """The array's tasks of the column's stream are complete (a sync waited for outputs that consumed them), and so
+        are the tasks queued before them: no wait for those."""
         q = self._queued.get((col, stream), [])
         if None in q:
             del q[:len(q) - q[::-1].index(None)]
 
     def _retire(self, streams: list[str], only: tuple[int, ...] | None = None) -> None:
-        """Rolling: wait for every queued task of the streams (only: of those columns): a token on each channel's last
+        """Wait for every queued task of the streams (only: of those columns): a token on each channel's last
         one, one wait per run of columns."""
         for stream in streams:
             direction, channel = self.op.ENDPOINTS[stream]
@@ -232,47 +189,23 @@ class Sequence:
                     start = i
 
     def wait_fills(self, stream: str, cols: tuple[int, ...]) -> None:
-        """Rolling: wait for the columns' fills of a stream (a fill of another column may follow them into its memtile:
+        """Wait for the columns' fills of a stream (a fill of another column may follow them into its memtile:
         a packet-switched stream's sources keep no order between them)."""
         self._retire([stream], cols)
 
     def sync(self, fills: bool = False) -> None:
-        """Issue the drains collected since the last sync and wait for them (a channel's last
-        drain carries the token). The fills issued before are complete then as well: their data
-        produced these outputs. Rolling: wait for the drains issued so far (and with ``fills`` for
-        the fills: the transaction's end)."""
-        if self.rolling:
-            drains = [s for s, (d, _) in self.op.ENDPOINTS.items() if d == txn.S2MM]
-            fill_streams = [s for s, (d, _) in self.op.ENDPOINTS.items() if d == txn.MM2S and s not in self.inputs]
-            self._retire([*self.inputs, *drains, *(fill_streams if fills else [])])
-            return
-        last = {(stream, col): i for i, (stream, col, *_) in enumerate(self._drains)}
-        waits: dict[int, list[int]] = {}
-        for i, (stream, col, address, nbytes, dims, handle) in enumerate(self._drains):
-            direction, channel = self.op.ENDPOINTS[stream]
-            self._controller(col, direction, channel)
-            token = last[(stream, col)] == i
-            handle.append(self.txn.shim_task(col, direction, channel, self._bd(stream, col), address=address,
-                                             nbytes=nbytes, token=token, dims=dims))
-            if token:
-                waits.setdefault(channel, []).append(col)
-        for channel, cols in waits.items():  # one wait per run of adjacent columns
-            cols.sort()
-            start = 0
-            for i in range(1, len(cols) + 1):
-                if i == len(cols) or cols[i] != cols[i - 1] + 1:
-                    self.txn.sync(col=cols[start], direction=txn.S2MM, channel=channel, ncol=i - start)
-                    start = i
-        self._drains.clear()
-        for col, stream in sorted(self._fill_tokens):  # (complete by now: their tokens must not linger)
-            self.txn.sync(col=col, direction=txn.MM2S, channel=self.op.ENDPOINTS[stream][1])
-        self._fill_tokens.clear()
-        self._pending.clear()
+        """Wait for the drains issued so far (a channel's last drain carries the token), and with ``fills`` for the
+        fills: the transaction's end. The fills issued before are complete after the drains as well: their data
+        produced these outputs."""
+        drains = [s for s, (d, _) in self.op.ENDPOINTS.items() if d == txn.S2MM]
+        fill_streams = [s for s, (d, _) in self.op.ENDPOINTS.items() if d == txn.MM2S and s not in self.inputs]
+        self._retire([*self.inputs, *drains, *(fill_streams if fills else [])])
 
     def words(self) -> np.ndarray:
-        assert not self._drains and not self._fill_tokens, "drains or tokens without a sync"
         assert not any(self._queued.values()), "tasks whose tokens are not waited for (sync(fills=True))"
-        return self.txn.words()
+        words = self.txn.words()
+        txn.verify_if_enabled(words)
+        return words
 
 
 class OverlayDevice:
@@ -317,7 +250,11 @@ class OverlayDevice:
         turns = _native.turn_foreign()
         if self._prologue is not None and (self.stale or turns != self._turns):
             self.stale = False
-            self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
+            try:
+                self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
+            except DispatchError as e:
+                self._note(e, self._prologue, what="the prologue's transaction (code pages)")
+                raise
         self._turns = turns
 
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
@@ -363,6 +300,7 @@ class OverlayDevice:
     def load(self, words: np.ndarray) -> None:
         """Make ``words`` the transaction of the following dispatches (``dispatch()``)."""
         assert words.nbytes <= self._insts.size, f"transaction of {words.nbytes} B"
+        txn.verify_if_enabled(words, queues=False)
         self._insts.map().view(np.uint32)[:words.size] = words
         self._insts.sync_to_device(words.nbytes, 0)
         self._loaded = self._insts.map().view(np.uint32)[:words.size]
@@ -370,19 +308,19 @@ class OverlayDevice:
     def dispatch(self, transaction: Transaction | None = None) -> None:
         """Run a transaction (default: the loaded one); blocking. The DispatchError of a transaction
         the driver's hang detection stopped names the operations where the firmware was."""
-        try:
-            with npu_turn():
-                self._fresh()
+        with npu_turn():
+            self._fresh()  # (a failure of the prologue is noted as its own)
+            try:
                 if transaction is None:
                     self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
                     return
                 t0 = time.perf_counter()
                 self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
                                               spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
-            transaction.durations.append(time.perf_counter() - t0)
-        except DispatchError as e:
-            self._note(e, transaction)
-            raise
+            except DispatchError as e:
+                self._note(e, transaction)
+                raise
+        transaction.durations.append(time.perf_counter() - t0)
 
     def submit(self, transaction: Transaction) -> None:
         """Start a transaction and return: ``wait`` waits for it (the host prepares the next one meanwhile)."""
@@ -403,12 +341,16 @@ class OverlayDevice:
             self._note(e, transaction)
             raise
 
-    def _note(self, e: DispatchError, transaction: Transaction | None) -> None:
-        if e.health is not None:
-            ops = txn.decode(self._loaded if transaction is None else transaction.words)
-            i = e.health["txn_op_idx"]
-            e.add_note(f"transaction operations {max(i - 1, 0)} .. {i + 1} of {len(ops)} (txn_op_idx {i}): "
-                       f"{ops[max(i - 1, 0):i + 2]}")
+    def _note(self, e: DispatchError, transaction: Transaction | None, *, what: str | None = None) -> None:
+        """Add where the firmware was to a DispatchError (``txn.hang_note``): the transaction ``transaction`` (None:
+        the loaded one) or the prologue's. Never raises: a note failing would mask the error."""
+        try:
+            if what is None:
+                what = "the loaded transaction" if transaction is None else "a transaction"
+            words = self._loaded if transaction is None else transaction.words
+            e.add_note(txn.hang_note(words, e.health, what=what))
+        except Exception as note_error:  # noqa: BLE001 (the dispatch's error is the one to see)
+            e.add_note(f"(no transaction position: {note_error!r})")
 
 
 class Transaction:
@@ -416,6 +358,7 @@ class Transaction:
     (rewrite BD words there, then ``flush``); ``durations``: its last dispatches' (s)."""
 
     def __init__(self, dev: OverlayDevice, words: np.ndarray):
+        txn.verify_if_enabled(words, queues=False)
         self.buffer = dev.device.alloc_insts_buffer(words.nbytes)
         self.words = self.buffer.map().view(np.uint32)[:words.size]
         self.words[:] = words

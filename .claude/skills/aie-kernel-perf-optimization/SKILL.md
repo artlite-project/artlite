@@ -243,7 +243,7 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   unit: 1.33x); group the small parts (`GemmQOperator.hg`). Long-K GEMMs: K parts keep the A strip resident in the
   memtile (`plan_phase(k_part=)`).
 - **Queue depth, not BD count, limits a shim channel**: at most 4 queued tasks. Rolling retirement
-  (`Sequence(rolling=True)`) keeps it full. Issue the fills the cores need to make progress before the bulk of a
+  (`Sequence`) keeps it full. Issue the fills the cores need to make progress before the bulk of a
   phase's weight fills, or the queue deadlocks.
 - **Deep memtile FIFOs run out of BD ids** (24 per channel parity); deeper FIFOs do not help a DMA-bound operator.
 - **Design switches**: every change of design in a library program is a reset and a reconfiguration (~80-90 µs); count

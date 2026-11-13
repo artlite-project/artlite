@@ -449,6 +449,7 @@ class Assembler:
         # (the PDI load of the next configuration with the reset, the other most likely the firmware's last; the first:
         # the second, as aiecc starts)
         self.parity = 1
+        self.item_ops: list[int] = []  # (the last ``assemble``'s operation count through the end of each of its items)
         self.reuse = REUSE and census is not None  # (configurations without the array reset: ``Quiet``)
         # (per entry: its cores that acquire a neighbour's lock, and those (tile, lock))
         self._neighbours = {e: (frozenset(t for t, _, _ in v), frozenset((lt, k) for _, lt, k in v))
@@ -520,8 +521,9 @@ class Assembler:
         return True
 
     def assemble(self, items: Sequence[Item]) -> np.ndarray:
-        """A control program (a TXN) of the items; advances ``parity``."""
+        """A control program (a TXN) of the items; advances ``parity``; ``item_ops`` holds where each item ends."""
         parts, n_ops, prev = [self.header, self.preamble], len(self.preamble) // 4, None  # (CREATE_SCRATCHPAD: 4 words)
+        self.item_ops = ends = []
         state = np.full((64, (_MEM_TILE_BDS[1] - _MEM_TILE_BDS[0]) // 4), -1, np.int64)  # (per column: the BDs held)
         ports: dict[int, dict[int, int]] = {}  # (the port configurations since the last array reset, per tile)
         for e, addrs in items:
@@ -548,10 +550,14 @@ class Assembler:
             words, bd_words, n = (blk.run if configure else blk.run.guarded).emit(state)
             words = words.copy()
             addr = np.asarray(addrs, np.int64)[blk.bd_arg] + blk.bd_rel
+            if addr.size and (addr.min() < 0 or addr.max() >= 1 << 48):
+                raise txn.HardwareLimitError(f"item {len(ends)} (entry {e}): BD addresses {int(addr.min()):#x} .. "
+                                             f"{int(addr.max()):#x} do not fit a BD's 48 bits")
             words[bd_words] = (addr & 0xFFFFFFFC).astype(np.uint32)
             words[bd_words + 1] = (words[bd_words + 1] & 0xFFFF0000) | (addr >> 32).astype(np.uint32)
             parts.append(words)
             n_ops += n
+            ends.append(n_ops)
             prev = e
         out = np.concatenate(parts)
         out[2], out[3] = n_ops, 4 * out.size

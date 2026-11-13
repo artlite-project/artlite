@@ -194,7 +194,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 - One NPU dispatch must finish within the driver's hang detection (2 s): split long work into pieces well under
   it. A killed job fails with `DispatchError ... TIMEOUT (state 8)` and "TDR timeout detected" in dmesg;
-  `health["txn_op_idx"]` is the last control-code operation the firmware ran.
+  `health["txn_op_idx"]` is the last control-code operation the firmware ran (0xFFFFFFFF: none reported).
 - A runtime-sequence argument stays below 4 GB (ELF relocation addends are 32-bit).
 - An ELF's control code goes into the process's device heap (64 MB heap BOs up to 512 MB; one before Linux 7.2, where
   `Library`'s pieces shrink to fit and a full heap raises `HeapFullError`); every ConfigureOp inlines its design's

@@ -11,6 +11,8 @@ import pytest
 # already set stays): spinning, torch's pool keeps ~1.2 CPUs busy while the NPU works (Llama 1B prefill: 1.16 vs 0.11
 # CPUs)
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+# every host-built transaction is verified where it is built or loaded (``txn.verify``)
+os.environ.setdefault("ARTLITE_VERIFY_TXN", "1")
 
 from artlite import parallel_compile
 

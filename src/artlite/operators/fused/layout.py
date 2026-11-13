@@ -11,6 +11,7 @@ import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
+from ...txn import HardwareLimitError
 from ..base import ArgSpec, ArtcOperator
 
 # Bytes of scratch one runtime-sequence argument may span: a full ELF's relocations carry 32-bit addends (aiebu
@@ -71,6 +72,14 @@ class BufferLayout:
                     offset += nbytes
             self.space_bytes[space] = offset
 
+    def check_limit(self, limit: int) -> None:
+        """The input and output spaces, each one runtime-sequence argument, stay within ``limit`` bytes (HardwareLimitError
+        naming the space: a larger one's relocation addends overflow 32 bits)."""
+        for space in ("input", "output"):
+            if self.space_bytes[space] > limit:
+                raise HardwareLimitError(f"the {space} buffers take {self.space_bytes[space]} bytes, more than one "
+                                         f"sequence argument may span ({limit}: 32-bit relocation addends)")
+
     def span(self, name: str) -> Span:
         """Where a buffer or a slice of one lies."""
         base, start, end = parse_name(name)
@@ -83,7 +92,9 @@ def scratch_segments(spans: Iterable[Span], limit: int) -> list[tuple[int, int]]
     one. Segments may overlap (a slice that crosses a segment's limit starts the next)."""
     segs: list[tuple[int, int]] = []
     for start, end in sorted({(s.offset, s.offset + s.nbytes) for s in spans if s.space == "scratch"}):
-        assert end - start <= limit, f"a scratch buffer of {end - start} bytes exceeds one argument ({limit})"
+        if end - start > limit:
+            raise HardwareLimitError(f"a scratch buffer of {end - start} bytes exceeds one sequence argument "
+                                     f"({limit}: 32-bit relocation addends)")
         if segs and end <= segs[-1][0] + limit:
             segs[-1] = (segs[-1][0], max(segs[-1][1], end))
         else:

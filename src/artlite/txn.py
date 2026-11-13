@@ -34,6 +34,9 @@ Memory-tile DMA (AM029 MEMORY_TILE_MODULE; the words aiecc writes for its runtim
 - every memory tile's task-complete tokens go to controller ``MEM_CONTROLLER_ID`` (as aiecc routes them).
 """
 
+import os
+from collections.abc import Mapping
+
 import numpy as np
 
 DDR_AIE_ADDR_OFFSET = 0x80000000  # device address of a host buffer = its paddr + this
@@ -44,6 +47,9 @@ OP_NOOP, OP_LOAD_PDI, OP_CREATE_SCRATCHPAD = 5, 8, 10
 # words of the fixed-size operations (a blockwrite and the custom operations, 0x80 on, carry their byte size)
 _OP_WORDS = {OP_WRITE: 6, OP_MASKWRITE: 7, OP_MASKPOLL: 7, OP_NOOP: 1, 6: 1, 7: 7, OP_LOAD_PDI: 4,
              OP_CREATE_SCRATCHPAD: 4, 12: 3}
+_OP_NAMES = {OP_WRITE: "write32", OP_BLOCKWRITE: "blockwrite", OP_MASKWRITE: "maskwrite32", OP_MASKPOLL: "maskpoll32",
+             OP_TCT: "sync", OP_DDR_PATCH: "patch", OP_NOOP: "noop", OP_LOAD_PDI: "load_pdi",
+             OP_CREATE_SCRATCHPAD: "create_scratchpad"}
 
 # shim tile DMA registers (row 0)
 SHIM_BD0 = 0x1D000
@@ -63,9 +69,21 @@ MEM_WEST, MEM_OWN, MEM_EAST = 0, 0x20000, 0x40000  # word-address bases of the t
 MEM_BDS, MEM_CONTROLLER_ID = 48, 26
 CORE_LOCK0 = 0x1F000  # a core tile's lock values (16 B apart)
 
-_BD_BURST_512B = 3 << 30  # BD word 4: AXI burst length 32 beats
-_BD_AXCACHE = 2 << 24  # BD word 5 (AxQoS stays 0)
-_BD_VALID = 1 << 25  # BD word 7
+# shim BD words 3 .. 7 that no dimension, iteration or lock changes (words 0 .. 2: length, address, packet header)
+BD_BURST_512B = 3 << 30  # word 4: AXI burst length 32 beats
+BD_AXCACHE = 2 << 24  # word 5 (its AxQoS field, bits 23:20, is never nonzero: ``BD_QOS_MASK``)
+BD_QOS_MASK = 0xF << 20
+BD_VALID = 1 << 25  # word 7
+BD_USE_NEXT = 1 << 26  # word 7: the task continues with BD Next_BD (bits 30:27)
+BD_PACKET = 1 << 30  # word 2: Enable_Packet; Packet_ID is bits 23:19 (``bd_packet_bits``)
+PACKET_IDS = 32
+
+NO_OP_INDEX = 0xFFFFFFFF  # the firmware's ``txn_op_idx`` when it reports no operation (ert.h)
+
+
+class HardwareLimitError(ValueError):
+    """A transaction field or id the hardware cannot encode, or a transaction that breaks a rule of the shim DMA
+    (``verify``); the message names the offending values."""
 
 
 def tile_address(col: int, row: int, reg: int) -> int:
@@ -133,40 +151,50 @@ class Txn:
         (a chain: one queue entry). packet: the MM2S stream gets a packet header of this id (a packet-switched
         channel); acquire (lock, value): the BD waits for shim lock ``lock`` >= value and subtracts it; release (lock,
         value): adds value to it when done."""
-        assert 0 <= bd < SHIM_BDS
+        if not 0 <= bd < SHIM_BDS:
+            raise HardwareLimitError(f"shim BD id {bd}: 0 .. {SHIM_BDS - 1}")
         d0 = d1 = d2 = 0
         if dims is not None:
             n0, n1, s1, s2 = dims
-            assert 0 < n0 < 1024 and 0 < n1 < 1024 and 0 < s1 <= 1 << 20 and 0 < s2 <= 1 << 20, dims
-            assert nbytes % (4 * n0 * n1) == 0, (nbytes, dims)
+            if not (0 < n0 < 1024 and 0 < n1 < 1024 and 0 < s1 <= 1 << 20 and 0 < s2 <= 1 << 20):
+                raise HardwareLimitError(f"shim BD dims (n0, n1, s1, s2) = {dims}: sizes 1 .. 1023, "
+                                         f"strides 1 .. 2^20 words")
+            if nbytes % (4 * n0 * n1):
+                raise HardwareLimitError(f"shim BD of {nbytes} bytes is not a whole number of dims {dims} groups")
             d0, d1, d2 = n0 << 20, (n1 << 20) | (s1 - 1), s2 - 1  # (size, step - 1); d0 steps by single words
         it = 0
         if iteration is not None:  # BD word 6: Iteration_Current 0, Iteration_Wrap - 1, Iteration_Stepsize - 1
             step, count = iteration
-            assert 0 < step <= 1 << 20 and 0 < count <= 64, iteration
+            if not (0 < step <= 1 << 20 and 0 < count <= 64):
+                raise HardwareLimitError(f"shim BD iteration (step, count) = {iteration}: step 1 .. 2^20 words, "
+                                         f"count 1 .. 64")
             it = ((count - 1) << 20) | (step - 1)
-        nxt = 0 if next_bd is None else next_bd << 27 | 1 << 26  # (BD word 7: Next_BD, Use_Next_BD)
-        assert next_bd is None or 0 <= next_bd < SHIM_BDS
+        nxt = 0
+        if next_bd is not None:  # (BD word 7: Next_BD, Use_Next_BD)
+            if not 0 <= next_bd < SHIM_BDS:
+                raise HardwareLimitError(f"shim BD {bd}: next BD id {next_bd}: 0 .. {SHIM_BDS - 1}")
+            nxt = next_bd << 27 | BD_USE_NEXT
         w = bd_words(address, nbytes)
-        if packet is not None:  # (word 2: Enable_Packet, Packet_ID)
-            assert 0 <= packet < 32, packet
-            w[2] |= 1 << 30 | packet << 19
+        if packet is not None:
+            w[2] |= bd_packet_bits(packet)
         nxt |= shim_lock_bits(acquire, release)
         at = self.blockwrite(tile_address(col, 0, SHIM_BD0 + BD_BYTES * bd),
-                             [*w, d0, _BD_BURST_512B | d1, _BD_AXCACHE | d2, it, _BD_VALID | nxt]) + 4
+                             [*w, d0, BD_BURST_512B | d1, BD_AXCACHE | d2, it, BD_VALID | nxt]) + 4
         self.addrs.append((at + 1, address))
         return at
 
     def shim_push(self, col: int, direction: int, channel: int, bd: int, *, token: bool = False,
                   repeat: int = 1) -> None:
         """Queue BD ``bd`` as a task of the channel (``token``: a task-complete token for ``sync``)."""
-        assert 1 <= repeat <= 256
+        if not 1 <= repeat <= 256:
+            raise HardwareLimitError(f"shim task repeat {repeat}: 1 .. 256")
         self.write32(tile_address(col, 0, QUEUE[direction][channel]), (int(token) << 31) | ((repeat - 1) << 16) | bd)
 
     def set_token(self, op: int) -> None:
         """Give the queue push of operation number ``op`` (a ``shim_push``) a task-complete token."""
         words = self._ops[op]
-        assert words[0] == OP_WRITE, words
+        if words[0] != OP_WRITE:
+            raise ValueError(f"operation {op} is not a queue push: {words}")
         words[4] |= 1 << 31
 
     def shim_task(self, col: int, direction: int, channel: int, bd: int, *, address: int, nbytes: int,
@@ -184,13 +212,17 @@ class Txn:
 
     def mem_bd(self, col: int, bd: int, words: list[int]) -> int:
         """Write memory-tile BD ``bd`` of column ``col`` (``mem_bd_words``)."""
-        assert 0 <= bd < MEM_BDS
+        if not 0 <= bd < MEM_BDS:
+            raise HardwareLimitError(f"memory-tile BD id {bd}: 0 .. {MEM_BDS - 1}")
         return self.blockwrite(tile_address(col, 1, MEM_BD0 + 32 * bd), words)
 
     def mem_push(self, col: int, direction: int, channel: int, bd: int, *, repeat: int = 1, token: bool = False) -> int:
         """Queue memory-tile BD ``bd`` as a task of the channel (``repeat`` runs); returns the operation's number (for
         ``set_token``)."""
-        assert 1 <= repeat <= 256 and 0 <= bd < MEM_BDS and 0 <= channel < 6 and bd // 24 == channel % 2, (bd, channel)
+        if not (1 <= repeat <= 256 and 0 <= bd < MEM_BDS and 0 <= channel < 6 and bd // 24 == channel % 2):
+            raise HardwareLimitError(f"memory-tile task: BD {bd} (0 .. {MEM_BDS - 1}, by channel parity: even channels "
+                                     f"0 .. 23, odd 24 .. 47) on channel {channel} (0 .. 5), repeat {repeat} "
+                                     f"(1 .. 256)")
         reg = (MEM_S2MM_CTRL if direction == S2MM else MEM_MM2S_CTRL) + 8 * channel + 4
         n = self.n_ops
         self.write32(tile_address(col, 1, reg), (int(token) << 31) | ((repeat - 1) << 16) | bd)
@@ -213,12 +245,14 @@ class Txn:
 def mem_lock(lock: int, base: int = MEM_OWN) -> int:
     """Memory-tile lock ``lock`` (0-63) of the tile ``base`` names (``MEM_WEST`` / ``MEM_OWN`` / ``MEM_EAST``) as its
     BDs number it."""
-    assert 0 <= lock < 64
+    if not 0 <= lock < 64:
+        raise HardwareLimitError(f"memory-tile lock id {lock}: 0 .. 63")
     return lock + {MEM_WEST: 0, MEM_OWN: 64, MEM_EAST: 128}[base]
 
 
 def _s7(v: int) -> int:
-    assert -64 <= v < 64, v
+    if not -64 <= v < 64:
+        raise HardwareLimitError(f"lock value {v}: -64 .. 63")
     return v & 0x7F
 
 
@@ -229,22 +263,30 @@ def mem_bd_words(*, addr: int, nwords: int, dims: list[tuple[int, int]] | None =
     innermost first as (size, stride) in words, d0..d2 with sizes (< 1024) and an optional (0, stride) d3; iteration
     (step words, count <= 64): execution i of a repeated task starts at step * (i % count); acquire (lock, value,
     greater or equal: else equal), release (lock, value); next_bd: chain (the task runs it after this one)."""
-    assert addr % 4 == 0 and 0 <= addr < 1 << 19 and 0 < nwords < 1 << 17, (addr, nwords)
+    if not (addr % 4 == 0 and 0 <= addr < 1 << 19 and 0 < nwords < 1 << 17):
+        raise HardwareLimitError(f"memory-tile BD: address {addr} (a word multiple below 2^19), {nwords} words "
+                                 f"(1 .. 2^17 - 1)")
     w = [nwords, base + addr // 4, 0, 0, 0, 0, 0, 0]
     if next_bd is not None:
-        assert 0 <= next_bd < MEM_BDS
+        if not 0 <= next_bd < MEM_BDS:
+            raise HardwareLimitError(f"memory-tile BD next id {next_bd}: 0 .. {MEM_BDS - 1}")
         w[1] |= 1 << 19 | next_bd << 20
     for i, (size, stride) in enumerate(dims or []):
-        assert 0 < stride <= 1 << 17, (i, size, stride)
+        if not 0 < stride <= 1 << 17:
+            raise HardwareLimitError(f"memory-tile BD dimension {i}: stride {stride}: 1 .. 2^17 words")
         if i < 3:
-            assert 0 < size < 1024, (i, size)
+            if not 0 < size < 1024:
+                raise HardwareLimitError(f"memory-tile BD dimension {i}: size {size}: 1 .. 1023")
             w[2 + i] = (size << 17) | (stride - 1)
         else:
-            assert i == 3 and size == 0, dims
+            if i != 3 or size != 0:
+                raise HardwareLimitError(f"memory-tile BD dims {dims}: at most 4, the fourth (0, stride)")
             w[5] = stride - 1
     if iteration is not None and iteration[1] > 1:  # (an iteration of one step: none)
         step, count = iteration
-        assert 0 < step <= 1 << 17 and count <= 64, iteration
+        if not (0 < step <= 1 << 17 and count <= 64):
+            raise HardwareLimitError(f"memory-tile BD iteration (step, count) = {iteration}: step 1 .. 2^17 words, "
+                                 f"count <= 64")
         w[6] = ((count - 1) << 17) | (step - 1)
     w7 = 1 << 31
     if acquire is not None:
@@ -263,20 +305,30 @@ def shim_lock_bits(acquire: tuple[int, int] | None = None, release: tuple[int, i
     w = 0
     if acquire is not None:
         lk, v = acquire
-        assert 0 <= lk < 16 and 0 < v < 64, acquire
+        if not (0 <= lk < 16 and 0 < v < 64):
+            raise HardwareLimitError(f"shim BD acquire (lock, value) = {acquire}: lock 0 .. 15, value 1 .. 63")
         w |= 1 << 12 | ((-v) & 0x7F) << 5 | lk
     if release is not None:
         lk, v = release
-        assert 0 <= lk < 16 and 0 < v < 64, release
+        if not (0 <= lk < 16 and 0 < v < 64):
+            raise HardwareLimitError(f"shim BD release (lock, value) = {release}: lock 0 .. 15, value 1 .. 63")
         w |= (v & 0x7F) << 18 | lk << 13
     return w
 
 
 def bd_words(address: int, nbytes: int) -> list[int]:
     """The first three words of a shim BD: length in 32-bit words, address low, address high."""
-    assert nbytes % 4 == 0 and nbytes > 0 and address % 4 == 0 and address < 1 << 48 and nbytes // 4 < 1 << 32, (
-        address, nbytes)
+    if not (nbytes % 4 == 0 and nbytes > 0 and address % 4 == 0 and 0 <= address < 1 << 48 and nbytes // 4 < 1 << 32):
+        raise HardwareLimitError(f"shim BD of {nbytes} bytes at {address:#x}: a word multiple of 4 .. 16 GB at a "
+                                 f"word-aligned address below 2^48")
     return [nbytes // 4, address & 0xFFFFFFFF, address >> 32]
+
+
+def bd_packet_bits(packet: int) -> int:
+    """A shim BD's word 2 packet fields (Enable_Packet, Packet_ID): its MM2S stream gets a header of this id."""
+    if not 0 <= packet < PACKET_IDS:
+        raise HardwareLimitError(f"packet id {packet}: 0 .. {PACKET_IDS - 1}")
+    return BD_PACKET | packet << 19
 
 
 def bd_offsets(nbytes: int, dims: tuple[int, int, int, int] | None = None) -> np.ndarray:
@@ -316,49 +368,231 @@ def without_ddr_patches(words: np.ndarray) -> np.ndarray:
 
 
 def op_offsets(body: np.ndarray) -> list[tuple[int, int]]:
-    """(word offset, opcode) of each operation of a transaction body (its words after the header)."""
+    """(word offset, opcode) of each operation of a transaction body (its words after the header); the one parser of
+    the operations' lengths (``decode``, ``verify`` and the control-program tools walk it). A ValueError names an
+    unknown opcode or a body that ends inside an operation."""
     m = memoryview(np.ascontiguousarray(body, np.uint32)).cast("B").cast("I")
     out, p = [], 0
     while p < len(m):
         op = m[p] & 0xFF
         out.append((p, op))
-        p += m[p + 3] >> 2 if op == OP_BLOCKWRITE else m[p + 1] >> 2 if op >= 0x80 else _OP_WORDS[op]
-    assert p == len(m), (p, len(m))
+        if op == OP_BLOCKWRITE:
+            p += m[p + 3] >> 2
+        elif op >= 0x80:
+            p += m[p + 1] >> 2
+        elif op in _OP_WORDS:
+            p += _OP_WORDS[op]
+        else:
+            raise ValueError(f"unknown transaction opcode {op:#x} at body word {p}")
+    if p != len(m):
+        raise ValueError(f"the transaction body ends inside an operation ({p} of {len(m)} words)")
     return out
 
 
 def decode(words: np.ndarray) -> list[tuple[str, dict[str, int]]]:
-    """The operations of a transaction (``insts.bin`` words), for inspection and tests."""
+    """The operations of a transaction (``insts.bin`` words), for inspection and tests: (name, fields) each; the
+    operations without fields of interest (no-ops, PDI loads) by name only, the others as ``op<opcode>``."""
     w = np.asarray(words, np.uint32)
     n_ops, size = int(w[2]), int(w[3])
-    assert size == 4 * w.size, (size, w.size)
+    if size != 4 * w.size:
+        raise ValueError(f"transaction header: {size} bytes, {4 * w.size} in the buffer")
+    ops = op_offsets(w[4:])
+    if len(ops) != n_ops:
+        raise ValueError(f"transaction header: {n_ops} operations, {len(ops)} in the body")
     out: list[tuple[str, dict[str, int]]] = []
-    p = 4
-    for _ in range(n_ops):
-        op = int(w[p]) & 0xFF
+    for p, op in ops:
+        p += 4
         if op == OP_WRITE:
-            out.append(("write32", {"addr": int(w[p + 2]), "value": int(w[p + 4])}))
-            p += 6
-        elif op == OP_MASKWRITE:
-            out.append(("maskwrite32", {"addr": int(w[p + 2]), "value": int(w[p + 4]), "mask": int(w[p + 5])}))
-            p += 7
-        elif op == OP_MASKPOLL:
-            out.append(("maskpoll32", {"addr": int(w[p + 2]), "value": int(w[p + 4]), "mask": int(w[p + 5])}))
-            p += 7
+            fields = {"addr": int(w[p + 2]), "value": int(w[p + 4])}
+        elif op in (OP_MASKWRITE, OP_MASKPOLL):
+            fields = {"addr": int(w[p + 2]), "value": int(w[p + 4]), "mask": int(w[p + 5])}
         elif op == OP_BLOCKWRITE:
-            n = int(w[p + 3]) // 4
-            out.append(("blockwrite", {"addr": int(w[p + 2]), "data": [int(x) for x in w[p + 4:p + n]]}))
-            p += n
+            fields = {"addr": int(w[p + 2]), "data": [int(x) for x in w[p + 4:p + (int(w[p + 3]) >> 2)]]}
         elif op == OP_TCT:
             a, b = int(w[p + 2]), int(w[p + 3])
-            out.append(("sync", {"direction": a & 0xFF, "row": (a >> 8) & 0xFF, "col": (a >> 16) & 0xFF,
-                                 "nrow": (b >> 8) & 0xFF, "ncol": (b >> 16) & 0xFF, "channel": b >> 24}))
-            p += 4
+            fields = {"direction": a & 0xFF, "row": (a >> 8) & 0xFF, "col": (a >> 16) & 0xFF,
+                      "nrow": (b >> 8) & 0xFF, "ncol": (b >> 16) & 0xFF, "channel": b >> 24}
         elif op == OP_DDR_PATCH:
-            out.append(("patch", {"addr": int(w[p + 6]), "arg": int(w[p + 8]),
-                                  "offset": int(w[p + 10]) | (int(w[p + 11]) << 32)}))
-            p += 12
+            fields = {"addr": int(w[p + 6]), "arg": int(w[p + 8]), "offset": int(w[p + 10]) | (int(w[p + 11]) << 32)}
         else:
-            raise ValueError(f"unknown transaction opcode {op:#x} at word {p}")
-    assert p == w.size, (p, w.size)
+            fields = {}
+        out.append((_OP_NAMES.get(op, f"op{op:#x}"), fields))
     return out
+
+
+def reported_op(health: Mapping[str, int] | None, n_ops: int) -> int | None:
+    """The operation a failed dispatch's health reports (``DispatchError.health["txn_op_idx"]``) in a transaction of
+    ``n_ops`` operations; None where the firmware reports none (``NO_OP_INDEX``) or an index outside it."""
+    i = None if health is None else health.get("txn_op_idx")
+    return i if i is not None and 0 <= i < n_ops else None
+
+
+def no_op_note(health: Mapping[str, int] | None, n_ops: int) -> str:
+    """What a DispatchError note says where ``reported_op`` has no operation."""
+    return (f"{n_ops} operations; the firmware reports no operation index "
+            f"(txn_op_idx {None if health is None else health.get('txn_op_idx')})")
+
+
+def hang_note(words: np.ndarray, health: Mapping[str, int] | None, *, what: str) -> str:
+    """A DispatchError note for ``what`` ran as the transaction ``words``: its size and the operations around the one
+    the firmware reports, the last sync at or before it (a hang usually sits at a wait) with its tile and channel.
+    Never raises: a transaction ``decode`` cannot read gets a plain note."""
+    try:
+        ops = decode(words)
+    except (ValueError, IndexError):
+        return f"{what}: {np.asarray(words).size} words, not decodable as a transaction"
+    i = reported_op(health, len(ops))
+    if i is None:
+        return f"{what}: {no_op_note(health, len(ops))}"
+    note = f"{what}: operations {max(i - 1, 0)} .. {i + 1} of {len(ops)} (txn_op_idx {i}): {ops[max(i - 1, 0):i + 2]}"
+    if (wait := next(((k, f) for k in range(i, -1, -1) if (f := ops[k])[0] == "sync"), None)) is not None and \
+            wait[0] != i:
+        a = wait[1][1]
+        note += (f"; the last sync before it: operation {wait[0]}, column {a['col']} (+{a['ncol'] - 1}), "
+                 f"row {a['row']}, {_DIRECTION[a['direction']]} channel {a['channel']}")
+    return note
+
+
+# ----------------------------------------------------------------------
+# Verification
+# ----------------------------------------------------------------------
+
+
+def verify_enabled() -> bool:
+    """Whether ``ARTLITE_VERIFY_TXN=1``: the transactions' producers run ``verify`` on what they build or load."""
+    return os.environ.get("ARTLITE_VERIFY_TXN") == "1"
+
+
+def verify_if_enabled(words: np.ndarray, *, queues: bool = True) -> None:
+    """``verify`` when ``ARTLITE_VERIFY_TXN=1`` (never per dispatch: where a transaction is created or loaded)."""
+    if verify_enabled():
+        verify(words, queues=queues)
+
+
+_DIRECTION = {S2MM: "S2MM", MM2S: "MM2S"}
+_SHIM_BD_END = SHIM_BD0 + SHIM_BDS * BD_BYTES
+_SHIM_QUEUES = {reg: (d, ch) for d in (S2MM, MM2S) for ch, reg in enumerate(QUEUE[d])}
+_SHIM_STATUS = {reg: (d, ch) for d in (S2MM, MM2S) for ch, reg in enumerate(QUEUE_STATUS[d])}
+_SHIM_CONTROLS = {reg: (d, ch) for d in (S2MM, MM2S) for ch, reg in enumerate(CTRL[d])}
+_MEM_QUEUES = {base + 8 * ch + 4: (d, ch) for d, base in ((S2MM, MEM_S2MM_CTRL), (MM2S, MEM_MM2S_CTRL))
+               for ch in range(6)}
+_MEM_CONTROLS = {base + 8 * ch: (d, ch) for d, base in ((S2MM, MEM_S2MM_CTRL), (MM2S, MEM_MM2S_CTRL))
+                 for ch in range(6)}
+
+
+def verify(words: np.ndarray, *, queues: bool = True) -> None:
+    """Check a finished transaction against the hazards that hang or corrupt the NPU (HardwareLimitError naming the
+    operation index, and the channel or BD):
+
+    - every shim BD blockwrite: AxQoS 0 (a nonzero one hangs the NPU until a reboot), the valid bit, a length, no
+      iteration state, the dimension words' unused bits clear;
+    - a task-complete token on a channel (a shim's or a memory tile's) only after the channel's token controller was
+      written (else the token is lost, and the ``sync`` hangs);
+    - ``queues``: the shim channels' task queues, modelled as the host sequencers drive them (``overlay.Sequence``): a
+      push queues a task (with the BDs of its chain), a ``sync`` retires a channel's tasks up to its first token task
+      (none: it would wait forever), a poll of a channel's queue status register retires the oldest tasks until the
+      polled size holds; a channel never holds more than ``QUEUE_DEPTH`` tasks (a push on a full queue blocks the
+      firmware), no BD is rewritten while a task that uses it is queued (the task would run with the new words),
+      and no task is queued at the end (the next dispatch rewrites the BDs from its start). A sequencer whose waits
+      the words do not show (``vision.seq``: the handover locks retire its tasks) verifies with ``queues=False``.
+    """
+    w = np.ascontiguousarray(words, np.uint32)
+    ops = op_offsets(w[4:])
+    body = w[4:].tolist()
+    problems: list[str] = []
+    controlled: set[tuple[int, int, int, int]] = set()
+    queue: dict[tuple[int, int, int], list[tuple[int, bool, tuple[int, ...]]]] = {}  # (col, dir, ch) -> its tasks
+    chain: dict[tuple[int, int], int | None] = {}  # (col, BD) -> the BD its task continues with
+    for i, (p, op) in enumerate(ops):
+        if op == OP_BLOCKWRITE:
+            addr = body[p + 2]
+            col, row, reg = addr >> 25, (addr >> 20) & 0x1F, addr & 0xFFFFF
+            if row != 0 or not SHIM_BD0 <= reg < _SHIM_BD_END:
+                continue
+            data = body[p + 4:p + (body[p + 3] >> 2)]
+            for j, v in enumerate(data):
+                r = reg + 4 * j
+                if r >= _SHIM_BD_END:
+                    break
+                bd, k = divmod(r - SHIM_BD0, BD_BYTES)
+                k //= 4
+                bad = None
+                if k == 0 and v == 0:
+                    bad = "length 0"
+                elif k == 3 and (v >> 30 or v & 0xFFFFF):
+                    bad = f"word 3 = {v:#x}: bits 31:30 and 19:0 are zero"
+                elif k == 5 and v & BD_QOS_MASK:
+                    bad = f"AxQoS {(v >> 20) & 0xF} (must be 0: a nonzero value hangs the NPU)"
+                elif k == 6 and v >> 26:
+                    bad = f"word 6 = {v:#x}: Iteration_Current (bits 31:26) is not written"
+                elif k == 7 and not v & BD_VALID:
+                    bad = "valid bit clear"
+                if bad is not None:
+                    problems.append(f"operation {i}: shim BD {bd} of column {col}: {bad}")
+                if k == 7:
+                    chain[(col, bd)] = v >> 27 & 0xF if v & BD_USE_NEXT else None
+            if queues:
+                last = (min(reg + 4 * len(data), _SHIM_BD_END) - 1 - SHIM_BD0) // BD_BYTES
+                for bd in range((reg - SHIM_BD0) // BD_BYTES, last + 1):
+                    for (c, d, ch), tasks in queue.items():
+                        for at, _, bds in tasks:
+                            if c == col and bd in bds:
+                                problems.append(f"operation {i}: shim BD {bd} of column {col} rewritten while operation "
+                                                f"{at}'s task is queued on its {_DIRECTION[d]} "
+                                                f"channel {ch}")
+        elif op in (OP_WRITE, OP_MASKWRITE):
+            addr, value = body[p + 2], body[p + 4]
+            col, row, reg = addr >> 25, (addr >> 20) & 0x1F, addr & 0xFFFFF
+            if row == 0 and reg in _SHIM_CONTROLS and value >> 8 & 0xFF:
+                controlled.add((col, 0, *_SHIM_CONTROLS[reg]))
+            elif row == 1 and reg in _MEM_CONTROLS and value >> 8 & 0xFF:
+                controlled.add((col, 1, *_MEM_CONTROLS[reg]))
+            elif op == OP_WRITE and row in (0, 1) and reg in (_SHIM_QUEUES if row == 0 else _MEM_QUEUES):
+                d, ch = (_SHIM_QUEUES if row == 0 else _MEM_QUEUES)[reg]
+                token = bool(value >> 31)
+                if token and (col, row, d, ch) not in controlled:
+                    problems.append(f"operation {i}: a token push on {_DIRECTION[d]} channel {ch} of "
+                                    f"column {col} (row {row}) before the channel's token controller is written")
+                if queues and row == 0:
+                    bds, bd = [], value & 0xF
+                    while len(bds) < SHIM_BDS and bd is not None:
+                        bds.append(bd)
+                        bd = chain.get((col, bd))
+                    tasks = queue.setdefault((col, d, ch), [])
+                    tasks.append((i, token, tuple(bds)))
+                    if len(tasks) > QUEUE_DEPTH:
+                        problems.append(f"operation {i}: {len(tasks)} tasks queued on {_DIRECTION[d]} "
+                                        f"channel {ch} of column {col} (at most {QUEUE_DEPTH})")
+                        del tasks[0]
+        elif op == OP_MASKPOLL and queues:
+            addr, value, mask = body[p + 2], body[p + 4], body[p + 5]
+            col, row, reg = addr >> 25, (addr >> 20) & 0x1F, addr & 0xFFFFF
+            if row == 0 and reg in _SHIM_STATUS and mask & 0x700000:
+                d, ch = _SHIM_STATUS[reg]
+                tasks = queue.get((col, d, ch), [])
+                while tasks and (len(tasks) << 20) & mask != value & mask:
+                    del tasks[0]
+        elif op == OP_TCT and queues:
+            a, b = body[p + 2], body[p + 3]
+            d, row0, col0 = a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF
+            nrow, ncol, ch = (b >> 8) & 0xFF, (b >> 16) & 0xFF, b >> 24
+            for c in range(col0, col0 + ncol):
+                for r in range(row0, row0 + nrow):
+                    if r != 0:
+                        continue
+                    tasks = queue.get((c, d, ch), [])
+                    k = next((k for k, t in enumerate(tasks) if t[1]), None)
+                    if k is None:
+                        problems.append(f"operation {i}: a sync on {_DIRECTION[d]} channel {ch} of "
+                                        f"column {c} with no token task queued (it would wait forever)")
+                    else:
+                        del tasks[:k + 1]
+    if queues:
+        for (c, d, ch), tasks in queue.items():
+            if tasks:
+                problems.append(f"end: {len(tasks)} tasks still queued on {_DIRECTION[d]} channel {ch} "
+                                f"of column {c} (the first from operation {tasks[0][0]}): the next dispatch rewrites "
+                                f"their BDs")
+    if problems:
+        raise HardwareLimitError(f"{len(problems)} problems in a transaction of {len(ops)} operations:\n  "
+                                 + "\n  ".join(problems[:8]) + ("\n  ..." if len(problems) > 8 else ""))

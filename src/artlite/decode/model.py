@@ -511,7 +511,7 @@ class ModelOverlay:
         if self._metas_s != (1, self.start):
             self._metas(1)
         if self._tr_lm is None:
-            seq = Sequence(self.op, rolling=True, inputs=("X",))
+            seq = Sequence(self.op, inputs=("X",))
             self._lm_phase(seq)
             seq.sync(fills=True)
             self._tr_lm = Transaction(self.dev, seq.words())

@@ -215,7 +215,7 @@ offsets): aie2p-coding section 8. For speed:
 - **Addresses**: shim BDs carry final addresses (paddr + 0x80000000).
 - **Queue limit**: at most 4 queued tasks per shim channel between syncs. A BD is reusable once
   its task completed.
-- **Rolling retirement** (`Sequence(rolling=True)`):
+- **Rolling retirement** (`Sequence`):
   - before a 5th task on a channel, the transaction waits for that channel's oldest;
   - 192 fills per column then cost the same as 3.
   - `sync()` waits for the drains, `sync(fills=True)` for everything;
@@ -261,8 +261,8 @@ offsets): aie2p-coding section 8. For speed:
   (and its output's allocation) merged into the current op where the memtile holds both, double buffering across ops
   (sd15 `vae.prefetch`: the VAE decoder's convs and norms 282 -> 258 ms).
 - **Watchdog**: a dispatch must finish within the driver's TDR (2 s): size chunks for < 1 s.
-  A killed job fails with `DispatchError ... TIMEOUT (state 8)`; for a host-built transaction
-  its message names the operations at the firmware's `txn_op_idx` (where it stopped).
+  A killed job fails with `DispatchError ... TIMEOUT (state 8)`; a note names the operations (a library's item) at the
+  firmware's `txn_op_idx` (where it stopped; 0xFFFFFFFF: the firmware reports none).
 
 ## Overlays, libraries and fused ELFs
 

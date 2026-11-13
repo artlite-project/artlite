@@ -821,7 +821,7 @@ class QwenOverlay(ModelOverlay):
     def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, int], ...]) -> _Step:
         """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps)."""
         dev, cfg = self.dev, self.cfg
-        seq = Sequence(self.op, rolling=True, inputs=("X",))
+        seq = Sequence(self.op, inputs=("X",))
         st = _Step(S, subs)
         self._gst = st.gst  # (``_gdn4``'s state transfers)
         if self.moe:  # (the control packets' route; the routing's shim locks)

@@ -42,6 +42,7 @@ class FusedElf:
         self.name = name
         self.runlist = list(runlist)
         self.layout = BufferLayout(self.runlist, inputs=inputs, outputs=outputs, sizes=sizes or {}, external=external)
+        self.layout.check_limit(layout.SEGMENT_BYTES)
         self.segments = scratch_segments((self.layout.span(n) for _, *names in self.runlist for n in names),
                                          layout.SEGMENT_BYTES)
         self.expand_load_pdis = expand_load_pdis

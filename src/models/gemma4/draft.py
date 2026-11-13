@@ -387,7 +387,7 @@ class GemmaDraft:
 
     def _build(self) -> Transaction:
         dev = self.ov.dev
-        seq = Sequence(self.ov.op, rolling=True, inputs=("X",))
+        seq = Sequence(self.ov.op, inputs=("X",))
         for c in range(COLS):
             seq.fill("X", c, dev.address("DACT", self.tok), 2 * XB)
         for c in range(COLS):

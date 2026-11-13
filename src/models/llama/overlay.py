@@ -312,7 +312,7 @@ class LlamaOverlay(ModelOverlay):
 
     def _build(self, S: int, lm: bool, subs: tuple) -> _Step:
         dev = self.dev
-        seq = Sequence(self.op, rolling=True, inputs=("X",))
+        seq = Sequence(self.op, inputs=("X",))
         st = _Step(S, subs, tok=self.toks[self._b])
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", st.tok), SMAX * XB)

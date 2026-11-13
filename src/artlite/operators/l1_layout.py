@@ -14,12 +14,18 @@ worker ``Buffer`` gets an ``address`` attribute. aiecc places everything else
 makes aiecc keep its intermediates).
 """
 
+import math
 from collections.abc import Callable
 
 from aie import ir
 from aie.dialects import aie
 from aie.dialects._aie_enum_gen import WireBundle
 from aie.passmanager import PassManager
+
+from ..txn import HardwareLimitError
+
+L1_BYTES = 0x10000  # a core's data memory
+L1_ALIGN = 64  # a 128-byte vector load needs 64-byte alignment: an unaligned address is silently rounded down
 
 
 def pin_l1_buffers(
@@ -31,8 +37,10 @@ def pin_l1_buffers(
     """Pin core-tile buffers of ``module`` in place; returns the number of FIFO pools pinned.
 
     fifo(fifo name, depth): byte addresses of the pool's buffers on a core tile (None: leave
-    it to aiecc); buffer(symbol name): byte address of a worker buffer (None: leave it)."""
+    it to aiecc); buffer(symbol name): byte address of a worker buffer (None: leave it). Per core tile the pinned
+    buffers must be ``L1_ALIGN``-aligned, inside L1 and pairwise disjoint (HardwareLimitError naming them)."""
     pinned = 0
+    placed: dict[tuple[int, int], list[tuple[str, int, int]]] = {}  # core tile -> (name, address, bytes) pinned
     with module.context, ir.Location.unknown():
         PassManager.parse("builtin.module(aie.device(aie-place-tiles,aie-objectfifo-split))").run(module.operation)
         device = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
@@ -45,10 +53,14 @@ def pin_l1_buffers(
                 addrs = fifo(ir.StringAttr(op.attributes["fifoName"]).value, depth)
                 if addrs is None:
                     continue
-                assert len(addrs) == depth, (ir.StringAttr(op.attributes["fifoName"]).value, depth, addrs)
+                if len(addrs) != depth:
+                    raise HardwareLimitError(f"FIFO {ir.StringAttr(op.attributes['fifoName']).value}: depth {depth}, "
+                                             f"{len(addrs)} pinned addresses {addrs}")
                 base = ir.StringAttr(op.attributes["sym_name"]).value.removesuffix("__pool")
                 names = []
+                nbytes = _nbytes(ir.TypeAttr(op.attributes["elemType"]).value)
                 for i, addr in enumerate(addrs):
+                    placed.setdefault(_tile(op), []).append((f"{base}__buf{i}", addr, nbytes))
                     aie.BufferOp(ir.TypeAttr(op.attributes["elemType"]).value, op.tile, sym_name=f"{base}__buf{i}",
                                  address=addr, ip=ir.InsertionPoint(op))
                     names.append(f"{base}__buf{i}")
@@ -58,7 +70,39 @@ def pin_l1_buffers(
                 addr = buffer(ir.StringAttr(op.attributes["sym_name"]).value)
                 if addr is not None:
                     op.attributes["address"] = ir.IntegerAttr.get(i32, addr)
+                    if op.tile.owner.opview.is_core_tile():
+                        placed.setdefault(_tile(op), []).append(
+                            (ir.StringAttr(op.attributes["sym_name"]).value, addr, _nbytes(op.results[0].type)))
+    check_placement(placed)
     return pinned
+
+
+def _tile(op: ir.Operation) -> tuple[int, int]:
+    tile = op.tile.owner.opview
+    return tile.col.value, tile.row.value
+
+
+def _nbytes(memref: ir.Type) -> int:
+    """The bytes of a static memref (0 where its element type has no width)."""
+    t = ir.MemRefType(memref)
+    return math.prod(t.shape) * getattr(t.element_type, "width", 0) // 8
+
+
+def check_placement(placed: dict[tuple[int, int], list[tuple[str, int, int]]]) -> None:
+    """Per core tile, the pinned buffers (name, address, bytes) are ``L1_ALIGN``-aligned, inside L1 and pairwise
+    disjoint; HardwareLimitError naming the buffers."""
+    for tile, buffers in placed.items():
+        end, last = 0, None
+        for name, addr, nbytes in sorted(buffers, key=lambda b: b[1]):
+            if addr % L1_ALIGN:
+                raise HardwareLimitError(f"tile {tile}: pinned buffer {name} at {addr:#x} is not {L1_ALIGN}-byte aligned")
+            if addr < 0 or addr + nbytes > L1_BYTES:
+                raise HardwareLimitError(f"tile {tile}: pinned buffer {name} [{addr:#x}, {addr + nbytes:#x}) is outside "
+                                         f"L1 (0 .. {L1_BYTES:#x})")
+            if addr < end:
+                raise HardwareLimitError(f"tile {tile}: pinned buffers {last[0]} [{last[1]:#x}, {end:#x}) and {name} "
+                                         f"[{addr:#x}, {addr + nbytes:#x}) overlap")
+            end, last = addr + nbytes, (name, addr)
 
 
 def packet_flow(module: ir.Module, pkt_id: int, src: tuple[int, int], channel: int,

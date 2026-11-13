@@ -102,7 +102,7 @@ class _Gathered(ArtcOperator):
             first += ctl.bd_packets(ROW_BDS[j], self.row_bd_words(0, j))
         first += ctl.push(txn.MM2S, 1, ROW_BDS[0])
         later: list[int] = []
-        pk = 1 << 30 | ctl.XID << 19
+        pk = txn.bd_packet_bits(ctl.XID)
         for j in range(CHAIN):
             later += [ctl._HDR, ctl._ctl_header(txn.SHIM_BD0 + txn.BD_BYTES * ROW_BDS[j] + 4, 2), 0, pk]
         later += ctl.push(txn.MM2S, 1, ROW_BDS[0])

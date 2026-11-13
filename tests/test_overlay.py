@@ -1,5 +1,5 @@
 """Host side of the transaction-run overlays (``artlite.txn``, ``artlite/overlay.py``): transaction encoding,
-shim BD iteration, the rolling task sequence. No NPU."""
+shim BD iteration, the task sequence. No NPU."""
 
 import types
 
@@ -48,14 +48,14 @@ def test_txn_bd_iteration() -> None:
     assert b["data"][6] == 0
 
 
-def test_rolling_sequence() -> None:
-    """Sequence(rolling=True): a channel never holds more than 4 tasks no wait covered (the 5th waits for its
+def test_sequence() -> None:
+    """Sequence: a channel never holds more than 4 tasks no wait covered (the 5th waits for its
     oldest), a BD is rewritten only after its task completed, a task carries a token only where a wait takes it (a
     wait covers its channel's earlier tasks: in-order completion), every token is taken, and sync(fills=True)
     leaves no task uncovered."""
     op = types.SimpleNamespace(ENDPOINTS={"A": (txn.MM2S, 0), "X0": (txn.MM2S, 1), "C": (txn.S2MM, 0)},
                                BD_BASE={"A": 0, "X0": 4, "C": 8})
-    seq = Sequence(op, rolling=True)
+    seq = Sequence(op)
     for i in range(11):
         seq.fill("A", i % 2, 0x8000_0000 + 4096 * i, 4096)
         if i % 3 == 0:
@@ -89,12 +89,12 @@ def test_rolling_sequence() -> None:
     assert tokens == waits < pushes, (tokens, waits, pushes)
 
 
-def test_rolling_inputs() -> None:
-    """Sequence(rolling=True, inputs=("X",)): a sync first waits for the X fills (one wait per run of columns), so the
+def test_sequence_inputs() -> None:
+    """Sequence(inputs=("X",)): a sync first waits for the X fills (one wait per run of columns), so the
     next phase's X fills follow the drain wait without waits of their own; the queue and token rules still hold."""
     op = types.SimpleNamespace(ENDPOINTS={"A": (txn.MM2S, 0), "X": (txn.MM2S, 1), "C": (txn.S2MM, 0)},
                                BD_BASE={"A": 0, "X": 4, "C": 8})
-    seq = Sequence(op, rolling=True, inputs=("X",))
+    seq = Sequence(op, inputs=("X",))
     for c in range(COLS):
         seq.fill("A", c, 0x8000_0000 + 0x10000 * c, 1 << 20)
     for phase in range(9):

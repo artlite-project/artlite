@@ -36,8 +36,6 @@ RBUF_META = 96  # the metadata's first word in them
 # the expert object's plan (the main core's workspace): its metadata, the gate / up and down templates, the
 # sub-phases, a sub-phase's metadata
 PLAN_SUBS, PLAN_META, PLAN_WORDS = 192, 208, 272
-# shim BD words 3 .. 7 of an item's task: no dimensions, 512-byte bursts, AxCACHE 2, AxQoS 0 (never nonzero), valid
-BD_W4, BD_W5, BD_VALID, BD_USE_NEXT = 3 << 30, 2 << 24, 1 << 25, 1 << 26
 
 
 # the control packets' route on a shim's MM2S1 (stream-switch slave South 7; aiecc: slot 0, the X objects' id -> a low
@@ -119,9 +117,9 @@ def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int, a
         if i < n:
             e, h0, h1 = items[i]
             a = base + (2 * e + h0) * stride
-            w2 = 0 if a_packet is None else 1 << 30 | a_packet << 19
-            w = [(h1 - h0 + 1) * stride // 4, a & 0xFFFFFFFF, (a >> 32) & 0xFFFF | w2, 0, BD_W4, BD_W5, 0,
-                 BD_VALID | (BD_USE_NEXT | EXPERT_BDS[i + 1] << 27 if i + 1 < n else 0)]
+            w2 = 0 if a_packet is None else txn.bd_packet_bits(a_packet)
+            w = [(h1 - h0 + 1) * stride // 4, a & 0xFFFFFFFF, (a >> 32) & 0xFFFF | w2, 0, txn.BD_BURST_512B,
+                 txn.BD_AXCACHE, 0, txn.BD_VALID | (txn.BD_USE_NEXT | EXPERT_BDS[i + 1] << 27 if i + 1 < n else 0)]
         reg = txn.SHIM_BD0 + txn.BD_BYTES * bd
         out += [sh, _ctl(reg, 4), *w[:4], sh, _ctl(reg + 16, 4), *w[4:]]
     out += [sh, _ctl(txn.QUEUE[txn.MM2S][0], 1), EXPERT_BDS[0]]
@@ -144,6 +142,6 @@ def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: i
     return _SRC.render(p=p, E=experts, K=top, COLS=cols, MAX_ITEMS=MAX_ITEMS, bds=EXPERT_BDS, ch=ch,
                        sh=_parity(CID), ch_push=_ctl(txn.QUEUE[txn.MM2S][0], 1),
                        ch_lock=_ctl(txn.SHIM_LOCK0 + 16 * LOCK_DONE, 1), RBUF_OBJECTS=RBUF_OBJECTS,
-                       RBUF_META=RBUF_META, BD_W4=BD_W4, BD_W5=BD_W5, BD_VALID=BD_VALID, BD_USE_NEXT=BD_USE_NEXT,
-                       bd_w2=0 if a_packet is None else 1 << 30 | a_packet << 19,
+                       RBUF_META=RBUF_META, BD_W4=txn.BD_BURST_512B, BD_W5=txn.BD_AXCACHE, BD_VALID=txn.BD_VALID,
+                       BD_USE_NEXT=txn.BD_USE_NEXT, bd_w2=0 if a_packet is None else txn.bd_packet_bits(a_packet),
                        **consts)

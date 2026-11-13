@@ -72,10 +72,16 @@ def test_packet_words_header() -> None:
 
 def test_packet_words() -> None:
     """A column's packets: whole writes of its items' BDs (chained, the halves' run as the address and length), the
-    unused BDs zero, the push of the first, the lock; only BDs < 16, AxQoS 0."""
-    base, stride = 0x8000_0001_2340_0000, 0x10_0000
+    unused BDs zero, the push of the first, the lock; only BDs < 16, AxQoS 0; each BD's words equal ``Txn.shim_bd``'s
+    for the same fields (the one owner of the BD word layout)."""
+    for a_packet in (None, 6):
+        _check_packet_words(a_packet)
+
+
+def _check_packet_words(a_packet: int | None) -> None:
+    base, stride = 0x8001_2340_0000, 0x10_0000
     items = [(7, 0, 1), (200, 1, 1)]
-    w = MR.packet_words(items, base=base, stride=stride).tolist()
+    w = MR.packet_words(items, base=base, stride=stride, a_packet=a_packet).tolist()
     assert len(w) == MR.PACKET_WORDS
     bds = {}
     i = 0
@@ -98,7 +104,8 @@ def test_packet_words() -> None:
             continue
         e, h0, h1 = items[i]
         a = base + (2 * e + h0) * stride
-        assert b[:3] == [(h1 - h0 + 1) * stride // 4, a & 0xFFFFFFFF, (a >> 32) & 0xFFFF]
-        assert b[5] == MR.BD_W5 and (b[5] >> 28) & 0xF == 0  # (AxQoS 0)
         nxt = MR.EXPERT_BDS[i + 1] if i + 1 < len(items) else None
-        assert b[7] == MR.BD_VALID | (MR.BD_USE_NEXT | nxt << 27 if nxt is not None else 0)
+        t = txn.Txn()  # (the same BD through the host's encoder: word for word)
+        t.shim_bd(0, bd, address=a, nbytes=(h1 - h0 + 1) * stride, next_bd=nxt, packet=a_packet)
+        assert b == txn.decode(t.words())[0][1]["data"]
+        assert b[5] & txn.BD_QOS_MASK == 0

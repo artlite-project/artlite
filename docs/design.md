@@ -277,8 +277,10 @@ Low-level DRM errors from the `shim_xdna` layer are thrown as `std::system_error
 errno) with descriptive messages.
 
 In Python, these map to `artlite.Error`, `artlite.ExecutableError`, and `artlite.DispatchError`
-(attributes `state`, `state_name`, `health`: a dict or None). The overlays' runtime adds the
-transaction operations at `txn_op_idx` to the message. `HwContext.status()` and
+(attributes `state`, `state_name`, `health`: a dict or None). The runtimes of the overlays, fused ELFs and
+libraries add a note: the transaction's operations at `txn_op_idx` and the last sync before them (a library: the
+item and operator that hold it; the code pages' prologue is noted as its own); `0xFFFFFFFF` means the firmware
+reports no operation. `HwContext.status()` and
 `Device.last_async_error()` query the firmware through the management mailbox: use them after
 a clean failure, never while a job may be hung (a mailbox timeout destroys the channel).
 

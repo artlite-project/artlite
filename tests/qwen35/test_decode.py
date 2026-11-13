@@ -98,7 +98,7 @@ class _Phases:
             dev.flush("NORM")
         n_obj = mmv.out_objects(region, flags, self.H, f32_ab=f32_ab)
         assert slots * n_obj * 2 * OD.C_LEN <= self.ob
-        seq = Sequence(op, rolling=True)
+        seq = Sequence(op)
         whole = slots == 8 and flags & OD.F_EMITR  # (the residual as the next input's x lies: [k block][slot sp][8])
         for c in range(COLS):  # drains [slot][objects]: object j of every slot, then j + 1
             if whole:
@@ -411,7 +411,7 @@ class _Gdn:
         MG = self.MG
         groups = mp.groups(r, OD.F_NORM | (OD.F_MSG if msg else 0), S, f32_ab=True)
         assert len(groups) == 1
-        seq = Sequence(op, rolling=True)
+        seq = Sequence(op)
         for c in range(COLS):
             seq.fill("A", c, dev.address("NORM"), self.n_norm * op.tile_bytes)
             for o, n, dims, rep, it in mp.a_reads(r, c, groups[0]):
@@ -767,7 +767,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     nr = 2 * (A1.REC_V + A1.ROWS_B)  # (the relayed records' bytes at most)
     dev.alloc("OUT", len(rnds) * COLS * ob)
     dev.alloc("REC", COLS * nr)
-    seq = Sequence(op, rolling=True)
+    seq = Sequence(op)
     def cache(u: int) -> None:
         kh = (rnds[u] & A1.SPLIT_KV) >> 2
         for c in range(0, COLS, nph if one else 1):

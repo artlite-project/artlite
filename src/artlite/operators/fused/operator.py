@@ -17,6 +17,7 @@ it must be an input, external, declared ``uninitialized`` or written by the host
 dispatch: a forgotten weight upload is an error, not silent zeros.
 """
 
+import bisect
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -24,7 +25,7 @@ from typing import Any
 import numpy as np
 from ml_dtypes import bfloat16
 
-from ... import txn
+from ... import _native, txn
 from ...elf_parser import ParsedElf
 from .elf import FusedElf, ShimBd
 from .layout import Runlist, Span, parse_name
@@ -198,17 +199,45 @@ class FusedOperator(FusedElf):
         times slower); use slightly less than the expected run time."""
         kern = self._kernel()
         self._check_host_writes()
-        if spin_after_s is None:
-            kern.dispatch_elf(self._insts_bo, self._dispatch_bufs)
-            return
-        kern.dispatch_elf_async(self._insts_bo, self._dispatch_bufs)
-        if spin_after_s > 0:  # (short naps keep the core in shallow idle states: one long sleep slows the next work)
-            end = time.perf_counter() + spin_after_s
-            while time.perf_counter() < end and not kern.dispatch_poll():
-                time.sleep(nap_s)
-        while not kern.dispatch_poll():
-            pass
-        kern.dispatch_wait()  # (retires the command; raises DispatchError on a failure)
+        try:
+            if spin_after_s is None:
+                kern.dispatch_elf(self._insts_bo, self._dispatch_bufs)
+                return
+            kern.dispatch_elf_async(self._insts_bo, self._dispatch_bufs)
+            if spin_after_s > 0:  # (short naps keep the core in shallow idle states: one long sleep slows the next work)
+                end = time.perf_counter() + spin_after_s
+                while time.perf_counter() < end and not kern.dispatch_poll():
+                    time.sleep(nap_s)
+            while not kern.dispatch_poll():
+                pass
+            kern.dispatch_wait()  # (retires the command; raises DispatchError on a failure)
+        except _native.DispatchError as e:
+            self._note(e)
+            raise
+
+    def _note(self, e: _native.DispatchError) -> None:
+        """Add to a DispatchError the runlist entries whose configuration holds the operation the firmware reports (a
+        configuration per change of operator: ``fused.design``). Never raises."""
+        try:
+            ops = txn.op_offsets(self._insts_bo.map().view(np.uint32)[4:])
+            i = txn.reported_op(e.health, len(ops))
+            if i is None:
+                e.add_note(f"{self.name}: {txn.no_op_note(e.health, len(ops))}")
+                return
+            loads = [k for k, (_, op) in enumerate(ops) if op == txn.OP_LOAD_PDI]
+            k = bisect.bisect_right(loads, i) - 1
+            starts = [n for n, (op, *_) in enumerate(self.runlist) if n == 0 or op is not self.runlist[n - 1][0]]
+            if k < 0:
+                where = "before the first configuration"
+            elif len(loads) != len(starts):
+                where = f"after configuration {k} of {len(loads)}"
+            else:
+                last = (starts[k + 1] if k + 1 < len(starts) else len(self.runlist)) - 1
+                where = (f"configuration {k}: entries {starts[k]}..{last} of the runlist "
+                         f"({type(self.runlist[starts[k]][0]).__name__})")
+            e.add_note(f"{self.name}: operation {i} of {len(ops)} (txn_op_idx {i}) is {where}")
+        except Exception as note_error:  # noqa: BLE001 (the dispatch's error is the one to see)
+            e.add_note(f"(no program position: {note_error!r})")
 
     def run(self, *, inputs: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
         """One shot: write ``inputs`` (by buffer name), sync every data BO (overlapping input and output names

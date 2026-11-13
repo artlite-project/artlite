@@ -590,7 +590,7 @@ class DFlashOverlay(ModelOverlay):
 
     def _build(self, S: int, block: bool, subs: tuple = ()) -> _Step:
         """The transaction of a dispatch: an injection of a verify's S rows (0: none), the block."""
-        seq = Sequence(self.op, rolling=True, inputs=("X",))
+        seq = Sequence(self.op, inputs=("X",))
         st = _Step(S, block)
         if S:
             self._inject(seq, st)

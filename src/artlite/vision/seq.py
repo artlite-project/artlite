@@ -341,4 +341,6 @@ class Seq:
                 self.t.set_token(q[-1][1])
                 self.t.sync(col=col, direction=txn.MM2S, channel=1)
         self.ddr_sync()
-        return self.t.words()
+        words = self.t.words()
+        txn.verify_if_enabled(words, queues=False)  # (the handover locks retire its tasks: not in the words)
+        return words
