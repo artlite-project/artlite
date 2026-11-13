@@ -37,7 +37,7 @@ int advise_pinned(void* mem, size_t n);
 
 /// dst gets the n bytes of src through non-temporal stores where dst is 64-byte aligned (the CPU never reads an image
 /// back: no cache flush needed for the device after them); the head up to the alignment and the tail go through
-/// memcpy. The calling thread fences its own stores (``_mm_sfence``).
+/// memcpy. No fence: the caller issues ``_mm_sfence`` after its last copy, before the device may read dst.
 ARTLITE_AVX512_FN inline void stream_copy(void* dst_, const void* src_, size_t n) {
   auto* dst = static_cast<uint8_t*>(dst_);
   auto* src = static_cast<const uint8_t*>(src_);
