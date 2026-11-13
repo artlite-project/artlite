@@ -11,6 +11,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.vision.device import VisionDevice
+from artlite.vision.vit import kinds_of
 from artlite.vision.weights import gguf_getter
 from models.lfm3a import codec as CD
 from models.lfm3a import depth as DP
@@ -32,8 +33,8 @@ def gen() -> tuple[DP.Depth, CD.Codec]:
     get = gguf_getter(g)
     npu = VisionDevice()
     mask = g.tensor("a.gen.code.mask_embd").dequantize().reshape(-1)
-    dp = DP.Depth(npu, DP.weights(get, 3), lambda r: g.rows("a.gen.code.embd.weight", r), mask)
-    cd = CD.Codec(npu, CD.weights(get, CD.kinds_of(g.tensor_info, 8)))
+    dp = DP.Depth(npu, DP.weights(get, DP.LAYERS), lambda r: g.rows("a.gen.code.embd.weight", r), mask)
+    cd = CD.Codec(npu, CD.weights(get, kinds_of(g.tensor_info, CD.LAYERS, CD.CONV_PROBE)))
     return dp, cd
 
 

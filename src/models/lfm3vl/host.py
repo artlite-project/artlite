@@ -8,9 +8,9 @@ bounds: the mmproj's ``image_min_pixels`` / 1024 = 64 tokens and llama.cpp's cap
 ``MAX_TOKENS``), taken from the original by Pillow's bicubic filter (llama.cpp's is Pillow's with torchvision's int16
 weights: a pixel at most a level apart).
 
-Tokens: the chat template's ``<|vision_start|><|image|><|vision_end|>`` per image (``image_prompt``), the placeholder
-replaced by the image's merged tokens (gh x gw, raster order: ``Grid.sequence``), one position each (the language
-model's positions are 1-D).
+Tokens: the chat template's ``<|vision_start|><|image|><|vision_end|>`` per image (``IMAGE``: ``models.lfm.lfm``
+splices the image's tokens in, ``models.sequence.splice_media``), the placeholder replaced by the image's merged tokens
+(gh x gw, raster order: ``Grid.sequence``), one position each (the language model's positions are 1-D).
 
 Videos (``VideoPlan``: transformers' ``Lfm3VlVideoProcessor`` and LFM3-Omni's processor as llama.cpp's mtmd runs them,
 ``MTMD_VIDEO_TEMPLATE_LFM3`` / ``_LFM3_OMNI``): frames sampled at 2 a second, n = trunc(n_src / fps x 2) clamped to 4 ..
@@ -33,7 +33,9 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from ..sequence import MEDIA, Sequence, splice
+from .. import images
+from ..images import TOKEN_PX, Grid, resized
+from ..sequence import Sequence
 
 MIN_TOKENS, MAX_TOKENS = 64, 4096  # (an image's merged tokens: the mmproj's min pixels / 1024, llama.cpp's cap)
 IMAGE = "<|image|>"  # (the chat template's place of an image, between <|vision_start|> and <|vision_end|>)
@@ -42,6 +44,7 @@ VISION_START, VISION_END = "<|vision_start|>", "<|vision_end|>"
 FPS = 2.0  # (a video's frames sampled a second)
 FRAMES, FRAMES_HEARD = (4, 768), 384  # (a video's frames at least, at most; at most with its soundtrack)
 VIDEO_PIXELS = (4096, 25165824)  # (all of a video's frames' pixels: at least, at most)
+HALF = (0.5, 0.5, 0.5)  # (the mean and std of the encoder's pixels)
 ROW_SAMPLES = 1280  # (the soundtrack's samples a row of the speech encoder: 8 mel frames of 160)
 
 
@@ -52,7 +55,7 @@ def token_bounds(min_pixels: int, max_pixels: int, min_tokens: int | None = None
     return min_tokens or max(1, min_pixels // 1024), max_tokens or min(MAX_TOKENS, max_pixels // 1024)
 
 
-def target_size(width: int, height: int, *, align: int = 32, min_tokens: int = MIN_TOKENS,
+def target_size(width: int, height: int, *, align: int = TOKEN_PX, min_tokens: int = MIN_TOKENS,
                 max_tokens: int = MAX_TOKENS) -> tuple[int, int]:
     """(width, height) of an image's encoder input: multiples of ``align`` (a merged token's pixels per side) of
     between min_tokens and max_tokens tokens at about the image's aspect (module docstring)."""
@@ -68,51 +71,18 @@ def target_size(width: int, height: int, *, align: int = 32, min_tokens: int = M
     return max(f, wb), max(f, hb)
 
 
-def image_pixels(im: Image.Image, *, align: int = 32, min_tokens: int = MIN_TOKENS,
+def image_pixels(im: Image.Image, *, align: int = TOKEN_PX, min_tokens: int = MIN_TOKENS,
                  max_tokens: int = MAX_TOKENS) -> np.ndarray:
     """An RGB image at its encoder size (``target_size``): uint8 (H, W, 3)."""
-    w, h = target_size(*im.size, align=align, min_tokens=min_tokens, max_tokens=max_tokens)
-    if (w, h) != im.size:
-        im = im.resize((w, h), Image.Resampling.BICUBIC)
-    return np.asarray(im.convert("RGB"), np.uint8)
+    return resized(im, target_size(*im.size, align=align, min_tokens=min_tokens, max_tokens=max_tokens))
 
 
 def normalized(pixels: np.ndarray) -> np.ndarray:
     """uint8 pixels (H, W, 3) -> the encoder's input (3, H, W) float32: (p / 255 - 0.5) / 0.5 (llama.cpp's)."""
-    x = pixels.transpose(2, 0, 1).astype(np.float32) / np.float32(255)
-    return (x - np.float32(0.5)) / np.float32(0.5)
+    return images.normalized(pixels, HALF, HALF)
 
 
-@dataclass(frozen=True)
-class Grid:
-    """An image's merged tokens: gh rows of gw."""
-
-    gh: int
-    gw: int
-
-    @property
-    def tokens(self) -> int:
-        return self.gh * self.gw
-
-    def sequence(self, embd: np.ndarray) -> Sequence:
-        """The image's tokens: the encoder's rows ``embd`` (tokens, hidden; raster order), a position each."""
-        assert embd.shape[0] == self.tokens, (embd.shape, self)
-        n = self.tokens
-        pos = np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
-        return Sequence(np.full(n, MEDIA, np.int64), np.ones(n, bool), np.ascontiguousarray(embd, np.float32), pos, n)
-
-
-def image_prompt(text: str, images: list[object], encode: Callable[[str], list[int]],
-                 sequence: Callable[[object], Sequence]) -> Sequence:
-    """A chat prompt's text with the template's ``IMAGE`` per image -> its tokens: each placeholder becomes the image's
-    tokens (``sequence(image)``: ``Grid.sequence``'s); the template's ``<|vision_start|>`` and ``<|vision_end|>``
-    around it stay text."""
-    if text.count(IMAGE) != len(images):
-        raise ValueError(f"{len(images)} image(s) for {text.count(IMAGE)} place(s) in the prompt")
-    return splice(text, IMAGE, [sequence(im) for im in images], encode)
-
-
-def video_size(width: int, height: int, n: int, *, align: int = 32) -> tuple[int, int]:
+def video_size(width: int, height: int, n: int, *, align: int = TOKEN_PX) -> tuple[int, int]:
     """(width, height) of a video's frames for n of them (Qwen3-VL's video ``smart_resize`` in float64, as llama.cpp's:
     sides below ``align`` scaled up first; the pixels of t_bar = 2 round(n / 2) frames bounded by ``VIDEO_PIXELS``, the
     scale computed over n frames)."""
@@ -157,7 +127,7 @@ class VideoPlan:
 
     @property
     def grid(self) -> Grid:
-        return Grid(self.height // 32, self.width // 32)
+        return Grid(self.height // TOKEN_PX, self.width // TOKEN_PX)
 
     def pairs(self, n: int | None = None) -> list[tuple[int, ...]]:
         """The temporal patches of the first n frames (default all): frames (2 i, 2 i + 1), an odd last one alone."""

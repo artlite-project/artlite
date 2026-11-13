@@ -35,6 +35,7 @@ from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 from artlite.vision.ops import Apply, Gemm, _dims
+from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.vit import (
     EPS,
@@ -600,39 +601,33 @@ def encode(bd: Builder, w: dict, *, joint: bool, name: str = "v") -> str:
 
 
 class Encoder:
-    """The encoder (``encode``) as dispatches on a VisionDevice: two transactions built once over the same weight images
-    (``Builder.fork``), one for a pair of entries of at most 64 groups each, one for a lone entry (joint). Per dispatch
+    """The encoder (``encode``) as dispatches on a VisionDevice: two programs built once over the same weight images
+    (``Program.build``), one for a pair of entries of at most 64 groups each, one for a lone entry (joint). Per dispatch
     (``plan``: an image's entries) the host writes the entries' patch panels and position rows (``inputs``) and the
     levels' key masks into their attention commands (``level_keys``), runs it and reads the embeddings."""
 
-    def __init__(self, npu: VisionDevice, w: dict, pos: np.ndarray, *, patch: int, name: str = "v"):
-        """w: ``weights``; pos: the learned position embedding (70 x 70 rows, 1152) in bf16 values; patch: pixels."""
+    def __init__(self, npu: VisionDevice, w: dict, pos: np.ndarray, *, patch: int, name: str = "v",
+                 state: dict | None = None):
+        """w: ``weights``; pos: the learned position embedding (70 x 70 rows, 1152) in bf16 values; patch: pixels;
+        state: a ``state()`` on a device whose images were restored (``VisionDevice.restore``: its programs taken)."""
         self.npu, self.name, self.patch, self.norm = npu, name, patch, w["patch"]["norm"]
         self.merge = 4 if w["insert"] >= 0 else 2  # (patches per output token per side)
         self.pos = np.pad(np.asarray(pos, np.float32), ((0, 0), (0, C - H)))
-        bd = Builder(npu)
-        self.words, self.addrs = {}, {}
-        for joint, b in ((False, bd), (True, bd.fork())):
-            self.out = encode(b, w, joint=joint, name=name)
-            self.words[joint], self.addrs[joint] = b.finish(), b.s.t.addrs
-        self.built = bd.built()  # (both builders': ``fork``)
+        self.out = f"{name}.f.out"  # (the final merger's image: ``final``, ``final_bands``)
+        self.bd = Builder(npu, reuse=state is not None)
+        if state is None:
+            def build(joint: bool) -> Callable[[Builder], None]:
+                def run(b: Builder) -> None:
+                    assert encode(b, w, joint=joint, name=name) == self.out
+                return run
+            self.programs = {joint: Program.build(npu, self.bd, build(joint)) for joint in (False, True)}
+        else:
+            self.programs = dict(state["programs"])
         self.tr: dict[bool, Transaction] = {}
 
     def state(self) -> dict:
-        """What ``restored`` needs besides the device's images: the transactions (their shim addresses as
-        relocations)."""
-        return {"words": self.words, "rel": {j: self.npu.relocations(a) for j, a in self.addrs.items()}, "out": self.out,
-                "merge": self.merge, "norm": self.norm}
-
-    @classmethod
-    def restored(cls, npu: VisionDevice, state: dict, pos: np.ndarray, *, patch: int, name: str = "v") -> "Encoder":
-        """An Encoder of ``state()`` on a device whose images were restored (``VisionDevice.restore``)."""
-        enc = cls.__new__(cls)
-        enc.npu, enc.name, enc.patch, enc.out, enc.merge, enc.tr = npu, name, patch, state["out"], state["merge"], {}
-        enc.norm = state["norm"]
-        enc.pos = np.pad(np.asarray(pos, np.float32), ((0, 0), (0, C - H)))
-        enc.words = {j: npu.relocate(wd, state["rel"][j]) for j, wd in state["words"].items()}
-        return enc
+        """What a restored device's encoder takes besides its images (``__init__``'s state): the programs."""
+        return {"programs": dict(self.programs)}
 
     def _host(self, ents: list[Entry], pixels: list[np.ndarray]) -> dict[str, np.ndarray]:
         """A dispatch's DDR images: its placed entries' patch panels and position rows, its levels' commands."""
@@ -657,7 +652,7 @@ class Encoder:
                     self.npu.write(n, data)
                 joint = ents[0].joint
                 if joint not in self.tr:
-                    self.tr[joint] = Transaction(self.npu.dev, self.words[joint])
+                    self.tr[joint] = self.programs[joint].transaction(self.npu)
                 self.npu.run(self.tr[joint])
                 for i, e in zip(idx, embeddings(self.npu, self.out, ents, self.merge), strict=True):
                     out[i] = e

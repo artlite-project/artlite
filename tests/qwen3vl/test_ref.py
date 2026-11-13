@@ -12,6 +12,7 @@ from PIL import Image
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
+from models.images import normalized
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
@@ -54,7 +55,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
     path = _image(case, str(tmp_path))
     g = golden(MODEL, MMPROJ, path, PROMPT)  # (inp_raw: the image of entry 0 and 1, the two kernels' convs)
     clip = ClipConfig.from_gguf(GGUFFile(MMPROJ))
-    px = Q.normalized(Q.image_pixels(load_image(path)), clip.mean, clip.std)
+    px = normalized(Q.image_pixels(load_image(path)), clip.mean, clip.std)
     ll = g.tensor("inp_raw", 0)
     # identical; a JPEG's decoded pixels within 3 levels (Pillow's libjpeg-turbo vs llama.cpp's stb_image)
     tol = 3.01 / 127.5 if case == "astronaut" else 1e-6

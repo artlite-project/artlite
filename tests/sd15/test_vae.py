@@ -122,7 +122,7 @@ def test_decoder(npu: VisionDevice) -> None:
     path = os.path.join(sd15_dir(), "vae")
     require(path)
     ref = reference.VaeDecoder(path)
-    dec = vae.Decoder(npu, ref.w, scale=ref.scale, eps=ref.EPS)
+    dec = vae.Decoder.build(npu, ref.w, scale=ref.scale, eps=ref.EPS)
     torch.manual_seed(7)
     lat = torch.randn(1, 4, 64, 64)  # (the sampler's latents: about unit variance)
     err = rel_native(dec(lat), ref(lat))

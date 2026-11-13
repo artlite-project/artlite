@@ -40,18 +40,19 @@ import numpy as np
 
 from artlite.operators import kmath
 from artlite.operators.design import COLS, ROWS
-from artlite.overlay import Transaction
 from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gelu_table, gemm
 from artlite.vision.ops import ROPE2_TAB, Gemm, StripConv, WinAttention
+from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.vit import ln, pad, vit_level
+from artlite.vision.vit import ln, pad, plain_index, vec, vit_level
 from artlite.vision.weights import Wt, cat, computed, eye, take, values
 
 H, C, FFN_REAL, FFN, HEADS, KVH, HD, HP = 768, 960, 1792, 1920, 8, 4, 96, 160
+LAYERS = 17  # (the encoder's layers)
 EPS = 1e-5
 THETA = 1e6
 WINDOW = 32
@@ -81,7 +82,9 @@ def rope2_dims() -> np.ndarray:
 
 def head_rows(heads: int, rope: bool) -> np.ndarray:
     """Rows (Q / K: rope2's, V's: plain) or O's columns of ``heads`` heads of 160 from HF's of 96."""
-    j = rope2_dims() if rope else np.where(np.arange(HP) < HD, np.arange(HP), -1)
+    if not rope:
+        return plain_index(range(heads), HD, HP)
+    j = rope2_dims()
     return np.concatenate([np.where(j >= 0, h * HD + j, -1) for h in range(heads)])
 
 
@@ -104,11 +107,6 @@ def rope2_tables(pos: np.ndarray) -> np.ndarray:
 
 
 # -- weights
-
-
-def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
-    """A vector of the file (a norm's weights, a bias), zero-padded to n."""
-    return pad(values(get(name)).reshape(-1), n)
 
 
 def residual_order(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...]) -> np.ndarray:
@@ -171,9 +169,7 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str, ord
     return w
 
 
-def kinds_of(names: object, layers: int) -> tuple[str, ...]:
-    """The layers' kinds ("conv", "attn") of an mmproj's tensor names."""
-    return tuple("conv" if f"a.blk.{il}.conv_dw.weight" in names else "attn" for il in range(layers))
+CONV_PROBE = "a.blk.{il}.conv_dw.weight"  # (a conv layer's tensor: ``vit.kinds_of``)
 
 
 def down_weights(get: Callable[[str], Wt | np.ndarray], order: np.ndarray) -> dict:
@@ -611,32 +607,19 @@ class Encoder:
         self.npu, self.w, self.p = npu, w, name
         self.net = Net(w, name)
         self.bd = Builder(npu, reuse=state is not None)
-        self.pieces = dict(state["pieces"]) if state else {"band": self._piece(self.net.band),
-                                                           "carry": self._piece(self.net.carry)}
+        self.programs = dict(state["programs"]) if state else {"band": Program.build(npu, self.bd, self.net.band),
+                                                               "carry": Program.build(npu, self.bd, self.net.carry)}
         npu.alloc(f"{name}.junk", 8 * 4096)  # (S2's zeroed time of a band before the clip's end)
-        self.band_tr, self.carry_tr = (self._transaction(self.pieces[k]) for k in ("band", "carry"))
-        self.band_tags = self.pieces["band"]["tags"]
+        self.band_tr, self.carry_tr = (self.programs[k].transaction(npu) for k in ("band", "carry"))
         self.proj = w["proj"]
         self.band = 0
         self._carry = False  # (the last band ran complete: the carry program before the next)
         self._t1 = None  # (stage 1's times of the band in progress in the mel image; None: none of its own yet)
         self.owner: object | None = None  # (the stream that ran the encoder last; None: a clip)
 
-    def _piece(self, build: Callable[[Builder], None]) -> dict:
-        """A program: its words, their shim addresses by image (``VisionDevice.refs``), its tags ([word, tag])."""
-        b = self.bd.fork()
-        build(b)
-        words = b.finish()
-        return {"words": words, "refs": self.npu.refs(b.s.t.addrs), "tags": list(b.s.tags)}
-
-    def _transaction(self, piece: dict) -> Transaction:
-        words = piece["words"].copy()
-        self.npu.resolve(words, piece["refs"], lambda n: n)
-        return Transaction(self.npu.dev, words)
-
     def state(self) -> dict:
         """What a restored device's encoder takes besides its images (``__init__``'s state): the programs."""
-        return {"pieces": dict(self.pieces)}
+        return {"programs": dict(self.programs)}
 
     def reset(self) -> None:
         """A new stream: its state zero (the downsampler stages' time -1, the conv layers' rows -2, -1; the first band's
@@ -692,9 +675,7 @@ class Encoder:
         t2 = -(-frames // 4) - T2 * b  # (S2's first time past the clip's end, if in this band)
         zrow = self.npu.address(f"{p}.s2", (1 + t2) * S2_ROW) if 0 <= t2 < T2 else self.npu.address(f"{p}.junk")
         tr = self.band_tr
-        for idx, tag in self.band_tags:
-            assert tag == TAG_ZROW
-            tr.words[idx], tr.words[idx + 1] = zrow & 0xFFFFFFFF, zrow >> 32
+        self.programs["band"].retarget(self.npu, tr, lambda tag, base: zrow)  # (the one tag: TAG_ZROW)
         tr.flush()
         self.npu.run(tr)
         if not partial:

@@ -45,18 +45,28 @@ from artlite.vision import windows as W
 from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm
+from artlite.vision.program import ProgramStore
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.vit import VIT, Bands, Keys, Vit, kv_bytes, layer_bands, pad, pad_heads
+from artlite.vision.vit import (
+    VIT,
+    Bands,
+    Keys,
+    Vit,
+    blocks4,
+    folded_patch,
+    kv_bytes,
+    layer_bands,
+    pad,
+    pad_heads,
+    rope_index,
+)
 from artlite.vision.vit import vit_level as level
 from artlite.vision.weights import Wt, computed, f32, take, values
-from artlite.vision.windows import Layout, Names, out_width
+from artlite.vision.windows import KP, ONE, PIX, Layout, Names, out_width
 
 PATCH = 16
-PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx) of 3 x 16 x 16; the constant input 1, a bfp16 block of
-# its own; the panels' K: whole k-tiles)
 UPC, DNC = 960, 640  # (the MLP's output chunks: mm.0's (3 passes a row), mm.2's (2))
-PIECE_BAND_LAYERS = 16  # (a piece's band-layers at most: its build ~0.4 s)
-PIECE_MS = 500.0  # (a dispatch's estimated time at most)
+PIECE_COST = (1.6, 0.15)  # (a layer of the 1152 tower ~1.6 nb + 0.15 nb^2 ms: ``windows.piece_layers``)
 
 
 def tower(hidden: int, heads: int, ffn: int, eps: float) -> Vit:
@@ -71,19 +81,10 @@ def merger(vt: Vit) -> W.Merger:
     return W.Merger(H=vt.H, C=vt.C, eps=vt.EPS, up=(UPC,) * (fup // UPC) + ((fup % UPC,) if fup % UPC else ()), dn=DNC)
 
 
-def rope_rows(vt: Vit) -> np.ndarray:
-    """``rope_heads``' rows: per head of HD dims its 80 channels, dims 0 .. HD / 2 - 1 at 0 .., HD / 2 .. at 40 ..
-    (pair k: channels k, 40 + k), -1 elsewhere."""
-    HD, HP = vt.HD, vt.HP
-    j = np.arange(HP)
-    d = np.where(j < HP // 2, j, j - HP // 2 + HD // 2)
-    ok = (j % (HP // 2)) < HD // 2
-    return np.concatenate([np.where(ok, h * HD + d, -1) for h in range(vt.HEADS)])
-
-
 def rope_heads(w: Wt | np.ndarray, vt: Vit = VIT) -> Wt | np.ndarray:
-    """Rows of the heads of HD -> heads of 80 for the RoPE epilogue (``rope_rows``; zeros elsewhere)."""
-    return take(w, rope_rows(vt))
+    """Rows of the heads of HD -> heads of 80 for the RoPE epilogue (``vit.rope_index``: per head its dims 0 .. HD / 2
+    - 1 at 0 .., HD / 2 .. at 40 .., pair k: channels k, 40 + k; zeros elsewhere)."""
+    return take(w, rope_index(range(vt.HEADS), vt.HD, vt.HP))
 
 
 def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, vt: Vit = VIT) -> dict[str, Wt | np.ndarray]:
@@ -111,12 +112,6 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, vt: Vit = VIT)
     return w
 
 
-def _blocks4(v: Wt | np.ndarray, axis: int = 0, vt: Vit = VIT) -> Wt | np.ndarray:
-    """A merged token's 4 x H channels (along axis: 0, a vector's or a matrix's rows; 1, a matrix's columns) -> 4 x C
-    (each patch's padded)."""
-    return take(v, np.array([k * vt.H + i if i < vt.H else -1 for k in range(4) for i in range(vt.C)]), axis)
-
-
 def weights(get: Callable[[str], Wt | np.ndarray], layers: int, proj: int, vt: Vit = VIT) -> dict:
     """Every padded weight of the encoder: "patch" (``patch_weights``), per layer il its ``layer_weights``, "post"
     (post_ln's gamma, beta), "up" / "down" (mm.0 on the merged 4 x C channels -> FUP, mm.2 FUP -> ``out_width``) and
@@ -126,7 +121,7 @@ def weights(get: Callable[[str], Wt | np.ndarray], layers: int, proj: int, vt: V
     w: dict = {"patch": patch_weights(get, vt), "layers": layers, "proj": proj, "vit": vt,
                **{il: layer_weights(get, il, vt) for il in range(layers)}}
     w["post_g"], w["post_b"] = (pad(f32(get(f"v.post_ln.{n}")).reshape(-1), vt.C) for n in ("weight", "bias"))
-    w["up"] = pad(_blocks4(get("mm.0.weight"), 1, vt), md.FUP, md.merged)
+    w["up"] = pad(blocks4(get("mm.0.weight"), 1, vt.H, vt.C), md.FUP, md.merged)
     w["up_b"] = pad(f32(get("mm.0.bias")).reshape(-1), md.FUP)
     w["down"] = pad(f32(get("mm.2.weight")), out_width(proj), md.FUP)
     w["down_b"] = pad(f32(get("mm.2.bias")).reshape(-1), out_width(proj))
@@ -138,14 +133,11 @@ def patch_weights(get: Callable[[str], Wt | np.ndarray], vt: Vit = VIT) -> dict[
     kernels summed, the normalization x = (p / 255 - 0.5) / 0.5 = a q + o of q = p - 128 (a = 1 / 127.5, o = 1 / 255)
     folded in: input k < 768 the weights' column k times a, input 768 (the constant 1) their offset sum_k w_k o
     (computed on the host at every load, ``weights.computed``); the bias."""
-    H, C = vt.H, vt.C
+    C = vt.C
     w = (values(get("v.patch_embd.weight")).astype(np.float64) +
-         values(get("v.patch_embd.weight.1")).astype(np.float64)).reshape(H, PIX)
-    a = 1 / 127.5
-    o = 128 * a - 1
-    wt = np.zeros((C, KP), np.float32)
-    wt[:H, :PIX], wt[:H, ONE] = w * a, w.sum(1) * o
-    return {"w": computed("qwen3vl.patch", wt), "b": pad(f32(get("v.patch_embd.bias")).reshape(-1), C)}
+         values(get("v.patch_embd.weight.1")).astype(np.float64)).reshape(vt.H, PIX)
+    return {"w": computed("qwen3vl.patch", folded_patch([w], c=C, kp=KP, one=ONE)),
+            "b": pad(f32(get("v.patch_embd.bias")).reshape(-1), C)}
 
 
 def pos_rows(table: np.ndarray, ph: int, pw: int) -> np.ndarray:
@@ -172,11 +164,8 @@ def rope_table(ph: int, pw: int, vt: Vit = VIT) -> np.ndarray:
 
 
 def layers_per_piece(nb: int, layers: int = 27) -> int:
-    """Layers of a dispatch at nb bands: all at nb 1, else at most PIECE_BAND_LAYERS band-layers (its build time) and
-    about PIECE_MS (a layer of the 1152 tower ~1.6 nb + 0.15 nb^2 ms: its GEMMs and its attention over every key)."""
-    if nb == 1:
-        return layers
-    return max(1, min(layers, PIECE_BAND_LAYERS // nb, int(PIECE_MS / (1.6 * nb + 0.15 * nb * nb))))
+    """Layers of a dispatch at nb bands (``windows.piece_layers`` at the 1152 tower's cost)."""
+    return W.piece_layers(nb, layers, PIECE_COST)
 
 
 def patch_embed(bd: Builder, w: dict[str, np.ndarray], nm: Names, nb: int, vt: Vit = VIT) -> None:
@@ -228,13 +217,13 @@ class Encoder(W.WindowEncoder):
     """The encoder (module docstring) as dispatches on a VisionDevice (``windows.WindowEncoder``)."""
 
     def __init__(self, npu: VisionDevice, w: dict, pos: np.ndarray, *, max_bands: int, name: str = "q",
-                 state: dict | None = None):
+                 state: dict | None = None, store: ProgramStore | None = None):
         """w: ``weights`` (its "vit": the tower's widths); pos: the learned position embedding (48 x 48 rows of the
         hidden, float32); max_bands: the largest level (the K / V^T slots' DDR, allocated first); state: a ``state()``
         on a device whose images were restored (``VisionDevice.restore``: its programs taken, new ones built over the
-        images as they are)."""
+        images as they are); store: where those are kept (``WindowEncoder``)."""
         self.pos, self.vt = pos, w["vit"]
-        super().__init__(npu, w, max_bands=max_bands, name=name, state=state,
+        super().__init__(npu, w, max_bands=max_bands, name=name, state=state, store=store,
                          kv_bytes=kv_bytes(level(max_bands), keys_of("", self.vt)))
 
     def patch_embed(self, bd: Builder, nb: int) -> None:

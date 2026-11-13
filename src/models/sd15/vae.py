@@ -26,6 +26,7 @@ from artlite.vision.build import Builder, Level
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
 from artlite.vision.ops import Apply, Gemm
+from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Wt, computed, flat, take, values
 
@@ -587,31 +588,28 @@ class Decoder:
     """The VAE decoder on a VisionDevice as one dispatch: ``self(latents)``, the sampler's latents (1, 4, 64, 64) -> the
     image (1, 3, 512, 512) in about [-1, 1]. Weights by diffusers name (``decoder.*``, ``post_quant_conv.*``)."""
 
-    def __init__(self, npu: VisionDevice, w: dict, *, scale: float, eps: float = 1e-6):
-        self.npu = npu
-        bd = Builder(npu)
-        self.lat = VImage(64, "vae.lat", L64)
-        self.lat.base(bd)
-        decoder(bd, w, self.lat, scale=scale, eps=eps, name="vae.out")
-        self.words = bd.finish()
-        self.tr = None
-        self.addrs, self.built = bd.s.t.addrs, bd.built()
-
-    def state(self) -> dict:
-        """What ``restored`` needs besides the device's images (the transaction's shim addresses as relocations)."""
-        return {"lat": self.lat, "words": self.words, "rel": self.npu.relocations(self.addrs)}
+    def __init__(self, npu: VisionDevice, *, program: Program, lat: VImage, bd: Builder | None = None):
+        """program, lat: ``build``'s, or a ``state()``'s on a device whose images were restored (``VisionDevice.
+        restore``); bd: the build's builder."""
+        self.npu, self.program, self.lat, self.bd = npu, program, lat, bd
+        self.tr: Transaction | None = None
 
     @classmethod
-    def restored(cls, npu: VisionDevice, state: dict) -> "Decoder":
-        """A Decoder of ``state()`` on a device whose images were restored (``VisionDevice.restore``)."""
-        d = cls.__new__(cls)
-        d.npu, d.tr, d.lat = npu, None, state["lat"]
-        d.words = npu.relocate(state["words"], state["rel"])
-        return d
+    def build(cls, npu: VisionDevice, w: dict, *, scale: float, eps: float = 1e-6) -> "Decoder":
+        """The decoder's program built over the weights ``w`` (diffusers names)."""
+        bd = Builder(npu)
+        lat = VImage(64, "vae.lat", L64)
+        lat.base(bd)
+        decoder(bd, w, lat, scale=scale, eps=eps, name="vae.out")
+        return cls(npu, program=Program.of(npu, bd), lat=lat, bd=bd)
+
+    def state(self) -> dict:
+        """What the constructor takes besides the device: the program, the latents' image."""
+        return {"program": self.program, "lat": self.lat}
 
     def __call__(self, lat: np.ndarray) -> np.ndarray:
         if self.tr is None:
-            self.tr = Transaction(self.npu.dev, self.words)
+            self.tr = self.program.transaction(self.npu)
         self.npu.write(self.lat.name, image_bytes(self.lat, latents(lat)))
         self.npu.run(self.tr)
         return image(self.npu.read("vae.out"))

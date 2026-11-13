@@ -47,11 +47,13 @@ from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm, ln_rec, silu_table
 from artlite.vision.ops import ROPE40_TAB, Apply, DepthAttention, Gemm
+from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.vit import ln, ln_records, pad, vit_level
+from artlite.vision.vit import ln, ln_records, pad, plain_index, vec, vit_level
 from artlite.vision.weights import Wt, cat, eye, take, values
 
 H, C, HD, HP, HEADS, KVH, FFN_REAL, FFN = 1024, 1280, 32, 40, 32, 8, 2816, 2880
+LAYERS = 3  # (the depthformer's layers)
 NCB, NCODES, NLOG = 12, 2017, 2240  # (codebooks, codes a codebook, its logits padded)
 PROJ, PROJ_OP = NCB * C, 3840  # (proj_in's outputs: a slot's 1280; per GEMM)
 NPICK = 4  # (codebooks a pass scores)
@@ -65,16 +67,6 @@ LOG_BYTES = NLOG // 80 * 5760  # (a head's fp32 tiles of a column: [pass][rb][cb
 # -- weights
 
 
-def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
-    return pad(values(get(name)).reshape(-1), n)
-
-
-def head_rows(heads: np.ndarray) -> np.ndarray:
-    """Rows (Q / K / V) or O's columns of heads of 40 from HF's heads ``heads`` of 32 (-1: a pad)."""
-    j = np.arange(HP)
-    return np.concatenate([np.where(j < HD, h * HD + j, -1) for h in heads])
-
-
 def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int) -> dict:
     """Layer il's padded weights: "ln1", "ln2"; "q" (the NPU's head order), "k", "v" (heads of 40), "g" (the gate's 32
     rows in the head order, padded to 320, times -log2 e), "o" (columns by head: K 1280), "qn" / "kn" (rope40's 80 norm
@@ -82,12 +74,12 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int) -> dict:
     "down" (K 2816)."""
     p = f"a.gen.code.blk.{il}."
     order = DepthAttention.order()
-    w: dict = {"ln1": vec(get, p + "ln1.weight"), "ln2": vec(get, p + "ln2.weight")}
-    w["q"] = take(get(p + "attn_q.weight"), head_rows(order))
-    w["k"] = take(get(p + "attn_k.weight"), head_rows(np.arange(KVH)))
-    w["v"] = take(get(p + "attn_v.weight"), head_rows(np.arange(KVH)))
+    w: dict = {"ln1": vec(get, p + "ln1.weight", C), "ln2": vec(get, p + "ln2.weight", C)}
+    w["q"] = take(get(p + "attn_q.weight"), plain_index(order, HD, HP))
+    w["k"] = take(get(p + "attn_k.weight"), plain_index(np.arange(KVH), HD, HP))
+    w["v"] = take(get(p + "attn_v.weight"), plain_index(np.arange(KVH), HD, HP))
     w["g"] = pad(take(get(p + "attn_gate.weight"), order), 320) * -LOG2E
-    w["o"] = pad(take(get(p + "attn_out.weight"), head_rows(order), 1), C)
+    w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(order, HD, HP), 1), C)
     for n, s in (("qn", QSCALE), ("kn", 1.0)):
         nw = np.zeros(HP, np.float32)
         nw[:HD] = values(get(p + f"attn_{n[0]}_norm.weight")).reshape(-1) * np.float32(s)
@@ -106,7 +98,7 @@ def weights(get: Callable[[str], Wt | np.ndarray], layers: int) -> dict:
     w: dict = {"layers": layers, "proj": take(get("a.gen.code.proj_in.weight"), rows),
                "proj_b": take(values(get("a.gen.code.proj_in.bias")).reshape(-1), rows),
                **{il: layer_weights(get, il) for il in range(layers)}}
-    w["on"] = vec(get, "a.gen.code.output_norm.weight")
+    w["on"] = vec(get, "a.gen.code.output_norm.weight", C)
     w["hn"] = np.stack([pad(r, C) for r in values(get("a.gen.code.head_norm.weight")).reshape(NCB, H)])
     emb = get("a.gen.code.embd.weight")
     w["heads"] = [pad(emb[NCODES * cb:NCODES * (cb + 1)], NLOG) for cb in range(NCB)]
@@ -265,7 +257,8 @@ class Depth:
         self.net = Net(w, name)
         self.bd = Builder(npu, reuse=state is not None)
         if state is None:
-            self.pieces = {"proj": self._piece(self.net.proj), "pass": self._piece(self.net.pass_)}
+            self.programs = {"proj": Program.build(npu, self.bd, self.net.proj),
+                             "pass": Program.build(npu, self.bd, self.net.pass_)}
             others = self.bd.fork()  # (the other codebooks' heads and norms: images of the program's layout)
             lv = self.net.lv
             t, hn = alloc(others, lv, C), alloc(others, lv, C, "pn")
@@ -275,27 +268,14 @@ class Depth:
             others.slots.pack(npu)
             self.bd.put(f"{name}.rope", np.tile(rope_table(), COLS))
         else:
-            self.pieces = dict(state["pieces"])
-        self.proj_tr = self._transaction(self.pieces["proj"])
-        p = self.pieces["pass"]
-        self._pass_words = p["words"]
-        self._pass_refs = p["refs"]
+            self.programs = dict(state["programs"])
+        self.proj_tr = self.programs["proj"].transaction(npu)
         self._trs: dict[tuple[int, ...], Transaction] = {}
         self.P = np.zeros((NCB, C), np.float32)
 
-    def _piece(self, build: Callable[[Builder], None]) -> dict:
-        b = self.bd.fork()
-        build(b)
-        words = b.finish()
-        return {"words": words, "refs": self.npu.refs(b.s.t.addrs)}
-
-    def _transaction(self, piece: dict, rename: Callable[[str], str] = lambda n: n) -> Transaction:
-        words = piece["words"].copy()
-        self.npu.resolve(words, piece["refs"], rename)
-        return Transaction(self.npu.dev, words)
-
     def state(self) -> dict:
-        return {"pieces": dict(self.pieces)}
+        """What a restored device's depthformer takes besides its images: the programs."""
+        return {"programs": dict(self.programs)}
 
     def begin(self, h: np.ndarray) -> None:
         """A frame's hidden state h (2048): P = proj_in(h) + b (the proj program)."""
@@ -325,8 +305,7 @@ class Depth:
         if tr is None:
             ren = {self.net.hn_image(j): self.net.hn_image(cb) for j, cb in enumerate(key)} | \
                 {self.net.head_image(j): self.net.head_image(cb) for j, cb in enumerate(key)}
-            tr = self._trs[key] = self._transaction({"words": self._pass_words, "refs": self._pass_refs},
-                                                   lambda n: ren.get(n, n))
+            tr = self._trs[key] = self.programs["pass"].transaction(self.npu, lambda n: ren.get(n, n))
             if len(self._trs) > 64:
                 self._trs.pop(next(iter(self._trs)))
         self.npu.run(tr)

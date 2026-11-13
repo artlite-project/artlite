@@ -18,6 +18,7 @@ from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import alloc
 from artlite.vision.vit import VIT, Bands, C, H, Keys, kv_bytes, ln_records, vit_level
+from models.images import normalized
 from models.qwen3vl import encoder as E
 from models.qwen3vl import host as Q
 from models.sequence import load_image
@@ -83,7 +84,7 @@ def test_layer(npu: VisionDevice, mm: tuple, size: tuple[int, int], il: int) -> 
     enc = V.Encoder(MMPROJ)
     enc.layers = il
     tr: dict[str, torch.Tensor] = {}
-    enc.forward(Q.normalized(px, clip.mean, clip.std), tr)
+    enc.forward(normalized(px, clip.mean, clip.std), tr)
     xin = tr[f"layer_out-{il - 1}"].to(torch.bfloat16).double()
     ph, pw = 2 * lay.gh, 2 * lay.gw
     ang = torch.from_numpy(V.rope_angles(ph, pw))
@@ -156,7 +157,7 @@ def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
     _, clip = mm
     px = _pixels(*size)
     got = encoder(px)
-    want = V.Encoder(MMPROJ).forward(Q.normalized(px, clip.mean, clip.std)).numpy()
+    want = V.Encoder(MMPROJ).forward(normalized(px, clip.mean, clip.std)).numpy()
     e = rel_rows(np.asarray(got, np.float64), want)
     print(f"{size}: {got.shape[0]} tokens, per token median {np.median(e):.4f}, p90 {np.percentile(e, 90):.4f}, max "
           f"{e.max():.3f}; sum {rel(got, want):.3f}")
@@ -174,7 +175,7 @@ def test_encoder_model(mm: tuple, encoder: E.Encoder) -> None:
     px = _pixels(512, 512)
     lay = E.Layout(16, 16)
     _, _, real = lay.slot_windows()
-    pix = Q.normalized(px, clip.mean, clip.std)
+    pix = normalized(px, clip.mean, clip.std)
     want = V.Encoder(MMPROJ).forward(pix).numpy()
     sim = V.NpuEncoder(MMPROJ).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
     e, es = rel_rows(np.asarray(encoder(px), np.float64), want), rel_rows(np.asarray(sim, np.float64), want)
@@ -206,7 +207,7 @@ def test_tower(npu: VisionDevice, name: str) -> None:
         px = _pixels(*size)
         lay = E.Layout(px.shape[0] // 32, px.shape[1] // 32)
         _, _, real = lay.slot_windows()
-        pix = Q.normalized(px, clip.mean, clip.std)
+        pix = normalized(px, clip.mean, clip.std)
         got = enc(px)
         assert np.array_equal(enc(px), got)
         want = V.Encoder(mmproj).forward(pix).numpy()

@@ -38,6 +38,16 @@ class Sequence:
         return cls(np.asarray(ids, np.int64).reshape(n), np.zeros(n, bool), np.zeros((0, hidden), np.float32),
                    np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1), n)
 
+    @classmethod
+    def media(cls, rows: np.ndarray, pos: np.ndarray | None = None, next: int | None = None) -> Sequence:
+        """The tokens of embedding rows alone (an image's, a clip's): ``rows`` (n, hidden), their positions ``pos`` (n, 3)
+        and the position after them ``next`` (default: a position each, from 0)."""
+        n = rows.shape[0]
+        if pos is None:
+            pos = np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
+        return cls(np.full(n, MEDIA, np.int64), np.ones(n, bool), np.ascontiguousarray(rows, np.float32), pos,
+                   n if next is None else next)
+
     def __len__(self) -> int:
         return len(self.ids)
 

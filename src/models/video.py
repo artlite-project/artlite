@@ -151,13 +151,25 @@ class Frames:
         cmd = [_tool("ffmpeg"), "-nostdin", *INPUT, *(["-vf", ",".join(vf)] if vf else []), "-frames:v",
                str(len(self.keep)), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel", "error"]
         self.nbytes = w * h * 3
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        widen_pipe(self.proc.stdout.fileno(), self.CHUNK)
-        self.feeder = _feed(self.proc, data)
         self.q: queue.Queue = queue.Queue(ahead)
         self.stop = threading.Event()
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
+        self.errors = b""  # (the end of ffmpeg's messages)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            widen_pipe(self.proc.stdout.fileno(), self.CHUNK)
+            self.feeder = _feed(self.proc, data)
+            self.reader = threading.Thread(target=self._read, daemon=True)
+            self.drainer = threading.Thread(target=self._drain, daemon=True)
+            self.reader.start()
+            self.drainer.start()
+        except BaseException:  # (no process left behind by a constructor that fails)
+            self.stop.set()
+            self.proc.kill()
+            self.proc.wait()
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            self.proc.stderr.close()
+            raise
 
     def _put(self, x: bytes | None) -> bool:
         while not self.stop.is_set():
@@ -191,22 +203,34 @@ class Frames:
         finally:
             self._put(None)
 
+    def _drain(self) -> None:
+        """ffmpeg's messages (its error pipe read as they come: a verbose one cannot block it), the last 2 KB kept."""
+        try:
+            while chunk := self.proc.stderr.read1(4096):
+                self.errors = (self.errors + chunk)[-2048:]
+        except (OSError, ValueError):
+            pass
+
     def __iter__(self) -> Iterator[np.ndarray]:
+        """The frames; VideoError: none decoded, or ffmpeg exited with an error status."""
         w, h = self.size
         got = 0
         while (raw := self.q.get()) is not None:
             got += 1
             yield np.frombuffer(raw, np.uint8).reshape(h, w, 3)
-        if got == 0:
-            self.proc.wait()
-            err = self.proc.stderr.read().decode(errors="replace").strip()[:200]
-            raise VideoError(f"ffmpeg decoded no frame: {err}")
+        status = self.proc.wait()
+        self.drainer.join()
+        if got == 0 or status:
+            err = self.errors.decode(errors="replace").strip()[-200:]
+            what = "decoded no frame" if got == 0 else f"exited with status {status}"
+            raise VideoError(f"ffmpeg {what}: {err}")
 
     def close(self) -> None:
         self.stop.set()
         self.proc.kill()
         self.proc.wait()
         self.reader.join()
+        self.drainer.join()
         self.feeder.join()
         self.proc.stdout.close()
         self.proc.stderr.close()

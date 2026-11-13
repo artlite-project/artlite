@@ -528,7 +528,7 @@ def test_unet(npu: VisionDevice) -> None:
     torch.manual_seed(0)
     x, ctx = torch.randn(2, 4, 64, 64), torch.randn(2, 77, 768)
     t0 = time.perf_counter()
-    net = UNet(npu, u.w, eps=u.cfg["norm_eps"])
+    net = UNet.build(npu, u.w, eps=u.cfg["norm_eps"])
     print(f"UNet: {net.bd.s.n} ops, built in {time.perf_counter() - t0:.1f} s")
     net.set_time(resnet_time_biases(u.w, 500.0))
     net.set_context(ctx)

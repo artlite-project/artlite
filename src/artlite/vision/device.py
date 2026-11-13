@@ -3,13 +3,13 @@ image of two B slots per role, the same for every core), and dispatches of ``seq
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import os
 import pickle
 import shutil
 import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
@@ -17,11 +17,12 @@ import numpy as np
 
 from ..operators import paging
 from ..operators.design import COLS, ROWS
-from ..operators.toolchain import CACHE_DIR, PACKAGE_DIR
+from ..operators.toolchain import CACHE_DIR
 from ..overlay import OverlayDevice, Transaction
 from . import core as K
 from . import design as D
 from .seq import Seq
+from .sources import SRC, source_files
 from .weights import Slots, Source
 
 if TYPE_CHECKING:
@@ -53,7 +54,7 @@ class VisionDevice:
     def __init__(self, design: D.VisionDesign | None = None):
         self.design = design or D.VisionDesign()
         self.dev = OverlayDevice(self.design)
-        self._packing: tuple[threading.Thread, list] | None = None  # (``pack_behind``)
+        self._packing: Future[None] | None = None  # (``pack_behind``)
         self._images: dict[str, tuple[str, int, int]] = {}  # (name -> chunk, offset, bytes)
         self._top = self.CHUNK  # (the bytes used of the newest chunk)
         self.pager = role_pages(os.path.dirname(self.dev._prog.insts_path))
@@ -134,24 +135,22 @@ class VisionDevice:
         """Run ``pack`` (weight images: ``weights.Slots``, the native packer without the GIL) on a thread while the
         caller goes on; the next dispatch waits for it (``packed``)."""
         self.packed()
-        err: list = []
+        done: Future[None] = Future()
 
         def run() -> None:
             try:
                 pack()
+                done.set_result(None)
             except BaseException as e:  # noqa: BLE001 (raised by ``packed``)
-                err.append(e)
-        t = threading.Thread(target=run, name="vision-pack")
-        t.start()
-        self._packing = (t, err)
+                done.set_exception(e)
+        threading.Thread(target=run, name="vision-pack").start()
+        self._packing = done
 
     def packed(self) -> None:
         """Until ``pack_behind``'s packing is done (its error raised here)."""
         if self._packing is not None:
-            (t, err), self._packing = self._packing, None
-            t.join()
-            if err:
-                raise err[0]
+            done, self._packing = self._packing, None
+            done.result()
 
     def layout(self) -> dict:
         """The DDR layout: the host buffers in creation order (name, bytes), per image its buffer, offset and bytes
@@ -168,27 +167,6 @@ class VisionDevice:
         self._images = dict(layout["images"])
         self._chunk, self._top = layout["chunk"], layout["top"]
 
-    def relocations(self, addrs: list[tuple[int, int]]) -> np.ndarray:
-        """Shim BD addresses of a transaction (``txn.Txn.addrs``) as [word index, buffer number, offset] rows: where
-        ``relocate`` writes them for another device's buffers."""
-        names = list(self.dev.buffers)
-        base = np.array([self.dev.address(n) for n in names], np.int64)
-        order = np.argsort(base)
-        a = np.array([x for _, x in addrs], np.int64)
-        k = order[np.searchsorted(base[order], a, side="right") - 1]
-        size = np.array([self.dev.view(n).nbytes for n in names], np.int64)
-        assert ((a >= base[k]) & (a < base[k] + size[k])).all(), "a shim address outside the buffers"
-        return np.stack([np.array([i for i, _ in addrs], np.int64), k, a - base[k]], 1)
-
-    def relocate(self, words: np.ndarray, rel: np.ndarray) -> np.ndarray:
-        """words with the addresses of ``relocations`` rows rewritten for this device's buffers (a copy)."""
-        base = np.array([self.dev.address(n) for n in self.dev.buffers], np.int64)
-        a = base[rel[:, 1]] + rel[:, 2]
-        out = words.copy()
-        out[rel[:, 0]] = (a & 0xFFFFFFFF).astype(np.uint32)
-        out[rel[:, 0] + 1] = (a >> 32).astype(np.uint32)
-        return out
-
     def refs(self, addrs: list[tuple[int, int]]) -> tuple[np.ndarray, list[str], np.ndarray]:
         """Shim BD addresses of a transaction (``txn.Txn.addrs``) by image: their word indices, the images' names and per
         address its image (an index into them) and offset in it (``resolve`` rewrites them for other images: another
@@ -199,7 +177,7 @@ class VisionDevice:
         order = np.argsort(base)
         a = np.array([x for _, x in addrs], np.int64)
         k = order[np.searchsorted(base[order], a, side="right") - 1]
-        assert ((a >= base[k]) & (a < base[k] + size[k])).all(), "a shim address outside the images"
+        assert ((a >= base[k]) & (a <= base[k] + size[k])).all(), "a shim address outside the images"  # (<=: an end)
         used, inv = np.unique(k, return_inverse=True)
         return np.array([i for i, _ in addrs], np.int64), [names[j] for j in used], np.stack([inv, a - base[k]], 1)
 
@@ -223,22 +201,15 @@ class VisionDevice:
 # per model file: restored, a load skips the builds and packs the weights from the model's files (``weights.Slots``),
 # as a build does; the cache never holds a copy of the weights.
 
-def state_dir(kind: str, path: str, sources: tuple[str, ...], files: list[str]) -> str:
+def state_dir(kind: str, path: str, modules: tuple[str, ...], files: list[str]) -> str:
     """The cache directory of a model's built state: ``CACHE_DIR/kind/<path's digest>/<key>``, the key covering the
-    toolchain, the code that builds the images and transactions (``sources``: files or directories of the src tree; a
-    directory's modules and kernel templates, a module's own templates: ``x.py`` with ``x.*.jinja``) and the model's
-    ``files`` (size and mtime)."""
-    src = os.path.dirname(PACKAGE_DIR)  # (the artlite and models packages' directory)
+    toolchain, the code that builds the images and transactions (the files ``sources.source_files(*modules)`` derives
+    from the modules' imports: the loader's modules, named by the caller) and the model's ``files`` (size and mtime)."""
     h = hashlib.sha256(version("llvm-aie").encode())
-    for s in sources:
-        p = os.path.join(src, s)
-        if os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, "*.py")) + glob.glob(os.path.join(p, "*.jinja")))
-        else:
-            files = [p, *sorted(glob.glob(os.path.splitext(glob.escape(p))[0] + ".*.jinja"))]
-        for f in files:
-            with open(f, "rb") as fh:
-                h.update(fh.read())
+    for f in source_files(*modules):
+        h.update(os.path.relpath(f, SRC).encode())
+        with open(f, "rb") as fh:
+            h.update(fh.read())
     for f in files:
         st = os.stat(f)
         h.update(f"{os.path.basename(f)} {st.st_size} {st.st_mtime_ns}".encode())

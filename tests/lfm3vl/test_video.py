@@ -6,6 +6,8 @@ far to check a pair's inputs by (its kernels swapped: 40-50%). The NPU's pairs (
 against the float64 encoder."""
 
 
+import types
+
 import numpy as np
 import pytest
 import torch
@@ -114,7 +116,7 @@ def test_program_cache() -> None:
     for k in [k for k in enc.programs if isinstance(k, tuple)]:
         del enc.programs[k]
     cached = {}
-    enc.built = lambda key, pieces, same: cached.__setitem__(key, same)
+    enc.store = types.SimpleNamespace(save=lambda key, pieces, same: cached.__setitem__(key, same))
     for nb in (2, 1, 3):
         enc.program(nb, pair=True)
     pairs = {k: v for k, v in cached.items() if isinstance(k, tuple)}  # (an image program a pair's took: cached)

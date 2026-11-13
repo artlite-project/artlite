@@ -51,20 +51,35 @@ from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm
 from artlite.vision.ops import DwConv, Gemm
+from artlite.vision.program import ProgramStore
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.vit import Bands, Keys, VitLevel, attend, kv_bytes, ln, pad, vit_level
+from artlite.vision.vit import (
+    Bands,
+    Keys,
+    VitLevel,
+    attend,
+    blocks4,
+    folded_patch,
+    kv_bytes,
+    ln,
+    pad,
+    plain_index,
+    rope_index,
+    vec,
+    vit_level,
+)
 from artlite.vision.weights import Wt, cat, computed, eye, f32, take, values
+from artlite.vision.windows import KP, ONE, PIX
 
 H, C, HD, HP, HEADS, KVH, FFN = 1024, 1280, 64, 80, 16, 8, 2560
 EPS = 1e-5
 THETA = 1e6
 QSCALE = 1.4426950408889634 / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
 PATCH = 16
-PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx); the constant input 1; the panels' K: whole k-tiles)
 ONE2, KP2 = 1536, 1600  # (a video pair's: its two frames' inputs, then the constant)
 MERGER = W.Merger(H=H, C=C, eps=1e-6, up=(1280, 1280, 1280, 320), dn=640)  # (mm.0's 4096 outputs in 4160)
-PIECE_BAND_LAYERS = 16  # (a piece's band-layers at most: its build time)
-PIECE_MS = 500.0  # (a dispatch's estimated time at most)
+PIECE_COST = (0.7, 0.05)  # (a layer ~ 0.7 nb + 0.05 nb^2 ms: its GEMMs, its attention over every key)
+CONV_PROBE = "v.blk.{il}.conv2d_in_proj.weight"  # (a conv layer's tensor: ``vit.kinds_of``)
 SILU_TABLE = np.tile(kmath.SILU.table_words(), 2).view(np.uint8)
 
 
@@ -74,33 +89,13 @@ def q_order() -> np.ndarray:
     return 2 * (h % KVH) + h // KVH
 
 
-def rope_index(heads: np.ndarray) -> np.ndarray:
-    """Rows of the RoPE epilogue's heads (80 each: dims 0..31 at 0..31, 32..63 at 40..71) from HF's heads ``heads``
-    (64 rows each); -1: zero."""
-    j = np.arange(HP)
-    d = np.where(j < HP // 2, j, j - HP // 2 + HD // 2)
-    ok = (j % (HP // 2)) < HD // 2
-    return np.concatenate([np.where(ok, h * HD + d, -1) for h in heads])
-
-
-def plain_index(heads: np.ndarray) -> np.ndarray:
-    """Rows (V's) or columns (O's) of 80 per head: HF head h's 64, then 16 zeros."""
-    j = np.arange(HP)
-    return np.concatenate([np.where(j < HD, h * HD + j, -1) for h in heads])
-
-
-def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
-    """A norm's weights (or any vector) of the file, zero-padded to n."""
-    return pad(f32(get(name)).reshape(-1), n)
-
-
 def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> dict:
     """Layer il's padded weights by role: "ln1", "ln2" (RMSNorm weights), "gu" (the feed-forward's rows [up | gate],
     K 1024), "down" (K 2560); a conv layer's "bx" ([B | x] rows, each padded to 1280), "c" (C's rows), "taps" (1280, 3,
     3), "out" (K 1024); an attention layer's "q" (the NPU's head order, RoPE rows), "k" (RoPE rows), "v", "o" (columns by
     head: K 1280), "qn" / "kn" (the q / k norms' 80 weights in the RoPE rows, q's times log2 e / 8)."""
     p = f"v.blk.{il}."
-    w: dict = {"kind": kind, "ln1": vec(get, p + "ln1.weight"), "ln2": vec(get, p + "ln2.weight"),
+    w: dict = {"kind": kind, "ln1": vec(get, p + "ln1.weight", C), "ln2": vec(get, p + "ln2.weight", C),
                "gu": cat([get(p + "ffn_up.weight"), get(p + "ffn_gate.weight")]), "down": pad(get(p + "ffn_down.weight"), C)}
     if kind == "conv":
         ip = get(p + "conv2d_in_proj.weight")
@@ -112,20 +107,15 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> 
         w["out"] = pad(get(p + "conv2d_out_proj.weight"), C)
         return w
     qo = q_order()
-    w["q"] = take(get(p + "attn_q.weight"), rope_index(qo))
-    w["k"] = take(get(p + "attn_k.weight"), rope_index(np.arange(KVH)))
-    w["v"] = take(get(p + "attn_v.weight"), plain_index(np.arange(KVH)))
-    w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(qo), 1), C)
-    idx = rope_index(np.zeros(1, np.int64))
+    w["q"] = take(get(p + "attn_q.weight"), rope_index(qo, HD, HP))
+    w["k"] = take(get(p + "attn_k.weight"), rope_index(np.arange(KVH), HD, HP))
+    w["v"] = take(get(p + "attn_v.weight"), plain_index(np.arange(KVH), HD, HP))
+    w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(qo, HD, HP), 1), C)
+    idx = rope_index(np.zeros(1, np.int64), HD, HP)
     for n, s in (("qn", QSCALE), ("kn", 1.0)):
         nw = f32(get(p + f"attn_{n[0]}_norm.weight")).reshape(-1)
         w[n] = np.where(idx >= 0, nw[np.maximum(idx, 0)], 0).astype(np.float32) * np.float32(s)
     return w
-
-
-def kinds_of(names: object, layers: int) -> tuple[str, ...]:
-    """The layers' kinds ("conv", "attn") of an mmproj's tensor names."""
-    return tuple("conv" if f"v.blk.{il}.conv2d_in_proj.weight" in names else "attn" for il in range(layers))
 
 
 def patch_weights(get: Callable[[str], Wt | np.ndarray], pair: bool = False) -> dict[str, Wt | np.ndarray]:
@@ -135,15 +125,8 @@ def patch_weights(get: Callable[[str], Wt | np.ndarray], pair: bool = False) -> 
     768 (1536; the constant 1) their offset sum_k w_k o (computed at every load); no bias. "eg": the embedding norm's
     weights; "eye": the identity (C rows of K 1024)."""
     w0, w1 = (values(get(n)).astype(np.float64).reshape(H, PIX) for n in ("v.patch_embd.weight", "v.patch_embd.weight.1"))
-    a = 1 / 127.5
-    o = 128 * a - 1
-    if pair:
-        wt = np.zeros((C, KP2), np.float32)
-        wt[:H, :PIX], wt[:H, PIX:2 * PIX], wt[:H, ONE2] = w0 * a, w1 * a, (w0 + w1).sum(1) * o
-    else:
-        wt = np.zeros((C, KP), np.float32)
-        wt[:H, :PIX], wt[:H, ONE] = (w0 + w1) * a, (w0 + w1).sum(1) * o
-    return {"w": computed("lfm3vl.patch2" if pair else "lfm3vl.patch", wt), "eg": vec(get, "v.embedding_norm.weight"),
+    wt = folded_patch([w0, w1], c=C, kp=KP2, one=ONE2) if pair else folded_patch([w0 + w1], c=C, kp=KP, one=ONE)
+    return {"w": computed("lfm3vl.patch2" if pair else "lfm3vl.patch", wt), "eg": vec(get, "v.embedding_norm.weight", C),
             "eye": pad(eye(H), C)}
 
 
@@ -156,9 +139,8 @@ def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...], proj:
     w: dict = {"patch": patch_weights(get), "patch2": patch_weights(get, pair=True), "layers": len(kinds), "proj": proj,
                "kinds": kinds,
                **{il: layer_weights(get, il, k) for il, k in enumerate(kinds)}}
-    w["post_g"], w["post_b"] = vec(get, "mm.input_norm.weight"), vec(get, "mm.input_norm.bias")
-    blocks = np.array([k * H + i if i < H else -1 for k in range(4) for i in range(C)])
-    w["up"] = pad(take(get("mm.0.weight"), blocks, 1), MERGER.FUP)
+    w["post_g"], w["post_b"] = vec(get, "mm.input_norm.weight", C), vec(get, "mm.input_norm.bias", C)
+    w["up"] = pad(blocks4(get("mm.0.weight"), 1, H, C), MERGER.FUP)
     w["up_b"] = pad(f32(get("mm.0.bias")).reshape(-1), MERGER.FUP)
     w["down"] = pad(get("mm.2.weight"), W.out_width(proj), MERGER.FUP)
     w["down_b"] = pad(f32(get("mm.2.bias")).reshape(-1), W.out_width(proj))
@@ -354,14 +336,16 @@ class Net:
 class Encoder(W.WindowEncoder):
     """The encoder (module docstring) as dispatches on a VisionDevice (``windows.WindowEncoder``)."""
 
-    def __init__(self, npu: VisionDevice, w: dict, *, max_bands: int, name: str = "l", state: dict | None = None):
-        """w: ``weights``; max_bands: the largest level; state: a restored device's (``WindowEncoder``)."""
+    def __init__(self, npu: VisionDevice, w: dict, *, max_bands: int, name: str = "l", state: dict | None = None,
+                 store: ProgramStore | None = None):
+        """w: ``weights``; max_bands: the largest level; state: a restored device's, store: where the later programs are
+        kept (``WindowEncoder``)."""
         self.kinds = w["kinds"]
         self.gmax = W.conv_ddr_bytes(max_bands)
         npu.alloc(f"{name}.g", self.gmax)  # (the conv input of the largest level, before any program)
         kvb = kv_bytes(level(max_bands), Keys("", joint=True, dense=True, kv_heads=KVH))
         self.net = Net(w, W.Names(name), 0)
-        super().__init__(npu, w, max_bands=max_bands, name=name, state=state, kv_bytes=kvb)
+        super().__init__(npu, w, max_bands=max_bands, name=name, state=state, store=store, kv_bytes=kvb)
 
     def patch_embed(self, bd: Builder, nb: int, pair: bool = False) -> None:
         self.net.kv = self.kv
@@ -376,11 +360,8 @@ class Encoder(W.WindowEncoder):
         W.merger(bd, self.w, self.nm, nb, self.nl, MERGER)
 
     def layers_per_piece(self, nb: int) -> int:
-        """Layers of a dispatch at nb bands: all at nb 1, else at most PIECE_BAND_LAYERS band-layers (its build time)
-        and about PIECE_MS (a layer ~0.7 nb + 0.05 nb^2 ms: its GEMMs, its attention over every key)."""
-        if nb == 1:
-            return self.nl
-        return max(1, min(self.nl, PIECE_BAND_LAYERS // nb, int(PIECE_MS / (0.7 * nb + 0.05 * nb * nb))))
+        """Layers of a dispatch at nb bands (``windows.piece_layers``)."""
+        return W.piece_layers(nb, self.nl, PIECE_COST)
 
     def _runs(self, nb: int) -> list[tuple[int, int]]:
         """(the leading conv layers, then runs of whole [attention, conv] pairs: pieces of one kind pattern)"""

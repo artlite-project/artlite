@@ -18,6 +18,7 @@ from artlite.vision.build import TBIAS, Builder, Level
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
 from artlite.vision.ops import Attention
+from artlite.vision.program import Program
 
 from .level64 import LV64, PImage, conv_in64, conv_out64, down64, latent_panels, noise, resnet64, resnet_cat64, up64
 from .unet import CTX_KEYS, outer, skip_bands, transformer_bands
@@ -61,49 +62,47 @@ class UNet:
     PREFIXES = [f"down_blocks.{i}.attentions.{j}." for i in range(3) for j in range(2)] + ["mid_block.attentions.0."] + \
         [f"up_blocks.{i}.attentions.{j}." for i in (1, 2, 3) for j in range(3)]
 
-    def __init__(self, npu: VisionDevice, w: dict, *, eps: float, runtime: dict | None = None):
-        """w: the weights by diffusers name (``weights.safetensors``' or tensors); runtime: the host's (``RUNTIME``,
-        tensors; default w)."""
-        self.npu, self.w = npu, w if runtime is None else runtime
-        bd = self.bd = Builder(npu)
-        lat = self.lat = PImage(64, "lat")
+    def __init__(self, npu: VisionDevice, runtime: dict, *, program: Program, lat: PImage, tb_used: int,
+                 tb_hooks: list, bd: Builder | None = None):
+        """runtime: the host's weights (``RUNTIME``, tensors); program, lat, tb_used, tb_hooks: ``build``'s, or a
+        ``state()``'s on a device whose images were restored (``VisionDevice.restore``); bd: the build's builder."""
+        self.npu, self.w, self.bd = npu, runtime, bd
+        self.program, self.lat, self.tb_used, self.tb_hooks = program, lat, tb_used, tb_hooks
+        self.tr: Transaction | None = None
+
+    @classmethod
+    def build(cls, npu: VisionDevice, w: dict, *, eps: float, runtime: dict | None = None) -> "UNet":
+        """The step's program built over the weights ``w`` (by diffusers name: ``weights.safetensors``' or tensors);
+        runtime: the host's (``RUNTIME``, tensors; default w)."""
+        bd = Builder(npu)
+        rt = w if runtime is None else runtime
+        lat = PImage(64, "lat")
         bd.ddr(lat.name, COLS * lat.colbytes)  # (zeros: per step only its first kb written)
         lv32 = Level(32, 2)
         kv = {16: bd.ddr("kv_self", 16 * Level(16).np * 2 * D.Q),
               32: bd.ddr("kv_self32", Attention(np=lv32.np, q=0, o=0, kv=0, d=80, nbands=lv32.nb).kv_bytes()),
               64: bd.ddr("kv_self64", Attention(np=LV64.np, q=0, o=0, kv=0, d=40, nbands=LV64.nb).kv_bytes())}
-        ctx_kv = {p: bd.image(p + "ctx", np.zeros(len(self._ctx(p, np.zeros((2, CTX_KEYS, 768), np.float32))), np.uint8))
-                  for p in self.PREFIXES}
+        zeros = np.zeros((2, CTX_KEYS, 768), np.float32)
+        ctx_kv = {p: bd.image(p + "ctx", np.zeros(len(cls._ctx(rt, p, zeros)), np.uint8)) for p in cls.PREFIXES}
         zero = {p[:-len("time_emb_proj.weight")]: np.zeros(w[p].shape[0], np.float32) for p in w if p.endswith("time_emb_proj.weight")}
         unet(bd, w, lat, biases=zero, ctx_kv=ctx_kv, kv=kv, eps=eps)
-        self.words = bd.finish()
-        self.tr = None
-        self.tb_used, self.tb_hooks = bd.tb_used, bd.tb_hooks
-        self.addrs, self.built = bd.s.t.addrs, bd.built()
+        return cls(npu, rt, program=Program.of(npu, bd), lat=lat, tb_used=bd.tb_used,
+                   tb_hooks=bd.tb_hooks, bd=bd)
 
     # (the host's weights at run time: the time embedding, the resnets' time projections and conv1 biases, the cross
     # attentions' K / V projections: ``host.resnet_time_biases``, ``set_time``, ``set_context``)
     RUNTIME = ("time_embedding.", "time_emb_proj.", "conv1.bias", "attn2.to_k.weight", "attn2.to_v.weight")
 
     def state(self) -> dict:
-        """What ``restored`` needs besides the device's images: the transaction (its shim addresses as relocations),
-        the latents' image, the time biases' places."""
-        return {"words": self.words, "rel": self.npu.relocations(self.addrs), "lat": self.lat, "tb_used": self.tb_used,
-                "tb_hooks": self.tb_hooks}
+        """What the constructor takes besides the device and the runtime weights: the program, the latents' image, the
+        time biases' places."""
+        return {"program": self.program, "lat": self.lat, "tb_used": self.tb_used, "tb_hooks": self.tb_hooks}
 
-    @classmethod
-    def restored(cls, npu: VisionDevice, w: dict, state: dict) -> "UNet":
-        """A UNet of ``state()`` on a device whose images were restored (``VisionDevice.restore``); w: the RUNTIME
-        weights."""
-        net = cls.__new__(cls)
-        net.npu, net.w, net.tr = npu, w, None
-        net.words = npu.relocate(state["words"], state["rel"])
-        net.lat, net.tb_used, net.tb_hooks = state["lat"], state["tb_used"], state["tb_hooks"]
-        return net
-
-    def _ctx(self, p: str, ctx: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _ctx(w: dict, p: str, ctx: np.ndarray) -> np.ndarray:
+        """Attention ``p``'s K / V^T slots of the context ctx (w: the runtime weights)."""
         a = p + "transformer_blocks.0.attn2."
-        wk, wv = self.w[a + "to_k.weight"], self.w[a + "to_v.weight"]
+        wk, wv = w[a + "to_k.weight"], w[a + "to_v.weight"]
         return L.kv_slots(ctx @ wk.T, ctx @ wv.T, d=wk.shape[0] // 8)
 
     def set_time(self, biases: dict[str, np.ndarray]) -> None:
@@ -116,13 +115,14 @@ class UNet:
 
     def set_context(self, ctx: np.ndarray, pool: Executor | None = None) -> None:
         """The cross-attentions' K / V^T slots of the text context (2 images, 77, 768) (pool: computed on its threads)."""
-        for p, v in zip(self.PREFIXES, (pool.map if pool else map)(lambda p: self._ctx(p, ctx), self.PREFIXES), strict=True):
+        slots = (pool.map if pool else map)(lambda p: self._ctx(self.w, p, ctx), self.PREFIXES)
+        for p, v in zip(self.PREFIXES, slots, strict=True):
             self.npu.write(p + "ctx", v)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         for c, p in enumerate(latent_panels(x)):
             self.npu.write(self.lat.name, p, c * self.lat.colbytes)
         if self.tr is None:
-            self.tr = Transaction(self.npu.dev, self.words)
+            self.tr = self.program.transaction(self.npu)
         self.npu.run(self.tr)
         return noise(self.npu.read("out"))

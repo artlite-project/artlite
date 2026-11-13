@@ -39,7 +39,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -51,11 +51,25 @@ from .build import Builder
 from .device import VisionDevice
 from .layers import Tensor, alloc, free, gelu_table, gemm
 from .ops import _dims
+from .program import Program, ProgramStore
 from .vit import ln, vit_level, xfer
 
 WIN = 128  # (windows of a band: 8 columns x 2 halves x 8 lanes)
 GW_MAX = 1024  # (an image's windows per row at most: 4096 merged tokens at transformers' aspect bound of 200)
 MARGIN = GW_MAX + 2  # (windows of the conv input's margins)
+TOKEN_PX = 32  # (a merged token's pixels per side: patches of 16, merged 2 x 2)
+PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx) of 3 x 16 x 16; the constant input 1, a bfp16 block of
+# its own; the panels' K: whole k-tiles)
+PIECE_BAND_LAYERS = 16  # (a piece's band-layers at most: its build time)
+PIECE_MS = 500.0  # (a dispatch's estimated time at most)
+
+
+def piece_layers(nb: int, layers: int, cost: tuple[float, float]) -> int:
+    """Layers of a dispatch at nb bands: all at nb 1, else at most PIECE_BAND_LAYERS band-layers and about PIECE_MS
+    (a layer ~ a nb + b nb^2 ms for ``cost`` (a, b): its GEMMs and its attention over every key)."""
+    if nb == 1:
+        return layers
+    return max(1, min(layers, PIECE_BAND_LAYERS // nb, int(PIECE_MS / (cost[0] * nb + cost[1] * nb * nb))))
 
 
 @dataclass(frozen=True)
@@ -246,16 +260,12 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
 
 
 @dataclass
-class Piece:
-    """A dispatch of a program: its transaction words, their shim addresses by image (``VisionDevice.refs``), the
-    layers it runs (a piece of layers: ``count`` built from layer ``start``, run at another layer by ``Names.rename``;
-    else None), its tagged shim addresses ([word, image, offset, tag]: ``WindowEncoder.shifts``)."""
+class Piece(Program):
+    """A dispatch of a window encoder's program: the layers it runs (a piece of layers: ``layers`` built from layer
+    ``start``, run at another layer by ``Names.rename``; else None)."""
 
-    words: np.ndarray
-    refs: tuple
     layers: int | None = None
     start: int = 0
-    tags: list = field(default_factory=list)
 
 
 class WindowEncoder:
@@ -270,11 +280,12 @@ class WindowEncoder:
     PATCH = 16
 
     def __init__(self, npu: VisionDevice, w: dict, *, max_bands: int, name: str, state: dict | None = None,
-                 kv_bytes: int = 0):
+                 store: ProgramStore | None = None, kv_bytes: int = 0):
         """w: the network's weights (``w["layers"]``: its layer count, ``w["proj"]``: the embeddings' width, ``w["down"]``:
         mm.2's padded rows); max_bands: the largest level (the K / V^T slots' DDR, ``kv_bytes``, allocated first);
         state: a ``state()`` on a device whose images were restored (``VisionDevice.restore``: its programs taken, new
-        ones built over the images as they are)."""
+        ones built over the images as they are); store: where the programs built later are kept (``program``: those
+        of the cached state's images only)."""
         self.npu, self.w, self.nm = npu, w, Names(name)
         self.nl, self.proj, self.outw = w["layers"], w["proj"], w["down"].shape[0]
         self.bd = Builder(npu, reuse=state is not None)
@@ -284,8 +295,7 @@ class WindowEncoder:
             self.bd.ddr(self.nm.attn(nb), 5760)
         # (programs by nb; a video's pairs' by ("pair", nb))
         self.programs: dict[int | tuple[str, int], list[Piece]] = {} if state is None else dict(state["programs"])
-        self.built: Callable[[int | tuple[str, int], list[Piece], bool], None] | None = None  # (a new program's hook: a
-        # cache's; the bool: it takes only images of the cached state, ``state``)
+        self.store = store
         self._kept: set[str] | None = set(npu._images) if state is not None else None  # (the cached state's images)
         self.tr: dict[tuple, Transaction] = {}  # (by (program key, piece): a pair's shared pieces the image's)
         self._inputs: OrderedDict[Layout, dict[str, np.ndarray]] = OrderedDict()
@@ -324,16 +334,6 @@ class WindowEncoder:
         self._kept = set(self.npu._images)
         return {"programs": dict(self.programs)}
 
-    def _piece(self, build: Callable[[Builder], None], nlayers: int | None = None, start: int = 0) -> Piece:
-        b = self.bd.fork()
-        build(b)
-        words = b.finish()
-        tags = []
-        if b.s.tags:  # (each tagged address's image and offset at build time)
-            refs = self.npu.refs([(i, int(words[i]) | int(words[i + 1]) << 32) for i, _ in b.s.tags])
-            tags = [(int(i), refs[1][k], int(off), tag) for (i, tag), (k, off) in zip(b.s.tags, refs[2], strict=True)]
-        return Piece(words, self.npu.refs(b.s.t.addrs), nlayers, start, tags)
-
     def _runs(self, nb: int) -> list[tuple[int, int]]:
         """The pieces of layers of nb bands (``layers_per_piece``): (first layer, count), each built from the first
         run of its kinds."""
@@ -359,22 +359,22 @@ class WindowEncoder:
                 embed(b, 1)
                 self.layers(b, 1, range(self.nl))
                 self.final(b, 1)
-            out = [self._piece(full)]
+            out = [Piece.build(self.npu, self.bd, full)]
         elif pair:
-            out = [self._piece(lambda b: embed(b, nb)), *self.program(nb)[1:]]
+            out = [Piece.build(self.npu, self.bd, lambda b: embed(b, nb)), *self.program(nb)[1:]]
         else:
-            out = [self._piece(lambda b: self.patch_embed(b, nb))]
+            out = [Piece.build(self.npu, self.bd, lambda b: self.patch_embed(b, nb))]
             built: dict[tuple, int] = {}
             for s, n in self._runs(nb):
                 key = tuple(self.kinds[s:s + n]) if self.kinds else (n,)
                 if key not in built:
                     built[key] = len(out)
-                    out.append(self._piece(lambda b, s=s, n=n: self.layers(b, nb, range(s, s + n)), n, s))
-            out.append(self._piece(lambda b: self.final(b, nb)))
+                    out.append(Piece.build(self.npu, self.bd, lambda b, s=s, n=n: self.layers(b, nb, range(s, s + n)),
+                                           layers=n, start=s))
+            out.append(Piece.build(self.npu, self.bd, lambda b: self.final(b, nb)))
         self.programs[pkey] = out
-        if self.built:
-            names = {n for pc in out for n in pc.refs[1]} | {t[1] for pc in out for t in pc.tags}
-            self.built(pkey, out, self._kept is not None and names <= self._kept)
+        if self.store is not None:
+            self.store.save(pkey, out, self._kept is not None and set().union(*(pc.images for pc in out)) <= self._kept)
         return out
 
     def schedule(self, nb: int, pair: bool = False) -> list[tuple[int, int]]:
@@ -401,17 +401,13 @@ class WindowEncoder:
         pc = self.program(nb, pair)[i]
         key = (("pair", nb) if pair and (nb == 1 or i == 0) else nb, i)
         if key not in self.tr:
-            words = pc.words.copy()
-            self.npu.resolve(words, pc.refs, lambda n: n)
-            self.tr[key] = Transaction(self.npu.dev, words)
+            self.tr[key] = pc.transaction(self.npu)
         tr = self.tr[key]
         want = (at, (lay.gh, lay.gw) if pc.tags else None)
         if self._at.get(key) != want:
             if pc.layers is not None:
                 self.npu.resolve(tr.words, pc.refs, self.nm.rename(at - pc.start))
-            for idx, name, off, tag in pc.tags:
-                a = self.npu.address(name, off) + self.shift(tag, lay)
-                tr.words[idx], tr.words[idx + 1] = a & 0xFFFFFFFF, a >> 32
+            pc.retarget(self.npu, tr, lambda tag, base: base + self.shift(tag, lay))
             tr.flush()
             self._at[key] = want
         return tr
@@ -452,12 +448,13 @@ class WindowEncoder:
         return False
 
     def __call__(self, px: np.ndarray, two: bool = False) -> np.ndarray:
-        """An image's pixels (uint8 (H, W, 3), multiples of 32) or a video's pair of frames ((2, H, W, 3)) -> its
+        """An image's pixels (uint8 (H, W, 3), multiples of ``TOKEN_PX``) or a video's pair of frames ((2, H, W, 3)) ->
+        its
         embeddings (H / 32 W / 32, proj) in raster order; ``two``: two of them of one size (px stacked; ``packs``) in
         one run -> (2, H / 32 W / 32, proj)."""
         pair = px.ndim == 4 + two
-        lay = Layout(px.shape[-3] // 32, px.shape[-2] // 32, two)
-        assert lay.gh * 32 == px.shape[-3] and lay.gw * 32 == px.shape[-2], px.shape
+        lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
+        assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape
         with ThreadPoolExecutor(1) as pool:  # (the inputs while the program builds, on first use)
             host = pool.submit(self.inputs, lay, px)
             plan = self.schedule(lay.nb, pair)
@@ -476,8 +473,8 @@ class WindowEncoder:
             if x is None:
                 return None
             px, two = x
-            lay = Layout(px.shape[-3] // 32, px.shape[-2] // 32, two)
-            assert lay.gh * 32 == px.shape[-3] and lay.gw * 32 == px.shape[-2], px.shape
+            lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
+            assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape
             return px.ndim == 4 + two, lay, self.inputs(lay, px)
         it = iter(items)
         done = None

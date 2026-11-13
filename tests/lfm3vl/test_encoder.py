@@ -17,7 +17,7 @@ from artlite.vision import layout as L
 from artlite.vision import windows as W
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import alloc
-from artlite.vision.vit import Bands, ln_records
+from artlite.vision.vit import Bands, kinds_of, ln_records
 from artlite.vision.weights import gguf_getter
 from models.lfm3vl import encoder as E
 from models.lfm3vl import host as Q
@@ -35,7 +35,7 @@ def mm() -> tuple:
     require(MMPROJ)
     g = GGUFFile(MMPROJ)
     clip = ClipConfig.from_gguf(g)
-    return gguf_getter(g), clip, E.kinds_of(g.tensor_info, clip.layers)
+    return gguf_getter(g), clip, kinds_of(g.tensor_info, clip.layers, E.CONV_PROBE)
 
 
 def _pixels(w: int, h: int) -> np.ndarray:

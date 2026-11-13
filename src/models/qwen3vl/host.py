@@ -20,13 +20,15 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from ..sequence import MEDIA, Sequence, splice
+from ..images import TOKEN_PX, marker_prompt, resized
+from ..images import Grid as MergedGrid
+from ..sequence import Sequence
 
 MIN_TOKENS, MAX_TOKENS = 8, 4096  # (an image's merged tokens: llama.cpp's bounds for Qwen-VL)
 IMAGE_PAD = "<|image_pad|>"  # (the chat template's place of an image, between <|vision_start|> and <|vision_end|>)
 
 
-def target_size(width: int, height: int, *, align: int = 32, min_tokens: int = MIN_TOKENS,
+def target_size(width: int, height: int, *, align: int = TOKEN_PX, min_tokens: int = MIN_TOKENS,
                 max_tokens: int = MAX_TOKENS) -> tuple[int, int]:
     """(width, height) of an image's encoder input: multiples of ``align`` (a merged token's pixels per side) of
     between min_tokens and max_tokens tokens at about the image's aspect (module docstring)."""
@@ -46,50 +48,24 @@ def target_size(width: int, height: int, *, align: int = 32, min_tokens: int = M
     return w, h
 
 
-def image_pixels(im: Image.Image, *, align: int = 32, min_tokens: int = MIN_TOKENS,
+def image_pixels(im: Image.Image, *, align: int = TOKEN_PX, min_tokens: int = MIN_TOKENS,
                  max_tokens: int = MAX_TOKENS) -> np.ndarray:
     """An RGB image at its encoder size (``target_size``): uint8 (H, W, 3)."""
-    w, h = target_size(*im.size, align=align, min_tokens=min_tokens, max_tokens=max_tokens)
-    if (w, h) != im.size:
-        im = im.resize((w, h), Image.Resampling.BICUBIC)
-    return np.asarray(im.convert("RGB"), np.uint8)
-
-
-def normalized(pixels: np.ndarray, mean: tuple[float, ...], std: tuple[float, ...]) -> np.ndarray:
-    """uint8 pixels (H, W, 3) -> the encoder's input (3, H, W) float32: (p / 255 - mean) / std (llama.cpp's)."""
-    x = pixels.transpose(2, 0, 1).astype(np.float32) / np.float32(255)
-    return (x - np.float32(mean)[:, None, None]) / np.float32(std)[:, None, None]
+    return resized(im, target_size(*im.size, align=align, min_tokens=min_tokens, max_tokens=max_tokens))
 
 
 @dataclass(frozen=True)
-class Grid:
-    """An image's merged tokens: gh rows of gw."""
-
-    gh: int
-    gw: int
-
-    @property
-    def tokens(self) -> int:
-        return self.gh * self.gw
+class Grid(MergedGrid):
+    """An image's merged tokens: gh rows of gw, at M-RoPE positions."""
 
     def positions(self) -> tuple[np.ndarray, int]:
         """(T, H, W) of the image's tokens (tokens, 3) from position 0, and the position of the text after them."""
         r, c = np.divmod(np.arange(self.tokens, dtype=np.int64), self.gw)
         return np.stack([np.zeros_like(r), r, c], 1), max(self.gh, self.gw)
 
-    def sequence(self, embd: np.ndarray) -> Sequence:
-        """The image's tokens from position 0: the encoder's rows ``embd`` (tokens, hidden; raster order)."""
-        assert embd.shape[0] == self.tokens, (embd.shape, self)
-        pos, nxt = self.positions()
-        n = self.tokens
-        return Sequence(np.full(n, MEDIA, np.int64), np.ones(n, bool), np.ascontiguousarray(embd, np.float32), pos, nxt)
-
 
 def image_prompt(text: str, images: list[object], encode: Callable[[str], list[int]],
                  sequence: Callable[[object], Sequence]) -> Sequence:
-    """A chat prompt's text with the template's ``IMAGE_PAD`` per image -> its tokens: each placeholder becomes the
-    image's tokens (``sequence(image)``: ``Grid.sequence``'s); the template's ``<|vision_start|>`` and
-    ``<|vision_end|>`` around it stay text."""
-    if text.count(IMAGE_PAD) != len(images):
-        raise ValueError(f"{len(images)} image(s) for {text.count(IMAGE_PAD)} place(s) in the prompt")
-    return splice(text, IMAGE_PAD, [sequence(im) for im in images], encode)
+    """A chat prompt's text with the template's ``IMAGE_PAD`` per image -> its tokens (``images.marker_prompt``; the
+    image's tokens: ``Grid.sequence``'s)."""
+    return marker_prompt(text, IMAGE_PAD, images, encode, sequence)

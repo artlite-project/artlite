@@ -25,7 +25,7 @@ from collections.abc import Callable
 import miniaudio
 import numpy as np
 
-from ..sequence import MEDIA, Sequence, splice
+from ..sequence import Sequence, splice
 
 SR, N_FFT, HOP, N_MEL = 16000, 400, 160, 128
 STRIDE = 8  # (mel frames per encoder row)
@@ -219,6 +219,4 @@ def audio_prompt(text: str, clips: list[object], encode: Callable[[str], list[in
 
 def clip_sequence(embd: np.ndarray) -> Sequence:
     """A clip's tokens: the encoder's rows ``embd`` (rows, hidden), a position each."""
-    n = embd.shape[0]
-    pos = np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
-    return Sequence(np.full(n, MEDIA, np.int64), np.ones(n, bool), np.ascontiguousarray(embd, np.float32), pos, n)
+    return Sequence.media(embd)

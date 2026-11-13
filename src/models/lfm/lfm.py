@@ -30,8 +30,7 @@ from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
-from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
-from artlite.vision.weights import sources
+from artlite.vision.shell import shared_device
 
 from .. import video
 from ..lfm3a import host as a_host
@@ -55,21 +54,6 @@ SAMPLING = {"temp": 0.1, "top_k": 50, "penalty_repeat": 1.1}
 # served at; its mmproj's maximum is LFM3-VL's)
 D1_IMAGE_TOKENS = 1600
 KEEP_VIDEOS = 2  # (videos whose sequences are kept)
-
-
-def media_device(mmproj: str, vision: vl_npu.NpuVision, audio: a_npu.NpuAudio) -> VisionDevice:
-    """An mmproj's vision tower and speech networks (LFM3-Omni's: the encoders and the speech generator) built on one
-    vision overlay: one hardware context, and an image and a clip run back to back without a switch. Their built state
-    is cached together, keyed by the mmproj (``artlite.vision.device.state_dir``)."""
-    w = {"vision": vision.weights(), "audio": audio.weights()}
-    cache = state_dir("lfm3omni", mmproj, vl_npu.SOURCES + a_npu.SOURCES, [mmproj])
-    npu, st = load_state(cache, sources(w), accept=lambda s: vision.accept(s["vision"]) and audio.accept(s["audio"])) \
-        or (VisionDevice(), None)
-    nets = [vision.build(npu, w["vision"], st and st["vision"], cache), *audio.build(npu, w["audio"], st and st["audio"])]
-    if st is None:
-        save_state(cache, npu, [n.bd.built() for n in nets], {"vision": vision.state(), "audio": audio.state()})
-    npu.warm()
-    return npu
 
 
 class NpuLfm(OverlayModel):
@@ -182,7 +166,7 @@ class Lfm(Model):
     "video": a file or its bytes}``, ``video_sequence``) and / or a speech encoder (audio clips in prompts: LFM3-Audio's,
     ``models.lfm3a.npu.NpuAudio``; a message's parts ``{"type": "audio", "audio": a file, its bytes or 16 kHz samples}``,
     OpenAI's ``input_audio`` and ``audio_url`` ones); both (LFM3-Omni's mmproj, which also holds the speech generator)
-    on one device (``media_device``), a video heard with its soundtrack. Text replies (``sampling``)
+    on one device (``artlite.vision.shell.shared_device``), a video heard with its soundtrack. Text replies (``sampling``)
     never open speech: the openers ``<|audio_start|>`` / ``<|mixed_start|>`` are banned (``host.TEXT_ONLY_BANNED``:
     transformers' generation mode "text", llama.cpp's logit bias); ``voice_reply`` lets a model that speaks speak."""
 
@@ -224,7 +208,7 @@ class Lfm(Model):
                 self.vision = vl_npu.NpuVision(mmproj, min_tokens=image_min_tokens, max_tokens=image_max_tokens,
                                                load=self.audio is None)
             if self.vision is not None and self.audio is not None:
-                media_device(mmproj, self.vision, self.audio)
+                shared_device("lfm3omni", mmproj, {"vision": self.vision, "audio": self.audio})
 
     @property
     def capabilities(self) -> Capabilities:

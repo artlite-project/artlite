@@ -117,3 +117,20 @@ def test_regular(videos: str) -> None:
             size = (plan.width, plan.height)
             fast = VD.frames(data, info, plan.indices, size)
             assert np.array_equal(fast, VD.frames(data, dataclasses.replace(info, regular=False), plan.indices, size))
+
+
+def test_frames_errors(videos: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Data ffmpeg cannot read is a VideoError with its message (its error pipe drained meanwhile), and a constructor that
+    fails after ffmpeg started leaves no process behind."""
+    data = VD.read(video_file(videos, "short"))
+    info = VD.probe(data)
+    with pytest.raises(VD.VideoError, match="decoded no frame: .*Invalid data"), \
+            VD.Frames(b"not a video" * 100, info, [0, 1], (200, 120)) as fr:
+        list(fr)
+    started = []
+    real = subprocess.Popen
+    monkeypatch.setattr(VD.subprocess, "Popen", lambda *a, **kw: started.append(real(*a, **kw)) or started[-1])
+    monkeypatch.setattr(VD, "widen_pipe", lambda *a: (_ for _ in ()).throw(OSError("pipe")))
+    with pytest.raises(OSError, match="pipe"):
+        VD.Frames(data, info, [0, 1], (200, 120))
+    assert len(started) == 1 and started[0].poll() is not None

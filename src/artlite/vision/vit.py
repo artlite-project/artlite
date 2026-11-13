@@ -28,7 +28,7 @@ not help.
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,7 +39,7 @@ from .build import Builder, Level
 from .layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 from .ops import Apply, Attention, Gemm
 from .seq import ColOps, MemTask
-from .weights import Wt, pad_index, take
+from .weights import Wt, pad_index, take, values
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
 FFN_REAL, FFN = 4304, 4480
@@ -78,7 +78,7 @@ class Vit:
 
     def head_rows(self) -> np.ndarray:
         """``pad_heads``' rows: per head its HD dims, then zeros to HP."""
-        return np.array([h * self.HD + d if d < self.HD else -1 for h in range(self.HEADS) for d in range(self.HP)])
+        return plain_index(range(self.HEADS), self.HD, self.HP)
 
 
 VIT = Vit()
@@ -146,6 +146,59 @@ def pad(w: Wt | np.ndarray, rows: int, cols: int = 0) -> Wt | np.ndarray:
     """w's rows (and columns) zero-padded to rows (cols)."""
     out = take(w, pad_index(rows, w.shape[0]))
     return take(out, pad_index(cols, w.shape[1]), 1) if cols else out
+
+
+# -- views of a network's weights (the tensors' rows, columns and channels in the overlay's layouts)
+
+def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int) -> np.ndarray:
+    """A vector of the file (a norm's weights, a bias), zero-padded to n."""
+    return pad(values(get(name)).reshape(-1), n)
+
+
+def kinds_of(names: object, layers: int, probe: str) -> tuple[str, ...]:
+    """The layers' kinds ("conv", "attn") of an mmproj's tensor names: a layer il is a conv layer where the tensor
+    ``probe.format(il=il)`` is there."""
+    return tuple("conv" if probe.format(il=il) in names else "attn" for il in range(layers))
+
+
+def blocks4(v: Wt | np.ndarray, axis: int, h: int, c: int) -> Wt | np.ndarray:
+    """A merged token's 4 x h channels (along axis: 0, a vector's or a matrix's rows; 1, a matrix's columns) -> 4 x c
+    (each source's padded)."""
+    return take(v, np.array([k * h + i if i < h else -1 for k in range(4) for i in range(c)]), axis)
+
+
+def plain_index(heads: Iterable[int], hd: int, hp: int) -> np.ndarray:
+    """Rows (or columns) of ``heads`` heads of hp from the file's heads of hd: each head's hd, then zeros (-1)."""
+    j = np.arange(hp)
+    return np.concatenate([np.where(j < hd, h * hd + j, -1) for h in heads])
+
+
+def rope_index(heads: Iterable[int], hd: int, hp: int) -> np.ndarray:
+    """Rows of ``heads`` heads of hp for a RoPE epilogue from the file's heads of hd: the pairs (k, hd / 2 + k) of a
+    head at k and hp / 2 + k, zeros (-1) elsewhere."""
+    j = np.arange(hp)
+    d = np.where(j < hp // 2, j, j - hp // 2 + hd // 2)
+    ok = (j % (hp // 2)) < hd // 2
+    return np.concatenate([np.where(ok, h * hd + d, -1) for h in heads])
+
+
+FOLD_A = 1 / 127.5  # (the patch embedding's pixels: x = (p / 255 - 0.5) / 0.5 = FOLD_A q + FOLD_O of q = p - 128)
+FOLD_O = 128 * FOLD_A - 1
+
+
+def folded_patch(kernels: list[np.ndarray], *, c: int, kp: int, one: int) -> np.ndarray:
+    """The patch embedding's operand (c, kp) float32 for integer panels (q = p - 128) of pixels normalized by 0.5 / 0.5:
+    ``kernels`` (float64 (rows, inputs): the temporal kernels, each on its own frame's inputs) at their inputs times
+    ``FOLD_A``, and at input ``one`` (the constant 1) the sum of the kernels' rows times ``FOLD_O``."""
+    total = kernels[0]
+    for k in kernels[1:]:
+        total = total + k
+    rows, pix = kernels[0].shape
+    wt = np.zeros((c, kp), np.float32)
+    for i, k in enumerate(kernels):
+        wt[:rows, i * pix:(i + 1) * pix] = k * FOLD_A
+    wt[:rows, one] = total.sum(1) * FOLD_O
+    return wt
 
 
 def ln_records(bd: Builder, x: Tensor, *, name: str, C: int = C) -> int:

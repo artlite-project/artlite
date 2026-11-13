@@ -150,15 +150,13 @@ def fake_npu() -> Iterator[Callable[[object], _Log]]:
         yield attach
 
 
-MEDIA = ("qwen3vl", "minicpmv", "lfm3vl", "lfm3a")  # (the media models' packages: their npu.py's state cache)
-
-
 @contextlib.contextmanager
 def fake_vision() -> Iterator[_Log]:
     """Within: the vision overlay's devices on one fake device, the log of their dispatches. The vision design compiles
     for real (a cached build: its role pages link from it), only its program is a stand-in; the media models' state
     caches neither restore nor save (every run builds its programs); their weights pack as usual."""
     from artlite.vision import device as vision_device
+    from artlite.vision import shell
 
     real = vision_device.OverlayDevice
     dev, log = _Device(), _Log()
@@ -173,10 +171,8 @@ def fake_vision() -> Iterator[_Log]:
         for name, value in (("turn_enter", lambda: None), ("turn_leave", lambda: None), ("turn_foreign", lambda: 0)):
             stack.enter_context(mock.patch.object(_native, name, value))
         stack.enter_context(mock.patch.object(vision_device, "OverlayDevice", overlay_device))
-        for pkg in MEDIA:
-            npu = importlib.import_module(f"models.{pkg}.npu")
-            stack.enter_context(mock.patch.object(npu, "load_state", lambda *a, **kw: None))
-            stack.enter_context(mock.patch.object(npu, "save_state", lambda *a, **kw: None))
+        for name in ("load_state", "save_state"):
+            stack.enter_context(mock.patch.object(shell, name, lambda *a, **kw: None))
         yield log
 
 

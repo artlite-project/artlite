@@ -40,18 +40,19 @@ from collections.abc import Callable
 import numpy as np
 
 from artlite.operators.design import COLS, ROWS
-from artlite.overlay import Transaction
 from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm, silu_table
 from artlite.vision.ops import ROPE2_TAB, Gemm, StripConv, WinAttention
+from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask
-from artlite.vision.vit import ln, pad, vit_level
+from artlite.vision.vit import ln, pad, plain_index, vec, vit_level
 from artlite.vision.weights import Wt, cat, eye, take, values
 
 H, C, FFN_REAL, FFN, HEADS, KVH, HD, HP = 512, 640, 2304, 2560, 8, 2, 64, 160
+LAYERS = 8  # (the codec's transformer layers)
 NBINS, NOUT, OUT_W = 641, 1282, 1600  # (STFT bins; the outputs, padded)
 EPS, THETA = 1e-5, 1e6
 WINDOW, NTAP = 30, 7
@@ -83,22 +84,12 @@ def fsq(codes: np.ndarray) -> np.ndarray:
 # -- weights
 
 
-def vec(get: Callable[[str], Wt | np.ndarray], name: str, n: int = C) -> np.ndarray:
-    return pad(values(get(name)).reshape(-1), n)
-
-
 def rope2_rows(heads: np.ndarray) -> np.ndarray:
     """Rows of heads of 160 in rope2's layout (pairs (i, 32 + i) of 64 dims at (i, 40 + i), the rest zero) from HF's
     heads ``heads`` of 64 (-1: a pad)."""
     j = np.full(HP, -1)
     j[:32], j[40:72] = np.arange(32), 32 + np.arange(32)
     return np.concatenate([np.where(j >= 0, h * HD + j, -1) for h in heads])
-
-
-def plain_rows(heads: np.ndarray) -> np.ndarray:
-    """Rows (V) or columns (O) of heads of 160: HF head h's 64, then zeros."""
-    j = np.arange(HP)
-    return np.concatenate([np.where(j < HD, h * HD + j, -1) for h in heads])
 
 
 def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> dict:
@@ -108,8 +99,8 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> 
     padded to 320, times -log2 e), "o" (columns by head: K 1280), "qn" / "kn" (rope2's 160 norm weights, q's times
     log2 e / 8)."""
     p = f"a.gen.wav.tfm.blk.{il}."
-    w: dict = {"kind": kind, "ln1": vec(get, p + "ln1.weight"), "ln2": vec(get, p + "ln2.weight"),
-               "post1": vec(get, p + "attn_post_norm.weight"), "post2": vec(get, p + "ffn_post_norm.weight")}
+    w: dict = {"kind": kind, "ln1": vec(get, p + "ln1.weight", C), "ln2": vec(get, p + "ln2.weight", C),
+               "post1": vec(get, p + "attn_post_norm.weight", C), "post2": vec(get, p + "ffn_post_norm.weight", C)}
     up, gt = pad(get(p + "ffn_up.weight"), FFN), pad(get(p + "ffn_gate.weight"), FFN)
     w["gu"] = [cat([up[1280 * k:1280 * (k + 1)], gt[1280 * k:1280 * (k + 1)]]) for k in range(2)]
     w["down"] = pad(get(p + "ffn_down.weight"), C)
@@ -125,9 +116,9 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> 
     kv = np.repeat(np.arange(KVH), ROWS // KVH)
     w["q"] = take(get(p + "attn_q.weight"), rope2_rows(np.arange(HEADS)))
     w["k"] = take(get(p + "attn_k.weight"), rope2_rows(kv))
-    w["v"] = take(get(p + "attn_v.weight"), plain_rows(kv))
+    w["v"] = take(get(p + "attn_v.weight"), plain_index(kv, HD, HP))
     w["g"] = pad(get(p + "attn_gate.weight"), 320) * -1.4426950408889634
-    w["o"] = pad(take(get(p + "attn_out.weight"), plain_rows(np.arange(HEADS)), 1), C)
+    w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(np.arange(HEADS), HD, HP), 1), C)
     idx = rope2_rows(np.zeros(1, np.int64))
     for n, s in (("qn", QSCALE), ("kn", 1.0)):
         nw = values(get(p + f"attn_{n[0]}_norm.weight")).astype(np.float32).reshape(-1)
@@ -135,8 +126,7 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int, kind: str) -> 
     return w
 
 
-def kinds_of(names: object, layers: int) -> tuple[str, ...]:
-    return tuple("conv" if f"a.gen.wav.tfm.blk.{il}.conv_dw.weight" in names else "attn" for il in range(layers))
+CONV_PROBE = "a.gen.wav.tfm.blk.{il}.conv_dw.weight"  # (a conv layer's tensor: ``vit.kinds_of``)
 
 
 def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...]) -> dict:
@@ -145,9 +135,9 @@ def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...]) -> di
     norm), "out" / "out_b" (rows padded to 1600), "eye" (C rows of K 512)."""
     w1 = get("a.gen.wav.quant.first.out_proj.weight")
     w: dict = {"kinds": kinds, "q1": pad(cat([w1, w1], 1), 320), "q1_b": vec(get, "a.gen.wav.quant.first.out_proj.bias", 320),
-               "in": pad(get("a.gen.wav.tfm.in_proj.weight"), C), "in_b": vec(get, "a.gen.wav.tfm.in_proj.bias"),
+               "in": pad(get("a.gen.wav.tfm.in_proj.weight"), C), "in_b": vec(get, "a.gen.wav.tfm.in_proj.bias", C),
                **{il: layer_weights(get, il, k) for il, k in enumerate(kinds)}}
-    w["on"] = vec(get, "a.gen.wav.tfm.output_norm.weight")
+    w["on"] = vec(get, "a.gen.wav.tfm.output_norm.weight", C)
     w["out"] = pad(get("a.gen.wav.tfm.out_proj.weight"), OUT_W)
     w["out_b"] = vec(get, "a.gen.wav.tfm.out_proj.bias", OUT_W)
     w["eye"] = pad(eye(H), C)
@@ -396,24 +386,14 @@ class Codec:
         self.npu, self.w, self.p = npu, w, name
         self.net = Net(w, name)
         self.bd = Builder(npu, reuse=state is not None)
-        self.pieces = dict(state["pieces"]) if state else {"band": self._piece(self.net.band),
-                                                           "carry": self._piece(self.net.carry)}
-        self.band_tr, self.carry_tr = (self._transaction(self.pieces[k]) for k in ("band", "carry"))
+        self.programs = dict(state["programs"]) if state else {"band": Program.build(npu, self.bd, self.net.band),
+                                                               "carry": Program.build(npu, self.bd, self.net.carry)}
+        self.band_tr, self.carry_tr = (self.programs[k].transaction(npu) for k in ("band", "carry"))
         self.reset()
 
-    def _piece(self, build: Callable[[Builder], None]) -> dict:
-        b = self.bd.fork()
-        build(b)
-        words = b.finish()
-        return {"words": words, "refs": self.npu.refs(b.s.t.addrs)}
-
-    def _transaction(self, piece: dict) -> Transaction:
-        words = piece["words"].copy()
-        self.npu.resolve(words, piece["refs"], lambda n: n)
-        return Transaction(self.npu.dev, words)
-
     def state(self) -> dict:
-        return {"pieces": dict(self.pieces)}
+        """What a restored device's codec takes besides its images: the programs."""
+        return {"programs": dict(self.programs)}
 
     def reset(self) -> None:
         """A new stream: its state zero (the conv layers' rows -6 .. -1; the first band's masks keep no key before it)."""

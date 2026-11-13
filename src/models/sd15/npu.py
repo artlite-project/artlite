@@ -15,7 +15,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
-from artlite.vision.device import VisionDevice, load_state, save_state, state_dir
+from artlite.vision.device import VisionDevice, state_dir
+from artlite.vision.shell import attach
 from artlite.vision.weights import Source, safetensors, sources
 
 from .host import resnet_time_biases
@@ -31,7 +32,7 @@ class NpuUNet:
     """The UNet of a diffusers directory's ``unet`` on the NPU: (x (2, 4, 64, 64) scaled, t, context (2, 77, 768))
     -> the predicted noise (2, 4, 64, 64)."""
 
-    def __init__(self, directory: str, *, npu: VisionDevice | None = None, state: dict | None = None):
+    def __init__(self, directory: str, *, npu: VisionDevice, state: dict | None = None):
         with open(os.path.join(directory, "config.json")) as f:
             cfg = json.load(f)
         assert cfg["block_out_channels"] == [320, 640, 1280, 1280] and cfg["attention_head_dim"] == 8, \
@@ -39,10 +40,9 @@ class NpuUNet:
         path = os.path.join(directory, FILE)
         self.w = load_safetensors(path, contains=UNet.RUNTIME)  # (the host's)
         if state is None:
-            self.net = UNet(npu or VisionDevice(), safetensors(path, tag="unet"), eps=cfg["norm_eps"], runtime=self.w)
-            self.net.npu.warm()
+            self.net = UNet.build(npu, safetensors(path, tag="unet"), eps=cfg["norm_eps"], runtime=self.w)
         else:  # (a restored device's: ``load``)
-            self.net = UNet.restored(npu, self.w, state)
+            self.net = UNet(npu, self.w, **state)
         self.context: np.ndarray | None = None
         self.pool = ThreadPoolExecutor(8)  # (the time biases' projections)
         self.worker = ThreadPoolExecutor(1)  # (the steps' time biases ahead of them: ``prepare``)
@@ -70,20 +70,15 @@ class NpuVae:
     def __init__(self, directory: str, npu: VisionDevice, *, state: dict | None = None):
         if state is None:
             w, scale = vae_weights(directory)
-            self.dec = Decoder(npu, w, scale=scale, eps=EPS)
-            npu.warm()
+            self.dec = Decoder.build(npu, w, scale=scale, eps=EPS)
         else:  # (a restored device's: ``load``)
-            self.dec = Decoder.restored(npu, state)
+            self.dec = Decoder(npu, **state)
 
     def __call__(self, latents: np.ndarray) -> np.ndarray:
         return np.concatenate([self.dec(latents[i:i + 1]) for i in range(latents.shape[0])])
 
 
-# (what the cache's key covers besides the model's files: the code that builds the images and the transactions)
-_SOURCES = ("artlite/vision", "models/sd15/unet.py", "models/sd15/level64.py", "models/sd15/model.py",
-            "models/sd15/vae.py", "artlite/txn.py", "artlite/npu_regs.py", "artlite/operators/bfp16.py",
-            "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
-            "artlite/overlay.py", "models/sd15/npu.py", "models/sd15/weights.py")
+MODULES = ("models.sd15.npu",)  # (the modules whose code and imports build the cached state: ``device.state_dir``)
 
 
 def vae_weights(directory: str) -> tuple[dict, float]:
@@ -105,19 +100,17 @@ def weight_sources(path: str) -> dict[str, Source]:
 
 def load(path: str) -> tuple[NpuUNet, NpuVae]:
     """A diffusers directory's UNet and VAE decoder on one NPU device: restored from the cache
-    (``artlite.vision.device.state_dir``: the device's layout, the commands and tables the builds wrote, the
-    transactions with their shim addresses relocated; keyed by the model's files and the code; the weights packed from
-    the files), else built and cached (one entry per model)."""
+    (``artlite.vision.shell.attach``: the device's layout, the commands and tables the builds wrote, the programs with
+    their shim addresses by image; keyed by the model's files and the code; the weights packed from the files), else
+    built and cached (one entry per model)."""
     files = [os.path.join(path, sub, f) for sub in ("unet", "vae") for f in ("config.json", FILE)]
-    cache = state_dir("sd15", path, _SOURCES, files)
-    if (got := load_state(cache, weight_sources(path))) is not None:
-        npu, st = got
-        unet = NpuUNet(os.path.join(path, "unet"), npu=npu, state=st["unet"])
-        vae = NpuVae(os.path.join(path, "vae"), npu, state=st["vae"])
-        npu.warm()
-        return unet, vae
-    unet = NpuUNet(os.path.join(path, "unet"))
-    npu = unet.net.npu
-    vae = NpuVae(os.path.join(path, "vae"), npu)
-    save_state(cache, npu, [unet.net.built, vae.dec.built], {"unet": unet.net.state(), "vae": vae.dec.state()})
-    return unet, vae
+    nets: dict[str, NpuUNet | NpuVae] = {}
+
+    def build(npu: VisionDevice, st: dict | None) -> list:
+        nets["unet"] = NpuUNet(os.path.join(path, "unet"), npu=npu, state=st and st["unet"])
+        nets["vae"] = NpuVae(os.path.join(path, "vae"), npu, state=st and st["vae"])
+        return [nets["unet"].net, nets["vae"].dec]
+
+    attach(state_dir("sd15", path, MODULES, files), weight_sources(path), build,
+           lambda: {"unet": nets["unet"].net.state(), "vae": nets["vae"].dec.state()})
+    return nets["unet"], nets["vae"]
