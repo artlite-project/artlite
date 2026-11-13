@@ -10,27 +10,15 @@ from pathlib import Path
 import pytest
 
 from artlite import aie2p_isa, gen_isa_tables
-from artlite.measure_ii import SLOTS, slot_of
+from artlite.measure_ii import SLOTS, count_slots, slot_of
 from artlite.operators.base import CLANGPP
-from artlite.variant_search import (
-    POST,
-    Variant,
-    _cli_variants,
-    _region_result,
-    apply_pragma,
-    compiler_drift,
-    count_slots,
-    ii,
-    parse_operator,
-    parse_postpipeliner_log,
-    parse_regions,
-    pragma_lines,
-    pragma_text,
-    print_report,
-    replace_function,
-    search,
-    substitute,
-)
+from artlite.variant_search import search
+from artlite.variant_search.cli import cli_variants, parse_operator
+from artlite.variant_search.npu import parse_regions, region_result
+from artlite.variant_search.patch import POST, apply_pragma, ii, pragma_lines, pragma_text, replace_function, substitute
+from artlite.variant_search.pipeliner_log import compiler_drift, parse_postpipeliner_log
+from artlite.variant_search.report import print_report
+from artlite.variant_search.variants import Variant
 
 SOURCE = """namespace {
 
@@ -344,7 +332,7 @@ def test_cli_parsing(tmp_path: Path) -> None:
         variants=None, pragmas="post,ii44", pragma=[["x", "none"]], sub=[["x", "OLD", "@" + str(tmp_path / "new.cc")]],
         define=[], param=[["y", "nsb=8"], ["y", "win=codes"]], loop=None,
     )
-    variants = _cli_variants(args)
+    variants = cli_variants(args)
     assert [variant.name for variant in variants] == ["base", "post", "ii44", "x", "y"]
     assert variants[3].pragma == "" and variants[3].subs == [("OLD", "NEW\n")]
     assert variants[4].params == {"nsb": 8, "win": "codes"} and variants[4].pragma is None
@@ -364,7 +352,7 @@ def test_counter_windows(tmp_path: Path) -> None:
         events += [{"name": name, "ph": "C", "ts": sample, "pid": 1, "tid": k + 1, "args": {"value": value}}
                    for k, (name, value) in enumerate(zip(labels, values))]
     (tmp_path / "Op_1234_counters.json").write_text(json.dumps(events))
-    region = _region_result(tmp_path)
+    region = region_result(tmp_path)
     assert (region.cycles, region.windows, region.memory_stall, region.lock_stall) == (330, 10, 9, 600)
 
 

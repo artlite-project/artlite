@@ -10,6 +10,7 @@ Trace mode: hardware event streaming to DDR + Chromium JSON conversion.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -159,6 +160,120 @@ def test_counter_limits():
         _parse_counter_specs(",".join([f"{prefix}1:1"] * n))
         with pytest.raises(ValueError, match="at most"):
             _parse_counter_specs(",".join([f"{prefix}1:1"] * (n + 1)))
+
+
+def test_counter_registers():
+    """The register map's counters: addresses and control words, and no address past a module's counters."""
+    from artlite import npu_regs
+
+    assert [npu_regs.CORE.address(i) for i in range(4)] == [0x31520, 0x31524, 0x31528, 0x3152C]
+    assert [npu_regs.MEM.address(i) for i in range(2)] == [0x11020, 0x11024]
+    assert [npu_regs.SHIM.address(i) for i in range(2)] == [0x31020, 0x31024]
+    assert [npu_regs.MEMTILE.address(i) for i in range(4)] == [0x91020, 0x91024, 0x91028, 0x9102C]
+    for module in npu_regs.MODULES.values():
+        for index in (-1, module.max_counters):
+            with pytest.raises(ValueError, match="counters"):
+                module.address(index)
+    assert npu_regs.CORE.ctrl_writes([(33, 34), (26, 26), (1, 1)]) == [
+        (0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24),
+        (0x31504, 1 | 1 << 8),
+    ]
+    assert npu_regs.window_counter_writes() == [
+        (0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24),
+        (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24),
+    ]
+    assert npu_regs.window_counter_writes(stall=23, memory_events=[7, 9])[2:] == [(0x11000, 7 | 7 << 8 | 9 << 16 | 9 << 24)]
+    with pytest.raises(ValueError, match="counters"):
+        npu_regs.MEM.ctrl_writes([(1, 1)] * 3)
+
+
+AIE_RT_PARAMS = Path(__file__).resolve().parents[2] / "mlir-aie/third_party/aie-rt/driver/src/global/xaie2pgbl_params.h"
+
+
+@pytest.mark.skipif(not AIE_RT_PARAMS.exists(), reason="no mlir-aie checkout next to this one")
+def test_counter_registers_match_aie_rt():
+    """The register map is the NPU's (aie-rt's xaie2pgbl_params.h), not AM029's."""
+    from artlite import npu_regs
+
+    text = AIE_RT_PARAMS.read_text()
+
+    def define(name: str) -> int:
+        return int(re.search(rf"#define XAIE2PGBL_{name}\s+(0x[0-9A-Fa-f]+)", text).group(1), 16)
+
+    for module, prefix, ctrl in (
+        (npu_regs.CORE, "CORE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
+        (npu_regs.MEM, "MEMORY_MODULE_PERFORMANCE_", ("CONTROL0",)),
+        (npu_regs.MEMTILE, "MEM_TILE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
+        (npu_regs.SHIM, "PL_MODULE_PERFORMANCE_", ("CTRL0",)),
+    ):
+        assert list(module.ctrl) == [define(prefix + name) for name in ctrl]
+        assert [module.address(i) for i in range(module.max_counters)] == [
+            define(f"{prefix}COUNTER{i}") for i in range(module.max_counters)
+        ]
+
+
+def test_profile_config_from_env():
+    """The configuration is built from the environment once; a malformed value names its variable."""
+    from artlite.profiling import CounterSpec, ProfileConfig, TileSelection
+
+    assert ProfileConfig.from_env({}) is None
+    assert ProfileConfig.from_env({"ARTLITE_PROFILE": "off"}) is None
+    config = ProfileConfig.from_env({"ARTLITE_PROFILE": "1"})
+    assert config.mode == "counters" and config.sample_every == 1 and config.convert
+    assert [tuple(spec) for spec in config.counter_specs] == [("core", 33, 34), ("core", 34, 33), ("core", 33, 33),
+                                                              ("core", 34, 34)]
+    config = ProfileConfig.from_env({
+        "ARTLITE_PROFILE": "trace", "ARTLITE_PROFILE_TRACE_SIZE": "4096", "ARTLITE_PROFILE_TILES": "first:3",
+        "ARTLITE_PROFILE_SAMPLE_EVERY": "0", "ARTLITE_PROFILE_LATERAL": "1", "ARTLITE_PROFILE_CONVERT": "0",
+    })
+    assert (config.mode, config.trace_size, config.trace_tiles.first, config.sample_every) == ("trace", 4096, 3, 1)
+    assert config.trace_lateral and not config.trace_distribute and not config.convert
+    assert TileSelection.parse("0,2;1,3").tiles == frozenset({(0, 2), (1, 3)})
+    for name, value in (("TRACE_SIZE", "4k"), ("SAMPLE_EVERY", "x"), ("TILES", "first:x"), ("TILES", "0;2"),
+                        ("COUNTERS", "1:2:3")):
+        with pytest.raises(ValueError, match=f"ARTLITE_PROFILE_{name}|bad counter pair"):
+            ProfileConfig.from_env({"ARTLITE_PROFILE": "1", f"ARTLITE_PROFILE_{name}": value})
+    with pytest.raises(ValueError, match="at most"):
+        ProfileConfig(mode="counters", out_dir="x", counter_specs=[CounterSpec("mem", 1, 1)] * 3)
+
+
+def test_profile_cache_key():
+    """Every field that is not runtime-only is in the cache key: a new field cannot reuse an unprofiled build."""
+    import dataclasses
+
+    from artlite.profiling import CounterSpec, ProfileConfig, TileSelection
+
+    base = ProfileConfig(mode="trace", out_dir="x")
+    changes = {
+        "mode": "counters", "counter_specs": [CounterSpec("core", 1, 2)], "trace_size": 1, "trace_events": [1],
+        "trace_tiles": TileSelection.parse("first:1"), "trace_lateral": True, "trace_distribute": True,
+    }
+    for field in dataclasses.fields(ProfileConfig):
+        if field.name in ProfileConfig.RUNTIME_FIELDS:
+            continue
+        assert field.name in changes, f"{field.name}: add it to this test"
+        other = dataclasses.replace(base, **{field.name: changes[field.name]})
+        if field.name == "counter_specs":  # (counters mode only)
+            base_c = dataclasses.replace(base, mode="counters")
+            other = dataclasses.replace(base_c, counter_specs=changes[field.name])
+            assert other.cache_key() != base_c.cache_key(), field.name
+        else:
+            assert other.cache_key() != base.cache_key(), field.name
+
+
+def test_instrumented_tiles():
+    """The tiles of a placed design come from its tile and aie.core ops."""
+    from artlite.profiling import CounterSpec, instrumented_tiles_of
+
+    mlir = """%t02 = aie.tile(0, 2)
+    %t12 = aie.tile(1, 2)
+    %t01 = aie.tile(0, 1)
+    %t00 = aie.tile(0, 0)
+    %c = aie.core(%t02) { aie.end }
+    %d = aie.core(%t12) { aie.end }"""
+    specs = [CounterSpec("core", 33, 34), CounterSpec("mt", 1, 1), CounterSpec("sh", 1, 1)]
+    assert instrumented_tiles_of(mlir, specs) == {"core": [(0, 2), (1, 2)], "mt": [(0, 1)], "sh": [(0, 0)]}
+    assert instrumented_tiles_of(mlir, specs[1:]) == {"mt": [(0, 1)], "sh": [(0, 0)]}
 
 
 def test_profiling_counters_shim(tmp_path):

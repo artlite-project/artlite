@@ -58,7 +58,6 @@ import itertools
 import math
 from dataclasses import dataclass
 from functools import cached_property
-from typing import ClassVar
 
 import numpy as np
 from aie.dialects.aiex import npu_write32
@@ -81,6 +80,7 @@ from ml_dtypes import bfloat16
 
 from ..decode.kv import Records
 from ..gemm.gemm_q import ChainPart, chained_fill
+from ..npu_regs import EVENT_LOCK_STALL, EVENT_MEMORY_STALL, window_counter_writes
 from ..operators import templating
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, plus_i32, range32, stream_walk
@@ -592,10 +592,7 @@ class AttnOperator(ArtcOperator):
     STACK = 2048
     pfx = kernel_prefix("paa")
     # stats builds: core counters 0: cycles in the region, 1: lock (memory) stall cycles, 2: all cycles, 3: windows
-    # (AM029 Performance_Control0 / 1)
-    CTRL: ClassVar[tuple[tuple[int, int], ...]] = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24),
-                                                   (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24))
-    COUNTER0 = 0x31520
+    # (``npu_regs.window_counter_writes``; values at ``CORE.address(k)``)
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
                  ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
@@ -937,12 +934,9 @@ class AttnOperator(ArtcOperator):
 
             sync_parameters()
             if any(a.startswith("ev_") for a in self.ablate):
-                ctrl = self.CTRL
-                if "memstall" in self.ablate:
-                    ctrl = ((ctrl[0][0], 33 | 34 << 8 | 23 << 16 | 23 << 24), ctrl[1])
                 mc = [int(a[3:]) for a in self.ablate if a.startswith("mc_")]  # (memory-module events, e.g. bank conflicts)
-                if mc:
-                    ctrl = (*ctrl, (0x11000, mc[0] | mc[0] << 8 | mc[-1] << 16 | mc[-1] << 24))
+                ctrl = window_counter_writes(stall=EVENT_MEMORY_STALL if "memstall" in self.ablate else EVENT_LOCK_STALL,
+                                             memory_events=mc)
                 for c in range(COLS):
                     for r in range(4):
                         for reg, val in ctrl:

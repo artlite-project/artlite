@@ -19,6 +19,7 @@ from aie.iron import Acquire, Bd, Buffer, DmaChannel, Flow, Kernel, Lock, Progra
 from aie.iron.device import NPU2, Tile
 
 from artlite import txn
+from artlite.npu_regs import CORE, EVENT_INSTR_0, EVENT_INSTR_1, ctrl_word
 from artlite.operators import paging
 from artlite.operators.base import ArgDirection, ArgSpec, ArtcOperator
 from artlite.operators.kernel_source import kernel_prefix
@@ -291,7 +292,7 @@ class _Bench:
         t = txn.Txn()
         if counters:  # (counter 0: cycles from event0 to event1)
             for c, r in self.tiles:
-                t.write32(txn.tile_address(c, r, 0x31500), 33 | 34 << 8)
+                t.write32(txn.tile_address(c, r, CORE.ctrl[0]), ctrl_word((EVENT_INSTR_0, EVENT_INSTR_1)))
         for col in B_SHIM:
             t.token_controller(col, txn.MM2S, 1)
             t.shim_task(col, txn.MM2S, 1, 1, address=self.dev.address("src"), nbytes=img.nbytes, token=True)
@@ -309,7 +310,7 @@ class _Bench:
         return [self.reg(c, r, RES + 4 * k) for c, r in self.tiles]
 
     def cycles(self) -> np.ndarray:
-        return np.array([self.reg(c, r, 0x31520) for c, r in self.tiles], np.int64)
+        return np.array([self.reg(c, r, CORE.address(0)) for c, r in self.tiles], np.int64)
 
 
 def _cmd(x: int, kind: int = 1, page: int = 0) -> np.ndarray:

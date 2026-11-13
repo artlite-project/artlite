@@ -334,10 +334,12 @@ mmvh_q5k_mm loop 1/1: for.body @kernel.cc:261, depth 1 (in base); ranked by cycl
   smaller unroll factors, or `AIE_PREPARE_FOR_POSTPIPELINING`.
 - **`@?` or `unattributed`**: the loop's schedule is right but its source line
   could not be tied to it; check the asm label and the `.loc` lines in
-  `<src>.annotated.s`, and improve the matching in `measure_ii.py`.
+  `<src>.annotated.s`, and improve the matching in `measure_ii/match.py`.
 - **Missing bank annotations**: add `__aie_dm_resource_a/b/c/d` qualifiers.
 
 ## Improvements
 
 measure_ii is error-prone. When the assembly or the compiler's remarks disagree with its report, do not just note
-it: fix `src/artlite/measure_ii.py` (tests in `tests/test_measure_ii.py`), so that the next report is right.
+it: fix `src/artlite/measure_ii/` (`remarks.py` the remarks, `asm.py` the assembly and its trip counts, `statements.py` and
+`match.py` the source loops, `costs.py`, `slots.py`, `render.py` the printed report; tests in `tests/test_measure_ii.py`), so
+that the next report is right.

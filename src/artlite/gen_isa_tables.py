@@ -183,7 +183,7 @@ def render(commit: str, slots: dict[str, list[str]], ports: dict[str, Counter[st
     out += [
         "}",
         "",
-        "# Mnemonics of several slots: the operands tell them apart (variant_search.slot_of).",
+        "# Mnemonics of several slots: the operands tell them apart (measure_ii.slot_of).",
         "SHARED_MNEMONICS = {",
         *(f'    "{mnemonic}": "{" ".join(found)}",' for mnemonic, found in sorted(slots.items()) if len(found) > 1),
         "}",

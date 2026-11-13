@@ -219,8 +219,11 @@ lagging average).
 
 ## Files
 
-- `src/artlite/profiling.py` — env parsing, MLIR injection, iron hook, exit-time trace conversion
-  (`convert_trace_dump`). Config is parsed once per process (set the environment before the first compile).
+- `src/artlite/profiling.py` — the configuration (`ProfileConfig.from_env`: parsed once per process, so set the
+  environment before the first compile; a malformed variable raises naming it), MLIR injection, iron hook, exit-time
+  trace conversion (`convert_trace_dump`).
+- `src/artlite/npu_regs.py` — the performance-counter registers of the four tile modules (core, memory, memtile, shim)
+  and their control words; a design that programs counters itself (`window_counter_writes`) takes them from there.
 - `csrc/artlite/profiler.{h,cpp}` — `artlite::Profiler` (context-scoped counter reads + Chromium JSON writer) and
   `dump_bo`.
 - `csrc/shim_xdna/hwctx.{h,cpp}` — `hw_ctx::read_aie_reg` (`AMDXDNA_AIE_TILE_READ`), `partition_start_col` (the

@@ -133,13 +133,8 @@ def _cache_key(*args: object) -> str:
 
 
 def profile_key(cfg: profiling.ProfileConfig | None) -> tuple | None:
-    """What a profiling configuration changes in a design (``BuildSpec.profile_key``: part of the cache key): trace
-    parameters shape the MLIR, counters are injected by the build."""
-    if cfg is None:
-        return None
-    if cfg.mode == "trace":
-        return "trace", cfg.trace_size, str(cfg.trace_events), cfg.trace_tiles, cfg.trace_lateral, cfg.trace_distribute
-    return "counters", cfg.counter_specs
+    """What a profiling configuration changes in a design (``BuildSpec.profile_key``: part of the cache key)."""
+    return None if cfg is None else cfg.cache_key()
 
 
 def buildable(spec: BuildSpec) -> bool:

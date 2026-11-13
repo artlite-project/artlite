@@ -18,7 +18,7 @@
 - Fields, the printed lines and which II numbers are real: the **measure-ii** skill. In short: only the final
   `!Passed pipeliner/schedule` remark (after register allocation) describes the code that runs; a loop of several
   blocks is never pipelined.
-- **If measure_ii disagrees with the assembly, fix measure_ii** (`src/artlite/measure_ii.py`, tests in
+- **If measure_ii disagrees with the assembly, fix measure_ii** (`src/artlite/measure_ii/`, tests in
   `tests/test_measure_ii.py`). It is the tool everyone reads.
 
 ## Remark flags (clang)

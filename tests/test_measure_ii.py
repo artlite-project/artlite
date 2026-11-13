@@ -8,27 +8,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from artlite.measure_ii import (
-    KernelReport,
-    LoopReport,
-    SourceLoop,
-    _asm_loops,
-    _CostModel,
-    _demangle_short,
-    _function_name,
-    _inlining_chain,
-    _LLVMLoader,
-    _loop_statements,
-    _parse_assembly,
-    _parse_source_trip,
-    _read_statements,
-    _template_arguments,
-    _tokenize,
-    _zol_iterations,
-    loop_cycles,
-    measure,
-    parse_yaml_remarks,
-)
+from artlite.cxx_scan import loop_statements, tokenize
+from artlite.measure_ii import KernelReport, LoopReport, SourceLoop, loop_cycles, measure
+from artlite.measure_ii.asm import asm_loops, inlining_chain, parse_assembly, zol_iterations
+from artlite.measure_ii.costs import CostModel
+from artlite.measure_ii.demangle import demangle_short, function_name
+from artlite.measure_ii.remarks import LLVMLoader, parse_yaml_remarks
+from artlite.measure_ii.statements import read_statements
+from artlite.measure_ii.trips import parse_source_trip, template_arguments
 
 KERNEL = """#include "operators.h"
 
@@ -203,7 +190,7 @@ def measured(tmp_path_factory: pytest.TempPathFactory) -> tuple[KernelReport, st
 
 
 def _loops(report: KernelReport, name: str) -> list[LoopReport]:
-    return [loop for loop in report.loops if _demangle_short(loop.function) == name]
+    return [loop for loop in report.loops if demangle_short(loop.function) == name]
 
 
 def _printed_loop(printed: str, head: str) -> list[str]:
@@ -234,7 +221,7 @@ def test_nested_loops(measured: tuple[KernelReport, str]) -> None:
     """The outer loop of several blocks is listed, the inner loop has its own line and trip count; the
     outer loop's cost adds the inner loop's iterations (its prologue and epilogue are the outer loop's own)."""
     report, _ = measured
-    costs = _CostModel(report)
+    costs = CostModel(report)
     for n in (4, 8):
         loops = {loop.kernel_line: loop for loop in _loops(report, f"scale<{n}>")}
         assert set(loops) == {_line("loop h"), _line("loop b")}, loops
@@ -350,21 +337,21 @@ def test_template_and_inlined_loops(measured: tuple[KernelReport, str]) -> None:
 
 
 def test_names_and_trips_offline(tmp_path: Path) -> None:
-    assert _function_name("void (anonymous namespace)::srec<32, 4>(unsigned char const*, float*)") == "srec<32, 4>"
-    assert _function_name("(anonymous namespace)::record(int*, int, int)") == "record"
-    assert _function_name("aie::vector_elem_ref<float, 32u>::operator float() const (.exit)") == (
+    assert function_name("void (anonymous namespace)::srec<32, 4>(unsigned char const*, float*)") == "srec<32, 4>"
+    assert function_name("(anonymous namespace)::record(int*, int, int)") == "record"
+    assert function_name("aie::vector_elem_ref<float, 32u>::operator float() const (.exit)") == (
         "aie::vector_elem_ref<float, 32u>::operator float.exit"
     )
-    assert yaml.load("LoopID: 0_1\nLine: 12\n", Loader=_LLVMLoader) == {"LoopID": "0_1", "Line": 12}
+    assert yaml.load("LoopID: 0_1\nLine: 12\n", Loader=LLVMLoader) == {"LoopID": "0_1", "Line": 12}
     source = tmp_path / "trip.cc"
     source.write_text("for (unsigned j = 0; j < 8; j += 2) {}\nfor (int i = s + 1; i < 32; i++) {}\n")
-    assert _parse_source_trip(source, 1) == 4
-    assert _parse_source_trip(source, 2) is None
+    assert parse_source_trip(source, 1) == 4
+    assert parse_source_trip(source, 2) is None
     source.write_text("template <int N, typename T, unsigned M = 2>\nvoid f(T *p) {\n"
                       "    for (int c = 0; c < N; c += M) {}\n}\n")
-    args = _template_arguments(source, 3, "_Z1fILi8EfLj4EEvPT0_")  # (f<8, float, 4u>)
+    args = template_arguments(source, 3, "_Z1fILi8EfLj4EEvPT0_")  # (f<8, float, 4u>)
     assert args == {"N": "8", "M": "4u"}
-    assert _parse_source_trip(source, 3, args) == 2
+    assert parse_source_trip(source, 3, args) == 2
 
 
 def test_statements_offline(tmp_path: Path) -> None:
@@ -373,7 +360,7 @@ def test_statements_offline(tmp_path: Path) -> None:
         "for (int i = 0; i < 5; i++) {\n    if (x) break;\n    for (int j = 0; j < 3; j++) { if (y) break; }\n}\n"
         "for (int k = 0; k < 2; k++) { switch (k) { case 0: break; } }\n"
     )
-    assert {statement.line: statement.exits for statement in _loop_statements(_tokenize(text))} == {
+    assert {statement.line: statement.exits for statement in loop_statements(tokenize(text))} == {
         1: True,
         3: True,
         5: False,
@@ -383,7 +370,7 @@ def test_statements_offline(tmp_path: Path) -> None:
                       "            g(j);\n    }\n}\n")
     inner = SourceLoop(function="f", path="k.cc", line=3, column=9, num_blocks=4)
     outer = SourceLoop(function="f", path="k.cc", line=3, column=9, num_blocks=9)
-    _read_statements([inner, outer], source=source)
+    read_statements([inner, outer], source=source)
     assert (inner.line, inner.end_line, inner.trip) == (3, 4, 8)
     assert (outer.line, outer.end_line, outer.trip) == (2, 5, 4)
 
@@ -400,7 +387,7 @@ def test_spill_counts_offline(tmp_path: Path) -> None:
         "\tjnz\t r0, #.LBB0_1\n"
         ".Lfunc_end0:\n"
     )
-    (block,) = _parse_assembly(asm)["f"].blocks
+    (block,) = parse_assembly(asm)["f"].blocks
     assert (block.spills, block.spill_bytes, block.reloads, block.reload_bytes) == (2, 68, 1, 64)
     assert block.header and block.jumps == [".LBB0_1"]
 
@@ -431,15 +418,15 @@ def test_inlining_chain_offline() -> None:
     none) leaves the .loc's own."""
     comment = (" .venv/x/aie_api/vector.hpp:1098:29 @[ src/artlite/include/kernel_lib.h:41:27 @[ "
                "/tmp/k/kernel.cc:0:3 @[ /tmp/k/kernel.cc:315:9 ] ] ]")
-    assert _inlining_chain("vector.hpp", 1098, comment) == (("vector.hpp", 1098), ("kernel_lib.h", 41),
+    assert inlining_chain("vector.hpp", 1098, comment) == (("vector.hpp", 1098), ("kernel_lib.h", 41),
                                                              ("kernel.cc", 315))
-    assert _inlining_chain("kernel.cc", 12, comment) == (("kernel.cc", 12),)
-    assert _inlining_chain("kernel.cc", 12, "") == (("kernel.cc", 12),)
+    assert inlining_chain("kernel.cc", 12, comment) == (("kernel.cc", 12),)
+    assert inlining_chain("kernel.cc", 12, "") == (("kernel.cc", 12),)
 
 
 def _zol_counts(asm: str) -> dict[int, int | None]:
-    (function,) = _parse_assembly(asm).values()
-    return _zol_iterations(function, _asm_loops(function))
+    (function,) = parse_assembly(asm).values()
+    return zol_iterations(function, asm_loops(function))
 
 
 def test_zol_count_dataflow_offline() -> None:
@@ -485,5 +472,5 @@ def test_tail_calls_offline() -> None:
         "\tj\t#.LBB0_2\n"
         ".Lfunc_end0:\n"
     )
-    (block,) = _parse_assembly(asm)["f"].blocks
+    (block,) = parse_assembly(asm)["f"].blocks
     assert block.calls == ["g", "_ZN12_GLOBAL__N_11hEv"]

@@ -61,50 +61,16 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from .npu_regs import MEMTILE_ROW, MODULES, SHIM_ROW
 
 if TYPE_CHECKING:
     from . import _native
 
-_CONFIG: ProfileConfig | None = None
-_CONFIG_PARSED = False
-_HOOK_INSTALLED = False
-_PROFILERS: list[_native.Profiler] = []
-_TRACE_DUMPS: list[tuple[str, str]] = []  # (ttbin path, physical mlir path)
-
-# AIE2P performance counter registers (aie-rt's xaie2pgbl_params.h; AM029 is
-# Versal's layout: its core offsets differ, its memtile and shim have 6).
-# Core module (per core tile): 4 counters. Memory module (per core tile's 64KB
-# DM + locks/DMAs): 2 counters. Memory-tile module (row 1): 4 counters.
-# PL module (shim tile, row 0): 2 counters. A start/stop ctrl reg serves two
-# counters; the reset-event regs follow them (0x31508, 0x11008, 0x91008,
-# 0x31008). Reading an address past a module's counters (no register there,
-# e.g. 0x91030) wedges the context.
-_CORE_CTRL0 = 0x31500  # core counters 0/1 start/stop events
-_CORE_CTRL1 = 0x31504  # core counters 2/3
-_CORE_CNT_BASE = 0x31520  # 4 x u32, +4 each
-_MEM_CTRL0 = 0x11000  # memory-module counters 0/1 (2 max)
-_MEM_CNT_BASE = 0x11020
-_MT_CTRL_BASES = (0x91000, 0x91004)
-_MT_CNT_BASE = 0x91020
-_SH_CTRL_BASES = (0x31000,)
-_SH_CNT_BASE = 0x31020
-
-_MAX_COUNTERS = {"core": 4, "mem": 2, "mt": 4, "sh": 2}
-# module name -> (trace-events enum attr, counter value base)
-_MOD_ENUM = {
-    "core": "CoreEvent",
-    "mem": "MemEvent",
-    "mt": "MemTileEvent",
-    "sh": "ShimTileEvent",
-}
-_MOD_CNT_BASE = {
-    "core": _CORE_CNT_BASE,
-    "mem": _MEM_CNT_BASE,
-    "mt": _MT_CNT_BASE,
-    "sh": _SH_CNT_BASE,
-}
+ENV_PREFIX = "ARTLITE_PROFILE"  # the mode's variable; the others are ARTLITE_PROFILE_<NAME>
 
 # AIE2P core event IDs (aie-rt xaie_events_aie2p.h); used for labels only —
 # full name resolution goes through aie.utils.trace.events.
@@ -118,40 +84,156 @@ def _event_name(module: str, code: int) -> str:
         from aie.utils.trace.events import get_events_for_device
 
         enums = get_events_for_device("npu2p")
-        return getattr(enums, _MOD_ENUM[module])(code).name
+        return getattr(enums, MODULES[module].events)(code).name
     except Exception:  # noqa: BLE001 - best-effort pretty name, fall back to the table
         return _EVENT_NAMES.get(code, f"event{code}")
 
 
-@dataclass
+class CounterSpec(NamedTuple):
+    """One performance counter: the tile module it is in and the events that start and stop it."""
+
+    module: str  # "core" | "mem" | "mt" | "sh" (``npu_regs.MODULES``)
+    start: int
+    stop: int
+
+
+def validate_counter_specs(specs: Sequence[CounterSpec]) -> None:
+    """At most each module's counters (a read past them wedges the hardware context), at least one."""
+    if not specs:
+        raise ValueError(f"{ENV_PREFIX}_COUNTERS: empty spec")
+    counts: dict[str, int] = {}
+    for spec in specs:
+        if spec.module not in MODULES:
+            raise ValueError(f"{ENV_PREFIX}_COUNTERS: unknown counter module {spec.module!r}")
+        counts[spec.module] = counts.get(spec.module, 0) + 1
+    for name, count in counts.items():
+        if count > MODULES[name].max_counters:
+            raise ValueError(
+                f"{ENV_PREFIX}_COUNTERS: at most {MODULES[name].max_counters} {name}-module pairs (got {count})"
+            )
+
+
+@dataclass(frozen=True)
+class TileSelection:
+    """The workers a trace covers: all of a program's, the first N, or those pinned to the listed tiles."""
+
+    text: str = "all"  # as given: "all", "first:N" or "col,row;col,row"
+    first: int | None = None
+    tiles: frozenset[tuple[int, int]] | None = None
+
+    @classmethod
+    def parse(cls, text: str) -> TileSelection:
+        name = f"{ENV_PREFIX}_TILES"
+        if text == "all":
+            return cls(text)
+        try:
+            if text.startswith("first:"):
+                return cls(text, first=int(text.split(":", 1)[1]))
+            tiles = set()
+            for token in text.split(";"):
+                col, row = token.split(",")
+                tiles.add((int(col), int(row)))
+            return cls(text, tiles=frozenset(tiles))
+        except ValueError:
+            raise ValueError(
+                f"{name}={text!r}: use 'all', 'first:N', or ';'-separated 'col,row' of pinned tiles"
+            ) from None
+
+    def pick(self, workers: list[Any]) -> list[Any]:
+        """The selected workers of a Program's worker list."""
+        if self.first is not None:
+            return workers[: self.first]
+        if self.tiles is None:
+            return workers
+        picked = [w for w in workers if (w.tile.col, w.tile.row) in self.tiles]
+        if not picked:
+            raise ValueError(
+                f"{ENV_PREFIX}_TILES={self.text}: no pinned worker tiles match; "
+                "use 'all', 'first:N', or ';'-separated 'col,row' of pinned tiles"
+            )
+        return picked
+
+
+@dataclass(frozen=True)
 class ProfileConfig:
+    """The profiling configuration of a process: built once from the environment (``from_env``)."""
+
     mode: str  # "counters" | "trace"
     out_dir: str
-    # (module, start_event, stop_event); module "core" (max 4) or "mem" (max 2)
-    counter_specs: list[tuple[str, int, int]] = field(
-        default_factory=lambda: [("core", s, e) for s, e in _DEFAULT_COUNTER_PAIRS]
+    counter_specs: list[CounterSpec] = field(
+        default_factory=lambda: [CounterSpec("core", s, e) for s, e in _DEFAULT_COUNTER_PAIRS]
     )
     trace_size: int = 4 * 1024 * 1024
     trace_events: list | None = None
-    trace_tiles: str = "all"
+    trace_tiles: TileSelection = TileSelection()
     trace_lateral: bool = False
     trace_distribute: bool = False
     convert: bool = True
     sample_every: int = 1
 
-    def counter_readout(
-        self, modules: tuple[str, ...] = ("core", "mem")
-    ) -> list[tuple[int, str]]:
+    # The fields that never change a design or its build (where the output goes, what is done with it): every other
+    # field is in ``cache_key``.
+    RUNTIME_FIELDS = frozenset({"out_dir", "convert", "sample_every"})
+
+    def __post_init__(self) -> None:
+        validate_counter_specs(self.counter_specs)
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str]) -> ProfileConfig | None:
+        """The configuration the environment selects (module docstring), None when profiling is off. A malformed
+        value raises a ValueError naming its variable."""
+        raw = environ.get(ENV_PREFIX, "0").lower()
+        if raw in ("0", "off", "", "false", "no"):
+            return None
+
+        def number(name: str, default: int) -> int:
+            text = environ.get(f"{ENV_PREFIX}_{name}", str(default))
+            try:
+                return int(text)
+            except ValueError:
+                raise ValueError(f"{ENV_PREFIX}_{name}: expected an integer, got {text!r}") from None
+
+        def flag(name: str, default: str) -> bool:
+            return environ.get(f"{ENV_PREFIX}_{name}", default) == "1"
+
+        counter_specs = [CounterSpec("core", s, e) for s, e in _DEFAULT_COUNTER_PAIRS]
+        if spec := environ.get(f"{ENV_PREFIX}_COUNTERS"):
+            counter_specs = _parse_counter_specs(spec)
+        trace_events = _parse_events(spec) if (spec := environ.get(f"{ENV_PREFIX}_EVENTS")) else None
+        return cls(
+            mode=raw if raw in ("counters", "trace") else "counters",
+            out_dir=environ.get(f"{ENV_PREFIX}_DIR", "artlite_profile"),
+            counter_specs=counter_specs,
+            trace_size=number("TRACE_SIZE", 4 * 1024 * 1024),
+            trace_events=trace_events,
+            trace_tiles=TileSelection.parse(environ.get(f"{ENV_PREFIX}_TILES", "all")),
+            trace_lateral=flag("LATERAL", "0"),
+            trace_distribute=flag("DISTRIBUTE", "0"),
+            convert=flag("CONVERT", "1"),
+            sample_every=max(1, number("SAMPLE_EVERY", 1)),
+        )
+
+    def cache_key(self) -> tuple:
+        """What the configuration changes in a design (part of the build's cache key): trace parameters shape the
+        MLIR, counters are injected by the build."""
+        if self.mode == "trace":
+            return (
+                "trace", self.trace_size, str(self.trace_events), self.trace_tiles.text, self.trace_lateral,
+                self.trace_distribute,
+            )
+        return "counters", [tuple(spec) for spec in self.counter_specs]
+
+    def counter_readout(self, modules: tuple[str, ...] = ("core", "mem")) -> list[tuple[int, str]]:
         """(register address, label) for each configured counter in `modules`."""
         out: list[tuple[int, str]] = []
         for module in modules:
-            specs = [p for p in self.counter_specs if p[0] == module]
+            specs = [p for p in self.counter_specs if p.module == module]
             for i, (_, s, e) in enumerate(specs):
                 lbl = (
                     f"{_event_name(module, s)}->{_event_name(module, e)}"
                     + (" cycles" if s != e else " count")
                 )
-                out.append((_MOD_CNT_BASE[module] + 4 * i, lbl))
+                out.append((MODULES[module].address(i), lbl))
         return out
 
 
@@ -165,7 +247,7 @@ def _resolve_event(module: str, tok: str) -> int:
     from aie.utils.trace.events import get_events_for_device
 
     enums = get_events_for_device("npu2p")
-    cls = getattr(enums, _MOD_ENUM[module])
+    cls = getattr(enums, MODULES[module].events)
     return int(cls[tok]._value_ if hasattr(cls[tok], "_value_") else cls[tok])
 
 
@@ -181,12 +263,11 @@ _MOD_PREFIXES = {
 }
 
 
-def _parse_counter_specs(text: str) -> list[tuple[str, int, int]]:
-    """Parse "33:34,m:77:77,mt:21:29,sh:14:22" into (module, start, stop)
-    tuples; module prefixes select the tile module: none = core module,
-    m: = core-tile memory module, mt: = memory tile (row 1), sh: = shim/PL
-    tile (row 0). Event names are accepted."""
-    specs: list[tuple[str, int, int]] = []
+def _parse_counter_specs(text: str) -> list[CounterSpec]:
+    """Parse "33:34,m:77:77,mt:21:29,sh:14:22" into counter specs; module prefixes select the tile module: none =
+    core module, m: = core-tile memory module, mt: = memory tile (row 1), sh: = shim/PL tile (row 0). Event names
+    are accepted."""
+    specs: list[CounterSpec] = []
     for item in text.split(","):
         parts = [p.strip() for p in item.strip().split(":")]
         module = "core"
@@ -195,19 +276,8 @@ def _parse_counter_specs(text: str) -> list[tuple[str, int, int]]:
             parts = parts[1:]
         if len(parts) != 2:
             raise ValueError(f"bad counter pair '{item}': expected start:stop")
-        specs.append((module, _resolve_event(module, parts[0]),
-                      _resolve_event(module, parts[1])))
-    counts: dict[str, int] = {}
-    for p in specs:
-        counts[p[0]] = counts.get(p[0], 0) + 1
-    for mod, cnt in counts.items():
-        if not cnt <= _MAX_COUNTERS[mod]:
-            raise ValueError(
-                f"ARTLITE_PROFILE_COUNTERS: at most {_MAX_COUNTERS[mod]} "
-                f"{mod}-module pairs (got {cnt})"
-            )
-    if not specs:
-        raise ValueError("ARTLITE_PROFILE_COUNTERS: empty spec")
+        specs.append(CounterSpec(module, _resolve_event(module, parts[0]), _resolve_event(module, parts[1])))
+    validate_counter_specs(specs)
     return specs
 
 
@@ -221,61 +291,32 @@ def _parse_events(text: str) -> list[object]:
     return events
 
 
+class _Session:
+    """The process's profiling state: its configuration (from the environment at the first ``get_config``), the
+    profilers and trace dumps to finish at exit, the IRON hook."""
+
+    def __init__(self) -> None:
+        self.config: ProfileConfig | None = None
+        self.parsed = False
+        self.hook_installed = False
+        self.profilers: list[_native.Profiler] = []
+        self.trace_dumps: list[tuple[str, str]] = []  # (ttbin path, physical mlir path)
+
+
+_SESSION = _Session()
+
+
 def get_config() -> ProfileConfig | None:
     """Return the profiling config, or None when profiling is disabled."""
-    global _CONFIG, _CONFIG_PARSED
-    if _CONFIG_PARSED:
-        return _CONFIG
-    _CONFIG_PARSED = True
-
-    raw = os.environ.get("ARTLITE_PROFILE", "0").lower()
-    if raw in ("0", "off", "", "false", "no"):
-        return None
-    mode = raw if raw in ("counters", "trace") else "counters"
-
-    counter_specs = [("core", s, e) for s, e in _DEFAULT_COUNTER_PAIRS]
-    if spec := os.environ.get("ARTLITE_PROFILE_COUNTERS"):
-        counter_specs = _parse_counter_specs(spec)
-
-    trace_events = None
-    if spec := os.environ.get("ARTLITE_PROFILE_EVENTS"):
-        trace_events = _parse_events(spec)
-
-    _CONFIG = ProfileConfig(
-        mode=mode,
-        out_dir=os.environ.get("ARTLITE_PROFILE_DIR", "artlite_profile"),
-        counter_specs=counter_specs,
-        trace_size=int(os.environ.get("ARTLITE_PROFILE_TRACE_SIZE", str(4 * 1024 * 1024))),
-        trace_events=trace_events,
-        trace_tiles=os.environ.get("ARTLITE_PROFILE_TILES", "all"),
-        trace_lateral=os.environ.get("ARTLITE_PROFILE_LATERAL", "0") == "1",
-        trace_distribute=os.environ.get("ARTLITE_PROFILE_DISTRIBUTE", "0") == "1",
-        convert=os.environ.get("ARTLITE_PROFILE_CONVERT", "1") == "1",
-        sample_every=max(1, int(os.environ.get("ARTLITE_PROFILE_SAMPLE_EVERY", "1"))),
-    )
-    os.makedirs(_CONFIG.out_dir, exist_ok=True)
-    atexit.register(_finalize)
-    return _CONFIG
-
-
-def _select_workers(cfg: ProfileConfig, workers: list) -> list | None:
-    """Pick the workers to trace from a Program's worker list."""
-    sel = cfg.trace_tiles
-    if sel == "all":
-        return workers
-    if sel.startswith("first:"):
-        return workers[: int(sel.split(":", 1)[1])]
-    tiles: set[tuple[int, int]] = set()
-    for tok in sel.split(";"):
-        c, r = tok.split(",")
-        tiles.add((int(c), int(r)))
-    picked = [w for w in workers if (w.tile.col, w.tile.row) in tiles]
-    if not picked:
-        raise ValueError(
-            f"ARTLITE_PROFILE_TILES={sel}: no pinned worker tiles match; "
-            "use 'all', 'first:N', or ';'-separated 'col,row' of pinned tiles"
-        )
-    return picked
+    if _SESSION.parsed:
+        return _SESSION.config
+    _SESSION.parsed = True
+    config = ProfileConfig.from_env(os.environ)
+    if config is not None:
+        os.makedirs(config.out_dir, exist_ok=True)
+        atexit.register(_finalize)
+    _SESSION.config = config
+    return config
 
 
 def install_iron_hook() -> None:
@@ -284,19 +325,18 @@ def install_iron_hook() -> None:
     Idempotent. Only effective in `trace` mode; in `counters` mode the hook
     resolves programs unchanged.
     """
-    global _HOOK_INSTALLED
-    if _HOOK_INSTALLED:
+    if _SESSION.hook_installed:
         return
-    _HOOK_INSTALLED = True
+    _SESSION.hook_installed = True
 
     import aie.iron
 
     orig_resolve = aie.iron.Program.resolve_program
 
-    def resolving(self, *args, **kwargs):
+    def resolving(self: Any, *args: Any, **kwargs: Any) -> Any:
         cfg = get_config()
         if cfg is not None and cfg.mode == "trace":
-            workers = _select_workers(cfg, [w for c in self._configurations for w in c.workers])
+            workers = cfg.trace_tiles.pick([w for c in self._configurations for w in c.workers])
             self.enable_trace(
                 cfg.trace_size,
                 workers=workers,
@@ -314,19 +354,8 @@ def _find_aie_opt() -> str:
     return os.path.join(pkg, "bin", "aie-opt")
 
 
-def _ctrl_writes(pairs: list[tuple[int, int]], bases: tuple[int, ...],
-                 cap: int) -> list[tuple[int, int]]:
-    """Pack (start, stop) event pairs into per-two-counters control regs."""
-    out: list[tuple[int, int]] = []
-    p = pairs + [(0, 0)] * (cap - len(pairs))
-    for grp in range((len(pairs) + 1) // 2):
-        a, b = p[2 * grp], p[2 * grp + 1]
-        out.append((bases[grp], a[0] | (a[1] << 8) | (b[0] << 16) | (b[1] << 24)))
-    return out
-
-
 def instrumented_tiles_of(
-    mlir_text: str, counter_specs: list[tuple[str, int, int]]
+    mlir_text: str, counter_specs: list[CounterSpec]
 ) -> dict[str, list[tuple[int, int]]]:
     """tiles_by_class: "core" (core tiles; core+mem module counters), "mt"
     (row-1 mem tiles), "sh" (row-0 shim tiles). Only classes with configured
@@ -342,29 +371,32 @@ def instrumented_tiles_of(
         }
     )
     all_xy = set(tiles.values())
-    mods = {p[0] for p in counter_specs}
+    classes = {MODULES[spec.module].tiles for spec in counter_specs}
     out: dict[str, list[tuple[int, int]]] = {}
-    if mods & {"core", "mem"}:
+    if "core" in classes:
         out["core"] = core_tiles
-    if "mt" in mods:
-        out["mt"] = sorted((c, r) for c, r in all_xy if r == 1)
-    if "sh" in mods:
-        out["sh"] = sorted((c, r) for c, r in all_xy if r == 0)
+    if "mt" in classes:
+        out["mt"] = sorted((c, r) for c, r in all_xy if r == MEMTILE_ROW)
+    if "sh" in classes:
+        out["sh"] = sorted((c, r) for c, r in all_xy if r == SHIM_ROW)
     return out
 
 
-_CTRL_PLANS: dict[str, tuple[tuple[int, ...], int]] = {
-    "core": ((_CORE_CTRL0, _CORE_CTRL1), 4),
-    "mem": ((_MEM_CTRL0,), 2),
-    "mt": (_MT_CTRL_BASES, 4),
-    "sh": (_SH_CTRL_BASES, 2),
-}
-# module -> tile classes that carry it
-_MOD_TILE_CLASSES = {"core": ("core",), "mem": ("core",), "mt": ("mt",), "sh": ("sh",)}
+def _run_aie_opt(pipeline: str, src_path: str, out_path: str, *, what: str, tail: int | None = None) -> None:
+    """aie-opt with a pass pipeline: src_path -> out_path; a failure raises with its stderr (its last ``tail``
+    characters)."""
+    r = subprocess.run(
+        [_find_aie_opt(), f"--pass-pipeline={pipeline}", src_path, "-o", out_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"{what} failed:\n{r.stderr[-tail:] if tail else r.stderr}")
 
 
 def inject_perf_counters(
-    mlir_text: str, counter_specs: list[tuple[str, int, int]], work_dir: str
+    mlir_text: str, counter_specs: list[CounterSpec], work_dir: str
 ) -> tuple[str, dict[str, list[tuple[int, int]]]]:
     """Place tiles and inject perf-counter configuration into the MLIR.
 
@@ -374,48 +406,37 @@ def inject_perf_counters(
     re-running aie-place-tiles on already-placed tiles is a no-op (this is
     also how mlir-aie pre-lowers trace options that aiecc cannot pass).
     """
+    validate_counter_specs(counter_specs)
     src_path = os.path.join(work_dir, "design_preprofile.mlir")
     placed_path = os.path.join(work_dir, "design_placed.mlir")
     with open(src_path, "w") as f:
         f.write(mlir_text)
-    aie_opt = _find_aie_opt()
-    r = subprocess.run(
-        [
-            aie_opt,
-            "--pass-pipeline=builtin.module(aie.device(aie-place-tiles))",
-            src_path,
-            "-o",
-            placed_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"aie-place-tiles failed:\n{r.stderr}")
+    _run_aie_opt("builtin.module(aie.device(aie-place-tiles))", src_path, placed_path, what="aie-place-tiles")
     with open(placed_path) as f:
         placed = f.read()
 
     tiles_by_class = instrumented_tiles_of(placed, counter_specs)
     if not tiles_by_class:
         raise RuntimeError("profiling: design has no tiles to instrument")
+    cores = len(re.findall(r"\baie\.core\(", placed))
+    if "core" in tiles_by_class and len(tiles_by_class["core"]) != cores:
+        # (the printer's format changed: the counters would miss cores)
+        raise RuntimeError(
+            f"profiling: {cores} aie.core ops in the placed MLIR, {len(tiles_by_class['core'])} core tiles recognized"
+        )
 
     # module -> packed control register writes
     writes_per_module = {
-        mod: _ctrl_writes(
-            [(s, e) for m2, s, e in counter_specs if m2 == mod],
-            _CTRL_PLANS[mod][0],
-            _CTRL_PLANS[mod][1],
-        )
-        for mod in _CTRL_PLANS
-        if any(p[0] == mod for p in counter_specs)
+        name: module.ctrl_writes([(spec.start, spec.stop) for spec in counter_specs if spec.module == name])
+        for name, module in MODULES.items()
+        if any(spec.module == name for spec in counter_specs)
     }
 
     lines: list[str] = []
     for cls, tile_list in tiles_by_class.items():
         writes: list[tuple[int, int]] = []
         for mod, w in writes_per_module.items():
-            if cls in _MOD_TILE_CLASSES[mod]:
+            if cls == MODULES[mod].tiles:
                 writes.extend(w)
         for col, row in tile_list:
             for addr, val in writes:
@@ -447,36 +468,27 @@ def pre_lower_trace(mlir_path: str, cfg: ProfileConfig, work_dir: str) -> str:
         opts += "distribute-channels=true "
     if cfg.trace_lateral:
         opts += "lateral-routing=true"
-    r = subprocess.run(
-        [
-            _find_aie_opt(),
-            (
-                "--pass-pipeline=builtin.module(aie.device("
-                "aie-place-tiles,"
-                f"aie-insert-trace-flows{{{opts}}},"
-                "aie-trace-to-config,aie-trace-pack-reg-writes,"
-                "aie-inline-trace-config),aie-fuse-trace-buffers)"
-            ),
-            mlir_path,
-            "-o",
-            out_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    _run_aie_opt(
+        "builtin.module(aie.device("
+        "aie-place-tiles,"
+        f"aie-insert-trace-flows{{{opts}}},"
+        "aie-trace-to-config,aie-trace-pack-reg-writes,"
+        "aie-inline-trace-config),aie-fuse-trace-buffers)",
+        mlir_path,
+        out_path,
+        what="trace pre-lowering",
+        tail=2000,
     )
-    if r.returncode != 0:
-        raise RuntimeError(f"trace pre-lowering failed:\n{r.stderr[-2000:]}")
     return out_path
 
 
 def register_profiler(profiler: _native.Profiler) -> None:
-    _PROFILERS.append(profiler)
+    _SESSION.profilers.append(profiler)
 
 
 def register_trace_dump(ttbin_path: str, work_dir: str) -> None:
     phys = os.path.join(work_dir, "design.mlir.prj", "input_with_addresses.mlir")
-    _TRACE_DUMPS.append((ttbin_path, phys))
+    _SESSION.trace_dumps.append((ttbin_path, phys))
 
 
 def convert_trace_dump(ttbin_path: str, phys_mlir_path: str) -> str | None:
@@ -525,12 +537,12 @@ def _cli() -> None:
 
 
 def _finalize() -> None:
-    for p in _PROFILERS:
+    for p in _SESSION.profilers:
         p.close()
-    cfg = _CONFIG
+    cfg = _SESSION.config
     if cfg is None or not cfg.convert:
         return
-    for ttbin, phys in _TRACE_DUMPS:
+    for ttbin, phys in _SESSION.trace_dumps:
         if os.path.exists(phys):
             convert_trace_dump(ttbin, phys)
         else:

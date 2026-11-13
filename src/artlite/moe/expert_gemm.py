@@ -63,6 +63,7 @@ from .. import txn
 from ..formats import KT, gu_tiles, slot
 from ..gemm.gemm_q import planar
 from ..gemm.gemm_qd import D_DEPTH, DQ_ONLY, GemmQdOperator
+from ..npu_regs import EVENT_LOCK_STALL, EVENT_MEMORY_STALL, window_counter_writes
 from ..operators import templating
 from ..operators.base import ArgSpec
 from ..operators.design import COLS, range32, stream_walk
@@ -95,10 +96,9 @@ class ExpertGemmOperator(GemmQdOperator):
 
     GU_ROWS = 128  # rows of a gate / up pass (128: its A strip resent half as often as at 64)
     # ablate "ev_dq" / "ev_mm" / "ev_kt" (GemmQOperator's event0 / 1 windows): the sequence programs the cores'
-    # performance counters (AM029 Performance_Control0 / 1; values at COUNTER0 + 4 k): 0: cycles in the windows, 1: lock
-    # stall cycles ("memstall": memory stall), 2: all cycles, 3: windows; "mc_<event>" (one or two): the memory modules'
-    # counters (at MCOUNTER0, MCOUNTER0 + 4) count those events (pulses) or their cycles (levels)
-    COUNTER0, MCOUNTER0 = 0x31520, 0x11020
+    # performance counters (``npu_regs.window_counter_writes``; values at ``CORE.address(k)``): 0: cycles in the
+    # windows, 1: lock stall cycles ("memstall": memory stall), 2: all cycles, 3: windows; "mc_<event>" (one or two): the
+    # memory modules' counters (``MEM.address(0 / 1)``) count those events (pulses) or their cycles (levels)
     mac_stack = 2048  # (the MAC cores' stack: GemmQdOperator's)
 
     def __init__(self, *, kind: str, fmt: str, R: int, row_tiles: int, G: int = 1, K: int, tile_bytes: int, kc: int,
@@ -567,14 +567,12 @@ class ExpertGemmOperator(GemmQdOperator):
                 for ch in (0, 1):  # (the drains' tokens to the controller)
                     npu_maskwrite32(txn.CTRL[txn.S2MM][ch], txn.CONTROLLER_ID << 8, 0x1F00, column=c, row=0)
                 npu_maskwrite32(MEM_S2MM_CTRL + 8 * A_CH, 1 << 16, 3 << 16, column=c, row=1)  # (A: finish on TLAST)
-                if any(a.startswith("ev_") for a in self.ablate):  # (the cores' performance counters: COUNTER0)
-                    stall = 23 if "memstall" in self.ablate else 26
+                if any(a.startswith("ev_") for a in self.ablate):  # (the cores' performance counters)
+                    stall = EVENT_MEMORY_STALL if "memstall" in self.ablate else EVENT_LOCK_STALL
                     mc = [int(a[3:]) for a in self.ablate if a.startswith("mc_")]  # (memory-module events)
                     for r in range(1 + MAC_ROWS):
-                        npu_write32(0x31500, 33 | 34 << 8 | stall << 16 | stall << 24, column=c, row=2 + r)
-                        npu_write32(0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24, column=c, row=2 + r)
-                        if mc:
-                            npu_write32(0x11000, mc[0] | mc[0] << 8 | mc[-1] << 16 | mc[-1] << 24, column=c, row=2 + r)
+                        for reg, val in window_counter_writes(stall=stall, memory_events=mc):
+                            npu_write32(reg, val, column=c, row=2 + r)
             tg = TaskGroup()
             for c in range(COLS):
                 bh[c].fill(CB, TensorAccessPattern((n_cb,), 2 * c * self.cb_words, [1, 1, 1, 2 * self.b0_words],

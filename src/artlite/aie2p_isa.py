@@ -59,7 +59,7 @@ SLOT_MNEMONICS = {
     ),
 }
 
-# Mnemonics of several slots: the operands tell them apart (variant_search.slot_of).
+# Mnemonics of several slots: the operands tell them apart (measure_ii.slot_of).
 SHARED_MNEMONICS = {
     "j": "alu lng",
     "jl": "alu lng",
