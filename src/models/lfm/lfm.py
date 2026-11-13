@@ -17,6 +17,7 @@ histories, ~0.5 MB). Drafts: the context's (``drafts.Lookup``), whose rejected t
 lazy shift, the caches' records overwritten).
 """
 
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -29,6 +30,7 @@ from artlite.overlay import WeightBuffer
 from ..common import Model, OverlayModel, Sampling
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
+from ..lfm3a import speech as a_speech
 from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
 from ..sequence import Sequence, splice_media
@@ -71,6 +73,7 @@ class NpuLfm(OverlayModel):
                 self.prefill.bind()
         self.overlay.ready()
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
+        self._w_post = gguf.tensor(f"blk.{self.cfg.num_hidden_layers - 1}.post_ffw_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
 
@@ -99,6 +102,24 @@ class NpuLfm(OverlayModel):
         if tokens.given.any():
             x[tokens.given] = tokens.rows
         return x
+
+    def audio_step(self, row: np.ndarray) -> np.ndarray:
+        """An embedding row (hidden,) at the next position (a speech frame's feedback: ``models.lfm3a.speech``) in a
+        step without the LM head: the hidden state after it (the LM head's input, from its header's: ``LfmOverlay.
+        lm_input``: r + v / rms(v) w_post, output-normed; fp32)."""
+        if self.position + 1 > self.capacity:
+            raise ValueError(f"the KV cache holds {self.capacity} positions")
+        self._dispatch(lambda: self.overlay.step(np.asarray(row, np.float32).reshape(1, -1), self.position, logits=False))
+        self.position += 1
+        return self.hidden_after()
+
+    def hidden_after(self, slot: int = 0) -> np.ndarray:
+        """The hidden state (hidden,) fp32 after a slot of the last step, with or without the LM head (module
+        ``audio_step``)."""
+        v, r, ss = self.overlay.lm_input(slot)
+        eps = np.float32(self.cfg.rms_norm_eps)
+        u = r + v / np.sqrt(ss / np.float32(self.cfg.hidden_size) + eps) * self._w_post
+        return self._normed(u[None])[0]
 
     def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
         return (self._rows(tokens),)
@@ -172,6 +193,23 @@ class Lfm(Model):
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
+
+    def tts(self, text: str, *, voice: str = "female", language: str = "en", seed: int | None = None,
+            max_frames: int = 512, stats: a_speech.SpeechStats | None = None) -> Iterator[np.ndarray]:
+        """The text spoken (LFM3-Audio's speech generator: its mmproj; the file's ``tts`` chat template, ``voice``
+        female or male, ``language`` a code of ``speech.TTS_LANGUAGES`` or a name): 24 kHz float32 samples in chunks as
+        they come (every ``speech.CHUNK`` frames of 80 ms), until the end of audio or ``max_frames``; ``seed``: the speech
+        codes' sampling (None: random). The loaded model's positions are the prompt's and the frames'."""
+        if self.audio is None or self.audio.gen is None:
+            raise ValueError(f"{self.name}: speech output needs LFM3-Audio's mmproj (its speech generator)")
+        if self._npu is None:
+            raise ValueError(f"{self.name}: load the model first")
+        npu = self._npu
+        ids = self.encode(a_speech.tts_prompt(self.gguf, text, language=language, voice=voice))
+        npu.reset()
+        h = npu.outputs(ids, at=[-1])[0]
+        sampler = a_speech.CodeSampler(self.audio.gen, seed)
+        yield from a_speech.speak(npu, self.audio, h, sampler, max_frames=max_frames, stats=stats)
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,

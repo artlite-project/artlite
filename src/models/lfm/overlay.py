@@ -718,6 +718,20 @@ class LfmOverlay(ModelOverlay):
         v = self.dev.view("ACT")[rg.off + XB:rg.off + XB + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, slot]
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
+    def lm_input(self, slot: int = 0) -> tuple[np.ndarray, np.ndarray, float]:
+        """The LM header's input of the last step, of a slot (a step without the LM head too: the last layer's FFN drains
+        v and its partial sums there, its header r): v, r (bf16 values as fp32) and v's sum of squares (the columns'
+        partial sums, fp32: the header's 1 / rms(v)). Its update r + v / rms(v) w_post, output-normed, is the LM head's
+        input (``models.lfm.lfm.NpuLfm.audio_step``)."""
+        rg, sp = self.inp[(-1, "lm")][0], packed_slots(self._last_s)
+        o = rg.off + XB
+        self.dev.fetch("ACT", o, XPAY + 4 * sp * self.H)
+        act = self.dev.view("ACT")
+        ps = act[o:o + 4 * COLS * SLOTS * 8].view(np.float32).reshape(COLS, SLOTS, 8)  # ([column][slot][8 lanes])
+        x = act[o + XPAY:o + XPAY + 4 * sp * self.H].view(np.uint16).reshape(self.H // 8, 2, sp, 8)[:, :, slot]
+        v, r = (np.ascontiguousarray(x[:, i]).reshape(-1).view(bfloat16).astype(np.float32) for i in range(2))
+        return v, r, float(ps[:, slot].sum(dtype=np.float32))
+
     def residual(self, slot: int = 0) -> np.ndarray:
         """The last step's residual stream after the last layer (the LM header's update), bf16 values as fp32."""
         off, sp = self.final + XB + XPAY, packed_slots(self._last_s)

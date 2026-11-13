@@ -12,7 +12,9 @@ Text: the prompt goes through the model's chat template (``--raw``: as it is), w
 model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them (``--audio`` alone:
 a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then sampled until an
 end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed report to
-stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr.
+stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr. Speech (``--tts``: LFM3-Audio
+with its mmproj, as llama.cpp's ``llama-tts``): the WAV goes to ``-o`` (default output.wav), the frames, the speech's
+length and the times to stderr.
 """
 
 import argparse
@@ -23,6 +25,7 @@ import sys
 import time
 
 import jinja2
+import numpy as np
 
 from artlite.model_config import MODELS_DIR, model_path
 
@@ -109,12 +112,16 @@ def arg_parser() -> argparse.ArgumentParser:
     aud.add_argument("--live", nargs="?", const="fast", choices=("fast", "realtime"),
                      help="live transcription (English) of the --audio files, the text while the audio streams in: as "
                           "fast as it goes, or paced as a microphone's (realtime: each chunk's latency)")
+    spk = p.add_argument_group("speech out (LFM3-Audio)")
+    spk.add_argument("--tts", metavar="TEXT", help="speak the text (the model's tts template) into the WAV file -o")
+    spk.add_argument("--voice", default="female", choices=("female", "male"), help="the voice (default: female)")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
     img.add_argument("--cfg-scale", type=float, default=7.0, help="classifier-free guidance scale (default: 7.0)")
     img.add_argument("--sampler", choices=SAMPLERS, default="euler_a", help="sampling method (default: euler_a)")
-    img.add_argument("-o", "--output", default="output.png", help="the PNG file to write (default: output.png)")
+    img.add_argument("-o", "--output", help="the PNG file to write (default: output.png); --tts: the WAV file (default: "
+                     "output.wav)")
     img.add_argument("-W", "--width", type=int, default=512, help="image width (512 only for now)")
     img.add_argument("-H", "--height", type=int, default=512, help="image height (512 only for now)")
     return p
@@ -153,13 +160,49 @@ def generate_image(args: argparse.Namespace) -> None:
     out = sd.txt2img(text, negative_prompt=args.negative_prompt, steps=args.steps, cfg_scale=args.cfg_scale,
                      sampler=args.sampler, seed=args.seed, width=args.width, height=args.height, progress=progress)
     try:
-        write_png(args.output, out.pixels)
+        write_png(args.output or "output.png", out.pixels)
     except OSError as e:
         sys.exit(f"artlite-cli: {e}")
     steps = f"{args.steps} step{'s' * (args.steps > 1)}"
     sys.stderr.write(f"text encoder: {out.t_text:.2f} s; {steps} ({args.sampler}, cfg scale {args.cfg_scale:g}): "
                      f"{out.t_steps:.2f} s ({out.t_steps / args.steps:.2f} s per step); VAE decoder: {out.t_vae:.2f} s\n"
-                     f"{args.output}: {args.width}x{args.height}, seed {args.seed}\n")
+                     f"{args.output or 'output.png'}: {args.width}x{args.height}, seed {args.seed}\n")
+
+
+def speak(args: argparse.Namespace, options: dict[str, object]) -> None:
+    """``--tts``: the text spoken (``Lfm.tts``) into the WAV file -o; the frames and times to stderr."""
+    from .lfm3a.speech import SR, SpeechStats, wav
+
+    out = args.output or "output.wav"
+    t0 = time.perf_counter()
+    try:
+        model = open_model(args.model, **{k: v for k, v in options.items() if v is not None})
+        if not hasattr(model, "tts"):
+            raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
+        npu = model.load(capacity=args.ctx_size or 4096, prefill=not args.no_prefill)
+    except (OSError, ValueError, NotImplementedError) as e:
+        sys.exit(f"artlite-cli: {e}")
+    sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): speech; loaded in {time.perf_counter() - t0:.1f} s: "
+                     f"{npu.describe()}\n")
+    st, chunks, first = SpeechStats(), [], None
+    t0 = time.perf_counter()
+    try:
+        for y in model.tts(args.tts, voice=args.voice, language=args.language or "en", seed=args.seed,
+                           max_frames=args.n_predict if args.n_predict > 0 else 512, stats=st):
+            if first is None and len(y):
+                first = time.perf_counter() - t0
+            chunks.append(y)
+    except ValueError as e:
+        sys.exit(f"artlite-cli: {e}")
+    dt = time.perf_counter() - t0
+    y = np.concatenate(chunks)
+    with open(out, "wb") as f:
+        f.write(wav(y, SR))
+    audio = len(y) / SR
+    sys.stderr.write(f"{out}: {st.frames} frames, {audio:.2f} s of speech ({SR} Hz) in {dt:.2f} s (real time x"
+                     f"{audio / dt if dt else 0:.2f}), first audio after {first or 0:.2f} s; per frame: the depthformer "
+                     f"{1e3 * st.t_depth / max(st.frames, 1):.1f} ms, the model's step {1e3 * st.t_steps / max(st.frames, 1):.1f} "
+                     f"ms, the codec {1e3 * st.t_codec / max(st.frames, 1):.1f} ms\n")
 
 
 def live(args: argparse.Namespace, options: dict[str, object]) -> None:
@@ -227,6 +270,9 @@ def main(argv: list[str] | None = None) -> None:
         ({} if args.reasoning_effort == "default" else {"reasoning_effort": args.reasoning_effort})
     if args.live:
         live(args, options)
+        return
+    if args.tts is not None:
+        speak(args, options)
         return
     try:
         text = prompt_text(args)
