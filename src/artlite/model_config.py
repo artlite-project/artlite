@@ -796,3 +796,54 @@ class AudioConfig:
     @property
     def head_dim(self) -> int:
         return self.hidden // self.heads
+
+
+@dataclass(frozen=True)
+class GenConfig:
+    """A speech generator, from the ``clip.gen.audio.*`` metadata of a GGUF file (architecture ``clip``; llama.cpp's
+    ``tools/mtmd/clip.cpp``): ``projector`` (``clip.gen.audio.projector_type``: "lfm3a_gen", LFM3-Audio's depthformer
+    and codec decoder), the depthformer (``layers`` of ``hidden`` with ``heads`` and ``kv_heads``, ``ffn``, RMSNorm
+    ``eps``), the language model's width ``projection_dim`` and the speech codes' sampling (``temp``, ``top_k``, the
+    repetition penalty ``penalty_repeat`` over the last ``penalty_last_n`` frames: the converter writes the model card's;
+    llama.cpp's defaults are LFM3-Omni's card)."""
+
+    projector: str
+    projection_dim: int
+    hidden: int
+    ffn: int
+    layers: int
+    heads: int
+    kv_heads: int
+    eps: float
+    temp: float
+    top_k: int
+    penalty_repeat: float
+    penalty_last_n: int
+
+    @classmethod
+    def has_gen(cls, gguf: Any) -> bool:
+        return gguf.arch == "clip" and bool(gguf.meta.get("clip.has_gen_audio_encoder", False))
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> GenConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert cls.has_gen(gguf), f"{gguf.path}: no speech generator (clip.has_gen_audio_encoder)"
+        m = lambda k, d=None: gguf.meta.get(f"clip.gen.audio.{k}", d)
+        return cls(
+            projector=str(m("projector_type")),
+            projection_dim=int(m("projection_dim")),
+            hidden=int(m("embedding_length")),
+            ffn=int(m("feed_forward_length")),
+            layers=int(m("block_count")),
+            heads=int(m("attention.head_count")),
+            kv_heads=int(m("attention.head_count_kv", m("attention.head_count"))),
+            eps=float(m("attention.layer_norm_epsilon")),
+            temp=float(m("sampling.temp", 0.4)),
+            top_k=int(m("sampling.top_k", 0)),
+            penalty_repeat=float(m("sampling.penalty_repeat", 1.2)),
+            penalty_last_n=int(m("sampling.penalty_last_n", 64)),
+        )
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden // self.heads
