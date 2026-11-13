@@ -1423,3 +1423,123 @@ if __name__ == "__main__":
     d = args.path or ui.fetch()
     uvicorn.run(app_of(eng, ui=lambda app: ui.mount(app, d), reasoning="on", sse_ping_interval=1.0), port=args.port)
     eng.stop()
+
+
+class FakeSpeaker(FakeAudio):
+    """A model that speaks (``Lfm.tts``'s interface): per request 3 chunks of 480 samples (their values the chunk's index
+    / 10), its arguments recorded; its generator's mmproj config a namespace."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.audio.gen = types.SimpleNamespace()
+        self.spoken: list[dict[str, object]] = []
+
+    def voice_reply(self, messages: list[dict[str, object]], **kw: object) -> Iterator[tuple[str, object]]:
+        """Interleaved: the words " hello" " there", 2 chunks of 480 samples between them; the messages recorded."""
+        self.spoken.append({"messages": messages, **kw})
+        st = kw.get("stats")
+        yield "text", self.tokenizer.id(" hello")
+        for i in range(2):
+            if st is not None:
+                st.frames += 1
+            yield "audio", np.full(480, i / 10, np.float32)
+        yield "text", self.tokenizer.id(" there")
+
+    def tts(self, text: str, **kw: object) -> Iterator[np.ndarray]:
+        self.spoken.append({"text": text, **kw})
+        st = kw.get("stats")
+        for i in range(3):
+            if st is not None:
+                st.frames += 1
+            yield np.full(480, i / 10, np.float32)
+
+
+def test_speech() -> None:
+    """llama-server's /tts and OpenAI's /v1/audio/speech on a model that speaks: a WAV of the chunks (16-bit, 24 kHz),
+    float32 PCM, a streamed WAV (its sizes 0xFFFFFFFF), SSE deltas of base64 16-bit chunks; the fields passed on (seed,
+    voice, language, frames); the refusals (speaker_ref, unknown voices and formats, speed); /props' voices and
+    /v1/models' output modalities; a model that does not speak: 501."""
+    model = FakeSpeaker()
+    npu = FakeNpu(model)
+    engine = Engine(lambda: (model, npu), warmup=False)
+    ENGINES.append(engine)
+    engine.start()
+    want = (np.concatenate([np.full(480, i / 10, np.float32) for i in range(3)]) * 32767).round().astype("<i2")
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        r = client.post("/tts", json={"input": "hello", "seed": 7, "voice": "male", "lang": "de", "n_predict": 20})
+        assert r.status_code == 200 and r.headers["content-type"] == "audio/wav" and r.content[:4] == b"RIFF"
+        assert int.from_bytes(r.content[40:44], "little") == 2 * 1440 and r.content[24:28] == (24000).to_bytes(4, "little")
+        assert np.array_equal(np.frombuffer(r.content[44:], "<i2"), want)
+        assert model.spoken[-1] | {"stats": None} == {"text": "hello", "voice": "male", "language": "de", "seed": 7,
+                                                      "max_frames": 20, "stats": None}
+        r = client.post("/tts", json={"prompt": "hi", "response_format": "pcm"})
+        assert r.headers["content-type"].startswith("audio/pcm;rate=24000") and len(r.content) == 4 * 1440
+        assert model.spoken[-1]["seed"] is None and model.spoken[-1]["voice"] == "female"
+        r = client.post("/tts", json={"input": "hi", "stream": True})
+        assert r.content[4:8] == b"\xff\xff\xff\xff" and np.array_equal(np.frombuffer(r.content[44:], "<i2"), want)
+        r = client.post("/tts", data={"input": "a form"})
+        assert r.status_code == 200 and model.spoken[-1]["text"] == "a form"
+        for body, word in (({"input": "x", "speaker_ref_b64": "AA=="}, "voice encoder"), ({"input": ""}, "input"),
+                           ({"input": "x", "voice": "alloy"}, "female, male"), ({"input": "x", "response_format": "mp3"}, "wav")):
+            r = client.post("/tts", json=body)
+            assert r.status_code == 400 and word in r.json()["error"]["message"], (body, r.text)
+        r = client.post("/v1/audio/speech", json={"model": "fake", "input": "hello", "voice": "female"})
+        assert r.headers["content-type"] == "audio/wav" and np.array_equal(np.frombuffer(r.content[44:], "<i2"), want)
+        r = client.post("/v1/audio/speech", json={"input": "hello", "response_format": "pcm"})
+        assert np.array_equal(np.frombuffer(r.content, "<i2"), want)
+        ev = events(client.post("/v1/audio/speech", json={"input": "hello", "stream_format": "sse"}))
+        pcm = np.concatenate([np.frombuffer(base64.b64decode(e["audio"]), "<i2") for e in ev
+                              if isinstance(e, dict) and e["type"] == "speech.audio.delta"])
+        assert np.array_equal(pcm, want) and ev[-1] == {"type": "speech.audio.done", "usage": {
+            "input_tokens": 0, "output_tokens": 3, "total_tokens": 3}}
+        for body, word in (({"input": "x", "response_format": "mp3"}, "no encoder"), ({"input": "x", "voice": "alloy"},
+                           "female, male"), ({"input": "x", "speed": 1.5}, "speed")):
+            r = client.post("/v1/audio/speech", json=body)
+            assert r.status_code == 400 and word in r.json()["error"]["message"]
+        assert client.get("/props").json()["voices"] == ["female", "male"]
+        assert client.get("/v1/models").json()["data"][0]["architecture"]["output_modalities"] == ["text", "audio"]
+
+
+def test_speech_refused(fake: tuple) -> None:
+    """A model that does not speak: /tts and /v1/audio/speech 501, no voices in /props."""
+    client = fake[3]
+    assert client.post("/tts", json={"input": "x"}).status_code == 501
+    assert client.post("/v1/audio/speech", json={"input": "x"}).status_code == 501
+    assert "voices" not in client.get("/props").json()
+
+
+def test_chat_audio() -> None:
+    """Chat completions with audio output (modalities text and audio): the spoken reply's transcript and its WAV (or
+    pcm16) in message.audio, streamed as delta.audio pieces; a later turn's assistant message with that audio id goes to
+    the model as its transcript; an unknown voice or format: 400."""
+    model = FakeSpeaker()
+    npu = FakeNpu(model)
+    engine = Engine(lambda: (model, npu), warmup=False)
+    ENGINES.append(engine)
+    engine.start()
+    want = (np.concatenate([np.full(480, i / 10, np.float32) for i in range(2)]) * 32767).round().astype("<i2")
+    msgs = [{"role": "user", "content": "hi"}]
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        r = client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"],
+                                                      "audio": {"voice": "female", "format": "wav"}})
+        m = r.json()["choices"][0]["message"]
+        assert m["content"] is None and m["audio"]["transcript"] == " hello there"
+        data = base64.b64decode(m["audio"]["data"])
+        assert data[:4] == b"RIFF" and np.array_equal(np.frombuffer(data[44:], "<i2"), want)
+        assert r.json()["usage"]["completion_tokens_details"] == {"text_tokens": 2, "audio_tokens": 2}
+        ev = events(client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"],
+                                                               "audio": {"voice": "female", "format": "pcm16"},
+                                                               "stream": True}))
+        deltas = [e["choices"][0]["delta"].get("audio", {}) for e in ev if isinstance(e, dict)]
+        assert "".join(d.get("transcript", "") for d in deltas) == " hello there"
+        pcm = np.concatenate([np.frombuffer(base64.b64decode(d["data"]), "<i2") for d in deltas if "data" in d])
+        assert np.array_equal(pcm, want) and ev[-1] == "[DONE]"
+        turn = msgs + [{"role": "assistant", "audio": {"id": m["audio"]["id"]}}, {"role": "user", "content": "more"}]
+        client.post("/v1/chat/completions", json={"messages": turn, "modalities": ["text", "audio"]})
+        seen = model.spoken[-1]["messages"]
+        assert [x["content"] for x in seen] == ["hi", " hello there", "more"]
+        for audio, word in (({"voice": "alloy"}, "female, male"), ({"format": "mp3"}, "wav or pcm16")):
+            r = client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"], "audio": audio})
+            assert r.status_code == 400 and word in r.json()["error"]["message"]

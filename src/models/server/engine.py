@@ -318,6 +318,12 @@ class Engine:
                 raise
         return self.run(run)
 
+    def device_taken(self) -> None:
+        """(on the worker) Before work that leaves the device's sequence unknown to the prompt cache (speech output:
+        ``models.lfm3a.speech``): the cache keeps what RAM holds of the current one, the next job resets the device."""
+        self.cache.clear()
+        self._dirty = True
+
     def hold(self, ids: Sequence) -> int:
         """(on the worker) A live stream's text sequence and its next chunk's tokens: the device where they continue
         from (``PromptCache.prepare``: as the last chunk left it, else, when requests ran between the stream's chunks,

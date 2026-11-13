@@ -34,11 +34,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Receive, Scope, Send
 
 from ..common import MEDIA_MARKER, TEMPLATE_RESERVED, Sampling, chat_template
+from ..lfm3a.speech import VOICES
 from ..readouts import Readouts
 from ..sequence import data_bytes
 from . import agents, decisions, readouts, realtime
 from .agents import Blocks
 from .engine import Engine, Job
+from .speech import Replies, add_speech, chat_audio, speaks
 from .tools import Calls, ToolCall, Vocabulary, call_arguments, functions, syntax_of
 
 log = logging.getLogger("artlite.server")
@@ -372,8 +374,7 @@ def key_check(api_keys: frozenset[str]) -> Callable[..., Awaitable[None]]:
 
 TRANSCRIPT_TOKENS = (64, 8)  # a transcription's tokens at most by default: 64 + 8 per second of audio
 
-NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/v1/audio/speech", "/audio/speech", "/lora-adapters",
-                 "/metrics"]
+NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/lora-adapters", "/metrics"]
 
 
 def add_unsupported(router: APIRouter) -> None:
@@ -418,6 +419,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     typed = takes_parts(info.chat_template)
     first = system_first(info.chat_template)
     store = agents.Store()  # (the Responses API's, for previous_response_id)
+    replies = Replies()  # (the spoken replies' transcripts: their audio ids in later turns)
     vocab: list[Vocabulary] = []  # (the model's tokens for the calls' names: built on the first request with tools)
     vocab_lock = asyncio.Lock()
 
@@ -794,6 +796,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 "total_slots": 1, "model_alias": options.alias, "model_path": info.path,
                 "modalities": {"vision": engine.model.vision is not None, "audio": engine.model.audio is not None,
                                "video": False},
+                **({"voices": list(VOICES)} if speaks(engine) else {}),
                 "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
                 "ui": options.ui is not None, "ui_settings": {},
                 "chat_template": info.chat_template, "bos_token": info.bos_token, "eos_token": info.eos_token,
@@ -816,7 +819,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                                         "parameter_size": "", "quantization_level": ""}}],
                 "data": [{"id": name, "aliases": [], "tags": [], "object": "model",
                           "architecture": {"input_modalities": ["text"] + ["image"] * vision + ["audio"] * audio,
-                                           "output_modalities": ["decisions" if info.decision else "text"]},
+                                           "output_modalities": ["decisions" if info.decision else "text"] +
+                                           ["audio"] * (engine.model is not None and speaks(engine))},
                           "created": int(time.time()), "owned_by": "artlite",
                           "meta": {"n_vocab": info.n_vocab, "n_ctx": options.n_ctx, "n_ctx_train": info.n_ctx_train,
                                    "n_embd": info.n_embd, "n_params": info.n_params, "size": info.size,
@@ -860,6 +864,11 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     @api.post("/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request,
                                x_conversation_id: str | None = Header(None)) -> Any:
+        if "audio" in ((req.model_extra or {}).get("modalities") or []):  # (a spoken reply)
+            body = req.model_dump(exclude_none=True)
+            msgs = await run_in_threadpool(lambda: messages_of(
+                [Message.model_validate(m) for m in replies.messages(body["messages"])]))
+            return await chat_audio(engine, body, msgs, alias=options.alias, error=ApiError, replies=replies)
         j, events = await start(req, conv_id=x_conversation_id)
         cid, created, name = f"chatcmpl-{secrets.token_hex(16)}", int(time.time()), options.alias
         head = {"created": created, "id": cid, "model": name, "system_fingerprint": options.build_info}
@@ -1304,6 +1313,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                          errors=(bad_request, lambda m: ApiError(501, "not_supported_error", m)), fits=fits)
     realtime.add_route(app, engine=engine, alias=options.alias,
                        authorized=lambda a, x: key_valid(options.api_keys, a, x))
+    add_speech(api, engine, ApiError)
     add_unsupported(listed)
     app.include_router(public)
     app.include_router(listed)
