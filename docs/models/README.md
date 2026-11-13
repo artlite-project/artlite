@@ -1,7 +1,7 @@
 # Models
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
-[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, LFM3-Audio-2B, d1-2B)](lfm3.md),
+[Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B, d1-2B, d1-Omni-2B)](lfm3.md),
 [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
@@ -42,8 +42,9 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3-Reranker-0.6B ([rerank](../server.md#embeddings-and-rerank)) | ggml-org Q8_0 | |
 | vllm-decision2 | ✅ vllm-sr Decision-2.0-Kai-0.6B (decision model: [`/v1/systemone`](../server.md#decisions)) | Q8_0 by llama.cpp's converter from vllm-sr's checkpoint | |
 | lfm3 | ✅ LFM3-1.7B | LiquidAI QAD-Q4_0, Q4_K_M, Q8_0 | the sliding-window layers' caches as rings; LiquidAI BF16 |
-| | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0, its mmproj Q8_0 (images) | video |
-| | ✅ LFM3-VL-2B | LiquidAI QAD-Q4_0, its mmproj BF16, Q8_0 (images) | video; LiquidAI Q4_K_M, Q8_0 |
+| | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0, its mmproj Q8_0 (images, videos) | |
+| | ✅ LFM3-VL-2B | LiquidAI QAD-Q4_0, its mmproj BF16, Q8_0 ([images](lfm3.md#lfm3-vl-2b-images), [videos](lfm3.md#videos)) | LiquidAI Q4_K_M, Q8_0 |
 | | ✅ LFM3-Audio-2B (speech in: [transcription, live transcription](lfm3.md#lfm3-audio-2b-speech); speech out: [text to speech, spoken replies](lfm3.md#speech-output)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | LiquidAI Q8_0 |
-| | 🤔 LFM3-Omni-2B | | LiquidAI LFM3-Omni-2B, d1-Omni-2B |
+| | ✅ LFM3-Omni-2B ([images, videos with their sound, speech in and out](lfm3.md#lfm3-omni-2b-images-videos-speech)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | LiquidAI Q8_0 |
+| | ✅ d1-Omni-2B (decision model: [`/v1/systemone`](../server.md#decisions); audio clips, spoken questions) | LiquidAI Q8_0, its mmproj Q8_0 | |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |

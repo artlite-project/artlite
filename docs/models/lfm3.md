@@ -1,7 +1,7 @@
 # LFM3 on the NPU
 
-LiquidAI's LFM3-1.7B (and LFM3-VL-2B with images, LFM3-Audio-2B with speech: [below](#lfm3-vl-2b-images)) from a GGUF
-file (architecture `lfm3`):
+LiquidAI's LFM3-1.7B (and LFM3-VL-2B with images and videos, LFM3-Audio-2B with speech, LFM3-Omni-2B with all of them,
+the decision models d1-2B and d1-Omni-2B: [below](#lfm3-vl-2b-images)) from a GGUF file (architecture `lfm3`):
 24 layers of three kinds, 13 short-convolution layers, 6
 full-attention layers and 5 sliding-window attention layers (a window of 256 positions), each an operator and a SwiGLU
 FFN with norms before and after both. The architecture is read from the file's metadata, the tokenizer and the chat
@@ -153,8 +153,12 @@ second, at least 4 and at most 768 (LFM3-Omni-2B, which hears the soundtrack: 38
 every frame stay under ~25 Mpx (a 30 s 720p video's frames are 832 x 480); consecutive frames in pairs, each pair one
 "image" whose two frames the encoder's patch embedding takes together, after a timestamp (`<0.5 seconds>`). LFM3-Omni
 hears the soundtrack too: it is encoded as one clip and its rows go after the pair they belong to. A pair runs on the
-vision overlay as an image of its size does (a 640 x 360 video's pairs: 35 ms each; 960 x 540: 70 ms); a frame over
-the encoder's largest image (4096 tokens: a 4K video under 3 s) takes an image's size, which llama.cpp does not cap.
+vision overlay as an image of its size does (a 640 x 360 video's pairs: 35 ms each; 960 x 540: 70 ms), two in one run
+where that takes fewer bands (pairs of up to 64 tokens, a video of over ~3 minutes: a band of 128 windows for two; each
+pair's embeddings bit for bit its own run's); a frame over the encoder's largest image (4096 tokens: a 4K video under
+3 s) takes an image's size, which llama.cpp does not cap. The pairs encode while FFmpeg decodes the video, and a video
+whose frames keep to its frame rate (the usual file) has only its sampled frames converted (the same pixels as
+llama.cpp's command, which converts every frame).
 
 ## LFM3-Audio-2B (speech)
 
@@ -273,12 +277,84 @@ switches between the hardware contexts ~5 ms, the codec ~0.7 ms), 2.5x real time
 half of the CPU's energy and somewhat less than the iGPU's, and leaves both free (its host side still keeps the CPU
 cores at ~10 W).
 
+## LFM3-Omni-2B (images, videos, speech)
+
+```bash
+M=LiquidAI/LFM3-Omni-2B-GGUF
+artlite-cli -m $M/LFM3-Omni-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Omni-2B-Q8_0.gguf --image photo.jpg --audio question.wav
+artlite-cli -m $M/LFM3-Omni-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Omni-2B-Q8_0.gguf --video clip.mp4 -p "What is said?"
+artlite-cli -m $M/LFM3-Omni-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Omni-2B-Q8_0.gguf --audio question.wav --speak reply.wav
+artlite-server -m $M/LFM3-Omni-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Omni-2B-Q8_0.gguf
+```
+
+```
+$ARTLITE_MODELS_DIR/LiquidAI/LFM3-Omni-2B-GGUF/   LiquidAI/LFM3-Omni-2B-GGUF
+    LFM3-Omni-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, its own weights; Q4_0 too)
+    mmproj-LFM3-Omni-2B-Q8_0.gguf                 (its vision encoder, speech encoder and speech generator; BF16, F16 too)
+```
+
+LiquidAI's LFM3-Omni-2B is LFM3's trunk with all three media networks in one mmproj: LFM3-VL's vision encoder (its own
+weights), LFM3-Audio's speech encoder and speech generator. Everything the sections above describe runs on it:
+pictures (64 to 2048 tokens: the mmproj's bounds), videos with their soundtrack ([Videos](#videos): at most 384
+frames), audio clips, transcription (the offline ASR prompt; live transcription is LFM3-Audio's), text to speech,
+spoken replies and realtime conversations ([artlite-server](../server.md#speech)), the template's tool calls. The three
+networks share one vision overlay, so an image and a clip run back to back without switching hardware contexts (the
+process holds three: the media's, the language model's decode overlay and its prefill library). Its mmproj must be
+Q8_0, BF16 or F16: the vision overlay's GEMMs read bfp16, so a 4-bit mmproj would grow to twice its size at every
+load (it is refused, naming Q8_0).
+
+Accuracy, teacher-forced over llama.cpp's answers (KL of the next-token distributions against llama.cpp's language
+model on exact (float64) media embeddings; llama.cpp's CPU encoders on the Q8_0 mmproj are themselves 3-4% from them):
+
+| prompt | the NPU's language model on those embeddings | the NPU's encoders too | llama.cpp's own run |
+|---|---|---|---|
+| a picture | 0.0033 | 0.0051 | 0.0040 |
+| a spoken clip (ASR) | 0.0002 | 0.0004 | 0.0002 |
+| a picture with a spoken question | 0.0021 | 0.0035 | 0.0024 |
+| a 14 s video with its soundtrack (7.3K tokens) | 0.0031 | 0.0068 | 0.0051 |
+
+(The greedy answers the same; a video's error is its pairs': the tower's tokens 5.1% from float64 at the median,
+llama.cpp's 3.2%.) Word error rates of the transcriptions (LibriSpeech, as [above](#lfm3-audio-2b-speech)): Artlite
+2.27% / 4.87% (test-clean / test-other), llama.cpp on the CPU 2.22% / 4.93%. Its speech (200 LibriSpeech sentences spoken twice each, transcribed back by
+Whisper base.en): 3.17% word error rate, llama.cpp's (CPU) 3.40% (paired: -0.23 points, 95% interval -0.64 .. +0.11). Questions
+about videos (60 of Daily-Omni's multiple-choice questions, one per clip of 30 or 60 s, their sound included, greedy):
+41 right, llama.cpp on the CPU 42, the same answer on 59 (the prompts' tokens the same).
+
+The time to the first token of a media prompt through each runtime's server (Strix Halo, HTTP included; the media
+fresh each request; energy: the SoC's power above an 18 W idle until the first token):
+
+| prompt (prompt tokens) | Artlite (NPU), Q4_K_M / Q4_0 | llama-server, iGPU (Vulkan) | llama-server, CPU (16 threads) |
+|---|---|---|---|
+| a 512 x 512 picture with a 2 s spoken question (316) | 0.19 / 0.18 s, 1.7 J | 0.30 s, 9.0 J | 0.64 s, 34 J |
+| a 10 s 640 x 360 video with its sound (2445) | 0.86 / 0.81 s, 16 J | 2.6 s, 101 J | 5.6 s, 293 J |
+| a 30 s 720p video with its sound (10.7K) | 3.85 / 3.66 s, 134 J | 12.4 s, 470 J | 31 s, 1583 J |
+| a 3-minute 720p video with its sound (14.5K) | 5.72 / 5.43 s, 236 J | 23.8 s, 915 J | 80 s, 3345 J |
+
+(The 30 s and 3-minute videos: cuts of one cooking video copied from its stream, so FFmpeg converts all their frames
+(llama.cpp's command); the same cuts re-encoded, as most files are, have only their sampled frames converted, but the
+3-minute one's frames come out a little larger (pairs of 66 tokens: a run each): 4.25 and 6.54 s on Q4_K_M.) Most of a
+long video's time is its pairs on the vision overlay and the prompt's prefill (14.5K tokens: 2.7 s); FFmpeg decodes
+meanwhile.
+
+Speech output, as LFM3-Audio's ([Speech output](#speech-output); `/tts`, streamed, warm):
+
+| | 9 s of speech | 41 s of speech | first audio | energy per minute of speech |
+|---|---|---|---|---|
+| Artlite (NPU), Q4_K_M | 3.8 s | 16.5 s | 0.19 s | 150 J |
+| Artlite (NPU), Q4_0 | 3.9 s | 12.0 s (30 s of speech) | 0.18 s | 150 J |
+| llama.cpp, CPU (16 threads) | 2.1 s | 9.9 s | 0.2 s | 760 J |
+| llama.cpp, iGPU (Vulkan) | 1.9 s | 8.2 s | 0.11 s | 420 J |
+
+A realtime conversation's turn ([artlite-server](../server.md#speech): the audio runs on the model as it arrives)
+answers in speech 0.36 s after the user's audio ends (`output_modalities: ["audio"]`; interleaved text and speech:
+0.48 s, its first 6 text tokens before the first frames).
+
 ## d1-2B (decision model)
 
 LiquidAI's d1-2B is a decision model on LFM3's trunk: typed answers to questions about a state (a choice, a score, a
 yes / no probability) from one forward pass, no generated text, through
-[artlite-server's `/v1/systemone`](../server.md#decisions), about text and pictures (its mmproj: LFM3-VL's encoder).
-Video does not run yet.
+[artlite-server's `/v1/systemone`](../server.md#decisions), about text, pictures and videos (their frames; its mmproj:
+LFM3-VL's encoder).
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/d1-2B-GGUF/         LiquidAI/d1-2B-GGUF
@@ -300,7 +376,19 @@ A request's pictures (`images`, or a chat state's `image_url` parts: [Decisions]
 state, each its tokens between `<|vision_start|>` and `<|vision_end|>`, as d1's runner and llama-server place them.
 A picture takes 64 to 1600 tokens of 32 x 32 pixels (d1's runner's budget, which it was trained at; llama-server reads
 up to 4096: `--image-max-tokens 1600` there gives the same sizes); a state with its pictures fits one chunk of 4096
-tokens.
+tokens. A video (a data URI, a chat state's `video_url` part) is its frames' pairs, as d1's runner reads them
+([Videos](#videos)), without its soundtrack.
+
+LiquidAI's d1-Omni-2B is d1 with LFM3-Omni's encoders (`LiquidAI/d1-Omni-2B-GGUF`: `d1-Omni-2B-Q8_0.gguf`, its mmproj
+`mmproj-d1-Omni-2B-Q8_0.gguf`): a request's media can also be audio clips (data URIs, `input_audio` parts; a video
+still its frames alone, as d1's runner reads it), and a question can be spoken (its `instructions` an `input_audio`
+part: heard where its text would be), as llama-server reads them. Against llama-server on the CPU, each question
+alone: the same answer on 316 of the 320 text questions above (the other four near ties, within 0.02), the largest
+difference in a probability 0.033 (median 0.004); about media 8 of 9 (the other a near tie), within 0.042. Through the
+servers (fresh media each request; energy above an 18 W idle), a request about a 14 s clip (4 questions), a picture
+with a spoken question (2) or a 4 s video's frames (3): 157 / 183 / 203 ms, 0.4 / 1.1 / 0.8 J a question (Artlite:
+its questions in one sequence); llama-server on the iGPU 362 / 317 / 701 ms, 3.3 / 4.9 / 6.7 J; on the CPU 595 /
+846 / 1287 ms, 7.8 / 21 / 21 J.
 
 How it runs: its full-attention layers are non-causal, so a request is read as d1's own runner reads it, the state
 once and up to 16 questions after it in one sequence (a request's `set_size`: [Decisions](../server.md#decisions)),

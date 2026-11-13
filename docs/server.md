@@ -295,8 +295,8 @@ generation run on the NPU worker between requests, its samples (24 kHz) streamed
   `response.function_call_arguments.delta` / `.done`); its result goes back as a `function_call_output` item, and the
   next `response.create` answers it. The conversation stays on the model between turns (the prompt cache: another
   request in between moves it to RAM and back): a turn's audio runs on the model while it arrives, so a response
-  starts with the turn's last rows (Omni's first audio ~0.5 s after the commit), and each reply stays as the model
-  said it (its text and frames).
+  starts with the turn's last rows (Omni's first audio 0.36 s after the commit; interleaved with text: 0.48 s), and
+  each reply stays as the model said it (its text and frames).
 - Chat completions with `modalities: ["text", "audio"]` and `audio: {"voice": "female", "format": "wav"}` (OpenAI's
   chat audio output): a spoken reply (the model's interleaved text and speech; `modalities: ["audio"]`: speech, then
   text) as `message.audio` (`id`, `data`: base64
