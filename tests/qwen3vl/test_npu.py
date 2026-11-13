@@ -17,7 +17,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import ASTRONAUT, essay
 from ..goldens.media import golden
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_report
 from .files import MMPROJ, MODEL
 

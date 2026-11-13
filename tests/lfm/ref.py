@@ -12,7 +12,7 @@ from artlite.model_config import d1_gguf, lfm3_gguf
 from .. import common
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import require
+from ..model_files import require
 from . import cpu
 
 SOURCES = [cpu.__file__]

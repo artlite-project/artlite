@@ -16,7 +16,7 @@ from artlite.model_config import QwenConfig, qwen_gguf, qwen_mtp_of
 from ..common import essay
 from ..goldens.text import Golden, golden
 from ..llama_cpp import llama_tokenize
-from ..models import require
+from ..model_files import require
 from ..moe import ref as moe_ref
 from ..numerics import rel_max
 from . import ref

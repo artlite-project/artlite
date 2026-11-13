@@ -17,7 +17,7 @@ from models.tokenizer import BpeTokenizer
 
 from ..goldens import media
 from ..goldens.media import VisionGolden
-from ..models import require
+from ..model_files import require
 from . import ref as R
 from .files import MARKER, MMPROJ, MODEL, asr_text, clip
 

@@ -18,7 +18,7 @@ from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator
 
 from ..common import to_numpy
-from ..models import require
+from ..model_files import require
 from ..numerics import rel_max
 from . import ref
 

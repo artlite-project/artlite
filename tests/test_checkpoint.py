@@ -20,7 +20,7 @@ from models.npu_model import NpuModel
 from models.sampling import Sampling
 
 from .common import essay
-from .models import require
+from .model_files import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 

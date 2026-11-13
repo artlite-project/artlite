@@ -17,7 +17,7 @@ from models.lfm3vl import host as H
 
 from .common import VIDEOS, video_file
 from .goldens.media import video_items
-from .models import require
+from .model_files import require
 
 
 @pytest.fixture(scope="module")

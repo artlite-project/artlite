@@ -14,7 +14,7 @@ from models.lfm.lfm import Lfm
 from models.lfm3a import host as A
 from models.lfm3a import speech as S
 
-from ..models import require
+from ..model_files import require
 from ..numerics import rel
 from . import gen_ref as R
 from .files import MMPROJ, MODEL, TEXT

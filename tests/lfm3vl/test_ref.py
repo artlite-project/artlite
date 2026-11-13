@@ -17,7 +17,7 @@ from models.sequence import load_image
 
 from ..common import ASTRONAUT
 from ..goldens.media import golden
-from ..models import require
+from ..model_files import require
 from . import ref as V
 from .files import MMPROJ, MODEL
 

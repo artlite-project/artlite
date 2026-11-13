@@ -10,7 +10,7 @@ import pytest
 
 from models.lfm3a import host as A
 
-from ..models import require
+from ..model_files import require
 from ..numerics import rel_rows
 from . import ref as R
 from .files import CLIPS, MMPROJ, clip

@@ -8,7 +8,7 @@ from artlite.model_config import lfm3a_gguf, lfm3a_mmproj
 from models.lfm3a import host as A
 from models.tokenizer import chat_prompt
 
-from ..models import require
+from ..model_files import require
 
 CLIPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "datasets", "librispeech")
 MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()

@@ -27,7 +27,7 @@ from ..common import essay
 from ..decode import mmv
 from ..goldens.text import Golden, golden
 from ..llama_cpp import llama_tokenize
-from ..models import require, size_gguf
+from ..model_files import require, size_gguf
 from ..moe import ref as moe_ref
 from ..numerics import bf16_round, from_bf16_bits, rel_max
 from ..operators import kmath_sim

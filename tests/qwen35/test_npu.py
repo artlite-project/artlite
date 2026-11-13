@@ -21,7 +21,7 @@ from models.qwen35.qwen import NpuQwen
 from ..common import draft_gate, draft_prompts, essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import require, size_gguf
+from ..model_files import require, size_gguf
 from ..numerics import kl_rows, rel_max
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow

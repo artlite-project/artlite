@@ -19,7 +19,7 @@ from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
 from ..common import essay, to_numpy, to_torch
-from ..models import require
+from ..model_files import require
 from ..numerics import rel
 
 LAYERS = (0, 5)  # a sliding-window and a full-attention layer

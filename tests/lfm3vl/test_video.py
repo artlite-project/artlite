@@ -18,7 +18,7 @@ from models.lfm3vl import host as H
 
 from ..common import video_file
 from ..goldens.media import golden
-from ..models import require
+from ..model_files import require
 from . import ref as V
 
 MODEL, MMPROJ = lfm3vl_gguf(), lfm3vl_mmproj("BF16")

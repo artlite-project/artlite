@@ -16,7 +16,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
 from .llama_cpp import llama_tokenize
-from .models import require
+from .model_files import require
 
 TEXTS = [
     "Hello world, this is a test.\nNew line  two spaces",

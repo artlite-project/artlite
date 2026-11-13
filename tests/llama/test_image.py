@@ -14,7 +14,7 @@ from artlite.model_config import LlamaConfig, llama_gguf, qwen3_gguf
 from artlite.operators.design import COLS
 from models.llama.image import KC, LlamaImage
 
-from ..models import require
+from ..model_files import require
 
 SIZES = {"1B": (16, 2048, 8192, 32, 64, 32.0), "3B": (28, 3072, 8192, 24, 128, 32.0),
          "8B": (32, 4096, 14336, 32, 128, 8.0)}  # layers, hidden, ffn, heads, head_dim, RoPE factor

@@ -19,7 +19,7 @@ from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
 
 from ..common import ASTRONAUT
-from ..models import require
+from ..model_files import require
 from ..numerics import bf16_like, rel
 from ..vision.ops_ref import from_level_tokens, level_tokens
 from . import ref as V

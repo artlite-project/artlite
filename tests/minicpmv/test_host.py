@@ -14,7 +14,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, minicpmv_gguf
 from models.minicpmv import host as M
 
-from ..models import require
+from ..model_files import require
 
 CLIP = ClipConfig(projector="minicpmv4_7", image_size=448, patch_size=14, hidden=1152, ffn=4304, layers=27, heads=16,
                   eps=1e-6, mean=(0.5,) * 3, std=(0.5,) * 3, projection_dim=1024, merge=4, max_slices=9, merger_layer=6)

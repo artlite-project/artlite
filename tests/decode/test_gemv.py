@@ -15,7 +15,7 @@ from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
 from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
-from ..models import require
+from ..model_files import require
 from ..numerics import bf16_round
 from ..tensors import random_tensor
 from . import mmv

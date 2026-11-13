@@ -14,7 +14,7 @@ from models.llama.tokenizer import chat_prompt
 from models.npu_model import auto_capacity
 
 from ..common import cached_ref, essays, model_key
-from ..models import llama_path
+from ..model_files import llama_path
 from ..numerics import kl_agree
 from . import cpu as llama_cpu
 

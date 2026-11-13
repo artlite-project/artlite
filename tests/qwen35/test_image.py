@@ -19,7 +19,7 @@ from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
-from ..models import require
+from ..model_files import require
 from ..moe.ref import experts
 
 S = 9280

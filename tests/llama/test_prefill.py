@@ -19,7 +19,7 @@ from artlite.operators.design import COLS
 from artlite.prefill import attn as PA
 from artlite.prefill.gemm import Layout
 
-from ..models import llama_path, require
+from ..model_files import llama_path, require
 from ..numerics import rel
 
 A_BYTES = 9280  # the cache objects (the Q4_K_M images' tile size)

@@ -17,7 +17,7 @@ from models.lfm3a import codec as CD
 from models.lfm3a import depth as DP
 from models.lfm3a import speech as S
 
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_rows
 from . import gen_ref as R
 from .files import MMPROJ, MODEL, TEXT

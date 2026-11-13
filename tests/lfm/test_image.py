@@ -16,7 +16,7 @@ from artlite.model_config import LFM3_QUANTS, LfmConfig, lfm3_gguf
 from artlite.operators.design import COLS
 from models.lfm.image import CH, KC, LfmImage
 
-from ..models import require
+from ..model_files import require
 
 TILES = {"QAD-Q4_0": 9280, "Q4_K_M": 9280, "Q8_0": 9216, "BF16": 9216}
 

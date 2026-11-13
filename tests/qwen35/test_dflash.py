@@ -36,7 +36,7 @@ from models.tokenizer import BpeTokenizer
 from .. import np_ops
 from ..common import essays, to_torch
 from ..goldens.text import golden
-from ..models import require, size_gguf
+from ..model_files import require, size_gguf
 from ..numerics import from_bf16_bits, rel_max
 from . import dflash_ref, ref
 

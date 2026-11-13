@@ -13,7 +13,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
 from models.sd15 import vae
 
-from ..models import require
+from ..model_files import require
 from ..numerics import rel_native
 
 

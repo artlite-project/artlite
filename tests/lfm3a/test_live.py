@@ -12,7 +12,7 @@ from artlite.model_config import lfm3a_gguf
 from models.lfm3a import host as A
 from models.lfm3a.live import CHUNK_ROWS, Stream
 
-from ..models import require
+from ..model_files import require
 from ..numerics import rel_rows
 from . import ref as R
 from .files import MMPROJ, clip

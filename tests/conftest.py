@@ -16,6 +16,14 @@ os.environ.setdefault("ARTLITE_VERIFY_TXN", "1")
 
 from artlite import parallel_compile
 
+# A module or package of tests/ named like a package of src/ would shadow it for a script run from tests/ (``python
+# tests/txn_dump.py``: the script's directory comes first on sys.path) and wherever the editable install's finder is not
+# first (worktrees, wheel installs).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if shadows := [p for p in ("artlite", "models") if os.path.exists(os.path.join(_HERE, p + ".py"))
+               or os.path.isdir(os.path.join(_HERE, p))]:
+    raise RuntimeError(f"tests/ has a module named like a src package: {shadows}")
+
 if TYPE_CHECKING:
     from artlite.vision.device import VisionDevice
 

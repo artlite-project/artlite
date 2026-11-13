@@ -15,7 +15,7 @@ from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer
 
 from ..goldens.media import golden
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_report
 from .files import MARKER, MMPROJ, MODEL, asr_text, clip
 

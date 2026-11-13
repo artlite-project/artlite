@@ -31,7 +31,7 @@ from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 from models.sampling import Sampling
 
 from ..common import as_torch, cached_ref, draft_gate, draft_prompts, model_key, to_torch
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_rows, rel_finite
 from . import cpu as gemma_cpu
 from . import ref

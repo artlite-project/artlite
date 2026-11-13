@@ -15,7 +15,7 @@ from artlite.model_config import QwenConfig
 from ..common import essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import require, size_gguf
+from ..model_files import require, size_gguf
 from ..numerics import rel_max
 
 

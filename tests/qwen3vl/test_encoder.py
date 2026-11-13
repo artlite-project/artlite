@@ -24,7 +24,7 @@ from models.qwen3vl import host as Q
 from models.sequence import load_image
 
 from ..common import ASTRONAUT
-from ..models import require
+from ..model_files import require
 from ..numerics import rel, rel_rows
 from . import ref as V
 from .files import MMPROJ

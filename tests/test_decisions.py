@@ -28,7 +28,7 @@ from models.server.decisions import Decisions
 from .common import cached_ref, essay, model_key
 from .goldens.text import golden
 from .llama_cpp import lib_identity, llama_server_decisions
-from .models import require
+from .model_files import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 

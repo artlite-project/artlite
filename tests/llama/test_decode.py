@@ -29,7 +29,7 @@ from artlite.operators.design import COLS
 from models.llama.overlay import LlamaOverlay
 
 from ..common import as_torch, essay, to_torch
-from ..models import llama_path
+from ..model_files import llama_path
 from ..numerics import rel_finite
 from . import ref
 

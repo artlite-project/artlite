@@ -20,7 +20,7 @@ from models.sampling import Penalties, Sampling
 from models.spec_options import add_spec_options, drafter_type, spec_options
 
 from .common import essay
-from .models import require
+from .model_files import require
 
 VOCAB = 32
 GREEDY = Sampling(greedy=True)

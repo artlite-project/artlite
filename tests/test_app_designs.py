@@ -24,7 +24,7 @@ from artlite.model_config import (
     swift_gguf,
 )
 
-from .models import require
+from .model_files import require
 
 
 def _llama(path: str, kv_k: str) -> tuple[str, Callable[[str], None]]:

@@ -16,7 +16,7 @@ from models.lfm3a import speech as S
 from models.tokenizer import BpeTokenizer
 
 from ..llama_cpp import llama_tokenize
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_rows
 from . import gen_ref as R
 from .files import MMPROJ, MODEL, TEXT

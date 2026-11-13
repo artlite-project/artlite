@@ -11,7 +11,7 @@ import pytest
 from artlite.model_config import sd15_dir
 from models.sd15.sampling import SAMPLERS, Schedule, cfg_denoiser, sample
 
-from ..models import require
+from ..model_files import require
 
 SIGMA_MIN, SIGMA_MAX = 0.02916716, 14.614641  # SD 1.x's sigmas at timesteps 0 and 999
 

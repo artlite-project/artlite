@@ -35,7 +35,7 @@ from ..goldens.media import golden
 from ..lfm3a import ref as AR
 from ..lfm3vl import ref as VR
 from ..llama_cpp import llama_tokenize
-from ..models import require
+from ..model_files import require
 from ..numerics import kl_agree
 
 MODEL, MMPROJ = lfm3omni_gguf(), lfm3omni_mmproj()

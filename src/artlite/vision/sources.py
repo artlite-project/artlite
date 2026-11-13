@@ -13,7 +13,7 @@ import glob
 import os
 from collections.abc import Iterator
 
-from ..operators.base import PACKAGE_DIR
+from ..operators.toolchain import PACKAGE_DIR
 
 ROOTS = ("artlite", "models")  # (the packages the closure follows)
 SRC = os.path.dirname(PACKAGE_DIR)  # (their directory)

@@ -20,7 +20,7 @@ from models.qwen35.image import QwenImage
 from ..common import essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import require
+from ..model_files import require
 from ..numerics import bf16_round, rel_max
 from . import ref
 

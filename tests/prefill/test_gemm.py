@@ -38,7 +38,7 @@ from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
 
 from ..common import to_numpy, to_torch
-from ..models import require
+from ..model_files import require
 from ..numerics import rel_native
 
 LEVEL = 3  # (a paced level: the paced copy of each worker body)

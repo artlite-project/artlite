@@ -21,7 +21,7 @@ from models.qwen35.image import QwenImage, gdn_v_heads
 from ..common import essay, to_numpy
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import require, size_gguf
+from ..model_files import require, size_gguf
 from ..numerics import bf16_round, rel_max
 from . import ref
 

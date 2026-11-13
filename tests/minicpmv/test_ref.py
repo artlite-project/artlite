@@ -18,7 +18,7 @@ from models.minicpmv import host as M
 
 from ..common import ASTRONAUT
 from ..goldens.media import VisionGolden, golden
-from ..models import require
+from ..model_files import require
 from ..numerics import rel
 from . import ref as V
 from .files import MMPROJ, NAMES

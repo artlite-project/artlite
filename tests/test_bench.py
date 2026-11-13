@@ -12,7 +12,7 @@ from artlite.model_config import gemma_gguf
 from models.bench import FIELDS, PRINTERS, arg_parser, file_info, file_type_name, int_list, plan, result
 from models.bench import Test as BenchTest  # (not a pytest class)
 
-from .models import require
+from .model_files import require
 
 
 def test_int_list() -> None:

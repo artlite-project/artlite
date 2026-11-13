@@ -21,7 +21,7 @@ from models.readouts import Readouts, pool, rows_of
 
 from .common import cached_ref, essay, model_key, to_torch
 from .llama_cpp import lib_identity, llama_embeddings
-from .models import require
+from .model_files import require
 from .numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
