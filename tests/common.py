@@ -8,7 +8,6 @@ import pytest
 import torch
 from ml_dtypes import bfloat16
 
-from artlite.model_config import llama_gguf  # noqa: F401 (the tests import it from here)
 from models.common import Sampling
 
 # CPU reference results of the slow tests (whole-model logits), cached across runs in a folder per model: gitignored

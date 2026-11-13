@@ -4,7 +4,6 @@ second continuing the first's state and conv state with padding tokens after its
 o and the state against the cores' arithmetic (``ref.core_gdn_scan``: the exact SiLU, the cores' table SiLU is
 within 0.59 bf16 ULP) and llama.cpp's."""
 
-import os
 
 import numpy as np
 import pytest
@@ -22,7 +21,7 @@ from models.qwen35.image import QwenImage, gdn_v_heads
 from ..common import essay, to_numpy
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import size_gguf
+from ..models import require, size_gguf
 from ..numerics import bf16_round, rel_max
 from . import ref
 
@@ -39,8 +38,7 @@ def _bits(x: np.ndarray) -> np.ndarray:
 def test_gdn_scan(T: int, size: str) -> None:
     """(Occamy: its F32 alpha in the ab slot as fp32, ``gdn_prefill.ab_f32``)"""
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     L = cfg.gdn_layers[0]
@@ -135,8 +133,7 @@ def test_gdn_out(size: str) -> None:
     from artlite.operators import bfp16
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     L, T, n = cfg.gdn_layers[0], 64, 50
@@ -184,8 +181,7 @@ def test_gdn_scan_packed(size: str) -> None:
     of a segment's state into the next); one that starts at a scan chunk bit-identical up to the chunk the next one
     starts inside (whose reset changes that chunk's arithmetic)."""
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     L, T = cfg.gdn_layers[0], 128
@@ -273,8 +269,7 @@ def test_gdn_scan_tree(size: str) -> None:
     arithmetic from the same state), within the reference's tolerance of the cores' arithmetic; the layer's state left
     as the prefix's (the 27B: three v heads per k head, the L1's tightest)."""
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     L, T, t, pre = cfg.gdn_layers[0], 192, 96, 100

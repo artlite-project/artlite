@@ -4,7 +4,6 @@ hidden state and, teacher-forced on llama.cpp's sampled frames, each frame's (th
 header's input), within the language model's own distance from llama.cpp's; seeded runs end with the end-of-audio frame
 and their speech transcribes back to the text (the model's own speech encoder: ASR)."""
 
-import os
 import re
 
 import numpy as np
@@ -15,6 +14,7 @@ from models.lfm.lfm import Lfm
 from models.lfm3a import host as A
 from models.lfm3a import speech as S
 
+from ..models import require
 from ..numerics import rel
 from . import gen_ref as R
 from .test_gen_ref import MMPROJ, MODEL, TEXT
@@ -24,9 +24,7 @@ pytestmark = pytest.mark.slow  # (the whole model)
 
 @pytest.fixture(scope="module")
 def app() -> tuple[Lfm, object]:
-    for p in (MODEL, MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(MODEL, MMPROJ)
     m = Lfm(MODEL, mmproj=MMPROJ)
     return m, m.load(capacity=2048)
 

@@ -35,6 +35,7 @@ from ..goldens.media import golden
 from ..lfm3a import ref as AR
 from ..lfm3vl import ref as VR
 from ..llama_cpp import llama_tokenize
+from ..models import require
 from ..numerics import kl_agree
 
 MODEL, MMPROJ = lfm3omni_gguf(), lfm3omni_mmproj()
@@ -93,12 +94,6 @@ def _text(m: Lfm, messages: list[dict[str, object]]) -> str:
     return chat_prompt(m.gguf, messages, enable_thinking=False, bos_token=bos)
 
 
-def _files(*paths: str) -> None:
-    for p in paths:
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
-
-
 @pytest.fixture(scope="module")
 def videos(tmp_path_factory: pytest.TempPathFactory) -> str:
     return str(tmp_path_factory.mktemp("videos"))
@@ -122,7 +117,7 @@ def test_prompt_tokens(case: str, videos: str) -> None:
     where each of llama.cpp's media chunks' tokens is."""
     vl = case.startswith("vl-")
     model, mmproj = (lfm3vl_gguf(), lfm3vl_mmproj()) if vl else (MODEL, MMPROJ)
-    _files(model, mmproj, SPEECH_CLIP)
+    require(model, mmproj, SPEECH_CLIP)
     m = _host(model, mmproj, audio=not vl)
     content, files, mtmd = [], [], []
     for kind, what in CASES[case]:
@@ -147,7 +142,7 @@ def test_prompt_tokens(case: str, videos: str) -> None:
 @pytest.mark.parametrize("voice, language", [("female", "en"), ("male", "de")])
 def test_tts_prompt(voice: str, language: str) -> None:
     """Omni's TTS prompt: the file's ``tts`` template (``<think></think>`` before ``<|audio_start|>``), llama.cpp's ids."""
-    _files(MODEL)
+    require(MODEL)
     g = GGUFFile(MODEL)
     text = S.tts_prompt(g, "Hello there.", language=language, voice=voice)
     assert text.endswith("<|im_start|>assistant\n<think></think><|audio_start|>")
@@ -157,7 +152,7 @@ def test_tts_prompt(voice: str, language: str) -> None:
 def test_interleaved_prompt() -> None:
     """A voice reply's prompt: the conversation with ``speech.INTERLEAVED`` as its system turn, the assistant turn opened
     by ``<think></think>`` (the template's default) and ``<|mixed_start|>``: llama.cpp's ids of that text."""
-    _files(MODEL, MMPROJ)
+    require(MODEL, MMPROJ)
     m = _host(MODEL, MMPROJ, audio=True)
     msgs = [{"role": "system", "content": S.INTERLEAVED}, {"role": "user", "content": "What is the capital of France?"}]
     text = _text(m, msgs) + S.MIXED_START
@@ -189,7 +184,7 @@ QA = {
 
 @pytest.fixture(scope="module")
 def app() -> tuple[Lfm, object]:
-    _files(MODEL, MMPROJ, SPEECH_CLIP)
+    require(MODEL, MMPROJ, SPEECH_CLIP)
     m = Lfm(MODEL, mmproj=MMPROJ)
     return m, m.load(capacity=16384)
 

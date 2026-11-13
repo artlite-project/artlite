@@ -7,7 +7,6 @@ positions apart (llama.cpp's own answer moves by a KL of 0.005 with the image's 
 cache is checked against the decode's too: the image's slots (rotated by their own cos / sin rows) as close as the
 text's."""
 
-import os
 
 import numpy as np
 import pytest
@@ -23,6 +22,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
 from ..goldens.media import golden, seq_golden
+from ..models import require
 from ..numerics import kl_report
 from .test_ref import IMAGE, MMPROJ, NAMES
 
@@ -36,9 +36,7 @@ ANSWER = ("The image shows an astronaut in a white spacesuit riding a brown hors
 @pytest.fixture(scope="module")
 def case() -> tuple:
     path = minicpmv_gguf()
-    for p in (path, MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(path, MMPROJ)
     g = GGUFFile(path)
     tok = BpeTokenizer(g)
     gold = golden(path, MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)

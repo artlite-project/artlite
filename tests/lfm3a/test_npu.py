@@ -3,7 +3,6 @@ a LibriSpeech clip, teacher-forced over its transcript, against llama.cpp's own 
 (``ref.golden``). With llama.cpp's embeddings the clip's rows are tested on their own, through the prefill and as
 decode steps; the app's path (``Lfm(mmproj=)``) adds the NPU encoder; its greedy transcript is the reference's."""
 
-import os
 
 import numpy as np
 import pytest
@@ -16,6 +15,7 @@ from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer
 
 from ..goldens.media import golden
+from ..models import require
 from ..numerics import kl_report
 from .test_ref import MARKER, MMPROJ, MODEL, asr_text, clip
 
@@ -33,9 +33,7 @@ def _messages(path: str) -> list[dict[str, object]]:
 
 @pytest.fixture(scope="module")
 def case() -> tuple:
-    for p in (MODEL, MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(MODEL, MMPROJ)
     g = GGUFFile(MODEL)
     tok = BpeTokenizer(g)
     answer = tok.encode(ANSWER)

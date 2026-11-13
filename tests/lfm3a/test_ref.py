@@ -18,6 +18,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..goldens import media
 from ..goldens.media import VisionGolden
+from ..models import require
 from . import ref as R
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,12 +34,6 @@ def clip(name: str = "6930-75918-0001") -> str:
     return path
 
 
-def _files() -> None:
-    for path in (MODEL, MMPROJ):
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
-
-
 def asr_text(gguf: GGUFFile, language: str = "en", marker: str = A.AUDIO) -> str:
     """The ASR prompt's text by the file's chat template, the clip at ``marker``."""
     msgs = [{"role": "system", "content": A.asr_system(language)},
@@ -49,12 +44,12 @@ def asr_text(gguf: GGUFFile, language: str = "en", marker: str = A.AUDIO) -> str
 
 
 def golden(path: str) -> VisionGolden:
-    _files()
+    require(MODEL, MMPROJ)
     return media.golden(MODEL, MMPROJ, path, asr_text(GGUFFile(MODEL), marker=MARKER))
 
 
 def test_config() -> None:
-    _files()
+    require(MODEL, MMPROJ)
     c = AudioConfig.from_gguf(GGUFFile(MMPROJ))
     assert (c.projector, c.hidden, c.heads, c.kv_heads, c.ffn, c.layers, c.mel_bins, c.window, c.projection_dim) == \
         ("lfm3a", 768, 8, 4, 1792, 17, 128, 32, 2048)
@@ -150,7 +145,7 @@ def test_encoder(name: str) -> None:
 
 def test_stream() -> None:
     """A clip in chunks of 12 rows (live ASR's), 8 frames, and a remainder: the rows of the clip at once."""
-    _files()
+    require(MODEL, MMPROJ)
     enc = R.Encoder(MMPROJ)
     mel = A.log_mel(A.load_audio(clip("6930-75918-0012")), dtype=np.float64)
     whole = enc.forward(mel).numpy()

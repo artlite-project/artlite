@@ -1,6 +1,10 @@
 """The model files the tests run: a size's file, and the tests' skip when it is missing."""
 
-from artlite.model_config import decision_gguf, occamy_gguf, qwen_gguf, swift_gguf
+import os
+
+import pytest
+
+from artlite.model_config import decision_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf, swift_gguf
 
 
 def size_gguf(size: str) -> str:
@@ -14,3 +18,18 @@ def size_gguf(size: str) -> str:
     if size == "swift":
         return swift_gguf()
     return occamy_gguf() if size == "occamy" else qwen_gguf("Q4_K_M", size)
+
+
+def require(*paths: str) -> None:
+    """Skip the test unless every file exists."""
+    for path in paths:
+        if not os.path.exists(path):
+            pytest.skip(f"{path} missing")
+
+
+def llama_path(quant: str, size: str) -> str:
+    """The file of a Llama test case (``size`` "qwen3:<size>": a Qwen3 file, any other the Llama ``quant`` of it), or skip
+    the test without it."""
+    path = qwen3_gguf(size.removeprefix("qwen3:")) if size.startswith("qwen3:") else llama_gguf(quant, size)
+    require(path)
+    return path

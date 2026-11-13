@@ -2,10 +2,8 @@
 reply), the fp32 CPU model's logits (``cpu.LfmCpu``, cached in ``tests/refs/<model>/``: ``common.cached_ref``) and
 llama.cpp's CPU logits of a sequence (the golden dump tool: ``tests.goldens.text.golden`` runs any architecture)."""
 
-import os
 
 import numpy as np
-import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
@@ -14,6 +12,7 @@ from artlite.model_config import d1_gguf, lfm3_gguf
 from .. import common
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
+from ..models import require
 from . import cpu
 
 SOURCES = [cpu.__file__]
@@ -25,8 +24,7 @@ REPLY = ("Photosynthesis is the process by which plants, algae and some bacteria
 
 def path(quant: str = "QAD-Q4_0") -> str:
     p = lfm3_gguf(quant)
-    if not os.path.exists(p):
-        pytest.skip(f"{p} missing")
+    require(p)
     return p
 
 
@@ -37,8 +35,7 @@ def gguf(quant: str = "QAD-Q4_0") -> GGUFFile:
 def d1_path(quant: str = "Q4_0") -> str:
     """A d1-2B file (non-causal full layers: a decision model's prompts)."""
     p = d1_gguf(quant)
-    if not os.path.exists(p):
-        pytest.skip(f"{p} missing")
+    require(p)
     return p
 
 

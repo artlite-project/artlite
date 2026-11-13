@@ -17,6 +17,7 @@ from artlite.model_config import MODELS_DIR, ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 
 from ..goldens.media import VisionGolden, golden
+from ..models import require
 from ..numerics import rel
 from . import ref as V
 
@@ -26,21 +27,15 @@ NAMES = ("pos_embed|layer_inp_normed|Qcur|attn_out|ffn_inp_normed|ffn_up_b|ffn_g
          "vit_merger_ds_out|post_ln|merger_out")
 
 
-def _files() -> None:
-    for path in (minicpmv_gguf(), MMPROJ):
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
-
-
 @pytest.fixture(scope="module")
 def gold() -> VisionGolden:
-    _files()
+    require(minicpmv_gguf(), MMPROJ)
     return golden(minicpmv_gguf(), MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)
 
 
 @pytest.mark.parametrize("case", ["astronaut", "square-1024", "small"])
 def test_slices(case: str, tmp_path: str) -> None:
-    _files()
+    require(minicpmv_gguf(), MMPROJ)
     path = IMAGE
     if case != "astronaut":  # (noise: the resampling exact at every pixel)
         w, h = (1024, 1024) if case == "square-1024" else (300, 200)

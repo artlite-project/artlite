@@ -3,7 +3,6 @@ each layer alone from the float64 input (its error a small part of its own contr
 depthwise conv, pieces of layers against one dispatch (bit for bit), whole images of 1, 2 and 9 bands per merged
 token."""
 
-import os
 
 import numpy as np
 import pytest
@@ -24,6 +23,7 @@ from models.lfm3vl import encoder as E
 from models.lfm3vl import host as Q
 from models.sequence import load_image
 
+from ..models import require
 from ..numerics import rel
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
@@ -36,8 +36,7 @@ def npu() -> VisionDevice:
 
 @pytest.fixture(scope="module")
 def mm() -> tuple:
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     g = GGUFFile(MMPROJ)
     clip = ClipConfig.from_gguf(g)
     return gguf_getter(g), clip, E.kinds_of(g.tensor_info, clip.layers)

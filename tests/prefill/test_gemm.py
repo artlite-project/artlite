@@ -10,7 +10,6 @@ in / out and its qkv with a gate block of one tile (two rows a column). The GEMM
 run in a library program as the prefill's do, paced (``gemm_q``'s "Pacing") at level 0 and at ``LEVEL``, and as unpaced
 twins: their outputs bit-identical."""
 
-import os
 
 import numpy as np
 import pytest
@@ -39,6 +38,7 @@ from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
 
 from ..common import to_numpy, to_torch
+from ..models import require
 from ..numerics import rel_native
 
 LEVEL = 3  # (a paced level: the paced copy of each worker body)
@@ -108,8 +108,7 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
             "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant)}[model]()
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     key = (path, layers)
     if key not in _images:
         _images.clear()

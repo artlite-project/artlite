@@ -20,6 +20,7 @@ from models.readouts import Readouts, pool, rows_of
 
 from .common import cached_ref, essay, model_key, to_torch
 from .llama_cpp import lib_identity, llama_embeddings
+from .models import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -30,8 +31,7 @@ CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B
 @pytest.fixture(scope="module", params=CASES, ids=os.path.basename)
 def loaded(request: pytest.FixtureRequest) -> tuple[str, Model, NpuModel]:
     path = request.param
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     return path, model, model.load(capacity=8192)
 
@@ -90,8 +90,7 @@ PACKED = [qwen3_gguf("embedding-0.6B"), decision_gguf("kev"), decision_gguf("d3-
 @pytest.fixture(scope="module", params=PACKED, ids=os.path.basename)
 def packed(request: pytest.FixtureRequest) -> tuple[str, Model, NpuModel]:
     path = request.param
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     return path, model, model.load(capacity=8192)
 

@@ -3,7 +3,6 @@ the attention prep and flash attention, the per-layer input operator, a slice's 
 GEMMs: prefill/test_gemm.py, the norm: prefill/test_norm.py).
 """
 
-import os
 
 import numpy as np
 import pytest
@@ -20,6 +19,7 @@ from models.gemma4.image import GemmaImage
 from models.gemma4.prefill import plan_gemm
 
 from ..common import essay, to_numpy, to_torch
+from ..models import require
 from ..numerics import rel
 
 LAYERS = (0, 5)  # a sliding-window and a full-attention layer
@@ -28,8 +28,7 @@ _image: dict[str, tuple] = {}
 
 def _img() -> tuple[GGUFFile, GemmaImage, np.ndarray]:
     path = gemma_gguf("Q4_0")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     if not _image:
         g = GGUFFile(path)
         img = GemmaImage(g, GemmaConfig.from_gguf(g), layers=list(LAYERS), vocab=COLS * 64)
@@ -207,8 +206,7 @@ def test_prefill_caches(n: int, p0: int) -> None:
     from .cpu import GemmaCpu
 
     path = gemma_gguf("Q4_0")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     layers = list(range(6))
     ids = GemmaTokenizer(g).encode(essay("apple.txt"), add_bos=True)[:p0 + n]

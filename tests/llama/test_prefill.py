@@ -19,6 +19,7 @@ from artlite.operators.design import COLS
 from artlite.prefill import attn as PA
 from artlite.prefill.gemm import Layout
 
+from ..models import llama_path, require
 from ..numerics import rel
 
 A_BYTES = 9280  # the cache objects (the Q4_K_M images' tile size)
@@ -291,21 +292,17 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     essay tokens, up to the rounding of the two paths' GEMM inputs (single bfp16 panels here, exact-integer weights
     against hi / lo inputs there): p0 tokens as decode steps first (a prefill continued after a decode), then n in the
     planner's chunks; the last token's output row against the decode path's LM input, and its logits."""
-    import os
 
     from artlite.gguf_model import GGUFFile
-    from artlite.model_config import qwen3_gguf
     from models.llama.overlay import LlamaOverlay
     from models.llama.prefill import LlamaPrefill
     from models.llama.tokenizer import load_tokenizer
     from models.tokenizer import BpeTokenizer
 
-    from ..common import essay, llama_gguf
+    from ..common import essay
 
     qwen3 = size.startswith("qwen3:")
-    path = qwen3_gguf(size.removeprefix("qwen3:")) if qwen3 else llama_gguf(quant, size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    path = llama_path(quant, size)
     g = GGUFFile(path)
     layers = [0, 1, 2, 3]
     ids = (BpeTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
@@ -344,17 +341,14 @@ def test_chunk_params_to_the_end() -> None:
     library's parameter has one range, its largest chunk's: the caches' padding (``KV_PAD``) extends it to every
     smaller chunk at the caches' end (with a pad short of the largest chunk, a 256-token chunk of a 32K prompt at
     31808 of 32768 positions was refused: its attention's P_FO)."""
-    import os
 
     from artlite.gguf_model import GGUFFile
+    from artlite.model_config import llama_gguf
     from models.llama.overlay import LlamaOverlay
     from models.llama.prefill import LlamaPrefill
 
-    from ..common import llama_gguf
-
     path = llama_gguf("Q4_K_M", "1B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     ov = LlamaOverlay(GGUFFile(path), layers=[0], vocab=2048, max_positions=4096)
     ov.load()
     pf = LlamaPrefill(ov).compile().bind()
@@ -386,7 +380,6 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     starts inside a record all of them rounded otherwise; every row within ~2% of the rows' largest (that V, the
     attention's key chunks); with the window attention the rows of a segment that starts at a 32-token chunk of keys
     up to its last V record bit-identical (the ring attention takes the key chunks in another order)."""
-    import os
 
     from artlite.gguf_model import GGUFFile
     from artlite.model_config import qwen3_gguf
@@ -397,8 +390,7 @@ def test_prefill_packed(p0: int, lengths: list[int]) -> None:
     from ..common import essay
 
     path = qwen3_gguf("embedding-0.6B")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     T = 1024
     ids = BpeTokenizer(g).encode(essay("apple.txt"))[:p0 + sum(lengths)]

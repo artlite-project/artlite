@@ -3,7 +3,6 @@
 also with a clip encoded between its chunks (the stream's state restored); the live transcript of LibriSpeech clips
 against llama.cpp's live mode (llama-server's ``/v1/realtime?intent=transcription``, Vulkan)."""
 
-import os
 import re
 
 import numpy as np
@@ -13,6 +12,7 @@ from artlite.model_config import lfm3a_gguf, lfm3a_mmproj
 from models.lfm3a import host as A
 from models.lfm3a.live import CHUNK_ROWS, Stream
 
+from ..models import require
 from . import ref as R
 from .test_encoder import rel_rows
 from .test_ref import clip
@@ -22,8 +22,7 @@ MMPROJ = lfm3a_mmproj()
 
 @pytest.fixture(scope="module")
 def audio() -> object:
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     from models.lfm3a.npu import NpuAudio
     return NpuAudio(MMPROJ)
 
@@ -105,9 +104,7 @@ def test_live() -> None:
     from models.lfm.lfm import Lfm
     from models.lfm3a.live import LiveAsr
 
-    for p in (lfm3a_gguf(), MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(lfm3a_gguf(), MMPROJ)
     app = Lfm(lfm3a_gguf(), mmproj=MMPROJ)
     asr = LiveAsr(app, app.load(capacity=2048), app.audio.encoder)
     for name, want in LIVE.items():

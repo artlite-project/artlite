@@ -3,19 +3,18 @@ teacher-forced: KL(same) of the next-token distributions measures the implementa
 through the prefill (one chunk), then its continuation one token and four tokens per dispatch, in both K formats of the
 KV cache (Qwen3: hi + lo, its default); a 4800-token essay prompt (prefill chunks) and 32 tokens after it."""
 
-import os
 
 import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import qwen3_gguf
 from models import open_model
 from models.common import auto_capacity
 from models.llama.llama import NpuLlama
 from models.llama.tokenizer import chat_prompt
 
-from ..common import cached_ref, essays, llama_gguf, model_key
+from ..common import cached_ref, essays, model_key
+from ..models import llama_path
 from ..numerics import kl_agree
 from . import cpu as llama_cpu
 
@@ -32,13 +31,6 @@ FILES = [("Q4_K_M", "1B"), ("Q5_K_M", "1B"), ("Q6_K", "1B"), ("Q4_0", "1B"), ("Q
 CASES = [(q, s, k) for q, s in FILES for k in ("single", "hilo") if not (s.startswith("qwen3") and k == "single")]
 
 
-def _path(quant: str, size: str) -> str:
-    path = qwen3_gguf(size.removeprefix("qwen3:")) if size.startswith("qwen3:") else llama_gguf(quant, size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
-    return path
-
-
 def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
     """CPU fp32 logits of positions first .. len(seq) - 1 of seq (cached in tests/refs)."""
     return cached_ref(path, "cpu_logits", (model_key(path), seq, first),
@@ -48,7 +40,7 @@ def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
 
 @pytest.mark.parametrize(("quant", "size", "kv_k"), CASES, ids=[f"{q}-{s}-{k}" for q, s, k in CASES])
 def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
-    path = _path(quant, size)
+    path = llama_path(quant, size)
     model = open_model(path, kv_k=kv_k)
     messages = [{"role": "user", "content": PROMPT}]
     prompt = model.chat(messages) if model.cfg.neox else \
@@ -67,7 +59,7 @@ def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
 @pytest.mark.parametrize(("quant", "size"), [("Q4_K_M", "1B"), ("Q4_K_M", "3B"), ("Q4_K_M", "8B"), ("Q4_1", "qwen3:0.6B")])
 def test_llama_npu_long_prompt(quant: str, size: str) -> None:
     """A 4800-token essay prompt (prefill chunks) and 32 tokens after it, one per dispatch."""
-    path = _path(quant, size)
+    path = llama_path(quant, size)
     P, N = 4800, 32
     model = open_model(path)
     ids = model.encode(essays())[:P + N]

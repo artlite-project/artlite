@@ -11,6 +11,7 @@ import pytest
 from artlite.model_config import lfm3a_mmproj
 from models.lfm3a import host as A
 
+from ..models import require
 from . import ref as R
 from .test_ref import CLIPS, clip
 
@@ -19,8 +20,7 @@ MMPROJ = lfm3a_mmproj()
 
 @pytest.fixture(scope="module")
 def audio() -> object:
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     from models.lfm3a.npu import NpuAudio
     return NpuAudio(MMPROJ)
 

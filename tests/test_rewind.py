@@ -15,6 +15,7 @@ from models import open_model
 from models.common import Model, NpuModel, Sampling
 
 from .common import essay
+from .models import require
 from .numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
@@ -39,8 +40,7 @@ def _logits(npu: NpuModel, prompt: list[int], continuation: list[int]) -> torch.
 def loaded(request: pytest.FixtureRequest) -> tuple[Model, NpuModel]:
     """A model file and the model on the NPU (once per case)."""
     path, prefill = request.param
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     return model, model.load(capacity=4096, prefill=prefill)
 

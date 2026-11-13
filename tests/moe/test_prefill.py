@@ -3,7 +3,6 @@ combine) on the decode images (``qwen35.image.QwenImage``, layers packed in host
 to the device) of Qwen3.6-35B-A3B Q4_K_M (layers 3, 5: Q6_K / Q4_K downs) and Occamy 1.0 APEX (layers 3, 13: Q3_K /
 IQ3_XXS experts, a Q5_K shared expert), against fp64 models on the operators' own inputs."""
 
-import os
 
 import numpy as np
 import pytest
@@ -19,6 +18,7 @@ from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator
 
 from ..common import to_numpy
+from ..models import require
 from ..numerics import rel_max
 from . import ref
 
@@ -31,8 +31,7 @@ _state: dict[str, object] = {}
 def _image(model: str = "35B-A3B") -> tuple[GGUFFile, object, np.ndarray]:
     """A model's image of its two layers, packed (cached per module)."""
     path, layers = MODELS[model][0](), MODELS[model][1]
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     if _state.get("model") != model:
         from models.qwen35.image import QwenImage
 

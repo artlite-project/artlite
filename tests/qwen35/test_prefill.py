@@ -5,7 +5,6 @@ llama.cpp's residual after the slice; then decode steps (the overlay) continuing
 states), against llama.cpp and against the same overlay running every position as a decode step. Occamy 1.0 APEX: its
 IQ3_XXS experts (layers 20 .. 23) and its Q3_K ones (layers 4 .. 7)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -16,7 +15,7 @@ from artlite.model_config import QwenConfig
 from ..common import essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import size_gguf
+from ..models import require, size_gguf
 from ..numerics import rel_max
 
 
@@ -29,8 +28,7 @@ def test_prefill_slice(size: str, La: int) -> None:
     from models.qwen35.prefill import QwenPrefill
 
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     La = La or cfg.attention_layers[len(cfg.attention_layers) // 2]

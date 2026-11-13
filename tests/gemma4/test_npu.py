@@ -14,7 +14,6 @@
 - the tokenizer and the chat template on fixed examples (ids as llama.cpp's llama-tokenize).
 """
 
-import os
 
 import numpy as np
 import pytest
@@ -31,6 +30,7 @@ from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 
 from ..common import as_torch, cached_ref, draft_gate, draft_prompts, model_key, to_torch
+from ..models import require
 from ..numerics import kl_rows, rel_finite
 from . import cpu as gemma_cpu
 from . import ref
@@ -55,8 +55,7 @@ LONG = ("Water moves through the environment in a continuous cycle. The sun heat
 
 def _gguf() -> GGUFFile:
     path = gemma_gguf("Q4_0")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     return GGUFFile(path)
 
 

@@ -4,7 +4,6 @@ llama.cpp's own encoder and language model on the CPU (``ref.golden``). With lla
 tokens and positions (the official M-RoPE ones, mtmd's) are tested on their own, through the prefill and as decode
 steps; the app's path (``Qwen(mmproj=)``) adds the NPU encoder."""
 
-import os
 
 import numpy as np
 import pytest
@@ -18,6 +17,7 @@ from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
 from ..goldens.media import golden
+from ..models import require
 from ..numerics import kl_report
 from .test_ref import IMAGE, MMPROJ, MODEL
 
@@ -39,9 +39,7 @@ def _messages(image: str | None) -> list[dict[str, object]]:
 
 @pytest.fixture(scope="module")
 def case() -> tuple:
-    for p in (MODEL, MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(MODEL, MMPROJ)
     g = GGUFFile(MODEL)
     tok = BpeTokenizer(g)
     text = chat_prompt(g, _messages(None), enable_thinking=False)

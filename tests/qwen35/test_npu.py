@@ -9,7 +9,6 @@
   text near a tie flip, in both runs and on the NPU).
 """
 
-import os
 
 import numpy as np
 import pytest
@@ -22,15 +21,14 @@ from models.qwen35.qwen import NpuQwen
 from ..common import draft_gate, draft_prompts, essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..models import size_gguf
+from ..models import require, size_gguf
 from ..numerics import kl_rows, rel_max
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
 
 def _path(size: str) -> str:
     path = size_gguf(size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     return path
 
 

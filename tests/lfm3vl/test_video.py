@@ -5,7 +5,6 @@ tower: llama.cpp's CPU runs a Q8_0 file's matmuls on 8-bit activations, 3-11% fr
 far to check a pair's inputs by (its kernels swapped: 40-50%). The NPU's pairs (``models.lfm3vl.npu.NpuVision.pairs``)
 against the float64 encoder."""
 
-import os
 
 import numpy as np
 import pytest
@@ -17,6 +16,7 @@ from models.lfm3vl import host as H
 
 from ..common import video_file
 from ..goldens.media import golden
+from ..models import require
 from . import ref as V
 
 MODEL, MMPROJ = lfm3vl_gguf(), lfm3vl_mmproj("BF16")
@@ -45,9 +45,7 @@ def pair_pixels(path: str, heard: bool = False) -> list[np.ndarray]:
 def test_pair_reference(videos: str, name: str) -> None:
     """Each pair's (and an odd last frame's) float64 embeddings within 3% of llama.cpp's (measured 1.0 - 2.4%; a 512 x
     512 image's 1.0%)."""
-    for p in (MODEL, MMPROJ):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(MODEL, MMPROJ)
     path = video_file(videos, name)
     g = golden(MODEL, MMPROJ, path, PROMPT)
     media = [c for c in g.chunks if "text" not in c]
@@ -72,8 +70,7 @@ def test_npu_pairs(videos: str, mmproj: str) -> None:
     from artlite.model_config import lfm3omni_mmproj
     from models.lfm3vl.npu import NpuVision
     mm = MMPROJ if mmproj == "BF16" else lfm3omni_mmproj()
-    if not os.path.exists(mm):
-        pytest.skip(f"{mm} missing")
+    require(mm)
     v, enc = NpuVision(mm), V.Encoder(mm)
     for name in ("odd-25fps", "astronaut"):
         data = VD.read(video_file(videos, name))
@@ -95,8 +92,7 @@ def test_packed_pairs(size: tuple[int, int]) -> None:
     bit for bit as a run each (``Encoder.packs``: pairs of 56 tokens, a band for two; of 168, 3 bands for two; 100
     tokens do not pack), with an odd frame and a lone last pair (run with itself)."""
     from models.lfm3vl.npu import NpuVision
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     v = NpuVision(MMPROJ)
     enc = v.encoder
     frames = np.random.default_rng(0).integers(0, 256, (7, *size, 3), np.uint8)  # (3 pairs and an odd frame)
@@ -113,8 +109,7 @@ def test_program_cache() -> None:
     are allocated after the state (by the first pair program built), so no pair program is cached, whichever size
     comes first (a later process restoring the state has no such image); the image programs they take are."""
     from models.lfm3vl.npu import NpuVision
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     enc = NpuVision(MMPROJ).encoder
     for k in [k for k in enc.programs if isinstance(k, tuple)]:
         del enc.programs[k]

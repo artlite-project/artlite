@@ -6,7 +6,6 @@ memory, stack and BD limits of the whole models, which the layer-slice tests do 
 link (each within the slot its core's resident code leaves: ``paging.link``, else only at load), and
 ``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
 
-import os
 from collections.abc import Callable
 
 import pytest
@@ -24,6 +23,8 @@ from artlite.model_config import (
     sd15_dir,
     swift_gguf,
 )
+
+from .models import require
 
 
 def _llama(path: str, kv_k: str) -> tuple[str, Callable[[str], None]]:
@@ -104,6 +105,5 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
 @pytest.mark.parametrize("app", list(APPS))
 def test_app_designs(app: str) -> None:
     path, build = APPS[app]
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     build(path)

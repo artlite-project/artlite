@@ -4,7 +4,6 @@ float64 layer as the CPU at the NPU's rounding points, a program in pieces bit f
 whole images of 1 .. 9 bands (per-token statistics; slow: as close as the CPU at the NPU's rounding points); the
 smaller towers (d3-lite's 768 wide, 12 heads; d3-nano's 1024) as close as the CPU at the NPU's rounding points."""
 
-import os
 from collections import OrderedDict
 
 import numpy as np
@@ -23,6 +22,7 @@ from models.qwen3vl import encoder as E
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
+from ..models import require
 from ..numerics import rel
 from . import ref as V
 from .test_ref import IMAGE, MMPROJ
@@ -63,8 +63,7 @@ def npu() -> VisionDevice:
 
 @pytest.fixture(scope="module")
 def mm() -> tuple:
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     g = GGUFFile(MMPROJ)
 
     def get(n: str) -> torch.Tensor:
@@ -201,8 +200,7 @@ def test_tower(npu: VisionDevice, name: str) -> None:
     (measured: lite median 4.7%, p90 14% at 352 x 352, the CPU's 4.1%, 14%; nano 6.9%, 42%, the CPU's 7.0%, 40%: its
     residual's drift through 24 layers, post_ln's amplification), the same at a second run."""
     mmproj = decision_mmproj(name)
-    if not os.path.exists(mmproj):
-        pytest.skip(f"{mmproj} missing")
+    require(mmproj)
     g = GGUFFile(mmproj)
     clip = ClipConfig.from_gguf(g)
 

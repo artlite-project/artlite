@@ -5,7 +5,6 @@ llama.cpp PR #30510's ``test_decoder_pos_minicpmv4_7``, from transformers 5.19, 
 official ``<image>`` corner and the template's "\\n" after the image, which that PR leaves out); the M-RoPE angles
 against transformers' interleaving; an image as a ``Sequence`` (its rows, its slices)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -14,6 +13,8 @@ from PIL import Image
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, minicpmv_gguf
 from models.minicpmv import host as M
+
+from ..models import require
 
 CLIP = ClipConfig(projector="minicpmv4_7", image_size=448, patch_size=14, hidden=1152, ffn=4304, layers=27, heads=16,
                   eps=1e-6, mean=(0.5,) * 3, std=(0.5,) * 3, projection_dim=1024, merge=4, max_slices=9, merger_layer=6)
@@ -94,8 +95,7 @@ def test_positions(ov: tuple, grid: tuple, cell: tuple, text: int, want: list) -
 
 def test_mrope_angles() -> None:
     path = minicpmv_gguf()
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))
     pos = np.random.default_rng(0).integers(0, 4096, (64, 3))
     # transformers' interleaved M-RoPE: pair i by H for i % 3 == 1 below 33, by W for i % 3 == 2 below 30, else T

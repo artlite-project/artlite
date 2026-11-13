@@ -18,6 +18,7 @@ from models import open_model
 from models.common import Model, NpuModel, Sampling
 
 from .common import essay
+from .models import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -31,8 +32,7 @@ GREEDY = Sampling(greedy=True)
 @pytest.fixture(scope="module", params=CASES, ids=[os.path.basename(p) for p in CASES])
 def loaded(request: pytest.FixtureRequest) -> tuple[Model, NpuModel]:
     """A model file and the model on the NPU (once per case)."""
-    if not os.path.exists(request.param):
-        pytest.skip(f"{request.param} missing")
+    require(request.param)
     model = open_model(request.param)
     return model, model.load(capacity=4096)
 

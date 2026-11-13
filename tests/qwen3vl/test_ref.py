@@ -16,6 +16,7 @@ from models.qwen3vl import host as Q
 from models.sequence import load_image
 
 from ..goldens.media import golden
+from ..models import require
 from . import ref as V
 
 IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
@@ -24,12 +25,6 @@ MMPROJ = os.path.join(MODELS_DIR, "lmstudio-community", "Qwen3.6-35B-A3B-GGUF", 
 PROMPT = "<__media__>Describe the image."
 # (the sizes keep the image's aspect: llama.cpp before its PR #30736 letterboxed the others)
 CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1536x1024": (1536, 1024)}
-
-
-def _files() -> None:
-    for path in (MODEL, MMPROJ):
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
 
 
 def _image(case: str, tmp: str) -> str:
@@ -56,7 +51,7 @@ def test_sizes() -> None:
 @pytest.mark.parametrize("case", list(CASES))
 def test_pixels(case: str, tmp_path: str) -> None:
     """The encoder's input against llama.cpp's inp_raw, the image chunk's tokens and positions."""
-    _files()
+    require(MODEL, MMPROJ)
     path = _image(case, str(tmp_path))
     g = golden(MODEL, MMPROJ, path, PROMPT)  # (inp_raw: the image of entry 0 and 1, the two kernels' convs)
     clip = ClipConfig.from_gguf(GGUFFile(MMPROJ))
@@ -75,7 +70,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
 
 @pytest.mark.slow  # (the whole encoder on the CPU, in float64)
 def test_encoder() -> None:
-    _files()
+    require(MODEL, MMPROJ)
     g = golden(MODEL, MMPROJ, IMAGE, PROMPT)
     out = V.Encoder(MMPROJ).forward(g.tensor("inp_raw", 0))
     emb = g.embd(0)

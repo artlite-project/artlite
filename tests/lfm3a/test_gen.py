@@ -4,7 +4,6 @@ generator (tests/lfm3a/gen_ref.py) on llama.cpp's sampled speech codes and hidde
 samples (PCM SNR within 3 dB of a bfloat16 codec's: transformers' dtype) and its streaming (calls of 4 frames = the codes
 at once, bit for bit: whole 8-key blocks), the ISTFT (= the reference's)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -17,6 +16,7 @@ from models.lfm3a import codec as CD
 from models.lfm3a import depth as DP
 from models.lfm3a import speech as S
 
+from ..models import require
 from ..numerics import kl_rows
 from . import gen_ref as R
 from .test_gen_ref import MMPROJ, MODEL, TEXT
@@ -27,9 +27,7 @@ TEXTS = [TEXT, "The quick brown fox jumps over the lazy dog, and then it runs ba
 
 @pytest.fixture(scope="module")
 def gen() -> tuple[DP.Depth, CD.Codec]:
-    for path in (MODEL, MMPROJ):
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
+    require(MODEL, MMPROJ)
     g = GGUFFile(MMPROJ)
     get = gguf_getter(g)
     npu = VisionDevice()

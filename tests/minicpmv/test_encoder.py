@@ -2,7 +2,6 @@
 rounding points on the CPU (ref.NpuEncoder), on real activations: the float64 encoder's residual after the
 ViT merger of the astronaut's overview and of its mirror image (two entries of 16 x 16 tokens)."""
 
-import os
 
 import numpy as np
 import pytest
@@ -19,6 +18,7 @@ from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
 
+from ..models import require
 from ..numerics import bf16_like, rel
 from ..vision.test_ops import from_level_tokens, level_tokens
 from . import ref as V
@@ -34,8 +34,7 @@ def npu() -> VisionDevice:
 
 @pytest.fixture(scope="module")
 def enc() -> V.Encoder:
-    if not os.path.exists(MMPROJ):
-        pytest.skip(f"{MMPROJ} missing")
+    require(MMPROJ)
     return V.Encoder(MMPROJ)
 
 
@@ -365,8 +364,7 @@ def test_encoder(npu: VisionDevice, compression: int) -> None:
     import time
 
     path = minicpmv_mmproj(compression)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     sim, enc = V.NpuEncoder(path), V.Encoder(path)
     pos = bf16_like(sim.w("v.position_embd.weight"))
     npe = M.Encoder(npu, M.weights(lambda n: sim.w(n).float(), sim.layers, sim.insert, sim.cfg.mean, sim.cfg.std), pos,

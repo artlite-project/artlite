@@ -16,6 +16,7 @@ from artlite.model_config import QwenConfig, qwen_gguf, qwen_mtp_of
 from ..common import essay
 from ..goldens.text import Golden, golden
 from ..llama_cpp import llama_tokenize
+from ..models import require
 from ..moe import ref as moe_ref
 from ..numerics import rel_max
 from . import ref
@@ -28,8 +29,7 @@ LAYERS = (0, 3)
 
 @pytest.fixture(scope="module")
 def gold() -> tuple[GGUFFile, Golden]:
-    if not os.path.exists(MODEL):
-        pytest.skip(f"{MODEL} missing")
+    require(MODEL)
     tokens = llama_tokenize(MODEL, essay("apple.txt"))[:32]
     return GGUFFile(MODEL), golden(MODEL, tokens, layers=LAYERS, names=NAMES, logits="none")
 

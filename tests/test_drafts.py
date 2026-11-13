@@ -18,6 +18,7 @@ from models.common import OverlayModel, Penalties, Sampling, add_spec_options, d
 from models.drafts import DRAFTER_MATCH, NMAX, PRIOR, RETRY, WARM, Lookup, Planner, bucket
 
 from .common import essay
+from .models import require
 
 VOCAB = 32
 GREEDY = Sampling(greedy=True)
@@ -386,8 +387,7 @@ def test_greedy(path: str) -> None:
     """A reply that copies its prompt (an essay's paragraphs, ~300 tokens), then another turn after it: greedy with
     drafts is the text of steps of one token, bit for bit, in fewer steps; with a drafter also with the context's
     drafts preferred (the drafter's rate made low: its states follow the context's rounds)."""
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     npu = model.load(capacity=4096)
     text = essay("addiction.txt")[:1200]

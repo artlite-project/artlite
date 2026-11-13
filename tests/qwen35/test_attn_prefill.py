@@ -2,7 +2,6 @@
 (llama.cpp's prompt-mode projections of an essay laid out as the attn_in GEMMs write them), two chunks: the second
 at position T, with padding tokens after its valid ones; non-causal (d3-lite's), one chunk with padding tokens."""
 
-import os
 
 import numpy as np
 import pytest
@@ -21,6 +20,7 @@ from models.qwen35.image import QwenImage
 from ..common import essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
+from ..models import require
 from ..numerics import bf16_round, rel_max
 from . import ref
 
@@ -57,8 +57,7 @@ class _Setup:
 
     def __init__(self, size: str, T: int, n2: int, tokens: int = 0):
         path = decision_gguf(size) if size.startswith("d3") else qwen_gguf("Q4_K_M", size)
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
+        require(path)
         self.g = g = GGUFFile(path)
         self.cfg = cfg = QwenConfig.from_gguf(g)
         self.L = L = next(i for i, a in enumerate(cfg.attention) if a)

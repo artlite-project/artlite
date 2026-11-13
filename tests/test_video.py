@@ -17,6 +17,7 @@ from models.lfm3vl import host as H
 
 from .common import VIDEOS, video_file
 from .goldens.media import video_items
+from .models import require
 
 
 @pytest.fixture(scope="module")
@@ -48,9 +49,7 @@ def test_items(videos: str, name: str, model: str) -> None:
     """Artlite's frames, timestamps and soundtrack pieces are llama.cpp's, bit for bit (LFM3-Omni: with the
     soundtrack; LFM3-VL: frames only)."""
     m, mm = (lfm3omni_gguf(), lfm3omni_mmproj()) if model == "omni" else (lfm3vl_gguf(), lfm3vl_mmproj())
-    for p in (m, mm):
-        if not os.path.exists(p):
-            pytest.skip(f"{p} missing")
+    require(m, mm)
     path = video_file(videos, name)
     want = video_items(m, mm, path)
     got = _ours(path, heard=model == "omni")

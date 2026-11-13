@@ -28,6 +28,7 @@ from models.server.decisions import Decisions
 from .common import cached_ref, essay, model_key
 from .goldens.text import golden
 from .llama_cpp import lib_identity, llama_server_decisions
+from .models import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -42,8 +43,7 @@ QUESTIONS = {
 
 def test_d3_lite() -> None:
     path = decision_gguf("d3-lite")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     npu = model.load(capacity=4096)
     assert not npu.causal
@@ -72,8 +72,7 @@ def test_kai() -> None:
     from .llama.cpu import LlamaCpu
 
     path = decision_gguf("kai")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     npu = model.load(capacity=4096)
     d = Decisions.of(path, model.tokenizer.encode)
@@ -98,8 +97,7 @@ def test_d1() -> None:
     from .lfm.cpu import LfmCpu
 
     path = decision_gguf("d1-2b")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
+    require(path)
     model = open_model(path)
     npu = model.load(capacity=4096)
     assert not npu.causal

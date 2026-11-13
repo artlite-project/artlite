@@ -15,7 +15,6 @@ per dim: layer 0's k_norm up to 96.5), Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 til
 Q4_K_M (hidden 2560 and ffn 9728 in K chunks padded with zero super-blocks; 4 query heads per KV head at head_dim 128).
 """
 
-import os
 
 import numpy as np
 import pytest
@@ -24,11 +23,12 @@ import torch
 from artlite.decode import kv
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import qwen3_gguf
+from artlite.model_config import llama_gguf
 from artlite.operators.design import COLS
 from models.llama.overlay import KV_K, LlamaOverlay
 
-from ..common import as_torch, essay, llama_gguf, to_torch
+from ..common import as_torch, essay, to_torch
+from ..models import llama_path
 from ..numerics import rel_finite
 from . import ref
 
@@ -48,10 +48,7 @@ TOL = 0.05
 
 
 def _gguf(quant: str, size: str) -> GGUFFile:
-    path = qwen3_gguf(size.removeprefix("qwen3:")) if size.startswith("qwen3:") else llama_gguf(quant, size)
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing")
-    return GGUFFile(path)
+    return GGUFFile(llama_path(quant, size))
 
 
 def _tokens(n: int) -> list[int]:

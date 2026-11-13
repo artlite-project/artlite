@@ -5,7 +5,6 @@ samples of speech codes (llama.cpp's SNR from float64, and a bfloat16 codec's: t
 chunks equal to the codes at once, and the code sampler's penalty window."""
 
 import math
-import os
 
 import numpy as np
 import pytest
@@ -17,17 +16,12 @@ from models.lfm3a import speech as S
 from models.tokenizer import BpeTokenizer
 
 from ..llama_cpp import llama_tokenize
+from ..models import require
 from ..numerics import kl_rows
 from . import gen_ref as R
 
 MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()
 TEXT = "Hello there, this is a test of the speech output."
-
-
-def _files() -> None:
-    for path in (MODEL, MMPROJ):
-        if not os.path.exists(path):
-            pytest.skip(f"{path} missing")
 
 
 def snr(ref: np.ndarray, x: np.ndarray) -> float:
@@ -36,19 +30,19 @@ def snr(ref: np.ndarray, x: np.ndarray) -> float:
 
 @pytest.fixture(scope="module")
 def weights() -> R.Weights:
-    _files()
+    require(MODEL, MMPROJ)
     return R.Weights(MMPROJ)
 
 
 @pytest.fixture(scope="module")
 def tts() -> R.GenGolden:
     """llama.cpp's TTS of TEXT: the prompt's hidden state, 40 frames sampled (seed 1) and each frame's hidden state."""
-    _files()
+    require(MODEL, MMPROJ)
     return R.golden(MODEL, MMPROJ, prompt=S.tts_prompt(GGUFFile(MODEL), TEXT), gen=40, seed=1)
 
 
 def test_config() -> None:
-    _files()
+    require(MODEL, MMPROJ)
     c = GenConfig.from_gguf(GGUFFile(MMPROJ))
     assert (c.projector, c.projection_dim, c.hidden, c.ffn, c.layers, c.heads, c.kv_heads, c.top_k, c.penalty_last_n) == \
         ("lfm3a_gen", 2048, 1024, 2816, 3, 32, 8, 128, 4096)
@@ -63,7 +57,7 @@ def test_config() -> None:
     ("Klingon", "male", "Perform TTS in Klingon using a male voice."),
 ])
 def test_tts_prompt(language: str, voice: str, system: str) -> None:
-    _files()
+    require(MODEL, MMPROJ)
     g = GGUFFile(MODEL)
     text = S.tts_prompt(g, TEXT, language=language, voice=voice)
     assert text == (f"<|startoftext|><|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{TEXT}<|im_end|>\n"
@@ -129,7 +123,7 @@ def test_codec(weights: R.Weights, tts: R.GenGolden) -> None:
 def test_sampler() -> None:
     """The penalty's window: a codebook's codes of the last ``penalty_last_n`` frames, the older ones forgotten; top-k
     keeps the k largest; temperature 0 is the argmax."""
-    _files()
+    require(MODEL, MMPROJ)
     cfg = GenConfig.from_gguf(GGUFFile(MMPROJ))
     s = S.CodeSampler(cfg.__class__(**{**cfg.__dict__, "penalty_last_n": 3}), seed=0)
     for f in range(5):
