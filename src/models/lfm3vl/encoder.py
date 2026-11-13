@@ -26,7 +26,9 @@ A layer on nb bands (``layer``), two passes over the bands (its operator needs e
   (the q norm, x log2 e / 8), the attention over every key, O + x, the feed-forward.
 - the feed-forward: LN2 (x parked in DDR meanwhile), gate / up as SwiGLU (``Gemm(act="silu")``: panels), x back, down + x.
 The patch embedding: the pixels' exact 8-bit integers (q = p - 128, the normalization folded into its weights; hi +
-lo weights), RMSNorm into panels, an identity GEMM back to C tiles (x0, with its records).
+lo weights), RMSNorm into panels, an identity GEMM back to C tiles (x0, with its records). A video's pair of frames
+(``host.VideoPlan``): the two temporal kernels on their own frames, the pair's 2 x 768 inputs and the constant (KP 1600:
+``patch_weights(pair=True)``); its other ops the image's.
 
 Precision: each layer alone is within 1.2-1.9% of its own contribution (the bfp16 operands of its GEMMs; every token
 within ~3.5%); the embeddings per merged token ~3.5% from the float64 encoder (median; p90 ~9%), a few tokens up to ~0.8
@@ -59,6 +61,7 @@ THETA = 1e6
 QSCALE = 1.4426950408889634 / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
 PATCH = 16
 PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx); the constant input 1; the panels' K: whole k-tiles)
+ONE2, KP2 = 1536, 1600  # (a video pair's: its two frames' inputs, then the constant)
 MERGER = W.Merger(H=H, C=C, eps=1e-6, up=(1280, 1280, 1280, 320), dn=640)  # (mm.0's 4096 outputs in 4160)
 PIECE_BAND_LAYERS = 16  # (a piece's band-layers at most: its build time)
 PIECE_MS = 500.0  # (a dispatch's estimated time at most)
@@ -125,26 +128,33 @@ def kinds_of(names: object, layers: int) -> tuple[str, ...]:
     return tuple("conv" if f"v.blk.{il}.conv2d_in_proj.weight" in names else "attn" for il in range(layers))
 
 
-def patch_weights(get: Callable[[str], Wt | np.ndarray]) -> dict[str, Wt | np.ndarray]:
-    """The patch embedding as a GEMM of the integer panels (KP inputs -> C): the two temporal kernels summed, the
-    normalization x = (p / 255 - 0.5) / 0.5 = a q + o of q = p - 128 (a = 1 / 127.5, o = 1 / 255) folded in: input
-    k < 768 the weights' column k times a, input 768 (the constant 1) their offset sum_k w_k o (computed at every
-    load); no bias. "eg": the embedding norm's weights; "eye": the identity (C rows of K 1024)."""
-    w = (values(get("v.patch_embd.weight")).astype(np.float64) +
-         values(get("v.patch_embd.weight.1")).astype(np.float64)).reshape(H, PIX)
+def patch_weights(get: Callable[[str], Wt | np.ndarray], pair: bool = False) -> dict[str, Wt | np.ndarray]:
+    """The patch embedding as a GEMM of the integer panels (KP inputs -> C): the two temporal kernels summed (``pair``:
+    a video's pair of frames, KP2 inputs: kernel t on frame t's 768), the normalization x = (p / 255 - 0.5) / 0.5 =
+    a q + o of q = p - 128 (a = 1 / 127.5, o = 1 / 255) folded in: input k < 768 the weights' column k times a, input
+    768 (1536; the constant 1) their offset sum_k w_k o (computed at every load); no bias. "eg": the embedding norm's
+    weights; "eye": the identity (C rows of K 1024)."""
+    w0, w1 = (values(get(n)).astype(np.float64).reshape(H, PIX) for n in ("v.patch_embd.weight", "v.patch_embd.weight.1"))
     a = 1 / 127.5
     o = 128 * a - 1
-    wt = np.zeros((C, KP), np.float32)
-    wt[:H, :PIX], wt[:H, ONE] = w * a, w.sum(1) * o
-    return {"w": computed("lfm3vl.patch", wt), "eg": vec(get, "v.embedding_norm.weight"), "eye": pad(eye(H), C)}
+    if pair:
+        wt = np.zeros((C, KP2), np.float32)
+        wt[:H, :PIX], wt[:H, PIX:2 * PIX], wt[:H, ONE2] = w0 * a, w1 * a, (w0 + w1).sum(1) * o
+    else:
+        wt = np.zeros((C, KP), np.float32)
+        wt[:H, :PIX], wt[:H, ONE] = (w0 + w1) * a, (w0 + w1).sum(1) * o
+    return {"w": computed("lfm3vl.patch2" if pair else "lfm3vl.patch", wt), "eg": vec(get, "v.embedding_norm.weight"),
+            "eye": pad(eye(H), C)}
 
 
 def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...], proj: int) -> dict:
-    """Every padded weight of the encoder: "patch" (``patch_weights``), per layer il its ``layer_weights``, "kinds",
+    """Every padded weight of the encoder: "patch", "patch2" (``patch_weights``: an image's, a video pair's), per layer
+    il its ``layer_weights``, "kinds",
     "post_g" / "post_b" (the projector's LayerNorm), "up" / "down" (mm.0 on the merged 4 x 1280 channels -> 4160, mm.2
     -> the language model's width in passes) and their biases; "layers", "proj". Matrices as ``get`` gives them (views
     of the file), never materialized."""
-    w: dict = {"patch": patch_weights(get), "layers": len(kinds), "proj": proj, "kinds": kinds,
+    w: dict = {"patch": patch_weights(get), "patch2": patch_weights(get, pair=True), "layers": len(kinds), "proj": proj,
+               "kinds": kinds,
                **{il: layer_weights(get, il, k) for il, k in enumerate(kinds)}}
     w["post_g"], w["post_b"] = vec(get, "mm.input_norm.weight"), vec(get, "mm.input_norm.bias")
     blocks = np.array([k * H + i if i < H else -1 for k in range(4) for i in range(C)])
@@ -194,19 +204,20 @@ class Net:
         bd.op(bd.load(f"{self.nm.p}.rope.{band}", t.addr, rt), {})
         return t
 
-    def patch(self, bd: Builder, nb: int) -> None:
-        """Per band the patch GEMM of the host's integer panels (<p>.pix.b), RMSNorm into panels, the identity GEMM
-        back to C tiles: the residual's bands before layer 0 and their records."""
-        w, nm, lv = self.w["patch"], self.nm, level(nb)
+    def patch(self, bd: Builder, nb: int, pair: bool = False) -> None:
+        """Per band the patch GEMM of the host's integer panels (<p>.pix.b; ``pair``: a video pair's, <p>.pixp.b), RMSNorm
+        into panels, the identity GEMM back to C tiles: the residual's bands before layer 0 and their records."""
+        w, nm, lv = self.w["patch2" if pair else "patch"], self.nm, level(nb)
         out = Bands(lv, nm.x(0))
-        pn = lv.pn(KP)
+        kp = KP2 if pair else KP
+        pn = lv.pn(kp)
         for b in range(nb):
-            pi = bd.ddr(f"{nm.p}.pix.{b}", COLS * pn)
-            pt = alloc(bd, lv, KP, "pn")
+            pi = bd.ddr(f"{nm.p}.{'pixp' if pair else 'pix'}.{b}", COLS * pn)
+            pt = alloc(bd, lv, kp, "pn")
             bd.op({c: ColOps(fills=[MemTask([{"addr": pt.addr, "nwords": pn // 4}], ddr=(pi + c * pn, pn, None))])
                    for c in range(COLS)}, {})
             p = alloc(bd, lv, C)
-            rec = gemm(bd, pt, w["w"], None, name=f"{nm.p}.patch", out=p, ln=True, hilo=True)
+            rec = gemm(bd, pt, w["w"], None, name=f"{nm.p}.patch{'2' * pair}", out=p, ln=True, hilo=True)
             free(bd, pt)
             n = alloc(bd, lv, C, "pn")
             rms(bd, p, n, w["eg"], name=f"{nm.p}.en", rec=rec)
@@ -352,9 +363,9 @@ class Encoder(W.WindowEncoder):
         self.net = Net(w, W.Names(name), 0)
         super().__init__(npu, w, max_bands=max_bands, name=name, state=state, kv_bytes=kvb)
 
-    def patch_embed(self, bd: Builder, nb: int) -> None:
+    def patch_embed(self, bd: Builder, nb: int, pair: bool = False) -> None:
         self.net.kv = self.kv
-        self.net.patch(bd, nb)
+        self.net.patch(bd, nb, pair)
 
     def layers(self, bd: Builder, nb: int, il: range) -> None:
         self.net.kv = self.kv
@@ -388,6 +399,8 @@ class Encoder(W.WindowEncoder):
         return out
 
     def pixel_panels(self, lay: W.Layout, px: np.ndarray) -> dict[str, np.ndarray]:
+        if px.ndim == 4:  # (a video's pair)
+            return W.patch_panels(lay, px, self.nm.p, kp=KP2, one=ONE2, tag="pixp")
         return W.patch_panels(lay, px, self.nm.p, kp=KP, one=ONE)
 
     def size_inputs(self, lay: W.Layout) -> dict[str, np.ndarray]:

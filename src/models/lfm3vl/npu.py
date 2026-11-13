@@ -4,6 +4,8 @@
 the one its speech networks share, ``models.lfm.lfm.media_device``) and its tokens
 (``host.Grid.sequence``).
 
+A video's frames go through in pairs (``pairs``: a program per size, as an image's).
+
 Every load packs the weights from the mmproj file (BF16 / F16 / Q8_0 -> BFP16: ``artlite.vision.weights``, the native
 packer). The encoder's built state (the programs of the smallest and the largest images, the layout and commands) is
 cached as Qwen3-VL's (``artlite.vision.device.state_dir``), keyed by the mmproj file and the code; another size's
@@ -40,12 +42,12 @@ PROJECTORS = ("lfm3vl",)  # the mmproj projector types (``clip.projector_type``)
 TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default bound)
 
 
-def _save_program(cache: str, nb: int, pieces: list[Piece], same_layout: bool) -> None:
+def _save_program(cache: str, nb: int | tuple[str, int], pieces: list[Piece], same_layout: bool) -> None:
     """A program built over a restored state's images (same_layout: none new, their layout the state's) into its cache
-    directory."""
+    directory (nb: its key, ("pair", nb) a video pair's)."""
     if not same_layout or not os.path.isdir(cache):
         return
-    path = os.path.join(cache, f"program_{nb}.pkl")
+    path = os.path.join(cache, f"program_{nb if isinstance(nb, int) else '_'.join(map(str, nb))}.pkl")
     tmp = f"{path}.{os.getpid()}"
     with open(tmp, "wb") as f:
         pickle.dump((nb, pieces), f)
@@ -84,9 +86,13 @@ class NpuVision:
         return V.weights(gguf_getter(self.gguf), V.kinds_of(self.gguf.tensor_info, self.clip.layers),
                          self.clip.projection_dim)
 
+    def bands(self) -> int:
+        """The encoder's largest level: its largest images' and ``MAX_TOKENS``' (a video's pairs: at most that)."""
+        return max(-(-n // WIN) for n in (self.max_tokens, MAX_TOKENS))
+
     def accept(self, state: dict) -> bool:
         """Whether a cached state's encoder takes this one's largest images."""
-        return state["max_bands"] >= -(-self.max_tokens // WIN)
+        return state["max_bands"] >= self.bands()
 
     def build(self, npu: VisionDevice, w: dict, state: dict | None, cache: str) -> V.Encoder:
         """The encoder on a device (restored from ``state`` and the programs built after it in ``cache``, or built);
@@ -99,7 +105,7 @@ class NpuVision:
                 state["programs"][nb] = pieces
             enc = V.Encoder(npu, w, max_bands=state["max_bands"], state=state)
         else:
-            enc = V.Encoder(npu, w, max_bands=max(-(-self.max_tokens // WIN), -(-MAX_TOKENS // WIN)))
+            enc = V.Encoder(npu, w, max_bands=self.bands())
         enc.built = lambda nb, pieces, same: _save_program(cache, nb, pieces, same)
         self.encoder = enc
         return enc
@@ -135,6 +141,18 @@ class NpuVision:
             if len(self._kept) > KEEP:
                 self._kept.popitem(last=False)
         return self._kept[key], grid
+
+    def pairs(self, frames: np.ndarray) -> list[np.ndarray]:
+        """A video's frames (n, H, W, 3) uint8 at its size (``host.VideoPlan``) -> each pair's embeddings (its merged
+        tokens in raster order): two frames a temporal patch, an odd last one alone (both kernels on it, as an
+        image)."""
+        if frames.shape[2] // 32 > GW_MAX:
+            raise ValueError(f"a video of {frames.shape[2] // 32} tokens per row (at most {GW_MAX})")
+        t0 = time.perf_counter()
+        out = [self.encoder(frames[i:i + 2] if i + 1 < len(frames) else frames[i]) for i in range(0, len(frames), 2)]
+        self.t_encode += time.perf_counter() - t0
+        self.entries += len(out)
+        return out
 
     def sequence(self, image: str | bytes | Image.Image) -> Sequence:
         """An image (a file, its bytes or a PIL image) as the language model's tokens (between the chat template's

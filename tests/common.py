@@ -55,7 +55,8 @@ def essays() -> str:
 
 
 # synthetic videos (``video_file``): name -> (size, rate, seconds, audio, the video stream's start); "astronaut": the
-# README's astronaut picture panned and zoomed, a LibriSpeech clip (6930-75918-0001, 14.2 s) as its soundtrack
+# README's astronaut picture panned and zoomed, a LibriSpeech clip (6930-75918-0001, 14.2 s) as its soundtrack (none in
+# "astronaut-silent")
 VIDEOS = {
     "odd-25fps": ("320x240", "25", 2.6, True, 0.0),  # (5 frames: an odd last pair)
     "ntsc-start": ("640x360", "30000/1001", 6.5, True, 0.5),  # (a fractional rate; the video starting at 0.5 s)
@@ -63,6 +64,7 @@ VIDEOS = {
     "big-1080p": ("1920x1080", "30", 7.0, True, 0.0),  # (14 frames over the pixel bound: scaled down)
     "silent": ("480x272", "24", 4.0, False, 0.0),  # (no audio stream)
     "astronaut": ("960x540", "25", 14.2, True, 0.0),
+    "astronaut-silent": ("960x540", "25", 14.2, False, 0.0),
 }
 ASTRONAUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "images", "sd15-astronaut.jpg")
 SPEECH_CLIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "librispeech", "6930-75918-0001.wav")
@@ -79,13 +81,14 @@ def video_file(folder: str, name: str) -> str:
     if os.path.exists(path):
         return path
     cmd = ["ffmpeg", "-v", "error", "-y"]
-    if name == "astronaut":
-        if not os.path.exists(SPEECH_CLIP):
+    if name.startswith("astronaut"):
+        if audio and not os.path.exists(SPEECH_CLIP):
             pytest.skip(f"{SPEECH_CLIP} missing: run tests/datasets/fetch_datasets.py")
         w, h = size.split("x")
         pan = (f"scale=1920:-2,zoompan=z='1+0.002*on':x='iw/2-(iw/zoom/2)+2*on':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}"
                f":fps={rate}")
-        cmd += ["-loop", "1", "-framerate", rate, "-i", ASTRONAUT, "-i", SPEECH_CLIP, "-t", str(sec), "-vf", pan]
+        cmd += ["-loop", "1", "-framerate", rate, "-i", ASTRONAUT, *(["-i", SPEECH_CLIP] if audio else []), "-t", str(sec),
+                "-vf", pan]
     else:
         if start:
             cmd += ["-itsoffset", str(start)]

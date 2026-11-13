@@ -17,6 +17,8 @@ histories, ~0.5 MB). Drafts: the context's (``drafts.Lookup``), whose rejected t
 lazy shift, the caches' records overwritten).
 """
 
+import hashlib
+from collections import OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,6 +49,7 @@ SAMPLING = {"temp": 0.1, "top_k": 50, "penalty_repeat": 1.1}
 # a d1 decision model's images at most (its runner's ``d1_vision_max_pixels``, 1638400: the budget it was trained and is
 # served at; its mmproj's maximum is LFM3-VL's)
 D1_IMAGE_TOKENS = 1600
+KEEP_VIDEOS = 2  # (videos whose sequences are kept)
 
 
 def media_device(mmproj: str, vision: vl_npu.NpuVision, audio: a_npu.NpuAudio) -> VisionDevice:
@@ -187,6 +190,7 @@ class Lfm(Model):
         self.bos = int(self.gguf.meta["tokenizer.ggml.bos_token_id"])
         self.kv_k = kv_k
         self._npu: NpuLfm | None = None
+        self._videos: OrderedDict[bytes, Sequence] = OrderedDict()  # (``video_sequence``'s last videos)
         toks = self.gguf.strings("tokenizer.ggml.tokens")
         self.banned = tuple(toks.index(t) for t in a_host.TEXT_ONLY_BANNED if t in toks)
         if mmproj is not None:
@@ -296,8 +300,13 @@ class Lfm(Model):
     def video_sequence(self, src: str | bytes, *, soundtrack: bool = True) -> Sequence:
         """A video (a file or its bytes) as the language model's tokens (``models.lfm3vl.host``: its frames' pairs
         through the vision encoder, ``NpuVision.pairs``; with LFM3-Omni's mmproj, which has the speech encoder too, its
-        soundtrack's rows after each pair, unless ``soundtrack`` is false)."""
+        soundtrack's rows after each pair, unless ``soundtrack`` is false). The last ``KEEP_VIDEOS`` videos' sequences
+        are kept (a conversation's video runs the encoders once)."""
         data = video.read(src)
+        key = hashlib.sha256(data).digest() + bytes([soundtrack])
+        if key in self._videos:
+            self._videos.move_to_end(key)
+            return self._videos[key]
         info = video.probe(data)
         heard = self.audio is not None  # (the mmproj hears a video: LFM3-Omni's prompt layout)
         plan = vl_host.VideoPlan.of(info.n_frames, info.fps, info.width, info.height, heard=heard)
@@ -310,7 +319,10 @@ class Lfm(Model):
             rows = [a_host.clip_sequence(embd[b:e]) for b, e in plan.rows(slices, len(embd))]
         grid = plan.grid
         pairs = [grid.sequence(e) for e in self.vision.pairs(frames)]
-        return vl_host.video_sequence(pairs, plan.stamps(len(frames)), self.tokenizer.encode, rows)
+        seq = self._videos[key] = vl_host.video_sequence(pairs, plan.stamps(len(frames)), self.tokenizer.encode, rows)
+        if len(self._videos) > KEEP_VIDEOS:
+            self._videos.popitem(last=False)
+        return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*), else the model card's."""

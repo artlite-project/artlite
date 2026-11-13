@@ -66,7 +66,8 @@ def test_items(videos: str, name: str, model: str) -> None:
 
 def test_plans() -> None:
     """The frame count's bounds (4; 768, or 384 with the soundtrack; the video's frames), the indices (round of
-    linspace), the size's rule (the pixel bound over all frames; small sides scaled up)."""
+    linspace), the size's rule (the pixel bound over all frames; small sides scaled up; a frame over the tower's
+    largest image takes an image's size)."""
     p = H.VideoPlan.of(9000, 30.0, 1280, 720, heard=True)  # (5 min at 30 fps: 600 frames at 2 fps)
     assert len(p.indices) == 384 and p.indices[0] == 0 and p.indices[-1] == 8999
     assert len(H.VideoPlan.of(9000, 30.0, 1280, 720, heard=False).indices) == 600
@@ -75,6 +76,8 @@ def test_plans() -> None:
     w, h = H.video_size(1280, 720, 60)  # (a 30 s 720p video at 2 fps: its 60 frames over 25.2 Mpx)
     assert w % 32 == h % 32 == 0 and 60 * w * h <= H.VIDEO_PIXELS[1] and (w, h) == (832, 480)
     assert H.video_size(16, 600, 8) == (32, 1216)  # (the narrow side scaled up to 32 first)
+    big = H.VideoPlan.of(120, 60.0, 3840, 2160, heard=True)  # (2 s of 4K: 4 frames of 6 Mpx under the video bound)
+    assert len(big.indices) == 4 and big.grid.tokens <= H.MAX_TOKENS  # (the tower's largest image instead)
     rows = H.VideoPlan.of(65, 25.0, 320, 240, heard=True)
     sl = rows.slices(41600)
     assert sl == [(0, 20480), (20480, 40960), (40960, 41600)] and rows.rows(sl, 33) == [(0, 16), (16, 32), (32, 33)]

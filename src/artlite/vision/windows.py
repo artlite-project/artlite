@@ -14,6 +14,8 @@ tile (token panel 2 (band % 4) + p) for the merger's MLP, its weights streamed o
 
 Programs (``WindowEncoder``): per nb a program of pieces, one dispatch each (built on first use, ``program``): nb 1 one
 piece (the patch embedding, every layer, the merger); larger images the patch embedding, pieces of layers, the merger.
+A video's pair of frames (one temporal patch: the patch embedding's two kernels on its two frames) runs a program of
+its own patch embedding, its other pieces the image program's of that nb.
 A piece of layers is built once from a layer s and run at layer at (its layers' kinds those from s: ``kinds``) by
 rewriting its shim addresses for layer at's images (``VisionDevice.refs`` / ``resolve``, ``Names.rename``: the
 residual's ping-pong images swapped at an odd distance). Shim addresses a piece's fills take per image size (tagged:
@@ -239,9 +241,10 @@ class WindowEncoder:
     """An encoder on the window layout (module docstring) as dispatches on a VisionDevice: per nb a program (``program``:
     its pieces built on first use, over the same weight images: ``Builder.fork``). Per image the host writes its inputs
     (``inputs``: patch panels, the size's rows: ``size_inputs``), runs the pieces and reads the embeddings. A subclass
-    gives the network: ``patch_embed``, ``layers``, ``final``, ``size_inputs``, ``layers_per_piece``, ``kinds`` (the
-    layers' kinds: a piece of layers runs where the kinds are its own), ``pixel_panels``, ``shift`` (a tagged
-    address's bytes for an image)."""
+    gives the network: ``patch_embed`` (``pair=True``: a video's pair of frames, where the network takes videos),
+    ``layers``, ``final``, ``size_inputs``, ``layers_per_piece``, ``kinds`` (the layers' kinds: a piece of layers runs
+    where the kinds are its own), ``pixel_panels`` (an image's pixels or a pair's), ``shift`` (a tagged address's bytes
+    for an image)."""
 
     PATCH = 16
 
@@ -258,12 +261,13 @@ class WindowEncoder:
         self.max_bands = max_bands
         for nb in range(1, max_bands + 1):  # (every level's attention command, before any program)
             self.bd.ddr(self.nm.attn(nb), 5760)
-        self.programs: dict[int, list[Piece]] = {} if state is None else dict(state["programs"])
-        self.built: Callable[[int, list[Piece], bool], None] | None = None  # (a new program's hook: a cache's; the
-        # bool: it took only images that existed before it)
-        self.tr: dict[tuple[int, int], Transaction] = {}
+        # (programs by nb; a video's pairs' by ("pair", nb))
+        self.programs: dict[int | tuple[str, int], list[Piece]] = {} if state is None else dict(state["programs"])
+        self.built: Callable[[int | tuple[str, int], list[Piece], bool], None] | None = None  # (a new program's hook: a
+        # cache's; the bool: it took only images that existed before it)
+        self.tr: dict[tuple, Transaction] = {}  # (by (program key, piece): a pair's shared pieces the image's)
         self._inputs: OrderedDict[tuple[int, int], dict[str, np.ndarray]] = OrderedDict()
-        self._at: dict[tuple[int, int], tuple] = {}  # (a transaction's last (layer, size) its words are set for)
+        self._at: dict[tuple, tuple] = {}  # (a transaction's last (layer, size) its words are set for)
         self.program(1)  # (every layer's images: nb 1 runs them all in one dispatch)
         self.program(max_bands)  # (every band's DDR images: the layout that later programs take)
 
@@ -315,19 +319,24 @@ class WindowEncoder:
             i += n
         return out
 
-    def program(self, nb: int) -> list[Piece]:
+    def program(self, nb: int, pair: bool = False) -> list[Piece]:
         """The pieces of nb bands (built on first use): nb 1 one; else the patch embedding, the layers' pieces (one per
-        distinct run of kinds: ``schedule`` runs each wherever its kinds are), the final merger."""
-        if nb in self.programs:
-            return self.programs[nb]
+        distinct run of kinds: ``schedule`` runs each wherever its kinds are), the final merger. ``pair``: a video's
+        pair of frames (the pair's patch embedding, then the image program's pieces)."""
+        pkey = ("pair", nb) if pair else nb
+        if pkey in self.programs:
+            return self.programs[pkey]
         assert nb <= self.max_bands, (nb, self.max_bands)
         had = set(self.npu._images)
+        embed = (lambda b, n: self.patch_embed(b, n, pair=True)) if pair else self.patch_embed
         if nb == 1:
             def full(b: Builder) -> None:
-                self.patch_embed(b, 1)
+                embed(b, 1)
                 self.layers(b, 1, range(self.nl))
                 self.final(b, 1)
             out = [self._piece(full)]
+        elif pair:
+            out = [self._piece(lambda b: embed(b, nb)), *self.program(nb)[1:]]
         else:
             out = [self._piece(lambda b: self.patch_embed(b, nb))]
             built: dict[tuple, int] = {}
@@ -337,15 +346,15 @@ class WindowEncoder:
                     built[key] = len(out)
                     out.append(self._piece(lambda b, s=s, n=n: self.layers(b, nb, range(s, s + n)), n, s))
             out.append(self._piece(lambda b: self.final(b, nb)))
-        self.programs[nb] = out
+        self.programs[pkey] = out
         if self.built:
-            self.built(nb, out, set(self.npu._images) <= had)
+            self.built(pkey, out, set(self.npu._images) <= had)
         return out
 
-    def schedule(self, nb: int) -> list[tuple[int, int]]:
-        """The dispatches of an image of nb bands: (piece, its first layer): the layers covered by the program's pieces
-        of layers, at each layer the longest whose kinds are the next layers'."""
-        prog = self.program(nb)
+    def schedule(self, nb: int, pair: bool = False) -> list[tuple[int, int]]:
+        """The dispatches of an image (``pair``: a video's pair) of nb bands: (piece, its first layer): the layers
+        covered by the program's pieces of layers, at each layer the longest whose kinds are the next layers'."""
+        prog = self.program(nb, pair)
         if nb == 1:
             return [(0, 0)]
         kinds = self.kinds or ("",) * self.nl
@@ -358,12 +367,13 @@ class WindowEncoder:
             at += prog[i].layers
         return out + [(len(prog) - 1, 0)]
 
-    def _transaction(self, nb: int, i: int, at: int, lay: Layout) -> Transaction:
-        """Piece i of nb's program for a run from layer ``at`` on an image of layout lay: its shim addresses resolved on
-        this device's images (another process's program: its images restored at other addresses), a layer piece's per
-        run for layer at's images, its tagged ones for lay's size, rewritten in place."""
-        pc = self.program(nb)[i]
-        key = (nb, i)
+    def _transaction(self, nb: int, i: int, at: int, lay: Layout, pair: bool = False) -> Transaction:
+        """Piece i of nb's program (``pair``: a video pair's) for a run from layer ``at`` on an image of layout lay: its
+        shim addresses resolved on this device's images (another process's program: its images restored at other
+        addresses), a layer piece's per run for layer at's images, its tagged ones for lay's size, rewritten in
+        place."""
+        pc = self.program(nb, pair)[i]
+        key = (("pair", nb) if pair and (nb == 1 or i == 0) else nb, i)
         if key not in self.tr:
             words = pc.words.copy()
             self.npu.resolve(words, pc.refs, lambda n: n)
@@ -403,33 +413,37 @@ class WindowEncoder:
         return lay.merged(tiles)[:, :self.proj]
 
     def __call__(self, px: np.ndarray) -> np.ndarray:
-        """An image's pixels (uint8 (H, W, 3), multiples of 32) -> its embeddings (H / 32 W / 32, proj) in raster
-        order."""
-        lay = Layout(px.shape[0] // 32, px.shape[1] // 32)
-        assert lay.gh * 32 == px.shape[0] and lay.gw * 32 == px.shape[1], px.shape
+        """An image's pixels (uint8 (H, W, 3), multiples of 32) or a video's pair of frames ((2, H, W, 3)) -> its
+        embeddings (H / 32 W / 32, proj) in raster order."""
+        pair = px.ndim == 4
+        lay = Layout(px.shape[-3] // 32, px.shape[-2] // 32)
+        assert lay.gh * 32 == px.shape[-3] and lay.gw * 32 == px.shape[-2], px.shape
         with ThreadPoolExecutor(1) as pool:  # (the inputs while the program builds, on first use)
             host = pool.submit(self.inputs, lay, px)
-            plan = self.schedule(lay.nb)
+            plan = self.schedule(lay.nb, pair)
             for n, data in host.result().items():
                 self.npu.write(n, data)
         for i, at in plan:
-            self.npu.run(self._transaction(lay.nb, i, at, lay))
+            self.npu.run(self._transaction(lay.nb, i, at, lay, pair))
         return self.embeddings(lay)
 
 
-def patch_panels(lay: Layout, px: np.ndarray, name: str, *, kp: int, one: int, patch: int = 16) -> dict[str, np.ndarray]:
-    """Per band its patches' integer panels (DDR image <name>.pix.b: q = p - 128 of the patch's (c, ky, kx) inputs,
-    the constant 1 at input ``one``, kp inputs) of an image's pixels px (uint8 (H, W, 3))."""
+def patch_panels(lay: Layout, px: np.ndarray, name: str, *, kp: int, one: int, patch: int = 16,
+                 tag: str = "pix") -> dict[str, np.ndarray]:
+    """Per band its patches' integer panels (DDR image <name>.<tag>.b: q = p - 128 of the patch's (c, ky, kx) inputs,
+    frame by frame, the constant 1 at input ``one``, kp inputs) of an image's pixels px (uint8 (H, W, 3)) or a video
+    pair's ((2, H, W, 3))."""
     nb = lay.nb
     ph, pw = 2 * lay.gh, 2 * lay.gw
-    q = px.reshape(ph, patch, pw, patch, 3).transpose(0, 2, 4, 1, 3).reshape(ph * pw, 3 * patch * patch).astype(np.int16) - 128
+    q = np.concatenate([f.reshape(ph, patch, pw, patch, 3).transpose(0, 2, 4, 1, 3).reshape(ph * pw, 3 * patch * patch)
+                        for f in (px if px.ndim == 4 else px[None])], 1).astype(np.int16) - 128
     sp = lay.slot_patches().reshape(nb, COLS, 64)
     out = {}
     pix = np.zeros((COLS, 64, kp), np.int8)
     pix[..., one] = 1
     for b in range(nb):
-        pix[..., :3 * patch * patch] = q[sp[b]]
-        out[f"{name}.pix.{b}"] = np.concatenate([L.int_panels(pix[c]) for c in range(COLS)])
+        pix[..., :q.shape[1]] = q[sp[b]]
+        out[f"{name}.{tag}.{b}"] = np.concatenate([L.int_panels(pix[c]) for c in range(COLS)])
     return out
 
 

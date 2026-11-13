@@ -15,7 +15,9 @@ model's positions are 1-D).
 Videos (``VideoPlan``: transformers' ``Lfm3VlVideoProcessor`` and LFM3-Omni's processor as llama.cpp's mtmd runs them,
 ``MTMD_VIDEO_TEMPLATE_LFM3`` / ``_LFM3_OMNI``): frames sampled at 2 a second, n = trunc(n_src / fps x 2) clamped to 4 ..
 768 (with the soundtrack, LFM3-Omni: 384) and to the video's frames, the source frames round(linspace(0, n_src - 1, n));
-one size for every frame (Qwen3-VL's video rule: ``video_size``); consecutive frames in pairs, one temporal patch each
+one size for every frame (Qwen3-VL's video rule: ``video_size``; a frame of more than ``MAX_TOKENS`` merged tokens,
+which llama.cpp does not cap, takes an image's size instead: a video under 3 s of more than 4 Mpx a frame);
+consecutive frames in pairs, one temporal patch each
 (the patch embedding's two kernels on its two frames; an odd last frame alone: both kernels on it, as on an image).
 The chat template's ``<|vision_start|><|video|><|vision_end|>`` becomes per pair its timestamp ``<t seconds>`` (the
 mean of its source frames' times, "%.1f"), ``<|vision_start|>``, its merged tokens, ``<|vision_end|>`` and, with a
@@ -148,7 +150,10 @@ class VideoPlan:
         n = min(max(n, FRAMES[0]), FRAMES_HEARD if heard else FRAMES[1], n_frames)
         step = (n_frames - 1) / (n - 1) if n > 1 else 0.0
         idx = tuple(int(np.rint(i * step)) for i in range(n))
-        return cls(idx, *video_size(width, height, n), fps)
+        w, h = video_size(width, height, n)
+        if w * h > MAX_TOKENS * 1024:  # (the tower's largest image)
+            w, h = target_size(width, height)
+        return cls(idx, w, h, fps)
 
     @property
     def grid(self) -> Grid:
