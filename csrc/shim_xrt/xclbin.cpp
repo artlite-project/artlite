@@ -4,8 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <format>
+#include <string>
 #include <string_view>
 
+#include "shim_xrt/abi.h"
 #include "xrt/detail/xclbin.h"
 
 namespace shim_xdna {
@@ -17,32 +20,36 @@ constexpr uint64_t kDpuKernelId = 0x901, kPdiId = 0x1;
 constexpr uint32_t kPreCdoGroup = 0xC1, kOpsPerCycle = 2048;
 constexpr uint64_t kInferenceFingerprint = 23423, kPrePostFingerprint = 12345;
 constexpr uint16_t kColumns = 8;
-constexpr uint32_t kBuffers = 5;  // bo0 .. bo4, the arguments from 3
 
-// The kernel's arguments as xclbinutil writes them from aiecc's kernel JSON.
-constexpr std::string_view kMetadata =
-    R"(<?xml version="1.0" encoding="utf-8"?>
+// The kernel's arguments (abi.h) as xclbinutil writes them from aiecc's kernel JSON.
+std::string kernel_metadata() {
+  using namespace xrt_abi;
+  std::string buffers;
+  for (unsigned i = 0; i < kMaxBuffers; i++)
+    buffers += std::format(
+        R"(          <arg name="bo{}" addressQualifier="1" id="{}" size="0x8" offset="0x{:02X}" hostOffset="0x0" hostSize="0x8" type="void*"/>
+)",
+        i, kArgFirstBuffer + i, 0x14 + 8 * i);
+  return std::format(
+      R"(<?xml version="1.0" encoding="utf-8"?>
 <project>
   <platform>
     <device>
       <core>
         <kernel name="MLIR_AIE" language="c" type="dpu">
           <extended-data subtype="1" functional="0" dpu_kernel_id="0x901"/>
-          <arg name="opcode" addressQualifier="0" id="0" size="0x8" offset="0x00" hostOffset="0x0" hostSize="0x8" type="uint64_t"/>
-          <arg name="instr" addressQualifier="1" id="1" size="0x8" offset="0x08" hostOffset="0x0" hostSize="0x8" type="char *"/>
-          <arg name="ninstr" addressQualifier="0" id="2" size="0x4" offset="0x10" hostOffset="0x0" hostSize="0x4" type="uint32_t"/>
-          <arg name="bo0" addressQualifier="1" id="3" size="0x8" offset="0x14" hostOffset="0x0" hostSize="0x8" type="void*"/>
-          <arg name="bo1" addressQualifier="1" id="4" size="0x8" offset="0x1C" hostOffset="0x0" hostSize="0x8" type="void*"/>
-          <arg name="bo2" addressQualifier="1" id="5" size="0x8" offset="0x24" hostOffset="0x0" hostSize="0x8" type="void*"/>
-          <arg name="bo3" addressQualifier="1" id="6" size="0x8" offset="0x2C" hostOffset="0x0" hostSize="0x8" type="void*"/>
-          <arg name="bo4" addressQualifier="1" id="7" size="0x8" offset="0x34" hostOffset="0x0" hostSize="0x8" type="void*"/>
-          <instance name="MLIRAIE"/>
+          <arg name="opcode" addressQualifier="0" id="{}" size="0x8" offset="0x00" hostOffset="0x0" hostSize="0x8" type="uint64_t"/>
+          <arg name="instr" addressQualifier="1" id="{}" size="0x8" offset="0x08" hostOffset="0x0" hostSize="0x8" type="char *"/>
+          <arg name="ninstr" addressQualifier="0" id="{}" size="0x4" offset="0x10" hostOffset="0x0" hostSize="0x4" type="uint32_t"/>
+{}          <instance name="MLIRAIE"/>
         </kernel>
       </core>
     </device>
   </platform>
 </project>
-)";
+)",
+      kArgOpcode, kArgInstr, kArgWords, buffers);
+}
 
 std::array<uint8_t, 32> sha256(std::span<const uint8_t> data) {
   static constexpr uint32_t K[64] = {
@@ -187,7 +194,7 @@ std::vector<char> connectivity_section(int copies) {
   std::vector<connection> c;
   for (int k = 0; k < copies; k++) {
     c.push_back({1, 0, 1});
-    for (uint32_t i = 0; i < kBuffers; i++) c.push_back({static_cast<int32_t>(3 + i), 0, 0});
+    for (unsigned i = 0; i < xrt_abi::kMaxBuffers; i++) c.push_back({static_cast<int32_t>(xrt_abi::kArgFirstBuffer + i), 0, 0});
   }
   std::vector<char> out(offsetof(connectivity, m_connection) + c.size() * sizeof(connection));
   const auto count = static_cast<int32_t>(c.size());
@@ -200,6 +207,7 @@ std::vector<char> connectivity_section(int copies) {
 
 std::vector<char> pdi_xclbin(std::span<const uint8_t> pdi) {
   const auto digest = sha256(pdi);
+  const std::string metadata = kernel_metadata();
   struct Section {
     axlf_section_kind kind;
     std::vector<char> data;
@@ -207,7 +215,7 @@ std::vector<char> pdi_xclbin(std::span<const uint8_t> pdi) {
   const Section sections[] = {
       {MEM_TOPOLOGY, topology_section()},
       {AIE_PARTITION, partition_section(pdi, digest.data())},
-      {EMBEDDED_METADATA, {kMetadata.begin(), kMetadata.end()}},
+      {EMBEDDED_METADATA, {metadata.begin(), metadata.end()}},
       {IP_LAYOUT, ip_layout_section()},
       {CONNECTIVITY, connectivity_section(1)},
       {ASK_GROUP_CONNECTIVITY, connectivity_section(2)},

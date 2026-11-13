@@ -12,6 +12,7 @@
 #include "artlite/shim.h"
 #include "artlite/spin.h"
 #include "artlite/turn.h"
+#include "shim_xrt/abi.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
@@ -24,10 +25,9 @@ using shim_xdna::hw_ctx;
 
 namespace {
 
-// The kernel's arguments: opcode, instruction buffer, its length in words, then the buffers.
-constexpr unsigned kArgOpcode = 0, kArgInstr = 1, kArgWords = 2, kArgFirstBuffer = 3;
+using namespace shim_xdna::xrt_abi;  // (the kernel's arguments)
+
 constexpr uint64_t kFirmwareOpcode = 3;
-constexpr size_t kMaxBuffers = 5;  // (bo0 .. bo4: a kernel with more fails to run)
 
 uint32_t state_of(const xrt::run& r) { return static_cast<uint32_t>(r.state()); }
 

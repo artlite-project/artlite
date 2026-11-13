@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "artlite/error.h"
+#include "artlite/memory.h"
 #include "artlite/platform.h"
 #include "artlite/shim.h"
 
@@ -24,25 +25,6 @@ constexpr size_t kBounce = 512 << 10;     // per thread: two hyperthreads share 
 constexpr size_t kPerThread = 32 << 20;   // fewer threads for small files
 constexpr unsigned kMaxThreads = 16;      // (2 GB from the page cache: 16 threads 71 GB/s, 8 49 GB/s)
 
-// dst gets the bytes of src through streaming stores (the head up to dst's 64-B alignment and
-// the tail through memcpy). The calling thread fences its own stores.
-ARTLITE_AVX512_FN void stream_copy(char* dst, const char* src, size_t n) {
-  size_t head = std::min(n, (64 - reinterpret_cast<uintptr_t>(dst) % 64) % 64);
-  std::memcpy(dst, src, head);
-  size_t i = head;
-  for (; i + 256 <= n; i += 256) {
-    __m512i a = _mm512_loadu_si512(src + i), b = _mm512_loadu_si512(src + i + 64);
-    __m512i c = _mm512_loadu_si512(src + i + 128), d = _mm512_loadu_si512(src + i + 192);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i), a);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i + 64), b);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i + 128), c);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i + 192), d);
-  }
-  for (; i + 64 <= n; i += 64)
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(dst + i), _mm512_loadu_si512(src + i));
-  std::memcpy(dst + i, src + i, n - i);
-}
-
 void copy_range(const platform::File& file, char* dst, uint64_t file_offset, size_t n) {
   auto bounce = platform::aligned_buffer(64, kBounce);
   if (!bounce) throw std::bad_alloc();
@@ -53,7 +35,7 @@ void copy_range(const platform::File& file, char* dst, uint64_t file_offset, siz
       if (r == 0) throw Error("read_file: the file ended early");
       got += r;
     }
-    stream_copy(dst + done, bounce.get(), len);
+    memory::stream_copy(dst + done, bounce.get(), len);
     done += len;
   }
   _mm_sfence();

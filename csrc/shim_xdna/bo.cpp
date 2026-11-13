@@ -5,19 +5,16 @@
 #include "bo.h"
 
 #include <drm/drm.h>
-#include <emmintrin.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
-#include <exception>
-#include <thread>
 #include <vector>
 
+#include "artlite/memory.h"
 #include "device.h"
 #include "shim_err.h"
 #include "xrt_mem.h"
@@ -38,19 +35,6 @@ amdxdna_bo_type flag_to_type(shim_xcl_bo_flags flags) {
       break;
   }
   return AMDXDNA_BO_INVALID;
-}
-
-// Write back and invalidate the cache lines of a range. CLFLUSH is not ordered against younger
-// loads: without the fences a read right after a device->host sync can still hit the stale line
-// (the kernel's clflush_cache_range fences the same way). CLFLUSHOPT is no faster on Zen 5.
-void clflush_range(const void* p, size_t len) {
-  if (!len) return;
-  constexpr uintptr_t line = 64;
-  uintptr_t cur = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
-  uintptr_t end = reinterpret_cast<uintptr_t>(p) + len;
-  _mm_mfence();
-  for (; cur < end; cur += line) _mm_clflush(reinterpret_cast<const void*>(cur));
-  _mm_mfence();
 }
 
 }  // namespace
@@ -130,7 +114,7 @@ bo::bo(const pdev& pdev, size_t size, shim_xcl_bo_flags flags, amdxdna_bo_type t
   // the data in cacheline will be flushed onto memory and pollute the output
   // from device. We perform a cache flush right after the BO is allocated to
   // avoid this issue.
-  if (m_type == AMDXDNA_BO_SHMEM) clflush_range(m_aligned, size);
+  if (m_type == AMDXDNA_BO_SHMEM) artlite::memory::flush_lines(m_aligned, size);
 }
 
 bo::bo(const pdev& p, size_t size, user_memory)
@@ -148,34 +132,10 @@ bo::bo(const pdev& p, size_t size, user_memory)
   try {
     // (the advice up to the next 2 MB boundary: the buffer's last part is a 2 MB page as well)
     const size_t advised = (m_aligned_size + huge - 1) / huge * huge;
-    ::madvise(mem, advised, MADV_HUGEPAGE);  // (no THP: 4 KB pages)
-    // no copy of the pinned pages in a forked child (a subprocess started without vfork)
-    if (::madvise(mem, advised, MADV_DONTFORK)) shim_err(errno, "madvise(MADV_DONTFORK) failed");
+    if (const int err = artlite::memory::advise_pinned(mem, advised)) shim_err(err, "madvise(MADV_DONTFORK) failed");
     // fault in (zeroed pages) and write back the zeroes: the NPU's DMA must not find stale DRAM under dirty lines,
-    // nor have its output overwritten by their eviction later (as a SHMEM BO's clflush at allocation). In pieces:
-    // a populate holds mmap_lock, which other threads' mmap / brk wait for (a tokenizer loading meanwhile: 2x).
-    const size_t piece = size_t(32) << 20;
-    const unsigned threads = static_cast<unsigned>(std::clamp<size_t>(m_aligned_size / (size_t(256) << 20), 1, 8));
-    std::atomic<size_t> next{0};
-    std::vector<std::exception_ptr> errors(threads);
-    auto populate = [&](unsigned t) {
-      try {
-        for (size_t a; (a = next.fetch_add(piece)) < m_aligned_size;) {
-          size_t n = std::min(piece, m_aligned_size - a);
-          if (::madvise(mem + a, n, MADV_POPULATE_WRITE))
-            for (size_t o = a; o < a + n; o += 4096) mem[o] = 0;  // (before Linux 5.14)
-          clflush_range(mem + a, n);
-        }
-      } catch (...) {
-        errors[t] = std::current_exception();
-      }
-    };
-    std::vector<std::thread> pool;
-    for (unsigned t = 1; t < threads; t++) pool.emplace_back(populate, t);
-    populate(0);
-    for (auto& th : pool) th.join();
-    for (auto& e : errors)
-      if (e) std::rethrow_exception(e);
+    // nor have its output overwritten by their eviction later (as a SHMEM BO's clflush at allocation)
+    artlite::memory::populate_zeroed(mem, m_aligned_size);
 
     std::vector<uint8_t> tbl(sizeof(amdxdna_drm_va_tbl) + sizeof(amdxdna_drm_va_entry));
     amdxdna_drm_va_tbl head = {.dmabuf_fd = -1, .num_entries = 1};
@@ -232,7 +192,7 @@ void bo::sync(direction, size_t size, size_t offset) {
     case AMDXDNA_BO_SHMEM:
     case AMDXDNA_BO_CMD:
     case AMDXDNA_BO_DEV:
-      clflush_range(static_cast<char*>(m_aligned) + offset, size);
+      artlite::memory::flush_lines(static_cast<char*>(m_aligned) + offset, size);
       break;
     default:
       shim_err(ENOTSUP, "Can't sync bo type {}", static_cast<int>(m_type));
@@ -242,9 +202,7 @@ void bo::sync(direction, size_t size, size_t offset) {
 void bo::sync(direction dir) { sync(dir, size(), 0); }
 
 void bo::sync_lines(const int64_t* offsets, size_t count) {
-  _mm_mfence();
-  for (size_t i = 0; i < count; i++) _mm_clflush(static_cast<const char*>(m_aligned) + offsets[i]);
-  _mm_mfence();
+  artlite::memory::flush_line_offsets(m_aligned, offsets, count);
 }
 
 }  // namespace shim_xdna

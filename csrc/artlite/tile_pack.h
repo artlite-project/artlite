@@ -22,6 +22,12 @@ TileFormat tile_format(std::string_view name);
 /// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512, F32: 1024).
 size_t block_bytes(TileFormat f);
 
+/// Bytes a tile of R rows of nsb super-blocks uses of its format's S (``~size_t(0)``: an R the format has no tile for).
+size_t used_bytes(TileFormat f, int R, int nsb);
+
+/// Most super-blocks of a tile.
+constexpr int kMaxNsb = 16;
+
 /// A run of row tiles in every column block of a weight image's region (``decode.image.Block``): column c's
 /// n rows (indices into the stacked tensors, -1: a zero row) as n / (R G) row tiles of S bytes over n_kc K chunks
 /// of 256 nsb columns, row tile rt's tile of chunk kc at ``Region.tile(rt0 + rt, kc)`` of the column block

@@ -1,7 +1,5 @@
 #include "shim_xrt/bo.h"
 
-#include <emmintrin.h>
-
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -12,14 +10,13 @@
 #endif
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <new>
 #include <span>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
+#include "artlite/memory.h"
 #include "shim_xrt/device.h"
 #include "shim_xrt/hwctx.h"
 #include "xrt/experimental/xrt_ext.h"
@@ -33,53 +30,12 @@ namespace {
 constexpr size_t kPage = 4096;
 size_t round_up(size_t n) { return (std::max<size_t>(n, 1) + kPage - 1) / kPage * kPage; }
 
-// Write back and invalidate the cache lines of a range. CLFLUSH is not ordered against younger loads: without the
-// fences a read right after a device->host sync can still hit the stale line.
-void flush_lines(const void* p, size_t len) {
-  if (!len) return;
-  constexpr uintptr_t line = 64;
-  uintptr_t cur = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
-  const uintptr_t end = reinterpret_cast<uintptr_t>(p) + len;
-  _mm_mfence();
-  for (; cur < end; cur += line) _mm_clflush(reinterpret_cast<const void*>(cur));
-  _mm_mfence();
-}
-
-#ifdef _WIN32
-void fault_in(char* p, size_t n) {
-  for (size_t o = 0; o < n; o += kPage) p[o] = 0;
-}
-#else
-void fault_in(char* p, size_t n) {
-  if (::madvise(p, n, MADV_POPULATE_WRITE))
-    for (size_t o = 0; o < n; o += kPage) p[o] = 0;  // (before Linux 5.14)
-}
-#endif
-
-// Fresh memory faulted in and written back by several threads: no dirty line of the zeroing may later land over what
-// the NPU wrote, and the driver's pin would fault the pages in one thread (Linux, 16 GB: ~1.7 s; this: ~0.3 s).
-void populate(char* mem, size_t n) {
-  constexpr size_t piece = size_t(32) << 20;
-  std::atomic<size_t> next{0};
-  auto work = [&] {
-    for (size_t a; (a = next.fetch_add(piece)) < n;) {
-      const size_t k = std::min(piece, n - a);
-      fault_in(mem + a, k);
-      flush_lines(mem + a, k);
-    }
-  };
-  std::vector<std::thread> pool;
-  for (size_t t = 1; t < std::clamp<size_t>(n / (size_t(256) << 20), 1, 8); t++) pool.emplace_back(work);
-  work();
-  for (auto& th : pool) th.join();
-}
-
 #ifdef _WIN32
 void* host_alloc(size_t size) {
   const size_t n = round_up(size);
   void* p = ::VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   if (!p) throw std::bad_alloc();
-  populate(static_cast<char*>(p), n);
+  artlite::memory::populate_zeroed(p, n);
   return p;
 }
 
@@ -96,13 +52,11 @@ void* host_alloc(size_t size) {
   char* const mem = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(lo) + huge - 1) & ~(huge - 1));
   if (mem > lo) ::munmap(lo, mem - lo);
   if (mem + n < lo + span) ::munmap(mem + n, lo + span - (mem + n));
-  ::madvise(mem, n, MADV_HUGEPAGE);  // (no THP: 4 KB pages)
-  if (::madvise(mem, n, MADV_DONTFORK)) {
-    const int err = errno;
+  if (const int err = artlite::memory::advise_pinned(mem, n)) {
     ::munmap(mem, n);
     throw std::system_error(err, std::generic_category(), "madvise(MADV_DONTFORK)");
   }
-  populate(mem, n);
+  artlite::memory::populate_zeroed(mem, n);
   return mem;
 }
 
@@ -185,10 +139,7 @@ void bo::sync_lines(const int64_t* offsets, size_t count) {
     sync(direction::host2device, std::min<size_t>(*hi - *lo + 64, m_size - *lo), static_cast<size_t>(*lo));
     return;
   }
-  const char* const host = static_cast<const char*>(m_host);
-  _mm_mfence();
-  for (size_t i = 0; i < count; i++) _mm_clflush(host + offsets[i]);
-  _mm_mfence();
+  artlite::memory::flush_line_offsets(m_host, offsets, count);
 }
 
 void bo::sync(direction dir, size_t size, size_t offset) {
@@ -206,7 +157,7 @@ void bo::sync(direction dir, size_t size, size_t offset) {
     }
     return;
   }
-  flush_lines(static_cast<char*>(m_host) + offset, size);
+  artlite::memory::flush_lines(static_cast<char*>(m_host) + offset, size);
 }
 
 uint64_t bo::get_paddr() {

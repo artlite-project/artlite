@@ -1,12 +1,14 @@
-# What every backend shares (dequantization, executables, GGUF strings, weight packing, the MoE prefill's host step,
-# sampling)
+# What every backend shares (dequantization, executables, GGUF strings, host memory operations, the parameter
+# scratchpad, weight packing, the MoE prefill's host step, sampling)
 add_library(artlite_core OBJECT
   artlite/dequant.cpp
   artlite/executable.cpp
   artlite/gguf_json.cpp
+  artlite/memory.cpp
   artlite/moe_host.cpp
   artlite/pack_run.cpp
   artlite/sampling.cpp
+  artlite/scratchpad.cpp
   artlite/slot_pack.cpp
   artlite/tile_pack.cpp
 )

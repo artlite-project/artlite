@@ -21,7 +21,7 @@ background while the tests run. Whole-model tests (`slow`) need the model files;
 corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp CPU build
 (`ARTLITE_LLAMA_CPP_DIR`) and skip without one.
 
-The C++ runtime's tests (gtest, `tests/csrc/npu_test.cpp`) build in their own tree, with the venv active (`build/` belongs
+The C++ runtime's tests (gtest: `tests/csrc/npu_test.cpp` on the NPU, the other files host-only) build in their own tree, with the venv active (`build/` belongs
 to the editable install):
 
 ```bash

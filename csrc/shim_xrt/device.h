@@ -70,8 +70,9 @@ struct device {
   static const hw_ctx* any_context(const device* preferred = nullptr);
 
   // `bytes` (4 KB pages) for a data buffer: in the process's current shared region (`offset`), a new one when it is
-  // full, a region of its own from kSharedMax. (A command lists at most 5 XRT buffers: a prefill's dozen buffers
-  // besides the weights, Qwen3.8 27B's KV cache and GDN states among them, reach the NPU through one or two regions.)
+  // full, a region of its own from kSharedMax. (A command lists at most xrt_abi::kMaxBuffers XRT buffers (abi.h): a
+  // prefill's dozen buffers besides the weights, Qwen3.8 27B's KV cache and GDN states among them, reach the NPU
+  // through one or two regions.)
   static std::shared_ptr<region> take(size_t bytes, size_t& offset);
 
  private:

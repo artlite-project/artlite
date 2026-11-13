@@ -60,3 +60,15 @@ target_compile_definitions(artlite_tests PRIVATE
 )
 add_dependencies(artlite_tests addone_aie)
 add_test(NAME npu_tests COMMAND artlite_tests)
+
+# Host-only tests (no NPU): the packers' tables and geometry, the parameter scratchpad's parser, the host memory
+# operations. Built on the host code the backends share (artlite_core).
+add_executable(artlite_host_tests scratchpad_test.cpp memory_test.cpp pack_test.cpp)
+target_link_libraries(artlite_host_tests PRIVATE artlite_core GTest::gtest GTest::gtest_main)
+add_test(NAME host_tests COMMAND artlite_host_tests)
+
+if(TARGET artlite_xrt)  # the XRT backend's argument ABI against its xclbin's metadata
+  add_executable(artlite_xrt_host_tests xrt_abi_test.cpp)
+  target_link_libraries(artlite_xrt_host_tests PRIVATE artlite_xrt GTest::gtest GTest::gtest_main)
+  add_test(NAME xrt_host_tests COMMAND artlite_xrt_host_tests)
+endif()

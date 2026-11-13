@@ -2,6 +2,8 @@
 
 #include "artlite/pack_run.h"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>

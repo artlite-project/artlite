@@ -13,15 +13,17 @@
 #include <memory>
 #include <unordered_map>
 
+#include "artlite/bfp16_simd.h"
 #include "artlite/error.h"
+#include "artlite/memory.h"
 #include "artlite/platform.h"
 
 namespace artlite {
 
 namespace {
 
-constexpr int kKt = 64;          // columns of a k-tile
-constexpr size_t kSlot = 5760;   // bytes of a k-tile's 80 rows (a B slot)
+constexpr int kKt = kTileCols;
+constexpr size_t kSlot = kSlotBytes;
 constexpr int kItemKt = 16;      // k-tiles of an item (92 KB of slots, twice with hilo)
 
 struct Item {
@@ -101,6 +103,30 @@ int64_t decode(const SlotTensor& t, int64_t r, int64_t lo, int64_t hi, float* sp
 
 }  // namespace
 
+SlotSource slot_source(std::string_view name) {
+  if (name == "F32") return SlotSource::F32;
+  if (name == "F16") return SlotSource::F16;
+  if (name == "BF16") return SlotSource::BF16;
+  if (name == "Q8_0") return SlotSource::Q8_0;
+  if (name == "EYE") return SlotSource::EYE;
+  throw Error(std::format("pack_slots: no source type {}", name));
+}
+
+size_t slot_row_bytes(SlotSource type, int64_t cols) {
+  switch (type) {
+    case SlotSource::F32:
+      return 4 * size_t(cols);
+    case SlotSource::Q8_0:
+      return 34 * size_t(cols / 32);
+    case SlotSource::EYE:
+      return 0;
+    case SlotSource::F16:
+    case SlotSource::BF16:
+      return 2 * size_t(cols);
+  }
+  return 0;
+}
+
 void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPart>& parts,
                 const std::vector<SlotJob>& jobs, const std::vector<pack::MappedFile>& files, unsigned threads,
                 bool release) {
@@ -123,7 +149,7 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
       if (p.tensor < 0 || size_t(p.tensor) >= tensors.size() || p.n_runs < 0)
         throw Error(std::format("pack_slots: job {}: part {}: tensor {} of {}", ji, pi, p.tensor, tensors.size()));
       const SlotTensor& t = tensors[p.tensor];
-      for (int64_t r = 0; r < int64_t(j.npo) * 80; r++)
+      for (int64_t r = 0; r < int64_t(j.npo) * kPassRows; r++)
         if (p.rows[r] < -1 || p.rows[r] >= t.rows)
           throw Error(std::format("pack_slots: job {}: part {}: row {} of a tensor of {}", ji, pi, p.rows[r], t.rows));
       for (int k = 0; k < p.n_runs; k++) {
@@ -134,7 +160,7 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
                                   pi, u[0], u[0] + u[1], cols, u[2], u[3], t.cols));
       }
       max_cols = std::max(max_cols, t.cols);
-      elem += t.type == SlotSource::F32 ? 4 : t.type == SlotSource::Q8_0 ? 34.0 / 32 : t.type == SlotSource::EYE ? 0 : 2;
+      elem += double(slot_row_bytes(t.type, 32)) / 32;
       auto [it, added] = number.try_emplace(p.tensor, static_cast<uint32_t>(run.tensors.size()));
       if (added) run.tensors.push_back({t.data, t.type == SlotSource::EYE ? 0 : size_t(t.rows) * t.row_bytes, t.file});
       if (std::find(ts.begin(), ts.end(), it->second) == ts.end()) ts.push_back(it->second);
@@ -143,7 +169,7 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
     for (int p = 0; p < j.npo; p++)
       for (int kt = 0; kt < half; kt += kItemKt) {
         items.push_back({static_cast<int>(ji), p, kt, std::min(kt + kItemKt, half)});
-        run.add(ts, static_cast<size_t>(80 * (items.back().kt1 - kt) * kKt * elem));
+        run.add(ts, static_cast<size_t>(kPassRows * (items.back().kt1 - kt) * kKt * elem));
       }
   }
 
@@ -191,12 +217,12 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
           use[n_use++] = u;
         }
       }
-      for (int i = 0; i < 80; i++) {
+      for (int i = 0; i < kPassRows; i++) {
         float* x = row.get();
         std::fill(x, x + nk, 0.0f);
         for (int ui = 0; ui < n_use; ui++) {
           const Use& u = use[ui];
-          const int64_t r = u.part->rows[int64_t(it.pass) * 80 + i];
+          const int64_t r = u.part->rows[int64_t(it.pass) * kPassRows + i];
           if (r < 0) continue;
           const SlotTensor& t = tensors[u.part->tensor];
           const float* src;
@@ -227,8 +253,8 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
           }
       }
       uint8_t* dst = j.dst + (size_t(it.pass) * j.nkt + it.kt0) * kSlot;
-      pack::stream_copy(dst, out.get(), nkt * kSlot);
-      if (j.hilo) pack::stream_copy(dst + half * kSlot, out.get() + nkt * kSlot, nkt * kSlot);
+      memory::stream_copy(dst, out.get(), nkt * kSlot);
+      if (j.hilo) memory::stream_copy(dst + half * kSlot, out.get() + nkt * kSlot, nkt * kSlot);
     });
   });
 }

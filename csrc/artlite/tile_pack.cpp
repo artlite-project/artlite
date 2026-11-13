@@ -16,7 +16,9 @@
 #include <memory>
 #include <unordered_map>
 
+#include "artlite/bfp16_simd.h"
 #include "artlite/error.h"
+#include "artlite/memory.h"
 #include "artlite/pack_run.h"
 #include "artlite/platform.h"
 
@@ -24,9 +26,6 @@ namespace artlite {
 
 namespace {
 
-constexpr int kMaxNsb = 16;
-// per 256 columns: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, BF16, F16, F32
-constexpr size_t kBlockBytes[] = {144, 176, 210, 144, 272, 160, 84, 110, 98, 110, 144, 136, 512, 512, 1024};
 constexpr int64_t kItemRows = 2048;  // rows of a work item
 
 alignas(64) const uint8_t kZeroRow[kMaxNsb * 1024] = {};  // a padding row's blocks (-1)
@@ -520,39 +519,65 @@ void tile_bfp16_f32(uint8_t* t, const uint8_t* const* src, const uint8_t* lo, in
     }
 }
 
-size_t used_bytes(TileFormat f, int R, int nsb) {
-  switch (f) {
-    case TileFormat::Q4_K:
-      return 144 * size_t(nsb) * R;
-    case TileFormat::Q5_K:
-      return 176 * size_t(nsb) * R;
-    case TileFormat::Q6_K:
-      return (2 * size_t(nsb) * R + 31) / 32 * 32 + 208 * size_t(nsb) * R;
-    case TileFormat::Q4_0:
-      return 144 * size_t(nsb) * R;
-    case TileFormat::Q8_0:
-      return 272 * size_t(nsb) * R;
-    case TileFormat::Q4_1:
-      return 160 * size_t(nsb) * R;
-    case TileFormat::Q2_K:
-      return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R;
-    case TileFormat::Q3_K:
-      return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R;
-    case TileFormat::IQ3_XXS:
-      return iq3xxs_unit(R) * size_t(nsb);
-    case TileFormat::IQ3_S:
-      return R > 16 && R <= 20 ? kIq3sUnit * nsb : ~size_t(0);
-    case TileFormat::IQ4_NL:
-      return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R;
-    case TileFormat::IQ4_XS:
-      return R % 8 ? ~size_t(0) : 136 * size_t(nsb) * R;
-    case TileFormat::BFP16_BF16:
-    case TileFormat::BFP16_F16:
-    case TileFormat::BFP16_F32:
-      return 288 * size_t(nsb) * R;
-  }
-  return 0;
+/// A format's packer on the tiles' rows: ``src[r]`` the GGUF blocks of row r's nsb super-blocks, ``lo[r]`` (BFP16 of
+/// F32 rows only) the plane of row r.
+using TileFn = void (*)(uint8_t* tile, const uint8_t* const* src, const uint8_t* lo, int R, int nsb);
+
+template <void (*F)(uint8_t*, const uint8_t* const*, int, int)>
+void plain(uint8_t* t, const uint8_t* const* src, const uint8_t*, int R, int nsb) {
+  F(t, src, R, nsb);
 }
+
+/// What every tile format is, in the order of ``TileFormat`` (checked below): the name its slot's tensors carry, the
+/// GGUF row bytes per 256 columns (a super-block; BF16 / F16: 512, F32: 1024), whether its scales are those of
+/// super-block pairs (nsb even), whether it is a BFP16 format (R is 8), the bytes a tile of R rows and nsb
+/// super-blocks uses (``~size_t(0)``: an R the format has no tile for), and its packer.
+struct FormatInfo {
+  TileFormat fmt;
+  std::string_view name;
+  size_t block_bytes;
+  bool pairs, bfp;
+  size_t (*used_bytes)(int R, int nsb);
+  TileFn pack;
+};
+
+constexpr FormatInfo kFormats[] = {
+    {TileFormat::Q4_K, "Q4_K", 144, true, false, [](int R, int nsb) { return 144 * size_t(nsb) * R; }, plain<tile_q4k>},
+    {TileFormat::Q5_K, "Q5_K", 176, true, false, [](int R, int nsb) { return 176 * size_t(nsb) * R; }, plain<tile_q5k>},
+    {TileFormat::Q6_K, "Q6_K", 210, true, false,
+     [](int R, int nsb) { return (2 * size_t(nsb) * R + 31) / 32 * 32 + 208 * size_t(nsb) * R; }, plain<tile_q6k>},
+    {TileFormat::Q4_0, "Q4_0", 144, false, false, [](int R, int nsb) { return 144 * size_t(nsb) * R; }, plain<tile_q4_0>},
+    {TileFormat::Q8_0, "Q8_0", 272, false, false, [](int R, int nsb) { return 272 * size_t(nsb) * R; }, plain<tile_q8_0>},
+    {TileFormat::Q4_1, "Q4_1", 160, false, false, [](int R, int nsb) { return 160 * size_t(nsb) * R; }, plain<tile_q4_1>},
+    {TileFormat::Q2_K, "Q2_K", 84, false, false,
+     [](int R, int nsb) { return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R; }, plain<tile_q2k>},
+    {TileFormat::Q3_K, "Q3_K", 110, true, false,
+     [](int R, int nsb) { return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R; }, plain<tile_q3k>},
+    {TileFormat::IQ3_XXS, "IQ3_XXS", 98, true, false, [](int R, int nsb) { return iq3xxs_unit(R) * size_t(nsb); },
+     plain<tile_iq3xxs>},
+    {TileFormat::IQ3_S, "IQ3_S", 110, false, false,
+     [](int R, int nsb) { return R > 16 && R <= 20 ? kIq3sUnit * nsb : ~size_t(0); }, plain<tile_iq3s>},
+    {TileFormat::IQ4_NL, "IQ4_NL", 144, false, false,
+     [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; }, plain<tile_iq4<false>>},
+    {TileFormat::IQ4_XS, "IQ4_XS", 136, false, false,
+     [](int R, int nsb) { return R % 8 ? ~size_t(0) : 136 * size_t(nsb) * R; }, plain<tile_iq4<true>>},
+    {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
+     plain<tile_bfp16<false>>},
+    {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
+     plain<tile_bfp16<true>>},
+    {TileFormat::BFP16_F32, "BFP16/F32", 1024, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
+     tile_bfp16_f32},
+};
+
+constexpr bool formats_in_enum_order() {
+  for (size_t i = 0; i < std::size(kFormats); i++)
+    if (kFormats[i].fmt != static_cast<TileFormat>(i)) return false;
+  return true;
+}
+static_assert(formats_in_enum_order() && kFormats[std::size(kFormats) - 1].fmt == TileFormat::BFP16_F32,
+              "kFormats lists every TileFormat, in the enum's order");
+
+const FormatInfo& info(TileFormat f) { return kFormats[static_cast<size_t>(f)]; }
 
 struct Item {
   int block, col;
@@ -562,25 +587,14 @@ struct Item {
 }  // namespace
 
 TileFormat tile_format(std::string_view name) {
-  if (name == "Q4_K") return TileFormat::Q4_K;
-  if (name == "Q5_K") return TileFormat::Q5_K;
-  if (name == "Q6_K") return TileFormat::Q6_K;
-  if (name == "Q4_0") return TileFormat::Q4_0;
-  if (name == "Q8_0") return TileFormat::Q8_0;
-  if (name == "Q4_1") return TileFormat::Q4_1;
-  if (name == "Q2_K") return TileFormat::Q2_K;
-  if (name == "Q3_K") return TileFormat::Q3_K;
-  if (name == "IQ3_XXS") return TileFormat::IQ3_XXS;
-  if (name == "IQ3_S") return TileFormat::IQ3_S;
-  if (name == "IQ4_NL") return TileFormat::IQ4_NL;
-  if (name == "IQ4_XS") return TileFormat::IQ4_XS;
-  if (name == "BFP16/BF16") return TileFormat::BFP16_BF16;
-  if (name == "BFP16/F16") return TileFormat::BFP16_F16;
-  if (name == "BFP16/F32") return TileFormat::BFP16_F32;
+  for (const FormatInfo& f : kFormats)
+    if (f.name == name) return f.fmt;
   throw Error(std::format("pack_tiles: no native packer for {}", name));
 }
 
-size_t block_bytes(TileFormat f) { return kBlockBytes[static_cast<int>(f)]; }
+size_t block_bytes(TileFormat f) { return info(f).block_bytes; }
+
+size_t used_bytes(TileFormat f, int R, int nsb) { return info(f).used_bytes(R, nsb); }
 
 void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blocks, const PackOptions& opt) {
   // checks, the work items, the tensors in order of first use
@@ -592,14 +606,13 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   const int file = opt.file.empty() ? -1 : 0;
   for (size_t bi = 0; bi < blocks.size(); bi++) {
     const PackBlock& b = blocks[bi];
-    const size_t row_bytes = size_t(b.row_sb) * kBlockBytes[static_cast<int>(b.fmt)];
-    const bool pairs = b.fmt <= TileFormat::Q6_K || b.fmt == TileFormat::Q3_K ||
-                       b.fmt == TileFormat::IQ3_XXS;  // (scales of super-block pairs)
-    const bool bfp = b.fmt >= TileFormat::BFP16_BF16, f32 = b.fmt == TileFormat::BFP16_F32;
+    const FormatInfo& fi = info(b.fmt);
+    const size_t row_bytes = size_t(b.row_sb) * fi.block_bytes;
+    const bool pairs = fi.pairs, bfp = fi.bfp, f32 = b.fmt == TileFormat::BFP16_F32;
     const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
     if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
         tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
-        b.kc_group <= 0 || b.n_kc % b.kc_group || used_bytes(b.fmt, b.R, b.nsb) > b.S || b.row_sb <= 0 ||
+        b.kc_group <= 0 || b.n_kc % b.kc_group || fi.used_bytes(b.R, b.nsb) > b.S || b.row_sb <= 0 ||
         b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
         (b.G > 1 && (b.n_kc != 1 || b.row_sb * b.G != b.nsb || f32)) ||
         b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
@@ -644,7 +657,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       const PackBlock& b = blocks[it.block];
       const bool f32 = b.fmt == TileFormat::BFP16_F32;
       const int tile_rows = b.R * b.G;
-      const size_t bb = kBlockBytes[static_cast<int>(b.fmt)], row_bytes = size_t(b.row_sb) * bb;
+      const FormatInfo& fi = info(b.fmt);
+      const size_t bb = fi.block_bytes, row_bytes = size_t(b.row_sb) * bb;
       std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
       uint8_t* col = out + b.offset + it.col * b.col_stride;
       for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
@@ -684,55 +698,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
               src[r] = p;
             }
           }
-          switch (b.fmt) {
-            case TileFormat::Q4_K:
-              tile_q4k(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q5_K:
-              tile_q5k(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q6_K:
-              tile_q6k(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q4_0:
-              tile_q4_0(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q8_0:
-              tile_q8_0(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q4_1:
-              tile_q4_1(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q2_K:
-              tile_q2k(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::Q3_K:
-              tile_q3k(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::IQ3_XXS:
-              tile_iq3xxs(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::IQ3_S:
-              tile_iq3s(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::IQ4_NL:
-              tile_iq4<false>(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::IQ4_XS:
-              tile_iq4<true>(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::BFP16_BF16:
-              tile_bfp16<false>(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::BFP16_F16:
-              tile_bfp16<true>(tile.get(), src, b.R, b.nsb);
-              break;
-            case TileFormat::BFP16_F32:
-              tile_bfp16_f32(tile.get(), src, lo, b.R, b.nsb);
-              break;
-          }
+          fi.pack(tile.get(), src, lo, b.R, b.nsb);
           const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
-          pack::stream_copy(col + idx * b.S, tile.get(), b.S);
+          memory::stream_copy(col + idx * b.S, tile.get(), b.S);
         }
       }
     });

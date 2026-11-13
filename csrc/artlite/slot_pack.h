@@ -2,15 +2,32 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include "artlite/pack_run.h"
 
 namespace artlite {
 
+/// The geometry of a core row's weight image (``vision.layout``): a k-tile is kTileCols columns of a pass's kPassRows
+/// output rows, as B slots of bfp16ebs8 blocks (8 values: an exponent byte and 8 mantissa bytes) of kSlotBytes.
+constexpr int kPassRows = 80;
+constexpr int kTileCols = 64;
+constexpr size_t kSlotBytes = size_t(kPassRows) * kTileCols / 8 * 9;
+static_assert(kSlotBytes == 5760);  // (the overlay's B slot)
+
 /// The element types of a weight source (``artlite.vision.weights.Source``): a file's F32 / F16 / BF16 / Q8_0 rows, or
 /// the identity matrix (no data).
 enum class SlotSource { F32, F16, BF16, Q8_0, EYE };
+
+/// Bytes of a job's slots: ``passes`` passes of ``ktiles`` k-tiles (hilo: both halves' tiles counted).
+constexpr size_t slot_job_bytes(size_t passes, size_t ktiles) { return passes * ktiles * kSlotBytes; }
+
+/// "F32", "F16", "BF16", "Q8_0", "EYE" -> the source type (throws on others).
+SlotSource slot_source(std::string_view name);
+
+/// Bytes of a row of ``cols`` elements of a source type (EYE: 0; Q8_0: cols a multiple of 32).
+size_t slot_row_bytes(SlotSource type, int64_t cols);
 
 /// A source matrix of rows x cols elements, row r at data + r row_bytes; file: its mapping in pack_slots' files (-1:
 /// memory of its own).
@@ -22,7 +39,7 @@ struct SlotTensor {
   int file = -1;
 };
 
-/// A part of a job's matrix: per output row (npo 80 of them) its row of tensor ``tensor`` (-1: zeros) times scale,
+/// A part of a job's matrix: per output row (npo kPassRows of them) its row of tensor ``tensor`` (-1: zeros) times scale,
 /// over the runs [k0, n, src0, stride] of output columns k0 .. k0 + n - 1 = the row's elements src0 + i stride (columns
 /// of no run: zeros; parts' runs do not overlap).
 struct SlotPart {
@@ -33,9 +50,9 @@ struct SlotPart {
   int n_runs;
 };
 
-/// A core row's weight image (``vision.layout``): npo passes of 80 output rows, each its nkt k-tiles of 64 columns as
-/// B slots [16-row block 5][k-step 8][half 2][row 8] of bfp16ebs8 blocks (5760 B a slot; a block 8 consecutive
-/// columns of one row: [E, m0 .. m7]), at dst. hilo: the matrix has nkt / 2 k-tiles, each pass's slots are those of
+/// A core row's weight image (``vision.layout``): npo passes of kPassRows output rows, each its nkt k-tiles of kTileCols
+/// columns as B slots [16-row block 5][k-step 8][half 2][row 8] of bfp16ebs8 blocks (kSlotBytes a slot; a block 8
+/// consecutive columns of one row: [E, m0 .. m7]), at dst. hilo: the matrix has nkt / 2 k-tiles, each pass's slots are those of
 /// hi = bfp16(w), then of lo = bfp16(w - hi).
 struct SlotJob {
   uint8_t* dst;
