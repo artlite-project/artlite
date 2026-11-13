@@ -1,4 +1,4 @@
-"""The MoE oracles of tests/qwen35/ref.py against llama.cpp's own tensors of Qwen3.6-35B-A3B (GGUF ``qwen35moe``;
+"""The MoE oracles of tests/moe/ref.py against llama.cpp's own tensors of Qwen3.6-35B-A3B (GGUF ``qwen35moe``;
 no NPU): per layer (a GDN and an attention layer) the router's logits from the F32 rows, its top 8 and weights, the
 routed experts' sum and the gated shared expert from llama.cpp's FFN input, and the layer's residual. llama.cpp
 rounds the experts' activations to Q8_K, so the experts' oracles (fp32) are off by that (~1%); exact to ~2e-7 once
@@ -11,38 +11,41 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import QwenConfig, qwen_mtp_of
+from artlite.model_config import QwenConfig, qwen_gguf, qwen_mtp_of
 
 from ..common import essay
+from ..goldens.text import Golden, golden
+from ..llama_cpp import llama_tokenize
+from ..moe import ref as moe_ref
 from ..numerics import rel_max
 from . import ref
 
-MODEL = ref.qwen_gguf("Q4_K_M", "35B-A3B")
+MODEL = qwen_gguf("Q4_K_M", "35B-A3B")
 NAMES = ("attn_residual|attn_post_norm|ffn_moe_logits|ffn_moe_topk|ffn_moe_weights_norm|ffn_moe_out|"
          "shared_expert_gate|ffn_shexp_gated|l_out")
 LAYERS = (0, 3)
 
 
 @pytest.fixture(scope="module")
-def gold() -> tuple[GGUFFile, ref.Golden]:
+def gold() -> tuple[GGUFFile, Golden]:
     if not os.path.exists(MODEL):
         pytest.skip(f"{MODEL} missing")
-    tokens = ref.llama_tokenize(MODEL, essay("apple.txt"))[:32]
-    return GGUFFile(MODEL), ref.golden(MODEL, tokens, layers=LAYERS, names=NAMES, logits="none")
+    tokens = llama_tokenize(MODEL, essay("apple.txt"))[:32]
+    return GGUFFile(MODEL), golden(MODEL, tokens, layers=LAYERS, names=NAMES, logits="none")
 
 
 @pytest.mark.parametrize("L", LAYERS)
-def test_moe_block(gold: tuple[GGUFFile, ref.Golden], L: int) -> None:
+def test_moe_block(gold: tuple[GGUFFile, Golden], L: int) -> None:
     g, G = gold
     b = f"blk.{L}."
     x = np.asarray(G["attn_post_norm", L], np.float32)
     wr = g.tensor(b + "ffn_gate_inp.weight").dequantize()
     assert rel_max(x @ wr.T, G["ffn_moe_logits", L]) < 2e-5
-    ids, w = ref.moe_route(G["ffn_moe_logits", L], int(g.arch_meta("expert_used_count")))
+    ids, w = moe_ref.moe_route(G["ffn_moe_logits", L], int(g.arch_meta("expert_used_count")))
     assert np.array_equal(ids, G["ffn_moe_topk", L])
     assert rel_max(w, G["ffn_moe_weights_norm", L]) < 2e-5
-    moe = ref.moe_ffn(x, ids, w, ref.experts(g, L))
-    shared = ref.shared_expert(x, *(g.tensor(b + f"ffn_{n}_shexp.weight").dequantize() for n in ("gate", "up", "down")),
+    moe = moe_ref.moe_ffn(x, ids, w, moe_ref.experts(g, L))
+    shared = moe_ref.shared_expert(x, *(g.tensor(b + f"ffn_{n}_shexp.weight").dequantize() for n in ("gate", "up", "down")),
                                g.tensor(b + "ffn_gate_inp_shexp.weight").dequantize()[0])
     assert rel_max(moe, G["ffn_moe_out", L]) < 3e-2
     assert rel_max(shared, G["ffn_shexp_gated", L]) < 3e-2
@@ -59,8 +62,8 @@ def test_mtp_block() -> None:
     if mtp is None:
         pytest.skip("no Qwen3.6-35B-A3B model file or MTP drafter")
     n, V = 64, 65536
-    tokens = ref.llama_tokenize(MODEL, essay("apple.txt"))[:n]
-    G = ref.golden(MODEL, tokens, layers=(40, "g"), names="mtp_.*|h_nextn|result_norm", mtp=mtp)
+    tokens = llama_tokenize(MODEL, essay("apple.txt"))[:n]
+    G = golden(MODEL, tokens, layers=(40, "g"), names="mtp_.*|h_nextn|result_norm", mtp=mtp)
     g = GGUFFile(mtp)
     emb = np.asarray(G.mtp("mtp_tok_embd", 40), np.float32).reshape(n, -1)
     h = np.asarray(G["result_norm"], np.float32).reshape(n, -1)

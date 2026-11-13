@@ -16,6 +16,7 @@ from models import video as VD
 from models.lfm3vl import host as H
 
 from ..common import video_file
+from ..goldens.media import golden
 from . import ref as V
 
 MODEL, MMPROJ = lfm3vl_gguf(), lfm3vl_mmproj("BF16")
@@ -48,7 +49,7 @@ def test_pair_reference(videos: str, name: str) -> None:
         if not os.path.exists(p):
             pytest.skip(f"{p} missing")
     path = video_file(videos, name)
-    g = V.golden(MODEL, MMPROJ, path, PROMPT)
+    g = golden(MODEL, MMPROJ, path, PROMPT)
     media = [c for c in g.chunks if "text" not in c]
     images = [k for k, c in enumerate(media) if "image" in c]
     pairs = pair_pixels(path)

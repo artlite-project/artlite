@@ -1,5 +1,5 @@
 """qwen35 models on the NPU (models.qwen35, models/qwen35/overlay.py) against llama.cpp's decode
-(ubatch 1) of the same GGUF file (golden tensors and logits, tests/qwen35/ref.py):
+(ubatch 1) of the same GGUF file (golden tensors and logits, tests/goldens/text.py):
 
 - a slice of four layers in the middle of the model (GDN layers and a full-attention layer), fed llama.cpp's residual
   stream before it token by token: the residual after every layer;
@@ -20,13 +20,15 @@ from artlite.model_config import QwenConfig
 from models.qwen35.qwen import NpuQwen
 
 from ..common import draft_gate, draft_prompts, essay
+from ..goldens.text import golden
+from ..llama_cpp import llama_tokenize
+from ..models import size_gguf
 from ..numerics import kl_rows, rel_max
-from . import ref
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
 
 def _path(size: str) -> str:
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     return path
@@ -41,7 +43,7 @@ def _drafter(path: str) -> None:
 
 
 def _tokens(path: str, n: int, name: str = "founders.txt") -> list[int]:
-    return ref.llama_tokenize(path, essay(name))[:n]
+    return llama_tokenize(path, essay(name))[:n]
 
 
 @pytest.mark.parametrize("size", ["9B", "27B", "1B"])
@@ -52,12 +54,12 @@ def test_slice(size: str) -> None:
 
     path = _path(size)
     g = GGUFFile(path)
-    cfg = ref.QwenConfig.from_gguf(g)
+    cfg = QwenConfig.from_gguf(g)
     La = cfg.attention_layers[len(cfg.attention_layers) // 2]
     layers = list(range(La - 3, La + 1))
     n = 34
     tokens = _tokens(path, n, "apple.txt")
-    G = ref.golden(path, tokens, ubatch=1, layers=(layers[0] - 1, *layers), names="l_out", logits="none")
+    G = golden(path, tokens, ubatch=1, layers=(layers[0] - 1, *layers), names="l_out", logits="none")
     ov = QwenOverlay(g, layers=layers, vocab=512, max_positions=64)
     ov.load(release=False)
     errs = np.zeros((n, len(layers)))
@@ -74,8 +76,8 @@ def test_slice(size: str) -> None:
 def test_teacher_forced(size: str) -> None:
     path = _path(size)
     tokens = _tokens(path, 128)
-    dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
-    pro = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
+    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
+    pro = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
     model = NpuQwen(GGUFFile(path), capacity=256)
     got = torch.from_numpy(model.forced_logits(tokens))
     kl, kl_llama = float(kl_rows(dec, got).mean()), float(kl_rows(dec, pro).mean())
@@ -102,8 +104,8 @@ def test_prefill(size: str) -> None:
     path = _path(size)
     P, K = 300, 24
     tokens = _tokens(path, P + K)
-    split = torch.from_numpy(np.asarray(ref.golden(path, tokens, split=P, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
-    dec = torch.from_numpy(np.asarray(ref.golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
+    split = torch.from_numpy(np.asarray(golden(path, tokens, split=P, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
+    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
     model = NpuQwen(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)

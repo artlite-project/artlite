@@ -17,8 +17,8 @@ from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
+from ..goldens.media import golden
 from ..numerics import kl_report
-from . import ref as V
 from .test_ref import IMAGE, MMPROJ, MODEL
 
 pytestmark = pytest.mark.slow  # (the whole model)
@@ -47,7 +47,7 @@ def case() -> tuple:
     bos = g.strings("tokenizer.ggml.tokens", int(g.meta["tokenizer.ggml.bos_token_id"]))[0]
     text = chat_prompt(g, _messages(None), enable_thinking=False, bos_token=bos)
     answer = tok.encode(ANSWER)
-    gold = V.golden(MODEL, MMPROJ, IMAGE, text.replace(PAD, "<__media__>"), answer=answer)
+    gold = golden(MODEL, MMPROJ, IMAGE, text.replace(PAD, "<__media__>"), answer=answer)
     raw = gold.tensor("inp_raw", 0)
     grid = Q.Grid(raw.shape[1] // 32, raw.shape[2] // 32)
     head, tail = text.split(Q.IMAGE)

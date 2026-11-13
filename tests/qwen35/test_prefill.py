@@ -11,10 +11,13 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
+from artlite.model_config import QwenConfig
 
 from ..common import essay
+from ..goldens.text import golden
+from ..llama_cpp import llama_tokenize
+from ..models import size_gguf
 from ..numerics import rel_max
-from . import ref
 
 
 @pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("occamy", 7),
@@ -25,18 +28,18 @@ def test_prefill_slice(size: str, La: int) -> None:
     from models.qwen35.overlay import QwenOverlay
     from models.qwen35.prefill import QwenPrefill
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
-    cfg = ref.QwenConfig.from_gguf(g)
+    cfg = QwenConfig.from_gguf(g)
     La = La or cfg.attention_layers[len(cfg.attention_layers) // 2]
     layers = list(range(La - 3, La + 1))
     n1, n2, n3, K = 288, 32, 45, 6  # (the chunks' valid tokens: n1 of 512, n2 of 64, n3 of 128; then K decode steps)
     P = n1 + n2 + n3
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:P + K]
+    tokens = llama_tokenize(path, essay("apple.txt"))[:P + K]
     moe = bool(g.arch_meta("expert_count"))
-    G = ref.golden(path, tokens, layers=(layers[0] - 1, *layers) if moe else (layers[0] - 1, La),
+    G = golden(path, tokens, layers=(layers[0] - 1, *layers) if moe else (layers[0] - 1, La),
                    names="l_out|ffn_moe_logits" if moe else "l_out", logits="none")
     x_in = np.asarray(G["l_out", layers[0] - 1], np.float32)
     want = np.asarray(G["l_out", La], np.float32)

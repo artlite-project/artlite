@@ -1,6 +1,6 @@
 """An MoE layer's routing on the decode overlay's cores (``decode.design``'s "MoE": the helper core of every column runs
 it on the route object), model-independent: E experts, the top K of each token slot, softmax weights over the K
-(llama.cpp's ``build_moe_ffn`` with softmax gating, the weights renormalized: the tests' ``qwen35/ref.py``).
+(llama.cpp's ``build_moe_ffn`` with softmax gating, the weights renormalized: the tests' ``moe/ref.py``).
 
 Per slot the core takes the K largest logits (fp32, compared as ordered integer keys of their bits: ties go to the
 lower id) and their weights w = e^(l - l_max) / sum over the K (fp32 to ~2^-16: ``kmath.exp2``,

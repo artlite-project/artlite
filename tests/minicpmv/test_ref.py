@@ -16,6 +16,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 
+from ..goldens.media import VisionGolden, golden
 from ..numerics import rel
 from . import ref as V
 
@@ -32,9 +33,9 @@ def _files() -> None:
 
 
 @pytest.fixture(scope="module")
-def gold() -> V.VisionGolden:
+def gold() -> VisionGolden:
     _files()
-    return V.golden(minicpmv_gguf(), MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)
+    return golden(minicpmv_gguf(), MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)
 
 
 @pytest.mark.parametrize("case", ["astronaut", "square-1024", "small"])
@@ -45,7 +46,7 @@ def test_slices(case: str, tmp_path: str) -> None:
         w, h = (1024, 1024) if case == "square-1024" else (300, 200)
         path = os.path.join(tmp_path, f"{case}.png")
         Image.fromarray(np.random.default_rng(0).integers(0, 256, (h, w, 3), np.uint8)).save(path)
-    g = V.golden(minicpmv_gguf(), MMPROJ, path, "<__media__>Describe the image.",
+    g = golden(minicpmv_gguf(), MMPROJ, path, "<__media__>Describe the image.",
                  names=NAMES if case == "astronaut" else "pos_embed")  # (the astronaut's: test_ops' golden)
     entries, grid = M.slice_image(M.load_image(path), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
     ll = [g.tensor("inp_raw", k) for k in range(g.entries)]
@@ -62,7 +63,7 @@ def test_slices(case: str, tmp_path: str) -> None:
 
 
 @pytest.mark.slow  # (the whole encoder on the CPU, in float32)
-def test_ops(gold: V.VisionGolden) -> None:
+def test_ops(gold: VisionGolden) -> None:
     enc = V.Encoder(MMPROJ, llama=True)
     t = lambda name, il=None: torch.from_numpy(gold.tensor(name, 0, il).copy())
     tr: dict[str, torch.Tensor] = {}
@@ -82,7 +83,7 @@ def test_ops(gold: V.VisionGolden) -> None:
 
 @pytest.mark.slow
 @pytest.mark.parametrize("llama", [True, False], ids=["llama", "f64"])
-def test_entries(gold: V.VisionGolden, llama: bool) -> None:
+def test_entries(gold: VisionGolden, llama: bool) -> None:
     enc = V.Encoder(MMPROJ, llama=llama)
     emb = gold.embd(0)
     image = next(c for c in gold.chunks if "image" in c)

@@ -15,8 +15,8 @@ from models.lfm3a import host as A
 from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer
 
+from ..goldens.media import golden
 from ..numerics import kl_report
-from . import ref as R
 from .test_ref import MARKER, MMPROJ, MODEL, asr_text, clip
 
 pytestmark = pytest.mark.slow  # (the whole model)
@@ -39,7 +39,7 @@ def case() -> tuple:
     g = GGUFFile(MODEL)
     tok = BpeTokenizer(g)
     answer = tok.encode(ANSWER)
-    gold = R.golden(MODEL, MMPROJ, clip(NAME), asr_text(g, marker=MARKER), answer=answer)
+    gold = golden(MODEL, MMPROJ, clip(NAME), asr_text(g, marker=MARKER), answer=answer)
     head, tail = asr_text(g).split(A.AUDIO)
     seq = tok.encode(head) + A.clip_sequence(gold.embd(0)) + tok.encode(tail)
     want = torch.from_numpy(np.asarray(gold.logits, np.float32)[-len(answer) - 1:-1].copy())

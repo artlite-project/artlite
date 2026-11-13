@@ -19,7 +19,11 @@ from models.qwen35.draft import TABLE_ROWS, QwenDraft, draft_formats, draft_gate
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.prefill import QwenPrefill
 
+from .. import np_ops
 from ..common import essay
+from ..goldens.text import golden
+from ..llama_cpp import llama_tokenize
+from ..models import size_gguf
 from . import ref
 
 N = 100
@@ -43,7 +47,7 @@ def _files(size: str) -> tuple[str, str]:
     """The model file of a size ("35B-A3B", "occamy", "3.8-27B"; "35B-A3B-Q8_0": its Q8_0 drafter) and its drafter's
     (the model's own, with a block)."""
     size, _, quant = size.partition("-Q")
-    model = ref.size_gguf(size)
+    model = size_gguf(size)
     if not os.path.exists(model):
         pytest.skip(f"no {model}")
     own = QwenConfig.from_gguf(GGUFFile(model)).nextn_layers
@@ -71,8 +75,8 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     gm = GGUFFile(mtp)
     cfg = QwenConfig.from_gguf(gm)
     L = cfg.num_hidden_layers
-    tokens = ref.llama_tokenize(model, essay("apple.txt"))[:N]
-    G = ref.golden(model, tokens, layers=(L, "g"), names="mtp_tok_embd|result_norm", logits="none", mtp=mtp)
+    tokens = llama_tokenize(model, essay("apple.txt"))[:N]
+    G = golden(model, tokens, layers=(L, "g"), names="mtp_tok_embd|result_norm", logits="none", mtp=mtp)
     emb = np.asarray(G.mtp("mtp_tok_embd", L), np.float32).reshape(N, -1)
     hr = np.asarray(G["result_norm"], np.float32).reshape(N, -1)
     h = np.concatenate([np.zeros_like(hr[:1]), hr[:-1]])
@@ -84,7 +88,7 @@ def setup(request: pytest.FixtureRequest) -> tuple:
     refs = [r]
     if cfg.moe:  # (rows whose 8th and 9th experts nearly tie: either may win, the other oracle routes them with the 9th)
         t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
-        p = np.sort(ref.softmax(r["mtp_attn_post_norm"] @ t.dequantize().reshape(t.rows, -1).T), -1)[:, ::-1]
+        p = np.sort(np_ops.softmax(r["mtp_attn_post_norm"] @ t.dequantize().reshape(t.rows, -1).T), -1)[:, ::-1]
         swap = (p[:, 7] - p[:, 8]) / p[:, 7] < tie
         refs.append(ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids, swap=swap))
     return draft, emb, h, refs, tol
@@ -183,7 +187,7 @@ def test_draft_prefill(size: str) -> None:
     draft.load()
     pf.bind()
     n = T * nch
-    emb = g.rows("token_embd.weight", ref.llama_tokenize(model, essay("apple.txt"))[:n + 1])
+    emb = g.rows("token_embd.weight", llama_tokenize(model, essay("apple.txt"))[:n + 1])
     target.rope[:n + 4] = np.arange(n + 4)[:, None]
     xs = []
     for c in range(nch):

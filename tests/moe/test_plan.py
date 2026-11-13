@@ -12,11 +12,11 @@ from artlite.moe import plan as MP
 from artlite.moe.expert_gemm import CHUNK
 from artlite.operators.design import COLS
 
-from ..qwen35 import ref
+from . import ref
 
 
 def test_route() -> None:
-    """The top 8 (ties to the lower id) and weights against ``qwen35.ref.moe_route``, ties included, from rows in the
+    """The top 8 (ties to the lower id) and weights against ``moe.ref.moe_route``, ties included, from rows in the
     router GEMM's layout (per column 32 experts at its pitch of 64) and from plain (T, E) rows; 1024 tokens (threads)."""
     rng = np.random.default_rng(0)
     lg = rng.standard_normal((1024, 256)).astype(np.float32) * 2

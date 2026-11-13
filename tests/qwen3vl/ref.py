@@ -1,5 +1,5 @@
 """References of Qwen3-VL's vision encoder (the mmproj of projector ``qwen3vl_merger``: Qwen3.5 / 3.6 / 3.8's): the
-encoder in torch, and llama.cpp goldens through libmtmd (``tests.minicpmv.ref.golden``: the dump tool runs any
+encoder in torch, and llama.cpp goldens through libmtmd (``tests.goldens.media.golden``: the dump tool runs any
 mmproj; its embeddings ``embd(0)`` are the image chunk's rows, the merged tokens in raster order).
 
 The encoder (``Encoder``): llama.cpp's ``clip_graph_qwen3vl`` (``tools/mtmd/models/qwen3vl.cpp``) and transformers'
@@ -22,7 +22,7 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
-from ..minicpmv.ref import VisionGolden, golden
+from ..goldens.media import VisionGolden, golden
 from ..numerics import bf16_like, gelu_table, gelu_tanh
 
 __all__ = ["Encoder", "NpuEncoder", "VisionGolden", "golden", "pos_rows", "rope_angles"]

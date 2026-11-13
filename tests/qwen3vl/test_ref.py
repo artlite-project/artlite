@@ -15,6 +15,7 @@ from artlite.model_config import MODELS_DIR, ClipConfig, qwen_gguf
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
+from ..goldens.media import golden
 from . import ref as V
 
 IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
@@ -57,7 +58,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
     """The encoder's input against llama.cpp's inp_raw, the image chunk's tokens and positions."""
     _files()
     path = _image(case, str(tmp_path))
-    g = V.golden(MODEL, MMPROJ, path, PROMPT)  # (inp_raw: the image of entry 0 and 1, the two kernels' convs)
+    g = golden(MODEL, MMPROJ, path, PROMPT)  # (inp_raw: the image of entry 0 and 1, the two kernels' convs)
     clip = ClipConfig.from_gguf(GGUFFile(MMPROJ))
     px = Q.normalized(Q.image_pixels(load_image(path)), clip.mean, clip.std)
     ll = g.tensor("inp_raw", 0)
@@ -75,7 +76,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
 @pytest.mark.slow  # (the whole encoder on the CPU, in float64)
 def test_encoder() -> None:
     _files()
-    g = V.golden(MODEL, MMPROJ, IMAGE, PROMPT)
+    g = golden(MODEL, MMPROJ, IMAGE, PROMPT)
     out = V.Encoder(MMPROJ).forward(g.tensor("inp_raw", 0))
     emb = g.embd(0)
     assert float(torch.linalg.norm(out - torch.from_numpy(emb).double()) / np.linalg.norm(emb)) < 2e-2

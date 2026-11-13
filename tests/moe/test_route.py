@@ -10,11 +10,11 @@ from artlite.moe import route as MR
 from artlite.operators.design import COLS
 from artlite.operators.fused.ctrlpkt import _slot
 
-from ..qwen35 import ref
+from . import ref
 
 
 def test_top_k() -> None:
-    """The cores' top 8 (ties to the lower id) and weights against ``qwen35.ref.moe_route``, ties included."""
+    """The cores' top 8 (ties to the lower id) and weights against ``moe.ref.moe_route``, ties included."""
     rng = np.random.default_rng(0)
     lg = rng.standard_normal((64, 256)).astype(np.float32) * 2
     lg[0, [3, 9, 200]] = lg[0].max() + 1  # (a three-way tie at the top)

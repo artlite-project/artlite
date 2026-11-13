@@ -28,19 +28,16 @@ last 480 dropped there).
 import hashlib
 import math
 import os
-import shutil
-import subprocess
-import tempfile
 
 import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LLAMA_CPP_DIR, GenConfig
-from artlite.operators.base import CACHE_DIR
+from artlite.model_config import GenConfig
 
 from .. import common
-from ..llama_cpp import _lib_identity, _llama_lib, llama_cpp_bin
+from ..goldens.runner import build_tool, cached_golden, run_tool
+from ..llama_cpp import lib_identity
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DUMP_SRC = os.path.join(HERE, "gen_dump.cpp")
@@ -286,27 +283,6 @@ def pcm(codec: Codec, codes: np.ndarray, chunk: int = 0) -> np.ndarray:
 # ----------------------------------------------------------------------
 
 
-def _mtmd_identity() -> str:
-    lib = os.path.realpath(llama_cpp_bin("libmtmd.so"))
-    return f"{lib}:{os.path.getsize(lib)}:{int(os.path.getmtime(lib))}"
-
-
-def dump_tool() -> str:
-    """The path of the built ``lfm3a_gen_dump`` (compiled on first use into the artlite cache)."""
-    with open(DUMP_SRC, "rb") as f:
-        key = hashlib.sha256(f.read() + (_lib_identity() + _mtmd_identity()).encode()).hexdigest()[:16]
-    path = os.path.join(CACHE_DIR, f"lfm3a_gen_dump_{key}")
-    if not os.path.exists(path):
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        bindir = os.path.dirname(_llama_lib())
-        tmp = f"{path}.{os.getpid()}.tmp"
-        subprocess.run(["g++", "-O2", "-std=c++17", "-Wno-deprecated-declarations", f"-I{LLAMA_CPP_DIR}/include",
-                        f"-I{LLAMA_CPP_DIR}/ggml/include", f"-I{LLAMA_CPP_DIR}/tools/mtmd", DUMP_SRC, "-o", tmp,
-                        f"-L{bindir}", "-lmtmd", "-lllama", "-lggml", "-lggml-base", f"-Wl,-rpath,{bindir}"], check=True)
-        os.replace(tmp, path)
-    return path
-
-
 class GenGolden:
     """The outputs of one ``lfm3a_gen_dump`` run (``gen_dump.cpp``'s files): ``h``, ``prompt_ids``, ``logits(tag)``,
     ``fb(tag)``, ``hf(i)``, ``codes`` and ``hg(i)`` (sampled frames), ``pcm``, ``pcm_calls``, ``tensor(name, graph)``."""
@@ -364,21 +340,13 @@ def golden(model: str, mmproj: str, *, prompt: str | None = None, h: np.ndarray 
             "passes": None if passes is None else np.ascontiguousarray(passes, np.int32),
             "feed": None if feed is None else np.ascontiguousarray(feed, np.int32),
             "frames": None if frames is None else np.ascontiguousarray(frames, np.int32)}
-    key = (common.model_key(model), common.model_key(mmproj), prompt, chunk, gen, seed, names, _lib_identity(),
-           _mtmd_identity(),
+    key = (common.model_key(model), common.model_key(mmproj), prompt, chunk, gen, seed, names, lib_identity(),
+           lib_identity("libmtmd.so"),
            {k: None if v is None else hashlib.sha256(v.tobytes()).hexdigest() for k, v in arrs.items()})
-    hh = hashlib.sha256(repr(key).encode())
-    with open(DUMP_SRC, "rb") as f:
-        hh.update(f.read())
-    folder = common.model_refs(model)
-    path = os.path.join(folder, f"ggolden_{hh.hexdigest()[:16]}")
-    if os.path.exists(os.path.join(path, "done")) and not common.REFRESH_REFS:
-        return GenGolden(path)
-    os.makedirs(folder, exist_ok=True)
-    tool = dump_tool()
-    tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
-    try:
-        cmd = [tool, "-m", model, "--mmproj", mmproj, "-o", tmp, "--threads", str(threads), "--chunk", str(chunk)]
+
+    def run(tmp: str) -> None:
+        cmd = [build_tool("lfm3a_gen_dump", DUMP_SRC, mtmd=True), "-m", model, "--mmproj", mmproj, "-o", tmp,
+               "--threads", str(threads), "--chunk", str(chunk)]
         if gen:
             cmd += ["--gen", str(gen), "--seed", str(seed)]
         if prompt is not None:
@@ -391,16 +359,10 @@ def golden(model: str, mmproj: str, *, prompt: str | None = None, h: np.ndarray 
                 cmd += [f"--{k}", os.path.join(tmp, f"{k}.bin")]
         if names:
             cmd += ["-n", names]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
-        if r.returncode:
-            raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
+        run_tool(cmd)
         for k in arrs:
             if os.path.exists(os.path.join(tmp, f"{k}.bin")):
                 os.remove(os.path.join(tmp, f"{k}.bin"))
         open(os.path.join(tmp, "done"), "w").close()
-        shutil.rmtree(path, ignore_errors=True)
-        os.replace(tmp, path)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-    return GenGolden(path)
+
+    return GenGolden(cached_golden(model, "ggolden", key, DUMP_SRC, run, marker="done"))

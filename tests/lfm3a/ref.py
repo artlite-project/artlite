@@ -1,5 +1,5 @@
 """References of LFM3-Audio's speech encoder (the mmproj of projector ``lfm3a``): the encoder in float64 torch, and
-llama.cpp goldens through libmtmd (``tests.minicpmv.ref.golden``: the dump tool runs any mmproj, an audio file as
+llama.cpp goldens through libmtmd (``tests.goldens.media.golden``: the dump tool runs any mmproj, an audio file as
 its media; ``embd(0)`` the clip's rows, ``tensor("inp_raw", 0)`` its log-mel spectrogram).
 
 The encoder (``Encoder``: llama.cpp's ``clip_graph_lfm3a``, ``tools/mtmd/models/lfm3a.cpp``; transformers'
@@ -29,7 +29,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig
 from models.lfm3a import host as A
 
-from ..minicpmv.ref import VisionGolden, golden
+from ..goldens.media import VisionGolden, golden
 
 __all__ = ["Encoder", "Stream", "VisionGolden", "golden"]
 

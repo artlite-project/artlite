@@ -14,6 +14,7 @@ from artlite.decode import kv as KV
 from artlite.decode import phases as mp
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
+from artlite.model_config import QwenConfig, qwen_gguf
 from artlite.operators import kmath
 from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
@@ -21,8 +22,13 @@ from artlite.overlay import OverlayDevice, Sequence, Transaction
 from models.qwen35 import decode as MD
 from models.qwen35.image import QwenImage
 
+from .. import np_ops
 from ..common import essay
 from ..decode import mmv
+from ..goldens.text import Golden, golden
+from ..llama_cpp import llama_tokenize
+from ..models import size_gguf
+from ..moe import ref as moe_ref
 from ..numerics import bf16_round, from_bf16_bits, rel_max
 from ..operators import kmath_sim
 from . import ref
@@ -38,7 +44,7 @@ class _Phases:
     def __init__(self, path: str, layers: list[int], slots: int = OD.SLOTS):
         self.path, self.slots = path, slots
         self.g = GGUFFile(path)
-        self.cfg = cfg = ref.QwenConfig.from_gguf(self.g)
+        self.cfg = cfg = QwenConfig.from_gguf(self.g)
         self.H = cfg.hidden_size
         self.img = img = QwenImage(self.g, cfg, layers=layers, vocab=COLS * 1024)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
@@ -122,14 +128,14 @@ class _Phases:
 
 
 @pytest.fixture(scope="module", params=["9B", "1B"])
-def setup(request: pytest.FixtureRequest) -> tuple[_Phases, ref.Golden, int, int]:
-    path = ref.qwen_gguf("Q4_K_M", request.param)
+def setup(request: pytest.FixtureRequest) -> tuple[_Phases, Golden, int, int]:
+    path = qwen_gguf("Q4_K_M", request.param)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
     Lg, La = cfg.gdn_layers[0], cfg.attention_layers[0]
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T]
-    G = ref.golden(path, tokens, ubatch=1, layers=("g", Lg, La - 1, La, cfg.num_hidden_layers - 1), names=NAMES,
+    tokens = llama_tokenize(path, essay("apple.txt"))[:T]
+    G = golden(path, tokens, ubatch=1, layers=("g", Lg, La - 1, La, cfg.num_hidden_layers - 1), names=NAMES,
                    logits="f32")
     return _Phases(path, [Lg, La]), G, Lg, La
 
@@ -239,10 +245,10 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
 
 @pytest.fixture(scope="module", params=[4, 8])
 def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
-    path = ref.qwen_gguf("Q4_K_M", "27B")
+    path = qwen_gguf("Q4_K_M", "27B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
     Lg, La = cfg.gdn_layers[0], cfg.attention_layers[0]
     return _Phases(path, [Lg, La], request.param), Lg, La
 
@@ -307,7 +313,7 @@ class _Gdn:
 
         self.MG = GD
         self.g = g = GGUFFile(path)
-        self.cfg = cfg = ref.QwenConfig.from_gguf(g)
+        self.cfg = cfg = QwenConfig.from_gguf(g)
         self.H, self.L = cfg.hidden_size, layer
         img = QwenImage(g, cfg, layers=[layer], vocab=COLS * 64)
         self.sh = sh = GD.GdnShape(cfg, chunk=chunk_of(cfg))
@@ -596,10 +602,10 @@ def _gdn_blocks(path: str, Lg: int, x: np.ndarray, junk: np.ndarray) -> None:
 def test_gdn_steps_a3b() -> None:
     """``_gdn_blocks`` on the 35B-A3B's first GDN layer (the chunkwise core of 4 slots, 4 v heads per column), random
     inputs."""
-    path = ref.size_gguf("35B-A3B")
+    path = size_gguf("35B-A3B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
     rng = np.random.default_rng(3)
     x = bf16_round(rng.standard_normal((20, cfg.hidden_size)).astype(np.float32) * 0.02)
     junk = bf16_round(rng.standard_normal((12, cfg.hidden_size)).astype(np.float32) * 0.02)
@@ -608,10 +614,10 @@ def test_gdn_steps_a3b() -> None:
 
 def test_gdn_steps_27b() -> None:
     """The same steps on the 27B's first GDN layer (6 v heads per column: 3 pairs) on random inputs."""
-    path = ref.qwen_gguf("Q4_K_M", "27B")
+    path = qwen_gguf("Q4_K_M", "27B")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
     x = bf16_round(np.random.default_rng(2).standard_normal((5, cfg.hidden_size)).astype(np.float32) * 0.02)
     _gdn_steps(path, cfg.gdn_layers[0], x, None)
 
@@ -676,10 +682,10 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     column's stream, a step across a cache group too; o an octet's 8 rows."""
     from models.qwen35 import attn as A1
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
-    cfg = ref.QwenConfig.from_gguf(GGUFFile(path))
+    cfg = QwenConfig.from_gguf(GGUFFile(path))
     g = p // 32
     one = size == "3.8-27B"
     assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == bool(split))
@@ -900,15 +906,15 @@ def test_overlay_slice(size: str, mode: str) -> None:
     are accepted (lazy8)."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     if mode in ("s7", "lazy8") and size not in ("3.8-27B", "swift"):
         pytest.skip("steps of more than 4 tokens: designs of 8 slots")
-    La = ref.QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
+    La = QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
     n, layers = 104 if mode.startswith("split") else 34, list(range(La + 1))
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
-    G_ = ref.golden(path, tokens, ubatch=1, layers=("g", *layers), names="l_out|model.input_embed", logits="none")
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, ubatch=1, layers=("g", *layers), names="l_out|model.input_embed", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=128)
     ov.load(release=False)
     errs = np.zeros((n, len(layers)))
@@ -943,11 +949,11 @@ def test_drafts_exact(size: str) -> None:
     slot's logits (bf16 bits) those of the step of one."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     g = GGUFFile(path)
-    layers = list(range(ref.QwenConfig.from_gguf(g).attention_layers[0] + 1))
+    layers = list(range(QwenConfig.from_gguf(g).attention_layers[0] + 1))
     P = 120
     rng = np.random.default_rng(5)
     tokens = [int(t) for t in rng.integers(0, 50000, P)]
@@ -985,12 +991,12 @@ def test_moe_slice(first: int) -> None:
     moves the layer's output by up to ~2% and the next layers' by up to ~5%)."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = ref.size_gguf("occamy")
+    path = size_gguf("occamy")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     layers, n = list(range(first, first + 4)), 16
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
-    G_ = ref.golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
                     names="l_out|model.input_embed|ffn_moe_logits|ffn_moe_topk", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
     ov.load(release=False)
@@ -1031,12 +1037,12 @@ def test_dense_slice(first: int) -> None:
     every layer within the 27B's bounds of ``test_overlay_slice``."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = ref.size_gguf("swift")
+    path = size_gguf("swift")
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     layers, n = list(range(first, first + 4)), 16
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
-    G_ = ref.golden(path, tokens, ubatch=1, layers=(first - 1, *layers), names="l_out", logits="none")
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, ubatch=1, layers=(first - 1, *layers), names="l_out", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
     ov.load(release=False)
     errs = np.zeros((n, len(layers)))
@@ -1055,13 +1061,13 @@ def test_lm_head(size: str) -> None:
     tokens: the logits within llama.cpp's own error (its Q8_K activations) of its logits, the same argmax."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     g = GGUFFile(path)
-    L = ref.QwenConfig.from_gguf(g).num_hidden_layers - 1
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T]
-    G_ = ref.golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
+    L = QwenConfig.from_gguf(g).num_hidden_layers - 1
+    tokens = llama_tokenize(path, essay("apple.txt"))[:T]
+    G_ = golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
     ov = QwenOverlay(g, layers=[L], max_positions=64)
     ov.load(release=False)
     for t in range(T):
@@ -1090,14 +1096,14 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     from artlite.moe import route as MR
     from models.qwen35.overlay import CP_BYTES, QwenOverlay
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path}: not present")
     g = GGUFFile(path)
     ov = QwenOverlay(g, layers=[L], vocab=COLS * 64, max_positions=128)
     ov.load(release=False)
     cfg, H = ov.cfg, ov.H
-    x = g.rows("token_embd.weight", ref.llama_tokenize(path, essay("apple.txt"))[:S])
+    x = g.rows("token_embd.weight", llama_tokenize(path, essay("apple.txt"))[:S])
     ov.step(x, 0, logits=False)
     dev = ov.dev
     dev.fetch("ACT")
@@ -1105,7 +1111,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     off = ov.inp[(L, "moe_in")][0].off + OD.XB
     xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
     b = f"blk.{L}."
-    xn = ref.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
+    xn = np_ops.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
                       cfg.rms_norm_eps)
     W = np.asarray(g.tensor(b + "ffn_gate_inp.weight").raw, np.float32).reshape(cfg.n_experts, H)
     lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
@@ -1113,7 +1119,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     lg = act[o:o + 4096].view(np.float32).reshape(OD.SLOTS, -1)[:S]
     assert rel_max(lg, lg_ref) < 3e-5, rel_max(lg, lg_ref)
     ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
-    rids, rw = ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
+    rids, rw = moe_ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
     assert np.array_equal(ids, rids)
     gu = ov.image.region(L, "exp_gu")
     for c in range(COLS):
@@ -1128,11 +1134,11 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
             it = em[OD.M_ITEM + OD.ITEM_WORDS * i:][:OD.ITEM_WORDS]
             assert it[0] == e | h0 << 8 | h1 << 9
             assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (c, i)
-    ex = ref.experts(g, L)
-    shared = ref.shared_expert(xn, *(g.tensor(b + t).dequantize() for t in
+    ex = moe_ref.experts(g, L)
+    shared = moe_ref.shared_expert(xn, *(g.tensor(b + t).dequantize() for t in
                                      ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
                                np.asarray(g.tensor(b + "ffn_gate_inp_shexp.weight").raw, np.float32).reshape(-1))
-    want = xin + ref.moe_ffn(xn, rids, rw, ex) + shared
+    want = xin + moe_ref.moe_ffn(xn, rids, rw, ex) + shared
     for s in range(S):
         got = ov.hidden(-1, slot=s)
         assert rel_max(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, rel_max(got, want[s]))

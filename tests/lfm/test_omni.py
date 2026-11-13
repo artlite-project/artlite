@@ -5,7 +5,7 @@ teacher-forced over llama.cpp's answers to a picture, a clip (ASR) and a picture
 speech), the KL against llama.cpp's language model on float64 embeddings within 2x of the NPU language model's own; a
 TTS run that ends with the end of audio and that the model's ASR hears back; a voice reply about a picture.
 
-Host (no NPU): the prompts' token ids are llama.cpp's (libmtmd's chunks through ``tests.minicpmv.ref.golden``: text ids,
+Host (no NPU): the prompts' token ids are llama.cpp's (libmtmd's chunks through ``tests.goldens.media.golden``: text ids,
 each media chunk's tokens) for an image, an audio clip, an image with a spoken question, videos with and without a
 soundtrack (Omni's layout: per pair its timestamp, its tokens, its piece of the soundtrack), an LFM3-VL-2B video (frames
 only); the TTS and interleaved prompts' ids are llama.cpp's tokenization of their text. The encoders here are stand-ins
@@ -31,10 +31,10 @@ from models.sequence import MEDIA, Sequence, load_image
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import ASTRONAUT, SPEECH_CLIP, video_file
+from ..goldens.media import golden
 from ..lfm3a import ref as AR
 from ..lfm3vl import ref as VR
 from ..llama_cpp import llama_tokenize
-from ..minicpmv.ref import golden
 from ..numerics import kl_agree
 
 MODEL, MMPROJ = lfm3omni_gguf(), lfm3omni_mmproj()

@@ -20,6 +20,9 @@ from models.qwen35 import gdn_prefill as GP
 from models.qwen35.image import QwenImage, gdn_v_heads
 
 from ..common import essay, to_numpy
+from ..goldens.text import golden
+from ..llama_cpp import llama_tokenize
+from ..models import size_gguf
 from ..numerics import bf16_round, rel_max
 from . import ref
 
@@ -35,7 +38,7 @@ def _bits(x: np.ndarray) -> np.ndarray:
 @pytest.mark.parametrize("T", [64])
 def test_gdn_scan(T: int, size: str) -> None:
     """(Occamy: its F32 alpha in the ab slot as fp32, ``gdn_prefill.ab_f32``)"""
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
@@ -46,8 +49,8 @@ def test_gdn_scan(T: int, size: str) -> None:
     lay = PG.plan_phase(img, region, T, pitch=PG.phase_pitch(img, "gdn_in", T)).layout
     blk = region.block("qkv")
     n2 = T - 5  # (the second chunk's valid tokens)
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:T + n2]
-    G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta|attn_output|new_state",
+    tokens = llama_tokenize(path, essay("apple.txt"))[:T + n2]
+    G_ = golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta|attn_output|new_state",
                     logits="none")
     qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(len(tokens), -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(len(tokens), -1)
@@ -131,7 +134,7 @@ def test_gdn_out(size: str) -> None:
     the conv state = G's qkv rows of the last three valid tokens, bit for bit."""
     from artlite.operators import bfp16
 
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
@@ -164,7 +167,7 @@ def test_gdn_out(size: str) -> None:
         z = G[:, c * lay.pitch + lay.off["z"]:][:, :len(vh) * 128].float().numpy().reshape(T, -1, 128)
         want = ref.core_gdn_out(O.float().numpy().reshape(T, hv, 128)[:, vh], z, norm, cfg.rms_norm_eps).reshape(T, -1)
         want = bfp16.from_panels(bfp16.to_panels(want), T, want.shape[1])  # (its blocks)
-        assert rel_max(A[:, vh].reshape(T, -1), want) < 1.2e-2, c  # (rel_err: max-based; a flip of the
+        assert rel_max(A[:, vh].reshape(T, -1), want) < 1.2e-2, c  # (rel_max: max-based; a flip of the
         # 7-bit mantissa in the block of the largest values is ~1 / 100)
         gh = fused.get_buffer("GH").view(np.int16)
         o = (c * HSLOT + CS_OFF) // 2
@@ -180,7 +183,7 @@ def test_gdn_scan_packed(size: str) -> None:
     cores' arithmetic of them alone (``ref.core_gdn_scan``): within the reference's tolerance as close as alone (no leak
     of a segment's state into the next); one that starts at a scan chunk bit-identical up to the chunk the next one
     starts inside (whose reset changes that chunk's arithmetic)."""
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
@@ -193,8 +196,8 @@ def test_gdn_scan_packed(size: str) -> None:
     lengths = [37, 8, 3, 50, 20]  # (starts 0, 37, 45, 48, 98; padding from 118)
     starts = np.cumsum([0, *lengths])[:-1]
     n = int(sum(lengths))
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
-    G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
     qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
     alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)
@@ -269,7 +272,7 @@ def test_gdn_scan_tree(size: str) -> None:
     between them: each segment's o bit-identical to its tokens alone after the prefix (the unpacked designs: the same
     arithmetic from the same state), within the reference's tolerance of the cores' arithmetic; the layer's state left
     as the prefix's (the 27B: three v heads per k head, the L1's tightest)."""
-    path = ref.size_gguf(size)
+    path = size_gguf(size)
     if not os.path.exists(path):
         pytest.skip(f"{path} missing")
     g = GGUFFile(path)
@@ -282,8 +285,8 @@ def test_gdn_scan_tree(size: str) -> None:
     lengths = [37, 8, 3, 50, 20]
     starts = np.cumsum([0, *(-(-m // GP.C) * GP.C for m in lengths)])[:-1]
     n = pre + int(sum(lengths))
-    tokens = ref.llama_tokenize(path, essay("apple.txt"))[:n]
-    G_ = ref.golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, layers=(L,), names="linear_attn_qkv_mixed|alpha|beta", logits="none")
     qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(n, -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
     alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)

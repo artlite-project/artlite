@@ -1,5 +1,5 @@
-"""The DFlash2 block drafter (``qwen35.dflash``) of Qwen3.8-27B: ``ref.DFlash`` (fp32) against llama.cpp's draft-dflash, its design on
-the NPU against ``ref.DFlash`` on the same taps, rounds of a generation.
+"""The DFlash2 block drafter (``qwen35.dflash``) of Qwen3.8-27B: ``dflash_ref.DFlash`` (fp32) against llama.cpp's draft-dflash, its design on
+the NPU against ``dflash_ref.DFlash`` on the same taps, rounds of a generation.
 
 - the reference: the block's tensors (llama.cpp quantizes its activations to Q8_K: 1-7% per layer, as much as two of its builds
   differ by), the same drafts but at near ties; past the window, on random taps (the model does not run);
@@ -34,9 +34,12 @@ from models.qwen35.qwen import NpuQwen, Qwen
 from models.server.cache import PromptCache
 from models.tokenizer import BpeTokenizer
 
+from .. import np_ops
 from ..common import essays, to_torch
+from ..goldens.text import golden
+from ..models import size_gguf
 from ..numerics import from_bf16_bits, rel_max
-from . import ref
+from . import dflash_ref, ref
 
 pytestmark = pytest.mark.slow  # the whole 27B: its taps from llama.cpp's CPU run, its head in place
 
@@ -44,7 +47,7 @@ NAMES = ("noise_norm", "attn_conv_in", "Qcur", "Kcur", "Vcur", "attn_conv_out", 
 
 
 def _files() -> tuple[str, str]:
-    model = ref.size_gguf("3.8-27B")
+    model = size_gguf("3.8-27B")
     if not os.path.exists(model):
         pytest.skip(f"no {model}")
     path = qwen_dflash_of(model)
@@ -57,8 +60,8 @@ def _tokens(model: str, n: int) -> list[int]:
     return BpeTokenizer(GGUFFile(model)).encode(essays()[:8 * n])[:n]
 
 
-def _emb(d: ref.DFlash, token: int) -> np.ndarray:
-    return ref.f32(d.model.rows("token_embd.weight", [token] + [d.cfg.mask_token] * (d.cfg.block - 1)))
+def _emb(d: dflash_ref.DFlash, token: int) -> np.ndarray:
+    return np_ops.f32(d.model.rows("token_embd.weight", [token] + [d.cfg.mask_token] * (d.cfg.block - 1)))
 
 
 def test_ref() -> None:
@@ -66,9 +69,9 @@ def test_ref() -> None:
     model, path = _files()
     ids, P = _tokens(model, 96), 80
     names = "|".join((*NAMES, "inp_g_embeddings", "Kcur_injected", "Vcur_injected", "result_norm", "result_output"))
-    g = ref.golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=P, dflash_names=names)
+    g = golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=P, dflash_names=names)
     taps = np.ascontiguousarray(g.dflash("taps"))
-    d = ref.DFlash(path, model, 256)
+    d = dflash_ref.DFlash(path, model, 256)
     assert rel_max(d.inject(taps, np.arange(P)), g.dflash("inp_g_embeddings")) < 0.02
     for L in range(d.cfg.layers):
         assert rel_max(d.K[L, :P], np.asarray(g.dflash("Kcur_injected", L))) < 0.04
@@ -95,8 +98,8 @@ def test_ref_window() -> None:
     model, path = _files()
     P = 2100
     ids = list(range(1000, 1000 + P + 8))
-    g = ref.golden(model, ids, ubatch=64, logits="none", dflash=path, dflash_at=P, dflash_names="result_norm", dflash_random=True)
-    d = ref.DFlash(path, model, 2400, head=np.arange(64))
+    g = golden(model, ids, ubatch=64, logits="none", dflash=path, dflash_at=P, dflash_names="result_norm", dflash_random=True)
+    d = dflash_ref.DFlash(path, model, 2400, head=np.arange(64))
     d.inject(np.ascontiguousarray(g.dflash("taps")), np.arange(P))
     assert rel_max(d.block(_emb(d, ids[P]), P)["result_norm"], np.asarray(g.dflash("result_norm"))) < 0.04
 
@@ -155,7 +158,7 @@ def _bf16(b: np.ndarray) -> np.ndarray:
     return from_bf16_bits(np.ascontiguousarray(b).view(np.uint16)).astype(np.float64)
 
 
-def _attention_errors(d: DFlashOverlay, rf: ref.DFlash, L: int, p: int) -> np.ndarray:
+def _attention_errors(d: DFlashOverlay, rf: dflash_ref.DFlash, L: int, p: int) -> np.ndarray:
     """The block at p just ran: per column, slot and query head the relative error of the attention core's o (aout's x) against the
     attention of its own operands (the rows' raw q, K, V in ACT, the ring, the open object; K and Q as the core's panels)."""
     d.dev.fetch("ACT")
@@ -219,7 +222,7 @@ def test_injection(npu: _Npu) -> None:
     taps = np.random.default_rng(2).normal(0, 1 / 16, (P, len(d.cfg.taps), d.H)).astype(np.float32)
     _inject(npu, taps, np.random.default_rng(1))
     assert d.next == P
-    rf = ref.DFlash(path, ref.size_gguf("3.8-27B"), P + 8, head=np.arange(64))
+    rf = dflash_ref.DFlash(path, size_gguf("3.8-27B"), P + 8, head=np.arange(64))
     rf.inject(taps, np.arange(P))
     kv, T, G = d.dev.view("KV"), d.T, d.shape.ring
     d.dev.fetch("KV")
@@ -249,7 +252,7 @@ def test_attention_core(npu: _Npu, P: int) -> None:
     d.reset()
     taps = np.random.default_rng(3).normal(0, 1 / 16, (P, len(d.cfg.taps), d.H)).astype(np.float32)
     _inject(npu, taps, np.random.default_rng(1))
-    rf = ref.DFlash(path, ref.size_gguf("3.8-27B"), 8)
+    rf = dflash_ref.DFlash(path, size_gguf("3.8-27B"), 8)
     emb = _emb(rf, 1000)
     d.step(0, 0, P, emb, P)
     for L in range(d.cfg.layers):
@@ -263,12 +266,12 @@ def test_block(npu: _Npu, P: int) -> None:
     selector as ref's."""
     model, path = _files()
     ids = _tokens(model, P + 16)
-    g = ref.golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=P, dflash_names="")
+    g = golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=P, dflash_names="")
     taps = np.ascontiguousarray(g.dflash("taps"))
     d = npu.d
     d.reset()
     _inject(npu, taps, None)
-    rf = ref.DFlash(path, model, P + 8, head=npu.head)
+    rf = dflash_ref.DFlash(path, model, P + 8, head=npu.head)
     rf.inject(taps, np.arange(P))
     emb = _emb(rf, ids[P])
     d.step(0, 0, P, emb, P)
@@ -553,11 +556,11 @@ def test_second_turn(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     assert m.accepted - a0 >= 8, (len(out), m.accepted - a0)
 
 
-def _llama_records(n: int) -> tuple[list[int], ref.DFlash]:
+def _llama_records(n: int) -> tuple[list[int], dflash_ref.DFlash]:
     model, path = _files()
     ids = _tokens(model, n + 8)
-    g = ref.golden(model, ids, ubatch=256, logits="none", dflash=path, dflash_at=n, dflash_names="")
-    rf = ref.DFlash(path, model, n + 8, head=np.arange(64))
+    g = golden(model, ids, ubatch=256, logits="none", dflash=path, dflash_at=n, dflash_names="")
+    rf = dflash_ref.DFlash(path, model, n + 8, head=np.arange(64))
     rf.inject(np.ascontiguousarray(g.dflash("taps")), np.arange(n))
     return ids, rf
 
@@ -596,17 +599,17 @@ def test_ring_wraps(app: tuple[NpuQwen, BpeTokenizer]) -> None:
 @pytest.mark.parametrize("n", [256, 264, 320, 325])
 def test_record_edges(app: tuple[NpuQwen, BpeTokenizer], n: int) -> None:
     """A prompt ending on a chunk's end, a record's, a cache group's, and past it: the block after it has the drafts of the same taps
-    run through ``ref.DFlash``."""
+    run through ``dflash_ref.DFlash``."""
     m, _ = app
     m.lookup = False
     model, path = _files()
     ids = _tokens(model, n + 8)
-    g = ref.golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=n, dflash_names="")
+    g = golden(model, ids, ubatch=len(ids), logits="none", dflash=path, dflash_at=n, dflash_names="")
     m.reset()
     m.forward(ids[:n])
     d = m.dflash
     head = d.table.ids
-    rf = ref.DFlash(path, model, n + 8, head=head)
+    rf = dflash_ref.DFlash(path, model, n + 8, head=head)
     rf.inject(np.ascontiguousarray(g.dflash("taps"))[:n], np.arange(n))
     emb = _emb(rf, ids[n])
     m._inject()

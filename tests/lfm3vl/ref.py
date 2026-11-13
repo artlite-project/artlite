@@ -1,5 +1,5 @@
 """References of LFM3-VL's vision encoder (the mmproj of projector ``lfm3vl``: LFM3-VL-2B's, d1-2B's): the encoder in
-torch, and llama.cpp goldens through libmtmd (``tests.minicpmv.ref.golden``: the dump tool runs any mmproj; its
+torch, and llama.cpp goldens through libmtmd (``tests.goldens.media.golden``: the dump tool runs any mmproj; its
 embeddings ``embd(0)`` are the image chunk's rows, the merged tokens in raster order).
 
 The encoder (``Encoder``): llama.cpp's ``clip_graph_lfm3vl`` (``tools/mtmd/models/lfm3vl.cpp``) and transformers'
@@ -24,7 +24,7 @@ import torch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
-from ..minicpmv.ref import VisionGolden, golden
+from ..goldens.media import VisionGolden, golden
 from ..numerics import bf16_like
 
 __all__ = ["Encoder", "VisionGolden", "golden", "rope_angles"]

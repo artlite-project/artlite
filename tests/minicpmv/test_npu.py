@@ -22,8 +22,8 @@ from models.qwen35.qwen import NpuQwen, Qwen
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from ..common import essay
+from ..goldens.media import golden, seq_golden
 from ..numerics import kl_report
-from . import ref as V
 from .test_ref import IMAGE, MMPROJ, NAMES
 
 pytestmark = pytest.mark.slow  # (the whole model)
@@ -41,7 +41,7 @@ def case() -> tuple:
             pytest.skip(f"{p} missing")
     g = GGUFFile(path)
     tok = BpeTokenizer(g)
-    gold = V.golden(path, MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)
+    gold = golden(path, MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)
     _, grid = M.slice_image(M.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
     chunk = gold.embd(0)  # (llama.cpp's image chunk: the tokens after <image>, through the last marker)
     embd = chunk[np.asarray(grid.layout(newline_after=False)[1:]) == M.MEDIA]
@@ -55,7 +55,7 @@ def case() -> tuple:
     rows = np.empty((len(seq), g.tensor("token_embd.weight").cols), np.float32)
     rows[~seq.given] = g.rows("token_embd.weight", seq.ids[~seq.given])
     rows[seq.given] = seq.rows
-    want = torch.from_numpy(np.asarray(V.seq_golden(path, rows, seq.pos, K - 1).logits, np.float32)[:-1].copy())
+    want = torch.from_numpy(np.asarray(seq_golden(path, rows, seq.pos, K - 1).logits, np.float32)[:-1].copy())
     return path, seq, K, want
 
 

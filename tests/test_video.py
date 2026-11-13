@@ -1,5 +1,5 @@
 """A video's frames and soundtrack (models/video.py) and LFM3-VL's video rules (models/lfm3vl/host.py ``VideoPlan``)
-against llama.cpp's mtmd video helper (``tests.minicpmv.ref.video_items``: as llama-server reads a video's bytes) on
+against llama.cpp's mtmd video helper (``tests.goldens.media.video_items``: as llama-server reads a video's bytes) on
 videos made by ffmpeg: the frames' indices, size and RGB bit for bit, the pairs' timestamps, the soundtrack's pieces'
 samples bit for bit; LFM3-Omni's mmproj (frames and soundtrack) and LFM3-VL-2B's (frames only). No NPU."""
 
@@ -16,7 +16,7 @@ from models import video as VD
 from models.lfm3vl import host as H
 
 from .common import VIDEOS, video_file
-from .minicpmv.ref import video_items
+from .goldens.media import video_items
 
 
 @pytest.fixture(scope="module")

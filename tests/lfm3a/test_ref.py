@@ -16,6 +16,8 @@ from artlite.model_config import AudioConfig, lfm3a_gguf, lfm3a_mmproj
 from models.lfm3a import host as A
 from models.tokenizer import BpeTokenizer, chat_prompt
 
+from ..goldens import media
+from ..goldens.media import VisionGolden
 from . import ref as R
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,9 +48,9 @@ def asr_text(gguf: GGUFFile, language: str = "en", marker: str = A.AUDIO) -> str
     return text.replace(A.AUDIO, marker)
 
 
-def golden(path: str) -> R.VisionGolden:
+def golden(path: str) -> VisionGolden:
     _files()
-    return R.golden(MODEL, MMPROJ, path, asr_text(GGUFFile(MODEL), marker=MARKER))
+    return media.golden(MODEL, MMPROJ, path, asr_text(GGUFFile(MODEL), marker=MARKER))
 
 
 def test_config() -> None:

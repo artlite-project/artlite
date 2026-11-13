@@ -14,12 +14,12 @@ from artlite.decode.design import norm_objects
 from artlite.decode.image import BLOCK_BYTES, pack_rows
 from artlite.formats import pack_tile, slice_fields
 from artlite.gguf_model import GGUFFile, QTensor
-from artlite.model_config import MODELS_DIR
+from artlite.model_config import MODELS_DIR, QwenConfig, decision_gguf, qwen_gguf
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
-from .ref import QwenConfig, decision_gguf, experts, qwen_gguf
+from ..moe.ref import experts
 
 S = 9280
 MOE = qwen_gguf("Q4_K_M", "35B-A3B")

@@ -1,6 +1,6 @@
 """References of the LFM3 tests: the files (``gguf``), token sequences (an essay's tokens, a chat turn with a fixed
 reply), the fp32 CPU model's logits (``cpu.LfmCpu``, cached in ``tests/refs/<model>/``: ``common.cached_ref``) and
-llama.cpp's CPU logits of a sequence (the golden dump tool: ``qwen35.ref.golden`` runs any architecture)."""
+llama.cpp's CPU logits of a sequence (the golden dump tool: ``tests.goldens.text.golden`` runs any architecture)."""
 
 import os
 
@@ -12,8 +12,8 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import d1_gguf, lfm3_gguf
 
 from .. import common
+from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
-from ..qwen35 import ref as qref
 from . import cpu
 
 SOURCES = [cpu.__file__]
@@ -67,7 +67,7 @@ def cpu_logits(quant: str, ids: list[int], *, layers: list[int] | None = None, v
 
 def llama_logits(quant: str, ids: list[int]) -> torch.Tensor:
     """llama.cpp's CPU logits (len(ids), vocab) of a sequence (its prompt graph)."""
-    g = qref.golden(path(quant), ids, logits="f32")
+    g = golden(path(quant), ids, logits="f32")
     return torch.from_numpy(np.asarray(g.logits, np.float32).copy())
 
 

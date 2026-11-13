@@ -12,7 +12,7 @@ from ml_dtypes import bfloat16
 
 import artlite
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import occamy_gguf
+from artlite.model_config import occamy_gguf, qwen_gguf
 from artlite.moe import gemm as MG
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
@@ -20,10 +20,10 @@ from artlite.prefill.norm import PrefillNormOperator
 
 from ..common import to_numpy
 from ..numerics import rel_max
-from ..qwen35 import ref
+from . import ref
 
 # (model, layer): the layers each image holds
-MODELS = {"35B-A3B": (lambda: ref.qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13))}
+MODELS = {"35B-A3B": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13))}
 LAYERS = [(m, L) for m, (_, ls) in MODELS.items() for L in ls]
 _state: dict[str, object] = {}
 

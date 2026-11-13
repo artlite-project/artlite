@@ -1,13 +1,5 @@
-"""References of MiniCPM-V 4.7's vision path (the mmproj of projector ``minicpmv4_7``): llama.cpp goldens and the
-encoder in torch.
-
-Goldens: ``golden`` runs an image prompt through llama.cpp's libmtmd on the CPU (``dump.cpp``, built against
-the llama.cpp tree of ``model_config.LLAMA_CPP_DIR``): the prompt's chunks (text tokens; image chunks with llama.cpp's
-decoder positions, which for MiniCPM-V 4.7 differ from the official ``get_rope_index`` at the markers and after the
-image: llama.cpp PR #30510), each image's embeddings, the encoder's tensors per entry (the overview, then the slices
-row by row; inp_raw: the entry's pixels) and the logits after every text token. Cached under
-``tests/refs/<model>/vgolden_<hash>/`` (``--refresh-refs`` recomputes). ``seq_golden``: the language model alone on
-a sequence of embedding rows at given (the official) positions.
+"""The encoder of MiniCPM-V 4.7's vision path (the mmproj of projector ``minicpmv4_7``) in torch
+(llama.cpp's goldens: ``goldens.media``).
 
 The encoder (``Encoder``): llama.cpp's ``clip_graph_minicpmv4_6`` (``tools/mtmd/models/minicpmv.cpp``) on the mmproj's
 tensors for one entry's pixels (3, H, W): the patch embedding, the learned position embedding over a 70 x 70 grid, the
@@ -20,212 +12,20 @@ bf16, GELU tanh goes through ggml's fp16 table. ``NpuEncoder``: the encoder at t
 (``models.minicpmv.encoder`` on the vision overlay).
 """
 
-import hashlib
-import json
 import math
-import os
-import shutil
-import subprocess
-import tempfile
 
 import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LLAMA_CPP_DIR, ClipConfig
-from artlite.operators.base import CACHE_DIR
+from artlite.model_config import ClipConfig
 from models.minicpmv import encoder as vision
 
-from .. import common
-from ..llama_cpp import _lib_identity, _llama_lib, llama_cpp_bin
 from ..numerics import bf16_like, gelu_table, gelu_tanh
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DUMP_SRC = os.path.join(HERE, "dump.cpp")
 # the separator rows of v.tok_embd_sep after an entry by its place (clip-impl.h clip_suffix_rows): 0 </image>,
 # 1 <slice>, 2 </slice>, 3 "\n"
 SUFFIX_ROWS = {"ov": [0], "ov_slice": [0, 1], "slice": [2, 1], "row_end": [2, 3, 1], "last": [2]}
-
-
-# ----------------------------------------------------------------------
-# llama.cpp goldens
-# ----------------------------------------------------------------------
-
-
-def _mtmd_identity() -> str:
-    lib = os.path.realpath(llama_cpp_bin("libmtmd.so"))
-    return f"{lib}:{os.path.getsize(lib)}:{int(os.path.getmtime(lib))}"
-
-
-def dump_tool() -> str:
-    """The path of the built ``minicpmv_dump`` (compiled on first use into the artlite cache)."""
-    with open(DUMP_SRC, "rb") as f:
-        key = hashlib.sha256(f.read() + (_lib_identity() + _mtmd_identity()).encode()).hexdigest()[:16]
-    path = os.path.join(CACHE_DIR, f"minicpmv_dump_{key}")
-    if not os.path.exists(path):
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        bindir = os.path.dirname(_llama_lib())
-        tmp = f"{path}.{os.getpid()}.tmp"
-        subprocess.run(["g++", "-O2", "-std=c++17", "-Wno-deprecated-declarations", f"-I{LLAMA_CPP_DIR}/include",
-                        f"-I{LLAMA_CPP_DIR}/ggml/include", f"-I{LLAMA_CPP_DIR}/tools/mtmd", DUMP_SRC, "-o", tmp,
-                        f"-L{bindir}", "-lmtmd", "-lllama", "-lggml", "-lggml-base", f"-Wl,-rpath,{bindir}"], check=True)
-        os.replace(tmp, path)
-    return path
-
-
-class VisionGolden:
-    """The outputs of one ``minicpmv_dump`` run: ``chunks`` (the chunks.json list), ``entries``, ``embd(i)``,
-    ``tensor(name, entry, layer)``, ``logits`` and ``logit_tokens`` (the sequence index of each row)."""
-
-    def __init__(self, path: str):
-        self.path = path
-        with open(os.path.join(path, "chunks.json")) as f:
-            j = json.load(f)
-        self.chunks, self.logit_tokens, self.entries = j["chunks"], j["logit_tokens"], j["entries"]
-
-    def embd(self, i: int = 0) -> np.ndarray:
-        return np.load(os.path.join(self.path, f"embd-{i}.npy"))
-
-    def tensor(self, name: str, entry: int, layer: int | None = None) -> np.ndarray:
-        """``name`` ("layer_out", ...; "Kcur.1": the second of that name) of the encoder's entry, of a layer."""
-        base, dot, dup = name.rpartition(".")
-        if not (dot and dup.isdigit()):
-            base, dup = name, ""
-        stem = base if layer is None else f"{base}-{layer}"
-        path = os.path.join(self.path, stem + (f".{dup}" if dup else "") + f".e{entry}.npy")
-        if not os.path.exists(path):
-            have = sorted(f for f in os.listdir(self.path) if f.endswith(f".e{entry}.npy"))
-            raise KeyError(f"{name} {layer} e{entry}: not dumped (have {have[:40]})")
-        return np.load(path)
-
-    @property
-    def logits(self) -> np.ndarray:
-        return np.load(os.path.join(self.path, "logits.npy"), mmap_mode="r")
-
-
-def golden(model: str, mmproj: str, image: str | list[str], prompt: str, *, answer: list[int] | tuple[int, ...] = (),
-           names: str = "", embd: np.ndarray | None = None, no_soundtrack: bool = False,
-           threads: int = 16) -> VisionGolden:
-    """llama.cpp's media path for media files (``image``: an image, an audio file or a video, or a list of them) and a
-    prompt (the text with ``<__media__>`` where each goes, in order) and teacher-forced answer tokens; ``names``: a
-    regex of the encoder tensors to dump (without the "-<il>" suffix); ``embd``: the media chunks' embeddings (their
-    tokens in order, n_embd) the language model takes instead of the encoders'; ``no_soundtrack``: a video's frames
-    only."""
-    ans = np.ascontiguousarray(answer, np.int32)
-    emb = None if embd is None else np.ascontiguousarray(embd, np.float32)
-    media = [image] if isinstance(image, str) else list(image)
-    hashes = []
-    for m in media:
-        with open(m, "rb") as f:
-            hashes.append(hashlib.sha256(f.read()).hexdigest())
-    key = (common.model_key(model), common.model_key(mmproj), hashes[0] if len(hashes) == 1 else tuple(hashes), prompt,
-           hashlib.sha256(ans.tobytes()).hexdigest(), names, None if emb is None else hashlib.sha256(emb.tobytes()).hexdigest(),
-           _lib_identity(), _mtmd_identity()) + (("no_soundtrack",) if no_soundtrack else ())
-    h = hashlib.sha256(repr(key).encode())
-    with open(DUMP_SRC, "rb") as f:
-        h.update(f.read())
-    folder = common.model_refs(model)
-    path = os.path.join(folder, f"vgolden_{h.hexdigest()[:16]}")
-    if os.path.exists(os.path.join(path, "meta.json")) and not common.REFRESH_REFS:
-        return VisionGolden(path)
-    os.makedirs(folder, exist_ok=True)
-    tool = dump_tool()
-    tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
-    try:
-        with open(os.path.join(tmp, "prompt.txt"), "w") as f:
-            f.write(prompt)
-        cmd = [tool, "-m", model, "--mmproj", mmproj, *(a for m in media for a in ("--image", m)), "-p",
-               os.path.join(tmp, "prompt.txt"), "-o", tmp, "--threads", str(threads)] + \
-            (["--no-soundtrack"] if no_soundtrack else [])
-        if ans.size:
-            ans.tofile(os.path.join(tmp, "answer.i32"))
-            cmd += ["-a", os.path.join(tmp, "answer.i32")]
-        if names:
-            cmd += ["-n", names]
-        if emb is not None:
-            emb.tofile(os.path.join(tmp, "embd.f32"))
-            cmd += ["-e", os.path.join(tmp, "embd.f32")]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
-        if r.returncode:
-            raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
-        shutil.rmtree(path, ignore_errors=True)
-        os.replace(tmp, path)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-    return VisionGolden(path)
-
-
-def video_items(model: str, mmproj: str, video: str, *, no_soundtrack: bool = False) -> list[dict]:
-    """The items llama.cpp's video helper reads from a video (``minicpmv_dump --video-items``: as llama-server reads a
-    video's bytes): {"text": s}, {"frame": RGB uint8 (h, w, 3)}, {"audio": float32 samples} in order. Cached as the
-    goldens are."""
-    with open(video, "rb") as f:
-        vh = hashlib.sha256(f.read()).hexdigest()
-    key = (common.model_key(model), common.model_key(mmproj), vh, no_soundtrack, _lib_identity(), _mtmd_identity())
-    h = hashlib.sha256(repr(key).encode())
-    with open(DUMP_SRC, "rb") as f:
-        h.update(f.read())
-    folder = common.model_refs(model)
-    path = os.path.join(folder, f"vitems_{h.hexdigest()[:16]}")
-    if not os.path.exists(os.path.join(path, "items.json")) or common.REFRESH_REFS:
-        os.makedirs(folder, exist_ok=True)
-        tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
-        try:
-            cmd = [dump_tool(), "-m", model, "--mmproj", mmproj, "--video-items", video, "-o", tmp] + \
-                (["--no-soundtrack"] if no_soundtrack else [])
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
-            if r.returncode:
-                raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
-            shutil.rmtree(path, ignore_errors=True)
-            os.replace(tmp, path)
-        except BaseException:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise
-    with open(os.path.join(path, "items.json")) as f:
-        out = json.load(f)
-    for it in out:
-        if "frame" in it:
-            it["frame"] = np.load(os.path.join(path, f"frame-{it['frame']}.npy"))
-        elif "audio" in it:
-            it["audio"] = np.load(os.path.join(path, f"audio-{it['audio']}.npy"))
-    return out
-
-
-def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *, threads: int = 16) -> VisionGolden:
-    """llama.cpp's language model on a whole sequence of embedding rows (n, n_embd) (the text tokens' too) at the
-    official M-RoPE positions ``pos`` (n, 3) (T, H, W), causal in token order (``minicpmv_dump --seq``): ``logits``
-    of tokens ``first`` .. n - 1."""
-    rows = np.ascontiguousarray(rows, np.float32)
-    pos = np.ascontiguousarray(pos, np.int32)
-    assert pos.shape == (rows.shape[0], 3), (rows.shape, pos.shape)
-    key = (common.model_key(model), hashlib.sha256(rows.tobytes() + pos.tobytes()).hexdigest(), first, _lib_identity(),
-           _mtmd_identity())
-    h = hashlib.sha256(repr(key).encode())
-    with open(DUMP_SRC, "rb") as f:
-        h.update(f.read())
-    folder = common.model_refs(model)
-    path = os.path.join(folder, f"vseq_{h.hexdigest()[:16]}")
-    if os.path.exists(os.path.join(path, "meta.json")) and not common.REFRESH_REFS:
-        return VisionGolden(path)
-    os.makedirs(folder, exist_ok=True)
-    tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
-    try:
-        rows.tofile(os.path.join(tmp, "seq.f32"))
-        pos.tofile(os.path.join(tmp, "pos.i32"))
-        cmd = [dump_tool(), "-m", model, "--seq", os.path.join(tmp, "seq.f32"), "--pos", os.path.join(tmp, "pos.i32"),
-               "--from", str(first), "-o", tmp, "--threads", str(threads)]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
-        if r.returncode:
-            raise RuntimeError(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr[-4000:]}")
-        for f in ("seq.f32", "pos.i32"):
-            os.remove(os.path.join(tmp, f))
-        shutil.rmtree(path, ignore_errors=True)
-        os.replace(tmp, path)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-    return VisionGolden(path)
 
 
 # ----------------------------------------------------------------------

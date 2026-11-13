@@ -19,6 +19,8 @@ from models.qwen35 import attn_prefill as AP
 from models.qwen35.image import QwenImage
 
 from ..common import essay
+from ..goldens.text import golden
+from ..llama_cpp import llama_tokenize
 from ..numerics import bf16_round, rel_max
 from . import ref
 
@@ -66,9 +68,9 @@ class _Setup:
         self.T, self.n2, self.qc = T, n2, cfg.num_attention_heads // COLS
         self.kvh = cfg.num_key_value_heads
         self.per = self.kvh * AT.HD // COLS  # (K / V dims of a column)
-        self.tokens = ref.llama_tokenize(path, essay("apple.txt"))[:tokens or T + n2]
+        self.tokens = llama_tokenize(path, essay("apple.txt"))[:tokens or T + n2]
         n = len(self.tokens)
-        G_ = ref.golden(path, self.tokens, layers=(L,), names="Qcur_full|Kcur|Vcur|Qcur|gate_sigmoid|attn_gated",
+        G_ = golden(path, self.tokens, layers=(L,), names="Qcur_full|Kcur|Vcur|Qcur|gate_sigmoid|attn_gated",
                         logits="none")
         self.qfull = bf16_round(np.asarray(G_["Qcur_full", L], np.float32).reshape(n, -1))
         self.k = bf16_round(np.asarray(G_["Kcur", L], np.float32).reshape(n, -1))

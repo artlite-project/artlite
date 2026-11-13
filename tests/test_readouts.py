@@ -3,7 +3,7 @@ readout's rows are the rows the prompt path's LM head reads (a chunk's last row:
 bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
 end token, as the file asks): cosine >= 0.999 for mean pooling, >= 0.995 for one row (last: llama.cpp's own two CPU
-paths, ``llama-embedding`` and ``qwen35/dump.cpp``, are 0.998 apart on MiniCPM-V's row of a 30-token text; the NPU
+paths, ``llama-embedding`` and ``goldens/qwen35_dump.cpp``, are 0.998 apart on MiniCPM-V's row of a 30-token text; the NPU
 0.996 - 0.999 on these files: the prefill's bfp16 weights and activations). Packed readouts (Qwen3-Embedding-0.6B,
 Kev-4B, d3-lite): against each input alone."""
 
@@ -19,7 +19,7 @@ from models.common import Model, NpuModel
 from models.readouts import Readouts, pool, rows_of
 
 from .common import cached_ref, essay, model_key, to_torch
-from .llama_cpp import _lib_identity, llama_embeddings
+from .llama_cpp import lib_identity, llama_embeddings
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
@@ -73,7 +73,7 @@ def test_embeddings(loaded: tuple[str, Model, NpuModel], pooling: str) -> None:
     path, model, npu = loaded
     text = essay("addiction.txt")
     texts = [text[:120], text[500:1500], text[2000:6000], text[6000:12000]]
-    ref = cached_ref(path, f"embeddings_{pooling}", (model_key(path), texts, pooling, _lib_identity()),
+    ref = cached_ref(path, f"embeddings_{pooling}", (model_key(path), texts, pooling, lib_identity()),
                      lambda: [torch.tensor(e) for e in llama_embeddings(path, texts, pooling)])
     readouts = Readouts.of(path)
     for t, want in zip(texts, ref, strict=True):

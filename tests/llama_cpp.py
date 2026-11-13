@@ -24,13 +24,10 @@ def llama_cpp_bin(name: str) -> str:
     return path
 
 
-def _llama_lib() -> str:
-    return llama_cpp_bin("libllama.so")
-
-
-def _lib_identity() -> str:
-    """The llama.cpp build the goldens come from (a rebuild invalidates them)."""
-    lib = os.path.realpath(_llama_lib())
+def lib_identity(name: str = "libllama.so") -> str:
+    """The identity of one of the llama.cpp build's libraries (``libmtmd.so``: its media library): what the goldens come
+    from (a rebuild invalidates them)."""
+    lib = os.path.realpath(llama_cpp_bin(name))
     return f"{lib}:{os.path.getsize(lib)}:{int(os.path.getmtime(lib))}"
 
 
