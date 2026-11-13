@@ -17,6 +17,7 @@ step's transaction (``_build``), its sub-steps (``subs``, repeating every ``peri
 
 import math
 import mmap
+import time
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -152,8 +153,10 @@ class ModelOverlay:
         self._last_s = 1
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
-        self.fresh = False  # whether the last step's transaction ran for the first time (its patch tables built then: its time
-        # not a step's, ``models.common``'s planner)
+        # the host seconds of the last step's one-time work: its transaction's first build and patch tables, a prompt's states
+        # turned into the decode's (``_once``): not a step's time (``models.common``'s planner)
+        self.once_s = 0.0
+        self._once_t = 0.0  # (the one-time work before the step's ``_run``)
         self._ran_keys: set = set()
         self._pads: list[tuple[int, int, int]] | None = None  # (``_clear_pads``)
         self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
@@ -403,8 +406,9 @@ class ModelOverlay:
         if p + S > self.max_positions:
             return
         subs = self.subs(p, S)
-        st = self._transaction(S, True, subs)
+        st, once = self._transaction(S, True, subs), self._once_t
         self._set_position(st, p)
+        self._once_t = once  # (while another dispatch runs: none of the step's time)
         self._ahead = (((S, True, self._variant(), subs), p, self._ring_state()), st)
 
     @staticmethod
@@ -457,6 +461,10 @@ class ModelOverlay:
                 self.dev.flush("ACT", a, b - a)
         self._dirty = (self._dirty - {sp}) | {self._sp(s) for s in range(1, self.SLOTS + 1) if self._sp(s) < sp}
 
+    def _once(self, t0: float) -> None:
+        """One-time work of the next step since ``t0`` (``time.perf_counter``): left out of its time (``once_s``)."""
+        self._once_t += time.perf_counter() - t0
+
     def _run(self, S: int, position: int, logits: bool) -> np.ndarray | None:
         """Dispatch the step of S slots at ``position`` (its inputs written): its transaction (built at its first use),
         patched (or patched ahead, while the previous step ran: ``AHEAD``); then, while it runs, the next step's (S slots
@@ -465,13 +473,16 @@ class ModelOverlay:
         self._clear_pads(self._sp(S))
         subs = self.subs(position, S)
         key = (S, logits, self._variant(), subs)
+        before, t = self._once_t, time.perf_counter()
         if self._ahead is not None and self._ahead[0] == (key, position, self._ring_state()):
             st = self._ahead[1]
         else:
             st = self._transaction(S, logits, subs)
             self._set_position(st, position)
         self._ahead = None
-        self.fresh = key not in self._ran_keys
+        # (one-time: the work before the step, and its patch's: all of it at the transaction's first run)
+        self.once_s = before + (time.perf_counter() - t if key not in self._ran_keys else self._once_t - before)
+        self._once_t = 0.0
         self._ran_keys.add(key)
         self.ready()
         self.dev.submit(st.tr)
@@ -482,6 +493,7 @@ class ModelOverlay:
                 nxt = self._transaction(S, logits, self.subs(p, S), 1 - st.b)
                 if self._set_position(nxt, p, ahead=True):
                     self._ahead = (((S, logits, self._variant(), self.subs(p, S)), p, self._ring_state()), nxt)
+                self._once_t = 0.0  # (while the step runs: none of the next step's time)
         finally:
             self.dev.wait()
         self._last_s = S

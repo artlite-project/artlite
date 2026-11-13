@@ -128,11 +128,10 @@ def test_mtp(size: str) -> None:
     """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B and Swift 1.5 with their files' own blocks
     (``NpuQwen.generate``, up to SLOTS - 1 drafts per step: 3, the 27Bs' designs 7): greedy replies to two user turns of
     a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
-    model's one-token steps over the same text (the dense 27B's steps of S slots give the numbers of S steps of one),
-    but where an MoE's multi-token step flips a near tie (its experts summed in another order: KL ~0.001 against steps
-    of one here; Occamy's ~0.005-0.009, its steps of 4 as close to llama.cpp's decode per layer as steps of one, but the
-    flips of its 40 layers' routing near ties move the top two logits by up to ~0.6); most drafts are accepted in both
-    replies (the drafter's cache follows the model's positions; up to 7 drafts: 40%)."""
+    model's one-token steps over the same text (steps of S slots give the numbers of S steps of one; an exact tie of the
+    bf16 logits takes either); most drafts are accepted (the drafter's cache follows the model's positions; up to 7
+    drafts: 40%), over both replies (a reply drafts as its measured step times say: 6 drafts in one, where one more or
+    less kept moves its share by 17%), and each reply that drafts keeps some."""
     from models.common import Sampling
     from models.qwen35.qwen import Qwen
 
@@ -166,10 +165,10 @@ def test_mtp(size: str) -> None:
                 lg = model.step(t)
     print(f"drafts (drafted, accepted): {stats1}, {stats2}; tokens not the argmax of one-token steps (their top-2 "
           f"gaps): {flips}")
-    flips = [g for g in flips if g > 0]  # (not at exact ties of the bf16 logits: either token is their argmax)
-    assert len(flips) <= (3 if model.cfg.moe else 0) and all(g <= (1.0 if size == "occamy" else 0.5) for g in flips)
+    assert not [g for g in flips if g > 0]  # (an exact tie of the bf16 logits: either token is their argmax)
     # (up to 7 drafts: the chains run deeper while their probability pays a slot, about half of them kept)
-    assert all(a >= (0.5 if drafts == 3 else 0.4) * d for d, a in (stats1, stats2))
+    d, a = stats1[0] + stats2[0], stats1[1] + stats2[1]
+    assert a >= (0.5 if drafts == 3 else 0.4) * d and all(a > 0 for d, a in (stats1, stats2) if d >= 4)
 
 
 @pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])

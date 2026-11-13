@@ -41,6 +41,7 @@ region-major one per phase and K group (the norm-weight objects from NORM).
 import itertools
 import math
 import os
+import time
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -1003,6 +1004,7 @@ class QwenOverlay(ModelOverlay):
         layers = [L for L in self.fatt if L in self.vring.from_prefill]
         if not layers:
             return
+        t0 = time.perf_counter()
         r, dev, ash, T = p >> 3, self.dev, self.ash, self.T
         if p % 8:
             kv = dev.view("KV")
@@ -1017,6 +1019,7 @@ class QwenOverlay(ModelOverlay):
         for L in layers:
             self.vring.slots.setdefault(L, {})[r & 1] = (r, p)
             self.vring.from_prefill.discard(L)
+        self._once(t0)
 
     @property
     def can_branch(self) -> bool:
@@ -1194,6 +1197,7 @@ class QwenOverlay(ModelOverlay):
         take zero gates: no change of the state, so that blocks start at multiples of 8 and prefills at a block's start)."""
         if not self._conv_in_ghdr:
             return
+        t0 = time.perf_counter()
         dev = self.dev
         self.nrep, self.cshift, self.kshift = 0, 0, 0
         src, dst, kv = self._conv_index()
@@ -1212,6 +1216,7 @@ class QwenOverlay(ModelOverlay):
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self.rope[:] = _text_rope(self.max_positions)
+        self._once(t0)
 
     @staticmethod
     def _id_runs(order: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
