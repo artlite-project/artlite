@@ -15,6 +15,7 @@ import ml_dtypes
 import numpy as np
 
 from ..base import ArtcOperator
+from ..mlir_util import device_op, device_ops, runtime_sequence
 from .layout import distinct
 
 _ELEM = 2  # bytes of main's argument elements (bf16)
@@ -65,22 +66,23 @@ def render(entries: Sequence[tuple[ArtcOperator, Sequence[Arg]]], *, arg_bytes: 
 def _device(texts: dict[str, str]) -> Any:
     """The devices' common type (each design: one device with a runtime sequence)."""
     from aie import ir
-    from aie.dialects import aie
     from aie.extras.context import mlir_mod_ctx
 
     device = None
     for name, text in texts.items():
         with mlir_mod_ctx() as ctx:
             module = ir.Module.parse(text, ctx.context)  # (kept: its operations live as long as it)
-            devices = [o for o in module.body.operations if isinstance(o, aie.DeviceOp)]
+            devices = device_ops(module)
             if len(devices) != 1:
                 raise ValueError(f"{name}: expected one device operation, got {len(devices)}")
             if device is None:
                 device = devices[0].device
             elif str(device) != str(devices[0].device):
                 raise ValueError(f"{name}: device {devices[0].device}, not {device}")
-            if not any(o.operation.name == "aie.runtime_sequence" for o in devices[0].body_region.blocks[0].operations):
-                raise ValueError(f"{name}: no runtime sequence")
+            try:
+                runtime_sequence(devices[0])
+            except StopIteration:
+                raise ValueError(f"{name}: no runtime sequence") from None
     return device
 
 
@@ -103,14 +105,14 @@ def _merge(ctx: Any, texts: dict[str, str], host: dict[str, str]) -> dict[str, A
             key = {n: str(attrs[n]) for n in attrs}.get("sym_name")
             text_of = repr((op.operation.name, sorted((n, str(attrs[n])) for n in attrs)))  # (not where it prints)
             if key is not None and key in declared:
-                assert declared[key] == text_of, f"{key}: different declarations ({declared[key]}, {text_of})"
+                if declared[key] != text_of:
+                    raise ValueError(f"{key}: different declarations ({declared[key]}, {text_of})")
                 continue
             if key is not None:
                 declared[key] = text_of
             ctx.module.body.append(op)
-        device = next(op for op in parsed.body.operations if isinstance(op, aie.DeviceOp))
-        sequence = next(o for o in device.body_region.blocks[0].operations
-                        if o.operation.name == "aie.runtime_sequence")
+        device = device_op(parsed)
+        sequence = runtime_sequence(device)
         sequences[name] = sequence
         if host[name] == name:
             device.sym_name = ir.StringAttr.get(name)
@@ -165,7 +167,8 @@ def _view(buf: Any, arg: Arg, ty: Any, memref: Any) -> Any:
     shape = [target.shape[j] for j in range(target.rank)]
     nbytes = math.prod(shape) * _elem_bytes(target.element_type)
     # (<=: operators that read different sizes of one buffer, e.g. a norm writes 2048 bf16 of what another reads 8192)
-    assert nbytes <= arg.nbytes, f"an argument of {nbytes} bytes in a buffer of {arg.nbytes}"
+    if nbytes > arg.nbytes:
+        raise ValueError(f"an argument of {nbytes} bytes in a buffer of {arg.nbytes}")
     strides = [math.prod(shape[j + 1:]) for j in range(len(shape))]
     sv = memref.subview(buf, [arg.offset // _ELEM], [arg.nbytes // _ELEM], [1])
     return memref.reinterpret_cast(result=ir.MemRefType.get(shape, target.element_type), source=sv, offsets=[],

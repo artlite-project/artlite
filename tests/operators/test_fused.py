@@ -219,7 +219,7 @@ def test_library_program_packets(monkeypatch):
     x = torch.randn(2 * n).bfloat16()
     outs = []
     for packets in (False, True):
-        monkeypatch.setattr(ctrlpkt, "ENABLED", packets)
+        monkeypatch.setenv("ARTLITE_PM_PACKETS", "1" if packets else "0")
         monkeypatch.setattr(ctrlpkt, "worth", lambda loader: True)
         lib = Library("t_library", [shift, add]).compile()
         lib.load()
@@ -251,7 +251,7 @@ def test_library_data_packets(monkeypatch):
     x = torch.randn(n).bfloat16()
     outs = []
     for packets in (False, True):
-        monkeypatch.setattr(ctrlpkt, "ENABLED", packets)
+        monkeypatch.setenv("ARTLITE_PM_PACKETS", "1" if packets else "0")
         monkeypatch.setattr(ctrlpkt, "worth", lambda loader: True)
         lib = Library("t_library_dm", [silu, add]).compile()
         lib.load()
@@ -395,7 +395,7 @@ def test_library_without_reset(monkeypatch):
     outs = []
     for reuse in (False, True):
         asm.reuse = reuse
-        lib._pieces.clear()
+        lib._cache.clear()
         fused_library._PIECES.held = [None, None]
         parity = asm.parity
         asm.assemble(items)  # (on the host only)
@@ -471,7 +471,7 @@ def test_control_packets_encoding(tmp_path):
     import os
     import subprocess
 
-    from artlite.operators.base import AIECC
+    from artlite.operators import toolchain
     from artlite.operators.fused import ctrlpkt
 
     rng = np.random.default_rng(1)
@@ -485,7 +485,7 @@ def test_control_packets_encoding(tmp_path):
                     f"#aie.packet_info<pkt_type = 0, pkt_id = {ctrlpkt.ROW_ID[4]}>}}\n    aie.runtime_sequence() {{\n"
                     f"{ops}\n    }}\n  }}\n}}\n")
     out = tmp_path / "pk.bin"
-    subprocess.run([os.path.join(os.path.dirname(AIECC), "aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
+    subprocess.run([os.path.join(os.path.dirname(toolchain.aiecc()), "aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
     want = np.fromfile(out, np.uint32)
     assert np.array_equal(ctrlpkt.packets(ctrlpkt.ROW_ID[4], writes), want)
 
@@ -509,7 +509,7 @@ class TestFusedLifecycle:
     def test_reads_before_writes(self):
         assert _add_chain("t_rbw")._reads_before_writes() == ["w"]
         assert _add_chain("t_rbw_u", uninitialized=["w"])._reads_before_writes() == []
-        with pytest.raises(AssertionError, match="nope"):
+        with pytest.raises(ValueError, match="nope"):
             _add_chain("t_rbw_x", uninitialized=["nope"])
 
     def test_patch_external(self):
@@ -736,7 +736,7 @@ def test_without_sequences():
 def test_skip_known_bds():
     """A memory tile's BD written again with the values it holds is left out (its words, operation count and the BD
     address words after it moved); a BD with an iteration (word 6: the DMA advances its current step) never is."""
-    from artlite.operators.fused.program import Run
+    from artlite.operators.fused.bdelide import Run
     reg = (3 << 25) | (1 << 20) | 0xA0040  # (column 3's memory tile, BD 2)
 
     def run(word6: int) -> Run:  # (a blockwrite of the BD's 8 words, a masked write of its address field, a push)

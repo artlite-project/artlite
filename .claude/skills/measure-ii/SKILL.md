@@ -117,7 +117,7 @@ def measure(
 ```
 
 - `clang_cmd`: optional full `clang++` argument list; defaults to
-  `artlite.operators.base.CLANG_CMD_COMMON` + `AIE_TARGET`. Must match the
+  `artlite.operators.toolchain.clang_cmd_common()` + `AIE_TARGET`. Must match the
   operator's flags (e.g. defines like `-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16`)
   or the numbers describe different code than what runs.
 - `trip_count`: fallback for loops whose trip count cannot be recovered.

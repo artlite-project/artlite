@@ -10,12 +10,12 @@ _demangle_cache: dict[str, str] = {}
 
 def _demangle_tool() -> str | None:
     try:
-        from artlite.operators.base import CLANGPP
+        from artlite.operators.toolchain import ToolchainError, clangpp
 
-        llvm_cxxfilt = Path(CLANGPP).with_name("llvm-cxxfilt")
+        llvm_cxxfilt = Path(clangpp()).with_name("llvm-cxxfilt")
         if llvm_cxxfilt.exists():
             return str(llvm_cxxfilt)
-    except (ImportError, AttributeError, SystemExit):
+    except (ImportError, ToolchainError):
         pass
     return shutil.which("llvm-cxxfilt") or shutil.which("c++filt")
 

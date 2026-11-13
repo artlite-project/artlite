@@ -39,6 +39,8 @@ from collections.abc import Mapping
 
 import numpy as np
 
+from .npu_regs import CORE_TILE, MEM_TILE
+
 DDR_AIE_ADDR_OFFSET = 0x80000000  # device address of a host buffer = its paddr + this
 
 # opcodes
@@ -63,11 +65,12 @@ SHIM_BDS = 16
 QUEUE_DEPTH = 4  # tasks a channel queues
 CONTROLLER_ID = 15  # the firmware's task-complete-token controller (as aiecc sets it)
 
-# memory tile (row 1)
-MEM_BD0, MEM_S2MM_CTRL, MEM_MM2S_CTRL, MEM_LOCK0 = 0xA0000, 0xA0600, 0xA0630, 0xC0000
+# memory tile (row 1; its registers: ``npu_regs.MEM_TILE``)
+MEM_BD0, MEM_S2MM_CTRL, MEM_MM2S_CTRL, MEM_LOCK0 = (MEM_TILE.bds[0], MEM_TILE.dma[0], MEM_TILE.mm2s_ctrl,
+                                                    MEM_TILE.locks[0])
 MEM_WEST, MEM_OWN, MEM_EAST = 0, 0x20000, 0x40000  # word-address bases of the three memories a BD can reach
 MEM_BDS, MEM_CONTROLLER_ID = 48, 26
-CORE_LOCK0 = 0x1F000  # a core tile's lock values (16 B apart)
+CORE_LOCK0 = CORE_TILE.locks[0]  # a core tile's lock values (16 B apart)
 
 # shim BD words 3 .. 7 that no dimension, iteration or lock changes (words 0 .. 2: length, address, packet header)
 BD_BURST_512B = 3 << 30  # word 4: AXI burst length 32 beats
@@ -89,6 +92,11 @@ class HardwareLimitError(ValueError):
 def tile_address(col: int, row: int, reg: int) -> int:
     """Absolute address of a tile register (NPU2: column << 25 | row << 20 | offset)."""
     return (col << 25) | (row << 20) | reg
+
+
+def address_row(addr: int) -> int:
+    """The tile row of an absolute address (``tile_address``)."""
+    return (addr >> 20) & 0x1F
 
 
 class Txn:

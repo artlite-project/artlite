@@ -126,6 +126,6 @@ def parse_stderr(stderr: str) -> dict[str, Any]:
 def resolve_clang_cmd(clang_cmd: list[str] | None) -> list[str]:
     if clang_cmd is not None:
         return list(clang_cmd)
-    from artlite.operators.base import AIE_TARGET, CLANG_CMD_COMMON
+    from artlite.operators import toolchain
 
-    return [*CLANG_CMD_COMMON, f"--target={AIE_TARGET}"]
+    return [*toolchain.clang_cmd_common(), f"--target={toolchain.AIE_TARGET}"]

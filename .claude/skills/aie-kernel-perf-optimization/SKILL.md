@@ -268,7 +268,7 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   unrolls a constant-trip worker loop to drop the rotation of the FIFO objects' pointers (the Qwen decode GDN core's
   32 panels: +800 B): `range32(n, unroll=False)` keeps it rolled. A global cap on unrolling instead cost the Gemma
   prefill 22% (other cores' unrolled loops are hot). The cores' llc
-  runs with `--enable-aie-zol-without-minitercount=false` (`operators/base.py` `CORE_LLC_FLAGS`, aiecc `-Xllc`): loops
+  runs with `--enable-aie-zol-without-minitercount=false` (`operators/toolchain.py` `CORE_LLC_FLAGS`, aiecc `-Xllc`): loops
   without a known minimum trip count (FIFO skip loops) would become zero-overhead loops padded with NOP bundles (~180 B
   each). aiecc's `-Xopt=<arg>` reaches the cores' opt (`-opt-bisect-limit=<n>`, `-opt-disable=<passes>`: which pass
   grows a core).

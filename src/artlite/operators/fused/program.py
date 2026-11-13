@@ -13,7 +13,7 @@ configuration only where the previous item is of another design:
   push (``Run.guarded``);
 - memory-tile BDs the registers already hold since the last configuration left out (``Run.emit``);
 - the configurations without the writes their PDI load's array reset makes redundant, a tile's stream switch ports
-  as blockwrites (``_prune``: 57% fewer configuration operations in a Llama prefill chunk, -6% time at 1K tokens);
+  as blockwrites (``prune``: 57% fewer configuration operations in a Llama prefill chunk, -6% time at 1K tokens);
 - the cores' program and data memory by control packets where they cost less than blockwrites (``ctrlpkt``: a Llama
   1B chunk of 128 tokens 43 -> 35 ms), from a packet buffer the library allocates (``Assembler.place``);
 - a configuration after another of the same piece without the array reset (``Quiet``: the PDI loaded last again, which
@@ -28,7 +28,6 @@ configuration only where the previous item is of another design:
 
 from __future__ import annotations
 
-import functools
 import itertools
 import os
 from collections.abc import Collection, Sequence
@@ -38,8 +37,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ... import txn
-from . import ctrlpkt
+from ...npu_regs import CORE_CONTROL_RESET, CORE_TILE, MEM_TILE, tile_map
+from . import ctrlpkt, quiet
+from .bdelide import Run
 from .elf import ShimBd
+from .prune import prune
 
 if TYPE_CHECKING:
     from .locks import Census
@@ -47,140 +49,16 @@ if TYPE_CHECKING:
 # Bytes of a program's piece (a dispatch: ``Library.run``) at most: the process's two piece BOs share its device heap
 # with the PDIs (smaller on a heap that cannot grow: ``library.Pieces``)
 PIECE_BYTES = 24 << 20
-REUSE = os.environ.get("ARTLITE_PDI_RESET", "0") != "1"  # (configurations without the array reset: ``Quiet``)
+
+
+def quiet_enabled() -> bool:
+    """Whether a configuration may go without the array reset (``Quiet``): not with ``ARTLITE_PDI_RESET=1``; read at
+    each use. It also needs the control packets (``ctrlpkt.enabled``): the quiet configuration is built on them."""
+    return os.environ.get("ARTLITE_PDI_RESET", "0") != "1" and ctrlpkt.enabled()
+
 
 Item = tuple[int, Sequence[int]]  # (entry, the device addresses of its arguments)
 Slot = tuple[int, int, int, int]  # (scratch start, end, entry, argument): where the ELF placed an entry's argument
-
-_CORE_CONTROL = 0x32000  # a core's control register (enable: bit 0)
-_CORE_CONTROL_RESET = 0x2  # (its value after a reset: Reset set, Enable clear; AM025)
-_CORE_DMA_CTRL = (0x1DE00, 0x1DE08, 0x1DE10, 0x1DE18)  # a core's DMA channel controls (Reset: bit 1)
-_START_QUEUES = {0: (*txn.QUEUE[txn.S2MM], *txn.QUEUE[txn.MM2S]), 1: tuple(0xA0604 + 8 * c for c in range(12)),
-                 2: (0x1DE04, 0x1DE0C, 0x1DE14, 0x1DE1C)}  # (shim, memory tile, core: DMA start queues)
-_CORE_LOCKS, _MEM_LOCKS = (0x1F000, 0x1F100), (0xC0000, 0xC0400)  # lock values (one per 16 B; 0 after a reset)
-# (stream switch port configurations, master and slave ranges of the shim, memory and core tiles: contiguous, 0 after
-# a reset)
-_SWITCH_PORTS = ctrlpkt.SWITCH_PORTS
-_MEM_TILE_BDS = (0xA0000, 0xA0600)  # a memory tile's BD registers (48 BDs of 8 words)
-# (word 6: Iteration_Current 28:23, which the DMA advances each time it loads the BD, Iteration_Wrap 22:17,
-# Iteration_Stepsize 16:0: a BD with an iteration does not keep its written value, AM029 DMA_BD0_6)
-_ITER_WORD, _ITER_MASK = 6, (1 << 23) - 1
-_QUEUE_STATUS = {q: s for d in txn.QUEUE for q, s in zip(txn.QUEUE[d], txn.QUEUE_STATUS[d])}
-_QUEUE_FULL = txn.QUEUE_DEPTH << 20  # (Task_Queue_Size, bits 22:20)
-
-
-def _row(reg: int) -> int:
-    return (reg >> 20) & 0x1F
-
-
-@dataclass(eq=False)
-class Run:
-    """A RunOp's control code: its words, its operation count, and the word of each data BD's address (bits 31:2;
-    the next word's low half: bits 47:32)."""
-
-    words: np.ndarray
-    n_ops: int
-    bd_words: np.ndarray
-
-    @functools.cached_property
-    def ops(self) -> list[tuple[int, int]]:
-        return txn.op_offsets(self.words)
-
-    @functools.cached_property
-    def guarded(self) -> Run:
-        """This RunOp as it runs again right after its own design: a poll for a free slot in the channel's task queue
-        before each shim task push (the previous run's unawaited tasks may still be queued, and a push onto a full
-        queue is dropped; aiecc inserts these polls where its queue model cannot rule that out)."""
-        parts, cuts, last = [], [], 0
-        for p, op in self.ops:
-            reg = int(self.words[p + 2]) if op == txn.OP_WRITE else 0
-            if op != txn.OP_WRITE or _row(reg) != 0 or (status := _QUEUE_STATUS.get(reg & 0xFFFFF)) is None:
-                continue
-            parts += [self.words[last:p],
-                      np.array([txn.OP_MASKPOLL, 0, (reg & ~0xFFFFF) | status, 0, 0, _QUEUE_FULL, 28], np.uint32)]
-            cuts.append(p)
-            last = p
-        parts.append(self.words[last:])
-        shift = 7 * np.searchsorted(np.asarray(cuts, np.int64), self.bd_words, side="right")
-        return Run(np.concatenate(parts), self.n_ops + len(cuts), self.bd_words + shift)
-
-    @functools.cached_property
-    def _bd_units(self) -> _BdUnits:
-        return _bd_units(self.words, self.ops)
-
-    def emit(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-        """(words, BD address words, operation count) of this RunOp without its memory-tile BD writes whose registers
-        already hold their values. ``state``: per column and BD register word, the value since the last configuration
-        (-1: unknown); updated."""
-        units = self._bd_units
-        if not len(units.start):
-            return self.words, self.bd_words, self.n_ops
-        held = (state[units.col, units.reg] == units.val) & (units.val >= 0)
-        state[units.col[units.last], units.reg[units.last]] = units.val[units.last]
-        if units.dup:
-            return self.words, self.bd_words, self.n_ops
-        drop = np.minimum.reduceat(held, units.first).astype(bool)
-        if not drop.any():
-            return self.words, self.bd_words, self.n_ops
-        keep = np.ones(len(self.words), bool)
-        for s, e in zip(units.start[drop], units.end[drop]):
-            keep[s:e] = False
-        shift = np.cumsum(~keep)
-        return self.words[keep], self.bd_words - shift[self.bd_words], self.n_ops - int(units.nops[drop].sum())
-
-
-@dataclass(eq=False)
-class _BdUnits:
-    """A run's memory-tile BD writes (each BD: its blockwrite and the masked writes of its fields right after it): per
-    unit its word range and operation count; their registers (column, word index in the BD block) and the values the
-    unit leaves (-1: a BD with an iteration, whose word 6 the DMA advances: never left out, unknown after); ``dup``: a
-    register written by two units (the run is then kept whole)."""
-
-    start: np.ndarray
-    end: np.ndarray
-    nops: np.ndarray
-    first: np.ndarray  # (each unit's first entry in col / reg / val)
-    col: np.ndarray
-    reg: np.ndarray
-    val: np.ndarray
-    dup: bool
-    last: np.ndarray  # (per register written, its last entry: the value the run leaves)
-
-
-def _bd_units(run: np.ndarray, ops: list[tuple[int, int]]) -> _BdUnits:
-    ends = [p for p, _ in ops[1:]] + [len(run)]
-    start, end, nops, first, col, reg, val = [], [], [], [], [], [], []
-    k = 0
-    while k < len(ops):
-        p, op = ops[k]
-        addr = int(run[p + 2]) if op == txn.OP_BLOCKWRITE else 0
-        if op != txn.OP_BLOCKWRITE or _row(addr) != 1 or not _MEM_TILE_BDS[0] <= addr & 0xFFFFF < _MEM_TILE_BDS[1]:
-            k += 1
-            continue
-        n = ends[k] - p - 4
-        vals = {addr + 4 * i: int(v) for i, v in enumerate(run[p + 4:ends[k]])}
-        j = k + 1  # (the writes into the BD right after its blockwrite)
-        while (j < len(ops) and ops[j][1] in (txn.OP_WRITE, txn.OP_MASKWRITE)
-               and addr <= int(run[ops[j][0] + 2]) < addr + 4 * n):
-            q = ops[j][0]
-            r, v = int(run[q + 2]), int(run[q + 4])
-            m = int(run[q + 5]) if ops[j][1] == txn.OP_MASKWRITE else 0xFFFFFFFF
-            vals[r] = (vals[r] & ~m & 0xFFFFFFFF) | (v & m)
-            j += 1
-        start.append(p)
-        end.append(ends[j - 1])
-        nops.append(j - k)
-        first.append(len(col))
-        iterated = vals.get(addr + 4 * _ITER_WORD, 0) & _ITER_MASK
-        for r, v in vals.items():
-            col.append(r >> 25)
-            reg.append(((r & 0xFFFFF) - _MEM_TILE_BDS[0]) // 4)
-            val.append(-1 if iterated else v)
-        k = j
-    keys = list(zip(col, reg))
-    last = sorted({key: i for i, key in enumerate(keys)}.values())
-    a = functools.partial(np.array, dtype=np.int64)
-    return _BdUnits(a(start), a(end), a(nops), a(first), a(col), a(reg), a(val), len(set(keys)) != len(keys), a(last))
 
 
 @dataclass(eq=False)
@@ -198,194 +76,8 @@ class Block:
     bd_rel: np.ndarray
     design: int
     packets: list[tuple[int, np.ndarray]] = field(default_factory=list)
-    ports: dict[int, dict[int, int]] = field(default_factory=dict)  # (``_ports`` of its configuration)
-    quiet: Quiet | None = None
-
-
-@dataclass(eq=False)
-class Quiet:
-    """An entry's configuration on the array its predecessor left running, without the array reset (words 0 .. 3: a
-    PDI load, the one loaded last when assembled: ``ctrlpkt.Loader(reused=True)``), its operation count and packets
-    (``Block.packets``'s form), and what ``Assembler._quiet`` checks: its tiles with packets and cores, its port
-    configurations (``_ports``), whether a channel it starts can send before any lock release (``_early``: the previous
-    design's routes would take the data), whether a memory tile DMA of it acquires a neighbour's lock (``_far``: that
-    acquire would stay pending after it), and per core tile the locks its DMA BDs take."""
-
-    config: np.ndarray
-    n_config: int
-    packets: list[tuple[int, np.ndarray]]
-    tiles: frozenset[tuple[int, int]]
-    cores: frozenset[tuple[int, int]]
-    ports: dict[int, dict[int, int]]
-    early: bool
-    far: bool
-    dma_locks: dict[tuple[int, int], set[int]]
-
-
-def _prune(cfg: np.ndarray, zero: Collection[int] = ()) -> tuple[np.ndarray, list[int]]:
-    """A configuration (after its PDI load: an array reset) with fewer operations (each costs the firmware ~0.1 us):
-    without the writes the reset makes redundant (lock values written the value they hold, 0 after the reset, before
-    the tile's DMA starts; the core DMA channels' reset pulses, set then cleared before the channel starts;
-    Core_Control writes that leave its value, 0x2 after the reset: in reset, disabled), and a tile's stream switch port
-    configurations before any DMA starts as one blockwrite per master and slave range (the ports it leaves out 0, their
-    reset value). ``zero``: port registers a loader set before (``ctrlpkt``), zeroed by those blockwrites; returns the
-    ones they do not cover."""
-    ops = txn.op_offsets(cfg)
-    ends = [p for p, _ in ops[1:]] + [len(cfg)]
-    drop: set[int] = set()
-    locks: dict[int, int] = {}
-    started: set[int] = set()  # (tiles whose DMA a start-queue write started)
-    pulse: dict[int, int] = {}  # (channel control register -> the op of its pending reset set)
-    control: dict[int, int] = {}
-    ports: dict[tuple[int, int], tuple[list[int], dict[int, int]]] = {}  # ((tile, range) -> (ops, {register: value}))
-    masked: set[int] = set()  # (tiles with a port mask-written: left as they are)
-    zeros: dict[tuple[int, int], set[int]] = {}
-    for reg in zero:
-        rng = next(r for r in _SWITCH_PORTS[min(_row(reg), 2)] if r[0] <= reg & 0xFFFFF < r[1])
-        zeros.setdefault((reg & ~0xFFFFF, rng[0]), set()).add(reg)
-    for k, (p, op) in enumerate(ops):
-        if op not in (txn.OP_WRITE, txn.OP_MASKWRITE):
-            continue
-        reg, v = int(cfg[p + 2]), int(cfg[p + 4])
-        tile, off, row = reg & ~0xFFFFF, reg & 0xFFFFF, _row(reg)
-        if op == txn.OP_WRITE:
-            if off in _START_QUEUES.get(min(row, 2), ()):
-                started.add(tile)
-            lock = (row >= 2 and _CORE_LOCKS[0] <= off < _CORE_LOCKS[1]) or (row == 1 and _MEM_LOCKS[0] <= off < _MEM_LOCKS[1])
-            if lock and off % 16 == 0 and tile not in started:
-                if locks.get(reg, 0) == v:
-                    drop.add(k)
-                locks[reg] = v
-            rng = next((r for r in _SWITCH_PORTS.get(min(row, 2), ()) if r[0] <= off < r[1]), None)
-            if rng is not None and not started:
-                ks, vals = ports.setdefault((tile, rng[0]), ([], {}))
-                ks.append(k)
-                vals[reg] = v
-            continue
-        m = int(cfg[p + 5])
-        if any(r[0] <= off < r[1] for r in _SWITCH_PORTS.get(min(row, 2), ())):
-            masked.add(tile)
-        if row >= 2 and off == _CORE_CONTROL:
-            old = control.get(reg, _CORE_CONTROL_RESET)
-            new = (old & ~m) | (v & m)
-            if new == old:
-                drop.add(k)
-            control[reg] = new
-        elif row >= 2 and off in _CORE_DMA_CTRL and m == 2 and tile not in started:
-            if v & 2:
-                pulse[reg] = k
-            elif reg in pulse:
-                drop |= {pulse.pop(reg), k}
-    merged = {}
-    for key, (ks, vals) in ports.items():
-        tile = key[0]
-        if tile in masked or (len(ks) < 2 and key not in zeros):
-            continue
-        vals = dict.fromkeys(zeros.pop(key, ()), 0) | vals
-        drop.update(ks[1:])
-        k, lo, hi = ks[0], min(vals), max(vals)
-        words = np.zeros((hi - lo) // 4 + 1, np.uint32)
-        for r, v in vals.items():
-            words[(r - lo) // 4] = v
-        merged[k] = np.concatenate([np.array([txn.OP_BLOCKWRITE, 0, lo, 4 * (4 + len(words))], np.uint32), words])
-    left = sorted(r for z in zeros.values() for r in z)
-    if not drop and not merged:
-        return cfg, left
-    keep = [merged[k] if k in merged else cfg[p:e] for k, ((p, _), e) in enumerate(zip(ops, ends)) if k not in drop]
-    return np.concatenate(keep), left
-
-
-def _ports(words: np.ndarray) -> dict[int, dict[int, int]]:
-    """The stream switch port configurations a transaction leaves: per tile (its base address) register -> value."""
-    out: dict[int, dict[int, int]] = {}
-    for p, op in txn.op_offsets(words):
-        if op not in (txn.OP_WRITE, txn.OP_BLOCKWRITE, txn.OP_MASKWRITE):
-            continue
-        reg = int(words[p + 2])
-        tile, off = reg & ~0xFFFFF, reg & 0xFFFFF
-        n = int(words[p + 3]) // 4 - 4 if op == txn.OP_BLOCKWRITE else 1
-        for i, v in enumerate(words[p + 4:p + 4 + n]):
-            if any(a <= off + 4 * i < b for a, b in _SWITCH_PORTS[min(_row(reg), 2)]):
-                regs = out.setdefault(tile, {})
-                if op == txn.OP_MASKWRITE:
-                    m = int(words[p + 5])
-                    v = (regs.get(off, 0) & ~m) | (int(v) & m)
-                regs[off + 4 * i] = int(v)
-    return out
-
-
-def _values(writes: list[tuple[int, np.ndarray]]) -> dict[int, int]:
-    """The register values a tile's moved writes (``ctrlpkt.split``'s) leave: tile-local address -> value (its BDs,
-    channels and locks: not memory)."""
-    out = {}
-    for addr, words in writes:
-        if addr >= 0x1D000:
-            out.update((addr + 4 * i, int(w)) for i, w in enumerate(words))
-    return out
-
-
-def _signed7(v: int) -> int:
-    return v - 128 if v & 0x40 else v
-
-
-def _early(values: dict[tuple[int, int], dict[int, int]]) -> bool:
-    """Whether an MM2S channel the configuration starts (memory and core tiles) can send before any lock release: its
-    first BD acquires no lock, or one whose initial value already grants it (or a neighbour memory tile's)."""
-    for (c, r), v in values.items():
-        if r == 1:
-            starts = [v[q] & 0x3F for q in (0xA0634 + 8 * k for k in range(6)) if q in v]
-            bds = [(v.get(0xA001C + 32 * bd, 0) >> 15 & 1, v.get(0xA001C + 32 * bd, 0)) for bd in starts]
-            locks = [(on, w & 0xFF, _signed7(w >> 8 & 0x7F)) for on, w in bds]
-            base, own = 0xC0000, range(64, 128)
-        else:
-            starts = [v[q] & 0xF for q in (0x1DE14, 0x1DE1C) if q in v]
-            bds = [(v.get(0x1D014 + 32 * bd, 0) >> 12 & 1, v.get(0x1D014 + 32 * bd, 0)) for bd in starts]
-            locks = [(on, (w & 0xF) + 64, _signed7(w >> 5 & 0x7F)) for on, w in bds]
-            base, own = 0x1F000, range(64, 80)
-        for on, lock, value in locks:
-            if not on or lock not in own:
-                return True
-            init = v.get(base + 16 * (lock - 64), 0)
-            if init >= -value if value <= 0 else init == value:
-                return True
-    return False
-
-
-def _far(values: dict[tuple[int, int], dict[int, int]], run: Run) -> bool:
-    """Whether a memory tile BD (of the configuration or its RunOp) acquires or releases a neighbour memory tile's lock
-    (ids 0-63 west, 128-191 east)."""
-    words = [w for (_, r), v in values.items() if r == 1
-             for a, w in v.items() if _MEM_TILE_BDS[0] <= a < _MEM_TILE_BDS[1] and a % 32 == 28]
-    for p, op in run.ops:
-        reg = int(run.words[p + 2]) if op in (txn.OP_WRITE, txn.OP_BLOCKWRITE) else 0
-        if _row(reg) == 1 and _MEM_TILE_BDS[0] <= reg & 0xFFFFF < _MEM_TILE_BDS[1]:
-            n = int(run.words[p + 3]) // 4 - 4 if op == txn.OP_BLOCKWRITE else 1
-            words += [int(w) for i, w in enumerate(run.words[p + 4:p + 4 + n]) if ((reg & 0xFFFFF) + 4 * i) % 32 == 28]
-    return any(w >> 31 and ((w >> 15 & 1 and not 64 <= w & 0xFF < 128)
-                            or (w >> 24 & 0x7F and not 64 <= w >> 16 & 0xFF < 128)) for w in words)
-
-
-def _dma_locks(values: dict[tuple[int, int], dict[int, int]]) -> dict[tuple[int, int], set[int]]:
-    """Per core tile, the locks its valid DMA BDs acquire or release."""
-    out = {}
-    for t, v in values.items():
-        if t[1] >= 2:
-            ws = [v.get(0x1D014 + 32 * bd, 0) for bd in range(16)]
-            out[t] = {k for w in ws if w >> 25 & 1
-                      for k, on in ((w & 0xF, w >> 12 & 1), (w >> 13 & 0xF, w >> 18 & 0x7F)) if on}
-    return out
-
-
-def _quiet(load: np.ndarray, without: np.ndarray, pm: ctrlpkt.Writes, run: Run) -> Quiet:
-    """An entry's ``Quiet`` (``without``, ``pm``: ``ctrlpkt.split`` of its configuration)."""
-    loader = ctrlpkt.Loader(pm, reused=True)
-    rest, left = _prune(without, loader.ports())
-    pre, _, at = loader.prelude(left + loader.slots(rest))
-    rest = np.concatenate([pre, rest])
-    values = {t: _values(w) for t, w in pm.items()}
-    return Quiet(np.concatenate([load, rest]), 1 + len(txn.op_offsets(rest)), [(4 + w, p) for w, p in at],
-                 frozenset(pm), frozenset(t for t in pm if t[1] >= 2), _ports(rest), _early(values),
-                 _far(values, run), _dma_locks(values))
+    ports: dict[int, dict[int, int]] = field(default_factory=dict)  # (``quiet.ports`` of its configuration)
+    quiet: quiet.Quiet | None = None
 
 
 def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
@@ -408,7 +100,7 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
     blocks: list[Block] = []
     for e, (a, b) in enumerate(itertools.pairwise(loads)):
         enables = [i for i in range(a, b) if ops[i][1] == txn.OP_MASKWRITE
-                   and code[starts[i] + 2] & 0xFFFFF == _CORE_CONTROL and code[starts[i] + 4] & 1]
+                   and code[starts[i] + 2] & 0xFFFFF == CORE_TILE.control[0] and code[starts[i] + 4] & 1]
         assert enables, f"block {e}: no core enables"
         r = enables[-1] + 1  # (the RunOp: after the configuration's core enables)
         lo, mid, hi = starts[a], starts[r], starts[b]
@@ -418,11 +110,11 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
         assert all(slots[i][2] == e for i in k) and (bd_start[sel] < [slots[i][1] for i in k]).all(), \
             f"block {e}: BD arguments"
         cfg, loader, pm = code[lo + 4:mid], None, None
-        if ctrlpkt.ENABLED:
+        if ctrlpkt.enabled():
             without, pm = ctrlpkt.split(cfg)
             if pm and ctrlpkt.worth(candidate := ctrlpkt.Loader(pm)):
                 cfg, loader = without, candidate
-        rest, left = _prune(cfg, loader.ports() if loader is not None else ())
+        rest, left = prune(cfg, loader.ports() if loader is not None else ())
         packets = []
         if loader is not None:
             pre, _, at = loader.prelude(left + loader.slots(rest))
@@ -433,7 +125,7 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
         blocks.append(Block(config, 1 + len(txn.op_offsets(rest)), run,
                             np.array([slots[i][3] for i in k], np.int64), bd_start[sel] - slot_starts[k],
                             designs.setdefault(b"".join([config[4:].tobytes(), *(p.tobytes() for _, p in packets)]), e),
-                            packets, _ports(rest), _quiet(code[lo:lo + 4], without, pm, run) if pm else None))
+                            packets, quiet.ports(rest), quiet.quiet(code[lo:lo + 4], without, pm, run) if pm else None))
     loadpdi = {tuple(int(v) for v in blk.config[:4]) for blk in blocks}
     assert len(loadpdi) == 2, f"configurations alternate between two PDI loads: {len(loadpdi)}"
     return code[:4].copy(), code[4:starts[loads[0]]].copy(), blocks, [np.array(v, np.uint32) for v in sorted(loadpdi)]
@@ -450,7 +142,7 @@ class Assembler:
         # the second, as aiecc starts)
         self.parity = 1
         self.item_ops: list[int] = []  # (the last ``assemble``'s operation count through the end of each of its items)
-        self.reuse = REUSE and census is not None  # (configurations without the array reset: ``Quiet``)
+        self.reuse = quiet_enabled() and census is not None  # (configurations without the array reset: ``Quiet``)
         # (per entry: its cores that acquire a neighbour's lock, and those (tile, lock))
         self._neighbours = {e: (frozenset(t for t, _, _ in v), frozenset((lt, k) for _, lt, k in v))
                             for e, v in (census or {}).items()}
@@ -489,7 +181,7 @@ class Assembler:
             stop = (qp.cores - qe.tiles) | set(crossers) | {t for t, _ in locks if t in qp.cores}
             t = txn.Txn()
             for c, r in sorted(stop):
-                t.write32(txn.tile_address(c, r, _CORE_CONTROL), _CORE_CONTROL_RESET)
+                t.write32(txn.tile_address(c, r, CORE_TILE.control[0]), CORE_CONTROL_RESET)
             for (c, r), k in sorted(locks):
                 for v in (ctrlpkt.LOCK_FLUSH, 0):
                     t.write32(txn.tile_address(c, r, ctrlpkt.LOCKS[2][0] + 16 * k), v)
@@ -513,7 +205,7 @@ class Assembler:
             old = ports.get(tile)
             if not old:
                 continue
-            (m0, m1), (s0, _) = _SWITCH_PORTS[min(_row(tile), 2)]
+            (m0, m1), (s0, _) = tile_map(txn.address_row(tile)).ports
             for reg, v in old.items():
                 if m0 <= reg < m1 and v >> 31 and reg not in regs and \
                         (v >> 30 & 1 or regs.get(s0 + 4 * (v & 0x7F), old.get(s0 + 4 * (v & 0x7F), 0)) >> 31):
@@ -524,7 +216,7 @@ class Assembler:
         """A control program (a TXN) of the items; advances ``parity``; ``item_ops`` holds where each item ends."""
         parts, n_ops, prev = [self.header, self.preamble], len(self.preamble) // 4, None  # (CREATE_SCRATCHPAD: 4 words)
         self.item_ops = ends = []
-        state = np.full((64, (_MEM_TILE_BDS[1] - _MEM_TILE_BDS[0]) // 4), -1, np.int64)  # (per column: the BDs held)
+        state = np.full((64, (MEM_TILE.bds[1] - MEM_TILE.bds[0]) // 4), -1, np.int64)  # (per column: the BDs held)
         ports: dict[int, dict[int, int]] = {}  # (the port configurations since the last array reset, per tile)
         for e, addrs in items:
             blk = self.blocks[e]

@@ -48,7 +48,7 @@ from artlite.model_config import (
     swift_gguf,
 )
 from artlite.moe import route as moe_route
-from artlite.operators import paging
+from artlite.operators import cdo
 
 BASE = 1 << 40  # the first buffer's device address (then STRIDE apart: every buffer fits, addresses stay < 2^48)
 STRIDE = 1 << 38
@@ -137,7 +137,7 @@ def fake_npu() -> Iterator[Callable[[object], _Log]]:
             mock.patch.object(_native, "turn_leave", lambda: None), \
             mock.patch.object(_native, "turn_foreign", lambda: 0), \
             mock.patch.object(TileImage, "pack", lambda self, out, **kw: False), \
-            mock.patch.object(paging, "cdo_values", lambda work_dir: {}), \
+            mock.patch.object(cdo, "values", lambda work_dir: {}), \
             mock.patch.object(moe_route, "check_route", lambda values, cols: None):  # (the compiled design's)
         dev, log = _Device(), _Log()
 

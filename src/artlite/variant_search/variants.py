@@ -38,7 +38,7 @@ def render_variant(
     """Render the operator (or the render function) with the variant's parameters and apply its patches. The patches
     see the rendered source's names (``{{ p }}_<name>``: ``kernel_source.MARK`` ...) and may also write them as the
     compiled file has them."""
-    from ..operators.base import AIE_TARGET, CLANG_CMD_COMMON
+    from ..operators import toolchain
     from ..operators.kernel_source import KernelSource
 
     made = factory(**{**kwargs, **variant.params})
@@ -61,4 +61,4 @@ def render_variant(
         lines = pragma_lines(unit, functions, loops=variant.loops) if variant.pragma is not None else []
     except ValueError as exc:
         raise ValueError(f"variant {variant.name}: {exc}") from None
-    return _Rendered(unit, source, [*CLANG_CMD_COMMON, f"--target={AIE_TARGET}", *flags], lines)
+    return _Rendered(unit, source, [*toolchain.clang_cmd_common(), f"--target={toolchain.AIE_TARGET}", *flags], lines)

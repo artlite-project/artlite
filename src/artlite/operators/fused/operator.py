@@ -43,12 +43,14 @@ class FusedOperator(FusedElf):
         self.input_args, self.output_args = list(input_args), list(output_args)
         self.buffer_sizes = dict(buffer_sizes or {})
         self.external_buffers = dict(external_buffers or {})
-        assert all(n in self.buffer_sizes for n in self.external_buffers), "external buffers need sizes"
+        if missing := [n for n in self.external_buffers if n not in self.buffer_sizes]:
+            raise ValueError(f"{name}: external buffers need sizes: {missing}")
         super().__init__(name=name, runlist=runlist, inputs=input_args, outputs=output_args, sizes=self.buffer_sizes,
                          external=self.external_buffers, expand_load_pdis=expand_load_pdis)
         self.uninitialized = set(uninitialized or ())
         unknown = self.uninitialized - {parse_name(n)[0] for _, *names in self.runlist for n in names}
-        assert not unknown, f"uninitialized buffers not in the runlist: {sorted(unknown)}"
+        if unknown:
+            raise ValueError(f"{name}: uninitialized buffers not in the runlist: {sorted(unknown)}")
         self._host_written: set[str] = set()
         self._checked = False  # (the host writes, at the first dispatch)
         self._views: dict[str, np.ndarray] = {}
@@ -93,7 +95,8 @@ class FusedOperator(FusedElf):
         self._ext = []  # (scratch start, end, BO, byte offset in the BO)
         for name, (bo, offset) in self.external_buffers.items():
             s = self.layout.spans[name]
-            assert s.space == "scratch", f"external buffer {name} must be a scratch buffer"
+            if s.space != "scratch":
+                raise ValueError(f"{self.name}: external buffer {name} must be a scratch buffer")
             if offset + s.nbytes > bo.size:  # (the NPU would read and write past the BO)
                 raise ValueError(f"{self.name}: external buffer {name} of {s.nbytes} bytes at {offset} in a BO of {bo.size}")
             self._ext.append((s.offset, s.offset + s.nbytes, bo, offset))

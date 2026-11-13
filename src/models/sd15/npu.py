@@ -81,9 +81,9 @@ class NpuVae:
 
 # (what the cache's key covers besides the model's files: the code that builds the images and the transactions)
 _SOURCES = ("artlite/vision", "models/sd15/unet.py", "models/sd15/level64.py", "models/sd15/model.py",
-            "models/sd15/vae.py", "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
-            "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/overlay.py",
-            "models/sd15/npu.py", "models/sd15/weights.py")
+            "models/sd15/vae.py", "artlite/txn.py", "artlite/npu_regs.py", "artlite/operators/bfp16.py",
+            "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
+            "artlite/overlay.py", "models/sd15/npu.py", "models/sd15/weights.py")
 
 
 def vae_weights(directory: str) -> tuple[dict, float]:

@@ -90,7 +90,7 @@ from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
-from artlite.operators import paging
+from artlite.operators import cdo
 from artlite.operators.bfp16 import block_values
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
@@ -384,7 +384,7 @@ class QwenOverlay(ModelOverlay):
     def _load(self) -> None:
         """The norm weights (NORM), the attention layers' F_ATT objects; (MoE) the control route's registers free."""
         if self.moe:
-            MR.check_route(paging.cdo_values(os.path.dirname(self.op._program.insts_path)), range(COLS))
+            MR.check_route(cdo.values(os.path.dirname(self.op._program.insts_path)), range(COLS))
         norm = self.dev.view("NORM")
         for (L, name), off in self.norm_off.items():
             w = self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight").astype(bfloat16)

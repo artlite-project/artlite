@@ -1,24 +1,20 @@
+"""The operator base class and its argument specs: an operator renders its kernel source and its array design
+(``build_spec``); ``build`` builds them."""
+
 from __future__ import annotations
 
-import glob
-import hashlib
+import math
 import os
-import shutil
-import subprocess
 import sys
-import sysconfig
-import tempfile
-from collections.abc import Callable
-from dataclasses import dataclass
 from enum import StrEnum
-from importlib.metadata import version
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, NamedTuple, Self
 
 import numpy as np
 
-from .. import backend, portable, profiling
+from .. import profiling
+from .build import BuildKind, BuildSpec, profile_key
 from .kernel_source import KernelSource, translation_unit
+from .toolchain import PACKAGE_DIR
 
 if TYPE_CHECKING:
     from aie.ir import Module
@@ -26,197 +22,6 @@ if TYPE_CHECKING:
 
     from .. import Device, Program
     from .._native import Buffer
-
-# Toolchain paths
-
-PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (the artlite package)
-INCLUDE_DIR = os.path.join(PACKAGE_DIR, "include")  # the kernels' headers
-OPERATORS_H = os.path.join(INCLUDE_DIR, "operators.h")
-
-CACHE_DIR = os.environ.get(
-    "ARTLITE_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "artlite"),
-)
-
-PEANO_DIR = find_spec("llvm-aie").submodule_search_locations[0]
-MLIR_AIE_DIR = find_spec("mlir_aie").submodule_search_locations[0]
-MLIR_AIE_INCLUDE = os.path.join(MLIR_AIE_DIR, "include")
-
-
-def peano_tool(name: str) -> str:
-    """A Peano binary's path."""
-    return os.path.join(PEANO_DIR, "bin", name + portable.EXE)
-
-
-CLANGPP = peano_tool("clang++")
-# PATH, then the interpreter's scripts directory: an unactivated venv (an IDE's test discovery) runs its python without it
-AIECC = shutil.which("aiecc") or shutil.which("aiecc", path=sysconfig.get_path("scripts"))
-if not AIECC:
-    sys.exit("ERROR: aiecc not found in PATH. Please check your installation.")
-
-AIE_RUNTIME_LIB_INCLUDE = os.path.join(MLIR_AIE_DIR, "aie_runtime_lib", "AIE2P")
-
-CLANG_CMD_COMMON = [
-    CLANGPP,
-    "-O2",
-    "-std=c++20",
-    "-Wno-unknown-attributes",
-    "-Wno-macro-redefined",
-    "-Wno-empty-body",
-    "-Wno-deprecated-declarations",
-    "-D__AIE_API_AIE_ADF_HPP__",
-    "-DNDEBUG",
-    "-I" + INCLUDE_DIR,
-    f"-I{MLIR_AIE_INCLUDE}",
-    f"-I{AIE_RUNTIME_LIB_INCLUDE}",
-]
-
-# AIE target triple for Peano cross-compiler: aie2p = AIE-ML v2 (NPU2: Strix Point, Strix Halo, Krackan)
-AIE_TARGET = "aie2p-none-unknown-elf"
-
-# llc flags for the cores' own code (the worker loops aiecc generates from a design; the kernels are clang++'s): a loop
-# without a known minimum trip count (an object fifo's skip loop: acquire, release) as a branch loop, not a zero-overhead
-# loop padded with full NOP bundles (~32 instead of ~180 B each: the Gemma decode overlay's attention cores' loop 1840 ->
-# 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
-CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false",)
-
-
-def _tool_env() -> dict[str, str] | None:
-    """The environment of the build tools (None: this process's). aiecc packs a full ELF with aiebu-asm, which mlir-aie's
-    Windows wheels lack: XRT's joins PATH."""
-    if not portable.WINDOWS or shutil.which("aiebu-asm") or not (tool := backend.xrt_tool("aiebu-asm")):
-        return None
-    return {**os.environ, "PATH": os.path.dirname(tool) + os.pathsep + os.environ.get("PATH", "")}
-
-
-
-
-# Internal helpers
-
-
-def _run(cmd: list[str], cwd: str | None = None, capture: bool = True) -> subprocess.CompletedProcess:
-    if os.environ.get("ARTLITE_LOG_COMMANDS", "0") == "1":
-        print(f"  $ {' '.join(cmd)}", file=sys.stderr)
-    r = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=capture, check=False, env=_tool_env())
-    if r.returncode != 0:
-        stderr = r.stderr if capture else ""
-        raise RuntimeError(
-            f"Command failed (rc={r.returncode}): {' '.join(cmd)}\n{stderr}"
-        )
-    return r
-
-
-def _run_aiecc(cmd: list[str], *, cwd: str, link_files: Callable[[], None]) -> None:
-    """Run aiecc while ``link_files`` builds what its cores link (kernel.o, then its checks): with --await-link-files
-    aiecc lowers the design meanwhile and reads no linked file until a line arrives on its stdin (the Llama prefill
-    library builds in 26 s, 37 s with kernel.o built first). Its output goes to a file: a pipe nobody reads
-    meanwhile would stall it."""
-    cmd = [*cmd, "--await-link-files"]
-    if os.environ.get("ARTLITE_LOG_COMMANDS", "0") == "1":
-        print(f"  $ {' '.join(cmd)}", file=sys.stderr)
-    with tempfile.TemporaryFile("w+") as log:
-        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True, env=_tool_env())
-        try:
-            link_files()
-        except BaseException:
-            proc.kill()
-            proc.wait()
-            raise
-        proc.communicate("\n")
-        if proc.returncode != 0:
-            log.seek(0)
-            raise RuntimeError(f"Command failed (rc={proc.returncode}): {' '.join(cmd)}\n{log.read()}")
-
-
-def _cache_key(*args: object) -> str:
-    return hashlib.sha256(repr(args).encode()).hexdigest()[:16]
-
-
-def profile_key(cfg: profiling.ProfileConfig | None) -> tuple | None:
-    """What a profiling configuration changes in a design (``BuildSpec.profile_key``: part of the cache key)."""
-    return None if cfg is None else cfg.cache_key()
-
-
-def buildable(spec: BuildSpec) -> bool:
-    """Whether this process builds ``spec`` as rendered: the build takes the profiling configuration (counters, trace
-    lowering, intermediates) from its process, so a spec of another one (a planning subprocess's) only where they
-    agree."""
-    return spec.kind != "rtc" or spec.profile_key == profile_key(profiling.get_config())
-
-
-def _compile_pch(*, clang_cmd: list[str]) -> str:
-    operators_pch_dir = os.path.join(CACHE_DIR, "operators")
-    os.makedirs(operators_pch_dir, exist_ok=True)
-
-    # -mllvm codegen args are rejected by the c++-header action; they don't
-    # affect the PCH contents, so drop them (only) from the PCH compile.
-    # Note: multiple -aie-* options may follow a single -mllvm, so strip
-    # every -aie-* token, not just the one directly after -mllvm.
-    pch_cmd: list[str] = []
-    for arg in clang_cmd:
-        if arg == "-mllvm" or arg.startswith("-aie-"):
-            continue
-        pch_cmd.append(arg)
-
-    aiecc_mtime = os.path.getmtime(AIECC)
-    clangpp_mtime = os.path.getmtime(CLANGPP)
-    # operators.h and the headers it includes (kernel_lib.h): contents and modification times
-    headers = sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h")))
-    header_keys = []
-    for path in headers:
-        with open(path, "rb") as f:
-            header_keys += [os.path.basename(path), f.read(), os.path.getmtime(path)]
-    pch_hash = _cache_key(
-        *clang_cmd,
-        *header_keys,
-        version("mlir_aie"),
-        version("llvm_aie"),
-        aiecc_mtime,
-        clangpp_mtime,
-    )
-    operators_pch_path = os.path.join(operators_pch_dir, f"{pch_hash}.pch")
-    # Lock around the exists-check AND the write: a fast-path read of a
-    # partially-written .pch from a parallel process crashes clang.
-    with portable.file_lock(operators_pch_path + ".lock"):
-        if not os.path.exists(operators_pch_path):
-            _run([*pch_cmd, "-x", "c++-header", OPERATORS_H, "-o", operators_pch_path])
-
-    return operators_pch_path
-
-
-def _compile_kernel(
-    *,
-    operators_pch_path: str,
-    work_dir: str,
-    source_code: str,
-    clang_cmd: list[str],
-    ignore_cache: bool = False,
-    measure: bool = True,
-) -> None:
-    """Compile kernel source to kernel.o in *work_dir* (``measure``: the ARTLITE_MEASURE_II report)."""
-
-    src_path = os.path.join(work_dir, "kernel.cc")
-
-    with open(src_path, "w") as f:
-        f.write(source_code)
-
-    if measure and os.environ.get("ARTLITE_MEASURE_II", "0") == "1":
-        from artlite import measure_ii
-
-        measure_ii.measure(src_path, clang_cmd=clang_cmd, verbose=True)
-
-    obj_path = os.path.join(work_dir, "kernel.o")
-    if not ignore_cache and os.path.exists(obj_path):
-        return
-
-    # -fstack-usage: kernel.su (per-function frames) for the stack check (checks.py)
-    _run(
-        [*clang_cmd, "-fstack-usage", "-include-pch", operators_pch_path, "-c", src_path, "-o", obj_path]
-    )
-
-    if os.environ.get("ARTLITE_GENERATE_ASM", "0") == "1":
-        asm_path = f"{src_path}.s"
-        _run([*clang_cmd, "-S", src_path, "-o", asm_path])
 
 
 class ArgDirection(StrEnum):
@@ -244,120 +49,9 @@ class ArgSpec(_ArgSpec):
     def __new__(cls, direction: ArgDirection | str, shape: tuple[int, ...], dtype: DTypeLike) -> Self:
         return super().__new__(cls, direction, shape, np.dtype(dtype))
 
-
-@dataclass(frozen=True)
-class BuildSpec:
-    """A rendered design: everything a build needs, as plain data (picklable, hashable), so that
-    rendering (Python, aie.iron: one thread) and building (``build``: subprocesses, any thread or
-    process) can happen apart (``artlite.parallel_compile``).
-
-    kind: "rtc" (an ArtcOperator: main.pdi + insts.bin) or "fused" (a FusedOperator: a full ELF);
-    label: the operator class or the fused ELF's name (checks, messages; a fused ELF's file name);
-    source: the kernel translation unit (``kernel_source.translation_unit``), None without kernels;
-    mlir: the design, its kernel names resolved (``KernelSource.rename``)."""
-
-    kind: str
-    label: str
-    source: str | None
-    mlir: str
-    clang_flags: tuple[str, ...] = ()
-    profile_key: tuple | None = None  # rtc: the profiling configuration the design was rendered with
-    expand_load_pdis: bool = False  # fused
-    aiecc_flags: tuple[str, ...] = ()  # rtc: ``ArtcOperator.AIECC_FLAGS``
-
     @property
-    def clang_cmd(self) -> list[str]:
-        return [*CLANG_CMD_COMMON, f"--target={AIE_TARGET}", *self.clang_flags]
-
-
-def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = True) -> str:
-    """Build ``spec`` into its cache directory (skipped when cached) and return the directory.
-    Builds of one cache key serialize on a lock file (the later ones find the cache); distinct
-    keys run in parallel. aiecc_jobs: aiecc's compile threads (default: its own choice);
-    measure: print the ARTLITE_MEASURE_II report."""
-    ignore_cache = os.environ.get("ARTLITE_IGNORE_CACHE", "0") == "1"
-    clang_cmd = spec.clang_cmd
-    pch_path = _compile_pch(clang_cmd=clang_cmd)
-    # --unified: every core of a device lowered once (default: a clone of the design per core); the same outputs, aiecc
-    # -55% (the Llama prefill library 52 -> 21 s, the SD 1.5 UNet program 22 -> 8 s)
-    aiecc_opts = [*([f"-j{aiecc_jobs}"] if aiecc_jobs else []), "--unified", f"--peano={PEANO_DIR}",
-                  *(f"-Xllc={flag}" for flag in CORE_LLC_FLAGS), *spec.aiecc_flags]
-    if spec.kind == "fused":
-        key = _cache_key(spec.source, spec.mlir, pch_path, version("mlir_aie"), version("llvm_aie"),
-                         spec.expand_load_pdis, CORE_LLC_FLAGS)
-        work_dir = os.path.join(CACHE_DIR, f"fused_{key}")
-        os.makedirs(work_dir, exist_ok=True)
-        elf_path = os.path.join(work_dir, f"{spec.label}.elf")
-        with portable.file_lock(os.path.join(CACHE_DIR, f"fused_{key}.lock")):
-            mlir_path = os.path.join(work_dir, "design.mlir")
-            with open(mlir_path, "w") as f:
-                f.write(spec.mlir)
-            if not os.path.exists(elf_path) or ignore_cache:
-                _run_aiecc([AIECC, *aiecc_opts, *(["--expand-load-pdis"] if spec.expand_load_pdis else []),
-                            "--get-full-elf", "--get-scratchpad-parameters", "--full-elf-name",
-                            os.path.abspath(elf_path), os.path.abspath(mlir_path)], cwd=work_dir,
-                           link_files=lambda: _kernel_and_checks(spec, work_dir=work_dir, pch_path=pch_path,
-                                                                 ignore_cache=ignore_cache, measure=measure))
-            elif spec.source:
-                _compile_kernel(operators_pch_path=pch_path, clang_cmd=clang_cmd, work_dir=work_dir,
-                                source_code=spec.source, ignore_cache=ignore_cache, measure=measure)
-        return work_dir
-
-    assert spec.kind == "rtc", spec.kind
-    profiling_cfg = profiling.get_config()
-    if not buildable(spec):
-        raise RuntimeError(f"{spec.label}: rendered with profiling {spec.profile_key}, this process has "
-                           f"{profile_key(profiling_cfg)}")
-    key = _cache_key(spec.source, *spec.clang_flags, spec.mlir, pch_path, spec.profile_key, CORE_LLC_FLAGS, *spec.aiecc_flags)
-    work_dir = os.path.join(CACHE_DIR, f"rtc_{key}")
-    os.makedirs(work_dir, exist_ok=True)
-    pdi_path = os.path.join(work_dir, "main.pdi")
-    insts_path = os.path.join(work_dir, "insts.bin")
-    mlir_path = os.path.join(work_dir, "design.mlir")
-
-    # Steps 1-3 under a per-key lock: concurrent compilation of an
-    # identical operator (same cache dir) from parallel tests/processes
-    # otherwise produces corrupted kernel.o / design.mlir.prj artifacts.
-    with portable.file_lock(os.path.join(CACHE_DIR, f"rtc_{key}.lock")):
-        # Step 1: write MLIR (with profiling transforms applied)
-        if not os.path.exists(mlir_path) or ignore_cache:
-            final_text = spec.mlir
-            if profiling_cfg is not None and profiling_cfg.mode == "counters":
-                final_text, _ = profiling.inject_perf_counters(spec.mlir, profiling_cfg.counter_specs, work_dir)
-            with open(mlir_path, "w") as f:
-                f.write(final_text)
-            if profiling_cfg is not None and profiling_cfg.mode == "trace":
-                pre_lowered = profiling.pre_lower_trace(mlir_path, profiling_cfg, work_dir)
-                if pre_lowered != mlir_path:
-                    shutil.copy(pre_lowered, mlir_path)
-
-        # Step 2: compile MLIR -> PDI + insts, the C++ kernel -> kernel.o meanwhile
-        if not (os.path.exists(pdi_path) and os.path.exists(insts_path)) or ignore_cache:
-            aiecc_cmd = [AIECC, *aiecc_opts, "--get-pdi", "--get-npu-insts", "--pdi-name=main.pdi",
-                         "--npu-insts-name=insts.bin"]
-            if profiling_cfg is not None:
-                # Persist design.mlir.prj intermediates (notably
-                # input_with_addresses.mlir) for trace parsing.
-                aiecc_cmd.append("--dump-intermediates")
-            aiecc_cmd.append(mlir_path)
-            _run_aiecc(aiecc_cmd, cwd=work_dir,
-                       link_files=lambda: _kernel_and_checks(spec, work_dir=work_dir, pch_path=pch_path,
-                                                             ignore_cache=ignore_cache, measure=measure))
-        elif spec.source:
-            _compile_kernel(operators_pch_path=pch_path, clang_cmd=clang_cmd, work_dir=work_dir,
-                            source_code=spec.source, ignore_cache=ignore_cache, measure=measure)
-    return work_dir
-
-
-def _kernel_and_checks(spec: BuildSpec, *, work_dir: str, pch_path: str, ignore_cache: bool, measure: bool) -> None:
-    """kernel.o of ``spec`` in ``work_dir`` (when it has kernels), then the checks of ``operators/checks.py``."""
-    from . import checks
-
-    if spec.source:
-        _compile_kernel(operators_pch_path=pch_path, clang_cmd=spec.clang_cmd, work_dir=work_dir,
-                        source_code=spec.source, ignore_cache=ignore_cache, measure=measure)
-    checks.check(source=spec.source, mlir_text=spec.mlir, label=spec.label,
-                 obj_path=os.path.join(work_dir, "kernel.o") if spec.source else None)
+    def nbytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
 
 
 class ArtcOperator:
@@ -389,6 +83,9 @@ class ArtcOperator:
     """
 
     AIECC_FLAGS: tuple[str, ...] = ()  # (aiecc options of the design)
+    # (calls the stack check cannot see in the object: (pattern of a caller's linked name, template of its callees' names
+    # expanded with the caller's match), ``checks.stack_usage``)
+    INDIRECT_CALLS: tuple[tuple[str, str], ...] = ()
 
     def __new__(cls, *args: object, **kwargs: object) -> Self:
         self = super().__new__(cls)
@@ -474,9 +171,9 @@ class ArtcOperator:
         ks = self.kernel_source()
         source_code = None if ks is None else translation_unit([ks])
 
-        return BuildSpec(kind="rtc", label=type(self).__name__, source=source_code, mlir=self.mlir_text(),
+        return BuildSpec(kind=BuildKind.RTC, label=type(self).__name__, source=source_code, mlir=self.mlir_text(),
                          clang_flags=tuple(self.clang_flags), profile_key=profile_key(profiling_cfg),
-                         aiecc_flags=self.AIECC_FLAGS)
+                         aiecc_flags=self.AIECC_FLAGS, indirect_calls=self.INDIRECT_CALLS)
 
     def compile(self, device: Device | None = None) -> ArtcOperator:
         """Compile the operator and prepare for dispatch (cached on disk, the render too: ``render_cache``; several

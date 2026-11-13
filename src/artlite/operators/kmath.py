@@ -32,6 +32,7 @@ import numpy as np
 from jinja2 import Environment, StrictUndefined
 
 from .kernel_source import kernel_prefix
+from .toolchain import CACHE_DIR
 
 KM = kernel_prefix("km")
 _ENV = Environment(trim_blocks=True, lstrip_blocks=True, undefined=StrictUndefined)  # (JINJA_ENV's options)
@@ -658,8 +659,6 @@ class ActTable:
     def coefficients(self) -> np.ndarray:
         """(segs, 3): c0 (fp32 values), c1, c2 (bf16 values) of g's segments (cached on disk: ~1 s to fit, keyed by the
         table's parameters and the fitting code)."""
-        from .base import CACHE_DIR  # (base imports this module)
-
         code = [inspect.getsource(f) for f in (self.f64, ActTable._fit, ActTable.reduce, _minimax, _round_bf16, _bf16, _f32,
                                                bf16_values, ulp_bf16)]
         key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, self.full, code)).encode()).hexdigest()[:16]

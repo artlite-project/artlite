@@ -13,7 +13,7 @@ import numpy as np
 from ... import backend, txn
 from ..._native import ParameterScratchpad
 from ...elf_parser import CTRL_SCRATCHPAD, DataBd, ParsedElf, parse_elf, patch_control_code, pdi_sections
-from ..base import BuildSpec
+from ..build import BuildKind, BuildSpec
 from ..design import COLS
 from ..kernel_source import translation_unit
 from . import design, layout
@@ -89,15 +89,17 @@ class FusedElf:
         compile flags) and the fused design."""
         ops = self.operators
         flags = {tuple(op.clang_flags) for op in ops}
-        assert len(flags) <= 1, f"{self.name}: the operators' clang_flags differ ({sorted(flags)})"
+        if len(flags) > 1:
+            raise ValueError(f"{self.name}: the operators' clang_flags differ ({sorted(flags)}): one translation unit")
         sources = {ks.raw: ks for op in ops if (ks := op.kernel_source()) is not None}
         arg_bytes = [self.layout.space_bytes["input"], self.layout.space_bytes["output"],
                      *(end - start for start, end in self.segments)]
         entries = [(op, [self._arg(n) for n in names]) for op, *names in self.runlist]
         mlir = design.render(entries, arg_bytes=arg_bytes, library=self.LIBRARY)
-        return BuildSpec(kind="fused", label=self.name,
+        return BuildSpec(kind=BuildKind.FUSED, label=self.name,
                          source=translation_unit(sources.values()) if sources else None, mlir=mlir,
-                         clang_flags=flags.pop() if flags else (), expand_load_pdis=self.expand_load_pdis)
+                         clang_flags=flags.pop() if flags else (), expand_load_pdis=self.expand_load_pdis,
+                         indirect_calls=tuple(sorted({c for op in ops for c in op.INDIRECT_CALLS})))
 
     def _arg(self, name: str) -> design.Arg:
         """Where a buffer (or slice) lies in main's arguments."""
@@ -123,7 +125,8 @@ class FusedElf:
     @property
     def device(self) -> Any:
         """The Device backing this ELF (``load`` first)."""
-        assert self._device is not None, f"{self.name}: load() first"
+        if self._device is None:
+            raise RuntimeError(f"{self.name}: load() first")
         return self._device
 
     def load(self) -> Self:
@@ -135,7 +138,8 @@ class FusedElf:
             parallel_compile.no_device()
             with self._lock:
                 if not self._loaded:
-                    assert self.compiled, f"{self.name}: compile() first"
+                    if not self.compiled:
+                        raise RuntimeError(f"{self.name}: compile() first")
                     self._load(parse_elf(self.elf_path))
                     self._loaded = True
         return self

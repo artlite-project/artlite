@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Callable
 
 from artlite.model_config import LLAMA_CPP_DIR
-from artlite.operators.base import CACHE_DIR
+from artlite.operators.toolchain import CACHE_DIR
 
 from .. import common
 from ..llama_cpp import lib_identity, llama_cpp_bin

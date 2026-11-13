@@ -228,7 +228,7 @@ lagging average).
   `dump_bo`.
 - `csrc/shim_xdna/hwctx.{h,cpp}` — `hw_ctx::read_aie_reg` (`AMDXDNA_AIE_TILE_READ`), `partition_start_col` (the
   device-wide READ/WRITE_AIE_REG ioctls return EOPNOTSUPP, and SET_STATE is root-only).
-- `src/artlite/operators/base.py` — compile-time integration; the cache key includes all profiling parameters.
+- `src/artlite/operators/build.py` — compile-time integration; the cache key includes all profiling parameters.
 - `src/artlite/profile_analysis.py` — slice synthesis + counter summaries.
 - Tests: `tests/test_profiling.py`.
 

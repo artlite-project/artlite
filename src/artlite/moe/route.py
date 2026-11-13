@@ -23,7 +23,7 @@ import numpy as np
 
 from .. import txn
 from ..operators import templating
-from ..operators.fused.ctrlpkt import _parity, _slot
+from ..operators.fused.ctrlpkt import parity, slot
 
 EXPERT_BDS = (3, 12, 13, 14, 15)  # the shim BDs of a column's items (A: 0 .. 2, the GDN cores' D stream: 12 .. 15, idle
 # during the FFN)
@@ -49,12 +49,12 @@ SW_SLOTS = range(0x3F200, 0x3F400, 4)  # (the slave ports' slots)
 
 def control_route(t: txn.Txn, col: int) -> None:
     """Route column col's control packets on its shim's MM2S1 to its TileControl (two writes; ``check_route``)."""
-    t.write32(txn.tile_address(col, 0, SW_SOUTH7_SLOT1), _slot(CID, CTL_ARB) | CTL_MSEL << 4)
+    t.write32(txn.tile_address(col, 0, SW_SOUTH7_SLOT1), slot(CID, CTL_ARB) | CTL_MSEL << 4)
     t.write32(txn.tile_address(col, 0, SW_MASTER_TILE_CTRL), 1 << 31 | 1 << 30 | 1 << (3 + CTL_MSEL) | CTL_ARB)
 
 
 def check_route(values: dict[int, int], cols: range) -> None:
-    """The configuration (``paging.cdo_values``) leaves the control route's registers to ``control_route`` and no stream
+    """The configuration (``cdo.values``) leaves the control route's registers to ``control_route`` and no stream
     on its arbiter and msel: the words of such a stream would reach TileControl."""
     for c in cols:
         for reg in (SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL):
@@ -101,14 +101,14 @@ def item_weights(ids: np.ndarray, w: np.ndarray, e: int) -> np.ndarray:
 
 def _ctl(addr: int, n: int) -> int:
     """The control header of a write of n words at a shim's register addr (odd parity)."""
-    return _parity(((n - 1) << 20) | (addr & 0xFFFFF))
+    return parity(((n - 1) << 20) | (addr & 0xFFFFF))
 
 
 def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int, a_packet: int | None = None) -> np.ndarray:
     """The control packets of a column's items (``PACKET_WORDS`` uint32, as the core writes them): the halves of item i
     (k = 2 e + h0 .. 2 e + h1) at base + k stride, in BD EXPERT_BDS[i] chained to the next item's; the unused BDs'
     words zero (never pushed). a_packet: the A stream's packet id, where it is packet-switched."""
-    sh = _parity(CID)
+    sh = parity(CID)
     out: list[int] = []
     n = len(items)
     assert 1 <= n <= MAX_ITEMS
@@ -140,7 +140,7 @@ def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: i
     regs = [txn.SHIM_BD0 + txn.BD_BYTES * bd for bd in EXPERT_BDS]
     ch = [h for r in regs for h in (_ctl(r, 4), _ctl(r + 16, 4))]
     return _SRC.render(p=p, E=experts, K=top, COLS=cols, MAX_ITEMS=MAX_ITEMS, bds=EXPERT_BDS, ch=ch,
-                       sh=_parity(CID), ch_push=_ctl(txn.QUEUE[txn.MM2S][0], 1),
+                       sh=parity(CID), ch_push=_ctl(txn.QUEUE[txn.MM2S][0], 1),
                        ch_lock=_ctl(txn.SHIM_LOCK0 + 16 * LOCK_DONE, 1), RBUF_OBJECTS=RBUF_OBJECTS,
                        RBUF_META=RBUF_META, BD_W4=txn.BD_BURST_512B, BD_W5=txn.BD_AXCACHE, BD_VALID=txn.BD_VALID,
                        BD_USE_NEXT=txn.BD_USE_NEXT, bd_w2=0 if a_packet is None else txn.bd_packet_bits(a_packet),

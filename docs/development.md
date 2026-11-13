@@ -74,7 +74,9 @@ Chromium JSON for Perfetto) is switched on by `ARTLITE_PROFILE` (below).
 | `ARTLITE_MEASURE_II=1` | print the per-loop schedule report of every kernel compiled ([measure-ii skill](../.claude/skills/measure-ii/SKILL.md)) |
 | `ARTLITE_SKIP_CHECKS=1` | skip the build-time design checks (stack depth, kernel signatures, rounding mode) |
 | `ARTLITE_VERIFY_TXN=1` | check every host-built transaction where it is built or loaded (`txn.verify`: AxQoS 0, valid BDs, token controllers, the shim channels' queues; the tests turn it on) |
-| `ARTLITE_PM_PACKETS=0` | a library configuration's tile writes all in the transaction, none as control packets |
+| `ARTLITE_PM_PACKETS=0` | a library configuration's tile writes all in the transaction, none as control packets (also no configuration without the array reset) |
+| `ARTLITE_PDI_RESET=1` | every library configuration with the array reset (none without it after another of the same piece) |
+| `ARTLITE_CHECKS=strict` | the build-time design checks' warnings (a kernel that rounds without setting the rounding mode, scalar arithmetic through runtime library calls) are errors |
 | `ARTLITE_PACE` | the prefill GEMMs' pace levels: `auto` (default: calibrated per machine, `prefill/pace.py`), `off`, `recalibrate`, or levels (`gu=3,qkv=2`; [probe.md](probe.md#prochot)) |
 | `ARTLITE_PROFILE=1`, `counters`, `trace` | on-NPU profiling; `ARTLITE_PROFILE_DIR` (default `./artlite_profile`) and the other `ARTLITE_PROFILE_*` variables tune it ([profiling skill](../.claude/skills/profiling/SKILL.md)) |
 | `ARTLITE_DEBUG_CLANG` | an assertions build of llvm-aie's `clang++`, for `variant_search`'s post-pipeliner traces |

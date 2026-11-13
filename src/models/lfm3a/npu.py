@@ -30,7 +30,7 @@ from . import host
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the programs)
 SOURCES = ("artlite/vision", "models/lfm3a/encoder.py", "models/lfm3a/depth.py", "models/lfm3a/codec.py",
-            "artlite/txn.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
+            "artlite/txn.py", "artlite/npu_regs.py", "artlite/operators/bfp16.py", "artlite/operators/kmath.py",
             "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py", "artlite/overlay.py",
             "models/lfm3a/npu.py")
 KEEP = 8  # clips whose embeddings are kept

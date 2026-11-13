@@ -19,10 +19,10 @@ from collections.abc import Callable
 
 from aie import ir
 from aie.dialects import aie
-from aie.dialects._aie_enum_gen import WireBundle
 from aie.passmanager import PassManager
 
 from ..txn import HardwareLimitError
+from .mlir_util import device_op
 
 L1_BYTES = 0x10000  # a core's data memory
 L1_ALIGN = 64  # a 128-byte vector load needs 64-byte alignment: an unaligned address is silently rounded down
@@ -43,7 +43,7 @@ def pin_l1_buffers(
     placed: dict[tuple[int, int], list[tuple[str, int, int]]] = {}  # core tile -> (name, address, bytes) pinned
     with module.context, ir.Location.unknown():
         PassManager.parse("builtin.module(aie.device(aie-place-tiles,aie-objectfifo-split))").run(module.operation)
-        device = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
+        device = device_op(module)
         i32 = ir.IntegerType.get_signless(32)
         for op in list(device.regions[0].blocks[0].operations):
             if isinstance(op, aie.ObjectFifoPoolOp) and "fifoName" in op.attributes:
@@ -104,16 +104,3 @@ def check_placement(placed: dict[tuple[int, int], list[tuple[str, int, int]]]) -
                 raise HardwareLimitError(f"tile {tile}: pinned buffers {last[0]} [{last[1]:#x}, {end:#x}) and {name} "
                                          f"[{addr:#x}, {addr + nbytes:#x}) overlap")
             end, last = addr + nbytes, (name, addr)
-
-
-def packet_flow(module: ir.Module, pkt_id: int, src: tuple[int, int], channel: int,
-                dsts: list[tuple[int, int, int]]) -> None:
-    """A packet flow from tile ``src``'s DMA ``channel`` to ``dsts`` (column, row, DMA channel) in a placed ``module``
-    (``pin_l1_buffers``); its tiles exist."""
-    with module.context, ir.Location.unknown():
-        device = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
-        block = device.regions[0].blocks[0]
-        tiles = {(t.col.value, t.row.value): t for t in block.operations if isinstance(t, aie.TileOp)}
-        aie.packetflow(pkt_id=pkt_id, source=tiles[src], source_port=WireBundle.DMA, source_channel=channel,
-                       dests=[{"dest": tiles[d[:2]], "port": WireBundle.DMA, "channel": d[2]} for d in dsts],
-                       keep_pkt_header=False, ip=ir.InsertionPoint.at_block_terminator(block))

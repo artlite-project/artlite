@@ -48,7 +48,6 @@ Transports, how the packets reach the TileControl:
 import hashlib
 import os
 import re
-import struct
 import subprocess
 from dataclasses import dataclass, field
 
@@ -58,71 +57,24 @@ from aie.iron import PacketFlow
 from aie.iron.device import Tile
 
 from .. import txn
-from . import templating
-from .base import peano_tool
+from ..elf_parser import SHF_ALLOC, SHF_EXECINSTR, ObjectFile, read_object
+from ..npu_regs import CORE_TILE
+from . import cdo, objdump, templating, toolchain
 from .checks import CORE_FRAME, MAIN_INIT_FRAME, core_frames, stack_usage
-from .fused.ctrlpkt import _parity, packets
+from .fused.ctrlpkt import packets, parity
 from .kernel_source import MARK
 
-PM = 0x20000  # (a core tile's program memory, tile-local: the control packets' addresses)
-PM_BYTES = 0x4000
-CORE_LOCK0 = 0x1F000  # (a core tile's lock values, 16 B apart)
+PM = CORE_TILE.program[0]  # (a core tile's program memory, tile-local: the control packets' addresses)
+PM_BYTES = CORE_TILE.program[1] - CORE_TILE.program[0]
+CORE_LOCK0 = CORE_TILE.locks[0]  # (a core tile's lock values, 16 B apart)
 LOCK_BASE = 48  # (core lock 0 in the core's lock numbering: acquire / release ids)
 STATE_WORDS = 4  # the pager's state: [page id, entry 0, entry 1, entry 2] (0: no page)
 STARTUP = "_main_init"
 LOOP_ID = 7  # (the self-DMA flows' stream id: a packet flow inside each tile's switchbox)
-OBJDUMP = peano_tool("llvm-objdump")
-_CLANG = peano_tool("clang")
 
 
 class PagingError(RuntimeError):
     pass
-
-
-@dataclass
-class _Elf:
-    """An ELF32 file: its bytes, sections (name, type, flags, address, data, link, info) and their names' offsets in
-    the file, symbols (name, value, size, info, section index), relocations by the section they apply to (symbol
-    indices)."""
-
-    raw: bytes
-    sections: list[tuple[str, int, int, int, bytes, int, int]] = field(default_factory=list)
-    name_at: list[int] = field(default_factory=list)
-    symbols: list[tuple[str, int, int, int, int]] = field(default_factory=list)
-    relocs: dict[int, list[int]] = field(default_factory=dict)
-
-    def section(self, name: str) -> tuple[str, int, int, int, bytes, int, int] | None:
-        return next((s for s in self.sections if s[0] == name), None)
-
-    def address(self, name: str) -> int:
-        out = [v for n, v, _, info, shn in self.symbols if n == name and shn]
-        assert len(out) == 1, (name, out)
-        return out[0]
-
-
-def _read(path: str) -> _Elf:
-    with open(path, "rb") as f:
-        b = f.read()
-    shoff, = struct.unpack_from("<I", b, 0x20)
-    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x2E)
-    hdr = [struct.unpack_from("<IIIIIIIIII", b, shoff + i * shentsize) for i in range(shnum)]
-    strtab = hdr[shstrndx][4]
-
-    def cstr(o: int) -> str:
-        return b[o:b.index(b"\0", o)].decode()
-    e = _Elf(b)
-    for h in hdr:
-        e.sections.append((cstr(strtab + h[0]), h[1], h[2], h[3], b[h[4]:h[4] + h[5]] if h[1] != 8 else b"", h[6], h[7]))
-        e.name_at.append(strtab + h[0])
-    for i, h in enumerate(hdr):
-        if h[1] == 2:  # (SHT_SYMTAB: 16-byte entries, names in the section h[6] links)
-            names = hdr[h[6]][4]
-            for o in range(h[4], h[4] + h[5], 16):
-                st_name, value, size, info, _, shndx = struct.unpack_from("<IIIBBH", b, o)
-                e.symbols.append((cstr(names + st_name) if st_name else "", value, size, info, shndx))
-        elif h[1] == 4:  # (SHT_RELA: offset, info (symbol << 8 | type), addend; it applies to section h[7])
-            e.relocs[h[7]] = [struct.unpack_from("<II", b, o)[1] >> 8 for o in range(h[4], h[4] + h[5], 12)]
-    return e
 
 
 def symbols(names: list[str], name: str) -> list[str]:
@@ -231,7 +183,7 @@ def _filler(stream_id: int, addr: int, values: np.ndarray, n: int) -> list[np.nd
 
 def header(stream_id: int = LOOP_ID) -> int:
     """A page's first word (its first packet's stream header): how a core tells a page from its other inputs."""
-    return _parity(stream_id)
+    return parity(stream_id)
 
 
 class _PageFlow(PacketFlow):
@@ -266,7 +218,7 @@ def request_flow(core: Tile, mem: Tile, *, stream_id: int) -> PacketFlow:
 def request(*, stream_id: int, channel: int) -> tuple[int, int]:
     """``pg_request``'s first two words: the stream header of a core's request route (``request_flow``) and a control
     header writing one word at its memtile MM2S ``channel``'s start queue (the third: the page BD's id)."""
-    return _parity(stream_id), _parity((txn.MEM_MM2S_CTRL + 8 * channel + 4) & 0xFFFFF)
+    return parity(stream_id), parity((txn.MEM_MM2S_CTRL + 8 * channel + 4) & 0xFFFFF)
 
 
 @dataclass(frozen=True)
@@ -334,12 +286,12 @@ class Store:
 
     def check(self, work_dir: str, cols: range) -> None:
         """None of the store's BDs, its channel's registers or its bytes is in the design's configuration (aiecc's
-        CDO: ``cdo_writes``; a check passed once is remembered in the design's directory)."""
+        CDO: ``cdo.writes``; a check passed once is remembered in the design's directory)."""
         done = os.path.join(work_dir, "design.mlir.prj",
                             f"store_{_key(self.base, self.size, self.channel, self.bd0, self.nbytes, tuple(cols))}.ok")
         if os.path.exists(done):
             return
-        regs = cdo_writes(work_dir)
+        regs = cdo.writes(work_dir)
         for c in cols:
             mine = {txn.tile_address(c, 1, txn.MEM_BD0 + 32 * (self.bd0 + k) + 4 * i)
                     for k in range(sum(len(p.pages) for p in self.pagers)) for i in range(8)}
@@ -350,40 +302,6 @@ class Store:
                 raise PagingError(f"the design configures {hex(hit[0])} (column {c}): the page store's")
         with open(done, "w"):
             pass
-
-
-def cdo_writes(work_dir: str) -> set[int]:
-    """The register and memory addresses a compiled design's configuration writes."""
-    return set(cdo_values(work_dir))
-
-
-def cdo_values(work_dir: str) -> dict[int, int]:
-    """Address -> the value a compiled design's configuration leaves there (aiecc's CDO files: writes, masked writes
-    and block writes, 64-bit addresses)."""
-    out: dict[int, int] = {}
-    prj = os.path.join(work_dir, "design.mlir.prj")
-    for name in ("main_aie_cdo_init.bin", "main_aie_cdo_enable.bin", "main_aie_cdo_elfs.bin"):
-        path = next((p for p in (os.path.join(prj, "cdo_main", name), os.path.join(prj, name)) if os.path.exists(p)), None)
-        if path is None:
-            raise PagingError(f"{work_dir}: no CDO {name}")
-        with open(path, "rb") as f:
-            b = f.read()
-        w = struct.unpack(f"<{len(b) // 4}I", b[:len(b) // 4 * 4])
-        i = 5  # (the header: its length, "CDO", the version, the length, the checksum)
-        while i < len(w):
-            api, n = w[i] & 0xFF, (w[i] >> 16) & 0xFF
-            i += 1
-            if n == 0xFF:
-                n, i = w[i], i + 1
-            p = w[i:i + n]
-            if api in (5, 7, 8):  # (block write, masked write: mask, value, write: the address in two words)
-                a = p[0] << 32 | p[1]
-                if api == 7:
-                    out[a] = out.get(a, 0) & ~p[2] | p[3] & p[2]
-                else:
-                    out.update({a + 4 * k: p[2 + k] for k in range(n - 2)} if api == 5 else {a: p[-1]})
-            i += n
-    return out
 
 
 _SRC = templating.load("artlite/operators/paging.cc.jinja")
@@ -398,34 +316,22 @@ def source(p: str, *, wake: int, send: int | None = None, nslots: int = 2, reque
 
 def check_pager(elf_path: str, *, pager: str, wake: int) -> None:
     """The wake lock is acquired only in the pager function, which has no jumps (a resident ELF's disassembly)."""
-    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", elf_path], capture_output=True, text=True,
-                         check=True).stdout
-    cur, acq, jumps = None, set(), []
-    want = LOCK_BASE + wake
-    for line in out.splitlines():
-        m = re.match(r"^[0-9a-f]+ <([^>]+)>:$", line)
-        if m:
-            if not m.group(1).startswith("."):
-                cur = m.group(1)
-            continue
-        for a in re.finditer(r"\bacq(?:\.\w+)?\s+#(0x[0-9a-f]+|\d+)", line):
-            if int(a.group(1), 0) == want:
-                acq.add(cur)
-        if cur == pager and re.search(r"\b(?:j|jl|jz|jnz)\s", line):
-            jumps.append(line.strip())
+    funcs = objdump.functions(elf_path)
+    acq = {fn for fn, f in funcs.items() if LOCK_BASE + wake in f.acquires}
+    jumps = funcs[pager].jumps if pager in funcs else ()
     if acq != {pager}:
         raise PagingError(f"{elf_path}: the wake lock {wake} acquired in {sorted(acq)}, not only in {pager}")
     if jumps:
         raise PagingError(f"{elf_path}: the pager {pager} jumps ({jumps[0]})")
 
 
-def _reach(obj: _Elf, start: set[int]) -> set[int]:
+def _reach(obj: ObjectFile, start: set[int]) -> set[int]:
     """The sections of a relocatable object reachable from ``start`` through their relocations."""
     seen, todo = set(start), list(start)
     while todo:
         s = todo.pop()
         for k in obj.relocs.get(s, ()):
-            t = obj.symbols[k][4]
+            t = obj.symbols[k].section_index
             if 0 < t < len(obj.sections) and t not in seen:
                 seen.add(t)
                 todo.append(t)
@@ -436,23 +342,29 @@ def _core_elf(prj: str, c: int, r: int) -> str:
     return os.path.join(prj, f"elfs_main_core_{c}_{r}", f"elfs_main_core_{c}_{r}.elf")
 
 
-def _same_kernels(ref: _Elf, other: _Elf, end: int, where: str) -> None:
+def _data(obj: ObjectFile, name: str) -> bytes:
+    """The contents of section ``name`` (empty where the object has none)."""
+    sec = obj.section(name)
+    return sec.data if sec is not None else b""
+
+
+def _same_kernels(ref: ObjectFile, other: ObjectFile, end: int, where: str) -> None:
     """Two cores' resident code agrees below ``end`` but for their own control code (``core_<c>_<r>``), and their data."""
-    def funcs(e: _Elf) -> dict[str, tuple[int, int]]:
-        return {n: (v, s) for n, v, s, info, shn in e.symbols if info & 15 == 2 and shn and n}
+    def funcs(e: ObjectFile) -> dict[str, tuple[int, int]]:
+        return {s.name: (s.value, s.size) for s in e.symbols if s.is_function and s.section_index and s.name}
     fa, fb = funcs(ref), funcs(other)
     own = {n for n in list(fa) + list(fb) if re.fullmatch(r"core_\d+_\d+", n)}
     if {n: v for n, v in fa.items() if n not in own} != {n: v for n, v in fb.items() if n not in own}:
         raise PagingError(f"{where}: its kernel functions are not where the pages' core has them")
-    ta, tb = bytearray(ref.section(".text")[4][:end]), bytearray(other.section(".text")[4][:end])
+    ta, tb = bytearray(_data(ref, ".text")[:end]), bytearray(_data(other, ".text")[:end])
     for e, t in ((fa, ta), (fb, tb)):
         for n in own & set(e):
             v, s = e[n]
             t[v:v + s] = bytes(s)
     if ta != tb:
         raise PagingError(f"{where}: its resident code differs from the pages' core's")
-    for name in [s[0] for s in ref.sections if s[2] & 2 and not s[2] & 4]:  # (SHF_ALLOC, not SHF_EXECINSTR)
-        if (other.section(name) or ("", 0, 0, 0, b""))[4] != ref.section(name)[4]:
+    for name in [s.name for s in ref.sections if s.flags & SHF_ALLOC and not s.flags & SHF_EXECINSTR]:
+        if _data(other, name) != _data(ref, name):
             raise PagingError(f"{where}: its data section {name} differs from the pages' core's")
 
 
@@ -475,26 +387,27 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
                          {n: Page(z[f"code_{i}"], tuple(int(e) for e in z[f"entries_{i}"])) for i, n in enumerate(pages)})
     c0, r0 = cores[0]
     ref_path = _core_elf(prj, c0, r0)
-    ref = _read(ref_path)
-    obj = _read(os.path.join(work_dir, "kernel.o"))
-    names = [s[0] for s in obj.symbols if s[0]]
+    ref = read_object(ref_path)
+    obj = read_object(os.path.join(work_dir, "kernel.o"))
+    names = [s.name for s in obj.symbols if s.name]
     entries = {e for es in pages.values() for e in es}
     if {e for es in calls.values() for e in es} - entries:
         raise PagingError(f"calls of functions no page enters: {sorted({e for es in calls.values() for e in es} - entries)}")
     lname = {n: symbol(names, n) for n in {pager, *entries}}
-    resident = {n for n, v, s, info, shn in ref.symbols if n and shn}
+    resident = {s.name for s in ref.symbols if s.name and s.section_index}
     many = {n: [x for x in symbols(names, n) if x in resident] for n in {*roots, *calls}}  # (their instances here)
     if lname[pager] not in resident or not all(many.values()):
         raise PagingError(f"the pager {pager}, a caller of entries ({', '.join(calls)}) or a root ({', '.join(roots)}) "
                           "is not resident")
-    entry_of = {n: shn for n, v, s, info, shn in obj.symbols if n and shn}
-    sec_resident = {shn for n, v, s, info, shn in obj.symbols if n in resident and 0 < shn < len(obj.sections)}
-    text = ref.section(".text")[4]
+    entry_of = {s.name: s.section_index for s in obj.symbols if s.name and s.section_index}
+    sec_resident = {s.section_index for s in obj.symbols
+                    if s.name in resident and 0 < s.section_index < len(obj.sections)}
+    text = _data(ref, ".text")
     slot = ref.address(STARTUP)
     if slot + _size(ref, STARTUP) < len(text):
         raise PagingError(f"{STARTUP} is not the last resident function")
     for c, r in cores[1:]:
-        _same_kernels(ref, _read(_core_elf(prj, c, r)), slot, f"core ({c}, {r})")
+        _same_kernels(ref, read_object(_core_elf(prj, c, r)), slot, f"core ({c}, {r})")
     check_pager(ref_path, pager=lname[pager], wake=wake)
     usage = _stack(work_dir, {c: {lname[e] for e in es} for n, es in calls.items() for c in many[n]})
     need = max(usage.get(r, 0) for n in roots for r in many[n]) + \
@@ -512,21 +425,21 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
         own = _reach(obj, esec) - sec_resident
         if pager_sec in _reach(obj, own):
             raise PagingError(f"page {name} reaches the pager")
-        bad = [obj.sections[s][0] for s in own if not obj.sections[s][0].startswith(".text.")]
+        bad = [obj.sections[s].name for s in own if not obj.sections[s].name.startswith(".text.")]
         if bad:
             raise PagingError(f"page {name} needs data the resident code does not have: {', '.join(sorted(bad))}")
         elf = _link_page(prj, obj, own, script, slot, name, (c0, r0))
-        e = _read(elf)
+        e = read_object(elf)
         if _without_start(e, slot) != _without_start(ref, slot):
             raise PagingError(f"page {name}: its link moved the resident code")
         for s in ref.sections:
-            if s[2] & 2 and not s[2] & 4 and (e.section(s[0]) or ("", 0, 0, 0, b""))[4] != s[4]:
-                raise PagingError(f"page {name}: its link changed the data section {s[0]}")
+            if s.flags & SHF_ALLOC and not s.flags & SHF_EXECINSTR and _data(e, s.name) != s.data:
+                raise PagingError(f"page {name}: its link changed the data section {s.name}")
         pt = e.section(".ptxt")
-        if pt is None or pt[3] != slot or slot + len(pt[4]) > PM_BYTES:
-            raise PagingError(f"page {name}: its code at {pt and hex(pt[3])} ({pt and len(pt[4])} B) is not within "
+        if pt is None or pt.addr != slot or slot + len(pt.data) > PM_BYTES:
+            raise PagingError(f"page {name}: its code at {pt and hex(pt.addr)} ({pt and len(pt.data)} B) is not within "
                               f"[{slot:#x}, {PM_BYTES:#x})")
-        code = pt[4] + bytes(-len(pt[4]) % 4)
+        code = pt.data + bytes(-len(pt.data) % 4)
         out[name] = Page(np.frombuffer(code, np.uint32).copy(), tuple(e.address(lname[x]) for x in entries))
     tmp = f"{cached}.{os.getpid()}.npz"
     np.savez(tmp, slot=slot, **{f"code_{i}": p.code for i, p in enumerate(out.values())},
@@ -543,17 +456,17 @@ def _key(*args: object) -> str:
     return h.hexdigest()[:16]
 
 
-def _without_start(e: _Elf, end: int) -> bytes:
+def _without_start(e: ObjectFile, end: int) -> bytes:
     """The resident code below ``end`` but the crt's ``__start`` (its call of the startup code, moved in a page's link:
     the core runs aiecc's)."""
-    t = bytearray(e.section(".text")[4][:end])
+    t = bytearray(_data(e, ".text")[:end])
     v = e.address("__start")
     t[v:v + _size(e, "__start")] = bytes(_size(e, "__start"))
     return bytes(t)
 
 
-def _size(e: _Elf, name: str) -> int:
-    return next(s for n, v, s, info, shn in e.symbols if n == name and shn)
+def _size(e: ObjectFile, name: str) -> int:
+    return next(s.size for s in e.symbols if s.name == name and s.section_index)
 
 
 def _stack(work_dir: str, calls: dict[str, set[str]]) -> dict[str, int]:
@@ -564,14 +477,14 @@ def _stack(work_dir: str, calls: dict[str, set[str]]) -> dict[str, int]:
     return stack_usage(os.path.join(work_dir, "kernel.o"), su, calls=calls)
 
 
-def _link_page(prj: str, obj: _Elf, own: set[int], script: str, slot: int, name: str, core: tuple[int, int]) -> str:
+def _link_page(prj: str, obj: ObjectFile, own: set[int], script: str, slot: int, name: str, core: tuple[int, int]) -> str:
     """Link page ``name``: kernel.o with its sections ``own`` renamed .text. -> .ptxt., placed at ``slot`` (the crt's
     startup code after it, outside program memory: it ran before any page)."""
     path = os.path.join(prj, f"page_{name}.elf")
     raw = bytearray(obj.raw)
     for s in own:
-        at = obj.name_at[s]
-        assert raw[at:at + 6] == b".text.", obj.sections[s][0]
+        at = obj.sections[s].name_offset
+        assert raw[at:at + 6] == b".text.", obj.sections[s].name
         raw[at:at + 6] = b".ptxt."
     tmp = f"{path}.{os.getpid()}"
     with open(tmp + ".o", "wb") as f:
@@ -591,7 +504,7 @@ def _link_page(prj: str, obj: _Elf, own: set[int], script: str, slot: int, name:
         f.write(s)
     c, r = core
     try:
-        subprocess.run([_CLANG, "-O2", "--target=aie2p-none-unknown-elf", "-fuse-ld=lld",
+        subprocess.run([toolchain.peano_tool("clang"), "-O2", "--target=aie2p-none-unknown-elf", "-fuse-ld=lld",
                         os.path.join(prj, f"objects_main_core_{c}_{r}", f"objects_main_core_{c}_{r}.o"),
                         "-Wl,--gc-sections", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld", "-o", tmp],
                        check=True, capture_output=True, text=True)

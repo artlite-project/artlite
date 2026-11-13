@@ -1,7 +1,8 @@
 """Minimal parser of AIE full ELFs (``aiecc --generate-full-elf``) and the patching of their main control program.
 
 Handles groups of one ``.ctrltext`` each, uncompressed sections, relocation types 5 and 8 (``patch_control_code``
-rejects anything else rather than load control code it did not patch).
+rejects anything else rather than load control code it did not patch). ``read_object``: a relocatable object or a linked
+core ELF (sections, symbols and relocations by section: ``operators/paging``).
 """
 
 import struct
@@ -19,6 +20,9 @@ PATCH_SHIM_DMA_48 = 5
 PATCH_ADDRESS_64 = 8
 
 SHF_COMPRESSED = 0x800
+SHT_SYMTAB, SHT_RELA, SHT_NOBITS = 2, 4, 8
+SHF_ALLOC, SHF_EXECINSTR = 2, 4
+STT_FUNC = 2
 
 CTRL_SCRATCHPAD = "scratch-pad-ctrl"  # the symbol of the control program's scratchpad (runtime parameters)
 
@@ -32,6 +36,10 @@ class ElfSection:
     addr: int
     data: bytes
     flags: int = 0
+    type: int = 0
+    link: int = 0  # (sh_link: a symbol table's string table, a relocation section's symbol table)
+    info: int = 0  # (sh_info: a relocation section's target section)
+    name_offset: int = 0  # (the file offset of the section's name)
 
 
 @dataclass
@@ -40,6 +48,11 @@ class ElfSymbol:
     value: int
     size: int
     section_index: int
+    info: int = 0  # (st_info: binding << 4 | type)
+
+    @property
+    def is_function(self) -> bool:
+        return self.info & 15 == STT_FUNC
 
 
 @dataclass
@@ -84,44 +97,47 @@ def _read_string(strtab: bytes, offset: int) -> str:
     return strtab[offset:end].decode("ascii")
 
 
-def parse_elf(path: str | Path) -> ParsedElf:
-    """Parse an AIE full-ELF file."""
-    data = Path(path).read_bytes()
-
-    # ELF header
+def _read_sections(data: bytes) -> list[ElfSection]:
+    """The section headers of an ELF32 file with their names and contents (a NOBITS section's is empty)."""
     e_shoff = _read_u32(data, 32)
     e_shentsize = _read_u16(data, 46)
     e_shnum = _read_u16(data, 48)
     e_shstrndx = _read_u16(data, 50)
 
-    # Parse section headers
     sections: list[ElfSection] = []
     for i in range(e_shnum):
         base = e_shoff + i * e_shentsize
-        sh_name_off = _read_u32(data, base)  # noqa: F841
-        sh_flags = _read_u32(data, base + 8)
-        sh_addr = _read_u32(data, base + 12)
+        sh_type = _read_u32(data, base + 4)
         sh_offset = _read_u32(data, base + 16)
         sh_size = _read_u32(data, base + 20)
-        sec_data = data[sh_offset : sh_offset + sh_size] if sh_size > 0 else b""
         sections.append(
             ElfSection(
                 name="",  # filled below
                 index=i,
                 offset=sh_offset,
                 size=sh_size,
-                addr=sh_addr,
-                data=sec_data,
-                flags=sh_flags,
+                addr=_read_u32(data, base + 12),
+                data=data[sh_offset : sh_offset + sh_size] if sh_size > 0 and sh_type != SHT_NOBITS else b"",
+                flags=_read_u32(data, base + 8),
+                type=sh_type,
+                link=_read_u32(data, base + 24),
+                info=_read_u32(data, base + 28),
             )
         )
 
     # Resolve section names from shstrtab
     shstrtab = sections[e_shstrndx].data
     for sec in sections:
-        base = e_shoff + sec.index * e_shentsize
-        name_off = _read_u32(data, base)
-        sec.name = _read_string(shstrtab, name_off)
+        sec.name_offset = sections[e_shstrndx].offset + _read_u32(data, e_shoff + sec.index * e_shentsize)
+        sec.name = _read_string(shstrtab, sec.name_offset - sections[e_shstrndx].offset)
+    return sections
+
+
+def parse_elf(path: str | Path) -> ParsedElf:
+    """Parse an AIE full-ELF file."""
+    data = Path(path).read_bytes()
+
+    sections = _read_sections(data)
 
     compressed = [s.name for s in sections if s.flags & SHF_COMPRESSED]
     if compressed:
@@ -273,3 +289,41 @@ def patch_control_code(elf: ParsedElf, *, address: Callable[[DataBd], int], pdis
             raise ValueError(f"unsupported relocation of the control code: type {rela.rela_type}, symbol "
                              f"{sym.name!r} at {rela.offset:#x}")
     return data, bds
+
+
+@dataclass
+class ObjectFile:
+    """A relocatable object or a linked ELF: its bytes, sections, symbols (of its symbol table) and the symbol indices
+    of the relocations of each section (by the section they apply to)."""
+
+    raw: bytes
+    sections: list[ElfSection]
+    symbols: list[ElfSymbol]
+    relocs: dict[int, list[int]]
+
+    def section(self, name: str) -> ElfSection | None:
+        return next((s for s in self.sections if s.name == name), None)
+
+    def address(self, name: str) -> int:
+        """The address of the defined symbol ``name`` (exactly one)."""
+        out = [s.value for s in self.symbols if s.name == name and s.section_index]
+        if len(out) != 1:
+            raise ValueError(f"symbol {name}: {len(out)} definitions")
+        return out[0]
+
+
+def read_object(path: str | Path) -> ObjectFile:
+    """Parse an ELF32 file as an object: every section, its symbol table and its relocations by target section."""
+    data = Path(path).read_bytes()
+    sections = _read_sections(data)
+    symbols: list[ElfSymbol] = []
+    relocs: dict[int, list[int]] = {}
+    for sec in sections:
+        if sec.type == SHT_SYMTAB:
+            names = sections[sec.link].data
+            for o in range(0, sec.size, _SYM_SIZE):
+                st_name, value, size, info, _, shndx = struct.unpack_from("<IIIBBH", sec.data, o)
+                symbols.append(ElfSymbol(_read_string(names, st_name) if st_name else "", value, size, shndx, info))
+        elif sec.type == SHT_RELA:  # (offset, info (symbol << 8 | type), addend)
+            relocs[sec.info] = [_read_u32(sec.data, o + 4) >> 8 for o in range(0, sec.size, _RELA_SIZE)]
+    return ObjectFile(data, sections, symbols, relocs)

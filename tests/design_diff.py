@@ -108,10 +108,10 @@ class Asm:
     error), cached as ``<design>.asm.json`` in the dump; compiled with this tree's headers."""
 
     def __init__(self) -> None:
-        from artlite.operators import base
+        from artlite.operators import build, toolchain
 
-        self.cmd = [*base.CLANG_CMD_COMMON, f"--target={base.AIE_TARGET}"]
-        self.pch = base._compile_pch(clang_cmd=self.cmd)
+        self.cmd = [*toolchain.clang_cmd_common(), f"--target={toolchain.AIE_TARGET}"]
+        self.pch = build.compile_pch(clang_cmd=self.cmd)
         self.tmp = tempfile.mkdtemp(prefix="design_diff_")
 
     def __call__(self, dump: Dump, design: str) -> dict[str, list[str]] | str | None:

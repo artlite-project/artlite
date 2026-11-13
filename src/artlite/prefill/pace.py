@@ -36,7 +36,7 @@ import numpy as np
 
 from .. import _native
 from ..gemm.gemm_q import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
-from ..operators.base import CACHE_DIR
+from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
 
 CACHE = os.path.join(CACHE_DIR, "pace.json")

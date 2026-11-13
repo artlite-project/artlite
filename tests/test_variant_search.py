@@ -11,7 +11,7 @@ import pytest
 
 from artlite import aie2p_isa, gen_isa_tables
 from artlite.measure_ii import SLOTS, count_slots, slot_of
-from artlite.operators.base import CLANGPP
+from artlite.operators.toolchain import clangpp
 from artlite.variant_search import search
 from artlite.variant_search.cli import cli_variants, parse_operator
 from artlite.variant_search.npu import parse_regions, region_result
@@ -109,9 +109,9 @@ def test_isa_tables_current() -> None:
 
 def test_compiler_drift() -> None:
     """The wheel's commit is in its --version; its own compiler does not drift from itself."""
-    commit = gen_isa_tables.clang_commit(CLANGPP)
+    commit = gen_isa_tables.clang_commit(clangpp())
     assert commit is not None and len(commit) == 40
-    assert compiler_drift(CLANGPP) is None
+    assert compiler_drift(clangpp()) is None
 
 
 def test_count_slots() -> None:

@@ -22,21 +22,73 @@ from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
 from ...overlay import SPIN_MARGIN_US, irq_cpu, npu_turn
 from ..base import ArtcOperator
-from . import ctrlpkt, locks, program
+from . import locks, program
 from .elf import FusedElf
-from .layout import Runlist, distinct, parse_name, spec_bytes
+from .layout import Runlist, distinct, parse_name
 from .program import PIECE_BYTES, Assembler, Item
 
 
 class _Flight(NamedTuple):
-    """A piece dispatched: its key (id(items), a, b), its start on the NPU, and what maps the operation index of a hang
-    to its item: the program's items, the index of the piece's first, ``Assembler.item_ops`` (None: not known)."""
+    """A piece dispatched: its start on the NPU, and what maps the operation index of a hang to its item: the program's
+    items, the indices of the piece's first and end, ``Assembler.item_ops`` (None: not known)."""
 
-    key: tuple[int, int, int]
     start: float
     items: Sequence[Item]
     first: int
+    end: int
     item_ops: list[int] | None
+
+
+class _Piece(NamedTuple):
+    """An assembled piece of a program: its items (the list it was assembled from), its control code, the PDI parity
+    after it and the operation count through the end of each of its items (``Assembler.item_ops``)."""
+
+    items: Sequence[Item]
+    code: np.ndarray
+    parity: int
+    item_ops: list[int]
+
+
+class PieceCache:
+    """The assembled pieces of the programs a Library runs again, and the shortest seen duration of each. A program's
+    items are a list the caller keeps (e.g. ChunkPrefill's per chunk size): an entry is of that list object, found by its
+    ``id`` and confirmed by identity (an entry keeps its list alive, so its id is not reused while it is held)."""
+
+    ENDS_KEPT = 4096  # (durations kept)
+
+    def __init__(self, limit: int):
+        """``limit``: bytes of pieces kept (all dropped when they would exceed it)."""
+        self.limit = limit
+        self._pieces: dict[tuple[int, int, int, int], _Piece] = {}
+        self._bytes = 0
+        self._ends: dict[tuple[int, int, int], tuple[Sequence[Item], float]] = {}
+
+    def get(self, items: Sequence[Item], a: int, b: int, parity: int) -> _Piece | None:
+        """The piece of ``items[a:b]`` assembled from PDI parity ``parity``."""
+        hit = self._pieces.get((id(items), a, b, parity))
+        return hit if hit is not None and hit.items is items else None
+
+    def put(self, a: int, b: int, parity: int, piece: _Piece) -> None:
+        """Keep the piece of ``piece.items[a:b]`` assembled from ``parity``."""
+        if self._bytes + piece.code.nbytes > self.limit:
+            self.clear()
+        self._pieces[(id(piece.items), a, b, parity)] = piece
+        self._bytes += piece.code.nbytes
+
+    def clear(self) -> None:
+        self._pieces.clear()
+        self._bytes = 0
+
+    def end(self, items: Sequence[Item], a: int, b: int) -> float | None:
+        """The shortest seen duration (s) of the piece ``items[a:b]``."""
+        hit = self._ends.get((id(items), a, b))
+        return hit[1] if hit is not None and hit[0] is items else None
+
+    def note_end(self, items: Sequence[Item], a: int, b: int, seconds: float) -> None:
+        if len(self._ends) >= self.ENDS_KEPT:
+            self._ends.clear()
+        old = self.end(items, a, b)
+        self._ends[(id(items), a, b)] = (items, seconds if old is None else min(seconds, old))
 
 
 class Pieces:
@@ -121,20 +173,21 @@ class Library(FusedElf):
                                              for e, op in enumerate(ops)])
         self._entry = {id(op): e for e, op in enumerate(ops)}
         self._asm: Assembler | None = None
-        # (assembled pieces: (id(items), a, b, parity) -> (items, piece, parity after, the operation count through the end
-        # of each item: ``Assembler.item_ops``); a program's items are a list the caller keeps, e.g. ChunkPrefill's per chunk
-        # size)
-        self._pieces: dict[tuple[int, int, int, int], tuple[Sequence[Item], np.ndarray, int, list[int]]] = {}
-        self._pieces_bytes = 0
-        self._ends: dict[tuple[int, int, int], float] = {}  # ((id(items), a, b) -> a piece's shortest seen duration)
+        self._cache = PieceCache(self.PIECES_KEPT)
 
-    def _keep(self, key: tuple[int, int, int, int], entry: tuple[Sequence[Item], np.ndarray, int, list[int]]) -> None:
-        """Keep an assembled piece (all dropped when they would exceed PIECES_KEPT bytes)."""
-        if self._pieces_bytes + entry[1].nbytes > self.PIECES_KEPT:
-            self._pieces.clear()
-            self._pieces_bytes = 0
-        self._pieces[key] = entry
-        self._pieces_bytes += entry[1].nbytes
+    def _piece(self, items: Sequence[Item], a: int, b: int, parity: int) -> _Piece:
+        """The piece of ``items[a:b]`` assembled from PDI parity ``parity`` (kept for a program run again); the
+        assembler's parity is not changed."""
+        hit = self._cache.get(items, a, b, parity)
+        if hit is None:
+            asm = self._asm
+            saved, asm.parity = asm.parity, parity
+            try:
+                hit = _Piece(items, asm.assemble(items[a:b]), asm.parity, asm.item_ops)
+            finally:
+                asm.parity = saved
+            self._cache.put(a, b, parity, hit)
+        return hit
 
     def __contains__(self, op: ArtcOperator) -> bool:
         return id(op) in self._entry
@@ -150,9 +203,9 @@ class Library(FusedElf):
             base, start, end = parse_name(name)
             size = getattr(buffers[base], "_raw", buffers[base]).size
             end = size if end is None else end
-            if end > size or end - start < spec_bytes(op.get_arg_spec()[i]):
+            if end > size or end - start < op.get_arg_spec()[i].nbytes:
                 raise ValueError(f"{self.name}: {type(op).__name__}'s argument {i} needs "
-                                 f"{spec_bytes(op.get_arg_spec()[i])} bytes, {name} has {min(end, size) - start}")
+                                 f"{op.get_arg_spec()[i].nbytes} bytes, {name} has {min(end, size) - start}")
             return txn.device_address(buffers[base], start, ctx)
 
         return [(self._entry[id(op)], [address(op, i, n) for i, n in enumerate(names)]) for op, *names in runlist]
@@ -162,7 +215,7 @@ class Library(FusedElf):
         code, bds = self._control_program(elf, lambda bd: 0)  # (the items' addresses: written per item)
         slots = [(s.offset, s.offset + s.nbytes, e, k)
                  for e, (_, *names) in enumerate(self.runlist) for k, s in enumerate(map(self.layout.span, names))]
-        census = locks.census(os.path.dirname(self.elf_path)) if program.REUSE and ctrlpkt.ENABLED else None
+        census = locks.census(os.path.dirname(self.elf_path)) if program.quiet_enabled() else None
         self._asm = Assembler(code, bds, slots, census)
         assert len(self._asm.blocks) == len(self.runlist), (len(self._asm.blocks), len(self.runlist))
         self._dispatch_bufs = list(self._pdis.values())
@@ -220,8 +273,8 @@ class Library(FusedElf):
             """Wait for ``piece`` until ``keep`` pieces after it are pending: napping on the interrupts' CPU, then
             polling from shortly before its shortest seen end; returns its end. A DispatchError names the item that
             holds the operation the firmware reports."""
-            pkey, start = piece.key, piece.start
-            est = self._ends.get(pkey)
+            start = piece.start
+            est = self._cache.end(piece.items, piece.first, piece.end)
             after = int((start + est - submit) * 1e6) - self.SPIN_US if est is not None else 1 << 30  # (from submit)
             try:
                 kern.dispatch_wait(0, max(0, after) if cpu >= 0 else -1, max(cpu, 0), keep)
@@ -229,7 +282,7 @@ class Library(FusedElf):
                 self._note(e, piece)
                 raise
             end = time.perf_counter()
-            self._ends[pkey] = min(end - start, est) if est is not None else end - start
+            self._cache.note_end(piece.items, piece.first, piece.end, end - start)
             return end
 
         if len(bounds) == 2 and not hooks:  # (a program of one piece run again: still in the BO of its parity)
@@ -239,24 +292,16 @@ class Library(FusedElf):
                 with npu_turn():
                     submit = time.perf_counter()
                     kern.dispatch_elf_async(_PIECES.bos[asm.parity], refs, held[0])
-                cached = self._pieces.get((id(items), 0, len(items), asm.parity))
+                cached = self._cache.get(items, 0, len(items), asm.parity)
                 asm.parity = held[1]
-                wait(_Flight((id(items), 0, len(items)), submit, items, 0,
-                             cached[3] if cached is not None and cached[0] is items else None), 0)
+                wait(_Flight(submit, items, 0, len(items), cached.item_ops if cached is not None else None), 0)
                 return 1
         k, starts = 0, []
         last, end = None, 0.0  # (the piece dispatched last; the end of the one before it)
         for k, (a, b) in enumerate(itertools.pairwise(bounds)):
             starts.append(asm.parity)
             slot = asm.parity if key is not None else k % 2
-            ck = (id(items), a, b, asm.parity)
-            hit = self._pieces.get(ck)
-            if hit is not None and hit[0] is items:
-                piece, asm.parity, item_ops = hit[1], hit[2], hit[3]
-            else:
-                piece = asm.assemble(items[a:b])
-                item_ops = asm.item_ops
-                self._keep(ck, (items, piece, asm.parity, item_ops))
+            piece, asm.parity, item_ops = self._piece(items, a, b, asm.parity)[1:]
             if piece.nbytes > limit:
                 raise ValueError(f"{self.name}: items {a}..{b} take {piece.nbytes} bytes of control code, more than "
                                  f"a piece BO's {limit}")
@@ -274,19 +319,12 @@ class Library(FusedElf):
                 kern.dispatch_elf_async(bo, refs, piece.nbytes)
             if last is not None:
                 end = wait(last, 1)  # (piece k - 1; piece k runs on from its end)
-            last = _Flight((id(items), a, b), max(submit, end), items, a, item_ops)
+            last = _Flight(max(submit, end), items, a, b, item_ops)
         if key is not None and asm.parity != slot:
             self._ahead(items, key, asm)
         elif asm.parity != starts[0]:  # (the next run's pieces start at the other parities: assembled while this one ends)
-            parity = asm.parity
             for (a, b), p in zip(itertools.pairwise(bounds), starts):
-                ck = (id(items), a, b, p ^ 1)
-                hit = self._pieces.get(ck)
-                if hit is None or hit[0] is not items:
-                    asm.parity = p ^ 1
-                    piece = asm.assemble(items[a:b])
-                    self._keep(ck, (items, piece, asm.parity, asm.item_ops))
-            asm.parity = parity
+                self._piece(items, a, b, p ^ 1)
         wait(last, 0)
         return k + 1
 
@@ -319,12 +357,5 @@ class Library(FusedElf):
         key = (key[0], p)  # (the key of a run that starts at this parity)
         if _PIECES.holds(p, self, key) is not None:
             return
-        ck = (id(items), 0, len(items), p)
-        hit = self._pieces.get(ck)
-        if hit is not None and hit[0] is items:
-            piece, end = hit[1], hit[2]
-        else:
-            piece = asm.assemble(items)
-            end, asm.parity = asm.parity, p
-            self._keep(ck, (items, piece, end, asm.item_ops))
-        _PIECES.write(p, piece, (self, key, end))
+        piece = self._piece(items, 0, len(items), p)
+        _PIECES.write(p, piece.code, (self, key, piece.parity))

@@ -20,19 +20,20 @@
   slow, and each helper costs program memory. Reported as a warning; vectorize the math (e.g.
   ``al::inv_rms``) or use shifts / ``al::div_small``.
 
-Errors raise ``DesignCheckError``; ``ARTLITE_SKIP_CHECKS=1`` skips the checks.
+Errors raise ``DesignCheckError``; ``ARTLITE_SKIP_CHECKS=1`` skips the checks, ``ARTLITE_CHECKS=strict`` makes the
+warnings errors too. The kernel object is disassembled once (``objdump``): the checks read its parse.
 """
 
 import glob
+import logging
 import os
 import re
-import subprocess
-import sys
-from collections.abc import Iterator
+from collections.abc import Iterable
 
-from .base import peano_tool
+from . import kernel_source, objdump
 
-OBJDUMP = peano_tool("llvm-objdump")
+log = logging.getLogger("artlite.checks")
+DEFAULT_STACK = 1024  # an ``aie.core`` without ``stack_size``: the target's default (mlir-aie's getDefaultCoreStackSize)
 _UNKNOWN_FRAME = 64  # stack of a callee without a frame record (runtime library helpers)
 CORE_FRAME = 128  # a core's own frame when its object is not kept (the largest measured)
 MAIN_INIT_FRAME = 64  # the crt's _main_init frame below main's (paddxm [sp], #0x40 before it calls main)
@@ -42,7 +43,6 @@ _MLIR_BYTES = {"i32": 4, "ui32": 4, "si32": 4, "f32": 4, "i16": 2, "i8": 1, "ui8
 _LIBCALL = re.compile(r"^__(?:(?:add|sub|mul|div|neg|pow)[sdt]f[23]|(?:eq|ne|lt|le|gt|ge|unord|cmp)[sdt]f2|"
                       r"float(?:un)?[sdt]i[sdt]f|fix(?:uns)?[sdt]f[sdt]i|extend[sdt]f[sdt]f2|trunc[sdt]f[sdt]f2|"
                       r"(?:u?div|u?mod|mul)[sd]i3)$")
-_ROUNDING = re.compile(r"\b(vst\.conv|vconv\.bf16|vconv\.bfp16|vsrs|vst\.srs|vst\.push\.conv|vst\.flush\.conv)")
 
 
 class DesignCheckError(RuntimeError):
@@ -53,86 +53,73 @@ def enabled() -> bool:
     return os.environ.get("ARTLITE_SKIP_CHECKS", "0") != "1"
 
 
-def _disassembly(obj_path: str) -> dict[str, list[str]]:
-    """Function name -> its disassembly lines with relocations (``llvm-objdump -dr``)."""
-    out = subprocess.run([OBJDUMP, "-dr", obj_path], capture_output=True, text=True, check=True).stdout
-    funcs: dict[str, list[str]] = {}
-    cur = None
-    for line in out.splitlines():
-        m = re.match(r"^[0-9a-f]+ <([^>]+)>:$", line)
-        if m:
-            if not m.group(1).startswith("."):
-                cur = m.group(1)
-                funcs.setdefault(cur, [])
-            continue
-        if cur is not None:
-            funcs[cur].append(line)
-    return funcs
+def strict() -> bool:
+    """Whether warnings are errors (``ARTLITE_CHECKS=strict``)."""
+    return os.environ.get("ARTLITE_CHECKS", "") == "strict"
 
 
-def stack_usage(obj_path: str, su_path: str, *, calls: dict[str, set[str]] | None = None) -> dict[str, int]:
-    """Deepest stack (bytes) of every function of kernel.o: its frame plus the deepest callee (``calls``: more calls,
-    by function name: indirect ones; a decode GEMV dispatcher's pages are its callees)."""
+def _callees(fn: str, f: objdump.Function) -> set[str]:
+    """The functions ``f`` (named ``fn``) calls by name, from its relocations."""
+    return {c for c in f.relocs if re.fullmatch(r"[A-Za-z_]\w*", c) and c != fn}
+
+
+def stack_usage(obj_path: str, su_path: str, *, calls: dict[str, set[str]] | None = None,
+                indirect: Iterable[tuple[str, str]] = ()) -> dict[str, int]:
+    """Deepest stack (bytes) of every function of kernel.o: its frame plus the deepest callee. Indirect calls are
+    callees too: ``calls`` by function name, ``indirect`` as (pattern of a caller's name, template of the pattern of
+    its callees' names, expanded with the caller's match: ``ArtcOperator.INDIRECT_CALLS``)."""
     own: dict[str, int] = {}
     with open(su_path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 2:
                 own[parts[0].rsplit(":", 1)[-1]] = int(parts[1])
-    graph: dict[str, set[str]] = {}
-    for fn, lines in _disassembly(obj_path).items():
-        graph[fn] = {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([A-Za-z_]\w*)$", ln))
-                     and not m.group(1).startswith(".") and m.group(1) != fn}
-    for fn in list(graph):  # (a decode GEMV dispatcher of core half H calls its pages through pointers: ``decode.gemv``)
-        if m := re.search(r"_mmv_[0-9a-f]{8}ILi([01])E", fn):
-            graph[fn] |= {g for g in graph if f"_pgf{m.group(1)}_" in g}
+    graph = {fn: _callees(fn, f) for fn, f in objdump.functions(obj_path).items()}
+    for caller, callee in indirect:
+        for fn in list(graph):
+            if m := re.search(caller, fn):
+                pattern = m.expand(callee)
+                graph[fn] |= {g for g in graph if re.search(pattern, g)}
     for fn, more in (calls or {}).items():
         graph[fn] = graph.get(fn, set()) | more
     memo: dict[str, int] = {}
 
-    def depth(fn: str, seen: frozenset[str]) -> int:
+    def depth(fn: str, seen: frozenset[str]) -> tuple[int, bool]:
+        """(the deepest stack from ``fn``, whether a recursion cut it short: such a depth depends on ``seen``)."""
         if fn in memo:
-            return memo[fn]
+            return memo[fn], False
         if fn in seen:  # recursion: count the frame once
-            return own.get(fn, _UNKNOWN_FRAME)
-        d = own.get(fn, _UNKNOWN_FRAME) + max((depth(c, seen | {fn}) for c in graph.get(fn, ())), default=0)
-        memo[fn] = d
-        return d
+            return own.get(fn, _UNKNOWN_FRAME), True
+        below = [depth(c, seen | {fn}) for c in graph.get(fn, ())]
+        d = own.get(fn, _UNKNOWN_FRAME) + max((v for v, _ in below), default=0)
+        cut = any(c for _, c in below)
+        if not cut:
+            memo[fn] = d
+        return d, cut
 
-    return {fn: depth(fn, frozenset()) for fn in set(own) | set(graph)}
+    return {fn: depth(fn, frozenset())[0] for fn in sorted(set(own) | set(graph))}
 
 
 def core_frames(design_dir: str) -> dict[str, int]:
     """'col,row' -> the stack frame of each core's own function (aiecc's control code: ``paddxm [sp], #N`` at its
     start), from the per-core objects aiecc keeps in design.mlir.prj ({} when it kept none)."""
-    objs = sorted(glob.glob(os.path.join(design_dir, "design.mlir.prj", "objects_main_core_*", "*.o")))
+    prj = os.path.join(design_dir, "design.mlir.prj")
+    objs = sorted(glob.glob(os.path.join(prj, "objects_main_core_*", "*.o")))
     if not objs:
         return {}
-    out = subprocess.run([OBJDUMP, "-d", *objs], capture_output=True, text=True, check=True).stdout
     frames: dict[str, int] = {}
-    cur = None
-    for line in out.splitlines():
-        m = re.match(r"^[0-9a-f]+ <core_(\d+)_(\d+)>:$", line)
-        if m:
-            cur = f"{m.group(1)},{m.group(2)}"
-        elif cur is not None and cur not in frames and (f := re.search(r"paddxm\s+\[sp\],\s*#(0x[0-9a-f]+|\d+)", line)):
-            frames[cur] = int(f.group(1), 0)
+    for funcs in objdump.functions_of([os.path.relpath(o, prj) for o in objs], cwd=prj).values():
+        for name, f in funcs.items():
+            if (m := re.fullmatch(r"core_(\d+)_(\d+)", name)) and f.frame is not None:
+                frames.setdefault(f"{m.group(1)},{m.group(2)}", f.frame)
     return frames
-
-
-def rounding_functions(obj_path: str) -> dict[str, tuple[bool, bool]]:
-    """Function -> (rounds: has conversion / SRS instructions, sets_mode: writes crrnd), own code only."""
-    return {fn: (any(_ROUNDING.search(ln) for ln in lines), any("crrnd" in ln and "mov" in ln for ln in lines))
-            for fn, lines in _disassembly(obj_path).items()}
 
 
 def unset_rounding(obj_path: str, entries: set[str]) -> dict[str, list[str]]:
     """Entry -> the functions of its call tree (``kernel.o``'s relocations) that round while neither they nor a
     function on the path from the entry set the rounding mode."""
-    funcs = _disassembly(obj_path)
-    rnd = rounding_functions(obj_path)
-    calls = {fn: {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+([\w.$]+)$", ln)) and m.group(1) in funcs}
-             for fn, lines in funcs.items()}
+    funcs = objdump.functions(obj_path)
+    calls = {fn: {c for c in f.relocs if c in funcs} for fn, f in funcs.items()}
     out: dict[str, list[str]] = {}
     for e in sorted(entries & set(funcs)):
         lax, seen, todo = set(), set(), [e]
@@ -141,10 +128,9 @@ def unset_rounding(obj_path: str, entries: set[str]) -> dict[str, list[str]]:
             if f in seen:
                 continue
             seen.add(f)
-            rounds, sets = rnd.get(f, (False, False))
-            if sets:
+            if f in funcs and funcs[f].sets_rounding:
                 continue
-            if rounds:
+            if f in funcs and funcs[f].rounds:
                 lax.add(f)
             todo += calls.get(f, ())
         if lax:
@@ -155,20 +141,11 @@ def unset_rounding(obj_path: str, entries: set[str]) -> dict[str, list[str]]:
 def library_arithmetic(obj_path: str) -> dict[str, set[str]]:
     """Function -> the compiler-rt arithmetic helpers it calls, own code only."""
     out: dict[str, set[str]] = {}
-    for fn, lines in _disassembly(obj_path).items():
-        calls = {m.group(1) for ln in lines if (m := re.search(r"R_AIE_\d+\s+(__\w+)$", ln)) and _LIBCALL.match(m.group(1))}
+    for fn, f in objdump.functions(obj_path).items():
+        calls = {c for c in f.relocs if re.fullmatch(r"__\w+", c) and _LIBCALL.match(c)}
         if calls:
             out[fn] = calls
     return out
-
-
-def _walk(op: object) -> Iterator[object]:
-    op = getattr(op, "operation", op)
-    yield op
-    for region in op.regions:
-        for block in region.blocks:
-            for inner in block.operations:
-                yield from _walk(inner)
 
 
 def _design(mlir_text: str) -> tuple[dict[str, list[str]], list[tuple[str, int, set[str]]]]:
@@ -176,27 +153,30 @@ def _design(mlir_text: str) -> tuple[dict[str, list[str]], list[tuple[str, int, 
     from aie import ir
     from aie.extras.context import mlir_mod_ctx
 
+    from .mlir_util import walk
+
     decls: dict[str, list[str]] = {}
     cores: list[tuple[str, int, set[str]]] = []
     with mlir_mod_ctx() as ctx:
         module = ir.Module.parse(mlir_text, ctx.context)
-        for op in _walk(module.operation):
+        for op in walk(module.operation):
             if op.name == "func.func" and not list(op.regions[0].blocks):
                 fty = ir.FunctionType(ir.TypeAttr(op.attributes["function_type"]).value)
                 decls[ir.StringAttr(op.attributes["sym_name"]).value] = (
                     [str(t) for t in fty.inputs] + [f"-> {t}" for t in fty.results])
             elif op.name == "aie.core":
-                stack = ir.IntegerAttr(op.attributes["stack_size"]).value if "stack_size" in op.attributes else 1024
+                stack = ir.IntegerAttr(op.attributes["stack_size"]).value if "stack_size" in op.attributes else DEFAULT_STACK
                 tile = op.operands[0].owner.attributes
                 where = (f"{ir.IntegerAttr(tile['col']).value},{ir.IntegerAttr(tile['row']).value}"
                          if "col" in tile and "row" in tile else "unplaced")
-                callees = {ir.FlatSymbolRefAttr(o.attributes["callee"]).value for o in _walk(op) if o.name == "func.call"}
+                callees = {ir.FlatSymbolRefAttr(o.attributes["callee"]).value for o in walk(op) if o.name == "func.call"}
                 cores.append((where, stack, callees))
     return decls, cores
 
 
-def _c_signature(source: str, name: str) -> tuple[str, list[str]] | None:
-    """(return type, parameter texts) of the definition of ``name`` in the kernel source."""
+def _c_signature(item: kernel_source.Item, name: str) -> tuple[str, list[str]] | None:
+    """(return type, parameter texts) of the definition of ``name`` in its kernel source item."""
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", "", item.text, flags=re.DOTALL)  # (a comment may show a signature)
     m = re.search(r"([A-Za-z_][\w:<>]*)\s*[\*&]?\s+" + re.escape(name) + r"\s*\(", source)
     if not m:
         return None
@@ -219,11 +199,14 @@ def _c_signature(source: str, name: str) -> tuple[str, list[str]] | None:
 
 
 def _check_signatures(source: str, decls: dict[str, list[str]]) -> list[str]:
+    """The kernels ``decls`` declares against their definitions in ``source`` (a kernel source's items: the item that
+    defines the name holds its signature); a kernel the source does not define is defined elsewhere (a library object)."""
     errors = []
+    items = kernel_source.split(source) if decls else []
     for name, types in decls.items():
-        sig = _c_signature(source, name)
+        sig = next((s for it in items if name in it.defines and (s := _c_signature(it, name))), None)
         if sig is None:
-            continue  # defined elsewhere (e.g. a library object)
+            continue
         ret, params = sig
         if any(t.startswith("-> ") for t in types) or ret != "void":
             errors.append(f"{name}: kernel entry points must return void (source: {ret})")
@@ -244,15 +227,15 @@ def _check_signatures(source: str, decls: dict[str, list[str]]) -> list[str]:
     return errors
 
 
-def check(*, source: str | None, mlir_text: str, obj_path: str | None, label: str) -> None:
-    """Run the checks for one compiled design (``obj_path``: kernel.o, with kernel.su next to it)."""
-    if not enabled():
-        return
+def analyze(*, source: str | None, mlir_text: str, obj_path: str | None,
+            indirect: Iterable[tuple[str, str]] = ()) -> tuple[list[str], list[str]]:
+    """The design's (errors, warnings) (``obj_path``: kernel.o, with kernel.su next to it)."""
     decls, cores = _design(mlir_text)
     errors = _check_signatures(source, decls) if source else []
+    warnings: list[str] = []
     su = obj_path[: -len(".o")] + ".su" if obj_path else None
     if obj_path and os.path.exists(obj_path) and su and os.path.exists(su):
-        usage = stack_usage(obj_path, su)
+        usage = stack_usage(obj_path, su, indirect=indirect)
         frames = core_frames(os.path.dirname(obj_path))
         for tile, stack, callees in cores:
             own = frames.get(tile, CORE_FRAME) + MAIN_INIT_FRAME
@@ -264,12 +247,27 @@ def check(*, source: str | None, mlir_text: str, obj_path: str | None, label: st
         called = set().union(*(c for _, _, c in cores)) if cores else set()
         lax = unset_rounding(obj_path, called)
         if lax:
-            sys.stderr.write(f"{label}: kernels that round without setting the rounding mode: "
-                             + "; ".join(f"{e} ({', '.join(f for f in fs if f != e) or 'itself'})" if fs != [e] else e
-                                         for e, fs in lax.items()) + "\n")
+            warnings.append("kernels that round without setting the rounding mode: "
+                            + "; ".join(f"{e} ({', '.join(f for f in fs if f != e) or 'itself'})" if fs != [e] else e
+                                        for e, fs in lax.items()))
         lib = library_arithmetic(obj_path)
         if lib:
-            sys.stderr.write(f"{label}: scalar arithmetic through runtime library calls (slow, program memory): "
-                             + "; ".join(f"{fn}: {', '.join(sorted(c))}" for fn, c in sorted(lib.items())) + "\n")
+            warnings.append("scalar arithmetic through runtime library calls (slow, program memory): "
+                            + "; ".join(f"{fn}: {', '.join(sorted(c))}" for fn, c in sorted(lib.items())))
+    return errors, warnings
+
+
+def check(*, source: str | None, mlir_text: str, obj_path: str | None, label: str,
+          indirect: Iterable[tuple[str, str]] = ()) -> None:
+    """Run the checks for one compiled design: errors raise ``DesignCheckError``, warnings are logged (errors too under
+    ``ARTLITE_CHECKS=strict``)."""
+    if not enabled():
+        return
+    errors, warnings = analyze(source=source, mlir_text=mlir_text, obj_path=obj_path, indirect=indirect)
+    if strict():
+        errors += warnings
+    else:
+        for w in warnings:
+            log.warning("%s: %s", label, w)
     if errors:
         raise DesignCheckError(f"{label}: " + "; ".join(errors))

@@ -36,7 +36,7 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   Also XDNA 2: Ryzen AI Z2 Extreme (handheld), Ryzen AI Embedded P100. Boards sharing a PCI revision are told apart by
   the firmware's revision query only (STXA, STXB, KRK1, KRK2, HALO, GPT1-3: xdna-driver `aie2_msg_priv.h`; sysfs
   `vbnv`). Versal AI Edge Gen 2 has AIE-ML v2 tiles too, behind a NoC: not Artlite's target.
-- Peano target: `--target=aie2p-none-unknown-elf`. [`src/artlite/operators/base.py` (`AIE_TARGET`)]
+- Peano target: `--target=aie2p-none-unknown-elf`. [`src/artlite/operators/toolchain.py` (`AIE_TARGET`)]
 - Physical array (mlir-aie `NPU2TargetModel`): 1 shim row + 1 memory-tile row + 4 compute rows = 6 rows, 8 columns:
   32 compute cores, 8 memory tiles, 8 shim tiles. [`include/aie/Dialect/AIE/IR/AIETargetModel.h`, ATB]
 - The same model has a `VirtualizedNPU2TargetModel` that runs on fewer columns; check the device name against the

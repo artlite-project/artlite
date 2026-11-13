@@ -39,7 +39,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .. import profiling
-from .base import AIECC, CACHE_DIR, CLANGPP, ArtcOperator
+from . import toolchain
+from .base import ArtcOperator
+from .toolchain import CACHE_DIR
 
 if TYPE_CHECKING:
     from .fused.elf import FusedElf
@@ -203,7 +205,7 @@ def _key(op: ArtcOperator | FusedElf) -> str | None:
     if k is None:
         return None
     # (the builds' keys: also the tools' modification times, a reinstalled or locally built toolchain)
-    versions = (_sources(), version("mlir_aie"), version("llvm_aie"), os.path.getmtime(AIECC), os.path.getmtime(CLANGPP),
+    versions = (_sources(), version("mlir_aie"), version("llvm_aie"), os.path.getmtime(toolchain.aiecc()), os.path.getmtime(toolchain.clangpp()),
                 sys.version_info[:2])
     return hashlib.sha256(repr((k, versions)).encode()).hexdigest()[:32]
 

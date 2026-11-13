@@ -24,7 +24,7 @@ from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-from artlite.operators.base import CACHE_DIR
+from artlite.operators.toolchain import CACHE_DIR
 
 TAG = "b11699"
 SHA256 = "bb99387bab7e55aaad19495e2e617e82bc8ff7ce547f967c4f1e0927fe7764be"

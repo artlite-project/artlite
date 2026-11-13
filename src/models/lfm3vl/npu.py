@@ -35,9 +35,9 @@ from . import encoder as V
 from .host import MAX_TOKENS, Grid, image_pixels, token_bounds
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the programs)
-SOURCES = ("artlite/vision", "models/lfm3vl/encoder.py", "artlite/txn.py", "artlite/operators/bfp16.py",
-            "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
-            "artlite/overlay.py", "models/lfm3vl/npu.py")
+SOURCES = ("artlite/vision", "models/lfm3vl/encoder.py", "artlite/txn.py", "artlite/npu_regs.py",
+            "artlite/operators/bfp16.py", "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py",
+            "artlite/operators/paging.py", "artlite/overlay.py", "models/lfm3vl/npu.py")
 KEEP = 8  # images whose embeddings are kept
 PROJECTORS = ("lfm3vl",)  # the mmproj projector types (``clip.projector_type``) of the encoder
 TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default bound)

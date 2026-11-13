@@ -106,9 +106,9 @@ from ..formats import FORMATS, TAB, TAB_BYTES, slot
 from ..moe import route as moe_k
 from ..operators import kmath, paging, templating
 from ..operators.base import ArgSpec, ArtcOperator
-from ..operators.design import COLS, linear_tap
+from ..operators.design import COLS, linear_tap, packet_flow
 from ..operators.kernel_source import kernel_prefix
-from ..operators.l1_layout import packet_flow, pin_l1_buffers
+from ..operators.l1_layout import pin_l1_buffers
 from ..operators.util import Attr, regions
 from ..operators.words import Kind
 from . import gemv, protocol
@@ -189,6 +189,9 @@ class DecodeOverlayOperator(ArtcOperator):
     and adds its cores: ``_extra_src`` (their kernel source), ``_extra_workers`` (their workers and D streams)."""
 
     PREFIX = "ovd"
+    # (a GEMV dispatcher of core half H, ``gemv``'s ``{p}_mmv<H>``, calls its pages' entries ``{p}_pgf<H>_<format>``
+    # through pointers: they are on its stack)
+    INDIRECT_CALLS = ((r"_mmv_[0-9a-f]{8}ILi([01])E", r"_pgf\1_"),)
     A_DEPTH, X_DEPTH = 8, 2  # memtile objects of the A and X streams
     # (the A stream's L1 objects: the main core's; A_FWD, the forward's own depth, differs where a model core holds two of
     # them at once: MLIR-AIE then takes each end's depth at its word instead of its largest acquire + 1)

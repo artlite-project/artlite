@@ -5,7 +5,7 @@ Compiling an operator has two parts:
 - **rendering** (``build_spec()``): Python builds the kernel source and the MLIR design. aie.iron is
   not thread-safe, so this runs in the calling thread. The result is a ``BuildSpec`` of plain
   strings (picklable, hashable).
-- **building** (``operators.base.build``): clang++ and aiecc subprocesses write
+- **building** (``operators.build.build``): clang++ and aiecc subprocesses write
   ``CACHE_DIR/<kind>_<key>/``. Concurrent builds of one key wait for each other on a lock file and
   then find the cache, so a build may run in any thread or process.
 
@@ -45,7 +45,7 @@ from multiprocessing.connection import Client, Connection, Listener
 from typing import TYPE_CHECKING, Any
 
 from . import portable
-from .operators.base import BuildSpec, build, buildable
+from .operators.build import BuildSpec, build, buildable
 
 if TYPE_CHECKING:
     from . import Device

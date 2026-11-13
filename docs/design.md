@@ -207,8 +207,8 @@ result = y.numpy()  # one sync at the end
 - **`Tensor`** - Device-resident tensor with explicit sync control
 - **`Program`** - Compiled AIE program ready for dispatch
 
-**Operators**, in layers (`src/artlite/`, then `src/models/`): the framework (``operators/``: ``base``, ``design``,
-``checks``, ``render_cache``, ``l1_layout``, `FusedOperator` in ``fused``, which links several operators into one
+**Operators**, in layers (`src/artlite/`, then `src/models/`): the framework (``operators/``: ``base``, ``toolchain``, ``build``,
+``design``, ``checks``, ``render_cache``, ``l1_layout``, `FusedOperator` in ``fused``, which links several operators into one
 program and checks that the host initializes every buffer the program reads; ``kmath``, ``bfp16``; the kernels'
 headers in ``include/``), and the runtime of the designs run by host-built transactions (``overlay.py``); the
 subsystems the models share: the GGUF tile formats (``formats/``, one slot per format family: Q4_0, Q4_1, Q8_0, Q4_K,
@@ -228,7 +228,7 @@ tested without an NPU with the host DMA model ``tests/dma_model.py`` (``tests/ge
 
 ## Kernel compilation pipeline
 
-`ArtcOperator.compile()` (`src/artlite/operators/base.py`) builds two
+`ArtcOperator.compile()` (`src/artlite/operators/build.py`) builds two
 artifacts that Artlite loads directly, cached per content hash in
 `~/.cache/artlite/rtc_<hash>/`:
 

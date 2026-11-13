@@ -219,11 +219,11 @@ def render(commit: str, slots: dict[str, list[str]], ports: dict[str, Counter[st
 def generate(*, llvm_aie: Path = LLVM_AIE, tblgen: Path | None = None, commit: str | None = None) -> str:
     """The text of aie2p_isa.py for the wheel's commit (or commit)."""
     if commit is None:
-        from .operators.base import CLANGPP
+        from .operators.toolchain import clangpp
 
-        commit = clang_commit(CLANGPP)
+        commit = clang_commit(clangpp())
         if commit is None:
-            raise RuntimeError(f"no llvm-aie commit in `{CLANGPP} --version`")
+            raise RuntimeError(f"no llvm-aie commit in `{clangpp()} --version`")
     tblgen = tblgen or llvm_aie / "build" / "bin" / "llvm-tblgen"
     if not tblgen.exists():
         raise RuntimeError(f"no llvm-tblgen at {tblgen} (build llvm-aie, or pass --tblgen)")

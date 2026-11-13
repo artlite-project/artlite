@@ -53,5 +53,4 @@ def bf16_hilo(x: float) -> tuple[float, float]:
 
 def arg_bytes(op: ArtcOperator, i: int) -> int:
     """Bytes of an operator's argument i (``get_arg_spec``)."""
-    spec = op.get_arg_spec()[i]
-    return int(np.prod(spec.shape)) * spec.dtype.itemsize
+    return op.get_arg_spec()[i].nbytes

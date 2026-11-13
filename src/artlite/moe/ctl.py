@@ -20,21 +20,21 @@ import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
 
 from .. import _native, txn
-from ..operators.fused.ctrlpkt import _parity, _slot
+from ..operators.fused.ctrlpkt import parity, slot
 
 CID, XID = 9, 3  # stream ids: control packets, the channel's data (as the decode overlay's: ``route``)
 # the control route on a shim's MM2S1 (stream-switch slave South 7; the configuration's: slot 0, the data's id -> arbiter
 # 0 -> North; its control-packet overlay: arbiter 5): slot 1 (CID) -> arbiter 1 -> master Tile_Ctrl, packet mode, the
 # header kept (AM029 PL_MODULE Stream_Switch_*)
 SW_SOUTH7_SLOT1, SW_MASTER_TILE_CTRL, CTL_ARB = 0x3F294, 0x3F000, 1
-ROUTE = ((SW_SOUTH7_SLOT1, _slot(CID, CTL_ARB)), (SW_MASTER_TILE_CTRL, 1 << 31 | 1 << 30 | 1 << 3 | CTL_ARB))
+ROUTE = ((SW_SOUTH7_SLOT1, slot(CID, CTL_ARB)), (SW_MASTER_TILE_CTRL, 1 << 31 | 1 << 30 | 1 << 3 | CTL_ARB))
 NEXT_WORDS = 15  # (a block's tail: the next block's BD, whole, and its push)
 
 
 def ctl(addr: int, data: list[int]) -> list[int]:
     """One control packet: stream header, control header (a write of 1-4 words at the shim's register addr), data."""
     assert 1 <= len(data) <= 4
-    return [_parity(CID), _parity(((len(data) - 1) << 20) | (addr & 0xFFFFF)), *data]
+    return [parity(CID), parity(((len(data) - 1) << 20) | (addr & 0xFFFFF)), *data]
 
 
 def bd_packets(bd: int, words: list[int]) -> list[int]:
@@ -92,11 +92,11 @@ def bd_words(address: int, tap: TensorAccessPattern, *, packet: int | None = Non
 # Streams (a layer's host step: thousands of blocks)
 # ----------------------------------------------------------------------
 
-_HDR = _parity(CID)
+_HDR = parity(CID)
 
 
 def _ctl_header(addr: int, n: int) -> int:
-    return _parity(((n - 1) << 20) | (addr & 0xFFFFF))
+    return parity(((n - 1) << 20) | (addr & 0xFFFFF))
 
 
 @functools.lru_cache(maxsize=16)
@@ -107,8 +107,8 @@ def _tails(bds: tuple[int, int], channel: int) -> np.ndarray:
     for i, bd in enumerate(bds):
         reg = (txn.SHIM_BD0 + txn.BD_BYTES * bd) & 0xFFFFF
         out[i, 0] = out[i, 6] = out[i, 12] = _HDR
-        out[i, 1] = _parity((3 << 20) | reg)
-        out[i, 7] = _parity((3 << 20) | (reg + 16))
+        out[i, 1] = parity((3 << 20) | reg)
+        out[i, 7] = parity((3 << 20) | (reg + 16))
         out[i, 8], out[i, 9], out[i, 11] = txn.BD_BURST_512B, txn.BD_AXCACHE, txn.BD_VALID
         out[i, 13] = _ctl_header(txn.QUEUE[txn.MM2S][channel], 1)
         out[i, 14] = bd

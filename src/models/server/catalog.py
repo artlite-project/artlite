@@ -40,7 +40,7 @@ from typing import Any
 
 from artlite.formats import has_tile_format
 from artlite.gguf_model import GGUFFile
-from artlite.operators.base import CACHE_DIR
+from artlite.operators.toolchain import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
 from .cli_options import ENV, FILES, MODEL, ROUTER, env_name

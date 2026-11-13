@@ -28,9 +28,9 @@ from . import encoder as V
 from .host import load_image, slice_image
 
 # (what the cache's key covers besides the mmproj: the code that builds the images and the transactions)
-_SOURCES = ("artlite/vision", "models/minicpmv/encoder.py", "artlite/txn.py", "artlite/operators/bfp16.py",
-            "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py", "artlite/operators/paging.py",
-            "artlite/overlay.py", "models/minicpmv/npu.py")
+_SOURCES = ("artlite/vision", "models/minicpmv/encoder.py", "artlite/txn.py", "artlite/npu_regs.py",
+            "artlite/operators/bfp16.py", "artlite/operators/kmath.py", "artlite/operators/fused/ctrlpkt.py",
+            "artlite/operators/paging.py", "artlite/overlay.py", "models/minicpmv/npu.py")
 KEEP = 8  # images whose embeddings are kept
 PROJECTORS = ("minicpmv4_7",)  # the mmproj projector types (``clip.projector_type``) of the encoder
 

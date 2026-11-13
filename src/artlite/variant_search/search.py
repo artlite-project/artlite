@@ -107,7 +107,7 @@ def search(
     totals: other functions reported by their cycles per call (e.g. the kernel entry point).
     The post-pipeliner trace (debug llvm-aie) is taken for variants with an unpipelined one-block target loop, or
     for all with why. A patch that does not apply raises ValueError before anything compiles."""
-    from ..operators.base import CACHE_DIR
+    from ..operators.toolchain import CACHE_DIR
 
     functions = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in functions]
     totals = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in totals]

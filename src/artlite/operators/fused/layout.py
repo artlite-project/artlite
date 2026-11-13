@@ -7,7 +7,6 @@ slices). The input and output spaces hold the input and output buffers in the gi
 the order of their first reference, the external ones (living in another BO) last.
 """
 
-import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
@@ -37,10 +36,6 @@ def parse_name(name: str) -> tuple[str, int, int | None]:
     return base, int(start), int(end)
 
 
-def spec_bytes(spec: ArgSpec) -> int:
-    return math.prod(spec.shape) * spec.dtype.itemsize
-
-
 class BufferLayout:
     def __init__(self, runlist: Runlist, *, inputs: Sequence[str], outputs: Sequence[str],
                  sizes: Mapping[str, int], external: Collection[str] = ()):
@@ -54,8 +49,8 @@ class BufferLayout:
                 base, _, end = parse_name(name)
                 if end is not None:
                     sliced.add(base)
-                elif base not in whole or spec_bytes(spec) > whole[base]:
-                    whole[base] = spec_bytes(spec)
+                elif base not in whole or spec.nbytes > whole[base]:
+                    whole[base] = spec.nbytes
         if unsized := sorted(b for b in sliced if b not in whole and b not in sizes):
             raise ValueError(f"buffers referenced only by slices need explicit sizes: {unsized}")
         self.spans: dict[str, Span] = {}

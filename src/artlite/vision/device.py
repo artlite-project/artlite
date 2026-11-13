@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..operators import paging
-from ..operators.base import CACHE_DIR, PACKAGE_DIR
 from ..operators.design import COLS, ROWS
+from ..operators.toolchain import CACHE_DIR, PACKAGE_DIR
 from ..overlay import OverlayDevice, Transaction
 from . import core as K
 from . import design as D

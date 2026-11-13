@@ -87,6 +87,7 @@ from ..operators.design import COLS, plus_i32, range32, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from ..operators.kmath import ACC_C
 from ..operators.l1_layout import pin_l1_buffers
+from ..operators.mlir_util import device_op
 from ..operators.util import Attr, bf16_hilo, regions
 from .gemm import Layout
 
@@ -1069,7 +1070,7 @@ class AttnOperator(ArtcOperator):
         nqs = (2 * self.qb * s.qh * s.qp + 2) * ob // 2  # (bf16 of a pass's Q units and SEG)
         walk = [(4, 72), (s.nd // 2, 288), (72, 1)]  # (an object's cache order [slice][d-block] into la_v's stream order)
         with module.context, ir.Location.unknown():
-            dev = next(o for o in module.body.operations if isinstance(o, aie.DeviceOp))
+            dev = device_op(module)
             blk = dev.regions[0].blocks[0]
             ops = {ir.StringAttr(o.attributes["sym_name"]).value: o for o in blk.operations
                    if "sym_name" in o.attributes}

@@ -8,7 +8,7 @@ from artlite import txn
 from artlite.decode.model import ModelOverlay
 from artlite.moe import route as MR
 from artlite.operators.design import COLS
-from artlite.operators.fused.ctrlpkt import _slot
+from artlite.operators.fused.ctrlpkt import slot
 
 from . import ref
 
@@ -46,10 +46,10 @@ def test_check_route() -> None:
     TileControl (one on the arbiter with another msel does not), a written route register would be overwritten."""
     MR.check_route({}, range(COLS))
     other = txn.tile_address(1, 0, MR.SW_SLOTS[20])
-    MR.check_route({other: _slot(3, MR.CTL_ARB + 1) | MR.CTL_MSEL << 4}, range(COLS))
-    MR.check_route({other: _slot(3, MR.CTL_ARB)}, range(COLS))
+    MR.check_route({other: slot(3, MR.CTL_ARB + 1) | MR.CTL_MSEL << 4}, range(COLS))
+    MR.check_route({other: slot(3, MR.CTL_ARB)}, range(COLS))
     with pytest.raises(AssertionError, match="control route"):
-        MR.check_route({other: _slot(3, MR.CTL_ARB) | MR.CTL_MSEL << 4}, range(COLS))
+        MR.check_route({other: slot(3, MR.CTL_ARB) | MR.CTL_MSEL << 4}, range(COLS))
     with pytest.raises(AssertionError, match="writes"):
         MR.check_route({txn.tile_address(2, 0, MR.SW_MASTER_TILE_CTRL): 0}, range(COLS))
 

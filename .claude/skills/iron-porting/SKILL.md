@@ -146,6 +146,6 @@ def test_my_op(size: int, tile_size: int):
 - `num_columns` 1-8; a shim tile has 2 MM2S + 2 S2MM channels.
 - 32 bf16 lanes (512 bits) per vector op; other widths only after checking the loop's II (the **measure-ii** skill).
 - Elementwise tile sizes in multiples of 32; operators may add constraints.
-- Toolchain: Peano `clang++` is `artlite.operators.base.CLANGPP` (target `aie2p-none-unknown-elf`); aiecc runs inside
+- Toolchain: Peano `clang++` is `artlite.operators.toolchain.clangpp()` (target `aie2p-none-unknown-elf`); aiecc runs inside
   `ArtcOperator.compile` / `FusedOperator` (single operators `--get-pdi --get-npu-insts`, fused ones `--get-full-elf`
   plus `--expand-load-pdis` unless `expand_load_pdis=False`).

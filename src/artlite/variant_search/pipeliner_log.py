@@ -30,9 +30,9 @@ def compiler_drift(compiler: str) -> str | None:
     None when both are one commit; else the commits and, when the build's checkout has both, the commits between
     them that touch the AIE backend or CodeGen."""
     from ..gen_isa_tables import clang_commit
-    from ..operators.base import CLANGPP
+    from ..operators.toolchain import clangpp
 
-    debug, wheel = clang_commit(compiler), clang_commit(CLANGPP)
+    debug, wheel = clang_commit(compiler), clang_commit(clangpp())
     if debug is None or wheel is None:
         return f"llvm-aie commits unknown (debug {debug or '?'}, wheel {wheel or '?'})"
     if debug.startswith(wheel) or wheel.startswith(debug):

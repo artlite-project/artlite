@@ -1,13 +1,18 @@
 """Building blocks of the operators' array designs (aie.iron): NPU2 geometry, i32 loops and access patterns."""
 
+import inspect
 import math
 from collections.abc import Iterator, Sequence
+from importlib.metadata import version
 
-from aie.dialects import arith, index, scf
+from aie.dialects import aie, arith, index, scf
+from aie.dialects._aie_enum_gen import WireBundle
 from aie.dialects.aie import T
 from aie.helpers.taplib import TensorAccessPattern
-from aie.ir import Attribute, IndexType, InsertionPoint
+from aie.ir import Attribute, IndexType, InsertionPoint, Location, Module
 from aie.iron.dataflow import objectfifo as _objectfifo
+
+from .mlir_util import device_op
 
 COLS = 8  # array columns
 ROWS = 4  # compute rows per column (rows 2-5; memtile row 1, shim row 0)
@@ -58,7 +63,7 @@ def stream_walk(n: int, dims: Sequence[tuple[int, int]],
     return tap.pad(pad) if pad else tap
 
 
-_check_walk_size = _objectfifo._check_walk_size
+_WALK_SIZE_PARAMS = ("tap", "sizes", "emits", "what")
 
 
 def _check_padded_walk_size(tap: TensorAccessPattern | None, sizes: list[int], emits: int, what: str) -> None:
@@ -72,7 +77,32 @@ def _check_padded_walk_size(tap: TensorAccessPattern | None, sizes: list[int], e
         partial = not any(b or a for b, a in tap.padding)
         if n % emits == 0 or partial:
             emits = n
-    _check_walk_size(tap, sizes, emits, what)
+    _original_check_walk_size(tap, sizes, emits, what)
 
 
-_objectfifo._check_walk_size = _check_padded_walk_size
+_original_check_walk_size = _objectfifo._check_walk_size
+
+
+def install_iron_patches() -> None:
+    """Replace IRON's ``_check_walk_size`` by the relaxed check (``_check_padded_walk_size``) in this process; once (the
+    operators package does it at its import). A toolchain whose check has another name or signature raises here, naming
+    the toolchain."""
+    current = getattr(_objectfifo, "_check_walk_size", None)
+    if current is _check_padded_walk_size:
+        return
+    if current is not _original_check_walk_size or tuple(inspect.signature(current).parameters) != _WALK_SIZE_PARAMS:
+        raise RuntimeError(f"mlir_aie {version('mlir_aie')}: aie.iron.dataflow.objectfifo._check_walk_size is not "
+                           f"{_WALK_SIZE_PARAMS}: the relaxed walk-size check of operators/design.py does not apply")
+    _objectfifo._check_walk_size = _check_padded_walk_size
+
+
+def packet_flow(module: Module, pkt_id: int, src: tuple[int, int], channel: int,
+                dsts: list[tuple[int, int, int]]) -> None:
+    """A packet flow from tile ``src``'s DMA ``channel`` to ``dsts`` (column, row, DMA channel) in a placed ``module``
+    (``l1_layout.pin_l1_buffers``); its tiles exist."""
+    with module.context, Location.unknown():
+        block = device_op(module).regions[0].blocks[0]
+        tiles = {(t.col.value, t.row.value): t for t in block.operations if isinstance(t, aie.TileOp)}
+        aie.packetflow(pkt_id=pkt_id, source=tiles[src], source_port=WireBundle.DMA, source_channel=channel,
+                       dests=[{"dest": tiles[d[:2]], "port": WireBundle.DMA, "channel": d[2]} for d in dsts],
+                       keep_pkt_header=False, ip=InsertionPoint.at_block_terminator(block))

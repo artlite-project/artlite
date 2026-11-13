@@ -17,7 +17,7 @@ assigns them, to its TileControl port, the rest North 0; the memtile in circuit 
 packets are a BD of one chained shim task per column (TLAST between tiles), the column's last tile's end with a write of
 ``MARK_VALUE`` to a memory word (cleared before) the transaction polls: a stream delivers its packets in order, so all
 of the column's writes are done before anything else of the configuration runs. The configuration's own stream switch
-writes then zero the loader's ports (``program._prune``'s merged port blockwrites; the ones it does not cover in the
+writes then zero the loader's ports (``prune``'s merged port blockwrites; the ones it does not cover in the
 prelude); its slots stay, inert unless the design puts that slave port in packet mode (then zeroed too). A tile's memory
 holds nothing of the design before its configuration: the marker costs none.
 
@@ -41,10 +41,22 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ... import txn
+from ...npu_regs import (
+    CORE_CONTROL_RESET,
+    CORE_TILE,
+    MEM_TILE,
+    SHIM_MUX,
+    SHIM_MUX_SOUTH3_DMA,
+    SHIM_SLAVE_SOUTH3,
+    SHIM_TILE,
+    SWITCH_ENABLE,
+    SWITCH_PACKET,
+    tile_map,
+)
 
-ENABLED = os.environ.get("ARTLITE_PM_PACKETS", "1") != "0"
 ROW_ID = {1: 26, 2: 27, 3: 29, 4: 30, 5: 31}  # (a tile's controller id per row: its packets' stream id)
-MARK = {1: 0x7FFFC, 2: 0xFFFC}  # (the memory word the column's packets end with: memtile, core tile)
+# (the memory word the column's packets end with, data memory's last: memtile, core tile)
+MARK = {1: MEM_TILE.data_bytes - 4, 2: CORE_TILE.data_bytes - 4}
 MARK_VALUE = 0x5A5A0001
 BD0 = 11  # (the shim BDs of a column's chained task, one per tile: free during a configuration)
 QUIESCE_BD0 = 6  # (``reused``: the shim BDs of a column's quiescing task)
@@ -53,37 +65,33 @@ QUIESCE_BD0 = 6  # (``reused``: the shim BDs of a column's quiescing task)
 WRITE_S, BLOCKWRITE_S, BLOCK_BYTE_S, POLL_S, STREAM_BYTE_S = 0.133e-6, 0.101e-6, 1.5e-9, 0.075e-6, 0.25e-9
 
 # (the registers a tile's packets take, per row kind: core tile - program memory, DMA BDs, DMA channels, locks, core
-# control, data memory; memtile - DMA BDs, DMA channels, locks, data memory)
-_MOVED = {2: ((0x20000, 0x24000), (0x1D000, 0x1D200), (0x1DE00, 0x1DE20), (0x1F000, 0x1F100), (0x32000, 0x32004),
-              (0x0, 0x10000)),
-          1: ((0xA0000, 0xA0660), (0xC0000, 0xC0400), (0x0, 0x80000))}
-_DATA_END = {2: 0x10000, 1: 0x80000}  # (a tile's data memory: from 0)
-_CORE_CONTROL, _CORE_CONTROL_RESET = 0x32000, 0x2  # (its value after a reset: in reset, disabled)
-# (stream switch registers: slave South 0, its slots, masters TileControl .. North 0, the slave port number of South 0)
-_SWITCH = {2: (0x3F114, 0x3F250, 0x3F00C, 0x3F034), 1: (0xB011C, 0xB0270, 0xB0018, 0xB002C)}
-_MEM_SOUTH0 = 7
-_SHIM_MUX, _SHIM_MUX_SOUTH3_DMA = 0x1F000, 0x400
-_SHIM_SLAVE_SOUTH3, _SHIM_MASTER_NORTH0, _SHIM_SOUTH3 = 0x3F114, 0x3F030, 5  # (South 3: slave port 5)
-_ENABLE, _PACKET = 1 << 31, 1 << 30
-# (stream switch port configurations, master and slave ranges of the shim, memory and core tiles, and the first slot:
-# 4 per slave port, in its order; aie-rt's AIE2P map)
-SWITCH_PORTS = {0: ((0x3F000, 0x3F058), (0x3F100, 0x3F15C)), 1: ((0xB0000, 0xB0044), (0xB0100, 0xB0148)),
-                2: ((0x3F000, 0x3F05C), (0x3F100, 0x3F164))}
-_SLOT0 = {0: 0x3F200, 1: 0xB0200, 2: 0x3F200}
-# (a tile's DMA channel controls (Reset: bit 1) and lock values (one per 16 B): core tile, memtile)
-_DMA_CTRL = {2: (0x1DE00, 0x1DE08, 0x1DE10, 0x1DE18), 1: tuple(0xA0600 + 8 * c for c in range(12))}
-LOCKS = {2: (0x1F000, 16), 1: (0xC0000, 64)}
+# control, data memory; memtile - DMA BDs and channels, locks, data memory)
+_MOVED = {2: (CORE_TILE.program, CORE_TILE.bds, CORE_TILE.dma, CORE_TILE.locks, CORE_TILE.control,
+              (0, CORE_TILE.data_bytes)),
+          1: ((MEM_TILE.bds[0], MEM_TILE.dma[1]), MEM_TILE.locks, (0, MEM_TILE.data_bytes))}
+_DATA_END = {2: CORE_TILE.data_bytes, 1: MEM_TILE.data_bytes}  # (a tile's data memory: from 0)
+_CORE_CONTROL = CORE_TILE.control[0]
+_MEM_SOUTH0 = 7  # (the memtile's slave port number of South 0)
+_SHIM_SOUTH3 = 5  # (the shim's slave port number of South 3)
+LOCKS = {2: (CORE_TILE.locks[0], 16), 1: (MEM_TILE.locks[0], 64)}  # (lock values, one per 16 B: first, count)
 LOCK_FLUSH = 63  # (a lock value that grants any pending acquire)
+
+
+def enabled() -> bool:
+    """Whether a library configuration's writes may go as control packets (``ARTLITE_PM_PACKETS=0``: none), read at each
+    assembly."""
+    return os.environ.get("ARTLITE_PM_PACKETS", "1") != "0"
+
 
 Writes = dict[tuple[int, int], list[tuple[int, np.ndarray]]]  # ((col, row) -> [(tile-local address, words)])
 
 
-def _parity(word: int) -> int:
+def parity(word: int) -> int:
     """The word with its odd parity bit (31)."""
     return word | (0 if word.bit_count() % 2 else 1 << 31)
 
 
-def _slot(stream_id: int, arbiter: int, mask: int = 0x1F) -> int:
+def slot(stream_id: int, arbiter: int, mask: int = 0x1F) -> int:
     """A slave port slot matching the stream ids equal to ``stream_id`` in the bits ``mask`` to an arbiter, msel 0."""
     return (stream_id << 24) | (mask << 16) | (1 << 8) | arbiter
 
@@ -94,13 +102,13 @@ def _north(own: int, up: list[int]) -> list[int]:
     out, left = [], set(up)
     while left:
         b = max(range(5), key=lambda b: sum(((i ^ own) >> b) & 1 for i in left))
-        out.append(_slot((~own >> b & 1) << b, 1, 1 << b))
+        out.append(slot((~own >> b & 1) << b, 1, 1 << b))
         left = {i for i in left if not ((i ^ own) >> b) & 1}
     return out
 
 
 def _parity_v(words: np.ndarray) -> np.ndarray:
-    """``_parity`` of each word of an array."""
+    """``parity`` of each word of an array."""
     w = np.asarray(words, np.uint32)
     c = w ^ (w >> 16)
     c ^= c >> 8
@@ -114,12 +122,12 @@ def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
     """A tile's writes ((tile-local address, words)) as control packets: per packet the stream header (``stream_id``:
     the route's packet id), the control header (write, words - 1, address), up to 4 words (mlir-aie's encoding) in one
     16-byte line (words past its end wrap to its start)."""
-    head = _parity(stream_id)
+    head = parity(stream_id)
     out = []
     for addr, data in writes:
         d = np.asarray(data, np.uint32)
         if k := min(d.size, -addr // 4 % 4):  # (the words up to the next line)
-            out.append(np.array([head, _parity(((k - 1) << 20) | (addr & 0xFFFFF)), *d[:k].tolist()], np.uint32))
+            out.append(np.array([head, parity(((k - 1) << 20) | (addr & 0xFFFFF)), *d[:k].tolist()], np.uint32))
             addr, d = addr + 4 * k, d[k:]
         q, r = divmod(d.size, 4)
         if q:  # (whole packets of 4 words)
@@ -129,7 +137,7 @@ def packets(stream_id: int, writes: list[tuple[int, np.ndarray]]) -> np.ndarray:
             blk[:, 2:] = d[:4 * q].reshape(q, 4)
             out.append(blk.reshape(-1))
         if r:
-            out.append(np.array([head, _parity(((r - 1) << 20) | ((addr + 16 * q) & 0xFFFFF)), *d[4 * q:].tolist()],
+            out.append(np.array([head, parity(((r - 1) << 20) | ((addr + 16 * q) & 0xFFFFF)), *d[4 * q:].tolist()],
                                 np.uint32))
     return np.concatenate(out) if out else np.zeros(0, np.uint32)
 
@@ -164,7 +172,7 @@ def split(cfg: np.ndarray) -> tuple[np.ndarray, Writes]:
             continue
         if op == txn.OP_MASKWRITE:
             v, m = int(cfg[p + 4]), int(cfg[p + 5])
-            old = last(reg, _CORE_CONTROL_RESET if row == 2 and off == _CORE_CONTROL else 0)
+            old = last(reg, CORE_CONTROL_RESET if row == 2 and off == _CORE_CONTROL else 0)
             words = np.array([(old & ~m) | (v & m)], np.uint32)
         else:
             words = cfg[p + 4:e] if op == txn.OP_BLOCKWRITE else cfg[p + 4:p + 5]
@@ -215,33 +223,34 @@ class Loader:
         memtile in circuit mode without packets."""
         a, out = txn.tile_address, []
         for c, rows in self.columns.items():
-            out += [(a(c, 0, _SHIM_MUX), [_SHIM_MUX_SOUTH3_DMA], "mux"), (a(c, 0, _SHIM_SLAVE_SOUTH3), [_ENABLE], "ports"),
-                    self._masters(c, 0, {_SHIM_MASTER_NORTH0: _ENABLE | _SHIM_SOUTH3})]
+            out += [(a(c, 0, SHIM_MUX), [SHIM_MUX_SOUTH3_DMA], "mux"), (a(c, 0, SHIM_SLAVE_SOUTH3), [SWITCH_ENABLE], "ports"),
+                    self._masters(c, 0, {SHIM_TILE.north0_master: SWITCH_ENABLE | _SHIM_SOUTH3})]
             for r in range(1, rows[-1] + 1):
-                slave, slots0, ctrl, north = _SWITCH[min(r, 2)]
+                t = tile_map(r)
+                slave, slots0, ctrl, north = t.south0_slave, t.south0_slots, t.tile_ctrl_master, t.north0_master
                 if r == 1 and r not in rows:
-                    out += [(a(c, 1, slave), [_ENABLE], "ports"), self._masters(c, 1, {north: _ENABLE | _MEM_SOUTH0})]
+                    out += [(a(c, 1, slave), [SWITCH_ENABLE], "ports"), self._masters(c, 1, {north: SWITCH_ENABLE | _MEM_SOUTH0})]
                     continue
                 up = [ROW_ID[q] for q in rows if q > r]
-                slots = ([_slot(ROW_ID[r], 0)] if r in rows else []) + _north(ROW_ID[r], up)
+                slots = ([slot(ROW_ID[r], 0)] if r in rows else []) + _north(ROW_ID[r], up)
                 masters = {}
                 if r in rows:
-                    masters[ctrl] = _ENABLE | _PACKET | (1 << 3)  # (arbiter 0, msel 0; the header kept)
+                    masters[ctrl] = SWITCH_ENABLE | SWITCH_PACKET | (1 << 3)  # (arbiter 0, msel 0; the header kept)
                 if up:
-                    masters[north] = _ENABLE | _PACKET | (1 << 3) | 1
-                out += [(a(c, r, slave), [_ENABLE | _PACKET], "ports"), (a(c, r, slots0), slots, "slots"),
+                    masters[north] = SWITCH_ENABLE | SWITCH_PACKET | (1 << 3) | 1
+                out += [(a(c, r, slave), [SWITCH_ENABLE | SWITCH_PACKET], "ports"), (a(c, r, slots0), slots, "slots"),
                         self._masters(c, r, masters)]
         return out
 
     def _masters(self, c: int, r: int, values: dict[int, int]) -> tuple[int, list[int], str]:
         """A route tile's master port writes: from the first of ``values`` (tile-local register -> value) to the last,
         the ports between 0 (``reused``: the whole master range)."""
-        lo, hi = (SWITCH_PORTS[min(r, 2)][0][0], SWITCH_PORTS[min(r, 2)][0][1] - 4) if self.reused else (min(values),
-                                                                                                         max(values))
+        masters = tile_map(r).masters
+        lo, hi = (masters[0], masters[1] - 4) if self.reused else (min(values), max(values))
         return txn.tile_address(c, r, lo), [values.get(reg, 0) for reg in range(lo, hi + 4, 4)], "ports"
 
     def ports(self) -> list[int]:
-        """The stream switch port registers the routes enable (``program._prune`` zeroes them)."""
+        """The stream switch port registers the routes enable (``prune`` zeroes them)."""
         return [addr + 4 * i for addr, words, kind in self.routes() if kind == "ports" for i, w in enumerate(words) if w]
 
     def slots(self, rest: np.ndarray) -> list[int]:
@@ -254,13 +263,13 @@ class Loader:
             reg = int(rest[p + 2])
             row = min((reg >> 20) & 0x1F, 2)
             n = int(rest[p + 3]) // 4 - 4 if op == txn.OP_BLOCKWRITE else 1
-            s0, s1 = SWITCH_PORTS[row][1]
+            s0, s1 = tile_map(row).slaves
             for i, v in enumerate(rest[p + 4:p + 4 + n]):
                 off = (reg & 0xFFFFF) + 4 * i
-                if int(v) & _PACKET and (s0 <= off < s1 if self.reused else row and off == _SWITCH[row][0]):
+                if int(v) & SWITCH_PACKET and (s0 <= off < s1 if self.reused else row and off == tile_map(row).south0_slave):
                     packet.add((reg & ~0xFFFFF, (off - s0) // 4))
         if self.reused:
-            return sorted(t | (_SLOT0[min((t >> 20) & 0x1F, 2)] + 16 * k + 4 * i) for t, k in packet for i in range(4))
+            return sorted(t | (tile_map((t >> 20) & 0x1F).slot0 + 16 * k + 4 * i) for t, k in packet for i in range(4))
         tiles = {t for t, _ in packet}
         return [addr + 4 * i for addr, words, kind in self.routes()
                 if kind == "slots" and addr & ~0xFFFFF in tiles for i in range(len(words))]
@@ -299,9 +308,10 @@ def _quiesce(row: int) -> list[tuple[int, np.ndarray]]:
     lock is written ``LOCK_FLUSH`` (granting any pending acquire) and then 0, the channels let go."""
     k = min(row, 2)
     base, n = LOCKS[k]
+    dma_ctrl = tile_map(k).channel_ctrl
     one = lambda v: np.array([v], np.uint32)
-    return ([(_CORE_CONTROL, one(_CORE_CONTROL_RESET))] if k == 2 else []) + [(r, one(2)) for r in _DMA_CTRL[k]] + \
-        [(base + 16 * i, one(v)) for v in (LOCK_FLUSH, 0) for i in range(n)] + [(r, one(0)) for r in _DMA_CTRL[k]]
+    return ([(_CORE_CONTROL, one(CORE_CONTROL_RESET))] if k == 2 else []) + [(r, one(2)) for r in dma_ctrl] + \
+        [(base + 16 * i, one(v)) for v in (LOCK_FLUSH, 0) for i in range(n)] + [(r, one(0)) for r in dma_ctrl]
 
 
 def _runs(regs: list[int]) -> list[tuple[int, int]]:

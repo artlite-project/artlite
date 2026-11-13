@@ -1,7 +1,7 @@
 # Python (the venv's, with Peano and aiecc) is found by the top-level CMakeLists.txt.
 set(PEANO_DIR "${Python_SITELIB}/llvm-aie")
 find_program(AIECC aiecc HINTS "${Python_ROOT_DIR}/bin" REQUIRED)
-# Same flags as ArtcOperator.compile() (artlite/operators/base.py: build, CORE_LLC_FLAGS).
+# Same flags as ArtcOperator.compile() (artlite/operators/build.py: build, toolchain.CORE_LLC_FLAGS).
 set(AIECC_FLAGS
   --unified
   --get-pdi --get-npu-insts
