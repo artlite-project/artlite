@@ -51,8 +51,8 @@ class _Piece(NamedTuple):
 
 class PieceCache:
     """The assembled pieces of the programs a Library runs again, and the shortest seen duration of each. A program's
-    items are a list the caller keeps (e.g. ChunkPrefill's per chunk size): an entry is of that list object, found by its
-    ``id`` and confirmed by identity (an entry keeps its list alive, so its id is not reused while it is held)."""
+    items are a list the caller keeps (e.g. ChunkPrefill's per chunk size): an entry is of that list object, found by
+    its ``id`` and confirmed by identity (an entry keeps its list alive, so its id is not reused while it is held)."""
 
     ENDS_KEPT = 4096  # (durations kept)
 

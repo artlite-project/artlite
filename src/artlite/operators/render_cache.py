@@ -205,8 +205,8 @@ def _key(op: ArtcOperator | FusedElf) -> str | None:
     if k is None:
         return None
     # (the builds' keys: also the tools' modification times, a reinstalled or locally built toolchain)
-    versions = (_sources(), version("mlir_aie"), version("llvm_aie"), os.path.getmtime(toolchain.aiecc()), os.path.getmtime(toolchain.clangpp()),
-                sys.version_info[:2])
+    versions = (_sources(), version("mlir_aie"), version("llvm_aie"), os.path.getmtime(toolchain.aiecc()),
+                os.path.getmtime(toolchain.clangpp()), sys.version_info[:2])
     return hashlib.sha256(repr((k, versions)).encode()).hexdigest()[:32]
 
 

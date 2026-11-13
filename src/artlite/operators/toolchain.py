@@ -32,9 +32,9 @@ CACHE_DIR = os.environ.get(
 AIE_TARGET = "aie2p-none-unknown-elf"
 
 # llc flags for the cores' own code (the worker loops aiecc generates from a design; the kernels are clang++'s): a loop
-# without a known minimum trip count (an object fifo's skip loop: acquire, release) as a branch loop, not a zero-overhead
-# loop padded with full NOP bundles (~32 instead of ~180 B each: the Gemma decode overlay's attention cores' loop 1840 ->
-# 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
+# without a known minimum trip count (an object fifo's skip loop: acquire, release) as a branch loop, not a
+# zero-overhead loop padded with full NOP bundles (~32 instead of ~180 B each: the Gemma decode overlay's attention
+# cores' loop 1840 -> 1408 B, the main cores' 2400 -> 2192). aiecc passes them on (-Xllc).
 CORE_LLC_FLAGS = ("--enable-aie-zol-without-minitercount=false",)
 
 
@@ -101,8 +101,8 @@ def clang_cmd_common() -> list[str]:
 
 
 def _tool_env() -> dict[str, str] | None:
-    """The environment of the build tools (None: this process's). aiecc packs a full ELF with aiebu-asm, which mlir-aie's
-    Windows wheels lack: XRT's joins PATH."""
+    """The environment of the build tools (None: this process's). aiecc packs a full ELF with aiebu-asm, which
+    mlir-aie's Windows wheels lack: XRT's joins PATH."""
     if not portable.WINDOWS or shutil.which("aiebu-asm") or not (tool := backend.xrt_tool("aiebu-asm")):
         return None
     return {**os.environ, "PATH": os.path.dirname(tool) + os.pathsep + os.environ.get("PATH", "")}

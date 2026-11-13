@@ -1,5 +1,5 @@
-"""The tile registers of ``artlite.npu_regs`` against aie-rt's ``xaie2pgbl_params.h`` (the NPU's register map: shipped in
-the mlir_aie wheel), and the BD lock fields' decoder."""
+"""The tile registers of ``artlite.npu_regs`` against aie-rt's ``xaie2pgbl_params.h`` (the NPU's register map:
+shipped in the mlir_aie wheel), and the BD lock fields' decoder."""
 
 import glob
 import os
@@ -47,7 +47,8 @@ class Header:
 @pytest.fixture(scope="module")
 def h() -> Header:
     wheel = find_spec("mlir_aie").submodule_search_locations[0]
-    found = glob.glob(os.path.join(wheel, "runtime_lib", "*", "xaiengine", "include", "xaiengine", "xaie2pgbl_params.h"))
+    found = glob.glob(os.path.join(wheel, "runtime_lib", "*", "xaiengine", "include", "xaiengine",
+                                   "xaie2pgbl_params.h"))
     if not found:
         pytest.skip("the mlir_aie wheel ships no xaie2pgbl_params.h")
     return Header(found[0])
@@ -72,7 +73,8 @@ def _locks_and_bds(h: Header, module: str, tile: npu_regs.TileMap, n_locks: int,
     assert h.reg(f"{module}_LOCK1_VALUE") - tile.locks[0] == npu_regs.LOCK_STRIDE
     assert h.reg(f"{module}_LOCK{n_locks - 1}_VALUE") + npu_regs.LOCK_STRIDE == tile.locks[1]
     assert not h.has(f"{module}_LOCK{n_locks}_VALUE")
-    assert h.reg(f"{module}_DMA_BD0_0") == tile.bds[0] and h.reg(f"{module}_DMA_BD1_0") - tile.bds[0] == npu_regs.BD_STRIDE
+    assert h.reg(f"{module}_DMA_BD0_0") == tile.bds[0]
+    assert h.reg(f"{module}_DMA_BD1_0") - tile.bds[0] == npu_regs.BD_STRIDE
     assert h.reg(f"{module}_DMA_BD{n_bds - 1}_0") + npu_regs.BD_STRIDE == tile.bds[1] and tile.n_bds == n_bds
     assert not h.has(f"{module}_DMA_BD{n_bds}_0")
     assert h.reg(f"{module}_DMA_BD0_{word}") == tile.bd_register(0, word)
@@ -81,7 +83,8 @@ def _locks_and_bds(h: Header, module: str, tile: npu_regs.TileMap, n_locks: int,
     assert f.valid == h.lsb(bd + "VALID_BD") and f.acq_enable == h.lsb(bd + "LOCK_ACQ_ENABLE")
     assert f.acq_value == h.lsb(bd + "LOCK_ACQ_VALUE") and h.width(bd + "LOCK_ACQ_VALUE") == 7
     assert f.rel_id == h.lsb(bd + "LOCK_REL_ID") and f.rel_value == h.lsb(bd + "LOCK_REL_VALUE")
-    assert f.acq_id_width == h.width(bd + "LOCK_ACQ_ID") == h.width(bd + "LOCK_REL_ID") and h.lsb(bd + "LOCK_ACQ_ID") == 0
+    assert f.acq_id_width == h.width(bd + "LOCK_ACQ_ID") == h.width(bd + "LOCK_REL_ID")
+    assert h.lsb(bd + "LOCK_ACQ_ID") == 0
     assert h.width(bd + "LOCK_REL_VALUE") == 7 and h.lsb(bd + "VALID_BD") == h.lsb(bd + "VALID_BD")
 
 
@@ -137,10 +140,12 @@ def test_shim_tile(h: Header) -> None:
 
 def test_txn_registers(h: Header) -> None:
     """The shim DMA words ``txn`` owns, and the memory and core tile registers it takes from ``npu_regs``."""
-    assert h.reg("NOC_MODULE_DMA_BD0_0") == txn.SHIM_BD0 and h.reg("NOC_MODULE_DMA_BD1_0") - txn.SHIM_BD0 == txn.BD_BYTES
+    assert h.reg("NOC_MODULE_DMA_BD0_0") == txn.SHIM_BD0
+    assert h.reg("NOC_MODULE_DMA_BD1_0") - txn.SHIM_BD0 == txn.BD_BYTES
     assert h.reg("NOC_MODULE_DMA_S2MM_0_CTRL") == txn.CTRL[txn.S2MM][0]
     assert h.reg("NOC_MODULE_DMA_MM2S_1_TASK_QUEUE") == txn.QUEUE[txn.MM2S][1]
-    assert txn.MEM_BD0 == MEM_TILE.bds[0] and txn.MEM_LOCK0 == MEM_TILE.locks[0] and txn.CORE_LOCK0 == CORE_TILE.locks[0]
+    assert txn.MEM_BD0 == MEM_TILE.bds[0] and txn.MEM_LOCK0 == MEM_TILE.locks[0]
+    assert txn.CORE_LOCK0 == CORE_TILE.locks[0]
     assert h.reg("MEM_TILE_MODULE_DMA_S2MM_0_CTRL") == txn.MEM_S2MM_CTRL
     assert h.reg("MEM_TILE_MODULE_DMA_MM2S_0_CTRL") == txn.MEM_MM2S_CTRL
 

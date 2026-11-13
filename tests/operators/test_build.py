@@ -41,6 +41,7 @@ def test_keys_unchanged() -> None:
                                                        version("llvm_aie"), True, flags)
     rtc = dataclasses.replace(RTC, clang_flags=("-DX",), aiecc_flags=("--y",), profile_key=("p",))
     assert rtc.cache_key(PCH) == toolchain.cache_key(rtc.source, "-DX", rtc.mlir, PCH, ("p",), flags, "--y")
+    assert RTC.cache_key(PCH) == "38bc0566d75549e2"  # (the key of the formula before the spec owned it)
 
 
 class FakeTools:

@@ -100,7 +100,8 @@ def far(vals: dict[tuple[int, int], dict[int, int]], run: Run) -> bool:
                       if ((reg & 0xFFFFF) + 4 * i - t.bds[0]) % stride == 4 * word]
     for w in words:
         f = t.bd_locks(w)
-        if f.valid and ((f.acq_enable and f.acq_id not in t.own_locks) or (f.rel_value and f.rel_id not in t.own_locks)):
+        if f.valid and ((f.acq_enable and f.acq_id not in t.own_locks)
+                        or (f.rel_value and f.rel_id not in t.own_locks)):
             return True
     return False
 

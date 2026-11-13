@@ -132,19 +132,20 @@ class TileMap:
 
 
 CORE_TILE = TileMap(
-    "core", locks=(0x1F000, 0x1F100), own_locks=range(16), bds=(0x1D000, 0x1D200), iteration_word=None, start_bd_mask=0xF,
-    dma=(0x1DE00, 0x1DE20), s2mm_channels=2, program=(0x20000, 0x24000), control=(0x32000, 0x32004), data_bytes=0x10000,
+    "core", locks=(0x1F000, 0x1F100), own_locks=range(16), bds=(0x1D000, 0x1D200), iteration_word=None,
+    start_bd_mask=0xF, dma=(0x1DE00, 0x1DE20), s2mm_channels=2, program=(0x20000, 0x24000),
+    control=(0x32000, 0x32004), data_bytes=0x10000,
     masters=(0x3F000, 0x3F05C), slaves=(0x3F100, 0x3F164), slot0=0x3F200, south0_slave=0x3F114, south0_slots=0x3F250,
     tile_ctrl_master=0x3F00C, north0_master=0x3F034, lock_word=_LockWord(5, 25, 12, 4, 5, 13, 18))
 MEM_TILE = TileMap(
-    "memtile", locks=(0xC0000, 0xC0400), own_locks=range(64, 128), bds=(0xA0000, 0xA0600), iteration_word=6, start_bd_mask=0x3F,
-    dma=(0xA0600, 0xA0660), s2mm_channels=6, program=None, control=None, data_bytes=0x80000,
+    "memtile", locks=(0xC0000, 0xC0400), own_locks=range(64, 128), bds=(0xA0000, 0xA0600), iteration_word=6,
+    start_bd_mask=0x3F, dma=(0xA0600, 0xA0660), s2mm_channels=6, program=None, control=None, data_bytes=0x80000,
     masters=(0xB0000, 0xB0044), slaves=(0xB0100, 0xB0148), slot0=0xB0200, south0_slave=0xB011C, south0_slots=0xB0270,
     tile_ctrl_master=0xB0018, north0_master=0xB002C, lock_word=_LockWord(7, 31, 15, 8, 8, 16, 24),
-    iteration_mask=(1 << 23) - 1)  # (word 6: Iteration_Current 28:23, which the DMA advances, Wrap 22:17, Stepsize 16:0)
+    iteration_mask=(1 << 23) - 1)  # (word 6: Iteration_Current 28:23, the DMA's; Wrap 22:17, Stepsize 16:0)
 SHIM_TILE = TileMap(
-    "shim", locks=None, own_locks=None, bds=None, iteration_word=None, start_bd_mask=0, dma=None, s2mm_channels=2, program=None,
-    control=None, data_bytes=None, masters=(0x3F000, 0x3F058), slaves=(0x3F100, 0x3F15C), slot0=0x3F200,
+    "shim", locks=None, own_locks=None, bds=None, iteration_word=None, start_bd_mask=0, dma=None, s2mm_channels=2,
+    program=None, control=None, data_bytes=None, masters=(0x3F000, 0x3F058), slaves=(0x3F100, 0x3F15C), slot0=0x3F200,
     south0_slave=None, south0_slots=None, tile_ctrl_master=None, north0_master=0x3F030, lock_word=None)
 SHIM_MUX, SHIM_MUX_SOUTH3_DMA = 0x1F000, 0x400  # (the shim's mux: South 3 from its DMA; the loader's route)
 SHIM_SLAVE_SOUTH3 = 0x3F114  # (the slave port South 3's configuration; its port number is 5)

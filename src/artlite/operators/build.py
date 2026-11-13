@@ -1,22 +1,21 @@
 """Builds: a rendered design (``BuildSpec``) into its cache directory, its artifacts published whole.
 
 ``build`` compiles the kernels (Peano: ``kernel.cc`` -> ``kernel.o``) and the design (``aiecc``: ``design.mlir`` ->
-``main.pdi`` + ``insts.bin``, or a fused design's full ELF) into ``CACHE_DIR/<kind>_<key>/``, ``BuildSpec.cache_key`` the
-only key. Builds of one key serialize on a lock file (the later ones find the cache); distinct keys run in parallel.
+``main.pdi`` + ``insts.bin``, or a fused design's full ELF) into ``CACHE_DIR/<kind>_<key>/``, ``BuildSpec.cache_key``
+the only key. Builds of one key serialize on a lock file (the later ones find the cache); distinct keys run in parallel.
 
 An artifact a later build takes for cached is never a partial one:
 
 - a single file a tool writes (``kernel.o`` with its ``kernel.su``, the precompiled header) is written under a temporary
   name and renamed whole once the tool succeeded;
-- aiecc writes its outputs and its project directory in place: ``IN_PROGRESS`` exists in the directory from before it runs
-  until it and its checks succeeded, and a directory that has it is built again (a build that failed, or one killed, leaves
-  it).
+- aiecc writes its outputs and its project directory in place: ``IN_PROGRESS`` exists in the directory from before it
+  runs until it and its checks succeeded, and a directory that has it is built again (a build that failed, or one
+  killed, leaves it).
 """
 
 import glob
 import os
 import shutil
-import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -72,7 +71,8 @@ class BuildSpec:
 
     def cache_key(self, pch_path: str) -> str:
         """The build's key: everything its artifacts depend on (``pch_path``: the precompiled header, a key of the
-        compile command and the headers)."""
+        compile command and the headers). A fused design's key also covers the compiler and aiecc flags (both empty in
+        every design today, so the keys of the existing builds are unchanged)."""
         if self.kind is BuildKind.FUSED:
             return toolchain.cache_key(self.source, self.mlir, pch_path, version("mlir_aie"), version("llvm_aie"),
                                        self.expand_load_pdis, CORE_LLC_FLAGS, *self.clang_flags, *self.aiecc_flags)
@@ -85,10 +85,6 @@ def buildable(spec: BuildSpec) -> bool:
     lowering, intermediates) from its process, so a spec of another one (a planning subprocess's) only where they
     agree."""
     return spec.kind is not BuildKind.RTC or spec.profile_key == profile_key(profiling.get_config())
-
-
-def _tmp_name() -> str:
-    return f"{os.getpid()}_{threading.get_ident()}"
 
 
 def compile_pch(*, clang_cmd: list[str]) -> str:
@@ -127,7 +123,7 @@ def compile_pch(*, clang_cmd: list[str]) -> str:
     # partially-written .pch from a parallel process crashes clang.
     with portable.file_lock(operators_pch_path + ".lock"):
         if not os.path.exists(operators_pch_path):
-            tmp = os.path.join(operators_pch_dir, f"{pch_hash}.{_tmp_name()}.tmp.pch")
+            tmp = os.path.join(operators_pch_dir, f"{pch_hash}.tmp.pch")
             try:
                 toolchain.run([*pch_cmd, "-x", "c++-header", OPERATORS_H, "-o", tmp])
                 os.replace(tmp, operators_pch_path)
@@ -165,8 +161,8 @@ def compile_kernel(
         return
 
     # kernel.su is named after the object: both under one temporary name, the .su first (kernel.o is what makes the
-    # compile cached)
-    stem = os.path.join(work_dir, f"kernel.{_tmp_name()}.tmp")
+    # compile cached). The key's lock serializes the builds, so a killed one's leftovers are overwritten by the next.
+    stem = os.path.join(work_dir, "kernel.tmp")
     try:
         toolchain.run([*clang_cmd, "-fstack-usage", "-include-pch", operators_pch_path, "-c", src_path,
                        "-o", stem + ".o"])

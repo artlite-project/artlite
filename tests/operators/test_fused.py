@@ -485,7 +485,8 @@ def test_control_packets_encoding(tmp_path):
                     f"#aie.packet_info<pkt_type = 0, pkt_id = {ctrlpkt.ROW_ID[4]}>}}\n    aie.runtime_sequence() {{\n"
                     f"{ops}\n    }}\n  }}\n}}\n")
     out = tmp_path / "pk.bin"
-    subprocess.run([os.path.join(os.path.dirname(toolchain.aiecc()), "aie-translate"), "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
+    translate = os.path.join(os.path.dirname(toolchain.aiecc()), "aie-translate")
+    subprocess.run([translate, "--aie-ctrlpkt-to-bin", str(mlir), "-o", str(out)], check=True)
     want = np.fromfile(out, np.uint32)
     assert np.array_equal(ctrlpkt.packets(ctrlpkt.ROW_ID[4], writes), want)
 

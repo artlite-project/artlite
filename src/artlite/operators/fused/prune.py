@@ -44,7 +44,8 @@ def prune(cfg: np.ndarray, zero: Collection[int] = ()) -> tuple[np.ndarray, list
         if op == txn.OP_WRITE:
             if off in _START_QUEUES.get(min(row, 2), ()):
                 started.add(tile)
-            lock = (row >= 2 and CORE_TILE.locks[0] <= off < CORE_TILE.locks[1]) or (row == 1 and MEM_TILE.locks[0] <= off < MEM_TILE.locks[1])
+            lock = ((row >= 2 and CORE_TILE.locks[0] <= off < CORE_TILE.locks[1])
+                    or (row == 1 and MEM_TILE.locks[0] <= off < MEM_TILE.locks[1]))
             if lock and off % 16 == 0 and tile not in started:
                 if locks.get(reg, 0) == v:
                     drop.add(k)

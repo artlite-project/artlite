@@ -46,7 +46,8 @@ def test_prune_locks_and_ports() -> None:
 
 
 def test_prune_core_control() -> None:
-    """A core control write that leaves its value after the reset (Reset set, Enable clear) is dropped; the enable stays."""
+    """A core control write that leaves its value after the reset (Reset set, Enable clear) is dropped; the enable
+    stays."""
     t = txn.Txn()
     t.maskwrite32(core(CORE_TILE.control[0]), 2, 3)
     t.maskwrite32(core(CORE_TILE.control[0]), 1, 1)
@@ -119,8 +120,9 @@ def test_piece_cache() -> None:
     piece = _Piece(items, np.zeros(10, np.uint32), 1, [3])
     assert cache.get(items, 0, 1, 0) is None
     cache.put(0, 1, 0, piece)
-    assert cache.get(items, 0, 1, 0) is piece and cache.get(items, 0, 1, 1) is None and cache.get(list(items), 0, 1, 0) is None
-    cache.put(0, 1, 1, _Piece(items, np.zeros(20, np.uint32), 0, [3]))  # (40 + 80 B: over the limit: the first is dropped)
+    assert cache.get(items, 0, 1, 0) is piece and cache.get(items, 0, 1, 1) is None
+    assert cache.get(list(items), 0, 1, 0) is None
+    cache.put(0, 1, 1, _Piece(items, np.zeros(20, np.uint32), 0, [3]))  # (40 + 80 B: over the limit: first dropped)
     assert cache.get(items, 0, 1, 0) is None and cache.get(items, 0, 1, 1) is not None
     assert cache.end(items, 0, 1) is None
     cache.note_end(items, 0, 1, 0.5)

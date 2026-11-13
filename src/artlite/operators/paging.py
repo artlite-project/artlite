@@ -477,7 +477,8 @@ def _stack(work_dir: str, calls: dict[str, set[str]]) -> dict[str, int]:
     return stack_usage(os.path.join(work_dir, "kernel.o"), su, calls=calls)
 
 
-def _link_page(prj: str, obj: ObjectFile, own: set[int], script: str, slot: int, name: str, core: tuple[int, int]) -> str:
+def _link_page(prj: str, obj: ObjectFile, own: set[int], script: str, slot: int, name: str,
+               core: tuple[int, int]) -> str:
     """Link page ``name``: kernel.o with its sections ``own`` renamed .text. -> .ptxt., placed at ``slot`` (the crt's
     startup code after it, outside program memory: it ran before any page)."""
     path = os.path.join(prj, f"page_{name}.elf")

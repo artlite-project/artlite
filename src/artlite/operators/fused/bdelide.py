@@ -96,7 +96,8 @@ def _bd_units(run: np.ndarray, ops: list[tuple[int, int]]) -> _BdUnits:
     while k < len(ops):
         p, op = ops[k]
         addr = int(run[p + 2]) if op == txn.OP_BLOCKWRITE else 0
-        if op != txn.OP_BLOCKWRITE or txn.address_row(addr) != 1 or not MEM_TILE.bds[0] <= addr & 0xFFFFF < MEM_TILE.bds[1]:
+        if (op != txn.OP_BLOCKWRITE or txn.address_row(addr) != 1
+                or not MEM_TILE.bds[0] <= addr & 0xFFFFF < MEM_TILE.bds[1]):
             k += 1
             continue
         n = ends[k] - p - 4

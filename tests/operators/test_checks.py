@@ -68,7 +68,8 @@ def test_parse() -> None:
     assert list(f) == ["entry", "mid", "setter", "leaf", "self_call", "core_1_2"]
     assert f["entry"].relocs == ("mid", "setter", ".text.leaf") and f["entry"].frame == 0x40
     assert f["mid"].rounds and not f["mid"].sets_rounding and f["setter"].sets_rounding and f["leaf"].rounds
-    assert f["self_call"].acquires == {0x34} and [j.split("\t", 1)[1] for j in f["self_call"].jumps] == ["jnz\tr1, #0x0", "jl\t#0x0"]
+    assert f["self_call"].acquires == {0x34}
+    assert [j.split("\t", 1)[1] for j in f["self_call"].jumps] == ["jnz\tr1, #0x0", "jl\t#0x0"]
     assert f["core_1_2"].frame == 0x80 and f["leaf"].frame is None and not f["leaf"].jumps
 
 
@@ -90,7 +91,7 @@ def test_stack_usage(obj: str) -> None:
     assert use["entry"] == 16 + 32 + 64 and use["setter"] == 8 + 48 and use["leaf"] == 48
     assert use["self_call"] == 24  # (its own call is not a callee)
     loop = checks.stack_usage(obj, su, calls={"leaf": {"mid"}})  # (recursion: counted once, not forever)
-    assert loop["leaf"] == 48 + 32 + 64 and loop["mid"] == 32 + max(48 + 32, 64)  # (a cycle's frames once, in any order)
+    assert loop["leaf"] == 48 + 32 + 64 and loop["mid"] == 32 + max(48 + 32, 64)  # (a cycle's frames once)
     more = checks.stack_usage(obj, su, calls={"leaf": {"setter"}})  # (an indirect call: leaf -> setter -> leaf)
     assert more["leaf"] == 48 + 8 + 48
     ind = checks.stack_usage(obj, su, indirect=[(r"^(ent)ry$", r"^s[a-z_]+$")])  # (entry calls every function s...)
@@ -166,9 +167,9 @@ def test_design() -> None:
     assert cores == [("0,2", 256, {"k"}), ("1,2", checks.DEFAULT_STACK, {"k"})]
 
 
-def test_analyze(obj: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Errors (a core whose deepest call and own frames exceed its stack) and warnings (rounding, library calls), and
-    ``ARTLITE_CHECKS=strict`` makes the warnings errors."""
+def test_analyze(obj: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,
+                 capsys: pytest.CaptureFixture[str]) -> None:
+    """Errors (a core whose deepest call and own frames exceed its stack) and warnings (rounding, library calls)."""
     mlir = MLIR.replace("@k", "@entry").replace("memref<16xi32>, i32", "").replace("(%b, %v)", "()").replace(
         "(memref<16xi32>, i32) -> ()", "() -> ()")
     errors, warnings = checks.analyze(source=None, mlir_text=mlir, obj_path=obj)
@@ -176,10 +177,7 @@ def test_analyze(obj: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch) ->
     assert len(errors) == 1 and "core (0,2)" in errors[0] and "need 304 B of stack" in errors[0], errors
     assert len(warnings) == 2 and warnings[0].startswith("kernels that round without setting") and "mid" in warnings[0]
     assert "scalar arithmetic through runtime library calls" in warnings[1]
-    monkeypatch.setenv("ARTLITE_CHECKS", "strict")
-    with pytest.raises(checks.DesignCheckError, match="round without setting"):
-        checks.check(source=None, mlir_text=mlir.replace("256", "4096"), obj_path=obj, label="T")
-    monkeypatch.setenv("ARTLITE_CHECKS", "")
     checks.check(source=None, mlir_text=mlir.replace("256", "4096"), obj_path=obj, label="T")
+    assert "T: kernels that round without setting" in capsys.readouterr().err
     monkeypatch.setenv("ARTLITE_SKIP_CHECKS", "1")
     checks.check(source=None, mlir_text=mlir, obj_path=obj, label="T")

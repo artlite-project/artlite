@@ -83,8 +83,8 @@ class ArtcOperator:
     """
 
     AIECC_FLAGS: tuple[str, ...] = ()  # (aiecc options of the design)
-    # (calls the stack check cannot see in the object: (pattern of a caller's linked name, template of its callees' names
-    # expanded with the caller's match), ``checks.stack_usage``)
+    # (calls the stack check cannot see in the object: (pattern of a caller's linked name, template of its callees'
+    # names expanded with the caller's match), ``checks.stack_usage``)
     INDIRECT_CALLS: tuple[tuple[str, str], ...] = ()
 
     def __new__(cls, *args: object, **kwargs: object) -> Self:

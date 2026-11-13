@@ -223,13 +223,15 @@ class Loader:
         memtile in circuit mode without packets."""
         a, out = txn.tile_address, []
         for c, rows in self.columns.items():
-            out += [(a(c, 0, SHIM_MUX), [SHIM_MUX_SOUTH3_DMA], "mux"), (a(c, 0, SHIM_SLAVE_SOUTH3), [SWITCH_ENABLE], "ports"),
+            out += [(a(c, 0, SHIM_MUX), [SHIM_MUX_SOUTH3_DMA], "mux"),
+                    (a(c, 0, SHIM_SLAVE_SOUTH3), [SWITCH_ENABLE], "ports"),
                     self._masters(c, 0, {SHIM_TILE.north0_master: SWITCH_ENABLE | _SHIM_SOUTH3})]
             for r in range(1, rows[-1] + 1):
                 t = tile_map(r)
                 slave, slots0, ctrl, north = t.south0_slave, t.south0_slots, t.tile_ctrl_master, t.north0_master
                 if r == 1 and r not in rows:
-                    out += [(a(c, 1, slave), [SWITCH_ENABLE], "ports"), self._masters(c, 1, {north: SWITCH_ENABLE | _MEM_SOUTH0})]
+                    out += [(a(c, 1, slave), [SWITCH_ENABLE], "ports"),
+                            self._masters(c, 1, {north: SWITCH_ENABLE | _MEM_SOUTH0})]
                     continue
                 up = [ROW_ID[q] for q in rows if q > r]
                 slots = ([slot(ROW_ID[r], 0)] if r in rows else []) + _north(ROW_ID[r], up)
@@ -261,12 +263,13 @@ class Loader:
             if op not in (txn.OP_WRITE, txn.OP_MASKWRITE, txn.OP_BLOCKWRITE):
                 continue
             reg = int(rest[p + 2])
-            row = min((reg >> 20) & 0x1F, 2)
+            row = min(txn.address_row(reg), 2)
             n = int(rest[p + 3]) // 4 - 4 if op == txn.OP_BLOCKWRITE else 1
             s0, s1 = tile_map(row).slaves
             for i, v in enumerate(rest[p + 4:p + 4 + n]):
                 off = (reg & 0xFFFFF) + 4 * i
-                if int(v) & SWITCH_PACKET and (s0 <= off < s1 if self.reused else row and off == tile_map(row).south0_slave):
+                south0 = row and off == tile_map(row).south0_slave
+                if int(v) & SWITCH_PACKET and (s0 <= off < s1 if self.reused else south0):
                     packet.add((reg & ~0xFFFFF, (off - s0) // 4))
         if self.reused:
             return sorted(t | (tile_map((t >> 20) & 0x1F).slot0 + 16 * k + 4 * i) for t, k in packet for i in range(4))

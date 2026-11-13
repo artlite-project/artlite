@@ -19,7 +19,8 @@ def values(work_dir: str) -> dict[int, int]:
     out: dict[int, int] = {}
     prj = os.path.join(work_dir, "design.mlir.prj")
     for name in ("main_aie_cdo_init.bin", "main_aie_cdo_enable.bin", "main_aie_cdo_elfs.bin"):
-        path = next((p for p in (os.path.join(prj, "cdo_main", name), os.path.join(prj, name)) if os.path.exists(p)), None)
+        candidates = (os.path.join(prj, "cdo_main", name), os.path.join(prj, name))
+        path = next((p for p in candidates if os.path.exists(p)), None)
         if path is None:
             raise CdoError(f"{work_dir}: no CDO {name}")
         with open(path, "rb") as f:

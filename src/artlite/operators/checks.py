@@ -20,20 +20,19 @@
   slow, and each helper costs program memory. Reported as a warning; vectorize the math (e.g.
   ``al::inv_rms``) or use shifts / ``al::div_small``.
 
-Errors raise ``DesignCheckError``; ``ARTLITE_SKIP_CHECKS=1`` skips the checks, ``ARTLITE_CHECKS=strict`` makes the
-warnings errors too. The kernel object is disassembled once (``objdump``): the checks read its parse.
+Errors raise ``DesignCheckError``; ``ARTLITE_SKIP_CHECKS=1`` skips the checks; warnings go to stderr.
+The kernel object is disassembled once (``objdump``): the checks read its parse.
 """
 
 import glob
-import logging
 import os
 import re
+import sys
 from collections.abc import Iterable
 
 from . import kernel_source, objdump
 
-log = logging.getLogger("artlite.checks")
-DEFAULT_STACK = 1024  # an ``aie.core`` without ``stack_size``: the target's default (mlir-aie's getDefaultCoreStackSize)
+DEFAULT_STACK = 1024  # an ``aie.core`` without ``stack_size``: the target's default (mlir-aie's default core stack)
 _UNKNOWN_FRAME = 64  # stack of a callee without a frame record (runtime library helpers)
 CORE_FRAME = 128  # a core's own frame when its object is not kept (the largest measured)
 MAIN_INIT_FRAME = 64  # the crt's _main_init frame below main's (paddxm [sp], #0x40 before it calls main)
@@ -51,11 +50,6 @@ class DesignCheckError(RuntimeError):
 
 def enabled() -> bool:
     return os.environ.get("ARTLITE_SKIP_CHECKS", "0") != "1"
-
-
-def strict() -> bool:
-    """Whether warnings are errors (``ARTLITE_CHECKS=strict``)."""
-    return os.environ.get("ARTLITE_CHECKS", "") == "strict"
 
 
 def _callees(fn: str, f: objdump.Function) -> set[str]:
@@ -165,11 +159,13 @@ def _design(mlir_text: str) -> tuple[dict[str, list[str]], list[tuple[str, int, 
                 decls[ir.StringAttr(op.attributes["sym_name"]).value] = (
                     [str(t) for t in fty.inputs] + [f"-> {t}" for t in fty.results])
             elif op.name == "aie.core":
-                stack = ir.IntegerAttr(op.attributes["stack_size"]).value if "stack_size" in op.attributes else DEFAULT_STACK
+                stack = (ir.IntegerAttr(op.attributes["stack_size"]).value if "stack_size" in op.attributes
+                         else DEFAULT_STACK)
                 tile = op.operands[0].owner.attributes
                 where = (f"{ir.IntegerAttr(tile['col']).value},{ir.IntegerAttr(tile['row']).value}"
                          if "col" in tile and "row" in tile else "unplaced")
-                callees = {ir.FlatSymbolRefAttr(o.attributes["callee"]).value for o in walk(op) if o.name == "func.call"}
+                callees = {ir.FlatSymbolRefAttr(o.attributes["callee"]).value
+                           for o in walk(op) if o.name == "func.call"}
                 cores.append((where, stack, callees))
     return decls, cores
 
@@ -200,7 +196,8 @@ def _c_signature(item: kernel_source.Item, name: str) -> tuple[str, list[str]] |
 
 def _check_signatures(source: str, decls: dict[str, list[str]]) -> list[str]:
     """The kernels ``decls`` declares against their definitions in ``source`` (a kernel source's items: the item that
-    defines the name holds its signature); a kernel the source does not define is defined elsewhere (a library object)."""
+    defines the name holds its signature); a kernel the source does not define is defined elsewhere (a library
+    object)."""
     errors = []
     items = kernel_source.split(source) if decls else []
     for name, types in decls.items():
@@ -259,15 +256,11 @@ def analyze(*, source: str | None, mlir_text: str, obj_path: str | None,
 
 def check(*, source: str | None, mlir_text: str, obj_path: str | None, label: str,
           indirect: Iterable[tuple[str, str]] = ()) -> None:
-    """Run the checks for one compiled design: errors raise ``DesignCheckError``, warnings are logged (errors too under
-    ``ARTLITE_CHECKS=strict``)."""
+    """Run the checks for one compiled design: errors raise ``DesignCheckError``, warnings go to stderr."""
     if not enabled():
         return
     errors, warnings = analyze(source=source, mlir_text=mlir_text, obj_path=obj_path, indirect=indirect)
-    if strict():
-        errors += warnings
-    else:
-        for w in warnings:
-            log.warning("%s: %s", label, w)
+    for w in warnings:
+        sys.stderr.write(f"{label}: {w}\n")
     if errors:
         raise DesignCheckError(f"{label}: " + "; ".join(errors))
