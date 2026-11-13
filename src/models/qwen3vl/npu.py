@@ -26,9 +26,8 @@ from artlite.vision.shell import (
     require_token_bounds,
 )
 from artlite.vision.weights import gguf_getter
-from artlite.vision.windows import WIN
+from artlite.vision.windows import TOKEN_PX, WIN
 
-from ..images import TOKEN_PX
 from ..sequence import Sequence, load_image
 from . import encoder as V
 from .host import MAX_TOKENS, MIN_TOKENS, Grid, image_pixels

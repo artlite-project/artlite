@@ -5,6 +5,8 @@ the vision overlay.
     python tests/txn_dump.py DIR [--only REGEX]    # per app present: its overlay on a fake device, a scripted run
                                                     # (decode steps; images, a video, clips); per dispatch the
                                                     # transaction's words and digests of the host buffers the NPU reads
+    python tests/txn_dump.py --restore [--only REGEX]  # the media apps' state caches: a run that builds and saves, then
+                                                    # the same run restored: identical dispatches
     python tests/txn_dump.py --diff BEFORE AFTER   # per app the first dispatch that differs, with its first differing
                                                     # operations decoded
 
@@ -151,10 +153,11 @@ def fake_npu() -> Iterator[Callable[[object], _Log]]:
 
 
 @contextlib.contextmanager
-def fake_vision() -> Iterator[_Log]:
+def fake_vision(cache: str | None = None) -> Iterator[_Log]:
     """Within: the vision overlay's devices on one fake device, the log of their dispatches. The vision design compiles
     for real (a cached build: its role pages link from it), only its program is a stand-in; the media models' state
-    caches neither restore nor save (every run builds its programs); their weights pack as usual."""
+    caches neither restore nor save (every run builds its programs; ``cache``: a directory they use, the run restores
+    what an earlier one saved there); their weights pack as usual."""
     from artlite.vision import device as vision_device
     from artlite.vision import shell
 
@@ -171,8 +174,11 @@ def fake_vision() -> Iterator[_Log]:
         for name, value in (("turn_enter", lambda: None), ("turn_leave", lambda: None), ("turn_foreign", lambda: 0)):
             stack.enter_context(mock.patch.object(_native, name, value))
         stack.enter_context(mock.patch.object(vision_device, "OverlayDevice", overlay_device))
-        for name in ("load_state", "save_state"):
-            stack.enter_context(mock.patch.object(shell, name, lambda *a, **kw: None))
+        if cache is None:
+            for name in ("load_state", "save_state"):
+                stack.enter_context(mock.patch.object(shell, name, lambda *a, **kw: None))
+        else:
+            stack.enter_context(mock.patch.object(vision_device, "CACHE_DIR", cache))
         yield log
 
 
@@ -362,10 +368,34 @@ def _record(path: str, make: Callable[[str], Callable[[Callable[[object], _Log]]
     return logs[0]
 
 
-def _record_media(path: str, make: Callable[[str], Callable[[_Log], None]]) -> _Log:
-    with fake_vision() as log:
+def _record_media(path: str, make: Callable[[str], Callable[[_Log], None]], cache: str | None = None) -> _Log:
+    with fake_vision(cache) as log:
         make(path)(log)
     return log
+
+
+def restore_check(only: str | None) -> int:
+    """Per media app: a run that builds and saves its state, then the same run restored from it, on fresh fake devices;
+    their dispatches' words and buffers must be identical."""
+    bad = 0
+    for app, (path, make) in MEDIA_APPS.items():
+        if (only and not re.search(only, app)) or not os.path.exists(path):
+            continue
+        with tempfile.TemporaryDirectory() as cache:
+            built = _record_media(path, make, cache).entries
+            assert any(os.scandir(cache)), f"{app}: no state saved"
+            from artlite.vision import shell
+
+            def no_save(*a: object, **kw: object) -> None:
+                raise AssertionError("the state was rebuilt, not restored")
+
+            with mock.patch.object(shell, "save_state", no_save):
+                restored = _record_media(path, make, cache).entries
+        same = len(built) == len(restored) and all(
+            a[0] == b[0] and np.array_equal(a[1], b[1]) and a[2] == b[2] for a, b in zip(built, restored, strict=True))
+        print(f"{app}: restored run {'identical' if same else 'DIFFERS'} ({len(built)} / {len(restored)} dispatches)")
+        bad += not same
+    return 1 if bad else 0
 
 
 def dump(out: str, only: str | None) -> None:
@@ -438,12 +468,15 @@ def diff(before: str, after: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("dirs", nargs="+")
+    ap.add_argument("dirs", nargs="*")
     ap.add_argument("--diff", action="store_true", help="compare two dumps")
+    ap.add_argument("--restore", action="store_true", help="the media apps built, saved, restored: runs compared")
     ap.add_argument("--only", help="the apps whose names match (a regular expression)")
     a = ap.parse_args()
     if a.diff:
         sys.exit(diff(*a.dirs))
+    if a.restore:
+        sys.exit(restore_check(a.only))
     dump(a.dirs[0], a.only)
 
 

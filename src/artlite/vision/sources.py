@@ -1,8 +1,9 @@
 """The code a cached state depends on, derived from the import graph (``import_closure``): the modules a network's
-loader imports within ``artlite`` and ``models`` (statically: every ``import`` of a module's source, function-local ones
-included), their packages' ``__init__`` modules (not what those import), and each module's kernel templates
-(``x.py``'s ``x.*.jinja``). A state's key (``device.state_dir``) hashes these files, so that a change to anything that builds the state's programs
-and images makes its cache miss; nothing lists them by hand."""
+loader imports within ``artlite`` and ``models`` (statically: every ``import`` of a module's source outside
+``if TYPE_CHECKING:``, function-local ones included), their packages' ``__init__`` modules (not what those import), and
+each module's kernel templates (``x.py``'s ``x.*.jinja``). A state's key (``device.state_dir``) hashes these files, so
+that a change to anything that builds the state's programs and images makes its cache miss; nothing lists them by
+hand."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import ast
 import functools
 import glob
 import os
+from collections.abc import Iterator
 
 from ..operators.base import PACKAGE_DIR
 
@@ -26,6 +28,18 @@ def module_path(name: str) -> str | None:
     return None
 
 
+def _walk(tree: ast.AST) -> Iterator[ast.AST]:
+    """The nodes of ``tree`` outside ``if TYPE_CHECKING:`` blocks (annotations only: no code of theirs runs)."""
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+            for n in node.orelse:
+                yield n
+                yield from _walk(n)
+            continue
+        yield node
+        yield from _walk(node)
+
+
 @functools.cache
 def imports(name: str) -> frozenset[str]:
     """The modules of ``ROOTS`` that module ``name``'s source imports (``from p import m``: ``p.m`` where that is a
@@ -36,7 +50,7 @@ def imports(name: str) -> frozenset[str]:
         tree = ast.parse(f.read(), path)
     package = name if os.path.basename(path) == "__init__.py" else name.rpartition(".")[0]
     out: set[str] = set()
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Import):
             out.update(a.name for a in node.names)
         elif isinstance(node, ast.ImportFrom):

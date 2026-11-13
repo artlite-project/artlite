@@ -449,9 +449,8 @@ class WindowEncoder:
 
     def __call__(self, px: np.ndarray, two: bool = False) -> np.ndarray:
         """An image's pixels (uint8 (H, W, 3), multiples of ``TOKEN_PX``) or a video's pair of frames ((2, H, W, 3)) ->
-        its
-        embeddings (H / 32 W / 32, proj) in raster order; ``two``: two of them of one size (px stacked; ``packs``) in
-        one run -> (2, H / 32 W / 32, proj)."""
+        its embeddings (H / TOKEN_PX W / TOKEN_PX, proj) in raster order; ``two``: two of them of one size (px stacked;
+        ``packs``) in one run -> (2, H / TOKEN_PX W / TOKEN_PX, proj)."""
         pair = px.ndim == 4 + two
         lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
         assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape

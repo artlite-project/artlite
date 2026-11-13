@@ -510,6 +510,11 @@ def _final_mlp(bd: Builder, w: dict[str, np.ndarray], name: str, mc: Tensor) -> 
     return e
 
 
+def out_name(name: str) -> str:
+    """The DDR image of the final merger's embeddings, for the merger built under ``name``."""
+    return name + ".out"
+
+
 def final(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int) -> str:
     """The final merger of ``POST``'s band (x, its records at rec; freed): post_ln (``_post``, to DDR), the band's 4
     windows of each group as one tile of 16 merged tokens (``_merged``: a DDR round trip of block copies), the MLP
@@ -520,9 +525,9 @@ def final(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int)
     free(bd, y)
     e = _final_mlp(bd, w, name, _merged(bd, [(f"{name}.p", 2 * k) for k in range(4)], name))
     l16 = e.lv
-    bd.op(_xfer(bd, name + ".out", l16.ct(C), fill=False, mem=e.addr, nbytes=l16.ct(C)), {})
+    bd.op(_xfer(bd, out_name(name), l16.ct(C), fill=False, mem=e.addr, nbytes=l16.ct(C)), {})
     free(bd, e)
-    return name + ".out"
+    return out_name(name)
 
 
 def final_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> str:
@@ -537,9 +542,9 @@ def final_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> s
     t16 = vit_level(1, 16).ct(C)
     for k in range(4):
         e = _final_mlp(bd, w, name, _merged(bd, [(p.band(s), 2 * k) for s in range(4)], name))
-        bd.op(_xfer(bd, name + ".out", 4 * t16, fill=False, mem=e.addr, nbytes=t16, off=k * t16), {})
+        bd.op(_xfer(bd, out_name(name), 4 * t16, fill=False, mem=e.addr, nbytes=t16, off=k * t16), {})
         free(bd, e)
-    return name + ".out"
+    return out_name(name)
 
 
 def embeddings(npu: VisionDevice, image: str, entries: list[Entry], merge: int = 4) -> list[np.ndarray]:
@@ -613,12 +618,12 @@ class Encoder:
         self.npu, self.name, self.patch, self.norm = npu, name, patch, w["patch"]["norm"]
         self.merge = 4 if w["insert"] >= 0 else 2  # (patches per output token per side)
         self.pos = np.pad(np.asarray(pos, np.float32), ((0, 0), (0, C - H)))
-        self.out = f"{name}.f.out"  # (the final merger's image: ``final``, ``final_bands``)
+        self.out = out_name(name + ".f")  # (the final merger's image: ``final``, ``final_bands``)
         self.bd = Builder(npu, reuse=state is not None)
         if state is None:
             def build(joint: bool) -> Callable[[Builder], None]:
                 def run(b: Builder) -> None:
-                    assert encode(b, w, joint=joint, name=name) == self.out
+                    assert encode(b, w, joint=joint, name=name) == self.out  # (checked on a build only)
                 return run
             self.programs = {joint: Program.build(npu, self.bd, build(joint)) for joint in (False, True)}
         else:

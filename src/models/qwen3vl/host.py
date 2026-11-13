@@ -20,8 +20,10 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from ..images import TOKEN_PX, marker_prompt, resized
+from artlite.vision.windows import TOKEN_PX
+
 from ..images import Grid as MergedGrid
+from ..images import marker_prompt, resized
 from ..sequence import Sequence
 
 MIN_TOKENS, MAX_TOKENS = 8, 4096  # (an image's merged tokens: llama.cpp's bounds for Qwen-VL)

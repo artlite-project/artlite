@@ -33,8 +33,10 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
+from artlite.vision.windows import TOKEN_PX
+
 from .. import images
-from ..images import TOKEN_PX, Grid, resized
+from ..images import Grid, resized
 from ..sequence import Sequence
 
 MIN_TOKENS, MAX_TOKENS = 64, 4096  # (an image's merged tokens: the mmproj's min pixels / 1024, llama.cpp's cap)

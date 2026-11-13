@@ -11,8 +11,6 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from artlite.vision.windows import TOKEN_PX  # noqa: F401 (the models' ``align``: a merged token's pixels per side)
-
 from .sequence import Sequence, splice
 
 

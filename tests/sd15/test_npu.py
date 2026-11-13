@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from artlite.model_config import sd15_dir
+from artlite.vision.device import VisionDevice
 from models import is_diffusers
 from models.sd15.npu import NpuUNet, NpuVae
 from models.sd15.pipeline import Backend, StableDiffusion
@@ -26,7 +27,10 @@ def model_dir() -> str:
 
 @pytest.fixture(scope="module")
 def npu_unet(model_dir: str) -> NpuUNet:
-    return NpuUNet(f"{model_dir}/unet")
+    npu = VisionDevice()
+    unet = NpuUNet(f"{model_dir}/unet", npu=npu)
+    npu.warm()
+    return unet
 
 
 @pytest.fixture(scope="module")
