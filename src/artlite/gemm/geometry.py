@@ -1,7 +1,7 @@
 """GemmQ's / GemmQd's geometry: what a GEMM's shape, tile format and options make of its passes, tiles and C objects.
 
 ``GemmSpec`` is the request (the operators' keyword arguments, documented there); ``Geometry.variants`` derives from it,
-as pure host arithmetic (no aie import), every size the data movement (``dataflow``), the L1 buffers and the kernels
+as host arithmetic (nothing here builds MLIR), every size the data movement (``dataflow``), the L1 buffers and the kernels
 are written from: the weight fills' units, the MMUL columns, the C objects' rows, the K chunk groups. A geometry is
 frozen: the operator picks the tokens per core row ``m`` (the largest that fits L1, ``with_m``) and, where whole-line
 drains are possible, one of the two drain variants, and keeps the chosen geometry as ``op.geo`` (whose fields the

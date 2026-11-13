@@ -230,7 +230,7 @@ class GemmQOperator(ArtcOperator):
         if runs > 2:
             return False
         chains = [flow.b_chain(c) for c in range(COLS)]
-        depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > SHIM_QUEUE else 2
+        depth = 1 if any(ch is not None and sum(map(len, ch)) > SHIM_QUEUE for ch in chains) else 2
         fills = max(sum(map(len, ch)) if ch is not None else len(flow.b_taps(c)) for c, ch in enumerate(chains))
         return depth * (fills + 1 + runs) <= TILE_BDS
 
@@ -373,9 +373,9 @@ class GemmQOperator(ArtcOperator):
             chains = [flow.b_chain(c) for c in range(COLS)]
             assert all(ch_ is not None for ch_ in chains) or max(len(t) for t in taps) <= SHIM_QUEUE, \
                 "per-pass weight fills beyond a shim queue and no chained fill (passes > MAX_BD_ITER)"
-            assert chains[0] is None or len(chains[0]) <= SHIM_QUEUE, "chained fills beyond a shim queue"
+            assert all(ch_ is None or len(ch_) <= SHIM_QUEUE for ch_ in chains), "chained fills beyond a shim queue"
             # a chained weight fill holds one BD per K chunk until its chunk's drains complete
-            depth = 1 if chains[0] is not None and sum(map(len, chains[0])) > SHIM_QUEUE else 2
+            depth = 1 if any(ch_ is not None and sum(map(len, ch_)) > SHIM_QUEUE for ch_ in chains) else 2
             inflight: list[TaskGroup] = []
             for ch in range(self.mc):
                 tg = TaskGroup()
