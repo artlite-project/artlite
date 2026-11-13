@@ -30,6 +30,7 @@ from . import design as D
 from . import layout as L
 from .seq import ColOps, MemTask, RowOps
 
+_IL_PATS = (1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0)  # (the 4-band convs: B, C walks)
 ROPE2_TAB = 5120  # (a rope2 tile's tables [A | B], m 16: 2 x 16 tokens x 80 bf16)
 ROPE40_TAB = 2560  # (a rope40 tile's table, m 16: 16 tokens x 80 bf16 [rb][cb][64])
 
@@ -328,12 +329,11 @@ class Gemm:
         assert len(calls) <= K.NCALL
         pb = (1, -1152, 4, 0, -5760) if il else (4, 0, 0, -5760, -5760)
         pl = (1, 2560, 4, -2432, -1792) if il else (4, 128, 0, 768, 768)
-        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out = np.zeros(K.CONV_WORDS, np.int64)
         out[:len(words)] = words
         out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [*pb, 0, 0, *pl, 0, 0]
         out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = [w | w << 16 for w in tapw]  # (odd tiles: the same)
         out[K.C_PHASE - K.C_CALLS:] = pw.reshape(-1)
-        assert K.C_PHASE + 24 <= D.WS // 4
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
 
     def _row_words(self) -> np.ndarray:
@@ -360,9 +360,9 @@ class Gemm:
         tapw = [first[dx] * K.CALL | (first[dx + 1] - first[dx]) << 10 | (1 if dx == 0 else 0) << 12 |
                 (1 if dx == 0 and dy else 0) << 15 for dy, dx in self.tap_order(0)]
         tapw = [w | w << 16 for w in tapw]  # (odd tiles: the same)
-        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out = np.zeros(K.CONV_WORDS, np.int64)
         out[:len(words)] = words
-        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
+        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = _IL_PATS
         out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
         out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 4] = (A[4], A[0] | K.SH_OBJ, A[1], A[5] | K.SH_OBJ)
         return (out & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
@@ -390,9 +390,9 @@ class Gemm:
             w = [use[p][dx][0] * K.CALL | use[p][dx][1] << 10 | phase[p].get(dx, 0) << 12 | (dx == 1 and dy > 0) << 15
                  for p in range(2)]
             tapw.append(w[0] | w[0 if self.par0 else 1] << 16)
-        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out = np.zeros(K.CONV_WORDS, np.int64)
         out[:len(words)] = words
-        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
+        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = _IL_PATS
         out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
         out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 16] = [A[7], A[0] | K.SH_OBJ, A[0], 0, 0, 0, 0, 0,
                                                                  A[7], 1152, A[0], A[4] | K.SH_OBJ, 0, 0, 0, 0]
@@ -428,9 +428,9 @@ class Gemm:
             return at[key][0] * K.CALL | at[key][1] << 10 | phase << 12 | (dx == 0 and dy > 0) << 15
         lo, hi = self.wide
         tapw = [tap(lo, dy, dx) | tap(hi, dy, dx) << 16 for dy, dx in self.tap_order(0)]
-        out = np.zeros(K.C_PHASE + 24 - K.C_CALLS, np.int64)
+        out = np.zeros(K.CONV_WORDS, np.int64)
         out[:len(words)] = words
-        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = [1, -1152, 4, 0, -5760, 0, 0, 1, 2560, 4, -2432, -1792, 0, 0]
+        out[K.C_PATS - K.C_CALLS:K.C_TAPW - K.C_CALLS] = _IL_PATS
         out[K.C_TAPW - K.C_CALLS:K.C_PHASE - K.C_CALLS] = tapw
         out[K.C_PHASE - K.C_CALLS:K.C_PHASE - K.C_CALLS + 16] = [A[0], A[7] | K.SH_OBJ, A[0], 0, 0, 0, 0, 0,
                                                                  A[0], 1152, A[5], A[6] | K.SH_OBJ, 0, 0, 0, 0]
@@ -463,7 +463,7 @@ class Gemm:
             cmd[K.C_QKW:K.C_QKW + w.size // 2] = w.view(np.int32)
         if self.conv:
             cmd[[K.C_CONV, K.C_NCH, K.C_R, K.C_ROT, K.C_TPAR]] = self.conv, self.nch, self.R, self.R == 2, self._tpar(row)
-            cmd[K.C_CALLS:K.C_PHASE + 24] = self.conv_words()
+            cmd[K.C_CALLS:K.C_CALLS + K.CONV_WORDS] = self.conv_words()
             assert K.C_BIAS * 4 + self.npo * 160 <= K.C_MASKS * 4
             cmd.view(np.uint8)[4 * K.C_MASKS:4 * K.C_MASKS + 1152] = np.frombuffer(K.shift_masks(self.joined), np.uint8)
         out = cmd.view(np.uint8).copy()
@@ -847,7 +847,7 @@ class Attention:
             for img in range(2):
                 cmd[K.C_KMASK[img]:K.C_KMASK[img] + 6] = m
         elif self.d != 40:
-            assert self.ng <= 32 and K.C_KMASK[0] + 64 <= K.C_WALKS and K.C_KMASK[1] + 64 <= D.WS // 4, "key masks"
+            assert self.ng <= 32, "key masks"
             km = self.key_masks().reshape(2, -1)
             for img in range(2):
                 cmd[K.C_KMASK[img]:K.C_KMASK[img] + 2 * self.ng] = km[img]

@@ -71,51 +71,94 @@ import numpy as np
 from ..gemm.mac import render_mac
 from ..operators import kmath, paging, templating
 from ..operators.kernel_source import kernel_prefix
+from ..operators.words import WordMap
 
-# command header words
+# The command's words (the core copies the first ``CMD_WORDS`` into its workspace): the header ``C_*`` words, then per kind of
+# command the regions it uses; the kinds are objects of their own, whose regions reuse one another's words
+# (``operators.words``: a kind overlaps nothing it extends)
+CMD_WORDS = 64 + 16 * 40 + 96  # the header, up to 16 passes' biases (bf16 [pass][80]), the attention's key masks
+CMD = WordMap("vision command", CMD_WORDS, objects=True)
+_H = CMD.common
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
- C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN) = range(29)
-C_RAISE = 29  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
-C_QKN = 32  # (a RoPE GEMM: each head RMS-normed first, C_INVN, C_EPS its 1 / n and eps, its weights at C_QKW)
-C_DENSE, C_NLIVE = 30, 31  # (attention: the dense key masks, the live groups: the module docstring)
-C_QMASK = 33  # (attention of d 160: per-query key masks from each unit's query object: the module docstring)
-C_ROPE2 = 34  # (a RoPE GEMM of m 16: heads of two passes, ``sd15_ext_r``; the word toggles 1 / 2 per pass)
-C_EPI = 35  # (role e's epilogue at O_ROPE: E_ROPE40 two heads of 40 a pass, E_F32 fp32 out, E_GATE 1 + 2^y as bf16)
-E_ROPE40, E_F32, E_GATE = 1, 2, 3
-C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
-# groups; -1: all; around the command's walks)
-C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
-C_MASKS = 256  # (conv: the lane shifts' byte masks, 1152 B: after the biases of at most 4 passes)
-C_CALLS = 544  # (conv: the taps' MAC calls, CALL words each: ``ops.Gemm.conv_words``)
-C_QKW = C_CALLS  # (a RoPE GEMM with C_QKN, not a conv: its heads' norm weights, 80 bf16)
-CALL, NCALL = 10, 11  # (words of a call, the most calls)
+ C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN, C_RAISE, C_DENSE, C_NLIVE,
+ C_QKN, C_QMASK, C_ROPE2, C_EPI, C_GINV, C_NOBJ, C_DWM, C_NTAP, C_DWS, C_NPAIR, C_GATE, C_DWC) = _H.words(
+    "C_KIND C_M C_NTILE C_NPASS C_NKT C_NRES C_OUT C_STATS C_GSIZE C_CH0 C_G0 C_NBLK C_MODE C_NREC C_INVN C_EPS C_NUNIT C_NQP "
+    "C_NG C_NK C_CONV C_NCH C_R C_ROT C_STF C_ND C_NKP C_TPAR C_JOIN "
+    "C_RAISE "  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
+    "C_DENSE C_NLIVE "  # (attention: the dense key masks, the live groups: the module docstring)
+    "C_QKN "  # (a RoPE GEMM: each head RMS-normed first, C_INVN, C_EPS its 1 / n and eps, its weights at C_QKW)
+    "C_QMASK "  # (attention of d 160: per-query key masks from each unit's query object: the module docstring)
+    "C_ROPE2 "  # (a RoPE GEMM of m 16: heads of two passes, ``sd15_ext_r``; the word toggles 1 / 2 per pass)
+    "C_EPI "  # (role e's epilogue at O_ROPE: E_ROPE40 two heads of 40 a pass, E_F32 fp32 out, E_GATE 1 + 2^y as bf16)
+    "C_GINV "  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
+    "C_NOBJ C_DWM C_NTAP C_DWS "  # (K_DW1: A objects, mode, taps, SiLU of the strips: ``ops.StripConv``)
+    "C_NPAIR "  # (attention of d 40: query pairs a unit, 0: 8)
+    # (attention of d 40: the byte of the output gate's factors 1 / sigmoid(g) (bf16) in a unit's query object (0: none);
+    # role g's at WIN_GATE)
+    "C_GATE "
+    "C_DWC",  # (K_DW1 mode 1: a half's C row block, in elements after its strip)
+    at=0)
+C_ZERO = _H.block("C_ZERO", 16, at=48)  # (16 zero words: a residual of zeros)
+# the values of the header words
+(K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN) = _H.values("K_NOP K_TABLE K_GEMM K_APPLY K_ATTN K_WATTN", of="kind", start=1)
+K_DW, K_DW1 = _H.values("K_DW K_DW1", of="kind", start=8)  # (not paging.header(), 7: a page's first word)
+O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU, O_ROPE = _H.values("O_BF16 O_BFP16 O_GEGLU O_VT O_DS O_GELU O_ROPE", of="out")
+S_NONE, S_GN, S_LN = _H.values("S_NONE S_GN S_LN", of="stats")
+A_GN, A_GNSILU, A_LN, A_RMS = _H.values("A_GN A_GNSILU A_LN A_RMS", of="apply", start=1)
+E_ROPE40, E_F32, E_GATE = _H.values("E_ROPE40 E_F32 E_GATE", of="epi", start=1)
+# (C_STF: a statistics record continued from / kept for the next op: one record over several ops; LayerNorm's: ops of one tile)
+ST_KEEP, ST_HOLD = _H.values("ST_KEEP ST_HOLD", of="stf", start=1)
+
+# a GEMM's or attention's MAC walks (a dims_3d_t each): the walk of A (``C_WALKS``, a GEMM's and attention's P V^T), the walks
+# of B and C (``C_PATS``: also a conv's)
+CALL, NCALL = 10, 11  # (words of a conv's call, the most calls)
+MASK_BYTES = 2 * 576  # (``shift_masks``)
+_PATS_AT = 256 + MASK_BYTES // 4 + CALL * NCALL
+PATS = CMD.kind("mac walks")
+C_PATS = PATS.block("C_PATS", 14, at=_PATS_AT)
+WALKS = CMD.kind("mac walks of A", extends=(PATS,))
+C_WALKS = WALKS.block("C_WALKS", 7, at=_PATS_AT - 7)
+# a GEMM: the biases bf16 [pass][80] from word C_BIAS (at most the passes before the next region: a use site checks its
+# passes)
+GEMM = CMD.kind("gemm", extends=(WALKS,))
+C_BIAS = GEMM.word("C_BIAS", at=64)
+ROPE = CMD.kind("rope gemm", extends=(WALKS,))
+ROPE.word("C_BIAS", at=64)
+C_QKW = ROPE.block("C_QKW", 80, at=_PATS_AT - CALL * NCALL)  # (with C_QKN: its heads' norm weights, 80 bf16 (m 16: 160))
+# a conv (K_GEMM with C_CONV: the tile = the column's tokens: C_R rows of groups): the lane shifts' byte masks (1152 B: after
+# the biases of at most 4 passes), the taps' MAC calls (``ops.Gemm.conv_words``), per tap (the order of its calls and shift
+# phase) a word, the shift phases (per output row a sd15_shift's offsets); the walks of B and C
+CONV = CMD.kind("conv", extends=(PATS,))
+CONV.word("C_BIAS", at=64)
+C_MASKS = CONV.block("C_MASKS", MASK_BYTES // 4, at=256)
+C_CALLS = CONV.block("C_CALLS", CALL * NCALL)
+C_TAPW = CONV.block("C_TAPW", 9, at=_PATS_AT + 14)
+C_PHASE = CONV.block("C_PHASE", 24)
+CONV_WORDS = C_PHASE + 24 - C_CALLS  # (the conv's words from C_CALLS on)
 CROSS = (1, 2, 5, 6)  # (the calls of the 4-band convs' corner taps: their walk crosses between cbuf and the object)
-C_PATS = C_CALLS + CALL * NCALL  # (the MAC's walks of B and C, a dims_3d_t each: a conv's, a GEMM's, attention's P V^T)
-C_WALKS = C_PATS - 7  # (a GEMM's and attention's P V^T: the MAC's walk of A)
-C_TAPW = C_PATS + 14  # (conv: per tap of the order its calls and shift phase)
-C_PHASE = C_TAPW + 9  # (conv: the shift phases, per output row a sd15_shift's offsets)
 SH_OBJ = 1 << 31  # (a shift phase's destination offset in the A object, else in cbuf)
-ST_KEEP, ST_HOLD = 1, 2  # (C_STF: a statistics record continued from / kept for the next op: one record over several
-# ops; LayerNorm's: ops of one tile)
-C_BIAS = 64  # (word of the biases: bf16 [pass][80])
-C_GTAB = 64  # (GroupNorm apply: ``group_words``, two per 16 channels)
-C_ZERO = 48  # (16 zero words: a residual of zeros)
-K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN, K_DW, K_DW1 = 1, 2, 3, 4, 5, 6, 8, 9  # (not paging.header(), 7: a
-# page's first word)
-DW_STRIP, DW_C, DW_MASK = 1600, 3200, 4480  # (a depthwise conv slot: its strips, C, mask words: ``ops.DwConv``)
-C_NOBJ, C_DWM, C_NTAP, C_DWS = 37, 38, 39, 40  # (K_DW1: A objects, mode, taps, SiLU of the strips: ``ops.StripConv``)
-C_NPAIR = 41  # (attention of d 40: query pairs a unit, 0: 8)
-C_GATE = 42  # (attention of d 40: the byte of the output gate's factors 1 / sigmoid(g) (bf16) in a unit's query object
-# (0: none); role g's at WIN_GATE)
+# attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32 groups (-1: all), around the
+# command's walks
+ATTN = CMD.kind("attention", extends=(WALKS,))
+C_KMASK = (ATTN.block("C_KMASK0", 64, at=576), ATTN.block("C_KMASK1", 64, at=704))
+APPLY = CMD.kind("apply")
+C_GTAB = APPLY.word("C_GTAB", at=64)  # (GroupNorm apply: ``group_words``, two per 16 channels)
+DW1 = CMD.kind("strip conv")
+C_TOFF = DW1.word("C_TOFF", at=64)  # (K_DW1: per tap its element offset in a half's strip)
 WIN_GATE = 4608 + 128  # (role g: the gate's factors in a unit's query object, after its masks: ``ops.WinAttention``)
-C_DWC = 43  # (K_DW1 mode 1: a half's C row block, in elements after its strip)
-C_TOFF = 64  # (K_DW1: per tap its element offset in a half's strip)
+DW_STRIP, DW_C, DW_MASK = 1600, 3200, 4480  # (a depthwise conv slot: its strips, C, mask words: ``ops.DwConv``)
 DW1_STRIP = 2048  # (K_DW1 mode 2: a half's strip, elements)
-O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU, O_ROPE = 0, 1, 2, 3, 4, 5, 6
-S_NONE, S_GN, S_LN = 0, 1, 2
-A_GN, A_GNSILU, A_LN, A_RMS = 1, 2, 3, 4
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
+
+
+def consts() -> dict[str, int]:
+    """The command words and values the core's kernels take."""
+    return (CMD.consts(GEMM, ROPE, CONV, ATTN, APPLY, DW1)
+            | {"C_KMASK": C_KMASK, "DW_STRIP": DW_STRIP, "DW_C": DW_C, "DW_MASK": DW_MASK, "DW1_STRIP": DW1_STRIP,
+               "REC_GN": REC_GN, "REC_SLOT": REC_SLOT})
+
+
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
 ROLES = ("a", "c", "v", "gn", "ln", "w", "r", "d", "s", "e", "g")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "aexp2", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
@@ -173,4 +216,4 @@ def source(*, win: str = "") -> str:
         L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
         gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, WinGate=WIN_GATE, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
-        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_", "E_") or k[:3] in ("REC", "ST_", "DW_", "DW1")})
+        **consts())
