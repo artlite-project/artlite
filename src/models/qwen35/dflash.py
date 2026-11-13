@@ -100,6 +100,7 @@ from .dflash_core import (
 )
 from .draft import HeadTable
 from .image import KC, payload
+from .overlay import KV_PAD
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}
@@ -322,6 +323,8 @@ class DFlashOverlay(ModelOverlay):
         self.ring_off = take("KV", cfg.layers * COLS * self.ring_bytes)
         self.open_off = take("KV", cfg.layers * COLS * T)
         self.sink = take("KV", 2 * PAIR)  # (the records no injection closes)
+        take("KV", KV_PAD // POS_PER_GROUP * T)  # (the prefill's sub-chunk slices of the last layer's rings run past them:
+        # ``dflash_prefill``'s DFlashPrepOperator, a sub-chunk's rings from its first object on)
         take("GATE", 2 * COLS * self.SLOTS * C_LEN)
         self._sizes()
 
