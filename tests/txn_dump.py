@@ -1,0 +1,353 @@
+"""The apps' host-built decode transactions, dumped and compared: the refactoring check of the overlays' host side
+(``pytest --dump-designs`` + ``design_diff.py`` check the designs).
+
+    python tests/txn_dump.py DIR [--only REGEX]    # per app present: its decode overlay on a fake device, a scripted
+                                                    # run of steps; per dispatch the transaction's words and digests of
+                                                    # the host buffers the NPU reads
+    python tests/txn_dump.py --diff BEFORE AFTER   # per app the first dispatch that differs, with its first differing
+                                                    # operations decoded
+
+The fake device runs the real ``OverlayDevice``, ``Transaction`` and ``Sequence`` on numpy buffers with fixed device
+addresses (in allocation order); a dispatch is recorded instead of run; the design is not compiled (its program a
+stand-in, its code pages left out) and the weight image is not packed (no transaction depends on its bytes). No NPU
+device is opened. A buffer of more than ``DIGEST_MAX`` bytes (the weight image, large KV caches) is recorded by size
+only: the host writes into it only at load (the image) or not at all in these runs (the caches).
+"""
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
+from unittest import mock
+
+import numpy as np
+
+from artlite import _native, txn
+from artlite.decode.image import TileImage
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf, swift_gguf
+from artlite.moe import route as moe_route
+from artlite.operators import paging
+
+BASE = 1 << 40  # the first buffer's device address (then STRIDE apart: every buffer fits, addresses stay < 2^48)
+STRIDE = 1 << 38
+DIGEST_MAX = 256 << 20
+
+
+class _Buffer:
+    def __init__(self, size: int, paddr: int):
+        self.size, self.paddr = size, paddr
+        self._a = np.zeros(size, np.uint8)
+
+    def map(self) -> np.ndarray:
+        return self._a
+
+    def paddr_in(self, context: object) -> int:
+        return self.paddr
+
+    def sync_to_device(self, *args: object) -> None:
+        pass
+
+    def sync_from_device(self, *args: object) -> None:
+        pass
+
+    def sync_lines(self, *args: object) -> None:
+        pass
+
+
+class _Log:
+    """The dispatches of a run: (label, transaction words, [(buffer size, digest or None)])."""
+
+    def __init__(self):
+        self.label = ""
+        self.entries: list[tuple[str, np.ndarray, list[tuple[int, str | None]]]] = []
+
+    def record(self, insts: _Buffer, buffers: list[_Buffer]) -> None:
+        w = insts.map().view(np.uint32)
+        words = w[:int(w[3]) // 4].copy()  # (header word 3: the transaction's bytes)
+        bufs = [(b.size, hashlib.sha256(b.map()).hexdigest()[:16] if b.size <= DIGEST_MAX else None) for b in buffers]
+        self.entries.append((self.label, words, bufs))
+
+
+class _Device:
+    def __init__(self):
+        self.n = 0
+
+    def _alloc(self, size: int) -> _Buffer:
+        self.n += 1
+        return _Buffer(size, BASE + self.n * STRIDE)
+
+    alloc_host_buffer = alloc_user_buffer = alloc_insts_buffer = _alloc
+
+
+class _Kernel:
+    def __init__(self, log: _Log):
+        self.log = log
+
+    def dispatch(self, insts: _Buffer, buffers: list[_Buffer], **kw: object) -> None:
+        self.log.record(insts, buffers)
+
+    def dispatch_async(self, insts: _Buffer, buffers: list[_Buffer]) -> None:
+        self.log.record(insts, buffers)
+
+    def dispatch_wait(self, **kw: object) -> None:
+        pass
+
+
+class _Program:
+    def __init__(self, device: _Device, log: _Log, insts_path: str):
+        self._device, self._ctx, self.insts_path = device, None, insts_path
+        self._k = _Kernel(log)
+
+    def _ensure_loaded(self) -> None:
+        pass
+
+    def _kernel(self) -> _Kernel:
+        return self._k
+
+
+@contextlib.contextmanager
+def fake_npu() -> Iterator[Callable[[object], _Log]]:
+    """Within: ``attach(op)`` gives a decode design's operator a fake program (on one fake device) and returns the log
+    of its dispatches. The NPU's turn is a no-op, the weight image is not packed, the checks that read the compiled
+    design (its endpoints, the MoE routes) do not run."""
+    with tempfile.NamedTemporaryFile(suffix=".bin") as empty, \
+            mock.patch.object(_native, "turn_enter", lambda: None), \
+            mock.patch.object(_native, "turn_leave", lambda: None), \
+            mock.patch.object(_native, "turn_foreign", lambda: 0), \
+            mock.patch.object(TileImage, "pack", lambda self, out, **kw: False), \
+            mock.patch.object(paging, "cdo_values", lambda work_dir: {}), \
+            mock.patch.object(moe_route, "check_route", lambda values, cols: None):  # (the compiled design's)
+        dev, log = _Device(), _Log()
+
+        def attach(op: object) -> _Log:
+            op._program = _Program(dev, log, empty.name)
+            op.check_endpoints = lambda insts: None  # (the compiled design's: none here)
+            op.page_store = lambda: None  # (code pages: linked from the compiled design)
+            return log
+
+        yield attach
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The runs: per app family a scripted sequence of steps (slot counts 1 .. 4, record and group boundaries, steps without
+# logits, a reset); x: fixed random embeddings
+# ----------------------------------------------------------------------------------------------------------------
+
+def _steps(long: int) -> list[tuple[int, int, bool]]:
+    """(S, position, logits) of a contiguous run: slot counts 1 .. 4 across record (8) and group (32) boundaries, steps
+    without logits, then steps of 4 up to ``long`` (logits every 16th)."""
+    out, p = [], 0
+    for S, lg in ((1, True), (4, True), (3, False), (2, True), (4, True), (4, True), (1, True), (4, True), (4, True),
+                  (4, True), (2, True), (3, True), (1, False), (4, True), (3, True), (4, True), (2, True), (4, True)):
+        out.append((S, p, lg))
+        p += S
+    while p + 4 <= long:
+        out.append((4, p, len(out) % 16 == 0))
+        p += 4
+    return out
+
+
+def _x(rng: np.random.Generator, S: int, H: int) -> np.ndarray:
+    return rng.standard_normal((S, H)).astype(np.float32)
+
+
+def _run_plain(ov: object, log: _Log, step: Callable[[np.ndarray, int, bool], object], *, lm: bool = True) -> None:
+    rng = np.random.default_rng(0)
+    ov.load()
+    for rnd, long in enumerate((600, 40)):
+        for S, p, logits in _steps(long):
+            log.label = f"round {rnd} S={S} p={p} logits={logits}"
+            step(_x(rng, S, ov.H), p, logits)
+        ov.reset()
+    if lm:
+        log.label = "logits_of"
+        ov.logits_of(_x(rng, 1, ov.H)[0])
+
+
+def _llama(path: str, kv_k: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.llama.overlay import LlamaOverlay
+
+        ov = LlamaOverlay(GGUFFile(path), kv_k=kv_k)
+        log = attach(ov.op)
+        _run_plain(ov, log, lambda x, p, lg: ov.step(x, p, logits=lg), lm=False)
+
+    return run
+
+
+def _lfm(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.lfm.overlay import LfmOverlay
+
+        ov = LfmOverlay(GGUFFile(path))
+        log = attach(ov.op)
+        _run_plain(ov, log, lambda x, p, lg: ov.step(x, p, logits=lg))
+
+    return run
+
+
+def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.gemma4.gemma import BATCH
+        from models.gemma4.overlay import GemmaOverlay
+
+        ov = GemmaOverlay(GGUFFile(path), max_positions=4096 + BATCH)
+        log = attach(ov.op)
+        rng = np.random.default_rng(1)
+        e_shape = (len(ov.layers), ov.cfg.per_layer_dim) if getattr(ov.cfg, "per_layer_dim", 0) else None
+
+        def step(x: np.ndarray, p: int, lg: bool) -> None:
+            e = rng.standard_normal((x.shape[0], *e_shape)).astype(np.float32) if e_shape else None
+            ov.step(x, e, p, logits=lg)
+
+        _run_plain(ov, log, step, lm=False)
+
+    return run
+
+
+def _qwen(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.qwen35.overlay import QwenOverlay
+
+        ov = QwenOverlay(GGUFFile(path), max_positions=4096)
+        log = attach(ov.op)
+        rng = np.random.default_rng(2)
+        ov.load()
+        for rnd in range(2):
+            p = 0
+            # (S, commit, accepted): committing steps, lazy steps accepting some of their tokens
+            for S, commit, n in ((1, True, 1), (4, True, 4), (4, False, 2), (3, False, 3), (2, False, 1), (4, True, 4),
+                                 (1, False, 1), (4, False, 4), (4, False, 0), (4, True, 4), (3, False, 2)):
+                S = min(S, ov.SLOTS)
+                n = min(n, S)
+                log.label = f"round {rnd} S={S} p={p} commit={commit} accept={n}"
+                ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
+                ov.accept(S if commit else n)
+                p += S if commit else n
+            while rnd == 0 and p + 4 <= 600:  # (then committing steps of 4, logits every 16th)
+                S = min(4, ov.SLOTS)
+                log.label = f"round {rnd} S={S} p={p} commit=True accept={S}"
+                ov.step(_x(rng, S, ov.H), p, logits=p % 64 == 0, commit=True)
+                ov.accept(S)
+                p += S
+            ov.reset()
+
+    return run
+
+
+APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], None]]]] = {
+    "llama-1B-Q4_K_M": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "single")),
+    "llama-1B-Q4_K_M-hilo": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "hilo")),
+    "llama-3B-Q4_K_M": (llama_gguf("Q4_K_M", "3B"), lambda p: _llama(p, "single")),
+    "llama-8B-Q4_K_S": (llama_gguf("Q4_K_S", "8B"), lambda p: _llama(p, "single")),
+    "qwen3-0.6B-Q4_1": (qwen3_gguf("0.6B"), lambda p: _llama(p, "hilo")),
+    "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
+    "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
+    "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
+    "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
+    "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
+    "occamy-1.0-APEX": (occamy_gguf(), _qwen),
+    "swift-1.5-APEX": (swift_gguf(), _qwen),
+    "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
+    "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
+}
+
+
+def _record(path: str, make: Callable[[str], Callable[[Callable[[object], _Log]], None]]) -> _Log:
+    """The dispatches of an app's run on the fake device."""
+    with fake_npu() as attach:
+        logs: list[_Log] = []
+
+        def attach_logged(op: object) -> _Log:
+            logs.append(attach(op))
+            return logs[-1]
+
+        make(path)(attach_logged)
+    return logs[0]
+
+
+def dump(out: str, only: str | None) -> None:
+    os.makedirs(out, exist_ok=True)
+    for app, (path, make) in APPS.items():
+        if only and not re.search(only, app):
+            continue
+        if not os.path.exists(path):
+            print(f"{app}: {path} missing, skipped")
+            continue
+        entries = _record(path, make).entries
+        np.savez_compressed(os.path.join(out, f"{app}.npz"), *[w for _, w, _ in entries])
+        with open(os.path.join(out, f"{app}.json"), "w") as f:
+            json.dump([{"label": lb, "words": hashlib.sha256(w).hexdigest()[:16], "n": int(w.size), "buffers": bufs}
+                       for lb, w, bufs in entries], f, indent=0)
+        print(f"{app}: {len(entries)} dispatches, {sum(w.size for _, w, _ in entries) * 4 >> 10} KB of words")
+
+
+def _entries(d: str, name: str) -> list[dict]:
+    with open(os.path.join(d, name)) as f:
+        return json.load(f)
+
+
+def _first_ops(a: np.ndarray, b: np.ndarray, n: int = 3) -> str:
+    oa, ob = txn.op_offsets(a[4:]), txn.op_offsets(b[4:])
+    for i, ((pa, ca), (pb, cb)) in enumerate(zip(oa, ob, strict=False)):
+        na = (oa[i + 1][0] if i + 1 < len(oa) else a.size - 4) - pa
+        nb = (ob[i + 1][0] if i + 1 < len(ob) else b.size - 4) - pb
+        if ca != cb or not np.array_equal(a[4 + pa:4 + pa + na], b[4 + pb:4 + pb + nb]):
+            da, db = txn.decode(a), txn.decode(b)
+            return f"operation {i} of {len(oa)} / {len(ob)}: {da[i:i + n]} vs {db[i:i + n]}"
+    return f"operation counts {len(oa)} vs {len(ob)}"
+
+
+def diff(before: str, after: str) -> int:
+    bad = 0
+    for name in sorted(f for f in os.listdir(before) if f.endswith(".json")):
+        app = name[:-5]
+        if not os.path.exists(os.path.join(after, name)):
+            print(f"{app}: only before")
+            bad += 1
+            continue
+        ea, eb = _entries(before, name), _entries(after, name)
+        if len(ea) != len(eb):
+            print(f"{app}: {len(ea)} vs {len(eb)} dispatches")
+            bad += 1
+        for i, (x, y) in enumerate(zip(ea, eb, strict=False)):
+            if x == y:
+                continue
+            bad += 1
+            msg = f"{app}: dispatch {i} ({x['label']} / {y['label']}) differs"
+            if x["words"] != y["words"]:
+                wa = np.load(os.path.join(before, f"{app}.npz"))[f"arr_{i}"]
+                wb = np.load(os.path.join(after, f"{app}.npz"))[f"arr_{i}"]
+                msg += f": words, {_first_ops(wa, wb)}"
+            if x["buffers"] != y["buffers"]:
+                msg += f": buffers {[j for j, (p, q) in enumerate(zip(x['buffers'], y['buffers'], strict=False)) if p != q]}"
+            print(msg)
+            break
+        else:
+            if len(ea) == len(eb):
+                print(f"{app}: {len(ea)} dispatches identical")
+    for name in sorted(f for f in os.listdir(after) if f.endswith(".json") and not os.path.exists(os.path.join(before, f))):
+        print(f"{name[:-5]}: only after")
+        bad += 1
+    return 1 if bad else 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("dirs", nargs="+")
+    ap.add_argument("--diff", action="store_true", help="compare two dumps")
+    ap.add_argument("--only", help="the apps whose names match (a regular expression)")
+    a = ap.parse_args()
+    if a.diff:
+        sys.exit(diff(*a.dirs))
+    dump(a.dirs[0], a.only)
+
+
+if __name__ == "__main__":
+    main()
