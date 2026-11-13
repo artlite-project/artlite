@@ -562,7 +562,7 @@ class _Blocks:
 
 
 def _gdn_blocks(path: str, Lg: int, x: np.ndarray, junk: np.ndarray) -> None:
-    """A chunkwise core of 4 (blocks of 8 positions, ``gdn``'s "4 slots, chunkwise") over the rows x in steps of one: each
+    """A chunkwise core of 4 (blocks of 8 positions, ``gdn``'s "Chunkwise") over the rows x in steps of one: each
     output within bf16 rounding of the cores' arithmetic in sequence (ref.core_gdn_step), the state at each block's end in
     the other half within 2e-3; then in steps of up to 4 slots whose drafts past the accepted ones are junk rows (steps
     inside a block, past its end with all or part of its lanes accepted, ending at its end): every accepted slot's
@@ -742,8 +742,10 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
         else:
             m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[kr + 1] - b[kr]) + tl, b[kr], 1 << 20
-        if one:  # (on the first column's stream)
+        if one:  # (on the first column's stream; the rows' masks and K lanes)
             m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
+            m[MD.M_BRANCH], w, m[MD.M_ALANE] = A1.step_words(p, S)
+            m[MD.M_AMASK:MD.M_AMASK + 4] = w.view(np.int32)
         o = c * per
         act[o:o + 4 * OD.META] = m.view(np.uint8)
         nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
@@ -911,7 +913,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize("size", ["1B", "9B", "35B-A3B", "occamy"])
+@pytest.mark.parametrize("size", ["1B", "9B", "35B-A3B", "occamy", "3.8-27B"])
 def test_drafts_exact(size: str) -> None:
     """A step of S slots gives each kept slot the numbers of a step of one, bit for bit, so that drafts never change a
     greedy text: the first layers up to the first full-attention layer over 120 random tokens (the attention's chains

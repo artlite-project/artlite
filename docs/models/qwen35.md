@@ -169,9 +169,10 @@ block of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a 
 to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt
 chunk; its head is the first 84480 rows of the model's LM head (the special tokens, the first ids and 512 of the sequence's own tokens: a few
 rows' cost, for the rare tokens that end a chain), and a selector on the host picks the block's path among each position's 16 best logits.
-Where the selector's first guess is uncertain (its second candidate over twice as likely as the whole chain), the round's step gives the
-chain's last two slots to a branch: the second candidate and its successor, after the round's token (the attention and GDN cores keep the
-drafts' slots out of the branch's view: `QwenOverlay.step`'s branch). When the first draft is wrong and the branch right, the round keeps
+Where the selector's first guess is uncertain (its second candidate over twice as likely as the whole chain) and the branch fits in the 8
+positions that hold the round's token (its attention record and GDN block), the round's step gives the chain's last two slots to a branch:
+the second candidate and its successor, after the round's token (the attention and GDN cores compute each branch slot as a step of one at
+its position would, without the chain's later drafts: `QwenOverlay.step`'s branch; greedy text is the same with and without drafts). When the first draft is wrong and the branch right, the round keeps
 the branch's tokens and the one after them, from the branch's own logits. On prose a quarter to a third of the first drafts are wrong:
 on the same texts branches save 5% of the rounds (32K prompts, the sampler held to each prompt's text: 6.73 to 7.05 tokens/s; essays
 +5%, general text +4%, JSON +4%), while code, math and thinking rarely branch. A block's cost pays on 256 greedy tokens after short

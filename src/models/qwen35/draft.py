@@ -222,6 +222,7 @@ class QwenDraft(QwenOverlay):
         assert 1 <= S <= self.SLOTS
         if self._metas_s != (S, self.start):
             self._metas(S)
+        self._set_branch(None, position, S)  # (its attention's rows' masks and K lanes)
         self._write_loadr(np.zeros((S, self.H), np.float32))
         for rg in self.inp[(self.L, "eh")]:
             self._write_input(rg, interleave(x[:, rg.k0:rg.k0 + rg.K], self._sp(S, (self.L, "eh"))).view(np.uint8).reshape(-1))

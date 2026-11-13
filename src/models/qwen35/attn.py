@@ -21,9 +21,11 @@ reaches every core of a KV head's chain. Per step a core gets
 The slots' K rows (normed, rotated) wait as one panel per d-block by position & 7, a step's at most 8 positions apart there
 (``kr``, ``kn``); each open record takes its rows as its K object passes (``kmerge``: lanes of the popped panels, in the core's
 copy, the last core's and the first's own), and a K object scores both pairs of records against the octets, each K panel
-popped once (``qk1``). Each row's positions past its own are masked, and a branching step's (``M_BRANCH``: its last slots follow an
-earlier slot than the one before them, ``QwenOverlay.step``'s branch) branch rows also the positions of the slots off their branch:
-two words, the lanes of those positions in the rows of slots 4 .. 7 for the step's first two records; P = 2^(s - m), m the row's maximum in the first group,
+popped once (``qk1``). Each row's positions past its own are masked (the host's masks of the step's first two records,
+``M_AMASK``). A branching step (``M_BRANCH``, ``QwenOverlay.step``'s branch: its last slots follow an earlier slot c, inside
+the 8 positions of c's record) scores that record again with the branch's K at its positions' lanes for the branch rows
+(``bqk``), and puts the branch's V rows there for its slots' P V (``tobj``): a branch row sees its record as a step of one at
+its position does. P = 2^(s - m), m the row's maximum in the first group,
 held for the whole pass (scores span less than P's 2^63.5: no rescale; QK starts from the baseline 192 - m), y += P V over the V object's records. A step may cross a group: the first group's open record keeps its scores in ``sc`` past the
 second group's (its slot is the group's last, the second group's open record its first). The tail objects are the open
 records' rows (the ring: ``decode.vring``; after a prefill the host decodes the record's V panels into it,
@@ -138,8 +140,11 @@ SPLIT_CHAIN, SPLIT_HALF = 1, 2  # M_SPLIT: the chain divides the cache (0: each 
 A_QA, A_HP, A_RW = 32, 36, 38  # (A_QA: up to 4 octets)
 A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
 A_WORDS = 40
-A_KR, A_KN, A_KM, A_BR = 40, 41, 42, 43  # (one pass) the new K's rows, panels; the merged records; from A_BR two words: the
-# branch slots' hidden lanes of the step's first two records (``M_BRANCH``)
+A_KR, A_KN, A_KM, A_KB, A_BR, A_MK, A_LN = 40, 41, 42, 43, 44, 45, 49  # (one pass) the new K's rows, panels; the merged
+# records; a branch's K panels (its rows at their positions' lanes); a branching step's word (``M_BRANCH``: its first lane in
+# its record | its slots << 8 | its record past the step's first << 12, or 0); from A_MK 4 words: the rows' masks of the
+# step's first two records (``M_AMASK``: per record those of rows 0 .. 3, 4 .. 7, a row's lanes past its position); the
+# slots' K lanes (``M_ALANE``: 3 bits a slot, a branch slot's at its position)
 ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 
 # (kernels both cores use)
@@ -206,7 +211,7 @@ __attribute__((noinline, minsize)) void {{ p }}_pkeep(const uint8_t *__restrict 
 
 _QPAN = r"""// The rows q (fp32, [row][256]) of NO octets -> their Q panels at out ([d-block][octet NO])
 template <int NO>
-__attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict out)
+__attribute__((noinline, minsize)) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict out)
 {
     al::BOut<> po((bfp16ebs8 *)out);
     for (int db = 0; db < {{ ND }}; db++) {
@@ -850,7 +855,7 @@ _ONE = JINJA_ENV.from_string(r"""
 namespace {
 
 // 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each)
-__attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
+__attribute__((noinline, minsize)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
                                                  const float *__restrict cs, const float *__restrict sn,
                                                  float *__restrict out)
 {
@@ -913,7 +918,7 @@ template <int NO>
 {{ e192.parts.poly.src }}
 
 """ + _PV4 + r"""// P V (``pv4``) of the pairs of records v, vb for the octets: two at once, then a third alone
-[[clang::always_inline]] inline void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp, float *__restrict y)
+__attribute__((noinline)) void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp, float *__restrict y)
 {
     {{ p }}_pv4<{{ QC if QC < 2 else 2 }}>(v, vb, pp, (const float __aie_dm_resource_c *)y, (float __aie_dm_resource_d *)y);
 {% if QC > 2 %}
@@ -1009,7 +1014,7 @@ __attribute__((noinline, minsize)) void {{ p }}_kmerge(uint8_t *a, const uint8_t
 }
 
 """ + _QPAN + r"""// A slot's K (256 fp32) into its row of the new rows ([d-block][position 8][8] bf16: dst its first values)
-__attribute__((noinline)) void {{ p }}_krow(const float *__restrict k, bfloat16 *__restrict dst)
+__attribute__((noinline, minsize)) void {{ p }}_krow(const float *__restrict k, bfloat16 *__restrict dst)
 {
     for (int db = 0; db < {{ ND }}; db += 4) {
         const aie::vector<bfloat16, 32> b = aie::accum<accfloat, 32>(aie::load_v<32>(k + 8 * db)).template to_vector<bfloat16>();
@@ -1021,7 +1026,7 @@ __attribute__((noinline)) void {{ p }}_krow(const float *__restrict k, bfloat16 
 }
 
 // The new rows -> their panels
-__attribute__((noinline)) void {{ p }}_kpan(const bfloat16 *__restrict kr, uint8_t *__restrict kn)
+__attribute__((noinline, minsize)) void {{ p }}_kpan(const bfloat16 *__restrict kr, uint8_t *__restrict kn)
 {
     al::BOut<> po((bfp16ebs8 *)kn);
     for (int db = 0; db < {{ ND }}; db++)
@@ -1029,14 +1034,14 @@ __attribute__((noinline)) void {{ p }}_kpan(const bfloat16 *__restrict kr, uint8
 }
 
 // A position's V (src: 256 bf16) into its row of a record's rows (dst: the row's first 8 values)
-__attribute__((noinline)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bfloat16 *__restrict src)
+__attribute__((noinline, minsize)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bfloat16 *__restrict src)
 {
     al::v_put(dst, src, {{ ND }});
 }
 
 // rows, those from position n on as zeros -> the record's V panels (al::v_enc; dup: each panel twice, a pair of records
 // [d-block][record 2] of it for ``pv`` of a lone record)
-__attribute__((noinline)) void {{ p }}_venc(const bfloat16 *__restrict rows, uint8_t *__restrict rec, int n, int dup)
+__attribute__((noinline, minsize)) void {{ p }}_venc(const bfloat16 *__restrict rows, uint8_t *__restrict rec, int n, int dup)
 {
     al::BOut<> o((bfp16ebs8 *)rec);
     const aie::mask<64> keep = aie::mask<64>::from_uint64(n < 8 ? (1ull << (8 * n)) - 1 : ~0ull);
@@ -1048,38 +1053,28 @@ __attribute__((noinline)) void {{ p }}_venc(const bfloat16 *__restrict rows, uin
     }
 }
 
-// The lanes of rows s0 .. s0 + 3 of a record of positions 8 r .. past their own: row s (slot s, lanes 8 s ..) at position p + s
-__attribute__((noinline, minsize)) uint32_t {{ p }}_past(int s0, int r, int p)
-{
-    uint32_t m = 0;
-    AIE_LOOP_NO_UNROLL
-    for (int q = 0; q < 4; q++) {
-        int n = p + s0 + q - 8 * r + 1;  // (valid positions of the record for the row)
-        n = n < 0 ? 0 : (n > 8 ? 8 : n);
-        m |= ((0xFFu << n) & 0xFFu) << (8 * q);
-    }
-    return m;
-}
-
 """ + _PKEEP.replace("ROW_OF_BLOCK", "i & 7") + r"""// Tail object t of the step (t = 0: the record of its first position; 1: of its last, nothing more when one holds both):
 // the record's rows ([d-block 32][position 8][8] bf16): its ring slot, in place. The step's V rows in; the octets' P panels (rows past
 // their positions: the masked scores of ``aobj``), l += P; then per slot of the step in the record: the record's V panels
 // from its rows up to the slot's position (what that position sees of the record in a step of any S), y += P V of the
-// slot's rows (the record's last slot of the step: also the later slots', which see it whole); the last ones, up to the
-// step's last position, stay for the last core's emission. The rows stay for the emission (A_RW: the object is held).
+// slot's rows (the record's last slot of the step: also the later slots', which see it whole); a branching step's branch (in
+// its parent's record): its rows at its positions' lanes, per branch slot the same, then the chain's rows back; the last
+// ones, up to the step's last position, stay for the last core's emission. The rows stay for the emission (A_RW: the object
+// is held).
 __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int32_t *__restrict ws, int t)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
-    const int p = st[{{ A_P }}], S = st[{{ A_S }}], r0 = p >> 3, r1 = (p + S - 1) >> 3;
+    const int p = st[{{ A_P }}], S = st[{{ A_S }}], r0 = p >> 3, r1 = (p + S - 1) >> 3, br = st[{{ A_BR }}], sc = S - ((br >> 8) & 15);
     if (t && r1 == r0)
         return;
     const int r = t ? r1 : r0, P0 = 8 * r, last = p + S - 1 - P0 < 7 ? p + S - 1 - P0 : 7;
+    const int lc = p + sc - 1 - P0 < last ? p + sc - 1 - P0 : last;  // (the chain's last row of the record)
     bfloat16 *__restrict rows = (bfloat16 *)a;
     st[{{ A_RW }} + t] = (int32_t)(uintptr_t)rows;
     const int j0 = P0 > p ? 0 : p - P0;  // (the step's first row of the record: slot P0 + j0 - p)
     AIE_LOOP_NO_UNROLL
-    for (int j = j0; j <= last; j++)
+    for (int j = j0; j <= lc; j++)
         {{ p }}_rowput(rows + 8 * j, AP(bfloat16, {{ A_VN }}) + {{ HD }} * (P0 + j - p));
     uint8_t *__restrict e = st[{{ A_ROLE }}] == {{ ROLE_V }} ? AP(uint8_t, {{ A_KM }}) + {{ REC_V }} * t : AP(uint8_t, {{ A_KN }});
     uint8_t *v = a + {{ ROWS_B }};  // (the object past its rows: read by no one)
@@ -1090,14 +1085,45 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
     for (int o = 0; o < {{ QC }}; o++)
         {{ p }}_psoft(ws, r & 3, o, pp + {{ PO }} * o);
     {{ p }}_pkeep(pp, {{ PO }}, pf, 72, {{ QC }}, 0, 8);
+    const int nb = br && r == r0 + ((br >> 12) & 1) ? (br >> 8) & 15 : 0, lb = br & 7, nc = lc - j0 + 1;  // (the branch's slots here)
     AIE_LOOP_NO_UNROLL
-    for (int j = j0; j <= last; j++) {
-        const int s = P0 + j - p;
+    for (int i = 0; i < nc + nb; i++) {  // (the chain's slots of the record, then the branch's: its row at its lane first)
+        const int b = i - nc, j = b < 0 ? j0 + i : lb + b, s = b < 0 ? P0 + j - p : sc + b;
+        if (b >= 0)
+            {{ p }}_rowput(rows + 8 * j, AP(bfloat16, {{ A_VN }}) + {{ HD }} * s);
         {{ p }}_venc(rows, v, j + 1, 1);
-        {{ p }}_pkeep(pf, 72, pp, {{ PO }}, {{ QC }}, s, j < last ? s + 1 : S);
+        {{ p }}_pkeep(pf, 72, pp, {{ PO }}, {{ QC }}, s, b < 0 && j == lc ? sc : s + 1);
         {{ p }}_pvs(v, v, pp, AW(float, {{ a.y }}));
     }
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < nb; b++)  // (the chain's rows back at the branch's lanes)
+        {{ p }}_rowput(rows + 8 * (lb + b), AP(bfloat16, {{ A_VN }}) + {{ HD }} * (P0 + lb + b - p));
     {{ p }}_venc(rows, e, last + 1, 0);
+}
+
+// The scores of a pair of K records rec (``qk1``) into so (sc's layout)
+__attribute__((noinline)) void {{ p }}_qkp(const uint8_t *rec, int32_t *__restrict ws, float *so)
+{
+    {{ p }}_qk1<{{ QC if QC < 2 else 2 }}>(rec, AP(const uint8_t, {{ A_QA }}), AW(const float, {{ a.ml }}), so);
+{% if QC > 2 %}
+    {{ p }}_qk1<1>(rec, AP(const uint8_t, {{ A_QA }} + 1), AW(const float, {{ a.ml }}) + 256, so + 512);
+{% endif %}
+}
+
+// A branching step's branch rows (rows 8 - L .. of each octet: its slots) take their scores of record bq of the pair rec
+// (after the chain's) from those against it with the branch's K at its lanes (into the norms' region, done with: their
+// scores, the merged record's copy), into sc (the record's scores of the step's: [octet][set 2][record 4][row 4 x 8])
+__attribute__((noinline, minsize)) void {{ p }}_bqk(uint8_t *rec, int32_t *__restrict ws, int bq, float *__restrict sc)
+{
+    const int br = AW(int32_t, {{ a.st }})[{{ A_BR }}], L = (br >> 8) & 15;
+    float *__restrict so = AP(float, {{ A_NRM }});
+    {{ p }}_kmerge(rec, AP(const uint8_t, {{ A_KB }}), (uint8_t *)so, bq, br & 7, (br & 7) + L);
+    {{ p }}_qkp(rec, ws, so);
+    const aie::mask<32> m = aie::mask<32>::from_uint32(~0u << (8 * (4 - L)));
+    so += 32 * bq;
+    AIE_LOOP_NO_UNROLL
+    for (int o = 0; o < {{ QC }}; o++)
+        aie::store_v(sc + 256 * o + 128, aie::select(aie::load_v<32>(sc + 256 * o + 128), aie::load_v<32>(so + 256 * o + 128), m));
 }
 
 // The new K into the open ones of a pair of records (r, r + 1) of a K object rec, the records to the merged ones' region
@@ -1114,8 +1140,9 @@ __attribute__((noinline, minsize)) void {{ p }}_kopen(uint8_t *rec, int32_t *__r
     }
 }
 
-// Records r, r + 1 from the first open one on: the scores of each row's positions past its own -16384 (P 0), of a record
-// past the step's all of them, but for a record that keeps the scores of the first group's open one (``aobj``)
+// Records r, r + 1 from the first open one on: the scores of each row's positions past its own -16384 (P 0: the host's masks,
+// A_MK), of a record past the step's all of them, but for a record that keeps the scores of the first group's open one
+// (``aobj``)
 __attribute__((noinline, minsize)) void {{ p }}_kmask(int32_t *__restrict ws, int r)
 {
     const int32_t *__restrict st = AW(int32_t, {{ a.st }});
@@ -1125,8 +1152,8 @@ __attribute__((noinline, minsize)) void {{ p }}_kmask(int32_t *__restrict ws, in
     for (int q = r; q < r + 2; q++) {
         if (q < rp || (((rp ^ rl) >> 2) && q > rl && (q & 3) == 3))
             continue;
-        const aie::mask<32> m0 = aie::mask<32>::from_uint32(q > rl ? ~0u : {{ p }}_past(0, q, p));
-        const aie::mask<32> m1 = aie::mask<32>::from_uint32(q > rl ? ~0u : {{ p }}_past(4, q, p) | st[{{ A_BR }} + q - rp]);
+        const aie::mask<32> m0 = aie::mask<32>::from_uint32(q > rl ? ~0u : st[{{ A_MK }} + 2 * (q - rp)]);
+        const aie::mask<32> m1 = aie::mask<32>::from_uint32(q > rl ? ~0u : st[{{ A_MK }} + 2 * (q - rp) + 1]);
         float *__restrict so = AW(float, {{ a.sc }}) + 32 * (q & 3);
         AIE_LOOP_NO_UNROLL
         for (int set = 0; set < {{ SETS }}; set += 2) {
@@ -1203,8 +1230,9 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     st[{{ A_NKV }}] = S;
     st[{{ A_NOBJ }}] = m[{{ M_ANA }}] - {{ HOLD }};
     st[{{ A_P }}] = m[{{ M_POS }}];
-    st[{{ A_BR }}] = m[{{ M_BRANCH }}];
-    st[{{ A_BR + 1 }}] = m[{{ M_BRANCH + 1 }}];
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 6; i++)  // (the branch word, the masks, the K lanes)
+        st[{{ A_BR }} + i] = m[{{ M_BRANCH }} + i];
     st[{{ A_I }}] = 0;
     st[{{ A_ROLE }}] = k == 0 ? {{ ROLE_K }} : k == {{ NPH - 1 }} ? {{ ROLE_V }} : {{ ROLE_O }};
     st[{{ A_QS }}] = 0;
@@ -1258,23 +1286,23 @@ __attribute__((minsize)) void {{ p }}_aqpan(int32_t *__restrict ws)
     al::zero<{{ 64 * SETS }}, 32>(AW(float, {{ a.ml }}));
 }
 
-// The raw K, V object of the next slot: its K (normed, rotated) into the new rows, its V (bf16); after the last slot the
-// new rows' panels
+// The raw K, V object of the next slot: its K (normed, rotated) into the new rows (at its position's lane), its V (bf16); after
+// the chain's last slot the new rows' panels (a branching step: then the branch's, after the step's last slot)
 __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
-    const int s = st[{{ A_KS }}], S = st[{{ A_S }}];
+    const int s = st[{{ A_KS }}], S = st[{{ A_S }}], br = st[{{ A_BR }}], sc = S - ((br >> 8) & 15);
     st[{{ A_KS }}] = s + 1;
     const bfloat16 *__restrict kv = x + {{ 2 * META }} + {{ 2 * HD }} * al::div_small<{{ NPH }}>(col);
     const float *__restrict nrm = AP(float, {{ A_NRM }});
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * s;
     float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
     {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, cs + 32, kf);
-    {{ p }}_krow(kf, AP(bfloat16, {{ A_KR }}) + 8 * ((st[{{ A_P }}] + s) & 7));
+    {{ p }}_krow(kf, AP(bfloat16, {{ A_KR }}) + 8 * ((st[{{ A_LN }}] >> (3 * s)) & 7));
     al::copy<{{ HD }}, 64>(AP(bfloat16, {{ A_VN }}) + {{ HD }} * s, kv + {{ HD }});
-    if (s + 1 == S)
-        {{ p }}_kpan(AP(const bfloat16, {{ A_KR }}), AP(uint8_t, {{ A_KN }}));
+    if (s + 1 == sc || s + 1 == S)
+        {{ p }}_kpan(AP(const bfloat16, {{ A_KR }}), AP(uint8_t, s + 1 == sc ? {{ A_KN }} : {{ A_KB }}));
 }
 
 // A step's A object: a cache object i (group i / 2's K object: the new K into its open records, the scores of its pairs of
@@ -1284,7 +1312,7 @@ void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
-    const int i = st[{{ A_I }}], p = st[{{ A_P }}], S = st[{{ A_S }}];
+    const int i = st[{{ A_I }}], p = st[{{ A_P }}], S = st[{{ A_S }}], br = st[{{ A_BR }}];
     st[{{ A_I }}] = i + 1;
     const int rp = p >> 3, rl = (p + S - 1) >> 3, t = i - st[{{ A_NOBJ }}];
     if (t >= 0) {
@@ -1306,10 +1334,10 @@ void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
         if (open)
             {{ p }}_kopen(rec, ws, r);
         if (r <= rl) {
-            {{ p }}_qk1<{{ QC if QC < 2 else 2 }}>(rec, AP(const uint8_t, {{ A_QA }}), AW(const float, {{ a.ml }}), sc + 64 * k);
-{% if QC > 2 %}
-            {{ p }}_qk1<1>(rec, AP(const uint8_t, {{ A_QA }} + 1), AW(const float, {{ a.ml }}) + 256, sc + 512 + 64 * k);
-{% endif %}
+            {{ p }}_qkp(rec, ws, sc + 64 * k);
+            const int bq = br ? rp + ((br >> 12) & 1) - r : -1;  // (a branching step: its branch's record in the pair: 0, 1)
+            if (bq >> 1 == 0)
+                {{ p }}_bqk(rec, ws, bq, sc + 32 * ((r + bq) & 3));
         }
         if (open)
             {{ p }}_kmask(ws, r);
@@ -1609,7 +1637,7 @@ class AttnShape:
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
-        own = [("st", 4 * (A_BR + 2 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
+        own = [("st", 4 * (A_LN + 1 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
                ("pp", self.ps)]
         self.gate_tab = not self.one and not self.main_gates  # (the sigmoid's table in the core's L1)
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK + (SIGMOID.table_words().nbytes if self.gate_tab else 0)
@@ -1628,6 +1656,7 @@ class AttnShape:
                 put(name, n)
             put("kr", ROWS_B, ("mx", "mw"))
             put("km", 2 * REC_K, ("mx", "mw"))
+            put("kb", REC_K, ("mx", "mw"))
             pan = 72 * ND
             own += [("qa0", min(self.qc, 2) * pan), ("qa1", pan)] if self.qc > 2 else [("qa0", self.qc * pan)]
             own.append(("kn", REC_K))
@@ -1659,7 +1688,7 @@ class AttnShape:
         bases = {"mw": ("mw", tail), "mx": ("mx", 0)}
         out = []
         names = [(A_NRM, "nrm"), (A_VN, "vn")] + [(A_GS, "gs")] * (not self.main_gates)
-        names += [(A_KR, "kr"), (A_KN, "kn"), (A_KM, "km")] if self.one else []
+        names += [(A_KR, "kr"), (A_KN, "kn"), (A_KM, "km"), (A_KB, "kb")] if self.one else []
         for w, name in names + [(A_QA + o, f"qa{o}") for o in range((1 + (self.qc > 2)) if self.one else self.octets)]:
             if name in self.ext:
                 r, off = self.ext[name]
@@ -1728,6 +1757,25 @@ class AttnShape:
         if self.one:
             return _ONE.render(**v) + _MAIN_ONE.render(**v)
         return _SRC.render(**v) + (_MAIN_SRC.render(**v) if self.main_gates else "")
+
+
+def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[int, np.ndarray, int]:
+    """(one pass) A step's F_ATT words that follow its slots' positions (p, S slots; ``branch``: its last L slots follow slot c,
+    at p + c + 1 .., inside the 8 positions of c's record): the branch word (``M_BRANCH``: its first lane in its record | L << 8
+    | its record past the step's first << 12, or 0), the rows' masks of the step's first two records (``M_AMASK``: per
+    record rows 0 .. 3, 4 .. 7, a row's lanes past its position: slot s's p + s, a branch slot's its own), the slots' K lanes
+    (``M_ALANE``: their positions' lanes, 3 bits each)."""
+    c, L = branch or (-1, 0)
+    sc = S - L
+    q = p % 8 + c + 1  # (the branch's first position, from the step's first record's)
+    word = q % 8 | L << 8 | q // 8 << 12 if branch else 0
+    pos = [p % 8 + (s if s < sc else c + 1 + s - sc) for s in range(8)]
+    w = np.zeros(4, np.uint32)
+    for k in range(2):
+        for s in range(8):
+            n = min(max(pos[s] - 8 * k + 1, 0), 8)
+            w[2 * k + s // 4] |= ((0xFF << n) & 0xFF) << (8 * (s % 4))
+    return word, w, sum((pos[s] % 8) << (3 * s) for s in range(8))
 
 
 # ----------------------------------------------------------------------

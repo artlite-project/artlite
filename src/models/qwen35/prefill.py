@@ -424,7 +424,7 @@ class QwenPrefill(ChunkPrefill):
         """(a chunkwise GDN core of 4: the GDN states in the half that the overlay's next position's block starts from,
         ``QwenOverlay._half``)"""
         ov = self.ov
-        if not (ov.g4 and ov._gcur):
+        if not (ov.blocks and ov._gcur):
             return super()._program(key)
         k1 = ("half", key)
         if k1 not in self._items:

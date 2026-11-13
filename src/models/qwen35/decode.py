@@ -32,11 +32,13 @@ from . import attn as AT
 from . import gdn as GD
 
 M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
-M_KSHIFT = OD.M_MODEL + 3  # (the gdn_in phase's, chunkwise core of 4: the k / v histories' and the gates' first row)
+M_KSHIFT = OD.M_MODEL + 3  # (the gdn_in phase's, chunkwise cores: the k / v histories' and the gates' first row)
 M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 10)  # (an F_ATT object's)
 M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
-M_BRANCH = 37  # (a step whose last slots branch off an earlier one: an F_ATT object's two words, the gdn_in object's one: their
-# kernels' ``M_BRANCH``)
+M_BRANCH = 37  # (a step whose last slots branch off an earlier one: the F_ATT objects' and the gdn_in object's word, its parent slot +
+# 1 | its slots << 8, or 0)
+M_AMASK = 38  # (an F_ATT object's, one pass: 4 words, the rows' masks of the step's first two records, ``attn``'s A_MK)
+M_ALANE = 42  # (an F_ATT object's, one pass: the slots' K lanes, ``attn``'s A_LN)
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
@@ -46,8 +48,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
 
     PREFIX = "q35m"
     GDN_STACK, ATTN_STACK = 4864, AT.STACK
-    GWS8_AT = 0x4000  # (chunkwise) the GDN workspace: regions 1 .. 3 whole, below the helper's scratch (8 slots) and a SiLU
-    # table copy
+    GWS8_AT = GD.GWS_AT  # (chunkwise) the GDN workspace
     A_FWD = 3  # (the attention core holds its last two A objects: decode.design's A_FWD)
     LENDS_WS = True  # (the attention core's regions in the main core's memory)
     GDN_ROW, ATTN_ROW = 2, 5
@@ -311,7 +312,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return Buffer(self._acc_type(), name=f"{self.PREFIX}_acc{c}", tile=Tile(c, self.ATTN_ROW))
 
     def _pins(self) -> dict[str, int]:
-        return {f"{self.PREFIX}_gws{c}": self.GWS8_AT for c in self._gws}
+        """(and an 8-slot GDN core's helper scratch: a branching step's branch, ``gdn.HS8_AT``)"""
+        g8 = self.gdn is not None and self.gdn.slots == 8
+        return {f"{self.PREFIX}_gws{c}": self.GWS8_AT for c in self._gws} | ({f"{self.PREFIX}_hs{c}": GD.HS8_AT for c in range(COLS)} if g8 else {})
 
     def _x_rows(self) -> tuple[int, ...]:
         return (*[self.GDN_ROW] * (self.gdn is not None), *[self.ATTN_ROW] * (self.attn is not None))
@@ -332,24 +335,25 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return k, self._gws_of(c)
 
     def _gdn8_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
-        """The GDN cores of an 8-slot design (``gdn``'s "8 slots"): per step (after the header) per k head its q and k blocks
-        (their histories out) and K objects, then its v heads (a block, the deltas and z, 16 state panels; the history,
-        the deltas and the gated outputs out)."""
+        """The GDN cores of an 8-slot design (``gdn``'s "8 slots"): per step (after the header) per k head its q block (its
+        history out), its k block and K object (its history out), then its v heads (a block and its R object, 16 state
+        panels; the history and the gated outputs out); the helper computes the Gram blocks and the chunks' constants."""
         p, P, gdn = s.p, self.PREFIX, self.gdn
         bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
         x_ty = s.x_ty
         GW = gdn.workspace()
+        assert self.GWS8_AT + GW["size"] <= GD.HS8_AT and GD.HS8_AT + self.hs_bytes <= GD.SILU_TAB[1] - 0x70000, GW
+        assert GD.HB_R + 5 * 2 * GD.D <= self.hs_bytes
         gws_ty = np.ndarray[(GW["size"] // 4,), i32]
         d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
         i_g = GW["st"] // 4
         kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
-        kxd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty, d_ty])
         kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
-        ks = [kx("gbegin"), kx("gw"), kx("gconv"), kd("ghist"), kx("gkold"), kd("gknew"), kx("gdl"), kx("gz"),
-              Kernel(f"{p}_gwait", "kernel.o", [gws_ty]), kxd("gpanel"), kd("gdlout"), kd("gout")]
+        ks = [kx("gbegin"), kx("gw"), kx("gconv"), kx("gk"), kx("gvr"), Kernel(f"{p}_gwait", "kernel.o", [gws_ty]),
+              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kx("gpanel0"), kd("ghq"), kd("ghv"), kd("ghv2"), kd("gout")]
         nv = gdn.hc // 2
 
-        def gdn_fn(x_f, d_f, gbegin, gw, gconv, ghist, gkold, gknew, gdl, gz, gwait, gpanel, gdlout, gout, ws, *_tabs):
+        def gdn_fn(x_f, d_f, gbegin, gw, gconv, gk, gvr, gwait, gpanel, gpanel0, ghq, ghv, ghv2, gout, ws, *_tabs):
             def take(k: Kernel) -> None:  # an X object into the workspace
                 x = x_f.acquire(1)
                 k(x, ws)
@@ -360,10 +364,6 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                 k(ws, d)
                 d_f.release(1)
 
-            def block() -> None:  # a conv block's two objects (its new history in the workspace)
-                take(gw)
-                take(gconv)
-
             for _ in forever_():
                 take(gbegin)
                 for _ in range_(ws[i_g + GD.G_NSKIP]):
@@ -371,26 +371,29 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                     x_f.release(1)
                 for _ in range_(ws[i_g + GD.G_ON]):  # (after the header: ``gbegin``)
                     for _ in range32(2, unroll=False):  # the k heads
-                        block()  # q
-                        emit(ghist)
-                        take(gkold)
-                        block()  # k
-                        gwait(ws)
-                        emit(gknew)
-                        emit(ghist)
+                        take(gw)  # q
+                        take(gconv)
+                        emit(ghq)
+                        take(gw)  # k
+                        take(gconv)
+                        take(gk)
+                        emit(ghv)
+                        emit(ghv2)
                         for _ in range32(nv, unroll=False):  # its v heads
-                            block()
-                            take(gdl)
-                            take(gz)
+                            take(gw)
+                            take(gconv)
+                            take(gvr)
                             gwait(ws)
-                            for _ in range32(16, unroll=False):
+                            for _ in range_(ws[i_g + GD.G_NPD]):  # (a step that ends its block: its update out)
                                 x = x_f.acquire(1)
                                 d = d_f.acquire(1)
                                 gpanel(x, ws, d)
                                 d_f.release(1)
                                 x_f.release(1)
-                            emit(ghist)  # (its history and deltas: one drain)
-                            emit(gdlout)
+                            for _ in range_(ws[i_g + GD.G_NPX]):
+                                take(gpanel0)
+                            emit(ghv)
+                            emit(ghv2)
                             emit(gout)
 
         for c in range(COLS):
@@ -409,7 +412,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return self._tabs[-2:]
 
     def _gdn4_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
-        """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "4 slots, chunkwise"): the step's message on M, then per k
+        """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "Chunkwise", "4 slots"): the step's message on M, then per k
         head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, H] objects, 16 state
         panels, its outputs and history out."""
         p, P, gdn = s.p, self.PREFIX, self.gdn

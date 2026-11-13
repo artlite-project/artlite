@@ -96,6 +96,8 @@ from artlite.overlay import Sequence, Transaction, WeightBuffer
 
 from . import attn, gdn
 from .decode import (
+    M_ALANE,
+    M_AMASK,
     M_ANA,
     M_BRANCH,
     M_COMMIT,
@@ -143,7 +145,7 @@ class _Step:
         # column's V panels and rows of record 0, then of record 1)
         self.drains: list[tuple[list[int], int, int, int, int]] = []
         self.patch: dict[str, np.ndarray] | None = None  # (``_patch_tables``)
-        # (chunkwise of 4: its state panels' fills and drains (BD word index or drain handle, GSTATE offset in a half, bytes,
+        # (chunkwise: its state panels' fills and drains (BD word index or drain handle, GSTATE offset in a half, bytes,
         # whether a drain), the half they are patched for: ``_gstate_at``)
         self.gst: list[tuple[int | list[int], int, int, bool]] | tuple[np.ndarray, ...] = []
         self.ghalf = -1
@@ -161,7 +163,7 @@ def slots_of(cfg: QwenConfig, fmts: set[str], drafts: bool) -> int:
 
 
 def chunk_of(cfg: QwenConfig) -> bool:
-    """Whether a model on a design of 4 slots runs the GDN core chunkwise (``gdn``'s "4 slots, chunkwise"): an MoE model, whose
+    """Whether a model on a design of 4 slots runs the GDN core chunkwise (``gdn``'s "Chunkwise"): an MoE model, whose
     drafter's steps of 2 .. 4 tokens gain 1.5-4.5% for 0.4-0.8% at S 1. The token-by-token core stays the better one for a model
     without a drafter, which only runs S 1."""
     return bool(cfg.moe)
@@ -214,15 +216,17 @@ class QwenOverlay(ModelOverlay):
                                       slots=slots, bcast=slots == 8, gu_win=gu_win,
                                       pairs=not cfg.moe and any(b.pairs for r in img.regions for b in r.blocks))
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
-        self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "4 slots, chunkwise")
+        self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "Chunkwise", "4 slots")
+        self.blocks = self.g4 or self.g8  # (a chunkwise core: the states at the ends of blocks of 8 positions, ``_half``)
         self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
         self._committed, self._accepted = True, True
-        # (chunkwise of 4) the GDN state's half: the block of position _gp starts in half _gh (``_half``); the step's
+        # (chunkwise) the GDN state's half: the block of position _gp starts in half _gh (``_half``); the step's
         # position, the next one; a prefill's half; the k / v histories' and gates' first row (8 after a block's end)
         self._gp = self._gh = self._gpos = self._gnext = self._gcur = self.kshift = 0
+        self._ends = True  # (8 slots) whether the step's chain ends its block: its state panels drain (``_variant``)
         self._order = None if img.order is None else self._id_runs(img.order)  # (``_logits``)
         self._plan()
 
@@ -319,7 +323,7 @@ class QwenOverlay(ModelOverlay):
                 self.gstate[L] = take("GSTATE", COLS * self.ps)
                 self.ghdr[L] = take("GHDR", COLS * HSLOT)
         self.ghalf = 0
-        if self.g4:  # (the states twice: a block's base, and the state at its end, ``_half``)
+        if self.blocks:  # (the states twice: a block's base, and the state at its end, ``_half``)
             self.ghalf = take("GSTATE", self._layout["GSTATE"] - 256) - 256
         self.xch, self.cp = {}, {}
         if self.moe:  # (per MoE layer its route object, per column its routing's objects and expert object; PART)
@@ -330,7 +334,7 @@ class QwenOverlay(ModelOverlay):
         self._fobj = np.array([[[(self.fatt[L] + (c * self.ash.u + u) * XB) // 4 for u in range(self.ash.u)]
                                 for c in range(COLS)] for L in self.fatt], np.int64)  # ([layer][column][sub-step], words)
         self._gin = np.array([self.inp[(L, "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
-        self._branch: bool | int = False  # (M_BRANCH words that are not zeros: ``_set_branch``; -1: unknown)
+        self._branch: tuple | None = None  # (the step words as the metadata objects hold them: ``_set_branch``; None: unknown)
         r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
             self.ring_off[L] = take("KV", self.ash.kvh * 2 * self.T)
@@ -406,8 +410,8 @@ class QwenOverlay(ModelOverlay):
         norm = self._f32(f"blk.{L}.ssm_norm.weight")
         m = np.zeros(META, np.int32)
         m[M_FLAGS], m[M_SKIP] = gdn.F_GDN, sh.n_objects - 1
-        if self.g8:  # (the helper's heads per step: ``gdn``'s ``hgdn``)
-            m[gdn.M_HPAN] = sh.hc + 2
+        if self.g8:  # (the helper's requests per step: ``gdn``'s ``hgdn``, its heads' and the step's end)
+            m[gdn.M_HPAN] = sh.hc + 3
         for c in range(COLS):
             vh = gdn_v_heads(cfg, c)
             rows = blk.rows[c][blk.rows[c] >= 0]
@@ -538,26 +542,25 @@ class QwenOverlay(ModelOverlay):
         assert sh.ch == (4 + sh.hc) * gdn.D
 
     def _gdn8(self, seq: Sequence, L: int, S: int) -> None:
-        """gdn_in and the GDN step of an 8-slot design (``gdn``'s "8 slots"): gdn_in's rows per slot into the conv
-        blocks' second objects, z into the v heads' Z objects, ab into the header (a sync), then per k head its group
-        and per v head its group and panels, each round over the columns before its drains (the D objects that the
-        core's later X objects wait for)."""
+        """gdn_in and the GDN step of an 8-slot design (``gdn``'s "8 slots"): gdn_in's rows per slot into the q blocks' second
+        objects, the k heads' K objects and the v heads' R objects (v, then z), ab into the header (a sync), then per k head
+        its group and per v head its group and panels (``_gdn_units``)."""
         dev, sh, hc = self.dev, self.gsh, self.gsh.hc
         X = XPAY // 4  # (words)
         self._weights(seq, (L, "gdn_in"), 0)
         seq.sync()
         self._inputs(seq, self.inp[(L, "gdn_in")][0], S, (L, "gdn_in"))
         # (a block's objects (half, slot) as [half][slot 8][64]: half 0's S rows, then half 1's 1 KB on; per execution its
-        # pair of blocks of the two k heads, or the 6 v blocks; then the next: k after q, z after v)
+        # pair of blocks of the two k heads, or the hc v blocks; then the next: k after q, z after v)
         hb = 2 * 64 * 8 // 4  # (words between the halves)
         for c in range(COLS):
             pay = lambda k, c=c: dev.address("GOBJ", self._gpay(L, c, k))
-            b0 = pay(sh.block_slot(0) + 1) + 3 * 2 * gdn.D  # (q0's rows)
-            seq.drain("C", c, b0, 2 * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.KH_SPAN * X), 2,
-                      ((pay(sh.block_slot(2)) - pay(sh.block_slot(0))) // 4, 2))  # q, then k rows
-            v0 = pay(sh.block_slot(4) + 1) + 3 * 2 * gdn.D
+            q0 = pay(sh.kh_slot(0) + 1) + 3 * 2 * gdn.D  # (q0's rows, past the history's rows 8 .. 10)
+            seq.drain("C", c, q0, 2 * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.KH_SPAN * X), 2,
+                      ((pay(sh.kh_slot(0) + 4) - q0) // 4, 2))  # q, then k rows (the K objects)
+            v0 = pay(sh.v_slot(0) + 2)
             seq.drain("C", c, v0, hc * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.V_SPAN * X), 2,
-                      ((pay(sh.v_slot(0) + 3) - v0) // 4, 2))  # v rows, then z
+                      (2048 // 4, 2))  # v rows, then z (the R objects' halves)
             seq.drain("C", c, pay(gdn.H_SLOT) + gdn.H_AB, 2 * S * C_LEN)  # ab
         seq.sync()
         vh = [gdn_v_heads(self.cfg, c) for c in range(COLS)]
@@ -567,50 +570,58 @@ class QwenOverlay(ModelOverlay):
             g0 = sh.kh_slot(kh) - (1 if kh == 0 else 0)
             seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, g0) - 256), (gdn.KH_SPAN + 1 - kh) * XB, DIMS_OBJ)
 
-        def kh_d(kh: int, c: int) -> None:  # (the q history, the step's K object, the k history: 6 KB apart)
-            a = dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh)) + 2048)
-            seq.drain("D", c, a, 3 * gdn.D_BYTES, (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
+        def kh_d(kh: int, c: int) -> None:  # (the q history from the q A object's second half; the k history from the k A
+            # object's, over the k B object, its last 2 KB into the K object's taken rows)
+            seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh)) + 2048), gdn.D_BYTES)
+            seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.kh_slot(kh) + 2) + 2048), 2 * gdn.D_BYTES)
 
-        def v_x(h: int, c: int) -> None:  # (its group, its panels)
+        def v_xa(h: int, c: int) -> None:
             seq.fill("X", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) - 256), gdn.V_SPAN * XB, DIMS_OBJ)
-            p0 = dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL - 256)
-            seq.fill("X", c, p0, 16 * XB, DIMS_OBJ)
 
-        def v_d(h: int, c: int) -> None:
-            v = self._gpay(L, c, sh.v_slot(h))
-            p0 = dev.address("GSTATE", self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL)
-            seq.drain("D", c, p0, 16 * gdn.PANEL)
-            seq.drain("D", c, dev.address("GOBJ", v + 2048), 2 * gdn.D_BYTES,  # its history, its deltas
-                      (gdn.D_BYTES // 8, 2, gdn.D_BYTES // 8, (2 * XPAY - 2048) // 4))
-            # its gated outputs (2 KB) at its head in gdn_out's x, the step's d per token after them (2 KB): of the last
-            # head into the header, else into the sink past that K group's x
+        def v_xp(h: int, c: int) -> None:  # (from the block's half; the step's position patches them: ``_gstate_at``)
+            o = self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL - 256
+            self._gst.append((seq.fill("X", c, dev.address("GSTATE", o), 16 * XB, DIMS_OBJ), o, 16 * XB, False))
+
+        def v_dp(h: int, c: int) -> None:  # (into the other half: a step that ends its block)
+            o = self.gstate[L] + c * self.ps + 16 * h * gdn.PANEL
+            self._gst.append((seq.drain("D", c, dev.address("GSTATE", o), 16 * gdn.PANEL), o, 16 * gdn.PANEL, True))
+
+        def v_dh(h: int, c: int) -> None:  # (its history from the A object's second half, over the B object, its last 2 KB into
+            # the R object's taken v rows)
+            seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) + 2048), 2 * gdn.D_BYTES)
+
+        def v_do(h: int, c: int) -> None:  # (its gated outputs (2 KB) at its head in gdn_out's x, the block's gates after them
+            # (2 KB): of the last head into the header, else into the sink past that K group's x)
             at, left = self._x_at((L, "gdn_out"), gdn.D * vh[c][h], S)
             xg = next(2 * self.SLOTS * rg.K for rg in self.inp[(L, "gdn_out")] if rg.k0 <= gdn.D * vh[c][h] < rg.k0 + rg.K)
             assert left >= 2048
             if h == last:
                 seq.drain("D", c, dev.address("ACT", at), gdn.D_BYTES // 2)
-                seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, gdn.H_SLOT) + gdn.H_DOLD), gdn.D_BYTES // 2)
+                seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, gdn.H_SLOT) + gdn.H_DN), gdn.D_BYTES // 2)
             else:
                 seq.drain("D", c, dev.address("ACT", at), gdn.D_BYTES, (512, 2, xg // 4, 512))
 
-        self._gdn_units(hc, (kh_x, kh_d), (v_x, v_d))
+        self._gdn_units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * self._ends + (v_dh, v_do)))
 
-    def _gdn_units(self, hc: int, k: tuple[object, object], v: tuple[object, object]) -> None:
-        """The chunkwise core's units in its order (per k head its group, then its v heads), each unit's fills k[0], v[0] one
-        unit ahead of the drains k[1], v[1] of the one before (a channel's fifth task waits for its oldest: the core then has
-        its next objects queued while the firmware waits for drains). At most 4 tasks a unit on a channel: a fifth would
-        wait for its own unit's first, column after column."""
+    @staticmethod
+    def _gdn_units(hc: int, k: tuple[tuple, tuple], v: tuple[tuple, tuple]) -> None:
+        """A chunkwise core's transfers in its order: per k head its unit (fills k[0], drains k[1]: task(head, column)), then
+        its v heads' (v[0], v[1]); each unit's fills ahead of the drains of the one before (a channel's fifth task waits for
+        its oldest: the core then has its next objects queued while the firmware waits for drains; at most 4 tasks a unit on
+        a channel), in rounds of one task over the columns (a column's tasks in a row would leave the last column's first one
+        ~10 us behind the first column's, at every unit): a head's panels drain before the next head's panels fill, whose wait
+        ends only when this head's panels are in."""
         units = [u for kh in range(2) for u in [(*k, kh)] + [(*v, h) for h in range(kh, hc, 2)]]
         for i in range(len(units) + 1):
-            if i < len(units):
-                for c in range(COLS):
-                    units[i][0](units[i][2], c)
-            if i:
-                for c in range(COLS):
-                    units[i - 1][1](units[i - 1][2], c)
+            fills = [(f, units[i][2]) for f in units[i][0]] if i < len(units) else []
+            drains = [(d, units[i - 1][2]) for d in units[i - 1][1]] if i else []
+            for pair in itertools.zip_longest(fills, drains):
+                for task, unit in filter(None, pair):
+                    for c in range(COLS):
+                        task(unit, c)
 
     def _gdn4(self, seq: Sequence, L: int, S: int) -> None:
-        """gdn_in and the GDN step of a chunkwise core of 4 slots (``gdn``'s "4 slots, chunkwise"): its rows on M, per k head its
+        """gdn_in and the GDN step of a chunkwise core of 4 slots (``gdn``'s "Chunkwise", "4 slots"): its rows on M, per k head its
         group and per v head its group and panels."""
         dev, sh = self.dev, self.gsh
         X = XPAY // 4  # (words)
@@ -647,17 +658,7 @@ class QwenOverlay(ModelOverlay):
         def v_dh(h: int, c: int) -> None:  # (its history, then its deltas: the A object's second half and the U object after it)
             seq.drain("D", c, dev.address("GOBJ", self._gpay(L, c, sh.v_slot(h)) + 2048), 3 * gdn.D_BYTES // 2)
 
-        # each unit's fills ahead of the drains of the one before, as ``_gdn_units``, in rounds of one task over the columns (a
-        # column's tasks in a row would leave the last column's first one ~10 us behind the first column's, at every unit): a
-        # head's panels drain before the next head's panels fill, whose wait ends only when this head's panels are in
-        units = [u for kh in range(2) for u in [((kh_x,), (kh_d,), kh)] + [((v_xa, v_xp), (v_dp, v_do, v_dh), h) for h in range(kh, sh.hc, 2)]]
-        for i in range(len(units) + 1):
-            fills = [(f, units[i][2]) for f in units[i][0]] if i < len(units) else []
-            drains = [(d, units[i - 1][2]) for d in units[i - 1][1]] if i else []
-            for pair in itertools.zip_longest(fills, drains):
-                for task, unit in filter(None, pair):
-                    for c in range(COLS):
-                        task(unit, c)
+        self._gdn_units(sh.hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp, v_do, v_dh)))
 
     def _runs(self, lm: bool) -> list[list[tuple[int, str]]]:
         """A column-major step's weight runs: its phases up to the first attention's attn_in, then from each
@@ -833,6 +834,23 @@ class QwenOverlay(ModelOverlay):
     def _head(self, seq: Sequence, S: int) -> None:
         """Phases before the first layer's (a drafter's eh: ``draft``)."""
 
+    def _variant(self) -> tuple:
+        """(a step of an 8-slot design: whether its chain ends its block, ``_ends``: only then its state panels drain)"""
+        return (self.start, self._ends)
+
+    def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
+        """(8 slots: the steps that end their block and those that do not)"""
+        for ends in (True, False) if self.g8 else (True,):
+            self._ends = ends
+            super().prepare(S, logits, start)
+        self._ends = True
+
+    def patch_ahead(self, S: int, p: int) -> None:
+        """(a step of a chain)"""
+        if self.g8:
+            self._ends = p % 8 + S >= 8
+        super().patch_ahead(S, p)
+
     def subs(self, p: int, S: int) -> tuple[tuple[int, int, bool], ...]:
         """The attention's sub-steps of a step at p .. p + S - 1 (``decode.vring.substeps``): (first slot, slots,
         whether the chains divide the cache: by its group alone)."""
@@ -862,13 +880,13 @@ class QwenOverlay(ModelOverlay):
         return {"f": f, "t": t, "r": r, "lines": np.unique(4 * at & ~63)}
 
     def _half(self, p: int) -> int:
-        """(chunkwise of 4) The GSTATE half that holds the state at the start of position p's block (``gdn``'s "4 slots,
-        chunkwise": blocks of 8 positions; a step reads its block's half and writes the other, the state at the block's end
+        """(chunkwise) The GSTATE half that holds the state at the start of position p's block (``gdn``'s "Chunkwise":
+        blocks of 8 positions; a step reads its block's half and writes the other, the state at the block's end
         when the step reaches it): from the half _gh of _gp's block, the other at each block after."""
         return (self._gh + p // 8 - self._gp // 8) & 1
 
     def _gstate_at(self, st: _Step, p: int) -> None:
-        """(chunkwise of 4) A step's state transfers for position p: the panels from p's block's half, into the other."""
+        """(chunkwise) A step's state transfers for position p: the panels from p's block's half, into the other."""
         h = self._half(p)
         if st.ghalf == h:
             return
@@ -883,7 +901,7 @@ class QwenOverlay(ModelOverlay):
     def _set_position(self, st: _Step, p: int) -> None:
         """The F_ATT objects (per sub-step: its positions, cache objects, rotations) and the step's cache and ring
         transfers (and a chunkwise core of 4's state transfers: ``_gstate_at``)."""
-        if self.g4:
+        if self.blocks:
             self._gstate_at(st, p)
         if self.ash is None:
             return
@@ -979,9 +997,9 @@ class QwenOverlay(ModelOverlay):
         return self.SLOTS == 8 and self.ash is not None and self.ash.one and self.gsh is not None and self.gsh.slots == 8
 
     def _metas(self, S: int) -> None:
-        """(the M_BRANCH words as the metadata objects left them: ``_set_branch`` writes them at the next step)"""
+        """(the step words as the metadata objects left them: ``_set_branch`` writes them at the next step)"""
         super()._metas(S)
-        self._branch = -1
+        self._branch = None
 
     def _branch_angles(self, p: int, L: int) -> None:
         """The F_ATT objects' angles of a step's last L slots at p (one pass: the step's slots' rows) from ``rope``."""
@@ -990,27 +1008,33 @@ class QwenOverlay(ModelOverlay):
         self.dev.view("ACT").view(np.float32)[at] = np.concatenate([c0, s0], 1).reshape(-1)
         self.dev.flush_at("ACT", np.unique(4 * at.ravel() & ~63))
 
-    def _set_branch(self, branch: tuple[int, int] | None, p: int) -> None:
-        """A step's M_BRANCH words, the branch (parent c, its L slots) at p hiding the chain's slots c + 1 .. 7 - L from its slots: in the
-        F_ATT objects per record of the step's first two the lanes of those positions in the rows of its slots 4 .. 7 (attn.py's
-        ``kmask``), in the gdn_in objects those slots as lanes | c + 1 << 8 | L << 12 (gdn.py: the branch slots' conv windows,
-        decays and L / M rows); None: zeros."""
-        w, g = np.zeros(2, np.int64), 0
-        if branch is not None:
-            c, L = branch
-            for s in range(8 - L, 8):
-                for q in range(p + c + 1, p + 8 - L):
-                    w[(q >> 3) - (p >> 3)] |= 1 << (8 * (s - 4) + (q & 7))
-            g = ((1 << (8 - L)) - (1 << (c + 1))) | (c + 1) << 8 | L << 12
+    def _set_branch(self, branch: tuple[int, int] | None, p: int, S: int) -> None:
+        """A step's words that follow its slots' positions and its branch (parent c, its L slots at p + c + 1 .., inside the 8
+        positions of slot c's: ``step``): per F_ATT object (one pass) ``attn.step_words``; the gdn_in objects' branch word (8
+        slots: c + 1 | L << 8, or 0). Written when they change."""
+        c, L = branch or (-1, 0)
+        key = (p % 8, S, c, L)
+        if key == self._branch:
+            return
+        word = (c + 1) | L << 8 if branch else 0
         a32 = self.dev.view("ACT").view(np.int32)
-        fo = self._fobj[:, :, 0] + M_BRANCH
-        a32[fo], a32[fo + 1] = w.astype(np.uint32).view(np.int32)
-        a32[self._gin + M_BRANCH] = g
-        self.dev.flush_at("ACT", np.unique(np.concatenate([4 * fo.ravel(), 4 * fo.ravel() + 4, 4 * self._gin + 4 * M_BRANCH]) & ~63))
-        self._branch = branch is not None
+        lines = []
+        if self.ash is not None and self.ash.one:
+            aword, w, lanes = attn.step_words(p, S, branch)
+            fo = self._fobj[:, :, 0].ravel()
+            a32[fo + M_BRANCH] = aword
+            a32[fo[:, None] + M_AMASK + np.arange(4)] = w.view(np.int32)
+            a32[fo + M_ALANE] = lanes
+            lines.append(4 * (fo + M_BRANCH))
+        if self.g8:
+            a32[self._gin + M_BRANCH] = word
+            lines.append(4 * (self._gin + M_BRANCH))
+        if lines:
+            self.dev.flush_at("ACT", np.unique(np.concatenate(lines) & ~63))
+        self._branch = key
 
     def _set_gdn(self, *, nrep: int, cshift: int, commit: bool) -> None:
-        """The GDN layers' gdn_in metadata words of the lazy commit (chunkwise of 4: the step's lanes in its block before
+        """The GDN layers' gdn_in metadata words of the lazy commit (chunkwise: the step's lanes in its block before
         it, the q history's base row, the k / v histories' and the gates' first row)."""
         if self.gobj:
             a32 = self.dev.view("ACT").view(np.int32)
@@ -1029,15 +1053,16 @@ class QwenOverlay(ModelOverlay):
         the previous step's accepted tokens: ``accept``). ``commit``: the GDN states after the step's tokens are written
         (all of them must then be accepted, ``accept(S)``), else the step's tokens are replayed by the next step as far
         as accepted (a chunkwise core of 4: the states are written at the ends of blocks of 8 positions whatever
-        ``commit``, which then only says that all S are accepted: ``gdn``'s "4 slots, chunkwise"). ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
-        at position + parent + 1 .. (a tree of two branches: ``_set_branch``); None: a chain. Returns the slots' logits
+        ``commit``, which then only says that all S are accepted: ``gdn``'s "Chunkwise"). ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
+        at position + parent + 1 .. inside the 8 positions of slot parent's (position % 8 + parent + L <= 7: its attention
+        records and GDN block; a tree of two branches: ``_set_branch``); None: a chain. Returns the slots' logits
         (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits`` None."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
         assert self._committed or self._accepted, "accept() the previous lazy step's tokens first"
         assert branch is None or (S == 8 and self.can_branch and not commit and branch[1] in (1, 2)
-                                  and 0 <= branch[0] < 7 - branch[1]), (S, branch)
+                                  and 0 <= branch[0] and position % 8 + branch[0] + branch[1] <= 7), (position, S, branch)
         self._conv_for_decode(position)
         if branch is not None:  # (after a prefill's text rope; a step patched ahead: its branch slots' angles again)
             c, L = branch
@@ -1046,10 +1071,10 @@ class QwenOverlay(ModelOverlay):
                 self._branch_angles(position, L)
         if self._metas_s != (S, self.start):
             self._metas(S)
-        if self._branch and self.can_branch or branch is not None:
-            self._set_branch(branch, position)
-        if self.g4:  # (the block's lanes before the step; the step's words do not depend on commit)
+        self._set_branch(branch, position, S)
+        if self.blocks:  # (the block's lanes before the step; the step's words do not depend on commit)
             assert position == self._gnext, (position, self._gnext)
+            self._ends = not self.g8 or position % 8 + S - (branch[1] if branch else 0) >= 8
             self._gpos = position
             self._set_gdn(nrep=position % 8, cshift=self.cshift, commit=False)
         else:
@@ -1062,14 +1087,14 @@ class QwenOverlay(ModelOverlay):
         out = self._run(S, position, logits)
         self._accepted = False
         if commit:  # (all S accepted)
-            if self.g4:
+            if self.blocks:
                 self._advance(S)
             else:
                 self.nrep, self.cshift = 0, S
         return out
 
     def _advance(self, m: int) -> None:
-        """(chunkwise of 4) The last step's first m tokens accepted: the next step's histories' rows (past its block's end:
+        """(chunkwise) The last step's first m tokens accepted: the next step's histories' rows (past its block's end:
         the next block's, 8 rows on) and q base row."""
         self.kshift = 8 if self._gpos % 8 + m >= 8 else 0
         self.cshift = m
@@ -1086,7 +1111,7 @@ class QwenOverlay(ModelOverlay):
     def _conv_index(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """bf16 indices of the GDN layers' conv states: (GOBJ history rows 0 .. 2 of every block, GHDR's [row][channel])
         in the same order, and which are a k or v block's; the decode's base rows are cshift rows past the GOBJ ones
-        (chunkwise of 4: a k or v block's, the block's lanes before the position past the history's first row,
+        (chunkwise: a k or v block's, the block's lanes before the position past the history's first row,
         ``_kv_rows``)."""
         if getattr(self, "_cvi", None) is None:
             ch = self.gsh.ch
@@ -1101,7 +1126,7 @@ class QwenOverlay(ModelOverlay):
                 for c in range(COLS):
                     src.append(self._gpay(L, c, 0) + at + 2 * (gdn.D * r + j % gdn.D))
                     dst.append(self.ghdr[L] + c * HSLOT + CS_OFF + 2 * np.arange(3 * ch))
-            kv = np.tile((b >= 2) & self.g4, len(self.gobj) * COLS)
+            kv = np.tile((b >= 2) & self.blocks, len(self.gobj) * COLS)
             self._cvi = (np.concatenate(src) // 2, np.concatenate(dst) // 2, kv)
         return self._cvi
 
@@ -1115,7 +1140,7 @@ class QwenOverlay(ModelOverlay):
         if self.gsh is None or self._conv_in_ghdr:
             return
         assert self.nrep == 0, "a prefill after a lazy step: commit its accepted tokens first"
-        assert not self.g4 or self._gnext % 8 == 0, "a prefill from a GDN block's start"
+        assert not self.blocks or self._gnext % 8 == 0, "a prefill from a GDN block's start"
         dev = self.dev
         src, dst, kv = self._conv_index()
         dev.fetch("GOBJ")
@@ -1123,7 +1148,7 @@ class QwenOverlay(ModelOverlay):
         dev.flush("GHDR")
         self._gcur = self._half(self._gnext)
         self._conv_in_ghdr = True
-        self._branch = -1  # (a prompt chunk in between: the next step writes the M_BRANCH words)
+        self._branch = None  # (a prompt chunk in between: the next step writes its step words)
 
     def conv_fresh(self) -> None:
         """Before a sequence's first prompt chunk (at position 0: no conv history, its zero rows the chunk's own,
@@ -1134,10 +1159,10 @@ class QwenOverlay(ModelOverlay):
         assert self.nrep == 0, "a prefill after a lazy step: commit its accepted tokens first"
         self._gcur = self._half(0)
         self._conv_in_ghdr = True
-        self._branch = -1
+        self._branch = None
 
     def _conv_for_decode(self, p: int) -> None:
-        """Before a decode step at p after a prefill: GHDR's conv states into the conv objects' base rows (chunkwise of 4:
+        """Before a decode step at p after a prefill: GHDR's conv states into the conv objects' base rows (chunkwise:
         the decode's blocks from the prefill's state at p, in its half; the block's lanes before p, none of the sequence's,
         take zero gates: no change of the state, so that blocks start at multiples of 8 and prefills at a block's start)."""
         if not self._conv_in_ghdr:
@@ -1148,13 +1173,13 @@ class QwenOverlay(ModelOverlay):
         dev.fetch("GHDR")
         g16 = dev.view("GOBJ").view(np.uint16)
         g16[src + self._rows_at(kv, p)] = dev.view("GHDR").view(np.uint16)[dst]
-        if self.g4:
+        if self.blocks:
             self._gp, self._gh, self._gnext = p, self._gcur, p
             gobj = dev.view("GOBJ")
             for L in self.gobj:
                 for c in range(COLS):
-                    for kh in range(2):
-                        a = self._gpay(L, c, self.gsh.kh_slot(kh)) + gdn.P_D
+                    for a in ([self._gpay(L, c, gdn.H_SLOT) + gdn.H_DN] if self.g8 else
+                              [self._gpay(L, c, self.gsh.kh_slot(kh)) + gdn.P_D for kh in range(2)]):
                         gobj[a:a + 64 * (p % 8)] = 0
         dev.flush("GOBJ")
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
@@ -1191,7 +1216,7 @@ class QwenOverlay(ModelOverlay):
         assert 0 <= n <= self._last_s and not self._accepted
         if self._committed:
             assert n == self._last_s, "a committing step's tokens are all accepted"
-        elif self.g4:
+        elif self.blocks:
             self._advance(n)
         else:
             self.nrep, self.cshift = n, n
@@ -1230,9 +1255,9 @@ class QwenOverlay(ModelOverlay):
         self.rope[:] = snapshot["rope"]
 
     def _gspan(self) -> slice:
-        """GSTATE's bytes a snapshot keeps: its states (chunkwise of 4: the half that the next position's block starts
+        """GSTATE's bytes a snapshot keeps: its states (chunkwise: the half that the next position's block starts
         from, the other is the next block's scratch; a prefill's next position: its half)."""
-        if not self.g4:
+        if not self.blocks:
             return slice(None)
         h = self._gcur if self._conv_in_ghdr else self._half(self._gnext)
         return slice(256 + h * self.ghalf, 256 + (h + 1) * self.ghalf)

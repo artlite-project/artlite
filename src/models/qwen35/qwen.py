@@ -461,7 +461,8 @@ class NpuQwen(OverlayModel):
 
         self._dispatch(lambda: d.step(S, keep, q, x, p + c, meanwhile=ahead))
         self.stale()
-        L = self.BRANCH if self.rounds and n > self.BRANCH and c + n + 1 == self.overlay.SLOTS and self.overlay.can_branch else 0
+        L = self.BRANCH if (self.rounds and n > self.BRANCH and c + n + 1 == self.overlay.SLOTS and self.overlay.can_branch
+                            and p % 8 + c + self.BRANCH <= 7) else 0  # (a branch inside its parent's 8 positions: ``QwenOverlay.step``)
         out = d.selector.walk(d.logits(), d.gates(), token, d.table.ids, n, set(self.eos_token_ids), sibling=L)
         self._sib = d.selector.sibling if L else None
         if self._sib is not None:

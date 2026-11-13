@@ -1,5 +1,5 @@
 """The GDN core of the multi-slot decode overlay (``qwen35/decode.py``): one Gated DeltaNet step of S <= 4 token
-slots (8 slots: below) per GDN layer and column, with a lazy commit of the recurrent state.
+slots (chunkwise and 8 slots: below) per GDN layer and column, with a lazy commit of the recurrent state.
 
 Column c holds q / k heads {2c, 2c + 1} and its HC v heads (``image.gdn_v_heads``; v head h of the column reads local
 k head h & 1). The heads come in pairs (2 c + 16 p, + 1). Per step the core gets:
@@ -29,45 +29,11 @@ histories, the 32 state panels, the delta object of the step's tokens and the ga
 of the pair's heads, slot-interleaved as the gdn_out phase reads them ([head 2][k block 16][slot 4][8] bf16, then
 2 KB of padding).
 
-8 slots (``GdnShape(slots=8)``, designs of steps of up to 8 tokens): the message of 8 slots (34 KB) and the per-pair
-arrays twice the size do not fit the core's L1 (which also holds the helper's scratch: ``decode.design``'s 8-slot
-partition), so the core runs per v head, its v heads grouped by k head (k head kh's v heads h = kh, kh + 2, ..: one k
-head's q, k and K objects in the workspace at a time), and gdn_in's rows reach it through DDR: gdn_in drains them (C)
-into the step's objects (3 drains per column, its objects (half, slot) as [half][slot 8][64]: the q / k blocks', the v
-blocks' then z, ab), then a sync. A column's objects of a layer are payload slots of XPAY bytes (each object's metadata
-the 256 bytes before it): the header H (F_GDN, M_SKIP; the slots' ab, dt, A, ssm_norm, the previous step's d per token
-from the last gated outputs' D object), per k head [q A, q B, K (K^T panels), k A, k B], per v head [A, B, DL (U), Z]. A conv block's
-two objects: A = [weights (2 KB) | its history's rows 0 .. 7], B = [the history's rows 8 .. 10 | the step's S rows]:
-the history (3 + 8 rows, 2816 bytes, after the weights) holds the previous step's [base 3 | S rows], from which the core
-takes the step's base rows at cshift, so the host patches nothing per step; the new history [base 3 | the step's S rows]
-goes out over it (D: from A's second half on). The step's words (S, M_NREP, M_CSHIFT, M_COMMIT) come from the gdn_in
-phase's metadata object (``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q block, the previous
-step's K object, its k block (then the q history, the step's K object and the k history out: 6 KB apart, one drain),
-then per v head its block, U and z, its 16 state panels, and its history, U and gated outputs out ([k block 16][slot 8][8]
-bf16: gdn_out's x of the head; the 2 KB after them the step's d per token, into the header from the last head, else the
-sink). A column's DMA tasks
-per layer: 14 fills (its X objects in runs: header + k head 0's group, k head 1's, per v head its group and its
-panels) and 21 drains.
-
-Branch (8 slots, ``M_BRANCH`` in gdn_in's metadata, ``QwenOverlay.step``'s branch): the step's last L slots follow slot c instead of
-slot 7 - L. Their conv windows take the history rows of slot c's window from their first row on, then their own (``conv1``); their
-rows of the decays come from the slots' d with the slots c + 1 .. 7 - L zeroed (factors 1: the products along the branch), and L, M
-hide those slots from them (the helper's ``vhead``). The other rows are the chain's: row t of T = (I + L)^-1 reads rows before it.
-
-The 8-slot core's delta rule is chunkwise (the WY / UT form, the prefill's ``gdn_prefill``, on one block of 8 tokens: its
-docstring has the equations): a step costs about one pass per panel, whatever its S (a token-by-token pass per panel
-took ~6000 cycles at S 8 against the panel's ~2170 of DMA, and held the weights' stream for it). Per k head the Gram
-blocks of its K, Q panels and per v head T = (I + L)^-1 and M (on the helper core, ``hgdn``, which reaches the core's
-memory and is idle in a GDN step: asked by the core's lock ``L_HRDY`` after the head's objects, ``L_HDONE`` before they are
-used; the header's ``M_HPAN`` tells it the heads of a step through a K_HELP command of the main core), per panel: the
-previous step's accepted tokens' update in one pass (the replay, from the kept K^T panels and U), the base out, X^T, Y^T
-of the step's tokens on the MMUL, R, U, O from T, M: ~690 cycles at every S. Token rows past S are zero (K, Q, beta, d). A token's numbers then depend on how the tokens were grouped
-into steps at the rounding level (hi + lo panels: ~3e-5 of o, ~70x below its bf16 rounding).
-
-4 slots, chunkwise (``GdnShape(chunk=True)``, an MoE model with its drafter: ``overlay.chunk_of``): the same delta rule
-in blocks of 8 positions (position mod 8: the block's lanes), each lane's numbers the same whatever the steps that run it
-(a draft rejected or accepted, a step of one or of four: the outputs of steps of S slots are those of steps of one, bit for
-bit). The state is materialized only at a block's end: a step reads its block's base state and recomputes every lane of the
+Chunkwise (``GdnShape(chunk=True)``: an MoE model with its drafter, ``overlay.chunk_of``, 4 slots; every design of 8 slots):
+the delta rule in its WY / UT form (the prefill's ``gdn_prefill``: its docstring has the equations) in blocks of 8 positions
+(position mod 8: the block's lanes), a step about one pass per panel whatever its S, each lane's numbers the same whatever the
+steps that run it (a draft rejected or accepted, a step of one or of eight: the outputs of steps of S slots are those of steps
+of one, bit for bit). The state is materialized only at a block's end: a step reads its block's base state and recomputes every lane of the
 block up to its own (the lanes before it from the k / v histories and the gates of the block, [the 3 rows before the block
 | its lanes' rows], which run on in the objects, read from row M_KSHIFT: 8 after a block's end); a lane's U by forward
 substitution in lane order (``solve``), O from it and Y; the products along the lanes are per lane in fp32 (bfp16 blocks run
@@ -78,10 +44,12 @@ read only after a block's end wrote it); a step past the block's end then runs
 the next block's lanes from that update in L1 (their V in o's rows the outputs do not take, their K panels in k2). A
 prefill ends anywhere: the decode's first block after it has no lanes before the prefill's end, whose zero gates leave the
 state as it is, so that blocks start at multiples of 8 and a prefill (at a multiple of 32) at a block's start, the state
-whole. A step's time at S 1 is its objects through DDR, so this core keeps the message on M in its workspace (no drains, no
-sync after gdn_in) and runs per v head, its v heads grouped by k head, on the payload slots of its groups (each object's
-metadata the 256 bytes before it, the previous payload's last; the first object's: F_GDN, M_SKIP): per k head [P, W, K], per
-v head [A, H]. P = [the q block's history (7 rows: [base 3 | the step's S rows], taken at cshift) | the block's lanes' gates
+whole. The core runs per v head, its v heads grouped by k head (k head kh's v heads h = kh, kh + 2, ..), on the payload slots
+of its groups (each object's metadata the 256 bytes before it, the previous payload's last; the first object's: F_GDN,
+M_SKIP).
+
+4 slots: a step's time at S 1 is its objects through DDR, so the core keeps the message on M in its workspace (no drains, no
+sync after gdn_in): per k head [P, W, K], per v head [A, H]. P = [the q block's history (7 rows: [base 3 | the step's S rows], taken at cshift) | the block's lanes' gates
 at P_D ([lane 12][d 8 | beta 8] fp32) | dt, A, ssm_norm at P_PRM (the first k head's)], W = [q weights | k weights], K = the
 k block's history (16 rows), A = [the v block's weights | its history's rows 0 .. 7], H = [rows 8 .. 15 | 2 KB]. Per step,
 after the message: per k head P (the gates), W (its q block at the step's lanes, Q's panels), the P object out, K (its k
@@ -90,6 +58,31 @@ lanes' constants: decays, L and M's columns, ``vhead``), 16 state panels and out
 | 1 KB | its history's rows 0 .. 7], [rows 8 .. 15 | 2 KB]. Conv outputs come out in panel layout ([panel 16][lane 8][8]:
 ``pconv``). Program memory is what bounds this core: cold functions are ``minsize`` where that measured smaller, vectors go by
 value through no call (a 64-lane argument costs more at its call sites than an inlined product).
+
+8 slots (``GdnShape(slots=8)``): the message of 8 slots (34 KB) does not fit the core's L1 (which also holds the helper's
+scratch: ``decode.design``'s 8-slot partition), so gdn_in's rows reach it through DDR: gdn_in drains them (C) into the step's
+objects (3 drains per column, a block's rows (half, slot) as [half][slot 8][64]: the q blocks' and the K objects, the R
+objects' v rows then z, ab), then a sync. The header [the slots' ab | dt, A, ssm_norm | the block's lanes' gates (16 lanes,
+from the last gated outputs' D object)], per k head [q A, q B, k A, k B, K], per v head [A, B, R]: a conv block's A = [weights
+(2 KB) | its history's rows 0 .. 7], B = [rows 8 .. | the step's q rows] (q: [base 3 | the step's S rows], taken at cshift) or
+[rows 8 .. 23] (a k or v block's history, block-linear as the 4-slot core's, 24 rows: 3 + 7 lanes before a step + 8 of it +
+6 past them), K = the step's k rows, R = [the step's v rows | z]. The step's words come from the gdn_in phase's metadata object
+(``F_GIN``). Per step: the header (``gbegin``: the gates), per k head its q block (its history out), its k block and K object
+(K's panels; its history out), then per v head A, B, R (its V), 16 state panels, its history and gated outputs out ([k block
+16][slot 8][8] bf16: gdn_out's x of the head; the 2 KB after them the block's gates, into the header from the last head, else
+the sink). The helper core (``hgdn``: it reaches the core's memory and is idle in a GDN step; asked by the core's lock
+``L_HRDY``, done on ``L_HDONE``; the header's ``M_HPAN`` tells it the requests of a step through a K_HELP command of the main
+core) computes per k head the Gram blocks and K^T's panels (after its K object; the first v head's R object waits for them),
+per v head its chunks' constants (``vhead``, after its R object; the panels wait for them).
+
+Branch (8 slots, ``QwenOverlay.step``'s branch; ``M_BRANCH`` in gdn_in's metadata): the step's last L slots follow slot c
+instead of the chain's last, at positions inside slot c's block. The chain is the step's other slots (S counts them), the
+branch a third chunk from the block's base over the lanes through its last: the chain's to slot c and its own (its conv
+windows: slot c's rows, then its own; its K and Q panels: the chain's with its lanes', its gates after the chain's in dn's
+lanes 16 ..), each lane as in a step of one at its position. Its regions lie in the helper's scratch (``HS8_AT``, pinned:
+idle while the helper waits in ``hgdn``, which the step's last v head releases only after its panels: the helper's next phase
+starts as the first heads' outputs come in), its outputs' lanes go into o's lanes past the chain's, where its slots' outputs
+read them.
 """
 
 import math
@@ -114,27 +107,37 @@ F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the G
 # state words of the GDN core's workspace (the first ones are trip counts of its program)
 (G_NSKIP, G_NMSG, G_ON, G_NCP, G_KO, G_PO, G_NS, G_NREP, G_CSHIFT, G_COMMIT, G_MJ, G_MS, G_CB, G_PAIR,
  G_PANEL) = range(15)
-G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (8 slots) the k head, its v heads done, the v head in the column
-G_HK = G_KO  # (8 slots) the helper's next work: a k head's (1), a v head's (0)
-G_KSHIFT = G_PO  # (4 slots, chunkwise) the k history's base row in its K object (M_KSHIFT)
-G_BR = 15  # (8 slots) a branching step's word (``M_BRANCH``: the lanes hidden from its branch | its parent slot + 1 << 8 | its
-# slots << 12, or 0)
+G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (chunkwise) the k head, its v heads done, the v head in the column
+G_HK = G_KO  # (8 slots) the helper's next work: a k head's Gram blocks (1), a v head's constants (0)
+G_KSHIFT = G_PO  # (chunkwise) the k / v histories' base row (M_KSHIFT)
+G_NPD, G_NPX = G_NCP, G_COMMIT  # (8 slots) a v head's state panels with a D object (a step that ends its block: its update
+# out), without one (else: nothing of them is read)
+G_BR = 15  # (8 slots) a branching step's word (``M_BRANCH``: its parent slot + 1 | its slots << 8, or 0)
 G_WORDS = 16
-G_TA = G_WORDS  # (8 slots) the SiLU table's addresses
+G_TA = G_WORDS  # (chunkwise) the SiLU table's addresses
+G_BN = G_WORDS + 2  # (8 slots) a branching step's branch chunk: the block's lanes through its last (0: none)
 PAN = 72  # bytes of a bfp16 panel (8 x 8)
 # (8 slots) the GDN tile's locks of the k and v heads' constants, which the helper core computes (``hgdn``): asked, done;
-# the header's metadata word of the helper's runs per step; the SiLU table's two copies in the core's regions 0, 1 (bytes)
+# the header's metadata word of the helper's runs per step (its heads' and the step's end); the SiLU table's two copies in the core's regions 0, 1 (bytes)
 L_HRDY, L_HDONE = 12, 13
 M_HPAN = 35
 SILU_TAB = (0x739C0, 0x7F9C0)
+# (8 slots) the helper's scratch on the GDN tile (local address, pinned: the helper waits in ``hgdn`` until the step's end; the
+# cores address it from the workspace, the helper's view of the tile differs from the GDN core's):
+# a branching step's branch there, V and O ([panel 16][lane 8][8] fp32) at HB_V, K and Q panels at HB_K, HB_Q, its rows'
+# scratch (the 3 rows before it, its own) at HB_R
+GWS_AT = 0x4000  # (chunkwise) the GDN workspace's local address (pinned: regions 1 .. 3, below the helper's scratch (8 slots)
+# and a SiLU table copy)
+HS8_AT = 0xD1C0
+HB_V, HB_K, HB_Q, HB_R = 0, 4096, 4096 + 16 * 2 * PAN, 4096 + 32 * 2 * PAN
 # (8 slots) a column's objects of a GDN layer: payload slots of XPAY bytes (each object's metadata the 256 bytes before
-# its payload): the header (H_SLOT), per k head kh its group [q A, q B, K, k A, k B] (from KH_SLOT + KH_SPAN kh), per v
-# head h its group [A, B, DL, Z] (from V_SLOT + V_SPAN h); the header's payload: the slots' ab at H_AB (a gdn_in object
-# each: 128 bytes), dt 16 | A 16 | ssm_norm 128 fp32 at H_PRM, the step's d per token ([token 8][8] fp32: the last
-# gated outputs' D object's second half) at H_DOLD
-H_SLOT, KH_SLOT, KH_SPAN, V_SLOT, V_SPAN = 0, 1, 5, 11, 4
-H_AB, H_PRM, H_DOLD = 0, 1024, 2048
-# (4 slots, chunkwise) a column's objects of a GDN layer: per k head its group [P, W, K], per v head its [A, H]; a P
+# its payload): the header (H_SLOT), per k head kh its group [q A, q B, k A, k B, K] (from KH_SLOT + KH_SPAN kh), per v
+# head h its group [A, B, R] (from V_SLOT + V_SPAN h); the header's payload: the slots' ab at H_AB (a gdn_in object
+# each: 128 bytes), dt 16 | A 16 | ssm_norm 128 fp32 at H_PRM, the block's lanes' gates at H_DN ([lane 16][d 8 | beta 8]
+# fp32: the last gated outputs' D object's second half)
+H_SLOT, KH_SLOT, KH_SPAN, V_SLOT, V_SPAN = 0, 1, 5, 11, 3
+H_AB, H_PRM, H_DN = 0, 1024, 2048
+# (chunkwise, 4 slots) a column's objects of a GDN layer: per k head its group [P, W, K], per v head its [A, H]; a P
 # object's bytes: its q block's history, the block's lanes' gates at P_D ([lane 12][d 8 | beta 8] fp32), the ssm parameters
 # at P_PRM; a K object: its k block's history (16 rows); A: the v block's weights, its history's rows 0 .. 7 at 2048; H: the
 # history's rows 8 .. 15
@@ -510,10 +513,8 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
 """)
 
 
-# The core of steps of up to 8 slots (``GdnShape(slots=8)``, module docstring "8 slots")
-# The chunkwise core's pieces (module docstring "8 slots", "4 slots, chunkwise"): rows and sizes of a step's tokens by SMAX
-# against the block's 8 lanes
-_CA = r"""{% set cold = "noinline" if SMAX == 8 else "noinline, minsize" %}
+# The chunkwise cores' pieces (module docstring "Chunkwise"): a block's 8 lanes whatever the step's slots
+_CA = r"""{% set cold = "noinline, minsize" %}
 
 // The GDN core's workspace (offsets in bytes: GdnShape.workspace())
 #define GW(T, off) ((T *)((uint8_t *)ws + (off)))
@@ -523,14 +524,14 @@ namespace {
 
 {{ gm.expm1.src }}
 {{ gm.softplus.src }}
-{% set silu = km.act(km.SILU, f32=True, table_arg=True, small=SMAX < 8) %}
+{% set silu = km.act(km.SILU, f32=True, table_arg=True, small=True) %}
 {{ silu.src }}
 
-// 1024 SiLUs: t scratch, y fp32 (the table's addresses run-time values: llvm-aie's gathers want pointers)
+// 512 SiLUs: t scratch, y fp32 (the table's addresses run-time values: llvm-aie's gathers want pointers)
 [[clang::always_inline]] inline void {{ p }}_silu(const bfloat16 *__restrict x, bfloat16 *__restrict t, float *__restrict y,
                                                  const int32_t *__restrict st)
 {
-    {{ silu }}<{{ SMAX * D }}>(x, t, y, (const uint32_t *)(uintptr_t)st[{{ G_TA }}], (const uint32_t *)(uintptr_t)st[{{ G_TA + 1 }}]);
+    {{ silu }}<{{ 4 * D }}>(x, t, y, (const uint32_t *)(uintptr_t)st[{{ G_TA }}], (const uint32_t *)(uintptr_t)st[{{ G_TA + 1 }}]);
 }
 
 // 1 / rms of 8 rows' squares summed (16 lanes: the rows', 0) over n = 1 or D values (al::inv_rms<n, 8>: powers of two)
@@ -539,26 +540,6 @@ __attribute__((noinline)) aie::vector<float, 16> {{ p }}_irms(aie::vector<float,
     return al::inv_sqrt_eps<8>(al::mulc<16>(ss, aie::broadcast<bfloat16, 16>(n == 1 ? 1.0f : {{ 1.0 / D }}f)), {{ eps }}f);
 }
 
-{% if SMAX == 8 %}
-// 4 KB
-__attribute__((noinline)) void {{ p }}_cp4k(int32_t *__restrict dst, const int32_t *__restrict src)
-{
-    al::copy<1024, 16>(dst, src);
-}
-
-// n lines of 64 B (once per head: program memory)
-__attribute__((noinline, minsize)) void {{ p }}_cpl(void *__restrict dst, const void *__restrict src, int n)
-{
-    int32_t *__restrict d = (int32_t *)dst;
-    const int32_t *__restrict s = (const int32_t *)src;
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < n; i++) {
-        aie::store_v(d, aie::load_v<16>(s));
-        d += 16;
-        s += 16;
-    }
-}
-{% else %}
 // n lines of 64 B
 __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__restrict src, int n = 64)
 {
@@ -571,7 +552,6 @@ __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__
         s += 16;
     }
 }
-{% endif %}
 
 // C += A (hi + lo) B (hi + lo)^T: three products
 [[clang::always_inline]] inline void {{ p }}_mm3(al::MM8 &c, const al::BV &ah, const al::BV &al_, const al::BV &bh,
@@ -599,50 +579,6 @@ template <int N, typename T>
     return al::gather<8, 8>(p, N);
 }
 
-{% if SMAX == 8 %}
-// x [t 8][8 n values] at row stride N bf16 -> y [panel n][j 8][t 8]
-__attribute__(({{ cold }})) void {{ p }}_tr8(const bfloat16 *__restrict x, bfloat16 *__restrict y, int n, int N)
-{
-    const bfloat16 *__restrict px = x;
-    bfloat16 *__restrict py = y;
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < n; i++) {
-        aie::store_v(py, aie::transpose(al::gather<8, 8>(px, N), 8, 8));
-        px += 8;
-        py += 64;
-    }
-}
-
-{% endif %}
-{% if SMAX == 8 %}
-// y[t][0 .. D) = bf16(sum over the taps of w (hi + lo) x) of the rows t: x rows t .. t + 3 of r (pitch D: the 3 base rows,
-// then the slots'), w [tap 4][hi, lo][D]
-__attribute__((noinline)) void {{ p }}_conv8(const bfloat16 *__restrict r, const bfloat16 *__restrict w, bfloat16 *__restrict y)
-{
-    for (int c = 0; c < {{ D }}; c += 32) {
-        aie::vector<bfloat16, 32> wh[4], wl[4];
-        AIE_LOOP_UNROLL_FULL
-        for (int t = 0; t < 4; t++) {
-            wh[t] = aie::load_v<32>(w + {{ 2 * D }} * t + c);
-            wl[t] = aie::load_v<32>(w + {{ 2 * D }} * t + {{ D }} + c);
-        }
-        const bfloat16 *__restrict pr = r + c;
-        bfloat16 *__restrict py = y + c;
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int t = 0; t < {{ SMAX }}; t++) {
-            aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
-            AIE_LOOP_UNROLL_FULL
-            for (int k = 0; k < 4; k++) {
-                const aie::vector<bfloat16, 32> xk = aie::load_v<32>(pr + {{ D }} * k);
-                acc = aie::mac(aie::mac(acc, xk, wh[k]), xk, wl[k]);
-            }
-            aie::store_v(py, acc.template to_vector<bfloat16>());
-            pr += {{ D }};
-            py += {{ D }};
-        }
-    }
-}
-{% else %}
 // The outputs t < n of the conv, bf16(sum over the taps of w (hi + lo) x) of x rows t .. t + 3 of r (pitch D: the 3 base
 // rows, then the lanes'), at lanes (l0 + t) & 7 of y ([panel 16][lane 8][8] bf16; its other lanes untouched); w [tap 4][hi,
 // lo][D]
@@ -675,88 +611,6 @@ __attribute__((noinline)) void {{ p }}_pconv(const bfloat16 *__restrict r, const
         }
     }
 }
-{% endif %}
-{% if SMAX == 8 %}
-
-// One slot's y (``conv8``'s arithmetic) whose window is rows a .. a + na - 1, then rows b ..: a branch slot of a step (its
-// parent's rows, then the branch's)
-__attribute__((noinline, minsize)) void {{ p }}_conv1(const bfloat16 *__restrict a, int na, const bfloat16 *__restrict b,
-                                                    const bfloat16 *__restrict w, bfloat16 *__restrict y)
-{
-    AIE_LOOP_NO_UNROLL
-    for (int c = 0; c < {{ D }}; c += 32) {
-        aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
-        AIE_LOOP_NO_UNROLL
-        for (int k = 0; k < 4; k++) {
-            const aie::vector<bfloat16, 32> xk = aie::load_v<32>((k < na ? a + {{ D }} * k : b + {{ D }} * (k - na)) + c);
-            acc = aie::mac(aie::mac(acc, xk, aie::load_v<32>(w + {{ 2 * D }} * k + c)), xk, aie::load_v<32>(w + {{ 2 * D }} * k + {{ D }} + c));
-        }
-        aie::store_v(y + c, acc.template to_vector<bfloat16>());
-    }
-}
-{% endif %}
-
-"""
-
-_L2ROWS = r"""// The panels of the rows y [8][D] (fp32) l2-normalized (q: times 1 / sqrt(D), the scores' scale; the rows outside the mask
-// rows zero): per i-block hi, lo at out + 288 ib (y unchanged; sq: 64 + 8 floats of scratch)
-__attribute__(({{ cold }})) void {{ p }}_l2panels(const float *__restrict y, float *__restrict sq, uint32_t rows, int q,
-                                              uint8_t *__restrict out)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const float *py = y;
-    float *__restrict ps = sq;
-    AIE_LOOP_NO_UNROLL
-    for (int t = 0; t < 8; t++) {
-        aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-        AIE_LOOP_NO_UNROLL
-        for (int k = 0; k < 2; k++) {
-            aie::vector<bfloat16, 64> a, b;
-            al::split2<64>(aie::load_v<64>(py), a, b);
-            py += 64;
-            ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
-        }
-        const aie::vector<float, 64> v = ss.template to_vector<float>();
-        const aie::vector<float, 32> h = aie::add(v.template extract<32>(0), v.template extract<32>(1));
-        const aie::vector<float, 16> g = aie::add(h.template extract<16>(0), h.template extract<16>(1));
-        aie::store_v(ps, aie::add(g.template extract<8>(0), g.template extract<8>(1)));
-        ps += 8;
-    }
-    aie::vector<float, 16> iv = {{ p }}_irms(al::group8<false>(aie::load_v<64>(sq)).template grow<16>(), 1);
-    if (q)
-        iv = al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(iv);
-    const aie::vector<float, 64> ib8 = al::bcast8(aie::select(aie::zeros<float, 16>(), iv, aie::mask<16>::from_uint32(rows)).template extract<8>(0));
-    const al::BV nI = al::neg_eye();
-    py = y;
-    uint8_t *__restrict po = out;
-    for (int ib = 0; ib < 16; ib++) {
-        {{ p }}_push2(aie::accum<accfloat, 64>(al::mulff<64>({{ p }}_blk<{{ D }}>(py), ib8)), nI, po);
-        py += 8;
-        po += {{ 4 * PAN }};
-    }
-}
-
-"""
-
-_CN = r"""// The 8 tokens' 1 / rms of o ([panel 16][j 8][t 8] fp32) at sq + 64; sq: 64 + 8 floats of scratch
-__attribute__(({{ cold }})) void {{ p }}_gnorm(const float *__restrict o, float *__restrict sq{{ ", int n" if SMAX < 8 else "" }})
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-    const float *__restrict po = o;
-    for (int kb = 0; kb < 16; kb++) {
-        aie::vector<bfloat16, 64> a, b;
-        al::split2<64>(aie::load_v<64>(po), a, b);
-        po += 64;
-        ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
-    }
-    const aie::vector<float, 64> q = ss.template to_vector<float>();  // ([j][t]: the sums over the j rows per lane t)
-    aie::vector<float, 8> g = aie::zeros<float, 8>();
-    AIE_LOOP_UNROLL_FULL
-    for (int j = 0; j < 8; j++)
-        g = aie::add(g, q.template extract<8>(j));
-    aie::store_v(sq + 64, {{ p }}_irms(g.template grow<16>(), {{ "n" if SMAX < 8 else D }}).template extract<8>(0));
-}
 
 """
 
@@ -775,360 +629,6 @@ __attribute__(({{ cold }})) void {{ p }}_gnorm(const float *__restrict o, float 
     aie::store_v(sq + 64, {{ p }}_irms(al::group8<false>(ss.template to_vector<float>()).template grow<16>(), {{ D }}).template extract<8>(0));
 }
 
-"""
-
-_GRAM = r"""// The k head's Gram blocks of its K, Q panels (kq: [ib 16][k hi, k lo, q hi, q lo]) on the MMUL: g = K K^T, Q K^T ([t][s]
-// fp32), and the K^T panels kt ([ib][hi, lo] of the [i 8][t 8] blocks: I (K hi + K lo)^T exactly, then split)
-__attribute__(({{ cold }})) void {{ p }}_gram(const uint8_t *__restrict kq, float *__restrict g, uint8_t *__restrict kt)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    {
-        al::MM8 a(aie::zeros<accfloat, 64>()), b(aie::zeros<accfloat, 64>());
-        al::BIn<> ks((const bfp16ebs8 *)kq);
-        for (int ib = 0; ib < 16; ib++) {
-            const al::BV kh = ks.pop(), kl = ks.pop(), qh = ks.pop(), ql = ks.pop();
-            a.mac(kh, TR(kh));
-            b.mac(qh, TR(kh));
-            a.mac(kh, TR(kl));
-            b.mac(qh, TR(kl));
-            a.mac(kl, TR(kh));
-            b.mac(ql, TR(kh));
-        }
-        aie::store_v(g, a.to_accum().template to_vector<float>());
-        aie::store_v(g + 64, b.to_accum().template to_vector<float>());
-    }
-    const al::BV I = al::eye(), nI = al::neg_eye();
-    al::BIn<> ks((const bfp16ebs8 *)kq);
-    uint8_t *__restrict po = kt;
-    for (int ib = 0; ib < 16; ib++) {
-        const al::BV h = ks.pop(), l = ks.pop();
-        ks.pop();
-        ks.pop();
-        al::MM8 t(aie::zeros<accfloat, 64>());
-        t.mac(I, TR(h));
-        t.mac(I, TR(l));
-        {{ p }}_push2(t.to_accum(), nI, po);
-        po += {{ 2 * PAN }};
-    }
-}
-
-"""
-
-_CB = r"""// The decays of 8 tokens (d fp32, 0 past the step's): er [row t][16]: lanes s < t E[t][s] = prod_{u = s + 1 .. t} (1 + d_u)
-// - 1, lane 8 prod_{u = 0 .. t} (1 + d_u) - 1 (no cancellation for weak decays), three bf16 products per factor
-__attribute__(({{ cold }})) void {{ p }}_decays(const float *__restrict d, float *__restrict er)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    bfloat16 *__restrict dh = (bfloat16 *)(er + 128), *__restrict dl = dh + 16;
-    {
-        aie::vector<bfloat16, 16> h, l;
-        al::split2<16>(aie::load_v<16>(d), h, l);
-        aie::store_v(dh, h);
-        aie::store_v(dl, l);
-    }
-    aie::vector<float, 16> e = aie::zeros<float, 16>();
-    unsigned m = 0x100u;  // (lanes s < t, the start)
-    AIE_LOOP_NO_UNROLL
-    for (int k = 0; k < {{ SMAX }}; k++) {
-        const aie::vector<bfloat16, 16> bh = aie::broadcast<bfloat16, 16>(dh[k]), bl = aie::broadcast<bfloat16, 16>(dl[k]);
-        aie::vector<bfloat16, 16> eh, el;
-        al::split2<16>(e, eh, el);
-        aie::accum<accfloat, 16> acc(aie::add(e, aie::broadcast<float, 16>(d[k])));
-        acc = aie::mac(aie::mac(aie::mac(acc, bh, eh), bh, el), bl, eh);
-        e = aie::select(aie::zeros<float, 16>(), acc.template to_vector<float>(), aie::mask<16>::from_uint32(m));
-        aie::store_v(er + 16 * k, e);
-        m = ((m & 0xFFu) << 1) | 1u | 0x100u;
-    }
-}
-
-// L = beta (1 + E) K K^T (s < t), M = (1 + E) Q K^T (s <= t) from the Gram blocks g and er: L as bf16 hi, lo (lb: [hi |
-// lo][t][s]), M's panels at pn + 2 panels
-__attribute__((noinline)) void {{ p }}_lm(const float *__restrict be, const float *__restrict g, const float *__restrict er,
-                                        bfloat16 *__restrict lb, uint8_t *__restrict pn, uint64_t hide)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const al::BV nI = al::neg_eye();
-    const aie::vector<float, 64> e = {{ p }}_blk<16>(er);
-    const aie::vector<float, 64> kk = aie::load_v<64>(g), q = aie::load_v<64>(g + 64);
-    const aie::vector<float, 64> l = al::mulff<64>(al::bcast8(aie::load_v<8>(be)), aie::add(kk, al::mulff<64>(e, kk)));
-    aie::vector<bfloat16, 64> h, lo;
-    al::split2<64>(aie::select(aie::zeros<float, 64>(), l, aie::mask<64>::from_uint64(0x{{ strict }}ull & ~hide)), h, lo);
-    aie::store_v(lb, h);
-    aie::store_v(lb + 64, lo);
-    {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)),
-                                                      aie::mask<64>::from_uint64(0x{{ lower }}ull & ~hide))), nI, pn + {{ 2 * PAN }});
-}
-
-// T = (I + L)^-1 by row substitution, r[t] = e_t - sum_{s < t} L[t][s] r[s]: per s three bf16 products into the row's
-// accumulator (L from lb, the finished rows as bf16 hi, lo in rb: [hi | lo][t][16]); tr: the rows (fp32); its panels at pn
-__attribute__((noinline)) void {{ p }}_tinv(const bfloat16 *__restrict lb, float *__restrict tr, bfloat16 *__restrict rb,
-                                          uint8_t *__restrict pn)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-{% if SMAX < 8 %}
-    al::zero<128, 16>(tr);  // (the rows from SMAX on: U's lanes stay zero)
-{% endif %}
-    AIE_LOOP_UNROLL_FULL
-    for (int t = 0; t < {{ SMAX }}; t++) {
-        aie::vector<float, 16> x = aie::zeros<float, 16>();
-        x[t] = 1.0f;
-        aie::store_v(tr + 16 * t, x);
-        aie::store_v(rb + 16 * t, aie::accum<accfloat, 16>(x).template to_vector<bfloat16>());
-        aie::store_v(rb + 128 + 16 * t, aie::zeros<bfloat16, 16>());
-    }
-    AIE_LOOP_NO_UNROLL
-    for (int t = 1; t < {{ SMAX }}; t++) {
-        // (three chains, one per product: a chain of 24 dependent MACs would bind)
-        aie::accum<accfloat, 16> a0(aie::load_v<16>(tr + 16 * t)), a1(aie::zeros<accfloat, 16>()), a2(aie::zeros<accfloat, 16>());
-        const bfloat16 *__restrict ph = lb + 8 * t;
-        const bfloat16 *__restrict qh = rb;
-        AIE_LOOP_UNROLL_FULL
-        for (int s = 0; s < {{ SMAX }}; s++) {
-            const aie::vector<bfloat16, 16> ch = aie::broadcast<bfloat16, 16>(ph[0]), cl = aie::broadcast<bfloat16, 16>(ph[64]);
-            const aie::vector<bfloat16, 16> xh = aie::load_v<16>(qh), xl = aie::load_v<16>(qh + 128);
-            a0 = aie::msc(a0, ch, xh);
-            a1 = aie::msc(a1, ch, xl);
-            a2 = aie::msc(a2, cl, xh);
-            ph++;
-            qh += 16;
-        }
-        const aie::accum<accfloat, 16> acc = aie::add(aie::add(a0, a1), a2);
-        const aie::vector<float, 16> x = acc.template to_vector<float>();
-        const aie::vector<bfloat16, 16> h = acc.template to_vector<bfloat16>();
-        aie::store_v(tr + 16 * t, x);
-        aie::store_v(rb + 16 * t, h);
-        aie::store_v(rb + 128 + 16 * t, aie::accum<accfloat, 16>(aie::sub(x, aie::accum<accfloat, 16>(h).template to_vector<float>())).template to_vector<bfloat16>());
-    }
-    {{ p }}_push2(aie::accum<accfloat, 64>({{ p }}_blk<16>(tr)), al::neg_eye(), pn);
-}
-
-// The state's factor over the first R of the tokens with the decays er: (uf: their U factors 1 + E[R - 1][s], 0 from R
-// on; dc: E of the R tokens, bf16 hi [64], lo [64])
-__attribute__((noinline)) void {{ p }}_fact(const float *__restrict er, int R, float *__restrict uf, bfloat16 *__restrict dc)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const float *__restrict row = er + 16 * (R - 1);
-    aie::store_v(uf, aie::select(aie::zeros<float, 16>(), aie::add(aie::load_v<16>(row), aie::broadcast<float, 16>(1.0f)),
-                                 aie::mask<16>::from_uint32((1u << R) - 1u)).template extract<8>(0));
-{% if SMAX == 8 %}
-    aie::vector<bfloat16, 64> ch, cl;
-    al::bf16_hilo<64>(row[8], ch, cl);
-    aie::store_v(dc, ch);
-    aie::store_v(dc + 64, cl);
-{% else %}
-    aie::vector<bfloat16, 16> ch, cl;
-    al::bf16_hilo<16>(row[8], ch, cl);
-    aie::store_v(dc, ch);
-    aie::store_v(dc + 16, cl);
-{% endif %}
-}
-
-// A v head's constants from its gates: T, M (pn), [beta | Gamma - 1] per token (fv: 64 lanes each), the factors of the
-// replay's tokens from their d and of a commit
-__attribute__(({{ cold }})) void {{ p }}_vhead(int32_t *__restrict ws)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    const int h = st[{{ G_VH }}], R = st[{{ G_NREP }}];
-    float *__restrict er = GW(float, {{ g.er }});
-    float *__restrict tv = GW(float, {{ g.tv }});  // (d [16] | beta [16])
-    const float *__restrict gt = GW(float, {{ g.gt }});
-    AIE_LOOP_NO_UNROLL
-    for (int t = 0; t < {{ SMAX }}; t++) {
-        tv[t] = gt[32 * t + h];
-        tv[16 + t] = gt[32 * t + 16 + h];
-    }
-{% if SMAX == 8 %}
-    const int br = st[{{ G_BR }}], hm = br & 0xFF, r0 = 8 - (br >> 12);  // (the hidden lanes, the branch's first row)
-    float *__restrict fb = GW(float, {{ g.fv }});
-    if (br) {  // (a branching step: its branch rows' decays along the parent's tokens, kept in fv meanwhile)
-        aie::store_v(fb, aie::select(aie::load_v<16>(tv), aie::zeros<float, 16>(), aie::mask<16>::from_uint32(hm)));
-        {{ p }}_decays(fb, er);
-        for (int r = r0; r < 8; r++)
-            aie::store_v(fb + 16 * r, aie::load_v<16>(er + 16 * r));
-    }
-    {{ p }}_decays(tv, er);
-    uint64_t hide = 0;  // (the branch rows' lanes off it)
-    if (br)
-        for (int r = r0; r < 8; r++) {
-            aie::store_v(er + 16 * r, aie::load_v<16>(fb + 16 * r));
-            hide |= (uint64_t)hm << (8 * r);
-        }
-{% else %}
-    {{ p }}_decays(tv, er);
-    const uint64_t hide = 0;
-{% endif %}
-    uint8_t *__restrict pn = GW(uint8_t, {{ g.pn }});
-    {{ p }}_lm(tv + 16, GW(float, {{ g.gg }}), er, GW(bfloat16, {{ g.lb }}), pn, hide);
-    {{ p }}_tinv(GW(bfloat16, {{ g.lb }}), GW(float, {{ g.xy }}), GW(bfloat16, {{ g.rb }}), pn);  // (xy: free between panels)
-    float *__restrict fv = GW(float, {{ g.fv }});
-{% if SMAX == 8 %}
-    aie::store_v(fv, aie::load_v<8>(tv + 16).template grow_replicate<64>());
-{% else %}
-    aie::store_v(fv, aie::load_v<8>(tv + 16));
-{% endif %}
-    aie::vector<float, 8> es{{ " = aie::zeros<float, 8>()" if SMAX < 8 else "" }};
-    AIE_LOOP_UNROLL_FULL
-    for (int t = 0; t < {{ SMAX }}; t++)
-        es[t] = er[16 * t + 8];
-{% if SMAX == 8 %}
-    aie::store_v(fv + 64, es.template grow_replicate<64>());
-{% else %}
-    aie::store_v(fv + 8, es);
-{% endif %}
-    if (st[{{ G_COMMIT }}])
-        {{ p }}_fact(er, st[{{ G_NS }}], GW(float, {{ g.uf }}) + 8, GW(bfloat16, {{ g.dc }}) + {{ 128 if SMAX == 8 else 32 }});
-    if (R) {
-        const float *__restrict dold = GW(float, {{ g.dold }});
-        AIE_LOOP_NO_UNROLL
-        for (int t = 0; t < {{ SMAX }}; t++)
-            tv[t] = dold[8 * t + h];
-        {{ p }}_decays(tv, er);
-        {{ p }}_fact(er, R, GW(float, {{ g.uf }}), GW(bfloat16, {{ g.dc }}));
-    }
-}
-
-// X^T, Y^T of the step's tokens on a panel: its 16 [j 8][i 8] blocks (fp32, split hi + lo on the MMUL) against the K, Q
-// panels: xy = [X^T | Y^T] ([j][t] fp32)
-__attribute__((noinline)) void {{ p }}_xy(const float *__restrict s, const uint8_t *__restrict kq, float *__restrict xy)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const al::BV nI = al::neg_eye();
-    al::MM8 x(aie::zeros<accfloat, 64>()), y(aie::zeros<accfloat, 64>());
-    al::BIn<> ks((const bfp16ebs8 *)kq);
-    const float *__restrict ps = s;
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int ib = 0; ib < 16; ib++) {
-        al::BV sh, sl;
-        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(ps)), nI, sh, sl);
-        ps += 64;
-        const al::BV kh = ks.pop(), kl = ks.pop(), qh = ks.pop(), ql = ks.pop();
-        x.mac(sh, TR(kh));
-        y.mac(sh, TR(qh));
-        x.mac(sh, TR(kl));
-        y.mac(sh, TR(ql));
-        x.mac(sl, TR(kh));
-        y.mac(sl, TR(qh));
-    }
-    aie::store_v(xy, x.to_accum().template to_vector<float>());
-    aie::store_v(xy + 64, y.to_accum().template to_vector<float>());
-}
-
-// R^T = beta (V^T - Gamma X^T); U^T = R^T T^T (u: [j][t] fp32); O^T = Gamma Y^T + U^T M^T (o: [j][t] fp32). xy, vt (64
-// fp32): the panel's; fv: [beta | Gamma - 1]; pn: [T | M] (hi, lo each)
-__attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const float *__restrict vt, const float *__restrict fv,
-                                           const uint8_t *__restrict pn, float *__restrict u, float *__restrict o)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const al::BV nI = al::neg_eye();
-{% if SMAX == 8 %}
-    const aie::vector<float, 64> g = aie::load_v<64>(fv + 64);
-{% else %}
-    const aie::vector<float, 64> g = aie::load_v<8>(fv + 8).template grow_replicate<64>();
-{% endif %}
-    const aie::vector<float, 64> x = aie::load_v<64>(xy), y = aie::load_v<64>(xy + 64);
-    al::BV rh, rl;
-    al::split_hilo(aie::accum<accfloat, 64>(al::mulff<64>({{ "aie::load_v<64>(fv)" if SMAX == 8 else "aie::load_v<8>(fv).template grow_replicate<64>()" }}, aie::sub(aie::sub(aie::load_v<64>(vt), x), al::mulff<64>(g, x)))), nI, rh, rl);
-    al::BIn<> ps((const bfp16ebs8 *)pn);
-    const al::BV th = ps.pop(), tl = ps.pop(), mh = ps.pop(), ml = ps.pop();
-    al::MM8 uu(aie::zeros<accfloat, 64>());
-    {{ p }}_mm3(uu, rh, rl, th, tl);
-    const aie::accum<accfloat, 64> ua = uu.to_accum();
-    aie::store_v(u, ua.template to_vector<float>());
-    al::BV uh, ul;
-    al::split_hilo(ua, nI, uh, ul);
-    al::MM8 c(aie::accum<accfloat, 64>(aie::add(y, al::mulff<64>(g, y))));
-    {{ p }}_mm3(c, uh, ul, mh, ml);
-    aie::store_v(o, c.to_accum().template to_vector<float>());
-}
-
-{% if SMAX == 8 %}
-// so = si + dc si (bf16 hi / lo products: dc bf16 hi [64], lo [64]): a panel's 64 lanes x 16 blocks; si, so distinct, or
-// the same buffer as distinct parameters (each block is read before it is written)
-__attribute__((noinline)) void {{ p }}_decay(const float *__restrict si, float *__restrict so, const bfloat16 *__restrict dc)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::vector<bfloat16, 64> ch = aie::load_v<64>(dc), cl = aie::load_v<64>(dc + 64);
-    const float __aie_dm_resource_c *__restrict pi = (const float __aie_dm_resource_c *)si;
-    float __aie_dm_resource_d *__restrict po = (float __aie_dm_resource_d *)so;
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int i = 0; i < 16; i++) {
-        const aie::vector<float, 64> v = aie::load_v<64>(pi);
-        pi += 64;
-        aie::vector<bfloat16, 64> vh, vl;
-        al::split2<64>(v, vh, vl);
-        aie::store_v(po, aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(v), vh, ch), vh, cl), vl, ch).template to_vector<float>());
-        po += 64;
-    }
-}
-
-{% else %}
-// so = si + dc si + U'^T K^T in one pass (si, so the same panel as distinct parameters, or two; kt: the K^T panels, up: U'; n:
-// as ``update``'s in the 8-slot core: 1, unknown at compile time, block vectors popped ahead of the inner loop)
-__attribute__((noinline)) void {{ p }}_dupdate(const float *__restrict si, float *__restrict so, const bfloat16 *__restrict dc,
-                                             const uint8_t *__restrict kt, const uint8_t *__restrict up, int n)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::vector<bfloat16, 64> ch = aie::load_v<16>(dc).template grow_replicate<64>(), cl = aie::load_v<16>(dc + 16).template grow_replicate<64>();
-    const float __aie_dm_resource_c *__restrict pi = (const float __aie_dm_resource_c *)si;
-    float __aie_dm_resource_d *__restrict po = (float __aie_dm_resource_d *)so;
-    AIE_LOOP_NO_UNROLL
-    for (int j = 0; j < n; j++) {
-        al::BIn<> us((const bfp16ebs8 *)up);
-        const al::BV uh = us.pop(), ul = us.pop();
-        al::BIn<> ks((const bfp16ebs8 *)kt);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int ib = 0; ib < 16; ib++) {
-            const aie::vector<float, 64> v = aie::load_v<64>(pi);
-            pi += 64;
-            aie::vector<bfloat16, 64> vh, vl;
-            al::split2<64>(v, vh, vl);
-            al::MM8 c(aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(v), vh, ch), vh, cl), vl, ch));
-            const al::BV kh = ks.pop(), kl = ks.pop();
-            {{ p }}_mm3(c, uh, ul, kh, kl);
-            aie::store_v(po, c.to_accum().template to_vector<float>());
-            po += 64;
-        }
-    }
-}
-
-{% endif %}
-// The panels (hi, lo) of U^T times uf per token -> up
-__attribute__((noinline)) void {{ p }}_uprep(const float *__restrict u, const float *__restrict uf, uint8_t *__restrict up)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<8>(uf).template grow_replicate<64>(), aie::load_v<64>(u))),
-                  al::neg_eye(), up);
-}
-
-{% if SMAX == 8 %}
-// S += U'^T K^T in place (si, so the same panel as distinct parameters): its 16 blocks against the K^T panels kt ([ib][hi,
-// lo]), up: U' (popped inside a loop of one iteration, n = 1 unknown at compile time: popped in the function's first block
-// and held across the inner loop, block vectors exhaust llvm-aie's register allocator)
-__attribute__((noinline)) void {{ p }}_update(const float *__restrict si, float *__restrict so, const uint8_t *__restrict kt,
-                                            const uint8_t *__restrict up, int n)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const float __aie_dm_resource_c *__restrict pi = (const float __aie_dm_resource_c *)si;
-    float __aie_dm_resource_d *__restrict po = (float __aie_dm_resource_d *)so;
-    AIE_LOOP_NO_UNROLL
-    for (int j = 0; j < n; j++) {
-        al::BIn<> us((const bfp16ebs8 *)up);
-        const al::BV uh = us.pop(), ul = us.pop();
-        al::BIn<> ks((const bfp16ebs8 *)kt);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int ib = 0; ib < 16; ib++) {
-            al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(pi)));
-            pi += 64;
-            const al::BV kh = ks.pop(), kl = ks.pop();
-            {{ p }}_mm3(c, uh, ul, kh, kl);
-            aie::store_v(po, c.to_accum().template to_vector<float>());
-            po += 64;
-        }
-    }
-}
-
-{% endif %}
 """
 
 _L2P4 = r"""// The panels of y ([panel 16][lane 8][8] fp32: a lane's row of D values in its panels) with each lane's row
@@ -1262,7 +762,8 @@ __attribute__(({{ cold }})) void {{ p }}_vhead(int32_t *__restrict ws, int c)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    const int h = st[{{ G_VH }}], e = st[{{ G_NREP }}] + st[{{ G_NS }}], n = c ? e - 8 : (e < 8 ? e : 8);
+    const int h = st[{{ G_VH }}], e = st[{{ G_NREP }}] + st[{{ G_NS }}];
+    const int n = {% if SMAX == 8 %}c > 1 ? st[{{ G_BN }}] : {% endif %}c ? e - 8 : (e < 8 ? e : 8);
     float *__restrict er = GW(float, {{ g.er }});
     float *__restrict tv = GW(float, {{ g.xy }});  // (d [16] | beta [16])
     const float *__restrict dn = GW(float, {{ g.dn }}) + 128 * c;
@@ -1382,64 +883,71 @@ __attribute__((noinline)) void {{ p }}_uprep(const float *__restrict u, const fl
 }
 
 """
-_ENTRY8 = r"""// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) ([slot][d 16 | beta 16] fp32, 0 past the step's;
-// prm: dt 16 | A 16) of the header's ab (per slot its gdn_in object: alpha HC | beta HC fp32)
+_ENTRY8 = r"""// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) from the header's ab (per slot its gdn_in object:
+// alpha HC | beta HC fp32; prm: dt 16 | A 16) into dn at their lanes t0 .. ([lane][d 8 | beta 8] fp32; a branch's slots after
+// the chain's)
 __attribute__((noinline)) void {{ p }}_ggates(const float *__restrict hab, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const int S = GW(int32_t, {{ g.st }})[{{ G_NS }}];
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int S = st[{{ G_NS }}] + (st[{{ G_BR }}] >> 8);
     const float *__restrict prm = GW(float, {{ g.prm }});
-    float *__restrict gt = GW(float, {{ g.gt }});
-    al::zero<{{ 32 * SMAX }}, 16>(gt);
+    float *__restrict dn = GW(float, {{ g.dn }}) + 16 * st[{{ G_NREP }}];
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {
-{% if 2 * HC <= 16 %}
         const aie::vector<float, 16> ab = aie::load_v<16>(hab + {{ C_LEN // 2 }} * s);  // (alpha HC | beta HC | ..)
-        const aie::mask<16> hc = aie::mask<16>::from_uint32({{ 2 ** HC - 1 }}u);
-        const aie::vector<float, 16> al_ = aie::select(aie::zeros<float, 16>(), ab, hc);
-        const aie::vector<float, 16> be = aie::select(aie::zeros<float, 16>(), aie::shuffle_down(ab, {{ HC }}), hc);
-{% else %}
-        const float *__restrict ab = hab + {{ C_LEN // 2 }} * s;
-        aie::vector<float, 16> al_ = aie::zeros<float, 16>(), be = aie::zeros<float, 16>();
-{% for h in range(HC) %}
-        al_[{{ h }}] = ab[{{ h }}];
-        be[{{ h }}] = ab[{{ HC + h }}];
-{% endfor %}
-{% endif %}
-        const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::add(al_, aie::load_v<16>(prm)));
-        aie::store_v(gt, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
-        // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
-        const aie::vector<float, 16> sn = {{ gm.softplus }}(aie::sub(aie::zeros<float, 16>(), be));
-        aie::store_v(gt + 16, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
-        gt += 32;
+        // softplus(alpha + dt), then softplus(-beta) in the lanes after: sigmoid(beta) = e^(-softplus(-beta)) (one call)
+        const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::select(aie::sub(aie::zeros<float, 16>(), ab), aie::add(ab, aie::load_v<16>(prm)),
+                                                                     aie::mask<16>::from_uint32({{ 2 ** HC - 1 }}u)));
+        aie::store_v(dn, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))).template extract<8>(0));
+        aie::store_v(dn + 8, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), aie::shuffle_down(sp, {{ HC }})))).template extract<8>(0));
+        dn += 16;
     }
 }
 
-// The header's payload: dt, A, ssm_norm, the previous step's d per token (the replay's), the slots' ab -> the gates
-__attribute__((noinline)) void {{ p }}_ghead(const bfloat16 *__restrict x, int32_t *__restrict ws)
+// The step's rows of a block (a branch's after the chain's), [half 2][slot 8][64] at r -> h ([row][D] bf16)
+__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, bfloat16 *__restrict h, const bfloat16 *__restrict r)
 {
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    const float *__restrict pay = (const float *)(x + {{ 2 * META }});
-    al::copy<160, 16>(GW(float, {{ g.prm }}), pay + {{ H_PRM // 4 }});
-    al::copy<{{ 8 * SMAX }}, 16>(GW(float, {{ g.dold }}), pay + {{ H_DOLD // 4 }});
-    {{ p }}_ggates(pay + {{ H_AB // 4 }}, ws);
-    st[{{ G_TA }}] = 0x{{ "%x" % TAB[0] }};
-    st[{{ G_TA + 1 }}] = 0x{{ "%x" % TAB[1] }};
-    st[{{ G_CB }}] = 0;
-    st[{{ G_PANEL }}] = 0;
-    st[{{ G_KH }}] = 0;
-    st[{{ G_VI }}] = 0;
-    st[{{ G_VH }}] = 0;
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < st[{{ G_NS }}] + (st[{{ G_BR }}] >> 8); s++) {
+        aie::store_v(h + {{ D }} * s, aie::load_v<64>(r + 64 * s));
+        aie::store_v(h + {{ D }} * s + 64, aie::load_v<64>(r + {{ 64 * SMAX }} + 64 * s));
+    }
+}
+
+// The conv of rows r on weights w: outputs t < n at lanes (l0 + t) & 7, SiLU: y ([panel 16][lane 8][8] fp32; the other lanes:
+// the values of zb's, the conv outputs before; scratch: zb, cc)
+__attribute__((noinline)) void {{ p }}_cblock(int32_t *__restrict ws, const bfloat16 *__restrict r, const bfloat16 *__restrict w,
+                                            int n, int l0, float *__restrict y)
+{
+    bfloat16 *__restrict yc = GW(bfloat16, {{ g.zb }}), *__restrict tt = GW(bfloat16, {{ g.cc }});
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    {{ p }}_pconv(r, w, yc, n, l0);
+    {{ p }}_silu(yc, tt, y, st);
+    {{ p }}_silu(yc + {{ 4 * D }}, tt, y + {{ 4 * D }}, st);
+}
+
+// A branching step's branch at its lanes (its conv windows: the 3 rows before it, then its own): the rows r3 (its first one's
+// 3 rows before) and rb (its own) into the scratch, ``cblock`` -> y (zb's other lanes as they are)
+__attribute__((noinline, minsize)) void {{ p }}_bconv(int32_t *__restrict ws, const bfloat16 *__restrict r3, const bfloat16 *__restrict rb,
+                                                    const bfloat16 *__restrict w, float *__restrict y)
+{
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int L = st[{{ G_BR }}] >> 8;
+    bfloat16 *__restrict r = (bfloat16 *)GW(uint8_t, {{ HS_OFF + HB_R }});
+    {{ p }}_cp4k(r, r3, {{ 3 * 2 * D // 64 }});
+    {{ p }}_cp4k(r + {{ 3 * D }}, rb, L * {{ 2 * D // 64 }});
+    {{ p }}_cblock(ws, r, w, L, st[{{ G_BN }}] - L, y);
 }
 
 }  // namespace
 
 extern "C" {
 
-// A new X object: the gdn_in phase's metadata object (F_GIN: the step's S, replay, shift and commit words; its input
-// objects follow: skipped), another main core phase's (skipped too), the header (F_GDN: ``ghead``, the step's objects
-// follow), or another core's first object (M_SKIP more follow)
+// A new X object: the gdn_in phase's metadata object (F_GIN: the step's words; its input objects follow: skipped), another
+// main core phase's (skipped too), the header (F_GDN: the ssm parameters, the block's lanes' gates before the step (from row
+// M_KSHIFT), the step's; the step's objects follow), or another core's first object (M_SKIP more follow)
 __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     const int32_t *__restrict m = (const int32_t *)x;
@@ -1447,15 +955,36 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
     const int flags = m[{{ M_FLAGS }}];
     st[{{ G_NSKIP }}] = 0;
     st[{{ G_ON }}] = 0;
-    if (flags & {{ F_GIN }}) {
-        st[{{ G_NS }}] = m[{{ M_NS }}];
+    if (flags & {{ F_GIN }}) {  // (a branching step: S counts the chain's slots; the branch chunk the lanes 0 .. t0 + c + L)
+        const int br = m[{{ M_BRANCH }}];
+        st[{{ G_NS }}] = m[{{ M_NS }}] - (br >> 8);
         st[{{ G_NREP }}] = m[{{ M_NREP }}];
         st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
-        st[{{ G_COMMIT }}] = m[{{ M_COMMIT }}];
-        st[{{ G_BR }}] = m[{{ M_BRANCH }}];
+        st[{{ G_KSHIFT }}] = m[{{ M_KSHIFT }}];
+        st[{{ G_BR }}] = br;
+        st[{{ G_BN }}] = br ? m[{{ M_NREP }}] + (br & 255) + (br >> 8) : 0;
+        const int ends = m[{{ M_NREP }}] + st[{{ G_NS }}] >= 8;
+        st[{{ G_NPD }}] = ends ? 16 : 0;
+        st[{{ G_NPX }}] = ends ? 0 : 16;
     }
     if (flags & {{ F_GDN }}) {
-        {{ p }}_ghead(x, ws);
+        const float *__restrict pay = (const float *)(x + {{ 2 * META }});
+        {{ p }}_cp4k(GW(float, {{ g.prm }}), pay + {{ H_PRM // 4 }}, 10);
+        {{ p }}_cp4k(GW(float, {{ g.dn }}), pay + {{ H_DN // 4 }} + 16 * st[{{ G_KSHIFT }}], st[{{ G_NREP }}]);
+        st[{{ G_TA }}] = 0x{{ "%x" % TAB[0] }};
+        st[{{ G_TA + 1 }}] = 0x{{ "%x" % TAB[1] }};
+        {{ p }}_ggates(pay + {{ H_AB // 4 }}, ws);
+        if (const int nb = st[{{ G_BN }}]) {  // (the branch chunk's gates at dn's lanes 16 ..: the chain's to its parent, its own)
+            const int L = st[{{ G_BR }}] >> 8;
+            float *__restrict dn = GW(float, {{ g.dn }});
+            {{ p }}_cp4k(dn + 256, dn, nb - L);
+            {{ p }}_cp4k(dn + 256 + 16 * (nb - L), dn + 16 * (st[{{ G_NREP }}] + st[{{ G_NS }}]), L);
+        }
+        st[{{ G_CB }}] = 0;
+        st[{{ G_PANEL }}] = 0;
+        st[{{ G_KH }}] = 0;
+        st[{{ G_VI }}] = 0;
+        st[{{ G_VH }}] = 0;
         st[{{ G_ON }}] = 1;
     } else if (!(flags & {{ F_MAIN }})) {
         st[{{ G_NSKIP }}] = m[{{ M_SKIP }}];
@@ -1465,99 +994,102 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
     }
 }
 
-// A conv block's first object ([weights: tap 4 x (hi 128 | lo 128) bf16 | its history's rows 0 .. 7]): the weights ->
-// cw, the step's base rows (the history's rows cshift .. cshift + 2) among them -> rows 0 .. 2 of the block's new
-// history hb
+// A conv block's first object ([weights: tap 4 x (hi 128 | lo 128) bf16 | its history's rows 0 .. 7]): the weights -> cw;
+// a q block's base rows among the rows (its history's rows cshift .. cshift + 2) -> hb's rows 0 .. 2; a k or v block's rows
+// -> vh (from M_KSHIFT 8 on: none of them)
 __attribute__((minsize)) void {{ p }}_gw(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     const int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
     const bfloat16 *__restrict w = x + {{ 2 * META }};
-    al::copy<{{ 8 * D }}, 64>(GW(bfloat16, {{ g.cw }}), w);
-    const int c0 = st[{{ G_CSHIFT }}];
-    for (int i = 0; i < 3; i++)
-        if (c0 + i < 8)
-            al::copy<{{ D }}, 64>(h + {{ D }} * i, w + {{ 8 * D }} + {{ D }} * (c0 + i));
+    {{ p }}_cp4k(GW(bfloat16, {{ g.cw }}), w, {{ 16 * D // 64 }});
+    if (st[{{ G_CB }}] == 0) {
+        const int c0 = st[{{ G_CSHIFT }}];
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < 3; i++)
+            if (c0 + i < 8)
+                {{ p }}_cp4k(GW(bfloat16, {{ g.hb }}) + {{ D }} * i, w + {{ 8 * D }} + {{ D }} * (c0 + i), {{ 2 * D // 64 }});
+    } else if (!st[{{ G_KSHIFT }}]) {
+        {{ p }}_cp4k(GW(bfloat16, {{ g.vh }}), w + {{ 8 * D }}, {{ 16 * D // 64 }});
+    }
 }
 
-// A conv block's second object ([its history's rows 8 .. 10 | the step's S rows as [half 2][slot 8][64]]): the rest of
-// the base rows and the step's rows into hb ([base 3 | S rows]: the next step's history; its rows past 3 + S stale), the
-// conv of hb's rows (their first S rows the step's), SiLU: q (block 0 of a k head), k (1) l2-normed as panels (kq), then
-// the Gram blocks; a v head's as V^T ([panel 16][j 8][t 8] fp32)
+// A conv block's second object: a q block's ([its history's rows 8 .. 10 | the step's rows as [half 2][slot 8][64]]): the
+// rest of the base rows and the step's rows into hb ([base 3 | S rows]: the next step's history), its conv at the step's
+// lanes, Q's panels; a k or v block's ([its history's rows 8 .. 23]): the rows into vh (from row M_KSHIFT on)
 void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
-    aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
+    const bfloat16 *__restrict r8 = x + {{ 2 * META }};
     const int b = st[{{ G_CB }}];
     st[{{ G_CB }}] = b + 1;
-    const int S = st[{{ G_NS }}], c0 = st[{{ G_CSHIFT }}];
-    const bfloat16 *__restrict r8 = x + {{ 2 * META }};
-    for (int i = 0; i < 3; i++)
-        if (c0 + i >= 8)
-            al::copy<{{ D }}, 64>(h + {{ D }} * i, r8 + {{ D }} * (c0 + i - 8));
-    AIE_LOOP_NO_UNROLL
-    for (int s = 0; s < S; s++) {
-        aie::store_v(h + {{ D }} * (3 + s), aie::load_v<64>(r8 + {{ 3 * D }} + 64 * s));
-        aie::store_v(h + {{ D }} * (3 + s) + 64, aie::load_v<64>(r8 + {{ 3 * D + 64 * SMAX }} + 64 * s));
-    }
-    // (scratch until the head's z object and panels: zb, y, o, vt)
-    bfloat16 *__restrict yc = GW(bfloat16, {{ g.zb }}), *__restrict t = GW(bfloat16, {{ g.y }});
-    float *__restrict ys = GW(float, {{ g.o }}), *__restrict vt = GW(float, {{ g.vt }});
-    {{ p }}_conv8(h, GW(bfloat16, {{ g.cw }}), yc);
-    if (const int br = st[{{ G_BR }}]) {  // (a branching step's branch slots j: its parent's rows from j on, then the branch's)
-        const int c1 = (br >> 8) & 15, L = br >> 12;
-        for (int j = 0; j < L; j++)
-            {{ p }}_conv1(h + {{ D }} * (c1 + j), 3 - j, h + {{ D }} * (11 - L), GW(bfloat16, {{ g.cw }}), yc + {{ D }} * (8 - L + j));
-    }
-    if (b >= 2) {
-        {{ p }}_tr8(yc, (bfloat16 *)ys, 8, {{ D }});
-        {{ p }}_tr8(yc + 64, (bfloat16 *)ys + 512, 8, {{ D }});
-        {{ p }}_silu((bfloat16 *)ys, t, vt, st);
+    if (b) {
+        {{ p }}_cp4k(GW(bfloat16, {{ g.vh }}) + {{ D }} * (8 - st[{{ G_KSHIFT }}]), r8, {{ 32 * D // 64 }});
         return;
     }
-    {{ p }}_silu(yc, t, ys, st);
-    uint8_t *__restrict kq = GW(uint8_t, {{ g.kq }});
-    {{ p }}_l2panels(ys, GW(float, {{ g.sq }}), (1u << S) - 1u, !b, kq + (b ? 0 : {{ 2 * PAN }}));
-    if (b) {  // (the helper: the Gram blocks)
-        st[{{ G_HK }}] = 1;
-        release(ws, {{ 48 + L_HRDY }}, 1);
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
+    const unsigned S = st[{{ G_NS }}], t0 = st[{{ G_NREP }}], c0 = st[{{ G_CSHIFT }}], m = ((1u << S) - 1u) << t0;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 3; i++)
+        if (c0 + i >= 8)
+            {{ p }}_cp4k(h + {{ D }} * i, r8 + {{ D }} * (c0 + i - 8), {{ 2 * D // 64 }});
+    {{ p }}_rows(ws, h + {{ 3 * D }}, r8 + {{ 3 * D }});
+    float *__restrict y = GW(float, {{ g.vt }});
+    {{ p }}_cblock(ws, h, GW(bfloat16, {{ g.cw }}), S, t0, y);
+    {{ p }}_l2panels(y, GW(float, {{ g.xy }}), (m | m >> 8) & 0xFFu, 1, GW(uint8_t, {{ g.qp }}));
+    if (const int nb = st[{{ G_BN }}]) {  // (the branch's Q at its lanes: its parent's rows before it, slots c - 2 .. c)
+        const int br = st[{{ G_BR }}], L = br >> 8;
+        {{ p }}_bconv(ws, h + {{ D }} * (br & 255), h + {{ D }} * (3 + S), GW(bfloat16, {{ g.cw }}), y);
+        {{ p }}_l2panels(y, GW(float, {{ g.xy }}), (1u << nb) - (1u << (nb - L)), 1, (uint8_t *)GW(uint8_t, {{ HS_OFF + HB_Q }}));
     }
 }
 
-// A conv block's new history (hb: [base 3 | S rows], 11 rows) -> d
-void {{ p }}_ghist(int32_t *__restrict ws, bfloat16 *__restrict d)
+// A k head's K object (the step's k rows as [half 2][slot 8][64]): its block over the block's lanes from vh ([the 3 rows
+// before the block | its lanes' rows], the step's at lane t0), K's panels; a branching step's branch K's (the block's lanes to
+// its parent, the conv outputs in zb, then its own: the same panels of those lanes); past the block's end in the step, the
+// next block's lanes' K panels; then the helper's Gram blocks (``hgdn``)
+void {{ p }}_gk(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
-    {{ p }}_cpl(d, GW(bfloat16, {{ g.hb }}), {{ 11 * D * 2 // 64 }});
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}], e = t0 + st[{{ G_NS }}], n = e < 8 ? e : 8, nb = st[{{ G_BN }}];
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.vh }});
+    float *__restrict y = GW(float, {{ g.vt }}), *__restrict sq = GW(float, {{ g.xy }});
+    {{ p }}_rows(ws, h + {{ D }} * (3 + t0), x + {{ 2 * META }});
+    {{ p }}_cblock(ws, h, GW(bfloat16, {{ g.cw }}), n, 0, y);
+    {{ p }}_l2panels(y, sq, (1u << n) - 1u, 0, GW(uint8_t, {{ g.kq }}));
+    if (nb) {
+        {{ p }}_bconv(ws, h + {{ D }} * (nb - (st[{{ G_BR }}] >> 8)), h + {{ D }} * (3 + e), GW(bfloat16, {{ g.cw }}), y);
+        {{ p }}_l2panels(y, sq, (1u << nb) - 1u, 0, (uint8_t *)GW(uint8_t, {{ HS_OFF + HB_K }}));
+    }
+    if (e > 8) {  // (the next block's lanes)
+        {{ p }}_cblock(ws, h + {{ 8 * D }}, GW(bfloat16, {{ g.cw }}), e - 8, 0, y);
+        {{ p }}_l2panels(y, sq, (1u << (e - 8)) - 1u, 0, GW(uint8_t, {{ g.k2 }}));
+    }
+    st[{{ G_HK }}] = 1;
+    release(ws, {{ 48 + L_HRDY }}, 1);
 }
 
-// The K^T panels of the previous step's tokens of the k head -> the workspace
-void {{ p }}_gkold(const bfloat16 *__restrict x, int32_t *__restrict ws)
+// A v head's R object ([the step's v rows | its z rows], each [half 2][slot 8][64]): its block over the block's lanes as V
+// ([panel 16][lane 8][8] in vt; past the block's end in the step, the next block's lanes' V in o: lanes the block's outputs
+// do not take), z kept; then (the k head's Gram blocks through) the helper's chunk constants
+void {{ p }}_gvr(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
-    {{ p }}_cpl(GW(int32_t, {{ g.kold }}), x + {{ 2 * META }}, {{ 16 * 2 * PAN // 64 }});
-}
-
-// The step's K^T panels of the k head
-void {{ p }}_gknew(int32_t *__restrict ws, bfloat16 *__restrict d)
-{
-    {{ p }}_cpl(d, GW(int32_t, {{ g.kt }}), {{ 16 * 2 * PAN // 64 }});
-}
-
-// A v head's U of the previous step ([panel 16][j 8][t 8] fp32) -> the workspace
-void {{ p }}_gdl(const bfloat16 *__restrict x, int32_t *__restrict ws)
-{
-    {{ p }}_cp4k(GW(int32_t, {{ g.dl }}), (const int32_t *)(x + {{ 2 * META }}));
-}
-
-// A v head's z object ([half 2][slot 8][64] bf16) -> the workspace ([panel 16][j 8][t 8]); the head's constants
-void {{ p }}_gz(const bfloat16 *__restrict x, int32_t *__restrict ws)
-{
-    const bfloat16 *__restrict z = x + {{ 2 * META }};
-    bfloat16 *__restrict zb = GW(bfloat16, {{ g.zb }});
-    {{ p }}_tr8(z, zb, 8, 64);
-    {{ p }}_tr8(z + {{ 64 * SMAX }}, zb + {{ 64 * 8 }}, 8, 64);
-    GW(int32_t, {{ g.st }})[{{ G_HK }}] = 0;
-    release(ws, {{ 48 + L_HRDY }}, 1);  // (the helper: the head's constants)
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}], e = t0 + st[{{ G_NS }}];
+    const bfloat16 *__restrict r = x + {{ 2 * META }};
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.vh }});
+    {{ p }}_rows(ws, h + {{ D }} * (3 + t0), r);
+    {{ p }}_cp4k(GW(bfloat16, {{ g.zr }}), r + {{ 8 * D }}, {{ 16 * D // 64 }});
+    {{ p }}_cblock(ws, h, GW(bfloat16, {{ g.cw }}), e < 8 ? e : 8, 0, GW(float, {{ g.vt }}));
+    if (const int nb = st[{{ G_BN }}])  // (the branch's V: zb's chain lanes, its own at its lanes: SiLU into vb)
+        {{ p }}_bconv(ws, h + {{ D }} * (nb - (st[{{ G_BR }}] >> 8)), h + {{ D }} * (3 + e), GW(bfloat16, {{ g.cw }}),
+                      (float *)GW(uint8_t, {{ HS_OFF + HB_V }}));
+    if (e > 8)  // (the next block's lanes)
+        {{ p }}_cblock(ws, h + {{ 8 * D }}, GW(bfloat16, {{ g.cw }}), e - 8, 0, GW(float, {{ g.o }}));
+    if (st[{{ G_HK }}]) {  // (the k head's first v head: its Gram blocks first)
+        acquire_greater_equal(ws, {{ 48 + L_HDONE }}, 1);
+        st[{{ G_HK }}] = 0;
+    }
+    release(ws, {{ 48 + L_HRDY }}, 1);
 }
 
 // The helper's work is through
@@ -1566,16 +1098,31 @@ void {{ p }}_gwait(int32_t *__restrict ws)
     acquire_greater_equal(ws, {{ 48 + L_HDONE }}, 1);
 }
 
-// (the helper) On the GDN core's workspace gws, its turn taken from the GDN tile's locks (the helper's 0 .. 15): a k
-// head's Gram blocks or a v head's constants; hs: unused
+// (the helper) On the GDN core's workspace gws, its turn taken from the GDN tile's locks (the helper's 0 .. 15): a k head's
+// Gram blocks and K^T's panels (past the block's end in the step, the next block's Gram blocks too), a v head's chunk constants
+// (``vhead``), or the step's end (its last request: until then the helper's scratch holds a branch's regions); hs: unused
 void {{ p }}_hgdn(int32_t *__restrict gws, uint8_t *__restrict hs)
 {
     acquire_greater_equal(gws, {{ L_HRDY }}, 1);
     int32_t *__restrict ws = gws;
-    if (GW(int32_t, {{ g.st }})[{{ G_HK }}])
-        {{ p }}_gram(GW(uint8_t, {{ g.kq }}), GW(float, {{ g.gg }}), GW(uint8_t, {{ g.kt }}));
-    else
-        {{ p }}_vhead(gws);
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int nc = 1 + (st[{{ G_NREP }}] + st[{{ G_NS }}] > 8);
+    if (st[{{ G_HK }}] == 2)  // (the step's end: its scratch, which held a branch, is the helper's again)
+        return;
+    if (st[{{ G_HK }}]) {
+        {{ p }}_gram(GW(uint8_t, {{ g.kq }}), GW(uint8_t, {{ g.qp }}), GW(float, {{ g.gg }}), GW(uint8_t, {{ g.kt }}));
+        if (nc > 1)
+            {{ p }}_gram(GW(uint8_t, {{ g.k2 }}), GW(uint8_t, {{ g.qp }}), GW(float, {{ g.gg }}) + 128, nullptr);
+        if (st[{{ G_BN }}])  // (the branch chunk's)
+            {{ p }}_gram((const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_K }}), (const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_Q }}),
+                         GW(float, {{ g.gg }}) + 256, nullptr);
+    } else {
+        AIE_LOOP_NO_UNROLL
+        for (int c = 0; c < nc; c++)
+            {{ p }}_vhead(gws, c);
+        if (st[{{ G_BN }}])
+            {{ p }}_vhead(gws, 2);
+    }
     release(gws, {{ L_HDONE }}, 1);
 }
 
@@ -1753,7 +1300,7 @@ void {{ p }}_gvh(const bfloat16 *__restrict x, int32_t *__restrict ws)
 """
 _GPANEL4 = r"""// State panel x of the v head (its next one, in place): the block's lanes' X, Y (``xy``), U, O (``solve``; the step's lanes'
 // O kept); out (the other half's panel): when the block ends in the step its update over the 8 lanes (S + dc S + U'^T K^T),
-// then past the block's end the next block's lanes from it; else nothing (the half is read only after a block's end)
+// then past the block's end the next block's lanes from it (8 slots: else no D object, ``gpanel0``; 4: nothing)
 __attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
 {
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
@@ -1766,8 +1313,12 @@ __attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__
     const uint8_t *__restrict qp = GW(uint8_t, {{ g.qp }});
     {{ p }}_xy(sp, GW(uint8_t, {{ g.kq }}), qp, xy);
     {{ p }}_solve(xy, GW(float, {{ g.vt }}) + 64 * pj, GW(float, {{ g.cc }}), u, o, ~0ull << (8 * t0), e < 8 ? e : 8);  // (lanes past the step's go nowhere)
+{% if SMAX == 8 %}
+    if (e >= 8) {  // (out: the other half's, which only a block's end writes before it is read)
+{% else %}
     if (e < 8)  // (out: the other half's, which only a block's end writes before it is read)
         return;
+{% endif %}
     uint8_t *__restrict up = GW(uint8_t, {{ g.xy }});
     {{ p }}_uprep(u, GW(float, {{ g.uf }}), up);
     {{ p }}_dupdate(sp, out, GW(bfloat16, {{ g.dc }}), GW(uint8_t, {{ g.kt }}), up, st[{{ G_ON }}]);
@@ -1775,79 +1326,79 @@ __attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__
         {{ p }}_xy(out, GW(uint8_t, {{ g.k2 }}), qp, xy);
         {{ p }}_solve(xy, o, GW(float, {{ g.cc }}) + 144, u, o, (1ull << (8 * (e - 8))) - 1ull, e - 8);
     }
+{% if SMAX == 8 %}
+    }
+    if (const int nb = st[{{ G_BN }}]) {  // (a branching step's branch: its chunk of lanes 0 .. nb - 1 from the block's base, V and O
+        // in vb; its lanes' O into o's lanes past the chain's, where its slots' outputs read them)
+        float *vb = (float *)GW(uint8_t, {{ HS_OFF + HB_V }}) + 64 * pj;
+        {{ p }}_xy(sp, (const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_K }}), (const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_Q }}), xy);
+        {{ p }}_solve(xy, vb, GW(float, {{ g.cc }}) + 288, u, vb, ~0ull, nb);
+        const int L = st[{{ G_BR }}] >> 8;
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < L; i++)
+            aie::store_v(o + 8 * ((e + i) & 7), aie::load_v<8>(vb + 8 * (nb - L + i)));
+    }
+{% endif %}
 }
+{% if SMAX == 8 %}
+
+// A state panel of a step that does not end its block: no D object (nothing of the other half is read before a block's end)
+void {{ p }}_gpanel0(bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    {{ p }}_gpanel(x, ws, nullptr);
+}
+{% endif %}
 
 """
-_GPANEL = r"""// State panel x of the v head (its next one, in place): the replay, the base out (or the state after the step's tokens:
-// commit), the step's tokens
-__attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
+_OUT8 = r"""// The q block's new history ([base 3 | the step's S rows]; a D object's 4 KB from hb on)
+void {{ p }}_ghq(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
-    int32_t *__restrict st = GW(int32_t, {{ g.st }});
-    const int pj = st[{{ G_PANEL }}];
-    st[{{ G_PANEL }}] = pj + 1;
-    float *sp = (float *)(x + {{ 2 * META }});
-    const int R = st[{{ G_NREP }}], commit = st[{{ G_COMMIT }}];
-    float *__restrict dl = GW(float, {{ g.dl }}) + 64 * pj;
-    float *__restrict uf = GW(float, {{ g.uf }});
-    float *s0 = commit ? sp : out;  // (the state before the step's tokens)
-    uint8_t *__restrict up = GW(uint8_t, {{ g.up }});
-    if (R) {
-{% if SMAX == 8 %}
-        {{ p }}_decay(sp, s0, GW(bfloat16, {{ g.dc }}));
-        {{ p }}_uprep(dl, uf, up);
-        {{ p }}_update(s0, s0, GW(uint8_t, {{ g.kold }}), up, R > 0);
-{% else %}
-        {{ p }}_uprep(dl, uf, up);
-        {{ p }}_dupdate(sp, s0, GW(bfloat16, {{ g.dc }}), GW(uint8_t, {{ g.kold }}), up, R > 0);
-{% endif %}
-    } else if (!commit) {
-        {{ p }}_cp4k((int32_t *)out, (const int32_t *)sp);
-    }
-    float *__restrict xy = GW(float, {{ g.xy }});
-    {{ p }}_xy(s0, GW(uint8_t, {{ g.kq }}), xy);
-    {{ p }}_solve(xy, GW(float, {{ g.vt }}) + 64 * pj, GW(float, {{ g.fv }}), GW(uint8_t, {{ g.pn }}), dl, GW(float, {{ g.o }}) + 64 * pj);
-    if (commit) {
-{% if SMAX == 8 %}
-        {{ p }}_decay(sp, out, GW(bfloat16, {{ g.dc }}) + 128);
-        {{ p }}_uprep(dl, uf + 8, up);
-        {{ p }}_update(out, out, GW(uint8_t, {{ g.kt }}), up, commit > 0);
-{% else %}
-        {{ p }}_uprep(dl, uf + 8, up);
-        {{ p }}_dupdate(sp, out, GW(bfloat16, {{ g.dc }}) + 32, GW(uint8_t, {{ g.kt }}), up, commit > 0);
-{% endif %}
-    }
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.hb }}));
 }
 
-"""
-
-_OUT8 = r"""// The v head's U of the step's tokens (the next step's replay)
-void {{ p }}_gdlout(int32_t *__restrict ws, bfloat16 *__restrict d)
+// A k or v block's history in the block ([the 3 rows before it | its lanes' rows]), rows 0 .. 15
+void {{ p }}_ghv(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
-    {{ p }}_cp4k((int32_t *)d, GW(int32_t, {{ g.dl }}));
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.vh }}));
 }
 
-// The v head's gated outputs rms(o) ssm_norm silu(z) -> d ([k block 16][slot 8][8] bf16), then the step's d per token
-// ([token 8][8] fp32: the next step's replay, from the last head's into the header); the next v head (of the next k
-// head after the last of this one's). (o, z: [panel 16][j 8][t 8]; the rows past S go nowhere)
+// ... its rows 16 .. 23 (then 2 KB into the next object's first half: the step's rows, taken)
+void {{ p }}_ghv2(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.vh }}) + {{ 16 * D }});
+}
+
+// The v head's gated outputs rms(o) ssm_norm silu(z) of the step's lanes (t0 + r) & 7 (a branching step's branch slots: o's
+// lanes past the chain's, ``gpanel``) -> d ([k block 16][slot 8][8] bf16), then the block's lanes' gates ([lane 16][d 8 | beta 8]
+// fp32: the next step's, from the last head's into the header); the next v head (of the next k head after the last of this
+// one's). (o: [panel 16][lane 8][8]; z: [half 2][slot 8][64], its SiLU in vt, the panels being through; the slots past the
+// step's go nowhere; its kb loop no hardware loop)
 void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}];
     const float *__restrict nw = GW(float, {{ g.prm }}) + 32;
-    float *__restrict sz = GW(float, {{ g.vt }});  // (silu(z): the panels are through)
-    {{ p }}_silu(GW(bfloat16, {{ g.zb }}), GW(bfloat16, {{ g.y }}), sz, st);
+    float *__restrict sz = GW(float, {{ g.vt }});
+    {{ p }}_silu(GW(bfloat16, {{ g.zr }}), GW(bfloat16, {{ g.cc }}), sz, st);
+    {{ p }}_silu(GW(bfloat16, {{ g.zr }}) + {{ 4 * D }}, GW(bfloat16, {{ g.cc }}), sz + {{ 4 * D }}, st);
     const float *__restrict o = GW(float, {{ g.o }});
-    {{ p }}_gnorm(o, GW(float, {{ g.sq }}));
-    const aie::vector<float, 64> iv = aie::load_v<8>(GW(float, {{ g.sq }}) + 64).template grow_replicate<64>();
+    {{ p }}_gnorm(o, GW(float, {{ g.xy }}));
+    const aie::vector<float, 64> iv = al::bcast8(aie::shuffle_down_rotate(aie::load_v<8>(GW(float, {{ g.xy }}) + 64), t0));
     AIE_LOOP_NO_UNROLL
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
     for (int kb = 0; kb < 16; kb++) {
-        const aie::vector<float, 64> w = al::bcast8(aie::load_v<8>(nw + 8 * kb));
-        const aie::vector<float, 64> t = al::mulff<64>(al::mulff<64>(al::mulff<64>(aie::load_v<64>(o + 64 * kb), iv), w), aie::load_v<64>(sz + 64 * kb));
-        aie::store_v(d + 64 * kb, aie::transpose(aie::accum<accfloat, 64>(t).template to_vector<bfloat16>(), 8, 8));
+        const float *__restrict ok = o + 64 * kb;
+        aie::vector<float, 64> ov;
+        AIE_LOOP_UNROLL_FULL
+        for (int r = 0; r < 8; r++)
+            ov.insert(r, aie::load_v<8>(ok + 8 * ((t0 + r) & 7)));
+        const aie::vector<float, 64> w = aie::load_v<8>(nw + 8 * kb).template grow_replicate<64>();
+        const aie::vector<float, 64> zk = al::gather<8, 8>(sz + {{ 4 * D }} * (kb >> 3) + 8 * (kb & 7), 64);
+        const aie::vector<float, 64> t = al::mulff<64>(al::mulff<64>(al::mulff<64>(ov, iv), w), zk);
+        aie::store_v(d + 64 * kb, aie::accum<accfloat, 64>(t).template to_vector<bfloat16>());
     }
-    float *__restrict dd = (float *)(d + {{ 16 * 64 }});
-    for (int r = 0; r < {{ SMAX }}; r++)
-        aie::store_v(dd + 8 * r, aie::load_v<8>(GW(float, {{ g.gt }}) + 32 * r));
+    {{ p }}_cp4k(d + {{ 8 * D }}, GW(float, {{ g.dn }}), 16);
     st[{{ G_PANEL }}] = 0;
     const int vi = st[{{ G_VI }}] + 1, last = vi == {{ HC // 2 }};
     const int kh = st[{{ G_KH }}] + last;
@@ -1856,6 +1407,10 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
     st[{{ G_VH }}] = 2 * (last ? 0 : vi) + kh;
     if (last)
         st[{{ G_CB }}] = 0;
+    if (kh == 2) {  // (the step's last v head: the helper's last request, ``hgdn``)
+        st[{{ G_HK }}] = 2;
+        release(ws, {{ 48 + L_HRDY }}, 1);
+    }
 }
 
 }  // extern "C"
@@ -1922,14 +1477,14 @@ void {{ p }}_gvhout(int32_t *__restrict ws, bfloat16 *__restrict d)
 }  // extern "C"
 """
 
-_SRC8 = JINJA_ENV.from_string(_CA + _L2ROWS + _CN + _GRAM + _CB + _ENTRY8 + _GPANEL + _OUT8)
+_SRC8 = JINJA_ENV.from_string(_CA + _L2P4 + _CN4 + _GRAM4 + _CB4 + _ENTRY8 + _GPANEL4 + _OUT8)
 _SRC4 = JINJA_ENV.from_string(_CA + _L2P4 + _CN4 + _GRAM4 + _CB4 + _ENTRY4 + _GPANEL4 + _OUT4)
 
 
 class GdnShape:
     """The GDN core's sizes for a model: HC v heads and CH conv channels per column, the message, the workspace; the
-    core of steps of up to ``slots`` (4: the message on M; 8: module docstring "8 slots"), of 4 slots ``chunk``wise (module
-    docstring "4 slots, chunkwise")."""
+    core of steps of up to ``slots`` (4: the message on M; 8: chunkwise, module docstring "8 slots"), of 4 slots ``chunk``wise
+    (module docstring "Chunkwise")."""
 
     def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SMAX,
                  chunk: bool = False):
@@ -1959,7 +1514,7 @@ class GdnShape:
     @property
     def n_objects(self) -> int:
         """X objects of a step (after the gdn_in phase's): conv q / k 4, K, per pair 2 conv + delta + 32 panels; 8 slots:
-        the header, per k head 5, per v head [A, B, DL, Z] + 16 panels."""
+        the header, per k head 5, per v head [A, B, R] + 16 panels."""
         if self.slots == 8:
             return 1 + 2 * KH_SPAN + self.hc * (V_SPAN + 16)
         return V_SLOT4 + self.hc * (V_SPAN4 + 16) if self.chunk else 5 + self.hc // 2 * 35
@@ -1970,16 +1525,16 @@ class GdnShape:
         return self.v_slot(self.hc)
 
     def kh_slot(self, kh: int) -> int:
-        """The first payload slot of k head kh's group (8 slots: [q A, q B, K, k A, k B]; 4: [P, W, K])."""
+        """The first payload slot of k head kh's group (8 slots: [q A, q B, k A, k B, K]; 4: [P, W, K])."""
         return KH_SLOT + KH_SPAN * kh if self.slots == 8 else KH_SPAN4 * kh
 
     def v_slot(self, h: int) -> int:
-        """The first payload slot of v head h's group (8 slots: [A, B, DL, Z]; 4: [A, U])."""
+        """The first payload slot of v head h's group (8 slots: [A, B, R]; 4: [A, H])."""
         return V_SLOT + V_SPAN * h if self.slots == 8 else V_SLOT4 + V_SPAN4 * h
 
     def block_slot(self, b: int) -> int:
         """(8 slots) The A object's payload slot of conv block b (q heads 0, 1, k heads 0, 1, then the v heads)."""
-        return self.kh_slot(b % 2) + 3 * (b // 2) if b < 4 else self.v_slot(b - 4)
+        return self.kh_slot(b % 2) + 2 * (b // 2) if b < 4 else self.v_slot(b - 4)
 
     def weights_at(self, b: int) -> int:
         """Bytes from a column's first payload to conv block b's weights."""
@@ -2010,13 +1565,19 @@ class GdnShape:
             assert out["prm"] == out["hb"] + P_PRM
             return out
         if self.slots == 8:
-            S = self.slots
-            sizes = [("st", 4 * (G_WORDS + 2)), ("prm", 4 * 160), ("gt", 4 * S * 32), ("kq", 16 * 4 * PAN), ("kt", 16 * 2 * PAN),
-                     ("kold", 16 * 2 * PAN), ("gg", 4 * 128), ("vt", 4 * S * D), ("o", 4 * S * D), ("dl", 4 * S * D),
-                     ("dold", 4 * S * 8), ("er", 4 * 128 + 64), ("tv", 4 * 32), ("lb", 2 * 128), ("rb", 2 * 256),
-                     ("pn", 4 * PAN), ("fv", 4 * 128), ("uf", 4 * 16), ("dc", 2 * 256), ("xy", 4 * 128), ("up", 2 * PAN),
-                     ("sq", 4 * 80), ("cw", 2 * 8 * D), ("zb", 2 * S * D), ("y", 2 * S * D), ("hb", 2 * 11 * D)]
-            return regions(sizes)
+            # (the 4-slot chunkwise core's regions but the message; dn: the block's gates of 16 lanes, then a branch chunk's 8;
+            # gg, cc: a branch chunk's third; a branch's own regions in the helper's scratch, HS8_AT; vh: a k or v block's
+            # history [the 3 rows before the block | its lanes' rows] (24 rows), whose last D object runs 2 KB past it (zr: the v
+            # head's z rows, [half 2][slot 8][64] bf16); hb: the q history [base 3 | the step's 8 rows] in vh's first rows (out
+            # before the k block's history comes in), a D object's 4 KB from it on)
+            sizes = [("st", 4 * (G_BN + 1)), ("prm", 4 * 160), ("dn", 4 * 24 * 16), ("kq", 16 * 2 * PAN), ("qp", 16 * 2 * PAN),
+                     ("k2", 16 * 2 * PAN), ("kt", 16 * 2 * PAN), ("gg", 4 * 384), ("vt", 4 * 8 * D), ("o", 4 * 8 * D),
+                     ("u", 4 * 64), ("er", 4 * 128 + 64), ("cc", 3 * 4 * 144), ("uf", 4 * 16), ("dc", 2 * 64),
+                     ("xy", 4 * 128), ("cw", 2 * 8 * D), ("zb", 2 * 8 * D), ("vh", 2 * 24 * D), ("zr", 2 * 8 * D)]
+            out = regions(sizes)
+            out["hb"] = out["vh"]
+            assert out["vh"] + 2 * 24 * D + D_BYTES // 2 <= out["size"] and HB_R + 5 * 2 * D <= 10240, out
+            return out
         sizes = [("st", 4 * G_WORDS), ("prm", 4 * 160), ("msg", 2 * SMAX * self.msgp), ("kq", 2 * SMAX * 8 * D),
                  ("gt", 4 * SMAX * 48), ("v", 4 * 2 * SMAX * D), ("o", 4 * 2 * SMAX * D), ("dl", 4 * 2 * SMAX * D),
                  ("kold", 2 * SMAX * 4 * D), ("dold", 4 * SMAX * 16), ("y", max(4 * D, 2 * SMAX * D)), ("uw", 4 * 16)]
@@ -2033,8 +1594,9 @@ class GdnShape:
         if self.slots == 8:
             return _SRC8.render(p=p, g=Attr(self.workspace()), gm=MATH, HC=self.hc, D=D, C_LEN=self.c_len, META=self.meta,
                                 SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)), F_GIN=F_GIN, F_GDN=F_GDN,
-                                H_AB=H_AB, H_PRM=H_PRM, H_DOLD=H_DOLD, PAN=PAN, strict=f"{strict:016X}", lower=f"{lower:016X}",
-                                L_HRDY=L_HRDY, L_HDONE=L_HDONE, TAB=SILU_TAB, **consts, **{k: v for k, v in globals().items() if k.startswith("G_")})
+                                H_AB=H_AB, H_PRM=H_PRM, H_DN=H_DN, HS_OFF=HS8_AT - GWS_AT, HB_V=HB_V, HB_K=HB_K, HB_Q=HB_Q, HB_R=HB_R,
+                                PAN=PAN, strict=f"{strict:016X}", lower=f"{lower:016X}", L_HRDY=L_HRDY, L_HDONE=L_HDONE,
+                                TAB=SILU_TAB, **consts, **{k: v for k, v in globals().items() if k.startswith("G_")})
         return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
                            PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps),
