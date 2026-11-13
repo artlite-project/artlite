@@ -95,7 +95,7 @@ class Gemm:
     kb), y (panels if out != "bf16", else C tiles), res (C tiles of N channels, or None). out "vt": panels of the
     transposes ([kb][token panel] of [8 channels][8 tokens], the attention's V^T); "geglu": the weights' rows
     [hid N / 2 | gate N / 2], output hid gelu(gate) (N / 2 channels; act "silu": hid silu(gate), SwiGLU, role d); "prod":
-    the same pairs' products hid gate as bf16 ([pass][rb][5 cb][64] in 5760 B per pass, role d; m 64, one tile); "gelu":
+    the same pairs' products hid gate as bf16 ([pass][rb][5 cb][64] in m 90 B per pass, role d; one tile); "gelu":
     gelu of the outputs as panels; "rope":
     each pass a head of 40 pairs of channels (k, 40 + k) turned by its tokens' angles, as panels: res is then the tile's
     cos | sin (one C-tile object of 80 channels, the same for every pass: ``core``'s RoPE; m 64, one tile, no
@@ -183,7 +183,7 @@ class Gemm:
         assert self.m in (64, 16) and self.N * self.tsplit % 320 == 0 and self.K % 8 == 0 and \
             self.out in ("bf16", "bfp16", "geglu", "vt", "ds", "gelu", "rope", "rope2", "rope40", "prod", "f32", "isig")
         assert self.act == "gelu" or self.act == "silu" and self.out in ("geglu", "gelu")
-        assert self.out != "prod" or self.m == 64 and self.ntile == 1 and self.stats is None and not self.conv
+        assert self.out != "prod" or self.ntile == 1 and self.stats is None and not self.conv
         assert self.out != "f32" or self.m == 16 and self.ntile == 1 and self.stats is None and self.res is None and not self.conv
         assert self.out != "isig" or self.stats is None and self.res is None and not self.conv
         assert self.out != "rope40" or self.res is not None and self.m == 16 and self.stats is None and not self.conv \
@@ -227,7 +227,8 @@ class Gemm:
         assert self.npass <= 16 and self.y_np >= self.np + self.junk
         ybytes = {"bfp16": self.N // 8, "vt": self.N // 8, "gelu": self.N // 8, "rope": self.N // 8, "rope2": self.N // 8,
                   "rope40": self.N // 8, "geglu": self.N // 16}.get(self.out, 0) * \
-            self.y_np * L.PANEL or (self.N // 80 * 5760 if self.out in ("prod", "f32") else 0) or \
+            self.y_np * L.PANEL or (self.N // 80 * self.m * 90 if self.out == "prod" else 0) or \
+            (self.N // 80 * 5760 if self.out == "f32" else 0) or \
             self.N // 80 * (1 if self.out == "ds" else self.ntile) * L.ct_bytes(self.m)
         assert self.y + ybytes <= D.HEAP and self.x + self.K // 8 * self.x_np * L.PANEL <= D.HEAP, "tensors past the heap"
         walk = self.aobj * (128 // self.m) - (self.nkt // 2 if self.hilo else 0)  # (k-tiles of x a walk reads; hilo:
@@ -612,9 +613,10 @@ class Gemm:
                 # panel (m / 8) t + rb)
                 data = _panel_recv(self.y + (r * self.npass + P0) * 10 * YN * L.PANEL, YN, m // 8, 10, NPO)
                 data["iteration"] = (TP, NT)
-            elif self.out in ("prod", "f32"):  # (pass p: 5760 B [rb][5 cb][64] bf16 or [rb][cb][64] fp32 (and a chunk's
-                # padding) at (r npass + p))
-                data = {"addr": self.y + (r * self.npass + P0) * 5760, "nwords": NPO * 1440}
+            elif self.out in ("prod", "f32"):  # (pass p: [rb][5 cb][64] bf16 in m 90 B or [rb][cb][64] fp32 in 5760 B
+                # (and a chunk's padding) at (r npass + p))
+                pb = self.m * 90 if self.out == "prod" else 5760
+                data = {"addr": self.y + (r * self.npass + P0) * pb, "nwords": NPO * pb // 4}
             elif self.out == "geglu":  # (pass p: [rb][5 cb] -> kb (r npass + p) 5 + cb)
                 data = _panel_recv(self.y + (r * self.npass + P0) * 5 * YN * L.PANEL, YN, m // 8, 5, NPO, self.junk)
                 data["iteration"] = (TP, NT)
