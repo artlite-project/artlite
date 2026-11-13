@@ -36,6 +36,7 @@ def build(count: Callable[[str], int], essays: list[str], target: int) -> str:
 def main() -> None:
     model = open_model(model_path(sys.argv[1]))
     out = sys.argv[2]
+    os.makedirs(out, exist_ok=True)
     essays = []
     for name in sorted(os.listdir(ESSAYS)):
         with open(os.path.join(ESSAYS, name)) as f:
