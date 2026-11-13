@@ -93,3 +93,28 @@ def test_no_count() -> None:
                         "-c:v", "libvpx-vp9", "-deadline", "realtime", path], check=True)
         info = VD.probe(VD.read(path))
         assert info.n_frames == 24 and (info.width, info.height) == (160, 120)
+
+
+def test_regular(videos: str) -> None:
+    """A regular stream's frames are picked before ffmpeg converts them (``Info.regular``), with the pixels of the whole
+    way (llama.cpp's command: every frame converted, the indices' kept): the tests' videos but the one that starts late
+    (ffmpeg's constant-rate output duplicates its first frame from the file's start); a variable-rate stream (frames
+    off their slots) and a stream with discarded packets (an edit list's lead-in) go the whole way."""
+    import dataclasses
+    with tempfile.TemporaryDirectory() as tmp:
+        vfr = os.path.join(tmp, "vfr.mp4")  # (every third frame 40% of a slot late)
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=192x128:rate=10:duration=3", "-vf",
+                        "settb=1/1000,setpts='N*100+if(eq(mod(N\\,3)\\,2)\\,40\\,0)'", "-fps_mode", "passthrough",
+                        "-enc_time_base:v", "1/1000", vfr], check=True)
+        cut = os.path.join(tmp, "cut.mp4")  # (stream-copied from a mid-GOP time: discarded lead-in packets)
+        subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.55", "-i", video_file(videos, "astronaut"), "-t", "4",
+                        "-c", "copy", cut], check=True)
+        paths = {n: video_file(videos, n) for n in VIDEOS} | {"vfr": vfr, "cut": cut}
+        for name, path in paths.items():
+            data = VD.read(path)
+            info = VD.probe(data)
+            assert info.regular == (name not in ("ntsc-start", "vfr", "cut")), name
+            plan = H.VideoPlan.of(info.n_frames, info.fps, info.width, info.height, heard=True)
+            size = (plan.width, plan.height)
+            fast = VD.frames(data, info, plan.indices, size)
+            assert np.array_equal(fast, VD.frames(data, dataclasses.replace(info, regular=False), plan.indices, size))

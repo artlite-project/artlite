@@ -2,11 +2,17 @@
 (mtmd's video helper), so that a prompt's frames and samples are llama-server's for the same file.
 
 - ``probe``: the first video stream's size, rate (``r_frame_rate`` as a float32, llama.cpp's float), frame count
-  (``nb_frames``; a container that does not record it: the stream's packets counted) and start time.
+  (``nb_frames``; a container that does not record it: the stream's packets counted), start time, and whether its
+  frames keep to their rate (``regular``: each within a quarter of a frame of its slot from the file's start, none of
+  its packets discarded).
 - ``Frames``: the frames at given indices (display order; an index may repeat), as RGB, scaled to a size by ffmpeg's
   bicubic (B 0, C 0.5: the closest to Pillow's) with accurate rounding and full chroma interpolation when the size is
   not the video's, as ffmpeg decodes them (a thread drains its output, so that it decodes ahead while the frames are
-  used: a video's pairs encode on the NPU meanwhile); ``frames``: all of them at once.
+  used: a video's pairs encode on the NPU meanwhile); ``frames``: all of them at once. llama.cpp's command converts
+  every frame up to the last index (ffmpeg's constant-rate output: a frame per slot of the rate, a stream that strays
+  from it duplicated or dropped to fit) and keeps the indices'. A regular stream's slots are its frames, so ffmpeg
+  picks the indices' frames before converting them (the same pixels; a 3-minute 720p video's 5400 frames decoded, 360
+  converted); any other goes the whole way.
 - ``soundtrack``: the first audio stream as mono float32 samples at a rate (ffmpeg's resampler), over the video stream's
   span: from its start time for n_frames / fps seconds; None without an audio stream.
 
@@ -37,13 +43,14 @@ class VideoError(ValueError):
 @dataclass(frozen=True)
 class Info:
     """A video stream: ``width`` x ``height`` pixels, ``fps`` frames a second (a float32's value), ``n_frames`` frames,
-    ``start`` its start time in seconds."""
+    ``start`` its start time in seconds; ``regular``: ffmpeg's constant-rate output is its frames, each once."""
 
     width: int
     height: int
     fps: float
     n_frames: int
     start: float
+    regular: bool = False
 
     @property
     def duration(self) -> float:
@@ -75,23 +82,41 @@ def _rate(s: str) -> float:
 
 def probe(data: bytes) -> Info:
     """The first video stream of a file's bytes (module docstring)."""
-    r = _run([_tool("ffprobe"), "-v", "quiet", "-show_entries",
-              "stream=width,height,r_frame_rate,nb_frames,duration,start_time", "-select_streams", "v:0", "-of",
-              "default=noprint_wrappers=1", *INPUT[:2], INPUT[3]], data)
-    kv = dict(line.split("=", 1) for line in r.stdout.decode(errors="replace").splitlines() if "=" in line)
-    num = lambda k, f, d: f(kv[k]) if kv.get(k, "N/A") not in ("N/A", "") else d
-    width, height = num("width", int, 0), num("height", int, 0)
-    fps = _rate(kv.get("r_frame_rate", ""))
+    r = _run([_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0", "-show_entries",
+              "stream=width,height,r_frame_rate,nb_frames,start_time:format=start_time:packet=pts_time,flags", "-of",
+              "compact", *INPUT[:2], INPUT[3]], data)
+    stream, file, pts, packets, dropped = {}, {}, [], 0, False
+    for line in r.stdout.decode(errors="replace").splitlines():
+        kind, _, rest = line.partition("|")
+        kv = dict(f.split("=", 1) for f in rest.split("|") if "=" in f)
+        if kind == "packet":
+            packets += 1
+            t = kv.get("pts_time", "N/A")
+            if "D" in kv.get("flags", "") or t in ("N/A", ""):  # (a packet the decoder discards, or without a time)
+                dropped = True
+            else:
+                pts.append(float(t))
+        elif kind in ("stream", "format"):
+            (stream if kind == "stream" else file).update(kv)
+    num = lambda kv, k, f, d: f(kv[k]) if kv.get(k, "N/A") not in ("N/A", "") else d
+    width, height = num(stream, "width", int, 0), num(stream, "height", int, 0)
+    fps = _rate(stream.get("r_frame_rate", ""))
     if width <= 0 or height <= 0 or fps <= 0:
         raise VideoError("not a video file (ffprobe found no video stream)")
-    n = num("nb_frames", int, 0)
-    if n <= 0:  # (a container without the count: the packets counted)
-        c = _run([_tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
-                  "stream=nb_read_packets", "-of", "csv=p=0", *INPUT[:2], INPUT[3]], data)
-        n = int(c.stdout.decode().strip() or 0) if c.stdout.decode().strip().isdigit() else 0
+    n = num(stream, "nb_frames", int, 0) or packets  # (a container without the count: the packets counted)
     if n <= 0:
         raise VideoError("a video without frames")
-    return Info(width, height, fps, n, num("start_time", float, 0.0))
+    slots = (np.sort(np.asarray(pts, np.float64)) - num(file, "start_time", float, 0.0)) * fps - np.arange(len(pts))
+    regular = bool(pts) and not dropped and bool(np.abs(slots).max() < 0.25)
+    return Info(width, height, fps, n, num(stream, "start_time", float, 0.0), regular)
+
+
+def _select(frames: list[int]) -> str:
+    """ffmpeg's select filter of the frames numbered ``frames`` (a sum of eq(n, i) as a balanced tree: the expression
+    parser's depth)."""
+    def tree(xs: list[int]) -> str:
+        return f"eq(n,{xs[0]})" if len(xs) == 1 else f"({tree(xs[:len(xs) // 2])}+{tree(xs[len(xs) // 2:])})"
+    return f"select='{tree(frames)}'"
 
 
 def _feed(proc: subprocess.Popen, data: bytes) -> threading.Thread:
@@ -118,11 +143,13 @@ class Frames:
                  ahead: int = 64):
         w, h = self.size = size
         self.idx = [int(i) for i in indices]
-        cmd = [_tool("ffmpeg"), "-nostdin", *INPUT]
+        self.keep = sorted(set(self.idx)) if info.regular else list(range(self.idx[-1] + 1))  # (ffmpeg's output frames)
+        vf = [_select(self.keep) + ",setpts=N/FRAME_RATE/TB"] if info.regular else []  # (the picked frames, in slots
+        # of their own: the constant-rate output passes each once)
         if (w, h) != (info.width, info.height):
-            cmd += ["-vf", f"format=rgb24,scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5"]
-        cmd += ["-frames:v", str(self.idx[-1] + 1), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel",
-                "error"]
+            vf.append(f"format=rgb24,scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5")
+        cmd = [_tool("ffmpeg"), "-nostdin", *INPUT, *(["-vf", ",".join(vf)] if vf else []), "-frames:v",
+               str(len(self.keep)), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel", "error"]
         self.nbytes = w * h * 3
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         widen_pipe(self.proc.stdout.fileno(), self.CHUNK)
@@ -143,16 +170,16 @@ class Frames:
 
     def _read(self) -> None:
         """ffmpeg's frames in order, several a read; the indices' kept, an index's frame once per occurrence."""
-        idx, n = self.idx, self.nbytes
+        idx, keep, n = self.idx, self.keep, self.nbytes
         fd, buf, at, k, src = self.proc.stdout.fileno(), bytearray(), 0, 0, 0
         try:
-            while src <= idx[-1]:
+            while src < len(keep):
                 chunk = os.read(fd, max(self.CHUNK, n))
                 if not chunk:
                     break
                 buf += chunk
-                while len(buf) - at >= n and src <= idx[-1]:
-                    while k < len(idx) and idx[k] == src:
+                while len(buf) - at >= n and src < len(keep):
+                    while k < len(idx) and idx[k] == keep[src]:
                         if not self._put(bytes(buf[at:at + n])):
                             return
                         k += 1

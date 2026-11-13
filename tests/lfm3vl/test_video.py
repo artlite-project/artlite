@@ -88,6 +88,25 @@ def test_npu_pairs(videos: str, mmproj: str) -> None:
             assert med < 0.06
 
 
+@pytest.mark.parametrize("size", [(224, 256), (384, 448), (320, 320)])
+def test_packed_pairs(size: tuple[int, int]) -> None:
+    """Two pairs in one run (``Layout.two``: one a half, their own keys and conv neighbours) give each pair's embeddings
+    bit for bit as a run each (``Encoder.packs``: pairs of 56 tokens, a band for two; of 168, 3 bands for two; 100
+    tokens do not pack), with an odd frame and a lone last pair (run with itself)."""
+    from models.lfm3vl.npu import NpuVision
+    if not os.path.exists(MMPROJ):
+        pytest.skip(f"{MMPROJ} missing")
+    v = NpuVision(MMPROJ)
+    enc = v.encoder
+    frames = np.random.default_rng(0).integers(0, 256, (7, *size, 3), np.uint8)  # (3 pairs and an odd frame)
+    packs = enc.packs(size[0] // 32, size[1] // 32)
+    assert packs == (size != (320, 320))
+    got = v.pairs(frames)
+    enc.packs = lambda gh, gw: False
+    want = v.pairs(frames)
+    assert len(got) == len(want) == 4 and all(np.array_equal(a, b) for a, b in zip(got, want, strict=True))
+
+
 def test_program_cache() -> None:
     """A program is cached for later processes only where it takes the cached state's images: a pair's pixel panels
     are allocated after the state (by the first pair program built), so no pair program is cached, whichever size

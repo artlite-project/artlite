@@ -399,20 +399,32 @@ class Encoder(W.WindowEncoder):
         return out
 
     def pixel_panels(self, lay: W.Layout, px: np.ndarray) -> dict[str, np.ndarray]:
-        if px.ndim == 4:  # (a video's pair)
+        if px.ndim == 4 + lay.two:  # (a video's pair, or two)
             return W.patch_panels(lay, px, self.nm.p, kp=KP2, one=ONE2, tag="pixp")
         return W.patch_panels(lay, px, self.nm.p, kp=KP, one=ONE)
 
     def size_inputs(self, lay: W.Layout) -> dict[str, np.ndarray]:
-        """The size's rows: the attention command's key masks, the RoPE tables, the conv's edge masks."""
+        """The size's rows: the attention command's key masks (``lay.two``: each image's own keys, the command's per
+        image masks over the joint sequence instead of its dense form), the RoPE tables, the conv's edge masks."""
         nm, nb = self.nm, lay.nb
         ph, pw = 2 * lay.gh, 2 * lay.gw
-        ok = lay.keys()
-        att = Keys(nm.attn(nb), valid=(ok, ok), joint=True, dense=True, kv_heads=KVH).attention(level(nb)).command()
-        out = {nm.attn(nb): att} | W.band_rows(lay, W.rope_table(ph, pw, HD, THETA, HP), f"{nm.p}.rope")
+        att = self._keys(lay).attention(level(nb)).command()
+        rope = W.rope_table(ph, pw, HD, THETA, HP)
+        out = {nm.attn(nb): att} | W.band_rows(lay, np.concatenate([rope] * (1 + lay.two)), f"{nm.p}.rope")
         for b in range(nb):
-            out[f"{nm.p}.cm.{b}"] = W.dw_masks(lay.gh, lay.gw, nb, b).view(np.uint8).reshape(-1)
+            out[f"{nm.p}.cm.{b}"] = W.dw_masks(lay.gh, lay.gw, nb, b, lay.two).view(np.uint8).reshape(-1)
         return out
+
+    def _keys(self, lay: W.Layout) -> Keys:
+        ok = lay.keys()
+        return Keys(self.nm.attn(lay.nb), valid=ok if lay.two else (ok, ok), joint=True, dense=not lay.two,
+                    kv_heads=KVH)
+
+    def packs(self, gh: int, gw: int) -> bool:
+        """Two pairs a run where that takes fewer bands than a run each (pairs of up to 64 tokens: a band for two) and
+        the attention command holds the images' masks (``ops.Attention``: at most 32 key groups, 4 bands)."""
+        one, two = W.Layout(gh, gw), W.Layout(gh, gw, True)
+        return two.nb < 2 * one.nb and two.nb <= self.max_bands and self._keys(two).attention(level(two.nb)).ng <= 32
 
     def shift(self, tag: object, lay: W.Layout) -> int:
         return W.conv_shift(str(tag), lay.gw)

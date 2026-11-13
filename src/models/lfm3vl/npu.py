@@ -19,7 +19,7 @@ import hashlib
 import os
 import pickle
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 import numpy as np
 from PIL import Image
@@ -145,20 +145,37 @@ class NpuVision:
 
     def pairs(self, frames: Iterable[np.ndarray]) -> list[np.ndarray]:
         """A video's frames (H, W, 3) uint8 at its size (``host.VideoPlan``; an array of them, or as they are decoded:
-        ``models.video.stream``) -> each pair's embeddings (its merged tokens in raster order): two frames a temporal
-        patch, encoded as soon as both are there, an odd last one alone (both kernels on it, as an image)."""
-        out, held = [], None
+        ``models.video.Frames``) -> each pair's embeddings (its merged tokens in raster order): two frames a temporal
+        patch, an odd last one alone (both kernels on it, as an image). Pairs encode as soon as they are there: two at a
+        time where they run as one (``Encoder.packs``: small pairs, a long video's), a lone last one with itself."""
+        keep: list[int] = []  # (per run the pairs whose embeddings it gives: a lone last pair runs with itself)
+
+        def runs() -> Iterator[tuple[np.ndarray, bool]]:
+            held, ready, packs = [], [], False
+            for i, f in enumerate(frames):
+                if f.shape[1] // 32 > GW_MAX:
+                    raise ValueError(f"a video of {f.shape[1] // 32} tokens per row (at most {GW_MAX})")
+                if i == 0:
+                    packs = self.encoder.packs(f.shape[0] // 32, f.shape[1] // 32)
+                held.append(f)
+                if len(held) == 2:
+                    ready.append(np.stack(held))
+                    held = []
+                if len(ready) == 1 + packs:
+                    keep.append(len(ready))
+                    yield (np.stack(ready), True) if packs else (ready[0], False)
+                    ready = []
+            if ready:  # (packs: a lone pair)
+                keep.append(1)
+                yield np.stack(ready * 2), True
+            if held:  # (the odd last frame: an image)
+                keep.append(1)
+                yield held[0], False
+        out = []
         t0 = time.perf_counter()
-        for f in frames:
-            if f.shape[1] // 32 > GW_MAX:
-                raise ValueError(f"a video of {f.shape[1] // 32} tokens per row (at most {GW_MAX})")
-            if held is None:
-                held = f
-                continue
-            out.append(self.encoder(np.stack([held, f])))
-            held = None
-        if held is not None:
-            out.append(self.encoder(held))
+        for emb in self.encoder.stream(runs()):
+            n = keep.pop(0)
+            out.extend(emb[:n] if emb.ndim == 3 else [emb])
         self.t_encode += time.perf_counter() - t0
         self.entries += len(out)
         return out
