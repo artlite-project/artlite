@@ -1218,7 +1218,10 @@ class OverlayModel(NpuModel):
                         won += 1
                 self._kept(p, [*self.carry, token, *d], c + 1 if won else c + len(new), mtp, won)
                 self.carry = tuple(new[:won])
-                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1))
+                if n > 1 and not getattr(getattr(self, "overlay", None), "fresh", False):  # (not the round after the prompt, whose step also turns
+                    # the prompt's states into the decode's, nor a transaction's first run: up to ~200 / ~60 ms more, which a running
+                    # average would carry for ten steps)
+                    plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1))
                 self.accepted += len(new) - 1
                 if mtp:
                     plan.drafted(m, len(new), t2 - t0 - (w2 - w0))

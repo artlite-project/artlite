@@ -152,6 +152,9 @@ class ModelOverlay:
         self._last_s = 1
         self._tr_lm: Transaction | None = None
         self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
+        self.fresh = False  # whether the last step's transaction ran for the first time (its patch tables built then: its time
+        # not a step's, ``models.common``'s planner)
+        self._ran_keys: set = set()
         self._pads: list[tuple[int, int, int]] | None = None  # (``_clear_pads``)
         self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
 
@@ -468,6 +471,8 @@ class ModelOverlay:
             st = self._transaction(S, logits, subs)
             self._set_position(st, position)
         self._ahead = None
+        self.fresh = key not in self._ran_keys
+        self._ran_keys.add(key)
         self.ready()
         self.dev.submit(st.tr)
         try:
