@@ -4,7 +4,9 @@ d 80, "s" of d 160, "c" of d 40, "v" the VAE decoder's single-head attention of 
 "ln" the LayerNorm / RMSNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's
 window attention, "r" the RoPE epilogue of the vision encoders' Q and K GEMMs (with LFM3-VL's per-head RMSNorm,
 LFM3-Audio's two-pass heads) and a SiLU epilogue at GELU's place, "d" LFM3-VL's depthwise 3 x 3 conv, the strip convs and
-the SwiGLU / gated-product epilogues at GEGLU's and GELU's places; together they do not fit 16 KB of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the
+the SwiGLU / gated-product epilogues at GEGLU's and GELU's places, "e" the epilogues of LFM3-Audio's speech generator at
+RoPE's place (C_EPI: heads of 40, fp32 tiles, the attention gate's factors), "g" the d-160 attention with per-query
+masks and LFM3's output gate (its codec's window attention); together they do not fit 16 KB of program memory), each a page (``paging``) whose entry (``sd15_ext_x``) the main loop calls through the
 pager's state words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third; "d": SwiGLU second,
 the product third: a GEMM's command picks the code by the page its op loads). A page arrives in the B stream
 (``device.VisionDevice``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
@@ -79,6 +81,8 @@ C_QKN = 32  # (a RoPE GEMM: each head RMS-normed first, C_INVN, C_EPS its 1 / n 
 C_DENSE, C_NLIVE = 30, 31  # (attention: the dense key masks, the live groups: the module docstring)
 C_QMASK = 33  # (attention of d 160: per-query key masks from each unit's query object: the module docstring)
 C_ROPE2 = 34  # (a RoPE GEMM of m 16: heads of two passes, ``sd15_ext_r``; the word toggles 1 / 2 per pass)
+C_EPI = 35  # (role e's epilogue at O_ROPE: E_ROPE40 two heads of 40 a pass, E_F32 fp32 out, E_GATE 1 + 2^y as bf16)
+E_ROPE40, E_F32, E_GATE = 1, 2, 3
 C_KMASK = (576, 704)  # (attention of d 80 / 160: per image its key groups' valid bits, [group][2] words, at most 32
 # groups; -1: all; around the command's walks)
 C_GINV = 36  # (GroupNorm: ``group_inv(C_GSIZE)``, the group of channel c being c C_GINV >> 20)
@@ -101,8 +105,12 @@ K_NOP, K_TABLE, K_GEMM, K_APPLY, K_ATTN, K_WATTN, K_DW, K_DW1 = 1, 2, 3, 4, 5, 6
 # page's first word)
 DW_STRIP, DW_C, DW_MASK = 1600, 3200, 4480  # (a depthwise conv slot: its strips, C, mask words: ``ops.DwConv``)
 C_NOBJ, C_DWM, C_NTAP, C_DWS = 37, 38, 39, 40  # (K_DW1: A objects, mode, taps, SiLU of the strips: ``ops.StripConv``)
+C_NPAIR = 41  # (attention of d 40: query pairs a unit, 0: 8)
+C_GATE = 42  # (attention of d 40: the byte of the output gate's factors 1 / sigmoid(g) (bf16) in a unit's query object
+# (0: none); role g's at WIN_GATE)
+WIN_GATE = 4608 + 128  # (role g: the gate's factors in a unit's query object, after its masks: ``ops.WinAttention``)
+C_DWC = 43  # (K_DW1 mode 1: a half's C row block, in elements after its strip)
 C_TOFF = 64  # (K_DW1: per tap its element offset in a half's strip)
-DW1_C = 800  # (K_DW1 mode 1: a half's C row block, in elements after its strip [10][80])
 DW1_STRIP = 2048  # (K_DW1 mode 2: a half's strip, elements)
 O_BF16, O_BFP16, O_GEGLU, O_VT, O_DS, O_GELU, O_ROPE = 0, 1, 2, 3, 4, 5, 6
 S_NONE, S_GN, S_LN = 0, 1, 2
@@ -110,7 +118,7 @@ A_GN, A_GNSILU, A_LN, A_RMS = 1, 2, 3, 4
 REC_GN = 256  # (bytes of a GroupNorm record)
 REC_SLOT = 22  # (GroupNorm records per B slot)
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "c", "v", "gn", "ln", "w", "r", "d", "s")
+ROLES = ("a", "c", "v", "gn", "ln", "w", "r", "d", "s", "e", "g")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "aexp2", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = r"""
@@ -1023,16 +1031,40 @@ static __attribute__((noinline)) void {{ p }}_attn_fin(const float *__restrict o
   }
 }
 
+// ``{{ p }}_attn_fin`` of a query pair (nqp 2) with LFM3's output gate: l times its factors 1 / sigmoid (g: bf16 [query
+// 8][head 2], the pair's two heads, q panel qp's the element qp; l rounded to bf16 first: below the panels' rounding)
+static __attribute__((noinline)) void {{ p }}_attn_fin_g(const float *__restrict o0, const float *__restrict l,
+                                                    bfp16ebs8 *__restrict out, int nd, const bfloat16 *__restrict g) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> po(out);
+  const aie::vector<bfloat16, 16> gv = aie::load_v<16>(g);
+  for (int qp = 0; qp < 2; qp++) {
+    const float *o = o0 + qp * 64 * nd;
+    aie::vector<bfloat16, 64> rh, rl;
+    const aie::vector<float, 8> l8 = aie::filter_even(aie::filter_even(aie::filter_even(aie::load_v<64>(l + 64 * qp))));
+    const aie::vector<float, 8> lg = aie::mul(aie::accum<accfloat, 8>(l8).template to_vector<bfloat16>(),
+                                              qp ? aie::filter_odd(gv) : aie::filter_even(gv)).template to_vector<float>();
+    al::split2<64>(al::bcast8(aie::inv(lg)), rh, rl);
+    AIE_LOOP_MIN_ITERATION_COUNT(10)
+    for (int db = 0; db < nd; db++) {
+      const aie::vector<bfloat16, 64> ob = aie::accum<accfloat, 64>(aie::load_v<64>(o)).template to_vector<bfloat16>();
+      po.push(aie::mac(aie::mul(ob, rh), ob, rl).template to_vector<bfp16ebs8>());
+      o += 64;
+    }
+  }
+}
+
 // K_ATTN (the module docstring) of d 160 (role s) or 80 (role a): O in the C buffer (fp32 [qp][nd][64], query pair
 // pr's from 2560 pr floats: d 80's in the buffer's halves, two L1 regions, the P V^T MAC alternating between them), S
 // of a pair in the Q object's halves' tails (after the pair, from the next 64-B boundary: one q panel's per half), the
 // pairs' P (d 160: in s1, 576 B each; d 80: pair 0's in s0, pair 1's in s1), 192 - m and l ([qp][8 q][8] each) in the
 // workspace after the header
-template <bool d160>
+template <bool d160, bool gated = false>
 static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32_t *cb, int32_t *ws) {
   const int nunit = ws[{{ C_NUNIT }}], nqp = ws[{{ C_NQP }}], ng = ws[{{ C_NG }}];
   const int nd = ws[{{ C_ND }}], nkp = ws[{{ C_NKP }}];
-  const int npair = (nqp + 1) / 2, dense = ws[{{ C_DENSE }}], nlive = ws[{{ C_NLIVE }}], qm = d160 && ws[{{ C_QMASK }}];
+  const int npair = (nqp + 1) / 2, dense = !gated && ws[{{ C_DENSE }}], nlive = ws[{{ C_NLIVE }}];
+  const int qm = gated || (d160 && ws[{{ C_QMASK }}]);  // (gated: role g, C_QMASK and C_GATE)
   float *o = (float *)cb, *mb = (float *)(ws + 64), *l = mb + 256;
   // (P V^T at d 80: the GEMM MAC of a band per query pair, its walks the command's)
   const dims_3d_t &pa = *(const dims_3d_t *)(ws + {{ C_WALKS }}), &pb = *(const dims_3d_t *)(ws + {{ C_PATS }});
@@ -1085,14 +1117,19 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn({{ p }}_st &s, int32
       {{ p }}_give_b(s, v);
       first &= !live;
     }
-    {{ p }}_give_a(s, q);
+    if constexpr (gated) {  // (the output gate's factors in the object: given back after)
+      {{ p }}_attn_fin_g(o, l, (bfp16ebs8 *)o, nd, (const bfloat16 *){{ p }}_ab((const uint8_t *)q, {{ WinGate }}));
+      {{ p }}_give_a(s, q);
+    } else {
+      {{ p }}_give_a(s, q);
 {% if win == "afin" %}
-    event0();
+      event0();
 {% endif %}
-    {{ p }}_attn_fin(o, l, nqp, (bfp16ebs8 *)o, nd, 2560);
+      {{ p }}_attn_fin(o, l, nqp, (bfp16ebs8 *)o, nd, 2560);
 {% if win == "afin" %}
-    event1();
+      event1();
 {% endif %}
+    }
     {{ p }}_out(s, cb, 72 * nd * nqp);
   }
 }
@@ -1242,17 +1279,18 @@ static __attribute__((noinline)) void {{ p }}_pv40(const bfp16ebs8 *__restrict p
 // panels [qp][d-block 5]
 static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   const int nunit = ws[{{ C_NUNIT }}], ng = ws[{{ C_NG }}], nkl = ws[{{ C_NK }}];
+  const int npair = ws[{{ C_NPAIR }}] ? ws[{{ C_NPAIR }}] : 8;  // (query pairs a unit: the rest of its object unused)
   float *o = (float *)cb, *lc = (float *)(ws + 64), *sm = (float *)tab;
   for (int u = 0; u < nunit; u++) {
     const int32_t *km = ws + (u >= nunit / 2 ? {{ C_KMASK[1] }} : {{ C_KMASK[0] }});  // (the unit's image's key masks)
     int32_t *q = {{ p }}_take_a(s);
-    {{ p }}_zero(cb, 5120);
-    {{ p }}_zero((int32_t *)lc, 128);
+    {{ p }}_zero(cb, 640 * npair);
+    {{ p }}_zero((int32_t *)lc, 16 * npair);
     for (int g = 0; g < ng; g++) {
       int32_t *kv = {{ p }}_take_b(s);
       bfp16ebs8 *pp = (bfp16ebs8 *)(kv == s.b0 ? s.s1 : s.s0);
       const int nk = g == ng - 1 ? nkl : 64;
-      for (int pr = 0; pr < 8; pr++) {
+      for (int pr = 0; pr < npair; pr++) {
         const int32_t *qa = {{ p }}_aw(q, 288 * pr);
         bfloat16 *bias = (bfloat16 *)(qa + 192);
 {% if win == "a40qk" %}
@@ -1279,10 +1317,17 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn40({{ p }}_st &s, int
       }
       {{ p }}_give_b(s, kv);
     }
+    if (ws[{{ C_GATE }}]) {  // (the output gate, one query pair: its l times its 16 queries' 1 / sigmoid(g), bf16 [query
+      // 16][head 8] in the object (the unit's channel u), before it goes: O / l is O g / l)
+      const bfloat16 *gw = (const bfloat16 *){{ p }}_ab((const uint8_t *)q, ws[{{ C_GATE }}]);
+      aie::vector<bfloat16, 16> gv;
+      for (int t = 0; t < 16; t++) gv.set(gw[8 * t + u], t);
+      aie::store_v(lc, al::mulc<16>(aie::load_v<16>(lc), gv).template to_vector<float>());
+    }
     {{ p }}_give_a(s, q);
-    for (int i = 0; i < 16; i++) aie::store_v(sm + 64 * i, al::bcast8(aie::load_v<8>(lc + 8 * i)));
-    {{ p }}_attn_fin(o, sm, 16, (bfp16ebs8 *)o, 5, 640);
-    {{ p }}_out(s, cb, 5760);
+    for (int i = 0; i < 2 * npair; i++) aie::store_v(sm + 64 * i, al::bcast8(aie::load_v<8>(lc + 8 * i)));
+    {{ p }}_attn_fin(o, sm, 2 * npair, (bfp16ebs8 *)o, 5, 640);
+    {{ p }}_out(s, cb, 720 * npair);
   }
 }
 
@@ -1582,6 +1627,10 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_s({{ p }}_st &s, int32_t *cb
   {{ p }}_attn<true>(s, cb, ws);
 }
 
+__attribute__((noinline, minsize)) void {{ p }}_ext_g({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  {{ p }}_attn<true, true>(s, cb, ws);
+}
+
 __attribute__((noinline, minsize)) void {{ p }}_ext_c({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *tab) {
   {{ p }}_attn40(s, cb, ws, tab);
 }
@@ -1660,6 +1709,55 @@ static __attribute__((noinline)) void {{ p }}_qkn2(bfloat16 *__restrict a, bfloa
   }
 }
 
+// 1 + 2^y of n fp32 values (``{{ exp2 }}``: bf16-level, saturating outside +-63.5) -> bf16 at y (in place: out may be
+// y's start); the gate's GEMM's weights are -log2 e times LFM3's attention gate's: 1 / sigmoid of its logits
+static __attribute__((noinline)) void {{ p }}_isig(const float *y, bfloat16 *out, int n) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  for (int i = 0; i < n; i += 32) {
+    const aie::accum<accfloat, 32> A = aie::add(aie::accum<accfloat, 32>(aie::load_v<32>(y + i)), aie::broadcast<float, 32>(192.0f));
+    aie::store_v(out + i, aie::add({{ exp2 }}(A), aie::broadcast<float, 32>(1.0f)).template to_vector<bfloat16>());
+  }
+}
+
+// a pass of two heads of 40 channels (C_EPI E_ROPE40, m 16: LFM3-Audio's depthformer, heads of 32 in 40) RMS-normed per
+// token over each head's channel blocks 0 .. 3 (C_INVN, C_EPS, w the command's 80 bf16 at C_QKW: ``{{ p }}_qkn``'s
+// steps; blocks 4, 9 the pads) and turned in place: per head the pairs (cb, cb + 2) of cb 0, 1 by the table t ([rb][cb]
+// [64] bf16: cos in cb 0, 1, sin in cb 2, 3, both heads')
+static __attribute__((noinline)) void {{ p }}_rope40(bfloat16 *__restrict c, const bfloat16 *__restrict t, const int32_t *ws,
+                                                int nrb) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const bfloat16 *w = (const bfloat16 *)(ws + {{ C_QKW }});
+  const aie::vector<float, 16> inv_n = aie::broadcast<int32, 16>(ws[{{ C_INVN }}]).template cast_to<float>();
+  const aie::vector<float, 16> eps = aie::broadcast<int32, 16>(ws[{{ C_EPS }}]).template cast_to<float>();
+  for (int rb = 0; rb < nrb; rb++) {
+    for (int hd = 0; hd < 2; hd++) {
+      bfloat16 *x = c + 640 * rb + 320 * hd;
+      aie::accum<accfloat, 64> a2 = aie::zeros<accfloat, 64>();
+      for (int cb = 0; cb < 4; cb++) {
+        const aie::vector<bfloat16, 64> v = aie::load_v<64>(x + 64 * cb);
+        a2 = aie::mac(a2, v, v);
+      }
+      const aie::vector<float, 16> ve = aie::add(al::mulff<16>(al::group8<false>(a2.template to_vector<float>()).template grow<16>(), inv_n), eps);
+      aie::vector<float, 16> r = aie::zeros<float, 16>();
+      AIE_LOOP_UNROLL_FULL
+      for (int k = 0; k < 8; k++) r.set(aie::invsqrt(ve[k]), k);
+      aie::vector<bfloat16, 16> rh, rl;
+      al::split2<16>(r, rh, rl);
+      const aie::vector<bfloat16, 64> h = al::expand8(rh.extract<8>(0)), l = al::expand8(rl.extract<8>(0));
+      for (int cb = 0; cb < 4; cb++) {
+        const aie::vector<bfloat16, 64> cw = aie::mul(aie::load_v<64>(x + 64 * cb), {{ p }}_rep(w + 40 * hd + 8 * cb)).template to_vector<bfloat16>();
+        aie::store_v(x + 64 * cb, aie::mac(aie::mul(cw, h), cw, l).template to_vector<bfloat16>());
+      }
+      for (int a = 0; a < 2; a++) {
+        const aie::vector<bfloat16, 64> vx = aie::load_v<64>(x + 64 * a), vy = aie::load_v<64>(x + 64 * (a + 2));
+        const aie::vector<bfloat16, 64> vc = aie::load_v<64>(t + 640 * rb + 64 * a), vs = aie::load_v<64>(t + 640 * rb + 64 * (a + 2));
+        aie::store_v(x + 64 * a, aie::msc(aie::mul(vx, vc), vy, vs).template to_vector<bfloat16>());
+        aie::store_v(x + 64 * (a + 2), aie::mac(aie::mul(vy, vc), vx, vs).template to_vector<bfloat16>());
+      }
+    }
+  }
+}
+
 // K_GEMM's RoPE epilogue (role r, the module docstring): the pass's fp32 C tile to bf16 in place (with C_QKN each
 // head RMS-normed: ``{{ p }}_qkn``), its C_NRES residual objects (the tokens' cos | sin, m x 80 bf16) into the C buffer
 // after it, the pairs turned, the tile -> bfp16 panels out. C_ROPE2 (m 16, a head in two passes, A then B: the
@@ -1703,6 +1801,27 @@ __attribute__((noinline, minsize)) void {{ p }}_ext_r({{ p }}_st &s, int32_t *cb
   {{ p }}_rope((bfloat16 *)cb, (const bfloat16 *)(cb + m * 40), m / 8);
   {{ p }}_bfp(cb, cb, m / 8 * 10);
   {{ p }}_out(s, cb, m * 90);
+}
+
+// K_GEMM's epilogues of LFM3-Audio's generator (role e, at O_ROPE: the pass's fp32 C tile in cb): C_EPI E_F32 the fp32
+// tile out as it is; E_GATE 1 + 2^y (``{{ p }}_isig``) as bf16 out; E_ROPE40 (m 16) to bf16, the residual object the
+// tile's table, two heads of 40 normed and turned (``{{ p }}_rope40``), bfp16 panels out
+__attribute__((noinline, minsize)) void {{ p }}_ext_e({{ p }}_st &s, int32_t *cb, int32_t *ws, int32_t *) {
+  const int m = ws[{{ C_M }}], epi = ws[{{ C_EPI }}];
+  if (epi == {{ E_F32 }}) {
+    {{ p }}_out(s, cb, m * 320);
+  } else if (epi == {{ E_GATE }}) {
+    {{ p }}_isig((const float *)cb, (bfloat16 *)cb, m * 80);
+    {{ p }}_out(s, cb, m * 160);
+  } else {
+    {{ p }}_res_f2b((const bfloat16 *)(ws + {{ C_ZERO }}), (const float *)cb, (bfloat16 *)cb, m * 80, 0, 0);
+    int32_t *t = cb + 640, *a = {{ p }}_take_a(s);  // (the table: 1280 words)
+    {{ p }}_copy8(a, t, 640);
+    {{ p }}_give_a(s, a);
+    {{ p }}_rope40((bfloat16 *)cb, (const bfloat16 *)t, ws, 2);
+    {{ p }}_bfp(cb, cb, 20);
+    {{ p }}_out(s, cb, 1440);
+  }
 }
 
 // SiLU of a C tile (role r's second and third entry: a GEMM's GELU path with role r): rb's 10 channel blocks -> silu as
@@ -1800,9 +1919,10 @@ static __attribute__((noinline)) void {{ p }}_dw1rb(const bfloat16 *__restrict s
   }
 }
 
-// the strip conv op (K_DW1, role d, ``ops.StripConv``): one 80-channel block of the column's tile; C_NOBJ A objects,
+// the strip conv op (K_DW1, role d, ``ops.StripConv``): one 80-channel block of the column's tile; C_NOBJ A objects (its
+// row blocks: two an object in mode 1, one in mode 2),
 // each two halves: mode 1 (C_DWM), half h of object o the inputs of row block 2 o + h ([strip rows][80] bf16, its C
-// row block [cb 10][64] at DW1_C: y = C conv), mode 2 row block o, half h its channels 40 h .. ([strip][40] bf16 of
+// row block [cb 10][64] at C_DWC: y = C conv), mode 2 row block o, half h its channels 40 h .. ([strip][40] bf16 of
 // DW1_STRIP values, SiLU'd first where C_DWS (into the C buffer's second half): y = conv + b); the taps (C_NTAP, B slot
 // [tap][80] bf16 then the bias [80]; their offsets C_TOFF) -> the C tile [rb][cb][64], then bfp16 panels out
 static __attribute__((noinline, minsize)) void {{ p }}_dw1({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
@@ -1817,14 +1937,14 @@ static __attribute__((noinline, minsize)) void {{ p }}_dw1({{ p }}_st &s, int32_
         {{ strip_act }}(st, scr, tab, tab + {{ tw }});
         st = scr;
       }
-      {{ p }}_dw1rb(st, taps, m1 ? nullptr : taps + 80 * ntap, m1 ? st + {{ DW1_C }} : nullptr,
+      {{ p }}_dw1rb(st, taps, m1 ? nullptr : taps + 80 * ntap, m1 ? st + ws[{{ C_DWC }}] : nullptr,
                     y + 640 * (m1 ? 2 * o + h : o), ws + {{ C_TOFF }}, ntap, m1 ? 0 : 5 * h, m1 ? 10 : 5);
     }
     {{ p }}_give_a(s, (int32_t *)a);
   }
   {{ p }}_give_b(s, (int32_t *)taps);
-  {{ p }}_bfp(cb, cb, 80);
-  {{ p }}_out(s, cb, 5760);
+  {{ p }}_bfp(cb, cb, m1 ? 20 * nobj : 10 * nobj);  // (the objects' row blocks)
+  {{ p }}_out(s, cb, m1 ? 1440 * nobj : 720 * nobj);
 }
 
 // the depthwise 3 x 3 conv op (K_DW, role d, ``ops.DwConv``): one 80-channel block of the column's tile; per half p two A
@@ -1911,5 +2031,5 @@ def source(*, win: str = "") -> str:
         p=P, pager=paging.source(P, wake=d.L_WAKE, send=d.L_SEND), header=paging.header(), lock_base=paging.LOCK_BASE,
         L_DONE=d.L_DONE, macf=render_mac(name=f"{P}_macf", k=d.KT, f32=True, nbr_arg=True, pats=True, c2_bank="b"),
         pvm=render_mac(name=f"{P}_pvm", k=32, f32=True, nbr_arg=True), Q=d.Q,
-        gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
-        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_") or k[:3] in ("REC", "ST_", "DW_", "DW1")})
+        gelu_tmax=kmath.GELU.t_max, win=win, CALL=CALL, CROSS=CROSS, A_OBJ=d.A_OBJ, WinGate=WIN_GATE, R23=d.R23, A_HI=d.A_HI, QS=(d.A_OBJ // 2 + d.A_HI) // 4, OCH=d.OCH, OSL=d.OSL, NO=d.NO, WS=d.WS, TAB=d.TAB,
+        **{k: v for k, v in globals().items() if k[:2] in ("C_", "K_", "O_", "S_", "A_", "E_") or k[:3] in ("REC", "ST_", "DW_", "DW1")})

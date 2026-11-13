@@ -828,47 +828,50 @@ def test_gemm_silu(npu: VisionDevice) -> None:
     assert _rel(y, F.silu(u)) < 1.2e-2
 
 
-@pytest.mark.parametrize("k", [0, 2])
-def test_strip_conv1(npu: VisionDevice, k: int) -> None:
-    """The causal 1-D conv of the strip conv op (``ops.StripConv`` mode 1: LFM3-Audio's short conv), step k (row r's
-    block 3 r + k of 960 channels) of a band in the interleaved layout (column c's token panel j: rows 64 j + 8 c ..):
-    the strips of B x from a DDR image [2 + 512][960] bf16 (rows -2, -1: the state), C from the memtile's C tiles: y = C
-    conv as torch's on the bf16 inputs (fp32 sums of the taps, bf16 products), rounded to the output's bfp16 blocks
-    (within 1e-3: the sums' order)."""
+@pytest.mark.parametrize("k, ntap, m", [(0, 3, 64), (2, 3, 64), (0, 7, 16), (1, 7, 16)])
+def test_strip_conv1(npu: VisionDevice, k: int, ntap: int, m: int) -> None:
+    """The causal 1-D conv of the strip conv op (``ops.StripConv`` mode 1: LFM3-Audio's short convs, the encoder's of 3
+    taps and 960 channels on tiles of 64, its codec's of 7 taps and 640 on tiles of 16), step k (row r's block nstep r +
+    k) of a band in the interleaved layout (column c's token panel j: rows 64 j + 8 c ..): the strips of B x from a DDR
+    image [ntap - 1 + rows][C] bf16 (the rows before: the state), C from the memtile's C tiles: y = C conv as torch's on
+    the bf16 inputs (fp32 sums of the taps, bf16 products), rounded to the output's bfp16 blocks (within 1e-3: the sums'
+    order)."""
     from ml_dtypes import bfloat16
 
     from artlite.vision.ops import StripConv
     torch.manual_seed(33)
-    C, T = 960, 512
-    g = torch.randn(2 + T, C).bfloat16().float()
+    C, T = (960, 512) if m == 64 else (640, 128)
+    nstep, h = C // 80 // ROWS, ntap - 1
+    g = torch.randn(h + T, C).bfloat16().float()
     cg = torch.randn(T, C).bfloat16().float()
-    taps = torch.randn(C, 3) / 2
-    order = torch.tensor([64 * j + 8 * c + i for c in range(COLS) for j in range(8) for i in range(8)]).reshape(COLS, 64)
+    taps = torch.randn(C, ntap) / 2
+    order = torch.tensor([64 * j + 8 * c + i for c in range(COLS) for j in range(m // 8) for i in range(8)]).reshape(COLS, m)
     npu.alloc("g", g.numel() * 2)
     npu.write("g", g.numpy().astype(bfloat16).view(np.uint8))
-    ct = L.ct_bytes(64)
-    STAGE, CT = 0, StripConv.STAGE1
+    ct = L.ct_bytes(m)
+    STAGE, CT = 0, StripConv.stage1(ntap, m // 8)
     Y = CT + C // 80 * ct
-    op = StripConv(mode=1, y=Y, off=(0, 80, 160), blocks=tuple(3 * r + k for r in range(ROWS)))
+    op = StripConv(mode=1, y=Y, off=tuple(80 * i for i in range(ntap)), blocks=tuple(nstep * r + k for r in range(ROWS)),
+                   nobj=m // 16, y_np=m // 8)
     s = npu.seq()
-    cols = fills(npu, "c", [L.ctiles(cg[order[c]], 64) for c in range(COLS)], CT)
+    cols = fills(npu, "c", [L.ctiles(cg[order[c]], m) for c in range(COLS)], CT)
     for c in range(COLS):
         cols[c].fills.append(op.fill1(STAGE, npu.address("g", 8 * c * C * 2), C, 64))
     s.op(cols, {})
     npu.alloc("t", ROWS * 2 * D.Q)
     npu.write("t", op.image(taps.numpy(), None))
-    s.op({c: ColOps(sends=op.sends1(STAGE, CT), recvs=op.recvs()) for c in range(COLS)}, op.row_ops(npu.address("t")))
-    nbytes = C // 8 * 8 * L.PANEL
+    s.op({c: ColOps(sends=op.sends1(STAGE, CT, ct), recvs=op.recvs()) for c in range(COLS)}, op.row_ops(npu.address("t")))
+    nbytes = C // 8 * m // 8 * L.PANEL
     s.op(drains(npu, "y", nbytes, Y), {})
     npu.run(npu.transaction(s))
     yb = npu.read("y", COLS * nbytes).reshape(COLS, nbytes)
-    got = torch.stack([torch.from_numpy(L.from_panels(yb[c], 64, C)) for c in range(COLS)])
+    got = torch.stack([torch.from_numpy(L.from_panels(yb[c], m, C)) for c in range(COLS)])
     wq = taps.bfloat16().float()
-    conv = (wq[:, 0] * g[:-2] + wq[:, 1] * g[1:-1] + wq[:, 2] * g[2:]).bfloat16().float()
+    conv = sum(wq[:, j] * g[j:j + T] for j in range(ntap)).bfloat16().float()
     ref = (conv * cg).bfloat16().float()[order]
     blk = torch.zeros(C, dtype=torch.bool)
     for r in range(ROWS):
-        blk[80 * (3 * r + k):80 * (3 * r + k) + 80] = True
+        blk[80 * (nstep * r + k):80 * (nstep * r + k) + 80] = True
     assert _rel(got[..., blk], q(ref)[..., blk]) < 1e-3
 
 
@@ -991,3 +994,186 @@ def test_strip_conv2(npu: VisionDevice, lead: str) -> None:
             ref[c, i] = (sum(wq[:, dy, dx] * xs[2 * to + dy, 2 * fo + dx] for dy in range(3) for dx in range(3)) + bq)
     ref = ref.bfloat16().float()
     assert _rel(got, q(ref)) < 4e-3
+
+
+def test_gemm_rope40(npu: VisionDevice) -> None:
+    """The two-head RoPE epilogue of role e (``Gemm(out="rope40")``, m 16: LFM3-Audio's depthformer): per pass two heads
+    of 32 dims in 40 channels, each RMS-normed over its 32 times its weights (the pads zero), its NEOX pairs (k, 16 + k)
+    turned by the tile's table: within 8e-3 of torch on the bfp16-rounded operands' bf16 outputs."""
+    from artlite.vision.ops import ROPE40_TAB
+    torch.manual_seed(36)
+    m, K, N = 16, 1024, 1280
+    pads = torch.arange(40) >= 32
+    x = torch.randn(COLS * m, K)
+    w = torch.randn(N, K) / K ** 0.5
+    w.reshape(N // 40, 40, K)[:, pads] = 0
+    nw = (1 + 0.3 * torch.randn(40)) * ~pads
+    ang = torch.rand(COLS * m, 16) * 20
+    tab = torch.zeros(COLS * m, 80)
+    tab[:, :16], tab[:, 16:32] = torch.cos(ang), torch.sin(ang)
+    X, RES = 0, K // 8 * m // 8 * L.PANEL
+    Y = RES + ROPE40_TAB + D.A_OBJ
+    tabs = [L.ctiles(tab[c * m:(c + 1) * m], m)[:ROPE40_TAB] for c in range(COLS)]
+    g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, res=RES, out="rope40", qkn=torch.cat([nw, nw]).numpy(), qkn_n=32,
+             qkn_eps=1e-5)
+    s = npu.seq()
+    s.op(merge(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X), fills(npu, "r", tabs, RES)), {})
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, None))
+    ybytes = N // 8 * m // 8 * L.PANEL
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    y = torch.cat([torch.from_numpy(L.from_panels(yb[c], m, N)) for c in range(COLS)])
+    c0 = (q(x) @ q(w).T).bfloat16().float().reshape(-1, N // 40, 40)
+    c0 = c0 / torch.sqrt((c0 * c0).sum(-1, keepdim=True) / 32 + 1e-5) * nw.bfloat16().float()
+    c, sn = (t.bfloat16().float()[:, None] for t in (tab[:, :16], tab[:, 16:32]))
+    a, b = c0[..., :16], c0[..., 16:32]
+    ref = torch.cat([a * c - b * sn, b * c + a * sn, c0[..., 32:]], -1)
+    assert _rel(y, ref.reshape(-1, N)) < 8e-3 and float(y.reshape(-1, N // 40, 40)[..., pads].abs().max()) == 0
+
+
+@pytest.mark.parametrize("out", ["f32", "isig"])
+def test_gemm_epilogue_e(npu: VisionDevice, out: str) -> None:
+    """Role e's other epilogues (m 16): "f32" the fp32 C tile (+ bias) out as it is (within 1e-6 of torch on the
+    bfp16-rounded operands: the sums' order); "isig" 1 + 2^y as bf16 C tiles (LFM3's gate factors; y up to +-90:
+    saturating past +-63.5, within 1e-2 of torch below)."""
+    torch.manual_seed(37)
+    m, K, N = 16, 512, 640
+    x = torch.randn(COLS * m, K)
+    w = torch.randn(N, K) / K ** 0.5 * (1 if out == "f32" else 20)
+    b = torch.randn(N) * 0.3
+    X, Y = 0, K // 8 * m // 8 * L.PANEL
+    g = Gemm(m=m, ntile=1, K=K, N=N, x=X, y=Y, out=out)
+    s = npu.seq()
+    s.op(fills(npu, "x", [L.panels(x[c * m:(c + 1) * m]) for c in range(COLS)], X), {})
+    s.op({c: g.col_ops() for c in range(COLS)}, gemm_rows(npu, "w", g, w, b))
+    ybytes = N // 80 * (5760 if out == "f32" else L.ct_bytes(m))
+    s.op(drains(npu, "y", ybytes, Y), {})
+    npu.run(npu.transaction(s))
+    yb = npu.read("y", COLS * ybytes).reshape(COLS, ybytes)
+    u = q(x) @ q(w).T + b.bfloat16().float()
+    if out == "f32":
+        t = yb.reshape(COLS, N // 80, 5760)[..., :5120].copy().view(np.float32).reshape(COLS, N // 80, 2, 10, 8, 8)
+        y = torch.from_numpy(np.ascontiguousarray(t.transpose(0, 2, 4, 1, 3, 5)).reshape(COLS * m, N))
+        assert float((y - u).abs().max()) <= 1e-6 * float(u.abs().max())
+    else:
+        y = torch.cat([torch.from_numpy(L.from_ctiles(yb[c], m, N, m)) for c in range(COLS)])
+        ref = 1 + torch.exp2(u.clamp(max=63.5))
+        ok = u.abs() < 60
+        assert float(u.abs().max()) > 64 and _rel(y[ok], ref[ok]) < 1e-2 and bool(torch.isfinite(y).all())
+
+
+def test_depth_attention(npu: VisionDevice) -> None:
+    """The depthformer's attention on role c (``ops.DepthAttention``): 32 query heads on 8 KV heads of 32 dims in 40, the
+    keys column 0's first 12 tokens (drained into every unit's slot, unit u: KV head u % 8), every column's 16 queries
+    against them, each output over its head's gate factor 1 + e^-g (a bf16 C tile: times sigmoid(g)): within 1.5e-2 of
+    softmax attention on the bfp16-rounded operands."""
+    from artlite.vision.ops import DepthAttention
+    torch.manual_seed(38)
+    m, H, KVH, d, nk = 16, 32, 8, 40, 12
+    pads = torch.arange(d) >= 32
+    qs = torch.randn(COLS * m, H, d) * (1.4426950408889634 / 32 ** 0.5) * 2
+    k, v = torch.randn(2, m, KVH, d)
+    qs[..., pads], k[..., pads], v[..., pads] = 0, 0, 0
+    k[nk:], v[nk:] = 0, 0
+    gl = torch.randn(COLS * m, H) * 2
+    fac = torch.zeros(COLS * m, 80)
+    fac[:, :H] = 1 + torch.exp(-gl)
+    QA, KA = 0, H * d // 8 * 2 * L.PANEL + D.A_OBJ
+    VA = KA + KVH * d // 8 * 2 * L.PANEL
+    GA = VA + KVH * d // 8 * 2 * L.PANEL
+    OA = GA + L.ct_bytes(m)
+    JA = OA + H * d // 8 * 2 * L.PANEL
+    npu.alloc("kv", DepthAttention.kv_bytes())
+    npu.write("kv", np.zeros(DepthAttention.kv_bytes(), np.uint8))
+    at = DepthAttention(q=QA, o=OA, kv=npu.address("kv"), gate=GA, junk=JA, nk=nk)
+    s = npu.seq()
+    s.op(merge(fills(npu, "k", [L.panels(k.reshape(m, -1))] * COLS, KA),
+               fills(npu, "v", [L.vt_panels(v.reshape(m, -1))] * COLS, VA),
+               fills(npu, "q", [L.panels(qs[c * m:(c + 1) * m].reshape(m, -1)) for c in range(COLS)], QA),
+               fills(npu, "g", [L.ctiles(fac[c * m:(c + 1) * m], m) for c in range(COLS)], GA)), {})
+    for dr in at.kv_drains(KA, VA):
+        s.op(dr, {})
+    s.ddr_sync()
+    npu.alloc("acmd", D.Q)
+    npu.write("acmd", at.command())
+    s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(npu.address("acmd")))
+    nbytes = H * d // 8 * 2 * L.PANEL
+    s.op(drains(npu, "o", nbytes, OA), {})
+    npu.run(npu.transaction(s))
+    ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
+    o = torch.cat([torch.from_numpy(L.from_panels(ob[c], m, H * d)) for c in range(COLS)]).reshape(-1, H, d)
+    kq = q(k.reshape(m, -1)).reshape(m, KVH, d)[:nk]
+    vq = q(v.reshape(m, -1)[:8].T).T.reshape(8, KVH, d)
+    vq = torch.cat([vq, q(v.reshape(m, -1)[8:].T).T.reshape(8, KVH, d)])[:nk]
+    qq = q(qs.reshape(COLS * m, -1)).reshape(-1, H, d)
+    sc = torch.einsum("thd,khd->thk", qq, kq[:, torch.arange(H) % KVH])
+    p = torch.exp2(sc - sc.amax(-1, keepdim=True))
+    ref = torch.einsum("thk,khd->thd", p, vq[:, torch.arange(H) % KVH]) / p.sum(-1, keepdim=True) / \
+        fac[:, :H].bfloat16().float()[..., None]
+    assert _rel(o, ref) < 1.5e-2 and float(o[..., pads].abs().max()) == 0
+
+
+@pytest.mark.parametrize("start", [True, False])
+def test_win_attention_gated(npu: VisionDevice, start: bool) -> None:
+    """The gated window attention (``ops.WinAttention`` with ``gate``, role g: LFM3-Audio's codec decoder, 8 query heads on
+    2 KV heads of 64 in 160 (each KV head twice: the rows' 4), a window of 30) on a band of 128 rows in tiles of 16 (2
+    units): each query over the keys t - 29 .. t, over its head's gate factor 1 + e^-g (a bf16 C tile: times sigmoid(g)):
+    within 1.5e-2 of softmax attention on the bfp16-rounded operands."""
+    from artlite.vision.ops import WinAttention
+    torch.manual_seed(39)
+    d, T, H, KVH, W, m = 160, 128, 8, 4, 30, 16
+    pads = torch.arange(d) >= 64
+    qs = torch.randn(T, H, d) * (1.4426950408889634 / 64 ** 0.5) * 2
+    k2, v2 = torch.randn(2, 32 + T, 2, d)
+    k, v = k2.repeat_interleave(2, 1), v2.repeat_interleave(2, 1)  # (KV head r // 2 for row r)
+    qs[..., pads], k[..., pads], v[..., pads] = 0, 0, 0
+    gl = torch.randn(T, H) * 2
+    fac = torch.zeros(T, 80)
+    fac[:, :H] = 1 + torch.exp(-gl)
+    order = torch.tensor([64 * j + 8 * c + i for c in range(COLS) for j in range(m // 8) for i in range(8)]).reshape(COLS, m)
+    QA = 0
+    KA = QA + H * d // 8 * 2 * L.PANEL + D.A_OBJ
+    VA = KA + KVH * d // 8 * 2 * L.PANEL
+    MA = VA + KVH * d // 8 * 2 * L.PANEL
+    GA = MA + 256 + D.A_OBJ // 2
+    OA = GA + L.ct_bytes(m)
+    img = WinAttention.kv_image(2)
+    npu.alloc("kv", img)
+    npu.write("kv", np.zeros(img, np.uint8))
+    at = WinAttention(q=QA, o=OA, mask=MA, kv=npu.address("kv"), units=2, np=2, gate=GA, kv_head_bytes=img // ROWS)
+    st = L.kv_slots(torch.cat([k[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1),
+                    torch.cat([v[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1))
+    st = st.reshape(2, 8, 2 * D.Q)[0]
+    for h in range(KVH):  # (the previous dispatch's last group: unit 0, slot 1)
+        npu.write("kv", st[h], h * img // ROWS + 2 * D.Q)
+    s = npu.seq()
+    rows = [order[c] for c in range(COLS)]
+    s.op(merge(fills(npu, "k", [L.panels(k[32:][r].reshape(m, -1)) for r in rows], KA),
+               fills(npu, "v", [L.vt_panels(v[32:][r].reshape(m, -1)) for r in rows], VA),
+               fills(npu, "q", [L.panels(qs[r].reshape(m, -1)) for r in rows], QA),
+               fills(npu, "m", [WinAttention.masks(c, 2, start, W).view(np.uint8).reshape(-1) for c in range(COLS)], MA),
+               fills(npu, "g", [L.ctiles(fac[r], m) for r in rows], GA)), {})
+    s.op({c: at.kv_drains(KA, VA, c, 0, npu.address("kv")) for c in range(COLS)}, {})
+    s.ddr_sync()
+    npu.alloc("acmd", D.Q)
+    npu.write("acmd", at.command())
+    s.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(npu.address("acmd"), 0))
+    nbytes = H * d // 8 * 2 * L.PANEL
+    s.op(drains(npu, "o", nbytes, OA), {})
+    npu.run(npu.transaction(s))
+    ob = npu.read("o", COLS * nbytes).reshape(COLS, nbytes)
+    o = torch.zeros(T, H * d)
+    for c in range(COLS):
+        o[order[c]] = torch.from_numpy(L.from_panels(ob[c], m, H * d))
+    kq = q(k.reshape(32 + T, -1)).reshape(32 + T, KVH, d)
+    vq = torch.cat([q(v.reshape(32 + T, -1)[i:i + 8].T).T for i in range(0, 32 + T, 8)]).reshape(32 + T, KVH, d)
+    ref = torch.zeros(T, H, d)
+    qq = q(qs.reshape(T, -1)).reshape(T, H, d)
+    for t in range(T):
+        lo = max(t - W + 1, 0 if start else -32) + 32
+        for h in range(H):
+            sc = kq[lo:t + 33, h // 2] @ qq[t, h]
+            p = torch.exp2(sc - sc.max())
+            ref[t, h] = (p @ vq[lo:t + 33, h // 2]) / p.sum() / fac[t, h].bfloat16().float()
+    assert _rel(o, ref.reshape(T, -1)) < 1.5e-2

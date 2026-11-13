@@ -400,20 +400,20 @@ class Net:
                   for col in range(COLS)}, release=[(g, gb)])
         bd.flush()
         y = alloc(bd, lv, C, "pn")
-        st = bd.mem.alloc(2 * StripConv.STAGE1)
+        st = bd.mem.alloc(2 * StripConv.stage1(3))
         bd.reading(gname)
         ops = [StripConv(mode=1, y=y.addr, off=(0, 80, 160), blocks=tuple(3 * r + k for r in range(ROWS))) for k in range(3)]
 
         def fills(k: int) -> dict[int, ColOps]:  # (panel j's strip: G rows 64 j + 8 c - 2 .. at index 64 j + 8 c)
-            return {col: ColOps(fills=[ops[k].fill1(st + (k % 2) * StripConv.STAGE1, ga + 8 * col * G_ROW, C, 64)])
+            return {col: ColOps(fills=[ops[k].fill1(st + (k % 2) * StripConv.stage1(3), ga + 8 * col * G_ROW, C, 64)])
                     for col in range(COLS)}
         bd.op(fills(0), {})
         for k, op in enumerate(ops):
             img = bd.image(f"{name}.dw{k}", op.image(w["taps"], None))
-            cols = {col: ColOps(sends=op.sends1(st + (k % 2) * StripConv.STAGE1, c.addr), recvs=op.recvs())
+            cols = {col: ColOps(sends=op.sends1(st + (k % 2) * StripConv.stage1(3), c.addr), recvs=op.recvs())
                     for col in range(COLS)}
             bd.op(bd.merge(cols, fills(k + 1)) if k < 2 else cols, op.row_ops(img))
-        bd.mem.release(st, 2 * StripConv.STAGE1)
+        bd.mem.release(st, 2 * StripConv.stage1(3))
         free(bd, c)
         rec = gemm(bd, Tensor(lv, H, y.addr, "pn", pnp=y.np), w["out"], None, name=name + ".out", out=x, res=x, ln=True)
         free(bd, y)

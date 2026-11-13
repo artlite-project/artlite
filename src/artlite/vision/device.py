@@ -38,7 +38,7 @@ def role_pages(work_dir: str) -> paging.Pager:
     return paging.link(work_dir, pages=pages, pager=f"{p}_pg_self",
                        calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES),
                               f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu", f"{p}_ext_r", f"{p}_swiglu", f"{p}_prod",
-                                            f"{p}_silu_pn")},
+                                            f"{p}_silu_pn", f"{p}_ext_e")},
                        roots=(f"{p}_main",), stack=D.STACK, cores=[(c, r + 2) for c in range(COLS) for r in range(ROWS)],
                        state=D.L1["ext"], wake=D.L_WAKE)
 
