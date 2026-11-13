@@ -212,8 +212,8 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
                     yield "data: " + json.dumps({"type": "speech.audio.delta",
                                                  "audio": base64.b64encode(pcm16(x)).decode()}) + "\n\n"
                 elif kind == "done":
-                    yield "data: " + json.dumps({"type": "speech.audio.done", "usage": {
-                        "input_tokens": 0, "output_tokens": x.frames, "total_tokens": x.frames}}) + "\n\n"
+                    use = {"input_tokens": x.prompt, "output_tokens": x.frames, "total_tokens": x.prompt + x.frames}
+                    yield "data: " + json.dumps({"type": "speech.audio.done", "usage": use}) + "\n\n"
                 else:
                     yield "data: " + json.dumps({"type": "error", "error": {"message": x}}) + "\n\n"
         return SpeechStream(events(), cancel, "text/event-stream")
@@ -283,14 +283,15 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
             [m for m in msgs if m.get("role") != "system"]
     seed = body.get("seed")
     max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or 1024)
+    mode = "audio" if "text" not in (body.get("modalities") or []) else "mixed"  # (["audio"]: speech, then text)
     model = engine.model
     cid, aid, created = f"chatcmpl-{secrets.token_hex(16)}", f"audio_{secrets.token_hex(12)}", int(time.time())
     head = {"created": created, "id": cid, "model": alias}
 
     def produce(push: Callable[[tuple[str, Any]], None], cancel: threading.Event) -> None:
         dec, st, n = StreamDecoder(model.tokenizer), SpeechStats(), 0
-        for kind, x in model.voice_reply(msgs, seed=None if seed is None else int(seed), max_tokens=max_tokens,
-                                         stats=st):
+        for kind, x in model.voice_reply(msgs, mode=mode, seed=None if seed is None else int(seed),
+                                         max_tokens=max_tokens, stats=st):
             if cancel.is_set():
                 break
             if kind == "text":
@@ -311,7 +312,8 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
                 return
 
     def usage(st: SpeechStats, n: int) -> dict[str, Any]:
-        return {"prompt_tokens": 0, "completion_tokens": n + st.frames, "total_tokens": n + st.frames,
+        out = n + st.frames
+        return {"prompt_tokens": st.prompt, "completion_tokens": out, "total_tokens": st.prompt + out,
                 "completion_tokens_details": {"text_tokens": n, "audio_tokens": st.frames}}
 
     if not stream:

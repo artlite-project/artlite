@@ -162,6 +162,23 @@ def image_bytes(url: object) -> bytes:
         raise bad_request("an image_url's base64 data does not decode") from None
 
 
+def video_bytes(part: dict[str, Any]) -> bytes:
+    """An ``input_video`` / ``video_url`` part's video (llama-server's: ``data`` or ``url``, a data URL or base64)."""
+    v = part.get(part.get("type")) or {}
+    u = v.get("data") or v.get("url") if isinstance(v, dict) else v
+    if not isinstance(u, str) or not u:
+        raise bad_request(f"a {part.get('type')} part without data (a data URL or base64)")
+    try:
+        return data_bytes(u) if u.startswith("data:") else base64.b64decode(u, validate=True)
+    except ValueError:
+        raise bad_request(f"a {part.get('type')} part's data does not decode") from None
+
+
+def takes_video(model: object) -> bool:
+    """Whether a model takes videos (LFM3-VL's towers: ``models.lfm.lfm.Lfm.video_sequence``)."""
+    return getattr(model, "vision", None) is not None and hasattr(model, "video_sequence")
+
+
 def bad_request(message: str) -> ApiError:
     return ApiError(400, "invalid_request_error", message)
 
@@ -503,11 +520,14 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     def messages_of(messages: list[Message], *, media: bool = False) -> list[dict[str, object]]:
         """The messages for the chat template: content as text parts if the template takes them (else joined by
         newlines), with images (``image_url`` parts of data URIs, a model with a vision encoder) as parts
-        ``{"type": "image", "image": bytes}`` and audio clips (``input_audio`` parts, ``audio_url`` ones of data URIs,
-        a model with a speech encoder) as parts ``{"type": "audio", "audio": bytes}`` among the text parts; ``media``:
-        images and clips as the text ``MEDIA_MARKER`` (the template's text alone)."""
+        ``{"type": "image", "image": bytes}``, audio clips (``input_audio`` parts, ``audio_url`` ones of data URIs,
+        a model with a speech encoder) as parts ``{"type": "audio", "audio": bytes}`` and videos (``input_video`` /
+        ``video_url`` parts, a model that takes them: ``takes_video``) as ``{"type": "video", "video": bytes}`` among
+        the text parts; ``media``: images, clips and videos as the text ``MEDIA_MARKER`` (the template's text
+        alone)."""
         out = []
         vision, audio = engine.model.vision is not None, engine.model.audio is not None
+        video = takes_video(engine.model)
         for m in messages:
             if m.role not in ROLES:
                 raise bad_request(f"message role {m.role!r} (one of {', '.join(ROLES)})")
@@ -525,11 +545,15 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     elif kind in ("input_audio", "audio_url") and audio:
                         parts.append({"type": "text", "text": MEDIA_MARKER} if media else
                                      {"type": "audio", "audio": audio_clip(part)})
+                    elif kind in ("input_video", "video_url") and video:
+                        parts.append({"type": "text", "text": MEDIA_MARKER} if media else
+                                     {"type": "video", "video": video_bytes(part)})
                     else:
-                        takes = [n for n, ok in (("images (image_url)", vision), ("audio (input_audio)", audio)) if ok]
+                        takes = [n for n, ok in (("images (image_url)", vision), ("audio (input_audio)", audio),
+                                                 ("videos (input_video)", video)) if ok]
                         raise bad_request(f"content of type {kind!r} is not supported: this server's model takes "
                                           f"text{' and ' + ' and '.join(takes) if takes else ' only'}")
-                content = parts if typed or any(p["type"] in ("image", "audio") for p in parts) else \
+                content = parts if typed or any(p["type"] in ("image", "audio", "video") for p in parts) else \
                     "\n".join(p["text"] for p in parts)
             d: dict[str, object] = {**(m.model_extra or {}), "role": role, "content": content or ""}
             if m.reasoning_content:
@@ -592,7 +616,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
             def chat() -> list[int]:
                 return engine.model.chat(msgs, think=think, tools=tools, preserve=preserve, variables=variables)
 
-            if any(p.get("type") in ("image", "audio") for m in msgs if isinstance(m["content"], list)
+            if any(p.get("type") in ("image", "audio", "video") for m in msgs if isinstance(m["content"], list)
                    for p in m["content"]):  # (an encoder on the NPU: between the worker's jobs)
                 return await asyncio.wrap_future(engine.run(chat))
             return await run_in_threadpool(chat)
@@ -613,7 +637,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                 return ids, think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
-        except (OSError, ValueError) as e:  # (an image that does not open, or does not fit the prompt)
+        except (OSError, ValueError) as e:  # (an image or video that does not open, or does not fit the prompt)
             raise bad_request(str(e)) from None
 
     def inside(ids: list[int]) -> bool:
@@ -795,7 +819,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                     default_think()))},
                 "total_slots": 1, "model_alias": options.alias, "model_path": info.path,
                 "modalities": {"vision": engine.model.vision is not None, "audio": engine.model.audio is not None,
-                               "video": False},
+                               "video": takes_video(engine.model)},
                 **({"voices": list(VOICES)} if speaks(engine) else {}),
                 "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
                 "ui": options.ui is not None, "ui_settings": {},
@@ -810,6 +834,7 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
     async def models() -> dict[str, Any]:
         name, vision = options.alias, engine.model is not None and engine.model.vision is not None
         audio = engine.model is not None and engine.model.audio is not None
+        video = engine.model is not None and takes_video(engine.model)
         return {"object": "list",
                 "models": [{"name": name, "model": name, "modified_at": "", "size": "", "digest": "", "type": "model",
                             "description": "", "tags": [""],
@@ -818,7 +843,8 @@ def create_app(engine: Engine, options: Options, info: ModelInfo) -> FastAPI:
                             "details": {"parent_model": "", "format": "gguf", "family": "", "families": [""],
                                         "parameter_size": "", "quantization_level": ""}}],
                 "data": [{"id": name, "aliases": [], "tags": [], "object": "model",
-                          "architecture": {"input_modalities": ["text"] + ["image"] * vision + ["audio"] * audio,
+                          "architecture": {"input_modalities": ["text"] + ["image"] * vision + ["audio"] * audio +
+                                           ["video"] * video,
                                            "output_modalities": ["decisions" if info.decision else "text"] +
                                            ["audio"] * (engine.model is not None and speaks(engine))},
                           "created": int(time.time()), "owned_by": "artlite",

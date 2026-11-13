@@ -182,9 +182,10 @@ def sample_frame(depth: Any, h: np.ndarray, sampler: CodeSampler) -> np.ndarray:
 
 @dataclass
 class SpeechStats:
-    """A generation's frames and seconds: the depthformer's (``t_depth``), the codec's and the ISTFT's (``t_codec``),
-    the language model's steps (``t_steps``)."""
+    """A generation's prompt tokens (``prompt``), frames and seconds: the depthformer's (``t_depth``), the codec's and
+    the ISTFT's (``t_codec``), the language model's steps (``t_steps``)."""
 
+    prompt: int = 0
     frames: int = 0
     t_depth: float = 0.0
     t_codec: float = 0.0

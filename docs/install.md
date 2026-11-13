@@ -19,6 +19,7 @@ The NPU reads the weights from system memory, so a model needs about its file's 
 | libdrm | the runtime's build links it (`pkg-config libdrm`) |
 | CMake 3.20 or newer, a C++23 compiler (GCC 13+, Clang 17+) | the runtime and its Python bindings |
 | Python 3.12 to 3.14 (the toolchain wheels' versions), [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
+| FFmpeg (optional) | videos in prompts ([LFM3-VL, LFM3-Omni](models/lfm3.md#videos)): `ffmpeg` and `ffprobe` on PATH read their frames and soundtrack, with llama.cpp's commands (llama.cpp's video input needs them too); without them a video is an error that names them |
 
 `uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed.
 

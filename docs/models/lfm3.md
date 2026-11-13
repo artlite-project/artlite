@@ -139,6 +139,23 @@ a few tokens are further off (up to ~0.8 of their norm): patches whose values ne
 which then scales up their small errors. The language model hardly notices: teacher-forced over a description of an image, its answer stays as close to llama.cpp's own
 (KL 0.0007, argmax agreement 1.0) as with llama.cpp's own image embeddings (KL 0.0005).
 
+### Videos
+
+```bash
+artlite-cli -m LiquidAI/LFM3-VL-2B-GGUF/LFM3-VL-2B-QAD-Q4_0.gguf \
+    --mmproj LiquidAI/LFM3-VL-2B-GGUF/mmproj-LFM3-VL-2B-BF16.gguf --video clip.mp4 -p "What happens in the video?"
+```
+
+A video (`--video`, artlite-server's `input_video` / `video_url` parts) needs FFmpeg's `ffmpeg` and `ffprobe` on PATH,
+which read its frames and its soundtrack with llama.cpp's commands, so that a prompt is llama-server's for the same
+file (its frames bit for bit, its token ids). As transformers' and llama.cpp's processors sample a video: 2 frames a
+second, at least 4 and at most 768 (LFM3-Omni-2B, which hears the soundtrack: 384), all at one size whose pixels over
+every frame stay under ~25 Mpx (a 30 s 720p video's frames are 832 x 480); consecutive frames in pairs, each pair one
+"image" whose two frames the encoder's patch embedding takes together, after a timestamp (`<0.5 seconds>`). LFM3-Omni
+hears the soundtrack too: it is encoded as one clip and its rows go after the pair they belong to. A pair runs on the
+vision overlay as an image of its size does (a 640 x 360 video's pairs: 35 ms each; 960 x 540: 70 ms); a frame over
+the encoder's largest image (4096 tokens: a 4K video under 3 s) takes an image's size, which llama.cpp does not cap.
+
 ## LFM3-Audio-2B (speech)
 
 ```bash

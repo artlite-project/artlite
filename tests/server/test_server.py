@@ -146,12 +146,19 @@ class FakeVision(FakeModel):
         for m in messages:
             text += f"<|{m['role']}|>"
             for part in m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]:
-                if part["type"] in ("image", "audio"):
-                    enc = self.vision if part["type"] == "image" else self.audio
+                if part["type"] in ("image", "audio", "video"):
+                    enc = self.audio if part["type"] == "audio" else self.vision
                     seq, text = seq + self.tokenizer.encode(text) + enc.sequence(part[part["type"]]), ""
                 else:
                     text += str(part["text"])
         return seq + self.tokenizer.encode(text + "<|assistant|>")
+
+
+class FakeVideo(FakeVision):
+    """A model that takes videos too (``models.lfm.lfm.Lfm.video_sequence``'s presence; a video's bytes as two rows)."""
+
+    def video_sequence(self, video: bytes) -> Sequence:
+        return self.vision.sequence(video)
 
 
 class FakeAudio(FakeVision):
@@ -940,6 +947,37 @@ def test_images() -> None:
         assert prompt == f"<s><|user|>look\n{MEDIA_MARKER}\nwhat is it<|assistant|>"
 
 
+def test_videos() -> None:
+    """input_video parts (llama-server's: data, base64 or a data URL) and video_url ones reach the model's chat as video
+    parts on the NPU worker; video in /props and /v1/models; a model without video input refuses them."""
+    clip = b"mp4" * 8
+    parts = [{"type": "input_video", "input_video": {"data": base64.b64encode(clip).decode()}},
+             {"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(clip).decode()}}]
+    model, _npu, engine = make(vision=True)
+    model.__class__ = FakeVideo
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        for part in parts:
+            b = chat(client, [{"role": "user", "content": [part, {"type": "text", "text": "what happens"}]}])
+            assert b.status_code == 200
+            video = next(p for p in model.rendered[0][0]["content"] if p["type"] == "video")
+            assert video["video"] == clip
+        assert model.threads == ["artlite-npu"] * 2
+        bad = {"type": "input_video", "input_video": {"data": "not base64!"}}
+        assert chat(client, [{"role": "user", "content": [bad]}]).status_code == 400
+        assert client.get("/props").json()["modalities"]["video"] is True
+        m = client.get("/v1/models").json()
+        assert m["data"][0]["architecture"]["input_modalities"] == ["text", "image", "video"]
+        prompt = client.post("/apply-template", json={"messages": [{"role": "user", "content": [parts[0]]}]}).json()
+        assert MEDIA_MARKER in prompt["prompt"]
+    model, _npu, engine = make(vision=True)
+    with TestClient(app_of(engine)) as client:
+        assert engine.wait_ready(5)
+        r = chat(client, [{"role": "user", "content": [parts[0]]}])
+        assert r.status_code == 400 and "images (image_url)" in r.json()["error"]["message"]
+        assert client.get("/props").json()["modalities"]["video"] is False
+
+
 def test_images_refused(fake: tuple) -> None:
     """A model without a vision encoder refuses images."""
     client = fake[3]
@@ -1438,6 +1476,8 @@ class FakeSpeaker(FakeAudio):
         """Interleaved: the words " hello" " there", 2 chunks of 480 samples between them; the messages recorded."""
         self.spoken.append({"messages": messages, **kw})
         st = kw.get("stats")
+        if st is not None:
+            st.prompt = 7
         yield "text", self.tokenizer.id(" hello")
         for i in range(2):
             if st is not None:
@@ -1448,6 +1488,8 @@ class FakeSpeaker(FakeAudio):
     def tts(self, text: str, **kw: object) -> Iterator[np.ndarray]:
         self.spoken.append({"text": text, **kw})
         st = kw.get("stats")
+        if st is not None:
+            st.prompt = 5
         for i in range(3):
             if st is not None:
                 st.frames += 1
@@ -1492,7 +1534,7 @@ def test_speech() -> None:
         pcm = np.concatenate([np.frombuffer(base64.b64decode(e["audio"]), "<i2") for e in ev
                               if isinstance(e, dict) and e["type"] == "speech.audio.delta"])
         assert np.array_equal(pcm, want) and ev[-1] == {"type": "speech.audio.done", "usage": {
-            "input_tokens": 0, "output_tokens": 3, "total_tokens": 3}}
+            "input_tokens": 5, "output_tokens": 3, "total_tokens": 8}}
         for body, word in (({"input": "x", "response_format": "mp3"}, "no encoder"), ({"input": "x", "voice": "alloy"},
                            "female, male"), ({"input": "x", "speed": 1.5}, "speed")):
             r = client.post("/v1/audio/speech", json=body)
@@ -1510,7 +1552,8 @@ def test_speech_refused(fake: tuple) -> None:
 
 
 def test_chat_audio() -> None:
-    """Chat completions with audio output (modalities text and audio): the spoken reply's transcript and its WAV (or
+    """Chat completions with audio output (modalities text and audio: interleaved; audio alone: speech first): the
+    spoken reply's transcript and its WAV (or
     pcm16) in message.audio, streamed as delta.audio pieces; a later turn's assistant message with that audio id goes to
     the model as its transcript; an unknown voice or format: 400."""
     model = FakeSpeaker()
@@ -1529,6 +1572,7 @@ def test_chat_audio() -> None:
         data = base64.b64decode(m["audio"]["data"])
         assert data[:4] == b"RIFF" and np.array_equal(np.frombuffer(data[44:], "<i2"), want)
         assert r.json()["usage"]["completion_tokens_details"] == {"text_tokens": 2, "audio_tokens": 2}
+        assert r.json()["usage"]["prompt_tokens"] == 7
         ev = events(client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"],
                                                                "audio": {"voice": "female", "format": "pcm16"},
                                                                "stream": True}))
@@ -1539,7 +1583,9 @@ def test_chat_audio() -> None:
         turn = msgs + [{"role": "assistant", "audio": {"id": m["audio"]["id"]}}, {"role": "user", "content": "more"}]
         client.post("/v1/chat/completions", json={"messages": turn, "modalities": ["text", "audio"]})
         seen = model.spoken[-1]["messages"]
-        assert [x["content"] for x in seen] == ["hi", " hello there", "more"]
+        assert [x["content"] for x in seen] == ["hi", " hello there", "more"] and model.spoken[-1]["mode"] == "mixed"
+        client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["audio"]})
+        assert model.spoken[-1]["mode"] == "audio"  # (speech, then text: <|audio_start|>)
         for audio, word in (({"voice": "alloy"}, "female, male"), ({"format": "mp3"}, "wav or pcm16")):
             r = client.post("/v1/chat/completions", json={"messages": msgs, "modalities": ["text", "audio"], "audio": audio})
             assert r.status_code == 400 and word in r.json()["error"]["message"]

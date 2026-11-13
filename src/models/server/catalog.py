@@ -47,7 +47,7 @@ from .main import ENV, FILES, MODEL, ROUTER, env_name
 
 log = logging.getLogger("artlite.server")
 
-VERSION = 3  # of the cache file (a header's fields)
+VERSION = 4  # of the cache file (a header's fields)
 DRAFTERS = ("mtp-", "dspark-", "dflash-", "eagle3-")
 SPLIT = re.compile(r"-(\d{5})-of-\d{5}$")
 TAG = re.compile(r"[-.]([A-Za-z0-9_]+)$")
@@ -59,8 +59,9 @@ TRUE, FALSE = ("1", "true", "on", "yes", "enabled"), ("0", "false", "off", "no",
 @dataclass
 class Entry:
     """A model the router serves: its ``id`` in the API, its file and what the router reads of it (``header``), its
-    vision or speech encoder's file (None: text only) and what it takes (``media``: ``image``, ``audio``), the other names that resolve to it (``names``, ``aliases``), its server's
-    options (dest -> value) and where it comes from (``models_dir``, ``preset``)."""
+    vision or speech encoder's file (None: text only) and what it takes and gives (``media``: ``image``, ``audio``,
+    ``video``, ``speech``), the other names that resolve to it (``names``, ``aliases``), its server's options (dest ->
+    value) and where it comes from (``models_dir``, ``preset``)."""
 
     id: str
     path: str
@@ -90,8 +91,8 @@ class Entry:
 
 
 def header(path: str) -> dict[str, Any]:
-    """What the router reads of a GGUF file: its architecture; an encoder's projector types (vision's, speech's) and
-    width; a model's
+    """What the router reads of a GGUF file: its architecture; an encoder's projector types (vision's, speech's), width
+    and whether it holds a speech generator; a model's
     context, sizes and file type, its decision type (``{arch}.decision.type``, or None) and the types of its matrices
     that have no tile format (``unsupported``)."""
     from ..bench import file_type_name
@@ -104,6 +105,7 @@ def header(path: str) -> dict[str, Any]:
             vision = ""
         audio = str(meta.get("clip.audio.projector_type", "")) if meta.get("clip.has_audio_encoder") else ""
         return {"arch": arch, "projector": vision, "audio": audio,
+                "speech": bool(meta.get("clip.has_gen_audio_encoder")),
                 "projection_dim": int(meta.get("clip.vision.projection_dim", meta.get("clip.audio.projection_dim", 0)))}
     tensors = g.tensor_info.values()
     return {"arch": arch, "n_ctx_train": int(meta.get(f"{arch}.context_length", 0)),
@@ -419,12 +421,14 @@ class Catalog:
         return min(fit, key=lambda p: (len(os.path.basename(p)), p)) if fit else None
 
     def _media(self, mmproj: str) -> list[str]:
-        """What an encoder file takes: ``image``, ``audio`` (both: ``image`` when its header cannot be read)."""
+        """What an encoder file takes and gives: ``image``, ``audio``, ``video`` (an LFM3-VL tower), ``speech`` (a speech
+        generator: audio out); ``image`` when its header cannot be read."""
         try:
             h = self._header(mmproj)
         except (OSError, ValueError, AssertionError, KeyError):
             return ["image"]
-        return ["image"] * bool(h.get("projector")) + ["audio"] * bool(h.get("audio"))
+        return ["image"] * bool(h.get("projector")) + ["audio"] * bool(h.get("audio")) + \
+            ["video"] * (h.get("projector") == "lfm3vl") + ["speech"] * bool(h.get("speech"))
 
     # ------------------------------------------------------------------
     # Names

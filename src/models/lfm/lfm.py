@@ -237,6 +237,8 @@ class Lfm(Model):
             raise ValueError(f"{self.name}: load the model first")
         npu = self._npu
         ids = self.encode(a_speech.tts_prompt(self.gguf, text, language=language, voice=voice))
+        if stats is not None:
+            stats.prompt = len(ids)
         npu.reset()
         h = npu.outputs(ids, at=[-1])[0]
         sampler = a_speech.CodeSampler(self.audio.gen, seed)
@@ -263,6 +265,8 @@ class Lfm(Model):
         toks = a_speech.speech_tokens(self.gguf.strings("tokenizer.ggml.tokens"))
         opener = {"mixed": [toks[a_speech.MIXED_START]], "audio": [toks[a_speech.AUDIO_START]]}.get(mode, [])
         prompt = self.chat(messages) + opener
+        if stats is not None:
+            stats.prompt = len(prompt)
         npu.reset()
         logits, h = None, None
         if mode == "audio":

@@ -8,13 +8,13 @@ options follow llama.cpp's ``llama-cli`` where it has an equivalent, the image o
         --mmproj openbmb/MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf --image photo.jpg -p "Describe the image."
     artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "..." -o image.png
 
-Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image`` and ``--audio`` files (a
-model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them (``--audio`` alone:
-a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then sampled until an
-end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed report to
-stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr. Speech (``--tts``: LFM3-Audio
-with its mmproj, as llama.cpp's ``llama-tts``): the WAV goes to ``-o`` (default output.wav), the frames, the speech's
-length and the times to stderr.
+Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image``, ``--video`` and
+``--audio`` files (a model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them
+(``--audio`` alone: a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then
+sampled until an end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed
+report to stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr. Speech (``--tts``:
+LFM3-Audio's or LFM3-Omni's model with its mmproj, as llama.cpp's ``llama-tts``): the WAV goes to ``-o`` (default
+output.wav), the frames, the speech's length and the times to stderr.
 """
 
 import argparse
@@ -97,6 +97,10 @@ def arg_parser() -> argparse.ArgumentParser:
     vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf)")
     vis.add_argument("--image", action="append", default=[],
                      help=f"an image file (repeatable): where the prompt has {MEDIA_MARKER}, else before it")
+    vis.add_argument("--video", action="append", default=[],
+                     help=f"a video file (repeatable; LFM3-VL's and LFM3-Omni's mmproj; FFmpeg's ffmpeg and ffprobe on "
+                          f"PATH): where the prompt has {MEDIA_MARKER}, else before it, after the images; LFM3-Omni hears "
+                          "its soundtrack")
     vis.add_argument("--max-slices", type=int,
                      help="an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36)")
     vis.add_argument("--image-min-tokens", type=int,
@@ -115,8 +119,8 @@ def arg_parser() -> argparse.ArgumentParser:
     spk = p.add_argument_group("speech out (LFM3-Audio)")
     spk.add_argument("--tts", metavar="TEXT", help="speak the text (the model's tts template) into the WAV file -o")
     spk.add_argument("--voice", default="female", choices=("female", "male"), help="the voice (default: female)")
-    spk.add_argument("--speak", metavar="WAV", help="answer -p / -f / --audio in interleaved text and speech: the text "
-                     "to stdout as it comes, the speech into this WAV file")
+    spk.add_argument("--speak", metavar="WAV", help="answer -p / -f and the --image / --video / --audio files in "
+                     "interleaved text and speech: the text to stdout as it comes, the speech into this WAV file")
     img = p.add_argument_group("images (a diffusers directory)")
     img.add_argument("--negative-prompt", default="", help="what the image should not show (default: none)")
     img.add_argument("--steps", type=int, default=20, help="sampling steps (default: 20)")
@@ -218,11 +222,12 @@ def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
         if not hasattr(model, "voice_reply"):
             raise ValueError(f"{model.name}: no speech output (LFM3-Audio's model and its mmproj)")
         text = prompt_text(args) if args.prompt is not None or args.file else ""
-        content: list[dict[str, object]] = [{"type": "audio", "audio": a} for a in args.audio]
+        content: list[dict[str, object]] = [{"type": "image", "image": im} for im in args.image] + \
+            [{"type": "video", "video": v} for v in args.video] + [{"type": "audio", "audio": a} for a in args.audio]
         if text:
             content.append({"type": "text", "text": text})
         if not content:
-            raise ValueError("--speak answers -p / -f or --audio files")
+            raise ValueError("--speak answers -p / -f, or --image, --video, --audio files")
         msgs = ([{"role": "system", "content": args.system_prompt}] if args.system_prompt else []) + \
             [{"role": "user", "content": content}]
         npu = model.load(capacity=args.ctx_size or 8192, prefill=not args.no_prefill)
@@ -323,10 +328,10 @@ def main(argv: list[str] | None = None) -> None:
         text = prompt_text(args)
         template = template_option(args.chat_template, args.chat_template_file)
         model = open_model(args.model, chat_template=template, **{k: v for k, v in options.items() if v is not None})
-        asr = bool(args.audio) and args.prompt is None and not args.file
+        asr = bool(args.audio) and not args.video and args.prompt is None and not args.file
         system = args.system_prompt or (asr_system(args.language) if asr else None)
         ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
-                           variables=variables)
+                           videos=args.video, variables=variables)
         sampling = model.sampling(think=args.think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
                  "repeat_last_n": args.repeat_last_n, "presence_penalty": args.presence_penalty,
@@ -337,9 +342,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"artlite-cli: the chat template failed: {e}")
     except (OSError, ValueError, NotImplementedError) as e:
         sys.exit(f"artlite-cli: {e}")
-    if model.vision is not None and args.image:
+    if model.vision is not None and (args.image or args.video):
         v = model.vision
-        sys.stderr.write(f"{len(args.image)} image(s): {v.entries} entries through the encoder in {v.t_encode:.2f} s "
+        what = ", ".join(f"{n} {k}" for n, k in ((len(args.image), "image(s)"), (len(args.video), "video(s)")) if n)
+        sys.stderr.write(f"{what}: {v.entries} entries through the encoder in {v.t_encode:.2f} s "
                          f"({1e3 * v.t_encode / max(v.entries, 1):.0f} ms each)\n")
     if model.audio is not None and args.audio:
         a = model.audio

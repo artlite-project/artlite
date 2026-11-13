@@ -33,13 +33,21 @@ CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
 
 def write_gguf(path: str, *, arch: str = "llama", n_embd: int = 64,
                qtype: GGMLQuantizationType = GGMLQuantizationType.Q4_0, projector: str = "minicpmv4_7",
-               audio: str | None = None) -> str:
+               audio: str | None = None, omni: bool = False) -> str:
     """A small GGUF file: a model of ``arch`` with one matrix of ``qtype``, or a vision encoder (``arch="clip"``; with
-    ``audio``: a speech encoder of that projector instead); written next to the path and moved there (a server may have
-    the old one mapped)."""
+    ``audio``: a speech encoder of that projector instead; ``omni``: LFM3-Omni's, a vision tower, a speech encoder and
+    a speech generator); written next to the path and moved there (a server may have the old one mapped)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     w = GGUFWriter(path + ".tmp", arch)
-    if arch == "clip" and audio is not None:
+    if omni:
+        for k in ("vision", "audio", "gen_audio"):
+            w.add_bool(f"clip.has_{k}_encoder", True)
+        w.add_string("clip.vision.projector_type", "lfm3vl")
+        w.add_string("clip.audio.projector_type", "lfm3a")
+        w.add_string("clip.gen.audio.projector_type", "lfm3a_gen")
+        w.add_uint32("clip.vision.projection_dim", n_embd)
+        w.add_tensor("v.patch_embd.weight", np.zeros((4, 4), np.float32))
+    elif arch == "clip" and audio is not None:
         w.add_bool("clip.has_audio_encoder", True)
         w.add_string("clip.audio.projector_type", audio)
         w.add_uint32("clip.audio.projection_dim", n_embd)
@@ -119,6 +127,21 @@ def test_catalog_audio(tmp_path: object) -> None:
     a, q = entries["org/a-GGUF:Q4_K_M"], entries["org/q-GGUF:Q4_K_M"]
     assert os.path.basename(a.mmproj) == "mmproj-a-Q8_0.gguf" and a.media == ["audio"]
     assert q.mmproj is None and q.media == []
+
+
+def test_catalog_omni(tmp_path: object) -> None:
+    """An LFM3 model's directory with LFM3-Omni's mmproj (a tower, a speech encoder, a speech generator): images, audio
+    and videos in, speech out (the listing's modalities)."""
+    d = str(tmp_path / "models")
+    write_gguf(f"{d}/org/o-GGUF/o-Q4_K_M.gguf", arch="lfm3", n_embd=128)
+    write_gguf(f"{d}/org/o-GGUF/mmproj-o-Q8_0.gguf", arch="clip", n_embd=128, omni=True)
+    cat = catalog_of(d, tmp_path)
+    entries = cat.scan()
+    o = entries["org/o-GGUF:Q4_K_M"]
+    assert os.path.basename(o.mmproj) == "mmproj-o-Q8_0.gguf" and o.media == ["image", "audio", "video", "speech"]
+    cat.entries = entries
+    m = Router(cat, spare=False).listing()["data"][0]["architecture"]
+    assert m["input_modalities"] == ["text", "image", "audio", "video"] and m["output_modalities"] == ["text", "audio"]
 
 
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,

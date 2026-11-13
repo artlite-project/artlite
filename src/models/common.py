@@ -1336,19 +1336,22 @@ class Model:
         raise NotImplementedError
 
     def prompt(self, text: str, *, system: str | None = None, raw: bool = False, think: bool = False,
-               images: list[object] = (), audio: list[object] = (), variables: dict[str, object] | None = None
-               ) -> list[int]:
+               images: list[object] = (), audio: list[object] = (), videos: list[object] = (),
+               variables: dict[str, object] | None = None) -> list[int]:
         """Token ids of a user message after an optional system message, through the chat template (``raw``: the text
-        alone; ``variables``: the template's, as ``chat``'s); ``images`` (files or their bytes), then ``audio`` clips
-        (files or their bytes), where the text has ``MEDIA_MARKER``, else before it."""
-        if images and self.vision is None:
-            raise ValueError(f"{self.name}: images need a vision encoder (an mmproj file)")
+        alone; ``variables``: the template's, as ``chat``'s); ``images``, then ``videos``, then ``audio`` clips (files
+        or their bytes), where the text has ``MEDIA_MARKER``, else before it."""
+        if (images or videos) and self.vision is None:
+            raise ValueError(f"{self.name}: images and videos need a vision encoder (an mmproj file)")
+        if videos and not hasattr(self, "video_sequence"):
+            raise ValueError(f"{self.name}: no video input (LFM3-VL's and LFM3-Omni's mmproj)")
         if audio and self.audio is None:
             raise ValueError(f"{self.name}: audio needs a speech encoder (an mmproj file)")
-        media = [{"type": "image", "image": im} for im in images] + [{"type": "audio", "audio": a} for a in audio]
+        media = [{"type": "image", "image": im} for im in images] + [{"type": "video", "video": v} for v in videos] + \
+            [{"type": "audio", "audio": a} for a in audio]
         if raw:
             if media:
-                raise ValueError("images and audio go through the chat template (not a raw prompt)")
+                raise ValueError("images, videos and audio go through the chat template (not a raw prompt)")
             return self.encode(text)
         if think and not self.thinks:
             raise ValueError(f"{self.name} has no thinking mode")

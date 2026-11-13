@@ -50,9 +50,11 @@ drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
 [MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images); the decision
 models d3 and d1: [below](#decisions)) come as a chat message's `image_url` parts of data URIs, as llama-server takes
-them; the web UI attaches them; audio (LFM3-Audio: [below](#speech)) as `input_audio` parts or `audio_url` data URIs,
-and a chat's `modalities: ["text", "audio"]` gets a spoken reply. Not provided: infill, `/metrics`, LoRA, model
-downloads; their routes answer 501.
+them; the web UI attaches them; audio (LFM3-Audio, LFM3-Omni: [below](#speech)) as `input_audio` parts or `audio_url`
+data URIs; videos (LFM3-VL-2B, LFM3-Omni-2B: [the models](models/lfm3.md#videos); FFmpeg's `ffmpeg` and `ffprobe` on
+the server's PATH) as `input_video` or `video_url` parts (`{"data": ...}` or `{"url": ...}`: a data URL or base64), as
+llama-server takes them (`/props`' `modalities.video`); and a chat's `modalities` with `"audio"` gets a spoken reply.
+Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
@@ -244,9 +246,9 @@ the next one). A choice's `confidence` is its probability and a score is the med
 
 ## Speech
 
-LFM3-Audio-2B started with its mmproj (`--mmproj LiquidAI/LFM3-Audio-2B-GGUF/mmproj-LFM3-Audio-2B-Q8_0.gguf`; the
-router pairs it with the model of its directory) takes audio as llama-server does
-([the model](models/lfm3.md#lfm3-audio-2b-speech)):
+LFM3-Audio-2B and LFM3-Omni-2B started with their mmproj (`--mmproj
+LiquidAI/LFM3-Audio-2B-GGUF/mmproj-LFM3-Audio-2B-Q8_0.gguf`, `.../mmproj-LFM3-Omni-2B-Q8_0.gguf`; the router pairs it
+with the model of its directory) take audio as llama-server does ([the models](models/lfm3.md#lfm3-audio-2b-speech)):
 
 - `/v1/audio/transcriptions` (and `/audio/transcriptions`): OpenAI's multipart form, `file` (WAV, MP3, FLAC, Ogg
   Vorbis), `language` (a code or a name; without it the model tells), `prompt` (text before the audio in the user
@@ -256,7 +258,8 @@ router pairs it with the model of its directory) takes audio as llama-server doe
   works unchanged.
 - Chat messages take `input_audio` parts (`{"data": base64, "format": "wav"}`) and `audio_url` parts of data URIs, as
   images: the encoder runs on the NPU worker between requests, a clip's rows kept for a conversation's next turns.
-- `/v1/realtime?intent=transcription`: live transcription (English) over a websocket, llama-server's events. The
+- `/v1/realtime?intent=transcription` (LFM3-Audio: a model trained for live ASR, its `asr` template): live
+  transcription (English) over a websocket, llama-server's events. The
   client appends PCM16 audio at 16 kHz (`input_audio_buffer.append`); every 0.96 s of it gives the text it holds
   (`conversation.item.input_audio_transcription.delta`); `input_audio_buffer.commit` pads the audio with silence to
   the next 0.96 s, then completes the item (`...completed` with its transcript), `"final": true` ends the stream.
@@ -284,7 +287,8 @@ generation run on the NPU worker between requests, its samples (24 kHz) streamed
   between the `response.*` start and done events; `response.cancel` stops it. Each reply stays in the conversation as
   its text; a response runs the conversation so far as one prompt (a turn's audio encoded once).
 - Chat completions with `modalities: ["text", "audio"]` and `audio: {"voice": "female", "format": "wav"}` (OpenAI's
-  chat audio output): a spoken reply (the model's interleaved text and speech) as `message.audio` (`id`, `data`: base64
+  chat audio output): a spoken reply (the model's interleaved text and speech; `modalities: ["audio"]`: speech, then
+  text) as `message.audio` (`id`, `data`: base64
   WAV, or 16-bit PCM for `format: "pcm16"`; `transcript`, `expires_at`), streamed as `delta.audio` (the transcript's
   pieces, base64 16-bit chunks; `format: "pcm16"`). An assistant message with an earlier reply's `audio: {"id": ...}`
   goes back to the model as that reply's transcript.
