@@ -15,6 +15,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 
 import numpy as np
 import pytest
@@ -52,9 +53,10 @@ class _Vision:
         g = Q.Grid(px.shape[0] // 32, px.shape[1] // 32)
         return g.sequence(np.zeros((g.tokens, self.hidden), np.float32))
 
-    def pairs(self, frames: np.ndarray) -> list[np.ndarray]:
-        g = Q.Grid(frames.shape[1] // 32, frames.shape[2] // 32)
-        return [np.zeros((g.tokens, self.hidden), np.float32) for _ in range(0, len(frames), 2)]
+    def pairs(self, frames: Iterable[np.ndarray]) -> list[np.ndarray]:
+        fr = list(frames)
+        g = Q.Grid(fr[0].shape[0] // 32, fr[0].shape[1] // 32)
+        return [np.zeros((g.tokens, self.hidden), np.float32) for _ in range(0, len(fr), 2)]
 
 
 class _Audio:

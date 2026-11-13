@@ -3,9 +3,10 @@
 
 - ``probe``: the first video stream's size, rate (``r_frame_rate`` as a float32, llama.cpp's float), frame count
   (``nb_frames``; a container that does not record it: the stream's packets counted) and start time.
-- ``frames``: the frames at given indices (display order; an index may repeat), as RGB, scaled to a size by ffmpeg's
+- ``Frames``: the frames at given indices (display order; an index may repeat), as RGB, scaled to a size by ffmpeg's
   bicubic (B 0, C 0.5: the closest to Pillow's) with accurate rounding and full chroma interpolation when the size is
-  not the video's.
+  not the video's, as ffmpeg decodes them (a thread drains its output, so that it decodes ahead while the frames are
+  used: a video's pairs encode on the NPU meanwhile); ``frames``: all of them at once.
 - ``soundtrack``: the first audio stream as mono float32 samples at a rate (ffmpeg's resampler), over the video stream's
   span: from its start time for n_frames / fps seconds; None without an audio stream.
 
@@ -13,12 +14,18 @@ The file goes to the tools through their standard input (``cache:pipe:0``: seeka
 as llama.cpp feeds them. Without ffmpeg / ffprobe a video is a ``VideoError`` that names them.
 """
 
+import os
+import queue
 import shutil
 import subprocess
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Self
 
 import numpy as np
+
+from artlite.portable import widen_pipe
 
 INPUT = ("-read_ahead_limit", "-1", "-i", "cache:pipe:0")  # (stdin, seekable; no read-ahead limit: the moov atom)
 
@@ -100,40 +107,94 @@ def _feed(proc: subprocess.Popen, data: bytes) -> threading.Thread:
     return t
 
 
-def frames(data: bytes, info: Info, indices: list[int] | np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """The frames at ``indices`` (ascending) at ``size`` (width, height): uint8 (len(indices), height, width, 3); fewer
-    where the stream ends before an index (llama.cpp keeps the frames it got)."""
-    w, h = size
-    idx = [int(i) for i in indices]
-    cmd = [_tool("ffmpeg"), "-nostdin", *INPUT]
-    if (w, h) != (info.width, info.height):
-        cmd += ["-vf", f"format=rgb24,scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5"]
-    cmd += ["-frames:v", str(idx[-1] + 1), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel", "error"]
-    out = np.empty((len(idx), h, w, 3), np.uint8)
-    nbytes = w * h * 3
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    feeder = _feed(proc, data)
-    got, src, buf = 0, 0, None
-    try:
-        for k, want in enumerate(idx):
-            while src <= want:
-                raw = proc.stdout.read(nbytes)
-                if len(raw) < nbytes:
+class Frames:
+    """The frames at ``indices`` (ascending) at ``size`` (width, height), each uint8 (height, width, 3), as ffmpeg
+    decodes them: ffmpeg starts at once and decodes up to ``ahead`` frames before they are taken (``with`` the stream,
+    iterate it); fewer where the stream ends before an index (llama.cpp keeps the frames it got)."""
+
+    CHUNK = 1 << 20  # (bytes of a read: the frames ffmpeg wrote meanwhile, the interpreter taken once for them)
+
+    def __init__(self, data: bytes, info: Info, indices: list[int] | np.ndarray, size: tuple[int, int], *,
+                 ahead: int = 64):
+        w, h = self.size = size
+        self.idx = [int(i) for i in indices]
+        cmd = [_tool("ffmpeg"), "-nostdin", *INPUT]
+        if (w, h) != (info.width, info.height):
+            cmd += ["-vf", f"format=rgb24,scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5"]
+        cmd += ["-frames:v", str(self.idx[-1] + 1), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel",
+                "error"]
+        self.nbytes = w * h * 3
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        widen_pipe(self.proc.stdout.fileno(), self.CHUNK)
+        self.feeder = _feed(self.proc, data)
+        self.q: queue.Queue = queue.Queue(ahead)
+        self.stop = threading.Event()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _put(self, x: bytes | None) -> bool:
+        while not self.stop.is_set():
+            try:
+                self.q.put(x, timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _read(self) -> None:
+        """ffmpeg's frames in order, several a read; the indices' kept, an index's frame once per occurrence."""
+        idx, n = self.idx, self.nbytes
+        fd, buf, at, k, src = self.proc.stdout.fileno(), bytearray(), 0, 0, 0
+        try:
+            while src <= idx[-1]:
+                chunk = os.read(fd, max(self.CHUNK, n))
+                if not chunk:
                     break
-                buf, src = raw, src + 1
-            else:
-                out[k] = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-                got = k + 1
-                continue
-            break
-    finally:
-        proc.stdout.close()
-        proc.kill()
-        proc.wait()
-        feeder.join()
-    if got == 0:
-        raise VideoError(f"ffmpeg decoded no frame: {proc.stderr.read().decode(errors='replace').strip()[:200]}")
-    return out[:got]
+                buf += chunk
+                while len(buf) - at >= n and src <= idx[-1]:
+                    while k < len(idx) and idx[k] == src:
+                        if not self._put(bytes(buf[at:at + n])):
+                            return
+                        k += 1
+                    at, src = at + n, src + 1
+                del buf[:at]
+                at = 0
+        except OSError:
+            pass
+        finally:
+            self._put(None)
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        w, h = self.size
+        got = 0
+        while (raw := self.q.get()) is not None:
+            got += 1
+            yield np.frombuffer(raw, np.uint8).reshape(h, w, 3)
+        if got == 0:
+            self.proc.wait()
+            err = self.proc.stderr.read().decode(errors="replace").strip()[:200]
+            raise VideoError(f"ffmpeg decoded no frame: {err}")
+
+    def close(self) -> None:
+        self.stop.set()
+        self.proc.kill()
+        self.proc.wait()
+        self.reader.join()
+        self.feeder.join()
+        self.proc.stdout.close()
+        self.proc.stderr.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def frames(data: bytes, info: Info, indices: list[int] | np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """``Frames``' frames at once: uint8 (frames, height, width, 3)."""
+    with Frames(data, info, indices, size) as fr:
+        return np.stack(list(fr))
 
 
 def soundtrack(data: bytes, info: Info, rate: int = 16000) -> np.ndarray | None:

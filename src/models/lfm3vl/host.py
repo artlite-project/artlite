@@ -198,10 +198,9 @@ def video_sequence(pairs: list[Sequence], stamps: list[str], encode: Callable[[s
     """A video's tokens between the chat template's markers (module docstring): per pair its timestamp, its tokens
     (``Grid.sequence``) between ``<|vision_start|>`` and ``<|vision_end|>``, then its soundtrack rows (``rows``, a
     sequence per pair: ``models.lfm3a.host.clip_sequence``); each text piece tokenized alone (llama.cpp's mtmd)."""
-    seq = None
+    parts = []
     for i, (pair, stamp) in enumerate(zip(pairs, stamps, strict=True)):
-        s = Sequence.text(encode(stamp)) + encode(VISION_START) + pair + encode(VISION_END)
+        parts += [encode(stamp), encode(VISION_START), pair, encode(VISION_END)]
         if rows is not None and len(rows[i]):
-            s = s + rows[i]
-        seq = s if seq is None else seq + s
-    return seq
+            parts.append(rows[i])
+    return Sequence.join(parts)

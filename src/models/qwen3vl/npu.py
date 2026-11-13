@@ -41,7 +41,7 @@ TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default
 
 
 def _save_program(cache: str, nb: int, pieces: list[Piece], same_layout: bool) -> None:
-    """A program built over a restored state's images (same_layout: none new, their layout the state's) into its cache
+    """A program that takes only the cached state's images (same_layout: ``WindowEncoder.state``) into its cache
     directory."""
     if not same_layout or not os.path.isdir(cache):
         return

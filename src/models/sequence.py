@@ -4,7 +4,7 @@
 given embedding row instead of its id's (``given``; the rows in ``rows``, in order) and its position (T, H, W) relative
 to the sequence's start; ``next``: the position of the text after it. Text from position 0 has the positions of its
 indices; an image's take fewer positions than tokens (``models.minicpmv.host``, ``models.qwen3vl.host``). Sequences
-concatenate (``+``, a list of token ids as text) and slice like lists (a slice's positions relative to its first
+concatenate (``+``, a list of token ids as text; many at once: ``join``) and slice like lists (a slice's positions relative to its first
 token's T, so that the slices of a sequence run one after another as the whole), so the model's prompt path runs them
 in chunks and steps as token lists. ``splice``: a text's tokens with sequences where it has a marker; ``load_image``: an
 image file as the vision encoders take it (``data_bytes``: a data URL's).
@@ -61,6 +61,17 @@ class Sequence:
     def __radd__(self, other: list[int]) -> Sequence:
         return Sequence.text(other, self.rows.shape[1]) + self
 
+    @classmethod
+    def join(cls, parts: list[Sequence | list[int]]) -> Sequence:
+        """The parts one after another (lists of token ids as text): ``+`` over them, each array copied once."""
+        ps = [p if isinstance(p, Sequence) else Sequence.text(p) for p in parts]
+        hidden = max(p.rows.shape[1] for p in ps)
+        at = np.cumsum([0] + [p.next for p in ps])
+        return cls(np.concatenate([p.ids for p in ps]), np.concatenate([p.given for p in ps]),
+                   np.concatenate([p.rows.reshape(-1, hidden) if p.rows.size else np.zeros((0, hidden), np.float32)
+                                   for p in ps]),
+                   np.concatenate([p.pos + a for p, a in zip(ps, at, strict=False)]), int(at[-1]))
+
     def cache_keys(self) -> list[int | bytes]:
         """Per token what a prompt cache compares: its id, or its given row's bytes (an image's tokens: their ids are
         alike)."""
@@ -76,10 +87,8 @@ def splice(text: str, marker: str, items: list[Sequence], encode: Callable[[str]
     parts = text.split(marker)
     if len(parts) != len(items) + 1:
         raise ValueError(f"{len(items)} item(s) for {len(parts) - 1} place(s) in the text")
-    seq = Sequence.text(encode(parts[0]))
-    for item, tail in zip(items, parts[1:], strict=True):
-        seq = seq + item + encode(tail)
-    return seq
+    return Sequence.join([encode(parts[0])] + [x for item, tail in zip(items, parts[1:], strict=True)
+                                               for x in (item, encode(tail))])
 
 
 def splice_media(text: str, items: dict[str, list[Sequence]], encode: Callable[[str], list[int]]) -> list[int] | Sequence:
@@ -93,14 +102,12 @@ def splice_media(text: str, items: dict[str, list[Sequence]], encode: Callable[[
     for m, v in items.items():
         if len(v) != sum(1 for _, m2 in found if m2 == m):
             raise ValueError(f"{len(v)} item(s) for {sum(1 for _, m2 in found if m2 == m)} place(s) of {m} in the text")
-    seq, at, nxt = None, 0, dict.fromkeys(items, 0)
+    seq, at, nxt = [], 0, dict.fromkeys(items, 0)
     for i, m in found:
-        piece = Sequence.text(encode(text[at:i]))
-        seq = piece if seq is None else seq + piece
-        seq = seq + items[m][nxt[m]]
+        seq += [encode(text[at:i]), items[m][nxt[m]]]
         nxt[m] += 1
         at = i + len(m)
-    return seq + encode(text[at:])
+    return Sequence.join(seq + [encode(text[at:])])
 
 
 def _finds(text: str, marker: str) -> list[int]:

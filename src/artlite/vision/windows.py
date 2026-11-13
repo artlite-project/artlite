@@ -264,7 +264,8 @@ class WindowEncoder:
         # (programs by nb; a video's pairs' by ("pair", nb))
         self.programs: dict[int | tuple[str, int], list[Piece]] = {} if state is None else dict(state["programs"])
         self.built: Callable[[int | tuple[str, int], list[Piece], bool], None] | None = None  # (a new program's hook: a
-        # cache's; the bool: it took only images that existed before it)
+        # cache's; the bool: it takes only images of the cached state, ``state``)
+        self._kept: set[str] | None = set(npu._images) if state is not None else None  # (the cached state's images)
         self.tr: dict[tuple, Transaction] = {}  # (by (program key, piece): a pair's shared pieces the image's)
         self._inputs: OrderedDict[tuple[int, int], dict[str, np.ndarray]] = OrderedDict()
         self._at: dict[tuple, tuple] = {}  # (a transaction's last (layer, size) its words are set for)
@@ -295,7 +296,11 @@ class WindowEncoder:
         raise NotImplementedError
 
     def state(self) -> dict:
-        """What a restored device's encoder takes besides its images (``__init__``'s state): the programs built."""
+        """What a restored device's encoder takes besides its images (``__init__``'s state): the programs built. The
+        device's images as they are now are the cached state's: a program built later is cached (``built``) only where
+        it takes none but these (a restored device has them where they were; an image allocated after the state, a
+        pair's pixels say, is not there)."""
+        self._kept = set(self.npu._images)
         return {"programs": dict(self.programs)}
 
     def _piece(self, build: Callable[[Builder], None], nlayers: int | None = None, start: int = 0) -> Piece:
@@ -327,7 +332,6 @@ class WindowEncoder:
         if pkey in self.programs:
             return self.programs[pkey]
         assert nb <= self.max_bands, (nb, self.max_bands)
-        had = set(self.npu._images)
         embed = (lambda b, n: self.patch_embed(b, n, pair=True)) if pair else self.patch_embed
         if nb == 1:
             def full(b: Builder) -> None:
@@ -348,7 +352,8 @@ class WindowEncoder:
             out.append(self._piece(lambda b: self.final(b, nb)))
         self.programs[pkey] = out
         if self.built:
-            self.built(pkey, out, set(self.npu._images) <= had)
+            names = {n for pc in out for n in pc.refs[1]} | {t[1] for pc in out for t in pc.tags}
+            self.built(pkey, out, self._kept is not None and names <= self._kept)
         return out
 
     def schedule(self, nb: int, pair: bool = False) -> list[tuple[int, int]]:

@@ -1,5 +1,5 @@
 """The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups, a
-thread's CPU, the memory still available.
+thread's CPU, the memory still available, a pipe's buffer.
 (``gguf_model``'s page hints test for ``mmap.madvise`` themselves.)"""
 
 import contextlib
@@ -107,3 +107,17 @@ def available_memory() -> int | None:
             return next((int(line.split()[1]) * 1024 for line in f if line.startswith("MemAvailable:")), None)
     except OSError:
         return None
+
+
+def widen_pipe(fd: int, nbytes: int) -> None:
+    """A pipe's buffer raised to hold ``nbytes`` (Linux: up to the system's ``pipe-max-size``, 1 MB by default), so that
+    a child writes that much without waiting for the reader; elsewhere (or refused) it stays as it is."""
+    setsize = getattr(fcntl, "F_SETPIPE_SZ", None) if not WINDOWS else None
+    if setsize is None:
+        return
+    try:
+        with open("/proc/sys/fs/pipe-max-size") as f:
+            nbytes = min(nbytes, int(f.read()))
+        fcntl.fcntl(fd, setsize, nbytes)
+    except (OSError, ValueError):
+        pass

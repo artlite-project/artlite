@@ -88,6 +88,25 @@ def test_npu_pairs(videos: str, mmproj: str) -> None:
             assert med < 0.06
 
 
+def test_program_cache() -> None:
+    """A program is cached for later processes only where it takes the cached state's images: a pair's pixel panels
+    are allocated after the state (by the first pair program built), so no pair program is cached, whichever size
+    comes first (a later process restoring the state has no such image); the image programs they take are."""
+    from models.lfm3vl.npu import NpuVision
+    if not os.path.exists(MMPROJ):
+        pytest.skip(f"{MMPROJ} missing")
+    enc = NpuVision(MMPROJ).encoder
+    for k in [k for k in enc.programs if isinstance(k, tuple)]:
+        del enc.programs[k]
+    cached = {}
+    enc.built = lambda key, pieces, same: cached.__setitem__(key, same)
+    for nb in (2, 1, 3):
+        enc.program(nb, pair=True)
+    pairs = {k: v for k, v in cached.items() if isinstance(k, tuple)}  # (an image program a pair's took: cached)
+    assert any(".pixp." in n for n in enc.npu._images) and pairs == dict.fromkeys([("pair", 2), ("pair", 1),
+                                                                                  ("pair", 3)], False)
+
+
 @pytest.mark.slow
 def test_app_video(videos: str) -> None:
     """LFM3-VL-2B with a video (frames only: its mmproj has no speech encoder): the app's prompt (pairs on the NPU)

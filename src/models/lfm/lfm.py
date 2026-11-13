@@ -364,16 +364,28 @@ class Lfm(Model):
         info = video.probe(data)
         heard = self.audio is not None  # (the mmproj hears a video: LFM3-Omni's prompt layout)
         plan = vl_host.VideoPlan.of(info.n_frames, info.fps, info.width, info.height, heard=heard)
-        frames = video.frames(data, info, plan.indices, (plan.width, plan.height))
-        groups = len(plan.pairs(len(frames)))
+        got = [0]
+
+        def counted(frames: Iterator[np.ndarray]) -> Iterator[np.ndarray]:
+            for f in frames:
+                got[0] += 1
+                yield f
         rows = None
-        if heard and soundtrack and (track := video.soundtrack(data, info)) is not None:
-            slices = plan.slices(len(track))[:groups]
-            embd = self.audio.embeddings(track[:slices[-1][1]])
-            rows = [a_host.clip_sequence(embd[b:e]) for b, e in plan.rows(slices, len(embd))]
+        with ThreadPoolExecutor(1) as pool, video.Frames(data, info, plan.indices, (plan.width, plan.height)) as fr:
+            # (ffmpeg decodes the frames while the soundtrack is read and encoded; the pairs encoded as they come)
+            track = pool.submit(video.soundtrack, data, info).result() if heard and soundtrack else None
+            if track is not None:  # (the soundtrack up to the planned pairs' end)
+                cut = plan.slices(len(track))[:len(plan.pairs())][-1][1]
+                emb = self.audio.embeddings(track[:cut])
+            embd = self.vision.pairs(counted(fr))
+        if track is not None:
+            slices = plan.slices(len(track))[:len(embd)]
+            if slices[-1][1] != cut:  # (the stream ended early: fewer pairs)
+                emb = self.audio.embeddings(track[:slices[-1][1]])
+            rows = [a_host.clip_sequence(emb[b:e]) for b, e in plan.rows(slices, len(emb))]
         grid = plan.grid
-        pairs = [grid.sequence(e) for e in self.vision.pairs(frames)]
-        seq = self._videos[key] = vl_host.video_sequence(pairs, plan.stamps(len(frames)), self.tokenizer.encode, rows)
+        pairs = [grid.sequence(e) for e in embd]
+        seq = self._videos[key] = vl_host.video_sequence(pairs, plan.stamps(got[0]), self.tokenizer.encode, rows)
         if len(self._videos) > KEEP_VIDEOS:
             self._videos.popitem(last=False)
         return seq

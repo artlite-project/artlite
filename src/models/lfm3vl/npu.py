@@ -19,6 +19,7 @@ import hashlib
 import os
 import pickle
 import time
+from collections.abc import Iterable
 
 import numpy as np
 from PIL import Image
@@ -43,7 +44,7 @@ TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default
 
 
 def _save_program(cache: str, nb: int | tuple[str, int], pieces: list[Piece], same_layout: bool) -> None:
-    """A program built over a restored state's images (same_layout: none new, their layout the state's) into its cache
+    """A program that takes only the cached state's images (same_layout: ``WindowEncoder.state``) into its cache
     directory (nb: its key, ("pair", nb) a video pair's)."""
     if not same_layout or not os.path.isdir(cache):
         return
@@ -142,14 +143,22 @@ class NpuVision:
                 self._kept.popitem(last=False)
         return self._kept[key], grid
 
-    def pairs(self, frames: np.ndarray) -> list[np.ndarray]:
-        """A video's frames (n, H, W, 3) uint8 at its size (``host.VideoPlan``) -> each pair's embeddings (its merged
-        tokens in raster order): two frames a temporal patch, an odd last one alone (both kernels on it, as an
-        image)."""
-        if frames.shape[2] // 32 > GW_MAX:
-            raise ValueError(f"a video of {frames.shape[2] // 32} tokens per row (at most {GW_MAX})")
+    def pairs(self, frames: Iterable[np.ndarray]) -> list[np.ndarray]:
+        """A video's frames (H, W, 3) uint8 at its size (``host.VideoPlan``; an array of them, or as they are decoded:
+        ``models.video.stream``) -> each pair's embeddings (its merged tokens in raster order): two frames a temporal
+        patch, encoded as soon as both are there, an odd last one alone (both kernels on it, as an image)."""
+        out, held = [], None
         t0 = time.perf_counter()
-        out = [self.encoder(frames[i:i + 2] if i + 1 < len(frames) else frames[i]) for i in range(0, len(frames), 2)]
+        for f in frames:
+            if f.shape[1] // 32 > GW_MAX:
+                raise ValueError(f"a video of {f.shape[1] // 32} tokens per row (at most {GW_MAX})")
+            if held is None:
+                held = f
+                continue
+            out.append(self.encoder(np.stack([held, f])))
+            held = None
+        if held is not None:
+            out.append(self.encoder(held))
         self.t_encode += time.perf_counter() - t0
         self.entries += len(out)
         return out
