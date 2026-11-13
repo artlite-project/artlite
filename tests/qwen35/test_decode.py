@@ -222,7 +222,7 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         x, resid, gold = _t(x).reshape(S, -1), _t(resid).reshape(S, -1), _t(gold).reshape(S, -1)
         x = np.pad(x, ((0, 0), (0, r.K - x.shape[1])))  # (a K padded to whole chunks: zero inputs)
         out = P.run(r, x, PR.F_RESID | PR.F_EMITR, resid=resid)
-        xb = mmv.bf(x)
+        xb = bf16_round(x)
         for c in range(COLS):
             kern = bf16_round(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(img, r, c, xb)[0])
             check(from_bf16_bits(out[c, :, :h8]), kern, gold[:, h8 * c:h8 * (c + 1)])
@@ -482,12 +482,12 @@ class _Gdn:
             go = dev.view("GO").view(np.uint16).reshape(COLS, hc, -1)[:, :, :16 * PR.SLOTS * 8]
             for c in range(COLS):
                 for h in range(hc):
-                    out.append(_bf16(go[c, h]).reshape(16, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
+                    out.append(from_bf16_bits(go[c, h]).reshape(16, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
             return msgs, np.stack(out, 1)
         go = dev.view("GO").view(np.uint16).reshape(COLS, self.npair, -1)[:, :, :2 * 16 * PR.SLOTS * 8]
         for c in range(COLS):
             for p in range(self.npair):
-                o = _bf16(go[c, p]).reshape(2, 16, PR.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
+                o = from_bf16_bits(go[c, p]).reshape(2, 16, PR.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
                 out.append(o)
         return msgs, np.stack(out, 1).reshape(S, -1, 128)
 
@@ -1001,7 +1001,7 @@ def test_moe_slice(first: int) -> None:
         ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
             got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+            errs[t, i] = rel_max(got, np.asarray(G_["l_out", L][t], np.float32))
             o = ov.xch[L] + 4 * PR.META  # (the route object's payload: [slot][expert] fp32)
             ov.dev.fetch("ACT", o, 4 * E)
             lg = ov.dev.view("ACT")[o:o + 4 * E].view(np.float32)
@@ -1098,7 +1098,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     dev.fetch("ACT")
     act = dev.view("ACT")
     off = ov.inp[(L, "moe_in")][0].off + PR.XB
-    xin = _bf16(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
+    xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
     b = f"blk.{L}."
     xn = np_ops.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
                       cfg.rms_norm_eps)
@@ -1106,7 +1106,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
     o = ov.xch[L] + 4 * PR.META
     lg = act[o:o + 4096].view(np.float32).reshape(PR.SLOTS, -1)[:S]
-    assert ref.rel_err(lg, lg_ref) < 3e-5, ref.rel_err(lg, lg_ref)
+    assert rel_max(lg, lg_ref) < 3e-5, rel_max(lg, lg_ref)
     ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
     rids, rw = moe_ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
     assert np.array_equal(ids, rids)
