@@ -5,42 +5,21 @@ clip's rows, the ASR prompt's tokens, the encoder's embeddings (llama.cpp's own 
 activations, ~2.4% at the projector), and a clip encoded in chunks (whole rows) equal to the clip at once."""
 
 import math
-import os
 
 import numpy as np
 import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import AudioConfig, lfm3a_gguf, lfm3a_mmproj
+from artlite.model_config import AudioConfig
 from models.lfm3a import host as A
-from models.tokenizer import BpeTokenizer, chat_prompt
+from models.tokenizer import BpeTokenizer
 
 from ..goldens import media
 from ..goldens.media import VisionGolden
 from ..models import require
 from . import ref as R
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CLIPS = os.path.join(HERE, "..", "datasets", "librispeech")
-MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()
-MARKER = "<__media__>"
-
-
-def clip(name: str = "6930-75918-0001") -> str:
-    path = os.path.join(CLIPS, f"{name}.wav")
-    if not os.path.exists(path):
-        pytest.skip(f"{path} missing (tests/datasets/fetch_datasets.py)")
-    return path
-
-
-def asr_text(gguf: GGUFFile, language: str = "en", marker: str = A.AUDIO) -> str:
-    """The ASR prompt's text by the file's chat template, the clip at ``marker``."""
-    msgs = [{"role": "system", "content": A.asr_system(language)},
-            {"role": "user", "content": [{"type": "audio", "audio": "clip"}]}]
-    text = chat_prompt(gguf, msgs, enable_thinking=False, bos_token=gguf.strings("tokenizer.ggml.tokens",
-                                                                                 gguf.meta["tokenizer.ggml.bos_token_id"])[0])
-    return text.replace(A.AUDIO, marker)
+from .files import MARKER, MMPROJ, MODEL, asr_text, clip
 
 
 def golden(path: str) -> VisionGolden:

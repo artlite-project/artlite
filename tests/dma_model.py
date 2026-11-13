@@ -14,10 +14,13 @@ Test a design by pushing uniquely numbered data through its hops and comparing
 each consumer object with what the kernel expects (``tests/gemm/test_dma.py``). ``check_*`` encode the BD limits met so far.
 """
 
+import collections
 from collections.abc import Sequence
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
+
+from artlite import txn
 
 SHIM_INNER_WORDS_MAX = 1023  # innermost wrap of a multi-dimensional BD, in words (10-bit wrap)
 MEMTILE_BD_BYTES_MAX = 512 * 1024 - 4  # one memtile BD: a 17-bit length in words (442 KB A strips run; a BD chain
@@ -123,3 +126,26 @@ def check_memtile_object(obj_bytes: int, walk: TensorAccessPattern | None = None
         raise ValueError(f"memtile walk has {walk.rank} dimensions (max {MEMTILE_DIMS_MAX})")
     if obj_bytes > MEMTILE_BD_BYTES_MAX and repeated:
         raise ValueError(f"a repeated memtile object of {obj_bytes} B exceeds one BD ({MEMTILE_BD_BYTES_MAX} B)")
+
+
+def channel_rows(words: np.ndarray) -> dict[tuple[int, int], tuple[np.ndarray, int, int]]:
+    """Per (column, BD) of a transaction: its rows' byte addresses (rows joined where they touch), a row's bytes and
+    the task's repeats (from the queue pushes)."""
+    bds, repeats = {}, collections.Counter()
+    for name, f in txn.decode(words):
+        reg = f.get("addr", 0) & 0xFFFFF
+        if name == "blockwrite" and txn.SHIM_BD0 <= reg < txn.SHIM_BD0 + txn.SHIM_BDS * txn.BD_BYTES:
+            d = f["data"]
+            n0, n1 = (d[3] >> 20) & 0x3FF, (d[4] >> 20) & 0x3FF
+            s1, s2 = (d[4] & 0xFFFFF) + 1, (d[5] & 0xFFFFF) + 1
+            count, step = (d[6] >> 20 & 0x3F) + 1, (d[6] & 0xFFFFF) + 1 if d[6] else 0  # (the iteration)
+            r = np.arange(d[0] // n0)
+            starts = d[1] + (d[2] << 32) + 4 * (r % n1 * s1 + r // n1 * s2)
+            run = 4 * n0
+            if n1 > 1 and s1 == n0:  # (a group's rows touch: one row)
+                starts, run = starts[::n1], run * n1
+            starts = np.concatenate([starts + 4 * step * j for j in range(count)])  # (the repeats of one iteration)
+            bds[f["addr"] >> 25, (reg - txn.SHIM_BD0) // txn.BD_BYTES] = starts, run
+        elif name == "write32" and reg in {q for qs in txn.QUEUE.values() for q in qs}:
+            repeats[f["addr"] >> 25, f["value"] & 0xF] += ((f["value"] >> 16) & 0xFF) + 1
+    return {key: (*rows, repeats[key]) for key, rows in bds.items()}

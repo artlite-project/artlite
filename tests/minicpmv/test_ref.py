@@ -13,30 +13,27 @@ import torch
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import MODELS_DIR, ClipConfig, minicpmv_gguf
+from artlite.model_config import ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
 
+from ..common import ASTRONAUT
 from ..goldens.media import VisionGolden, golden
 from ..models import require
 from ..numerics import rel
 from . import ref as V
-
-IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
-MMPROJ = os.path.join(MODELS_DIR, "openbmb", "MiniCPM-V-4.7-1B-gguf", "mmproj-model-f16.gguf")
-NAMES = ("pos_embed|layer_inp_normed|Qcur|attn_out|ffn_inp_normed|ffn_up_b|ffn_gelu|ffn_out|layer_out|"
-         "vit_merger_ds_out|post_ln|merger_out")
+from .files import MMPROJ, NAMES
 
 
 @pytest.fixture(scope="module")
 def gold() -> VisionGolden:
     require(minicpmv_gguf(), MMPROJ)
-    return golden(minicpmv_gguf(), MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)
+    return golden(minicpmv_gguf(), MMPROJ, ASTRONAUT, "<__media__>Describe the image.", names=NAMES)
 
 
 @pytest.mark.parametrize("case", ["astronaut", "square-1024", "small"])
 def test_slices(case: str, tmp_path: str) -> None:
     require(minicpmv_gguf(), MMPROJ)
-    path = IMAGE
+    path = ASTRONAUT
     if case != "astronaut":  # (noise: the resampling exact at every pixel)
         w, h = (1024, 1024) if case == "square-1024" else (300, 200)
         path = os.path.join(tmp_path, f"{case}.png")

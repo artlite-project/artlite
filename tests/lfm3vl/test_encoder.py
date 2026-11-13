@@ -23,15 +23,11 @@ from models.lfm3vl import encoder as E
 from models.lfm3vl import host as Q
 from models.sequence import load_image
 
+from ..common import ASTRONAUT
 from ..models import require
 from ..numerics import rel
 from . import ref as V
-from .test_ref import IMAGE, MMPROJ
-
-
-@pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
+from .files import MMPROJ
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +39,7 @@ def mm() -> tuple:
 
 
 def _pixels(w: int, h: int) -> np.ndarray:
-    return Q.image_pixels(load_image(IMAGE).resize((w, h), Image.Resampling.BICUBIC), min_tokens=1)
+    return Q.image_pixels(load_image(ASTRONAUT).resize((w, h), Image.Resampling.BICUBIC), min_tokens=1)
 
 
 def test_masks() -> None:

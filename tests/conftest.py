@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -12,6 +13,9 @@ import pytest
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 from artlite import parallel_compile
+
+if TYPE_CHECKING:
+    from artlite.vision.device import VisionDevice
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -23,6 +27,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
                      help="instead of compiling and running, render every operator's kernel source and MLIR design "
                           "into DIR (index.jsonl: test -> designs; the tests are skipped there). Diff two dumps to "
                           "check that a refactoring leaves the designs unchanged.")
+
+
+@pytest.fixture(scope="module")
+def npu() -> "VisionDevice":
+    """The vision overlay's device, once per module (the image networks' tests; a module with its own ``npu`` fixture
+    overrides it)."""
+    from artlite.vision.device import VisionDevice
+
+    return VisionDevice()
 
 
 # The smoke set (``pytest tests -m smoke``, about a minute with the designs cached): the host-side tests, the

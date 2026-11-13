@@ -285,12 +285,12 @@ UNIT = [("IQ3_S", 6), ("IQ3_S", 3), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ4_XS", 1)]
 def test_unit_gemm(fmt: str, tiles: int) -> None:
     """GemmQd on super-block unit tiles of random GGUF blocks (packed C of two passes per column, K of two chunks; 3 and 2
     MAC rows) against the product of the dequantized weights."""
-    from ..decode.test_gemv import _random_tensor
+    from ..tensors import random_tensor
 
     S, kc, K, T, passes = 9280, 1024, 2048, 192, 2
     R = FORMATS[fmt].rows(S, kc // 256)
     n_rt, w = passes * tiles, tiles * R + tiles * R % 2
-    t = _random_tensor(fmt, COLS * n_rt * R, K, 7)
+    t = random_tensor(fmt, COLS * n_rt * R, K, 7)
     W = np.concatenate([pack_rows([t], np.arange(c * n_rt * R, (c + 1) * n_rt * R), fmt, R, S, K // kc, kc=kc).reshape(-1)
                         for c in range(COLS)])
     pitch = passes * w

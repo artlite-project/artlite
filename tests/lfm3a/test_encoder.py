@@ -8,14 +8,12 @@ import os
 import numpy as np
 import pytest
 
-from artlite.model_config import lfm3a_mmproj
 from models.lfm3a import host as A
 
 from ..models import require
+from ..numerics import rel_rows
 from . import ref as R
-from .test_ref import CLIPS, clip
-
-MMPROJ = lfm3a_mmproj()
+from .files import CLIPS, MMPROJ, clip
 
 
 @pytest.fixture(scope="module")
@@ -28,10 +26,6 @@ def audio() -> object:
 @pytest.fixture(scope="module")
 def enc() -> R.Encoder:
     return R.Encoder(MMPROJ)
-
-
-def rel_rows(got: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    return np.linalg.norm(got - ref, axis=1) / np.linalg.norm(ref, axis=1)
 
 
 @pytest.mark.parametrize("name", ["6930-75918-0012", "6930-75918-0001"])

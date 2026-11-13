@@ -20,11 +20,11 @@ from models.qwen35 import attn as AT
 from models.qwen35.qwen import NpuQwen, Qwen
 from models.tokenizer import BpeTokenizer, chat_prompt
 
-from ..common import essay
+from ..common import ASTRONAUT, essay
 from ..goldens.media import golden, seq_golden
 from ..models import require
 from ..numerics import kl_report
-from .test_ref import IMAGE, MMPROJ, NAMES
+from .files import MMPROJ, NAMES
 
 pytestmark = pytest.mark.slow  # (the whole model)
 
@@ -39,8 +39,8 @@ def case() -> tuple:
     require(path, MMPROJ)
     g = GGUFFile(path)
     tok = BpeTokenizer(g)
-    gold = golden(path, MMPROJ, IMAGE, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)
-    _, grid = M.slice_image(M.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
+    gold = golden(path, MMPROJ, ASTRONAUT, "<__media__>Describe the image.", names=NAMES)  # (test_ref's)
+    _, grid = M.slice_image(M.load_image(ASTRONAUT), ClipConfig.from_gguf(GGUFFile(MMPROJ)))
     chunk = gold.embd(0)  # (llama.cpp's image chunk: the tokens after <image>, through the last marker)
     embd = chunk[np.asarray(grid.layout(newline_after=False)[1:]) == M.MEDIA]
     img = grid.sequence(embd, GGUFFile(MMPROJ).rows("v.tok_embd_sep", [0, 1, 2, 3]))
@@ -108,9 +108,9 @@ def test_app_image_prompt(case: tuple) -> None:
     context ran in between) bit-identical."""
     path, seq, K, want = case
     app = Qwen(path, mmproj=MMPROJ)
-    im = M.load_image(IMAGE)
+    im = M.load_image(ASTRONAUT)
     first, _ = app.vision.embeddings(im)
-    prompt = app.chat(_messages(IMAGE))
+    prompt = app.chat(_messages(ASTRONAUT))
     assert np.array_equal(prompt.ids, seq.ids[:K]) and np.array_equal(prompt.pos, seq.pos[:K])
     assert np.array_equal(prompt.given, seq.given[:K])
     model = app.load(capacity=1024)

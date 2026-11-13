@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import GenConfig, lfm3a_gguf, lfm3a_mmproj
+from artlite.model_config import GenConfig
 from models.lfm3a import speech as S
 from models.tokenizer import BpeTokenizer
 
@@ -19,9 +19,7 @@ from ..llama_cpp import llama_tokenize
 from ..models import require
 from ..numerics import kl_rows
 from . import gen_ref as R
-
-MODEL, MMPROJ = lfm3a_gguf(), lfm3a_mmproj()
-TEXT = "Hello there, this is a test of the speech output."
+from .files import MMPROJ, MODEL, TEXT
 
 
 def snr(ref: np.ndarray, x: np.ndarray) -> float:

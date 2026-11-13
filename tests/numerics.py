@@ -42,6 +42,11 @@ def rel_finite(a: object, b: object) -> float:
     return float((a - b).pow(2).sum().sqrt() / b.pow(2).sum().sqrt())
 
 
+def rel_rows(got: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Per row of two matrices: ``|got - ref| / |ref|`` (float64 norms of the rows)."""
+    return np.linalg.norm(got - ref, axis=1) / np.linalg.norm(ref, axis=1)
+
+
 def rel_max(a: object, b: object) -> float:
     """``max |a - b| / max |b|`` in float64."""
     a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)

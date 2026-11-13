@@ -14,12 +14,7 @@ from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor
 
 from ..numerics import rel_native
-from ..vision.test_ops import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
-
-
-@pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
+from ..vision.ops_ref import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
 
 
 def _rand_resnet(p: str, cin: int, cout: int) -> dict:

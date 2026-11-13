@@ -17,34 +17,15 @@ from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
 from ..numerics import bf16_round
+from ..tensors import random_tensor
 from . import mmv
 
-# per GGUF block: (columns, bytes, the offsets of its fp16 fields)
-BLOCK = {"Q4_0": (32, 18, (0,)), "Q4_1": (32, 20, (0, 2)), "Q8_0": (32, 34, (0,)), "Q4_K": (256, 144, (0, 2)),
-         "Q5_K": (256, 176, (0, 2)), "Q6_K": (256, 210, (208,)), "Q2_K": (256, 84, (80, 82)), "Q3_K": (256, 110, (108,)),
-         "IQ3_XXS": (256, 98, (0,)), "IQ3_S": (256, 110, (0,)), "IQ4_NL": (32, 18, (0,)), "IQ4_XS": (256, 136, (0,))}
 # (GGUF type, tile bytes, super-blocks per tile) the packer is checked at: Gemma's 512-column tiles, Llama's and Qwen's
 # 1024 (the tile sizes of the images that hold them)
 PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_0", 9280, 4),
         ("Q4_1", 9280, 4), ("Q4_1", 10240, 4), ("Q2_K", 9408, 4), ("Q3_K", 9408, 4), ("Q3_K", 9856, 4), ("BF16", 9216, 4),
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
         ("IQ3_S", 18432, 8), ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4)]
-
-
-def _random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:
-    """Random GGUF blocks (fp16 scales of a plausible range), or random BF16 / F16 values."""
-    rng = np.random.default_rng(seed)
-    if qtype in ("BF16", "F16"):
-        w = (rng.standard_normal((rows, cols)) * 0.02).astype(np.float32)
-        raw = w.astype(np.float16) if qtype == "F16" else torch.from_numpy(w).bfloat16().view(torch.int16).numpy()
-        return QTensor(name="t", qtype=qtype, rows=rows, cols=cols, raw=raw.view(np.uint16 if qtype == "BF16" else np.float16))
-    per, nb, f16 = BLOCK[qtype]
-    n = cols // per
-    raw = rng.integers(0, 256, (rows, n, nb), dtype=np.uint8)
-    for o in f16:
-        d = (rng.standard_normal((rows, n)) * 0.01).astype(np.float16)
-        raw[..., o:o + 2] = d.view(np.uint8).reshape(rows, n, 2)
-    return QTensor(name="t", qtype=qtype, rows=rows, cols=cols, raw=raw.reshape(rows, -1))
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "NSB"), PACK, ids=[f"{f}-{s}-nsb{n}" for f, s, n in PACK])
@@ -54,7 +35,7 @@ def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
     fmt = tile_format(qtype)
     KC = 256 * NSB
     R = FORMATS[fmt].rows(S_BYTES, NSB, gemv.row_split(fmt, NSB) if gemv.supported(fmt, NSB) else 0)
-    a, b = _random_tensor(qtype, 40, 3 * KC, 1), _random_tensor(qtype, 9, 3 * KC, 2)
+    a, b = random_tensor(qtype, 40, 3 * KC, 1), random_tensor(qtype, 9, 3 * KC, 2)
     rows = np.concatenate([np.random.default_rng(3).permutation(49), [-1] * 5])
     rows = np.concatenate([rows, np.full((-rows.size) % R, -1)])
     tiles = pack_rows([a, b], rows, fmt, R, S_BYTES, 3, kc=KC)
@@ -82,7 +63,7 @@ def test_pack_native_groups(qtype: str, S_BYTES: int, G: int) -> None:
     slot's pack_tile packs those rows' fields side by side; two stacked tensors, padding rows, a partial last tile."""
     fmt, K = tile_format(qtype), 1024 // G
     R = FORMATS[fmt].rows(S_BYTES, 4)
-    a, b = _random_tensor(qtype, 30, K, 4), _random_tensor(qtype, 11, K, 5)
+    a, b = random_tensor(qtype, 30, K, 4), random_tensor(qtype, 11, K, 5)
     rows = np.concatenate([np.random.default_rng(6).permutation(41), [-1] * 3])
     rows = np.concatenate([rows, np.full((-rows.size) % (R * G), -1)])
     tiles = pack_rows([a, b], rows, fmt, R, S_BYTES, 1, G=G)
@@ -204,7 +185,7 @@ def test_gemv8(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str
 
 def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int, slots: int = 4) -> None:
     if key[0] == "random":
-        t = _random_tensor(name, 256, 2048, 4)
+        t = random_tensor(name, 256, 2048, 4)
     else:
         path = _path(key)
         if not os.path.exists(path):

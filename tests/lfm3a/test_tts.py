@@ -17,7 +17,7 @@ from models.lfm3a import speech as S
 from ..models import require
 from ..numerics import rel
 from . import gen_ref as R
-from .test_gen_ref import MMPROJ, MODEL, TEXT
+from .files import MMPROJ, MODEL, TEXT
 
 pytestmark = pytest.mark.slow  # (the whole model)
 

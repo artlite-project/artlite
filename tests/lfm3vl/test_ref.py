@@ -11,17 +11,16 @@ import torch
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import ClipConfig, lfm3vl_gguf, lfm3vl_mmproj
+from artlite.model_config import ClipConfig
 from models.lfm3vl import host as Q
 from models.sequence import load_image
 
+from ..common import ASTRONAUT
 from ..goldens.media import golden
 from ..models import require
 from . import ref as V
+from .files import MMPROJ, MODEL
 
-IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
-MODEL = lfm3vl_gguf()
-MMPROJ = lfm3vl_mmproj()
 PROMPT = "<__media__>Describe the image."
 CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1536x1024": (1536, 1024), "noise-1000x700": (1000, 700)}
 VISION_START = 125009  # (<|vision_start|>)
@@ -29,7 +28,7 @@ VISION_START = 125009  # (<|vision_start|>)
 
 def _image(case: str, tmp: str) -> str:
     if CASES[case] is None:
-        return IMAGE
+        return ASTRONAUT
     w, h = CASES[case]
     path = os.path.join(tmp, f"{case}.png")
     Image.fromarray(np.random.default_rng(0).integers(0, 256, (h, w, 3), np.uint8)).save(path)
@@ -80,7 +79,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
 @pytest.mark.slow  # (the whole encoder on the CPU, in float64)
 def test_encoder() -> None:
     require(MODEL, MMPROJ)
-    g = golden(MODEL, MMPROJ, IMAGE, PROMPT)
+    g = golden(MODEL, MMPROJ, ASTRONAUT, PROMPT)
     out = V.Encoder(MMPROJ).forward(g.tensor("inp_raw", 0))
     emb = g.embd(0)
     assert float(torch.linalg.norm(out - torch.from_numpy(emb).double()) / np.linalg.norm(emb)) < 2e-2

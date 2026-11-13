@@ -18,18 +18,14 @@ from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
 
+from ..common import ASTRONAUT
 from ..models import require
 from ..numerics import bf16_like, rel
-from ..vision.test_ops import from_level_tokens, level_tokens
+from ..vision.ops_ref import from_level_tokens, level_tokens
 from . import ref as V
-from .test_ref import IMAGE, MMPROJ
+from .files import MMPROJ
 
 COLS = 8
-
-
-@pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +36,7 @@ def enc() -> V.Encoder:
 
 def _entries(enc: V.Encoder, il: int) -> list[torch.Tensor]:
     """The two entries' residuals (256, 1152) before layer il (> the merger's: layer 7's the merger's output)."""
-    ov = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
+    ov = MV.slice_image(MV.load_image(ASTRONAUT), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
     out = []
     for px in (ov, np.ascontiguousarray(ov[:, :, ::-1])):
         tr: dict[str, torch.Tensor] = {}
@@ -175,7 +171,7 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
     """A layer before the ViT merger (3) on two entries of 32 x 32 tokens, the level in 4 bands: as far from the float64
     layer as the CPU at the NPU's rounding points (both ~8.6e-3), the pad channels zero."""
     il = 3
-    ov = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
+    ov = MV.slice_image(MV.load_image(ASTRONAUT), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0][0]
     xs = []
     for px in (ov, np.ascontiguousarray(ov[:, :, ::-1])):
         tr: dict[str, torch.Tensor] = {}
@@ -209,7 +205,7 @@ def _bands_read(npu: VisionDevice, y: M.Bands) -> torch.Tensor:
 def _pixels(case: str) -> list[np.ndarray]:
     """A dispatch's entries: "pair" the astronaut's overview (32 x 32 patches: 64 groups) and its first slice cut to
     24 x 40 (60 groups: the overview's padding masked); "joint" that slice whole (24 x 44: 66 groups, alone)."""
-    ents = MV.slice_image(MV.load_image(IMAGE), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0]
+    ents = MV.slice_image(MV.load_image(ASTRONAUT), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0]
     return [ents[0], np.ascontiguousarray(ents[1][:, :, :40 * 14])] if case == "pair" else [ents[1]]
 
 
@@ -260,7 +256,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     """The ViT merger's window attention on random Q, K, V of 4 sources for two token panels per column: within 1.2e-2
     of softmax attention per window and head on the bfp16 operands (Q, K blocked along the dims, V along the 8 windows
     of a panel), P in bf16 and the bfp16 output."""
-    from ..vision.test_ops import q as bq
+    from ..vision.ops_ref import q as bq
 
     torch.manual_seed(5)
     n = COLS * 16  # (windows: per column 2 panels of 8)

@@ -127,8 +127,8 @@ def test_my_op(size: int, tile_size: int):
 - The runtime takes and returns numpy arrays (bf16: `ml_dtypes.bfloat16`); a torch reference crosses over with
   `tests/common.py`'s `to_numpy` / `to_torch`.
 - Parametrize over the sizes and tile sizes IRON tests (edge cases included); `torch.equal` for bit-identical
-  results, `verify_close` for floating point. Keep the body before `compile()` cheap: the planning pass runs it up to
-  the first use of the NPU.
+  results, `tests/numerics.py`'s `verify_close` for floating point. Keep the body before `compile()` cheap: the planning
+  pass runs it up to the first use of the NPU.
 
 ## Patterns
 

@@ -16,19 +16,9 @@ from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Slots, as_wt
 
 from ..numerics import rel_native
+from .ops_ref import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
 
 COLS, ROWS = 8, 4
-
-
-@pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
-
-
-def q(x: torch.Tensor) -> torch.Tensor:
-    """x rounded to bfp16ebs8 blocks of 8 along the last dimension."""
-    return torch.from_numpy(L.unblocks(L.blocks(np.ascontiguousarray(x.float().reshape(*x.shape[:-1], -1, 8).numpy()))
-                                       )).reshape(x.shape)
 
 
 def fills(npu: VisionDevice, name: str, images: list[np.ndarray], addr: int) -> dict[int, ColOps]:
@@ -388,25 +378,6 @@ def test_attention(npu: VisionDevice, np_: int, d: int, nb: int, rows: int, sink
     assert rel_native(o, ref) < 1.5e-2
 
 
-def level_tokens(x: torch.Tensor, rows: int, L_: int) -> torch.Tensor:
-    """(2 images, C, H, W) -> per column its tokens (COLS, rows 2 L_ 8, C): column c's image rows c rows .., token panel
-    (row, g, image), lane j = pixel x = g + L_ j."""
-    _, C, H, W = x.shape
-    assert H == COLS * rows and W == 8 * L_
-    v = x.reshape(2, C, COLS, rows, 8, L_)  # i C c row j g
-    return v.permute(2, 3, 5, 0, 4, 1).reshape(COLS, rows * L_ * 16, C)
-
-
-def from_level_tokens(y: torch.Tensor, rows: int, L_: int) -> torch.Tensor:
-    C = y.shape[-1]
-    return y.reshape(COLS, rows, L_, 2, 8, C).permute(3, 5, 0, 1, 4, 2).reshape(2, C, COLS * rows, 8 * L_)
-
-
-def qconv_w(w: torch.Tensor) -> torch.Tensor:
-    """Conv weights (N, C, 3, 3) rounded as the B stream holds them (blocks of 8 input channels per tap)."""
-    return q(w.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-
 @pytest.mark.parametrize("H, stride, Cin, N, res", [(16, 1, 640, 640, False), (16, 1, 640, 640, True),
                                                    (8, 1, 1280, 640, True), (16, 2, 640, 640, False)])
 def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: bool) -> None:
@@ -520,20 +491,6 @@ def test_cross_attention(npu: VisionDevice, np_: int, d: int, nb: int) -> None:
             ref[sel, ch] = (p @ vq[:, ch]) / p.sum(-1, keepdim=True)
     err = rel_native(o, ref)
     assert err < 1.5e-2, err
-
-
-IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (64x64: a row's groups in their storage order, even then odd)
-
-
-def il_tokens(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """``level_tokens`` of a 64x64 level's rows (8 groups): token panel (row, group IL[k], image)."""
-    t = level_tokens(x, rows, 8)
-    return t.reshape(COLS, rows, 8, 16, -1)[:, :, list(IL)].reshape(t.shape)
-
-
-def from_il_tokens(y: torch.Tensor, rows: int) -> torch.Tensor:
-    inv = [IL.index(g) for g in range(8)]
-    return from_level_tokens(y.reshape(COLS, rows, 8, 16, -1)[:, :, inv].reshape(y.shape), rows, 8)
 
 
 @pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (320, 320, True)])

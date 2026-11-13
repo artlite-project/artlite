@@ -1,38 +1,15 @@
 """artlite-probe (models.probe) on the NPU: its table, the array clock and the DDR rates in their ranges; the rows of
 ``--pages`` on the host."""
 
-import collections
 
 import numpy as np
 import pytest
 
-from artlite import txn
 from models import probe
 
+from .dma_model import channel_rows
+
 BUFFER = 16 * probe.CHANNEL_BYTES
-
-
-def _channel_rows(words: np.ndarray) -> dict[tuple[int, int], tuple[np.ndarray, int, int]]:
-    """Per (column, BD) of a transaction: its rows' byte addresses (rows joined where they touch), a row's bytes and
-    the task's repeats (from the queue pushes)."""
-    bds, repeats = {}, collections.Counter()
-    for name, f in txn.decode(words):
-        reg = f.get("addr", 0) & 0xFFFFF
-        if name == "blockwrite" and txn.SHIM_BD0 <= reg < txn.SHIM_BD0 + txn.SHIM_BDS * txn.BD_BYTES:
-            d = f["data"]
-            n0, n1 = (d[3] >> 20) & 0x3FF, (d[4] >> 20) & 0x3FF
-            s1, s2 = (d[4] & 0xFFFFF) + 1, (d[5] & 0xFFFFF) + 1
-            count, step = (d[6] >> 20 & 0x3F) + 1, (d[6] & 0xFFFFF) + 1 if d[6] else 0  # (the iteration)
-            r = np.arange(d[0] // n0)
-            starts = d[1] + (d[2] << 32) + 4 * (r % n1 * s1 + r // n1 * s2)
-            run = 4 * n0
-            if n1 > 1 and s1 == n0:  # (a group's rows touch: one row)
-                starts, run = starts[::n1], run * n1
-            starts = np.concatenate([starts + 4 * step * j for j in range(count)])  # (the repeats of one iteration)
-            bds[f["addr"] >> 25, (reg - txn.SHIM_BD0) // txn.BD_BYTES] = starts, run
-        elif name == "write32" and reg in {q for qs in txn.QUEUE.values() for q in qs}:
-            repeats[f["addr"] >> 25, f["value"] & 0xF] += ((f["value"] >> 16) & 0xFF) + 1
-    return {key: (*rows, repeats[key]) for key, rows in bds.items()}
 
 
 def test_page_cases() -> None:
@@ -45,7 +22,7 @@ def test_page_cases() -> None:
         rows = case.rows
         for reads, writes in case.tasks():
             words, total = probe.page_transaction(case, reads, writes, src, dst)
-            channels = _channel_rows(words)
+            channels = channel_rows(words)
             assert len(channels) == len(reads) + len(writes), case.name
             seen: dict[int, set[int]] = {src: set(), dst: set()}
             for starts, run, repeat in channels.values():

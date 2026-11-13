@@ -8,16 +8,14 @@ import re
 import numpy as np
 import pytest
 
-from artlite.model_config import lfm3a_gguf, lfm3a_mmproj
+from artlite.model_config import lfm3a_gguf
 from models.lfm3a import host as A
 from models.lfm3a.live import CHUNK_ROWS, Stream
 
 from ..models import require
+from ..numerics import rel_rows
 from . import ref as R
-from .test_encoder import rel_rows
-from .test_ref import clip
-
-MMPROJ = lfm3a_mmproj()
+from .files import MMPROJ, clip
 
 
 @pytest.fixture(scope="module")

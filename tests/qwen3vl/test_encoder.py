@@ -22,10 +22,11 @@ from models.qwen3vl import encoder as E
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
+from ..common import ASTRONAUT
 from ..models import require
 from ..numerics import rel
 from . import ref as V
-from .test_ref import IMAGE, MMPROJ
+from .files import MMPROJ
 
 
 @pytest.mark.parametrize("gh, gw", [(11, 11), (16, 16), (18, 20), (64, 64), (1, 8), (3, 5), (24, 48)])
@@ -57,11 +58,6 @@ def test_layout(gh: int, gw: int) -> None:
 
 
 @pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
-
-
-@pytest.fixture(scope="module")
 def mm() -> tuple:
     require(MMPROJ)
     g = GGUFFile(MMPROJ)
@@ -73,7 +69,7 @@ def mm() -> tuple:
 
 
 def _pixels(w: int, h: int) -> np.ndarray:
-    return Q.image_pixels(load_image(IMAGE).resize((w, h)))
+    return Q.image_pixels(load_image(ASTRONAUT).resize((w, h)))
 
 
 @pytest.mark.parametrize("size, il", [((352, 352), 10), ((640, 576), 20)], ids=["nb1-l10", "nb3-l20"])

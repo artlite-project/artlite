@@ -16,11 +16,6 @@ from models.sd15 import vae
 from ..numerics import rel_native
 
 
-@pytest.fixture(scope="module")
-def npu() -> VisionDevice:
-    return VisionDevice()
-
-
 def q(x: torch.Tensor) -> torch.Tensor:
     """bfp16ebs8 rounding along the last axis (blocks of 8)."""
     return torch.from_numpy(L.unblocks(L.blocks(x.float().reshape(*x.shape[:-1], -1, 8)))).reshape(x.shape)

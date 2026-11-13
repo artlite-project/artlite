@@ -19,7 +19,7 @@ from models.lfm3a import speech as S
 from ..models import require
 from ..numerics import kl_rows
 from . import gen_ref as R
-from .test_gen_ref import MMPROJ, MODEL, TEXT
+from .files import MMPROJ, MODEL, TEXT
 
 TEXTS = [TEXT, "The quick brown fox jumps over the lazy dog, and then it runs back into the forest.",
          "Speech synthesis on a neural processing unit is a good test of small matrix programs."]

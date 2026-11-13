@@ -10,11 +10,12 @@ from artlite import txn
 from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator
 from models.diagnose import rows, telemetry
-from tests.test_probe import _channel_rows
+
+from .dma_model import channel_rows
 
 
 def _extents(words: object) -> list[tuple[int, int]]:
-    """(first byte, end) of each shim BD's transfer in a transaction: its strided rows (``_channel_rows``) or, without
+    """(first byte, end) of each shim BD's transfer in a transaction: its strided rows (``channel_rows``) or, without
     dimensions, its contiguous bytes."""
     out, strided = [], {}
     for name, f in txn.decode(words):
@@ -27,7 +28,7 @@ def _extents(words: object) -> list[tuple[int, int]]:
                 addr = d[1] + (d[2] << 32)
                 out.append((addr, addr + 4 * d[0]))
     if strided:
-        out += [(int(starts.min()), int(starts.max()) + run) for starts, run, _ in _channel_rows(words).values()]
+        out += [(int(starts.min()), int(starts.max()) + run) for starts, run, _ in channel_rows(words).values()]
     return out
 
 

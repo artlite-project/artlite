@@ -388,7 +388,7 @@ Address spaces and layout:
 
 ## 13. Numerical verification
 
-- Compare with absolute and relative tolerances (`tests/common.py` `verify_close`; ATB's GEMM: `abs_tol=0.5`,
+- Compare with absolute and relative tolerances (`tests/numerics.py` `verify_close`; ATB's GEMM: `abs_tol=0.5`,
   `rel_tol=0.10` for 2x bf16), the reference rounded to bf16 first; `torch.equal` where the arithmetic order is the
   kernel's. [ATB]
 - For large outputs a stochastic 1000-sample check is acceptable.

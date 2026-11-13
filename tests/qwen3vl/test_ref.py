@@ -11,17 +11,16 @@ import torch
 from PIL import Image
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import MODELS_DIR, ClipConfig, qwen_gguf
+from artlite.model_config import ClipConfig
 from models.qwen3vl import host as Q
 from models.sequence import load_image
 
+from ..common import ASTRONAUT
 from ..goldens.media import golden
 from ..models import require
 from . import ref as V
+from .files import MMPROJ, MODEL
 
-IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "images", "sd15-astronaut.jpg")
-MODEL = qwen_gguf("Q4_K_M", "35B-A3B")
-MMPROJ = os.path.join(MODELS_DIR, "lmstudio-community", "Qwen3.6-35B-A3B-GGUF", "mmproj-Qwen3.6-35B-A3B-BF16.gguf")
 PROMPT = "<__media__>Describe the image."
 # (the sizes keep the image's aspect: llama.cpp before its PR #30736 letterboxed the others)
 CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1536x1024": (1536, 1024)}
@@ -29,7 +28,7 @@ CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1536x1024": (153
 
 def _image(case: str, tmp: str) -> str:
     if CASES[case] is None:
-        return IMAGE
+        return ASTRONAUT
     w, h = CASES[case]
     path = os.path.join(tmp, f"{case}.png")  # (noise: the resampling exact at every pixel)
     Image.fromarray(np.random.default_rng(0).integers(0, 256, (h, w, 3), np.uint8)).save(path)
@@ -71,7 +70,7 @@ def test_pixels(case: str, tmp_path: str) -> None:
 @pytest.mark.slow  # (the whole encoder on the CPU, in float64)
 def test_encoder() -> None:
     require(MODEL, MMPROJ)
-    g = golden(MODEL, MMPROJ, IMAGE, PROMPT)
+    g = golden(MODEL, MMPROJ, ASTRONAUT, PROMPT)
     out = V.Encoder(MMPROJ).forward(g.tensor("inp_raw", 0))
     emb = g.embd(0)
     assert float(torch.linalg.norm(out - torch.from_numpy(emb).double()) / np.linalg.norm(emb)) < 2e-2

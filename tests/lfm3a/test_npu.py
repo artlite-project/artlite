@@ -17,7 +17,7 @@ from models.tokenizer import BpeTokenizer
 from ..goldens.media import golden
 from ..models import require
 from ..numerics import kl_report
-from .test_ref import MARKER, MMPROJ, MODEL, asr_text, clip
+from .files import MARKER, MMPROJ, MODEL, asr_text, clip
 
 pytestmark = pytest.mark.slow  # (the whole model)
 
