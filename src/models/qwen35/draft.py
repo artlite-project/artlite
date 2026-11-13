@@ -30,8 +30,8 @@ from collections.abc import Callable, Iterable
 
 import numpy as np
 
-from artlite.decode.design import interleave, norm_objects
 from artlite.decode.image import column_rows
+from artlite.decode.protocol import interleave, norm_objects
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS

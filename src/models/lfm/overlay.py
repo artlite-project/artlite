@@ -63,15 +63,13 @@ from artlite.decode.attn import (
     M_TOK_A,
     M_TOK_G0,
     M_TOK_NA,
-    SMAX,
     Attn,
     U,
     rope_tables,
     score_bits,
-    substeps,
-    tails,
 )
-from artlite.decode.design import (
+from artlite.decode.model import InputRegion, ModelOverlay
+from artlite.decode.protocol import (
     C_LEN,
     F_EMITR,
     F_GU,
@@ -96,7 +94,7 @@ from artlite.decode.design import (
     packed_slots,
     post_region_bytes,
 )
-from artlite.decode.model import InputRegion, ModelOverlay
+from artlite.decode.vring import substeps, tails
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LfmConfig
 from artlite.operators.design import COLS
@@ -111,7 +109,7 @@ PHASES = {"conv": ("in", "conv", "out", "gate_up", "down"), "attn": ("qkv", "att
 OPS = ("att", "conv")  # (the operator cores' phases)
 KV_K = {"single": 1, "hilo": 2}  # K precision of the caches (``kv_k``): K panels per record
 CHAIN = 2  # columns per KV head
-TOKENS = 2 * SMAX  # token objects: t = SMAX kind + a, of the sub-step from slot a on (kind 0 SWA, 1 full)
+TOKENS = 2 * SLOTS  # token objects: t = SLOTS kind + a, of the sub-step from slot a on (kind 0 SWA, 1 full)
 KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache
 KINDS = ("swa", "full")
 
@@ -203,7 +201,7 @@ class LfmOverlay(ModelOverlay):
         convs = [L for L in self.layers if self.kind(L) == "conv"]
         kvh = self.cfg.num_key_value_heads
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
-        # object of the sub-step from slot a on (its token SMAX kind + a)
+        # object of the sub-step from slot a on (its token SLOTS kind + a)
         self.att_reg = {(L, h): take("ACT", 2 * SLOTS * XB) for L in att for h in range(kvh)}
         self.conv_reg = {(L, c): take("ACT", CV.region_bytes()) for L in convs for c in range(COLS)}
         self.kv_off = {L: take("KV", kvh * self._kv_bytes(L)) for L in att}
@@ -273,7 +271,7 @@ class LfmOverlay(ModelOverlay):
              .view(np.uint8) for n in ("q", "k")}
         for h in range(cfg.num_key_value_heads):
             for a in range(SLOTS):
-                t = SMAX * kind + a
+                t = SLOTS * kind + a
                 m = np.zeros(META, np.int32)
                 m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = F_ATT, 0, 0
                 m[M_AHD], m[M_AKIND], m[M_AOWN] = self.hd, kind, 1
@@ -579,13 +577,13 @@ class LfmOverlay(ModelOverlay):
         for kind, kn in enumerate(KINDS):
             cs = rope_tables(self.inv_freq[kn], range(p, p + S), cfg.rot(kn)).view(np.uint8).reshape(-1)
             for a in range(SLOTS):  # (each token object copies the step's table; one of no sub-step: no objects)
-                o = self.tok + (SMAX * kind + a) * XB
+                o = self.tok + (SLOTS * kind + a) * XB
                 act[o + 4 * META:o + 4 * META + cs.size] = cs
                 m = act[o:o + 4 * META].view(np.int32)
                 m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[M_TOK_NA:M_TOK_NA + COLS] = 0, 0, 0
             for u, (a, n) in enumerate(st.subs):
                 r = self._ranges(kind, p + a)
-                o = self.tok + (SMAX * kind + a) * XB
+                o = self.tok + (SLOTS * kind + a) * XB
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)
                 m[M_NS], m[M_POS], m[M_TOK_A] = n, p + a, a

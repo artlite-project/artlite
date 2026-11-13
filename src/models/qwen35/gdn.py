@@ -90,37 +90,48 @@ import math
 import numpy as np
 from jinja2 import Template
 
+from artlite.decode.protocol import PHASE, SLOTS, XMETA
 from artlite.model_config import QwenConfig
 from artlite.operators import kmath, templating
 from artlite.operators.design import COLS
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.util import Attr, bf16_hilo, regions
+from artlite.operators.words import WordMap
+
+from .words import FLAGS, GDN_IN
 
 D = 128  # ssm_state: k and v dims of a head
 PANEL = 4096  # bytes of a state panel (128 i x 8 j fp32)
 D_BYTES = 4096  # bytes of a D object
-SMAX = 4  # token slots (of a 4-slot design's core)
-HIST = 3 + SMAX  # history rows of a conv object
-F_GDN = 1 << 8  # M_FLAGS of the first GDN object of a step (the other cores skip it and M_SKIP objects after it)
-F_GIN = 1 << 9  # (8 slots) M_FLAGS of the gdn_in phase's metadata object: the GDN core takes the step's words from it
+HIST = 3 + SLOTS  # history rows of a conv object
 
-# state words of the GDN core's workspace (the first ones are trip counts of its program)
+# state words of the GDN core's workspace (the first ones are trip counts of its program): one array of the three
+# layouts (4 slots, chunkwise, 8 slots), which read some words as other things (the aliases)
+STATE = WordMap("GDN core state", 19)
+_G = STATE.common
 (G_NSKIP, G_NMSG, G_ON, G_NCP, G_KO, G_PO, G_NS, G_NREP, G_CSHIFT, G_COMMIT, G_MJ, G_MS, G_CB, G_PAIR,
- G_PANEL) = range(15)
-G_KH, G_VI, G_VH = G_PAIR, G_MJ, G_MS  # (chunkwise) the k head, its v heads done, the v head in the column
-G_HK = G_KO  # (8 slots) the helper's next work: a k head's Gram blocks (1), a v head's constants (0)
-G_KSHIFT = G_PO  # (chunkwise) the k / v histories' base row (M_KSHIFT)
-G_NPD, G_NPX = G_NCP, G_COMMIT  # (8 slots) a v head's state panels with a D object (a step that ends its block: its update
-# out), without one (else: nothing of them is read)
-G_BR = 15  # (8 slots) a branching step's word (``M_BRANCH``: its parent slot + 1 | its slots << 8, or 0)
-G_WORDS = 16
-G_TA = G_WORDS  # (chunkwise) the SiLU table's addresses
-G_BN = G_WORDS + 2  # (8 slots) a branching step's branch chunk: the block's lanes through its last (0: none)
+ G_PANEL) = _G.words("G_NSKIP G_NMSG G_ON G_NCP G_KO G_PO G_NS G_NREP G_CSHIFT G_COMMIT G_MJ G_MS G_CB G_PAIR G_PANEL", at=0)
+G_KH, G_VI, G_VH = _G.alias("G_KH", G_PAIR), _G.alias("G_VI", G_MJ), _G.alias("G_VH", G_MS)  # (chunkwise) the k head, its v heads done, the v head in the column
+G_HK = _G.alias("G_HK", G_KO)  # (8 slots) the helper's next work: a k head's Gram blocks (1), a v head's constants (0)
+G_KSHIFT = _G.alias("G_KSHIFT", G_PO)  # (chunkwise) the k / v histories' base row (M_KSHIFT)
+G_NPD, G_NPX = _G.alias("G_NPD", G_NCP), _G.alias("G_NPX", G_COMMIT)  # (8 slots) a v head's state panels with a D object (a step
+# that ends its block: its update out), without one (else: nothing of them is read)
+G_BR = _G.word("G_BR")  # (8 slots) a branching step's word (``M_BRANCH``: its parent slot + 1 | its slots << 8, or 0)
+G_WORDS = G_BR + 1
+G_TA = _G.block("G_TA", 2)  # (chunkwise) the SiLU table's addresses
+G_BN = _G.word("G_BN")  # (8 slots) a branching step's branch chunk: the block's lanes through its last (0: none)
+
+
+def consts() -> dict[str, int]:
+    """The words and flags the GDN core's kernels take: the metadata words of its objects and its state words."""
+    return XMETA.consts(PHASE, GDN_IN, FLAGS) | STATE.consts()
+
+
 PAN = 72  # bytes of a bfp16 panel (8 x 8)
 # (8 slots) the GDN tile's locks of the k and v heads' constants, which the helper core computes (``hgdn``): asked, done;
-# the header's metadata word of the helper's runs per step (its heads' and the step's end); the SiLU table's two copies in the core's regions 0, 1 (bytes)
+# the SiLU table's two copies in the core's regions 0, 1 (bytes); the header's metadata word of the helper's runs per step (its
+# heads' and the step's end): ``M_HPAN``
 L_HRDY, L_HDONE = 12, 13
-M_HPAN = 35
 SILU_TAB = (0x739C0, 0x7F9C0)
 # (8 slots) the helper's scratch on the GDN tile (local address, pinned: the helper waits in ``hgdn`` until the step's end; the
 # cores address it from the workspace, the helper's view of the tile differs from the GDN core's):
@@ -170,10 +181,10 @@ class GdnShape:
     core of steps of up to ``slots`` (4: the message on M; 8: chunkwise, module docstring "8 slots"), of 4 slots ``chunk``wise
     (module docstring "Chunkwise")."""
 
-    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SMAX,
+    def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int = SLOTS,
                  chunk: bool = False):
         assert cfg.ssm_state == D and cfg.ssm_k_heads == 2 * COLS and cfg.ssm_v_heads % (2 * COLS) == 0
-        assert slots in (SMAX, 8)
+        assert slots in (SLOTS, 8)
         self.slots = slots
         self.chunk = chunk or slots == 8
         self.hc = cfg.ssm_v_heads // COLS
@@ -184,11 +195,11 @@ class GdnShape:
         self.n_msg = -(-self.msg_values // c_len)
         self.msgp = self.n_msg * c_len  # bf16 elements of a slot's message
         self.eps = cfg.rms_norm_eps
-        assert 8 * D * 2 + HIST * D * 2 + 4 * SMAX * 16 <= xpay  # a conv object
-        assert SMAX * 2 * 2 * D * 2 <= xpay and 2 * SMAX * D * 4 <= xpay  # the K and delta objects
+        assert 8 * D * 2 + HIST * D * 2 + 4 * SLOTS * 16 <= xpay  # a conv object
+        assert SLOTS * 2 * 2 * D * 2 <= xpay and 2 * SLOTS * D * 4 <= xpay  # the K and delta objects
         assert self.hc <= 8 and self.hc % 2 == 0
         # (8 slots: the gdn_in objects of a slot: qkv rows, z, ab; the ab object at a C object's start)
-        assert slots == SMAX or (self.ch + D * self.hc) % c_len == 0 and 4 * self.hc <= c_len
+        assert slots == SLOTS or (self.ch + D * self.hc) % c_len == 0 and 4 * self.hc <= c_len
 
     @property
     def n_panels(self) -> int:
@@ -262,30 +273,28 @@ class GdnShape:
             out["hb"] = out["vh"]
             assert out["vh"] + 2 * 24 * D + D_BYTES // 2 <= out["size"] and HB_R + 5 * 2 * D <= 10240, out
             return out
-        sizes = [("st", 4 * G_WORDS), ("prm", 4 * 160), ("msg", 2 * SMAX * self.msgp), ("kq", 2 * SMAX * 8 * D),
-                 ("gt", 4 * SMAX * 48), ("v", 4 * 2 * SMAX * D), ("o", 4 * 2 * SMAX * D), ("dl", 4 * 2 * SMAX * D),
-                 ("kold", 2 * SMAX * 4 * D), ("dold", 4 * SMAX * 16), ("y", max(4 * D, 2 * SMAX * D)), ("uw", 4 * 16)]
+        sizes = [("st", 4 * G_WORDS), ("prm", 4 * 160), ("msg", 2 * SLOTS * self.msgp), ("kq", 2 * SLOTS * 8 * D),
+                 ("gt", 4 * SLOTS * 48), ("v", 4 * 2 * SLOTS * D), ("o", 4 * 2 * SLOTS * D), ("dl", 4 * 2 * SLOTS * D),
+                 ("kold", 2 * SLOTS * 4 * D), ("dold", 4 * SLOTS * 16), ("y", max(4 * D, 2 * SLOTS * D)), ("uw", 4 * 16)]
         return regions(sizes)
 
-    def render(self, p: str, consts: dict[str, int]) -> str:
+    def render(self, p: str) -> str:
         strict = sum(1 << (8 * t + j) for t in range(8) for j in range(t))
         lower = sum(1 << (8 * t + j) for t in range(8) for j in range(t + 1))
         if self.chunk and self.slots == 4:
             return _SRC4.render(p=p, g=Attr(self.workspace()), gm=MATH, HC=self.hc, CH=self.ch, D=D, C_LEN=self.c_len, META=self.meta,
                                 MSGP=self.msgp, n_msg=self.n_msg, SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)),
-                                PAN=PAN, P_D=P_D, P_PRM=P_PRM, strict=f"{strict:016X}", lower=f"{lower:016X}", TAB=SILU_TAB, **consts,
-                                **{k: v for k, v in globals().items() if k.startswith("G_")})
+                                PAN=PAN, P_D=P_D, P_PRM=P_PRM, strict=f"{strict:016X}", lower=f"{lower:016X}", TAB=SILU_TAB, **consts())
         if self.slots == 8:
             return _SRC8.render(p=p, g=Attr(self.workspace()), gm=MATH, HC=self.hc, D=D, C_LEN=self.c_len, META=self.meta,
-                                SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)), F_GIN=F_GIN, F_GDN=F_GDN,
+                                SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)),
                                 H_AB=H_AB, H_PRM=H_PRM, H_DN=H_DN, HS_OFF=HS8_AT - GWS_AT, HB_V=HB_V, HB_K=HB_K, HB_Q=HB_Q, HB_R=HB_R,
                                 PAN=PAN, strict=f"{strict:016X}", lower=f"{lower:016X}", L_HRDY=L_HRDY, L_HDONE=L_HDONE,
-                                TAB=SILU_TAB, **consts, **{k: v for k, v in globals().items() if k.startswith("G_")})
+                                TAB=SILU_TAB, **consts())
         return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
-                           PANEL=PANEL, SMAX=SMAX, HIST=HIST, eps=repr(self.eps),
-                           rs=bf16_hilo(1 / math.sqrt(D)), **consts,
-                           **{k: v for k, v in globals().items() if k.startswith("G_")})
+                           PANEL=PANEL, SMAX=SLOTS, HIST=HIST, eps=repr(self.eps),
+                           rs=bf16_hilo(1 / math.sqrt(D)), **consts())
 
 
 # ----------------------------------------------------------------------
@@ -346,7 +355,7 @@ def conv_payloads(sh: GdnShape, w: np.ndarray, dt: np.ndarray, ssm_a: np.ndarray
         wb = np.stack([hi[:, b * D:(b + 1) * D], lo[:, b * D:(b + 1) * D]], 1)  # (4, 2, 128)
         out[b, :wb.nbytes] = np.ascontiguousarray(wb).view(np.uint8).reshape(-1)
     pad = np.zeros(64, np.float32)
-    pad[8 * SMAX:8 * SMAX + sh.hc], pad[8 * SMAX + 8:8 * SMAX + 8 + sh.hc] = dt, ssm_a
+    pad[8 * SLOTS:8 * SLOTS + sh.hc], pad[8 * SLOTS + 8:8 * SLOTS + 8 + sh.hc] = dt, ssm_a
     out[0, pad0:pad0 + 256] = pad.view(np.uint8)
     nb = np.asarray(norm, np.float32)
     out[1, pad0:pad0 + 256], out[2, pad0:pad0 + 256] = nb[:64].view(np.uint8), nb[64:].view(np.uint8)

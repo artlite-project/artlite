@@ -6,7 +6,7 @@ layer kind and sub-step its positions and cache ranges, the RoPE tables) and the
 embeddings, fp32); E2B / E4B then run the per-layer projection of the embeddings ("ple": column c's rows the 32 c .. of
 each layer's 256, ``image``), its rows drained as p into the gate phases' metadata objects [p: slot][256] (one BD per
 column: the gate input regions sit ``gate_pitch`` apart; e, the host's per-layer token rows sqrt(256 / 2), in the
-other half), from which each gate phase completes its column's per-layer inputs (``decode.design.F_PLI``; a step
+other half), from which each gate phase completes its column's per-layer inputs (``decode.protocol.F_PLI``; a step
 whose tokens' p the host kept, ``read_p``, writes them instead and runs without the phase: ``ple``); then per layer L
 (column c, KV head h = c / 4):
 
@@ -29,7 +29,7 @@ from the host: x), while its GEMV input is (r + v / rms(v) w_post) w1 from those
 the image, before their phase's tiles: ``image.GemmaImage.norms``) of a header: [w1 2048 | w_post 2048] per 8 input
 objects.
 
-Phase inputs are packed (``decode.design.packed_slots``): SP = 1, 2, 4 slots per k block in a step of S = 1, 2, 3 / 4
+Phase inputs are packed (``decode.protocol.packed_slots``): SP = 1, 2, 4 slots per k block in a step of S = 1, 2, 3 / 4
 slots, so a step of one token reads a quarter of the 4-slot layout's input bytes.
 
 The step's transaction is built once per S and pattern of sub-steps (and LM head or not) and patched per step: each
@@ -50,7 +50,8 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode import kv
-from artlite.decode.design import (
+from artlite.decode.model import InputRegion, ModelOverlay
+from artlite.decode.protocol import (
     C_LEN,
     F_EMITR,
     F_GU,
@@ -76,7 +77,6 @@ from artlite.decode.design import (
     packed_slots,
     post_region_bytes,
 )
-from artlite.decode.model import InputRegion, ModelOverlay
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -198,7 +198,7 @@ class GemmaOverlay(ModelOverlay):
                 self._add_inputs((L, name), post=bool(self._flags(L, name) & F_POST))
         self.final = take("ACT", post_region_bytes(H))  # (the LM header's updated residual)
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
-        # object of the sub-step from slot a on (its token SMAX kind + a)
+        # object of the sub-step from slot a on (its token SLOTS kind + a)
         self.att_reg = {(L, h): take("ACT", 2 * SLOTS * XB) for L in self.layers for h in range(AT.KV_HEADS)}
         self.kv_off: dict[int, int] = {}
         for L in self.layers:
@@ -277,7 +277,7 @@ class GemmaOverlay(ModelOverlay):
         kind = int(not cfg.swa[L])
         for h in range(AT.KV_HEADS):
             for a in range(SLOTS):
-                t = AT.SMAX * kind + a
+                t = SLOTS * kind + a
                 m = np.zeros(META, np.int32)
                 m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = AT.F_ATT, -1 - t, 0
                 m[AT.M_AHD], m[AT.M_AKIND], m[AT.M_AOWN] = cfg.head_dim(L), kind, int(src == L)
@@ -522,13 +522,13 @@ class GemmaOverlay(ModelOverlay):
             pg = self.at.pg[hd]
             cs = AT.rope_tables(cfg, list(range(p, p + S)), self.at.rot, swa=swa).view(np.uint8).reshape(-1)
             for a in range(SLOTS):  # (each token object copies the step's table; one of no sub-step: no objects)
-                o = self.tok + (AT.SMAX * kind + a) * XB
+                o = self.tok + (SLOTS * kind + a) * XB
                 act[o + 4 * META:o + 4 * META + cs.size] = cs
                 m = act[o:o + 4 * META].view(np.int32)
                 m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[AT.M_TOK_NA:AT.M_TOK_NA + COLS] = 0, 0, 0
             for u, (a, n) in enumerate(st.subs[kind]):
                 r = self._ranges(swa, p + a)
-                o = self.tok + (AT.SMAX * kind + a) * XB
+                o = self.tok + (SLOTS * kind + a) * XB
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)
                 m[M_NS], m[AT.M_POS], m[AT.M_TOK_A] = n, p + a, a
@@ -611,7 +611,7 @@ class GemmaOverlay(ModelOverlay):
         return self._e_idx
 
     def _write_pe(self, e: np.ndarray, p: np.ndarray | None) -> None:
-        """Each layer's gate meta object: e [slot 4][per_layer_dim] bf16 after p (``decode.design.F_PLI``; e: the model's
+        """Each layer's gate meta object: e [slot 4][per_layer_dim] bf16 after p (``decode.protocol.F_PLI``; e: the model's
         layers) and p (bf16 bits, the overlay's layers) when given."""
         S, d = e.shape[0], self.cfg.per_layer_dim
         idx, act = self._pe_index()[:, :S], self.dev.view("ACT").view(np.uint16)

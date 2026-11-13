@@ -39,12 +39,11 @@ keeps its transposed codes, its tables and partial sums in its scratch (``SCR_BY
 Output: y [g 2][slot][r 8] fp32 (rows 8 g ..), accumulated.
 """
 
-from dataclasses import dataclass
-
 from ..formats import FORMATS, kernel_template, slot
 from ..formats import SLOTS as FORMAT_SLOTS
 from ..formats.common import MMV_SLOTS
 from ..operators import paging, templating
+from .protocol import B_G4
 
 SLOTS = MMV_SLOTS  # token slots of an x panel (designs of 8: ``render(slots=8)``)
 KB = 8  # k per block
@@ -69,7 +68,6 @@ def scr_bytes(slots: int = SLOTS) -> int:
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
 RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS", "Q8_0")  # (``render(rg=)``) the formats of row-group tiles
 NZ_FORMATS = ("Q4_0", "Q4_1", "Q4_K", "Q5_K", "Q6_K")  # the formats whose kernels read the -z e_i panels (``_nz``)
-B_G4 = 8192  # (``decode.design``'s block format word bit of row groups of 4)
 
 
 def supported(fmt: str, nsb: int, slots: int = SLOTS) -> bool:
@@ -120,20 +118,6 @@ _SRC = templating.source("artlite/decode/gemv.cc.jinja")
 _TEMPLATE = kernel_template(_SRC)
 
 
-@dataclass(frozen=True)
-class PageSpec:
-    """Where the paged formats' pages go and come from (``render(paged=)``): the pager's state words (a core address,
-    the same on both cores), its wake lock (a core lock id), per core half the stream header of its request route and
-    the BD of its first page (``paging.request``, ``paging.Store.bd``: page i at bd0 + i - 1) and the control header
-    writing its page channel's start queue."""
-
-    state: int
-    wake: int
-    hdr: tuple[int, int]
-    bd0: tuple[int, int]
-    ctl: tuple[int, int]
-
-
 def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str, ...]]:
     """The pages of core half h (``paging.link``'s ``pages``) of ``render(p, paged=)``: per paged format its entry, in
     page-id order."""
@@ -141,7 +125,7 @@ def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str,
 
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
-           pg: PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS,
+           pg: paging.PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS,
            tab: tuple[tuple[int, int], tuple[int, int]] | None = None) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels

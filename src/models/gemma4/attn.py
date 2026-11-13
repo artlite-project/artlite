@@ -3,7 +3,7 @@ a window of W positions, every dim pair (i, i + 128) rotated) or 512 (full layer
 rotated), q / k RMS-normed per head with one weight per layer each (folded into the score constant: q_norm k_norm
 log2(e), attention scale 1), v RMS-normed without a weight, K as bfp16 hi + lo blocks (or one: ``kp``). The 4 columns
 of KV head h (4 h .. 4 h + 3) attend together, one chain of 4 with all 4 query heads of the KV head (a drafter's: 2);
-sub-steps of at most 4 slots at head_dim 256, 2 at 512. The token objects: t = SMAX kind + a per layer kind (0 SWA,
+sub-steps of at most 4 slots at head_dim 256, 2 at 512. The token objects: t = SLOTS kind + a per layer kind (0 SWA,
 1 full).
 """
 
@@ -24,23 +24,21 @@ from artlite.decode.attn import (
     M_TOK_A,
     M_TOK_G0,
     M_TOK_NA,
-    SMAX,
     Attn,
     U,
-    ring_rows,
     score_bits,
-    substeps,
-    tails,
 )
 from artlite.decode.attn import rope_tables as _rope_tables
+from artlite.decode.protocol import SLOTS
+from artlite.decode.vring import ring_rows, substeps, tails
 from artlite.operators.design import COLS
 
 __all__ = ["F_ATT", "M_AHD", "M_AKIND", "M_ANH", "M_AOWN", "M_ATOK", "M_ATREC", "M_AWIN", "M_POS", "M_QC_HI", "M_QC_LO",
-           "M_TOK_A", "M_TOK_G0", "M_TOK_NA", "SMAX", "U", "ring_rows", "substeps", "tails"]
+           "M_TOK_A", "M_TOK_G0", "M_TOK_NA", "U", "ring_rows", "substeps", "tails"]
 
 QH = 4  # query heads per KV head (one chain's columns)
 KV_HEADS = COLS // QH
-TOKENS = 2 * SMAX  # token objects: t = SMAX kind + a, of the sub-step from slot a on
+TOKENS = 2 * SLOTS  # token objects: t = SLOTS kind + a, of the sub-step from slot a on
 
 
 class GemmaAttn(Attn):
@@ -63,7 +61,7 @@ class GemmaAttn(Attn):
 
 
 def rope_tables(cfg: object, positions: list[int], rot: tuple[int, int], *, swa: bool) -> np.ndarray:
-    """(SMAX, 2 rot) fp32: per slot [cos | sin] of the rotated pairs' angles (unused slots zero)."""
+    """(SLOTS, 2 rot) fp32: per slot [cos | sin] of the rotated pairs' angles (unused slots zero)."""
     return _rope_tables(cfg.rope_inv_freq(swa=swa), positions, rot[0] if swa else rot[1])
 
 

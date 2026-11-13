@@ -933,7 +933,7 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
 {% else %}
     {
 {% endif %}
-        st[63] = 1;  // (tile: the window's end)
+        st[{{ S_TEND }}] = 1;  // (tile: the window's end)
         event0();
     }
 {% endif %}
@@ -1131,7 +1131,7 @@ void {{ p }}_tile(uint8_t *__restrict a, int32_t *__restrict ws, uint8_t *__rest
     const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     const int kc = st[{{ S_KC }}];
 {% if WIN in (5, 6, 7) %}
-    if (st[63]) {
+    if (st[{{ S_TEND }}]) {
         event1();
         ((int32_t *)st)[63] = 0;
     }

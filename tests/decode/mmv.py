@@ -15,7 +15,6 @@ from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 
-from artlite.decode.design import C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.decode.gemv import (
     KB,
     PANEL,
@@ -31,6 +30,7 @@ from artlite.decode.gemv import (
 )
 from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
+from artlite.decode.protocol import C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.formats import FORMATS, TAB, slice_fields, slot
 from artlite.gguf_model import IQ4_VALUES
 from artlite.operators import bfp16

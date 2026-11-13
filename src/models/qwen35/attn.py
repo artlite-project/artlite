@@ -95,13 +95,17 @@ panels (``mx_bytes``), idle in a sub-step.
 
 import numpy as np
 
-from artlite.decode.design import XB
 from artlite.decode.kv import Records
+from artlite.decode.protocol import META, PHASE, SLOTS, TOK_STATE, XB, XMETA
+from artlite.decode.protocol import STATE as MAIN_STATE
 from artlite.model_config import QwenConfig
 from artlite.operators import templating
 from artlite.operators.design import COLS
 from artlite.operators.kmath import SIGMOID
 from artlite.operators.util import Attr, regions, rup
+from artlite.operators.words import WordMap
+
+from .words import ATT, FLAGS
 
 HD = 256  # head_dim
 ND = HD // 8  # d-blocks (panels per record part)
@@ -111,8 +115,6 @@ POS_PER_GROUP = 32  # 4 records: a K object and a V object
 OBJS = REC.objects  # cache objects of a group
 OBJ_BYTES = 9280  # the overlay's objects: a weight tile (1024 columns: 16 rows of Q4_0, Q4_K) and a cache object
 ROT = 32  # rotated pairs (dims i, i + 32 for i < 32)
-F_ATT = 1 << 10  # M_FLAGS of an attention core's object
-SMAX = 4
 MAX_ROWS = 16  # query rows of a sub-step at most (``AttnShape.sub``), the gates in the core's sight
 MAX_ROWS_G = 24  # with the main core applying the gates (``AttnShape.main_gates``: dense models' designs)
 V_SCATTER = (18, ND, 36, 36 * ND)  # a V record's drain into its pair (txn.shim_bd dims, words): ND panels 144 B apart
@@ -125,33 +127,54 @@ EXT_W = 9728  # bytes of the main core's workspace past its residual (``decode.d
 EXT_X = 5760  # bytes of a dense design's main core's sum panels (``decode.design.xs_bytes``), idle in a sub-step
 EXT_W8, EXT_X8 = 12288, 9600  # (the same of a design of 8 slots)
 PO = 288  # bytes of an octet's P panels of a group (4 panels)
-# state words of the main core for the gates (main_gates: its workspace's words past decode.design's of a dense design):
-# the q objects to gate, those seen, the slots, the query rows per slot, the R objects of o, those relayed
-MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = range(56, 63)
+# state words of the main core for the gates (main_gates: its workspace's words past decode.protocol's of a dense design,
+# where the token objects' words are not: ``GATES``): the q objects to gate, those seen, the slots, the query rows per slot,
+# the R objects of o, those relayed
+GATES = MAIN_STATE.kind("qwen35 gates", exclusive_with=(TOK_STATE,))
+MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = GATES.words("MG_Q MG_I MG_S MG_QR MG_NO MG_E MG_SI", at=56)
 # M_SPLIT, bits 1:0: the chain divides the cache (0: each column over all of it), a round's chains do; bit 2 (a round):
 # its KV head; bit 3: no records (a round's other chain)
 SPLIT_CHAIN, SPLIT_ROUND, SPLIT_KV, SPLIT_NOREC = 1, 2, 4, 8
 
 
-# metadata words of an F_ATT object: decode.py's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A
-# objects and the tail objects), M_NREL (R objects to relay), M_POS (the first slot's position), M_SA (the first slot's
-# row of angles in the object: 0, each sub-step's object holds its own slots'), M_NTAIL (tail objects)
+# metadata words of an F_ATT object (``words.ATT``): the protocol's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the
+# cache's A objects and the tail objects), M_NREL (R objects to relay), M_POS (the first slot's position), M_SA (the first
+# slot's row of angles in the object: 0, each sub-step's object holds its own slots'), M_NTAIL (tail objects)
 
 # state words of the attention core (the first ones are trip counts of its program). A_NOBJ: the A objects before the
 # held ones; A_NKH: the sub-step group's K objects after the tails (a chain's first column, not split); A_NRM, A_VN, A_GS,
 # A_QA (one per octet): the addresses of the norms, the step's V, the gates, the Q panels; A_HP: the held objects (in
 # order), A_RW: the open records' rows (per tail object)
+STATE = WordMap("attention core state", 50)
+_A = STATE.common
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
- A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = range(31)
-A_KH, A_QA, A_HP, A_RW = 31, 32, 36, 38  # (A_KH: the KV head of the slots' K, V; A_QA: up to 4 octets)
-A_LPER = A_TP  # (a main core's phase of a packed design of 8 slots: log2 of its input objects' strips)
-A_WORDS = 40
-A_KR, A_KN, A_KM, A_KB, A_BR, A_MK, A_LN = 40, 41, 42, 43, 44, 45, 49  # (one pass) the new K's rows, panels; the merged
-# records; a branch's K panels (its rows at their positions' lanes); a branching step's word (``M_BRANCH``: its first lane in
-# its record | its slots << 8 | its record past the step's first << 12, or 0); from A_MK 4 words: the rows' masks of the
-# step's first two records (``M_AMASK``: per record those of rows 0 .. 3, 4 .. 7, a row's lanes past its position); the
-# slots' K lanes (``M_ALANE``: 3 bits a slot, a branch slot's at its position)
-ROLE_K, ROLE_V, ROLE_O = 0, 1, 2  # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
+ A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = _A.words(
+    "A_NNO A_NXN A_NXSKIP A_NASKIP A_NQ A_NQP A_NKV A_NOBJ A_NE A_TP A_TC A_S A_P A_I A_EIDX A_ROLE A_QS A_KS A_XL A_QR "
+    "A_G0 A_GATT A_GJ A_NO A_SA A_NTAIL A_SOFT A_NKH A_NRM A_VN A_GS", at=0)
+A_KH = _A.word("A_KH")  # the KV head of the slots' K, V
+A_QA = _A.block("A_QA", 4)  # up to 4 octets
+A_HP = _A.block("A_HP", HOLD)
+A_RW = _A.block("A_RW", TAILS)
+A_LPER = _A.alias("A_LPER", A_TP)  # (a main core's phase of a packed design of 8 slots) log2 of its input objects' strips
+A_WORDS = _A.next_free()
+# (one pass) the new K's rows, panels; the merged records; a branch's K panels (its rows at their positions' lanes); a
+# branching step's word (``M_BRANCH``: its first lane in its record | its slots << 8 | its record past the step's first
+# << 12, or 0); from A_MK 4 words: the rows' masks of the step's first two records (``M_AMASK``: per record those of rows
+# 0 .. 3, 4 .. 7, a row's lanes past its position); the slots' K lanes (``M_ALANE``: 3 bits a slot, a branch slot's at its
+# position)
+ONE = STATE.kind("one pass")
+A_KR, A_KN, A_KM, A_KB, A_BR = ONE.words("A_KR A_KN A_KM A_KB A_BR", at=A_WORDS)
+A_MK = ONE.block("A_MK", 4)
+A_LN = ONE.word("A_LN")
+# A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
+ROLE_K, ROLE_V, ROLE_O = _A.values("ROLE_K ROLE_V ROLE_O", of="role")
+
+
+def consts() -> dict[str, int]:
+    """The words and flags the attention core's kernels take (and the main core's, for the gates): the metadata words of its
+    objects, its state words and the main core's gate words."""
+    return XMETA.consts(PHASE, ATT, FLAGS) | STATE.consts(ONE) | GATES.consts()
+
 
 _SRC = templating.load("models/qwen35/attn.cc.jinja")
 
@@ -172,11 +195,11 @@ class AttnShape:
     memory."""
 
     def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
-                 slots: int = SMAX):
+                 slots: int = SLOTS):
         """slots: a step's slots at most (a design of 8: ``one``)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.one = slots == 8  # (module docstring "One pass")
-        self.smax = slots if self.one else SMAX
+        self.smax = slots if self.one else SLOTS
         self.kvh = cfg.num_key_value_heads
         assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay
         self.nph = COLS // self.kvh
@@ -186,13 +209,13 @@ class AttnShape:
         # (a sub-step's slots: as many as the core holds the chain's query rows for; then a step takes up to u
         # sub-steps, one more where its slots cross a group. A dense model's main core has the program memory to apply
         # the gates: then the core takes more rows)
-        self.sub1 = slots if self.one else min(SMAX, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
+        self.sub1 = slots if self.one else min(SLOTS, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
         assert self.sub1 >= 1
         # (more slots than a chain of 4 holds: two rounds, one per KV head, of both chains, each with half its heads; the
         # first chain's shims read the round's cache for the column 4 away too)
-        self.rounds = not self.one and self.nph == 4 and self.kvh == 2 and self.sub1 < SMAX
+        self.rounds = not self.one and self.nph == 4 and self.kvh == 2 and self.sub1 < SLOTS
         self.a_bcast = tuple((c, c + 4) for c in range(COLS // 2)) if self.rounds else ()
-        self.sub = SMAX if self.rounds else self.sub1
+        self.sub = SLOTS if self.rounds else self.sub1
         # (a step's sub-steps at most, a round each: one more where a sub-step of more slots than sub1 runs in two)
         self.u = 1 if self.one else -(-(slots - 1) // self.sub) + 1 + self.rounds
         self.rows = 8 * self.qc if self.one else self.sub1 * self.nph * self.qc  # (a sub-step's query rows at most)
@@ -217,7 +240,7 @@ class AttnShape:
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
-        own = [("st", 4 * (A_LN + 1 if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
+        own = [("st", 4 * (STATE.size if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
                ("pp", self.ps)]
         self.gate_tab = not self.one and not self.main_gates  # (the sigmoid's table in the core's L1)
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK + (SIGMOID.table_words().nbytes if self.gate_tab else 0)
@@ -331,16 +354,17 @@ class AttnShape:
         (qa1: octets 1, 2 of three; done with in the tails: qa1 a tail's V pair)."""
         return dict(self._ws)
 
-    def render(self, p: str, consts: dict[str, int], *, tail: int, packed8: bool = False) -> str:
-        """packed8: the main core's inputs packed in a design of 8 slots (``decode.design.M_SP``)."""
+    def render(self, p: str, *, tail: int, nx_per_norm: int, packed8: bool = False) -> str:
+        """nx_per_norm: the design's input objects per norm-weight object; packed8: the main core's inputs packed in a design of
+        8 slots (``decode.protocol.M_SP``)."""
         names = {"ws": "ws", "mw": "mw", "mx": "mx"}
         at = [(w, (names[r], off)) for w, (r, off) in self.at(tail)]
         v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
                  HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, PO=self.po, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps),
-                 C_LEN=self.c_len, OBJ=self.a_bytes, PAIR_K=2 * REC_K, NO_OBJ=32 * self.qc,
+                 C_LEN=self.c_len, META=META, NX_PER_NORM=nx_per_norm, OBJ=self.a_bytes, PAIR_K=2 * REC_K, NO_OBJ=32 * self.qc,
                  GATE_MAIN=self.main_gates, PACKED8=packed8, ROUNDS=self.rounds,
                  SPLIT_ROUND=SPLIT_ROUND, SPLIT_NOREC=SPLIT_NOREC,
-                 **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k.startswith(("A_", "ROLE_", "MG_"))}))
+                 **consts())
         if self.one:
             return _ONE.render(**v) + _MAIN_ONE.render(**v)
         return _SRC.render(**v) + (_MAIN_SRC.render(**v) if self.main_gates else "")

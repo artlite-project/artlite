@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.decode import design as OD
 from artlite.decode import kv as KV
 from artlite.decode import phases as mp
+from artlite.decode import protocol as PR
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_gguf
@@ -19,6 +19,7 @@ from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
 from models.qwen35 import decode as MD
+from models.qwen35 import words as W
 from models.qwen35.image import QwenImage
 
 from .. import np_ops
@@ -40,7 +41,7 @@ NAMES = ("attn_norm|linear_attn_qkv_mixed|z|alpha|beta|final_output|attn_residua
 class _Phases:
     """One phase per dispatch on the overlay's main and helper cores (inputs shared by the columns)."""
 
-    def __init__(self, path: str, layers: list[int], slots: int = OD.SLOTS):
+    def __init__(self, path: str, layers: list[int], slots: int = PR.SLOTS):
         self.path, self.slots = path, slots
         self.g = GGUFFile(path)
         self.cfg = cfg = QwenConfig.from_gguf(self.g)
@@ -66,52 +67,52 @@ class _Phases:
         """x (S, K) bf16 values; resid (S, H) fp32. Returns the outputs (COLS, S, objects x C_LEN) as raw bf16 bits."""
         dev, op, S, slots = self.dev, self.op, x.shape[0], self.slots
         groups = mp.groups(region, flags, S, f32_ab=f32_ab, slots=slots)
-        sp = OD.packed_slots(S) if op.packed else slots  # (a packed design: the step's slots per k block)
+        sp = PR.packed_slots(S) if op.packed else slots  # (a packed design: the step's slots per k block)
         for gr in groups:
-            gr.meta[OD.M_SP] = sp
+            gr.meta[PR.M_SP] = sp
         act = dev.view("ACT")
         act[:] = 0
         h8 = self.H // COLS
         inputs, off = [], 0
         for gr in groups:  # per group its region [metadata object | x interleaved]
-            act[off:off + 4 * OD.META] = gr.meta.view(np.uint8)
-            xi = OD.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K], sp)
-            act[off + OD.XB:off + OD.XB + xi.nbytes] = xi.view(np.uint8).reshape(-1)
+            act[off:off + 4 * PR.META] = gr.meta.view(np.uint8)
+            xi = PR.interleave(np.asarray(x)[:, gr.k0 * 1024:gr.k0 * 1024 + gr.K], sp)
+            act[off + PR.XB:off + PR.XB + xi.nbytes] = xi.view(np.uint8).reshape(-1)
             inputs.append((off, gr.K))
-            off += -(-OD.region_bytes(gr.K, slots) // 64) * 64
+            off += -(-PR.region_bytes(gr.K, slots) // 64) * 64
         loadr = off
         if resid is not None:  # per column and slot an F_LOADR object
             for c in range(COLS):
                 for s in range(S):
-                    o = loadr + (c * slots + s) * OD.XB
-                    act[o:o + 4 * OD.META] = mp.loadr_meta(s).view(np.uint8)
-                    act[o + 4 * OD.META:o + 4 * OD.META + 4 * h8] = \
+                    o = loadr + (c * slots + s) * PR.XB
+                    act[o:o + 4 * PR.META] = mp.loadr_meta(s).view(np.uint8)
+                    act[o + 4 * PR.META:o + 4 * PR.META + 4 * h8] = \
                         np.asarray(resid[s, h8 * c:h8 * (c + 1)], np.float32).view(np.uint8)
         dev.flush("ACT")
         n_norm = 0
         if norm:
             nv = dev.view("NORM")
             nv[:] = 0
-            objs = OD.norm_objects(self.norm_w(norm), op.tile_bytes)
+            objs = PR.norm_objects(self.norm_w(norm), op.tile_bytes)
             nv[:objs.nbytes] = objs.view(np.uint8).reshape(-1)
             n_norm = len(objs)
             dev.flush("NORM")
         n_obj = mmv.out_objects(region, flags, self.H, f32_ab=f32_ab)
-        assert slots * n_obj * 2 * OD.C_LEN <= self.ob
+        assert slots * n_obj * 2 * PR.C_LEN <= self.ob
         seq = Sequence(op)
-        whole = slots == 8 and flags & OD.F_EMITR  # (the residual as the next input's x lies: [k block][slot sp][8])
+        whole = slots == 8 and flags & PR.F_EMITR  # (the residual as the next input's x lies: [k block][slot sp][8])
         for c in range(COLS):  # drains [slot][objects]: object j of every slot, then j + 1
             if whole:
-                seq.drain("C", c, dev.address("OUT", c * self.ob), sp * n_obj * 2 * OD.C_LEN)
+                seq.drain("C", c, dev.address("OUT", c * self.ob), sp * n_obj * 2 * PR.C_LEN)
             else:
-                seq.drain("C", c, dev.address("OUT", c * self.ob), S * n_obj * 2 * OD.C_LEN,
-                          (OD.C_LEN // 2, S, n_obj * OD.C_LEN // 2, OD.C_LEN // 2))
+                seq.drain("C", c, dev.address("OUT", c * self.ob), S * n_obj * 2 * PR.C_LEN,
+                          (PR.C_LEN // 2, S, n_obj * PR.C_LEN // 2, PR.C_LEN // 2))
         for c in range(COLS):
             if resid is not None:
                 for s in range(S):
-                    seq.fill("X", c, dev.address("ACT", loadr + (c * slots + s) * OD.XB), OD.XB)
+                    seq.fill("X", c, dev.address("ACT", loadr + (c * slots + s) * PR.XB), PR.XB)
             for i, gr in enumerate(groups):
-                nbytes, dims = OD.input_fill(gr.K, sp, slots)
+                nbytes, dims = PR.input_fill(gr.K, sp, slots)
                 seq.fill("X", c, dev.address("ACT", inputs[i][0]), nbytes, dims)
                 if n_norm and i == 0:
                     seq.fill("A", c, dev.address("NORM"), n_norm * op.tile_bytes)
@@ -122,8 +123,8 @@ class _Phases:
         dev.fetch("OUT")
         out = dev.view("OUT").view(np.uint16).reshape(COLS, -1)
         if whole:
-            return out[:, :sp * n_obj * OD.C_LEN].reshape(COLS, -1, sp, 8)[:, :, :S].transpose(0, 2, 1, 3).reshape(COLS, S, -1).copy()
-        return out[:, :S * n_obj * OD.C_LEN].reshape(COLS, S, -1).copy()
+            return out[:, :sp * n_obj * PR.C_LEN].reshape(COLS, -1, sp, 8)[:, :, :S].transpose(0, 2, 1, 3).reshape(COLS, S, -1).copy()
+        return out[:, :S * n_obj * PR.C_LEN].reshape(COLS, S, -1).copy()
 
 
 @pytest.fixture(scope="module", params=["9B", "1B"])
@@ -187,7 +188,7 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         norm = "output_norm.weight" if L < 0 else f"blk.{L}.attn_norm.weight"
         xn, inv = mmv.norm_input(x, P.norm_w(norm), eps)
         f32_ab = phase == "gdn_in"
-        out = P.run(r, x, OD.F_NORM, norm=norm, f32_ab=f32_ab)
+        out = P.run(r, x, PR.F_NORM, norm=norm, f32_ab=f32_ab)
         if phase == "gdn_in":
             golds = [G["linear_attn_qkv_mixed", L][t], G["z", L][t],
                      np.concatenate([G["alpha", L][t], np.asarray(G["beta", L][t]).reshape(S, -1)], -1)]
@@ -220,8 +221,8 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
             "down": (G["ffn_swiglu", Lg][t], G["attn_residual", Lg][t], G["l_out", Lg][t])}[phase]
         x, resid, gold = _t(x).reshape(S, -1), _t(resid).reshape(S, -1), _t(gold).reshape(S, -1)
         x = np.pad(x, ((0, 0), (0, r.K - x.shape[1])))  # (a K padded to whole chunks: zero inputs)
-        out = P.run(r, x, OD.F_RESID | OD.F_EMITR, resid=resid)
-        xb = bf16_round(x)
+        out = P.run(r, x, PR.F_RESID | PR.F_EMITR, resid=resid)
+        xb = mmv.bf(x)
         for c in range(COLS):
             kern = bf16_round(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(img, r, c, xb)[0])
             check(from_bf16_bits(out[c, :, :h8]), kern, gold[:, h8 * c:h8 * (c + 1)])
@@ -230,7 +231,7 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
         x = _t(G["attn_residual", Lg][t]).reshape(S, -1)
         norm = f"blk.{Lg}.post_attention_norm.weight"
         xn, inv = mmv.norm_input(x, P.norm_w(norm), eps)
-        out = P.run(r, x, OD.F_NORM | OD.F_GU, norm=norm)
+        out = P.run(r, x, PR.F_NORM | PR.F_GU, norm=norm)
         ffn = cfg.intermediate_size // COLS
         sw = _t(G["ffn_swiglu", Lg][t]).reshape(S, -1)
         for c in range(COLS):
@@ -268,7 +269,7 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
     if phase in ("gdn_in", "attn_in"):
         norm = f"blk.{L}.attn_norm.weight"
         xn, inv = mmv.norm_input(x, P.norm_w(norm), P.cfg.rms_norm_eps)
-        out = P.run(r, x, OD.F_NORM, norm=norm)
+        out = P.run(r, x, PR.F_NORM, norm=norm)
         for c in range(COLS):
             kern = np.concatenate([bf16_round(y * inv[:, None]) for y in mmv.ref_rows(P.img, r, c, xn, slots)], -1)
             got = from_bf16_bits(out[c, :, :kern.shape[1]])
@@ -277,7 +278,7 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
     if phase == "gate_up":
         norm = f"blk.{L}.post_attention_norm.weight"
         xn, inv = mmv.norm_input(x, P.norm_w(norm), P.cfg.rms_norm_eps)
-        out = P.run(r, x, OD.F_NORM | OD.F_GU, norm=norm)
+        out = P.run(r, x, PR.F_NORM | PR.F_GU, norm=norm)
         ffn = P.cfg.intermediate_size // COLS
         for c in range(COLS):
             y = mmv.ref_rows(P.img, r, c, xn, slots)[0].reshape(S, -1, 2, 8) * inv[:, None, None, None]
@@ -287,7 +288,7 @@ def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
             assert rel_max(got, kern) < 1e-2, (c, rel_max(got, kern))
         return
     resid = rng.standard_normal((S, H)).astype(np.float32)
-    out = P.run(r, x, OD.F_RESID | OD.F_EMITR, resid=resid)
+    out = P.run(r, x, PR.F_RESID | PR.F_EMITR, resid=resid)
     for c in range(COLS):
         kern = bf16_round(resid[:, h8 * c:h8 * (c + 1)] + mmv.ref_rows(P.img, r, c, x, slots)[0])
         assert rel_max(from_bf16_bits(out[c, :, :h8]), kern) < 4e-3, (c, rel_max(from_bf16_bits(out[c, :, :h8]), kern))
@@ -321,14 +322,14 @@ class _Gdn:
         img.pack(dev.alloc("W", img.nbytes), release=False)
         dev.flush("W")
         self.r = r = img.region(layer, "gdn_in")
-        dev.alloc("ACT", OD.region_bytes(self.H))
+        dev.alloc("ACT", PR.region_bytes(self.H))
         nw = np.asarray(g.tensor(f"blk.{layer}.attn_norm.weight").raw, np.float32).reshape(-1)
-        objs = OD.norm_objects(nw, img.tile_bytes)
+        objs = PR.norm_objects(nw, img.tile_bytes)
         self.n_norm = len(objs)
         dev.alloc("NORM", objs.nbytes)[:] = objs.view(np.uint8).reshape(-1)
         dev.flush("NORM")
-        self.n_c = mmv.out_objects(r, OD.F_NORM, self.H, f32_ab=True)
-        self.ob = OD.SLOTS * self.n_c * 2 * OD.C_LEN
+        self.n_c = mmv.out_objects(r, PR.F_NORM, self.H, f32_ab=True)
+        self.ob = PR.SLOTS * self.n_c * 2 * PR.C_LEN
         dev.alloc("OUT", COLS * self.ob)
         self.npair = sh.hc // 2
         self.gcol = 256 + 4096 * (sh.n_slots if sh.chunk else 5 + 3 * self.npair)  # a column's GDN objects [header | payloads]
@@ -343,13 +344,13 @@ class _Gdn:
         A = np.asarray(g.tensor(f"blk.{layer}.ssm_a").raw, np.float32).reshape(-1)
         norm = np.asarray(g.tensor(f"blk.{layer}.ssm_norm.weight").raw, np.float32).reshape(-1)
         self.vh, self.params = [], []
-        meta = np.zeros(OD.META, np.int32)
-        meta[OD.M_FLAGS], meta[OD.M_SKIP] = GD.F_GDN, sh.n_objects - 1
+        meta = np.zeros(PR.META, np.int32)
+        meta[PR.M_FLAGS], meta[PR.M_SKIP] = W.F_GDN, sh.n_objects - 1
         for c in range(COLS):
             vh = gdn_v_heads(cfg, c)
             rows = blk.rows[c][blk.rows[c] >= 0]
             o = c * self.gcol
-            gobj[o:o + 4 * OD.META] = meta.view(np.uint8)
+            gobj[o:o + 4 * PR.META] = meta.view(np.uint8)
             if sh.chunk:
                 h_ = self.pay(c, 0) + GD.P_PRM
                 gobj[h_:h_ + 640] = GD.head_payload(dt[vh], A[vh], norm)
@@ -380,15 +381,15 @@ class _Gdn:
         """A chunkwise core's objects and drains (``overlay._gdn4``; its state from half h, into the other), its outputs
         into GO."""
         dev, MG, sh = self.dev, self.MG, self.sh
-        dims4 = (OD.XB // 8, 2, OD.XB // 8, OD.XPAY // 4)
+        dims4 = (PR.XB // 8, 2, PR.XB // 8, PR.XPAY // 4)
         units = [u for kh in range(2) for u in [("k", kh)] + [("v", h) for h in range(kh, sh.hc, 2)]]
 
         def fills(kind: str, i: int, c: int) -> None:
             if kind == "k":
-                seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i)) - 256), MG.KH_SPAN4 * OD.XB, dims4)
+                seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i)) - 256), MG.KH_SPAN4 * PR.XB, dims4)
                 return
-            seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) - 256), MG.V_SPAN4 * OD.XB, dims4)
-            seq.fill("X", c, dev.address("GSTATE", h * self.half + c * self.ps + 16 * i * MG.PANEL), 16 * OD.XB, dims4)
+            seq.fill("X", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) - 256), MG.V_SPAN4 * PR.XB, dims4)
+            seq.fill("X", c, dev.address("GSTATE", h * self.half + c * self.ps + 16 * i * MG.PANEL), 16 * PR.XB, dims4)
 
         def drains(kind: str, i: int, c: int) -> None:
             if kind == "k":
@@ -409,36 +410,36 @@ class _Gdn:
     def _transaction(self, S: int, msg: bool, h: int = 0) -> Transaction:
         dev, op, r = self.dev, self.op, self.r
         MG = self.MG
-        groups = mp.groups(r, OD.F_NORM | (OD.F_MSG if msg else 0), S, f32_ab=True)
+        groups = mp.groups(r, PR.F_NORM | (PR.F_MSG if msg else 0), S, f32_ab=True)
         assert len(groups) == 1
         seq = Sequence(op)
         for c in range(COLS):
             seq.fill("A", c, dev.address("NORM"), self.n_norm * op.tile_bytes)
             for o, n, dims, rep, it in mp.a_reads(r, c, groups[0]):
                 seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
-        dims4 = (OD.XB // 8, 2, OD.XB // 8, OD.XPAY // 4)
+        dims4 = (PR.XB // 8, 2, PR.XB // 8, PR.XPAY // 4)
         # (in rounds over the columns, each round's drains before the next round's fills: a fifth task on a channel
         # waits for its oldest, which must not need a later round)
         for c in range(COLS):
-            nbytes, dims = OD.input_fill(self.H)
+            nbytes, dims = PR.input_fill(self.H)
             seq.fill("X", c, dev.address("ACT"), nbytes, dims)
             if msg and not self.sh.chunk:
-                seq.fill("X", c, dev.address("GOBJ", c * self.gcol), 5 * OD.XB, dims4)
+                seq.fill("X", c, dev.address("GOBJ", c * self.gcol), 5 * PR.XB, dims4)
         if msg and self.sh.chunk:
             self._chunk_units(seq, h)
             seq.sync(fills=True)
             return Transaction(dev, seq.words())
         for c in range(COLS):
             if not msg:
-                seq.drain("C", c, dev.address("OUT", c * self.ob), S * self.n_c * 2 * OD.C_LEN,
-                          (OD.C_LEN // 2, S, self.n_c * OD.C_LEN // 2, OD.C_LEN // 2))
+                seq.drain("C", c, dev.address("OUT", c * self.ob), S * self.n_c * 2 * PR.C_LEN,
+                          (PR.C_LEN // 2, S, self.n_c * PR.C_LEN // 2, PR.C_LEN // 2))
                 continue
             seq.drain("D", c, dev.address("GOBJ", self.pay(c, 0) + 2048), 2 * MG.D_BYTES, (512, 2, 1024, 2048))
             seq.drain("D", c, dev.address("GOBJ", self.pay(c, 4)), MG.D_BYTES)
         for p in range(self.npair if msg else 0):
             for c in range(COLS):
-                seq.fill("X", c, dev.address("GOBJ", self.pay(c, 5 + 3 * p) - 256), 3 * OD.XB, dims4)
-                seq.fill("X", c, dev.address("GSTATE", c * self.ps + 32 * p * MG.PANEL), 32 * OD.XB, dims4)
+                seq.fill("X", c, dev.address("GOBJ", self.pay(c, 5 + 3 * p) - 256), 3 * PR.XB, dims4)
+                seq.fill("X", c, dev.address("GSTATE", c * self.ps + 32 * p * MG.PANEL), 32 * PR.XB, dims4)
             for c in range(COLS):
                 seq.drain("D", c, dev.address("GOBJ", self.pay(c, 5 + 3 * p) + 2048), MG.D_BYTES, (512, 2, 1024, 1024))
                 seq.drain("D", c, dev.address("GSTATE", 256 + c * self.ps + 32 * p * MG.PANEL), 32 * MG.PANEL)
@@ -455,18 +456,18 @@ class _Gdn:
         dev, hc, ch, S = self.dev, self.sh.hc, self.sh.ch, x.shape[0]
         out = []
         for msg in (False, True):
-            gr = mp.groups(self.r, OD.F_NORM | (OD.F_MSG if msg else 0), S, f32_ab=True)[0]
-            gr.meta[MD.M_NREP], gr.meta[MD.M_CSHIFT], gr.meta[MD.M_COMMIT] = nrep, cshift, int(commit)
-            gr.meta[MD.M_KSHIFT] = kshift
+            gr = mp.groups(self.r, PR.F_NORM | (PR.F_MSG if msg else 0), S, f32_ab=True)[0]
+            gr.meta[W.M_NREP], gr.meta[W.M_CSHIFT], gr.meta[W.M_COMMIT] = nrep, cshift, int(commit)
+            gr.meta[W.M_KSHIFT] = kshift
             act = dev.view("ACT")
             act[:] = 0
-            act[:4 * OD.META] = gr.meta.view(np.uint8)
-            act[OD.XB:] = OD.interleave(x).view(np.uint8).reshape(-1)
+            act[:4 * PR.META] = gr.meta.view(np.uint8)
+            act[PR.XB:] = PR.interleave(x).view(np.uint8).reshape(-1)
             dev.flush("ACT")
             dev.dispatch(self._transaction(S, msg, half))
             if not msg:
                 dev.fetch("OUT")
-                raw = dev.view("OUT").view(np.uint16).reshape(COLS, -1)[:, :S * self.n_c * OD.C_LEN].reshape(COLS, S, -1)
+                raw = dev.view("OUT").view(np.uint16).reshape(COLS, -1)[:, :S * self.n_c * PR.C_LEN].reshape(COLS, S, -1)
                 msgs = []
                 for c in range(COLS):
                     m = []
@@ -478,15 +479,15 @@ class _Gdn:
                     msgs.append(m)
         dev.fetch("GO")
         if self.sh.chunk:
-            go = dev.view("GO").view(np.uint16).reshape(COLS, hc, -1)[:, :, :16 * OD.SLOTS * 8]
+            go = dev.view("GO").view(np.uint16).reshape(COLS, hc, -1)[:, :, :16 * PR.SLOTS * 8]
             for c in range(COLS):
                 for h in range(hc):
-                    out.append(from_bf16_bits(go[c, h]).reshape(16, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
+                    out.append(_bf16(go[c, h]).reshape(16, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, 128))
             return msgs, np.stack(out, 1)
-        go = dev.view("GO").view(np.uint16).reshape(COLS, self.npair, -1)[:, :, :2 * 16 * OD.SLOTS * 8]
+        go = dev.view("GO").view(np.uint16).reshape(COLS, self.npair, -1)[:, :, :2 * 16 * PR.SLOTS * 8]
         for c in range(COLS):
             for p in range(self.npair):
-                o = from_bf16_bits(go[c, p]).reshape(2, 16, OD.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
+                o = _bf16(go[c, p]).reshape(2, 16, PR.SLOTS, 8)[:, :, :S].transpose(2, 0, 1, 3).reshape(S, 2, 128)
                 out.append(o)
         return msgs, np.stack(out, 1).reshape(S, -1, 128)
 
@@ -685,7 +686,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     assert one or ((p + S - 1) // 32 == g and A1.AttnShape.splits(g) == bool(split))
     rounds = split == A1.SPLIT_ROUND
     P = 32 * ((p + S - 1) // 32 + 1)  # (cache positions: whole groups)
-    slots = 8 if one else A1.SMAX
+    slots = 8 if one else PR.SLOTS
     ash = A1.AttnShape(cfg, P, slots=slots)
     op = MD.QwenDecodeOperator(hidden=cfg.hidden_size, rows={"Q4_K": 16}, eps=cfg.rms_norm_eps, attn=ash, slots=slots)
     dev = OverlayDevice(op)
@@ -724,43 +725,43 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     nt = ash.records(S)
     rnds = (A1.SPLIT_ROUND, A1.SPLIT_ROUND | A1.SPLIT_KV) if rounds else (int(split),)  # (the sub-step's rounds)
     # X: per column [F_ATT | q objects SLOTS], then the raw K, V objects (shared), then per column a second round's F_ATT
-    per = (1 + slots) * OD.XB
-    act = dev.alloc("ACT", COLS * per + S * OD.XB + COLS * OD.XB)
+    per = (1 + slots) * PR.XB
+    act = dev.alloc("ACT", COLS * per + S * PR.XB + COLS * PR.XB)
 
     def fatt(c: int, u: int) -> int:
-        return c * per if u == 0 else COLS * per + S * OD.XB + c * OD.XB
+        return c * per if u == 0 else COLS * per + S * PR.XB + c * PR.XB
 
     for c in range(COLS):
         k = c % nph
         tl = nt if not split or k == nph - 1 else 0
         for u, sp in enumerate(rnds):
-            m = np.zeros(OD.META, np.int32)
+            m = np.zeros(PR.META, np.int32)
             sw = ash.round_word(sp, c)
-            m[OD.M_FLAGS], m[OD.M_NS], m[OD.M_SKIP] = A1.F_ATT, S, (3 if rounds else nph + 1 if split else 2) * S
-            m[OD.M_NREL], m[MD.M_POS], m[MD.M_SPLIT] = ash.n_rel(c, sw, S), p, sw
-            m[MD.M_NTAIL] = tl
+            m[PR.M_FLAGS], m[PR.M_NS], m[PR.M_SKIP] = W.F_ATT, S, (3 if rounds else nph + 1 if split else 2) * S
+            m[PR.M_NREL], m[W.M_POS], m[W.M_SPLIT] = ash.n_rel(c, sw, S), p, sw
+            m[W.M_NTAIL] = tl
             if not split:  # (a chain's first column: then group g's K and V objects, for its K records; one pass: none)
-                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
+                m[PR.M_NASKIP], m[W.M_G0], m[W.M_GATT] = o_k * G + tl + (2 if k == 0 and not one else 0), 0, 1 << 20
             elif k == 0:  # (then group g's K and V objects)
-                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT], m[MD.M_GJ] = o_k * b[1] + 2, 0, b[1], g
+                m[PR.M_NASKIP], m[W.M_G0], m[W.M_GATT], m[W.M_GJ] = o_k * b[1] + 2, 0, b[1], g
             else:
-                m[OD.M_NASKIP], m[MD.M_G0], m[MD.M_GATT] = o_k * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
+                m[PR.M_NASKIP], m[W.M_G0], m[W.M_GATT] = o_k * (b[k + 1] - b[k]) + tl, b[k], 1 << 20
             if one:  # (on the first column's stream; the rows' masks and K lanes)
-                m[MD.M_ANA], m[OD.M_NASKIP] = m[OD.M_NASKIP], 0 if k else m[OD.M_NASKIP]
-                m[MD.M_BRANCH], w, m[MD.M_ALANE] = A1.step_words(p, S)
-                m[MD.M_AMASK:MD.M_AMASK + 4] = w.view(np.int32)
+                m[W.M_ANA], m[PR.M_NASKIP] = m[PR.M_NASKIP], 0 if k else m[PR.M_NASKIP]
+                m[W.M_BRANCH], w, m[W.M_ALANE] = A1.step_words(p, S)
+                m[W.M_AMASK:W.M_AMASK + 4] = w.view(np.int32)
             o = fatt(c, u)
-            act[o:o + 4 * OD.META] = m.view(np.uint8)
+            act[o:o + 4 * PR.META] = m.view(np.uint8)
             nrm = np.zeros(2 * HD + 64 * ash.smax, np.float32)
             nrm[:HD], nrm[HD:2 * HD] = qn * np.float32(np.log2(np.e) / 16), kn
             for s in range(S):
                 nrm[2 * HD + 64 * s:2 * HD + 64 * s + 64] = np.concatenate(cs[s])
-            act[o + 4 * OD.META:o + 4 * OD.META + nrm.nbytes] = nrm.view(np.uint8)
+            act[o + 4 * PR.META:o + 4 * PR.META + nrm.nbytes] = nrm.view(np.uint8)
         for s in range(S):
-            q0 = c * per + (1 + s) * OD.XB + 4 * OD.META
+            q0 = c * per + (1 + s) * PR.XB + 4 * PR.META
             act[q0:q0 + 2 * qc * 2 * HD] = interleave_bits(qg[c, s].reshape(-1))
     for s in range(S):
-        k0 = COLS * per + s * OD.XB + 4 * OD.META
+        k0 = COLS * per + s * PR.XB + 4 * PR.META
         act[k0:k0 + 2 * kvh * 2 * HD] = interleave_bits(kv[s].reshape(-1))
     dev.flush("ACT")
     ob = nph * qc * 32 * (8 if one else S) * 16  # (o of a chain's heads)
@@ -774,7 +775,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
             k, role = c % nph, ash.role(c)
             if rounds and c >= nph:  # (the first chain's streams, for the column 4 away too)
                 continue
-            pk = {"packet": OD.AB_ID + ash.a_bcast.index((c, c + nph))} if rounds else {}
+            pk = {"packet": PR.AB_ID + ash.a_bcast.index((c, c + nph))} if rounds else {}
             h = kh if rounds else c // nph
             base, ring = dev.address("KV", h * hb), dev.address("KV", kvh * hb + h * rb)
             if not split:
@@ -792,14 +793,14 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     def inputs(u: int) -> None:
         kh = (rnds[u] & A1.SPLIT_KV) >> 2
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", fatt(c, u)), OD.XB)
+            seq.fill("X", c, dev.address("ACT", fatt(c, u)), PR.XB)
             if split:  # (the q objects of the chain's columns in order; a round: its half of the KV head's)
                 q0, nc = (kh * nph + 2 * (c // nph), 2) if rounds else (c - c % nph, nph)
                 for c1 in range(q0, q0 + nc):
-                    seq.fill("X", c, dev.address("ACT", c1 * per + OD.XB), S * OD.XB)
+                    seq.fill("X", c, dev.address("ACT", c1 * per + PR.XB), S * PR.XB)
             else:
-                seq.fill("X", c, dev.address("ACT", c * per + OD.XB), S * OD.XB)
-            seq.fill("X", c, dev.address("ACT", COLS * per), S * OD.XB)
+                seq.fill("X", c, dev.address("ACT", c * per + PR.XB), S * PR.XB)
+            seq.fill("X", c, dev.address("ACT", COLS * per), S * PR.XB)
 
     def outputs(u: int) -> None:
         for c in range(COLS):
@@ -1000,8 +1001,8 @@ def test_moe_slice(first: int) -> None:
         ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
         for i, L in enumerate(layers):
             got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = rel_max(got, np.asarray(G_["l_out", L][t], np.float32))
-            o = ov.xch[L] + 4 * OD.META  # (the route object's payload: [slot][expert] fp32)
+            errs[t, i] = ref.rel_err(got, np.asarray(G_["l_out", L][t], np.float32))
+            o = ov.xch[L] + 4 * PR.META  # (the route object's payload: [slot][expert] fp32)
             ov.dev.fetch("ACT", o, 4 * E)
             lg = ov.dev.view("ACT")[o:o + 4 * E].view(np.float32)
             want = np.asarray(G_["ffn_moe_logits", L][t], np.float32)
@@ -1096,30 +1097,30 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     dev = ov.dev
     dev.fetch("ACT")
     act = dev.view("ACT")
-    off = ov.inp[(L, "moe_in")][0].off + OD.XB
-    xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, OD.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
+    off = ov.inp[(L, "moe_in")][0].off + PR.XB
+    xin = _bf16(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
     b = f"blk.{L}."
     xn = np_ops.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
                       cfg.rms_norm_eps)
     W = np.asarray(g.tensor(b + "ffn_gate_inp.weight").raw, np.float32).reshape(cfg.n_experts, H)
     lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
-    o = ov.xch[L] + 4 * OD.META
-    lg = act[o:o + 4096].view(np.float32).reshape(OD.SLOTS, -1)[:S]
-    assert rel_max(lg, lg_ref) < 3e-5, rel_max(lg, lg_ref)
+    o = ov.xch[L] + 4 * PR.META
+    lg = act[o:o + 4096].view(np.float32).reshape(PR.SLOTS, -1)[:S]
+    assert ref.rel_err(lg, lg_ref) < 3e-5, ref.rel_err(lg, lg_ref)
     ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
     rids, rw = moe_ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
     assert np.array_equal(ids, rids)
     gu = ov.image.region(L, "exp_gu")
     for c in range(COLS):
-        cp = act[ov.cp[L] + c * (CP_BYTES + OD.XB):][:CP_BYTES].view(np.uint32)
+        cp = act[ov.cp[L] + c * (CP_BYTES + PR.XB):][:CP_BYTES].view(np.uint32)
         assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset), stride=gu.col_stride,
                                                                      a_packet=ov.op.PACKET.get("A"))), c
-        em = cp[MR.RBUF_META:MR.RBUF_META + OD.META].view(np.int32)
+        em = cp[MR.RBUF_META:MR.RBUF_META + PR.META].view(np.int32)
         dn = ov.image.region(L, "exp_down")
         nh = sum(h1 - h0 + 1 for _, h0, h1 in items[c])
-        assert (em[OD.M_NITEM], em[OD.M_NT]) == (len(items[c]), nh * (gu.n_rt * gu.n_kc + dn.n_rt * dn.n_kc)), c
+        assert (em[PR.M_NITEM], em[PR.M_NT]) == (len(items[c]), nh * (gu.n_rt * gu.n_kc + dn.n_rt * dn.n_kc)), c
         for i, (e, h0, h1) in enumerate(items[c]):
-            it = em[OD.M_ITEM + OD.ITEM_WORDS * i:][:OD.ITEM_WORDS]
+            it = em[PR.M_ITEM + PR.ITEM_WORDS * i:][:PR.ITEM_WORDS]
             assert it[0] == e | h0 << 8 | h1 << 9
             assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (c, i)
     ex = moe_ref.experts(g, L)

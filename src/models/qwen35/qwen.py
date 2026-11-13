@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from artlite.decode.design import XB
+from artlite.decode.protocol import XB
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer

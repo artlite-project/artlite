@@ -56,4 +56,4 @@ Speed and accuracy (E4B Q4_0, Strix):
 | after a prompt through the prefill | KL 0.00020 (34 tokens); its KV caches within 1-3% of the decode path's at every position through layer 11 (deeper layers amplify the prefill's rounding at a few positions) |
 | determinism | a token's logits depend on the tokens up to it only: not on the other slots of its dispatch, nor on rejected drafts; steps of 1-4 tokens give the same logits bit for bit (greedy text with drafts is the text without) |
 
-Design: the module docstrings of `decode/design.py` and `gemma4/`.
+Design: the module docstrings of `decode/protocol.py`, `decode/design.py` and `gemma4/`.

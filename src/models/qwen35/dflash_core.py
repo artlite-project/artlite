@@ -36,15 +36,17 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
-from artlite.decode import design as OD
-from artlite.decode.design import C_LEN, META, XPAY, DecodeOverlayOperator, _Streams
+from artlite.decode.design import DecodeOverlayOperator, _Streams
 from artlite.decode.kv import Records
+from artlite.decode.protocol import C_LEN, M_MODEL, META, PHASE, XMETA, XPAY
 from artlite.model_config import DFlashConfig
 from artlite.operators import templating
 from artlite.operators.design import COLS
 from artlite.operators.util import Attr, regions
+from artlite.operators.words import WordMap
 
 from .attn import OBJ_BYTES
+from .words import FLAGS
 
 HD, QC, QH = 128, 4, 8 * 128  # (a head's dims, the query heads per column, the rows' stride of an octet)
 ND = HD // 8
@@ -57,26 +59,38 @@ OPEN_BYTES = 4 * ROWS_B  # the open object's rows
 PAIR = 2 * REC_K  # a pair of records
 PO = 288  # an octet's P panels of 4 records
 CHUNK = 4 * PO  # the 4 octets' P panels of 4 records
-F_ATT = 1 << 10  # M_FLAGS of an attention step's first object
-F_CV = 1 << 11  # M_FLAGS of a conv core's object
 CV_LOAD, CV_IN, CV_OUT = range(3)
 D_BYTES = 2048  # a conv core's D object: 16 k blocks of x
 XK = 80  # k blocks of a column's x
 H8 = 8 * XK  # a column's channels
 GROUPS = H8 // 16  # conv groups of a column
 DYN_ROWS = 192  # dyn's rows per slot in its object: whole C objects of its 160
-M_CVOP, M_CVNE, M_POS, M_INJ, M_KEEP, M_ANOBJ, M_G0 = range(OD.M_MODEL, OD.M_MODEL + 7)
+# metadata words: a conv core's object (``CONV``: the flag ``F_CV``, the op and the objects' count) and an attention step's first
+# object (``ATT``: ``words.F_ATT``)
+CONV = XMETA.kind("dflash conv")
+F_CV = CONV.flag("F_CV", 11)  # M_FLAGS of a conv core's object
+M_CVOP, M_CVNE = CONV.words("M_CVOP M_CVNE", at=M_MODEL)
+ATT = XMETA.kind("dflash attention")
+M_POS, M_INJ, M_KEEP, M_ANOBJ, M_G0 = ATT.words("M_POS M_INJ M_KEEP M_ANOBJ M_G0", at=M_MODEL + 2)
 # conv core state words (the first ones are trip counts of its program)
-V_NSKIP, V_NOBJ, V_NE, V_OP, V_I, V_IE = range(6)
+CONV_STATE = WordMap("conv core state", 16)
+V_NSKIP, V_NOBJ, V_NE, V_OP, V_I, V_IE = CONV_STATE.common.words("V_NSKIP V_NOBJ V_NE V_OP V_I V_IE", at=0)
 # attention core state words (the first ones are trip counts of its program)
-(A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NSTEP, A_NQ, A_NE1, A_NOBJ, A_NE, A_XL, A_LPER, A_P, A_S, A_INJ, A_KEEP, A_I, A_G0, A_QS,
- A_EIDX, A_SOFT, A_NRM, A_ROPE, A_KO, A_VO) = range(24)
 STATE_WORDS = 32
-assert A_VO < STATE_WORDS
+STATE = WordMap("attention core state", STATE_WORDS)
+(A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NSTEP, A_NQ, A_NE1, A_NOBJ, A_NE, A_XL, A_LPER, A_P, A_S, A_INJ, A_KEEP, A_I, A_G0, A_QS,
+ A_EIDX, A_SOFT, A_NRM, A_ROPE, A_KO, A_VO) = STATE.common.words(
+    "A_NNO A_NXN A_NXSKIP A_NASKIP A_NSTEP A_NQ A_NE1 A_NOBJ A_NE A_XL A_LPER A_P A_S A_INJ A_KEEP A_I A_G0 A_QS A_EIDX "
+    "A_SOFT A_NRM A_ROPE A_KO A_VO", at=0)
 STACK = 1600
 V_STACK = 1024
 NE_BLOCK = QC * ND  # R objects of a block's o
 NE_INJ = (OPEN_BYTES + 2 * REC_K) // (2 * C_LEN)  # R objects of an injection: the open object, a record's K and V panels
+
+def consts() -> dict[str, int]:
+    """The words and flags the drafter's cores' kernels take: the metadata words of their objects and their state words."""
+    return XMETA.consts(PHASE, CONV, ATT, FLAGS) | CONV_STATE.consts() | STATE.consts()
+
 
 _CONV = templating.load("models/qwen35/dflash_core.conv.cc.jinja")
 
@@ -115,14 +129,14 @@ class DFlashShape:
         """Regions in the main core's idle memory, past its residual: offsets from there."""
         return regions([("nrm", 4 * 2 * HD), ("rope", 4 * 128 * 8), ("ko", PAIR), ("vo", PAIR)])
 
-    def render(self, p: str, consts: dict[str, int], *, tail: int) -> str:
+    def render(self, p: str, *, tail: int, nx_per_norm: int) -> str:
         e = self.ext()
         at = [(A_NRM, tail + e["nrm"]), (A_ROPE, tail + e["rope"]), (A_KO, tail + e["ko"]), (A_VO, tail + e["vo"])]
         v = dict(p=p, a=Attr(self.workspace()), v=Attr(self.conv_workspace()), at=at, QC=QC, SETS=self.sets, HD=HD, ND=ND, PO=PO, CHUNK=CHUNK,
                  PAIR=PAIR, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, OPEN_BYTES=OPEN_BYTES, C_LEN=C_LEN, eps=repr(self.eps),
-                 WINDOW=self.window, META=META, XPAY=XPAY, H8=H8, XK=XK, GROUPS=GROUPS, DYN_ROWS=DYN_ROWS, H=self.cfg.hidden,
+                 WINDOW=self.window, META=META, XPAY=XPAY, H8=H8, XK=XK, NX_PER_NORM=nx_per_norm, GROUPS=GROUPS, DYN_ROWS=DYN_ROWS, H=self.cfg.hidden,
                  NO_OBJ=NE_BLOCK, NE_INJ=NE_INJ, CV_LOAD=CV_LOAD, CV_IN=CV_IN, CV_OUT=CV_OUT,
-                 **(consts | {"F_ATT": F_ATT, "F_CV": F_CV} | {k: w for k, w in globals().items() if k.startswith(("A_", "V_", "M_"))}))
+                 **consts())
         return _CONV.render(**v) + _ATT.render(**v)
 
 
@@ -131,6 +145,7 @@ class DFlashOperator(DecodeOverlayOperator):
     cores' sizes."""
 
     PREFIX = "dfl"
+    META_KINDS = (FLAGS, CONV, ATT)  # (the conv and attention cores')
     A_FWD = 2
     LENDS_WS = True
     CONV_ROW, ATTN_ROW = 2, 5
@@ -141,14 +156,10 @@ class DFlashOperator(DecodeOverlayOperator):
         self.relay = True
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, slots=8, packed=True, bcast=True)
 
-    def _consts(self) -> dict[str, int]:
-        return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
-
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         W = self.workspace()
         assert W["size"] - W["inv"] >= self.shape.ext()["size"], W
-        return self.shape.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                 | {"NX_PER_NORM": self.nx_per_norm}, tail=W["inv"])
+        return self.shape.render(p, nx_per_norm=self.nx_per_norm, tail=W["inv"])
 
     @property
     def d_cols(self) -> list[int]:

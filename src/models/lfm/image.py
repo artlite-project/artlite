@@ -18,7 +18,7 @@ Per-column rows (layer L, column c; an attention layer's KV head h = c / 2, j = 
   whole K chunks with zero super-blocks (8192);
 - "lm": rows vocab / 8 c .. of ``token_embd`` (the tied LM head; 128000: 250 C objects per column).
 
-Normed phases ("in", "qkv", "gate_up", "lm") are headers of the post-norm residual update (``decode.design.F_POST``:
+Normed phases ("in", "qkv", "gate_up", "lm") are headers of the post-norm residual update (``decode.protocol.F_POST``:
 the sandwich norms), their norm-weight objects [w1 | w_post] per 8 input objects: "in" / "qkv" (w1 = ``attn_norm``,
 w_post = the previous layer's ``post_ffw_norm``; the first layer's: a plain input, w1 alone), "gate_up" (``ffn_norm``,
 ``post_attention_norm``), "lm" (``output_norm``, the last layer's ``post_ffw_norm``).
@@ -27,8 +27,8 @@ w_post = the previous layer's ``post_ffw_norm``; the first layer's: a plain inpu
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite.decode.design import MAX_K, NX_PER_NORM, OBJ_K, POST_K
 from artlite.decode.image import TileImage, column_rows, gate_up_rows
+from artlite.decode.protocol import MAX_K, NX_PER_NORM, OBJ_K, POST_K
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LfmConfig
 from artlite.operators.design import COLS
@@ -76,7 +76,7 @@ class LfmImage(TileImage):
 
     def norms(self, L: int, name: str) -> tuple[str, str | None]:
         """(w1, w_post) tensor names of a normed phase; w_post None: a plain normed input (the slice's first layer),
-        else a header (``decode.design.F_POST``)."""
+        else a header (``decode.protocol.F_POST``)."""
         b = f"blk.{L}."
         if name in ("in", "qkv"):
             if L == self.layers[0]:

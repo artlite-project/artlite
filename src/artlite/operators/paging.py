@@ -270,6 +270,21 @@ def request(*, stream_id: int, channel: int) -> tuple[int, int]:
 
 
 @dataclass(frozen=True)
+class PageSpec:
+    """Where a core's pages come from, as its kernel source needs it (the memtile transport; ``source``'s ``pg_request``
+    takes ``hdr`` and ``ctl``): the pager's state words (a core address), its wake lock (a core lock id) and, per core
+    half that pages (a core of the column, or two sharing the kernels: a decode design's main and helper cores), the
+    stream header of the half's request route (``request``), the BD of its first page (``Store.bd``: page i at
+    bd0 + i - 1) and the control header writing its page channel's start queue (``request``)."""
+
+    state: int
+    wake: int
+    hdr: tuple[int, ...]
+    bd0: tuple[int, ...]
+    ctl: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Store:
     """A column's page store (memtile transport): the page streams of ``pagers`` (one per core of the column that
     pages, its ``stream_id`` its ``page_flow``'s) in the ``size`` memtile bytes from ``base`` (the design's reserved

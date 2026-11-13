@@ -19,8 +19,8 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.decode.design import SLOTS as NB
-from artlite.decode.design import XB, packed_slots
+from artlite.decode.protocol import SLOTS as NB
+from artlite.decode.protocol import XB, packed_slots
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import assistant_of, gemma_gguf
 from models.common import Sampling

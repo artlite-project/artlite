@@ -16,31 +16,10 @@ Streams (shim channels fixed: ``ENDPOINTS``): A (weight tiles, norm-weight objec
 X (activation objects, other cores' objects) shim MM2S 1 -> memtile -> main (and the model's cores); C (main's outputs,
 objects of ``C_LEN`` bf16) -> shim S2MM 0; D (a model core's outputs) -> shim S2MM 1.
 
-X objects (``XB`` bytes): ``META`` metadata words, then a payload of ``XPAY`` bytes. A phase's input of K elements
-per slot lives in DDR as ``[metadata object | x]`` (``region_bytes(K)``), x slot-interleaved: [k block K / 8][slot
-4][8] bf16 (unused slots zero; ``packed`` designs: the step's slots only, [k block][slot SP][8], ``packed_slots``: an
-input object then holds 4 / SP strips of ``OBJ_K`` k); one shim BD reads it as the metadata object and the input
-objects, each the ``XB`` bytes that end with its part of x (``input_fill``: its first ``4 META`` bytes are the
-previous ones' end, unread). Outputs go out per slot: whenever every slot has ``C_LEN`` new values, one C object per slot
-(slot 0 .. S - 1), so that one drain BD scatters a column's outputs (into the next input's interleaved layout or by
-slot).
+X objects (``XB`` bytes: ``META`` metadata words, then a payload; a phase's input in DDR, its layout, the main core's
+program per object): ``decode.protocol``, which declares the words, flags and ids the cores and the host share.
 
-The main core's program, per X object (``_begin``):
-
-- without ``F_MAIN``: an object of another core (``M_SKIP`` more X objects, ``M_NASKIP`` A objects belong to it;
-  ``M_NREL`` R objects to relay);
-- ``F_LOADR``: the payload holds slot ``M_SLOT``'s part of the residual stream (fp32, hidden / 8 values: the column's
-  rows of every output projection), kept in the main core's workspace across layers;
-- else a phase's metadata object: ``M_NX`` input objects follow; with ``F_NORM`` they arrive under norm-weight A
-  objects (``nbegin``: each holds the weights of ``NX_PER_NORM`` input objects, the input is multiplied by them,
-  and the outputs are scaled by the slots' 1 / rms), then ``M_NT`` weight tiles (``M_NRT`` row tiles x ``M_G`` K
-  chunks, a row tile's chunks in a row; blocks of row tiles ``M_B``: end row tile, format (| ``B_F32``), valid
-  rows). Per tile the main core posts the helper's command, runs its half, adds the helper's partial rows; a
-  complete row tile's rows per slot: ``F_RESID`` into the residual (fp32), ``F_GU`` (rows 0 .. 7 gate, 8 .. 15 up) ->
-  bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
-  after the tiles the residual goes out (bf16).
-
-Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``design.cc.jinja`` (and ``gemv.py``).
+The cores' kernel source: ``design.cc.jinja`` (and ``gemv.py``).
 
 MoE (``moe``: an MoE model's FFN; its transaction: ``qwen35.overlay``): the X stream is packet-switched (``XID``),
 its shim channel also carrying control packets into the shim's own TileControl (``moe.route``); the decode's K groups
@@ -131,100 +110,64 @@ from ..operators.design import COLS, linear_tap
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import packet_flow, pin_l1_buffers
 from ..operators.util import Attr, regions
-from . import gemv
+from ..operators.words import Kind
+from . import gemv, protocol
+from .protocol import (
+    A_MT,
+    AB_ID,
+    AID,
+    BC_COL,
+    BC_ID,
+    C_LEN,
+    CMD_WORDS,
+    ITEM_WORDS,
+    MAX_K,
+    META,
+    MOE,
+    MOE_STATE,
+    NBLK,
+    NORM_K,
+    PG_BD,
+    PG_CH,
+    PG_PAGE_ID,
+    PG_REQ_ID,
+    PG_STATE,
+    PG_STORE,
+    PG_STORE_BYTES,
+    PG_WAKE,
+    PHASE,
+    POST_K,
+    POST_STATE,
+    S_NASKIP,
+    S_NE,
+    S_NIN,
+    S_NLS,
+    S_NM,
+    S_NNO,
+    S_NPS,
+    S_NR,
+    S_NSKIP,
+    S_NSUB,
+    S_NT,
+    S_NXN,
+    S_NXP,
+    S_NXS1,
+    S_WORDS,
+    SLOTS,
+    STATE,
+    TOK_STATE,
+    TOKEN,
+    WINS,
+    X_CH,
+    XB,
+    XC_ID,
+    XID,
+    XMETA,
+    XPAY,
+)
 
 _SRC = templating.load("artlite/decode/design.cc.jinja")  # (the main and helper cores' kernels)
 
-SLOTS = gemv.SLOTS  # token slots of a design (4; ``DecodeOverlayOperator(slots=8)``: 8)
-META = 64  # int32 metadata words at the start of an X object
-XB = 4352  # bytes of an X object
-XPAY = XB - 4 * META  # payload bytes of an X object
-OBJ_K = XPAY // (2 * SLOTS)  # k of an input object (512: 64 k blocks of the slots' 8 values; 8 slots: 256, ``obj_k``)
-NX_PER_NORM = 8  # input objects per norm-weight object (8 x 512 bf16 weights; 8 slots: 16 x 256, ``nx_per_norm``)
-NORM_K = NX_PER_NORM * OBJ_K  # weights of a norm-weight object
-C_LEN = 64  # bf16 elements of a C object
-NBLK = 4  # blocks of row tiles a phase may have
-MAX_K = 5120  # k of a phase's K group: its x panels (46 KB) in the helper's memory
-CMD_WORDS = 16
-
-# metadata words
-M_FLAGS, M_NS, M_NX, M_K, M_NT, M_G, M_NRT, M_NB, M_B = range(9)  # M_B + 3 i: block i (end rt, fmt, valid rows)
-M_SKIP = M_B + 3 * NBLK  # (20) X objects after this one that belong to another core
-M_NASKIP, M_NREL, M_SLOT = 21, 22, 23
-M_MODEL = 24  # the first word of the model cores' own
-M_SP = 39  # (packed designs of 8 slots) a phase input's slots per k block (``packed_slots``; the host's per phase)
-# (``post`` designs) an F_POST phase's layer output scale (bf16 bits); (``tok`` designs) a token object's index
-# (M_TOK_KIND, < N_TOK) and per column its cache objects (M_TOK_NG + c); an object of another core with M_NASKIP = -1 -
-# index: that token's count; (``post``) a phase's residual slice per column (M_H8) and 1 / the length of its norms
-# (M_IH, fp32 bits): the model's hidden size or a drafter's (``hidden_meta``)
-M_SCALE = 40
-M_TOK_KIND, M_TOK_NG = 41, 48
-M_H8, M_IH = 42, 43
-B_F32 = 256  # in a block's format word: its rows go out as fp32 (two bf16 slots each)
-# M_FLAGS
-F_NORM = 1  # RMSNorm of the input (norm-weight objects); the outputs scaled by 1 / rms
-F_LOADR = 2  # the payload is a slot's residual slice (fp32)
-F_RESID = 4  # the rows add into the residual
-F_EMITR = 8  # after the tiles, the residual goes out (bf16)
-F_GU = 16  # tiles of [8 gate | 8 up] rows -> act(gate) up
-F_MAIN = 32  # an object of the main core
-F_MSG = 64  # the outputs go to the model's core on M instead of C
-# (``post`` designs: post-norm residual updates, Gemma)
-F_POST = 1 << 12  # a header: [partial sums | v, r] input, res = (res + v / rms(v) w_post) scale, x = r w1
-F_VOUT = 1 << 13  # the rows add into pend (the sub-layer's output v); with F_EMITR v and its partial sums go out
-F_PLI = 1 << 14  # the rows' outputs gelu(bf16(y)) pli, pli = bf16(p / rms(p) w + e): the meta object's payload
-# [p: slot 4][256] | [e: slot 4][256] bf16 (p: the per-layer projection's rows, ``gemma4.overlay``; rms over the 256),
-# w (bf16 hi | lo) after [w1 | w_post] in the phase's first norm-weight object
-F_PZERO = 1 << 15  # pend = 0 first (an F_VOUT phase's first K group)
-F_TOK = 1 << 16  # (another core's object) a token object: the main core keeps M_TOK_NG + col (its cache A objects)
-F_KPAIR = 1 << 18  # (a header) its tiles hold row pairs of a matrix of K = POST_K (a row's super-blocks: two rows), run
-# as two slots of one token: slot 0 = [x | 0], slot 1 = [0 | x] (the helper mirrors strip 0 into slot 1 for strip 1)
-# (``moe`` designs: an MoE layer, module docstring "MoE")
-B_GU = 512  # in a block's format word: its rows are [8 gate | 8 up] groups (F_GU for this block)
-B_PAIR = 1024  # its rows are pairs [hi, lo] of one value (an F32 router's planes): the pairs' sums go out
-B_KEEP = 2048  # (B_PAIR) the block's first value stays in the main core's state (S_SG + slot): the shared expert's gate
-B_G2, B_G4 = 4096, gemv.B_G4  # its tiles hold row groups of 2 / 4 rows (``decode.image.Block.G``)
-F_WS = 1 << 19  # the rows times the slots' scales (wsc: the shared expert's gate, an expert's routing weights)
-F_ROUTE = 1 << 20  # the route object: the router's logits as its payload -> the routing (control packets, expert object)
-F_EXPERT = 1 << 21  # the expert object: the column's items, M_NT their A objects (the main core's sub-phases)
-F_COMB = 1 << 22  # the combine: its input objects (the columns' partials of a slot) add into the residual; F_EMITR
-F_HOUT = 1 << 23  # (an expert's gate / up sub-phase) the outputs into the hold buffer: its down's input
-F_ACCUM = 1 << 24  # (a down sub-phase) the rows add into acc ([slot][hidden] bf16; F_ACC0: stored), F_EMITA: then out
-F_ACC0 = 1 << 25
-F_EMITA = 1 << 26
-XID = 3  # (moe, bcast) the X stream's packet id (moe: its channel also carries the routing's control packets: ``moe.route.CID``)
-XC_ID, BC_ID, BC_COL, X_CH = 4, 5, 3, 1  # (bcast) the X objects' packet id past the memtile, the broadcast's, its shim, the cores' X channel
-AID, AB_ID, A_MT = 6, 10, 0  # (a_bcast) the A stream's packet id, its first broadcast's, the memtiles' A channel
-# (moe) metadata words: a phase's first chunk of x / sum panels; the route object's (the layer's expert halves at
-# M_RBASE (device address lo, hi) + k M_RSTR, M_RTGU + M_RTDN A objects each); the expert object's items (M_NITEM,
-# then per item: e | h0 << 8 | h1 << 9, its weights per slot, fp32 bits)
-M_NITEM, M_ITEM = 24, 25
-ITEM_WORDS = 1 + SLOTS  # (e | h0 << 8 | h1 << 9, its weight in each slot)
-M_RBASE, M_RSTR, M_RTGU, M_RTDN = 50, 52, 53, 54
-M_XC0 = 55
-assert M_ITEM + ITEM_WORDS * moe_k.MAX_ITEMS <= M_RBASE
-
-# state words of the main core's workspace (the first ones are trip counts of the core program)
-(S_NNO, S_NXN, S_NXP, S_NIN, S_NT, S_NE, S_NSKIP, S_NASKIP, S_NM, S_NR, S_FLAGS, S_NS, S_K8, S_G, S_NRT, S_NB, S_KC,
- S_RT, S_XD, S_NX, S_STG, S_ESLOT, S_EJ, S_ESRC, S_FMT, S_TL) = range(26)
-# (``packed`` designs) the slots of an input k block, the strips (helper input commands) of an input object, less one
-S_SP, S_NXS, S_NXS1 = 26, 27, 28
-S_GN, S_GK = 29, 30  # (``gu_win`` designs) the rows in the gate / up windows, the windows of 16 so far in a SiLU group
-S_B = 32  # the block table, 3 words per block
-# (``post`` designs) the partial sums object (a trip count), the scale (bf16 bits), the column, the phase's residual
-# slice and 1 / norm length (M_H8, M_IH); (``tok``) the cache objects per token object (S_NAS + M_TOK_KIND: N_TOK words)
-S_NPS, S_SCALE, S_COL, S_H8, S_IH, S_NAS = 44, 45, 48, 49, 50, 52
-N_TOK = 8
-# (moe) the sub-phases of an expert object (a trip count), their local input strips (a trip count), the phase's first
-# panel chunk, the next sub-phase, the shared gate's logit per slot (fp32 bits)
-S_NSUB, S_NLS, S_XC0, S_SUB, S_SG = 44, 45, 46, 47, 48
-S_WORDS = 64
-assert S_TL < S_B and S_B + 3 * NBLK <= S_NPS and S_NAS + N_TOK <= S_WORDS and S_SG + SLOTS <= S_WORDS
-# paged formats (module docstring): the memtile's page channel, its first page BD (none of aiecc's: ``Store.check``), the
-# store's bytes (of up to 4 paged formats; of more: ``pg_store``); the pager's state words (data memory of the main and
-# helper cores) and wake lock; the stream ids of the pages' and the requests' routes (main, helper)
-PG_CH, PG_BD, PG_STORE, PG_STORE_BYTES = 5, 40, 0x78000, 0x8000
-PG_STATE, PG_WAKE = 0xFFE0, 15  # (32-byte aligned: aiecc)
 WS8_AT = 0x4000  # (8 slots) the main core's workspace (region 1 on; then the sum panels)
 # (8 slots) the main core's SiLU table, its two copies in regions 0, 3 of the helper's memory: the room of a second X object
 SILU8_AT = (0x0800, 0xF9C0)
@@ -232,32 +175,6 @@ SILU8_AT = (0x0800, 0xF9C0)
 # helper's in regions 0 and 3 (its scratch is in the core south of it)
 TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
 STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores' stacks (their deepest calls, pages included)
-PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
-# the event windows of a stats build (DecodeOverlayOperator(win=)): main's half tile, the helper's, main's row
-# epilogue (collect), the helper's input objects
-WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}  # (gap: a phase's last tile to the next X object; gapm: to the next phase's)  # (pre: a phase's begin to its first tile)
-# the helper's commands: CMD words 0 .. 3 (by kind), the kind at C_KIND
-C_KIND = 4
-K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC, K_HELP = range(9)  # (K_SUB, K_ACC: moe; K_HELP:
-# ``help_flag``)
-C_SP = 5  # (K_STRIP, K_PSTRIP) the input's slots per k block (K_PSTRIP: + C_MIRROR: strip 0 into slot 1, F_KPAIR)
-C_MIRROR = 8
-POST_K = 256  # (post designs) k of a header phase's input object: [k block 32][v | r][slot 4][8] bf16
-
-
-def hidden_meta(m: np.ndarray, hidden: int) -> None:
-    """(``post`` designs) A phase's M_H8 / M_IH words for a residual of ``hidden`` values (hidden / 8 per column)."""
-    m[M_H8] = hidden // 8
-    m[M_IH] = np.float32(1.0 / hidden).view(np.int32)
-
-
-def packed_slots(S: int) -> int:
-    """(``packed`` designs) The slots of an input k block in a step of S slots: 1, 2 or 4 (S = 3 pads a slot; a design
-    of 8: 8 from S 5 on). An input object then holds the k blocks of slots / SP strips (the helper's input commands:
-    OBJ_K or POST_K k each)."""
-    return 1 if S == 1 else (2 if S == 2 else (4 if S <= 4 else 8))
-
-
 
 
 class DecodeOverlayOperator(ArtcOperator):
@@ -294,6 +211,8 @@ class DecodeOverlayOperator(ArtcOperator):
     # the count at metadata word help_word), then the helper runs ``_help``'s kernel that many times
     help_flag, help_word = 0, 0
     ACC_AT = 0  # (moe) acc's byte offset in ``_acc``'s buffer
+    GATE_STATE: ClassVar[tuple[Kind, ...]] = ()  # (gate) the state words (``protocol.STATE``'s kinds) the model's gate code adds
+    META_KINDS: ClassVar[tuple[Kind, ...]] = ()  # the kinds of X objects (``protocol.XMETA``) the model's cores add to the design's
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -314,6 +233,9 @@ class DecodeOverlayOperator(ArtcOperator):
         memtiles, the same objects in both columns (module docstring "Shared A objects"); pairs: a dense design's blocks
         of plane pairs (B_PAIR: an F32 matrix's [hi, lo] rows, their sums out as fp32; an MoE design has them anyway)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
+        STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
+                       *([MOE_STATE] if moe else []), *(self.GATE_STATE if self.gate else ()))
+        XMETA.consts(PHASE, TOKEN, MOE, *self.META_KINDS)  # (the design's words and flags: each name and bit once)
         self.slots, self.bcast = slots, bcast
         assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
         if bcast:
@@ -441,15 +363,15 @@ class DecodeOverlayOperator(ArtcOperator):
         sizes = [("st", 4 * S_WORDS), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
                  ("yt", 4 * self.yt), ("stg", 2 * S * 2 * C_LEN), ("gs", 2 * 16 * S), ("scr", gemv.scr_bytes(S))]
         if self.post:
-            sizes += [("pend", 4 * SLOTS * self.res_pitch), ("ivv", 4 * 32)]
+            sizes += [("pend", 4 * S * self.res_pitch), ("ivv", 4 * 32)]
         if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; [slot][8] fp32 sums, then the slots' 1 / rms(p) [slot][r 8]
             # bf16 hi | lo)
-            sizes += [("pli", 2 * 2 * 4 * SLOTS * 8 + 4 * 32)]
+            sizes += [("pli", 2 * 2 * 4 * S * 8 + 4 * 32)]
         if self.gu_win:  # (a window of 64 rows per slot for tiles of more than 16 rows, else 32)
             sizes += [("gw", 4 * S * (64 if self.wide else 32))]
         if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
             # routing's C objects (control packets, the expert object's metadata), the expert object's plan)
-            sizes += [("wsc", 4 * 32), ("hold", 2 * SLOTS * OBJ_K), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
+            sizes += [("wsc", 4 * 32), ("hold", 2 * S * self.obj_k), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
                       ("plan", 4 * moe_k.PLAN_WORDS)]
         out = regions(sizes)
         assert self.slots == 8 or MAX_K + 2048 <= self.hs_bytes  # (the 16-k sums of a K group, fp32, and hpstrip's nb
@@ -461,11 +383,7 @@ class DecodeOverlayOperator(ArtcOperator):
                 ArgSpec("in", (COLS * XB // 2,), bfloat16),
                 ArgSpec("out", (2 * COLS * C_LEN,), bfloat16)]
 
-    def _consts(self) -> dict[str, int]:
-        """The metadata, flag and state words the kernel sources take."""
-        return {k: v for k, v in globals().items() if k[:2] in ("M_", "F_", "S_", "B_", "K_") or k in ("C_KIND", "C_MIRROR")}
-
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         """The kernel source of the model's cores."""
         return ""
 
@@ -476,13 +394,13 @@ class DecodeOverlayOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         p = self.pfx
-        consts = self._consts()
+        consts = protocol.consts()
         fmts = list(self.rows)
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
                           pg=self._page_spec() if self.paged else None, rg=self.moe, yb=self.yb, slots=self.slots,
                           tab=self.tab)
-        src += self._extra_src(p, consts)
+        src += self._extra_src(p)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
               "XS_SLOT": gemv.xs_slot(self.slots),
               "XPH": self.max_g * self.chunk.xp // 2, "XPHC": self.chunk.xp // 2,
@@ -502,7 +420,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
-                                 packed=self.packed, C_SP=C_SP, MAX_K=MAX_K, ablate=self.ablate, SILU8=self.silu8_addresses(),
+                                 packed=self.packed, MAX_K=MAX_K, ablate=self.ablate, SILU8=self.silu8_addresses(),
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  **self._moe_vars(p, consts), **consts)
 
@@ -511,7 +429,7 @@ class DecodeOverlayOperator(ArtcOperator):
         plan's layout."""
         if not self.moe:
             return {}
-        route = moe_k.render(p, consts | {"META": META, "SLOTS": SLOTS, "ITEM_WORDS": ITEM_WORDS,
+        route = moe_k.render(p, consts | {"META": META, "SLOTS": self.slots, "ITEM_WORDS": ITEM_WORDS,
                                           "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS,
                              a_packet=AID if self.a_bcast else None)
         return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
@@ -555,12 +473,12 @@ class DecodeOverlayOperator(ArtcOperator):
         n = len(self.paged)
         return ((4, bd0, base, size // 2), (5, 48 - n, base + size // 2, size - size // 2))
 
-    def _page_spec(self) -> gemv.PageSpec:
+    def _page_spec(self) -> paging.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
         (h0, c0), (h1, c1) = (paging.request(stream_id=i, channel=ch) for i, ch in zip(PG_REQ_ID, self.pg_channels))
         bd0 = self.pg_store[0]
         bd1 = self.pg_halves()[1][1] if self.pg_split else bd0 + len(self.paged)
-        return gemv.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1), bd0=(bd0, bd1), ctl=(c0, c1))
+        return paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1), bd0=(bd0, bd1), ctl=(c0, c1))
 
     def page_store(self) -> tuple[paging.Store, ...] | None:
         """The compiled design's page stores (the paged formats' pages of the main cores, then of the helpers; ``pg_split``:
@@ -990,61 +908,3 @@ class _Streams:
     xp: list  # per column the helper's x panels (a model core may use them while its objects run)
     sq: list  # per column the input's sums of squares of a normed phase, the helper's (8 slots: in the HS8_ROW core's memory)
     x_kw: dict  # the arguments of a consumer's handle of x_l1
-
-
-# ----------------------------------------------------------------------
-# Host side: the X objects of a phase's input
-# ----------------------------------------------------------------------
-
-
-def n_inputs(K: int, slots: int = SLOTS) -> int:
-    """Input objects of a phase of K elements per slot (after its metadata object) of a design of ``slots``."""
-    k = XPAY // (2 * slots)
-    assert K % k == 0, K
-    return K // k
-
-
-def region_bytes(K: int, slots: int = SLOTS) -> int:
-    """Bytes of a phase's input in DDR: [metadata object | x: [k block K / 8][slot ``slots``][8] bf16]."""
-    return XB + 2 * slots * K
-
-
-def input_fill(K: int, sp: int = SLOTS, slots: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
-    """(bytes, shim BD dims) of the X fill of a phase's input from the start of its region: the metadata object, then
-    object i = the XB bytes that end with x's i-th XPAY bytes (strides of XPAY, extents of XB); x of sp slots per k
-    block (``packed_slots``) of a design of ``slots``."""
-    return (1 + -(-n_inputs(K, slots) * sp // slots)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
-
-
-def post_region_bytes(K: int) -> int:
-    """Bytes of a header phase's input in DDR: [metadata object | the partial sums object's payload (the 8 columns'
-    C objects at 128 c) | x: [k block K / 8][v | r][slot 4][8] bf16]."""
-    return XB + XPAY + 4 * SLOTS * K
-
-
-def post_input_fill(K: int, sp: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
-    """(bytes, shim BD dims) of the X fill of a header phase's input (as ``input_fill``: the metadata object, the
-    partial sums object, then the input objects: K / POST_K strips, SLOTS / sp per object)."""
-    return (2 + -(-(K // POST_K) * sp // SLOTS)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
-
-
-def interleave(x: np.ndarray, sp: int = SLOTS) -> np.ndarray:
-    """S <= sp slots' x (S, K) -> the input layout [k block][slot sp][8] (K / 8, sp, 8) bf16 bits (uint16)."""
-    S, K = x.shape
-    out = np.zeros((K // 8, sp, 8), np.uint16)
-    xb = np.asarray(x, np.float32).astype(bfloat16).view(np.uint16)
-    out[:, :S] = xb.reshape(S, K // 8, 8).transpose(1, 0, 2)
-    return out
-
-
-def norm_objects(w: np.ndarray, tile_bytes: int) -> np.ndarray:
-    """The norm-weight A objects of a weight vector (bf16 values): object n holds the weights of input objects
-    ``NX_PER_NORM`` n .. at its start."""
-    per = NORM_K
-    n = -(-len(w) // per)
-    out = np.zeros((n, tile_bytes // 2), np.uint16)
-    wb = np.asarray(w, np.float32).astype(bfloat16).view(np.uint16)
-    for i in range(n):
-        part = wb[i * per:(i + 1) * per]
-        out[i, :len(part)] = part
-    return out

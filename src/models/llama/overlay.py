@@ -18,7 +18,7 @@ padding rows' logits are cut off, ``ModelOverlay._logits``).
 The KV caches (KV): per layer and KV head linear groups of kp + 1 objects of the tile size T (``decode.kv``: kp K
 objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``), 128 positions per group at
 head_dim 64, 64 at 128 for objects of ~9.3 KB; then per layer and KV head a ring of two slots of T bytes with the
-exact V values of the open records (``decode.vring``). Phase inputs are packed (``decode.design.packed_slots``).
+exact V values of the open records (``decode.vring``). Phase inputs are packed (``decode.protocol.packed_slots``).
 
 A hidden size that is not a whole number of K chunks (Qwen3-Embedding-4B's 2560) pads the K of the phases that read
 the residual stream (qkv, gate_up, the LM head) with zero super-blocks (``decode.image``); their inputs' padding k
@@ -55,15 +55,13 @@ from artlite.decode.attn import (
     M_TOK_A,
     M_TOK_G0,
     M_TOK_NA,
-    SMAX,
     Attn,
     U,
     rope_tables,
     score_bits,
-    substeps,
-    tails,
 )
-from artlite.decode.design import (
+from artlite.decode.model import ModelOverlay, paged_formats
+from artlite.decode.protocol import (
     C_LEN,
     F_EMITR,
     F_GU,
@@ -82,7 +80,7 @@ from artlite.decode.design import (
     interleave,
     packed_slots,
 )
-from artlite.decode.model import ModelOverlay, paged_formats
+from artlite.decode.vring import substeps, tails
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
@@ -173,7 +171,7 @@ class LlamaOverlay(ModelOverlay):
         self._layout = dict.fromkeys(("ACT", "KV"), 0)
         take = self._take
         # (token t: of the sub-step from slot t on; two copies, one per transaction buffer: ``AHEAD``)
-        self.toks = (take("ACT", SMAX * XB), take("ACT", SMAX * XB))
+        self.toks = (take("ACT", SLOTS * XB), take("ACT", SLOTS * XB))
         self.loadr = take("ACT", COLS * SLOTS * XB)
         for L, name in self.phases():
             if name != "att":
@@ -210,7 +208,7 @@ class LlamaOverlay(ModelOverlay):
         """The token objects' metadata words, the attention layers' objects'."""
         act = self.dev.view("ACT")
         for tok in self.toks:
-            for t in range(SMAX):
+            for t in range(SLOTS):
                 m = np.zeros(META, np.int32)
                 m[M_FLAGS], m[M_TOK_KIND] = F_TOK, t
                 act[tok + t * XB:][:4 * META] = m.view(np.uint8)
@@ -315,7 +313,7 @@ class LlamaOverlay(ModelOverlay):
         seq = Sequence(self.op, inputs=("X",))
         st = _Step(S, subs, tok=self.toks[self._b])
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", st.tok), SMAX * XB)
+            seq.fill("X", c, dev.address("ACT", st.tok), SLOTS * XB)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
         ph = self.phases(lm)
@@ -422,7 +420,7 @@ class LlamaOverlay(ModelOverlay):
             pu[u] = p + a, n
             rec = kv.records(p=p + a, S=n, hd=self.hd, a_bytes=T, kp=self.kp)
             ro[u, :len(rec)] = rec
-        dev.flush("ACT", st.tok, SMAX * XB)
+        dev.flush("ACT", st.tok, SLOTS * XB)
         if st.patch is None:
             st.patch = self._patch_tables(st)
         t, kv0 = st.patch, dev.address("KV")

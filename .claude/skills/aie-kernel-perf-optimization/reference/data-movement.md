@@ -93,9 +93,9 @@ bandwidth.
   always-sent history: -0.1 ms a layer).
 - **Every column reads every input** (the decode overlays): a phase's input goes to all 8 columns, each from its own
   shim: 8 copies through the one port and 8 fill tasks at every phase boundary. A phase's input is on the critical path
-  (its tiles wait for it): read the step's slots only (``decode.design.packed_slots``; the 27B's 8-slot design read 8
+  (its tiles wait for it): read the step's slots only (``decode.protocol.packed_slots``; the 27B's 8-slot design read 8
   slots at every S: S 1 303.6 -> 298.5 ms packed). Per step: Gemma E4B 42 MB of 3.1 GB
-  (95% of it the same bytes in every column; packed to the step's slots, `decode.design.packed_slots`, from 100 MB),
+  (95% of it the same bytes in every column; packed to the step's slots, `decode.protocol.packed_slots`, from 100 MB),
   qwen35 9B 124 MB of 5.2 GB, 27B 351 MB of 16.4 GB (half of it per-column GDN states). One broadcast copy would save
   ~1-1.7%: the bytes, and 7 of the 8 fills between a drain wait and the next phase (their firmware ops are ~60% on
   the critical path). The overlays cannot take it as they are: the X stream also carries per-column objects

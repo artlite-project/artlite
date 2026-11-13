@@ -19,8 +19,8 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.decode.design import META, XB, interleave
 from artlite.decode.kv import kv_from_groups
+from artlite.decode.protocol import META, XB, interleave
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import qwen_dflash_of
 from artlite.operators.bfp16 import block_bytes, block_values

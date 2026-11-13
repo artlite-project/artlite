@@ -1,6 +1,6 @@
 """The per-layer input of the Gemma prefill: h = gelu(bf16(y)) pli between the per-layer input gate (``inp_gate``) and
 the per-layer projection (``proj``), with the per-layer inputs pli = bf16(p / rms(p) w + e) formed here, as the decode's
-F_PLI epilogue forms them (``decode.design.F_PLI``).
+F_PLI epilogue forms them (``decode.protocol.F_PLI``).
 
 ``PleOperator`` runs over T tokens: y the gate GEMM's output (T rows of 8 column slots of ``SLOT`` values: column c's
 32 outputs at 64 c, ``prefill.gemm`` layout of the gate phase); p the layer's rows of the per-layer projection of the

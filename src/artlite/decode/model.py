@@ -30,7 +30,8 @@ from ..operators.design import COLS
 from ..operators.util import rup
 from ..overlay import OverlayDevice, Sequence, Transaction, WeightBuffer
 from . import phases as mp
-from .design import (
+from .image import TileImage
+from .protocol import (
     BC_COL,
     BC_ID,
     C_LEN,
@@ -43,7 +44,6 @@ from .design import (
     post_region_bytes,
     region_bytes,
 )
-from .image import TileImage
 from .vring import VRing
 
 
@@ -70,8 +70,8 @@ def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tupl
 
 @dataclass
 class InputRegion:
-    """A K group's input region in ACT: [metadata object | x] (``design.region_bytes``; a header's:
-    ``design.post_region_bytes``), its input elements k0 .. k0 + K."""
+    """A K group's input region in ACT: [metadata object | x] (``protocol.region_bytes``; a header's:
+    ``protocol.post_region_bytes``), its input elements k0 .. k0 + K."""
 
     off: int
     k0: int
@@ -282,7 +282,7 @@ class ModelOverlay:
         return w
 
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
-        """The slots of an input k block in a step of S slots (``design.packed_slots`` in a packed design) of a phase's
+        """The slots of an input k block in a step of S slots (``protocol.packed_slots`` in a packed design) of a phase's
         input."""
         return packed_slots(S) if self.op.packed else self.SLOTS
 
@@ -306,7 +306,7 @@ class ModelOverlay:
                 seq.fill("A", c, self.dev.address(buf, r.offset + c * r.col_stride), n)
 
     def _inputs(self, seq: Sequence, rg: InputRegion, S: int, phase: tuple[int, str] | None = None) -> None:
-        """The X fills of a K group's input (``design.input_fill``, a header's ``post_input_fill``) of a phase."""
+        """The X fills of a K group's input (``protocol.input_fill``, a header's ``post_input_fill``) of a phase."""
         sp = self._sp(S, phase)
         nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)
         if self.op.bcast and phase != self._input(self.start):  # (a step's first phase: ``design``'s "Broadcast inputs")
@@ -432,7 +432,7 @@ class ModelOverlay:
         self.dev.flush("ACT", self.loadr, COLS * self.SLOTS * XB)
 
     def _write_input(self, rg: InputRegion, xi: np.ndarray) -> None:
-        """A plain input's x (``design.interleave``, as bytes) -> the x of its (first) K group's region."""
+        """A plain input's x (``protocol.interleave``, as bytes) -> the x of its (first) K group's region."""
         self.dev.view("ACT")[rg.off + XB:rg.off + XB + xi.size] = xi
         self.dev.flush("ACT", rg.off + XB, xi.size)
 

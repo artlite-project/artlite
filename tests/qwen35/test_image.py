@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.decode.design import norm_objects
 from artlite.decode.image import BLOCK_BYTES, pack_rows
+from artlite.decode.protocol import norm_objects
 from artlite.formats import pack_tile, slice_fields
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import MODELS_DIR, QwenConfig, decision_gguf, qwen_gguf

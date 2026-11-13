@@ -34,7 +34,7 @@ one. Softmax with a running maximum per row (masked positions add exactly nothin
 scores only); at the end each column merges the partial (m, l, y) of its west neighbour in the chain (shared memory,
 ordered by token ObjectFifos) into its own, so the chain's last column holds the whole and emits o = y / l on D into
 the sub-step's slots of the O projection's packed input ([k block][slot SP][8] bf16, heads in a row:
-``decode.design.packed_slots``). The last column holds the newest group: of a layer with its own cache it inserts the
+``decode.protocol.packed_slots``). The last column holds the newest group: of a layer with its own cache it inserts the
 sub-step's K (rotated, normed if ``qk_norm``; bfp16 blocks, kp per 8 dims) into their records as they pass and its V
 rows into the open records' rows at the tail objects, and emits the K records of the sub-step's first and last
 positions as the K objects come, then per open record its V panels and its ring slot (``decode.kv.emit_order``) on D
@@ -53,7 +53,7 @@ once for both octets (a tail object's record with its partner's P 0: the same ro
 positions: steps of 1 / 2 / 3 / 4 tokens 20.2 / 21.6 / 25.2 / 26.4 ms; 3.1 8B 104.2 / 106.4 / 111.7 / 115.4.
 
 Per step the core gets on X (broadcast with the main core's; it skips the main core's objects and the main core its):
-the token objects (``F_TOK``, t = SMAX kind + a per layer kind and slot a: of the sub-step from a on its first
+the token objects (``F_TOK``, t = SLOTS kind + a per layer kind and slot a: of the sub-step from a on its first
 position and slot, its slots, the columns' ranges and A objects, and the step's cos / sin of the rotated pairs per
 slot, fp32; for the main cores the A objects of the sub-step that ends at a, ``M_TOK_NG``), then per attention layer
 and sub-step the KV head's q objects of its slots ([head nh][hd] bf16; the first one's metadata words: the ``F_ATT``
@@ -64,7 +64,6 @@ its tail objects).
 """
 
 import math
-from dataclasses import dataclass
 
 import numpy as np
 from aie.iron import Buffer, Kernel, ObjectFifo, Worker
@@ -75,46 +74,61 @@ from ml_dtypes import bfloat16
 from ..operators import paging, templating
 from ..operators.design import COLS
 from ..operators.util import Attr, bf16_bits, bf16_hilo, regions, rup
+from ..operators.words import WordMap
 from .kv import Records
-from .vring import ring_rows, substeps, tails
+from .protocol import M_MODEL, META, NX_PER_NORM, PHASE, SLOTS, TOKEN, XMETA
+from .protocol import WINS as DESIGN_WINS
 
-__all__ = ["ring_rows", "substeps", "tails"]  # (the shared helpers, re-exported for the overlays and tests)
-
-SMAX = 4  # token slots
-F_ATT = 1 << 17  # M_FLAGS of a sub-step's first q object (the main cores skip it, the cache by its token)
 U = 3  # sub-steps of a layer kind per step at most (``substeps``: slots of 2 at head_dim 512)
 
-# metadata words (the shared overlay's M_MODEL = 24 on): an F_TOK object's last cached position before the step (the
-# masks: a slot s attends to positions <= M_POS + s); an F_ATT object's head_dim, kind (its index in the head dims),
-# own cache (the layer computes K / V), the score constant (bf16 hi, lo bits), the window (0: none), the query heads
-# per KV head; a token object's per-column first positions (M_TOK_G0 + c) next to the shared overlay's M_TOK_NG + c
-# (the columns' cache A objects)
-M_POS, M_AHD, M_AKIND, M_AOWN, M_QC_HI, M_QC_LO, M_AWIN, M_ANH = range(24, 32)
-M_TOK_NA, M_TOK_G0 = 32, 56  # (per column: its attended cache objects | its A objects << 16, its range's first position)
-M_TOK_A = 44  # a token object's first slot of the step (its slots: a .. a + M_NS - 1)
-M_ATREC = 32  # an F_ATT object's: the first tail object is the open record's V panels (the cache's last writer was the
-# prefill), not its ring slot
-M_ATOK = 33  # an F_ATT object's token (its sub-step's: the shared overlay's M_NASKIP = -1 - M_ATOK)
+# metadata words (the protocol's ``M_MODEL`` = 24 on): an F_TOK object's last cached position before the step (the
+# masks: a slot s attends to positions <= M_POS + s); an F_ATT object's head_dim, kind (its index in the head dims), own
+# cache (the layer computes K / V), the score constant (bf16 hi, lo bits), the window (0: none), the query heads per KV
+# head
+ATT = XMETA.kind("attention")
+M_POS, M_AHD, M_AKIND, M_AOWN, M_QC_HI, M_QC_LO, M_AWIN, M_ANH = ATT.words(
+    "M_POS M_AHD M_AKIND M_AOWN M_QC_HI M_QC_LO M_AWIN M_ANH", at=M_MODEL)
+# the first tail object is the open record's V panels (the cache's last writer was the prefill), not its ring slot
+M_ATREC = ATT.word("M_ATREC")
+M_ATOK = ATT.word("M_ATOK")  # the token (its sub-step's: the protocol's M_NASKIP = -1 - M_ATOK)
+F_ATT = ATT.flag("F_ATT", 17)  # M_FLAGS of a sub-step's first q object (the main cores skip it, the cache by its token)
+# a token object's per-column first positions (M_TOK_G0 + c) and attended cache objects | its A objects << 16 (M_TOK_NA + c),
+# next to the protocol's M_TOK_NG + c (the columns' cache A objects); its first slot of the step (its slots: a .. a + M_NS - 1)
+TOKEN_ATT = XMETA.kind("attention token", extends=(TOKEN,))
+M_TOK_NA = TOKEN_ATT.block("M_TOK_NA", COLS, at=32)
+M_TOK_A = TOKEN_ATT.word("M_TOK_A", at=44)
+M_TOK_G0 = TOKEN_ATT.block("M_TOK_G0", COLS, at=56)
 
-# state words of the attention core (the first ones are trip counts of its program)
+# state words of the attention core (the first ones are trip counts of its program); A_TOK: per token t the column's range's
+# first position, its cache objects, its attended ones, p << 8 | a << 4 | S (a token of no sub-step: S = 0, no cache objects;
+# two kinds of layer at most)
+A_TOK_AT = 40
+A_WORDS = A_TOK_AT + 4 * 2 * SLOTS
+STATE = WordMap("attention core state", A_WORDS)
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_NO, A_NPS, A_XL, A_P, A_S, A_I, A_EIDX,
  A_HD, A_KIND, A_OWN, A_WIN, A_QC, A_NH, A_SA, A_POS, A_MERGE, A_CEND, A_INS, A_QS, A_KS, A_EOFF0, A_EN0, A_EOFF1,
- A_EN1, A_EREC) = range(34)
-A_NHM = 34  # (query heads per KV head not a power of 2) 64 / nh rounded up: a row's slot (r nhm) >> 6 for r < 16
-A_LPER = 35  # log2 of the strips of a main core phase's input object (``decode.design.packed_slots``)
-A_NATT = 36  # the attended cache objects (the others after them are skipped)
-A_YNZ = 37  # y holds P V terms (else zero: a rise of the running maxima needs no rescale)
-A_TREC = 38  # (M_ATREC)
-A_TOK = 40  # per token t: the column's range's first position, its cache objects, its attended ones, p << 8 | a << 4 | S
-# (a token of no sub-step: S = 0, no cache objects)
-A_WORDS = A_TOK + 4 * 2 * SMAX  # (two kinds of layer at most)
-assert A_EREC < A_NHM < A_LPER < A_NATT < A_YNZ < A_TREC < A_TOK
+ A_EN1, A_EREC) = STATE.common.words(
+    "A_NNO A_NXN A_NXSKIP A_NASKIP A_NQ A_NQP A_NKV A_NOBJ A_NE A_NO A_NPS A_XL A_P A_S A_I A_EIDX A_HD A_KIND A_OWN A_WIN "
+    "A_QC A_NH A_SA A_POS A_MERGE A_CEND A_INS A_QS A_KS A_EOFF0 A_EN0 A_EOFF1 A_EN1 A_EREC", at=0)
+A_NHM = STATE.common.word("A_NHM")  # (query heads per KV head not a power of 2) 64 / nh rounded up: a row's slot (r nhm) >> 6 for r < 16
+A_LPER = STATE.common.word("A_LPER")  # log2 of the strips of a main core phase's input object (``decode.protocol.packed_slots``)
+A_NATT = STATE.common.word("A_NATT")  # the attended cache objects (the others after them are skipped)
+A_YNZ = STATE.common.word("A_YNZ")  # y holds P V terms (else zero: a rise of the running maxima needs no rescale)
+A_TREC = STATE.common.word("A_TREC")  # (M_ATREC)
+A_TOK = STATE.common.block("A_TOK", 4 * 2 * SLOTS, at=A_TOK_AT)
 # the event windows of a stats build (the decode operator's win=): the attention core's kernels
 WINS = {"abegin": 11, "aq": 12, "aqpan": 13, "akv": 14, "kobj": 15, "vobj": 16, "arec": 17, "aend": 18, "aemit": 19,
         "put_k": 20, "tobj": 21, "scores": 22, "pv": 23,
         # (spans: an attention step from its region's first object to its end; the first cache object's wait from
         # there; the merge's wait for the west neighbour from the last cache object)
         "aspan": 40, "afirst": 41, "achain": 42}
+assert not set(WINS.values()) & set(DESIGN_WINS.values()), "event windows of the design and of the attention core collide"
+
+
+def consts() -> dict[str, int]:
+    """The words, flags and ids the attention cores' kernels take: their own, and of the protocol the phase objects they
+    skip (``PHASE``) and the token objects (``TOKEN``)."""
+    return XMETA.consts(PHASE, ATT, TOKEN_ATT) | STATE.consts() | {"A_WORDS": A_WORDS}
 
 
 _SRC = templating.load("artlite/decode/attn.cc.jinja")
@@ -131,11 +145,11 @@ class Attn:
     stream's). ``conv``: a second job of the cores between attention layers (LFM3's short convolution,
     ``models.lfm.conv.ConvJob``: its kernels, its state words after A_WORDS, its workspace over the attention's scratch,
     its X objects from one with its ``flag``, its outputs on D). ``pages``: the cores' code as pages (a program beyond 16
-    KB: ``PAGES``), the memtile transport's words (``AttnPages``)."""
+    KB: ``PAGES``), the memtile transport's words (``paging.PageSpec``: one core half)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
-                 c_len: int = 64, gate: bool = False, conv: object = None, pages: object = None):
+                 c_len: int = 64, gate: bool = False, conv: object = None, pages: paging.PageSpec | None = None):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and 1 <= heads <= 4, (chain, heads)
@@ -164,7 +178,7 @@ class Attn:
 
     def slots(self, hd: int) -> int:
         """Slots of a sub-step at most (its query rows: ``rows``)."""
-        return min(SMAX, self.rows(hd) // self.heads)
+        return min(SLOTS, self.rows(hd) // self.heads)
 
     def y_floats(self) -> int:
         """fp32 of an attention core's y: per set of 4 query rows its blocks [d-block][32], then l [32]; at least the
@@ -182,10 +196,10 @@ class Attn:
         qa = max(self.rows(hd) // 4 * 72 * hd // 8 for hd in self.hds)
         rg = max(self.rg.values())
         sets = max(self.rows(hd) // 4 for hd in self.hds)
-        kb = max(self.kb_slot * SMAX, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
+        kb = max(self.kb_slot * SLOTS, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
         words = A_WORDS + (self.conv.words if self.conv is not None else 0)
-        sizes = [("st", 4 * words), ("cs", 4 * 2 * SMAX * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
-                 ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SMAX), ("sc", 4 * 32 * rg * sets),
+        sizes = [("st", 4 * words), ("cs", 4 * 2 * SLOTS * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
+                 ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SLOTS), ("sc", 4 * 32 * rg * sets),
                  ("pp", self.ppo * sets // 2 if len(self.hds) == 1 else 72 * rg), ("m", 4 * 32 * sets)]
         if self.gate:
             sizes.append(("gt", 4 * 4 * sets))  # (1 + e^-g per query row)
@@ -208,22 +222,21 @@ class Attn:
         on: the mantissas' vector stores)."""
         return rup(9 * self.kp * max(self.hds) // 8)
 
-    def render(self, p: str, consts: dict[str, int], win: str = "") -> str:
+    def render(self, p: str, win: str = "") -> str:
         nd_min = min(32, min(self.hds) // 8)
         hds = self.hds
         ws = self.workspace()
         conv = self.conv
         pg = self.pages
         X = "_x" if pg is not None else ""
-        src = "" if conv is None else conv.render(p, base=ws["y"], st=ws["st"], X=X, consts={
-            k: v for k, v in globals().items() if k[:2] in ("A_", "M_")})
+        src = "" if conv is None else conv.render(p, base=ws["y"], st=ws["st"], X=X, consts=STATE.consts() | {"A_WORDS": A_WORDS})
 
         def by(var: str, vals: dict[int, object], key: object = lambda hd: hd) -> str:  # (a value per head dim)
             if len(hds) == 1:
                 return str(vals[hds[0]])
             return f"{var} == {key(hds[0])} ? {vals[hds[0]]} : {vals[hds[1]]}"
 
-        return src + _SRC.render(p=p, a=Attr(ws), eps=repr(self.eps), SMAX=SMAX, ROT=self.rot, HDS=hds,
+        return src + _SRC.render(p=p, a=Attr(ws), eps=repr(self.eps), SMAX=SLOTS, ROT=self.rot, HDS=hds,
                            WINS=WINS, KPER=self.kper, RG=self.rg, RG_MAX=max(self.rg.values()), D_LEN=self.d_len,
                            D_SHIFT=int(math.log2(2 * self.d_len)), WIN=WINS.get(win, 0), Y_FLOATS=self.y_floats(),
                            KB_SLOT=self.kb_slot, KP=self.kp, DB=nd_min, ND_MIN=nd_min, ONE_HD=len(hds) == 1,
@@ -239,7 +252,7 @@ class Attn:
                            CONV_BEGIN=conv.begin_src(p) if conv else "", CONV_TOK=conv.token_src(A_WORDS) if conv else "",
                            NH_POW2=self.heads in (1, 2, 4), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
-                           **(consts | {"F_ATT": F_ATT} | {k: v for k, v in globals().items() if k[:2] in ("A_", "M_")}))
+                           META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts())
 
     def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1,
                 extra: dict[int, list] | None = None) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
@@ -363,19 +376,6 @@ class Attn:
         return workers, d_fifos
 
 
-@dataclass(frozen=True)
-class AttnPages:
-    """Where the attention cores' pages come from (``Attn(pages=)``, the memtile transport: ``paging``): the pager's
-    state words (a core address), its wake lock (a core lock id), the stream header of the core's request route and the
-    control header of its memtile channel's start queue (``paging.request``), the BD of its first page."""
-
-    state: int
-    wake: int
-    hdr: int
-    ctl: int
-    bd0: int
-
-
 def page_entries(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
     """The attention cores' pages (``paging.link``'s ``pages``, page ids from 1 in this order): the query's preparation,
     the attention over the cache, the conv job's."""
@@ -395,9 +395,9 @@ def page_calls(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
 
 
 def rope_tables(inv_freq: np.ndarray, positions: list[int] | range, rot: int) -> np.ndarray:
-    """(SMAX, 2 rot) fp32: per slot [cos | sin] of the rotated pairs' angles position inv_freq[i], i < rot (unused slots
+    """(SLOTS, 2 rot) fp32: per slot [cos | sin] of the rotated pairs' angles position inv_freq[i], i < rot (unused slots
     zero)."""
-    out = np.zeros((SMAX, 2 * rot), np.float32)
+    out = np.zeros((SLOTS, 2 * rot), np.float32)
     for s, pos in enumerate(positions):
         th = pos * np.asarray(inv_freq)[:rot]
         out[s, :rot], out[s, rot:] = np.cos(th), np.sin(th)

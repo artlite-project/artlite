@@ -435,4 +435,4 @@ about a picture and 8 about one (energy a question above a 16.5 W idle, the thre
 | 8 questions about a 512 x 512 picture | 126 ms (one sequence of 516 tokens; each alone: 646 ms) | 1184 ms | 3667 ms |
 | energy a question | 0.29 J | 3.8 J | 16 J |
 
-Design: the module docstrings of `decode/design.py`, `decode/attn.py` and `lfm/`.
+Design: the module docstrings of `decode/protocol.py`, `decode/design.py`, `decode/attn.py` and `lfm/`.

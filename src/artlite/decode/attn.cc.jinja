@@ -1111,7 +1111,7 @@ __attribute__((noinline)) void {{ p }}_need(int page, int32_t *__restrict ws)
 {
     if (((const volatile int32_t *){{ PG.state }})[0] != page) {
         {{ p }}_keep(AW(v64int8, {{ a.keep }}));
-        {{ p }}_pg_request((int32_t){{ PG.hdr }}u, (int32_t){{ PG.ctl }}u, {{ PG.bd0 }} + page - 1);
+        {{ p }}_pg_request((int32_t){{ PG.hdr[0] }}u, (int32_t){{ PG.ctl[0] }}u, {{ PG.bd0[0] }} + page - 1);
     }
 }
 

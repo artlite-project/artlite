@@ -2,8 +2,8 @@
 metadata and weight reads.
 
 A phase is one region of the image (``image.Region``) against the inputs of S <= ``slots`` (the design's) slots. Its K
-chunks run in groups of at most ``design.MAX_K`` elements (the x panels of a group live in the helper core's memory):
-each group is an input of its own (a metadata object and the slots' x interleaved: ``design.input_fill``) followed by
+chunks run in groups of at most ``protocol.MAX_K`` elements (the x panels of a group live in the helper core's memory):
+each group is an input of its own (a metadata object and the slots' x interleaved: ``protocol.input_fill``) followed by
 its tiles, a row tile's chunks of the group in a row.
 """
 
@@ -13,7 +13,8 @@ import numpy as np
 
 from ..formats import FORMATS
 from . import gemv
-from .design import (
+from .image import Region
+from .protocol import (
     B_F32,
     B_G2,
     B_G4,
@@ -41,7 +42,6 @@ from .design import (
     POST_K,
     n_inputs,
 )
-from .image import Region
 
 
 @dataclass
@@ -88,7 +88,7 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
     header: input objects of POST_K). The "ab" block (alpha, beta; or "alpha" of BFP16 planes, B_PAIR, and "beta")
     goes out as fp32 with F_MSG (the GDN core's) or ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block
-    of row groups (``Block.G``) gets B_G2 / B_G4; ``slots``: the design's (its input objects of ``design.n_inputs``)."""
+    of row groups (``Block.G``) gets B_G2 / B_G4; ``slots``: the design's (its input objects of ``protocol.n_inputs``)."""
     assert len(region.blocks) <= NBLK and 1 <= S <= slots
     blk, rt = [], 0
     for b, nv in zip(region.blocks, valid_rows(region)):

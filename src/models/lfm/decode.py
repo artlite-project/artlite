@@ -29,22 +29,13 @@ from aie.iron.device import Tile
 
 from artlite import txn
 from artlite.decode import gemv
-from artlite.decode.attn import Attn, AttnPages, page_calls, page_entries
-from artlite.decode.design import (
-    C_LEN,
-    META,
-    NX_PER_NORM,
-    PG_BD,
-    PG_CH,
-    PG_STATE,
-    PG_STORE,
-    PG_STORE_BYTES,
-    PG_WAKE,
-    DecodeOverlayOperator,
-    _Streams,
-)
+from artlite.decode.attn import ATT, TOKEN_ATT, Attn, page_calls, page_entries
+from artlite.decode.design import DecodeOverlayOperator, _Streams
+from artlite.decode.protocol import C_LEN, PG_BD, PG_CH, PG_STATE, PG_STORE, PG_STORE_BYTES, PG_WAKE
 from artlite.operators import paging
 from artlite.operators.design import COLS
+
+from .conv import CONV, CONV_TOKEN
 
 OP_PAGE_ID, OP_REQ_ID = 5, 6  # the operator cores' pages' and requests' stream ids
 
@@ -55,6 +46,7 @@ class LfmDecodeOperator(DecodeOverlayOperator):
     ``gu_win``: the gate / up tiles hold other than 16 rows (``DecodeOverlayOperator``); ``paged``: formats whose kernels
     are code pages (``DecodeOverlayOperator``)."""
 
+    META_KINDS = (ATT, TOKEN_ATT, CONV, CONV_TOKEN)  # (the operator cores': attention and conv)
     PREFIX = "lfd"
     ATTN_STACK = 3072
     ATTN_ROW = 5
@@ -67,16 +59,16 @@ class LfmDecodeOperator(DecodeOverlayOperator):
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes and attn.chain == 2)
         assert not paged, "the operator cores page: the formats' kernels stay resident"
         if attn is not None:
-            attn.pages = AttnPages(0x70000 + PG_STATE, PG_WAKE, *paging.request(stream_id=OP_REQ_ID, channel=PG_CH), PG_BD)
+            hdr, ctl = paging.request(stream_id=OP_REQ_ID, channel=PG_CH)
+            attn.pages = paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(hdr,), bd0=(PG_BD,), ctl=(ctl,))
         self.attn = attn
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu", post=True,
                          packed=True, gu_win=gu_win, paged=paged, win=win)
 
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         if self.attn is None:
             return ""
-        return self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                | {"META": META, "NX_PER_NORM": NX_PER_NORM, "COLS": COLS}, self.win)
+        return self.attn.render(p, self.win)
 
     @property
     def d_cols(self) -> list[int]:

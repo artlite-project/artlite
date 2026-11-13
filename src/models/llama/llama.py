@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from artlite.decode.design import SLOTS
+from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer

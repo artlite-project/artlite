@@ -32,8 +32,8 @@ from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.decode import gemv
-from artlite.decode.design import MAX_K, NX_PER_NORM, OBJ_K, POST_K
 from artlite.decode.image import TileImage, column_rows, gate_up_rows
+from artlite.decode.protocol import MAX_K, NX_PER_NORM, OBJ_K, POST_K
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -93,7 +93,7 @@ class GemmaImage(TileImage):
 
     def norms(self, L: int, name: str) -> tuple[str | None, str | None, str | None]:
         """(w1, w_post, scale) tensor names of a normed phase (None: ones / no scale); w_post None: a plain normed
-        input (the slice's first layer), else a header (``decode.design.F_POST``)."""
+        input (the slice's first layer), else a header (``decode.protocol.F_POST``)."""
         b = f"blk.{L}."
         if name == "qkv":
             if L == self.layers[0]:

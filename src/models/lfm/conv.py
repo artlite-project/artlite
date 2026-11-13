@@ -14,7 +14,7 @@ Per conv layer and column c (its 256 channels 256 c ..: ``image.CH``), a step of
   (``decode.attn``'s F_TOK, words ``M_TOK_S`` / ``M_CSHIFT``), builds the window [history rows cshift .. cshift + 5 | the
   step's S rows of bx = bf16(B x)], y_s = bf16(C_s sum_k (hi_k + lo_k) window[s + k]) (the sum in fp32, k in order, hi
   then lo; times C as bf16 hi + lo of the sum), and emits on D: y as out's packed input ([k block 32][slot SP][8] bf16,
-  ``decode.design.packed_slots``), then the new history [window rows 0 .. 5 + S] (``hist_drains``).
+  ``decode.protocol.packed_slots``), then the new history [window rows 0 .. 5 + S] (``hist_drains``).
 
 The history holds the previous step's 6 base rows and its S rows: the next step's base starts at its accepted count
 (lazy commit, as qwen35's GDN conv), so rejected drafts cost nothing and the host patches no addresses per step. A
@@ -24,26 +24,30 @@ prefill leaves rows 0 .. 5 = its last 6 rows of bx and the next step's shift 0.
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite.decode.design import META, XB, XPAY, packed_slots
+from artlite.decode.attn import TOKEN_ATT
+from artlite.decode.protocol import META, SLOTS, XB, XMETA, XPAY, packed_slots
 from artlite.operators import templating
+from artlite.operators.words import WordMap
 
-F_CONV = 1 << 8  # M_FLAGS of a conv region's first object (the other cores skip it and M_SKIP objects after it)
-M_TOK_S, M_CSHIFT = 45, 46  # token object 0's: the step's slots, the conv shift
+CONV = XMETA.kind("lfm conv")
+F_CONV = CONV.flag("F_CONV", 8)  # M_FLAGS of a conv region's first object (the other cores skip it and M_SKIP objects after it)
+CONV_TOKEN = XMETA.kind("lfm conv token", extends=(TOKEN_ATT,))
+M_TOK_S, M_CSHIFT = CONV_TOKEN.words("M_TOK_S M_CSHIFT", at=45)  # token object 0's: the step's slots, the conv shift
 CH = 256  # channels per column
-WIDTH = 7  # taps (the history: WIDTH - 1 base rows and up to SMAX step rows)
-SMAX = 4
-HIST = WIDTH - 1 + SMAX  # history rows in the region
+WIDTH = 7  # taps (the history: WIDTH - 1 base rows and up to SLOTS step rows)
+HIST = WIDTH - 1 + SLOTS  # history rows in the region
 ROW = 2 * CH  # bytes of a history row
 OBJS = 5  # X objects of a conv region
 TAP = 2 * ROW  # bytes of a tap: [hi 256 | lo 256] bf16
 RJ = 12  # rows objects (C objects) per slot: B, C, x of 256 channels in 64s
 H8 = XPAY + 3 * TAP  # (in the region's payloads, object i's at XPAY i) history rows 8, 9: after taps 4 .. 6
 D_BYTES = 128  # a D object (decode.attn's d_len at head_dim 128)
-assert 4 * TAP == XPAY and H8 + 2 * ROW == 2 * XPAY and 8 * ROW == XPAY and 8 * SMAX * 128 == XPAY
+assert 4 * TAP == XPAY and H8 + 2 * ROW == 2 * XPAY and 8 * ROW == XPAY and 8 * SLOTS * 128 == XPAY
 
 # state words of the operator core (after decode.attn's A_WORDS)
-C_NCV, C_CX, C_CJ, C_S, C_SH = range(5)
 C_WORDS = 8
+STATE = WordMap("conv state", C_WORDS)
+C_NCV, C_CX, C_CJ, C_S, C_SH = STATE.common.words("C_NCV C_CX C_CJ C_S C_SH", at=0)
 
 
 def tap_objects(w: np.ndarray) -> np.ndarray:
@@ -104,7 +108,7 @@ class ConvJob:
         """Byte offsets of the conv's regions (from its base): taps, the emitted y and history (in a row: cemit), B and C
         rows."""
         out = {"taps": 0, "y": WIDTH * TAP}
-        out["hist"] = out["y"] + CH * 2 * SMAX
+        out["hist"] = out["y"] + CH * 2 * SLOTS
         out["bc"] = out["hist"] + HIST * ROW
         out["size"] = out["bc"] + XPAY
         return out
@@ -116,8 +120,7 @@ class ConvJob:
     def render(self, p: str, *, base: int, st: int, X: str, consts: dict[str, int]) -> str:
         """(X: the suffix of the worker's kernels when they are page code: ``decode.attn.Attn(pages=)``)"""
         return _SRC.render(p=p, base=base, st=st, X=X, c=self.layout(), CH=CH, WIDTH=WIDTH, ROW=ROW, TAP=TAP, XPAY=XPAY,
-                           META=META, OBJS=OBJS, D_BYTES=D_BYTES, C_NCV=C_NCV, C_CX=C_CX, C_CJ=C_CJ, C_S=C_S,
-                           C_SH=C_SH, **consts)
+                           META=META, OBJS=OBJS, D_BYTES=D_BYTES, **STATE.consts(), **consts)
 
     def begin_src(self, p: str) -> str:
         """abegin's call for an F_CONV object (x, ws in scope)."""

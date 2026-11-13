@@ -75,10 +75,9 @@ from artlite.prefill.norm import PrefillNormOperator
 from . import attn_prefill as AP
 from . import gdn as GD
 from . import gdn_prefill as GP
-from .decode import META
 from .dflash_prefill import DFlashPrefill
 from .draft_prefill import DraftPrefill
-from .overlay import KV_PAD, QwenOverlay
+from .overlay import CS_OFF, KV_PAD, QwenOverlay
 
 SUB = 256  # tokens per sub-chunk (the operators' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
@@ -86,7 +85,6 @@ SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention d
 MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
 MAX_T = MOE_SIZES[-1]
 assert MAX_T - SUB <= KV_PAD
-CS_OFF = 4 * META + 640  # the conv state's bytes in a GDN header slot of the overlay
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
 # the time model's constants (``layer_seconds``; fitted to the chunk times of the 1B, 9B and 27B Q4_K_M, T = 256 ..
 # 2048 at p0 = 0 .. 30K: within ~2%): per sub-chunk a byte of a layer's weights, a GEMM item, a norm per hidden unit,

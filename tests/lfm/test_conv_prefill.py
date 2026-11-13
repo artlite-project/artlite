@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from artlite.decode.design import XPAY
+from artlite.decode.protocol import XPAY
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.operators.fused import FusedOperator

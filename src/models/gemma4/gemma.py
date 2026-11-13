@@ -33,7 +33,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import parallel_compile
-from artlite.decode.design import SLOTS as BATCH  # tokens per dispatch
+from artlite.decode.protocol import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig, assistant_of
 

@@ -2,7 +2,7 @@
 token slots, the step.
 
 ``QwenOverlay`` lays out the weight image (``image.QwenImage``, packed at ``load``), the norm-weight objects (NORM),
-every phase's input (ACT: per K group [metadata object | x slot-interleaved], ``decode.design.region_bytes``; a producer
+every phase's input (ACT: per K group [metadata object | x slot-interleaved], ``decode.protocol.region_bytes``; a producer
 drains its outputs straight into its consumer's x), the residual-slice objects (F_LOADR), the GDN layers' objects (GOBJ:
 per column [header | conv q / k | K | per pair of v heads: conv v, deltas], a chunkwise core's groups: ``gdn``) and states (GSTATE: per column its
 panels, as the prefill reads them), the attention layers' objects (per column an F_ATT object per sub-step, then per
@@ -49,7 +49,8 @@ from ml_dtypes import bfloat16
 from artlite import txn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
-from artlite.decode.design import (
+from artlite.decode.model import ModelOverlay, host_bytes, paged_formats
+from artlite.decode.protocol import (
     AB_ID,
     B_F32,
     B_GU,
@@ -85,7 +86,6 @@ from artlite.decode.design import (
     XPAY,
     interleave,
 )
-from artlite.decode.model import ModelOverlay, host_bytes, paged_formats
 from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
@@ -96,7 +96,12 @@ from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
 
 from . import attn, gdn
-from .decode import (
+from .decode import QwenDecodeOperator
+from .image import NORMS, QwenImage, gdn_v_heads
+from .words import (
+    F_ATT,
+    F_GDN,
+    F_GIN,
     M_ALANE,
     M_AMASK,
     M_ANA,
@@ -106,15 +111,14 @@ from .decode import (
     M_G0,
     M_GATT,
     M_GJ,
+    M_HPAN,
     M_KSHIFT,
     M_NREP,
     M_NTAIL,
     M_POS,
     M_SA,
     M_SPLIT,
-    QwenDecodeOperator,
 )
-from .image import NORMS, QwenImage, gdn_v_heads
 
 FLAGS = {"eh": F_RESID | F_EMITR,  # (a drafter's first phase: ``draft``)
          "gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
@@ -123,11 +127,13 @@ MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32, "sgate": B_PAIR | B_KEEP}  
 MOE_MAX_K = 2048  # (an MoE model's K groups at most: ``image.payload``)
 CP_BYTES = 128 * MR.RBUF_OBJECTS  # (a column's routing objects in CP; the expert object starts 256 B before their end)
 KV_PAD = 4096 - 256  # positions past the caches (the last layer's): the prefill's sub-chunk slices
-CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot (prefill.CS_OFF)
+CS_OFF = 4 * META + 640  # GHDR: the conv state's bytes in a column's slot
 HSLOT = 12288  # GHDR: a column's slot (the prefill's conv-state drain writes 8 KB from CS_OFF)
 DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart (the overlapping regions)
 FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
-F_WORDS = np.array([M_POS, M_NS, M_SA, M_SKIP, M_SPLIT, M_NREL, M_NTAIL, M_NASKIP, M_G0, M_GATT, M_GJ, M_ANA])  # (an F_ATT object's)
+F_WORDS = {"pos": M_POS, "ns": M_NS, "sa": M_SA, "skip": M_SKIP, "split": M_SPLIT, "nrel": M_NREL, "ntail": M_NTAIL,
+           "naskip": M_NASKIP, "g0": M_G0, "gatt": M_GATT, "gj": M_GJ, "ana": M_ANA}  # (an F_ATT object's words, by name)
+F_ATT_AT = np.array(list(F_WORDS.values()))
 
 
 class _Step:
@@ -219,7 +225,7 @@ class QwenOverlay(ModelOverlay):
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
         self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "Chunkwise", "4 slots")
         self.blocks = self.g4 or self.g8  # (a chunkwise core: the states at the ends of blocks of 8 positions, ``_half``)
-        self.flags = FLAGS | ({"gdn_in": F_NORM | gdn.F_GIN} if slots == 8 else {})
+        self.flags = FLAGS | ({"gdn_in": F_NORM | F_GIN} if slots == 8 else {})
         self._a_bds = getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)  # (the host's BDs on A)
         self._conv_in_ghdr = False
         self._cvi: tuple[np.ndarray, np.ndarray] | None = None
@@ -310,6 +316,7 @@ class QwenOverlay(ModelOverlay):
         self._gobj0: dict[int, np.ndarray] = {}  # (``reset``: a GDN layer's objects as loaded)
         self.hslot = HSLOT
         if self.gsh is not None:
+            assert CS_OFF + 2 * 3 * self.gsh.ch <= HSLOT, (self.gsh.ch, CS_OFF, HSLOT)  # (the conv state: the prefill's drain)
             self.npair = self.gsh.hc // 2
             self.gcol = 256 + XPAY * (self.gsh.n_slots if self.gsh.chunk else 5 + 3 * self.npair)
             self.ps = self.gsh.hc * 16 * gdn.PANEL
@@ -397,7 +404,7 @@ class QwenOverlay(ModelOverlay):
             for u in range(self.ash.u):
                 o = self._fatt(L, c, u)
                 m = np.zeros(META, np.int32)
-                m[M_FLAGS] = attn.F_ATT
+                m[M_FLAGS] = F_ATT
                 act[o:o + 4 * META] = m.view(np.uint8)
                 act[o + 4 * META:o + 4 * META + norms.nbytes] = norms.view(np.uint8)
 
@@ -410,9 +417,9 @@ class QwenOverlay(ModelOverlay):
         dt, A = self._f32(f"blk.{L}.ssm_dt.bias"), self._f32(f"blk.{L}.ssm_a")
         norm = self._f32(f"blk.{L}.ssm_norm.weight")
         m = np.zeros(META, np.int32)
-        m[M_FLAGS], m[M_SKIP] = gdn.F_GDN, sh.n_objects - 1
+        m[M_FLAGS], m[M_SKIP] = F_GDN, sh.n_objects - 1
         if self.g8:  # (the helper's requests per step: ``gdn``'s ``hgdn``, its heads' and the step's end)
-            m[gdn.M_HPAN] = sh.hc + 3
+            m[M_HPAN] = sh.hc + 3
         for c in range(COLS):
             vh = gdn_v_heads(cfg, c)
             rows = blk.rows[c][blk.rows[c] >= 0]
@@ -964,12 +971,14 @@ class QwenOverlay(ModelOverlay):
                 ana, na = na, 0 if ash.one and k else na  # (one pass: the chain's cores on the first column's stream)
                 nq = 3 if split & 3 == attn.SPLIT_ROUND else nph + 1 if split else 2  # (per slot the X objects after F_ATT)
                 sw = ash.round_word(split, c)
-                w[u, c] = q, n, 0, nq * n, sw, ash.n_rel(c, sw, n), nt, na, g0, ga, gj, ana
+                v = {"pos": q, "ns": n, "sa": 0, "skip": nq * n, "split": sw, "nrel": ash.n_rel(c, sw, n), "ntail": nt, "naskip": na,
+                     "g0": g0, "gatt": ga, "gj": gj, "ana": ana}
+                w[u, c] = [v[k] for k in F_WORDS]  # (by name: a word of F_WORDS without a value is a KeyError)
             for k in range(nph):
                 gr[u, :, k] = (0, G), (g, g + 1), (b[k], b[k + 1])
         fo = self._fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
         a32 = act.view(np.int32)
-        a32[fo[..., None] + F_WORDS] = w[np.arange(U), np.arange(COLS)[:, None]]
+        a32[fo[..., None] + F_ATT_AT] = w[np.arange(U), np.arange(COLS)[:, None]]
         q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)
         af = act.view(np.float32)
         for u, (a, n, _) in enumerate(st.subs):

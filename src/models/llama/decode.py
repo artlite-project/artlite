@@ -16,8 +16,9 @@ Phases and buffers: ``llama/overlay.py``.
 from aie.iron import ObjectFifo, Worker
 
 from artlite.decode import gemv
-from artlite.decode.attn import Attn
-from artlite.decode.design import C_LEN, META, NX_PER_NORM, DecodeOverlayOperator, _Streams
+from artlite.decode.attn import ATT, TOKEN_ATT, Attn
+from artlite.decode.design import DecodeOverlayOperator, _Streams
+from artlite.decode.protocol import C_LEN
 from artlite.operators.design import COLS
 
 
@@ -27,6 +28,7 @@ class LlamaDecodeOperator(DecodeOverlayOperator):
     tiles hold fewer than 16 rows (Q5_K, Q6_K: ``DecodeOverlayOperator``); ``paged``: formats whose kernels are code
     pages (``DecodeOverlayOperator``)."""
 
+    META_KINDS = (ATT, TOKEN_ATT)  # (the attention cores')
     PREFIX = "l3d"
     ATTN_STACK = 3072
     ATTN_ROW = 5
@@ -41,11 +43,10 @@ class LlamaDecodeOperator(DecodeOverlayOperator):
         super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu", packed=True,
                          tok=True, gu_win=gu_win, paged=paged, win=win)
 
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         if self.attn is None:
             return ""
-        return self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                | {"META": META, "NX_PER_NORM": NX_PER_NORM, "COLS": COLS}, self.win)
+        return self.attn.render(p, self.win)
 
     @property
     def d_cols(self) -> list[int]:

@@ -8,11 +8,7 @@ cores of every column, their GEMV phases) with the qwen35 cores:
   chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair (one
   pass, a design of 8 slots: each core emits its own rows, no tokens).
 
-Metadata words of the model cores (``M_MODEL`` on): the gdn_in phase's for the GDN core (``M_NREP``, ``M_CSHIFT``,
-``M_COMMIT``, ``M_KSHIFT``: gdn.py), an F_ATT object's for the attention core (attn.py): the sub-step's first position; split: the
-KV head's chain divides the cache's groups (1); the core's first group, the end of its attention groups, the first
-group past them (a chain's first core's: the sub-step's group, for its records only); its first slot's row of angles;
-the tail objects.
+Metadata words of the model cores (``M_MODEL`` on): ``words.py``.
 """
 
 import numpy as np
@@ -22,23 +18,15 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
-from artlite.decode import design as OD
 from artlite.decode import gemv
-from artlite.decode.design import C_LEN, META, XPAY, DecodeOverlayOperator, _Streams
+from artlite.decode.design import DecodeOverlayOperator, _Streams
+from artlite.decode.protocol import C_LEN, MAX_K, META, SLOTS, XPAY
 from artlite.operators import kmath
 from artlite.operators.design import COLS, range32
 
 from . import attn as AT
 from . import gdn as GD
-
-M_NREP, M_CSHIFT, M_COMMIT = OD.M_MODEL, OD.M_MODEL + 1, OD.M_MODEL + 2  # (the gdn_in phase's, for the GDN core)
-M_KSHIFT = OD.M_MODEL + 3  # (the gdn_in phase's, chunkwise cores: the k / v histories' and the gates' first row)
-M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = range(OD.M_MODEL + 3, OD.M_MODEL + 10)  # (an F_ATT object's)
-M_ANA = 36  # (an F_ATT object's, one pass: the core's A objects through its held ones)
-M_BRANCH = 37  # (a step whose last slots branch off an earlier one: the F_ATT objects' and the gdn_in object's word, its parent slot +
-# 1 | its slots << 8, or 0)
-M_AMASK = 38  # (an F_ATT object's, one pass: 4 words, the rows' masks of the step's first two records, ``attn``'s A_MK)
-M_ALANE = 42  # (an F_ATT object's, one pass: the slots' K lanes, ``attn``'s A_LN)
+from .words import ATT, F_GDN, FLAGS, GDN_IN, M_HPAN
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
@@ -47,15 +35,17 @@ class QwenDecodeOperator(DecodeOverlayOperator):
     (None: without)."""
 
     PREFIX = "q35m"
+    META_KINDS = (FLAGS, GDN_IN, ATT)  # (the GDN and attention cores')
     GDN_STACK, ATTN_STACK = 4864, AT.STACK
     GWS8_AT = GD.GWS_AT  # (chunkwise) the GDN workspace
+    GATE_STATE = (AT.GATES,)  # (the main core applies the attention's gates) its state words
     A_FWD = 3  # (the attention core holds its last two A objects: decode.design's A_FWD)
     LENDS_WS = True  # (the attention core's regions in the main core's memory)
     GDN_ROW, ATTN_ROW = 2, 5
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = AT.OBJ_BYTES, eps: float = 1e-6,
                  gdn: GD.GdnShape | None = None, attn: AT.AttnShape | None = None, moe: tuple[int, int] | None = None,
-                 max_k: int = OD.MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = OD.SLOTS,
+                 max_k: int = MAX_K, paged: tuple[str, ...] = (), win: str = "", slots: int = SLOTS,
                  bcast: bool = False, gu_win: bool = False, pairs: bool = False):
         """moe: (experts, experts per token) of an MoE model (``decode.design``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``decode.model.paged_formats``:
@@ -67,7 +57,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
         if gdn is not None and slots == 8:  # (the helper computes the v heads' constants: gdn's ``vhead``)
-            self.help_flag, self.help_word = GD.F_GDN, GD.M_HPAN
+            self.help_flag, self.help_word = F_GDN, M_HPAN
         self._gws: dict[int, Buffer] = {}
         self._tabs: list[Buffer] = []
         self.msg, self.relay = gdn is not None and slots == 4, attn is not None
@@ -77,20 +67,15 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                          paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast, gu_win=gu_win,
                          a_bcast=attn.a_bcast if attn is not None else (), pairs=pairs)
 
-    def _consts(self) -> dict[str, int]:
-        return super()._consts() | {k: v for k, v in globals().items() if k[:2] == "M_"}
-
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         src = ""
         if self.gdn is not None:
-            src += self.gdn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")})
+            src += self.gdn.render(p)
         if self.attn is not None:
             W = self.workspace()  # (the main core's: its regions past the residual, idle in an attention sub-step)
             assert W["size"] - W["inv"] >= self.attn.ext_w and self.xs_bytes >= self.attn.mx_bytes, W
             assert not self.gate or self.xp_bytes >= 2 * self.attn.rows * AT.HD  # (the gate table in the helper's xp)
-            src += self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                    | {"META": META, "NX_PER_NORM": self.nx_per_norm}, tail=W["inv"],
-                                    packed8=self.packed and self.slots == 8)
+            src += self.attn.render(p, tail=W["inv"], nx_per_norm=self.nx_per_norm, packed8=self.packed and self.slots == 8)
         return src
 
     @property
@@ -299,11 +284,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         if not self.moe or self.attn is None:
             return 0
         aw = self.attn.workspace()
-        assert aw["y"] == aw["st"] + 192 and aw["y"] + (OD.SLOTS * self.hidden + 32) * 4 <= aw["size"], aw
+        assert aw["y"] == aw["st"] + 192 and aw["y"] + (SLOTS * self.hidden + 32) * 4 <= aw["size"], aw
         return aw["y"]
 
     def _acc_type(self) -> type:
-        n = self.attn.workspace()["size"] // 4 if self.attn is not None else OD.SLOTS * self.hidden + 32
+        n = self.attn.workspace()["size"] // 4 if self.attn is not None else SLOTS * self.hidden + 32
         return np.ndarray[(n,), np.dtype[np.int32]]
 
     def _acc(self, c: int) -> Buffer:

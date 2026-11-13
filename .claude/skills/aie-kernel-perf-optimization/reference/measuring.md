@@ -99,7 +99,7 @@ These have no MLIR runtime sequence, so the profiling hook does not apply. Do it
    #define CLK(k) Win<(k)> win_   // at the top of a region's scope
    ```
 
-   Example: `DecodeOverlayOperator(win="tile")` (the main core's tile; regions in `decode.design.WINS`, the Gemma
+   Example: `DecodeOverlayOperator(win="tile")` (the main core's tile; regions in `decode.protocol.WINS`, the Gemma
    attention cores' (Gemma, Llama) in `decode.attn.WINS`). Spans across kernel calls are explicit `event0()` / `event1()` at
    their two ends, e.g. `"gap"`: a phase's last tile to the next X object.
 2. **Program the counters in the transaction**, once per dispatch, for every core:

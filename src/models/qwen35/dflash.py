@@ -38,7 +38,9 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
-from artlite.decode.design import (
+from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
+from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
+from artlite.decode.protocol import (
     BC_COL,
     BC_ID,
     C_LEN,
@@ -59,8 +61,6 @@ from artlite.decode.design import (
     XPAY,
     input_fill,
 )
-from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
-from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
@@ -74,7 +74,6 @@ from .dflash_core import (
     CV_OUT,
     D_BYTES,
     DYN_ROWS,
-    F_ATT,
     F_CV,
     GROUPS,
     H8,
@@ -101,6 +100,7 @@ from .dflash_core import (
 from .draft import HeadTable
 from .image import KC, payload
 from .overlay import KV_PAD
+from .words import F_ATT
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}

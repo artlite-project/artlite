@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 from ml_dtypes import bfloat16
 
-from artlite.decode.design import POST_K
 from artlite.decode.image import COL_SLOT, pack_rows
+from artlite.decode.protocol import POST_K
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LFM3_QUANTS, LfmConfig, lfm3_gguf
 from artlite.operators.design import COLS

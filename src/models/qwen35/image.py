@@ -23,7 +23,7 @@ An MoE layer (``qwen35moe``: ``QwenConfig.moe``) has instead of gate_up and down
   ``decode.image.Block``: per expert its hi and lo rows, whose outputs the decode adds: the logits' order of
   llama.cpp's fp32 up to ~3e-5 of a weight); "sgate", the shared expert's gate row (``ffn_gate_inp_shexp``: its hi and
   lo planes) in every column. Both F32 tensors are packed times w / bf16(w), w the layer's ``post_attention_norm``
-  (``pack``): the decode's norm multiplies x by bf16 weights (``decode.design.norm_objects``), the logits need w's
+  (``pack``): the decode's norm multiplies x by bf16 weights (``decode.protocol.norm_objects``), the logits need w's
   fp32 (with the bf16 weights alone they are 8e-4 of their largest off, against 1.3e-5);
 - "sdown": the shared expert's down, rows hidden / 8 c .., its K (512) as row groups of 2 per tile row
   (``decode.image.group_rows``);
@@ -62,9 +62,9 @@ import math
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite.decode.design import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
 from artlite.decode.phases import group_chunks
+from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS

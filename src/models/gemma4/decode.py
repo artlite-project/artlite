@@ -14,7 +14,9 @@ Phases and buffers: ``gemma4/overlay.py``.
 
 from aie.iron import ObjectFifo, Worker
 
-from artlite.decode.design import C_LEN, DecodeOverlayOperator, _Streams
+from artlite.decode.attn import ATT, TOKEN_ATT
+from artlite.decode.design import DecodeOverlayOperator, _Streams
+from artlite.decode.protocol import C_LEN
 from artlite.operators.design import COLS
 
 from . import attn as AT
@@ -25,6 +27,7 @@ class GemmaDecodeOperator(DecodeOverlayOperator):
     """The Gemma decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} (Q4_0 32, Q8_0
     16); ``attn``: the attention cores' shapes (None: without)."""
 
+    META_KINDS = (ATT, TOKEN_ATT)  # (the attention cores')
     PREFIX = "g4d"
     ATTN_STACK = 3072
     ATTN_ROW = 5
@@ -38,11 +41,10 @@ class GemmaDecodeOperator(DecodeOverlayOperator):
         super().__init__(hidden=hidden, rows=rows, tile_bytes=TILE_BYTES, eps=eps, nsb=KC // 256, act="gelu",
                          post=True, pli=True, packed=True, win=win)
 
-    def _extra_src(self, p: str, consts: dict[str, int]) -> str:
+    def _extra_src(self, p: str) -> str:
         if self.attn is None:
             return ""
-        return self.attn.render(p, {k: v for k, v in consts.items() if k[:2] in ("M_", "F_")}
-                                | {"META": 64, "NX_PER_NORM": 8, "COLS": COLS}, self.win)
+        return self.attn.render(p, self.win)
 
     @property
     def d_cols(self) -> list[int]:

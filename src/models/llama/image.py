@@ -5,7 +5,7 @@ padding zero), objects of the size that streams the fewest bytes for the file's 
 9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0, 9216 for Q8_0 alone).
 
 Column-major (as ``gemma4.image``): a column's regions in step order, each normed phase's norm-weight objects (data
-region "<name>_norm": the RMSNorm weights, ``decode.design.norm_objects``) before its tiles, so that a decode step
+region "<name>_norm": the RMSNorm weights, ``decode.protocol.norm_objects``) before its tiles, so that a decode step
 streams a column's weights between two attentions as one run (8B: in two layout blocks of layers, each under 3 GiB, the
 prefill GEMMs' weight arguments within 4 GB: ``decode.image.BLOCK_BYTES``).
 
@@ -19,13 +19,13 @@ Per-column rows (layer L, column c = KV head c, qh query heads per KV head):
 - "lm": rows vocab / 8 c .. of ``output`` (the tied ``token_embd`` in 1B and 3B), the vocabulary padded to whole C
   objects per column (128256 -> 128512; padding rows -1: zero tiles).
 
-down's K chunks go in groups of the overlay's K group (``decode.design.MAX_K``: 1B / 3B 2 groups of 4, 8B 7 of 2).
+down's K chunks go in groups of the overlay's K group (``decode.protocol.MAX_K``: 1B / 3B 2 groups of 4, 8B 7 of 2).
 """
 
 import numpy as np
 
-from artlite.decode.design import C_LEN, MAX_K, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.decode.image import TileImage, column_rows, gate_up_rows
+from artlite.decode.protocol import C_LEN, MAX_K, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS

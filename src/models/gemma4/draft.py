@@ -11,7 +11,7 @@ next step's h, back to the model's width). Every step of a draft runs at the sam
 
 On the overlay (the model's phases: ``gemma4/overlay.py``):
 
-- the residual: 32 values per column (``decode.design.M_H8``); a narrow emit's C object holds them and 32 zeros, drained
+- the residual: 32 values per column (``decode.protocol.M_H8``); a narrow emit's C object holds them and 32 zeros, drained
   into the slot-1 positions next to them (which must be zero);
 - pre (K 5120: [x | h], one row tile per column) adds into the residual (F_RESID, after F_LOADR objects of zeros); o
   and down (K 1024 / 2048, 32 rows per column) are F_VOUT phases as in the model; q, gate_up and the LM head are
@@ -34,7 +34,8 @@ from ml_dtypes import bfloat16
 
 from artlite.decode import gemv, kv
 from artlite.decode import phases as mp
-from artlite.decode.design import (
+from artlite.decode.image import TileImage, column_rows
+from artlite.decode.protocol import (
     C_LEN,
     F_EMITR,
     F_GU,
@@ -56,6 +57,7 @@ from artlite.decode.design import (
     META,
     NX_PER_NORM,
     POST_K,
+    SLOTS,
     XB,
     XPAY,
     hidden_meta,
@@ -64,7 +66,6 @@ from artlite.decode.design import (
     post_region_bytes,
     region_bytes,
 )
-from artlite.decode.image import TileImage, column_rows
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -292,7 +293,7 @@ class GemmaDraft:
         act = dev.view("DACT")
         for kind in (0, 1):  # (the first sub-step's token of each layer kind)
             m = np.zeros(META, np.int32)
-            m[M_FLAGS], m[M_TOK_KIND], m[M_NS] = F_TOK, AT.SMAX * kind, 1
+            m[M_FLAGS], m[M_TOK_KIND], m[M_NS] = F_TOK, SLOTS * kind, 1
             act[self.tok + kind * XB:][:4 * META] = m.view(np.uint8)
         for c in range(COLS):
             for s in range(2):
@@ -310,9 +311,9 @@ class GemmaDraft:
             hi, lo = AT.score_constant(self._scalar(f"blk.{L}.attn_q_norm.weight", self.gguf),
                                        self.ov._scalar(f"blk.{self.src[L]}.attn_k_norm.weight"))
             m = np.zeros(META, np.int32)
-            m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = AT.F_ATT, -1 - AT.SMAX * int(not swa), 0
+            m[M_FLAGS], m[M_NASKIP], m[M_SKIP] = AT.F_ATT, -1 - SLOTS * int(not swa), 0
             m[AT.M_AHD], m[AT.M_AKIND], m[AT.M_AOWN] = self.image.hd[L], int(not swa), 0
-            m[AT.M_QC_HI], m[AT.M_QC_LO], m[AT.M_ATOK] = hi, lo, AT.SMAX * int(not swa)
+            m[AT.M_QC_HI], m[AT.M_QC_LO], m[AT.M_ATOK] = hi, lo, SLOTS * int(not swa)
             m[AT.M_AWIN], m[AT.M_ANH] = self.cfg.sliding_window - 1 if swa else 0, self.nq
             act[off:off + 4 * META] = m.view(np.uint8)
         dev.flush("DACT")

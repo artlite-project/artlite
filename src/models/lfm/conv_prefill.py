@@ -32,7 +32,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from artlite.decode.design import XB, XPAY
+from artlite.decode.protocol import XB, XPAY
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.design import COLS
