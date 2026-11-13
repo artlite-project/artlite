@@ -1,0 +1,32 @@
+// lo / hi: the 6-bit values' low nibbles and high crumbs (shifted by hsh) [row 16][group 8]; sw: the
+// rows' scale words (shifted by ssh: the bf16 in the low half) -> out (group n at out + outs[n])
+[[clang::always_inline]] inline void {{ p }}_plane8(aie::vector<uint8, 128> lo, aie::vector<uint8, 128> hi,
+                                                  aie::vector<uint32, 16> sw, unsigned hsh, unsigned ssh,
+                                                  bfloat16 *__restrict out)
+{
+    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
+    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
+    aie::vector<uint8, 128> c = aie::bit_and(aie::downshift(hi, hsh), aie::broadcast<uint8, 128>(3));
+    aie::vector<uint8, 128> v = aie::bit_or(lo, aie::upshift(c, 4));  // 6-bit values [row 16][group 8]
+    aie::vector<bfloat16, 16> s16 = aie::filter_even(aie::downshift(sw, ssh).template cast_to<bfloat16>(), 1);  // row scales
+    aie::vector<bfloat16, 64> S0, S1;
+    al::expand16(s16, S0, S1);
+    // (128 + v) s - 128 s = v s exact in fp32, one rounding
+    aie::vector<bfloat16, 64> r0 =
+        aie::mac(aie::mul(S0, k128), al::zipw(v.template extract<64>(0), c43), S0).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 64> r1 =
+        aie::mac(aie::mul(S1, k128), al::zipw(v.template extract<64>(1), c43), S1).template to_vector<bfloat16>();
+    auto [e1, o1] = aie::interleave_unzip(r0, r1, 1);
+    auto [e2, o2] = aie::interleave_unzip(e1, o1, 1);
+    auto [e3, o3] = aie::interleave_unzip(e2, o2, 1);
+{% if outs is not defined %}
+    aie::store_v(out, e3);  // [group n 8][row 16]: groups 0 .. 3, 4 .. 7
+    aie::store_v(out + 64, o3);
+{% else %}
+    aie::vector<bfloat16, 128> tr = aie::concat(e3, o3);  // [group n 8][row 16]
+{% for o in outs %}
+    aie::store_v(out + {{ o }}, tr.template extract<16>({{ loop.index0 }}));
+{% endfor %}
+{% endif %}
+}
+

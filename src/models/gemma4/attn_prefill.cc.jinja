@@ -1,0 +1,326 @@
+
+// The attention core's buffers: wo = o [db ND][8 x 8] fp32; ws (bytes): sc [record RG][8 x 8] fp32 (scores, log2
+// units), m, l [64] (lane 8 q + k: query q's running maximum / its partial sums), pp [record] P panels hi, lo, rm (the group
+// maxima), st [16] int32 (the group's first record relative to the core's queries, skip)
+#define AW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+{# P = 2^(A - 192) (pexp clamps A at 129 itself: 2^-63) #}
+{% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="none", inline=True) %}
+{{ exp2.src }}
+{{ e192.src }}
+
+namespace {
+
+// Rows whose maximum grew: o, l scaled by 2^(m - mn), m = mn = max(m, rm) (rm: the rows' group maxima)
+__attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__restrict pl, float *__restrict pm,
+                                               const float *__restrict prm)
+{
+    const aie::vector<float, 64> m = aie::load_v<64>(pm);
+    const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
+    const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
+    al::scale<{{ ND }}>(o, o, a);
+    aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
+    aie::store_v(pm, mn);
+}
+
+// P = 2^(s - m) of the group's RG score panels, clamped at 2^-63 (A = max(s + 192 - m, 129)), in place (sl, ss: the
+// scores as distinct restrict parameters, each read before it is written); l += P
+__attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict pm,
+                                            float *__restrict pl)
+{
+    const aie::vector<float, 32> b0 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm));
+    const aie::vector<float, 32> b1 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm + 32));
+    const aie::vector<float, 32> lo = aie::broadcast<float, 32>(129.0f);
+    aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
+    for (int k = 0; k < {{ RG }}; k++) {
+        const aie::accum<accfloat, 32> p0 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl), b0), lo)));
+        const aie::accum<accfloat, 32> p1 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl + 32), b1), lo)));
+        l0 = aie::add(l0, p0);
+        l1 = aie::add(l1, p1);
+        aie::store_v(ss, p0.template to_vector<float>());
+        aie::store_v(ss + 32, p1.template to_vector<float>());
+        sl += 64;
+        ss += 64;
+    }
+    aie::store_v(pl, l0.template to_vector<float>());
+    aie::store_v(pl + 32, l1.template to_vector<float>());
+}
+
+// o of QB query blocks += P0 V0 + P1 V1, P as hi + lo panels (v: per d-block the two records' panels, interleaved by
+// the memtile, popped once for every block{{ "; d-blocks 0 .. ND / 2 - 1 in v, the rest in v1: the two streams" if not SWA }};
+// o in place: the ol, os pairs the same panels as distinct restrict parameters, each read before it is written, so
+// the loop pipelines)
+[[clang::always_inline]] inline void {{ p }}_pvh(const al::BV &P0, const al::BV &L0, const al::BV &P1, const al::BV &L1,
+{% if QB == 2 %}
+                                                 const al::BV &Q0, const al::BV &M0, const al::BV &Q1, const al::BV &M1,
+{% endif %}
+                                                 const uint8_t *__restrict v, {{ "const uint8_t *__restrict v1, " if not SWA }}const float *__restrict ol_,
+                                                 float *__restrict os_{{ ", const float *__restrict ol1_, float *__restrict os1_" if QB == 2 }})
+{
+    const float __aie_dm_resource_c *__restrict ol = (const float __aie_dm_resource_c *)ol_;
+    float __aie_dm_resource_d *__restrict os = (float __aie_dm_resource_d *)os_;
+{% if QB == 2 %}
+    const float __aie_dm_resource_c *__restrict ol1 = (const float __aie_dm_resource_c *)ol1_;
+    float __aie_dm_resource_d *__restrict os1 = (float __aie_dm_resource_d *)os1_;
+{% endif %}
+{% for src in (["v"] if SWA else ["v", "v1"]) %}
+    {
+    al::BInR<aie_dm_resource::a> sv((const bfp16ebs8 *){{ src }});
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND if SWA else ND // 2 }}; db++) {
+        const al::BV V0 = sv.pop(), V1 = sv.pop();
+        al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(ol)));
+{% if QB == 2 %}
+        c.mac(P0, aie::op_transpose(V0));
+        c.mac(L0, aie::op_transpose(V0));
+        c.mac(P1, aie::op_transpose(V1));
+        c.mac(L1, aie::op_transpose(V1));
+        aie::store_v(os, c.template to_vector<float>());
+        ol += 64;
+        os += 64;
+        al::MM8 c1(aie::accum<accfloat, 64>(aie::load_v<64>(ol1)));
+        c1.mac(Q0, aie::op_transpose(V0));
+        c1.mac(M0, aie::op_transpose(V0));
+        c1.mac(Q1, aie::op_transpose(V1));
+        c1.mac(M1, aie::op_transpose(V1));
+        aie::store_v(os1, c1.template to_vector<float>());
+        ol1 += 64;
+        os1 += 64;
+{% else %}
+        al::MM8 d(aie::zeros<accfloat, 64>());  // (the lo products: a second chain)
+        c.mac(P0, aie::op_transpose(V0));
+        d.mac(L0, aie::op_transpose(V0));
+        c.mac(P1, aie::op_transpose(V1));
+        d.mac(L1, aie::op_transpose(V1));
+        aie::store_v(os, aie::add(c.to_accum(), d.to_accum()).template to_vector<float>());
+        ol += 64;
+        os += 64;
+{% endif %}
+    }
+    }
+{% endfor %}
+}
+
+}  // namespace
+
+extern "C" {
+
+// A pass's start: o = 0, m = a floor far above the masked scores and below any real one, l = 0 (every query block)
+void {{ p }}_init(float *__restrict ws, float *__restrict wo)
+{
+    al::zero<{{ QB * 64 * ND }}, 64>(wo);
+    for (int b = 0; b < {{ QB }}; b++)
+        aie::store_v(AW(float, {{ w.m }}) + 64 * b, aie::broadcast<float, 64>(-1e4f));
+    al::zero<{{ QB * 64 }}, 64>(AW(float, {{ w.l }}));
+}
+
+// The group g of the pass: its first record relative to the core's first query block (rho: record 0 + rho holds its
+// queries; block b's: rho - b), skipped when every position is before 0. {{ "Sliding window: rho = 4 g - 64 - %d r, x = p0 / 32 + %d b (skip: g + x < 16)" % (QB, QB) if SWA else "Full: rho = 2 g - x - r, x = p0 / 8 + 4 b" }}
+void {{ p }}_grp(float *__restrict ws, int32_t g, int32_t x, int32_t r)
+{
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+{% if SWA %}
+    st[0] = 4 * g - 64 - {{ QB }} * r;
+    st[1] = g + x < 16;
+{% else %}
+    st[0] = 2 * g - x - r;
+    st[1] = 0;
+{% endif %}
+}
+
+{% if not SWA %}
+// A pass's Q object i of the KV head's 16 (its halves a, b, one per stream): the core's own (i == me) into q
+void {{ p }}_qsel(const bfloat16 *__restrict a, const bfloat16 *__restrict b, bfloat16 *__restrict q, int32_t i,
+                  int32_t me)
+{
+    if (i != me)
+        return;
+    for (int j = 0; j < {{ ND * 72 // 2 }}; j += 32) {
+        aie::store_v(q + j, aie::load_v<32>(a + j));
+        aie::store_v(q + {{ ND * 72 // 2 }} + j, aie::load_v<32>(b + j));
+    }
+}
+
+{% endif %}
+{% if KP == 2 %}
+// Scores of K record k (8 positions; per d-block its hi and lo panels, interleaved by the memtile{{ "; d-blocks
+// 0 .. ND / 2 - 1 in kr, the rest in kl: the two streams" if not SWA }})
+// for the QB query blocks: Q hi K hi, then Q lo K hi + Q hi K lo (q: per d-block {{ "the blocks' " if QB == 2 }}Q panels
+// hi, lo), {{ "one loop" if SWA else "a loop per stream object" }} of two panel streams
+void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, {{ "const bfloat16 *__restrict kl, " if not SWA }}float *__restrict ws, int32_t k)
+{
+{% if "qk" in ablate %}
+    return;
+{% endif %}
+    if (AW(int32_t, {{ w.st }})[1])
+        return;
+    float *__restrict sc = AW(float, {{ w.sc }}) + 64 * k;
+    al::MM8 a(aie::zeros<accfloat, 64>()), b(aie::zeros<accfloat, 64>());
+{% if QB == 2 %}
+    al::MM8 a1(aie::zeros<accfloat, 64>()), b1(aie::zeros<accfloat, 64>());
+{% endif %}
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+{% for src in (["kr"] if SWA else ["kr", "kl"]) %}
+    {
+    al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *){{ src }});
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND if SWA else ND // 2 }}; db++) {
+        const al::BV qh = qs.pop(), ql = qs.pop(), Kh = ks.pop(), Kl = ks.pop();
+        a.mac(qh, aie::op_transpose(Kh));
+        b.mac(ql, aie::op_transpose(Kh));
+        b.mac(qh, aie::op_transpose(Kl));
+{% if QB == 2 %}
+        const al::BV qh1 = qs.pop(), ql1 = qs.pop();
+        a1.mac(qh1, aie::op_transpose(Kh));
+        b1.mac(ql1, aie::op_transpose(Kh));
+        b1.mac(qh1, aie::op_transpose(Kl));
+{% endif %}
+    }
+    }
+{% endfor %}
+    aie::store_v(sc, aie::add(a.to_accum(), b.to_accum()).template to_vector<float>());
+{% if QB == 2 %}
+    aie::store_v(sc + {{ 64 * RG }}, aie::add(a1.to_accum(), b1.to_accum()).template to_vector<float>());
+{% endif %}
+}
+
+{% else %}
+// Scores of K unit k (records 2 k, 2 k + 1; per d-block their panels, interleaved by the memtile{{ "; d-blocks
+// 0 .. ND / 2 - 1 in kr, the rest in kl: the two streams" if not SWA }})
+// for the QB query blocks: Q hi K + Q lo K (q: per d-block {{ "the blocks' " if QB == 2 }}Q panels hi, lo),
+// {{ "one loop" if SWA else "a loop per stream object" }} of two panel streams
+void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, {{ "const bfloat16 *__restrict kl, " if not SWA }}float *__restrict ws, int32_t k)
+{
+{% if "qk" in ablate %}
+    return;
+{% endif %}
+    if (AW(int32_t, {{ w.st }})[1])
+        return;
+    float *__restrict sc = AW(float, {{ w.sc }}) + 128 * k;
+    al::MM8 a0(aie::zeros<accfloat, 64>()), a1(aie::zeros<accfloat, 64>());
+{% if QB == 2 %}
+    al::MM8 c0(aie::zeros<accfloat, 64>()), c1(aie::zeros<accfloat, 64>());
+{% endif %}
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)q);
+{% for src in (["kr"] if SWA else ["kr", "kl"]) %}
+    {
+    al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *){{ src }});
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND if SWA else ND // 2 }}; db++) {
+        const al::BV qh = qs.pop(), ql = qs.pop(), K0 = ks.pop(), K1 = ks.pop();
+        a0.mac(qh, aie::op_transpose(K0));
+        a1.mac(qh, aie::op_transpose(K1));
+        a0.mac(ql, aie::op_transpose(K0));
+        a1.mac(ql, aie::op_transpose(K1));
+{% if QB == 2 %}
+        const al::BV qh1 = qs.pop(), ql1 = qs.pop();
+        c0.mac(qh1, aie::op_transpose(K0));
+        c1.mac(qh1, aie::op_transpose(K1));
+        c0.mac(ql1, aie::op_transpose(K0));
+        c1.mac(ql1, aie::op_transpose(K1));
+{% endif %}
+    }
+    }
+{% endfor %}
+    aie::store_v(sc, a0.template to_vector<float>());
+    aie::store_v(sc + 64, a1.template to_vector<float>());
+{% if QB == 2 %}
+    aie::store_v(sc + {{ 64 * RG }}, c0.template to_vector<float>());
+    aie::store_v(sc + {{ 64 * RG + 64 }}, c1.template to_vector<float>());
+{% endif %}
+}
+
+{% endif %}
+// The group's softmax terms, per query block b: per record its mask (relative record rho = st[0] - b + k: past the
+// queries (rho > 0) or {{ "before their window (rho < -64): all; rho = 0: keys after the query; rho = -64: keys up to the query's" if SWA else "rho > 0: all; rho = 0: keys after the query" }}); a row's maximum is raised (o, l
+// rescaled) only when its group maximum exceeds it by 2^16; P = 2^(s - m) as bfp16 hi + lo panels, l += P
+void {{ p }}_soft(float *__restrict ws, float *__restrict wo)
+{
+{% if "soft" in ablate %}
+    return;
+{% endif %}
+    const int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    if (st[1])
+        return;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::mask<64> tri = aie::mask<64>::from_uint64(0x{{ tri }}ull);  // lane 8 q + j: j > q
+    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-1e30f);
+    AIE_LOOP_NO_UNROLL
+    for (int bq = 0; bq < {{ QB }}; bq++) {
+        float *__restrict s = AW(float, {{ w.sc }}) + {{ 64 * RG }} * bq;
+        const int rho0 = st[0] - bq;
+        for (int k = 0; k < {{ RG }}; k++) {
+            const int rho = rho0 + k;
+            if (rho > 0{{ " || rho < -64" if SWA }})
+                aie::store_v(s + 64 * k, ninf);
+            else if (rho == 0)
+                aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
+{% if SWA %}
+            else if (rho == -64)
+                aie::store_v(s + 64 * k, aie::select(ninf, aie::load_v<64>(s + 64 * k), tri));
+{% endif %}
+        }
+{% if RG == 4 %}
+        const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
+                                                  aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+{% else %}
+        const aie::vector<float, 64> v = aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64));
+{% endif %}
+        float *__restrict pm = AW(float, {{ w.m }}) + 64 * bq;
+        float *__restrict pl = AW(float, {{ w.l }}) + 64 * bq;
+        // (each lane against its row's maximum: the rows' group maxima only when one is raised, rarely)
+        if (!aie::lt(aie::sub(v, aie::load_v<64>(pm)), aie::broadcast<float, 64>(16.0f)).full()) {
+            float *__restrict prm = AW(float, {{ w.rm }});
+            aie::store_v(prm, al::bcast8(al::group8<true>(v)));
+            {{ p }}_rescale(wo + {{ 64 * ND }} * bq, pl, pm, prm);
+        }
+        {{ p }}_pexp(s, s, pm, pl);
+        const al::BV nI = al::neg_eye();
+        al::BOut<> po((bfp16ebs8 *)(AW(uint8_t, {{ w.pp }}) + {{ 144 * RG }} * bq));
+        for (int k = 0; k < {{ RG }}; k++) {
+            al::BV h, l;
+            al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(s)), nI, h, l);
+            po.push(h);
+            po.push(l);
+            s += 64;
+        }
+    }
+}
+
+// o += P V of the group's V unit u (records 2 u, 2 u + 1: a panel per d-block of blocks over the positions{{ "; v1: the second record" if not SWA }})
+void {{ p }}_pv(const bfloat16 *__restrict v, {{ "const bfloat16 *__restrict v1, " if not SWA }}float *__restrict ws, float *__restrict wo, int32_t u)
+{
+{% if "pv" in ablate %}
+    return;
+{% endif %}
+    if (AW(int32_t, {{ w.st }})[1])
+        return;
+    al::BIn<> ps((const bfp16ebs8 *)(AW(uint8_t, {{ w.pp }}) + 288 * u));
+    const al::BV P0 = ps.pop(), L0 = ps.pop(), P1 = ps.pop(), L1 = ps.pop();
+{% if QB == 2 %}
+    al::BIn<> ps1((const bfp16ebs8 *)(AW(uint8_t, {{ w.pp }}) + {{ 144 * RG }} + 288 * u));
+    const al::BV Q0 = ps1.pop(), M0 = ps1.pop(), Q1 = ps1.pop(), M1 = ps1.pop();
+    {{ p }}_pvh(P0, L0, P1, L1, Q0, M0, Q1, M1, (const uint8_t *)v, wo, wo, wo + {{ 64 * ND }}, wo + {{ 64 * ND }});
+{% else %}
+    {{ p }}_pvh(P0, L0, P1, L1, (const uint8_t *)v, {{ "(const uint8_t *)v1, " if not SWA }}wo, wo);
+{% endif %}
+}
+
+// The pass's output: o / l of each query block as the O GEMM's ND A panels (8 queries x 8 dims)
+void {{ p }}_fin(float *__restrict ws, float *__restrict wo, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BOut<> po((bfp16ebs8 *)out);
+    for (int bq = 0; bq < {{ QB }}; bq++) {
+        const aie::vector<float, 8> ls = al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * bq));
+        const aie::vector<float, 16> inv = aie::inv(aie::concat(ls, aie::broadcast<float, 8>(1.0f)));
+        const aie::vector<float, 64> iv = al::bcast8(inv.template extract<8>(0));
+        const float *__restrict o = wo + {{ 64 * ND }} * bq;
+        for (int db = 0; db < {{ ND }}; db++) {
+            po.push(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(o), iv)).template to_vector<bfp16ebs8>());
+            o += 64;
+        }
+    }
+}
+
+}  // extern "C"

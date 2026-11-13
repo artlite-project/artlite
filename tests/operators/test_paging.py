@@ -20,8 +20,9 @@ from aie.iron.device import NPU2, Tile
 
 from artlite import txn
 from artlite.operators import paging
-from artlite.operators.base import JINJA_ENV, ArgDirection, ArgSpec, ArtcOperator
+from artlite.operators.base import ArgDirection, ArgSpec, ArtcOperator
 from artlite.operators.kernel_source import kernel_prefix
+from artlite.operators.templating import JINJA_ENV
 from artlite.overlay import OverlayDevice, Transaction
 
 ROWS = 4

@@ -40,7 +40,7 @@ The main core's program, per X object (``_begin``):
   bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
   after the tiles the residual goes out (bf16).
 
-Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``kernels.py`` (and ``gemv.py``).
+Metadata words from ``M_MODEL`` on are the model cores'. The cores' kernel source: ``design.cc.jinja`` (and ``gemv.py``).
 
 MoE (``moe``: an MoE model's FFN; its transaction: ``qwen35.overlay``): the X stream is packet-switched (``XID``),
 its shim channel also carrying control packets into the shim's own TileControl (``moe.route``); the decode's K groups
@@ -125,14 +125,15 @@ from ml_dtypes import bfloat16
 from .. import txn
 from ..formats import FORMATS, TAB, TAB_BYTES, slot
 from ..moe import route as moe_k
-from ..operators import kmath, paging
+from ..operators import kmath, paging, templating
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, linear_tap
 from ..operators.kernel_source import kernel_prefix
 from ..operators.l1_layout import packet_flow, pin_l1_buffers
 from ..operators.util import Attr, regions
 from . import gemv
-from .kernels import SRC as _SRC
+
+_SRC = templating.load("artlite/decode/design.cc.jinja")  # (the main and helper cores' kernels)
 
 SLOTS = gemv.SLOTS  # token slots of a design (4; ``DecodeOverlayOperator(slots=8)``: 8)
 META = 64  # int32 metadata words at the start of an X object

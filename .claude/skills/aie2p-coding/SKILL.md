@@ -322,7 +322,7 @@ Silent wrong results:
 - **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B
   aligned** is accessed 32 B lower (the low address bits dropped): its stores overwrite the 32 B before the buffer
   (sd15's d-80 attention scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B
-  boundaries, or access a 32-B-aligned window as two 32-B halves (`decode/kernels.py`'s MoE accumulator).
+  boundaries, or access a 32-B-aligned window as two 32-B halves (`decode/design.cc.jinja`'s MoE accumulator).
 - **A bfp16 block-vector stream (`al::BIn`) constructed at an address not 64-B aligned** (a 72-B panel of a packed
   array) reads garbage (NaN state, or wrong values: the qwen35 decode's second pair of P panels at 3 x 288 B), and so
   does a `seek` to such a position (a rewind by a panel count not a multiple of 8: 5 panels, 360 B). Open one stream at

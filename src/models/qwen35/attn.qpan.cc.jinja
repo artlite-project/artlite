@@ -1,0 +1,17 @@
+// The rows q (fp32, [row][256]) of NO octets -> their Q panels at out ([d-block][octet NO])
+template <int NO>
+__attribute__((noinline, minsize)) void {{ p }}_qpan(const float *__restrict q, uint8_t *__restrict out)
+{
+    al::BOut<> po((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            aie::vector<float, 64> v;
+{% for r in range(8) %}
+            v.insert({{ r }}, aie::load_v<8>(q + {{ HD }} * (8 * o + {{ r }}) + 8 * db));
+{% endfor %}
+            po.push(aie::accum<accfloat, 64>(v).template to_vector<bfp16ebs8>());
+        }
+    }
+}
+

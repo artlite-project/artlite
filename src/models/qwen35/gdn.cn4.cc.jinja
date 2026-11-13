@@ -1,0 +1,15 @@
+// The lanes' 1 / rms of o ([panel 16][t 8][j 8] fp32: a lane's values in a row) at sq + 64; sq: 64 + 8 floats of scratch
+__attribute__(({{ cold }})) void {{ p }}_gnorm(const float *__restrict o, float *__restrict sq)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    const float *__restrict po = o;
+    for (int kb = 0; kb < 16; kb++) {
+        aie::vector<bfloat16, 64> a, b;
+        al::split2<64>(aie::load_v<64>(po), a, b);
+        po += 64;
+        ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
+    }
+    aie::store_v(sq + 64, {{ p }}_irms(al::group8<false>(ss.template to_vector<float>()).template grow<16>(), {{ D }}).template extract<8>(0));
+}
+

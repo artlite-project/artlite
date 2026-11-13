@@ -24,7 +24,7 @@ docstrings give each format's bytes per row and super-block).
 import math
 
 import numpy as np
-from jinja2 import FunctionLoader, Template
+from jinja2 import ChoiceLoader, FunctionLoader, Template
 
 from . import bf16, common, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6k, q8
 from .common import KC, KT, SB, TAB, TAB_BYTES, DqKernels, Slot, TileFormat
@@ -77,17 +77,19 @@ def pack_tile(fmt: str, f: dict[str, np.ndarray], tile_bytes: int) -> np.ndarray
     return out
 
 
-def _load(name: str) -> str:
-    # (one newline more: Jinja drops a template's last one, an included fragment keeps its lines whole)
-    return SOURCES[name] + "\n"
+def _load(name: str) -> str | None:
+    # (one newline more: Jinja drops a template's last one, an included fragment keeps its lines whole; None: not a
+    # fragment, a template file of the packages)
+    text = SOURCES.get(name)
+    return None if text is None else text + "\n"
 
 
 def kernel_template(source: str, **globals: object) -> Template:
-    """A kernel template (``base.JINJA_ENV``) that includes the slots' fragments (``{% include "gemm/" ~ fmt %}``)
-    with the including template's variables."""
-    from ..operators.base import JINJA_ENV
+    """A kernel template (``templating.JINJA_ENV``) that includes the slots' fragments (``{% include "gemm/" ~ fmt %}``)
+    with the including template's variables, and the packages' template files."""
+    from ..operators.templating import JINJA_ENV
 
-    env = JINJA_ENV.overlay(loader=FunctionLoader(_load))
+    env = JINJA_ENV.overlay(loader=ChoiceLoader([FunctionLoader(_load), JINJA_ENV.loader]))
     return env.from_string(source, globals=globals)
 
 

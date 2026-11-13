@@ -1,0 +1,89 @@
+
+// The prep cores' workspace (bytes): k_norm fp32, row (HD fp32), stage [db][row 8][8] fp32, kf: the first record's panels
+#define PW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+// x (HD bf16) -> row = x / rms(x) w (fp32), rotated by cs [cos HD / 2 | sin HD / 2] (NeoX pairs i, i + HD / 2)
+__attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
+                                          const float *__restrict cs, float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
+    ss = aie::mac_square(ss, aie::load_v<64>(x + 64));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    const aie::vector<float, 64> iv = aie::broadcast<float, 64>(inv);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<float, 64> xf = aie::accum<accfloat, 64>(aie::load_v<64>(x + i)).template to_vector<float>();
+        aie::store_v(row + i, al::mulff<64>(al::mulff<64>(xf, iv), aie::load_v<64>(w + i)));
+    }
+    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
+        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ HD // 2 }} + i);
+        aie::store_v(row + i, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
+        aie::store_v(row + {{ HD // 2 }} + i, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+// The first object: k_norm
+void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
+{
+    al::copy<{{ HD }}, 16>(PW(float, {{ w.nrm }}), (const float *)n);
+}
+
+// 8 tokens of a KV head's K (bf16), cs -> record ``half`` of a pair of records ([d-block][record 2], out): the first's panels into the
+// workspace, then per d-block the first's and the second's
+void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out, int32_t half)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr(k + {{ HD }} * r, PW(float, {{ w.nrm }}), cs + {{ HD }} * r, row);
+        for (int db = 0; db < {{ ND }}; db++)
+            aie::store_v(st + 64 * db + 8 * r, aie::load_v<8>(row + 8 * db));
+    }
+    if (!half) {
+        al::BOut<> o((bfp16ebs8 *)PW(uint8_t, {{ w.kf }}));
+        for (int db = 0; db < {{ ND }}; db++)
+            o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st + 64 * db)).template to_vector<bfp16ebs8>());
+        return;
+    }
+    al::BIn<> a((const bfp16ebs8 *)PW(uint8_t, {{ w.kf }}));
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(a.pop());
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st + 64 * db)).template to_vector<bfp16ebs8>());
+    }
+}
+
+// The V panel of d-block db of 8 tokens' rows: per dim of the 8 a block over the positions
+[[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
+{
+    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
+    return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
+}
+
+// 8 tokens of a KV head's V -> record ``half`` of a pair of records
+void {{ p }}_v(const bfloat16 *__restrict v, float *__restrict ws, bfloat16 *__restrict out, int32_t half)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    if (!half) {
+        al::BOut<> o((bfp16ebs8 *)ws);
+        for (int db = 0; db < {{ ND }}; db++)
+            o.push({{ p }}_vpan(v, db));
+        return;
+    }
+    al::BIn<> a((const bfp16ebs8 *)ws);
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(a.pop());
+        o.push({{ p }}_vpan(v, db));
+    }
+}
+
+}  // extern "C"

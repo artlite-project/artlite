@@ -1,0 +1,255 @@
+{% if not planar and nsb == 8 %}
+// k-tile slot kt (0..3) of a scale-header plane (one {{ tq // 2 }} KB L1 object):
+// [tile {{ tq }}][il 2][s 4][row 16] words of two bf16 (group pair h = 0, 1) ->
+// ws [kt][il][s][tile][h][row] (de-interleaved; groups 16 s + 4 kt + 2 il + h
+// of the tile row's 64 scales).
+void {{ p }}_hdr(const bfloat16 *__restrict b, bfloat16 *__restrict ws, int32_t plane, int32_t kt)
+{
+    ws += {{ 1024 * tq }} * plane + {{ 256 * tq }} * kt;
+    for (int tl = 0; tl < {{ tq }}; tl++) {
+        bfloat16 *__restrict w = ws + tl * 32;
+        const bfloat16 *__restrict src = b + tl * 8 * 32;
+        AIE_LOOP_NO_UNROLL
+        for (int is = 0; is < 8; is++) {  // (walked pointers: indexed src + 32 is, w + 128 is ran at II 7)
+            aie::vector<bfloat16, 32> v = aie::load_v<32>(src);
+            auto [e, o] = aie::interleave_unzip(v, v, 1);
+            aie::store_v(w, aie::concat(e.template extract<16>(0), o.template extract<16>(0)));
+            src += 32;
+            w += {{ 32 * tq }};
+        }
+    }
+}
+
+{% include "gemm/dq_tile_major" %}
+{% elif not planar %}
+{% set parts = 2 if fmt == "Q4_1" else 1 %}
+// k-tile slot kt of the header unit of 1024-column tiles (a {{ tq // 2 }} KB L1 object; {{ "d | m: the whole slice-sized unit" if parts == 2 else "d: the upper half of a slice-sized unit read from 1 KB before the tile" }}). The memtile's permutation
+// puts row r of header word w (the bf16 pair of groups 2 w, 2 w + 1 of the row's 32) at permutation row {{ "8 P + r / 2 (part P)" if parts == 2 else "8 + r / 2" }},
+// step 2 (r % 2) + w / 8 of k-tile slot (w % 8) / 2: slot kt holds the words 8 hw + 2 kt + j (hw, j = 0, 1), tile t's
+// 8 even / odd rows of a word as 8 consecutive words -> ws [part][w][tile][h][row 16] (the dequant's layout: group 2 w + h
+// = 8 sb + 2 kt' + h of super-block sb and k-tile kt')
+void {{ p }}_hdr(const bfloat16 *__restrict b, bfloat16 *__restrict ws, int32_t plane, int32_t kt)
+{
+    const uint32_t *__restrict src = (const uint32_t *)b;
+    bfloat16 *__restrict dst = ws + {{ 64 * tq }} * kt;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tq }}; t++) {
+{% for part in range(parts) %}
+{% for hw in range(2) %}
+{% for j in range(2) %}
+        {
+            const uint32_t *__restrict w = src + {{ 64 * j + 16 * hw + (8 * part if parts == 2 else 8) }};
+            auto [r0, r1] = aie::interleave_zip(aie::load_v<8>(w), aie::load_v<8>(w + 32), 1);
+            const aie::vector<bfloat16, 32> d = aie::concat(r0, r1).template cast_to<bfloat16>();  // [row 16][h 2]
+            aie::store_v(dst + {{ 512 * tq * part + (8 * hw + j) * 32 * tq }}, aie::filter_even(d, 1));
+            aie::store_v(dst + {{ 512 * tq * part + (8 * hw + j) * 32 * tq + 16 }}, aie::filter_odd(d, 1));
+        }
+{% endfor %}
+{% endfor %}
+{% endfor %}
+        src += 128;
+        dst += 32;
+    }
+}
+
+{% include "gemm/dq_tile_major" %}
+{% else %}
+{% set parts = 2 if fmt == "Q4_1" else 1 %}
+// {{ fmt }} (GemmQd, planar: {{ R }}-row tiles of {{ 256 * nsb }} columns): weight objects [step s 4][word ii 2][g {{ n }}]
+// words (the nibbles of step s of groups 2 kt + ii), rows g of the pass's tiles zero-padded to {{ n }}. The header
+// ({{ hu }} unit{{ "s" if hu > 1 else "" }}: d{{ " | m" if parts == 2 else "" }} [row][sb][group] bf16, gathered like the codes, so a word holds the
+// bf16 pair of groups 2 j, 2 j + 1 of one row) spans the four k-tile slots of each unit: _hcp collects them in hb
+// ([unit][kt][s][ii][g] words), _hdr_sb expands a super-block's scales before its k-tiles into ws [group 8][d | m][g].
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t unit, int32_t kt)
+{
+    al::copy<{{ 16 * n }}, 32>(hb + {{ 16 * n }} * (4 * unit + kt), b);
+}
+
+{% if nsb == 8 %}
+// the header of 2048 columns: tile row r's 128 B per part are gathered row r: group pair j of super-block sb is
+// word (sb % 2) 4 + j of step sb / 2, i.e. slot 4 part + 2 (sb % 2) + j / 2, word ii j % 2
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb)
+{
+    const uint32_t *__restrict src = hb + (sb & 1) * {{ 16 * n }} + (sb >> 1) * {{ 2 * n }};
+    bfloat16 *__restrict dst = ws;
+    AIE_LOOP_NO_UNROLL
+    for (int g = 0; g < {{ n }}; g += 16) {
+{% for part in range(parts) %}
+{% for j in range(4) %}
+        {
+            const aie::vector<bfloat16, 32> v = aie::load_v<16>(src + {{ (4 * part + j // 2) * 8 * n + (j % 2) * n }}).template cast_to<bfloat16>();
+            aie::store_v(dst + {{ 2 * j * 2 * n + part * n }}, aie::filter_even(v, 1));
+            aie::store_v(dst + {{ (2 * j + 1) * 2 * n + part * n }}, aie::filter_odd(v, 1));
+        }
+{% endfor %}
+{% endfor %}
+        src += 16;
+        dst += 16;
+    }
+}
+{% elif nsb == 2 %}
+{% set Rs = R // us %}
+{% if hg > 1 %}
+// the header of 512 columns: the unit holds the headers of up to {{ hg }} K chunks ([chunk q][tile row r][32 B]): tile row
+// r's 32 B of chunk q are step s = r % 4 of unit row u = 8 q + r / 4, gathered at row (u / {{ Rs }}) {{ tiles * Rs }} + {{ Rs }} t + u % {{ Rs }}
+// (sub-units); group pair j of super-block sb is word 4 sb + j (slot 2 sb + j / 2, word ii j % 2): per 8 unit rows the
+// 4 steps' words, transposed [s][u] -> [u][s] = rows 4 u + s
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb, int32_t q)
+{
+    const uint32_t *__restrict src = hb + sb * {{ 16 * n }} + (q >> 1) * {{ tiles * Rs }} + (q & 1) * 8;
+{% else %}
+// the header of 512 columns: part P's 32 B of tile row r are step s = r % 4 of unit row u = {{ hrow0 }} + P R / 4 + r / 4
+// (the unit starts {{ 128 * hrow0 }} B before the tile){{ ", gathered at row (u / %d) %d + %d t + u %% %d (sub-units)" % (Rs, tiles * Rs, Rs, Rs) if us > 1 else "" }}; group pair j of
+// super-block sb is word 4 sb + j (slot 2 sb + j / 2, word ii j % 2): per 8 unit rows the 4 steps' words, transposed
+// [s][u] -> [u][s] = rows 4 u + s
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb)
+{
+    const uint32_t *__restrict src = hb + sb * {{ 16 * n }};
+{% endif %}
+    bfloat16 *__restrict dst = ws;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tiles }}; t++) {
+{% for uu in range(R // 32) %}
+{% for part in range(parts) %}
+{% set u0 = (0 if hg > 1 else hrow0) + part * R // 4 + 8 * uu %}
+{% set g0 = (u0 // Rs) * tiles * Rs + u0 % Rs if us > 1 else u0 %}
+{% for j in range(4) %}
+        {
+            const uint32_t *__restrict w = src + {{ (j // 2) * 8 * n + (j % 2) * n + g0 }};
+            const aie::vector<uint32, 32> v = aie::concat(aie::load_v<8>(w), aie::load_v<8>(w + {{ 2 * n }}),
+                                                          aie::load_v<8>(w + {{ 4 * n }}), aie::load_v<8>(w + {{ 6 * n }}));
+            const aie::vector<bfloat16, 64> r = aie::transpose(v, 4, 8).template cast_to<bfloat16>();  // rows 32 uu ..
+            aie::store_v(dst + {{ 2 * j * 2 * n + part * n + 32 * uu }}, aie::filter_even(r, 1));
+            aie::store_v(dst + {{ (2 * j + 1) * 2 * n + part * n + 32 * uu }}, aie::filter_odd(r, 1));
+        }
+{% endfor %}
+{% endfor %}
+{% endfor %}
+        src += {{ Rs if us > 1 else R }};
+        dst += {{ R }};
+    }
+}
+{% else %}
+// the header of 1024 columns: part P's 64 B of tile row r start at byte {{ 64 * R }} P' + 64 r of the unit
+// ({{ "the unit starts " ~ (64 * R) ~ " B before the tile, P' = 1" if fmt == "Q4_0" else "P' = P" }}): gathered row u = {{ R // 2 }} P' + r / 2, rows r = 2 v, 2 v + 1 in steps
+// sb / 2 and 2 + sb / 2; group pair j is word (sb % 2) 4 + j (slot 2 (sb % 2) + j / 2, word ii j % 2)
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb)
+{
+    const uint32_t *__restrict src = hb + (sb & 1) * {{ 16 * n }} + (sb >> 1) * {{ 2 * n }};
+{% if R == 16 %}
+    bfloat16 *__restrict dst = ws;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tiles }}; t++) {
+{% for part in range(parts) %}
+{% set u0 = 8 * (1 if fmt == "Q4_0" else part) %}
+{% for j in range(4) %}
+        {
+            const uint32_t *__restrict w = src + {{ (j // 2) * 8 * n + (j % 2) * n + u0 }};
+            auto [z0, z1] = aie::interleave_zip(aie::load_v<8>(w), aie::load_v<8>(w + {{ 4 * n }}), 1);
+            const aie::vector<bfloat16, 32> v = aie::concat(z0, z1).template cast_to<bfloat16>();  // rows 0 .. 15
+            aie::store_v(dst + {{ 2 * j * 2 * n + part * n }}, aie::filter_even(v, 1));
+            aie::store_v(dst + {{ (2 * j + 1) * 2 * n + part * n }}, aie::filter_odd(v, 1));
+        }
+{% endfor %}
+{% endfor %}
+        src += 16;
+        dst += 16;
+    }
+{% else %}
+    // (rows of a 16-row block span tiles: 32-bit stores of row pairs)
+    uint32_t *__restrict dst = (uint32_t *)ws;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tiles }}; t++) {
+        AIE_LOOP_NO_UNROLL
+        for (int v = 0; v < {{ R // 2 }}; v++) {
+{% for part in range(parts) %}
+{% set u0 = (R // 2) * (1 if fmt == "Q4_0" else part) %}
+{% for j in range(4) %}
+            {
+                const uint32_t we = src[{{ (j // 2) * 8 * n + (j % 2) * n + u0 }} + v], wo = src[{{ (j // 2) * 8 * n + (j % 2) * n + u0 + 4 * n }} + v];
+                dst[{{ (2 * j * 2 * n + part * n) // 2 }} + v] = (we & 0xFFFFu) | (wo << 16);
+                dst[{{ ((2 * j + 1) * 2 * n + part * n) // 2 }} + v] = (we >> 16) | (wo & 0xFFFF0000u);
+            }
+{% endfor %}
+{% endfor %}
+        }
+        src += {{ R }};
+        dst += {{ R // 2 }};
+    }
+{% if n > TR %}
+    // (the padding rows' scales: zero, so their MMUL columns are 0)
+    uint32_t *__restrict wz = (uint32_t *)ws;
+    AIE_LOOP_NO_UNROLL
+    for (int g = {{ TR // 2 }}; g < {{ n // 2 }}; g++) {
+{% for part in range(parts) %}
+{% for i in range(8) %}
+        wz[{{ (i * 2 * n + part * n) // 2 }} + g] = 0;
+{% endfor %}
+{% endfor %}
+    }
+{% endif %}
+{% endif %}
+}
+{% endif %}
+
+// k-tile kt of super-block sb -> {{ n }} x 64 bfp16 panels in the MAC pop order [16-row block][k-step 4 ii + s]
+// [8-row half]: {{ "w = d q + m = (128 + q) d + (m - 128 d)" if parts == 2 else "w = d (q - 8) = (128 + q) d - 136 d" }}, exact in fp32, rounded once
+void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt{{ half_arg }})
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if halves > 1 %}
+{% if us == 1 %}
+    b += half * {{ 4 * n_mac }};  // (the half's 16-row blocks)
+{% endif %}
+    ws += half * {{ n_mac }};
+{% endif %}
+    const bfloat16 __aie_dm_resource_c *__restrict pa = (const bfloat16 __aie_dm_resource_c *)(ws + 4 * kt * {{ n }});
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
+    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
+{% if parts == 2 %}
+    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
+{% else %}
+    const aie::vector<bfloat16, 64> k136 = aie::broadcast<bfloat16, 64>(-136.0f);
+{% endif %}
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n_mac // 8 }}; it++) {  // (16-row block, word ii) = (it / 2, it % 2)
+        const int nb = it >> 1, ii = it & 1;
+        aie::vector<bfloat16, 64> D0, D1;
+        al::expand16_bc(aie::load_v<16>(pa + 2 * ii * {{ n }} + 16 * nb), D0, D1);
+{% if parts == 2 %}
+        aie::vector<bfloat16, 64> M0, M1;
+        al::expand16_bc(aie::load_v<16>(pa + (2 * ii + 1) * {{ n }} + 16 * nb), M0, M1);
+        const aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
+        const aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
+{% else %}
+        const aie::accum<accfloat, 64> C0 = aie::mul(D0, k136);
+        const aie::accum<accfloat, 64> C1 = aie::mul(D1, k136);
+{% endif %}
+{% if us > 1 %}
+        // (the gathered rows [sub-unit {{ us }}][tile {{ tiles }}][16 rows]: 16-row block nbn of the tiles' order is gb)
+        const int nbn = {{ "half * %d + " % (n_mac // 16) if halves > 1 else "" }}nb;
+        const int gb = (nbn & {{ us - 1 }}) * {{ tiles }} + (nbn >> {{ (us - 1).bit_length() }});
+        const uint8_t *__restrict row = b + 4 * (ii * {{ n }} + 16 * gb);
+{% else %}
+        const uint8_t *__restrict row = b + 4 * (ii * {{ n }} + 16 * nb);
+{% endif %}
+        AIE_LOOP_UNROLL_FULL
+        for (int s = 0; s < 4; s++) {
+            const aie::vector<uint8, 128> q = aie::unpack(aie::load_v<128>((const uint4 __aie_dm_resource_a *)(row + {{ 4 * 2 * n }} * s)));
+            out.push(aie::mac(C0, al::zipw(q.template extract<64>(0), c43), D0).template to_vector<bfp16ebs8>());
+            out.push(aie::mac(C1, al::zipw(q.template extract<64>(1), c43), D1).template to_vector<bfp16ebs8>());
+        }
+    }
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}
+
+{% endif %}

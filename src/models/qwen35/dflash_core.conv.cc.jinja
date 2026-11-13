@@ -1,0 +1,125 @@
+
+// The conv core (``dflash_core``'s docstring). Offsets in bytes: DFlashShape.conv_workspace()
+#define VW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+// The 8 slots' coefficients of group g of a tap (dyn [slot 8][192]: row r) -> 64 lanes, [slot][8]
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_slots(const bfloat16 *__restrict dyn, int r)
+{
+    return al::concat({% for s in range(8) %}aie::broadcast<bfloat16, 8>(dyn[{{ DYN_ROWS * s }} + r]){{ ", " if not loop.last }}{% endfor %});
+}
+
+// 8 values -> 64 lanes, [slot][8]
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_rep(aie::vector<bfloat16, 8> b)
+{
+    return b.grow_replicate<64>();
+}
+
+// [slot][8] -> each slot's row its predecessor's, slot 0 zeros
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_prev(aie::vector<bfloat16, 64> v)
+{
+    return aie::shuffle_up_fill(v, aie::zeros<bfloat16, 64>(), 8);
+}
+
+}  // namespace
+
+extern "C" {
+
+// A new X object: the core's (``CV_*``: its payload's constants, ``M_SKIP`` objects after it), or another's to skip
+__attribute__((minsize)) void {{ p }}_vbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict m = (const int32_t *)x;
+    int32_t *__restrict st = VW(int32_t, {{ v.st }});
+    const int flags = m[{{ M_FLAGS }}];
+    st[{{ V_NSKIP }}] = 0;
+    st[{{ V_NOBJ }}] = 0;
+    st[{{ V_NE }}] = 0;
+    if (flags & {{ F_CV }}) {
+        st[{{ V_NOBJ }}] = m[{{ M_SKIP }}];
+        st[{{ V_NE }}] = m[{{ M_CVNE }}];
+        st[{{ V_OP }}] = m[{{ M_CVOP }}];
+        st[{{ V_I }}] = 0;
+        st[{{ V_IE }}] = 0;
+        al::copy<{{ 3 * H8 }}, 32>(VW(bfloat16, {{ v.cs }}), x + {{ 2 * META }});
+    } else if (!(flags & {{ F_MAIN }})) {
+        st[{{ V_NSKIP }}] = m[{{ M_SKIP }}];
+    } else if (!(flags & {{ F_LOADR }})) {  // (its input objects: of 8 / M_SP strips)
+        const int sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));
+        st[{{ V_NSKIP }}] = (m[{{ M_NX }}] + (1 << lper) - 1) >> lper;
+    }
+}
+
+// The next object after a ``CV_*`` object
+__attribute__((minsize)) void {{ p }}_vobj(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = VW(int32_t, {{ v.st }});
+    const int op = st[{{ V_OP }}], i = st[{{ V_I }}];
+    st[{{ V_I }}] = i + 1;
+    const bfloat16 *__restrict pay = x + {{ 2 * META }};
+    if (op == {{ CV_IN }}) {
+        al::copy<{{ 8 * DYN_ROWS }}, 32>(VW(bfloat16, {{ v.dyn }}), pay);
+        return;
+    }
+    float *__restrict r = VW(float, {{ v.res }});
+    if (op == {{ CV_LOAD }}) {
+        al::copy<{{ XPAY // 4 }}, 16>(r + 1024 * i, (const float *)pay);
+        return;
+    }
+    r += 2048 * i;
+    // (y's next 32 k blocks, 16 in the last object: conv-out into res)
+    const bfloat16 *__restrict b = VW(bfloat16, {{ v.cs }}) + 32 * 8 * i;
+    const bfloat16 *__restrict dyn = VW(bfloat16, {{ v.dyn }});
+    const int k0 = 32 * i, n = i == {{ XK // 32 }} ? {{ XK % 32 }} : 32;
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < n; k++) {
+        const int g = (k0 + k) >> 1;
+        const aie::vector<bfloat16, 64> d0 = {{ p }}_slots(dyn, {{ 2 * GROUPS }} + g), d1 = {{ p }}_slots(dyn, {{ 3 * GROUPS }} + g);
+        const aie::vector<bfloat16, 64> b0 = {{ p }}_rep(aie::load_v<8>(b + 8 * k)), b1 = {{ p }}_rep(aie::load_v<8>(b + {{ H8 }} + 8 * k));
+        const aie::vector<bfloat16, 64> y = aie::load_v<64>(pay + 64 * k), yp = {{ p }}_prev(y);
+        aie::accum<accfloat, 64> a(aie::load_v<64>(r + 64 * k));
+        a = aie::mac(aie::mac(aie::mac(aie::mac(a, b0, y), d0, y), b1, yp), d1, yp);
+        aie::store_v(r + 64 * k, a.template to_vector<float>());
+    }
+}
+
+// The next D object (16 k blocks of x): conv-in of the phase, or res
+void {{ p }}_vout(int32_t *__restrict ws, bfloat16 *__restrict d, const float *__restrict sq)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = VW(int32_t, {{ v.st }});
+    const int e = st[{{ V_IE }}];
+    st[{{ V_IE }}] = e + 1;
+    const float *__restrict r = VW(float, {{ v.res }}) + 64 * 16 * e;
+    if (st[{{ V_OP }}] != {{ CV_IN }}) {
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 16; k++)
+            aie::store_v(d + 64 * k, aie::accum<accfloat, 64>(aie::load_v<64>(r + 64 * k)).template to_vector<bfloat16>());
+        return;
+    }
+    const bfloat16 *__restrict cs = VW(bfloat16, {{ v.cs }}) + 8 * 16 * e;
+    const bfloat16 *__restrict dyn = VW(bfloat16, {{ v.dyn }});
+    float *__restrict ir = VW(float, {{ v.ir }});
+    if (!e) {  // (the slots' 1 / rms, from the helper's sums of squares, as bf16 hi | lo per lane)
+        const aie::vector<float, 8> ss = al::group8<false>(aie::load_v<64>(sq));
+        aie::store_v(ir, al::bcast8(al::inv_rms<{{ H }}, 8>(ss.template grow<16>(), {{ eps }}f).template extract<8>(0)));
+    }
+    aie::vector<bfloat16, 64> ih, il;
+    al::split2<64>(aie::load_v<64>(ir), ih, il);
+    const int k0 = 16 * e;
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < 16; k++) {
+        const int g = (k0 + k) >> 1;
+        const aie::vector<bfloat16, 64> xb = aie::accum<accfloat, 64>(aie::load_v<64>(r + 64 * k)).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> w = {{ p }}_rep(aie::load_v<8>(cs + 8 * k));
+        const aie::vector<float, 64> xr = aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>();
+        const aie::vector<bfloat16, 64> xn = al::mulc<64>(xr, w).template to_vector<bfloat16>(), xp = {{ p }}_prev(xn);
+        const aie::vector<bfloat16, 64> b0 = {{ p }}_rep(aie::load_v<8>(cs + {{ H8 }} + 8 * k)), b1 = {{ p }}_rep(aie::load_v<8>(cs + {{ 2 * H8 }} + 8 * k));
+        const aie::vector<bfloat16, 64> d0 = {{ p }}_slots(dyn, g), d1 = {{ p }}_slots(dyn, {{ GROUPS }} + g);
+        const aie::accum<accfloat, 64> a = aie::mac(aie::mac(aie::mac(aie::mul(b0, xn), d0, xn), b1, xp), d1, xp);
+        aie::store_v(d + 64 * k, a.template to_vector<bfloat16>());
+    }
+}
+
+}  // extern "C"

@@ -16,10 +16,8 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, NamedTuple, Self
 
 import numpy as np
-from jinja2 import Environment, StrictUndefined
 
 from .. import backend, portable, profiling
-from . import kmath
 from .kernel_source import KernelSource, translation_unit
 
 if TYPE_CHECKING:
@@ -91,13 +89,6 @@ def _tool_env() -> dict[str, str] | None:
     return {**os.environ, "PATH": os.path.dirname(tool) + os.pathsep + os.environ.get("PATH", "")}
 
 
-# Shared Jinja environment for all kernel template strings.
-# trim_blocks removes the newline after a block tag; lstrip_blocks strips
-# leading whitespace before a block tag. Both keep the generated C++ clean.
-# StrictUndefined: a variable the render call does not pass is an error, not an empty string.
-# km: the math functions generated per contract (kmath.py), in every template.
-JINJA_ENV = Environment(trim_blocks=True, lstrip_blocks=True, undefined=StrictUndefined)
-JINJA_ENV.globals["km"] = kmath
 
 
 # Internal helpers

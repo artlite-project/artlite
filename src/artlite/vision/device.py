@@ -225,13 +225,18 @@ class VisionDevice:
 
 def state_dir(kind: str, path: str, sources: tuple[str, ...], files: list[str]) -> str:
     """The cache directory of a model's built state: ``CACHE_DIR/kind/<path's digest>/<key>``, the key covering the
-    toolchain, the code that builds the images and transactions (``sources``: files or directories of the src tree)
-    and the model's ``files`` (size and mtime)."""
+    toolchain, the code that builds the images and transactions (``sources``: files or directories of the src tree; a
+    directory's modules and kernel templates, a module's own templates: ``x.py`` with ``x.*.jinja``) and the model's
+    ``files`` (size and mtime)."""
     src = os.path.dirname(PACKAGE_DIR)  # (the artlite and models packages' directory)
     h = hashlib.sha256(version("llvm-aie").encode())
     for s in sources:
         p = os.path.join(src, s)
-        for f in sorted(glob.glob(os.path.join(p, "*.py"))) if os.path.isdir(p) else [p]:
+        if os.path.isdir(p):
+            files = sorted(glob.glob(os.path.join(p, "*.py")) + glob.glob(os.path.join(p, "*.jinja")))
+        else:
+            files = [p, *sorted(glob.glob(os.path.splitext(glob.escape(p))[0] + ".*.jinja"))]
+        for f in files:
             with open(f, "rb") as fh:
                 h.update(fh.read())
     for f in files:

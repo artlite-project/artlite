@@ -1,0 +1,71 @@
+
+namespace {
+
+// An object of another core (the main core's begin): an F_ATT object of a column that emits o: its q objects' gates
+// and its o's R objects (main_gates' state words MG_*)
+[[clang::always_inline]] inline void {{ p }}_gbegin(const int32_t *__restrict m, int32_t *__restrict st, int32_t col)
+{
+    const int S = m[{{ M_NS }}], split = m[{{ M_SPLIT }}], k = col - {{ NPH }} * al::div_small<{{ NPH }}>(col);
+    const int emit = (m[{{ M_FLAGS }}] & {{ F_ATT }}) && (!split || k == {{ NPH - 1 }}), qr = split ? {{ NPH * QC }} : {{ QC }};
+    st[{{ MG_Q }}] = emit ? (split ? {{ NPH }} * S : S) : 0;
+    st[{{ MG_I }}] = 0;
+    st[{{ MG_S }}] = S;
+    st[{{ MG_QR }}] = qr;
+    st[{{ MG_NO }}] = emit ? 4 * S * qr : 0;
+    st[{{ MG_E }}] = 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+// A skipped X object: a q object of the column's o (aq's order): its heads' sigmoid(gate) into the gate table gt
+// ([row][256] bf16 in the helper's x panels, idle in the attention)
+__attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat16 *__restrict gt)
+{
+    int32_t *__restrict st = ws;
+    const int i = st[{{ MG_I }}];
+    if (i >= st[{{ MG_Q }}])
+        return;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    st[{{ MG_I }}] = i + 1;
+    const int S = st[{{ MG_S }}], QR = st[{{ MG_QR }}];
+    const int kc = QR == {{ QC }} ? 0 : {{ p }}_divs(i, S), s = i - S * kc, h0 = {{ QC }} * kc;
+    const bfloat16 *__restrict pay = x + {{ 2 * META }};
+    AIE_LOOP_NO_UNROLL
+    for (int h = 0; h < {{ QC }}; h++) {
+        bfloat16 *__restrict g = gt + {{ HD }} * (QR * s + h0 + h);
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ HD }}; i += 32)
+            {{ p }}_gate(pay + {{ 2 * HD }} * h + {{ HD }} + i, g + i);
+    }
+}
+
+// An R object -> a C object: of o (fp32 y / l: the gates' products, bf16; aemit's chunks), or a record's (bf16)
+__attribute__((minsize)) void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloat16 *__restrict o, int32_t *__restrict ws,
+                                            const bfloat16 *__restrict gt)
+{
+    int32_t *__restrict st = ws;
+    const int e = st[{{ MG_E }}];
+    st[{{ MG_E }}] = e + 1;
+    if (e >= st[{{ MG_NO }}]) {
+        aie::store_v(o, aie::load_v<{{ C_LEN }}>(r));
+        return;
+    }
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int S = st[{{ MG_S }}], QR = st[{{ MG_QR }}];
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 8; i += 2) {
+        aie::vector<bfloat16, 8> gk[2];
+        AIE_LOOP_UNROLL_FULL
+        for (int k = 0; k < 2; k++) {
+            const int c = 8 * e + i + k, hk = {{ p }}_divs(c, S), s = c - S * hk;
+            gk[k] = aie::load_v<8>(gt + {{ HD }} * (QR * s + (hk >> 5)) + 8 * (hk & 31));
+        }
+        const aie::vector<bfloat16, 16> g = al::concat(gk[0], gk[1]);
+        // (g bf16: mulff's products less g's lo part, 0)
+        aie::store_v(o + 8 * i, al::mulc<16>(aie::load_v<16>((const float *)r + 8 * i), g).template to_vector<bfloat16>());
+    }
+}
+
+}  // extern "C"

@@ -1,0 +1,21 @@
+// ---- Q4_0 / Q4_1 tiles of 1024 columns (R rows, row group 1 = rows 8 .. and junk): d [row][sb 4][i 8] bf16 (Q4_1: then
+// m [row][sb][i]) | codes [sb][row R][128 B]. Core H: super-blocks 2 H, 2 H + 1 of every row (the K-quants' split).
+// Scratch: the codes transposed [u 2][g 2][i 8][s 4][32 B] (4 KB) | tab [u][g][i][r] (512 B) | c [u][i][g][32] (2 KB; 8
+// slots: [64], 4 KB)
+
+// The codes of super-blocks 2 H, 2 H + 1 (src: the first's [row][128 B], the second rb B after it) -> dst
+// [u][g][i][s][32 B]: panel (s, i) of row group g = word i of chunk s of its rows
+__attribute__((noinline)) void {{ p }}_q4s_tr(const uint8_t *__restrict src, uint8_t *__restrict dst, int rb)
+{
+    const uint8_t *s = src;
+    uint8_t *d = dst;
+    const int sj = rb - 1024 - 96;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < 16; t++) {  // (u, g, s): [row 8][128 B] blocks, chunk s at 32 s
+        v16int32 o0, o1, o2, o3;
+        {{ p }}_tr8<128>(s, o0, o1, o2, o3);
+        {{ p }}_put8<128>(d, o0, o1, o2, o3);
+        s += (t & 3) != 3 ? 32 : ((t & 7) != 7 ? 1024 - 96 : sj);
+        d += (t & 3) != 3 ? 32 : 1024 - 96;
+    }
+}

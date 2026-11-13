@@ -1,0 +1,98 @@
+{% set cold = "noinline, minsize" %}
+
+// The GDN core's workspace (offsets in bytes: GdnShape.workspace())
+#define GW(T, off) ((T *)((uint8_t *)ws + (off)))
+#define TR(x) aie::op_transpose(x)
+
+namespace {
+
+{{ gm.expm1.src }}
+{{ gm.softplus.src }}
+{% set silu = km.act(km.SILU, f32=True, table_arg=True, small=True) %}
+{{ silu.src }}
+
+// 512 SiLUs: t scratch, y fp32 (the table's addresses run-time values: llvm-aie's gathers want pointers)
+[[clang::always_inline]] inline void {{ p }}_silu(const bfloat16 *__restrict x, bfloat16 *__restrict t, float *__restrict y,
+                                                 const int32_t *__restrict st)
+{
+    {{ silu }}<{{ 4 * D }}>(x, t, y, (const uint32_t *)(uintptr_t)st[{{ G_TA }}], (const uint32_t *)(uintptr_t)st[{{ G_TA + 1 }}]);
+}
+
+// 1 / rms of 8 rows' squares summed (16 lanes: the rows', 0) over n = 1 or D values (al::inv_rms<n, 8>: powers of two)
+__attribute__((noinline)) aie::vector<float, 16> {{ p }}_irms(aie::vector<float, 16> ss, int n)
+{
+    return al::inv_sqrt_eps<8>(al::mulc<16>(ss, aie::broadcast<bfloat16, 16>(n == 1 ? 1.0f : {{ 1.0 / D }}f)), {{ eps }}f);
+}
+
+// n lines of 64 B
+__attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__restrict src, int n = 64)
+{
+    int32_t *__restrict d = (int32_t *)dst;
+    const int32_t *__restrict s = (const int32_t *)src;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < n; i++) {
+        aie::store_v(d, aie::load_v<16>(s));
+        d += 16;
+        s += 16;
+    }
+}
+
+// C += A (hi + lo) B (hi + lo)^T: three products
+[[clang::always_inline]] inline void {{ p }}_mm3(al::MM8 &c, const al::BV &ah, const al::BV &al_, const al::BV &bh,
+                                               const al::BV &bl)
+{
+    c.mac(ah, TR(bh));
+    c.mac(ah, TR(bl));
+    c.mac(al_, TR(bh));
+}
+
+// x (64 fp32) -> panels hi, lo at out
+[[clang::always_inline]] inline void {{ p }}_push2(aie::accum<accfloat, 64> x, const al::BV &nI, uint8_t *out)
+{
+    al::BV h, l;
+    al::split_hilo(x, nI, h, l);
+    al::BOut<> po((bfp16ebs8 *)out);
+    po.push(h);
+    po.push(l);
+}
+
+// an 8 x 8 block of rows at stride N -> 64 lanes [r][c]
+template <int N, typename T>
+[[clang::always_inline]] inline aie::vector<T, 64> {{ p }}_blk(const T *__restrict p)
+{
+    return al::gather<8, 8>(p, N);
+}
+
+// The outputs t < n of the conv, bf16(sum over the taps of w (hi + lo) x) of x rows t .. t + 3 of r (pitch D: the 3 base
+// rows, then the lanes'), at lanes (l0 + t) & 7 of y ([panel 16][lane 8][8] bf16; its other lanes untouched); w [tap 4][hi,
+// lo][D]
+__attribute__((noinline)) void {{ p }}_pconv(const bfloat16 *__restrict r, const bfloat16 *__restrict w, bfloat16 *__restrict y,
+                                           int n, int l0)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int c = 0; c < {{ D }}; c += 32) {
+        aie::vector<bfloat16, 32> wh[4], wl[4];
+        AIE_LOOP_UNROLL_FULL
+        for (int t = 0; t < 4; t++) {
+            wh[t] = aie::load_v<32>(w + {{ 2 * D }} * t + c);
+            wl[t] = aie::load_v<32>(w + {{ 2 * D }} * t + {{ D }} + c);
+        }
+        const bfloat16 *__restrict pr = r + c;
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int t = 0; t < n; t++) {
+            aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+            AIE_LOOP_UNROLL_FULL
+            for (int k = 0; k < 4; k++) {
+                const aie::vector<bfloat16, 32> xk = aie::load_v<32>(pr + {{ D }} * k);
+                acc = aie::mac(aie::mac(acc, xk, wh[k]), xk, wl[k]);
+            }
+            const aie::vector<bfloat16, 32> v = acc.template to_vector<bfloat16>();
+            bfloat16 *__restrict py = y + 8 * c + 8 * ((l0 + t) & 7);
+            AIE_LOOP_UNROLL_FULL
+            for (int q = 0; q < 4; q++)
+                aie::store_v(py + 64 * q, v.template extract<8>(q));
+            pr += {{ D }};
+        }
+    }
+}
+

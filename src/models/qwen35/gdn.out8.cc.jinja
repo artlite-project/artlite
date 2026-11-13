@@ -1,0 +1,64 @@
+// The q block's new history ([base 3 | the step's S rows]; a D object's 4 KB from hb on)
+void {{ p }}_ghq(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.hb }}));
+}
+
+// A k or v block's history in the block ([the 3 rows before it | its lanes' rows]), rows 0 .. 15
+void {{ p }}_ghv(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.vh }}));
+}
+
+// ... its rows 16 .. 23 (then 2 KB into the next object's first half: the step's rows, taken)
+void {{ p }}_ghv2(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.vh }}) + {{ 16 * D }});
+}
+
+// The v head's gated outputs rms(o) ssm_norm silu(z) of the step's lanes (t0 + r) & 7 (a branching step's branch slots: o's
+// lanes past the chain's, ``gpanel``) -> d ([k block 16][slot 8][8] bf16), then the block's lanes' gates ([lane 16][d 8 | beta 8]
+// fp32: the next step's, from the last head's into the header); the next v head (of the next k head after the last of this
+// one's). (o: [panel 16][lane 8][8]; z: [half 2][slot 8][64], its SiLU in vt, the panels being through; the slots past the
+// step's go nowhere; its kb loop no hardware loop)
+void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}];
+    const float *__restrict nw = GW(float, {{ g.prm }}) + 32;
+    float *__restrict sz = GW(float, {{ g.vt }});
+    {{ p }}_silu(GW(bfloat16, {{ g.zr }}), GW(bfloat16, {{ g.cc }}), sz, st);
+    {{ p }}_silu(GW(bfloat16, {{ g.zr }}) + {{ 4 * D }}, GW(bfloat16, {{ g.cc }}), sz + {{ 4 * D }}, st);
+    const float *__restrict o = GW(float, {{ g.o }});
+    {{ p }}_gnorm(o, GW(float, {{ g.xy }}));
+    const aie::vector<float, 64> iv = al::bcast8(aie::shuffle_down_rotate(aie::load_v<8>(GW(float, {{ g.xy }}) + 64), t0));
+    AIE_LOOP_NO_UNROLL
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (int kb = 0; kb < 16; kb++) {
+        const float *__restrict ok = o + 64 * kb;
+        aie::vector<float, 64> ov;
+        AIE_LOOP_UNROLL_FULL
+        for (int r = 0; r < 8; r++)
+            ov.insert(r, aie::load_v<8>(ok + 8 * ((t0 + r) & 7)));
+        const aie::vector<float, 64> w = aie::load_v<8>(nw + 8 * kb).template grow_replicate<64>();
+        const aie::vector<float, 64> zk = al::gather<8, 8>(sz + {{ 4 * D }} * (kb >> 3) + 8 * (kb & 7), 64);
+        const aie::vector<float, 64> t = al::mulff<64>(al::mulff<64>(al::mulff<64>(ov, iv), w), zk);
+        aie::store_v(d + 64 * kb, aie::accum<accfloat, 64>(t).template to_vector<bfloat16>());
+    }
+    {{ p }}_cp4k(d + {{ 8 * D }}, GW(float, {{ g.dn }}), 16);
+    st[{{ G_PANEL }}] = 0;
+    const int vi = st[{{ G_VI }}] + 1, last = vi == {{ HC // 2 }};
+    const int kh = st[{{ G_KH }}] + last;
+    st[{{ G_VI }}] = last ? 0 : vi;
+    st[{{ G_KH }}] = kh;
+    st[{{ G_VH }}] = 2 * (last ? 0 : vi) + kh;
+    if (last)
+        st[{{ G_CB }}] = 0;
+    if (kh == 2) {  // (the step's last v head: the helper's last request, ``hgdn``)
+        st[{{ G_HK }}] = 2;
+        release(ws, {{ 48 + L_HRDY }}, 1);
+    }
+}
+
+}  // extern "C"

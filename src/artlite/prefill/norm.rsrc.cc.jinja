@@ -1,0 +1,196 @@
+
+// workspace (bytes): wp [E] bf16 | w1 [E] bf16 | ss [64] fp32 | a hi, lo [64] bf16 | iv hi, lo [64] bf16 | s hi, lo [64] bf16
+#define NW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+// 64 lanes -> 8 rows (pitch P) x 8 elements
+template <int P>
+[[clang::always_inline]] inline void {{ p }}_scatter8(float *__restrict p, aie::vector<float, 64> v)
+{
+{% for t in range(8) %}
+    aie::store_v(p + {{ t }} * P, v.template extract<8>({{ t }}));
+{% endfor %}
+}
+
+// x' of a panel: (x + d w a) s (module docstring), lanes 8 t + e; d2 ..: the other K parts (deltas > 1)
+[[clang::always_inline]] inline aie::vector<float, 64> {{ p }}_xp(aie::vector<float, 64> x, aie::vector<bfloat16, 64> d,
+{% for i in range(2, deltas + 1) %}
+                                                               aie::vector<bfloat16, 64> d{{ i }},
+{% endfor %}
+                                                               aie::vector<bfloat16, 64> w,
+                                                               aie::vector<bfloat16, 64> ah, aie::vector<bfloat16, 64> al,
+                                                               aie::vector<bfloat16, 64> sh, aie::vector<bfloat16, 64> sl)
+{
+    aie::accum<accfloat, 64> u = aie::mul(d, w);
+{% for i in range(2, deltas + 1) %}
+    u = aie::mac(u, d{{ i }}, w);
+{% endfor %}
+    const aie::vector<float, 64> uf = u.template to_vector<float>();
+    const aie::vector<bfloat16, 64> uh = aie::accum<accfloat, 64>(uf).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 64> ul = aie::accum<accfloat, 64>(
+        aie::sub(uf, aie::accum<accfloat, 64>(uh).template to_vector<float>())).template to_vector<bfloat16>();
+{% if scale %}
+    const aie::vector<bfloat16, 64> xh = aie::accum<accfloat, 64>(x).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 64> xl = aie::accum<accfloat, 64>(
+        aie::sub(x, aie::accum<accfloat, 64>(xh).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::accum<accfloat, 64> acc = aie::mac(aie::mac(aie::mul(xh, sh), xh, sl), xl, sh);
+    acc = aie::mac(aie::mac(aie::mac(acc, uh, ah), uh, al), ul, ah);
+{% else %}
+    aie::accum<accfloat, 64> acc = aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(x), uh, ah), uh, al), ul, ah);
+{% endif %}
+    return acc.template to_vector<float>();
+}
+
+// the 8 tokens' 1 / rms from the lanes' sums of squares (lane 8 t + e) -> hi, lo (lane 8 t + e) of 1 / rms times
+// the scale (hi + lo; 1 / rms alone when sh = 1, sl = 0)
+[[clang::always_inline]] inline void {{ p }}_inv(const float *__restrict ss, aie::vector<bfloat16, 64> sh,
+                                                 aie::vector<bfloat16, 64> sl, bfloat16 *__restrict hi,
+                                                 bfloat16 *__restrict lo)
+{
+    const aie::vector<float, 8> s8 = al::group8<false>(aie::load_v<64>(ss));
+    aie::vector<bfloat16, 16> ih, il;
+    al::split2<16>(al::inv_rms<{{ E }}, 8>(s8.template grow<16>(), {{ eps }}f), ih, il);
+    // (v sh + v sl, v = vh + vl: the four products in one accumulator)
+    const aie::vector<bfloat16, 64> vh = al::expand8(ih.template extract<8>(0)), vl = al::expand8(il.template extract<8>(0));
+    const aie::vector<float, 64> b = aie::mac(aie::mac(aie::mac(aie::mul(vh, sh), vl, sh), vh, sl), vl, sl).template to_vector<float>();
+    const aie::vector<bfloat16, 64> h = aie::accum<accfloat, 64>(b).template to_vector<bfloat16>();
+    aie::store_v(hi, h);
+    aie::store_v(lo, aie::accum<accfloat, 64>(aie::sub(b, aie::accum<accfloat, 64>(h).template to_vector<float>()))
+                         .template to_vector<bfloat16>());
+}
+
+}  // namespace
+
+extern "C" {
+
+// the parameters' chunk kc ([8 rows][CH] bf16 of [w_post | w1 | s hi, lo])
+void {{ p }}_prm(const bfloat16 *__restrict pr, bfloat16 *__restrict ws, int32_t kc)
+{
+    al::copy<{{ CH }}, 32>(NW(bfloat16, {{ w.wp }}) + {{ CH }} * kc, pr);
+    al::copy<{{ CH }}, 32>(NW(bfloat16, {{ w.w1 }}) + {{ CH }} * kc, pr + {{ CH }});
+    if (kc == 0) {
+        aie::store_v(NW(bfloat16, {{ w.sh }}), aie::broadcast<bfloat16, 64>(pr[2 * {{ CH }}]));
+        aie::store_v(NW(bfloat16, {{ w.sl }}), aie::broadcast<bfloat16, 64>(pr[2 * {{ CH }} + 1]));
+    }
+}
+
+// pass A, chunk kc: the lanes' sums of squares of {{ "x" if mode == "in" else "d" }} (8 tokens x CH)
+void {{ p }}_ss(const bfloat16 *__restrict v, bfloat16 *__restrict ws, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict ss = NW(float, {{ w.ss }});
+    aie::accum<accfloat, 64> acc(aie::load_v<64>(ss));
+    if (kc == 0)
+        acc = aie::zeros<accfloat, 64>();
+{% if mode == "in" %}
+    const float *__restrict px = (const float *)v;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
+        acc = aie::mac_square(acc, aie::accum<accfloat, 64>(al::gather<8, 8>(px, {{ CH }})).template to_vector<bfloat16>());
+        px += 8;
+    }
+{% else %}
+    const bfloat16 *__restrict pd = v;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
+{% if deltas > 1 %}
+        aie::accum<accfloat, 64> s(al::gather<8, 8>(pd, {{ CH }}));
+{% for i in range(1, deltas) %}
+        s = aie::add(s, al::gather<8, 8>(pd + {{ 8 * CH * i }}, {{ CH }}));
+{% endfor %}
+        acc = aie::mac_square(acc, s.template to_vector<bfloat16>());
+{% else %}
+        acc = aie::mac_square(acc, al::gather<8, 8>(pd, {{ CH }}));
+{% endif %}
+        pd += 8;
+    }
+{% endif %}
+    aie::store_v(ss, acc.template to_vector<float>());
+}
+
+{% if mode != "in" %}
+// pass B, chunk kc: x' -> xo (8 tokens x CH fp32){{ ", its panels -> pan" if mode == "plain" else ", the lanes' sums of squares of bf16(x')" }}
+void {{ p }}_upd(const bfloat16 *__restrict x_, const bfloat16 *__restrict d, bfloat16 *__restrict ws,
+                 bfloat16 *__restrict xo_{{ ", bfloat16 *__restrict pan" if mode == "plain" }}, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict ss = NW(float, {{ w.ss }});
+    const aie::vector<bfloat16, 64> sh = aie::load_v<64>(NW(bfloat16, {{ w.sh }})), sl = aie::load_v<64>(NW(bfloat16, {{ w.sl }}));
+    if (kc == 0)  // (a = s / rms(d) from pass A's sums)
+        {{ p }}_inv(ss, sh, sl, NW(bfloat16, {{ w.ah }}), NW(bfloat16, {{ w.al }}));
+    const aie::vector<bfloat16, 64> ah = aie::load_v<64>(NW(bfloat16, {{ w.ah }})), al_ = aie::load_v<64>(NW(bfloat16, {{ w.al }}));
+{% if mode == "post" %}
+    aie::accum<accfloat, 64> acc(aie::load_v<64>(ss));
+    if (kc == 0)
+        acc = aie::zeros<accfloat, 64>();
+{% else %}
+    al::BOut<> o((bfp16ebs8 *)pan);
+{% endif %}
+    const float *__restrict px = (const float *)x_;
+    float *__restrict xo = (float *)xo_;
+    const bfloat16 *__restrict pw = NW(bfloat16, {{ w.wp }}) + {{ CH }} * kc;
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
+        const aie::vector<float, 64> xp = {{ p }}_xp(al::gather<8, 8>(px, {{ CH }}), al::gather<8, 8>(d + 8 * kb, {{ CH }}),
+{% for i in range(1, deltas) %}
+                                                    al::gather<8, 8>(d + {{ 8 * CH * i }} + 8 * kb, {{ CH }}),
+{% endfor %}
+                                                    aie::load_v<8>(pw).template grow_replicate<64>(), ah, al_, sh, sl);
+        {{ p }}_scatter8<{{ CH }}>(xo, xp);
+{% if mode == "post" %}
+        acc = aie::mac_square(acc, aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>());
+{% else %}
+        o.push(aie::accum<accfloat, 64>(xp).template to_vector<bfp16ebs8>());
+{% endif %}
+        px += 8;
+        xo += 8;
+        pw += 8;
+    }
+{% if mode == "post" %}
+    aie::store_v(ss, acc.template to_vector<float>());
+{% endif %}
+}
+{% endif %}
+
+{% if mode != "plain" %}
+// pass C, chunk kc: the panels of bf16(x') w1 / rms(x'){{ " (x' recomputed: pass B's arithmetic)" if mode == "post" }}
+void {{ p }}_pan(const bfloat16 *__restrict x_, {{ "const bfloat16 *__restrict d, " if mode == "post" }}bfloat16 *__restrict ws,
+                 bfloat16 *__restrict pan, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    if (kc == 0) {  // (1 / rms(x') from the sums of squares)
+        const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+        {{ p }}_inv(NW(float, {{ w.ss }}), one, aie::zeros<bfloat16, 64>(), NW(bfloat16, {{ w.ih }}), NW(bfloat16, {{ w.il }}));
+    }
+    const aie::vector<bfloat16, 64> ih = aie::load_v<64>(NW(bfloat16, {{ w.ih }})), il = aie::load_v<64>(NW(bfloat16, {{ w.il }}));
+{% if mode == "post" %}
+    const aie::vector<bfloat16, 64> sh = aie::load_v<64>(NW(bfloat16, {{ w.sh }})), sl = aie::load_v<64>(NW(bfloat16, {{ w.sl }}));
+    const aie::vector<bfloat16, 64> ah = aie::load_v<64>(NW(bfloat16, {{ w.ah }})), al_ = aie::load_v<64>(NW(bfloat16, {{ w.al }}));
+    const bfloat16 *__restrict pw = NW(bfloat16, {{ w.wp }}) + {{ CH }} * kc;
+{% endif %}
+    const bfloat16 *__restrict p1 = NW(bfloat16, {{ w.w1 }}) + {{ CH }} * kc;
+    const float *__restrict px = (const float *)x_;
+    al::BOut<> o((bfp16ebs8 *)pan);
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
+{% if mode == "post" %}
+        const aie::vector<float, 64> xp = {{ p }}_xp(al::gather<8, 8>(px, {{ CH }}), al::gather<8, 8>(d + 8 * kb, {{ CH }}),
+{% for i in range(1, deltas) %}
+                                                    al::gather<8, 8>(d + {{ 8 * CH * i }} + 8 * kb, {{ CH }}),
+{% endfor %}
+                                                    aie::load_v<8>(pw).template grow_replicate<64>(), ah, al_, sh, sl);
+        pw += 8;
+{% else %}
+        const aie::vector<float, 64> xp = al::gather<8, 8>(px, {{ CH }});
+{% endif %}
+        const aie::vector<bfloat16, 64> xw = aie::mul(aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>(),
+                                                      aie::load_v<8>(p1).template grow_replicate<64>()).template to_vector<bfloat16>();
+        o.push(aie::mac(aie::mul(xw, ih), xw, il).template to_vector<bfp16ebs8>());
+        px += 8;
+        p1 += 8;
+    }
+}
+{% endif %}
+
+}  // extern "C"

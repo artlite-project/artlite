@@ -181,7 +181,7 @@ a worker `Buffer` argument (`km.act(table_arg=True)`: SKILL.md section 2). `walk
 gate halves of a gate/up C tile in place, `walk=(1, 64)` the PLE's slots; the vision overlay feeds a GELU table on SiLU's grid 2 |x|
 (`scale=2`, `clamp`). The clamp pass is a noinline function of its own; `inline=True` puts it into the caller, which
 only the PLE takes (its call cost 7 cycles; inlined, the GEMM epilogue and the vision overlay's row loops spill more). The decode
-overlay's GELU (`decode/kernels.py`) is `km.act(km.GELU)`,
+overlay's GELU (`decode/design.cc.jinja`) is `km.act(km.GELU)`,
 32 values at a time: 2.4x faster than the tanh form through `vtanh` (a bf16 fit below |w| = 1.25, e^(2w) (1 + |tanh w|)
 for w < 0), which is within 1.7 ULP at ~7 cycles per element.
 

@@ -1,0 +1,169 @@
+// The slots' gates d = expm1(A softplus(alpha + dt)), beta = sigmoid(beta) from their messages' ab (alpha HC | beta HC fp32;
+// prm: dt 16 | A 16) into dn at their lanes t0 .. ([lane][d 8 | beta 8] fp32)
+__attribute__((noinline)) void {{ p }}_ggates(int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int S = st[{{ G_NS }}];
+    const float *__restrict prm = GW(float, {{ g.prm }});
+    float *__restrict dn = GW(float, {{ g.dn }}) + 16 * st[{{ G_NREP }}];
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < S; s++) {
+        const aie::vector<float, 16> ab = aie::load_v<16>((const float *)(GW(bfloat16, {{ g.msg }}) + {{ MSGP }} * s + {{ CH + HC * D }}));
+        // softplus(alpha + dt), then softplus(-beta) in the lanes after: sigmoid(beta) = e^(-softplus(-beta)) (one call)
+        const aie::vector<float, 16> sp = {{ gm.softplus }}(aie::select(aie::sub(aie::zeros<float, 16>(), ab), aie::add(ab, aie::load_v<16>(prm)),
+                                                                     aie::mask<16>::from_uint32({{ 2 ** HC - 1 }}u)));
+        aie::store_v(dn, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))).template extract<8>(0));
+        aie::store_v(dn + 8, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), aie::shuffle_down(sp, {{ HC }})))).template extract<8>(0));
+        dn += 16;
+    }
+}
+
+// The step's S rows of conv block b (the message's) -> h ([row][D] bf16)
+__attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, bfloat16 *__restrict h, int b)
+{
+    const bfloat16 *__restrict r = GW(bfloat16, {{ g.msg }}) + {{ D }} * b;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < GW(int32_t, {{ g.st }})[{{ G_NS }}]; s++) {
+        {{ p }}_cp4k(h + {{ D }} * s, r, {{ 2 * D // 64 }});
+        r += {{ MSGP }};
+    }
+}
+
+// The conv of rows r on weights w: outputs t < n at lanes (l0 + t) & 7, SiLU: y ([panel 16][lane 8][8] fp32; the other lanes:
+// the values of zb's, the conv outputs before; scratch: zb, cc)
+__attribute__((noinline)) void {{ p }}_cblock(int32_t *__restrict ws, const bfloat16 *__restrict r, const bfloat16 *__restrict w,
+                                            int n, int l0, float *__restrict y)
+{
+    bfloat16 *__restrict yc = GW(bfloat16, {{ g.zb }}), *__restrict tt = GW(bfloat16, {{ g.cc }});
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    {{ p }}_pconv(r, w, yc, n, l0);
+    {{ p }}_silu(yc, tt, y, st);
+    {{ p }}_silu(yc + {{ 4 * D }}, tt, y + {{ 4 * D }}, st);
+}
+
+}  // namespace
+
+extern "C" {
+
+// A new X object: a main core's phase (its input objects follow: skipped), the gdn_in phase (F_MSG: the step), or
+// another core's first object (M_SKIP more follow)
+__attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict m = (const int32_t *)x;
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int flags = m[{{ M_FLAGS }}];
+    st[{{ G_NSKIP }}] = 0;
+    st[{{ G_NMSG }}] = 0;
+    st[{{ G_ON }}] = 0;
+    if (!(flags & {{ F_MAIN }}))
+        st[{{ G_NSKIP }}] = m[{{ M_SKIP }}];
+    else if (!(flags & {{ F_LOADR }}))
+        st[{{ G_NSKIP }}] = m[{{ M_NX }}];
+    if (!(flags & {{ F_MSG }}))
+        return;
+    const int S = m[{{ M_NS }}];
+    st[{{ G_NS }}] = S;
+    st[{{ G_NMSG }}] = S * {{ n_msg }};
+    st[{{ G_ON }}] = 1;
+    st[{{ G_NREP }}] = m[{{ M_NREP }}];
+    st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
+    st[{{ G_KSHIFT }}] = m[{{ M_KSHIFT }}];
+    st[{{ G_MJ }}] = 0;
+    st[{{ G_MS }}] = 0;
+    st[{{ G_KH }}] = 0;
+    st[{{ G_PANEL }}] = 0;
+    st[{{ G_TA }}] = 0x{{ "%x" % TAB[0] }};
+    st[{{ G_TA + 1 }}] = 0x{{ "%x" % TAB[1] }};
+}
+
+// The next message object: object j of slot s
+void {{ p }}_gmsg(const bfloat16 *__restrict m, int32_t *__restrict ws)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int j = st[{{ G_MJ }}], s = st[{{ G_MS }}];
+    const int last = s + 1 == st[{{ G_NS }}];
+    st[{{ G_MS }}] = last ? 0 : s + 1;
+    st[{{ G_MJ }}] = last ? j + 1 : j;
+    aie::store_v(GW(bfloat16, {{ g.msg }}) + {{ MSGP }} * s + {{ C_LEN }} * j, aie::load_v<{{ C_LEN }}>(m));
+}
+
+// A k head's P object: its q block's history -> the step's base rows; the first k head's: the ssm parameters, the block's
+// lanes' gates before the step (from row M_KSHIFT), the step's
+void {{ p }}_gq(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const bfloat16 *__restrict p = x + {{ 2 * META }};
+    if (!st[{{ G_KH }}]) {
+        st[{{ G_VI }}] = 0;
+        {{ p }}_cp4k(GW(float, {{ g.prm }}), p + {{ P_PRM // 2 }}, 10);
+        {{ p }}_cp4k(GW(float, {{ g.dn }}), p + {{ P_D // 2 }} + 32 * st[{{ G_KSHIFT }}], st[{{ G_NREP }}]);
+        {{ p }}_ggates(ws);
+    }
+    {{ p }}_cp4k(GW(bfloat16, {{ g.hb }}), p + {{ D }} * st[{{ G_CSHIFT }}], {{ 3 * 2 * D // 64 }});
+}
+
+// A k head's W object ([q weights | k weights]): its q block at the step's lanes, Q's panels; k's weights kept
+void {{ p }}_gqw(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const bfloat16 *__restrict w = x + {{ 2 * META }};
+    const unsigned S = st[{{ G_NS }}], t0 = st[{{ G_NREP }}], m = ((1u << S) - 1u) << t0;
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.hb }});
+    float *__restrict y = GW(float, {{ g.vt }});
+    {{ p }}_rows(ws, h + {{ 3 * D }}, st[{{ G_KH }}]);
+    {{ p }}_cblock(ws, h, w, S, t0, y);
+    {{ p }}_l2panels(y, GW(float, {{ g.xy }}), (m | m >> 8) & 0xFFu, 1, GW(uint8_t, {{ g.qp }}));
+    {{ p }}_cp4k(GW(bfloat16, {{ g.cw }}), w + {{ 8 * D }}, {{ 16 * D // 64 }});
+}
+
+// A k head's K object (its k block's history: [the 3 rows before the block | its lanes' rows], from row M_KSHIFT on): its k
+// block over the block's lanes, K's panels (a lane's own blocks), the Gram blocks and K^T's panels; past the block's end in
+// the step, the next block's lanes' K panels and Gram blocks
+void {{ p }}_gk(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const bfloat16 *__restrict p = x + {{ 2 * META }};
+    const int t0 = st[{{ G_NREP }}], e = t0 + st[{{ G_NS }}], n = e < 8 ? e : 8;
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.kh }});
+    float *__restrict y = GW(float, {{ g.vt }}), *__restrict sq = GW(float, {{ g.xy }});
+    const uint8_t *__restrict qp = GW(uint8_t, {{ g.qp }});
+    {{ p }}_cp4k(h, p + {{ D }} * st[{{ G_KSHIFT }}], (3 + t0) * {{ 2 * D // 64 }});
+    {{ p }}_rows(ws, h + {{ D }} * (3 + t0), 2 + st[{{ G_KH }}]);
+    AIE_LOOP_NO_UNROLL
+    for (int c = 0; c < 1 + (e > 8); c++) {  // (the block's lanes, then the next block's)
+        const int nc = c ? e - 8 : n;
+        uint8_t *__restrict k = c ? GW(uint8_t, {{ g.k2 }}) : GW(uint8_t, {{ g.kq }});
+        {{ p }}_cblock(ws, h + {{ 8 * D }} * c, GW(bfloat16, {{ g.cw }}), nc, 0, y);
+        {{ p }}_l2panels(y, sq, (1u << nc) - 1u, 0, k);
+        {{ p }}_gram(k, qp, GW(float, {{ g.gg }}) + 128 * c, c ? nullptr : GW(uint8_t, {{ g.kt }}));
+    }
+}
+
+// A v head's A object ([weights | its history's rows 0 .. 7]): the weights, the rows (from M_KSHIFT 8 on: none)
+void {{ p }}_gv(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const bfloat16 *__restrict w = x + {{ 2 * META }};
+    {{ p }}_cp4k(GW(bfloat16, {{ g.cw }}), w, {{ 16 * D // 64 }});
+    if (!GW(int32_t, {{ g.st }})[{{ G_KSHIFT }}])
+        {{ p }}_cp4k(GW(bfloat16, {{ g.kh }}), w + {{ 8 * D }}, {{ 16 * D // 64 }});
+}
+
+// A v head's H object ([its history's rows 8 .. 15 | 2 KB]): its block over the block's lanes as V ([panel 16][lane 8][8] in
+// vt); past the block's end in the step, the next block's lanes' V (in o: lanes the block's outputs do not take); the
+// chunks' constants
+void {{ p }}_gvh(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}], e = t0 + st[{{ G_NS }}];
+    bfloat16 *__restrict h = GW(bfloat16, {{ g.kh }});
+    {{ p }}_cp4k(h + {{ D }} * (8 - st[{{ G_KSHIFT }}]), x + {{ 2 * META }}, {{ 16 * D // 64 }});
+    {{ p }}_rows(ws, h + {{ D }} * (3 + t0), 4 + st[{{ G_VH }}]);
+    {{ p }}_cblock(ws, h, GW(bfloat16, {{ g.cw }}), e < 8 ? e : 8, 0, GW(float, {{ g.vt }}));
+    if (e > 8)  // (the next block's lanes)
+        {{ p }}_cblock(ws, h + {{ 8 * D }}, GW(bfloat16, {{ g.cw }}), e - 8, 0, GW(float, {{ g.o }}));
+    {{ p }}_vhead(ws, 0);  // (after the convs: their scratch is the constants')
+    if (e > 8)
+        {{ p }}_vhead(ws, 1);
+}
+

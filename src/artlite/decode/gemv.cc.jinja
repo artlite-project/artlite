@@ -1,0 +1,218 @@
+
+namespace {
+
+// 8 rows' 32-byte chunks (row r at p + r ST) -> o0 .. o3 = [panel 2 k | panel 2 k + 1], panel c = word c of the 8 rows
+template <int ST, typename T>
+[[clang::always_inline]] inline void {{ p }}_tr8(const T *p, v16int32 &o0, v16int32 &o1, v16int32 &o2, v16int32 &o3)
+{
+    const v16int32 a0 = concat(*(const v8int32 *)(p), *(const v8int32 *)(p + ST));
+    const v16int32 a1 = concat(*(const v8int32 *)(p + 2 * ST), *(const v8int32 *)(p + 3 * ST));
+    const v16int32 a2 = concat(*(const v8int32 *)(p + 4 * ST), *(const v8int32 *)(p + 5 * ST));
+    const v16int32 a3 = concat(*(const v8int32 *)(p + 6 * ST), *(const v8int32 *)(p + 7 * ST));
+    const v16int32 t0 = shuffle(a0, a1, T32_4x8_lo), t1 = shuffle(a0, a1, T32_4x8_hi);
+    const v16int32 t2 = shuffle(a2, a3, T32_4x8_lo), t3 = shuffle(a2, a3, T32_4x8_hi);
+    o0 = shuffle(t0, t2, T128_2x4_lo);
+    o1 = shuffle(t0, t2, T128_2x4_hi);
+    o2 = shuffle(t1, t3, T128_2x4_lo);
+    o3 = shuffle(t1, t3, T128_2x4_hi);
+}
+
+// the 8 panels of o0 .. o3 -> p + c ST (panel c)
+template <int ST, typename T>
+[[clang::always_inline]] inline void {{ p }}_put8(T *p, const v16int32 &o0, const v16int32 &o1, const v16int32 &o2,
+                                                  const v16int32 &o3)
+{
+    *(v8int32 *)(p) = extract_v8int32(o0, 0);
+    *(v8int32 *)(p + ST) = extract_v8int32(o0, 1);
+    *(v8int32 *)(p + 2 * ST) = extract_v8int32(o1, 0);
+    *(v8int32 *)(p + 3 * ST) = extract_v8int32(o1, 1);
+    *(v8int32 *)(p + 4 * ST) = extract_v8int32(o2, 0);
+    *(v8int32 *)(p + 5 * ST) = extract_v8int32(o2, 1);
+    *(v8int32 *)(p + 6 * ST) = extract_v8int32(o3, 0);
+    *(v8int32 *)(p + 7 * ST) = extract_v8int32(o3, 1);
+}
+
+// a weight panel of 32 B of nibbles (8 rows x 8 k) unpacked by the load, at exponent e (value = code 2^(e - 133))
+template <typename T>
+[[clang::always_inline]] inline v64bfp16ebs8 {{ p }}_wu(const T *p, int e = 0x85)
+{
+    v64bfp16ebs8 n;
+    n.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_b *)p);
+    n.exponent = al::e8(e);
+    return n;
+}
+
+// a constant panel -z e_i (column i): the chain start of sub-block i, -z XS_i (exponent e: -z 2^(e - 133))
+template <typename T>
+[[clang::always_inline]] inline v64bfp16ebs8 {{ p }}_np(const T *p, int e = 0x85)
+{
+    v64bfp16ebs8 n;
+    n.mantissa = *(const v64int8 __aie_dm_resource_d *)p;
+    n.exponent = al::e8(e);
+    return n;
+}
+
+// the 64 lanes [a][r] of an MMUL result -> bf16 of the hi and lo rows' sums: 32 lanes [slot][r]
+[[clang::always_inline]] inline aie::vector<bfloat16, 32> {{ p }}_sum2(v64accfloat C)
+{
+    const aie::accum<accfloat, 64> a(C);
+    return aie::add(a.template extract<32>(0), a.template extract<32>(1)).template to_vector<bfloat16>();
+}
+
+// T (exact integers, [i][r]) times D ([i][r] = d_r) exactly in fp32 -> tab: bf16 hi, lo (64 each)
+[[clang::always_inline]] inline void {{ p }}_td(v64accfloat T, aie::vector<bfloat16, 64> D, bfloat16 *__restrict tab)
+{
+    const aie::accum<accfloat, 64> TD = aie::mul(aie::accum<accfloat, 64>(T).template to_vector<bfloat16>(), D);
+    const aie::vector<bfloat16, 64> th = TD.template to_vector<bfloat16>();
+    aie::store_v(tab, th);
+    aie::store_v(tab + 64, aie::msc(TD, th, aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfloat16>());
+}
+
+// acc + M [a][r] as bf16 hi + lo times s ([a][r])
+[[clang::always_inline]] inline aie::accum<accfloat, 64> {{ p }}_mo(v64accfloat M, aie::vector<bfloat16, 64> s,
+                                                                    aie::accum<accfloat, 64> acc)
+{
+    const aie::accum<accfloat, 64> m(M);
+    const aie::vector<bfloat16, 64> h = m.template to_vector<bfloat16>();
+    return aie::mac(aie::mac(acc, h, s), aie::msc(m, h, aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfloat16>(), s);
+}
+
+// y[0 .. 32) += the hi and lo rows' sums of a (64 lanes [a][r])
+[[clang::always_inline]] inline void {{ p }}_yadd(float *__restrict y, aie::accum<accfloat, 64> a)
+{
+    const aie::vector<float, 64> v = a.template to_vector<float>();
+    aie::store_v(y, aie::add(aie::load_v<32>(y), aie::add(v.template extract<32>(0), v.template extract<32>(1))));
+}
+
+// the 8 values of the rows at lanes sbl, sbl + 2, .. of v
+[[clang::always_inline]] inline aie::vector<bfloat16, 8> {{ p }}_pick(aie::vector<bfloat16, 16> v, int sbl)
+{
+    return aie::filter_even(aie::shuffle_down(v, sbl), 1);
+}
+
+// -8 e_i panels (mantissas): [i][64] (-16 e_i, -32 e_i: the same mantissas at exponents 0x86, 0x87)
+alignas(64) static const int8_t {{ p }}_nz[8][64] = {
+{% for i in range(8) %}
+    { {% for l in range(64) %}{{ -8 if l % 8 == i else 0 }}, {% endfor %}},
+{% endfor %}
+};
+
+{% if slots == 8 %}
+// (8 slots) the 64 lanes [slot][r] of an MMUL result -> bf16: a sub-block's c
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_c8(v64accfloat C)
+{
+    return aie::accum<accfloat, 64>(C).template to_vector<bfloat16>();
+}
+
+// (8 slots) y[0 .. 64) += a
+[[clang::always_inline]] inline void {{ p }}_yadd8(float *__restrict y, aie::accum<accfloat, 64> a)
+{
+    aie::store_v(y, aie::add(aie::load_v<64>(y), a.template to_vector<float>()));
+}
+
+{% endif %}
+// Pass 4 of every format: y[g] += sum over 8 sub-blocks of c_g (TD hi + lo)_g; c: of g 0 at c + CS n, g 1 at + {{ L }};
+// tab: TD hi of g 0 at tab + TN n, lo at + 64, g 1 at + TG (one copy for every format: runtime strides){{ "; 64 lanes\n// [slot 8][r 8] (a 64-lane MAC is one op, as a 32-lane one)" if slots == 8 else "" }}
+__attribute__((noinline)) void {{ p }}_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y,
+                                          int TG, int TN, int CS)
+{
+    constexpr int N = 8;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < N; i++) {
+        const aie::vector<bfloat16, {{ L }}> c0 = aie::load_v<{{ L }}>(pc), c1 = aie::load_v<{{ L }}>(pc + {{ L }});
+        Y0 = aie::mac(aie::mac(Y0, c0, aie::load_v<8>(ph).template grow_replicate<{{ L }}>()), c0, aie::load_v<8>(ph + 64).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(aie::mac(Y1, c1, aie::load_v<8>(ph + TG).template grow_replicate<{{ L }}>()), c1, aie::load_v<8>(ph + TG + 64).template grow_replicate<{{ L }}>());
+        pc += CS;
+        ph += TN;
+    }
+    aie::store_v(y, Y0.template to_vector<float>());
+    aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
+}
+
+{% for part in parts %}
+
+{% include part %}
+{% endfor %}
+
+{% if paged %}
+{{ pager }}
+
+{% if keep or keep_nz %}
+// (resident) The data the pages read and no resident kernel does, read into the scratch o (192 B), so that the links of
+// the cores that page keep it (and no other core's: a retained section would take room in every core of the design); a
+// page writes no data but a gather table (``paging.Pager.data``)
+__attribute__((noinline)) void {{ p }}_keep(v64int8 *o)
+{
+{% if keep %}
+    const v64bfp16ebs8 a = al::eye(), b = al::neg_eye();  // (every format paged: the inline tables of kernel_lib)
+    o[0] = a.mantissa;
+    o[1] = b.mantissa;
+{% endif %}
+{% if keep_nz %}
+    o[2] = *(const volatile v64int8 *){{ p }}_nz[0];
+{% endif %}
+}
+{% endif %}
+
+// (resident) page ``page`` of core half H into program memory unless its state words name it (``render(paged=)``)
+template <int H>
+__attribute__((noinline)) void {{ p }}_pg_need(int page, uint8_t *__restrict scr)
+{
+    if (((const volatile int32_t *){{ pg.state }})[0] != page) {
+{% if keep or keep_nz %}
+        {{ p }}_keep((v64int8 *)scr);
+{% endif %}
+        {{ p }}_pg_request(H ? (int32_t){{ pg.hdr[1] }}u : (int32_t){{ pg.hdr[0] }}u,
+                           H ? (int32_t){{ pg.ctl[1] }}u : (int32_t){{ pg.ctl[0] }}u,
+                           (H ? {{ pg.bd0[1] }} : {{ pg.bd0[0] }}) + page - 1);
+    }
+}
+{% endif %}
+
+// One tile of format fmt, super-blocks 2 H, 2 H + 1: y[g][32] += their rows against xp (the 64 panels of those
+// super-blocks) and xs (the chunk's sum panels){{ "; rg: fmt's B_G4 (row groups of 4: super-block 2 H + 1's rows into y + %d, rows of their own)" % yb if rg else "" }}
+{% if rowsplit %}
+// (a row-split format, ``row_split``: rows 16 H .. of all its super-blocks, xp the chunk's panels; Q8_0: its row
+// group H into y[32 H ..])
+{% endif %}
+template <int H>
+__attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr,
+                                           int32_t fmt)
+{
+{% if rg %}
+    const int ys = (fmt & {{ B_G4 }}) ? {{ yb }} : 0;
+    fmt &= 255;
+{% endif %}
+{% for f in fmts %}
+{% if f in paged %}
+    if (fmt == {{ fid[f] }}) {
+        {{ p }}_pg_need<H>({{ paged.index(f) + 1 }}, scr);
+        ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if f in rg_fmts else "" }}))(intptr_t)
+             ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+        return;
+    }
+{% else %}
+    if (fmt == {{ fid[f] }})
+        {{ p }}_{{ fn[f] }}<H>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+{% endif %}
+{% endfor %}
+}
+
+}  // namespace
+{% for f in paged %}
+{% for h in (0, 1) %}
+
+// (a page: format {{ f }}'s half {{ h }}, entered through the pager's state words only; external, so that it stays in
+// the object for ``paging.link``)
+void {{ p }}_pgf{{ h }}_{{ f | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                        float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if f in rg_fmts else "" }})
+{
+    {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+}
+{% endfor %}
+{% endfor %}

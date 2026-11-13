@@ -1,0 +1,23 @@
+
+{% if send is not none %}
+// (paging: ``artlite.operators.paging``) a page's slots, held by the core, out through its own MM2S into its
+// TileControl; asleep until the page's last packet sets the wake lock: nothing runs in between (a write to program
+// memory loses to the core's fetch), and page code is entered only after this returns (an acquire in a jump's delay
+// slots completes after the jump's target is fetched)
+__attribute__((noinline)) void {{ p }}_pg_self() {
+  release({{ base + send }}, {{ nslots }});
+  acquire_greater_equal({{ base + wake }}, 1);
+  __builtin_aie2p_sched_barrier();
+}
+{% endif %}
+{% if request %}
+// (paging: ``artlite.operators.paging``) a page's request (hdr, ctl: a write of the page BD's id to its memtile
+// channel's start queue) out through the core's stream port; asleep until the page's last packet sets the wake lock
+__attribute__((noinline)) void {{ p }}_pg_request(int32_t hdr, int32_t ctl, int32_t bd) {
+  put_ms(hdr, 0);
+  put_ms(ctl, 0);
+  put_ms(bd, 1);
+  acquire_greater_equal({{ base + wake }}, 1);
+  __builtin_aie2p_sched_barrier();
+}
+{% endif %}

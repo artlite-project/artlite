@@ -1,0 +1,163 @@
+
+// The prep cores' workspace (bytes): row (HD fp32) | stage [db ND][row 8][8] fp32{{ " | nrm [q_norm | k_norm] fp32" if NORM else "" }}
+#define PW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+{% if NORM %}
+// x (HD bf16) -> row = x / rms(x) w (fp32: x times 1 / rms's hi and lo parts, times w), the pairs (i, i + HD / 2)
+// rotated by cs [cos HD / 2 | sin HD / 2]
+__attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict w, const float *__restrict cs,
+                                            float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < {{ HD }}; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, 64> ih, il;
+    al::bf16_hilo<64>(inv, ih, il);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
+        aie::store_v(row + i, al::mulff<64>(aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>(), aie::load_v<64>(w + i)));
+    }
+{% else %}
+// x (HD bf16) -> row (fp32), the pairs (i, i + HD / 2) rotated by cs [cos HD / 2 | sin HD / 2]
+__attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict row)
+{
+    for (int i = 0; i < {{ HD }}; i += 32)
+        aie::store_v(row + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
+{% endif %}
+    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
+        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ HD // 2 }} + i);
+        aie::accum<accfloat, 32> o0, o1;
+        al::rot2(a, b, c, s, o0, o1);
+        aie::store_v(row + i, o0.template to_vector<float>());
+        aie::store_v(row + {{ HD // 2 }} + i, o1.template to_vector<float>());
+    }
+}
+
+// row (HD fp32) -> row r of the stage [db][r][8]
+__attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
+{
+    float *__restrict d = st + 8 * r;
+    for (int db = 0; db < {{ ND }}; db++) {
+        aie::store_v(d, aie::load_v<8>(row));
+        row += 8;
+        d += 64;
+    }
+}
+
+// the stage -> [hi panels ND | lo panels ND]
+__attribute__((noinline)) void {{ p }}_hilo(const float *__restrict st, uint8_t *__restrict out)
+{
+    const al::BV nI = al::neg_eye();
+    al::BOut<> ho((bfp16ebs8 *)out);
+    al::BOut<> lo((bfp16ebs8 *)(out + {{ 72 * ND }}));
+    for (int db = 0; db < {{ ND }}; db++) {
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+        ho.push(h);
+        lo.push(l);
+        st += 64;
+    }
+}
+
+// 8 tokens of head h of the core's nq (rows of nq HD bf16), cs (8 x [cos | sin] fp32) -> unit h of out: the Q panels
+// ({{ "hi then lo" if QP == 2 else "single bfp16" }}) of q rotated, times the score constant
+__attribute__((noinline)) void {{ p }}_qh(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws,
+                                          bfloat16 *__restrict out, int32_t h, int32_t nq)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_rope(q + {{ HD }} * (nq * r + h), {% if NORM %}PW(float, {{ w.nrm }}), {% endif %}cs + {{ HD }} * r, row);
+        for (int i = 0; i < {{ HD }}; i += 64)
+            aie::store_v(row + i, al::mul_hilo<64, {{ qc[0] }}f, {{ qc[1] }}f>(aie::load_v<64>(row + i)));
+        {{ p }}_scatter(row, st, r);
+    }
+{% if QP == 2 %}
+    {{ p }}_hilo(st, (uint8_t *)out + {{ QUNIT }} * h);
+{% else %}
+    al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ QUNIT }} * h));
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
+        st += 64;
+    }
+{% endif %}
+}
+
+}  // namespace
+
+extern "C" {
+
+{% if NORM %}
+// The B stream's first object: the layer's q_norm, k_norm (HD fp32 each)
+void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
+{
+    al::copy<{{ 2 * HD }}, 16>(PW(float, {{ w.nrm }}), (const float *)n);
+}
+
+{% endif %}
+{% for i in range(2) %}
+// the Q core {{ i }}'s (its own buffer sizes)
+void {{ p }}_q{{ i }}(const bfloat16 *__restrict q, const bfloat16 *__restrict cs, float *__restrict ws, bfloat16 *__restrict out,
+                int32_t h, int32_t nq)
+{
+    {{ p }}_qh(q, cs, ws, out, h, nq);
+}
+
+{% endfor %}
+// 8 tokens of the KV head's K (rows of HD bf16), cs -> record r of the group's K objects in out
+void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out,
+               int32_t r)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int t = 0; t < 8; t++) {
+        {{ p }}_rope(k + {{ HD }} * t, {% if NORM %}PW(float, {{ w.nrm }}) + {{ HD }}, {% endif %}cs + {{ HD }} * t, row);
+        {{ p }}_scatter(row, st, t);
+    }
+    uint8_t *__restrict rec = (uint8_t *)out + {{ KREC }} * r;
+{% if KP == 2 %}
+    {{ p }}_hilo(st, rec);
+{% else %}
+    al::BOut<> o((bfp16ebs8 *)rec);
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
+        st += 64;
+    }
+{% endif %}
+}
+
+{% if GATE %}
+{% set sig = km.sigmoid(16) %}
+{{ sig.src }}
+
+// 8 tokens' gate logits of the column's heads (rows of {{ QH }} bf16) -> sigmoid(g) [token 8][head {{ QH }}] bf16
+void {{ p }}_g(const bfloat16 *__restrict g, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::vector<float, 16> v = aie::accum<accfloat, 16>(aie::load_v<16>(g)).template to_vector<float>();
+    aie::store_v(out, aie::accum<accfloat, 16>({{ sig }}(v)).template to_vector<bfloat16>());
+}
+
+{% endif %}
+// 8 tokens of the KV head's V (rows of HD bf16) -> record r of the group's V object in out: per 8 dims a panel of
+// blocks over the positions
+void {{ p }}_v(const bfloat16 *__restrict v, bfloat16 *__restrict out, int32_t r)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }} * r));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND }}; db++) {
+        const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
+        o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
+    }
+}
+
+}  // extern "C"

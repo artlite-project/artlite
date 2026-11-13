@@ -1,0 +1,36 @@
+// The Gram blocks of K panels k and Q panels q ([ib 16][hi, lo] each) on the MMUL: g = K K^T, Q K^T ([t][s] fp32); with
+// kt, the K^T panels ([ib][hi, lo] of the [i 8][t 8] blocks: I (K hi + K lo)^T exactly, then split)
+__attribute__(({{ cold }})) void {{ p }}_gram(const uint8_t *__restrict k, const uint8_t *__restrict q, float *__restrict g,
+                                            uint8_t *__restrict kt)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {
+        al::MM8 a(aie::zeros<accfloat, 64>()), b(aie::zeros<accfloat, 64>());
+        al::BIn<> ks((const bfp16ebs8 *)k), qs((const bfp16ebs8 *)q);
+        for (int ib = 0; ib < 16; ib++) {
+            const al::BV kh = ks.pop(), kl = ks.pop(), qh = qs.pop(), ql = qs.pop();
+            a.mac(kh, TR(kh));
+            b.mac(qh, TR(kh));
+            a.mac(kh, TR(kl));
+            b.mac(qh, TR(kl));
+            a.mac(kl, TR(kh));
+            b.mac(ql, TR(kh));
+        }
+        aie::store_v(g, a.to_accum().template to_vector<float>());
+        aie::store_v(g + 64, b.to_accum().template to_vector<float>());
+    }
+    if (!kt)
+        return;
+    const al::BV I = al::eye(), nI = al::neg_eye();
+    al::BIn<> ks((const bfp16ebs8 *)k);
+    uint8_t *__restrict po = kt;
+    for (int ib = 0; ib < 16; ib++) {
+        const al::BV h = ks.pop(), l = ks.pop();
+        al::MM8 t(aie::zeros<accfloat, 64>());
+        t.mac(I, TR(h));
+        t.mac(I, TR(l));
+        {{ p }}_push2(t.to_accum(), nI, po);
+        po += {{ 2 * PAN }};
+    }
+}
+

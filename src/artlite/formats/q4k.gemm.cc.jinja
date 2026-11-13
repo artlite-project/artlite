@@ -1,0 +1,159 @@
+// Q4_K: the header unit holds the per-row scale records (formats.pack_tile: per row sc lo
+// nibbles, mn lo nibbles, sc hi crumbs, mn hi crumbs, d, -dmin), permuted like the codes. ws plane
+// 0 <- A = bf16(d sc), plane 1 <- B = bf16(-dmin mn) (the decode's values), in the layout dq reads.
+{% if nsb == 8 %}
+// 2048-column tiles: record words w 0-7 sc lo, 8-15 mn lo, 16-19 sc hi, 20-23 mn hi, 24-27 d, 28-31
+// -dmin; word w of tile t is at [w/2 % 4][t {{ tq }}][w % 2][w / 8][row 16].
+#define {{ p }}_WOFF(t, w) (4 * (((((((w) & 7) >> 1) * {{ tq }} + (t)) * 2 + ((w) & 1)) * 4 + ((w) >> 3)) * 16))
+{% set outs = [0, 16, 128 * tq, 128 * tq + 16, 256 * tq, 256 * tq + 16, 384 * tq, 384 * tq + 16] %}
+{% else %}
+// 1024-column tiles: record words w 0-3 sc lo, 4-7 mn lo, 8-9 sc hi, 10-11 mn hi, 12-13 d, 14-15 -dmin
+// (16 per row). The header (16 rows x 16 words) is the upper half of a slice-sized unit read from 1 KB
+// before the tile, so row r of word w lies at memtile-permutation row 8 + r / 2, step 2 (r % 2) + w / 8:
+// the 8 even (e = 0) or odd (e = 1) rows of word w of tile t are 8 consecutive words at {{ p }}_HW(t, w, e)
+// bytes (hb = the unit's 4 k-tile slots of {{ 128 * tq }} words).
+#define {{ p }}_HW(t, w, e) (4 * ((((w) & 7) >> 1) * {{ 128 * tq }} + (t) * 128 + ((w) & 1) * 64 + (2 * (e) + ((w) >> 3)) * 16 + 8))
+{% set outs = [0, 16, 32 * tq, 32 * tq + 16, 64 * tq, 64 * tq + 16, 96 * tq, 96 * tq + 16] %}
+// 64 values of 8 rows (even, odd) -> [row 16][8] in row order (the rows' 8-element chunks interleaved)
+[[clang::always_inline]] inline aie::vector<uint8, 128> {{ p }}_rows16(const uint8_t *__restrict pe,
+                                                                      const uint8_t *__restrict po)
+{
+    auto [z0, z1] = aie::interleave_zip(aie::load_v<64>((const uint4 *)pe).unpack(),
+                                        aie::load_v<64>((const uint4 *)po).unpack(), 8);
+    return aie::concat(z0, z1);
+}
+{% if not dqb %}
+// _hdr_q4k's parts. The bytes are transposed before the arithmetic (one 8x8 shuffle per 64 values; the bf16
+// results took 12 per 128) and each crumb word serves its two super-blocks.
+// 8 even / 8 odd rows' words at pe / po (8 nibbles each) -> bytes [nibble n 8][row 16]
+[[clang::always_inline]] inline aie::vector<uint8, 128> {{ p }}_t16(const uint8_t *__restrict pe, const uint8_t *__restrict po)
+{
+    const v64uint8 e = (v64uint8)aie::load_v<64>((const uint4 *)pe).unpack();  // [row' 8][n 8]
+    const v64uint8 o = (v64uint8)aie::load_v<64>((const uint4 *)po).unpack();
+    auto [z0, z1] = aie::interleave_zip(aie::vector<uint8, 64>(::shuffle(e, T8_8x8)),
+                                        aie::vector<uint8, 64>(::shuffle(o, T8_8x8)), 1);  // [n][row' 8][e 2]
+    return aie::concat(z0, z1);
+}
+// half h (super-block parity) of the 16 rows' bf16 pairs of a scale word, tiled 4 times: lanes [4][row 16]
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_dh(const uint8_t *__restrict pe, const uint8_t *__restrict po,
+                                                                    const int h)
+{
+    auto [d0, d1] = aie::interleave_zip(aie::load_v<8>((const uint32 *)pe), aie::load_v<8>((const uint32 *)po), 1);
+    const aie::vector<bfloat16, 32> dd = aie::concat(d0, d1).template cast_to<bfloat16>();  // [row 16][half 2]
+    const aie::vector<bfloat16, 16> l = h ? aie::filter_odd(dd, 1) : aie::filter_even(dd, 1);
+    return aie::concat(l, l, l, l);
+}
+// 64 values [group 4][row 16] (lo: low nibbles, cr: crumb nibbles of the super-block pair, masked by cm: 3 (crumb
+// << 4 = 16 (cr & 3)) or 12 (4 (cr & 12))) -> o0, o1 (groups 0 1, 2 3) = bf16(d v): v = lo + 16 c on the integer
+// MAC, OR 0x4300 = the bf16 bits of 128 + v, then (128 + v) d - 128 d exact in fp32, one rounding
+[[clang::always_inline]] inline void {{ p }}_g4(const int cm, aie::vector<uint8, 64> lo, aie::vector<uint8, 64> cr,
+                                                aie::vector<bfloat16, 64> d, bfloat16 *__restrict o0,
+                                                bfloat16 *__restrict o1)
+{
+    aie::accum<acc32, 64> v = aie::mul(lo, aie::broadcast<uint8, 64>(1));
+    v = aie::mac(v, aie::bit_and(cr, aie::broadcast<uint8, 64>(cm)), aie::broadcast<uint8, 64>(cm == 3 ? 16 : 4));
+    const aie::vector<bfloat16, 64> w =
+        aie::bit_or(v.template to_vector<uint16>(), aie::broadcast<uint16, 64>(0x4300)).template cast_to<bfloat16>();
+    const aie::vector<bfloat16, 64> r =
+        aie::mac(aie::mul(d, aie::broadcast<bfloat16, 64>(-128.0f)), w, d).template to_vector<bfloat16>();
+    aie::store_v(o0, r.template extract<32>(0));
+    aie::store_v(o1, r.template extract<32>(1));
+}
+{% endif %}
+{% endif %}
+{% include "gemm/plane8" %}
+// k-tile slot kt of the Q4_K header (one {{ tq // 2 }} KB L1 object) -> hb + {{ tq // 2 }} KB kt: the records of a
+// super-block span all four slots, so _hdr_q4k expands them once the header is complete
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
+{
+    al::copy<{{ 256 * tq }}, 32>(hb + {{ 256 * tq }} * kt, b);
+}
+
+{% macro hdr_body() %}
+{% if nsb == 8 %}
+            unsigned hsh = (sb >> 2) << 1, ssh = (sb & 1) << 4;
+            bfloat16 *__restrict o = ws + (((2 * sb) & 3) * 8 + (sb >> 1)) * {{ 32 * tq }} + t * 32;
+            {{ p }}_plane8(aie::load_v<128>((const uint4 *)(b + {{ p }}_WOFF(t, sb))).unpack(),
+                           aie::load_v<128>((const uint4 *)(b + {{ p }}_WOFF(t, 16 + (sb & 3)))).unpack(),
+                           aie::load_v<16>((const uint32 *)(b + {{ p }}_WOFF(t, 24 + (sb >> 1)))), hsh, ssh, o);
+            {{ p }}_plane8(aie::load_v<128>((const uint4 *)(b + {{ p }}_WOFF(t, 8 + sb))).unpack(),
+                           aie::load_v<128>((const uint4 *)(b + {{ p }}_WOFF(t, 20 + (sb & 3)))).unpack(),
+                           aie::load_v<16>((const uint32 *)(b + {{ p }}_WOFF(t, 28 + (sb >> 1)))), hsh, ssh, o + {{ 1024 * tq }});
+{% else %}
+            // groups 8 sb .. 8 sb + 7 -> ws [group / 2][tile][group % 2][row 16]
+            unsigned hsh = (sb >> 1) << 1, ssh = (sb & 1) << 4;
+            bfloat16 *__restrict o = ws + sb * {{ 128 * tq }} + t * 32;
+            const int ws_ = 12 + (sb >> 1), wm = 14 + (sb >> 1);
+            auto [d0, d1] = aie::interleave_zip(aie::load_v<8>((const uint32 *)(b + {{ p }}_HW(t, ws_, 0))),
+                                                aie::load_v<8>((const uint32 *)(b + {{ p }}_HW(t, ws_, 1))), 1);
+            {{ p }}_plane8({{ p }}_rows16(b + {{ p }}_HW(t, sb, 0), b + {{ p }}_HW(t, sb, 1)),
+                           {{ p }}_rows16(b + {{ p }}_HW(t, 8 + (sb & 1), 0), b + {{ p }}_HW(t, 8 + (sb & 1), 1)),
+                           aie::concat(d0, d1), hsh, ssh, o);
+            auto [m0, m1] = aie::interleave_zip(aie::load_v<8>((const uint32 *)(b + {{ p }}_HW(t, wm, 0))),
+                                                aie::load_v<8>((const uint32 *)(b + {{ p }}_HW(t, wm, 1))), 1);
+            {{ p }}_plane8({{ p }}_rows16(b + {{ p }}_HW(t, 4 + sb, 0), b + {{ p }}_HW(t, 4 + sb, 1)),
+                           {{ p }}_rows16(b + {{ p }}_HW(t, 10 + (sb & 1), 0), b + {{ p }}_HW(t, 10 + (sb & 1), 1)),
+                           aie::concat(m0, m1), hsh, ssh, o + {{ 128 * tq * nsb }});
+{% endif %}
+{% endmacro %}
+{% if dqb %}
+// super-block sb's records of the 4 tiles (GemmQd expands them before the super-block's k-tiles: no
+// long pause of the dequantizing core at a K chunk's start)
+void {{ p }}_hdr_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tq }}; t++) {
+{{ hdr_body() }}
+    }
+}
+{% else %}
+void {{ p }}_hdr_q4k(const uint8_t *__restrict b, bfloat16 *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if nsb == 8 %}
+    for (int t = 0; t < {{ tq }}; t++)
+        AIE_LOOP_NO_UNROLL
+        for (int sb = 0; sb < {{ nsb }}; sb++) {
+{{ hdr_body() }}
+        }
+{% else %}
+    // per plane (A: sc, d; B: mn, -dmin) and tile: super-blocks (0, 2) on crumb word 8 (& 3, & 12), (1, 3) on word 9;
+    // d of sb in half sb % 2 of word 12 + sb / 2 (plane B: words + 4 / + 2, 4 KB / 2 KB further). 920 cycles (the
+    // per-super-block form with its transposes of the results: 2246)
+    AIE_LOOP_NO_UNROLL
+    for (int pl = 0; pl < 2; pl++) {
+        const uint8_t *__restrict bl = b + {{ 1024 * tq }} * pl;  // lo words 4 pl ..
+        const uint8_t *__restrict bc = b + {{ 512 * tq }} * pl;  // crumb / scale words 8 + 2 pl ..
+        bfloat16 *__restrict o = ws + {{ 128 * tq * nsb }} * pl;
+        AIE_LOOP_NO_UNROLL
+        for (int t = 0; t < {{ tq }}; t++) {
+{% for par in range(2) %}
+            {
+                const aie::vector<uint8, 128> c = {{ p }}_t16(bc + {{ p }}_HW(0, {{ 8 + par }}, 0), bc + {{ p }}_HW(0, {{ 8 + par }}, 1));
+{% for sb in (par, par + 2) %}
+                {
+                    const aie::vector<bfloat16, 64> d =
+                        {{ p }}_dh(bc + {{ p }}_HW(0, {{ 12 + sb // 2 }}, 0), bc + {{ p }}_HW(0, {{ 12 + sb // 2 }}, 1), {{ par }});
+                    const aie::vector<uint8, 128> l = {{ p }}_t16(bl + {{ p }}_HW(0, {{ sb }}, 0), bl + {{ p }}_HW(0, {{ sb }}, 1));
+                    {{ p }}_g4({{ 3 if sb < 2 else 12 }}, l.template extract<64>(0), c.template extract<64>(0), d, o + {{ 128 * tq * sb }},
+                               o + {{ 128 * tq * sb + 32 * tq }});
+                    {{ p }}_g4({{ 3 if sb < 2 else 12 }}, l.template extract<64>(1), c.template extract<64>(1), d, o + {{ 128 * tq * sb + 64 * tq }},
+                               o + {{ 128 * tq * sb + 96 * tq }});
+                }
+{% endfor %}
+            }
+{% endfor %}
+            bl += 512;
+            bc += 512;
+            o += 32;
+        }
+    }
+{% endif %}
+}
+{% endif %}
+
+{% include "gemm/dq_tile_major" %}

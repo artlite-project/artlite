@@ -1,14 +1,11 @@
-"""Kernel source of the decode overlay's main and helper cores (``design.DecodeOverlayOperator._render`` renders it
-with the design's constants and the metadata, flag and state words of ``decode``): per X object ``begin`` (a phase's
-metadata, a residual slice, another core's object), the input strips (``strip`` / ``strip_n``: the helper's commands;
-``nbegin``: a norm-weight object; ``psums``: a header's partial sums), ``input`` / ``inv`` (the sum panels, 1 / rms), per
-weight tile ``cmd`` / ``tile`` / ``collect`` (the main core's half, the helper's, the row epilogue: norm scale, GU and
-PLI activations, residual adds), ``emit`` (C objects), and the helper's ``htask`` (half tiles, ``hstrip`` /
-``hpstrip`` x panels, ``hinput``). The GEMV kernels themselves: ``gemv.render``."""
+{# The kernel source of the decode overlay's main and helper cores (``design.DecodeOverlayOperator`` renders it with the
+design's constants and the metadata, flag and state words of ``decode``): per X object ``begin`` (a phase's metadata, a
+residual slice, another core's object), the input strips (``strip`` / ``strip_n``: the helper's commands; ``nbegin``: a
+norm-weight object; ``psums``: a header's partial sums), ``input`` / ``inv`` (the sum panels, 1 / rms), per weight tile
+``cmd`` / ``tile`` / ``collect`` (the main core's half, the helper's, the row epilogue: norm scale, GU and PLI
+activations, residual adds), ``emit`` (C objects), and the helper's ``htask`` (half tiles, ``hstrip`` / ``hpstrip`` x
+panels, ``hinput``). The GEMV kernels themselves: ``gemv.render``. #}
 
-from ..operators.base import JINJA_ENV
-
-SRC = JINJA_ENV.from_string(r"""
 // The main core's workspace (offsets in bytes: DecodeOverlayOperator.workspace())
 #define WS(T, off) ((T *)((uint8_t *)ws + (off)))
 
@@ -1815,4 +1812,3 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 }
 
 }  // extern "C"
-""")

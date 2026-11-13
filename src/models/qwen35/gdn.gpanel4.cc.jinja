@@ -1,0 +1,51 @@
+// State panel x of the v head (its next one, in place): the block's lanes' X, Y (``xy``), U, O (``solve``; the step's lanes'
+// O kept); out (the other half's panel): when the block ends in the step its update over the 8 lanes (S + dc S + U'^T K^T),
+// then past the block's end the next block's lanes from it (8 slots: else no D object, ``gpanel0``; 4: nothing)
+__attribute__((minsize)) void {{ p }}_gpanel(bfloat16 *__restrict x, int32_t *__restrict ws, float *__restrict out)
+{
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int pj = st[{{ G_PANEL }}];
+    st[{{ G_PANEL }}] = pj + 1;
+    const int t0 = st[{{ G_NREP }}], e = t0 + st[{{ G_NS }}];
+    float *sp = (float *)(x + {{ 2 * META }});
+    float *__restrict u = GW(float, {{ g.u }}), *__restrict xy = GW(float, {{ g.xy }});
+    float *o = GW(float, {{ g.o }}) + 64 * pj;
+    const uint8_t *__restrict qp = GW(uint8_t, {{ g.qp }});
+    {{ p }}_xy(sp, GW(uint8_t, {{ g.kq }}), qp, xy);
+    {{ p }}_solve(xy, GW(float, {{ g.vt }}) + 64 * pj, GW(float, {{ g.cc }}), u, o, ~0ull << (8 * t0), e < 8 ? e : 8);  // (lanes past the step's go nowhere)
+{% if SMAX == 8 %}
+    if (e >= 8) {  // (out: the other half's, which only a block's end writes before it is read)
+{% else %}
+    if (e < 8)  // (out: the other half's, which only a block's end writes before it is read)
+        return;
+{% endif %}
+    uint8_t *__restrict up = GW(uint8_t, {{ g.xy }});
+    {{ p }}_uprep(u, GW(float, {{ g.uf }}), up);
+    {{ p }}_dupdate(sp, out, GW(bfloat16, {{ g.dc }}), GW(uint8_t, {{ g.kt }}), up, st[{{ G_ON }}]);
+    if (e > 8) {
+        {{ p }}_xy(out, GW(uint8_t, {{ g.k2 }}), qp, xy);
+        {{ p }}_solve(xy, o, GW(float, {{ g.cc }}) + 144, u, o, (1ull << (8 * (e - 8))) - 1ull, e - 8);
+    }
+{% if SMAX == 8 %}
+    }
+    if (const int nb = st[{{ G_BN }}]) {  // (a branching step's branch: its chunk of lanes 0 .. nb - 1 from the block's base, V and O
+        // in vb; its lanes' O into o's lanes past the chain's, where its slots' outputs read them)
+        float *vb = (float *)GW(uint8_t, {{ HS_OFF + HB_V }}) + 64 * pj;
+        {{ p }}_xy(sp, (const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_K }}), (const uint8_t *)GW(uint8_t, {{ HS_OFF + HB_Q }}), xy);
+        {{ p }}_solve(xy, vb, GW(float, {{ g.cc }}) + 288, u, vb, ~0ull, nb);
+        const int L = st[{{ G_BR }}] >> 8;
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < L; i++)
+            aie::store_v(o + 8 * ((e + i) & 7), aie::load_v<8>(vb + 8 * (nb - L + i)));
+    }
+{% endif %}
+}
+{% if SMAX == 8 %}
+
+// A state panel of a step that does not end its block: no D object (nothing of the other half is read before a block's end)
+void {{ p }}_gpanel0(bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    {{ p }}_gpanel(x, ws, nullptr);
+}
+{% endif %}
+

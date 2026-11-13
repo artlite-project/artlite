@@ -1,0 +1,53 @@
+// Q8_0 (GemmQd, super-block units: formats/q8.py): the weight object is a unit of the pass's {{ T8 }} row groups of 8
+// rows, [group][codes [i 8][s 4][r 8][8 B] (2048 B) | d [r 8][i 8] bf16 (128 B)] at a pitch of {{ UP }} B. _sb: per row
+// group and group i the 64-lane scale vector [r][k] = d[r][i] -> ws [group][i][64]; _dq: per panel the codes to fp32
+// (exact) times it (exact), rounded once.
+void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    const uint8_t *__restrict pb = b + 2048;
+    bfloat16 *__restrict pw = ws;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ T8 }}; t++) {
+        const aie::vector<bfloat16, 64> dd = aie::transpose(aie::load_v<64>((const bfloat16 *)pb), 8, 8);  // [i][r]
+{% for i in range(8) %}
+        aie::store_v(pw + {{ 64 * i }}, al::expand8_of(dd.template extract<32>({{ i // 4 }}), {{ i % 4 }}));
+{% endfor %}
+        pb += {{ UP }};
+        pw += 512;
+    }
+}
+
+// k-tile kt of the unit -> {{ n }} x 64 bfp16 panels in the MAC pop order [16-row block][k-step ks][8-row half]: row
+// group 2 block + half, group i = 2 kt + ks / 4, step ks % 4
+void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt{{ half_arg }})
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int8_t __aie_dm_resource_a *__restrict pq = (const int8_t __aie_dm_resource_a *)(b + 512 * kt);
+    const bfloat16 __aie_dm_resource_c *__restrict pd = (const bfloat16 __aie_dm_resource_c *)(ws + 128 * kt);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
+    // (codes: k-steps 64 B apart, then the next block 2 row groups on; scales: 4 k-steps per group, the second group, then
+    // the next block)
+    dims_2d_t wq = dims_2d_from_steps(8, 64, {{ 2 * UP }});
+    dims_3d_t wd = dims_3d_from_steps(4, 0, 2, 64, 1024);
+    for (int it = 0; it < {{ n // 2 }}; it++) {  // (16-row block, k-step) = (it / 8, it % 8)
+        const aie::vector<bfloat16, 64> D0 = aie::load_v<64>(pd), D1 = aie::load_v<64>(pd + 512);
+        out.push(aie::mul(aie::to_float<bfloat16>(aie::load_v<64>(pq)), D0).template to_vector<bfp16ebs8>());
+        out.push(aie::mul(aie::to_float<bfloat16>(aie::load_v<64>(pq + {{ UP }})), D1).template to_vector<bfp16ebs8>());
+        pq = add_2d_ptr(pq, wq);
+        pd = add_3d_ptr(pd, wd);
+    }
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}
+

@@ -11,37 +11,14 @@ from typing import ClassVar
 import numpy as np
 from ml_dtypes import bfloat16
 
-from ..operators import bfp16
+from ..operators import bfp16, templating
 from .common import Slot, TileFormat
 
 # GemmQ: no dequant (the tile-major Q4 dequant renders unused)
-_GEMM = r"""{% include "gemm/dq_tile_major" %}
-"""
+_GEMM = templating.source("artlite/formats/bf16.gemm.cc.jinja")
 
 # the decode GEMV (``decode.gemv``): the tile's panels are MMUL B operands
-_MMV = r"""// ---- BFP16 (8 rows): the panels [k8 {{ 32 * NSB }}][row 8][exp, 8 int8] (a bfp16 block per row and 8 k, formats/bf16.py);
-// core H: super-blocks {{ NSB // 2 }} H .. (k8 {{ 16 * NSB }} H ..). y[g 0] += the hi and lo rows' sums of X W^T (8 slots: its
-// rows), in fp32 (two chains: even and odd k8)
-template <int H>
-__attribute__((noinline)) void {{ p }}_bfp(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
-{
-    al::BInR<aie_dm_resource::a> xv((const bfp16ebs8 *)xp);
-    al::BInR<aie_dm_resource::b> wv((const bfp16ebs8 *)(a + {{ 16 * NSB * PANEL }} * H));
-    v64accfloat C0 = mul_8x8_8x8T(xv.pop(), 1, wv.pop(), 1);
-    v64accfloat C1 = mul_8x8_8x8T(xv.pop(), 1, wv.pop(), 1);
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int k = 1; k < {{ 8 * NSB }}; k++) {
-        C0 = mac_8x8_8x8T(xv.pop(), 1, wv.pop(), 1, C0);
-        C1 = mac_8x8_8x8T(xv.pop(), 1, wv.pop(), 1, C1);
-    }
-{% if slots == 8 %}
-    {{ p }}_yadd8(y, aie::add(aie::accum<accfloat, 64>(C0), aie::accum<accfloat, 64>(C1)));
-{% else %}
-    {{ p }}_yadd(y, aie::add(aie::accum<accfloat, 64>(C0), aie::accum<accfloat, 64>(C1)));
-{% endif %}
-}
-"""
+_MMV = templating.source("artlite/formats/bf16.mmv.cc.jinja")
 
 
 def _values(w: np.ndarray) -> np.ndarray:

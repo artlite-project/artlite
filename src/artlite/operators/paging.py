@@ -58,7 +58,8 @@ from aie.iron import PacketFlow
 from aie.iron.device import Tile
 
 from .. import txn
-from .base import JINJA_ENV, peano_tool
+from . import templating
+from .base import peano_tool
 from .checks import CORE_FRAME, MAIN_INIT_FRAME, core_frames, stack_usage
 from .fused.ctrlpkt import _parity, packets
 from .kernel_source import MARK
@@ -368,37 +369,14 @@ def cdo_values(work_dir: str) -> dict[int, int]:
     return out
 
 
-_SRC = r"""
-{% if send is not none %}
-// (paging: ``artlite.operators.paging``) a page's slots, held by the core, out through its own MM2S into its
-// TileControl; asleep until the page's last packet sets the wake lock: nothing runs in between (a write to program
-// memory loses to the core's fetch), and page code is entered only after this returns (an acquire in a jump's delay
-// slots completes after the jump's target is fetched)
-__attribute__((noinline)) void {{ p }}_pg_self() {
-  release({{ base + send }}, {{ nslots }});
-  acquire_greater_equal({{ base + wake }}, 1);
-  __builtin_aie2p_sched_barrier();
-}
-{% endif %}
-{% if request %}
-// (paging: ``artlite.operators.paging``) a page's request (hdr, ctl: a write of the page BD's id to its memtile
-// channel's start queue) out through the core's stream port; asleep until the page's last packet sets the wake lock
-__attribute__((noinline)) void {{ p }}_pg_request(int32_t hdr, int32_t ctl, int32_t bd) {
-  put_ms(hdr, 0);
-  put_ms(ctl, 0);
-  put_ms(bd, 1);
-  acquire_greater_equal({{ base + wake }}, 1);
-  __builtin_aie2p_sched_barrier();
-}
-{% endif %}
-"""
+_SRC = templating.load("artlite/operators/paging.cc.jinja")
 
 
 def source(p: str, *, wake: int, send: int | None = None, nslots: int = 2, request: bool = False) -> str:
     """The pager's kernel source under prefix ``p``: ``{p}_pg_self()`` (self-DMA: releases core lock ``send`` by
     ``nslots``, the slots' MM2S BDs' acquire) and / or ``{p}_pg_request(hdr, ctl, bd)`` (memtile); both sleep on core
     lock ``wake``."""
-    return JINJA_ENV.from_string(_SRC).render(p=p, wake=wake, send=send, nslots=nslots, request=request, base=LOCK_BASE)
+    return _SRC.render(p=p, wake=wake, send=send, nslots=nslots, request=request, base=LOCK_BASE)
 
 
 def check_pager(elf_path: str, *, pager: str, wake: int) -> None:

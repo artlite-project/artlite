@@ -1,0 +1,11 @@
+// ---- 16 entries of a 4x16 gather table (a: their addresses, lanes 0, 1 of each 4 from one table copy, 2, 3 from the
+// other) -> lanes 0 .. 15: a lane's entry lands in halfword 0 of its 64-bit output lane, T16_16x4_lo gathers those of two
+// vectors in order
+[[clang::always_inline]] inline v16int16 {{ p }}_g16(v16int32 a)
+{
+    const v8int32 a0 = extract_v8int32(a, 0), a1 = extract_v8int32(a, 1);
+    const v16int32 c0 = concat(load_4x16_lo(a0), load_4x16_hi(a0));
+    const v16int32 c1 = concat(load_4x16_lo(a1), load_4x16_hi(a1));
+    return extract_v16int16((v32int16)::shuffle(c0, c1, T16_16x4_lo), 0);
+}
+

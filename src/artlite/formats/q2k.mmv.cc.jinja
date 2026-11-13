@@ -1,0 +1,102 @@
+// ---- Q2_K ({{ R2 }} rows, {{ G2 }} row groups; row groups past R: junk): header words [sb][sc h 0, sc h 1, mn h 0, mn h 1]
+// (nibble s: sub-block 8 h + s) | [sb] d | dmin | codes [sb][word j 16] (word j = sub-block j: nibble b = c(16 j + b) +
+// 4 c(16 j + 8 + b)), word-major. Core H: super-blocks 2 H, 2 H + 1 (the K-quants' split); per super-block u the integer
+// scales and the offsets (_tab: y = d (sum c sc + 2 XS16 sc) - dmin XS16 mn, the offsets' sums on the MMUL), the
+// sub-block sums c (_mm: the codes centered, q - 2; every row group per sub-block: independent chains), then d (sum c sc
+// + 2 XS16 sc) (_k23sc). Scratch: hw [sc / mn 8 | d 2][128 B] (1280 B) | sct [g 4][j 16][r] | yu [g 4][32] fp32 | dg
+// [g 4][r] | c [j 16][g 4][32]
+
+// Super-block u: its integer scales sc (I against the rows' nibbles: [j][r]) -> sct [g][j][r], d -> dg, yu[g] = 2 XS16 sc
+// (fp32, the hi and lo rows summed), y[g] += hilo(XS16 mn) (-dmin) (xs16: the super-block's 16-k sum panels)
+__attribute__((noinline)) void {{ p }}_q2k_tab(const uint8_t *__restrict hw, const uint8_t *__restrict xs16,
+                                               bfloat16 *__restrict sct, float *__restrict yu, bfloat16 *__restrict dg,
+                                               float *__restrict y, int u)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const v64bfp16ebs8 I = al::eye();
+    al::BIn<> xsp((const bfp16ebs8 *)xs16);
+    const v64bfp16ebs8 X0 = xsp.pop(), X1 = xsp.pop();
+    const uint8_t __aie_dm_resource_a *ps = (const uint8_t __aie_dm_resource_a *)(hw + 512 * u);
+    const uint8_t __aie_dm_resource_b *pd = (const uint8_t __aie_dm_resource_b *)(hw + 1024 + 128 * u);
+    bfloat16 *__restrict pt = sct, *__restrict pg = dg;
+    float *__restrict pu = yu, *__restrict py = y;
+    v64bfp16ebs8 S0, S1, M0, M1;
+    S0.exponent = S1.exponent = M0.exponent = M1.exponent = al::e8(0x85);
+    AIE_LOOP_NO_UNROLL  // (pointers walked: recomputed ones chained the y store to the next group's loads, RecMII 39)
+    for (int g = 0; g < 4; g++) {
+        S0.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_a *)ps);
+        S1.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_a *)(ps + 128));
+        M0.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_a *)(ps + 256));
+        M1.mantissa = (v64int8)unpack(*(const v64uint4 __aie_dm_resource_a *)(ps + 384));
+        ps += 32;
+        const aie::vector<bfloat16, 16> dm = aie::load_v<16>((const bfloat16 __aie_dm_resource_b *)pd);  // [row 8][d, dmin]
+        pd += 32;
+        aie::store_v(pg, aie::filter_even(dm, 1));
+        pg += 8;
+        aie::store_v(pt, aie::accum<accfloat, 64>(mul_8x8_8x8T(I, 1, S0, 0)).template to_vector<bfloat16>());
+        aie::store_v(pt + 64, aie::accum<accfloat, 64>(mul_8x8_8x8T(I, 1, S1, 0)).template to_vector<bfloat16>());
+        pt += 128;
+        const aie::vector<float, 64> ms = aie::accum<accfloat, 64>(mac_8x8_8x8T(X1, 1, S1, 0, mul_8x8_8x8T(X0, 1, S0, 0))).template to_vector<float>();
+        const aie::vector<float, 32> m2 = aie::add(ms.template extract<32>(0), ms.template extract<32>(1));
+        aie::store_v(pu, aie::add(m2, m2));
+        pu += 32;
+        const aie::vector<bfloat16, 64> Dm = aie::mul(aie::filter_odd(dm, 1).template grow_replicate<64>(), aie::broadcast<bfloat16, 64>(-1.0f)).template to_vector<bfloat16>();
+        {{ p }}_yadd(py, {{ p }}_mo(mac_8x8_8x8T(X1, 1, M1, 0, mul_8x8_8x8T(X0, 1, M0, 0)), Dm, aie::zeros<accfloat, 64>()));
+        py += 32;
+    }
+}
+
+// c_j,g = bf16(C[hi rows] + C[lo rows]) -> c [j][g 4][32] for the 16 sub-blocks j of a super-block, every row group:
+// C = x(2 j) (w & 3 - 2) + x(2 j + 1) ((w & 12) / 4 - 2) (w: word j's row group, realigned from the tile: o the super-block's
+// first word; xp: its 32 panels; the -2: x against a constant panel, once per sub-block for the four groups); the panels'
+// exponents set outside the loop (a code panel: one vband)
+__attribute__((noinline)) void {{ p }}_q2k_mm(const uint8_t *__restrict xp, const uint8_t *w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const v64uint8 m3 = broadcast_to_v64uint8((unsigned char)3), m12 = broadcast_to_v64uint8((unsigned char)12);
+    v64bfp16ebs8 N2, A0, A1, A2, A3, B0, B1, B2, B3;  // (the zero point, the codes & 3, the codes & 12 per row group)
+    N2.mantissa = broadcast_to_v64int8(-2);
+    N2.exponent = al::e8(0x85);
+    A0.exponent = A1.exponent = A2.exponent = A3.exponent = al::e8(0x85);
+    B0.exponent = B1.exponent = B2.exponent = B3.exponent = al::e8(0x83);
+    uintptr_t o = (uintptr_t)w;
+    bfloat16 *__restrict pc = c;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int s = 0; s < 16; s++) {
+        const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop();
+        v16int32 lo, hi;
+        {{ p }}_k23w2(o, {{ 4 * R2 }}, lo, hi);
+        const v64accfloat Z = mac_8x8_8x8T(x1, 1, N2, 1, mul_8x8_8x8T(x0, 1, N2, 1));
+{% for g in range(4) %}
+        {
+            const v64uint8 q = unpack(extract_v64uint4((v128uint4){{ "lo" if g < 2 else "hi" }}, {{ g % 2 }}));
+            A{{ g }}.mantissa = (v64int8)band(q, m3);
+            B{{ g }}.mantissa = (v64int8)band(q, m12);
+            aie::store_v(pc + {{ 32 * g }}, {{ p }}_sum2(mac_8x8_8x8T(x1, 1, B{{ g }}, 0, mac_8x8_8x8T(x0, 1, A{{ g }}, 0, Z))));
+        }
+{% endfor %}
+        o += {{ 4 * R2 }};
+        pc += 128;
+    }
+}
+
+// super-blocks 2 H, 2 H + 1 of a Q2_K tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels)
+template <int H>
+__attribute__((noinline)) void {{ p }}_q2k(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+{
+    uint8_t *hw = scr;
+    bfloat16 *sct = (bfloat16 *)(scr + 1280), *dg = (bfloat16 *)(scr + 2816), *c = (bfloat16 *)(scr + 2880);
+    float *yu = (float *)(scr + 2304);
+    {{ p }}_k23al(a + {{ 4 * R2 * 8 }} * H, hw, 8, {{ 4 * R2 }});  // (sc / mn of the two)
+    {{ p }}_k23al(a + {{ 4 * R2 * 16 }} + {{ 4 * R2 * 2 }} * H, hw + 1024, 2, {{ 4 * R2 }});  // (d | dmin)
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        const uint8_t *xs16 = xs + {{ XS_SLOT }} * (2 + 2 * H + u);
+        const uint8_t *w = a + {{ 4 * R2 * NW2 }} + {{ 4 * R2 * 16 }} * (2 * H + u);
+        {{ p }}_q2k_tab(hw, xs16, sct, yu, dg, y, u);
+        {{ p }}_q2k_mm(xp + {{ 32 * PANEL }} * u, w, c);
+        {{ p }}_k23sc(c, sct, yu, dg, y);
+    }
+}

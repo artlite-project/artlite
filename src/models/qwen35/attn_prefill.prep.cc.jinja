@@ -1,0 +1,169 @@
+
+// The prep cores' workspace (bytes): nrm [q_norm | k_norm] fp32, row (256 fp32), stage [db 32][row 8][8] fp32
+#define PW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+{% set sigmoid = km.table_pass(km.SIGMOID) %}
+{{ sigmoid.src }}
+
+namespace {
+
+// x (256 bf16) -> row = x / rms(x) w (fp32), dims 0 .. 63 rotated by cs [cos 32 | sin 32] (NeoX pairs i, i + 32)
+__attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
+                                          const float *__restrict cs, float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < {{ HD }}; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    const aie::vector<float, 64> iv = aie::broadcast<float, 64>(inv);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<float, 64> xf = aie::accum<accfloat, 64>(aie::load_v<64>(x + i)).template to_vector<float>();
+        aie::store_v(row + i, al::mulff<64>(al::mulff<64>(xf, iv), aie::load_v<64>(w + i)));
+    }
+    const aie::vector<float, 32> a = aie::load_v<32>(row), b = aie::load_v<32>(row + 32);
+    const aie::vector<float, 32> c = aie::load_v<32>(cs), s = aie::load_v<32>(cs + 32);
+    aie::store_v(row, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
+    aie::store_v(row + 32, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
+}
+
+// row (256 fp32) -> row r of the stage [db][r][8]
+__attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
+{
+    float *__restrict d = st + 8 * r;
+    for (int db = 0; db < {{ ND }}; db++) {
+        aie::store_v(d, aie::load_v<8>(row));
+        row += 8;
+        d += 64;
+    }
+}
+
+// stage -> per d-block the hi panel, then the lo panel (a panel: the 8 rows' blocks of 8 dims; Q and the K records:
+// one stream for the attention's MMUL)
+__attribute__((noinline)) void {{ p }}_hiloi(const float *__restrict st, uint8_t *__restrict out)
+{
+    const al::BV nI = al::neg_eye();
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+        o.push(h);
+        o.push(l);
+        st += 64;
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+// The first object: q_norm, k_norm (256 fp32 each); q_norm times the scores' scale log2(e) / 16 (the rotation is
+// linear: the scale before it)
+void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::copy<{{ 2 * HD }}, 16>(PW(float, {{ w.nrm }}), (const float *)n);
+    for (int i = 0; i < {{ HD }}; i += 64)
+        aie::store_v(PW(float, {{ w.nrm }}) + i, al::mul_hilo<64, {{ qs[0] }}f, {{ qs[1] }}f>(aie::load_v<64>(PW(float, {{ w.nrm }}) + i)));
+}
+
+// 8 tokens of a q head: q (rows [q 256 | gate 256] bf16), cs (8 x [cos 32 | sin 32] fp32) -> out: per d-block the
+// Q panels hi, lo of q / rms(q) q_norm log2(e) / 16, rotated
+void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr(q + {{ 2 * HD }} * r, PW(float, {{ w.nrm }}), cs + 64 * r, row);
+        {{ p }}_scatter(row, st, r);
+    }
+    {{ p }}_hiloi(st, (uint8_t *)out);
+}
+
+// sigmoid(gate) of the 8 tokens in the panel order of the attention's output: per 8 dims db a block [query 8][8] and 8
+// zeros (72 values: the slot's layout of a Q panel pair), sg. The gates clamped to the table's range into the stage
+// (bf16 [8][256]), the table pass in place (kmath.SIGMOID: within 0.54 bf16 ULP), then the blocks
+void {{ p }}_sg(const bfloat16 *__restrict q, float *__restrict ws, bfloat16 *__restrict sg)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ tmax }}f), lo = aie::broadcast<bfloat16, 32>(-{{ tmax }}f);
+    bfloat16 *__restrict st = (bfloat16 *)PW(float, {{ w.stage }});
+    const bfloat16 *__restrict g = q + {{ HD }};
+    bfloat16 *__restrict t = st;
+    for (int r = 0; r < 8; r++) {
+        for (int i = 0; i < {{ HD }}; i += 32)
+            aie::store_v(t + i, aie::min(aie::max(aie::load_v<32>(g + i), lo), hi));
+        g += {{ 2 * HD }};
+        t += {{ HD }};
+    }
+    {{ sigmoid }}<{{ 8 * HD }}>(st, st, st, st);
+    const bfloat16 *__restrict ps = st;
+    bfloat16 *__restrict po = sg;
+    for (int db = 0; db < {{ ND }}; db++) {
+        AIE_LOOP_UNROLL_FULL
+        for (int r = 0; r < 8; r++)
+            aie::store_v(po + 8 * r, aie::load_v<8>(ps + {{ HD }} * r));
+        aie::store_v(po + 64, aie::zeros<bfloat16, 8>());
+        ps += 8;
+        po += 72;
+    }
+}
+
+// 8 tokens of a KV head's K (rows [half 0 | half 1] bf16), cs -> record ``half`` of a pair of cache records ([d-block][record
+// 2], out): the first's panels into the workspace, then per d-block the first's and the second's
+void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out,
+               int32_t half)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    const float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr(k + {{ HD }} * r, PW(float, {{ w.nrm }}) + {{ HD }}, cs + 64 * r, row);
+        {{ p }}_scatter(row, PW(float, {{ w.stage }}), r);
+    }
+    if (!half) {
+        al::BOut<> o((bfp16ebs8 *)PW(uint8_t, {{ w.kf }}));
+        for (int db = 0; db < {{ ND }}; db++)
+            o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st + 64 * db)).template to_vector<bfp16ebs8>());
+        return;
+    }
+    al::BIn<> a((const bfp16ebs8 *)PW(uint8_t, {{ w.kf }}));
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(a.pop());
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st + 64 * db)).template to_vector<bfp16ebs8>());
+    }
+}
+
+// The V panel of d-block db of 8 tokens' rows (bf16): per dim of the 8 a block over the positions
+[[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
+{
+    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
+    return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
+}
+
+// 8 tokens of a KV head's V (rows bf16) -> record ``half`` of a pair of cache records ([d-block][record 2], out): the
+// first's panels into the workspace, then per d-block the first's and the second's
+void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, float *__restrict ws,
+               bfloat16 *__restrict out, int32_t half)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    if (!half) {
+        al::BOut<> o((bfp16ebs8 *)ws);
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int db = 0; db < {{ ND }}; db++)
+            o.push({{ p }}_vpan(v, db));
+        return;
+    }
+    al::BIn<> a((const bfp16ebs8 *)ws);
+    al::BOut<> o((bfp16ebs8 *)out);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(a.pop());
+        o.push({{ p }}_vpan(v, db));
+    }
+}
+
+}  // extern "C"

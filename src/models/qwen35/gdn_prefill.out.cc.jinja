@@ -1,0 +1,107 @@
+
+namespace {
+{% set silu = km.act(km.SILU) %}
+{{ silu.src }}
+}  // namespace
+
+extern "C" {
+
+// The first object: ssm_norm (128 fp32)
+void {{ p }}_norm(const bfloat16 *__restrict a, float *__restrict ws)
+{
+    al::copy<{{ D }}, 32>(ws, (const float *)a);
+}
+
+// 1 / rms of the 16 (token, head) rows of o -> ivt [16][hi 32 | lo 32] (bf16)
+[[clang::always_inline]] inline void {{ p }}_rms16(const bfloat16 *__restrict o, bfloat16 *__restrict ivt)
+{
+    const bfloat16 *__restrict po = o;
+    bfloat16 *__restrict pv = ivt;
+    AIE_LOOP_NO_UNROLL
+    for (int th = 0; th < 16; th++) {
+        aie::accum<accfloat, 32> ss = aie::zeros<accfloat, 32>();
+        AIE_LOOP_UNROLL_FULL
+        for (int i = 0; i < {{ D }}; i += 32)
+            ss = aie::mac_square(ss, aie::load_v<32>(po + i));
+        aie::vector<bfloat16, 32> h, l;
+        al::bf16_hilo<32>(al::inv_rms<{{ D }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f), h, l);
+        aie::store_v(pv, h);
+        aie::store_v(pv + 32, l);
+        po += {{ D }};
+        pv += 64;
+    }
+}
+
+// y = mulff(mulff(o, 1 / rms), w) silu(z), term by term: o and silu(z) are bf16 (their lo parts 0), the weight's and
+// 1 / rms's hi / lo from tables (nwt [4][hi 32 | lo 32]); distinct restrict parameters (the tables and y share a
+// workspace: as pointers into it the loop would carry a store -> load dependence, RecMII = its 48-bundle body)
+[[clang::always_inline]] inline void {{ p }}_rmsw(const bfloat16 *__restrict o_, const bfloat16 *__restrict zs_,
+                                                  const bfloat16 *__restrict ivt_, const bfloat16 *__restrict nwt_,
+                                                  float *__restrict y)
+{
+    const bfloat16 __aie_dm_resource_a *__restrict po = (const bfloat16 __aie_dm_resource_a *)o_;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)zs_;
+    const bfloat16 __aie_dm_resource_c *__restrict piv = (const bfloat16 __aie_dm_resource_c *)ivt_;
+    const bfloat16 __aie_dm_resource_d *__restrict pn = (const bfloat16 __aie_dm_resource_d *)nwt_;
+    float *__restrict py = y;
+    dims_2d_t div = dims_2d_from_steps({{ D // 32 }}, 0, 64);  // (a row's 1 / rms for its blocks)
+    dims_2d_t dnw = dims_2d_from_steps({{ D // 32 }}, 64, 0);  // (the weight's blocks, again per row)
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < {{ 16 * D // 32 }}; j++) {
+        const aie::vector<bfloat16, 32> ov = aie::load_v<32>(po), sv = aie::load_v<32>(ps);
+        const aie::vector<float, 32> v1 =
+            aie::mac(aie::mul(ov, aie::load_v<32>(piv)), ov, aie::load_v<32>(piv + 32)).template to_vector<float>();
+        const aie::vector<bfloat16, 32> v1h = aie::accum<accfloat, 32>(v1).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> v1l =
+            aie::accum<accfloat, 32>(aie::sub(v1, aie::accum<accfloat, 32>(v1h).template to_vector<float>())).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> wh = aie::load_v<32>(pn), wl = aie::load_v<32>(pn + 32);
+        const aie::vector<float, 32> v2 = aie::mac(aie::mac(aie::mul(v1h, wh), v1h, wl), v1l, wh).template to_vector<float>();
+        const aie::vector<bfloat16, 32> v2h = aie::accum<accfloat, 32>(v2).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> v2l =
+            aie::accum<accfloat, 32>(aie::sub(v2, aie::accum<accfloat, 32>(v2h).template to_vector<float>())).template to_vector<bfloat16>();
+        aie::store_v(py, aie::mac(aie::mul(v2h, sv), v2l, sv).template to_vector<float>());
+        po += 32;
+        ps += 32;
+        py += 32;
+        piv = add_2d_ptr(piv, div);
+        pn = add_2d_ptr(pn, dnw);
+    }
+}
+
+// 8 tokens of a pair of v heads: u = [o | z] ([8][2 x 128] each) -> rms(o) ssm_norm silu(z) as 32 bfp16 panels (8
+// tokens x 8 dims) (4565 cycles: the rows' 1 / rms first, then one pipelined loop, II 14 per 32; per-row loops,
+// unpipelined: 7713)
+void {{ p }}_pair(const bfloat16 *__restrict u, float *__restrict ws, bfloat16 *__restrict out)
+{
+    const bfloat16 *__restrict o = u;
+    const bfloat16 *__restrict z = u + {{ OBJ }};
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict nw = ws;
+    float *__restrict y = ws + {{ D }};  // [8][256]
+    bfloat16 *__restrict zs = (bfloat16 *)(ws + {{ D + 8 * 256 }});  // silu(z) [8][256]
+    bfloat16 *__restrict ivt = (bfloat16 *)(ws + {{ D + 8 * 256 + 4 * 256 }});  // [16][hi 32 | lo 32]
+    bfloat16 *__restrict nwt = ivt + 1024;  // [{{ D // 32 }}][hi 32 | lo 32]
+    {{ silu }}<{{ OBJ }}>(z, zs);
+    for (int i = 0; i < {{ D // 32 }}; i++) {
+        const aie::vector<float, 32> w = aie::load_v<32>(nw + 32 * i);
+        const aie::vector<bfloat16, 32> h = aie::accum<accfloat, 32>(w).template to_vector<bfloat16>();
+        aie::store_v(nwt + 64 * i, h);
+        aie::store_v(nwt + 64 * i + 32,
+                     aie::accum<accfloat, 32>(aie::sub(w, aie::accum<accfloat, 32>(h).template to_vector<float>())).template to_vector<bfloat16>());
+    }
+    {{ p }}_rms16(o, ivt);
+    {{ p }}_rmsw(o, zs, ivt, nwt, y);
+    al::BOut<> pb((bfp16ebs8 *)out);
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < 32; kb++) {
+        const float *__restrict py = y + 8 * kb;
+        const aie::vector<float, 64> v = aie::concat(
+            aie::concat(aie::concat(aie::load_v<8>(py), aie::load_v<8>(py + 256)),
+                        aie::concat(aie::load_v<8>(py + 512), aie::load_v<8>(py + 768))),
+            aie::concat(aie::concat(aie::load_v<8>(py + 1024), aie::load_v<8>(py + 1280)),
+                        aie::concat(aie::load_v<8>(py + 1536), aie::load_v<8>(py + 1792))));
+        pb.push(aie::accum<accfloat, 64>(v).template to_vector<bfp16ebs8>());
+    }
+}
+
+}  // extern "C"

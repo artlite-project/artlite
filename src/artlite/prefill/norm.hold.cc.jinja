@@ -1,0 +1,90 @@
+
+namespace {
+// st: ss[4][32] -> inv_hi[64] | inv_lo[64] at st + 128 (bf16, lane 32 h + 8 t + e = token t's 1 / rms)
+__attribute__((noinline)) void {{ p }}_inv(float *__restrict st)
+{
+    aie::vector<float, 64> p = aie::zeros<float, 64>();  // lane 8 t + e: token t's 32 sums folded to 8
+    AIE_LOOP_UNROLL_FULL
+    for (int t = 0; t < {{ G }}; t++) {
+        const aie::vector<float, 32> v = aie::load_v<32>(st + 32 * t);
+        const aie::vector<float, 16> h = aie::add(v.template extract<16>(0), v.template extract<16>(1));
+        p.insert(t, aie::add(h.template extract<8>(0), h.template extract<8>(1)));
+    }
+    const aie::vector<float, 16> s = al::group8<false>(p).template grow<16>();
+    const aie::vector<float, 32> v = al::rows4(al::inv_rms<{{ E }}, {{ G }}>(s, {{ eps }}f));
+    aie::vector<bfloat16, 64> hi, lo;
+    al::split2<64>(aie::concat(v, v), hi, lo);
+    aie::store_v((bfloat16 *)(st + 128), hi);
+    aie::store_v((bfloat16 *)(st + 128) + 64, lo);
+}
+}  // namespace
+
+extern "C" {
+
+// the weight object j (w[{{ G * C }} j ..]) -> w
+void {{ p }}_w(const bfloat16 *__restrict in, bfloat16 *__restrict w, int32_t j)
+{
+    al::copy<{{ G * C }}, 32>(w + {{ G * C }} * j, in);
+}
+
+// pass A, chunk kc of a group: v = x + d1 + .. + d{{ nd }} (summed in fp32, rounded once) -> the group's v[t][C kc ..]
+// and xo (x_out); ss[t][32 lanes] += squares
+void {{ p }}_a(const bfloat16 *__restrict x, const bfloat16 *__restrict d, bfloat16 *__restrict v,
+               bfloat16 *__restrict xo, float *__restrict ss, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    for (int t = 0; t < {{ G }}; t++) {
+        const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)(x + {{ C }} * t);
+        const bfloat16 __aie_dm_resource_b *__restrict pd = (const bfloat16 __aie_dm_resource_b *)(d + {{ C }} * t);
+        bfloat16 *__restrict pv = v + {{ E }} * t + {{ C }} * kc;
+        bfloat16 *__restrict po = xo + {{ C }} * t;
+        aie::accum<accfloat, 32> acc(aie::load_v<32>(ss + 32 * t));
+        if (kc == 0)
+            acc = aie::zeros<accfloat, 32>();
+        for (int j = 0; j < {{ C // 32 }}; j++) {
+            aie::accum<accfloat, 32> s(aie::load_v<32>(px));
+{% for i in range(nd) %}
+            s = aie::mac(s, aie::load_v<32>(pd + {{ G * C * i }}), one);
+{% endfor %}
+            const aie::vector<bfloat16, 32> u = s.template to_vector<bfloat16>();
+            aie::store_v(pv, u);
+            aie::store_v(po, u);
+            acc = aie::mac_square(acc, u);
+            px += 32;
+            pd += 32;
+            pv += 32;
+            po += 32;
+        }
+        aie::store_v(ss + 32 * t, acc.template to_vector<float>());
+    }
+}
+
+// pass B, chunk kc: the group's half panels (4 tokens x 8 columns, 36 B) of v w (1 / rms) as bfp16ebs8, two per
+// 64-lane vector (lanes 32 h + 8 t + e: column block 2 kb + h)
+void {{ p }}_b(const bfloat16 *__restrict v, const bfloat16 *__restrict w, float *__restrict st,
+               bfloat16 *__restrict out, int32_t kc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *__restrict ih = (bfloat16 *)(st + 128);
+    bfloat16 *__restrict il = ih + 64;
+    if (kc == 0)
+        {{ p }}_inv(st);
+    const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
+    const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    const bfloat16 *__restrict pv = v + {{ C }} * kc;
+    const bfloat16 *__restrict pw = w + {{ C }} * kc;
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ C // 16 }}; kb++) {
+        aie::vector<bfloat16, 64> xp = aie::concat(al::gather<4, 8>(pv, {{ E }}), al::gather<4, 8>(pv + 8, {{ E }}));
+        const aie::vector<bfloat16, 64> wr = aie::concat(aie::load_v<8>(pw).template grow_replicate<32>(),
+                                                         aie::load_v<8>(pw + 8).template grow_replicate<32>());
+        aie::vector<bfloat16, 64> xw = aie::mul(xp, wr).template to_vector<bfloat16>();
+        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        pv += 16;
+        pw += 16;
+    }
+}
+
+}  // extern "C"

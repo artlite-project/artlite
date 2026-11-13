@@ -1,0 +1,431 @@
+
+// The attention core (``dflash_core``'s docstring). Offsets in bytes: DFlashShape.workspace(); AP: a region whose address is in
+// state word w (DFlashShape.ext: in the main core's memory)
+{% include "models/qwen35/dflash_core.common.cc.jinja" %}
+
+namespace {
+
+// x (256 bf16 stride 128) -> fp32 out = x / rms(x) w, then the NeoX rotation of all HD dims (cs, sn: 64 fp32 each)
+__attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
+                                                 const float *__restrict cs, const float *__restrict sn,
+                                                 float *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
+    ss = aie::mac_square(ss, aie::load_v<64>(x + 64));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, 32> ih, il;  // (x is bf16: x / rms = x ih + x il, mulff's products less x's lo part, 0)
+    al::split2<32>(aie::broadcast<float, 32>(inv), ih, il);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ HD }}; i += 32) {
+        const aie::vector<bfloat16, 32> xb = aie::load_v<32>(x + i);
+        aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>(), aie::load_v<32>(w + i)));
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
+        const aie::vector<float, 32> a = aie::load_v<32>(out + i), b = aie::load_v<32>(out + {{ HD // 2 }} + i);
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(sn + i);
+        aie::store_v(out + i, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
+        aie::store_v(out + {{ HD // 2 }} + i, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
+    }
+}
+
+// Scores of a pair of K records ([d-block][record 2]) against two octets (their rows' Q panels, [d-block][octet 2]), from the rows'
+// baselines mb ([octet][set 2][b 32 | 1 / l 32]): so[256 o + 128 h + 32 r + j] = s + b (log2 units; set h, record r of the pair
+// at ``at``), every K panel popped once for the octets
+__attribute__((noinline)) void {{ p }}_qk1(const uint8_t *__restrict k, const uint8_t *__restrict qa, const float *__restrict mb,
+                                           float *__restrict so, int at)
+{
+    al::MM8 a[2], b[2];
+    AIE_LOOP_UNROLL_FULL
+    for (int o = 0; o < 2; o++) {
+        const aie::accum<accfloat, 64> c(aie::concat(aie::load_v<32>(mb + 128 * o), aie::load_v<32>(mb + 128 * o + 64)));
+        a[o] = al::MM8(c);
+        b[o] = al::MM8(c);
+    }
+    al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+    al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)qa);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int d = 0; d < {{ ND }}; d++) {
+        const al::BV K0 = ks.pop(), K1 = ks.pop();
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < 2; o++) {
+            const al::BV Q = qs.pop();
+            a[o].mac(Q, aie::op_transpose(K0));
+            b[o].mac(Q, aie::op_transpose(K1));
+        }
+    }
+    AIE_LOOP_UNROLL_FULL
+    for (int o = 0; o < 2; o++) {
+        const aie::vector<float, 64> x = a[o].to_accum().template to_vector<float>(), z = b[o].to_accum().template to_vector<float>();
+        aie::store_v(so + 256 * o + at, x.template extract<32>(0));
+        aie::store_v(so + 256 * o + 128 + at, x.template extract<32>(1));
+        aie::store_v(so + 256 * o + at + 32, z.template extract<32>(0));
+        aie::store_v(so + 256 * o + 160 + at, z.template extract<32>(1));
+    }
+}
+
+{# P's 2^x in two steps (bias 192; masked scores -16384) #}
+{% set e192 = km.exp2(32, bias=192, below="bounded", above="clamp") %}
+{{ e192.parts.reduce.src }}
+{{ e192.parts.poly.src }}
+
+{% include "models/qwen35/attn.pv4.cc.jinja" %}
+// y += P V of the 4 octets (two calls) of pairs v, vb and their P panels (pp: [octet 4][P 4])
+__attribute__((noinline)) void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp, float *__restrict y)
+{
+    {{ p }}_pv4<2>(v, vb, pp, (const float __aie_dm_resource_c *)y, (float __aie_dm_resource_d *)y);
+    {{ p }}_pv4<2>(v, vb, pp + {{ 2 * PO }}, (const float __aie_dm_resource_c *)(y + {{ 128 * (ND + 1) }}),
+                   (float __aie_dm_resource_d *)(y + {{ 128 * (ND + 1) }}));
+}
+
+// P = 2^(s - m) of 4 records' scores of the 4 octets: P panels at pp, l += P (two passes: each pipelined)
+template <int N>
+__attribute__((noinline)) void {{ p }}_pexp1(float *__restrict s)
+{
+    AIE_LOOP_UNROLL(2)
+    for (int t = 0; t < N; t++) {
+        aie::accum<accfloat, 32> A(aie::load_v<32>(s));
+        aie::vector<bfloat16, 32> P, f;
+        {{ e192.parts.reduce }}(A, P, f);
+        aie::store_v((bfloat16 *)s, P);
+        aie::store_v((bfloat16 *)(s + 16), f);
+        s += 32;
+    }
+}
+
+template <int N>
+__attribute__((noinline)) void {{ p }}_pexp2(const bfloat16 *__restrict p0, const bfloat16 *__restrict p1, float *__restrict l, uint8_t *__restrict pp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BOut<> po((bfp16ebs8 *)pp);
+    aie::accum<accfloat, 32> l0(aie::load_v<32>(l)), l1(aie::load_v<32>(l + {{ 32 * (ND + 1) }}));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < N; t++) {
+        const aie::accum<accfloat, 32> r0 = {{ e192.parts.poly }}(aie::load_v<32>(p0), aie::load_v<32>(p0 + 32));
+        const aie::accum<accfloat, 32> r1 = {{ e192.parts.poly }}(aie::load_v<32>(p1), aie::load_v<32>(p1 + 32));
+        l0 = aie::add(l0, r0);
+        l1 = aie::add(l1, r1);
+        po.push(aie::concat(r0, r1).template to_vector<bfp16ebs8>());
+        p0 += 64;
+        p1 += 64;
+    }
+    aie::store_v(l, l0.template to_vector<float>());
+    aie::store_v(l + {{ 32 * (ND + 1) }}, l1.template to_vector<float>());
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_soft4(int32_t *__restrict ws, uint8_t *__restrict pp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict sc = AW(float, {{ a.sc }});
+    float *__restrict y = AW(float, {{ a.y }}) + {{ 32 * ND }};
+    AIE_LOOP_NO_UNROLL
+    for (int o = 0; o < {{ QC }}; o++) {
+        {{ p }}_pexp1<8>(sc);
+        {{ p }}_pexp2<4>((const bfloat16 *)sc, (const bfloat16 *)(sc + 128), y, pp);
+        sc += 256;
+        y += {{ 64 * (ND + 1) }};
+        pp += {{ PO }};
+    }
+}
+
+{% include "models/qwen35/attn.qpan.cc.jinja" %}
+// A row's K (HD fp32) into its row of the open rows ([d-block][position 8][8] bf16: dst its first values)
+__attribute__((noinline)) void {{ p }}_krow(const float *__restrict k, bfloat16 *__restrict dst)
+{
+    for (int db = 0; db < {{ ND }}; db += 4) {
+        const aie::vector<bfloat16, 32> b = aie::accum<accfloat, 32>(aie::load_v<32>(k + 8 * db)).template to_vector<bfloat16>();
+        aie::store_v(dst + 64 * db, b.template extract<8>(0));
+        aie::store_v(dst + 64 * db + 64, b.template extract<8>(1));
+        aie::store_v(dst + 64 * db + 128, b.template extract<8>(2));
+        aie::store_v(dst + 64 * db + 192, b.template extract<8>(3));
+    }
+}
+
+// A record's rows -> its K, V panels ([d-block], as ``kpair`` and ``vpair`` hold them)
+__attribute__((noinline, minsize)) void {{ p }}_krec(const bfloat16 *__restrict r, uint8_t *__restrict out)
+{
+    al::BOut<> po((bfp16ebs8 *)out);
+    AIE_LOOP_NO_UNROLL
+    for (int db = 0; db < {{ ND }}; db++)
+        po.push(aie::accum<accfloat, 64>(aie::load_v<64>(r + 64 * db)).template to_vector<bfp16ebs8>());
+}
+
+// Records' rows ([d-block][position 8][8] bf16) -> K panels [d-block][record 2] (a block per position's 8 dims)
+__attribute__((noinline)) void {{ p }}_kpair(const bfloat16 *__restrict r0, const bfloat16 *__restrict r1, uint8_t *__restrict out)
+{
+    al::BOut<> po((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        po.push(aie::accum<accfloat, 64>(aie::load_v<64>(r0 + 64 * db)).template to_vector<bfp16ebs8>());
+        po.push(aie::accum<accfloat, 64>(aie::load_v<64>(r1 + 64 * db)).template to_vector<bfp16ebs8>());
+    }
+}
+
+// Records' rows, those from position n0 / n1 on as zeros -> V panels [d-block][record 2] (a block per dim over the positions)
+__attribute__((noinline)) void {{ p }}_vpair(const bfloat16 *__restrict r0, const bfloat16 *__restrict r1, uint8_t *__restrict out, int n0, int n1)
+{
+    al::BOut<> po((bfp16ebs8 *)out);
+    const aie::mask<64> k0 = aie::mask<64>::from_uint64(n0 < 8 ? (1ull << (8 * n0)) - 1 : ~0ull);
+    const aie::mask<64> k1 = aie::mask<64>::from_uint64(n1 < 8 ? (1ull << (8 * n1)) - 1 : ~0ull);
+    for (int db = 0; db < {{ ND }}; db++) {
+        const aie::vector<bfloat16, 64> a = aie::select(aie::zeros<bfloat16, 64>(), aie::load_v<64>(r0 + 64 * db), k0);
+        const aie::vector<bfloat16, 64> b = aie::select(aie::zeros<bfloat16, 64>(), aie::load_v<64>(r1 + 64 * db), k1);
+        po.push(aie::accum<accfloat, 64>(aie::transpose(a, 8, 8)).template to_vector<bfp16ebs8>());
+        po.push(aie::accum<accfloat, 64>(aie::transpose(b, 8, 8)).template to_vector<bfp16ebs8>());
+    }
+}
+
+// Of rows s0 .. s0 + 3 of an octet the lanes of record r whose positions are not attended: past ``end`` (exclusive; every row) or
+// before the row's window (row s: from lo + s on)
+__attribute__((noinline, minsize)) uint32_t {{ p }}_masked(int s0, int r, int lo, int end)
+{
+    const int hi = end - 8 * r;  // (valid below it)
+    const uint32_t past = hi <= 0 ? 0xFFu : hi >= 8 ? 0u : (0xFFu << hi) & 0xFFu;
+    uint32_t m = 0;
+    AIE_LOOP_NO_UNROLL
+    for (int q = 0; q < 4; q++) {
+        int n = lo + s0 + q - 8 * r;
+        n = n < 0 ? 0 : (n > 8 ? 8 : n);
+        m |= (past | ((1u << n) - 1)) << (8 * q);
+    }
+    return m;
+}
+
+// Scores of 4 records from r on that the rows do not attend: -16384 (P exactly 0)
+__attribute__((noinline, minsize)) void {{ p }}_kmask(int32_t *__restrict ws, int r, int lo, int end)
+{
+    const aie::vector<float, 32> neg = aie::broadcast<float, 32>(-16384.0f);
+    AIE_LOOP_NO_UNROLL
+    for (int q = 0; q < 4; q++) {
+        const int a = r + q;
+        if (8 * a >= lo + 7 && 8 * (a + 1) <= end)
+            continue;
+        const aie::mask<32> m0 = aie::mask<32>::from_uint32({{ p }}_masked(0, a, lo, end));
+        const aie::mask<32> m1 = aie::mask<32>::from_uint32({{ p }}_masked(4, a, lo, end));
+        float *__restrict so = AW(float, {{ a.sc }}) + 32 * q;
+        AIE_LOOP_NO_UNROLL
+        for (int set = 0; set < {{ SETS }}; set += 2) {
+            aie::store_v(so + 128 * set, aie::select(aie::load_v<32>(so + 128 * set), neg, m0));
+            aie::store_v(so + 128 * set + 128, aie::select(aie::load_v<32>(so + 128 * set + 128), neg, m1));
+        }
+    }
+}
+
+// The open pair's scores in (from baselines 0, the 4 records' last two all masked): each row's reference m its maximum there, baselines
+// b = 192 - m, scores as A = s + b from here on
+__attribute__((noinline, minsize)) void {{ p }}_m0(int32_t *__restrict ws)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int set = 0; set < {{ SETS }}; set++) {
+        float *__restrict ss = AW(float, {{ a.sc }}) + 128 * set;
+        const aie::vector<float, 32> m = al::max8(aie::max(aie::load_v<32>(ss), aie::load_v<32>(ss + 32)));
+        const aie::vector<float, 32> b = aie::sub(aie::broadcast<float, 32>(192.0f), m);
+        aie::store_v(AW(float, {{ a.ml }}) + 64 * set, b);
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 128; k += 32)
+            aie::store_v(ss + k, aie::add(aie::load_v<32>(ss + k), b));
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+// A new X object: F_ATT (a step: its rope and norm objects, q objects and the open object follow), a main core's phase (its input
+// objects and A objects skipped in the main core's order, the norm-weight objects around their inputs), another core's. mw: the
+// main core's workspace (its idle regions: DFlashShape.ext)
+__attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t *__restrict mw)
+{
+    const int32_t *__restrict m = (const int32_t *)x;
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int flags = m[{{ M_FLAGS }}];
+    for (int i = 0; i < {{ A_LPER }}; i++)
+        st[i] = 0;
+    if (flags & {{ F_MAIN }}) {
+        if (!(flags & {{ F_LOADR }})) {
+            const int nx = m[{{ M_NX }}], sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));
+            st[{{ A_LPER }}] = lper;
+            if (flags & {{ F_NORM }}) {
+                st[{{ A_NNO }}] = (nx + {{ NX_PER_NORM - 1 }}) / {{ NX_PER_NORM }};
+                st[{{ A_XL }}] = nx;
+            } else {
+                st[{{ A_NXSKIP }}] = (nx + (1 << lper) - 1) >> lper;
+            }
+            st[{{ A_NASKIP }}] = m[{{ M_NT }}];
+        }
+        return;
+    }
+    if (!(flags & {{ F_ATT }})) {
+        st[{{ A_NXSKIP }}] = m[{{ M_SKIP }}];
+        return;
+    }
+    const int S = m[{{ M_NS }}], inj = m[{{ M_INJ }}];
+    st[{{ A_NSTEP }}] = 1;
+    st[{{ A_NQ }}] = S;
+    st[{{ A_S }}] = S;
+    st[{{ A_P }}] = m[{{ M_POS }}];
+    st[{{ A_INJ }}] = inj;
+    st[{{ A_KEEP }}] = m[{{ M_KEEP }}];
+    st[{{ A_NE1 }}] = inj ? {{ NE_INJ }} : 0;
+    st[{{ A_NOBJ }}] = m[{{ M_ANOBJ }}];
+    st[{{ A_NE }}] = inj ? 0 : {{ NO_OBJ }};
+    st[{{ A_G0 }}] = m[{{ M_G0 }}];
+    st[{{ A_I }}] = 0;
+    st[{{ A_QS }}] = 0;
+    st[{{ A_EIDX }}] = 0;
+{% for w, off in at %}
+    st[{{ w }}] = (int32_t)((uintptr_t)mw + {{ off }});
+{% endfor %}
+}
+
+// A main core's norm-weight object: the input objects under it
+__attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
+{
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int left = st[{{ A_XL }}], n = left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left;
+    st[{{ A_NXN }}] = (n + (1 << st[{{ A_LPER }}]) - 1) >> st[{{ A_LPER }}];
+    st[{{ A_XL }}] = left - n;
+}
+
+// The rope object: the rows' cos, sin ([slot 8][cos 64 | sin 64] fp32); the norms: q_norm x log2(e) / sqrt(HD), k_norm
+__attribute__((minsize)) void {{ p }}_arope(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    al::copy<{{ 128 * 8 }}, 16>(AP(float, {{ A_ROPE }}), (const float *)(x + {{ 2 * META }}));
+}
+
+__attribute__((minsize)) void {{ p }}_anorm(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    al::copy<{{ 2 * HD }}, 16>(AP(float, {{ A_NRM }}), (const float *)(x + {{ 2 * META }}));
+}
+
+// The next row's object ([q 4 heads | K | V], an injection's [K | V]): q (head h's octet h, row s) normed, rotated; K (normed, rotated)
+// and V into the open rows a (rows an injection does not keep: none)
+__attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws, uint8_t *__restrict a)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int s = st[{{ A_QS }}], inj = st[{{ A_INJ }}];
+    st[{{ A_QS }}] = s + 1;
+    const bfloat16 *__restrict pay = x + {{ 2 * META }};
+    const float *__restrict nrm = AP(float, {{ A_NRM }});
+    const float *__restrict cs = AP(float, {{ A_ROPE }}) + {{ HD }} * s;
+    if (!inj) {
+        AIE_LOOP_NO_UNROLL
+        for (int h = 0; h < {{ QC }}; h++)
+            {{ p }}_norm_rope(pay + {{ HD }} * h, nrm, cs, cs + {{ HD // 2 }}, AW(float, {{ a.y }}) + {{ HD }} * (8 * h + s));
+    } else if (s >= st[{{ A_KEEP }}]) {
+        return;
+    }
+    const bfloat16 *__restrict kv = pay + (inj ? 0 : {{ QC * HD }});
+    const int q = st[{{ A_P }}] + s, slot = (q >> 3) & 1, j = q & 7;
+    float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
+    {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, cs + {{ HD // 2 }}, kf);
+    bfloat16 *__restrict rows = (bfloat16 *)a;
+    {{ p }}_krow(kf, rows + {{ ROWS_B // 2 }} * slot + 8 * j);
+    al::v_put<{{ ND }}>(rows + {{ ROWS_B // 2 }} * (2 + slot) + 8 * j, kv + {{ HD }}, {{ ND }});
+}
+
+// The rows are in. A block: the Q panels, y, l and the baselines zero, the open records' K and V panels, their scores (the references
+// m), P, y += P V. An injection: the record it closes as K and V panels.
+__attribute__((minsize)) void {{ p }}_aopen(int32_t *__restrict ws, uint8_t *__restrict a)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const bfloat16 *__restrict rows = (const bfloat16 *)a;
+    const int p = st[{{ A_P }}], r = p >> 3, odd = r & 1;
+    uint8_t *__restrict ko = AP(uint8_t, {{ A_KO }}), *__restrict vo = AP(uint8_t, {{ A_VO }});
+    if (st[{{ A_INJ }}]) {
+        const int end = p + st[{{ A_KEEP }}], rc = (end >> 3) - 1;  // (the record it closes, when it reaches its end)
+        if (rc >= r) {
+            const int sl = rc & 1;
+            {{ p }}_krec(rows + {{ ROWS_B // 2 }} * sl, ko);
+            al::v_enc<{{ ND }}>(rows + {{ ROWS_B // 2 }} * (2 + sl), vo, {{ ND }}, 8);
+        }
+        return;
+    }
+    const int S = st[{{ A_S }}], last = p + S;  // (the rows see the whole block)
+    float *__restrict q = AW(float, {{ a.y }});
+    {{ p }}_qpan<2>(q, AW(uint8_t, {{ a.qa0 }}));
+    {{ p }}_qpan<2>(q + {{ 16 * HD }}, AW(uint8_t, {{ a.qa1 }}));
+    al::zero<{{ 32 * (ND + 1) * SETS }}, 32>(q);
+    al::zero<{{ 64 * SETS }}, 32>(AW(float, {{ a.ml }}));
+    const int n0 = last - 8 * r, n1 = last - 8 * (r + 1);
+    {{ p }}_kpair(rows + {{ ROWS_B // 2 }} * odd, rows + {{ ROWS_B // 2 }} * (1 - odd), ko);
+    {{ p }}_vpair(rows + {{ ROWS_B // 2 }} * (2 + odd), rows + {{ ROWS_B // 2 }} * (3 - odd), vo, n0 > 8 ? 8 : n0, n1 < 0 ? 0 : n1);
+    float *__restrict sc = AW(float, {{ a.sc }});
+    {{ p }}_qk1(ko, AW(const uint8_t, {{ a.qa0 }}), AW(const float, {{ a.ml }}), sc, 0);
+    {{ p }}_qk1(ko, AW(const uint8_t, {{ a.qa1 }}), AW(const float, {{ a.ml }}) + 256, sc + 512, 0);
+    {{ p }}_kmask(ws, r, -(1 << 30), last);
+    {{ p }}_m0(ws);
+    uint8_t *__restrict pp = AW(uint8_t, {{ a.pp }});
+    {{ p }}_soft4(ws, pp);
+    {{ p }}_pvs(vo, vo, pp, AW(float, {{ a.y }}));
+}
+
+// The ring's next object: scores of its 4 records, P, y += P V (none of them attended: nothing)
+void {{ p }}_aobj(uint8_t *__restrict a, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int i = st[{{ A_I }}];
+    st[{{ A_I }}] = i + 1;
+    const int p = st[{{ A_P }}], lo = p - {{ WINDOW }} + 1, end = 8 * (p >> 3), r = 4 * (st[{{ A_G0 }}] + i);
+    if (8 * (r + 4) <= lo || 8 * r >= end)
+        return;
+    float *__restrict sc = AW(float, {{ a.sc }});
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < 2; k++) {
+        {{ p }}_qk1(a + {{ PAIR }} * k, AW(const uint8_t, {{ a.qa0 }}), AW(const float, {{ a.ml }}), sc, 64 * k);
+        {{ p }}_qk1(a + {{ PAIR }} * k, AW(const uint8_t, {{ a.qa1 }}), AW(const float, {{ a.ml }}) + 256, sc + 512, 64 * k);
+    }
+    {{ p }}_kmask(ws, r, lo, end);
+    uint8_t *__restrict pp = AW(uint8_t, {{ a.pp }});
+    {{ p }}_soft4(ws, pp);
+    {{ p }}_pvs(a + {{ 2 * PAIR }}, a + {{ 3 * PAIR }}, pp, AW(float, {{ a.y }}));
+}
+
+// The attention is through: 1 / l per row
+__attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_NO_UNROLL
+    for (int set = 0; set < {{ SETS }}; set++) {
+        const float *__restrict l = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + {{ 32 * ND }};
+        const aie::vector<float, 16> sl = al::sum8(aie::load_v<32>(l));
+        aie::vector<float, 16> il = aie::broadcast<float, 16>(1.0f);  // (one scalar inv per row)
+        AIE_LOOP_UNROLL_FULL
+        for (int q = 0; q < 4; q++)
+            il[q] = aie::inv(sl[q]);
+        aie::store_v(AW(float, {{ a.ml }}) + 64 * set + 32, al::rows4(il));
+    }
+}
+
+// The next R object of o ([head 4][k block 16][slot 8][8] bf16 y / l)
+void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict r)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int e = st[{{ A_EIDX }}];
+    st[{{ A_EIDX }}] = e + 1;
+    const int o = e >> 4, db = e & 15;
+    const float *__restrict y = AW(float, {{ a.y }}) + {{ 64 * (ND + 1) }} * o + 32 * db;
+    const float *__restrict il = AW(float, {{ a.ml }}) + 128 * o + 32;
+    const aie::vector<float, 32> a = al::mulff<32>(aie::load_v<32>(y), aie::load_v<32>(il));
+    const aie::vector<float, 32> b = al::mulff<32>(aie::load_v<32>(y + {{ 32 * (ND + 1) }}), aie::load_v<32>(il + 64));
+    aie::store_v(r, aie::accum<accfloat, 64>(aie::concat(a, b)).template to_vector<bfloat16>());
+}
+
+// An injection's next R object: the open object, then the record it closes (K, V panels: the host drains them into the ring, or past
+// it when none closes)
+__attribute__((minsize)) void {{ p }}_aemit1(int32_t *__restrict ws, bfloat16 *__restrict r, const uint8_t *__restrict a)
+{
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int e = st[{{ A_EIDX }}];
+    st[{{ A_EIDX }}] = e + 1;
+    const int n = {{ OPEN_BYTES // (2 * C_LEN) }}, nr = {{ REC_K // (2 * C_LEN) }};
+    const uint8_t *__restrict src = e < n ? a + {{ 2 * C_LEN }} * e : e < n + nr ? AP(const uint8_t, {{ A_KO }}) + {{ 2 * C_LEN }} * (e - n)
+                                                                                  : AP(const uint8_t, {{ A_VO }}) + {{ 2 * C_LEN }} * (e - n - nr);
+    aie::store_v(r, aie::load_v<{{ C_LEN }}>((const bfloat16 *)src));
+}
+
+}  // extern "C"

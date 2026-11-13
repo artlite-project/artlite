@@ -1,0 +1,29 @@
+// The panels of y ([panel 16][lane 8][8] fp32: a lane's row of D values in its panels) with each lane's row
+// l2-normalized (q: times 1 / sqrt(D), the scores' scale; the lanes outside the mask rows zero): per i-block hi, lo at out +
+// 2 PAN ib (y unchanged; sq: 64 + 8 floats of scratch)
+__attribute__(({{ cold }})) void {{ p }}_l2panels(const float *__restrict y, float *__restrict sq, uint32_t rows, int q,
+                                                uint8_t *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    const float *__restrict py = y;
+    for (int ib = 0; ib < 16; ib++) {
+        aie::vector<bfloat16, 64> a, b;
+        al::split2<64>(aie::load_v<64>(py), a, b);
+        py += 64;
+        ss = aie::mac(aie::mac(aie::mac(ss, a, a), a, b), a, b);
+    }
+    aie::vector<float, 16> iv = {{ p }}_irms(al::group8<false>(ss.template to_vector<float>()).template grow<16>(), 1);
+    if (q)
+        iv = al::mul_hilo<16, {{ rs[0] }}f, {{ rs[1] }}f>(iv);
+    const aie::vector<float, 64> ib8 = al::bcast8(aie::select(aie::zeros<float, 16>(), iv, aie::mask<16>::from_uint32(rows)).template extract<8>(0));
+    const al::BV nI = al::neg_eye();
+    py = y;
+    uint8_t *__restrict po = out;
+    for (int ib = 0; ib < 16; ib++) {
+        {{ p }}_push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(py), ib8)), nI, po);
+        py += 64;
+        po += {{ 2 * PAN }};
+    }
+}
+

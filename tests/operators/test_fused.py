@@ -15,8 +15,9 @@ from ml_dtypes import bfloat16
 import artlite
 from artlite import backend
 from artlite.operators import FusedOperator
-from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
+from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.fused import Library
+from artlite.operators.templating import JINJA_ENV
 
 from ..common import to_numpy, to_torch, verify_close
 from .elementwise import SiluOperator, StreamOperator

@@ -1,0 +1,17 @@
+
+namespace {
+// x (HD bf16) -> row = x / rms(x) (fp32), no rotation (V)
+__attribute__((noinline)) void {{ p }}_nr0(const bfloat16 *__restrict x, float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < {{ HD }}; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, 64> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts)
+    al::bf16_hilo<64>(inv, ih, il);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
+        aie::store_v(row + i, aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>());
+    }
+}
+}  // namespace

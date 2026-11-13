@@ -1,0 +1,67 @@
+
+extern "C" {
+
+// The region's payloads 0 .. 2 (12 KB: taps 0 .. 3, taps 4 .. 6 and history rows 8, 9, history rows 0 .. 7; held for
+// the chunk: its taps): the window's rows 0 .. 5
+void {{ p }}_cinit(const bfloat16 *__restrict r, bfloat16 *__restrict win, int32_t *__restrict st, int32_t n)
+{
+    st[0] = 0;  // (the next group's first token)
+    st[1] = n;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ 6 * CH }}; i += 64)
+        aie::store_v(win + i, aie::load_v<64>(r + {{ 2 * XPAY }} + i));
+}
+
+// 8 tokens t0 .. t0 + 7 of G (rows [B | C | x]) -> 32 panels of y (8 tokens x 8 channels); the token n - 1 among them:
+// the 6 rows of bx up to it into hk (the history's output object, held for the chunk)
+void {{ p }}_cgrp(const bfloat16 *__restrict g, const bfloat16 *__restrict taps, bfloat16 *__restrict win,
+                  float *__restrict yt, bfloat16 *__restrict hk, bfloat16 *__restrict out, int32_t *__restrict st)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int t0 = st[0], n = st[1];
+    st[0] = t0 + 8;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 8; t++) {
+        AIE_LOOP_NO_UNROLL
+        for (int v = 0; v < {{ CH // 64 }}; v++) {
+            const aie::vector<bfloat16, 64> b = aie::load_v<64>(g + {{ ROW }} * t + 64 * v);
+            const aie::vector<bfloat16, 64> x = aie::load_v<64>(g + {{ ROW }} * t + {{ 2 * CH }} + 64 * v);
+            aie::store_v(win + {{ CH }} * (6 + t) + 64 * v, aie::mul(b, x).template to_vector<bfloat16>());
+        }
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 8; t++) {
+        AIE_LOOP_NO_UNROLL
+        for (int v = 0; v < {{ CH // 64 }}; v++) {
+            aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
+            AIE_LOOP_NO_UNROLL
+            for (int k = 0; k < 7; k++) {
+                const aie::vector<bfloat16, 64> r = aie::load_v<64>(win + {{ CH }} * (t + k) + 64 * v);
+                acc = aie::mac(acc, aie::load_v<64>(taps + {{ 2 * CH }} * k + 64 * v), r);
+                acc = aie::mac(acc, aie::load_v<64>(taps + {{ 2 * CH }} * k + {{ CH }} + 64 * v), r);
+            }
+            const aie::vector<bfloat16, 64> ah = acc.template to_vector<bfloat16>();
+            const aie::vector<bfloat16, 64> al = aie::accum<accfloat, 64>(
+                aie::sub(acc.template to_vector<float>(), aie::accum<accfloat, 64>(ah).template to_vector<float>())).template to_vector<bfloat16>();
+            const aie::vector<bfloat16, 64> c = aie::load_v<64>(g + {{ ROW }} * t + {{ CH }} + 64 * v);
+            aie::store_v(yt + {{ CH }} * t + 64 * v, aie::mac(aie::mul(ah, c), al, c).template to_vector<float>());
+        }
+    }
+    {
+        al::BOut<> o((bfp16ebs8 *)out);
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < {{ CH // 8 }}; j++)
+            o.push(aie::accum<accfloat, 64>(al::gather<8, 8>(yt + 8 * j, {{ CH }})).template to_vector<bfp16ebs8>());
+    }
+    if (n - 1 >= t0 && n - 1 < t0 + 8) {  // (window rows n - 6 - t0 + 6 .. : the 6 tokens up to n - 1)
+        const bfloat16 *__restrict src = win + {{ CH }} * (n - t0);
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ 6 * CH }}; i += 64)
+            aie::store_v(hk + i, aie::load_v<64>(src + i));
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ 6 * CH }}; i += 64)  // (the next group's rows before it)
+        aie::store_v(win + i, aie::load_v<64>(win + {{ 8 * CH }} + i));
+}
+
+}  // extern "C"

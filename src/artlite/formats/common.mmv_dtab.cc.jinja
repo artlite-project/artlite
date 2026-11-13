@@ -1,0 +1,37 @@
+// ---- Q4_0, Q4_1, Q8_0: per 32-k group i one exact sum c = bf16(C[hi rows] + C[lo rows]), y += c d (d exact in bf16).
+
+// The scales d [row][sb][i] (rows of 8 NSB bf16) of G row groups and NS super-blocks from d -> tab [sb][g][i][r] (64
+// bf16 per (sb, g))
+template <int G, int NS = {{ NSB }}>
+__attribute__((noinline)) void {{ p }}_dtab(const bfloat16 *__restrict d, bfloat16 *__restrict tab)
+{
+    bfloat16 *__restrict pt = tab;
+    AIE_LOOP_NO_UNROLL AIE_LOOP_REG_REWRITE_BASIC  // (II 11; the default rewrite: 13)
+    for (int t = 0; t < NS * G; t++) {
+        const bfloat16 *q = d + {{ 64 * NSB }} * (t % G) + 8 * (t / G);  // (row group t % G, super-block t / G)
+        const aie::vector<bfloat16, 64> v = al::gather<8, 8>(q, {{ 8 * NSB }});
+        aie::store_v(pt, aie::transpose(v, 8, 8));  // [r][i] -> [i][r]
+        pt += 64;
+    }
+}
+
+// One super-block: y[g] += sum over the 8 groups i of c_g,i (c [i][g][{{ L }}]) times tab [g][i][r] (G row groups; y
+// [g][slot][r])
+template <int G>
+__attribute__((noinline)) void {{ p }}_sc1(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y)
+{
+    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 8; i++) {
+        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(pc), aie::load_v<8>(ph).template grow_replicate<{{ L }}>());
+        if constexpr (G == 2)
+            Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(pc + {{ L }}), aie::load_v<8>(ph + 64).template grow_replicate<{{ L }}>());
+        pc += {{ L }} * G;
+        ph += 8;
+    }
+    aie::store_v(y, Y0.template to_vector<float>());
+    if constexpr (G == 2)
+        aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
+}

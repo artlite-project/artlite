@@ -1,0 +1,9 @@
+// ---- IQ3_XXS: a weight panel (8 rows x 8 k) from its 16 entries' addresses a (lanes 2 r, 2 r + 1: row r's two) and its
+// signs m (bit 8 r + j: value j of row r negative): 4 gathers, the entries compacted, zero - w where a sign is set
+[[clang::always_inline]] inline v64int8 {{ p }}_iq3_panel(v16int32 a, v2int32 m)
+{
+    const v8int32 a0 = extract_v8int32(a, 0), a1 = extract_v8int32(a, 1);
+    const v16int32 c01 = concat(load_4x32_lo(a0), load_4x32_hi(a0));  // (entries 0 .. 7 in the even 32-bit lanes)
+    const v16int32 c23 = concat(load_4x32_lo(a1), load_4x32_hi(a1));
+    return __builtin_aie2p_vaddsub8(broadcast_zero_to_v64int8(), (v64int8)::shuffle(c01, c23, T32_16x2_lo), m);
+}

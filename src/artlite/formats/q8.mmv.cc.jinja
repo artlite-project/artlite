@@ -1,0 +1,73 @@
+// a weight panel of 64 int8 codes (8 rows x 8 k), value = code
+template <typename T>
+[[clang::always_inline]] inline v64bfp16ebs8 {{ p }}_w8(const T *p)
+{
+    v64bfp16ebs8 n;
+    n.mantissa = *(const v64int8 __aie_dm_resource_b *)p;
+    n.exponent = al::e8(0x85);
+    return n;
+}
+
+// ---- Q8_0 ({{ R80 }} rows): per super-block and row group a sub-unit [codes [i][s][row 8][8 B] (MMUL panels) | d [row 8][i] bf16] (2176 B), units [sb][g]. {{ "Core H: super-blocks 2 H, 2 H + 1 of the row group (y[0 ..])" if R80 == 8 else "Core H: row group H of both super-blocks (y[32 H ..])" }}.
+// Scratch: tab [sb][i][r] (128 B per sb) | c [sb][i][32] (512 B per sb)
+
+// c_sb,i = bf16(C[hi rows] + C[lo rows]) (8 slots: bf16(C)) -> c [sb][i][{{ L }}] for NS super-blocks (their slices of the row group SK bytes
+// apart); C = sum_s X(sb, i, s) W(sb, i, s); groups i, i + 1 in two chains
+template <int NS, int SK>
+__attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, const uint8_t *__restrict w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < NS; sb++) {
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < 8; i += 2) {
+            const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
+            const v64bfp16ebs8 x4 = xs.pop(), x5 = xs.pop(), x6 = xs.pop(), x7 = xs.pop();
+            v64accfloat C0 = mul_8x8_8x8T(x0, 1, {{ p }}_w8(pw), 1);
+            v64accfloat C1 = mul_8x8_8x8T(x4, 1, {{ p }}_w8(pw + 256), 1);
+            C0 = mac_8x8_8x8T(x1, 1, {{ p }}_w8(pw + 64), 1, C0);
+            C1 = mac_8x8_8x8T(x5, 1, {{ p }}_w8(pw + 320), 1, C1);
+            C0 = mac_8x8_8x8T(x2, 1, {{ p }}_w8(pw + 128), 1, C0);
+            C1 = mac_8x8_8x8T(x6, 1, {{ p }}_w8(pw + 384), 1, C1);
+            C0 = mac_8x8_8x8T(x3, 1, {{ p }}_w8(pw + 192), 1, C0);
+            C1 = mac_8x8_8x8T(x7, 1, {{ p }}_w8(pw + 448), 1, C1);
+{% if slots == 8 %}
+            aie::store_v(pc, {{ p }}_c8(C0));
+            aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
+            aie::store_v(pc, {{ p }}_sum2(C0));
+            aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
+            pw += 512;
+            pc += {{ 2 * L }};
+        }
+        pw += SK;  // (the next super-block's slice, the same row group)
+    }
+}
+
+// the d [row 8][i 8] of two sub-units SU bytes apart (from u: codes, then d) -> tab [sb 2][i][r]
+template <int SU>
+__attribute__((noinline)) void {{ p }}_q80_d(const uint8_t *__restrict u, bfloat16 *__restrict tab)
+{
+    aie::store_v(tab, aie::transpose(aie::load_v<64>((const bfloat16 *)(u + 2048)), 8, 8));
+    aie::store_v(tab + 64, aie::transpose(aie::load_v<64>((const bfloat16 *)(u + SU + 2048)), 8, 8));
+}
+
+{% set unit = 272 * R80 %}
+{% set yo = (" + sb * ys" if rg else "") if R80 == 8 else " + %d * H" % L %}
+template <int H>
+__attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg and R80 == 8 else "" }})
+{
+    bfloat16 *tab = (bfloat16 *)scr;
+    bfloat16 *c = (bfloat16 *)(scr + 1024);
+    uint8_t *u = a + {{ 2 * unit if R80 == 8 else 2176 }} * H;  // (the core's first sub-unit; the next super-block's {{ unit }} B on)
+    {{ p }}_q80_d<{{ unit }}>(u, tab);
+    {{ p }}_q80_mm<2, {{ unit - 2048 }}>(xp, u, c);
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg and R80 == 8 else "" }}
+        {{ p }}_sc1<1>(c + {{ 8 * L }} * sb, tab + 64 * sb, y{{ yo }});
+}

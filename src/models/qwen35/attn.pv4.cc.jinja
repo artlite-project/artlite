@@ -1,0 +1,41 @@
+// y += P V of two pairs of records v, vb (a V object's, or one twice) for NO octets, one read and one write of y per
+// d-block for the four records' MMULs: pp [octet][P0 | P1 | P2 | P3]; y in place (yl, ys the same buffer as distinct
+// restrict parameters, each block read before it is written)
+template <int NO>
+__attribute__((noinline)) void {{ p }}_pv4(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp,
+                                           const float __aie_dm_resource_c *__restrict yl,
+                                           float __aie_dm_resource_d *__restrict ys)
+{
+    al::BV P0[NO], P1[NO], P2[NO], P3[NO];
+    {
+        al::BIn<> pa((const bfp16ebs8 *)pp);
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            P0[o] = pa.pop();
+            P1[o] = pa.pop();
+            P2[o] = pa.pop();
+            P3[o] = pa.pop();
+        }
+    }
+    al::BInR<aie_dm_resource::b> v0((const bfp16ebs8 *)v);
+    al::BIn<> v1((const bfp16ebs8 *)vb);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int d = 0; d < {{ ND }}; d++) {
+        const al::BV A = v0.pop(), B = v0.pop(), C = v1.pop(), D = v1.pop();
+        AIE_LOOP_UNROLL_FULL
+        for (int o = 0; o < NO; o++) {
+            al::MM8 c(aie::accum<accfloat, 64>(aie::concat(aie::load_v<32>(yl + {{ 64 * (ND + 1) }} * o),
+                                                           aie::load_v<32>(yl + {{ 64 * (ND + 1) }} * o + {{ 32 * (ND + 1) }}))));
+            c.mac(P0[o], aie::op_transpose(A));
+            c.mac(P1[o], aie::op_transpose(B));
+            c.mac(P2[o], aie::op_transpose(C));
+            c.mac(P3[o], aie::op_transpose(D));
+            const aie::vector<float, 64> r = c.to_accum().template to_vector<float>();
+            aie::store_v(ys + {{ 64 * (ND + 1) }} * o, r.template extract<32>(0));
+            aie::store_v(ys + {{ 64 * (ND + 1) }} * o + {{ 32 * (ND + 1) }}, r.template extract<32>(1));
+        }
+        yl += 32;
+        ys += 32;
+    }
+}
+

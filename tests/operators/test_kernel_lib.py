@@ -4,7 +4,7 @@ from 256-bit ones (aie::concat), bit for bit against numpy (data movement only).
 import numpy as np
 import pytest
 
-from artlite.operators.base import JINJA_ENV
+from artlite.operators.templating import JINJA_ENV
 
 from .elementwise import StreamOperator
 

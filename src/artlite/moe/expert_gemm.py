@@ -63,7 +63,8 @@ from .. import txn
 from ..formats import KT, gu_tiles, slot
 from ..gemm.gemm_q import planar
 from ..gemm.gemm_qd import D_DEPTH, DQ_ONLY, GemmQdOperator
-from ..operators.base import JINJA_ENV, ArgSpec
+from ..operators import templating
+from ..operators.base import ArgSpec
 from ..operators.design import COLS, range32, stream_walk
 from ..operators.l1_layout import pin_l1_buffers
 from . import ctl
@@ -81,16 +82,7 @@ MEM_S2MM_CTRL = 0xA0600  # + 8 channel: a memtile's DMA_S2MM_<ch>_Ctrl (AM029; F
 MARKER = 32  # words of a column's control buffer at its end, all ones (a panel of them: an inactive strip)
 
 
-_CHK = JINJA_ENV.from_string(r"""
-extern "C" {
-// fl[0] = 1 if the A object's first panel is the marker (all ones: no finite panel has exponents 0xFF), else 0
-void {{ p }}_chk(const bfloat16 *__restrict a, int32_t *__restrict fl)
-{
-    const int32_t *__restrict w = (const int32_t *)a;  // (the panel: 16 words of mantissas, 2 of exponents)
-    fl[0] = aie::equal(aie::load_v<16>(w), aie::broadcast<int32_t, 16>(-1)) && w[16] == -1 && w[17] == -1;
-}
-}
-""")
+_CHK = templating.load("artlite/moe/expert_gemm.cc.jinja")
 
 
 class ExpertGemmOperator(GemmQdOperator):

@@ -1,0 +1,145 @@
+
+// The prep cores' workspace (bytes): c [64] fp32 (the score constant), row (HD fp32), stage [db ND][row 8][8] fp32,
+// vn [8][HD] bf16
+#define PW(T, off) ((T *)((uint8_t *)ws + (off)))
+
+namespace {
+
+// x (HD bf16) -> row = x / rms(x) (fp32), the pairs (i, i + HD / 2) of i < ROT rotated by cs [cos ROT | sin ROT]
+__attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict row)
+{
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < {{ HD }}; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, 64> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts)
+    al::bf16_hilo<64>(inv, ih, il);
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
+        aie::store_v(row + i, aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>());
+    }
+{% if ROT %}
+    for (int i = 0; i < {{ ROT }}; i += 32) {
+        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ ROT }} + i);
+        aie::accum<accfloat, 32> o0, o1;
+        al::rot2(a, b, c, s, o0, o1);
+        aie::store_v(row + i, o0.template to_vector<float>());
+        aie::store_v(row + {{ HD // 2 }} + i, o1.template to_vector<float>());
+    }
+{% endif %}
+}
+
+// row (HD fp32) -> row r of the stage [db][r][8]
+__attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
+{
+    float *__restrict d = st + 8 * r;
+    for (int db = 0; db < {{ ND }}; db++) {
+        aie::store_v(d, aie::load_v<8>(row));
+        row += 8;
+        d += 64;
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+// The first object of the cos / sin stream: the score constant (Q cores)
+void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
+{
+    aie::store_v(PW(float, {{ w.c }}), aie::broadcast<float, 64>(((const float *)n)[0]));
+}
+
+// 8 tokens of the q head (rows of HD bf16), cs (8 x [cos | sin] fp32) -> out: the Q panels of q / rms(q), rotated,
+// times the score constant: {{ "per half of the d-blocks its hi panels, then its lo (the attention's memtile interleaves them)" if HALVES else "per d-block hi, lo" }}
+void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    const aie::vector<float, 64> cv = aie::load_v<64>(PW(float, {{ w.c }}));
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr(q + {{ HD }} * r, cs + {{ 2 * ROT }} * r, row);
+        for (int i = 0; i < {{ HD }}; i += 64)
+            aie::store_v(row + i, al::mulff<64>(aie::load_v<64>(row + i), cv));
+        {{ p }}_scatter(row, st, r);
+    }
+    const al::BV nI = al::neg_eye();
+{% if HALVES %}
+    for (int s = 0; s < 2; s++) {
+        al::BOut<> ho((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }} * s));
+        al::BOut<> lo((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }} * s + {{ 36 * ND }}));
+        for (int db = 0; db < {{ ND // 2 }}; db++) {
+            al::BV h, l;
+            al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+            ho.push(h);
+            lo.push(l);
+            st += 64;
+        }
+    }
+{% else %}
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+        o.push(h);
+        o.push(l);
+        st += 64;
+    }
+{% endif %}
+}
+
+// 8 tokens of a KV head's K (rows of HD bf16), cs -> its cache record {{ "[hi panels | lo panels]" if KP == 2 else "(single panels)" }}
+void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict cs = (const float *)cs_;
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr(k + {{ HD }} * r, cs + {{ 2 * ROT }} * r, row);
+        {{ p }}_scatter(row, st, r);
+    }
+{% if KP == 2 %}
+    const al::BV nI = al::neg_eye();
+    al::BOut<> ho((bfp16ebs8 *)out);
+    al::BOut<> lo((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }}));
+    for (int db = 0; db < {{ ND }}; db++) {
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+        ho.push(h);
+        lo.push(l);
+        st += 64;
+    }
+{% else %}
+    al::BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < {{ ND }}; db++) {
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
+        st += 64;
+    }
+{% endif %}
+}
+
+// 8 tokens of a KV head's V (rows of HD bf16) -> its cache record: bf16(v / rms(v)), per 8 dims a panel of blocks
+// over the positions
+void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict row = PW(float, {{ w.row }});
+    bfloat16 *__restrict vn = PW(bfloat16, {{ w.vn }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_nr0(v + {{ HD }} * r, row);
+        for (int i = 0; i < {{ HD }}; i += 32)
+            aie::store_v(vn + {{ HD }} * r + i, aie::accum<accfloat, 32>(aie::load_v<32>(row + i)).template to_vector<bfloat16>());
+    }
+    al::BOut<> o((bfp16ebs8 *)out);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int db = 0; db < {{ ND }}; db++) {
+        const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(vn + 8 * db, {{ HD }});  // [position][dim]
+        o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
+    }
+}
+
+}  // extern "C"

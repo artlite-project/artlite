@@ -1,0 +1,378 @@
+
+
+namespace {
+
+{{ mac_src }}
+{% if silu and act == "gelu" %}
+{% set gact = km.act(km.GELU, table_arg=True, walk=(2, 128)) %}
+{{ gact.src }}
+{% endif %}
+{# the gate/up epilogues' last loop: h = y up (y in the scratch, up the C tile's up halves) -> hout as bfp16 panels #}
+{% macro times_up(mp_) %}
+    {
+        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
+        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
+        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)hout);
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < {{ mp_ * n // 128 }}; i++) {
+            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
+            out.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
+            pu += 128;
+            py += 64;
+        }
+    }
+{%- endmacro %}
+
+}  // namespace
+
+extern "C" {
+
+{% if csplit %}
+// (the tile's halves {{ csplit }} bytes apart: rows {{ m // 2 }}.. after the first half's 16 KB region)
+void {{ p }}_zero(bfloat16 *__restrict out)
+{
+    al::zero<{{ m * n // 2 }}, 32>(out);
+    al::zero<{{ m * n // 2 }}, 32>(out + {{ csplit // 2 }});
+}
+{% else %}
+void {{ p }}_zero(bfloat16 *__restrict out)
+{
+    al::zero<{{ m * n }}, 32>(out);
+}
+{% endif %}
+
+{# the dequantizing kernels: n = the pass's MMUL columns, a dq call converts n_mac of them (halves: one half) #}
+{% set n_mac = n %}
+{% set n = nd %}
+{% set half_arg = ", int32_t half" if halves > 1 else "" %}
+
+{% include "gemm/" ~ fmt %}
+
+{% set n = n_mac %}
+{% if c_pack and carry %}
+{% set nv = (n_c + 31) // 32 %}
+// whole-line drains: C (m x {{ n_c }} row-major; the memtile drains windows of {{ win }} columns from each row) row t =
+// [the previous pass's last cr columns, from column sh of the row it left in this C object | the pass's {{ n_out }}
+// columns of the MAC tile (m x {{ n }}, 8x8 row-major sub-blocks)]; (cr, sh) of each pass from the tables
+static const int8_t {{ p }}_cr[{{ carry | length }}] = { {% for cr, sh in carry %}{{ cr }}{{ ", " if not loop.last }}{% endfor %} };
+static const int16_t {{ p }}_sh[{{ carry | length }}] = { {% for cr, sh in carry %}{{ sh }}{{ ", " if not loop.last }}{% endfor %} };
+
+void {{ p }}_pack(const bfloat16 *__restrict acc, bfloat16 *c, int32_t pass)
+{
+    const int cr = {{ p }}_cr[pass];
+    const int sh = {{ p }}_sh[pass];
+    if (cr == 0) {  // (the pass's columns from column 0: 16-byte items, the source walking [band][row][block])
+        const bfloat16 __aie_dm_resource_a *__restrict src = (const bfloat16 __aie_dm_resource_a *)acc;
+        bfloat16 *__restrict dst = c;
+        dims_3d_t d = dims_3d_from_steps({{ n_c // 8 }}, 64, 8, 8, {{ 8 * n }});
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < {{ m * n_c // 8 }}; i++) {
+            aie::store_v(dst, aie::load_v<8>(src));
+            dst += 8;
+            src = add_3d_ptr(src, d);
+        }
+        return;
+    }
+    const aie::vector<bfloat16, 8> z8 = aie::zeros<bfloat16, 8>();
+    const aie::vector<bfloat16, 32> z = aie::zeros<bfloat16, 32>();
+    const aie::mask<32> head = aie::mask<32>::from_uint32((1u << cr) - 1u);
+    const unsigned up = 2 * (32 - cr);  // (bytes: the own columns move cr lanes up)
+    const int ks = std::min(sh, {{ n_c - 32 }});  // (the carry's 4 items within the row: its columns are)
+    const unsigned kb = 2 * (sh - ks);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < {{ m }}; t++) {
+        const bfloat16 __aie_dm_resource_a *s = (const bfloat16 __aie_dm_resource_a *)acc + (t / 8) * {{ 8 * n }} + (t % 8) * 8;
+        bfloat16 *row = c + t * {{ n_c }};
+        // (own columns 32 j.. : 8-column items of the token's sub-block row; zeros past the MAC tile)
+{% for j in range(nv) %}
+        const aie::vector<bfloat16, 32> o{{ j }} = al::concat({% for i in range(4) %}{{ "aie::load_v<8>(s + %d)" % (64 * (4 * j + i)) if 4 * j + i < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+{% endfor %}
+        // (the carry, loaded before the stores overwrite where it was; aie::concat's shift chain, not al::gather: the
+        // carry's loads follow the previous token's stores into c, and the shuffle tree lengthens that recurrence)
+        const aie::vector<bfloat16, 32> k = aie::vector<bfloat16, 32>(::shift_bytes(aie::concat({% for i in range(4) %}aie::load_v<8>(row + ks + {{ 8 * i }}){{ ", " if not loop.last }}{% endfor %}), z, kb));
+{% for j in range(nv) %}
+{% if j == 0 %}
+        const aie::vector<bfloat16, 32> w0 = aie::select(aie::vector<bfloat16, 32>(::shift_bytes(z, o0, up)), k, head);
+{% else %}
+        const aie::vector<bfloat16, 32> w{{ j }} = aie::vector<bfloat16, 32>(::shift_bytes(o{{ j - 1 }}, o{{ j }}, up));
+{% endif %}
+{% for i in range(4) if 32 * j + 8 * i < n_c %}
+        aie::store_v(row + {{ 32 * j + 8 * i }}, w{{ j }}.extract<8>({{ i }}));
+{% endfor %}
+{% endfor %}
+    }
+}
+
+{% elif c_pack %}
+// C (m x {{ n_c }} row-major; the memtile drains its first {{ n_out }} columns) = the first {{ n_c }} columns of the
+// MAC tile (m x {{ n }}, 8x8 row-major sub-blocks): 16-byte items (8 columns of a sub-block row), the source
+// walking [band][row][block]
+void {{ p }}_pack(const bfloat16 *__restrict acc, bfloat16 *__restrict c)
+{
+    const bfloat16 __aie_dm_resource_a *__restrict src = (const bfloat16 __aie_dm_resource_a *)acc;
+    bfloat16 *__restrict dst = c;
+    dims_3d_t d = dims_3d_from_steps({{ n_c // 8 }}, 64, 8, 8, {{ 8 * n }});
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < {{ m * n_c // 8 }}; i++) {
+        aie::store_v(dst, aie::load_v<8>(src));
+        dst += 8;
+        src = add_3d_ptr(src, d);
+    }
+}
+
+{% if slots == 2 %}
+{% macro window(s, w) -%}
+{%- if w == 0 %}h{{ s }}0{% elif w == 32 %}h{{ s }}1{% elif w < 0 %}aie::shuffle_up_fill(h{{ s }}0, z, {{ -w }})
+{%- elif w < 32 %}aie::shuffle_down_fill(h{{ s }}0, h{{ s }}1, {{ w }}){% else %}aie::shuffle_down_fill(h{{ s }}1, z, {{ w - 32 }}){% endif %}
+{%- endmacro %}
+// row groups, two slots per C object: C (m x {{ n_c }} row-major) = per tile t of the pass [slot 0's {{ R }} rows |
+// slot 1's], from the slots' MAC tiles a0, a1 (m x {{ n }}, 8x8 row-major sub-blocks): per token row its 8-value
+// items (``pack_plan``), each a sub-block row of one slot or lanes of two slots' rows shifted into place (a row's
+// values as two 32-lane halves h<slot>0, h<slot>1)
+void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1, bfloat16 *__restrict c)
+{
+{% if pack_plan.halves %}
+    const aie::vector<bfloat16, 8> z8 = aie::zeros<bfloat16, 8>();
+    const aie::vector<bfloat16, 32> z = aie::zeros<bfloat16, 32>();
+{% endif %}
+    bfloat16 *__restrict dst = c;
+    for (int rb = 0; rb < {{ m // 8 }}; rb++)
+        for (int rr = 0; rr < 8; rr++) {
+            const bfloat16 *__restrict s0 = a0 + rb * {{ 8 * n }} + rr * 8;
+            const bfloat16 *__restrict s1 = a1 + rb * {{ 8 * n }} + rr * 8;
+{% if pack_plan.halves %}
+{% for sl in (0, 1) %}
+            const aie::vector<bfloat16, 32> h{{ sl }}0 = al::concat({% for j in range(4) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+            const aie::vector<bfloat16, 32> h{{ sl }}1 = al::concat({% for j in range(4, 8) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+{% endfor %}
+{% endif %}
+{% for item in pack_plan.items %}
+{% if item | length == 1 and item[0][1] % 8 == 0 and 0 <= item[0][1] <= n - 8 %}
+            aie::store_v(dst + {{ 8 * loop.index0 }}, aie::load_v<8>(s{{ item[0][0] }} + {{ item[0][1] // 8 * 64 }}));
+{% else %}
+            {
+                aie::vector<bfloat16, 32> v = {{ window(item[0][0], item[0][1]) }};
+{% for s_, w, lanes in item[1:] %}
+                v = aie::select(v, {{ window(s_, w) }}, aie::mask<32>::from_uint32({{ "0x%Xu" % lanes }}));
+{% endfor %}
+                aie::store_v(dst + {{ 8 * loop.index0 }}, v.extract<8>(0));
+            }
+{% endif %}
+{% endfor %}
+            dst += {{ n_c }};
+        }
+}
+
+{% endif %}
+{% endif %}
+{% if silu and act == "silu" %}
+// gate/up epilogue: C 8x8 sub-block pairs (2 t, 2 t + 1) of a tile are 8 gate and 8 up rows (acc: [gate
+// 64 | up 64] per 128 values); h = silu(gate) * up -> hout (m x {{ n // 2 }}, 8x8 sub-blocks; as bfp16ebs8 panels (8 tokens x 8 outputs)).
+// Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
+// cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
+// (II 4 per 64 values: ``times_up``).
+{% set parts = 2 if csplit else sxp %}
+{% set mp = m // parts %}
+{% set silu_t = km.silu_tanh(walk=(2, 128)) %}
+{{ silu_t.src }}
+
+void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
+                  int32_t zero{{ ", int32_t c_part" if c_parts == 2 else "" }})
+{
+{% if "act" in ablate %}
+    return;
+{% endif %}
+{% if "ev_act" in ablate %}
+    event0();
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if c_parts == 2 %}
+    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};  // (the C object's part: a pass of two, or a pass's half)
+{% endif %}
+{% if parts > 1 %}
+    // ({{ parts }} parts of {{ mp }} rows: the scratch holds one part's{{ "; the C tile's halves" if csplit else "" }})
+    AIE_LOOP_NO_UNROLL
+    for (int part = 0; part < {{ parts }}; part++) {
+    const bfloat16 *__restrict cacc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
+    bfloat16 *__restrict hout = hout_ + part * {{ mp * n // 2 * 9 // 16 }};
+{% else %}
+    const bfloat16 *__restrict cacc = cacc_;
+    bfloat16 *__restrict hout = hout_;
+{% endif %}
+    {{ silu_t }}<{{ mp * n // 2 }}>(cacc, scratch, zero);
+{{ times_up(mp) }}
+{% if parts > 1 %}
+    }
+{% endif %}
+{% if "ev_act" in ablate %}
+    event1();
+{% endif %}
+}
+
+{% endif %}
+{% if silu and act == "gelu" %}
+// gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
+// panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
+// table, in two 16 KB regions), then times up.
+{% set parts = 2 if csplit else sxp %}
+{% set mp = m // parts %}
+void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
+                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd{{ ", int32_t c_part" if c_parts == 2 else "" }})
+{
+{% if "act" in ablate %}
+    return;
+{% endif %}
+{% if "ev_act" in ablate %}
+    event0();
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if c_parts == 2 %}
+    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};  // (the C object's part: a pass of two, or a pass's half)
+{% endif %}
+{% if parts > 1 %}
+    AIE_LOOP_NO_UNROLL
+    for (int part = 0; part < {{ parts }}; part++) {
+    const bfloat16 *__restrict cacc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
+    bfloat16 *__restrict hout = hout_ + part * {{ mp * n // 2 * 9 // 16 }};
+{% else %}
+    const bfloat16 *__restrict cacc = cacc_;
+    bfloat16 *__restrict hout = hout_;
+{% endif %}
+    {{ gact }}<{{ mp * n // 2 }}>(cacc, scratch, tab_ab, tab_cd);
+{{ times_up(mp) }}
+{% if parts > 1 %}
+    }
+{% endif %}
+{% if "ev_act" in ablate %}
+    event1();
+{% endif %}
+}
+
+{% endif %}
+{% if pair %}
+// C (m x {{ n }}, 8x8 row-major sub-blocks) += A (m x 64 bfp16ebs8 panels in MAC pop order) @ the pass's B in two
+// halves of {{ n // 2 }} columns (GemmQ pair): the core's own (columns {{ n // 2 }} h .., in its memory), then its partner's (in the
+// partner's memory): the pair never streams B from one memory at the same time (one loop, gemm/mac.py split)
+// (k-tile kt: C in pC, out pCb when kt is even, else from pCb into pC: two C tiles in different 16 KB regions)
+void {{ p }}_mm(const bfloat16 *__restrict pA_in, const void *__restrict own, const void *__restrict other,
+                bfloat16 *__restrict pC, bfloat16 *__restrict pCb, int32_t h, int32_t kt)
+{
+{% if "ev_mm" in ablate %}
+    event0();
+{% endif %}
+{% if "mm" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const bool odd = kt & 1;
+    {{ mac }}((const bfp16ebs8 *)pA_in, own, other, (const bfloat16 __aie_dm_resource_c *)(odd ? pCb : pC),
+                (bfloat16 __aie_dm_resource_c *)(odd ? pC : pCb), h);
+{% if "ev_mm" in ablate or "ev_kt" in ablate %}
+    event1();
+{% endif %}
+}
+{% else %}
+// C (m x n, 8x8 row-major sub-blocks) += A (m x 64 bfp16ebs8 panels in MAC pop order) @ stage
+void {{ p }}_mm(const bfloat16 *__restrict pA_in, const void *__restrict stage, bfloat16 *__restrict pC)
+{
+{% if "ev_mm" in ablate %}
+    event0();
+{% endif %}
+{% if "mm" in ablate %}
+    return;
+{% endif %}
+    // (every entry sets the rounding: BFP16 tiles have no dq kernel that would, and
+    // the default truncates the C tiles and B conversions: 5.7e-2 instead of 1.2e-2 rel-rms)
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if csplit %}
+{% set nb, half, band = n // 16, m // 32, 16 * 72 %}
+    // C's halves {{ csplit }} bytes apart (two 16 KB regions): the blocks of bands b and b + {{ half }} alternate, so a block's
+    // C stores (the loop's second stage) meet the next block's C loads in the other region
+    dims_3d_t patA(1, {{ (half - 1) * band }}, {{ nb - 1 }}, {{ -(half + 1) * band }}, {{ -half * band }});
+    dims_3d_t patB(1, {{ -band }}, {{ nb - 1 }}, 0, {{ -nb * band }});
+    dims_3d_t patL(1, {{ csplit // 2 }}, {{ nb - 1 }}, {{ 128 - csplit // 2 }}, {{ 16 * n - (nb - 1) * 128 - csplit // 2 }});
+    dims_3d_t patS = patL;
+    {{ macs }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
+                (bfloat16 __aie_dm_resource_c *)pC, patA, patB, patL, patS);
+{% else %}
+    {{ mac }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pC,
+                (bfloat16 __aie_dm_resource_c *)pC);
+{% endif %}
+{% if "ev_mm" in ablate or "ev_kt" in ablate %}
+    event1();
+{% endif %}
+}
+{% endif %}
+
+{% if c_pairs %}
+void {{ p }}_zerof(float *__restrict acc)
+{
+    al::zero<{{ m * n }}, 16>(acc);
+}
+
+// acc (m x n fp32, 8x8 row-major sub-blocks) += A @ stage
+void {{ p }}_mmf(const bfloat16 *__restrict pA_in, const void *__restrict stage, float *__restrict acc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {{ macf }}((const bfp16ebs8 *)pA_in, stage, (const float __aie_dm_resource_c *)acc,
+                 (float __aie_dm_resource_c *)acc);
+}
+
+// c (m x {{ n // 2 }} fp32, row-major) = acc's columns 2 i + 2 i + 1 (an MoE router's [hi, lo] rows of an expert)
+void {{ p }}_pairs(const float *__restrict acc, float *__restrict c)
+{
+    for (int rb = 0; rb < {{ m // 8 }}; rb++)
+        for (int cb = 0; cb < {{ n // 8 }}; cb++) {
+            const float *__restrict s = acc + rb * {{ 8 * n }} + cb * 64;
+            float *__restrict d = c + rb * {{ 4 * n }} + cb * 4;
+            for (int r = 0; r < 8; r++)
+                for (int j = 0; j < 4; j++)
+                    d[{{ n // 2 }} * r + j] = s[8 * r + 2 * j] + s[8 * r + 2 * j + 1];
+        }
+}
+
+{% endif %}
+{% if pingpong %}
+// C out (m x n) = C in + A @ stage: the k-tiles alternate between two C tiles in different 16 KB regions,
+// so the MAC loop's C loads and stores never meet in one region's banks
+void {{ p }}_mm2(const bfloat16 *__restrict pA_in, const void *__restrict stage, const bfloat16 *__restrict pCin,
+                 bfloat16 *__restrict pCout)
+{
+{% if "ev_mm" in ablate %}
+    event0();
+{% endif %}
+{% if "mm" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {{ mac }}((const bfp16ebs8 *)pA_in, stage, (const bfloat16 __aie_dm_resource_c *)pCin,
+                (bfloat16 __aie_dm_resource_c *)pCout);
+{% if "ev_mm" in ablate or "ev_kt" in ablate %}
+    event1();
+{% endif %}
+}
+
+{% endif %}
+{% if pace is not none %}
+// pacing (a paced core: ``pace_cores``): st[0] = the tile's timer (get_cycles: mov cntr) when its last acquire returned.
+// An acquire returned: the core works from now
+void {{ p }}_pace0(int32_t *__restrict st)
+{
+    st[0] = (int32_t)get_cycles();
+}
+
+// before an acquire: idle PACE_IDLE[level] / 16 of the cycles worked since the last one returned (not after a pause;
+// the levels' sixteenths a byte each of one immediate: no table in data memory)
+void {{ p }}_pace1(int32_t *__restrict st, int32_t level)
+{
+    const unsigned t = (unsigned)get_cycles();
+    const unsigned busy = t - (unsigned)st[0];
+    if (busy >= {{ pace_cap }}u)
+        return;
+    const unsigned idle = busy * (unsigned)(({{ pace_idle }}ull >> 8 * level) & 0xFF) >> 4;
+    while ((unsigned)get_cycles() - t < idle) {
+    }
+}
+
+{% endif %}
+}  // extern "C"

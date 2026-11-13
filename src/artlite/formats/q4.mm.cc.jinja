@@ -1,0 +1,59 @@
+// ---- Q4_0 / Q4_1: c_g,sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][g][32]; C = -8 XS_i + sum_s X(sb, i, s)
+// W_g(sb, s, i) (the codes centered) of NS super-blocks, w [sb][g][i][s][32 B] (each super-block ADV + 1024 B after the
+// last)
+template <int NS, int ADV>
+__attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, const uint8_t *__restrict xsum,
+                                              const uint8_t *__restrict w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const uint8_t __aie_dm_resource_b *__restrict pw = (const uint8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < NS; sb++) {
+        al::BIn<aie_dm_resource::d> xz((const bfp16ebs8 *)(xsum + {{ XS_SLOT }} * (sb >> 1)));  // (the pair's slot)
+{% if slots == 8 %}
+        v64bfp16ebs8 Z = xz.pop(), ZL = xz.pop();  // (the sums' hi and lo panels)
+        if (sb & 1) {
+            Z = xz.pop();
+            ZL = xz.pop();
+        }
+{% else %}
+        v64bfp16ebs8 Z = xz.pop();
+        if (sb & 1)
+            Z = xz.pop();
+{% endif %}
+        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < 8; i++) {
+            const v64bfp16ebs8 N = {{ p }}_np(pn);
+            pn += 64;
+            const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
+{% if slots == 8 %}
+            v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+            v64accfloat C1 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+{% else %}
+            v64accfloat C0 = mul_8x8_8x8T(Z, 1, N, 1);
+            v64accfloat C1 = mul_8x8_8x8T(Z, 1, N, 1);
+{% endif %}
+            C0 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw), 0, C0);
+            C1 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw + 1024), 0, C1);
+            C0 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 32), 0, C0);
+            C1 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 1056), 0, C1);
+            C0 = mac_8x8_8x8T(x2, 1, {{ p }}_wu(pw + 64), 0, C0);
+            C1 = mac_8x8_8x8T(x2, 1, {{ p }}_wu(pw + 1088), 0, C1);
+            C0 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 96), 0, C0);
+            C1 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 1120), 0, C1);
+{% if slots == 8 %}
+            aie::store_v(pc, {{ p }}_c8(C0));
+            aie::store_v(pc + 64, {{ p }}_c8(C1));
+{% else %}
+            aie::store_v(pc, {{ p }}_sum2(C0));
+            aie::store_v(pc + 32, {{ p }}_sum2(C1));
+{% endif %}
+            pw += 128;
+            pc += {{ 2 * L }};
+        }
+        pw += ADV;  // (the next super-block's codes)
+    }
+}

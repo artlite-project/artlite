@@ -1,0 +1,16 @@
+// The P panels of no octets at src (ss bytes apart; block j of octet o: its row j's 8 positions, 9 bytes) -> dst (sd
+// apart) with the blocks of rows lo .. hi - 1 kept, the others 0 (a row: i & 7 of block i = 8 o + j)
+__attribute__((noinline, minsize)) void {{ p }}_pkeep(const uint8_t *__restrict src, int ss, uint8_t *__restrict dst, int sd,
+                                                    int no, int lo, int hi)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 8 * no; i++) {
+        const int row = i & 7, keep = row >= lo && row < hi;
+        const uint8_t *__restrict s = src + ss * (i >> 3) + 9 * (i & 7);
+        uint8_t *__restrict d = dst + sd * (i >> 3) + 9 * (i & 7);
+        AIE_LOOP_NO_UNROLL
+        for (int b = 0; b < 9; b++)
+            d[b] = keep ? s[b] : 0;
+    }
+}
+

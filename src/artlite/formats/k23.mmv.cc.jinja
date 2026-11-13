@@ -1,0 +1,78 @@
+// ---- Q2_K / Q3_K (formats/k23.py): n >= 2 words of R rows (wb = 4 R B each, from src) -> dst [word][32 rows] (128 B per
+// word, rows R .. junk): per word three aligned 64-byte loads (the third only where the word reaches it: within the
+// tile, whose end is 64-byte aligned) and two byte shifts
+__attribute__((noinline)) void {{ p }}_k23al(const uint8_t *src, uint8_t *__restrict dst, int n, int wb)
+{
+    uintptr_t o = (uintptr_t)src;
+    v16int32 *__restrict pd = (v16int32 *)dst;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(2)
+    for (int w = 0; w < n; w++) {
+        const uintptr_t b = o & ~(uintptr_t)63;
+        const unsigned sh = o & 63;
+        const uintptr_t b2 = sh + wb > 128 ? b + 128 : b + 64;
+        const v16int32 v0 = *(const v16int32 __aie_dm_resource_a *)b, v1 = *(const v16int32 __aie_dm_resource_a *)(b + 64);
+        const v16int32 v2 = *(const v16int32 __aie_dm_resource_a *)b2;
+        pd[0] = shift_bytes(v0, v1, sh);
+        pd[1] = shift_bytes(v1, v2, sh);
+        pd += 2;
+        o += wb;
+    }
+}
+
+// rows 0 .. 15 (lo) and 16 .. 31 (hi) of a word at o (4-byte aligned, within the tile, R > 16): the aligned 64-byte
+// blocks around it shifted (the third only where the word reaches it)
+[[clang::always_inline]] inline void {{ p }}_k23w2(uintptr_t o, int wb, v16int32 &lo, v16int32 &hi)
+{
+    const uintptr_t b = o & ~(uintptr_t)63;
+    const unsigned sh = o & 63;
+    const v16int32 v1 = *(const v16int32 __aie_dm_resource_b *)(b + 64);
+    lo = shift_bytes(*(const v16int32 __aie_dm_resource_b *)b, v1, sh);
+    hi = shift_bytes(v1, *(const v16int32 __aie_dm_resource_b *)(sh + wb > 128 ? b + 128 : b + 64), sh);
+}
+
+// 64 bytes at o (4-byte aligned) of which the first n are the tile's: the aligned 64-byte block, and the next one where
+// those n reach it, shifted
+[[clang::always_inline]] inline v16int32 {{ p }}_k23w1(uintptr_t o, int n)
+{
+    const uintptr_t b = o & ~(uintptr_t)63;
+    const unsigned sh = o & 63;
+    return shift_bytes(*(const v16int32 __aie_dm_resource_b *)b, *(const v16int32 __aie_dm_resource_b *)(sh + n > 64 ? b + 64 : b), sh);
+}
+
+// y += hilo(Y) d (N lanes [slot][r]: 32 or 64; d: the 8 rows' bf16)
+template <unsigned N>
+[[clang::always_inline]] inline void {{ p }}_k23d(float *__restrict y, aie::accum<accfloat, N> Y, const bfloat16 *d)
+{
+    const aie::vector<bfloat16, N> h = Y.template to_vector<bfloat16>();
+    const aie::vector<bfloat16, N> l = aie::msc(Y, h, aie::broadcast<bfloat16, N>(1.0f)).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, N> D = aie::load_v<8>(d).template grow_replicate<N>();
+    aie::store_v(y, aie::mac(aie::mac(aie::accum<accfloat, N>(aie::load_v<N>(y)), h, D), l, D).template to_vector<float>());
+}
+
+// y[g] += hilo(yu[g] + sum over the 16 sub-blocks j of c[j][g] sct[g][j][r]) dg[g] for 4 row groups g (Q3_K's three:
+// the fourth junk): c [j][g 4][32] the sub-block sums (bf16), sct [g][j][r] the integer scales (bf16), yu [g][32] fp32 (the
+// offsets), dg [g][r] the rows' d; the products exact, their sums in fp32, d as hi + lo once
+__attribute__((noinline)) void {{ p }}_k23sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
+                                             const float *__restrict yu, const bfloat16 *__restrict dg, float *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 32> Y0(aie::load_v<32>(yu)), Y1(aie::load_v<32>(yu + 32)), Y2(aie::load_v<32>(yu + 64)),
+        Y3(aie::load_v<32>(yu + 96));
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < 16; j++) {
+        Y0 = aie::mac(Y0, aie::load_v<32>(pc), aie::load_v<8>(ps).template grow_replicate<32>());
+        Y1 = aie::mac(Y1, aie::load_v<32>(pc + 32), aie::load_v<8>(ps + 128).template grow_replicate<32>());
+        Y2 = aie::mac(Y2, aie::load_v<32>(pc + 64), aie::load_v<8>(ps + 256).template grow_replicate<32>());
+        Y3 = aie::mac(Y3, aie::load_v<32>(pc + 96), aie::load_v<8>(ps + 384).template grow_replicate<32>());
+        pc += 128;
+        ps += 8;
+    }
+    {{ p }}_k23d(y, Y0, dg);
+    {{ p }}_k23d(y + 32, Y1, dg + 8);
+    {{ p }}_k23d(y + 64, Y2, dg + 16);
+    {{ p }}_k23d(y + 96, Y3, dg + 24);
+}
+

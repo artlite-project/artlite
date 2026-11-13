@@ -1,0 +1,61 @@
+// Dequantize k-tile kt of super-block sb: b ({{ tq // 2 }} KB) = {{ 16 * tq }} packed panels [tile {{ tq }}][k-step
+// (il, s)][half][row][word] -> stage = the same panels as bfp16ebs8 d (q - 8), the MAC's B operands (GemmQd: the
+// dequantizing core's output; GemmQ: a core's half of the k-tile, tq = 2 of the pass's 4 tiles)
+void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt)
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    // scales of groups 2 kt, 2 kt + 1 of super-block sb: header slot
+    // (kt'' = 2 (sb % 2) + kt / 2, il'' = kt % 2, s'' = sb / 2), h = group % 2
+{% if nsb == 8 %}
+    const bfloat16 __aie_dm_resource_c *__restrict hd = (const bfloat16 __aie_dm_resource_c *)
+        (ws + ((2 * (sb & 1) + (kt >> 1)) * 2 + (kt & 1)) * {{ 128 * tq }} + (sb >> 1) * {{ 32 * tq }});
+{% else %}
+    // ([group / 2][tile][group % 2][row 16]: _hdr_q4k of 1024-column tiles)
+    const bfloat16 __aie_dm_resource_c *__restrict hd = (const bfloat16 __aie_dm_resource_c *)(ws + (sb * 4 + kt) * {{ 32 * tq }});
+{% endif %}
+    const uint4 __aie_dm_resource_a *__restrict pb = (const uint4 __aie_dm_resource_a *)b;
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
+    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
+{% if fmt in ("Q4_1", "Q4_K") %}
+    // w = d q + m = (128 + q) d + (m - 128 d), exact in fp32 (Q4_K: d = d sc, m = -dmin mn)
+    const bfloat16 __aie_dm_resource_d *__restrict hm = (const bfloat16 __aie_dm_resource_d *)(hd + {{ 128 * tq * nsb }});
+    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
+{% else %}
+    // w = d (q - 8) = (128 + q) d - 136 d, exact in fp32
+    const aie::vector<bfloat16, 64> k136 = aie::broadcast<bfloat16, 64>(-136.0f);
+{% endif %}
+    // (L_RM_PORT-bound: shuffles + the stream's pushes / flushes, II 40 per 8 panels; post-RA only: 41)
+    for (int it = 0; it < {{ 2 * tq }}; it++) {  // (tile, group) = (it / 2, 2 kt + it % 2)
+        aie::vector<bfloat16, 64> D0, D1;
+        al::expand16_bc(aie::load_v<16>(hd), D0, D1);
+        hd += 16;
+{% if fmt in ("Q4_1", "Q4_K") %}
+        aie::vector<bfloat16, 64> M0, M1;
+        al::expand16_bc(aie::load_v<16>(hm), M0, M1);
+        hm += 16;
+        aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
+        aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
+{% else %}
+        aie::accum<accfloat, 64> C0 = aie::mul(D0, k136);
+        aie::accum<accfloat, 64> C1 = aie::mul(D1, k136);
+{% endif %}
+        AIE_LOOP_UNROLL_FULL
+        for (int st = 0; st < 4; st++) {
+            aie::vector<uint8, 64> q0 = aie::unpack(aie::load_v<64>(pb));
+            aie::vector<uint8, 64> q1 = aie::unpack(aie::load_v<64>(pb + 32));
+            pb += 64;
+            out.push(aie::mac(C0, al::zipw(q0, c43), D0).template to_vector<bfp16ebs8>());
+            out.push(aie::mac(C1, al::zipw(q1, c43), D1).template to_vector<bfp16ebs8>());
+        }
+    }
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}

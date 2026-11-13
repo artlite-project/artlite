@@ -15,140 +15,15 @@ from typing import ClassVar
 
 import numpy as np
 
+from ..operators import templating
 from .common import DqKernels, Slot, TileFormat, _bf16_bytes, dq_kernel, i32
 
 # the decode GEMV (``decode.gemv``; the scale tables: ``mmv/dtab``)
-_MMV = r"""// a weight panel of 64 int8 codes (8 rows x 8 k), value = code
-template <typename T>
-[[clang::always_inline]] inline v64bfp16ebs8 {{ p }}_w8(const T *p)
-{
-    v64bfp16ebs8 n;
-    n.mantissa = *(const v64int8 __aie_dm_resource_b *)p;
-    n.exponent = al::e8(0x85);
-    return n;
-}
-
-// ---- Q8_0 ({{ R80 }} rows): per super-block and row group a sub-unit [codes [i][s][row 8][8 B] (MMUL panels) | d [row 8][i] bf16] (2176 B), units [sb][g]. {{ "Core H: super-blocks 2 H, 2 H + 1 of the row group (y[0 ..])" if R80 == 8 else "Core H: row group H of both super-blocks (y[32 H ..])" }}.
-// Scratch: tab [sb][i][r] (128 B per sb) | c [sb][i][32] (512 B per sb)
-
-// c_sb,i = bf16(C[hi rows] + C[lo rows]) (8 slots: bf16(C)) -> c [sb][i][{{ L }}] for NS super-blocks (their slices of the row group SK bytes
-// apart); C = sum_s X(sb, i, s) W(sb, i, s); groups i, i + 1 in two chains
-template <int NS, int SK>
-__attribute__((noinline)) void {{ p }}_q80_mm(const uint8_t *__restrict xp, const uint8_t *__restrict w, bfloat16 *__restrict c)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
-    const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
-    bfloat16 *__restrict pc = c;
-    AIE_LOOP_NO_UNROLL
-    for (int sb = 0; sb < NS; sb++) {
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int i = 0; i < 8; i += 2) {
-            const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
-            const v64bfp16ebs8 x4 = xs.pop(), x5 = xs.pop(), x6 = xs.pop(), x7 = xs.pop();
-            v64accfloat C0 = mul_8x8_8x8T(x0, 1, {{ p }}_w8(pw), 1);
-            v64accfloat C1 = mul_8x8_8x8T(x4, 1, {{ p }}_w8(pw + 256), 1);
-            C0 = mac_8x8_8x8T(x1, 1, {{ p }}_w8(pw + 64), 1, C0);
-            C1 = mac_8x8_8x8T(x5, 1, {{ p }}_w8(pw + 320), 1, C1);
-            C0 = mac_8x8_8x8T(x2, 1, {{ p }}_w8(pw + 128), 1, C0);
-            C1 = mac_8x8_8x8T(x6, 1, {{ p }}_w8(pw + 384), 1, C1);
-            C0 = mac_8x8_8x8T(x3, 1, {{ p }}_w8(pw + 192), 1, C0);
-            C1 = mac_8x8_8x8T(x7, 1, {{ p }}_w8(pw + 448), 1, C1);
-{% if slots == 8 %}
-            aie::store_v(pc, {{ p }}_c8(C0));
-            aie::store_v(pc + 64, {{ p }}_c8(C1));
-{% else %}
-            aie::store_v(pc, {{ p }}_sum2(C0));
-            aie::store_v(pc + 32, {{ p }}_sum2(C1));
-{% endif %}
-            pw += 512;
-            pc += {{ 2 * L }};
-        }
-        pw += SK;  // (the next super-block's slice, the same row group)
-    }
-}
-
-// the d [row 8][i 8] of two sub-units SU bytes apart (from u: codes, then d) -> tab [sb 2][i][r]
-template <int SU>
-__attribute__((noinline)) void {{ p }}_q80_d(const uint8_t *__restrict u, bfloat16 *__restrict tab)
-{
-    aie::store_v(tab, aie::transpose(aie::load_v<64>((const bfloat16 *)(u + 2048)), 8, 8));
-    aie::store_v(tab + 64, aie::transpose(aie::load_v<64>((const bfloat16 *)(u + SU + 2048)), 8, 8));
-}
-
-{% set unit = 272 * R80 %}
-{% set yo = (" + sb * ys" if rg else "") if R80 == 8 else " + %d * H" % L %}
-template <int H>
-__attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg and R80 == 8 else "" }})
-{
-    bfloat16 *tab = (bfloat16 *)scr;
-    bfloat16 *c = (bfloat16 *)(scr + 1024);
-    uint8_t *u = a + {{ 2 * unit if R80 == 8 else 2176 }} * H;  // (the core's first sub-unit; the next super-block's {{ unit }} B on)
-    {{ p }}_q80_d<{{ unit }}>(u, tab);
-    {{ p }}_q80_mm<2, {{ unit - 2048 }}>(xp, u, c);
-    AIE_LOOP_NO_UNROLL
-    for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg and R80 == 8 else "" }}
-        {{ p }}_sc1<1>(c + {{ 8 * L }} * sb, tab + 64 * sb, y{{ yo }});
-}
-"""
+_MMV = templating.source("artlite/formats/q8.mmv.cc.jinja")
 
 
 # GemmQd (prefill) on super-block units: the pass's 8-row groups
-_GEMM = r"""// Q8_0 (GemmQd, super-block units: formats/q8.py): the weight object is a unit of the pass's {{ T8 }} row groups of 8
-// rows, [group][codes [i 8][s 4][r 8][8 B] (2048 B) | d [r 8][i 8] bf16 (128 B)] at a pitch of {{ UP }} B. _sb: per row
-// group and group i the 64-lane scale vector [r][k] = d[r][i] -> ws [group][i][64]; _dq: per panel the codes to fp32
-// (exact) times it (exact), rounded once.
-void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
-{
-{% if "hdr" in ablate %}
-    return;
-{% endif %}
-    const uint8_t *__restrict pb = b + 2048;
-    bfloat16 *__restrict pw = ws;
-    AIE_LOOP_NO_UNROLL
-    for (int t = 0; t < {{ T8 }}; t++) {
-        const aie::vector<bfloat16, 64> dd = aie::transpose(aie::load_v<64>((const bfloat16 *)pb), 8, 8);  // [i][r]
-{% for i in range(8) %}
-        aie::store_v(pw + {{ 64 * i }}, al::expand8_of(dd.template extract<32>({{ i // 4 }}), {{ i % 4 }}));
-{% endfor %}
-        pb += {{ UP }};
-        pw += 512;
-    }
-}
-
-// k-tile kt of the unit -> {{ n }} x 64 bfp16 panels in the MAC pop order [16-row block][k-step ks][8-row half]: row
-// group 2 block + half, group i = 2 kt + ks / 4, step ks % 4
-void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
-                int32_t sb, int32_t kt{{ half_arg }})
-{
-{% if "ev_dq" in ablate or "ev_kt" in ablate %}
-    event0();
-{% endif %}
-{% if "dq" in ablate %}
-    return;
-{% endif %}
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const int8_t __aie_dm_resource_a *__restrict pq = (const int8_t __aie_dm_resource_a *)(b + 512 * kt);
-    const bfloat16 __aie_dm_resource_c *__restrict pd = (const bfloat16 __aie_dm_resource_c *)(ws + 128 * kt);
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
-    // (codes: k-steps 64 B apart, then the next block 2 row groups on; scales: 4 k-steps per group, the second group, then
-    // the next block)
-    dims_2d_t wq = dims_2d_from_steps(8, 64, {{ 2 * UP }});
-    dims_3d_t wd = dims_3d_from_steps(4, 0, 2, 64, 1024);
-    for (int it = 0; it < {{ n // 2 }}; it++) {  // (16-row block, k-step) = (it / 8, it % 8)
-        const aie::vector<bfloat16, 64> D0 = aie::load_v<64>(pd), D1 = aie::load_v<64>(pd + 512);
-        out.push(aie::mul(aie::to_float<bfloat16>(aie::load_v<64>(pq)), D0).template to_vector<bfp16ebs8>());
-        out.push(aie::mul(aie::to_float<bfloat16>(aie::load_v<64>(pq + {{ UP }})), D1).template to_vector<bfp16ebs8>());
-        pq = add_2d_ptr(pq, wq);
-        pd = add_3d_ptr(pd, wd);
-    }
-{% if "ev_dq" in ablate %}
-    event1();
-{% endif %}
-}
-
-"""
+_GEMM = templating.source("artlite/formats/q8.gemm.cc.jinja")
 
 
 class Q8Slot(Slot):

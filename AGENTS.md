@@ -102,7 +102,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, the NPU's turn between processes, profiler) and the host's hot code (weight packers, dequantization, sampling, the MoE prefill's host step); API and errors: `docs/design.md`; the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
 | `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
 | `src/artlite/{txn,elf_parser}.py`, `overlay.py` | control programs: transactions built on the host (the `insts.bin` format), full ELFs and the patching of their control code; the host runtime of the overlays, designs run by host-built transactions (`Sequence`, `OverlayDevice`, `Transaction`, `WeightBuffer`) |
-| `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, cache, dispatch), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py`, `render_cache.py`, and the pieces operators share (How an operator works) |
+| `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, cache, dispatch), `templating.py` (the kernel template files, `JINJA_ENV`), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py`, `render_cache.py`, and the pieces operators share (How an operator works) |
 | `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu; arrays through the gather LUT: `act`, `table_pass` and the tables; `silu_tanh`), each variant's bit-exact numpy model in `tests/operators/kmath_sim.py` (`tests/operators/test_kmath.py`) |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host; their configurations' tile writes as control packets: `ctrlpkt`; after a piece's first, without the array reset: `program.Quiet`, `locks`) |
@@ -132,9 +132,12 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 
 ## How an operator works
 
-- One file per operator: an `ArtcOperator` subclass implementing
+- One module per operator: an `ArtcOperator` subclass implementing
   - `get_kernel_src()`: C++ from a Jinja2 template (`JINJA_ENV`: undefined variables are errors) with shapes, trip
-    counts and strides as compile-time constants, its names under `kernel_prefix` (Rules);
+    counts and strides as compile-time constants, its names under `kernel_prefix` (Rules). Kernel templates are files
+    next to their module, `<module>.cc.jinja` (several: `<module>.<part>.cc.jinja`), named by their path from `src/`
+    in Python (`templating.load`, `templating.source`) and in `{% include %}` (on a line of its own: whole lines),
+    never C++ in Python strings;
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
 - Reuse the shared pieces instead of copying (`artlite/operators/`, the headers in `artlite/include/`): `kmath.py`

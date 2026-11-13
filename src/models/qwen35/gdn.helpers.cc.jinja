@@ -1,0 +1,27 @@
+{{ gm.expm1.src }}
+{{ gm.softplus.src }}
+{% if sigmoid %}
+{{ gm.sigmoid.src }}
+{% endif %}
+{# silu(x) of 32 bf16 lanes: one copy (inlined it needs a large frame) #}
+{{ gm.silu.src }}
+
+// 128 fp32 x -> x / sqrt(sum x^2 + eps) as bf16 hi, lo at h, l (64 B aligned)
+__attribute__((noinline)) void {{ p }}_l2(const float *__restrict x, bfloat16 *__restrict h, bfloat16 *__restrict l)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    aie::vector<bfloat16, 64> xh[2], xl[2];
+    for (int k = 0; k < 2; k++) {
+        al::split2<64>(aie::load_v<64>(x + 64 * k), xh[k], xl[k]);
+        ss = aie::mac(aie::mac(aie::mac(ss, xh[k], xh[k]), xh[k], xl[k]), xh[k], xl[k]);
+    }
+    const float inv = al::inv_rms<1>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    const aie::vector<float, 64> iv = aie::broadcast<float, 64>(inv);
+    for (int k = 0; k < 2; k++) {
+        aie::vector<bfloat16, 64> a, b;
+        al::split2<64>(al::mulff<64>(aie::load_v<64>(x + 64 * k), iv), a, b);
+        aie::store_v(h + 64 * k, a);
+        aie::store_v(l + 64 * k, b);
+    }
+}

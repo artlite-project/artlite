@@ -1,0 +1,122 @@
+// Q5_K: _hdr_sb expands a super-block's 6-bit scales of 16 rows at a time into ws [16-row block][A | B][group 8][row 16]
+{% include "gemm/plane8" %}
+
+// Q5_K (GemmQd): weight objects [plane 5][word ii 2][g {{ n }}] words (planes: the nibbles of steps 0 .. 3, the
+// qh nibbles; word ii: group 2 kt + ii), rows g of the pass's tiles zero-padded to {{ n }}. The header unit (the
+// tiles' scale planes [pair][row][8 words], permuted like the codes: its planes {{ 5 - nsb // 2 }} .. 4) spans
+// the four k-tile slots: _hcp collects their planes {{ hp0 }} .. 4 in hb ([kt][plane][ii][g] words), _hdr_sb expands a
+// super-block's scales before its k-tiles. Scale word w of a plane is in slot w / 2, word w % 2: sc lo (sb % 2), mn lo
+// (2 + sb % 2), crumbs (4 + sb % 2), d pair (6), -dmin pair (7).
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
+{
+    const bfloat16 *s = b + {{ 4 * hp0 * n }};  // (before the call: al::copy)
+    al::copy<{{ 2 * hs }}, 32>(hb + {{ 2 * hs }} * kt, s);
+}
+
+// super-block sb's scales of the pass's rows: ws [16-row block][A | B][group i 8][row 16] = bf16(d sc), bf16(-dmin mn)
+// (the decode's roundings; zero for the padding rows, whose words are zero)
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t *__restrict w = hb + 2 * ({{ 5 - nsb // 2 - hp0 }} + (sb >> 1)) * {{ n }} + (sb & 1) * {{ n }};
+    const unsigned ssh = (sb & 1) << 4;
+    AIE_LOOP_NO_UNROLL
+    for (int g = 0; g < {{ n }}; g += 16) {
+        const aie::vector<uint8, 128> cr = aie::load_v<128>((const uint4 *)(w + {{ 2 * hs }} + g)).unpack();
+        {{ p }}_plane8(aie::load_v<128>((const uint4 *)(w + g)).unpack(), cr,
+                       aie::load_v<16>(w + {{ 3 * hs }} - (sb & 1) * {{ n }} + g), 0, ssh, ws + 16 * g);
+        {{ p }}_plane8(aie::load_v<128>((const uint4 *)(w + {{ hs }} + g)).unpack(), cr,
+                       aie::load_v<16>(w + {{ 3 * hs + n }} - (sb & 1) * {{ n }} + g), 2, ssh, ws + 16 * g + 128);
+    }
+}
+
+// the k-tile's scales per MAC lane (groups 2 kt + ii of 16 rows, each row's scale repeated over its 8 k):
+// ex [16-row block][word ii][A0 | A1 bf16 x 64 | C0 | C1 fp32 x 64] with C = B - 128 A, exact in fp32
+// (ws: the super-block's scales from group 2 kt on)
+__attribute__((noinline)) void {{ p }}_expand(const bfloat16 *__restrict ws, bfloat16 *__restrict ex)
+{
+    const bfloat16 __aie_dm_resource_c *__restrict pa = (const bfloat16 __aie_dm_resource_c *)ws;
+    const bfloat16 __aie_dm_resource_d *__restrict pb = (const bfloat16 __aie_dm_resource_d *)(ws + 128);
+    bfloat16 *__restrict pe = ex;
+    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
+    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+    int ca = 0, cb = 0;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n // 8 }}; it++) {  // (16-row block, word ii) = (it / 2, it % 2)
+        aie::vector<bfloat16, 64> A0, A1, B0, B1;
+        al::expand16_bc(aie::load_v<16>(pa), A0, A1);
+        al::expand16_bc(aie::load_v<16>(pb), B0, B1);
+        aie::store_v(pe, A0);
+        aie::store_v(pe + 64, A1);
+        aie::store_v((float *)(pe + 128), aie::mac(aie::mul(A0, k128), B0, one).template to_vector<float>());
+        aie::store_v((float *)(pe + 256), aie::mac(aie::mul(A1, k128), B1, one).template to_vector<float>());
+        pe += 384;
+        // next word ii (group), or the next 16-row block's
+        pa = add_2d_ptr(pa, 240, 1, ca, 16);
+        pb = add_2d_ptr(pb, 240, 1, cb, 16);
+    }
+}
+
+// k-tile kt of super-block sb -> {{ n }} x 64 bfp16 panels in the MAC pop order [16-row block][k-step 4 ii + s]
+// [8-row half]: w = A q + B = (128 + q) A + C with q = lo + 16 hb (hb: bit s of the qh nibble), exact in fp32,
+// rounded once. The scales come expanded (_expand: the loop has room for the 8 panels of a 16-row block, the
+// steps' shifts compile-time constants) and the pointers walk 2-d patterns: II 50 per 8 panels.
+void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt{{ half_arg }}, bfloat16 *__restrict ex)
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if halves > 1 %}
+    if (half == 0)  // (the k-tile's scales of both halves)
+        {{ p }}_expand(ws + 32 * kt, ex);
+    b += half * {{ 4 * n_mac }};  // (the half's 16-row blocks)
+    const bfloat16 __aie_dm_resource_c *__restrict pe = (const bfloat16 __aie_dm_resource_c *)(ex + half * {{ n_mac // 8 * 384 }});
+{% else %}
+    {{ p }}_expand(ws + 32 * kt, ex);
+    const bfloat16 __aie_dm_resource_c *__restrict pe = (const bfloat16 __aie_dm_resource_c *)ex;
+{% endif %}
+    const uint8_t *__restrict ph = b + {{ 4 * 2 * 4 * n }};  // the qh plane
+    const uint8_t *__restrict pl = b;  // the nibbles of step s at + {{ 4 * 2 * n }} s
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
+    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
+    const aie::vector<uint8, 64> c16 = aie::broadcast<uint8, 64>(16);
+    int ch = 0, cl = 0;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n_mac // 8 }}; it++) {  // (16-row block, word ii) = (it / 2, it % 2)
+        const aie::vector<bfloat16, 64> A0 = aie::load_v<64>(pe), A1 = aie::load_v<64>(pe + 64);
+        const aie::accum<accfloat, 64> C0(aie::load_v<64>((const float __aie_dm_resource_d *)(pe + 128)));
+        const aie::accum<accfloat, 64> C1(aie::load_v<64>((const float __aie_dm_resource_d *)(pe + 256)));
+        // 16 qh: read back shifted down by the step (a multiply, not an upshift: the shifts 0 .. 3 then fit the 4
+        // shift registers, II 52 -> 50)
+        const aie::accum<acc32, 64> u0 = aie::mul(aie::unpack(aie::load_v<64>((const uint4 __aie_dm_resource_a *)ph)), c16);
+        const aie::accum<acc32, 64> u1 =
+            aie::mul(aie::unpack(aie::load_v<64>((const uint4 __aie_dm_resource_a *)(ph + 32))), c16);
+        AIE_LOOP_UNROLL_FULL
+        for (int s = 0; s < 4; s++) {
+            const aie::vector<uint8, 64> q0 = aie::bit_or(
+                aie::unpack(aie::load_v<64>((const uint4 __aie_dm_resource_a *)(pl + {{ 4 * 2 * n }} * s))),
+                aie::bit_and(u0.template to_vector<uint8>(s), c16));
+            const aie::vector<uint8, 64> q1 = aie::bit_or(
+                aie::unpack(aie::load_v<64>((const uint4 __aie_dm_resource_a *)(pl + {{ 4 * 2 * n }} * s + 32))),
+                aie::bit_and(u1.template to_vector<uint8>(s), c16));
+            out.push(aie::mac(C0, al::zipw(q0, c43), A0).template to_vector<bfp16ebs8>());
+            out.push(aie::mac(C1, al::zipw(q1, c43), A1).template to_vector<bfp16ebs8>());
+        }
+        pe += 384;
+        // next word ii, or the next 16-row block's word 0
+        ph = add_2d_byte(ph, {{ 64 - 4 * n }}, 1, ch, {{ 4 * n }});
+        pl = add_2d_byte(pl, {{ 64 - 4 * n }}, 1, cl, {{ 4 * n }});
+    }
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}
+

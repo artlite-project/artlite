@@ -8,6 +8,8 @@ from typing import ClassVar
 import numpy as np
 from ml_dtypes import bfloat16
 
+from ..operators import templating
+
 KC = 2048  # a K chunk of 8 super-blocks (the GEMM operators' default; the images' tiles: 1024 or 512)
 SB = 256  # super-block (8 groups of 32)
 KT = 64  # the prefill GEMMs' k-tile (a super-block: 4 k-tiles of 2 groups)
@@ -282,190 +284,14 @@ def sb_major(b: np.ndarray, R: int, n: int) -> np.ndarray:
 
 SOURCES = {
 # 16 table entries by 4x16 gathers (IQ4, IQ3_S)
-"mmv/g16": r"""// ---- 16 entries of a 4x16 gather table (a: their addresses, lanes 0, 1 of each 4 from one table copy, 2, 3 from the
-// other) -> lanes 0 .. 15: a lane's entry lands in halfword 0 of its 64-bit output lane, T16_16x4_lo gathers those of two
-// vectors in order
-[[clang::always_inline]] inline v16int16 {{ p }}_g16(v16int32 a)
-{
-    const v8int32 a0 = extract_v8int32(a, 0), a1 = extract_v8int32(a, 1);
-    const v16int32 c0 = concat(load_4x16_lo(a0), load_4x16_hi(a0));
-    const v16int32 c1 = concat(load_4x16_lo(a1), load_4x16_hi(a1));
-    return extract_v16int16((v32int16)::shuffle(c0, c1, T16_16x4_lo), 0);
-}
-
-""",
+"mmv/g16": templating.source("artlite/formats/common.mmv_g16.cc.jinja"),
 # the decode GEMV's scale tables and per-super-block scaling of the formats with a bf16 scale per 32-k group (Q4_0, Q4_1,
 # Q8_0)
-"mmv/trq": r"""// ---- Q5_K, Q6_K: Pass 1: a super-block's code planes of ps B -> scr [i][h][g][ql0 | ql1 | c0 | c1], per half h of its
-// steps: the low nibbles of its two steps (the planes from src on), the high bits of its two steps (the plane from q on,
-// masked by m0, m1 (<< ms per half), still packed); sa, qa: past a half's low planes, to the next half's
-__attribute__((noinline)) void {{ p }}_trq(const uint8_t *__restrict src, const uint8_t *__restrict q, uint8_t *__restrict scr,
-                                           int ps, int sa, int qa, int m0, int m1, int ms)
-{
-    const uint8_t *s = src, *ph = q;
-    uint8_t *d = scr;
-    AIE_LOOP_NO_UNROLL
-    for (int h = 0; h < 2; h++) {
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int j = 0; j < 2; j++) {  // the low-nibble planes of the half's steps, both row groups (256 B apart)
-            v16int32 o0, o1, o2, o3, u0, u1, u2, u3;
-            {{ p }}_tr8<32>(s, o0, o1, o2, o3);
-            {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
-            {{ p }}_put8<512>(d, o0, o1, o2, o3);
-            {{ p }}_put8<512>(d + 128, u0, u1, u2, u3);
-            s += ps;
-            d += 32;
-        }
-        const v16int32 a = broadcast_to_v16int32(m0), b = broadcast_to_v16int32(m1);
-        v16int32 o0, o1, o2, o3, u0, u1, u2, u3;  // qh
-        {{ p }}_tr8<32>(ph, o0, o1, o2, o3);
-        {{ p }}_tr8<32>(ph + 256, u0, u1, u2, u3);
-        {{ p }}_put8<512>(d, band(o0, a), band(o1, a), band(o2, a), band(o3, a));
-        {{ p }}_put8<512>(d + 32, band(o0, b), band(o1, b), band(o2, b), band(o3, b));
-        {{ p }}_put8<512>(d + 128, band(u0, a), band(u1, a), band(u2, a), band(u3, a));
-        {{ p }}_put8<512>(d + 160, band(u0, b), band(u1, b), band(u2, b), band(u3, b));
-        s += sa;
-        ph += qa;
-        d += 256 - 64;
-        m0 <<= ms;
-        m1 <<= ms;
-    }
-}
-""",
-"mmv/dtab": r"""// ---- Q4_0, Q4_1, Q8_0: per 32-k group i one exact sum c = bf16(C[hi rows] + C[lo rows]), y += c d (d exact in bf16).
-
-// The scales d [row][sb][i] (rows of 8 NSB bf16) of G row groups and NS super-blocks from d -> tab [sb][g][i][r] (64
-// bf16 per (sb, g))
-template <int G, int NS = {{ NSB }}>
-__attribute__((noinline)) void {{ p }}_dtab(const bfloat16 *__restrict d, bfloat16 *__restrict tab)
-{
-    bfloat16 *__restrict pt = tab;
-    AIE_LOOP_NO_UNROLL AIE_LOOP_REG_REWRITE_BASIC  // (II 11; the default rewrite: 13)
-    for (int t = 0; t < NS * G; t++) {
-        const bfloat16 *q = d + {{ 64 * NSB }} * (t % G) + 8 * (t / G);  // (row group t % G, super-block t / G)
-        const aie::vector<bfloat16, 64> v = al::gather<8, 8>(q, {{ 8 * NSB }});
-        aie::store_v(pt, aie::transpose(v, 8, 8));  // [r][i] -> [i][r]
-        pt += 64;
-    }
-}
-
-// One super-block: y[g] += sum over the 8 groups i of c_g,i (c [i][g][{{ L }}]) times tab [g][i][r] (G row groups; y
-// [g][slot][r])
-template <int G>
-__attribute__((noinline)) void {{ p }}_sc1(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y)
-{
-    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
-    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
-    const bfloat16 __aie_dm_resource_b *__restrict ph = (const bfloat16 __aie_dm_resource_b *)tab;
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int i = 0; i < 8; i++) {
-        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(pc), aie::load_v<8>(ph).template grow_replicate<{{ L }}>());
-        if constexpr (G == 2)
-            Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(pc + {{ L }}), aie::load_v<8>(ph + 64).template grow_replicate<{{ L }}>());
-        pc += {{ L }} * G;
-        ph += 8;
-    }
-    aie::store_v(y, Y0.template to_vector<float>());
-    if constexpr (G == 2)
-        aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
-}
-""",
+"mmv/trq": templating.source("artlite/formats/common.mmv_trq.cc.jinja"),
+"mmv/dtab": templating.source("artlite/formats/common.mmv_dtab.cc.jinja"),
 # the 6-bit scale expansion of Q4_K and Q5_K (``outs``: Q4_K's scattered group stores)
-"gemm/plane8": r"""// lo / hi: the 6-bit values' low nibbles and high crumbs (shifted by hsh) [row 16][group 8]; sw: the
-// rows' scale words (shifted by ssh: the bf16 in the low half) -> out (group n at out + outs[n])
-[[clang::always_inline]] inline void {{ p }}_plane8(aie::vector<uint8, 128> lo, aie::vector<uint8, 128> hi,
-                                                  aie::vector<uint32, 16> sw, unsigned hsh, unsigned ssh,
-                                                  bfloat16 *__restrict out)
-{
-    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
-    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
-    aie::vector<uint8, 128> c = aie::bit_and(aie::downshift(hi, hsh), aie::broadcast<uint8, 128>(3));
-    aie::vector<uint8, 128> v = aie::bit_or(lo, aie::upshift(c, 4));  // 6-bit values [row 16][group 8]
-    aie::vector<bfloat16, 16> s16 = aie::filter_even(aie::downshift(sw, ssh).template cast_to<bfloat16>(), 1);  // row scales
-    aie::vector<bfloat16, 64> S0, S1;
-    al::expand16(s16, S0, S1);
-    // (128 + v) s - 128 s = v s exact in fp32, one rounding
-    aie::vector<bfloat16, 64> r0 =
-        aie::mac(aie::mul(S0, k128), al::zipw(v.template extract<64>(0), c43), S0).template to_vector<bfloat16>();
-    aie::vector<bfloat16, 64> r1 =
-        aie::mac(aie::mul(S1, k128), al::zipw(v.template extract<64>(1), c43), S1).template to_vector<bfloat16>();
-    auto [e1, o1] = aie::interleave_unzip(r0, r1, 1);
-    auto [e2, o2] = aie::interleave_unzip(e1, o1, 1);
-    auto [e3, o3] = aie::interleave_unzip(e2, o2, 1);
-{% if outs is not defined %}
-    aie::store_v(out, e3);  // [group n 8][row 16]: groups 0 .. 3, 4 .. 7
-    aie::store_v(out + 64, o3);
-{% else %}
-    aie::vector<bfloat16, 128> tr = aie::concat(e3, o3);  // [group n 8][row 16]
-{% for o in outs %}
-    aie::store_v(out + {{ o }}, tr.template extract<16>({{ loop.index0 }}));
-{% endfor %}
-{% endif %}
-}
-
-""",
+"gemm/plane8": templating.source("artlite/formats/common.gemm_plane8.cc.jinja"),
 # GemmQ / GemmQd's dequant of the tile-major Q4 tiles (Q4_0 / Q4_1 of 16 rows x 2048, Q4_K); BFP16 kernels render it
 # too, unused
-"gemm/dq_tile_major": r"""// Dequantize k-tile kt of super-block sb: b ({{ tq // 2 }} KB) = {{ 16 * tq }} packed panels [tile {{ tq }}][k-step
-// (il, s)][half][row][word] -> stage = the same panels as bfp16ebs8 d (q - 8), the MAC's B operands (GemmQd: the
-// dequantizing core's output; GemmQ: a core's half of the k-tile, tq = 2 of the pass's 4 tiles)
-void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint8_t *__restrict stage,
-                int32_t sb, int32_t kt)
-{
-{% if "ev_dq" in ablate or "ev_kt" in ablate %}
-    event0();
-{% endif %}
-{% if "dq" in ablate %}
-    return;
-{% endif %}
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    // scales of groups 2 kt, 2 kt + 1 of super-block sb: header slot
-    // (kt'' = 2 (sb % 2) + kt / 2, il'' = kt % 2, s'' = sb / 2), h = group % 2
-{% if nsb == 8 %}
-    const bfloat16 __aie_dm_resource_c *__restrict hd = (const bfloat16 __aie_dm_resource_c *)
-        (ws + ((2 * (sb & 1) + (kt >> 1)) * 2 + (kt & 1)) * {{ 128 * tq }} + (sb >> 1) * {{ 32 * tq }});
-{% else %}
-    // ([group / 2][tile][group % 2][row 16]: _hdr_q4k of 1024-column tiles)
-    const bfloat16 __aie_dm_resource_c *__restrict hd = (const bfloat16 __aie_dm_resource_c *)(ws + (sb * 4 + kt) * {{ 32 * tq }});
-{% endif %}
-    const uint4 __aie_dm_resource_a *__restrict pb = (const uint4 __aie_dm_resource_a *)b;
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
-    const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
-{% if fmt in ("Q4_1", "Q4_K") %}
-    // w = d q + m = (128 + q) d + (m - 128 d), exact in fp32 (Q4_K: d = d sc, m = -dmin mn)
-    const bfloat16 __aie_dm_resource_d *__restrict hm = (const bfloat16 __aie_dm_resource_d *)(hd + {{ 128 * tq * nsb }});
-    const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
-{% else %}
-    // w = d (q - 8) = (128 + q) d - 136 d, exact in fp32
-    const aie::vector<bfloat16, 64> k136 = aie::broadcast<bfloat16, 64>(-136.0f);
-{% endif %}
-    // (L_RM_PORT-bound: shuffles + the stream's pushes / flushes, II 40 per 8 panels; post-RA only: 41)
-    for (int it = 0; it < {{ 2 * tq }}; it++) {  // (tile, group) = (it / 2, 2 kt + it % 2)
-        aie::vector<bfloat16, 64> D0, D1;
-        al::expand16_bc(aie::load_v<16>(hd), D0, D1);
-        hd += 16;
-{% if fmt in ("Q4_1", "Q4_K") %}
-        aie::vector<bfloat16, 64> M0, M1;
-        al::expand16_bc(aie::load_v<16>(hm), M0, M1);
-        hm += 16;
-        aie::accum<accfloat, 64> C0 = aie::mac(aie::accum<accfloat, 64>(M0), D0, k128);  // (no ones vector: one spill less)
-        aie::accum<accfloat, 64> C1 = aie::mac(aie::accum<accfloat, 64>(M1), D1, k128);
-{% else %}
-        aie::accum<accfloat, 64> C0 = aie::mul(D0, k136);
-        aie::accum<accfloat, 64> C1 = aie::mul(D1, k136);
-{% endif %}
-        AIE_LOOP_UNROLL_FULL
-        for (int st = 0; st < 4; st++) {
-            aie::vector<uint8, 64> q0 = aie::unpack(aie::load_v<64>(pb));
-            aie::vector<uint8, 64> q1 = aie::unpack(aie::load_v<64>(pb + 32));
-            pb += 64;
-            out.push(aie::mac(C0, al::zipw(q0, c43), D0).template to_vector<bfp16ebs8>());
-            out.push(aie::mac(C1, al::zipw(q1, c43), D1).template to_vector<bfp16ebs8>());
-        }
-    }
-{% if "ev_dq" in ablate %}
-    event1();
-{% endif %}
-}
-""",
+"gemm/dq_tile_major": templating.source("artlite/formats/common.gemm_dq_tile_major.cc.jinja"),
 }

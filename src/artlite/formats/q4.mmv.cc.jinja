@@ -1,0 +1,53 @@
+{% if NSB == 2 %}
+// ---- Q4_0 ({{ R40 }} rows, 512 columns): d [row][sb][i] bf16 | codes [sb][row][128 B] = words (s 4, i 8) of 8 consecutive k
+// (as Q4_K's). Core H: rows 16 H .. 16 H + 15 of every super-block (the row split). Scratch: tab [sb][g][i][r] (256 B
+// per sb) | c [sb][i][g][32] (1 KB per sb)
+
+// Pass 1: the core's codes in place, per (sb, g, s) -> panel (s, i) at row 8 g + i's chunk s ([sb][g][i][s][32 B])
+__attribute__((noinline)) void {{ p }}_q40_tr(const uint8_t *__restrict src, uint8_t *__restrict dst)
+{
+    const uint8_t *s = src;
+    uint8_t *d = dst;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < {{ 8 * NSB }}; t++) {  // (sb, g, s): 1 KB blocks [row 8][128 B], chunk s at 32 s
+        v16int32 o0, o1, o2, o3;
+        {{ p }}_tr8<128>(s, o0, o1, o2, o3);
+        {{ p }}_put8<128>(d, o0, o1, o2, o3);
+        const int step = (t & 3) != 3 ? 32 : ((t & 7) != 7 ? 1024 - 96 : {{ 128 * R40 - 1024 - 96 }});
+        s += step;
+        d += step;
+    }
+}
+
+// rows 16 H .. 16 H + 15 of a Q4_0 tile: y[g][32] (rows 8 g ..) += their sums against xp (the chunk's panels)
+template <int H>
+__attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+{
+    uint8_t *codes = a + {{ 16 * NSB * R40 }} + 2048 * H;
+    bfloat16 *tab = (bfloat16 *)scr;
+    bfloat16 *c = (bfloat16 *)(scr + 1024);
+    {{ p }}_q40_tr(codes, codes);
+    {{ p }}_dtab<2>((const bfloat16 *)a + {{ 128 * NSB }} * H, tab);
+    {{ p }}_q40_mm<{{ NSB }}, {{ 128 * R40 - 1024 }}>(xp, xs, codes, c);
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < {{ NSB }}; sb++)
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * sb, tab + 128 * sb, y);
+}
+{% else %}
+// ---- Q4_0 ({{ R40 }} rows): d [row][sb][i] bf16 | codes (mmv/q4s). y[g][32] (rows 8 g ..) += the rows of super-blocks 2 H,
+// 2 H + 1 against xp (their 64 panels)
+template <int H>
+__attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
+{
+    bfloat16 *tab = (bfloat16 *)(scr + 4096);
+    bfloat16 *c = (bfloat16 *)(scr + 4608);
+    {{ p }}_q4s_tr(a + {{ 64 * R40 }} + {{ 256 * R40 }} * H, scr, {{ 128 * R40 }});
+    {{ p }}_dtab<2, 2>((const bfloat16 *)a + 16 * H, tab);
+    {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++)  // (rg: super-block 2 H + 1's rows into y + ys, rows of their own)
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
+}
+{% endif %}

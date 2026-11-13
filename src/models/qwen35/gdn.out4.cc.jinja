@@ -1,0 +1,59 @@
+// The k head's P object: its q block's new history, the block's lanes' gates, the ssm parameters
+void {{ p }}_ghq(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.hb }}), {{ (P_PRM + 640) // 64 }});
+}
+
+// The k head's K object: its k block's history (the base rows, then the block's lanes')
+void {{ p }}_ghk(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(uint8_t, {{ g.kh }}));
+}
+
+// The v head's gated outputs rms(o) ssm_norm silu(z) of the step's lanes (t0 + r) & 7, r < 4 -> d ([k block 16][slot 4][8]
+// bf16; 1 KB of padding), its history's rows 0 .. 7 2 KB on; the next v head (of the next k head after the last of this one's).
+// (o: [panel 16][lane 8][8]; z from the message, its SiLU's rows in vt, the panels being through; the slots past the step's go
+// nowhere; its kb loop no hardware loop: a minimum of 1 iteration)
+void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int t0 = st[{{ G_NREP }}];
+    const float *__restrict nw = GW(float, {{ g.prm }}) + 32;
+    float *__restrict sz = GW(float, {{ g.vt }});
+    bfloat16 *__restrict zb = GW(bfloat16, {{ g.zb }});
+    const bfloat16 *__restrict z = GW(bfloat16, {{ g.msg }}) + {{ CH }} + {{ D }} * st[{{ G_VH }}];
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ SMAX }}; t++)
+        {{ p }}_cp4k(zb + {{ D }} * t, z + {{ MSGP }} * t, {{ 2 * D // 64 }});
+    {{ p }}_silu(zb, GW(bfloat16, {{ g.cc }}), sz, st);
+    const float *__restrict o = GW(float, {{ g.o }});
+    {{ p }}_gnorm(o, GW(float, {{ g.xy }}));
+    const aie::vector<float, 32> iv = al::bcast8(aie::shuffle_down_rotate(aie::load_v<8>(GW(float, {{ g.xy }}) + 64), t0)).template extract<32>(0);
+    const int l0 = 8 * t0, l1 = 8 * ((t0 + 1) & 7), l2 = 8 * ((t0 + 2) & 7), l3 = 8 * ((t0 + 3) & 7);
+    AIE_LOOP_NO_UNROLL
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (int kb = 0; kb < 16; kb++) {
+        const float *__restrict ok = o + 64 * kb;
+        const aie::vector<float, 32> ov = al::concat(aie::load_v<8>(ok + l0), aie::load_v<8>(ok + l1), aie::load_v<8>(ok + l2), aie::load_v<8>(ok + l3));
+        const aie::vector<float, 32> w = aie::load_v<8>(nw + 8 * kb).template grow_replicate<32>();
+        const aie::vector<float, 32> zk = al::gather<4, 8>(sz + 8 * kb, {{ D }});
+        const aie::vector<float, 32> t = al::mulff<32>(al::mulff<32>(al::mulff<32>(ov, iv), w), zk);
+        aie::store_v(d + 32 * kb, aie::accum<accfloat, 32>(t).template to_vector<bfloat16>());
+    }
+    {{ p }}_cp4k(d + {{ 8 * D }}, GW(bfloat16, {{ g.kh }}), {{ 16 * D // 64 }});
+    st[{{ G_PANEL }}] = 0;
+    const int vi = st[{{ G_VI }}] + 1, last = vi == {{ HC // 2 }};
+    const int kh = st[{{ G_KH }}] + last;
+    st[{{ G_VI }}] = last ? 0 : vi;
+    st[{{ G_KH }}] = kh;
+    st[{{ G_VH }}] = 2 * (last ? 0 : vi) + kh;
+}
+
+// The v head's history's rows 8 .. 15 (then 2 KB that go nowhere)
+void {{ p }}_gvhout(int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_cp4k(d, GW(bfloat16, {{ g.kh }}) + {{ 8 * D }}, {{ 16 * D // 64 }});
+}
+
+}  // extern "C"

@@ -15,8 +15,9 @@ from ml_dtypes import bfloat16
 from numpy.typing import DTypeLike
 
 from artlite.operators import kmath
-from artlite.operators.base import JINJA_ENV, ArgSpec, ArtcOperator
+from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.design import COLS, ROWS, linear_tap
+from artlite.operators.templating import JINJA_ENV
 
 
 def vec(n: int, dtype: DTypeLike) -> type[np.ndarray]:

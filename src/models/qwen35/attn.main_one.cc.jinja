@@ -1,0 +1,72 @@
+
+{% set exp2 = km.exp2(32, below="zero", inline=True) %}
+{{ exp2.src }}
+
+// A head's gates: sigmoid(g) = 1 / (1 + 2^(-g log2 e)) (bf16-level: the output is rounded to bf16; -g log2 e: al::log2e's
+// products of the bf16 g, negated)
+__attribute__((noinline)) void {{ p }}_gates(const bfloat16 *__restrict g, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < {{ HD // 32 }}; j++) {
+        const aie::vector<bfloat16, 32> gb = aie::load_v<32>(g);
+        const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
+                                                     aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
+        aie::store_v(out, aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>());
+        g += 32;
+        out += 32;
+    }
+}
+
+namespace {
+
+// An object of another core (the main core's begin): an F_ATT object: its q objects' gates and its o's R objects
+// (the state words MG_*)
+[[clang::always_inline]] inline void {{ p }}_gbegin(const int32_t *__restrict m, int32_t *__restrict st, int32_t col)
+{
+    const int att = m[{{ M_FLAGS }}] & {{ F_ATT }};
+    st[{{ MG_Q }}] = att ? m[{{ M_NS }}] : 0;
+    st[{{ MG_I }}] = 0;
+    st[{{ MG_NO }}] = att ? {{ NO_OBJ }} : 0;
+    st[{{ MG_E }}] = 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+// A skipped X object: a q object: its heads' sigmoid(gate) into the gate table gt ([row 8 h + s][256] bf16 in the helper's x
+// panels, idle in the attention)
+__attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_t *__restrict ws, bfloat16 *__restrict gt)
+{
+    int32_t *__restrict st = ws;
+    const int i = st[{{ MG_I }}];
+    if (i >= st[{{ MG_Q }}])
+        return;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    st[{{ MG_I }}] = i + 1;
+    const bfloat16 *__restrict pay = x + {{ 2 * META }};
+    AIE_LOOP_NO_UNROLL
+    for (int h = 0; h < {{ QC }}; h++)
+        {{ p }}_gates(pay + {{ 2 * HD }} * h + {{ HD }}, gt + {{ HD }} * (8 * h + i));
+}
+
+// An R object -> a C object: of o (fp32 y / l [slot 8][8] of a head's k block: the gates' products, bf16), or a record's
+// (bf16)
+void {{ p }}_mrelay(const bfloat16 *__restrict r, bfloat16 *__restrict o, int32_t *__restrict ws, const bfloat16 *__restrict gt)
+{
+    int32_t *__restrict st = ws;
+    const int e = st[{{ MG_E }}];
+    st[{{ MG_E }}] = e + 1;
+    if (e >= st[{{ MG_NO }}]) {
+        aie::store_v(o, aie::load_v<{{ C_LEN }}>(r));
+        return;
+    }
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *__restrict g = gt + {{ 8 * HD }} * (e >> 5) + 8 * (e & 31);
+    const aie::vector<bfloat16, 64> gv = al::gather<8, 8>(g, {{ HD }});
+    // (g bf16: mulff's products less g's lo part, 0)
+    aie::store_v(o, al::mulc<64>(aie::load_v<64>((const float *)r), gv).template to_vector<bfloat16>());
+}
+
+}  // extern "C"

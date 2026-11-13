@@ -1,0 +1,43 @@
+// {{ fmt }} (GemmQd, planar: formats/k23.py): weight objects [word {{ W }}][g {{ n }}] (the k-tile's
+// code words of rows g of the pass's tiles, zero-padded to {{ n }}). The header ({{ nw }} words per row, word-major like
+// the codes: gathered row g holds the header of the same tile row) comes as {{ hu }} unit(s) of {{ cw }} words from
+// {{ skip }} words before the tile (the previous tile's codes): _hcp collects the units' k-tile slots in hb ([word][g]:
+// header word w at {{ hpad }} + w), _hdr_sb turns a super-block's scales into ws before its k-tiles.
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t unit, int32_t kt)
+{
+    const int w0 = {{ cw }} * unit + {{ W }} * kt - {{ skip - hpad }};  // (the hb word of the slot's first)
+    if (w0 < 0)
+        return;  // (codes of the previous tile)
+    al::copy<{{ 2 * W * n }}, 32>(hb + {{ 2 * n }} * w0, b);
+}
+
+using {{ p }}_BV = v64bfp16ebs8;
+// [s]: the one-hot panel of column s (W [k][m] = 1 for m = s): X W^T repeats column s of X over each row's 8 lanes
+alignas(64) static const int8_t {{ p }}_onehot[8][64] = {
+{% for s in range(8) %}
+    { {% for i in range(64) %}{{ 1 if i % 8 == s else 0 }}, {% endfor %}},
+{% endfor %}
+};
+
+// the nibbles of 8 rows' words (32 B at w) as bytes [r][nibble]
+[[clang::always_inline]] inline v64int8 {{ p }}_nib(const uint32_t *w)
+{
+    return (v64int8)unpack(*(const v64uint4 *)w);
+}
+
+// lanes [s][r]: the bf16 halves (lo, hi) of 8 rows' 32-bit words (32 B at w), the 8 values repeated 8 times
+[[clang::always_inline]] inline void {{ p }}_d64(const uint32_t *w, aie::vector<bfloat16, 64> &lo,
+                                                 aie::vector<bfloat16, 64> &hi)
+{
+    const aie::vector<bfloat16, 16> v = aie::load_v<16>((const bfloat16 *)w);
+    lo = aie::filter_even(v, 1).template grow_replicate<64>();
+    hi = aie::filter_odd(v, 1).template grow_replicate<64>();
+}
+
+// S = bf16(d T) (T: integer scales of 8 rows, lanes [s][r])
+[[clang::always_inline]] inline void {{ p }}_scale64(v64accfloat T, aie::vector<bfloat16, 64> d64,
+                                                     bfloat16 *__restrict S)
+{
+    aie::store_v(S, aie::mul(aie::accum<accfloat, 64>(T).template to_vector<bfloat16>(), d64).template to_vector<bfloat16>());
+}
+

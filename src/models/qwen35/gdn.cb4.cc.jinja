@@ -1,0 +1,182 @@
+// The decays of a block's 8 lanes (d fp32, 0 past its lanes): er [row t][16]: lanes s < t E[t][s] = prod_{u = s + 1 .. t}
+// (1 + d_u) - 1, lane 8 prod_{u = 0 .. t} (1 + d_u) - 1 (no cancellation for weak decays), three bf16 products per factor;
+// gm: lane 8 of each row (Gamma - 1 per lane)
+__attribute__(({{ cold }})) void {{ p }}_decays(const float *__restrict d, float *__restrict er, float *__restrict gm)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *__restrict dh = (bfloat16 *)(er + 128), *__restrict dl = dh + 16;
+    {
+        aie::vector<bfloat16, 16> h, l;
+        al::split2<16>(aie::load_v<16>(d), h, l);
+        aie::store_v(dh, h);
+        aie::store_v(dl, l);
+    }
+    aie::vector<float, 16> e = aie::zeros<float, 16>();
+    unsigned m = 0x100u;  // (lanes s < t, the start)
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < 8; k++) {
+        const aie::vector<bfloat16, 16> bh = aie::broadcast<bfloat16, 16>(dh[k]), bl = aie::broadcast<bfloat16, 16>(dl[k]);
+        aie::vector<bfloat16, 16> eh, el;
+        al::split2<16>(e, eh, el);
+        aie::accum<accfloat, 16> acc(aie::add(e, aie::broadcast<float, 16>(d[k])));
+        acc = aie::mac(aie::mac(aie::mac(acc, bh, eh), bh, el), bl, eh);
+        e = aie::select(aie::zeros<float, 16>(), acc.template to_vector<float>(), aie::mask<16>::from_uint32(m));
+        aie::store_v(er + 16 * k, e);
+        gm[k] = e[8];
+        m = ((m & 0xFFu) << 1) | 1u | 0x100u;
+    }
+}
+
+// Column s of an 8 x 8 block x ([t][s]: lane 8 t + s) as 8 lanes over t
+template <int S>
+[[clang::always_inline]] inline aie::vector<float, 8> {{ p }}_col(aie::vector<float, 64> x)
+{
+    const aie::vector<float, 32> a = (S & 4) ? aie::filter_odd(x, 4) : aie::filter_even(x, 4);
+    const aie::vector<float, 16> b = (S & 2) ? aie::filter_odd(a, 2) : aie::filter_even(a, 2);
+    return (S & 1) ? aie::filter_odd(b, 1) : aie::filter_even(b, 1);
+}
+
+// L = beta (1 + E) K K^T (s < t), M = (1 + E) Q K^T (s <= t) from the Gram blocks g and er, as their columns ([s][t] fp32: lc,
+// mc; column s: lane s's U's factor in each lane t)
+__attribute__((noinline)) void {{ p }}_lm(const float *__restrict be, const float *__restrict g, const float *__restrict er,
+                                        float *__restrict lc, float *__restrict mc)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<float, 64> e = {{ p }}_blk<16>(er);
+    const aie::vector<float, 64> kk = aie::load_v<64>(g), q = aie::load_v<64>(g + 64);
+    const aie::vector<float, 64> l = aie::select(aie::zeros<float, 64>(), al::mulff<64>(al::bcast8(aie::load_v<8>(be)), aie::add(kk, al::mulff<64>(e, kk))),
+                                                 aie::mask<64>::from_uint64(0x{{ strict }}ull));
+    const aie::vector<float, 64> m = aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), aie::mask<64>::from_uint64(0x{{ lower }}ull));
+{% for c in range(8) %}
+    aie::store_v(lc + {{ 8 * c }}, {{ p }}_col<{{ c }}>(l));
+    aie::store_v(mc + {{ 8 * c }}, {{ p }}_col<{{ c }}>(m));
+{% endfor %}
+}
+
+// A chunk's constants for a v head from its lanes' gates (dn: [lane][d 8 | beta 8] fp32): the decays, L and M's columns
+// and [beta | Gamma - 1] per lane (cc: [lc 64 | mc 64 | beta 8 | Gamma - 1 8]); chunk 0: the block's lanes 0 .. n1 - 1
+// (and the block's update's factors when it ends in the step), chunk 1: the next block's lanes of a step past the block's end
+__attribute__(({{ cold }})) void {{ p }}_vhead(int32_t *__restrict ws, int c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int32_t *__restrict st = GW(int32_t, {{ g.st }});
+    const int h = st[{{ G_VH }}], e = st[{{ G_NREP }}] + st[{{ G_NS }}];
+    const int n = {% if SMAX == 8 %}c > 1 ? st[{{ G_BN }}] : {% endif %}c ? e - 8 : (e < 8 ? e : 8);
+    float *__restrict er = GW(float, {{ g.er }});
+    float *__restrict tv = GW(float, {{ g.xy }});  // (d [16] | beta [16])
+    const float *__restrict dn = GW(float, {{ g.dn }}) + 128 * c;
+    float *__restrict cc = GW(float, {{ g.cc }}) + 144 * c;
+    al::zero<32, 16>(tv);
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < n; t++) {
+        tv[t] = dn[16 * t + h];
+        tv[16 + t] = dn[16 * t + 8 + h];
+    }
+    {{ p }}_decays(tv, er, cc + 136);
+    {{ p }}_lm(tv + 16, GW(float, {{ g.gg }}) + 128 * c, er, cc, cc + 64);
+    aie::store_v(cc + 128, aie::load_v<8>(tv + 16));
+    if (!c && e >= 8) {  // the block's update's factors: U' = U (1 + E[7][s]) per lane, the state's E of the 8 lanes
+        const float *__restrict row = er + 112;
+        aie::store_v(GW(float, {{ g.uf }}), aie::add(aie::load_v<8>(row), aie::broadcast<float, 8>(1.0f)));
+        aie::vector<bfloat16, 16> ch, cl;
+        al::bf16_hilo<16>(row[8], ch, cl);
+        aie::store_v(GW(bfloat16, {{ g.dc }}), ch);
+        aie::store_v(GW(bfloat16, {{ g.dc }}) + 16, cl);
+    }
+}
+
+// X, Y of a chunk's lanes on a panel: its 16 [j 8][i 8] blocks (fp32, split hi + lo on the MMUL) against the lanes' K, Q
+// panels k, q ([ib][hi, lo] of [t 8][i 8] blocks: a lane's own blocks): xy = [X | Y] ([t][j] fp32)
+__attribute__((noinline)) void {{ p }}_xy(const float *__restrict s, const uint8_t *__restrict k, const uint8_t *__restrict q,
+                                        float *__restrict xy)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    al::MM8 x(aie::zeros<accfloat, 64>()), y(aie::zeros<accfloat, 64>());
+    al::BIn<> ks((const bfp16ebs8 *)k), qs((const bfp16ebs8 *)q);
+    const float *__restrict ps = s;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int ib = 0; ib < 16; ib++) {
+        al::BV sh, sl;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(ps)), nI, sh, sl);
+        ps += 64;
+        const al::BV kh = ks.pop(), kl = ks.pop(), qh = qs.pop(), ql = qs.pop();
+        x.mac(kh, TR(sh));
+        y.mac(qh, TR(sh));
+        x.mac(kh, TR(sl));
+        y.mac(qh, TR(sl));
+        x.mac(kl, TR(sh));
+        y.mac(ql, TR(sh));
+    }
+    aie::store_v(xy, x.to_accum().template to_vector<float>());
+    aie::store_v(xy + 64, y.to_accum().template to_vector<float>());
+}
+
+// A chunk's lanes on a panel ([t][j] fp32: X, Y in xy, V in v): R = beta (V - Gamma X); U by forward substitution in lane
+// order (lane t: R_t - sum_{s < t} L[t][s] U_s, s increasing: a lane's U is the same in a step of any lanes), O = Gamma Y +
+// sum_{s <= t} M[t][s] U_s, over the chunk's n lanes (s < n: the lanes past them take no part in theirs). cc: the chunk's
+// constants (``vhead``); u: the lanes' U; o: the lanes of omask (v may be o: read first)
+__attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const float *v, const float *__restrict cc,
+                                           float *__restrict u, float *o, uint64_t omask, int n)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<float, 64> g = al::bcast8(aie::load_v<8>(cc + 136)), be = al::bcast8(aie::load_v<8>(cc + 128));
+    const aie::vector<float, 64> x = aie::load_v<64>(xy), y = aie::load_v<64>(xy + 64);
+    aie::vector<float, 64> a = al::mulff<64>(be, aie::sub(aie::sub(aie::load_v<64>(v), x), al::mulff<64>(g, x)));
+    aie::accum<accfloat, 64> c(aie::add(y, al::mulff<64>(g, y)));
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < n; s++) {
+        aie::vector<bfloat16, 64> uh, ul, lh, ll, mh, ml;
+        al::split2<64>(a.template extract<8>(s).template grow_replicate<64>(), uh, ul);  // (U_s over j, every row)
+        al::split2<64>(al::bcast8(aie::load_v<8>(cc + 8 * s)), lh, ll);
+        al::split2<64>(al::bcast8(aie::load_v<8>(cc + 64 + 8 * s)), mh, ml);
+        a = aie::msc(aie::msc(aie::msc(aie::accum<accfloat, 64>(a), lh, uh), lh, ul), ll, uh).template to_vector<float>();
+        c = aie::mac(aie::mac(aie::mac(c, mh, uh), mh, ul), ml, uh);
+    }
+    aie::store_v(u, a);
+    aie::store_v(o, aie::select(aie::load_v<64>(o), c.template to_vector<float>(), aie::mask<64>::from_uint64(omask)));
+}
+
+// so = si + dc si + U'^T K^T in one pass (kt: the K^T panels, up: U'; n: 1, unknown at compile time: the block vectors
+// popped ahead of the inner loop, which the register allocation needs)
+__attribute__((noinline)) void {{ p }}_dupdate(const float *__restrict si, float *__restrict so, const bfloat16 *__restrict dc,
+                                             const uint8_t *__restrict kt, const uint8_t *__restrict up, int n)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 64> ch = aie::load_v<16>(dc).template grow_replicate<64>(), cl = aie::load_v<16>(dc + 16).template grow_replicate<64>();
+    const float __aie_dm_resource_c *__restrict pi = (const float __aie_dm_resource_c *)si;
+    float __aie_dm_resource_d *__restrict po = (float __aie_dm_resource_d *)so;
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < n; j++) {
+        al::BIn<> us((const bfp16ebs8 *)up);
+        const al::BV uh = us.pop(), ul = us.pop();
+        al::BIn<> ks((const bfp16ebs8 *)kt);
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int ib = 0; ib < 16; ib++) {
+            const aie::vector<float, 64> v = aie::load_v<64>(pi);
+            pi += 64;
+            aie::vector<bfloat16, 64> vh, vl;
+            al::split2<64>(v, vh, vl);
+            al::MM8 c(aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(v), vh, ch), vh, cl), vl, ch));
+            const al::BV kh = ks.pop(), kl = ks.pop();
+            {{ p }}_mm3(c, uh, ul, kh, kl);
+            aie::store_v(po, c.to_accum().template to_vector<float>());
+            po += 64;
+        }
+    }
+}
+
+// The panels (hi, lo) of U'^T, U' = U ([t][j]) times uf per lane: [j 8][t 8], blocks along the lanes (the update's sums over
+// them): a lane's hi, lo, transposed on the MMUL exactly, then split again
+__attribute__((noinline)) void {{ p }}_uprep(const float *__restrict u, const float *__restrict uf, uint8_t *__restrict up)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV I = al::eye(), nI = al::neg_eye();
+    al::BV h, l;
+    al::split_hilo(aie::accum<accfloat, 64>(al::mulff<64>(al::bcast8(aie::load_v<8>(uf)), aie::load_v<64>(u))), nI, h, l);
+    al::MM8 t(aie::zeros<accfloat, 64>());
+    t.mac(I, TR(h));
+    t.mac(I, TR(l));
+    {{ p }}_push2(t.to_accum(), nI, up);
+}
+
