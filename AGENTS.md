@@ -230,9 +230,10 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   kernel code (`kmath.py`, `include/kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
   BEFORE before the change, `--partial --asm` after (`design_diff.py`'s docstring); on the NPU then only the tests of
   the designs whose code changed.
-- Host-side refactoring check (the overlays' step building and patching, metadata writes): `python tests/txn_dump.py
-  DIR` before and after, then `python tests/txn_dump.py --diff BEFORE AFTER` (every app's decode overlay on a fake
-  device, no NPU: per dispatch the transaction's words and the host buffers' digests must be identical).
+- Host-side refactoring check (the overlays' step building and patching, metadata and command writes, weight
+  packing): `python tests/txn_dump.py DIR` before and after, then `python tests/txn_dump.py --diff BEFORE AFTER` (every
+  app's decode overlay and media encoder on a fake device, no NPU: per dispatch the transaction's words and the host
+  buffers' digests must be identical).
 - Data layouts (shim taps, memtile walks, joins) are tested on the host with `tests/dma_model.py`
   (`tests/gemm/test_dma.py` is the pattern).
 - Long prompts use the essay corpus (`tests/datasets/`): the essays concatenated in file-name order.

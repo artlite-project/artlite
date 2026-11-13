@@ -1,9 +1,10 @@
-"""The apps' host-built decode transactions, dumped and compared: the refactoring check of the overlays' host side
-(``pytest --dump-designs`` + ``design_diff.py`` check the designs).
+"""The apps' host-built transactions, dumped and compared: the refactoring check of the overlays' host side (``pytest
+--dump-designs`` + ``design_diff.py`` check the designs): the language models' decode overlays and the media encoders on
+the vision overlay.
 
-    python tests/txn_dump.py DIR [--only REGEX]    # per app present: its decode overlay on a fake device, a scripted
-                                                    # run of steps; per dispatch the transaction's words and digests of
-                                                    # the host buffers the NPU reads
+    python tests/txn_dump.py DIR [--only REGEX]    # per app present: its overlay on a fake device, a scripted run
+                                                    # (decode steps; images, a video, clips); per dispatch the
+                                                    # transaction's words and digests of the host buffers the NPU reads
     python tests/txn_dump.py --diff BEFORE AFTER   # per app the first dispatch that differs, with its first differing
                                                     # operations decoded
 
@@ -11,12 +12,15 @@ The fake device runs the real ``OverlayDevice``, ``Transaction`` and ``Sequence`
 addresses (in allocation order); a dispatch is recorded instead of run; the design is not compiled (its program a
 stand-in, its code pages left out) and the weight image is not packed (no transaction depends on its bytes). No NPU
 device is opened. A buffer of more than ``DIGEST_MAX`` bytes (the weight image, large KV caches) is recorded by size
-only: the host writes into it only at load (the image) or not at all in these runs (the caches).
+only: the host writes into it only at load (the image) or not at all in these runs (the caches). The vision overlay's
+design compiles for real (cached builds; its role pages link from it), only its program is a stand-in, and the media
+models' weights are packed as usual (their digests cover them); their state caches are bypassed.
 """
 
 import argparse
 import contextlib
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -30,7 +34,19 @@ import numpy as np
 from artlite import _native, txn
 from artlite.decode.image import TileImage
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, occamy_gguf, qwen3_gguf, qwen_gguf, swift_gguf
+from artlite.model_config import (
+    decision_mmproj,
+    gemma_gguf,
+    lfm3_gguf,
+    lfm3a_mmproj,
+    lfm3vl_mmproj,
+    llama_gguf,
+    minicpmv_mmproj,
+    occamy_gguf,
+    qwen3_gguf,
+    qwen_gguf,
+    swift_gguf,
+)
 from artlite.moe import route as moe_route
 from artlite.operators import paging
 
@@ -132,6 +148,36 @@ def fake_npu() -> Iterator[Callable[[object], _Log]]:
             return log
 
         yield attach
+
+
+MEDIA = ("qwen3vl", "minicpmv", "lfm3vl", "lfm3a")  # (the media models' packages: their npu.py's state cache)
+
+
+@contextlib.contextmanager
+def fake_vision() -> Iterator[_Log]:
+    """Within: the vision overlay's devices on one fake device, the log of their dispatches. The vision design compiles
+    for real (a cached build: its role pages link from it), only its program is a stand-in; the media models' state
+    caches neither restore nor save (every run builds its programs); their weights pack as usual."""
+    from artlite.vision import device as vision_device
+
+    real = vision_device.OverlayDevice
+    dev, log = _Device(), _Log()
+
+    def overlay_device(op: object, **kw: object) -> object:
+        if not isinstance(op._program, _Program):
+            op.compile()
+            op._program = _Program(dev, log, op._program.insts_path)
+        return real(op, **kw)
+
+    with contextlib.ExitStack() as stack:
+        for name, value in (("turn_enter", lambda: None), ("turn_leave", lambda: None), ("turn_foreign", lambda: 0)):
+            stack.enter_context(mock.patch.object(_native, name, value))
+        stack.enter_context(mock.patch.object(vision_device, "OverlayDevice", overlay_device))
+        for pkg in MEDIA:
+            npu = importlib.import_module(f"models.{pkg}.npu")
+            stack.enter_context(mock.patch.object(npu, "load_state", lambda *a, **kw: None))
+            stack.enter_context(mock.patch.object(npu, "save_state", lambda *a, **kw: None))
+        yield log
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -241,6 +287,54 @@ def _qwen(path: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
+def _image(rng: np.random.Generator, w: int, h: int) -> object:
+    from PIL import Image
+
+    return Image.fromarray(rng.integers(0, 256, (h, w, 3), np.uint8))
+
+
+def _vision(pkg: str, sizes: tuple[tuple[int, int], ...], *, video: tuple[int, int] | None = None
+            ) -> Callable[[str], Callable[[_Log], None]]:
+    """An image encoder's run: images of ``sizes`` (w, h); ``video``: then 3 frames of that size (two pairs)."""
+    def make(path: str) -> Callable[[_Log], None]:
+        def run(log: _Log) -> None:
+            npu = importlib.import_module(f"models.{pkg}.npu")
+            rng = np.random.default_rng(3)
+            log.label = "load"
+            enc = npu.NpuVision(path)
+            for w, h in sizes:
+                log.label = f"image {w}x{h}"
+                enc.embeddings(_image(rng, w, h))
+            if video is not None:
+                log.label = f"video 3 frames {video[0]}x{video[1]}"
+                enc.pairs(rng.integers(0, 256, (3, video[1], video[0], 3), np.uint8))
+
+        return run
+
+    return make
+
+
+def _audio(path: str) -> Callable[[_Log], None]:
+    def run(log: _Log) -> None:
+        from models.lfm3a.npu import NpuAudio
+
+        rng = np.random.default_rng(4)
+        log.label = "load"
+        enc = NpuAudio(path)
+        for seconds in (1.5, 7.0):
+            log.label = f"clip {seconds} s"
+            enc.embeddings((0.1 * rng.standard_normal(int(16000 * seconds))).astype(np.float32))
+
+    return run
+
+
+MEDIA_APPS: dict[str, tuple[str, Callable[[str], Callable[[_Log], None]]]] = {
+    "qwen3vl-d3-lite": (decision_mmproj("d3-lite"), _vision("qwen3vl", ((224, 224), (640, 480)))),
+    "minicpmv-4.7": (minicpmv_mmproj(), _vision("minicpmv", ((448, 448), (1024, 640)))),
+    "lfm3vl-2B": (lfm3vl_mmproj(), _vision("lfm3vl", ((256, 256), (640, 480)), video=(320, 256))),
+    "lfm3a-audio-2B": (lfm3a_mmproj(), _audio),
+}
+
 APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], None]]]] = {
     "llama-1B-Q4_K_M": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "single")),
     "llama-1B-Q4_K_M-hilo": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "hilo")),
@@ -272,15 +366,23 @@ def _record(path: str, make: Callable[[str], Callable[[Callable[[object], _Log]]
     return logs[0]
 
 
+def _record_media(path: str, make: Callable[[str], Callable[[_Log], None]]) -> _Log:
+    with fake_vision() as log:
+        make(path)(log)
+    return log
+
+
 def dump(out: str, only: str | None) -> None:
     os.makedirs(out, exist_ok=True)
-    for app, (path, make) in APPS.items():
+    runs = [(app, path, lambda p, m=make: _record(p, m)) for app, (path, make) in APPS.items()]
+    runs += [(app, path, lambda p, m=make: _record_media(p, m)) for app, (path, make) in MEDIA_APPS.items()]
+    for app, path, record in runs:
         if only and not re.search(only, app):
             continue
         if not os.path.exists(path):
             print(f"{app}: {path} missing, skipped")
             continue
-        entries = _record(path, make).entries
+        entries = record(path).entries
         np.savez_compressed(os.path.join(out, f"{app}.npz"), *[w for _, w, _ in entries])
         with open(os.path.join(out, f"{app}.json"), "w") as f:
             json.dump([{"label": lb, "words": hashlib.sha256(w).hexdigest()[:16], "n": int(w.size), "buffers": bufs}
