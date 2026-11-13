@@ -1,5 +1,5 @@
 """artlite-server's readout routes (embeddings, rerank, classify) and ``logprobs`` on the host, with the scripted fake model
-(``test_server``: its output rows are a function of the tokens up to each, ``fake_row``): shapes and errors as
+(``fakes``: its output rows are a function of the tokens up to each, ``fake_row``): shapes and errors as
 llama-server's, pooling and normalization against numpy, base64, OpenAI's ``dimensions``, rerank's order, ``top_n``
 and both formats, the prompt cache's prefix; the readout math of ``models.readouts``."""
 
@@ -14,17 +14,15 @@ from fastapi.testclient import TestClient
 from models.readouts import RankHead, Readouts, normalize, pool, pooling_of, rows_of
 from models.server.cache import common_prefix
 
-from .test_server import _stop_engines, app_of, chat, events, fake_row, make  # noqa: F401 (_stop_engines: autouse)
+from .fakes import chat, events, fake_row
+from .fakes import client_of as served
 
 HEAD = RankHead(np.stack([np.arange(8, dtype=np.float32) / 8, -np.arange(8, dtype=np.float32) / 8]), None, True,
                 ("yes", "no"))
 
 
 def client_of(**options: object) -> Iterator[tuple[object, object, TestClient]]:
-    readouts = options.pop("readouts", None)
-    model, npu, engine = make()
-    with TestClient(app_of(engine, readouts=readouts, **options)) as client:
-        assert engine.wait_ready(5)
+    with served(options) as (model, npu, _engine, client):
         yield model, npu, client
 
 

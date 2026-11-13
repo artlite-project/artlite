@@ -26,7 +26,6 @@ import asyncio
 import base64
 import json
 import logging
-import secrets
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -34,12 +33,14 @@ from typing import Any
 
 import numpy as np
 from fastapi import APIRouter, Request
-from fastapi.responses import Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from fastapi.responses import Response
 
 from ..common import StreamDecoder
 from ..lfm3a.speech import SR, VOICES, Reply, SpeechStats, pcm16, wav_header
+from .app_base import NO_CACHE, CancellingResponse, sse
 from .engine import Engine
+from .errors import bad_request, not_supported, server_error
+from .ids import hex_id
 
 log = logging.getLogger("artlite.server")
 MAX_FRAMES = 512  # (a request's frames by default: llama-server's n_predict, 41 s)
@@ -53,29 +54,17 @@ def speaks(engine: Engine) -> bool:
     return m is not None and hasattr(m, "tts") and getattr(m, "audio", None) is not None and m.audio.gen is not None
 
 
-class SpeechStream(StreamingResponse):
+def audio_stream(body: AsyncIterator[bytes | str], cancel: threading.Event, media_type: str) -> CancellingResponse:
     """A streamed response whose generation stops when the response ends early (its client went away)."""
-
-    def __init__(self, body: AsyncIterator[bytes | str], cancel: threading.Event, media_type: str):
-        super().__init__(body, media_type=media_type, headers={"Cache-Control": "no-cache"})
-        self.cancel = cancel
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self.cancel.set()
+    return CancellingResponse(body, on_end=cancel.set, media_type=media_type, headers=NO_CACHE)
 
 
-def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], Exception]) -> None:
-    """The speech routes on ``api``; ``error(status, kind, message)``: the server's error responses."""
-
-    def bad(message: str) -> Exception:
-        return error(400, "invalid_request_error", message)
+def add_speech(api: APIRouter, engine: Engine) -> None:
+    """The speech routes on ``api``."""
 
     def check() -> None:
         if not speaks(engine):
-            raise error(501, "not_supported_error", "The current model does not support speech output.")
+            raise not_supported("The current model does not support speech output.")
 
     def generate(text: str, voice: str, lang: str, seed: int, frames: int
                  ) -> tuple[asyncio.Queue[tuple[str, Any]], threading.Event]:
@@ -104,15 +93,15 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
             if kind == "audio":
                 parts.append(x)
             elif kind == "error":
-                raise error(500, "server_error", x)
+                raise server_error(x)
             else:
                 return (np.concatenate(parts) if parts else np.zeros(0, np.float32)), x
-        raise error(500, "server_error", "the generation ended early")
+        raise server_error("the generation ended early")
 
     def voice_of(v: object) -> str:
         v = "female" if v in (None, "") else str(v).lower()
         if v not in VOICES:
-            raise bad(f"voice {v!r}: the model's voices are {', '.join(VOICES)}")
+            raise bad_request(f"voice {v!r}: the model's voices are {', '.join(VOICES)}")
         return v
 
     async def fields(request: Request) -> dict[str, Any]:
@@ -121,14 +110,14 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
             try:
                 form = await request.form()
             except (AssertionError, ValueError) as e:
-                raise bad(f"a form: {e}") from None
+                raise bad_request(f"a form: {e}") from None
             return {k: v for k, v in form.items()}
         try:
             body = await request.json()
         except ValueError:
-            raise bad("a JSON body") from None
+            raise bad_request("a JSON body") from None
         if not isinstance(body, dict):
-            raise bad("a JSON object")
+            raise bad_request("a JSON object")
         return body
 
     @api.post("/tts")
@@ -138,16 +127,16 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
         f = await fields(request)
         text = f.get("input", f.get("prompt"))
         if not isinstance(text, str) or not text.strip():
-            raise bad("input: the text to speak")
+            raise bad_request("input: the text to speak")
         if f.get("speaker_ref") is not None or f.get("speaker_ref_b64"):
-            raise bad("speaker_ref: the model has no voice encoder (its voices: female, male)")
+            raise bad_request("speaker_ref: the model has no voice encoder (its voices: female, male)")
         fmt = str(f.get("response_format") or "wav")
         if fmt not in ("wav", "pcm"):
-            raise bad(f"response_format {fmt!r}: wav or pcm")
+            raise bad_request(f"response_format {fmt!r}: wav or pcm")
         try:
             seed, frames = int(f.get("seed", -1)), int(f.get("n_predict", MAX_FRAMES))
         except (TypeError, ValueError):
-            raise bad("seed, n_predict: integers") from None
+            raise bad_request("seed, n_predict: integers") from None
         stream = str(f.get("stream", False)).lower() in ("true", "1")
         q, cancel = generate(text, voice_of(f.get("voice")), str(f.get("lang") or "en"), seed,
                              frames if frames > 0 else MAX_FRAMES)
@@ -165,7 +154,7 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
                     yield pcm16(x) if fmt == "wav" else np.asarray(x, "<f4").tobytes()
                 elif kind == "error":
                     log.error("/tts: %s", x)
-        return SpeechStream(body(), cancel, mt)
+        return audio_stream(body(), cancel, mt)
 
     @api.post("/v1/audio/speech")
     @api.post("/audio/speech")
@@ -175,49 +164,49 @@ def add_speech(api: APIRouter, engine: Engine, error: Callable[[int, str, str], 
         f = await fields(request)
         text = f.get("input")
         if not isinstance(text, str) or not text.strip():
-            raise bad("input: the text to speak")
+            raise bad_request("input: the text to speak")
         fmt = str(f.get("response_format") or "wav")
         if fmt in ("mp3", "opus", "aac", "flac"):
-            raise bad(f"response_format {fmt!r}: not supported (no encoder): wav or pcm")
+            raise bad_request(f"response_format {fmt!r}: not supported (no encoder): wav or pcm")
         if fmt not in ("wav", "pcm"):
-            raise bad(f"response_format {fmt!r}: wav or pcm")
+            raise bad_request(f"response_format {fmt!r}: wav or pcm")
         try:
             speed = float(f.get("speed", 1.0))
         except (TypeError, ValueError):
-            raise bad("speed: a number") from None
+            raise bad_request("speed: a number") from None
         if speed != 1.0:
-            raise bad("speed: 1 only")
+            raise bad_request("speed: 1 only")
         if f.get("instructions"):
             log.info("/v1/audio/speech: instructions are not used")
-        sse = str(f.get("stream_format") or "audio")
-        if sse not in ("audio", "sse"):
-            raise bad(f"stream_format {sse!r}: audio or sse")
+        stream_format = str(f.get("stream_format") or "audio")
+        if stream_format not in ("audio", "sse"):
+            raise bad_request(f"stream_format {stream_format!r}: audio or sse")
         q, cancel = generate(text, voice_of(f.get("voice")), "en", -1, MAX_FRAMES)
-        if sse == "audio" and fmt == "wav":  # (a whole file: its header's sizes)
+        if stream_format == "audio" and fmt == "wav":  # (a whole file: its header's sizes)
             y, _ = await whole(q)
             return Response(wav_header(len(y)) + pcm16(y), media_type="audio/wav")
-        if sse == "audio":  # (16-bit samples as they come: chunked)
+        if stream_format == "audio":  # (16-bit samples as they come: chunked)
             async def body() -> AsyncIterator[bytes]:
                 async for kind, x in samples(q):
                     if kind == "audio":
                         yield pcm16(x)
                     elif kind == "error":
                         log.error("/v1/audio/speech: %s", x)
-            return SpeechStream(body(), cancel, "audio/pcm")
+            return audio_stream(body(), cancel, "audio/pcm")
 
         async def events() -> AsyncIterator[str]:
             n = 0
             async for kind, x in samples(q):
                 if kind == "audio":
                     n += len(x)
-                    yield "data: " + json.dumps({"type": "speech.audio.delta",
-                                                 "audio": base64.b64encode(pcm16(x)).decode()}) + "\n\n"
+                    yield sse({"type": "speech.audio.delta", "audio": base64.b64encode(pcm16(x)).decode()},
+                              ensure_ascii=True)
                 elif kind == "done":
                     use = {"input_tokens": x.prompt, "output_tokens": x.frames, "total_tokens": x.prompt + x.frames}
-                    yield "data: " + json.dumps({"type": "speech.audio.done", "usage": use}) + "\n\n"
+                    yield sse({"type": "speech.audio.done", "usage": use}, ensure_ascii=True)
                 else:
-                    yield "data: " + json.dumps({"type": "error", "error": {"message": x}}) + "\n\n"
-        return SpeechStream(events(), cancel, "text/event-stream")
+                    yield sse({"type": "error", "error": {"message": x}}, ensure_ascii=True)
+        return audio_stream(events(), cancel, "text/event-stream")
 
 
 def worker(engine: Engine, produce: Callable[[Callable[[tuple[str, Any]], None], threading.Event], None], *,
@@ -306,19 +295,19 @@ def reply_parts(model: Any, reply: Reply, opener: list[int]) -> list[dict[str, A
 
 
 async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, object]], *, alias: str,
-                     error: Callable[[int, str, str], Exception], replies: Replies) -> Response:
+                     replies: Replies) -> Response:
     """A chat completion with audio output (module docstring): ``body`` the request, ``msgs`` its messages for the chat
     template."""
     if not speaks(engine):
-        raise error(501, "not_supported_error", "The current model does not support speech output.")
+        raise not_supported("The current model does not support speech output.")
     a = body.get("audio") or {}
     voice = str(a.get("voice") or "female").lower()
     if voice not in VOICES:
-        raise error(400, "invalid_request_error", f"audio.voice {voice!r}: the model's voices are {', '.join(VOICES)}")
+        raise bad_request(f"audio.voice {voice!r}: the model's voices are {', '.join(VOICES)}")
     stream = bool(body.get("stream"))
     fmt = str(a.get("format") or ("pcm16" if stream else "wav"))
     if fmt not in ("wav", "pcm16") or (stream and fmt != "pcm16"):
-        raise error(400, "invalid_request_error", f"audio.format {fmt!r}: wav or pcm16 (streamed: pcm16)")
+        raise bad_request(f"audio.format {fmt!r}: wav or pcm16 (streamed: pcm16)")
     if voice != "female":
         msgs = [{"role": "system", "content": f"Respond with interleaved text and audio, in a {voice} voice."}] + \
             [m for m in msgs if m.get("role") != "system"]
@@ -326,7 +315,7 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
     max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or 1024)
     mode = "audio" if "text" not in (body.get("modalities") or []) else "mixed"  # (["audio"]: speech, then text)
     model = engine.model
-    cid, aid, created = f"chatcmpl-{secrets.token_hex(16)}", f"audio_{secrets.token_hex(12)}", int(time.time())
+    cid, aid, created = hex_id("chatcmpl-", 16), hex_id("audio_", 12), int(time.time())
     head = {"created": created, "id": cid, "model": alias}
 
     said = Reply()
@@ -367,7 +356,7 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
             elif kind == "audio":
                 parts.append(x)
             elif kind == "error":
-                raise error(500, "server_error", x)
+                raise server_error(x)
             else:
                 st, n = x
         y = np.concatenate(parts) if parts else np.zeros(0, np.float32)
@@ -381,8 +370,8 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
             "usage": usage(st, n)}), media_type="application/json")
 
     def chunk(delta: dict[str, Any], finish: str | None = None, **extra: object) -> str:
-        return "data: " + json.dumps({"choices": [{"finish_reason": finish, "index": 0, "delta": delta}], **head,
-                                      "object": "chat.completion.chunk", **extra}) + "\n\n"
+        return sse({"choices": [{"finish_reason": finish, "index": 0, "delta": delta}], **head,
+                    "object": "chat.completion.chunk", **extra}, ensure_ascii=True)
 
     async def events() -> AsyncIterator[str]:
         yield chunk({"role": "assistant", "content": None})
@@ -400,5 +389,5 @@ async def chat_audio(engine: Engine, body: dict[str, Any], msgs: list[dict[str, 
                             **({"usage": usage(*x)} if inc else {}))
                 yield "data: [DONE]\n\n"
             else:
-                yield "data: " + json.dumps({"error": {"message": x, "type": "server_error"}}) + "\n\n"
-    return SpeechStream(events(), cancel, "text/event-stream")
+                yield sse({"error": {"message": x, "type": "server_error"}}, ensure_ascii=True)
+    return audio_stream(events(), cancel, "text/event-stream")

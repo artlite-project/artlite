@@ -1,246 +1,29 @@
 """The server's NPU side: one worker thread owns the model and runs the requests' generations one at a time, in
-arrival order (``Engine``), each from what the prompt cache keeps of its prompt (``cache.PromptCache``); the generated
-text's stop strings (``StopMatcher``), its split into thoughts and answer (``ReasoningSplitter``) and the answer's tool
-calls (``tools.Parser``; their names kept the functions' by ``tools.NameMask`` as the tokens are sampled); the timings
-of a generation as llama-server reports them."""
+arrival order (``Engine``; ``jobs``: its queue's work and the events back), each from what the prompt cache
+(``cache.PromptCache``) keeps of its prompt (``generation.Generation``: the stop strings and the thought split of
+``textflow``, the answer's tool calls of ``tools``)."""
 
 import collections
 import concurrent.futures
 import itertools
 import logging
-import math
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from artlite import _native, portable
+from artlite import portable
 
-from ..common import (
-    Detokenizer,
-    LogitsLike,
-    Model,
-    NpuModel,
-    Sampling,
-    StreamDecoder,
-    argmax,
-    logit_bits,
-    seed,
-    top_logits,
-)
+from ..common import Model, NpuModel, argmax
 from ..sequence import Sequence
 from .cache import PromptCache, common_prefix
-from .tools import Calls, held
+from .generation import Generation
+from .jobs import Call, Cancelled, Job
 
 log = logging.getLogger("artlite.server")
 CACHE_RAM = 8192 << 20  # the prompt cache's host memory by default at most (llama-server's --cache-ram)
-
-Emit = Callable[[str, dict[str, Any]], None]  # (event, data) -> None: a job's events to its request
-
-
-class Cancelled(Exception):
-    """A job was cancelled: its client went away, the UI's Stop, or the server's shutdown."""
-
-
-@dataclass(eq=False)
-class Job:
-    """A generation for the worker: the prompt's tokens and how to continue them; ``emit`` sends its events (called
-    on the worker thread):
-
-    - ``progress``: the prompt's ``prompt_progress`` (``total``, ``cache``, ``processed``, ``time_ms``), when
-      ``progress`` is set: at the start and after each chunk;
-    - ``delta``: ``parts``, the new output as (kind, value) pairs: kind ``content`` or ``reasoning_content`` with
-      text, ``tool_call`` with a ``tools.ToolCall`` (``tools``: a call's start and its arguments' fragments), the
-      ``timings`` so far, and with ``n_probs``: ``probs``, llama-server's entries of the sampled tokens since the last
-      delta (``prob_entry``);
-    - ``done``: ``finish_reason`` (``stop``: an end-of-sequence token or a stop string, ``length``: ``max_tokens`` or a
-      full cache, ``tool_calls``: the answer has complete calls), ``stop_word``, ``timings``, ``n_prompt`` (the
-      prompt's tokens), ``n_cached`` (positions cached after it), ``n_calls`` (the complete tool calls), and
-      ``probs``: the entries no delta carried;
-    - ``error``: ``message``, a failure in the model (the job ends);
-    - ``cancelled``: the job ended early (``cancel`` set)."""
-
-    ids: list[int]  # (or a sequence of ids and embedding rows: an image's, ``Model.chat``)
-    emit: Emit
-    sampling: Sampling
-    max_tokens: int = -1  # < 0: until an end-of-sequence token or a full cache
-    drafts: int | None = None  # draft tokens per step at most (None: the model's, ``NpuModel.DRAFTS``)
-    seed: int = -1  # < 0: random
-    stop: list[str] = field(default_factory=list)
-    reasoning: bool = False  # split the thoughts off (the model's ``reasoning`` markers)
-    inside: bool = False  # the prompt ends inside a thought (it opened one)
-    think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
-    tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
-    cache_prompt: bool = True  # continue from the cached prefix
-    answer_mark: bool = False  # the next prompt re-renders this answer's opener (its template drops earlier thoughts)
-    progress: bool = False  # send prompt_progress events
-    n_probs: int = 0  # per sampled token its probability and the n_probs most likely ones' (0: none; ``prob_entry``)
-    post_sampling: bool = False  # the probabilities the sampler drew from (its candidates), not the model's
-    conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
-    name: str = ""  # for the log
-    cancel: threading.Event = field(default_factory=threading.Event)
-    state: str = "queued"  # queued, prompt, generating, done
-    kept: int = 0  # the prompt's cached tokens (the prefix it continued from)
-    n_gen: int = 0  # tokens generated so far
-
-
-@dataclass(eq=False)
-class Call:
-    """Work for the worker between jobs (``Engine.run``): an image prompt's encoder, the NPU dispatches of another
-    hardware context."""
-
-    fn: Callable[[], Any]
-    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
-    conv_id: str | None = None
-    cancel: threading.Event = field(default_factory=threading.Event)
-
-
-def _text(b: bytes) -> str:
-    """A token's text: its bytes but an unfinished character at the end (llama-server's ``validate_utf8``)."""
-    for k in range(4):
-        try:
-            return b[:len(b) - k].decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-    return b.decode("utf-8", errors="replace")
-
-
-def prob_entry(tokenizer: Detokenizer, row: LogitsLike, token: int, cap: float, cand: tuple[np.ndarray, np.ndarray],
-               *, n: int, sampling: Sampling | None = None) -> dict[str, Any]:
-    """llama-server's ``probs`` entry of a sampled token: its id, text and bytes, its log-probability under the model's
-    logits ``row`` (soft cap ``cap``) and the ``n`` most likely tokens' (``top_logprobs``); with ``sampling``
-    (``post_sampling_probs``) the probabilities ``sampling`` drew from among its candidates ``cand`` (``prob``,
-    ``top_probs``)."""
-
-    def tok(t: int, key: str, v: float) -> dict[str, Any]:
-        b = tokenizer.decode_bytes([t])
-        return {"id": t, "token": _text(b), "bytes": list(b), key: v}
-
-    if sampling is not None:
-        q, ids = sampling.probs(cand[0]), cand[1]
-        top = [tok(int(i), "prob", float(p)) for i, p in zip(ids[:n], q[:n], strict=True) if p > 0]
-        return {**tok(token, "prob", float(q[ids == token].sum())), "top_probs": top}
-    lse = _native.logsumexp(logit_bits(row), cap)
-    v = float(row[token])
-    own = (math.tanh(v / cap) * cap if cap else v) - lse
-    values, ids = top_logits(row, n, cap)
-    return {**tok(token, "logprob", own),
-            "top_logprobs": [tok(int(i), "logprob", float(x) - lse) for x, i in zip(values, ids, strict=True)]}
-
-
-class StopMatcher:
-    """Stop strings in a stream of text: ``feed`` returns the text that may be sent and whether a stop string ended it
-    (the text is cut before the stop string, ``word``). Text that may begin a stop string is held back until what
-    follows decides."""
-
-    def __init__(self, stops: list[str]):
-        self.stops = [s for s in stops if s]
-        self.word: str | None = None
-        self._held = ""
-
-    def feed(self, text: str) -> tuple[str, bool]:
-        if not self.stops:
-            return text, False
-        s = self._held + text
-        hits = [(i, w) for w in self.stops if (i := s.find(w)) >= 0]
-        if hits:
-            i, self.word = min(hits)
-            self._held = ""
-            return s[:i], True
-        k = held(s, self.stops)
-        self._held = s[len(s) - k:]
-        return s[:len(s) - k], False
-
-    def flush(self) -> str:
-        """The text held back, at the end of the generation."""
-        out, self._held = self._held, ""
-        return out
-
-
-class ReasoningSplitter:
-    """A thinking model's generated text split into its thoughts (``reasoning_content``) and its answer (``content``) by
-    its thought markers (``Model.reasoning``): ``feed`` returns the (kind, text) parts a text completes. The markers
-    are dropped, and so is the white space around them; text that may begin a marker and trailing white space are held
-    back until what follows decides. A close marker outside a thought is dropped (Gemma may end an answer with one).
-    ``inside``: the text starts inside a thought (the prompt opened it); ``ends``: text that ends a thought and begins
-    the answer (kept: a Qwen tool call without the close marker); ``once``: a thought only begins the text (Qwen's),
-    markers after it are answer. ``answering``: the answer has begun (a thought ended, or answer text came)."""
-
-    def __init__(self, markers: tuple[str, str], *, inside: bool = False, ends: tuple[str, ...] = (),
-                 once: bool = False):
-        self.open, self.close = markers
-        self.inside = inside
-        self.ends, self.once = ends, once
-        self._held = ""
-        self._lead = True  # (a part begins: its leading white space is dropped)
-        self._over = False  # (once: the thought is over, or the text began outside one)
-        self.answering = False
-
-    @property
-    def kind(self) -> str:
-        return "reasoning_content" if self.inside else "content"
-
-    def _part(self, out: list[tuple[str, str]], text: str) -> None:
-        if self._lead:
-            text = text.lstrip()
-            self._lead = not text
-        if text:
-            out.append((self.kind, text))
-            if not self.inside:
-                self._over = self.once
-                self.answering = True
-
-    def _marks(self) -> list[str]:
-        if self.inside:
-            return [self.close, *self.ends]
-        return [] if self._over else [self.open, self.close]
-
-    def feed(self, text: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        s = self._held + text
-        while True:
-            marks = self._marks()
-            hits = [(i, m) for m in marks if (i := s.find(m)) >= 0]
-            if not hits:
-                break
-            i, m = min(hits)
-            self._part(out, s[:i].rstrip())
-            s = s[i:] if m in self.ends and self.inside else s[i + len(m):]
-            self.answering = self.answering or self.inside
-            self.inside = m == self.open
-            self._over = self.once and not self.inside
-            self._lead = True
-        k = held(s, marks)
-        body = s[:len(s) - k]
-        text = body.rstrip()
-        self._held = body[len(text):] + s[len(s) - k:]
-        self._part(out, text)
-        return out
-
-    def flush(self) -> list[tuple[str, str]]:
-        """The text held back, at the end of the generation."""
-        out: list[tuple[str, str]] = []
-        self._part(out, self._held.rstrip())
-        self._held = ""
-        return out
-
-
-def timings(*, cache_n: int, prompt_n: int, prompt_s: float, predicted_n: int, predicted_s: float,
-            drafts: tuple[int, int] = (0, 0)) -> dict[str, Any]:
-    """llama-server's ``timings`` of a generation; ``drafts``: (draft tokens, accepted ones) of multi-token
-    prediction."""
-    t = {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": prompt_s * 1e3,
-         "prompt_per_token_ms": prompt_s * 1e3 / max(prompt_n, 1),
-         "prompt_per_second": prompt_n / prompt_s if prompt_s > 0 else 0.0,
-         "predicted_n": predicted_n, "predicted_ms": predicted_s * 1e3,
-         "predicted_per_token_ms": predicted_s * 1e3 / max(predicted_n, 1),
-         "predicted_per_second": predicted_n / predicted_s if predicted_s > 0 else 0.0}
-    if drafts[0]:
-        t |= {"draft_n": drafts[0], "draft_n_accepted": drafts[1]}
-    return t
 
 
 class Engine:
@@ -313,24 +96,33 @@ class Engine:
             try:
                 return fn()
             except Exception:  # (the device's state is unknown)
-                self.cache.clear()
-                self._dirty = True
+                self.recover()
                 raise
         return self.run(run)
 
-    def device_taken(self) -> None:
-        """(on the worker) Before work that leaves the device's sequence unknown to the prompt cache (speech output:
-        ``models.lfm3a.speech``): the cache keeps what RAM holds of the current one, the next job resets the device."""
+    def begin(self) -> None:
+        """(on the worker) Before work on the device: it starts over when a failure left its state unknown."""
+        if self._dirty:
+            self.npu.reset()
+            self._dirty = False
+
+    def recover(self) -> None:
+        """(on the worker) After a failure, or before work that leaves the device's sequence unknown to the prompt cache
+        (speech output: ``models.lfm3a.speech``): the cache keeps what RAM holds of the current one, the next work
+        resets the device (``begin``)."""
         self.cache.clear()
         self._dirty = True
+
+    def device_taken(self) -> None:
+        """(on the worker) Before work that leaves the device's sequence unknown to the prompt cache (speech output:
+        ``models.lfm3a.speech``)."""
+        self.recover()
 
     def hold(self, ids: Sequence) -> int:
         """(on the worker) A live stream's text sequence and its next chunk's tokens: the device where they continue
         from (``PromptCache.prepare``: as the last chunk left it, else, when requests ran between the stream's chunks,
         what the prompt cache keeps), the tokens it holds."""
-        if self._dirty:
-            self.npu.reset()
-            self._dirty = False
+        self.begin()
         return self.cache.prepare(ids)[0]
 
     def ran(self, seq: Sequence) -> None:
@@ -354,9 +146,7 @@ class Engine:
         cache_prompt = cache_prompt and npu.causal  # (a non-causal model reads every prompt whole)
         t0, ran = time.perf_counter(), 0
         try:
-            if self._dirty:
-                npu.reset()
-                self._dirty = False
+            self.begin()
             if sets is not None:  # (a non-causal model's sequences of their own attention: each whole, from position 0)
                 assert not npu.causal
                 cache.prepare([], enabled=False)
@@ -385,8 +175,7 @@ class Engine:
                 cache.ran(prefix)
                 ran = p - k + sum(len(ids) - p for ids in inputs)
         except Exception:  # (the device's state is unknown: the caches start over)
-            cache.clear()
-            self._dirty = True
+            self.recover()
             raise
         n = sum(map(len, inputs))
         log.info(f"{name}: {len(inputs)} input{'s' * (len(inputs) != 1)}, {ran} tokens ({n - ran} cached) in "
@@ -481,15 +270,14 @@ class Engine:
                     job.future.set_exception(e)
                 continue
             try:
-                self._process(job)
+                Generation(self, job).run()
             except Cancelled:
                 log.info("%s: cancelled after %d of %d prompt tokens, %d generated", job.name,
                          max(min(self.npu.position, len(job.ids)) - job.kept, 0), len(job.ids) - job.kept, job.n_gen)
                 job.emit("cancelled", {})
             except Exception as e:  # (a failure in the model: the job's error; the caches start over)
                 log.exception("%s failed", job.name)
-                self.cache.clear()
-                self._dirty = True
+                self.recover()
                 job.emit("error", {"message": f"{type(e).__name__}: {e}"})
             finally:
                 job.state = "done"
@@ -512,151 +300,3 @@ class Engine:
             npu.outputs(ids, [-1])
         npu.reset()
         log.info("warmup: %.2f s", time.perf_counter() - t0)
-
-    def _process(self, job: Job) -> None:
-        """Run a job: its end is an event (``done``, ``cancelled``: ``Cancelled`` raised, ``error``: any other
-        exception), and ``cached`` the tokens at the cached positions."""
-        if job.cancel.is_set():
-            raise Cancelled
-        npu, model = self.npu, self.model
-        t0 = time.perf_counter()
-        seed(job.seed if job.seed >= 0 else None)
-        ids, cache = job.ids, self.cache
-        if self._dirty:
-            npu.reset()
-            self._dirty = False
-        kept, last, how = cache.prepare(ids, enabled=job.cache_prompt)
-        job.kept = kept
-        drafted0, accepted0 = getattr(npu, "drafted", 0), getattr(npu, "accepted", 0)
-        d0 = npu.dispatches
-
-        def progress(i: int) -> None:
-            if job.progress:
-                job.emit("progress", {"total": len(ids), "cache": kept, "processed": min(kept + i, len(ids)),
-                                      "time_ms": (time.perf_counter() - t0) * 1e3})
-            if job.cancel.is_set():
-                raise Cancelled
-
-        tools = job.tools
-        force = tools.force if tools is not None else None
-        # (a forced call: its opener ends the prompt, or follows the thought where one may come first)
-        thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
-        early = model.tokenizer.encode(force) if force and not thought else []
-        late = (tools.syntax.gap if job.inside else "") + force if force and thought else ""
-        mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
-        gen: list[int] = []
-        it = None  # (the generation's tokens)
-
-        def forced(tokens: list[int]) -> None:
-            gen.extend(tokens)
-            for t in tokens if mask is not None else ():
-                mask.accept(t)
-
-        job.state = "prompt"
-        try:
-            progress(0)
-            at = kept
-            for m in cache.marks(ids, kept, answer=job.answer_mark):  # (the prompt in parts: a checkpoint after each)
-                npu.prompt(ids[at:m], progress=lambda i, b=at - kept: progress(b + i))
-                at = m
-                cache.checkpoint(ids[:m])
-            if last is not None and not early:  # (all of it cached: a checkpoint of its end, with its logits)
-                logits = last
-            else:
-                logits = npu.forward(ids[at:] + early, progress=lambda i, b=at - kept: progress(b + i))
-                cache.checkpoint(ids + early, logits)
-            forced(early)
-            t1 = time.perf_counter()
-            d1, t_npu1, t_host1 = npu.dispatches, npu.t_npu, npu.t_host
-            job.state = "generating"
-
-            def times(t: float) -> dict[str, Any]:
-                return timings(cache_n=kept, prompt_n=len(ids) - kept, prompt_s=t1 - t0, predicted_n=len(gen),
-                               predicted_s=t - t1, drafts=(getattr(npu, "drafted", 0) - drafted0,
-                                                           getattr(npu, "accepted", 0) - accepted0))
-
-            text = StreamDecoder(model.tokenizer)
-            stop = StopMatcher(job.stop)
-            split = ReasoningSplitter(model.reasoning, inside=job.inside, once=model.thought_first,
-                                      ends=tools.syntax.ends if tools is not None else ()) \
-                if job.reasoning and model.reasoning is not None else None
-            calls = tools.parser() if tools is not None else None
-
-            def parse(s: str) -> list[tuple[str, Any]]:
-                parts = split.feed(s) if split is not None else [("content", s)] if s else []
-                return calls.parts(parts) if calls is not None else parts
-
-            def send(parts: list[tuple[str, Any]]) -> None:
-                nonlocal sent
-                if parts:
-                    data = {"parts": parts, "timings": times(time.perf_counter())}
-                    if probs is not None:  # (the sampled tokens up to here, whose text this delta holds)
-                        data["probs"], sent = entries[sent:sampled], sampled
-                    job.emit("delta", data)
-
-            entries: list[dict[str, Any]] = []  # (llama-server's probs: one per sampled token)
-            sent = sampled = 0
-            post = job.sampling if job.post_sampling else None
-            probs = (lambda row, t, cap, cand: entries.append(prob_entry(model.tokenizer, row, t, cap, cand,
-                                                                         n=job.n_probs, sampling=post))
-                     ) if job.n_probs > 0 else None
-            send(parse(force) if early else [])
-            finish = "length"
-            while True:
-                left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-                it = npu.generate(logits, left, job.sampling, ids + gen, mask, probs, drafts=job.drafts)
-                for token in it:
-                    gen.append(token)
-                    sampled += 1
-                    job.n_gen = len(gen)
-                    if token in model.eos_token_ids:
-                        finish = "stop"
-                        break
-                    s, hit = stop.feed(text.feed(token))
-                    send(parse(s))
-                    if hit:
-                        finish = "stop"
-                        break
-                    if job.cancel.is_set():
-                        raise Cancelled
-                    # (the answer began and no call did: the forced call's opener follows)
-                    forcing = bool(late) and split is not None and split.answering and not calls.started
-                    # the answer is complete, or the opener goes next: end where every token but the last ran (a
-                    # step of drafts runs several; the parser drops what follows a call when parallel is off)
-                    if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):
-                        break
-                if not forcing or finish == "stop":
-                    break
-                n = npu.rewind(npu.position)  # (the generation stopped where the next request would continue)
-                opener = model.tokenizer.encode(late)
-                logits = npu.forward((ids + gen)[n:] + opener)
-                forced(opener)
-                send(parse(late))
-                late = ""
-            if stop.word is None:
-                send(parse(stop.flush()))
-            tail = split.flush() if split is not None else []
-            send(calls.parts(tail) + calls.flush() if calls is not None else tail)
-            if calls is not None and calls.calls and not calls.calling:
-                finish = "tool_calls"
-        finally:
-            rest: list[int] = []  # (a step of drafts ran tokens past a stop string or a cancel: the device holds them)
-            while it is not None and len(ids) + len(gen) + len(rest) < npu.position:
-                if (t := next(it, None)) is None:
-                    break
-                rest.append(t)
-            cache.ran((ids + gen + rest)[:npu.position])
-        t2 = time.perf_counter()
-        t = times(t2)
-        job.emit("done", {"finish_reason": finish, "stop_word": stop.word, "timings": t, "n_prompt": len(ids),
-                          "n_cached": len(self.cached), "n_calls": calls.calls if calls is not None else 0,
-                          "probs": entries[sent:sampled]})
-        # (artlite-cli's report: the generation's dispatches, the time of each, the host's inputs)
-        passes = max(npu.dispatches - d1, 1)
-        host = f", {(npu.t_host - t_host1) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > t_host1 else ""
-        drafts = f"; {t['draft_n']} draft tokens, {t['draft_n_accepted']} accepted" if "draft_n" in t else ""
-        how = f" ({how})" if how else ""
-        log.info(f"{job.name}: {kept} cached tokens{how}; prompt: {len(ids) - kept} tokens in {t1 - t0:.2f} s "
-                 f"({t['prompt_per_second']:.1f} tokens/s, {d1 - d0} dispatches); generation: {len(gen)} tokens in "
-                 f"{t2 - t1:.2f} s ({t['predicted_per_second']:.2f} tokens/s): {passes} dispatches of "
-                 f"{(npu.t_npu - t_npu1) / passes * 1e3:.1f} ms{host}{drafts}; finish: {finish}")

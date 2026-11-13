@@ -27,7 +27,6 @@ import ast
 import bisect
 import json
 import re
-import secrets
 import string
 from dataclasses import dataclass
 from typing import Any
@@ -35,13 +34,13 @@ from typing import Any
 import numpy as np
 
 from ..common import Detokenizer, StreamDecoder
-
-ALNUM = string.ascii_letters + string.digits
+from .ids import alnum_id
+from .textflow import held
 
 
 def call_id() -> str:
     """A new tool call's id (OpenAI's form)."""
-    return "call_" + "".join(secrets.choice(ALNUM) for _ in range(24))
+    return alnum_id(24, "call_")
 
 
 def functions(tools: object) -> list[dict[str, Any]]:
@@ -91,18 +90,6 @@ class ToolCall:
 
 
 Part = tuple[str, Any]  # ("content", text), ("reasoning_content", text) or ("tool_call", ToolCall)
-
-
-def held(text: str, words: tuple[str, ...] | list[str]) -> int:
-    """The length of the longest end of ``text`` that begins one of ``words`` (without being all of it): text held
-    back until what follows decides."""
-    best = 0
-    for w in words:
-        for k in range(min(len(w) - 1, len(text)), best, -1):
-            if text.endswith(w[:k]):
-                best = k
-                break
-    return best
 
 
 def _types(schema: object) -> set[str]:

@@ -1,8 +1,8 @@
 """OpenAI's realtime API as llama-server's: live transcription sessions (the websocket
 ``/v1/realtime?intent=transcription`` of a model with LFM3-Audio's live ASR: ``models.lfm3a.live``, its speech encoder
-and the ``asr`` chat template; a model with a speech encoder and no live ASR, LFM3-Omni: each committed buffer
-transcribed alone, ``transcription``) and conversations (``conversation``: other sessions of a model that speaks,
-continued turn by turn on the prompt cache: ``Conversation``).
+and the ``asr`` chat template: ``LiveAsrSession``; a model with a speech encoder and no live ASR, LFM3-Omni: each
+committed buffer transcribed alone, ``TranscriptionSession``) and conversations (``ConversationSession``: other
+sessions of a model that speaks, continued turn by turn on the prompt cache: ``conversation.Conversation``).
 
 A session (one stream): ``session.created`` (PCM16 mono at 16 kHz in), then the client's events -
 ``input_audio_buffer.append`` (base64 PCM16), ``input_audio_buffer.commit`` (the audio so far padded with silence to a
@@ -10,7 +10,10 @@ chunk's end: its text, then the next item; ``"final": true`` ends the stream), `
 ``session.update`` (answered, nothing to set) - and the server's ``conversation.item.input_audio_transcription.delta``
 as each chunk's text comes out, ``...completed`` per item (the transcript). The stream's chunks run on the engine's
 worker between other requests' jobs (the stream's text sequence back through the prompt cache, its encoder state
-restored when a clip ran meanwhile)."""
+restored when a clip ran meanwhile).
+
+Every session is a ``Session``: it receives the client's JSON events and dispatches each by its ``type`` to a handler
+(``handlers``; a handler that returns True ends the session), and answers what no handler takes with an error event."""
 
 import asyncio
 import base64
@@ -18,288 +21,32 @@ import binascii
 import contextlib
 import json
 import logging
-import secrets
-from collections.abc import Callable
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from ..common import StreamDecoder
-from ..sequence import Sequence
-from .cache import common_prefix
+from ..sequence import data_bytes
+from .conversation import Conversation
 from .engine import Engine
+from .ids import hex_id
 from .speech import speaks, worker
+from .tools import functions, syntax_of
 
 log = logging.getLogger("artlite.server")
 
-
-def add_route(app: FastAPI, *, engine: Engine, alias: str, authorized: Callable[[str | None, str | None], bool],
-              transcribe: Callable[[np.ndarray, str], Any] | None = None) -> None:
-    """``authorized(authorization, x_api_key)``: the request's headers pass the server's API keys; ``transcribe``: a
-    clip's offline transcript as its pieces come (the transcription sessions of a model without live ASR)."""
-
-    @app.websocket("/v1/realtime")
-    async def realtime(ws: WebSocket) -> None:
-        if not authorized(ws.headers.get("authorization"), ws.headers.get("x-api-key")):
-            await ws.close(code=1008, reason="Invalid API Key")
-            return
-        await ws.accept()
-
-        async def event(ev: dict[str, Any]) -> None:
-            await ws.send_text(json.dumps({"event_id": f"event_{secrets.token_hex(8)}", **ev}))
-
-        async def error(message: str, kind: str = "invalid_request_error") -> None:
-            await event({"type": "error", "error": {"type": kind, "code": None, "message": message, "param": None}})
-
-        model = engine.model if engine.ready else None
-        if ws.query_params.get("intent") != "transcription" and model is not None and speaks(engine):
-            await conversation(ws, engine, alias, event, error)
-            return
-        live_asr = "tokenizer.chat_template.asr" in getattr(getattr(model, "gguf", None), "meta", {})
-        if ws.query_params.get("intent") == "transcription" and model is not None and model.audio is not None and \
-                not live_asr and transcribe is not None:
-            await transcription(ws, transcribe, alias, event, error)
-            return
-        if ws.query_params.get("intent") != "transcription" or model is None or model.audio is None or not live_asr:
-            await error("The current model does not support realtime transcription (a model with a speech encoder: "
-                        "LFM3-Audio, LFM3-Omni; ?intent=transcription).")
-            await ws.close()
-            return
-        from ..lfm3a import live as lv
-
-        try:
-            live = await asyncio.wrap_future(engine.live(lambda: lv.LiveAsr(model, engine.npu, model.audio.encoder,
-                                                                            sync=(engine.hold, engine.ran))))
-        except Exception as e:  # (the model refuses)
-            log.exception("realtime transcription failed")
-            await error(f"{type(e).__name__}: {e}", "server_error")
-            await ws.close()
-            return
-        session = {"id": f"sess_{secrets.token_hex(12)}", "object": "realtime.transcription_session",
-                   "type": "transcription",
-                   "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}, "transcription": {"model": alias},
-                                       "turn_detection": None, "noise_reduction": None}}}
-        await event({"type": "session.created", "session": session})
-        item, prev, text = f"item_{secrets.token_hex(12)}", None, []
-
-        async def run(fn: Callable[[], str]) -> None:
-            out = await asyncio.wrap_future(engine.live(fn))
-            if out:
-                text.append(out)
-                await event({"type": "conversation.item.input_audio_transcription.delta", "item_id": item,
-                             "content_index": 0, "delta": out})
-
-        async def completed() -> None:
-            await event({"type": "conversation.item.input_audio_transcription.completed", "item_id": item,
-                         "content_index": 0, "transcript": "".join(text)})
-            text.clear()
-
-        try:
-            while True:
-                try:
-                    ev = json.loads(await ws.receive_text())
-                    kind = ev.get("type") if isinstance(ev, dict) else None
-                except ValueError:
-                    await error("invalid JSON")
-                    continue
-                if kind in ("session.update", "transcription_session.update"):
-                    await event({"type": "session.updated", "session": session})
-                elif kind == "input_audio_buffer.append":
-                    try:
-                        pcm = base64.b64decode(str(ev.get("audio", "")), validate=True)
-                    except binascii.Error:
-                        await error("invalid base64 audio")
-                        continue
-                    x = np.frombuffer(pcm[:len(pcm) // 2 * 2], np.int16).astype(np.float32) / 32768
-                    if len(x):
-                        await run(lambda x=x: live.push(x))
-                elif kind == "input_audio_buffer.commit":
-                    if ev.get("final"):
-                        await run(live.end)
-                        await completed()
-                        break
-                    await event({"type": "input_audio_buffer.committed", "previous_item_id": prev, "item_id": item})
-                    await run(live.commit)
-                    await completed()
-                    prev, item = item, f"item_{secrets.token_hex(12)}"
-                elif kind == "input_audio_buffer.clear":
-                    await event({"type": "input_audio_buffer.cleared"})
-                else:
-                    await error(f"unknown event type: {kind}")
-        except WebSocketDisconnect:
-            return
-        except Exception as e:  # (a failure in the model: the session's error)
-            log.exception("realtime transcription failed")
-            await error(f"{type(e).__name__}: {e}", "server_error")
-        log.info("realtime transcription: %d chunks; the encoder %.2f s, the text %.2f s", live.chunks,
-                 live.stream.t_encode, live.t_text)
-        await ws.close()
-
-
 MODES = {None: "auto", ("text",): "text", ("audio",): "audio", ("audio", "text"): "mixed"}  # (output_modalities)
-ROWS_STEP = 8  # (a user turn's audio rows run on the language model as they come, 8 at a time: 0.64 s)
-
-
-class Turns:
-    """The text around a realtime conversation's turns, from the model's chat template rendered with placeholder
-    messages (llama-server's ``derive_turn_text``): ``first`` (the system turn - instructions, tools - and the first user
-    turn's header), ``user`` / ``user_end`` (a later user turn's header, a user turn's end), ``reply`` (the generation
-    prompt: the assistant's header and its empty thought), ``reply_end`` (after an answer), ``tool`` / ``tool_end``
-    (around a function's output), ``audio`` / ``image`` (around a clip's rows, an image's tokens in a user turn:
-    LFM3-Omni's vision markers; LFM3-Audio's clip bare)."""
-
-    def __init__(self, model: Any, instructions: str, tools: list[dict[str, Any]] | None):
-        u, r, x = "@@USER@@", "@@REPLY@@", "@@RESULT@@"
-        system = [{"role": "system", "content": instructions}] if instructions else []
-
-        def render(msgs: list[dict[str, Any]], gen: bool = False) -> str:  # (``Lfm.chat_text``)
-            return model.chat_text(system + msgs, tools=tools or None, generation=gen)
-        user = {"role": "user", "content": u}
-        a, g = render([user]), render([user], True)
-        c = render([user, {"role": "assistant", "content": r}])
-        d = render([user, {"role": "assistant", "content": r}, user])
-        pa, pc, pd = a.find(u), c.find(r), d.find(u, len(c))
-        if min(pa, pc, pd) < 0 or not (c.startswith(a) and d.startswith(c) and g.startswith(a)):
-            raise ValueError("the chat template's turns do not compose: no realtime conversation")
-        self.first, self.user_end, self.reply = a[:pa], a[pa + len(u):], g[len(a):]
-        self.reply_end, self.user = c[pc + len(r):], d[len(c):pd]
-        self.tool = self.tool_end = ""
-        if tools:
-            fn = {"name": tools[0]["function"]["name"], "arguments": {}}
-            call = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "type": "function", "function": fn}]}
-            e = render([user, call])
-            f = render([user, call, {"role": "tool", "tool_call_id": "call_0", "content": x}])
-            pf = f.find(x, len(e))
-            if pf < 0 or not f.startswith(e):
-                raise ValueError("the chat template's tool results do not compose: no realtime tools")
-            self.tool, self.tool_end = f[len(e):pf], f[pf + len(x):]
-
-        def around(kind: str, marker: str) -> tuple[str, str]:
-            t = render([{"role": "user", "content": [{"type": "text", "text": "@@A@@"}, {"type": kind},
-                                                     {"type": "text", "text": "@@B@@"}]}])
-            mid = t[t.find("@@A@@") + 5:t.find("@@B@@")]
-            i = mid.find(marker)
-            return (mid[:i], mid[i + len(marker):]) if i >= 0 else ("", "")
-        self.audio, self.image = around("audio", "<|audio|>"), around("image", "<|image|>")
-
-
-class Conversation:
-    """A realtime conversation's sequence on the model (llama-server's realtime slot): every token and embedding row
-    it ran, in order (``seq``): the turns' text (``Turns``), a user turn's audio rows as the speech encoder's stream
-    gives them (``models.lfm3a.live.Stream``), an image's tokens, each reply's tokens and its frames' feedback rows
-    (``models.lfm3a.speech.Reply``: the next turns see a spoken reply as the model said it). Its methods run on the
-    engine's worker; the device holds the sequence through the prompt cache (``Engine.hold``: requests that ran
-    between its turns displace it, the cache brings it back; ``Engine.ran``), and a turn's audio runs on the language
-    model while it arrives (``ROWS_STEP`` rows at a time), so that a response starts with its last rows and the
-    assistant's header."""
-
-    def __init__(self, engine: Engine, model: Any):
-        self.engine, self.model = engine, model
-        self.seq = Sequence.text([], model.cfg.hidden_size)
-        self.turns: Turns | None = None
-        self.open = False  # (a user turn is being filled)
-        self.after = ""  # (the text before the next turn: the last answer's end)
-        self.n = 0  # (responses so far)
-        self.results = False  # (a function's output since the last response: the next answers it)
-        self.stream: Any = None  # (the open turn's audio: a speech encoder stream)
-
-    def start(self, instructions: str, tools: list[dict[str, Any]] | None) -> None:
-        """The session's system turn (fixed at its first audio, message or response)."""
-        if self.turns is None:
-            self.turns = Turns(self.model, instructions, tools)
-
-    def _text(self, text: str) -> None:
-        if text:
-            self.seq = self.seq + self.model.tokenizer.encode(text)
-
-    def _turn(self) -> None:
-        if not self.open:
-            self._text(self.turns.first if self.n == 0 else self.after + self.turns.user)
-            self.after, self.open = "", True
-
-    def sync(self) -> None:
-        """The device holds the sequence: what the prompt cache keeps of it, the rest run (nothing when the device's
-        sequence is it already: a prompt cache keeps a whole prompt only with its last token's logits)."""
-        cached = self.engine.cached
-        if len(cached) == len(self.seq) and common_prefix(cached, self.seq) == len(self.seq):
-            return
-        kept = self.engine.hold(self.seq)
-        if kept < len(self.seq):
-            self.engine.npu.prompt(self.seq[kept:])
-        self.engine.ran(self.seq)
-
-    def audio(self, samples: np.ndarray) -> None:
-        """More of the user turn's audio (16 kHz): its rows run as they come."""
-        self._turn()
-        if self.stream is None:
-            self._text(self.turns.audio[0])
-            self.stream = self.model.audio_stream()
-        self.stream.push(samples)
-        if self.stream.available() >= ROWS_STEP:
-            self._rows(self.stream.available())
-            self.sync()
-
-    def _rows(self, n: int) -> None:
-        from ..lfm3a.host import clip_sequence
-        self.seq = self.seq + clip_sequence(self.stream.take(n))
-
-    def commit(self) -> bool:
-        """The turn's audio ends (its last rows, the text after a clip); False: no audio."""
-        if self.stream is None:
-            return False
-        self.stream.end()
-        if self.stream.available():
-            self._rows(self.stream.available())
-        self.stream = None
-        self._text(self.turns.audio[1])
-        self.sync()
-        return True
-
-    def text(self, text: str) -> None:
-        self._turn()
-        self._text(text)
-
-    def image(self, data: bytes) -> None:
-        """An image in the user turn (a camera frame): its tokens between the template's text around one."""
-        self._turn()
-        self._text(self.turns.image[0])
-        try:
-            self.seq = self.seq + self.model.vision.sequence(data)
-        finally:
-            self.model._vision_ran()
-        self._text(self.turns.image[1])
-
-    def output(self, text: str) -> None:
-        """A function's output (the last response called it)."""
-        self._text(self.after + self.turns.tool + text + self.turns.tool_end)
-        self.after, self.results = "", True
-
-    def respond(self, mode: str, max_tokens: int, stats: Any, seed: int | None = None) -> Any:
-        """The reply's ("text", token) and ("audio", samples) as they come (``Lfm.reply``; ``seed``: its speech codes'
-        sampling); its tokens and frames stay in the sequence."""
-        from ..lfm3a.speech import Reply
-        if self.open:
-            self._text(self.turns.user_end)
-        self._text(self.turns.reply)
-        self.seq = self.seq + self.model.opener(mode)
-        stats.prompt = len(self.seq)
-        kept = self.engine.hold(self.seq)
-        reply = Reply()
-        try:
-            yield from self.model.reply(self.seq[kept:], mode=mode, seed=seed, max_tokens=max_tokens, reply=reply,
-                                        stats=stats)
-        finally:
-            self.seq = self.seq + reply.sequence(self.model.cfg.hidden_size)
-            self.engine.ran(self.seq)
-            self.after, self.open, self.results = self.turns.reply_end, False, False
-            self.n += 1
+Handler = Callable[[dict[str, Any]], Awaitable[bool | None]]
+TRANSCRIPTION_EVENT = "conversation.item.input_audio_transcription"
+TEMPLATE_KEY = "tokenizer.chat_template"
 
 
 def _responses_tools(tools: object) -> list[dict[str, Any]]:
     """A realtime session's ``tools`` (the Responses API's form, ``{"type": "function", "name", ...}``) as the chat
     templates take them (``tools.functions``: ValueError, not a list of functions)."""
-    from .tools import functions
     if isinstance(tools, list):
         tools = [t if not isinstance(t, dict) or "function" in t else
                  {"type": t.get("type"), "function": {k: t[k] for k in ("name", "description", "parameters") if k in t}}
@@ -307,8 +54,198 @@ def _responses_tools(tools: object) -> list[dict[str, Any]]:
     return functions(tools)
 
 
-async def conversation(ws: WebSocket, engine: Engine, alias: str, event: Callable[[dict[str, Any]], Any],
-                       error: Callable[..., Any]) -> None:
+class Session:
+    """A realtime websocket session: the server's events out (``event``, ``error``), the client's in (``loop``).
+    A subclass sets ``handlers`` (the client's event types to coroutines of the event; True ends the session)."""
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.handlers: dict[str, Handler] = {}
+
+    async def event(self, ev: dict[str, Any]) -> None:
+        await self.ws.send_text(json.dumps({"event_id": hex_id("event_", 8), **ev}))
+
+    async def error(self, message: str, kind: str = "invalid_request_error") -> None:
+        await self.event({"type": "error", "error": {"type": kind, "code": None, "message": message, "param": None}})
+
+    async def pcm(self, ev: dict[str, Any]) -> np.ndarray | None:
+        """An ``input_audio_buffer.append``'s samples (base64 PCM16 as float32); None (the client told): not base64."""
+        try:
+            pcm = base64.b64decode(str(ev.get("audio", "")), validate=True)
+        except binascii.Error:
+            await self.error("invalid base64 audio")
+            return None
+        return np.frombuffer(pcm[:len(pcm) // 2 * 2], np.int16).astype(np.float32) / 32768
+
+    async def before(self) -> None:
+        """Before each event's handler."""
+
+    async def loop(self) -> None:
+        """The client's events, each to its handler, until a handler returns True."""
+        while True:
+            try:
+                ev = json.loads(await self.ws.receive_text())
+                kind = ev.get("type") if isinstance(ev, dict) else None
+            except ValueError:
+                await self.error("invalid JSON")
+                continue
+            await self.before()
+            handler = self.handlers.get(kind)
+            if handler is None:
+                await self.error(f"unknown event type: {kind}")
+            elif await handler(ev):
+                return
+
+
+class LiveAsrSession(Session):
+    """A live transcription session over ``models.lfm3a.live.LiveAsr`` (``live``), whose steps run on the engine's
+    worker: ``input_audio_buffer.append`` pushes samples, ``.commit`` ends a chunk's item (``final``: the stream)."""
+
+    def __init__(self, ws: WebSocket, engine: Engine, alias: str, live: Any):
+        super().__init__(ws)
+        self.engine, self.live = engine, live
+        self.session = {"id": hex_id("sess_", 12), "object": "realtime.transcription_session",
+                        "type": "transcription",
+                        "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000},
+                                            "transcription": {"model": alias}, "turn_detection": None,
+                                            "noise_reduction": None}}}
+        self.item, self.prev, self.text = hex_id("item_", 12), None, []
+        self.handlers = {"session.update": self.update, "transcription_session.update": self.update,
+                         "input_audio_buffer.append": self.append, "input_audio_buffer.commit": self.commit,
+                         "input_audio_buffer.clear": self.clear}
+
+    @classmethod
+    async def open(cls, ws: WebSocket, engine: Engine, alias: str) -> "LiveAsrSession | None":
+        """The session of the engine's model, or None (the client told: the model refuses)."""
+        from ..lfm3a import live as lv
+
+        model = engine.model
+        try:
+            live = await asyncio.wrap_future(engine.live(lambda: lv.LiveAsr(model, engine.npu, model.audio.encoder,
+                                                                            sync=(engine.hold, engine.ran))))
+        except Exception as e:  # (the model refuses)
+            log.exception("realtime transcription failed")
+            await Session(ws).error(f"{type(e).__name__}: {e}", "server_error")
+            return None
+        return cls(ws, engine, alias, live)
+
+    async def step(self, fn: Callable[[], str]) -> None:
+        out = await asyncio.wrap_future(self.engine.live(fn))
+        if out:
+            self.text.append(out)
+            await self.event({"type": f"{TRANSCRIPTION_EVENT}.delta", "item_id": self.item, "content_index": 0,
+                              "delta": out})
+
+    async def completed(self) -> None:
+        await self.event({"type": f"{TRANSCRIPTION_EVENT}.completed", "item_id": self.item, "content_index": 0,
+                          "transcript": "".join(self.text)})
+        self.text.clear()
+
+    async def update(self, ev: dict[str, Any]) -> None:
+        await self.event({"type": "session.updated", "session": self.session})
+
+    async def append(self, ev: dict[str, Any]) -> None:
+        x = await self.pcm(ev)
+        if x is not None and len(x):
+            await self.step(lambda: self.live.push(x))
+
+    async def commit(self, ev: dict[str, Any]) -> bool | None:
+        if ev.get("final"):
+            await self.step(self.live.end)
+            await self.completed()
+            return True
+        await self.event({"type": "input_audio_buffer.committed", "previous_item_id": self.prev,
+                          "item_id": self.item})
+        await self.step(self.live.commit)
+        await self.completed()
+        self.prev, self.item = self.item, hex_id("item_", 12)
+        return None
+
+    async def clear(self, ev: dict[str, Any]) -> None:
+        await self.event({"type": "input_audio_buffer.cleared"})
+
+    async def run(self) -> None:
+        await self.event({"type": "session.created", "session": self.session})
+        try:
+            await self.loop()
+        except WebSocketDisconnect:
+            return
+        except Exception as e:  # (a failure in the model: the session's error)
+            log.exception("realtime transcription failed")
+            await self.error(f"{type(e).__name__}: {e}", "server_error")
+        live = self.live
+        log.info("realtime transcription: %d chunks; the encoder %.2f s, the text %.2f s", live.chunks,
+                 live.stream.t_encode, live.t_text)
+        await self.ws.close()
+
+
+class TranscriptionSession(Session):
+    """A transcription session of a model not trained for live ASR (LFM3-Omni; llama-server's): each committed buffer
+    transcribed alone with the offline ASR prompt (``transcribe(samples, language)``: its text's pieces as they come),
+    as ``conversation.item.input_audio_transcription.delta`` events and the item's ``...completed``."""
+
+    def __init__(self, ws: WebSocket, alias: str, transcribe: Callable[[np.ndarray, str], AsyncIterator[str]]):
+        super().__init__(ws)
+        self.transcribe = transcribe
+        self.session = {"id": hex_id("sess_", 12), "object": "realtime.transcription_session",
+                        "type": "transcription",
+                        "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000},
+                                            "transcription": {"model": alias, "language": None},
+                                            "turn_detection": None, "noise_reduction": None}}}
+        self.buf: list[np.ndarray] = []
+        self.prev: str | None = None
+        self.handlers = {"session.update": self.update, "transcription_session.update": self.update,
+                         "input_audio_buffer.append": self.append, "input_audio_buffer.commit": self.commit,
+                         "input_audio_buffer.clear": self.clear}
+
+    async def update(self, ev: dict[str, Any]) -> None:
+        tr = (((ev.get("session") or {}).get("audio") or {}).get("input") or {}).get("transcription") or {}
+        if "language" in tr:
+            self.session["audio"]["input"]["transcription"]["language"] = tr["language"]
+        await self.event({"type": "session.updated", "session": self.session})
+
+    async def append(self, ev: dict[str, Any]) -> None:
+        x = await self.pcm(ev)
+        if x is not None:
+            self.buf.append(x)
+
+    async def commit(self, ev: dict[str, Any]) -> bool | None:
+        x = np.concatenate(self.buf) if self.buf else np.zeros(0, np.float32)
+        self.buf.clear()
+        final = bool(ev.get("final"))
+        if not len(x):
+            if not final:
+                await self.error("input_audio_buffer.commit: the buffer is empty", "input_audio_buffer_commit_empty")
+            return final
+        item = hex_id("item_", 12)
+        await self.event({"type": "input_audio_buffer.committed", "previous_item_id": self.prev, "item_id": item})
+        text = []
+        async for piece in self.transcribe(x, self.session["audio"]["input"]["transcription"]["language"] or ""):
+            text.append(piece)
+            await self.event({"type": f"{TRANSCRIPTION_EVENT}.delta", "item_id": item, "content_index": 0,
+                              "delta": piece})
+        await self.event({"type": f"{TRANSCRIPTION_EVENT}.completed", "item_id": item, "content_index": 0,
+                          "transcript": "".join(text)})
+        self.prev = item
+        return final
+
+    async def clear(self, ev: dict[str, Any]) -> None:
+        self.buf.clear()
+        await self.event({"type": "input_audio_buffer.cleared"})
+
+    async def run(self) -> None:
+        await self.event({"type": "session.created", "session": self.session})
+        try:
+            await self.loop()
+        except WebSocketDisconnect:
+            return
+        except Exception as e:  # (a failure in the model: the session's error)
+            log.exception("realtime transcription failed")
+            await self.error(f"{type(e).__name__}: {e}", "server_error")
+        await self.ws.close()
+
+
+class ConversationSession(Session):
     """A realtime conversation (llama-server's "Realtime conversation", a model that speaks: ``Conversation``): the
     session's ``instructions`` (the system prompt), ``tools`` (the Responses API's functions; the model's calls as
     ``function_call`` items, their outputs back as ``function_call_output`` items), ``output_modalities`` (left out: the
@@ -320,61 +257,196 @@ async def conversation(ws: WebSocket, engine: Engine, alias: str, event: Callabl
     ``response.output_text.delta`` and ``response.output_audio.delta`` (base64 PCM16 at 24 kHz) between the
     ``response.*`` start and done events; ``response.cancel`` stops it. The instructions and tools are fixed at the
     session's first audio, message or response."""
-    from ..sequence import data_bytes
-    from .tools import syntax_of
 
-    model = engine.model
-    session: dict[str, Any] = {"id": f"sess_{secrets.token_hex(12)}", "object": "realtime.session", "type": "realtime",
-                               "model": alias, "instructions": "", "output_modalities": None, "max_output_tokens": "inf",
-                               "tools": [], "tool_choice": "auto",
-                               "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}},
-                                         "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "female"}}}
-    await event({"type": "session.created", "session": session})
-    conv = Conversation(engine, model)
-    fns: list[dict[str, Any]] = []
-    task: asyncio.Task | None = None
-    cancel: list[Any] = [None]
-    last: list[str | None] = [None]  # (the last item's id)
-    has_audio = [False]
+    def __init__(self, ws: WebSocket, engine: Engine, alias: str):
+        super().__init__(ws)
+        self.engine, self.model = engine, engine.model
+        self.session: dict[str, Any] = {
+            "id": hex_id("sess_", 12), "object": "realtime.session", "type": "realtime", "model": alias,
+            "instructions": "", "output_modalities": None, "max_output_tokens": "inf", "tools": [],
+            "tool_choice": "auto",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}},
+                      "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "female"}}}
+        self.conv = Conversation(engine, self.model)
+        self.fns: list[dict[str, Any]] = []
+        self.task: asyncio.Task | None = None  # (the response being generated)
+        self.stop: threading.Event | None = None  # (its cancel)
+        self.last: str | None = None  # (the last item's id)
+        self.has_audio = False
+        self.handlers = {"session.update": self.update, "input_audio_buffer.append": self.append,
+                         "input_audio_buffer.commit": self.commit_audio, "input_audio_buffer.clear": self.clear,
+                         "conversation.item.create": self.create_item, "response.create": self.create_response,
+                         "response.cancel": self.cancel_response}
 
-    async def on_worker(fn: Callable[[], Any]) -> Any:
-        return await asyncio.wrap_future(engine.run(fn))
+    @property
+    def busy(self) -> bool:
+        return self.task is not None and not self.task.done()
 
-    async def started() -> None:
-        if conv.turns is None:
-            await on_worker(lambda: conv.start(session["instructions"], fns))
+    @property
+    def template(self) -> str:
+        return self.model.chat_template or str(self.model.gguf.meta[TEMPLATE_KEY])
 
-    async def item_done(item: dict[str, Any]) -> None:
-        await event({"type": "conversation.item.added", "previous_item_id": last[0], "item": item})
-        await event({"type": "conversation.item.done", "previous_item_id": last[0], "item": item})
-        last[0] = item["id"]
+    async def on_worker(self, fn: Callable[[], Any]) -> Any:
+        return await asyncio.wrap_future(self.engine.run(fn))
 
-    async def commit() -> bool:
-        if not has_audio[0]:
+    async def started(self) -> None:
+        if self.conv.turns is None:
+            await self.on_worker(lambda: self.conv.start(self.session["instructions"], self.fns))
+
+    async def item_done(self, item: dict[str, Any]) -> None:
+        await self.event({"type": "conversation.item.added", "previous_item_id": self.last, "item": item})
+        await self.event({"type": "conversation.item.done", "previous_item_id": self.last, "item": item})
+        self.last = item["id"]
+
+    async def commit(self) -> bool:
+        """The user turn's audio ends (False: there is none)."""
+        if not self.has_audio:
             return False
-        await on_worker(conv.commit)
-        has_audio[0] = False
-        item = f"item_{secrets.token_hex(12)}"
-        await event({"type": "input_audio_buffer.committed", "previous_item_id": last[0], "item_id": item})
-        await item_done({"id": item, "object": "realtime.item", "type": "message", "role": "user", "status": "completed",
-                         "content": [{"type": "input_audio"}]})
+        await self.on_worker(self.conv.commit)
+        self.has_audio = False
+        item = hex_id("item_", 12)
+        await self.event({"type": "input_audio_buffer.committed", "previous_item_id": self.last, "item_id": item})
+        await self.item_done({"id": item, "object": "realtime.item", "type": "message", "role": "user",
+                              "status": "completed", "content": [{"type": "input_audio"}]})
         return True
 
-    async def respond(over: dict[str, Any]) -> None:
+    async def before(self) -> None:
+        if self.task is not None and self.task.done() and self.task.exception() is not None:
+            log.error("realtime response failed: %s", self.task.exception())
+
+    # ------------------------------------------------------------------
+    # The client's events
+    # ------------------------------------------------------------------
+
+    async def update(self, ev: dict[str, Any]) -> None:
+        session = self.session
+        up = ev.get("session") or {}
+        if self.conv.turns is not None and any(k in up for k in ("instructions", "tools")):
+            await self.error("session.update: instructions and tools cannot change after the first audio or message")
+            return
+        if "tools" in up:
+            try:
+                self.fns = _responses_tools(up["tools"])
+            except ValueError as e:
+                await self.error(f"session.update: {e}")
+                return
+            if self.fns and syntax_of(self.template) is None:
+                await self.error("session.update: the model's chat template has no tool calls")
+                self.fns = []
+                return
+        for k in ("instructions", "output_modalities", "max_output_tokens", "type", "tools", "tool_choice"):
+            if k in up:
+                session[k] = up[k]
+        v = ((up.get("audio") or {}).get("output") or {}).get("voice")
+        if v in ("female", "male"):
+            session["audio"]["output"]["voice"] = v
+            session["instructions"] = session["instructions"] or ("" if v == "female" else "Respond in a male voice.")
+        await self.event({"type": "session.updated", "session": session})
+
+    async def append(self, ev: dict[str, Any]) -> None:
+        x = await self.pcm(ev)
+        if x is None or not len(x):
+            return
+        if self.busy:
+            await self.error("input_audio_buffer.append: a response is in progress")
+            return
+        await self.started()
+        await self.on_worker(lambda: self.conv.audio(x))
+        self.has_audio = True
+
+    async def commit_audio(self, ev: dict[str, Any]) -> None:
+        if not await self.commit():
+            await self.error("input_audio_buffer.commit: the buffer is empty", "input_audio_buffer_commit_empty")
+
+    async def clear(self, ev: dict[str, Any]) -> None:
+        await self.event({"type": "input_audio_buffer.cleared"})  # (what ran stays: the model heard it)
+
+    async def create_item(self, ev: dict[str, Any]) -> None:
+        conv = self.conv
+        it = ev.get("item") or {}
+        if self.busy:
+            await self.error("conversation.item.create: a response is in progress")
+            return
+        if it.get("type") == "function_call_output":
+            if not self.fns or conv.n == 0 or conv.open:
+                await self.error("conversation.item.create: a function call output must follow the response that "
+                                 "called it")
+                return
+            out = str(it.get("output", ""))
+            await self.on_worker(lambda: conv.output(out))
+            await self.item_done({"id": it.get("id") or hex_id("item_", 12), "object": "realtime.item",
+                                  "type": "function_call_output", "call_id": it.get("call_id", ""), "output": out,
+                                  "status": "completed"})
+            return
+        if it.get("role", "user") != "user" or it.get("type", "message") != "message":
+            await self.error("conversation.item.create: only user messages and function call outputs are supported")
+            return
+        content = [c for c in it.get("content") or [] if isinstance(c, dict)]
+        bad = [c.get("type") for c in content if c.get("type") not in ("input_text", "text", "input_image")]
+        if bad or not content:
+            await self.error(f"conversation.item.create: unsupported content {bad or 'none'} (input_text, "
+                             "input_image)")
+            return
+        if any(c.get("type") == "input_image" for c in content) and self.model.vision is None:
+            await self.error("conversation.item.create: the model takes no images (an mmproj with a vision tower)")
+            return
+        await self.started()
+        if self.has_audio:
+            await self.commit()
+        try:
+            for c in content:
+                if c.get("type") == "input_image":
+                    url = c.get("image_url")
+                    url = url.get("url") if isinstance(url, dict) else url
+                    data = data_bytes(str(url))
+                    await self.on_worker(lambda data=data: conv.image(data))
+                else:
+                    t = str(c.get("text", ""))
+                    await self.on_worker(lambda t=t: conv.text(t))
+        except (OSError, ValueError) as e:
+            await self.error(f"conversation.item.create: {e}")
+            return
+        await self.item_done({"id": it.get("id") or hex_id("item_", 12), "object": "realtime.item",
+                              "type": "message", "role": "user", "status": "completed",
+                              "content": [{"type": c.get("type")} | ({"text": c.get("text", "")}
+                                          if c.get("type") != "input_image" else {}) for c in content]})
+
+    async def create_response(self, ev: dict[str, Any]) -> None:
+        if self.busy:
+            await self.error("a response is in progress")
+            return
+        await self.started()
+        await self.commit()
+        if not self.conv.open and not self.conv.results:
+            await self.error("response.create: commit audio or create a message first", "conversation_empty")
+            return
+        self.task = asyncio.create_task(self.respond(ev.get("response") or {}))
+
+    async def cancel_response(self, ev: dict[str, Any]) -> None:
+        if self.stop is not None:
+            self.stop.set()
+
+    # ------------------------------------------------------------------
+    # A response
+    # ------------------------------------------------------------------
+
+    async def respond(self, over: dict[str, Any]) -> None:
+        """A response (``over``: the request's own ``output_modalities`` and ``max_output_tokens``): the reply
+        generated on the worker, streamed as the ``response.*`` events."""
+        session, model, conv = self.session, self.model, self.conv
         mods = over.get("output_modalities", session["output_modalities"])
         mode = MODES.get(tuple(sorted(mods)) if mods else None)
         if mode is None:
-            await error(f"output_modalities {mods!r}: text and / or audio")
+            await self.error(f"output_modalities {mods!r}: text and / or audio")
             return
         mx = over.get("max_output_tokens", session["max_output_tokens"])
         mx = 4096 if mx in (None, "inf") else int(mx)
-        rid, item = f"resp_{secrets.token_hex(12)}", f"item_{secrets.token_hex(12)}"
-        syntax = syntax_of(model.chat_template or str(model.gguf.meta["tokenizer.chat_template"])) if fns else None
-        parser = syntax.parser(fns) if syntax is not None else None
+        syntax = syntax_of(self.template) if self.fns else None
+        parser = syntax.parser(self.fns) if syntax is not None else None
 
-        def produce(push: Callable[[tuple[str, Any]], None], stop: Any) -> None:
+        def produce(push: Callable[[tuple[str, Any]], None], stop: threading.Event) -> None:
             from ..lfm3a.speech import SpeechStats
-            cancel[0] = stop
+            self.stop = stop
             dec, st = StreamDecoder(model.tokenizer), SpeechStats()
             for kind, x in conv.respond(mode, mx, st):
                 if stop.is_set():
@@ -386,56 +458,18 @@ async def conversation(ws: WebSocket, engine: Engine, alias: str, event: Callabl
                     push(("audio", x))
             push(("done", (stop.is_set(), st)))
 
-        q, stop = worker(engine, produce, taken=False)
-        cancel[0] = stop
-        await event({"type": "response.created", "response": {"id": rid, "object": "realtime.response",
-                                                              "status": "in_progress", "output": []}})
-        output: list[dict[str, Any]] = [{"id": item, "object": "realtime.item", "type": "message", "role": "assistant",
-                                         "status": "in_progress", "content": []}]
-        await event({"type": "response.output_item.added", "response_id": rid, "output_index": 0, "item": output[0]})
-        base = {"response_id": rid, "item_id": item, "output_index": 0}
-        text, kinds, calls = [], {}, {}  # (the message's parts by kind: their content index; calls: index -> item)
-
-        async def part(kind: str) -> int:
-            if kind not in kinds:
-                kinds[kind] = len(kinds)
-                p = {"type": kind, "text": ""} if kind == "output_text" else {"type": kind, "transcript": ""}
-                await event({"type": "response.content_part.added", **base, "content_index": kinds[kind], "part": p})
-            return kinds[kind]
-
-        async def content(piece: str) -> None:
-            text.append(piece)
-            await event({"type": "response.output_text.delta", **base, "content_index": await part("output_text"),
-                         "delta": piece})
-
-        async def call(c: Any) -> None:
-            if c.index not in calls:
-                calls[c.index] = len(output)
-                output.append({"id": f"item_{secrets.token_hex(12)}", "object": "realtime.item", "type": "function_call",
-                               "status": "in_progress", "name": c.name, "call_id": c.id, "arguments": ""})
-                await event({"type": "response.output_item.added", "response_id": rid, "output_index": calls[c.index],
-                             "item": output[calls[c.index]]})
-            it = output[calls[c.index]]
-            if c.arguments:
-                it["arguments"] += c.arguments
-                await event({"type": "response.function_call_arguments.delta", "response_id": rid, "item_id": it["id"],
-                             "output_index": calls[c.index], "call_id": it["call_id"], "delta": c.arguments})
-
-        async def parts(ps: list[tuple[str, Any]]) -> None:
-            for k, v in ps:
-                await (content(v) if k == "content" else call(v) if k == "tool_call" else asyncio.sleep(0))
-
+        q, self.stop = worker(self.engine, produce, taken=False)
+        out = ResponseEvents(self, hex_id("resp_", 12), hex_id("item_", 12))
+        await out.created()
         status, n_out = "completed", 0
         while True:
             kind, x = await q.get()
             if kind == "text":
-                await (parts(parser.parts([("content", x)])) if parser is not None else content(x))
+                await (out.parts(parser.parts([("content", x)])) if parser is not None else out.content(x))
             elif kind == "audio":
-                pcm = (np.clip(x, -1, 1) * 32767).round().astype("<i2").tobytes()
-                await event({"type": "response.output_audio.delta", **base, "content_index": await part("output_audio"),
-                             "delta": base64.b64encode(pcm).decode()})
+                await out.audio(x)
             elif kind == "error":
-                await error(x, "server_error")
+                await self.error(x, "server_error")
                 status = "failed"
                 break
             else:
@@ -443,10 +477,89 @@ async def conversation(ws: WebSocket, engine: Engine, alias: str, event: Callabl
                 status, n_out = "cancelled" if stopped else "completed", st.frames
                 break
         if parser is not None:
-            await parts(parser.flush())
-        transcript = "".join(text)
+            await out.parts(parser.flush())
+        await out.finish(status, n_out)
+
+    async def run(self) -> None:
+        await self.event({"type": "session.created", "session": self.session})
+        try:
+            await self.loop()
+        except WebSocketDisconnect:
+            if self.stop is not None:
+                self.stop.set()
+            return
+        finally:
+            if self.task is not None and not self.task.done():
+                if self.stop is not None:
+                    self.stop.set()
+                with contextlib.suppress(Exception):
+                    await self.task
+
+
+class ResponseEvents:
+    """The ``response.*`` events of one response of a conversation session: its message item (the text and audio
+    parts, by content index) and the function call items the parser finds in the text."""
+
+    def __init__(self, session: ConversationSession, rid: str, item: str):
+        self.session, self.rid, self.item = session, rid, item
+        self.output: list[dict[str, Any]] = [{"id": item, "object": "realtime.item", "type": "message",
+                                              "role": "assistant", "status": "in_progress", "content": []}]
+        self.base = {"response_id": rid, "item_id": item, "output_index": 0}
+        self.text: list[str] = []
+        self.kinds: dict[str, int] = {}  # (the message's parts by kind: their content index)
+        self.calls: dict[int, int] = {}  # (a call's index: its output item)
+
+    async def created(self) -> None:
+        event = self.session.event
+        await event({"type": "response.created", "response": {"id": self.rid, "object": "realtime.response",
+                                                               "status": "in_progress", "output": []}})
+        await event({"type": "response.output_item.added", "response_id": self.rid, "output_index": 0,
+                     "item": self.output[0]})
+
+    async def part(self, kind: str) -> int:
+        if kind not in self.kinds:
+            self.kinds[kind] = len(self.kinds)
+            p = {"type": kind, "text": ""} if kind == "output_text" else {"type": kind, "transcript": ""}
+            await self.session.event({"type": "response.content_part.added", **self.base,
+                                      "content_index": self.kinds[kind], "part": p})
+        return self.kinds[kind]
+
+    async def content(self, piece: str) -> None:
+        self.text.append(piece)
+        await self.session.event({"type": "response.output_text.delta", **self.base,
+                                  "content_index": await self.part("output_text"), "delta": piece})
+
+    async def audio(self, samples: np.ndarray) -> None:
+        pcm = (np.clip(samples, -1, 1) * 32767).round().astype("<i2").tobytes()
+        await self.session.event({"type": "response.output_audio.delta", **self.base,
+                                  "content_index": await self.part("output_audio"),
+                                  "delta": base64.b64encode(pcm).decode()})
+
+    async def call(self, c: Any) -> None:
+        event, output, calls = self.session.event, self.output, self.calls
+        if c.index not in calls:
+            calls[c.index] = len(output)
+            output.append({"id": hex_id("item_", 12), "object": "realtime.item", "type": "function_call",
+                           "status": "in_progress", "name": c.name, "call_id": c.id, "arguments": ""})
+            await event({"type": "response.output_item.added", "response_id": self.rid,
+                         "output_index": calls[c.index], "item": output[calls[c.index]]})
+        it = output[calls[c.index]]
+        if c.arguments:
+            it["arguments"] += c.arguments
+            await event({"type": "response.function_call_arguments.delta", "response_id": self.rid,
+                         "item_id": it["id"], "output_index": calls[c.index], "call_id": it["call_id"],
+                         "delta": c.arguments})
+
+    async def parts(self, ps: list[tuple[str, Any]]) -> None:
+        for k, v in ps:
+            await (self.content(v) if k == "content" else self.call(v) if k == "tool_call" else asyncio.sleep(0))
+
+    async def finish(self, status: str, n_out: int) -> None:
+        """The parts', calls' and items' done events, then ``response.done``."""
+        event, base, rid, output = self.session.event, self.base, self.rid, self.output
+        transcript = "".join(self.text)
         ps = []
-        for kind, i in sorted(kinds.items(), key=lambda kv: kv[1]):
+        for kind, i in sorted(self.kinds.items(), key=lambda kv: kv[1]):
             if kind == "output_text":
                 await event({"type": "response.output_text.done", **base, "content_index": i, "text": transcript})
                 ps.append({"type": kind, "text": transcript})
@@ -455,209 +568,48 @@ async def conversation(ws: WebSocket, engine: Engine, alias: str, event: Callabl
                 ps.append({"type": kind, "transcript": transcript})
             await event({"type": "response.content_part.done", **base, "content_index": i, "part": ps[-1]})
         output[0]["content"] = ps
-        for i in calls.values():
+        for i in self.calls.values():
             it = output[i]
             await event({"type": "response.function_call_arguments.done", "response_id": rid, "item_id": it["id"],
-                         "output_index": i, "call_id": it["call_id"], "name": it["name"], "arguments": it["arguments"]})
+                         "output_index": i, "call_id": it["call_id"], "name": it["name"],
+                         "arguments": it["arguments"]})
         for i, it in enumerate(output):
             it["status"] = status
             await event({"type": "response.output_item.done", "response_id": rid, "output_index": i, "item": it})
-            last[0] = it["id"]
+            self.session.last = it["id"]
         await event({"type": "response.done", "response": {"id": rid, "object": "realtime.response", "status": status,
                                                            "output": output, "usage": {"output_tokens": n_out}}})
 
-    try:
-        while True:
-            try:
-                ev = json.loads(await ws.receive_text())
-                kind = ev.get("type") if isinstance(ev, dict) else None
-            except ValueError:
-                await error("invalid JSON")
-                continue
-            if task is not None and task.done() and task.exception() is not None:
-                log.error("realtime response failed: %s", task.exception())
-            busy = task is not None and not task.done()
-            if kind == "session.update":
-                up = ev.get("session") or {}
-                fixed = conv.turns is not None
-                if fixed and any(k in up for k in ("instructions", "tools")):
-                    await error("session.update: instructions and tools cannot change after the first audio or message")
-                    continue
-                if "tools" in up:
-                    try:
-                        fns = _responses_tools(up["tools"])
-                    except ValueError as e:
-                        await error(f"session.update: {e}")
-                        continue
-                    if fns and syntax_of(model.chat_template or str(model.gguf.meta["tokenizer.chat_template"])) is None:
-                        await error("session.update: the model's chat template has no tool calls")
-                        fns = []
-                        continue
-                for k in ("instructions", "output_modalities", "max_output_tokens", "type", "tools", "tool_choice"):
-                    if k in up:
-                        session[k] = up[k]
-                v = ((up.get("audio") or {}).get("output") or {}).get("voice")
-                if v in ("female", "male"):
-                    session["audio"]["output"]["voice"] = v
-                    session["instructions"] = session["instructions"] or (
-                        "" if v == "female" else "Respond in a male voice.")
-                await event({"type": "session.updated", "session": session})
-            elif kind == "input_audio_buffer.append":
-                try:
-                    pcm = base64.b64decode(str(ev.get("audio", "")), validate=True)
-                except binascii.Error:
-                    await error("invalid base64 audio")
-                    continue
-                x = np.frombuffer(pcm[:len(pcm) // 2 * 2], np.int16).astype(np.float32) / 32768
-                if len(x):
-                    if busy:
-                        await error("input_audio_buffer.append: a response is in progress")
-                        continue
-                    await started()
-                    await on_worker(lambda x=x: conv.audio(x))
-                    has_audio[0] = True
-            elif kind == "input_audio_buffer.commit":
-                if not await commit():
-                    await error("input_audio_buffer.commit: the buffer is empty", "input_audio_buffer_commit_empty")
-            elif kind == "input_audio_buffer.clear":
-                await event({"type": "input_audio_buffer.cleared"})  # (what ran stays: the model heard it)
-            elif kind == "conversation.item.create":
-                it = ev.get("item") or {}
-                if busy:
-                    await error("conversation.item.create: a response is in progress")
-                    continue
-                if it.get("type") == "function_call_output":
-                    if not fns or conv.n == 0 or conv.open:
-                        await error("conversation.item.create: a function call output must follow the response that "
-                                    "called it")
-                        continue
-                    out = str(it.get("output", ""))
-                    await on_worker(lambda out=out: conv.output(out))
-                    await item_done({"id": it.get("id") or f"item_{secrets.token_hex(12)}", "object": "realtime.item",
-                                     "type": "function_call_output", "call_id": it.get("call_id", ""), "output": out,
-                                     "status": "completed"})
-                    continue
-                if it.get("role", "user") != "user" or it.get("type", "message") != "message":
-                    await error("conversation.item.create: only user messages and function call outputs are supported")
-                    continue
-                content = [c for c in it.get("content") or [] if isinstance(c, dict)]
-                bad = [c.get("type") for c in content if c.get("type") not in ("input_text", "text", "input_image")]
-                if bad or not content:
-                    await error(f"conversation.item.create: unsupported content {bad or 'none'} (input_text, "
-                                "input_image)")
-                    continue
-                if any(c.get("type") == "input_image" for c in content) and model.vision is None:
-                    await error("conversation.item.create: the model takes no images (an mmproj with a vision tower)")
-                    continue
-                await started()
-                if has_audio[0]:
-                    await commit()
-                try:
-                    for c in content:
-                        if c.get("type") == "input_image":
-                            url = c.get("image_url")
-                            url = url.get("url") if isinstance(url, dict) else url
-                            data = data_bytes(str(url))
-                            await on_worker(lambda data=data: conv.image(data))
-                        else:
-                            t = str(c.get("text", ""))
-                            await on_worker(lambda t=t: conv.text(t))
-                except (OSError, ValueError) as e:
-                    await error(f"conversation.item.create: {e}")
-                    continue
-                await item_done({"id": it.get("id") or f"item_{secrets.token_hex(12)}", "object": "realtime.item",
-                                 "type": "message", "role": "user", "status": "completed",
-                                 "content": [{"type": c.get("type")} | ({"text": c.get("text", "")}
-                                             if c.get("type") != "input_image" else {}) for c in content]})
-            elif kind == "response.create":
-                if busy:
-                    await error("a response is in progress")
-                    continue
-                await started()
-                await commit()
-                if not conv.open and not conv.results:
-                    await error("response.create: commit audio or create a message first", "conversation_empty")
-                    continue
-                task = asyncio.create_task(respond(ev.get("response") or {}))
-            elif kind == "response.cancel":
-                if cancel[0] is not None:
-                    cancel[0].set()
-            else:
-                await error(f"unknown event type: {kind}")
-    except WebSocketDisconnect:
-        if cancel[0] is not None:
-            cancel[0].set()
-        return
-    finally:
-        if task is not None and not task.done():
-            if cancel[0] is not None:
-                cancel[0].set()
-            with contextlib.suppress(Exception):
-                await task
 
+def add_route(app: FastAPI, *, engine: Engine, alias: str, authorized: Callable[[str | None, str | None], bool],
+              transcribe: Callable[[np.ndarray, str], AsyncIterator[str]] | None = None) -> None:
+    """``/v1/realtime``: ``authorized(authorization, x_api_key)``: the request's headers pass the server's API keys;
+    ``transcribe``: a clip's offline transcript as its pieces come (the transcription sessions of a model without live
+    ASR)."""
 
-async def transcription(ws: WebSocket, transcribe: Callable[[np.ndarray, str], Any], alias: str,
-                        event: Callable[[dict[str, Any]], Any], error: Callable[..., Any]) -> None:
-    """A transcription session of a model not trained for live ASR (LFM3-Omni; llama-server's): each committed buffer
-    transcribed alone with the offline ASR prompt (``transcribe(samples, language)``: its text's pieces as they come),
-    as ``conversation.item.input_audio_transcription.delta`` events and the item's ``...completed``."""
-    session = {"id": f"sess_{secrets.token_hex(12)}", "object": "realtime.transcription_session",
-               "type": "transcription",
-               "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000},
-                                   "transcription": {"model": alias, "language": None}, "turn_detection": None,
-                                   "noise_reduction": None}}}
-    await event({"type": "session.created", "session": session})
-    buf: list[np.ndarray] = []
-    prev = None
-    try:
-        while True:
-            try:
-                ev = json.loads(await ws.receive_text())
-                kind = ev.get("type") if isinstance(ev, dict) else None
-            except ValueError:
-                await error("invalid JSON")
-                continue
-            if kind in ("session.update", "transcription_session.update"):
-                tr = (((ev.get("session") or {}).get("audio") or {}).get("input") or {}).get("transcription") or {}
-                if "language" in tr:
-                    session["audio"]["input"]["transcription"]["language"] = tr["language"]
-                await event({"type": "session.updated", "session": session})
-            elif kind == "input_audio_buffer.append":
-                try:
-                    pcm = base64.b64decode(str(ev.get("audio", "")), validate=True)
-                except binascii.Error:
-                    await error("invalid base64 audio")
-                    continue
-                buf.append(np.frombuffer(pcm[:len(pcm) // 2 * 2], np.int16).astype(np.float32) / 32768)
-            elif kind == "input_audio_buffer.commit":
-                x = np.concatenate(buf) if buf else np.zeros(0, np.float32)
-                buf.clear()
-                if not len(x):
-                    if not ev.get("final"):
-                        await error("input_audio_buffer.commit: the buffer is empty", "input_audio_buffer_commit_empty")
-                    if ev.get("final"):
-                        break
-                    continue
-                item = f"item_{secrets.token_hex(12)}"
-                await event({"type": "input_audio_buffer.committed", "previous_item_id": prev, "item_id": item})
-                text = []
-                async for piece in transcribe(x, session["audio"]["input"]["transcription"]["language"] or ""):
-                    text.append(piece)
-                    await event({"type": "conversation.item.input_audio_transcription.delta", "item_id": item,
-                                 "content_index": 0, "delta": piece})
-                await event({"type": "conversation.item.input_audio_transcription.completed", "item_id": item,
-                             "content_index": 0, "transcript": "".join(text)})
-                prev = item
-                if ev.get("final"):
-                    break
-            elif kind == "input_audio_buffer.clear":
-                buf.clear()
-                await event({"type": "input_audio_buffer.cleared"})
-            else:
-                await error(f"unknown event type: {kind}")
-    except WebSocketDisconnect:
-        return
-    except Exception as e:  # (a failure in the model: the session's error)
-        log.exception("realtime transcription failed")
-        await error(f"{type(e).__name__}: {e}", "server_error")
-    await ws.close()
+    @app.websocket("/v1/realtime")
+    async def realtime(ws: WebSocket) -> None:
+        if not authorized(ws.headers.get("authorization"), ws.headers.get("x-api-key")):
+            await ws.close(code=1008, reason="Invalid API Key")
+            return
+        await ws.accept()
+        model = engine.model if engine.ready else None
+        transcribing = ws.query_params.get("intent") == "transcription"
+        if not transcribing and model is not None and speaks(engine):
+            await ConversationSession(ws, engine, alias).run()
+            return
+        live_asr = TEMPLATE_KEY + ".asr" in getattr(getattr(model, "gguf", None), "meta", {})
+        if transcribing and model is not None and model.audio is not None and not live_asr and transcribe is not None:
+            await TranscriptionSession(ws, alias, transcribe).run()
+            return
+        if not transcribing or model is None or model.audio is None or not live_asr:
+            session = Session(ws)
+            await session.error("The current model does not support realtime transcription (a model with a speech "
+                                "encoder: LFM3-Audio, LFM3-Omni; ?intent=transcription).")
+            await ws.close()
+            return
+        session = await LiveAsrSession.open(ws, engine, alias)
+        if session is None:
+            await ws.close()
+            return
+        await session.run()

@@ -14,19 +14,7 @@ from fastapi.testclient import TestClient
 from models.server.agents import Blocks, Store, billing
 from models.server.tools import ToolCall
 
-from .test_server import (  # noqa: F401 (_stop_engines: the engines' cleanup, autouse)
-    QWEN,
-    TOOLS_TEMPLATE,
-    WEATHER,
-    FakeModel,
-    FakeNpu,
-    _stop_engines,
-    app_of,
-    call_pieces,
-    chat,
-    live,
-    make,
-)
+from .fakes import QWEN, TOOLS_TEMPLATE, WEATHER, FakeModel, FakeNpu, app_of, call_pieces, chat, live, make
 
 # a template that takes a system message only first, as Qwen's (the fake model renders the prompt its own way)
 FIRST = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}" \

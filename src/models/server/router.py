@@ -26,7 +26,7 @@ out the models whose props say they have none); a client that goes away closes t
 cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the server of the conversation's last
 request (``X-Conversation-Id``), or cancels the request still waiting for its model.
 Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
-and with --models-max above 1 its default prompt cache takes its part of the RAM (``main.SHARE``). Models loaded
+and with --models-max above 1 its default prompt cache takes its part of the RAM (``cli_options.SHARE``). Models loaded
 together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
 the NPU, and none is queued ahead of its requests: ``prefill.chunks.PEER_PIECE_S``, ``Library.run``)."""
 
@@ -54,13 +54,15 @@ import httpx
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.types import Receive, Scope, Send
 
 from artlite import portable
 
-from . import main as server
-from .api import ApiError, add_ui, add_unsupported, bad_request, key_check, new_app, sse
+from . import cli_options
+from .app_base import NO_CACHE, CancellingResponse, add_ui, add_unsupported, key_check, new_app, sse
 from .catalog import Catalog, Entry, read_preset
+from .errors import ApiError, bad_request
+from .listing import architecture, model_entries, model_meta
+from .process import Server, listen
 
 log = logging.getLogger("artlite.server")
 
@@ -79,7 +81,7 @@ LOG_LINE = re.compile(r"([DIWEC]) ([\w.\-]+): (.*)")
 LEVELS = {"D": logging.DEBUG, "I": logging.INFO, "W": logging.WARNING, "E": logging.ERROR, "C": logging.CRITICAL}
 
 
-class Cancelled(Exception):
+class RequestCancelled(Exception):
     """A request stopped waiting for its model: its client went away, the UI's Stop, the router's shutdown."""
 
 
@@ -100,7 +102,7 @@ class Child:
         self.on_message: Callable[[dict[str, Any]], None] | None = None
         self.on_exit: Callable[[int], None] | None = None
         self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     env={**env, server.ENV + "API_KEY": self.key}, encoding="utf-8",
+                                     env={**env, cli_options.ENV + "API_KEY": self.key}, encoding="utf-8",
                                      errors="replace", bufsize=1, **portable.group_options())
         threading.Thread(target=self._messages, name="child-messages", daemon=True).start()
         threading.Thread(target=self._log, name="child-log", daemon=True).start()
@@ -184,13 +186,13 @@ class Router:
                  defaults: argparse.Namespace | None = None, command: list[str] | None = None, spare: bool = True):
         self.catalog = catalog
         self.models_max, self.autoload, self.spare_on = models_max, autoload, spare
-        self.defaults = defaults or server.arg_parser(env=False).parse_args([])
+        self.defaults = defaults or cli_options.arg_parser(env=False).parse_args([])
         self.command = command or [sys.executable, "-m", "models.server.child"]
-        hidden = server.ROUTER | server.MODEL  # (the children's env: none of the router's own, nor a model's)
+        hidden = cli_options.ROUTER | cli_options.MODEL  # (the children's env: none of the router's own, nor a model's)
         self.env = {k: v for k, v in os.environ.items()
-                    if not (k.startswith(server.ENV) and k[len(server.ENV):].lower() in hidden)}
+                    if not (k.startswith(cli_options.ENV) and k[len(cli_options.ENV):].lower() in hidden)}
         if models_max > 1:  # (each model's default prompt cache: its part of the RAM)
-            self.env[server.SHARE] = str(models_max)
+            self.env[cli_options.SHARE] = str(models_max)
         self.instances: dict[str, Instance] = {}
         self.failures: dict[str, dict[str, Any]] = {}  # id -> exit_code, error of its last failed load
         self.queue: list[str] = []  # the models requests wait to load, in the order they asked
@@ -305,28 +307,23 @@ class Router:
 
     def n_ctx(self, entry: Entry) -> int:
         """The KV cache positions its server will have."""
-        return server.capacity(entry.options.get("ctx_size", self.defaults.ctx_size), entry.header["n_ctx_train"])
+        return cli_options.capacity(entry.options.get("ctx_size", self.defaults.ctx_size), entry.header["n_ctx_train"])
 
     def listing(self) -> dict[str, Any]:
         """GET /v1/models: every model with its status, and (aligned) details as llama-server's ``models``."""
         data, details = [], []
         for e in self.catalog.entries.values():
             h, media = e.header, e.media
-            data.append({"id": e.id, "aliases": e.aliases, "tags": [], "object": "model", "owned_by": "artlite",
-                         "created": int(time.time()), "path": e.path, "status": self.status(e),
-                         "architecture": {"input_modalities": ["text"] + [m for m in media if m != "speech"],
-                                          "output_modalities": ["decisions" if h["decision"] else "text"] +
-                                          ["audio"] * ("speech" in media)},
-                         "source": e.source, "can_remove": False, "context_length": h["n_ctx_train"],
-                         "meta": {"architecture": h["arch"], "n_vocab": h["n_vocab"], "n_ctx": self.n_ctx(e),
-                                  "n_ctx_train": h["n_ctx_train"], "n_embd": h["n_embd"], "n_params": h["n_params"],
-                                  "size": h["size"], "ftype": h["ftype"]}})
-            details.append({"name": e.id, "model": e.id, "modified_at": "", "size": "", "digest": "", "type": "model",
-                            "description": "", "tags": [""], "capabilities": ["completion"] + ["multimodal"] * bool(media),
-                            "parameters": "",
-                            "details": {"parent_model": "", "format": "gguf", "family": h["arch"],
-                                        "families": [h["arch"]], "parameter_size": h["size_label"],
-                                        "quantization_level": e.tag}})
+            entry, detail = model_entries(
+                e.id, aliases=e.aliases, created=int(time.time()), multimodal=bool(media),
+                arch=architecture(media, decision=bool(h["decision"])),
+                meta=model_meta(arch=h["arch"], n_vocab=h["n_vocab"], n_ctx=self.n_ctx(e), n_ctx_train=h["n_ctx_train"],
+                                n_embd=h["n_embd"], n_params=h["n_params"], size=h["size"], ftype=h["ftype"]),
+                family=h["arch"], parameter_size=h["size_label"], quantization=e.tag,
+                extra={"path": e.path, "status": self.status(e), "source": e.source, "can_remove": False,
+                       "context_length": h["n_ctx_train"]})
+            data.append(entry)
+            details.append(detail)
         return {"object": "list", "data": data, "models": details}
 
     def _publish(self, event: dict[str, Any]) -> None:
@@ -366,13 +363,13 @@ class Router:
     async def ensure(self, entry: Entry, *, load: bool = True,
                      cancelled: Callable[[], Awaitable[bool]] | None = None) -> Instance:
         """The model's server once it is loaded: loaded (``load``), or one loading waited for (module docstring).
-        ApiError 400: not loaded (``load`` false); LoadError: its load failed; Cancelled: ``cancelled`` became true
+        ApiError 400: not loaded (``load`` false); LoadError: its load failed; RequestCancelled: ``cancelled`` became true
         or the router shuts down."""
         self.queue.append(entry.id)
         try:
             while True:
                 if self.closing:
-                    raise Cancelled("the server is shutting down")
+                    raise RequestCancelled("the server is shutting down")
                 inst = self.instances.get(entry.id)
                 if inst is not None and inst.state == "loaded":
                     return inst
@@ -403,7 +400,7 @@ class Router:
         """Load a model in the background (POST /models/load, a preset's load-on-startup)."""
 
         async def load() -> None:
-            with contextlib.suppress(LoadError, Cancelled):
+            with contextlib.suppress(LoadError, RequestCancelled):
                 await self.ensure(entry)
 
         self._spawn_task(load())
@@ -415,9 +412,9 @@ class Router:
                 return
             except TimeoutError:
                 if self.closing:
-                    raise Cancelled("the server is shutting down") from None
+                    raise RequestCancelled("the server is shutting down") from None
                 if cancelled is not None and await cancelled():
-                    raise Cancelled("the request was cancelled while its model was loading") from None
+                    raise RequestCancelled("the request was cancelled while its model was loading") from None
 
     def _turn(self, model_id: str) -> bool:
         """The model is the first one requests wait for that is not running."""
@@ -582,22 +579,18 @@ class Router:
         return Proxied(r, done)
 
 
-class Proxied(StreamingResponse):
+class Proxied(CancellingResponse):
     """A model server's response, streamed through as it comes; its end, or the client's going away, closes it (the
     model's server then cancels its generation)."""
 
     def __init__(self, r: httpx.Response, done: Callable[[], None]):
-        super().__init__(r.aiter_raw(), status_code=r.status_code,
-                         headers={k: v for k, v in r.headers.items() if k.lower() not in RESPONSE_DROP})
-        self.r, self.done = r, done
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
+        async def end() -> None:
             with anyio.CancelScope(shield=True):
-                await self.r.aclose()
-            self.done()
+                await r.aclose()
+            done()
+
+        super().__init__(r.aiter_raw(), on_end=end, status_code=r.status_code,
+                         headers={k: v for k, v in r.headers.items() if k.lower() not in RESPONSE_DROP})
 
 
 @dataclass
@@ -643,7 +636,7 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
                 inst = await router.ensure(entry, load=autoload(request), cancelled=cancelled)
             except LoadError as e:
                 raise ApiError(500, "server_error", f"{entry.id} failed to load: {e}") from None
-            except Cancelled as e:
+            except RequestCancelled as e:
                 raise ApiError(503 if router.closing else 400,
                                "unavailable_error" if router.closing else "invalid_request_error", str(e)) from None
         return inst
@@ -733,7 +726,7 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
             finally:
                 router.feeds.discard(q)
 
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+        return StreamingResponse(events(), media_type="text/event-stream", headers=NO_CACHE)
 
     @api.post("/models")
     @api.delete("/models")
@@ -796,13 +789,13 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
 def serve(p: argparse.ArgumentParser, args: argparse.Namespace, given: set[str]) -> None:
     """Router mode (``main``): ``given``, the options of the command line (to the models' servers: the ones that are
     not the router's)."""
-    if given & server.MODEL:
-        p.error(f"{', '.join(sorted('--' + d.replace('_', '-') for d in given & server.MODEL))}: one model's option "
+    if given & cli_options.MODEL:
+        p.error(f"{', '.join(sorted('--' + d.replace('_', '-') for d in given & cli_options.MODEL))}: one model's option "
                 f"(router mode: a preset's, --models-preset)")
     if args.models_max < 0:
         p.error("--models-max: 0 (any number) or more")
     try:
-        keys = server.api_keys(args)
+        keys = cli_options.api_keys(args)
         if args.models_preset:
             read_preset(args.models_preset, p)
     except (OSError, ValueError) as e:
@@ -810,16 +803,16 @@ def serve(p: argparse.ArgumentParser, args: argparse.Namespace, given: set[str])
     if not os.path.isdir(args.models_dir) and not args.models_preset:
         sys.exit(f"artlite-server: {args.models_dir}: no such directory (--models-dir, ARTLITE_MODELS_DIR, or a "
                  f"model: -m)")
-    forwarded = {d: getattr(args, d) for d in given - server.ROUTER - server.MODEL}
+    forwarded = {d: getattr(args, d) for d in given - cli_options.ROUTER - cli_options.MODEL}
     catalog = Catalog(args.models_dir, parser=p, preset=args.models_preset, options=forwarded)
     router = Router(catalog, models_max=args.models_max, autoload=args.models_autoload, defaults=args)
-    ui, no_ui = server.web_ui(args)
-    options = RouterOptions(api_keys=keys, cors_origins=[o.strip() for o in args.cors_origins.split(",") if o.strip()],
-                            ui=ui, no_ui=no_ui or RouterOptions.no_ui, build_info=server.build_info())
+    ui, no_ui = cli_options.web_ui(args)
+    options = RouterOptions(api_keys=keys, cors_origins=cli_options.parse_cors(args.cors_origins), ui=ui,
+                            no_ui=no_ui or RouterOptions.no_ui, build_info=cli_options.build_info())
     config = uvicorn.Config(create_router_app(router, options), host=args.host, port=args.port, log_config=None,
                             access_log=args.verbose, timeout_keep_alive=int(args.timeout), lifespan="on")
-    srv = server.Server(config, router.close)
-    sock = server.listen(config)
+    srv = Server(config, router.close)
+    sock = listen(config)
     log.info("router mode: the models of %s (at most %s at a time); %s, the API at /v1", catalog.models_dir,
              args.models_max or "any number", "the web UI at /" if ui else "no web UI")
     try:

@@ -1,4 +1,4 @@
-"""The prompt cache (``models.server.cache``) through the server's routes on ``test_server``'s fake model: a recurrent
+"""The prompt cache (``models.server.cache``) through the server's routes on ``fakes``' fake model: a recurrent
 model's checkpoints (where the last message and the first user message begin; the fake's turns: its role tags),
 conversations saved to RAM and restored, the RAM limit and the checkpoints per sequence, a failure, image prompts. The
 fake's restores check that the device holds the tokens of the checkpoint they restore; saving copies a sequence past 8
@@ -14,16 +14,7 @@ from fastapi.testclient import TestClient
 from models.server import cache
 from models.server.engine import Engine
 
-from .test_server import (  # noqa: F401 (_stop_engines: the engines' cleanup, autouse)
-    QWEN,
-    TEMPLATE,
-    FakeModel,
-    FakeNpu,
-    _stop_engines,
-    app_of,
-    chat,
-    make,
-)
+from .fakes import QWEN, TEMPLATE, FakeModel, FakeNpu, app_of, chat, make
 
 TURNS = ("<|assistant|>", "<|user|>")  # (the fake template's: the answer's tag, the user's)
 GROUP = 4  # (the fake's cache group: a checkpoint's mark rounded down to it)

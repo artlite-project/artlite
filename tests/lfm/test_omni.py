@@ -364,16 +364,16 @@ def test_voice_reply_picture(app: tuple[Lfm, object]) -> None:
 
 @pytest.mark.slow
 def test_realtime_conversation(app: tuple[Lfm, object], question: str) -> None:
-    """A realtime conversation on the prompt cache (``models.server.realtime.Conversation`` on an engine over the loaded
-    model): two camera frames and a spoken question streamed in 0.1 s pieces (its rows run on the model as they come)
-    answered in interleaved speech, then two text questions answered in text; each answer right and the first audio
+    """A realtime conversation on the prompt cache (``models.server.conversation.Conversation`` on an engine over the
+    loaded model): two camera frames and a spoken question streamed in 0.1 s pieces (its rows run on the model as they
+    come) answered in interleaved speech, then two text questions answered in text; each answer right and the first audio
     soon after the commit. Run again with another request between the turns (the conversation displaced: brought back
     from what the prompt cache kept of it, RAM and a checkpoint, the rest run again): the same sequence and answers.
     The logits there and from scratch as close as one sequence's runs in other splits are (the prefill's 8-bit GEMM
     operands against decode steps: KL ~1e-3; the same split gives the same bits)."""
     from models.lfm3a.speech import SpeechStats
+    from models.server.conversation import Conversation
     from models.server.engine import Engine
-    from models.server.realtime import Conversation
     m, npu = app
     x = A.load_audio(question)
     example = os.path.join(os.path.dirname(ASTRONAUT), "sd15-example.jpg")  # (another astronaut on another horse)

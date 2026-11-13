@@ -22,7 +22,7 @@ from models.server import decisions as D
 from models.server.cache import common_prefix
 from models.server.decisions import Decisions
 
-from .test_server import _stop_engines, app_of, fake_row, make  # noqa: F401 (_stop_engines: autouse)
+from .fakes import app_of, fake_row, make
 
 STATE = "I was charged twice for my order last week and nobody has replied."
 QUESTIONS = {  # (llama.cpp's test_systemone)

@@ -1,6 +1,6 @@
 """artlite-server's router mode on the host (no NPU): the catalog of a directory of small GGUF files (ids, skipped
 files, vision encoders, the header cache, presets), and the router under uvicorn with model servers that run
-``models.server.child`` with test_server's fake model (it replies with its file's name; a file named ``fail-*`` fails
+``models.server.child`` with the fake model of ``fakes`` (it replies with its file's name; a file named ``fail-*`` fails
 to load, ``waitload-*`` loads slowly, ``slow-*`` replies slowly and long). Each model server is a process (~2 s to
 start). Serving the fake models with the web UI, for a manual check of its model picker in a browser:
 
@@ -25,7 +25,8 @@ from gguf import GGMLQuantizationType, GGUFWriter
 from models.server import catalog as catalog_module
 from models.server import ui
 from models.server.catalog import Catalog, read_preset, render
-from models.server.main import SHARE, arg_parser, listen
+from models.server.cli_options import SHARE, arg_parser
+from models.server.process import listen
 from models.server.router import Router, RouterOptions, create_router_app
 
 CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
@@ -514,10 +515,10 @@ def test_router_reload(models_dir: str, tmp_path: object) -> None:
 
 
 def fake_child() -> None:
-    """``models.server.child`` with test_server's fake model: it replies with its file's name (and " mmproj" with a
+    """``models.server.child`` with the fake model of ``fakes``: it replies with its file's name (and " mmproj" with a
     vision encoder); ``fail-*`` fails to load, ``waitload-*`` takes 3 s, ``slow-*`` replies with 2000 more words, 5 ms
     each."""
-    from test_server import FakeModel, FakeNpu
+    from fakes import FakeModel, FakeNpu
 
     from models.server import child, main
 

@@ -31,23 +31,19 @@ from __future__ import annotations
 import collections
 import json
 import re
-import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .tools import ALNUM, Part, ToolCall
+from .ids import alnum_id, hex_id
+from .tools import Part, ToolCall
 
 Note = Callable[[str], None]  # a field the conversion ignores: logged once
 
 ANTHROPIC_MAX_TOKENS = 4096  # an Anthropic request's max_tokens when it has none (llama-server's)
 BILLING = "x-anthropic-billing-header:"
 STORED = 1024  # the responses kept for previous_response_id
-
-
-def token(n: int = 24) -> str:
-    return "".join(secrets.choice(ALNUM) for _ in range(n))
 
 
 def event(name: str, data: dict[str, Any]) -> str:
@@ -282,7 +278,7 @@ class Anthropic:
     prompt's cached tokens are known), ``parts`` and ``end`` the events."""
 
     def __init__(self, model: str):
-        self.id, self.model = f"msg_{token()}", model
+        self.id, self.model = alnum_id(24, "msg_"), model
         self.blocks = Blocks()
         self.started = False
 
@@ -498,7 +494,7 @@ class Responses:
     ``reasoning.encrypted_content``: reasoning items carry an empty one)."""
 
     def __init__(self, model: str, body: dict[str, Any]):
-        self.id, self.model, self.created = f"resp_{secrets.token_hex(24)}", model, int(time.time())
+        self.id, self.model, self.created = hex_id("resp_", 24), model, int(time.time())
         self.echo = {"tool_choice": "auto", "tools": [], "parallel_tool_calls": True, "store": True,
                      "truncation": "disabled", "metadata": {}, "text": {"format": {"type": "text"}}} | \
             {k: body[k] for k in ECHOED if k in body}
@@ -509,7 +505,7 @@ class Responses:
 
     def item_id(self, b: Block) -> str:
         return self.ids.setdefault(b.index, {"thinking": "rs_", "text": "msg_", "call": "fc_"}[b.kind] + (
-            b.call.id.removeprefix("call_") if b.kind == "call" else token()))
+            b.call.id.removeprefix("call_") if b.kind == "call" else alnum_id(24)))
 
     def item(self, b: Block, *, status: str = "completed") -> dict[str, Any]:
         """A block as an output item (``status`` in_progress: as just added, without its text)."""

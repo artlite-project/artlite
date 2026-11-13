@@ -42,7 +42,6 @@ state's media: ``spoken``); a file's kind is its data URL's or part's type, else
 non-d1 types are refused (501). A causal model's questions share the prompt's prefix through the prompt
 cache (``Engine.readouts``: the state once)."""
 
-import asyncio
 import base64
 import json
 import math
@@ -52,14 +51,11 @@ from dataclasses import dataclass, field
 from typing import Any, Self
 
 import numpy as np
-from fastapi import APIRouter
-from starlette.concurrency import run_in_threadpool
 
 from artlite.gguf_model import GGUFFile
 
 from ..common import MEDIA_MARKER, render_template
 from ..sequence import Sequence, data_bytes, splice
-from .engine import Engine
 
 TYPES = ("openjev", "lev", "nimble", "pplx-decider", "vllm-d3", "kev", "vllm-decision2", "lfm3-d1",
          "lfm3-d1-omni")  # (Artlite's)
@@ -79,8 +75,6 @@ D1_POOL = ([chr(c) for c in range(65, 91)] + [f"{i:02d}" for i in range(100)] + 
            + [f"#{i}" for i in range(200)] + [a + b for a in map(chr, range(65, 91)) for b in map(chr, range(65, 91))])
 ZWSP = "\u200b"
 KINDS = ("choice", "score", "noul")
-
-ApiErrors = tuple[Callable[[str], Exception], Callable[[str], Exception]]  # (400, 501)
 
 
 class BadRequest(ValueError):
@@ -808,90 +802,5 @@ class Decisions:
         return out
 
 
-def add_routes(api: APIRouter, *, engine: Engine, alias: str, kind: str | None, make: Callable[[], Decisions],
-               errors: ApiErrors, fits: Callable[[list[int]], None]) -> None:
-    """``/v1/systemone`` on ``api`` (``kind``: the model file's decision type, None: not a decision model; ``make``: its
-    ``Decisions``, built on the first request); ``errors``: a 400 and a 501 from a message; ``fits``: refuses a prompt
-    the KV cache does not hold."""
-    bad, unsupported = errors
-    ctx: list[Decisions] = []
-    lock = asyncio.Lock()
-
-    async def decisions() -> Decisions:
-        async with lock:
-            if not ctx:
-                if kind not in TYPES:
-                    raise unsupported(f"decision model type {kind!r} is not supported by artlite-server (it answers "
-                                      f"{', '.join(TYPES)})")
-                ctx.append(await run_in_threadpool(make))
-        return ctx[0]
-
-    @api.post("/v1/systemone")
-    async def systemone(body: dict[str, Any]) -> Any:
-        """Answers to questions about a state (module docstring)."""
-        if kind is None:
-            raise unsupported("This model is not a decision model")
-        d = await decisions()
-        try:
-            questions = d.questions(body)
-            state, images = d.state(body)
-            set_size = d.set_size(body) if d.type in D1 else 1
-        except BadRequest as e:
-            raise bad(str(e)) from None
-        except Unsupported as e:
-            raise unsupported(str(e)) from None
-        model = engine.model
-        kinds = [m.kind for m in images]
-        if d.type not in D1 and any(k != "image" for k in kinds):
-            raise unsupported(f"artlite-server reads images in decision requests of {d.type}, not audio or video")
-        clips = {i: q.instructions["input_audio"]["data"] for i, q in enumerate(questions) if spoken(q.instructions)}
-        for k, enc in (("image", model.vision), ("video", model.vision), ("audio", model.audio)):
-            if (k in kinds or k == "audio" and clips) and enc is None:
-                raise unsupported(f"This server does not support {k} input for decisions. For a model that supports it, "
-                                  "start it with `--mmproj`")
-        if images and d.type not in IMAGE_TYPES:
-            raise unsupported(f"artlite-server reads images in decision requests of {', '.join(IMAGE_TYPES)}, not "
-                              f"{d.type}")
-        media: list[Sequence] = []
-        heard: dict[int, Sequence] = {}
-        if images or clips:  # (the encoders on the worker, between its jobs)
-            def encode_media() -> tuple[list[Sequence], dict[int, Sequence]]:
-                if d.type not in D1:
-                    return [model.image_tokens(b) for b in images], {}
-                said = {i: model.media_tokens(data_bytes(c) if c.startswith("data:") else base64.b64decode(c), "audio")
-                        for i, c in clips.items()}
-                return [model.image_tokens(b) if k == "image" else model.media_tokens(b, k)
-                        for b, k in zip(images, kinds, strict=True)], said
-            try:
-                media, heard = await asyncio.wrap_future(engine.run(encode_media))
-            except (OSError, ValueError) as e:  # (media that do not open or are too large)
-                raise bad(f"media: {e}") from None
-        npu = engine.npu
-        whole = npu.prefill.sizes[-1] if not npu.causal else 0  # (a non-causal model reads a prompt in one chunk)
-        try:
-            prompts = await run_in_threadpool(d.prompts, state, questions, model.tokenizer.encode, media=media,
-                                              set_size=set_size, max_tokens=whole, spoken_media=heard)
-        except BadRequest as e:
-            raise bad(str(e)) from None
-        for p in prompts:
-            fits(p.ids)
-            if whole and len(p.ids) > whole:
-                raise bad(f"the prompt has {len(p.ids)} tokens, this model reads at most {whole} in one pass")
-        sets = [p.sets for p in prompts] if any(p.sets for p in prompts) else None
-        out = await asyncio.wrap_future(engine.readouts([p.ids for p in prompts], [p.rows for p in prompts],
-                                                        cache_prompt=d.shares_prompt, name="decisions", sets=sets))
-        scores: list[list[np.ndarray]] = [[] for _ in questions]
-        for p, rows in zip(prompts, out, strict=True):
-            if len(p.questions) == 1:
-                scores[p.question].append(d.scores(questions[p.question], rows))
-                continue
-            for j, i in enumerate(p.questions):  # (a sequence's questions: a row each)
-                scores[i].append(d.scores(questions[i], rows[j:j + 1]))
-        n = sum(len(p.ids) for p in prompts)
-        return {"model": body.get("model") or alias,
-                "answers": {q.id: d.answer(q, s, media=bool(media)) for q, s in zip(questions, scores, strict=True)},
-                "usage": {"input_tokens": n, "output_tokens": 0}}
-
-
-__all__ = ["IMAGE_TYPES", "TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "Unsupported",
-           "add_routes", "d1_break", "decision_type", "escape_special"]
+__all__ = ["D1", "IMAGE_TYPES", "TYPES", "BadRequest", "Decisions", "JointHead", "Prompt", "Question", "Unsupported",
+           "d1_break", "decision_type", "escape_special", "spoken"]

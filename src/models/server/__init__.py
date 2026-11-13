@@ -5,13 +5,20 @@
     artlite-server -m ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf    # then http://127.0.0.1:8080
     artlite-server                                                            # the models directory's models
 
-Modules: ``main`` (the command line, uvicorn, the shutdown), ``api`` (the FastAPI routes, server-sent events, API
-keys), ``agents`` (Anthropic's Messages and OpenAI's Responses APIs: their requests as chat completions, their
-responses and streams, the stored responses), ``engine`` (the NPU worker, stop strings, the reasoning split,
-timings), ``cache`` (the prompt cache), ``tools`` (tool calls: a template's syntax, the parsers of generated calls,
-the mask of their names), ``ui`` (llama.cpp's prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml
-authors); router mode: ``router`` (a model server process per model, loads and unloads, the proxy), ``child`` (a
-model server under the router), ``catalog`` (the directory's models, their ids, presets).
+Modules: ``cli_options`` (the command line's option table), ``main`` (one model's server: its engine, uvicorn, the
+shutdown), ``process`` (uvicorn's server and socket, the log), ``api`` (the FastAPI app) over ``context`` (what the
+routes share: ``ApiContext``), ``prompt`` (a chat request's prompt), ``streaming`` (a job's events as a response, the
+server-sent events of each API), ``app_base`` (the app's errors, API keys, the cancelling response), ``errors``, and the
+route groups ``routes_status``, ``routes_chat``, ``routes_audio``, ``routes_agents``, ``routes_completion``,
+``routes_utility``, ``routes_readouts`` (embeddings, rerank, classify), ``routes_decisions`` (``/v1/systemone``: the
+decision model's answers are ``decisions``), ``speech`` (speech output), ``realtime`` and ``conversation`` (the
+realtime websocket); ``agents`` (Anthropic's Messages and OpenAI's Responses APIs: their requests as chat completions,
+their responses and streams, the stored responses), ``engine`` (the NPU worker) with ``generation`` (one job's run),
+``jobs`` (its work and events, timings) and ``textflow`` (stop strings, the reasoning split), ``cache`` (the prompt
+cache), ``tools`` (tool calls: a template's syntax, the parsers of generated calls, the mask of their names), ``ui``
+(llama.cpp's prebuilt web UI, pinned by build and sha256; MIT license, copyright The ggml authors); router mode:
+``router`` (a model server process per model, loads and unloads, the proxy), ``child`` (a model server under the
+router), ``catalog`` (the directory's models, their ids, presets).
 
 What follows is one model's server (router mode runs one per loaded model).
 
@@ -43,6 +50,8 @@ temperature, top-k, top-p, min-p); the sampler fields the NPU path does not have
 are accepted and ignored, logged when not neutral. Tool calls: ``tools`` (the template's syntax and the parsers of
 the generated calls); the engine parses them after the thoughts, and their names are masked to the functions' as the
 tokens are sampled. Agent clients: ``/v1/messages`` and ``/v1/messages/count_tokens`` (Anthropic's: Claude Code),
-``/v1/responses`` and ``/v1/responses/input_tokens`` (OpenAI's: Codex), on the same jobs. Not provided: embeddings,
-reranking, infill, ``/metrics``, LoRA, resumable streams.
+``/v1/responses`` and ``/v1/responses/input_tokens`` (OpenAI's: Codex), on the same jobs; embeddings, reranking and
+classification (``--embedding``, ``--rerank``), ``/v1/systemone``, speech and realtime sessions where the model has
+them.
+Not provided: infill, ``/metrics``, LoRA, resumable streams.
 """
