@@ -32,8 +32,8 @@ from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.decode import gemv
-from artlite.decode.image import TileImage, column_rows, gate_up_rows
-from artlite.decode.protocol import MAX_K, NX_PER_NORM, OBJ_K, POST_K
+from artlite.decode.image import NormedImage, column_rows, gate_up_rows
+from artlite.decode.protocol import MAX_K, NX_PER_NORM, POST_K
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -57,18 +57,16 @@ def kv_rows(hd: int) -> np.ndarray:
     return np.stack(out)
 
 
-class GemmaImage(TileImage):
+class GemmaImage(NormedImage):
     """The weight image of a Gemma 4 GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default
     the vocabulary)."""
 
     def __init__(self, gguf: GGUFFile, cfg: GemmaConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None):
-        self.cfg = cfg = cfg or GemmaConfig.from_gguf(gguf)
-        self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
+        cfg = cfg or GemmaConfig.from_gguf(gguf)
         H = cfg.hidden_size
-        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=TILE_BYTES,
-                         vocab=cfg.vocab_size if vocab is None else vocab, max_rows=gemv.row_splits(KC // 256),
-                         column_major=True)
+        super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=TILE_BYTES,
+                         vocab=cfg.vocab_size if vocab is None else vocab, max_rows=gemv.row_splits(KC // 256))
         assert self.vocab % (COLS * 16) == 0 and H % (COLS * 64) == 0
         if cfg.per_layer_dim:
             assert cfg.per_layer_dim == COLS * PLE, "per-layer inputs: 32 per column"
@@ -106,36 +104,13 @@ class GemmaImage(TileImage):
         assert name == "lm", name
         return ("output_norm.weight", *self._post_of(self.layers[-1]))
 
-    def n_norm(self, L: int, name: str) -> int:
-        """Norm-weight objects of a phase: [w1 4096] (a plain input) or [w1 2048 | w_post 2048] (a header)."""
-        per = NX_PER_NORM * (OBJ_K if self.norms(L, name)[1] is None else POST_K)
-        return -(-self.cfg.hidden_size // per)
-
-    def _norm(self, L: int, name: str) -> None:
-        self._add_data(L, name + "_norm", self.n_norm(L, name) * self.tile_bytes)
-
-    def _vec(self, name: str | None, fill: float = 1.0) -> np.ndarray:
-        if name is None:
-            return np.full(self.cfg.hidden_size, fill, np.float32)
-        return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
-
     def norm_objects(self, L: int, name: str) -> np.ndarray:
-        """(n_norm, tile_bytes) uint8: the phase's norm-weight objects (bf16)."""
-        w1n, wpn, _ = self.norms(L, name)
-        H, n, T = self.cfg.hidden_size, self.n_norm(L, name), self.tile_bytes
-        if wpn is None:
-            parts = np.zeros((1, n * NX_PER_NORM * OBJ_K), np.float32)
-            parts[0, :H] = self._vec(w1n)
-        else:
-            parts = np.zeros((2, n * NX_PER_NORM * POST_K), np.float32)
-            parts[0, :H], parts[1, :H] = self._vec(w1n), self._vec(wpn)
-        objs = parts.reshape(len(parts), n, -1).transpose(1, 0, 2).reshape(n, -1)  # [object][w1 | w_post]
-        b = np.ascontiguousarray(objs).astype(bfloat16).view(np.uint8)
-        out = np.zeros((n, T), np.uint8)
-        out[:, :b.shape[1]] = b
+        """(n_norm, tile_bytes) uint8: the phase's norm-weight objects (bf16); a gate phase's first object also holds the
+        column's own per-layer projection norm weights (``PLW``): (COLS, n_norm, tile_bytes)."""
+        out = super().norm_objects(L, name)
         if name != "gate":
             return out
-        assert b.shape[1] == PLW and PLW + 4 * PLE <= T
+        assert out.shape[1] >= PLW + 4 * PLE
         w = (self._vec("per_layer_proj_norm.weight") / np.float32(math.sqrt(2.0))).astype(np.float32)
         hi = w.astype(bfloat16)
         lo = (w - hi.astype(np.float32)).astype(bfloat16)

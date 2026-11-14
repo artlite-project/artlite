@@ -29,13 +29,16 @@ whole.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
+from ml_dtypes import bfloat16
 
 from .. import _native
 from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, tile_format
 from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
+from .protocol import NX_PER_NORM, OBJ_K, POST_K
 
 PAD = 64 * 1024
 BLOCK_BYTES = 3 << 30  # a column-major layout block at most (8 columns of its layers' regions)
@@ -344,6 +347,51 @@ class TileImage:
 # ----------------------------------------------------------------------
 # Tiles of row groups
 # ----------------------------------------------------------------------
+
+
+class NormedImage(TileImage):
+    """A column-major image of an attention model (``llama.image``, ``lfm.image``, ``gemma4.image``): the model's config
+    (``cfg``), the layers it lays out (``layers``: default all) and each normed phase's norm-weight objects (a data region
+    "<phase>_norm" before its tiles: ``norm_objects``). A model supplies ``norms(L, name)``: the tensor names (w1, w_post,
+    ...) of a normed phase; w_post None: a plain normed input (objects of [w1 4096]), else a header of the post-norm
+    residual update (``protocol.F_POST``: [w1 2048 | w_post 2048] per 8 input objects); w1 None: ones."""
+
+    def __init__(self, gguf: GGUFFile, cfg: Any, *, layers: list[int] | None, **image: Any):
+        self.cfg = cfg
+        self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
+        super().__init__(gguf, column_major=True, **image)
+
+    def norms(self, L: int, name: str) -> tuple[str | None, ...]:
+        """The tensor names (w1, w_post, ...) of the normed phase ``name`` of layer L (-1: the LM head)."""
+        raise NotImplementedError
+
+    def n_norm(self, L: int, name: str) -> int:
+        """Norm-weight objects of a phase: [w1 4096] (a plain input) or [w1 2048 | w_post 2048] (a header)."""
+        per = NX_PER_NORM * (OBJ_K if self.norms(L, name)[1] is None else POST_K)
+        return -(-self.cfg.hidden_size // per)
+
+    def _norm(self, L: int, name: str) -> None:
+        self._add_data(L, name + "_norm", self.n_norm(L, name) * self.tile_bytes)
+
+    def _vec(self, name: str | None) -> np.ndarray:
+        """A norm weight (hidden,) fp32 (None: ones)."""
+        if name is None:
+            return np.ones(self.cfg.hidden_size, np.float32)
+        return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
+
+    def norm_objects(self, layer: int, name: str) -> np.ndarray:
+        """(n_norm, tile_bytes) uint8: the phase's norm-weight objects (bf16): [w1] or per object [w1 | w_post]."""
+        w1, wp = self.norms(layer, name)[:2]
+        H, n, T = self.cfg.hidden_size, self.n_norm(layer, name), self.tile_bytes
+        vecs = [self._vec(w1)] + ([] if wp is None else [self._vec(wp)])
+        parts = np.zeros((len(vecs), n * NX_PER_NORM * (OBJ_K if wp is None else POST_K)), np.float32)
+        for i, v in enumerate(vecs):
+            parts[i, :H] = v
+        objs = parts.reshape(len(vecs), n, -1).transpose(1, 0, 2).reshape(n, -1)  # [object][w1 | w_post]
+        b = np.ascontiguousarray(objs).astype(bfloat16).view(np.uint8)
+        out = np.zeros((n, T), np.uint8)
+        out[:, :b.shape[1]] = b
+        return out
 
 
 def _native_format(fmt: str, tensors: list[QTensor]) -> str:

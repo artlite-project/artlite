@@ -20,12 +20,9 @@ Memory: the weights the NPU streams are re-laid-out into a device buffer at load
 while the tokenizer and the designs load), at their quantization's size; nothing is written to disk.
 """
 
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 
 from artlite.decode.kv import kv_precision
-from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
@@ -54,16 +51,7 @@ class NpuLlama(OverlayModel):
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.prefill = LlamaPrefill(self.overlay, sizes=sizes, precise=readout, pack=readout) if prefill else None
-        with ThreadPoolExecutor(1) as pool:
-            build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
-            self.overlay.load(threads=threads)
-            for S in range(1, SLOTS + 1):  # (the steps' transactions: prompt tokens, a prompt's last, generated ones)
-                self.overlay.prepare(S, logits=False)
-                self.overlay.prepare(S, logits=True)
-            if build is not None:
-                build.result()  # (its error, if any)
-                self.prefill.bind()
-        self.overlay.ready()  # (the weights' thread packs meanwhile)
+        self._open(threads=threads)
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0

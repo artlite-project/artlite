@@ -5,7 +5,7 @@ padding zero), objects of the size that streams the fewest bytes for the file's 
 9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0, 9216 for Q8_0 alone).
 
 Column-major (as ``gemma4.image``): a column's regions in step order, each normed phase's norm-weight objects (data
-region "<name>_norm": the RMSNorm weights, ``decode.protocol.norm_objects``) before its tiles, so that a decode step
+region "<name>_norm": the RMSNorm weights, ``decode.image.NormedImage``) before its tiles, so that a decode step
 streams a column's weights between two attentions as one run (8B: in two layout blocks of layers, each under 3 GiB, the
 prefill GEMMs' weight arguments within 4 GB: ``decode.image.BLOCK_BYTES``).
 
@@ -24,8 +24,8 @@ down's K chunks go in groups of the overlay's K group (``decode.protocol.MAX_K``
 
 import numpy as np
 
-from artlite.decode.image import TileImage, column_rows, gate_up_rows
-from artlite.decode.protocol import C_LEN, MAX_K, NX_PER_NORM, OBJ_K, norm_objects
+from artlite.decode.image import NormedImage, column_rows, gate_up_rows
+from artlite.decode.protocol import C_LEN, MAX_K
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
@@ -34,21 +34,19 @@ KC = 1024  # K chunk of a tile
 NORMS = {"qkv": "attn_norm", "gate_up": "ffn_norm"}  # a layer's normed phases: their RMSNorm weights
 
 
-class LlamaImage(TileImage):
+class LlamaImage(NormedImage):
     """The weight image of a Llama GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
     padded vocabulary; tile_bytes: the object size, default chosen from the file's formats)."""
 
     def __init__(self, gguf: GGUFFile, cfg: LlamaConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0):
-        self.cfg = cfg = cfg or LlamaConfig.from_gguf(gguf)
-        self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
+        cfg = cfg or LlamaConfig.from_gguf(gguf)
         H, I = cfg.hidden_size, cfg.intermediate_size
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
-        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab, column_major=True)
+        super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab)
         assert cfg.num_key_value_heads == COLS, f"one KV head per column: {cfg.num_key_value_heads} KV heads"
         assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
-        self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
         for L in self.layers:
             self._layer(L)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
@@ -57,13 +55,9 @@ class LlamaImage(TileImage):
         self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
         self._place()
 
-    def _norm(self, L: int, name: str) -> None:
-        self._add_data(L, name + "_norm", self.n_norm * self.tile_bytes)
-
-    def norm_objects(self, L: int, name: str) -> np.ndarray:
-        """(n_norm, tile_bytes) uint8: the phase's RMSNorm weights (bf16)."""
-        w = self.gguf.tensor("output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight").dequantize()
-        return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
+    def norms(self, L: int, name: str) -> tuple[str, None]:
+        """(w1, None) tensor names of a normed phase: plain inputs (pre-norm residual updates)."""
+        return "output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight", None
 
     def _layer(self, L: int) -> None:
         cfg, b = self.cfg, f"blk.{L}."

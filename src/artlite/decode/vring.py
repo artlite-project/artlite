@@ -39,6 +39,10 @@ def ring_rows(slot: np.ndarray, hd: int) -> np.ndarray:
     return np.ascontiguousarray(v.reshape(hd // 8, 8, 8).transpose(1, 0, 2)).reshape(8, hd)
 
 
+class RingStateError(RuntimeError):
+    """A step continues from positions whose open records the rings do not hold (``VRing.check``)."""
+
+
 class VRing:
     """Which open records the rings of an overlay's layers hold: per layer the (record, rows up to (exclusive)) of each
     slot as the last steps left them; and the layers whose cache a prefill wrote last (it writes no ring: their open
@@ -70,7 +74,8 @@ class VRing:
         if p % 8 == 0 and end <= p:
             return
         r, e = self.slots.get(layer, {}).get((p >> 3) & 1, (-1, 0))
-        assert r == p >> 3 and e >= end, f"layer {layer}: the ring holds rows of record {r} to {e}, not {p >> 3} to {end}"
+        if r != p >> 3 or e < end:
+            raise RingStateError(f"layer {layer}: the ring holds rows of record {r} to {e}, not {p >> 3} to {end}")
 
     def ran(self, layer: int, p: int, S: int) -> None:
         """A step of S slots at p wrote the rows of its records into the ring of ``layer``."""

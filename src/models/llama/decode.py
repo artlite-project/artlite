@@ -13,46 +13,23 @@ their GEMV phases on the image's tiles, ``llama.image``) with Llama's options an
 Phases and buffers: ``llama/overlay.py``.
 """
 
-from aie.iron import ObjectFifo, Worker
-
 from artlite.decode import gemv
-from artlite.decode.attn import ATT, TOKEN_ATT, Attn
-from artlite.decode.design import DecodeOverlayOperator, _Streams
-from artlite.decode.protocol import C_LEN
-from artlite.operators.design import COLS
+from artlite.decode.attn import Attn
+from artlite.decode.attn_operator import AttentionDecodeOperator
 
 
-class LlamaDecodeOperator(DecodeOverlayOperator):
+class LlamaDecodeOperator(AttentionDecodeOperator):
     """The Llama decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of 1024
     columns (``tile_bytes``); ``attn``: the attention cores' shapes (None: without); ``gu_win``: the gate / up
     tiles hold fewer than 16 rows (Q5_K, Q6_K: ``DecodeOverlayOperator``); ``paged``: formats whose kernels are code
     pages (``DecodeOverlayOperator``)."""
 
-    META_KINDS = (ATT, TOKEN_ATT)  # (the attention cores')
     PREFIX = "l3d"
-    ATTN_STACK = 3072
-    ATTN_ROW = 5
-    A_DEPTH = 12  # (the memtile's BDs: 24 per channel parity)
+    CHAIN = 1
     ATTN_A_DEPTH = 2  # (the attention cores' cache objects in L1: one arrives while the core works on the other)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float = 1e-5, attn: Attn | None = None,
                  gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
         assert all(gemv.supported(f, 4) for f in rows), rows
-        assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes and attn.chain == 1)
-        self.attn = attn
-        super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu", packed=True,
-                         tok=True, gu_win=gu_win, paged=paged, win=win)
-
-    def _extra_src(self, p: str) -> str:
-        if self.attn is None:
-            return ""
-        return self.attn.render(p, self.win)
-
-    @property
-    def d_cols(self) -> list[int]:
-        return list(range(COLS)) if self.attn is not None else []
-
-    def _extra_workers(self, s: _Streams) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
-        if self.attn is None:
-            return [], []
-        return self.attn.workers(s, prefix=self.PREFIX, row=self.ATTN_ROW, stack=self.ATTN_STACK, a_depth=self.ATTN_A_DEPTH)
+        super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu",
+                         packed=True, tok=True, gu_win=gu_win, paged=paged, win=win)

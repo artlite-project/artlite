@@ -12,45 +12,21 @@ their GEMV phases on the image's Q4_0 / Q8_0 tiles, ``gemma4.image``) with Gemma
 Phases and buffers: ``gemma4/overlay.py``.
 """
 
-from aie.iron import ObjectFifo, Worker
-
-from artlite.decode.attn import ATT, TOKEN_ATT
-from artlite.decode.design import DecodeOverlayOperator, _Streams
-from artlite.decode.protocol import C_LEN
-from artlite.operators.design import COLS
+from artlite.decode.attn_operator import AttentionDecodeOperator
 
 from . import attn as AT
 from .image import KC, TILE_BYTES
 
 
-class GemmaDecodeOperator(DecodeOverlayOperator):
+class GemmaDecodeOperator(AttentionDecodeOperator):
     """The Gemma decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} (Q4_0 32, Q8_0
     16); ``attn``: the attention cores' shapes (None: without)."""
 
-    META_KINDS = (ATT, TOKEN_ATT)  # (the attention cores')
     PREFIX = "g4d"
-    ATTN_STACK = 3072
-    ATTN_ROW = 5
-    A_DEPTH = 12  # (the memtile's BDs: 24 per channel parity)
+    CHAIN = AT.QH
 
     def __init__(self, *, hidden: int, rows: dict[str, int], eps: float = 1e-6, attn: AT.GemmaAttn | None = None,
                  win: str = ""):
         assert set(rows) <= {"Q4_0", "Q8_0"}, rows
-        assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == TILE_BYTES)
-        self.attn = attn
-        super().__init__(hidden=hidden, rows=rows, tile_bytes=TILE_BYTES, eps=eps, nsb=KC // 256, act="gelu",
-                         post=True, pli=True, packed=True, win=win)
-
-    def _extra_src(self, p: str) -> str:
-        if self.attn is None:
-            return ""
-        return self.attn.render(p, self.win)
-
-    @property
-    def d_cols(self) -> list[int]:
-        return list(range(COLS)) if self.attn is not None else []
-
-    def _extra_workers(self, s: _Streams) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
-        if self.attn is None:
-            return [], []
-        return self.attn.workers(s, prefix=self.PREFIX, row=self.ATTN_ROW, stack=self.ATTN_STACK)
+        super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=TILE_BYTES, eps=eps, nsb=KC // 256,
+                         act="gelu", post=True, pli=True, packed=True, win=win)

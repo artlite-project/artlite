@@ -458,7 +458,7 @@ class GemmaDraft:
         self._pos = pos
 
     def _tail_fills(self, pos: int) -> bool:
-        """The chain ends' tail fills of the open record of position pos - 1 (``GemmaOverlay.tail_mode``: its ring
+        """The chain ends' tail fills of the open record of position pos - 1 (``AttentionOverlay.tail_mode``: its ring
         slots, or its V panels as the prefill left them) and the F_ATT objects' M_ATREC; False: as they were."""
         ov, T, dev = self.ov, self.T, self.ov.dev
         rec = {src: ov.tail_mode(src, before=False) for src in set(self.src)}

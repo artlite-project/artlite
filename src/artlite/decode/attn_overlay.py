@@ -21,10 +21,11 @@ the token objects, each column's range of each layer's cache per sub-step (A: ad
 objects (A: the ring slots of the sub-step's open records, or after a prefill the V panels of the first: record mode,
 ``_ring_modes``) and the record drains (D: address, length): ``decode.step``.
 
-What a model supplies: its ``phases`` and their flags (``_flags``), the layout of its buffers (``_plan``: with ``_plan_caches``
-and, for post-norm models, ``_plan_headers``), its GEMV outputs (``_outputs``), what the attention objects hold
-(``_attention_scale``, ``_qk_weights``, ``_load_layer`` for other layers), the sub-steps (``subs``, ``_kind_subs``), the
-RoPE tables of a kind (``_rope``) and the words of its own in the token objects (``_token_words``).
+What a model supplies: its ``phases`` and their flags (``_flags``), the layout of its buffers (``_plan``: with
+``_plan_caches`` and, for post-norm models, ``_plan_headers``), its GEMV outputs (``_outputs``), what the attention
+objects hold (``_attention_scale``, ``_qk_weights``, ``_load_layer`` for other layers), the sub-steps (``subs``,
+``_kind_subs``), the RoPE tables of a kind (``_rope``) and the words of its own in the token objects
+(``_token_words``).
 """
 
 import itertools
@@ -239,8 +240,8 @@ class AttentionOverlay(ModelOverlay):
         raise NotImplementedError
 
     def _qk_weights(self, L: int) -> dict[str, np.ndarray]:
-        """The q / k norms' weights of layer L (hd fp32 as bytes, "q" and "k"), after the payloads the qkv drains write: q_norm
-        after a q object's heads, k_norm after a K / V object's [K | V]; none: {}."""
+        """The q / k norms' weights of layer L (hd fp32 as bytes, "q" and "k"), after the payloads the qkv drains write:
+        q_norm after a q object's heads, k_norm after a K / V object's [K | V]; none: {}."""
         return {}
 
     def _load_attention(self, L: int) -> None:
@@ -290,8 +291,8 @@ class AttentionOverlay(ModelOverlay):
         self._post_to(seq, c, self.inp[nxt][0].off if nxt is not None else self.final, h8 * c, h8, st.S, 1)
 
     def _vout(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], c: int) -> None:
-        """An F_VOUT phase's outputs of column c: its rows v into the v slots of the next header's input, then its partial sums
-        of squares."""
+        """An F_VOUT phase's outputs of column c: its rows v into the v slots of the next header's input, then its
+        partial sums of squares."""
         h8, tgt = self.H // COLS, self.inp[self.v_to[phase]][0].off
         self._post_to(seq, c, tgt, h8 * c, h8, st.S, 0)
         seq.drain("C", c, self.dev.address("ACT", tgt + XB + 2 * C_LEN * c), 2 * C_LEN)
@@ -308,7 +309,8 @@ class AttentionOverlay(ModelOverlay):
         self._outputs(seq, st, phase)
 
     def _operator(self, seq: Sequence, st: StepPlan, L: int, name: str, weights: list[tuple[int, str]]) -> None:
-        """An operator phase of layer L (``OPS``); ``weights``: the GEMV phases after it up to the next operator (one A run)."""
+        """An operator phase of layer L (``OPS``); ``weights``: the GEMV phases after it up to the next operator (one A
+        run)."""
         assert name == "att", name
         self._attention(seq, st, L, weights)
 
@@ -533,7 +535,8 @@ class AttentionOverlay(ModelOverlay):
         self._bd_words(st.tr.words, t.fills.at, kv0 + t.fills.base + f[:, 0] * T, f[:, 1] * T)
         if not self._tails(st, p, words.pu, ahead):
             return False
-        r = words.ro[t.recs.kind, t.recs.sub, t.recs.i]  # (the record drains: from the KV head's group 0 or ring, offset, bytes)
+        # (the record drains: from the KV head's group 0 or ring, offset, bytes)
+        r = words.ro[t.recs.kind, t.recs.sub, t.recs.i]
         base = np.take_along_axis(t.recs.base, r[:, :1], 1)[:, 0]
         self._bd_words(st.tr.words, t.recs.at, kv0 + base + r[:, 1], r[:, 2])
         st.tr.flush()

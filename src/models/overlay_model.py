@@ -64,6 +64,30 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def _pool(self) -> ThreadPoolExecutor:
         return ThreadPoolExecutor(1)  # (a prompt chunk's inputs while the previous chunk runs)
 
+    def _open(self, *, threads: int) -> None:
+        """Load the overlay: its weights pack (``threads``) while the prefill's designs compile, then the drafters' (``_load_
+        drafters``), the steps' transactions (``_prepare_steps``), the prefill's buffers (``bind``: after the overlay's
+        device is loaded) and the wait for the weights' thread (``ready``)."""
+        with ThreadPoolExecutor(1) as pool:
+            build = pool.submit(self.prefill.compile) if self.prefill is not None else None  # (while the weights are packed)
+            self.overlay.load(threads=threads)
+            self._load_drafters(threads)
+            self._prepare_steps()
+            if build is not None:
+                build.result()  # (its error, if any)
+                self.prefill.bind()
+        self.overlay.ready()  # (the weights' thread packs meanwhile)
+
+    def _load_drafters(self, threads: int) -> None:
+        """The drafters' weights and static objects on the loaded overlay's device."""
+
+    def _prepare_steps(self) -> None:
+        """The steps' transactions before the first prompt: of S = 1 .. SLOTS tokens (a prompt's, its last token's and a
+        generated one's), without and with logits."""
+        for S in range(1, self.overlay.SLOTS + 1) if self.causal else ():
+            self.overlay.prepare(S, logits=False)
+            self.overlay.prepare(S, logits=True)
+
     def prepare(self, prompt_len: int) -> None:
         """(the overlay's and the prefill's hardware contexts, the prefill's piece BOs and its chunks' items: else the
         first prompt of a process pays them, ~50 ms, most of it the first context waking the NPU)"""

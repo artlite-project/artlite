@@ -112,11 +112,11 @@ class LfmOverlay(AttentionOverlay):
         self.pg = at.pg[self.hd]  # positions per cache group
         assert cfg.sliding_window % self.pg == 0
         self.guard = cfg.sliding_window // self.pg  # (groups before a sliding-window cache's first one)
-        self.n_full = -(-max_positions // self.pg)
-        self.max_positions = self.n_full * self.pg
-        self.n_swa = self.guard + self.n_full
-        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.n_swa, guard=self.guard, window=cfg.sliding_window),
-                      CacheKind(hd=self.hd, pg=self.pg, groups=self.n_full))
+        full = -(-max_positions // self.pg)
+        self.max_positions = full * self.pg
+        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.guard + full, guard=self.guard,
+                                window=cfg.sliding_window),
+                      CacheKind(hd=self.hd, pg=self.pg, groups=full))
         self.uses = {L: CacheUse(kind=KINDS.index(self.kind(L)), source=L, ring=L)
                      for L in self.layers if self.kind(L) != "conv"}
         self.period = PAIR

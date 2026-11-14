@@ -102,9 +102,9 @@ class LlamaOverlay(AttentionOverlay):
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                       eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16}, paged=paged_formats(gguf, fmts))
         self.pg = at.pg[self.hd]  # positions per cache group
-        self.n_groups = -(-max_positions // self.pg)
-        self.max_positions = self.n_groups * self.pg
-        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.n_groups),)
+        groups = -(-max_positions // self.pg)
+        self.max_positions = groups * self.pg
+        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=groups),)
         self.uses = {L: CacheUse(kind=0, source=L, ring=0) for L in self.layers}
         self.period = PAIR
         self.inv_freq = cfg.rope_inv_freq()

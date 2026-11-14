@@ -118,6 +118,7 @@ class GemmaPrefill(ChunkPrefill):
             cs_positions=self.cs_rows, kp=ov.at.kp) for hd in self.hds}
         self.attn = {(hd, T): AP.GemmaAttnOperator(T=T, cfg=cfg, hd=hd, kv_bytes=self.kv_bytes[hd], kv_pad=pad,
                                                    kp=ov.at.kp) for hd in self.hds for T in self.sizes}
+        self._starts: dict[int, list[int]] = {}  # (per chunk size: its layers' first items, ``_layer_starts``)
         self._rows()
         self._library()
 
@@ -160,7 +161,9 @@ class GemmaPrefill(ChunkPrefill):
         rl += [(self.n_in, self._np("in", self.n_in), tok("PX", j, self.n_in, i=1), tok("PXN", j, self.n_in, i=2))
                for j in range(S)]
         ple_off = self.ple_plan.layout.off["ple"]
+        starts = []
         for i, L in enumerate(self.layers):
+            starts.append(len(rl))
             hd = cfg.head_dim(L)
             kd = self.kind[hd]
             rg, rq, ra = 2 * COLS * self.pitch[hd], COLS * kd.qp // 8, 9 * hd  # (the kind's G, QS, A rows)
@@ -201,6 +204,7 @@ class GemmaPrefill(ChunkPrefill):
             n = self.n_p
             rl += [(n, self._np((L, "p"), n), tok("PX", j, n, i=1), tok("P", j, n, i=2), tok("PX", j, n, i=3),
                     tok("PXN", j, n, i=4)) for j in range(S)]
+        self._starts[T] = [*starts, len(rl)]
         return rl
 
     # ------------------------------------------------------------------
@@ -332,15 +336,4 @@ class GemmaPrefill(ChunkPrefill):
         return len(gemms) + 2 + 3 + 1
 
     def _layer_starts(self, T: int) -> list[int]:
-        """(after the chunk's first items: x's panels, the per-layer projection, the first norm)"""
-        S = max(1, T // SUB)
-        starts = [S * (len(self.ple_plan.gemms) + 2)]
-        for L in self.layers:
-            starts.append(starts[-1] + self.layer_entries(L, S))
-        return starts
-
-    def layer_entries(self, L: int, S: int) -> int:
-        if L == self.layers[-1]:
-            return S * (len(self.plans[(L, "qkv")].gemms) + 1)
-        gemms = sum(len(self.plans[(L, name)].gemms) for name in PHASES)
-        return S * (gemms + 1 + 3 + 1) + 1
+        return self._starts[T]

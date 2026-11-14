@@ -64,6 +64,7 @@ its tail objects).
 """
 
 import math
+from typing import Protocol
 
 import numpy as np
 from aie.iron import Buffer, Kernel, ObjectFifo, Worker
@@ -134,6 +135,26 @@ def consts() -> dict[str, int]:
 _SRC = templating.load("artlite/decode/attn.cc.jinja")
 
 
+class AttnJob(Protocol):
+    """A second job of the attention cores (``Attn(conv=)``: LFM3's short convolution, ``models.lfm.conv.ConvJob``): the
+    M_FLAGS ``flag`` of its regions' first object, its state words (``words``, after A_WORDS), the bytes of a D object it
+    emits (``d_bytes``), its workspace (``need`` bytes), its kernels (``render``) and the lines it adds to abegin
+    (``begin_src``: a region's first object, ``token_src``: token object 0)."""
+
+    flag: int
+    words: int
+    d_bytes: int
+
+    @property
+    def need(self) -> int: ...
+
+    def render(self, p: str, *, base: int, st: int, X: str, consts: dict[str, int]) -> str: ...
+
+    def begin_src(self, p: str) -> str: ...
+
+    def token_src(self, A_WORDS: int) -> str: ...
+
+
 class Attn:
     """The attention cores' shapes: the kinds of layer (at most two) by their rotated pairs ``rot`` and head dims ``hds``
     (one per kind, or one for both: the F_ATT object's M_AKIND tells a layer's kind), ``chain`` columns per KV head
@@ -149,7 +170,7 @@ class Attn:
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
-                 c_len: int = 64, gate: bool = False, conv: object = None, pages: paging.PageSpec | None = None):
+                 c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and 1 <= heads <= 4, (chain, heads)

@@ -25,10 +25,9 @@ w_post = the previous layer's ``post_ffw_norm``; the first layer's: a plain inpu
 """
 
 import numpy as np
-from ml_dtypes import bfloat16
 
-from artlite.decode.image import TileImage, column_rows, gate_up_rows
-from artlite.decode.protocol import MAX_K, NX_PER_NORM, OBJ_K, POST_K
+from artlite.decode.image import NormedImage, column_rows, gate_up_rows
+from artlite.decode.protocol import MAX_K, NX_PER_NORM, POST_K
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LfmConfig
 from artlite.operators.design import COLS
@@ -51,17 +50,16 @@ def qkv_rows(cfg: LfmConfig) -> dict[str, np.ndarray]:
     return {"q": q, "k": half, "v": half, "g": heads}
 
 
-class LfmImage(TileImage):
+class LfmImage(NormedImage):
     """The weight image of an LFM3 GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
     vocabulary; tile_bytes: the object size, default chosen from the file's formats)."""
 
     def __init__(self, gguf: GGUFFile, cfg: LfmConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0):
-        self.cfg = cfg = cfg or LfmConfig.from_gguf(gguf)
-        self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
+        cfg = cfg or LfmConfig.from_gguf(gguf)
         H = cfg.hidden_size
-        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=tile_bytes,
-                         vocab=cfg.vocab_size if vocab is None else vocab, column_major=True)
+        super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=tile_bytes,
+                         vocab=cfg.vocab_size if vocab is None else vocab)
         assert H == COLS * CH and cfg.num_key_value_heads * 2 == COLS and self.vocab % (COLS * 64) == 0, cfg
         assert NX_PER_NORM * POST_K >= H, "a header's [w1 | w_post] in one norm-weight object per 8 input objects"
         for L in self.layers:
@@ -86,31 +84,6 @@ class LfmImage(TileImage):
             return b + "ffn_norm.weight", b + "post_attention_norm.weight"
         assert name == "lm", name
         return "output_norm.weight", f"blk.{self.layers[-1]}.post_ffw_norm.weight"
-
-    def n_norm(self, L: int, name: str) -> int:
-        """Norm-weight objects of a phase: [w1 4096] (a plain input) or [w1 2048 | w_post 2048] (a header)."""
-        per = NX_PER_NORM * (OBJ_K if self.norms(L, name)[1] is None else POST_K)
-        return -(-self.cfg.hidden_size // per)
-
-    def _norm(self, L: int, name: str) -> None:
-        self._add_data(L, name + "_norm", self.n_norm(L, name) * self.tile_bytes)
-
-    def _vec(self, name: str) -> np.ndarray:
-        return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
-
-    def norm_objects(self, L: int, name: str) -> np.ndarray:
-        """(n_norm, tile_bytes) uint8: the phase's norm-weight objects (bf16): [w1] or per object [w1 | w_post]."""
-        w1, wp = self.norms(L, name)
-        H, n, T = self.cfg.hidden_size, self.n_norm(L, name), self.tile_bytes
-        vecs = [self._vec(w1)] + ([] if wp is None else [self._vec(wp)])
-        parts = np.zeros((len(vecs), n * NX_PER_NORM * (OBJ_K if wp is None else POST_K)), np.float32)
-        for i, v in enumerate(vecs):
-            parts[i, :H] = v
-        objs = parts.reshape(len(vecs), n, -1).transpose(1, 0, 2).reshape(n, -1)  # [object][w1 | w_post]
-        b = np.ascontiguousarray(objs).astype(bfloat16).view(np.uint8)
-        out = np.zeros((n, T), np.uint8)
-        out[:, :b.shape[1]] = b
-        return out
 
     # ------------------------------------------------------------------
     # Regions

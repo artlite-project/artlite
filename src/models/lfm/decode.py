@@ -24,14 +24,14 @@ Phases and buffers: ``lfm/overlay.py``.
 import os
 
 import numpy as np
-from aie.iron import Buffer, Lock, ObjectFifo, Worker
+from aie.iron import Buffer, Lock
 from aie.iron.device import Tile
 
 from artlite import txn
 from artlite.decode import gemv
 from artlite.decode.attn import ATT, TOKEN_ATT, Attn, page_calls, page_entries
-from artlite.decode.design import DecodeOverlayOperator, _Streams
-from artlite.decode.protocol import C_LEN, PG_BD, PG_CH, PG_STATE, PG_STORE, PG_STORE_BYTES, PG_WAKE
+from artlite.decode.attn_operator import AttentionDecodeOperator
+from artlite.decode.protocol import PG_BD, PG_CH, PG_STATE, PG_STORE, PG_STORE_BYTES, PG_WAKE
 from artlite.operators import paging
 from artlite.operators.design import COLS
 
@@ -40,7 +40,7 @@ from .conv import CONV, CONV_TOKEN
 OP_PAGE_ID, OP_REQ_ID = 5, 6  # the operator cores' pages' and requests' stream ids
 
 
-class LfmDecodeOperator(DecodeOverlayOperator):
+class LfmDecodeOperator(AttentionDecodeOperator):
     """The LFM3 decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of 1024
     columns (``tile_bytes``); ``attn``: the operator cores' attention (and its conv job: ``Attn.conv``; None: without);
     ``gu_win``: the gate / up tiles hold other than 16 rows (``DecodeOverlayOperator``); ``paged``: formats whose kernels
@@ -48,38 +48,24 @@ class LfmDecodeOperator(DecodeOverlayOperator):
 
     META_KINDS = (ATT, TOKEN_ATT, CONV, CONV_TOKEN)  # (the operator cores': attention and conv)
     PREFIX = "lfd"
-    ATTN_STACK = 3072
-    ATTN_ROW = 5
-    A_DEPTH = 12  # (the memtile's BDs: 24 per channel parity)
+    CHAIN = 2
     ATTN_A_DEPTH = 2  # (the operator cores' cache objects in L1: one arrives while the core works on the other)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float = 1e-5, attn: Attn | None = None,
                  gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
         assert all(gemv.supported(f, 4) for f in rows), rows
-        assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes and attn.chain == 2)
         assert not paged, "the operator cores page: the formats' kernels stay resident"
         if attn is not None:
             hdr, ctl = paging.request(stream_id=OP_REQ_ID, channel=PG_CH)
             attn.pages = paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(hdr,), bd0=(PG_BD,), ctl=(ctl,))
-        self.attn = attn
-        super().__init__(hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu", post=True,
-                         packed=True, gu_win=gu_win, paged=paged, win=win)
+        super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu",
+                         post=True, packed=True, gu_win=gu_win, paged=paged, win=win)
 
-    def _extra_src(self, p: str) -> str:
-        if self.attn is None:
-            return ""
-        return self.attn.render(p, self.win)
-
-    @property
-    def d_cols(self) -> list[int]:
-        return list(range(COLS)) if self.attn is not None else []
-
-    def _extra_workers(self, s: _Streams) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
-        if self.attn is None:
-            return [], []
+    def _core_buffers(self) -> dict[int, list]:
+        """The pager: per core its state words and wake lock, per column its store and routes."""
         extra = {}
         P, st_ty = self.PREFIX, np.ndarray[(paging.STATE_WORDS,), np.dtype[np.int32]]
-        for c in range(COLS):  # (the pager: per core its state words and wake lock, per column its store and routes)
+        for c in range(COLS):
             mem, core = Tile(c, 1), Tile(c, self.ATTN_ROW)
             store = Buffer(np.ndarray[(PG_STORE_BYTES // 4,), np.dtype[np.int32]], tile=mem, name=f"{P}_pgstore{c}",
                            address=PG_STORE)
@@ -87,8 +73,7 @@ class LfmDecodeOperator(DecodeOverlayOperator):
             self._locks.append(Lock(core, lock_id=PG_WAKE, init=0, name=f"{P}_pgw{c}"))
             self._flows += [paging.page_flow(mem, core, channel=PG_CH, stream_id=OP_PAGE_ID),
                             paging.request_flow(core, mem, stream_id=OP_REQ_ID)]
-        return self.attn.workers(s, prefix=self.PREFIX, row=self.ATTN_ROW, stack=self.ATTN_STACK,
-                                 a_depth=self.ATTN_A_DEPTH, extra=extra)
+        return extra
 
     def page_store(self) -> tuple[paging.Store, ...] | None:
         """The compiled design's page stores, per place in a KV head's chain (the columns of one place have one control

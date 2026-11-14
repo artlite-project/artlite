@@ -8,6 +8,7 @@ its tiles, a row tile's chunks of the group in a row.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -113,19 +114,30 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
     return out
 
 
-def a_reads(region: Region, c: int, group: Group) -> list[tuple[int, int, tuple | None, int, tuple | None]]:
-    """The A fill of column c's tiles of a group: (byte offset in the image, bytes, BD dims, repeat, iteration), the
-    tiles in the order the cores run them (row tile major, the group's chunks in a row)."""
+class AFill(NamedTuple):
+    """One A fill of a group's tiles (``Sequence.fill``): the byte offset in the image, the bytes, the BD dims (None:
+    contiguous), the repeat count and the iteration (None: none)."""
+
+    offset: int
+    nbytes: int
+    dims: tuple | None
+    repeat: int
+    iteration: tuple | None
+
+
+def a_reads(region: Region, c: int, group: Group) -> list[AFill]:
+    """The A fill of column c's tiles of a group, the tiles in the order the cores run them (row tile major, the group's
+    chunks in a row)."""
     base = region.offset + c * region.col_stride
     S, n, g_img, n_rt = region.tile_bytes, region.n_kc, region.kc_group, region.n_rt
     tw = S // 4  # words of a tile, read in n0-word pieces (a BD's inner dimension is < 1024 words)
     n0 = next(k for k in range(1023, 0, -1) if tw % k == 0)
     if group.g == g_img:  # a block of whole row tiles' chunk groups: contiguous
-        return [(base + group.k0 * n_rt * S, n_rt * group.g * S, None, 1, None)]
+        return [AFill(base + group.k0 * n_rt * S, n_rt * group.g * S, None, 1, None)]
     if g_img == n:  # part of each row tile's chunks: per row tile g tiles, n tiles apart
-        return [(base + group.k0 * S, n_rt * group.g * S, (n0, group.g * tw // n0, n0, n * tw), 1, None)]
+        return [AFill(base + group.k0 * S, n_rt * group.g * S, (n0, group.g * tw // n0, n0, n * tw), 1, None)]
     # chunk-major (g_img = 1): per row tile (repeat, iteration) its g chunks, n_rt tiles apart
-    return [(base + group.k0 * n_rt * S, group.g * S, (n0, tw // n0, n0, n_rt * tw), n_rt, (tw, n_rt))]
+    return [AFill(base + group.k0 * n_rt * S, group.g * S, (n0, tw // n0, n0, n_rt * tw), n_rt, (tw, n_rt))]
 
 
 def loadr_meta(slot: int) -> np.ndarray:

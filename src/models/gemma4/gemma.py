@@ -32,7 +32,6 @@ from collections.abc import Callable, Sequence
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite import parallel_compile
 from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
@@ -79,21 +78,28 @@ class NpuGemma(OverlayModel):
         self.drafter: GemmaDraft | None = None  # (OverlayModel's)
         if path and (drafter or os.path.exists(path)):
             self.drafter = GemmaDraft(self.overlay, GGUFFile(path))
-        parallel_compile.compile_all([self.overlay.op] + ([self.prefill.lib] if prefill else []))
-        self.overlay.load(threads=threads)
+        self._open(threads=threads)
+        gguf.release()
+        self.position = 0
+
+    def _open(self, *, threads: int) -> None:
+        """(and the prefill's hardware context before timing, as the decode's)"""
+        super()._open(threads=threads)
+        if self.prefill is not None:
+            self.prefill.lib._kernel()
+
+    def _load_drafters(self, threads: int) -> None:
         if self.drafter is not None:
             self.drafter.load(threads=threads)
             self.drafter.gguf.release()
-        if self.prefill is not None:
-            self.prefill.bind()
-            self.prefill.lib._kernel()  # (its HW context before timing, as the decode's)
-        for S in range(1, BATCH + 1):  # (the steps' transactions; with drafts every S has logits)
+
+    def _prepare_steps(self) -> None:
+        """(with drafts every S has logits; a prompt's last token after its chunk: a step from the prefill's last layer)"""
+        for S in range(1, BATCH + 1):
             self.overlay.prepare(S, logits=True)
             self.overlay.prepare(S, logits=False)
-        if self.prefill is not None:  # (a prompt's last token after its chunk)
+        if self.prefill is not None:
             self.overlay.prepare(1, logits=True, start=self.prefill.layers[-1])
-        gguf.release()
-        self.position = 0
 
     def describe(self) -> str:
         d = f", drafter {os.path.basename(self.drafter.gguf.path)}" if self.drafter is not None else ""
