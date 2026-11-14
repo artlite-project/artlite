@@ -320,6 +320,9 @@ class GdnPrepOperator(ArtcOperator):
 
 
 _SCAN = templating.load("models/qwen35/gdn_prefill.scan.cc.jinja")
+# runs of the v rows and of o in a round (which queues 5 other shim BDs: B, a chain of 2, the state in and out)
+MAX_RUNS = 4
+assert 5 + 2 * MAX_RUNS <= TILE_BDS
 
 
 class GdnScanOperator(ArtcOperator):
@@ -339,8 +342,6 @@ class GdnScanOperator(ArtcOperator):
     STACK = 3072
     CV_ROWS = 16  # rows of CV read (the v quarter's conv state: [16][32])
     RUN = MAX_BD_ITER * C  # tokens per BD of the v rows and o (a BD iterates at most MAX_BD_ITER times)
-    MAX_RUNS = 4  # runs of the v rows and of o in a round (which queues 5 other shim BDs: B, a chain of 2, the state in and out)
-    assert 5 + 2 * MAX_RUNS <= TILE_BDS
     pfx = kernel_prefix("gdsc")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = (),
@@ -354,8 +355,8 @@ class GdnScanOperator(ArtcOperator):
         self.pack, self.tree = pack, tree
         assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0
         check_bd_iterations(T // self.sub, "GdnScan: the sub-chunks")
-        if T > self.MAX_RUNS * self.RUN:
-            raise HardwareLimitError(f"GdnScan: T {T} needs more than {self.MAX_RUNS} runs of {self.RUN} tokens "
+        if T > MAX_RUNS * self.RUN:
+            raise HardwareLimitError(f"GdnScan: T {T} needs more than {MAX_RUNS} runs of {self.RUN} tokens "
                                      f"(a round's shim BDs: at most {TILE_BDS})")
         self.T, self.cfg, self.layout = T, cfg, layout
         self.ablate = tuple(ablate)

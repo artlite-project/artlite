@@ -344,10 +344,9 @@ class PrefillAttnOperator(ArtcOperator):
     def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
                  pp: int = 1, pack: bool = False):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
-        results); "ev_qk",
-        "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed
-        (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or hi + lo (2: P V's error gone; one stream: the lo pair
-        in the same loop, two streams: P V once per part)."""
+        results); "ev_qk", "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters
+        programmed (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or
+        hi + lo (2: P V's error gone; one stream: the lo pair in the same loop, two streams: P V once per part)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0

@@ -177,7 +177,8 @@ class GdnShape(GdnDims):
     slots: int
     chunk: bool
 
-    def __new__(cls, cfg: QwenConfig | None = None, /, *, slots: int = SLOTS, chunk: bool = False, **_: int) -> Self:
+    def __new__(cls, cfg: QwenConfig | None = None, /, *, slots: int = SLOTS, chunk: bool = False,
+                c_len: int = 64, xpay: int = 4096, meta: int = 64) -> Self:
         if cls is GdnShape:
             assert slots in (SLOTS, 8)
             return super().__new__(Gdn8 if slots == 8 else Gdn4Chunk if chunk else Gdn4)
