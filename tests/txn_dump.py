@@ -50,6 +50,7 @@ from artlite.model_config import (
     qwen_dflash_of,
     qwen_gguf,
     qwen_mtp_of,
+    sd15_dir,
     swift_gguf,
 )
 from artlite.moe import route as moe_route
@@ -480,11 +481,33 @@ def _audio(path: str) -> Callable[[_Log], None]:
     return run
 
 
+def _diffusion(path: str) -> Callable[[_Log], None]:
+    """Stable Diffusion 1.5's UNet step (two timesteps, a new context between them) and VAE decode."""
+    def run(log: _Log) -> None:
+        from models.sd15 import npu
+
+        rng = np.random.default_rng(5)
+        log.label = "load"
+        unet, vae = npu.load(path)
+        context = rng.standard_normal((2, 77, 768)).astype(np.float32)
+        latents = rng.standard_normal((2, 4, 64, 64)).astype(np.float32)
+        for step, t in enumerate((981.0, 481.0)):
+            log.label = f"unet step {step}"
+            unet(latents, t, context)
+        log.label = "unet new context"
+        unet(latents, 1.0, context + 1.0)
+        log.label = "vae"
+        vae(latents[:1])
+
+    return run
+
+
 MEDIA_APPS: dict[str, tuple[str, Callable[[str], Callable[[_Log], None]]]] = {
     "qwen3vl-d3-lite": (decision_mmproj("d3-lite"), _vision("qwen3vl", ((224, 224), (640, 480)))),
     "minicpmv-4.7": (minicpmv_mmproj(), _vision("minicpmv", ((448, 448), (1024, 640)))),
     "lfm3vl-2B": (lfm3vl_mmproj(), _vision("lfm3vl", ((256, 256), (640, 480)), video=(320, 256))),
     "lfm3a-audio-2B": (lfm3a_mmproj(), _audio),
+    "sd15": (sd15_dir(), lambda path: _diffusion(path)),
 }
 
 APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], None]]]] = {
