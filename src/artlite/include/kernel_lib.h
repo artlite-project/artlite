@@ -1,5 +1,5 @@
 // Kernel helpers shared by the operators' templates (namespace al); math functions with variants (exp2,
-// reciprocal, expm1, softplus, sigmoid, SiLU, GELU) are generated per contract in kmath.py.
+// reciprocal, expm1, softplus, sigmoid, SiLU, GELU) are generated per contract in operators/kmath/.
 //
 // Included by operators.h, so every kernel gets them through the precompiled header, and a fused
 // ELF (one translation unit for all its operators) has one copy. Everything is inline: a helper
@@ -204,7 +204,7 @@ template <unsigned N>
 }
 
 // ---------------------------------------------------------------------------------------------
-// LUT activations (exp2, reciprocal, SiLU, GELU, sigmoid in software: kmath.py; the hardware vexp2
+// LUT activations (exp2, reciprocal, SiLU, GELU, sigmoid in software: operators/kmath/; the hardware vexp2
 // is the chord 2^n (1 + f): up to +6% on bf16 inputs; vtanh is a coarse LUT)
 // ---------------------------------------------------------------------------------------------
 
