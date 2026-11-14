@@ -339,7 +339,7 @@ class Builder:
         tb = self.npu.address(TBIAS)
         for r, ro in rows.items():
             (a, n), *more = ro.runs  # (more: the weights again per further tile)
-            self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
+            self.put(TBIAS, g.bias_bytes(b, r), off + r * nb)  # (a build's write: a restored state has it too)
             ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
         self.tb_hooks.append(TimeBias(resnet, off, np.concatenate([g.weight_rows(r) for r in range(ROWS)])))
 
