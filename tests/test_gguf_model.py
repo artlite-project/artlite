@@ -3,7 +3,7 @@ gguf-py, the native row dequantization against ``QTensor.dequantize``, the draft
 
 import numpy as np
 import pytest
-from gguf.quants import IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
+from gguf.quants import IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
 
 from artlite import _native
 from artlite.gguf_model import IQ4_VALUES
@@ -23,6 +23,28 @@ def test_iq3xxs_dequantize() -> None:
     q = f["q"].astype(np.int32)
     assert set(np.unique(np.abs(q))) <= {4, 12, 20, 28, 36, 44, 52, 62}
     assert ((q < 0).reshape(t.rows, -1, 8).sum(-1) % 2 == 0).all()
+
+
+@pytest.mark.parametrize("qtype", ["IQ2_XXS", "IQ2_XS", "IQ2_S"])
+def test_iq2_dequantize(qtype: str) -> None:
+    """IQ2_XXS, IQ2_XS and IQ2_S weights bit-identical to gguf-py's on random blocks (every index, sign field and scale),
+    their fields consistent: the codes on the grid ({8, 25, 43}) times the scales, XXS and XS signs of even parity per 8
+    values."""
+    t = random_tensor(qtype, 64, 2048, 0)
+    w = t.dequantize()
+    q = {"IQ2_XXS": IQ2_XXS, "IQ2_XS": IQ2_XS, "IQ2_S": IQ2_S}[qtype]
+    ref = q.dequantize_rows(np.ascontiguousarray(t.raw)).reshape(t.rows, t.cols).astype(np.float32)
+    assert np.array_equal(w.view(np.uint32), ref.view(np.uint32))
+    f = t.fields()
+    c = f["q"].astype(np.int32)
+    assert set(np.unique(np.abs(c))) == {8, 25, 43}
+    assert f["idx"].max() == {"IQ2_XXS": 255, "IQ2_XS": 511, "IQ2_S": 1023}[qtype]
+    if qtype != "IQ2_S":
+        assert ((c < 0).reshape(t.rows, -1, 8).sum(-1) % 2 == 0).all()
+    s = f["ls"] if qtype == "IQ2_XXS" else f["sc"]
+    n = 32 if qtype == "IQ2_XXS" else 16
+    d = np.repeat(f["d"], 256 // n, -1) * (2 * s.astype(np.float32) + 1) / 8
+    assert np.array_equal(w, (d[..., None] * c.reshape(t.rows, -1, n)).reshape(w.shape))
 
 
 @pytest.mark.parametrize("qtype", ["IQ3_S", "IQ4_NL", "IQ4_XS"])

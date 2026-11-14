@@ -8,7 +8,8 @@ from artlite.gguf_model import QTensor
 # per GGUF block: (columns, bytes, the offsets of its fp16 fields)
 BLOCK = {"Q4_0": (32, 18, (0,)), "Q4_1": (32, 20, (0, 2)), "Q8_0": (32, 34, (0,)), "Q4_K": (256, 144, (0, 2)),
          "Q5_K": (256, 176, (0, 2)), "Q6_K": (256, 210, (208,)), "Q2_K": (256, 84, (80, 82)), "Q3_K": (256, 110, (108,)),
-         "IQ3_XXS": (256, 98, (0,)), "IQ3_S": (256, 110, (0,)), "IQ4_NL": (32, 18, (0,)), "IQ4_XS": (256, 136, (0,))}
+         "IQ2_XXS": (256, 66, (0,)), "IQ2_XS": (256, 74, (0,)), "IQ2_S": (256, 82, (0,)), "IQ3_XXS": (256, 98, (0,)),
+         "IQ3_S": (256, 110, (0,)), "IQ4_NL": (32, 18, (0,)), "IQ4_XS": (256, 136, (0,))}
 
 
 def random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:

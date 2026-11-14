@@ -8,8 +8,8 @@ ggml blocks along the row (the reduction dimension K of a linear layer).
 losslessly (only fp16 scales become bf16, NPU side). ``dequantize`` gives
 the fp32 weights the ggml reference would compute.
 
-Supported: F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS (their
-tables: gguf-py's, ``iq3xxs_grid``, ``iq3s_grid``, ``IQ4_VALUES``). A tensor of another type is listed
+Supported: F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+IQ4_NL, IQ4_XS (their tables: gguf-py's, ``iq2_grid``, ``iq3xxs_grid``, ``iq3s_grid``, ``IQ4_VALUES``). A tensor of another type is listed
 (``tensor_info``: its size unknown, None) and raises NotImplementedError when read.
 
 llama.cpp's converter permutes the rows of a Llama's attn_q / attn_k per head (interleaved rotary pairs):
@@ -69,6 +69,13 @@ class QTensor:
         IQ3_S: d (rows, cols/256), sc (rows, cols/32) u8 in [0, 15], idx (rows, cols/4) u16 grid indices in [0, 511]
                (``iq3s_grid``: 4 values per entry), signs (rows, cols/8) u8 (bit j: value j negative), q (rows, cols)
                i8 in [-15, 15] the signed grid values;   w = d (1 + 2 sc_j) q (j = 32-group)
+        IQ2_XXS: d (rows, cols/256), ls (rows, cols/32) u8 in [0, 15], idx (rows, cols/8) u8 grid indices
+               (``iq2_grid``: 8 values per entry), signs (rows, cols/8) u8 7-bit sign fields (as IQ3_XXS's), q (rows,
+               cols) i8 in [-43, 43] the signed grid values; w = d (2 ls_j + 1) / 8 q (j = 32-group)
+        IQ2_XS: d (rows, cols/256), sc (rows, cols/16) u8 in [0, 15], idx (rows, cols/8) u16 grid indices in [0, 511],
+               signs (rows, cols/8) u8 7-bit sign fields, q;  w = d (2 sc_j + 1) / 8 q (j = 16-group)
+        IQ2_S: d (rows, cols/256), sc (rows, cols/16) u8 in [0, 15], idx (rows, cols/8) u16 grid indices in [0, 1023],
+               signs (rows, cols/8) u8 (bit j: value j negative), q;  w = d (2 sc_j + 1) / 8 q (j = 16-group)
         IQ4_NL: d (rows, cols/32), q (rows, cols) u8 in [0, 15] (Q4_0's order);
                                                          w = d IQ4_VALUES[q]
         IQ4_XS: d (rows, cols/256), ls (rows, cols/32) u8 in [0, 63], q (rows, cols) u8 in [0, 15] (a 32-group's as
@@ -174,6 +181,8 @@ class QTensor:
             sc = np.stack([b[..., 106:110] & 0xF, b[..., 106:110] >> 4], -1).reshape(self.rows, nb * 8)
             return {"d": _f16(b[..., 0:2]), "sc": sc, "idx": idx.reshape(self.rows, nb * 64),
                     "signs": sg.reshape(self.rows, nb * 32), "q": np.where(neg, -g, g).reshape(self.rows, self.cols)}
+        if t in ("IQ2_XXS", "IQ2_XS", "IQ2_S"):
+            return self._iq2_fields(t)
         if t == "IQ4_NL":
             b = self.blocks(18)
             q = np.empty((self.rows, b.shape[1], 32), np.uint8)
@@ -193,6 +202,39 @@ class QTensor:
             return {"d": _f16(b[..., 0:2]), "ls": (lo | hi << 4).reshape(self.rows, nb * 8),
                     "q": q.reshape(self.rows, self.cols)}
         raise ValueError(f"{self.name}: no quantization fields for {t}")
+
+    def _iq2_fields(self, t: str) -> dict[str, np.ndarray]:
+        """The fields of IQ2_XXS (66 B per 256: d, per 32-group a word of its 4 grid indices and a word of four 7-bit
+        sign fields (bits 7 l ..) and ls (bits 28 .. 31)), IQ2_XS (74 B: d, qs[32] u16 = index | sign field << 9,
+        scales[8]: 16-group 2 i in the low nibble of byte i, 2 i + 1 in the high) and IQ2_S (82 B: d, qs[0 .. 31] the
+        indices' low bytes, signs[32] (bit j of byte f: value 8 f + j negative), qh[8] (index 4 i + l's bits 8, 9 at bits
+        2 l of byte i), scales[8] as IQ2_XS's)."""
+        b = self.blocks({"IQ2_XXS": 66, "IQ2_XS": 74, "IQ2_S": 82}[t])
+        nb = b.shape[1]
+        out = {"d": _f16(b[..., 0:2])}
+        if t == "IQ2_XXS":
+            words = np.ascontiguousarray(b[..., 2:66]).view("<u4").reshape(self.rows, nb, 8, 2)
+            idx = np.ascontiguousarray(words[..., 0]).view(np.uint8).reshape(self.rows, nb, 32).astype(np.uint16)
+            sg = ((words[..., 1, None] >> np.array([0, 7, 14, 21], np.uint32)) & 0x7F).astype(np.uint8)
+            sg = sg.reshape(self.rows, nb, 32)
+            out["ls"] = (words[..., 1] >> 28).astype(np.uint8).reshape(self.rows, nb * 8)
+            s8 = sg | (_PARITY7[sg] << 7)
+        else:
+            sc = b[..., -8:]
+            out["sc"] = np.stack([sc & 0xF, sc >> 4], -1).reshape(self.rows, nb * 16)
+            if t == "IQ2_XS":
+                qs = np.ascontiguousarray(b[..., 2:66]).view("<u2")  # (rows, nb, 32)
+                idx, sg = qs & 0x1FF, (qs >> 9).astype(np.uint8)
+                s8 = sg | (_PARITY7[sg] << 7)
+            else:
+                qh = (b[..., 66:74, None] >> (2 * np.arange(4, dtype=np.uint8))) & 3  # (rows, nb, 8, 4)
+                idx = b[..., 2:34].astype(np.uint16) | (qh.reshape(self.rows, nb, 32).astype(np.uint16) << 8)
+                sg = s8 = np.ascontiguousarray(b[..., 34:66])
+        neg = ((s8[..., None] >> np.arange(8, dtype=np.uint8)) & 1).astype(bool)  # (rows, nb, 32, 8)
+        g = iq2_grid(t)[idx]
+        out.update(idx=idx.reshape(self.rows, nb * 32), signs=sg.reshape(self.rows, nb * 32),
+                   q=np.where(neg, -g, g).reshape(self.rows, self.cols))
+        return out
 
     def dequantize(self) -> np.ndarray:
         """fp32 (rows, cols) weights, computed from :meth:`fields`."""
@@ -226,6 +268,12 @@ class QTensor:
         elif t == "IQ3_S":  # (exact in fp32: d (1 + 2 sc) q has at most 20 significant bits)
             db = np.repeat(f["d"], 8, axis=-1) * (1 + 2 * f["sc"].astype(np.float32))
             w = db[..., None] * f["q"].reshape(r, -1, 32).astype(np.float32)
+        elif t == "IQ2_XXS":  # (db = d (0.5 + ls) 0.25: ggml's order, exact in fp32)
+            db = (np.repeat(f["d"], 8, axis=-1) * (np.float32(0.5) + f["ls"].astype(np.float32))) * np.float32(0.25)
+            w = db[..., None] * f["q"].reshape(r, -1, 32).astype(np.float32)
+        elif t in ("IQ2_XS", "IQ2_S"):
+            db = (np.repeat(f["d"], 16, axis=-1) * (np.float32(0.5) + f["sc"].astype(np.float32))) * np.float32(0.25)
+            w = db[..., None] * f["q"].reshape(r, -1, 16).astype(np.float32)
         elif t == "IQ4_NL":
             w = f["d"][..., None] * IQ4_VALUES[f["q"]].reshape(r, -1, 32).astype(np.float32)
         elif t == "IQ4_XS":  # (dl = d (ls - 32), then dl v: ggml's order, exact in fp32)
@@ -257,6 +305,16 @@ def iq3s_grid() -> np.ndarray:
     return IQ3_S.grid.reshape(512, 4).astype(np.int8)
 
 
+def iq2_grid(qtype: str) -> np.ndarray:
+    """The grid of IQ2_XXS, IQ2_XS or IQ2_S (ggml's ``iq2xxs_grid``, ``iq2xs_grid``, ``iq2s_grid``, from gguf-py): (256,
+    512 or 1024, 8) int8, entry i = the 8 values of index i, each in {8, 25, 43}."""
+    from gguf import quants
+
+    q = {"IQ2_XXS": quants.IQ2_XXS, "IQ2_XS": quants.IQ2_XS, "IQ2_S": quants.IQ2_S}[qtype]
+    q.init_grid()
+    return q.grid.reshape(-1, 8).astype(np.int8)
+
+
 # IQ4_NL / IQ4_XS's 16 values (ggml's kvalues_iq4nl)
 IQ4_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.int8)
 
@@ -274,8 +332,9 @@ _KV_STRING, _KV_ARRAY = 8, 9
 # ggml tensor types: name, (weights per block, bytes per block)
 _GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20), 8: ("Q8_0", 32, 34),
                10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
-               14: ("Q6_K", 256, 210), 18: ("IQ3_XXS", 256, 98), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110),
-               23: ("IQ4_XS", 256, 136), 30: ("BF16", 1, 2)}
+               14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
+               20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+               30: ("BF16", 1, 2)}
 _BLOCKS = {name: (per, nb) for name, per, nb in _GGML_TYPES.values()}
 
 

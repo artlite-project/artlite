@@ -1,5 +1,5 @@
-// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq3.py, iq3s.py, iq4.py,
-// bf16.py:
+// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq2.py, iq3.py, iq3s.py,
+// iq4.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
@@ -459,6 +459,70 @@ void tile_iq3s(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// IQ2_XXS / IQ2_XS / IQ2_S (iq2.py): per super-block a unit of 2304 bytes (R <= 24 rows; rows past R zero), in panel
+/// order p = (4 i + l) 3 + g (row 8 g + r's 8-k block 4 i + l): LO [p][r] the grid indices' low bytes, SG [p][r] the
+/// signs (XXS, XS: the prefix XOR of the 7-bit field, XXS with bit l of ls at bit 7; S: the 8 signs), SC [i][g][r] the
+/// scales byte and HB [half 2][bit 2][word 12] the indices' bits 8 and 9 (XS, S: bit n of word m = entry 32 m + n of the
+/// half's panels), D [row] bf16.
+constexpr size_t kIq2Unit = 2304;
+enum class Iq2 { XXS, XS, S };
+
+inline uint8_t prefix_xor7(uint32_t f) {
+  f &= 0x7F;
+  f ^= f << 1;
+  f ^= f << 2;
+  f ^= f << 4;
+  return static_cast<uint8_t>(f & 0x7F);
+}
+
+template <Iq2 F>
+void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  constexpr size_t bb = F == Iq2::XXS ? 66 : F == Iq2::XS ? 74 : 82;
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* u = t + kIq2Unit * sb;
+    uint32_t hb[2][2][12] = {};
+    for (int r = 0; r < R; r++) {
+      const uint8_t* b = src[r] + bb * sb;
+      const int g = r / 8, rr = r % 8;
+      put16(u + 1920 + 2 * r, bf16_of(b));
+      for (int i = 0; i < 8; i++) {
+        uint32_t w0 = 0, w1 = 0;  // (IQ2_XXS: the 32-group's index and sign / scale words)
+        if constexpr (F == Iq2::XXS) {
+          std::memcpy(&w0, b + 2 + 8 * i, 4);
+          std::memcpy(&w1, b + 6 + 8 * i, 4);
+        } else {
+          u[1536 + (3 * i + g) * 8 + rr] = b[bb - 8 + i];
+        }
+        for (int l = 0; l < 4; l++) {
+          const int e = 8 * ((4 * i + l) * 3 + g) + rr;  // (the entry in panel order)
+          uint32_t idx;
+          uint8_t s;
+          if constexpr (F == Iq2::XXS) {
+            idx = (w0 >> (8 * l)) & 0xFF;
+            s = static_cast<uint8_t>(prefix_xor7(w1 >> (7 * l)) | (((w1 >> (28 + l)) & 1) << 7));
+          } else if constexpr (F == Iq2::XS) {
+            uint16_t q;
+            std::memcpy(&q, b + 2 + 2 * (4 * i + l), 2);
+            idx = q & 0x1FF;
+            s = prefix_xor7(q >> 9);
+          } else {
+            idx = b[2 + 4 * i + l] | (((b[66 + i] >> (2 * l)) & 3u) << 8);
+            s = b[34 + 4 * i + l];
+          }
+          u[e] = static_cast<uint8_t>(idx);
+          u[768 + e] = s;
+          if constexpr (F != Iq2::XXS) {
+            const int q = e / 384, m = e % 384 / 32, n = e % 32;
+            hb[q][0][m] |= ((idx >> 8) & 1) << n;
+            hb[q][1][m] |= ((idx >> 9) & 1) << n;
+          }
+        }
+      }
+    }
+    if constexpr (F != Iq2::XXS) std::memcpy(u + 1728, hb, sizeof hb);
+  }
+}
+
 /// IQ4_NL / IQ4_XS (iq4.py): per super-block a unit: the codes [32-k group i][step s 4][row group][row 8][4 B] (byte b of
 /// word (i, s) = codes 8 s + 2 b and 8 s + 2 b + 1 of group i, the lower k in the low nibble), then IQ4_NL: d [i][row]
 /// bf16; IQ4_XS: the scales' low nibbles [i][row], their high crumbs [i' 4][row] (nibble = crumb i' | crumb i' + 4 << 2),
@@ -555,6 +619,12 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R; }, plain<tile_q3k>},
     {TileFormat::IQ3_XXS, "IQ3_XXS", 98, true, false, [](int R, int nsb) { return iq3xxs_unit(R) * size_t(nsb); },
      plain<tile_iq3xxs>},
+    {TileFormat::IQ2_XXS, "IQ2_XXS", 66, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
+     plain<tile_iq2<Iq2::XXS>>},
+    {TileFormat::IQ2_XS, "IQ2_XS", 74, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
+     plain<tile_iq2<Iq2::XS>>},
+    {TileFormat::IQ2_S, "IQ2_S", 82, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
+     plain<tile_iq2<Iq2::S>>},
     {TileFormat::IQ3_S, "IQ3_S", 110, false, false,
      [](int R, int nsb) { return R > 16 && R <= 20 ? kIq3sUnit * nsb : ~size_t(0); }, plain<tile_iq3s>},
     {TileFormat::IQ4_NL, "IQ4_NL", 144, false, false,
