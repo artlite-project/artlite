@@ -21,7 +21,6 @@ from . import layout as L
 from .builder import Builder, Records
 from .levels import Level
 from .ops import Apply, Attention, ConvSpec, Gemm
-from .seq import ColOps, MemTask
 from .weights import flat
 
 
@@ -239,21 +238,15 @@ class DTensor:
         t = alloc(bd, self.lv, n, self.kind)
         off = self.lv.ct(c0) if c0 else 0
         assert self.kind == "ct" or not c0
-        bd.reading(self.band(b))
-        base = bd.npu.address(self.band(b))
-        bd.op({c: ColOps(fills=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
-                                        ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}, {})
+        bd.op(bd.fill(self.band(b), self.nbytes, mem=t.addr, nbytes=t.nbytes, off=off), {})
         t.rec = self.rec
         return t
 
     def store(self, bd: Builder, b: int, t: Tensor, *, defer: bool = True, c0: int = 0) -> None:
         """Band b (C tiles: its channels from c0) from the memtile tensor t (drained with the next op, t's bytes released
         after it; defer False: an op of its own, t freed); its records."""
-        base = bd.ddr(self.band(b), COLS * self.nbytes)
-        bd.written(self.band(b))
         off = self.lv.ct(c0) if c0 else 0
-        cols = {c: ColOps(drains=[MemTask([{"addr": t.addr, "nwords": t.nbytes // 4}],
-                                          ddr=(base + c * self.nbytes + off, t.nbytes, None))]) for c in range(COLS)}
+        cols = bd.drain(self.band(b), self.nbytes, mem=t.addr, nbytes=t.nbytes, off=off)
         if defer:
             bd.defer(cols, release=[(t.addr, t.size or t.nbytes)])
         else:
