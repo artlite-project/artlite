@@ -8,14 +8,14 @@ leading axis (the basic ops: ``np_ops``; the MoE FFN: ``moe.ref``): ``conv_seq``
 
 The cores' arithmetic (their rounding points, float64 elsewhere): ``core_gdn_step`` (the decode's GDN core),
 ``core_gdn_scan`` / ``core_gdn_out`` (the prefill's GDN scan and gated output), ``core_attention`` (a decode
-attention column).
+attention column); the GDN state's panel layout: ``state_panels`` and its inverse.
 """
 
 import numpy as np
 
 from artlite.model_config import QwenConfig
 from models.qwen35.attn import HD, ROT
-from models.qwen35.gdn import D
+from models.qwen35.gdn_math import D
 
 from ..moe.ref import experts, moe_ffn, moe_route, shared_expert, swiglu
 from ..np_ops import f32, rms_norm, sigmoid, silu, softmax, softplus
@@ -182,6 +182,20 @@ def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos
 # ----------------------------------------------------------------------
 # The cores' arithmetic (float64 where the kernels are accurate to ~2^-16)
 # ----------------------------------------------------------------------
+
+
+def state_panels(m: np.ndarray) -> np.ndarray:
+    """llama.cpp's state of the column's v heads (HC, j, i) fp32 ([h][j][i] = S[i][j]) -> the cores' panel order
+    (HC, 16 j-panels, 16 i-blocks, 8 j, 8 i) as (HC * 16, 1024) fp32 (one row per panel)."""
+    hc = m.shape[0]
+    s = np.asarray(m, np.float32).reshape(hc, 16, 8, 16, 8)  # [h][jp][jj][ib][ii]
+    return np.ascontiguousarray(s.transpose(0, 1, 3, 2, 4)).reshape(hc * 16, 1024)
+
+
+def state_from_panels(p: np.ndarray, hc: int) -> np.ndarray:
+    """Inverse of ``state_panels``."""
+    s = np.asarray(p, np.float32).reshape(hc, 16, 16, 8, 8).transpose(0, 1, 3, 2, 4)
+    return np.ascontiguousarray(s).reshape(hc, D, D)
 
 
 def _silu64(x: np.ndarray) -> np.ndarray:

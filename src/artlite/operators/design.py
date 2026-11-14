@@ -12,6 +12,7 @@ from aie.helpers.taplib import TensorAccessPattern
 from aie.ir import Attribute, IndexType, InsertionPoint, Location, Module
 from aie.iron.dataflow import objectfifo as _objectfifo
 
+from ..txn import QUEUE_DEPTH, SHIM_BDS, HardwareLimitError
 from .mlir_util import device_op
 
 COLS = 8  # array columns
@@ -19,12 +20,18 @@ ROWS = 4  # compute rows per column (rows 2-5; memtile row 1, shim row 0)
 
 # Shim DMA limits the designs' runtime sequences are written around (``txn`` checks the host-built transactions')
 MAX_BD_ITER = 64  # a BD's iteration count (a task repeats its chain at most this often: longer runs are split)
-SHIM_QUEUE = 4  # tasks queued on a shim channel (more stall the controller before later fills are issued: a hang)
-TILE_BDS = 16  # BDs of a shim tile's DMA: a GEMM's weight fills, an A strip and the C drains of the chunks in flight
+SHIM_QUEUE = QUEUE_DEPTH  # tasks queued on a shim channel (more stall the controller before later fills: a hang)
+TILE_BDS = SHIM_BDS  # BDs of a shim tile's DMA: a GEMM's weight fills, an A strip, the C drains of the chunks in flight
 MAX_CHAIN_BDS = TILE_BDS - 2  # BDs of a chained weight fill (a policy bound, not the hardware's: the tile's BDs less
 # the A strip's and one C drain's; ``Dataflow`` checks every column's chains against it)
 MAX_BD_STEP_WORDS = 1 << 20  # a shim BD dimension's stride, in words (``txn.Txn.shim_bd``: the descriptor's step field)
 MAX_INNER_WORDS = 1023  # a shim BD's innermost dimension, in words (a longer one can make aiecc run for very long)
+
+
+def check_bd_iterations(n: int, what: str) -> None:
+    """HardwareLimitError where a BD of ``what`` would repeat ``n`` times, more than ``MAX_BD_ITER``."""
+    if n > MAX_BD_ITER:
+        raise HardwareLimitError(f"{what}: a BD repeats {n} times, at most {MAX_BD_ITER}")
 
 
 def range32(stop: object, *, unroll: bool = True) -> Iterator[object]:

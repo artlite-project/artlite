@@ -9,6 +9,7 @@ import numpy as np
 
 from ...decode.kv import Records
 from ...operators.design import COLS
+from ...operators.util import cos_sin_rows
 from .layout import L1_LIMIT, core_bytes
 
 P_CS = "pa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (2 hd p0)
@@ -103,8 +104,7 @@ class Shape:
 def cs_rows(inv_freq: np.ndarray, positions: np.ndarray) -> np.ndarray:
     """(n, hd) fp32: per position [cos hd / 2 | sin hd / 2] of the pairs' angles position inv_freq[i] (the decode's
     ``decode.attn.rope_tables``)."""
-    th = np.outer(np.asarray(positions, np.float64), np.asarray(inv_freq, np.float64))
-    return np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+    return cos_sin_rows(np.outer(np.asarray(positions, np.float64), np.asarray(inv_freq, np.float64)))
 
 
 def cs_table(inv_freq: np.ndarray, n: int) -> np.ndarray:

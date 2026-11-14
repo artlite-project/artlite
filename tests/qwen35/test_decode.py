@@ -492,11 +492,9 @@ class _Gdn:
         return msgs, np.stack(out, 1).reshape(S, -1, 128)
 
     def states(self, half: int = 0) -> list[np.ndarray]:
-        from models.qwen35 import gdn as G1
-
         self.dev.fetch("GSTATE")
         v = self.dev.view("GSTATE")[256 + half * self.half:256 + half * self.half + COLS * self.ps].reshape(COLS, -1)
-        return [G1.state_from_panels(v[c].view(np.float32), self.sh.hc) for c in range(COLS)]
+        return [ref.state_from_panels(v[c].view(np.float32), self.sh.hc) for c in range(COLS)]
 
 
 def _gdn_steps(path: str, Lg: int, x: np.ndarray, gold: np.ndarray | None) -> None:
@@ -1139,11 +1137,9 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
 
 
 def test_state_panels() -> None:
-    from models.qwen35 import gdn as G
-
     m = np.random.default_rng(0).standard_normal((3, 128, 128)).astype(np.float32)
-    p = G.state_panels(m)
+    p = ref.state_panels(m)
     assert p.shape == (48, 1024)
     # panel 16 h + jp, sub-panel ib: [jj][ii] = S[i = 8 ib + ii][j = 8 jp + jj] = m[h][j][i]
     assert p[16 * 2 + 5, 64 * 3 + 8 * 4 + 6] == m[2, 8 * 5 + 4, 8 * 3 + 6]
-    assert np.array_equal(G.state_from_panels(p, 3), m)
+    assert np.array_equal(ref.state_from_panels(p, 3), m)

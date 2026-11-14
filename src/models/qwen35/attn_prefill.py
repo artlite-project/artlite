@@ -55,13 +55,23 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from artlite.model_config import QwenConfig
+from artlite.npu_regs import window_counter_writes
 from artlite.operators import kmath, templating
 from artlite.operators.base import ArgSpec, ArtcOperator
+from artlite.operators.bfp16 import PANEL_BYTES, PANEL_ELEMS, panel_elems
 from artlite.operators.chain import ChainPart, chained_fill
-from artlite.operators.design import COLS, MAX_BD_ITER, range32, stream_walk
+from artlite.operators.design import (
+    COLS,
+    MAX_BD_ITER,
+    MAX_INNER_WORDS,
+    SHIM_QUEUE,
+    check_bd_iterations,
+    range32,
+    stream_walk,
+)
 from artlite.operators.kernel_source import kernel_prefix
-from artlite.operators.l1_layout import pin_l1_buffers
-from artlite.operators.util import Attr, bf16_hilo, regions
+from artlite.operators.l1_layout import REGION, pin_l1_buffers
+from artlite.operators.util import Attr, arg_elems, bf16_hilo, cos_sin_rows, mask64, regions
 from artlite.prefill.gemm import Layout
 
 from . import attn as AT
@@ -71,7 +81,10 @@ ND = AT.ND
 SLOT = 2 * AT.REC_K  # bytes per head of a token group's Q panels (and of its sigmoid(gate): 4096 B used); of a pair of records
 GROUP = AT.OBJS * AT.OBJ_BYTES  # bytes of a cache group (32 positions: a K object, a V object)
 OBJ_ELEMS = AT.OBJ_BYTES // 2  # bf16 of a cache object
-A_SET = ND * 36  # bf16 of a set of 32 A panels (ND panels of 36 bf16: 72 B each)
+A_SET = ND * PANEL_ELEMS  # bf16 of a set of 32 A panels (ND panels of 72 B)
+PREP_ROW = 576  # bf16 of a row of the prep's QS and KV taps (a BD's inner dimension: at most ``MAX_INNER_WORDS`` words)
+PASSES_IN_FLIGHT = 2  # a pass queues one task per shim channel: its fills wait for the pass before the last
+assert PREP_ROW // 2 <= MAX_INNER_WORDS and PASSES_IN_FLIGHT <= SHIM_QUEUE
 # Scratchpad parameters. QA_KV and QA_OFF are one per operator size ("qa_kv<T>"): a parameter's range is the tightest
 # of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
 QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
@@ -81,8 +94,6 @@ QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; t
 QA_NK = "qa_nk"  # (non-causal) the prompt's keys in its last group (1 .. 32)
 QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
-# (timing builds, ablate "ev_<kernel>": counter 0 the window's cycles, 1 lock stall, 2 all cycles, 3 the windows)
-COUNTERS = ((0x31500, 33 | 34 << 8 | 26 << 16 | 26 << 24), (0x31504, 1 | 1 << 8 | 33 << 16 | 33 << 24))
 
 
 def pass_groups(cfg: QwenConfig, T: int) -> int:
@@ -110,8 +121,7 @@ def part_walk() -> TensorAccessPattern:
 def cs_rows(cfg: QwenConfig, positions: np.ndarray | range) -> np.ndarray:
     """(n, 64) fp32: per position (text, or M-RoPE (T, H, W)) [cos 32 | sin 32] of the rotated pairs
     (``QwenConfig.rope_theta``)."""
-    th = cfg.rope_theta(positions).astype(np.float64)
-    return np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+    return cos_sin_rows(cfg.rope_theta(positions))
 
 
 def cs_table(cfg: QwenConfig, n: int) -> np.ndarray:
@@ -136,7 +146,8 @@ class AttnPrepOperator(ArtcOperator):
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
-        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER, "whole cache groups; a BD repeats at most MAX_BD_ITER times"
+        assert T % 32 == 0, "whole cache groups"
+        check_bd_iterations(T // 8, "AttnPrep")
         assert {"q", "k", "v"} <= set(layout.off)
         self.T, self.cfg, self.layout = T, cfg, layout
         self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
@@ -264,9 +275,9 @@ class AttnPrepOperator(ArtcOperator):
                     fn = core_v
                 workers.append(Worker(fn, args, tile=Tile(c, 2 + h), stack_size=self.STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
-        n_cs, n_kv = self.cs_positions * 128, self.kvh * self.head_bytes // 2
+        n_cs, n_qs, n_kv = arg_elems(self, 1), arg_elems(self, 3), arg_elems(self, 4)
         nph, per = self.nph, self.per
-        n_qs, blk = self.n_qs, 4 * self.qg * qc * SLOT  # (bf16 of a column's slots in a pass)
+        blk = 4 * self.qg * qc * SLOT  # (bf16 of a column's slots in a pass)
         hb, g2, o2 = self.head_bytes // 2, GROUP // 2, AT.OBJ_BYTES // 2
 
         def seq(G, CS, NRM, QS, KV, ah, bh, oh, khs):
@@ -284,14 +295,15 @@ class AttnPrepOperator(ArtcOperator):
                 bh[c].fill(NRM, TensorAccessPattern((2 * HD * 2,), 0, [1, 1, 1, 2 * HD * 2], [0, 0, 0, 1]), group=tg)
                 bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 128], [0, 0, 0, 1]), offset_parameter=p_cs,
                            group=tg)
-                oh[c].drain(QS, TensorAccessPattern((n_qs,), c * blk, [1, n_tg // (4 * self.qg), blk // 576, 576],
-                                                    [0, COLS * blk, 576, 1]), group=tg, wait=True)
+                oh[c].drain(QS, TensorAccessPattern((n_qs,), c * blk,
+                                                    [1, n_tg // (4 * self.qg), blk // PREP_ROW, PREP_ROW],
+                                                    [0, COLS * blk, PREP_ROW, 1]), group=tg, wait=True)
                 if c not in jobs:
                     continue
                 kind, h = jobs[c]
-                # (rows of 576 elements: a shim BD's inner dimension is at most 1023 words)
                 # (the K or V object of group g + i: its 4 records)
-                tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2, [1, T // 32, 8, 576], [0, g2, 576, 1])
+                tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2, [1, T // 32, 8, PREP_ROW],
+                                          [0, g2, PREP_ROW, 1])
                 kh[c].drain(KV, tap, offset_parameter=p_kv, group=tg, wait=True)
             tg.finish()
 
@@ -333,8 +345,8 @@ class PrefillAttnOperator(ArtcOperator):
                  pp: int = 1, pack: bool = False):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
         results); "ev_qk",
-        "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
-        two streams only). ``pp``: P as single bfp16 panels (1) or hi + lo (2: P V's error gone; one stream: the lo pair
+        "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed
+        (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or hi + lo (2: P V's error gone; one stream: the lo pair
         in the same loop, two streams: P V once per part)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
@@ -361,8 +373,8 @@ class PrefillAttnOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         p = self.pfx
-        tri = sum(1 << (8 * q + k) for q in range(8) for k in range(8) if k > q)
-        keys = [f"{sum(1 << (8 * q + k) for q in range(8) for k in range(v, 8)):016X}" for v in range(8)]
+        tri = mask64(lambda q, k: k > q)
+        keys = [f"{mask64(lambda q, k, v=v: k >= v):016X}" for v in range(8)]
         return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
                             tri=f"{tri:016X}", keys=keys, ablate=self.ablate, TWO=self.two, OB=self.ob,
                             CAUSAL=self.causal, PP=self.pp, PACK=self.pack)
@@ -377,7 +389,7 @@ class PrefillAttnOperator(ArtcOperator):
         seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.pack else []
         return [ArgSpec("in", (COLS * T // 8 * 2 * self.qc * SLOT // 2,), bfloat16),
                 ArgSpec("in", (self.kvh * self.head_bytes // 2,), bfloat16),
-                ArgSpec("out", (T * self.H * HD * 9 // 16,), bfloat16), *seg]
+                ArgSpec("out", (panel_elems(T * self.H * HD),), bfloat16), *seg]
 
     def seg(self, lo: np.ndarray, hi: np.ndarray, p0: int = 0) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk at p0: per token (T,) its segment's first and last key
@@ -481,8 +493,7 @@ class PrefillAttnOperator(ArtcOperator):
                                  (c % nph * 4 * qg + qg * r) * qc, *([k_seg] if pack else [])],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
-        n_qs = COLS * T // 8 * qc * SLOT
-        n_kv, n_a = n_kvh * self.head_bytes // 2, T * H * HD * 9 // 16
+        n_qs, n_kv, n_a = (arg_elems(self, i) for i in range(3))
         hb, sl, blk = self.head_bytes // 2, SLOT // 2, 4 * qg * qc * SLOT  # (blk: a column's slots in a pass)
 
         n_seg = self.n_seg
@@ -493,7 +504,7 @@ class PrefillAttnOperator(ArtcOperator):
             if any(a.startswith("ev_") for a in self.ablate):  # (the cores' counters: window cycles, lock stall)
                 for c in range(COLS):
                     for r in range(4):
-                        for reg, val in COUNTERS:
+                        for reg, val in window_counter_writes():
                             npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):
@@ -505,7 +516,7 @@ class PrefillAttnOperator(ArtcOperator):
                                                        [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
                                                        [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]), group=tg,
                                 wait=True)
-            inflight = []  # (a pass: one task of up to four BDs per part, at most two passes in flight)
+            inflight = []  # (a pass: one task of up to four BDs per part, ``PASSES_IN_FLIGHT`` passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
                 more = qg * b + qg - 1 if causal else 0  # (the chunk's groups after its first through the pass's)
@@ -528,7 +539,7 @@ class PrefillAttnOperator(ArtcOperator):
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
-                if len(inflight) > 1:
+                if len(inflight) >= PASSES_IN_FLIGHT:
                     inflight.pop(0).finish()
             for tp in inflight:
                 tp.finish()
@@ -642,8 +653,7 @@ class PrefillAttnOperator(ArtcOperator):
                                              (c % nph) * 4 + r, *([k_seg] if pack else [])],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
-        n_qs = COLS * T // 8 * qc * SLOT
-        n_kv, n_a = n_kvh * self.head_bytes // 2, T * H * HD * 9 // 16
+        n_qs, n_kv, n_a = (arg_elems(self, i) for i in range(3))
         hb, sl = self.head_bytes // 2, SLOT // 2
         blk = 4 * qg * qc * SLOT  # (a column's slots in a pass: per token group [its heads' Q | their sigmoid(gate)])
         n_seg = self.n_seg
@@ -654,7 +664,7 @@ class PrefillAttnOperator(ArtcOperator):
             if any(a.startswith("ev_") for a in self.ablate):  # (the cores' counters: window cycles, lock stall)
                 for c in range(COLS):
                     for r in range(4):
-                        for reg, val in COUNTERS:
+                        for reg, val in window_counter_writes():
                             npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):
@@ -664,7 +674,7 @@ class PrefillAttnOperator(ArtcOperator):
                                                        [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
                                                        [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]),
                                 group=tg, wait=True)
-            inflight = []  # (a pass: one task of up to four BDs per stream, at most two passes in flight)
+            inflight = []  # (a pass: one task of up to four BDs per stream, ``PASSES_IN_FLIGHT`` passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
                 more = qg * b + qg - 1 if causal else 0  # (the chunk's groups after its first through the pass's)
@@ -689,7 +699,7 @@ class PrefillAttnOperator(ArtcOperator):
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
-                if len(inflight) > 1:
+                if len(inflight) >= PASSES_IN_FLIGHT:
                     inflight.pop(0).finish()
             for tp in inflight:
                 tp.finish()
@@ -709,20 +719,15 @@ class PrefillAttnOperator(ArtcOperator):
         """Core byte addresses by 16 KB region (aiecc puts the stack at 0): 0 the K / V records, an output buffer and the
         softmax's scratch, 1 the Q panels held through a pass, the other output buffer (and with o's second copy the
         scores, m, l), 2 and 3 o (its two copies, else the workspace): QK streams Q (1) against K (0), PV V (0) from one
-        o copy into the other (two streams: their objects in regions 0 and 1). The 9B: all 64 KB, the 27B 61."""
-        kv, o, q, w = SLOT, ND * 72, self.R * SLOT, self.workspace()
+        o copy into the other (two streams: their objects in regions 0 and 1). The 9B: all 64 KB, the 27B 61. The
+        pinned buffers' bounds and overlaps are checked where they are pinned (``pin_l1_buffers``)."""
+        kv, o, q, w = SLOT, ND * PANEL_BYTES, self.R * SLOT, self.workspace()
         pw = self.STACK + 2 * kv + o
         if self.two:  # (the two streams' objects i in region i, b's after a's: the kernels read both from a's pointer; the
             # Q slots, then the gates, and the scores in region 2, o in 3)
-            lay = {"pa_ka": [self.STACK, 0x4000], "pa_kb": [self.STACK + kv, 0x4000 + kv],
-                   "pa_or": [self.STACK + 2 * kv, 0x4000 + 2 * kv], "pa_qb": [0x8000], "pa_pw": [pw],
-                   "pa_ws": [0x10000 - w["size"]]}
-            assert pw + PW <= 0x4000 and 0x4000 + 2 * kv + o <= 0x8000 and 0x8000 + q <= 0x10000 - w["size"]
-            assert 0x10000 - w["size"] + w["o"] == 0xC000
-            return lay
-        else:
-            lay = {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, 0x4000 + q], "pa_qb": [0x4000]}
-        ws = 0x8000 - w["o"] if self.ob else 0x8000
-        lay |= {"pa_pw": [pw], "pa_ws": [ws]}
-        assert pw + PW <= 0x4000 and 0x4000 + q + o <= ws and ws + w["size"] <= 0x10000
-        return lay
+            return {"pa_ka": [self.STACK, REGION], "pa_kb": [self.STACK + kv, REGION + kv],
+                    "pa_or": [self.STACK + 2 * kv, REGION + 2 * kv], "pa_qb": [2 * REGION], "pa_pw": [pw],
+                    "pa_ws": [3 * REGION - w["o"]]}  # (o of the workspace at the start of region 3)
+        ws = (2 * REGION - w["o"] if self.ob else 2 * REGION)
+        return {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, REGION + q], "pa_qb": [REGION],
+                "pa_pw": [pw], "pa_ws": [ws]}

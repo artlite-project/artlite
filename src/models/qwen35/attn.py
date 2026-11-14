@@ -93,6 +93,8 @@ step's V, ...: ``AttnShape.ext``) lie in the main core's memory: its workspace p
 panels (``mx_bytes``), idle in a sub-step.
 """
 
+from typing import Literal, NamedTuple
+
 import numpy as np
 
 from artlite.decode.kv import Records
@@ -100,9 +102,11 @@ from artlite.decode.protocol import META, PHASE, SLOTS, TOK_STATE, XB, XMETA
 from artlite.decode.protocol import STATE as MAIN_STATE
 from artlite.model_config import QwenConfig
 from artlite.operators import templating
+from artlite.operators.bfp16 import PANEL_BYTES, PANEL_ELEMS
 from artlite.operators.design import COLS
 from artlite.operators.kmath import SIGMOID
-from artlite.operators.util import Attr, regions, rup
+from artlite.operators.l1_layout import L1_BYTES
+from artlite.operators.util import Attr, cos_sin_rows, regions, rup
 from artlite.operators.words import WordMap
 
 from .words import ATT, FLAGS
@@ -117,12 +121,12 @@ OBJ_BYTES = 9280  # the overlay's objects: a weight tile (1024 columns: 16 rows 
 ROT = 32  # rotated pairs (dims i, i + 32 for i < 32)
 MAX_ROWS = 16  # query rows of a sub-step at most (``AttnShape.sub``), the gates in the core's sight
 MAX_ROWS_G = 24  # with the main core applying the gates (``AttnShape.main_gates``: dense models' designs)
-V_SCATTER = (18, ND, 36, 36 * ND)  # a V record's drain into its pair (txn.shim_bd dims, words): ND panels 144 B apart
+# a V record's drain into its pair (txn.shim_bd dims, words): ND panels 144 B apart
+V_SCATTER = (18, ND, PANEL_ELEMS, PANEL_ELEMS * ND)
 K_SCATTER = V_SCATTER  # (one pass) a K record's drain into its pair
 TAILS = 2  # tail objects of a sub-step that attends to its group: the ring slots of its first and last records
 HOLD = 2  # the last A objects of an attention sub-step, held until its emission
 STACK = 1600  # the core's stack (its deepest kernel call: ~1.2 KB)
-L1 = 65536
 EXT_W = 9728  # bytes of the main core's workspace past its residual (``decode.design``: inv .. scr), idle in a sub-step
 EXT_X = 5760  # bytes of a dense design's main core's sum panels (``decode.design.xs_bytes``), idle in a sub-step
 EXT_W8, EXT_X8 = 12288, 9600  # (the same of a design of 8 slots)
@@ -189,6 +193,14 @@ _MAIN_SRC = templating.load("models/qwen35/attn.main.cc.jinja")
 _MAIN_ONE = templating.load("models/qwen35/attn.main_one.cc.jinja")
 
 
+class Addr(NamedTuple):
+    """Where a region of the core's state lies: ``base`` "ws" (its workspace), "mw" (the main core's workspace past its
+    residual) or "mx" (the main core's sum panels), ``off`` bytes from the base."""
+
+    base: Literal["ws", "mw", "mx"]
+    off: int
+
+
 class AttnShape:
     """The attention core's sizes for a model: QC query heads per column, NPH columns per KV head (a chain), the
     slots of a sub-step and their query-row sets, the cache's capacity, the workspace and its regions in the main core's
@@ -236,7 +248,7 @@ class AttnShape:
 
     def _plan(self) -> None:
         """The workspace (the core's L1 next to its two A buffers, X buffer, R buffers, token and stack) and the regions
-        in the main core's memory (``ext``: region, offset; "mw" its workspace past its residual, "mx" its sum panels):
+        in the main core's memory (``ext``: an ``Addr`` of "mw" its workspace past its residual or "mx" its sum panels):
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
@@ -246,11 +258,11 @@ class AttnShape:
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK + (SIGMOID.table_words().nbytes if self.gate_tab else 0)
         self.ext_w, self.ext_x = (EXT_W8, EXT_X8) if self.one else (EXT_W, EXT_X)
         free = {"mw": self.ext_w, "mx": self.ext_x}
-        self.ext: dict[str, tuple[str, int]] = {}
+        self.ext: dict[str, Addr] = {}
 
         def put(name: str, n: int, order: tuple[str, ...] = ("mw", "mx")) -> None:
             r = next(r for r in order if free[r] >= n)
-            self.ext[name] = (r, (self.ext_w if r == "mw" else self.ext_x) - free[r])
+            self.ext[name] = Addr(r, (self.ext_w if r == "mw" else self.ext_x) - free[r])
             free[r] -= n
 
         cold = [("nrm", 4 * (2 * HD + 64 * self.smax)), ("vn", 2 * HD * self.smax)]
@@ -260,13 +272,13 @@ class AttnShape:
             put("kr", ROWS_B, ("mx", "mw"))
             put("km", 2 * REC_K, ("mx", "mw"))
             put("kb", REC_K, ("mx", "mw"))
-            pan = 72 * ND
+            pan = PANEL_BYTES * ND
             own += [("qa0", min(self.qc, 2) * pan), ("qa1", pan)] if self.qc > 2 else [("qa0", self.qc * pan)]
             own.append(("kn", REC_K))
-            assert ROWS_B + 2 * REC_V + 72 * self.qc <= self.a_bytes  # (tobj: past a tail's rows its V pair, the P panels)
+            assert ROWS_B + 2 * REC_V + PANEL_BYTES * self.qc <= self.a_bytes  # (tobj: past a tail's rows its V pair, the P panels)
         else:
             own.append(("kb", max(9 * ND * self.smax, REC_V)))  # (the slots' K blocks; aemit: a record's V panels)
-            qa = [(f"qa{o}", 2 * 72 * ND) for o in range(self.octets)]
+            qa = [(f"qa{o}", 2 * PANEL_BYTES * ND) for o in range(self.octets)]
             if not self.main_gates:
                 put("gs", 2 * self.rows * HD)
                 put(*cold[1], ("mx",))
@@ -274,30 +286,29 @@ class AttnShape:
             else:
                 for name, n in cold:
                     put(name, n)
-                n_own = (L1 - fixed - regions(own)["size"]) // qa[0][1]
+                n_own = (L1_BYTES - fixed - regions(own)["size"]) // qa[0][1]
                 own += qa[:n_own]
                 for name, n in qa[n_own:]:
                     put(name, n, ("mx", "mw"))
-            assert "qa0" in dict(own) and self.octets >= 2 and 2 * REC_V <= 2 * 72 * ND  # (tobj: a tail's V pair in the
+            assert "qa0" in dict(own) and self.octets >= 2 and 2 * REC_V <= 2 * PANEL_BYTES * ND  # (tobj: a tail's V pair in the
             # second octet's Q panels)
         self.mx_bytes = self.ext_x - free["mx"]  # (of the main core's sum panels)
         self._ws = regions(own)
-        assert self._ws["size"] + fixed <= L1, (self._ws["size"], fixed)
+        assert self._ws["size"] + fixed <= L1_BYTES, (self._ws["size"], fixed)
         assert 4 * 128 * self.sets >= 4 * HD  # (kf: the scores' region)
 
-    def at(self, tail: int) -> list[tuple[int, tuple[str, int]]]:
-        """The address state words abegin sets: (word, (base, offset)); tail: the main core's workspace offset past its
+    def at(self, tail: int) -> list[tuple[int, Addr]]:
+        """The address state words abegin sets: (word, address); tail: the main core's workspace offset past its
         residual."""
-        bases = {"mw": ("mw", tail), "mx": ("mx", 0)}
         out = []
         names = [(A_NRM, "nrm"), (A_VN, "vn")] + [(A_GS, "gs")] * (not self.main_gates)
         names += [(A_KR, "kr"), (A_KN, "kn"), (A_KM, "km"), (A_KB, "kb")] if self.one else []
         for w, name in names + [(A_QA + o, f"qa{o}") for o in range((1 + (self.qc > 2)) if self.one else self.octets)]:
             if name in self.ext:
-                r, off = self.ext[name]
-                out.append((w, (bases[r][0], bases[r][1] + off)))
+                a = self.ext[name]
+                out.append((w, Addr(a.base, a.off + (tail if a.base == "mw" else 0))))
             else:
-                out.append((w, ("ws", self._ws[name])))
+                out.append((w, Addr("ws", self._ws[name])))
         return out
 
     def role(self, c: int) -> int:
@@ -357,9 +368,7 @@ class AttnShape:
     def render(self, p: str, *, tail: int, nx_per_norm: int, packed8: bool = False) -> str:
         """nx_per_norm: the design's input objects per norm-weight object; packed8: the main core's inputs packed in a design of
         8 slots (``decode.protocol.M_SP``)."""
-        names = {"ws": "ws", "mw": "mw", "mx": "mx"}
-        at = [(w, (names[r], off)) for w, (r, off) in self.at(tail)]
-        v = dict(p=p, a=Attr(self.workspace()), at=at, QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
+        v = dict(p=p, a=Attr(self.workspace()), at=self.at(tail), QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
                  HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, PO=self.po, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps),
                  C_LEN=self.c_len, META=META, NX_PER_NORM=nx_per_norm, OBJ=self.a_bytes, PAIR_K=2 * REC_K, NO_OBJ=32 * self.qc,
                  GATE_MAIN=self.main_gates, PACKED8=packed8, ROUNDS=self.rounds,
@@ -396,5 +405,5 @@ def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[i
 
 def rope_cs(cfg: QwenConfig, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """cos, sin (n, 32) fp32 of positions' angles (``QwenConfig.rope_theta``: (n,) text positions or (n, 3) (T, H, W))."""
-    th = cfg.rope_theta(positions).astype(np.float64)
-    return np.cos(th).astype(np.float32), np.sin(th).astype(np.float32)
+    rows = cos_sin_rows(cfg.rope_theta(positions))
+    return np.ascontiguousarray(rows[:, :ROT]), np.ascontiguousarray(rows[:, ROT:])

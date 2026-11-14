@@ -14,6 +14,14 @@ each panel = 8 rows x 8 columns, one block per row.
 import numpy as np
 from ml_dtypes import bfloat16
 
+PANEL_BYTES = 72  # an activation panel: 8 blocks of 9 B
+PANEL_ELEMS = PANEL_BYTES // 2  # (bf16 elements, as the designs' types count them)
+
+
+def panel_elems(values: int) -> int:
+    """bf16 elements of the panels of ``values`` values (9 B per 8 values)."""
+    return values * 9 // 16
+
 
 def blocks(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """float (..., 8) -> (exponent bytes (...,), int8 mantissas (..., 8)), round to nearest even.

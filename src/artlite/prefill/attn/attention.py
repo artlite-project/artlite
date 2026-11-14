@@ -29,7 +29,7 @@ from ...operators.design import COLS, plus_i32, range32, stream_walk
 from ...operators.kernel_source import kernel_prefix
 from ...operators.kmath import ACC_C
 from ...operators.l1_layout import pin_l1_buffers
-from ...operators.util import Attr, regions
+from ...operators.util import Attr, mask64, regions
 
 # scratchpad parameters
 from .layout import OS, STACK, l1_layout, two_copies, workspace_regions
@@ -150,8 +150,7 @@ class AttnOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         p = self.pfx
         s = self.shape
-        tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
-        tril = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j <= q)
+        tri, tril = mask64(lambda q, j: j > q), mask64(lambda q, j: j <= q)
         w = self.workspace()
         cur = f" + {OS} * AW(int32_t, {w['st']})[15]" if self.oc == 2 else ""
         return _ATTN.render(p=p, w=Attr(w), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,

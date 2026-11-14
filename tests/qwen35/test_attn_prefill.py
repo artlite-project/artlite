@@ -27,6 +27,15 @@ from . import ref
 MAX_POS = 1024
 
 
+def _fill_cs(fused: FusedOperator, cfg: QwenConfig, positions: np.ndarray | None = None) -> None:
+    """The CS buffer: the cos / sin rows of every text position (MAX_POS), the last len(positions) rows those of
+    ``positions`` (a chunk of packed segments' own positions: ``prep.params(p0, MAX_POS - len(positions))``)."""
+    cs = AP.cs_table(cfg, MAX_POS)
+    if positions is not None:
+        cs[MAX_POS - len(positions):] = AP.cs_rows(cfg, positions)
+    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
+
+
 def _q_panels(slots: np.ndarray) -> np.ndarray:
     """Q slots (..., SLOT) uint8 ([d-block 32][hi | lo panel]) -> (..., 8 queries, 256) the Q values they hold (hi +
     lo)."""
@@ -103,7 +112,7 @@ def _prep_fused(s: _Setup) -> tuple[AP.AttnPrepOperator, FusedOperator]:
     op = AP.AttnPrepOperator(T=s.T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     fused = FusedOperator(name="attn_prep", runlist=[(op, "G", "CS", "NRM", "QS", "KV")], input_args=["G", "CS", "NRM"],
                           output_args=["QS"]).compile()  # (KV: scratch, zeroed by the host: flushed with the inputs)
-    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    _fill_cs(fused, s.cfg)
     nrm = np.concatenate([s.qn, s.kn]).astype(np.float32)
     fused.get_buffer("NRM").view(np.uint8)[:] = nrm.view(np.uint8)
     fused.get_buffer("KV")[:] = 0
@@ -166,7 +175,7 @@ def test_attn_prefill(size: str, T: int, pp: int) -> None:
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=pp)
     fused = FusedOperator(name=f"attn_prefill{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    _fill_cs(fused, s.cfg)
     fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
     fused.get_buffer("KV")[:] = 0
     H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
@@ -208,7 +217,7 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
     assert attn.two == (T % 64 == 0)
     fused = FusedOperator(name=f"attn_prefill_nc{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    _fill_cs(fused, s.cfg)
     fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
     fused.get_buffer("KV")[:] = 0
     H, qc, hd = s.cfg.num_attention_heads, s.qc, AT.HD
@@ -254,14 +263,12 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
         hi[a:a + m] = a + m - 1 if not causal else np.arange(a, a + m)
         pos[a:a + m] = np.arange(m)
     R = MAX_POS - T  # (the chunk's rows of the cos / sin table)
-    cs = AP.cs_table(s.cfg, MAX_POS)
-    cs[R:] = AP.cs_rows(s.cfg, pos)
     prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=causal, pp=2, pack=True)
     fused = FusedOperator(name=f"attn_prefill_packed{int(causal)}",
                           runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A", "SEG")],
                           input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
+    _fill_cs(fused, s.cfg, pos)
     fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
     fused.get_buffer("SEG").view(np.uint8)[:] = attn.seg(lo, hi)
     fused.get_buffer("KV")[:] = 0
@@ -290,7 +297,7 @@ def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
     alone = FusedOperator(name=f"attn_prefill_alone{int(causal)}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
                                                                              (attn1, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
-    alone.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+    _fill_cs(alone, s.cfg)
     alone.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
     alone.get_buffer("KV")[:] = 0
     _run(alone, prep.params(0) | attn1.params(0, lengths[0]), s.G(0, lengths[0]))
@@ -319,7 +326,7 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
                                                                    (attn1, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
     for f in (alone,):
-        f.get_buffer("CS").view(np.uint8)[:] = AP.cs_table(s.cfg, MAX_POS).view(np.uint8).reshape(-1)
+        _fill_cs(f, s.cfg)
         f.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
         f.get_buffer("KV")[:] = 0
     _run(alone, prep.params(0) | attn1.params(0), s.G(0, T))  # (the history: the essay's first T tokens)
@@ -332,13 +339,11 @@ def test_attn_prefill_tree(size: str, T: int) -> None:
         lo[a:a + m], hi[a:a + m], pos[a:a + m] = a, np.arange(a, a + m), T + np.arange(m)
         G += s.G(int(t), m, np.arange(a, a + m))
     R = MAX_POS - T  # (the chunk's rows of the cos / sin table)
-    cs = AP.cs_table(s.cfg, MAX_POS)
-    cs[R:] = AP.cs_rows(s.cfg, pos)
     attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, pp=2, pack=True)
     fused = FusedOperator(name="attn_prefill_tree", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"),
                                                              (attn, "QS", "KV", "A", "SEG")],
                           input_args=["G", "CS", "NRM", "SEG"], output_args=["A"]).compile()
-    fused.get_buffer("CS").view(np.uint8)[:] = cs.view(np.uint8).reshape(-1)
+    _fill_cs(fused, s.cfg, pos)
     fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
     fused.get_buffer("SEG").view(np.uint8)[:] = attn.seg(lo, hi, T)
     fused.get_buffer("KV")[:] = hist

@@ -41,18 +41,22 @@ from artlite.decode.kv import Records
 from artlite.decode.protocol import C_LEN, M_MODEL, META, PHASE, XMETA, XPAY
 from artlite.model_config import DFlashConfig
 from artlite.operators import templating
+from artlite.operators.bfp16 import PANEL_BYTES
 from artlite.operators.design import COLS
+from artlite.operators.l1_layout import REGION
 from artlite.operators.util import Attr, regions
 from artlite.operators.words import WordMap
 
-from .attn import OBJ_BYTES
+from .attn import (  # (POS_PER_GROUP: an A object of the ring: 4 records [K pairs 2 | V pairs 2])
+    OBJ_BYTES,
+    POS_PER_GROUP,
+)
 from .words import FLAGS
 
 HD, QC, QH = 128, 4, 8 * 128  # (a head's dims, the query heads per column, the rows' stride of an octet)
 ND = HD // 8
 REC = Records(HD, 1)
 REC_K, REC_V, ROWS_B = REC.k_bytes, REC.v_bytes, REC.rows_bytes
-POS_PER_GROUP = 32  # an A object of the ring: 4 records [K pairs 2 | V pairs 2]
 MAX_CHUNK = 2048  # a prefill chunk's positions at most
 MAX_PADDING = 256  # a prefill chunk's padding rows at most (they write records too: over the ring's oldest slots, not the window's)
 OPEN_BYTES = 4 * ROWS_B  # the open object's rows
@@ -123,7 +127,7 @@ class DFlashShape:
         [row][HD] fp32); sc: per octet the scores of 4 records [set 2][record 4][32] (before the cache: a row's K); pp: their P
         panels, [octet][P 4]; qa0, qa1: the Q panels [d-block][octet 2]."""
         return regions([("st", 4 * STATE_WORDS), ("y", 4 * 32 * (ND + 1) * self.sets), ("ml", 4 * 64 * self.sets),
-                        ("sc", 4 * 128 * self.sets), ("pp", CHUNK), ("qa0", 2 * 72 * ND), ("qa1", 2 * 72 * ND)])
+                        ("sc", 4 * 128 * self.sets), ("pp", CHUNK), ("qa0", 2 * PANEL_BYTES * ND), ("qa1", 2 * PANEL_BYTES * ND)])
 
     def ext(self) -> dict[str, int]:
         """Regions in the main core's idle memory, past its residual: offsets from there."""
@@ -149,7 +153,7 @@ class DFlashOperator(DecodeOverlayOperator):
     A_FWD = 2
     LENDS_WS = True
     CONV_ROW, ATTN_ROW = 2, 5
-    CONV_AT = 0x4000  # (the conv workspace: regions 1 .. 3, below the helper's scratch)
+    CONV_AT = REGION  # (the conv workspace: regions 1 .. 3, below the helper's scratch)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], shape: DFlashShape, tile_bytes: int = OBJ_BYTES, eps: float = 1e-6):
         self.shape = shape

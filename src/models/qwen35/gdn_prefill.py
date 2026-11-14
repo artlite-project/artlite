@@ -59,24 +59,24 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
+from artlite.operators.bfp16 import PANEL_BYTES, PANEL_ELEMS, panel_elems
 from artlite.operators.chain import ChainPart, chained_fill
-from artlite.operators.design import COLS, MAX_BD_ITER
+from artlite.operators.design import COLS, MAX_BD_ITER, TILE_BDS, check_bd_iterations
 from artlite.operators.kernel_source import kernel_prefix
-from artlite.operators.util import Attr, bf16_hilo, regions
+from artlite.operators.util import Attr, arg_elems, bf16_hilo, bf16_hilo_bits, mask64, regions
 from artlite.prefill.gemm import Layout
+from artlite.txn import HardwareLimitError
 
-from . import gdn as GD
+from .gdn_math import GDN, MATH, PANEL, D, GdnDims, helpers_source
 from .image import gdn_v_heads
 
-D, PANEL = GD.D, GD.PANEL
 CONV_OFF = "gdn_conv"  # scratchpad parameter: GC's bf16 offset of the conv state rows (``conv_offset``)
 C = 16  # tokens per chunk of the scan
 B_ELEMS = 2560  # bf16 of a GdnPrep input object: 8 tokens x [ab slot 64 (alpha, beta) | q 128 | k 128]
 QB_ELEMS = 1536  # (its q core's part: [ab | q]; the k core's: k)
 PART = 512  # bf16 of a scan split / joined part (1 KB: a chunk's v or o quarter, 16 tokens x 32)
 N_SPART = 4 * PANEL // (2 * PART)  # parts of a state quarter (16)
-PAN = 72  # bytes of a bfp16 panel (8 x 8)
-KP_BYTES = 16 * 2 * 2 * PAN  # a chunk's K (or Q) panels: [ib 16][tb 2][hi, lo]
+KP_BYTES = 16 * 2 * 2 * PANEL_BYTES  # a chunk's K (or Q) panels: [ib 16][tb 2][hi, lo]
 PREP_P = 2 * B_ELEMS  # bytes of a (column, k head) record of P: the prep's first object [q part | k part]
 V_P = 4 * 2 * PART  # bytes of a (column, v head) record of P: per quarter a part, its v conv weights (512 B) first
 P_HEAD = 4096  # P: ssm_norm (fp32) first
@@ -108,7 +108,7 @@ def scan_params(g: GGUFFile, cfg: QwenConfig, layer: int, rows: np.ndarray) -> n
     lo][128] bf16, dt and ssm_a of the k head's v heads (fp32 [16] each) | k part: k conv weights]; per column and v
     head per quarter r its v conv weights [tap 4][hi, lo][32].
     ``rows``: the gdn_in qkv block's rows per column (``Block.rows``: global conv channels)."""
-    hc = GD.GdnShape(cfg).hc
+    hc = GdnDims(cfg).hc
     cw = np.asarray(g.tensor(f"blk.{layer}.ssm_conv1d.weight").raw, np.float32)  # (channels, 4)
     dt = np.asarray(g.tensor(f"blk.{layer}.ssm_dt.bias").raw, np.float32).reshape(-1)
     A = np.asarray(g.tensor(f"blk.{layer}.ssm_a").raw, np.float32).reshape(-1)
@@ -117,7 +117,7 @@ def scan_params(g: GGUFFile, cfg: QwenConfig, layer: int, rows: np.ndarray) -> n
     out[:norm.nbytes] = norm.view(np.uint8)
 
     def hl(w: np.ndarray) -> np.ndarray:  # (..., ch, 4) -> (..., [tap][hi, lo][ch]) bf16 bits as bytes
-        hi, lo = GD.hilo_bits(np.swapaxes(w, -1, -2))
+        hi, lo = bf16_hilo_bits(np.swapaxes(w, -1, -2))
         return np.stack([hi, lo], -2).view(np.uint8).reshape(*w.shape[:-2], -1)
 
     ch = np.stack([r[r >= 0] for r in rows])  # (COLS, channels): the columns' global conv channels
@@ -167,10 +167,10 @@ class GdnPrepOperator(ArtcOperator):
     pfx = kernel_prefix("gdp")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False, tree: bool = False):
-        assert T % C == 0 and T // 8 <= MAX_BD_ITER and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
+        assert T % C == 0 and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
+        check_bd_iterations(T // 8, "GdnPrep")
         self.T, self.cfg, self.layout, self.pack, self.tree = T, cfg, layout, pack, tree
-        self.sh = GD.GdnShape(cfg)
-        self.hc = self.sh.hc
+        self.hc = GdnDims(cfg).hc
         self.vh = self.hc // 2
         assert {"qkv", "z"} <= set(layout.off) and ("ab" in layout.off or {"alpha", "beta"} <= set(layout.off)) \
             and self.hc % 2 == 0 and self.hc <= 6, "two k heads of up to 3 v heads per column"
@@ -182,11 +182,10 @@ class GdnPrepOperator(ArtcOperator):
         return regions(sizes + ([("cv0", 2 * 3 * 128)] if self.tree else []))
 
     def get_kernel_src(self) -> str:
-        helpers = templating.load("models/qwen35/gdn.helpers.cc.jinja").render(p=GD.GDN, eps=repr(self.cfg.rms_norm_eps), D=D, gm=GD.MATH,
-                                                           sigmoid=True)
-        return _PREP.render(p=self.pfx, g=GD.GDN, gm=GD.MATH, helpers=helpers, w=Attr(self.workspace()), D=D, HC=self.hc,
+        return _PREP.render(p=self.pfx, g=GDN, gm=MATH, helpers=helpers_source(self.cfg.rms_norm_eps), w=Attr(self.workspace()),
+                            D=D, HC=self.hc,
                             F32A=ab_f32(self.layout),
-                            VH=self.vh, T=self.T, PAN=PAN, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
+                            VH=self.vh, T=self.T, PAN=PANEL_BYTES, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
                             rs=bf16_hilo(1 / math.sqrt(D)), PACK=self.pack, TREE=self.tree,
                             SEG=self.pack or self.tree)
 
@@ -288,8 +287,8 @@ class GdnPrepOperator(ArtcOperator):
                                       tile=Tile(c, 3 + 2 * kh), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
         N, pitch = lay.N, lay.pitch
-        n_p, n_cv = params_bytes(self.hc) // 2, self.CV_ROWS * N
-        n_pr, per = self.n_pr, n_ch * self.jobj  # (a column's k head's records)
+        n_cv, n_p, n_pr = arg_elems(self, 1), arg_elems(self, 2), arg_elems(self, 4)
+        per = n_ch * self.jobj  # (a column's k head's records)
         n_g = T // 8
 
         def seq(G, CV, P, M, PR, ih, oh):
@@ -338,9 +337,10 @@ class GdnScanOperator(ArtcOperator):
     the chunk's state update after their release (``post``: the next record streams meanwhile)."""
 
     STACK = 3072
-    STACK_PACK = 3072
     CV_ROWS = 16  # rows of CV read (the v quarter's conv state: [16][32])
     RUN = MAX_BD_ITER * C  # tokens per BD of the v rows and o (a BD iterates at most MAX_BD_ITER times)
+    MAX_RUNS = 4  # runs of the v rows and of o in a round (which queues 5 other shim BDs: B, a chain of 2, the state in and out)
+    assert 5 + 2 * MAX_RUNS <= TILE_BDS
     pfx = kernel_prefix("gdsc")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, sub: int = 0, ablate: tuple[str, ...] = (),
@@ -352,12 +352,15 @@ class GdnScanOperator(ArtcOperator):
         segment's first three tokens' v convs from its first token on."""
         self.sub = sub or T
         self.pack, self.tree = pack, tree
-        assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0 and T // self.sub <= MAX_BD_ITER
-        assert T <= 4 * self.RUN, "the v rows and o in at most four runs (a round's BDs: 13 of a shim's 16)"
+        assert T % self.sub == 0 and not (pack and tree) and self.sub % C == 0
+        check_bd_iterations(T // self.sub, "GdnScan: the sub-chunks")
+        if T > self.MAX_RUNS * self.RUN:
+            raise HardwareLimitError(f"GdnScan: T {T} needs more than {self.MAX_RUNS} runs of {self.RUN} tokens "
+                                     f"(a round's shim BDs: at most {TILE_BDS})")
         self.T, self.cfg, self.layout = T, cfg, layout
         self.ablate = tuple(ablate)
-        self.sh = GD.GdnShape(cfg)
-        self.hc, self.ch, self.hv = self.sh.hc, self.sh.ch, cfg.ssm_v_heads
+        self.dims = GdnDims(cfg)
+        self.hc, self.ch, self.hv = self.dims.hc, self.dims.ch, cfg.ssm_v_heads
         self.vh = self.hc // 2
         assert {"qkv", "z"} <= set(layout.off) and self.hc % 2 == 0 and self.hc <= 6
         super().__init__()
@@ -367,12 +370,12 @@ class GdnScanOperator(ArtcOperator):
         conv's yc, ys too, dead once V^T is built)"""
         vconv = [("yc", 2 * 8 * 32), ("ys", 2 * 16 * 32)]
         common = [("wc", 2 * 4 * 2 * 32), ("rows", 2 * 11 * 32), *([] if self.tree else vconv),
-                  ("vt", 2 * 4 * 2 * 64), ("kt", KP_BYTES), ("fv", 4 * 2 * 3 * 64), ("pn", 12 * PAN), ("dc", 2 * 2 * 64),
-                  ("up", 4 * 4 * PAN)] + ([("pk", 4 * 32)] if self.pack else []) + \
+                  ("vt", 2 * 4 * 2 * 64), ("kt", KP_BYTES), ("fv", 4 * 2 * 3 * 64), ("pn", 12 * PANEL_BYTES), ("dc", 2 * 2 * 64),
+                  ("up", 4 * 4 * PANEL_BYTES)] + ([("pk", 4 * 32)] if self.pack else []) + \
             ([("cv0", 2 * 3 * 32), ("tf", 64)] if self.tree else [])
         gates = [("g", 4 * 6 * 64), ("er", 4 * 8 * 32 + 64), ("ed", 4 * 3 * 64), ("lt", 2 * 4 * 64), ("tr", 4 * 8 * 16),
                  ("rb", 2 * 2 * 8 * 16)]
-        jblock = [("xy", 4 * 4 * 64), ("sw", 4 * 192 + 6 * PAN)]
+        jblock = [("xy", 4 * 4 * 64), ("sw", 4 * 192 + 6 * PANEL_BYTES)]
         w = regions(common)
         shared = [regions(gates), regions(jblock), *([regions(vconv)] if self.tree else [])]
         out = {k: v for k, v in w.items() if k != "size"}
@@ -382,10 +385,9 @@ class GdnScanOperator(ArtcOperator):
         return out
 
     def get_kernel_src(self) -> str:
-        strict = sum(1 << (8 * t + s) for t in range(8) for s in range(t))
-        lower = sum(1 << (8 * t + s) for t in range(8) for s in range(t + 1))
+        strict, lower = mask64(lambda t, s: s < t), mask64(lambda t, s: s <= t)
         return _SCAN.render(p=self.pfx, w=Attr(self.workspace()),
-                            PART=PART, PAN=PAN, KP_BYTES=KP_BYTES, strict=f"{strict:016X}", lower=f"{lower:016X}",
+                            PART=PART, PAN=PANEL_BYTES, KP_BYTES=KP_BYTES, strict=f"{strict:016X}", lower=f"{lower:016X}",
                             ablate=self.ablate, PACK=self.pack, TREE=self.tree, VH=self.vh)
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -393,7 +395,7 @@ class GdnScanOperator(ArtcOperator):
                 ArgSpec("in", (self.T * self.layout.N,), bfloat16),
                 ArgSpec("in", (self.CV_ROWS * self.layout.N,), bfloat16),
                 ArgSpec("in", (params_bytes(self.hc) // 2,), bfloat16),
-                ArgSpec("in", (COLS * self.sh.n_panels * PANEL // 2,), bfloat16),
+                ArgSpec("in", (COLS * self.dims.n_panels * PANEL // 2,), bfloat16),
                 ArgSpec("out", (self.T * self.hv * D,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
@@ -479,17 +481,14 @@ class GdnScanOperator(ArtcOperator):
                 else:
                     args = [b1[c].cons(), v1[c][r].cons(), o1[c][r].prod(), k_vinit, k_sin, k_sout, k_chunk, ws, S]
                 workers.append(Worker(core_tree if self.tree else core, args,
-                                      tile=Tile(c, 2 + r), stack_size=self.STACK_PACK if self.pack else self.STACK,
+                                      tile=Tile(c, 2 + r), stack_size=self.STACK,
                                       dynamic_objfifo_lowering=True,
                                       while_true=False))
 
         N, pitch = lay.N, lay.pitch
-        n_p = params_bytes(hc) // 2
-        n_cv = self.CV_ROWS * N
-        n_st = COLS * self.sh.n_panels * PANEL // 2
-        n_o = T * self.hv * D
+        n_pr, n_cv, n_p, n_st, n_o = (arg_elems(self, i) for i in (0, 2, 3, 4, 5))
         n_sub, sub_ch = T // self.sub, self.sub // C  # (GdnPrep calls, chunks per call)
-        n_pr, per, pr_sub = COLS * 2 * n_ch * jobj, sub_ch * jobj, COLS * 2 * sub_ch * jobj
+        per, pr_sub = sub_ch * jobj, COLS * 2 * sub_ch * jobj
         runs = [(t0, min(self.RUN, T - t0)) for t0 in range(0, T, self.RUN)]
 
         def seq(PR, G, CV, P, GS, O, bh, vh, oh):
@@ -499,7 +498,7 @@ class GdnScanOperator(ArtcOperator):
                 for c in range(COLS):
                     qkv = c * pitch + lay.off["qkv"]  # (the column's conv channels: rows of CV and G alike)
                     vp = (P_HEAD + COLS * 2 * PREP_P + (c * hc + h) * V_P) // 2
-                    st = (c * self.sh.n_panels + 16 * h) * PANEL // 2  # the head's state (4 quarters of 16 KB)
+                    st = (c * self.dims.n_panels + 16 * h) * PANEL // 2  # the head's state (4 quarters of 16 KB)
                     bh[c].fill(PR, TensorAccessPattern((n_pr,), (2 * c + kh) * per, [n_sub, sub_ch, jobj // 64, 64],
                                                        [pr_sub, jobj, 64, 1]), group=tg)
                     chained_fill(vh[c], P, [TensorAccessPattern((n_p,), vp, [1, 1, 4, PART], [0, 0, PART, 1]),
@@ -546,11 +545,12 @@ class GdnOutOperator(ArtcOperator):
     pfx = kernel_prefix("gdo")
 
     def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, hslot: int, cs_off: int, gc_rows: int = 0):
-        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER
+        assert T % 32 == 0
+        check_bd_iterations(T // 8, "GdnOut")
         self.T, self.cfg, self.layout, self.hslot, self.cs_off = T, cfg, layout, hslot, cs_off
         self.gc_rows = gc_rows or T
-        self.sh = GD.GdnShape(cfg)
-        self.hc, self.ch, self.hv = self.sh.hc, self.sh.ch, cfg.ssm_v_heads
+        self.dims = GdnDims(cfg)
+        self.hc, self.ch, self.hv = self.dims.hc, self.dims.ch, cfg.ssm_v_heads
         assert self.hc % 2 == 0 and 3 * self.ch <= 2 * self.OBJ
         assert cs_off + 4 * self.OBJ <= hslot, "the conv-state objects end in the column's slot"
         super().__init__()
@@ -575,14 +575,14 @@ class GdnOutOperator(ArtcOperator):
                 ArgSpec("in", (self.gc_rows * self.layout.N,), bfloat16),
                 ArgSpec("in", (params_bytes(self.hc) // 2,), bfloat16),
                 ArgSpec("out", (self.ghdr_bytes // 2,), bfloat16),
-                ArgSpec("out", (T * hv * D * 9 // 16,), bfloat16)]
+                ArgSpec("out", (panel_elems(T * hv * D),), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         p, T, hc, lay, hv, ch = self.pfx, self.T, self.hc, self.layout, self.hv, self.ch
         bf = np.dtype[bfloat16]
         U = 2 * self.OBJ  # (a unit: [o | z])
         obj_ty, u_ty, uq_ty = (np.ndarray[(n,), bf] for n in (self.OBJ, U, 4 * U))
-        pan_ty, panq_ty = np.ndarray[(32 * 36,), bf], np.ndarray[(4 * 32 * 36,), bf]  # 32 panels of 72 B
+        pan_ty, panq_ty = np.ndarray[(32 * PANEL_ELEMS,), bf], np.ndarray[(4 * 32 * PANEL_ELEMS,), bf]  # 32 panels
         ws_ty = np.ndarray[(D + 8 * 256 + 4 * 256 + 512 + D // 32 * 32,), np.dtype[np.float32]]  # norm | y | silu(z) (bf16) | 1 / rms | norm hi / lo
         k_norm = Kernel(f"{p}_norm", "kernel.o", [u_ty, ws_ty])
         k_pair = Kernel(f"{p}_pair", "kernel.o", [u_ty, ws_ty, pan_ty])
@@ -591,7 +591,7 @@ class GdnOutOperator(ArtcOperator):
         a1 = [a3[c].cons().split([U * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[u_ty] * 4,
                                  names=[f"go_ap{c}_{r}" for r in range(4)]) for c in range(COLS)]
         c3 = [ObjectFifo(panq_ty, name=f"go_c{c}", depth=2) for c in range(COLS)]
-        c1 = [c3[c].prod().join([32 * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
+        c1 = [c3[c].prod().join([32 * PANEL_ELEMS * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[pan_ty] * 4, names=[f"go_cp{c}_{r}" for r in range(4)]) for c in range(COLS)]
         d3 = [ObjectFifo(obj_ty, name=f"go_d{c}", depth=2) for c in range(COLS)]  # (the conv state: DDR -> memtile -> DDR)
         d1 = [d3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"go_dm{c}") for c in range(COLS)]
@@ -613,11 +613,10 @@ class GdnOutOperator(ArtcOperator):
         workers = [Worker(core, [a1[c][r].cons(), c1[c][r].prod(), k_norm, k_pair, Buffer(ws_ty, name=f"go_ws{c}_{r}")],
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
-        N, n_o, n_p = lay.N, T * hv * D, params_bytes(hc) // 2
-        n_hdr, n_a = self.ghdr_bytes // 2, T * hv * D * 9 // 16
-        kb_row = hv * D // 8 * 36  # (bf16 of a token group's panels)
+        N = lay.N
+        n_o, n_gc, n_p, n_hdr, n_a = (arg_elems(self, i) for i in (0, 2, 3, 4, 5))
+        kb_row = hv * D // 8 * PANEL_ELEMS  # (bf16 of a token group's panels)
 
-        n_gc = self.gc_rows * N
 
         def seq(O, G, GC, P, GH, A, ah, ch_, dh, d1h):
             if conv is not None:
@@ -643,8 +642,8 @@ class GdnOutOperator(ArtcOperator):
                 # (the conv state and the objects' padding after it: the bytes the decode's conv-state drain writes)
                 cs = (c * self.hslot + self.cs_off) // 2
                 d1h[c].drain(GH, TensorAccessPattern((n_hdr,), cs, [1, 1, 1, 2 * self.OBJ], [0, 0, 0, 1]), group=tg)
-                ch_[c].drain(A, TensorAccessPattern((n_a,), 2 * c * 16 * 36, [1, npair, n_g, 32 * 36],
-                                                    [0, 16 * 16 * 36, kb_row, 1]), group=tg, wait=True)
+                ch_[c].drain(A, TensorAccessPattern((n_a,), 2 * c * 16 * PANEL_ELEMS, [1, npair, n_g, 32 * PANEL_ELEMS],
+                                                    [0, 16 * 16 * PANEL_ELEMS, kb_row, 1]), group=tg, wait=True)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_o,), bf], np.ndarray[(T * N,), bf], np.ndarray[(n_gc,), bf],

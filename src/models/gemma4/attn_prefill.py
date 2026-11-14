@@ -54,7 +54,7 @@ from artlite.operators.chain import ChainPart, chained_fill
 from artlite.operators.design import COLS, MAX_BD_ITER, range32, stream_walk
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.l1_layout import pin_l1_buffers
-from artlite.operators.util import Attr, regions
+from artlite.operators.util import Attr, mask64, regions
 from artlite.prefill.gemm import Layout
 
 from . import attn as AT
@@ -342,7 +342,7 @@ class GemmaAttnOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         p = self.pfx
         k = self.kind
-        tri = sum(1 << (8 * q + j) for q in range(8) for j in range(8) if j > q)
+        tri = mask64(lambda q, j: j > q)
         return _ATTN.render(p=p, w=Attr(self.workspace()), ND=k.nd, RG=k.recs, KP=k.kp, SWA=k.swa, QB=self.qb,
                             tri=f"{tri:016X}", ablate=self.ablate)
 

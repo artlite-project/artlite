@@ -14,8 +14,8 @@ from artlite.model_config import QwenConfig
 from artlite.operators import FusedOperator
 from artlite.operators.design import COLS
 from artlite.prefill import gemm as PG
-from models.qwen35 import gdn as GD
 from models.qwen35 import gdn_prefill as GP
+from models.qwen35.gdn_math import GdnDims
 from models.qwen35.image import QwenImage, gdn_v_heads
 
 from ..common import essay, to_numpy
@@ -59,7 +59,7 @@ def test_gdn_scan(T: int, size: str) -> None:
     fused = FusedOperator(name="gdn_scan", runlist=[(prep, "G", "CV", "P", "M", "PR"),
                                                     (op, "PR", "G", "CV", "P", "GS", "O")],
                           input_args=["G", "P", "M", "CV"], output_args=["O"]).compile()  # (GS: scratch, written and read)
-    sh = op.sh
+    sh = op.dims
     P = GP.scan_params(g, cfg, L, blk.rows)
     cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
     dt = np.asarray(g.tensor(f"blk.{L}.ssm_dt.bias").raw, np.float32).reshape(-1)
@@ -107,7 +107,7 @@ def test_gdn_scan(T: int, size: str) -> None:
                                            state=st[c], n=n, eps=cfg.rms_norm_eps)
             cs[c] = np.concatenate([cs[c], x[:n]])[-3:]
             o_want[:, vh] = o_c
-            got_s = GD.state_from_panels(S[c].reshape(-1, 1024), sh.hc)
+            got_s = ref.state_from_panels(S[c].reshape(-1, 1024), sh.hc)
             s_err.append(rel_max(got_s, st[c]))
             assert s_err[-1] < 8e-3, (chunk, c)
             final.append(got_s)
@@ -198,7 +198,7 @@ def test_gdn_scan_packed(size: str) -> None:
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
     alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)
     beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
-    sh = GD.GdnShape(cfg)
+    sh = GdnDims(cfg)
     P = GP.scan_params(g, cfg, L, blk.rows)
     cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
     dt = np.asarray(g.tensor(f"blk.{L}.ssm_dt.bias").raw, np.float32).reshape(-1)
@@ -286,7 +286,7 @@ def test_gdn_scan_tree(size: str) -> None:
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(n, -1)
     alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)
     beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(n, -1))
-    sh = GD.GdnShape(cfg)
+    sh = GdnDims(cfg)
     P = GP.scan_params(g, cfg, L, blk.rows)
     cw = np.asarray(g.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
     dt = np.asarray(g.tensor(f"blk.{L}.ssm_dt.bias").raw, np.float32).reshape(-1)
@@ -331,7 +331,7 @@ def test_gdn_scan_tree(size: str) -> None:
           GP.GdnPrepOperator.mask(pre, T))
     s_p = alone.get_buffer("GS").view(np.float32).copy()  # (the prefix's state and conv state)
     cv_p = g_rows(np.arange(pre - 3, pre), np.arange(3))[:3]
-    st_p = [GD.state_from_panels(s_p.reshape(COLS, -1)[c].reshape(-1, 1024), sh.hc) for c in range(COLS)]
+    st_p = [ref.state_from_panels(s_p.reshape(COLS, -1)[c].reshape(-1, 1024), sh.hc) for c in range(COLS)]
     # the tree chunk: two GdnPrep calls of t tokens (the second's conv rows G's before it), the scan over both
     tp = GP.GdnPrepOperator(T=t, cfg=cfg, layout=lay, tree=True)
     ts = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay, sub=t, tree=True)
