@@ -80,6 +80,28 @@ class RowOps:
                                      f"{self.b_objects} counted: every later op of the row would read its slots off by one")
 
 
+class Channel:
+    """A DMA channel's queue as the sequencer tracks it: the pending tasks (the op and the push's operation number: a
+    token on it proves the task complete), the tasks pushed (the shim BD rotation), the BD rotation of the B runs, and
+    the memtile chains its BDs hold (chain -> (its BD ids, their words))."""
+
+    def __init__(self) -> None:
+        self.pending: collections.deque[tuple[int, int]] = collections.deque()
+        self.pushed = 0
+        self.b_rotation = 0
+        self.chains: dict[tuple, tuple[list[int], list[list[int]]]] = {}
+
+
+class MemBds:
+    """One column's memtile BDs: the words each holds, the op of its last task (a BD is rewritten only once that op is
+    complete) and its last use (the pool's least recently used BD is rewritten first)."""
+
+    def __init__(self) -> None:
+        self.held: list[list[int] | None] = [None] * txn.MEM_BDS
+        self.user: list[int | None] = [None] * txn.MEM_BDS
+        self.lru = [-1] * txn.MEM_BDS
+
+
 class Seq:
     """A dispatch's transaction. ``nop``: the device address of a NOP command (one B slot); pages: per role the
     device address of its page (two B slots: ``device.VisionDevice``)."""
@@ -91,14 +113,9 @@ class Seq:
         self.role_of: list[Role | None] = [None] * ROWS  # (per core row the role its cores hold, as far as known)
         self.n = 0  # ops pushed
         self.frontier = 0  # every task of the ops before it is complete
-        self._q: dict[tuple, collections.deque] = {}  # (row 0 / 1, col, dir, ch) -> ops of its pending tasks
-        self._k: dict[tuple, int] = {}  # tasks per shim channel (BD rotation)
-        self._kbd: dict[tuple, int] = {}  # BD rotation per shim channel (the B runs)
-        self._chains: dict[tuple, dict] = {}  # per memtile channel: chain -> (its BD ids, their words) of the chains its BDs hold
-        self._lru = [[-1] * txn.MEM_BDS for _ in range(COLS)]  # (per column, per memtile BD: its last use)
+        self._ch: dict[tuple, Channel] = {}  # (row 0 / 1, col, dir, ch) -> its queue
+        self._mem = [MemBds() for _ in range(COLS)]
         self._tick = 0
-        self._held: list[list[list[int] | None]] = [[None] * txn.MEM_BDS for _ in range(COLS)]  # (its words)
-        self._user: list[list[int | None]] = [[None] * txn.MEM_BDS for _ in range(COLS)]  # (the op of its last task)
         self._b_user: dict[tuple[int, int], int] = {}  # (col, shim BD of the B runs) -> the op of its last task
         self._gates: dict[int, list[int]] = {}  # op -> per column its gate's push (for tokens)
         self._prod = [0] * COLS  # producers pushed since the column's last gate
@@ -125,11 +142,15 @@ class Seq:
         self.t.sync(col=0, direction=txn.MM2S, channel=5, row=1, ncol=COLS)
         self.frontier = u + 1
 
+    def _channel(self, key: tuple) -> Channel:
+        return self._ch.setdefault(key, Channel())
+
     def _slot(self, key: tuple, op: int) -> int:
         """A queue slot on a channel for a task of ``op`` (before a fifth pending task: the oldest's op complete, or
         the oldest itself when it is of this op: its own token); returns the channel's task count (shim BD
         rotation). The caller records the push (``_pushed``)."""
-        q = self._q.setdefault(key, collections.deque())
+        ch = self._channel(key)
+        q = ch.pending
         while q and q[0][0] < self.frontier:
             q.popleft()
         while len(q) >= txn.QUEUE_DEPTH:
@@ -137,17 +158,28 @@ class Seq:
             if u < op:
                 self.complete(u)
             else:
-                row, col, d, ch = key
+                row, col, d, c = key
                 self.t.set_token(push)
-                self.t.sync(col=col, direction=d, channel=ch, row=row)
+                self.t.sync(col=col, direction=d, channel=c, row=row)
         q.append((op, -1))
-        k = self._k.get(key, 0)
-        self._k[key] = k + 1
+        k = ch.pushed
+        ch.pushed += 1
         return k
 
     def _pushed(self, key: tuple, push: int) -> None:
-        q = self._q[key]
+        q = self._ch[key].pending
         q[-1] = (q[-1][0], push)
+
+    def check(self) -> None:
+        """The sequencer's invariants (raises ``HardwareLimitError``): no channel has more tasks pending than its queue
+        holds, a memtile BD whose words the transaction rewrote has a complete last user, and the handover locks'
+        counts fit."""
+        for key, ch in self._ch.items():
+            if len(ch.pending) > txn.QUEUE_DEPTH:
+                raise HardwareLimitError(f"channel {key}: {len(ch.pending)} tasks pending, its queue holds {txn.QUEUE_DEPTH}")
+        for c, p in enumerate(self._prod):
+            if p >= 64:
+                raise HardwareLimitError(f"column {c}: {p} producers since its last gate, a lock counts to 63")
 
     def _task(self, col: int, d: int, ch: int, op: int, chain: list[list[int]], ck: tuple, repeat: int) -> int:
         """A memtile task: its chain on BDs of the channel's pool (``design.mem_bd_pool``), linked: a chain the channel ran
@@ -155,6 +187,7 @@ class Seq:
         user complete; never one of this op's; ck: the chain as a key). Returns the push's operation number."""
         key = (1, col, d, ch)
         self._slot(key, op)
+        mem = self._mem[col]
 
         def linked(ids: list[int]) -> list[list[int]]:
             out = []
@@ -164,9 +197,9 @@ class Seq:
                     words[1] |= 1 << 19 | ids[i + 1] << 20
                 out.append(words)
             return out
-        cache = self._chains.setdefault(key, {})
+        cache = self._channel(key).chains
         hit = cache.get(ck)
-        users, held, lru = self._user[col], self._held[col], self._lru[col]
+        users, held, lru = mem.user, mem.held, mem.lru
         if hit is not None and all(held[b] == w for b, w in zip(*hit, strict=True)):
             ids = hit[0]
         else:
@@ -196,12 +229,13 @@ class Seq:
         key = (1, col, txn.MM2S, 5)
         self._slot(key, op)
         bid = D.GATE_BDS[op % len(D.GATE_BDS)]
-        if self._held[col][bid] != words:
-            if (u := self._user[col][bid]) is not None:
+        mem = self._mem[col]
+        if mem.held[bid] != words:
+            if (u := mem.user[bid]) is not None:
                 self.complete(u)
             self.t.mem_bd(col, bid, words)
-            self._held[col][bid] = words
-        self._user[col][bid] = op
+            mem.held[bid] = words
+        mem.user[bid] = op
         push = self.t.mem_push(col, txn.MM2S, 5, bid)
         self._pushed(key, push)
         return push
@@ -214,13 +248,13 @@ class Seq:
         for c0 in range(0, len(runs), len(B_BDS)):
             chunk = runs[c0:c0 + len(B_BDS)]
             if c0:  # (the previous chain complete: its BDs free)
-                self.t.set_token(self._q[key][-1][1])
+                self.t.set_token(self._ch[key].pending[-1][1])
                 self.t.sync(col=col, direction=txn.MM2S, channel=1)
-                self._q[key].pop()
+                self._ch[key].pending.pop()
             self._slot(key, op)
-            k = self._kbd.get(key, 0)
-            ids = [B_BDS[(k + i) % len(B_BDS)] for i in range(len(chunk))]
-            self._kbd[key] = k + len(chunk)
+            ch = self._ch[key]
+            ids = [B_BDS[(ch.b_rotation + i) % len(B_BDS)] for i in range(len(chunk))]
+            ch.b_rotation += len(chunk)
             for i, (bid, run) in enumerate(zip(ids, chunk, strict=True)):
                 if (u := self._b_user.get((col, bid))) is not None and u != op:
                     self.complete(u)
@@ -262,7 +296,9 @@ class Seq:
             co = cols.get(c, ColOps())
             execs = (0 if free_sends else sum(t.repeat for ts in co.sends.values() for t in ts)) + \
                 sum(t.repeat for t in co.fills + co.drains)
-            assert execs < 64 and self._prod[c] < 64, (execs, self._prod[c])
+            if execs >= 64 or self._prod[c] >= 64:
+                raise HardwareLimitError(f"column {c}: {execs} consumers and {self._prod[c]} producers of one op, a lock "
+                                         "counts to 63")
             words = txn.mem_bd_words(addr=D.GATE_SCRATCH, nwords=1,
                                      acquire=(x, self._prod[c], True) if self._prod[c] else None,
                                      release=(lock_g, execs) if execs else None)
@@ -330,6 +366,7 @@ class Seq:
             self.ddr_sync()
         if not deep:
             b_runs()
+        self.check()
         return n
 
     def ddr_sync(self) -> None:
@@ -347,7 +384,7 @@ class Seq:
         self.op({}, {r: RowOps(runs=[], b_objects=0) for r in range(ROWS) if self._par[r]})
         self.complete(self.n - 2)
         for col in D.B_SHIM:  # (the last op's B runs, and any op's of B runs alone: no gate covers them)
-            if q := self._q.get((0, col, txn.MM2S, 1)):
+            if (ch := self._ch.get((0, col, txn.MM2S, 1))) and (q := ch.pending):
                 self.t.set_token(q[-1][1])
                 self.t.sync(col=col, direction=txn.MM2S, channel=1)
         self.ddr_sync()
